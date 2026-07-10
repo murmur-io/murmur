@@ -5,6 +5,7 @@ import { AiResolvedMapComponent } from "../ai/ai-resolved-map/ai-resolved-map.co
 import { AiSetupBlockComponent } from "../ai/ai-setup-block/ai-setup-block.component";
 import { BrainPostureBlockComponent } from "../ai/brain-posture-block/brain-posture-block.component";
 import { DuringMeetingsBlockComponent } from "../ai/during-meetings-block/during-meetings-block.component";
+import { NoteAssistantBlockComponent } from "../ai/note-assistant-block/note-assistant-block.component";
 import { OnDeviceIntelligenceBlockComponent } from "../ai/on-device-intelligence-block/on-device-intelligence-block.component";
 
 /**
@@ -20,6 +21,7 @@ import { OnDeviceIntelligenceBlockComponent } from "../ai/on-device-intelligence
  *   C — What runs where: the resolved map, grouped cloud vs on-Mac;
  *   D — Advanced disclosure: connection cards + per-feature role rows;
  *   E — Live during meetings: in-meeting voice assistant + proactive hints;
+ *   E2 — Note assistant: the in-note selection actions (Refine/Shorten/Enhance);
  *   F — On-device intelligence: always-on badges + semantic search + models;
  *   G — Privacy strip (where-your-text-goes consent Allow/Revoke).
  * All state stays in the shell-provided SettingsStore.
@@ -33,6 +35,7 @@ import { OnDeviceIntelligenceBlockComponent } from "../ai/on-device-intelligence
     AiResolvedMapComponent,
     AiAdvancedBlockComponent,
     DuringMeetingsBlockComponent,
+    NoteAssistantBlockComponent,
     OnDeviceIntelligenceBlockComponent,
     AiPrivacyStripComponent,
   ],

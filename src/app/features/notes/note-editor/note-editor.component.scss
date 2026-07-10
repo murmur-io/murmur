@@ -1,0 +1,502 @@
+/* The note editor is a full drill-down (like /meeting/:id): the fixed host fills
+   the window (app-shell hides the primary rail on /notes). Single centered
+   document column, capped at --content-max. Design-tokens only. */
+:host {
+  position: fixed;
+  inset: 0;
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+  background: var(--surface-base);
+}
+
+/* Transparent full-viewport backdrop that closes an open header menu on an
+   outside click (a real focusable button for a11y; sits under the menus). */
+.menu-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 15;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  cursor: default;
+}
+
+/* ===== Sticky header ===== */
+.editor-head {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-4) var(--space-6) var(--space-3);
+  border-bottom: 1px solid var(--border-subtle);
+}
+.head-spacer {
+  flex: 1 1 auto;
+}
+
+.rail-back {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  height: 34px;
+  padding: 0 var(--space-2);
+  border: 0;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 0.9rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  cursor: pointer;
+  transition: background var(--transition-fast), color var(--transition-fast);
+}
+.rail-back:hover {
+  background: var(--surface-hover);
+  color: var(--text-primary);
+}
+.rail-back:focus-visible {
+  outline: none;
+  color: var(--text-primary);
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+.rail-back-icon {
+  flex: none;
+  width: 16px;
+  height: 16px;
+}
+
+/* Breadcrumb / more triggers. */
+.head-crumb,
+.head-more {
+  position: relative;
+}
+.crumb-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  height: 32px;
+  padding: 0 var(--space-2);
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 0.85rem;
+  font-weight: 550;
+  cursor: pointer;
+  transition: background var(--transition-fast), color var(--transition-fast);
+}
+.crumb-btn:hover {
+  background: var(--surface-hover);
+  color: var(--text-primary);
+}
+.crumb-btn:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--accent-ring);
+}
+.crumb-btn.is-icon {
+  padding: 0 var(--space-2);
+}
+
+.head-seg {
+  flex: none;
+}
+.head-btn {
+  height: 32px;
+  padding: 0 var(--space-3);
+  font-size: 0.85rem;
+}
+.head-btn.is-shared {
+  color: var(--accent-hover);
+}
+.share-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+}
+
+/* Header overlay menus — opaque (T3), positioned under the trigger. */
+.head-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  z-index: 20;
+  min-width: 220px;
+  max-height: 60vh;
+  overflow-y: auto;
+}
+.head-menu.is-right {
+  left: auto;
+  right: 0;
+}
+.menu-here {
+  margin-left: auto;
+  font-size: 0.7rem;
+  color: var(--accent-hover);
+}
+.menu-empty,
+.menu-path {
+  padding: var(--space-1) var(--space-3);
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 0.72rem;
+  word-break: break-all;
+}
+.menu-confirm {
+  padding: var(--space-1) var(--space-3);
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 0.8rem;
+}
+.menu-confirm-row {
+  display: flex;
+  gap: var(--space-2);
+  padding: var(--space-1) var(--space-2) var(--space-1);
+}
+.menu-confirm-btn {
+  height: 32px;
+  flex: 1 1 0;
+  font-size: 0.82rem;
+}
+
+/* Autosave indicator. */
+.save-state {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  min-width: 70px;
+  font-size: 0.78rem;
+  color: var(--text-muted);
+}
+.save-state[data-state="saved"] {
+  color: var(--success);
+}
+.save-check {
+  color: var(--success);
+}
+.save-retry {
+  border: 0;
+  background: transparent;
+  color: var(--danger);
+  font: inherit;
+  font-size: 0.78rem;
+  cursor: pointer;
+  text-decoration: underline;
+}
+.save-spin {
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  border: 1.5px solid var(--accent-soft);
+  border-top-color: var(--accent);
+  animation: ed-spin 0.7s linear infinite;
+}
+@keyframes ed-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* ===== Body scroll region ===== */
+.editor-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: var(--space-5) var(--space-6) var(--space-8);
+}
+.editor-status {
+  color: var(--text-muted);
+  padding: var(--space-4) var(--space-2);
+}
+.empty-title {
+  margin: 0 0 var(--space-2);
+  font-size: 1.15rem;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+.empty-body {
+  margin: 0 0 var(--space-4);
+  color: var(--text-secondary);
+  max-width: 44ch;
+}
+
+/* Lock gate. */
+.lock-gate {
+  max-width: 460px;
+  margin: var(--space-7) auto 0;
+}
+.lock-glyph {
+  color: var(--text-muted);
+  margin-bottom: var(--space-2);
+}
+.lock-gate-btn {
+  margin-top: var(--space-2);
+}
+
+/* ===== The document ===== */
+.note-doc {
+  max-width: var(--content-max);
+  margin: 0 auto;
+}
+.note-title-input {
+  width: 100%;
+  border: 0;
+  background: transparent;
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 1.75rem;
+  font-weight: 650;
+  letter-spacing: -0.025em;
+  line-height: 1.2;
+  padding: 0;
+  margin-bottom: var(--space-3);
+}
+.note-title-input::placeholder {
+  color: var(--text-muted);
+}
+.note-title-input:focus {
+  outline: none;
+}
+
+/* Properties bar. */
+.props {
+  margin-bottom: var(--space-4);
+  overflow: hidden;
+}
+.props-toggle {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  width: 100%;
+  padding: var(--space-2) var(--space-3);
+  border: 0;
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 0.78rem;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+.props-chevron {
+  transition: transform var(--transition);
+}
+.props.is-open .props-chevron {
+  transform: rotate(90deg);
+}
+.props-count {
+  margin-left: auto;
+  min-width: 18px;
+  padding: 0 5px;
+  border-radius: var(--radius-pill);
+  background: var(--surface-hover);
+  color: var(--text-secondary);
+  font-size: 0.68rem;
+  text-align: center;
+}
+.props-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: 0 var(--space-3) var(--space-3);
+}
+.prop-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: 30px;
+}
+.prop-key {
+  flex: none;
+  width: 84px;
+  color: var(--text-muted);
+  font-size: 0.8rem;
+  font-family: var(--font-mono);
+}
+.prop-tags {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1);
+  flex: 1 1 auto;
+}
+.prop-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 0.74rem;
+}
+.prop-tag-x,
+.prop-remove {
+  border: 0;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 0.95rem;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 2px;
+}
+.prop-tag-x:hover,
+.prop-remove:hover {
+  color: var(--danger);
+}
+.tag-add {
+  position: relative;
+}
+.prop-input {
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background: var(--surface-input);
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 0.82rem;
+  padding: 4px var(--space-2);
+  min-width: 90px;
+}
+.prop-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.prop-value {
+  flex: 1 1 auto;
+}
+.tag-suggest {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  z-index: 15;
+  min-width: 160px;
+}
+.prop-add-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+}
+.prop-add-chip {
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius-pill);
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 0.74rem;
+  padding: 3px var(--space-2);
+  cursor: pointer;
+  transition: color var(--transition-fast), border-color var(--transition-fast);
+}
+.prop-add-chip:hover {
+  color: var(--text-primary);
+  border-color: var(--accent);
+}
+.prop-add-chip.is-quiet {
+  border-style: solid;
+  border-color: var(--border-subtle);
+  color: var(--text-muted);
+}
+.prop-add-btn {
+  height: 30px;
+  padding: 0 var(--space-3);
+  font-size: 0.78rem;
+}
+
+/* Formatting toolbar. */
+.toolbar {
+  position: sticky;
+  top: 0;
+  z-index: 8;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px;
+  padding: var(--space-1) var(--space-2);
+  margin-bottom: var(--space-3);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--surface-overlay);
+}
+.tool {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 30px;
+  height: 28px;
+  padding: 0 var(--space-2);
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 0.82rem;
+  font-weight: 550;
+  cursor: pointer;
+  transition: background var(--transition-fast), color var(--transition-fast);
+}
+.tool:hover {
+  background: var(--surface-hover);
+  color: var(--text-primary);
+}
+.tool:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--accent-ring);
+}
+.tool-sep {
+  width: 1px;
+  height: 18px;
+  margin: 0 var(--space-1);
+  background: var(--border-subtle);
+}
+
+/* Body textarea (document surface). */
+.body-wrap {
+  position: relative;
+}
+.body-area {
+  display: block;
+  width: 100%;
+  min-height: 60vh;
+  border: 0;
+  background: transparent;
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 1rem;
+  line-height: 1.7;
+  resize: none;
+  overflow: hidden;
+  padding: 0;
+}
+.body-area::placeholder {
+  color: var(--text-muted);
+}
+.body-area:focus {
+  outline: none;
+}
+.slash-menu {
+  position: absolute;
+  top: 1.9rem;
+  left: 0;
+  z-index: 18;
+  min-width: 200px;
+  max-height: 300px;
+  overflow-y: auto;
+}
+.slash-menu .menu-item.is-active {
+  background: var(--surface-hover);
+}
+
+/* Preview. */
+.note-preview {
+  min-height: 40vh;
+  font-size: 1rem;
+  line-height: 1.7;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .save-spin,
+  .props-chevron {
+    animation: none;
+    transition: none;
+  }
+}

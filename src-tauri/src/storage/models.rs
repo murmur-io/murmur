@@ -498,6 +498,131 @@ pub struct DocChunkHit {
     pub snippet: String,
 }
 
+/// A standalone authored note — the LIST-row DTO (leak-free: no body for a sealed note). A note is a
+/// `documents(kind='note')` row. `title` falls back to `name` when the `title` column is NULL;
+/// `updatedAt` falls back to `createdAt` when `updated_at` is NULL. When the owning folder is
+/// sealed-and-not-session-unlocked the COMMAND layer returns a MASKED value (`locked: true`,
+/// `title: "🔒 Locked"`, empty `snippet`/`tags`) — the title/topic never leaks.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NoteSummary {
+    pub id: String,
+    pub title: String,
+    pub folder_id: String,
+    /// First ~180 chars of the BODY (front-matter stripped); "" when locked.
+    pub snippet: String,
+    /// Parsed from the note's YAML front-matter `tags:` list; [] when locked.
+    pub tags: Vec<String>,
+    pub updated_at: i64,
+    pub created_at: i64,
+    /// Sealed AND not session-unlocked.
+    pub locked: bool,
+    /// Has an active outbound share (WP6 wires this; false until then).
+    pub shared: bool,
+}
+
+/// A standalone authored note — the FULL DTO for the editor. Same masking contract as
+/// [`NoteSummary`]: when locked the COMMAND layer returns `markdown: ""`, `title: "🔒 Locked"`,
+/// empty `tags`/`properties`, so the sealed body never crosses the IPC boundary.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NoteDoc {
+    pub id: String,
+    pub title: String,
+    pub folder_id: String,
+    /// FULL markdown INCLUDING YAML front-matter; "" when masked.
+    pub markdown: String,
+    /// Parsed from the front-matter `tags:` list; [] when masked.
+    pub tags: Vec<String>,
+    /// Other scalar front-matter keys (excl. `tags`); {} when masked.
+    pub properties: std::collections::BTreeMap<String, String>,
+    pub updated_at: i64,
+    pub created_at: i64,
+    /// The vault `.md` path, or null when never exported / sealed.
+    pub exported_path: Option<String>,
+    /// Masked (no markdown) when true.
+    pub locked: bool,
+    pub shared: bool,
+}
+
+/// A note folder — reuses the [`Folder`] shape with the `kind` discriminator surfaced (always
+/// `"note"` for a note folder). Note folders are `folders` rows with `kind='note'`; the Notes
+/// section shows only these, the Meetings section shows `kind != 'note'`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NoteFolder {
+    pub id: String,
+    pub name: String,
+    pub path: String,
+    pub parent_id: Option<String>,
+    pub locked: bool,
+    pub kind: String,
+}
+
+/// The selection Brain-assistant request (WP4): the selected text + its surrounding context +
+/// which action. `before`/`after` are up to ~500 chars each around the selection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NoteAssistRequest {
+    pub note_id: String,
+    /// `"refine"` | `"shorten"` | `"enhance"`.
+    pub action: String,
+    pub selection: String,
+    #[serde(default)]
+    pub before: Option<String>,
+    #[serde(default)]
+    pub after: Option<String>,
+}
+
+/// One enhance-context provenance citation — the source note/meeting the additive passage drew on.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NoteCitation {
+    /// `"meeting"` | `"note"`.
+    pub kind: String,
+    pub id: String,
+    pub title: String,
+    pub snippet: String,
+}
+
+/// The selection Brain-assistant result (WP4). `suggestion` is the replacement for
+/// refine/shorten, or the ADDITIVE passage for enhance. `citations` is populated for enhance only.
+/// `modelLabel`/`mode`/`redacted` are DISPLAY metadata derived from the resolved provider target +
+/// `CallMeta` — the popover shows them ("via Claude" / "via Qwen local").
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NoteAssistResult {
+    pub action: String,
+    pub suggestion: String,
+    pub citations: Vec<NoteCitation>,
+    pub model_label: String,
+    /// `"local"` | `"cloud"`.
+    pub mode: String,
+    pub redacted: bool,
+}
+
+/// One proposed auto-organize move (WP5): a note and its proposed target note-folder. `toFolderId`
+/// is the existing note-folder id when the name matches an existing `kind='note'` folder, else null
+/// (⇒ a new folder to create on apply). Non-destructive: the FE reviews before `apply_organize_plan`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrganizeMove {
+    pub note_id: String,
+    pub title: String,
+    pub from_folder_id: String,
+    pub from_folder: String,
+    pub to_folder: String,
+    pub to_folder_id: Option<String>,
+    pub reason: String,
+}
+
+/// The auto-organize plan (WP5) — the reviewable set of proposed moves.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrganizePlan {
+    pub moves: Vec<OrganizeMove>,
+}
+
 /// One turn in a meeting chat conversation. `role` is "user" | "assistant".
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
