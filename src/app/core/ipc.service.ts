@@ -1578,6 +1578,17 @@ export class IpcService {
   }
 
   /**
+   * FAST autosave — persist a note's title + markdown ONLY (no re-index / no vault
+   * re-export). The frequent debounced autosave uses this so typing stays smooth
+   * even with the embed model present; the expensive re-index + export are deferred
+   * to {@link updateNoteDoc}, which the editor runs on blur / close / preview.
+   * Returns the new `updatedAt` (epoch ms).
+   */
+  saveNoteText(id: string, title: string, markdown: string): Promise<number> {
+    return invoke<number>("save_note_text", { id, title, markdown });
+  }
+
+  /**
    * List notes in `folderId` (null ⇒ all VISIBLE notes across note-folders). GATED
    * IN THE QUERY: a sealed-and-not-session-unlocked note is masked (title
    * "🔒 Locked", empty snippet/tags) — never a per-row skip that could leak a title.

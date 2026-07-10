@@ -355,7 +355,7 @@ impl AppState {
 /// there is no content key at startup). Best-effort and panic-free: every failure is logged, never
 /// fatal to launch.
 fn reconcile_locked_at_rest(db: &Db) {
-    let (rows, rollup_exports) = match db.reblank_locked_folders_at_rest() {
+    let (rows, rollup_exports, note_md_exports) = match db.reblank_locked_folders_at_rest() {
         Ok(a) => a,
         Err(e) => {
             tracing::warn!(target: "state", error = %e, "startup reconciliation: re-blank of locked folders failed");
@@ -368,6 +368,25 @@ fn reconcile_locked_at_rest(db: &Db) {
     // regenerate from visible facts on the next hourly pass.
     for p in &rollup_exports {
         let _ = std::fs::remove_file(p);
+    }
+    // 2026-07-10 audit F2 (filesystem half): a session unlock re-exports each authored note's vault
+    // `.md`; a crash while unlocked leaves that plaintext on disk. Delete the recorded files, THEN
+    // clear the column (delete-then-clear: a crash between the two keeps the path recorded so the
+    // next startup retries). Mirrors the clean-relock cleanup in `reblank_folder_extras`. Count-only
+    // log — never paths (they embed note titles).
+    if !note_md_exports.is_empty() {
+        for p in &note_md_exports {
+            let _ = std::fs::remove_file(p);
+        }
+        if let Err(e) = db.clear_note_exported_paths_in_locked_folders() {
+            tracing::warn!(target: "state", error = %e, "startup reconciliation: clearing locked note exported_path failed");
+        } else {
+            tracing::warn!(
+                target: "state",
+                count = note_md_exports.len(),
+                "startup reconciliation: removed re-exported plaintext note .md files left by a crash while unlocked"
+            );
+        }
     }
     for row in rows {
         let crate::storage::LockedMeetingAudio {
@@ -518,6 +537,50 @@ mod tests {
         crate::storage::migration::encrypt_in_place(path, GOOD_KEY).unwrap();
         // Fold any sidecar WAL/SHM into the main file so the byte-equality check below is stable.
         assert!(path.exists());
+    }
+
+    /// 2026-07-10 lock-audit F2 (RED-before-GREEN): a session unlock re-exports each authored note's
+    /// vault `.md` (`reexport_notes_in_folder`) — a CRASH while unlocked then leaves that plaintext
+    /// `.md` on disk with `documents.exported_path` still set. The STARTUP reconcile must delete the
+    /// file and clear the column (the clean-relock path already does; the reconcile did not).
+    #[test]
+    fn reconcile_at_rest_deletes_reexported_note_md() {
+        use crate::storage::models::Folder;
+        let db = Db::open_with_key(&tmp_path("note-md-reconcile"), GOOD_KEY).unwrap();
+        db.insert_folder(&Folder {
+            id: "f1".to_string(),
+            name: "Secret".to_string(),
+            path: "Notes/Secret".to_string(),
+            parent_id: None,
+            locked: false,
+            created_at: "2026-07-10T08:00:00Z".to_string(),
+        })
+        .unwrap();
+        db.insert_note("n1", "f1", "plan", "Plan", "", 1).unwrap();
+        // The crash-while-unlocked shape: a re-exported plaintext .md + a recorded exported_path.
+        let md = std::env::temp_dir().join(format!(
+            "murmur-reconcile-note-{}-{}.md",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&md, "# secret plan\ninternal launch April").unwrap();
+        db.set_note_doc_exported_path("n1", Some(md.to_str().unwrap()))
+            .unwrap();
+        db.set_folder_locked("f1", true, None).unwrap();
+
+        reconcile_locked_at_rest(&db);
+
+        assert!(
+            !md.exists(),
+            "startup reconcile must delete the re-exported plaintext note .md of a locked folder"
+        );
+        assert!(
+            db.note_exported_paths_in_folder("f1").unwrap().is_empty(),
+            "startup reconcile must clear documents.exported_path for the locked folder"
+        );
     }
 
     /// B4 sweep: a PLAINTEXT `*.pre-encrypt.bak` (the live at-rest leak older builds wrote) is

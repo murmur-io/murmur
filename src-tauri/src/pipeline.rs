@@ -1097,16 +1097,25 @@ async fn summarize_and_export(
         gateway_host.as_deref(),
         &call_meta,
     );
-    state.db.upsert_note(&NoteRecord {
-        meeting_id: meeting_id.to_string(),
-        provider_id: notes_target.connection.clone(),
-        markdown: markdown.clone(),
-        created_at,
-        exported_path: None,
-        model_requested,
-        model_served: call_meta.model_served.clone(),
-        gateway_host,
-    })?;
+    // 2026-07-10 audit F1 (the re-summarize case): a meeting whose folder is LOCKED and
+    // session-unlocked passes the `resummarize` gate — the fresh markdown must be RE-SEALED into
+    // `content_blob` in the same write (a plaintext-only upsert against the stale lock-time blob is
+    // destroyed by the next relock; a NEW provider row would be ungoverned). Open/rootless meetings
+    // (every first-time pipeline run — the auto-file `SealInto` below assigns the folder later)
+    // take the plain upsert inside the helper.
+    crate::commands::upsert_note_reseal_if_locked(
+        state,
+        &NoteRecord {
+            meeting_id: meeting_id.to_string(),
+            provider_id: notes_target.connection.clone(),
+            markdown: markdown.clone(),
+            created_at,
+            exported_path: None,
+            model_requested,
+            model_served: call_meta.model_served.clone(),
+            gateway_host,
+        },
+    )?;
 
     // Brain v2 L4 — the live bullets are now folded into the persisted note: CONSUME the
     // crash-recovery row (best-effort; a failed clear only means a later resummarize would see
@@ -1172,6 +1181,42 @@ async fn summarize_and_export(
             meeting_id: meeting_id.to_string(),
         });
     };
+
+    // 2026-07-10 audit F1 (re-summarize case, vault half): a meeting ALREADY governed by a LOCKED
+    // folder (session-unlocked — the `resummarize` gate refused otherwise) must NOT re-materialize a
+    // plaintext vault `.md`: the seal deleted its `.md` + NULLed `exported_path`, a session unlock
+    // never re-exports MEETING notes, and the relock cleanup would not know about a fresh root-level
+    // export. The note is already durably (re-)sealed in the DB by the upsert above, so finish
+    // exactly like the no-vault path (title + `Summarized`, `exported_path: None`).
+    let meeting_locked = match state.db.folder_for_meeting(meeting_id)? {
+        Some(fid) => state
+            .db
+            .folder_by_id(&fid)?
+            .map(|f| f.locked)
+            .unwrap_or(false),
+        None => false,
+    };
+    if meeting_locked {
+        let title = finalize_note_without_vault(&state.db, meeting_id, &markdown, date_iso)?;
+        emit_status(
+            app,
+            "saved",
+            "Saved to Murmur — this folder is locked, so no plaintext note was exported.",
+            meeting_id,
+        );
+        // Same best-effort graph persist as the no-vault path (Sink B's own gate skips vault stubs
+        // for a locked folder; Sink A rows are visibility-gated on read).
+        if let Err(e) =
+            crate::commands::build_and_persist_entities(state, meeting_id, &title, &markdown).await
+        {
+            tracing::warn!(target: "graph", error = %e, "graph entity persist failed (note saved unaffected)");
+        }
+        return Ok(PipelineResult {
+            note_markdown: markdown,
+            exported_path: None,
+            meeting_id: meeting_id.to_string(),
+        });
+    }
 
     emit_status(app, "exporting", "Writing note to vault…", meeting_id);
 

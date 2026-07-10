@@ -262,7 +262,17 @@ impl MistralReasoner {
             self.model_dir.to_string_lossy().to_string(),
             vec![self.model_file.clone()],
         )
-        .with_logging();
+        .with_logging()
+        // Brain stability fix: DISABLE mistralrs sequence-level prefix caching
+        // (`with_prefix_cache_n(None)` ⇒ engine `no_prefix_cache: true`; the default is
+        // `Some(16)` = ON). It reuses the KV-cache PREFIX across requests that share a leading
+        // system prompt — which EVERY brain call does — and on the non-paged Metal GGUF path that
+        // cached prefix goes stale/corrupt after the first few generations, so the 2nd+ call samples
+        // from NaN/Inf logits: "Invalid sampling probability at index 0: NaN. The model likely
+        // produced NaN/Inf logits" (the note-assistant failing "za drugim razem"). Our brain calls
+        // are ONE-SHOT completions, not multi-turn chat, so re-prefilling the short system prompt
+        // each call is negligible next to correctness — every request now gets a FRESH KV cache.
+        .with_prefix_cache_n(None);
         let rt = brain_rt().ok_or_else(|| AppError::Summarize("brain runtime unavailable".into()))?;
         // `build()` returns `anyhow::Result<Model>`; flatten the thread-join + the inner result.
         let model = block_on(rt, builder.build())?
