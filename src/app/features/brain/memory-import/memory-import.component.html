@@ -1,0 +1,62 @@
+<section class="mi">
+  <button
+    type="button"
+    class="mi-toggle"
+    [attr.aria-expanded]="open()"
+    (click)="open.set(!open())"
+  >
+    <svg
+      class="mi-chevron"
+      [class.is-open]="open()"
+      viewBox="0 0 16 16"
+      width="12"
+      height="12"
+      fill="none"
+      aria-hidden="true"
+    >
+      <path
+        d="M5.5 4l5 4-5 4"
+        stroke="currentColor"
+        stroke-width="1.7"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+      />
+    </svg>
+    Import memories from another assistant
+  </button>
+
+  @if (open()) {
+    <div class="mi-body">
+      <p class="mi-hint text-secondary">
+        Paste what ChatGPT or Claude remembers about you. Murmur extracts the
+        durable facts on-device, skips anything it already knows, and files the
+        import as one “Memory Import” entry you can delete to undo.
+      </p>
+      <textarea
+        class="mi-text"
+        rows="5"
+        [value]="text()"
+        (input)="onInput($event)"
+        [disabled]="importing()"
+        placeholder="Paste the exported memories here…"
+        aria-label="Memories to import"
+      ></textarea>
+      <div class="mi-actions">
+        @if (lastCount() === 0) {
+          <span class="mi-result text-secondary">
+            Nothing new to import — these memories are already known (or no
+            on-device model is available to read them).
+          </span>
+        }
+        <button
+          type="button"
+          class="btn btn-primary"
+          (click)="runImport()"
+          [disabled]="!canImport()"
+        >
+          {{ importing() ? "Importing…" : "Import" }}
+        </button>
+      </div>
+    </div>
+  }
+</section>

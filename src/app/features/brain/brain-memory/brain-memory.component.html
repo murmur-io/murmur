@@ -148,6 +148,12 @@
         </footer>
       </div>
     }
+
+    <!-- L2.3 — paste a ChatGPT/Claude memory export; hidden while memory is off/loading
+         (an import would be refused by the backend gate anyway). -->
+    @if (!loading() && !disabled()) {
+      <app-memory-import (imported)="onImported()" />
+    }
   }
 </section>
   
