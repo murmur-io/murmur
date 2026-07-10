@@ -412,22 +412,26 @@
             </div>
           } @else {
             <div class="body-wrap">
-              <textarea
-                #bodyArea
-                class="body-area"
-                placeholder="Start writing… Type / for blocks."
-                aria-label="Note body"
-                autocapitalize="sentences"
-                autocomplete="off"
-                spellcheck="true"
-                [value]="body()"
-                (input)="onBodyInput($event)"
-                (keydown)="onBodyKeydown($event)"
-                (mouseup)="onBodySelect()"
-                (keyup)="onBodySelect()"
-                (select)="onBodySelect()"
-                (blur)="onBlur()"
-              ></textarea>
+              <!-- CSS auto-grow: the grid mirror (`::after` fed by data-value) sizes the
+                   row to the content, the textarea fills it — no per-keystroke JS reflow. -->
+              <div class="body-grow" [attr.data-value]="body()">
+                <textarea
+                  #bodyArea
+                  class="body-area"
+                  placeholder="Start writing… Type / for blocks."
+                  aria-label="Note body"
+                  autocapitalize="sentences"
+                  autocomplete="off"
+                  spellcheck="true"
+                  [value]="body()"
+                  (input)="onBodyInput($event)"
+                  (keydown)="onBodyKeydown($event)"
+                  (mouseup)="onBodySelect()"
+                  (keyup)="onBodySelect()"
+                  (select)="onBodySelect()"
+                  (blur)="onBlur()"
+                ></textarea>
+              </div>
 
               <!-- Slash menu (opaque overlay, T3). -->
               @if (slashOpen()) {

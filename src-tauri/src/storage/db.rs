@@ -2148,6 +2148,27 @@ impl Db {
         Ok(())
     }
 
+    /// SEAL-ON-WRITE twin of [`Db::set_manual_notes`] for a meeting in a session-unlocked LOCKED
+    /// folder: persist the fresh plaintext (session-visible) AND its freshly-encrypted
+    /// `manual_notes_blob` in ONE atomic statement, so relock/at-rest reblank restores THIS buffer —
+    /// never a stale lock-time copy. The CALLER must have verified the blob decrypts back
+    /// byte-identical BEFORE calling this (verify-before-destroy) — exactly like
+    /// [`Db::seal_manual_notes`]. 2026-07-10 audit F1.
+    pub fn set_manual_notes_sealed(
+        &self,
+        meeting_id: &str,
+        text: &str,
+        blob: &[u8],
+    ) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE meetings SET manual_notes = ?2, manual_notes_blob = ?3 WHERE id = ?1",
+            rusqlite::params![meeting_id, text, blob],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
     /// The meeting's typed-notes plaintext, or "" when never set / NULL (legacy rows) / unknown id /
     /// sealed-and-blanked. UNGATED at the DB layer — callers that return this to a surface MUST gate
     /// first (`meeting_is_unlocked` in commands / `meeting_is_visible` for the live brain). The
@@ -4135,15 +4156,42 @@ impl Db {
         .map_err(map_err)
     }
 
-    /// Update an authored note's `title` + `text` + `updated_at` (write path). Leaves `text_blob`
-    /// alone (an update on a session-unlocked locked folder writes plaintext; the seal blob is
-    /// rebuilt on the next relock). Idempotent on an unknown id / non-note row (0 rows affected).
+    /// Update an authored note's `title` + `text` + `updated_at` (write path, OPEN folders only).
+    /// Leaves `text_blob` alone. A write into a session-unlocked LOCKED folder must NOT come here —
+    /// the relock reblank discards the plaintext and restores the stale blob (content loss) — it goes
+    /// through the command layer's `reseal_document_if_locked` → [`Db::update_note_row_sealed`],
+    /// which re-seals the fresh text into `text_blob` in the same write (2026-07-10 audit F1).
+    /// Idempotent on an unknown id / non-note row (0 rows affected).
     pub fn update_note_row(&self, id: &str, title: &str, text: &str, updated_at: i64) -> Result<()> {
         let conn = self.lock();
         conn.execute(
             "UPDATE documents SET title = ?2, text = ?3, updated_at = ?4
                WHERE id = ?1 AND kind = 'note'",
             rusqlite::params![id, title, text, updated_at],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// SEAL-ON-WRITE twin of [`Db::update_note_row`] for a session-unlocked LOCKED folder: persist
+    /// the fresh plaintext (session-visible) AND its freshly-encrypted `text_blob` in ONE atomic
+    /// statement, so the at-rest seal always matches the newest text (relock re-blanks the plaintext
+    /// and the next unlock restores THIS write, never a stale lock-time copy). The CALLER must have
+    /// verified the blob decrypts back byte-identical BEFORE calling this (verify-before-destroy) —
+    /// exactly like [`Db::seal_document`]. Idempotent on an unknown id / non-note row.
+    pub fn update_note_row_sealed(
+        &self,
+        id: &str,
+        title: &str,
+        text: &str,
+        text_blob: &[u8],
+        updated_at: i64,
+    ) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE documents SET title = ?2, text = ?3, text_blob = ?4, updated_at = ?5
+               WHERE id = ?1 AND kind = 'note'",
+            rusqlite::params![id, title, text, text_blob, updated_at],
         )
         .map_err(map_err)?;
         Ok(())
@@ -4505,6 +4553,51 @@ impl Db {
                 note.model_requested,
                 note.model_served,
                 note.gateway_host,
+            ],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// SEAL-ON-WRITE twin of [`Db::upsert_note`] for a meeting whose folder is LOCKED (and
+    /// session-unlocked — the command layer gates first): persist the fresh markdown (session-
+    /// visible) AND its freshly-encrypted `content_blob` AND the governing `folder_id` in ONE atomic
+    /// statement. Setting `folder_id` on insert keeps a NEW provider row governed by the meeting's
+    /// lock (a bare insert would leave it NULL → ungoverned → visible). The CALLER must have verified
+    /// the blob decrypts back byte-identical BEFORE calling this (verify-before-destroy) — exactly
+    /// like [`Db::seal_note`]. 2026-07-10 audit F1.
+    pub fn upsert_note_sealed(
+        &self,
+        note: &NoteRecord,
+        content_blob: &[u8],
+        folder_id: &str,
+    ) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO notes
+               (meeting_id, provider_id, markdown, created_at, exported_path,
+                model_requested, model_served, gateway_host, content_blob, folder_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT(meeting_id, provider_id) DO UPDATE SET
+               markdown = excluded.markdown,
+               created_at = excluded.created_at,
+               exported_path = excluded.exported_path,
+               model_requested = excluded.model_requested,
+               model_served = excluded.model_served,
+               gateway_host = excluded.gateway_host,
+               content_blob = excluded.content_blob,
+               folder_id = excluded.folder_id",
+            rusqlite::params![
+                note.meeting_id,
+                note.provider_id,
+                note.markdown,
+                note.created_at,
+                note.exported_path,
+                note.model_requested,
+                note.model_served,
+                note.gateway_host,
+                content_blob,
+                folder_id,
             ],
         )
         .map_err(map_err)?;
@@ -5225,11 +5318,41 @@ impl Db {
     /// unsealed its notes elsewhere — this does NOT reassign or delete any note, and a locked folder
     /// with sealed content must never reach here (the command refuses unless the lock was removed
     /// first). Returns the number of rows deleted (0 if the id was already gone — idempotent).
+    /// Delete a folder row + its documents' derived index rows in ONE tx (2026-07-10 audit F3).
+    /// The `documents` FK CASCADE reaches `doc_chunks`, but (a) `doc_vec_chunks` is a FK-less vec0
+    /// table (its vectors would orphan) and (b) a cascade DELETE does not fire the
+    /// `fts_doc_chunks_ad` trigger (`recursive_triggers` is unset) — leaving searchable FTS tokens
+    /// of the deleted content behind. So the documents' chunk rows are purged EXPLICITLY (which
+    /// fires the trigger and removes the vec0 rows), mirroring `delete_document`. Meetings are NOT
+    /// deleted here — `delete_folder_inner` reassigns every note to the vault root first, so the
+    /// meeting-side `vec_chunks` have no cascade hole on this path.
     pub fn delete_folder(&self, id: &str) -> Result<usize> {
-        let conn = self.lock();
-        let n = conn
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        let document_ids: Vec<String> = {
+            let mut stmt = tx
+                .prepare("SELECT id FROM documents WHERE folder_id = ?1")
+                .map_err(map_err)?;
+            let rows = stmt
+                .query_map(rusqlite::params![id], |r| r.get::<_, String>(0))
+                .map_err(map_err)?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r.map_err(map_err)?);
+            }
+            out
+        };
+        Self::purge_doc_chunks_tx(&tx, &document_ids)?;
+        // Explicit (rather than FK-cascade) so the delete is deterministic and trigger-visible.
+        tx.execute(
+            "DELETE FROM documents WHERE folder_id = ?1",
+            rusqlite::params![id],
+        )
+        .map_err(map_err)?;
+        let n = tx
             .execute("DELETE FROM folders WHERE id = ?1", rusqlite::params![id])
             .map_err(map_err)?;
+        tx.commit().map_err(map_err)?;
         Ok(n)
     }
 
@@ -5451,6 +5574,16 @@ impl Db {
             // re-blanked / sealed) folders in the SAME transaction — a sealed meeting contributes
             // nothing to the flywheel.
             Self::purge_corrections_tx(&tx, &meeting_ids)?;
+            // 2026-07-10 audit F5: the four derived-content families the LOCK tx
+            // (`purge_chunks_for_meetings`) and the STARTUP reconcile
+            // (`reblank_locked_folders_at_rest`) already purge were MISSING from this RELOCK tx —
+            // rows re-derived DURING a session unlock (facts extraction, user memory, voice Q&A,
+            // re-diarized voiceprints) survived the relock at rest. Same purge-on-seal contract,
+            // same meeting scope, same atomic unit as the plaintext re-blank above.
+            Self::purge_facts_tx(&tx, &meeting_ids)?;
+            Self::purge_user_facts_tx(&tx, &meeting_ids)?;
+            Self::purge_assistant_interactions_tx(&tx, &meeting_ids)?;
+            Self::purge_speaker_voiceprints_tx(&tx, &meeting_ids)?;
             // Re-Truth LOCK-SAFETY: drop supersession rows referencing any meeting in these
             // (re-blanked / sealed) folders — an applied row's plaintext note pre-image must not
             // linger at rest for a sealed folder (same purge-on-seal contract as corrections above).
@@ -5499,9 +5632,17 @@ impl Db {
     ///
     /// The second tuple element is the `exported_path`s of the memory rollups purged in-tx when any
     /// folder is locked (`purge_memory_rollups_tx`) — the caller deletes those vault `.md` files.
+    ///
+    /// The third tuple element (2026-07-10 audit F2) is the recorded `exported_path` of every
+    /// authored NOTE in a locked folder: a session unlock re-exports each note's vault `.md`
+    /// (`reexport_notes_in_folder`), so a crash-while-unlocked leaves that plaintext `.md` on disk.
+    /// The caller ([`crate::state`] `reconcile_locked_at_rest`) deletes those files and THEN clears
+    /// the column via [`Db::clear_note_exported_paths_in_locked_folders`] (delete-then-clear, so a
+    /// crash between the two keeps the path recorded and the next startup retries). Mirrors the
+    /// clean-relock cleanup in `reblank_folder_extras`.
     pub fn reblank_locked_folders_at_rest(
         &self,
-    ) -> Result<(Vec<LockedMeetingAudio>, Vec<String>)> {
+    ) -> Result<(Vec<LockedMeetingAudio>, Vec<String>, Vec<String>)> {
         const LOCKED_MEETINGS: &str = "SELECT DISTINCT meeting_id FROM notes \
              WHERE folder_id IN (SELECT id FROM folders WHERE locked = 1)";
         let mut conn = self.lock();
@@ -5724,8 +5865,45 @@ impl Db {
         } else {
             Vec::new()
         };
+        // 2026-07-10 audit F2: surface the authored notes' re-exported vault `.md` paths for every
+        // LOCKED folder (a crash while session-unlocked leaves them plaintext on disk with the
+        // column still set). Paths only — the caller deletes the files then clears the column
+        // (`clear_note_exported_paths_in_locked_folders`), never text (no PII here).
+        let note_md_exports = {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT exported_path FROM documents \
+                       WHERE kind = 'note' AND exported_path IS NOT NULL \
+                         AND folder_id IN (SELECT id FROM folders WHERE locked = 1)",
+                )
+                .map_err(map_err)?;
+            let rows = stmt
+                .query_map([], |r| r.get::<_, String>(0))
+                .map_err(map_err)?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r.map_err(map_err)?);
+            }
+            out
+        };
         tx.commit().map_err(map_err)?;
-        Ok((audio, rollup_exports))
+        Ok((audio, rollup_exports, note_md_exports))
+    }
+
+    /// NULL the `exported_path` of every authored NOTE in EVERY locked folder — the startup-
+    /// reconcile companion of [`Db::clear_note_exported_paths_in_folder`], run AFTER the caller has
+    /// deleted the on-disk `.md` files surfaced by [`Db::reblank_locked_folders_at_rest`]
+    /// (delete-then-clear; 2026-07-10 audit F2).
+    pub fn clear_note_exported_paths_in_locked_folders(&self) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE documents SET exported_path = NULL \
+               WHERE kind = 'note' \
+                 AND folder_id IN (SELECT id FROM folders WHERE locked = 1)",
+            [],
+        )
+        .map_err(map_err)?;
+        Ok(())
     }
 
     /// Folder ids that are sealed (`locked=1`) — used to re-blank every sealed note on relock-all.
@@ -10313,6 +10491,159 @@ mod tests {
         assert_brief_leak_purged(&db);
     }
 
+    // ── 2026-07-10 lock-audit F3/F5: folder-delete purge + the relock-tx derived families ─────────
+
+    /// Raw at-rest scalar (COUNT) — what actually survives, independent of any gated read.
+    fn count_raw(db: &Db, sql: &str) -> i64 {
+        let conn = db.lock();
+        conn.query_row(sql, [], |r| r.get(0)).unwrap()
+    }
+
+    /// F3 (RED-before-GREEN): deleting a folder must purge its documents' `doc_chunks` +
+    /// `doc_vec_chunks` + `fts_doc_chunks` tokens IN the delete tx. Before the fix `delete_folder`
+    /// was a bare `DELETE FROM folders`: the `documents`→`doc_chunks` FK CASCADE does NOT fire the
+    /// `fts_doc_chunks_ad` trigger (cascade actions skip triggers without `recursive_triggers`), and
+    /// `doc_vec_chunks` is a FK-less vec0 table — leaving searchable tokens + invertible vectors of
+    /// the deleted content at rest.
+    #[test]
+    fn delete_folder_purges_doc_vec_chunks_and_fts() {
+        let db = mem_db();
+        seed_folder(&db, "f-docs", "Research");
+        db.insert_document("d1", "f-docs", "spec.md", "unicornbudget approved", "document", 1)
+            .unwrap();
+        db.index_document_chunks("d1", None).unwrap(); // chunks + FTS (model-less: no vectors)
+        // Attach a vector to the chunk directly (no embedder on CI) — the orphan the fix must purge.
+        {
+            let conn = db.lock();
+            let chunk_id: i64 = conn
+                .query_row(
+                    "SELECT id FROM doc_chunks WHERE document_id = 'd1' LIMIT 1",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let blob = crate::embed::vec_to_blob(&one_hot(0));
+            conn.execute(
+                "INSERT INTO doc_vec_chunks(chunk_id, embedding) VALUES (?1, ?2)",
+                rusqlite::params![chunk_id, blob],
+            )
+            .unwrap();
+        }
+
+        db.delete_folder("f-docs").unwrap();
+
+        assert_eq!(
+            count_raw(&db, "SELECT COUNT(*) FROM documents WHERE folder_id = 'f-docs'"),
+            0,
+            "documents gone with the folder"
+        );
+        assert_eq!(
+            count_raw(&db, "SELECT COUNT(*) FROM doc_chunks WHERE document_id = 'd1'"),
+            0,
+            "doc_chunks purged with the folder"
+        );
+        assert_eq!(
+            count_raw(&db, "SELECT COUNT(*) FROM doc_vec_chunks"),
+            0,
+            "no orphan doc vector survives the folder delete (FK-less vec0)"
+        );
+        assert_eq!(
+            count_raw(
+                &db,
+                "SELECT COUNT(*) FROM fts_doc_chunks WHERE fts_doc_chunks MATCH 'unicornbudget'"
+            ),
+            0,
+            "no searchable FTS token of the deleted content survives (cascade skips the _ad trigger)"
+        );
+    }
+
+    /// F5 (RED-before-GREEN): the RELOCK tx (`blank_sealed_notes_in_folders`, both the
+    /// `relock_folder` and `relock_all_inner` legs) must purge the four derived-content families the
+    /// LOCK tx (`purge_chunks_for_meetings`) and the STARTUP reconcile
+    /// (`reblank_locked_folders_at_rest`) already purge: `facts`, `user_facts`,
+    /// `assistant_interactions`, `speaker_voiceprints`. Before the fix, rows derived DURING a
+    /// session unlock survived the relock at rest.
+    #[test]
+    fn relock_purges_facts_user_facts_interactions_and_voiceprints() {
+        let db = mem_db();
+        seed_folder(&db, "f-locked", "Secret");
+        db.insert_meeting(&sample_meeting("m1", "2026-07-10T10:00:00Z"))
+            .unwrap();
+        note_for(&db, "m1", "claude_code", "note");
+        db.set_note_folder("m1", Some("f-locked")).unwrap();
+
+        // Rows re-derived while the folder was session-unlocked (the relock must drop them).
+        let anna = db.upsert_entity("Anna", EntityKind::Person).unwrap();
+        db.apply_fact_ops(&[crate::facts::FactOp::Add(crate::facts::NewFact {
+            entity_id: anna.clone(),
+            subject: "Anna".into(),
+            predicate: "role".into(),
+            object: "QA lead".into(),
+            valid_from: "2026-07-10T10:00:00Z".into(),
+            recorded_at: "2026-07-10T10:00:00Z".into(),
+            confidence: 1.0,
+            meeting_id: Some("m1".into()),
+        })])
+        .unwrap();
+        db.apply_user_fact_ops(&[crate::facts::FactOp::Add(crate::facts::NewFact {
+            entity_id: "user".into(),
+            subject: "user".into(),
+            predicate: "prefers".into(),
+            object: "Polish replies".into(),
+            valid_from: "2026-07-10T10:00:00Z".into(),
+            recorded_at: "2026-07-10T10:00:00Z".into(),
+            confidence: 1.0,
+            meeting_id: Some("m1".into()),
+        })])
+        .unwrap();
+        db.insert_assistant_interaction(
+            "m1",
+            "what did Anna say",
+            "she owns QA sign-off",
+            &[],
+            "answered",
+            None,
+            None,
+            None,
+            "2026-07-10T10:05:00Z",
+        )
+        .unwrap();
+        db.insert_voiceprint("vp1", "m1", 0, Some("Anna"), &[1.0, 0.0, 0.0], "2026-07-10T10:06:00Z")
+            .unwrap();
+
+        // RELOCK tx.
+        let mut folders = HashSet::new();
+        folders.insert("f-locked".to_string());
+        db.blank_sealed_notes_in_folders(&folders).unwrap();
+
+        assert_eq!(
+            count_raw(&db, "SELECT COUNT(*) FROM facts WHERE meeting_id = 'm1'"),
+            0,
+            "relock must purge the sealed meeting's facts"
+        );
+        assert_eq!(
+            count_raw(&db, "SELECT COUNT(*) FROM user_facts WHERE meeting_id = 'm1'"),
+            0,
+            "relock must purge the sealed meeting's user facts"
+        );
+        assert_eq!(
+            count_raw(
+                &db,
+                "SELECT COUNT(*) FROM assistant_interactions WHERE meeting_id = 'm1'"
+            ),
+            0,
+            "relock must purge the sealed meeting's Q&A log"
+        );
+        assert_eq!(
+            count_raw(
+                &db,
+                "SELECT COUNT(*) FROM speaker_voiceprints WHERE meeting_id = 'm1'"
+            ),
+            0,
+            "relock must purge the sealed meeting's voiceprints"
+        );
+    }
+
     /// PURGE-ON-DELETE: deleting a meeting removes its live-bullets row (explicit purge + FK).
     #[test]
     fn live_bullets_purged_on_delete_meeting() {
@@ -14552,7 +14883,7 @@ mod lock_tests {
 
         // Startup reconcile with NO locked folder ⇒ rollups SURVIVE (nothing sealed, no leak).
         seed_rollup(&db);
-        let (_, paths) = db.reblank_locked_folders_at_rest().unwrap();
+        let (_, paths, _) = db.reblank_locked_folders_at_rest().unwrap();
         assert!(paths.is_empty());
         assert_eq!(
             db.list_memory_rollups().unwrap().len(),
@@ -14562,7 +14893,7 @@ mod lock_tests {
 
         // Startup reconcile WITH a locked folder ⇒ purged.
         db.set_folder_locked("f1", true, None).unwrap();
-        let (_, paths) = db.reblank_locked_folders_at_rest().unwrap();
+        let (_, paths, _) = db.reblank_locked_folders_at_rest().unwrap();
         assert_eq!(paths.len(), 1);
         assert!(db.list_memory_rollups().unwrap().is_empty());
 
