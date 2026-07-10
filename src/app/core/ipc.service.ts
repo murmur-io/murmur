@@ -813,6 +813,21 @@ export class IpcService {
     return invoke<void>("clear_user_memory");
   }
 
+  /**
+   * Import pasted memories from another AI assistant (a ChatGPT/Claude "what I
+   * remember about you" export) into the user-memory store. Extraction runs
+   * STRICTLY on the on-device light brain model (local-or-stub, NEVER cloud —
+   * the pasted export never leaves the device); the candidates are reconciled
+   * (deduped) against the existing memory and anchored to one synthetic
+   * "Memory Import" meeting — deleting that meeting undoes the import.
+   * Resolves with the number of NEW facts added (0 on a duplicate re-import or
+   * when no on-device brain model is installed). Rejects with
+   * `AppError::InvalidArg` on empty text or when memory is disabled.
+   */
+  importMemories(text: string): Promise<number> {
+    return invoke<number>("import_memories", { text });
+  }
+
   // ── brain2 documents — expand the brain with imported .md/.txt files ────
 
   /**
