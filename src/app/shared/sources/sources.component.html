@@ -1,12 +1,25 @@
 @if (sources().length) {
   <div class="src">
     <span class="src-label">Sources</span>
-    @for (s of visible(); track s.meetingId) {
-      <a class="src-chip" [routerLink]="['/meeting', s.meetingId]">
-        <span class="src-dot"></span>
-        <span class="src-title">{{ s.title }}</span>
-        <span class="src-date">{{ fmt(s.startedAt) }}</span>
-      </a>
+    @for (s of visible(); track s.origin?.orgItemId ?? s.meetingId) {
+      @if (isOrg(s)) {
+        <!-- Org-brain hit — distinct chip (author + date), routes to the
+             read-only org-item viewer instead of a local meeting. -->
+        <a class="src-chip src-chip--org" [routerLink]="['/org-item', s.origin?.orgItemId]">
+          <span class="src-org-badge" aria-hidden="true">org</span>
+          <span class="src-title">{{ s.title }}</span>
+          @if (s.origin?.author; as author) {
+            <span class="src-author">{{ author }}</span>
+          }
+          <span class="src-date">{{ fmt(s.startedAt) }}</span>
+        </a>
+      } @else {
+        <a class="src-chip" [routerLink]="['/meeting', s.meetingId]">
+          <span class="src-dot"></span>
+          <span class="src-title">{{ s.title }}</span>
+          <span class="src-date">{{ fmt(s.startedAt) }}</span>
+        </a>
+      }
     }
     @if (sources().length > limit()) {
       <button type="button" class="src-more" (click)="toggle()">

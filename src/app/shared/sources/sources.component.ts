@@ -39,4 +39,9 @@ export class SourcesComponent {
       ? ""
       : d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
   }
+
+  /** True when a source is an org-brain hit (renders an org chip → org-item viewer). */
+  isOrg(s: VaultSource): boolean {
+    return s.origin?.kind === "org";
+  }
 }

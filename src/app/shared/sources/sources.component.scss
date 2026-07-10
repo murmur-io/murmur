@@ -44,6 +44,33 @@
   border-radius: var(--radius-pill);
   background: var(--accent);
 }
+/* Org-brain source chip — distinct accent tint + an "org" badge so a synced
+   colleague's item reads differently from a local meeting. */
+.src-chip--org {
+  background: var(--accent-soft);
+  border-color: var(--accent-ring);
+}
+.src-chip--org:hover {
+  background: var(--accent-soft);
+  border-color: var(--accent-hover);
+}
+.src-org-badge {
+  flex: 0 0 auto;
+  padding: 1px 6px;
+  border-radius: var(--radius-pill);
+  background: var(--accent);
+  color: var(--text-on-accent);
+  font-size: 9px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.src-author {
+  flex: 0 0 auto;
+  color: var(--accent-hover);
+  font-size: 11px;
+  font-weight: 600;
+}
 .src-title {
   overflow: hidden;
   text-overflow: ellipsis;

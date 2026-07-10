@@ -13,12 +13,18 @@ import { IpcService } from "../../../core/ipc.service";
 import type {
   AccountStatus,
   MyShareEntry,
+  OrgShareEntry,
+  OrgStatus,
   RecipientPreview,
 } from "../../../core/models";
 import {
   ShareVerifySheetComponent,
   type ShareVerifyMode,
 } from "../share-verify-sheet/share-verify-sheet.component";
+import {
+  OrgShareSheetComponent,
+  type OrgShareTarget,
+} from "../org-share-sheet/org-share-sheet.component";
 
 /** The step the in-flow "Share with a person" panel is showing. */
 export type PersonShareStep = "email" | "suggest-link" | "consent" | "result";
@@ -68,7 +74,7 @@ export interface LinkShareRow {
 @Component({
   selector: "app-share-panel",
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [ShareVerifySheetComponent],
+  imports: [ShareVerifySheetComponent, OrgShareSheetComponent],
   templateUrl: "./share-panel.component.html",
   styleUrl: "./share-panel.component.scss",
 })
@@ -278,6 +284,33 @@ export class SharePanelComponent {
   readonly personResult = signal<string | null>(null);
   readonly verifyMode = signal<ShareVerifyMode | null>(null);
 
+  // --- Org Brain (Shared Brain v1) ------------------------------------------
+  /** The user's org membership + sync state; `null` when in no org (hides the section). */
+  private readonly orgStatus = signal<OrgStatus | null>(null);
+  readonly org = this.orgStatus.asReadonly();
+  /** This user's outgoing org shares (drives the "In Org Brain" state for THIS meeting). */
+  private readonly orgShares = signal<OrgShareEntry[]>([]);
+  /** True while the org-share PREVIEW SHEET is open (the confirm flow). */
+  readonly orgSheetOpen = signal(false);
+
+  /** The org-share sheet target (this meeting), passed into the preview sheet. */
+  readonly orgTarget = computed<OrgShareTarget>(() => ({
+    kind: "meeting",
+    id: this.meetingId() ?? "",
+  }));
+
+  /**
+   * Whether THIS meeting is already in the org brain — matched by an active
+   * (non-revoked) org share. The org-share list is content-free (item ids), so a
+   * true match needs a live badge but we can't join it to a meeting id from the
+   * FE alone; the backend `list_org_shares` returns THIS user's shares and the
+   * detail header's badge wires to that. Here we only show the CTA-vs-shared
+   * state for the whole section (see the template's active-count line).
+   */
+  readonly orgActiveShareCount = computed(
+    () => this.orgShares().filter((s) => s.state !== "revoked").length,
+  );
+
   constructor() {
     // Lazy-load account status + shares whenever the Share tab is active for a
     // loaded meeting (T1 — async IPC-on-signal-change effect writes loading/error).
@@ -331,12 +364,65 @@ export class SharePanelComponent {
       } else {
         this.myShares.set([]);
       }
+      // Org Brain state (best-effort, non-blocking): the section only appears
+      // when the user is in an org. A failure leaves it hidden — never breaks
+      // the link/person share UI above.
+      void this.refreshOrg(id);
     } catch (e) {
       this.listError.set(String(e));
       this.gateError.set(String(e));
     } finally {
       this.loading.set(false);
     }
+  }
+
+  /** Load the org status + this user's org shares (stale-guarded on the meeting id). */
+  private async refreshOrg(id: string): Promise<void> {
+    try {
+      const status = await this.ipc.orgStatus();
+      if (this.meetingId() !== id) {
+        return;
+      }
+      this.orgStatus.set(status);
+      if (status) {
+        const shares = await this.ipc.listOrgShares();
+        if (this.meetingId() !== id) {
+          return;
+        }
+        this.orgShares.set(shares);
+      } else {
+        this.orgShares.set([]);
+      }
+    } catch {
+      // Org unavailable (older backend / not joined) — hide the section.
+      this.orgStatus.set(null);
+      this.orgShares.set([]);
+    }
+  }
+
+  // --- Org Brain handlers ---------------------------------------------------
+
+  /** Open the "Add to Org Brain" preview sheet (disabled while editing). */
+  openOrgSheet(): void {
+    if (this.editing() || !this.meetingId()) {
+      return;
+    }
+    this.orgSheetOpen.set(true);
+  }
+
+  /** Close the org-share sheet (cancel / backdrop / Escape) — nothing left the device. */
+  closeOrgSheet(): void {
+    this.orgSheetOpen.set(false);
+  }
+
+  /** The sheet published successfully → close it, refresh org state, ping the shell. */
+  async onOrgShared(): Promise<void> {
+    this.orgSheetOpen.set(false);
+    const id = this.meetingId();
+    if (id) {
+      await this.refreshOrg(id);
+    }
+    this.changed.emit();
   }
 
   /**
@@ -569,6 +655,7 @@ export class SharePanelComponent {
     this.sessionShares.set(new Map());
     this.confirmingRevokeId.set(null);
     this.copiedRowId.set(null);
+    this.orgSheetOpen.set(false);
     this.closePerson();
   }
 
