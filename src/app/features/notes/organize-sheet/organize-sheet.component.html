@@ -1,0 +1,100 @@
+<!-- Scrim carries the dialog semantics + keyboard escape alongside the
+     backdrop-click dismiss, so the (click) handler has a keyboard equivalent
+     (a11y) — mirrors the quick-search spotlight scrim. -->
+<div
+  class="scrim"
+  role="dialog"
+  aria-modal="true"
+  aria-label="Review the auto-organize plan"
+  tabindex="-1"
+  (click)="onScrimClick($event)"
+  (keydown.escape)="cancelled.emit()"
+>
+  <div #panel class="sheet" tabindex="-1">
+    @if (isEmpty()) {
+      <!-- Null or empty plan: nothing to move. -->
+      <div class="empty-state organize-empty">
+        <h3 class="empty-title">Everything's already well organized</h3>
+        <p class="empty-body text-secondary">
+          No notes need moving — the folders already match their content.
+        </p>
+        <button type="button" class="btn btn-primary" (click)="cancelled.emit()">
+          Close
+        </button>
+      </div>
+    } @else {
+      <header class="sheet-head">
+        <div class="sheet-head-copy">
+          <h3 class="sheet-title">Auto-organize notes</h3>
+          <p class="sheet-summary text-secondary">
+            {{ selectedCount() }}
+            {{ selectedCount() === 1 ? "note" : "notes" }} →
+            {{ targetFolderCount() }}
+            {{ targetFolderCount() === 1 ? "folder" : "folders" }}
+          </p>
+        </div>
+        <button
+          type="button"
+          class="btn btn-ghost select-all-btn"
+          (click)="toggleSelectAll()"
+        >
+          {{ allSelected() ? "Select none" : "Select all" }}
+        </button>
+      </header>
+
+      <ul class="move-list">
+        @for (move of moves(); track move.noteId) {
+          <li class="move-row" [class.is-excluded]="!isIncluded(move.noteId)">
+            <label class="move-toggle">
+              <input
+                type="checkbox"
+                class="switch"
+                [checked]="isIncluded(move.noteId)"
+                [attr.aria-label]="'Include ' + move.title"
+                (change)="toggleMove(move.noteId)"
+              />
+            </label>
+
+            <div class="move-body">
+              <span class="move-title">{{ move.title }}</span>
+              <span class="move-path">
+                <span class="move-from">{{ move.fromFolder }}</span>
+                <span class="move-arrow" aria-hidden="true">→</span>
+                <span class="move-to">{{ move.toFolder }}</span>
+                @if (move.toFolderId === null) {
+                  <span class="pill is-accent move-new">NEW</span>
+                }
+              </span>
+              <span class="move-reason text-secondary">{{ move.reason }}</span>
+            </div>
+          </li>
+        }
+      </ul>
+
+      <footer class="sheet-actions">
+        <button
+          type="button"
+          class="btn btn-ghost"
+          (click)="cancelled.emit()"
+          [disabled]="busy()"
+        >
+          Cancel
+        </button>
+        <button
+          type="button"
+          class="btn btn-primary"
+          (click)="onApply()"
+          [disabled]="busy() || selectedCount() === 0"
+        >
+          @if (busy()) {
+            <span class="spin-ring" aria-hidden="true"></span>
+            Applying…
+          } @else {
+            Apply
+            {{ selectedCount() > 0 ? "(" + selectedCount() + ")" : "" }}
+          }
+        </button>
+      </footer>
+    }
+  </div>
+</div>

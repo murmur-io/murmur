@@ -192,6 +192,12 @@ export class SettingsStore {
     roleLiveConnection: "",
     roleLiveModel: "",
     roleLiveEffort: "",
+    // Notes feature — the three in-note selection-assistant actions. All default
+    // TRUE and round-tripped on every save so a settings save never silently
+    // disables one (mirrors the proactiveHintsEnabled/userMemoryEnabled pattern).
+    noteAssistRefine: true,
+    noteAssistShorten: true,
+    noteAssistEnhance: true,
   });
   readonly keyControl = new FormControl("", { nonNullable: true });
   /** BYO Brave Search API key input (web-search connector). Cleared after save. */
@@ -829,6 +835,18 @@ export class SettingsStore {
   );
 
   /**
+   * The resolved Notes model label for the Note-assistant clarifying line —
+   * in-note Brain actions ride `Role::Notes`, so this is the model that answers
+   * them. Sourced from the backend-resolved "what runs where" map (the `notes`
+   * row's `model`, the authoritative truth); null until the map loads so the
+   * copy degrades to the plain sentence rather than showing a stale guess.
+   */
+  readonly noteAssistModelLabel = computed<string | null>(() => {
+    const row = this.aiMap().find((r) => r.job === "notes");
+    return row?.model?.trim() ? row.model : null;
+  });
+
+  /**
    * Ask/Live-row Inherit summary — an honest mirror of the backend resolver:
    * with the role key empty, Ask/Live fall back to the legacy `brainBackend`
    * mapping, NOT unconditionally to the Default AI. Showing "Follows Default
@@ -1284,6 +1302,11 @@ export class SettingsStore {
         roleLiveConnection: cfg.roleLiveConnection ?? "",
         roleLiveModel: cfg.roleLiveModel ?? "",
         roleLiveEffort: cfg.roleLiveEffort ?? "",
+        // Notes feature — note-assistant action toggles, default TRUE (an absent
+        // value from a backend that hasn't shipped these yet reads as ON).
+        noteAssistRefine: cfg.noteAssistRefine ?? true,
+        noteAssistShorten: cfg.noteAssistShorten ?? true,
+        noteAssistEnhance: cfg.noteAssistEnhance ?? true,
       });
       this._loadedBrainBackend = (cfg.brainBackend ?? "cloud") as BrainBackend;
       // Prefetch the model catalogs the loaded config already renders selects
@@ -2009,6 +2032,11 @@ export class SettingsStore {
       roleLiveConnection: v.roleLiveConnection,
       roleLiveModel: v.roleLiveModel,
       roleLiveEffort: v.roleLiveEffort,
+      // Notes feature — the three note-assistant action toggles ride every save
+      // like the other feature flags, so a settings save never disables one.
+      noteAssistRefine: v.noteAssistRefine,
+      noteAssistShorten: v.noteAssistShorten,
+      noteAssistEnhance: v.noteAssistEnhance,
       // M3-CLIENT sharing — preserve-only: carry the snapshot back unchanged so
       // the shell Save never clears the sharing server / share-egress consent
       // (the Account section is the sole owner of these values).

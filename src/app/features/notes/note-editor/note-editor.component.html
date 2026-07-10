@@ -1,0 +1,483 @@
+<section class="editor">
+  <!-- Full-viewport dismissal backdrop for the header menus (click-outside).
+       A real focusable button so the a11y lint + keyboard users are satisfied. -->
+  @if (menu() !== "none") {
+    <button
+      type="button"
+      class="menu-backdrop"
+      aria-label="Close menu"
+      (click)="closeMenus()"
+    ></button>
+  }
+
+  <!-- ===== Sticky header: back · breadcrumb+Move · Edit/Preview · Share · ⋯ ===== -->
+  <header class="editor-head">
+    <button
+      type="button"
+      class="rail-back"
+      (click)="back()"
+      aria-label="Back to Notes"
+    >
+      <svg
+        class="rail-back-icon"
+        viewBox="0 0 16 16"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="1.6"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+        aria-hidden="true"
+      >
+        <path d="M9.5 3.5 5 8l4.5 4.5" />
+      </svg>
+      <span class="rail-back-label">Notes</span>
+    </button>
+
+    @if (note(); as doc) {
+      @if (!doc.locked) {
+        <!-- Folder breadcrumb + Move menu (opaque overlay, T3). -->
+        <div class="head-crumb">
+          <button
+            type="button"
+            class="crumb-btn"
+            (click)="toggleMenu('move')"
+            [attr.aria-expanded]="menu() === 'move'"
+          >
+            <svg viewBox="0 0 16 16" width="13" height="13" fill="none" aria-hidden="true">
+              <path
+                d="M2 4.5A1.5 1.5 0 0 1 3.5 3h3l1.5 1.5h4.5A1.5 1.5 0 0 1 14 6v5.5A1.5 1.5 0 0 1 12.5 13h-9A1.5 1.5 0 0 1 2 11.5v-7Z"
+                stroke="currentColor"
+                stroke-width="1.3"
+              />
+            </svg>
+            {{ breadcrumb() }}
+            <svg viewBox="0 0 16 16" width="11" height="11" fill="none" aria-hidden="true">
+              <path d="M4 6l4 4 4-4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" />
+            </svg>
+          </button>
+          @if (menu() === "move") {
+            <div class="menu head-menu" role="menu" aria-label="Move to folder">
+              <p class="menu-group-label">Move to…</p>
+              @for (folder of noteFolders(); track folder.id) {
+                <button
+                  type="button"
+                  class="menu-item"
+                  role="menuitem"
+                  [disabled]="folder.id === doc.folderId"
+                  (click)="moveTo(folder.id)"
+                >
+                  {{ folder.name }}
+                  @if (folder.id === doc.folderId) {
+                    <span class="menu-here">Here</span>
+                  }
+                </button>
+              } @empty {
+                <p class="menu-empty">No folders yet.</p>
+              }
+            </div>
+          }
+        </div>
+
+        <span class="head-spacer"></span>
+
+        <!-- Autosave indicator. -->
+        <span class="save-state" [attr.data-state]="saveState()" aria-live="polite">
+          @switch (saveState()) {
+            @case ("saving") {
+              <span class="save-spin" aria-hidden="true"></span> Saving…
+            }
+            @case ("saved") {
+              <span class="save-check" aria-hidden="true">✓</span> Saved
+            }
+            @case ("error") {
+              <button type="button" class="save-retry" (click)="retrySave()">
+                Save failed · Retry
+              </button>
+            }
+          }
+        </span>
+
+        <!-- Edit / Preview toggle. -->
+        <div class="seg head-seg" role="group" aria-label="Edit or preview">
+          <button
+            type="button"
+            class="seg-btn"
+            [class.is-active]="!preview()"
+            (click)="setPreview(false)"
+          >
+            Edit
+          </button>
+          <button
+            type="button"
+            class="seg-btn"
+            [class.is-active]="preview()"
+            (click)="setPreview(true)"
+          >
+            Preview
+          </button>
+        </div>
+
+        <button
+          type="button"
+          class="btn btn-ghost head-btn"
+          [class.is-shared]="doc.shared"
+          (click)="share()"
+        >
+          @if (doc.shared) {
+            <span class="share-dot" aria-hidden="true"></span>
+          }
+          Share
+        </button>
+
+        <!-- ⋯ overflow (opaque overlay). -->
+        <div class="head-more">
+          <button
+            type="button"
+            class="crumb-btn is-icon"
+            (click)="toggleMenu('more')"
+            aria-label="More actions"
+            [attr.aria-expanded]="menu() === 'more'"
+          >
+            <svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor" aria-hidden="true">
+              <circle cx="3" cy="8" r="1.4" />
+              <circle cx="8" cy="8" r="1.4" />
+              <circle cx="13" cy="8" r="1.4" />
+            </svg>
+          </button>
+          @if (menu() === "more") {
+            <div class="menu head-menu is-right" role="menu">
+              @if (doc.shared) {
+                <p class="menu-group-label">Shared</p>
+              }
+              <button type="button" class="menu-item" role="menuitem" (click)="exportNote()">
+                Save to vault &amp; reveal
+              </button>
+              @if (doc.exportedPath) {
+                <p class="menu-path">{{ doc.exportedPath }}</p>
+              }
+              <div class="menu-group">
+                @if (!confirmingDelete()) {
+                  <button
+                    type="button"
+                    class="menu-item menu-item-danger"
+                    role="menuitem"
+                    (click)="askDelete()"
+                  >
+                    Delete note
+                  </button>
+                } @else {
+                  <p class="menu-confirm">Delete this note permanently?</p>
+                  <div class="menu-confirm-row">
+                    <button type="button" class="btn btn-danger menu-confirm-btn" (click)="doDelete()">
+                      Delete
+                    </button>
+                    <button type="button" class="btn btn-ghost menu-confirm-btn" (click)="cancelDelete()">
+                      Cancel
+                    </button>
+                  </div>
+                }
+              </div>
+            </div>
+          }
+        </div>
+      }
+    }
+  </header>
+
+  <!-- ===== Body ===== -->
+  <div class="editor-body">
+    @if (loading()) {
+      <p class="editor-status">Loading note…</p>
+    } @else if (error()) {
+      <div class="empty-state">
+        <h3 class="empty-title">Couldn’t open this note</h3>
+        <p class="empty-body">{{ error() }}</p>
+        <button type="button" class="btn btn-ghost" (click)="back()">
+          Back to Notes
+        </button>
+      </div>
+    } @else if (note(); as doc) {
+      @if (doc.locked) {
+        <!-- Lock gate — sealed-not-unlocked note. Body masked server-side. -->
+        <div class="card empty-state lock-gate" role="group">
+          <span class="lock-glyph" aria-hidden="true">
+            <svg viewBox="0 0 24 24" width="30" height="30" fill="none">
+              <rect x="5" y="11" width="14" height="9" rx="2" stroke="currentColor" stroke-width="1.6" />
+              <path d="M8 11V8a4 4 0 0 1 8 0v3" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
+            </svg>
+          </span>
+          <h3 class="empty-title">This note is locked</h3>
+          <p class="empty-body">
+            It lives in a locked folder. Unlock to read and edit it.
+          </p>
+          <button
+            type="button"
+            class="btn btn-primary lock-gate-btn"
+            (click)="unlock()"
+            [disabled]="unlocking()"
+          >
+            {{ unlocking() ? "Unlocking…" : "🔒 Unlock (Touch ID)" }}
+          </button>
+        </div>
+      } @else {
+        <article class="note-doc">
+          <!-- Title -->
+          <input
+            #titleInput
+            type="text"
+            class="note-title-input"
+            placeholder="Untitled"
+            aria-label="Note title"
+            autocapitalize="sentences"
+            autocomplete="off"
+            spellcheck="true"
+            [value]="title()"
+            (input)="onTitleInput($event)"
+            (blur)="onBlur()"
+          />
+
+          <!-- Properties bar (collapsible). -->
+          <div class="panel-card props" [class.is-open]="propsOpen()">
+            <button
+              type="button"
+              class="props-toggle"
+              (click)="toggleProps()"
+              [attr.aria-expanded]="propsOpen()"
+            >
+              <svg
+                class="props-chevron"
+                viewBox="0 0 16 16"
+                width="12"
+                height="12"
+                fill="none"
+                aria-hidden="true"
+              >
+                <path d="M6 4l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
+              </svg>
+              Properties
+              @if (!propsOpen() && (tags().length > 0 || propertyRows().length > 0)) {
+                <span class="props-count">{{ tags().length + propertyRows().length }}</span>
+              }
+            </button>
+
+            @if (propsOpen()) {
+              <div class="props-body">
+                <!-- Tags row -->
+                <div class="prop-row">
+                  <span class="prop-key">tags</span>
+                  <div class="prop-tags">
+                    @for (tag of tags(); track tag) {
+                      <span class="pill prop-tag">
+                        #{{ tag }}
+                        <button
+                          type="button"
+                          class="prop-tag-x"
+                          (click)="removeTag(tag)"
+                          [attr.aria-label]="'Remove tag ' + tag"
+                        >
+                          ×
+                        </button>
+                      </span>
+                    }
+                    <div class="tag-add">
+                      <input
+                        #tagInput
+                        type="text"
+                        class="prop-input"
+                        placeholder="Add tag"
+                        aria-label="Add tag"
+                        autocapitalize="off"
+                        autocomplete="off"
+                        [value]="tagDraft()"
+                        (input)="onTagInput($event)"
+                        (keydown.enter)="addTag()"
+                      />
+                      @if (tagSuggestions().length > 0 && tagDraft().length > 0) {
+                        <div class="menu tag-suggest" role="listbox">
+                          @for (s of tagSuggestions(); track s) {
+                            <button
+                              type="button"
+                              class="menu-item"
+                              role="option"
+                              aria-selected="false"
+                              (click)="addTag(s)"
+                            >
+                              #{{ s }}
+                            </button>
+                          }
+                        </div>
+                      }
+                    </div>
+                  </div>
+                </div>
+
+                <!-- Custom properties -->
+                @for (row of propertyRows(); track row.key) {
+                  <div class="prop-row">
+                    <span class="prop-key">{{ row.key }}</span>
+                    <input
+                      type="text"
+                      class="prop-input prop-value"
+                      [value]="row.value"
+                      [attr.aria-label]="row.key + ' value'"
+                      (input)="editProp(row.key, $event)"
+                      (blur)="onBlur()"
+                    />
+                    <button
+                      type="button"
+                      class="prop-remove"
+                      (click)="removeProp(row.key)"
+                      [attr.aria-label]="'Remove property ' + row.key"
+                    >
+                      ×
+                    </button>
+                  </div>
+                }
+
+                <!-- Add property -->
+                @if (addingProp()) {
+                  <div class="prop-row prop-add">
+                    <input
+                      type="text"
+                      class="prop-input prop-add-key"
+                      placeholder="key"
+                      aria-label="Property key"
+                      [value]="propKeyDraft()"
+                      (input)="onPropKeyInput($event)"
+                    />
+                    <input
+                      type="text"
+                      class="prop-input prop-value"
+                      placeholder="value"
+                      aria-label="Property value"
+                      [value]="propValDraft()"
+                      (input)="onPropValInput($event)"
+                      (keydown.enter)="commitProp()"
+                    />
+                    <button type="button" class="btn btn-ghost prop-add-btn" (click)="commitProp()">
+                      Add
+                    </button>
+                    <button type="button" class="prop-remove" (click)="cancelAddProp()" aria-label="Cancel">
+                      ×
+                    </button>
+                  </div>
+                } @else {
+                  <div class="prop-add-row">
+                    <button type="button" class="prop-add-chip" (click)="startAddProp()">
+                      + Add property
+                    </button>
+                    <button type="button" class="prop-add-chip is-quiet" (click)="addPropPreset('status')">
+                      status
+                    </button>
+                    <button type="button" class="prop-add-chip is-quiet" (click)="addPropPreset('date')">
+                      date
+                    </button>
+                    <button type="button" class="prop-add-chip is-quiet" (click)="addPropPreset('aliases')">
+                      aliases
+                    </button>
+                  </div>
+                }
+              </div>
+            }
+          </div>
+
+          <!-- Formatting toolbar (sticky) — hidden in preview. -->
+          @if (!preview()) {
+            <div class="toolbar" role="toolbar" aria-label="Formatting">
+              <button type="button" class="tool" title="Heading 1" (click)="format('h1')">H1</button>
+              <button type="button" class="tool" title="Heading 2" (click)="format('h2')">H2</button>
+              <button type="button" class="tool" title="Heading 3" (click)="format('h3')">H3</button>
+              <span class="tool-sep"></span>
+              <button type="button" class="tool" title="Bold (⌘B)" (click)="format('bold')"><b>B</b></button>
+              <button type="button" class="tool" title="Italic (⌘I)" (click)="format('italic')"><i>I</i></button>
+              <button type="button" class="tool" title="Strikethrough" (click)="format('strike')"><s>S</s></button>
+              <button type="button" class="tool" title="Inline code" (click)="format('code')">&lt;/&gt;</button>
+              <span class="tool-sep"></span>
+              <button type="button" class="tool" title="Bullet list" (click)="format('ul')">•</button>
+              <button type="button" class="tool" title="Numbered list" (click)="format('ol')">1.</button>
+              <button type="button" class="tool" title="Checklist" (click)="format('check')">☐</button>
+              <button type="button" class="tool" title="Quote" (click)="format('quote')">❝</button>
+              <button type="button" class="tool" title="Code block" (click)="format('codeblock')">▤</button>
+              <span class="tool-sep"></span>
+              <button type="button" class="tool" title="Link" (click)="format('link')">🔗</button>
+              <button type="button" class="tool" title="Wikilink" (click)="format('wikilink')">[[ ]]</button>
+              <button type="button" class="tool" title="Divider" (click)="format('divider')">—</button>
+            </div>
+          }
+
+          <!-- Body: preview (cached computed) OR the source-of-truth textarea. -->
+          @if (preview()) {
+            <div class="note-preview">
+              <app-markdown [markdown]="previewMarkdown()" />
+            </div>
+          } @else {
+            <div class="body-wrap">
+              <textarea
+                #bodyArea
+                class="body-area"
+                placeholder="Start writing… Type / for blocks."
+                aria-label="Note body"
+                autocapitalize="sentences"
+                autocomplete="off"
+                spellcheck="true"
+                [value]="body()"
+                (input)="onBodyInput($event)"
+                (keydown)="onBodyKeydown($event)"
+                (mouseup)="onBodySelect()"
+                (keyup)="onBodySelect()"
+                (select)="onBodySelect()"
+                (blur)="onBlur()"
+              ></textarea>
+
+              <!-- Slash menu (opaque overlay, T3). -->
+              @if (slashOpen()) {
+                <div class="menu slash-menu" role="listbox" aria-label="Insert block">
+                  @for (item of slashItems; track item.id; let i = $index) {
+                    <button
+                      type="button"
+                      class="menu-item"
+                      role="option"
+                      [class.is-active]="i === slashIndex()"
+                      [attr.aria-selected]="i === slashIndex()"
+                      (click)="pickSlash(item)"
+                    >
+                      {{ item.label }}
+                    </button>
+                  }
+                </div>
+              }
+            </div>
+          }
+        </article>
+      }
+    }
+  </div>
+
+  <!-- ===== Selection Brain popover (FP3) ===== -->
+  @if (popoverSel(); as sel) {
+    @if (note(); as doc) {
+      <app-note-brain-popover
+        [noteId]="doc.id"
+        [selection]="sel"
+        [toggles]="assistToggles()"
+        (accepted)="applyEdit($event)"
+        (dismiss)="closePopover()"
+      />
+    }
+  }
+
+  <!-- ===== Share modal (WP6) — link-share this note, opaque overlay (T3).
+       Never shown for a locked note (share() no-ops + button is hidden). ===== -->
+  @if (shareOpen()) {
+    @if (note(); as doc) {
+      @if (!doc.locked) {
+        <app-note-share-panel
+          [noteId]="doc.id"
+          (closed)="closeShare()"
+          (changed)="onShareChanged()"
+          (setupSharing)="goToSharingSettings()"
+        />
+      }
+    }
+  }
+</section>

@@ -4,6 +4,7 @@ import { ChangeDetectionStrategy, Component, input } from "@angular/core";
 export type ShellIcon =
   | "record"
   | "meetings"
+  | "notes"
   | "analytics"
   | "graph"
   | "people"

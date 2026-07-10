@@ -49,6 +49,12 @@ import type {
   ModelDownloadProgress,
   NerDownloadProgress,
   NoteDto,
+  NoteSummary,
+  NoteDoc,
+  NoteFolder,
+  NoteAssistRequest,
+  NoteAssistResult,
+  OrganizePlan,
   PersonCard,
   PinResult,
   PruneSummary,
@@ -414,6 +420,32 @@ export class IpcService {
       expiresDays: opts?.expiresDays,
       password: opts?.password,
       maxDownloads: opts?.maxDownloads,
+    });
+  }
+
+  /**
+   * Create a zero-knowledge link share of an AUTHORED NOTE (`documents(kind='note')`),
+   * returning the share URL. The distinct command name `share_note_to_link_doc` avoids
+   * the meeting `share_note_to_link` collision (the note is anchored on its
+   * `document_id`, not a meeting). Same E2EE contract as the meeting path: the note is
+   * cleaned + sealed on-device, only ciphertext + wrapped keys leave, and the URL's
+   * `#…` fragment (decryption key `L`) is assembled locally and NEVER reaches the server
+   * (never log the returned URL). Refuses (`Locked`) a sealed-not-unlocked note's folder;
+   * requires login + share consent. `expiresDays`/`password`/`maxDownloads` are all
+   * optional (null ⇒ omit); a note's shares are the {@link listMyShares} rows whose
+   * `documentId` matches this note id.
+   */
+  shareNoteToLinkDoc(
+    id: string,
+    expiresDays: number | null,
+    password: string | null,
+    maxDownloads: number | null,
+  ): Promise<string> {
+    return invoke<string>("share_note_to_link_doc", {
+      id,
+      expiresDays,
+      password,
+      maxDownloads,
     });
   }
 
@@ -1503,6 +1535,135 @@ export class IpcService {
   /** Permanently remove a folder's lock: decrypt to plaintext + re-export to the vault. */
   removeLock(folderId: string): Promise<void> {
     return invoke<void>("remove_lock", { folderId });
+  }
+
+  // ── Notes — first-class authored notes (documents kind='note') ──────────
+  // One typed method per command in docs/notes-feature/DESIGN.md §2. Every
+  // read/list/export/assistant path is GATED backend-side on the note's
+  // folder-unlock — a sealed-and-not-session-unlocked note is MASKED (title
+  // "🔒 Locked", no body/snippet/tags), never leaked per-row. Args are camelCase;
+  // Tauri maps them onto the snake_case Rust params.
+
+  /**
+   * Create an empty note in `folderId` (null ⇒ the default "Notes" folder).
+   * Returns the new note id — navigate to `/notes/:id` to open the editor.
+   */
+  createNote(folderId: string | null, title: string): Promise<string> {
+    return invoke<string>("create_note", { folderId, title });
+  }
+
+  /**
+   * Read ONE note in full for the editor. GATED: a sealed-and-not-session-unlocked
+   * note returns a MASKED {@link NoteDoc} (`locked: true`, title "🔒 Locked", empty
+   * markdown/tags/properties) — render the lock gate, not the body.
+   */
+  getNote(id: string): Promise<NoteDoc> {
+    return invoke<NoteDoc>("get_note", { id });
+  }
+
+  /**
+   * Persist a note's title + FULL markdown (incl. front-matter), re-index it for
+   * the brain, re-export the vault `.md`, and bump `updatedAt`. Write-gated:
+   * rejects (`Locked`) for a sealed-and-not-session-unlocked note. Returns the
+   * reconciled {@link NoteDoc}.
+   *
+   * NAME NOTE: the meeting-note editor already owns `updateNote(meetingId,
+   * markdown)` (a different Tauri command), so the authored-note editor's method
+   * is `updateNoteDoc` to avoid a TS method collision — the editor agent binds to
+   * THIS one. (Same reason `moveNoteDoc` / `exportNoteDoc` are suffixed: the
+   * meeting `moveNote` / `exportNote` methods pre-exist.)
+   */
+  updateNoteDoc(id: string, title: string, markdown: string): Promise<NoteDoc> {
+    return invoke<NoteDoc>("update_note_doc", { id, title, markdown });
+  }
+
+  /**
+   * List notes in `folderId` (null ⇒ all VISIBLE notes across note-folders). GATED
+   * IN THE QUERY: a sealed-and-not-session-unlocked note is masked (title
+   * "🔒 Locked", empty snippet/tags) — never a per-row skip that could leak a title.
+   */
+  listNotes(folderId: string | null): Promise<NoteSummary[]> {
+    return invoke<NoteSummary[]>("list_notes", { folderId });
+  }
+
+  /**
+   * Move a note into `folderId` (re-exports it under the new folder's vault path).
+   * Gated on BOTH sides — rejects (`Locked`) when the source or target folder is
+   * sealed-and-not-session-unlocked.
+   */
+  moveNoteDoc(id: string, folderId: string): Promise<void> {
+    return invoke<void>("move_note_doc", { id, folderId });
+  }
+
+  /**
+   * Permanently delete a note (cascade-deletes its chunks + vectors + vault `.md`).
+   * GATED: a sealed-and-not-session-unlocked folder is refused (`Locked`); an
+   * unknown id is an idempotent no-op.
+   */
+  deleteNote(id: string): Promise<void> {
+    return invoke<void>("delete_note", { id });
+  }
+
+  /**
+   * (Re)write a note's vault `.md` under its note-folder path and return the
+   * written path. GATED: rejects (`Locked`) for a sealed-and-not-session-unlocked
+   * note.
+   */
+  exportNoteDoc(id: string): Promise<string> {
+    return invoke<string>("export_note_doc", { id });
+  }
+
+  /**
+   * The selection Brain-assistant action: refine / shorten (replace the selection)
+   * or enhance (retrieve related brain context + propose an ADDITIVE passage with
+   * citations). Routes via `provider_for(Role::Notes)` (local Qwen vs cloud Claude
+   * per posture, redaction firewall + egress ledger for free). The result carries
+   * the resolved `modelLabel`/`mode`/`redacted` for the popover mode chip.
+   */
+  noteAssistantAction(req: NoteAssistRequest): Promise<NoteAssistResult> {
+    return invoke<NoteAssistResult>("note_assistant_action", { req });
+  }
+
+  /**
+   * Propose per-note folder assignments by content (auto-organize step 1). Returns
+   * an {@link OrganizePlan} of moves with reasons; `folderId` (null ⇒ all notes)
+   * scopes the run. Non-destructive — nothing moves until {@link applyOrganizePlan}.
+   */
+  planOrganizeNotes(folderId: string | null): Promise<OrganizePlan> {
+    return invoke<OrganizePlan>("plan_organize_notes", { folderId });
+  }
+
+  /**
+   * Apply an auto-organize plan (step 2): create the needed note-folders + move the
+   * notes (gated; re-exports). Confirm-before-apply on the FE.
+   */
+  applyOrganizePlan(plan: OrganizePlan): Promise<void> {
+    return invoke<void>("apply_organize_plan", { plan });
+  }
+
+  /** The note-kind folder list (`kind='note'` only). */
+  listNoteFolders(): Promise<NoteFolder[]> {
+    return invoke<NoteFolder[]>("list_note_folders");
+  }
+
+  /** Create a note-kind folder under an optional parent. Returns the new {@link NoteFolder}. */
+  createNoteFolder(name: string, parentId: string | null): Promise<NoteFolder> {
+    return invoke<NoteFolder>("create_note_folder", { name, parentId });
+  }
+
+  /** Rename a note-kind folder (metadata + vault subdir). */
+  renameNoteFolder(id: string, name: string): Promise<void> {
+    return invoke<void>("rename_note_folder", { id, name });
+  }
+
+  /** Delete a note-kind folder (its notes move to the default note-folder). */
+  deleteNoteFolder(id: string): Promise<void> {
+    return invoke<void>("delete_note_folder", { id });
+  }
+
+  /** Re-parent a note-kind folder (null ⇒ the Notes root). */
+  moveNoteFolder(id: string, parentId: string | null): Promise<void> {
+    return invoke<void>("move_note_folder", { id, parentId });
   }
 
   /**
