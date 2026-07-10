@@ -288,6 +288,7 @@ fn pack_meetings(
             meeting_id: m.id,
             title,
             started_at: m.started_at,
+            origin: None,
         });
     }
 

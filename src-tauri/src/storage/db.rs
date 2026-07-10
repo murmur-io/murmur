@@ -12,7 +12,7 @@ use crate::storage::models::{
     Analytics, AssistantInteraction, AssistantThreadRow, Commitment, CorrectionRecord, DayCount,
     DocChunkHit, DocumentInfo, EntityDetail, EntityKind, EntityNeighbor, Folder, GraphData,
     GraphEdge, GraphEntity, GraphNode, Meeting, MeetingStatus, NoteFolder, NoteRecord, NoteSummary,
-    PendingShareAccept, PersonCard, RecipeRecord, SearchHit, StatusCount, VaultSource,
+    OrgChunkHit, PendingShareAccept, PersonCard, RecipeRecord, SearchHit, StatusCount, VaultSource,
 };
 use crate::transcribe::types::Segment;
 
@@ -577,6 +577,12 @@ impl Db {
         // `outbound_shares`). NOT the org_items/chunks ingest tables (a later slice owns those).
         // Additive + guarded so migrate() stays idempotent.
         Self::migrate_orgs(&conn)?;
+        // M6 Shared Brain (sync/ingest slice) — the DECRYPTED-REPLICA + local RETRIEVAL tables for
+        // the org feed: `org_items` (the decrypted replica of each feed item), `org_chunks` (its
+        // plaintext chunks), `org_vec_chunks` (vec0 **int8[EMBED_DIM]** KNN — 3.7× smaller than f32,
+        // holds in-budget at 300k chunks per the scale spike), and `fts_org_chunks` (keyword leg).
+        // Additive + guarded so migrate() stays idempotent. Runs AFTER migrate_orgs.
+        Self::migrate_org_ingest(&conn)?;
         // Phase 2a — vector retrieval layer (note_chunks + the vec0 KNN table). Additive + guarded
         // (CREATE TABLE / CREATE VIRTUAL TABLE IF NOT EXISTS) so migrate() stays idempotent.
         Self::migrate_vector(&conn)?;
@@ -1364,6 +1370,89 @@ impl Db {
              CREATE INDEX IF NOT EXISTS idx_org_shares_org ON org_shares(org_id);
              CREATE INDEX IF NOT EXISTS idx_org_shares_state ON org_shares(state);
              CREATE INDEX IF NOT EXISTS idx_org_shares_item ON org_shares(item_id);",
+        )
+        .map_err(map_err)
+    }
+
+    /// M6 Shared Brain (sync/ingest slice) — the local DECRYPTED REPLICA of the org feed + its
+    /// RETRIEVAL layer. Additive + guarded so migrate() stays idempotent.
+    ///
+    /// - `org_items` — one row per feed item, keyed by the SERVER item id. The decrypted
+    ///   `title`/`markdown`/`author_hint` (opened from the OCK-sealed envelope), the feed `seq`
+    ///   cursor position, the item `rev`/`generation`, and a `content_sha256` (the PLAINTEXT hash,
+    ///   for self-share dedup). `tombstoned` = the item was revoked at the server (its chunks are
+    ///   evicted but the row is kept as a tombstone so a re-pull is idempotent).
+    /// - `org_chunks` — plaintext chunks DERIVED from an item's markdown (the embed source + snippet
+    ///   store), 1:1 with `org_vec_chunks` by `id`. CASCADE on the parent item.
+    /// - `org_vec_chunks` — the vec0 KNN table, **`int8[EMBED_DIM]`** (the scale spike's load-bearing
+    ///   finding: int8 is 3.7× smaller than f32 and holds a 300k-chunk org in the 100–400 ms query
+    ///   budget). Values are scalar-quantized from the f32 embedding and bound via `vec_int8(?)`.
+    /// - `fts_org_chunks` — external-content FTS5 over `org_chunks.text`, same
+    ///   `unicode61 remove_diacritics 2` tokenizer + `_ai`/`_ad`/`_au` trigger trio as the meeting/doc
+    ///   indexes, so org text is keyword-retrievable on a DEFAULT install (no e5 model).
+    ///
+    /// LOCK-DOMAIN NOTE (spec §"Trust model"): org items are DELIBERATELY org-disclosed content living
+    /// OUTSIDE the folder-lock domain, in these dedicated `org_*` tables — no folder seal/gate applies
+    /// (there is no sealed state for an org item). They are protected at rest by whole-DB SQLCipher.
+    fn migrate_org_ingest(conn: &Connection) -> Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS org_items (
+               item_id        TEXT PRIMARY KEY,
+               org_id         TEXT NOT NULL,
+               seq            INTEGER NOT NULL,
+               author_hint    TEXT NOT NULL DEFAULT '',
+               title          TEXT NOT NULL DEFAULT '',
+               markdown       TEXT NOT NULL DEFAULT '',
+               created_at     TEXT NOT NULL DEFAULT '',
+               rev            INTEGER NOT NULL DEFAULT 1,
+               generation     INTEGER NOT NULL DEFAULT 1,
+               content_sha256 BLOB,
+               tombstoned     INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE INDEX IF NOT EXISTS idx_org_items_org ON org_items(org_id);
+             CREATE INDEX IF NOT EXISTS idx_org_items_sha ON org_items(content_sha256);
+             CREATE TABLE IF NOT EXISTS org_chunks (
+               id         INTEGER PRIMARY KEY,
+               item_id    TEXT NOT NULL,
+               chunk_idx  INTEGER NOT NULL,
+               text       TEXT NOT NULL,
+               FOREIGN KEY (item_id) REFERENCES org_items(item_id) ON DELETE CASCADE
+             );
+             CREATE INDEX IF NOT EXISTS idx_org_chunks_item ON org_chunks(item_id);",
+        )
+        .map_err(map_err)?;
+        // vec0 int8 KNN table (width = EMBED_DIM; compile-time const, no user input). int8 per the
+        // scale spike — see the doc comment. Values are inserted via `vec_int8(?)` (a raw i8 blob).
+        conn.execute_batch(&format!(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS org_vec_chunks USING vec0(
+                 chunk_id INTEGER PRIMARY KEY,
+                 embedding int8[{dim}]
+             );",
+            dim = crate::embed::EMBED_DIM
+        ))
+        .map_err(map_err)?;
+        // External-content FTS5 over org_chunks.text + the production trigger trio (mirrors
+        // migrate_doc_fts). No one-time backfill is needed (org_chunks only ever appear via the
+        // trigger-covered ingest path, never predate the index), so this is a plain CREATE.
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS fts_org_chunks USING fts5(
+                 text,
+                 content='org_chunks',
+                 content_rowid='id',
+                 tokenize = 'unicode61 remove_diacritics 2'
+             );
+             CREATE TRIGGER IF NOT EXISTS fts_org_chunks_ai AFTER INSERT ON org_chunks BEGIN
+                 INSERT INTO fts_org_chunks(rowid, text) VALUES (new.id, new.text);
+             END;
+             CREATE TRIGGER IF NOT EXISTS fts_org_chunks_ad AFTER DELETE ON org_chunks BEGIN
+                 INSERT INTO fts_org_chunks(fts_org_chunks, rowid, text)
+                   VALUES ('delete', old.id, old.text);
+             END;
+             CREATE TRIGGER IF NOT EXISTS fts_org_chunks_au AFTER UPDATE ON org_chunks BEGIN
+                 INSERT INTO fts_org_chunks(fts_org_chunks, rowid, text)
+                   VALUES ('delete', old.id, old.text);
+                 INSERT INTO fts_org_chunks(rowid, text) VALUES (new.id, new.text);
+             END;",
         )
         .map_err(map_err)
     }
@@ -4496,6 +4585,291 @@ impl Db {
         Ok(hits)
     }
 
+    // ── M6 Shared Brain — org feed INGEST + local RETRIEVAL ─────────────────────────────────────
+    //
+    // The org partition is a decrypted REPLICA of the org feed, living in the dedicated `org_*`
+    // tables OUTSIDE the folder-lock domain (spec §"Trust model": org items are deliberately
+    // org-disclosed content — no folder seal/gate applies; SQLCipher protects them at rest). All
+    // writes here happen after the caller OPENED the OCK-sealed envelope (`share::org_envelope`),
+    // so the plaintext title/markdown are already the member's to see. NO PII in logs (ids/counts).
+
+    /// UPSERT one decrypted org feed item + (re)index its chunks. Idempotent on `item_id`: a re-pull
+    /// of the same seq REPLACES the row and re-chunks (clean replace via `index_org_item_chunks`). A
+    /// bumped `rev` (an update-share) overwrites the markdown + re-indexes. `content_sha256` is the
+    /// PLAINTEXT hash (the self-share dedup key). `embedder` is the member's OWN active embedder —
+    /// `None`/StubEmbedder ⇒ FTS-only (no int8 vectors written; the sync report flags `ftsOnly`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn upsert_org_item(
+        &self,
+        item_id: &str,
+        org_id: &str,
+        seq: u64,
+        author_hint: &str,
+        title: &str,
+        markdown: &str,
+        created_at: &str,
+        rev: u32,
+        generation: u32,
+        content_sha256: &[u8],
+        embedder: Option<&dyn Embedder>,
+    ) -> Result<()> {
+        // Chunk + embed OUTSIDE the write lock (embedding is CPU/Metal work). The header carries the
+        // item title as provenance; the date axis is the item's created_at.
+        let chunks = crate::embed::chunk_note(title, created_at, markdown);
+        let vectors = match embedder {
+            Some(e) if !chunks.is_empty() => Some(e.embed_passage(&chunks)?),
+            _ => None, // model absent → FTS-only (int8 vectors come later on a re-embed).
+        };
+
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        // Replace the item row (idempotent upsert). CASCADE + the explicit vec purge below clear the
+        // old chunks first so a re-pull never leaves stale chunks/vectors.
+        Self::purge_org_item_chunks_tx(&tx, item_id)?;
+        tx.execute(
+            "INSERT INTO org_items
+               (item_id, org_id, seq, author_hint, title, markdown, created_at, rev, generation,
+                content_sha256, tombstoned)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,0)
+             ON CONFLICT(item_id) DO UPDATE SET
+               org_id=excluded.org_id, seq=excluded.seq, author_hint=excluded.author_hint,
+               title=excluded.title, markdown=excluded.markdown, created_at=excluded.created_at,
+               rev=excluded.rev, generation=excluded.generation,
+               content_sha256=excluded.content_sha256, tombstoned=0",
+            rusqlite::params![
+                item_id,
+                org_id,
+                seq as i64,
+                author_hint,
+                title,
+                markdown,
+                created_at,
+                rev as i64,
+                generation as i64,
+                content_sha256,
+            ],
+        )
+        .map_err(map_err)?;
+        {
+            let mut ins_chunk = tx
+                .prepare("INSERT INTO org_chunks (item_id, chunk_idx, text) VALUES (?1, ?2, ?3)")
+                .map_err(map_err)?;
+            // int8 vec0 → the value MUST be wrapped `vec_int8(?)` (the scale-spike partition format).
+            let mut ins_vec = tx
+                .prepare("INSERT INTO org_vec_chunks(chunk_id, embedding) VALUES (?1, vec_int8(?2))")
+                .map_err(map_err)?;
+            for (idx, text) in chunks.iter().enumerate() {
+                ins_chunk
+                    .execute(rusqlite::params![item_id, idx as i64, text])
+                    .map_err(map_err)?;
+                if let Some(vecs) = &vectors {
+                    if let Some(vector) = vecs.get(idx) {
+                        let chunk_id = tx.last_insert_rowid();
+                        let blob = crate::embed::vec_to_int8_blob(vector);
+                        ins_vec
+                            .execute(rusqlite::params![chunk_id, blob])
+                            .map_err(map_err)?;
+                    }
+                }
+            }
+        }
+        tx.commit().map_err(map_err)?;
+        Ok(())
+    }
+
+    /// TOMBSTONE an org item: mark the row `tombstoned=1` and DROP its chunks/vectors/FTS so the item
+    /// vanishes from retrieval, while the tombstone row keeps a re-pull idempotent (a later feed entry
+    /// for the same id is a no-op). Idempotent — tombstoning an unknown/already-tombstoned id is fine.
+    pub fn tombstone_org_item(&self, item_id: &str) -> Result<()> {
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        Self::purge_org_item_chunks_tx(&tx, item_id)?;
+        tx.execute(
+            "UPDATE org_items SET tombstoned = 1, markdown = '', title = '' WHERE item_id = ?1",
+            rusqlite::params![item_id],
+        )
+        .map_err(map_err)?;
+        tx.commit().map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Delete an org item's `org_chunks` + `org_vec_chunks` rows within an EXISTING tx. vec0 first
+    /// (its FK-less rowid mirrors `org_chunks.id`), then the source rows (whose DELETE fires the FTS
+    /// `_ad` trigger, purging the tokens). Mirrors [`Db::purge_doc_chunks_tx`].
+    fn purge_org_item_chunks_tx(tx: &rusqlite::Transaction<'_>, item_id: &str) -> Result<()> {
+        tx.execute(
+            "DELETE FROM org_vec_chunks WHERE chunk_id IN
+               (SELECT id FROM org_chunks WHERE item_id = ?1)",
+            rusqlite::params![item_id],
+        )
+        .map_err(map_err)?;
+        tx.execute(
+            "DELETE FROM org_chunks WHERE item_id = ?1",
+            rusqlite::params![item_id],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// GATED-FREE (no folder lock applies to org items) semantic KNN over the int8 org partition:
+    /// the top-`k` nearest `org_vec_chunks` for the int8-quantized `query_vec`, joined to their
+    /// (non-tombstoned) items, deduped to one hit per item (nearest). `query_vec` is the member's OWN
+    /// f32 query embedding — it is int8-quantized here so it is comparable to the stored int8 vectors.
+    pub fn search_org_chunks_knn(&self, query_vec: &[f32], k: i64) -> Result<Vec<OrgChunkHit>> {
+        if query_vec.is_empty() || k <= 0 {
+            return Ok(Vec::new());
+        }
+        let conn = self.lock();
+        // KNN isolated to the vec0 table in a CTE (a vec0 query allows a single MATCH+k); the item
+        // columns + the tombstone filter are joined OUTSIDE it.
+        let sql = "WITH knn(chunk_id, distance) AS (
+                 SELECT chunk_id, distance FROM org_vec_chunks
+                  WHERE embedding MATCH vec_int8(?1) AND k = ?2
+                  ORDER BY distance
+             )
+             SELECT oi.item_id, oi.author_hint, oi.title, oc.text, oi.content_sha256, knn.distance
+               FROM knn
+               JOIN org_chunks oc ON oc.id = knn.chunk_id
+               JOIN org_items oi ON oi.item_id = oc.item_id
+              WHERE oi.tombstoned = 0
+              ORDER BY knn.distance ASC, oi.item_id ASC";
+        let blob = crate::embed::vec_to_int8_blob(query_vec);
+        let mut stmt = conn.prepare(sql).map_err(map_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![blob, k], |row| {
+                Ok(OrgChunkHit {
+                    item_id: row.get(0)?,
+                    author_hint: row.get(1)?,
+                    title: row.get(2)?,
+                    snippet: row.get(3)?,
+                    content_sha256: row.get::<_, Option<Vec<u8>>>(4)?.unwrap_or_default(),
+                })
+            })
+            .map_err(map_err)?;
+        Self::dedup_org_hits_by_item(rows)
+    }
+
+    /// KEYWORD (FTS5/BM25) leg over the org partition — the model-free twin of
+    /// [`Db::search_org_chunks_knn`], so org text is reachable on a DEFAULT install (no e5 model).
+    ///
+    /// CRITICAL (scale-spike finding #2): the `LIMIT` is PUSHED DOWN into the SQL (bm25-ordered),
+    /// NOT applied in Rust after reading every match — the unbounded production reader hit an 8.8 s
+    /// p95 tail at 1M chunks. We over-fetch a small multiple of `limit` (so per-item dedup still has
+    /// candidates) then cap in Rust; the SQL ceiling is the real bound.
+    pub fn search_org_chunks_fts(&self, query: &str, limit: i64) -> Result<Vec<OrgChunkHit>> {
+        if limit <= 0 {
+            return Ok(Vec::new());
+        }
+        let Some(match_expr) = fts_match_query(query.trim()) else {
+            return Ok(Vec::new()); // punctuation-only / empty query → no hits, never an FTS error.
+        };
+        let conn = self.lock();
+        // Over-fetch a bounded multiple of `limit` so per-item dedup has candidates, but keep the SQL
+        // LIMIT as the hard bound (spike #2). 8× is generous for a per-item dedup at small `limit`.
+        let sql_cap = limit.saturating_mul(8).clamp(limit, 512);
+        let sql = "SELECT oi.item_id, oi.author_hint, oi.title, oc.text, oi.content_sha256,
+                          bm25(fts_org_chunks) AS rank
+               FROM fts_org_chunks
+               JOIN org_chunks oc ON oc.id = fts_org_chunks.rowid
+               JOIN org_items oi ON oi.item_id = oc.item_id
+              WHERE fts_org_chunks MATCH ?1 AND oi.tombstoned = 0
+              ORDER BY rank ASC, oi.item_id ASC
+              LIMIT ?2";
+        let mut stmt = conn.prepare(sql).map_err(map_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![match_expr, sql_cap], |row| {
+                Ok(OrgChunkHit {
+                    item_id: row.get(0)?,
+                    author_hint: row.get(1)?,
+                    title: row.get(2)?,
+                    snippet: row.get(3)?,
+                    content_sha256: row.get::<_, Option<Vec<u8>>>(4)?.unwrap_or_default(),
+                })
+            })
+            .map_err(map_err)?;
+        let mut hits = Self::dedup_org_hits_by_item(rows)?;
+        hits.truncate(limit as usize);
+        Ok(hits)
+    }
+
+    /// Dedup a stream of org chunk hits to ONE per item (first-seen = best-ranked, since callers
+    /// order by distance/bm25 ascending). Shared by both retrieval legs.
+    fn dedup_org_hits_by_item(
+        rows: impl Iterator<Item = rusqlite::Result<OrgChunkHit>>,
+    ) -> Result<Vec<OrgChunkHit>> {
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut hits = Vec::new();
+        for r in rows {
+            let hit = r.map_err(map_err)?;
+            if !seen.insert(hit.item_id.clone()) {
+                continue;
+            }
+            hits.push(hit);
+        }
+        Ok(hits)
+    }
+
+    /// The full decrypted org item (for the read-only FE viewer). `None` for an unknown or TOMBSTONED
+    /// item. No lock gate — org items are deliberately org-disclosed content.
+    pub fn get_org_item(&self, item_id: &str) -> Result<Option<crate::storage::models::OrgItemDetail>> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT item_id, author_hint, title, created_at, rev, markdown
+               FROM org_items WHERE item_id = ?1 AND tombstoned = 0",
+            rusqlite::params![item_id],
+            |r| {
+                Ok(crate::storage::models::OrgItemDetail {
+                    item_id: r.get(0)?,
+                    author_hint: r.get(1)?,
+                    title: r.get(2)?,
+                    created_at: r.get(3)?,
+                    rev: r.get::<_, i64>(4)? as u32,
+                    markdown: r.get(5)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(map_err)
+    }
+
+    /// Count of LIVE (non-tombstoned) org items for an org — the `OrgStatus.itemCount` source.
+    pub fn org_item_count(&self, org_id: &str) -> Result<u64> {
+        let conn = self.lock();
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM org_items WHERE org_id = ?1 AND tombstoned = 0",
+                rusqlite::params![org_id],
+                |r| r.get(0),
+            )
+            .map_err(map_err)?;
+        Ok(n.max(0) as u64)
+    }
+
+    /// LIVE org item ids that still LACK any int8 vector (chunks present but no `org_vec_chunks`) —
+    /// the re-embed backlog once a real embedder appears on a member that ingested FTS-only. Bounded
+    /// by `limit`. Empty when every live item is already embedded (or FTS-only with no chunks).
+    pub fn org_items_needing_embed(&self, org_id: &str, limit: i64) -> Result<Vec<String>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT DISTINCT oc.item_id
+                   FROM org_chunks oc
+                   JOIN org_items oi ON oi.item_id = oc.item_id
+                  WHERE oi.org_id = ?1 AND oi.tombstoned = 0
+                    AND NOT EXISTS (SELECT 1 FROM org_vec_chunks v WHERE v.chunk_id = oc.id)
+                  LIMIT ?2",
+            )
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![org_id, limit], |r| r.get::<_, String>(0))
+            .map_err(map_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(map_err)?);
+        }
+        Ok(out)
+    }
+
     // ── NOTES (authored `documents(kind='note')`) ───────────────────────────────────────────────
 
     /// Insert an authored note row (`documents` with `kind='note'`). Separate from
@@ -7391,6 +7765,7 @@ impl Db {
                     meeting_id,
                     title: title.unwrap_or_default(),
                     started_at,
+                    origin: None,
                 })
             })
             .map_err(map_err)?;
