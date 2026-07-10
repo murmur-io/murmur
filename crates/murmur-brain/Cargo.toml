@@ -1,0 +1,26 @@
+[package]
+name = "murmur-brain"
+version = "0.8.0"
+edition = "2021"
+rust-version = "1.77"
+description = "Murmur on-device GGUF LLM inference, isolated in a killable helper process"
+# Never published; the app bundles the built binary as a signed Resources/ helper.
+publish = false
+
+# The compiled binary is named `meetnotes-brain` so the existing inside-out signing glob
+# `Contents/Resources/meetnotes-*` in scripts/macos-sign-notarize.sh covers it for free.
+[[bin]]
+name = "meetnotes-brain"
+path = "src/main.rs"
+
+[dependencies]
+# The ONLY crate in the repo that owns mistralrs now — the multi-GB residency, drop-leaks (#723/#865),
+# and uncancellable generation are confined to THIS process, reclaimed by the OS on kill.
+mistralrs = { version = "0.8.1", features = ["metal"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "sync", "time"] }
+# Diagnostics go to STDERR ONLY (stdout is the NDJSON protocol channel — it must stay pure).
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -55,15 +55,14 @@ async-trait = "0.1"
 # bundled-sqlcipher-vendored-openssl: whole-DB at-rest encryption, no system OpenSSL dependency
 # (universal-capable). Fallback if the universal build breaks: "bundled-sqlcipher".
 rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl"] }
-# ── Local reasoning brain (always compiled; the real impl activates at runtime when the model is present) ──
-# In-process GGUF inference (Metal). A build-proof PROVED this links cleanly alongside whisper.cpp +
-# sherpa's static onnxruntime + bundled SQLCipher (zero ORT/ggml/openssl conflict). Always compiled:
-# `reason::active_reasoner` (BrainBackend::Local) returns the real `MistralReasoner` when a GGUF model
-# is present on disk, else gracefully degrades to the dependency-free `StubReasoner` (model presence is
-# the ONLY switch — no cargo feature). The `metal` feature precompiles shaders via xcrun (needs full
-# Xcode, or env `MISTRALRS_METAL_PRECOMPILE=0` to defer shader compile to first run — REQUIRED on a
-# Mac with only the Command Line Tools).
-mistralrs = { version = "0.8.1", features = ["metal"] }
+# ── Local reasoning brain — EXTRACTED to the sibling member crate `crates/murmur-brain` ──
+# mistralrs (in-process GGUF inference, Metal) NO LONGER links into this app crate: it was extracted
+# into `crates/murmur-brain`, compiled to a killable helper binary `meetnotes-brain`. The app drives
+# it through `reason::sidecar::SidecarReasoner` over the NDJSON protocol in `crates/murmur-brain/src/
+# brain_ipc.rs` — so `cargo test --lib` stops compiling the largest single ML tree, and killing the
+# child reclaims ALL model RAM to the OS (idle-unload / per-request timeout / app-quit). Model
+# presence is still the ONLY switch: `reason::active_reasoner` (BrainBackend::Local) returns the
+# `SidecarReasoner` when a GGUF is on disk, else the dependency-free `StubReasoner`.
 
 # ── Vector retrieval (Phase 2a) ──
 # sqlite-vec `vec0` virtual table for on-device KNN, registered into the SAME bundled SQLCipher
@@ -77,12 +76,12 @@ sqlite-vec = "0.1.9"
 # In-process BERT embedding (candle-transformers, Metal) for the REAL multilingual-e5-small encoder
 # behind `embed::active_embedder`, AND the mDeBERTa-v3 PERSON-name NER behind
 # `summarize::redact::active_name_redactor`. A build-proof PROVED candle 0.10.2 links cleanly
-# in-process with ZERO second onnxruntime — it SHARES candle with the mistralrs brain graph, and
-# sherpa stays the only ORT. Always compiled: `embed::active_embedder` returns the real
-# `CandleBertEmbedder` when the e5 model dir is present on disk, else the dependency-free
-# `StubEmbedder`; likewise `active_name_redactor` returns the real `DebertaNameRedactor` when the NER
-# model dir is present, else the byte-identical `NoopNameRedactor` (model presence is the ONLY switch —
-# no cargo feature). The `metal`/`accelerate` features mirror the candle in the brain graph.
+# in-process with ZERO second onnxruntime, and sherpa stays the only ORT. (Since the mistralrs brain
+# graph moved to `crates/murmur-brain`, candle is now the app crate's SOLE ML tree — a lighter
+# `cargo test --lib`.) Always compiled: `embed::active_embedder` returns the real `CandleBertEmbedder`
+# when the e5 model dir is present on disk, else the dependency-free `StubEmbedder`; likewise
+# `active_name_redactor` returns the real `DebertaNameRedactor` when the NER model dir is present, else
+# the byte-identical `NoopNameRedactor` (model presence is the ONLY switch — no cargo feature).
 candle-core = { version = "0.10.2", features = ["metal", "accelerate"] }
 candle-nn = { version = "0.10.2", features = ["metal", "accelerate"] }
 candle-transformers = { version = "0.10.2", features = ["metal", "accelerate"] }
@@ -179,9 +178,10 @@ security-framework = { version = "3.7", features = ["OSX_10_15"] }
 security-framework-sys = { version = "2.17", features = ["OSX_10_15"] }
 
 [features]
-# default keeps Metal on for whisper; nothing else conditional. The on-device brain (mistralrs),
-# embedder + NER (candle/tokenizers) are ALWAYS compiled — the real impls activate at runtime on
-# model-presence (see `reason::active_reasoner`, `embed::active_embedder`,
-# `summarize::redact::active_name_redactor`), so there is no longer a cargo feature to flip; a fresh
-# install with no downloaded model still boots and runs on the stub/no-op floor.
+# default keeps Metal on for whisper; nothing else conditional. The on-device brain (mistralrs) now
+# lives in the `crates/murmur-brain` helper (NOT this crate); the embedder + NER (candle/tokenizers)
+# are ALWAYS compiled here — the real impls activate at runtime on model-presence (see
+# `reason::active_reasoner` → the brain sidecar, `embed::active_embedder`,
+# `summarize::redact::active_name_redactor`), so there is no cargo feature to flip; a fresh install
+# with no downloaded model still boots and runs on the stub/no-op floor.
 default = []

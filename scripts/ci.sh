@@ -50,7 +50,10 @@ fi
 # with unmaintained/unsound *warnings* (unic-ucd-*, glib) that we cannot fix here and that are not
 # exploitable in this app. The maintenance dimension is still gated — narrowly, on our DIRECT deps
 # — by `cargo deny check` below (`advisories.unmaintained = "workspace"`).
-( cd src-tauri && cargo audit )
+# The cargo lock moved to the WORKSPACE ROOT (`./Cargo.lock`) when the brain-sidecar extraction made
+# this a virtual workspace; cargo-audit reads the lock from the cwd and does NOT walk up to find it,
+# so point it at the root lock explicitly (this now also covers the `crates/murmur-brain` member).
+cargo audit --file Cargo.lock
 
 echo "── cargo deny check (advisories, licenses, bans, sources) ──"
 if ! command -v cargo-deny >/dev/null 2>&1; then
