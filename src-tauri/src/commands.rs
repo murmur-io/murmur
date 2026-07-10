@@ -12622,8 +12622,14 @@ pub async fn list_my_shares(state: State<'_, AppState>) -> Result<Vec<MyShareEnt
 /// `revoke_share(share_id)` — DELETE the server ciphertext + flip the local state. Idempotent.
 #[tauri::command]
 pub async fn revoke_share(state: State<'_, AppState>, share_id: String) -> Result<(), AppError> {
-    let base = share_base_url(state.inner())?;
-    let access = valid_access_token(state.inner()).await?;
+    revoke_share_inner(state.inner(), share_id).await
+}
+
+/// Inner of [`revoke_share`] taking `&AppState` so bulk callers (`revoke_shares_for_folder`) can reuse
+/// the exact link/user revoke path (server revoke → local `revoked` → content-free ledger).
+pub(crate) async fn revoke_share_inner(state: &AppState, share_id: String) -> Result<(), AppError> {
+    let base = share_base_url(state)?;
+    let access = valid_access_token(state).await?;
     let client = crate::share::client::ShareClient::new(&base)?;
     client.revoke_share(&access, &share_id).await?;
     state.db.set_outbound_share_state(&share_id, "revoked")?;
@@ -21373,6 +21379,69 @@ mod lifecycle_tests {
         assert!(active.iter().any(|(item, _)| item.as_deref() == Some("item-m")));
         assert!(active.iter().any(|(item, _)| item.is_none())); // the queued note share (no item yet)
     }
+
+    /// Closes the pre-existing lock×shares HOLE: before `active_link_user_shares_for_folder`, a folder
+    /// could be sealed with NO warning that its notes were still shared 1:1 (link/user). This proves
+    /// the enumeration that `folder_active_shares` (→ the dialog) reads: it surfaces the folder's
+    /// ACTIVE link + user shares, and excludes revoked shares AND shares in other folders.
+    #[test]
+    fn active_link_user_shares_for_folder_lists_active_1to1_and_excludes_revoked_and_other_folders() {
+        let state = build_state("folder-1to1-shares");
+        make_open_folder(&state.db, "f1", "Team");
+        make_open_folder(&state.db, "f2", "Other");
+        let mk_note = |mid: &str, fid: &str, title: &str| {
+            state
+                .db
+                .insert_meeting(&Meeting {
+                    id: mid.into(),
+                    started_at: "2026-07-10T09:00:00Z".into(),
+                    ended_at: None,
+                    title: Some(title.into()),
+                    duration_s: 60,
+                    audio_path: None,
+                    status: MeetingStatus::Summarized,
+                    folder_id: Some(fid.into()),
+                })
+                .unwrap();
+            state
+                .db
+                .upsert_note(&NoteRecord {
+                    meeting_id: mid.into(),
+                    provider_id: "claude_code".into(),
+                    markdown: "# n".into(),
+                    created_at: "t".into(),
+                    exported_path: None,
+                    model_requested: None,
+                    model_served: None,
+                    gateway_host: None,
+                })
+                .unwrap();
+            state.db.set_note_folder(mid, Some(fid)).unwrap();
+        };
+        mk_note("m1", "f1", "Sync");
+        mk_note("m2", "f2", "Elsewhere");
+        // f1/m1: an active LINK + active USER share, plus a REVOKED link that must be excluded.
+        state.db.insert_outbound_share("lnk", "m1", "link", 1, "t").unwrap();
+        state.db.insert_outbound_share("usr", "m1", "user", 1, "t").unwrap();
+        state.db.insert_outbound_share("old", "m1", "link", 1, "t").unwrap();
+        state.db.set_outbound_share_state("old", "revoked").unwrap();
+        // f2/m2: a share in ANOTHER folder must not leak into f1's report.
+        state.db.insert_outbound_share("f2lnk", "m2", "link", 1, "t").unwrap();
+
+        let shares = state.db.active_link_user_shares_for_folder("f1").unwrap();
+        assert_eq!(
+            shares.len(),
+            2,
+            "two active 1:1 shares in f1 (revoked + other-folder excluded): {shares:?}"
+        );
+        let links = shares.iter().filter(|(_, m)| m == "link").count();
+        let users = shares.iter().filter(|(_, m)| m == "user").count();
+        assert_eq!((links, users), (1, 1), "one link + one user share");
+        assert!(
+            shares.iter().all(|(id, _)| id != "old" && id != "f2lnk"),
+            "revoked + other-folder shares excluded"
+        );
+    }
 }
 
 // ════════════════════════════════ M6 Shared Brain (Organizations) ════════════════════════════════
@@ -22274,6 +22343,97 @@ pub(crate) async fn revoke_org_share_inner(state: &AppState, item_id: String) ->
     state.db.set_org_share_state(&row.id, "revoked", &now)?;
     crate::share::ledger_row(&state.db, &client.host(), "org_share_revoke", 0);
     Ok(())
+}
+
+/// One org-brain item still live for a folder (lock×shares dialog). `item_id` is the server item id
+/// for an uploaded share, or the local row id for a still-queued one (a stable key for the FE list;
+/// only uploaded ones are deep-linkable). Serializes camelCase → matches `models.ts` `OrgActiveShare`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrgActiveShare {
+    pub item_id: String,
+    pub title: String,
+}
+
+/// The active-shares report for the lock×shares dialog. `links`/`users` are counts of the folder's
+/// live zero-knowledge LINK / Murmur↔Murmur USER shares; `org` lists the org-brain items shared from
+/// the folder. Content-free enough for a dialog (titles render only to the local owner). Mirrors the
+/// TS `ActiveSharesReport`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActiveSharesReport {
+    pub links: u32,
+    pub users: u32,
+    pub org: Vec<OrgActiveShare>,
+}
+
+/// `folder_active_shares(folder_id)` — the folder's live outgoing shares, for the lock×shares dialog.
+/// Closes the pre-existing hole where `lock_folder` sealed a folder without ever warning that its
+/// notes were still shared (live 1:1 link/user shares were completely invisible; only org shares were
+/// tracked). READ-ONLY, no egress: link/user COUNTS + the org items' ids+titles.
+#[tauri::command]
+pub fn folder_active_shares(
+    state: State<'_, AppState>,
+    folder_id: String,
+) -> Result<ActiveSharesReport, AppError> {
+    let st = state.inner();
+    let (mut links, mut users) = (0u32, 0u32);
+    for (_share_id, mode) in st.db.active_link_user_shares_for_folder(&folder_id)? {
+        match mode.as_str() {
+            "link" => links += 1,
+            "user" => users += 1,
+            _ => {}
+        }
+    }
+    let org = st
+        .db
+        .active_org_share_ids_for_folder(&folder_id)?
+        .into_iter()
+        .map(|(row_id, item_id, title)| OrgActiveShare {
+            item_id: item_id.unwrap_or(row_id),
+            title,
+        })
+        .collect();
+    Ok(ActiveSharesReport { links, users, org })
+}
+
+/// `revoke_shares_for_folder(folder_id)` — bulk-revoke every live share from a folder (the "Revoke &
+/// lock" path of the lock×shares dialog). Best-effort: attempts EVERY share even if one fails, then
+/// returns the FIRST error, so the FE never proceeds to seal on a partial revoke. Link/user → server
+/// revoke + local `revoked`; org uploaded → server tombstone; org still-queued → cancelled locally so
+/// the launch sweep never egresses it. Idempotent (an already-revoked share is simply re-listed out).
+#[tauri::command]
+pub async fn revoke_shares_for_folder(
+    state: State<'_, AppState>,
+    folder_id: String,
+) -> Result<(), AppError> {
+    let st = state.inner();
+    let link_user = st.db.active_link_user_shares_for_folder(&folder_id)?;
+    let org = st.db.active_org_share_ids_for_folder(&folder_id)?;
+    let mut first_err: Option<AppError> = None;
+
+    for (share_id, _mode) in link_user {
+        if let Err(e) = revoke_share_inner(st, share_id).await {
+            first_err.get_or_insert(e);
+        }
+    }
+    for (row_id, item_id, _title) in org {
+        let res = match item_id {
+            Some(id) => revoke_org_share_inner(st, id).await,
+            None => {
+                // Never uploaded — cancel locally so the launch sweep skips it (no server item).
+                let now = chrono::Utc::now().to_rfc3339();
+                st.db.set_org_share_state(&row_id, "revoked", &now)
+            }
+        };
+        if let Err(e) = res {
+            first_err.get_or_insert(e);
+        }
+    }
+    match first_err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 /// `org_sweep_pending()` — the on-launch org queue sweep (extends the mode-B `share_rewrap_pending`
