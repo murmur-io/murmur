@@ -1,7 +1,7 @@
 # RAG bake-off
 
 - date: 2026-07-10
-- commit: 3362d3c-dirty
+- commit: e862302-dirty
 - corpus: synthetic (eval::corpus, 16 seeded meetings, anchor 2026-06-29)
 - labeled set: src-tauri/src/eval/fixtures/rag-bakeoff-synthetic.json (20 queries, k=5)
 - config: score_fuse 0.4/0.4/0.2 + topic legs + temporal filter (RRF_K=60 fallback)
