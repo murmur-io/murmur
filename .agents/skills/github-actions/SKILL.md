@@ -1,6 +1,6 @@
 ---
 name: github-actions
-description: Author and maintain GitHub Actions workflows for THIS repo (Murmur — Tauri 2 Rust + Angular 18, macOS-first, heavy always-compiled ML build). The best-practice patterns tuned to Murmur — macos-14 runner, Swatinem/rust-cache + npm cache + whisper-model cache, SHA-pinned actions resolved live, least-privilege permissions, concurrency cancel, secrets by name, and the ci.sh-wraps-not-duplicates rule. Includes the release-workflow blueprint (CD) that stays a design, since notarization belongs to release-engineer. Use whenever the user wants to write/change a GitHub Actions workflow, tune CI runtime/caching, pin actions, or design a cloud release pipeline for Murmur.
+description: Author and maintain GitHub Actions workflows for THIS repo (Murmur — Tauri 2 Rust + Angular 22, macOS-first, heavy always-compiled ML build). The best-practice patterns tuned to Murmur — macos-14 runner, Swatinem/rust-cache + npm cache + whisper-model cache, SHA-pinned actions resolved live, least-privilege permissions, concurrency cancel, secrets by name, and the ci.sh-wraps-not-duplicates rule. Includes the release-workflow blueprint (CD) that stays a design, since notarization belongs to release-engineer. Use whenever the user wants to write/change a GitHub Actions workflow, tune CI runtime/caching, pin actions, or design a cloud release pipeline for Murmur.
 ---
 
 # /github-actions — workflow best-practices for Murmur
@@ -29,15 +29,20 @@ gh api repos/Swatinem/rust-cache/git/tags/<that-sha> --jq '.object.sha'       # 
 
 Pin the **commit** sha, comment the version. Currently pinned in `ci.yml`:
 `actions/checkout@…11bd719 # v4.2.2`, `actions/setup-node@…39370e3 # v4.1.0`,
-`Swatinem/rust-cache@…82a92a6 # v2.7.5`, `taiki-e/install-action@…678b06b # v2.44.60`,
-`actions/cache@…6849a64 # v4.1.2`.
+`Swatinem/rust-cache@…c193711 # v2.9.1`, `taiki-e/install-action@…678b06b # v2.44.60`,
+`actions/cache@…55cc834 # v6.1.0`.
+
+**Cache-service deprecation (bitten 2026-07-05):** GitHub killed the legacy cache
+backend — `actions/cache` < v4.2 and `Swatinem/rust-cache` < v2.7.8 are AUTO-FAILED
+at job setup ("deprecated version of actions/cache"). If a run dies before the first
+step with that error, bump BOTH cache actions to current tags (resolve SHAs live).
 
 ## Make it fast (or the team routes around it)
 
 - **`Swatinem/rust-cache`** with `workspaces: src-tauri`, AFTER the toolchain is resolved. This is the single biggest win — the always-compiled ML tree (mistralrs/candle) is hundreds of MB cold.
 - **`actions/setup-node` with `cache: npm`** + `npm ci` (not `npm install`) for a reproducible, cached FE install.
 - **Prebuilt cargo tools via `taiki-e/install-action`** (`tool: cargo-audit,cargo-deny`) so `ci.sh` finds them on PATH and skips its slow `cargo install`.
-- **Split the heavy E2E off the per-PR path.** The `gate` job runs `MURMUR_CI_SKIP_E2E=1 bash scripts/ci.sh`; the `full-gate` job (weekly `schedule` + `workflow_dispatch` `run_e2e`) runs the whole thing with a **whisper-model `actions/cache`** + `brew install ffmpeg`. Don't make every PR download a 142 MB model.
+- **Cache the heavy E2E inputs.** Since the 2026-07-05 release-parity change every PR runs the COMPLETE ci.sh (incl. audio E2E); the cost is tamed with a **whisper-model `actions/cache`** + `brew install ffmpeg` — the 142 MB model downloads once, not per PR. `MURMUR_CI_SKIP_E2E=1` is local-only.
 - **Resolve the pinned toolchain with `rustup show`** (reads `rust-toolchain.toml` → 1.96.0 + clippy/rustfmt). Don't add a second `dtolnay/rust-toolchain` with a different version.
 - `timeout-minutes` on every job (a hung ML link shouldn't burn the full 6 h).
 
@@ -46,21 +51,18 @@ Pin the **commit** sha, comment the version. Currently pinned in `ci.yml`:
 ```yaml
 on:
   pull_request: { branches: [murmur] }
-  workflow_dispatch: { inputs: { run_e2e: { type: boolean, default: false } } }
+  workflow_dispatch: {}
   schedule: [ { cron: "0 6 * * 1" } ]
 permissions: { contents: read }
 concurrency: { group: ci-${{ github.workflow }}-${{ github.ref }}, cancel-in-progress: true }
 env: { MISTRALRS_METAL_PRECOMPILE: "0", CARGO_TERM_COLOR: always }
 jobs:
-  gate:                       # every PR — correctness + supply-chain, no E2E
+  gate:   # every PR + weekly + on-demand — the COMPLETE ci.sh (release parity)
     runs-on: macos-14
-    steps: [ checkout, setup-node(cache:npm), rustup show, rust-cache(src-tauri),
-             install-action(cargo-audit,cargo-deny), npm ci,
-             run: bash scripts/ci.sh  (env MURMUR_CI_SKIP_E2E=1) ]
-  full-gate:                  # weekly + on-demand — the complete ci.sh incl. E2E
-    if: schedule || (workflow_dispatch && inputs.run_e2e)
-    runs-on: macos-14
-    steps: [ …, brew install ffmpeg, cache(whisper model), npm ci, run: bash scripts/ci.sh ]
+    steps: [ checkout, setup-node(node-version-file: .nvmrc, cache:npm), rustup show,
+             rust-cache(src-tauri), install-action(cargo-audit,cargo-deny),
+             brew install ffmpeg, cache(whisper model), npm ci,
+             run: bash scripts/ci.sh ]
 ```
 
 ## Verify before you push
@@ -69,7 +71,7 @@ jobs:
 python3 -c "import yaml; yaml.safe_load(open('.github/workflows/ci.yml')); print('yaml ok')"
 command -v actionlint >/dev/null && actionlint .github/workflows/ci.yml || echo "(install actionlint to lint)"
 # After it's on a branch, trigger and watch:
-gh workflow run CI -R murmur-io/murmur -f run_e2e=true      # manual full-gate
+gh workflow run CI -R murmur-io/murmur                      # manual gate run
 gh run watch -R murmur-io/murmur
 ```
 
