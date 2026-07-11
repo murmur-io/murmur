@@ -119,6 +119,11 @@ fn stage_brain_sidecar() {
     // debug fallback for a dev child build. First existing wins. This ONLY finds a HOST-ARCH child in
     // a normal `cargo build -p murmur-brain` dev build (a target-triple build writes under
     // `target/<triple>/…`, which the release path stages via `beforeBuildCommand`, not here).
+    // Require a NON-EMPTY file: a half-written / interrupted child build can leave a 0-byte
+    // `target/<profile>/meetnotes-brain`. A bare `is_file()` would treat that empty stub as a real
+    // child, then `fs::copy` it into `binaries/…` on EVERY build (since `already_real` — which also
+    // gates on `len() > 0` — never flips true for a 0-byte copy), re-arming the dev watcher into an
+    // infinite rebuild loop, and would emit a `BRAIN_BIN` pointing at an unspawnable empty binary.
     let built = target_dir.as_ref().and_then(|td| {
         [
             td.join("release").join(BIN),
@@ -126,7 +131,7 @@ fn stage_brain_sidecar() {
             td.join("debug").join(BIN),
         ]
         .into_iter()
-        .find(|p| p.is_file())
+        .find(|p| std::fs::metadata(p).map(|m| m.is_file() && m.len() > 0).unwrap_or(false))
     });
 
     match built {
