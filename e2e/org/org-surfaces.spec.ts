@@ -22,23 +22,39 @@ const ACCOUNT_STATUS = () => ({
   biometricUnlockAvailable: true,
 });
 
-// An org this user owns, with a couple of members + a couple of synced items.
-const ORG_STATUS = () => ({
-  orgId: "org-1",
-  name: "Acme Inc.",
-  role: "owner",
-  memberCount: 3,
-  consented: true,
-  lastSeq: 42,
-  itemCount: 12,
-  pendingShares: 1,
-});
+// The user's orgs (multi-org): one they own, one they were invited into.
+const ORG_STATUSES = () => [
+  {
+    orgId: "org-1",
+    name: "Acme Inc.",
+    role: "owner",
+    memberCount: 3,
+    consented: true,
+    lastSeq: 42,
+    itemCount: 12,
+    pendingShares: 1,
+  },
+  {
+    orgId: "org-2",
+    name: "Globex Design",
+    role: "member",
+    memberCount: 8,
+    consented: true,
+    lastSeq: 100,
+    itemCount: 57,
+    pendingShares: 0,
+  },
+];
 
 test.describe("Shared Brain v1 — org FE surfaces (mocked IPC)", () => {
-  test("Settings › Organization renders the managed state", async ({ page }) => {
+  test("Settings › Organization renders the managed (multi-org) state", async ({
+    page,
+  }) => {
     await mockTauri(page, {
-      org_status: ORG_STATUS,
       account_status: ACCOUNT_STATUS,
+      org_refresh: () => null,
+      org_list_statuses: ORG_STATUSES,
+      org_status: () => null,
       org_list_members: () => [
         {
           userId: "u-1",
@@ -57,20 +73,26 @@ test.describe("Shared Brain v1 — org FE surfaces (mocked IPC)", () => {
       ],
     });
     await page.goto("/settings");
-    await page.getByText("Organization").first().click();
+    await page.getByRole("button", { name: "Organization" }).first().click();
 
     await expect(
       page.locator("app-settings-organization-section"),
     ).toBeVisible({ timeout: 10_000 });
-    // Managed state: org name, member email, sync affordance.
+    // Both org cards render, by name.
     await expect(page.getByText("Acme Inc.").first()).toBeVisible();
+    await expect(page.getByText("Globex Design").first()).toBeVisible();
+    // Sync + Invite affordances (the owned org exposes Invite).
+    await expect(
+      page.getByRole("button", { name: "Sync now" }).first(),
+    ).toBeVisible();
+    const owned = page.locator(".org-card", { hasText: "Acme Inc." });
+    await expect(
+      owned.getByRole("button", { name: "Invite & members" }),
+    ).toBeVisible();
+    // Expand the member manager to reveal the member list.
+    await owned.getByRole("button", { name: "Invite & members" }).click();
     await expect(page.getByText("kasia@example.com")).toBeVisible();
-    await expect(
-      page.getByRole("button", { name: "Sync now" }),
-    ).toBeVisible();
-    await expect(
-      page.getByRole("button", { name: "Invite" }),
-    ).toBeVisible();
+    await expect(page.getByRole("button", { name: "Invite" })).toBeVisible();
 
     await page.screenshot({
       path: "e2e/org/__screens__/settings-organization.png",
@@ -78,15 +100,17 @@ test.describe("Shared Brain v1 — org FE surfaces (mocked IPC)", () => {
     });
   });
 
-  test("Settings › Organization renders the create form with no org", async ({
+  test("Settings › Organization renders the empty state with no orgs", async ({
     page,
   }) => {
     await mockTauri(page, {
-      org_status: () => null,
       account_status: ACCOUNT_STATUS,
+      org_refresh: () => null,
+      org_list_statuses: () => [],
+      org_status: () => null,
     });
     await page.goto("/settings");
-    await page.getByText("Organization").first().click();
+    await page.getByRole("button", { name: "Organization" }).first().click();
 
     await expect(
       page.getByText("Create an organization"),
@@ -106,7 +130,17 @@ test.describe("Shared Brain v1 — org FE surfaces (mocked IPC)", () => {
   }) => {
     await mockTauri(page, {
       account_status: ACCOUNT_STATUS,
-      org_status: ORG_STATUS,
+      // The share panel still reads the single-org `org_status` (unchanged).
+      org_status: () => ({
+        orgId: "org-1",
+        name: "Acme Inc.",
+        role: "owner",
+        memberCount: 3,
+        consented: true,
+        lastSeq: 42,
+        itemCount: 12,
+        pendingShares: 1,
+      }),
       list_my_shares: () => [],
       list_org_shares: () => [],
       preview_org_share: () => ({

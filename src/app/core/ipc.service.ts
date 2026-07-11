@@ -532,24 +532,49 @@ export class IpcService {
     return invoke<OrgStatus | null>("org_status");
   }
 
-  /** Invite a member by email (owner only). Idempotent on an already-invited address. */
-  orgInviteMember(email: string): Promise<void> {
-    return invoke<void>("org_invite_member", { email });
+  /**
+   * EVERY org this user actively belongs to (created OR invited-into) — one
+   * {@link OrgStatus} per org. Supersedes the single-org {@link orgStatus} for
+   * the multi-org Settings surface. Call {@link orgRefresh} first so a freshly
+   * invited-into org (never created locally) is discovered before this reads the
+   * local replica. Content-free per org (counts + role only, no member emails).
+   */
+  orgListStatuses(): Promise<OrgStatus[]> {
+    return invoke<OrgStatus[]>("org_list_statuses");
   }
 
-  /** List the org's members (owner sees emails to manage; drives the member list). */
-  orgListMembers(): Promise<OrgMember[]> {
-    return invoke<OrgMember[]>("org_list_members");
+  /**
+   * Pull the user's org MEMBERSHIP list from the server (`GET /v1/orgs`) and
+   * reconcile the local `org_state` — this is what makes an org you were INVITED
+   * to (and never created locally) appear. Best-effort: resolves even if the
+   * server is unreachable (the last-known local state stands). Run it before
+   * {@link orgListStatuses} on open.
+   */
+  orgRefresh(): Promise<void> {
+    return invoke<void>("org_refresh");
   }
 
-  /** Remove a member (owner only) — drives the OCK generation rotation server-side. */
-  orgRemoveMember(userId: string): Promise<void> {
-    return invoke<void>("org_remove_member", { userId });
+  /**
+   * Invite a member by email into a SPECIFIC org (owner only). Idempotent on an
+   * already-invited address. `orgId` targets the org in a multi-org world.
+   */
+  orgInviteMember(orgId: string, email: string): Promise<void> {
+    return invoke<void>("org_invite_member", { orgId, email });
   }
 
-  /** Leave the org (self-removal). The local org replica is dropped. */
-  orgLeave(): Promise<void> {
-    return invoke<void>("org_leave");
+  /** List one org's members (owner sees emails to manage; drives the member list). */
+  orgListMembers(orgId: string): Promise<OrgMember[]> {
+    return invoke<OrgMember[]>("org_list_members", { orgId });
+  }
+
+  /** Remove a member from a SPECIFIC org (owner only) — drives the OCK generation rotation. */
+  orgRemoveMember(orgId: string, userId: string): Promise<void> {
+    return invoke<void>("org_remove_member", { orgId, userId });
+  }
+
+  /** Leave a SPECIFIC org (self-removal). The local org replica for that org is dropped. */
+  orgLeave(orgId: string): Promise<void> {
+    return invoke<void>("org_leave", { orgId });
   }
 
   /** Grant the one-time org-egress consent (mirrors `consentToShareEgress`). PRESERVE-ONLY config key. */
@@ -603,9 +628,9 @@ export class IpcService {
     return invoke<void>("revoke_org_share", { itemId });
   }
 
-  /** Manually pull + ingest the org feed now → the {@link OrgSyncReport} (counts + errors only). */
-  orgSyncNow(): Promise<OrgSyncReport> {
-    return invoke<OrgSyncReport>("org_sync_now");
+  /** Manually pull + ingest a SPECIFIC org's feed now → the {@link OrgSyncReport} (counts + errors only). */
+  orgSyncNow(orgId: string): Promise<OrgSyncReport> {
+    return invoke<OrgSyncReport>("org_sync_now", { orgId });
   }
 
   /** The full decrypted org item for the read-only viewer route. */

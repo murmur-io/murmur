@@ -204,6 +204,8 @@ pub fn run() {
             // M6 Shared Brain (Organizations): create/status/members + consent + preview + share.
             commands::org_create,
             commands::org_status,
+            commands::org_list_statuses,
+            commands::org_refresh,
             commands::org_invite_member,
             commands::org_list_members,
             commands::org_remove_member,

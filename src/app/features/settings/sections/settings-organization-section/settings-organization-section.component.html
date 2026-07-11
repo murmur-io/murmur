@@ -2,7 +2,7 @@
   <div class="card account-card">
     <div class="account-head">
       <span class="account-mark" aria-hidden="true">
-        <svg viewBox="0 0 24 24" width="26" height="26" fill="none" role="img" aria-label="Organization">
+        <svg viewBox="0 0 24 24" width="26" height="26" fill="none" role="img" aria-label="Organizations">
           <circle cx="12" cy="8" r="3.2" fill="var(--accent-soft)" stroke="var(--accent-hover)" stroke-width="1.3" />
           <path d="M5.5 20a6.5 6.5 0 0 1 13 0" fill="none" stroke="var(--accent-hover)" stroke-width="1.3" stroke-linecap="round" />
           <circle cx="4.5" cy="10.5" r="1.8" fill="none" stroke="var(--accent-hover)" stroke-width="1.2" />
@@ -10,185 +10,200 @@
         </svg>
       </span>
       <div class="account-copy">
-        <h3>Organization</h3>
+        <h3>Organizations</h3>
         <p class="text-secondary account-sub">
-          Share notes into your org's <strong>shared brain</strong> — a
-          searchable knowledge base every member syncs on-device. It's
-          end-to-end encrypted; the server can't read it.
+          Share notes into an org's <strong>shared brain</strong> — a searchable
+          knowledge base every member syncs on-device. It's end-to-end
+          encrypted; the server can't read it. You can belong to several orgs.
         </p>
+        @if (email(); as e) {
+          <p class="text-muted account-note signed-as">Signed in as <strong>{{ e }}</strong></p>
+        }
       </div>
     </div>
 
     @if (!loaded()) {
-      <p class="text-muted account-note">Loading organization…</p>
-    } @else if (status(); as st) {
-      <!-- ── In an org: manage ── -->
-      <div class="account-section">
-        <span class="account-section-label text-muted">Your organization</span>
-        <div class="signed-in-row">
-          <span class="pill is-success signed-pill">
-            <span class="pill-dot"></span>
-            {{ st.name }}
-          </span>
-          <span class="org-role-chip">{{ st.role === "owner" ? "Owner" : "Member" }}</span>
-          <button
-            type="button"
-            class="btn btn-ghost"
-            (click)="leave()"
-            [disabled]="busy()"
-          >
-            Leave organization
-          </button>
-        </div>
-        <p class="text-secondary account-note">
-          {{ st.memberCount }}
-          {{ st.memberCount === 1 ? "member" : "members" }} ·
-          {{ st.itemCount }} shared
-          {{ st.itemCount === 1 ? "item" : "items" }} synced
-        </p>
-      </div>
-
-      <!-- Org-egress consent — a dedicated command (preserve-only config). -->
-      <div class="account-section">
-        <span class="account-section-label text-muted">Sharing to the org brain</span>
-        <div class="consent-row">
-          @if (consented()) {
-            <span class="pill is-success signed-pill">
-              <span class="pill-dot"></span>
-              Org sharing allowed
-            </span>
-            <button
-              type="button"
-              class="btn btn-ghost"
-              (click)="toggleConsent()"
-              [disabled]="consentBusy()"
-            >
-              {{ consentBusy() ? "…" : "Turn off" }}
-            </button>
-          } @else {
-            <p class="text-secondary account-note">
-              You haven't allowed org sharing yet. When you add an item, its
-              encrypted copy is uploaded to your org's feed.
-            </p>
-            <button
-              type="button"
-              class="btn btn-primary"
-              (click)="toggleConsent()"
-              [disabled]="consentBusy()"
-            >
-              {{ consentBusy() ? "…" : "Allow org sharing" }}
-            </button>
-          }
-        </div>
-      </div>
-
-      <!-- Sync status + Sync now. -->
-      <div class="account-section">
-        <span class="account-section-label text-muted">Sync</span>
-        <div class="signed-in-row">
-          <span class="text-secondary account-note">
-            Last synced sequence <strong>{{ st.lastSeq }}</strong> ·
-            {{ st.itemCount }} {{ st.itemCount === 1 ? "item" : "items" }} in your
-            local brain
-          </span>
-          <button
-            type="button"
-            class="btn btn-ghost"
-            (click)="syncNow()"
-            [disabled]="syncing()"
-          >
-            {{ syncing() ? "Syncing…" : "Sync now" }}
-          </button>
-        </div>
-        @if (st.pendingShares > 0) {
-          <p class="text-secondary account-note">
-            {{ st.pendingShares }}
-            {{ st.pendingShares === 1 ? "share" : "shares" }} still queued to
-            upload — they'll sync on the next launch.
-          </p>
-        }
-        @if (lastSync(); as report) {
-          <p class="text-secondary account-note" role="status">
-            Pulled {{ report.pulled }}, ingested {{ report.ingested }},
-            removed {{ report.tombstoned }}.
-            @if (report.ftsOnly) {
-              <span class="text-muted">
-                (Text-only search — download an embedding model in AI &amp;
-                Models for semantic search.)
-              </span>
-            }
-          </p>
-          @for (err of report.errors; track err) {
-            <p class="text-danger account-note">{{ err }}</p>
-          }
-        }
-      </div>
-
-      <!-- Members (owner only). -->
-      @if (isOwner()) {
+      <p class="text-muted account-note">Loading organizations…</p>
+    } @else {
+      <!-- ── Your organizations ── -->
+      @if (hasOrgs()) {
         <div class="account-section">
-          <span class="account-section-label text-muted">Members</span>
-          <div class="invite-row">
-            <input
-              type="email"
-              class="text-input invite-input"
-              [value]="inviteEmail()"
-              (input)="onInviteEmailInput($event)"
-              (keydown.enter)="invite()"
-              placeholder="colleague@example.com"
-              autocomplete="off"
-              spellcheck="false"
-              aria-label="Invite a member by email"
-              [disabled]="inviting()"
-            />
-            <button
-              type="button"
-              class="btn btn-primary"
-              (click)="invite()"
-              [disabled]="inviting() || !inviteEmail().trim()"
-            >
-              {{ inviting() ? "Inviting…" : "Invite" }}
-            </button>
-          </div>
-          @if (membersError(); as merr) {
-            <p class="text-danger account-note" role="alert">{{ merr }}</p>
-          }
-          <ul class="member-list">
-            @for (m of sortedMembers(); track m.userId) {
-              <li class="member-row" [class.is-removed]="m.removed">
-                <div class="member-meta">
-                  <span class="member-email">{{ m.email }}</span>
-                  <span class="member-sub text-muted">
-                    {{ m.role === "owner" ? "Owner" : "Member" }} ·
-                    joined {{ formatDate(m.addedAt) }}
-                    @if (m.removed) {
-                      · removed
-                    }
+          <span class="account-section-label text-muted">
+            Your organizations
+          </span>
+          <ul class="org-list">
+            @for (o of orgs(); track o.orgId) {
+              <li class="org-card">
+                <div class="org-card-head">
+                  <div class="org-identity">
+                    <span class="org-name">{{ o.name }}</span>
+                    <span
+                      class="org-role-badge"
+                      [class.is-owner]="o.role === 'owner'"
+                      [class.is-member]="o.role !== 'owner'"
+                    >
+                      {{ o.role === "owner" ? "Owner" : "Member" }}
+                    </span>
+                  </div>
+                  <span class="text-secondary org-counts">
+                    {{ o.memberCount }}
+                    {{ o.memberCount === 1 ? "member" : "members" }} ·
+                    {{ o.itemCount }} {{ o.itemCount === 1 ? "item" : "items" }}
                   </span>
                 </div>
-                @if (!m.removed && m.role !== "owner") {
+
+                <p class="text-muted account-note org-sync-line">
+                  Synced to sequence <strong>{{ o.lastSeq }}</strong>.
+                  @if (o.pendingShares > 0) {
+                    {{ o.pendingShares }}
+                    {{ o.pendingShares === 1 ? "share" : "shares" }} queued to
+                    upload.
+                  }
+                </p>
+
+                <div class="org-actions">
+                  @if (o.role === "owner") {
+                    <button
+                      type="button"
+                      class="btn btn-ghost mini-btn"
+                      (click)="toggleMembers(o)"
+                    >
+                      {{ expandedOrgId() === o.orgId ? "Hide members" : "Invite & members" }}
+                    </button>
+                  }
                   <button
                     type="button"
                     class="btn btn-ghost mini-btn"
-                    (click)="removeMember(m)"
-                    [disabled]="removingId() !== null"
+                    (click)="syncNow(o)"
+                    [disabled]="syncingOrgId() !== null"
                   >
-                    {{ removingId() === m.userId ? "Removing…" : "Remove" }}
+                    {{ syncingOrgId() === o.orgId ? "Syncing…" : "Sync now" }}
                   </button>
+                  <button
+                    type="button"
+                    class="btn btn-ghost mini-btn org-leave"
+                    (click)="leave(o)"
+                    [disabled]="busyOrgId() !== null"
+                  >
+                    {{ busyOrgId() === o.orgId ? "Leaving…" : "Leave" }}
+                  </button>
+                </div>
+
+                <!-- Member manager (owner only, expanded on demand). -->
+                @if (o.role === "owner" && expandedOrgId() === o.orgId) {
+                  <div class="org-members">
+                    <div class="invite-row">
+                      <input
+                        type="email"
+                        class="text-input invite-input"
+                        [value]="inviteEmail()"
+                        (input)="onInviteEmailInput($event)"
+                        (keydown.enter)="invite(o.orgId)"
+                        placeholder="colleague@example.com"
+                        autocomplete="off"
+                        spellcheck="false"
+                        aria-label="Invite a member by email"
+                        [disabled]="inviting()"
+                      />
+                      <button
+                        type="button"
+                        class="btn btn-primary"
+                        (click)="invite(o.orgId)"
+                        [disabled]="inviting() || !inviteEmail().trim()"
+                      >
+                        {{ inviting() ? "Inviting…" : "Invite" }}
+                      </button>
+                    </div>
+                    @if (membersError(); as merr) {
+                      <p class="text-danger account-note" role="alert">{{ merr }}</p>
+                    }
+                    @if (membersLoading()) {
+                      <p class="text-muted account-note">Loading members…</p>
+                    } @else {
+                      <ul class="member-list">
+                        @for (m of sortedMembers(); track m.userId) {
+                          <li class="member-row" [class.is-removed]="m.removed">
+                            <div class="member-meta">
+                              <span class="member-email">{{ m.email ?? m.userId }}</span>
+                              <span class="member-sub text-muted">
+                                {{ m.role === "owner" ? "Owner" : "Member" }} ·
+                                joined {{ formatDate(m.addedAt) }}
+                                @if (m.removed) {
+                                  · removed
+                                }
+                              </span>
+                            </div>
+                            @if (!m.removed && m.role !== "owner") {
+                              <button
+                                type="button"
+                                class="btn btn-ghost mini-btn"
+                                (click)="removeMember(o.orgId, m)"
+                                [disabled]="removingId() !== null"
+                              >
+                                {{ removingId() === m.userId ? "Removing…" : "Remove" }}
+                              </button>
+                            }
+                          </li>
+                        } @empty {
+                          <li class="member-empty text-muted">No other members yet — invite a colleague.</li>
+                        }
+                      </ul>
+                      <p class="text-muted account-note">
+                        Removing a member rotates the org's encryption key so they
+                        can no longer read new items.
+                      </p>
+                    }
+                  </div>
                 }
               </li>
-            } @empty {
-              <li class="member-empty text-muted">No other members yet — invite a colleague.</li>
             }
           </ul>
-          <p class="text-muted account-note">
-            Removing a member rotates the org's encryption key so they can no
-            longer read new items.
+        </div>
+
+        <!-- ONE global org-egress consent — not per-org (a follow-up). -->
+        <div class="account-section">
+          <span class="account-section-label text-muted">Sharing to your org brains</span>
+          <div class="consent-row">
+            @if (consented()) {
+              <span class="pill is-success signed-pill">
+                <span class="pill-dot"></span>
+                Org sharing allowed
+              </span>
+              <button
+                type="button"
+                class="btn btn-ghost"
+                (click)="toggleConsent()"
+                [disabled]="consentBusy()"
+              >
+                {{ consentBusy() ? "…" : "Turn off" }}
+              </button>
+            } @else {
+              <p class="text-secondary account-note">
+                Share my notes into my organizations. When you add an item, its
+                encrypted copy is uploaded to that org's feed.
+              </p>
+              <button
+                type="button"
+                class="btn btn-primary"
+                (click)="toggleConsent()"
+                [disabled]="consentBusy()"
+              >
+                {{ consentBusy() ? "…" : "Allow org sharing" }}
+              </button>
+            }
+          </div>
+        </div>
+      } @else {
+        <!-- ── Empty state: in no org ── -->
+        <div class="account-section">
+          <p class="text-secondary account-note org-empty">
+            You're not in any organization yet — create one, or ask a teammate to
+            invite you by email.
           </p>
         </div>
       }
-    } @else {
-      <!-- ── No org: create ── -->
+
+      <!-- Create an org (always available — you can be in several). -->
       <div class="account-section">
         <span class="account-section-label text-muted">Create an organization</span>
         <p class="text-secondary account-note">
