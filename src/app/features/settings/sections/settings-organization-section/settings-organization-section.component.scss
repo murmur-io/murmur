@@ -51,6 +51,12 @@
 .account-sub strong {
   color: var(--text-primary);
 }
+.signed-as {
+  margin-top: var(--space-1);
+}
+.signed-as strong {
+  color: var(--text-secondary);
+}
 
 .account-section {
   display: flex;
@@ -72,25 +78,95 @@
   color: var(--text-primary);
 }
 
-.signed-in-row {
+/* ── Org list of cards ── */
+.org-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+.org-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-4);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--surface-input);
+}
+.org-card-head {
   display: flex;
   align-items: center;
+  justify-content: space-between;
   gap: var(--space-3);
   flex-wrap: wrap;
 }
-.signed-pill {
-  align-self: flex-start;
+.org-identity {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
 }
-.org-role-chip {
+.org-name {
+  color: var(--text-primary);
+  font-size: 1rem;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.org-role-badge {
   padding: 2px var(--space-2);
   border-radius: var(--radius-pill);
-  background: var(--surface-input);
-  border: 1px solid var(--border-subtle);
-  color: var(--text-secondary);
-  font-size: 0.75rem;
-  font-weight: 600;
+  font-size: 0.7rem;
+  font-weight: 700;
   text-transform: uppercase;
-  letter-spacing: 0.03em;
+  letter-spacing: 0.04em;
+  flex: none;
+}
+/* OWNER = filled accent (you manage this org). */
+.org-role-badge.is-owner {
+  background: var(--accent);
+  color: var(--text-on-accent);
+  border: 1px solid transparent;
+}
+/* MEMBER = neutral outline (you belong, someone else owns). */
+.org-role-badge.is-member {
+  background: transparent;
+  color: var(--text-secondary);
+  border: 1px solid var(--border-strong);
+}
+.org-counts {
+  font-size: 0.85rem;
+  white-space: nowrap;
+}
+.org-sync-line {
+  font-size: 0.85rem;
+}
+
+.org-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+.org-leave {
+  color: var(--text-secondary);
+}
+
+.org-members {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--border-subtle);
+}
+
+.org-empty {
+  font-size: 0.9rem;
 }
 
 .consent-row {
@@ -98,6 +174,9 @@
   align-items: center;
   gap: var(--space-3);
   flex-wrap: wrap;
+}
+.signed-pill {
+  align-self: flex-start;
 }
 
 /* Shared text input — mirrors the account section's input treatment via tokens. */
