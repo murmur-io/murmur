@@ -55,19 +55,24 @@ test("selecting body text floats the bubble; Ask Brain → Refine → Accept upd
   const popover = page.locator("app-note-brain-popover");
   await expect(popover).toBeVisible();
 
-  // The three actions (settings toggles all ON in the mock).
-  await expect(popover.getByRole("button", { name: "Refine", exact: true })).toBeVisible();
-  await expect(popover.getByRole("button", { name: "Shorten", exact: true })).toBeVisible();
-  await expect(popover.getByRole("button", { name: "Enhance context", exact: true })).toBeVisible();
+  // The ClickUp-style command menu: the "Ask Brain to edit…" input + the 5 quick
+  // actions. Row buttons carry a label AND a description, so their accessible name
+  // is "<label> <desc>" — match by (non-exact) label substring, not exact. "Enhance
+  // context" is NOT a quick action anymore; it lives under "More actions".
+  await expect(popover.getByPlaceholder("Ask Brain to edit…")).toBeVisible();
+  await expect(popover.getByRole("button", { name: "Refine" })).toBeVisible();
+  await expect(popover.getByRole("button", { name: "Shorten" })).toBeVisible();
+  await expect(popover.getByRole("button", { name: "Find related" })).toBeVisible();
+  await expect(popover.getByRole("button", { name: "Enhance context" })).toHaveCount(0);
 
-  // Run Refine → the stepped flow lands the mocked suggestion.
+  // Run Refine → the stepped flow lands the mocked replace suggestion.
   // NOTE: use dispatchEvent("click") rather than a full pointer .click() here.
   // A real pointer click (mousedown→mouseup) on a floating element while a
   // <textarea> holds a live selection disturbs that selection mid-sequence in
   // headless Chromium, so `run()` doesn't advance; a plain DOM `click` event —
   // exactly what the (click) handler responds to — fires the flow deterministically.
   // (Verified: a native el.click() advances the popover to the result phase.)
-  await popover.getByRole("button", { name: "Refine", exact: true }).dispatchEvent("click");
+  await popover.getByRole("button", { name: "Refine" }).dispatchEvent("click");
   await expect(popover.getByText("A refined version of your text.")).toBeVisible();
 
   // Accept → the editor replaces the selection in the textarea with the suggestion

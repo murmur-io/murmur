@@ -24,6 +24,7 @@ import type {
   VoiceprintInfo,
 } from "../../core/models";
 import type { UnlistenFn } from "@tauri-apps/api/event";
+import { NOTE_ASSIST_NEW_ACTION_IDS } from "../notes/note-brain-popover/note-assist-catalog";
 
 /**
  * The four provider-backed connection ids — the ones `list_models` serves a
@@ -212,12 +213,35 @@ export class SettingsStore {
     roleLiveConnection: "",
     roleLiveModel: "",
     roleLiveEffort: "",
-    // Notes feature — the three in-note selection-assistant actions. All default
-    // TRUE and round-tripped on every save so a settings save never silently
-    // disables one (mirrors the proactiveHintsEnabled/userMemoryEnabled pattern).
+    // Notes feature — the three LEGACY in-note selection-assistant actions. All
+    // default TRUE and round-tripped on every save so a settings save never
+    // silently disables one (mirrors the proactiveHintsEnabled/userMemoryEnabled
+    // pattern). The 16 NEWER actions each get a boolean control too (all default
+    // TRUE = enabled); load()/save() convert those booleans ↔ the single
+    // `noteAssistActionsOff: string[]` config field (an action is OFF ⇒ its id is
+    // in the list). Keeping one bool PER new action lets `mur-toggle
+    // formControlName` bind directly and ride the existing auto-save, while the
+    // DTO stays a single scalable field (contract).
     noteAssistRefine: true,
     noteAssistShorten: true,
     noteAssistEnhance: true,
+    // NEW actions (control name === action id). TRUE = enabled.
+    grammar: true,
+    expand: true,
+    simplify: true,
+    tone: true,
+    translate: true,
+    bullets: true,
+    table: true,
+    keypoints: true,
+    find_related: true,
+    link_entities: true,
+    fact_check: true,
+    ask: true,
+    action_items: true,
+    decisions: true,
+    draft_followup: true,
+    spinoff_note: true,
   });
   readonly keyControl = new FormControl("", { nonNullable: true });
   /** BYO Brave Search API key input (web-search connector). Cleared after save. */
@@ -1349,6 +1373,8 @@ export class SettingsStore {
         noteAssistRefine: cfg.noteAssistRefine ?? true,
         noteAssistShorten: cfg.noteAssistShorten ?? true,
         noteAssistEnhance: cfg.noteAssistEnhance ?? true,
+        // The 16 NEW actions: enabled ⇔ NOT in the off-list (absent list ⇒ all ON).
+        ...this.noteAssistOffToToggles(cfg.noteAssistActionsOff ?? []),
       });
       this._loadedBrainBackend = (cfg.brainBackend ?? "cloud") as BrainBackend;
       // Prefetch the model catalogs the loaded config already renders selects
@@ -2092,11 +2118,14 @@ export class SettingsStore {
       roleLiveConnection: v.roleLiveConnection,
       roleLiveModel: v.roleLiveModel,
       roleLiveEffort: v.roleLiveEffort,
-      // Notes feature — the three note-assistant action toggles ride every save
-      // like the other feature flags, so a settings save never disables one.
+      // Notes feature — the three legacy note-assistant action toggles ride every
+      // save like the other feature flags, so a settings save never disables one.
       noteAssistRefine: v.noteAssistRefine,
       noteAssistShorten: v.noteAssistShorten,
       noteAssistEnhance: v.noteAssistEnhance,
+      // The 16 NEW actions collapse to a single off-list: an action whose toggle
+      // is FALSE has its id added here (scales without one column per action).
+      noteAssistActionsOff: this.noteAssistTogglesToOff(v),
       // M3-CLIENT sharing — preserve-only: carry the snapshot back unchanged so
       // the shell Save never clears the sharing server / share-egress consent
       // (the Account section is the sole owner of these values).
@@ -2125,6 +2154,29 @@ export class SettingsStore {
     } catch (e) {
       this._loadError.set("Save failed: " + String(e));
     }
+  }
+
+  /**
+   * Map the config's `noteAssistActionsOff` list → the per-action toggle booleans
+   * the form patches on load: an action is ON (true) unless its id is in the list.
+   * Only the NEW actions are handled here (the legacy trio ride their own bools).
+   */
+  private noteAssistOffToToggles(off: string[]): Record<string, boolean> {
+    const offSet = new Set(off);
+    const toggles: Record<string, boolean> = {};
+    for (const id of NOTE_ASSIST_NEW_ACTION_IDS) {
+      toggles[id] = !offSet.has(id);
+    }
+    return toggles;
+  }
+
+  /**
+   * Collapse the per-action toggle booleans (from the form value) → the config's
+   * `noteAssistActionsOff` list: an action whose toggle is FALSE contributes its
+   * id. Order-stable (catalog order) so a save produces a deterministic list.
+   */
+  private noteAssistTogglesToOff(v: Record<string, unknown>): string[] {
+    return NOTE_ASSIST_NEW_ACTION_IDS.filter((id) => v[id] === false);
   }
 
   /** Re-fetch the token-bearing MCP config into its signal (after load / config save). */

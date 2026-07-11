@@ -22,6 +22,7 @@ import { FoldersService } from "../../../services/folders.service";
 import { NotesService } from "../../../services/notes.service";
 import { ToastService } from "../../../services/toast.service";
 import { MarkdownComponent } from "../../../shared/markdown/markdown.component";
+import { NOTE_ASSIST_CATALOG } from "../note-brain-popover/note-assist-catalog";
 import {
   NoteBrainPopoverComponent,
   type AcceptedEdit,
@@ -278,32 +279,46 @@ export class NoteEditorComponent {
   private readonly config = signal<AppConfigDto | null>(null);
 
   /**
-   * Which selection-assistant actions the user has ENABLED in Settings
-   * (`noteAssistRefine`/`-Shorten`/`-Enhance`). All default TRUE — an ABSENT
-   * value (undefined) is treated as TRUE (the same contract the settings block +
-   * backend use), and a null config (not yet loaded / load failed) also defaults
-   * every action ON so the popover works before the config lands. The popover
-   * hides a disabled action's button; the backend is still the real gate
-   * (a disabled action refuses `Unavailable`).
+   * The set of selection-assistant action ids the user has ENABLED in Settings,
+   * fed to the popover (it hides a disabled row; the backend is still the real
+   * gate — a disabled action refuses `Unavailable`). The legacy trio follows its
+   * own AppConfig bools (`noteAssistRefine`/`-Shorten`/`-Enhance`); every other
+   * catalog action is enabled unless its id is in `noteAssistActionsOff`. All
+   * default ON: an ABSENT bool reads TRUE and an absent off-list means nothing is
+   * off (the same contract the settings block + backend use), and a null config
+   * (not yet loaded / load failed) also defaults every action ON so the popover
+   * works before the config lands. `custom` is always available (the popover adds
+   * it regardless), so it is not in this set.
    */
-  readonly assistToggles = computed(() => {
+  readonly enabledActions = computed<Set<string>>(() => {
     const cfg = this.config();
-    return {
-      refine: cfg?.noteAssistRefine ?? true,
-      shorten: cfg?.noteAssistShorten ?? true,
-      enhance: cfg?.noteAssistEnhance ?? true,
-    };
+    const off = new Set(cfg?.noteAssistActionsOff ?? []);
+    const on = new Set<string>();
+    for (const a of NOTE_ASSIST_CATALOG) {
+      let enabled: boolean;
+      if (a.id === "refine") {
+        enabled = cfg?.noteAssistRefine ?? true;
+      } else if (a.id === "shorten") {
+        enabled = cfg?.noteAssistShorten ?? true;
+      } else if (a.id === "enhance") {
+        enabled = cfg?.noteAssistEnhance ?? true;
+      } else {
+        enabled = !off.has(a.id);
+      }
+      if (enabled) {
+        on.add(a.id);
+      }
+    }
+    return on;
   });
 
   /**
-   * Whether ANY note-assistant action is enabled — gates the bubble's "Ask Brain"
-   * button (formatting is always available; only the AI entry point is hidden when
-   * the user disabled every action in Settings).
+   * Whether the bubble's "Ask Brain" AI entry point is offered. `custom` (the
+   * command-input free-text instruction) is ALWAYS available in the popover, so
+   * the AI button stays even when the user turned every catalog action off — the
+   * user can still type an instruction. (The backend still gates each action.)
    */
-  readonly anyAssistEnabled = computed(() => {
-    const t = this.assistToggles();
-    return t.refine || t.shorten || t.enhance;
-  });
+  readonly anyAssistEnabled = computed(() => true);
 
   /**
    * Resolve the route id on every change: `/notes/new` creates + replaces the
@@ -339,7 +354,7 @@ export class NoteEditorComponent {
   }
 
   /**
-   * Load the app config into a signal so `assistToggles` can gate the selection
+   * Load the app config into a signal so `enabledActions` can gate the selection
    * popover's actions by the Settings note-assistant flags. Best-effort — mirrors
    * how `detail.component.ts` reads config (a failure leaves `config` null, and
    * every action defaults ON, matching the undefined-⇒-TRUE contract).
@@ -1221,11 +1236,28 @@ export class NoteEditorComponent {
   }
 
   /**
-   * Apply an accepted assistant edit into the textarea. Refine/Shorten REPLACE
-   * the current selection; Enhance INSERTS the passage AFTER the selection
-   * (additive — never destroys the user's text). Then autosave.
+   * Apply an accepted assistant outcome. Branches on `edit.kind` (never on the
+   * action):
+   * - `copy`    — write `text` to the clipboard (draft follow-up / an info answer);
+   *              no textarea change needed.
+   * - `spinoff` — create a NEW note from `title` + `body` and open it.
+   * - `replace` — replace the current selection with `suggestion`.
+   * - `insert`  — append `suggestion` after the selection (additive — never
+   *              destroys the user's text). Then autosave.
    */
   applyEdit(edit: AcceptedEdit): void {
+    // Clipboard + note-creation don't touch the selection span — handle first.
+    if (edit.kind === "copy") {
+      void this.copyToClipboard(edit.text);
+      this.clearSelection();
+      return;
+    }
+    if (edit.kind === "spinoff") {
+      void this.createSpinoffNote(edit.title, edit.body);
+      this.clearSelection();
+      return;
+    }
+
     const el = this.bodyArea()?.nativeElement;
     const sel = this.sel();
     if (!el || !sel) {
@@ -1245,7 +1277,7 @@ export class NoteEditorComponent {
       }
       end = start + sel.text.length;
     }
-    if (edit.action === "enhance") {
+    if (edit.kind === "insert") {
       // Insert the additive passage after the selection on its own paragraph.
       const insert = `\n\n${edit.suggestion.trim()}\n`;
       this.replaceRange(el, end, end, insert, end + insert.length, end + insert.length);
@@ -1265,6 +1297,34 @@ export class NoteEditorComponent {
       );
     }
     this.clearSelection();
+  }
+
+  /** Copy assistant output to the clipboard (best-effort; toast on either path). */
+  private async copyToClipboard(text: string): Promise<void> {
+    try {
+      await navigator.clipboard.writeText(text);
+      this.toast.success("Copied to clipboard");
+    } catch {
+      this.toast.danger("Couldn’t copy to clipboard");
+    }
+  }
+
+  /**
+   * Create a NEW note from a spin-off draft (title + body) in the CURRENT folder
+   * and open it. The assistant command returned only a draft — note creation is
+   * the user's explicit action here (keeps the command pure, per the seam
+   * contract). Best-effort; a failure toasts and leaves the editor untouched.
+   */
+  private async createSpinoffNote(title: string, body: string): Promise<void> {
+    try {
+      const folderId = this.note()?.folderId ?? null;
+      const id = await this.ipc.createNote(folderId, title);
+      await this.ipc.updateNoteDoc(id, title, body);
+      void this.notes.loadNotes(null);
+      void this.router.navigate(["/notes", id]);
+    } catch {
+      this.toast.danger("Couldn’t create the note");
+    }
   }
 
   // ── Presentational helpers ────────────────────────────────────────────
