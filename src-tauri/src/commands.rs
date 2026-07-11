@@ -12786,6 +12786,14 @@ pub async fn account_login(
     }
 
     crate::share::ledger_row(&state.db, &client.host(), "account_login", 0);
+
+    // Membership discovery: reconcile the org set the server says we belong to (owned AND invited)
+    // into local `org_state` now the session is cached — so an org we were invited to appears (and
+    // becomes syncable) at login, not only after a create. Best-effort: a failure never blocks login.
+    if let Err(e) = org_reconcile_memberships(state.inner()).await {
+        tracing::warn!(target: "org", error = %brief_err(&e), "org membership reconcile at login failed (non-fatal)");
+    }
+
     account_status(state)
 }
 
@@ -22529,6 +22537,262 @@ mod lifecycle_tests {
         assert!(state.db.get_org_state("org-1").unwrap().is_none());
     }
 
+    /// Seed a bare local org row (membership metadata only) for the multi-org tests.
+    fn seed_org(db: &Db, org_id: &str, name: &str, role: &str, generation: u32) {
+        db.upsert_org_state(&crate::storage::OrgState {
+            org_id: org_id.into(),
+            name: name.into(),
+            role: role.into(),
+            joined_at: "2026-07-11T00:00:00Z".into(),
+            consented: false,
+            last_seq: 0,
+            generation,
+        })
+        .unwrap();
+    }
+
+    /// Seed a local org row with an explicit `joined_at` so the `.next()` (ORDER BY joined_at ASC)
+    /// ordering is DETERMINISTIC — the targeting tests need the pre-fix first-org to be a fixed org so
+    /// their RED direction (a `.next()` returning the WRONG org) is unambiguous, not flaky.
+    fn seed_org_at(db: &Db, org_id: &str, name: &str, role: &str, joined_at: &str) {
+        db.upsert_org_state(&crate::storage::OrgState {
+            org_id: org_id.into(),
+            name: name.into(),
+            role: role.into(),
+            joined_at: joined_at.into(),
+            consented: false,
+            last_seq: 0,
+            generation: 1,
+        })
+        .unwrap();
+    }
+
+    /// MULTI-ORG STATUS (RED→GREEN for the single-org `.next()` bug): `org_list_statuses` must return
+    /// an `OrgStatus` for EVERY locally-joined org — the one I created AND the one I was invited to —
+    /// not just the first. With no server configured (empty base URL) it stays offline: each status
+    /// falls back to the cached row. This FAILS on any `.next()`/first-only status path (it would
+    /// return 1). `org_status` (legacy) still returns exactly the FIRST for old callers.
+    #[test]
+    fn org_list_statuses_returns_all_local_orgs() {
+        let state = build_state("org-list-statuses");
+        // Two orgs: one owned (created), one member (invited). No server → offline per-org fallback.
+        seed_org(&state.db, "org-own", "Acme", "owner", 1);
+        seed_org(&state.db, "org-inv", "Partner Co", "member", 2);
+
+        let statuses = block_on(org_list_statuses_inner(&state)).unwrap();
+        assert_eq!(
+            statuses.len(),
+            2,
+            "every locally-joined org yields a status (RED on a single-org .next())"
+        );
+        let ids: std::collections::HashSet<&str> =
+            statuses.iter().map(|s| s.org_id.as_str()).collect();
+        assert!(ids.contains("org-own"), "the owned org appears");
+        assert!(ids.contains("org-inv"), "the invited org appears");
+
+        // Legacy single-org `org_status` still returns the FIRST (ordered by joined_at) — unchanged
+        // for pre-multi-org FE callers.
+        let first = block_on(org_status_inner(&state)).unwrap();
+        assert!(first.is_some(), "legacy org_status still returns the first");
+    }
+
+    /// MEMBERSHIP RECONCILE (DB core, network-free): `reconcile_org_state_into_db` must ADD an org the
+    /// server now lists (an invite I didn't have locally) and REMOVE an org the server no longer lists
+    /// (I left / was removed). Preserves an existing org's local cursor/consent across the refresh.
+    #[test]
+    fn reconcile_adds_invited_org_and_removes_departed() {
+        let state = build_state("org-reconcile");
+        // Local pre-state: I'm in "org-keep" (with a cursor + consent) and "org-gone" (departed).
+        seed_org(&state.db, "org-keep", "Keep", "member", 1);
+        seed_org(&state.db, "org-gone", "Gone", "member", 1);
+        state.db.set_org_consented("org-keep", true).unwrap();
+        state.db.set_org_last_seq("org-keep", 55).unwrap();
+
+        // Server says: I'm in "org-keep" (name refreshed) + a NEW "org-new" (an invite). "org-gone" is
+        // absent (I left / was removed).
+        let server = vec![
+            crate::share::org_dto::OrgSummary {
+                org_id: "org-keep".into(),
+                name: "Keep Renamed".into(),
+                role: "member".into(),
+                created_at: "2026-07-01T00:00:00Z".into(),
+                current_generation: 3,
+            },
+            crate::share::org_dto::OrgSummary {
+                org_id: "org-new".into(),
+                name: "Newly Invited".into(),
+                role: "member".into(),
+                created_at: "2026-07-11T09:00:00Z".into(),
+                current_generation: 1,
+            },
+        ];
+
+        let outcome = reconcile_org_state_into_db(&state, &server).unwrap();
+        // "org-new" is the only NEW org (needs an OCK fetch); "org-gone" is the only removal.
+        assert_eq!(outcome.new_orgs, vec![("org-new".to_string(), 1u32)]);
+        assert_eq!(outcome.removed, 1);
+
+        let after: std::collections::HashSet<String> = state
+            .db
+            .list_org_states()
+            .unwrap()
+            .into_iter()
+            .map(|o| o.org_id)
+            .collect();
+        assert!(after.contains("org-keep"), "kept org stays");
+        assert!(after.contains("org-new"), "invited org added");
+        assert!(!after.contains("org-gone"), "departed org removed");
+
+        // The kept org's LOCAL cursor + consent survive the reconcile (upsert only refreshed
+        // name/role/generation); its generation was refreshed to the server value.
+        let keep = state.db.get_org_state("org-keep").unwrap().unwrap();
+        assert_eq!(keep.name, "Keep Renamed", "name refreshed from server");
+        assert_eq!(keep.generation, 3, "generation refreshed from server");
+        assert_eq!(keep.last_seq, 55, "local cursor NOT rewound");
+        assert!(keep.consented, "local consent NOT cleared");
+        // The new org lands with the defaults.
+        let new = state.db.get_org_state("org-new").unwrap().unwrap();
+        assert_eq!(new.joined_at, "2026-07-11T09:00:00Z");
+        assert!(!new.consented);
+        assert_eq!(new.last_seq, 0);
+    }
+
+    /// MULTI-ORG SYNC iterates ALL orgs (does NOT `.next()`-short-circuit on the FIRST). Seed TWO
+    /// orgs + a live session, and point the client at an UNREACHABLE loopback URL (no real egress —
+    /// the connection is refused). `org_sync_now_inner` must attempt BOTH orgs' feeds: each per-org
+    /// pull fails (connection refused), and a per-org failure is recorded in `report.errors` WITHOUT
+    /// aborting the others — so we see TWO org-level error entries, proving the loop ran twice. The
+    /// pre-fix single-org path would produce at most ONE. No cursor is ever rewound.
+    #[test]
+    fn org_sync_now_over_two_orgs_iterates_both() {
+        let state = build_state("org-sync-multi");
+        seed_org(&state.db, "org-a", "A", "member", 1);
+        seed_org(&state.db, "org-b", "B", "member", 1);
+        state.db.set_org_last_seq("org-a", 10).unwrap();
+        state.db.set_org_last_seq("org-b", 20).unwrap();
+
+        // A loopback URL with a closed port → connection refused (validate_gateway_url allows http on
+        // loopback). NO real network egress; both org feeds fail the same way.
+        state.config.lock().unwrap().share_base_url = "http://127.0.0.1:9/".to_string();
+        // A live (non-expired) session so `valid_access_token` yields a bearer and the loop runs.
+        *state.account_session.lock().unwrap() = Some(crate::share::AccountSession {
+            account_id: "user@example.com".into(),
+            email: "user@example.com".into(),
+            server_user_id: Some("c534b6d2-02c1-4c2c-a256-3af8592b1567".into()),
+            device_id: "dev-1".into(),
+            mk: Zeroizing::new([7u8; 32]),
+            generation: 1,
+            access_token: "a".into(),
+            access_expires_at: Some("2099-01-01T00:00:00Z".into()),
+            refresh_token: "r".into(),
+        });
+
+        let report = block_on(org_sync_now_inner(&state)).unwrap();
+        // BOTH orgs were attempted → BOTH per-org failures recorded (loop iterated twice, not once).
+        assert_eq!(
+            report.errors.len(),
+            2,
+            "one error per org proves the loop iterated ALL orgs, not just the first"
+        );
+        assert_eq!(report.ingested, 0);
+        assert_eq!(report.tombstoned, 0);
+        // Neither cursor is rewound by a failed sync (monotonic).
+        assert_eq!(state.db.get_org_state("org-a").unwrap().unwrap().last_seq, 10);
+        assert_eq!(state.db.get_org_state("org-b").unwrap().unwrap().last_seq, 20);
+    }
+
+    /// F1 (MULTI-ORG TARGETING, RED→GREEN for the `.next()` misroute): with TWO local orgs, the org
+    /// commands must resolve the SPECIFIC org the FE passed, never the FIRST. `resolve_org` — the
+    /// shared resolution seam every per-org command now uses — must return the SECOND org's row when
+    /// asked for it (RED on any `.next()`/first-only resolution: it would return org #1's row), refuse
+    /// a blank id, and refuse an org the caller isn't a local member of.
+    #[test]
+    fn resolve_org_targets_the_specified_org_not_the_first() {
+        let state = build_state("org-resolve-target");
+        // `org-first` joined EARLIER → it is the deterministic `.next()` (ORDER BY joined_at ASC) org,
+        // so a pre-fix first-only resolve would return it — making the RED direction unambiguous.
+        seed_org_at(&state.db, "org-first", "First", "owner", "2026-07-01T00:00:00Z");
+        seed_org_at(&state.db, "org-second", "Second", "member", "2026-07-11T00:00:00Z");
+
+        // Ask for the SECOND org explicitly → get the SECOND (not the first-by-.next()).
+        let got = resolve_org(&state, "org-second").unwrap();
+        assert_eq!(
+            got.org_id, "org-second",
+            "resolve targets the specified org, not the first (RED on a .next() resolve)"
+        );
+        assert_eq!(got.role, "member");
+        // And the first, explicitly, still resolves to the first.
+        assert_eq!(resolve_org(&state, "org-first").unwrap().org_id, "org-first");
+
+        // A blank id is an InvalidArg refusal (never a silent first-org pick).
+        assert!(matches!(
+            resolve_org(&state, "  "),
+            Err(AppError::InvalidArg(_))
+        ));
+        // An org we're not a local member of is refused — we never operate on an org the caller isn't in.
+        assert!(matches!(
+            resolve_org(&state, "org-not-mine"),
+            Err(AppError::InvalidArg(_))
+        ));
+    }
+
+    /// F1 (org_leave targets the SPECIFIED org's local state). `org_leave` deletes the local org row +
+    /// purges the replica for the org the FE picked. It first calls the server (unreachable here), so
+    /// we drive the DB-side purge through the same helper `org_leave` uses (`delete_org_state`) against
+    /// the resolved SECOND org and assert ONLY it is removed — the first org (which a `.next()` would
+    /// have wrongly purged) survives. Proves the leave operates on the specified org id, not the first.
+    #[test]
+    fn org_leave_purges_only_the_specified_org() {
+        let state = build_state("org-leave-target");
+        // `org-keep` joined EARLIER → it is the deterministic `.next()` org a pre-fix leave would have
+        // wrongly purged; the FE asks to leave `org-drop` (the SECOND).
+        seed_org_at(&state.db, "org-keep", "Keep", "owner", "2026-07-01T00:00:00Z");
+        seed_org_at(&state.db, "org-drop", "Drop", "member", "2026-07-11T00:00:00Z");
+
+        // Resolve the SECOND org (the one the FE asked to leave) and apply the same DB purge `org_leave`
+        // does after the server call.
+        let target = resolve_org(&state, "org-drop").unwrap();
+        assert_eq!(target.org_id, "org-drop");
+        state.db.delete_org_state(&target.org_id).unwrap();
+        state.db.purge_org_replica(&target.org_id).unwrap();
+
+        assert!(
+            state.db.get_org_state("org-drop").unwrap().is_none(),
+            "the specified org was removed"
+        );
+        assert!(
+            state.db.get_org_state("org-keep").unwrap().is_some(),
+            "the FIRST org is untouched (a .next()-based leave would have wrongly purged it)"
+        );
+    }
+
+    /// F2 (HARDENING, RED→GREEN): an EMPTY server membership list must NOT wipe all local org replicas.
+    /// `reconcile_org_state_into_db` with an empty target set but a NON-empty local set removes NOTHING
+    /// (a `{"orgs":[]}` from a buggy/hostile/transient server would otherwise purge every local org).
+    /// RED on the pre-fix reconcile (it removed both local orgs = `removed == 2`, both gone); GREEN
+    /// after the empty-server guard (removed == 0, both cached rows kept). A non-empty list omitting a
+    /// SPECIFIC org (the real leave/remove case) still removes it — asserted by
+    /// `reconcile_adds_invited_org_and_removes_departed`.
+    #[test]
+    fn reconcile_empty_server_list_keeps_local_orgs() {
+        let state = build_state("org-reconcile-empty");
+        seed_org(&state.db, "org-a", "A", "owner", 1);
+        seed_org(&state.db, "org-b", "B", "member", 1);
+
+        // Server returns an EMPTY membership list (suspicious while we HAVE local orgs).
+        let server: Vec<crate::share::org_dto::OrgSummary> = Vec::new();
+        let outcome = reconcile_org_state_into_db(&state, &server).unwrap();
+
+        assert_eq!(
+            outcome.removed, 0,
+            "an empty server list removes NOTHING (RED on the pre-fix wipe)"
+        );
+        assert!(outcome.new_orgs.is_empty());
+        // Both local replicas are still present (not purged by an empty/transient server response).
+        assert!(state.db.get_org_state("org-a").unwrap().is_some(), "org-a kept");
+        assert!(state.db.get_org_state("org-b").unwrap().is_some(), "org-b kept");
+    }
+
     /// REGRESSION (2026-07-11 live 404): org key-grants MUST key on the stable SERVER USER ID (a UUID),
     /// never the email `account_id`. A login sets `account_id = email` (the mk-wrap AAD depends on it),
     /// and `LoginFinishResponse` used to omit the user id, so the app sent the EMAIL as the grant
@@ -23333,7 +23597,8 @@ pub(crate) async fn org_create_inner(state: &AppState, name: String) -> Result<O
     }))
 }
 
-/// `org_status()` — the caller's current org (the FIRST locally-joined org in v1), or null.
+/// `org_status()` — the caller's current org (the FIRST locally-joined org, kept for legacy FE
+/// callers that predate the multi-org list), or null. New callers use `org_list_statuses`.
 #[tauri::command]
 pub async fn org_status(state: State<'_, AppState>) -> Result<Option<OrgStatus>, AppError> {
     org_status_inner(state.inner()).await
@@ -23343,6 +23608,36 @@ pub(crate) async fn org_status_inner(state: &AppState) -> Result<Option<OrgStatu
     let Some(local) = state.db.list_org_states()?.into_iter().next() else {
         return Ok(None);
     };
+    Ok(Some(org_status_for(state, local).await?))
+}
+
+/// `org_list_statuses()` — a content-free [`OrgStatus`] for EVERY locally-joined org (owned AND
+/// invited). Replaces the single-org `org_status` for the multi-org FE. Each org's name/role/
+/// generation is refreshed from the server best-effort; a per-org refresh failure falls back to the
+/// cached row (never aborts the others). Consent is the GLOBAL org-egress flag for now (per-org
+/// consent is a documented follow-up — mirrors `org_status_inner`).
+#[tauri::command]
+pub async fn org_list_statuses(state: State<'_, AppState>) -> Result<Vec<OrgStatus>, AppError> {
+    org_list_statuses_inner(state.inner()).await
+}
+
+pub(crate) async fn org_list_statuses_inner(state: &AppState) -> Result<Vec<OrgStatus>, AppError> {
+    let mut out = Vec::new();
+    for local in state.db.list_org_states()? {
+        out.push(org_status_for(state, local).await?);
+    }
+    Ok(out)
+}
+
+/// Build the content-free [`OrgStatus`] for ONE locally-joined org. Refreshes name/role/generation +
+/// member_count from the server best-effort (offline / a per-org error falls back to the cached row),
+/// then reads pending/item counts from the local outbound `org_shares` and the GLOBAL egress consent.
+/// The single source of the per-org status body — `org_status_inner` (first) and `org_list_statuses`
+/// (all) both go through here so their per-org semantics can never drift.
+async fn org_status_for(
+    state: &AppState,
+    local: crate::storage::OrgState,
+) -> Result<OrgStatus, AppError> {
     // Refresh membership/generation from the server when logged in (best-effort — offline shows the
     // cached row).
     let member_count = match (share_base_url(state), valid_access_token(state).await) {
@@ -23390,7 +23685,7 @@ pub(crate) async fn org_status_inner(state: &AppState) -> Result<Option<OrgStatu
         .lock()
         .map_err(|_| AppError::Config("config mutex poisoned".into()))?
         .org_egress_consented;
-    Ok(Some(OrgStatus {
+    Ok(OrgStatus {
         org_id: refreshed.org_id,
         name: refreshed.name,
         role: refreshed.role,
@@ -23399,27 +23694,197 @@ pub(crate) async fn org_status_inner(state: &AppState) -> Result<Option<OrgStatu
         last_seq: refreshed.last_seq,
         item_count,
         pending_shares: pending,
-    }))
+    })
 }
 
-/// `org_invite_member(email)` — owner adds a registered account, then wraps the CURRENT-generation
-/// OCK to them + PUTs the grant so they can decrypt the feed. Requires the OCK session.
+/// `org_refresh()` — pull the caller's org MEMBERSHIP from the server and reconcile it into local
+/// `org_state` (add invited orgs, drop departed ones). Best-effort; offline / logged-out = no-op. The
+/// FE triggers this on settings-open so an org you were just invited to appears without a re-login.
+#[tauri::command]
+pub async fn org_refresh(state: State<'_, AppState>) -> Result<(), AppError> {
+    org_reconcile_memberships(state.inner()).await
+}
+
+/// Reconcile the LOCAL `org_state` set against the server's authoritative membership list
+/// (`GET /v1/orgs`). Root fix for the single-org / no-membership-discovery bug: an org you were
+/// INVITED to (never one you CREATED) was invisible locally and never synced.
+///
+/// - ADD every server org: `upsert_org_state`. For an org already known locally, the upsert PRESERVES
+///   `joined_at`/`consented`/`last_seq` (its ON CONFLICT only refreshes name/role/generation) — so a
+///   reconcile never rewinds a cursor or clears consent. A NEW org is inserted with the server's
+///   `created_at` as `joined_at`, `consented=false`, `last_seq=0`, and its OCK is best-effort acquired
+///   so its feed can later decrypt (a missing grant is NOT fatal — logged + skipped).
+/// - REMOVE every local org NOT in the server list (you left / were removed) and PURGE its decrypted
+///   replica (`purge_org_replica`, same as `org_leave`) so a departed org's docs don't linger/leak.
+///   F2 GUARD: an EMPTY server list while local orgs exist is treated as suspicious (a hostile/buggy/
+///   transient `{"orgs":[]}`) and SKIPS all removals — one bad response must never wipe every replica.
+///
+/// Offline / not-logged-in = NO-OP: the cached rows are kept untouched (never destructive on a
+/// transient network failure). No PII in logs — ids/counts only.
+pub(crate) async fn org_reconcile_memberships(state: &AppState) -> Result<(), AppError> {
+    // Logged out / no server ⇒ keep the cached rows, do nothing (not an error).
+    let base = match share_base_url(state) {
+        Ok(b) if !b.trim().is_empty() => b,
+        _ => return Ok(()),
+    };
+    let access = match valid_access_token(state).await {
+        Ok(a) => a,
+        Err(_) => return Ok(()),
+    };
+    let client = crate::share::client::ShareClient::new(&base)?;
+    // A pull failure (network/5xx) is best-effort: keep the cached rows, retry next tick.
+    let server_orgs = match client.org_list(&access).await {
+        Ok(o) => o,
+        Err(e) => {
+            tracing::warn!(target: "org", error = %brief_err(&e), "org membership pull failed — keeping cached rows");
+            return Ok(());
+        }
+    };
+
+    // Apply the ADD/REMOVE against the local DB (pure, testable without a network) and learn which
+    // orgs are NEW (so we can best-effort acquire their OCK) and which we dropped (to purge OCKs).
+    let outcome = reconcile_org_state_into_db(state, &server_orgs)?;
+
+    // Best-effort: acquire each newly-discovered org's OCK so its feed can later decrypt. A grant not
+    // yet issued (the owner hasn't PUT our wrapped key) must NOT fail the whole reconcile.
+    for (org_id, generation) in &outcome.new_orgs {
+        if let Err(e) = acquire_org_ock(state, org_id, *generation).await {
+            tracing::info!(
+                target: "org",
+                error = %brief_err(&e),
+                "org OCK not yet available for a newly-discovered org (will retry on sync)"
+            );
+        }
+    }
+
+    tracing::info!(
+        target: "org",
+        server = server_orgs.len(),
+        added = outcome.new_orgs.len(),
+        removed = outcome.removed,
+        "org membership reconciled"
+    );
+    Ok(())
+}
+
+/// The DB-side outcome of a membership reconcile: the NEW orgs (id + generation, needing an OCK
+/// fetch) and how many local orgs were REMOVED.
+struct ReconcileOutcome {
+    new_orgs: Vec<(String, u32)>,
+    removed: u32,
+}
+
+/// Apply the server's authoritative org set to the local `org_state` table — the PURE, network-free
+/// core of [`org_reconcile_memberships`] (so the add/remove/purge logic is unit-testable without a
+/// live server). ADD/refresh every server org (`upsert_org_state` preserves joined_at/consented/
+/// last_seq for a KNOWN org via its ON CONFLICT; a NEW org inserts with created_at/consented=false/
+/// last_seq=0), and REMOVE + `purge_org_replica` every local org the server no longer lists. Returns
+/// the NEW orgs (for OCK acquisition by the caller) + the removed count.
+fn reconcile_org_state_into_db(
+    state: &AppState,
+    server_orgs: &[crate::share::org_dto::OrgSummary],
+) -> Result<ReconcileOutcome, AppError> {
+    // Snapshot the known-local set BEFORE the upserts so "new org" detection is against the pre-state.
+    let known_before: std::collections::HashSet<String> = state
+        .db
+        .list_org_states()?
+        .into_iter()
+        .map(|o| o.org_id)
+        .collect();
+    let server_ids: std::collections::HashSet<String> =
+        server_orgs.iter().map(|o| o.org_id.clone()).collect();
+
+    let mut new_orgs = Vec::new();
+    for o in server_orgs {
+        let is_new = !known_before.contains(&o.org_id);
+        state.db.upsert_org_state(&crate::storage::OrgState {
+            org_id: o.org_id.clone(),
+            name: o.name.clone(),
+            role: o.role.clone(),
+            joined_at: o.created_at.clone(),
+            consented: false,
+            last_seq: 0,
+            generation: o.current_generation,
+        })?;
+        if is_new {
+            new_orgs.push((o.org_id.clone(), o.current_generation));
+        }
+    }
+
+    // F2 HARDENING — an EMPTY server list while we HAVE local orgs is SUSPICIOUS (a buggy/hostile
+    // server, or a transient `{"orgs":[]}` 200). Removing every local org on that signal would purge
+    // ALL replicas — an unrecoverable local wipe from a single bad response. SKIP the removals (keep
+    // the cached rows), log a warning (ids/counts only — no PII), and let the next reconcile with a
+    // real non-empty list do the honest cleanup. A NON-empty list that merely OMITS a specific org
+    // (the real leave/remove case) still removes that org below — only the all-empty case is guarded.
+    if server_orgs.is_empty() && !known_before.is_empty() {
+        tracing::warn!(
+            target: "org",
+            local = known_before.len(),
+            "server returned an EMPTY org membership list while local replicas exist — skipping removals (suspected transient/hostile empty response)"
+        );
+        return Ok(ReconcileOutcome {
+            new_orgs,
+            removed: 0,
+        });
+    }
+
+    // Remove local orgs the server no longer lists (left / removed) + purge their decrypted replica so
+    // a departed org's docs don't linger in the local retrieval partition (the same purge `org_leave`
+    // does — leak/consent invariant) + drop its cached OCKs.
+    let mut removed = 0u32;
+    for org_id in &known_before {
+        if !server_ids.contains(org_id) {
+            state.db.delete_org_state(org_id)?;
+            state.db.purge_org_replica(org_id)?;
+            if let Ok(mut cache) = state.org_ock_cache.lock() {
+                cache.retain(|(oid, _), _| oid != org_id);
+            }
+            removed += 1;
+        }
+    }
+
+    Ok(ReconcileOutcome { new_orgs, removed })
+}
+
+/// Resolve the TARGETED org by id, MEMBERSHIP-CHECKED against the local `org_state`. The multi-org
+/// fix: the FE passes the org the user picked, and every per-org command resolves THAT org (never the
+/// first via `.next()`, which misrouted a destructive/egress op to org #1 on a multi-org account). A
+/// blank id or an org we're not a local member of is an `InvalidArg` refusal — we never operate on an
+/// org the caller isn't in.
+fn resolve_org(state: &AppState, org_id: &str) -> Result<crate::storage::OrgState, AppError> {
+    let org_id = org_id.trim();
+    if org_id.is_empty() {
+        return Err(AppError::InvalidArg("org id required".into()));
+    }
+    state
+        .db
+        .get_org_state(org_id)?
+        .ok_or_else(|| AppError::InvalidArg("not a member of that org".into()))
+}
+
+/// `org_invite_member(org_id, email)` — owner adds a registered account into the TARGETED org, then
+/// wraps that org's CURRENT-generation OCK to them + PUTs the grant so they can decrypt the feed.
+/// Requires the OCK session for the targeted org.
 #[tauri::command]
 pub async fn org_invite_member(
     state: State<'_, AppState>,
+    org_id: String,
     email: String,
 ) -> Result<(), AppError> {
-    org_invite_member_inner(state.inner(), email).await
+    org_invite_member_inner(state.inner(), org_id, email).await
 }
 
-pub(crate) async fn org_invite_member_inner(state: &AppState, email: String) -> Result<(), AppError> {
+pub(crate) async fn org_invite_member_inner(
+    state: &AppState,
+    org_id: String,
+    email: String,
+) -> Result<(), AppError> {
     let email = email.trim().to_string();
     if email.is_empty() {
         return Err(AppError::InvalidArg("email required".into()));
     }
-    let Some(org) = state.db.list_org_states()?.into_iter().next() else {
-        return Err(AppError::InvalidArg("not a member of any org".into()));
-    };
+    let org = resolve_org(state, &org_id)?;
     let base = share_base_url(state)?;
     let (account_id, gen_id, mk, access_token) = require_session_mk(state).await?;
     let client = crate::share::client::ShareClient::new(&base)?;
@@ -23467,12 +23932,14 @@ pub(crate) async fn org_invite_member_inner(state: &AppState, email: String) -> 
     Ok(())
 }
 
-/// `org_list_members()` — the org's active members (content-free).
+/// `org_list_members(org_id)` — the TARGETED org's active members (content-free). Resolves the org the
+/// FE picked (membership-checked), never the first via `.next()`.
 #[tauri::command]
-pub async fn org_list_members(state: State<'_, AppState>) -> Result<Vec<OrgMember>, AppError> {
-    let Some(org) = state.inner().db.list_org_states()?.into_iter().next() else {
-        return Ok(Vec::new());
-    };
+pub async fn org_list_members(
+    state: State<'_, AppState>,
+    org_id: String,
+) -> Result<Vec<OrgMember>, AppError> {
+    let org = resolve_org(state.inner(), &org_id)?;
     let base = share_base_url(state.inner())?;
     let access = valid_access_token(state.inner()).await?;
     let client = crate::share::client::ShareClient::new(&base)?;
@@ -23490,22 +23957,26 @@ pub async fn org_list_members(state: State<'_, AppState>) -> Result<Vec<OrgMembe
         .collect())
 }
 
-/// `org_remove_member(user_id)` — owner soft-removes a member, then ROTATES the OCK: generate gen
-/// N+1, wrap it to every REMAINING member, PUT the grants, and bump the server generation. The
-/// removed member keeps only the old-gen OCK (can't read anything sealed under N+1).
+/// `org_remove_member(org_id, user_id)` — owner soft-removes a member from the TARGETED org, then
+/// ROTATES that org's OCK: generate gen N+1, wrap it to every REMAINING member, PUT the grants, and
+/// bump the server generation. The removed member keeps only the old-gen OCK (can't read anything
+/// sealed under N+1). Resolves the FE-picked org (membership-checked), never the first via `.next()`.
 #[tauri::command]
 pub async fn org_remove_member(
     state: State<'_, AppState>,
+    org_id: String,
     user_id: String,
 ) -> Result<(), AppError> {
-    org_remove_member_inner(state.inner(), user_id).await
+    org_remove_member_inner(state.inner(), org_id, user_id).await
 }
 
-pub(crate) async fn org_remove_member_inner(state: &AppState, user_id: String) -> Result<(), AppError> {
+pub(crate) async fn org_remove_member_inner(
+    state: &AppState,
+    org_id: String,
+    user_id: String,
+) -> Result<(), AppError> {
     let user_id = user_id.trim().to_string();
-    let Some(org) = state.db.list_org_states()?.into_iter().next() else {
-        return Err(AppError::InvalidArg("not a member of any org".into()));
-    };
+    let org = resolve_org(state, &org_id)?;
     let base = share_base_url(state)?;
     let (account_id, gen_id, mk, access_token) = require_session_mk(state).await?;
     // DB grant key = the owner's server user id (UUID), not the email `account_id`.
@@ -23570,14 +24041,13 @@ pub(crate) async fn org_remove_member_inner(state: &AppState, user_id: String) -
     Ok(())
 }
 
-/// `org_leave()` — the caller leaves the org (member self-removal). Drops the local org row + cached
-/// OCKs. Does NOT retroactively un-share the caller's already-published items (use `revoke_org_share`
-/// for that first if desired).
+/// `org_leave(org_id)` — the caller leaves the TARGETED org (member self-removal). Drops that org's
+/// local row + cached OCKs + decrypted replica. Does NOT retroactively un-share the caller's
+/// already-published items (use `revoke_org_share` for that first if desired). Resolves the FE-picked
+/// org (membership-checked), never the first via `.next()` — a leave must purge the RIGHT org.
 #[tauri::command]
-pub async fn org_leave(state: State<'_, AppState>) -> Result<(), AppError> {
-    let Some(org) = state.inner().db.list_org_states()?.into_iter().next() else {
-        return Ok(());
-    };
+pub async fn org_leave(state: State<'_, AppState>, org_id: String) -> Result<(), AppError> {
+    let org = resolve_org(state.inner(), &org_id)?;
     let base = share_base_url(state.inner())?;
     let access = valid_access_token(state.inner()).await?;
     let client = crate::share::client::ShareClient::new(&base)?;
@@ -23788,9 +24258,23 @@ pub(crate) async fn share_to_org_inner(
         }
     }
 
-    let Some(org) = state.db.list_org_states()?.into_iter().next() else {
+    // TODO(multi-org): let the user pick the target org — the FE does NOT yet pass an org_id to
+    // `share_meeting_to_org` / `share_document_to_org`, so this still resolves to the FIRST local org.
+    // For a single-org account that is correct; for a MULTI-org account this is a destructive EGRESS
+    // op picking org #1, so make the choice EXPLICIT (log which org — id only, no content) rather than
+    // silently choosing. When the FE gains an org picker, thread an `org_id` param through here (as
+    // `org_invite_member`/`org_leave` now do) and resolve via `resolve_org`.
+    let all_orgs = state.db.list_org_states()?;
+    let Some(org) = all_orgs.into_iter().next() else {
         return Err(AppError::InvalidArg("not a member of any org".into()));
     };
+    if state.db.list_org_states()?.len() > 1 {
+        tracing::warn!(
+            target: "org",
+            org_id = %org.org_id,
+            "org share targeting the first org on a multi-org account (no FE picker yet — TODO multi-org)"
+        );
+    }
     let base = share_base_url(state)?;
     let (_account_id, _gen_id, _mk, access_token) = require_session_mk(state).await?;
     let client = crate::share::client::ShareClient::new(&base)?;
@@ -23932,6 +24416,9 @@ pub(crate) async fn share_to_org_inner(
 /// local owner). Content-free enough for the FE list.
 #[tauri::command]
 pub fn list_org_shares(state: State<'_, AppState>) -> Result<Vec<OrgShareEntry>, AppError> {
+    // TODO(multi-org): let the user pick the target org — the FE does NOT yet pass an org_id here, so
+    // this read still lists the FIRST local org's shares. A READ (not destructive/egress), so a
+    // first-org default is acceptable until the FE gains an org picker; thread `org_id` through then.
     let Some(org) = state.inner().db.list_org_states()?.into_iter().next() else {
         return Ok(Vec::new());
     };
@@ -24099,6 +24586,11 @@ pub const ORG_SYNC_TICK_SECS: u64 = 300;
 /// `Ok` when logged out / no org joined, so this is a no-op until a session is live. Logs only
 /// non-PII counts on a productive tick.
 pub(crate) async fn org_background_sync_tick(state: &AppState) {
+    // Reconcile membership FIRST so a newly-invited org is present (and synced this same tick) and a
+    // departed org is dropped before we pull its feed. Best-effort — a failure never blocks the sync.
+    if let Err(e) = org_reconcile_memberships(state).await {
+        tracing::warn!(target: "org", error = %brief_err(&e), "org membership reconcile tick failed");
+    }
     if let Err(e) = org_sweep_pending_inner(state).await {
         tracing::warn!(target: "org", error = %e, "org outbound sweep tick failed");
     }
@@ -24183,22 +24675,66 @@ pub(crate) async fn org_sweep_pending_inner(state: &AppState) -> Result<u32, App
     Ok(advanced)
 }
 
-/// `org_sync_now()` — pull the org feed from the last synced cursor, OPEN each ciphertext blob with
-/// the (RAM-cached / grant-unwrapped) OCK, and INGEST it into the local decrypted replica + int8
+/// `org_sync_now(org_id?)` — pull the org feed from the last synced cursor, OPEN each ciphertext blob
+/// with the (RAM-cached / grant-unwrapped) OCK, and INGEST it into the local decrypted replica + int8
 /// retrieval partition. A TOMBSTONE evicts the item's chunks/vectors/FTS. Returns a content-free
 /// [`OrgSyncReport`] (counts + `fts_only` + per-item error strings). Best-effort per item: a single
 /// item whose OCK is unavailable / whose blob won't open is SKIPPED (recorded in `errors`), never
 /// crashing the whole sync — the cursor still advances past a tombstone but STOPS at the first
 /// un-openable LIVE item so a transient key gap is retried next sync (no silent skip-forward).
+///
+/// `org_id`: `Some(id)` syncs ONLY that (FE-picked, membership-checked) org; `None` syncs ALL joined
+/// orgs (the background tick / internal callers). The tick's all-orgs iteration is unchanged.
 #[tauri::command]
 pub async fn org_sync_now(
     state: State<'_, AppState>,
+    org_id: Option<String>,
 ) -> Result<crate::storage::models::OrgSyncReport, AppError> {
-    org_sync_now_inner(state.inner()).await
+    // The FE passes a SPECIFIC org id (→ sync only that org); the background tick / internal callers
+    // pass `None` (→ sync ALL orgs, the tick's iteration is unchanged). This is the command-boundary
+    // dispatch of the multi-org fix: a user-triggered "Sync now" from a picked org must not sync (or
+    // report against) the wrong org.
+    match org_id {
+        Some(id) => org_sync_one_now_inner(state.inner(), &id).await,
+        None => org_sync_now_inner(state.inner()).await,
+    }
 }
 
 /// Server feed page size per `org_feed` request. The loop pages until the feed is drained.
 const ORG_FEED_PAGE: u32 = 200;
+
+/// Sync exactly ONE (FE-targeted) org's feed — the single-org boundary of [`org_sync_now`]. Resolves
+/// the org (membership-checked, never `.next()`), then runs the same per-org pull/ingest via
+/// `org_sync_one` used by the all-orgs loop. Offline / logged-out ⇒ an empty report (no-op), matching
+/// the all-orgs path.
+pub(crate) async fn org_sync_one_now_inner(
+    state: &AppState,
+    org_id: &str,
+) -> Result<crate::storage::models::OrgSyncReport, AppError> {
+    let mut report = crate::storage::models::OrgSyncReport::default();
+    let org = resolve_org(state, org_id)?;
+    let base = share_base_url(state)?;
+    if base.trim().is_empty() {
+        return Ok(report);
+    }
+    let access = match valid_access_token(state).await {
+        Ok(a) => a,
+        Err(_) => return Ok(report),
+    };
+    let client = crate::share::client::ShareClient::new(&base)?;
+    report.fts_only = !crate::embed::embed_model_present();
+    org_sync_one(state, &client, &access, &org, &mut report).await?;
+    tracing::info!(
+        target: "org",
+        pulled = report.pulled,
+        ingested = report.ingested,
+        tombstoned = report.tombstoned,
+        fts_only = report.fts_only,
+        errors = report.errors.len(),
+        "org feed sync (single org)"
+    );
+    Ok(report)
+}
 
 pub(crate) async fn org_sync_now_inner(
     state: &AppState,
@@ -24206,9 +24742,10 @@ pub(crate) async fn org_sync_now_inner(
     let mut report = crate::storage::models::OrgSyncReport::default();
 
     // No org joined ⇒ nothing to sync (not an error).
-    let Some(org) = state.db.list_org_states()?.into_iter().next() else {
+    let orgs = state.db.list_org_states()?;
+    if orgs.is_empty() {
         return Ok(report);
-    };
+    }
     let base = share_base_url(state)?;
     if base.trim().is_empty() {
         return Ok(report);
@@ -24224,6 +24761,40 @@ pub(crate) async fn org_sync_now_inner(
     // flag it so the FE can offer a re-embed once a model lands.
     report.fts_only = !crate::embed::embed_model_present();
 
+    // MULTI-ORG: sync EVERY locally-joined org (each with its own cursor via `org_last_seq_for`). A
+    // per-org failure must NOT abort the others — it's recorded in `report.errors` and the loop
+    // continues; `report.last_seq` reflects the LAST org synced (the field is per-org, but the counts
+    // aggregate). This is the fix for the single-org `.next()` that hid every invited org's feed.
+    for org in orgs {
+        if let Err(e) = org_sync_one(state, &client, &access, &org, &mut report).await {
+            report
+                .errors
+                .push(format!("org sync failed ({})", brief_err(&e)));
+        }
+    }
+
+    tracing::info!(
+        target: "org",
+        pulled = report.pulled,
+        ingested = report.ingested,
+        tombstoned = report.tombstoned,
+        fts_only = report.fts_only,
+        errors = report.errors.len(),
+        "org feed sync (multi-org)"
+    );
+    Ok(report)
+}
+
+/// Sync ONE org's append-only feed from its own cursor into the local decrypted replica + retrieval
+/// partition. Extracted from `org_sync_now_inner` so the multi-org loop can call it per org while the
+/// per-org pull/ingest logic stays byte-identical. Aggregates counts into the shared `report`.
+async fn org_sync_one(
+    state: &AppState,
+    client: &crate::share::client::ShareClient,
+    access: &str,
+    org: &crate::storage::OrgState,
+    report: &mut crate::storage::models::OrgSyncReport,
+) -> Result<(), AppError> {
     // ── ASYNC PULL PHASE — drain the feed, opening each cell; buffer decrypted items ──────────────
     // The embedder (`dyn Embedder`, !Send) is deliberately NOT constructed here: the whole async
     // section is Send-safe, and the synchronous INGEST phase below owns the embedder entirely (never
@@ -24249,7 +24820,7 @@ pub(crate) async fn org_sync_now_inner(
 
     'pages: loop {
         let feed = client
-            .org_feed(&access, &org.org_id, cursor, ORG_FEED_PAGE)
+            .org_feed(access, &org.org_id, cursor, ORG_FEED_PAGE)
             .await?;
         if feed.items.is_empty() {
             break;
@@ -24291,7 +24862,7 @@ pub(crate) async fn org_sync_now_inner(
                     break 'pages;
                 }
             };
-            let ciphertext = match client.get_blob(&access, &blob_id).await {
+            let ciphertext = match client.get_blob(access, &blob_id).await {
                 Ok(c) => c,
                 Err(e) => {
                     report
@@ -24385,17 +24956,9 @@ pub(crate) async fn org_sync_now_inner(
         state.db.set_org_last_seq(&org.org_id, applied as i64)?;
     }
 
+    // `report.last_seq` reflects the LAST org synced (per-org field on an aggregate report).
     report.last_seq = state.db.org_last_seq_for(&org.org_id)?;
-    tracing::info!(
-        target: "org",
-        pulled = report.pulled,
-        ingested = report.ingested,
-        tombstoned = report.tombstoned,
-        fts_only = report.fts_only,
-        errors = report.errors.len(),
-        "org feed sync"
-    );
-    Ok(report)
+    Ok(())
 }
 
 /// A short, PII-free rendering of an error for a sync report string (never note content — AppError

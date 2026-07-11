@@ -1783,12 +1783,14 @@ export interface NoteFolder {
 export type OrgRole = "owner" | "member";
 
 /**
- * The org membership + sync state for the Settings › Organization section
- * (`orgStatus` / `orgCreate`). `null` from `orgStatus` ⇒ this user is in no org
- * yet (show the create form). `memberCount` + `itemCount` are counts only (no
- * names/content); `lastSeq` is the last synced feed sequence; `pendingShares`
- * is the count of queued/failed local outbound org shares awaiting the sweep.
- * Mirrors the Rust `OrgStatus`.
+ * The membership + sync state for ONE org (`orgCreate` returns one; `orgStatus`
+ * returns the legacy single-org view or `null`; `orgListStatuses` returns one
+ * per org the user belongs to — created OR invited-into). An empty
+ * `orgListStatuses` array ⇒ the user is in no org (show the empty state + create
+ * form). `memberCount` + `itemCount` are counts only (no names/content);
+ * `lastSeq` is the last synced feed sequence; `pendingShares` is the count of
+ * queued/failed local outbound org shares awaiting the sweep. Mirrors the Rust
+ * `OrgStatus`.
  */
 export interface OrgStatus {
   orgId: string;
@@ -1807,12 +1809,15 @@ export interface OrgStatus {
 
 /**
  * One org member row for the owner's member list (`orgListMembers`). Content-free:
- * an `email` the owner already knows + a role + join time. `removed` marks a
- * former member (rendered muted / historical). Mirrors the Rust `OrgMember`.
+ * a `role` + join time, and an `email` ONLY when the server discloses it — the
+ * server currently withholds member emails (content-minimization), so `email` is
+ * `null` and the row falls back to the opaque `userId`. `removed` marks a former
+ * member (rendered muted / historical). Mirrors the Rust `OrgMember`.
  */
 export interface OrgMember {
   userId: string;
-  email: string;
+  /** The member's email when the server discloses it; `null` otherwise (show `userId`). */
+  email: string | null;
   role: OrgRole;
   addedAt: string;
   removed: boolean;
