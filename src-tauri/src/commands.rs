@@ -22074,9 +22074,12 @@ mod lifecycle_tests {
     fn share_meeting_to_org_refuses_a_sealed_meeting() {
         let state = build_state("org-share-lockgate");
         seed_locked_meeting_with_note(&state, "f-lock", "m-locked");
+        // A real org so the target resolves — the read-gate + consent gate still fire FIRST.
+        seed_org(&state.db, "org-1", "Acme", "owner", 1);
         // NOT session-unlocked: unlocked_folders stays empty.
         let err = block_on(share_to_org_inner(
             &state,
+            "org-1",
             Some("m-locked".to_string()),
             None,
             true,
@@ -22095,6 +22098,7 @@ mod lifecycle_tests {
             .insert("f-lock".to_string());
         let err2 = block_on(share_to_org_inner(
             &state,
+            "org-1",
             Some("m-locked".to_string()),
             None,
             true,
@@ -22130,9 +22134,11 @@ mod lifecycle_tests {
             .db
             .set_folder_locked("f-note", true, Some(&b"wrapped"[..]))
             .unwrap();
+        seed_org(&state.db, "org-1", "Acme", "owner", 1);
 
         let err = block_on(share_to_org_inner(
             &state,
+            "org-1",
             None,
             Some("n1".to_string()),
             true,
@@ -22150,6 +22156,7 @@ mod lifecycle_tests {
             .insert("f-note".to_string());
         let err2 = block_on(share_to_org_inner(
             &state,
+            "org-1",
             None,
             Some("n1".to_string()),
             true,
@@ -22486,6 +22493,119 @@ mod lifecycle_tests {
         assert!(state.db.get_org_item("nope").unwrap().is_none());
     }
 
+    /// FIX A (browsable org-items LIST): `db.list_org_items` returns the org's LIVE items as headers
+    /// (newest `seq` first, no markdown body), and DROPS a tombstoned item + scopes to the org. This is
+    /// what lets a member SEE what colleagues shared IN — the root of the "A can't see B's note" bug (org
+    /// content was search-only). RED on a missing list (there was no browse path); GREEN with the list.
+    #[test]
+    fn list_org_items_returns_live_headers_newest_first_scoped_and_untombstoned() {
+        let state = build_state("org-list-items");
+        // Two items in org-1 at seq 1 and 2, plus an item in a DIFFERENT org, plus a tombstoned one.
+        state
+            .db
+            .upsert_org_item("a", "org-1", 1, "anna", "Kickoff", "the kickoff agenda", "2026-07-10T09:00:00Z", 1, 1, &[1u8; 32], None)
+            .unwrap();
+        state
+            .db
+            .upsert_org_item("b", "org-1", 2, "bob", "Retro", "the sprint retro", "2026-07-11T09:00:00Z", 1, 1, &[2u8; 32], None)
+            .unwrap();
+        state
+            .db
+            .upsert_org_item("z", "org-2", 9, "zed", "Other org", "not our org", "2026-07-11T09:00:00Z", 1, 1, &[3u8; 32], None)
+            .unwrap();
+        state
+            .db
+            .upsert_org_item("d", "org-1", 3, "dan", "Dead", "revoked", "2026-07-11T10:00:00Z", 1, 1, &[4u8; 32], None)
+            .unwrap();
+        state.db.tombstone_org_item("d").unwrap();
+
+        let items = state.db.list_org_items("org-1").unwrap();
+        // Only the two LIVE org-1 items, newest seq first (b before a), no other org, no tombstone.
+        assert_eq!(items.len(), 2, "only live org-1 items: {items:?}");
+        assert_eq!(items[0].item_id, "b", "newest seq first");
+        assert_eq!(items[0].title, "Retro");
+        assert_eq!(items[0].author_hint, "bob");
+        assert_eq!(items[0].seq, 2);
+        assert_eq!(items[1].item_id, "a");
+        assert!(
+            !items.iter().any(|h| h.item_id == "z"),
+            "another org's item never appears"
+        );
+        assert!(
+            !items.iter().any(|h| h.item_id == "d"),
+            "a tombstoned item never appears"
+        );
+    }
+
+    /// FIX A (command gate): `list_org_items_inner` refuses an org the caller isn't a local member of
+    /// (membership-checked via `resolve_org`) — never leaking another org's list — and returns the list
+    /// for a member org.
+    #[test]
+    fn list_org_items_command_refuses_non_member_org() {
+        let state = build_state("org-list-items-gate");
+        seed_org(&state.db, "org-mine", "Mine", "owner", 1);
+        state
+            .db
+            .upsert_org_item("m1", "org-mine", 1, "anna", "Mine A", "body", "2026-07-11T09:00:00Z", 1, 1, &[1u8; 32], None)
+            .unwrap();
+        // A member org resolves + returns the item.
+        let ok = list_org_items_inner(&state, "org-mine").unwrap();
+        assert_eq!(ok.len(), 1);
+        assert_eq!(ok[0].item_id, "m1");
+        // A non-member org is InvalidArg (never a leak of that org's list).
+        assert!(matches!(
+            list_org_items_inner(&state, "org-not-mine"),
+            Err(AppError::InvalidArg(_))
+        ));
+        // A blank id is refused too.
+        assert!(matches!(
+            list_org_items_inner(&state, "  "),
+            Err(AppError::InvalidArg(_))
+        ));
+    }
+
+    /// FIX B (received-items COUNT): `OrgStatus.received_count` reflects the LOCAL replica (what
+    /// colleagues shared IN), DISTINCT from `item_count` (the caller's OWN uploaded outbound shares).
+    /// Seed org_items (received) + an outbound uploaded share and assert the two counts are independent.
+    /// RED on the pre-fix code (only `item_count` existed → a receiving member saw "0 items").
+    #[test]
+    fn org_status_received_count_reflects_replica_distinct_from_outbound() {
+        let state = build_state("org-received-count");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        // TWO received items (from colleagues) in the local replica.
+        state
+            .db
+            .upsert_org_item("r1", "org-1", 1, "anna", "Doc A", "body a", "2026-07-10T09:00:00Z", 1, 1, &[1u8; 32], None)
+            .unwrap();
+        state
+            .db
+            .upsert_org_item("r2", "org-1", 2, "bob", "Doc B", "body b", "2026-07-11T09:00:00Z", 1, 1, &[2u8; 32], None)
+            .unwrap();
+        // ONE of the caller's OWN outbound shares, state 'uploaded' (item_count = 1).
+        let now = "2026-07-11T12:00:00Z";
+        state
+            .db
+            .insert_org_share("s1", "org-1", Some("m-own"), None, "meeting", Some("My Share"), 1, 1, &[9u8; 32], now)
+            .unwrap();
+        state.db.set_org_share_uploaded("s1", "srv-item-1", now).unwrap();
+
+        let status = block_on(org_status_for(
+            &state,
+            state.db.get_org_state("org-1").unwrap().unwrap(),
+        ))
+        .unwrap();
+        assert_eq!(status.received_count, 2, "received_count = local replica items");
+        assert_eq!(status.item_count, 1, "item_count = the caller's OWN outbound uploads");
+        // A tombstoned received item drops out of received_count.
+        state.db.tombstone_org_item("r1").unwrap();
+        let status2 = block_on(org_status_for(
+            &state,
+            state.db.get_org_state("org-1").unwrap().unwrap(),
+        ))
+        .unwrap();
+        assert_eq!(status2.received_count, 1, "a tombstoned received item is excluded");
+    }
+
     /// `org_state` upsert preserves the LOCAL consent + sync cursor across a status refresh (a refresh
     /// carrying role/name/generation must NOT reset consent or rewind last_seq), and the consent +
     /// generation + last_seq setters work as the single mutators.
@@ -22701,6 +22821,73 @@ mod lifecycle_tests {
         assert_eq!(state.db.get_org_state("org-b").unwrap().unwrap().last_seq, 20);
     }
 
+    /// FIX D (per-item sync robustness, RED→GREEN): a TERMINAL-bad item at seq N must NOT stall the
+    /// feed forever — the GOOD item at N+1 still ingests on the SAME sync. Pre-fix EVERY per-item
+    /// failure did `break 'pages`, so one poison cell blocked all newer items indefinitely. We serve a
+    /// synthetic one-page feed: item at seq 5 is a LIVE entry with NO blob (structurally terminal — it
+    /// can never open, detected before any key/network), and item at seq 6 is a TOMBSTONE (a "good"
+    /// action that applies with no key/blob). After the fix: seq 5 is skipped (error recorded, cursor
+    /// advanced), seq 6's tombstone APPLIES (`tombstoned == 1`) and the cursor advances to 6. RED on the
+    /// old break-all code: seq 5 breaks the loop → seq 6 never processed → `tombstoned == 0`, cursor
+    /// unchanged.
+    #[test]
+    fn org_sync_skips_a_terminal_item_and_ingests_the_next() {
+        use std::io::{Read, Write};
+        // One-shot local server answering exactly one `GET /v1/orgs/{id}/items` feed page.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 8192];
+            let _ = sock.read(&mut buf).unwrap();
+            // seq 5: LIVE (tombstoned:false) but blobId:null → TERMINAL missing-blob.
+            // seq 6: TOMBSTONE → applies without a key/blob (the "good" item behind the poison one).
+            let body = r#"{"items":[{"itemId":"poison","seq":5,"authorUserId":"u","rev":1,"generation":1,"createdAt":"2026-07-11T09:00:00Z","tombstoned":false,"blobId":null,"contentSha256":null},{"itemId":"good-tomb","seq":6,"authorUserId":"u","rev":1,"generation":1,"createdAt":"2026-07-11T09:01:00Z","tombstoned":true,"blobId":null,"contentSha256":null}],"nextSeq":6}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = sock.write_all(resp.as_bytes());
+        });
+
+        let state = build_state("org-sync-terminal-skip");
+        seed_org(&state.db, "org-x", "X", "member", 1);
+        state.db.set_org_last_seq("org-x", 4).unwrap(); // cursor starts at 4 (items 5,6 are new)
+        state.config.lock().unwrap().share_base_url = format!("http://{addr}");
+        *state.account_session.lock().unwrap() = Some(crate::share::AccountSession {
+            account_id: "user@example.com".into(),
+            email: "user@example.com".into(),
+            server_user_id: Some("c534b6d2-02c1-4c2c-a256-3af8592b1567".into()),
+            device_id: "dev-1".into(),
+            mk: Zeroizing::new([7u8; 32]),
+            generation: 1,
+            access_token: "a".into(),
+            access_expires_at: Some("2099-01-01T00:00:00Z".into()),
+            refresh_token: "r".into(),
+        });
+
+        let report = block_on(org_sync_one_now_inner(&state, "org-x")).unwrap();
+        server.join().unwrap();
+
+        // Both items were pulled; the terminal one was recorded as an error, the good one APPLIED.
+        assert_eq!(report.pulled, 2, "both feed items were pulled");
+        assert_eq!(
+            report.tombstoned, 1,
+            "the GOOD item behind the poison one ingested (RED on break-all: this was 0)"
+        );
+        assert!(
+            report.errors.iter().any(|e| e.contains("poison") && e.contains("missing blob")),
+            "the terminal item is recorded as an error, not silently dropped: {:?}",
+            report.errors
+        );
+        // The cursor advanced PAST both the skipped terminal item and the applied tombstone.
+        assert_eq!(
+            state.db.get_org_state("org-x").unwrap().unwrap().last_seq,
+            6,
+            "cursor advanced past the terminal item AND the good one (RED on break-all: stayed at 4)"
+        );
+    }
+
     /// F1 (MULTI-ORG TARGETING, RED→GREEN for the `.next()` misroute): with TWO local orgs, the org
     /// commands must resolve the SPECIFIC org the FE passed, never the FIRST. `resolve_org` — the
     /// shared resolution seam every per-org command now uses — must return the SECOND org's row when
@@ -22734,6 +22921,79 @@ mod lifecycle_tests {
             resolve_org(&state, "org-not-mine"),
             Err(AppError::InvalidArg(_))
         ));
+    }
+
+    /// FIX C (org SHARE targets the SPECIFIED org, RED→GREEN for the `.next()` MISROUTE): with TWO
+    /// local orgs, `share_to_org_inner` must queue the outbound share under the org the FE PICKED, never
+    /// the FIRST (`.next()`). Seed a session + consent + an open (unlocked) meeting with a note, point
+    /// the client at a CLOSED loopback port (no real egress — the seal/upload fails), and share TARGETING
+    /// the SECOND org. Regardless of the network failure, the QUEUED row is persisted BEFORE any egress —
+    /// under `org-second`. RED on the pre-fix code (it `.next()`-picked `org-first` → the row landed under
+    /// org #1); GREEN after routing through `resolve_org`.
+    #[test]
+    fn share_to_org_queues_under_the_specified_org_not_the_first() {
+        let state = build_state("org-share-target");
+        // `org-first` joined EARLIER → the deterministic `.next()` (ORDER BY joined_at ASC) org a pre-fix
+        // share would have wrongly used. The FE picks `org-second`.
+        seed_org_at(&state.db, "org-first", "First", "owner", "2026-07-01T00:00:00Z");
+        seed_org_at(&state.db, "org-second", "Second", "member", "2026-07-11T00:00:00Z");
+
+        // An OPEN folder + a note so the read-gate + clean/scrub pass (no lock).
+        state
+            .db
+            .insert_folder(&Folder {
+                id: "f-share".to_string(),
+                name: "Team".to_string(),
+                path: "Team".to_string(),
+                parent_id: None,
+                locked: false,
+                created_at: "2026-07-11T00:00:00Z".to_string(),
+            })
+            .unwrap();
+        state
+            .db
+            .insert_note("n-share", "f-share", "plan", "Q3 Plan", "# the Q3 roadmap", 1)
+            .unwrap();
+
+        // Consent granted + a closed loopback port (connection refused; NO real egress).
+        state.config.lock().unwrap().org_egress_consented = true;
+        state.config.lock().unwrap().share_base_url = "http://127.0.0.1:9/".to_string();
+        // A live (non-expired) session so `require_session_mk` yields a bearer and the queue insert runs.
+        *state.account_session.lock().unwrap() = Some(crate::share::AccountSession {
+            account_id: "user@example.com".into(),
+            email: "user@example.com".into(),
+            server_user_id: Some("c534b6d2-02c1-4c2c-a256-3af8592b1567".into()),
+            device_id: "dev-1".into(),
+            mk: Zeroizing::new([7u8; 32]),
+            generation: 1,
+            access_token: "a".into(),
+            access_expires_at: Some("2099-01-01T00:00:00Z".into()),
+            refresh_token: "r".into(),
+        });
+
+        // Share TARGETING the SECOND org. The network egress fails (closed port), but the QUEUED row is
+        // written first — under the resolved target org.
+        let _ = block_on(share_to_org_inner(
+            &state,
+            "org-second",
+            None,
+            Some("n-share".to_string()),
+            true,
+        ));
+
+        // The row MUST be under org-second (the picked org), NOT org-first (the `.next()` org).
+        let second = state.db.list_org_shares_for_org("org-second").unwrap();
+        assert_eq!(
+            second.len(),
+            1,
+            "the outbound share was queued under the PICKED org (org-second)"
+        );
+        assert_eq!(second[0].document_id.as_deref(), Some("n-share"));
+        let first = state.db.list_org_shares_for_org("org-first").unwrap();
+        assert!(
+            first.is_empty(),
+            "no share landed under the FIRST org (RED on a .next() misroute — the row was under org-first)"
+        );
     }
 
     /// F1 (org_leave targets the SPECIFIED org's local state). `org_leave` deletes the local org row +
@@ -23308,7 +23568,12 @@ pub struct OrgStatus {
     pub member_count: u32,
     pub consented: bool,
     pub last_seq: i64,
+    /// The caller's OWN outbound uploads into this org (`org_shares` in state `uploaded`).
     pub item_count: u32,
+    /// RECEIVED items in the local org replica (`org_items`, non-tombstoned) — what colleagues shared
+    /// IN. Distinct from `item_count`: a member who only RECEIVES shows `item_count = 0` but a real
+    /// `received_count`, so the Settings count no longer lies "0 items" to a receiver.
+    pub received_count: u32,
     pub pending_shares: u32,
 }
 
@@ -23593,6 +23858,7 @@ pub(crate) async fn org_create_inner(state: &AppState, name: String) -> Result<O
         consented: false,
         last_seq: 0,
         item_count: 0,
+        received_count: 0,
         pending_shares: 0,
     }))
 }
@@ -23679,6 +23945,9 @@ async fn org_status_for(
         .iter()
         .filter(|s| s.state == "uploaded")
         .count() as u32;
+    // RECEIVED items in the local replica (what colleagues shared IN) — distinct from item_count
+    // (the caller's OWN uploads). Fixes the "0 items" lie a receiving member saw.
+    let received_count = state.db.count_org_items(&refreshed.org_id)?;
     // Consent is the GLOBAL org-egress config flag (mirrors share_egress_consented).
     let consented = state
         .config
@@ -23693,6 +23962,7 @@ async fn org_status_for(
         consented,
         last_seq: refreshed.last_seq,
         item_count,
+        received_count,
         pending_shares: pending,
     })
 }
@@ -24209,30 +24479,35 @@ pub(crate) fn preview_org_share_inner(
     })
 }
 
-/// `share_meeting_to_org(meeting_id, scrub)` — the normative org share flow (spec gate order):
+/// `share_meeting_to_org(org_id, meeting_id, scrub)` — the normative org share flow (spec gate order):
 /// (1) read-gate, (2) consent fail-closed, (3) clean, (4) scrub, (5) seal under OCK + local
-/// open-verify, (6) upload blob + publish item, (7) content-free egress-ledger entry.
+/// open-verify, (6) upload blob + publish item, (7) content-free egress-ledger entry. `org_id` is the
+/// FE-picked target (membership-checked via `resolve_org`) — the multi-org fix for the `.next()`
+/// misroute that shared into the FIRST org, not the chosen one.
 #[tauri::command]
 pub async fn share_meeting_to_org(
     state: State<'_, AppState>,
+    org_id: String,
     meeting_id: String,
     scrub: bool,
 ) -> Result<OrgShareEntry, AppError> {
-    share_to_org_inner(state.inner(), Some(meeting_id), None, scrub).await
+    share_to_org_inner(state.inner(), &org_id, Some(meeting_id), None, scrub).await
 }
 
-/// `share_document_to_org(document_id, scrub)` — the note twin of [`share_meeting_to_org`].
+/// `share_document_to_org(org_id, document_id, scrub)` — the note twin of [`share_meeting_to_org`].
 #[tauri::command]
 pub async fn share_document_to_org(
     state: State<'_, AppState>,
+    org_id: String,
     document_id: String,
     scrub: bool,
 ) -> Result<OrgShareEntry, AppError> {
-    share_to_org_inner(state.inner(), None, Some(document_id), scrub).await
+    share_to_org_inner(state.inner(), &org_id, None, Some(document_id), scrub).await
 }
 
 pub(crate) async fn share_to_org_inner(
     state: &AppState,
+    org_id: &str,
     meeting_id: Option<String>,
     document_id: Option<String>,
     scrub: bool,
@@ -24258,23 +24533,11 @@ pub(crate) async fn share_to_org_inner(
         }
     }
 
-    // TODO(multi-org): let the user pick the target org — the FE does NOT yet pass an org_id to
-    // `share_meeting_to_org` / `share_document_to_org`, so this still resolves to the FIRST local org.
-    // For a single-org account that is correct; for a MULTI-org account this is a destructive EGRESS
-    // op picking org #1, so make the choice EXPLICIT (log which org — id only, no content) rather than
-    // silently choosing. When the FE gains an org picker, thread an `org_id` param through here (as
-    // `org_invite_member`/`org_leave` now do) and resolve via `resolve_org`.
-    let all_orgs = state.db.list_org_states()?;
-    let Some(org) = all_orgs.into_iter().next() else {
-        return Err(AppError::InvalidArg("not a member of any org".into()));
-    };
-    if state.db.list_org_states()?.len() > 1 {
-        tracing::warn!(
-            target: "org",
-            org_id = %org.org_id,
-            "org share targeting the first org on a multi-org account (no FE picker yet — TODO multi-org)"
-        );
-    }
+    // MULTI-ORG: share into the FE-PICKED org (membership-checked), never the first via `.next()`.
+    // This is a destructive EGRESS op — misrouting it to org #1 published a member's note into the
+    // WRONG org (the root of the "B shared into Siema but it went to org #1" bug). `resolve_org`
+    // refuses a blank id / an org the caller isn't a local member of.
+    let org = resolve_org(state, org_id)?;
     let base = share_base_url(state)?;
     let (_account_id, _gen_id, _mk, access_token) = require_session_mk(state).await?;
     let client = crate::share::client::ShareClient::new(&base)?;
@@ -24654,6 +24917,9 @@ pub(crate) async fn org_sweep_pending_inner(state: &AppState) -> Result<u32, App
             }
             let res = share_to_org_inner(
                 state,
+                // Re-publish targets the SAME org the row was queued under (never the first via
+                // `.next()`) — a multi-org account's sweep must re-share into the right org.
+                &row.org_id,
                 row.meeting_id.clone(),
                 row.document_id.clone(),
                 // A re-publish preserves the ORIGINAL scrub intent: if we can't know it, scrub ON
@@ -24798,12 +25064,27 @@ async fn org_sync_one(
     // ── ASYNC PULL PHASE — drain the feed, opening each cell; buffer decrypted items ──────────────
     // The embedder (`dyn Embedder`, !Send) is deliberately NOT constructed here: the whole async
     // section is Send-safe, and the synchronous INGEST phase below owns the embedder entirely (never
-    // held across an `.await`). A tombstone applies immediately (no key/blob needed). We STOP at the
-    // first un-openable LIVE item (never a silent skip-forward), so a transient key gap retries next
-    // sync — the cursor only advances past items we successfully ingested/tombstoned.
+    // held across an `.await`). A tombstone applies immediately (no key/blob needed).
+    //
+    // FIX D — per-item failures are classified TRANSIENT vs TERMINAL so one poison item never stalls
+    // the WHOLE feed forever (pre-fix: EVERY failure did `break 'pages`, so a single un-openable cell
+    // blocked all newer items indefinitely):
+    //   • TRANSIENT (OCK unavailable / blob fetch network error) → `break 'pages`, cursor NOT advanced:
+    //     the same item is retried next sync (correct — it may succeed once the key/network recovers).
+    //   • TERMINAL (missing blob / missing hash / envelope open failed / content-hash mismatch —
+    //     permanent for THAT cell) → record the error, `SkipTerminal` (advance the cursor PAST this
+    //     seq), and `continue` to the next item. It will NEVER ingest, so blocking newer items on it is
+    //     pure stall. The cursor only advances past a terminal item that appears BEFORE the first
+    //     transient stop (the loop processes items in seq order and breaks on the first transient), so
+    //     we never skip forward past a transient un-ingested item.
     enum FeedAction {
         Tombstone {
             item_id: String,
+            seq: u64,
+        },
+        /// A permanently un-ingestable item: advance the cursor past its seq (no DB write) so it never
+        /// stalls the feed. Recorded in `report.errors`.
+        SkipTerminal {
             seq: u64,
         },
         Ingest {
@@ -24837,22 +25118,27 @@ async fn org_sync_one(
             }
 
             let Some(blob_id) = item.blob_id.clone() else {
+                // TERMINAL: a live entry with no blob is structurally broken — it can never open. Skip
+                // past it (advance) rather than stall every newer item behind it.
                 report
                     .errors
                     .push(format!("item {}: live entry missing blob", item.item_id));
-                break 'pages;
+                actions.push(FeedAction::SkipTerminal { seq: item.seq });
+                continue;
             };
             // The AAD item nonce is hex(content_sha256) — the SAME value the publisher sealed under.
             let Some(sha) = item.content_sha256.clone() else {
+                // TERMINAL: no content hash ⇒ we can't derive the AAD nonce for this cell — permanent.
                 report
                     .errors
                     .push(format!("item {}: live entry missing content hash", item.item_id));
-                break 'pages;
+                actions.push(FeedAction::SkipTerminal { seq: item.seq });
+                continue;
             };
             let item_nonce = org_item_nonce(&sha);
 
             // Resolve the OCK for THIS item's generation (RAM cache / grant unwrap; gated on MK
-            // session). Unavailable ⇒ transient key gap → record + STOP (retried next sync).
+            // session). Unavailable ⇒ TRANSIENT key gap → record + STOP (retried next sync).
             let ock = match acquire_org_ock(state, &org.org_id, item.generation).await {
                 Ok(k) => k,
                 Err(e) => {
@@ -24865,6 +25151,7 @@ async fn org_sync_one(
             let ciphertext = match client.get_blob(access, &blob_id).await {
                 Ok(c) => c,
                 Err(e) => {
+                    // TRANSIENT: a network blob-fetch failure may succeed next sync → STOP, don't skip.
                     report
                         .errors
                         .push(format!("item {}: blob fetch failed ({})", item.item_id, brief_err(&e)));
@@ -24880,22 +25167,27 @@ async fn org_sync_one(
             ) {
                 Ok(e) => e,
                 Err(e) => {
+                    // TERMINAL: this exact ciphertext will never open under this key/AAD (a tampered or
+                    // corrupt cell is permanent for THAT seq). Skip past it rather than stall the feed.
                     report.errors.push(format!(
                         "item {}: envelope open failed ({})",
                         item.item_id,
                         brief_err(&e)
                     ));
-                    break 'pages;
+                    actions.push(FeedAction::SkipTerminal { seq: item.seq });
+                    continue;
                 }
             };
             // INTEGRITY: the opened plaintext's own hash must equal the feed-supplied one the AAD was
             // derived from (a successful AAD open already implies this, but assert so a server pairing
             // a valid cell with a lying feed hash is caught).
             if env.content_sha256() != sha {
+                // TERMINAL: the cell/hash pairing is permanently inconsistent for this seq.
                 report
                     .errors
                     .push(format!("item {}: content hash mismatch", item.item_id));
-                break 'pages;
+                actions.push(FeedAction::SkipTerminal { seq: item.seq });
+                continue;
             }
             actions.push(FeedAction::Ingest {
                 item_id: item.item_id.clone(),
@@ -24926,6 +25218,12 @@ async fn org_sync_one(
                 state.db.tombstone_org_item(&item_id)?;
                 report.tombstoned += 1;
                 applied = applied.max(seq);
+            }
+            // FIX D: a permanently un-ingestable item advances the cursor past its seq (no DB write),
+            // so it never stalls the feed — the good item behind it ingests on the SAME sync.
+            FeedAction::SkipTerminal { seq } => {
+                applied = applied.max(seq);
+                state.db.set_org_last_seq(&org.org_id, applied as i64)?;
             }
             FeedAction::Ingest {
                 item_id,
@@ -24981,6 +25279,32 @@ pub fn org_get_item(
     item_id: String,
 ) -> Result<Option<crate::storage::models::OrgItemDetail>, AppError> {
     state.inner().db.get_org_item(&item_id)
+}
+
+/// `list_org_items(org_id)` — the browsable LIST of one org's live items (headers only), so a member
+/// can SEE what colleagues shared into the org (the root of the "can't see B's note" bug: org content
+/// was search-only, with no browsable list). Resolves the FE-picked org membership-checked
+/// (`resolve_org`) — never the first via `.next()` — then returns newest-first headers. Org items are
+/// deliberately org-disclosed content (no folder lock gate applies); headers carry NO markdown body
+/// (that's `org_get_item`), keeping the list content-min. Not-a-member ⇒ `InvalidArg` (never a leak
+/// of another org's list).
+#[tauri::command]
+pub fn list_org_items(
+    state: State<'_, AppState>,
+    org_id: String,
+) -> Result<Vec<crate::storage::models::OrgItemHeader>, AppError> {
+    list_org_items_inner(state.inner(), &org_id)
+}
+
+/// Inner of [`list_org_items`] taking `&AppState` (unit-testable membership gate). Refuses an org the
+/// caller isn't a local member of; org items are org-disclosed content so no folder lock gate applies.
+pub(crate) fn list_org_items_inner(
+    st: &AppState,
+    org_id: &str,
+) -> Result<Vec<crate::storage::models::OrgItemHeader>, AppError> {
+    // Membership re-check: refuse if the caller isn't a local member of this org.
+    let org = resolve_org(st, org_id)?;
+    st.db.list_org_items(&org.org_id)
 }
 
 #[cfg(test)]

@@ -39,6 +39,21 @@ pub fn ock_grant_id(org_id: &str, generation: u32) -> String {
     format!("org:{org_id}:gen:{generation}")
 }
 
+/// The FIXED sender/granter IDENTITY generation an OCK grant is signed under, on BOTH wrap and unwrap.
+///
+/// LOCK-SECURITY (FIX F): the underlying [`ShareGrantSignedView`] signs a `sender_generation` field.
+/// For an OCK grant that field is AMBIGUOUS and adds nothing — the grant is ALREADY bound to the org +
+/// the ORG generation via [`ock_grant_id`] (the `share_id`/`rev`). The two sides disagreed on which
+/// generation to bind: `wrap_ock_for_member` bound the GRANTER's (owner's) identity generation, while
+/// `acquire_org_ock` unwrapped with the MEMBER's OWN identity generation. Today both are hard-wired to
+/// 1, so the signature verifies — but the moment identity generation rotation ships, an invited
+/// member's identity gen (2+) would no longer match the owner's (1) and EVERY invited-member unwrap
+/// would fail closed. Pinning BOTH sides to this constant removes the ambiguous field's mismatch (org
+/// authenticity still rests on the org-scoped grant id + the granter-key TOFU pin) while keeping the
+/// public signatures unchanged. The `*_generation` parameters below are therefore IGNORED for OCK
+/// grants.
+const OCK_GRANT_SENDER_GENERATION: u32 = 0;
+
 /// Generate a fresh random 32-byte OCK (org create + each rotation). Zeroizes on drop.
 pub fn generate_ock() -> Result<Key32> {
     crate::e2ee::random_key32()
@@ -52,6 +67,10 @@ pub fn generate_ock() -> Result<Key32> {
 /// `granter` is the owner's identity keypair (derived from their MK); `granter_acct_id` /
 /// `recipient_acct_id` are the stable account ids the two sides pin on (the caller passes the server
 /// user ids / fingerprints, exactly as mode-B does).
+///
+/// `granter_generation` is IGNORED (FIX F): the signed grant's `sender_generation` is pinned to the
+/// fixed [`OCK_GRANT_SENDER_GENERATION`] on BOTH wrap and unwrap, so an invited member's own identity
+/// generation never has to match the granter's for the unwrap to verify.
 #[allow(clippy::too_many_arguments)]
 pub fn wrap_ock_for_member(
     ock: &[u8; 32],
@@ -61,7 +80,7 @@ pub fn wrap_ock_for_member(
     recipient_acct_id: &str,
     granter: &IdentityKeypair,
     granter_acct_id: &str,
-    granter_generation: u32,
+    _granter_generation: u32,
 ) -> Result<OckGrant> {
     let grant_id = ock_grant_id(org_id, generation);
     // The signed grant binds a hash of the "content cell". For an OCK grant there is no separate
@@ -75,7 +94,9 @@ pub fn wrap_ock_for_member(
         recipient_acct_id,
         granter,
         granter_acct_id,
-        granter_generation,
+        // FIX F: pin the sender identity generation to a fixed constant (org+gen binding lives in the
+        // grant id; the identity generation is ambiguous across owner-vs-member and adds nothing).
+        OCK_GRANT_SENDER_GENERATION,
         &grant_id,
         generation,
     )?;
@@ -93,6 +114,10 @@ pub fn wrap_ock_for_member(
 ///
 /// `pinned_granter_acct_id` / `pinned_granter_pk_sig` are the TOFU-pinned granter identity the
 /// recipient stored on first contact (the org owner). `self_acct_id` is the caller's own account id.
+///
+/// `granter_generation` is IGNORED (FIX F): the reconstructed `sender_generation` is the fixed
+/// [`OCK_GRANT_SENDER_GENERATION`], matching the wrap side, so a member whose OWN identity generation
+/// differs from the granter's (post-rotation) still opens the grant.
 #[allow(clippy::too_many_arguments)]
 pub fn open_own_grant(
     wrapped_key: &[u8],
@@ -101,7 +126,7 @@ pub fn open_own_grant(
     recipient_acct_id: &str,
     self_acct_id: &str,
     granter_acct_id: &str,
-    granter_generation: u32,
+    _granter_generation: u32,
     pinned_granter_acct_id: &str,
     pinned_granter_pk_sig: &[u8],
     org_id: &str,
@@ -117,7 +142,8 @@ pub fn open_own_grant(
         recipient_acct_id,
         self_acct_id,
         granter_acct_id,
-        granter_generation,
+        // FIX F: pin the sender identity generation to the SAME fixed constant the wrap side used.
+        OCK_GRANT_SENDER_GENERATION,
         pinned_granter_acct_id,
         pinned_granter_pk_sig,
         &grant_id,
@@ -170,6 +196,53 @@ mod tests {
         )
         .unwrap();
         assert_eq!(*opened, *ock, "member recovers the exact OCK");
+    }
+
+    /// FIX F (identity-generation mismatch, RED→GREEN): the OWNER wraps the OCK under their own
+    /// identity generation (1), and the invited MEMBER unwraps under a DIFFERENT identity generation (2)
+    /// — as happens the moment identity rotation ships (the owner is gen 1, an invited member gen 2+).
+    /// The grant is bound to the ORG + org generation via the grant id, so the ambiguous IDENTITY
+    /// generation must NOT be part of what has to match: the unwrap still opens the exact OCK. RED on the
+    /// pre-fix code (wrap bound owner-gen=1, unwrap reconstructed member-gen=2 → signature mismatch →
+    /// Auth error); GREEN after both sides pin the fixed OCK sender generation.
+    #[test]
+    fn ock_open_succeeds_across_identity_generation_mismatch() {
+        let owner = generate_identity().unwrap();
+        let member = generate_identity().unwrap();
+        let ock = generate_ock().unwrap();
+
+        // Owner wraps under identity generation 1.
+        let grant = wrap_ock_for_member(
+            &ock,
+            ORG,
+            GEN,
+            &member.pk_enc,
+            MEMBER,
+            &owner,
+            OWNER,
+            1, // owner's identity generation at wrap
+        )
+        .unwrap();
+
+        // Member unwraps under identity generation 2 (post-rotation) — must STILL open.
+        let opened = open_own_grant(
+            &grant.wrapped_key,
+            &grant.grant_sig,
+            &member,
+            MEMBER,
+            MEMBER,
+            OWNER,
+            2, // member's OWN identity generation — DIFFERENT from the owner's
+            OWNER,
+            &owner.pk_sig,
+            ORG,
+            GEN,
+        )
+        .unwrap();
+        assert_eq!(
+            *opened, *ock,
+            "an invited member opens the OCK even when its identity generation differs from the granter's"
+        );
     }
 
     /// A grant wrapped for org-1 must NOT open as org-2 (cross-org replay blocked).
