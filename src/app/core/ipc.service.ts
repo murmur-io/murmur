@@ -1844,11 +1844,15 @@ export class IpcService {
   }
 
   /**
-   * The selection Brain-assistant action: refine / shorten (replace the selection)
-   * or enhance (retrieve related brain context + propose an ADDITIVE passage with
-   * citations). Routes via `provider_for(Role::Notes)` (local Qwen vs cloud Claude
-   * per posture, redaction firewall + egress ledger for free). The result carries
-   * the resolved `modelLabel`/`mode`/`redacted` for the popover mode chip.
+   * The selection Brain-assistant action (full set — edit / structure / brain /
+   * extract / create; see the shared action catalog). `req` carries the action,
+   * the selection + bounded context, and optionally `variant` (tone/language) or
+   * `instruction` (custom free-text / an `ask` question). Routes via
+   * `provider_for(Role::Notes)` (local vs cloud per posture, redaction firewall +
+   * egress ledger for free; `find_related` is retrieval-only, no provider). The
+   * result carries the `shape` the FE renders off, `title` for artifacts, and the
+   * resolved `modelLabel`/`mode`/`redacted` for the mode chip. Optional `req`
+   * fields ride through unchanged (the whole object is forwarded).
    */
   noteAssistantAction(req: NoteAssistRequest): Promise<NoteAssistResult> {
     return invoke<NoteAssistResult>("note_assistant_action", { req });

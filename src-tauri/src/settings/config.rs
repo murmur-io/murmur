@@ -240,6 +240,14 @@ pub struct AppConfig {
     pub note_assist_shorten: bool,
     #[serde(default = "default_true")]
     pub note_assist_enhance: bool,
+    /// NOTES feature — the ids of the FULL-SET assistant actions (grammar/expand/tone/…, everything
+    /// beyond the three legacy bools) the user has turned OFF. This one opt-OUT list scales to any
+    /// number of actions without a column per action: an action is ENABLED unless its id is here.
+    /// `custom` is always enabled (the escape hatch) and can never be listed here. Persisted as a
+    /// JSON string array (`db.get_setting`/`set_setting` are string-only). `#[serde(default)]` ⇒ a
+    /// config persisted before this field existed loads as an empty list (all new actions enabled).
+    #[serde(default)]
+    pub note_assist_actions_off: Vec<String>,
     /// Summary note language: "auto" (match the meeting) | "en" | "pl" | "de" | ... .
     pub note_language: String,
     /// Require an `Authorization: Bearer <token>` on EVERY MCP method (E3) — including
@@ -638,6 +646,7 @@ impl Default for AppConfig {
             note_assist_refine: true,
             note_assist_shorten: true,
             note_assist_enhance: true,
+            note_assist_actions_off: Vec::new(),
             auto_organize: false,
             note_language: "auto".to_string(),
             mcp_require_token: true,
@@ -729,6 +738,7 @@ const K_NOTES_MODE: &str = "notes_mode";
 const K_NOTE_ASSIST_REFINE: &str = "note_assist_refine";
 const K_NOTE_ASSIST_SHORTEN: &str = "note_assist_shorten";
 const K_NOTE_ASSIST_ENHANCE: &str = "note_assist_enhance";
+const K_NOTE_ASSIST_ACTIONS_OFF: &str = "note_assist_actions_off";
 const K_AUTO_ORGANIZE: &str = "auto_organize";
 const K_NOTE_LANGUAGE: &str = "note_language";
 const K_MCP_REQUIRE_TOKEN: &str = "mcp_require_token";
@@ -910,6 +920,11 @@ impl AppConfig {
         }
         if let Some(v) = db.get_setting(K_NOTE_ASSIST_ENHANCE)? {
             cfg.note_assist_enhance = v == "true";
+        }
+        // The opt-OUT list is a JSON string array. A malformed / legacy value falls back to an
+        // empty list (all actions enabled) rather than erroring the whole config load.
+        if let Some(v) = db.get_setting(K_NOTE_ASSIST_ACTIONS_OFF)? {
+            cfg.note_assist_actions_off = serde_json::from_str(&v).unwrap_or_default();
         }
         if let Some(v) = db.get_setting(K_NOTE_LANGUAGE)? {
             if !v.is_empty() {
@@ -1183,6 +1198,12 @@ impl AppConfig {
             } else {
                 "false"
             },
+        )?;
+        // JSON-encode the opt-out list (settings are string-only). `unwrap_or_default` keeps a
+        // serialize hiccup from failing the whole save — an empty array just re-enables all actions.
+        db.set_setting(
+            K_NOTE_ASSIST_ACTIONS_OFF,
+            &serde_json::to_string(&self.note_assist_actions_off).unwrap_or_else(|_| "[]".into()),
         )?;
         db.set_setting(K_NOTE_LANGUAGE, &self.note_language)?;
         db.set_setting(
@@ -1976,6 +1997,32 @@ mod tests {
         assert!(!loaded.note_assist_refine, "a Refine opt-out persists");
         assert!(loaded.note_assist_shorten, "shorten still ON");
         assert!(loaded.note_assist_enhance, "enhance still ON");
+    }
+
+    /// NOTES full-set — the opt-OUT list (`note_assist_actions_off`) defaults empty (all new actions
+    /// enabled) and round-trips as a JSON string array across save/load, so a user who turns an
+    /// action off stays off.
+    #[test]
+    fn note_assist_actions_off_defaults_empty_and_round_trips() {
+        let db = temp_db();
+        // Fresh DB ⇒ no actions opted out (missing key keeps the Default's empty Vec).
+        assert!(
+            AppConfig::load(&db).unwrap().note_assist_actions_off.is_empty(),
+            "the opt-out list defaults empty (all actions enabled)"
+        );
+
+        AppConfig {
+            note_assist_actions_off: vec!["bullets".into(), "table".into()],
+            ..Default::default()
+        }
+        .save(&db)
+        .unwrap();
+        let loaded = AppConfig::load(&db).unwrap();
+        assert_eq!(
+            loaded.note_assist_actions_off,
+            vec!["bullets".to_string(), "table".to_string()],
+            "an explicit opt-out list round-trips through the JSON-encoded setting"
+        );
     }
 
     /// TIER 1 default-on: an EXPLICIT opt-out (a stored `false`) must PERSIST across reload — a user

@@ -63,8 +63,8 @@
   background: var(--accent-gradient);
   box-shadow: 0 0 12px var(--accent-soft);
 }
-/* The action name ("Shorten"…) sits quietly next to the brand once a result
-   lands; a subtle divider dot separates it from "Brain". */
+/* The action name ("Shorten"…) sits quietly next to the brand once a flow
+   starts; a subtle divider dot separates it from "Brain". */
 .pop-head-action {
   font-size: 0.8125rem;
   font-weight: 550;
@@ -74,6 +74,15 @@
   content: "·";
   margin: 0 var(--space-1) 0 0;
   color: var(--text-muted);
+}
+/* The idle "selection" tag in the menu phase. */
+.pop-head-tag {
+  font-size: 0.7rem;
+  font-weight: 600;
+  color: var(--text-muted);
+  background: var(--surface-hover);
+  padding: 2px var(--space-2);
+  border-radius: var(--radius-pill);
 }
 .pop-close {
   margin-left: auto;
@@ -98,46 +107,191 @@
   box-shadow: 0 0 0 2px var(--accent-ring);
 }
 
-/* --- Action picker --------------------------------------------------------- */
-.pop-actions {
+/* --- Command input --------------------------------------------------------- */
+.pop-cmd {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md); /* --radius (bare) is undefined → was 0 (square well) */
+  background: var(--surface-input);
+}
+.pop-cmd:focus-within {
+  border-color: var(--accent-ring);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+.pop-cmd-ico {
+  flex: none;
+  color: var(--text-muted);
+}
+/* 2-class + `:focus` selector to DEFEAT the shared control style in
+   primitives.css (`input[type="text"]` base well + `input:focus` ring). The
+   plain `.pop-cmd-input` class (0,1,0) LOSES to `input[type="text"]` (0,1,1),
+   so the global paints a SECOND bordered/rounded pill (with its own focus ring)
+   INSIDE .pop-cmd → the double-border bug. Zero its border/radius/padding/bg/
+   ring here; .pop-cmd owns the single well + focus-within ring. */
+.pop-cmd .pop-cmd-input,
+.pop-cmd .pop-cmd-input:focus {
+  flex: 1;
+  min-width: 0;
+  height: auto;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  outline: none;
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 0.875rem;
+}
+.pop-cmd .pop-cmd-input::placeholder {
+  color: var(--text-muted);
+}
+.pop-cmd-kbd {
+  flex: none;
+  font: inherit;
+  font-size: 0.62rem;
+  color: var(--text-muted);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 1px 5px;
+}
+
+/* --- Scrollable row list --------------------------------------------------- */
+.pop-scroll {
   display: flex;
   flex-direction: column;
   gap: 2px;
+  max-height: 320px;
+  overflow-y: auto;
+  margin: 0 calc(-1 * var(--space-1));
+  padding: 0 var(--space-1);
 }
-.pop-action {
+.pop-grp-label {
+  font-size: 0.63rem;
+  font-weight: 660;
+  letter-spacing: 0.13em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  padding: var(--space-2) var(--space-2) var(--space-1);
+}
+
+/* --- Action rows ----------------------------------------------------------- */
+.pop-row {
   display: flex;
   align-items: center;
   gap: var(--space-2);
   width: 100%;
-  padding: var(--space-2) var(--space-3);
+  padding: var(--space-2);
   border: 0;
   border-radius: var(--radius-sm);
   background: transparent;
   color: var(--text-primary);
   font: inherit;
   font-size: 0.875rem;
-  font-weight: 500;
   text-align: left;
   cursor: pointer;
   transition: background var(--transition-fast);
 }
-.pop-action:hover {
+.pop-row:hover {
   background: var(--surface-hover);
 }
-.pop-action:focus-visible {
+.pop-row:focus-visible {
   outline: none;
-  box-shadow: 0 0 0 2px var(--accent-ring);
+  box-shadow: inset 0 0 0 1.5px var(--accent-ring);
 }
-.pop-action-ico {
+.pop-row-ico {
+  flex: none;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 20px;
-  height: 20px;
+  width: 26px;
+  height: 26px;
   border-radius: var(--radius-sm);
   background: var(--accent-soft);
   color: var(--accent-hover);
+  font-size: 0.82rem;
+}
+.pop-row-body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+.pop-row-label {
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.pop-row-variant {
+  flex: 1;
+}
+.pop-row-desc {
+  margin-top: 1px;
+  font-size: 0.72rem;
+  font-weight: 400;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pop-row-chev {
+  flex: none;
+  color: var(--text-muted);
   font-size: 0.8rem;
+}
+/* One dot per result shape (replace/insert/info/artifact). */
+.pop-shape-dot {
+  flex: none;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--shape-replace);
+}
+.pop-shape-dot.is-insert {
+  background: var(--shape-insert);
+}
+.pop-shape-dot.is-info {
+  background: var(--shape-info);
+}
+.pop-shape-dot.is-artifact {
+  background: var(--shape-artifact);
+}
+
+/* The "run as a custom instruction" row (the command-input escape hatch). */
+.pop-row-custom .pop-row-ico {
+  background: var(--surface-hover);
+  color: var(--text-secondary);
+}
+.pop-row-custom .pop-row-label b {
+  color: var(--accent-hover);
+}
+/* The "More actions" + "Back" rows. */
+.pop-row-more {
+  color: var(--text-secondary);
+}
+.pop-row-more .pop-row-ico {
+  background: var(--surface-hover);
+  color: var(--text-secondary);
+}
+.pop-row-back {
+  color: var(--text-secondary);
+  font-weight: 550;
+}
+.pop-row-back .pop-row-ico {
+  width: 20px;
+  background: transparent;
+  color: var(--text-muted);
+}
+
+.pop-empty {
+  margin: 0;
+  padding: var(--space-3) var(--space-2);
+  font-size: 0.82rem;
+  color: var(--text-muted);
+  text-align: center;
 }
 
 /* --- Step tracker ---------------------------------------------------------- */
@@ -207,7 +361,6 @@
     transform: rotate(360deg);
   }
 }
-/* Shimmer sweep under the steps while working. */
 .pop-shimmer {
   height: 2px;
   border-radius: var(--radius-pill);
@@ -230,7 +383,7 @@
   }
 }
 
-/* --- Diff / result --------------------------------------------------------- */
+/* --- Result ---------------------------------------------------------------- */
 .pop-result,
 .pop-error {
   display: flex;
@@ -262,7 +415,6 @@
 .pop-diff-tag.is-add {
   color: var(--success);
 }
-/* The change direction between the two blocks (original → suggested). */
 .pop-diff-arrow {
   align-self: center;
   font-size: 0.8rem;
@@ -276,6 +428,8 @@
   color: var(--text-secondary);
   font-size: 0.82rem;
   line-height: 1.5;
+  text-decoration: line-through;
+  text-decoration-color: var(--text-muted);
 }
 .pop-suggestion {
   padding: var(--space-2) var(--space-3);
@@ -290,6 +444,37 @@
 .pop-suggestion.is-add {
   background: var(--success-soft);
   border-color: color-mix(in srgb, var(--success) 30%, transparent);
+}
+/* Info answer + artifact body — a neutral read-only block. */
+.pop-info-answer {
+  max-height: 260px;
+  overflow-y: auto;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-hover);
+  color: var(--text-primary);
+  font-size: 0.85rem;
+  line-height: 1.55;
+  white-space: pre-wrap;
+}
+.pop-artifact-title {
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+/* find_related lead line (the count) — plain text above the source chips, not a boxed answer. */
+.pop-info-lead {
+  margin: 0;
+  color: var(--text-primary);
+  font-size: 0.85rem;
+  line-height: 1.5;
+}
+/* Quiet caption under the source chips ("Tap a source to open it."). */
+.pop-hint {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 0.72rem;
 }
 
 /* --- Citation chips -------------------------------------------------------- */
@@ -354,6 +539,7 @@
 /* --- Buttons --------------------------------------------------------------- */
 .pop-buttons {
   display: flex;
+  flex-wrap: wrap;
   gap: var(--space-2);
 }
 .pop-btn {
