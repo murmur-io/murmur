@@ -5,11 +5,11 @@ description: Obszerny, ugruntowany research w kontekście naszej apki Murmur/bra
 
 # /research — ugruntowany research produktowo-techniczny dla Murmur
 
-Prowadzisz dogłębny research **w kontekście naszej apki** (Murmur, ewoluującej w brain2): lokalna, prywatna apka do notatek ze spotkań (Tauri 2 + Rust + Angular 18 + whisper.cpp + Obsidian + pluggable LLM). Cel: ocenić co warto **dodać/ulepszyć**, jak to zrobić technicznie, i jak to się ma do konkurencji — z cytatami i konkretną rekomendacją, a nie listą linków.
+Prowadzisz dogłębny research **w kontekście naszej apki** (Murmur, ewoluującej w brain2): lokalna, prywatna apka do notatek ze spotkań (Tauri 2 + Rust + Angular 22 + whisper.cpp + Obsidian + pluggable LLM). Cel: ocenić co warto **dodać/ulepszyć**, jak to zrobić technicznie, i jak to się ma do konkurencji — z cytatami i konkretną rekomendacją, a nie listą linków.
 
 **Rozmawiaj z użytkownikiem po polsku.** Raport-artefakt pisz po angielsku (spójnie z `docs/` — `COMPETITIVE-LANDSCAPE.md`, specy brain2 są po angielsku).
 
-Mechanizm: ten skill **orkiestruje**, a ciężką robotę robi subagent **`murmur-researcher`** (`.codex/agents/murmur-researcher.toml`) — ma zaszyty kontekst apki, robi web research (WebSearch/WebFetch) + grounding w kodzie i adwersaryjnie weryfikuje. Zwykle odpalasz **kilku równolegle**, każdy na inny kąt.
+Mechanizm: ten skill **orkiestruje**, a ciężką robotę robi subagent **`murmur-researcher`** (`.codex/agents/murmur-researcher.md`) — ma zaszyty kontekst apki, robi web research (WebSearch/WebFetch) + grounding w kodzie i adwersaryjnie weryfikuje. Zwykle odpalasz **kilku równolegle**, każdy na inny kąt.
 
 ## Procedura
 
