@@ -1,0 +1,42 @@
+<!-- OPAQUE floating bubble (T3): --surface-overlay + backdrop-filter:none.
+     Positioned in JS (afterNextRender) above the selection rect; re-positions on
+     any scroll/resize via the directive. `mousedown` is prevented so a button
+     click never blurs the textarea / collapses the selection. -->
+<div
+  #bar
+  class="sel-bar"
+  appRepositionOnScroll
+  (reposition)="reposition()"
+  (mousedown)="$event.preventDefault()"
+  role="toolbar"
+  aria-label="Format selection"
+>
+  <button type="button" class="sel-tool" title="Heading 1" (click)="emit('h1')">H1</button>
+  <button type="button" class="sel-tool" title="Heading 2" (click)="emit('h2')">H2</button>
+  <button type="button" class="sel-tool" title="Heading 3" (click)="emit('h3')">H3</button>
+  <span class="sel-sep" aria-hidden="true"></span>
+  <button type="button" class="sel-tool" title="Bold (⌘B)" (click)="emit('bold')"><b>B</b></button>
+  <button type="button" class="sel-tool" title="Italic (⌘I)" (click)="emit('italic')"><i>I</i></button>
+  <button type="button" class="sel-tool" title="Strikethrough" (click)="emit('strike')"><s>S</s></button>
+  <button type="button" class="sel-tool" title="Inline code" (click)="emit('code')">&lt;/&gt;</button>
+  <span class="sel-sep" aria-hidden="true"></span>
+  <button type="button" class="sel-tool" title="Bullet list" (click)="emit('ul')">•</button>
+  <button type="button" class="sel-tool" title="Numbered list" (click)="emit('ol')">1.</button>
+  <button type="button" class="sel-tool" title="Checklist" (click)="emit('check')">☐</button>
+  <button type="button" class="sel-tool" title="Quote" (click)="emit('quote')">❝</button>
+  <span class="sel-sep" aria-hidden="true"></span>
+  <button type="button" class="sel-tool" title="Link" (click)="emit('link')">🔗</button>
+  <button type="button" class="sel-tool" title="Wikilink" (click)="emit('wikilink')">[[ ]]</button>
+  @if (showAi()) {
+    <span class="sel-sep" aria-hidden="true"></span>
+    <button
+      type="button"
+      class="sel-tool sel-ai"
+      title="Ask Brain"
+      (click)="askBrain.emit()"
+    >
+      <span class="sel-ai-glyph" aria-hidden="true"></span>
+      Ask Brain
+    </button>
+  }
+</div>

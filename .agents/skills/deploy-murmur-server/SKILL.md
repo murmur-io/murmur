@@ -43,12 +43,12 @@ workflow manually after `variableUpsert` if only env changed.
 ## Tokens — ALREADY PERSISTED (no need to ask the user)
 
 The user does NOT touch Railway. The credentials are already stored so any future session can manage the deploy hands-off:
-- **`$RAILWAY_API_TOKEN`** — the Railway account/team token, set in `~/.claude/settings.json` `env` → available in every tool call's environment. Use it for the GraphQL API (`Authorization: Bearer $RAILWAY_API_TOKEN`).
+- **`$RAILWAY_API_TOKEN`** — the Railway account/team token when Codex has it in the tool environment. In Codex, expose it from the parent shell or user-local `~/.codex/.env`; if it is absent, use the fallback file below. Use it for the GraphQL API (`Authorization: Bearer $RAILWAY_API_TOKEN`).
 - **`~/.murmur/railway-token`** (600) — the same account/team token, on disk (fallback if the env var is absent).
 - **`~/.murmur/railway-projtoken`** (600) — the project token scoped to this project+env, for `RAILWAY_TOKEN=... railway up`.
 - **`~/.murmur/railway-ids`** — the project / env / server-service / postgres-service ids + the domain, one per line (same as the table above).
 
-⚠️ SECURITY: the account/team token has broad access to the user's whole Railway account (not just this project). It's stored only in user-local files (`~/.claude/settings.json` + `~/.murmur/`, both non-repo, 600). The user chose convenience over scoping. If it's ever exposed, rotate it at `railway.com/account/tokens` and update both locations. Note: a project-scoped token does NOT work for the GraphQL API (only for `railway up`/`status`), so the team token is the minimum for full management.
+⚠️ SECURITY: the account/team token has broad access to the user's whole Railway account (not just this project). Store it only in user-local files (`~/.codex/.env` if used, plus `~/.murmur/`, both non-repo, 600). The user chose convenience over scoping. If it's ever exposed, rotate it at `railway.com/account/tokens` and update both locations. Note: a project-scoped token does NOT work for the GraphQL API (only for `railway up`/`status`), so the team token is the minimum for full management.
 
 ## Tokens (the auth model — this tripped us up)
 
