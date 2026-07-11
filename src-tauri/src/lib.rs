@@ -544,7 +544,14 @@ pub fn run() {
                     .await;
                     loop {
                         if let Some(state) = handle.try_state::<AppState>() {
-                            crate::commands::org_background_sync_tick(state.inner()).await;
+                            // On a PRODUCTIVE tick (≥1 ingest/tombstone) emit a content-free
+                            // `org-feed-updated` ping so an open FE view (Notes org picker /
+                            // Settings shared-brain list) re-fetches without polling. Best-effort:
+                            // a failed emit never breaks the loop. The count is aggregated across
+                            // orgs by the all-orgs tick, so we report `1` (≥1 org changed).
+                            if crate::commands::org_background_sync_tick(state.inner()).await {
+                                crate::events::emit_org_feed_updated(&handle, 1);
+                            }
                         }
                         tokio::time::sleep(std::time::Duration::from_secs(
                             crate::commands::ORG_SYNC_TICK_SECS,
