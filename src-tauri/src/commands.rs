@@ -12082,7 +12082,7 @@ async fn refresh_session(state: &AppState, stale_token: &str) -> Result<String, 
     // changed AND is now fresh, use it — do not spend our (now-stale) refresh token a second time.
     // The session (NOT the Keychain) is the source of truth for the current refresh token — see the
     // RAM-first rationale above; the identity fields ride along for the best-effort persist below.
-    let (refresh_token, device_id, email, account_id, generation) = {
+    let (refresh_token, device_id, email, account_id, server_user_id, generation) = {
         let g = state
             .account_session
             .lock()
@@ -12101,6 +12101,7 @@ async fn refresh_session(state: &AppState, stale_token: &str) -> Result<String, 
             s.device_id.clone(),
             s.email.clone(),
             s.account_id.clone(),
+            s.server_user_id.clone(),
             s.generation,
         )
     };
@@ -12191,6 +12192,7 @@ async fn refresh_session(state: &AppState, stale_token: &str) -> Result<String, 
         device_id,
         email,
         account_id,
+        server_user_id,
         generation,
         access_expires_at: Some(rotated.access_expires_at.clone()),
     }) {
@@ -12443,6 +12445,9 @@ pub async fn account_login(
         ));
     }
     let access_expires_at = finish.access_expires_at.clone();
+    // The account's stable server user id (UUID) — the client keys org grants on THIS, not the email.
+    // A pre-fix server omits it (`None`) ⇒ org sharing prompts a re-login once the server ships it.
+    let server_user_id = finish.user_id.clone();
     let (Some(access_token), Some(refresh_token), Some(device_id), Some(key_material)) = (
         finish.access_token,
         finish.refresh_token,
@@ -12465,6 +12470,7 @@ pub async fn account_login(
         device_id: device_id.clone(),
         email: acct_id.clone(),
         account_id: acct_id.clone(),
+        server_user_id: server_user_id.clone(),
         generation,
         access_expires_at: access_expires_at.clone(),
     })?;
@@ -12478,6 +12484,7 @@ pub async fn account_login(
         *session = Some(crate::share::AccountSession {
             account_id: acct_id.clone(),
             email: acct_id.clone(),
+            server_user_id,
             device_id,
             mk: Zeroizing::new(*mk),
             generation,
@@ -12571,6 +12578,7 @@ pub async fn unlock_sharing_with_biometric(
         *session = Some(crate::share::AccountSession {
             account_id: tokens.account_id,
             email: tokens.email,
+            server_user_id: tokens.server_user_id,
             device_id: tokens.device_id,
             mk,
             generation: tokens.generation,
@@ -13041,6 +13049,24 @@ async fn require_session_mk(state: &AppState) -> Result<SessionMk, AppError> {
         zeroize::Zeroizing::new(*s.mk),
         access_token,
     ))
+}
+
+/// The account's stable SERVER USER ID (UUID) for org key-grants, from the live session. Errors with a
+/// clear re-login prompt when the session predates the `server_user_id` field (a login before the
+/// server started returning it on `LoginFinishResponse`). Org grants MUST key on this UUID — matching
+/// `org_members.user_id` — never the email `account_id` (the `parse_org_id` 404 root cause, 2026-07-11).
+fn session_server_user_id(state: &AppState) -> Result<String, AppError> {
+    let g = state
+        .account_session
+        .lock()
+        .map_err(|_| AppError::Storage("account-session mutex poisoned".into()))?;
+    let s = crate::share::require_login(&g)?;
+    s.server_user_id.clone().ok_or_else(|| {
+        AppError::Unavailable(
+            "sign out and sign back in to enable organization sharing (your saved session predates it)"
+                .into(),
+        )
+    })
 }
 
 /// The configured vault path (empty ⇒ `None`), read over `&AppState`.
@@ -15164,6 +15190,7 @@ mod lifecycle_tests {
         *state.account_session.lock().unwrap() = Some(crate::share::AccountSession {
             account_id: "acct-1".into(),
             email: "user@example.com".into(),
+            server_user_id: None,
             device_id: "dev-1".into(),
             mk: Zeroizing::new([7u8; 32]),
             generation: 1,
@@ -15214,6 +15241,7 @@ mod lifecycle_tests {
         *state.account_session.lock().unwrap() = Some(crate::share::AccountSession {
             account_id: "acct-1".into(),
             email: "user@example.com".into(),
+            server_user_id: None,
             device_id: "dev-1".into(),
             mk: Zeroizing::new([7u8; 32]),
             generation: 1,
@@ -21806,6 +21834,40 @@ mod lifecycle_tests {
         assert!(state.db.get_org_state("org-1").unwrap().is_none());
     }
 
+    /// REGRESSION (2026-07-11 live 404): org key-grants MUST key on the stable SERVER USER ID (a UUID),
+    /// never the email `account_id`. A login sets `account_id = email` (the mk-wrap AAD depends on it),
+    /// and `LoginFinishResponse` used to omit the user id, so the app sent the EMAIL as the grant
+    /// `user_id` → the server's `parse_org_id` rejected it 404 ("Start a shared brain" failed).
+    /// `session_server_user_id` now returns the UUID from the session, and fails CLOSED with a re-login
+    /// prompt (never the email) when a pre-fix session lacks it.
+    #[test]
+    fn org_identity_uses_server_user_id_not_email() {
+        let state = build_state("org-identity");
+        let uuid = "c534b6d2-02c1-4c2c-a256-3af8592b1567";
+        let set_session = |server_user_id: Option<String>| {
+            *state.account_session.lock().unwrap() = Some(crate::share::AccountSession {
+                account_id: "user@example.com".into(), // the EMAIL — must NEVER be the grant key
+                email: "user@example.com".into(),
+                server_user_id,
+                device_id: "dev-1".into(),
+                mk: Zeroizing::new([7u8; 32]),
+                generation: 1,
+                access_token: "a".into(),
+                access_expires_at: Some("2099-01-01T00:00:00Z".into()),
+                refresh_token: "r".into(),
+            });
+        };
+        // UUID present ⇒ org identity is the UUID, not the email.
+        set_session(Some(uuid.into()));
+        assert_eq!(session_server_user_id(&state).unwrap(), uuid);
+        // Absent (a session persisted before the fix) ⇒ a clear re-login prompt, never the email.
+        set_session(None);
+        assert!(matches!(
+            session_server_user_id(&state),
+            Err(AppError::Unavailable(_))
+        ));
+    }
+
     /// `active_org_shares_for_folder` returns the folder's ACTIVE (non-revoked/failed) org shares for
     /// the lock×shares dialog — meeting-anchored AND note-anchored — and excludes revoked ones.
     #[test]
@@ -22091,6 +22153,8 @@ async fn acquire_org_ock(
     // Miss → unwrap from the caller's server-relayed grant. Needs the MK session (to derive our
     // identity keypair) + a valid bearer.
     let (account_id, gen_id, mk, access_token) = require_session_mk(state).await?;
+    // Grants are keyed by the server user id (UUID) — NOT the email `account_id`.
+    let server_user_id = session_server_user_id(state)?;
     let base = share_base_url(state)?;
     let client = crate::share::client::ShareClient::new(&base)?;
     let recipient = crate::e2ee::keys::derive_identity(&mk, &account_id, gen_id)?;
@@ -22101,7 +22165,7 @@ async fn acquire_org_ock(
     let grant = grants
         .grants
         .into_iter()
-        .find(|g| g.generation == generation && g.user_id == account_id)
+        .find(|g| g.generation == generation && g.user_id == server_user_id)
         .ok_or_else(|| {
             AppError::Unavailable(format!(
                 "no org key grant for generation {generation} — ask the owner to re-share the key"
@@ -22175,6 +22239,8 @@ pub(crate) async fn org_create_inner(state: &AppState, name: String) -> Result<O
     }
     let base = share_base_url(state)?;
     let (account_id, gen_id, mk, access_token) = require_session_mk(state).await?;
+    // The server DB key for grants (matches `org_members.user_id`) — a UUID, NOT the email `account_id`.
+    let server_user_id = session_server_user_id(state)?;
     let client = crate::share::client::ShareClient::new(&base)?;
 
     let created = client.org_create(&access_token, &name).await?;
@@ -22189,7 +22255,7 @@ pub(crate) async fn org_create_inner(state: &AppState, name: String) -> Result<O
         &created.org_id,
         created.current_generation,
         &owner.pk_enc,
-        &account_id, // recipient acct id = our server user id (grants are keyed by user_id)
+        &owner_fp, // recipient_acct_id = our FINGERPRINT (the crypto binding `acquire_org_ock` opens with)
         &owner,
         &owner_fp,
         gen_id,
@@ -22199,7 +22265,8 @@ pub(crate) async fn org_create_inner(state: &AppState, name: String) -> Result<O
             &access_token,
             &created.org_id,
             vec![crate::share::org_dto::KeyGrantInput {
-                user_id: account_id.clone(),
+                // DB key = the server user id (UUID), so the grant links to our `org_members` row.
+                user_id: server_user_id.clone(),
                 generation: created.current_generation,
                 wrapped_key: grant.wrapped_key,
                 grant_sig: grant.grant_sig,
@@ -22346,12 +22413,15 @@ pub(crate) async fn org_invite_member_inner(state: &AppState, email: String) -> 
     let ock = acquire_org_ock(state, &org.org_id, generation).await?;
     let owner = crate::e2ee::keys::derive_identity(&mk, &account_id, gen_id)?;
     let owner_fp = crate::e2ee::key_fingerprint(&owner.pk_enc, &owner.pk_sig);
+    // recipient_acct_id = the member's FINGERPRINT (the crypto binding THEY open with via `self_fp` in
+    // `acquire_org_ock`); the DB grant key stays their server user id (`added.user_id`).
+    let member_fp = crate::e2ee::key_fingerprint(&key.pk_enc, &key.pk_sig);
     let grant = crate::e2ee::org::wrap_ock_for_member(
         &ock,
         &org.org_id,
         generation,
         &key.pk_enc,
-        &added.user_id,
+        &member_fp,
         &owner,
         &owner_fp,
         gen_id,
@@ -22413,6 +22483,8 @@ pub(crate) async fn org_remove_member_inner(state: &AppState, user_id: String) -
     };
     let base = share_base_url(state)?;
     let (account_id, gen_id, mk, access_token) = require_session_mk(state).await?;
+    // DB grant key = the owner's server user id (UUID), not the email `account_id`.
+    let server_user_id = session_server_user_id(state)?;
     let client = crate::share::client::ShareClient::new(&base)?;
 
     client
@@ -22440,7 +22512,7 @@ pub(crate) async fn org_remove_member_inner(state: &AppState, user_id: String) -
         &org.org_id,
         new_gen,
         &owner.pk_enc,
-        &account_id,
+        &owner_fp, // recipient_acct_id = our FINGERPRINT (matches `acquire_org_ock`'s open)
         &owner,
         &owner_fp,
         gen_id,
@@ -22450,7 +22522,7 @@ pub(crate) async fn org_remove_member_inner(state: &AppState, user_id: String) -
             &access_token,
             &org.org_id,
             vec![crate::share::org_dto::KeyGrantInput {
-                user_id: account_id.clone(),
+                user_id: server_user_id.clone(),
                 generation: new_gen,
                 wrapped_key: owner_grant.wrapped_key,
                 grant_sig: owner_grant.grant_sig,

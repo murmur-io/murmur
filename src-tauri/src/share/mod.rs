@@ -40,8 +40,15 @@ const KC_REFRESH_TOKEN: &str = "murmur_share_refresh_token";
 const KC_DEVICE_ID: &str = "murmur_share_device_id";
 /// Keychain account name for the account email (non-secret, but session-scoped; kept out of SQLite).
 const KC_ACCOUNT_EMAIL: &str = "murmur_share_account_email";
-/// Keychain account name for the account id (server user id).
+/// Keychain account name for the account id. NOTE: this is the account's EMAIL — it is baked into the
+/// `mk_wrap_pw` AAD + the identity-key derivation at signup, so it MUST stay the email (a login can't
+/// re-derive the MK otherwise). It is NOT the server user id despite the historical name.
 const KC_ACCOUNT_ID: &str = "murmur_share_account_id";
+/// Keychain account name for the account's stable SERVER USER ID (a UUID). Distinct from
+/// `KC_ACCOUNT_ID` (the email): org key-grants key on this UUID (matching `org_members.user_id`). A
+/// login learns it from `LoginFinishResponse.user_id`; absent for sessions persisted before this
+/// field existed ⇒ `None` ⇒ org sharing prompts a re-login to backfill it.
+const KC_SERVER_USER_ID: &str = "murmur_share_server_user_id";
 /// Keychain account name for the identity-key GENERATION (non-secret key-rotation counter). Persisted
 /// alongside the tokens so a biometric session restore can rebuild the identity-slot AAD without a
 /// re-login — the MK itself is cached separately + biometric-gated (see `secrets::keychain`).
@@ -71,6 +78,10 @@ pub struct PersistedTokens {
     pub device_id: String,
     pub email: String,
     pub account_id: String,
+    /// The account's stable server user id (UUID), from `LoginFinishResponse.user_id`. Org key-grants
+    /// key on it. `None` for a session persisted before this field existed ⇒ org sharing prompts a
+    /// re-login to backfill it (see `load_tokens`).
+    pub server_user_id: Option<String>,
     /// The identity-key generation at login (non-secret rotation counter). Needed to rebuild the
     /// `AccountSession` on a biometric restore; defaults to 1 for sessions persisted before this field
     /// existed (see `load_tokens`).
@@ -89,6 +100,11 @@ pub fn store_tokens(t: &PersistedTokens) -> Result<()> {
     crate::secrets::set_secret(KC_DEVICE_ID, &t.device_id)?;
     crate::secrets::set_secret(KC_ACCOUNT_EMAIL, &t.email)?;
     crate::secrets::set_secret(KC_ACCOUNT_ID, &t.account_id)?;
+    // The server user id (UUID) when known; otherwise DELETE any stale prior value.
+    match &t.server_user_id {
+        Some(uid) => crate::secrets::set_secret(KC_SERVER_USER_ID, uid)?,
+        None => crate::secrets::delete_secret(KC_SERVER_USER_ID)?,
+    }
     crate::secrets::set_secret(KC_GENERATION, &t.generation.to_string())?;
     // Write the expiry when known; otherwise DELETE any stale prior value so a refresh that omitted it
     // never leaves an old expiry behind (which would suppress the next proactive refresh).
@@ -120,12 +136,15 @@ pub fn load_tokens() -> Result<Option<PersistedTokens>> {
         .unwrap_or(1);
     // Absent for a session persisted before this field existed ⇒ `None` ⇒ refresh on the next share op.
     let access_expires_at = crate::secrets::get_secret(KC_ACCESS_EXPIRES_AT)?;
+    // `None` for a session persisted before this field existed ⇒ org sharing prompts a re-login.
+    let server_user_id = crate::secrets::get_secret(KC_SERVER_USER_ID)?;
     Ok(Some(PersistedTokens {
         access_token,
         refresh_token,
         device_id,
         email,
         account_id,
+        server_user_id,
         generation,
         access_expires_at,
     }))
@@ -143,6 +162,7 @@ pub fn clear_tokens() -> Result<()> {
     crate::secrets::delete_secret(KC_DEVICE_ID)?;
     crate::secrets::delete_secret(KC_ACCOUNT_EMAIL)?;
     crate::secrets::delete_secret(KC_ACCOUNT_ID)?;
+    crate::secrets::delete_secret(KC_SERVER_USER_ID)?;
     crate::secrets::delete_secret(KC_GENERATION)?;
     crate::secrets::delete_secret(KC_ACCESS_EXPIRES_AT)?;
     Ok(())
@@ -155,6 +175,9 @@ pub fn clear_tokens() -> Result<()> {
 pub struct AccountSession {
     pub account_id: String,
     pub email: String,
+    /// The account's stable server user id (UUID) for org key-grants. `None` for a session restored
+    /// from tokens persisted before this field existed ⇒ org sharing prompts a re-login to backfill it.
+    pub server_user_id: Option<String>,
     pub device_id: String,
     /// The account master key `MK`, unwrapped at login from the server's `mk_wrap_pw` via
     /// `keys::derive_kek_pw(export_key)`. Zeroized on drop.
