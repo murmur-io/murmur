@@ -1,42 +1,38 @@
 <div class="card note-assist-card" [formGroup]="form">
   <div class="use-group">
     <span class="use-group-label text-muted">Note assistant</span>
+    <p class="text-secondary note-assist-intro">
+      Turn on the in-note Brain actions you want in the selection command menu.
+      Each runs on your Notes model — everything stays available through the
+      command box even if a row is off.
+    </p>
 
-    <label class="toggle-row">
-      <span class="toggle-copy">
-        <span class="toggle-title">Refine</span>
-        <span class="text-secondary toggle-sub">
-          Improve the selected text's clarity, grammar and flow — same meaning,
-          better wording.
-        </span>
-      </span>
-      <mur-toggle formControlName="noteAssistRefine" />
-    </label>
-
-    <label class="toggle-row">
-      <span class="toggle-copy">
-        <span class="toggle-title">Shorten</span>
-        <span class="text-secondary toggle-sub">
-          Tighten the selection into a more concise version, keeping the point.
-        </span>
-      </span>
-      <mur-toggle formControlName="noteAssistShorten" />
-    </label>
-
-    <label class="toggle-row">
-      <span class="toggle-copy">
-        <span class="toggle-title">Enhance context</span>
-        <span class="text-secondary toggle-sub">
-          Pull related notes and meetings from your brain and add a grounded
-          passage with sources — never overwrites what you wrote.
-        </span>
-      </span>
-      <mur-toggle formControlName="noteAssistEnhance" />
-    </label>
+    @for (g of groups; track g) {
+      <div class="assist-group">
+        <span class="assist-group-label text-muted">{{ g }}</span>
+        @for (a of actionsInGroup(g); track a.id) {
+          <label class="toggle-row">
+            <span class="toggle-copy">
+              <span class="toggle-title">
+                <span class="assist-ico" aria-hidden="true">{{ a.icon }}</span>
+                {{ a.label }}
+              </span>
+              <span class="text-secondary toggle-sub">{{ a.desc }}</span>
+            </span>
+            <mur-toggle
+              [formControlName]="controlName(a)"
+              [ariaLabel]="a.label"
+            />
+          </label>
+        }
+      </div>
+    }
 
     <p class="text-secondary note-assist-note">
-      In-note Brain actions (Refine · Shorten · Enhance context) run on your
-      Notes model@if (noteAssistModelLabel(); as model) {
+      In-note Brain actions run on your Notes model@if (
+        noteAssistModelLabel();
+        as model
+      ) {
         <span class="note-assist-model"> ({{ model }})</span>
       }, so they follow the same local or cloud connection you set for Notes
       above.

@@ -21,6 +21,26 @@
   text-transform: uppercase;
 }
 
+/* Intro line above the grouped toggles. */
+.note-assist-intro {
+  margin: 0;
+  font-size: 0.85rem;
+  line-height: 1.55;
+}
+
+/* Grouped action sections (EDIT / STRUCTURE / …). */
+.assist-group {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+.assist-group-label {
+  font-size: 0.68rem;
+  font-weight: 660;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
 /* Toggle rows. */
 .toggle-row {
   display: flex;
@@ -35,9 +55,23 @@
   gap: var(--space-1);
 }
 .toggle-title {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
   color: var(--text-primary);
   font-size: 0.95rem;
   font-weight: 550;
+}
+.assist-ico {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: var(--radius-sm);
+  background: var(--accent-soft);
+  color: var(--accent-hover);
+  font-size: 0.8rem;
 }
 .toggle-sub {
   font-size: 0.85rem;
