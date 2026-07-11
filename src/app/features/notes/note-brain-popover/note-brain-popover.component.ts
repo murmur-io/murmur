@@ -150,12 +150,6 @@ export class NoteBrainPopoverComponent {
     return t.refine || t.shorten || t.enhance;
   });
 
-  /** The mode chip label — the resolved model once a result lands, else neutral. */
-  readonly modeLabel = computed(() => {
-    const r = this.result();
-    return r ? `via ${r.modelLabel}` : "Brain";
-  });
-
   /** Whether the current result is the additive-enhance shape (insert, not replace). */
   readonly isEnhanceResult = computed(
     () => this.result()?.action === "enhance",
