@@ -159,6 +159,20 @@ pub struct AppConfigDto {
     /// silently blanks it. Mirrors Rust `AppConfig::live_asr_engine` / FE `liveAsrEngine`.
     #[serde(default = "default_live_asr_engine")]
     pub live_asr_engine: String,
+    /// Brain-sidecar IDLE-KILL window (s) — after this idle the host kills the `meetnotes-brain`
+    /// child to reclaim its model RAM. Settable. An omitted key deserializes to 300
+    /// (`#[serde(default = "…")]`) so an older FE payload never zeroes it. Mirrors Rust
+    /// `AppConfig::brain_idle_timeout_secs` / FE `brainIdleTimeoutSecs`.
+    #[serde(default = "default_brain_idle_timeout_secs")]
+    pub brain_idle_timeout_secs: u64,
+    /// Brain-sidecar READY-handshake timeout (s). Settable. Omitted ⇒ 90. Mirrors Rust
+    /// `AppConfig::brain_ready_timeout_secs` / FE `brainReadyTimeoutSecs`.
+    #[serde(default = "default_brain_ready_timeout_secs")]
+    pub brain_ready_timeout_secs: u64,
+    /// Brain-sidecar HARD per-generation cap (s) for calls with no explicit timeout. Settable.
+    /// Omitted ⇒ 180. Mirrors Rust `AppConfig::brain_hard_cap_secs` / FE `brainHardCapSecs`.
+    #[serde(default = "default_brain_hard_cap_secs")]
+    pub brain_hard_cap_secs: u64,
     pub voice_trigger: bool,
     pub onboarded: bool,
     pub note_style: String,
@@ -374,6 +388,22 @@ fn default_true() -> bool {
 /// older FE payload that omits `liveAsrEngine` never blanks the engine.
 fn default_live_asr_engine() -> String {
     crate::transcribe::live_asr::ENGINE_WHISPER.to_string()
+}
+
+/// serde default for the DTO's `brain_idle_timeout_secs` — 300 s (matches `AppConfig`), so an older
+/// FE payload that omits `brainIdleTimeoutSecs` never zeroes the idle-kill window.
+fn default_brain_idle_timeout_secs() -> u64 {
+    300
+}
+
+/// serde default for the DTO's `brain_ready_timeout_secs` — 90 s.
+fn default_brain_ready_timeout_secs() -> u64 {
+    90
+}
+
+/// serde default for the DTO's `brain_hard_cap_secs` — 180 s.
+fn default_brain_hard_cap_secs() -> u64 {
+    180
 }
 
 /// Lenient `brain_backend` deserialization for the settings DTO: an UNKNOWN/garbage token
@@ -6912,6 +6942,9 @@ fn config_to_dto(c: &AppConfig) -> AppConfigDto {
         audio_auto_prune: c.audio_auto_prune,
         model_size: c.model_size.clone(),
         live_asr_engine: c.live_asr_engine.clone(),
+        brain_idle_timeout_secs: c.brain_idle_timeout_secs,
+        brain_ready_timeout_secs: c.brain_ready_timeout_secs,
+        brain_hard_cap_secs: c.brain_hard_cap_secs,
         voice_trigger: c.voice_trigger,
         onboarded: c.onboarded,
         note_style: c.note_style.clone(),
@@ -7021,6 +7054,24 @@ fn dto_to_config(d: AppConfigDto, current: &AppConfig) -> AppConfig {
             crate::transcribe::live_asr::ENGINE_WHISPER.to_string()
         } else {
             d.live_asr_engine
+        },
+        // Brain-sidecar timeouts (settable). A 0 value would idle-kill/degrade immediately, so a 0
+        // (or an omitted, serde-defaulted) value falls back to the built-in default — never a
+        // pathological zero-window.
+        brain_idle_timeout_secs: if d.brain_idle_timeout_secs == 0 {
+            300
+        } else {
+            d.brain_idle_timeout_secs
+        },
+        brain_ready_timeout_secs: if d.brain_ready_timeout_secs == 0 {
+            90
+        } else {
+            d.brain_ready_timeout_secs
+        },
+        brain_hard_cap_secs: if d.brain_hard_cap_secs == 0 {
+            180
+        } else {
+            d.brain_hard_cap_secs
         },
         // T1.3/T1.4 (transcription heat): the live-model pin + live VAD gate are NOT carried on
         // the settings DTO (no FE toggles yet) — PRESERVE the live values (the L3/L4-flag
@@ -15968,7 +16019,7 @@ mod lifecycle_tests {
             "precondition: the general extraction seam is cloud under this config"
         );
         // The import seam must stay local-or-stub regardless. On a machine WITH the light model
-        // installed this is the local engine (`mistralrs:*`); without it, the stub (⇒ 0 imported).
+        // installed this is the local sidecar engine (`sidecar:*`); without it, the stub (⇒ 0 imported).
         // Both are on-device — the binding invariant is NEVER `cloud:*`.
         let id = import_extraction_reasoner(&state).id().to_string();
         assert!(
@@ -15976,7 +16027,7 @@ mod lifecycle_tests {
             "memory import must NEVER extract on a cloud reasoner (got {id})"
         );
         assert!(
-            id == "stub" || id.starts_with("mistralrs:"),
+            id == "stub" || id.starts_with("sidecar:"),
             "the import reasoner must be the LIGHT local-or-stub handle (got {id})"
         );
     }

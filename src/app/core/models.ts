@@ -112,6 +112,24 @@ export interface AppConfigDto {
    * fallback. Settable from the Transcription settings toggle.
    */
   liveAsrEngine: string;
+  /**
+   * Brain-sidecar IDLE-KILL window in seconds (mirrors Rust `brain_idle_timeout_secs`, default
+   * 300): after this long with no on-device brain request, the host kills the `meetnotes-brain`
+   * child to reclaim ALL its model RAM to the OS.
+   */
+  brainIdleTimeoutSecs: number;
+  /**
+   * Brain-sidecar READY-handshake timeout in seconds (mirrors Rust `brain_ready_timeout_secs`,
+   * default 90): the bounded wait for the child's `Ready` after spawn (model load can be slow). On
+   * timeout the brain call degrades to Cloud/floor rather than blocking.
+   */
+  brainReadyTimeoutSecs: number;
+  /**
+   * Brain-sidecar HARD per-generation cap in seconds (mirrors Rust `brain_hard_cap_secs`, default
+   * 180) for a call with no explicit timeout: a wedged child is killed + respawned at this cap so it
+   * can never hold model RAM forever.
+   */
+  brainHardCapSecs: number;
   voiceTrigger: boolean;
   onboarded: boolean;
   /**

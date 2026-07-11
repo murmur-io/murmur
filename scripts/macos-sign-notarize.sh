@@ -28,7 +28,10 @@ ENTITLEMENTS="$ROOT/src-tauri/entitlements.plist"
 ENTITLEMENTS_APP="$ROOT/src-tauri/entitlements-app.plist"
 PROFILE="$ROOT/src-tauri/Murmur_Developer_ID.provisionprofile"
 VERSION="$(grep -m1 '"version"' "$ROOT/src-tauri/tauri.conf.json" | sed -E 's/.*"version"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/')"
-APP="$ROOT/src-tauri/target/universal-apple-darwin/release/bundle/macos/Murmur.app"
+# NOTE: the cargo target dir moved to the WORKSPACE ROOT (`$ROOT/target`) when the brain-sidecar
+# extraction introduced a virtual workspace (members: src-tauri + crates/murmur-brain). It was
+# `$ROOT/src-tauri/target/...` before. Entitlements/profile below stay under src-tauri/ (source files).
+APP="$ROOT/target/universal-apple-darwin/release/bundle/macos/Murmur.app"
 OUT_DMG="$HOME/Desktop/Murmur-$VERSION.dmg"
 
 : "${DEVELOPER_ID:?set DEVELOPER_ID='Developer ID Application: Your Name (TEAMID)' — see security find-identity -v -p codesigning}"

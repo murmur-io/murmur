@@ -52,7 +52,112 @@ fn main() {
         "26.0",
         &["FoundationModels"],
     );
+    // Brain sidecar (`crates/murmur-brain` → `meetnotes-brain`): STAGE-IF-EXISTS the pre-built
+    // binary into `binaries/meetnotes-brain` + emit `BRAIN_BIN` for the dev fallback. We DO NOT
+    // shell `cargo build -p murmur-brain` here (nested-cargo-in-build.rs = re-entrancy / target-lock
+    // hazard): release builds the child via `tauri.conf.json` `beforeBuildCommand`, and this just
+    // copies it. If it is ABSENT (e.g. during `cargo test --lib`, which never builds the child) this
+    // is a HARMLESS no-op — the resource entry is likewise release-only (see tauri.conf.json).
+    stage_brain_sidecar();
     tauri_build::build();
+}
+
+/// STAGE the `meetnotes-brain` child binary into the stable in-crate `binaries/meetnotes-brain`
+/// path (the `bundle.resources` mount point), by profile:
+///
+/// - RELEASE bundle: the REAL UNIVERSAL binary is staged by `tauri.conf.json`'s `beforeBuildCommand`
+///   (two per-arch `cargo build -p murmur-brain --release --target …` + a `lipo -create … -output
+///   src-tauri/binaries/meetnotes-brain`), which runs ONCE *before* `tauri build` compiles the app —
+///   i.e. before THIS build.rs runs. So on a real release build `binaries/meetnotes-brain` already
+///   exists as the correct universal Mach-O when we get here, and we MUST NOT touch it. Overwriting
+///   it with a stale HOST-ARCH-only `target/release/meetnotes-brain` (from a prior dev child build) or
+///   with an empty placeholder is exactly BLOCKER-8: the universal DMG would ship a dead brain.
+/// - DEV (`cargo build` / `npm run dev`, host-arch): stage the host-arch `target/{debug,release}`
+///   child IF present, and emit `cargo:rustc-env=BRAIN_BIN=<built>` so the dev fallback in
+///   `resolve_bin` can spawn it. Only refresh `binaries/…` from the host-arch build when the current
+///   `binaries/…` is ABSENT or is the empty test placeholder — never clobber a real (universal or
+///   larger) staged binary.
+/// - `cargo test --lib` (runs build.rs, never `beforeBuildCommand`, never builds the child): if
+///   nothing is present, write an EMPTY placeholder so `tauri_build`'s resource-existence check passes.
+///   The placeholder is a TEST/DEV-ONLY sentinel; a real bundle ALWAYS gets the real universal binary
+///   from the `beforeBuildCommand`-before-build.rs ordering above.
+///
+/// INVARIANT (BLOCKER-8): NEVER overwrite an already-present REAL `binaries/meetnotes-brain` with a
+/// placeholder or a smaller/host-arch binary. Best-effort otherwise: a missing binary in a dev/test
+/// build is a silent no-op so `cargo test --lib` is NEVER blocked.
+fn stage_brain_sidecar() {
+    const BIN: &str = "meetnotes-brain";
+    println!("cargo:rerun-if-changed=build.rs");
+
+    let bundled = Path::new("binaries").join(BIN);
+    if let Some(parent) = bundled.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    // Is a REAL binary already staged? The empty placeholder we write below is 0 bytes; a real child
+    // (host-arch dev build ~200+ MB, or the universal release binary) is far from empty. Treat any
+    // non-empty `binaries/…` as already-staged and DO NOT clobber it (the release universal binary
+    // staged by `beforeBuildCommand` lands here BEFORE build.rs runs — see the fn doc).
+    let already_real = std::fs::metadata(&bundled).map(|m| m.len() > 0).unwrap_or(false);
+
+    // Resolve the workspace target dir. `OUT_DIR` is `<target>/<profile>/build/murmur-*/out`;
+    // climb to `<target>` then probe the profile subdirs. Honor `CARGO_TARGET_DIR` if set.
+    let target_dir: Option<PathBuf> = std::env::var("CARGO_TARGET_DIR")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var("OUT_DIR").ok().and_then(|out| {
+                // out = <target>/<profile>/build/<pkg>-<hash>/out → 4 parents up = <target>.
+                let mut p = PathBuf::from(out);
+                for _ in 0..4 {
+                    p = p.parent()?.to_path_buf();
+                }
+                Some(p)
+            })
+        });
+
+    // Prefer release; also probe the universal-apple-darwin release the shipped bundle uses, then a
+    // debug fallback for a dev child build. First existing wins. This ONLY finds a HOST-ARCH child in
+    // a normal `cargo build -p murmur-brain` dev build (a target-triple build writes under
+    // `target/<triple>/…`, which the release path stages via `beforeBuildCommand`, not here).
+    let built = target_dir.as_ref().and_then(|td| {
+        [
+            td.join("release").join(BIN),
+            td.join("universal-apple-darwin").join("release").join(BIN),
+            td.join("debug").join(BIN),
+        ]
+        .into_iter()
+        .find(|p| p.is_file())
+    });
+
+    match built {
+        Some(built) => {
+            // A real host-arch child was built (dev `-p murmur-brain`). Expose the DEV fallback path so
+            // `resolve_bin` can spawn it directly. Only refresh the staged `binaries/…` when the
+            // current one is ABSENT or the empty placeholder — NEVER clobber an already-real (e.g.
+            // universal, staged by `beforeBuildCommand`) binary.
+            println!("cargo:rustc-env=BRAIN_BIN={}", built.display());
+            println!("cargo:rerun-if-changed={}", built.display());
+            if !already_real {
+                if let Err(e) = std::fs::copy(&built, &bundled) {
+                    println!(
+                        "cargo:warning=could not stage {BIN} for bundling ({e}); a release bundle may lack it"
+                    );
+                }
+            }
+        }
+        None => {
+            // Not built yet (the COMMON case during `cargo test --lib`, which never builds the child).
+            // `tauri_build` validates every `bundle.resources` path EXISTS — even in a test build — so
+            // create an EMPTY placeholder ONLY if none is present. The placeholder is a TEST/DEV-ONLY
+            // sentinel; a real release bundle ALWAYS gets the real UNIVERSAL binary from the
+            // `beforeBuildCommand` `lipo` (which runs BEFORE this build.rs), so we must NOT overwrite it.
+            // NO `BRAIN_BIN` is emitted here, so a dev run without a built child resolves no binary and
+            // the reasoner degrades to the stub.
+            if !bundled.exists() {
+                let _ = std::fs::write(&bundled, b"");
+            }
+        }
+    }
 }
 
 /// Compile a Swift helper as a UNIVERSAL (arm64 + x86_64) Mach-O so the distributed universal
