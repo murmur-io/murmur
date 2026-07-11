@@ -266,14 +266,10 @@
 
 /* --- 2.5 Manage --- */
 .manage,
-.person,
-.org {
+.person {
   display: flex;
   flex-direction: column;
   gap: var(--space-3);
-}
-.org-btn {
-  align-self: flex-start;
 }
 .manage-head {
   display: flex;
