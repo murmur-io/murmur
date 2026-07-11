@@ -1835,6 +1835,15 @@ export interface OrgItemHeader {
   createdAt: string;
   /** The item's feed sequence — stable ordering key for the browse list. */
   seq: number;
+  /**
+   * When THIS user published the item AND their local source is readable, the
+   * editable original behind it (resolved backend-side, unlock-gated). Present ⇒
+   * the row links straight to `/notes/:id` | `/meeting/:id` and `title` is the
+   * source's CURRENT title (never a stale publish-time snapshot). Absent ⇒ a
+   * read-only replica shared by someone else (or a locked own source), opened via
+   * the `/org-item/:id` viewer. Mirrors the Rust `OrgItemHeader.owned_source`.
+   */
+  ownedSource?: { kind: "document" | "meeting"; id: string } | null;
 }
 
 /**
