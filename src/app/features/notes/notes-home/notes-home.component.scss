@@ -145,6 +145,32 @@
   white-space: nowrap;
 }
 
+/* --- Rail: "Shared brains" (orgs) section --- */
+.org-head {
+  /* A quiet divider above the section so it reads as a distinct group. */
+  margin-top: var(--space-3);
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--border-subtle);
+}
+.org-body {
+  /* The org list sits under the folder list; it does not need its own scroll. */
+  flex: 0 0 auto;
+  overflow: visible;
+}
+.org-row {
+  cursor: pointer;
+}
+/* A quiet role hint (Owner / Member) trailing the org name. */
+.org-role {
+  flex: none;
+  margin-left: auto;
+  font-size: 0.62rem;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  background: var(--surface-raised);
+}
+
 /* --- Right pane: note list --- */
 .notes-content {
   display: flex;
@@ -279,6 +305,48 @@
 }
 .note-shared {
   flex: none;
+}
+
+/* --- Org (Shared Brain) card: a read-only replica, styled as a note card --- */
+.note-card--org {
+  display: block;
+  text-decoration: none;
+  color: inherit;
+}
+.note-card--org:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+/* The org card has no floating move button, so it needs no right-side reserve. */
+.note-open--org {
+  padding-right: var(--space-4);
+  cursor: pointer;
+}
+/* The "shared brain" origin badge — distinct from the outbound "Shared" pill:
+   a neutral raised surface (not the accent fill) with the org's name + a glyph. */
+.org-badge {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  max-width: 14ch;
+  overflow: hidden;
+  color: var(--text-secondary);
+  background: var(--surface-raised);
+  border: 1px solid var(--border-subtle);
+  font-size: 0.7rem;
+  font-weight: 600;
+}
+.org-badge-glyph {
+  flex: none;
+  color: var(--text-muted);
+}
+.note-author {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.8rem;
 }
 
 .note-snippet {

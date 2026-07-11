@@ -1,6 +1,7 @@
 import {
   ChangeDetectionStrategy,
   Component,
+  DestroyRef,
   ElementRef,
   Injector,
   OnInit,
@@ -10,9 +11,18 @@ import {
   signal,
   viewChild,
 } from "@angular/core";
-import { Router } from "@angular/router";
+import { Router, RouterLink } from "@angular/router";
+import type { UnlistenFn } from "@tauri-apps/api/event";
+import { IpcService } from "../../../core/ipc.service";
 import { NavHistoryService } from "../../../core/nav-history.service";
-import type { NoteFolder, OrganizeMove, OrganizePlan } from "../../../core/models";
+import type {
+  NoteFolder,
+  NoteSummary,
+  OrganizeMove,
+  OrganizePlan,
+  OrgItemHeader,
+  OrgStatus,
+} from "../../../core/models";
 import { MurSidebarComponent } from "../../../design-system/sidebar/sidebar.component";
 import { FoldersService } from "../../../services/folders.service";
 import { FolderLockFlowService } from "../../../services/folder-lock-flow.service";
@@ -20,6 +30,31 @@ import { NotesService } from "../../../services/notes.service";
 import { ToastService } from "../../../services/toast.service";
 import { LockSharesDialogComponent } from "../../folders/lock-shares-dialog/lock-shares-dialog.component";
 import { OrganizeSheetComponent } from "../organize-sheet/organize-sheet.component";
+
+/**
+ * One row of the unified content list — a discriminated union over the two
+ * sources the pane merges. A `"note"` card is YOUR authored note (opens the
+ * editor); an `"org"` card is a READ-ONLY org (Shared Brain) replica (opens the
+ * `/org-item/:id` viewer, carries the origin org's name for its badge). Both
+ * expose an epoch-ms `sortAt` so the merged list orders by date desc regardless
+ * of source. `id` is namespaced (`note:`/`org:`) so the `@for` track key is
+ * stable + collision-free across the two id spaces.
+ */
+export type NotesListItem =
+  | {
+      kind: "note";
+      id: string;
+      sortAt: number;
+      note: NoteSummary;
+    }
+  | {
+      kind: "org";
+      id: string;
+      sortAt: number;
+      item: OrgItemHeader;
+      /** The origin org's display name (drives the "shared brain" badge label). */
+      orgName: string;
+    };
 
 /**
  * The Notes landing view — a Meetings-style drill-down `[note-folder rail |
@@ -43,6 +78,7 @@ import { OrganizeSheetComponent } from "../organize-sheet/organize-sheet.compone
   changeDetection: ChangeDetectionStrategy.OnPush,
   host: { "(document:keydown.escape)": "onEscape()" },
   imports: [
+    RouterLink,
     MurSidebarComponent,
     OrganizeSheetComponent,
     LockSharesDialogComponent,
@@ -53,9 +89,11 @@ import { OrganizeSheetComponent } from "../organize-sheet/organize-sheet.compone
 export class NotesHomeComponent implements OnInit {
   private readonly notes = inject(NotesService);
   private readonly folders = inject(FoldersService);
+  private readonly ipc = inject(IpcService);
   private readonly router = inject(Router);
   private readonly toast = inject(ToastService);
   private readonly injector = inject(Injector);
+  private readonly destroyRef = inject(DestroyRef);
   /**
    * Shared lock×shares flow (probe → warn/revoke dialog → lock). The SAME flow the
    * meetings tree runs, so locking a note-folder with live shares also warns before
@@ -78,6 +116,108 @@ export class NotesHomeComponent implements OnInit {
   /** True while a create-note IPC call is in flight (guards the "New note" button). */
   readonly creating = signal(false);
 
+  // --- Org (Shared Brain) shared-brain notes ------------------------------
+  /**
+   * Every org (Shared Brain) this user belongs to — the rail's "Shared brains"
+   * section + the source of merged org items in "All notes". Loaded stale-guarded
+   * on init, on the `org-feed-updated` event, and on window focus.
+   */
+  private readonly _orgs = signal<OrgStatus[]>([]);
+  readonly orgs = this._orgs.asReadonly();
+  /**
+   * The org's shared items keyed by orgId (`listOrgItems`). A flat parallel signal
+   * (not per-org sub-signals) so the merged `listItems` computed re-derives on any
+   * change. Populated alongside {@link _orgs} in {@link loadOrgs}.
+   */
+  private readonly _orgItems = signal<Record<string, OrgItemHeader[]>>({});
+  /**
+   * Selected org id in the rail (null ⇒ not viewing a specific org). MUTUALLY
+   * exclusive with a note-folder selection: selecting an org clears
+   * {@link activeFolderId} back to the "All notes" root and vice-versa, so the
+   * content pane has exactly one active scope.
+   */
+  readonly activeOrgId = signal<string | null>(null);
+  /** True while the org list + items are (re)loading (rail hint only). */
+  readonly orgsLoading = signal(false);
+  /** The org whose items are shown when an org is rail-selected (null otherwise). */
+  readonly activeOrg = computed<OrgStatus | null>(() => {
+    const oid = this.activeOrgId();
+    return oid === null
+      ? null
+      : (this._orgs().find((o) => o.orgId === oid) ?? null);
+  });
+
+  /**
+   * The unified content list feeding the pane, sorted by date desc:
+   *  - a specific org rail-selected ⇒ ONLY that org's items;
+   *  - "All notes" (no folder, no org) ⇒ your authored notes MERGED with EVERY
+   *    org's shared items;
+   *  - a specific note-folder ⇒ only that folder's authored notes (no org items).
+   * Org items never carry a lock (they are deliberately-disclosed org content) —
+   * only authored notes can be masked.
+   */
+  readonly listItems = computed<NotesListItem[]>(() => {
+    const orgId = this.activeOrgId();
+    const orgItemsByOrg = this._orgItems();
+    const orgs = this._orgs();
+    const orgNameById = new Map(orgs.map((o) => [o.orgId, o.name]));
+
+    // A specific org selected: show ONLY that org's items.
+    if (orgId !== null) {
+      const name = orgNameById.get(orgId) ?? "";
+      return (orgItemsByOrg[orgId] ?? [])
+        .map((item) => this.toOrgCard(item, name))
+        .sort((a, b) => b.sortAt - a.sortAt);
+    }
+
+    const noteCards: NotesListItem[] = this.noteList().map((note) => ({
+      kind: "note" as const,
+      id: `note:${note.id}`,
+      sortAt: note.updatedAt,
+      note,
+    }));
+
+    // A specific note-folder is selected (not "All notes"): authored notes only.
+    if (this.activeFolderId() !== null) {
+      return noteCards.sort((a, b) => b.sortAt - a.sortAt);
+    }
+
+    // "All notes": merge YOUR notes with EVERY org's shared items.
+    const orgCards: NotesListItem[] = orgs.flatMap((o) =>
+      (orgItemsByOrg[o.orgId] ?? []).map((item) =>
+        this.toOrgCard(item, o.name),
+      ),
+    );
+    return [...noteCards, ...orgCards].sort((a, b) => b.sortAt - a.sortAt);
+  });
+
+  /** True when the unified list has zero rows (drives the empty state). */
+  readonly listEmpty = computed(() => this.listItems().length === 0);
+
+  /** Build an org card from a header + its origin org name. */
+  private toOrgCard(item: OrgItemHeader, orgName: string): NotesListItem {
+    const t = Date.parse(item.createdAt);
+    return {
+      kind: "org",
+      id: `org:${item.itemId}`,
+      sortAt: Number.isNaN(t) ? 0 : t,
+      item,
+      orgName,
+    };
+  }
+
+  /** Released on destroy to detach the org-feed-updated live-refresh listener. */
+  private orgFeedUnlisten: UnlistenFn | null = null;
+  /** True once destroyed — so a `listen()` that resolves AFTER teardown releases immediately
+   * (distinct from `orgFeedUnlisten === null`, which also means "not yet resolved"). */
+  private orgFeedDestroyed = false;
+  /** Bumped per org load so a late (stale) reload result is dropped (T1 guard). */
+  private orgLoadSeq = 0;
+  /** Bound window-focus handler — re-loads org items when the view regains focus. */
+  private readonly onWindowFocus = (): void => {
+    void this.loadOrgs();
+  };
+
   /** The active folder node (null for the "All notes" root). */
   readonly activeFolder = computed<NoteFolder | null>(() => {
     const fid = this.activeFolderId();
@@ -86,8 +226,13 @@ export class NotesHomeComponent implements OnInit {
       : (this.noteFolders().find((f) => f.id === fid) ?? null);
   });
 
-  /** The active folder's display name, or "All notes" for the null selection. */
-  readonly listHeading = computed(() => this.activeFolder()?.name ?? "All notes");
+  /**
+   * The content-pane heading: the active org's name when an org is selected, else
+   * the active note-folder's name, else "All notes" for the root selection.
+   */
+  readonly listHeading = computed(
+    () => this.activeOrg()?.name ?? this.activeFolder()?.name ?? "All notes",
+  );
 
   /** True when the active folder is sealed (drives the locked-folder banner). */
   readonly activeFolderLocked = computed(() => !!this.activeFolder()?.locked);
@@ -132,12 +277,110 @@ export class NotesHomeComponent implements OnInit {
   readonly organizeOpen = computed(() => this.organizePlan() !== null);
 
   async ngOnInit(): Promise<void> {
-    // Load the note-folder rail + the (all-notes) list in parallel; settle each
-    // independently so a folder-load failure never blanks the note list.
+    // Live-refresh: the background org-sync loop fires `org-feed-updated` on a
+    // productive tick (≥1 ingest/tombstone). Subscribe ONCE (push straight into a
+    // reload — NEVER subscribe-into-a-field), and re-load org items when the view
+    // regains focus. Both cleaned up on destroy (release the UnlistenFn + the
+    // focus handler).
+    this.destroyRef.onDestroy(() => {
+      this.orgFeedDestroyed = true;
+      this.orgFeedUnlisten?.();
+      this.orgFeedUnlisten = null;
+      window.removeEventListener("focus", this.onWindowFocus);
+    });
+    window.addEventListener("focus", this.onWindowFocus);
+    void this.ipc
+      .onOrgFeedUpdated(() => void this.loadOrgs())
+      .then((un) => {
+        // If the view was already torn down before the listener resolved, release
+        // it immediately (never leak a subscription past destroy).
+        if (this.orgFeedDestroyed) {
+          un();
+        } else {
+          this.orgFeedUnlisten = un;
+        }
+      })
+      .catch(() => {
+        /* best-effort: no Tauri host (e.g. plain browser) → no live refresh */
+      });
+
+    // Load the note-folder rail + the (all-notes) list + the org list in parallel;
+    // settle each independently so one load's failure never blanks the others.
     await Promise.allSettled([
       this.notes.loadFolders(),
       this.notes.loadNotes(null),
+      this.loadOrgs(),
     ]);
+  }
+
+  /**
+   * (Re)load the org (Shared Brain) list + every org's shared items, stale-guarded
+   * on {@link orgLoadSeq} so a late reload (event / focus / init racing) never
+   * overwrites a newer result. Best-effort throughout: `orgRefresh` (server
+   * membership discovery) and each per-org `listOrgItems` swallow their own
+   * failures so a transient/offline error leaves the last-known list standing
+   * rather than blanking the pane. Never throws.
+   */
+  async loadOrgs(): Promise<void> {
+    const seq = ++this.orgLoadSeq;
+    this.orgsLoading.set(true);
+    try {
+      // Discover freshly-invited orgs before reading the local replica (best-effort).
+      try {
+        await this.ipc.orgRefresh();
+      } catch {
+        /* offline / no server → fall through to the local replica */
+      }
+      let orgs: OrgStatus[];
+      try {
+        orgs = await this.ipc.orgListStatuses();
+      } catch {
+        return; // keep the last-known orgs on a transient failure
+      }
+      if (seq !== this.orgLoadSeq) {
+        return; // a newer load superseded this one — drop the result
+      }
+      // Pull each org's browsable items in parallel; a per-org failure yields [].
+      const itemLists = await Promise.all(
+        orgs.map((o) =>
+          this.ipc.listOrgItems(o.orgId).catch(() => [] as OrgItemHeader[]),
+        ),
+      );
+      if (seq !== this.orgLoadSeq) {
+        return;
+      }
+      const byOrg: Record<string, OrgItemHeader[]> = {};
+      orgs.forEach((o, i) => {
+        byOrg[o.orgId] = itemLists[i];
+      });
+      this._orgs.set(orgs);
+      this._orgItems.set(byOrg);
+      // If the rail's selected org has since disappeared, fall back to "All notes".
+      const sel = this.activeOrgId();
+      if (sel !== null && !orgs.some((o) => o.orgId === sel)) {
+        this.activeOrgId.set(null);
+      }
+    } finally {
+      if (seq === this.orgLoadSeq) {
+        this.orgsLoading.set(false);
+      }
+    }
+  }
+
+  /**
+   * Rail-select an org (Shared Brain): the pane shows ONLY that org's shared
+   * items. Mutually exclusive with a note-folder selection — clears
+   * {@link activeFolderId} back to the root + closes any open move popover.
+   */
+  selectOrg(orgId: string): void {
+    this.movePopoverId.set(null);
+    this.activeFolderId.set(null);
+    this.activeOrgId.set(orgId);
+  }
+
+  /** A friendly role hint for the rail ("Owner" / "Member"). */
+  orgRoleLabel(org: OrgStatus): string {
+    return org.role === "owner" ? "Owner" : "Member";
   }
 
   /** Esc backs out — but never mid-edit in a field, and it closes open transient UI first. */
@@ -162,12 +405,18 @@ export class NotesHomeComponent implements OnInit {
     this.nav.back();
   }
 
-  /** Select a note-folder (or null for "All notes") and reload its notes. */
+  /**
+   * Select a note-folder (or null for "All notes") and reload its notes. Clears
+   * any active org selection (the two rail scopes are mutually exclusive). A
+   * no-op re-select of the SAME folder while no org is active is skipped — but a
+   * re-select of "All notes" WHILE an org is active still runs, to drop the org.
+   */
   async selectFolder(folderId: string | null): Promise<void> {
     this.movePopoverId.set(null);
-    if (this.activeFolderId() === folderId) {
+    if (this.activeFolderId() === folderId && this.activeOrgId() === null) {
       return;
     }
+    this.activeOrgId.set(null);
     this.activeFolderId.set(folderId);
     await this.notes.loadNotes(folderId);
   }
@@ -457,6 +706,19 @@ export class NotesHomeComponent implements OnInit {
       day: "numeric",
       hour: "2-digit",
       minute: "2-digit",
+    });
+  }
+
+  /** Presentational only: an ISO timestamp (org item `createdAt`) → a friendly date. */
+  formatOrgDate(iso: string): string {
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) {
+      return "";
+    }
+    return d.toLocaleDateString(undefined, {
+      year: "numeric",
+      month: "short",
+      day: "numeric",
     });
   }
 }

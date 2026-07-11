@@ -1931,6 +1931,18 @@ export interface OrgSyncReport {
 }
 
 /**
+ * Payload of the `murmur://org-feed-updated` event (`onOrgFeedUpdated`). Emitted
+ * by the background org-sync loop ONLY on a PRODUCTIVE tick (≥1 ingest/tombstone
+ * changed the local org replica). Content-free — a single count, NO item ids /
+ * titles / content; the FE treats any arrival as "re-fetch the org lists".
+ * Mirrors the Rust `OrgFeedUpdatedPayload`.
+ */
+export interface OrgFeedUpdatedPayload {
+  /** Number of joined orgs whose replica changed this tick (≥1 when emitted). */
+  orgsChanged: number;
+}
+
+/**
  * The active-shares report for the lock×shares dialog (`folderActiveShares`),
  * gathered when the user tries to lock a folder that has outgoing shares. Titles
  * render only to the local owner (who can already read them) — content-free
