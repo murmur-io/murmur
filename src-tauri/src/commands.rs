@@ -191,6 +191,11 @@ pub struct AppConfigDto {
     pub note_assist_shorten: bool,
     #[serde(default = "default_true")]
     pub note_assist_enhance: bool,
+    /// NOTES full-set opt-OUT list (`noteAssistActionsOff`): the ids of the non-legacy assistant
+    /// actions the user turned OFF. `#[serde(default)]` ⇒ an older FE payload that omits it loads
+    /// as an empty list (all actions enabled) — a missing field enables, never disables.
+    #[serde(default)]
+    pub note_assist_actions_off: Vec<String>,
     pub note_language: String,
     /// E3/security: default true (matches AppConfig::default) when the FE omits it on an older
     /// payload — an omitted flag must FAIL CLOSED (require a token), never silently disable MCP
@@ -3007,11 +3012,82 @@ impl Drop for NoteAssistTurnGuard<'_> {
     }
 }
 
-/// The selection Brain-assistant action. GATED four ways: (1) the note's folder must be unlocked
-/// (never send a sealed note's text off-device / to any model); (2) the action must be ENABLED in
-/// config (else `Unavailable`); (3) enhance retrieval contributes ONLY visible/unlocked sources;
-/// (4) the cloud path rides the redaction firewall via `provider_for`. Returns the suggestion +
-/// (enhance) citations + display metadata (modelLabel/mode/redacted).
+/// The FULL known note-assistant action set (the FE catalog mirror). `custom` is always available
+/// (the escape hatch) so it is intentionally OUTSIDE this list — it is handled explicitly. An action
+/// not in this list and not `custom` is an unknown id → `InvalidArg`.
+const NOTE_ASSIST_KNOWN_ACTIONS: &[&str] = &[
+    // EDIT (replace)
+    "refine",
+    "grammar",
+    "shorten",
+    "expand",
+    "simplify",
+    "tone",
+    "translate",
+    // STRUCTURE
+    "bullets",
+    "table",
+    "keypoints",
+    // FROM YOUR BRAIN
+    "enhance",
+    "find_related",
+    "link_entities",
+    "fact_check",
+    "ask",
+    // EXTRACT
+    "action_items",
+    "decisions",
+    // CREATE (artifact)
+    "draft_followup",
+    "spinoff_note",
+];
+
+/// The result shape the FE renders + applies off (see the seam contract table). MUST be one of
+/// `"replace" | "insert" | "info" | "artifact"`. `custom` is a free-text replace.
+fn note_assist_shape(action: &str) -> &'static str {
+    match action {
+        // EDIT + link_entities + custom rewrite the selection in place.
+        "refine" | "grammar" | "shorten" | "expand" | "simplify" | "tone" | "translate"
+        | "bullets" | "table" | "link_entities" | "custom" => "replace",
+        // Keeps the text; appends after the selection.
+        "keypoints" | "enhance" | "action_items" | "decisions" => "insert",
+        // Read-only grounded answer + citations (no destructive edit).
+        "find_related" | "fact_check" | "ask" => "info",
+        // A drafted email/note (title + body).
+        "draft_followup" | "spinoff_note" => "artifact",
+        // Unknown ids never reach here (gated to InvalidArg upstream); default to the safest
+        // non-destructive shape.
+        _ => "info",
+    }
+}
+
+/// Which citation-gathering strategy an action uses. Grounded brain actions reuse the enhance
+/// readers (visibility-gated); `link_entities` uses the gated entity list; everything else needs
+/// no retrieval.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NoteAssistRetrieval {
+    /// No retrieval (pure edit on the selection).
+    None,
+    /// The enhance readers: `search_visible` + `search_doc_chunks_*_visible` (excluding this note).
+    BrainCitations,
+    /// The gated entity list (`list_entities_visible`) → which names to wikilink.
+    Entities,
+}
+
+fn note_assist_retrieval(action: &str) -> NoteAssistRetrieval {
+    match action {
+        "enhance" | "find_related" | "fact_check" | "ask" => NoteAssistRetrieval::BrainCitations,
+        "link_entities" => NoteAssistRetrieval::Entities,
+        _ => NoteAssistRetrieval::None,
+    }
+}
+
+/// The selection Brain-assistant action. GATED five ways (normative order): (1) the action must be
+/// ENABLED in config (else `Unavailable`); (2) the note's folder must be unlocked (never send a
+/// sealed note's text off-device / to any model, else `Locked`); (3) brain-grounded retrieval
+/// contributes ONLY visible/unlocked sources; (4) the cloud path rides the redaction firewall via
+/// `provider_for`. `find_related` is retrieval-ONLY (no provider, no egress). Returns the suggestion
+/// + citations + display metadata (modelLabel/mode/redacted/shape/title).
 #[tauri::command]
 pub async fn note_assistant_action(
     state: State<'_, AppState>,
@@ -3026,6 +3102,20 @@ pub(crate) async fn note_assistant_action_inner(
     state: &AppState,
     req: NoteAssistRequest,
 ) -> Result<NoteAssistResult, AppError> {
+    // Production path: build the NOTES-role provider through the full egress gate chain.
+    note_assistant_action_impl(state, req, None).await
+}
+
+/// The testable core of [`note_assistant_action_inner`]. `provider_override` lets a unit test inject
+/// a scripted fake provider (so the provider-dependent actions run headless without shelling out to
+/// a real LLM); in production it is `None` and the NOTES-role provider is built via `provider_for`
+/// (consent gate + redaction firewall + egress ledger). The gate order is IDENTICAL either way — the
+/// override only replaces the provider CONSTRUCTION at step (6), never a gate.
+async fn note_assistant_action_impl(
+    state: &AppState,
+    req: NoteAssistRequest,
+    provider_override: Option<std::sync::Arc<dyn crate::summarize::provider::SummarizerProvider>>,
+) -> Result<NoteAssistResult, AppError> {
     let action = req.action.trim().to_lowercase();
     // (1) ACTION ENABLED? A disabled action is refused BEFORE any read/egress.
     let config = {
@@ -3035,10 +3125,18 @@ pub(crate) async fn note_assistant_action_inner(
             .map_err(|_| AppError::Config("config mutex poisoned".into()))?
             .clone()
     };
+    // The 3 legacy actions keep their own bools (backward compat — the FE still sends all three).
+    // `custom` is the always-on escape hatch. Every OTHER KNOWN action is enabled UNLESS the user
+    // opted it OUT (`note_assist_actions_off`). An id that is neither known nor `custom` → InvalidArg
+    // BEFORE any read/egress.
     let enabled = match action.as_str() {
         "refine" => config.note_assist_refine,
         "shorten" => config.note_assist_shorten,
         "enhance" => config.note_assist_enhance,
+        "custom" => true,
+        other if NOTE_ASSIST_KNOWN_ACTIONS.contains(&other) => {
+            !config.note_assist_actions_off.iter().any(|a| a == other)
+        }
         other => {
             return Err(AppError::InvalidArg(format!(
                 "unknown note-assistant action: {other}"
@@ -3083,7 +3181,41 @@ pub(crate) async fn note_assistant_action_inner(
         ));
     }
 
-    // (3) Resolve the display metadata (modelLabel/mode) from the RESOLVED target BEFORE the call.
+    let shape = note_assist_shape(&action).to_string();
+    let retrieval = note_assist_retrieval(&action);
+
+    // (3) FIND_RELATED: retrieval-ONLY — NO provider, NO egress. Gather visible citations through
+    //     the SAME gated readers as enhance, build a one-line answer, and return `shape="info"`
+    //     with `mode="local"`, `redacted=false`. This never raises the local user-turn priority
+    //     flag (no decode contends for Metal) and never calls a model → a privacy win.
+    if action == "find_related" {
+        let citations = gather_note_enhance_citations(state, &req)?;
+        let suggestion = match citations.len() {
+            0 => "No related sources found in your brain.".to_string(),
+            1 => "1 related source in your brain.".to_string(),
+            n => format!("{n} related sources in your brain."),
+        };
+        tracing::info!(
+            target: "notes",
+            action = %action,
+            mode = "local",
+            citations = citations.len(),
+            redacted = false,
+            "note assistant action completed (retrieval-only)"
+        );
+        return Ok(NoteAssistResult {
+            action,
+            suggestion,
+            citations,
+            model_label: "Your brain (local search)".to_string(),
+            mode: "local".to_string(),
+            redacted: false,
+            shape,
+            title: None,
+        });
+    }
+
+    // (4) Resolve the display metadata (modelLabel/mode) from the RESOLVED target BEFORE the call.
     let target =
         crate::summarize::roles::provider_target(crate::summarize::roles::Role::Notes, &config);
     let mode = if crate::summarize::egress_is_cloud(&target.connection, &config) {
@@ -3110,27 +3242,58 @@ pub(crate) async fn note_assistant_action_inner(
         format!("{conn_label} · {model_requested}")
     };
 
-    // (4) enhance: retrieve VISIBLE related sources (EXCLUDING this note) → grounded prompt + citations.
-    let citations = if action == "enhance" {
-        gather_note_enhance_citations(state, &req)?
-    } else {
-        Vec::new()
+    // (5) Retrieve VISIBLE grounding for the brain-grounded actions (EXCLUDING this note). Both the
+    //     citation readers and `list_entities_visible` push the session unlock set through
+    //     `visibility_clause`, so a sealed source never grounds a result.
+    let (citations, entity_names) = match retrieval {
+        NoteAssistRetrieval::BrainCitations => {
+            (gather_note_enhance_citations(state, &req)?, Vec::new())
+        }
+        NoteAssistRetrieval::Entities => {
+            let unlocked = unlocked_snapshot(state)?;
+            let names: Vec<String> = state
+                .db
+                .list_entities_visible(&unlocked)?
+                .into_iter()
+                .map(|n| n.name)
+                .collect();
+            (Vec::new(), names)
+        }
+        NoteAssistRetrieval::None => (Vec::new(), Vec::new()),
     };
 
-    // (5) Build the prompts, then call the NOTES-role provider (consent gate + redaction firewall +
-    //     egress ledger ride inside `provider_for`/`complete_with_meta_opts`). The edit runs under an
-    //     input-sized token cap + low temperature (`GenOptions::edit_rewrite`) so a compression edit
+    // (6) Build the prompts, then call the NOTES-role provider (consent gate + redaction firewall +
+    //     egress ledger ride inside `provider_for`/`complete_with_meta_opts`). The edit runs under a
+    //     per-action token cap + low temperature (`GenOptions::edit_rewrite`) so a compression edit
     //     can't run away and LENGTHEN, and `generate_note_edit` enforces "shorten is actually shorter"
     //     with one stricter retry.
-    let (system, user) = build_note_assist_prompt(&action, &req, &citations, &config.note_language);
-    let provider = crate::summarize::provider_for(crate::summarize::roles::Role::Notes, &config)?;
+    let (system, user) =
+        build_note_assist_prompt(&action, &req, &citations, &entity_names, &config.note_language);
+    let provider = match provider_override {
+        Some(p) => p,
+        None => crate::summarize::provider_for(crate::summarize::roles::Role::Notes, &config)?,
+    };
     let opts = crate::reason::GenOptions::edit_rewrite(note_edit_max_tokens(
         &action,
         req.selection.chars().count(),
     ));
     let input_words = note_edit_word_count(&req.selection);
-    let (suggestion, meta) =
+    let (mut suggestion, meta) =
         generate_note_edit(provider.as_ref(), &action, &system, &user, opts, input_words).await?;
+    suggestion = suggestion.trim().to_string();
+
+    // Artifacts carry a title (email subject / note title). Derive it from the note's own title for
+    // a follow-up draft, and from the drafted body's first line for a spin-off note (a title only —
+    // never logged). Non-artifacts have no title.
+    let title = if shape == "artifact" {
+        Some(derive_artifact_title(
+            &action,
+            row.title.as_deref().unwrap_or(""),
+            &suggestion,
+        ))
+    } else {
+        None
+    };
 
     // `redacted` = the firewall scrubbed at least one PII token on THIS call (only a cloud
     // RedactingProvider populates `meta.redactions`; a local provider leaves it None → false).
@@ -3144,6 +3307,7 @@ pub(crate) async fn note_assistant_action_inner(
         target: "notes",
         action = %action,
         mode = %mode,
+        shape = %shape,
         citations = citations.len(),
         redacted,
         "note assistant action completed"
@@ -3151,12 +3315,47 @@ pub(crate) async fn note_assistant_action_inner(
 
     Ok(NoteAssistResult {
         action,
-        suggestion: suggestion.trim().to_string(),
+        suggestion,
         citations,
         model_label,
         mode: mode.to_string(),
         redacted,
+        shape,
+        title,
     })
+}
+
+/// Derive a non-PII-in-logs artifact title. `draft_followup` reuses the note's own title as an email
+/// subject; `spinoff_note` uses the drafted body's first non-empty line (stripped of leading `#`),
+/// falling back to the note title. The returned string is user-facing content (a title) — it is NEVER
+/// logged.
+fn derive_artifact_title(action: &str, note_title: &str, body: &str) -> String {
+    let fallback = |t: &str| {
+        let t = t.trim();
+        if t.is_empty() {
+            "Untitled".to_string()
+        } else {
+            t.to_string()
+        }
+    };
+    match action {
+        "draft_followup" => {
+            let subj = note_title.trim();
+            if subj.is_empty() {
+                "Follow-up".to_string()
+            } else {
+                format!("Re: {subj}")
+            }
+        }
+        // spinoff_note: first meaningful body line as the title.
+        _ => body
+            .lines()
+            .map(|l| l.trim_start_matches('#').trim())
+            .find(|l| !l.is_empty())
+            .map(|l| l.chars().take(120).collect::<String>())
+            .filter(|l| !l.is_empty())
+            .unwrap_or_else(|| fallback(note_title)),
+    }
 }
 
 /// enhance-context retrieval: run the GATED brain readers (meeting `search_visible` + document/note
@@ -3231,13 +3430,36 @@ fn gather_note_enhance_citations(
     Ok(out)
 }
 
-/// Build the (system, user) prompts for a note-assistant action. Refine/Shorten operate on the
-/// selection with its surrounding context; Enhance grounds an ADDITIVE passage in the retrieved
-/// citations only. `note_language` steers the reply language (matching the rest of the note stack).
+/// Format the retrieved brain citations as a numbered grounding block for the grounded actions.
+fn note_assist_grounding_block(citations: &[NoteCitation]) -> String {
+    let mut grounding = String::new();
+    for (i, c) in citations.iter().enumerate() {
+        grounding.push_str(&format!(
+            "[{n}] ({kind}) {title}: {snippet}\n",
+            n = i + 1,
+            kind = c.kind,
+            title = c.title,
+            snippet = c.snippet
+        ));
+    }
+    if grounding.is_empty() {
+        grounding.push_str("(no related material found)\n");
+    }
+    grounding
+}
+
+/// Build the (system, user) prompts for a note-assistant action. EDIT actions rewrite the selection
+/// with its surrounding context; STRUCTURE reshapes it; the FROM-YOUR-BRAIN actions ground on the
+/// retrieved citations (or entity names) ONLY; the INFO actions (`fact_check`/`ask`) produce an
+/// ANSWER, not an edit; CREATE actions draft an artifact body. `note_language` steers the reply
+/// language (matching the rest of the note stack). Every prompt passes the preceding text as
+/// READ-ONLY context ("do NOT continue it") with the SELECTION LAST — the discipline that fixed
+/// "shorten made it longer".
 fn build_note_assist_prompt(
     action: &str,
     req: &NoteAssistRequest,
     citations: &[NoteCitation],
+    entity_names: &[String],
     note_language: &str,
 ) -> (String, String) {
     let lang = if note_language.trim().is_empty() || note_language == "auto" {
@@ -3245,27 +3467,41 @@ fn build_note_assist_prompt(
     } else {
         format!("language code '{note_language}'")
     };
+    // EDIT actions (refine/grammar/shorten/expand/simplify/tone) rewrite a passage the user
+    // ALREADY wrote in some language — they must always match ITS language, never the global
+    // `note_language` pin (that pin is for content GENERATED from scratch: the full note, the
+    // STRUCTURE/FROM-YOUR-BRAIN/INFO/CREATE actions, and `translate`'s explicit target). Forcibly
+    // translating during a surgical edit was the bug: Shorten on an English passage under a
+    // Polish-pinned note_language rewrote it into Polish instead of shortening it in English.
+    let edit_lang = "the same language as the selected text".to_string();
     let before = req.before.as_deref().unwrap_or("");
-    // Preceding text is passed as READ-ONLY context with an explicit "do NOT continue it", and the
-    // SELECTION always comes LAST. The old prompt appended raw CONTEXT AFTER too, which a small
-    // next-token model reads as an autocomplete gradient and CONTINUES (lengthening) instead of
-    // editing only the selection — a load-bearing cause of "shorten made it longer".
     let preceding = if before.trim().is_empty() {
         String::new()
     } else {
         format!("Preceding text (READ-ONLY context — do NOT reproduce or continue it):\n{before}\n\n")
     };
+    let sel = req.selection.as_str();
+    let variant = req.variant.as_deref().unwrap_or("").trim();
+    let instruction = req.instruction.as_deref().unwrap_or("").trim();
     match action {
         "refine" => {
             let system = format!(
                 "You refine a passage of the user's own note: improve clarity, grammar, and flow \
-                 WITHOUT changing its meaning, adding facts, or padding its length. Reply in {lang}. \
-                 Output ONLY the rewritten passage — no preamble, no quotes, no explanation."
+                 WITHOUT changing its meaning, adding facts, or padding its length. Reply in \
+                 {edit_lang}. Output ONLY the rewritten passage — no preamble, no quotes, no \
+                 explanation."
             );
-            let user = format!(
-                "{preceding}PASSAGE TO REFINE (rewrite ONLY this):\n{sel}",
-                sel = req.selection
+            let user = format!("{preceding}PASSAGE TO REFINE (rewrite ONLY this):\n{sel}");
+            (system, user)
+        }
+        "grammar" => {
+            let system = format!(
+                "You are a copy-editor. Correct ONLY spelling, grammar, and punctuation in the \
+                 passage. Do NOT restructure, rephrase, shorten, lengthen, or change the meaning or \
+                 word choice beyond what a correction requires. Reply in {edit_lang}. Output ONLY \
+                 the corrected passage — no preamble, no quotes, no explanation."
             );
+            let user = format!("{preceding}PASSAGE TO CORRECT (fix ONLY this):\n{sel}");
             (system, user)
         }
         "shorten" => {
@@ -3273,33 +3509,95 @@ fn build_note_assist_prompt(
                 "You shorten a passage of the user's own note. Rewrite it in ABOUT HALF the \
                  sentences: keep every decision, number, name, date, and commitment; cut hedging, \
                  repetition, filler, and throat-clearing. The result MUST be shorter than the \
-                 original. Reply in {lang}. Output ONLY the shortened passage — no preamble, no \
-                 quotes, no explanation.\n\nExample —\nOriginal: I think that, honestly, we should \
+                 original. Reply in {edit_lang}. Output ONLY the shortened passage — no preamble, \
+                 no quotes, no explanation.\n\nExample —\nOriginal: I think that, honestly, we should \
                  probably consider maybe moving the deadline to Friday, because the team is quite \
                  busy right now and there is a lot going on.\nShortened: Move the deadline to \
                  Friday — the team is overloaded."
             );
-            let user = format!(
-                "{preceding}PASSAGE TO SHORTEN (rewrite ONLY this, shorter):\n{sel}",
-                sel = req.selection
-            );
+            let user = format!("{preceding}PASSAGE TO SHORTEN (rewrite ONLY this, shorter):\n{sel}");
             (system, user)
         }
-        // enhance
-        _ => {
-            let mut grounding = String::new();
-            for (i, c) in citations.iter().enumerate() {
-                grounding.push_str(&format!(
-                    "[{n}] ({kind}) {title}: {snippet}\n",
-                    n = i + 1,
-                    kind = c.kind,
-                    title = c.title,
-                    snippet = c.snippet
-                ));
-            }
-            if grounding.is_empty() {
-                grounding.push_str("(no related material found)\n");
-            }
+        "expand" => {
+            let system = format!(
+                "You expand a terse passage of the user's own note into fuller, clearer prose. \
+                 Elaborate ONLY on what is already stated — spell out shorthand, join fragments into \
+                 sentences, add connective phrasing. Do NOT invent facts, opinions, numbers, names, \
+                 or commitments that are not in the passage. Reply in {edit_lang}. Output ONLY the \
+                 expanded passage — no preamble, no quotes, no explanation."
+            );
+            let user = format!("{preceding}PASSAGE TO EXPAND (rewrite ONLY this, fuller):\n{sel}");
+            (system, user)
+        }
+        "simplify" => {
+            let system = format!(
+                "You rewrite a passage of the user's own note in plain, jargon-free language a \
+                 non-expert can follow. Keep every fact, number, name, and decision; replace \
+                 jargon and convoluted phrasing with simple words and short sentences. Do NOT add or \
+                 remove information. Reply in {edit_lang}. Output ONLY the simplified passage — no \
+                 preamble, no quotes, no explanation."
+            );
+            let user = format!("{preceding}PASSAGE TO SIMPLIFY (rewrite ONLY this):\n{sel}");
+            (system, user)
+        }
+        "tone" => {
+            let tone = if variant.is_empty() { "professional" } else { variant };
+            let system = format!(
+                "You rewrite a passage of the user's own note in a {tone} tone WITHOUT changing its \
+                 meaning, facts, or length beyond what the tone requires. Reply in {edit_lang}. \
+                 Output ONLY the rewritten passage — no preamble, no quotes, no explanation."
+            );
+            let user = format!("{preceding}PASSAGE TO REWRITE in a {tone} tone (rewrite ONLY this):\n{sel}");
+            (system, user)
+        }
+        "translate" => {
+            // For translate the TARGET language is the variant, overriding note_language.
+            let target = if variant.is_empty() {
+                "the language the user most likely wants".to_string()
+            } else {
+                variant.to_string()
+            };
+            let system = format!(
+                "You translate a passage of the user's own note into {target}. Preserve meaning, \
+                 tone, formatting, names, numbers, and any markdown. Do NOT add or omit content. \
+                 Output ONLY the translated passage — no preamble, no quotes, no explanation."
+            );
+            let user = format!("{preceding}PASSAGE TO TRANSLATE into {target} (translate ONLY this):\n{sel}");
+            (system, user)
+        }
+        "bullets" => {
+            let system = format!(
+                "You reformat a passage of the user's own note into a markdown bullet list. Turn \
+                 each distinct point into its own `- ` line, preserving every fact, number, name, and \
+                 decision; do NOT add, remove, or invent content. Reply in {lang}. Output ONLY the \
+                 markdown list — no preamble, no heading, no explanation."
+            );
+            let user = format!("{preceding}PASSAGE TO CONVERT to a bullet list (convert ONLY this):\n{sel}");
+            (system, user)
+        }
+        "table" => {
+            let system = format!(
+                "You reformat a passage of the user's own note into a GitHub-flavored markdown table \
+                 with a header row and a `---` separator. Infer sensible columns from the content; \
+                 preserve every fact, number, name, and decision; do NOT add or invent data. Reply \
+                 in {lang}. Output ONLY the markdown table — no preamble, no explanation."
+            );
+            let user = format!("{preceding}PASSAGE TO CONVERT to a table (convert ONLY this):\n{sel}");
+            (system, user)
+        }
+        "keypoints" => {
+            let system = format!(
+                "You write a SHORT TL;DR digest of a passage of the user's own note: 2–4 markdown \
+                 bullets capturing only the key points, decisions, and numbers. This is an ADDITIVE \
+                 summary to insert AFTER the selection — do NOT rewrite or reproduce the original. \
+                 Reply in {lang}. Output ONLY the bullet digest — no preamble, no heading, no \
+                 explanation."
+            );
+            let user = format!("{preceding}PASSAGE TO SUMMARIZE (write a short digest of this):\n{sel}");
+            (system, user)
+        }
+        "enhance" => {
+            let grounding = note_assist_grounding_block(citations);
             let system = format!(
                 "You expand the user's note by proposing a SHORT ADDITIVE passage that builds on \
                  the selection using ONLY the RELATED MATERIAL provided — never invent facts. If the \
@@ -3308,9 +3606,124 @@ fn build_note_assist_prompt(
                  explanation."
             );
             let user = format!(
-                "RELATED MATERIAL (from the user's own brain):\n{grounding}\nSELECTION TO EXPAND:\n{sel}",
-                sel = req.selection
+                "RELATED MATERIAL (from the user's own brain):\n{grounding}\nSELECTION TO EXPAND:\n{sel}"
             );
+            (system, user)
+        }
+        "link_entities" => {
+            let names = if entity_names.is_empty() {
+                "(none — return the selection unchanged)".to_string()
+            } else {
+                entity_names.join(", ")
+            };
+            let system = format!(
+                "You rewrite a passage of the user's own note, wrapping ONLY the known entity names \
+                 listed below in `[[wikilinks]]` where they appear. Do NOT invent links, do NOT link \
+                 any name not in the list, do NOT change any other word, spacing, or punctuation, and \
+                 do NOT double-wrap a name already inside `[[...]]`. If a name does not appear in the \
+                 passage, leave the passage as-is for that name. Reply in {lang}. Output ONLY the \
+                 rewritten passage — no preamble, no quotes, no explanation."
+            );
+            let user = format!(
+                "KNOWN ENTITY NAMES (link ONLY these):\n{names}\n\n{preceding}PASSAGE TO LINK (rewrite ONLY this):\n{sel}"
+            );
+            (system, user)
+        }
+        "fact_check" => {
+            let grounding = note_assist_grounding_block(citations);
+            let system = format!(
+                "You fact-check the SELECTION against the user's OWN brain (the RELATED MATERIAL \
+                 below) ONLY — never external knowledge. Flag any claim in the selection that \
+                 CONTRADICTS or is UNSUPPORTED by the material, quoting the conflicting source. If \
+                 everything checks out, say so briefly. This is an ANSWER, not an edit — do NOT \
+                 rewrite the selection. Reply in {lang}. Output ONLY your findings — no preamble."
+            );
+            let user = format!(
+                "RELATED MATERIAL (from the user's own brain):\n{grounding}\nSELECTION TO FACT-CHECK:\n{sel}"
+            );
+            (system, user)
+        }
+        "ask" => {
+            let grounding = note_assist_grounding_block(citations);
+            let question = if instruction.is_empty() {
+                "What is the most important thing to know about this selection?"
+            } else {
+                instruction
+            };
+            let system = format!(
+                "You answer the user's QUESTION about the SELECTION, grounded in the SELECTION and \
+                 the RELATED MATERIAL from their own brain ONLY — never invent facts. If the answer \
+                 is not in the material, say so. This is an ANSWER, not an edit — do NOT rewrite the \
+                 selection. Reply in {lang}. Output ONLY the answer — no preamble."
+            );
+            let user = format!(
+                "QUESTION:\n{question}\n\nRELATED MATERIAL (from the user's own brain):\n{grounding}\nSELECTION:\n{sel}"
+            );
+            (system, user)
+        }
+        "action_items" => {
+            let system = format!(
+                "You extract action items / TODOs from a passage of the user's own note into a \
+                 markdown checklist. Each task is its own `- [ ] ` line; capture the owner and any \
+                 due date if stated; do NOT invent tasks. If there are no action items, reply with an \
+                 empty line. This is an ADDITIVE list to insert AFTER the selection — do NOT reproduce \
+                 the original. Reply in {lang}. Output ONLY the checklist — no preamble, no heading."
+            );
+            let user = format!("{preceding}PASSAGE TO SCAN for action items:\n{sel}");
+            (system, user)
+        }
+        "decisions" => {
+            let system = format!(
+                "You extract the DECISIONS made in a passage of the user's own note into a short \
+                 markdown bullet list. Capture only decisions actually made (not open questions or \
+                 tasks); do NOT invent any. If there are no decisions, reply with an empty line. This \
+                 is an ADDITIVE list to insert AFTER the selection — do NOT reproduce the original. \
+                 Reply in {lang}. Output ONLY the list — no preamble, no heading."
+            );
+            let user = format!("{preceding}PASSAGE TO SCAN for decisions:\n{sel}");
+            (system, user)
+        }
+        "draft_followup" => {
+            let system = format!(
+                "You draft a concise follow-up email or message based on the SELECTION from the \
+                 user's own note. Cover the key points, decisions, and next steps; keep a {tone} \
+                 tone. Do NOT invent facts beyond the selection. Do NOT include a subject line — just \
+                 the message body. Reply in {lang}. Output ONLY the message body — no preamble, no \
+                 explanation.",
+                tone = if variant.is_empty() { "professional" } else { variant }
+            );
+            let user = format!("{preceding}SELECTION TO TURN INTO A FOLLOW-UP MESSAGE:\n{sel}");
+            (system, user)
+        }
+        "custom" => {
+            // The free-text "Ask Brain to edit…" instruction, applied to the SELECTION (shape=replace).
+            // MUST have its own arm — without it `custom` fell through to the spinoff_note catch-all,
+            // silently dropping the instruction and drafting an unrelated note that Accept then
+            // destructively wrote over the selection. The instruction is woven into the directive; the
+            // FE only sends `custom` with non-empty text, but an empty directive degrades to a refine.
+            let directive = if instruction.is_empty() {
+                "Improve the clarity, grammar, and flow of the passage without changing its meaning"
+            } else {
+                instruction
+            };
+            let system = format!(
+                "You edit a passage of the user's own note by applying THIS instruction to it: \
+                 \"{directive}\". Apply the instruction to the passage ONLY — do NOT invent facts \
+                 beyond it, do NOT answer as chat, do NOT continue the surrounding text. Reply in \
+                 {lang}. Output ONLY the edited passage — no preamble, no quotes, no explanation."
+            );
+            let user = format!("{preceding}PASSAGE TO EDIT (apply the instruction, rewrite ONLY this):\n{sel}");
+            (system, user)
+        }
+        // spinoff_note
+        _ => {
+            let system = format!(
+                "You draft a new standalone note from the SELECTION in the user's existing note. \
+                 Start with a short `# ` heading that titles the new note, then write clean note body \
+                 in markdown. Build ONLY on the selection — do NOT invent facts. Reply in {lang}. \
+                 Output ONLY the new note (heading + body) — no preamble, no explanation."
+            );
+            let user = format!("{preceding}SELECTION TO TURN INTO A NEW NOTE:\n{sel}");
             (system, user)
         }
     }
@@ -3323,15 +3736,24 @@ fn note_edit_word_count(s: &str) -> usize {
 }
 
 /// The RUNAWAY-GUARD token cap for a note edit, sized off the selection (rough chars/4 token
-/// estimate). `shorten` is capped at ~the input length so it can't physically LENGTHEN; `refine` /
-/// `enhance` get headroom. Floors keep a tiny selection from being truncated; ceilings keep a huge
-/// selection inside the 4096-token on-device context budget. This is a safety net — the prompt's
-/// length budget + [`generate_note_edit`]'s validation are the primary length controls.
+/// estimate). `shorten` is capped at ~the input length so it can't physically LENGTHEN; the
+/// in-place edits (refine/grammar/simplify/tone/translate/bullets/table/link_entities/custom) get
+/// modest headroom; the ADDITIVE / GENERATIVE actions (expand/enhance/keypoints/action_items/
+/// decisions/fact_check/ask/drafts) get GENEROUS headroom because their output is new content, not a
+/// rewrite of the selection. Floors keep a tiny selection from being truncated; ceilings keep a huge
+/// selection inside the 4096-token on-device context budget. A safety net — the prompt's length
+/// budget + [`generate_note_edit`]'s validation are the primary length controls.
 fn note_edit_max_tokens(action: &str, input_chars: usize) -> usize {
     let input_tokens = (input_chars / 4).max(1);
     let (mult, floor, ceil) = match action {
+        // Must not exceed ~input tokens (physically can't lengthen).
         "shorten" => (1.0_f64, 48usize, 1024usize),
-        _ => (1.5_f64, 64usize, 1536usize), // refine / enhance can legitimately match or exceed input
+        // Additive / generated output: the answer/draft/list is NEW content — give it room, and a
+        // higher floor so a short selection can still yield a full draft or answer.
+        "expand" | "enhance" | "keypoints" | "action_items" | "decisions" | "fact_check" | "ask"
+        | "draft_followup" | "spinoff_note" => (3.0_f64, 256usize, 2048usize),
+        // In-place edits can legitimately match or slightly exceed the input length.
+        _ => (1.5_f64, 64usize, 1536usize),
     };
     ((input_tokens as f64 * mult).ceil() as usize).clamp(floor, ceil)
 }
@@ -7095,6 +7517,7 @@ fn config_to_dto(c: &AppConfig) -> AppConfigDto {
         note_assist_refine: c.note_assist_refine,
         note_assist_shorten: c.note_assist_shorten,
         note_assist_enhance: c.note_assist_enhance,
+        note_assist_actions_off: c.note_assist_actions_off.clone(),
         note_language: c.note_language.clone(),
         mcp_require_token: c.mcp_require_token,
         lock_require_biometric: c.lock_require_biometric,
@@ -7239,6 +7662,7 @@ fn dto_to_config(d: AppConfigDto, current: &AppConfig) -> AppConfig {
         note_assist_refine: d.note_assist_refine,
         note_assist_shorten: d.note_assist_shorten,
         note_assist_enhance: d.note_assist_enhance,
+        note_assist_actions_off: d.note_assist_actions_off,
         note_language: if d.note_language.trim().is_empty() {
             "auto".to_string()
         } else {
@@ -19000,6 +19424,8 @@ mod lifecycle_tests {
             selection: "body text".into(),
             before: None,
             after: None,
+            variant: None,
+            instruction: None,
         };
         let err = block_on(note_assistant_action_inner(&state, req.clone())).unwrap_err();
         assert!(
@@ -19043,6 +19469,8 @@ mod lifecycle_tests {
             selection: "body text".into(),
             before: None,
             after: None,
+            variant: None,
+            instruction: None,
         };
         let err = block_on(note_assistant_action_inner(&state, req)).unwrap_err();
         assert!(
@@ -19057,6 +19485,8 @@ mod lifecycle_tests {
             selection: "x".into(),
             before: None,
             after: None,
+            variant: None,
+            instruction: None,
         };
         assert!(matches!(
             block_on(note_assistant_action_inner(&state, bad)).unwrap_err(),
@@ -19076,8 +19506,10 @@ mod lifecycle_tests {
             selection: "some long selection".into(),
             before: Some("the preceding sentence".into()),
             after: Some("the TRAILINGWORD sentence".into()),
+            variant: None,
+            instruction: None,
         };
-        let (system, user) = build_note_assist_prompt("shorten", &req, &[], "auto");
+        let (system, user) = build_note_assist_prompt("shorten", &req, &[], &[], "auto");
         assert!(
             system.to_lowercase().contains("shorter"),
             "shorten prompt must state the result MUST be shorter: {system}"
@@ -19090,6 +19522,37 @@ mod lifecycle_tests {
             user.trim_end().ends_with("some long selection"),
             "the selection must come LAST so the model edits it, not continues past it: {user}"
         );
+    }
+
+    /// EDIT actions on an existing selection (refine/grammar/shorten/expand/simplify/tone) must
+    /// ALWAYS reply in the selection's OWN language, never the global `note_language` pin — these
+    /// are surgical edits to text the user already wrote, not new-content generation. Reported live:
+    /// with Settings → Notes language pinned to "pl", clicking Shorten on an ENGLISH passage forced
+    /// a Polish rewrite instead of shortening it in English. RED on the old code, which threaded the
+    /// `note_language` parameter straight into every action's `lang`, including `shorten`.
+    #[test]
+    fn edit_actions_ignore_note_language_pin_and_match_selection() {
+        let req = NoteAssistRequest {
+            note_id: "n1".into(),
+            action: "shorten".into(),
+            selection: "some english selection".into(),
+            before: None,
+            after: None,
+            variant: None,
+            instruction: None,
+        };
+        for action in ["refine", "grammar", "shorten", "expand", "simplify", "tone"] {
+            let (system, _user) = build_note_assist_prompt(action, &req, &[], &[], "pl");
+            assert!(
+                system.contains("the same language as the selected text"),
+                "{action} must always match the selection's own language, ignoring the \
+                 note_language pin ('pl'); got: {system}"
+            );
+            assert!(
+                !system.contains("language code 'pl'"),
+                "{action} must NOT force the pinned note_language onto an edited selection: {system}"
+            );
+        }
     }
 
     /// STAGE 1 — the note-edit GenOptions preset caps the on-device decode (a compression edit can't
@@ -19218,6 +19681,8 @@ mod lifecycle_tests {
             selection: "launchcode".into(),
             before: None,
             after: None,
+            variant: None,
+            instruction: None,
         };
         let cites = gather_note_enhance_citations(&state, &req).unwrap();
         let ids: Vec<&str> = cites.iter().map(|c| c.id.as_str()).collect();
@@ -19232,6 +19697,345 @@ mod lifecycle_tests {
         assert!(
             ids.contains(&other_id.as_str()),
             "a different VISIBLE note that matches IS cited"
+        );
+    }
+
+    // ── NOTES full-set assistant (brain-menu) ──────────────────────────────────────────────────────
+
+    /// A scripted fake NOTES provider that records how many `complete_with_meta_opts` calls it
+    /// received — the seam for asserting `find_related` makes ZERO provider calls while an LLM action
+    /// makes exactly one. Returns a canned reply for the (single) call.
+    struct CountingProvider {
+        reply: String,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    impl CountingProvider {
+        fn new(reply: &str) -> std::sync::Arc<Self> {
+            std::sync::Arc::new(Self {
+                reply: reply.to_string(),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+        fn count(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+    #[async_trait::async_trait]
+    impl crate::summarize::provider::SummarizerProvider for CountingProvider {
+        fn id(&self) -> &str {
+            "counting"
+        }
+        async fn availability(&self) -> crate::summarize::provider::Availability {
+            crate::summarize::provider::Availability::Available
+        }
+        async fn summarize(
+            &self,
+            _r: &crate::summarize::provider::SummarizeRequest,
+        ) -> crate::error::Result<String> {
+            Ok(String::new())
+        }
+        async fn complete(&self, _s: &str, _u: &str) -> crate::error::Result<String> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(self.reply.clone())
+        }
+    }
+
+    /// Build a note in an unlocked folder + a DIFFERENT visible note that matches a query term (so
+    /// the gated readers return a citation). Returns (state, note_id).
+    fn brain_menu_fixture(tag: &str) -> (AppState, String) {
+        let state = build_state(tag);
+        let fid = create_note_folder_inner(&state, "Work", None).unwrap().id;
+        let id = create_note_inner(&state, Some(&fid), "Draft").unwrap();
+        update_note_doc_inner(&state, &id, "Draft", "The launchcode plan is here.").unwrap();
+        // A second visible note that also matches — a legitimate grounding source.
+        let other = create_note_inner(&state, Some(&fid), "Other").unwrap();
+        update_note_doc_inner(&state, &other, "Other", "More on the launchcode topic.").unwrap();
+        (state, id)
+    }
+
+    fn brain_menu_req(note_id: &str, action: &str) -> NoteAssistRequest {
+        NoteAssistRequest {
+            note_id: note_id.to_string(),
+            action: action.to_string(),
+            selection: "launchcode".into(),
+            before: None,
+            after: None,
+            variant: None,
+            instruction: None,
+        }
+    }
+
+    /// (a) A DISABLED new action (its id in `note_assist_actions_off`) is refused `Unavailable`
+    /// BEFORE any read/egress — the one opt-out list gates every non-legacy action.
+    #[test]
+    fn brain_menu_disabled_new_action_refuses_unavailable() {
+        let (state, id) = brain_menu_fixture("brain-menu-disabled");
+        {
+            let mut c = state.config.lock().unwrap();
+            c.note_assist_actions_off = vec!["bullets".into()];
+        }
+        let err = block_on(note_assistant_action_impl(
+            &state,
+            brain_menu_req(&id, "bullets"),
+            Some(CountingProvider::new("- x")),
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(err, AppError::Unavailable(_)),
+            "an opted-out new action must refuse Unavailable, got {err:?}"
+        );
+    }
+
+    /// `custom` is the always-on escape hatch — even if every other action were off, `custom` runs.
+    #[test]
+    fn brain_menu_custom_is_always_enabled() {
+        let (state, id) = brain_menu_fixture("brain-menu-custom");
+        {
+            let mut c = state.config.lock().unwrap();
+            c.note_assist_actions_off = vec!["custom".into()]; // even if (wrongly) listed
+        }
+        let mut req = brain_menu_req(&id, "custom");
+        req.instruction = Some("make it a haiku".into());
+        let out = block_on(note_assistant_action_impl(
+            &state,
+            req,
+            Some(CountingProvider::new("a tiny haiku")),
+        ))
+        .unwrap();
+        assert_eq!(out.shape, "replace", "custom is a free-text replace");
+        assert_eq!(out.suggestion, "a tiny haiku");
+    }
+
+    /// (b) A LOCKED note (folder not session-unlocked) is refused `Locked` at the read gate, BEFORE
+    /// any provider call — the provider override proves no egress happened (0 calls).
+    #[test]
+    fn brain_menu_locked_note_refuses_locked_before_egress() {
+        let (state, id) = brain_menu_fixture("brain-menu-locked");
+        let fid = state.db.get_note_row(&id).unwrap().unwrap().folder_id;
+        lock_folder_inner(&state, fid).unwrap();
+        let provider = CountingProvider::new("edited");
+        let err = block_on(note_assistant_action_impl(
+            &state,
+            brain_menu_req(&id, "bullets"),
+            Some(provider.clone()),
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(err, AppError::Locked(_)),
+            "a locked note must refuse Locked, got {err:?}"
+        );
+        assert_eq!(
+            provider.count(),
+            0,
+            "a locked note must never reach the provider"
+        );
+    }
+
+    /// (c) SHAPE mapping — assert `result.shape` for a REPLACE (bullets), an INSERT (action_items),
+    /// an INFO (ask), and an ARTIFACT (spinoff_note) action. The provider override drives each to a
+    /// deterministic reply so the shape is the thing under test.
+    #[test]
+    fn brain_menu_shape_mapping_covers_all_four_shapes() {
+        let (state, id) = brain_menu_fixture("brain-menu-shapes");
+
+        let replace = block_on(note_assistant_action_impl(
+            &state,
+            brain_menu_req(&id, "bullets"),
+            Some(CountingProvider::new("- one\n- two")),
+        ))
+        .unwrap();
+        assert_eq!(replace.shape, "replace", "bullets is a replace");
+        assert!(replace.title.is_none(), "a replace carries no title");
+
+        let insert = block_on(note_assistant_action_impl(
+            &state,
+            brain_menu_req(&id, "action_items"),
+            Some(CountingProvider::new("- [ ] ship it")),
+        ))
+        .unwrap();
+        assert_eq!(insert.shape, "insert", "action_items is an insert");
+
+        let mut ask_req = brain_menu_req(&id, "ask");
+        ask_req.instruction = Some("when is launch?".into());
+        let info = block_on(note_assistant_action_impl(
+            &state,
+            ask_req,
+            Some(CountingProvider::new("Launch is Friday.")),
+        ))
+        .unwrap();
+        assert_eq!(info.shape, "info", "ask is an info answer");
+
+        let artifact = block_on(note_assistant_action_impl(
+            &state,
+            brain_menu_req(&id, "spinoff_note"),
+            Some(CountingProvider::new("# Launch plan\nDetails follow.")),
+        ))
+        .unwrap();
+        assert_eq!(artifact.shape, "artifact", "spinoff_note is an artifact");
+        assert_eq!(
+            artifact.title.as_deref(),
+            Some("Launch plan"),
+            "a spinoff_note derives its title from the drafted body's first heading line"
+        );
+    }
+
+    /// The pure shape/retrieval mapping is also asserted directly (defense-in-depth against a future
+    /// action landing in the wrong bucket).
+    #[test]
+    fn note_assist_shape_and_retrieval_mapping_is_correct() {
+        assert_eq!(note_assist_shape("refine"), "replace");
+        assert_eq!(note_assist_shape("grammar"), "replace");
+        assert_eq!(note_assist_shape("translate"), "replace");
+        assert_eq!(note_assist_shape("link_entities"), "replace");
+        assert_eq!(note_assist_shape("custom"), "replace");
+        assert_eq!(note_assist_shape("keypoints"), "insert");
+        assert_eq!(note_assist_shape("enhance"), "insert");
+        assert_eq!(note_assist_shape("decisions"), "insert");
+        assert_eq!(note_assist_shape("find_related"), "info");
+        assert_eq!(note_assist_shape("fact_check"), "info");
+        assert_eq!(note_assist_shape("ask"), "info");
+        assert_eq!(note_assist_shape("draft_followup"), "artifact");
+        assert_eq!(note_assist_shape("spinoff_note"), "artifact");
+        assert!(matches!(
+            note_assist_retrieval("fact_check"),
+            NoteAssistRetrieval::BrainCitations
+        ));
+        assert!(matches!(
+            note_assist_retrieval("link_entities"),
+            NoteAssistRetrieval::Entities
+        ));
+        assert!(matches!(
+            note_assist_retrieval("bullets"),
+            NoteAssistRetrieval::None
+        ));
+    }
+
+    /// (d) FIND_RELATED makes ZERO provider calls (retrieval-only, no egress) yet returns
+    /// `shape="info"`, `mode="local"`, `redacted=false`, and citations wired from the gated reader.
+    #[test]
+    fn brain_menu_find_related_makes_no_provider_call_and_returns_info() {
+        let (state, id) = brain_menu_fixture("brain-menu-find-related");
+        // A provider override that would PANIC-loudly (via the call counter assert below) if invoked.
+        let provider = CountingProvider::new("SHOULD NEVER BE USED");
+        let out = block_on(note_assistant_action_impl(
+            &state,
+            brain_menu_req(&id, "find_related"),
+            Some(provider.clone()),
+        ))
+        .unwrap();
+        assert_eq!(
+            provider.count(),
+            0,
+            "find_related is retrieval-only — it must NEVER call the provider"
+        );
+        assert_eq!(out.shape, "info", "find_related is an info shape");
+        assert_eq!(out.mode, "local", "find_related never egresses → local");
+        assert!(!out.redacted, "find_related never egresses → not redacted");
+        assert!(
+            !out.citations.is_empty(),
+            "find_related surfaces the gated brain citations"
+        );
+        assert!(
+            out.suggestion.contains("related source"),
+            "find_related returns a one-line answer, got {:?}",
+            out.suggestion
+        );
+    }
+
+    /// (e) An `ask` result carries the ANSWER in `suggestion` with `shape="info"` (the free-text
+    /// question rides `req.instruction`).
+    #[test]
+    fn brain_menu_ask_carries_answer_in_suggestion() {
+        let (state, id) = brain_menu_fixture("brain-menu-ask");
+        let mut req = brain_menu_req(&id, "ask");
+        req.instruction = Some("when does the launch happen?".into());
+        let out = block_on(note_assistant_action_impl(
+            &state,
+            req,
+            Some(CountingProvider::new("The launch happens on Friday.")),
+        ))
+        .unwrap();
+        assert_eq!(out.shape, "info");
+        assert_eq!(
+            out.suggestion, "The launch happens on Friday.",
+            "an ask answer lands in `suggestion`"
+        );
+    }
+
+    /// (f) An UNKNOWN action id → `InvalidArg`, refused before any read/egress.
+    #[test]
+    fn brain_menu_unknown_action_is_invalid_arg() {
+        let (state, id) = brain_menu_fixture("brain-menu-unknown");
+        let err = block_on(note_assistant_action_impl(
+            &state,
+            brain_menu_req(&id, "teleport"),
+            Some(CountingProvider::new("nope")),
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(err, AppError::InvalidArg(_)),
+            "an unknown action id must be InvalidArg, got {err:?}"
+        );
+    }
+
+    /// The `ask` question and `custom` instruction reach the prompt (the `instruction` field is the
+    /// carrier); `tone`/`translate` weave the `variant`.
+    #[test]
+    fn build_note_assist_prompt_weaves_instruction_and_variant() {
+        let mut ask = brain_menu_req("n1", "ask");
+        ask.instruction = Some("UNIQUEQUESTION".into());
+        let (_s, u) = build_note_assist_prompt("ask", &ask, &[], &[], "auto");
+        assert!(
+            u.contains("UNIQUEQUESTION"),
+            "the ask question must reach the user prompt: {u}"
+        );
+
+        let mut tone = brain_menu_req("n1", "tone");
+        tone.variant = Some("Confident".into());
+        let (s, _u) = build_note_assist_prompt("tone", &tone, &[], &[], "auto");
+        assert!(
+            s.contains("Confident"),
+            "the tone variant must reach the system prompt: {s}"
+        );
+
+        let mut tr = brain_menu_req("n1", "translate");
+        tr.variant = Some("Polski".into());
+        let (s2, u2) = build_note_assist_prompt("translate", &tr, &[], &[], "auto");
+        assert!(
+            s2.contains("Polski") && u2.contains("Polski"),
+            "the translate target language must reach both prompts"
+        );
+
+        // link_entities only wraps the PROVIDED names.
+        let le = brain_menu_req("n1", "link_entities");
+        let (s3, u3) =
+            build_note_assist_prompt("link_entities", &le, &[], &["Acme Corp".to_string()], "auto");
+        assert!(
+            u3.contains("Acme Corp"),
+            "link_entities must pass the known names to link: {u3}"
+        );
+        assert!(
+            s3.to_lowercase().contains("wikilink")
+                || s3.contains("[[")
+                || s3.to_lowercase().contains("known entity"),
+            "link_entities must instruct wrapping known names: {s3}"
+        );
+
+        // custom — the free-text instruction MUST reach the prompt and drive a REWRITE of the
+        // selection (shape=replace), NOT be silently dropped into the spinoff_note "new note" draft.
+        // RED→GREEN: on the buggy code `custom` fell through the `_` catch-all to the spinoff arm, so
+        // the instruction never appeared and the prompt was the "new note" one — both asserts failed.
+        let mut custom = brain_menu_req("n1", "custom");
+        custom.instruction = Some("ZZ_CUSTOM_INSTRUCTION".into());
+        let (cs, cu) = build_note_assist_prompt("custom", &custom, &[], &[], "auto");
+        assert!(
+            cs.contains("ZZ_CUSTOM_INSTRUCTION"),
+            "the custom instruction must reach the prompt: {cs}"
+        );
+        assert!(
+            !cs.contains("new standalone note") && !cu.contains("TURN INTO A NEW NOTE"),
+            "custom must NOT be routed to the spinoff_note prompt: {cs} / {cu}"
         );
     }
 
