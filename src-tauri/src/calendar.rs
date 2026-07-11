@@ -130,15 +130,16 @@ fn run_sidecar(bin: &PathBuf, back_minutes: u32, forward_minutes: u32) -> String
             Ok(None) => {
                 if std::time::Instant::now() >= deadline {
                     tracing::warn!(target: "calendar", "calendar sidecar timed out; killing");
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    kill_and_reap(&mut child);
                     return String::new();
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
             Err(e) => {
                 tracing::warn!(target: "calendar", error = %e, "calendar sidecar wait failed");
-                let _ = child.kill();
+                // C3: reap the SIGKILL'd child so it does not linger as a `<defunct>` zombie for the
+                // rest of the process lifetime (symmetric with the timeout arm two branches above).
+                kill_and_reap(&mut child);
                 return String::new();
             }
         }
@@ -148,6 +149,15 @@ fn run_sidecar(bin: &PathBuf, back_minutes: u32, forward_minutes: u32) -> String
         Ok(out) => String::from_utf8_lossy(&out.stdout).into_owned(),
         Err(_) => String::new(),
     }
+}
+
+/// C3 — SIGKILL a wedged/errored sidecar child THEN `wait()` to reap it, so it never lingers as a
+/// `<defunct>` zombie for the process lifetime. Used by BOTH the timeout and the `try_wait` error
+/// arms of [`run_sidecar`] (before the fix the error arm killed but never waited). Best-effort +
+/// panic-free — a kill/wait failure just means the child was already gone.
+fn kill_and_reap(child: &mut std::process::Child) {
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 #[cfg(test)]
@@ -214,5 +224,65 @@ mod tests {
         let events = parse_sidecar_output(s);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].id, "E");
+    }
+
+    /// C3 (RED-before-GREEN): the sidecar kill path must REAP the child, not leave a `<defunct>`
+    /// zombie for the process lifetime. The pre-fix `try_wait` error arm did `child.kill()` WITHOUT
+    /// `child.wait()`.
+    ///
+    /// The test proves BOTH sides against the kernel via `ps -o stat`:
+    ///   (a) the OLD behavior — a bare `kill()` with no reap — leaves the pid in state `Z` (zombie),
+    ///   (b) the FIX — `kill_and_reap` — leaves NO `ps` entry (the pid is fully reaped).
+    /// So this is genuinely RED on the old code shape and GREEN on the new one.
+    #[test]
+    fn kill_and_reap_leaves_no_zombie_unlike_bare_kill() {
+        use std::process::{Command, Stdio};
+
+        fn ps_stat(pid: u32) -> Option<String> {
+            let out = Command::new("/bin/ps")
+                .args(["-o", "stat=", "-p", &pid.to_string()])
+                .output()
+                .ok()?;
+            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if s.is_empty() {
+                None
+            } else {
+                Some(s)
+            }
+        }
+
+        fn spawn_dummy() -> std::process::Child {
+            Command::new("/bin/sleep")
+                .arg("30")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn a dummy long-lived child")
+        }
+
+        // (a) OLD behavior: kill WITHOUT reap → the child becomes a zombie (`Z`).
+        let mut zombie = spawn_dummy();
+        let zpid = zombie.id();
+        let _ = zombie.kill();
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            ps_stat(zpid).as_deref().map(|s| s.starts_with('Z')),
+            Some(true),
+            "the pre-fix bare kill (no wait) strands a `<defunct>` zombie"
+        );
+        // Clean the fixture zombie up so the test leaves no residue.
+        let _ = zombie.wait();
+
+        // (b) THE FIX: kill AND reap → no `ps` entry at all (fully reaped, no zombie).
+        let mut reaped = spawn_dummy();
+        let rpid = reaped.id();
+        kill_and_reap(&mut reaped);
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            ps_stat(rpid),
+            None,
+            "kill_and_reap must fully reap the child — no zombie, no `ps` entry"
+        );
     }
 }

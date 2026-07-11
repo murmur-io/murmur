@@ -529,6 +529,13 @@ where
     let total = resp.content_length();
 
     let part = dest.with_extension("part");
+    // R1: guard the `.part` so ANY early return below — a mid-stream body/write/flush error, a
+    // truncated (empty) body, or a task drop — removes the partial file instead of orphaning up to
+    // ~3.1 GB on disk. `disarm()`ed ONLY after the successful atomic rename (the part no longer
+    // exists then, so it's a no-op either way — but disarming keeps the log honest). The sync
+    // `std::fs::remove_file` in Drop is safe here (best-effort cleanup of a small metadata op).
+    let mut guard = PartFileGuard::new(part.clone());
+
     let mut file = tokio::fs::File::create(&part)
         .await
         .map_err(|e| AppError::Transcribe(format!("create model temp file: {e}")))?;
@@ -550,7 +557,7 @@ where
     drop(file);
 
     if downloaded == 0 {
-        let _ = tokio::fs::remove_file(&part).await;
+        // The guard removes the empty `.part` on the early return below.
         return Err(AppError::Transcribe(
             "model download returned empty body".into(),
         ));
@@ -558,6 +565,8 @@ where
     tokio::fs::rename(&part, dest)
         .await
         .map_err(|e| AppError::Transcribe(format!("rename model file: {e}")))?;
+    // Renamed successfully — the `.part` is gone; don't let the guard log/try to remove it.
+    guard.disarm();
 
     tracing::info!(
         target: "transcribe",
@@ -566,6 +575,72 @@ where
         "whisper model ready"
     );
     Ok(())
+}
+
+/// RAII guard that removes a partial `<model>.part` download file on drop unless [`disarm`]ed after
+/// the successful atomic rename (R1). Guarantees a mid-stream error / aborted model switch never
+/// leaves multi-GB residue: every `?` early return in [`download_model_streaming`] unwinds through
+/// this drop. Best-effort + panic-free (a failed remove is ignored — startup [`sweep_stale_model_parts`]
+/// is the crash/force-quit safety net). No PII: the `.part` path carries only a model filename.
+struct PartFileGuard {
+    part: PathBuf,
+    armed: bool,
+}
+
+impl PartFileGuard {
+    fn new(part: PathBuf) -> Self {
+        Self { part, armed: true }
+    }
+
+    /// Called after the successful rename (the `.part` no longer exists) so drop is a no-op.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PartFileGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_file(&self.part);
+        }
+    }
+}
+
+/// Best-effort startup sweep: remove any STALE `*.part` download residue in `models_dir` left by a
+/// crash / force-quit / aborted model switch mid-download (up to ~3.1 GB per orphan). Only removes a
+/// `.part` whose mtime is OLDER than [`STALE_PART_AGE_SECS`] so it can NEVER race a live in-progress
+/// download (whose `.part` mtime stays fresh). This is the only thing that reclaims crash orphans —
+/// the in-process [`PartFileGuard`] covers only clean error returns. Panic-free; logs a COUNT only
+/// (no PII — a model `.part` name carries a whisper model id, nothing user-authored).
+pub fn sweep_stale_model_parts(models_dir: &Path) {
+    /// A `.part` older than 1 h cannot belong to a live download — the streaming writer touches its
+    /// file on every chunk, so a real in-progress fetch keeps the mtime fresh.
+    const STALE_PART_AGE_SECS: u64 = 3600;
+    let Ok(entries) = std::fs::read_dir(models_dir) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    let mut removed = 0u32;
+    for entry in entries.flatten() {
+        // Match the `.part` EXTENSION (covers `ggml-tiny.part` from `with_extension("part")` and any
+        // `<name>.bin.part` shape). Never touch a real model file.
+        if entry.path().extension().and_then(|e| e.to_str()) != Some("part") {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| now.duration_since(t).ok())
+            .map(|age| age.as_secs() > STALE_PART_AGE_SECS)
+            .unwrap_or(false);
+        if stale && std::fs::remove_file(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    if removed > 0 {
+        tracing::warn!(target: "transcribe", removed, "swept stale model .part download residue at startup");
+    }
 }
 
 /// Non-progress download for the VAD + diarization models (small, no UI progress bar). Delegates to
@@ -577,6 +652,151 @@ async fn download_model(url: &str, dest: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// R1 helper: make a unique temp dir for a `.part`/sweep fixture.
+    fn parts_tmp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "murmur-model-parts-{}-{}-{}",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// R1 (RED-before-GREEN, mid-stream error path): a download that fails PART-WAY through the body
+    /// must leave NO `.part` residue. Before the fix the write/flush/body loop returned via `?` and
+    /// orphaned a multi-GB partial; the `PartFileGuard` now removes it on any early return.
+    ///
+    /// Drives the REAL `download_model_streaming` against a local socket that advertises a large
+    /// `Content-Length` but closes after a few bytes → `reqwest`'s `chunk()` errors mid-stream. On the
+    /// unpatched loop the `.part` survives (FAIL); with the guard it is gone (PASS).
+    #[tokio::test]
+    async fn download_removes_part_on_midstream_error() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Serve ONE connection: promise 1 MB, send 8 bytes, then drop the socket → truncated body.
+        let server = std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf); // consume the request line/headers
+                let _ = sock.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\nConnection: close\r\n\r\n",
+                );
+                let _ = sock.write_all(b"PARTIAL0");
+                let _ = sock.flush();
+                // Drop `sock` → connection closes with only 8/1000000 bytes delivered.
+            }
+        });
+
+        let dir = parts_tmp_dir("midstream");
+        let dest = dir.join("ggml-tiny.bin");
+        let url = format!("http://{addr}/model.bin");
+
+        let res = download_model_streaming(&url, &dest, |_, _| {}).await;
+        assert!(res.is_err(), "a truncated body must surface an error");
+
+        // `with_extension("part")` maps `ggml-tiny.bin` → `ggml-tiny.part`.
+        let part = dest.with_extension("part");
+        assert!(
+            !part.exists(),
+            "the partial `.part` must be removed on a mid-stream error (no multi-GB orphan)"
+        );
+        assert!(!dest.exists(), "no model file is produced from a failed download");
+
+        let _ = server.join();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R1 unit: the `PartFileGuard` removes the `.part` on drop UNLESS disarmed after a successful
+    /// rename. This is the exact contract the mid-stream test above relies on.
+    #[test]
+    fn part_file_guard_removes_unless_disarmed() {
+        let dir = parts_tmp_dir("guard");
+        // (a) armed guard → drop removes the file.
+        let armed = dir.join("armed.part");
+        std::fs::write(&armed, b"partial").unwrap();
+        {
+            let _g = PartFileGuard::new(armed.clone());
+        }
+        assert!(!armed.exists(), "an armed guard removes the `.part` on drop");
+
+        // (b) disarmed guard → drop leaves the file (success path already renamed it away).
+        let kept = dir.join("kept.part");
+        std::fs::write(&kept, b"renamed-away").unwrap();
+        {
+            let mut g = PartFileGuard::new(kept.clone());
+            g.disarm();
+        }
+        assert!(kept.exists(), "a disarmed guard must NOT remove the file");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R1 (RED-before-GREEN, crash-orphan path): the startup sweep reclaims a STALE `.part` (old
+    /// mtime — a crash/force-quit orphan) while leaving a real `.bin` model AND a FRESH `.part` (a
+    /// possibly-live download) untouched. Before the fix nothing ever reclaimed a crash orphan.
+    #[test]
+    fn sweep_removes_stale_part_keeps_bin_and_fresh_part() {
+        let dir = parts_tmp_dir("sweep");
+
+        // A stale orphan: old mtime (2 h) → must be swept.
+        let stale = dir.join("ggml-tiny.bin.part");
+        std::fs::write(&stale, b"orphaned-partial").unwrap();
+        let two_hours_ago =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 3600);
+        filetime_set(&stale, two_hours_ago);
+
+        // A fresh `.part` (possibly a live in-progress download) → must survive.
+        let fresh = dir.join("ggml-small.part");
+        std::fs::write(&fresh, b"in-progress").unwrap();
+
+        // A real model file → must survive.
+        let real = dir.join("ggml-tiny.bin");
+        std::fs::write(&real, b"MODEL-BYTES").unwrap();
+
+        sweep_stale_model_parts(&dir);
+
+        assert!(!stale.exists(), "a stale `.part` orphan must be swept");
+        assert!(fresh.exists(), "a fresh `.part` (possibly live) must NOT be raced/removed");
+        assert!(real.exists(), "a real model `.bin` must never be touched");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Set a file's mtime to `when` via a truncate-in-place touch fallback. `std::fs` has no mtime
+    /// setter, so we age the fixture with a no-dep `utimensat`-free trick: rewrite the file, then
+    /// use the FS's own timestamp by sleeping is too slow — instead we spawn `/usr/bin/touch -t`.
+    /// macOS-only test helper (this crate is macOS-first; tests run on the same platform).
+    fn filetime_set(path: &Path, when: std::time::SystemTime) {
+        let secs = when
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        // `touch -t [[CC]YY]MMDDhhmm[.SS]` — format the aged timestamp in local-agnostic UTC via
+        // a simple civil-time breakdown is overkill; use `-d @epoch`-free `-t` with a computed
+        // value. Simplest robust path: `touch -A -<seconds>` is not portable, so use `-t`.
+        // Build the `-t` stamp from the epoch using `date -r`.
+        let stamp = std::process::Command::new("/bin/date")
+            .args(["-r", &secs.to_string(), "+%Y%m%d%H%M.%S"])
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .expect("date -r must format the aged mtime");
+        let ok = std::process::Command::new("/usr/bin/touch")
+            .args(["-t", &stamp])
+            .arg(path)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "touch -t must age the fixture mtime");
+    }
 
     #[test]
     fn english_resolves_en_only_build_for_small_sizes() {

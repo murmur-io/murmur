@@ -142,7 +142,7 @@ pub fn write_note(
     // Atomic write: write to a hidden temp dotfile in the SAME directory (so the
     // rename is a same-filesystem atomic operation), fsync, then rename over the
     // final path. The temp name is unique to avoid clobbering a concurrent write.
-    let tmp_name = format!(".{}.{}.tmp", sanitize_for_tmp(&stem), std::process::id());
+    let tmp_name = format!(".{}.{}.murmur.tmp", sanitize_for_tmp(&stem), std::process::id());
     let tmp_path = target_dir.join(tmp_name);
 
     write_and_sync(&tmp_path, markdown).inspect_err(|_| {
@@ -328,7 +328,7 @@ pub fn overwrite_note(path: &Path, markdown: &str) -> Result<()> {
         .ok_or_else(|| AppError::Export("note path has no parent".into()))?;
     std::fs::create_dir_all(parent)
         .map_err(|e| AppError::Export(format!("create note dir failed: {e}")))?;
-    let tmp_path = parent.join(format!(".edit.{}.tmp", std::process::id()));
+    let tmp_path = parent.join(format!(".edit.{}.murmur.tmp", std::process::id()));
     write_and_sync(&tmp_path, markdown).inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp_path);
     })?;
@@ -337,6 +337,125 @@ pub fn overwrite_note(path: &Path, markdown: &str) -> Result<()> {
         AppError::Export(format!("atomic rename failed: {e}"))
     })?;
     Ok(())
+}
+
+// ── Export temp-dotfile sweep ────────────────────────────────────────────────
+
+/// A `.tmp` export dotfile older than this cannot belong to a live export (both `write_note` and
+/// `overwrite_note` rename within a single synchronous call), so mtime is the fallback liveness
+/// signal when the embedded PID has been recycled onto an unrelated process.
+const STALE_EXPORT_TMP_AGE_SECS: u64 = 3600;
+
+/// R2 — best-effort startup sweep of orphaned export temp DOTFILES in the vault. `write_note` writes
+/// `.<stem>.<pid>.murmur.tmp` and `overwrite_note` writes `.edit.<pid>.murmur.tmp`, renaming
+/// atomically over the final `.md`; `remove_file` fires only on the ERROR branch, so a SIGKILL
+/// between the fsync and the rename orphans the dotfile in the user's vault (`collect_md_stems` skips
+/// dotfiles but never deletes them). This reclaims that residue. The `.murmur.tmp` marker makes the
+/// sweep provably OURS-only — a foreign third-party dotfile is never touched.
+///
+/// SAFE against a concurrent LIVE export: an entry is removed ONLY when its embedded PID is not a
+/// live process, OR its mtime is older than [`STALE_EXPORT_TMP_AGE_SECS`]. So a `.tmp` written by
+/// THIS still-running process (its own pid is live + mtime fresh) is never raced. Recurses into
+/// subfolders but SKIPS `.obsidian` / `.trash` (and every other dotfolder). No PII: logs a COUNT
+/// only — never a stem/path (they embed note titles).
+pub fn sweep_stale_export_tmp(vault_dir: &Path) {
+    let removed = sweep_export_tmp_dir(vault_dir, std::time::SystemTime::now());
+    if removed > 0 {
+        tracing::warn!(target: "export", removed, "swept orphaned export temp dotfiles at startup");
+    }
+}
+
+/// Recursive worker for [`sweep_stale_export_tmp`], with `now` injected so the age check is testable.
+/// Returns the count removed. Never errors (best-effort startup cleanup).
+fn sweep_export_tmp_dir(dir: &Path, now: std::time::SystemTime) -> u32 {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return 0,
+    };
+    let mut removed = 0u32;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(OsStr::to_str) else {
+            continue;
+        };
+        let file_type = match entry.file_type() {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        if file_type.is_dir() {
+            // Never descend into Obsidian's config / trash (or any dotfolder) — they are not ours.
+            if name.starts_with('.') {
+                continue;
+            }
+            removed += sweep_export_tmp_dir(&path, now);
+            continue;
+        }
+        if !file_type.is_file() {
+            continue;
+        }
+        // Only OUR export temp shape: a dotfile ending `.tmp` whose penultimate `.`-segment is a PID.
+        let Some(pid) = export_tmp_pid(name) else {
+            continue;
+        };
+        // Remove only when the PID is dead OR the file is stale — never race a live export.
+        let pid_live = pid_is_live(pid);
+        let stale = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| now.duration_since(t).ok())
+            .map(|age| age.as_secs() > STALE_EXPORT_TMP_AGE_SECS)
+            .unwrap_or(false);
+        if (!pid_live || stale) && std::fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// Parse the PID out of an export temp dotfile name, or `None` if it is not our shape. Matches both
+/// `write_note`'s `.<stem>.<pid>.tmp` and `overwrite_note`'s `.edit.<pid>.tmp`: a name that STARTS
+/// with `.`, ENDS with `.tmp`, and whose token immediately before `.tmp` parses as a u32 pid. A
+/// stem may itself contain dots, so we key off the LAST two dot-segments only.
+fn export_tmp_pid(name: &str) -> Option<u32> {
+    // Require the Murmur-specific `.murmur.tmp` marker so the sweep only ever reclaims OUR export
+    // temps — NEVER a foreign third-party dotfile of a similar `.<x>.<n>.tmp` shape in the vault
+    // (the theoretical over-delete both reviewers flagged). Only `write_note`/`overwrite_note`
+    // produce this marker.
+    if !name.starts_with('.') || !name.ends_with(".murmur.tmp") {
+        return None;
+    }
+    // Strip the `.murmur.tmp` marker, then the segment after the final '.' is the pid.
+    let without_marker = name.strip_suffix(".murmur.tmp")?;
+    let pid_seg = without_marker.rsplit('.').next()?;
+    // Guard against a missing pid (`.murmur.tmp` alone): require a non-empty numeric segment AND at
+    // least one more '.' before it (so `.<something>.<pid>.murmur.tmp`).
+    if pid_seg.is_empty() || !without_marker.contains('.') {
+        return None;
+    }
+    pid_seg.parse::<u32>().ok()
+}
+
+/// Whether `pid` is a currently-live process (best-effort, macOS-first). Uses `/bin/kill -0 <pid>`
+/// — signal 0 sends NO signal, it is the canonical liveness probe: exit 0 ⇒ the process exists (or
+/// exists but is owned by another user — still live), non-zero ⇒ gone (ESRCH). A dead pid means the
+/// export that wrote the temp file is gone, so its orphan is safe to reclaim. No new deps (mirrors
+/// the `/bin/kill -TERM` pattern the audio helpers already use); on a spawn failure we conservatively
+/// treat the pid as LIVE so a temp file is never mistakenly reclaimed (mtime staleness still catches
+/// it). NOTE: `kill -0` reports EPERM as a NON-zero exit on macOS, so we additionally fall back to
+/// the mtime staleness check at the call site — this probe only needs to avoid a false "dead".
+fn pid_is_live(pid: u32) -> bool {
+    std::process::Command::new("/bin/kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        // Conservative: if we can't even probe, assume LIVE (don't race a real export); the mtime
+        // staleness check at the call site still reclaims a genuinely-old orphan.
+        .unwrap_or(true)
 }
 
 // ── Deep links + pinned moments ─────────────────────────────────────────────
@@ -843,6 +962,107 @@ mod tests {
                 .unwrap_or(false)
         });
         assert!(!has_tmp, "temp dotfile must be renamed away");
+    }
+
+    /// R2 helper: does the dir still contain any `.tmp` dotfile?
+    fn dir_has_tmp(dir: &Path) -> bool {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .any(|e| e.unwrap().file_name().to_str().is_some_and(|n| n.ends_with(".tmp")))
+    }
+
+    /// R2 `export_tmp_pid` shape parser: matches BOTH `write_note` and `overwrite_note` temp shapes,
+    /// rejects non-ours names, and tolerates a stem that itself contains dots.
+    #[test]
+    fn export_tmp_pid_recognizes_our_shapes_only() {
+        // Our MARKED shapes parse:
+        assert_eq!(export_tmp_pid(".2026-06-24 1430 - Sync.99999.murmur.tmp"), Some(99999));
+        assert_eq!(export_tmp_pid(".edit.12345.murmur.tmp"), Some(12345));
+        assert_eq!(export_tmp_pid(".a.b.c.777.murmur.tmp"), Some(777)); // stem with dots
+        // Not our shape — REJECTED (the `.murmur.tmp` marker makes the sweep Murmur-only):
+        assert_eq!(export_tmp_pid(".2026-06-24 1430 - Sync.99999.tmp"), None); // no marker (old/foreign)
+        assert_eq!(export_tmp_pid(".foo.12345.tmp"), None); // a FOREIGN third-party temp — must NOT match
+        assert_eq!(export_tmp_pid("Sync.md"), None); // a real note
+        assert_eq!(export_tmp_pid(".hidden"), None); // dotfile, not a temp
+        assert_eq!(export_tmp_pid(".notapid.murmur.tmp"), None); // trailing seg not numeric
+        assert_eq!(export_tmp_pid(".murmur.tmp"), None); // no pid / no stem
+        assert_eq!(export_tmp_pid("noleadingdot.123.murmur.tmp"), None); // not a dotfile
+    }
+
+    /// R2 (RED-before-GREEN): a SIGKILL between fsync and the atomic rename orphans a `.tmp` dotfile
+    /// in the vault; `collect_md_stems` skips it but nothing deletes it. The startup sweep must
+    /// reclaim it — while leaving real `.md` files and never descending into `.obsidian`/`.trash`.
+    /// Mirrors the `no_temp_files_left_behind` / `has_tmp` assertion shape.
+    #[test]
+    fn sweep_removes_orphaned_export_tmp_keeps_md_and_skips_dotfolders() {
+        let dir = tmp_dir("sweep-tmp");
+
+        // A real exported note — must survive.
+        std::fs::write(dir.join("2026-06-24 1430 - Sync.md"), "# body").unwrap();
+
+        // Orphaned export temp dotfiles with a DEAD pid (99999 is not a live process) — must go.
+        let orphan_write = dir.join(".2026-06-24 1430 - Sync.99999.murmur.tmp");
+        std::fs::write(&orphan_write, "half-written").unwrap();
+        let orphan_edit = dir.join(".edit.99999.murmur.tmp");
+        std::fs::write(&orphan_edit, "half-edited").unwrap();
+
+        // A FOREIGN third-party dotfile of a similar shape but WITHOUT our `.murmur.tmp` marker,
+        // dead pid — the sweep must NEVER touch it (it is not ours).
+        let foreign = dir.join(".foo.99999.tmp");
+        std::fs::write(&foreign, "not ours").unwrap();
+
+        // A `.murmur.tmp` inside `.obsidian` — the sweep must NOT descend there (not ours).
+        std::fs::create_dir_all(dir.join(".obsidian")).unwrap();
+        let obsidian_tmp = dir.join(".obsidian").join(".foo.99999.murmur.tmp");
+        std::fs::write(&obsidian_tmp, "config-temp").unwrap();
+
+        // A temp whose pid is THIS live process + fresh mtime — must be spared (a live export).
+        let live_tmp = dir.join(format!(".edit.{}.murmur.tmp", std::process::id()));
+        std::fs::write(&live_tmp, "in-progress").unwrap();
+
+        sweep_stale_export_tmp(&dir);
+
+        assert!(!orphan_write.exists(), "dead-pid write_note temp orphan must be swept");
+        assert!(!orphan_edit.exists(), "dead-pid overwrite_note temp orphan must be swept");
+        assert!(
+            dir.join("2026-06-24 1430 - Sync.md").exists(),
+            "a real exported .md must never be touched"
+        );
+        assert!(
+            obsidian_tmp.exists(),
+            "the sweep must not descend into .obsidian"
+        );
+        assert!(
+            live_tmp.exists(),
+            "a live process's fresh export temp must not be raced/removed"
+        );
+        assert!(
+            foreign.exists(),
+            "a foreign dotfile WITHOUT our .murmur.tmp marker must never be swept"
+        );
+        // The live temp (and the untouched foreign file) remain at the top level; orphans are gone.
+        assert!(dir_has_tmp(&dir), "the live temp is intentionally left");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R2 mtime fallback: an OLD `.tmp` whose embedded PID happens to be alive again (pid recycled)
+    /// is still reclaimed via the > 1 h staleness check, so a recycled pid can't strand residue
+    /// forever. Uses the injectable `now` on the private worker (age = 2 h).
+    #[test]
+    fn sweep_removes_stale_tmp_even_if_pid_recycled_live() {
+        let dir = tmp_dir("sweep-stale");
+        // A temp whose pid is THIS (live) process — but we age `now` forward 2 h so it counts stale.
+        let recycled = dir.join(format!(".edit.{}.murmur.tmp", std::process::id()));
+        std::fs::write(&recycled, "orphaned-but-pid-recycled").unwrap();
+
+        let future = std::time::SystemTime::now() + std::time::Duration::from_secs(2 * 3600);
+        let removed = sweep_export_tmp_dir(&dir, future);
+
+        assert_eq!(removed, 1, "a stale (> 1 h) temp is reclaimed even with a live pid");
+        assert!(!recycled.exists(), "the stale recycled-pid temp is removed");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
