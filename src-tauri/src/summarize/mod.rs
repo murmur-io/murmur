@@ -251,8 +251,17 @@ fn make_provider_resolved(
             let configured = config.brain_model_path.as_deref().map(std::path::Path::new);
             match crate::reason::resolve_brain_model(configured, model_id.as_deref())? {
                 Some(path) => {
-                    let reasoner: Arc<dyn crate::reason::LocalReasoner> =
-                        Arc::new(crate::reason::mistral::MistralReasoner::new(path)?);
+                    // The FullyLocal Notes/Ask provider now drives the on-device HEAVY engine through
+                    // the killable brain sidecar (mistralrs no longer links here). Timeouts come from
+                    // the live config so a wedged child can never hang the app.
+                    let timeouts = crate::reason::sidecar::SidecarTimeouts {
+                        idle_secs: config.brain_idle_timeout_secs,
+                        ready_secs: config.brain_ready_timeout_secs,
+                        hard_cap_secs: config.brain_hard_cap_secs,
+                    };
+                    let reasoner: Arc<dyn crate::reason::LocalReasoner> = Arc::new(
+                        crate::reason::sidecar::SidecarReasoner::new(path, timeouts)?,
+                    );
                     return Ok(Arc::new(local::LocalSummarizerProvider::new(reasoner)));
                 }
                 None => {
