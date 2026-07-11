@@ -12,16 +12,30 @@
     (keydown.escape)="cancelled.emit()"
   >
     <h2 id="lock-shares-title" class="sheet-title">
-      “{{ folderName() }}” has active shares
+      @if (probeFailed()) {
+        Couldn’t check “{{ folderName() }}” for active shares
+      } @else {
+        “{{ folderName() }}” has active shares
+      }
     </h2>
 
-    <p class="sheet-copy">
-      {{ totalCount() }} {{ totalCount() === 1 ? "item is" : "items are" }} shared
-      @if (orgCount() > 0) {
-        ({{ orgCount() }} in Org Brain)
-      }. Locking this folder encrypts its notes, but does
-      <strong>not</strong> take back shares that already left this Mac.
-    </p>
+    @if (probeFailed()) {
+      <!-- FAIL-CLOSED (F5): the share probe errored, so we can't confirm this folder has no
+           live shares. Warn + let the user decide rather than silently locking. -->
+      <p class="sheet-copy">
+        We couldn’t verify whether this folder still has active shares. Locking
+        encrypts its notes, but does <strong>not</strong> take back any shares
+        that already left this Mac. Revoke first to be safe, or lock anyway.
+      </p>
+    } @else {
+      <p class="sheet-copy">
+        {{ totalCount() }} {{ totalCount() === 1 ? "item is" : "items are" }} shared
+        @if (orgCount() > 0) {
+          ({{ orgCount() }} in Org Brain)
+        }. Locking this folder encrypts its notes, but does
+        <strong>not</strong> take back shares that already left this Mac.
+      </p>
+    }
 
     <!-- Breakdown of the active shares. -->
     <ul class="share-breakdown">

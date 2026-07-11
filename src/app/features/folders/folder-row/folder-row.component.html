@@ -362,15 +362,17 @@
 }
 
 <!-- Lock×shares blocking dialog — shown when locking a folder that still has
-     active shares (Shared Brain v1). OPAQUE overlay (trap T3). -->
-@if (sharesReport(); as report) {
+     active shares (or when the share probe failed; Shared Brain v1 + PK-F1).
+     Owned by the shared FolderLockFlowService. OPAQUE overlay (trap T3). -->
+@if (showLockDialog()) {
   <app-lock-shares-dialog
     [folderName]="node().name"
-    [report]="report"
-    [busy]="revokingShares()"
-    (revokeAndLock)="onRevokeAndLock()"
-    (lockAnyway)="onLockAnyway()"
-    (cancelled)="onCancelLockShares()"
+    [report]="lockFlow.report()"
+    [probeFailed]="lockFlow.pending()?.probeFailed ?? false"
+    [busy]="lockFlow.busy()"
+    (revokeAndLock)="lockFlow.revokeAndLock()"
+    (lockAnyway)="lockFlow.lockAnyway()"
+    (cancelled)="lockFlow.cancel()"
   />
 }
   
