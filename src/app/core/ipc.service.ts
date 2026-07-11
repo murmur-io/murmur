@@ -91,6 +91,7 @@ import type {
   OrgItemDetail,
   OrgItemHeader,
   OrgSyncReport,
+  OrgFeedUpdatedPayload,
   ActiveSharesReport,
 } from "./models";
 
@@ -129,6 +130,9 @@ export const EVENT_STORAGE_PRUNED = "murmur://storage-pruned";
 export const EVENT_RECORDING_CAPPED = "murmur://recording-capped";
 // Brain v2 L5 — a scheduled brief was STAGED (propose-accept; run id + label + size only).
 export const EVENT_BRIEF_PROPOSED = "murmur://brief-proposed";
+// Shared Brain — the background org-sync loop INGESTED/TOMBSTONED ≥1 org item this tick
+// (content-free "something changed, re-fetch" ping; drives the Notes org picker live refresh).
+export const EVENT_ORG_FEED_UPDATED = "murmur://org-feed-updated";
 
 /**
  * Thin wrapper over @tauri-apps/api invoke/listen. One method per Tauri command
@@ -2110,6 +2114,22 @@ export class IpcService {
   /** Fires with per-file progress for the in-flight PERSON-name NER model download. */
   onNerDownload(cb: (p: NerDownloadProgress) => void): Promise<UnlistenFn> {
     return listen<NerDownloadProgress>(EVENT_NER_DOWNLOAD, (e) =>
+      cb(e.payload),
+    );
+  }
+
+  /**
+   * Fires after the background org-sync loop INGESTED/TOMBSTONED ≥1 org (Shared
+   * Brain) item this tick — i.e. the local org replica actually changed. Lets an
+   * open view (the Notes org picker + merged All-notes list, the Settings
+   * shared-brain list) re-fetch its org items WITHOUT polling. Content-free — a
+   * count only, NO item ids / titles / content; treat any arrival as "re-fetch
+   * the org lists". Mirrors the {@link onBriefProposed} shape.
+   */
+  onOrgFeedUpdated(
+    cb: (p: OrgFeedUpdatedPayload) => void,
+  ): Promise<UnlistenFn> {
+    return listen<OrgFeedUpdatedPayload>(EVENT_ORG_FEED_UPDATED, (e) =>
       cb(e.payload),
     );
   }
