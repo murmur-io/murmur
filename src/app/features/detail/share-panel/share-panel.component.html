@@ -44,14 +44,10 @@
       }
     </div>
   } @else {
-    <!-- ORG BRAIN — the flagship share action, surfaced FIRST (only in an org). -->
-    @if (org(); as orgStatus) {
-      <mur-org-brain-cta
-        [orgName]="orgStatus.name"
-        [memberCount]="orgStatus.memberCount"
-        [disabled]="editing()"
-        (add)="openOrgSheet()"
-      />
+    <!-- ORG BRAIN — the flagship share action, surfaced FIRST (only in an org).
+         Generic CTA: the org is PICKED in the sheet (a member can be in many). -->
+    @if (org()) {
+      <mur-org-brain-cta [disabled]="editing()" (add)="openOrgSheet()" />
     }
 
     <!-- ============================================================== -->
