@@ -836,17 +836,23 @@ fn format_web_hits_raw(hits: &[crate::connectors::ConnectorHit]) -> String {
         .join("\n")
 }
 
-/// SHARED BRAIN — is the org partition available as a tool for THIS session? True iff an org is
-/// joined AND org egress is consented (the same one-time consent that governs SHARING; a member who
-/// consented to publish into the org brain has opted into the org-brain surface). Fail-closed on any
-/// DB read error. This is the single advertisement predicate for BOTH the agent tool
-/// (`org_brain_search`) and the MCP tool (`org_search`).
+/// SHARED BRAIN — is the org partition available to READ/search for THIS session? True iff the caller
+/// has JOINED an org (`org_state` present). Fail-closed on any DB read error. This is the single
+/// advertisement predicate for BOTH the agent tool (`org_brain_search`) and the MCP tool
+/// (`org_search`).
+///
+/// FIX G — READ is decoupled from WRITE consent: `org_egress_consented` governs PUBLISHING INTO the
+/// org (the `share_*_to_org` egress path), NOT reading what colleagues shared. A joined member who has
+/// NOT consented to publish must still be able to SEE the org brain (the root of "A can't see B's
+/// shared note"). No leak: org items are DELIBERATELY-DISCLOSED content living in the dedicated `org_*`
+/// tables outside the folder-lock domain (personal notes stay lock-gated on their own read paths); and
+/// on `org_leave` the replica is purged, so a departed member (no `org_state`) is already excluded
+/// here. The egress/publish path keeps its own consent gate (`share_to_org_inner` step 2), unchanged.
 pub(crate) fn org_brain_available(db: &Db, config: &AppConfig) -> bool {
-    config.org_egress_consented
-        && db
-            .list_org_states()
-            .map(|orgs| !orgs.is_empty())
-            .unwrap_or(false)
+    let _ = config; // consent is a WRITE gate; reading the org brain needs only membership.
+    db.list_org_states()
+        .map(|orgs| !orgs.is_empty())
+        .unwrap_or(false)
 }
 
 /// SHARED BRAIN — the single org retrieval + format seam used by BOTH `org_brain_search` (agent) and
@@ -859,13 +865,16 @@ pub(crate) fn org_brain_available(db: &Db, config: &AppConfig) -> bool {
 /// a system-prompt override into the loop. The output is DATA for the loop — NEVER a system prompt.
 pub(crate) fn search_org_brain(db: &Db, config: &AppConfig, query: &str) -> Result<String> {
     // AVAILABILITY GATE (belt-and-braces, applied at the SEAM not just at advertisement): the org
-    // partition is searchable ONLY when an org is joined AND org egress is consented. The AGENT tool
-    // gates this at `specs()` advertisement time, but the MCP `org_search` path reaches this seam
-    // DIRECTLY via `dispatch_tool` → `execute_tool` with NO advertisement filter — so without this
-    // in-seam check a departed member (whose replica hadn't yet been purged) or an un-consented user
-    // could still search colleagues' content. Fail-closed to an empty (never-a-leak) result.
+    // partition is searchable ONLY when the caller has JOINED an org. The AGENT tool gates this at
+    // `specs()` advertisement time, but the MCP `org_search` path reaches this seam DIRECTLY via
+    // `dispatch_tool` → `execute_tool` with NO advertisement filter — so without this in-seam check a
+    // departed member (whose replica hadn't yet been purged) could still search colleagues' content.
+    // FIX G: this is a READ gate = membership only; egress CONSENT gates PUBLISHING, not reading. Org
+    // items are disclosed content, so a joined-but-not-consented member reads legitimately; a departed
+    // member has no `org_state` (and a purged replica) so is excluded here. Fail-closed to an empty
+    // (never-a-leak) result.
     if !org_brain_available(db, config) {
-        return Ok("No org-brain results (not a member of a consented org).".to_string());
+        return Ok("No org-brain results (not a member of an org).".to_string());
     }
     let q = query.trim();
     if q.is_empty() {
@@ -2557,62 +2566,83 @@ mod tests {
     /// SEAM GATE (RED-before-GREEN, leak/consent): `search_org_brain` — the shared retrieval seam the
     /// MCP `org_search` reaches DIRECTLY (no advertisement filter) — must itself fail-closed when the
     /// org is not consented, even if the decrypted replica still holds a colleague's item. Pre-fix,
-    /// the seam returned the item (the "empty partition" assumption is false when a departed/
-    /// un-consented user still has the replica). RED on old code: the hit surfaced.
+    /// The seam fails closed for a NON-MEMBER (no `org_state`) even with a populated replica (as right
+    /// after a leave, before the replica purge lands). RED on a seam that trusts the replica alone: the
+    /// hit surfaces. FIX G: membership — not egress consent — is the read gate.
     #[test]
-    fn search_org_brain_seam_fails_closed_when_unconsented() {
+    fn search_org_brain_seam_fails_closed_for_a_non_member() {
         let db = tmp_db();
-        seed_org(&db); // joins org-1 (org_state present)
-        // A colleague's item IS in the local replica (as it would be right after a leave, before the
-        // replica purge lands / or for a user who ingested then revoked consent).
+        // A colleague's item IS in the local replica but the caller has NO org_state (departed member).
         ingest_org(&db, "it-x", "anna", "Anna's roadmap", "the apollo migration ships friday", &[3u8; 32]);
 
-        // Config: org egress NOT consented → the seam must return nothing.
-        let cfg_off = AppConfig {
-            org_egress_consented: false,
-            semantic_search_enabled: false,
-            ..AppConfig::default()
-        };
-        let out = search_org_brain(&db, &cfg_off, "apollo migration").unwrap();
-        assert!(
-            !out.contains("Anna's roadmap") && !out.contains("[org · anna]"),
-            "un-consented org search must leak NOTHING even with a populated replica: {out}"
-        );
-
-        // Sanity: WITH consent the same item is found (proving the gate — not a broken query — hid it).
-        let cfg_on = AppConfig {
+        // No org joined → the seam must return nothing (regardless of consent).
+        let cfg = AppConfig {
             org_egress_consented: true,
             semantic_search_enabled: false,
             ..AppConfig::default()
         };
-        let found = search_org_brain(&db, &cfg_on, "apollo migration").unwrap();
+        let out = search_org_brain(&db, &cfg, "apollo migration").unwrap();
+        assert!(
+            !out.contains("Anna's roadmap") && !out.contains("[org · anna]"),
+            "a non-member org search must leak NOTHING even with a populated replica: {out}"
+        );
+
+        // Sanity: once JOINED the same item is found (proving membership — not a broken query — gated it).
+        seed_org(&db);
+        let found = search_org_brain(&db, &cfg, "apollo migration").unwrap();
         assert!(
             found.contains("Anna's roadmap"),
-            "with consent the seam returns the item (gate, not query, hid it): {found}"
+            "a joined member's seam returns the item (gate, not query, hid it): {found}"
         );
     }
 
-    /// ADVERTISEMENT GATE: `org_brain_available` is true ONLY when an org is joined AND org egress is
-    /// consented — the single predicate both the agent tool and the MCP tool advertise on.
+    /// FIX G (READ decoupled from WRITE consent, RED→GREEN): a JOINED-but-NOT-CONSENTED member must be
+    /// able to READ/search the org brain — `org_egress_consented` governs PUBLISHING, not reading.
+    /// RED on the pre-fix consent-gated predicate (a joined member with consent=false got NOTHING, the
+    /// exact "A can't see B's shared note" bug); GREEN once the read gate is membership only.
     #[test]
-    fn org_brain_available_requires_join_and_consent() {
+    fn org_read_is_available_to_a_joined_but_unconsented_member() {
+        let db = tmp_db();
+        seed_org(&db); // JOINED org-1
+        ingest_org(&db, "it-y", "bob", "Bob's plan", "the siema onboarding checklist", &[7u8; 32]);
+
+        // Egress NOT consented (the member never opted to PUBLISH) — but they JOINED.
+        let cfg = AppConfig {
+            org_egress_consented: false,
+            semantic_search_enabled: false,
+            ..AppConfig::default()
+        };
+        // Available as a tool …
+        assert!(
+            org_brain_available(&db, &cfg),
+            "a joined member can READ the org brain without publish consent (RED on the consent gate)"
+        );
+        // … and actually returns the colleague's item.
+        let out = search_org_brain(&db, &cfg, "siema onboarding").unwrap();
+        assert!(
+            out.contains("Bob's plan") && out.contains("[org · bob]"),
+            "a joined-but-unconsented member SEES what colleagues shared: {out}"
+        );
+    }
+
+    /// ADVERTISEMENT GATE (FIX G): `org_brain_available` is true iff an org is JOINED — independent of
+    /// egress consent (a READ gate is membership; consent gates PUBLISHING).
+    #[test]
+    fn org_brain_available_requires_join_only() {
         let db = tmp_db();
         let mut cfg = AppConfig::default();
 
-        // No org, no consent → unavailable.
+        // No org → unavailable, regardless of consent (default egress = unconsented).
         assert!(!org_brain_available(&db, &cfg));
-
-        // Consent but no org → still unavailable.
         cfg.org_egress_consented = true;
         assert!(!org_brain_available(&db, &cfg));
 
-        // Org joined + consent → available.
+        // Org joined → available whether or not egress is consented.
         seed_org(&db);
-        assert!(org_brain_available(&db, &cfg));
-
-        // Org joined but consent revoked → unavailable (fail-closed).
         cfg.org_egress_consented = false;
-        assert!(!org_brain_available(&db, &cfg));
+        assert!(org_brain_available(&db, &cfg), "joined member reads without publish consent");
+        cfg.org_egress_consented = true;
+        assert!(org_brain_available(&db, &cfg));
     }
 
     /// The `org_brain_search` tool is CONNECTOR-CLASS: reachable ONLY at Tier 3 / Full, never at the

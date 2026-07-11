@@ -165,6 +165,60 @@
   border-top: 1px solid var(--border-subtle);
 }
 
+/* ── Shared brain browse list (fix A) ── */
+.org-browse {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--border-subtle);
+}
+.org-item-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+}
+.org-item-row {
+  border-top: 1px solid var(--border-subtle);
+}
+.org-item-row:first-child {
+  border-top: none;
+}
+.org-item-link {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: var(--space-3) 0;
+  text-decoration: none;
+  color: inherit;
+  border-radius: var(--radius-sm);
+}
+.org-item-link:hover .org-item-title {
+  color: var(--accent);
+}
+.org-item-link:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+.org-item-title {
+  color: var(--text-primary);
+  font-size: 0.9rem;
+  font-weight: 550;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.org-item-sub {
+  font-size: 0.78rem;
+}
+.org-item-empty {
+  padding: var(--space-3) 0;
+  font-size: 0.875rem;
+}
+
 .org-empty {
   font-size: 0.9rem;
 }
