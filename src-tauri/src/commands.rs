@@ -3106,10 +3106,19 @@ pub(crate) async fn note_assistant_action_inner(
     };
 
     // (5) Build the prompts, then call the NOTES-role provider (consent gate + redaction firewall +
-    //     egress ledger ride inside `provider_for`/`complete_with_meta`).
+    //     egress ledger ride inside `provider_for`/`complete_with_meta_opts`). The edit runs under an
+    //     input-sized token cap + low temperature (`GenOptions::edit_rewrite`) so a compression edit
+    //     can't run away and LENGTHEN, and `generate_note_edit` enforces "shorten is actually shorter"
+    //     with one stricter retry.
     let (system, user) = build_note_assist_prompt(&action, &req, &citations, &config.note_language);
     let provider = crate::summarize::provider_for(crate::summarize::roles::Role::Notes, &config)?;
-    let (suggestion, meta) = provider.complete_with_meta(&system, &user).await?;
+    let opts = crate::reason::GenOptions::edit_rewrite(note_edit_max_tokens(
+        &action,
+        req.selection.chars().count(),
+    ));
+    let input_words = note_edit_word_count(&req.selection);
+    let (suggestion, meta) =
+        generate_note_edit(provider.as_ref(), &action, &system, &user, opts, input_words).await?;
 
     // `redacted` = the firewall scrubbed at least one PII token on THIS call (only a cloud
     // RedactingProvider populates `meta.redactions`; a local provider leaves it None → false).
@@ -3225,28 +3234,41 @@ fn build_note_assist_prompt(
         format!("language code '{note_language}'")
     };
     let before = req.before.as_deref().unwrap_or("");
-    let after = req.after.as_deref().unwrap_or("");
+    // Preceding text is passed as READ-ONLY context with an explicit "do NOT continue it", and the
+    // SELECTION always comes LAST. The old prompt appended raw CONTEXT AFTER too, which a small
+    // next-token model reads as an autocomplete gradient and CONTINUES (lengthening) instead of
+    // editing only the selection — a load-bearing cause of "shorten made it longer".
+    let preceding = if before.trim().is_empty() {
+        String::new()
+    } else {
+        format!("Preceding text (READ-ONLY context — do NOT reproduce or continue it):\n{before}\n\n")
+    };
     match action {
         "refine" => {
             let system = format!(
-                "You improve a passage of the user's own note: clarity, grammar, and flow, WITHOUT \
-                 changing its meaning or adding new facts. Reply in {lang}. Output ONLY the rewritten \
-                 passage — no preamble, no quotes, no explanation."
+                "You refine a passage of the user's own note: improve clarity, grammar, and flow \
+                 WITHOUT changing its meaning, adding facts, or padding its length. Reply in {lang}. \
+                 Output ONLY the rewritten passage — no preamble, no quotes, no explanation."
             );
             let user = format!(
-                "CONTEXT BEFORE:\n{before}\n\nSELECTION TO REFINE:\n{sel}\n\nCONTEXT AFTER:\n{after}",
+                "{preceding}PASSAGE TO REFINE (rewrite ONLY this):\n{sel}",
                 sel = req.selection
             );
             (system, user)
         }
         "shorten" => {
             let system = format!(
-                "You make a passage of the user's own note more concise while preserving every fact \
-                 and its meaning. Reply in {lang}. Output ONLY the shortened passage — no preamble, \
-                 no quotes, no explanation."
+                "You shorten a passage of the user's own note. Rewrite it in ABOUT HALF the \
+                 sentences: keep every decision, number, name, date, and commitment; cut hedging, \
+                 repetition, filler, and throat-clearing. The result MUST be shorter than the \
+                 original. Reply in {lang}. Output ONLY the shortened passage — no preamble, no \
+                 quotes, no explanation.\n\nExample —\nOriginal: I think that, honestly, we should \
+                 probably consider maybe moving the deadline to Friday, because the team is quite \
+                 busy right now and there is a lot going on.\nShortened: Move the deadline to \
+                 Friday — the team is overloaded."
             );
             let user = format!(
-                "CONTEXT BEFORE:\n{before}\n\nSELECTION TO SHORTEN:\n{sel}\n\nCONTEXT AFTER:\n{after}",
+                "{preceding}PASSAGE TO SHORTEN (rewrite ONLY this, shorter):\n{sel}",
                 sel = req.selection
             );
             (system, user)
@@ -3280,6 +3302,55 @@ fn build_note_assist_prompt(
             (system, user)
         }
     }
+}
+
+/// Whitespace word count — the unit the note-edit length guard compares in (word/sentence targets
+/// are followable by small models; character/token targets are not).
+fn note_edit_word_count(s: &str) -> usize {
+    s.split_whitespace().count()
+}
+
+/// The RUNAWAY-GUARD token cap for a note edit, sized off the selection (rough chars/4 token
+/// estimate). `shorten` is capped at ~the input length so it can't physically LENGTHEN; `refine` /
+/// `enhance` get headroom. Floors keep a tiny selection from being truncated; ceilings keep a huge
+/// selection inside the 4096-token on-device context budget. This is a safety net — the prompt's
+/// length budget + [`generate_note_edit`]'s validation are the primary length controls.
+fn note_edit_max_tokens(action: &str, input_chars: usize) -> usize {
+    let input_tokens = (input_chars / 4).max(1);
+    let (mult, floor, ceil) = match action {
+        "shorten" => (1.0_f64, 48usize, 1024usize),
+        _ => (1.5_f64, 64usize, 1536usize), // refine / enhance can legitimately match or exceed input
+    };
+    ((input_tokens as f64 * mult).ceil() as usize).clamp(floor, ceil)
+}
+
+/// Generate one note edit through `provider`, and for `shorten` ENFORCE that the result is actually
+/// shorter than the input — one stricter retry if the first attempt is not (the "shorten made it
+/// longer" guard; the model otherwise ran unbounded on the fully-local path). Returns the shortest
+/// candidate for `shorten`, the single result otherwise. Takes `&dyn SummarizerProvider` so it is
+/// unit-testable with a scripted fake provider.
+async fn generate_note_edit(
+    provider: &dyn crate::summarize::provider::SummarizerProvider,
+    action: &str,
+    system: &str,
+    user: &str,
+    opts: crate::reason::GenOptions,
+    input_words: usize,
+) -> Result<(String, crate::summarize::meta::CallMeta), AppError> {
+    // `opts` is `Copy` — each call gets its own copy (no `.clone()`, which would trip clippy).
+    let (out, meta) = provider.complete_with_meta_opts(system, user, opts).await?;
+    if action == "shorten" && note_edit_word_count(&out) >= input_words {
+        // First attempt did not shorten — retry ONCE with a stricter instruction.
+        let strict = format!(
+            "{system}\n\nThe previous attempt was NOT shorter than the original. Return a STRICTLY \
+             shorter version: fewer words than the original, keeping only the essential facts."
+        );
+        let (out2, meta2) = provider.complete_with_meta_opts(&strict, user, opts).await?;
+        if note_edit_word_count(&out2) < note_edit_word_count(&out) {
+            return Ok((out2, meta2));
+        }
+    }
+    Ok((out, meta))
 }
 
 // ── NOTES — auto-organize (WP5) ──────────────────────────────────────────────────────────────────
@@ -18896,6 +18967,133 @@ mod lifecycle_tests {
             block_on(note_assistant_action_inner(&state, bad)).unwrap_err(),
             AppError::InvalidArg(_)
         ));
+    }
+
+    /// STAGE 1 (shorten-lengthens fix) — the `shorten` prompt now carries a hard length budget
+    /// ("MUST be shorter") and DROPS the trailing `CONTEXT AFTER` block (which a small next-token
+    /// model reads as an autocomplete gradient and continues, lengthening). The selection comes LAST.
+    /// RED on the old prompt ("more concise while preserving every fact", with `CONTEXT AFTER`).
+    #[test]
+    fn note_assist_shorten_prompt_has_length_budget_and_drops_trailing_context() {
+        let req = NoteAssistRequest {
+            note_id: "n1".into(),
+            action: "shorten".into(),
+            selection: "some long selection".into(),
+            before: Some("the preceding sentence".into()),
+            after: Some("the TRAILINGWORD sentence".into()),
+        };
+        let (system, user) = build_note_assist_prompt("shorten", &req, &[], "auto");
+        assert!(
+            system.to_lowercase().contains("shorter"),
+            "shorten prompt must state the result MUST be shorter: {system}"
+        );
+        assert!(
+            !user.contains("CONTEXT AFTER") && !user.contains("TRAILINGWORD"),
+            "shorten prompt must not append the trailing context: {user}"
+        );
+        assert!(
+            user.trim_end().ends_with("some long selection"),
+            "the selection must come LAST so the model edits it, not continues past it: {user}"
+        );
+    }
+
+    /// STAGE 1 — the note-edit GenOptions preset caps the on-device decode (a compression edit can't
+    /// run away) and lowers temperature for a faithful edit. RED: `edit_rewrite` did not exist —
+    /// note-assist ran with `GenOptions::default()` (no cap, model-default diversity sampler).
+    #[test]
+    fn gen_options_edit_rewrite_caps_output_and_lowers_temperature() {
+        let o = crate::reason::GenOptions::edit_rewrite(100);
+        assert_eq!(o.max_tokens, Some(100), "the token cap must be set");
+        assert_eq!(
+            o.temperature,
+            Some(0.2),
+            "temperature must be lowered for a faithful edit"
+        );
+    }
+
+    /// STAGE 1 — the runaway-guard cap sizes off the selection: `shorten` can't exceed ~the input
+    /// length (so it physically can't lengthen in tokens), `refine` gets headroom, and a tiny
+    /// selection is floored so it isn't truncated.
+    #[test]
+    fn note_edit_max_tokens_shorten_bounds_input_refine_gets_headroom() {
+        let input_chars = 400; // ~100 tokens
+        let shorten = note_edit_max_tokens("shorten", input_chars);
+        let refine = note_edit_max_tokens("refine", input_chars);
+        assert!(
+            shorten <= 101,
+            "shorten cap must not exceed ~input tokens: {shorten}"
+        );
+        assert!(
+            refine > shorten,
+            "refine must get more headroom than shorten: {refine} vs {shorten}"
+        );
+        assert!(
+            note_edit_max_tokens("shorten", 4) >= 48,
+            "a tiny selection must be floored, not truncated"
+        );
+    }
+
+    /// STAGE 1 — `generate_note_edit` ENFORCES that a `shorten` is actually shorter: if the first
+    /// attempt is not, it retries once and takes the shorter candidate; `refine` (no "shorter"
+    /// invariant) never retries. RED: no retry existed — the first (longer) output shipped verbatim.
+    #[test]
+    fn generate_note_edit_retries_shorten_until_actually_shorter() {
+        struct Scripted(std::sync::Mutex<std::collections::VecDeque<String>>);
+        impl Scripted {
+            fn new(outs: &[&str]) -> Self {
+                Self(std::sync::Mutex::new(
+                    outs.iter().map(|s| s.to_string()).collect(),
+                ))
+            }
+        }
+        #[async_trait::async_trait]
+        impl crate::summarize::provider::SummarizerProvider for Scripted {
+            fn id(&self) -> &str {
+                "scripted"
+            }
+            async fn availability(&self) -> crate::summarize::provider::Availability {
+                crate::summarize::provider::Availability::Available
+            }
+            async fn summarize(
+                &self,
+                _r: &crate::summarize::provider::SummarizeRequest,
+            ) -> crate::error::Result<String> {
+                Ok(String::new())
+            }
+            async fn complete(&self, _s: &str, _u: &str) -> crate::error::Result<String> {
+                Ok(self.0.lock().unwrap().pop_front().unwrap_or_default())
+            }
+        }
+
+        // shorten: attempt 1 is LONGER than the input → one retry → the genuinely shorter result.
+        let p = Scripted::new(&[
+            "this first attempt is clearly much much longer than the tiny input phrase",
+            "short result",
+        ]);
+        let input = "the tiny input";
+        let opts = crate::reason::GenOptions::edit_rewrite(64);
+        let (out, _) = block_on(generate_note_edit(
+            &p,
+            "shorten",
+            "sys",
+            "usr",
+            opts,
+            note_edit_word_count(input),
+        ))
+        .unwrap();
+        assert_eq!(
+            out, "short result",
+            "shorten must retry and take the genuinely shorter result"
+        );
+
+        // refine: one call, even if longer — the second scripted output must NOT be consumed.
+        let p2 = Scripted::new(&["a longer refined version of the passage", "UNUSED"]);
+        let (out2, _) =
+            block_on(generate_note_edit(&p2, "refine", "sys", "usr", opts, 3)).unwrap();
+        assert_eq!(
+            out2, "a longer refined version of the passage",
+            "refine must not retry"
+        );
     }
 
     /// WP4 enhance retrieval — `gather_note_enhance_citations` EXCLUDES the current note's own

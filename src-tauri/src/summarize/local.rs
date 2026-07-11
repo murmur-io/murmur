@@ -78,6 +78,28 @@ impl SummarizerProvider for LocalSummarizerProvider {
             .map_err(|e| AppError::Summarize(format!("local complete task join failed: {e}")))??;
         Ok(out.trim().to_string())
     }
+
+    /// Honor the per-call [`crate::reason::GenOptions`] on the on-device path — the note-edit token
+    /// cap + low temperature reach [`crate::reason::LocalReasoner::reason_with`] →
+    /// `SidecarReasoner`'s `set_sampler_max_len`, so a compression/rewrite edit can't run away and
+    /// LENGTHEN. `CallMeta::default()` (no redactions — nothing egresses on the local path).
+    async fn complete_with_meta_opts(
+        &self,
+        system: &str,
+        user: &str,
+        opts: crate::reason::GenOptions,
+    ) -> crate::error::Result<(String, crate::summarize::meta::CallMeta)> {
+        let reasoner = Arc::clone(&self.reasoner);
+        let system = system.to_string();
+        let user = user.to_string();
+        let out = tokio::task::spawn_blocking(move || reasoner.reason_with(&system, &user, opts))
+            .await
+            .map_err(|e| AppError::Summarize(format!("local complete task join failed: {e}")))??;
+        Ok((
+            out.trim().to_string(),
+            crate::summarize::meta::CallMeta::default(),
+        ))
+    }
 }
 
 #[cfg(test)]
