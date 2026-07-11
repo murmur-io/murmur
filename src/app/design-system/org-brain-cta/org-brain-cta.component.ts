@@ -1,7 +1,6 @@
 import {
   ChangeDetectionStrategy,
   Component,
-  computed,
   input,
   output,
 } from "@angular/core";
@@ -12,7 +11,9 @@ import {
  * is the flagship action, so this is an accent-tinted card (not a quiet
  * `.panel-card` with a ghost link) with the org mark, a one-line E2EE promise,
  * and a primary button. Purely presentational — it emits `add` and the host
- * panel opens the real `<app-org-share-sheet>`. Shared by `note-share-panel`
+ * panel opens the real `<app-org-share-sheet>`, where the user PICKS which
+ * organization to publish to (a member can belong to several), so this card is
+ * deliberately GENERIC and names no single org. Shared by `note-share-panel`
  * and the meeting `share-panel` so the two stay identical.
  */
 @Component({
@@ -22,19 +23,9 @@ import {
   styleUrl: "./org-brain-cta.component.scss",
 })
 export class MurOrgBrainCtaComponent {
-  /** The target org's display name. */
-  readonly orgName = input.required<string>();
-  /** Teammate count (drives the "N teammate(s)" copy). */
-  readonly memberCount = input.required<number>();
   /** Disables the button (e.g. while the note is mid-edit). */
   readonly disabled = input(false);
 
   /** Fired when the user clicks the CTA — the host opens the org-share sheet. */
   readonly add = output<void>();
-
-  /** "your N teammate" / "N teammates" — never a bare count. */
-  readonly audience = computed(() => {
-    const n = this.memberCount();
-    return `${n} ${n === 1 ? "teammate" : "teammates"}`;
-  });
 }
