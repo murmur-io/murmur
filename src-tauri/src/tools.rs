@@ -858,6 +858,15 @@ pub(crate) fn org_brain_available(db: &Db, config: &AppConfig) -> bool {
 /// ([`neutralize_murmur_fences`]) so an UNTRUSTED org author cannot smuggle managed-block markers or
 /// a system-prompt override into the loop. The output is DATA for the loop — NEVER a system prompt.
 pub(crate) fn search_org_brain(db: &Db, config: &AppConfig, query: &str) -> Result<String> {
+    // AVAILABILITY GATE (belt-and-braces, applied at the SEAM not just at advertisement): the org
+    // partition is searchable ONLY when an org is joined AND org egress is consented. The AGENT tool
+    // gates this at `specs()` advertisement time, but the MCP `org_search` path reaches this seam
+    // DIRECTLY via `dispatch_tool` → `execute_tool` with NO advertisement filter — so without this
+    // in-seam check a departed member (whose replica hadn't yet been purged) or an un-consented user
+    // could still search colleagues' content. Fail-closed to an empty (never-a-leak) result.
+    if !org_brain_available(db, config) {
+        return Ok("No org-brain results (not a member of a consented org).".to_string());
+    }
     let q = query.trim();
     if q.is_empty() {
         return Ok("No org-brain results for an empty query.".to_string());
@@ -2542,6 +2551,44 @@ mod tests {
         assert!(
             out.contains("Anna's note") && out.contains("[org · anna]"),
             "a colleague's item must still surface: {out}"
+        );
+    }
+
+    /// SEAM GATE (RED-before-GREEN, leak/consent): `search_org_brain` — the shared retrieval seam the
+    /// MCP `org_search` reaches DIRECTLY (no advertisement filter) — must itself fail-closed when the
+    /// org is not consented, even if the decrypted replica still holds a colleague's item. Pre-fix,
+    /// the seam returned the item (the "empty partition" assumption is false when a departed/
+    /// un-consented user still has the replica). RED on old code: the hit surfaced.
+    #[test]
+    fn search_org_brain_seam_fails_closed_when_unconsented() {
+        let db = tmp_db();
+        seed_org(&db); // joins org-1 (org_state present)
+        // A colleague's item IS in the local replica (as it would be right after a leave, before the
+        // replica purge lands / or for a user who ingested then revoked consent).
+        ingest_org(&db, "it-x", "anna", "Anna's roadmap", "the apollo migration ships friday", &[3u8; 32]);
+
+        // Config: org egress NOT consented → the seam must return nothing.
+        let cfg_off = AppConfig {
+            org_egress_consented: false,
+            semantic_search_enabled: false,
+            ..AppConfig::default()
+        };
+        let out = search_org_brain(&db, &cfg_off, "apollo migration").unwrap();
+        assert!(
+            !out.contains("Anna's roadmap") && !out.contains("[org · anna]"),
+            "un-consented org search must leak NOTHING even with a populated replica: {out}"
+        );
+
+        // Sanity: WITH consent the same item is found (proving the gate — not a broken query — hid it).
+        let cfg_on = AppConfig {
+            org_egress_consented: true,
+            semantic_search_enabled: false,
+            ..AppConfig::default()
+        };
+        let found = search_org_brain(&db, &cfg_on, "apollo migration").unwrap();
+        assert!(
+            found.contains("Anna's roadmap"),
+            "with consent the seam returns the item (gate, not query, hid it): {found}"
         );
     }
 

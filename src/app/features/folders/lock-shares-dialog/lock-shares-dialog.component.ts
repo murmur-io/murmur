@@ -41,6 +41,13 @@ export class LockSharesDialogComponent {
   readonly report = input.required<ActiveSharesReport>();
   /** True while the parent's revoke/lock call is in flight. */
   readonly busy = input(false);
+  /**
+   * True when the active-shares PROBE itself failed (fail-closed, F5): the report is
+   * all-zero but we can't be sure the folder has no shares, so the dialog warns the
+   * user to decide explicitly instead of the app silently locking a possibly-shared
+   * folder. Swaps the copy to the "couldn't check shares" message.
+   */
+  readonly probeFailed = input(false);
 
   /** Revoke every share, then lock (default when org shares exist). */
   readonly revokeAndLock = output<void>();

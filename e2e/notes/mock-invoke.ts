@@ -14,8 +14,16 @@ import { mockTauri } from "../settings-ai/mock-invoke";
  * self-contained, no closures over test-scope). Unknown commands fall through to
  * the demo mock's benign defaults, so the app always boots. `get_config` here
  * carries the note-assistant toggles ON so the editor's popover picker renders.
+ *
+ * `extra` layers per-spec command overrides into the SAME `mockTauri` call (the base
+ * mock re-installs `window.__TAURI_INTERNALS__` from scratch, so a SECOND `mockTauri`
+ * call would wipe these Notes overrides — everything must go through one call). Keys
+ * in `extra` win over the Notes defaults.
  */
-export async function mockNotes(page: Page): Promise<void> {
+export async function mockNotes(
+  page: Page,
+  extra: Record<string, (args: any) => unknown> = {},
+): Promise<void> {
   await mockTauri(page, {
     // --- config (note-assistant toggles ON so the popover shows every action) ---
     get_config: () => ({
@@ -162,5 +170,8 @@ export async function mockNotes(page: Page): Promise<void> {
 
     // --- sharing (empty list; the editor warms this) ---
     list_my_shares: () => [],
+
+    // --- per-spec overrides win over the Notes defaults above ---
+    ...extra,
   });
 }

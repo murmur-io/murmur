@@ -9,6 +9,9 @@
    ============================================================================ */
 :root[data-theme="light"] {
   color-scheme: light;
+  /* --scrim is intentionally INHERITED from :root (rgba(0,0,0,0.5)) — a modal scrim
+     DIMS the content behind it, so it stays dark in both themes (a light scrim would
+     wash out instead of dim). Same rationale as radius/spacing/motion inheritance. */
   --surface-base: #f3f3f8;
   --surface-raised: rgba(255, 255, 255, 0.72);
   --surface-overlay: #ffffff;
