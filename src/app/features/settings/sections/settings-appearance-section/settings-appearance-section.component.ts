@@ -4,6 +4,11 @@ import {
   type SegmentOption,
 } from "../../../../design-system/segmented/segmented.component";
 import { MurSliderComponent } from "../../../../design-system/slider/slider.component";
+import {
+  ChromeService,
+  type AccentId,
+  type SidebarCollapseStyle,
+} from "../../../../services/chrome.service";
 import { GlassService } from "../../../../services/glass.service";
 import { ThemeService, type ThemeMode } from "../../../../services/theme.service";
 
@@ -22,6 +27,7 @@ import { ThemeService, type ThemeMode } from "../../../../services/theme.service
 export class SettingsAppearanceSectionComponent {
   private readonly theme = inject(ThemeService);
   private readonly glass = inject(GlassService);
+  private readonly chrome = inject(ChromeService);
 
   /** The three theme choices, rendered by <mur-segmented>. */
   readonly themeOptions: readonly SegmentOption[] = [
@@ -44,5 +50,37 @@ export class SettingsAppearanceSectionComponent {
   /** Apply + persist the glass level live as the slider moves (auto-saved). */
   setGlass(value: number): void {
     this.glass.setLevel(value);
+  }
+
+  /** The two sidebar-collapse behaviors, rendered by <mur-segmented>. */
+  readonly collapseOptions: readonly SegmentOption[] = [
+    { value: "bar", label: "Top bar", icon: "topbar" },
+    { value: "rail", label: "Icon rail", icon: "sidebar" },
+  ];
+
+  /** Current collapse behavior — drives the Sidebar control. */
+  readonly collapseStyle = this.chrome.collapseStyle;
+
+  /** Apply a collapse behavior immediately (persisted in the service). */
+  setCollapseStyle(style: string): void {
+    this.chrome.setCollapseStyle(style as SidebarCollapseStyle);
+  }
+
+  /** The accent swatches; each maps to an `--accent-option-*` token class. */
+  readonly accentOptions: readonly { id: AccentId; label: string }[] = [
+    { id: "purple", label: "Purple" },
+    { id: "blue", label: "Blue" },
+    { id: "teal", label: "Teal" },
+    { id: "green", label: "Green" },
+    { id: "orange", label: "Orange" },
+    { id: "pink", label: "Pink" },
+  ];
+
+  /** Current accent palette — drives the swatch selection ring. */
+  readonly accent = this.chrome.accent;
+
+  /** Apply an accent immediately (persisted in the service). */
+  setAccent(accent: AccentId): void {
+    this.chrome.setAccent(accent);
   }
 }

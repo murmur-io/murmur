@@ -30,6 +30,42 @@
   font-size: 0.875rem;
 }
 
+/* --- Accent color swatches --- */
+.accent-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+}
+.accent-swatch {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  color: var(--text-on-accent);
+  cursor: pointer;
+  transition: transform var(--transition-fast), box-shadow var(--transition-fast);
+}
+.accent-swatch:hover {
+  transform: scale(1.12);
+}
+.accent-swatch.is-active {
+  box-shadow: 0 0 0 2px var(--surface-solid), 0 0 0 4px var(--text-secondary);
+}
+.accent-swatch:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--surface-solid), 0 0 0 4px var(--accent-ring);
+}
+.swatch-purple { background: var(--accent-option-purple); }
+.swatch-blue { background: var(--accent-option-blue); }
+.swatch-teal { background: var(--accent-option-teal); }
+.swatch-green { background: var(--accent-option-green); }
+.swatch-orange { background: var(--accent-option-orange); }
+.swatch-pink { background: var(--accent-option-pink); }
+
 /* --- Liquid Glass slider --- */
 .glass-row {
   display: flex;

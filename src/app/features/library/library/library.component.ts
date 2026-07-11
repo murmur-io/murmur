@@ -18,7 +18,6 @@ import type {
   Meeting,
   MeetingStatus,
   SearchHit,
-  StorageReport,
 } from "../../../core/models";
 import {
   FoldersService,
@@ -44,8 +43,14 @@ interface SnippetPart {
   changeDetection: ChangeDetectionStrategy.OnPush,
   // Esc in Meetings backs out ("← Murmur") — but NOT while you're typing: in the
   // search box Esc clears/blurs it first, and it never hijacks another form field.
-  // Declarative host listener — Angular owns its lifecycle (mirrors settings).
-  host: { "(document:keydown.escape)": "onEscape()" },
+  // Declarative host listeners — Angular owns their lifecycle (mirrors settings).
+  // Esc lives at DOCUMENT level on purpose: after clicking non-focusable text
+  // focus falls to <body>, so a panel-scoped (keydown.escape) would go dead.
+  // document:click closes the row ⋯ menu / move popover on an outside click.
+  host: {
+    "(document:keydown.escape)": "onEscape()",
+    "(document:click)": "onDocumentClick($event)",
+  },
   imports: [
     MurSidebarComponent,
     RouterLink,
@@ -67,12 +72,21 @@ export class LibraryComponent implements OnInit {
   readonly nav = inject(NavHistoryService);
 
   /**
-   * Esc while in Meetings. Backs out to where you came from — EXCEPT while you're
-   * typing: in the search box the first Esc clears it (or blurs when empty), and
-   * Esc is ignored inside any other form field, so it never ejects you mid-edit.
-   * Mirrors settings.component's onEscape.
+   * Esc while in Meetings. An open row ⋯ menu / move popover closes first (one
+   * Esc = one dismissal); otherwise backs out to where you came from — EXCEPT
+   * while you're typing: in the search box the first Esc clears it (or blurs
+   * when empty), and Esc is ignored inside any other form field, so it never
+   * ejects you mid-edit. Mirrors settings.component's onEscape.
    */
   onEscape(): void {
+    if (this.rowMenuId() !== null) {
+      this.rowMenuId.set(null);
+      return;
+    }
+    if (this.movePopoverId() !== null) {
+      this.closeMovePopover();
+      return;
+    }
     const el = document.activeElement as HTMLElement | null;
     if (el?.classList.contains("search-input")) {
       if (this.query().trim()) {
@@ -89,8 +103,28 @@ export class LibraryComponent implements OnInit {
     this.nav.back();
   }
 
-  /** The meeting id whose "Move to…" folder-chip popover is open (null = none). */
+  /** The meeting id whose "Move to…" popover is open (null = none). */
   readonly movePopoverId = signal<string | null>(null);
+
+  /** The meeting id whose row ⋯ actions menu is open (null = none). */
+  readonly rowMenuId = signal<string | null>(null);
+
+  /**
+   * Outside-click dismissal for the row ⋯ menu and the move popover. The ⋯
+   * trigger and every menu item stopPropagation, so any click that reaches the
+   * document and isn't inside an open panel means "clicked elsewhere → close".
+   */
+  onDocumentClick(event: MouseEvent): void {
+    if (this.rowMenuId() === null && this.movePopoverId() === null) {
+      return;
+    }
+    const target = event.target as HTMLElement | null;
+    if (target?.closest(".row-menu, .row-menu-btn, .move-anchor")) {
+      return;
+    }
+    this.rowMenuId.set(null);
+    this.movePopoverId.set(null);
+  }
 
   /** The meeting id currently being dragged (mirrors the shared drag signal). */
   readonly draggingId = this.drag.draggingId;
@@ -102,16 +136,6 @@ export class LibraryComponent implements OnInit {
   // --- No-query meetings list (unchanged behaviour) -----------------------
   readonly meetings = signal<Meeting[]>([]);
   readonly loading = signal(true);
-
-  // --- Recording-storage usage (header chip, only when a cap is set) -------
-  /** Live disk-usage report for the recordings dir (best-effort; null before load / on failure). */
-  readonly storageReport = signal<StorageReport | null>(null);
-  /** % of the cap in use (0..100, clamped); 0 when no cap is set. */
-  readonly storagePct = computed(() => {
-    const r = this.storageReport();
-    if (!r || r.limitBytes == null || r.limitBytes === 0) return 0;
-    return Math.min(100, Math.round((r.usedBytes / r.limitBytes) * 100));
-  });
 
   // --- Folder filter (left pane) ------------------------------------------
   /** The lock-aware folder forest from the signal store. */
@@ -236,6 +260,36 @@ export class LibraryComponent implements OnInit {
   /** Whether the (trimmed) query is non-empty — switches list ↔ results. */
   readonly hasQuery = computed(() => this.query().trim().length > 0);
 
+  /** Ids of the meetings carrying the active tag — O(1) membership checks. */
+  private readonly tagMeetingIds = computed(
+    () => new Set(this.tagMeetings().map((m) => m.id)),
+  );
+
+  /**
+   * Search hits, narrowed by the active tag when one is selected. The backend
+   * search command has no tag parameter, so the intersection is client-side:
+   * `tagMeetings` (already fetched by {@link selectTag}) provides the id set of
+   * meetings carrying the tag, and hits outside it are dropped. "All" (null tag)
+   * passes every hit through untouched.
+   */
+  readonly displayedResults = computed(() => {
+    const hits = this.results();
+    if (this.activeTag() === null) {
+      return hits;
+    }
+    const ids = this.tagMeetingIds();
+    return hits.filter((h) => ids.has(h.meeting.id));
+  });
+
+  /**
+   * The search surface is busy while the search itself OR the active tag's
+   * meeting list (needed to filter the hits) is still in flight — either gap
+   * would otherwise flash a bogus "no matches".
+   */
+  readonly searchBusy = computed(
+    () => this.searching() || (this.activeTag() !== null && this.tagLoading()),
+  );
+
   /** Tracked so we can cancel a pending debounce on re-trigger / destroy. */
   private searchTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -257,13 +311,6 @@ export class LibraryComponent implements OnInit {
       this.meetings.set(meetings.value);
     }
     this.loading.set(false);
-    // Recording-storage usage — best-effort; drives the header chip when a cap is set.
-    this.ipc
-      .getStorageReport()
-      .then((r) => this.storageReport.set(r))
-      .catch(() => {
-        /* best-effort: no cap set / backend unavailable → the chip stays hidden */
-      });
   }
 
   /** Fetch the distinct tag set; on failure leave `tags` empty (no filter bar). */
@@ -286,9 +333,11 @@ export class LibraryComponent implements OnInit {
     if (this.activeTag() === tag) {
       return;
     }
-    // Switching the view dismisses any open delete confirm to avoid a dangling
-    // panel pointing at a row that may not be in the new list.
+    // Switching the view dismisses any open delete confirm / row menu / move
+    // popover to avoid a dangling panel pointing at a row not in the new list.
     this.cancelDelete();
+    this.rowMenuId.set(null);
+    this.movePopoverId.set(null);
     // Tag + folder filters are mutually exclusive: picking a tag clears any
     // active folder selection so the two never compose into an empty surprise.
     if (tag !== null) {
@@ -336,6 +385,8 @@ export class LibraryComponent implements OnInit {
       return;
     }
     this.cancelDelete();
+    this.rowMenuId.set(null);
+    this.movePopoverId.set(null);
     // Folder + tag filters are mutually exclusive — picking a folder clears the
     // tag selection (and its fetched list) so they never compose.
     if (folderId !== null) {
@@ -346,11 +397,11 @@ export class LibraryComponent implements OnInit {
     this.activeFolderId.set(folderId);
   }
 
-  // --- Filing: the per-row folder chip + "Move to…" popover ----------------
+  // --- Filing: the per-row ⋯ actions menu + "Move to…" popover -------------
 
   /**
    * The display name of a meeting's current folder, or null when it's at the
-   * vault root. Drives the folder chip's label ("Marketing" vs "+ Add to folder").
+   * vault root. Drives the row's display-only folder label pill.
    */
   folderNameOf(m: Meeting): string | null {
     const fid = m.folderId ?? null;
@@ -360,10 +411,24 @@ export class LibraryComponent implements OnInit {
     return this.folderById().get(fid)?.name ?? null;
   }
 
-  /** Open / close / toggle the row's folder picker popover (one open at a time). */
-  toggleMovePopover(id: string): void {
-    this.movePopoverId.update((cur) => (cur === id ? null : id));
+  /** Toggle the row's ⋯ actions menu (one open at a time; closes the mover). */
+  toggleRowMenu(id: string): void {
+    this.movePopoverId.set(null);
+    this.rowMenuId.update((cur) => (cur === id ? null : id));
   }
+
+  /** ⋯ menu → "Move to folder…": swap the menu for the folder-picker popover. */
+  openMoveFromMenu(id: string): void {
+    this.rowMenuId.set(null);
+    this.movePopoverId.set(id);
+  }
+
+  /** ⋯ menu → "Delete meeting…": swap the menu for the inline confirm panel. */
+  deleteFromMenu(id: string): void {
+    this.rowMenuId.set(null);
+    this.askDelete(id);
+  }
+
   closeMovePopover(): void {
     this.movePopoverId.set(null);
   }
@@ -510,12 +575,9 @@ export class LibraryComponent implements OnInit {
       return;
     }
 
-    // Search takes precedence over BOTH the tag and folder filters: reset to
-    // the full list so clearing the search returns to "All" (the chip bar is
-    // hidden while searching). Per-row delete still works against `meetings`.
-    if (this.activeTag() !== null) {
-      void this.selectTag(null);
-    }
+    // Search takes precedence over the FOLDER filter (search is vault-wide),
+    // but COMPOSES with the tag filter: the tagbar stays visible while
+    // searching and the active tag narrows the hits (see `displayedResults`).
     if (this.activeFolderId() !== null) {
       this.activeFolderId.set(null);
     }
@@ -709,13 +771,6 @@ export class LibraryComponent implements OnInit {
       return `${m}m ${s}s`;
     }
     return `${s}s`;
-  }
-
-  /** Human MB/GB label (binary) — matches the Settings → Storage section. */
-  mb(bytes: number): string {
-    if (bytes >= 1024 * 1024 * 1024)
-      return (bytes / (1024 * 1024 * 1024)).toFixed(2) + " GB";
-    return Math.round(bytes / (1024 * 1024)) + " MB";
   }
 
   /**
