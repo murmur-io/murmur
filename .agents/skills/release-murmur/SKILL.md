@@ -1,12 +1,12 @@
 ---
 name: release-murmur
-description: Cut a signed, notarized macOS release of Murmur (Tauri 2 + Angular 18). The exact, proven step-by-step runbook — preflight gates → version bump (+ Cargo.lock sync) → QueaT commit → PR-merge to the `murmur` trunk (never direct-push) → rustup targets → stop dev → universal build → Developer-ID sign BY IDENTITY HASH (the Polish-ń cert gotcha) → DMG → notarize → staple/spctl → gh release create + upload. Use whenever the user wants to ship, release, cut a version, build a distributable .app/.dmg, sign/notarize, or publish a GitHub release of Murmur. Supersedes the stale docs/RELEASE-CHECKLIST.md.
+description: Cut a signed, notarized macOS release of Murmur (Tauri 2 + Angular 22). The exact, proven step-by-step runbook — preflight gates → version bump (+ Cargo.lock sync) → QueaT commit → PR-merge to the `murmur` trunk (never direct-push) → rustup targets → stop dev → universal build → Developer-ID sign BY IDENTITY HASH (the Polish-ń cert gotcha) → DMG → notarize → staple/spctl → gh release create + upload. Use whenever the user wants to ship, release, cut a version, build a distributable .app/.dmg, sign/notarize, or publish a GitHub release of Murmur. Supersedes the stale docs/RELEASE-CHECKLIST.md.
 ---
 
 # /release-murmur — the Murmur macOS release runbook
 
 You are cutting a distributable build of **Murmur** — a local-first macOS app
-(Tauri 2.11, Rust crate `murmur` / bin `Murmur` / lib `meetnotes_lib` + Angular 18
+(Tauri 2.11, Rust crate `murmur` / bin `Murmur` / lib `meetnotes_lib` + Angular 22
 zoneless). Output is a **universal (arm64 + x86_64), Developer-ID-signed,
 notarized, stapled `.dmg`** attached to a GitHub release on `murmur-io/murmur`.
 
@@ -25,8 +25,8 @@ stop at that boundary and hand back the exact command the user must run.
 
 1. **`gh` active account MUST be `JakubGawr`.** `gh auth status` → "Active account: true"
    on `JakubGawr` (a second account `jakub-united` is also logged in — do not use it).
-2. **Commit author MUST be `QueaT <kgm004a@gmail.com>`.** NO `Co-Authored-By: <AI>`,
-   NO AI co-author trailers anywhere in release commits/PR bodies. (Repo git config is already
+2. **Commit author MUST be `QueaT <kgm004a@gmail.com>`.** NO `Co-Authored-By: Codex`,
+   NO Codex trailers anywhere in release commits/PR bodies. (Repo git config is already
    `QueaT` / `kgm004a@gmail.com`; the v0.3.0 bump commit `2038177` proves the shape.)
 3. **NEVER `git push origin murmur` / `…main` directly.** The trunk branch is `murmur`;
    integrate via a PR (`gh pr create … --base murmur` → `gh pr merge`). An environment-level
@@ -66,6 +66,12 @@ bash scripts/ci.sh                        # the full gate — must end "✅ CI: 
 
 Do not proceed unless CI is green.
 
+> **Also refresh the public copy before you ship.** Run **`/sync-release-copy`** now —
+> it checks the landing page (`landing/index.html`) and the GitHub repo description
+> against what the app actually does as of this release, and lands any needed edits
+> (landing via a PR that auto-deploys, description via `gh repo edit`). Skipping it
+> ships a release whose marketing describes an older app.
+
 ## Stage 1 — Pick the version
 
 ```bash
@@ -87,7 +93,7 @@ drifts):
 grep -A1 '^name = "murmur"' src-tauri/Cargo.lock   # confirm version = "<NEW>"
 ```
 
-## Stage 3 — Commit as QueaT (no AI co-author trailers)
+## Stage 3 — Commit as QueaT (no Codex trailers)
 
 ```bash
 git add package.json src-tauri/tauri.conf.json src-tauri/Cargo.toml src-tauri/Cargo.lock
@@ -95,8 +101,8 @@ git commit -m "chore(release): bump version to $NEW"
 git log -1 --format='%an <%ae>%n%b'   # author QueaT, body has NO Co-Authored-By / Codex
 ```
 
-> **CALLOUT — no AI co-author trailers.** If your environment auto-appends a
-> AI co-author trailer, strip it (`git commit --amend`) before pushing.
+> **CALLOUT — no Codex trailers.** If your environment auto-appends a
+> `Co-Authored-By: Codex` trailer, strip it (`git commit --amend`) before pushing.
 > Release history is QueaT-only.
 
 ## Stage 4 — Merge to the `murmur` trunk via PR (NEVER direct push)
@@ -127,8 +133,8 @@ rustup target add aarch64-apple-darwin x86_64-apple-darwin
 
 ## Stage 6 — STOP the dev server
 
-The running `tauri dev` (from `/tauri-dev`) holds the `src-tauri/target` cargo lock —
-a release build will block on it.
+The running `tauri dev` (from `/tauri-dev`) holds the `target` cargo lock (at the WORKSPACE
+ROOT since the brain-sidecar extraction made this a virtual workspace) — a release build blocks on it.
 
 ```bash
 pkill -f 'tauri dev' ; pkill -x Murmur ; pkill -f 'target/debug/Murmur' || true
@@ -136,16 +142,19 @@ pkill -f 'tauri dev' ; pkill -x Murmur ; pkill -f 'target/debug/Murmur' || true
 
 ## Stage 7 — Universal build
 
-The full product IS the default build — the local-model cargo features were removed, so the
-on-device brain (mistralrs) + embedder/NER (candle) are always compiled and activate at runtime on
-model-presence. NO `--features` flag. `MISTRALRS_METAL_PRECOMPILE=0` is baked into
-`src-tauri/.cargo/config.toml [env]` (CLT-only Mac → defer Metal-shader compile to first run); keep
-it on the command line too as a guard.
+The full product IS the default build. The on-device brain (mistralrs) now lives in the
+`crates/murmur-brain` workspace member, compiled to the `meetnotes-brain` helper; the embedder/NER
+(candle) are always compiled in the app crate and activate at runtime on model-presence. NO
+`--features` flag. `MISTRALRS_METAL_PRECOMPILE=0` is baked into the WORKSPACE-ROOT `.cargo/config.toml
+[env]` (moved there so the brain member inherits it; CLT-only Mac → defer Metal-shader compile to
+first run); keep it on the command line too as a guard. The `beforeBuildCommand` builds
+`meetnotes-brain` universal (both arches + `lipo`) into `src-tauri/binaries/` before the app compiles.
 
 ```bash
 source "$HOME/.cargo/env"
 MISTRALRS_METAL_PRECOMPILE=0 npx tauri build --target universal-apple-darwin --bundles app
-APP="src-tauri/target/universal-apple-darwin/release/bundle/macos/Murmur.app"
+APP="target/universal-apple-darwin/release/bundle/macos/Murmur.app"   # target is at the workspace ROOT now
+lipo -archs "$APP/Contents/Resources/meetnotes-brain"   # NEW: MUST also print x86_64 arm64 (the brain helper)
 lipo -archs "$APP/Contents/MacOS/Murmur"     # MUST print: x86_64 arm64
 ```
 
@@ -266,7 +275,7 @@ hard boundary — a headless orchestrator hands them to the user rather than fak
 - **Never invent a green.** `lipo` must show both arches; `codesign --verify` must show
   `flags=0x10000(runtime)` + `Developer ID Application`; `spctl` must say accepted. If a
   check doesn't pass, STOP and report — do not "assume it worked."
-- **Identity is non-negotiable:** gh=JakubGawr, commit-author=QueaT (no AI co-author trailers),
+- **Identity is non-negotiable:** gh=JakubGawr, commit-author=QueaT (no Codex trailers),
   base=`murmur` via PR, identifier=`com.meetnotes.app` unchanged, sign **by hash**.
 - **Headless honesty.** If there is no Mac / no cert / no notary creds, say so and hand the
   user the exact remaining commands — never claim a notarized DMG you didn't produce.
