@@ -95,6 +95,22 @@ pub trait SummarizerProvider: Send + Sync {
         Ok((self.complete(system, user).await?, CallMeta::default()))
     }
 
+    /// Like [`complete_with_meta`] but carries [`crate::reason::GenOptions`] — a per-call token cap /
+    /// sampler override for the on-device path (the note-edit runaway guard).
+    ///
+    /// DEFAULT = IGNORE the options and delegate to [`complete_with_meta`]. The cloud
+    /// ([`super::redact::RedactingProvider`]) and other non-local providers have no local sampler to
+    /// bound and keep their own limits + redaction — so ignoring the opts is correct and non-breaking.
+    /// [`super::local::LocalSummarizerProvider`] OVERRIDES this to honor the cap on the GGUF path.
+    async fn complete_with_meta_opts(
+        &self,
+        system: &str,
+        user: &str,
+        _opts: crate::reason::GenOptions,
+    ) -> Result<(String, CallMeta)> {
+        self.complete_with_meta(system, user).await
+    }
+
     /// Structured-output completion returning the JSON value AND the provider's `CallMeta`
     /// (token usage + served model).
     ///
