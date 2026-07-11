@@ -172,6 +172,19 @@ app-shell {
   overflow: hidden;
 }
 
+/* The rail's LEFT corners sit right at the window's own left edge, 10px in —
+   exactly where macOS applies its own small, FIXED native window-corner mask.
+   A big 24px panel corner right next to that tighter OS curve reads as two
+   mismatched corners stacked in the same spot. Soften just those two corners
+   toward the OS's own rounding so the panel nests into it instead of
+   clashing. (The right-hand corners face the content pane, not a window
+   edge, so they keep the full Liquid-Glass --radius-xl.) */
+.drill-rail,
+.app-sidebar {
+  border-top-left-radius: var(--radius-md);
+  border-bottom-left-radius: var(--radius-md);
+}
+
 /* --- Sidebar (Apple TV: a floating rounded liquid-glass panel) ------------- */
 .app-sidebar {
   position: sticky;
