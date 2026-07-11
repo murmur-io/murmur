@@ -11,9 +11,10 @@
     tabindex="-1"
     (keydown.escape)="cancel()"
   >
+    <!-- Compact header: mark + title + one-line copy. -->
     <div class="sheet-head">
       <span class="org-mark" aria-hidden="true">
-        <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+        <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
           <circle cx="12" cy="8" r="3.2" />
           <path d="M5 20a7 7 0 0 1 14 0" />
           <circle cx="4.5" cy="10" r="2" />
@@ -23,25 +24,50 @@
       <div class="sheet-headings">
         <h2 id="org-share-title" class="sheet-title">Add to Org Brain</h2>
         <p class="sheet-copy">
-          Publishes an <strong>end-to-end-encrypted</strong> copy of this
-          {{ target().kind === "meeting" ? "meeting note" : "note" }} to your
-          org's shared brain. Every member's Murmur syncs and can search it — the
-          server can't read it.
+          An <strong>end-to-end-encrypted</strong> copy of this
+          {{ target().kind === "meeting" ? "meeting note" : "note" }} — every
+          member syncs and can search it; the server can't read it.
         </p>
       </div>
     </div>
 
-    <!-- Who can see this. -->
-    <p class="audience">
-      <span class="audience-mark" aria-hidden="true">👁</span>
-      <span>Who can see this: <strong>{{ audienceLabel() }}</strong></span>
-    </p>
+    <!-- Org PICKER (fix C): choose WHICH org to publish to; one org ⇒ a label. -->
+    <div class="org-pick">
+      <span class="section-label" id="org-pick-label">Publish to</span>
+      @if (orgsLoading()) {
+        <p class="pick-status text-muted">Loading your organizations…</p>
+      } @else if (orgsError(); as oerr) {
+        <p class="sheet-error" role="alert">{{ oerr }}</p>
+      } @else if (singleOrg()) {
+        @if (selectedOrg(); as org) {
+          <p class="pick-single">
+            <span class="pick-name">{{ org.name }}</span>
+            <span class="pick-members text-muted">{{ audienceLabel() }}</span>
+          </p>
+        }
+      } @else {
+        <mur-select
+          class="pick-select"
+          ariaLabel="Choose an organization"
+          [ngModel]="selectedOrgId()"
+          (ngModelChange)="selectedOrgId.set($event)"
+        >
+          @for (o of orgs(); track o.orgId) {
+            <option [value]="o.orgId">{{ o.name }}</option>
+          }
+        </mur-select>
+        @if (audienceLabel(); as label) {
+          <p class="pick-members text-muted">{{ label }}</p>
+        }
+      }
+    </div>
 
     @if (previewError(); as err) {
       <p class="sheet-error" role="alert">{{ err }}</p>
     }
 
-    <!-- The exact outgoing markdown (scrollable) + its size. -->
+    <!-- The exact outgoing markdown (scrollable) + its size. Honesty invariant:
+         the user sees EXACTLY what would leave the Mac before confirming. -->
     <div class="preview-block">
       <div class="preview-head">
         <span class="section-label">Exactly what leaves your Mac</span>
@@ -61,7 +87,7 @@
       }
     </div>
 
-    <!-- PII scrub toggle (default ON) + the scrubbed counts. -->
+    <!-- One-line scrub/consent note + toggle (default ON) + scrubbed counts. -->
     <div class="scrub-row">
       <label class="check">
         <input
@@ -113,7 +139,7 @@
         type="button"
         class="btn btn-primary"
         (click)="confirm()"
-        [disabled]="sharing() || loading() || !preview()"
+        [disabled]="sharing() || loading() || !preview() || !selectedOrgId()"
       >
         {{ sharing() ? "Adding…" : "Add to Org Brain" }}
       </button>

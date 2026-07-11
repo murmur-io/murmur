@@ -5055,6 +5055,57 @@ impl Db {
         .map_err(map_err)
     }
 
+    /// The browsable LIST of one org's live (non-tombstoned) items — headers only (no `markdown`
+    /// body; that's [`Db::get_org_item`]). Newest-first by feed `seq`. This is what lets a member SEE
+    /// what colleagues shared into the org instead of only search-hitting it. Org items are
+    /// deliberately org-disclosed content (no folder lock gate applies); the COMMAND layer re-checks
+    /// the caller is a local member of `org_id` before calling this.
+    pub fn list_org_items(
+        &self,
+        org_id: &str,
+    ) -> Result<Vec<crate::storage::models::OrgItemHeader>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT item_id, title, author_hint, created_at, seq
+                   FROM org_items
+                  WHERE org_id = ?1 AND tombstoned = 0
+                  ORDER BY seq DESC",
+            )
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![org_id], |r| {
+                Ok(crate::storage::models::OrgItemHeader {
+                    item_id: r.get(0)?,
+                    title: r.get(1)?,
+                    author_hint: r.get(2)?,
+                    created_at: r.get(3)?,
+                    seq: r.get::<_, i64>(4)? as u64,
+                })
+            })
+            .map_err(map_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(map_err)?);
+        }
+        Ok(out)
+    }
+
+    /// COUNT of one org's live (non-tombstoned) RECEIVED items — the size of the local org replica
+    /// (what colleagues shared IN). Distinct from the outbound `org_shares` count (what THIS member
+    /// published OUT); the two were conflated so the Settings item count showed the caller's own
+    /// uploads and read "0 items" to a receiver. Content-free.
+    pub fn count_org_items(&self, org_id: &str) -> Result<u32> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT COUNT(*) FROM org_items WHERE org_id = ?1 AND tombstoned = 0",
+            rusqlite::params![org_id],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|n| n as u32)
+        .map_err(map_err)
+    }
+
     /// Every non-null `content_sha256` from the local `org_shares` rows (across all orgs the user has
     /// shared into) — the SELF-SHARE dedup key set. A retrieval hit whose hash is in this set is the
     /// caller's OWN published item and is relabelled/dropped so a member never sees their own share

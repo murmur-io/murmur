@@ -32,6 +32,7 @@ const ORG_STATUSES = () => [
     consented: true,
     lastSeq: 42,
     itemCount: 12,
+    receivedCount: 12,
     pendingShares: 1,
   },
   {
@@ -41,7 +42,8 @@ const ORG_STATUSES = () => [
     memberCount: 8,
     consented: true,
     lastSeq: 100,
-    itemCount: 57,
+    itemCount: 0,
+    receivedCount: 57,
     pendingShares: 0,
   },
 ];
@@ -130,7 +132,8 @@ test.describe("Shared Brain v1 — org FE surfaces (mocked IPC)", () => {
   }) => {
     await mockTauri(page, {
       account_status: ACCOUNT_STATUS,
-      // The share panel still reads the single-org `org_status` (unchanged).
+      // The share panel's gate reads the single-org `org_status`; the sheet's
+      // picker reads the multi-org `org_list_statuses` (fix C).
       org_status: () => ({
         orgId: "org-1",
         name: "Acme Inc.",
@@ -139,8 +142,22 @@ test.describe("Shared Brain v1 — org FE surfaces (mocked IPC)", () => {
         consented: true,
         lastSeq: 42,
         itemCount: 12,
+        receivedCount: 12,
         pendingShares: 1,
       }),
+      org_list_statuses: () => [
+        {
+          orgId: "org-1",
+          name: "Acme Inc.",
+          role: "owner",
+          memberCount: 3,
+          consented: true,
+          lastSeq: 42,
+          itemCount: 12,
+          receivedCount: 12,
+          pendingShares: 1,
+        },
+      ],
       list_my_shares: () => [],
       list_org_shares: () => [],
       preview_org_share: () => ({
@@ -175,9 +192,12 @@ test.describe("Shared Brain v1 — org FE surfaces (mocked IPC)", () => {
     await expect(
       page.locator("app-org-share-sheet [role='dialog']"),
     ).toBeVisible();
-    // The exact outgoing markdown + the scrubbed-email count render.
+    // The exact outgoing markdown + the picker's single-org audience line render
+    // (one org ⇒ a label, not a redundant picker — fix C).
     await expect(page.getByText("Exactly what leaves your Mac")).toBeVisible();
-    await expect(page.getByText("Who can see this:")).toBeVisible();
+    await expect(
+      page.locator("app-org-share-sheet").getByText("3 members of Acme Inc."),
+    ).toBeVisible();
     await page.screenshot({
       path: "e2e/org/__screens__/org-share-sheet.png",
       fullPage: true,

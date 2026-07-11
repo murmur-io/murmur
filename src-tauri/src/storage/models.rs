@@ -530,6 +530,21 @@ pub struct OrgItemDetail {
     pub markdown: String,
 }
 
+/// Shared Brain v1 — a LIST-row header for one live org item (the browsable org-items list, so a
+/// member can SEE what colleagues shared into the org instead of only search-hitting it). Headers
+/// ONLY — the `markdown` body is deliberately NOT here (that's `org_get_item`); org items are
+/// disclosed content so no per-note lock gate applies, but keeping the list content-min avoids
+/// shipping every body on a list read. Mirrors the FE `OrgItemHeader` (camelCase).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OrgItemHeader {
+    pub item_id: String,
+    pub title: String,
+    pub author_hint: String,
+    pub created_at: String,
+    pub seq: u64,
+}
+
 /// Shared Brain v1 — the content-free result of a manual `org_sync_now()` (counts + errors only).
 /// `fts_only` is true when the local member has no real embedder (StubEmbedder ⇒ the org partition
 /// is indexed FTS-only until a model appears + a re-embed runs). Mirrors the FE `OrgSyncReport`
