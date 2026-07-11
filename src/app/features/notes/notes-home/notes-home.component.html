@@ -432,10 +432,14 @@
                   </div>
                 }
                 @case ("org") {
-                  <!-- A READ-ONLY org (Shared Brain) replica — opens the /org-item viewer. -->
+                  <!-- An org (Shared Brain) item. If the caller AUTHORED it
+                       (`ownedSource`), the row links straight to the EDITABLE
+                       original (/notes/:id | /meeting/:id) with the current title;
+                       otherwise it's a READ-ONLY replica → the /org-item viewer. -->
                   <a
                     class="card note-card note-card--org"
-                    [routerLink]="['/org-item', it.item.itemId]"
+                    [class.note-card--owned]="it.item.ownedSource"
+                    [routerLink]="orgItemLink(it.item)"
                   >
                     <div class="note-open note-open--org">
                       <div class="note-card-head">

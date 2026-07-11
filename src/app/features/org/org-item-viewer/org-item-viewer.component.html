@@ -1,7 +1,7 @@
 <section class="org-item">
-  <button type="button" class="back" (click)="nav.back()">
+  <button type="button" class="back" (click)="back()">
     <span class="back-arrow" aria-hidden="true">←</span>
-    <span>Back</span>
+    <span>Notes</span>
   </button>
 
   @if (loading()) {
@@ -16,15 +16,25 @@
   } @else if (item(); as it) {
     <article class="card oi-card">
       <header class="oi-head">
-        <span class="oi-org-chip">
-          <span class="oi-org-dot" aria-hidden="true"></span>
-          Org Brain
-        </span>
         <h1 class="oi-title">{{ it.title }}</h1>
-        <p class="oi-meta">
-          Shared by <strong>{{ it.authorHint }}</strong>
-          · {{ formatDate(it.createdAt) }}
-        </p>
+        <div class="oi-meta">
+          <span class="oi-org-chip">
+            <span class="oi-org-dot" aria-hidden="true"></span>
+            Org Brain
+          </span>
+          @if (orgName(); as name) {
+            <span class="oi-meta-sep" aria-hidden="true">·</span>
+            <span class="oi-org-name">{{ name }}</span>
+          }
+          @if (it.authorHint) {
+            <span class="oi-meta-sep" aria-hidden="true">·</span>
+            <span class="oi-author">Shared by {{ it.authorHint }}</span>
+          }
+          <span class="oi-meta-sep" aria-hidden="true">·</span>
+          <span class="oi-date">{{ formatDate(it.createdAt) }}</span>
+          <span class="oi-meta-sep" aria-hidden="true">·</span>
+          <span class="oi-rev">revision {{ it.rev }}</span>
+        </div>
       </header>
       <div class="oi-body">
         <app-markdown [markdown]="it.markdown" />
