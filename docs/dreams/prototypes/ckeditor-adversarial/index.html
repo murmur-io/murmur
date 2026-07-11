@@ -1,0 +1,638 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>CKEditor AI — Adversarial Review (vibe prototype)</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: #1a1a2b;
+      color: #d4d4e8;
+      font-family: 'Georgia', serif;
+      min-height: 100vh;
+      overflow: hidden;
+    }
+
+    /* ── Toolbar ── */
+    .toolbar {
+      background: #13131e;
+      border-bottom: 1px solid #252535;
+      padding: 7px 14px;
+      display: flex;
+      gap: 6px;
+      align-items: center;
+      height: 44px;
+    }
+    .toolbar button {
+      background: transparent;
+      border: 1px solid #2e2e48;
+      color: #aaaacc;
+      padding: 3px 9px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 12px;
+      transition: background 0.15s;
+    }
+    .toolbar button:hover { background: #22223a; color: #d4d4e8; }
+    .divider { width: 1px; height: 22px; background: #252535; margin: 0 3px; }
+    .spacer { flex: 1; }
+
+    .btn-challenge {
+      background: linear-gradient(135deg, #e5294a, #b01e38) !important;
+      border-color: #e5294a !important;
+      color: #fff !important;
+      font-weight: 700;
+      padding: 3px 14px !important;
+      font-size: 13px !important;
+      letter-spacing: 0.2px;
+    }
+    .btn-challenge:hover { opacity: 0.88; background: linear-gradient(135deg, #f03055, #c02040) !important; }
+
+    .btn-argmap {
+      background: transparent !important;
+      border: 1px solid #5b48e8 !important;
+      color: #9080f8 !important;
+      font-weight: 600;
+      padding: 3px 12px !important;
+      font-size: 12px !important;
+    }
+    .btn-argmap:hover { background: #1e1a3a !important; }
+
+    /* ── Layout ── */
+    .main {
+      display: grid;
+      grid-template-columns: 1fr 340px;
+      height: calc(100vh - 44px);
+    }
+
+    /* ── Editor area ── */
+    .editor-wrap {
+      padding: 32px 48px;
+      overflow-y: auto;
+      background: #1a1a2b;
+    }
+    .ck-content {
+      background: #20203a;
+      border: 1px solid #2a2a48;
+      border-radius: 8px;
+      padding: 36px 44px;
+      min-height: 460px;
+      outline: none;
+      font-size: 15.5px;
+      line-height: 1.75;
+      color: #d0d0ec;
+    }
+    .ck-content h2 {
+      font-family: Arial, sans-serif;
+      font-size: 21px;
+      font-weight: 700;
+      color: #e8e8fa;
+      margin-bottom: 18px;
+      line-height: 1.3;
+    }
+    .ck-content p { margin-bottom: 14px; }
+
+    /* Claim highlights — colored underline */
+    .claim {
+      cursor: pointer;
+      border-radius: 2px;
+      padding: 1px 0;
+      transition: background 0.18s;
+    }
+    .claim-0 { border-bottom: 2px solid #f97316; }
+    .claim-1 { border-bottom: 2px solid #f43f5e; }
+    .claim-2 { border-bottom: 2px solid #a855f7; }
+    .claim-3 { border-bottom: 2px solid #3b82f6; }
+    .claim:hover { background: rgba(255,255,255,0.05); }
+    .claim.active-claim { background: rgba(229,41,74,0.18); border-radius: 3px; }
+
+    /* ── Sidebar ── */
+    .sidebar {
+      background: #13131e;
+      border-left: 1px solid #252535;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    .sidebar-tabs {
+      display: flex;
+      border-bottom: 1px solid #252535;
+    }
+    .tab {
+      flex: 1;
+      padding: 10px 8px;
+      text-align: center;
+      font-size: 11px;
+      font-family: Arial, sans-serif;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      cursor: pointer;
+      color: #55556e;
+      border-bottom: 2px solid transparent;
+      transition: all 0.15s;
+    }
+    .tab.active { color: #d4d4e8; border-bottom-color: #5b48e8; }
+    .tab:hover:not(.active) { color: #9090b8; }
+
+    .panel { display: none; flex: 1; overflow-y: auto; flex-direction: column; }
+    .panel.active { display: flex; }
+
+    /* Empty state */
+    .empty-state {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 32px 24px;
+      text-align: center;
+      gap: 12px;
+    }
+    .empty-icon { font-size: 44px; }
+    .empty-title { font-size: 14px; font-family: Arial, sans-serif; font-weight: 600; color: #c0c0d8; }
+    .empty-sub { font-size: 12px; color: #44445e; font-family: Arial, sans-serif; line-height: 1.5; }
+
+    /* Loading */
+    .loading {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 12px;
+    }
+    .loading-icon { font-size: 36px; animation: pulse 1.2s ease-in-out infinite; }
+    @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:0.4; } }
+    .loading-text { font-family: Arial, sans-serif; font-size: 13px; color: #7070a0; }
+    .progress-bar { width: 140px; height: 3px; background: #252535; border-radius: 2px; margin-top: 4px; }
+    .progress-fill { height: 100%; background: linear-gradient(90deg, #e5294a, #f97316); border-radius: 2px; width: 0%; transition: width 0.3s; }
+
+    /* Score */
+    .score-block {
+      padding: 14px 16px;
+      border-bottom: 1px solid #1e1e34;
+      font-family: Arial, sans-serif;
+    }
+    .score-label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.6px; color: #55556e; margin-bottom: 6px; }
+    .score-row { display: flex; align-items: baseline; gap: 4px; margin-bottom: 8px; }
+    .score-num { font-size: 32px; font-weight: 800; }
+    .score-denom { font-size: 14px; color: #55556e; }
+    .score-verdict { font-size: 11px; font-weight: 600; }
+    .verdict-weak { color: #f43f5e; }
+    .verdict-mod  { color: #f97316; }
+    .verdict-strong { color: #4ade80; }
+    .score-track { height: 4px; background: #252535; border-radius: 2px; }
+    .score-fill { height: 100%; border-radius: 2px; transition: width 1.2s cubic-bezier(.4,0,.2,1); }
+    .fill-weak   { background: linear-gradient(90deg, #e5294a, #f43f5e); }
+    .fill-mod    { background: linear-gradient(90deg, #f97316, #fbbf24); }
+    .fill-strong { background: linear-gradient(90deg, #22c55e, #4ade80); }
+
+    /* Challenge cards */
+    .challenges-list { padding: 10px; display: flex; flex-direction: column; gap: 8px; }
+
+    .c-card {
+      background: #1c1c30;
+      border: 1px solid #2a2a48;
+      border-radius: 8px;
+      padding: 11px 12px;
+      cursor: pointer;
+      transition: border-color 0.15s, background 0.15s;
+      animation: slideIn 0.3s ease both;
+      font-family: Arial, sans-serif;
+    }
+    @keyframes slideIn { from { opacity:0; transform:translateX(14px); } to { opacity:1; transform:translateX(0); } }
+    .c-card:hover { border-color: #4a3a5a; background: #22223a; }
+    .c-card.c-active { border-color: #e5294a; background: #251320; }
+
+    .c-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 7px; }
+    .c-type { font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.5px; font-weight: 700; }
+    .sev-high { color: #f43f5e; }
+    .sev-med  { color: #f97316; }
+    .sev-low  { color: #4ade80; }
+    .sev-badge { font-size: 10px; color: #44445e; }
+
+    .c-text { font-size: 12.5px; color: #b0b0cc; line-height: 1.5; margin-bottom: 9px; }
+
+    .c-actions { display: flex; gap: 6px; }
+    .btn-xs {
+      font-size: 11px;
+      padding: 3px 9px;
+      border-radius: 4px;
+      cursor: pointer;
+      border: none;
+      font-family: Arial, sans-serif;
+      transition: background 0.15s;
+    }
+    .btn-strengthen { background: #201830; color: #c084fc; border: 1px solid #6d28d9; }
+    .btn-strengthen:hover { background: #2a2040; }
+    .btn-dismiss { background: #181828; color: #44445e; border: 1px solid #252535; }
+    .btn-dismiss:hover { background: #20203a; color: #7070a0; }
+
+    .strengthen-box {
+      margin-top: 9px;
+      background: #150f28;
+      border: 1px solid #5b21b6;
+      border-radius: 6px;
+      padding: 9px 10px;
+      font-size: 12px;
+      line-height: 1.55;
+      color: #c4b5fd;
+      display: none;
+      animation: fadeIn 0.18s ease;
+    }
+    @keyframes fadeIn { from { opacity:0; } to { opacity:1; } }
+    .strengthen-box.visible { display: block; }
+    .strengthen-label { font-size: 9.5px; text-transform: uppercase; letter-spacing: 0.5px; color: #7c3aed; margin-bottom: 5px; font-weight: 700; }
+
+    /* ── Argument Map panel ── */
+    .argmap-wrap {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 16px;
+      gap: 8px;
+    }
+    .argmap-canvas {
+      width: 100%;
+      background: #181828;
+      border: 1px solid #252535;
+      border-radius: 8px;
+    }
+    .argmap-legend {
+      font-family: Arial, sans-serif;
+      font-size: 10.5px;
+      color: #44445e;
+      text-align: center;
+      line-height: 1.6;
+    }
+
+    /* Scrollbar */
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: #2a2a45; border-radius: 3px; }
+  </style>
+</head>
+<body>
+
+<!-- Toolbar -->
+<div class="toolbar">
+  <button>↩</button>
+  <button>↪</button>
+  <div class="divider"></div>
+  <button><b>B</b></button>
+  <button><i>I</i></button>
+  <button style="text-decoration:underline">U</button>
+  <div class="divider"></div>
+  <button>H1</button>
+  <button>¶</button>
+  <button>⊞</button>
+  <div class="divider"></div>
+  <button>💬 Comment</button>
+  <button>🔀 Track</button>
+  <div class="spacer"></div>
+  <button class="btn-argmap" onclick="showArgMap()">🗺 Argument Map</button>
+  <button class="btn-challenge" id="challengeBtn" onclick="startChallenge()">⚔️ Challenge Me</button>
+</div>
+
+<!-- Main -->
+<div class="main">
+
+  <!-- Document -->
+  <div class="editor-wrap">
+    <div class="ck-content" contenteditable="true">
+      <h2>Project Proposal: AI-Powered Customer Support Platform</h2>
+      <p>Our company should <span class="claim claim-0" data-c="0">immediately invest $2M in building a proprietary AI chatbot</span> to replace our current customer support team of 45 agents. This will significantly reduce costs and improve efficiency.</p>
+      <p>The AI system will <span class="claim claim-1" data-c="1">handle 95% of all customer queries without human intervention</span>, based on benchmarks from similar companies in our industry. The remaining 5% will be routed to remaining staff.</p>
+      <p><span class="claim claim-2" data-c="2">Customer satisfaction will increase by 30%</span> after the transition, as AI responses are faster and available 24/7. Users generally prefer automated systems for their speed and consistency.</p>
+      <p>The implementation timeline is <span class="claim claim-3" data-c="3">6 months from kickoff to full deployment</span>, requiring minimal disruption to current operations. Our engineering team can handle this alongside their existing roadmap with no additional hires.</p>
+      <p>This initiative will position us as a leader in customer experience innovation and deliver a sustainable competitive advantage for years to come.</p>
+    </div>
+  </div>
+
+  <!-- Sidebar -->
+  <div class="sidebar">
+    <div class="sidebar-tabs">
+      <div class="tab active" id="tab-adv" onclick="switchTab('adv')">⚔ Adversarial</div>
+      <div class="tab" id="tab-map" onclick="switchTab('map')">🗺 Arg Map</div>
+    </div>
+
+    <!-- ADVERSARIAL PANEL -->
+    <div class="panel active" id="panel-adv">
+
+      <div class="empty-state" id="empty">
+        <div class="empty-icon">⚔️</div>
+        <div class="empty-title">Adversarial Review</div>
+        <div class="empty-sub">AI plays devil's advocate — finds weaknesses, missing evidence, and logical gaps before your reader does.</div>
+        <div class="empty-sub" style="color:#33334a;margin-top:4px">Click <strong style="color:#e5294a">Challenge Me</strong> to start.</div>
+      </div>
+
+      <div class="loading" id="loading" style="display:none">
+        <div class="loading-icon">🧠</div>
+        <div class="loading-text" id="loadingMsg">Reading your arguments…</div>
+        <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
+      </div>
+
+      <div id="results" style="display:none">
+        <div class="score-block">
+          <div class="score-label">Argument strength</div>
+          <div class="score-row">
+            <span class="score-num" id="scoreNum" style="color:#f43f5e">0</span>
+            <span class="score-denom">/100</span>
+            <span class="score-verdict verdict-weak" id="scoreVerdict" style="margin-left:8px"></span>
+          </div>
+          <div class="score-track">
+            <div class="score-fill fill-weak" id="scoreFill" style="width:0%"></div>
+          </div>
+        </div>
+        <div class="challenges-list" id="challengesList"></div>
+      </div>
+
+    </div>
+
+    <!-- ARG MAP PANEL -->
+    <div class="panel" id="panel-map">
+      <div class="argmap-wrap">
+        <svg class="argmap-canvas" id="argSvg" viewBox="0 0 308 380" xmlns="http://www.w3.org/2000/svg"></svg>
+        <div class="argmap-legend">Click a node to jump to that paragraph</div>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<script>
+/* ─── Data ─── */
+const challenges = [
+  {
+    ci: 0,
+    type: 'Unsupported Investment Claim',
+    sev: 'high',
+    text: '"Immediately" + "$2M" with no ROI analysis. What does "significantly reduce costs" mean in actual numbers? This will kill credibility in review.',
+    fix: 'Add: "Based on 3-year TCO modeling, this investment projects a $4.2M labor-cost reduction, break-even at month 18 (see Appendix A for assumptions and sensitivity analysis)."'
+  },
+  {
+    ci: 1,
+    type: 'Questionable Benchmark',
+    sev: 'high',
+    text: '"95% without human intervention" — which companies? What industry? Published research puts tier-1 AI deflection at 40–65% in year one. This number will be challenged immediately.',
+    fix: 'Replace with: "Zendesk & Intercom case studies show 55–70% deflection in Year 1, scaling to 80%+ by Year 3 for comparable support volumes."'
+  },
+  {
+    ci: 2,
+    type: 'Contradicts Research',
+    sev: 'med',
+    text: 'Gartner 2023: 64% of customers prefer human agents for complex issues. "Users generally prefer automated systems" is factually contestable and weakens trust.',
+    fix: 'Reframe: "For Tier-1 queries (password resets, order status), AI reduces resolution from 8 min → 12 sec. Human agents are retained for complex cases, improving their quality KPIs by 40%."'
+  },
+  {
+    ci: 3,
+    type: 'Unrealistic Timeline',
+    sev: 'med',
+    text: '"6 months, minimal disruption" while replacing 45 agents is a contradiction. No mention of training data pipeline, compliance review, UAT, or the human redeployment plan.',
+    fix: 'Honest phasing: "Phase 1 (M1–4): Build & train. Phase 2 (M5–8): Pilot 20% traffic. Phase 3 (M9–12): Full rollout + agent redeployment program."'
+  }
+];
+
+/* ─── State ─── */
+let activeIdx = -1;
+let challenged = false;
+
+/* ─── Tab switching ─── */
+function switchTab(t) {
+  document.querySelectorAll('.tab').forEach(el => el.classList.remove('active'));
+  document.querySelectorAll('.panel').forEach(el => el.classList.remove('active'));
+  document.getElementById('tab-' + t).classList.add('active');
+  document.getElementById('panel-' + t).classList.add('active');
+  if (t === 'map') drawArgMap();
+}
+
+function showArgMap() { switchTab('map'); }
+
+/* ─── Challenge flow ─── */
+function startChallenge() {
+  if (challenged) return;
+  switchTab('adv');
+  document.getElementById('empty').style.display = 'none';
+  document.getElementById('loading').style.display = 'flex';
+  document.getElementById('results').style.display = 'none';
+  document.getElementById('challengeBtn').disabled = true;
+
+  const messages = [
+    'Reading your arguments…',
+    'Identifying unsupported claims…',
+    'Checking against research…',
+    'Scoring argument strength…'
+  ];
+  let mi = 0;
+  let pct = 0;
+  const fill = document.getElementById('progressFill');
+  const msg  = document.getElementById('loadingMsg');
+
+  const iv = setInterval(() => {
+    pct = Math.min(pct + (mi < 3 ? 28 : 10), 96);
+    fill.style.width = pct + '%';
+    if (mi < messages.length - 1) { mi++; msg.textContent = messages[mi]; }
+  }, 620);
+
+  setTimeout(() => {
+    clearInterval(iv);
+    fill.style.width = '100%';
+    setTimeout(() => {
+      document.getElementById('loading').style.display = 'none';
+      document.getElementById('results').style.display = 'block';
+      challenged = true;
+      renderCards();
+      animateScore(34, 'Weak — significant gaps');
+    }, 300);
+  }, 2600);
+}
+
+/* ─── Score animation ─── */
+function animateScore(target, verdict) {
+  let v = 0;
+  const num   = document.getElementById('scoreNum');
+  const fill  = document.getElementById('scoreFill');
+  const verd  = document.getElementById('scoreVerdict');
+  const iv = setInterval(() => {
+    v = Math.min(v + 2, target);
+    num.textContent = v;
+    fill.style.width = v + '%';
+    if (v >= target) clearInterval(iv);
+  }, 28);
+  verd.textContent = verdict;
+}
+
+/* ─── Cards ─── */
+function renderCards() {
+  const list = document.getElementById('challengesList');
+  list.innerHTML = '';
+  challenges.forEach((c, i) => {
+    const card = document.createElement('div');
+    card.className = 'c-card';
+    card.style.animationDelay = (i * 0.1) + 's';
+    const sevCls   = c.sev === 'high' ? 'sev-high' : c.sev === 'med' ? 'sev-med' : 'sev-low';
+    const sevLabel = c.sev === 'high' ? '⚠ High' : c.sev === 'med' ? '◆ Med' : '● Low';
+    card.innerHTML = `
+      <div class="c-header">
+        <span class="c-type ${sevCls}">${c.type}</span>
+        <span class="sev-badge">${sevLabel}</span>
+      </div>
+      <div class="c-text">${c.text}</div>
+      <div class="c-actions">
+        <button class="btn-xs btn-strengthen" onclick="toggleFix(${i},event)">✨ Strengthen</button>
+        <button class="btn-xs btn-dismiss"    onclick="dismissCard(${i},event)">✕</button>
+      </div>
+      <div class="strengthen-box" id="fix-${i}">
+        <div class="strengthen-label">💡 Suggested rewrite</div>
+        ${c.fix}
+      </div>`;
+    card.addEventListener('click', () => activateCard(i, card));
+    list.appendChild(card);
+  });
+
+  // claim click → card
+  document.querySelectorAll('.claim').forEach(el => {
+    el.addEventListener('click', () => {
+      if (!challenged) return;
+      const ci = parseInt(el.dataset.c);
+      const idx = challenges.findIndex(x => x.ci === ci);
+      if (idx < 0) return;
+      const cards = document.querySelectorAll('.c-card');
+      if (cards[idx]) {
+        switchTab('adv');
+        activateCard(idx, cards[idx]);
+        cards[idx].scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      }
+    });
+  });
+}
+
+function activateCard(idx, card) {
+  document.querySelectorAll('.c-card').forEach(c => c.classList.remove('c-active'));
+  document.querySelectorAll('.claim').forEach(c => c.classList.remove('active-claim'));
+  card.classList.add('c-active');
+  const claim = document.querySelector(`.claim[data-c="${challenges[idx].ci}"]`);
+  if (claim) {
+    claim.classList.add('active-claim');
+    claim.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  }
+  activeIdx = idx;
+}
+
+function toggleFix(i, e) {
+  e.stopPropagation();
+  document.getElementById('fix-' + i).classList.toggle('visible');
+}
+
+function dismissCard(i, e) {
+  e.stopPropagation();
+  const cards = document.querySelectorAll('.c-card');
+  const card = cards[i];
+  card.style.transition = 'opacity 0.2s, transform 0.2s';
+  card.style.opacity = '0';
+  card.style.transform = 'translateX(16px)';
+  setTimeout(() => card.remove(), 220);
+}
+
+/* ─── Argument Map ─── */
+function drawArgMap() {
+  const svg = document.getElementById('argSvg');
+  svg.innerHTML = '';
+
+  const nodes = [
+    { id: 'c', x: 154, y: 38,  label: 'Conclusion',     sub: 'AI replaces support team',    color: '#5b48e8', r: 36 },
+    { id: '0', x: 60,  y: 140, label: 'Claim',          sub: '$2M immediate investment',     color: '#f97316', r: 28 },
+    { id: '1', x: 154, y: 140, label: 'Claim',          sub: '95% AI resolution rate',       color: '#f43f5e', r: 28 },
+    { id: '2', x: 248, y: 140, label: 'Claim',          sub: '+30% CSAT guarantee',          color: '#a855f7', r: 28 },
+    { id: '3', x: 154, y: 248, label: 'Support',        sub: '6 month timeline',             color: '#3b82f6', r: 24 },
+    { id: 'e0',x: 30,  y: 300, label: 'Evidence?',      sub: 'Unspecified benchmarks',       color: '#374151', r: 20, dashed: true },
+    { id: 'e1',x: 110, y: 300, label: 'Evidence?',      sub: '"Similar companies"',           color: '#374151', r: 20, dashed: true },
+    { id: 'e2',x: 200, y: 300, label: 'Evidence?',      sub: 'No satisfaction source',       color: '#374151', r: 20, dashed: true },
+    { id: 'e3',x: 278, y: 300, label: 'Risk',           sub: 'Engineering capacity?',        color: '#991b1b', r: 20, dashed: true },
+  ];
+
+  const edges = [
+    ['0','c'], ['1','c'], ['2','c'],
+    ['3','1'],
+    ['e0','0'], ['e1','1'], ['e2','2'], ['e3','3']
+  ];
+
+  const nodeMap = {};
+  nodes.forEach(n => nodeMap[n.id] = n);
+
+  // defs
+  const defs = document.createElementNS('http://www.w3.org/2000/svg','defs');
+  defs.innerHTML = `<marker id="arr" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+    <path d="M0,0 L0,6 L8,3 z" fill="#2a2a48"/>
+  </marker>
+  <marker id="arr-red" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+    <path d="M0,0 L0,6 L8,3 z" fill="#991b1b"/>
+  </marker>`;
+  svg.appendChild(defs);
+
+  // edges
+  edges.forEach(([from, to]) => {
+    const f = nodeMap[from], t = nodeMap[to];
+    const isRisk = from.startsWith('e');
+    const line = document.createElementNS('http://www.w3.org/2000/svg','line');
+    line.setAttribute('x1', f.x); line.setAttribute('y1', f.y);
+    line.setAttribute('x2', t.x); line.setAttribute('y2', t.y);
+    line.setAttribute('stroke', isRisk ? '#374151' : '#2a2a60');
+    line.setAttribute('stroke-width', isRisk ? '1' : '1.5');
+    if (isRisk) line.setAttribute('stroke-dasharray', '4,3');
+    line.setAttribute('marker-end', isRisk ? 'url(#arr)' : 'url(#arr)');
+    svg.appendChild(line);
+  });
+
+  // nodes
+  nodes.forEach(n => {
+    const g = document.createElementNS('http://www.w3.org/2000/svg','g');
+    g.style.cursor = 'pointer';
+
+    const circ = document.createElementNS('http://www.w3.org/2000/svg','circle');
+    circ.setAttribute('cx', n.x); circ.setAttribute('cy', n.y); circ.setAttribute('r', n.r);
+    circ.setAttribute('fill', n.dashed ? '#13131e' : n.color + '22');
+    circ.setAttribute('stroke', n.color);
+    circ.setAttribute('stroke-width', n.dashed ? '1' : '2');
+    if (n.dashed) circ.setAttribute('stroke-dasharray', '4,3');
+    g.appendChild(circ);
+
+    const label = document.createElementNS('http://www.w3.org/2000/svg','text');
+    label.setAttribute('x', n.x); label.setAttribute('y', n.y - 4);
+    label.setAttribute('text-anchor','middle'); label.setAttribute('font-size', '9');
+    label.setAttribute('font-family','Arial'); label.setAttribute('font-weight','700');
+    label.setAttribute('fill', n.color);
+    label.textContent = n.label;
+    g.appendChild(label);
+
+    const sub = document.createElementNS('http://www.w3.org/2000/svg','text');
+    sub.setAttribute('x', n.x); sub.setAttribute('y', n.y + 8);
+    sub.setAttribute('text-anchor','middle'); sub.setAttribute('font-size', '7.5');
+    sub.setAttribute('font-family','Arial'); sub.setAttribute('fill', '#7070a0');
+    // word-wrap simulation: split at space
+    const words = n.sub.split(' ');
+    let line1 = '', line2 = '';
+    let mid = Math.ceil(words.length / 2);
+    line1 = words.slice(0, mid).join(' ');
+    line2 = words.slice(mid).join(' ');
+    sub.innerHTML = `<tspan x="${n.x}" dy="0">${line1}</tspan><tspan x="${n.x}" dy="9">${line2}</tspan>`;
+    g.appendChild(sub);
+
+    // click → jump to claim
+    if (['0','1','2','3'].includes(n.id)) {
+      g.addEventListener('click', () => {
+        switchTab('adv');
+        const claim = document.querySelector(`.claim[data-c="${n.id}"]`);
+        if (claim) claim.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      });
+    }
+
+    svg.appendChild(g);
+  });
+}
+</script>
+</body>
+</html>
