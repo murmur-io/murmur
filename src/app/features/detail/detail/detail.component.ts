@@ -289,35 +289,50 @@ export class DetailComponent implements OnInit {
   readonly timelineLoading = signal(false);
 
   /**
+   * One-shot latch for the Audio-tab effect: the meeting id whose Audio-tab timeline read has
+   * already been attempted (and resolved) this open. Set the moment `loadTimeline` starts, so the
+   * effect can NEVER re-enter for the same meeting — even if the read resolves to an empty/falsy
+   * backend timeline that leaves no terminal signal set (the #234 infinite-loop root cause: a
+   * `get_timeline`/`generate_timeline` returning `{speakers:[],topics:[]}`/null left
+   * `timeline==null && !error && !needsGeneration`, so the effect re-fired forever). Cleared per
+   * meeting in `loadMeeting`. The explicit Retry / Generate clicks call `loadTimeline`/`generateTimeline`
+   * directly (not via the effect), so a deliberate re-run is unaffected.
+   */
+  private readonly _timelineAttempted = signal<string | null>(null);
+
+  /**
    * PERF/OOM (P0.1): generate the timeline LAZILY — only when the Audio tab (the only surface that
    * renders it) is first opened for an unlocked meeting and it isn't already loaded / in flight.
    * `loadMeeting`/`unlock` no longer kick it off on open, so a plain Note-tab open never triggers the
-   * multi-GB on-device LLM pass that OOM-killed the Mac. `allowSignalWrites` because `loadTimeline`
-   * writes `timelineLoading` (which this effect reads) — the `!timelineLoading()` guard makes the
-   * re-run a no-op, so there is no loop. See docs/research/2026-07-07-perf-memory-audit.md.
+   * multi-GB on-device LLM pass that OOM-killed the Mac. Signal writes in the invoked `loadTimeline`
+   * are fine in v22 (no flag) — the `_timelineAttempted` latch below makes the effect fire at most
+   * once per meeting-open, so there is no loop. See docs/research/2026-07-07-perf-memory-audit.md.
    */
-  private readonly _timelineOnAudioTab = effect(
-    () => {
-      if (
-        this.activeTab() === "audio" &&
-        this.detail() &&
-        !this.locked() &&
-        !this.timeline() &&
-        !this.timelineLoading() &&
-        // Do NOT auto-retry after a failure: a persistent error would otherwise re-fire this effect
-        // every time `timelineLoading` flips back to false → an infinite retry loop. A failed load
-        // surfaces the Retry button, which clears `timelineError` and re-calls `loadTimeline`.
-        !this.timelineError() &&
-        // Do NOT re-fire once we've surfaced the "Generate" affordance (on-device, no cache): the
-        // read leaves `timeline` null + `timelineLoading` false, so without this guard the effect
-        // would loop calling `loadTimeline` forever. Cleared only by the user's Generate click.
-        !this.timelineNeedsGeneration()
-      ) {
-        void this.loadTimeline();
-      }
-    },
-    { allowSignalWrites: true },
-  );
+  private readonly _timelineOnAudioTab = effect(() => {
+    const d = this.detail();
+    const id = d?.meeting.id ?? null;
+    if (
+      this.activeTab() === "audio" &&
+      d &&
+      id &&
+      !this.locked() &&
+      !this.timeline() &&
+      !this.timelineLoading() &&
+      // Do NOT auto-retry after a failure: a persistent error would otherwise re-fire this effect
+      // every time `timelineLoading` flips back to false → an infinite retry loop. A failed load
+      // surfaces the Retry button, which clears `timelineError` and re-calls `loadTimeline`.
+      !this.timelineError() &&
+      // Do NOT re-fire once we've surfaced the "Generate" affordance (on-device, no cache): the
+      // read leaves `timeline` null + `timelineLoading` false, so without this guard the effect
+      // would loop calling `loadTimeline` forever. Cleared only by the user's Generate click.
+      !this.timelineNeedsGeneration() &&
+      // ONE-SHOT LATCH (#234): never re-attempt the Audio-tab read for a meeting id already tried
+      // this open — an empty/falsy backend result that sets no terminal signal must NOT re-loop.
+      this._timelineAttempted() !== id
+    ) {
+      void this.loadTimeline();
+    }
+  });
   readonly timelineError = signal(false);
   /**
    * PERF/OOM: true when deriving THIS install's timeline would load a residency-bound on-device
@@ -418,15 +433,26 @@ export class DetailComponent implements OnInit {
    * Refresh the "In Org Brain" header pill from `list_org_shares`. See the
    * {@link orgShared} SEAM note: matched by title (the content-free share list
    * carries no meeting id yet). Fails closed to `false` on any error / no org.
+   *
+   * STALE-RESULT guard (FE failure mode #4): capture the meeting id at call time and,
+   * after the `list_org_shares` await, drop the result if the user navigated to another
+   * meeting mid-flight (`openRelated` reuses this component) — otherwise a late response
+   * could set the pill from the PREVIOUS meeting's title over the current one.
    */
   private async refreshOrgShared(): Promise<void> {
-    const title = this.detail()?.meeting.title;
+    const meeting = this.detail()?.meeting;
+    const id = meeting?.id;
+    const title = meeting?.title;
     if (!title) {
       this.orgShared.set(false);
       return;
     }
     try {
       const shares = await this.ipc.listOrgShares();
+      // Drop late responses for a meeting the user has since navigated away from.
+      if (this.detail()?.meeting.id !== id) {
+        return;
+      }
       this.orgShared.set(
         shares.some((s) => s.state !== "revoked" && s.title === title),
       );
@@ -453,6 +479,8 @@ export class DetailComponent implements OnInit {
     this.timeline.set(null);
     this.timelineError.set(false);
     this.timelineNeedsGeneration.set(false);
+    // Reset the Audio-tab one-shot latch so the next meeting-open may attempt its timeline read once.
+    this._timelineAttempted.set(null);
     this.speakerSuggestions.set([]);
     this.tags.set([]);
     this.graph.set(null);
@@ -656,6 +684,11 @@ export class DetailComponent implements OnInit {
     if (!id || this.timelineLoading()) {
       return;
     }
+    // ONE-SHOT LATCH (#234): record that this meeting's Audio-tab timeline read has been attempted,
+    // so the `_timelineOnAudioTab` effect can never re-enter for it even when the read resolves to
+    // an empty/falsy timeline that sets no terminal signal. A deliberate Retry clears the terminal
+    // signals and re-calls this method directly; the latch is not consulted there.
+    this._timelineAttempted.set(id);
     this.timelineError.set(false);
     this.timelineNeedsGeneration.set(false);
     this.timelineLoading.set(true);
@@ -666,7 +699,7 @@ export class DetailComponent implements OnInit {
       if (this.detail()?.meeting.id !== id) {
         return;
       }
-      if (cached.speakers.length > 0 || cached.topics.length > 0) {
+      if (cached && (cached.speakers.length > 0 || cached.topics.length > 0)) {
         this.timeline.set(cached);
       } else if (this.timelineOnDevice()) {
         // Heavy on-device generation is user-initiated only — show the Generate affordance.
@@ -720,7 +753,16 @@ export class DetailComponent implements OnInit {
       if (this.detail()?.meeting.id !== id) {
         return; // stale — the user moved on
       }
-      this.timeline.set(tl);
+      // TERMINAL-STATE guard (#234): a falsy/empty generate_timeline result must NOT leave
+      // `timeline==null && !error && !needsGeneration` — that combination re-fired the Audio-tab
+      // effect forever. An empty derivation is a resolved failure to produce content → surface the
+      // Retry affordance (timelineError) rather than a silent, effect-re-triggering blank.
+      if (tl && (tl.speakers.length > 0 || tl.topics.length > 0)) {
+        this.timeline.set(tl);
+      } else {
+        this.timeline.set(null);
+        this.timelineError.set(true);
+      }
     } catch {
       if (this.detail()?.meeting.id === id) {
         this.timeline.set(null);

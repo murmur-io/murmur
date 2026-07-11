@@ -64,16 +64,13 @@ export class Stage2PanelComponent {
    * state. Paired with a per-op stale-id guard in `fetchContext`/`addToNote`/`clearContext` below
    * (belt-and-braces: the reset clears the UI; the guard blocks a write racing a mid-flight nav).
    */
-  private readonly _resetOnMeetingChange = effect(
-    () => {
-      this.meetingId(); // track
-      this.hits.set(null);
-      this.applied.set(false);
-      this.cleared.set(false);
-      this.error.set(null);
-    },
-    { allowSignalWrites: true },
-  );
+  private readonly _resetOnMeetingChange = effect(() => {
+    this.meetingId(); // track
+    this.hits.set(null);
+    this.applied.set(false);
+    this.cleared.set(false);
+    this.error.set(null);
+  });
 
   /**
    * The EGRESS moment: fetch live context from the consented connectors.

@@ -500,10 +500,11 @@ pub struct DocChunkHit {
 
 /// Shared Brain v1 — one ORG-partition retrieval hit: the nearest/best chunk's snippet + the
 /// source org item's id, `author_hint`, and title. The parallel of [`DocChunkHit`] for the org
-/// leg; the retrieval fusion turns it into a [`VaultSource`] with `origin = SourceOrigin::org(..)`
-/// so the FE renders the `[org · <author>]` provenance chip. `content_sha256` rides along so the
-/// self-share dedup (drop a hit whose plaintext hash matches a local `org_shares` row) is applied
-/// at the fusion layer without a second DB read.
+/// leg. The `org_search` / `org_brain_search` TOOL renders each hit as a LOUD `[org · <author>]`
+/// text line (`crate::tools::format_org_hits`); the structured `VaultSource` provenance chip on the
+/// Ask surface is NOT wired to org hits (`origin` is always `None`). `content_sha256` rides along
+/// so the self-share dedup (drop a hit whose plaintext hash matches a local `org_shares` row) is
+/// applied without a second DB read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrgChunkHit {
     pub item_id: String,
@@ -527,18 +528,6 @@ pub struct OrgItemDetail {
     pub created_at: String,
     pub rev: u32,
     pub markdown: String,
-}
-
-/// Shared Brain v1 — a summary row of a synced org item (feed replica). Mirrors the FE
-/// `OrgItemSummary` (camelCase).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct OrgItemSummary {
-    pub item_id: String,
-    pub author_hint: String,
-    pub title: String,
-    pub created_at: String,
-    pub rev: u32,
 }
 
 /// Shared Brain v1 — the content-free result of a manual `org_sync_now()` (counts + errors only).
@@ -779,6 +768,11 @@ pub struct PinResult {
 /// org hit, `author` is the item's `author_hint` label and `org_item_id` is the id the read-only
 /// org-item viewer loads via `org_get_item`. Mirrors the FE `SourceOrigin` (camelCase). CONTENT-FREE
 /// beyond the author label the local user is already allowed to see.
+///
+/// NOTE (2026-07-11 SB-2): the STRUCTURED chip is not yet wired — every [`VaultSource`] currently
+/// sets `origin: None`; org retrieval provenance is surfaced only as the LOUD `[org · <author>]`
+/// TEXT line the `org_search` / `org_brain_search` tool emits (`crate::tools::format_org_hits`).
+/// This DTO exists for the (unimplemented) chip surface; do not document a fusion that does not run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SourceOrigin {
@@ -790,17 +784,6 @@ pub struct SourceOrigin {
     pub org_item_id: Option<String>,
 }
 
-impl SourceOrigin {
-    /// The provenance of an ORG-brain hit (renders the `[org · <author>]` chip → the viewer route).
-    pub fn org(author: impl Into<String>, org_item_id: impl Into<String>) -> Self {
-        Self {
-            kind: "org".to_string(),
-            author: Some(author.into()),
-            org_item_id: Some(org_item_id.into()),
-        }
-    }
-}
-
 /// A meeting referenced as a source in an Ask-My-Vault answer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -808,9 +791,10 @@ pub struct VaultSource {
     pub meeting_id: String,
     pub title: String,
     pub started_at: String,
-    /// Shared Brain v1 — absent/null for a plain LOCAL owned-content source; present with
-    /// `kind:"org"` for an org-brain hit synced from a colleague. Lets the FE render an org-origin
-    /// chip (author + date) routing to the read-only org-item viewer.
+    /// Shared Brain v1 — always `None` today (SB-2): the structured org-origin chip is NOT wired, so
+    /// every source is a plain LOCAL owned-content reference. Kept as an ADDITIVE, FE-optional field
+    /// (`skip_serializing_if`) for the eventual chip surface; org provenance rides the tool's text
+    /// `[org · <author>]` line instead. See [`SourceOrigin`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<SourceOrigin>,
 }
