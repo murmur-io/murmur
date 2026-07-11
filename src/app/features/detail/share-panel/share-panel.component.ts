@@ -25,6 +25,7 @@ import {
   OrgShareSheetComponent,
   type OrgShareTarget,
 } from "../org-share-sheet/org-share-sheet.component";
+import { MurOrgBrainCtaComponent } from "../../../design-system/org-brain-cta/org-brain-cta.component";
 
 /** The step the in-flow "Share with a person" panel is showing. */
 export type PersonShareStep = "email" | "suggest-link" | "consent" | "result";
@@ -74,7 +75,11 @@ export interface LinkShareRow {
 @Component({
   selector: "app-share-panel",
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [ShareVerifySheetComponent, OrgShareSheetComponent],
+  imports: [
+    ShareVerifySheetComponent,
+    OrgShareSheetComponent,
+    MurOrgBrainCtaComponent,
+  ],
   templateUrl: "./share-panel.component.html",
   styleUrl: "./share-panel.component.scss",
 })
