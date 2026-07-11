@@ -21,6 +21,13 @@ import type {
   NoteCitation,
 } from "../../../core/models";
 import { TimerService } from "../../../services/timer.service";
+import {
+  NOTE_ASSIST_CATALOG,
+  NOTE_ASSIST_GROUPS,
+  type NoteAssistCatalogEntry,
+  type NoteAssistGroup,
+  noteAssistEntry,
+} from "./note-assist-catalog";
 import { RepositionOnScrollDirective } from "./reposition-on-scroll.directive";
 
 /** The live text selection the popover acts on, plus its viewport anchor rect. */
@@ -39,12 +46,19 @@ export interface PopoverSelection {
   rect: { top: number; left: number; right: number; bottom: number };
 }
 
-/** One accepted assistant edit, applied by the editor into the textarea. */
-export interface AcceptedEdit {
-  action: NoteAssistAction;
-  /** refine/shorten: replacement for the selection. enhance: additive passage. */
-  suggestion: string;
-}
+/**
+ * One accepted assistant outcome, applied by the editor. Discriminated by `kind`
+ * so the editor branches without re-deriving intent from the action:
+ * - `replace` — replace the selection with `suggestion`.
+ * - `insert`  — append `suggestion` after the selection (additive; also "Insert as note").
+ * - `copy`    — copy `text` to the clipboard (draft follow-up / an info answer).
+ * - `spinoff` — create a NEW note from `title` + `body` and open it.
+ */
+export type AcceptedEdit =
+  | { kind: "replace"; suggestion: string }
+  | { kind: "insert"; suggestion: string }
+  | { kind: "copy"; text: string }
+  | { kind: "spinoff"; title: string; body: string };
 
 /** One step in the animated progress tracker (mirrors the Ask trace-chip language). */
 interface FlowStep {
@@ -54,35 +68,41 @@ interface FlowStep {
   state: "pending" | "running" | "done";
 }
 
-/** Which assistant actions are enabled (from settings — all default ON). */
-export interface AssistToggles {
-  refine: boolean;
-  shorten: boolean;
-  enhance: boolean;
-}
-
-/** The label shown BEFORE the first result lands, keyed off the pre-fetched posture. */
-type PhaseView = "actions" | "running" | "result" | "error";
+/** The high-level view the popover is showing. */
+type PhaseView = "menu" | "submenu" | "running" | "result" | "error";
 
 const POPOVER_WIDTH = 340;
 const POPOVER_GAP = 10;
 
+/** Catalog action ids that read the brain → show a "Searching your brain" step. */
+const RETRIEVAL_ACTIONS = new Set<NoteAssistAction>([
+  "enhance",
+  "find_related",
+  "link_entities",
+  "fact_check",
+  "ask",
+]);
+
 /**
- * The selection Brain-assistant popover (FP3). Floats ABOVE a non-empty body
- * selection and offers Refine / Shorten / Enhance context. Each action expands
- * into an animated step tracker, then lands a reviewable DIFF (original vs
- * suggestion) with Accept / Discard / Retry.
+ * The selection Brain-assistant popover — a ClickUp-style command menu. Floats
+ * ABOVE a non-empty body selection. A command input filters the action list live
+ * and, on Enter with text, runs a free-text `custom` instruction. The default
+ * (compact) view shows the input + 5 quick actions + "More actions"; expanding
+ * reveals every action grouped under quiet section labels; the variant-heavy
+ * actions (tone / translate) open a second-level submenu with a Back row.
  *
- * The single `noteAssistantAction` await drives the flow: the leading steps
- * animate optimistically while awaiting, then the popover lands on the REAL
- * result (the `Found N related` count is filled from `result.citations.length`,
- * never fabricated). A per-action `activeRequestId` guard drops a late reply for
- * a superseded selection/action (trap #4).
+ * Running an action animates an optimistic step tracker while the single
+ * `noteAssistantAction` await is in flight (retrieval actions add a "Searching
+ * your brain" step), then lands the REAL result. The RESULT phase branches on
+ * `result().shape` (NOT the action) into replace / insert / info / artifact
+ * renderings. A per-request `requestSeq` guard drops a late reply for a
+ * superseded selection/action (trap #4).
  *
  * OPAQUE overlay (T3): `--surface-overlay`, `--border-strong`, `--shadow-lg`,
  * `backdrop-filter:none`. Positioned via `afterNextRender({injector})` — no
- * `setTimeout`/`rAF`. Dismiss is owned by the host (outside-click / Esc /
- * selection-collapse); the popover only emits `dismiss` on its own Close/Discard.
+ * `setTimeout`/`rAF` (the step tick uses the root TimerService, rule §5).
+ * Dismiss is owned by the host (outside-click / Esc / selection-collapse); the
+ * popover only emits `dismiss` on its own Close / Discard / after-Accept.
  */
 @Component({
   selector: "app-note-brain-popover",
@@ -103,22 +123,32 @@ export class NoteBrainPopoverComponent {
   readonly noteId = input.required<string>();
   /** The live selection + anchor rect. A new object re-positions + resets the flow. */
   readonly selection = input.required<PopoverSelection>();
-  /** Which actions are enabled (settings). Disabled actions are hidden. */
-  readonly toggles = input<AssistToggles>({
-    refine: true,
-    shorten: true,
-    enhance: true,
-  });
+  /**
+   * Which action ids are ENABLED (from Settings). A row not in this set is hidden
+   * from the menu; `custom` (the command-input escape hatch) is ALWAYS available
+   * regardless. The backend is still the real gate (a disabled action refuses
+   * `Unavailable`). Defaults to every catalog id enabled.
+   */
+  readonly enabledActions = input<ReadonlySet<string>>(
+    new Set(NOTE_ASSIST_CATALOG.map((a) => a.id)),
+  );
 
-  /** Accept: the editor applies the edit into the textarea + triggers autosave. */
+  /** Accept: the editor applies the outcome (replace/insert/copy/spinoff). */
   readonly accepted = output<AcceptedEdit>();
   /** The popover asked to close (Close / after Accept / Discard). */
   readonly dismiss = output<void>();
 
   /** Which phase the popover UI is in. */
-  readonly phase = signal<PhaseView>("actions");
-  /** The action currently running / shown (null in the picker phase). */
+  readonly phase = signal<PhaseView>("menu");
+  /** Compact (5 quick + More) vs expanded (all, grouped). */
+  readonly expanded = signal(false);
+  /** The live command-input filter text. */
+  readonly filter = signal("");
+  /** The open submenu's parent action id (tone / translate), else null. */
+  readonly submenuId = signal<string | null>(null);
+  /** The action currently running / shown, and its variant (for the run + result header). */
   readonly activeAction = signal<NoteAssistAction | null>(null);
+  readonly activeVariant = signal<string | null>(null);
   /** The animated step tracker. */
   readonly steps = signal<FlowStep[]>([]);
   /** The landed result (null until it arrives). */
@@ -129,6 +159,12 @@ export class NoteBrainPopoverComponent {
   /** The popover element, positioned after render. */
   private readonly popoverEl =
     viewChild<ElementRef<HTMLDivElement>>("popover");
+  /** The command input, focused after the menu renders. */
+  private readonly cmdInput =
+    viewChild<ElementRef<HTMLInputElement>>("cmdInput");
+
+  /** Static catalog references for the template. */
+  protected readonly groups = NOTE_ASSIST_GROUPS;
 
   /**
    * Monotonic request token — a late `noteAssistantAction` reply for a
@@ -144,16 +180,66 @@ export class NoteBrainPopoverComponent {
   /** The original selected text — the diff's "before" side. */
   readonly original = computed(() => this.selection().text);
 
-  /** Whether at least one action is enabled (else the picker is empty → dismiss). */
-  readonly anyActionEnabled = computed(() => {
-    const t = this.toggles();
-    return t.refine || t.shorten || t.enhance;
+  /** Only the enabled catalog entries (a disabled action is hidden from the menu). */
+  private readonly enabledCatalog = computed<readonly NoteAssistCatalogEntry[]>(
+    () => {
+      const on = this.enabledActions();
+      return NOTE_ASSIST_CATALOG.filter((a) => on.has(a.id));
+    },
+  );
+
+  /** The compact-default quick set (enabled ∩ quick), in catalog order. */
+  readonly quickActions = computed(() =>
+    this.enabledCatalog().filter((a) => a.quick),
+  );
+
+  /**
+   * The rows shown in the current menu view, keyed by the trimmed filter:
+   * - filter present → fuzzy matches (label + desc), across ALL enabled actions.
+   * - compact → the quick set only.
+   * - expanded → all enabled actions (rendered grouped by the template).
+   */
+  readonly filterHits = computed<readonly NoteAssistCatalogEntry[]>(() => {
+    const f = this.filter().trim().toLowerCase();
+    if (!f) {
+      return [];
+    }
+    return this.enabledCatalog().filter((a) =>
+      `${a.label} ${a.desc}`.toLowerCase().includes(f),
+    );
   });
 
-  /** Whether the current result is the additive-enhance shape (insert, not replace). */
-  readonly isEnhanceResult = computed(
-    () => this.result()?.action === "enhance",
-  );
+  /** True when the filter is non-empty (drives the custom row + filtered list). */
+  readonly filtering = computed(() => this.filter().trim().length > 0);
+
+  /** The enabled actions for one group (for the expanded grouped view). */
+  groupActions(group: NoteAssistGroup): readonly NoteAssistCatalogEntry[] {
+    return this.enabledCatalog().filter((a) => a.group === group);
+  }
+
+  /** The open submenu's parent entry (tone / translate), or null. */
+  readonly submenu = computed<NoteAssistCatalogEntry | null>(() => {
+    const id = this.submenuId();
+    return id ? (noteAssistEntry(id) ?? null) : null;
+  });
+
+  /** The header caption for the result / submenu / running phases. */
+  readonly headerCaption = computed<string | null>(() => {
+    const phase = this.phase();
+    if (phase === "submenu") {
+      return this.submenu()?.label ?? null;
+    }
+    if (phase === "running" || phase === "result" || phase === "error") {
+      const action = this.activeAction();
+      if (!action) {
+        return null;
+      }
+      const base = action === "custom" ? "Custom" : (noteAssistEntry(action)?.label ?? action);
+      const variant = this.activeVariant();
+      return variant ? `${base} · ${variant}` : base;
+    }
+    return null;
+  });
 
   constructor() {
     // Re-position + reset the flow whenever a NEW selection arrives. Positioning
@@ -161,55 +247,103 @@ export class NoteBrainPopoverComponent {
     // writes orchestrated off the input — a legitimate signal-writing effect (T1).
     effect(() => {
       this.selection(); // track
-      // A fresh selection supersedes any in-flight action and returns to the picker.
+      // A fresh selection supersedes any in-flight action and returns to the menu.
       this.requestSeq++;
       this.clearStepTimers();
-      this.phase.set("actions");
+      this.phase.set("menu");
+      this.expanded.set(false);
+      this.filter.set("");
+      this.submenuId.set(null);
       this.activeAction.set(null);
+      this.activeVariant.set(null);
       this.steps.set([]);
       this.result.set(null);
       this.errorMsg.set(null);
       this.reposition();
+      this.focusInput();
     });
-    // Also re-position after the phase changes (the popover grows/shrinks).
+    // Also re-position after the phase / density changes (the popover grows/shrinks).
     effect(() => {
       this.phase();
+      this.expanded();
+      this.filtering();
       this.reposition();
     });
     this.destroyRef.onDestroy(() => this.clearStepTimers());
   }
 
-  /** Human labels for the action buttons + the diff header. */
-  protected actionLabel(action: NoteAssistAction): string {
-    switch (action) {
-      case "refine":
-        return "Refine";
-      case "shorten":
-        return "Shorten";
-      case "enhance":
-        return "Enhance context";
+  // ── Menu navigation ──────────────────────────────────────────────────────
+
+  /** The command input changed — track the filter (drives the live-filtered list). */
+  onFilterInput(event: Event): void {
+    this.filter.set((event.target as HTMLInputElement).value);
+  }
+
+  /** Enter with text in the command input → run it as a free-text custom instruction. */
+  onFilterKeydown(event: KeyboardEvent): void {
+    if (event.key === "Enter" && this.filter().trim().length > 0) {
+      event.preventDefault();
+      void this.runCustom(this.filter().trim());
     }
+  }
+
+  /** Expand the compact menu to the full grouped list. */
+  showMore(): void {
+    this.expanded.set(true);
+    this.reposition();
+  }
+
+  /** A row was chosen: open its submenu (variant actions) or run it. */
+  choose(entry: NoteAssistCatalogEntry): void {
+    if (entry.sub) {
+      this.submenuId.set(entry.id);
+      this.phase.set("submenu");
+      return;
+    }
+    void this.run(entry.id, null);
+  }
+
+  /** Back out of a submenu to the menu. */
+  back(): void {
+    this.submenuId.set(null);
+    this.phase.set("menu");
+  }
+
+  /** Run a submenu variant (a tone / a target language). */
+  runVariant(entry: NoteAssistCatalogEntry, variant: string): void {
+    void this.run(entry.id, variant);
+  }
+
+  // ── Running an action ────────────────────────────────────────────────────
+
+  /** Run a free-text custom instruction from the command input. */
+  private async runCustom(instruction: string): Promise<void> {
+    await this.run("custom", null, instruction);
   }
 
   /**
    * Run one assistant action. Animates the leading steps optimistically while the
    * single `noteAssistantAction` await is in flight, then lands the REAL result
-   * (filling the enhance `Found N related` count from `citations.length`). A
-   * fresh request bumps `requestSeq`; a late reply for a superseded request/action
-   * is dropped.
+   * (filling a `Found N related` step from `citations.length` for retrieval
+   * actions). A fresh request bumps `requestSeq`; a late reply for a superseded
+   * request/action is dropped.
    */
-  async run(action: NoteAssistAction): Promise<void> {
+  async run(
+    action: NoteAssistAction,
+    variant: string | null,
+    instruction?: string,
+  ): Promise<void> {
     const seq = ++this.requestSeq;
     this.clearStepTimers();
     this.activeAction.set(action);
+    this.activeVariant.set(variant);
     this.phase.set("running");
     this.result.set(null);
     this.errorMsg.set(null);
 
-    const labels =
-      action === "enhance"
-        ? ["Reading selection", "Searching your brain", "Drafting"]
-        : ["Reading selection", "Drafting"];
+    const labels = RETRIEVAL_ACTIONS.has(action)
+      ? ["Reading selection", "Searching your brain", "Drafting"]
+      : ["Reading selection", "Drafting"];
     this.steps.set(
       labels.map((label, i) => ({
         id: this.nextStepId++,
@@ -227,16 +361,18 @@ export class NoteBrainPopoverComponent {
         selection: sel.text,
         before: sel.before,
         after: sel.after,
+        variant: variant ?? undefined,
+        instruction: instruction ?? undefined,
       });
       if (seq !== this.requestSeq) {
         return; // superseded — a newer selection/action took over.
       }
-      // Land the real result: mark every step done, then, for enhance, append the
-      // real "Found N related" step from the actual citation count.
+      // Land the real result: mark every step done, then, for retrieval actions
+      // that returned citations, append the real "Found N related" step.
       this.clearStepTimers();
       this.steps.update((steps) => {
         const done = steps.map((s) => ({ ...s, state: "done" as const }));
-        if (action === "enhance") {
+        if (RETRIEVAL_ACTIONS.has(action) && res.citations.length > 0) {
           done.push({
             id: this.nextStepId++,
             label: `Found ${res.citations.length} related`,
@@ -291,13 +427,49 @@ export class NoteBrainPopoverComponent {
     advance(0);
   }
 
-  /** Accept the suggestion — the editor applies it + autosaves; then dismiss. */
-  accept(): void {
+  // ── Result actions ───────────────────────────────────────────────────────
+
+  /** replace: apply the suggestion over the selection, then dismiss. */
+  acceptReplace(): void {
     const res = this.result();
     if (!res) {
       return;
     }
-    this.accepted.emit({ action: res.action, suggestion: res.suggestion });
+    this.accepted.emit({ kind: "replace", suggestion: res.suggestion });
+    this.dismiss.emit();
+  }
+
+  /** insert / "Insert as note": append the suggestion after the selection, then dismiss. */
+  acceptInsert(): void {
+    const res = this.result();
+    if (!res) {
+      return;
+    }
+    this.accepted.emit({ kind: "insert", suggestion: res.suggestion });
+    this.dismiss.emit();
+  }
+
+  /** Copy the answer/draft body to the clipboard (draft follow-up / an info answer). */
+  copyResult(): void {
+    const res = this.result();
+    if (!res) {
+      return;
+    }
+    this.accepted.emit({ kind: "copy", text: res.suggestion });
+    this.dismiss.emit();
+  }
+
+  /** Spin-off note: create a note from the artifact title + body and open it. */
+  createNote(): void {
+    const res = this.result();
+    if (!res) {
+      return;
+    }
+    this.accepted.emit({
+      kind: "spinoff",
+      title: (res.title ?? "").trim() || "Untitled",
+      body: res.suggestion,
+    });
     this.dismiss.emit();
   }
 
@@ -306,20 +478,27 @@ export class NoteBrainPopoverComponent {
     this.dismiss.emit();
   }
 
-  /** Retry the current action (fresh request id). */
+  /** Retry the current action (fresh request id, same action/variant). */
   retry(): void {
     const action = this.activeAction();
     if (action) {
-      void this.run(action);
+      void this.run(action, this.activeVariant());
     }
   }
 
   /** Open a citation's source note/meeting; dismiss the popover first. */
   openCitation(cite: NoteCitation): void {
     this.dismiss.emit();
-    const path = cite.kind === "note" ? "/notes" : "/meeting";
+    const path =
+      cite.kind === "meeting"
+        ? "/meeting"
+        : cite.kind === "person" || cite.kind === "entity"
+          ? "/graph"
+          : "/notes";
     void this.router.navigate([path, cite.id]);
   }
+
+  // ── Positioning + teardown ───────────────────────────────────────────────
 
   /** Reposition the popover ABOVE the selection rect (flips below if no room). */
   reposition(): void {
@@ -348,6 +527,18 @@ export class NoteBrainPopoverComponent {
 
         el.style.left = `${Math.round(left)}px`;
         el.style.top = `${Math.round(Math.max(POPOVER_GAP, top))}px`;
+      },
+      { injector: this.injector },
+    );
+  }
+
+  /** Focus the command input after the menu renders (menu phase only). */
+  private focusInput(): void {
+    afterNextRender(
+      () => {
+        if (this.phase() === "menu") {
+          this.cmdInput()?.nativeElement.focus();
+        }
       },
       { injector: this.injector },
     );
