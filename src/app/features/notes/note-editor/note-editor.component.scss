@@ -415,53 +415,6 @@
   font-size: 0.78rem;
 }
 
-/* Formatting toolbar. */
-.toolbar {
-  position: sticky;
-  top: 0;
-  z-index: 8;
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 2px;
-  padding: var(--space-1) var(--space-2);
-  margin-bottom: var(--space-3);
-  border: 1px solid var(--border-subtle);
-  border-radius: var(--radius-md);
-  background: var(--surface-overlay);
-}
-.tool {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  min-width: 30px;
-  height: 28px;
-  padding: 0 var(--space-2);
-  border: 0;
-  border-radius: var(--radius-sm);
-  background: transparent;
-  color: var(--text-secondary);
-  font: inherit;
-  font-size: 0.82rem;
-  font-weight: 550;
-  cursor: pointer;
-  transition: background var(--transition-fast), color var(--transition-fast);
-}
-.tool:hover {
-  background: var(--surface-hover);
-  color: var(--text-primary);
-}
-.tool:focus-visible {
-  outline: none;
-  box-shadow: 0 0 0 2px var(--accent-ring);
-}
-.tool-sep {
-  width: 1px;
-  height: 18px;
-  margin: 0 var(--space-1);
-  background: var(--border-subtle);
-}
-
 /* Body textarea (document surface) with CSS auto-grow. */
 .body-wrap {
   position: relative;
