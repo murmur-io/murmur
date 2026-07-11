@@ -8,7 +8,7 @@ description: Run, understand, and debug Murmur's CI — the local `scripts/ci.sh
 Murmur's "CI" is two layers of the SAME gate:
 
 - **`scripts/ci.sh`** — the **single source of truth** for what "green" means. Runs locally and is what every contributor / release must pass.
-- **`.github/workflows/ci.yml`** — a thin macOS wrapper that just calls `bash scripts/ci.sh`. The per-PR `gate` job runs the subset (`MURMUR_CI_SKIP_E2E=1`); the `full-gate` job (weekly + on-demand) runs the whole thing incl. the audio E2E.
+- **`.github/workflows/ci.yml`** — a thin macOS wrapper that just calls `bash scripts/ci.sh`. Since 2026-07-05 the per-PR `gate` job runs the COMPLETE ci.sh (release parity — incl. the audio E2E, with a cached whisper model + brew ffmpeg); the same job also runs weekly (schedule) and on-demand (`workflow_dispatch`). Node comes from `.nvmrc` (Angular 22 needs >= 24.15). `MURMUR_CI_SKIP_E2E=1` is a LOCAL iteration convenience only — CI never sets it.
 
 > **Golden rule:** to change WHAT CI checks, edit `scripts/ci.sh`. The workflow follows for free. Never add a check only to the YAML (see `/add-ci-gate`).
 
@@ -45,7 +45,7 @@ MURMUR_CI_SKIP_E2E=1 bash scripts/ci.sh
 
 ## Reproduce a red CI run locally (the #1 job)
 
-1. **Use the SAME command CI used.** PR gate red? → `MURMUR_CI_SKIP_E2E=1 bash scripts/ci.sh`. `full-gate` red? → full `bash scripts/ci.sh`. Matching the command rules out "works on my machine" drift.
+1. **Use the SAME command CI used.** CI gate red? → full `bash scripts/ci.sh` (that is what every PR runs since the release-parity change). For a fast local subset while iterating: `MURMUR_CI_SKIP_E2E=1 bash scripts/ci.sh`. Matching the command rules out "works on my machine" drift.
 2. **Read the failing step, not the summary.** ci.sh prints a `── <step> ──` banner before each; the first non-zero exit stops it (`set -euo pipefail`). Find the last banner — that's the culprit.
 3. **Pull the cloud log** when it's CI-only:
    ```bash
@@ -58,7 +58,7 @@ MURMUR_CI_SKIP_E2E=1 bash scripts/ci.sh
 
 - **Cold builds are slow, on purpose.** The mistralrs/candle/tokenizers ML tree is ALWAYS compiled (feature gates removed) → the first CI build (or after a deps bump / cache miss) pulls hundreds of MB. `Swatinem/rust-cache` keeps the incremental loop fast. Don't "fix" a slow cold build by ripping out the ML deps.
 - **`cargo clippy --all-targets` is BLOCKED as a bare command** by `.codex/hooks/block-bash.sh` (it thrashes the openssl/sqlcipher profile and times out in the iterate loop). It runs fine INSIDE `ci.sh` (allowed as `bash scripts/ci.sh`). To reproduce just clippy, run the whole `ci.sh` — don't call the raw clippy line.
-- **The E2E is heavy + host-specific.** `e2e-core.sh` downloads `ggml-base.en.bin` (~142 MB) and needs `say` + ffmpeg; the provider step falls back to a **stub note** when no `claude` CLI is present (so it passes in CI). That's why per-PR uses `MURMUR_CI_SKIP_E2E=1` and the full E2E is weekly/on-demand with a model cache.
+- **The E2E is heavy + host-specific.** `e2e-core.sh` downloads `ggml-base.en.bin` (~142 MB) and needs `say` + ffmpeg; the provider step falls back to a **stub note** when no `claude` CLI is present (so it passes in CI). In CI the model is `actions/cache`d and ffmpeg brew-installed, so the per-PR full gate stays affordable; locally, skip it while iterating with `MURMUR_CI_SKIP_E2E=1`.
 - **macOS-only steps.** `swiftc`/ScreenCaptureKit, whisper Metal, `say`, the universal build — a Linux runner would silently skip them. CI must stay on `macos-14`.
 - **`cargo audit`/`cargo deny` self-install** (via `cargo install`) if absent — slow. In CI they're pre-installed prebuilt (`taiki-e/install-action`); locally, the first run compiles them once.
 - **What CI can't prove — say so.** Real mic, live ScreenCaptureKit, Touch ID, lock-at-rest, screen-share auto-relock, notarization all need a **signed build on a real Mac**. A green gate is not evidence for them.
@@ -73,6 +73,6 @@ MURMUR_CI_SKIP_E2E=1 bash scripts/ci.sh
 | Guardrail hooks + meta-test | `.codex/hooks/` (`selftest.sh`, `block-bash.sh`, `secret-scan.sh`) |
 | Supply-chain policy | `deny.toml` |
 | Pinned Rust toolchain | `rust-toolchain.toml` (1.96.0 + clippy/rustfmt) |
-| The CI owner-agent | `.codex/agents/ci-cd-engineer.toml` |
+| The CI owner-agent | `.codex/agents/ci-cd-engineer.md` |
 
 Adding a step → `/add-ci-gate`. Authoring/altering the workflow → `/github-actions`. Cutting a release (CD) → `/release-murmur` (not this skill).

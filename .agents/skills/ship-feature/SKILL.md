@@ -1,12 +1,12 @@
 ---
 name: ship-feature
-description: The agentic feature-shipping discipline for Murmur (Tauri 2.11 Rust core + Angular 18 zoneless). Scope → (Workflow) plan → build backend and/or FE under the project conventions → ADVERSARIAL verify (an adversarial-verifier pass, plus a lock-security review when the change touches the lock/crypto/visibility path) → gates green (cargo test --lib, ng lint, ng build, scripts/ci.sh) → QueaT commit → PR to the `murmur` trunk. Use whenever the user wants to build, implement, add, or ship a feature/fix in Murmur end-to-end. Encodes the verify-before-trust discipline that caught 7 bugs.
+description: The agentic feature-shipping discipline for Murmur (Tauri 2.11 Rust core + Angular 22 zoneless). Scope → (Workflow) plan → build backend and/or FE under the project conventions → ADVERSARIAL verify (an adversarial-verifier pass, plus a lock-security review when the change touches the lock/crypto/visibility path) → gates green (cargo test --lib, ng lint, ng build, scripts/ci.sh) → QueaT commit → PR to the `murmur` trunk. Use whenever the user wants to build, implement, add, or ship a feature/fix in Murmur end-to-end. Encodes the verify-before-trust discipline that caught 7 bugs.
 ---
 
 # /ship-feature — ship a Murmur feature end-to-end
 
 You are shipping a change into **Murmur** (Rust crate `murmur` / bin `Murmur` / lib
-`meetnotes_lib` + Angular 18 zoneless). The job is not "write code" — it is "land a
+`meetnotes_lib` + Angular 22 zoneless). The job is not "write code" — it is "land a
 **verified** change behind the project's gates and identity rules." The non-obvious value
 here is **adversarial verification**: the team distrusts AI-written, self-certified code, and
 this loop's adversarial pass is what previously **caught 7 bugs** that the implementing agent
@@ -128,7 +128,7 @@ in `ci.sh`, NOT the inner loop — see `/tauri-dev`.)
 ### 5b. Extract the lesson (close the loop)
 If verification caught anything real — or the run confirmed a non-obvious approach that worked —
 append ONE `## Run journal` entry to the relevant `.codex/learnings/<agent>.md` (or run
-the `murmur-learn` skill with `<agent>: <lesson>`), citing the artifact that revealed it. Periodically `murmur-curate-learnings`
+`/learn <agent>: <lesson>`), citing the artifact that revealed it. Periodically `/curate-learnings`
 promotes repeat offenders into `## Recurring patterns`. This is what makes "every bug a permanent
 lesson" instead of a re-paid one.
 
@@ -138,7 +138,7 @@ git checkout -b feat/<slug>      # never commit on the murmur trunk (block-bash.
 git add -A && git commit -m "<type>(<scope>): <subject>"
 git log -1 --format='%an <%ae>'  # MUST be QueaT <kgm004a@gmail.com>
 ```
-**No AI co-author trailers.** Conventional-commit style
+**No `Co-Authored-By: Codex` / no Codex trailers.** Conventional-commit style
 (`feat`/`fix`/`chore(scope)`), matching the existing log.
 
 ### 7. PR to the `murmur` trunk (never direct push)
@@ -159,7 +159,7 @@ hand off to **`/release-murmur`**.
 - **Conventions are binding** — the Rust (AppError/Result, additive migrations,
   verify-before-destroy, gated reads, crash-safe FFI) and Angular-zoneless (signals/`@if`/
   `toSignal`/no-`setTimeout`/no-new-deps) rules above are non-negotiable.
-- **Identity interlocks:** commit author=QueaT (no AI co-author trailers), gh=JakubGawr, PR base
+- **Identity interlocks:** commit author=QueaT (no Codex trailers), gh=JakubGawr, PR base
   =`murmur`, `com.meetnotes.app` immutable.
 - **Honest about the signed-build boundary.** A dev run cannot prove Touch ID / lock-at-rest /
   screen-share — say so; only a Developer-ID build verifies them (`/release-murmur`).
