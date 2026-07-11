@@ -5,9 +5,10 @@ import { mockTauri } from "../settings-ai/mock-invoke";
  * FE smoke for the "org-editable-and-fresh" work against the mocked Tauri IPC
  * (no Rust core). Covers:
  *   B1 — the org-item viewer Back button navigates to /notes (was a no-op).
- *   F1 — org (Shared Brain) items appear in the Library: a "Shared brains" rail
- *        section + merged in the all-meetings list; selecting an org shows only
- *        its items.
+ *   F1 — the Library (Meetings) view is RECORDINGS ONLY: even with org statuses +
+ *        items mocked, it shows NO "Shared brains" rail and merges NO org items
+ *        (org content lives in the Notes view). This inverts the old 0.9.5
+ *        org-in-Meetings unification, per the product decision.
  *   F2 — the /org-item viewer resolves the local source and redirects the AUTHOR
  *        (org_resolve_source → { kind:'document' }) to /notes/:id; a null resolve
  *        renders the read-only view (F3) with the metadata strip.
@@ -47,34 +48,42 @@ const ORG_ITEMS = () => [
 ];
 
 test.describe("org-editable + library unification (mocked IPC)", () => {
-  test("F1 — Library shows the Shared brains rail + merged org items", async ({
+  test("F1 — Library (Meetings) is recordings ONLY: no Shared brains, no org items", async ({
     page,
   }) => {
     await mockTauri(page, {
       org_refresh: () => null,
+      // Org statuses + items are mocked but MUST be ignored by the Meetings view.
       org_list_statuses: ORG_STATUSES,
       list_org_items: ORG_ITEMS,
+      list_meetings: () => [
+        {
+          id: "m-1",
+          startedAt: "2026-07-11T09:00:00Z",
+          endedAt: "2026-07-11T09:30:00Z",
+          title: "Weekly sync recording",
+          durationS: 1800,
+          audioPath: null,
+          status: "done",
+          folderId: null,
+        },
+      ],
     });
     await page.goto("/library");
 
-    // The rail "Shared brains" section + the org row render.
-    await expect(page.getByText("Shared brains")).toBeVisible({
+    // The recording renders — this IS the Meetings view.
+    await expect(page.getByText("Weekly sync recording")).toBeVisible({
       timeout: 10_000,
     });
-    await expect(page.locator(".org-row", { hasText: "Acme Inc." })).toBeVisible();
 
-    // The all-meetings list MERGES org items — an org card links to /org-item/:id.
-    await expect(
-      page.locator("a[href='/org-item/it-1']"),
-    ).toBeVisible();
-    await expect(page.getByText("Acme onboarding brief")).toBeVisible();
-
-    // Selecting the org narrows to ONLY that org's items (heading = org name).
-    await page.locator(".org-row", { hasText: "Acme Inc." }).click();
-    await expect(
-      page.locator(".library-head h2", { hasText: "Acme Inc." }),
-    ).toBeVisible();
-    await expect(page.locator("a[href='/org-item/it-2']")).toBeVisible();
+    // NO "Shared brains" rail section.
+    await expect(page.getByText("Shared brains")).toHaveCount(0);
+    // NO org rows, NO merged org cards, NO org-item links — org content is
+    // Notes-only now.
+    await expect(page.locator(".org-row")).toHaveCount(0);
+    await expect(page.locator("a[href^='/org-item/']")).toHaveCount(0);
+    await expect(page.getByText("Acme onboarding brief")).toHaveCount(0);
+    await expect(page.getByText("Pricing rework notes")).toHaveCount(0);
   });
 
   test("B1+F3 — read-only viewer (null resolve) renders + Back goes to /notes", async ({
