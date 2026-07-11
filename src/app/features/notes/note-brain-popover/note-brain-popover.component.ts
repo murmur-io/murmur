@@ -20,6 +20,7 @@ import type {
   NoteAssistResult,
   NoteCitation,
 } from "../../../core/models";
+import { TimerService } from "../../../services/timer.service";
 import { RepositionOnScrollDirective } from "./reposition-on-scroll.directive";
 
 /** The live text selection the popover acts on, plus its viewport anchor rect. */
@@ -95,6 +96,8 @@ export class NoteBrainPopoverComponent {
   private readonly injector = inject(Injector);
   private readonly destroyRef = inject(DestroyRef);
   private readonly router = inject(Router);
+  /** Root-owned timer service — the sanctioned home for the step-animation tick (rule §5). */
+  private readonly timers = inject(TimerService);
 
   /** The note being edited (for the assistant request). */
   readonly noteId = input.required<string>();
@@ -133,8 +136,8 @@ export class NoteBrainPopoverComponent {
    * resolution time (stale-result guard, trap #4).
    */
   private requestSeq = 0;
-  /** The step-animation timers to clear on teardown / supersede (no leak). */
-  private stepTimers: ReturnType<typeof setTimeout>[] = [];
+  /** The step-animation timer HANDLE IDS (from TimerService) to clear on teardown / supersede. */
+  private stepTimers: number[] = [];
   /** Monotonic id source for stable step `@for` keys. */
   private nextStepId = 1;
 
@@ -263,16 +266,16 @@ export class NoteBrainPopoverComponent {
   /**
    * Optimistically walk the step tracker forward while the IPC is in flight:
    * every ~520ms mark the running step done and start the next, stopping one
-   * short of the last so it stays "running" until the real result lands. Tracked
-   * timers cleared on supersede/teardown (no bare component setTimeout leak; the
-   * handles are owned + cleared here, the sanctioned tracked pattern).
+   * short of the last so it stays "running" until the real result lands. The tick
+   * is scheduled through the root {@link TimerService} (rule §5 — no bare component
+   * setTimeout); the returned handle ids are tracked + cleared on supersede/teardown.
    */
   private animateSteps(seq: number, count: number): void {
     const advance = (index: number): void => {
       if (seq !== this.requestSeq || index >= count - 1) {
         return;
       }
-      const handle = setTimeout(() => {
+      const handle = this.timers.after(520, () => {
         if (seq !== this.requestSeq) {
           return;
         }
@@ -288,7 +291,7 @@ export class NoteBrainPopoverComponent {
           }),
         );
         advance(index + 1);
-      }, 520);
+      });
       this.stepTimers.push(handle);
     };
     advance(0);
@@ -356,10 +359,10 @@ export class NoteBrainPopoverComponent {
     );
   }
 
-  /** Clear + forget every pending step-animation timer. */
+  /** Clear + forget every pending step-animation timer (through the TimerService). */
   private clearStepTimers(): void {
     for (const handle of this.stepTimers) {
-      clearTimeout(handle);
+      this.timers.clear(handle);
     }
     this.stepTimers = [];
   }

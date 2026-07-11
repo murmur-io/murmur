@@ -6,7 +6,7 @@
   align-items: center;
   justify-content: center;
   padding: var(--space-5);
-  background: rgba(0, 0, 0, 0.5);
+  background: var(--scrim);
 }
 
 /* Floating modal → OPAQUE (trap T3): never the frosted .card, or the note list

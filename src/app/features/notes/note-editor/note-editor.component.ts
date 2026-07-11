@@ -1250,7 +1250,19 @@ export class NoteEditorComponent {
       const insert = `\n\n${edit.suggestion.trim()}\n`;
       this.replaceRange(el, end, end, insert, end + insert.length, end + insert.length);
     } else {
-      this.replaceRange(el, start, end, edit.suggestion, start, start + edit.suggestion.length);
+      // COLLAPSE the caret to the END of the inserted suggestion (WT-F1 fix). Re-SELECTING the
+      // suggestion (start..start+len) makes `setSelectionRange` queue a `select` event that fires
+      // AFTER `clearSelection()` below — with a live non-empty selection but a null `sel()`, so the
+      // unchanged-selection guard in `onBodySelect` can't fire and the bubble RE-FLOATS after Accept.
+      // A collapsed caret leaves no selection → the queued `select` closes cleanly → bubble stays gone.
+      this.replaceRange(
+        el,
+        start,
+        end,
+        edit.suggestion,
+        start + edit.suggestion.length,
+        start + edit.suggestion.length,
+      );
     }
     this.clearSelection();
   }
