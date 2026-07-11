@@ -79,6 +79,41 @@
         />
       }
     </div>
+
+    <!-- ===== Shared brains (orgs) — read-only replicated org items ===== -->
+    @if (orgs().length > 0) {
+      <div class="folders-head org-head">
+        <h3 class="folders-title">Shared brains</h3>
+      </div>
+      <nav class="folders-body org-body" aria-label="Shared brains">
+        @for (org of orgs(); track org.orgId) {
+          <button
+            type="button"
+            class="org-row"
+            [class.is-selected]="activeOrgId() === org.orgId"
+            [attr.aria-pressed]="activeOrgId() === org.orgId"
+            (click)="selectOrg(org.orgId)"
+          >
+            <span class="org-icon" aria-hidden="true">
+              <svg viewBox="0 0 16 16" width="15" height="15" fill="none">
+                <circle cx="5" cy="6" r="2" stroke="currentColor" stroke-width="1.3" />
+                <circle cx="11" cy="6" r="2" stroke="currentColor" stroke-width="1.3" />
+                <path
+                  d="M2 13c0-1.8 1.3-3 3-3s3 1.2 3 3M8 13c0-1.8 1.3-3 3-3s3 1.2 3 3"
+                  stroke="currentColor"
+                  stroke-width="1.3"
+                  stroke-linecap="round"
+                />
+              </svg>
+            </span>
+            <span class="org-name">{{ org.name }}</span>
+            <span class="pill org-role" [title]="orgRoleLabel(org)">{{
+              orgRoleLabel(org)
+            }}</span>
+          </button>
+        }
+      </nav>
+    }
   </mur-sidebar>
 
   <!-- ============ RIGHT PANE — search, filters, meeting list ============ -->
@@ -237,8 +272,8 @@
         @if (activeFolderExposure(); as exp) {
           <app-lock-badge [exposure]="exp" />
         }
-        @if (!listLoading() && displayedMeetings().length > 0) {
-          <span class="count">{{ displayedMeetings().length }}</span>
+        @if (!listLoading() && !listEmpty()) {
+          <span class="count">{{ listItems().length }}</span>
         }
         @if (storageReport(); as sr) {
           @if (sr.limitBytes !== null) {
@@ -263,9 +298,17 @@
         <div class="card state-card">
           <p class="empty">Loading…</p>
         </div>
-      } @else if (displayedMeetings().length === 0) {
+      } @else if (listEmpty()) {
         <div class="card empty-state">
-          @if (activeFolderId() !== null) {
+          @if (activeOrg(); as org) {
+            <!-- An org is selected but its shared brain has no items yet. -->
+            <span class="empty-mark" aria-hidden="true"></span>
+            <p class="empty-title">Nothing shared yet</p>
+            <p class="empty">
+              No one has shared into “{{ org.name }}” yet. Shared items appear
+              here automatically as they sync.
+            </p>
+          } @else if (activeFolderId() !== null) {
             <!-- ACTIONABLE empty folder: on-brand "drop here" illustration
                  plus the two concrete ways to file a note. -->
             <span class="empty-illo" aria-hidden="true">
@@ -357,13 +400,16 @@
         </div>
       } @else {
         <ul class="list card">
-          @for (m of displayedMeetings(); track m.id; let i = $index) {
-            <li
-              class="row-item"
-              [class.is-confirming]="pendingDeleteId() === m.id"
-              [class.is-dragging]="draggingId() === m.id"
-              [class.is-menu-open]="movePopoverId() === m.id"
-            >
+          @for (it of listItems(); track it.id; let i = $index) {
+            @switch (it.kind) {
+              @case ("meeting") {
+                @let m = it.meeting;
+                <li
+                  class="row-item"
+                  [class.is-confirming]="pendingDeleteId() === m.id"
+                  [class.is-dragging]="draggingId() === m.id"
+                  [class.is-menu-open]="movePopoverId() === m.id"
+                >
               <a
                 class="row"
                 [routerLink]="['/meeting', m.id]"
@@ -574,6 +620,75 @@
                 </div>
               }
             </li>
+              }
+              @case ("org") {
+                <!-- A READ-ONLY org (Shared Brain) replica — opens the /org-item
+                     viewer (which routes the AUTHOR to their editable source).
+                     No folder-chip / delete / drag / lock affordances. -->
+                <li class="row-item row-item--org">
+                  <a
+                    class="row row--org"
+                    [routerLink]="['/org-item', it.item.itemId]"
+                    [style.animation-delay.ms]="i * 45"
+                  >
+                    <span class="row-main">
+                      <span class="title-row">
+                        <span class="title">{{
+                          it.item.title || "(untitled)"
+                        }}</span>
+                      </span>
+                      <span class="meta">
+                        @if (it.item.authorHint) {
+                          <span class="date">Shared by {{ it.item.authorHint }}</span>
+                          <span class="dot" aria-hidden="true">·</span>
+                        }
+                        <span class="date">{{
+                          formatOrgDate(it.item.createdAt)
+                        }}</span>
+                      </span>
+                    </span>
+                    <span class="row-aside">
+                      <span
+                        class="pill org-badge"
+                        [title]="'Shared brain · ' + it.orgName"
+                      >
+                        <svg
+                          class="org-badge-glyph"
+                          viewBox="0 0 16 16"
+                          width="11"
+                          height="11"
+                          fill="none"
+                          aria-hidden="true"
+                        >
+                          <circle
+                            cx="5"
+                            cy="6"
+                            r="1.6"
+                            stroke="currentColor"
+                            stroke-width="1.2"
+                          />
+                          <circle
+                            cx="11"
+                            cy="6"
+                            r="1.6"
+                            stroke="currentColor"
+                            stroke-width="1.2"
+                          />
+                          <path
+                            d="M2.5 12c0-1.5 1.1-2.5 2.5-2.5s2.5 1 2.5 2.5M8.5 12c0-1.5 1.1-2.5 2.5-2.5s2.5 1 2.5 2.5"
+                            stroke="currentColor"
+                            stroke-width="1.2"
+                            stroke-linecap="round"
+                          />
+                        </svg>
+                        {{ it.orgName }}
+                      </span>
+                      <span class="chevron" aria-hidden="true">›</span>
+                    </span>
+                  </a>
+                </li>
+              }
+            }
           }
         </ul>
       }

@@ -779,6 +779,94 @@
   }
 }
 
+/* --- Rail: "Shared brains" (orgs) section --- */
+/* A quiet divider above the section so it reads as a distinct group. */
+.org-head {
+  margin-top: var(--space-3);
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--border-subtle);
+}
+/* Sits under the folder tree; no own scroll. */
+.org-body {
+  flex: 0 0 auto;
+  overflow: visible;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.org-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  width: 100%;
+  padding: var(--space-2);
+  border: 0;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 0.9rem;
+  text-align: left;
+  cursor: pointer;
+  transition: background var(--transition-fast), color var(--transition-fast);
+}
+.org-row:hover {
+  background: var(--surface-hover);
+  color: var(--text-primary);
+}
+.org-row:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+.org-row.is-selected {
+  background: var(--accent-soft);
+  color: var(--text-primary);
+}
+.org-icon {
+  flex: none;
+  display: inline-flex;
+  color: var(--text-muted);
+}
+.org-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* A quiet role hint (Owner / Member) trailing the org name. */
+.org-role {
+  flex: none;
+  margin-left: auto;
+  font-size: 0.62rem;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  background: var(--surface-raised);
+}
+
+/* --- List: org (Shared Brain) row --- */
+/* The org row has no delete button → no right-side reserve; the "shared brain"
+   origin badge is a neutral raised surface with the org name. */
+.row-item--org .row--org {
+  padding-right: var(--space-4);
+}
+.org-badge {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  max-width: 16ch;
+  overflow: hidden;
+  color: var(--text-secondary);
+  background: var(--surface-raised);
+  border: 1px solid var(--border-subtle);
+  font-size: 0.7rem;
+  font-weight: 600;
+}
+.org-badge-glyph {
+  flex: none;
+  color: var(--text-muted);
+}
+
 /* Honor reduced-motion everywhere: no rail slide / content stagger (the
    surface is opaque from frame 1, so entry is instant with no flash), and
    no in-flow rise on the popover / empty illustration. */

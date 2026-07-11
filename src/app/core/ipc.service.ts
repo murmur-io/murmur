@@ -90,6 +90,7 @@ import type {
   OrgShareEntry,
   OrgItemDetail,
   OrgItemHeader,
+  OrgSourceRef,
   OrgSyncReport,
   OrgFeedUpdatedPayload,
   ActiveSharesReport,
@@ -665,6 +666,18 @@ export class IpcService {
   /** The full decrypted org item for the read-only viewer route. */
   orgGetItem(itemId: string): Promise<OrgItemDetail> {
     return invoke<OrgItemDetail>("org_get_item", { itemId });
+  }
+
+  /**
+   * Resolve an org item back to THIS device's local editable source (the note or
+   * meeting it was shared FROM), or `null` when the caller is NOT the author (no
+   * local source). Lets the `/org-item/:id` viewer send an author straight to
+   * their editable original (`/notes/:id` or `/meeting/:id`, whose edits
+   * re-publish) while a non-author gets the read-only replica view. Mirrors
+   * `org_resolve_source`.
+   */
+  orgResolveSource(itemId: string): Promise<OrgSourceRef | null> {
+    return invoke<OrgSourceRef | null>("org_resolve_source", { itemId });
   }
 
   /**
