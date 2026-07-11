@@ -1468,13 +1468,19 @@ pub fn get_last_note(state: State<'_, AppState>) -> Result<Option<NoteDto>, AppE
 
 /// Replace a meeting note's markdown (in-app edit) and re-write the SAME vault file in
 /// place (no duplicate). Returns the updated note.
+///
+/// COMMIT BOUNDARY: after the local write succeeds, BEST-EFFORT re-publish any org shares of this
+/// meeting so a colleague sees the edit (never frozen at share time). Best-effort — a republish
+/// failure NEVER fails the save (`let _ = …`); the launch sweep retries a `failed` row.
 #[tauri::command]
-pub fn update_note(
+pub async fn update_note(
     state: State<'_, AppState>,
     meeting_id: String,
     markdown: String,
 ) -> Result<NoteDto, AppError> {
-    update_note_inner(state.inner(), &meeting_id, &markdown)
+    let dto = update_note_inner(state.inner(), &meeting_id, &markdown)?;
+    let _ = republish_org_shares_for_source(state.inner(), Some(&meeting_id), None).await;
+    Ok(dto)
 }
 
 /// Inner of [`update_note`] taking `&AppState` — the FULL command body (gate + lifecycle guard +
@@ -2455,14 +2461,20 @@ pub(crate) fn list_notes_inner(
 /// Update a note's title + markdown (write path). WRITE-GATED. Bumps `updated_at`, PURGES the old
 /// `doc_chunks` and re-chunks+re-embeds the new BODY (front-matter stripped) so the note stays a
 /// first-class brain source, then re-exports the vault `.md`. Returns the fresh DTO.
+///
+/// COMMIT BOUNDARY (authored-note full save): after the local write succeeds, BEST-EFFORT re-publish
+/// any org shares of this note (never freeze the org copy at share time). NOT the debounced
+/// `save_note_text` autosave (OCK-seal + egress per keystroke is unacceptable) — only this commit path.
 #[tauri::command]
-pub fn update_note_doc(
+pub async fn update_note_doc(
     state: State<'_, AppState>,
     id: String,
     title: String,
     markdown: String,
 ) -> Result<NoteDoc, AppError> {
-    update_note_doc_inner(state.inner(), &id, &title, &markdown)
+    let doc = update_note_doc_inner(state.inner(), &id, &title, &markdown)?;
+    let _ = republish_org_shares_for_source(state.inner(), None, Some(&id)).await;
+    Ok(doc)
 }
 
 /// Inner of [`update_note_doc`] taking `&AppState` (unit-testable gate).
@@ -7903,6 +7915,9 @@ pub async fn resummarize(
         ));
     }
     let result = pipeline::resummarize_existing(&app, &state, &meeting_id).await?;
+    // COMMIT BOUNDARY: a re-summarize rewrites the meeting's note → BEST-EFFORT re-publish any org
+    // shares of it so members see the fresh summary. Best-effort — never fails the re-summarize.
+    let _ = republish_org_shares_for_source(state.inner(), Some(&meeting_id), None).await;
     Ok(StopResult {
         meeting_id: result.meeting_id,
         markdown: result.note_markdown,
@@ -22609,6 +22624,104 @@ mod lifecycle_tests {
         );
     }
 
+    /// F-org-editable: `list_org_items_inner` ENRICHES an item the caller published with an
+    /// `owned_source` ref plus the source's CURRENT title (so the author's own card links to the
+    /// editable original and never shows a stale publish-time snapshot), while an item shared by
+    /// SOMEONE ELSE (no local share) stays a bare read-only replica. RED before the enrichment
+    /// (owned_source always None, title frozen).
+    #[test]
+    fn list_org_items_enriches_owned_items_with_editable_source_and_current_title() {
+        let state = build_state("org-list-owned");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        make_open_folder(&state.db, "f-own", "Team");
+        // The author's local note, retitled to "Jest tytul" AFTER it was shared as "Untitled".
+        state
+            .db
+            .insert_note("n-own", "f-own", "Untitled", "Jest tytul", "# body", 1)
+            .unwrap();
+        // The received replica (frozen at publish time = "Untitled") + the matching OUTBOUND share.
+        state
+            .db
+            .upsert_org_item("item-own", "org-1", 2, "kgm004a", "Untitled", "# body", "2026-07-11T09:00:00Z", 1, 1, &[9u8; 32], None)
+            .unwrap();
+        state
+            .db
+            .insert_org_share("s-own", "org-1", None, Some("n-own"), "note", Some("Untitled"), 1, 1, &[9u8; 32], "2026-07-11T09:00:00Z")
+            .unwrap();
+        state
+            .db
+            .set_org_share_uploaded("s-own", "item-own", "2026-07-11T09:00:00Z")
+            .unwrap();
+        // Someone ELSE's replica — no local share ⇒ stays read-only, title untouched.
+        state
+            .db
+            .upsert_org_item("item-other", "org-1", 1, "kgm004a+2", "Ich notatka", "body", "2026-07-10T09:00:00Z", 1, 1, &[7u8; 32], None)
+            .unwrap();
+
+        let items = list_org_items_inner(&state, "org-1").unwrap();
+        let own = items.iter().find(|i| i.item_id == "item-own").unwrap();
+        assert_eq!(
+            own.title, "Jest tytul",
+            "owned item shows the source's CURRENT title, not the stale snapshot"
+        );
+        let owned = own.owned_source.as_ref().expect("owned item carries a source ref");
+        assert_eq!(owned.kind, "document");
+        assert_eq!(owned.id, "n-own");
+
+        let other = items.iter().find(|i| i.item_id == "item-other").unwrap();
+        assert!(other.owned_source.is_none(), "a non-author's item is a read-only replica");
+        assert_eq!(other.title, "Ich notatka", "a non-owned title is left as-is");
+    }
+
+    /// F-org-editable GATE: an owned item whose source folder is LOCKED (not session-unlocked) is NOT
+    /// enriched — its current title must never leak through the org list, and it falls back to the
+    /// read-only replica (frozen snapshot title). RED before the `folder_is_unlocked` gate.
+    #[test]
+    fn list_org_items_does_not_leak_a_locked_owned_source_title() {
+        let state = build_state("org-list-owned-locked");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        // A LOCKED folder (never added to the session unlocked set).
+        state
+            .db
+            .insert_folder(&Folder {
+                id: "f-lock".to_string(),
+                name: "Vault".to_string(),
+                path: "Vault".to_string(),
+                parent_id: None,
+                locked: true,
+                created_at: "2026-06-27T08:00:00Z".to_string(),
+            })
+            .unwrap();
+        state
+            .db
+            .insert_note("n-lock", "f-lock", "secret", "Secret Title", "# body", 1)
+            .unwrap();
+        state
+            .db
+            .upsert_org_item("item-lock", "org-1", 1, "kgm004a", "Old Snapshot", "# body", "2026-07-11T09:00:00Z", 1, 1, &[5u8; 32], None)
+            .unwrap();
+        state
+            .db
+            .insert_org_share("s-lock", "org-1", None, Some("n-lock"), "note", Some("Old Snapshot"), 1, 1, &[5u8; 32], "2026-07-11T09:00:00Z")
+            .unwrap();
+        state
+            .db
+            .set_org_share_uploaded("s-lock", "item-lock", "2026-07-11T09:00:00Z")
+            .unwrap();
+
+        let items = list_org_items_inner(&state, "org-1").unwrap();
+        let it = items.iter().find(|i| i.item_id == "item-lock").unwrap();
+        assert!(
+            it.owned_source.is_none(),
+            "a locked owned source is not resolved (no editable link)"
+        );
+        assert_ne!(
+            it.title, "Secret Title",
+            "a locked source's current title must NOT leak into the org list"
+        );
+        assert_eq!(it.title, "Old Snapshot", "falls back to the frozen replica snapshot");
+    }
+
     /// FIX A (command gate): `list_org_items_inner` refuses an org the caller isn't a local member of
     /// (membership-checked via `resolve_org`) — never leaking another org's list — and returns the list
     /// for a member org.
@@ -23066,6 +23179,413 @@ mod lifecycle_tests {
             first.is_empty(),
             "no share landed under the FIRST org (RED on a .next() misroute — the row was under org-first)"
         );
+    }
+
+    // ── RE-PUBLISH-ON-EDIT (the stale-org-copy fix) — end-to-end against a MOCK org server ─────────
+
+    /// What a `MockOrgServer` recorded across a test: the sequence of published item ids (one per
+    /// `POST …/items`) and the set of tombstoned item ids (one per `DELETE …/items/{id}`). Lets a
+    /// republish test assert BOTH the new-item-published AND the old-item-tombstoned sides.
+    #[derive(Default)]
+    struct MockOrgLog {
+        published: Vec<String>,
+        tombstoned: Vec<String>,
+    }
+
+    /// A minimal in-process org server (tiny_http) that answers the THREE routes the org publish/
+    /// republish flow hits — `POST /v1/blobs`, `POST /v1/orgs/{id}/items` (mints a fresh item id +
+    /// monotonic seq), `DELETE /v1/orgs/{id}/items/{id}` — so the full seal→upload→publish→tombstone
+    /// chain runs headless WITHOUT a real backend. The OCK is pre-seeded into `org_ock_cache` so
+    /// `acquire_org_ock` never needs the (unmocked) key-grants endpoint. Shuts down on drop.
+    struct MockOrgServer {
+        base: String,
+        log: Arc<Mutex<MockOrgLog>>,
+        shutdown: Arc<AtomicBool>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl MockOrgServer {
+        fn start() -> Self {
+            let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+            let addr = server.server_addr();
+            let base = format!("http://{}/", addr.to_ip().unwrap());
+            let log = Arc::new(Mutex::new(MockOrgLog::default()));
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let log_t = Arc::clone(&log);
+            let shutdown_t = Arc::clone(&shutdown);
+            let handle = std::thread::spawn(move || {
+                let mut seq: u64 = 0;
+                let mut counter: u64 = 0;
+                loop {
+                    if shutdown_t.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    match server.recv_timeout(std::time::Duration::from_millis(50)) {
+                        Ok(Some(req)) => {
+                            let method = req.method().clone();
+                            let url = req.url().to_string();
+                            let path = url.split('?').next().unwrap_or("").to_string();
+                            // POST /v1/blobs → {"blobId": "..."}
+                            if method == tiny_http::Method::Post && path == "/v1/blobs" {
+                                counter += 1;
+                                let body = format!("{{\"blobId\":\"blob-{counter}\"}}");
+                                let resp = tiny_http::Response::from_string(body).with_header(
+                                    "Content-Type: application/json".parse::<tiny_http::Header>().unwrap(),
+                                );
+                                let _ = req.respond(resp);
+                                continue;
+                            }
+                            // POST /v1/orgs/{id}/items → {"itemId": "...", "seq": N} (fresh id each call)
+                            if method == tiny_http::Method::Post
+                                && path.starts_with("/v1/orgs/")
+                                && path.ends_with("/items")
+                            {
+                                seq += 1;
+                                let item_id = format!("item-{seq}");
+                                log_t.lock().unwrap().published.push(item_id.clone());
+                                let body = format!("{{\"itemId\":\"{item_id}\",\"seq\":{seq}}}");
+                                let resp = tiny_http::Response::from_string(body).with_header(
+                                    "Content-Type: application/json".parse::<tiny_http::Header>().unwrap(),
+                                );
+                                let _ = req.respond(resp);
+                                continue;
+                            }
+                            // DELETE /v1/orgs/{id}/items/{itemId} → 200 (tombstone)
+                            if method == tiny_http::Method::Delete
+                                && path.contains("/items/")
+                                && !path.ends_with("/items")
+                            {
+                                if let Some(item) = path.rsplit('/').next() {
+                                    log_t.lock().unwrap().tombstoned.push(item.to_string());
+                                }
+                                let _ = req.respond(tiny_http::Response::empty(200));
+                                continue;
+                            }
+                            let _ = req.respond(tiny_http::Response::empty(404));
+                        }
+                        Ok(None) => continue,
+                        Err(_) => break,
+                    }
+                }
+            });
+            Self {
+                base,
+                log,
+                shutdown,
+                handle: Some(handle),
+            }
+        }
+    }
+
+    impl Drop for MockOrgServer {
+        fn drop(&mut self) {
+            self.shutdown.store(true, Ordering::SeqCst);
+            if let Some(h) = self.handle.take() {
+                let _ = h.join();
+            }
+        }
+    }
+
+    /// Seed a live (non-expiring) session so `require_session_mk` / `valid_access_token` yield a bearer
+    /// with NO network refresh — the mock server never sees an auth call.
+    fn seed_live_session(state: &AppState) {
+        *state.account_session.lock().unwrap() = Some(crate::share::AccountSession {
+            account_id: "user@example.com".into(),
+            email: "user@example.com".into(),
+            server_user_id: Some("c534b6d2-02c1-4c2c-a256-3af8592b1567".into()),
+            device_id: "dev-1".into(),
+            mk: Zeroizing::new([7u8; 32]),
+            generation: 1,
+            access_token: "a".into(),
+            access_expires_at: Some("2099-01-01T00:00:00Z".into()),
+            refresh_token: "r".into(),
+        });
+    }
+
+    /// Pre-seed the session OCK cache for `(org_id, generation)` so `acquire_org_ock` hits the cache
+    /// and never touches the (unmocked) key-grants endpoint.
+    fn seed_ock(state: &AppState, org_id: &str, generation: u32) {
+        state
+            .org_ock_cache
+            .lock()
+            .unwrap()
+            .insert((org_id.to_string(), generation), Zeroizing::new([9u8; 32]));
+    }
+
+    /// ITEM 1 — the core republish-on-edit assertion. Share a DOC to a mock org (item rev 1, one
+    /// `uploaded` `org_shares` row), then EDIT the note body → the edit re-publishes as a NEW item at
+    /// rev 2, the SAME single org_shares row is repointed (new item_id, rev==2, new content hash), the
+    /// OLD item is tombstoned, and the egress ledger carries a publish+revoke pair. RED on the old code
+    /// (no edit path re-published → org copy frozen at rev 1); GREEN after.
+    #[test]
+    fn republish_bumps_rev_and_tombstones_old_on_edit() {
+        let mock = MockOrgServer::start();
+        let state = build_state("org-republish-edit");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        make_open_folder(&state.db, "f-rp", "Team");
+        state
+            .db
+            .insert_note("n-rp", "f-rp", "plan", "Q3 Plan", "# original body", 1)
+            .unwrap();
+
+        state.config.lock().unwrap().org_egress_consented = true;
+        state.config.lock().unwrap().share_base_url = mock.base.clone();
+        seed_live_session(&state);
+        seed_ock(&state, "org-1", 1);
+
+        // Initial share → item-1, rev 1, one uploaded row.
+        let entry = block_on(share_to_org_inner(
+            &state,
+            "org-1",
+            None,
+            Some("n-rp".to_string()),
+            true,
+        ))
+        .expect("initial share should publish against the mock server");
+        assert_eq!(entry.rev, 1, "first share is rev 1");
+        assert_eq!(entry.item_id.as_deref(), Some("item-1"));
+        let rows = state.db.list_org_shares_for_org("org-1").unwrap();
+        assert_eq!(rows.len(), 1, "one uploaded share row after the initial share");
+        assert_eq!(rows[0].state, "uploaded");
+        assert_eq!(rows[0].item_id.as_deref(), Some("item-1"));
+        let sha_before = rows[0].content_sha256.clone();
+
+        // EDIT the note body through the COMMIT boundary. The async command wrapper is exactly
+        // `update_note_doc_inner(..)?` then `republish_org_shares_for_source(..).await` — replicate
+        // those two steps (a real `tauri::State` can't be constructed in a unit test).
+        update_note_doc_inner(&state, "n-rp", "Q3 Plan", "# EDITED body — the org copy must reflect this")
+            .unwrap();
+        block_on(republish_org_shares_for_source(&state, None, Some("n-rp"))).unwrap();
+
+        // The edit superseded the org item: a NEW item published, rev bumped, SAME row repointed.
+        let after = state.db.list_org_shares_for_org("org-1").unwrap();
+        assert_eq!(
+            after.len(),
+            1,
+            "still ONE org_shares row after republish (no row amplification)"
+        );
+        assert_eq!(after[0].state, "uploaded");
+        assert_eq!(after[0].rev, 2, "rev bumped to 2 on the edit republish");
+        assert_eq!(
+            after[0].item_id.as_deref(),
+            Some("item-2"),
+            "the row was repointed to the NEW server item"
+        );
+        assert_ne!(
+            after[0].content_sha256, sha_before,
+            "content hash changed (the body was edited)"
+        );
+
+        // The mock server saw two publishes and the OLD item tombstoned.
+        let log = mock.log.lock().unwrap();
+        assert_eq!(log.published, vec!["item-1".to_string(), "item-2".to_string()]);
+        assert_eq!(
+            log.tombstoned,
+            vec!["item-1".to_string()],
+            "the OLD item (item-1) was tombstoned so members evict the stale copy"
+        );
+
+        // Egress ledger: two publishes + one revoke (all content-free).
+        assert_eq!(
+            state.db.count_share_egress_by_kind("org_share_publish").unwrap(),
+            2
+        );
+        assert_eq!(
+            state.db.count_share_egress_by_kind("org_share_revoke").unwrap(),
+            1
+        );
+    }
+
+    /// ITEM 1 — a republish MUST NOT tombstone-into-nothing. Lock the note's folder AFTER the share,
+    /// then edit (the write itself is gated, but even the republish read-gate refuses): the org copy is
+    /// left UNTOUCHED — no new publish, NO tombstone. Proves the `Locked` skip protects the org copy.
+    #[test]
+    fn republish_refuses_when_folder_locked() {
+        let mock = MockOrgServer::start();
+        let state = build_state("org-republish-locked");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        make_open_folder(&state.db, "f-lk", "Team");
+        state
+            .db
+            .insert_note("n-lk", "f-lk", "plan", "Plan", "# body", 1)
+            .unwrap();
+        state.config.lock().unwrap().org_egress_consented = true;
+        state.config.lock().unwrap().share_base_url = mock.base.clone();
+        seed_live_session(&state);
+        seed_ock(&state, "org-1", 1);
+
+        block_on(share_to_org_inner(
+            &state,
+            "org-1",
+            None,
+            Some("n-lk".to_string()),
+            true,
+        ))
+        .unwrap();
+
+        // Lock the folder (NOT session-unlocked) → the build_org_share_body read-gate refuses.
+        state
+            .db
+            .set_folder_locked("f-lk", true, Some(&b"wrapped"[..]))
+            .unwrap();
+
+        // Republish directly (an edit would be gated too; here we exercise the republish skip path).
+        block_on(republish_org_shares_for_source(&state, None, Some("n-lk"))).unwrap();
+
+        let rows = state.db.list_org_shares_for_org("org-1").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].rev, 1, "rev NOT bumped — republish skipped a locked source");
+        assert_eq!(
+            rows[0].item_id.as_deref(),
+            Some("item-1"),
+            "org copy left as-is (still item-1)"
+        );
+        let log = mock.log.lock().unwrap();
+        assert_eq!(log.published, vec!["item-1".to_string()], "no new publish");
+        assert!(log.tombstoned.is_empty(), "NEVER tombstone-into-nothing on a locked source");
+    }
+
+    /// ITEM 1 — unchanged content ⇒ NO egress. Re-save the IDENTICAL body → the content hash matches
+    /// the stored row → republish short-circuits: no new item, no tombstone, no egress ledger row.
+    #[test]
+    fn republish_noop_when_content_unchanged() {
+        let mock = MockOrgServer::start();
+        let state = build_state("org-republish-noop");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        make_open_folder(&state.db, "f-nc", "Team");
+        state
+            .db
+            .insert_note("n-nc", "f-nc", "plan", "Plan", "# same body", 1)
+            .unwrap();
+        state.config.lock().unwrap().org_egress_consented = true;
+        state.config.lock().unwrap().share_base_url = mock.base.clone();
+        seed_live_session(&state);
+        seed_ock(&state, "org-1", 1);
+
+        block_on(share_to_org_inner(
+            &state,
+            "org-1",
+            None,
+            Some("n-nc".to_string()),
+            true,
+        ))
+        .unwrap();
+        let publishes_before = state.db.count_share_egress_by_kind("org_share_publish").unwrap();
+
+        // Re-save the SAME body (title unchanged too) → identical envelope hash → no-op republish.
+        update_note_doc_inner(&state, "n-nc", "Plan", "# same body").unwrap();
+        block_on(republish_org_shares_for_source(&state, None, Some("n-nc"))).unwrap();
+
+        let rows = state.db.list_org_shares_for_org("org-1").unwrap();
+        assert_eq!(rows[0].rev, 1, "no rev bump on unchanged content");
+        assert_eq!(rows[0].item_id.as_deref(), Some("item-1"));
+        assert_eq!(
+            state.db.count_share_egress_by_kind("org_share_publish").unwrap(),
+            publishes_before,
+            "unchanged content ⇒ NO new publish egress"
+        );
+        let log = mock.log.lock().unwrap();
+        assert_eq!(log.published, vec!["item-1".to_string()], "no second publish");
+        assert!(log.tombstoned.is_empty(), "no tombstone on a no-op republish");
+    }
+
+    /// ITEM 6 — the MEETING arm: share a MEETING note → edit the meeting note via `update_note` → the
+    /// same supersede (new item rev 2, repointed row, old item tombstoned) fires for the meeting path.
+    #[test]
+    fn republish_meeting_note_bumps_rev_and_tombstones_old() {
+        let mock = MockOrgServer::start();
+        let state = build_state("org-republish-meeting");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        make_open_folder(&state.db, "f-mtg", "Team");
+        state
+            .db
+            .insert_meeting(&Meeting {
+                id: "m-rp".to_string(),
+                started_at: "2026-07-10T09:00:00Z".to_string(),
+                ended_at: None,
+                title: Some("Board strategy".to_string()),
+                duration_s: 600,
+                audio_path: None,
+                status: MeetingStatus::Summarized,
+                folder_id: Some("f-mtg".to_string()),
+            })
+            .unwrap();
+        state
+            .db
+            .upsert_note(&NoteRecord {
+                meeting_id: "m-rp".to_string(),
+                provider_id: "claude_code".to_string(),
+                markdown: "# meeting note original".to_string(),
+                created_at: "2026-07-10T09:10:00Z".to_string(),
+                exported_path: None,
+                model_requested: None,
+                model_served: None,
+                gateway_host: None,
+            })
+            .unwrap();
+        state.db.set_note_folder("m-rp", Some("f-mtg")).unwrap();
+
+        state.config.lock().unwrap().org_egress_consented = true;
+        state.config.lock().unwrap().share_base_url = mock.base.clone();
+        seed_live_session(&state);
+        seed_ock(&state, "org-1", 1);
+
+        block_on(share_to_org_inner(
+            &state,
+            "org-1",
+            Some("m-rp".to_string()),
+            None,
+            true,
+        ))
+        .unwrap();
+
+        // Edit the meeting note through the commit boundary (inner + republish, as the wrapper does).
+        update_note_inner(&state, "m-rp", "# meeting note EDITED").unwrap();
+        block_on(republish_org_shares_for_source(&state, Some("m-rp"), None)).unwrap();
+
+        let rows = state.db.list_org_shares_for_org("org-1").unwrap();
+        assert_eq!(rows.len(), 1, "one repointed row for the meeting share");
+        assert_eq!(rows[0].rev, 2, "meeting republish bumped rev to 2");
+        assert_eq!(rows[0].item_id.as_deref(), Some("item-2"));
+        assert_eq!(rows[0].meeting_id.as_deref(), Some("m-rp"));
+        let log = mock.log.lock().unwrap();
+        assert_eq!(log.published, vec!["item-1".to_string(), "item-2".to_string()]);
+        assert_eq!(log.tombstoned, vec!["item-1".to_string()]);
+    }
+
+    /// ITEM 2 — `org_resolve_source` maps an uploaded org item back to its LOCAL editable source, and
+    /// returns `None` for an unknown item id (a colleague's item this device never published).
+    #[test]
+    fn org_resolve_source_maps_item_to_local_source() {
+        let mock = MockOrgServer::start();
+        let state = build_state("org-resolve-source");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        make_open_folder(&state.db, "f-rs", "Team");
+        state
+            .db
+            .insert_note("n-rs", "f-rs", "plan", "Plan", "# body", 1)
+            .unwrap();
+        state.config.lock().unwrap().org_egress_consented = true;
+        state.config.lock().unwrap().share_base_url = mock.base.clone();
+        seed_live_session(&state);
+        seed_ock(&state, "org-1", 1);
+
+        let entry = block_on(share_to_org_inner(
+            &state,
+            "org-1",
+            None,
+            Some("n-rs".to_string()),
+            true,
+        ))
+        .unwrap();
+        let item_id = entry.item_id.unwrap();
+
+        let resolved = org_resolve_source_inner(&state, &item_id).unwrap().unwrap();
+        assert_eq!(resolved.kind, "document");
+        assert_eq!(resolved.source_id, "n-rs");
+
+        // An unknown item (not published by THIS device) → None.
+        assert!(org_resolve_source_inner(&state, "item-unknown").unwrap().is_none());
     }
 
     /// F1 (org_leave targets the SPECIFIED org's local state). `org_leave` deletes the local org row +
@@ -23692,6 +24212,19 @@ pub struct OrgShareEntry {
     pub shared_at: String,
     pub rev: u32,
     pub state: String,
+}
+
+/// The LOCAL editable SOURCE behind an org item, if the CALLER is its author. `org_resolve_source`
+/// returns `Some` only when THIS device holds the `org_shares` row for the item (i.e. the caller
+/// published it) — so a member reading a colleague's org item gets `None` (no editable source). The
+/// FE uses it to route an org-item viewer to the real note/meeting editor for one's OWN shares.
+#[derive(serde::Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct OrgSourceRef {
+    /// `"document"` (an authored note) or `"meeting"` (a meeting note).
+    pub kind: String,
+    /// The local `documents.id` (for a note) or `meetings.id` (for a meeting).
+    pub source_id: String,
 }
 
 /// The org-scoped "grant author" identity id we pin the OCK granter on. For v1 (single-org, owner
@@ -24584,6 +25117,26 @@ pub(crate) async fn share_to_org_inner(
     document_id: Option<String>,
     scrub: bool,
 ) -> Result<OrgShareEntry, AppError> {
+    // Initial share = rev 1. A re-publish-on-edit supersede bumps the rev (see
+    // `republish_org_shares_for_source`, which calls `publish_org_body` with `old_rev + 1`).
+    publish_org_body(state, org_id, meeting_id, document_id, scrub, 1).await
+}
+
+/// The org publish CORE, shared by the FIRST share (`share_to_org_inner`, `rev = 1`) and the
+/// re-publish-on-edit supersede (`republish_org_shares_for_source`, `rev = old_rev + 1`). It owns the
+/// FULL gate chain so a republish INHERITS it rather than re-implementing (the leak-safety single
+/// seam): (1) read-gate + (3) clean + (4) scrub via `build_org_share_body`, (2) org-egress consent
+/// fail-closed, (5) OCK seal + LOCAL open-verify-before-publish, (6) blob upload + publish item,
+/// (7) content-free egress ledger. `rev` is stamped into BOTH the `OrgEnvelope` (source_rev) and the
+/// `PublishItemRequest` so members see the supersede.
+pub(crate) async fn publish_org_body(
+    state: &AppState,
+    org_id: &str,
+    meeting_id: Option<String>,
+    document_id: Option<String>,
+    scrub: bool,
+    rev: u32,
+) -> Result<OrgShareEntry, AppError> {
     // (1) READ-GATE + (3) clean + (4) scrub — all inside `build_org_share_body` (read-gate FIRST).
     let (title, markdown, created_at, _counts, kind) = build_org_share_body(
         state,
@@ -24635,7 +25188,7 @@ pub(crate) async fn share_to_org_inner(
         markdown,
         author_hint,
         created_at,
-        1,
+        rev,
     );
     let content_sha = env.content_sha256();
     // SB-3 row-amplification fix: REUSE any existing retriable (`queued`/`failed`) row for this
@@ -24653,7 +25206,7 @@ pub(crate) async fn share_to_org_inner(
             state.db.reset_org_share_for_retry(
                 &existing.id,
                 Some(&title),
-                1,
+                rev,
                 generation,
                 &content_sha,
                 &now,
@@ -24669,7 +25222,7 @@ pub(crate) async fn share_to_org_inner(
                 document_id.as_deref(),
                 kind.as_str(),
                 Some(&title),
-                1,
+                rev,
                 generation,
                 &content_sha,
                 &now,
@@ -24713,7 +25266,7 @@ pub(crate) async fn share_to_org_inner(
             crate::share::org_dto::PublishItemRequest {
                 blob_id,
                 content_sha256: content_sha.clone(),
-                rev: 1,
+                rev,
                 generation,
             },
         )
@@ -24742,9 +25295,262 @@ pub(crate) async fn share_to_org_inner(
         kind: kind.as_str().to_string(),
         title: Some(title),
         shared_at: now,
-        rev: 1,
+        rev,
         state: "uploaded".to_string(),
     })
+}
+
+/// RE-PUBLISH-ON-EDIT (the stale-org-copy fix). When the author edits a note/meeting they have
+/// already shared into one or more orgs, the org copy would otherwise stay FROZEN at share time (the
+/// blob is written ONCE by the initial share; nothing re-publishes; the feed has no in-place update —
+/// `org_publish_item` mints a NEW server item_id every call and members key on item_id). The only
+/// correct supersede is TOMBSTONE-OLD + PUBLISH-NEW-REV, done for EVERY org this source was shared to.
+///
+/// BEST-EFFORT: called AFTER a local write already succeeded. It NEVER fails the save — a network /
+/// transient failure marks the row `failed` so the existing launch sweep re-publishes it later (the
+/// intent is not lost), and the whole helper swallows its own error at the call site (`let _ = …`).
+///
+/// Per uploaded row (across ALL orgs — a note may be shared to several):
+///  - Re-read the CURRENT plaintext THROUGH the read-gate (`build_org_share_body`). If it now refuses
+///    (`Locked` — the folder/meeting got locked since the share) → SKIP (never tombstone-into-nothing;
+///    leave the org copy as-is). Same skip if org-egress consent was withdrawn.
+///  - Short-circuit: if the fresh body's `content_sha256` == the row's stored hash → NO egress, skip.
+///  - Seal a fresh OCK envelope at the item's current generation with local open-verify (the egress
+///    verify-before-destroy) → `put_blob` → `org_publish_item(rev = old_rev + 1)` → REPOINT THE SAME
+///    ROW to the new item_id (`set_org_share_uploaded`, bumping rev + hash — no row amplification) →
+///    THEN tombstone the OLD item so members evict the stale copy. ORDER IS LOAD-BEARING: publish-new
+///    BEFORE tombstone-old (a crash between = a transient dup, recoverable; the reverse risks a window
+///    with NO org copy). Both are ledgered content-free.
+///  - SCRUB INTENT: `org_shares` does not persist the original scrub flag, so republish defaults scrub
+///    ON (fail-safe toward LESS egress — matches the launch sweep's documented default). An edit must
+///    never silently DOWNGRADE scrubbing.
+pub(crate) async fn republish_org_shares_for_source(
+    state: &AppState,
+    meeting_id: Option<&str>,
+    document_id: Option<&str>,
+) -> Result<(), AppError> {
+    let rows = state.db.org_shares_for_source(meeting_id, document_id)?;
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    for row in rows {
+        // Re-read the CURRENT plaintext THROUGH the read-gate. `build_org_share_body` also does the
+        // clean+scrub (scrub ON by default — fail-safe toward LESS egress). A `Locked` refusal (the
+        // source got locked since the share) → SKIP without tombstone.
+        let (title, markdown, created_at, _counts, kind) = match build_org_share_body(
+            state,
+            row.meeting_id.as_deref(),
+            row.document_id.as_deref(),
+            true,
+        ) {
+            Ok(v) => v,
+            Err(AppError::Locked(_)) => {
+                tracing::info!(
+                    target: "org",
+                    org_id = %row.org_id,
+                    "republish skipped: source is locked (org copy left as-is)"
+                );
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(target: "org", error = %e, "republish: could not re-read source; skipped");
+                continue;
+            }
+        };
+
+        // Consent could have been withdrawn since the share → SKIP (never egress without consent).
+        {
+            let consented = state
+                .config
+                .lock()
+                .map(|c| c.org_egress_consented)
+                .unwrap_or(false);
+            if !consented {
+                tracing::info!(target: "org", org_id = %row.org_id, "republish skipped: org egress consent withdrawn");
+                continue;
+            }
+        }
+
+        // Author hint = the account's email local-part (a display label, never note content).
+        let author_hint = {
+            let g = match state.account_session.lock() {
+                Ok(g) => g,
+                Err(_) => continue,
+            };
+            crate::share::require_login(&g)
+                .map(|s| org_author_hint(&s.email))
+                .unwrap_or_else(|_| "member".to_string())
+        };
+
+        // Short-circuit: unchanged content ⇒ NO new item, NO egress. `content_sha256` folds
+        // `source_rev` into the canonical bytes, so the stored hash (computed at `row.rev`) must be
+        // compared against a hash at the SAME rev — else every republish would look "changed" purely
+        // because the rev bumped. Build the comparison envelope at `row.rev`; only the PUBLISH envelope
+        // uses `new_rev`.
+        let cmp_env = crate::share::org_envelope::OrgEnvelope::new(
+            kind,
+            title.clone(),
+            markdown.clone(),
+            author_hint.clone(),
+            created_at.clone(),
+            row.rev,
+        );
+        if row.content_sha256.as_deref() == Some(cmp_env.content_sha256().as_slice()) {
+            continue;
+        }
+
+        let new_rev = row.rev.saturating_add(1);
+        let env = crate::share::org_envelope::OrgEnvelope::new(
+            kind,
+            title,
+            markdown,
+            author_hint,
+            created_at,
+            new_rev,
+        );
+        let content_sha = env.content_sha256();
+
+        // Resolve the org + a live session (best-effort: a resolve/session failure just skips this row;
+        // the note is already saved locally). `generation` = the item's CURRENT live generation.
+        let org = match resolve_org(state, &row.org_id) {
+            Ok(o) => o,
+            Err(_) => continue,
+        };
+        let generation = org.generation;
+        let base = match share_base_url(state) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        let access_token = match require_session_mk(state).await {
+            Ok((_, _, _, t)) => t,
+            Err(_) => {
+                // No live session → leave the row uploaded (stale); a later save with a session
+                // republishes. NOT a failure (never blocks the save).
+                continue;
+            }
+        };
+        let client = match crate::share::client::ShareClient::new(&base) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        // (5) Seal under the OCK + LOCAL OPEN-VERIFY (egress verify-before-destroy). AAD nonce =
+        // hex(content_sha256) — deterministic + rides the feed so every member reconstructs it.
+        let ock = match acquire_org_ock(state, &org.org_id, generation).await {
+            Ok(k) => k,
+            Err(_) => {
+                state.db.set_org_share_failed(&row.id, "republish_ock_failed", &now)?;
+                continue;
+            }
+        };
+        let item_nonce = org_item_nonce(&content_sha);
+        let ciphertext =
+            match crate::share::org_envelope::seal_org_envelope(&ock, &env, &org.org_id, &item_nonce) {
+                Ok((ct, _)) => ct,
+                Err(_) => {
+                    state.db.set_org_share_failed(&row.id, "republish_seal_failed", &now)?;
+                    continue;
+                }
+            };
+
+        // (6) upload → publish the NEW rev. On failure, mark the row `failed` (the launch sweep retries)
+        // but do NOT tombstone (the OLD copy stays live — never leave the org with no copy).
+        let blob_id = match client.put_blob(&access_token, ciphertext).await {
+            Ok(id) => id,
+            Err(_) => {
+                state.db.set_org_share_failed(&row.id, "republish_upload_failed", &now)?;
+                continue;
+            }
+        };
+        let published = match client
+            .org_publish_item(
+                &access_token,
+                &org.org_id,
+                crate::share::org_dto::PublishItemRequest {
+                    blob_id,
+                    content_sha256: content_sha.clone(),
+                    rev: new_rev,
+                    generation,
+                },
+            )
+            .await
+        {
+            Ok(p) => p,
+            Err(_) => {
+                state.db.set_org_share_failed(&row.id, "republish_publish_failed", &now)?;
+                continue;
+            }
+        };
+
+        // REPOINT THE SAME ROW to the new item (new item_id + bumped rev + fresh hash) — no new row.
+        state.db.reset_org_share_for_retry(
+            &row.id,
+            row.title.as_deref(),
+            new_rev,
+            generation,
+            &content_sha,
+            &now,
+        )?;
+        state
+            .db
+            .set_org_share_uploaded(&row.id, &published.item_id, &now)?;
+        crate::share::ledger_row(&state.db, &client.host(), "org_share_publish", content_sha.len());
+
+        // LOCAL REPLICA CONSISTENCY (F-org-editable): the author's OWN `org_items` replica would
+        // otherwise stay frozen on the OLD item_id until the next feed pull — so the just-repointed
+        // `org_shares` row no longer matches the replica the Notes list renders (`item_id` drift →
+        // the card falls back to a stale, read-only viewer). Upsert the NEW item + tombstone the OLD
+        // one LOCALLY now, so `list_org_items` immediately resolves this as an owned/editable card with
+        // the fresh title. FTS-only (`None` embedder) to keep this editor-close path light; the next
+        // real `org_sync_now` re-ingests authoritatively (idempotent upsert) and re-embeds. Best-effort:
+        // a local-replica error must never fail the save (the server copy is already live + correct).
+        if let Err(e) = state.db.upsert_org_item(
+            &published.item_id,
+            &org.org_id,
+            published.seq,
+            &env.author_hint,
+            &env.title,
+            &env.markdown,
+            &env.created_at,
+            new_rev,
+            generation,
+            &content_sha,
+            None,
+        ) {
+            tracing::warn!(target: "org", error = %e, "republish: local replica upsert failed (server copy live)");
+        }
+        if let Some(old_item) = row.item_id.as_deref() {
+            // Guard: only tombstone the OLD id if it truly differs from the freshly-published one —
+            // a defensive no-op if the server ever reused the item_id (it mints a new one per publish),
+            // so we never tombstone the replica we just upserted.
+            if old_item != published.item_id {
+                if let Err(e) = state.db.tombstone_org_item(old_item) {
+                    tracing::warn!(target: "org", error = %e, "republish: local old-item tombstone failed");
+                }
+            }
+        }
+
+        // THEN tombstone the OLD item so members evict the stale copy. Publish-BEFORE-tombstone: a
+        // crash here leaves a transient dup (recoverable), never a window with no org copy. A tombstone
+        // failure is non-fatal — the new copy is already live; the stale one lingers until a revoke.
+        if let Some(old_item) = row.item_id.as_deref() {
+            match client.org_tombstone_item(&access_token, &org.org_id, old_item).await {
+                Ok(()) => {
+                    crate::share::ledger_row(&state.db, &client.host(), "org_share_revoke", 0);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "org",
+                        error = %e,
+                        org_id = %org.org_id,
+                        "republish: superseded item published but old-item tombstone failed (transient dup)"
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// `list_org_shares()` — the caller's outbound org shares (local rows; titles render only to the
@@ -24796,6 +25602,45 @@ pub(crate) async fn revoke_org_share_inner(state: &AppState, item_id: String) ->
     state.db.set_org_share_state(&row.id, "revoked", &now)?;
     crate::share::ledger_row(&state.db, &client.host(), "org_share_revoke", 0);
     Ok(())
+}
+
+/// `org_resolve_source(item_id)` — resolve an org item back to the LOCAL editable source (note or
+/// meeting) IF the caller authored it. Only the author's device holds the `org_shares` row for the
+/// item, so a `Some(...)` result means the caller can edit the underlying note/meeting; a member
+/// reading a colleague's shared item gets `None`. READ-ONLY (a local row lookup; no egress, no
+/// content). The FE routes its own shares from the org-item viewer into the real editor.
+#[tauri::command]
+pub fn org_resolve_source(
+    state: State<'_, AppState>,
+    item_id: String,
+) -> Result<Option<OrgSourceRef>, AppError> {
+    org_resolve_source_inner(state.inner(), &item_id)
+}
+
+pub(crate) fn org_resolve_source_inner(
+    state: &AppState,
+    item_id: &str,
+) -> Result<Option<OrgSourceRef>, AppError> {
+    let item_id = item_id.trim();
+    let Some(row) = state.db.org_share_by_item(item_id)? else {
+        return Ok(None);
+    };
+    if row.state != "uploaded" {
+        return Ok(None);
+    }
+    if let Some(document_id) = row.document_id {
+        return Ok(Some(OrgSourceRef {
+            kind: "document".to_string(),
+            source_id: document_id,
+        }));
+    }
+    if let Some(meeting_id) = row.meeting_id {
+        return Ok(Some(OrgSourceRef {
+            kind: "meeting".to_string(),
+            source_id: meeting_id,
+        }));
+    }
+    Ok(None)
 }
 
 /// One org-brain item still live for a folder (lock×shares dialog). `item_id` is the server item id
@@ -25388,7 +26233,76 @@ pub(crate) fn list_org_items_inner(
 ) -> Result<Vec<crate::storage::models::OrgItemHeader>, AppError> {
     // Membership re-check: refuse if the caller isn't a local member of this org.
     let org = resolve_org(st, org_id)?;
-    st.db.list_org_items(&org.org_id)
+    let mut items = st.db.list_org_items(&org.org_id)?;
+    // OWNERSHIP ENRICHMENT (F-org-editable): for each replica the CALLER published, resolve its local
+    // editable source + CURRENT title so the FE links straight to the editable original and never shows
+    // a stale publish-time snapshot. GATED — a locked-not-unlocked source resolves to `None` (its title
+    // must never leak through this org-disclosed list). A non-author's item has no local share ⇒ `None`
+    // ⇒ stays a read-only replica.
+    for item in &mut items {
+        if let Some(src) = resolve_owned_source(st, &item.item_id)? {
+            item.title = src.title;
+            item.owned_source = Some(src.owned);
+        }
+    }
+    Ok(items)
+}
+
+/// The caller's editable local source + its CURRENT title for an org item they published, if any. `None`
+/// when the item was shared by someone else (no local `org_shares` row), the source row is gone, or the
+/// source is locked-and-not-session-unlocked (never leak a sealed title through the org list). Powers the
+/// `OrgItemHeader.owned_source` enrichment; the gate mirrors the note/meeting content-read gates.
+struct OwnedSourceResolved {
+    title: String,
+    owned: crate::storage::models::OrgOwnedSource,
+}
+
+fn resolve_owned_source(
+    st: &AppState,
+    item_id: &str,
+) -> Result<Option<OwnedSourceResolved>, AppError> {
+    let Some(row) = st.db.org_share_by_item(item_id)? else {
+        return Ok(None);
+    };
+    if row.state != "uploaded" {
+        return Ok(None);
+    }
+    if let Some(document_id) = row.document_id {
+        let Some(note) = st.db.get_note_row(&document_id)? else {
+            return Ok(None);
+        };
+        // GATE: a sealed-not-unlocked note's title must not leak into the org list.
+        if !folder_is_unlocked(st, &note.folder_id)? {
+            return Ok(None);
+        }
+        return Ok(Some(OwnedSourceResolved {
+            title: note_display_title(&note),
+            owned: crate::storage::models::OrgOwnedSource {
+                kind: "document".to_string(),
+                id: document_id,
+            },
+        }));
+    }
+    if let Some(meeting_id) = row.meeting_id {
+        // GATE: a sealed-not-unlocked meeting refuses (masked title never leaks).
+        if !meeting_is_unlocked(st, &meeting_id)? {
+            return Ok(None);
+        }
+        let title = st
+            .db
+            .get_meeting(&meeting_id)?
+            .and_then(|m| m.title.clone())
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| "Shared note".to_string());
+        return Ok(Some(OwnedSourceResolved {
+            title,
+            owned: crate::storage::models::OrgOwnedSource {
+                kind: "meeting".to_string(),
+                id: meeting_id,
+            },
+        }));
+    }
+    Ok(None)
 }
 
 #[cfg(test)]

@@ -1835,6 +1835,15 @@ export interface OrgItemHeader {
   createdAt: string;
   /** The item's feed sequence — stable ordering key for the browse list. */
   seq: number;
+  /**
+   * When THIS user published the item AND their local source is readable, the
+   * editable original behind it (resolved backend-side, unlock-gated). Present ⇒
+   * the row links straight to `/notes/:id` | `/meeting/:id` and `title` is the
+   * source's CURRENT title (never a stale publish-time snapshot). Absent ⇒ a
+   * read-only replica shared by someone else (or a locked own source), opened via
+   * the `/org-item/:id` viewer. Mirrors the Rust `OrgItemHeader.owned_source`.
+   */
+  ownedSource?: { kind: "document" | "meeting"; id: string } | null;
 }
 
 /**
@@ -1912,6 +1921,20 @@ export interface OrgItemDetail {
   createdAt: string;
   rev: number;
   markdown: string;
+}
+
+/**
+ * The LOCAL source of an org item — resolved by `org_resolve_source` so the
+ * viewer can route the AUTHOR straight to their editable original (a `/notes/:id`
+ * note or a `/meeting/:id` detail) instead of the read-only replica, while a
+ * non-author (no local source) still gets the read-only viewer. `kind` selects
+ * the route family; `sourceId` is the local document/meeting id. Mirrors the Rust
+ * `OrgSourceRef`. A `null` result (from `orgResolveSource`) ⇒ this user is NOT the
+ * author (no local source) → render the read-only viewer.
+ */
+export interface OrgSourceRef {
+  kind: "document" | "meeting";
+  sourceId: string;
 }
 
 /**

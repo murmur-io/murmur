@@ -251,8 +251,8 @@
         @if (activeFolderExposure(); as exp) {
           <app-lock-badge [exposure]="exp" />
         }
-        @if (!listLoading() && displayedMeetings().length > 0) {
-          <span class="count">{{ displayedMeetings().length }}</span>
+        @if (!listLoading() && !listEmpty()) {
+          <span class="count">{{ listItems().length }}</span>
         }
       </header>
 
@@ -260,7 +260,7 @@
         <div class="card state-card">
           <p class="empty">Loading…</p>
         </div>
-      } @else if (displayedMeetings().length === 0) {
+      } @else if (listEmpty()) {
         <div class="card empty-state">
           @if (activeFolderId() !== null) {
             <!-- ACTIONABLE empty folder: on-brand "drop here" illustration
@@ -338,7 +338,8 @@
         </div>
       } @else {
         <ul class="list">
-          @for (m of displayedMeetings(); track m.id; let i = $index) {
+          @for (it of listItems(); track it.id; let i = $index) {
+            @let m = it.meeting;
             <li
               class="row-item"
               [class.is-confirming]="pendingDeleteId() === m.id"

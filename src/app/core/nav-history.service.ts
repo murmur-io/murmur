@@ -21,7 +21,13 @@ export function isDrilldownRoute(url: string): boolean {
     url.startsWith("/settings") ||
     url.startsWith("/library") ||
     url.startsWith("/meeting") ||
-    url.startsWith("/notes")
+    url.startsWith("/notes") ||
+    // The org-item viewer is "inside" the Notes flow (reached from an org card; its
+    // own Back returns to /notes). Treating it as a drill-down (a) hides the primary
+    // rail so it owns the window like the note editor, and (b) keeps it OUT of
+    // `_lastAppRoute` so the Notes "← Murmur" affordance returns to the real prior
+    // app view (/record), not back into an org-item viewer.
+    url.startsWith("/org-item")
   );
 }
 

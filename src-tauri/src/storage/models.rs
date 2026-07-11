@@ -543,6 +543,24 @@ pub struct OrgItemHeader {
     pub author_hint: String,
     pub created_at: String,
     pub seq: u64,
+    /// The caller's OWN editable local source for this item, when THIS device published it (resolved
+    /// via `org_share_by_item` → the anchored note/meeting) AND that source is currently readable
+    /// (unlock-gated — a locked source resolves to `None`, never leaking its title). `None` for an
+    /// item shared by someone else (a read-only replica) or a locked own source. When present, the FE
+    /// links the row straight to the editable original (`/notes/:id` | `/meeting/:id`) and the header's
+    /// `title` is overridden to the source's CURRENT title — so the author's own card never shows a
+    /// stale publish-time snapshot and never routes through the read-only viewer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owned_source: Option<OrgOwnedSource>,
+}
+
+/// The caller's local editable source behind an org item they authored (see `OrgItemHeader.owned_source`).
+/// `kind` is `"document"` (a note → `/notes/:id`) or `"meeting"` (a recording → `/meeting/:id`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OrgOwnedSource {
+    pub kind: String,
+    pub id: String,
 }
 
 /// Shared Brain v1 — the content-free result of a manual `org_sync_now()` (counts + errors only).
