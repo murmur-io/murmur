@@ -19,6 +19,7 @@ import {
   OrgShareSheetComponent,
   type OrgShareTarget,
 } from "../../detail/org-share-sheet/org-share-sheet.component";
+import { MurOrgBrainCtaComponent } from "../../../design-system/org-brain-cta/org-brain-cta.component";
 
 /** The link-share flow step (Manage always coexists as the list below). */
 type ShareStep = "configure" | "created";
@@ -65,7 +66,7 @@ interface LinkShareRow {
 @Component({
   selector: "app-note-share-panel",
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [OrgShareSheetComponent],
+  imports: [OrgShareSheetComponent, MurOrgBrainCtaComponent],
   templateUrl: "./note-share-panel.component.html",
   styleUrl: "./note-share-panel.component.scss",
 })

@@ -1,0 +1,33 @@
+<div class="org-cta">
+  <div class="org-cta-head">
+    <span class="org-cta-mark" aria-hidden="true">
+      <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="12" cy="8" r="3.2" />
+        <path d="M5 20a7 7 0 0 1 14 0" />
+        <circle cx="4.5" cy="10" r="2" />
+        <circle cx="19.5" cy="10" r="2" />
+      </svg>
+    </span>
+    <span class="org-cta-headings">
+      <span class="org-cta-title">Add to Org Brain</span>
+      <span class="org-cta-org">{{ orgName() }}</span>
+    </span>
+  </div>
+
+  <p class="org-cta-copy">
+    Share this note into <strong>{{ orgName() }}</strong>’s shared brain so your
+    {{ audience() }} can find it. End-to-end encrypted — the server can’t read it.
+  </p>
+
+  <button
+    type="button"
+    class="btn btn-primary org-cta-btn"
+    (click)="add.emit()"
+    [disabled]="disabled()"
+  >
+    <svg viewBox="0 0 16 16" width="15" height="15" fill="none" aria-hidden="true">
+      <path d="M8 3.5v9M3.5 8h9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" />
+    </svg>
+    Add to Org Brain
+  </button>
+</div>
