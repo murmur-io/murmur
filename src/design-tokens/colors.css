@@ -47,4 +47,13 @@
   --danger-soft: rgba(255, 107, 107, 0.14);
   --warning: #f5b14c;
   --warning-soft: rgba(245, 177, 76, 0.14);
+
+  /* --- Note-assistant result-shape hues ----------------------------------
+     One dot per result shape in the Brain command menu (replace/insert reuse
+     the accent/success identity; info/artifact get their own quiet hue). Used
+     ONLY for the tiny shape-legend dot next to each action row. */
+  --shape-replace: var(--accent);
+  --shape-insert: #43c59e;
+  --shape-info: #e0a944;
+  --shape-artifact: #c86ff2;
 }

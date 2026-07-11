@@ -646,13 +646,25 @@ pub struct NoteFolder {
 #[serde(rename_all = "camelCase")]
 pub struct NoteAssistRequest {
     pub note_id: String,
-    /// `"refine"` | `"shorten"` | `"enhance"`.
+    /// One of the note-assistant action ids (see the seam contract): the EDIT actions
+    /// (`refine`/`grammar`/`shorten`/`expand`/`simplify`/`tone`/`translate`), STRUCTURE
+    /// (`bullets`/`table`/`keypoints`), FROM YOUR BRAIN (`enhance`/`find_related`/`link_entities`/
+    /// `fact_check`/`ask`), EXTRACT (`action_items`/`decisions`), CREATE (`draft_followup`/
+    /// `spinoff_note`), or `custom`.
     pub action: String,
     pub selection: String,
     #[serde(default)]
     pub before: Option<String>,
     #[serde(default)]
     pub after: Option<String>,
+    /// Variant selector for the variant-heavy actions: `tone` name (Professional/Casual/…) or
+    /// `translate` target language. `None` for actions that take no variant.
+    #[serde(default)]
+    pub variant: Option<String>,
+    /// Free-text instruction: the `custom` action's instruction, or the `ask` action's question
+    /// about the selection. `None` for actions that need no instruction.
+    #[serde(default)]
+    pub instruction: Option<String>,
 }
 
 /// One enhance-context provenance citation — the source note/meeting the additive passage drew on.
@@ -680,6 +692,16 @@ pub struct NoteAssistResult {
     /// `"local"` | `"cloud"`.
     pub mode: String,
     pub redacted: bool,
+    /// How the FE renders + applies the result: `"replace"` (struck original vs suggestion →
+    /// Accept replaces the selection) | `"insert"` (append the suggestion after the selection) |
+    /// `"info"` (read-only answer + citations; Copy / Insert-as-note; NO destructive replace) |
+    /// `"artifact"` (a drafted email/note preview: `title` + `suggestion`). The FE renders
+    /// generically off THIS field — it does NOT re-derive the shape from the action.
+    pub shape: String,
+    /// The artifact title — an email subject (`draft_followup`) or note title (`spinoff_note`).
+    /// `None` for every non-artifact shape.
+    #[serde(default)]
+    pub title: Option<String>,
 }
 
 /// One proposed auto-organize move (WP5): a note and its proposed target note-folder. `toFolderId`

@@ -130,14 +130,28 @@ export async function mockNotes(
     export_note_doc: () => "/Users/demo/Obsidian/Vault/Notes/My-First-Note.md",
 
     // --- the selection Brain assistant ---
-    note_assistant_action: (args: { req: { action: string } }) => ({
-      action: args.req.action,
-      suggestion: "A refined version of your text.",
-      citations: [],
-      modelLabel: "Claude",
-      mode: "cloud",
-      redacted: false,
-    }),
+    note_assistant_action: (args: { req: { action: string } }) => {
+      // Mirror the backend `note_assist_shape` so the popover's `@switch (res.shape)`
+      // renders the right result phase (replace/insert/info/artifact).
+      const a = args.req.action;
+      const shape = ["find_related", "fact_check", "ask"].includes(a)
+        ? "info"
+        : ["enhance", "keypoints", "action_items", "decisions"].includes(a)
+          ? "insert"
+          : ["draft_followup", "spinoff_note"].includes(a)
+            ? "artifact"
+            : "replace";
+      return {
+        action: a,
+        shape,
+        title: shape === "artifact" ? "Re: Note" : null,
+        suggestion: "A refined version of your text.",
+        citations: [],
+        modelLabel: "Claude",
+        mode: "cloud",
+        redacted: false,
+      };
+    },
 
     // --- auto-organize (one proposed move to a NEW folder) ---
     plan_organize_notes: () => ({
