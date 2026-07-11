@@ -27,6 +27,12 @@
   --transition: 200ms cubic-bezier(0.32, 0.72, 0, 1);
   --transition-fast: 130ms cubic-bezier(0.32, 0.72, 0, 1);
   --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+  /* Duration-only companions — use when composing an `animation` shorthand with an
+     explicit easing (e.g. --ease-spring). Pairing a duration with --transition (which
+     ALREADY carries its own easing) yields TWO timing-functions → an INVALID shorthand
+     the browser drops silently. Compose as `<name> var(--transition-dur) var(--ease-spring)`. */
+  --transition-dur: 200ms;
+  --transition-fast-dur: 130ms;
 
   /* --- Layout ------------------------------------------------------------- */
   --content-max: 840px;

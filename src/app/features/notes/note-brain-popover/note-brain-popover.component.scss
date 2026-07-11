@@ -25,7 +25,9 @@
   box-shadow: var(--shadow-lg);
   -webkit-backdrop-filter: none;
   backdrop-filter: none;
-  animation: pop-in var(--transition) var(--ease-spring) both;
+  /* Duration-only token: --transition already carries an easing, so pairing it with
+     --ease-spring made TWO timing-functions → an invalid shorthand the browser dropped. */
+  animation: pop-in var(--transition-dur) var(--ease-spring) both;
 }
 
 @keyframes pop-in {

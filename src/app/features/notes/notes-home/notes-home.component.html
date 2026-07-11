@@ -410,4 +410,19 @@
       (cancelled)="closeOrganize()"
     />
   }
+
+  <!-- Lock×shares blocking dialog (PK-F1): the SAME flow the meetings tree runs —
+       shown when locking a note-folder that still has active shares (or when the
+       share probe failed). Owned by the shared FolderLockFlowService. OPAQUE (T3). -->
+  @if (lockFlow.pending(); as pending) {
+    <app-lock-shares-dialog
+      [folderName]="pending.folderName"
+      [report]="lockFlow.report()"
+      [probeFailed]="pending.probeFailed"
+      [busy]="lockFlow.busy()"
+      (revokeAndLock)="lockFlow.revokeAndLock()"
+      (lockAnyway)="lockFlow.lockAnyway()"
+      (cancelled)="lockFlow.cancel()"
+    />
+  }
 </section>

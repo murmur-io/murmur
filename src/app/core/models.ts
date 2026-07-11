@@ -1865,19 +1865,6 @@ export interface OrgShareEntry {
 }
 
 /**
- * A summary row of a synced org item (feed replica). Content-free beyond the
- * title/author-hint the local user is allowed to see. Mirrors the Rust
- * `OrgItemSummary`.
- */
-export interface OrgItemSummary {
-  itemId: string;
-  authorHint: string;
-  title: string;
-  createdAt: string;
-  rev: number;
-}
-
-/**
  * The full decrypted org item for the read-only viewer route (`orgGetItem`).
  * `markdown` is the plaintext envelope body — this is deliberately-disclosed org
  * content (no lock gate applies to org items), rendered read-only with an
