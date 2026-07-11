@@ -436,6 +436,25 @@ impl Db {
              );
              CREATE INDEX IF NOT EXISTS idx_user_facts_meeting ON user_facts(meeting_id);
 
+             -- MEM-1 reversible memory-import supersede. When an import_memories run reconciles a
+             -- pasted export against EXISTING user facts and a same-key/different-object collision
+             -- CLOSES a pre-existing OPEN fact anchored to ANOTHER meeting, we record the link here so
+             -- deleting the synthetic Memory-Import meeting (the undo affordance) can REOPEN those
+             -- facts. Without it, delete_meeting purge_user_facts_tx deletes only the import's
+             -- OWN Adds (meeting_id = import_id) and the superseded pre-existing facts stay closed
+             -- FOREVER — a partial undo that silently loses prior memories. `superseded_valid_to` is
+             -- the exact `valid_to` we stamped, so the reopen only reverts OUR closure (idempotent /
+             -- conflict-safe). No FK on `superseded_fact_id` (the fact row survives — only its
+             -- valid_to changed); the import_meeting_id side is cleaned by `delete_meeting`.
+             CREATE TABLE IF NOT EXISTS user_fact_import_supersedes (
+               import_meeting_id  TEXT NOT NULL,
+               superseded_fact_id TEXT NOT NULL,
+               superseded_valid_to TEXT NOT NULL,
+               PRIMARY KEY (import_meeting_id, superseded_fact_id)
+             );
+             CREATE INDEX IF NOT EXISTS idx_ufis_import
+               ON user_fact_import_supersedes(import_meeting_id);
+
              -- On-device VOICE BIOMETRICS for diarized remote speakers (opt-in, default off). One row
              -- per diarized others-{cluster_index} cluster of a meeting: the L2-normalized CAM++
              -- speaker embedding (little-endian f32 BLOB), plus the bound person `label` once the user
@@ -1927,6 +1946,62 @@ impl Db {
         .map_err(map_err)
     }
 
+    /// SB-3 dedup: the EXISTING retriable (`queued`/`failed`) org-share row for a logical share key
+    /// (org + meeting-or-document), if any. `share_to_org_inner` REUSES it on a re-publish instead of
+    /// minting a fresh row every sweep tick — without this, each failed retry inserted a NEW row while
+    /// the old one survived, so a persistently-failing share amplified rows unboundedly and a later
+    /// recovery double-published. Newest-created first (a stable pick if somehow >1 exists). Uploaded/
+    /// revoked/revoke_pending rows are NOT reused (an uploaded share is a distinct published item; a
+    /// revoked one is intentionally torn down). `meeting_id`/`document_id` are matched exactly (both
+    /// NULL-safe via `IS`).
+    pub fn find_reusable_org_share(
+        &self,
+        org_id: &str,
+        meeting_id: Option<&str>,
+        document_id: Option<&str>,
+    ) -> Result<Option<crate::storage::OrgShareRow>> {
+        let conn = self.lock();
+        conn.query_row(
+            &format!(
+                "SELECT {} FROM org_shares
+                   WHERE org_id = ?1
+                     AND meeting_id IS ?2 AND document_id IS ?3
+                     AND state IN ('queued', 'failed')
+                   ORDER BY created_at DESC LIMIT 1",
+                Self::ORG_SHARE_COLS
+            ),
+            rusqlite::params![org_id, meeting_id, document_id],
+            Self::map_org_share,
+        )
+        .optional()
+        .map_err(map_err)
+    }
+
+    /// SB-3 retry re-arm: reset an EXISTING org-share row back to `queued` for a fresh publish attempt,
+    /// refreshing the per-attempt fields (title/content hash/generation/timestamps) and CLEARING any
+    /// item_id + last_error. Used by `share_to_org_inner` when it reuses a `find_reusable_org_share`
+    /// row instead of inserting a new one — so N failed attempts stay ONE row, and a later success
+    /// flips that same row to uploaded (no duplicate). Idempotent on the row id.
+    pub fn reset_org_share_for_retry(
+        &self,
+        id: &str,
+        title: Option<&str>,
+        rev: u32,
+        generation: u32,
+        content_sha256: &[u8],
+        updated_at: &str,
+    ) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE org_shares SET state = 'queued', item_id = NULL, last_error = NULL,
+               title = ?2, rev = ?3, generation = ?4, content_sha256 = ?5, updated_at = ?6
+             WHERE id = ?1",
+            rusqlite::params![id, title, rev as i64, generation as i64, content_sha256, updated_at],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
     /// All org shares in a given `state` (the launch sweep pulls `queued` + `revoke_pending`).
     pub fn list_org_shares_in_state(
         &self,
@@ -2788,6 +2863,13 @@ impl Db {
         // tx (the meetings FK CASCADE also covers it — the explicit delete keeps the purge visible
         // and test-bound alongside the other derived artifacts).
         Self::purge_live_bullets_tx(&tx, &[id.to_string()])?;
+        // MEM-1 (reversible import supersede): BEFORE purging this meeting's own facts, REOPEN every
+        // pre-existing fact that a synthetic Memory-Import superseded (set valid_to back to NULL) and
+        // drop the link rows — so "delete the import ⇒ undo" restores prior memories instead of
+        // leaving them permanently closed. A non-import meeting has no link rows ⇒ a no-op. Runs
+        // before `purge_user_facts_tx` so the reopen targets facts that survive (the import's OWN
+        // Adds are then deleted below); the two never touch the same rows.
+        Self::reopen_import_superseded_facts_tx(&tx, id)?;
         // Brain v2 L2.2: purge this meeting's user facts EXPLICITLY (direct DELETE) rather than
         // relying on the meetings FK cascade alone — the direct DELETE reliably fires the
         // `fts_user_facts_ad` trigger, so the deleted facts' tokens leave the FTS index in this
@@ -4485,18 +4567,46 @@ impl Db {
         let mut conn = self.lock();
         let tx = conn.transaction().map_err(map_err)?;
         // Descendants first: rewrite every `<old_path>/…` prefix to `<new_path>/…`.
+        // NOTES-3 (2026-07-11 audit): SQLite `substr()` counts CHARACTERS, not bytes, so the
+        // suffix offset MUST be the char count of `old_path` (+1 for the following '/'), never the
+        // Rust byte length — a multi-byte prefix (Polish "Sprzedaż") would otherwise slice mid-path
+        // and corrupt every descendant. `char_length(old_path) + 1` picks up at the '/' after the
+        // old prefix, so the leading slash survives into the rewritten path.
         let like = format!("{}/%", old_path.replace('!', "!!").replace('%', "!%").replace('_', "!_"));
         tx.execute(
             "UPDATE folders
                 SET path = ?1 || substr(path, ?2)
               WHERE kind = 'note' AND path LIKE ?3 ESCAPE '!'",
-            rusqlite::params![new_path, (old_path.len() + 1) as i64, like],
+            rusqlite::params![new_path, (old_path.chars().count() + 1) as i64, like],
         )
         .map_err(map_err)?;
         // Then the folder itself: its own path + parent link.
         tx.execute(
             "UPDATE folders SET path = ?2, parent_id = ?3 WHERE id = ?1 AND kind = 'note'",
             rusqlite::params![id, new_path, parent_id],
+        )
+        .map_err(map_err)?;
+        // NOTES-2 (2026-07-11 audit): rewrite every affected authored note's `documents.exported_path`
+        // so it reflects the NEW on-disk vault path (the FS `.md` was physically moved by
+        // `reparent_note_folder_paths`). Without this the path stays STALE and a later `lock_folder`
+        // deletes nothing at that stale path — leaving the real plaintext `.md` on disk in a sealed
+        // folder (a sealed-content leak). We replace the OLD path prefix with the NEW one for the moved
+        // folder AND its descendants. `replace()` is byte-safe (substring, not offset) and multi-byte
+        // safe. Scoped to notes whose folder is now under the new path (folders were rewritten above).
+        tx.execute(
+            "UPDATE documents
+                SET exported_path = replace(exported_path, ?1, ?2)
+              WHERE kind = 'note' AND exported_path IS NOT NULL
+                AND instr(exported_path, ?1) > 0
+                AND folder_id IN (
+                    SELECT id FROM folders
+                     WHERE kind = 'note' AND (path = ?2 OR path LIKE ?3 ESCAPE '!')
+                )",
+            rusqlite::params![
+                old_path,
+                new_path,
+                format!("{}/%", new_path.replace('!', "!!").replace('%', "!%").replace('_', "!_")),
+            ],
         )
         .map_err(map_err)?;
         tx.commit().map_err(map_err)?;
@@ -4756,6 +4866,46 @@ impl Db {
         Ok(())
     }
 
+    /// LEAVE-A-ORG CONSENT PURGE: drop the ENTIRE decrypted replica of one org — every `org_items`
+    /// row plus its derived `org_chunks` / `org_vec_chunks` / `fts_org_chunks` tokens — in ONE atomic
+    /// tx. Called by `org_leave` so a departed member keeps NO searchable copy of colleagues' shared
+    /// content (leak/consent invariant): the OCK cache is dropped and `org_state` deleted at the
+    /// command layer, but WITHOUT this the plaintext replica lingered forever and `org_search` could
+    /// still return it. Order: vec0 first (its FK-less rowid mirrors `org_chunks.id`), then
+    /// `org_chunks` (whose DELETE fires the `fts_org_chunks_ad` trigger, purging the keyword tokens),
+    /// then the `org_items` header rows. Idempotent; an unknown org id is a no-op. Content-free log
+    /// (org id + counts, never titles/bodies).
+    pub fn purge_org_replica(&self, org_id: &str) -> Result<()> {
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        // vec0 KNN rows for every chunk of every item in this org (the FK-less mirror table).
+        tx.execute(
+            "DELETE FROM org_vec_chunks WHERE chunk_id IN
+               (SELECT oc.id FROM org_chunks oc
+                  JOIN org_items oi ON oi.item_id = oc.item_id
+                 WHERE oi.org_id = ?1)",
+            rusqlite::params![org_id],
+        )
+        .map_err(map_err)?;
+        // Source chunks (their DELETE fires the FTS `_ad` trigger → keyword tokens purged).
+        tx.execute(
+            "DELETE FROM org_chunks WHERE item_id IN
+               (SELECT item_id FROM org_items WHERE org_id = ?1)",
+            rusqlite::params![org_id],
+        )
+        .map_err(map_err)?;
+        // Finally the item headers (the decrypted markdown/title replica).
+        let items = tx
+            .execute(
+                "DELETE FROM org_items WHERE org_id = ?1",
+                rusqlite::params![org_id],
+            )
+            .map_err(map_err)?;
+        tx.commit().map_err(map_err)?;
+        tracing::info!(target: "org", items, "purged org replica on leave");
+        Ok(())
+    }
+
     /// Delete an org item's `org_chunks` + `org_vec_chunks` rows within an EXISTING tx. vec0 first
     /// (its FK-less rowid mirrors `org_chunks.id`), then the source rows (whose DELETE fires the FTS
     /// `_ad` trigger, purging the tokens). Mirrors [`Db::purge_doc_chunks_tx`].
@@ -4903,19 +5053,6 @@ impl Db {
         )
         .optional()
         .map_err(map_err)
-    }
-
-    /// Count of LIVE (non-tombstoned) org items for an org — the `OrgStatus.itemCount` source.
-    pub fn org_item_count(&self, org_id: &str) -> Result<u64> {
-        let conn = self.lock();
-        let n: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM org_items WHERE org_id = ?1 AND tombstoned = 0",
-                rusqlite::params![org_id],
-                |r| r.get(0),
-            )
-            .map_err(map_err)?;
-        Ok(n.max(0) as u64)
     }
 
     /// Every non-null `content_sha256` from the local `org_shares` rows (across all orgs the user has
@@ -5633,6 +5770,31 @@ impl Db {
         Ok(())
     }
 
+    /// SEAL-ON-WRITE twin of [`Db::set_timeline_data`] for a meeting in a session-unlocked LOCKED
+    /// folder (2026-07-11 audit SEAM-F1/F2): upsert the fresh plaintext (session-visible) AND its
+    /// freshly-encrypted `data_blob` in ONE atomic statement, so relock/at-rest reblank restores THIS
+    /// timeline — never a stale lock-time copy, and a timeline GENERATED while unlocked is sealed from
+    /// birth (never a blob-less plaintext behind a lock). The CALLER must have verified the blob
+    /// decrypts back byte-identical BEFORE calling this (verify-before-destroy) — exactly like
+    /// [`Db::seal_timeline`]. INSERT-or-update (a freshly generated timeline has no row yet).
+    pub fn set_timeline_data_sealed(
+        &self,
+        meeting_id: &str,
+        data: &str,
+        data_blob: &[u8],
+    ) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO timelines (meeting_id, data, data_blob) VALUES (?1, ?2, ?3)
+             ON CONFLICT(meeting_id) DO UPDATE SET
+               data = excluded.data,
+               data_blob = excluded.data_blob",
+            rusqlite::params![meeting_id, data, data_blob],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
     // ── meeting tags ─────────────────────────────────────────────────────────
 
     /// Replace all tags for a meeting with `tags` (trimmed, blanks dropped).
@@ -6259,9 +6421,30 @@ impl Db {
     pub fn delete_folder(&self, id: &str) -> Result<usize> {
         let mut conn = self.lock();
         let tx = conn.transaction().map_err(map_err)?;
+        // NOTES-1 (2026-07-11 audit, CRITICAL data loss): AUTHORED notes (`documents(kind='note')`)
+        // must have been REPARENTED to the default note-folder by the command layer BEFORE we get
+        // here — the FE promises "delete folder" MOVES its notes, never destroys them. If any authored
+        // note STILL references this folder, REFUSE (never blanket-DELETE an authored note). The
+        // pre-fix `DELETE FROM documents WHERE folder_id` permanently destroyed every authored note in
+        // the folder. Uploaded/ingested documents (`kind != 'note'`) — which are DERIVED brain sources,
+        // not user-authored primary content — are still cleaned up here as before.
+        let authored_remaining: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM documents WHERE folder_id = ?1 AND kind = 'note'",
+                rusqlite::params![id],
+                |r| r.get(0),
+            )
+            .map_err(map_err)?;
+        if authored_remaining > 0 {
+            return Err(AppError::Storage(format!(
+                "refusing to delete folder {id}: {authored_remaining} authored note(s) still assigned \
+                 — reparent them first (never destroy authored notes on folder delete)"
+            )));
+        }
+        // Only DERIVED (uploaded/ingested) documents remain — purge their chunks + rows.
         let document_ids: Vec<String> = {
             let mut stmt = tx
-                .prepare("SELECT id FROM documents WHERE folder_id = ?1")
+                .prepare("SELECT id FROM documents WHERE folder_id = ?1 AND kind != 'note'")
                 .map_err(map_err)?;
             let rows = stmt
                 .query_map(rusqlite::params![id], |r| r.get::<_, String>(0))
@@ -6273,9 +6456,10 @@ impl Db {
             out
         };
         Self::purge_doc_chunks_tx(&tx, &document_ids)?;
-        // Explicit (rather than FK-cascade) so the delete is deterministic and trigger-visible.
+        // Explicit (rather than FK-cascade) so the delete is deterministic and trigger-visible. Scoped
+        // to non-authored documents — authored notes were reparented out above (and refused if not).
         tx.execute(
-            "DELETE FROM documents WHERE folder_id = ?1",
+            "DELETE FROM documents WHERE folder_id = ?1 AND kind != 'note'",
             rusqlite::params![id],
         )
         .map_err(map_err)?;
@@ -8625,6 +8809,29 @@ impl Db {
     /// and is NOT persisted (there is no entity column). The whole batch commits or rolls back
     /// together, so a crash mid-apply never leaves a half-reconciled store.
     pub fn apply_user_fact_ops(&self, ops: &[crate::facts::FactOp]) -> Result<()> {
+        self.apply_user_fact_ops_inner(ops, None)
+    }
+
+    /// MEM-1: apply the reconcile ops AND, in the SAME atomic tx, record every `Invalidate`d
+    /// pre-existing fact under `import_meeting_id` (into `user_fact_import_supersedes`) so deleting the
+    /// synthetic Memory-Import meeting can REOPEN them. Used ONLY by `import_memories` — a normal
+    /// meeting's fact extraction anchors its Adds to the meeting itself and needs no reversible link
+    /// (deleting that meeting purges its Adds; it does not supersede OTHER meetings' facts). Recording
+    /// the closure link atomically with the closure means a crash can never leave a closed-but-unlinked
+    /// (permanently-lost-on-undo) fact.
+    pub fn apply_user_fact_ops_recording_import_supersedes(
+        &self,
+        ops: &[crate::facts::FactOp],
+        import_meeting_id: &str,
+    ) -> Result<()> {
+        self.apply_user_fact_ops_inner(ops, Some(import_meeting_id))
+    }
+
+    fn apply_user_fact_ops_inner(
+        &self,
+        ops: &[crate::facts::FactOp],
+        import_meeting_id: Option<&str>,
+    ) -> Result<()> {
         use crate::facts::FactOp;
         if ops.is_empty() {
             return Ok(());
@@ -8654,16 +8861,62 @@ impl Db {
                     .map_err(map_err)?;
                 }
                 FactOp::Invalidate { id, valid_to } => {
-                    tx.execute(
-                        "UPDATE user_facts SET valid_to = ?2 WHERE id = ?1 AND valid_to IS NULL",
-                        rusqlite::params![id, valid_to],
-                    )
-                    .map_err(map_err)?;
+                    let closed = tx
+                        .execute(
+                            "UPDATE user_facts SET valid_to = ?2 WHERE id = ?1 AND valid_to IS NULL",
+                            rusqlite::params![id, valid_to],
+                        )
+                        .map_err(map_err)?;
+                    // MEM-1: only record the reversible link when WE actually closed the row (the
+                    // `AND valid_to IS NULL` guard) AND this is an import run — so the undo reopens
+                    // exactly the facts THIS import superseded, nothing else.
+                    if closed > 0 {
+                        if let Some(imid) = import_meeting_id {
+                            tx.execute(
+                                "INSERT OR IGNORE INTO user_fact_import_supersedes
+                                   (import_meeting_id, superseded_fact_id, superseded_valid_to)
+                                 VALUES (?1, ?2, ?3)",
+                                rusqlite::params![imid, id, valid_to],
+                            )
+                            .map_err(map_err)?;
+                        }
+                    }
                 }
                 FactOp::NoOp => {}
             }
         }
         tx.commit().map_err(map_err)?;
+        Ok(())
+    }
+
+    /// MEM-1 reversible-supersede UNDO (in an EXISTING tx, called from `delete_meeting`): when the
+    /// deleted meeting is a synthetic Memory-Import, REOPEN every pre-existing fact that import closed
+    /// (set `valid_to` back to NULL) — but ONLY where the row is still closed at the EXACT `valid_to`
+    /// we stamped (so a later legitimate re-supersession by a DIFFERENT meeting is never clobbered) —
+    /// then drop the link rows. Then the caller's `purge_user_facts_tx` deletes the import's OWN Adds.
+    /// A non-import meeting has no link rows ⇒ a no-op. This makes "delete the import ⇒ full undo"
+    /// restore the pre-existing memories instead of leaving them permanently closed.
+    fn reopen_import_superseded_facts_tx(
+        tx: &rusqlite::Transaction<'_>,
+        import_meeting_id: &str,
+    ) -> Result<()> {
+        // Reopen each still-matching superseded fact (guarded on the recorded valid_to).
+        tx.execute(
+            "UPDATE user_facts
+                SET valid_to = NULL
+              WHERE id IN (SELECT superseded_fact_id FROM user_fact_import_supersedes
+                            WHERE import_meeting_id = ?1)
+                AND valid_to = (SELECT superseded_valid_to FROM user_fact_import_supersedes s
+                                 WHERE s.import_meeting_id = ?1 AND s.superseded_fact_id = user_facts.id)",
+            rusqlite::params![import_meeting_id],
+        )
+        .map_err(map_err)?;
+        // Drop the link rows (the import is being deleted).
+        tx.execute(
+            "DELETE FROM user_fact_import_supersedes WHERE import_meeting_id = ?1",
+            rusqlite::params![import_meeting_id],
+        )
+        .map_err(map_err)?;
         Ok(())
     }
 
@@ -10264,6 +10517,73 @@ mod tests {
         assert_eq!(n, 0, "org_chunks purged on tombstone");
         // Idempotent re-tombstone.
         db.tombstone_org_item("it-t").unwrap();
+    }
+
+    /// LEAVE PURGE (RED-before-GREEN, leak/consent): `purge_org_replica` drops the WHOLE decrypted
+    /// replica of an org — every `org_items` header, its `org_chunks`/`org_vec_chunks`, and the
+    /// `fts_org_chunks` tokens — so `org_leave` leaves NO searchable copy of colleagues' content.
+    /// Pre-fix `org_leave` deleted only `org_state`, so the replica lingered forever and `org_search`
+    /// could still return it. Idempotent; scoped to the named org (a second org survives).
+    #[test]
+    fn purge_org_replica_drops_the_whole_decrypted_replica() {
+        let db = mem_db();
+        let emb = crate::embed::StubEmbedder;
+        db.upsert_org_item(
+            "it-a", "org-1", 1, "anna", "Roadmap", "the falcon rollout plan alpha", "t", 1, 1,
+            &sha32(6), Some(&emb),
+        )
+        .unwrap();
+        db.upsert_org_item(
+            "it-b", "org-1", 2, "bob", "Budget", "the falcon rollout budget beta", "t", 1, 1,
+            &sha32(7), Some(&emb),
+        )
+        .unwrap();
+        // A DIFFERENT org's item must SURVIVE the scoped purge.
+        db.upsert_org_item(
+            "it-other", "org-2", 1, "carol", "Other", "unrelated other-org content", "t", 1, 1,
+            &sha32(8), Some(&emb),
+        )
+        .unwrap();
+
+        // Precondition: org-1 items are retrievable.
+        assert_eq!(db.search_org_chunks_fts("falcon rollout", 10).unwrap().len(), 2);
+
+        db.purge_org_replica("org-1").unwrap();
+
+        // FTS + KNN + the viewer + the raw rows all show org-1 gone.
+        assert!(
+            db.search_org_chunks_fts("falcon rollout", 10).unwrap().is_empty(),
+            "org-1 replica must vanish from FTS after leave-purge"
+        );
+        // KNN: no org-1 item survives (the surviving org-2 item may still appear — StubEmbedder
+        // vectors are text-independent — so assert org-1's ids are GONE, not that KNN is empty).
+        let qv = emb.embed_query(&["falcon rollout".to_string()]).unwrap().remove(0);
+        let knn = db.search_org_chunks_knn(&qv, 10).unwrap();
+        assert!(
+            knn.iter().all(|h| h.item_id != "it-a" && h.item_id != "it-b"),
+            "no org-1 item may survive in KNN after leave-purge: {:?}",
+            knn.iter().map(|h| &h.item_id).collect::<Vec<_>>()
+        );
+        assert!(db.get_org_item("it-a").unwrap().is_none());
+        assert!(db.get_org_item("it-b").unwrap().is_none());
+        let n_items: i64 = db
+            .lock()
+            .query_row("SELECT COUNT(*) FROM org_items WHERE org_id='org-1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n_items, 0, "org_items header rows for org-1 are gone");
+        let n_chunks: i64 = db
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM org_chunks WHERE item_id IN ('it-a','it-b')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n_chunks, 0, "org_chunks for org-1 items are gone");
+
+        // The OTHER org is untouched, and the purge is idempotent.
+        assert!(db.get_org_item("it-other").unwrap().is_some(), "org-2 survives the scoped purge");
+        db.purge_org_replica("org-1").unwrap(); // idempotent no-op
     }
 
     /// Re-pull idempotency: upserting the SAME item id twice REPLACES (never duplicates) its chunks —
