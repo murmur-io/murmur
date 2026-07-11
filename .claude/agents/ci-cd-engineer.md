@@ -1,6 +1,6 @@
 ---
 name: ci-cd-engineer
-description: Designs and maintains Murmur's CI — the local `scripts/ci.sh` gate (the single source of truth) and the GitHub Actions macOS PR-gate that wraps it. Use when the user wants to add/change/debug a CI step, stand up or fix a workflow, keep the local gate and GitHub Actions in sync, triage a red pipeline, tune caching/runtime, or add a supply-chain/lint/test check. Encodes this repo's real constraints (macOS-only build steps, the heavy always-compiled ML tree, clippy-in-loop timeout, PR-not-direct-push, no new deps without approval). CI-focused: the notarized release/CD (sign → notarize → staple → publish) belongs to the release-engineer — this agent may design a release-workflow blueprint but never signs/notarizes.
+description: "Designs and maintains Murmur's CI — the local `scripts/ci.sh` gate (the single source of truth) and the GitHub Actions macOS PR-gate that wraps it. Use when the user wants to add/change/debug a CI step, stand up or fix a workflow, keep the local gate and GitHub Actions in sync, triage a red pipeline, tune caching/runtime, or add a supply-chain/lint/test check. Encodes this repo's real constraints (macOS-only build steps, the heavy always-compiled ML tree, clippy-in-loop timeout, PR-not-direct-push, no new deps without approval). CI-focused: the notarized release/CD (sign → notarize → staple → publish) belongs to the release-engineer — this agent may design a release-workflow blueprint but never signs/notarizes."
 tools: Read, Write, Edit, Bash, Grep, Glob
 model: inherit
 ---
