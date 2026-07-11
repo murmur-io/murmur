@@ -28,13 +28,14 @@ import {
   type PopoverSelection,
 } from "../note-brain-popover/note-brain-popover.component";
 import { NoteSharePanelComponent } from "../note-share-panel/note-share-panel.component";
+import { NoteSelectionToolbarComponent } from "../note-selection-toolbar/note-selection-toolbar.component";
 import { parseDoc, serializeDoc } from "./front-matter";
 
 /** The autosave indicator state. */
 type SaveState = "idle" | "saving" | "saved" | "error";
 
 /** The formatting-toolbar operations that wrap/toggle markdown around a selection. */
-type FormatOp =
+export type FormatOp =
   | "h1"
   | "h2"
   | "h3"
@@ -89,7 +90,9 @@ const AUTOSAVE_MS = 600;
  * debounced autosave, and a sticky header (folder breadcrumb + Move, Preview
  * toggle, Share, ⋯ menu). A sealed-not-unlocked note shows the lock gate.
  *
- * Selecting text in the body floats the {@link NoteBrainPopoverComponent} (FP3).
+ * Selecting text in the body floats a compact formatting bubble
+ * ({@link NoteSelectionToolbarComponent}); its "Ask Brain" button opens the
+ * {@link NoteBrainPopoverComponent} (FP3) over that same selection.
  *
  * State is signals; IPC lands in signals (never a subscribe-into-a-field);
  * DOM-after-render work is `afterNextRender({injector})` (no setTimeout in the
@@ -101,6 +104,7 @@ const AUTOSAVE_MS = 600;
   imports: [
     MarkdownComponent,
     NoteBrainPopoverComponent,
+    NoteSelectionToolbarComponent,
     NoteSharePanelComponent,
   ],
   templateUrl: "./note-editor.component.html",
@@ -176,8 +180,15 @@ export class NoteEditorComponent {
   readonly slashOpen = signal(false);
   readonly slashIndex = signal(0);
 
-  // --- Selection popover ---------------------------------------------------
-  readonly popoverSel = signal<PopoverSelection | null>(null);
+  // --- Selection toolbar + Brain popover -----------------------------------
+  /**
+   * The live body selection. Drives the floating formatting toolbar (bubble); the
+   * Brain popover mounts over the SAME selection only once {@link brainOpen} flips
+   * (the AI button), so selecting text no longer auto-pops the modal.
+   */
+  readonly sel = signal<PopoverSelection | null>(null);
+  /** True once the AI button opened the Brain popover for the current selection. */
+  readonly brainOpen = signal(false);
 
   private readonly titleInput =
     viewChild<ElementRef<HTMLInputElement>>("titleInput");
@@ -282,6 +293,16 @@ export class NoteEditorComponent {
       shorten: cfg?.noteAssistShorten ?? true,
       enhance: cfg?.noteAssistEnhance ?? true,
     };
+  });
+
+  /**
+   * Whether ANY note-assistant action is enabled — gates the bubble's "Ask Brain"
+   * button (formatting is always available; only the AI entry point is hidden when
+   * the user disabled every action in Settings).
+   */
+  readonly anyAssistEnabled = computed(() => {
+    const t = this.assistToggles();
+    return t.refine || t.shorten || t.enhance;
   });
 
   /**
@@ -660,6 +681,10 @@ export class NoteEditorComponent {
 
   setPreview(on: boolean): void {
     this.preview.set(on);
+    if (on) {
+      // No textarea to select in Preview — drop the floating bubble / Brain popover.
+      this.clearSelection();
+    }
     // Switching to Preview is a natural "I'm reviewing" pause: run the deferred FULL
     // save (re-index + vault export) once if there are unindexed edits, so the note
     // becomes brain-searchable + vault-synced without waiting for editor close.
@@ -1125,39 +1150,39 @@ export class NoteEditorComponent {
     }
   }
 
-  // ── Selection Brain popover ─────────────────────────────────────────────
+  // ── Selection toolbar + Brain popover ───────────────────────────────────
 
   /**
    * On a non-empty selection inside the body textarea, capture the selected text
-   * + bounded surrounding context + the anchor rect and float the popover. A
-   * collapsed selection closes it. Called on mouseup / keyup / select.
+   * + bounded surrounding context + the anchor rect and float the formatting
+   * bubble. A collapsed selection (or Preview) closes everything. Called on
+   * mouseup / keyup / select. Formatting is ALWAYS offered; the bubble's AI button
+   * is gated separately by {@link anyAssistEnabled}.
    */
   onBodySelect(): void {
     const el = this.bodyArea()?.nativeElement;
     if (!el || this.preview()) {
-      this.popoverSel.set(null);
-      return;
-    }
-    // If the user disabled EVERY assistant action in Settings, never float the
-    // popover (it would be an empty picker). Each toggle still hides its own
-    // button inside the popover when only some are off.
-    const t = this.assistToggles();
-    if (!t.refine && !t.shorten && !t.enhance) {
-      this.popoverSel.set(null);
+      this.clearSelection();
       return;
     }
     const start = el.selectionStart;
     const end = el.selectionEnd;
     const text = el.value.slice(start, end);
     if (text.trim().length === 0) {
-      this.popoverSel.set(null);
+      this.clearSelection();
+      return;
+    }
+    // Unchanged selection → leave state alone, so a stray keyup/mouseup can't
+    // reset an open Brain popover back to the bubble or re-trigger a reposition.
+    const cur = this.sel();
+    if (cur && cur.start === start && cur.end === end && cur.text === text) {
       return;
     }
     const rect = this.selectionRect(el, start, end);
     if (!rect) {
       return;
     }
-    this.popoverSel.set({
+    this.sel.set({
       text,
       start,
       end,
@@ -1165,11 +1190,34 @@ export class NoteEditorComponent {
       after: el.value.slice(end, end + CONTEXT_CHARS),
       rect,
     });
+    // A fresh selection always returns to the formatting bubble.
+    this.brainOpen.set(false);
   }
 
-  /** Dismiss the selection popover (Esc / outside-click / discard). */
+  /** Apply a bubble formatting op, then re-anchor the bubble to the new selection. */
+  onToolbarFormat(op: FormatOp): void {
+    this.format(op);
+    // `format` re-selects the transformed span (or collapses for block inserts);
+    // re-capture so the bubble repositions to the new rect (or hides if collapsed).
+    this.onBodySelect();
+  }
+
+  /** The AI button — open the Brain popover over the current selection. */
+  openBrain(): void {
+    if (this.sel()) {
+      this.brainOpen.set(true);
+    }
+  }
+
+  /** Dismiss the Brain popover + the bubble (Close / Discard / after Accept). */
   closePopover(): void {
-    this.popoverSel.set(null);
+    this.clearSelection();
+  }
+
+  /** Drop the selection state (hides both the bubble and the Brain popover). */
+  private clearSelection(): void {
+    this.sel.set(null);
+    this.brainOpen.set(false);
   }
 
   /**
@@ -1179,7 +1227,7 @@ export class NoteEditorComponent {
    */
   applyEdit(edit: AcceptedEdit): void {
     const el = this.bodyArea()?.nativeElement;
-    const sel = this.popoverSel();
+    const sel = this.sel();
     if (!el || !sel) {
       return;
     }
@@ -1192,7 +1240,7 @@ export class NoteEditorComponent {
     if (value.slice(start, end) !== sel.text) {
       start = value.indexOf(sel.text);
       if (start === -1) {
-        this.popoverSel.set(null);
+        this.clearSelection();
         return;
       }
       end = start + sel.text.length;
@@ -1204,7 +1252,7 @@ export class NoteEditorComponent {
     } else {
       this.replaceRange(el, start, end, edit.suggestion, start, start + edit.suggestion.length);
     }
-    this.popoverSel.set(null);
+    this.clearSelection();
   }
 
   // ── Presentational helpers ────────────────────────────────────────────

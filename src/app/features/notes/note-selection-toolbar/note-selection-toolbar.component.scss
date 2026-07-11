@@ -1,0 +1,98 @@
+/* The floating selection bubble floats OVER the editor → OPAQUE overlay (T3):
+   --surface-overlay, --border-strong, --shadow-lg, backdrop-filter:none. Never
+   the frosted .card. Positioned in JS (top/left set from the selection rect). */
+:host {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  pointer-events: none; /* only the bar itself is interactive */
+}
+
+.sel-bar {
+  position: fixed;
+  top: 0;
+  left: 0;
+  pointer-events: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  max-width: calc(100vw - 2 * var(--space-3));
+  padding: 4px 6px;
+  background: var(--surface-overlay);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-lg);
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+  animation: sel-in var(--transition) var(--ease-spring) both;
+}
+
+@keyframes sel-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px) scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+.sel-tool {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 30px;
+  height: 28px;
+  padding: 0 var(--space-2);
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 0.82rem;
+  font-weight: 550;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background var(--transition-fast), color var(--transition-fast);
+}
+.sel-tool:hover {
+  background: var(--surface-hover);
+  color: var(--text-primary);
+}
+.sel-tool:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--accent-ring);
+}
+
+.sel-sep {
+  width: 1px;
+  height: 18px;
+  margin: 0 var(--space-1);
+  background: var(--border-subtle);
+}
+
+/* The accent AI entry point — the one restrained accent in the neutral bar. */
+.sel-ai {
+  gap: var(--space-1);
+  padding: 0 var(--space-2);
+  color: var(--accent-hover);
+  font-weight: 600;
+}
+.sel-ai:hover {
+  background: var(--accent-soft);
+  color: var(--accent-hover);
+}
+.sel-ai-glyph {
+  width: 11px;
+  height: 11px;
+  border-radius: 3px;
+  background: var(--accent-gradient);
+  box-shadow: 0 0 10px var(--accent-soft);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sel-bar {
+    animation: none;
+  }
+}
