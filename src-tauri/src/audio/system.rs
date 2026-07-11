@@ -155,26 +155,40 @@ impl SystemAudioRecorder {
     /// SIGTERM the sidecar so it finalizes the WAV, wait for it, and return the WAV path
     /// if it captured anything. Returns `Ok(None)` on sidecar failure (e.g. permission
     /// denied → exit 3) so the caller proceeds mic-only rather than failing the recording.
-    pub fn stop(mut self) -> Result<Option<PathBuf>> {
+    ///
+    /// `self` implements `Drop` (C1), so we run the whole teardown under [`std::mem::ManuallyDrop`]
+    /// and SUPPRESS the drop-guard's second teardown — a clean `stop` reaps the child exactly once
+    /// (no double-SIGTERM, no recycled-pid risk). The fields are then dropped explicitly (no leak).
+    pub fn stop(self) -> Result<Option<PathBuf>> {
+        let mut this = std::mem::ManuallyDrop::new(self);
         // Use `/bin/kill -TERM` (not `Child::kill`, which is SIGKILL and would truncate
         // the WAV) so the sidecar's signal handler can flush + close the file.
         let _ = Command::new("kill")
             .arg("-TERM")
-            .arg(self.child.id().to_string())
+            .arg(this.child.id().to_string())
             .status();
 
-        let status = self
-            .child
-            .wait()
-            .map_err(|e| AppError::Audio(format!("waiting on system-audio sidecar: {e}")))?;
+        let wait_res = this.child.wait();
 
         // Join the stderr drainer (the child is gone, so its stderr is at EOF → the thread ends).
-        if let Some(handle) = self.stderr_reader.take() {
+        if let Some(handle) = this.stderr_reader.take() {
             let _ = handle.join();
         }
 
-        if status.success() && self.wav_path.exists() {
-            Ok(Some(self.wav_path))
+        // Take the fields out of the ManuallyDrop, then let them drop normally at end of scope —
+        // the recorder's `Drop` never runs (suppressed), so the child is reaped exactly once here.
+        // SAFETY: each field is read exactly once out of the ManuallyDrop and never used again.
+        let wav_path = unsafe { std::ptr::read(&this.wav_path) };
+        let _child = unsafe { std::ptr::read(&this.child) };
+        let _first_frame_at = unsafe { std::ptr::read(&this.first_frame_at) };
+        // `stderr_reader` was already `.take()`n above (now `None`); read + drop it too.
+        let _stderr_reader = unsafe { std::ptr::read(&this.stderr_reader) };
+
+        let status = wait_res
+            .map_err(|e| AppError::Audio(format!("waiting on system-audio sidecar: {e}")))?;
+
+        if status.success() && wav_path.exists() {
+            Ok(Some(wav_path))
         } else {
             tracing::warn!(
                 target: "audio",
@@ -186,9 +200,30 @@ impl SystemAudioRecorder {
     }
 }
 
+/// C1 — best-effort teardown for a recorder that is DROPPED without a clean [`SystemAudioRecorder::stop`]
+/// (app-quit mid-recording, a panic, a `take()` into a discard). A std [`Child`] merely DETACHES on
+/// drop — it does not kill or reap — so without this the Swift capture helper reparents to launchd and
+/// keeps writing to its temp WAV until its 4h self-cap. SIGTERM (not SIGKILL) so the helper flushes +
+/// closes its WAV exactly as `stop()` does, then `wait()` to reap the child (no `<defunct>` zombie).
+///
+/// After a normal `stop()` (which runs teardown under `ManuallyDrop` and suppresses this guard) this
+/// Drop never runs on that value, so there is no double-SIGTERM / recycled-pid risk. Panic-free:
+/// every step is `let _ =`.
+impl Drop for SystemAudioRecorder {
+    fn drop(&mut self) {
+        // SIGTERM via `/bin/kill` (matches `stop`) so the helper's signal handler finalizes the WAV.
+        let _ = Command::new("kill")
+            .arg("-TERM")
+            .arg(self.child.id().to_string())
+            .status();
+        // Reap the child so it does not linger as a zombie for the process lifetime.
+        let _ = self.child.wait();
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::is_first_frame_line;
+    use super::*;
 
     #[test]
     fn first_frame_line_is_recognized() {
@@ -199,5 +234,55 @@ mod tests {
             "audiocap: tap stuck silent — rebuilding (1)"
         ));
         assert!(!is_first_frame_line(""));
+    }
+
+    /// Whether `pid` still has a process-table entry (any state). None once fully reaped.
+    fn ps_present(pid: u32) -> bool {
+        std::process::Command::new("/bin/ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .map(|o| !String::from_utf8_lossy(&o.stdout).trim().is_empty())
+            .unwrap_or(false)
+    }
+
+    /// Build a `SystemAudioRecorder` around a real long-lived dummy child (`sleep`) WITHOUT going
+    /// through `start()` (which needs an AppHandle + a real sidecar). Mirrors the struct `start()`
+    /// produces: no stderr reader, spawn instant as the anchor.
+    fn recorder_over_dummy_child() -> (SystemAudioRecorder, u32) {
+        let child = Command::new("/bin/sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn a dummy long-lived child");
+        let pid = child.id();
+        let rec = SystemAudioRecorder {
+            child,
+            wav_path: std::path::PathBuf::from("/nonexistent/dummy.wav"),
+            started_at: std::time::Instant::now(),
+            first_frame_at: Arc::new(OnceLock::new()),
+            stderr_reader: None,
+        };
+        (rec, pid)
+    }
+
+    /// C1 (RED-before-GREEN): a `SystemAudioRecorder` DROPPED without a clean `stop()` (app-quit
+    /// mid-recording) must SIGTERM + REAP its capture-helper child. A std `Child` merely DETACHES on
+    /// drop — so before the added `impl Drop` the child would keep running (reparented to launchd)
+    /// and NEVER be reaped. Proof: after the drop the pid has no process-table entry at all.
+    #[test]
+    fn drop_without_stop_reaps_the_capture_child() {
+        let (rec, pid) = recorder_over_dummy_child();
+        assert!(ps_present(pid), "the dummy child is alive before drop");
+
+        drop(rec); // no stop() — exercises the app-quit-mid-recording path.
+
+        // Give the SIGTERM + wait() a moment to complete.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            !ps_present(pid),
+            "dropping without stop() must SIGTERM + reap the child — no orphan, no zombie"
+        );
     }
 }

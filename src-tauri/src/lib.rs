@@ -404,6 +404,23 @@ pub fn run() {
             // (Salvage above already moved any RECOVERABLE far-side scratch out of the reaper's reach.)
             crate::audio::aec::reap_orphaned_capture_helpers();
             crate::audio::aec::sweep_stale_scratch();
+            // R1: reclaim any STALE `*.part` model-download residue (a crash / force-quit / aborted
+            // model switch mid-download orphans up to ~3.1 GB). Only removes a `.part` older than 1 h
+            // so a live in-progress download is never raced. Best-effort; never fatal to launch.
+            if let Ok(models_dir) = crate::transcribe::model::models_dir() {
+                crate::transcribe::model::sweep_stale_model_parts(&models_dir);
+            }
+            // R2: reclaim any orphaned export temp DOTFILE (`.<stem>.<pid>.tmp` / `.edit.<pid>.tmp`)
+            // a SIGKILL between fsync + rename left in the user's Obsidian vault. Only removes a temp
+            // whose PID is dead OR whose mtime is > 1 h, and never descends into `.obsidian`/`.trash`,
+            // so a live export is never raced. Skipped entirely when no vault is configured.
+            {
+                let state = app.state::<AppState>();
+                let vault = state.config.lock().ok().and_then(|c| c.vault_path.clone());
+                if let Some(vault) = vault.filter(|v| !v.trim().is_empty()) {
+                    crate::export::obsidian::sweep_stale_export_tmp(std::path::Path::new(&vault));
+                }
+            }
 
             // STAGE 2 salvage worker (async, detached): now that the reaper has downed any orphan
             // helper, reconstruct + pipeline each claimed crashed recording. No-op when nothing crashed.
@@ -547,7 +564,8 @@ pub fn run() {
                 main.on_window_event(move |event| {
                     if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                         api.prevent_close();
-                        relock_and_zeroize_on_lifecycle(&handle, "window-close");
+                        // Window-close only HIDES (recoverable from the tray) — do NOT stop capture.
+                        relock_and_zeroize_on_lifecycle(&handle, LIFECYCLE_CTX_WINDOW_CLOSE);
                         let _ = w.hide();
                     }
                 });
@@ -561,24 +579,43 @@ pub fn run() {
             // checkpoint+truncate the WAL so no plaintext lingers past the process. This is the
             // last-chance cleanup before the process tears down.
             if let tauri::RunEvent::ExitRequested { .. } = event {
-                relock_and_zeroize_on_lifecycle(handle, "app-exit");
-                // Kill the on-device brain sidecar so its multi-GB model RAM is reclaimed on quit
-                // (bounded reap — never hangs app-exit; a slow-dying child reparents to launchd and
-                // the startup reaper SIGTERMs it next launch).
+                // True exit — relock + stop_all_capture (C2) run FIRST inside the hook, THEN kill the
+                // brain sidecar so its multi-GB model RAM is reclaimed on quit (bounded reap — never
+                // hangs app-exit; a slow-dying child reparents to launchd and the startup reaper
+                // SIGTERMs it next launch).
+                relock_and_zeroize_on_lifecycle(handle, LIFECYCLE_CTX_APP_EXIT);
                 crate::reason::sidecar::kill_on_quit();
             }
         });
 }
 
+/// Lifecycle-hook context tags. `app-exit` is the TRUE quit (stop capture + relock); `window-close`
+/// merely hides the window while the app keeps running/recording in the tray (relock only, NEVER
+/// stop capture). Kept as named constants so the C2 exit-only gate can't drift on a typo.
+const LIFECYCLE_CTX_APP_EXIT: &str = "app-exit";
+const LIFECYCLE_CTX_WINDOW_CLOSE: &str = "window-close";
+
 /// Shared lifecycle cleanup (B12/C4): relock every session-unlocked folder (which re-blanks plaintext
 /// + zeroizes the cached master KEK) and checkpoint+truncate the WAL. Best-effort and panic-free —
 ///   invoked from both the window-close and app-exit paths, where there is no Result to surface. No-op
 ///   if AppState was never managed (the graceful-init failure path returns early without it).
+///
+/// C2: on the TRUE exit path (`ctx == "app-exit"`) we ALSO stop every capture path in-process
+/// (`stop_all_capture`) FIRST, so quitting mid-recording finalizes + reaps the Swift capture helpers
+/// instead of orphaning them to launchd until their 4h self-cap (the next-launch reaper then becomes
+/// the safety net, not the primary path). We deliberately do NOT stop capture on `ctx ==
+/// "window-close"`: closing the window only HIDES it and the app keeps recording in the tray — killing
+/// capture there would silently drop an active tray recording.
 fn relock_and_zeroize_on_lifecycle(handle: &tauri::AppHandle, ctx: &str) {
     use crate::state::AppState;
     let Some(state) = handle.try_state::<AppState>() else {
         return; // init failed / state not managed — nothing to clean up.
     };
+    // C2: FIRST, on the true exit path only, finalize + reap the capture helpers. Never on a mere
+    // window-hide (the tray recording must survive that).
+    if ctx == LIFECYCLE_CTX_APP_EXIT {
+        crate::commands::stop_all_capture(state.inner());
+    }
     // relock_all_inner clears the unlock set, zeroizes the cached KEK, re-blanks all sealed notes,
     // and (as of B12) checkpoints the WAL.
     if let Err(e) = crate::commands::relock_all_inner(state.inner()) {
