@@ -928,6 +928,26 @@ impl GenOptions {
         }
     }
 
+    /// The NOTE-EDIT preset (refine / shorten): a caller-computed hard token cap sized off the
+    /// selection length so a compression/rewrite edit can't run away and LENGTHEN the passage (the
+    /// "shorten made it longer" bug — the fully-local note-assist path otherwise ran with
+    /// `GenOptions::default()`, i.e. NO cap and the model's diversity-tuned default sampler). Low
+    /// temperature (0.2) for a faithful, near-deterministic edit rather than a creative rewrite, and
+    /// a 30 s wall-clock timeout so an interactive edit degrades instead of hanging the popover.
+    /// Effective on the on-device GGUF path ([`sidecar::SidecarReasoner`] honors it via
+    /// `set_sampler_max_len`); a best-effort no-op on stub/cloud/AFM (the cloud provider has its own
+    /// limits). The cap is a RUNAWAY GUARD — the prompt's length budget + the output-length
+    /// validation are the primary controls.
+    pub fn edit_rewrite(max_tokens: usize) -> Self {
+        Self {
+            max_tokens: Some(max_tokens),
+            temperature: Some(0.2),
+            enable_thinking: false,
+            timeout: Some(std::time::Duration::from_secs(30)),
+            ..Self::default()
+        }
+    }
+
     /// Brain v2 P0.3 — the LIVE in-meeting answer preset: a hard 1024-token cap so a runaway
     /// on-device decode can't saturate Metal mid-recording (effective on the local GGUF path — the
     /// only truly unbounded one; a best-effort no-op elsewhere), plus a 30 s wall-clock timeout —
