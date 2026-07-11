@@ -1,10 +1,5 @@
-# The bundled onnxruntime static lib in sherpa-onnx (offline speaker diarization) is built for
-# macOS 13.4+. Pin the binary's deployment target so its `minos` matches the shipped floor
-# (tauri.conf.json minimumSystemVersion = 13.4) instead of emitting a linker-version mismatch.
-[env]
-MACOSX_DEPLOYMENT_TARGET = "13.4"
-# mistralrs/metal (the on-device brain, ALWAYS compiled) precompiles Metal shaders via `xcrun metal`,
-# which needs the FULL Xcode toolchain. On a Command-Line-Tools-only Mac that step fails, so we defer
-# shader compile to first runtime use. Set here (not force) so every cargo invocation — `npm run dev`,
-# `cargo test --lib`, `tauri build` — gets it automatically; an explicit env override still wins.
-MISTRALRS_METAL_PRECOMPILE = "0"
+# The build `[env]` (MACOSX_DEPLOYMENT_TARGET, MISTRALRS_METAL_PRECOMPILE) MOVED to the WORKSPACE
+# ROOT `../.cargo/config.toml` (2026-07-11, brain-sidecar extraction) so the sibling
+# `crates/murmur-brain` member — the crate that now owns mistralrs — also inherits it (cargo does not
+# read a sibling member's `.cargo/config.toml`). A build started here still picks up the root config
+# via upward config discovery, so nothing changes for `cd src-tauri && cargo ...`.

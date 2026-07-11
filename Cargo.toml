@@ -1,0 +1,17 @@
+# Virtual workspace root (introduced for the brain-sidecar extraction, 2026-07-11).
+#
+# WHY a workspace: the on-device GGUF LLM (mistralrs) was extracted out of the app crate into its
+# OWN member crate (`crates/murmur-brain`) compiled to a killable helper binary `meetnotes-brain`.
+# The app crate (`src-tauri`, package `murmur`) NO LONGER depends on mistralrs — so `cargo test --lib`
+# stops compiling the largest single ML tree, and (the real point) the multi-GB model residency +
+# mistralrs drop-leaks (#723/#865) + uncancellable generation now live in a child process whose RAM
+# the OS reclaims in full on kill (idle-unload / timeout / quit).
+#
+# The murmur-protocol path-dep (../../murmur-server/crates/murmur-protocol) lives OUTSIDE this repo
+# in a SEPARATE workspace — a path-dependency, never a member here, so it is unaffected.
+[workspace]
+resolver = "2"
+members = ["src-tauri", "crates/murmur-brain"]
+# Keep the inner loop + `cd src-tauri && cargo ...` (CI / release / `npm run dev`) building ONLY the
+# app crate by default; the brain sidecar is built explicitly (beforeBuildCommand / `-p murmur-brain`).
+default-members = ["src-tauri"]

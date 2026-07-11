@@ -194,7 +194,8 @@ tags do not support."
 /// prefill KV cache from an unbounded 1h transcript (P0.2 / mem-2 — the note-generation twin of the
 /// `timeline.rs` guard). Matches the `MAX_TRANSCRIPT_CHARS` cap `chat.rs`/`recipes.rs` already apply.
 /// Cloud providers call [`render_user_content`] directly and are NOT capped (they handle the full
-/// transcript; the RAM-refuse guard in `reason/mistral.rs` is the true OOM backstop).
+/// transcript; the RAM-refuse guard in `reason/sidecar.rs` — plus the child's own self-check — is
+/// the true OOM backstop).
 const LOCAL_NOTE_MAX_CHARS: usize = 40_000;
 
 pub fn render_prompt(req: &SummarizeRequest) -> String {

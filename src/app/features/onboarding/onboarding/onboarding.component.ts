@@ -519,6 +519,11 @@ export class OnboardingComponent implements OnInit {
       // Live-caption engine — preserve-only here (the Settings Transcription section owns the
       // toggle + the parakeet download); round-trip the snapshot, default "whisper".
       liveAsrEngine: base?.liveAsrEngine ?? "whisper",
+      // Brain-sidecar lifecycle timeouts — preserve-only here (the Settings Transcription/brain
+      // section owns the controls); round-trip the snapshot, defaults mirror AppConfig::default().
+      brainIdleTimeoutSecs: base?.brainIdleTimeoutSecs ?? 300,
+      brainReadyTimeoutSecs: base?.brainReadyTimeoutSecs ?? 90,
+      brainHardCapSecs: base?.brainHardCapSecs ?? 180,
       voiceTrigger: base?.voiceTrigger ?? false,
       onboarded: markOnboarded ? true : (base?.onboarded ?? false),
       // First-run sharing latch — preserve-only here (the /welcome gateway owns

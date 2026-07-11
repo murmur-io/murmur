@@ -19,6 +19,8 @@
 /src-tauri/binaries/meetnotes-sysaudio
 /src-tauri/binaries/meetnotes-audiocap
 /src-tauri/binaries/meetnotes-aeccap
+# Build artifact: universal brain sidecar (~219 MB) staged by beforeBuildCommand for bundle.resources
+/src-tauri/binaries/meetnotes-brain
 .claude/tmp/
 
 # Playwright

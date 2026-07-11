@@ -39,6 +39,18 @@ const PROVIDER_CONNECTION_IDS: readonly string[] = [
 ];
 
 /**
+ * Coerce a form value (a number, a numeric string, or blank/null after clearing a
+ * `<input type="number">`) to a finite POSITIVE integer, falling back to `fallback`
+ * for anything blank/non-finite/≤ 0. Used for the brain-sidecar timeout fields so a
+ * cleared/invalid control never persists a pathological 0-second window (the backend
+ * re-defaults 0 too — belt and suspenders).
+ */
+function coercePositive(value: unknown, fallback: number): number {
+  const n = Math.floor(Number(value));
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+/**
  * Synthetic id for the built-in on-device engine (the brain-engine-card) in the
  * `inUseConnections` set — it is not a provider CONNECTION, so it needs its own
  * token to be markable "In use now" alongside the real connection ids.
@@ -149,6 +161,12 @@ export class SettingsStore {
     modelSize: "large-v3",
     // OPTIONAL live-caption engine: "whisper" (default) | "parakeet".
     liveAsrEngine: "whisper",
+    // Brain-sidecar lifecycle timeouts (seconds). COMMIT ON BLUR (like the storage cap): a
+    // per-keystroke commit would persist intermediate values ("3" while typing "30"). The 0-guard
+    // in the backend's `dto_to_config` falls a 0/blank back to the default, never a zero window.
+    brainIdleTimeoutSecs: this.fb.nonNullable.control(300, { updateOn: "blur" }),
+    brainReadyTimeoutSecs: this.fb.nonNullable.control(90, { updateOn: "blur" }),
+    brainHardCapSecs: this.fb.nonNullable.control(180, { updateOn: "blur" }),
     voiceTrigger: false,
     noteStyle: "standard",
     notesMode: "enhance",
@@ -1285,6 +1303,9 @@ export class SettingsStore {
         // here is only the nullish safety net.
         modelSize: cfg.modelSize ?? "small",
         liveAsrEngine: cfg.liveAsrEngine ?? "whisper",
+        brainIdleTimeoutSecs: cfg.brainIdleTimeoutSecs ?? 300,
+        brainReadyTimeoutSecs: cfg.brainReadyTimeoutSecs ?? 90,
+        brainHardCapSecs: cfg.brainHardCapSecs ?? 180,
         voiceTrigger: cfg.voiceTrigger ?? false,
         noteStyle: cfg.noteStyle ?? "standard",
         notesMode: cfg.notesMode ?? "enhance",
@@ -2005,6 +2026,12 @@ export class SettingsStore {
       audioAutoPrune: v.audioAutoPrune,
       modelSize: v.modelSize,
       liveAsrEngine: v.liveAsrEngine,
+      // Brain-sidecar timeouts (seconds). Coerce to a finite positive number; a blank/invalid value
+      // falls back to the default here AND the backend's `dto_to_config` re-defaults a 0 — belt and
+      // suspenders, never a pathological zero window.
+      brainIdleTimeoutSecs: coercePositive(v.brainIdleTimeoutSecs, 300),
+      brainReadyTimeoutSecs: coercePositive(v.brainReadyTimeoutSecs, 90),
+      brainHardCapSecs: coercePositive(v.brainHardCapSecs, 180),
       voiceTrigger: v.voiceTrigger,
       onboarded: this.loadedOnboarded,
       noteStyle: v.noteStyle,

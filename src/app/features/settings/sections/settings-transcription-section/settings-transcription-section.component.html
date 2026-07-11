@@ -201,5 +201,63 @@
               <p class="model-error text-danger">{{ perr }}</p>
             }
           </div>
+
+          <div class="card model-card">
+            <div class="model-copy">
+              <h3>On-device brain lifecycle</h3>
+              <p class="text-secondary model-sub">
+                Murmur's on-device brain runs as a separate helper process so its
+                memory is fully reclaimed when it's not needed. These timers control
+                how long it stays loaded and how long a single answer may take before
+                it's cancelled. The defaults suit most Macs — only change them if the
+                brain feels slow to unload or you want a longer generation ceiling.
+              </p>
+            </div>
+
+            <div class="model-grid">
+              <label class="field">
+                <span class="field-label">Idle unload (seconds)</span>
+                <input
+                  type="number"
+                  min="10"
+                  step="10"
+                  formControlName="brainIdleTimeoutSecs"
+                />
+                <span class="field-help text-muted">
+                  After this long with no brain activity, the helper is killed and its
+                  model memory is returned to the system. Default 300 (5 minutes).
+                </span>
+              </label>
+
+              <label class="field">
+                <span class="field-label">Ready timeout (seconds)</span>
+                <input
+                  type="number"
+                  min="10"
+                  step="10"
+                  formControlName="brainReadyTimeoutSecs"
+                />
+                <span class="field-help text-muted">
+                  How long to wait for the model to finish loading before falling back
+                  to the cloud/floor. Default 90.
+                </span>
+              </label>
+
+              <label class="field">
+                <span class="field-label">Max answer time (seconds)</span>
+                <input
+                  type="number"
+                  min="10"
+                  step="10"
+                  formControlName="brainHardCapSecs"
+                />
+                <span class="field-help text-muted">
+                  A single on-device answer that exceeds this is cancelled and the
+                  helper restarted, so a stuck generation can never hold memory
+                  forever. Default 180.
+                </span>
+              </label>
+            </div>
+          </div>
 </div>
 

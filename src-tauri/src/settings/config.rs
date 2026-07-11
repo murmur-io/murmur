@@ -175,6 +175,24 @@ pub struct AppConfig {
     /// existed loads as `"whisper"` (byte-identical to today's behavior).
     #[serde(default = "default_live_asr_engine")]
     pub live_asr_engine: String,
+    /// Brain-sidecar host-authoritative IDLE-KILL window (seconds): after this long with no
+    /// on-device brain request AND nothing in flight, the host kills the `meetnotes-brain` child to
+    /// reclaim ALL its model RAM to the OS. Default 300. `#[serde(default = "…")]` ⇒ a config
+    /// persisted before this field existed loads as 300 (byte-identical to the built-in default).
+    #[serde(default = "default_brain_idle_timeout_secs")]
+    pub brain_idle_timeout_secs: u64,
+    /// Brain-sidecar READY-handshake timeout (seconds): the bounded wait for the child's `Ready`
+    /// after spawn (model load can be slow on a cold disk / first Metal shader compile). On timeout
+    /// the child is killed and the brain call degrades to Cloud/floor — the app never blocks forever.
+    /// Default 90. `#[serde(default = "…")]` ⇒ pre-existing configs load as 90.
+    #[serde(default = "default_brain_ready_timeout_secs")]
+    pub brain_ready_timeout_secs: u64,
+    /// Brain-sidecar HARD per-generation cap (seconds) applied when a call carries NO `GenOptions`
+    /// timeout (note-gen / the FullyLocal Ask floor). Unlike the old in-process path (unbounded), a
+    /// wedged child could hold model RAM forever, so the host guillotines + respawns at this cap.
+    /// Default 180. `#[serde(default = "…")]` ⇒ pre-existing configs load as 180.
+    #[serde(default = "default_brain_hard_cap_secs")]
+    pub brain_hard_cap_secs: u64,
     /// T1.3 (transcription heat) — the LIVE caption tick's model PIN. Non-empty (default
     /// `"small"`) ⇒ while recording, the live loop decodes with THIS size whenever its file is
     /// downloaded, regardless of `model_size` and `brain_live` — live captions are throwaway
@@ -564,6 +582,21 @@ fn default_live_asr_engine() -> String {
     crate::transcribe::live_asr::ENGINE_WHISPER.to_string()
 }
 
+/// serde default for [`AppConfig::brain_idle_timeout_secs`] — 300 s (5 min) idle-kill window.
+fn default_brain_idle_timeout_secs() -> u64 {
+    300
+}
+
+/// serde default for [`AppConfig::brain_ready_timeout_secs`] — 90 s ready-handshake bound.
+fn default_brain_ready_timeout_secs() -> u64 {
+    90
+}
+
+/// serde default for [`AppConfig::brain_hard_cap_secs`] — 180 s hard per-generation cap.
+fn default_brain_hard_cap_secs() -> u64 {
+    180
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -593,6 +626,9 @@ impl Default for AppConfig {
             // `transcribe::model::default_model_size`. Onboarding preselects THIS value.
             model_size: crate::transcribe::model::default_model_size_now().to_string(),
             live_asr_engine: default_live_asr_engine(),
+            brain_idle_timeout_secs: default_brain_idle_timeout_secs(),
+            brain_ready_timeout_secs: default_brain_ready_timeout_secs(),
+            brain_hard_cap_secs: default_brain_hard_cap_secs(),
             live_model_pin: default_live_model_pin(),
             live_vad_gate: true,
             voice_trigger: false,
@@ -681,6 +717,9 @@ const K_AUDIO_STORAGE_LIMIT_GB: &str = "audio_storage_limit_gb";
 const K_AUDIO_AUTO_PRUNE: &str = "audio_auto_prune";
 const K_MODEL_SIZE: &str = "model_size";
 const K_LIVE_ASR_ENGINE: &str = "live_asr_engine";
+const K_BRAIN_IDLE_TIMEOUT_SECS: &str = "brain_idle_timeout_secs";
+const K_BRAIN_READY_TIMEOUT_SECS: &str = "brain_ready_timeout_secs";
+const K_BRAIN_HARD_CAP_SECS: &str = "brain_hard_cap_secs";
 const K_LIVE_MODEL_PIN: &str = "live_model_pin";
 const K_LIVE_VAD_GATE: &str = "live_vad_gate";
 const K_VOICE_TRIGGER: &str = "voice_trigger";
@@ -815,6 +854,23 @@ impl AppConfig {
         if let Some(v) = db.get_setting(K_LIVE_ASR_ENGINE)? {
             if !v.is_empty() {
                 cfg.live_asr_engine = v;
+            }
+        }
+        // Brain-sidecar timeouts: parse the stored decimal; a missing key OR an unparseable value
+        // keeps the built-in default (never a 0-second window that would kill/degrade immediately).
+        if let Some(v) = db.get_setting(K_BRAIN_IDLE_TIMEOUT_SECS)? {
+            if let Ok(n) = v.parse::<u64>() {
+                cfg.brain_idle_timeout_secs = n;
+            }
+        }
+        if let Some(v) = db.get_setting(K_BRAIN_READY_TIMEOUT_SECS)? {
+            if let Ok(n) = v.parse::<u64>() {
+                cfg.brain_ready_timeout_secs = n;
+            }
+        }
+        if let Some(v) = db.get_setting(K_BRAIN_HARD_CAP_SECS)? {
+            if let Ok(n) = v.parse::<u64>() {
+                cfg.brain_hard_cap_secs = n;
             }
         }
         // `""` is a VALID stored value (= pin disabled), so it is taken verbatim — only an
@@ -1083,6 +1139,15 @@ impl AppConfig {
         )?;
         db.set_setting(K_MODEL_SIZE, &self.model_size)?;
         db.set_setting(K_LIVE_ASR_ENGINE, &self.live_asr_engine)?;
+        db.set_setting(
+            K_BRAIN_IDLE_TIMEOUT_SECS,
+            &self.brain_idle_timeout_secs.to_string(),
+        )?;
+        db.set_setting(
+            K_BRAIN_READY_TIMEOUT_SECS,
+            &self.brain_ready_timeout_secs.to_string(),
+        )?;
+        db.set_setting(K_BRAIN_HARD_CAP_SECS, &self.brain_hard_cap_secs.to_string())?;
         db.set_setting(K_LIVE_MODEL_PIN, &self.live_model_pin)?;
         db.set_setting(
             K_LIVE_VAD_GATE,
@@ -1629,6 +1694,53 @@ mod tests {
         }"#;
         let cfg: AppConfig = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.live_asr_engine, "whisper");
+    }
+
+    /// Brain-sidecar timeouts: default to 300/90/180 (fresh struct AND empty settings table so
+    /// today's behavior is unchanged), round-trip explicit values through save/load, and a payload
+    /// that OMITS them (persisted before the fields existed) deserializes to the defaults via the
+    /// `#[serde(default = "…")]` fns.
+    #[test]
+    fn brain_sidecar_timeouts_default_and_round_trip() {
+        let d = AppConfig::default();
+        assert_eq!(d.brain_idle_timeout_secs, 300);
+        assert_eq!(d.brain_ready_timeout_secs, 90);
+        assert_eq!(d.brain_hard_cap_secs, 180);
+
+        let db = temp_db();
+        let loaded = AppConfig::load(&db).unwrap();
+        assert_eq!(loaded.brain_idle_timeout_secs, 300);
+        assert_eq!(loaded.brain_ready_timeout_secs, 90);
+        assert_eq!(loaded.brain_hard_cap_secs, 180);
+
+        // Explicit values persist + reload verbatim.
+        let cfg = AppConfig {
+            brain_idle_timeout_secs: 120,
+            brain_ready_timeout_secs: 45,
+            brain_hard_cap_secs: 240,
+            ..Default::default()
+        };
+        cfg.save(&db).unwrap();
+        let r = AppConfig::load(&db).unwrap();
+        assert_eq!(r.brain_idle_timeout_secs, 120);
+        assert_eq!(r.brain_ready_timeout_secs, 45);
+        assert_eq!(r.brain_hard_cap_secs, 240);
+
+        // A JSON payload omitting the brain-timeout keys deserializes to the defaults.
+        let json = r#"{
+            "providerId":"claude_code","vaultPath":null,"vaultSubfolder":null,
+            "whisperModelPath":null,"language":null,"anthropicModel":"claude-opus-4-8",
+            "ollamaBaseUrl":"http://localhost:11434","ollamaModel":"llama3.1","claudeBinary":"claude",
+            "inputDevice":null,"captureSystemAudio":false,"vadEnabled":true,"keepHiresMasters":false,
+            "diarizeOthers":false,"aecEnabled":false,"postAecEnabled":true,"modelSize":"large-v3","voiceTrigger":false,
+            "onboarded":false,"noteStyle":"standard","autoOrganize":false,"noteLanguage":"auto",
+            "mcpRequireToken":true,"lockRequireBiometric":true,"relockOnScreenshare":true,
+            "cloudEgressConsented":false
+        }"#;
+        let cfg: AppConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.brain_idle_timeout_secs, 300);
+        assert_eq!(cfg.brain_ready_timeout_secs, 90);
+        assert_eq!(cfg.brain_hard_cap_secs, 180);
     }
 
     #[test]

@@ -1,0 +1,14 @@
+# Workspace-wide build env — MOVED here from src-tauri/.cargo/config.toml (2026-07-11) so BOTH
+# members inherit it. Cargo config discovery walks from the build cwd UP the directory tree, so a
+# build started in `src-tauri/` still picks this up; but a build of the sibling `crates/murmur-brain`
+# member does NOT read `src-tauri/.cargo/config.toml` — and murmur-brain is the crate that actually
+# owns mistralrs, so its Metal-shader precompile MUST see MISTRALRS_METAL_PRECOMPILE here.
+[env]
+# sherpa-onnx's bundled static onnxruntime is built for macOS 13.4+. Pin the deployment target so the
+# binary's `minos` matches the shipped floor (tauri.conf.json minimumSystemVersion = 13.4).
+MACOSX_DEPLOYMENT_TARGET = "13.4"
+# mistralrs/metal precompiles Metal shaders via `xcrun metal`, which needs the FULL Xcode toolchain.
+# On a Command-Line-Tools-only Mac that step fails, so defer shader compile to first runtime use.
+# REQUIRED by BOTH members: the brain crate owns mistralrs; the app crate still links candle/whisper
+# Metal. Set (not force) so an explicit env override still wins.
+MISTRALRS_METAL_PRECOMPILE = "0"
