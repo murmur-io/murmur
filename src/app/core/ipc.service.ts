@@ -89,6 +89,7 @@ import type {
   OrgSharePreview,
   OrgShareEntry,
   OrgItemDetail,
+  OrgItemHeader,
   OrgSyncReport,
   ActiveSharesReport,
 } from "./models";
@@ -605,17 +606,41 @@ export class IpcService {
   }
 
   /**
+   * List a SPECIFIC org's browsable shared-brain items (`list_org_items`) — the
+   * synced+decrypted item headers (title + author hint + date), newest first.
+   * This is what makes org content BROWSABLE (previously it was search-only, so a
+   * member had nowhere to see a colleague's share). Content-lean per the org
+   * "no content-derived strings" discipline; the full body is fetched by
+   * {@link orgGetItem} in the viewer. `orgId` targets the org in a multi-org world.
+   */
+  listOrgItems(orgId: string): Promise<OrgItemHeader[]> {
+    return invoke<OrgItemHeader[]>("list_org_items", { orgId });
+  }
+
+  /**
    * Publish a MEETING to the org brain (seal under the OCK + upload). Gate order
    * backend-side: unlocked → consent → clean → scrub → seal → upload → ledger.
    * Refuses (`Locked`) a sealed meeting; requires org membership + consent.
    */
-  shareMeetingToOrg(meetingId: string, scrub: boolean): Promise<void> {
-    return invoke<void>("share_meeting_to_org", { meetingId, scrub });
+  shareMeetingToOrg(
+    meetingId: string,
+    orgId: string,
+    scrub: boolean,
+  ): Promise<void> {
+    return invoke<void>("share_meeting_to_org", { meetingId, orgId, scrub });
   }
 
-  /** Publish an authored NOTE to the org brain. Same gated pipeline as the meeting path. */
-  shareDocumentToOrg(documentId: string, scrub: boolean): Promise<void> {
-    return invoke<void>("share_document_to_org", { documentId, scrub });
+  /**
+   * Publish an authored NOTE to the org brain. Same gated pipeline as the meeting
+   * path. `orgId` targets the CHOSEN org (previously the backend shared to the
+   * FIRST org via `.next()`, which is why a share landed in the wrong org).
+   */
+  shareDocumentToOrg(
+    documentId: string,
+    orgId: string,
+    scrub: boolean,
+  ): Promise<void> {
+    return invoke<void>("share_document_to_org", { documentId, orgId, scrub });
   }
 
   /** This user's outgoing org shares (drives the "In Org Brain" state + per-item revoke). */

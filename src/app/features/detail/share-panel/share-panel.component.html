@@ -490,11 +490,9 @@
       />
     }
 
-    @if (orgSheetOpen() && org(); as orgStatus) {
+    @if (orgSheetOpen() && org()) {
       <app-org-share-sheet
         [target]="orgTarget()"
-        [orgName]="orgStatus.name"
-        [memberCount]="orgStatus.memberCount"
         (shared)="onOrgShared()"
         (cancelled)="closeOrgSheet()"
       />

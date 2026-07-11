@@ -37,6 +37,7 @@ const TWO_ORGS = () => [
     consented: true,
     lastSeq: 42,
     itemCount: 12,
+    receivedCount: 12,
     pendingShares: 0,
   },
   {
@@ -46,7 +47,8 @@ const TWO_ORGS = () => [
     memberCount: 8,
     consented: true,
     lastSeq: 100,
-    itemCount: 57,
+    itemCount: 0,
+    receivedCount: 57,
     pendingShares: 0,
   },
 ];

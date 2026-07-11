@@ -1801,10 +1801,40 @@ export interface OrgStatus {
   consented: boolean;
   /** Last synced feed sequence (drives the "N items synced" status). */
   lastSeq: number;
-  /** Number of decrypted org items in the local replica. */
+  /**
+   * Items YOU uploaded into this org (your own outbound shares). Distinct from
+   * {@link receivedCount} — labelling them separately kills the "0 items" lie
+   * where a member who received a colleague's share still saw `0` because this
+   * only counted the caller's OWN uploads.
+   */
   itemCount: number;
+  /**
+   * Items IN the org brain that THIS member has synced + ingested (everyone's
+   * shares, including received ones). This is the count of browsable org items —
+   * pair it with {@link itemCount} in the UI ("N in the org brain · M shared by
+   * you"). Mirrors the Rust `OrgStatus.receivedCount`.
+   */
+  receivedCount: number;
   /** Local outbound org shares still queued/failed (awaiting the launch sweep). */
   pendingShares: number;
+}
+
+/**
+ * One browsable row of an org's shared brain (`listOrgItems(orgId)`) — the
+ * header of a synced+decrypted org item, enough to render a list row that links
+ * to the read-only {@link OrgItemDetail} viewer (`/org-item/:id`). Content-lean:
+ * `title` + an author HINT (never a full identity) + the created date; the full
+ * body is fetched lazily by the viewer. `seq` is the item's feed sequence (stable
+ * order). Mirrors the Rust `OrgItemHeader`.
+ */
+export interface OrgItemHeader {
+  itemId: string;
+  title: string;
+  /** A short author hint (e.g. an email prefix) — never a full identity. */
+  authorHint: string;
+  createdAt: string;
+  /** The item's feed sequence — stable ordering key for the browse list. */
+  seq: number;
 }
 
 /**

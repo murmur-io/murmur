@@ -6,8 +6,14 @@ import {
   inject,
   signal,
 } from "@angular/core";
+import { RouterLink } from "@angular/router";
 import { IpcService } from "../../../../core/ipc.service";
-import type { OrgMember, OrgStatus } from "../../../../core/models";
+import { ToastService } from "../../../../services/toast.service";
+import type {
+  OrgItemHeader,
+  OrgMember,
+  OrgStatus,
+} from "../../../../core/models";
 
 /**
  * Settings → Organization section (Shared Brain v1, MULTI-ORG).
@@ -38,11 +44,13 @@ import type { OrgMember, OrgStatus } from "../../../../core/models";
 @Component({
   selector: "app-settings-organization-section",
   changeDetection: ChangeDetectionStrategy.OnPush,
+  imports: [RouterLink],
   templateUrl: "./settings-organization-section.component.html",
   styleUrl: "./settings-organization-section.component.scss",
 })
 export class SettingsOrganizationSectionComponent {
   private readonly ipc = inject(IpcService);
+  private readonly toast = inject(ToastService);
 
   /** Every org the user belongs to (created OR invited-into). Empty ⇒ empty state. */
   private readonly _orgs = signal<OrgStatus[]>([]);
@@ -110,6 +118,20 @@ export class SettingsOrganizationSectionComponent {
   private readonly _syncingOrgId = signal<string | null>(null);
   readonly syncingOrgId = this._syncingOrgId.asReadonly();
 
+  // ── Browse the shared brain (fix A) — per-org item list ──────────────────────
+  /** The org id whose "Shared brain" browse list is expanded (one at a time). */
+  private readonly _browseOrgId = signal<string | null>(null);
+  readonly browseOrgId = this._browseOrgId.asReadonly();
+  /** The expanded org's browsable items (`listOrgItems`). */
+  private readonly _orgItems = signal<OrgItemHeader[]>([]);
+  readonly orgItems = this._orgItems.asReadonly();
+  private readonly _itemsError = signal<string | null>(null);
+  readonly itemsError = this._itemsError.asReadonly();
+  private readonly _itemsLoading = signal(false);
+  readonly itemsLoading = this._itemsLoading.asReadonly();
+  /** Monotonic browse token — a resolved list writes only if it's still the latest. */
+  private _browseSeq = 0;
+
   constructor() {
     // On open: refresh membership from the server (so an invited-into org is
     // discovered) then load every org. Keyed on `_reloadTick` so create/leave/
@@ -161,12 +183,18 @@ export class SettingsOrganizationSectionComponent {
     this._reloadTick.update((n) => n + 1);
   }
 
-  /** Drop the expanded member manager if its org is gone from the fresh list. */
+  /** Drop the expanded member manager / browse list if their org is gone. */
   private reconcileExpanded(list: OrgStatus[]): void {
     const open = this._expandedOrgId();
     if (open && !list.some((o) => o.orgId === open)) {
       this._expandedOrgId.set(null);
       this._members.set([]);
+    }
+    const browse = this._browseOrgId();
+    if (browse && !list.some((o) => o.orgId === browse)) {
+      this._browseOrgId.set(null);
+      this._orgItems.set([]);
+      this._itemsError.set(null);
     }
   }
 
@@ -328,7 +356,13 @@ export class SettingsOrganizationSectionComponent {
 
   // ── Per-org: sync ──────────────────────────────────────────────────────────────
 
-  /** Pull + ingest one org's feed now, then reload the counts. */
+  /**
+   * Pull + ingest one org's feed now, inspect the report (fix E), then reload the
+   * counts. The report drives an honest toast: a partial/failed sync (errors, or
+   * pulled-but-nothing-ingested — the sync-stall symptom where a key isn't
+   * granted yet) shows a danger toast with the counts; a clean sync shows success.
+   * If the browse list for this org is open, refresh it too.
+   */
   async syncNow(org: OrgStatus): Promise<void> {
     if (this._syncingOrgId() !== null) {
       return;
@@ -336,12 +370,68 @@ export class SettingsOrganizationSectionComponent {
     this._syncingOrgId.set(org.orgId);
     this._error.set(null);
     try {
-      await this.ipc.orgSyncNow(org.orgId);
+      const report = await this.ipc.orgSyncNow(org.orgId);
+      const stalled = report.pulled > 0 && report.ingested === 0;
+      if (report.errors.length > 0 || stalled) {
+        this.toast.danger(
+          `${report.pulled} pulled, ${report.ingested} ingested, ` +
+            `${report.errors.length} error${report.errors.length === 1 ? "" : "s"} — ` +
+            `a key may not be granted yet.`,
+        );
+      } else {
+        this.toast.success(
+          report.ingested > 0
+            ? `Synced — ${report.ingested} new item${report.ingested === 1 ? "" : "s"}.`
+            : "Synced — up to date.",
+        );
+      }
       this.reload();
+      // Keep an open browse list fresh after a sync brings in new items.
+      if (this._browseOrgId() === org.orgId) {
+        void this.loadOrgItems(org.orgId);
+      }
     } catch (e) {
       this._error.set(String(e));
+      this.toast.danger(`Sync failed — ${String(e)}`);
     } finally {
       this._syncingOrgId.set(null);
+    }
+  }
+
+  // ── Browse the shared brain (fix A) ─────────────────────────────────────────
+
+  /** Toggle the "Shared brain" browse list for an org; loads its items lazily. */
+  async toggleBrowse(org: OrgStatus): Promise<void> {
+    if (this._browseOrgId() === org.orgId) {
+      this._browseOrgId.set(null);
+      this._orgItems.set([]);
+      this._itemsError.set(null);
+      return;
+    }
+    this._browseOrgId.set(org.orgId);
+    await this.loadOrgItems(org.orgId);
+  }
+
+  /** Load one org's browsable items (`listOrgItems`), stale-guarded on a token. */
+  private async loadOrgItems(orgId: string): Promise<void> {
+    const seq = ++this._browseSeq;
+    this._itemsError.set(null);
+    this._itemsLoading.set(true);
+    this._orgItems.set([]);
+    try {
+      const items = await this.ipc.listOrgItems(orgId);
+      if (seq !== this._browseSeq) {
+        return; // a newer browse/toggle superseded this one — drop the result
+      }
+      this._orgItems.set(items);
+    } catch (e) {
+      if (seq === this._browseSeq) {
+        this._itemsError.set(String(e));
+      }
+    } finally {
+      if (seq === this._browseSeq) {
+        this._itemsLoading.set(false);
+      }
     }
   }
 
