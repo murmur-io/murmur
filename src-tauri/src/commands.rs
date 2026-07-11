@@ -3569,17 +3569,17 @@ pub fn search_meetings(
 #[tauri::command]
 pub fn delete_meeting(state: State<'_, AppState>, meeting_id: String) -> Result<(), AppError> {
     // Capture + remove on-disk files before the rows disappear (best-effort).
+    // C4: the playback audio may exist as BOTH the plaintext WAV *and* its sealed `.enc` at once —
+    // during a session-unlock, `session_unseal` decrypts the `.enc` to a plaintext WAV for playback
+    // but KEEPS the `.enc`. So `audio_path` (plaintext form) alone would orphan the `.enc` on
+    // record→lock→unlock→delete. Remove BOTH forms, exactly as the masters block below already does.
     if let Some(m) = state.db.get_meeting(&meeting_id)? {
-        if let Some(audio) = m.audio_path.as_deref() {
-            let _ = std::fs::remove_file(audio);
-        }
+        remove_meeting_audio_files(m.audio_path.as_deref());
     }
     // Masters too — a master path may be the plaintext WAV or its `.enc`; clear both forms.
     if let Ok((mic, sys)) = state.db.get_meeting_master_paths(&meeting_id) {
         for p in [mic, sys].into_iter().flatten() {
-            let _ = std::fs::remove_file(&p);
-            let _ = std::fs::remove_file(format!("{p}{ENC_SUFFIX}"));
-            let _ = std::fs::remove_file(p.trim_end_matches(ENC_SUFFIX));
+            remove_meeting_audio_files(Some(&p));
         }
     }
     if let Some(note) = state.db.get_latest_note_for_meeting(&meeting_id)? {
@@ -3604,6 +3604,20 @@ fn remove_rollup_export_files(paths: &[String]) {
     for p in paths {
         let _ = std::fs::remove_file(p);
     }
+}
+
+/// C4 — remove ALL on-disk forms of one at-rest audio path (best-effort). A path recorded in the DB
+/// may be the plaintext WAV OR its sealed `.enc`, and during a session-unlock BOTH coexist (the
+/// unseal decrypts the `.enc` to a playable WAV but keeps the `.enc`). So deleting a meeting must
+/// remove the path as-given, its `.enc` twin, and its plaintext twin — otherwise a
+/// record→lock→Touch-ID-unlock→delete leaves the `.enc` orphaned on disk. This is disk-residue
+/// cleanup, NOT a security gate (the plaintext WAV is removed regardless). Mirrors the masters block
+/// in `delete_meeting`. `None` is a no-op.
+fn remove_meeting_audio_files(audio_path: Option<&str>) {
+    let Some(p) = audio_path else { return };
+    let _ = std::fs::remove_file(p); // the path as recorded (plaintext WAV or the `.enc`).
+    let _ = std::fs::remove_file(format!("{p}{ENC_SUFFIX}")); // its sealed `.enc` twin.
+    let _ = std::fs::remove_file(p.trim_end_matches(ENC_SUFFIX)); // its plaintext twin.
 }
 
 /// Rename a meeting's title (in-app + Library list). Does not rename the vault file.
@@ -10048,6 +10062,56 @@ pub(crate) fn relock_all_inner(state: &AppState) -> Result<(), AppError> {
     Ok(())
 }
 
+/// C1/C2 — best-effort in-process teardown of EVERY capture path on a true app exit
+/// (`RunEvent::ExitRequested`, via the `lib::relock_and_zeroize_on_lifecycle` hook). Without this,
+/// quitting mid-recording never runs any `stop()`, so the Swift capture helpers (system-audio /
+/// AEC) reparent to launchd and keep writing their temp WAVs until their 4h self-cap — the
+/// next-launch reaper (`aec::reap_orphaned_capture_helpers`) becomes the ONLY thing that reclaims
+/// them. Calling this on a clean exit finalizes + reaps them in-process, so the reaper is the true
+/// safety net rather than the primary path.
+///
+/// For each slot: `take()` it OUT of `AppState` under its own lock (deterministic — no `Drop`
+/// ordering ambiguity), then let the value's teardown run:
+///   - `system_recorder` / `aec_recorder`: `.stop()` SIGTERMs the helper so it flushes its WAV, then
+///     reaps it (their `Drop` would do the same, but the explicit `stop()` matches the clean-Stop
+///     path and consumes the value so the `Drop` no-ops).
+///   - `recorder` / `spill_writer`: just `take()` — their existing `Drop` handles teardown (the
+///     spill guard deletes the plaintext spill; the recorder stops its cpal stream) and runs
+///     deterministically at end of scope.
+///
+/// Panic-free: a POISONED slot mutex is skipped (`.lock().ok()`), a `stop()` error is ignored — this
+/// is a last-chance exit hook with no `Result` to surface. Never touches the DB / lock model. NOTE:
+/// call this ONLY on the true exit path, never on a mere window-hide (the app keeps recording in the
+/// tray then — see `lib::relock_and_zeroize_on_lifecycle`).
+pub(crate) fn stop_all_capture(state: &AppState) {
+    // System-audio sidecar: SIGTERM-flush + reap.
+    if let Some(rec) = state
+        .system_recorder
+        .lock()
+        .ok()
+        .and_then(|mut slot| slot.take())
+    {
+        let _ = rec.stop();
+    }
+    // AEC (VPIO) helper: SIGTERM-flush + reap.
+    if let Some(rec) = state
+        .aec_recorder
+        .lock()
+        .ok()
+        .and_then(|mut slot| slot.take())
+    {
+        let _ = rec.stop();
+    }
+    // The cpal mic recorder: `Drop` stops its stream — `take()` makes that deterministic here.
+    let _mic = state.recorder.lock().ok().and_then(|mut slot| slot.take());
+    // The crash-salvage spill writer: `Drop` stops the thread + deletes the plaintext spill.
+    let _spill = state
+        .spill_writer
+        .lock()
+        .ok()
+        .and_then(|mut slot| slot.take());
+}
+
 /// PERMANENTLY remove a folder's lock: KEK → unwrap CK → decrypt each note back to plaintext
 /// markdown, clear `content_blob`, set `locked=0` + `wrapped_key=NULL`, and re-export each note's
 /// `.md` to the vault. The folder returns to the default OPEN state.
@@ -13864,6 +13928,64 @@ mod lock_read_gate_tests {
         );
     }
 
+    /// C4 (RED-before-GREEN): `delete_meeting` removed only the plaintext form of the primary
+    /// playback audio (`std::fs::remove_file(audio_path)`), but during a session-unlock the sealed
+    /// `.enc` coexists on disk (`session_unseal` decrypts to a plaintext WAV for playback yet KEEPS
+    /// the `.enc`). So record→lock→Touch-ID-unlock→delete left the `<file>.enc` orphaned. This is a
+    /// disk-residue leak, NOT a security leak (the plaintext IS removed). The fix routes the primary
+    /// audio through `remove_meeting_audio_files`, which clears both forms (matching the masters).
+    ///
+    /// RED: the assertion for the `.enc` fails under the OLD single-form removal (modeled inline
+    /// below to prove it). GREEN: `remove_meeting_audio_files` clears both.
+    #[test]
+    fn delete_meeting_removes_both_plaintext_and_enc_playback_audio() {
+        let base = std::env::temp_dir().join(format!(
+            "murmur-c4-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        // The session-unlock shape: audio_path points at the PLAINTEXT WAV, and its `.enc` twin
+        // (the durable sealed copy) coexists on disk.
+        let plaintext = format!("{}.wav", base.to_string_lossy());
+        let enc = format!("{plaintext}{ENC_SUFFIX}");
+        std::fs::write(&plaintext, b"PLAYBACK-WAV").unwrap();
+        std::fs::write(&enc, b"SEALED-ENC").unwrap();
+
+        // Proof of the OLD bug: removing ONLY the plaintext form (the pre-fix behavior) leaves the
+        // `.enc` orphaned — this is exactly the residue the fix eliminates.
+        let _ = std::fs::remove_file(&plaintext);
+        assert!(
+            std::path::Path::new(&enc).exists(),
+            "RED: the pre-fix single-form delete strands the sealed .enc"
+        );
+
+        // Re-create the plaintext to model the real pre-delete on-disk state, then run the FIX.
+        std::fs::write(&plaintext, b"PLAYBACK-WAV").unwrap();
+        remove_meeting_audio_files(Some(&plaintext));
+
+        assert!(
+            !std::path::Path::new(&plaintext).exists(),
+            "the plaintext playback WAV is removed"
+        );
+        assert!(
+            !std::path::Path::new(&enc).exists(),
+            "GREEN: the sealed .enc twin is ALSO removed (no orphan)"
+        );
+
+        // Symmetric: when audio_path is recorded as the `.enc` form, both twins are cleared too.
+        std::fs::write(&plaintext, b"PLAYBACK-WAV").unwrap();
+        std::fs::write(&enc, b"SEALED-ENC").unwrap();
+        remove_meeting_audio_files(Some(&enc));
+        assert!(!std::path::Path::new(&enc).exists(), ".enc form removes the .enc");
+        assert!(
+            !std::path::Path::new(&plaintext).exists(),
+            ".enc form also removes the plaintext twin"
+        );
+    }
+
     /// REGRESSION (audio asset-protocol leak): `get_meeting_detail`'s masked DTO for a sealed-and-
     /// not-session-unlocked meeting MUST null `audio_path`. The FE feeds `audio_path` straight into
     /// `convertFileSrc` (the Tauri `asset:` protocol, scoped to the audio dir) which serves the
@@ -14139,6 +14261,42 @@ mod lifecycle_tests {
             .build()
             .unwrap()
             .block_on(f)
+    }
+
+    /// C2 (lifecycle-helper contract): `stop_all_capture` must clear EVERY capture slot to `None`
+    /// (deterministic `take()`) and be panic-free on an empty state. Combined with the C1 Drop tests
+    /// (which prove a taken recorder finalizes + reaps its helper), this is the exit-hook safety net:
+    /// after it runs, no capture path is left owned by `AppState`. The real SIGTERM of the Swift
+    /// helper only truly verifies on a signed build, so this asserts the DETERMINISTIC slot-clearing —
+    /// the seam the exit hook depends on.
+    #[test]
+    fn stop_all_capture_clears_every_capture_slot() {
+        let state = build_state("stop-all-capture");
+        // Sanity: fresh state has no recorders (a real recording would populate these).
+        assert!(state.recorder.lock().unwrap().is_none());
+        assert!(state.system_recorder.lock().unwrap().is_none());
+        assert!(state.aec_recorder.lock().unwrap().is_none());
+        assert!(state.spill_writer.lock().unwrap().is_none());
+
+        // Must not panic, and must leave every slot None.
+        stop_all_capture(&state);
+
+        assert!(
+            state.recorder.lock().unwrap().is_none(),
+            "mic recorder slot cleared"
+        );
+        assert!(
+            state.system_recorder.lock().unwrap().is_none(),
+            "system-audio recorder slot cleared"
+        );
+        assert!(
+            state.aec_recorder.lock().unwrap().is_none(),
+            "AEC recorder slot cleared"
+        );
+        assert!(
+            state.spill_writer.lock().unwrap().is_none(),
+            "spill writer slot cleared"
+        );
     }
 
     /// PHASE-4 lock gate (RED-before-GREEN): `verify_note_sources` + `apply_note_verify_markers` on a

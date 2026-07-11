@@ -222,17 +222,29 @@ impl AecRecorder {
 
     /// SIGTERM the helper, wait, and return the WAV path if it captured anything. `Ok(None)` on any
     /// failure so the caller falls back to the raw cpal mic for ASR.
-    pub fn stop(mut self) -> Result<Option<PathBuf>> {
+    ///
+    /// `self` implements `Drop` (C1), so the teardown runs under [`std::mem::ManuallyDrop`] to
+    /// SUPPRESS the drop-guard's second teardown — a clean `stop` reaps the child exactly once (no
+    /// double-SIGTERM / recycled-pid risk). Fields are then dropped explicitly (no leak).
+    pub fn stop(self) -> Result<Option<PathBuf>> {
+        let mut this = std::mem::ManuallyDrop::new(self);
         let _ = Command::new("kill")
             .arg("-TERM")
-            .arg(self.child.id().to_string())
+            .arg(this.child.id().to_string())
             .status();
-        let status = self
-            .child
-            .wait()
-            .map_err(|e| AppError::Audio(format!("waiting on AEC helper: {e}")))?;
-        if status.success() && self.wav_path.exists() {
-            Ok(Some(self.wav_path))
+        let wait_res = this.child.wait();
+
+        // Move the fields out of the ManuallyDrop so they drop normally (the recorder's own `Drop`
+        // stays suppressed → the child is reaped exactly once above).
+        // SAFETY: each field is read exactly once and never touched again.
+        let wav_path = unsafe { std::ptr::read(&this.wav_path) };
+        let _child = unsafe { std::ptr::read(&this.child) };
+        let _started_at = unsafe { std::ptr::read(&this.started_at) };
+
+        let status =
+            wait_res.map_err(|e| AppError::Audio(format!("waiting on AEC helper: {e}")))?;
+        if status.success() && wav_path.exists() {
+            Ok(Some(wav_path))
         } else {
             tracing::warn!(
                 target: "audio",
@@ -241,6 +253,22 @@ impl AecRecorder {
             );
             Ok(None)
         }
+    }
+}
+
+/// C1 — best-effort teardown for an [`AecRecorder`] DROPPED without a clean [`AecRecorder::stop`]
+/// (app-quit mid-recording, a panic, a `take()` into a discard). A std [`Child`] only DETACHES on
+/// drop, so without this the VPIO helper reparents to launchd and keeps writing an unbounded scratch
+/// WAV until its 4h self-cap (the 91 GB incident). SIGTERM (not SIGKILL) so it flushes + closes the
+/// WAV exactly as `stop()` does, then `wait()` to reap. After a normal `stop(mut self)` (which
+/// CONSUMES self) this never runs on that value → no double-SIGTERM. Panic-free (`let _ =`).
+impl Drop for AecRecorder {
+    fn drop(&mut self) {
+        let _ = Command::new("kill")
+            .arg("-TERM")
+            .arg(self.child.id().to_string())
+            .status();
+        let _ = self.child.wait();
     }
 }
 
@@ -295,5 +323,45 @@ mod tests {
         assert!(parse_orphan_helpers("  412     1 /usr/libexec/somethingd").is_empty());
         assert!(parse_orphan_helpers("garbage\n\n123 abc def").is_empty());
         assert!(parse_orphan_helpers("").is_empty());
+    }
+
+    /// Whether `pid` still has a process-table entry (any state). None once fully reaped.
+    fn ps_present(pid: u32) -> bool {
+        std::process::Command::new("/bin/ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .map(|o| !String::from_utf8_lossy(&o.stdout).trim().is_empty())
+            .unwrap_or(false)
+    }
+
+    /// C1 (RED-before-GREEN): an `AecRecorder` DROPPED without a clean `stop()` (app-quit
+    /// mid-recording) must SIGTERM + REAP its VPIO helper child. A std `Child` merely DETACHES on
+    /// drop — so before the added `impl Drop` the child would keep running (reparented to launchd,
+    /// growing an unbounded scratch WAV up to the 4h cap — the 91 GB incident) and never be reaped.
+    /// Proof: after the drop the pid has no process-table entry at all.
+    #[test]
+    fn drop_without_stop_reaps_the_aec_child() {
+        let child = Command::new("/bin/sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn a dummy long-lived child");
+        let pid = child.id();
+        let rec = AecRecorder {
+            child,
+            wav_path: PathBuf::from("/nonexistent/dummy.wav"),
+            started_at: Instant::now(),
+        };
+        assert!(ps_present(pid), "the dummy child is alive before drop");
+
+        drop(rec); // no stop() — the app-quit-mid-recording path.
+
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            !ps_present(pid),
+            "dropping without stop() must SIGTERM + reap the AEC helper — no orphan, no zombie"
+        );
     }
 }
