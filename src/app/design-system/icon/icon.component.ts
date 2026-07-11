@@ -14,6 +14,7 @@ export type ShellIcon =
   | "search"
   | "plus"
   | "sidebar"
+  | "topbar"
   | "sun"
   | "moon"
   | "display";
