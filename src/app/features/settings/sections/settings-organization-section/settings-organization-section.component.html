@@ -48,7 +48,8 @@
                   <span class="text-secondary org-counts">
                     {{ o.memberCount }}
                     {{ o.memberCount === 1 ? "member" : "members" }} ·
-                    {{ o.itemCount }} {{ o.itemCount === 1 ? "item" : "items" }}
+                    {{ o.receivedCount }} in the org brain ·
+                    {{ o.itemCount }} shared by you
                   </span>
                 </div>
 
@@ -62,6 +63,13 @@
                 </p>
 
                 <div class="org-actions">
+                  <button
+                    type="button"
+                    class="btn btn-ghost mini-btn"
+                    (click)="toggleBrowse(o)"
+                  >
+                    {{ browseOrgId() === o.orgId ? "Hide shared brain" : "Shared brain" }}
+                  </button>
                   @if (o.role === "owner") {
                     <button
                       type="button"
@@ -88,6 +96,41 @@
                     {{ busyOrgId() === o.orgId ? "Leaving…" : "Leave" }}
                   </button>
                 </div>
+
+                <!-- Shared brain browse list (fix A) — everything shared INTO
+                     this org, so a member can actually SEE a colleague's share.
+                     Each row links to the read-only /org-item/:id viewer. -->
+                @if (browseOrgId() === o.orgId) {
+                  <div class="org-browse">
+                    <span class="account-section-label text-muted">Shared brain</span>
+                    @if (itemsError(); as ierr) {
+                      <p class="text-danger account-note" role="alert">{{ ierr }}</p>
+                    }
+                    @if (itemsLoading()) {
+                      <p class="text-muted account-note">Loading shared items…</p>
+                    } @else {
+                      <ul class="org-item-list">
+                        @for (item of orgItems(); track item.itemId) {
+                          <li class="org-item-row">
+                            <a
+                              class="org-item-link"
+                              [routerLink]="['/org-item', item.itemId]"
+                            >
+                              <span class="org-item-title">{{ item.title }}</span>
+                              <span class="org-item-sub text-muted">
+                                {{ item.authorHint }} · {{ formatDate(item.createdAt) }}
+                              </span>
+                            </a>
+                          </li>
+                        } @empty {
+                          <li class="org-item-empty text-muted">
+                            Nothing shared into this org yet.
+                          </li>
+                        }
+                      </ul>
+                    }
+                  </div>
+                }
 
                 <!-- Member manager (owner only, expanded on demand). -->
                 @if (o.role === "owner" && expandedOrgId() === o.orgId) {
