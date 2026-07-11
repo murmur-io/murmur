@@ -40,8 +40,9 @@
   gap: var(--space-2);
   /* Extra left inset clears the overlay macOS traffic lights (trafficLightPosition
      {32,30} in tauri.conf.json — this fixed drill-down covers the whole window,
-     so nothing else reserves room for them on this row). */
-  padding: var(--space-4) var(--space-6) var(--space-3) 84px;
+     so nothing else reserves room for them on this row). ~20px past the last dot
+     so the "‹ Notes" back button doesn't crowd the green light. */
+  padding: var(--space-4) var(--space-6) var(--space-3) 104px;
   border-bottom: 1px solid var(--border-subtle);
 }
 .head-spacer {
