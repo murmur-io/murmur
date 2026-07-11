@@ -2,33 +2,38 @@ import {
   ChangeDetectionStrategy,
   Component,
   computed,
+  effect,
   inject,
   signal,
 } from "@angular/core";
 import { IpcService } from "../../../../core/ipc.service";
-import type {
-  OrgMember,
-  OrgStatus,
-  OrgSyncReport,
-} from "../../../../core/models";
+import type { OrgMember, OrgStatus } from "../../../../core/models";
 
 /**
- * Settings → Organization section (Shared Brain v1). Manages the org behind the
- * org-wide E2EE shared brain. Mirrors the sibling `settings-account-section`
- * shape (`:host { display: contents }` + `.section-stack` + frosted `.card`,
- * global `.btn`/`.btn-primary`/`.btn-ghost`, `var(--token)`).
+ * Settings → Organization section (Shared Brain v1, MULTI-ORG).
  *
- * Two states, driven by `orgStatus`:
- *  - NO org → a create form (name → `orgCreate`).
- *  - IN an org → the org name/role, the member list (owner: invite by email +
- *    remove), Leave, the org-egress consent toggle, and the sync status
- *    (lastSeq / itemCount) with a "Sync now" (`orgSyncNow`).
+ * A user can belong to SEVERAL orgs — the ones they created AND the ones they
+ * were invited into. The old single-org surface only ever showed the FIRST
+ * locally-created org, so an invited-into org was invisible and never synced
+ * (root cause: `org_status_inner`/`org_sync_now_inner` took `…next()` and local
+ * `org_state` was only populated by create). This section now lists EVERY org
+ * the user actively belongs to.
  *
- * Everything talks to the Rust core through {@link IpcService}. `orgStatus` loads
- * once into a signal on construction; every mutation reloads it. The member list
- * loads only for the OWNER (the member management surface). The org-egress
- * consent is a dedicated command (`consentToOrgEgress` / `revokeOrgEgress`),
- * PRESERVE-ONLY config like the share-egress consent — never part of a config save.
+ * On open it refreshes membership from the server (`orgRefresh` = server
+ * discovery, so an invited-into org appears) then loads the full list
+ * (`orgListStatuses`) into `orgs`. Both run inside ONE tracked effect keyed on a
+ * `_reloadTick` trigger with a STALE-RESULT guard (a late response from a
+ * superseded reload is dropped — project failure mode #4).
+ *
+ * Each org renders as a card: name, a distinct OWNER/MEMBER role badge, member +
+ * item counts, and per-org actions — Invite (owner only; expands a member
+ * manager), Sync now, Leave. The CREATE-org form stays; creating refreshes the
+ * list. Consent is ONE GLOBAL control ("Share my notes into my organizations")
+ * bound to the existing global org-egress flag — NOT per-org (a follow-up).
+ *
+ * Everything talks to the Rust core through {@link IpcService}. The consent
+ * command pair (`consentToOrgEgress` / `revokeOrgEgress`) is PRESERVE-ONLY
+ * config, never part of a config save — mirrors the share-egress consent.
  */
 @Component({
   selector: "app-settings-organization-section",
@@ -39,33 +44,55 @@ import type {
 export class SettingsOrganizationSectionComponent {
   private readonly ipc = inject(IpcService);
 
-  /** The org membership + sync state; `null` = in no org (show the create form). */
-  private readonly _status = signal<OrgStatus | null>(null);
-  readonly status = this._status.asReadonly();
+  /** Every org the user belongs to (created OR invited-into). Empty ⇒ empty state. */
+  private readonly _orgs = signal<OrgStatus[]>([]);
+  readonly orgs = this._orgs.asReadonly();
 
-  /** True until the first `orgStatus` load resolves (avoids a create-form flash). */
+  /** True until the first list load resolves (avoids an empty-state flash). */
   private readonly _loaded = signal(false);
   readonly loaded = this._loaded.asReadonly();
 
-  /** A general org error (load / mutate failure). */
+  /** A general org error (list load / mutate failure). */
   private readonly _error = signal<string | null>(null);
   readonly error = this._error.asReadonly();
 
-  /** True during any in-flight mutation (debounces the buttons). */
-  private readonly _busy = signal(false);
-  readonly busy = this._busy.asReadonly();
+  /** True during any org-level mutation (Leave) — debounces those buttons. */
+  private readonly _busyOrgId = signal<string | null>(null);
+  readonly busyOrgId = this._busyOrgId.asReadonly();
 
-  readonly isOwner = computed(() => this._status()?.role === "owner");
+  /** The signed-in account email (header context); `null` until loaded / logged out. */
+  private readonly _email = signal<string | null>(null);
+  readonly email = this._email.asReadonly();
 
-  // ── Create form ───────────────────────────────────────────────────────────
+  /** True while at least one org is present. */
+  readonly hasOrgs = computed(() => this._orgs().length > 0);
+
+  /** True while the global org-egress consent is granted (any org's flag ⇒ global grant). */
+  private readonly _consented = signal(false);
+  readonly consented = this._consented.asReadonly();
+  readonly consentBusy = signal(false);
+
+  // ── Reload trigger + stale-result guard ─────────────────────────────────────
+  /** Bump to re-run the load effect (open, after create/leave/invite). */
+  private readonly _reloadTick = signal(0);
+  /** Monotonic load token — a resolved fetch writes only if it is still the latest. */
+  private _loadSeq = 0;
+
+  // ── Create form ─────────────────────────────────────────────────────────────
   readonly createName = signal("");
   readonly creating = signal(false);
 
-  // ── Members (owner only) ──────────────────────────────────────────────────
+  // ── Per-org member management (owner only) ──────────────────────────────────
+  /** The org id whose member manager is expanded (only one at a time). */
+  private readonly _expandedOrgId = signal<string | null>(null);
+  readonly expandedOrgId = this._expandedOrgId.asReadonly();
+  /** Members of the currently-expanded org (owner surface). */
   private readonly _members = signal<OrgMember[]>([]);
   readonly members = this._members.asReadonly();
   private readonly _membersError = signal<string | null>(null);
   readonly membersError = this._membersError.asReadonly();
+  private readonly _membersLoading = signal(false);
+  readonly membersLoading = this._membersLoading.asReadonly();
   /** The invite-by-email draft + in-flight flag. */
   readonly inviteEmail = signal("");
   readonly inviting = signal(false);
@@ -78,62 +105,78 @@ export class SettingsOrganizationSectionComponent {
     [...this._members()].sort((a, b) => Number(a.removed) - Number(b.removed)),
   );
 
-  // ── Consent ───────────────────────────────────────────────────────────────
-  readonly consented = computed(() => this._status()?.consented ?? false);
-  readonly consentBusy = signal(false);
-
-  // ── Sync ──────────────────────────────────────────────────────────────────
-  readonly syncing = signal(false);
-  private readonly _lastSync = signal<OrgSyncReport | null>(null);
-  readonly lastSync = this._lastSync.asReadonly();
+  // ── Sync (per-org) ──────────────────────────────────────────────────────────
+  /** The org id currently syncing (locks its Sync now button). */
+  private readonly _syncingOrgId = signal<string | null>(null);
+  readonly syncingOrgId = this._syncingOrgId.asReadonly();
 
   constructor() {
-    // Fire-and-forget one-shot load (no signal read → no effect needed).
-    void this.reload();
+    // On open: refresh membership from the server (so an invited-into org is
+    // discovered) then load every org. Keyed on `_reloadTick` so create/leave/
+    // invite can re-run it; a stale-result guard drops a superseded response.
+    effect(() => {
+      this._reloadTick(); // dependency: any bump re-runs the load
+      const seq = ++this._loadSeq;
+      this._error.set(null);
+      void (async () => {
+        // Account email (best-effort — a logged-out user still sees the section).
+        try {
+          const acct = await this.ipc.accountStatus();
+          if (seq === this._loadSeq) {
+            this._email.set(acct.email);
+          }
+        } catch {
+          // Non-fatal — the header just omits the email line.
+        }
+        // Server membership discovery is best-effort; a failure must not hide
+        // the locally-known orgs, so swallow it and still load the list.
+        try {
+          await this.ipc.orgRefresh();
+        } catch {
+          // Offline / no server → fall through to the local replica.
+        }
+        try {
+          const list = await this.ipc.orgListStatuses();
+          if (seq !== this._loadSeq) {
+            return; // a newer reload superseded this one — drop the result
+          }
+          this._orgs.set(list);
+          this._consented.set(list.some((o) => o.consented));
+          this.reconcileExpanded(list);
+        } catch (e) {
+          if (seq === this._loadSeq) {
+            this._error.set(String(e));
+          }
+        } finally {
+          if (seq === this._loadSeq) {
+            this._loaded.set(true);
+          }
+        }
+      })();
+    });
   }
 
-  /** Load the org status + (for an owner) the member list. */
-  private async reload(): Promise<void> {
-    try {
-      const st = await this.ipc.orgStatus();
-      this._status.set(st);
-      if (st?.role === "owner") {
-        await this.loadMembers();
-      } else {
-        this._members.set([]);
-      }
-      // On-open responsiveness: pull the org feed once (best-effort) so a freshly-joined member sees
-      // teammates' items right away instead of waiting for the next background sync tick. The periodic
-      // backend loop keeps it fresh thereafter; this only covers the "just opened Settings" moment.
-      if (st) {
-        void this.ipc
-          .orgSyncNow()
-          .then(async () => this._status.set(await this.ipc.orgStatus()))
-          .catch(() => undefined);
-      }
-    } catch (e) {
-      this._error.set(String(e));
-    } finally {
-      this._loaded.set(true);
+  /** Re-run the load effect (server discovery + list). */
+  private reload(): void {
+    this._reloadTick.update((n) => n + 1);
+  }
+
+  /** Drop the expanded member manager if its org is gone from the fresh list. */
+  private reconcileExpanded(list: OrgStatus[]): void {
+    const open = this._expandedOrgId();
+    if (open && !list.some((o) => o.orgId === open)) {
+      this._expandedOrgId.set(null);
+      this._members.set([]);
     }
   }
 
-  private async loadMembers(): Promise<void> {
-    this._membersError.set(null);
-    try {
-      this._members.set(await this.ipc.orgListMembers());
-    } catch (e) {
-      this._membersError.set(String(e));
-    }
-  }
-
-  // ── Create ─────────────────────────────────────────────────────────────────
+  // ── Create ───────────────────────────────────────────────────────────────────
 
   onCreateNameInput(event: Event): void {
     this.createName.set((event.target as HTMLInputElement).value);
   }
 
-  /** Create the org (this user becomes owner), then reload into the managed state. */
+  /** Create the org (this user becomes owner), then reload the full list. */
   async createOrg(): Promise<void> {
     const name = this.createName().trim();
     if (!name || this.creating()) {
@@ -142,12 +185,9 @@ export class SettingsOrganizationSectionComponent {
     this._error.set(null);
     this.creating.set(true);
     try {
-      const st = await this.ipc.orgCreate(name);
-      this._status.set(st);
+      await this.ipc.orgCreate(name);
       this.createName.set("");
-      if (st.role === "owner") {
-        await this.loadMembers();
-      }
+      this.reload();
     } catch (e) {
       this._error.set(String(e));
     } finally {
@@ -155,92 +195,27 @@ export class SettingsOrganizationSectionComponent {
     }
   }
 
-  // ── Members ────────────────────────────────────────────────────────────────
+  // ── Consent (ONE global control) ──────────────────────────────────────────────
 
-  onInviteEmailInput(event: Event): void {
-    this.inviteEmail.set((event.target as HTMLInputElement).value);
-  }
-
-  /** Invite a member by email (owner), then refresh the member list. */
-  async invite(): Promise<void> {
-    const email = this.inviteEmail().trim();
-    if (!email || this.inviting()) {
-      return;
-    }
-    this._membersError.set(null);
-    this.inviting.set(true);
-    try {
-      await this.ipc.orgInviteMember(email);
-      this.inviteEmail.set("");
-      await this.loadMembers();
-      await this.refreshStatusCounts();
-    } catch (e) {
-      this._membersError.set(String(e));
-    } finally {
-      this.inviting.set(false);
-    }
-  }
-
-  /** Remove a member (owner) — drives OCK rotation backend-side. Then refresh. */
-  async removeMember(member: OrgMember): Promise<void> {
-    if (this._removingId() !== null) {
-      return;
-    }
-    this._removingId.set(member.userId);
-    this._membersError.set(null);
-    try {
-      await this.ipc.orgRemoveMember(member.userId);
-      await this.loadMembers();
-      await this.refreshStatusCounts();
-    } catch (e) {
-      this._membersError.set(String(e));
-    } finally {
-      this._removingId.set(null);
-    }
-  }
-
-  // ── Leave ────────────────────────────────────────────────────────────────
-
-  /** Leave the org (self-removal); the section flips back to the create form. */
-  async leave(): Promise<void> {
-    if (this._busy()) {
-      return;
-    }
-    this._busy.set(true);
-    this._error.set(null);
-    try {
-      await this.ipc.orgLeave();
-      this._status.set(null);
-      this._members.set([]);
-      this._lastSync.set(null);
-    } catch (e) {
-      this._error.set(String(e));
-    } finally {
-      this._busy.set(false);
-    }
-  }
-
-  // ── Consent ────────────────────────────────────────────────────────────────
-
-  /** Toggle the one-time org-egress consent (dedicated command, preserve-only config). */
+  /** Toggle the one global org-egress consent (dedicated command, preserve-only config). */
   async toggleConsent(): Promise<void> {
     if (this.consentBusy()) {
       return;
     }
     this.consentBusy.set(true);
     this._error.set(null);
-    const grant = !this.consented();
+    const grant = !this._consented();
     try {
       if (grant) {
         await this.ipc.consentToOrgEgress();
       } else {
         await this.ipc.revokeOrgEgress();
       }
-      // Reflect locally so the UI flips without a full reload.
-      const st = this._status();
-      if (st) {
-        this._status.set({ ...st, consented: grant });
-      }
+      // Reflect locally without a full reload; mirror it onto every org row.
+      this._consented.set(grant);
+      this._orgs.update((list) =>
+        list.map((o) => ({ ...o, consented: grant })),
+      );
     } catch (e) {
       this._error.set(String(e));
     } finally {
@@ -248,33 +223,125 @@ export class SettingsOrganizationSectionComponent {
     }
   }
 
-  // ── Sync ─────────────────────────────────────────────────────────────────
+  // ── Per-org: expand member manager (owner) ────────────────────────────────────
 
-  /** Pull + ingest the org feed now; show the report + refresh the status counts. */
-  async syncNow(): Promise<void> {
-    if (this.syncing()) {
+  /** Toggle the member manager for an org (owner only); loads its members. */
+  async toggleMembers(org: OrgStatus): Promise<void> {
+    if (org.role !== "owner") {
       return;
     }
-    this.syncing.set(true);
-    this._error.set(null);
+    if (this._expandedOrgId() === org.orgId) {
+      this._expandedOrgId.set(null);
+      this._members.set([]);
+      return;
+    }
+    this._expandedOrgId.set(org.orgId);
+    this.inviteEmail.set("");
+    await this.loadMembers(org.orgId);
+  }
+
+  private async loadMembers(orgId: string): Promise<void> {
+    this._membersError.set(null);
+    this._membersLoading.set(true);
+    this._members.set([]);
     try {
-      const report = await this.ipc.orgSyncNow();
-      this._lastSync.set(report);
-      await this.refreshStatusCounts();
+      const members = await this.ipc.orgListMembers(orgId);
+      // Guard against a stale expand switch mid-flight.
+      if (this._expandedOrgId() === orgId) {
+        this._members.set(members);
+      }
     } catch (e) {
-      this._error.set(String(e));
+      if (this._expandedOrgId() === orgId) {
+        this._membersError.set(String(e));
+      }
     } finally {
-      this.syncing.set(false);
+      if (this._expandedOrgId() === orgId) {
+        this._membersLoading.set(false);
+      }
     }
   }
 
-  /** Re-read `orgStatus` to refresh the live counts (memberCount / lastSeq / itemCount). */
-  private async refreshStatusCounts(): Promise<void> {
+  onInviteEmailInput(event: Event): void {
+    this.inviteEmail.set((event.target as HTMLInputElement).value);
+  }
+
+  /** Invite a member by email into the expanded org (owner), then refresh. */
+  async invite(orgId: string): Promise<void> {
+    const email = this.inviteEmail().trim();
+    if (!email || this.inviting()) {
+      return;
+    }
+    this._membersError.set(null);
+    this.inviting.set(true);
     try {
-      const st = await this.ipc.orgStatus();
-      this._status.set(st);
-    } catch {
-      // Non-fatal — the last-known status stays.
+      await this.ipc.orgInviteMember(orgId, email);
+      this.inviteEmail.set("");
+      await this.loadMembers(orgId);
+      this.reload();
+    } catch (e) {
+      this._membersError.set(String(e));
+    } finally {
+      this.inviting.set(false);
+    }
+  }
+
+  /** Remove a member from the expanded org (owner) — rotates the OCK. Then refresh. */
+  async removeMember(orgId: string, member: OrgMember): Promise<void> {
+    if (this._removingId() !== null) {
+      return;
+    }
+    this._removingId.set(member.userId);
+    this._membersError.set(null);
+    try {
+      await this.ipc.orgRemoveMember(orgId, member.userId);
+      await this.loadMembers(orgId);
+      this.reload();
+    } catch (e) {
+      this._membersError.set(String(e));
+    } finally {
+      this._removingId.set(null);
+    }
+  }
+
+  // ── Per-org: leave ─────────────────────────────────────────────────────────────
+
+  /** Leave one org (self-removal). Reloads the list (the row drops out). */
+  async leave(org: OrgStatus): Promise<void> {
+    if (this._busyOrgId() !== null) {
+      return;
+    }
+    this._busyOrgId.set(org.orgId);
+    this._error.set(null);
+    try {
+      await this.ipc.orgLeave(org.orgId);
+      if (this._expandedOrgId() === org.orgId) {
+        this._expandedOrgId.set(null);
+        this._members.set([]);
+      }
+      this.reload();
+    } catch (e) {
+      this._error.set(String(e));
+    } finally {
+      this._busyOrgId.set(null);
+    }
+  }
+
+  // ── Per-org: sync ──────────────────────────────────────────────────────────────
+
+  /** Pull + ingest one org's feed now, then reload the counts. */
+  async syncNow(org: OrgStatus): Promise<void> {
+    if (this._syncingOrgId() !== null) {
+      return;
+    }
+    this._syncingOrgId.set(org.orgId);
+    this._error.set(null);
+    try {
+      await this.ipc.orgSyncNow(org.orgId);
+      this.reload();
+    } catch (e) {
+      this._error.set(String(e));
+    } finally {
+      this._syncingOrgId.set(null);
     }
   }
 

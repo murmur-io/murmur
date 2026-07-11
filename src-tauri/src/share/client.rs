@@ -466,6 +466,18 @@ impl ShareClient {
         .await
     }
 
+    /// `GET /v1/orgs` (bearer) — EVERY org the caller actively belongs to (owned OR invited-and-active).
+    /// This is the membership-discovery pull: without it an org you were INVITED to (never one you
+    /// CREATED) is invisible locally and its feed never syncs. Content-free (ids/roles/timestamps).
+    pub async fn org_list(
+        &self,
+        access_token: &str,
+    ) -> Result<Vec<super::org_dto::OrgSummary>> {
+        let resp: super::org_dto::OrgListResponse =
+            self.get_json("/v1/orgs", access_token, "org-list").await?;
+        Ok(resp.orgs)
+    }
+
     /// `GET /v1/orgs/{id}` (member-gated) — the caller's view of an org (name + role + generation).
     pub async fn org_status(
         &self,
