@@ -633,6 +633,24 @@ deferred it twice is now removed, so it's unblocked for the GA cut.
     },
   };
 
+  // Tauri v2 event-plugin internals: the `UnlistenFn` returned by
+  // `@tauri-apps/api` `listen()` calls `__TAURI_EVENT_PLUGIN_INTERNALS__
+  // .unregisterListener(event, eventId)` on teardown (event.js `_unlisten`).
+  // Without this, ANY component that unsubscribes a `listen()` on destroy (e.g.
+  // navigating away from a view holding an `onXxx` subscription) throws
+  // "Cannot read properties of undefined (reading 'unregisterListener')". We
+  // best-effort prune the maps the invoke router uses so a subscribe→unsubscribe
+  // round-trip is a clean no-op under the mock.
+  window.__TAURI_EVENT_PLUGIN_INTERNALS__ = {
+    unregisterListener: (event, eventId) => {
+      const set = listeners.get(event);
+      if (set) {
+        set.delete(eventId);
+      }
+      callbacks.delete(eventId);
+    },
+  };
+
   // Legacy global some code paths probe.
   window.__TAURI__ = window.__TAURI__ || {};
 

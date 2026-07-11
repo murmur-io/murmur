@@ -24840,7 +24840,7 @@ pub async fn revoke_shares_for_folder(
 /// first tick fires `ORG_SYNC_FIRST_DELAY_SECS` after launch (no startup contention); subsequent
 /// ticks every `ORG_SYNC_TICK_SECS`. Every tick is a cheap no-op while logged out / no org joined.
 pub const ORG_SYNC_FIRST_DELAY_SECS: u64 = 20;
-pub const ORG_SYNC_TICK_SECS: u64 = 300;
+pub const ORG_SYNC_TICK_SECS: u64 = 120;
 
 /// One background org-sync tick: drain the outbound share queue, then pull + ingest the inbound feed
 /// into the local int8 partition. This is what makes the org brain a REPLICATED brain — every
@@ -24848,7 +24848,13 @@ pub const ORG_SYNC_TICK_SECS: u64 = 300;
 /// warns-and-continues (a transient failure never kills the loop), and both inners gate to an early
 /// `Ok` when logged out / no org joined, so this is a no-op until a session is live. Logs only
 /// non-PII counts on a productive tick.
-pub(crate) async fn org_background_sync_tick(state: &AppState) {
+///
+/// Returns `true` when the inbound sync actually CHANGED the local replica this tick (≥1 ingest or
+/// tombstone) — the caller (`lib.rs` loop) uses this to fire a content-free
+/// [`crate::events::EVENT_ORG_FEED_UPDATED`] so an open FE view re-fetches WITHOUT polling. Returns
+/// `false` on a no-op / error tick. Emitting is done by the loop (which holds the `AppHandle`); the
+/// tick signature stays `&AppState`, unchanged for the other internal callers.
+pub(crate) async fn org_background_sync_tick(state: &AppState) -> bool {
     // Reconcile membership FIRST so a newly-invited org is present (and synced this same tick) and a
     // departed org is dropped before we pull its feed. Best-effort — a failure never blocks the sync.
     if let Err(e) = org_reconcile_memberships(state).await {
@@ -24858,14 +24864,20 @@ pub(crate) async fn org_background_sync_tick(state: &AppState) {
         tracing::warn!(target: "org", error = %e, "org outbound sweep tick failed");
     }
     match org_sync_now_inner(state).await {
-        Ok(r) if r.ingested > 0 || r.tombstoned > 0 => tracing::info!(
-            target: "org",
-            ingested = r.ingested,
-            tombstoned = r.tombstoned,
-            "org feed synced"
-        ),
-        Ok(_) => {}
-        Err(e) => tracing::warn!(target: "org", error = %e, "org feed sync tick failed"),
+        Ok(r) if r.ingested > 0 || r.tombstoned > 0 => {
+            tracing::info!(
+                target: "org",
+                ingested = r.ingested,
+                tombstoned = r.tombstoned,
+                "org feed synced"
+            );
+            true
+        }
+        Ok(_) => false,
+        Err(e) => {
+            tracing::warn!(target: "org", error = %e, "org feed sync tick failed");
+            false
+        }
     }
 }
 
