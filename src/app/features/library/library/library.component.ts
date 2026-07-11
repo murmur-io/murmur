@@ -10,7 +10,6 @@ import {
   viewChild,
 } from "@angular/core";
 import { RouterLink } from "@angular/router";
-import type { UnlistenFn } from "@tauri-apps/api/event";
 import { IpcService } from "../../../core/ipc.service";
 import { NavHistoryService } from "../../../core/nav-history.service";
 import { MurSidebarComponent } from "../../../design-system/sidebar/sidebar.component";
@@ -18,8 +17,6 @@ import type {
   FolderNode,
   Meeting,
   MeetingStatus,
-  OrgItemHeader,
-  OrgStatus,
   SearchHit,
   StorageReport,
 } from "../../../core/models";
@@ -43,31 +40,18 @@ interface SnippetPart {
 }
 
 /**
- * One row of the unified no-query list — a discriminated union over the two
- * sources the list merges. A `"meeting"` row is a local recording (opens
- * `/meeting/:id`, keeps its folder-chip / delete / drag / lock affordances); an
- * `"org"` row is a READ-ONLY org (Shared Brain) replica (opens the
- * `/org-item/:id` viewer, carries the origin org's name for its badge, no
- * folder/delete/drag affordances). Both expose an epoch-ms `sortAt` so the
- * merged list orders by date desc regardless of source. `id` is namespaced
- * (`meeting:`/`org:`) so the `@for` track key is stable + collision-free across
- * the two id spaces.
+ * One row of the no-query list. Meetings is a RECORDINGS-ONLY view: a
+ * `"meeting"` row is a local recording (opens `/meeting/:id`, keeps its
+ * folder-chip / delete / drag / lock affordances). It exposes an epoch-ms
+ * `sortAt` so the list orders by date desc, and a `meeting:`-namespaced `id`
+ * so the `@for` track key is stable.
  */
-export type MeetingsListItem =
-  | {
-      kind: "meeting";
-      id: string;
-      sortAt: number;
-      meeting: Meeting;
-    }
-  | {
-      kind: "org";
-      id: string;
-      sortAt: number;
-      item: OrgItemHeader;
-      /** The origin org's display name (drives the "shared brain" badge label). */
-      orgName: string;
-    };
+export interface MeetingsListItem {
+  kind: "meeting";
+  id: string;
+  sortAt: number;
+  meeting: Meeting;
+}
 
 @Component({
   selector: "app-library",
@@ -209,8 +193,7 @@ export class LibraryComponent implements OnInit {
    *   folder selected → folder-filtered;
    *   else tag selected → tag-filtered;
    *   else → the full list.
-   * This is the meeting SOURCE the unified {@link listItems} merges with org
-   * items; an org selection is handled in `listItems` (it shows only org items).
+   * This is the meeting SOURCE the {@link listItems} list is built from.
    */
   readonly displayedMeetings = computed(() => {
     if (this.activeFolderId() !== null) {
@@ -220,62 +203,23 @@ export class LibraryComponent implements OnInit {
   });
 
   /**
-   * The unified no-query list feeding the pane, sorted by date desc:
-   *  - a specific org rail-selected ⇒ ONLY that org's items;
-   *  - "Meetings" (no folder, no tag, no org) ⇒ your recordings MERGED with EVERY
-   *    org's shared items;
-   *  - a specific folder OR tag ⇒ only those meetings (no org items).
-   * Org items never carry a lock (they are deliberately-disclosed org content) —
-   * only recordings can be masked (folder-sealed).
+   * The no-query list feeding the pane (RECORDINGS ONLY), sorted by date desc.
+   * Built from {@link displayedMeetings}, which already applies the folder/tag
+   * precedence. Only recordings can be masked (folder-sealed).
    */
-  readonly listItems = computed<MeetingsListItem[]>(() => {
-    const orgId = this.activeOrgId();
-    const orgItemsByOrg = this._orgItems();
-    const orgs = this._orgs();
-
-    // A specific org selected: show ONLY that org's items.
-    if (orgId !== null) {
-      const name = orgs.find((o) => o.orgId === orgId)?.name ?? "";
-      return (orgItemsByOrg[orgId] ?? [])
-        .map((item) => this.toOrgCard(item, name))
-        .sort((a, b) => b.sortAt - a.sortAt);
-    }
-
-    const meetingCards: MeetingsListItem[] = this.displayedMeetings().map(
-      (meeting) => ({
-        kind: "meeting" as const,
+  readonly listItems = computed<MeetingsListItem[]>(() =>
+    this.displayedMeetings()
+      .map<MeetingsListItem>((meeting) => ({
+        kind: "meeting",
         id: `meeting:${meeting.id}`,
         sortAt: this.meetingSortAt(meeting),
         meeting,
-      }),
-    );
+      }))
+      .sort((a, b) => b.sortAt - a.sortAt),
+  );
 
-    // A specific folder OR tag is selected (not the "Meetings" root): meetings only.
-    if (this.activeFolderId() !== null || this.activeTag() !== null) {
-      return meetingCards.sort((a, b) => b.sortAt - a.sortAt);
-    }
-
-    // "Meetings" (all): merge YOUR recordings with EVERY org's shared items.
-    const orgCards: MeetingsListItem[] = orgs.flatMap((o) =>
-      (orgItemsByOrg[o.orgId] ?? []).map((item) => this.toOrgCard(item, o.name)),
-    );
-    return [...meetingCards, ...orgCards].sort((a, b) => b.sortAt - a.sortAt);
-  });
-
-  /** True when the unified no-query list has zero rows (drives the empty state). */
+  /** True when the no-query list has zero rows (drives the empty state). */
   readonly listEmpty = computed(() => this.listItems().length === 0);
-
-  /** Build an org card from a header + its origin org name. */
-  private toOrgCard(item: OrgItemHeader, orgName: string): MeetingsListItem {
-    const t = Date.parse(item.createdAt);
-    return {
-      kind: "org",
-      id: `org:${item.itemId}`,
-      sortAt: Number.isNaN(t) ? 0 : t,
-      item,
-      orgName,
-    };
-  }
 
   /** Epoch-ms sort key for a meeting (its start time; 0 when unparseable). */
   private meetingSortAt(m: Meeting): number {
@@ -283,30 +227,21 @@ export class LibraryComponent implements OnInit {
     return Number.isNaN(t) ? 0 : t;
   }
 
-  /** Loading state for the visible no-query list (initial load, tag fetch, or org load). */
+  /** Loading state for the visible no-query list (initial load or tag fetch). */
   readonly listLoading = computed(() => {
-    if (this.activeOrgId() !== null) {
-      // An org scope: the org items are client-side; share the org-load flag.
-      return this.orgsLoading();
-    }
     if (this.activeFolderId() !== null) {
       // Folder filtering is client-side over `meetings`, so it shares the
       // initial-load flag (and the tree's own loading shows in the left pane).
       return this.loading();
     }
-    // The "Meetings" root merges org items, so its load also depends on the org load.
     if (this.activeTag() === null) {
-      return this.loading() || this.orgsLoading();
+      return this.loading();
     }
     return this.tagLoading();
   });
 
-  /** Heading for the no-query list: org name → folder name → tag → "Meetings". */
+  /** Heading for the no-query list: folder name → tag → "Meetings". */
   readonly listHeading = computed(() => {
-    const org = this.activeOrg();
-    if (org) {
-      return org.name;
-    }
     const fid = this.activeFolderId();
     if (fid !== null) {
       return this.folderById().get(fid)?.name ?? "Folder";
@@ -323,52 +258,6 @@ export class LibraryComponent implements OnInit {
     const node = this.folderById().get(fid);
     return node ? this.folders.exposureOf(node) : null;
   });
-
-  // --- Org (Shared Brain) shared-brain items ------------------------------
-  /**
-   * Every org (Shared Brain) this user belongs to — the rail's "Shared brains"
-   * section + the source of merged org items in the "Meetings" (all) list. Loaded
-   * stale-guarded on init, on the `org-feed-updated` event, and on window focus.
-   * Mirrors the notes-home org integration (0.9.4).
-   */
-  private readonly _orgs = signal<OrgStatus[]>([]);
-  readonly orgs = this._orgs.asReadonly();
-  /**
-   * The org's shared items keyed by orgId (`listOrgItems`). A flat parallel signal
-   * (not per-org sub-signals) so the merged list computed re-derives on any change.
-   */
-  private readonly _orgItems = signal<Record<string, OrgItemHeader[]>>({});
-  /**
-   * Selected org id in the rail (null ⇒ not viewing a specific org). MUTUALLY
-   * exclusive with a folder OR tag selection: selecting an org clears both
-   * {@link activeFolderId} and {@link activeTag}, and selecting a folder/tag clears
-   * this — so the content pane has exactly one active scope.
-   */
-  readonly activeOrgId = signal<string | null>(null);
-  /** True while the org list + items are (re)loading (rail hint only). */
-  readonly orgsLoading = signal(false);
-  /** The org whose items are shown when an org is rail-selected (null otherwise). */
-  readonly activeOrg = computed<OrgStatus | null>(() => {
-    const oid = this.activeOrgId();
-    return oid === null
-      ? null
-      : (this._orgs().find((o) => o.orgId === oid) ?? null);
-  });
-
-  /** Released on destroy to detach the org-feed-updated live-refresh listener. */
-  private orgFeedUnlisten: UnlistenFn | null = null;
-  /**
-   * True once destroyed — so a `listen()` that resolves AFTER teardown releases
-   * immediately (distinct from `orgFeedUnlisten === null`, which also means "not
-   * yet resolved").
-   */
-  private orgFeedDestroyed = false;
-  /** Bumped per org load so a late (stale) reload result is dropped (T1 guard). */
-  private orgLoadSeq = 0;
-  /** Bound window-focus handler — re-loads org items when the view regains focus. */
-  private readonly onWindowFocus = (): void => {
-    void this.loadOrgs();
-  };
 
   // --- Delete affordance (in-app, signal-driven confirm) ------------------
   /** Id of the meeting whose inline confirm panel is open (null = none). */
@@ -393,45 +282,18 @@ export class LibraryComponent implements OnInit {
   private searchTimer: ReturnType<typeof setTimeout> | null = null;
 
   async ngOnInit(): Promise<void> {
-    // Clean up any in-flight debounce timer + the org live-refresh listener +
-    // the focus handler when the view is torn down.
+    // Clean up any in-flight debounce timer when the view is torn down.
     this.destroyRef.onDestroy(() => {
       if (this.searchTimer) {
         clearTimeout(this.searchTimer);
       }
-      this.orgFeedDestroyed = true;
-      this.orgFeedUnlisten?.();
-      this.orgFeedUnlisten = null;
-      window.removeEventListener("focus", this.onWindowFocus);
     });
 
-    // Live-refresh the org items: the background org-sync loop fires
-    // `org-feed-updated` on a productive tick (≥1 ingest/tombstone). Subscribe
-    // ONCE (push straight into a reload — never subscribe-into-a-field), and
-    // re-load org items when the view regains focus. Mirrors notes-home.
-    window.addEventListener("focus", this.onWindowFocus);
-    void this.ipc
-      .onOrgFeedUpdated(() => void this.loadOrgs())
-      .then((un) => {
-        // If the view was already torn down before the listener resolved, release
-        // it immediately (never leak a subscription past destroy).
-        if (this.orgFeedDestroyed) {
-          un();
-        } else {
-          this.orgFeedUnlisten = un;
-        }
-      })
-      .catch(() => {
-        /* best-effort: no Tauri host (e.g. plain browser) → no live refresh */
-      });
-
-    // Load the meetings list, the tag set, and the org list in parallel; a
-    // tag/org-load failure must not break the meetings list, so settle each
-    // independently.
+    // Load the meetings list and the tag set in parallel; a tag-load failure
+    // must not break the meetings list, so settle each independently.
     const [meetings] = await Promise.allSettled([
       this.ipc.listMeetings(),
       this.loadTags(),
-      this.loadOrgs(),
     ]);
     if (meetings.status === "fulfilled") {
       this.meetings.set(meetings.value);
@@ -444,94 +306,6 @@ export class LibraryComponent implements OnInit {
       .catch(() => {
         /* best-effort: no cap set / backend unavailable → the chip stays hidden */
       });
-  }
-
-  /**
-   * (Re)load the org (Shared Brain) list + every org's shared items, stale-guarded
-   * on {@link orgLoadSeq} so a late reload (event / focus / init racing) never
-   * overwrites a newer result. Best-effort throughout: `orgRefresh` (server
-   * membership discovery) and each per-org `listOrgItems` swallow their own
-   * failures so a transient/offline error leaves the last-known list standing
-   * rather than blanking the pane. Never throws. Mirrors notes-home `loadOrgs`.
-   */
-  async loadOrgs(): Promise<void> {
-    const seq = ++this.orgLoadSeq;
-    this.orgsLoading.set(true);
-    try {
-      // Discover freshly-invited orgs before reading the local replica (best-effort).
-      try {
-        await this.ipc.orgRefresh();
-      } catch {
-        /* offline / no server → fall through to the local replica */
-      }
-      let orgs: OrgStatus[];
-      try {
-        orgs = await this.ipc.orgListStatuses();
-      } catch {
-        return; // keep the last-known orgs on a transient failure
-      }
-      if (seq !== this.orgLoadSeq) {
-        return; // a newer load superseded this one — drop the result
-      }
-      // Pull each org's browsable items in parallel; a per-org failure yields [].
-      const itemLists = await Promise.all(
-        orgs.map((o) =>
-          this.ipc.listOrgItems(o.orgId).catch(() => [] as OrgItemHeader[]),
-        ),
-      );
-      if (seq !== this.orgLoadSeq) {
-        return;
-      }
-      const byOrg: Record<string, OrgItemHeader[]> = {};
-      orgs.forEach((o, i) => {
-        byOrg[o.orgId] = itemLists[i];
-      });
-      this._orgs.set(orgs);
-      this._orgItems.set(byOrg);
-      // If the rail's selected org has since disappeared, fall back to "Meetings".
-      const sel = this.activeOrgId();
-      if (sel !== null && !orgs.some((o) => o.orgId === sel)) {
-        this.activeOrgId.set(null);
-      }
-    } finally {
-      if (seq === this.orgLoadSeq) {
-        this.orgsLoading.set(false);
-      }
-    }
-  }
-
-  /**
-   * Rail-select an org (Shared Brain): the pane shows ONLY that org's shared
-   * items. Mutually exclusive with a folder OR tag selection — clears both
-   * {@link activeFolderId} and {@link activeTag} (and its fetched list) + closes
-   * any open transient UI.
-   */
-  selectOrg(orgId: string): void {
-    this.cancelDelete();
-    this.closeMovePopover();
-    this.activeFolderId.set(null);
-    this.activeTag.set(null);
-    this.tagMeetings.set([]);
-    this.tagLoading.set(false);
-    this.activeOrgId.set(orgId);
-  }
-
-  /** A friendly role hint for the rail ("Owner" / "Member"). */
-  orgRoleLabel(org: OrgStatus): string {
-    return org.role === "owner" ? "Owner" : "Member";
-  }
-
-  /** Presentational only: an ISO timestamp (org item `createdAt`) → a friendly date. */
-  formatOrgDate(iso: string): string {
-    const d = new Date(iso);
-    if (Number.isNaN(d.getTime())) {
-      return "";
-    }
-    return d.toLocaleDateString(undefined, {
-      year: "numeric",
-      month: "short",
-      day: "numeric",
-    });
   }
 
   /** Fetch the distinct tag set; on failure leave `tags` empty (no filter bar). */
@@ -557,12 +331,11 @@ export class LibraryComponent implements OnInit {
     // Switching the view dismisses any open delete confirm to avoid a dangling
     // panel pointing at a row that may not be in the new list.
     this.cancelDelete();
-    // Tag + folder + org scopes are mutually exclusive: picking a tag clears any
-    // active folder AND org selection so they never compose into an empty surprise.
+    // Tag + folder scopes are mutually exclusive: picking a tag clears any
+    // active folder so they never compose into an empty surprise.
     if (tag !== null) {
       this.activeFolderId.set(null);
     }
-    this.activeOrgId.set(null);
     this.activeTag.set(tag);
 
     if (tag === null) {
@@ -601,22 +374,18 @@ export class LibraryComponent implements OnInit {
    * race exists; the same idempotent-guard shape is kept for consistency.
    */
   selectFolder(folderId: string | null): void {
-    // A re-select of the SAME folder while no org is active is a no-op — but a
-    // re-select of "All notes" (null) WHILE an org is active still runs, to drop
-    // the org scope.
-    if (this.activeFolderId() === folderId && this.activeOrgId() === null) {
+    // A re-select of the SAME folder is a no-op.
+    if (this.activeFolderId() === folderId) {
       return;
     }
     this.cancelDelete();
-    // Folder + tag + org scopes are mutually exclusive — picking a folder clears
-    // the tag selection (and its fetched list) AND any org selection so they
-    // never compose.
+    // Folder + tag scopes are mutually exclusive — picking a folder clears the
+    // tag selection (and its fetched list) so they never compose.
     if (folderId !== null) {
       this.activeTag.set(null);
       this.tagMeetings.set([]);
       this.tagLoading.set(false);
     }
-    this.activeOrgId.set(null);
     this.activeFolderId.set(folderId);
   }
 
@@ -784,18 +553,14 @@ export class LibraryComponent implements OnInit {
       return;
     }
 
-    // Search takes precedence over the tag, folder AND org scopes: reset to the
-    // full list so clearing the search returns to "All" (the chip bar is hidden
-    // while searching). Search stays meetings-only — org items appear only in the
-    // no-query list branch. Per-row delete still works against `meetings`.
+    // Search takes precedence over the tag AND folder scopes: reset to the full
+    // list so clearing the search returns to "All" (the chip bar is hidden while
+    // searching). Per-row delete still works against `meetings`.
     if (this.activeTag() !== null) {
       void this.selectTag(null);
     }
     if (this.activeFolderId() !== null) {
       this.activeFolderId.set(null);
-    }
-    if (this.activeOrgId() !== null) {
-      this.activeOrgId.set(null);
     }
 
     this.searching.set(true);
