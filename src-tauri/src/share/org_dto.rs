@@ -42,6 +42,30 @@ pub struct OrgResponse {
     pub current_generation: u32,
 }
 
+/// One org the caller actively belongs to, in `GET /v1/orgs` — the membership-discovery pull that
+/// makes an org you were INVITED to (not one you created) visible + syncable. Content-free: an opaque
+/// id, a role label, a timestamp, and the live generation. Mirrors [`OrgResponse`]'s field set (the
+/// server returns the same per-org shape in a list), tolerant of a server that omits `currentGeneration`.
+#[derive(Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct OrgSummary {
+    pub org_id: String,
+    pub name: String,
+    /// `owner` | `member`.
+    pub role: String,
+    pub created_at: String,
+    /// The org's live OCK generation (defaults to 1 for older servers that omit it).
+    #[serde(default = "one")]
+    pub current_generation: u32,
+}
+
+/// Response to `GET /v1/orgs` — every org the caller actively belongs to (owned OR invited-and-active).
+#[derive(Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct OrgListResponse {
+    pub orgs: Vec<OrgSummary>,
+}
+
 /// `POST /v1/orgs/{id}/members {email}` (owner-only).
 #[derive(Serialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -253,5 +277,33 @@ mod tests {
         let json = r#"{"orgId":"o1","name":"Acme","role":"member","createdAt":"2026-07-10T00:00:00Z"}"#;
         let r: OrgResponse = serde_json::from_str(json).unwrap();
         assert_eq!(r.current_generation, 1);
+    }
+
+    /// `GET /v1/orgs` deserializes a MIXED list — an org I own + an org I was invited to (member),
+    /// one carrying a generation, one relying on the default. This is the membership-discovery shape.
+    #[test]
+    fn org_list_response_deserializes_owned_and_invited() {
+        let json = r#"{"orgs":[
+            {"orgId":"o-own","name":"Acme","role":"owner",
+             "createdAt":"2026-07-10T00:00:00Z","currentGeneration":3},
+            {"orgId":"o-inv","name":"Partner Co","role":"member",
+             "createdAt":"2026-07-11T00:00:00Z"}
+        ]}"#;
+        let r: OrgListResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(r.orgs.len(), 2);
+        assert_eq!(r.orgs[0].org_id, "o-own");
+        assert_eq!(r.orgs[0].role, "owner");
+        assert_eq!(r.orgs[0].current_generation, 3);
+        assert_eq!(r.orgs[1].org_id, "o-inv");
+        assert_eq!(r.orgs[1].role, "member");
+        // Default generation for the invited org whose row omitted it.
+        assert_eq!(r.orgs[1].current_generation, 1);
+    }
+
+    /// An empty membership list (a fresh account belonging to nothing) round-trips to an empty vec.
+    #[test]
+    fn org_list_response_deserializes_empty() {
+        let r: OrgListResponse = serde_json::from_str(r#"{"orgs":[]}"#).unwrap();
+        assert!(r.orgs.is_empty());
     }
 }
