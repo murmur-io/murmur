@@ -5132,6 +5132,9 @@ impl Db {
                     author_hint: r.get(2)?,
                     created_at: r.get(3)?,
                     seq: r.get::<_, i64>(4)? as u64,
+                    // Enriched in `list_org_items_inner` (needs `&AppState` for the unlock gate); the
+                    // raw DB row carries no ownership resolution.
+                    owned_source: None,
                 })
             })
             .map_err(map_err)?;
