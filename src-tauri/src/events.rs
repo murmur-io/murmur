@@ -312,3 +312,57 @@ pub fn emit_recording_capped(app: &AppHandle) {
         );
     }
 }
+
+/// Emitted after a background org-feed sync tick INGESTED or TOMBSTONED ≥1 item — i.e. the local
+/// org (Shared Brain) replica actually changed this tick. Lets an open FE view (the Notes org
+/// picker, the Settings shared-brain list) refresh WITHOUT polling. Counts only, NO PII (no item
+/// ids, titles, or content) — it is purely a "something changed, re-fetch" ping.
+pub const EVENT_ORG_FEED_UPDATED: &str = "murmur://org-feed-updated";
+
+/// Payload for [`EVENT_ORG_FEED_UPDATED`]. A single count only — NO PII. `orgsChanged` is the number
+/// of joined orgs whose feed produced ≥1 ingest/tombstone this tick (the all-orgs background tick
+/// aggregates across orgs). The FE treats any arrival as "re-fetch the org lists".
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrgFeedUpdatedPayload {
+    /// Number of orgs whose replica changed this tick (≥1 when emitted).
+    pub orgs_changed: u32,
+}
+
+/// Emit [`EVENT_ORG_FEED_UPDATED`] to the FE (best-effort). Fired ONLY on a productive tick
+/// (≥1 ingest/tombstone). Swallows the emit failure with a `tracing::warn!` so a failed emit can
+/// NEVER break the background sync loop. NO PII (a count only).
+pub fn emit_org_feed_updated(app: &AppHandle, orgs_changed: u32) {
+    if let Err(e) = app.emit(EVENT_ORG_FEED_UPDATED, OrgFeedUpdatedPayload { orgs_changed }) {
+        tracing::warn!(
+            target: "org",
+            error = %e,
+            "failed to emit org-feed-updated notice"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The FE listens on this exact event name; a rename silently drops the live-refresh.
+    #[test]
+    fn org_feed_updated_event_name_is_stable() {
+        assert_eq!(EVENT_ORG_FEED_UPDATED, "murmur://org-feed-updated");
+    }
+
+    /// The payload must serialize `orgs_changed` as camelCase `orgsChanged` (the FE contract) and
+    /// carry NO PII field — a count only.
+    #[test]
+    fn org_feed_updated_payload_is_camel_case_count_only() {
+        let json = serde_json::to_string(&OrgFeedUpdatedPayload { orgs_changed: 3 }).unwrap();
+        assert_eq!(json, r#"{"orgsChanged":3}"#);
+    }
+
+    /// The global org auto-sync cadence is 2 minutes (guards the 300→120 change from regressing).
+    #[test]
+    fn org_sync_tick_cadence_is_two_minutes() {
+        assert_eq!(crate::commands::ORG_SYNC_TICK_SECS, 120);
+    }
+}

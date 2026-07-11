@@ -1,0 +1,141 @@
+import { test, expect } from "@playwright/test";
+import { mockNotes } from "./mock-invoke";
+
+/**
+ * Notes home — org (Shared Brain) surfacing. Confirms that with a mocked org
+ * (`org_list_statuses`) carrying a shared item (`list_org_items`), the Notes view:
+ *   1. renders the "Shared brains" rail section listing the org (name + role);
+ *   2. MERGES the org's shared item into the "All notes" content pane alongside
+ *      YOUR authored notes, with the ORG-NAME badge on the org card;
+ *   3. routes to the READ-ONLY `/org-item/:id` viewer when the org card is clicked
+ *      (your own notes still open the `/notes/:id` editor).
+ * All under the mocked IPC with NO console/page errors — the runtime check that
+ * catches NG0600 / ɵcmp / forwardRef / routerLink regressions a green build misses.
+ *
+ * The org command NAMES + camelCase DTOs match `ipc.service.ts` / `models.ts`:
+ *   org_refresh → void · org_list_statuses → OrgStatus[] · list_org_items →
+ *   OrgItemHeader[] · org_get_item → OrgItemDetail.
+ */
+
+/** The mocked org command overrides shared by every case in this file. */
+const ORG_MOCKS = {
+  org_refresh: () => null,
+  org_list_statuses: () => [
+    {
+      orgId: "org1",
+      name: "Siema",
+      role: "member",
+      memberCount: 3,
+      consented: true,
+      lastSeq: 5,
+      itemCount: 0,
+      receivedCount: 1,
+      pendingShares: 0,
+    },
+  ],
+  list_org_items: (args: { orgId: string }) =>
+    args.orgId === "org1"
+      ? [
+          {
+            itemId: "oi1",
+            title: "Team Roadmap Q3",
+            authorHint: "alice",
+            createdAt: "2026-07-09T10:00:00Z",
+            seq: 5,
+          },
+        ]
+      : [],
+  org_get_item: (args: { itemId: string }) => ({
+    itemId: args.itemId,
+    authorHint: "alice",
+    title: "Team Roadmap Q3",
+    createdAt: "2026-07-09T10:00:00Z",
+    rev: 1,
+    markdown: "# Team Roadmap Q3\n\nShip the org brain.",
+  }),
+};
+
+test("All notes merges org shared items (with org-name badge) + the rail lists the org", async ({
+  page,
+}) => {
+  const consoleErrors: string[] = [];
+  page.on("console", (msg) => {
+    if (msg.type() === "error") {
+      consoleErrors.push(msg.text());
+    }
+  });
+  page.on("pageerror", (err) => consoleErrors.push(String(err)));
+
+  await mockNotes(page, ORG_MOCKS);
+  await page.goto("/notes");
+
+  await expect(page.locator(".notes-content")).toBeVisible();
+
+  // 1) The rail's "Shared brains" section lists the org (name + role hint).
+  await expect(page.locator(".folders-title", { hasText: "Shared brains" })).toBeVisible();
+  const orgRow = page.locator(".org-row");
+  await expect(orgRow).toHaveCount(1);
+  await expect(orgRow.locator(".folder-name")).toHaveText("Siema");
+  await expect(orgRow.locator(".org-role")).toHaveText("Member");
+
+  // 2) "All notes" shows YOUR authored note AND the org shared item, merged.
+  await expect(page.getByText("My First Note")).toBeVisible();
+  const orgCard = page.locator(".note-card--org");
+  await expect(orgCard).toHaveCount(1);
+  await expect(orgCard.getByText("Team Roadmap Q3")).toBeVisible();
+  // The org card carries the ORG-NAME badge + the author hint.
+  await expect(orgCard.locator(".org-badge")).toContainText("Siema");
+  await expect(orgCard.locator(".note-author")).toHaveText("alice");
+
+  expect(consoleErrors).toEqual([]);
+});
+
+test("clicking an org shared item routes to the read-only /org-item viewer", async ({
+  page,
+}) => {
+  const consoleErrors: string[] = [];
+  page.on("console", (msg) => {
+    if (msg.type() === "error") {
+      consoleErrors.push(msg.text());
+    }
+  });
+  page.on("pageerror", (err) => consoleErrors.push(String(err)));
+
+  await mockNotes(page, ORG_MOCKS);
+  await page.goto("/notes");
+  await expect(page.locator(".notes-content")).toBeVisible();
+
+  // Click the org card → the read-only org-item viewer route.
+  await page.locator(".note-card--org").click();
+  await expect(page).toHaveURL(/\/org-item\/oi1$/);
+  // The viewer rendered the decrypted org item body (read-only, no editor).
+  await expect(page.locator("app-org-item-viewer")).toBeVisible();
+  await expect(page.getByText("Ship the org brain.")).toBeVisible();
+
+  expect(consoleErrors).toEqual([]);
+});
+
+test("selecting the org in the rail shows ONLY that org's items", async ({
+  page,
+}) => {
+  const consoleErrors: string[] = [];
+  page.on("console", (msg) => {
+    if (msg.type() === "error") {
+      consoleErrors.push(msg.text());
+    }
+  });
+  page.on("pageerror", (err) => consoleErrors.push(String(err)));
+
+  await mockNotes(page, ORG_MOCKS);
+  await page.goto("/notes");
+  await expect(page.locator(".notes-content")).toBeVisible();
+
+  // Select the org in the rail → the pane scopes to its items only.
+  await page.locator(".org-row").click();
+  await expect(page.locator(".content-title")).toHaveText("Siema");
+  await expect(page.locator(".note-card--org")).toHaveCount(1);
+  // Your authored notes are NOT in the org-scoped view.
+  await expect(page.getByText("My First Note")).toHaveCount(0);
+
+  expect(consoleErrors).toEqual([]);
+});
