@@ -44,6 +44,12 @@
       }
     </div>
   } @else {
+    <!-- ORG BRAIN — the flagship share action, surfaced FIRST (only in an org).
+         Generic CTA: the org is PICKED in the sheet (a member can be in many). -->
+    @if (org()) {
+      <mur-org-brain-cta [disabled]="editing()" (add)="openOrgSheet()" />
+    }
+
     <!-- ============================================================== -->
     <!-- CONFIGURE (2.3) — password FIRST → expires → open limit →       -->
     <!-- consent → Create link. Replaced by CREATED after a create.     -->
@@ -449,34 +455,6 @@
         </div>
       }
     </div>
-
-    <!-- ============================================================== -->
-    <!-- ORG BRAIN (Shared Brain v1) — publish this note to the org's    -->
-    <!-- shared brain. Only shown when the user is in an org.            -->
-    <!-- ============================================================== -->
-    @if (org(); as orgStatus) {
-      <div class="panel-card org">
-        <div class="manage-head">
-          <span class="section-label">Org Brain</span>
-          <span class="hint-inline">{{ orgStatus.name }}</span>
-        </div>
-        <p class="consent-copy">
-          Add this note to <strong>{{ orgStatus.name }}</strong>'s shared brain so
-          your
-          {{ orgStatus.memberCount }}
-          {{ orgStatus.memberCount === 1 ? "teammate" : "teammates" }} can find it.
-          It's end-to-end encrypted; the server can't read it.
-        </p>
-        <button
-          type="button"
-          class="btn btn-ghost org-btn"
-          (click)="openOrgSheet()"
-          [disabled]="editing()"
-        >
-          Add to Org Brain
-        </button>
-      </div>
-    }
 
     @if (verifyMode(); as mode) {
       <app-share-verify-sheet
