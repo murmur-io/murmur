@@ -182,17 +182,37 @@ export class NotesHomeComponent implements OnInit {
       return noteCards.sort((a, b) => b.sortAt - a.sortAt);
     }
 
-    // "All notes": merge YOUR notes with EVERY org's shared items.
+    // "All notes": merge YOUR notes with EVERY org's shared items — but DROP org
+    // replicas the caller authored (`ownedSource`): the editable original already
+    // appears (as a note card, or under Meetings), so showing the replica too would
+    // duplicate the row and surface a stale publish-time title. Replicas shared by
+    // OTHERS stay (that's the point of the merged view).
     const orgCards: NotesListItem[] = orgs.flatMap((o) =>
-      (orgItemsByOrg[o.orgId] ?? []).map((item) =>
-        this.toOrgCard(item, o.name),
-      ),
+      (orgItemsByOrg[o.orgId] ?? [])
+        .filter((item) => !item.ownedSource)
+        .map((item) => this.toOrgCard(item, o.name)),
     );
     return [...noteCards, ...orgCards].sort((a, b) => b.sortAt - a.sortAt);
   });
 
   /** True when the unified list has zero rows (drives the empty state). */
   readonly listEmpty = computed(() => this.listItems().length === 0);
+
+  /**
+   * Router target for an org card. When the caller AUTHORED the item (`ownedSource`,
+   * resolved+gated backend-side) the row opens the EDITABLE original — a `/notes/:id`
+   * note or a `/meeting/:id` recording — so the author edits the real thing instead of
+   * a read-only replica. Otherwise it opens the read-only `/org-item/:id` viewer.
+   */
+  orgItemLink(item: OrgItemHeader): string[] {
+    const owned = item.ownedSource;
+    if (owned) {
+      return owned.kind === "meeting"
+        ? ["/meeting", owned.id]
+        : ["/notes", owned.id];
+    }
+    return ["/org-item", item.itemId];
+  }
 
   /** Build an org card from a header + its origin org name. */
   private toOrgCard(item: OrgItemHeader, orgName: string): NotesListItem {

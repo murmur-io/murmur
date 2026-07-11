@@ -22552,6 +22552,104 @@ mod lifecycle_tests {
         );
     }
 
+    /// F-org-editable: `list_org_items_inner` ENRICHES an item the caller published with an
+    /// `owned_source` ref plus the source's CURRENT title (so the author's own card links to the
+    /// editable original and never shows a stale publish-time snapshot), while an item shared by
+    /// SOMEONE ELSE (no local share) stays a bare read-only replica. RED before the enrichment
+    /// (owned_source always None, title frozen).
+    #[test]
+    fn list_org_items_enriches_owned_items_with_editable_source_and_current_title() {
+        let state = build_state("org-list-owned");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        make_open_folder(&state.db, "f-own", "Team");
+        // The author's local note, retitled to "Jest tytul" AFTER it was shared as "Untitled".
+        state
+            .db
+            .insert_note("n-own", "f-own", "Untitled", "Jest tytul", "# body", 1)
+            .unwrap();
+        // The received replica (frozen at publish time = "Untitled") + the matching OUTBOUND share.
+        state
+            .db
+            .upsert_org_item("item-own", "org-1", 2, "kgm004a", "Untitled", "# body", "2026-07-11T09:00:00Z", 1, 1, &[9u8; 32], None)
+            .unwrap();
+        state
+            .db
+            .insert_org_share("s-own", "org-1", None, Some("n-own"), "note", Some("Untitled"), 1, 1, &[9u8; 32], "2026-07-11T09:00:00Z")
+            .unwrap();
+        state
+            .db
+            .set_org_share_uploaded("s-own", "item-own", "2026-07-11T09:00:00Z")
+            .unwrap();
+        // Someone ELSE's replica — no local share ⇒ stays read-only, title untouched.
+        state
+            .db
+            .upsert_org_item("item-other", "org-1", 1, "kgm004a+2", "Ich notatka", "body", "2026-07-10T09:00:00Z", 1, 1, &[7u8; 32], None)
+            .unwrap();
+
+        let items = list_org_items_inner(&state, "org-1").unwrap();
+        let own = items.iter().find(|i| i.item_id == "item-own").unwrap();
+        assert_eq!(
+            own.title, "Jest tytul",
+            "owned item shows the source's CURRENT title, not the stale snapshot"
+        );
+        let owned = own.owned_source.as_ref().expect("owned item carries a source ref");
+        assert_eq!(owned.kind, "document");
+        assert_eq!(owned.id, "n-own");
+
+        let other = items.iter().find(|i| i.item_id == "item-other").unwrap();
+        assert!(other.owned_source.is_none(), "a non-author's item is a read-only replica");
+        assert_eq!(other.title, "Ich notatka", "a non-owned title is left as-is");
+    }
+
+    /// F-org-editable GATE: an owned item whose source folder is LOCKED (not session-unlocked) is NOT
+    /// enriched — its current title must never leak through the org list, and it falls back to the
+    /// read-only replica (frozen snapshot title). RED before the `folder_is_unlocked` gate.
+    #[test]
+    fn list_org_items_does_not_leak_a_locked_owned_source_title() {
+        let state = build_state("org-list-owned-locked");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        // A LOCKED folder (never added to the session unlocked set).
+        state
+            .db
+            .insert_folder(&Folder {
+                id: "f-lock".to_string(),
+                name: "Vault".to_string(),
+                path: "Vault".to_string(),
+                parent_id: None,
+                locked: true,
+                created_at: "2026-06-27T08:00:00Z".to_string(),
+            })
+            .unwrap();
+        state
+            .db
+            .insert_note("n-lock", "f-lock", "secret", "Secret Title", "# body", 1)
+            .unwrap();
+        state
+            .db
+            .upsert_org_item("item-lock", "org-1", 1, "kgm004a", "Old Snapshot", "# body", "2026-07-11T09:00:00Z", 1, 1, &[5u8; 32], None)
+            .unwrap();
+        state
+            .db
+            .insert_org_share("s-lock", "org-1", None, Some("n-lock"), "note", Some("Old Snapshot"), 1, 1, &[5u8; 32], "2026-07-11T09:00:00Z")
+            .unwrap();
+        state
+            .db
+            .set_org_share_uploaded("s-lock", "item-lock", "2026-07-11T09:00:00Z")
+            .unwrap();
+
+        let items = list_org_items_inner(&state, "org-1").unwrap();
+        let it = items.iter().find(|i| i.item_id == "item-lock").unwrap();
+        assert!(
+            it.owned_source.is_none(),
+            "a locked owned source is not resolved (no editable link)"
+        );
+        assert_ne!(
+            it.title, "Secret Title",
+            "a locked source's current title must NOT leak into the org list"
+        );
+        assert_eq!(it.title, "Old Snapshot", "falls back to the frozen replica snapshot");
+    }
+
     /// FIX A (command gate): `list_org_items_inner` refuses an org the caller isn't a local member of
     /// (membership-checked via `resolve_org`) — never leaking another org's list — and returns the list
     /// for a member org.
@@ -25327,6 +25425,40 @@ pub(crate) async fn republish_org_shares_for_source(
             .set_org_share_uploaded(&row.id, &published.item_id, &now)?;
         crate::share::ledger_row(&state.db, &client.host(), "org_share_publish", content_sha.len());
 
+        // LOCAL REPLICA CONSISTENCY (F-org-editable): the author's OWN `org_items` replica would
+        // otherwise stay frozen on the OLD item_id until the next feed pull — so the just-repointed
+        // `org_shares` row no longer matches the replica the Notes list renders (`item_id` drift →
+        // the card falls back to a stale, read-only viewer). Upsert the NEW item + tombstone the OLD
+        // one LOCALLY now, so `list_org_items` immediately resolves this as an owned/editable card with
+        // the fresh title. FTS-only (`None` embedder) to keep this editor-close path light; the next
+        // real `org_sync_now` re-ingests authoritatively (idempotent upsert) and re-embeds. Best-effort:
+        // a local-replica error must never fail the save (the server copy is already live + correct).
+        if let Err(e) = state.db.upsert_org_item(
+            &published.item_id,
+            &org.org_id,
+            published.seq,
+            &env.author_hint,
+            &env.title,
+            &env.markdown,
+            &env.created_at,
+            new_rev,
+            generation,
+            &content_sha,
+            None,
+        ) {
+            tracing::warn!(target: "org", error = %e, "republish: local replica upsert failed (server copy live)");
+        }
+        if let Some(old_item) = row.item_id.as_deref() {
+            // Guard: only tombstone the OLD id if it truly differs from the freshly-published one —
+            // a defensive no-op if the server ever reused the item_id (it mints a new one per publish),
+            // so we never tombstone the replica we just upserted.
+            if old_item != published.item_id {
+                if let Err(e) = state.db.tombstone_org_item(old_item) {
+                    tracing::warn!(target: "org", error = %e, "republish: local old-item tombstone failed");
+                }
+            }
+        }
+
         // THEN tombstone the OLD item so members evict the stale copy. Publish-BEFORE-tombstone: a
         // crash here leaves a transient dup (recoverable), never a window with no org copy. A tombstone
         // failure is non-fatal — the new copy is already live; the stale one lingers until a revoke.
@@ -26029,7 +26161,76 @@ pub(crate) fn list_org_items_inner(
 ) -> Result<Vec<crate::storage::models::OrgItemHeader>, AppError> {
     // Membership re-check: refuse if the caller isn't a local member of this org.
     let org = resolve_org(st, org_id)?;
-    st.db.list_org_items(&org.org_id)
+    let mut items = st.db.list_org_items(&org.org_id)?;
+    // OWNERSHIP ENRICHMENT (F-org-editable): for each replica the CALLER published, resolve its local
+    // editable source + CURRENT title so the FE links straight to the editable original and never shows
+    // a stale publish-time snapshot. GATED — a locked-not-unlocked source resolves to `None` (its title
+    // must never leak through this org-disclosed list). A non-author's item has no local share ⇒ `None`
+    // ⇒ stays a read-only replica.
+    for item in &mut items {
+        if let Some(src) = resolve_owned_source(st, &item.item_id)? {
+            item.title = src.title;
+            item.owned_source = Some(src.owned);
+        }
+    }
+    Ok(items)
+}
+
+/// The caller's editable local source + its CURRENT title for an org item they published, if any. `None`
+/// when the item was shared by someone else (no local `org_shares` row), the source row is gone, or the
+/// source is locked-and-not-session-unlocked (never leak a sealed title through the org list). Powers the
+/// `OrgItemHeader.owned_source` enrichment; the gate mirrors the note/meeting content-read gates.
+struct OwnedSourceResolved {
+    title: String,
+    owned: crate::storage::models::OrgOwnedSource,
+}
+
+fn resolve_owned_source(
+    st: &AppState,
+    item_id: &str,
+) -> Result<Option<OwnedSourceResolved>, AppError> {
+    let Some(row) = st.db.org_share_by_item(item_id)? else {
+        return Ok(None);
+    };
+    if row.state != "uploaded" {
+        return Ok(None);
+    }
+    if let Some(document_id) = row.document_id {
+        let Some(note) = st.db.get_note_row(&document_id)? else {
+            return Ok(None);
+        };
+        // GATE: a sealed-not-unlocked note's title must not leak into the org list.
+        if !folder_is_unlocked(st, &note.folder_id)? {
+            return Ok(None);
+        }
+        return Ok(Some(OwnedSourceResolved {
+            title: note_display_title(&note),
+            owned: crate::storage::models::OrgOwnedSource {
+                kind: "document".to_string(),
+                id: document_id,
+            },
+        }));
+    }
+    if let Some(meeting_id) = row.meeting_id {
+        // GATE: a sealed-not-unlocked meeting refuses (masked title never leaks).
+        if !meeting_is_unlocked(st, &meeting_id)? {
+            return Ok(None);
+        }
+        let title = st
+            .db
+            .get_meeting(&meeting_id)?
+            .and_then(|m| m.title.clone())
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| "Shared note".to_string());
+        return Ok(Some(OwnedSourceResolved {
+            title,
+            owned: crate::storage::models::OrgOwnedSource {
+                kind: "meeting".to_string(),
+                id: meeting_id,
+            },
+        }));
+    }
+    Ok(None)
 }
 
 #[cfg(test)]
