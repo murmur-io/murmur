@@ -38,6 +38,20 @@ interface SnippetPart {
   hit: boolean;
 }
 
+/**
+ * One row of the no-query list. Meetings is a RECORDINGS-ONLY view: a
+ * `"meeting"` row is a local recording (opens `/meeting/:id`, keeps its
+ * folder-chip / delete / drag / lock affordances). It exposes an epoch-ms
+ * `sortAt` so the list orders by date desc, and a `meeting:`-namespaced `id`
+ * so the `@for` track key is stable.
+ */
+export interface MeetingsListItem {
+  kind: "meeting";
+  id: string;
+  sortAt: number;
+  meeting: Meeting;
+}
+
 @Component({
   selector: "app-library",
   changeDetection: ChangeDetectionStrategy.OnPush,
@@ -198,13 +212,12 @@ export class LibraryComponent implements OnInit {
   readonly tagLoading = signal(false);
 
   /**
-   * The list to render when not searching, in strict precedence (search is
-   * handled separately via `hasQuery()`):
+   * The MEETINGS (recordings) to render when not searching, in strict precedence
+   * (search is handled separately via `hasQuery()`):
    *   folder selected → folder-filtered;
    *   else tag selected → tag-filtered;
    *   else → the full list.
-   * No existing branch is removed — the folder branch sits ABOVE the tag/all
-   * branches the screen already had.
+   * This is the meeting SOURCE the {@link listItems} list is built from.
    */
   readonly displayedMeetings = computed(() => {
     if (this.activeFolderId() !== null) {
@@ -212,14 +225,43 @@ export class LibraryComponent implements OnInit {
     }
     return this.activeTag() === null ? this.meetings() : this.tagMeetings();
   });
-  /** Loading state for the visible no-query list (initial load or a tag fetch). */
+
+  /**
+   * The no-query list feeding the pane (RECORDINGS ONLY), sorted by date desc.
+   * Built from {@link displayedMeetings}, which already applies the folder/tag
+   * precedence. Only recordings can be masked (folder-sealed).
+   */
+  readonly listItems = computed<MeetingsListItem[]>(() =>
+    this.displayedMeetings()
+      .map<MeetingsListItem>((meeting) => ({
+        kind: "meeting",
+        id: `meeting:${meeting.id}`,
+        sortAt: this.meetingSortAt(meeting),
+        meeting,
+      }))
+      .sort((a, b) => b.sortAt - a.sortAt),
+  );
+
+  /** True when the no-query list has zero rows (drives the empty state). */
+  readonly listEmpty = computed(() => this.listItems().length === 0);
+
+  /** Epoch-ms sort key for a meeting (its start time; 0 when unparseable). */
+  private meetingSortAt(m: Meeting): number {
+    const t = Date.parse(m.startedAt);
+    return Number.isNaN(t) ? 0 : t;
+  }
+
+  /** Loading state for the visible no-query list (initial load or tag fetch). */
   readonly listLoading = computed(() => {
     if (this.activeFolderId() !== null) {
       // Folder filtering is client-side over `meetings`, so it shares the
       // initial-load flag (and the tree's own loading shows in the left pane).
       return this.loading();
     }
-    return this.activeTag() === null ? this.loading() : this.tagLoading();
+    if (this.activeTag() === null) {
+      return this.loading();
+    }
+    return this.tagLoading();
   });
 
   /** Heading for the no-query list: folder name → tag → "Meetings". */
@@ -302,7 +344,7 @@ export class LibraryComponent implements OnInit {
     });
 
     // Load the meetings list and the tag set in parallel; a tag-load failure
-    // must not break the list, so settle each independently.
+    // must not break the meetings list, so settle each independently.
     const [meetings] = await Promise.allSettled([
       this.ipc.listMeetings(),
       this.loadTags(),
@@ -338,8 +380,8 @@ export class LibraryComponent implements OnInit {
     this.cancelDelete();
     this.rowMenuId.set(null);
     this.movePopoverId.set(null);
-    // Tag + folder filters are mutually exclusive: picking a tag clears any
-    // active folder selection so the two never compose into an empty surprise.
+    // Tag + folder scopes are mutually exclusive: picking a tag clears any
+    // active folder so they never compose into an empty surprise.
     if (tag !== null) {
       this.activeFolderId.set(null);
     }
@@ -381,13 +423,14 @@ export class LibraryComponent implements OnInit {
    * race exists; the same idempotent-guard shape is kept for consistency.
    */
   selectFolder(folderId: string | null): void {
+    // A re-select of the SAME folder is a no-op.
     if (this.activeFolderId() === folderId) {
       return;
     }
     this.cancelDelete();
     this.rowMenuId.set(null);
     this.movePopoverId.set(null);
-    // Folder + tag filters are mutually exclusive — picking a folder clears the
+    // Folder + tag scopes are mutually exclusive — picking a folder clears the
     // tag selection (and its fetched list) so they never compose.
     if (folderId !== null) {
       this.activeTag.set(null);

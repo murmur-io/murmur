@@ -1696,6 +1696,21 @@ impl Db {
         Ok(())
     }
 
+    /// Count content-free egress-ledger rows of a given `kind` (e.g. `org_share_publish` /
+    /// `org_share_revoke`). Content-free (a count, never a body); used by the re-publish tests to
+    /// assert a publish+revoke pair was ledgered on an edit-supersede.
+    pub fn count_share_egress_by_kind(&self, kind: &str) -> Result<u64> {
+        let conn = self.lock();
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM share_egress_log WHERE kind = ?1",
+                rusqlite::params![kind],
+                |r| r.get(0),
+            )
+            .map_err(map_err)?;
+        Ok(n as u64)
+    }
+
     // ── M6 Shared Brain: local org state + the outbound org-share state machine ──────────────────
 
     /// Upsert the locally-cached membership of an org (create/status). Preserves an existing row's
@@ -1944,6 +1959,42 @@ impl Db {
         )
         .optional()
         .map_err(map_err)
+    }
+
+    /// Every UPLOADED (live-on-server) org share anchored to a given source (`meeting_id` XOR
+    /// `document_id`). Powers the re-publish-on-edit fix: one logical note may be shared into SEVERAL
+    /// orgs, so this returns rows ACROSS ALL of them (never restricted to the first). Only `uploaded`
+    /// rows are returned — a still-`queued`/`failed` row has no live server item to supersede yet (the
+    /// launch sweep publishes the current plaintext for it), and a `revoked`/`revoke_pending` share was
+    /// intentionally torn down (an edit must not resurrect it). Exactly one of `meeting_id`/`document_id`
+    /// must be `Some`; both-`None` returns an empty vec (no source ⇒ nothing to republish).
+    pub fn org_shares_for_source(
+        &self,
+        meeting_id: Option<&str>,
+        document_id: Option<&str>,
+    ) -> Result<Vec<crate::storage::OrgShareRow>> {
+        if meeting_id.is_none() && document_id.is_none() {
+            return Ok(Vec::new());
+        }
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT {} FROM org_shares
+                   WHERE state = 'uploaded'
+                     AND ((?1 IS NOT NULL AND meeting_id = ?1)
+                       OR (?2 IS NOT NULL AND document_id = ?2))
+                   ORDER BY created_at ASC",
+                Self::ORG_SHARE_COLS
+            ))
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![meeting_id, document_id], Self::map_org_share)
+            .map_err(map_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(map_err)?);
+        }
+        Ok(out)
     }
 
     /// SB-3 dedup: the EXISTING retriable (`queued`/`failed`) org-share row for a logical share key
@@ -5081,6 +5132,9 @@ impl Db {
                     author_hint: r.get(2)?,
                     created_at: r.get(3)?,
                     seq: r.get::<_, i64>(4)? as u64,
+                    // Enriched in `list_org_items_inner` (needs `&AppState` for the unlock gate); the
+                    // raw DB row carries no ownership resolution.
+                    owned_source: None,
                 })
             })
             .map_err(map_err)?;
@@ -10684,6 +10738,49 @@ mod tests {
         let hashes = db.all_org_shared_content_hashes().unwrap();
         assert!(hashes.contains(&sha32(7)));
         assert!(hashes.contains(&sha32(8)));
+    }
+
+    /// `org_shares_for_source` (the re-publish-on-edit enumerator) returns EVERY uploaded row for a
+    /// source ACROSS ALL orgs (a note may be shared to several), and ONLY `uploaded` rows — a
+    /// `queued`/`failed`/`revoked` row is excluded (no live server item to supersede). A `None`/`None`
+    /// call returns empty.
+    #[test]
+    fn org_shares_for_source_returns_uploaded_rows_across_all_orgs() {
+        let db = mem_db();
+        let now = "2026-07-11T00:00:00Z";
+        // Document d1 shared to TWO orgs, both uploaded.
+        db.insert_org_share("a", "org-1", None, Some("d1"), "note", Some("T"), 1, 1, &sha32(1), now)
+            .unwrap();
+        db.set_org_share_uploaded("a", "item-a", now).unwrap();
+        db.insert_org_share("b", "org-2", None, Some("d1"), "note", Some("T"), 1, 1, &sha32(2), now)
+            .unwrap();
+        db.set_org_share_uploaded("b", "item-b", now).unwrap();
+        // A THIRD row for d1 still `queued` (not uploaded) — must be EXCLUDED.
+        db.insert_org_share("c", "org-3", None, Some("d1"), "note", Some("T"), 1, 1, &sha32(3), now)
+            .unwrap();
+        // An unrelated document's uploaded row — must NOT be returned for d1.
+        db.insert_org_share("d", "org-1", None, Some("d2"), "note", Some("T"), 1, 1, &sha32(4), now)
+            .unwrap();
+        db.set_org_share_uploaded("d", "item-d", now).unwrap();
+
+        let rows = db.org_shares_for_source(None, Some("d1")).unwrap();
+        assert_eq!(rows.len(), 2, "both uploaded org rows for d1 (across orgs) returned");
+        let orgs: std::collections::HashSet<_> =
+            rows.iter().map(|r| r.org_id.as_str()).collect();
+        assert!(orgs.contains("org-1") && orgs.contains("org-2"));
+        assert!(
+            rows.iter().all(|r| r.state == "uploaded"),
+            "only uploaded rows (the queued org-3 row is excluded)"
+        );
+
+        // Meeting arm + the both-None guard.
+        db.insert_org_share("e", "org-1", Some("m1"), None, "note", Some("T"), 1, 1, &sha32(5), now)
+            .unwrap();
+        db.set_org_share_uploaded("e", "item-e", now).unwrap();
+        let mrows = db.org_shares_for_source(Some("m1"), None).unwrap();
+        assert_eq!(mrows.len(), 1);
+        assert_eq!(mrows[0].meeting_id.as_deref(), Some("m1"));
+        assert!(db.org_shares_for_source(None, None).unwrap().is_empty());
     }
 
     /// NOTES feature — the additive columns exist after migrate() and re-migrating is a no-op
