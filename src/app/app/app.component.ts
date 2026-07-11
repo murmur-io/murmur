@@ -13,6 +13,7 @@ import { filter, map } from "rxjs";
 import { IpcService } from "../core/ipc.service";
 import { NavHistoryService } from "../core/nav-history.service";
 import { FoldersService } from "../services/folders.service";
+import { ChromeService } from "../services/chrome.service";
 import { GlassService } from "../services/glass.service";
 import { ScreenShareService } from "../services/screen-share.service";
 import { ThemeService } from "../services/theme.service";
@@ -40,6 +41,8 @@ export class AppComponent implements OnInit {
   private readonly theme = inject(ThemeService);
   // Same for the Liquid Glass level (--glass-user-alpha on <html>).
   private readonly glass = inject(GlassService);
+  // Same for the accent palette (data-accent on <html>).
+  private readonly chrome = inject(ChromeService);
   private readonly updates = inject(UpdateService);
   // Injected at bootstrap purely so it starts observing router events from the
   // FIRST navigation — its "last non-settings route" (used by the settings

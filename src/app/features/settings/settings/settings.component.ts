@@ -55,6 +55,24 @@ const SETTINGS_SECTIONS: readonly SettingsSection[] = [
 ];
 
 /**
+ * Sidebar grouping (mirrors the main rail's labeled clusters): the two
+ * everyday sections sit ungrouped on top, then labeled categories, with About
+ * ungrouped at the bottom. `key` = the first id (stable @for identity — labels
+ * repeat `null`).
+ */
+const SETTINGS_GROUPS: readonly {
+  readonly label: string | null;
+  readonly ids: readonly string[];
+}[] = [
+  { label: null, ids: ["appearance", "general"] },
+  { label: "Capture", ids: ["transcription", "audio", "storage"] },
+  { label: "Intelligence", ids: ["notes", "ai", "connectors"] },
+  { label: "Sharing", ids: ["account", "organization"] },
+  { label: "Privacy & Vault", ids: ["privacy", "obsidian"] },
+  { label: null, ids: ["about"] },
+];
+
+/**
  * Settings SHELL (Stage-1 split): owns the macOS-style sidebar (search +
  * section nav + Save), section switching, and kicking off the config
  * load/save orchestration. All form + cross-section state lives in
@@ -150,6 +168,23 @@ export class SettingsComponent implements OnInit {
     return this.sections.filter((s) =>
       (s.label + " " + s.keywords).toLowerCase().includes(q),
     );
+  });
+
+  /**
+   * The sidebar's grouped view of `visibleSections`: sections in their
+   * category, categories whose every section is filtered out disappear.
+   */
+  readonly visibleGroups = computed(() => {
+    const visible = new Set(this.visibleSections().map((s) => s.id));
+    const byId = new Map(this.sections.map((s) => [s.id, s]));
+    return SETTINGS_GROUPS.map((g) => ({
+      label: g.label,
+      key: g.ids[0],
+      sections: g.ids
+        .filter((id) => visible.has(id))
+        .map((id) => byId.get(id))
+        .filter((s): s is SettingsSection => s !== undefined),
+    })).filter((g) => g.sections.length > 0);
   });
 
   /** Human label for the active section (right-pane header). */

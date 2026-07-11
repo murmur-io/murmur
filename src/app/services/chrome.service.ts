@@ -1,0 +1,108 @@
+import { Injectable, signal } from "@angular/core";
+
+/**
+ * What the sidebar becomes when the user collapses it:
+ * - `bar` (default) — the floating top-center pill bar (the Apple TV pattern).
+ * - `rail` — a slim icon-only rail that stays docked at the left edge.
+ */
+export type SidebarCollapseStyle = "bar" | "rail";
+
+/** The user-selectable accent palettes (Settings → Appearance). `purple` is
+ * the base :root ramp in colors.css; the others live in accents.css. */
+export type AccentId =
+  | "purple"
+  | "blue"
+  | "teal"
+  | "green"
+  | "orange"
+  | "pink";
+
+const STORAGE_KEY = "murmur-sidebar-collapse-style";
+const VALID: readonly SidebarCollapseStyle[] = ["bar", "rail"];
+
+const ACCENT_KEY = "murmur-accent";
+const VALID_ACCENTS: readonly AccentId[] = [
+  "purple",
+  "blue",
+  "teal",
+  "green",
+  "orange",
+  "pink",
+];
+
+/**
+ * Owns chrome-behavior preferences (Settings → Appearance). Persisted in
+ * localStorage like ThemeService — pure webview chrome state, no IPC needed.
+ * The collapsed/expanded FLAG itself stays with AppShellComponent
+ * (murmur-sidebar-collapsed); this service only decides what "collapsed"
+ * looks like.
+ */
+@Injectable({ providedIn: "root" })
+export class ChromeService {
+  private readonly _collapseStyle = signal<SidebarCollapseStyle>(this.read());
+  /** The user's chosen collapse behavior: `bar` (default) or `rail`. */
+  readonly collapseStyle = this._collapseStyle.asReadonly();
+
+  private readonly _accent = signal<AccentId>(this.readAccent());
+  /** The user's chosen accent palette (default `purple`). */
+  readonly accent = this._accent.asReadonly();
+
+  constructor() {
+    // Applied at first injection (AppComponent, before the window is revealed)
+    // so a non-default accent never flashes purple — same timing as ThemeService.
+    this.applyAccent(this._accent());
+  }
+
+  /** Set and persist the accent palette; applies immediately (auto-saved). */
+  setAccent(accent: AccentId): void {
+    this._accent.set(accent);
+    try {
+      localStorage.setItem(ACCENT_KEY, accent);
+    } catch {
+      // localStorage unavailable — the in-memory signal still works.
+    }
+    this.applyAccent(accent);
+  }
+
+  /** Set and persist the collapse style; applies immediately (auto-saved). */
+  setCollapseStyle(style: SidebarCollapseStyle): void {
+    this._collapseStyle.set(style);
+    try {
+      localStorage.setItem(STORAGE_KEY, style);
+    } catch {
+      // localStorage unavailable (private mode / disabled) — the in-memory
+      // signal still works for this session.
+    }
+  }
+
+  private read(): SidebarCollapseStyle {
+    try {
+      const v = localStorage.getItem(STORAGE_KEY);
+      if (v && VALID.includes(v as SidebarCollapseStyle)) {
+        return v as SidebarCollapseStyle;
+      }
+    } catch {
+      // ignore — fall through to the default
+    }
+    return "bar";
+  }
+
+  private readAccent(): AccentId {
+    try {
+      const v = localStorage.getItem(ACCENT_KEY);
+      if (v && VALID_ACCENTS.includes(v as AccentId)) return v as AccentId;
+    } catch {
+      // ignore — fall through to the default
+    }
+    return "purple";
+  }
+
+  /** Default purple = NO attribute (the base :root ramp); others stamp it. */
+  private applyAccent(accent: AccentId): void {
+    if (accent === "purple") {
+      document.documentElement.removeAttribute("data-accent");
+    } else {
+      document.documentElement.setAttribute("data-accent", accent);
+    }
+  }
+}

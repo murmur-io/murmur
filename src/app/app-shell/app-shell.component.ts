@@ -23,11 +23,15 @@ import {
 import { MurKbdComponent } from "../design-system/kbd/kbd.component";
 import { MurQuickSearchComponent } from "../design-system/quick-search/quick-search.component";
 import { MurSidebarComponent } from "../design-system/sidebar/sidebar.component";
+import { ChromeService } from "../services/chrome.service";
 import { FoldersService } from "../services/folders.service";
 import { ToastService, type Toast } from "../services/toast.service";
 
 /** localStorage key for the chrome mode: "1" = pill bar, "0" = sidebar. */
 const SIDEBAR_KEY = "murmur-sidebar-collapsed";
+
+/** localStorage key for the Insights sidebar group: "1" = expanded. */
+const INSIGHTS_KEY = "murmur-sidebar-insights";
 
 /** A primary navigation destination. `icon` selects the inline SVG. */
 interface NavItem {
@@ -35,6 +39,69 @@ interface NavItem {
   readonly label: string;
   readonly icon: ShellIcon;
 }
+
+/** A labeled cluster of destinations in the EXPANDED sidebar only. */
+interface NavGroup {
+  readonly label: string | null;
+  readonly collapsible?: boolean;
+  readonly items: readonly NavItem[];
+}
+
+/**
+ * QUIET GLASS sidebar grouping: Record (the app's primary act) solo on top,
+ * then labeled clusters; the analytical destinations collapse under Insights.
+ * The PILL BAR is untouched — it keeps the flat item list (NAV_ITEMS below).
+ */
+const NAV_GROUPS: readonly NavGroup[] = [
+  {
+    label: null,
+    items: [{ path: "/record", label: "Record", icon: "record" }],
+  },
+  {
+    label: "Workspace",
+    items: [
+      { path: "/library", label: "Meetings", icon: "meetings" },
+      { path: "/notes", label: "Notes", icon: "notes" },
+    ],
+  },
+  {
+    label: "Assistant",
+    items: [
+      { path: "/ask", label: "Ask", icon: "ask" },
+      { path: "/brain", label: "Brain", icon: "brain" },
+    ],
+  },
+  {
+    label: "Insights",
+    collapsible: true,
+    items: [
+      { path: "/analytics", label: "Analytics", icon: "analytics" },
+      { path: "/graph", label: "Graph", icon: "graph" },
+      { path: "/people", label: "People", icon: "people" },
+    ],
+  },
+];
+
+/**
+ * The flat destination list for the PILL BAR — kept in the pill bar's
+ * PRE-EXISTING order (the grouping above reorders only the expanded sidebar;
+ * the collapsed chrome must not silently reshuffle).
+ */
+const NAV_ITEMS: readonly NavItem[] = [
+  { path: "/record", label: "Record", icon: "record" },
+  { path: "/library", label: "Meetings", icon: "meetings" },
+  { path: "/notes", label: "Notes", icon: "notes" },
+  { path: "/analytics", label: "Analytics", icon: "analytics" },
+  { path: "/graph", label: "Graph", icon: "graph" },
+  { path: "/people", label: "People", icon: "people" },
+  { path: "/brain", label: "Brain", icon: "brain" },
+  { path: "/ask", label: "Ask", icon: "ask" },
+];
+
+/** Routes that live inside the collapsible Insights group. */
+const INSIGHT_PATHS = NAV_GROUPS.filter((g) => g.collapsible).flatMap((g) =>
+  g.items.map((i) => i.path),
+);
 
 /**
  * PROTOTYPE (Apple TV iPadOS shell) — the app chrome in two liquid-glass modes:
@@ -68,8 +135,9 @@ interface NavItem {
   ],
   host: {
     // Scoped to !inDrilldown so the pill-clearance padding never leaks onto
-    // drill-down routes (which render no pill bar).
-    "[class.pill-mode]": "pillMode() && !inDrilldown()",
+    // drill-down routes (which render no pill bar). Rail-style collapse keeps
+    // the sidebar in the flex row, so it needs no clearance either.
+    "[class.pill-mode]": "barMode() && !inDrilldown()",
     "(document:keydown)": "onGlobalKeydown($event)",
   },
   templateUrl: "./app-shell.component.html",
@@ -79,6 +147,7 @@ export class AppShellComponent {
   private readonly folders = inject(FoldersService);
   private readonly toast = inject(ToastService);
   private readonly router = inject(Router);
+  private readonly chrome = inject(ChromeService);
 
   /**
    * The current URL, updated on every completed navigation. Seeded from
@@ -96,16 +165,24 @@ export class AppShellComponent {
   readonly inDrilldown = computed(() => isDrilldownRoute(this.currentUrl()));
 
   /** Primary destinations (Settings lives in the chrome footer / pill end). */
-  readonly navItems: readonly NavItem[] = [
-    { path: "/record", label: "Record", icon: "record" },
-    { path: "/library", label: "Meetings", icon: "meetings" },
-    { path: "/notes", label: "Notes", icon: "notes" },
-    { path: "/analytics", label: "Analytics", icon: "analytics" },
-    { path: "/graph", label: "Graph", icon: "graph" },
-    { path: "/people", label: "People", icon: "people" },
-    { path: "/brain", label: "Brain", icon: "brain" },
-    { path: "/ask", label: "Ask", icon: "ask" },
-  ];
+  readonly navItems: readonly NavItem[] = NAV_ITEMS;
+
+  /** Sidebar-only grouping of the same destinations (pill bar stays flat). */
+  readonly navGroups: readonly NavGroup[] = NAV_GROUPS;
+
+  /** Persisted Insights-group preference (default collapsed). */
+  private readonly _insightsOpen = signal(this.readStoredInsightsOpen());
+
+  /**
+   * Whether the Insights group renders expanded: the stored preference, OR
+   * forced open while the CURRENT route lives inside it (the active pill must
+   * never be hidden by a collapsed group).
+   */
+  readonly insightsExpanded = computed(
+    () =>
+      this._insightsOpen() ||
+      INSIGHT_PATHS.some((p) => this.currentUrl().startsWith(p)),
+  );
 
   /**
    * Chrome mode: false = floating sidebar, true = top pill bar. Persisted
@@ -114,6 +191,24 @@ export class AppShellComponent {
    */
   private readonly _pillMode = signal(this.readStoredPillMode());
   readonly pillMode = this._pillMode.asReadonly();
+
+  /**
+   * How a COLLAPSED sidebar renders (Settings → Appearance → Sidebar):
+   * `bar` (default) = the floating top pill bar; `rail` = a slim icon-only
+   * rail docked at the left edge. The collapsed FLAG and its persistence
+   * (murmur-sidebar-collapsed) are unchanged — only the rendering differs.
+   */
+  readonly collapseStyle = this.chrome.collapseStyle;
+
+  /** Collapsed AND the top-bar style — render the pill bar. */
+  readonly barMode = computed(
+    () => this.pillMode() && this.collapseStyle() === "bar",
+  );
+
+  /** Collapsed AND the rail style — render the icon-only sidebar rail. */
+  readonly railMode = computed(
+    () => this.pillMode() && this.collapseStyle() === "rail",
+  );
 
   /** Whether the ⌘K quick-search spotlight is open. */
   readonly searchOpen = signal(false);
@@ -134,9 +229,28 @@ export class AppShellComponent {
     }
   });
 
+  /** Persist the Insights-group preference whenever it changes. */
+  private readonly _persistInsightsOpen = effect(() => {
+    const value = this._insightsOpen();
+    try {
+      localStorage.setItem(INSIGHTS_KEY, value ? "1" : "0");
+    } catch {
+      // Private-mode / storage-disabled — the preference is not persisted.
+    }
+  });
+
   /** Toggle between the floating sidebar and the top pill bar. */
   togglePillMode(): void {
     this._pillMode.update((c) => !c);
+  }
+
+  /**
+   * Toggle the Insights group. Uses the RENDERED state as the base so a click
+   * always visibly inverts what the user sees (the group may be auto-expanded
+   * by the active route while the stored preference says collapsed).
+   */
+  toggleInsights(): void {
+    this._insightsOpen.set(!this.insightsExpanded());
   }
 
   /** Open the ⌘K spotlight. */
@@ -186,6 +300,15 @@ export class AppShellComponent {
   private readStoredPillMode(): boolean {
     try {
       return localStorage.getItem(SIDEBAR_KEY) === "1";
+    } catch {
+      return false;
+    }
+  }
+
+  /** Read the persisted Insights-group preference; default collapsed. */
+  private readStoredInsightsOpen(): boolean {
+    try {
+      return localStorage.getItem(INSIGHTS_KEY) === "1";
     } catch {
       return false;
     }
