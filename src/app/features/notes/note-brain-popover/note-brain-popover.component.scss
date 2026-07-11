@@ -63,17 +63,17 @@
   background: var(--accent-gradient);
   box-shadow: 0 0 12px var(--accent-soft);
 }
-.pop-mode {
-  font-size: 0.7rem;
+/* The action name ("Shorten"…) sits quietly next to the brand once a result
+   lands; a subtle divider dot separates it from "Brain". */
+.pop-head-action {
+  font-size: 0.8125rem;
   font-weight: 550;
-  color: var(--text-muted);
-  padding: 2px var(--space-2);
-  border-radius: var(--radius-pill);
-  background: var(--surface-hover);
+  color: var(--text-secondary);
 }
-.pop-mode.is-resolved {
-  color: var(--accent-hover);
-  background: var(--accent-soft);
+.pop-head-action::before {
+  content: "·";
+  margin: 0 var(--space-1) 0 0;
+  color: var(--text-muted);
 }
 .pop-close {
   margin-left: auto;
@@ -240,26 +240,42 @@
 .pop-diff {
   display: flex;
   flex-direction: column;
-  gap: var(--space-2);
+  gap: var(--space-1);
   max-height: 260px;
   overflow-y: auto;
 }
+.pop-diff-col {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
 .pop-diff-tag {
-  font-size: 0.68rem;
-  font-weight: 600;
-  letter-spacing: 0.04em;
+  font-size: 0.66rem;
+  font-weight: 650;
+  letter-spacing: 0.05em;
   text-transform: uppercase;
+  color: var(--text-muted);
+}
+.pop-diff-tag.is-accent {
+  color: var(--accent-hover);
+}
+.pop-diff-tag.is-add {
+  color: var(--success);
+}
+/* The change direction between the two blocks (original → suggested). */
+.pop-diff-arrow {
+  align-self: center;
+  font-size: 0.8rem;
+  line-height: 1;
   color: var(--text-muted);
 }
 .pop-original {
   padding: var(--space-2) var(--space-3);
   border-radius: var(--radius-sm);
   background: var(--surface-hover);
-  color: var(--text-muted);
-  font-size: 0.85rem;
+  color: var(--text-secondary);
+  font-size: 0.82rem;
   line-height: 1.5;
-  text-decoration: line-through;
-  text-decoration-color: var(--text-muted);
 }
 .pop-suggestion {
   padding: var(--space-2) var(--space-3);
@@ -323,6 +339,16 @@
   display: flex;
   align-items: center;
   gap: var(--space-1);
+}
+
+/* Quiet model attribution — a single truncated line, out of the way. */
+.pop-model {
+  margin: 0;
+  font-size: 0.68rem;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 /* --- Buttons --------------------------------------------------------------- */

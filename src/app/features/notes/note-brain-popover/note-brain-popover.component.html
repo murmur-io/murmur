@@ -10,15 +10,16 @@
   role="dialog"
   aria-label="Brain assistant"
 >
-  <!-- Header: the "Brain" identity + the mode chip (neutral until a result). -->
+  <!-- Header: the "Brain" identity + (once a result lands) the action name. The
+       model attribution moved to a quiet footer caption so the header stays clean. -->
   <div class="pop-head">
     <span class="pop-brand">
       <span class="pop-brand-glyph" aria-hidden="true"></span>
       Brain
     </span>
-    <span class="pop-mode" [class.is-resolved]="result() !== null">
-      {{ modeLabel() }}
-    </span>
+    @if (result(); as res) {
+      <span class="pop-head-action">{{ actionLabel(res.action) }}</span>
+    }
     <button
       type="button"
       class="pop-close"
@@ -93,12 +94,10 @@
     @case ("result") {
       @if (result(); as res) {
         <div class="pop-result">
-          <p class="pop-flow-title">{{ actionLabel(res.action) }}</p>
-
           @if (isEnhanceResult()) {
             <!-- Enhance is ADDITIVE: keep the selection, show the passage to insert. -->
             <div class="pop-diff">
-              <span class="pop-diff-tag">Keeps your text; adds</span>
+              <span class="pop-diff-tag is-add">Keeps your text · adds</span>
               <div class="pop-suggestion is-add">{{ res.suggestion }}</div>
             </div>
             @if (res.citations.length > 0) {
@@ -117,10 +116,18 @@
               </div>
             }
           } @else {
-            <!-- Refine/Shorten REPLACE: struck original vs accent suggestion. -->
+            <!-- Refine/Shorten REPLACE: original (muted) → suggestion (accent),
+                 each clearly labelled so the change reads at a glance. -->
             <div class="pop-diff">
-              <div class="pop-original">{{ original() }}</div>
-              <div class="pop-suggestion">{{ res.suggestion }}</div>
+              <div class="pop-diff-col">
+                <span class="pop-diff-tag">Original</span>
+                <div class="pop-original">{{ original() }}</div>
+              </div>
+              <span class="pop-diff-arrow" aria-hidden="true">↓</span>
+              <div class="pop-diff-col">
+                <span class="pop-diff-tag is-accent">Suggested</span>
+                <div class="pop-suggestion">{{ res.suggestion }}</div>
+              </div>
             </div>
           }
 
@@ -130,6 +137,8 @@
               Sensitive details were redacted before this left your Mac.
             </p>
           }
+
+          <p class="pop-model" [title]="res.modelLabel">{{ res.modelLabel }}</p>
 
           <div class="pop-buttons">
             <button
