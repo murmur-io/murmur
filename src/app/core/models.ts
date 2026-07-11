@@ -1915,6 +1915,20 @@ export interface OrgItemDetail {
 }
 
 /**
+ * The LOCAL source of an org item — resolved by `org_resolve_source` so the
+ * viewer can route the AUTHOR straight to their editable original (a `/notes/:id`
+ * note or a `/meeting/:id` detail) instead of the read-only replica, while a
+ * non-author (no local source) still gets the read-only viewer. `kind` selects
+ * the route family; `sourceId` is the local document/meeting id. Mirrors the Rust
+ * `OrgSourceRef`. A `null` result (from `orgResolveSource`) ⇒ this user is NOT the
+ * author (no local source) → render the read-only viewer.
+ */
+export interface OrgSourceRef {
+  kind: "document" | "meeting";
+  sourceId: string;
+}
+
+/**
  * The result of a manual `orgSyncNow()` — counts + errors only, no content.
  * `ftsOnly` is true when the local member has no real embedder (StubEmbedder ⇒
  * the org partition is FTS-only until a model appears + a re-embed runs).
