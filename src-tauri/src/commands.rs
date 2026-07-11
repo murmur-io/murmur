@@ -3952,13 +3952,23 @@ pub fn list_all_tags(state: State<'_, AppState>) -> Result<Vec<String>, AppError
     state.db.list_all_tags()
 }
 
-/// Meetings carrying a given tag, newest first.
+/// Meetings carrying a given tag, newest first. Sealed-and-not-session-unlocked meetings are
+/// MASKED at the backend before the DTO crosses IPC, exactly like [`list_meetings`] — the tag
+/// view is the same Library surface, so a sealed title / audio path must not leak through it
+/// (rule: every content read is gated; see `mask_locked_meetings`).
 #[tauri::command]
 pub fn list_meetings_by_tag(
     state: State<'_, AppState>,
     tag: String,
 ) -> Result<Vec<Meeting>, AppError> {
-    state.db.list_meetings_by_tag(&tag)
+    list_meetings_by_tag_inner(state.inner(), &tag)
+}
+
+/// Inner body of [`list_meetings_by_tag`] (unit-testable without a tauri `State`): the DB read
+/// routed through the same backend mask as [`list_meetings`].
+fn list_meetings_by_tag_inner(state: &AppState, tag: &str) -> Result<Vec<Meeting>, AppError> {
+    let meetings = state.db.list_meetings_by_tag(tag)?;
+    mask_locked_meetings(state, meetings)
 }
 
 /// Built-in recipe templates (quick chips).
@@ -16236,6 +16246,68 @@ mod lifecycle_tests {
             .unwrap()
             .insert("f-sealed".to_string());
         let unmasked = mask_locked_meetings(&state, db.list_meetings(200).unwrap()).unwrap();
+        let now = unmasked.iter().find(|m| m.id == "m-sealed").unwrap();
+        assert_eq!(now.title.as_deref(), Some("Board strategy"));
+        assert_eq!(now.audio_path.as_deref(), Some("/data/m-sealed.wav.enc"));
+    }
+
+    /// Quiet-Glass verifier finding (2026-07-11): `list_meetings_by_tag` returned rows WITHOUT the
+    /// backend mask — a sealed meeting's real AI title + `.enc` audio path crossed IPC whenever the
+    /// Library was filtered by tag (the FE then leaked the title into the delete-confirm
+    /// `aria-label`). RED on the unpatched command (it called `db.list_meetings_by_tag` directly);
+    /// GREEN now that it routes through `list_meetings_by_tag_inner` → `mask_locked_meetings`,
+    /// exactly like `list_meetings`. Reversible on session-unlock, open-folder rows untouched.
+    #[test]
+    fn list_meetings_by_tag_masks_a_sealed_meeting_at_the_backend() {
+        let state = build_state("tag-list-mask");
+        let db = &state.db;
+        make_open_folder(db, "f-sealed", "Secret");
+        make_open_folder(db, "f-open", "Standups");
+        seed_titled_meeting(
+            db,
+            "m-sealed",
+            "Board strategy",
+            "/data/m-sealed.wav.enc",
+            "f-sealed",
+        );
+        seed_titled_meeting(db, "m-open", "Open standup", "/data/m-open.wav", "f-open");
+        db.set_meeting_tags("m-sealed", &["planning".to_string()])
+            .unwrap();
+        db.set_meeting_tags("m-open", &["planning".to_string()])
+            .unwrap();
+        db.set_folder_locked("f-sealed", true, Some(&b"wrapped"[..]))
+            .unwrap();
+        // NOT session-unlocked: `unlocked_folders` stays empty.
+
+        let rows = list_meetings_by_tag_inner(&state, "planning").unwrap();
+        let sealed = rows.iter().find(|m| m.id == "m-sealed").unwrap();
+        assert_eq!(
+            sealed.title.as_deref(),
+            Some("🔒 Locked"),
+            "the tag view must mask a sealed meeting's real title at the backend"
+        );
+        assert_eq!(
+            sealed.audio_path, None,
+            "the .enc audio_path must be nulled on the tag path too (convertFileSrc surface)"
+        );
+        assert_eq!(
+            sealed.folder_id.as_deref(),
+            Some("f-sealed"),
+            "folder_id is preserved so the FE still renders the lock badge"
+        );
+
+        // The open-folder meeting is untouched by the mask.
+        let open = rows.iter().find(|m| m.id == "m-open").unwrap();
+        assert_eq!(open.title.as_deref(), Some("Open standup"));
+        assert_eq!(open.audio_path.as_deref(), Some("/data/m-open.wav"));
+
+        // Session-unlock → the real fields come back (masking is reversible, never lossy).
+        state
+            .unlocked_folders
+            .lock()
+            .unwrap()
+            .insert("f-sealed".to_string());
+        let unmasked = list_meetings_by_tag_inner(&state, "planning").unwrap();
         let now = unmasked.iter().find(|m| m.id == "m-sealed").unwrap();
         assert_eq!(now.title.as_deref(), Some("Board strategy"));
         assert_eq!(now.audio_path.as_deref(), Some("/data/m-sealed.wav.enc"));

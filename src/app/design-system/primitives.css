@@ -48,19 +48,21 @@
   transform: none;
 }
 
+/* QUIET GLASS / HIG "prominent": a flat, opaque accent tint — no gradient,
+   no glow. Hover/active step through the accent ramp instead of a filter. */
 .btn-primary {
-  background: var(--accent-gradient);
+  background: var(--accent);
   border-color: transparent;
   color: var(--text-on-accent);
   font-weight: 600;
-  box-shadow: var(--shadow-accent), var(--glass-highlight);
+  box-shadow: var(--shadow-sm);
 }
 .btn-primary:hover {
-  background: var(--accent-gradient);
-  filter: brightness(1.08);
+  background: var(--accent-hover);
   border-color: transparent;
 }
-.btn-primary:disabled { box-shadow: none; filter: none; }
+.btn-primary:active { background: var(--accent-active); }
+.btn-primary:disabled { box-shadow: none; }
 
 .btn-ghost {
   background: transparent;
