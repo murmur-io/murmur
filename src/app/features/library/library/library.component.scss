@@ -199,70 +199,30 @@
   cursor: grabbing;
 }
 
-/* --- Folder chip — the primary filing affordance on every row -------- */
-.folder-chip {
+/* --- Folder label — display-only pill naming the note's folder -------- */
+.folder-label {
   display: inline-flex;
   align-items: center;
   gap: var(--space-1);
   max-width: 168px;
-  height: 26px;
+  height: 24px;
   padding: 0 var(--space-2);
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-pill);
   background: var(--surface-input);
   color: var(--text-muted);
-  font-family: inherit;
   font-size: 0.75rem;
   font-weight: 600;
   letter-spacing: -0.005em;
   line-height: 1;
   white-space: nowrap;
-  cursor: pointer;
-  transition:
-    color var(--transition),
-    background var(--transition),
-    border-color var(--transition),
-    transform var(--transition-fast);
 }
-.folder-chip:hover {
-  color: var(--text-primary);
-  background: var(--surface-hover);
-  border-color: var(--border-strong);
-}
-.folder-chip:active {
-  transform: scale(0.96);
-}
-.folder-chip:focus-visible {
-  outline: none;
-  box-shadow: 0 0 0 3px var(--accent-ring);
-}
-/* A note that IS filed reads in the accent voice — its folder is "real". */
-.folder-chip.is-filed {
-  background: var(--accent-soft);
-  border-color: transparent;
-  color: var(--accent-hover);
-}
-.folder-chip.is-filed:hover {
-  background: var(--accent-soft);
-  filter: brightness(1.12);
-}
-.row-item.is-menu-open .folder-chip {
-  background: var(--accent-soft);
-  border-color: var(--accent);
-  color: var(--accent-hover);
-}
-.folder-chip-icon {
+.folder-label-icon {
   flex: none;
 }
-.folder-chip-label {
+.folder-label-name {
   overflow: hidden;
   text-overflow: ellipsis;
-}
-.folder-chip-plus {
-  font-size: 0.95rem;
-  line-height: 0;
-  margin-left: 1px;
-  opacity: 0.8;
 }
 
 /* --- "Move to…" popover anchor (right edge of the row) --------------- */
@@ -271,6 +231,17 @@
   top: calc(100% - var(--space-2));
   right: var(--space-3);
   z-index: 40;
+  animation: rise 160ms var(--transition) both;
+}
+
+/* --- Row ⋯ actions menu (the .menu primitive carries the OPAQUE overlay
+   look per trap T3; only the anchoring lives here) -------------------- */
+.row-menu {
+  position: absolute;
+  top: calc(100% - var(--space-2));
+  right: var(--space-3);
+  z-index: 40;
+  min-width: 200px;
   animation: rise 160ms var(--transition) both;
 }
 
@@ -477,48 +448,25 @@
   margin: 0;
 }
 
-/* --- Recording-storage usage chip (header, only with a cap set) --- */
-.storage-chip {
-  position: relative;
-  display: inline-flex;
-  align-items: center;
-  overflow: hidden;
-  margin-left: auto;
-  padding: 3px var(--space-2);
-  border-radius: var(--radius-pill);
-  background: var(--surface-input);
-  color: var(--text-secondary);
-  font-size: 0.75rem;
-  text-decoration: none;
-  min-width: 8rem;
-}
-.storage-fill {
-  position: absolute;
-  inset: 0 auto 0 0;
-  background: var(--accent-soft);
-  border-radius: inherit;
-}
-.storage-chip[data-state="amber"] .storage-fill {
-  background: color-mix(in srgb, var(--warning) 30%, transparent);
-}
-.storage-chip[data-state="red"] .storage-fill {
-  background: color-mix(in srgb, var(--live) 30%, transparent);
-}
-.storage-label {
-  position: relative;
-}
-
 /* Muted "audio freed" chip on a pruned meeting row. */
 .audio-freed {
   font-size: 0.7rem;
   color: var(--text-muted);
 }
 
-/* --- Meeting / results list --- */
+/* --- Meeting / results list — FLAT rows ("content is paper"): no frosted
+   card box, no shadow, no backdrop-filter. Rows sit on the page surface and
+   separate with 1px hairlines; hover paints a quiet rounded wash. --- */
 .list {
   list-style: none;
-  padding: var(--space-2);
+  padding: 0;
   margin: 0;
+}
+.list > li {
+  border-top: 1px solid var(--border-subtle);
+}
+.list > li:last-child {
+  border-bottom: 1px solid var(--border-subtle);
 }
 .row {
   display: flex;
@@ -526,16 +474,14 @@
   justify-content: space-between;
   gap: var(--space-4);
   padding: var(--space-3) var(--space-4);
-  border-radius: var(--radius-md);
+  border-radius: var(--radius-sm);
+  background: transparent;
   text-decoration: none;
   color: inherit;
   animation: rise 360ms var(--transition) both;
   transition:
     background var(--transition),
     transform var(--transition-fast);
-}
-.list li + li {
-  border-top: 1px solid var(--border-subtle);
 }
 .row:hover {
   background: var(--surface-hover);
@@ -548,15 +494,17 @@
   transform: translateY(1px);
 }
 
-/* --- Per-row delete affordance (hidden until hover / focus) --------- */
+/* --- Per-row ⋯ actions trigger (hidden until hover / keyboard focus).
+   It's always in the tab order (opacity doesn't remove focusability) and
+   reveals itself on :focus-visible, so keyboard users can always reach it. */
 .row-item {
   position: relative;
 }
-/* Keep the link clear of the delete button's hover footprint. */
+/* Keep the link clear of the ⋯ button's hover footprint. */
 .row-item .row {
   padding-right: var(--space-7);
 }
-.row-delete {
+.row-menu-btn {
   position: absolute;
   top: 50%;
   right: var(--space-3);
@@ -581,37 +529,40 @@
     border-color var(--transition),
     color var(--transition);
 }
-.row-item:hover .row-delete,
-.row-item:focus-within .row-delete,
-.row-item.is-confirming .row-delete {
+.row-item:hover .row-menu-btn,
+.row-item:focus-within .row-menu-btn,
+.row-item.is-confirming .row-menu-btn,
+.row-item.is-menu-open .row-menu-btn {
   opacity: 1;
   pointer-events: auto;
   transform: translateY(-50%) scale(1);
 }
-.row-delete:hover {
-  background: var(--danger-soft);
-  border-color: var(--danger);
-  color: var(--danger);
+.row-menu-btn:hover,
+.row-item.is-menu-open .row-menu-btn {
+  background: var(--surface-hover);
+  border-color: var(--border-strong);
+  color: var(--text-primary);
 }
-.row-delete:active {
+.row-menu-btn:active {
   transform: translateY(-50%) scale(0.92);
 }
-.row-delete:focus-visible {
+.row-menu-btn:focus-visible {
   outline: none;
   opacity: 1;
   pointer-events: auto;
   box-shadow: 0 0 0 3px var(--accent-ring);
 }
-/* Fade the decorative chevron out so the ✕ owns the right edge. */
+/* Fade the decorative chevron out so the ⋯ owns the right edge. */
 .row-item:hover .chevron,
 .row-item:focus-within .chevron,
-.row-item.is-confirming .chevron {
+.row-item.is-confirming .chevron,
+.row-item.is-menu-open .chevron {
   opacity: 0;
 }
 
 /* --- In-app delete confirm (signal-driven; not window.confirm) ------ */
 .confirm {
-  margin: 0 var(--space-2) var(--space-2);
+  margin: var(--space-2) 0;
   padding: var(--space-4);
   border: 1px solid var(--danger);
   border-radius: var(--radius-md);
@@ -786,6 +737,7 @@
   .folders-pane,
   .meetings-pane,
   .move-anchor,
+  .row-menu,
   .empty-illo {
     animation: none;
   }

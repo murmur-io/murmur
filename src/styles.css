@@ -3,6 +3,7 @@
 @import "./design-tokens/layout.css";
 @import "./design-tokens/glass.css";
 @import "./design-tokens/theme-light.css";
+@import "./design-tokens/accents.css";
 @import "./app/design-system/primitives.css";
 
 /* ============================================================================
@@ -51,7 +52,9 @@ body {
   letter-spacing: -0.012em;
 }
 
-/* --- Atmospheric aurora field (sits behind everything; glass blurs it) ----- */
+/* --- Atmospheric aurora field (sits behind everything; glass blurs it) -----
+   QUIET GLASS: the field is a STATIC vignette hugging the left edge (see
+   --aurora-field) — no drift animation; the reading column stays calm. */
 body::before {
   content: "";
   position: fixed;
@@ -60,8 +63,6 @@ body::before {
   background: var(--aurora-field);
   filter: saturate(120%);
   opacity: var(--aurora-opacity, 1);
-  animation: aurora-drift 26s ease-in-out infinite alternate;
-  will-change: transform;
 }
 /* Fine grain overlay — kills gradient banding, adds a premium tactile finish. */
 body::after {
@@ -70,12 +71,8 @@ body::after {
   inset: 0;
   z-index: -1;
   pointer-events: none;
-  opacity: 0.04;
+  opacity: 0.025;
   background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
-}
-@keyframes aurora-drift {
-  from { transform: translate3d(0, 0, 0) scale(1); }
-  to { transform: translate3d(2%, -3%, 0) scale(1.08); }
 }
 
 /* --- Base typography ------------------------------------------------------- */
@@ -269,14 +266,61 @@ app-shell {
   color: var(--text-primary);
   box-shadow: 0 0 0 3px var(--accent-ring);
 }
-/* Active: a NEUTRAL glass-on-glass pill; only the glyph/label take the accent
-   (the Apple TV pattern — chrome never fills with the accent color). */
+/* Active: a NEUTRAL glass-on-glass pill; the label stays neutral and ONLY the
+   glyph takes the accent (QUIET GLASS: color = meaning, chrome stays calm). */
 .sidebar-nav a.active,
 .sidebar-settings.active {
   color: var(--shell-active-text);
   background: var(--shell-active-bg);
   box-shadow: var(--shell-active-shadow);
 }
+.sidebar-nav a.active .nav-icon,
+.sidebar-settings.active .nav-icon {
+  color: var(--shell-active-icon);
+}
+/* --- Sidebar groups (QUIET GLASS): labeled clusters; Insights collapses ---- */
+.sidebar-group-label {
+  display: block;
+  padding: var(--space-3) var(--space-3) var(--space-1);
+  color: var(--text-muted);
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  user-select: none;
+}
+.sidebar-group-toggle {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  width: 100%;
+  margin: 0;
+  padding: 0 var(--space-3) 0 0;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-muted);
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: color var(--transition-fast);
+}
+.sidebar-group-toggle .sidebar-group-label {
+  flex: 1 1 auto;
+  color: inherit;
+}
+.sidebar-group-toggle:hover { color: var(--text-secondary); }
+.sidebar-group-toggle:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+.group-chev {
+  flex: none;
+  margin-top: var(--space-2); /* optically centers against the label's top padding */
+  transition: transform var(--transition-fast);
+}
+.group-chev.open { transform: rotate(90deg); }
+
 .nav-icon {
   display: grid;
   place-items: center;
@@ -323,6 +367,49 @@ app-shell {
 .unlocked-glyph { display: block; flex: none; }
 .unlocked-count { font-variant-numeric: tabular-nums; }
 .unlocked-label { color: var(--accent-hover); opacity: 0.85; }
+
+/* --- Icon-rail collapse (Settings → Appearance → Sidebar → "Icon rail") ----
+   The ALTERNATIVE collapsed chrome: the same floating glass panel, shrunk to
+   a slim icon-only column docked at the left edge. Same collapsed flag and
+   toggle as the pill bar — only the rendering differs. */
+.app-sidebar.is-rail {
+  width: 64px;
+  padding: 0 var(--space-2) var(--space-4);
+  /* The rail is too narrow to contain the overlay traffic lights
+     (trafficLightPosition 32,30 assumes the 236px panel) — start BELOW them,
+     like the pill bar does, so the lights float over the window backdrop. */
+  top: 52px;
+  margin-top: 52px;
+  height: calc(100vh - 62px);
+}
+.app-sidebar.is-rail .sidebar-drag {
+  height: 10px; /* the lights live above the rail now — no reserved zone */
+}
+.app-sidebar.is-rail .nav-label,
+.app-sidebar.is-rail .quick-kbd,
+.app-sidebar.is-rail .sidebar-group-label,
+.app-sidebar.is-rail .sidebar-group-toggle,
+.app-sidebar.is-rail .unlocked-label {
+  display: none;
+}
+.app-sidebar.is-rail .sidebar-nav a,
+.app-sidebar.is-rail .quick-row,
+.app-sidebar.is-rail .sidebar-settings,
+.app-sidebar.is-rail .sidebar-collapse {
+  justify-content: center;
+  gap: 0;
+  padding: 0;
+}
+.app-sidebar.is-rail .unlocked-pill {
+  justify-content: center;
+  gap: var(--space-1);
+  padding: 0;
+}
+/* Grouped destinations read as one calm icon column; give the groups a
+   breath of separation where their labels used to sit. */
+.app-sidebar.is-rail .sidebar-nav a + a {
+  margin-top: 2px;
+}
 
 /* --- Pill bar (Apple TV collapsed chrome: floating top-center liquid pill) - */
 /* Invisible strip along the window's top edge: keeps the window draggable and
@@ -392,6 +479,7 @@ app-shell {
   box-shadow: var(--shell-active-shadow);
   padding: 0 var(--space-3);
 }
+.pill-item.active .nav-icon { color: var(--shell-active-icon); }
 .pill-item.active .nav-label { display: block; flex: none; }
 .pill-sep {
   flex: none;
