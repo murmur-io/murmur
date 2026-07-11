@@ -220,6 +220,23 @@ fn run(app: AppHandle, model_path: PathBuf, lang: Option<String>) {
     // T1.5 — QoS: the caption tick is background inference; tag this thread UTILITY so macOS
     // schedules it onto efficiency cores under contention. Best-effort C call, never fatal.
     crate::thermal::set_utility_qos();
+    // TP-F1 — advertise the live-loop as RUNNING while this thread lives (the only consumer of a
+    // manual voice-command capture). Set here at entry and cleared on EVERY exit (incl. the early
+    // model-load-failure returns below and a panic) via the RAII guard, so `begin_voice_command_inner`
+    // knows a consumer exists. Registered BEFORE `Transcriber::load` so a load failure still clears it.
+    struct LiveRunningGuard(AppHandle);
+    impl Drop for LiveRunningGuard {
+        fn drop(&mut self) {
+            self.0
+                .state::<AppState>()
+                .live_running
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    app.state::<AppState>()
+        .live_running
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let _live_running_guard = LiveRunningGuard(app.clone());
     // Fresh transcript per recording: clear any leftover from a previous meeting so the in-meeting
     // assistant can never answer about a stale recording.
     if let Ok(mut lt) = app.state::<AppState>().live_transcript.lock() {

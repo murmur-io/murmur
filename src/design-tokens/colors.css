@@ -7,6 +7,7 @@
   --surface-input: rgba(255, 255, 255, 0.035);  /* form wells (glassy)         */
   --surface-solid: #111118;      /* when a true opaque surface is needed       */
   --surface-hover: rgba(255, 255, 255, 0.06);   /* hover wash on rows/ghosts   */
+  --scrim: rgba(0, 0, 0, 0.5);   /* dimming backdrop behind a floating modal   */
 
   /* --- Text --------------------------------------------------------------- */
   --text-primary: #f6f6fa;

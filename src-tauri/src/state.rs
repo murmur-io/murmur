@@ -123,6 +123,15 @@ pub struct AppState {
     /// SAME gated `handle_voice_action` path as the wake trigger. Opt-in PER CLICK — independent of
     /// the `realtime_reactions` toggle.
     pub voice_command_capture: Mutex<Option<CaptureState>>,
+    /// TP-F1 — `true` while the LIVE-caption loop (`transcribe::live::run`) is actually running: the
+    /// ONLY consumer of a [`voice_command_capture`](Self::voice_command_capture). Set at the loop's
+    /// entry, cleared on EVERY exit (RAII guard) incl. an early model-load failure. The recorder being
+    /// present is NOT sufficient — on the fresh-install heavy-model default (`large-v3-turbo-q8_0`,
+    /// pinned `small` absent) `start_recording` sets `live_model = None` and spawns NO live loop, so a
+    /// voice command armed against a live-less recording would WEDGE with no consumer/backstop.
+    /// `begin_voice_command_inner` gates on THIS (not just the recorder) so it refuses cleanly
+    /// ("voice needs the live model") instead of arming a stuck capture. No PII (a bare flag).
+    pub live_running: AtomicBool,
     /// Db is internally Send+Sync (Mutex<Connection>). Held in an `Arc` so the egress-ledger
     /// sink (`DbEgressSink`) can hold a cheaply-cloned handle without requiring a second keychain
     /// access or separate connection (the ledger writes go through the same locked `Mutex<Conn>`).
@@ -325,6 +334,7 @@ impl AppState {
             spill_writer: Mutex::new(None),
             voice_listener: Mutex::new(None),
             voice_command_capture: Mutex::new(None),
+            live_running: AtomicBool::new(false),
             db,
             config,
             reasoner,

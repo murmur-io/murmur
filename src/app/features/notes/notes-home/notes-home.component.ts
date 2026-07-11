@@ -15,8 +15,10 @@ import { NavHistoryService } from "../../../core/nav-history.service";
 import type { NoteFolder, OrganizeMove, OrganizePlan } from "../../../core/models";
 import { MurSidebarComponent } from "../../../design-system/sidebar/sidebar.component";
 import { FoldersService } from "../../../services/folders.service";
+import { FolderLockFlowService } from "../../../services/folder-lock-flow.service";
 import { NotesService } from "../../../services/notes.service";
 import { ToastService } from "../../../services/toast.service";
+import { LockSharesDialogComponent } from "../../folders/lock-shares-dialog/lock-shares-dialog.component";
 import { OrganizeSheetComponent } from "../organize-sheet/organize-sheet.component";
 
 /**
@@ -40,7 +42,11 @@ import { OrganizeSheetComponent } from "../organize-sheet/organize-sheet.compone
   selector: "app-notes-home",
   changeDetection: ChangeDetectionStrategy.OnPush,
   host: { "(document:keydown.escape)": "onEscape()" },
-  imports: [MurSidebarComponent, OrganizeSheetComponent],
+  imports: [
+    MurSidebarComponent,
+    OrganizeSheetComponent,
+    LockSharesDialogComponent,
+  ],
   templateUrl: "./notes-home.component.html",
   styleUrl: "./notes-home.component.scss",
 })
@@ -50,6 +56,12 @@ export class NotesHomeComponent implements OnInit {
   private readonly router = inject(Router);
   private readonly toast = inject(ToastService);
   private readonly injector = inject(Injector);
+  /**
+   * Shared lock×shares flow (probe → warn/revoke dialog → lock). The SAME flow the
+   * meetings tree runs, so locking a note-folder with live shares also warns before
+   * sealing (PK-F1). Public so the template can bind the dialog + its actions.
+   */
+  readonly lockFlow = inject(FolderLockFlowService);
 
   /** Drill-down back navigation ("← Murmur" + Esc). */
   readonly nav = inject(NavHistoryService);
@@ -317,20 +329,26 @@ export class NotesHomeComponent implements OnInit {
   // --- Folder lock / unlock -----------------------------------------------
 
   /**
-   * Lock a note-folder (seal its notes). Reuses the shared folder lock command
-   * via `FoldersService`; on success we refresh the NOTE lists so the rail badge
-   * + masked rows reflect the new sealed state.
+   * Lock a note-folder (seal its notes) THROUGH the shared lock×shares flow (PK-F1):
+   * the flow FIRST probes `folder_active_shares` and — if the folder still has live
+   * shares, or the probe itself fails (FAIL-CLOSED, F5) — opens the warn/revoke dialog
+   * instead of sealing straight away. Previously this called `FoldersService.lock`
+   * directly and BYPASSED that dialog, so a shared note-folder could be sealed without
+   * the owner deciding what happens to the outstanding shares. The `onLocked` callback
+   * refreshes the NOTE lists once a lock actually lands (from any path) so the rail
+   * badge + masked rows reflect the new sealed state.
    */
   async lockFolder(folder: NoteFolder, event: Event): Promise<void> {
     event.stopPropagation();
-    if (this.lockBusyId() !== null) {
+    if (this.lockBusyId() !== null || this.lockFlow.busy()) {
       return;
     }
     this.lockBusyId.set(folder.id);
     try {
-      await this.folders.lock(folder.id);
-      await this.refreshAfterLockChange();
-      this.toast.success(`Locked “${folder.name}”`);
+      await this.lockFlow.requestLock(folder.id, folder.name, async () => {
+        await this.refreshAfterLockChange();
+        this.toast.success(`Locked “${folder.name}”`);
+      });
     } catch {
       this.toast.danger("Couldn’t lock this folder. Please try again.");
     } finally {

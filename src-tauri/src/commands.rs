@@ -1083,21 +1083,52 @@ pub(crate) fn begin_voice_command_inner(
         .map_err(|_| AppError::Audio("recorder mutex poisoned".into()))?
         .as_ref()
         .map(|r| r.total_samples());
-    let Some(offset) = start_sample else {
-        return Ok(VoiceCommandArmResult {
+    let live_running = state
+        .live_running
+        .load(std::sync::atomic::Ordering::SeqCst);
+    match voice_command_arm_decision(start_sample, live_running) {
+        // A refusal (not recording / no live consumer) — arm NOTHING and return the reason.
+        Err(refusal) => Ok(refusal),
+        // Cleared to arm: latch the fresh capture the live loop consumes.
+        Ok(offset) => {
+            let mut guard = state.voice_command_capture.lock().map_err(|_| {
+                AppError::Other(anyhow::anyhow!("voice-command capture mutex poisoned"))
+            })?;
+            *guard = Some(crate::state::CaptureState::armed_from(offset));
+            Ok(VoiceCommandArmResult {
+                listening: true,
+                reason: None,
+            })
+        }
+    }
+}
+
+/// PURE arm decision for [`begin_voice_command_inner`] (no state, no locks → unit-testable without a
+/// real `Recorder`). `recording_offset` is `Some(total_samples)` while recording, `None` otherwise;
+/// `live_running` is whether the live-caption loop (the ONLY consumer of a voice capture) is running.
+///
+/// Returns `Ok(offset)` when the click may arm, else `Err(refusal)` carrying the FE-facing reason:
+/// - not recording ⇒ "not recording" (arm nothing — the live loop only runs during a recording);
+/// - TP-F1: recording but NO live consumer ⇒ "voice needs the live model" (the fresh-install
+///   heavy-turbo default spawns no live loop, so an armed capture would WEDGE with nothing to
+///   transcribe/dispatch it — refuse cleanly instead of arming a consumer-less generation).
+fn voice_command_arm_decision(
+    recording_offset: Option<usize>,
+    live_running: bool,
+) -> std::result::Result<usize, VoiceCommandArmResult> {
+    let Some(offset) = recording_offset else {
+        return Err(VoiceCommandArmResult {
             listening: false,
             reason: Some("not recording".into()),
         });
     };
-    let mut guard = state
-        .voice_command_capture
-        .lock()
-        .map_err(|_| AppError::Other(anyhow::anyhow!("voice-command capture mutex poisoned")))?;
-    *guard = Some(crate::state::CaptureState::armed_from(offset));
-    Ok(VoiceCommandArmResult {
-        listening: true,
-        reason: None,
-    })
+    if !live_running {
+        return Err(VoiceCommandArmResult {
+            listening: false,
+            reason: Some("voice needs the live model".into()),
+        });
+    }
+    Ok(offset)
 }
 
 /// STOP the MANUAL voice-command capture (CLICK-TO-STOP): the user clicked "stop" / "done", so the
@@ -3540,9 +3571,13 @@ pub(crate) fn import_memories_inner(
         status: crate::storage::models::MeetingStatus::Exported,
         folder_id: None,
     })?;
-    // 4) Stamp the anchor onto the Adds (gating + purge anchor) and apply atomically.
+    // 4) Stamp the anchor onto the Adds (gating + purge anchor) and apply atomically. MEM-1: use the
+    //    import-aware apply so every pre-existing fact this import SUPERSEDES (an Invalidate on a fact
+    //    anchored to another meeting) is linked to the synthetic import id — deleting the import then
+    //    REOPENS those facts, making "delete to undo" a FULL reversal instead of a partial one that
+    //    leaves prior memories permanently closed.
     crate::facts::set_meeting_id(&mut ops, &meeting_id);
-    db.apply_user_fact_ops(&ops)?;
+    db.apply_user_fact_ops_recording_import_supersedes(&ops, &meeting_id)?;
     tracing::info!(
         target: "user_memory",
         meeting_id = %meeting_id,
@@ -7903,7 +7938,12 @@ pub(crate) fn rename_speaker_inner(
     }
     let updated = serde_json::to_string(&tl)
         .map_err(|e| AppError::Storage(format!("serialize timeline: {e}")))?;
-    state.db.set_timeline_data(meeting_id, &updated)?;
+    // SEAM-F2 (2026-07-11 audit, edit lost): in a session-unlocked LOCKED folder the renamed timeline
+    // must be RE-SEALED under the folder CK at write time — the pre-fix bare `set_timeline_data`
+    // landed plaintext-only against the STALE sealed blob, so relock re-blanked the plaintext and the
+    // next unlock restored the OLD speaker labels (the rename was destroyed). Open/rootless meeting →
+    // the plain write inside the helper. Fail-closed on a missing session KEK.
+    set_timeline_data_reseal_if_locked(state, meeting_id, &updated)?;
 
     // ENROLL-ON-RENAME (Phase 2, opt-in): if the OLD label resolves to a diarized cluster (either a
     // raw `others-{n}` tag or, via the reconciliation above, the display label the FE lane showed) and
@@ -8224,8 +8264,20 @@ pub async fn generate_timeline(
     let provider = crate::summarize::provider_for(crate::summarize::roles::Role::Notes, &config)?;
     let timeline =
         crate::summarize::timeline::generate(provider.as_ref(), &segments, duration_s).await?;
+    // SEAM-F1 (2026-07-11 audit, plaintext-at-rest): the provider `.await` above can span a relock,
+    // so re-take the lifecycle guard and RE-GATE the meeting AFTER generation before persisting. Then
+    // route the write through the seal-on-write seam: a session-unlocked LOCKED folder SEALS the fresh
+    // timeline under the folder CK (never a bare plaintext `set_timeline_data`, which the pre-fix path
+    // left in the sealed row after relock — plaintext at rest). If a relock landed mid-generation
+    // (the meeting is now sealed-not-unlocked), do NOT persist plaintext at all — the generated
+    // timeline is discarded (the FE re-generates after the next unlock).
     if let Ok(json) = serde_json::to_string(&timeline) {
-        let _ = state.db.set_timeline_data(&meeting_id, &json);
+        let _lifecycle = lifecycle_guard(state.inner());
+        if !meeting_is_unlocked(state.inner(), &meeting_id)? {
+            return Ok(timeline); // relocked mid-generation → persist nothing plaintext behind the lock.
+        }
+        // Fail-closed on a missing session KEK for a locked folder (never write unsealed plaintext).
+        set_timeline_data_reseal_if_locked(state.inner(), &meeting_id, &json)?;
     }
     Ok(timeline)
 }
@@ -10665,6 +10717,13 @@ pub(crate) fn delete_folder_inner(state: &AppState, folder_id: String) -> Result
         }
     }
 
+    // NOTES-1 (2026-07-11 audit, CRITICAL data loss): AUTHORED notes (`documents(kind='note')`)
+    // must be REPARENTED to the default note-folder, NOT destroyed — the FE promises "delete folder"
+    // MOVES its notes to the default folder. The pre-fix path left them for `Db::delete_folder`'s
+    // blanket `DELETE FROM documents`, permanently deleting authored notes. `Db::delete_folder` now
+    // REFUSES if any authored note still references the folder, so this reparent MUST run first.
+    reparent_authored_notes_to_default(state, &folder_id)?;
+
     // Delete the folder row, then remove the (now note-free) vault subdir. Row first: a leftover
     // empty dir is harmless/reconcilable; a dangling row is not.
     state.db.delete_folder(&folder_id)?;
@@ -10720,6 +10779,121 @@ fn move_note_file_to_root(
             &dest.to_string_lossy(),
         )?;
     }
+    Ok(())
+}
+
+/// NOTES-1 (2026-07-11 audit, CRITICAL data loss) — reparent every AUTHORED note
+/// (`documents(kind='note')`) in a to-be-deleted folder to the DEFAULT note-folder ("Notes"), moving
+/// its plaintext `.md` into the default folder's vault subdir (copy-then-remove — never lose bytes)
+/// and rewriting `documents.exported_path`. The FE's "delete folder" promises its notes MOVE to the
+/// default folder; the pre-fix path left them for `Db::delete_folder`'s blanket `DELETE`, destroying
+/// them. Runs AFTER any sealed folder was unsealed back to plaintext (`remove_lock_inner`), so the
+/// notes here are plaintext. If the folder BEING deleted IS the default note-folder itself, its notes
+/// can't reparent to themselves — REFUSE rather than risk destroying them (the FE never offers to
+/// delete the root "Notes" folder). Best-effort FS move: a note's bytes live in the DB (canonical),
+/// so a failed `.md` move never loses content — but a missing target keeps the reparent (the row moves
+/// regardless). No PII in logs (ids only).
+fn reparent_authored_notes_to_default(
+    state: &AppState,
+    folder_id: &str,
+) -> Result<(), AppError> {
+    let note_ids = state.db.note_ids_in_folder(folder_id)?;
+    if note_ids.is_empty() {
+        return Ok(());
+    }
+    let default_id = state.db.ensure_default_note_folder()?;
+    if default_id == folder_id {
+        // Deleting the default note-folder while it still holds authored notes: reparenting to
+        // itself is a no-op and the row-delete would then destroy them. Fail closed.
+        return Err(AppError::InvalidArg(
+            "cannot delete the default \"Notes\" folder while it holds notes — move them first".into(),
+        ));
+    }
+    let default_folder = state
+        .db
+        .note_folder_by_id(&default_id)?
+        .ok_or_else(|| AppError::Storage("default note-folder missing after ensure".into()))?;
+    for id in &note_ids {
+        // Reassign the row to the default note-folder (the gate/seal anchor). The default folder is
+        // OPEN (root "Notes" is never locked), so a plain reassign is correct — no reseal needed.
+        state.db.set_note_doc_folder(id, &default_id)?;
+        // Move the plaintext `.md` into the default folder's vault subdir + re-point exported_path.
+        if let Some(row) = state.db.get_note_row(id)? {
+            move_authored_note_md_to_folder(state, &row, &default_folder)?;
+        }
+    }
+    tracing::info!(
+        target: "notes",
+        folder_id = %folder_id,
+        moved = note_ids.len(),
+        "reparented authored notes to the default folder before folder delete"
+    );
+    Ok(())
+}
+
+/// Move ONE authored note's plaintext `.md` from its old export path into `target` note-folder's
+/// vault subdir (copy-then-remove — never lose bytes) and re-point `documents.exported_path`. A
+/// `&AppState`-only helper for the `_inner` delete path (which can't reach the `&State`-signature
+/// export helpers). No-op when there is no vault, no old export, or the source file is already gone
+/// (the DB row is the canonical copy; a re-export recreates the `.md`).
+fn move_authored_note_md_to_folder(
+    state: &AppState,
+    row: &crate::storage::db::NoteRow,
+    target: &NoteFolder,
+) -> Result<(), AppError> {
+    let Some(vault) = vault_path(state) else {
+        // No vault → nothing on disk to move; still clear the stale export path so a later lock
+        // never chases it.
+        state.db.set_note_doc_exported_path(&row.id, None)?;
+        return Ok(());
+    };
+    let vault_root = std::path::Path::new(&vault);
+    // Read the source bytes (if any). A missing source → nothing to move; clear the path.
+    let bytes = match row.exported_path.as_deref() {
+        Some(src_path) => match std::fs::read_to_string(src_path) {
+            Ok(b) => Some((src_path.to_string(), b)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(AppError::Export(format!("read note for move failed: {e}"))),
+        },
+        None => None,
+    };
+    let Some((src_path, content)) = bytes else {
+        // No on-disk file → just re-export from the (canonical) DB text into the new folder if we
+        // have text; otherwise clear the stale path.
+        if row.text.is_empty() {
+            state.db.set_note_doc_exported_path(&row.id, None)?;
+        } else if let Some(p) = write_note_to_vault(state, row)? {
+            let _ = p; // write_note_to_vault already re-points exported_path.
+        }
+        return Ok(());
+    };
+    // Compose the destination inside the target folder's vault subdir, D5-contained.
+    let file_name = std::path::Path::new(&src_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| AppError::Export("note path has no filename".into()))?;
+    let rel = std::path::Path::new(&target.path).join(file_name);
+    let dest = assert_in_vault(vault_root, &rel)?;
+    let src_canon = std::path::Path::new(&src_path)
+        .canonicalize()
+        .unwrap_or_else(|_| std::path::PathBuf::from(&src_path));
+    if dest == src_canon {
+        // Already at the destination (nothing to move) — just record the path.
+        state
+            .db
+            .set_note_doc_exported_path(&row.id, Some(&dest.to_string_lossy()))?;
+        return Ok(());
+    }
+    if let Some(dir) = dest.parent() {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| AppError::Export(format!("create move dir failed: {e}")))?;
+    }
+    // Write the destination atomically, THEN remove the source (never lose bytes).
+    crate::export::overwrite_note(&dest, &content)?;
+    let _ = std::fs::remove_file(&src_path);
+    state
+        .db
+        .set_note_doc_exported_path(&row.id, Some(&dest.to_string_lossy()))?;
     Ok(())
 }
 
@@ -11798,6 +11972,40 @@ pub(crate) fn set_manual_notes_reseal_with(
     }
     db.set_manual_notes_sealed(meeting_id, text, &blob)?;
     tracing::debug!(target: "lock", meeting_id = %meeting_id, "seal-on-write: typed notes re-sealed under the folder CK");
+    Ok(())
+}
+
+/// Persist a meeting's timeline JSON, RE-SEALING the fresh data into `data_blob` when the meeting's
+/// folder is LOCKED (session-unlocked, or the caller's gate already refused). Open/rootless meeting →
+/// the plain [`Db::set_timeline_data`]. Locked → encrypt under the folder CK with the SAME AAD the
+/// folder seal uses (`aad_content(.., "timeline")`), VERIFY byte-identical, then upsert plaintext +
+/// fresh blob atomically ([`Db::set_timeline_data_sealed`]) — so relock re-blanks to THIS timeline
+/// (never a stale copy), and a timeline GENERATED while session-unlocked is sealed FROM BIRTH (never
+/// a blob-less plaintext behind a lock). FAIL-CLOSED via [`session_folder_ck`]: no cached KEK ⇒
+/// `AppError::Locked` before any write. 2026-07-11 audit SEAM-F1 (generate_timeline) + SEAM-F2
+/// (rename_speaker).
+fn set_timeline_data_reseal_if_locked(
+    state: &AppState,
+    meeting_id: &str,
+    data: &str,
+) -> Result<(), AppError> {
+    let locked_folder = match state.db.folder_for_meeting(meeting_id)? {
+        Some(fid) => state.db.folder_by_id(&fid)?.filter(|f| f.locked),
+        None => None,
+    };
+    let Some(folder) = locked_folder else {
+        return state.db.set_timeline_data(meeting_id, data);
+    };
+    let ck = session_folder_ck(state, &folder.id)?;
+    let aad = aad_content(&folder.id, meeting_id, AAD_NO_PROVIDER, "timeline");
+    let blob = crate::crypto::encrypt(&ck, data.as_bytes(), &aad)?;
+    if crate::crypto::decrypt(&ck, &blob, &aad)? != data.as_bytes() {
+        return Err(AppError::Storage(
+            "timeline seal-on-write verification failed (blob mismatch)".into(),
+        ));
+    }
+    state.db.set_timeline_data_sealed(meeting_id, data, &blob)?;
+    tracing::debug!(target: "lock", meeting_id = %meeting_id, "seal-on-write: timeline re-sealed under the folder CK");
     Ok(())
 }
 
@@ -13793,6 +14001,9 @@ fn ingest_shared_note(
     sender_user_id: &str,
     share_id: &str,
 ) -> Result<AcceptedShare, AppError> {
+    // LOCK-SHARE-INGEST-1 (2026-07-11 audit, sealed-content leak): hold the lifecycle guard across the
+    // whole ingest so a relock cannot land between the meeting insert and the (sealed) note write.
+    let _lifecycle = lifecycle_guard(state);
     let meeting_id = uuid::Uuid::new_v4().to_string();
     let now = chrono::Utc::now().to_rfc3339();
     // A well-formed created_at (RFC3339) is kept; otherwise fall back to now (never trust the payload).
@@ -13828,21 +14039,41 @@ fn ingest_shared_note(
         folder_id: Some(target.id.clone()),
     })?;
 
-    // Atomic vault export (best-effort — a missing/invalid vault just leaves exported_path None; the
-    // note is still durable in the DB, the source of truth).
-    let exported_path = config_vault(state).and_then(|vault| {
-        crate::export::write_note(
-            std::path::Path::new(&vault),
-            Some(&target.path),
-            &title,
-            &started_at,
-            &full_md,
-        )
-        .ok()
-        .map(|p| p.to_string_lossy().to_string())
-    });
+    // LOCK-SHARE-INGEST-1: a session-unlocked LOCKED target must NOT receive a plaintext `.md` on
+    // disk NOR a plaintext note row — the pre-fix path wrote both via a RAW `upsert_note` + vault
+    // export, so the plaintext survived the next relock at rest (a sealed-content leak). When the
+    // target is locked, SEAL the note under the target folder CK from birth (verify-before-destroy
+    // inside `upsert_note_reseal_if_locked`) and write NO vault file. An open target keeps the plain
+    // write + export.
+    let target_locked = state
+        .db
+        .folder_by_id(&target.id)?
+        .map(|f| f.locked)
+        .unwrap_or(false);
 
-    state.db.upsert_note(&NoteRecord {
+    // Set the meeting's folder FIRST so `upsert_note_reseal_if_locked` resolves the (locked) folder
+    // via `folder_for_meeting`. It reads `notes.folder_id`, but there is no note row yet — so seed a
+    // folder association through a folder-set on the (about-to-be-written) note. We do this by writing
+    // the note with the folder resolved directly below instead of relying on a two-step.
+    let exported_path = if target_locked {
+        None // a locked folder has no on-disk export.
+    } else {
+        // Atomic vault export (best-effort — a missing/invalid vault just leaves exported_path None;
+        // the note is still durable in the DB, the source of truth).
+        config_vault(state).and_then(|vault| {
+            crate::export::write_note(
+                std::path::Path::new(&vault),
+                Some(&target.path),
+                &title,
+                &started_at,
+                &full_md,
+            )
+            .ok()
+            .map(|p| p.to_string_lossy().to_string())
+        })
+    };
+
+    let note = NoteRecord {
         meeting_id: meeting_id.clone(),
         provider_id: "shared".to_string(),
         markdown: full_md,
@@ -13851,10 +14082,28 @@ fn ingest_shared_note(
         model_requested: None,
         model_served: None,
         gateway_host: None,
-    })?;
-    // The meeting's folder is resolved via `notes.folder_id` (`folder_for_meeting`) — set it so every
-    // gate (`meeting_is_unlocked`, `visibility_clause`) sees this note as living in the target folder.
-    state.db.set_note_folder(&meeting_id, Some(&target.id))?;
+    };
+    if target_locked {
+        // Seal under the TARGET folder CK from birth. `upsert_note_sealed` also writes the governing
+        // `folder_id`, so the gate + reblank lifecycle see this note as living in the target folder.
+        // Fail-closed on a missing session KEK (never unsealed plaintext behind a lock).
+        let ck = session_folder_ck(state, &target.id)?;
+        // SAME AAD the folder seal / `upsert_note_reseal_if_locked` use:
+        // aad_content(folder, meeting, provider, "note").
+        let aad = aad_content(&target.id, &note.meeting_id, &note.provider_id, "note");
+        let blob = crate::crypto::encrypt(&ck, note.markdown.as_bytes(), &aad)?;
+        if crate::crypto::decrypt(&ck, &blob, &aad)? != note.markdown.as_bytes() {
+            return Err(AppError::Storage(
+                "shared-note seal-on-ingest verification failed (blob mismatch)".into(),
+            ));
+        }
+        state.db.upsert_note_sealed(&note, &blob, &target.id)?;
+    } else {
+        state.db.upsert_note(&note)?;
+        // The meeting's folder is resolved via `notes.folder_id` (`folder_for_meeting`) — set it so
+        // every gate (`meeting_is_unlocked`, `visibility_clause`) sees this note in the target folder.
+        state.db.set_note_folder(&meeting_id, Some(&target.id))?;
+    }
 
     // Idempotency + provenance record (a re-accept of this share_id is INSERT-OR-IGNORE'd).
     state
@@ -14257,6 +14506,7 @@ mod lifecycle_tests {
             spill_writer: Mutex::new(None),
             voice_listener: Mutex::new(None),
             voice_command_capture: Mutex::new(None),
+            live_running: std::sync::atomic::AtomicBool::new(false),
             db,
             config: Arc::new(Mutex::new(AppConfig::default())),
             reasoner: crate::reason::ReasonerCell::fixed(Arc::new(crate::reason::StubReasoner)),
@@ -15627,6 +15877,52 @@ mod lifecycle_tests {
         );
     }
 
+    /// TP-F1 (RED-before-GREEN, fresh-install regression): the PURE arm decision. A RECORDING is in
+    /// progress (`Some(offset)`) but NO live loop is running (`live_running=false`) — the fresh-install
+    /// heavy-turbo default arm where `start_recording` sets `live_model=None` and spawns no live loop.
+    /// The decision must REFUSE cleanly ("voice needs the live model"), NOT arm — pre-fix the code saw
+    /// only the present recorder and armed a capture no consumer would ever transcribe, wedging the FE
+    /// in "listening…". This targets the extracted pure helper (a real `Recorder` can't be built
+    /// headless), covering all three arms: not-recording, recording-without-consumer, recording+consumer.
+    #[test]
+    fn voice_command_arm_refuses_without_a_live_consumer() {
+        // Not recording at all → "not recording", regardless of live_running.
+        assert_eq!(
+            voice_command_arm_decision(None, true).unwrap_err().reason.as_deref(),
+            Some("not recording")
+        );
+        assert_eq!(
+            voice_command_arm_decision(None, false).unwrap_err().reason.as_deref(),
+            Some("not recording")
+        );
+        // RECORDING but NO live consumer (the fresh-install wedge) → refuse cleanly, arm nothing.
+        let refusal = voice_command_arm_decision(Some(4800), false).unwrap_err();
+        assert!(!refusal.listening, "must not arm a consumer-less generation");
+        assert_eq!(
+            refusal.reason.as_deref(),
+            Some("voice needs the live model"),
+            "the wedge case must surface a clear reason, not arm"
+        );
+        // RECORDING + a live consumer → cleared to arm at the latched offset.
+        assert_eq!(
+            voice_command_arm_decision(Some(4800), true).unwrap(),
+            4800,
+            "with a live consumer, the click arms at the latched offset"
+        );
+    }
+
+    /// The inner integration for the not-recording path (no recorder ⇒ not recording), still exercising
+    /// `begin_voice_command_inner` end-to-end. The recording-present arms need a real audio device, so
+    /// the recording×consumer matrix is covered by the pure-decision test above.
+    #[test]
+    fn begin_voice_command_inner_not_recording_arms_nothing() {
+        let state = build_state("voicecmd-inner-notrec");
+        let res = begin_voice_command_inner(&state).unwrap();
+        assert!(!res.listening);
+        assert_eq!(res.reason.as_deref(), Some("not recording"));
+        assert!(state.voice_command_capture.lock().unwrap().is_none());
+    }
+
     /// MANUAL voice command: arming sets a fresh full-budget [`crate::state::CaptureState`] on the
     /// state (the live loop reads it). We exercise the arming half directly (a live `Recorder` needs
     /// a real audio device); the decision/dispatch half is unit-tested in `transcribe::live`.
@@ -16175,6 +16471,120 @@ mod lifecycle_tests {
         assert!(
             state.db.user_facts_all().unwrap().is_empty(),
             "deleting the synthetic meeting must undo the import"
+        );
+    }
+
+    /// MEM-1 (RED-before-GREEN): a memory import that SUPERSEDES a pre-existing user fact (anchored to
+    /// ANOTHER meeting) must be FULLY reversible — deleting the synthetic Memory-Import meeting must
+    /// REOPEN the superseded fact, not leave it permanently closed. Pre-fix, `set_meeting_id` stamped
+    /// only the Adds, so `delete_meeting`'s `purge_user_facts_tx` (WHERE meeting_id = import id)
+    /// deleted the import's Add but the pre-existing fact — closed by the reconcile's Invalidate —
+    /// stayed closed forever (a partial undo that silently lost the prior memory). This seeds the prior
+    /// fact under a REAL meeting, imports a colliding value (same subject/predicate, different object),
+    /// asserts the prior fact is now CLOSED + the new one OPEN, then deletes the import and asserts the
+    /// prior fact is REOPEN.
+    #[test]
+    fn import_supersede_is_reversible_delete_reopens_prior_fact() {
+        use crate::facts::{FactOp, NewFact};
+        let state = build_state("mem-import-reopen");
+        let none = HashSet::new();
+
+        // A REAL prior meeting the pre-existing user fact is anchored to (so it is visible + survives
+        // the import; deleting the IMPORT must not touch it beyond reopening).
+        state
+            .db
+            .insert_meeting(&crate::storage::models::Meeting {
+                id: "m-old".to_string(),
+                started_at: "2026-07-01T00:00:00Z".to_string(),
+                ended_at: None,
+                title: Some("Old chat".to_string()),
+                duration_s: 0,
+                audio_path: None,
+                status: crate::storage::models::MeetingStatus::Exported,
+                folder_id: None,
+            })
+            .unwrap();
+        // Pre-existing OPEN user fact keyed (You, "prefers") = "English replies", anchored to m-old.
+        // MockImportBrain emits {"prefers":"Polish replies"} → a same-key/DIFFERENT-object collision.
+        state
+            .db
+            .apply_user_fact_ops(&[FactOp::Add(NewFact {
+                entity_id: crate::user_memory::USER_SCOPE.to_string(),
+                subject: "You".to_string(),
+                predicate: "prefers".to_string(),
+                object: "English replies".to_string(),
+                valid_from: "2026-07-01T00:00:00Z".to_string(),
+                recorded_at: "2026-07-01T00:00:00Z".to_string(),
+                confidence: 1.0,
+                meeting_id: Some("m-old".to_string()),
+            })])
+            .unwrap();
+        let prior_id = state.db.user_facts_all().unwrap()[0].id.clone();
+        assert!(
+            state.db.user_facts_all().unwrap()[0].valid_to.is_none(),
+            "precondition: the prior fact is OPEN"
+        );
+
+        // IMPORT: supersedes "prefers" (English→Polish) and adds "works on".
+        let n = import_memories_inner(&state.db, &MockImportBrain, true, "export").unwrap();
+        assert_eq!(n, 2, "two Adds: the superseding 'prefers' + 'works on'");
+        // The prior fact is now CLOSED (superseded), and the new value is the visible one.
+        let prior_after = state
+            .db
+            .user_facts_all()
+            .unwrap()
+            .into_iter()
+            .find(|f| f.id == prior_id)
+            .unwrap();
+        assert!(
+            prior_after.valid_to.is_some(),
+            "the import superseded (closed) the prior fact"
+        );
+        let visible: Vec<_> = state
+            .db
+            .list_user_facts_visible(&none)
+            .unwrap()
+            .into_iter()
+            .filter(|f| f.predicate == "prefers")
+            .collect();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].object, "Polish replies", "the import's value is current");
+
+        // DELETE the synthetic import ⇒ the reconcile is REVERSED: the prior fact REOPENS, and the
+        // import's own Adds are gone.
+        let import_id = state
+            .db
+            .list_meetings(100)
+            .unwrap()
+            .into_iter()
+            .find(|m| m.id.starts_with("import-"))
+            .unwrap()
+            .id;
+        state.db.delete_meeting(&import_id).unwrap();
+
+        let prior_reopened = state
+            .db
+            .user_facts_all()
+            .unwrap()
+            .into_iter()
+            .find(|f| f.id == prior_id)
+            .expect("the prior fact must still exist (only the import's Adds were deleted)");
+        assert!(
+            prior_reopened.valid_to.is_none(),
+            "deleting the import must REOPEN the superseded prior fact (full undo)"
+        );
+        // And it is once again the visible current value.
+        let visible_after: Vec<_> = state
+            .db
+            .list_user_facts_visible(&none)
+            .unwrap()
+            .into_iter()
+            .filter(|f| f.predicate == "prefers")
+            .collect();
+        assert_eq!(visible_after.len(), 1, "exactly one open 'prefers' fact after undo");
+        assert_eq!(
+            visible_after[0].object, "English replies",
+            "the prior value is current again after undoing the import"
         );
     }
 
@@ -21699,6 +22109,93 @@ mod lifecycle_tests {
         assert_eq!(failed[0].last_error.as_deref(), Some("upload_failed"));
     }
 
+    /// SB-3 ROW-AMPLIFICATION FIX (RED-before-GREEN): a share whose upload keeps FAILING must yield
+    /// EXACTLY ONE `org_shares` row (state `failed`) no matter how many sweep retries run, and a later
+    /// SUCCESS must flip that SAME row to `uploaded` with NO duplicate. This models the exact
+    /// row-management decision `share_to_org_inner` now makes — `find_reusable_org_share` →
+    /// `reset_org_share_for_retry` (reuse) instead of `insert_org_share` (mint) — using the real DB
+    /// helpers. Pre-fix `share_to_org_inner` unconditionally minted a fresh row every attempt while the
+    /// prior failed row survived, so N failures produced N rows and a recovery double-published. RED on
+    /// the old decision: `find_reusable_org_share` returned nothing (it didn't exist) → every attempt
+    /// would insert. This drives 3 failed attempts + 1 success and asserts a single row throughout.
+    #[test]
+    fn org_share_retry_reuses_one_row_no_amplification() {
+        let state = build_state("org-share-sb3");
+        let sha = vec![5u8; 32];
+        let org = "org-1";
+        let mid = Some("m-flaky");
+
+        // The share row decision `share_to_org_inner` performs, extracted so it can run without a
+        // server: reuse an existing retriable row, else insert a fresh one; return the row id.
+        let attempt_row_id = |title: &str, ts: &str| -> String {
+            match state
+                .db
+                .find_reusable_org_share(org, mid, None)
+                .unwrap()
+            {
+                Some(existing) => {
+                    state
+                        .db
+                        .reset_org_share_for_retry(&existing.id, Some(title), 1, 1, &sha, ts)
+                        .unwrap();
+                    existing.id
+                }
+                None => {
+                    let id = crate::share::new_share_id();
+                    state
+                        .db
+                        .insert_org_share(&id, org, mid, None, "note", Some(title), 1, 1, &sha, ts)
+                        .unwrap();
+                    id
+                }
+            }
+        };
+        let total_rows = || state.db.list_org_shares_for_org(org).unwrap().len();
+
+        // Attempt 1: insert, then upload FAILS.
+        let id1 = attempt_row_id("Flaky", "2026-07-11T10:00:00Z");
+        state.db.set_org_share_failed(&id1, "upload_failed", "2026-07-11T10:00:01Z").unwrap();
+        assert_eq!(total_rows(), 1, "first failed attempt = one row");
+
+        // Attempts 2 & 3 (sweep retries): REUSE the same row, fail again.
+        for (n, ts) in [(2, "2026-07-11T10:05:00Z"), (3, "2026-07-11T10:10:00Z")] {
+            let idn = attempt_row_id("Flaky", ts);
+            assert_eq!(idn, id1, "retry {n} must reuse the SAME row, not mint a new one");
+            state.db.set_org_share_failed(&idn, "upload_failed", ts).unwrap();
+            assert_eq!(total_rows(), 1, "after retry {n}, still exactly one row (no amplification)");
+        }
+        // Exactly one row, and it is FAILED (not a pile of stale queued/failed rows).
+        let failed = state.db.list_org_shares_in_state("failed").unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].id, id1);
+
+        // Recovery: the next attempt reuses the row again and SUCCEEDS → the SAME row flips to
+        // uploaded, item_id recorded, with NO duplicate published row.
+        let id4 = attempt_row_id("Flaky", "2026-07-11T10:15:00Z");
+        assert_eq!(id4, id1, "recovery reuses the same row");
+        state.db.set_org_share_uploaded(&id4, "server-item-1", "2026-07-11T10:15:01Z").unwrap();
+        assert_eq!(total_rows(), 1, "success must not add a duplicate row");
+        let uploaded = state.db.get_org_share(&id1).unwrap().unwrap();
+        assert_eq!(uploaded.state, "uploaded");
+        assert_eq!(uploaded.item_id.as_deref(), Some("server-item-1"));
+        assert!(state.db.list_org_shares_in_state("failed").unwrap().is_empty());
+
+        // A DIFFERENT logical share (a different meeting) is its OWN row — reuse is per logical key.
+        let other = match state.db.find_reusable_org_share(org, Some("m-other"), None).unwrap() {
+            Some(_) => panic!("no reusable row should exist for a fresh meeting"),
+            None => {
+                let id = crate::share::new_share_id();
+                state
+                    .db
+                    .insert_org_share(&id, org, Some("m-other"), None, "note", Some("O"), 1, 1, &sha, "t")
+                    .unwrap();
+                id
+            }
+        };
+        assert_ne!(other, id1);
+        assert_eq!(total_rows(), 2, "a distinct share key gets its own row");
+    }
+
     /// CROSS-SLICE AAD FIX (RED-before-GREEN for the round-trip bug): the envelope AAD item nonce is
     /// `hex(content_sha256)`, which BOTH the publisher (from the envelope it seals) and every consumer
     /// (from the feed's `content_sha256`) derive identically — so a cross-member open SUCCEEDS. The
@@ -21996,6 +22493,336 @@ mod lifecycle_tests {
         assert!(
             shares.iter().all(|(id, _)| id != "old" && id != "f2lnk"),
             "revoked + other-folder shares excluded"
+        );
+    }
+
+    // ── 2026-07-11 audit remediation: NOTES-1/2/3, SEAM-F1/F2, LOCK-SHARE-INGEST-1, gate ─────────────
+
+    /// NOTES-1 (CRITICAL data loss, RED-before-GREEN): deleting a note-folder must REPARENT its
+    /// authored notes (`documents(kind='note')`) to the default "Notes" folder — never DELETE them.
+    /// Pre-fix `delete_folder_inner` demoted only MEETING notes, then `Db::delete_folder`'s blanket
+    /// `DELETE FROM documents WHERE folder_id` permanently destroyed every authored note (the FE
+    /// promises they MOVE to the default folder). This asserts the row SURVIVES under the default
+    /// folder with its `.md` moved + `exported_path` re-pointed.
+    #[test]
+    fn delete_note_folder_reparents_authored_notes_never_deletes_them() {
+        let vault = tmp_vault("notes1-del");
+        let state = build_state_with_vault("notes1-del", &vault);
+        state.db.ensure_default_note_folder().unwrap();
+        let fid = create_note_folder_inner(&state, "Sprint", None).unwrap().id;
+        let id = create_note_inner(&state, Some(&fid), "Roadmap").unwrap();
+        // Give it a body so it exports a real `.md`.
+        update_note_doc_inner(&state, &id, "Roadmap", "the plan lives here").unwrap();
+        let old_path = state
+            .db
+            .get_note_row(&id)
+            .unwrap()
+            .unwrap()
+            .exported_path
+            .expect("note exported to the vault");
+        assert!(std::path::Path::new(&old_path).exists(), "old .md exists");
+
+        delete_folder_inner(&state, fid.clone()).unwrap();
+
+        // The folder row is gone…
+        assert!(
+            state.db.note_folder_by_id(&fid).unwrap().is_none(),
+            "folder row deleted"
+        );
+        // …but the AUTHORED NOTE ROW SURVIVES (the pre-fix bug DELETED it) under the default folder.
+        let row = state
+            .db
+            .get_note_row(&id)
+            .unwrap()
+            .expect("authored note row MUST still exist after folder delete (never destroyed)");
+        assert_eq!(row.text, "the plan lives here", "note content never lost");
+        let default_id = state.db.ensure_default_note_folder().unwrap();
+        assert_eq!(row.folder_id, default_id, "note reparented to the default folder");
+        // Its `.md` moved into the default folder's vault subdir and `exported_path` re-points to it.
+        let new_path = row.exported_path.expect("exported_path re-pointed to the moved .md");
+        assert!(std::path::Path::new(&new_path).exists(), "moved .md exists at the new path");
+        assert!(new_path.contains("Notes"), "moved under the default Notes subdir: {new_path}");
+        assert!(
+            new_path != old_path,
+            "exported_path was actually re-pointed (not left stale)"
+        );
+
+        let _ = std::fs::remove_dir_all(&vault);
+    }
+
+    /// NOTES-2 (CRITICAL sealed-content leak, RED-before-GREEN): moving a note-folder physically
+    /// `fs::rename`s its vault dir, so `documents.exported_path` MUST be rewritten to the new on-disk
+    /// path — otherwise a later `lock_folder` deletes NOTHING at the stale path and the real plaintext
+    /// `.md` survives on disk in a sealed folder. This asserts the path is rewritten to the moved file
+    /// AND that a subsequent lock leaves NO plaintext `.md` at either the old or new path.
+    #[test]
+    fn move_note_folder_rewrites_exported_path_so_lock_deletes_the_real_md() {
+        let vault = tmp_vault("notes2-move");
+        let state = build_state_with_vault("notes2-move", &vault);
+        state.db.ensure_default_note_folder().unwrap();
+        // Notes/Parent and Notes/Dest; the note lives in Parent, we move Parent under Dest.
+        let parent = create_note_folder_inner(&state, "Parent", None).unwrap().id;
+        let dest = create_note_folder_inner(&state, "Dest", None).unwrap().id;
+        let id = create_note_inner(&state, Some(&parent), "Secret plan").unwrap();
+        update_note_doc_inner(&state, &id, "Secret plan", "top secret body").unwrap();
+        let old_path = state
+            .db
+            .get_note_row(&id)
+            .unwrap()
+            .unwrap()
+            .exported_path
+            .expect("exported to the vault");
+        assert!(std::path::Path::new(&old_path).exists(), "old .md present pre-move");
+
+        // Move Parent under Dest → the on-disk dir moves; exported_path must follow.
+        move_note_folder_inner(&state, &parent, Some(&dest)).unwrap();
+
+        let new_path = state
+            .db
+            .get_note_row(&id)
+            .unwrap()
+            .unwrap()
+            .exported_path
+            .expect("exported_path present after move");
+        assert!(
+            new_path != old_path,
+            "exported_path REWRITTEN to the moved location (pre-fix it stayed stale)"
+        );
+        assert!(
+            new_path.contains("Dest"),
+            "exported_path reflects the new vault path under Dest: {new_path}"
+        );
+        assert!(
+            std::path::Path::new(&new_path).exists(),
+            "the real .md is at the rewritten path"
+        );
+
+        // Now LOCK the moved folder (Parent, now under Dest). It must delete the REAL `.md` — so no
+        // plaintext `.md` survives at EITHER path in the sealed folder.
+        lock_folder_inner(&state, parent.clone()).unwrap();
+        assert!(
+            !std::path::Path::new(&new_path).exists(),
+            "lock deleted the REAL plaintext .md (the leak the stale path caused)"
+        );
+        assert!(
+            !std::path::Path::new(&old_path).exists(),
+            "no plaintext .md left at the old path either"
+        );
+
+        let _ = std::fs::remove_dir_all(&vault);
+    }
+
+    /// NOTES-3 (MAJOR, RED-before-GREEN): the descendant-path rewrite in `Db::reparent_note_folder`
+    /// (triggered by MOVING a note-folder) fed the Rust BYTE length into SQLite `substr()` (which
+    /// counts CHARACTERS), corrupting descendant paths for a multi-byte (Polish) folder name. Move a
+    /// multi-byte parent under a new destination and assert the child path = `<new>/Sprzedaż/Q3` with
+    /// the leading slash intact (no mid-path slice / dropped separator).
+    #[test]
+    fn move_multibyte_note_folder_keeps_descendant_paths_intact() {
+        let state = build_state("notes3-multibyte");
+        state.db.ensure_default_note_folder().unwrap();
+        // "Sprzedaż" has a multi-byte 'ż' → BYTE length (15 for "Notes/Sprzedaż") != CHAR length (14),
+        // so a byte-length `substr()` offset drops the '/' after the prefix and corrupts descendants.
+        let parent = create_note_folder_inner(&state, "Sprzedaż", None).unwrap().id;
+        let child = create_note_folder_inner(&state, "Q3", Some(&parent))
+            .unwrap()
+            .id;
+        let dest = create_note_folder_inner(&state, "Klienci", None).unwrap().id;
+        assert_eq!(
+            state.db.note_folder_by_id(&child).unwrap().unwrap().path,
+            "Notes/Sprzedaż/Q3"
+        );
+
+        // MOVE the multi-byte parent under "Notes/Klienci" → parent becomes "Notes/Klienci/Sprzedaż";
+        // the child MUST follow to "Notes/Klienci/Sprzedaż/Q3" with the leading slash intact.
+        move_note_folder_inner(&state, &parent, Some(&dest)).unwrap();
+
+        let child_path = state.db.note_folder_by_id(&child).unwrap().unwrap().path;
+        assert_eq!(
+            child_path, "Notes/Klienci/Sprzedaż/Q3",
+            "multi-byte parent move must not corrupt the descendant path (byte vs char substr)"
+        );
+    }
+
+    /// SEAM-F1 (MAJOR plaintext-at-rest, RED-before-GREEN): a timeline persisted while a locked folder
+    /// is session-unlocked must be SEALED under the folder CK — the pre-fix bare `set_timeline_data`
+    /// left a plaintext timeline in the sealed row that survived relock at rest. This drives the
+    /// seal-on-write helper `generate_timeline` now uses and asserts the row has an encrypted
+    /// `data_blob` and NO plaintext `data` at rest after relock.
+    #[test]
+    fn timeline_written_while_unlocked_is_sealed_at_rest() {
+        let state = build_state("seam-f1-timeline");
+        make_open_folder(&state.db, "f", "Vault");
+        seed_meeting(&state.db, "m", "# note", Some("f"));
+        lock_folder_inner(&state, "f".to_string()).unwrap();
+        let ck = session_unlock(&state, "f");
+
+        // The write path `generate_timeline` uses after re-gating.
+        let json = "{\"topics\":[{\"title\":\"Budget\"}],\"speakers\":[]}";
+        set_timeline_data_reseal_if_locked(&state, "m", json).unwrap();
+
+        // At the session it is plaintext-visible AND carries a blob.
+        let raw = state.db.raw_timeline("m").unwrap().unwrap();
+        assert_eq!(raw.data, json, "plaintext visible in-session");
+        assert!(raw.data_blob.is_some(), "sealed blob written at write time");
+
+        // RELOCK: plaintext re-blanked, blob kept.
+        state.unlocked_folders.lock().unwrap().remove("f");
+        reblank_folder_extras(&state, "f").unwrap();
+        let at_rest = state.db.raw_timeline("m").unwrap().unwrap();
+        assert_eq!(at_rest.data, "", "NO plaintext timeline at rest after relock");
+        assert!(at_rest.data_blob.is_some(), "encrypted data_blob kept at rest");
+
+        // UNLOCK: byte-identical restore of the generated timeline.
+        unseal_folder_extras(&state, "f", &ck, None).unwrap();
+        assert_eq!(
+            state.db.raw_timeline("m").unwrap().unwrap().data,
+            json,
+            "the sealed timeline restores byte-identical"
+        );
+    }
+
+    /// SEAM-F2 (MAJOR edit lost, RED-before-GREEN): a speaker rename in a session-unlocked locked
+    /// folder plaintext-upserted the renamed timeline over the sealed blob, so relock destroyed the
+    /// rename (reblank restored the OLD sealed labels). This asserts the rename ROUND-TRIPS through
+    /// the sealed blob across a relock→unlock cycle.
+    #[test]
+    fn rename_speaker_in_unlocked_locked_folder_survives_relock() {
+        let state = build_state("seam-f2-rename");
+        make_open_folder(&state.db, "f", "Vault");
+        seed_meeting(&state.db, "m", "# note", Some("f"));
+        // Seed a timeline with a speaker turn we can rename.
+        let tl0 = "{\"topics\":[],\"speakers\":[{\"speaker\":\"others-0\",\"start_s\":0.0,\"end_s\":1.0}]}";
+        state.db.set_timeline_data("m", tl0).unwrap();
+        lock_folder_inner(&state, "f".to_string()).unwrap();
+        let ck = session_unlock(&state, "f");
+
+        rename_speaker_inner(&state, "m", "others-0", "Alice").unwrap();
+
+        // In-session the rename is visible AND sealed.
+        let raw = state.db.raw_timeline("m").unwrap().unwrap();
+        assert!(raw.data.contains("Alice"), "rename visible in-session");
+        assert!(raw.data_blob.is_some(), "renamed timeline sealed at write time");
+
+        // RELOCK then UNLOCK: the rename must persist through the sealed blob.
+        state.unlocked_folders.lock().unwrap().remove("f");
+        reblank_folder_extras(&state, "f").unwrap();
+        assert_eq!(
+            state.db.raw_timeline("m").unwrap().unwrap().data,
+            "",
+            "plaintext re-blanked at rest"
+        );
+        unseal_folder_extras(&state, "f", &ck, None).unwrap();
+        let restored = state.db.raw_timeline("m").unwrap().unwrap().data;
+        assert!(
+            restored.contains("Alice") && !restored.contains("others-0"),
+            "the speaker rename survives the relock round-trip (was destroyed pre-fix): {restored}"
+        );
+    }
+
+    /// LOCK-SHARE-INGEST-1 (MAJOR sealed-content leak, RED-before-GREEN): accepting a share into a
+    /// session-unlocked LOCKED folder wrote a RAW plaintext note row + a plaintext `.md`, both of
+    /// which survived the next relock at rest. This asserts the ingested note is SEALED from birth
+    /// (blob present, no plaintext row at rest after relock) and no plaintext `.md` is written.
+    #[test]
+    fn ingest_shared_note_into_unlocked_locked_folder_seals_at_rest() {
+        let vault = tmp_vault("share-ingest");
+        let state = build_state_with_vault("share-ingest", &vault);
+        make_open_folder(&state.db, "f", "Shared");
+        std::fs::create_dir_all(vault.join("Shared")).unwrap();
+        lock_folder_inner(&state, "f".to_string()).unwrap();
+        let ck = session_unlock(&state, "f");
+        let target = state.db.folder_by_id("f").unwrap().unwrap();
+
+        let env = murmur_protocol::envelope::ShareEnvelope::new(
+            "Confidential deal",
+            "the secret terms",
+            "2026-07-04T10:00:00Z",
+        );
+        let accepted =
+            ingest_shared_note(&state, &target, &env, "SENDERFP", "sender-uuid", "share-lk").unwrap();
+        let mid = accepted.meeting_id;
+
+        // The note row must be SEALED (blob present) — never a raw plaintext note behind the lock.
+        let sealed = &state.db.sealable_notes_for_meeting(&mid).unwrap()[0];
+        assert!(
+            sealed.content_blob.is_some(),
+            "shared note sealed from birth (blob present)"
+        );
+        // No plaintext `.md` was written into the locked folder.
+        let shared_dir = vault.join("Shared");
+        let md_files: Vec<_> = std::fs::read_dir(&shared_dir)
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("md"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            md_files.is_empty(),
+            "no plaintext .md written into the locked target: {md_files:?}"
+        );
+
+        // RELOCK (command-layer shape): blank the sealed meeting-note markdown + reblank the extras.
+        state.unlocked_folders.lock().unwrap().remove("f");
+        let mut one = std::collections::HashSet::new();
+        one.insert("f".to_string());
+        state.db.blank_sealed_notes_in_folders(&one).unwrap();
+        reblank_folder_extras(&state, "f").unwrap();
+        let n = &state.db.sealable_notes_for_meeting(&mid).unwrap()[0];
+        assert_eq!(n.markdown, "", "no plaintext note markdown at rest after relock");
+        assert!(n.content_blob.is_some(), "sealed blob kept at rest");
+
+        // UNLOCK: the shared note comes back with its provenance + body.
+        // (unlock restores note markdown via the folder unlock path; here we assert the blob decrypts.)
+        let aad = aad_content("f", &mid, "shared", "note");
+        let pt = crate::crypto::decrypt(&ck, n.content_blob.as_ref().unwrap(), &aad).unwrap();
+        let restored = String::from_utf8(pt).unwrap();
+        assert!(
+            restored.contains("the secret terms") && restored.contains("share-id: share-lk"),
+            "sealed shared note decrypts to the ingested content + provenance"
+        );
+
+        let _ = std::fs::remove_dir_all(&vault);
+    }
+
+    /// folder_active_shares gate (RED-before-GREEN): the report returned org-share TITLES (plaintext)
+    /// for ANY folder including a sealed-and-not-session-unlocked one. This asserts a locked-not-
+    /// unlocked folder returns an EMPTY report (no title leak).
+    #[test]
+    fn folder_active_shares_masks_a_sealed_not_unlocked_folder() {
+        let state = build_state("active-shares-gate");
+        make_open_folder(&state.db, "f", "Secret");
+        seed_meeting(&state.db, "m", "# note", Some("f"));
+        // Seed an org share carrying a plaintext title anchored to this folder's meeting.
+        state
+            .db
+            .insert_org_share(
+                "os-1",
+                "org-1",
+                Some("m"),
+                None,
+                "note",
+                Some("TOP SECRET acquisition"),
+                1,
+                1,
+                &[0u8; 32],
+                "2026-07-11T00:00:00Z",
+            )
+            .unwrap();
+        // Sanity: while OPEN, the title is surfaced.
+        let open = folder_active_shares_inner(&state, "f").unwrap();
+        assert_eq!(open.org.len(), 1, "open folder surfaces the org share");
+
+        // Lock (NOT session-unlocked) → the report MUST be empty (no title leak).
+        lock_folder_inner(&state, "f".to_string()).unwrap();
+        let masked = folder_active_shares_inner(&state, "f").unwrap();
+        assert_eq!(masked.links, 0);
+        assert_eq!(masked.users, 0);
+        assert!(
+            masked.org.is_empty(),
+            "a sealed-not-unlocked folder leaks NO org share titles: {:?}",
+            masked.org
         );
     }
 }
@@ -22558,6 +23385,12 @@ pub async fn org_leave(state: State<'_, AppState>) -> Result<(), AppError> {
     let client = crate::share::client::ShareClient::new(&base)?;
     client.org_leave(&access, &org.org_id).await?;
     state.inner().db.delete_org_state(&org.org_id)?;
+    // LEAVE = full consent withdrawal: PURGE the decrypted org replica (items/chunks/vectors/FTS) so
+    // a departed member keeps NO searchable copy of colleagues' shared content. Without this the
+    // plaintext replica lingered forever and `org_search` / the `org_brain_search` tool would still
+    // return it (leak/consent invariant). Belt-and-braces beside the `org_brain_available` gate on
+    // the retrieval seam (a purged replica is empty either way).
+    state.inner().db.purge_org_replica(&org.org_id)?;
     // Drop every cached OCK for this org.
     {
         let mut cache = state
@@ -22777,8 +23610,7 @@ pub(crate) async fn share_to_org_inner(
     };
 
     // Persist a queued row FIRST (so a crash between seal + publish is recoverable by the launch
-    // sweep). The row id doubles as the envelope's item nonce (fresh per publish).
-    let row_id = crate::share::new_share_id();
+    // sweep).
     let now = chrono::Utc::now().to_rfc3339();
     let env = crate::share::org_envelope::OrgEnvelope::new(
         kind,
@@ -22789,18 +23621,45 @@ pub(crate) async fn share_to_org_inner(
         1,
     );
     let content_sha = env.content_sha256();
-    state.db.insert_org_share(
-        &row_id,
+    // SB-3 row-amplification fix: REUSE any existing retriable (`queued`/`failed`) row for this
+    // logical share key (org + meeting-or-document) instead of minting a fresh row on every sweep
+    // attempt. Pre-fix each retry inserted a NEW row while the old survived → unbounded row growth +
+    // a duplicate publish on eventual recovery. On reuse we re-arm the SAME row (state → queued,
+    // item_id/last_error cleared, per-attempt fields refreshed); a later success flips THAT one row to
+    // uploaded. Only a truly-new share (no reusable row) inserts.
+    let row_id = match state.db.find_reusable_org_share(
         &org.org_id,
         meeting_id.as_deref(),
         document_id.as_deref(),
-        kind.as_str(),
-        Some(&title),
-        1,
-        generation,
-        &content_sha,
-        &now,
-    )?;
+    )? {
+        Some(existing) => {
+            state.db.reset_org_share_for_retry(
+                &existing.id,
+                Some(&title),
+                1,
+                generation,
+                &content_sha,
+                &now,
+            )?;
+            existing.id
+        }
+        None => {
+            let row_id = crate::share::new_share_id();
+            state.db.insert_org_share(
+                &row_id,
+                &org.org_id,
+                meeting_id.as_deref(),
+                document_id.as_deref(),
+                kind.as_str(),
+                Some(&title),
+                1,
+                generation,
+                &content_sha,
+                &now,
+            )?;
+            row_id
+        }
+    };
 
     // (5) Seal under the OCK + LOCAL OPEN-VERIFY (the egress verify-before-destroy — publish only a
     // blob we just proved we can decrypt back).
@@ -22950,9 +23809,28 @@ pub fn folder_active_shares(
     state: State<'_, AppState>,
     folder_id: String,
 ) -> Result<ActiveSharesReport, AppError> {
-    let st = state.inner();
+    folder_active_shares_inner(state.inner(), &folder_id)
+}
+
+/// Inner of [`folder_active_shares`] taking `&AppState` (unit-testable gate).
+pub(crate) fn folder_active_shares_inner(
+    st: &AppState,
+    folder_id: &str,
+) -> Result<ActiveSharesReport, AppError> {
+    // GATE (2026-07-11 audit): a sealed-and-not-session-unlocked folder surfaces NOTHING here — org
+    // shares carry plaintext `title`s (stored un-sealed), which this command returned ungated for ANY
+    // folder, leaking a locked folder's note titles. Mirror the `folder_is_unlocked` read gate: a
+    // locked-not-unlocked folder returns an empty report (the FE shows the unlock affordance, never
+    // the share list). An open / session-unlocked folder proceeds normally.
+    if !folder_is_unlocked(st, folder_id)? {
+        return Ok(ActiveSharesReport {
+            links: 0,
+            users: 0,
+            org: Vec::new(),
+        });
+    }
     let (mut links, mut users) = (0u32, 0u32);
-    for (_share_id, mode) in st.db.active_link_user_shares_for_folder(&folder_id)? {
+    for (_share_id, mode) in st.db.active_link_user_shares_for_folder(folder_id)? {
         match mode.as_str() {
             "link" => links += 1,
             "user" => users += 1,
@@ -22961,7 +23839,7 @@ pub fn folder_active_shares(
     }
     let org = st
         .db
-        .active_org_share_ids_for_folder(&folder_id)?
+        .active_org_share_ids_for_folder(folder_id)?
         .into_iter()
         .map(|(row_id, item_id, title)| OrgActiveShare {
             item_id: item_id.unwrap_or(row_id),
@@ -23095,10 +23973,10 @@ pub(crate) async fn org_sweep_pending_inner(state: &AppState) -> Result<u32, App
             )
             .await;
             if res.is_ok() {
-                // The new share created a fresh row; drop the stale queued/failed row so it doesn't
-                // re-fire. (A superseded queue entry — the retry replaced it.)
-                let now = chrono::Utc::now().to_rfc3339();
-                let _ = state.db.set_org_share_state(&row.id, "revoked", &now);
+                // SB-3: `share_to_org_inner` REUSED this same row (dedup on the logical key) and
+                // flipped it to `uploaded` on success — so there is NO stale row to revoke here (the
+                // pre-fix code minted a fresh row per attempt and revoked the old one, which is
+                // exactly the amplification we removed). Just count the advance.
                 advanced += 1;
             }
         }
