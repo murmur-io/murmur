@@ -34,35 +34,30 @@
   --warning: #b9791f;
   --warning-soft: rgba(185, 121, 31, 0.12);
   --shadow-sm: 0 1px 2px rgba(18, 18, 40, 0.10);
-  --shadow-md: 0 16px 40px rgba(18, 18, 40, 0.12);
-  --shadow-lg: 0 28px 70px rgba(18, 18, 40, 0.16);
-  --shadow-accent: 0 10px 30px rgba(110, 118, 255, 0.28);
-  /* Light aurora: FULL opacity + punchier pastels — on a near-white base the
-     glass has nothing to lens otherwise (the Apple Mail / Tahoe look is the
-     wallpaper glowing through the rail). Blobs stay on the edges. */
+  --shadow-md: 0 12px 30px rgba(18, 18, 40, 0.10);
+  --shadow-lg: 0 22px 55px rgba(18, 18, 40, 0.13);
+  --shadow-accent: 0 4px 12px rgba(110, 118, 255, 0.20);
+  /* Light aurora (QUIET GLASS): a static vignette hugging the LEFT edge only,
+     slightly punchier than dark (a near-white base gives the glass nothing to
+     lens otherwise) — the reading column stays on clean --surface-base. */
   --aurora-opacity: 1;
   --aurora-field:
-    radial-gradient(52% 44% at 10% 12%, rgba(110, 118, 255, 0.34), transparent 62%),
-    radial-gradient(40% 34% at 30% 0%, rgba(74, 196, 240, 0.26), transparent 62%),
-    radial-gradient(46% 40% at 92% 8%, rgba(157, 123, 255, 0.24), transparent 62%),
-    radial-gradient(50% 46% at 6% 88%, rgba(255, 122, 92, 0.18), transparent 62%),
-    radial-gradient(44% 40% at 88% 94%, rgba(110, 118, 255, 0.18), transparent 64%);
+    radial-gradient(48% 42% at 8% 10%, rgba(110, 118, 255, 0.24), transparent 60%),
+    radial-gradient(36% 32% at 26% 0%, rgba(74, 196, 240, 0.16), transparent 62%),
+    radial-gradient(42% 40% at 4% 90%, rgba(157, 123, 255, 0.16), transparent 62%);
   --shell-glass-bg: linear-gradient(
     160deg,
-    rgba(255, 255, 255, 0.42) 0%,
-    rgba(255, 255, 255, 0.22) 55%,
-    rgba(255, 255, 255, 0.34) 100%
+    rgba(255, 255, 255, 0.46) 0%,
+    rgba(255, 255, 255, 0.36) 55%,
+    rgba(255, 255, 255, 0.40) 100%
   );
   --shell-glass-veil: rgba(247, 247, 251, calc(0.94 * (1 - var(--glass-user-alpha))));
-  --shell-glass-border: rgba(255, 255, 255, 0.78);
-  --shell-glass-inner: inset 0 1px 0 rgba(255, 255, 255, 1),
-    inset 1px 0 0 rgba(255, 255, 255, 0.75),
-    inset -1px 0 0 rgba(255, 255, 255, 0.55),
-    inset 0 -1px 0 rgba(18, 18, 40, 0.09),
-    inset 0 18px 38px -22px rgba(255, 255, 255, 0.95);
+  --shell-glass-border: rgba(255, 255, 255, 0.65);
+  --shell-glass-inner: inset 0 1px 0 rgba(255, 255, 255, 0.95);
   --shell-active-bg: rgba(255, 255, 255, 0.92);
-  --shell-active-text: #4e56e4;
-  --shell-active-shadow: 0 1px 4px rgba(18, 18, 40, 0.14),
+  --shell-active-text: #17171f;
+  --shell-active-icon: #4e56e4;
+  --shell-active-shadow: 0 1px 3px rgba(18, 18, 40, 0.10),
     inset 0 1px 0 rgba(255, 255, 255, 1);
 }
 @media (prefers-color-scheme: light) {
@@ -91,32 +86,27 @@
     --warning: #b9791f;
     --warning-soft: rgba(185, 121, 31, 0.12);
     --shadow-sm: 0 1px 2px rgba(18, 18, 40, 0.10);
-    --shadow-md: 0 16px 40px rgba(18, 18, 40, 0.12);
-    --shadow-lg: 0 28px 70px rgba(18, 18, 40, 0.16);
-    --shadow-accent: 0 10px 30px rgba(110, 118, 255, 0.28);
+    --shadow-md: 0 12px 30px rgba(18, 18, 40, 0.10);
+    --shadow-lg: 0 22px 55px rgba(18, 18, 40, 0.13);
+    --shadow-accent: 0 4px 12px rgba(110, 118, 255, 0.20);
     --aurora-opacity: 1;
     --aurora-field:
-      radial-gradient(52% 44% at 10% 12%, rgba(110, 118, 255, 0.34), transparent 62%),
-      radial-gradient(40% 34% at 30% 0%, rgba(74, 196, 240, 0.26), transparent 62%),
-      radial-gradient(46% 40% at 92% 8%, rgba(157, 123, 255, 0.24), transparent 62%),
-      radial-gradient(50% 46% at 6% 88%, rgba(255, 122, 92, 0.18), transparent 62%),
-      radial-gradient(44% 40% at 88% 94%, rgba(110, 118, 255, 0.18), transparent 64%);
+      radial-gradient(48% 42% at 8% 10%, rgba(110, 118, 255, 0.24), transparent 60%),
+      radial-gradient(36% 32% at 26% 0%, rgba(74, 196, 240, 0.16), transparent 62%),
+      radial-gradient(42% 40% at 4% 90%, rgba(157, 123, 255, 0.16), transparent 62%);
     --shell-glass-bg: linear-gradient(
       160deg,
-      rgba(255, 255, 255, 0.42) 0%,
-      rgba(255, 255, 255, 0.22) 55%,
-      rgba(255, 255, 255, 0.34) 100%
+      rgba(255, 255, 255, 0.46) 0%,
+      rgba(255, 255, 255, 0.36) 55%,
+      rgba(255, 255, 255, 0.40) 100%
     );
     --shell-glass-veil: rgba(247, 247, 251, calc(0.94 * (1 - var(--glass-user-alpha))));
-    --shell-glass-border: rgba(255, 255, 255, 0.78);
-    --shell-glass-inner: inset 0 1px 0 rgba(255, 255, 255, 1),
-      inset 1px 0 0 rgba(255, 255, 255, 0.75),
-      inset -1px 0 0 rgba(255, 255, 255, 0.55),
-      inset 0 -1px 0 rgba(18, 18, 40, 0.09),
-      inset 0 18px 38px -22px rgba(255, 255, 255, 0.95);
+    --shell-glass-border: rgba(255, 255, 255, 0.65);
+    --shell-glass-inner: inset 0 1px 0 rgba(255, 255, 255, 0.95);
     --shell-active-bg: rgba(255, 255, 255, 0.92);
-    --shell-active-text: #4e56e4;
-    --shell-active-shadow: 0 1px 4px rgba(18, 18, 40, 0.14),
+    --shell-active-text: #17171f;
+    --shell-active-icon: #4e56e4;
+    --shell-active-shadow: 0 1px 3px rgba(18, 18, 40, 0.10),
       inset 0 1px 0 rgba(255, 255, 255, 1);
   }
 }

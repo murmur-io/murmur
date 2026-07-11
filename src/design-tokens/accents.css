@@ -1,0 +1,138 @@
+/* Design tokens — user-selectable ACCENT palettes (Settings → Appearance).
+   The default (purple) lives in colors.css as the base :root tokens; picking a
+   different accent stamps `data-accent="<id>"` on <html> (ChromeService) and
+   these blocks re-tint the accent ramp + its derived tokens. Light theme gets
+   its own soft/icon/shadow values in BOTH activation paths (explicit
+   [data-theme="light"] and System-mode `prefers-color-scheme`), mirroring
+   theme-light.css. Imported AFTER theme-light.css on purpose — a chosen accent
+   must win the --accent-soft / --shadow-accent tie against the light block. */
+
+:root {
+  /* Swatch colors for the Appearance picker (consumed by component scss). */
+  --accent-option-purple: #6e76ff;
+  --accent-option-blue: #4a9eff;
+  --accent-option-teal: #2ec8c0;
+  --accent-option-green: #3fbf6f;
+  --accent-option-orange: #ff9f43;
+  --accent-option-pink: #ff5e9c;
+}
+
+/* ── Blue ─────────────────────────────────────────────────────────────────── */
+:root[data-accent="blue"] {
+  --accent: #4a9eff;
+  --accent-hover: #6fb2ff;
+  --accent-active: #3c8ae6;
+  --accent-soft: rgba(74, 158, 255, 0.16);
+  --accent-ring: rgba(74, 158, 255, 0.5);
+  --shadow-accent: 0 4px 14px rgba(74, 158, 255, 0.22);
+  --shell-active-icon: #6fb2ff;
+}
+:root[data-accent="blue"][data-theme="light"] {
+  --accent-soft: rgba(74, 158, 255, 0.13);
+  --shadow-accent: 0 4px 12px rgba(74, 158, 255, 0.2);
+  --shell-active-icon: #3c8ae6;
+}
+@media (prefers-color-scheme: light) {
+  :root[data-accent="blue"][data-theme="system"],
+  :root[data-accent="blue"]:not([data-theme]) {
+    --accent-soft: rgba(74, 158, 255, 0.13);
+    --shadow-accent: 0 4px 12px rgba(74, 158, 255, 0.2);
+    --shell-active-icon: #3c8ae6;
+  }
+}
+
+/* ── Teal ─────────────────────────────────────────────────────────────────── */
+:root[data-accent="teal"] {
+  --accent: #2ec8c0;
+  --accent-hover: #52d6cf;
+  --accent-active: #23aaa3;
+  --accent-soft: rgba(46, 200, 192, 0.16);
+  --accent-ring: rgba(46, 200, 192, 0.5);
+  --shadow-accent: 0 4px 14px rgba(46, 200, 192, 0.22);
+  --shell-active-icon: #52d6cf;
+}
+:root[data-accent="teal"][data-theme="light"] {
+  --accent-soft: rgba(46, 200, 192, 0.13);
+  --shadow-accent: 0 4px 12px rgba(46, 200, 192, 0.2);
+  --shell-active-icon: #23aaa3;
+}
+@media (prefers-color-scheme: light) {
+  :root[data-accent="teal"][data-theme="system"],
+  :root[data-accent="teal"]:not([data-theme]) {
+    --accent-soft: rgba(46, 200, 192, 0.13);
+    --shadow-accent: 0 4px 12px rgba(46, 200, 192, 0.2);
+    --shell-active-icon: #23aaa3;
+  }
+}
+
+/* ── Green ────────────────────────────────────────────────────────────────── */
+:root[data-accent="green"] {
+  --accent: #3fbf6f;
+  --accent-hover: #63cf8c;
+  --accent-active: #2fa75d;
+  --accent-soft: rgba(63, 191, 111, 0.16);
+  --accent-ring: rgba(63, 191, 111, 0.5);
+  --shadow-accent: 0 4px 14px rgba(63, 191, 111, 0.22);
+  --shell-active-icon: #63cf8c;
+}
+:root[data-accent="green"][data-theme="light"] {
+  --accent-soft: rgba(63, 191, 111, 0.13);
+  --shadow-accent: 0 4px 12px rgba(63, 191, 111, 0.2);
+  --shell-active-icon: #2fa75d;
+}
+@media (prefers-color-scheme: light) {
+  :root[data-accent="green"][data-theme="system"],
+  :root[data-accent="green"]:not([data-theme]) {
+    --accent-soft: rgba(63, 191, 111, 0.13);
+    --shadow-accent: 0 4px 12px rgba(63, 191, 111, 0.2);
+    --shell-active-icon: #2fa75d;
+  }
+}
+
+/* ── Orange ───────────────────────────────────────────────────────────────── */
+:root[data-accent="orange"] {
+  --accent: #ff9f43;
+  --accent-hover: #ffb46b;
+  --accent-active: #e8892f;
+  --accent-soft: rgba(255, 159, 67, 0.16);
+  --accent-ring: rgba(255, 159, 67, 0.5);
+  --shadow-accent: 0 4px 14px rgba(255, 159, 67, 0.22);
+  --shell-active-icon: #ffb46b;
+}
+:root[data-accent="orange"][data-theme="light"] {
+  --accent-soft: rgba(255, 159, 67, 0.13);
+  --shadow-accent: 0 4px 12px rgba(255, 159, 67, 0.2);
+  --shell-active-icon: #e8892f;
+}
+@media (prefers-color-scheme: light) {
+  :root[data-accent="orange"][data-theme="system"],
+  :root[data-accent="orange"]:not([data-theme]) {
+    --accent-soft: rgba(255, 159, 67, 0.13);
+    --shadow-accent: 0 4px 12px rgba(255, 159, 67, 0.2);
+    --shell-active-icon: #e8892f;
+  }
+}
+
+/* ── Pink ─────────────────────────────────────────────────────────────────── */
+:root[data-accent="pink"] {
+  --accent: #ff5e9c;
+  --accent-hover: #ff7fb0;
+  --accent-active: #e64c8a;
+  --accent-soft: rgba(255, 94, 156, 0.16);
+  --accent-ring: rgba(255, 94, 156, 0.5);
+  --shadow-accent: 0 4px 14px rgba(255, 94, 156, 0.22);
+  --shell-active-icon: #ff7fb0;
+}
+:root[data-accent="pink"][data-theme="light"] {
+  --accent-soft: rgba(255, 94, 156, 0.13);
+  --shadow-accent: 0 4px 12px rgba(255, 94, 156, 0.2);
+  --shell-active-icon: #e64c8a;
+}
+@media (prefers-color-scheme: light) {
+  :root[data-accent="pink"][data-theme="system"],
+  :root[data-accent="pink"]:not([data-theme]) {
+    --accent-soft: rgba(255, 94, 156, 0.13);
+    --shadow-accent: 0 4px 12px rgba(255, 94, 156, 0.2);
+    --shell-active-icon: #e64c8a;
+  }
+}

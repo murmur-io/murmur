@@ -1,20 +1,38 @@
 <!-- Chrome is HIDDEN under any drill-down route (/settings, /library):
      each drills down to its own two-column [rail | content] layout. -->
 @if (!inDrilldown()) {
-  @if (!pillMode()) {
-    <mur-sidebar class="app-sidebar">
+  @if (!barMode()) {
+    @if (railMode()) {
+      <!-- Rail mode: the traffic lights sit ABOVE the slim rail — keep the
+           window draggable along the top edge, like pill mode does. -->
+      <div class="pill-drag" data-tauri-drag-region></div>
+    }
+    <!-- Full sidebar, or (rail collapse style) the slim icon-only variant. -->
+    <mur-sidebar class="app-sidebar" [class.is-rail]="railMode()">
       <!-- Top drag strip: reserves room for the overlay traffic lights and
            lets the user move the window. -->
       <div class="sidebar-drag" data-tauri-drag-region></div>
 
       <!-- Quick actions (Apple TV puts Search first in the rail). -->
       <div class="sidebar-quick">
-        <button type="button" class="quick-row" (click)="openSearch()">
+        <button
+          type="button"
+          class="quick-row"
+          (click)="openSearch()"
+          aria-label="Search (⌘K)"
+          [attr.title]="railMode() ? 'Search (⌘K)' : null"
+        >
           <mur-icon icon="search" />
           <span class="nav-label">Search</span>
           <mur-kbd class="quick-kbd">⌘K</mur-kbd>
         </button>
-        <button type="button" class="quick-row" (click)="newNote()">
+        <button
+          type="button"
+          class="quick-row"
+          (click)="newNote()"
+          aria-label="New note (⌘N)"
+          [attr.title]="railMode() ? 'New note (⌘N)' : null"
+        >
           <mur-icon icon="plus" />
           <span class="nav-label">New note</span>
           <mur-kbd class="quick-kbd">⌘N</mur-kbd>
@@ -22,15 +40,52 @@
       </div>
 
       <nav class="sidebar-nav" aria-label="Primary">
-        @for (item of navItems; track item.path) {
-          <a
-            [routerLink]="item.path"
-            routerLinkActive="active"
-            [attr.aria-label]="item.label"
-          >
-            <mur-icon [icon]="item.icon" />
-            <span class="nav-label">{{ item.label }}</span>
-          </a>
+        @for (group of navGroups; track group.label ?? "top") {
+          @if (group.label; as label) {
+            @if (group.collapsible) {
+              <button
+                type="button"
+                class="sidebar-group-toggle"
+                (click)="toggleInsights()"
+                [attr.aria-expanded]="insightsExpanded()"
+                [attr.aria-label]="
+                  (insightsExpanded() ? 'Collapse ' : 'Expand ') + label
+                "
+              >
+                <span class="sidebar-group-label">{{ label }}</span>
+                <svg
+                  class="group-chev"
+                  [class.open]="insightsExpanded()"
+                  viewBox="0 0 16 16"
+                  width="11"
+                  height="11"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="1.6"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  aria-hidden="true"
+                >
+                  <path d="m6 4.5 3.5 3.5L6 11.5" />
+                </svg>
+              </button>
+            } @else {
+              <span class="sidebar-group-label">{{ label }}</span>
+            }
+          }
+          @if (!group.collapsible || insightsExpanded() || railMode()) {
+            @for (item of group.items; track item.path) {
+              <a
+                [routerLink]="item.path"
+                routerLinkActive="active"
+                [attr.aria-label]="item.label"
+                [attr.title]="railMode() ? item.label : null"
+              >
+                <mur-icon [icon]="item.icon" />
+                <span class="nav-label">{{ item.label }}</span>
+              </a>
+            }
+          }
         }
       </nav>
 
@@ -71,6 +126,7 @@
           routerLink="/settings"
           routerLinkActive="active"
           aria-label="Settings"
+          [attr.title]="railMode() ? 'Settings' : null"
         >
           <mur-icon icon="settings" />
           <span class="nav-label">Settings</span>
@@ -80,11 +136,25 @@
           type="button"
           class="sidebar-collapse"
           (click)="togglePillMode()"
-          aria-label="Collapse the sidebar into the top bar"
-          title="Collapse into the top bar"
+          [attr.aria-label]="
+            railMode()
+              ? 'Expand the sidebar'
+              : collapseStyle() === 'rail'
+                ? 'Collapse the sidebar into an icon rail'
+                : 'Collapse the sidebar into the top bar'
+          "
+          [attr.title]="
+            railMode()
+              ? 'Expand sidebar'
+              : collapseStyle() === 'rail'
+                ? 'Collapse to icon rail'
+                : 'Collapse into the top bar'
+          "
         >
           <mur-icon icon="sidebar" />
-          <span class="nav-label">Collapse to bar</span>
+          <span class="nav-label">{{
+            collapseStyle() === "rail" ? "Collapse to rail" : "Collapse to bar"
+          }}</span>
         </button>
       </div>
     </mur-sidebar>
