@@ -2,11 +2,12 @@ import { test, expect } from "@playwright/test";
 import { mockNotes } from "./mock-invoke";
 
 /**
- * The note editor — loads a note via `get_note` and renders the title, body,
- * formatting toolbar and Edit/Preview toggle. Toggling to Preview renders the
- * markdown (`# Heading` → an `<h1>`). Runtime check: ZERO console/page errors.
+ * The note editor — loads a note via `get_note` and renders the title, body, and
+ * Edit/Preview toggle. Formatting now lives in a floating bubble that appears on a
+ * body selection (no persistent toolbar). Toggling to Preview renders the markdown
+ * (`# Heading` → an `<h1>`). Runtime check: ZERO console/page errors.
  */
-test("note editor loads a note, shows the toolbar, and Preview renders the heading — no console errors", async ({
+test("note editor loads a note, floats the formatting bubble on selection, and Preview renders the heading — no console errors", async ({
   page,
 }) => {
   const consoleErrors: string[] = [];
@@ -27,9 +28,19 @@ test("note editor loads a note, shows the toolbar, and Preview renders the headi
   const body = page.locator(".body-area");
   await expect(body).toHaveValue(/Some body text to select\./);
 
-  // The formatting toolbar (H1/Bold/…) is present in edit mode.
-  await expect(page.locator(".toolbar")).toBeVisible();
-  await expect(page.locator(".tool", { hasText: "H1" }).first()).toBeVisible();
+  // No persistent toolbar — formatting floats on a selection. Simulate one and
+  // assert the bubble (H1/Bold/… + Ask Brain) appears above the selected text.
+  await body.evaluate((el: HTMLTextAreaElement) => {
+    const start = el.value.indexOf("body text");
+    el.focus();
+    el.setSelectionRange(start, start + "body text".length);
+    el.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+  });
+  const bubble = page.locator("app-note-selection-toolbar");
+  await expect(bubble).toBeVisible();
+  // The button label is its text ("H1"); the descriptive "Heading 1" is its title.
+  await expect(bubble.getByRole("button", { name: "H1", exact: true })).toBeVisible();
+  await expect(bubble.getByRole("button", { name: "Ask Brain" })).toBeVisible();
 
   // The Edit/Preview segmented toggle.
   const previewBtn = page.getByRole("button", { name: "Preview", exact: true });

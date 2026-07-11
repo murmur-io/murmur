@@ -2,21 +2,22 @@ import { test, expect } from "@playwright/test";
 import { mockNotes } from "./mock-invoke";
 
 /**
- * The selection Brain-assistant popover (FP3). The editor floats the popover on a
- * NON-EMPTY body selection: `onBodySelect()` is wired to the textarea's
- * (mouseup)/(keyup)/(select) events and reads `selectionStart/End`. We simulate
- * that by focusing `.body-area`, setting a selection range, and dispatching a
- * `mouseup` — the handler then captures the text + anchor rect and shows the
- * popover.
+ * The selection Brain-assistant popover (FP3). Selecting body text now floats a
+ * FORMATTING BUBBLE (`app-note-selection-toolbar`); the Brain popover opens only
+ * when its "Ask Brain" button is pressed — the modal no longer auto-appears.
+ * `onBodySelect()` is wired to the textarea's (mouseup)/(keyup)/(select) events
+ * and reads `selectionStart/End`. We simulate that by focusing `.body-area`,
+ * setting a selection range, and dispatching a `mouseup` — the handler captures
+ * the text + anchor rect and floats the bubble; clicking "Ask Brain" mounts the
+ * popover over that same selection.
  *
  * The core assertion is the runtime-error gate (ZERO console/page errors through
- * the whole select → Refine → Accept flow) plus the popover's presence + the
- * mocked suggestion. The textarea-selection simulation is reliable in Chromium
- * (native selection API + a synthetic mouseup); if a future engine change made it
- * flaky, the fallback assertion is a clean editor render (documented inline) —
- * this spec must never be faked or deleted.
+ * the whole select → Ask Brain → Refine → Accept flow) plus the popover's presence
+ * + the mocked suggestion. The textarea-selection simulation is reliable in
+ * Chromium (native selection API + a synthetic mouseup); this spec must never be
+ * faked or deleted.
  */
-test("selecting body text floats the Refine/Shorten/Enhance popover; Refine → Accept updates the textarea — no console errors", async ({
+test("selecting body text floats the bubble; Ask Brain → Refine → Accept updates the textarea — no console errors", async ({
   page,
 }) => {
   const consoleErrors: string[] = [];
@@ -35,13 +36,21 @@ test("selecting body text floats the Refine/Shorten/Enhance popover; Refine → 
   await expect(body).toHaveValue(/Some body text to select\./);
 
   // Simulate a real body selection: focus, select the "body text" substring, then
-  // dispatch the mouseup the popover trigger listens for.
+  // dispatch the mouseup the selection trigger listens for.
   await body.evaluate((el: HTMLTextAreaElement) => {
     const start = el.value.indexOf("body text");
     el.focus();
     el.setSelectionRange(start, start + "body text".length);
     el.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
   });
+
+  // The FORMATTING BUBBLE floats first (not the Brain modal). Its "Ask Brain"
+  // button opens the popover. Use dispatchEvent("click") — a plain DOM click that
+  // doesn't disturb the live textarea selection (see the Refine note below).
+  const bubble = page.locator("app-note-selection-toolbar");
+  await expect(bubble).toBeVisible();
+  await expect(page.locator("app-note-brain-popover")).toHaveCount(0);
+  await bubble.getByRole("button", { name: "Ask Brain" }).dispatchEvent("click");
 
   const popover = page.locator("app-note-brain-popover");
   await expect(popover).toBeVisible();
@@ -61,14 +70,12 @@ test("selecting body text floats the Refine/Shorten/Enhance popover; Refine → 
   await popover.getByRole("button", { name: "Refine", exact: true }).dispatchEvent("click");
   await expect(popover.getByText("A refined version of your text.")).toBeVisible();
 
-  // Accept → the editor replaces the selection in the textarea with the suggestion.
+  // Accept → the editor replaces the selection in the textarea with the suggestion
+  // and clears the selection state, so both the popover and the bubble dismiss.
   await popover.getByRole("button", { name: "Accept", exact: true }).dispatchEvent("click");
   await expect(body).toHaveValue(/A refined version of your text\./);
-  // NOTE on post-Accept behavior (verified, by design in note-editor): the editor
-  // leaves the just-inserted suggestion SELECTED + the textarea focused, so the
-  // selection popover re-floats over the new selection (you can chain another
-  // action on the result). We therefore assert the textarea CONTENT was replaced
-  // — the load-bearing outcome — rather than a dismiss the editor doesn't do.
+  await expect(popover).toHaveCount(0);
+  await expect(bubble).toHaveCount(0);
 
   expect(consoleErrors).toEqual([]);
 });

@@ -1,0 +1,35 @@
+---
+name: murmur-learn
+description: Record one operator-observed lesson in Murmur's compounding learnings journal. Use when the user asks to record a learning or gives input like "<agent>: <lesson>" for `.codex/learnings/<agent>.md`.
+---
+
+# Murmur Learn
+
+Record a learning in the compounding-lessons loop. The expected input is:
+
+```text
+<agent>: <lesson text>
+```
+
+Valid agents are the files in `.codex/learnings/`: `angular-zoneless-dev`,
+`rust-tauri-dev`, `adversarial-verifier`, `lock-security-reviewer`,
+`release-engineer`, and `murmur-researcher`.
+
+## Steps
+
+1. Parse `<agent>` before the first `:` and `<lesson>` after it. If the agent is unknown, list valid agents and stop.
+2. Open `.codex/learnings/<agent>.md`.
+3. Insert a new entry at the top of `## Run journal`:
+
+   ```markdown
+   ### [<today> operator] <one-line title derived from the lesson>
+   - **Pattern:** <what happens / the failure mode, in the operator's words>
+   - **Caught by:** operator
+   - **Lesson:** <the imperative to apply next time>
+   - **Status:** journal
+   ```
+
+4. Use `date +%F` for `<today>`.
+5. Do not touch `## Recurring patterns`; promotion belongs to `murmur-curate-learnings`.
+6. If the journal exceeds about 50 entries, drop the oldest `journal` entries only. Never drop `distilled` or `success-pattern` entries.
+7. Confirm the one-line title added; do not restate the full file.

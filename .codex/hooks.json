@@ -1,0 +1,29 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "^Bash$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$(git rev-parse --show-toplevel)/.codex/hooks/block-bash.sh\"",
+            "timeout": 30,
+            "statusMessage": "Checking Bash guardrails"
+          },
+          {
+            "type": "command",
+            "command": "bash \"$(git rev-parse --show-toplevel)/.codex/hooks/secret-scan.sh\"",
+            "timeout": 30,
+            "statusMessage": "Scanning staged secrets"
+          },
+          {
+            "type": "command",
+            "command": "bash \"$(git rev-parse --show-toplevel)/.codex/hooks/finish-guard.sh\"",
+            "timeout": 30,
+            "statusMessage": "Checking task verification gates"
+          }
+        ]
+      }
+    ]
+  }
+}
