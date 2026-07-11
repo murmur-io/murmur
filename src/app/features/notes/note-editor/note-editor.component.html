@@ -381,31 +381,9 @@
             }
           </div>
 
-          <!-- Formatting toolbar (sticky) — hidden in preview. -->
-          @if (!preview()) {
-            <div class="toolbar" role="toolbar" aria-label="Formatting">
-              <button type="button" class="tool" title="Heading 1" (click)="format('h1')">H1</button>
-              <button type="button" class="tool" title="Heading 2" (click)="format('h2')">H2</button>
-              <button type="button" class="tool" title="Heading 3" (click)="format('h3')">H3</button>
-              <span class="tool-sep"></span>
-              <button type="button" class="tool" title="Bold (⌘B)" (click)="format('bold')"><b>B</b></button>
-              <button type="button" class="tool" title="Italic (⌘I)" (click)="format('italic')"><i>I</i></button>
-              <button type="button" class="tool" title="Strikethrough" (click)="format('strike')"><s>S</s></button>
-              <button type="button" class="tool" title="Inline code" (click)="format('code')">&lt;/&gt;</button>
-              <span class="tool-sep"></span>
-              <button type="button" class="tool" title="Bullet list" (click)="format('ul')">•</button>
-              <button type="button" class="tool" title="Numbered list" (click)="format('ol')">1.</button>
-              <button type="button" class="tool" title="Checklist" (click)="format('check')">☐</button>
-              <button type="button" class="tool" title="Quote" (click)="format('quote')">❝</button>
-              <button type="button" class="tool" title="Code block" (click)="format('codeblock')">▤</button>
-              <span class="tool-sep"></span>
-              <button type="button" class="tool" title="Link" (click)="format('link')">🔗</button>
-              <button type="button" class="tool" title="Wikilink" (click)="format('wikilink')">[[ ]]</button>
-              <button type="button" class="tool" title="Divider" (click)="format('divider')">—</button>
-            </div>
-          }
-
-          <!-- Body: preview (cached computed) OR the source-of-truth textarea. -->
+          <!-- Body: preview (cached computed) OR the source-of-truth textarea.
+               Formatting lives in the floating bubble on selection (below) +
+               ⌘B/⌘I shortcuts + the `/` slash menu — no persistent toolbar. -->
           @if (preview()) {
             <div class="note-preview">
               <app-markdown [markdown]="previewMarkdown()" />
@@ -457,16 +435,28 @@
     }
   </div>
 
-  <!-- ===== Selection Brain popover (FP3) ===== -->
-  @if (popoverSel(); as sel) {
+  <!-- ===== Selection formatting bubble + Brain popover (FP3) =====
+       On a body selection the bubble floats above it (formatting + Ask Brain).
+       Pressing Ask Brain flips `brainOpen` → the Brain popover mounts over the
+       SAME selection; the modal no longer auto-appears on select. -->
+  @if (sel(); as s) {
     @if (note(); as doc) {
-      <app-note-brain-popover
-        [noteId]="doc.id"
-        [selection]="sel"
-        [toggles]="assistToggles()"
-        (accepted)="applyEdit($event)"
-        (dismiss)="closePopover()"
-      />
+      @if (brainOpen()) {
+        <app-note-brain-popover
+          [noteId]="doc.id"
+          [selection]="s"
+          [toggles]="assistToggles()"
+          (accepted)="applyEdit($event)"
+          (dismiss)="closePopover()"
+        />
+      } @else {
+        <app-note-selection-toolbar
+          [selection]="s"
+          [showAi]="anyAssistEnabled()"
+          (format)="onToolbarFormat($event)"
+          (askBrain)="openBrain()"
+        />
+      }
     }
   }
 

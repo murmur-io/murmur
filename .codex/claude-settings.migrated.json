@@ -1,0 +1,38 @@
+{
+  "env": {
+    "MURMUR_FINISH_GUARD": "advisory",
+    "MURMUR_AUTOFMT": "0"
+  },
+  "permissions": {
+    "deny": [
+      "Read(~/.ssh/**)",
+      "Read(~/.aws/**)",
+      "Read(~/.gnupg/**)",
+      "Read(**/*.pem)",
+      "Read(**/*.p12)",
+      "Read(**/id_rsa)",
+      "Read(**/id_ed25519)",
+      "Read(~/Library/Application Support/MeetNotes/**)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          { "type": "command", "command": "\"$CLAUDE_PROJECT_DIR/.codex/hooks/block-bash.sh\"" },
+          { "type": "command", "command": "\"$CLAUDE_PROJECT_DIR/.codex/hooks/secret-scan.sh\"" },
+          { "type": "command", "command": "\"$CLAUDE_PROJECT_DIR/.codex/hooks/finish-guard.sh\"" }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          { "type": "command", "command": "\"$CLAUDE_PROJECT_DIR/.codex/hooks/autoformat.sh\"" }
+        ]
+      }
+    ]
+  }
+}
