@@ -1755,7 +1755,8 @@ export interface NoteAssistRequest {
  * note/meeting.
  */
 export interface NoteCitation {
-  kind: "meeting" | "note" | "person" | "entity";
+  kind: "meeting" | "note" | "person" | "entity" | "org";
+  /** For `kind === "org"` this is the org item id, routed to `/org-item/:id` — never a local id. */
   id: string;
   title: string;
   snippet: string;
