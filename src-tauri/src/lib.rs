@@ -478,10 +478,24 @@ pub fn run() {
                     if !semantic_enabled || !crate::embed::embed_model_present() {
                         return;
                     }
+                    // 2026-07-13 launch-freeze incident: on a RAM-starved machine, defer the whole
+                    // backfill (incl. the lazy Candle/Metal embedder load) rather than starting it
+                    // at launch — it is content-hash idempotent, so a later, healthier launch just
+                    // picks up where this one left off.
+                    if !crate::transcribe::model::topic_backfill_ram_permits_now() {
+                        tracing::info!(target: "rag", "topic-chunk backfill skipped: low system RAM");
+                        return;
+                    }
+                    let started = std::time::Instant::now();
                     let embedder = crate::embed::active_embedder();
                     match db.backfill_topic_chunks_idempotent(embedder.as_ref()) {
                         Ok(indexed) if indexed > 0 => {
-                            tracing::info!(target: "rag", indexed, "topic-chunk backfill complete");
+                            tracing::info!(
+                                target: "rag",
+                                indexed,
+                                elapsed_ms = started.elapsed().as_millis() as u64,
+                                "topic-chunk backfill complete"
+                            );
                         }
                         Ok(_) => {}
                         Err(e) => {
