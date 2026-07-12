@@ -1479,12 +1479,21 @@ pub fn get_last_note(state: State<'_, AppState>) -> Result<Option<NoteDto>, AppE
 /// failure NEVER fails the save (`let _ = …`); the launch sweep retries a `failed` row.
 #[tauri::command]
 pub async fn update_note(
+    app: AppHandle,
     state: State<'_, AppState>,
     meeting_id: String,
     markdown: String,
 ) -> Result<NoteDto, AppError> {
     let dto = update_note_inner(state.inner(), &meeting_id, &markdown)?;
-    let _ = republish_org_shares_for_source(state.inner(), Some(&meeting_id), None).await;
+    // If the edit re-published ≥1 org copy, ping open org views (Notes list + Settings) so the fresh
+    // title/body shows without a manual "Sync now". Best-effort — a republish failure never fails the save.
+    if republish_org_shares_for_source(state.inner(), Some(&meeting_id), None)
+        .await
+        .unwrap_or(0)
+        > 0
+    {
+        crate::events::emit_org_feed_updated(&app, 1);
+    }
     Ok(dto)
 }
 
@@ -2472,13 +2481,21 @@ pub(crate) fn list_notes_inner(
 /// `save_note_text` autosave (OCK-seal + egress per keystroke is unacceptable) — only this commit path.
 #[tauri::command]
 pub async fn update_note_doc(
+    app: AppHandle,
     state: State<'_, AppState>,
     id: String,
     title: String,
     markdown: String,
 ) -> Result<NoteDoc, AppError> {
     let doc = update_note_doc_inner(state.inner(), &id, &title, &markdown)?;
-    let _ = republish_org_shares_for_source(state.inner(), None, Some(&id)).await;
+    // See `update_note`: ping open org views when the edit re-published ≥1 org copy. Best-effort.
+    if republish_org_shares_for_source(state.inner(), None, Some(&id))
+        .await
+        .unwrap_or(0)
+        > 0
+    {
+        crate::events::emit_org_feed_updated(&app, 1);
+    }
     Ok(doc)
 }
 
@@ -8340,8 +8357,15 @@ pub async fn resummarize(
     }
     let result = pipeline::resummarize_existing(&app, &state, &meeting_id).await?;
     // COMMIT BOUNDARY: a re-summarize rewrites the meeting's note → BEST-EFFORT re-publish any org
-    // shares of it so members see the fresh summary. Best-effort — never fails the re-summarize.
-    let _ = republish_org_shares_for_source(state.inner(), Some(&meeting_id), None).await;
+    // shares of it so members see the fresh summary. Best-effort — never fails the re-summarize. If
+    // ≥1 org copy was re-published, ping open org views so the fresh summary shows without a manual sync.
+    if republish_org_shares_for_source(state.inner(), Some(&meeting_id), None)
+        .await
+        .unwrap_or(0)
+        > 0
+    {
+        crate::events::emit_org_feed_updated(&app, 1);
+    }
     Ok(StopResult {
         meeting_id: result.meeting_id,
         markdown: result.note_markdown,
@@ -24319,6 +24343,54 @@ mod lifecycle_tests {
         );
     }
 
+    /// B1 (owner-live-refresh) — the OWNER's OWN first-time share must appear in `list_org_items`
+    /// IMMEDIATELY via the local `org_items` replica, not only after a later feed pull. RED before the
+    /// fix (`publish_org_body` published to the server but never upserted the local row → the shared
+    /// note was invisible in the Notes org view / Settings browse until a manual "Sync now"); GREEN
+    /// after: one owned/editable card resolves right away carrying the note's CURRENT title.
+    #[test]
+    fn initial_share_populates_local_org_items_replica_immediately() {
+        let mock = MockOrgServer::start();
+        let state = build_state("org-initial-share-replica");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        make_open_folder(&state.db, "f-sh", "Team");
+        state
+            .db
+            .insert_note("n-sh", "f-sh", "plan", "Kickoff Plan", "# body to share", 1)
+            .unwrap();
+
+        state.config.lock().unwrap().org_egress_consented = true;
+        state.config.lock().unwrap().share_base_url = mock.base.clone();
+        seed_live_session(&state);
+        seed_ock(&state, "org-1", 1);
+
+        let entry = block_on(share_to_org_inner(
+            &state,
+            "org-1",
+            None,
+            Some("n-sh".to_string()),
+            true,
+        ))
+        .expect("initial share should publish against the mock server");
+        assert_eq!(entry.item_id.as_deref(), Some("item-1"));
+
+        // The local replica must ALREADY hold the item — no feed pull has happened. This is exactly what
+        // makes the shared note show up without a manual "Sync now".
+        let items = list_org_items_inner(&state, "org-1").unwrap();
+        assert_eq!(
+            items.len(),
+            1,
+            "the owner's own share is in the local replica immediately (no pull needed)"
+        );
+        assert_eq!(items[0].item_id, "item-1");
+        // The caller authored it → resolved as an OWNED/editable card with the note's CURRENT title.
+        assert!(
+            items[0].owned_source.is_some(),
+            "the author's own item resolves to an owned/editable source"
+        );
+        assert_eq!(items[0].title, "Kickoff Plan");
+    }
+
     /// ITEM 1 — a republish MUST NOT tombstone-into-nothing. Lock the note's folder AFTER the share,
     /// then edit (the write itself is gated, but even the republish read-gate refuses): the org copy is
     /// left UNTOUCHED — no new publish, NO tombstone. Proves the `Locked` skip protects the org copy.
@@ -26026,23 +26098,35 @@ pub(crate) fn preview_org_share_inner(
 /// misroute that shared into the FIRST org, not the chosen one.
 #[tauri::command]
 pub async fn share_meeting_to_org(
+    app: AppHandle,
     state: State<'_, AppState>,
     org_id: String,
     meeting_id: String,
     scrub: bool,
 ) -> Result<OrgShareEntry, AppError> {
-    share_to_org_inner(state.inner(), &org_id, Some(meeting_id), None, scrub).await
+    let entry = share_to_org_inner(state.inner(), &org_id, Some(meeting_id), None, scrub).await?;
+    // A successful share now lives in the local replica (`publish_org_body` upserts it) AND the server
+    // feed — ping every open org view (Notes list + Settings shared-brain) to re-fetch immediately, so
+    // the shared note appears without a manual "Sync now". Content-free count-only event; a best-effort
+    // emit never affects the share result.
+    crate::events::emit_org_feed_updated(&app, 1);
+    Ok(entry)
 }
 
 /// `share_document_to_org(org_id, document_id, scrub)` — the note twin of [`share_meeting_to_org`].
 #[tauri::command]
 pub async fn share_document_to_org(
+    app: AppHandle,
     state: State<'_, AppState>,
     org_id: String,
     document_id: String,
     scrub: bool,
 ) -> Result<OrgShareEntry, AppError> {
-    share_to_org_inner(state.inner(), &org_id, None, Some(document_id), scrub).await
+    let entry = share_to_org_inner(state.inner(), &org_id, None, Some(document_id), scrub).await?;
+    // See `share_meeting_to_org`: ping open org views so the freshly-shared note appears without a
+    // manual "Sync now". Content-free; best-effort.
+    crate::events::emit_org_feed_updated(&app, 1);
+    Ok(entry)
 }
 
 pub(crate) async fn share_to_org_inner(
@@ -26287,6 +26371,29 @@ pub(crate) async fn publish_org_body(
         .db
         .set_org_share_uploaded(&row_id, &published.item_id, &now)?;
 
+    // LOCAL REPLICA CONSISTENCY (owner-live-refresh): the author's OWN `org_items` replica would
+    // otherwise stay EMPTY of this item until the next feed pull — so a note the owner just shared is
+    // invisible in `list_org_items` (the Notes org view + Settings browse) until a manual "Sync now".
+    // Upsert it LOCALLY now, mirroring the republish path, so `list_org_items` immediately resolves it
+    // as an owned/editable card. FTS-only (`None` embedder) to keep this share path light; the next real
+    // `org_sync_now` re-ingests authoritatively (idempotent upsert) and re-embeds. Best-effort: a local
+    // replica error must never fail the share (the server copy is already live + correct).
+    if let Err(e) = state.db.upsert_org_item(
+        &published.item_id,
+        &org.org_id,
+        published.seq,
+        &env.author_hint,
+        &env.title,
+        &env.markdown,
+        &env.created_at,
+        rev,
+        generation,
+        &content_sha,
+        None,
+    ) {
+        tracing::warn!(target: "org", error = %e, "share: local replica upsert failed (server copy live)");
+    }
+
     // (7) CONTENT-FREE egress ledger (host + ciphertext byte size). NEVER a title / note text / OCK.
     crate::share::ledger_row(
         &state.db,
@@ -26333,7 +26440,7 @@ pub(crate) async fn republish_org_shares_for_source(
     state: &AppState,
     meeting_id: Option<&str>,
     document_id: Option<&str>,
-) -> Result<(), AppError> {
+) -> Result<u32, AppError> {
     // DEDUP FIRST (auto-clean, user-opted-in): collapse any accidental duplicate live items for this
     // source — PER ORG — down to the earliest BEFORE republishing. Otherwise we'd republish (and keep
     // alive) every duplicate; the survivor is what the edit then supersedes. Best-effort — a tombstone
@@ -26356,8 +26463,12 @@ pub(crate) async fn republish_org_shares_for_source(
 
     let rows = state.db.org_shares_for_source(meeting_id, document_id)?;
     if rows.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
+    // Count of rows that produced a NEW published rev this call — returned so the caller can emit
+    // `org-feed-updated` ONLY when > 0 (a save that changed nothing / skipped every row must not ping
+    // the FE).
+    let mut republished = 0u32;
     let now = chrono::Utc::now().to_rfc3339();
     for row in rows {
         // Re-read the CURRENT plaintext THROUGH the read-gate. `build_org_share_body` also does the
@@ -26574,8 +26685,10 @@ pub(crate) async fn republish_org_shares_for_source(
                 }
             }
         }
+        // This row published a NEW rev this call — count it so the caller emits `org-feed-updated`.
+        republished += 1;
     }
-    Ok(())
+    Ok(republished)
 }
 
 /// `list_org_shares()` — the caller's outbound org shares (local rows; titles render only to the
@@ -26806,8 +26919,11 @@ pub async fn revoke_shares_for_folder(
 /// Cadence of the background org-feed sync loop (M6 Shared Brain, spawned in `lib.rs` setup). The
 /// first tick fires `ORG_SYNC_FIRST_DELAY_SECS` after launch (no startup contention); subsequent
 /// ticks every `ORG_SYNC_TICK_SECS`. Every tick is a cheap no-op while logged out / no org joined.
+/// 60s (not 120s) so a member — who has no server push, only this pull — sees a colleague's newly
+/// shared/edited note within ~1 min without a manual "Sync now"; the owner's own shares refresh
+/// instantly via the `org-feed-updated` emit on the share/edit commands.
 pub const ORG_SYNC_FIRST_DELAY_SECS: u64 = 20;
-pub const ORG_SYNC_TICK_SECS: u64 = 120;
+pub const ORG_SYNC_TICK_SECS: u64 = 60;
 
 /// One background org-sync tick: drain the outbound share queue, then pull + ingest the inbound feed
 /// into the local int8 partition. This is what makes the org brain a REPLICATED brain — every
