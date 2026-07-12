@@ -132,6 +132,15 @@ export class BrainEnableCardComponent {
         const heavy = this.store.brainModels().find((m) => m.selectedHeavy);
         if (!heavy) throw new Error("no on-device model available");
         await this.store.downloadBrainModel(heavy.id);
+        // Downloading the GGUF is not the same as SELECTING it: `brain_model_present`
+        // resolves via the persisted `brain_model_id`, which download alone never
+        // writes — a fresh install with no prior selection would download the file
+        // successfully and then still report it "missing" forever (until something
+        // else, e.g. a posture preset, happened to set the id). "Enable the brain"
+        // means both fetch AND activate, so select explicitly here.
+        if (this.store.brainError() === null) {
+          await this.ipc.selectBrainModel(heavy.id);
+        }
       }
       if (this.embedPresent() !== true) {
         this.stage.set("embed");
