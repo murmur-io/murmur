@@ -1,261 +1,7 @@
 <section class="notes">
-  <!-- ============ LEFT PANE — note-folder rail (lean list) ============ -->
-  <mur-sidebar class="folders-pane" aria-label="Note folders">
-    <!-- Drag strip mirrors the primary rail so the overlay traffic lights
-         stay clear of the Back button when the rail is flush to the edge. -->
-    <div class="rail-drag" data-tauri-drag-region></div>
-
-    <!-- Drill-down "up": returns to the last non-drill-down route (or /record). -->
-    <button
-      type="button"
-      class="rail-back"
-      (click)="nav.back()"
-      aria-label="Back to Murmur"
-    >
-      <svg
-        class="rail-back-icon"
-        viewBox="0 0 16 16"
-        fill="none"
-        stroke="currentColor"
-        stroke-width="1.6"
-        stroke-linecap="round"
-        stroke-linejoin="round"
-        aria-hidden="true"
-      >
-        <path d="M9.5 3.5 5 8l4.5 4.5" />
-      </svg>
-      <span class="rail-back-label">Murmur</span>
-    </button>
-
-    <div class="folders-head">
-      <h3 class="folders-title">Notes</h3>
-      <button
-        type="button"
-        class="folder-add"
-        (click)="startCreateFolder()"
-        aria-label="New folder"
-        title="New folder"
-      >
-        <svg viewBox="0 0 16 16" width="14" height="14" fill="none" aria-hidden="true">
-          <path d="M8 3.5v9M3.5 8h9" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
-        </svg>
-      </button>
-    </div>
-
-    <nav class="folders-body" aria-label="Note folders">
-      <button
-        type="button"
-        class="folder-row"
-        [class.is-selected]="activeFolderId() === null"
-        [attr.aria-pressed]="activeFolderId() === null"
-        (click)="selectFolder(null)"
-      >
-        <span class="folder-icon" aria-hidden="true">
-          <svg viewBox="0 0 16 16" width="15" height="15" fill="none">
-            <path
-              d="M1.75 4.25c0-.7.55-1.25 1.25-1.25h2.8c.4 0 .77.18 1 .5l.6.75h4.6c.7 0 1.25.55 1.25 1.25v5.5c0 .7-.55 1.25-1.25 1.25H3c-.7 0-1.25-.55-1.25-1.25z"
-              stroke="currentColor"
-              stroke-width="1.3"
-              stroke-linejoin="round"
-            />
-            <path
-              d="M4.4 9.4h7.2"
-              stroke="currentColor"
-              stroke-width="1.3"
-              stroke-linecap="round"
-              opacity="0.55"
-            />
-          </svg>
-        </span>
-        <span class="folder-name">All notes</span>
-      </button>
-
-      @for (folder of noteFolders(); track folder.id) {
-        @if (renamingId() === folder.id) {
-          <!-- Inline rename field. -->
-          <form class="folder-edit" (submit)="confirmRename(folder.id, $event)">
-            <input
-              class="folder-edit-input"
-              type="text"
-              [value]="renameDraft()"
-              (input)="renameDraft.set($any($event.target).value)"
-              [attr.aria-label]="'Rename folder ' + folder.name"
-              autocomplete="off"
-            />
-            <div class="folder-edit-actions">
-              <button type="submit" class="btn btn-primary btn-tiny" [disabled]="folderBusy()">Save</button>
-              <button type="button" class="btn btn-ghost btn-tiny" (click)="cancelFolderEdits()">Cancel</button>
-            </div>
-          </form>
-        } @else if (pendingDeleteId() === folder.id) {
-          <!-- Inline delete confirm. -->
-          <div class="folder-confirm">
-            <span class="folder-confirm-copy text-secondary">
-              Delete “{{ folder.name }}”? Its notes move to your default folder.
-            </span>
-            <div class="folder-edit-actions">
-              <button
-                type="button"
-                class="btn btn-danger btn-tiny"
-                [disabled]="folderBusy()"
-                (click)="confirmDeleteFolder(folder.id)"
-              >
-                Delete
-              </button>
-              <button type="button" class="btn btn-ghost btn-tiny" (click)="cancelFolderEdits()">Cancel</button>
-            </div>
-          </div>
-        } @else {
-          <div
-            class="folder-row folder-row--managed"
-            [class.is-selected]="activeFolderId() === folder.id"
-          >
-            <button
-              type="button"
-              class="folder-select"
-              [attr.aria-pressed]="activeFolderId() === folder.id"
-              (click)="selectFolder(folder.id)"
-            >
-              <span class="folder-icon" aria-hidden="true">
-                @if (folder.locked) {
-                  <svg viewBox="0 0 16 16" width="14" height="14" fill="none">
-                    <rect x="3.5" y="7" width="9" height="6" rx="1.4" stroke="currentColor" stroke-width="1.3" />
-                    <path d="M5.5 7V5.4a2.5 2.5 0 0 1 5 0V7" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
-                  </svg>
-                } @else {
-                  <svg viewBox="0 0 16 16" width="15" height="15" fill="none">
-                    <path
-                      d="M1.75 4.25c0-.7.55-1.25 1.25-1.25h2.8c.4 0 .77.18 1 .5l.6.75h4.6c.7 0 1.25.55 1.25 1.25v5.5c0 .7-.55 1.25-1.25 1.25H3c-.7 0-1.25-.55-1.25-1.25z"
-                      stroke="currentColor"
-                      stroke-width="1.3"
-                      stroke-linejoin="round"
-                    />
-                  </svg>
-                }
-              </span>
-              <span class="folder-name">{{ folder.name }}</span>
-              @if (folder.locked) {
-                <span class="pill is-warning folder-lock-badge" title="Locked">Locked</span>
-              }
-            </button>
-
-            <!-- Per-folder actions: lock/unlock · rename · delete. -->
-            <div class="folder-actions">
-              @if (folder.locked) {
-                <button
-                  type="button"
-                  class="folder-act"
-                  [disabled]="lockBusyId() === folder.id"
-                  (click)="unlockFolder(folder, $event)"
-                  aria-label="Unlock folder"
-                  title="Unlock"
-                >
-                  <svg viewBox="0 0 16 16" width="13" height="13" fill="none" aria-hidden="true">
-                    <rect x="3.5" y="7" width="9" height="6" rx="1.4" stroke="currentColor" stroke-width="1.3" />
-                    <path d="M5.5 7V5.4a2.5 2.5 0 0 1 4.6-0.9" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
-                  </svg>
-                </button>
-              } @else {
-                <button
-                  type="button"
-                  class="folder-act"
-                  [disabled]="lockBusyId() === folder.id"
-                  (click)="lockFolder(folder, $event)"
-                  aria-label="Lock folder"
-                  title="Lock"
-                >
-                  <svg viewBox="0 0 16 16" width="13" height="13" fill="none" aria-hidden="true">
-                    <rect x="3.5" y="7" width="9" height="6" rx="1.4" stroke="currentColor" stroke-width="1.3" />
-                    <path d="M5.5 7V5.4a2.5 2.5 0 0 1 5 0V7" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
-                  </svg>
-                </button>
-              }
-              <button
-                type="button"
-                class="folder-act"
-                (click)="startRename(folder, $event)"
-                aria-label="Rename folder"
-                title="Rename"
-              >
-                <svg viewBox="0 0 16 16" width="13" height="13" fill="none" aria-hidden="true">
-                  <path d="M11 2.7l2.3 2.3-7.4 7.4-2.8.6.6-2.8z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" />
-                </svg>
-              </button>
-              <button
-                type="button"
-                class="folder-act folder-act--danger"
-                (click)="askDeleteFolder(folder, $event)"
-                aria-label="Delete folder"
-                title="Delete"
-              >
-                <svg viewBox="0 0 16 16" width="13" height="13" fill="none" aria-hidden="true">
-                  <path d="M4 4.5h8M6.5 4.5V3.2h3v1.3M5 4.5l.5 8h5l.5-8" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" />
-                </svg>
-              </button>
-            </div>
-          </div>
-        }
-      }
-
-      <!-- Inline "New folder" create field. -->
-      @if (creatingFolder()) {
-        <form class="folder-edit" (submit)="confirmCreateFolder($event)">
-          <input
-            #folderInput
-            class="folder-edit-input"
-            type="text"
-            [value]="folderDraft()"
-            (input)="folderDraft.set($any($event.target).value)"
-            placeholder="Folder name"
-            aria-label="New folder name"
-            autocomplete="off"
-          />
-          <div class="folder-edit-actions">
-            <button type="submit" class="btn btn-primary btn-tiny" [disabled]="folderBusy()">Create</button>
-            <button type="button" class="btn btn-ghost btn-tiny" (click)="cancelFolderEdits()">Cancel</button>
-          </div>
-        </form>
-      }
-    </nav>
-
-    <!-- ===== Shared brains (orgs) — read-only replicated org notes ===== -->
-    @if (orgs().length > 0 || orgsLoading()) {
-      <div class="folders-head org-head">
-        <h3 class="folders-title">Shared brains</h3>
-        @if (orgsLoading()) {
-          <mur-spinner [size]="12" class="org-head-spinner" />
-        }
-      </div>
-      <nav class="folders-body org-body" aria-label="Shared brains">
-        @for (org of orgs(); track org.orgId) {
-          <button
-            type="button"
-            class="folder-row org-row"
-            [class.is-selected]="activeOrgId() === org.orgId"
-            [attr.aria-pressed]="activeOrgId() === org.orgId"
-            (click)="selectOrg(org.orgId)"
-          >
-            <span class="folder-icon" aria-hidden="true">
-              <svg viewBox="0 0 16 16" width="15" height="15" fill="none">
-                <circle cx="5" cy="6" r="2" stroke="currentColor" stroke-width="1.3" />
-                <circle cx="11" cy="6" r="2" stroke="currentColor" stroke-width="1.3" />
-                <path
-                  d="M2 13c0-1.8 1.3-3 3-3s3 1.2 3 3M8 13c0-1.8 1.3-3 3-3s3 1.2 3 3"
-                  stroke="currentColor"
-                  stroke-width="1.3"
-                  stroke-linecap="round"
-                />
-              </svg>
-            </span>
-            <span class="folder-name">{{ org.name }}</span>
-            <span class="pill org-role" [title]="orgRoleLabel(org)">{{ orgRoleLabel(org) }}</span>
-          </button>
-        }
-      </nav>
-    }
-  </mur-sidebar>
-
-  <!-- ============ RIGHT PANE — note list ============ -->
+  <!-- The note-folder tree now lives in the ALWAYS-VISIBLE main sidebar
+       (NotesSidebarTreeComponent, nested under "Notes" — see AppShellComponent).
+       This view is pure in-flow content beside it, like /record. -->
   <div class="notes-content">
     <header class="content-head">
       <h2 class="content-title">{{ listHeading() }}</h2>
@@ -290,6 +36,40 @@
         </button>
       </div>
     </header>
+
+    <!-- ===== Shared brains (orgs) — read-only replicated org notes =====
+         A content-pane chip row (orgs aren't note-folders, so they don't live
+         in the sidebar's folder tree). Picking a chip scopes the list to that
+         org's shared items only; picking it again returns to the note-folder
+         scope. -->
+    @if (orgs().length > 0 || orgsLoading()) {
+      <div class="org-chip-row" role="group" aria-label="Shared brains">
+        @for (org of orgs(); track org.orgId) {
+          <button
+            type="button"
+            class="pill org-chip"
+            [class.is-selected]="activeOrgId() === org.orgId"
+            [attr.aria-pressed]="activeOrgId() === org.orgId"
+            (click)="activeOrgId() === org.orgId ? clearOrg() : selectOrg(org.orgId)"
+          >
+            <svg viewBox="0 0 16 16" width="13" height="13" fill="none" aria-hidden="true">
+              <circle cx="5" cy="6" r="1.8" stroke="currentColor" stroke-width="1.2" />
+              <circle cx="11" cy="6" r="1.8" stroke="currentColor" stroke-width="1.2" />
+              <path
+                d="M2.3 12.5c0-1.6 1.2-2.7 2.7-2.7s2.7 1.1 2.7 2.7M8.3 12.5c0-1.6 1.2-2.7 2.7-2.7s2.7 1.1 2.7 2.7"
+                stroke="currentColor"
+                stroke-width="1.2"
+                stroke-linecap="round"
+              />
+            </svg>
+            {{ org.name }}
+          </button>
+        }
+        @if (orgsLoading()) {
+          <mur-spinner [size]="12" class="org-chip-spinner" />
+        }
+      </div>
+    }
 
     <div class="content-body">
       @if (activeFolderLocked()) {
@@ -344,131 +124,132 @@
           </div>
         }
       } @else {
-        <ul class="note-list">
-          @for (it of listItems(); track it.id) {
-            <li class="note-item">
-              @switch (it.kind) {
+        <!-- Notion/database-style TABLE (2026-07-12: replaced the card grid,
+             then extracted into <mur-table> — a real Design System component,
+             §6b — so row-height consistency (fix 2026-07-12) is enforced BY
+             the component, not something every consumer has to remember).
+             Spans the FULL available content width (`.app-main` is uncapped
+             on every main route now — styles.css) instead of a narrow
+             reading column: this view is a dense list to scan, not
+             prose. -->
+        <mur-table [rows]="listItems()" [trackBy]="trackByItemId" [rowClass]="rowClassFor">
+          <mur-table-column key="title" header="Title">
+            <ng-template let-row>
+              @switch (row.kind) {
                 @case ("note") {
-                  <div
-                    class="card note-card"
-                    [class.is-locked]="it.note.locked"
-                    [class.menu-open]="movePopoverId() === it.note.id"
+                  <button
+                    type="button"
+                    class="title-btn"
+                    (click)="openNote(row.note.id, row.note.locked, row.note.title)"
                   >
-                    <button
-                      type="button"
-                      class="note-open"
-                      (click)="openNote(it.note.id, it.note.locked)"
-                    >
-                      <div class="note-card-head">
-                        <span class="note-title">
-                          @if (it.note.locked) {
-                            <svg class="note-lock" viewBox="0 0 16 16" width="13" height="13" fill="none" aria-hidden="true">
-                              <rect x="3.5" y="7" width="9" height="6" rx="1.4" stroke="currentColor" stroke-width="1.3" />
-                              <path d="M5.5 7V5.4a2.5 2.5 0 0 1 5 0V7" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
-                            </svg>
-                          }
-                          {{ it.note.title }}
-                        </span>
-                        @if (it.note.shared) {
-                          <span class="pill is-accent note-shared" title="Shared">Shared</span>
-                        }
-                      </div>
-
-                      @if (it.note.snippet) {
-                        <p class="note-snippet">{{ it.note.snippet }}</p>
-                      }
-
-                      <div class="note-card-foot">
-                        @if (it.note.tags.length > 0) {
-                          <span class="note-tags">
-                            @for (tag of it.note.tags; track tag) {
-                              <span class="pill note-tag">{{ tag }}</span>
-                            }
-                          </span>
-                        }
-                        <span class="note-date">{{ formatDate(it.note.updatedAt) }}</span>
-                      </div>
-                    </button>
-
-                    <!-- Per-note "Move to…" affordance (hidden for masked rows). -->
-                    @if (!it.note.locked) {
-                      <div class="note-move">
-                        <button
-                          type="button"
-                          class="note-move-btn"
-                          [attr.aria-expanded]="movePopoverId() === it.note.id"
-                          aria-label="Move note to a folder"
-                          title="Move to…"
-                          (click)="toggleMovePopover(it.note.id, $event)"
-                        >
-                          <svg viewBox="0 0 16 16" width="16" height="16" fill="none" aria-hidden="true">
-                            <circle cx="8" cy="3.5" r="1.2" fill="currentColor" />
-                            <circle cx="8" cy="8" r="1.2" fill="currentColor" />
-                            <circle cx="8" cy="12.5" r="1.2" fill="currentColor" />
-                          </svg>
-                        </button>
-
-                        @if (movePopoverId() === it.note.id) {
-                          <!-- Opaque move menu (T3): --surface-overlay, no blur. -->
-                          <div class="menu move-menu" role="menu">
-                            <p class="menu-group-label">Move to folder</p>
-                            @for (folder of noteFolders(); track folder.id) {
-                              <button
-                                type="button"
-                                class="menu-item"
-                                role="menuitem"
-                                [disabled]="folder.id === it.note.folderId"
-                                (click)="moveNote(it.note.id, folder.id)"
-                              >
-                                {{ folder.name }}
-                                @if (folder.id === it.note.folderId) {
-                                  <span class="menu-current text-muted">current</span>
-                                }
-                              </button>
-                            } @empty {
-                              <p class="menu-empty text-muted">No folders yet.</p>
-                            }
-                          </div>
-                        }
-                      </div>
+                    @if (row.note.locked) {
+                      <svg class="note-lock" viewBox="0 0 16 16" width="13" height="13" fill="none" aria-hidden="true">
+                        <rect x="3.5" y="7" width="9" height="6" rx="1.4" stroke="currentColor" stroke-width="1.3" />
+                        <path d="M5.5 7V5.4a2.5 2.5 0 0 1 5 0V7" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
+                      </svg>
                     }
-                  </div>
+                    <!-- Title ONLY — no body-snippet preview (2026-07-12: the
+                         user asked for the description text gone from the row
+                         entirely, not just truncated/inlined). Single line via
+                         `.title-text`'s own ellipsis; <mur-table> also enforces
+                         a fixed row height regardless of title length. -->
+                    <span class="title-text">{{ row.note.title }}</span>
+                    @if (row.note.shared) {
+                      <span class="pill is-accent note-shared" title="Shared">Shared</span>
+                    }
+                    @if (row.note.tags.length > 0) {
+                      <span class="note-tags">
+                        @for (tag of row.note.tags; track tag) {
+                          <span class="pill note-tag">{{ tag }}</span>
+                        }
+                      </span>
+                    }
+                  </button>
                 }
                 @case ("org") {
                   <!-- An org (Shared Brain) item. If the caller AUTHORED it
                        (`ownedSource`), the row links straight to the EDITABLE
                        original (/notes/:id | /meeting/:id) with the current title;
                        otherwise it's a READ-ONLY replica → the /org-item viewer. -->
-                  <a
-                    class="card note-card note-card--org"
-                    [class.note-card--owned]="it.item.ownedSource"
-                    [routerLink]="orgItemLink(it.item)"
-                  >
-                    <div class="note-open note-open--org">
-                      <div class="note-card-head">
-                        <span class="note-title">{{ it.item.title }}</span>
-                        <span class="pill org-badge" [title]="'Shared brain · ' + it.orgName">
-                          <svg class="org-badge-glyph" viewBox="0 0 16 16" width="11" height="11" fill="none" aria-hidden="true">
-                            <circle cx="5" cy="6" r="1.6" stroke="currentColor" stroke-width="1.2" />
-                            <circle cx="11" cy="6" r="1.6" stroke="currentColor" stroke-width="1.2" />
-                            <path d="M2.5 12c0-1.5 1.1-2.5 2.5-2.5s2.5 1 2.5 2.5M8.5 12c0-1.5 1.1-2.5 2.5-2.5s2.5 1 2.5 2.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" />
-                          </svg>
-                          {{ it.orgName }}
-                        </span>
-                      </div>
-                      <div class="note-card-foot">
-                        @if (it.item.authorHint) {
-                          <span class="note-author text-muted">{{ it.item.authorHint }}</span>
-                        }
-                        <span class="note-date">{{ formatOrgDate(it.item.createdAt) }}</span>
-                      </div>
-                    </div>
+                  <a class="title-btn title-link" [routerLink]="orgItemLink(row.item)">
+                    <span class="title-text">{{ row.item.title }}</span>
+                    <span class="pill org-badge" [title]="'Shared brain · ' + row.orgName">
+                      <svg class="org-badge-glyph" viewBox="0 0 16 16" width="11" height="11" fill="none" aria-hidden="true">
+                        <circle cx="5" cy="6" r="1.6" stroke="currentColor" stroke-width="1.2" />
+                        <circle cx="11" cy="6" r="1.6" stroke="currentColor" stroke-width="1.2" />
+                        <path d="M2.5 12c0-1.5 1.1-2.5 2.5-2.5s2.5 1 2.5 2.5M8.5 12c0-1.5 1.1-2.5 2.5-2.5s2.5 1 2.5 2.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" />
+                      </svg>
+                      {{ row.orgName }}
+                    </span>
+                    @if (row.item.authorHint) {
+                      <span class="note-author text-muted">{{ row.item.authorHint }}</span>
+                    }
                   </a>
                 }
               }
-            </li>
-          }
-        </ul>
+            </ng-template>
+          </mur-table-column>
+
+          <mur-table-column key="date" header="Last modified" width="160px" [alignEnd]="true">
+            <ng-template let-row>
+              @switch (row.kind) {
+                @case ("note") {
+                  {{ formatDate(row.note.updatedAt) }}
+                }
+                @case ("org") {
+                  {{ formatOrgDate(row.item.createdAt) }}
+                }
+              }
+            </ng-template>
+          </mur-table-column>
+
+          <mur-table-column key="actions" header="Actions" [hideHeader]="true" width="44px">
+            <ng-template let-row>
+              <!-- Per-note "Move to…" affordance (hidden for masked rows + org rows). -->
+              @if (row.kind === "note" && !row.note.locked) {
+                <div class="row-move">
+                  <button
+                    type="button"
+                    class="row-menu-btn"
+                    [attr.aria-expanded]="movePopoverId() === row.note.id"
+                    aria-label="Move note to a folder"
+                    title="Move to…"
+                    (click)="toggleMovePopover(row.note.id, $event)"
+                  >
+                    <svg viewBox="0 0 16 16" width="16" height="16" fill="none" aria-hidden="true">
+                      <circle cx="8" cy="3.5" r="1.2" fill="currentColor" />
+                      <circle cx="8" cy="8" r="1.2" fill="currentColor" />
+                      <circle cx="8" cy="12.5" r="1.2" fill="currentColor" />
+                    </svg>
+                  </button>
+
+                  @if (movePopoverId() === row.note.id) {
+                    <!-- Opaque move menu (T3): --surface-overlay, no blur. -->
+                    <div class="menu move-menu" role="menu">
+                      <p class="menu-group-label">Move to folder</p>
+                      @for (folder of noteFolders(); track folder.id) {
+                        <button
+                          type="button"
+                          class="menu-item"
+                          role="menuitem"
+                          [disabled]="folder.id === row.note.folderId"
+                          (click)="moveNote(row.note.id, folder.id)"
+                        >
+                          {{ folder.name }}
+                          @if (folder.id === row.note.folderId) {
+                            <span class="menu-current text-muted">current</span>
+                          }
+                        </button>
+                      } @empty {
+                        <p class="menu-empty text-muted">No folders yet.</p>
+                      }
+                    </div>
+                  }
+                </div>
+              }
+            </ng-template>
+          </mur-table-column>
+        </mur-table>
       }
     </div>
   </div>
@@ -490,21 +271,6 @@
       [busy]="organizeApplying()"
       (apply)="applyOrganize($event)"
       (cancelled)="closeOrganize()"
-    />
-  }
-
-  <!-- Lock×shares blocking dialog (PK-F1): the SAME flow the meetings tree runs —
-       shown when locking a note-folder that still has active shares (or when the
-       share probe failed). Owned by the shared FolderLockFlowService. OPAQUE (T3). -->
-  @if (lockFlow.pending(); as pending) {
-    <app-lock-shares-dialog
-      [folderName]="pending.folderName"
-      [report]="lockFlow.report()"
-      [probeFailed]="pending.probeFailed"
-      [busy]="lockFlow.busy()"
-      (revokeAndLock)="lockFlow.revokeAndLock()"
-      (lockAnyway)="lockFlow.lockAnyway()"
-      (cancelled)="lockFlow.cancel()"
     />
   }
 </section>

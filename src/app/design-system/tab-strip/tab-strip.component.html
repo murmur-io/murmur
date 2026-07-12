@@ -1,0 +1,48 @@
+@if (tabs().length > 0) {
+  <nav class="tab-strip" aria-label="Open documents">
+    @for (tab of tabs(); track tab.id) {
+      <div class="tab-item" [class.active]="tab.id === activeTabId()">
+        <button
+          type="button"
+          class="tab-label"
+          [attr.aria-current]="tab.id === activeTabId() ? 'page' : null"
+          [attr.title]="tab.title"
+          (click)="activate(tab.id)"
+        >
+          {{ tab.title }}
+        </button>
+        <button
+          type="button"
+          class="tab-close"
+          [attr.aria-label]="'Close ' + tab.title"
+          (click)="close(tab.id, $event)"
+        >
+          <svg viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">
+            <path
+              d="M4 4l8 8M12 4l-8 8"
+              stroke="currentColor"
+              stroke-width="1.6"
+              stroke-linecap="round"
+            />
+          </svg>
+        </button>
+      </div>
+    }
+    <button
+      type="button"
+      class="tab-new"
+      aria-label="New note (⌘T)"
+      title="New note (⌘T)"
+      (click)="newTab()"
+    >
+      <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
+        <path
+          d="M8 3.5v9M3.5 8h9"
+          stroke="currentColor"
+          stroke-width="1.6"
+          stroke-linecap="round"
+        />
+      </svg>
+    </button>
+  </nav>
+}

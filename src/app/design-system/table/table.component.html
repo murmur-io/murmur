@@ -1,0 +1,33 @@
+<table class="mur-table">
+  <thead>
+    <tr>
+      @for (col of columns(); track col.key()) {
+        <th
+          [style.width]="col.width()"
+          [class.is-end]="col.alignEnd()"
+          scope="col"
+        >
+          @if (col.hideHeader()) {
+            <span class="sr-only">{{ col.header() }}</span>
+          } @else {
+            {{ col.header() }}
+          }
+        </th>
+      }
+    </tr>
+  </thead>
+  <tbody>
+    @for (row of rows(); track trackBy()(row)) {
+      <tr [class]="rowClass()(row)">
+        @for (col of columns(); track col.key()) {
+          <td [class.is-end]="col.alignEnd()">
+            <ng-container
+              [ngTemplateOutlet]="col.cellTemplate() ?? null"
+              [ngTemplateOutletContext]="{ $implicit: row }"
+            />
+          </td>
+        }
+      </tr>
+    }
+  </tbody>
+</table>

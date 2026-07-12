@@ -27,6 +27,14 @@ export class NotesService {
   private readonly _loading = signal(false);
   private readonly _foldersLoading = signal(false);
   private readonly _error = signal<string | null>(null);
+  /**
+   * The active note-folder scope (null = "All notes") — SHARED between the main
+   * sidebar's Notes tree ({@link NotesSidebarTreeComponent}, which drives it via
+   * {@link selectFolder}) and {@link NotesHomeComponent} (which reads it to filter
+   * the content pane). Moved here (2026-07-12) so the always-visible sidebar and
+   * the `/notes` content view stay in sync without a route param.
+   */
+  private readonly _activeFolderId = signal<string | null>(null);
 
   /** The note list, as last returned by the backend (gated — masked rows included). */
   readonly notes = this._notes.asReadonly();
@@ -38,6 +46,20 @@ export class NotesService {
   readonly foldersLoading = this._foldersLoading.asReadonly();
   /** Non-null when the last op failed (cleared at the start of the next op). */
   readonly error = this._error.asReadonly();
+  /** The active note-folder scope (null = "All notes"). */
+  readonly activeFolderId = this._activeFolderId.asReadonly();
+
+  /**
+   * Select a note-folder (or null for "All notes") as the shared sidebar/content
+   * scope and reload its notes. A no-op re-select of the same folder is skipped.
+   */
+  async selectFolder(folderId: string | null): Promise<void> {
+    if (this._activeFolderId() === folderId) {
+      return;
+    }
+    this._activeFolderId.set(folderId);
+    await this.loadNotes(folderId);
+  }
 
   /**
    * (Re)load the note list for `folderId` (null ⇒ all visible notes). Safe to call

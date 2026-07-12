@@ -26,6 +26,14 @@ export class FoldersService {
   private readonly _tree = signal<FolderNode[]>([]);
   private readonly _loading = signal(false);
   private readonly _error = signal<string | null>(null);
+  /**
+   * The active MEETING-folder scope (null = no folder filter) — SHARED between
+   * the main sidebar's Meetings tree (`MeetingsSidebarTreeComponent`, which
+   * drives it via {@link selectFolder}) and `LibraryComponent` (which reads it
+   * to filter the meetings list). Added 2026-07-12 (Stage 2 of the always-
+   * visible-sidebar work) mirroring `NotesService.activeFolderId` for Notes.
+   */
+  private readonly _activeFolderId = signal<string | null>(null);
 
   /** The folder forest (roots → children), as last returned by the backend. */
   readonly tree = this._tree.asReadonly();
@@ -33,6 +41,18 @@ export class FoldersService {
   readonly loading = this._loading.asReadonly();
   /** Non-null when the last op failed (cleared at the start of the next op). */
   readonly error = this._error.asReadonly();
+  /** The active meeting-folder scope (null = no folder filter). */
+  readonly activeFolderId = this._activeFolderId.asReadonly();
+
+  /**
+   * Select a meeting-folder (or null to clear the filter) as the shared
+   * sidebar/content scope. Purely a signal write (folder filtering over an
+   * already-loaded meeting list is client-side in `LibraryComponent` — no IPC
+   * here, unlike `NotesService.selectFolder`, which reloads a server-paged list).
+   */
+  selectFolder(folderId: string | null): void {
+    this._activeFolderId.set(folderId);
+  }
 
   /** Flattened view of every node in the forest, for counts/lookups. */
   private readonly allNodes = computed(() => this.flatten(this._tree()));
@@ -59,17 +79,40 @@ export class FoldersService {
     return node.unlocked ? "session" : "locked";
   }
 
+  /** True once a `load()` has SUCCEEDED at least once (an empty tree is a
+   *  legitimate success — a user with no folders). Drives `ensureLoaded`. */
+  private loadedOnce = false;
+
   /** (Re)load the folder tree from the backend. Safe to call repeatedly. */
   async load(): Promise<void> {
     this._loading.set(true);
     this._error.set(null);
     try {
       this._tree.set(await this.ipc.listFolders());
+      this.loadedOnce = true;
     } catch (e) {
       this._error.set(String(e));
     } finally {
       this._loading.set(false);
     }
+  }
+
+  /**
+   * Load the tree ONLY if no load has ever succeeded (PERF, perf-audit fix
+   * 1b): `DetailComponent.loadMeeting` used to call `load()` on EVERY meeting
+   * open just to prime the folder badge/picker — but each load publishes a
+   * NEW tree array, which fires every open tab's lock-reactive root effect,
+   * so each tab-open re-touched every already-open tab (the measured O(N²)
+   * `get_meeting_detail` stampede). AppComponent already loads the tree at
+   * boot; callers that merely need the tree PRESENT use this no-op-after-
+   * first-success variant. Mutating ops (lock/unlock/move/…) keep calling
+   * `load()` — they genuinely change the tree.
+   */
+  async ensureLoaded(): Promise<void> {
+    if (this.loadedOnce) {
+      return;
+    }
+    await this.load();
   }
 
   /**

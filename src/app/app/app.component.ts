@@ -12,6 +12,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { filter, map } from "rxjs";
 import { IpcService } from "../core/ipc.service";
 import { NavHistoryService } from "../core/nav-history.service";
+import { TabsService } from "../core/tabs.service";
 import { FoldersService } from "../services/folders.service";
 import { ChromeService } from "../services/chrome.service";
 import { GlassService } from "../services/glass.service";
@@ -49,6 +50,9 @@ export class AppComponent implements OnInit {
   // drill-down "← Murmur" back button) must be recorded before the user reaches
   // settings, so it cannot wait for lazy construction inside SettingsComponent.
   private readonly navHistory = inject(NavHistoryService);
+  // Injected at bootstrap so its persisted tabs are restored (constructor field
+  // initializers) in time for the boot-restore navigation at the end of ngOnInit.
+  private readonly tabs = inject(TabsService);
 
   /** True in the floating-bar window (route /bar) — the app chrome is hidden there. */
   readonly isBar = toSignal(
@@ -153,6 +157,16 @@ export class AppComponent implements OnInit {
       }
     } catch {
       // Config unavailable — don't trap the user; the app loads normally.
+    }
+
+    // Session-restore for open tabs (browser-style: closed/reopened tabs come
+    // back). Reached ONLY when neither onboarding nor the sharing gate fired
+    // above — never hijack first-run. A restored tab's route is a `/meeting/:id`
+    // or `/notes/:id` deep link, which TabRouteReuseStrategy + the destination
+    // component load exactly like any other navigation (no special casing here).
+    const restoredRoute = this.tabs.restoredRoute();
+    if (restoredRoute) {
+      await this.router.navigate([...restoredRoute]);
     }
   }
 }

@@ -285,6 +285,56 @@ export class AudioPanelComponent {
     }
   }
 
+  /**
+   * Pause playback — called from `DetailComponent.onTabBackgrounded` when
+   * this meeting's TAB is backgrounded (the shell's `<router-outlet (detach)>`
+   * fires on every tab switch, not just a real destroy — see
+   * `AppShellComponent.onOutletDetach`). A still-playing closed/backgrounded
+   * tab would otherwise keep narrating from off-screen: WKWebView's own
+   * detach-pauses-media behavior is real but browser/version-dependent, so
+   * this is an explicit safety net rather than relying on it.
+   */
+  pausePlayback(): void {
+    this.el?.pause();
+  }
+
+  /**
+   * Collapse the transcript back to the windowed `RENDER_CAP` — called from
+   * `DetailComponent.onTabBackgrounded` when this tab is detached (perf-audit
+   * fix 2): a backgrounded tab with "Show all N turns" expanded retains the
+   * FULL turn DOM off-screen (measured ~21k nodes + ~4k listeners on a
+   * 2000-segment meeting) — a few such tabs is WKWebView-jettison territory.
+   * Only the unbounded DOM collapses; the data signals stay, and the user
+   * re-expands with one click on return (same as browsers discarding heavy
+   * background-tab content).
+   */
+  collapseTranscript(): void {
+    this.transcriptExpanded.set(false);
+  }
+
+  /**
+   * Hard-stop AND unload the recording — called by the detail shell's
+   * lock-mask path (`DetailComponent.maskLocally`) the moment this meeting's
+   * folder is sealed. `pause()` alone leaves a resumable element still holding
+   * the (now-locked) asset URL; removing `src` + `load()` releases it so a
+   * stale `<audio>` can never outlive the lock, even in a detached
+   * (backgrounded) tab whose template won't re-render until reattach. The
+   * declarative `[src]="audioSrc()"` binding converges to null on the next
+   * refresh (the masked detail nulls `audioPath`); this covers the frozen-CD
+   * window before that.
+   */
+  stopAndUnload(): void {
+    const el = this.el;
+    if (!el) {
+      return;
+    }
+    el.pause();
+    el.removeAttribute("src");
+    el.load();
+    this.playing.set(false);
+    this.currentTime.set(0);
+  }
+
   /** Skip forward/back by `delta` seconds, clamped to [0, duration]. */
   skip(delta: number): void {
     const el = this.el;

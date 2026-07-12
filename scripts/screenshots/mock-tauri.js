@@ -767,6 +767,12 @@ scope to the GA-critical path only.
       case "org_list_statuses": return ORGS;
       case "list_org_items": return ORG_ITEMS_BY_ORG[args.orgId] || [];
       case "org_resolve_source": return null;
+      // Per-meeting (Detail header pill) / bulk (Library row badge) share
+      // pairings — both array-shaped; unmocked callers must see `[]`, never
+      // the generic `null` default (a bare array-returning command doesn't
+      // match the `list_`/`get_` fallback prefixes below).
+      case "meeting_org_shares": return [];
+      case "org_live_shares_for_source": return [];
 
       // ── exports / misc ──
       case "export_audio": case "export_note": case "export_mic_master": case "export_sys_master": return null;
