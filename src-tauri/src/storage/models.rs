@@ -681,12 +681,15 @@ pub struct NoteAssistRequest {
     pub instruction: Option<String>,
 }
 
-/// One enhance-context provenance citation — the source note/meeting the additive passage drew on.
+/// One enhance-context provenance citation — the source note/meeting/org-item the additive passage
+/// drew on.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NoteCitation {
-    /// `"meeting"` | `"note"`.
+    /// `"meeting"` | `"note"` | `"org"`.
     pub kind: String,
+    /// For `kind == "org"` this is the org item id (`OrgChunkHit::item_id`), routed by the FE to
+    /// `/org-item/:id` — never a local meeting/note id.
     pub id: String,
     pub title: String,
     pub snippet: String,
@@ -889,6 +892,19 @@ pub struct DigestResult {
     pub exported_path: Option<String>,
 }
 
+/// Result of the CLOUD-synthesized `entity_dossier` command (B2, Shared Brain). `has_org_context`
+/// is an HONEST signal: `true` iff the synthesis prompt included any `[org · author]`-attributed
+/// colleague content ALONGSIDE the user's own verified facts — so the FE/response never silently
+/// blends org-sourced claims into the dossier without a distinguishing signal. READ-ONLY: org
+/// content that contributes here is NEVER written into `entities`/`entity_mentions`/`facts`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EntityDossierResult {
+    pub markdown: String,
+    #[serde(default)]
+    pub has_org_context: bool,
+}
+
 /// An upcoming Calendar event (best-effort; absent if Calendar access is denied).
 /// Minimal shape used by the legacy AppleScript `next_calendar_event` probe.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1007,6 +1023,13 @@ pub struct TopicThread {
 }
 
 /// M6 Shared Brain — a locally-joined org (row of `org_state`). Membership metadata only; no content.
+///
+/// `context_enabled` (per-instance org toggle): whether this JOINED org contributes content on THIS
+/// Murmur install — browsing (`list_org_items`) AND brain/assistant context
+/// (`search_org_chunks_knn`/`_fts`). Default `true` (every existing/new membership stays active).
+/// Distinct from `consented` (org EGRESS consent — sharing OUT); this gates READING IN. A disabled
+/// org's rows are NEVER deleted/purged — only excluded from every read path — so re-enabling is
+/// instant with no re-sync.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrgState {
     pub org_id: String,
@@ -1016,6 +1039,7 @@ pub struct OrgState {
     pub consented: bool,
     pub last_seq: i64,
     pub generation: u32,
+    pub context_enabled: bool,
 }
 
 /// M6 Shared Brain — one row of the outbound org-share state machine (`org_shares`). Anchors on a

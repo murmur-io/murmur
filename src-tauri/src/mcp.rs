@@ -236,7 +236,7 @@ fn tools_spec() -> Value {
     json!([
         {
             "name": "search_meetings",
-            "description": "Full-text search across your meeting titles, transcripts, notes, and imported documents/brain notes. Returns matching meetings and documents with snippets and ids.",
+            "description": "Full-text search across your meeting titles, transcripts, notes, and imported documents/brain notes. Returns matching meetings and documents with snippets and ids. If nothing relevant turns up and you have joined an org, also try org_search — a colleague may have already shared the answer.",
             "inputSchema": { "type": "object", "properties": { "query": { "type": "string" } }, "required": ["query"] }
         },
         {
@@ -251,7 +251,7 @@ fn tools_spec() -> Value {
         },
         {
             "name": "search_semantic",
-            "description": "Semantic (meaning-based) search across your meeting notes and imported documents/brain notes, fused with full-text search. Finds relevant content even without the exact words. When semantic search is disabled in Murmur settings it falls back to keyword-only matching (the result says so).",
+            "description": "Semantic (meaning-based) search across your meeting notes and imported documents/brain notes, fused with full-text search. Finds relevant content even without the exact words. When semantic search is disabled in Murmur settings it falls back to keyword-only matching (the result says so). If nothing relevant turns up and you have joined an org, also try org_search — a colleague may have already shared the answer.",
             "inputSchema": { "type": "object", "properties": { "query": { "type": "string" } }, "required": ["query"] }
         },
         {
@@ -266,7 +266,7 @@ fn tools_spec() -> Value {
         },
         {
             "name": "org_search",
-            "description": "Search the ORGANIZATION brain — notes your colleagues explicitly shared to the shared org brain (synced + decrypted locally; no data leaves this device). Results are attributed '[org · <author>]' and MUST be cited as coming from that colleague. Only meaningful when you have joined an org and consented to org sharing (otherwise returns no results). Use for 'what does the team / someone else know or decide about X' questions.",
+            "description": "Fallback for when search_meetings / search_semantic find nothing relevant in your OWN vault and you have joined an org: search the ORGANIZATION brain — notes your colleagues explicitly shared to the shared org brain (synced + decrypted locally; no data leaves this device). Results are attributed '[org · <author>]' and MUST be cited as coming from that colleague. Only meaningful when you have joined an org and consented to org sharing (otherwise returns no results). Use for 'what does the team / someone else know or decide about X' questions.",
             "inputSchema": { "type": "object", "properties": { "query": { "type": "string" } }, "required": ["query"] }
         }
     ])
@@ -424,6 +424,38 @@ mod tests {
         assert!(tools.iter().any(|t| t["name"] == "get_entity_dossier"));
         // Shared Brain — the org partition search tool is advertised.
         assert!(tools.iter().any(|t| t["name"] == "org_search"));
+    }
+
+    /// A4 (RED-before-GREEN): the MCP catalog must steer callers toward `org_search` as a FALLBACK
+    /// when `search_meetings`/`search_semantic` find nothing — and `org_search`'s own description
+    /// must lead with that fallback framing, not present itself as an unrelated alternative.
+    #[test]
+    fn tool_catalog_nudges_org_search_as_a_fallback() {
+        let r = rpc(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#).unwrap();
+        let tools = r["result"]["tools"].as_array().unwrap();
+        let desc = |name: &str| -> String {
+            tools
+                .iter()
+                .find(|t| t["name"] == name)
+                .and_then(|t| t["description"].as_str())
+                .unwrap_or_default()
+                .to_string()
+        };
+        let search_meetings = desc("search_meetings");
+        let search_semantic = desc("search_semantic");
+        let org_search = desc("org_search");
+        assert!(
+            search_meetings.contains("org_search"),
+            "search_meetings must mention org_search as a fallback: {search_meetings}"
+        );
+        assert!(
+            search_semantic.contains("org_search"),
+            "search_semantic must mention org_search as a fallback: {search_semantic}"
+        );
+        assert!(
+            org_search.to_lowercase().starts_with("fallback"),
+            "org_search's own description must LEAD with the fallback framing: {org_search}"
+        );
     }
 
     #[test]

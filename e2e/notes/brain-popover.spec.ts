@@ -84,3 +84,91 @@ test("selecting body text floats the bubble; Ask Brain → Refine → Accept upd
 
   expect(consoleErrors).toEqual([]);
 });
+
+/**
+ * A3 — `find_related` gains an org citation (`kind: "org"`, backed by
+ * `gather_note_enhance_citations`' new org-brain leg). Clicking it MUST route to
+ * the read-only `/org-item/:id` viewer (mirrors `library.component.ts`'s
+ * `orgItemLink`) — NOT the broken `/notes/<id>` fallback an unrecognized `kind`
+ * used to fall into. This is the regression test for BOTH the new org leg AND the
+ * incidental pre-existing `openCitation()` bug it made reachable.
+ */
+test("Find related: an org-kind citation routes to the read-only /org-item viewer, not /notes", async ({
+  page,
+}) => {
+  const consoleErrors: string[] = [];
+  page.on("console", (msg) => {
+    if (msg.type() === "error") {
+      consoleErrors.push(msg.text());
+    }
+  });
+  page.on("pageerror", (err) => consoleErrors.push(String(err)));
+
+  await mockNotes(page, {
+    note_assistant_action: (args: { req: { action: string } }) => ({
+      action: args.req.action,
+      shape: "info",
+      title: null,
+      suggestion: "2 related sources in your brain.",
+      citations: [
+        {
+          kind: "org",
+          id: "oi-launchcode",
+          title: "Anna's launchcode notes",
+          snippet: "the launchcode rollout plan",
+        },
+        {
+          kind: "note",
+          id: "n2",
+          title: "Weekly plan",
+          snippet: "Ship the notes feature",
+        },
+      ],
+      modelLabel: "Your brain (local search)",
+      mode: "local",
+      redacted: false,
+    }),
+    org_get_item: (args: { itemId: string }) => ({
+      itemId: args.itemId,
+      authorHint: "anna",
+      title: "Anna's launchcode notes",
+      createdAt: "2026-07-10T09:00:00Z",
+      rev: 1,
+      markdown: "# Anna's launchcode notes\n\nthe launchcode rollout plan",
+    }),
+  });
+  await page.goto("/notes/n1");
+
+  const body = page.locator(".body-area");
+  await expect(body).toBeVisible();
+
+  await body.evaluate((el: HTMLTextAreaElement) => {
+    const start = el.value.indexOf("body text");
+    el.focus();
+    el.setSelectionRange(start, start + "body text".length);
+    el.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+  });
+
+  const bubble = page.locator("app-note-selection-toolbar");
+  await expect(bubble).toBeVisible();
+  await bubble.getByRole("button", { name: "Ask Brain" }).dispatchEvent("click");
+
+  const popover = page.locator("app-note-brain-popover");
+  await expect(popover).toBeVisible();
+  await popover.getByRole("button", { name: "Find related" }).dispatchEvent("click");
+
+  await expect(popover.getByText("2 related sources in your brain.")).toBeVisible();
+  const orgCite = popover.locator(".pop-cite", { hasText: "Anna's launchcode notes" });
+  await expect(orgCite).toBeVisible();
+  await expect(orgCite.locator(".pop-cite-kind")).toHaveText("org");
+
+  await orgCite.dispatchEvent("click");
+
+  // The old bug: an unrecognized `kind` fell through to `/notes/<id>` — assert the
+  // FIX routes to the org-item viewer instead.
+  await expect(page).toHaveURL(/\/org-item\/oi-launchcode$/);
+  await expect(page).not.toHaveURL(/\/notes\/oi-launchcode$/);
+  await expect(page.locator("app-org-item-viewer")).toBeVisible();
+
+  expect(consoleErrors).toEqual([]);
+});

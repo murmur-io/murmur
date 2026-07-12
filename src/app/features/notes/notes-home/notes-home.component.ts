@@ -367,7 +367,11 @@ export class NotesHomeComponent implements OnInit {
       }
       let orgs: OrgStatus[];
       try {
-        orgs = await this.ipc.orgListStatuses();
+        // PER-INSTANCE ORG TOGGLE: this rail is a content BROWSER (mirrors
+        // library.component.ts) — a disabled org must not appear as a pickable
+        // "Shared brains" entry; the toggle itself lives only in Settings, which
+        // fetches its own unfiltered list.
+        orgs = (await this.ipc.orgListStatuses()).filter((o) => o.contextEnabled);
       } catch {
         return; // keep the last-known orgs on a transient failure
       }

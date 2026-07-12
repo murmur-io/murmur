@@ -1390,7 +1390,11 @@ impl Db {
              CREATE INDEX IF NOT EXISTS idx_org_shares_state ON org_shares(state);
              CREATE INDEX IF NOT EXISTS idx_org_shares_item ON org_shares(item_id);",
         )
-        .map_err(map_err)
+        .map_err(map_err)?;
+        // Per-instance org toggle: which JOINED orgs actually contribute content on THIS install
+        // (Settings → Organization). Default enabled (1) so every existing membership stays active
+        // pre-upgrade. Guarded/additive per the migration rule.
+        Self::add_column_if_missing(conn, "org_state", "context_enabled", "INTEGER NOT NULL DEFAULT 1")
     }
 
     /// M6 Shared Brain (sync/ingest slice) — the local DECRYPTED REPLICA of the org feed + its
@@ -1721,13 +1725,14 @@ impl Db {
     // ── M6 Shared Brain: local org state + the outbound org-share state machine ──────────────────
 
     /// Upsert the locally-cached membership of an org (create/status). Preserves an existing row's
-    /// local `consented` flag and `last_seq` cursor (an incoming status refresh MUST NOT reset the
-    /// consent flag or rewind the sync cursor). NO content — membership metadata only.
+    /// local `consented` flag, `last_seq` cursor, AND `context_enabled` toggle (an incoming status
+    /// refresh MUST NOT reset the consent flag, rewind the sync cursor, or silently re-enable an org
+    /// the user disabled on this instance). NO content — membership metadata only.
     pub fn upsert_org_state(&self, o: &crate::storage::OrgState) -> Result<()> {
         let conn = self.lock();
         conn.execute(
-            "INSERT INTO org_state (org_id, name, role, joined_at, consented, last_seq, generation)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "INSERT INTO org_state (org_id, name, role, joined_at, consented, last_seq, generation, context_enabled)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(org_id) DO UPDATE SET
                name = excluded.name,
                role = excluded.role,
@@ -1739,7 +1744,8 @@ impl Db {
                 o.joined_at,
                 o.consented as i64,
                 o.last_seq,
-                o.generation as i64
+                o.generation as i64,
+                o.context_enabled as i64
             ],
         )
         .map_err(map_err)?;
@@ -1755,6 +1761,7 @@ impl Db {
             consented: r.get::<_, i64>(4)? != 0,
             last_seq: r.get(5)?,
             generation: r.get::<_, i64>(6)? as u32,
+            context_enabled: r.get::<_, i64>(7)? != 0,
         })
     }
 
@@ -1762,7 +1769,7 @@ impl Db {
     pub fn get_org_state(&self, org_id: &str) -> Result<Option<crate::storage::OrgState>> {
         let conn = self.lock();
         conn.query_row(
-            "SELECT org_id, name, role, joined_at, consented, last_seq, generation
+            "SELECT org_id, name, role, joined_at, consented, last_seq, generation, context_enabled
                FROM org_state WHERE org_id = ?1",
             rusqlite::params![org_id],
             Self::map_org_state,
@@ -1776,7 +1783,7 @@ impl Db {
         let conn = self.lock();
         let mut stmt = conn
             .prepare(
-                "SELECT org_id, name, role, joined_at, consented, last_seq, generation
+                "SELECT org_id, name, role, joined_at, consented, last_seq, generation, context_enabled
                    FROM org_state ORDER BY joined_at ASC",
             )
             .map_err(map_err)?;
@@ -1797,6 +1804,21 @@ impl Db {
         conn.execute(
             "UPDATE org_state SET consented = ?2 WHERE org_id = ?1",
             rusqlite::params![org_id, consented as i64],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Set the PER-INSTANCE org context toggle (Settings → Organization): whether a JOINED org
+    /// contributes content on THIS Murmur install — browsing (`list_org_items`) AND brain/assistant
+    /// context (`search_org_chunks_knn`/`_fts`). The ONLY mutator (mirrors `set_org_consented`) — a
+    /// status/feed refresh (`upsert_org_state`) never touches this column. Disabling never deletes the
+    /// local replica; re-enabling is instant with no re-sync.
+    pub fn set_org_context_enabled(&self, org_id: &str, enabled: bool) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE org_state SET context_enabled = ?2 WHERE org_id = ?1",
+            rusqlite::params![org_id, enabled as i64],
         )
         .map_err(map_err)?;
         Ok(())
@@ -5097,13 +5119,18 @@ impl Db {
     /// the top-`k` nearest `org_vec_chunks` for the int8-quantized `query_vec`, joined to their
     /// (non-tombstoned) items, deduped to one hit per item (nearest). `query_vec` is the member's OWN
     /// f32 query embedding — it is int8-quantized here so it is comparable to the stored int8 vectors.
+    ///
+    /// PER-INSTANCE ORG TOGGLE: joined to `org_state` and filtered on `context_enabled = 1` — a
+    /// disabled org's chunks are EXCLUDED at the SQL level, never read into Rust at all. This is the
+    /// hard data-level gate (not a UI hide): a caller cannot accidentally surface a disabled org's
+    /// content by forgetting to filter it downstream.
     pub fn search_org_chunks_knn(&self, query_vec: &[f32], k: i64) -> Result<Vec<OrgChunkHit>> {
         if query_vec.is_empty() || k <= 0 {
             return Ok(Vec::new());
         }
         let conn = self.lock();
         // KNN isolated to the vec0 table in a CTE (a vec0 query allows a single MATCH+k); the item
-        // columns + the tombstone filter are joined OUTSIDE it.
+        // columns + the tombstone/context-enabled filters are joined OUTSIDE it.
         let sql = "WITH knn(chunk_id, distance) AS (
                  SELECT chunk_id, distance FROM org_vec_chunks
                   WHERE embedding MATCH vec_int8(?1) AND k = ?2
@@ -5113,7 +5140,8 @@ impl Db {
                FROM knn
                JOIN org_chunks oc ON oc.id = knn.chunk_id
                JOIN org_items oi ON oi.item_id = oc.item_id
-              WHERE oi.tombstoned = 0
+               JOIN org_state os ON os.org_id = oi.org_id
+              WHERE oi.tombstoned = 0 AND os.context_enabled = 1
               ORDER BY knn.distance ASC, oi.item_id ASC";
         let blob = crate::embed::vec_to_int8_blob(query_vec);
         let mut stmt = conn.prepare(sql).map_err(map_err)?;
@@ -5133,6 +5161,7 @@ impl Db {
 
     /// KEYWORD (FTS5/BM25) leg over the org partition — the model-free twin of
     /// [`Db::search_org_chunks_knn`], so org text is reachable on a DEFAULT install (no e5 model).
+    /// Same `context_enabled = 1` per-instance org filter as the KNN leg — see its doc.
     ///
     /// CRITICAL (scale-spike finding #2): the `LIMIT` is PUSHED DOWN into the SQL (bm25-ordered),
     /// NOT applied in Rust after reading every match — the unbounded production reader hit an 8.8 s
@@ -5154,7 +5183,8 @@ impl Db {
                FROM fts_org_chunks
                JOIN org_chunks oc ON oc.id = fts_org_chunks.rowid
                JOIN org_items oi ON oi.item_id = oc.item_id
-              WHERE fts_org_chunks MATCH ?1 AND oi.tombstoned = 0
+               JOIN org_state os ON os.org_id = oi.org_id
+              WHERE fts_org_chunks MATCH ?1 AND oi.tombstoned = 0 AND os.context_enabled = 1
               ORDER BY rank ASC, oi.item_id ASC
               LIMIT ?2";
         let mut stmt = conn.prepare(sql).map_err(map_err)?;
@@ -5191,13 +5221,17 @@ impl Db {
         Ok(hits)
     }
 
-    /// The full decrypted org item (for the read-only FE viewer). `None` for an unknown or TOMBSTONED
-    /// item. No lock gate — org items are deliberately org-disclosed content.
+    /// The full decrypted org item (for the read-only FE viewer). `None` for an unknown, TOMBSTONED,
+    /// OR per-instance-DISABLED item's org (a stale citation/bookmark to `/org-item/:id` must not read
+    /// through the toggle — same `context_enabled = 1` gate as `search_org_chunks_knn`/`_fts`). No lock
+    /// gate otherwise — org items are deliberately org-disclosed content.
     pub fn get_org_item(&self, item_id: &str) -> Result<Option<crate::storage::models::OrgItemDetail>> {
         let conn = self.lock();
         conn.query_row(
-            "SELECT item_id, author_hint, title, created_at, rev, markdown
-               FROM org_items WHERE item_id = ?1 AND tombstoned = 0",
+            "SELECT oi.item_id, oi.author_hint, oi.title, oi.created_at, oi.rev, oi.markdown
+               FROM org_items oi
+               JOIN org_state os ON os.org_id = oi.org_id
+              WHERE oi.item_id = ?1 AND oi.tombstoned = 0 AND os.context_enabled = 1",
             rusqlite::params![item_id],
             |r| {
                 Ok(crate::storage::models::OrgItemDetail {
@@ -10597,11 +10631,29 @@ mod tests {
         vec![tag; 32]
     }
 
+    /// Join `org_id` locally (enabled by default) — the retrieval legs INNER JOIN `org_state`
+    /// (per-instance org toggle), so any test that ingests `org_items` directly must seed this first,
+    /// mirroring how production content can never exist without a prior join.
+    fn seed_org_state(db: &Db, org_id: &str) {
+        db.upsert_org_state(&crate::storage::OrgState {
+            org_id: org_id.to_string(),
+            name: "Acme".to_string(),
+            role: "member".to_string(),
+            joined_at: "2026-07-10T00:00:00Z".to_string(),
+            consented: true,
+            last_seq: 0,
+            generation: 1,
+            context_enabled: true,
+        })
+        .unwrap();
+    }
+
     /// Ingest round-trip: upsert an org item WITH a real (stub) embedder → both the int8 KNN leg AND
     /// the FTS leg retrieve it back with the right author/title/snippet + content hash.
     #[test]
     fn org_ingest_round_trips_through_int8_knn_and_fts() {
         let db = mem_db();
+        seed_org_state(&db, "org-1");
         let emb = crate::embed::StubEmbedder;
         let sha = sha32(1);
         db.upsert_org_item(
@@ -10653,6 +10705,7 @@ mod tests {
     #[test]
     fn org_ingest_fts_only_when_no_embedder() {
         let db = mem_db();
+        seed_org_state(&db, "org-1");
         db.upsert_org_item(
             "it-x",
             "org-1",
@@ -10690,6 +10743,7 @@ mod tests {
     #[test]
     fn org_tombstone_evicts_from_retrieval_and_viewer() {
         let db = mem_db();
+        seed_org_state(&db, "org-1");
         let emb = crate::embed::StubEmbedder;
         db.upsert_org_item(
             "it-t",
@@ -10751,6 +10805,8 @@ mod tests {
     #[test]
     fn purge_org_replica_drops_the_whole_decrypted_replica() {
         let db = mem_db();
+        seed_org_state(&db, "org-1");
+        seed_org_state(&db, "org-2");
         let emb = crate::embed::StubEmbedder;
         db.upsert_org_item(
             "it-a", "org-1", 1, "anna", "Roadmap", "the falcon rollout plan alpha", "t", 1, 1,
@@ -10815,6 +10871,7 @@ mod tests {
     #[test]
     fn org_upsert_is_idempotent_and_replaces_on_rev_bump() {
         let db = mem_db();
+        seed_org_state(&db, "org-1");
         let emb = crate::embed::StubEmbedder;
         db.upsert_org_item(
             "it-r", "org-1", 1, "dan", "V1", "first version body alpha", "t", 1, 1, &sha32(4),
@@ -10838,6 +10895,63 @@ mod tests {
         let detail = db.get_org_item("it-r").unwrap().unwrap();
         assert_eq!(detail.rev, 2);
         assert_eq!(detail.title, "V2");
+    }
+
+    /// PER-INSTANCE ORG TOGGLE (RED-before-GREEN, the user's hard mandate: a disabled org's context
+    /// must NEVER leak through). Two orgs, BOTH with matching content; org-1 disabled, org-2 stays
+    /// enabled. The disabled org's item must be COMPLETELY absent from both retrieval legs — not
+    /// merely ranked lower — while the enabled org's item still surfaces normally. Proves the SQL
+    /// filter is a real exclusion, not a soft demotion.
+    #[test]
+    fn disabled_org_is_excluded_from_both_retrieval_legs_while_enabled_org_still_surfaces() {
+        let db = mem_db();
+        seed_org_state(&db, "org-1");
+        seed_org_state(&db, "org-2");
+        let emb = crate::embed::StubEmbedder;
+        db.upsert_org_item(
+            "it-disabled", "org-1", 1, "anna", "Disabled org note",
+            "the quantum ledger migration plan", "t", 1, 1, &sha32(11), None, Some(&emb),
+        )
+        .unwrap();
+        db.upsert_org_item(
+            "it-enabled", "org-2", 1, "bob", "Enabled org note",
+            "the quantum ledger migration rollout", "t", 1, 1, &sha32(12), None, Some(&emb),
+        )
+        .unwrap();
+
+        // Precondition: BOTH are reachable while both orgs are enabled.
+        let fts_before = db.search_org_chunks_fts("quantum ledger migration", 10).unwrap();
+        assert_eq!(fts_before.len(), 2, "both items reachable before any org is disabled");
+
+        db.set_org_context_enabled("org-1", false).unwrap();
+
+        let fts_after = db.search_org_chunks_fts("quantum ledger migration", 10).unwrap();
+        assert!(
+            fts_after.iter().all(|h| h.item_id != "it-disabled"),
+            "the disabled org's item must be ABSENT from FTS, not just re-ranked: {:?}",
+            fts_after.iter().map(|h| &h.item_id).collect::<Vec<_>>()
+        );
+        assert!(
+            fts_after.iter().any(|h| h.item_id == "it-enabled"),
+            "the STILL-enabled org's item must keep surfacing normally"
+        );
+
+        let qv = emb
+            .embed_query(&["quantum ledger migration".to_string()])
+            .unwrap()
+            .remove(0);
+        let knn_after = db.search_org_chunks_knn(&qv, 10).unwrap();
+        assert!(
+            knn_after.iter().all(|h| h.item_id != "it-disabled"),
+            "the disabled org's item must be ABSENT from KNN too: {:?}",
+            knn_after.iter().map(|h| &h.item_id).collect::<Vec<_>>()
+        );
+        assert!(knn_after.iter().any(|h| h.item_id == "it-enabled"));
+
+        // Re-enabling is instant — no re-sync/re-ingest needed, the replica was never touched.
+        db.set_org_context_enabled("org-1", true).unwrap();
+        let fts_reenabled = db.search_org_chunks_fts("quantum ledger migration", 10).unwrap();
+        assert_eq!(fts_reenabled.len(), 2, "re-enabling instantly restores visibility, no re-sync");
     }
 
     /// The self-share dedup source: `all_org_shared_content_hashes` returns every non-null
