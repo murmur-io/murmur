@@ -233,6 +233,22 @@
   align-self: flex-start;
 }
 
+/* ── Per-instance org toggle ── */
+.context-toggle-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+.context-disabled-pill {
+  background: transparent;
+  color: var(--text-secondary);
+  border: 1px solid var(--border-strong);
+}
+.context-disabled-note {
+  font-size: 0.8125rem;
+}
+
 /* Shared text input — mirrors the account section's input treatment via tokens. */
 .text-input {
   height: 38px;

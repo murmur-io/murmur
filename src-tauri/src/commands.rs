@@ -6895,6 +6895,7 @@ mod entity_dossier_tests {
             consented: true,
             last_seq: 0,
             generation: 1,
+            context_enabled: true,
         })
         .unwrap();
     }
@@ -20106,6 +20107,7 @@ mod lifecycle_tests {
                 consented: true,
                 last_seq: 0,
                 generation: 1,
+                context_enabled: true,
             })
             .unwrap();
         state
@@ -24132,6 +24134,82 @@ mod lifecycle_tests {
         ));
     }
 
+    /// PER-INSTANCE ORG TOGGLE (RED-before-GREEN): a DISABLED org's `list_org_items_inner` returns
+    /// EMPTY — not an error (disabling is a deliberate, reversible local setting, not a membership
+    /// problem) — even though the local replica still has live items. Re-enabling instantly restores
+    /// the listing, proving the replica itself is untouched by the toggle.
+    #[test]
+    fn list_org_items_inner_is_empty_for_a_disabled_org_and_restores_on_reenable() {
+        let state = build_state("org-list-items-disabled");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        state
+            .db
+            .upsert_org_item("m1", "org-1", 1, "anna", "Kickoff", "body", "2026-07-11T09:00:00Z", 1, 1, &[1u8; 32], None, None)
+            .unwrap();
+
+        assert_eq!(list_org_items_inner(&state, "org-1").unwrap().len(), 1, "visible while enabled");
+
+        state.db.set_org_context_enabled("org-1", false).unwrap();
+        assert_eq!(
+            list_org_items_inner(&state, "org-1").unwrap(),
+            Vec::new(),
+            "a disabled org's item list must be EMPTY, not an error"
+        );
+
+        state.db.set_org_context_enabled("org-1", true).unwrap();
+        assert_eq!(
+            list_org_items_inner(&state, "org-1").unwrap().len(),
+            1,
+            "re-enabling instantly restores the listing — the replica was never touched"
+        );
+    }
+
+    /// `org_set_context_enabled_inner` (RED-before-GREEN): flips the per-instance toggle for a
+    /// MEMBER org, refuses a non-member (never lets a caller toggle an org it isn't in), and an
+    /// incoming `upsert_org_state` status refresh NEVER silently re-enables a locally-disabled org —
+    /// mirrors the existing `consented`/`last_seq` preservation contract.
+    #[test]
+    fn org_set_context_enabled_toggles_gates_non_members_and_survives_a_status_refresh() {
+        let state = build_state("org-set-context-enabled");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+
+        assert!(state.db.get_org_state("org-1").unwrap().unwrap().context_enabled);
+        org_set_context_enabled_inner(&state, "org-1", false).unwrap();
+        assert!(!state.db.get_org_state("org-1").unwrap().unwrap().context_enabled);
+
+        // Refuses a non-member — never toggles an org the caller isn't in.
+        assert!(matches!(
+            org_set_context_enabled_inner(&state, "org-not-mine", true),
+            Err(AppError::InvalidArg(_))
+        ));
+
+        // An incoming status refresh (e.g. `org_refresh`) must NOT silently re-enable the org the
+        // user explicitly disabled — mirrors the consent/cursor preservation contract.
+        state
+            .db
+            .upsert_org_state(&crate::storage::OrgState {
+                org_id: "org-1".to_string(),
+                name: "Acme Corp".to_string(), // the refresh DOES update name/role/generation...
+                role: "member".to_string(),
+                joined_at: "2026-07-10T00:00:00Z".to_string(),
+                consented: true,
+                last_seq: 0,
+                generation: 2,
+                context_enabled: true, // ...but this must be IGNORED, not applied.
+            })
+            .unwrap();
+        let row = state.db.get_org_state("org-1").unwrap().unwrap();
+        assert_eq!(row.name, "Acme Corp", "the refresh still updates name normally");
+        assert!(
+            !row.context_enabled,
+            "a status refresh must NEVER silently re-enable a locally-disabled org"
+        );
+
+        // Re-enable, explicit.
+        org_set_context_enabled_inner(&state, "org-1", true).unwrap();
+        assert!(state.db.get_org_state("org-1").unwrap().unwrap().context_enabled);
+    }
+
     /// `meeting_org_shares`: an OPEN meeting's active org shares are visible (org id + display
     /// name), and a SEALED-and-not-session-unlocked meeting's org-share status is MASKED to an empty
     /// list — exactly like `get_meeting_detail`'s `locked: true` masking. RED on any pre-gate version
@@ -24328,6 +24406,7 @@ mod lifecycle_tests {
                 consented: false,
                 last_seq: 0,
                 generation: 1,
+                context_enabled: true,
             })
             .unwrap();
         // Grant local consent + advance the cursor + bump the generation.
@@ -24346,6 +24425,7 @@ mod lifecycle_tests {
                 consented: false, // an incoming refresh's false must NOT clobber the local grant
                 last_seq: 0,      // …nor rewind the cursor
                 generation: 3,
+                context_enabled: true,
             })
             .unwrap();
         let row = state.db.get_org_state("org-1").unwrap().unwrap();
@@ -24373,6 +24453,7 @@ mod lifecycle_tests {
             consented: false,
             last_seq: 0,
             generation,
+            context_enabled: true,
         })
         .unwrap();
     }
@@ -24389,6 +24470,7 @@ mod lifecycle_tests {
             consented: false,
             last_seq: 0,
             generation: 1,
+            context_enabled: true,
         })
         .unwrap();
     }
@@ -25855,6 +25937,9 @@ pub struct OrgStatus {
     /// `received_count`, so the Settings count no longer lies "0 items" to a receiver.
     pub received_count: u32,
     pub pending_shares: u32,
+    /// PER-INSTANCE org toggle: whether this org contributes content (browsing + brain context) on
+    /// THIS Murmur install. `true` by default; flip via `org_set_context_enabled`.
+    pub context_enabled: bool,
 }
 
 /// One org member row for the FE (spec DTO `OrgMember`).
@@ -26142,6 +26227,7 @@ pub(crate) async fn org_create_inner(state: &AppState, name: String) -> Result<O
         consented: false,
         last_seq: 0,
         generation: created.current_generation,
+        context_enabled: true,
     })?;
     {
         let mut cache = state
@@ -26165,6 +26251,7 @@ pub(crate) async fn org_create_inner(state: &AppState, name: String) -> Result<O
         item_count: 0,
         received_count: 0,
         pending_shares: 0,
+        context_enabled: true,
     }))
 }
 
@@ -26200,6 +26287,31 @@ pub(crate) async fn org_list_statuses_inner(state: &AppState) -> Result<Vec<OrgS
     Ok(out)
 }
 
+/// `org_set_context_enabled(org_id, enabled)` — the PER-INSTANCE org toggle (Settings →
+/// Organization): whether a JOINED org contributes content on THIS Murmur install. Membership-checked
+/// via [`resolve_org`] (refuses an org the caller isn't a local member of, exactly like every other
+/// per-org command); the actual gate lives in `Db::set_org_context_enabled` + the `context_enabled = 1`
+/// filter in `search_org_chunks_knn`/`_fts`/`list_org_items_inner` — this command only flips the flag.
+/// Disabling NEVER deletes the local replica (re-enabling is instant, no re-sync); NO egress, NO
+/// server call — purely local.
+#[tauri::command]
+pub fn org_set_context_enabled(
+    state: State<'_, AppState>,
+    org_id: String,
+    enabled: bool,
+) -> Result<(), AppError> {
+    org_set_context_enabled_inner(state.inner(), &org_id, enabled)
+}
+
+pub(crate) fn org_set_context_enabled_inner(
+    state: &AppState,
+    org_id: &str,
+    enabled: bool,
+) -> Result<(), AppError> {
+    resolve_org(state, org_id)?; // membership re-check
+    state.db.set_org_context_enabled(org_id, enabled)
+}
+
 /// Build the content-free [`OrgStatus`] for ONE locally-joined org. Refreshes name/role/generation +
 /// member_count from the server best-effort (offline / a per-org error falls back to the cached row),
 /// then reads pending/item counts from the local outbound `org_shares` and the GLOBAL egress consent.
@@ -26224,6 +26336,7 @@ async fn org_status_for(
                         consented: local.consented,
                         last_seq: local.last_seq,
                         generation: fresh.current_generation,
+                        context_enabled: true,
                     })?;
                     state.db.set_org_generation(&local.org_id, fresh.current_generation)?;
                     client
@@ -26269,6 +26382,7 @@ async fn org_status_for(
         item_count,
         received_count,
         pending_shares: pending,
+        context_enabled: refreshed.context_enabled,
     })
 }
 
@@ -26380,6 +26494,7 @@ fn reconcile_org_state_into_db(
             consented: false,
             last_seq: 0,
             generation: o.current_generation,
+            context_enabled: true,
         })?;
         if is_new {
             new_orgs.push((o.org_id.clone(), o.current_generation));
@@ -28250,6 +28365,13 @@ pub(crate) fn list_org_items_inner(
 ) -> Result<Vec<crate::storage::models::OrgItemHeader>, AppError> {
     // Membership re-check: refuse if the caller isn't a local member of this org.
     let org = resolve_org(st, org_id)?;
+    // PER-INSTANCE ORG TOGGLE: a disabled org is EMPTY here — not an error (it's a deliberate,
+    // reversible local setting, not a membership problem) — the local replica is never deleted, so
+    // this is silent and instant to reverse. Mirrors the `context_enabled = 1` SQL filter in
+    // `search_org_chunks_knn`/`_fts`; this is the direct-browse (Library "Shared brains") twin.
+    if !org.context_enabled {
+        return Ok(Vec::new());
+    }
     let mut items = st.db.list_org_items(&org.org_id)?;
     // OWNERSHIP ENRICHMENT (F-org-editable): for each replica the CALLER published, resolve its local
     // editable source + CURRENT title so the FE links straight to the editable original and never shows

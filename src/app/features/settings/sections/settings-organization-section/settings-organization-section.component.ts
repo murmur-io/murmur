@@ -69,6 +69,10 @@ export class SettingsOrganizationSectionComponent {
   private readonly _busyOrgId = signal<string | null>(null);
   readonly busyOrgId = this._busyOrgId.asReadonly();
 
+  /** The org id currently flipping its per-instance context toggle — locks that row's control. */
+  private readonly _contextTogglingOrgId = signal<string | null>(null);
+  readonly contextTogglingOrgId = this._contextTogglingOrgId.asReadonly();
+
   /** The signed-in account email (header context); `null` until loaded / logged out. */
   private readonly _email = signal<string | null>(null);
   readonly email = this._email.asReadonly();
@@ -390,6 +394,37 @@ export class SettingsOrganizationSectionComponent {
       this._error.set(String(e));
     } finally {
       this._busyOrgId.set(null);
+    }
+  }
+
+  // ── Per-org: active on this device (per-instance context toggle) ───────────────
+
+  /**
+   * Flip whether this org contributes content — browsing + brain/assistant
+   * context — on THIS Murmur install. Optimistic local flip (mirrors {@link
+   * toggleConsent}) with rollback on failure; purely local, no egress. Disabling
+   * never deletes the synced replica, so re-enabling is instant.
+   */
+  async toggleContextEnabled(org: OrgStatus): Promise<void> {
+    if (this._contextTogglingOrgId() !== null) {
+      return;
+    }
+    const next = !org.contextEnabled;
+    this._contextTogglingOrgId.set(org.orgId);
+    this._error.set(null);
+    this._orgs.update((list) =>
+      list.map((o) => (o.orgId === org.orgId ? { ...o, contextEnabled: next } : o)),
+    );
+    try {
+      await this.ipc.orgSetContextEnabled(org.orgId, next);
+    } catch (e) {
+      // Roll back the optimistic flip on failure.
+      this._orgs.update((list) =>
+        list.map((o) => (o.orgId === org.orgId ? { ...o, contextEnabled: !next } : o)),
+      );
+      this._error.set(String(e));
+    } finally {
+      this._contextTogglingOrgId.set(null);
     }
   }
 
