@@ -27,6 +27,11 @@ const ORG_STATUSES = () => [
     itemCount: 2,
     receivedCount: 2,
     pendingShares: 0,
+    // Per-instance active/inactive toggle (origin/murmur#273 follow-up) —
+    // Library/Notes' org chip rows filter to contextEnabled orgs only, so a
+    // fixture missing this field renders an empty chip row (looks like the
+    // org vanished, not like a stale fixture — 2026-07-12).
+    contextEnabled: true,
   },
 ];
 

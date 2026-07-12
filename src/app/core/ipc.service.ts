@@ -553,6 +553,16 @@ export class IpcService {
   }
 
   /**
+   * PER-INSTANCE org toggle (Settings → Organization): flip whether a JOINED org
+   * contributes content — browsing + brain/assistant context — on THIS Murmur
+   * install. Membership-checked server-side; purely local, no egress. Disabling
+   * never deletes the local replica, so re-enabling is instant.
+   */
+  orgSetContextEnabled(orgId: string, enabled: boolean): Promise<void> {
+    return invoke<void>("org_set_context_enabled", { orgId, enabled });
+  }
+
+  /**
    * Pull the user's org MEMBERSHIP list from the server (`GET /v1/orgs`) and
    * reconcile the local `org_state` — this is what makes an org you were INVITED
    * to (and never created locally) appear. Best-effort: resolves even if the

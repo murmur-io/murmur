@@ -35,6 +35,9 @@ const ORG_MOCKS = {
       itemCount: 0,
       receivedCount: 1,
       pendingShares: 0,
+      // Per-instance active/inactive toggle (origin/murmur#273 follow-up) —
+      // Library/Notes' org chip rows filter to contextEnabled orgs only.
+      contextEnabled: true,
     },
   ],
   list_org_items: (args: { orgId: string }) =>

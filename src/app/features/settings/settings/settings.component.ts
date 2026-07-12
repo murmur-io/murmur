@@ -8,6 +8,7 @@ import {
 } from "@angular/core";
 import { toSignal } from "@angular/core/rxjs-interop";
 import { FormControl, ReactiveFormsModule } from "@angular/forms";
+import { ActivatedRoute } from "@angular/router";
 import { startWith } from "rxjs";
 import { NavHistoryService } from "../../../core/nav-history.service";
 import { MurSidebarComponent } from "../../../design-system/sidebar/sidebar.component";
@@ -115,6 +116,10 @@ export class SettingsComponent implements OnInit {
   /** Drill-down back navigation ("← Murmur" + Esc) — no settings state coupling. */
   readonly nav = inject(NavHistoryService);
 
+  /** Deep-link support: `?section=<id>` (e.g. from the Library "Shared brains" rail's
+   * settings shortcut) opens directly on that section instead of the Appearance default. */
+  private readonly route = inject(ActivatedRoute);
+
   /**
    * Esc while in settings. Backs out to where you came from — EXCEPT while you're
    * typing: in the search box the first Esc clears it (or blurs when empty), and
@@ -206,5 +211,11 @@ export class SettingsComponent implements OnInit {
     // Pre-split this was an async ngOnInit whose promise Angular ignored;
     // `void` keeps identical fire-and-forget semantics.
     void this.store.load();
+    // `?section=<id>` deep-link — only honored when it names a REAL section, so a stale/typo'd
+    // link falls back to the default (Appearance) instead of a blank right pane.
+    const requested = this.route.snapshot.queryParamMap.get("section");
+    if (requested && this.sections.some((s) => s.id === requested)) {
+      this.activeSection.set(requested);
+    }
   }
 }

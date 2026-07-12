@@ -32,19 +32,29 @@ pub const TIER1_SUFFIX: &str = "SCOPE — CURRENT MEETING ONLY: Answer STRICTLY 
     EXACTLY this JSON and nothing else: {\"answer\":\"__ESCALATE__\"}. Otherwise answer normally.";
 
 /// Tier 2 — answer from the user's OWN VAULT (their saved meetings/notes) via the gated search tools;
-/// if the vault doesn't cover it, escalate.
+/// if the vault doesn't cover it, escalate. B1 (Shared Brain): the org/Shared Brain tool itself is
+/// NOT reachable at this tier (it is Tier-3/Connectors-class, `tools::AssistantScope::allows`), so the
+/// steering here is to escalate rather than give up — the ACTUAL "also try org" instruction lives in
+/// [`TIER3_SUFFIX`], the tier that can actually call it.
 pub const TIER2_SUFFIX: &str = "SCOPE — YOUR VAULT: Answer from the user's OWN saved meetings and notes, \
     using the gated vault search tools to ground your answer. Cite meetings by their [[Title]] \
     wikilink. If — and only if — the answer is NOT in the user's vault (it needs the web, Jira, \
-    Slack, or the calendar), reply with EXACTLY this JSON and nothing else: \
-    {\"answer\":\"__ESCALATE__\"}. Otherwise answer normally.";
+    Slack, the calendar, or your organization's Shared Brain), reply with EXACTLY this JSON and \
+    nothing else: {\"answer\":\"__ESCALATE__\"}. Otherwise answer normally.";
 
 /// Tier 3 — TERMINAL: reach the consent-gated connectors/web. If it still can't be answered, say so
-/// honestly — there is NO further tier, so NEVER emit the escalation sentinel here.
+/// honestly — there is NO further tier, so NEVER emit the escalation sentinel here. B1 (Shared Brain):
+/// explicitly steers the model to also try `org_brain_search` before concluding it doesn't know — the
+/// tool is already advertised at this tier (`AssistantScope::Connectors` allows `org_brain_search`,
+/// tools.rs) but a model that never CHOOSES to call it would otherwise silently skip a colleague's
+/// answer. No new tier/UI/badge — reuses the existing `[org · author]` citation format.
 pub const TIER3_SUFFIX: &str = "SCOPE — CONNECTORS & WEB (last resort): Use the consent-gated connector \
-    and web tools (and the vault tools for grounding) to answer. Loud-attribute external facts \
-    (\"(via web)\", \"(via Jira)\", \"(via Slack)\"). This is the LAST step — if you still cannot \
-    find the answer, say so plainly; do NOT emit any escalation marker.";
+    and web tools (and the vault tools for grounding) to answer. If the current meeting and your own \
+    vault don't answer this, ALSO try org_brain_search (your organization's Shared Brain) before \
+    concluding you don't know — a colleague may have already answered it. Loud-attribute external \
+    facts (\"(via web)\", \"(via Jira)\", \"(via Slack)\") and org facts by their \"[org · author]\" \
+    provenance. This is the LAST step — if you still cannot find the answer, say so plainly; do NOT \
+    emit any escalation marker.";
 
 // ── RECORDING-AWARENESS phrases (moved verbatim from `voice_action`) ─────────────────────────────
 // The THREE load-bearing substrings BOTH the cloud cascade prompt
@@ -104,6 +114,28 @@ mod tests {
         assert!(
             !TIER3_SUFFIX.contains(crate::agent::ESCALATE_SENTINEL),
             "the terminal tier must never be told to emit the sentinel"
+        );
+    }
+
+    /// B1 (Shared Brain, RED-before-GREEN): the TERMINAL Tier 3 suffix — the only tier that can
+    /// actually reach `org_brain_search` (`AssistantScope::Connectors`/`Full`) — must explicitly
+    /// steer the model to try it before concluding it doesn't know, mirroring the A2 fallback
+    /// sentence. Tier 2 must at least MENTION the Shared Brain as a reason to escalate rather than
+    /// give up. Pre-fix, neither suffix mentioned org/Shared Brain at all.
+    #[test]
+    fn tier3_suffix_steers_toward_org_brain_search_before_giving_up() {
+        assert!(
+            TIER3_SUFFIX.contains("org_brain_search"),
+            "the terminal tier must explicitly name org_brain_search as a fallback: {TIER3_SUFFIX}"
+        );
+        assert!(
+            TIER3_SUFFIX.to_lowercase().contains("shared brain")
+                || TIER3_SUFFIX.contains("[org ·"),
+            "the terminal tier must frame org search as the Shared Brain / attribute its provenance: {TIER3_SUFFIX}"
+        );
+        assert!(
+            TIER2_SUFFIX.to_lowercase().contains("shared brain"),
+            "Tier 2 must mention the Shared Brain as a reason to escalate, not just give up: {TIER2_SUFFIX}"
         );
     }
 
