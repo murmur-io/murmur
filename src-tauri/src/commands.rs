@@ -1479,12 +1479,21 @@ pub fn get_last_note(state: State<'_, AppState>) -> Result<Option<NoteDto>, AppE
 /// failure NEVER fails the save (`let _ = …`); the launch sweep retries a `failed` row.
 #[tauri::command]
 pub async fn update_note(
+    app: AppHandle,
     state: State<'_, AppState>,
     meeting_id: String,
     markdown: String,
 ) -> Result<NoteDto, AppError> {
     let dto = update_note_inner(state.inner(), &meeting_id, &markdown)?;
-    let _ = republish_org_shares_for_source(state.inner(), Some(&meeting_id), None).await;
+    // If the edit re-published ≥1 org copy, ping open org views (Notes list + Settings) so the fresh
+    // title/body shows without a manual "Sync now". Best-effort — a republish failure never fails the save.
+    if republish_org_shares_for_source(state.inner(), Some(&meeting_id), None)
+        .await
+        .unwrap_or(0)
+        > 0
+    {
+        crate::events::emit_org_feed_updated(&app, 1);
+    }
     Ok(dto)
 }
 
@@ -2472,13 +2481,21 @@ pub(crate) fn list_notes_inner(
 /// `save_note_text` autosave (OCK-seal + egress per keystroke is unacceptable) — only this commit path.
 #[tauri::command]
 pub async fn update_note_doc(
+    app: AppHandle,
     state: State<'_, AppState>,
     id: String,
     title: String,
     markdown: String,
 ) -> Result<NoteDoc, AppError> {
     let doc = update_note_doc_inner(state.inner(), &id, &title, &markdown)?;
-    let _ = republish_org_shares_for_source(state.inner(), None, Some(&id)).await;
+    // See `update_note`: ping open org views when the edit re-published ≥1 org copy. Best-effort.
+    if republish_org_shares_for_source(state.inner(), None, Some(&id))
+        .await
+        .unwrap_or(0)
+        > 0
+    {
+        crate::events::emit_org_feed_updated(&app, 1);
+    }
     Ok(doc)
 }
 
@@ -8340,8 +8357,15 @@ pub async fn resummarize(
     }
     let result = pipeline::resummarize_existing(&app, &state, &meeting_id).await?;
     // COMMIT BOUNDARY: a re-summarize rewrites the meeting's note → BEST-EFFORT re-publish any org
-    // shares of it so members see the fresh summary. Best-effort — never fails the re-summarize.
-    let _ = republish_org_shares_for_source(state.inner(), Some(&meeting_id), None).await;
+    // shares of it so members see the fresh summary. Best-effort — never fails the re-summarize. If
+    // ≥1 org copy was re-published, ping open org views so the fresh summary shows without a manual sync.
+    if republish_org_shares_for_source(state.inner(), Some(&meeting_id), None)
+        .await
+        .unwrap_or(0)
+        > 0
+    {
+        crate::events::emit_org_feed_updated(&app, 1);
+    }
     Ok(StopResult {
         meeting_id: result.meeting_id,
         markdown: result.note_markdown,
@@ -23890,6 +23914,125 @@ mod lifecycle_tests {
         .unwrap();
     }
 
+    /// IDEMPOTENCY — the double-click / re-click DUPLICATE fix. `share_to_org_inner` for a source that is
+    /// ALREADY live (`uploaded`) in the org returns the EXISTING share WITHOUT publishing a second item:
+    /// no new `org_shares` row, no egress. RED before the guard: unpatched `share_to_org_inner` falls
+    /// straight into `publish_org_body`, which with no live session/consent in a unit test ERRORS instead
+    /// of returning the already-shared item. GREEN: the guard short-circuits BEFORE the publish path.
+    #[test]
+    fn share_to_org_inner_is_idempotent_for_an_already_uploaded_source() {
+        let state = build_state("org-share-idem");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        // The FIRST click already published ONE uploaded share of document n1 into org-1.
+        state
+            .db
+            .insert_org_share(
+                "s1", "org-1", None, Some("n1"), "note", Some("A Note"), 1, 1, &[9u8; 32],
+                "2026-07-11T09:00:00Z",
+            )
+            .unwrap();
+        state
+            .db
+            .set_org_share_uploaded("s1", "item-1", "2026-07-11T09:00:00Z")
+            .unwrap();
+
+        let before = state.db.list_org_shares_for_org("org-1").unwrap().len();
+        // The SECOND share of the same source (the double-click) must NOT publish again.
+        let entry = block_on(share_to_org_inner(
+            &state,
+            "org-1",
+            None,
+            Some("n1".to_string()),
+            false,
+        ))
+        .unwrap();
+        assert_eq!(
+            entry.item_id.as_deref(),
+            Some("item-1"),
+            "returns the EXISTING item, not a fresh publish"
+        );
+        assert_eq!(entry.state, "uploaded");
+        let after = state.db.list_org_shares_for_org("org-1").unwrap();
+        assert_eq!(after.len(), before, "no new org_shares row was inserted (no duplicate)");
+        assert_eq!(
+            after.iter().filter(|r| r.state == "uploaded").count(),
+            1,
+            "still exactly one live share"
+        );
+    }
+
+    /// COLLAPSE — auto-clean of duplicates that already exist. `share_to_org_inner` on a source with
+    /// MULTIPLE live copies in one org returns the EARLIEST (the keeper) and marks the extras for teardown
+    /// (`revoke_pending`). The tombstone network call fails in a unit test (no session) but is
+    /// best-effort: `revoke_org_share_inner` marks the row `revoke_pending` FIRST (the launch sweep
+    /// finishes it), and the swallowed error never breaks the idempotent return.
+    #[test]
+    fn share_to_org_inner_collapses_existing_duplicates_keeping_the_earliest() {
+        let state = build_state("org-share-collapse");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        // Two accidental duplicates of (org-1, n1): earliest = keeper, later = the extra to tombstone.
+        state
+            .db
+            .insert_org_share(
+                "keep", "org-1", None, Some("n1"), "note", Some("A Note"), 1, 1, &[1u8; 32],
+                "2026-07-11T09:00:00Z",
+            )
+            .unwrap();
+        state
+            .db
+            .set_org_share_uploaded("keep", "item-keep", "2026-07-11T09:00:00Z")
+            .unwrap();
+        state
+            .db
+            .insert_org_share(
+                "dup", "org-1", None, Some("n1"), "note", Some("A Note"), 1, 1, &[2u8; 32],
+                "2026-07-11T09:05:00Z",
+            )
+            .unwrap();
+        state
+            .db
+            .set_org_share_uploaded("dup", "item-dup", "2026-07-11T09:05:00Z")
+            .unwrap();
+        // A NOT-yet-uploaded sibling (a stuck pending retry) for the same source — redundant, cancelled.
+        state
+            .db
+            .insert_org_share(
+                "pending", "org-1", None, Some("n1"), "note", Some("A Note"), 1, 1, &[3u8; 32],
+                "2026-07-11T09:06:00Z",
+            )
+            .unwrap();
+
+        let entry = block_on(share_to_org_inner(
+            &state,
+            "org-1",
+            None,
+            Some("n1".to_string()),
+            false,
+        ))
+        .unwrap();
+        assert_eq!(
+            entry.item_id.as_deref(),
+            Some("item-keep"),
+            "the EARLIEST live copy is the keeper"
+        );
+        // Keeper stays uploaded; the duplicate is queued for tombstone. No new row was minted.
+        assert_eq!(
+            state.db.get_org_share("keep").unwrap().unwrap().state,
+            "uploaded",
+            "keeper untouched"
+        );
+        assert_eq!(
+            state.db.get_org_share("dup").unwrap().unwrap().state,
+            "revoke_pending",
+            "the duplicate is marked for tombstone (launch sweep finishes it)"
+        );
+        assert_eq!(
+            state.db.get_org_share("pending").unwrap().unwrap().state,
+            "revoked",
+            "a redundant not-yet-uploaded sibling is cancelled locally (no server item)"
+        );
+    }
+
     /// MULTI-ORG STATUS (RED→GREEN for the single-org `.next()` bug): `org_list_statuses` must return
     /// an `OrgStatus` for EVERY locally-joined org — the one I created AND the one I was invited to —
     /// not just the first. With no server configured (empty base URL) it stays offline: each status
@@ -24412,6 +24555,54 @@ mod lifecycle_tests {
             state.db.count_share_egress_by_kind("org_share_revoke").unwrap(),
             1
         );
+    }
+
+    /// B1 (owner-live-refresh) — the OWNER's OWN first-time share must appear in `list_org_items`
+    /// IMMEDIATELY via the local `org_items` replica, not only after a later feed pull. RED before the
+    /// fix (`publish_org_body` published to the server but never upserted the local row → the shared
+    /// note was invisible in the Notes org view / Settings browse until a manual "Sync now"); GREEN
+    /// after: one owned/editable card resolves right away carrying the note's CURRENT title.
+    #[test]
+    fn initial_share_populates_local_org_items_replica_immediately() {
+        let mock = MockOrgServer::start();
+        let state = build_state("org-initial-share-replica");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        make_open_folder(&state.db, "f-sh", "Team");
+        state
+            .db
+            .insert_note("n-sh", "f-sh", "plan", "Kickoff Plan", "# body to share", 1)
+            .unwrap();
+
+        state.config.lock().unwrap().org_egress_consented = true;
+        state.config.lock().unwrap().share_base_url = mock.base.clone();
+        seed_live_session(&state);
+        seed_ock(&state, "org-1", 1);
+
+        let entry = block_on(share_to_org_inner(
+            &state,
+            "org-1",
+            None,
+            Some("n-sh".to_string()),
+            true,
+        ))
+        .expect("initial share should publish against the mock server");
+        assert_eq!(entry.item_id.as_deref(), Some("item-1"));
+
+        // The local replica must ALREADY hold the item — no feed pull has happened. This is exactly what
+        // makes the shared note show up without a manual "Sync now".
+        let items = list_org_items_inner(&state, "org-1").unwrap();
+        assert_eq!(
+            items.len(),
+            1,
+            "the owner's own share is in the local replica immediately (no pull needed)"
+        );
+        assert_eq!(items[0].item_id, "item-1");
+        // The caller authored it → resolved as an OWNED/editable card with the note's CURRENT title.
+        assert!(
+            items[0].owned_source.is_some(),
+            "the author's own item resolves to an owned/editable source"
+        );
+        assert_eq!(items[0].title, "Kickoff Plan");
     }
 
     /// ITEM 1 — a republish MUST NOT tombstone-into-nothing. Lock the note's folder AFTER the share,
@@ -25230,6 +25421,18 @@ pub struct OrgShareEntry {
     pub shared_at: String,
     pub rev: u32,
     pub state: String,
+}
+
+/// Which org already holds a LIVE (`uploaded`) share of a given LOCAL source (meeting/note), so the FE
+/// can mark that org "Already added ✓" and BLOCK a re-share (the double-click duplicate fix). Content-
+/// free: only the org id + the server item id + rev — never a title or any other member's data. Powers
+/// `org_live_shares_for_source` (a READ, no egress).
+#[derive(serde::Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct OrgSourceShareStatus {
+    pub org_id: String,
+    pub item_id: Option<String>,
+    pub rev: u32,
 }
 
 /// The LOCAL editable SOURCE behind an org item, if the CALLER is its author. `org_resolve_source`
@@ -26109,23 +26312,35 @@ pub(crate) fn preview_org_share_inner(
 /// misroute that shared into the FIRST org, not the chosen one.
 #[tauri::command]
 pub async fn share_meeting_to_org(
+    app: AppHandle,
     state: State<'_, AppState>,
     org_id: String,
     meeting_id: String,
     scrub: bool,
 ) -> Result<OrgShareEntry, AppError> {
-    share_to_org_inner(state.inner(), &org_id, Some(meeting_id), None, scrub).await
+    let entry = share_to_org_inner(state.inner(), &org_id, Some(meeting_id), None, scrub).await?;
+    // A successful share now lives in the local replica (`publish_org_body` upserts it) AND the server
+    // feed — ping every open org view (Notes list + Settings shared-brain) to re-fetch immediately, so
+    // the shared note appears without a manual "Sync now". Content-free count-only event; a best-effort
+    // emit never affects the share result.
+    crate::events::emit_org_feed_updated(&app, 1);
+    Ok(entry)
 }
 
 /// `share_document_to_org(org_id, document_id, scrub)` — the note twin of [`share_meeting_to_org`].
 #[tauri::command]
 pub async fn share_document_to_org(
+    app: AppHandle,
     state: State<'_, AppState>,
     org_id: String,
     document_id: String,
     scrub: bool,
 ) -> Result<OrgShareEntry, AppError> {
-    share_to_org_inner(state.inner(), &org_id, None, Some(document_id), scrub).await
+    let entry = share_to_org_inner(state.inner(), &org_id, None, Some(document_id), scrub).await?;
+    // See `share_meeting_to_org`: ping open org views so the freshly-shared note appears without a
+    // manual "Sync now". Content-free; best-effort.
+    crate::events::emit_org_feed_updated(&app, 1);
+    Ok(entry)
 }
 
 pub(crate) async fn share_to_org_inner(
@@ -26135,9 +26350,79 @@ pub(crate) async fn share_to_org_inner(
     document_id: Option<String>,
     scrub: bool,
 ) -> Result<OrgShareEntry, AppError> {
-    // Initial share = rev 1. A re-publish-on-edit supersede bumps the rev (see
-    // `republish_org_shares_for_source`, which calls `publish_org_body` with `old_rev + 1`).
+    // IDEMPOTENCY (the double-click / re-click DUPLICATE fix). A user-initiated share of a source that
+    // is ALREADY live in this org must NOT mint a second feed item. The pre-fix hole: `publish_org_body`
+    // → `find_reusable_org_share` only reuses `queued`/`failed` rows, so a second click AFTER the first
+    // upload succeeded found no reusable row, inserted a fresh one, and published a DISTINCT item →
+    // the note appeared twice. Here we resolve the org (membership-checked) and look for an existing
+    // `uploaded` share of this exact (org, source): if one exists we COLLAPSE any accidental extras
+    // (keep the earliest, tombstone the rest — the user opted into auto-clean) and RETURN the survivor
+    // WITHOUT publishing. This is a READ + a dedup of the caller's OWN shares, NOT fresh content egress,
+    // so it runs BEFORE the org-egress consent gate — re-clicking an already-shared note never needs
+    // re-consent. Freshness on EDIT is `republish_org_shares_for_source`'s job, never this button's.
+    let org = resolve_org(state, org_id)?;
+    if let Some(keeper) = collapse_org_share_dups_for_source(
+        state,
+        &org.org_id,
+        meeting_id.as_deref(),
+        document_id.as_deref(),
+    )
+    .await?
+    {
+        return Ok(OrgShareEntry {
+            item_id: keeper.item_id,
+            kind: keeper.kind,
+            title: keeper.title,
+            shared_at: keeper.created_at,
+            rev: keeper.rev,
+            state: keeper.state,
+        });
+    }
+
+    // Not yet live in this org → the normal first share = rev 1. A re-publish-on-edit supersede bumps
+    // the rev (see `republish_org_shares_for_source`, which calls `publish_org_body` with `old_rev + 1`).
     publish_org_body(state, org_id, meeting_id, document_id, scrub, 1).await
+}
+
+/// Collapse accidental DUPLICATE live (`uploaded`) org items for ONE (org, source) down to the earliest,
+/// tombstoning the rest, and return the SURVIVOR (the earliest `uploaded` row) — or `None` when the
+/// source is not currently live in this org. The keeper = the oldest published item (the identity other
+/// members first synced); every later duplicate is revoked via `revoke_org_share_inner` (tombstone the
+/// server item + mark the local row revoked). BEST-EFFORT on each tombstone: a network failure leaves
+/// the extra `revoke_pending` (the launch sweep finishes it) and simply isn't cleaned this pass — it
+/// NEVER fails the idempotent share. No content is read or egressed here (only the caller's own share
+/// rows + a tombstone of a redundant copy), so it is safe to run before the egress-consent gate.
+async fn collapse_org_share_dups_for_source(
+    state: &AppState,
+    org_id: &str,
+    meeting_id: Option<&str>,
+    document_id: Option<&str>,
+) -> Result<Option<crate::storage::OrgShareRow>, AppError> {
+    // Oldest-first, so `remove(0)` is the canonical keeper and the remainder are the extras.
+    let mut rows =
+        state
+            .db
+            .uploaded_org_shares_for_source_in_org(org_id, meeting_id, document_id)?;
+    if rows.is_empty() {
+        return Ok(None);
+    }
+    let keeper = rows.remove(0);
+    for extra in rows {
+        if let Some(item_id) = extra.item_id.clone() {
+            // Tombstone the redundant copy. Swallow errors — `revoke_org_share_inner` marks the row
+            // `revoke_pending` first, so an interrupted tombstone is completed by the launch sweep.
+            let _ = revoke_org_share_inner(state, item_id).await;
+        }
+    }
+    // Also cancel any NOT-yet-uploaded sibling (`queued`/`failed`) for this (org, source): the source is
+    // already live (the keeper), so a pending row is redundant and would otherwise linger as a stuck
+    // "pending" share that the launch sweep re-attempts every start. Local-only — these have no server
+    // item to tombstone. Best-effort (never fails the idempotent return).
+    let now = chrono::Utc::now().to_rfc3339();
+    let _ = state
+        .db
+        .cancel_pending_org_shares_for_source_in_org(org_id, meeting_id, document_id, &now);
+    Ok(Some(keeper))
 }
 
 /// The org publish CORE, shared by the FIRST share (`share_to_org_inner`, `rev = 1`) and the
@@ -26309,6 +26594,30 @@ pub(crate) async fn publish_org_body(
         .db
         .set_org_share_uploaded(&row_id, &published.item_id, &now)?;
 
+    // LOCAL REPLICA CONSISTENCY (owner-live-refresh): the author's OWN `org_items` replica would
+    // otherwise stay EMPTY of this item until the next feed pull — so a note the owner just shared is
+    // invisible in `list_org_items` (the Notes org view + Settings browse) until a manual "Sync now".
+    // Upsert it LOCALLY now, mirroring the republish path, so `list_org_items` immediately resolves it
+    // as an owned/editable card. FTS-only (`None` embedder) to keep this share path light; the next real
+    // `org_sync_now` re-ingests authoritatively (idempotent upsert) and re-embeds. Best-effort: a local
+    // replica error must never fail the share (the server copy is already live + correct).
+    if let Err(e) = state.db.upsert_org_item(
+        &published.item_id,
+        &org.org_id,
+        published.seq,
+        &env.author_hint,
+        &env.title,
+        &env.markdown,
+        &env.created_at,
+        rev,
+        generation,
+        &content_sha,
+        env.source_kind.map(crate::share::org_envelope::OrgSourceKind::as_str),
+        None,
+    ) {
+        tracing::warn!(target: "org", error = %e, "share: local replica upsert failed (server copy live)");
+    }
+
     // (7) CONTENT-FREE egress ledger (host + ciphertext byte size). NEVER a title / note text / OCK.
     crate::share::ledger_row(
         &state.db,
@@ -26356,12 +26665,33 @@ pub(crate) async fn republish_org_shares_for_source(
     meeting_id: Option<&str>,
     document_id: Option<&str>,
 ) -> Result<u32, AppError> {
+    // DEDUP FIRST (auto-clean, user-opted-in): collapse any accidental duplicate live items for this
+    // source — PER ORG — down to the earliest BEFORE republishing. Otherwise we'd republish (and keep
+    // alive) every duplicate; the survivor is what the edit then supersedes. Best-effort — a tombstone
+    // failure leaves the extra for the launch sweep's dedup pass and never blocks the save.
+    let dup_orgs: Vec<String> = {
+        let mut v: Vec<String> = state
+            .db
+            .org_shares_for_source(meeting_id, document_id)?
+            .into_iter()
+            .map(|r| r.org_id)
+            .collect();
+        v.sort();
+        v.dedup();
+        v
+    };
+    for org_id in &dup_orgs {
+        let _ =
+            collapse_org_share_dups_for_source(state, org_id, meeting_id, document_id).await;
+    }
+
     let rows = state.db.org_shares_for_source(meeting_id, document_id)?;
     if rows.is_empty() {
         return Ok(0);
     }
-    // Count of rows that produced a NEW published rev this call — the caller emits `org-feed-updated`
-    // only when > 0 (a save that changed nothing / skipped every row must not ping the FE).
+    // Count of rows that produced a NEW published rev this call — returned so the caller can emit
+    // `org-feed-updated` ONLY when > 0 (a save that changed nothing / skipped every row must not ping
+    // the FE).
     let mut republished = 0u32;
     let now = chrono::Utc::now().to_rfc3339();
     for row in rows {
@@ -26593,6 +26923,8 @@ pub(crate) async fn republish_org_shares_for_source(
                 }
             }
         }
+        // This row published a NEW rev this call — count it so the caller emits `org-feed-updated`.
+        republished += 1;
     }
     Ok(republished)
 }
@@ -26733,6 +27065,31 @@ pub(crate) fn list_meeting_org_shares_inner(
         });
     }
     Ok(out)
+}
+
+/// `org_live_shares_for_source(meeting_id?, document_id?)` — which orgs already hold a LIVE (`uploaded`)
+/// share of THIS exact local source, so the FE can mark those orgs "Already added ✓" and BLOCK a
+/// re-share (the double-click duplicate fix). READ-ONLY, no egress. Content-free: only (org_id, item_id,
+/// rev) — never a title or another member's data. Exactly one of meeting_id/document_id is set; both-None
+/// ⇒ empty. Reuses `org_shares_for_source` (uploaded rows across ALL the caller's orgs).
+#[tauri::command]
+pub fn org_live_shares_for_source(
+    state: State<'_, AppState>,
+    meeting_id: Option<String>,
+    document_id: Option<String>,
+) -> Result<Vec<OrgSourceShareStatus>, AppError> {
+    let rows = state
+        .inner()
+        .db
+        .org_shares_for_source(meeting_id.as_deref(), document_id.as_deref())?;
+    Ok(rows
+        .into_iter()
+        .map(|r| OrgSourceShareStatus {
+            org_id: r.org_id,
+            item_id: r.item_id,
+            rev: r.rev,
+        })
+        .collect())
 }
 
 /// `revoke_org_share(item_id)` — tombstone a published org item (destroys its server ciphertext) and
@@ -26914,8 +27271,11 @@ pub async fn revoke_shares_for_folder(
 /// Cadence of the background org-feed sync loop (M6 Shared Brain, spawned in `lib.rs` setup). The
 /// first tick fires `ORG_SYNC_FIRST_DELAY_SECS` after launch (no startup contention); subsequent
 /// ticks every `ORG_SYNC_TICK_SECS`. Every tick is a cheap no-op while logged out / no org joined.
+/// 60s (not 120s) so a member — who has no server push, only this pull — sees a colleague's newly
+/// shared/edited note within ~1 min without a manual "Sync now"; the owner's own shares refresh
+/// instantly via the `org-feed-updated` emit on the share/edit commands.
 pub const ORG_SYNC_FIRST_DELAY_SECS: u64 = 20;
-pub const ORG_SYNC_TICK_SECS: u64 = 120;
+pub const ORG_SYNC_TICK_SECS: u64 = 60;
 
 /// One background org-sync tick: drain the outbound share queue, then pull + ingest the inbound feed
 /// into the local int8 partition. This is what makes the org brain a REPLICATED brain — every
@@ -26979,6 +27339,21 @@ pub(crate) async fn org_sweep_pending_inner(state: &AppState) -> Result<u32, App
         return Ok(0);
     }
     let mut advanced = 0u32;
+
+    // 0) DEDUP (auto-clean, user-opted-in): collapse accidental DUPLICATE live items — same org + same
+    //    source — down to the earliest, tombstoning the extras. Fixes duplicates created BEFORE the
+    //    idempotency guard existed (e.g. a double-click on Share), which self-healing needs a proactive
+    //    pass to reach (the FE now blocks re-share, so the share-time collapse never re-fires for them).
+    //    `duplicate_uploaded_org_shares` returns exactly the extras (never a keeper); each is torn down
+    //    via the crash-safe revoke path (marks `revoke_pending` first, so an interrupted tombstone is
+    //    completed by step 1 on the next pass). Best-effort — a network failure just retries next launch.
+    for extra in state.db.duplicate_uploaded_org_shares()? {
+        if let Some(item_id) = extra.item_id.clone() {
+            if revoke_org_share_inner(state, item_id).await.is_ok() {
+                advanced += 1;
+            }
+        }
+    }
 
     // 1) Finish any pending revokes (a tombstone that didn't land before a crash).
     for row in state.db.list_org_shares_in_state("revoke_pending")? {

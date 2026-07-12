@@ -88,6 +88,7 @@ import type {
   OrgMember,
   OrgSharePreview,
   OrgShareEntry,
+  OrgSourceShareStatus,
   OrgItemDetail,
   OrgItemHeader,
   MeetingOrgShareInfo,
@@ -673,6 +674,21 @@ export class IpcService {
    */
   listMeetingOrgShares(): Promise<MeetingOrgShareRow[]> {
     return invoke<MeetingOrgShareRow[]>("list_meeting_org_shares");
+  }
+
+  /**
+   * Which orgs already hold a LIVE (`uploaded`) share of THIS local source
+   * (meeting XOR note) — so the share sheet can mark those orgs "Already added ✓"
+   * and BLOCK a re-share (the double-click duplicate fix). Read-only, no egress.
+   */
+  orgLiveSharesForSource(args: {
+    meetingId?: string;
+    documentId?: string;
+  }): Promise<OrgSourceShareStatus[]> {
+    return invoke<OrgSourceShareStatus[]>("org_live_shares_for_source", {
+      meetingId: args.meetingId ?? null,
+      documentId: args.documentId ?? null,
+    });
   }
 
   /** Revoke an org share: tombstone the feed item + drop the local ciphertext. Idempotent. */

@@ -30,6 +30,28 @@ A **local-first macOS desktop app** that records meetings, transcribes on-device
 
 **Angular** (`src/app/features/`): `analytics`, `ask`, `bar`, `detail`, `folders`, `graph`, `library`, `onboarding`, `record`, `settings`. Services: `core/ipc.service.ts`, `services/{folders,toast,screen-share}.service.ts`, `core/models.ts`.
 
+## Backend server — a SEPARATE repo at `../murmur-server/`
+
+The accounts + sharing backend is **not in this repo** — it lives in the sibling checkout
+`../murmur-server/` (GitHub `murmur-io/murmur-server`). Murmur is local-first and fully usable with
+**no account**; this server is an **opt-in Tier 1** zero-knowledge relay that unlocks E2EE note +
+Org "Shared Brain" sharing. It stores only **ciphertext blobs, wrapped keys, and public keys** —
+never plaintext.
+
+**When a task touches the backend/server** — accounts (OPAQUE login), link-share, Murmur↔Murmur
+invites, Org sync, the sharing wire format, or anything the app calls over HTTPS — **read
+`../murmur-server/` for the real server-side implementation**; do not reason from the client alone.
+It is a Rust workspace:
+- `crates/murmur-protocol` — the shared E2EE envelope + wire format, **compiled into BOTH the Tauri
+  client (this repo) and the server**, so a format change must land in both or it's a compile error.
+  A client-side sharing change usually has a server-side counterpart here (`MIT OR Apache-2.0`).
+- `crates/murmur-server` — the axum + Postgres service (`AGPL-3.0`), deployed on **Railway**.
+
+Authoritative design spec lives in THIS repo:
+`docs/superpowers/specs/2026-07-04-murmur-server-spec.md` (accounts via OPAQUE, modes A/B, the
+threat matrix §1.1, the one-way two-domain rule §9). Deploy / redeploy / logs / env: follow the
+runbook `../murmur-server/DEPLOY.md` (Railway, GraphQL API not CLI) — never hand-roll ops.
+
 ## Common commands
 
 ```bash

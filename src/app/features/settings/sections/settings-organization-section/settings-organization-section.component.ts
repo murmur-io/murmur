@@ -2,6 +2,7 @@ import {
   ChangeDetectionStrategy,
   Component,
   computed,
+  DestroyRef,
   effect,
   inject,
   signal,
@@ -132,6 +133,14 @@ export class SettingsOrganizationSectionComponent {
   /** Monotonic browse token — a resolved list writes only if it's still the latest. */
   private _browseSeq = 0;
 
+  // ── Live refresh (org-feed-updated) ─────────────────────────────────────────
+  private readonly destroyRef = inject(DestroyRef);
+  /** Released on destroy to detach the org-feed-updated live-refresh listener. */
+  private orgFeedUnlisten: (() => void) | null = null;
+  /** True once destroyed — so a `listen()` that resolves AFTER teardown releases immediately
+   * (distinct from `orgFeedUnlisten === null`, which also means "not yet resolved"). */
+  private orgFeedDestroyed = false;
+
   constructor() {
     // On open: refresh membership from the server (so an invited-into org is
     // discovered) then load every org. Keyed on `_reloadTick` so create/leave/
@@ -176,6 +185,36 @@ export class SettingsOrganizationSectionComponent {
         }
       })();
     });
+
+    // Live-refresh: the background org-sync loop AND the share/edit commands fire `org-feed-updated`
+    // whenever the org replica changes. Subscribe ONCE (push straight into a reload — never
+    // subscribe-into-a-field) so the counts + shared-brain browse list stay live WITHOUT a manual
+    // "Sync now"; released on destroy (never leak the subscription past teardown).
+    this.destroyRef.onDestroy(() => {
+      this.orgFeedDestroyed = true;
+      this.orgFeedUnlisten?.();
+      this.orgFeedUnlisten = null;
+    });
+    void this.ipc
+      .onOrgFeedUpdated(() => {
+        this.reload();
+        // Keep an open browse list fresh too (the reload only refreshes the org cards/counts).
+        const open = this._browseOrgId();
+        if (open !== null) {
+          void this.loadOrgItems(open);
+        }
+      })
+      .then((un) => {
+        // If the view was torn down before the listener resolved, release it immediately.
+        if (this.orgFeedDestroyed) {
+          un();
+        } else {
+          this.orgFeedUnlisten = un;
+        }
+      })
+      .catch(() => {
+        /* best-effort: no Tauri host (e.g. plain browser) → no live refresh */
+      });
   }
 
   /** Re-run the load effect (server discovery + list). */

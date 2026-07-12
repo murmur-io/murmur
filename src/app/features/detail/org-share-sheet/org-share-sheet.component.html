@@ -53,7 +53,7 @@
           (ngModelChange)="selectedOrgId.set($event)"
         >
           @for (o of orgs(); track o.orgId) {
-            <option [value]="o.orgId">{{ o.name }}</option>
+            <option [value]="o.orgId">{{ o.name }}{{ sharedOrgIds().has(o.orgId) ? " · already added ✓" : "" }}</option>
           }
         </mur-select>
         @if (audienceLabel(); as label) {
@@ -131,17 +131,28 @@
       <p class="sheet-error" role="alert">{{ err }}</p>
     }
 
+    <!-- ALREADY-SHARED BLOCK (dup fix): the source is already live in the chosen
+         org, so re-adding would only duplicate it. Edits sync automatically via
+         re-publish-on-edit, so the confirm is disabled — nothing to add. -->
+    @if (alreadyShared()) {
+      <p class="pick-status text-muted" role="status">
+        This {{ target().kind === "meeting" ? "meeting note" : "note" }} is already in
+        {{ selectedOrg()?.name ?? "this organization" }}’s brain — your edits sync
+        automatically, so there’s nothing to add.
+      </p>
+    }
+
     <div class="sheet-actions">
       <button type="button" class="btn btn-ghost" (click)="cancel()" [disabled]="sharing()">
-        Cancel
+        {{ alreadyShared() ? "Close" : "Cancel" }}
       </button>
       <button
         type="button"
         class="btn btn-primary"
         (click)="confirm()"
-        [disabled]="sharing() || loading() || !preview() || !selectedOrgId()"
+        [disabled]="sharing() || loading() || !preview() || !selectedOrgId() || alreadyShared()"
       >
-        {{ sharing() ? "Adding…" : "Add to Org Brain" }}
+        {{ alreadyShared() ? "Already in Org Brain ✓" : (sharing() ? "Adding…" : "Add to Org Brain") }}
       </button>
     </div>
   </div>
