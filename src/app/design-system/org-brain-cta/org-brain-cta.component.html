@@ -1,4 +1,4 @@
-<div class="org-cta">
+<div class="org-cta" [class.is-shared]="shared()">
   <div class="org-cta-head">
     <span class="org-cta-mark" aria-hidden="true">
       <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
@@ -9,15 +9,22 @@
       </svg>
     </span>
     <span class="org-cta-headings">
-      <span class="org-cta-title">Add to Org Brain</span>
-      <span class="org-cta-org">End-to-end encrypted</span>
+      <span class="org-cta-title">{{ shared() ? "In Org Brain ✓" : "Add to Org Brain" }}</span>
+      <span class="org-cta-org">{{ shared() ? "Shared — edits sync automatically" : "End-to-end encrypted" }}</span>
     </span>
   </div>
 
-  <p class="org-cta-copy">
-    Share this note into a team’s <strong>shared brain</strong> so your teammates
-    can find it — you choose which organization next. The server can’t read it.
-  </p>
+  @if (shared()) {
+    <p class="org-cta-copy">
+      This note is in a team’s <strong>shared brain</strong>. Your edits sync
+      automatically — there’s no need to re-share. Open to see or manage where it’s shared.
+    </p>
+  } @else {
+    <p class="org-cta-copy">
+      Share this note into a team’s <strong>shared brain</strong> so your teammates
+      can find it — you choose which organization next. The server can’t read it.
+    </p>
+  }
 
   <button
     type="button"
@@ -26,8 +33,12 @@
     [disabled]="disabled()"
   >
     <svg viewBox="0 0 16 16" width="15" height="15" fill="none" aria-hidden="true">
-      <path d="M8 3.5v9M3.5 8h9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" />
+      @if (shared()) {
+        <path d="M3.5 8.5l3 3 6-7" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" />
+      } @else {
+        <path d="M8 3.5v9M3.5 8h9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" />
+      }
     </svg>
-    Add to Org Brain
+    {{ shared() ? "Manage in Org Brain" : "Add to Org Brain" }}
   </button>
 </div>

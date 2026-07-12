@@ -26,6 +26,13 @@ export class MurOrgBrainCtaComponent {
   /** Disables the button (e.g. while the note is mid-edit). */
   readonly disabled = input(false);
 
+  /**
+   * The source is ALREADY in the org brain (in ≥1 of the user's orgs). Flips the
+   * CTA to a calm "In Org Brain ✓ / Manage" state — edits sync automatically, so
+   * there is no re-share to make (the duplicate fix, surfaced before the sheet).
+   */
+  readonly shared = input(false);
+
   /** Fired when the user clicks the CTA — the host opens the org-share sheet. */
   readonly add = output<void>();
 }
