@@ -1,6 +1,6 @@
 {
   "name": "murmur",
-  "version": "0.9.7",
+  "version": "0.9.8",
   "scripts": {
     "start": "ng serve --port 1420",
     "build": "ng build",
