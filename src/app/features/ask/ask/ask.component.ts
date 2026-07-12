@@ -116,15 +116,23 @@ export class AskComponent implements OnInit {
   );
 
   /**
-   * Probe whether there are any meetings to ask about. A failure here is not
-   * fatal — we still let the user try (the ask itself surfaces its own error),
-   * so we only flip to the empty state on a confirmed empty list.
+   * Probe whether there is ANYTHING to ask about — meetings OR notes (Ask
+   * chats across the whole vault, not just recordings; a vault with only
+   * standalone notes and zero meetings is very much askable — live-found bug,
+   * 2026-07-12: this used to check `listMeetings()` alone, so a notes-only
+   * vault wrongly showed "No meetings to ask about yet" and blocked the
+   * feature). A failure here is not fatal — we still let the user try (the
+   * ask itself surfaces its own error), so we only flip to the empty state
+   * when BOTH come back confirmed-empty.
    */
   async ngOnInit(): Promise<void> {
     void this.listenAskTool();
     try {
-      const meetings = await this.ipc.listMeetings();
-      this.isEmpty.set(meetings.length === 0);
+      const [meetings, notes] = await Promise.all([
+        this.ipc.listMeetings(),
+        this.ipc.listNotes(null),
+      ]);
+      this.isEmpty.set(meetings.length === 0 && notes.length === 0);
     } catch {
       this.isEmpty.set(false);
     } finally {

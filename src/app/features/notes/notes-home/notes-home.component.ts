@@ -1,16 +1,14 @@
 import {
   ChangeDetectionStrategy,
   Component,
-  DestroyRef,
   OnInit,
   computed,
   effect,
   inject,
   signal,
+  untracked,
 } from "@angular/core";
 import { Router, RouterLink } from "@angular/router";
-import type { UnlistenFn } from "@tauri-apps/api/event";
-import { IpcService } from "../../../core/ipc.service";
 import { TabsService } from "../../../core/tabs.service";
 import type {
   NoteFolder,
@@ -25,6 +23,7 @@ import { MurTableComponent } from "../../../design-system/table/table.component"
 import { MurSpinnerComponent } from "../../../design-system/spinner/spinner.component";
 import { FoldersService } from "../../../services/folders.service";
 import { NotesService } from "../../../services/notes.service";
+import { OrgBrainService } from "../../../services/org-brain.service";
 import { ToastService } from "../../../services/toast.service";
 import { OrganizeSheetComponent } from "../organize-sheet/organize-sheet.component";
 
@@ -87,12 +86,11 @@ export type NotesListItem =
 })
 export class NotesHomeComponent implements OnInit {
   private readonly notes = inject(NotesService);
+  private readonly orgBrain = inject(OrgBrainService);
   private readonly folders = inject(FoldersService);
-  private readonly ipc = inject(IpcService);
   private readonly router = inject(Router);
   private readonly toast = inject(ToastService);
   private readonly tabsService = inject(TabsService);
-  private readonly destroyRef = inject(DestroyRef);
 
   /** The note list from the store (gated — masked rows carry no snippet/tags). */
   readonly noteList = this.notes.notes;
@@ -111,19 +109,14 @@ export class NotesHomeComponent implements OnInit {
   readonly creating = signal(false);
 
   // --- Org (Shared Brain) shared-brain notes ------------------------------
-  /**
-   * Every org (Shared Brain) this user belongs to — the content pane's "Shared
-   * brains" chip row + the source of merged org items in "All notes". Loaded
-   * stale-guarded on init, on the `org-feed-updated` event, and on window focus.
-   */
-  private readonly _orgs = signal<OrgStatus[]>([]);
-  readonly orgs = this._orgs.asReadonly();
-  /**
-   * The org's shared items keyed by orgId (`listOrgItems`). A flat parallel signal
-   * (not per-org sub-signals) so the merged `listItems` computed re-derives on any
-   * change. Populated alongside {@link _orgs} in {@link loadOrgs}.
-   */
-  private readonly _orgItems = signal<Record<string, OrgItemHeader[]>>({});
+  // The RAW org roster/items/loading state lives in the shared, root-persisted
+  // OrgBrainService now (was: a component-local signal wiped to empty on every
+  // destroy+recreate — the stale-while-revalidate fix, 2026-07-12). This
+  // component keeps only its OWN derived view + chip-row selection.
+  /** Every org (Shared Brain) this user belongs to — the content pane's "Shared brains" chip row. */
+  readonly orgs = this.orgBrain.orgs;
+  /** True while the org list + items are (re)loading (chip-row hint only — never a render gate). */
+  readonly orgsLoading = this.orgBrain.loading;
   /**
    * Selected org id (null ⇒ not viewing a specific org), chosen via the content
    * pane's "Shared brains" chip row. Exiting to a DIFFERENT note-folder (picked
@@ -132,14 +125,25 @@ export class NotesHomeComponent implements OnInit {
    * one active scope.
    */
   readonly activeOrgId = signal<string | null>(null);
-  /** True while the org list + items are (re)loading (chip-row hint only). */
-  readonly orgsLoading = signal(false);
   /** The org whose items are shown when an org chip is selected (null otherwise). */
   readonly activeOrg = computed<OrgStatus | null>(() => {
     const oid = this.activeOrgId();
     return oid === null
       ? null
-      : (this._orgs().find((o) => o.orgId === oid) ?? null);
+      : (this.orgBrain.orgs().find((o) => o.orgId === oid) ?? null);
+  });
+  /**
+   * If the chip row's selected org has since disappeared (left/no longer
+   * enabled here), fall back to "All notes" — mirrors LibraryComponent's
+   * `_clearMissingActiveOrg`; reactive over the SHARED roster since a load can
+   * land from either this view or Library's.
+   */
+  private readonly _clearMissingActiveOrg = effect(() => {
+    const orgs = this.orgBrain.orgs();
+    const sel = this.activeOrgId();
+    if (sel !== null && !orgs.some((o) => o.orgId === sel)) {
+      untracked(() => this.activeOrgId.set(null));
+    }
   });
 
   /**
@@ -153,8 +157,8 @@ export class NotesHomeComponent implements OnInit {
    */
   readonly listItems = computed<NotesListItem[]>(() => {
     const orgId = this.activeOrgId();
-    const orgItemsByOrg = this._orgItems();
-    const orgs = this._orgs();
+    const orgItemsByOrg = this.orgBrain.orgItems();
+    const orgs = this.orgBrain.orgs();
     const orgNameById = new Map(orgs.map((o) => [o.orgId, o.name]));
 
     // A specific org selected: show ONLY that org's items — EXCLUDING `kind === "meeting"`
@@ -217,19 +221,27 @@ export class NotesHomeComponent implements OnInit {
   });
 
   /**
-   * Router target for an org card. When the caller AUTHORED the item (`ownedSource`,
-   * resolved+gated backend-side) the row opens the EDITABLE original — a `/notes/:id`
-   * note or a `/meeting/:id` recording — so the author edits the real thing instead of
-   * a read-only replica. Otherwise it opens the read-only `/org-item/:id` viewer.
+   * Open an org card as a tracked tab. When the caller AUTHORED the item
+   * (`ownedSource`, resolved+gated backend-side) it opens the EDITABLE
+   * original — a note or meeting tab — so the author edits the real thing
+   * instead of a read-only replica; otherwise it opens the read-only
+   * `/org-item/:id` viewer tab. Live-found bug, 2026-07-12: this used to be a
+   * plain `[routerLink]`, so unlike an owned note/meeting it never registered
+   * with {@link TabsService} — it opened but never appeared in the tab strip
+   * and couldn't be switched back to. Routes through the SAME open* call an
+   * owned note/meeting card would use.
    */
-  orgItemLink(item: OrgItemHeader): string[] {
+  openOrgCard(item: OrgItemHeader): void {
     const owned = item.ownedSource;
     if (owned) {
-      return owned.kind === "meeting"
-        ? ["/meeting", owned.id]
-        : ["/notes", owned.id];
+      if (owned.kind === "meeting") {
+        void this.tabsService.openMeeting(owned.id, item.title || "Meeting");
+      } else {
+        void this.tabsService.openNote(owned.id, item.title || "Note");
+      }
+      return;
     }
-    return ["/org-item", item.itemId];
+    void this.tabsService.openOrgItem(item.itemId, item.title || "Shared note");
   }
 
   /** Build an org card from a header + its origin org name. */
@@ -243,18 +255,6 @@ export class NotesHomeComponent implements OnInit {
       orgName,
     };
   }
-
-  /** Released on destroy to detach the org-feed-updated live-refresh listener. */
-  private orgFeedUnlisten: UnlistenFn | null = null;
-  /** True once destroyed — so a `listen()` that resolves AFTER teardown releases immediately
-   * (distinct from `orgFeedUnlisten === null`, which also means "not yet resolved"). */
-  private orgFeedDestroyed = false;
-  /** Bumped per org load so a late (stale) reload result is dropped (T1 guard). */
-  private orgLoadSeq = 0;
-  /** Bound window-focus handler — re-loads org items when the view regains focus. */
-  private readonly onWindowFocus = (): void => {
-    void this.loadOrgs();
-  };
 
   /** The active folder node (null for the "All notes" root). */
   readonly activeFolder = computed<NoteFolder | null>(() => {
@@ -307,32 +307,8 @@ export class NotesHomeComponent implements OnInit {
   });
 
   async ngOnInit(): Promise<void> {
-    // Live-refresh: the background org-sync loop fires `org-feed-updated` on a
-    // productive tick (≥1 ingest/tombstone). Subscribe ONCE (push straight into a
-    // reload — NEVER subscribe-into-a-field), and re-load org items when the view
-    // regains focus. Both cleaned up on destroy (release the UnlistenFn + the
-    // focus handler).
-    this.destroyRef.onDestroy(() => {
-      this.orgFeedDestroyed = true;
-      this.orgFeedUnlisten?.();
-      this.orgFeedUnlisten = null;
-      window.removeEventListener("focus", this.onWindowFocus);
-    });
-    window.addEventListener("focus", this.onWindowFocus);
-    void this.ipc
-      .onOrgFeedUpdated(() => void this.loadOrgs())
-      .then((un) => {
-        // If the view was already torn down before the listener resolved, release
-        // it immediately (never leak a subscription past destroy).
-        if (this.orgFeedDestroyed) {
-          un();
-        } else {
-          this.orgFeedUnlisten = un;
-        }
-      })
-      .catch(() => {
-        /* best-effort: no Tauri host (e.g. plain browser) → no live refresh */
-      });
+    // Live-refresh (org-feed-updated + window-focus) is subscribed ONCE, for the
+    // app's lifetime, by the shared OrgBrainService now — no per-mount wiring here.
 
     // Load the note-folder list (Move-to-folder menu + breadcrumb — the sidebar
     // tree also loads it independently, but this component may mount first),
@@ -347,62 +323,9 @@ export class NotesHomeComponent implements OnInit {
     ]);
   }
 
-  /**
-   * (Re)load the org (Shared Brain) list + every org's shared items, stale-guarded
-   * on {@link orgLoadSeq} so a late reload (event / focus / init racing) never
-   * overwrites a newer result. Best-effort throughout: `orgRefresh` (server
-   * membership discovery) and each per-org `listOrgItems` swallow their own
-   * failures so a transient/offline error leaves the last-known list standing
-   * rather than blanking the pane. Never throws.
-   */
+  /** (Re)load the org roster + items — delegates to the shared {@link OrgBrainService}. */
   async loadOrgs(): Promise<void> {
-    const seq = ++this.orgLoadSeq;
-    this.orgsLoading.set(true);
-    try {
-      // Discover freshly-invited orgs before reading the local replica (best-effort).
-      try {
-        await this.ipc.orgRefresh();
-      } catch {
-        /* offline / no server → fall through to the local replica */
-      }
-      let orgs: OrgStatus[];
-      try {
-        // PER-INSTANCE ORG TOGGLE: this rail is a content BROWSER (mirrors
-        // library.component.ts) — a disabled org must not appear as a pickable
-        // "Shared brains" entry; the toggle itself lives only in Settings, which
-        // fetches its own unfiltered list.
-        orgs = (await this.ipc.orgListStatuses()).filter((o) => o.contextEnabled);
-      } catch {
-        return; // keep the last-known orgs on a transient failure
-      }
-      if (seq !== this.orgLoadSeq) {
-        return; // a newer load superseded this one — drop the result
-      }
-      // Pull each org's browsable items in parallel; a per-org failure yields [].
-      const itemLists = await Promise.all(
-        orgs.map((o) =>
-          this.ipc.listOrgItems(o.orgId).catch(() => [] as OrgItemHeader[]),
-        ),
-      );
-      if (seq !== this.orgLoadSeq) {
-        return;
-      }
-      const byOrg: Record<string, OrgItemHeader[]> = {};
-      orgs.forEach((o, i) => {
-        byOrg[o.orgId] = itemLists[i];
-      });
-      this._orgs.set(orgs);
-      this._orgItems.set(byOrg);
-      // If the rail's selected org has since disappeared, fall back to "All notes".
-      const sel = this.activeOrgId();
-      if (sel !== null && !orgs.some((o) => o.orgId === sel)) {
-        this.activeOrgId.set(null);
-      }
-    } finally {
-      if (seq === this.orgLoadSeq) {
-        this.orgsLoading.set(false);
-      }
-    }
+    await this.orgBrain.loadOrgs();
   }
 
   /** A friendly role hint for the chip row ("Owner" / "Member"). */

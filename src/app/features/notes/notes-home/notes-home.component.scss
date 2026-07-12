@@ -45,12 +45,21 @@
   gap: var(--space-2);
 }
 
-/* --- Shared brains (orgs) chip row --- */
+/* --- Shared brains (orgs) chip row (mirrors library.component.scss) --- */
 .org-chip-row {
   display: flex;
   flex-wrap: wrap;
+  align-items: center;
   gap: var(--space-2);
   margin-bottom: var(--space-4);
+}
+/* A leading label so the chips read as "these are organizations", not
+   unlabeled generic tags (live-found feedback, 2026-07-12). */
+.org-chip-row-label {
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
 }
 .org-chip {
   display: inline-flex;
@@ -82,6 +91,26 @@
 .org-chip-spinner {
   margin-left: var(--space-1);
   color: var(--text-muted);
+}
+/* Shortcut to Settings → Organization (which orgs are active on this device). */
+.org-chip-settings-link {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border-radius: var(--radius-sm);
+  color: var(--text-muted);
+  text-decoration: none;
+  transition: color var(--transition-fast), background var(--transition-fast);
+}
+.org-chip-settings-link:hover {
+  color: var(--text-secondary);
+  background: var(--surface-hover);
+}
+.org-chip-settings-link:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
 }
 
 .content-body {
@@ -161,11 +190,6 @@
   flex: none;
 }
 
-/* Org (Shared Brain) title link — same `.title-btn` shape, an `<a>` instead
-   of a `<button>` since it's a real navigation target. */
-.title-link {
-  cursor: pointer;
-}
 /* The "shared brain" origin badge — distinct from the outbound "Shared" pill:
    a neutral raised surface (not the accent fill) with the org's name + a glyph. */
 .org-badge {
