@@ -12,6 +12,7 @@ import {
 import { Router } from "@angular/router";
 import type { NoteFolder } from "../../../core/models";
 import { MurTreeRowComponent } from "../../../design-system/tree-row/tree-row.component";
+import { MurRowMenuComponent } from "../../../design-system/row-menu/row-menu.component";
 import { FolderLockFlowService } from "../../../services/folder-lock-flow.service";
 import { FoldersService } from "../../../services/folders.service";
 import { NotesService } from "../../../services/notes.service";
@@ -37,11 +38,24 @@ import { ToastService } from "../../../services/toast.service";
  * This component is imported directly by the eagerly-loaded `AppShellComponent`
  * (like `FoldersService`'s `unlockedCount` badge already is) so the sidebar has
  * live folder data on every route, not just while `/notes` is active.
+ *
+ * TRAILING ACTIONS (2026-07-12, unification round 2): Rename + Delete live
+ * behind the shared `<mur-row-menu>` gear dropdown (design-system,
+ * `row-menu.component.ts`) — the SAME component instance type
+ * `FolderRowComponent` (Meetings) renders, so the two trees' dropdowns are
+ * guaranteed identical rather than two hand-copied lookalikes (see that
+ * component's class doc for the full history of why "measured the same size"
+ * turned out not to mean "looks the same"). Lock/unlock stays its own small
+ * icon in the cluster, NOT folded into the dropdown — this tree never treated
+ * lock as a glanceable-without-hovering state badge in the first place
+ * (unlike Meetings' `.lock-toggle`), so there's nothing lost by keeping it
+ * separate, and both dropdowns end up with the exact same two items (Rename,
+ * Delete) in the exact same order.
  */
 @Component({
   selector: "app-notes-sidebar-tree",
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [MurTreeRowComponent],
+  imports: [MurTreeRowComponent, MurRowMenuComponent],
   templateUrl: "./notes-sidebar-tree.component.html",
   styleUrl: "./notes-sidebar-tree.component.scss",
 })

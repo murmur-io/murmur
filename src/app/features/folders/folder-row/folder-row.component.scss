@@ -8,8 +8,11 @@
 /* The ROW VISUAL (container/indent/hover/selected pill/drop states/caret/
    icon/label/count) lives in the shared `<mur-tree-row>` (design-system,
    2026-07-12 consolidation) — this file keeps only the feature-specific
-   pieces this component projects into it (the lock toggle + ⋯ menu) and its
-   own transient states (rename field, error line). */
+   pieces this component projects into it (the lock toggle) and its own
+   transient states (rename field, delete confirm, error line). Rename/Delete
+   now live behind the shared `<mur-row-menu>` dropdown (design-system,
+   `row-menu.component.ts`) — its trigger/panel chrome is NOT duplicated
+   here. */
 
 /* --- Inline rename: a slim stand-in for the row while editing ------- */
 .rename-line {
@@ -74,8 +77,8 @@
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 28px;
-  height: 28px;
+  width: 21px;
+  height: 21px;
   padding: 0;
   border: 1px solid transparent;
   border-radius: var(--radius-sm);
@@ -148,118 +151,29 @@ mur-tree-row:focus-within .lock-toggle {
   }
 }
 
-/* --- ⋯ folder-actions menu ----------------------------------------- */
-.menu-wrap {
-  position: relative;
-  display: inline-flex;
-}
-.menu-trigger {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 28px;
-  height: 28px;
-  padding: 0;
-  border: 1px solid transparent;
-  border-radius: var(--radius-sm);
-  background: transparent;
-  color: var(--text-muted);
-  cursor: pointer;
-  /* Quiet until the row is hovered/focused (like the lock toggle). */
-  opacity: 0;
-  transition:
-    color var(--transition),
-    background var(--transition),
-    border-color var(--transition),
-    opacity var(--transition);
-}
-mur-tree-row:hover .menu-trigger,
-mur-tree-row:focus-within .menu-trigger,
-.menu-trigger.is-open {
-  opacity: 1;
-}
-.menu-trigger:hover:not(:disabled),
-.menu-trigger.is-open {
-  color: var(--text-primary);
-  background: var(--surface-hover);
-  border-color: var(--border-strong);
-}
-.menu-trigger:focus-visible {
-  outline: none;
-  opacity: 1;
-  box-shadow: 0 0 0 3px var(--accent-ring);
-}
-.menu-trigger:disabled {
-  opacity: 0.4;
-  cursor: not-allowed;
-}
-
-/* Floating popover OVER the tree → OPAQUE surface (never the frosted .card). */
-.menu {
-  position: absolute;
-  top: calc(100% + 4px);
-  right: 0;
-  z-index: 30;
-  min-width: 196px;
-  padding: var(--space-1);
-  background: var(--surface-overlay);
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius-md);
-  box-shadow: var(--shadow-lg);
-  -webkit-backdrop-filter: none;
-  backdrop-filter: none;
-}
-.menu-item {
+/* Delete confirm: a slim stand-in for the row (mirrors `.rename-line` above) —
+   opened from the shared `<mur-row-menu>`'s "Delete folder" item (see the
+   class doc); its own visual chrome lives in `row-menu.component.ts`/scss and
+   the global `.menu`/`.menu-item` primitives, not here. */
+.confirm-line {
   display: flex;
-  align-items: center;
-  gap: var(--space-2);
-  width: 100%;
-  padding: var(--space-2) var(--space-2);
-  border: 1px solid transparent;
-  border-radius: var(--radius-sm);
-  background: transparent;
-  color: var(--text-secondary);
-  font-family: inherit;
-  font-size: 0.85rem;
-  font-weight: 550;
-  text-align: left;
-  cursor: pointer;
-  transition:
-    color var(--transition),
-    background var(--transition);
-}
-.menu-item:hover {
-  color: var(--text-primary);
-  background: var(--surface-hover);
-}
-.menu-item:focus-visible {
-  outline: none;
-  box-shadow: 0 0 0 3px var(--accent-ring);
-}
-.menu-item.is-danger {
-  color: var(--danger);
-}
-.menu-item.is-danger:hover {
-  color: var(--danger);
-  background: var(--danger-soft);
-}
-.menu-icon {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
   flex: none;
-  width: 18px;
-  height: 18px;
-  font-size: 0.8rem;
-  color: var(--text-muted);
+  align-items: flex-start;
+  gap: var(--space-1);
+  padding-left: calc(var(--depth, 0) * var(--tree-indent));
 }
-.menu-item.is-danger .menu-icon {
-  color: var(--danger);
+.confirm-line .caret--leaf {
+  display: inline-flex;
+  flex: none;
+  width: 20px;
+  height: 20px;
 }
-
-/* Load-bearing delete confirm (names the consequence). */
 .confirm {
+  flex: 1 1 auto;
+  min-width: 0;
   padding: var(--space-2);
+  border-radius: var(--radius-md);
+  background: var(--surface-input);
 }
 .confirm-body {
   margin: 0 0 var(--space-2);

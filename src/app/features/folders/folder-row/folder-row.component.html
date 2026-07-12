@@ -30,6 +30,46 @@
       />
     </form>
   </div>
+} @else if (confirmingDelete()) {
+  <!-- Delete confirm: a slim stand-in for the row (mirrors `.rename-line`
+       above) — REPLACES the row rather than floating a popover over it, the
+       same "confirm takes the row's place" pattern the Notes tree uses for
+       its own `pendingDeleteId` branch. Meetings keeps its own
+       consequence-naming confirm copy (`deleteConfirmText()`/`canDelete()` —
+       notes move, or "unlock first" when sealed) since Notes has no
+       per-folder consequence to name; only the TRIGGER lives inside the
+       shared `<mur-row-menu>`'s "Delete folder" item now. -->
+  <div class="confirm-line" [style.--depth]="depth()">
+    <span class="caret caret--leaf" aria-hidden="true"></span>
+    <div class="confirm" role="alertdialog" aria-modal="true">
+      <p class="confirm-body">{{ deleteConfirmText() }}</p>
+      @if (actionError()) {
+        <p class="confirm-error" role="alert">
+          {{ actionError() }}
+        </p>
+      }
+      <div class="confirm-actions">
+        <button
+          type="button"
+          class="btn btn-ghost"
+          [disabled]="busy()"
+          (click)="cancelDelete()"
+        >
+          Cancel
+        </button>
+        @if (canDelete()) {
+          <button
+            type="button"
+            class="btn btn-danger"
+            [disabled]="busy()"
+            (click)="onDelete()"
+          >
+            {{ busy() ? "Deleting…" : "Delete folder" }}
+          </button>
+        }
+      </div>
+    </div>
+  </div>
 } @else {
   <!-- The ROW VISUAL is the shared <mur-tree-row> (2026-07-12, design-system
        consolidation — this component keeps the recursion/drag-drop/lock LOGIC
@@ -49,10 +89,22 @@
     [dropFolderId]="node().id"
     (dropNote)="dropNote.emit({ meetingId: $event, folderId: node().id })"
   >
-  <!-- ONE lock control. It is the state AND the action: a single padlock per
-       row. Always visible while locked/session (so the privacy state always
-       reads); revealed on hover for an open folder (the "encrypt" action). -->
+  <!-- Trailing action cluster (2026-07-12, unification round 2): the lock
+       control still leads — it is the state AND the action, and unlike
+       rename/delete it's a security-relevant glanceable badge (see its own
+       doc below), so it stays its own always-visible control rather than
+       hiding behind a menu. Rename + Delete now live behind the SAME
+       `<mur-row-menu>` gear-trigger dropdown `NotesSidebarTreeComponent`
+       renders (design-system, `row-menu.component.ts`) — ONE shared
+       component, not two hand-copied icon rows that can drift apart again
+       (the previous attempt LOOKED identical by measured box size but read
+       visibly different in color/weight between the two trees — this round
+       fixes that by construction: it's literally the same component
+       instance type, not a copy). -->
   <div class="row-actions">
+    <!-- ONE lock control. It is the state AND the action: a single padlock per
+         row. Always visible while locked/session (so the privacy state always
+         reads); revealed on hover for an open folder (the "encrypt" action). -->
     @switch (exposure()) {
       @case ("open") {
         <button
@@ -66,8 +118,8 @@
           <!-- open padlock (shackle up & off the body) -->
           <svg
             viewBox="0 0 16 16"
-            width="14"
-            height="14"
+            width="12"
+            height="12"
             fill="none"
             aria-hidden="true"
           >
@@ -101,8 +153,8 @@
           <!-- closed padlock, filled body -->
           <svg
             viewBox="0 0 16 16"
-            width="14"
-            height="14"
+            width="12"
+            height="12"
             fill="none"
             aria-hidden="true"
           >
@@ -138,8 +190,8 @@
           <!-- open padlock, accent — plaintext exposed this session -->
           <svg
             viewBox="0 0 16 16"
-            width="14"
-            height="14"
+            width="12"
+            height="12"
             fill="none"
             aria-hidden="true"
           >
@@ -164,143 +216,32 @@
       }
     }
 
-    <!-- The ⋯ folder-actions menu: Rename · Make private/Unlock · Delete. -->
-    <div class="menu-wrap">
+    <!-- Rename + Delete — behind the shared gear dropdown. Same items, same
+         order, as `NotesSidebarTreeComponent`'s menu (Delete opens the SAME
+         consequence-naming confirm as before, via the `confirmingDelete()`
+         branch at the top of this template). -->
+    <mur-row-menu
+      #actions
+      [label]="'Actions for ' + node().name"
+      [disabled]="busy()"
+    >
       <button
         type="button"
-        class="menu-trigger"
-        [class.is-open]="menuOpen()"
-        [disabled]="busy()"
-        [attr.aria-haspopup]="true"
-        [attr.aria-expanded]="menuOpen()"
-        [attr.aria-label]="'Folder actions for ' + node().name"
-        title="Folder actions"
-        (click)="toggleMenu()"
+        class="menu-item"
+        role="menuitem"
+        (click)="actions.close(); startRename()"
       >
-        <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true">
-          <circle cx="8" cy="3.2" r="1.35" fill="currentColor" />
-          <circle cx="8" cy="8" r="1.35" fill="currentColor" />
-          <circle cx="8" cy="12.8" r="1.35" fill="currentColor" />
-        </svg>
+        Rename
       </button>
-
-      @if (menuOpen()) {
-        <div
-          class="menu"
-          role="menu"
-          [attr.aria-label]="node().name + ' actions'"
-        >
-          @if (confirmingDelete()) {
-            <!-- Load-bearing confirm: names the exact consequence (notes move, or unlock first). -->
-            <div class="confirm" role="alertdialog" aria-modal="true">
-              <p class="confirm-body">{{ deleteConfirmText() }}</p>
-              @if (actionError()) {
-                <p class="confirm-error" role="alert">
-                  {{ actionError() }}
-                </p>
-              }
-              <div class="confirm-actions">
-                <button
-                  type="button"
-                  class="btn btn-ghost"
-                  [disabled]="busy()"
-                  (click)="cancelDelete()"
-                >
-                  Cancel
-                </button>
-                @if (canDelete()) {
-                  <button
-                    type="button"
-                    class="btn btn-danger"
-                    [disabled]="busy()"
-                    (click)="onDelete()"
-                  >
-                    {{ busy() ? "Deleting…" : "Delete folder" }}
-                  </button>
-                }
-              </div>
-            </div>
-          } @else {
-            <button
-              type="button"
-              class="menu-item"
-              role="menuitem"
-              (click)="startRename()"
-            >
-              <span class="menu-icon" aria-hidden="true">
-                <svg viewBox="0 0 16 16" width="14" height="14" fill="none">
-                  <path
-                    d="M11.3 2.2 13.8 4.7 5.5 13H3v-2.5z"
-                    stroke="currentColor"
-                    stroke-width="1.3"
-                    stroke-linejoin="round"
-                  />
-                </svg>
-              </span>
-              Rename
-            </button>
-
-            <!-- "Make private" (lock) when open; "Unlock" via Touch ID when locked;
-                 "Re-seal now" when session-unlocked. Reuses the row's lock affordances. -->
-            @switch (exposure()) {
-              @case ("open") {
-                <button
-                  type="button"
-                  class="menu-item"
-                  role="menuitem"
-                  (click)="onLockFromMenu()"
-                >
-                  <span class="menu-icon" aria-hidden="true">🔒</span>
-                  Make private
-                </button>
-              }
-              @case ("locked") {
-                <button
-                  type="button"
-                  class="menu-item"
-                  role="menuitem"
-                  (click)="onUnlockFromMenu()"
-                >
-                  <span class="menu-icon" aria-hidden="true">🔑</span>
-                  Locked — unlock
-                </button>
-              }
-              @case ("session") {
-                <button
-                  type="button"
-                  class="menu-item"
-                  role="menuitem"
-                  (click)="onRelockFromMenu()"
-                >
-                  <span class="menu-icon" aria-hidden="true">🔒</span>
-                  Re-seal now
-                </button>
-              }
-            }
-
-            <button
-              type="button"
-              class="menu-item is-danger"
-              role="menuitem"
-              (click)="startDelete()"
-            >
-              <span class="menu-icon" aria-hidden="true">
-                <svg viewBox="0 0 16 16" width="14" height="14" fill="none">
-                  <path
-                    d="M3.5 4.5h9M6.5 4.5V3.2c0-.4.3-.7.7-.7h1.6c.4 0 .7.3.7.7v1.3M5 4.5l.5 8c0 .4.3.7.7.7h3.6c.4 0 .7-.3.7-.7l.5-8"
-                    stroke="currentColor"
-                    stroke-width="1.3"
-                    stroke-linecap="round"
-                    stroke-linejoin="round"
-                  />
-                </svg>
-              </span>
-              Delete folder
-            </button>
-          }
-        </div>
-      }
-    </div>
+      <button
+        type="button"
+        class="menu-item menu-item-danger"
+        role="menuitem"
+        (click)="actions.close(); startDelete()"
+      >
+        Delete folder
+      </button>
+    </mur-row-menu>
   </div>
   </mur-tree-row>
 }
@@ -322,4 +263,3 @@
     (dropNote)="dropNote.emit($event)"
   />
 }
-
