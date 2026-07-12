@@ -596,6 +596,7 @@
               <tr><td>Ollama</td><td>Fully local</td><td><span class="tag no">No</span></td></tr>
               <tr><td>Claude Code <span style="color:var(--text-muted);font-weight:400">(default summarizer)</span></td><td>Local CLI → cloud</td><td><span class="tag yes">Redacted only</span></td></tr>
               <tr><td>Anthropic API <span style="color:var(--text-muted);font-weight:400">(bring your own key)</span></td><td>Direct HTTPS</td><td><span class="tag yes">Redacted only</span></td></tr>
+              <tr><td>AI Gateway <span style="color:var(--text-muted);font-weight:400">(any OpenAI-compatible endpoint — LiteLLM, Kong, Portkey, vLLM…)</span></td><td>Direct HTTPS</td><td><span class="tag yes">Redacted only</span></td></tr>
             </tbody>
           </table>
         </div>
@@ -635,7 +636,7 @@
           <h3>It hears both sides of the call.</h3>
           <p>Dual-stream recording captures your mic and the other side's system audio, transcribes each independently on-device, and merges them by wall-clock into a clean Me / Others transcript with live captions as you speak.</p>
           <ul class="flist">
-            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> On-device Whisper (large-v3) with live + accurate passes</li>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> On-device Whisper, tiny to large-v3 — pick your speed/accuracy tradeoff</li>
             <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Optional speaker diarization &amp; voice activity detection</li>
             <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> A floating recorder bar — record from anywhere (⌘⇧R)</li>
           </ul>
@@ -672,6 +673,36 @@
         </div>
         <div class="shot"><img src="./assets/detail-note.jpg" alt="A structured note — summary, decisions, action items, quotes" loading="lazy" /></div>
       </div>
+
+      <!-- Feature 5 -->
+      <div class="feature reveal">
+        <div class="ftext">
+          <span class="eyebrow">Notes</span>
+          <h3>Not just meeting notes. All your notes.</h3>
+          <p>A full Markdown editor with folders, tags, and properties — for anything you write, not just what Murmur transcribes. Select any passage and a command menu appears: refine, shorten, change tone, translate, fact-check, or just type what you want done.</p>
+          <ul class="flist">
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Nineteen Brain actions, one keystroke away</li>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Grounded in your own meetings &amp; notes, not the model's guesses</li>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Same encrypted store, same Touch ID lock, same Obsidian export</li>
+          </ul>
+        </div>
+        <div class="shot"><img src="assets/notes-editor-brain-menu.png" alt="The standalone note editor with a text selection and the Brain command menu open, showing Refine, Shorten, Change tone and more actions" loading="lazy" /></div>
+      </div>
+
+      <!-- Feature 6 -->
+      <div class="feature flip reveal">
+        <div class="ftext">
+          <span class="eyebrow">Shared Brain</span>
+          <h3>Work as a team, still end-to-end encrypted.</h3>
+          <p>Publish a note or meeting summary into your org's Shared Brain and it stays in sync for every member as you edit. Everything is sealed on your Mac before it ever leaves — the server only ever stores ciphertext, wrapped keys, and public keys.</p>
+          <ul class="flist">
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> AES-256-GCM sealed under an org content key before upload</li>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Verify-before-publish — the same discipline as locking a folder</li>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Belong to more than one org — each gets its own encrypted feed</li>
+          </ul>
+        </div>
+        <div class="shot"><img src="assets/shared-brain-rail.png" alt="The Notes view Shared Brains rail with an organization selected, showing synced org items with author badges" loading="lazy" /></div>
+      </div>
     </div>
   </section>
 
@@ -694,6 +725,9 @@
             <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Unlimited on-device recording &amp; transcription</li>
             <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> In-meeting AI assistant + Ask Your Vault</li>
             <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Semantic search &amp; the auto knowledge graph</li>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Standalone notes with a Brain-assisted editor</li>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Shared Brain — E2EE org sharing, unlimited members</li>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Expiring, encrypted share links for a note or meeting</li>
             <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Per-folder Touch ID lock &amp; AES-256 encryption</li>
             <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Screen-share auto-relock</li>
             <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Local MCP server + Obsidian export</li>
@@ -711,23 +745,23 @@
             <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Everything in Free</li>
             <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> End-to-end encrypted sync across your Macs &amp; iPhone</li>
             <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Zero-knowledge encrypted cloud backup</li>
-            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Expiring, encrypted share links for a note or meeting</li>
             <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Optional low-latency managed brain (redacted)</li>
             <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Custom recipes &amp; automations</li>
           </ul>
           <a class="btn btn-ghost" href="https://github.com/murmur-io/murmur">Follow on GitHub</a>
         </div>
 
-        <!-- Team / Enterprise — roadmap -->
+        <!-- Team / Enterprise — roadmap. Shared Brain org sharing itself already
+             shipped free (see the Free plan above) — this tier is only the
+             admin/governance layer on top: roles, SSO, audit log, SLA. -->
         <div class="plan soon reveal">
           <span class="plan-badge soon">Coming soon</span>
           <h3>Team</h3>
           <div class="price"><span class="amt">Contact</span></div>
-          <p class="tagline">Shared meeting memory for a team — privacy kept intact.</p>
+          <p class="tagline">Admin controls for a Shared Brain org — privacy kept intact.</p>
           <ul>
             <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Everything in Pro</li>
-            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Shared workspaces &amp; projects (end-to-end encrypted)</li>
-            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Invite members, roles &amp; permissions</li>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Member roles &amp; permissions for your Shared Brain org</li>
             <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> SSO &amp; SCIM provisioning</li>
             <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Security policy, retention &amp; audit log</li>
             <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Priority support &amp; SLA</li>
@@ -735,7 +769,7 @@
           <a class="btn btn-ghost" href="https://github.com/murmur-io/murmur">Talk to us</a>
         </div>
       </div>
-      <p style="text-align:center; color:var(--text-muted); font-size:13.5px; margin-top:26px;">Pricing for Pro and Team is indicative and not final. Murmur stays free while in early access.</p>
+      <p style="text-align:center; color:var(--text-muted); font-size:13.5px; margin-top:26px;">Shared Brain org sharing is free today — see the Free plan. Pricing for Pro and Team is indicative and not final; Murmur stays free while in early access.</p>
     </div>
   </section>
 
