@@ -23,7 +23,19 @@ const ORG_ITEM_AAD_V1: &str = "murmur-org/v1|org-item";
 
 /// The envelope wire version. Bump only for a breaking canonical-format change (readers reject an
 /// unknown version fail-closed).
-pub const ORG_ENVELOPE_VERSION: u16 = 1;
+///
+/// v1 → v2 history: v2 APPENDS one `source_kind` tag byte after `created_at` (no other field moved).
+/// `from_canonical_bytes` accepts BOTH v1 (already-published envelopes sitting in real org feeds —
+/// parsed exactly as before, `source_kind: None`) and v2 (new envelopes, always constructed via
+/// `OrgEnvelope::new`) — an already-published v1 envelope MUST stay parseable forever; only an
+/// unrecognized version (anything but 1 or 2) fails closed. `to_canonical_bytes` also branches on
+/// `self.version` so re-serializing a PARSED v1 envelope reproduces byte-identical v1 bytes (never
+/// silently upgrades the wire form — that would shift `content_sha256` for existing dedup rows).
+pub const ORG_ENVELOPE_VERSION: u16 = 2;
+
+/// The PREVIOUS wire version, still accepted on read for backward compatibility with envelopes
+/// already published to org feeds before this device upgraded. See `ORG_ENVELOPE_VERSION` doc.
+const ORG_ENVELOPE_VERSION_V1: u16 = 1;
 
 /// The kind of authored content an org item carries. Serialized as a single tag byte in the canonical
 /// form (stable across versions).
@@ -58,7 +70,44 @@ impl OrgItemKind {
     }
 }
 
-/// The plaintext an org item carries (spec `OrgEnvelope v1`). `author_hint` is a display label only
+/// The SOURCE type an org item was published from — a DIFFERENT axis from [`OrgItemKind`] (which is
+/// content SHAPE, not source type; both `share_meeting_to_org` and `share_document_to_org` currently
+/// stamp every envelope `OrgItemKind::Note` regardless of source). Serialized as a single tag byte,
+/// present ONLY in a v2 envelope (v1 envelopes carry no source-type signal on the wire and parse to
+/// `OrgEnvelope.source_kind: None`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrgSourceKind {
+    /// Published from an authored standalone note/document.
+    Document,
+    /// Published from a meeting's note/summary.
+    Meeting,
+}
+
+impl OrgSourceKind {
+    fn tag(self) -> u8 {
+        match self {
+            OrgSourceKind::Document => 1,
+            OrgSourceKind::Meeting => 2,
+        }
+    }
+    fn from_tag(t: u8) -> Result<Self> {
+        match t {
+            1 => Ok(OrgSourceKind::Document),
+            2 => Ok(OrgSourceKind::Meeting),
+            _ => Err(AppError::InvalidArg("unknown org source kind tag".into())),
+        }
+    }
+    /// The lowercase wire label used by storage + FE DTOs (mirrors `OrgItemHeader.kind`'s existing
+    /// `"document"` / `"meeting"` strings from the owned-item resolver).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OrgSourceKind::Document => "document",
+            OrgSourceKind::Meeting => "meeting",
+        }
+    }
+}
+
+/// The plaintext an org item carries (spec `OrgEnvelope v1`/`v2`). `author_hint` is a display label only
 /// (e.g. the author's email local-part / account short id) — it is deliberately NOT a note-content
 /// string, and is what the connector formatter renders as `[org · <author_hint>]` provenance.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,12 +120,18 @@ pub struct OrgEnvelope {
     pub created_at: String,
     /// The source revision of the local note/document at publish time (for later "update share").
     pub source_rev: u32,
+    /// The SOURCE type (document vs meeting) this envelope was published from. `Some(..)` for every
+    /// envelope THIS device constructs (`new()` always stamps v2 + a required source kind); `None`
+    /// ONLY for an envelope PARSED from already-published v1 wire bytes, which carry no such signal.
+    pub source_kind: Option<OrgSourceKind>,
 }
 
 impl OrgEnvelope {
-    /// Build a v1 envelope. Callers pass the ALREADY-CLEANED + scrubbed markdown (the seal layer does
-    /// no sanitization — that is the command's job, upstream, so the leak-safety transform is a
-    /// single well-tested seam).
+    /// Build a NEW envelope — always stamped the CURRENT wire version (`ORG_ENVELOPE_VERSION`, v2) with
+    /// a REQUIRED `source_kind`: every envelope this device constructs always knows its own source type,
+    /// so `source_kind: None` is reserved for envelopes parsed off old v1 wire data, never one built
+    /// here. Callers pass the ALREADY-CLEANED + scrubbed markdown (the seal layer does no sanitization —
+    /// that is the command's job, upstream, so the leak-safety transform is a single well-tested seam).
     pub fn new(
         kind: OrgItemKind,
         title: impl Into<String>,
@@ -84,6 +139,7 @@ impl OrgEnvelope {
         author_hint: impl Into<String>,
         created_at: impl Into<String>,
         source_rev: u32,
+        source_kind: OrgSourceKind,
     ) -> Self {
         Self {
             version: ORG_ENVELOPE_VERSION,
@@ -93,12 +149,17 @@ impl OrgEnvelope {
             author_hint: author_hint.into(),
             created_at: created_at.into(),
             source_rev,
+            source_kind: Some(source_kind),
         }
     }
 
-    /// Serialize to the CANONICAL byte form: `version(u16 LE) | kind_tag(u8) | source_rev(u32 LE) |
-    /// [len(u32 LE) || utf8]{title, markdown, author_hint, created_at}`. Fixed field order + explicit
-    /// length prefixes ⇒ two devices produce byte-identical bytes ⇒ a stable `content_sha256`.
+    /// Serialize to the CANONICAL byte form. v1 layout: `version(u16 LE) | kind_tag(u8) |
+    /// source_rev(u32 LE) | [len(u32 LE) || utf8]{title, markdown, author_hint, created_at}`. v2 layout
+    /// APPENDS one `source_kind_tag(u8)` after `created_at` — nothing before it moves, so a v1-shaped
+    /// value serialized here (i.e. `self.version == 1`, from a PARSED old envelope) reproduces the
+    /// EXACT v1 bytes, never silently upgrading the wire form (that would shift `content_sha256` for
+    /// existing dedup rows). Fixed field order + explicit length prefixes ⇒ two devices on the same
+    /// version produce byte-identical bytes ⇒ a stable `content_sha256`.
     pub fn to_canonical_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(
             2 + 1
@@ -107,7 +168,8 @@ impl OrgEnvelope {
                 + self.title.len()
                 + self.markdown.len()
                 + self.author_hint.len()
-                + self.created_at.len(),
+                + self.created_at.len()
+                + 1,
         );
         out.extend_from_slice(&self.version.to_le_bytes());
         out.push(self.kind.tag());
@@ -121,15 +183,27 @@ impl OrgEnvelope {
             out.extend_from_slice(&(field.len() as u32).to_le_bytes());
             out.extend_from_slice(field.as_bytes());
         }
+        if self.version >= ORG_ENVELOPE_VERSION {
+            // v2 (or later, should the format ever grow again): append the source-kind tag. `new()`
+            // guarantees `Some` here; a `None` on a v2-stamped value is an internal invariant violation
+            // (should never happen — nothing constructs one), so fail closed rather than write garbage.
+            let tag = self.source_kind.map(OrgSourceKind::tag).unwrap_or(0);
+            out.push(tag);
+        }
         out
     }
 
     /// Parse the canonical byte form. Fails closed (`InvalidArg`) on a truncated/oversized/malformed
     /// buffer or an unknown version — never panics, never reads out of bounds.
+    ///
+    /// BACKWARD COMPAT (binding): accepts BOTH `ORG_ENVELOPE_VERSION_V1` (already-published envelopes —
+    /// parsed exactly as the original v1 layout, `source_kind: None`) and `ORG_ENVELOPE_VERSION` (v2 —
+    /// the same 4 fields, then one extra source-kind tag byte). Any OTHER version fails closed exactly
+    /// as before. Never reject a v1 envelope — real users have v1 bytes live in org feeds today.
     pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self> {
         let mut cur = Cursor { b: bytes, i: 0 };
         let version = cur.take_u16()?;
-        if version != ORG_ENVELOPE_VERSION {
+        if version != ORG_ENVELOPE_VERSION_V1 && version != ORG_ENVELOPE_VERSION {
             return Err(AppError::InvalidArg(format!(
                 "unsupported org envelope version {version}"
             )));
@@ -140,6 +214,11 @@ impl OrgEnvelope {
         let markdown = cur.take_str()?;
         let author_hint = cur.take_str()?;
         let created_at = cur.take_str()?;
+        let source_kind = if version == ORG_ENVELOPE_VERSION {
+            Some(OrgSourceKind::from_tag(cur.take_u8()?)?)
+        } else {
+            None
+        };
         if cur.i != bytes.len() {
             return Err(AppError::InvalidArg(
                 "trailing bytes after org envelope".into(),
@@ -153,6 +232,7 @@ impl OrgEnvelope {
             author_hint,
             created_at,
             source_rev,
+            source_kind,
         })
     }
 
@@ -270,7 +350,22 @@ mod tests {
             "anna",
             "2026-07-10T10:00:00Z",
             3,
+            OrgSourceKind::Meeting,
         )
+    }
+
+    /// Hand-build a byte buffer in the OLD v1 wire layout (no trailing `source_kind` byte) — the exact
+    /// shape of an envelope already published to a real org feed before this device shipped v2. Mirrors
+    /// the manual byte-construction style of `malformed_canonical_bytes_fail_closed_no_panic`.
+    fn v1_bytes(title: &str, markdown: &str, author_hint: &str, created_at: &str, source_rev: u32) -> Vec<u8> {
+        let mut out = ORG_ENVELOPE_VERSION_V1.to_le_bytes().to_vec();
+        out.push(OrgItemKind::Note.tag());
+        out.extend_from_slice(&source_rev.to_le_bytes());
+        for field in [title, markdown, author_hint, created_at] {
+            out.extend_from_slice(&(field.len() as u32).to_le_bytes());
+            out.extend_from_slice(field.as_bytes());
+        }
+        out
     }
 
     #[test]
@@ -281,6 +376,65 @@ mod tests {
         assert_eq!(back, e);
         // Re-serializing the parsed value yields identical bytes (stable canonical form).
         assert_eq!(back.to_canonical_bytes(), bytes);
+    }
+
+    /// RED-BEFORE-GREEN (the load-bearing backward-compat regression): a byte buffer in the OLD v1
+    /// wire layout — no trailing `source_kind` tag byte, exactly what is sitting in real users' org
+    /// feeds today — MUST still parse successfully, yield `source_kind: None` (unclassified, not a
+    /// guess), and re-serialize back to the EXACT SAME v1 bytes (so `content_sha256`/dedup for
+    /// already-published v1 items never shifts). A naive "just require the new field always" fix fails
+    /// this test (either by rejecting the version-1 buffer outright, or by upgrading it to v2 bytes on
+    /// re-serialize); only correct version-branching in both `from_canonical_bytes` and
+    /// `to_canonical_bytes` passes.
+    #[test]
+    fn v1_wire_bytes_still_parse_and_reserialize_byte_identical() {
+        let old = v1_bytes(
+            "Weekly Sync",
+            "- decided on the roadmap\n- Anna owns follow-up",
+            "anna",
+            "2026-07-10T10:00:00Z",
+            3,
+        );
+        let parsed = OrgEnvelope::from_canonical_bytes(&old)
+            .expect("an already-published v1 envelope must remain parseable forever");
+        assert_eq!(parsed.version, ORG_ENVELOPE_VERSION_V1);
+        assert_eq!(
+            parsed.source_kind, None,
+            "a v1 envelope carries no source-type signal on the wire — unclassified, never guessed"
+        );
+        assert_eq!(parsed.title, "Weekly Sync");
+        assert_eq!(parsed.kind, OrgItemKind::Note);
+        // Re-serializing a PARSED v1 value must reproduce the EXACT v1 bytes — no silent upgrade to
+        // the v2 layout (that would shift content_sha256 for existing dedup rows).
+        assert_eq!(
+            parsed.to_canonical_bytes(),
+            old,
+            "re-serializing a parsed v1 envelope must not mutate the wire format of old data"
+        );
+    }
+
+    /// A v2 envelope (freshly constructed via `new()`, always required to carry a `source_kind`) round
+    /// trips both source kinds through the canonical byte form.
+    #[test]
+    fn v2_canonical_round_trips_both_source_kinds() {
+        for sk in [OrgSourceKind::Meeting, OrgSourceKind::Document] {
+            let e = OrgEnvelope::new(
+                OrgItemKind::Note,
+                "Standup",
+                "body",
+                "anna",
+                "2026-07-11T09:00:00Z",
+                1,
+                sk,
+            );
+            assert_eq!(e.version, ORG_ENVELOPE_VERSION);
+            let bytes = e.to_canonical_bytes();
+            let back = OrgEnvelope::from_canonical_bytes(&bytes).unwrap();
+            assert_eq!(back, e);
+            assert_eq!(back.source_kind, Some(sk));
+            // Stable re-serialization for v2 too.
+            assert_eq!(back.to_canonical_bytes(), bytes);
+        }
     }
 
     #[test]
@@ -354,6 +508,21 @@ mod tests {
         bad.extend_from_slice(&0u32.to_le_bytes()); // source_rev
         bad.extend_from_slice(&(9999u32).to_le_bytes()); // title len way past EOF
         assert!(OrgEnvelope::from_canonical_bytes(&bad).is_err());
+
+        // A v2 buffer missing its trailing source_kind tag byte (truncated exactly at the v1/v2
+        // boundary) must fail closed, not silently parse as v1.
+        let v2_missing_tag = v1_bytes("t", "m", "a", "c", 1); // v1-shaped bytes...
+        let mut v2_claimed = v2_missing_tag.clone();
+        v2_claimed[0] = ORG_ENVELOPE_VERSION.to_le_bytes()[0]; // ...but claims version 2
+        v2_claimed[1] = ORG_ENVELOPE_VERSION.to_le_bytes()[1];
+        assert!(OrgEnvelope::from_canonical_bytes(&v2_claimed).is_err());
+
+        // A v2 buffer with an unknown source_kind tag byte fails closed.
+        let mut v2_bad_tag = v1_bytes("t", "m", "a", "c", 1);
+        v2_bad_tag[0] = ORG_ENVELOPE_VERSION.to_le_bytes()[0];
+        v2_bad_tag[1] = ORG_ENVELOPE_VERSION.to_le_bytes()[1];
+        v2_bad_tag.push(0); // 0 is not a valid OrgSourceKind tag
+        assert!(OrgEnvelope::from_canonical_bytes(&v2_bad_tag).is_err());
     }
 
     #[test]
@@ -366,5 +535,41 @@ mod tests {
         assert!(OrgItemKind::from_tag(0).is_err());
         assert_eq!(OrgItemKind::Note.as_str(), "note");
         assert_eq!(OrgItemKind::Summary.as_str(), "summary");
+    }
+
+    #[test]
+    fn source_kind_tag_round_trips_and_labels() {
+        assert_eq!(
+            OrgSourceKind::from_tag(OrgSourceKind::Document.tag()).unwrap(),
+            OrgSourceKind::Document
+        );
+        assert_eq!(
+            OrgSourceKind::from_tag(OrgSourceKind::Meeting.tag()).unwrap(),
+            OrgSourceKind::Meeting
+        );
+        assert!(OrgSourceKind::from_tag(0).is_err());
+        assert_eq!(OrgSourceKind::Document.as_str(), "document");
+        assert_eq!(OrgSourceKind::Meeting.as_str(), "meeting");
+    }
+
+    /// The seal/open AEAD layer round-trips a v2 envelope end to end (models
+    /// `seal_open_round_trips_and_verifies_before_egress` for the new source_kind field).
+    #[test]
+    fn seal_open_round_trips_v2_envelope_with_source_kind() {
+        let ock = crypto::random_key().unwrap();
+        let e = OrgEnvelope::new(
+            OrgItemKind::Note,
+            "Doc share",
+            "authored note body",
+            "bob",
+            "2026-07-11T12:00:00Z",
+            1,
+            OrgSourceKind::Document,
+        );
+        let (ct, sha) = seal_org_envelope(&ock, &e, "org-1", "item-2").unwrap();
+        assert_eq!(sha, e.content_sha256());
+        let opened = open_org_envelope(&ock, &ct, "org-1", "item-2").unwrap();
+        assert_eq!(opened, e);
+        assert_eq!(opened.source_kind, Some(OrgSourceKind::Document));
     }
 }

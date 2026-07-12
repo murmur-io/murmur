@@ -157,6 +157,11 @@
   flex: 0 0 auto;
   overflow: visible;
 }
+/* Trails the "Shared brains" heading while the org list/items are (re)loading. */
+.org-head-spinner {
+  margin-left: auto;
+  color: var(--text-muted);
+}
 .org-row {
   cursor: pointer;
 }
