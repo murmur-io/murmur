@@ -143,11 +143,17 @@ export class BrainEnableCardComponent {
         this.enabled.emit();
       } else {
         // The store swallows download failures into its own signals — surface
-        // them so a failed download never looks like a silent no-op.
+        // them so a failed download never looks like a silent no-op. If NEITHER
+        // signal is set, the download command itself reported success but the
+        // presence probe still says missing — name which model and point at the
+        // likely cause (this is a resolve/disk-state mismatch, not a network
+        // failure, so "try again" alone is misleading).
+        const specific = this.store.brainError() ?? this.store.embedDownloadError();
         this.error.set(
-          this.store.brainError() ??
-            this.store.embedDownloadError() ??
-            "The download didn't finish. Please try again.",
+          specific ??
+            (!this.brainPresent()
+              ? "The brain model downloaded, but Murmur can't find it afterward. Check available disk space, then try again."
+              : "The embedding model downloaded, but Murmur can't find it afterward. Check available disk space, then try again."),
         );
         this.stage.set("idle");
       }
