@@ -26,6 +26,7 @@ import type {
   FolderNode,
   GraphPayload,
   MeetingDetail,
+  MeetingOrgShareInfo,
   MeetingTimeline,
   SpeakerSuggestion,
 } from "../../../core/models";
@@ -233,16 +234,15 @@ export class DetailComponent implements OnInit {
 
   // --- Org Brain badge (Shared Brain v1) -----------------------------------
   /**
-   * True when THIS meeting is in the org brain — drives the "In Org Brain"
-   * header pill. Loaded best-effort from `list_org_shares` and refreshed when
-   * the share-panel reports a change.
-   *
-   * SEAM (Shared Brain v1): `list_org_shares` is content-free (item ids + titles,
-   * no `meetingId`), so we match by TITLE as the honest heuristic until the
-   * backend stamps an org-share row with the source meeting id. When it does,
-   * replace the title match in {@link refreshOrgShared} with a meeting-id join.
+   * Every org THIS meeting is actively shared into (`meetingOrgShares`, a real
+   * meeting-id join — supersedes the earlier title-match heuristic). Empty when
+   * never shared, OR when the meeting is locked (the backend gates this exactly
+   * like `getMeetingDetail`). Drives the "Shared with…" header pill(s); loaded
+   * best-effort and refreshed when the share-panel reports a change.
    */
-  readonly orgShared = signal(false);
+  readonly orgShares = signal<MeetingOrgShareInfo[]>([]);
+  /** True when this meeting is shared into at least one org — drives the pill's presence. */
+  readonly orgShared = computed(() => this.orgShares().length > 0);
 
   // --- Export Canvas (Obsidian .canvas board) ------------------------------
   /** True while an exportCanvas IPC call is in flight (disables the button). */
@@ -600,34 +600,33 @@ export class DetailComponent implements OnInit {
   }
 
   /**
-   * Refresh the "In Org Brain" header pill from `list_org_shares`. See the
-   * {@link orgShared} SEAM note: matched by title (the content-free share list
-   * carries no meeting id yet). Fails closed to `false` on any error / no org.
+   * Refresh the "Shared with…" header pill from `meetingOrgShares` — a real
+   * meeting-id join (gated backend-side exactly like `getMeetingDetail`), so a
+   * locked meeting always resolves to `[]`. Fails closed to `[]` on any error.
    *
-   * STALE-RESULT guard (FE failure mode #4): capture the meeting id at call time and,
-   * after the `list_org_shares` await, drop the result if the user navigated to another
-   * meeting mid-flight (`openRelated` reuses this component) — otherwise a late response
-   * could set the pill from the PREVIOUS meeting's title over the current one.
+   * STALE-RESULT guard (FE failure mode #4): capture the meeting id at call time
+   * and, after the await, drop the result if the user navigated to another
+   * meeting mid-flight (`openRelated` reuses this component) — otherwise a late
+   * response could paint the PREVIOUS meeting's org badges over the current one.
    */
   private async refreshOrgShared(): Promise<void> {
-    const meeting = this.detail()?.meeting;
-    const id = meeting?.id;
-    const title = meeting?.title;
-    if (!title) {
-      this.orgShared.set(false);
+    const id = this.detail()?.meeting.id;
+    if (!id) {
+      this.orgShares.set([]);
       return;
     }
     try {
-      const shares = await this.ipc.listOrgShares();
+      const shares = await this.ipc.meetingOrgShares(id);
       // Drop late responses for a meeting the user has since navigated away from.
       if (this.detail()?.meeting.id !== id) {
         return;
       }
-      this.orgShared.set(
-        shares.some((s) => s.state !== "revoked" && s.title === title),
-      );
+      // Defensive: `orgShared` reads `.length` unconditionally — never let a
+      // malformed/non-array response (e.g. an unmocked IPC command resolving
+      // to its generic `null` default) null-deref the computed.
+      this.orgShares.set(Array.isArray(shares) ? shares : []);
     } catch {
-      this.orgShared.set(false);
+      this.orgShares.set([]);
     }
   }
 

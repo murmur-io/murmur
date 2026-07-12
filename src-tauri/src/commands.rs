@@ -191,6 +191,11 @@ pub struct AppConfigDto {
     pub note_assist_shorten: bool,
     #[serde(default = "default_true")]
     pub note_assist_enhance: bool,
+    /// NOTES full-set opt-OUT list (`noteAssistActionsOff`): the ids of the non-legacy assistant
+    /// actions the user turned OFF. `#[serde(default)]` ⇒ an older FE payload that omits it loads
+    /// as an empty list (all actions enabled) — a missing field enables, never disables.
+    #[serde(default)]
+    pub note_assist_actions_off: Vec<String>,
     pub note_language: String,
     /// E3/security: default true (matches AppConfig::default) when the FE omits it on an older
     /// payload — an omitted flag must FAIL CLOSED (require a token), never silently disable MCP
@@ -1474,12 +1479,21 @@ pub fn get_last_note(state: State<'_, AppState>) -> Result<Option<NoteDto>, AppE
 /// failure NEVER fails the save (`let _ = …`); the launch sweep retries a `failed` row.
 #[tauri::command]
 pub async fn update_note(
+    app: AppHandle,
     state: State<'_, AppState>,
     meeting_id: String,
     markdown: String,
 ) -> Result<NoteDto, AppError> {
     let dto = update_note_inner(state.inner(), &meeting_id, &markdown)?;
-    let _ = republish_org_shares_for_source(state.inner(), Some(&meeting_id), None).await;
+    // If the edit re-published ≥1 org copy, ping open org views (Notes list + Settings) so the fresh
+    // title/body shows without a manual "Sync now". Best-effort — a republish failure never fails the save.
+    if republish_org_shares_for_source(state.inner(), Some(&meeting_id), None)
+        .await
+        .unwrap_or(0)
+        > 0
+    {
+        crate::events::emit_org_feed_updated(&app, 1);
+    }
     Ok(dto)
 }
 
@@ -2467,13 +2481,21 @@ pub(crate) fn list_notes_inner(
 /// `save_note_text` autosave (OCK-seal + egress per keystroke is unacceptable) — only this commit path.
 #[tauri::command]
 pub async fn update_note_doc(
+    app: AppHandle,
     state: State<'_, AppState>,
     id: String,
     title: String,
     markdown: String,
 ) -> Result<NoteDoc, AppError> {
     let doc = update_note_doc_inner(state.inner(), &id, &title, &markdown)?;
-    let _ = republish_org_shares_for_source(state.inner(), None, Some(&id)).await;
+    // See `update_note`: ping open org views when the edit re-published ≥1 org copy. Best-effort.
+    if republish_org_shares_for_source(state.inner(), None, Some(&id))
+        .await
+        .unwrap_or(0)
+        > 0
+    {
+        crate::events::emit_org_feed_updated(&app, 1);
+    }
     Ok(doc)
 }
 
@@ -3007,11 +3029,82 @@ impl Drop for NoteAssistTurnGuard<'_> {
     }
 }
 
-/// The selection Brain-assistant action. GATED four ways: (1) the note's folder must be unlocked
-/// (never send a sealed note's text off-device / to any model); (2) the action must be ENABLED in
-/// config (else `Unavailable`); (3) enhance retrieval contributes ONLY visible/unlocked sources;
-/// (4) the cloud path rides the redaction firewall via `provider_for`. Returns the suggestion +
-/// (enhance) citations + display metadata (modelLabel/mode/redacted).
+/// The FULL known note-assistant action set (the FE catalog mirror). `custom` is always available
+/// (the escape hatch) so it is intentionally OUTSIDE this list — it is handled explicitly. An action
+/// not in this list and not `custom` is an unknown id → `InvalidArg`.
+const NOTE_ASSIST_KNOWN_ACTIONS: &[&str] = &[
+    // EDIT (replace)
+    "refine",
+    "grammar",
+    "shorten",
+    "expand",
+    "simplify",
+    "tone",
+    "translate",
+    // STRUCTURE
+    "bullets",
+    "table",
+    "keypoints",
+    // FROM YOUR BRAIN
+    "enhance",
+    "find_related",
+    "link_entities",
+    "fact_check",
+    "ask",
+    // EXTRACT
+    "action_items",
+    "decisions",
+    // CREATE (artifact)
+    "draft_followup",
+    "spinoff_note",
+];
+
+/// The result shape the FE renders + applies off (see the seam contract table). MUST be one of
+/// `"replace" | "insert" | "info" | "artifact"`. `custom` is a free-text replace.
+fn note_assist_shape(action: &str) -> &'static str {
+    match action {
+        // EDIT + link_entities + custom rewrite the selection in place.
+        "refine" | "grammar" | "shorten" | "expand" | "simplify" | "tone" | "translate"
+        | "bullets" | "table" | "link_entities" | "custom" => "replace",
+        // Keeps the text; appends after the selection.
+        "keypoints" | "enhance" | "action_items" | "decisions" => "insert",
+        // Read-only grounded answer + citations (no destructive edit).
+        "find_related" | "fact_check" | "ask" => "info",
+        // A drafted email/note (title + body).
+        "draft_followup" | "spinoff_note" => "artifact",
+        // Unknown ids never reach here (gated to InvalidArg upstream); default to the safest
+        // non-destructive shape.
+        _ => "info",
+    }
+}
+
+/// Which citation-gathering strategy an action uses. Grounded brain actions reuse the enhance
+/// readers (visibility-gated); `link_entities` uses the gated entity list; everything else needs
+/// no retrieval.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NoteAssistRetrieval {
+    /// No retrieval (pure edit on the selection).
+    None,
+    /// The enhance readers: `search_visible` + `search_doc_chunks_*_visible` (excluding this note).
+    BrainCitations,
+    /// The gated entity list (`list_entities_visible`) → which names to wikilink.
+    Entities,
+}
+
+fn note_assist_retrieval(action: &str) -> NoteAssistRetrieval {
+    match action {
+        "enhance" | "find_related" | "fact_check" | "ask" => NoteAssistRetrieval::BrainCitations,
+        "link_entities" => NoteAssistRetrieval::Entities,
+        _ => NoteAssistRetrieval::None,
+    }
+}
+
+/// The selection Brain-assistant action. GATED five ways (normative order): (1) the action must be
+/// ENABLED in config (else `Unavailable`); (2) the note's folder must be unlocked (never send a
+/// sealed note's text off-device / to any model, else `Locked`); (3) brain-grounded retrieval
+/// contributes ONLY visible/unlocked sources; (4) the cloud path rides the redaction firewall via
+/// `provider_for`. `find_related` is retrieval-ONLY (no provider, no egress). Returns the suggestion
+/// + citations + display metadata (modelLabel/mode/redacted/shape/title).
 #[tauri::command]
 pub async fn note_assistant_action(
     state: State<'_, AppState>,
@@ -3026,6 +3119,20 @@ pub(crate) async fn note_assistant_action_inner(
     state: &AppState,
     req: NoteAssistRequest,
 ) -> Result<NoteAssistResult, AppError> {
+    // Production path: build the NOTES-role provider through the full egress gate chain.
+    note_assistant_action_impl(state, req, None).await
+}
+
+/// The testable core of [`note_assistant_action_inner`]. `provider_override` lets a unit test inject
+/// a scripted fake provider (so the provider-dependent actions run headless without shelling out to
+/// a real LLM); in production it is `None` and the NOTES-role provider is built via `provider_for`
+/// (consent gate + redaction firewall + egress ledger). The gate order is IDENTICAL either way — the
+/// override only replaces the provider CONSTRUCTION at step (6), never a gate.
+async fn note_assistant_action_impl(
+    state: &AppState,
+    req: NoteAssistRequest,
+    provider_override: Option<std::sync::Arc<dyn crate::summarize::provider::SummarizerProvider>>,
+) -> Result<NoteAssistResult, AppError> {
     let action = req.action.trim().to_lowercase();
     // (1) ACTION ENABLED? A disabled action is refused BEFORE any read/egress.
     let config = {
@@ -3035,10 +3142,18 @@ pub(crate) async fn note_assistant_action_inner(
             .map_err(|_| AppError::Config("config mutex poisoned".into()))?
             .clone()
     };
+    // The 3 legacy actions keep their own bools (backward compat — the FE still sends all three).
+    // `custom` is the always-on escape hatch. Every OTHER KNOWN action is enabled UNLESS the user
+    // opted it OUT (`note_assist_actions_off`). An id that is neither known nor `custom` → InvalidArg
+    // BEFORE any read/egress.
     let enabled = match action.as_str() {
         "refine" => config.note_assist_refine,
         "shorten" => config.note_assist_shorten,
         "enhance" => config.note_assist_enhance,
+        "custom" => true,
+        other if NOTE_ASSIST_KNOWN_ACTIONS.contains(&other) => {
+            !config.note_assist_actions_off.iter().any(|a| a == other)
+        }
         other => {
             return Err(AppError::InvalidArg(format!(
                 "unknown note-assistant action: {other}"
@@ -3083,7 +3198,41 @@ pub(crate) async fn note_assistant_action_inner(
         ));
     }
 
-    // (3) Resolve the display metadata (modelLabel/mode) from the RESOLVED target BEFORE the call.
+    let shape = note_assist_shape(&action).to_string();
+    let retrieval = note_assist_retrieval(&action);
+
+    // (3) FIND_RELATED: retrieval-ONLY — NO provider, NO egress. Gather visible citations through
+    //     the SAME gated readers as enhance, build a one-line answer, and return `shape="info"`
+    //     with `mode="local"`, `redacted=false`. This never raises the local user-turn priority
+    //     flag (no decode contends for Metal) and never calls a model → a privacy win.
+    if action == "find_related" {
+        let citations = gather_note_enhance_citations(state, &req)?;
+        let suggestion = match citations.len() {
+            0 => "No related sources found in your brain.".to_string(),
+            1 => "1 related source in your brain.".to_string(),
+            n => format!("{n} related sources in your brain."),
+        };
+        tracing::info!(
+            target: "notes",
+            action = %action,
+            mode = "local",
+            citations = citations.len(),
+            redacted = false,
+            "note assistant action completed (retrieval-only)"
+        );
+        return Ok(NoteAssistResult {
+            action,
+            suggestion,
+            citations,
+            model_label: "Your brain (local search)".to_string(),
+            mode: "local".to_string(),
+            redacted: false,
+            shape,
+            title: None,
+        });
+    }
+
+    // (4) Resolve the display metadata (modelLabel/mode) from the RESOLVED target BEFORE the call.
     let target =
         crate::summarize::roles::provider_target(crate::summarize::roles::Role::Notes, &config);
     let mode = if crate::summarize::egress_is_cloud(&target.connection, &config) {
@@ -3110,27 +3259,58 @@ pub(crate) async fn note_assistant_action_inner(
         format!("{conn_label} · {model_requested}")
     };
 
-    // (4) enhance: retrieve VISIBLE related sources (EXCLUDING this note) → grounded prompt + citations.
-    let citations = if action == "enhance" {
-        gather_note_enhance_citations(state, &req)?
-    } else {
-        Vec::new()
+    // (5) Retrieve VISIBLE grounding for the brain-grounded actions (EXCLUDING this note). Both the
+    //     citation readers and `list_entities_visible` push the session unlock set through
+    //     `visibility_clause`, so a sealed source never grounds a result.
+    let (citations, entity_names) = match retrieval {
+        NoteAssistRetrieval::BrainCitations => {
+            (gather_note_enhance_citations(state, &req)?, Vec::new())
+        }
+        NoteAssistRetrieval::Entities => {
+            let unlocked = unlocked_snapshot(state)?;
+            let names: Vec<String> = state
+                .db
+                .list_entities_visible(&unlocked)?
+                .into_iter()
+                .map(|n| n.name)
+                .collect();
+            (Vec::new(), names)
+        }
+        NoteAssistRetrieval::None => (Vec::new(), Vec::new()),
     };
 
-    // (5) Build the prompts, then call the NOTES-role provider (consent gate + redaction firewall +
-    //     egress ledger ride inside `provider_for`/`complete_with_meta_opts`). The edit runs under an
-    //     input-sized token cap + low temperature (`GenOptions::edit_rewrite`) so a compression edit
+    // (6) Build the prompts, then call the NOTES-role provider (consent gate + redaction firewall +
+    //     egress ledger ride inside `provider_for`/`complete_with_meta_opts`). The edit runs under a
+    //     per-action token cap + low temperature (`GenOptions::edit_rewrite`) so a compression edit
     //     can't run away and LENGTHEN, and `generate_note_edit` enforces "shorten is actually shorter"
     //     with one stricter retry.
-    let (system, user) = build_note_assist_prompt(&action, &req, &citations, &config.note_language);
-    let provider = crate::summarize::provider_for(crate::summarize::roles::Role::Notes, &config)?;
+    let (system, user) =
+        build_note_assist_prompt(&action, &req, &citations, &entity_names, &config.note_language);
+    let provider = match provider_override {
+        Some(p) => p,
+        None => crate::summarize::provider_for(crate::summarize::roles::Role::Notes, &config)?,
+    };
     let opts = crate::reason::GenOptions::edit_rewrite(note_edit_max_tokens(
         &action,
         req.selection.chars().count(),
     ));
     let input_words = note_edit_word_count(&req.selection);
-    let (suggestion, meta) =
+    let (mut suggestion, meta) =
         generate_note_edit(provider.as_ref(), &action, &system, &user, opts, input_words).await?;
+    suggestion = suggestion.trim().to_string();
+
+    // Artifacts carry a title (email subject / note title). Derive it from the note's own title for
+    // a follow-up draft, and from the drafted body's first line for a spin-off note (a title only —
+    // never logged). Non-artifacts have no title.
+    let title = if shape == "artifact" {
+        Some(derive_artifact_title(
+            &action,
+            row.title.as_deref().unwrap_or(""),
+            &suggestion,
+        ))
+    } else {
+        None
+    };
 
     // `redacted` = the firewall scrubbed at least one PII token on THIS call (only a cloud
     // RedactingProvider populates `meta.redactions`; a local provider leaves it None → false).
@@ -3144,6 +3324,7 @@ pub(crate) async fn note_assistant_action_inner(
         target: "notes",
         action = %action,
         mode = %mode,
+        shape = %shape,
         citations = citations.len(),
         redacted,
         "note assistant action completed"
@@ -3151,12 +3332,47 @@ pub(crate) async fn note_assistant_action_inner(
 
     Ok(NoteAssistResult {
         action,
-        suggestion: suggestion.trim().to_string(),
+        suggestion,
         citations,
         model_label,
         mode: mode.to_string(),
         redacted,
+        shape,
+        title,
     })
+}
+
+/// Derive a non-PII-in-logs artifact title. `draft_followup` reuses the note's own title as an email
+/// subject; `spinoff_note` uses the drafted body's first non-empty line (stripped of leading `#`),
+/// falling back to the note title. The returned string is user-facing content (a title) — it is NEVER
+/// logged.
+fn derive_artifact_title(action: &str, note_title: &str, body: &str) -> String {
+    let fallback = |t: &str| {
+        let t = t.trim();
+        if t.is_empty() {
+            "Untitled".to_string()
+        } else {
+            t.to_string()
+        }
+    };
+    match action {
+        "draft_followup" => {
+            let subj = note_title.trim();
+            if subj.is_empty() {
+                "Follow-up".to_string()
+            } else {
+                format!("Re: {subj}")
+            }
+        }
+        // spinoff_note: first meaningful body line as the title.
+        _ => body
+            .lines()
+            .map(|l| l.trim_start_matches('#').trim())
+            .find(|l| !l.is_empty())
+            .map(|l| l.chars().take(120).collect::<String>())
+            .filter(|l| !l.is_empty())
+            .unwrap_or_else(|| fallback(note_title)),
+    }
 }
 
 /// enhance-context retrieval: run the GATED brain readers (meeting `search_visible` + document/note
@@ -3231,13 +3447,36 @@ fn gather_note_enhance_citations(
     Ok(out)
 }
 
-/// Build the (system, user) prompts for a note-assistant action. Refine/Shorten operate on the
-/// selection with its surrounding context; Enhance grounds an ADDITIVE passage in the retrieved
-/// citations only. `note_language` steers the reply language (matching the rest of the note stack).
+/// Format the retrieved brain citations as a numbered grounding block for the grounded actions.
+fn note_assist_grounding_block(citations: &[NoteCitation]) -> String {
+    let mut grounding = String::new();
+    for (i, c) in citations.iter().enumerate() {
+        grounding.push_str(&format!(
+            "[{n}] ({kind}) {title}: {snippet}\n",
+            n = i + 1,
+            kind = c.kind,
+            title = c.title,
+            snippet = c.snippet
+        ));
+    }
+    if grounding.is_empty() {
+        grounding.push_str("(no related material found)\n");
+    }
+    grounding
+}
+
+/// Build the (system, user) prompts for a note-assistant action. EDIT actions rewrite the selection
+/// with its surrounding context; STRUCTURE reshapes it; the FROM-YOUR-BRAIN actions ground on the
+/// retrieved citations (or entity names) ONLY; the INFO actions (`fact_check`/`ask`) produce an
+/// ANSWER, not an edit; CREATE actions draft an artifact body. `note_language` steers the reply
+/// language (matching the rest of the note stack). Every prompt passes the preceding text as
+/// READ-ONLY context ("do NOT continue it") with the SELECTION LAST — the discipline that fixed
+/// "shorten made it longer".
 fn build_note_assist_prompt(
     action: &str,
     req: &NoteAssistRequest,
     citations: &[NoteCitation],
+    entity_names: &[String],
     note_language: &str,
 ) -> (String, String) {
     let lang = if note_language.trim().is_empty() || note_language == "auto" {
@@ -3245,27 +3484,41 @@ fn build_note_assist_prompt(
     } else {
         format!("language code '{note_language}'")
     };
+    // EDIT actions (refine/grammar/shorten/expand/simplify/tone) rewrite a passage the user
+    // ALREADY wrote in some language — they must always match ITS language, never the global
+    // `note_language` pin (that pin is for content GENERATED from scratch: the full note, the
+    // STRUCTURE/FROM-YOUR-BRAIN/INFO/CREATE actions, and `translate`'s explicit target). Forcibly
+    // translating during a surgical edit was the bug: Shorten on an English passage under a
+    // Polish-pinned note_language rewrote it into Polish instead of shortening it in English.
+    let edit_lang = "the same language as the selected text".to_string();
     let before = req.before.as_deref().unwrap_or("");
-    // Preceding text is passed as READ-ONLY context with an explicit "do NOT continue it", and the
-    // SELECTION always comes LAST. The old prompt appended raw CONTEXT AFTER too, which a small
-    // next-token model reads as an autocomplete gradient and CONTINUES (lengthening) instead of
-    // editing only the selection — a load-bearing cause of "shorten made it longer".
     let preceding = if before.trim().is_empty() {
         String::new()
     } else {
         format!("Preceding text (READ-ONLY context — do NOT reproduce or continue it):\n{before}\n\n")
     };
+    let sel = req.selection.as_str();
+    let variant = req.variant.as_deref().unwrap_or("").trim();
+    let instruction = req.instruction.as_deref().unwrap_or("").trim();
     match action {
         "refine" => {
             let system = format!(
                 "You refine a passage of the user's own note: improve clarity, grammar, and flow \
-                 WITHOUT changing its meaning, adding facts, or padding its length. Reply in {lang}. \
-                 Output ONLY the rewritten passage — no preamble, no quotes, no explanation."
+                 WITHOUT changing its meaning, adding facts, or padding its length. Reply in \
+                 {edit_lang}. Output ONLY the rewritten passage — no preamble, no quotes, no \
+                 explanation."
             );
-            let user = format!(
-                "{preceding}PASSAGE TO REFINE (rewrite ONLY this):\n{sel}",
-                sel = req.selection
+            let user = format!("{preceding}PASSAGE TO REFINE (rewrite ONLY this):\n{sel}");
+            (system, user)
+        }
+        "grammar" => {
+            let system = format!(
+                "You are a copy-editor. Correct ONLY spelling, grammar, and punctuation in the \
+                 passage. Do NOT restructure, rephrase, shorten, lengthen, or change the meaning or \
+                 word choice beyond what a correction requires. Reply in {edit_lang}. Output ONLY \
+                 the corrected passage — no preamble, no quotes, no explanation."
             );
+            let user = format!("{preceding}PASSAGE TO CORRECT (fix ONLY this):\n{sel}");
             (system, user)
         }
         "shorten" => {
@@ -3273,33 +3526,95 @@ fn build_note_assist_prompt(
                 "You shorten a passage of the user's own note. Rewrite it in ABOUT HALF the \
                  sentences: keep every decision, number, name, date, and commitment; cut hedging, \
                  repetition, filler, and throat-clearing. The result MUST be shorter than the \
-                 original. Reply in {lang}. Output ONLY the shortened passage — no preamble, no \
-                 quotes, no explanation.\n\nExample —\nOriginal: I think that, honestly, we should \
+                 original. Reply in {edit_lang}. Output ONLY the shortened passage — no preamble, \
+                 no quotes, no explanation.\n\nExample —\nOriginal: I think that, honestly, we should \
                  probably consider maybe moving the deadline to Friday, because the team is quite \
                  busy right now and there is a lot going on.\nShortened: Move the deadline to \
                  Friday — the team is overloaded."
             );
-            let user = format!(
-                "{preceding}PASSAGE TO SHORTEN (rewrite ONLY this, shorter):\n{sel}",
-                sel = req.selection
-            );
+            let user = format!("{preceding}PASSAGE TO SHORTEN (rewrite ONLY this, shorter):\n{sel}");
             (system, user)
         }
-        // enhance
-        _ => {
-            let mut grounding = String::new();
-            for (i, c) in citations.iter().enumerate() {
-                grounding.push_str(&format!(
-                    "[{n}] ({kind}) {title}: {snippet}\n",
-                    n = i + 1,
-                    kind = c.kind,
-                    title = c.title,
-                    snippet = c.snippet
-                ));
-            }
-            if grounding.is_empty() {
-                grounding.push_str("(no related material found)\n");
-            }
+        "expand" => {
+            let system = format!(
+                "You expand a terse passage of the user's own note into fuller, clearer prose. \
+                 Elaborate ONLY on what is already stated — spell out shorthand, join fragments into \
+                 sentences, add connective phrasing. Do NOT invent facts, opinions, numbers, names, \
+                 or commitments that are not in the passage. Reply in {edit_lang}. Output ONLY the \
+                 expanded passage — no preamble, no quotes, no explanation."
+            );
+            let user = format!("{preceding}PASSAGE TO EXPAND (rewrite ONLY this, fuller):\n{sel}");
+            (system, user)
+        }
+        "simplify" => {
+            let system = format!(
+                "You rewrite a passage of the user's own note in plain, jargon-free language a \
+                 non-expert can follow. Keep every fact, number, name, and decision; replace \
+                 jargon and convoluted phrasing with simple words and short sentences. Do NOT add or \
+                 remove information. Reply in {edit_lang}. Output ONLY the simplified passage — no \
+                 preamble, no quotes, no explanation."
+            );
+            let user = format!("{preceding}PASSAGE TO SIMPLIFY (rewrite ONLY this):\n{sel}");
+            (system, user)
+        }
+        "tone" => {
+            let tone = if variant.is_empty() { "professional" } else { variant };
+            let system = format!(
+                "You rewrite a passage of the user's own note in a {tone} tone WITHOUT changing its \
+                 meaning, facts, or length beyond what the tone requires. Reply in {edit_lang}. \
+                 Output ONLY the rewritten passage — no preamble, no quotes, no explanation."
+            );
+            let user = format!("{preceding}PASSAGE TO REWRITE in a {tone} tone (rewrite ONLY this):\n{sel}");
+            (system, user)
+        }
+        "translate" => {
+            // For translate the TARGET language is the variant, overriding note_language.
+            let target = if variant.is_empty() {
+                "the language the user most likely wants".to_string()
+            } else {
+                variant.to_string()
+            };
+            let system = format!(
+                "You translate a passage of the user's own note into {target}. Preserve meaning, \
+                 tone, formatting, names, numbers, and any markdown. Do NOT add or omit content. \
+                 Output ONLY the translated passage — no preamble, no quotes, no explanation."
+            );
+            let user = format!("{preceding}PASSAGE TO TRANSLATE into {target} (translate ONLY this):\n{sel}");
+            (system, user)
+        }
+        "bullets" => {
+            let system = format!(
+                "You reformat a passage of the user's own note into a markdown bullet list. Turn \
+                 each distinct point into its own `- ` line, preserving every fact, number, name, and \
+                 decision; do NOT add, remove, or invent content. Reply in {lang}. Output ONLY the \
+                 markdown list — no preamble, no heading, no explanation."
+            );
+            let user = format!("{preceding}PASSAGE TO CONVERT to a bullet list (convert ONLY this):\n{sel}");
+            (system, user)
+        }
+        "table" => {
+            let system = format!(
+                "You reformat a passage of the user's own note into a GitHub-flavored markdown table \
+                 with a header row and a `---` separator. Infer sensible columns from the content; \
+                 preserve every fact, number, name, and decision; do NOT add or invent data. Reply \
+                 in {lang}. Output ONLY the markdown table — no preamble, no explanation."
+            );
+            let user = format!("{preceding}PASSAGE TO CONVERT to a table (convert ONLY this):\n{sel}");
+            (system, user)
+        }
+        "keypoints" => {
+            let system = format!(
+                "You write a SHORT TL;DR digest of a passage of the user's own note: 2–4 markdown \
+                 bullets capturing only the key points, decisions, and numbers. This is an ADDITIVE \
+                 summary to insert AFTER the selection — do NOT rewrite or reproduce the original. \
+                 Reply in {lang}. Output ONLY the bullet digest — no preamble, no heading, no \
+                 explanation."
+            );
+            let user = format!("{preceding}PASSAGE TO SUMMARIZE (write a short digest of this):\n{sel}");
+            (system, user)
+        }
+        "enhance" => {
+            let grounding = note_assist_grounding_block(citations);
             let system = format!(
                 "You expand the user's note by proposing a SHORT ADDITIVE passage that builds on \
                  the selection using ONLY the RELATED MATERIAL provided — never invent facts. If the \
@@ -3308,9 +3623,124 @@ fn build_note_assist_prompt(
                  explanation."
             );
             let user = format!(
-                "RELATED MATERIAL (from the user's own brain):\n{grounding}\nSELECTION TO EXPAND:\n{sel}",
-                sel = req.selection
+                "RELATED MATERIAL (from the user's own brain):\n{grounding}\nSELECTION TO EXPAND:\n{sel}"
             );
+            (system, user)
+        }
+        "link_entities" => {
+            let names = if entity_names.is_empty() {
+                "(none — return the selection unchanged)".to_string()
+            } else {
+                entity_names.join(", ")
+            };
+            let system = format!(
+                "You rewrite a passage of the user's own note, wrapping ONLY the known entity names \
+                 listed below in `[[wikilinks]]` where they appear. Do NOT invent links, do NOT link \
+                 any name not in the list, do NOT change any other word, spacing, or punctuation, and \
+                 do NOT double-wrap a name already inside `[[...]]`. If a name does not appear in the \
+                 passage, leave the passage as-is for that name. Reply in {lang}. Output ONLY the \
+                 rewritten passage — no preamble, no quotes, no explanation."
+            );
+            let user = format!(
+                "KNOWN ENTITY NAMES (link ONLY these):\n{names}\n\n{preceding}PASSAGE TO LINK (rewrite ONLY this):\n{sel}"
+            );
+            (system, user)
+        }
+        "fact_check" => {
+            let grounding = note_assist_grounding_block(citations);
+            let system = format!(
+                "You fact-check the SELECTION against the user's OWN brain (the RELATED MATERIAL \
+                 below) ONLY — never external knowledge. Flag any claim in the selection that \
+                 CONTRADICTS or is UNSUPPORTED by the material, quoting the conflicting source. If \
+                 everything checks out, say so briefly. This is an ANSWER, not an edit — do NOT \
+                 rewrite the selection. Reply in {lang}. Output ONLY your findings — no preamble."
+            );
+            let user = format!(
+                "RELATED MATERIAL (from the user's own brain):\n{grounding}\nSELECTION TO FACT-CHECK:\n{sel}"
+            );
+            (system, user)
+        }
+        "ask" => {
+            let grounding = note_assist_grounding_block(citations);
+            let question = if instruction.is_empty() {
+                "What is the most important thing to know about this selection?"
+            } else {
+                instruction
+            };
+            let system = format!(
+                "You answer the user's QUESTION about the SELECTION, grounded in the SELECTION and \
+                 the RELATED MATERIAL from their own brain ONLY — never invent facts. If the answer \
+                 is not in the material, say so. This is an ANSWER, not an edit — do NOT rewrite the \
+                 selection. Reply in {lang}. Output ONLY the answer — no preamble."
+            );
+            let user = format!(
+                "QUESTION:\n{question}\n\nRELATED MATERIAL (from the user's own brain):\n{grounding}\nSELECTION:\n{sel}"
+            );
+            (system, user)
+        }
+        "action_items" => {
+            let system = format!(
+                "You extract action items / TODOs from a passage of the user's own note into a \
+                 markdown checklist. Each task is its own `- [ ] ` line; capture the owner and any \
+                 due date if stated; do NOT invent tasks. If there are no action items, reply with an \
+                 empty line. This is an ADDITIVE list to insert AFTER the selection — do NOT reproduce \
+                 the original. Reply in {lang}. Output ONLY the checklist — no preamble, no heading."
+            );
+            let user = format!("{preceding}PASSAGE TO SCAN for action items:\n{sel}");
+            (system, user)
+        }
+        "decisions" => {
+            let system = format!(
+                "You extract the DECISIONS made in a passage of the user's own note into a short \
+                 markdown bullet list. Capture only decisions actually made (not open questions or \
+                 tasks); do NOT invent any. If there are no decisions, reply with an empty line. This \
+                 is an ADDITIVE list to insert AFTER the selection — do NOT reproduce the original. \
+                 Reply in {lang}. Output ONLY the list — no preamble, no heading."
+            );
+            let user = format!("{preceding}PASSAGE TO SCAN for decisions:\n{sel}");
+            (system, user)
+        }
+        "draft_followup" => {
+            let system = format!(
+                "You draft a concise follow-up email or message based on the SELECTION from the \
+                 user's own note. Cover the key points, decisions, and next steps; keep a {tone} \
+                 tone. Do NOT invent facts beyond the selection. Do NOT include a subject line — just \
+                 the message body. Reply in {lang}. Output ONLY the message body — no preamble, no \
+                 explanation.",
+                tone = if variant.is_empty() { "professional" } else { variant }
+            );
+            let user = format!("{preceding}SELECTION TO TURN INTO A FOLLOW-UP MESSAGE:\n{sel}");
+            (system, user)
+        }
+        "custom" => {
+            // The free-text "Ask Brain to edit…" instruction, applied to the SELECTION (shape=replace).
+            // MUST have its own arm — without it `custom` fell through to the spinoff_note catch-all,
+            // silently dropping the instruction and drafting an unrelated note that Accept then
+            // destructively wrote over the selection. The instruction is woven into the directive; the
+            // FE only sends `custom` with non-empty text, but an empty directive degrades to a refine.
+            let directive = if instruction.is_empty() {
+                "Improve the clarity, grammar, and flow of the passage without changing its meaning"
+            } else {
+                instruction
+            };
+            let system = format!(
+                "You edit a passage of the user's own note by applying THIS instruction to it: \
+                 \"{directive}\". Apply the instruction to the passage ONLY — do NOT invent facts \
+                 beyond it, do NOT answer as chat, do NOT continue the surrounding text. Reply in \
+                 {lang}. Output ONLY the edited passage — no preamble, no quotes, no explanation."
+            );
+            let user = format!("{preceding}PASSAGE TO EDIT (apply the instruction, rewrite ONLY this):\n{sel}");
+            (system, user)
+        }
+        // spinoff_note
+        _ => {
+            let system = format!(
+                "You draft a new standalone note from the SELECTION in the user's existing note. \
+                 Start with a short `# ` heading that titles the new note, then write clean note body \
+                 in markdown. Build ONLY on the selection — do NOT invent facts. Reply in {lang}. \
+                 Output ONLY the new note (heading + body) — no preamble, no explanation."
+            );
+            let user = format!("{preceding}SELECTION TO TURN INTO A NEW NOTE:\n{sel}");
             (system, user)
         }
     }
@@ -3323,15 +3753,24 @@ fn note_edit_word_count(s: &str) -> usize {
 }
 
 /// The RUNAWAY-GUARD token cap for a note edit, sized off the selection (rough chars/4 token
-/// estimate). `shorten` is capped at ~the input length so it can't physically LENGTHEN; `refine` /
-/// `enhance` get headroom. Floors keep a tiny selection from being truncated; ceilings keep a huge
-/// selection inside the 4096-token on-device context budget. This is a safety net — the prompt's
-/// length budget + [`generate_note_edit`]'s validation are the primary length controls.
+/// estimate). `shorten` is capped at ~the input length so it can't physically LENGTHEN; the
+/// in-place edits (refine/grammar/simplify/tone/translate/bullets/table/link_entities/custom) get
+/// modest headroom; the ADDITIVE / GENERATIVE actions (expand/enhance/keypoints/action_items/
+/// decisions/fact_check/ask/drafts) get GENEROUS headroom because their output is new content, not a
+/// rewrite of the selection. Floors keep a tiny selection from being truncated; ceilings keep a huge
+/// selection inside the 4096-token on-device context budget. A safety net — the prompt's length
+/// budget + [`generate_note_edit`]'s validation are the primary length controls.
 fn note_edit_max_tokens(action: &str, input_chars: usize) -> usize {
     let input_tokens = (input_chars / 4).max(1);
     let (mult, floor, ceil) = match action {
+        // Must not exceed ~input tokens (physically can't lengthen).
         "shorten" => (1.0_f64, 48usize, 1024usize),
-        _ => (1.5_f64, 64usize, 1536usize), // refine / enhance can legitimately match or exceed input
+        // Additive / generated output: the answer/draft/list is NEW content — give it room, and a
+        // higher floor so a short selection can still yield a full draft or answer.
+        "expand" | "enhance" | "keypoints" | "action_items" | "decisions" | "fact_check" | "ask"
+        | "draft_followup" | "spinoff_note" => (3.0_f64, 256usize, 2048usize),
+        // In-place edits can legitimately match or slightly exceed the input length.
+        _ => (1.5_f64, 64usize, 1536usize),
     };
     ((input_tokens as f64 * mult).ceil() as usize).clamp(floor, ceil)
 }
@@ -7095,6 +7534,7 @@ fn config_to_dto(c: &AppConfig) -> AppConfigDto {
         note_assist_refine: c.note_assist_refine,
         note_assist_shorten: c.note_assist_shorten,
         note_assist_enhance: c.note_assist_enhance,
+        note_assist_actions_off: c.note_assist_actions_off.clone(),
         note_language: c.note_language.clone(),
         mcp_require_token: c.mcp_require_token,
         lock_require_biometric: c.lock_require_biometric,
@@ -7239,6 +7679,7 @@ fn dto_to_config(d: AppConfigDto, current: &AppConfig) -> AppConfig {
         note_assist_refine: d.note_assist_refine,
         note_assist_shorten: d.note_assist_shorten,
         note_assist_enhance: d.note_assist_enhance,
+        note_assist_actions_off: d.note_assist_actions_off,
         note_language: if d.note_language.trim().is_empty() {
             "auto".to_string()
         } else {
@@ -7916,8 +8357,15 @@ pub async fn resummarize(
     }
     let result = pipeline::resummarize_existing(&app, &state, &meeting_id).await?;
     // COMMIT BOUNDARY: a re-summarize rewrites the meeting's note → BEST-EFFORT re-publish any org
-    // shares of it so members see the fresh summary. Best-effort — never fails the re-summarize.
-    let _ = republish_org_shares_for_source(state.inner(), Some(&meeting_id), None).await;
+    // shares of it so members see the fresh summary. Best-effort — never fails the re-summarize. If
+    // ≥1 org copy was re-published, ping open org views so the fresh summary shows without a manual sync.
+    if republish_org_shares_for_source(state.inner(), Some(&meeting_id), None)
+        .await
+        .unwrap_or(0)
+        > 0
+    {
+        crate::events::emit_org_feed_updated(&app, 1);
+    }
     Ok(StopResult {
         meeting_id: result.meeting_id,
         markdown: result.note_markdown,
@@ -19000,6 +19448,8 @@ mod lifecycle_tests {
             selection: "body text".into(),
             before: None,
             after: None,
+            variant: None,
+            instruction: None,
         };
         let err = block_on(note_assistant_action_inner(&state, req.clone())).unwrap_err();
         assert!(
@@ -19043,6 +19493,8 @@ mod lifecycle_tests {
             selection: "body text".into(),
             before: None,
             after: None,
+            variant: None,
+            instruction: None,
         };
         let err = block_on(note_assistant_action_inner(&state, req)).unwrap_err();
         assert!(
@@ -19057,6 +19509,8 @@ mod lifecycle_tests {
             selection: "x".into(),
             before: None,
             after: None,
+            variant: None,
+            instruction: None,
         };
         assert!(matches!(
             block_on(note_assistant_action_inner(&state, bad)).unwrap_err(),
@@ -19076,8 +19530,10 @@ mod lifecycle_tests {
             selection: "some long selection".into(),
             before: Some("the preceding sentence".into()),
             after: Some("the TRAILINGWORD sentence".into()),
+            variant: None,
+            instruction: None,
         };
-        let (system, user) = build_note_assist_prompt("shorten", &req, &[], "auto");
+        let (system, user) = build_note_assist_prompt("shorten", &req, &[], &[], "auto");
         assert!(
             system.to_lowercase().contains("shorter"),
             "shorten prompt must state the result MUST be shorter: {system}"
@@ -19090,6 +19546,37 @@ mod lifecycle_tests {
             user.trim_end().ends_with("some long selection"),
             "the selection must come LAST so the model edits it, not continues past it: {user}"
         );
+    }
+
+    /// EDIT actions on an existing selection (refine/grammar/shorten/expand/simplify/tone) must
+    /// ALWAYS reply in the selection's OWN language, never the global `note_language` pin — these
+    /// are surgical edits to text the user already wrote, not new-content generation. Reported live:
+    /// with Settings → Notes language pinned to "pl", clicking Shorten on an ENGLISH passage forced
+    /// a Polish rewrite instead of shortening it in English. RED on the old code, which threaded the
+    /// `note_language` parameter straight into every action's `lang`, including `shorten`.
+    #[test]
+    fn edit_actions_ignore_note_language_pin_and_match_selection() {
+        let req = NoteAssistRequest {
+            note_id: "n1".into(),
+            action: "shorten".into(),
+            selection: "some english selection".into(),
+            before: None,
+            after: None,
+            variant: None,
+            instruction: None,
+        };
+        for action in ["refine", "grammar", "shorten", "expand", "simplify", "tone"] {
+            let (system, _user) = build_note_assist_prompt(action, &req, &[], &[], "pl");
+            assert!(
+                system.contains("the same language as the selected text"),
+                "{action} must always match the selection's own language, ignoring the \
+                 note_language pin ('pl'); got: {system}"
+            );
+            assert!(
+                !system.contains("language code 'pl'"),
+                "{action} must NOT force the pinned note_language onto an edited selection: {system}"
+            );
+        }
     }
 
     /// STAGE 1 — the note-edit GenOptions preset caps the on-device decode (a compression edit can't
@@ -19218,6 +19705,8 @@ mod lifecycle_tests {
             selection: "launchcode".into(),
             before: None,
             after: None,
+            variant: None,
+            instruction: None,
         };
         let cites = gather_note_enhance_citations(&state, &req).unwrap();
         let ids: Vec<&str> = cites.iter().map(|c| c.id.as_str()).collect();
@@ -19232,6 +19721,345 @@ mod lifecycle_tests {
         assert!(
             ids.contains(&other_id.as_str()),
             "a different VISIBLE note that matches IS cited"
+        );
+    }
+
+    // ── NOTES full-set assistant (brain-menu) ──────────────────────────────────────────────────────
+
+    /// A scripted fake NOTES provider that records how many `complete_with_meta_opts` calls it
+    /// received — the seam for asserting `find_related` makes ZERO provider calls while an LLM action
+    /// makes exactly one. Returns a canned reply for the (single) call.
+    struct CountingProvider {
+        reply: String,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    impl CountingProvider {
+        fn new(reply: &str) -> std::sync::Arc<Self> {
+            std::sync::Arc::new(Self {
+                reply: reply.to_string(),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+        fn count(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+    #[async_trait::async_trait]
+    impl crate::summarize::provider::SummarizerProvider for CountingProvider {
+        fn id(&self) -> &str {
+            "counting"
+        }
+        async fn availability(&self) -> crate::summarize::provider::Availability {
+            crate::summarize::provider::Availability::Available
+        }
+        async fn summarize(
+            &self,
+            _r: &crate::summarize::provider::SummarizeRequest,
+        ) -> crate::error::Result<String> {
+            Ok(String::new())
+        }
+        async fn complete(&self, _s: &str, _u: &str) -> crate::error::Result<String> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(self.reply.clone())
+        }
+    }
+
+    /// Build a note in an unlocked folder + a DIFFERENT visible note that matches a query term (so
+    /// the gated readers return a citation). Returns (state, note_id).
+    fn brain_menu_fixture(tag: &str) -> (AppState, String) {
+        let state = build_state(tag);
+        let fid = create_note_folder_inner(&state, "Work", None).unwrap().id;
+        let id = create_note_inner(&state, Some(&fid), "Draft").unwrap();
+        update_note_doc_inner(&state, &id, "Draft", "The launchcode plan is here.").unwrap();
+        // A second visible note that also matches — a legitimate grounding source.
+        let other = create_note_inner(&state, Some(&fid), "Other").unwrap();
+        update_note_doc_inner(&state, &other, "Other", "More on the launchcode topic.").unwrap();
+        (state, id)
+    }
+
+    fn brain_menu_req(note_id: &str, action: &str) -> NoteAssistRequest {
+        NoteAssistRequest {
+            note_id: note_id.to_string(),
+            action: action.to_string(),
+            selection: "launchcode".into(),
+            before: None,
+            after: None,
+            variant: None,
+            instruction: None,
+        }
+    }
+
+    /// (a) A DISABLED new action (its id in `note_assist_actions_off`) is refused `Unavailable`
+    /// BEFORE any read/egress — the one opt-out list gates every non-legacy action.
+    #[test]
+    fn brain_menu_disabled_new_action_refuses_unavailable() {
+        let (state, id) = brain_menu_fixture("brain-menu-disabled");
+        {
+            let mut c = state.config.lock().unwrap();
+            c.note_assist_actions_off = vec!["bullets".into()];
+        }
+        let err = block_on(note_assistant_action_impl(
+            &state,
+            brain_menu_req(&id, "bullets"),
+            Some(CountingProvider::new("- x")),
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(err, AppError::Unavailable(_)),
+            "an opted-out new action must refuse Unavailable, got {err:?}"
+        );
+    }
+
+    /// `custom` is the always-on escape hatch — even if every other action were off, `custom` runs.
+    #[test]
+    fn brain_menu_custom_is_always_enabled() {
+        let (state, id) = brain_menu_fixture("brain-menu-custom");
+        {
+            let mut c = state.config.lock().unwrap();
+            c.note_assist_actions_off = vec!["custom".into()]; // even if (wrongly) listed
+        }
+        let mut req = brain_menu_req(&id, "custom");
+        req.instruction = Some("make it a haiku".into());
+        let out = block_on(note_assistant_action_impl(
+            &state,
+            req,
+            Some(CountingProvider::new("a tiny haiku")),
+        ))
+        .unwrap();
+        assert_eq!(out.shape, "replace", "custom is a free-text replace");
+        assert_eq!(out.suggestion, "a tiny haiku");
+    }
+
+    /// (b) A LOCKED note (folder not session-unlocked) is refused `Locked` at the read gate, BEFORE
+    /// any provider call — the provider override proves no egress happened (0 calls).
+    #[test]
+    fn brain_menu_locked_note_refuses_locked_before_egress() {
+        let (state, id) = brain_menu_fixture("brain-menu-locked");
+        let fid = state.db.get_note_row(&id).unwrap().unwrap().folder_id;
+        lock_folder_inner(&state, fid).unwrap();
+        let provider = CountingProvider::new("edited");
+        let err = block_on(note_assistant_action_impl(
+            &state,
+            brain_menu_req(&id, "bullets"),
+            Some(provider.clone()),
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(err, AppError::Locked(_)),
+            "a locked note must refuse Locked, got {err:?}"
+        );
+        assert_eq!(
+            provider.count(),
+            0,
+            "a locked note must never reach the provider"
+        );
+    }
+
+    /// (c) SHAPE mapping — assert `result.shape` for a REPLACE (bullets), an INSERT (action_items),
+    /// an INFO (ask), and an ARTIFACT (spinoff_note) action. The provider override drives each to a
+    /// deterministic reply so the shape is the thing under test.
+    #[test]
+    fn brain_menu_shape_mapping_covers_all_four_shapes() {
+        let (state, id) = brain_menu_fixture("brain-menu-shapes");
+
+        let replace = block_on(note_assistant_action_impl(
+            &state,
+            brain_menu_req(&id, "bullets"),
+            Some(CountingProvider::new("- one\n- two")),
+        ))
+        .unwrap();
+        assert_eq!(replace.shape, "replace", "bullets is a replace");
+        assert!(replace.title.is_none(), "a replace carries no title");
+
+        let insert = block_on(note_assistant_action_impl(
+            &state,
+            brain_menu_req(&id, "action_items"),
+            Some(CountingProvider::new("- [ ] ship it")),
+        ))
+        .unwrap();
+        assert_eq!(insert.shape, "insert", "action_items is an insert");
+
+        let mut ask_req = brain_menu_req(&id, "ask");
+        ask_req.instruction = Some("when is launch?".into());
+        let info = block_on(note_assistant_action_impl(
+            &state,
+            ask_req,
+            Some(CountingProvider::new("Launch is Friday.")),
+        ))
+        .unwrap();
+        assert_eq!(info.shape, "info", "ask is an info answer");
+
+        let artifact = block_on(note_assistant_action_impl(
+            &state,
+            brain_menu_req(&id, "spinoff_note"),
+            Some(CountingProvider::new("# Launch plan\nDetails follow.")),
+        ))
+        .unwrap();
+        assert_eq!(artifact.shape, "artifact", "spinoff_note is an artifact");
+        assert_eq!(
+            artifact.title.as_deref(),
+            Some("Launch plan"),
+            "a spinoff_note derives its title from the drafted body's first heading line"
+        );
+    }
+
+    /// The pure shape/retrieval mapping is also asserted directly (defense-in-depth against a future
+    /// action landing in the wrong bucket).
+    #[test]
+    fn note_assist_shape_and_retrieval_mapping_is_correct() {
+        assert_eq!(note_assist_shape("refine"), "replace");
+        assert_eq!(note_assist_shape("grammar"), "replace");
+        assert_eq!(note_assist_shape("translate"), "replace");
+        assert_eq!(note_assist_shape("link_entities"), "replace");
+        assert_eq!(note_assist_shape("custom"), "replace");
+        assert_eq!(note_assist_shape("keypoints"), "insert");
+        assert_eq!(note_assist_shape("enhance"), "insert");
+        assert_eq!(note_assist_shape("decisions"), "insert");
+        assert_eq!(note_assist_shape("find_related"), "info");
+        assert_eq!(note_assist_shape("fact_check"), "info");
+        assert_eq!(note_assist_shape("ask"), "info");
+        assert_eq!(note_assist_shape("draft_followup"), "artifact");
+        assert_eq!(note_assist_shape("spinoff_note"), "artifact");
+        assert!(matches!(
+            note_assist_retrieval("fact_check"),
+            NoteAssistRetrieval::BrainCitations
+        ));
+        assert!(matches!(
+            note_assist_retrieval("link_entities"),
+            NoteAssistRetrieval::Entities
+        ));
+        assert!(matches!(
+            note_assist_retrieval("bullets"),
+            NoteAssistRetrieval::None
+        ));
+    }
+
+    /// (d) FIND_RELATED makes ZERO provider calls (retrieval-only, no egress) yet returns
+    /// `shape="info"`, `mode="local"`, `redacted=false`, and citations wired from the gated reader.
+    #[test]
+    fn brain_menu_find_related_makes_no_provider_call_and_returns_info() {
+        let (state, id) = brain_menu_fixture("brain-menu-find-related");
+        // A provider override that would PANIC-loudly (via the call counter assert below) if invoked.
+        let provider = CountingProvider::new("SHOULD NEVER BE USED");
+        let out = block_on(note_assistant_action_impl(
+            &state,
+            brain_menu_req(&id, "find_related"),
+            Some(provider.clone()),
+        ))
+        .unwrap();
+        assert_eq!(
+            provider.count(),
+            0,
+            "find_related is retrieval-only — it must NEVER call the provider"
+        );
+        assert_eq!(out.shape, "info", "find_related is an info shape");
+        assert_eq!(out.mode, "local", "find_related never egresses → local");
+        assert!(!out.redacted, "find_related never egresses → not redacted");
+        assert!(
+            !out.citations.is_empty(),
+            "find_related surfaces the gated brain citations"
+        );
+        assert!(
+            out.suggestion.contains("related source"),
+            "find_related returns a one-line answer, got {:?}",
+            out.suggestion
+        );
+    }
+
+    /// (e) An `ask` result carries the ANSWER in `suggestion` with `shape="info"` (the free-text
+    /// question rides `req.instruction`).
+    #[test]
+    fn brain_menu_ask_carries_answer_in_suggestion() {
+        let (state, id) = brain_menu_fixture("brain-menu-ask");
+        let mut req = brain_menu_req(&id, "ask");
+        req.instruction = Some("when does the launch happen?".into());
+        let out = block_on(note_assistant_action_impl(
+            &state,
+            req,
+            Some(CountingProvider::new("The launch happens on Friday.")),
+        ))
+        .unwrap();
+        assert_eq!(out.shape, "info");
+        assert_eq!(
+            out.suggestion, "The launch happens on Friday.",
+            "an ask answer lands in `suggestion`"
+        );
+    }
+
+    /// (f) An UNKNOWN action id → `InvalidArg`, refused before any read/egress.
+    #[test]
+    fn brain_menu_unknown_action_is_invalid_arg() {
+        let (state, id) = brain_menu_fixture("brain-menu-unknown");
+        let err = block_on(note_assistant_action_impl(
+            &state,
+            brain_menu_req(&id, "teleport"),
+            Some(CountingProvider::new("nope")),
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(err, AppError::InvalidArg(_)),
+            "an unknown action id must be InvalidArg, got {err:?}"
+        );
+    }
+
+    /// The `ask` question and `custom` instruction reach the prompt (the `instruction` field is the
+    /// carrier); `tone`/`translate` weave the `variant`.
+    #[test]
+    fn build_note_assist_prompt_weaves_instruction_and_variant() {
+        let mut ask = brain_menu_req("n1", "ask");
+        ask.instruction = Some("UNIQUEQUESTION".into());
+        let (_s, u) = build_note_assist_prompt("ask", &ask, &[], &[], "auto");
+        assert!(
+            u.contains("UNIQUEQUESTION"),
+            "the ask question must reach the user prompt: {u}"
+        );
+
+        let mut tone = brain_menu_req("n1", "tone");
+        tone.variant = Some("Confident".into());
+        let (s, _u) = build_note_assist_prompt("tone", &tone, &[], &[], "auto");
+        assert!(
+            s.contains("Confident"),
+            "the tone variant must reach the system prompt: {s}"
+        );
+
+        let mut tr = brain_menu_req("n1", "translate");
+        tr.variant = Some("Polski".into());
+        let (s2, u2) = build_note_assist_prompt("translate", &tr, &[], &[], "auto");
+        assert!(
+            s2.contains("Polski") && u2.contains("Polski"),
+            "the translate target language must reach both prompts"
+        );
+
+        // link_entities only wraps the PROVIDED names.
+        let le = brain_menu_req("n1", "link_entities");
+        let (s3, u3) =
+            build_note_assist_prompt("link_entities", &le, &[], &["Acme Corp".to_string()], "auto");
+        assert!(
+            u3.contains("Acme Corp"),
+            "link_entities must pass the known names to link: {u3}"
+        );
+        assert!(
+            s3.to_lowercase().contains("wikilink")
+                || s3.contains("[[")
+                || s3.to_lowercase().contains("known entity"),
+            "link_entities must instruct wrapping known names: {s3}"
+        );
+
+        // custom — the free-text instruction MUST reach the prompt and drive a REWRITE of the
+        // selection (shape=replace), NOT be silently dropped into the spinoff_note "new note" draft.
+        // RED→GREEN: on the buggy code `custom` fell through the `_` catch-all to the spinoff arm, so
+        // the instruction never appeared and the prompt was the "new note" one — both asserts failed.
+        let mut custom = brain_menu_req("n1", "custom");
+        custom.instruction = Some("ZZ_CUSTOM_INSTRUCTION".into());
+        let (cs, cu) = build_note_assist_prompt("custom", &custom, &[], &[], "auto");
+        assert!(
+            cs.contains("ZZ_CUSTOM_INSTRUCTION"),
+            "the custom instruction must reach the prompt: {cs}"
+        );
+        assert!(
+            !cs.contains("new standalone note") && !cu.contains("TURN INTO A NEW NOTE"),
+            "custom must NOT be routed to the spinoff_note prompt: {cs} / {cu}"
         );
     }
 
@@ -22504,7 +23332,9 @@ mod lifecycle_tests {
     /// row id), proving the two AADs match.
     #[test]
     fn org_envelope_aad_nonce_is_content_hash_so_cross_member_open_succeeds() {
-        use crate::share::org_envelope::{open_org_envelope, seal_org_envelope, OrgEnvelope, OrgItemKind};
+        use crate::share::org_envelope::{
+            open_org_envelope, seal_org_envelope, OrgEnvelope, OrgItemKind, OrgSourceKind,
+        };
 
         let ock = crate::crypto::random_key().unwrap();
         let env = OrgEnvelope::new(
@@ -22514,6 +23344,7 @@ mod lifecycle_tests {
             "anna",
             "2026-07-10T09:00:00Z",
             1,
+            OrgSourceKind::Meeting,
         );
         let content_sha = env.content_sha256();
 
@@ -22564,6 +23395,7 @@ mod lifecycle_tests {
                 1,
                 &[5u8; 32],
                 None,
+                None,
             )
             .unwrap();
         let got = state.db.get_org_item("it-g").unwrap().unwrap();
@@ -22590,19 +23422,19 @@ mod lifecycle_tests {
         // Two items in org-1 at seq 1 and 2, plus an item in a DIFFERENT org, plus a tombstoned one.
         state
             .db
-            .upsert_org_item("a", "org-1", 1, "anna", "Kickoff", "the kickoff agenda", "2026-07-10T09:00:00Z", 1, 1, &[1u8; 32], None)
+            .upsert_org_item("a", "org-1", 1, "anna", "Kickoff", "the kickoff agenda", "2026-07-10T09:00:00Z", 1, 1, &[1u8; 32], None, None)
             .unwrap();
         state
             .db
-            .upsert_org_item("b", "org-1", 2, "bob", "Retro", "the sprint retro", "2026-07-11T09:00:00Z", 1, 1, &[2u8; 32], None)
+            .upsert_org_item("b", "org-1", 2, "bob", "Retro", "the sprint retro", "2026-07-11T09:00:00Z", 1, 1, &[2u8; 32], None, None)
             .unwrap();
         state
             .db
-            .upsert_org_item("z", "org-2", 9, "zed", "Other org", "not our org", "2026-07-11T09:00:00Z", 1, 1, &[3u8; 32], None)
+            .upsert_org_item("z", "org-2", 9, "zed", "Other org", "not our org", "2026-07-11T09:00:00Z", 1, 1, &[3u8; 32], None, None)
             .unwrap();
         state
             .db
-            .upsert_org_item("d", "org-1", 3, "dan", "Dead", "revoked", "2026-07-11T10:00:00Z", 1, 1, &[4u8; 32], None)
+            .upsert_org_item("d", "org-1", 3, "dan", "Dead", "revoked", "2026-07-11T10:00:00Z", 1, 1, &[4u8; 32], None, None)
             .unwrap();
         state.db.tombstone_org_item("d").unwrap();
 
@@ -22642,7 +23474,7 @@ mod lifecycle_tests {
         // The received replica (frozen at publish time = "Untitled") + the matching OUTBOUND share.
         state
             .db
-            .upsert_org_item("item-own", "org-1", 2, "kgm004a", "Untitled", "# body", "2026-07-11T09:00:00Z", 1, 1, &[9u8; 32], None)
+            .upsert_org_item("item-own", "org-1", 2, "kgm004a", "Untitled", "# body", "2026-07-11T09:00:00Z", 1, 1, &[9u8; 32], None, None)
             .unwrap();
         state
             .db
@@ -22655,7 +23487,7 @@ mod lifecycle_tests {
         // Someone ELSE's replica — no local share ⇒ stays read-only, title untouched.
         state
             .db
-            .upsert_org_item("item-other", "org-1", 1, "kgm004a+2", "Ich notatka", "body", "2026-07-10T09:00:00Z", 1, 1, &[7u8; 32], None)
+            .upsert_org_item("item-other", "org-1", 1, "kgm004a+2", "Ich notatka", "body", "2026-07-10T09:00:00Z", 1, 1, &[7u8; 32], None, None)
             .unwrap();
 
         let items = list_org_items_inner(&state, "org-1").unwrap();
@@ -22671,6 +23503,73 @@ mod lifecycle_tests {
         let other = items.iter().find(|i| i.item_id == "item-other").unwrap();
         assert!(other.owned_source.is_none(), "a non-author's item is a read-only replica");
         assert_eq!(other.title, "Ich notatka", "a non-owned title is left as-is");
+    }
+
+    /// `OrgItemHeader.kind` round-trips for BOTH an owned document-kind share and an owned
+    /// meeting-kind share, and stays `None` for a colleague's item that was upserted with no stored
+    /// `source_kind` (mirrors an item ingested off a v1 envelope / before this column existed — the
+    /// genuinely-unclassified case; a colleague's item ingested off a v2 envelope now DOES classify,
+    /// since `Db::list_org_items` SELECTs the stored `org_items.source_kind` column directly for
+    /// every item). For owned items, `kind` is resolved from `org_shares.document_id` / `meeting_id`
+    /// presence — metadata only, independent of the `owned_source` unlock gate.
+    #[test]
+    fn list_org_items_resolves_kind_for_document_and_meeting_owned_shares_and_none_for_others() {
+        let state = build_state("org-list-kind");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        make_open_folder(&state.db, "f-own", "Team");
+
+        // Owned DOCUMENT (note) share.
+        state
+            .db
+            .insert_note("n-own", "f-own", "Untitled", "A Note", "# body", 1)
+            .unwrap();
+        state
+            .db
+            .upsert_org_item("item-doc", "org-1", 3, "kgm004a", "A Note", "# body", "2026-07-11T09:00:00Z", 1, 1, &[9u8; 32], None, None)
+            .unwrap();
+        state
+            .db
+            .insert_org_share("s-doc", "org-1", None, Some("n-own"), "note", Some("A Note"), 1, 1, &[9u8; 32], "2026-07-11T09:00:00Z")
+            .unwrap();
+        state.db.set_org_share_uploaded("s-doc", "item-doc", "2026-07-11T09:00:00Z").unwrap();
+
+        // Owned MEETING share (unlocked meeting: no folder_id).
+        state
+            .db
+            .insert_meeting(&Meeting {
+                id: "m-own".to_string(),
+                started_at: "2026-07-11T09:00:00Z".to_string(),
+                ended_at: None,
+                title: Some("Standup".to_string()),
+                duration_s: 60,
+                audio_path: None,
+                status: MeetingStatus::Exported,
+                folder_id: None,
+            })
+            .unwrap();
+        state
+            .db
+            .upsert_org_item("item-meeting", "org-1", 2, "kgm004a", "Standup", "# body", "2026-07-11T09:00:00Z", 1, 1, &[8u8; 32], None, None)
+            .unwrap();
+        state
+            .db
+            .insert_org_share("s-meeting", "org-1", Some("m-own"), None, "meeting", Some("Standup"), 1, 1, &[8u8; 32], "2026-07-11T09:00:00Z")
+            .unwrap();
+        state.db.set_org_share_uploaded("s-meeting", "item-meeting", "2026-07-11T09:00:00Z").unwrap();
+
+        // A colleague's item — no local `org_shares` row.
+        state
+            .db
+            .upsert_org_item("item-other", "org-1", 1, "kgm004a+2", "Ich notatka", "body", "2026-07-10T09:00:00Z", 1, 1, &[7u8; 32], None, None)
+            .unwrap();
+
+        let items = list_org_items_inner(&state, "org-1").unwrap();
+        let doc = items.iter().find(|i| i.item_id == "item-doc").unwrap();
+        assert_eq!(doc.kind.as_deref(), Some("document"), "owned note share ⇒ kind=document");
+        let meeting = items.iter().find(|i| i.item_id == "item-meeting").unwrap();
+        assert_eq!(meeting.kind.as_deref(), Some("meeting"), "owned meeting share ⇒ kind=meeting");
+        let other = items.iter().find(|i| i.item_id == "item-other").unwrap();
+        assert!(other.kind.is_none(), "a colleague's item has no locally-knowable kind");
     }
 
     /// F-org-editable GATE: an owned item whose source folder is LOCKED (not session-unlocked) is NOT
@@ -22698,7 +23597,7 @@ mod lifecycle_tests {
             .unwrap();
         state
             .db
-            .upsert_org_item("item-lock", "org-1", 1, "kgm004a", "Old Snapshot", "# body", "2026-07-11T09:00:00Z", 1, 1, &[5u8; 32], None)
+            .upsert_org_item("item-lock", "org-1", 1, "kgm004a", "Old Snapshot", "# body", "2026-07-11T09:00:00Z", 1, 1, &[5u8; 32], None, None)
             .unwrap();
         state
             .db
@@ -22714,6 +23613,11 @@ mod lifecycle_tests {
         assert!(
             it.owned_source.is_none(),
             "a locked owned source is not resolved (no editable link)"
+        );
+        assert_eq!(
+            it.kind.as_deref(),
+            Some("document"),
+            "kind is METADATA (not content) — still resolved even when the owned source is locked"
         );
         assert_ne!(
             it.title, "Secret Title",
@@ -22731,7 +23635,7 @@ mod lifecycle_tests {
         seed_org(&state.db, "org-mine", "Mine", "owner", 1);
         state
             .db
-            .upsert_org_item("m1", "org-mine", 1, "anna", "Mine A", "body", "2026-07-11T09:00:00Z", 1, 1, &[1u8; 32], None)
+            .upsert_org_item("m1", "org-mine", 1, "anna", "Mine A", "body", "2026-07-11T09:00:00Z", 1, 1, &[1u8; 32], None, None)
             .unwrap();
         // A member org resolves + returns the item.
         let ok = list_org_items_inner(&state, "org-mine").unwrap();
@@ -22749,6 +23653,144 @@ mod lifecycle_tests {
         ));
     }
 
+    /// `meeting_org_shares`: an OPEN meeting's active org shares are visible (org id + display
+    /// name), and a SEALED-and-not-session-unlocked meeting's org-share status is MASKED to an empty
+    /// list — exactly like `get_meeting_detail`'s `locked: true` masking. RED on any pre-gate version
+    /// that reads `org_shares_for_source` unconditionally (it would leak the org name for a locked
+    /// meeting even though every OTHER content channel on that meeting is closed).
+    #[test]
+    fn meeting_org_shares_gated_by_meeting_is_unlocked() {
+        let state = build_state("meeting-org-shares-gate");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+
+        // An OPEN meeting, actively shared into org-1.
+        make_open_folder(&state.db, "f-open", "Open");
+        seed_meeting(&state.db, "m-open", "# note", Some("f-open"));
+        state
+            .db
+            .insert_org_share(
+                "s-open", "org-1", Some("m-open"), None, "meeting", Some("Quarterly strategy"),
+                1, 1, &[7u8; 32], "2026-07-11T09:00:00Z",
+            )
+            .unwrap();
+        state
+            .db
+            .set_org_share_uploaded("s-open", "item-open", "2026-07-11T09:00:00Z")
+            .unwrap();
+
+        let open_shares = meeting_org_shares_inner(&state, "m-open").unwrap();
+        assert_eq!(open_shares.len(), 1, "the open meeting's active org share is visible");
+        assert_eq!(open_shares[0].org_id, "org-1");
+        assert_eq!(open_shares[0].org_name, "Acme", "the org's display name resolves");
+
+        // A SEALED, NOT session-unlocked meeting, also actively shared into org-1.
+        state
+            .db
+            .insert_folder(&Folder {
+                id: "f-sealed".to_string(),
+                name: "Sealed".to_string(),
+                path: "Sealed".to_string(),
+                parent_id: None,
+                locked: true,
+                created_at: "2026-06-27T08:00:00Z".to_string(),
+            })
+            .unwrap();
+        seed_meeting(&state.db, "m-sealed", "# note", Some("f-sealed"));
+        state
+            .db
+            .insert_org_share(
+                "s-sealed", "org-1", Some("m-sealed"), None, "meeting", Some("Confidential"),
+                1, 1, &[8u8; 32], "2026-07-11T09:00:00Z",
+            )
+            .unwrap();
+        state
+            .db
+            .set_org_share_uploaded("s-sealed", "item-sealed", "2026-07-11T09:00:00Z")
+            .unwrap();
+
+        let sealed_shares = meeting_org_shares_inner(&state, "m-sealed").unwrap();
+        assert!(
+            sealed_shares.is_empty(),
+            "a sealed-and-not-session-unlocked meeting's org-share status must be masked, not leaked"
+        );
+
+        // Session-unlock the folder — the same meeting's org-share status becomes visible again.
+        state
+            .unlocked_folders
+            .lock()
+            .unwrap()
+            .insert("f-sealed".to_string());
+        let unlocked_shares = meeting_org_shares_inner(&state, "m-sealed").unwrap();
+        assert_eq!(
+            unlocked_shares.len(),
+            1,
+            "a session-unlocked meeting's org-share status is visible again"
+        );
+        assert_eq!(unlocked_shares[0].org_id, "org-1");
+    }
+
+    /// `list_meeting_org_shares`: the BULK Library-row variant of `meeting_org_shares` — one row per
+    /// (meeting, org). An open meeting's active share is listed; a sealed-and-not-session-unlocked
+    /// meeting's row is DROPPED (never leaked in the bulk list either), and a document-anchored share
+    /// (no `meeting_id`) is skipped as not a Library concern.
+    #[test]
+    fn list_meeting_org_shares_drops_locked_meetings() {
+        let state = build_state("list-meeting-org-shares-gate");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+
+        make_open_folder(&state.db, "f-open", "Open");
+        seed_meeting(&state.db, "m-open", "# note", Some("f-open"));
+        state
+            .db
+            .insert_org_share(
+                "s-open", "org-1", Some("m-open"), None, "meeting", Some("Quarterly strategy"),
+                1, 1, &[7u8; 32], "2026-07-11T09:00:00Z",
+            )
+            .unwrap();
+        state.db.set_org_share_uploaded("s-open", "item-open", "2026-07-11T09:00:00Z").unwrap();
+
+        state
+            .db
+            .insert_folder(&Folder {
+                id: "f-sealed".to_string(),
+                name: "Sealed".to_string(),
+                path: "Sealed".to_string(),
+                parent_id: None,
+                locked: true,
+                created_at: "2026-06-27T08:00:00Z".to_string(),
+            })
+            .unwrap();
+        seed_meeting(&state.db, "m-sealed", "# note", Some("f-sealed"));
+        state
+            .db
+            .insert_org_share(
+                "s-sealed", "org-1", Some("m-sealed"), None, "meeting", Some("Confidential"),
+                1, 1, &[8u8; 32], "2026-07-11T09:00:00Z",
+            )
+            .unwrap();
+        state.db.set_org_share_uploaded("s-sealed", "item-sealed", "2026-07-11T09:00:00Z").unwrap();
+
+        // A document-anchored share — not a meeting, must be skipped from the Library-scoped list.
+        state
+            .db
+            .insert_org_share(
+                "s-doc", "org-1", None, Some("n-doc"), "note", Some("A note"),
+                1, 1, &[9u8; 32], "2026-07-11T09:00:00Z",
+            )
+            .unwrap();
+        state.db.set_org_share_uploaded("s-doc", "item-doc", "2026-07-11T09:00:00Z").unwrap();
+
+        let rows = list_meeting_org_shares_inner(&state).unwrap();
+        assert_eq!(rows.len(), 1, "only the OPEN meeting's share is listed");
+        assert_eq!(rows[0].meeting_id, "m-open");
+        assert_eq!(rows[0].org_id, "org-1");
+        assert_eq!(rows[0].org_name, "Acme");
+        assert!(
+            !rows.iter().any(|r| r.meeting_id == "m-sealed"),
+            "a sealed-and-not-session-unlocked meeting's share must not appear in the bulk list"
+        );
+    }
+
     /// FIX B (received-items COUNT): `OrgStatus.received_count` reflects the LOCAL replica (what
     /// colleagues shared IN), DISTINCT from `item_count` (the caller's OWN uploaded outbound shares).
     /// Seed org_items (received) + an outbound uploaded share and assert the two counts are independent.
@@ -22760,11 +23802,11 @@ mod lifecycle_tests {
         // TWO received items (from colleagues) in the local replica.
         state
             .db
-            .upsert_org_item("r1", "org-1", 1, "anna", "Doc A", "body a", "2026-07-10T09:00:00Z", 1, 1, &[1u8; 32], None)
+            .upsert_org_item("r1", "org-1", 1, "anna", "Doc A", "body a", "2026-07-10T09:00:00Z", 1, 1, &[1u8; 32], None, None)
             .unwrap();
         state
             .db
-            .upsert_org_item("r2", "org-1", 2, "bob", "Doc B", "body b", "2026-07-11T09:00:00Z", 1, 1, &[2u8; 32], None)
+            .upsert_org_item("r2", "org-1", 2, "bob", "Doc B", "body b", "2026-07-11T09:00:00Z", 1, 1, &[2u8; 32], None, None)
             .unwrap();
         // ONE of the caller's OWN outbound shares, state 'uploaded' (item_count = 1).
         let now = "2026-07-11T12:00:00Z";
@@ -22870,6 +23912,125 @@ mod lifecycle_tests {
             generation: 1,
         })
         .unwrap();
+    }
+
+    /// IDEMPOTENCY — the double-click / re-click DUPLICATE fix. `share_to_org_inner` for a source that is
+    /// ALREADY live (`uploaded`) in the org returns the EXISTING share WITHOUT publishing a second item:
+    /// no new `org_shares` row, no egress. RED before the guard: unpatched `share_to_org_inner` falls
+    /// straight into `publish_org_body`, which with no live session/consent in a unit test ERRORS instead
+    /// of returning the already-shared item. GREEN: the guard short-circuits BEFORE the publish path.
+    #[test]
+    fn share_to_org_inner_is_idempotent_for_an_already_uploaded_source() {
+        let state = build_state("org-share-idem");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        // The FIRST click already published ONE uploaded share of document n1 into org-1.
+        state
+            .db
+            .insert_org_share(
+                "s1", "org-1", None, Some("n1"), "note", Some("A Note"), 1, 1, &[9u8; 32],
+                "2026-07-11T09:00:00Z",
+            )
+            .unwrap();
+        state
+            .db
+            .set_org_share_uploaded("s1", "item-1", "2026-07-11T09:00:00Z")
+            .unwrap();
+
+        let before = state.db.list_org_shares_for_org("org-1").unwrap().len();
+        // The SECOND share of the same source (the double-click) must NOT publish again.
+        let entry = block_on(share_to_org_inner(
+            &state,
+            "org-1",
+            None,
+            Some("n1".to_string()),
+            false,
+        ))
+        .unwrap();
+        assert_eq!(
+            entry.item_id.as_deref(),
+            Some("item-1"),
+            "returns the EXISTING item, not a fresh publish"
+        );
+        assert_eq!(entry.state, "uploaded");
+        let after = state.db.list_org_shares_for_org("org-1").unwrap();
+        assert_eq!(after.len(), before, "no new org_shares row was inserted (no duplicate)");
+        assert_eq!(
+            after.iter().filter(|r| r.state == "uploaded").count(),
+            1,
+            "still exactly one live share"
+        );
+    }
+
+    /// COLLAPSE — auto-clean of duplicates that already exist. `share_to_org_inner` on a source with
+    /// MULTIPLE live copies in one org returns the EARLIEST (the keeper) and marks the extras for teardown
+    /// (`revoke_pending`). The tombstone network call fails in a unit test (no session) but is
+    /// best-effort: `revoke_org_share_inner` marks the row `revoke_pending` FIRST (the launch sweep
+    /// finishes it), and the swallowed error never breaks the idempotent return.
+    #[test]
+    fn share_to_org_inner_collapses_existing_duplicates_keeping_the_earliest() {
+        let state = build_state("org-share-collapse");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        // Two accidental duplicates of (org-1, n1): earliest = keeper, later = the extra to tombstone.
+        state
+            .db
+            .insert_org_share(
+                "keep", "org-1", None, Some("n1"), "note", Some("A Note"), 1, 1, &[1u8; 32],
+                "2026-07-11T09:00:00Z",
+            )
+            .unwrap();
+        state
+            .db
+            .set_org_share_uploaded("keep", "item-keep", "2026-07-11T09:00:00Z")
+            .unwrap();
+        state
+            .db
+            .insert_org_share(
+                "dup", "org-1", None, Some("n1"), "note", Some("A Note"), 1, 1, &[2u8; 32],
+                "2026-07-11T09:05:00Z",
+            )
+            .unwrap();
+        state
+            .db
+            .set_org_share_uploaded("dup", "item-dup", "2026-07-11T09:05:00Z")
+            .unwrap();
+        // A NOT-yet-uploaded sibling (a stuck pending retry) for the same source — redundant, cancelled.
+        state
+            .db
+            .insert_org_share(
+                "pending", "org-1", None, Some("n1"), "note", Some("A Note"), 1, 1, &[3u8; 32],
+                "2026-07-11T09:06:00Z",
+            )
+            .unwrap();
+
+        let entry = block_on(share_to_org_inner(
+            &state,
+            "org-1",
+            None,
+            Some("n1".to_string()),
+            false,
+        ))
+        .unwrap();
+        assert_eq!(
+            entry.item_id.as_deref(),
+            Some("item-keep"),
+            "the EARLIEST live copy is the keeper"
+        );
+        // Keeper stays uploaded; the duplicate is queued for tombstone. No new row was minted.
+        assert_eq!(
+            state.db.get_org_share("keep").unwrap().unwrap().state,
+            "uploaded",
+            "keeper untouched"
+        );
+        assert_eq!(
+            state.db.get_org_share("dup").unwrap().unwrap().state,
+            "revoke_pending",
+            "the duplicate is marked for tombstone (launch sweep finishes it)"
+        );
+        assert_eq!(
+            state.db.get_org_share("pending").unwrap().unwrap().state,
+            "revoked",
+            "a redundant not-yet-uploaded sibling is cancelled locally (no server item)"
+        );
     }
 
     /// MULTI-ORG STATUS (RED→GREEN for the single-org `.next()` bug): `org_list_statuses` must return
@@ -23394,6 +24555,54 @@ mod lifecycle_tests {
             state.db.count_share_egress_by_kind("org_share_revoke").unwrap(),
             1
         );
+    }
+
+    /// B1 (owner-live-refresh) — the OWNER's OWN first-time share must appear in `list_org_items`
+    /// IMMEDIATELY via the local `org_items` replica, not only after a later feed pull. RED before the
+    /// fix (`publish_org_body` published to the server but never upserted the local row → the shared
+    /// note was invisible in the Notes org view / Settings browse until a manual "Sync now"); GREEN
+    /// after: one owned/editable card resolves right away carrying the note's CURRENT title.
+    #[test]
+    fn initial_share_populates_local_org_items_replica_immediately() {
+        let mock = MockOrgServer::start();
+        let state = build_state("org-initial-share-replica");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        make_open_folder(&state.db, "f-sh", "Team");
+        state
+            .db
+            .insert_note("n-sh", "f-sh", "plan", "Kickoff Plan", "# body to share", 1)
+            .unwrap();
+
+        state.config.lock().unwrap().org_egress_consented = true;
+        state.config.lock().unwrap().share_base_url = mock.base.clone();
+        seed_live_session(&state);
+        seed_ock(&state, "org-1", 1);
+
+        let entry = block_on(share_to_org_inner(
+            &state,
+            "org-1",
+            None,
+            Some("n-sh".to_string()),
+            true,
+        ))
+        .expect("initial share should publish against the mock server");
+        assert_eq!(entry.item_id.as_deref(), Some("item-1"));
+
+        // The local replica must ALREADY hold the item — no feed pull has happened. This is exactly what
+        // makes the shared note show up without a manual "Sync now".
+        let items = list_org_items_inner(&state, "org-1").unwrap();
+        assert_eq!(
+            items.len(),
+            1,
+            "the owner's own share is in the local replica immediately (no pull needed)"
+        );
+        assert_eq!(items[0].item_id, "item-1");
+        // The caller authored it → resolved as an OWNED/editable card with the note's CURRENT title.
+        assert!(
+            items[0].owned_source.is_some(),
+            "the author's own item resolves to an owned/editable source"
+        );
+        assert_eq!(items[0].title, "Kickoff Plan");
     }
 
     /// ITEM 1 — a republish MUST NOT tombstone-into-nothing. Lock the note's folder AFTER the share,
@@ -24212,6 +25421,18 @@ pub struct OrgShareEntry {
     pub shared_at: String,
     pub rev: u32,
     pub state: String,
+}
+
+/// Which org already holds a LIVE (`uploaded`) share of a given LOCAL source (meeting/note), so the FE
+/// can mark that org "Already added ✓" and BLOCK a re-share (the double-click duplicate fix). Content-
+/// free: only the org id + the server item id + rev — never a title or any other member's data. Powers
+/// `org_live_shares_for_source` (a READ, no egress).
+#[derive(serde::Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct OrgSourceShareStatus {
+    pub org_id: String,
+    pub item_id: Option<String>,
+    pub rev: u32,
 }
 
 /// The LOCAL editable SOURCE behind an org item, if the CALLER is its author. `org_resolve_source`
@@ -25091,23 +26312,35 @@ pub(crate) fn preview_org_share_inner(
 /// misroute that shared into the FIRST org, not the chosen one.
 #[tauri::command]
 pub async fn share_meeting_to_org(
+    app: AppHandle,
     state: State<'_, AppState>,
     org_id: String,
     meeting_id: String,
     scrub: bool,
 ) -> Result<OrgShareEntry, AppError> {
-    share_to_org_inner(state.inner(), &org_id, Some(meeting_id), None, scrub).await
+    let entry = share_to_org_inner(state.inner(), &org_id, Some(meeting_id), None, scrub).await?;
+    // A successful share now lives in the local replica (`publish_org_body` upserts it) AND the server
+    // feed — ping every open org view (Notes list + Settings shared-brain) to re-fetch immediately, so
+    // the shared note appears without a manual "Sync now". Content-free count-only event; a best-effort
+    // emit never affects the share result.
+    crate::events::emit_org_feed_updated(&app, 1);
+    Ok(entry)
 }
 
 /// `share_document_to_org(org_id, document_id, scrub)` — the note twin of [`share_meeting_to_org`].
 #[tauri::command]
 pub async fn share_document_to_org(
+    app: AppHandle,
     state: State<'_, AppState>,
     org_id: String,
     document_id: String,
     scrub: bool,
 ) -> Result<OrgShareEntry, AppError> {
-    share_to_org_inner(state.inner(), &org_id, None, Some(document_id), scrub).await
+    let entry = share_to_org_inner(state.inner(), &org_id, None, Some(document_id), scrub).await?;
+    // See `share_meeting_to_org`: ping open org views so the freshly-shared note appears without a
+    // manual "Sync now". Content-free; best-effort.
+    crate::events::emit_org_feed_updated(&app, 1);
+    Ok(entry)
 }
 
 pub(crate) async fn share_to_org_inner(
@@ -25117,9 +26350,79 @@ pub(crate) async fn share_to_org_inner(
     document_id: Option<String>,
     scrub: bool,
 ) -> Result<OrgShareEntry, AppError> {
-    // Initial share = rev 1. A re-publish-on-edit supersede bumps the rev (see
-    // `republish_org_shares_for_source`, which calls `publish_org_body` with `old_rev + 1`).
+    // IDEMPOTENCY (the double-click / re-click DUPLICATE fix). A user-initiated share of a source that
+    // is ALREADY live in this org must NOT mint a second feed item. The pre-fix hole: `publish_org_body`
+    // → `find_reusable_org_share` only reuses `queued`/`failed` rows, so a second click AFTER the first
+    // upload succeeded found no reusable row, inserted a fresh one, and published a DISTINCT item →
+    // the note appeared twice. Here we resolve the org (membership-checked) and look for an existing
+    // `uploaded` share of this exact (org, source): if one exists we COLLAPSE any accidental extras
+    // (keep the earliest, tombstone the rest — the user opted into auto-clean) and RETURN the survivor
+    // WITHOUT publishing. This is a READ + a dedup of the caller's OWN shares, NOT fresh content egress,
+    // so it runs BEFORE the org-egress consent gate — re-clicking an already-shared note never needs
+    // re-consent. Freshness on EDIT is `republish_org_shares_for_source`'s job, never this button's.
+    let org = resolve_org(state, org_id)?;
+    if let Some(keeper) = collapse_org_share_dups_for_source(
+        state,
+        &org.org_id,
+        meeting_id.as_deref(),
+        document_id.as_deref(),
+    )
+    .await?
+    {
+        return Ok(OrgShareEntry {
+            item_id: keeper.item_id,
+            kind: keeper.kind,
+            title: keeper.title,
+            shared_at: keeper.created_at,
+            rev: keeper.rev,
+            state: keeper.state,
+        });
+    }
+
+    // Not yet live in this org → the normal first share = rev 1. A re-publish-on-edit supersede bumps
+    // the rev (see `republish_org_shares_for_source`, which calls `publish_org_body` with `old_rev + 1`).
     publish_org_body(state, org_id, meeting_id, document_id, scrub, 1).await
+}
+
+/// Collapse accidental DUPLICATE live (`uploaded`) org items for ONE (org, source) down to the earliest,
+/// tombstoning the rest, and return the SURVIVOR (the earliest `uploaded` row) — or `None` when the
+/// source is not currently live in this org. The keeper = the oldest published item (the identity other
+/// members first synced); every later duplicate is revoked via `revoke_org_share_inner` (tombstone the
+/// server item + mark the local row revoked). BEST-EFFORT on each tombstone: a network failure leaves
+/// the extra `revoke_pending` (the launch sweep finishes it) and simply isn't cleaned this pass — it
+/// NEVER fails the idempotent share. No content is read or egressed here (only the caller's own share
+/// rows + a tombstone of a redundant copy), so it is safe to run before the egress-consent gate.
+async fn collapse_org_share_dups_for_source(
+    state: &AppState,
+    org_id: &str,
+    meeting_id: Option<&str>,
+    document_id: Option<&str>,
+) -> Result<Option<crate::storage::OrgShareRow>, AppError> {
+    // Oldest-first, so `remove(0)` is the canonical keeper and the remainder are the extras.
+    let mut rows =
+        state
+            .db
+            .uploaded_org_shares_for_source_in_org(org_id, meeting_id, document_id)?;
+    if rows.is_empty() {
+        return Ok(None);
+    }
+    let keeper = rows.remove(0);
+    for extra in rows {
+        if let Some(item_id) = extra.item_id.clone() {
+            // Tombstone the redundant copy. Swallow errors — `revoke_org_share_inner` marks the row
+            // `revoke_pending` first, so an interrupted tombstone is completed by the launch sweep.
+            let _ = revoke_org_share_inner(state, item_id).await;
+        }
+    }
+    // Also cancel any NOT-yet-uploaded sibling (`queued`/`failed`) for this (org, source): the source is
+    // already live (the keeper), so a pending row is redundant and would otherwise linger as a stuck
+    // "pending" share that the launch sweep re-attempts every start. Local-only — these have no server
+    // item to tombstone. Best-effort (never fails the idempotent return).
+    let now = chrono::Utc::now().to_rfc3339();
+    let _ = state
+        .db
+        .cancel_pending_org_shares_for_source_in_org(org_id, meeting_id, document_id, &now);
+    Ok(Some(keeper))
 }
 
 /// The org publish CORE, shared by the FIRST share (`share_to_org_inner`, `rev = 1`) and the
@@ -25144,6 +26447,14 @@ pub(crate) async fn publish_org_body(
         document_id.as_deref(),
         scrub,
     )?;
+    // `build_org_share_body` already enforces exactly one of meeting_id/document_id is `Some` (else it
+    // errors before this line is reached), so this mirrors that same exclusivity to stamp the wire
+    // envelope's SOURCE type (document vs meeting — a new axis, distinct from `kind`/content-shape).
+    let source_kind = if meeting_id.is_some() {
+        crate::share::org_envelope::OrgSourceKind::Meeting
+    } else {
+        crate::share::org_envelope::OrgSourceKind::Document
+    };
 
     // (2) consent fail-closed (the global one-time org-egress consent).
     {
@@ -25189,6 +26500,7 @@ pub(crate) async fn publish_org_body(
         author_hint,
         created_at,
         rev,
+        source_kind,
     );
     let content_sha = env.content_sha256();
     // SB-3 row-amplification fix: REUSE any existing retriable (`queued`/`failed`) row for this
@@ -25282,6 +26594,30 @@ pub(crate) async fn publish_org_body(
         .db
         .set_org_share_uploaded(&row_id, &published.item_id, &now)?;
 
+    // LOCAL REPLICA CONSISTENCY (owner-live-refresh): the author's OWN `org_items` replica would
+    // otherwise stay EMPTY of this item until the next feed pull — so a note the owner just shared is
+    // invisible in `list_org_items` (the Notes org view + Settings browse) until a manual "Sync now".
+    // Upsert it LOCALLY now, mirroring the republish path, so `list_org_items` immediately resolves it
+    // as an owned/editable card. FTS-only (`None` embedder) to keep this share path light; the next real
+    // `org_sync_now` re-ingests authoritatively (idempotent upsert) and re-embeds. Best-effort: a local
+    // replica error must never fail the share (the server copy is already live + correct).
+    if let Err(e) = state.db.upsert_org_item(
+        &published.item_id,
+        &org.org_id,
+        published.seq,
+        &env.author_hint,
+        &env.title,
+        &env.markdown,
+        &env.created_at,
+        rev,
+        generation,
+        &content_sha,
+        env.source_kind.map(crate::share::org_envelope::OrgSourceKind::as_str),
+        None,
+    ) {
+        tracing::warn!(target: "org", error = %e, "share: local replica upsert failed (server copy live)");
+    }
+
     // (7) CONTENT-FREE egress ledger (host + ciphertext byte size). NEVER a title / note text / OCK.
     crate::share::ledger_row(
         &state.db,
@@ -25328,11 +26664,35 @@ pub(crate) async fn republish_org_shares_for_source(
     state: &AppState,
     meeting_id: Option<&str>,
     document_id: Option<&str>,
-) -> Result<(), AppError> {
+) -> Result<u32, AppError> {
+    // DEDUP FIRST (auto-clean, user-opted-in): collapse any accidental duplicate live items for this
+    // source — PER ORG — down to the earliest BEFORE republishing. Otherwise we'd republish (and keep
+    // alive) every duplicate; the survivor is what the edit then supersedes. Best-effort — a tombstone
+    // failure leaves the extra for the launch sweep's dedup pass and never blocks the save.
+    let dup_orgs: Vec<String> = {
+        let mut v: Vec<String> = state
+            .db
+            .org_shares_for_source(meeting_id, document_id)?
+            .into_iter()
+            .map(|r| r.org_id)
+            .collect();
+        v.sort();
+        v.dedup();
+        v
+    };
+    for org_id in &dup_orgs {
+        let _ =
+            collapse_org_share_dups_for_source(state, org_id, meeting_id, document_id).await;
+    }
+
     let rows = state.db.org_shares_for_source(meeting_id, document_id)?;
     if rows.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
+    // Count of rows that produced a NEW published rev this call — returned so the caller can emit
+    // `org-feed-updated` ONLY when > 0 (a save that changed nothing / skipped every row must not ping
+    // the FE).
+    let mut republished = 0u32;
     let now = chrono::Utc::now().to_rfc3339();
     for row in rows {
         // Re-read the CURRENT plaintext THROUGH the read-gate. `build_org_share_body` also does the
@@ -25357,6 +26717,13 @@ pub(crate) async fn republish_org_shares_for_source(
                 tracing::warn!(target: "org", error = %e, "republish: could not re-read source; skipped");
                 continue;
             }
+        };
+        // `org_shares_for_source` rows always anchor exactly one of meeting_id/document_id (mirrors the
+        // exclusivity `build_org_share_body` already enforced when this row was first published).
+        let source_kind = if row.meeting_id.is_some() {
+            crate::share::org_envelope::OrgSourceKind::Meeting
+        } else {
+            crate::share::org_envelope::OrgSourceKind::Document
         };
 
         // Consent could have been withdrawn since the share → SKIP (never egress without consent).
@@ -25395,6 +26762,7 @@ pub(crate) async fn republish_org_shares_for_source(
             author_hint.clone(),
             created_at.clone(),
             row.rev,
+            source_kind,
         );
         if row.content_sha256.as_deref() == Some(cmp_env.content_sha256().as_slice()) {
             continue;
@@ -25408,6 +26776,7 @@ pub(crate) async fn republish_org_shares_for_source(
             author_hint,
             created_at,
             new_rev,
+            source_kind,
         );
         let content_sha = env.content_sha256();
 
@@ -25496,6 +26865,10 @@ pub(crate) async fn republish_org_shares_for_source(
             .db
             .set_org_share_uploaded(&row.id, &published.item_id, &now)?;
         crate::share::ledger_row(&state.db, &client.host(), "org_share_publish", content_sha.len());
+        // This row produced a NEW published rev this call — counted so the caller can decide whether
+        // to emit `org-feed-updated` (only when > 0; a save that changed nothing / skipped every row
+        // must not ping the FE).
+        republished += 1;
 
         // LOCAL REPLICA CONSISTENCY (F-org-editable): the author's OWN `org_items` replica would
         // otherwise stay frozen on the OLD item_id until the next feed pull — so the just-repointed
@@ -25516,6 +26889,7 @@ pub(crate) async fn republish_org_shares_for_source(
             new_rev,
             generation,
             &content_sha,
+            env.source_kind.map(crate::share::org_envelope::OrgSourceKind::as_str),
             None,
         ) {
             tracing::warn!(target: "org", error = %e, "republish: local replica upsert failed (server copy live)");
@@ -25549,8 +26923,10 @@ pub(crate) async fn republish_org_shares_for_source(
                 }
             }
         }
+        // This row published a NEW rev this call — count it so the caller emits `org-feed-updated`.
+        republished += 1;
     }
-    Ok(())
+    Ok(republished)
 }
 
 /// `list_org_shares()` — the caller's outbound org shares (local rows; titles render only to the
@@ -25573,6 +26949,145 @@ pub fn list_org_shares(state: State<'_, AppState>) -> Result<Vec<OrgShareEntry>,
             shared_at: r.created_at,
             rev: r.rev,
             state: r.state,
+        })
+        .collect())
+}
+
+/// One org this meeting is actively shared into (`meeting_org_shares`) — just enough for the
+/// Library row badge + the Detail "Shared with…" indicator. Content-free beyond the org's own
+/// display name (which the caller already sees everywhere else in the org UI).
+#[derive(serde::Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct MeetingOrgShareInfo {
+    pub org_id: String,
+    pub org_name: String,
+}
+
+/// `meeting_org_shares(meeting_id)` — every org THIS meeting is currently (actively) shared into,
+/// i.e. the `uploaded` `org_shares` rows anchored on it. Same disclosure class as `get_meeting_tags`
+/// (a metadata-only read of the user's OWN share state — never note/transcript content), but gated
+/// exactly like `get_meeting_detail`: a sealed-and-not-session-unlocked meeting returns an EMPTY
+/// list rather than leaking whether/where it's shared, mirroring `meeting_is_unlocked` at every
+/// other content read site. A meeting the caller never shared (or an unknown id) also returns `[]`.
+#[tauri::command]
+pub fn meeting_org_shares(
+    state: State<'_, AppState>,
+    meeting_id: String,
+) -> Result<Vec<MeetingOrgShareInfo>, AppError> {
+    meeting_org_shares_inner(state.inner(), &meeting_id)
+}
+
+/// Inner of [`meeting_org_shares`] taking `&AppState` (unit-testable read-gate). See the command doc
+/// for the disclosure-class rationale.
+pub(crate) fn meeting_org_shares_inner(
+    st: &AppState,
+    meeting_id: &str,
+) -> Result<Vec<MeetingOrgShareInfo>, AppError> {
+    if !meeting_is_unlocked(st, meeting_id)? {
+        return Ok(Vec::new());
+    }
+    let rows = st.db.org_shares_for_source(Some(meeting_id), None)?;
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for row in rows {
+        if !seen.insert(row.org_id.clone()) {
+            continue; // one badge per org even if somehow >1 uploaded row exists for it.
+        }
+        let name = st
+            .db
+            .get_org_state(&row.org_id)?
+            .map(|o| o.name)
+            .unwrap_or_else(|| "Shared brain".to_string());
+        out.push(MeetingOrgShareInfo {
+            org_id: row.org_id,
+            org_name: name,
+        });
+    }
+    Ok(out)
+}
+
+/// One row of [`list_meeting_org_shares`] — a single meeting-to-org share pairing (a meeting may
+/// have several rows, one per org it's shared into).
+#[derive(serde::Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct MeetingOrgShareRow {
+    pub meeting_id: String,
+    pub org_id: String,
+    pub org_name: String,
+}
+
+/// `list_meeting_org_shares()` — EVERY active meeting→org share pairing across ALL of the caller's
+/// meetings, in one bulk call (avoids an N+1 `meeting_org_shares` fetch per Library row). Same
+/// disclosure class + gate as [`meeting_org_shares`]: a sealed-and-not-session-unlocked meeting's
+/// rows are dropped, exactly mirroring `mask_locked_meetings` for `list_meetings`.
+#[tauri::command]
+pub fn list_meeting_org_shares(
+    state: State<'_, AppState>,
+) -> Result<Vec<MeetingOrgShareRow>, AppError> {
+    list_meeting_org_shares_inner(state.inner())
+}
+
+/// Inner of [`list_meeting_org_shares`] taking `&AppState` (unit-testable read-gate).
+pub(crate) fn list_meeting_org_shares_inner(
+    st: &AppState,
+) -> Result<Vec<MeetingOrgShareRow>, AppError> {
+    let rows = st.db.list_org_shares_in_state("uploaded")?;
+    let mut out = Vec::new();
+    let mut org_names: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut seen = std::collections::HashSet::new();
+    for row in rows {
+        let Some(meeting_id) = row.meeting_id else {
+            continue; // a document-anchored share — not a Library concern.
+        };
+        if !seen.insert((meeting_id.clone(), row.org_id.clone())) {
+            continue; // one badge per (meeting, org) even if somehow >1 uploaded row exists.
+        }
+        // GATE: a sealed-and-not-session-unlocked meeting's share status must not leak, exactly
+        // like every other content/metadata read on it (`meeting_is_unlocked`).
+        if !meeting_is_unlocked(st, &meeting_id)? {
+            continue;
+        }
+        let name = if let Some(n) = org_names.get(&row.org_id) {
+            n.clone()
+        } else {
+            let n = st
+                .db
+                .get_org_state(&row.org_id)?
+                .map(|o| o.name)
+                .unwrap_or_else(|| "Shared brain".to_string());
+            org_names.insert(row.org_id.clone(), n.clone());
+            n
+        };
+        out.push(MeetingOrgShareRow {
+            meeting_id,
+            org_id: row.org_id,
+            org_name: name,
+        });
+    }
+    Ok(out)
+}
+
+/// `org_live_shares_for_source(meeting_id?, document_id?)` — which orgs already hold a LIVE (`uploaded`)
+/// share of THIS exact local source, so the FE can mark those orgs "Already added ✓" and BLOCK a
+/// re-share (the double-click duplicate fix). READ-ONLY, no egress. Content-free: only (org_id, item_id,
+/// rev) — never a title or another member's data. Exactly one of meeting_id/document_id is set; both-None
+/// ⇒ empty. Reuses `org_shares_for_source` (uploaded rows across ALL the caller's orgs).
+#[tauri::command]
+pub fn org_live_shares_for_source(
+    state: State<'_, AppState>,
+    meeting_id: Option<String>,
+    document_id: Option<String>,
+) -> Result<Vec<OrgSourceShareStatus>, AppError> {
+    let rows = state
+        .inner()
+        .db
+        .org_shares_for_source(meeting_id.as_deref(), document_id.as_deref())?;
+    Ok(rows
+        .into_iter()
+        .map(|r| OrgSourceShareStatus {
+            org_id: r.org_id,
+            item_id: r.item_id,
+            rev: r.rev,
         })
         .collect())
 }
@@ -25756,8 +27271,11 @@ pub async fn revoke_shares_for_folder(
 /// Cadence of the background org-feed sync loop (M6 Shared Brain, spawned in `lib.rs` setup). The
 /// first tick fires `ORG_SYNC_FIRST_DELAY_SECS` after launch (no startup contention); subsequent
 /// ticks every `ORG_SYNC_TICK_SECS`. Every tick is a cheap no-op while logged out / no org joined.
+/// 60s (not 120s) so a member — who has no server push, only this pull — sees a colleague's newly
+/// shared/edited note within ~1 min without a manual "Sync now"; the owner's own shares refresh
+/// instantly via the `org-feed-updated` emit on the share/edit commands.
 pub const ORG_SYNC_FIRST_DELAY_SECS: u64 = 20;
-pub const ORG_SYNC_TICK_SECS: u64 = 120;
+pub const ORG_SYNC_TICK_SECS: u64 = 60;
 
 /// One background org-sync tick: drain the outbound share queue, then pull + ingest the inbound feed
 /// into the local int8 partition. This is what makes the org brain a REPLICATED brain — every
@@ -25821,6 +27339,21 @@ pub(crate) async fn org_sweep_pending_inner(state: &AppState) -> Result<u32, App
         return Ok(0);
     }
     let mut advanced = 0u32;
+
+    // 0) DEDUP (auto-clean, user-opted-in): collapse accidental DUPLICATE live items — same org + same
+    //    source — down to the earliest, tombstoning the extras. Fixes duplicates created BEFORE the
+    //    idempotency guard existed (e.g. a double-click on Share), which self-healing needs a proactive
+    //    pass to reach (the FE now blocks re-share, so the share-time collapse never re-fires for them).
+    //    `duplicate_uploaded_org_shares` returns exactly the extras (never a keeper); each is torn down
+    //    via the crash-safe revoke path (marks `revoke_pending` first, so an interrupted tombstone is
+    //    completed by step 1 on the next pass). Best-effort — a network failure just retries next launch.
+    for extra in state.db.duplicate_uploaded_org_shares()? {
+        if let Some(item_id) = extra.item_id.clone() {
+            if revoke_org_share_inner(state, item_id).await.is_ok() {
+                advanced += 1;
+            }
+        }
+    }
 
     // 1) Finish any pending revokes (a tombstone that didn't land before a crash).
     for row in state.db.list_org_shares_in_state("revoke_pending")? {
@@ -26173,6 +27706,11 @@ async fn org_sync_one(
                     rev,
                     generation,
                     &sha,
+                    // Straight off the opened envelope: `Some("document"|"meeting")` for an item
+                    // published from a v2 wire envelope (this device's own publishes, or a peer already
+                    // on v2); `None` for one opened off an old v1 envelope (no wire signal) — honest
+                    // "unclassified", never guessed.
+                    env.source_kind.map(crate::share::org_envelope::OrgSourceKind::as_str),
                     embedder_ref,
                 )?;
                 report.ingested += 1;
@@ -26239,13 +27777,45 @@ pub(crate) fn list_org_items_inner(
     // a stale publish-time snapshot. GATED — a locked-not-unlocked source resolves to `None` (its title
     // must never leak through this org-disclosed list). A non-author's item has no local share ⇒ `None`
     // ⇒ stays a read-only replica.
+    //
+    // KIND (source-type) ENRICHMENT: separate from the above — `kind` is METADATA (meeting vs document),
+    // never content. `Db::list_org_items` now populates `item.kind` DIRECTLY from the stored
+    // `org_items.source_kind` column for EVERY item (opened off a v2 `OrgEnvelope` at ingest, so a
+    // colleague's item now classifies too). This local `org_shares`-anchored resolver is kept as a
+    // fallback/override ONLY for the CALLER'S OWN items — it stays correct (and UNGATED, unlike
+    // `owned_source`: a locked source still reports its kind) even if the stored column is somehow null
+    // for a row ingested before this column existed. It must NOT clobber a correctly-populated stored
+    // value for a colleague's item with `None`.
     for item in &mut items {
+        if let Some(own_kind) = resolve_own_item_kind(st, &item.item_id)? {
+            item.kind = Some(own_kind);
+        }
         if let Some(src) = resolve_owned_source(st, &item.item_id)? {
             item.title = src.title;
             item.owned_source = Some(src.owned);
         }
     }
     Ok(items)
+}
+
+/// The source kind (`"document"` | `"meeting"`) of an org item THIS device published, from the local
+/// `org_shares` anchor — metadata only (no title/body), so UNGATED (a locked source still reports its
+/// kind; only `owned_source`'s title is lock-gated). `None` when no local share row exists (an item
+/// published by a colleague) or the row anchors neither `meeting_id` nor `document_id` (shouldn't
+/// happen — `insert_org_share` always sets exactly one — but fails closed to `None` rather than guess).
+/// A fallback/override for the CALLER'S OWN items only — see the call site in `list_org_items_inner`;
+/// `Db::list_org_items` now populates `kind` for colleagues' items too, straight from storage.
+fn resolve_own_item_kind(st: &AppState, item_id: &str) -> Result<Option<String>, AppError> {
+    let Some(row) = st.db.org_share_by_item(item_id)? else {
+        return Ok(None);
+    };
+    if row.document_id.is_some() {
+        Ok(Some("document".to_string()))
+    } else if row.meeting_id.is_some() {
+        Ok(Some("meeting".to_string()))
+    } else {
+        Ok(None)
+    }
 }
 
 /// The caller's editable local source + its CURRENT title for an org item they published, if any. `None`

@@ -349,6 +349,16 @@ export interface AppConfigDto {
   noteAssistRefine?: boolean;
   noteAssistShorten?: boolean;
   noteAssistEnhance?: boolean;
+  /**
+   * Notes feature — ids of the NEW (post-refine/shorten/enhance) selection-assistant
+   * actions the user has turned OFF. Scales to any number of actions without one
+   * column each. Enabled check: refine/shorten/enhance follow their bools above;
+   * every other action id is enabled unless it appears here; `custom` is always
+   * enabled (the escape hatch). OPTIONAL — an absent value means nothing is off
+   * (mirrors Rust `AppConfigDto.note_assist_actions_off`, camelCase). Round-tripped
+   * on every `save_config` like the other flags.
+   */
+  noteAssistActionsOff?: string[];
 }
 
 /** Phase H — which backend powers the brain / in-meeting voice assistant. */
@@ -1679,15 +1689,50 @@ export interface NoteDoc {
 }
 
 /**
- * The three selection-assistant actions. `refine`/`shorten` REPLACE the selection;
- * `enhance` retrieves related brain context and proposes an ADDITIVE passage.
+ * The full selection-assistant action set (mirrors the Rust `NoteAssistAction`).
+ * Grouped EDIT / STRUCTURE / FROM YOUR BRAIN / EXTRACT / CREATE (see the shared
+ * action catalog in `note-assist-catalog.ts`). Each action maps to a RESULT
+ * SHAPE (replace/insert/info/artifact) the backend reports in
+ * `NoteAssistResult.shape` — the FE renders off that shape, never re-deriving it.
+ * `custom` is the free-text escape hatch (always enabled).
  */
-export type NoteAssistAction = "refine" | "shorten" | "enhance";
+export type NoteAssistAction =
+  | "refine"
+  | "grammar"
+  | "shorten"
+  | "expand"
+  | "simplify"
+  | "tone"
+  | "translate"
+  | "bullets"
+  | "table"
+  | "keypoints"
+  | "enhance"
+  | "find_related"
+  | "link_entities"
+  | "fact_check"
+  | "ask"
+  | "action_items"
+  | "decisions"
+  | "draft_followup"
+  | "spinoff_note"
+  | "custom";
+
+/**
+ * How the backend result maps to the FE rendering (mirrors the Rust
+ * `NoteAssistResult.shape`). `replace` = struck original vs suggestion + Accept;
+ * `insert` = keep the selection, append the suggestion; `info` = read-only
+ * answer + citations (Copy / Insert as note); `artifact` = a titled draft
+ * (email / new note) with Copy / Create note. TRUST this over the action id.
+ */
+export type NoteAssistShape = "replace" | "insert" | "info" | "artifact";
 
 /**
  * A selection-assistant request (`note_assistant_action`). Mirrors the Rust
  * `NoteAssistRequest`. `before`/`after` carry a bounded slice of surrounding
  * context (~500 chars each) so the model can act coherently on the selection.
+ * `variant` carries a tone name / target language for the variant actions;
+ * `instruction` carries the free-text for `custom` or the question for `ask`.
  */
 export interface NoteAssistRequest {
   noteId: string;
@@ -1698,6 +1743,10 @@ export interface NoteAssistRequest {
   before?: string;
   /** Up to ~500 chars of context after the selection. */
   after?: string;
+  /** Tone name (tone) or target language (translate); undefined otherwise. */
+  variant?: string;
+  /** Free-text instruction (`custom`) or question (`ask`); undefined otherwise. */
+  instruction?: string;
 }
 
 /**
@@ -1706,7 +1755,7 @@ export interface NoteAssistRequest {
  * note/meeting.
  */
 export interface NoteCitation {
-  kind: "meeting" | "note";
+  kind: "meeting" | "note" | "person" | "entity";
   id: string;
   title: string;
   snippet: string;
@@ -1714,17 +1763,27 @@ export interface NoteCitation {
 
 /**
  * The result of a selection-assistant action (`note_assistant_action`). Mirrors
- * the Rust `NoteAssistResult`. `suggestion` REPLACES the selection for
- * refine/shorten, or is an ADDITIVE passage to INSERT after the selection for
- * enhance. `citations` is populated for enhance only (else []). `modelLabel`/
+ * the Rust `NoteAssistResult`. The FE renders GENERICALLY off `shape` (never
+ * re-derived from `action`):
+ * - `replace`  — `suggestion` replaces the selection.
+ * - `insert`   — `suggestion` is appended after the selection (additive).
+ * - `info`     — `suggestion` is the answer text; `citations` the sources.
+ * - `artifact` — `title` + `suggestion` is a draft (email subject/body or note
+ *                title/body) the user copies or turns into a note.
+ * `citations` is populated for the brain-reading actions (else []). `modelLabel`/
  * `mode`/`redacted` reflect the resolved `provider_for(Role::Notes)` routing —
- * the popover DISPLAYS them (never decides them).
+ * the popover DISPLAYS them (never decides them). `find_related` is retrieval-only
+ * (`redacted=false`, no shield).
  */
 export interface NoteAssistResult {
   action: NoteAssistAction;
-  /** refine/shorten: the replacement. enhance: an additive passage to insert. */
+  /** How to render + apply this result — replace/insert/info/artifact. */
+  shape: NoteAssistShape;
+  /** Artifact title (email subject / note title); null/undefined for non-artifact. */
+  title?: string | null;
+  /** replace: the replacement. insert: additive passage. info: the answer. artifact: the body. */
   suggestion: string;
-  /** enhance-context provenance; [] for refine/shorten. */
+  /** Brain-source provenance; [] for actions that don't read the brain. */
   citations: NoteCitation[];
   /** e.g. "Claude" | "Qwen2.5 4B (local)" — shown in the popover mode chip. */
   modelLabel: string;
@@ -1836,6 +1895,18 @@ export interface OrgItemHeader {
   /** The item's feed sequence — stable ordering key for the browse list. */
   seq: number;
   /**
+   * The item's source kind — `"document"` (a shared authored note, for the Notes
+   * view) or `"meeting"` (a shared meeting note, for the Library/Meetings view) —
+   * so a per-org list can be filtered into "shared meetings" vs "shared notes".
+   * Populated backend-side (`Db::list_org_items` reads the stored `org_items
+   * .source_kind` column) for ANY item ingested off a v2 `OrgEnvelope` — including
+   * a colleague's item, not just one THIS device published. Still absent/`null`
+   * for an item ingested off an old v1 envelope (published before the source-kind
+   * wire field existed) — treat `null` as "unclassified", do NOT default it into
+   * either bucket. Mirrors the Rust `OrgItemHeader.kind`.
+   */
+  kind?: "document" | "meeting" | null;
+  /**
    * When THIS user published the item AND their local source is readable, the
    * editable original behind it (resolved backend-side, unlock-gated). Present ⇒
    * the row links straight to `/notes/:id` | `/meeting/:id` and `title` is the
@@ -1906,6 +1977,43 @@ export interface OrgShareEntry {
   sharedAt: string;
   rev: number;
   state: "queued" | "uploaded" | "failed" | "revoke_pending" | "revoked";
+}
+
+/**
+ * One org a meeting is ACTIVELY shared into (`meetingOrgShares`) — drives the "Shared with
+ * [org]" badge on the Library row + the Detail view. Content-free beyond the org's own display
+ * name. Gated exactly like `MeetingDetail`: a sealed-and-not-session-unlocked meeting resolves
+ * to `[]`, never leaking its share status. Only the text note/summary is ever shared through
+ * this path — the audio recording never leaves the device. Mirrors the Rust `MeetingOrgShareInfo`.
+ */
+export interface MeetingOrgShareInfo {
+  orgId: string;
+  orgName: string;
+}
+
+/**
+ * One row of `listMeetingOrgShares` — the BULK Library-row variant of
+ * {@link MeetingOrgShareInfo}: every active meeting→org share pairing across ALL of the
+ * caller's meetings in one call (avoids an N+1 per-row fetch). Same gate: a sealed-and-
+ * not-session-unlocked meeting contributes no rows. Mirrors the Rust `MeetingOrgShareRow`.
+ */
+export interface MeetingOrgShareRow {
+  meetingId: string;
+  orgId: string;
+  orgName: string;
+}
+
+/**
+ * Which org already holds a LIVE (`uploaded`) share of a given LOCAL source
+ * (meeting/note), so the share sheet can mark that org "Already added ✓" and
+ * BLOCK a re-share (the double-click duplicate fix). Content-free: only the org
+ * id + server item id + rev. Populated by `orgLiveSharesForSource`. Mirrors the
+ * Rust `OrgSourceShareStatus`.
+ */
+export interface OrgSourceShareStatus {
+  orgId: string;
+  itemId: string | null;
+  rev: number;
 }
 
 /**

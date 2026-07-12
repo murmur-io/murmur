@@ -11,12 +11,18 @@ import {
   untracked,
   viewChild,
 } from "@angular/core";
+import { RouterLink } from "@angular/router";
+import type { UnlistenFn } from "@tauri-apps/api/event";
 import { IpcService } from "../../../core/ipc.service";
 import { TabsService } from "../../../core/tabs.service";
+import { MurSpinnerComponent } from "../../../design-system/spinner/spinner.component";
 import type {
   FolderNode,
   Meeting,
+  MeetingOrgShareRow,
   MeetingStatus,
+  OrgItemHeader,
+  OrgStatus,
   SearchHit,
 } from "../../../core/models";
 import {
@@ -51,6 +57,21 @@ export interface MeetingsListItem {
   meeting: Meeting;
 }
 
+/**
+ * One row of an org's "Shared Brains" meeting list (shown ONLY when an org is
+ * rail-selected — never merged into {@link MeetingsListItem}'s "All meetings").
+ * A READ-ONLY replica (opens `/org-item/:id`), UNLESS the caller authored it
+ * (`ownedSource`), in which case it routes straight to the editable original
+ * (`/meeting/:id`). `id` is `org:`-namespaced for a stable `@for` track key.
+ */
+export interface OrgMeetingListItem {
+  kind: "org";
+  id: string;
+  sortAt: number;
+  item: OrgItemHeader;
+  orgName: string;
+}
+
 @Component({
   selector: "app-library",
   changeDetection: ChangeDetectionStrategy.OnPush,
@@ -64,7 +85,12 @@ export interface MeetingsListItem {
     "(document:keydown.escape)": "onEscape()",
     "(document:click)": "onDocumentClick($event)",
   },
-  imports: [LockBadgeComponent, MoveToMenuComponent],
+  imports: [
+    RouterLink,
+    MurSpinnerComponent,
+    LockBadgeComponent,
+    MoveToMenuComponent,
+  ],
   templateUrl: "./library.component.html",
   styleUrl: "./library.component.scss",
 })
@@ -177,6 +203,10 @@ export class LibraryComponent implements OnInit {
       this.cancelDelete();
       this.rowMenuId.set(null);
       this.movePopoverId.set(null);
+      // A folder pick is a THIRD mutually-exclusive scope alongside tag/org —
+      // always drop the org chip selection here too (mirrors NotesHomeComponent's
+      // `_clearOrgOnFolderChange`), so the content pane never shows two scopes.
+      this.activeOrgId.set(null);
       if (fid !== null) {
         this.activeTag.set(null);
         this.tagMeetings.set([]);
@@ -184,6 +214,219 @@ export class LibraryComponent implements OnInit {
       }
     });
   });
+
+  // --- Org (Shared Brain) chip row — "Shared Brains" meeting lists ---------
+  /**
+   * Every org (Shared Brain) this user belongs to — the content pane's
+   * "Shared brains" chip row. Loaded stale-guarded on init, on the `org-feed-updated` event, and
+   * on window focus. Deliberately separate from Notes' own org state (each view
+   * loads independently; "notes has notes, meetings has meetings" — PR #259).
+   */
+  private readonly _orgs = signal<OrgStatus[]>([]);
+  readonly orgs = this._orgs.asReadonly();
+  /**
+   * Each org's shared items keyed by orgId (`listOrgItems`) — UNFILTERED (both
+   * kinds); {@link orgListItems} narrows to `kind === "meeting"` for display.
+   */
+  private readonly _orgItems = signal<Record<string, OrgItemHeader[]>>({});
+  /**
+   * Selected org id, chosen via the content pane's "Shared brains" chip row
+   * (null ⇒ not viewing a specific org). MUTUALLY
+   * exclusive with a folder/tag selection: selecting an org clears both back to
+   * the "All meetings" root, and vice-versa — the content pane has exactly one
+   * active scope, and an org's items are NEVER merged into "All meetings" (the
+   * bug #259 fixed).
+   */
+  readonly activeOrgId = signal<string | null>(null);
+  /** True while the org list + items are (re)loading (chip-row hint only). */
+  readonly orgsLoading = signal(false);
+  /** The org whose items are shown when an org chip is selected (null otherwise). */
+  readonly activeOrg = computed<OrgStatus | null>(() => {
+    const oid = this.activeOrgId();
+    return oid === null
+      ? null
+      : (this._orgs().find((o) => o.orgId === oid) ?? null);
+  });
+
+  /**
+   * The active org's items narrowed to `kind === "meeting"` — a DISTINCT list,
+   * never merged into {@link listItems} ("All meetings" stays exactly what
+   * #259 left it: the user's own recordings only). A `kind === "document"`
+   * item never appears here (it belongs in Notes); a `kind == null`
+   * (unclassified, pre-kind wire format) item is EXCLUDED from this
+   * confirmed-meetings list too — see {@link orgUnclassifiedCount}.
+   */
+  readonly orgListItems = computed<OrgMeetingListItem[]>(() => {
+    const org = this.activeOrg();
+    if (!org) {
+      return [];
+    }
+    const items = this._orgItems()[org.orgId] ?? [];
+    return items
+      .filter((item) => item.kind === "meeting")
+      .map((item) => this.toOrgMeetingCard(item, org.name))
+      .sort((a, b) => b.sortAt - a.sortAt);
+  });
+
+  /**
+   * Count of the active org's items that are neither a confirmed meeting nor a
+   * confirmed document (`kind == null` — shared under the pre-kind wire format).
+   * Surfaced as a small "N unclassified" note rather than silently folding them
+   * into the meeting list as if verified.
+   */
+  readonly orgUnclassifiedCount = computed(() => {
+    const org = this.activeOrg();
+    if (!org) {
+      return 0;
+    }
+    const items = this._orgItems()[org.orgId] ?? [];
+    return items.filter((item) => item.kind == null).length;
+  });
+
+  /** Router target for an org meeting card — the editable original for the author, else the read-only viewer. */
+  orgItemLink(item: OrgItemHeader): string[] {
+    const owned = item.ownedSource;
+    if (owned) {
+      return owned.kind === "meeting"
+        ? ["/meeting", owned.id]
+        : ["/notes", owned.id];
+    }
+    return ["/org-item", item.itemId];
+  }
+
+  /** Build an org meeting card from a header + its origin org name. */
+  private toOrgMeetingCard(item: OrgItemHeader, orgName: string): OrgMeetingListItem {
+    const t = Date.parse(item.createdAt);
+    return {
+      kind: "org",
+      id: `org:${item.itemId}`,
+      sortAt: Number.isNaN(t) ? 0 : t,
+      item,
+      orgName,
+    };
+  }
+
+  /** Released on destroy to detach the org-feed-updated live-refresh listener. */
+  private orgFeedUnlisten: UnlistenFn | null = null;
+  /** True once destroyed — a `listen()` resolving AFTER teardown releases immediately. */
+  private orgFeedDestroyed = false;
+  /** Bumped per org load so a late (stale) reload result is dropped (T1 guard). */
+  private orgLoadSeq = 0;
+  /** Bound window-focus handler — re-loads org items when the view regains focus. */
+  private readonly onOrgWindowFocus = (): void => {
+    void this.loadOrgs();
+  };
+
+  /**
+   * (Re)load the org (Shared Brain) list + every org's shared items, stale-guarded
+   * on {@link orgLoadSeq}, and the bulk own-meeting org-share pairings (for the
+   * Library row badge). Best-effort throughout — a transient/offline error leaves
+   * the last-known state standing. Never throws.
+   */
+  async loadOrgs(): Promise<void> {
+    const seq = ++this.orgLoadSeq;
+    this.orgsLoading.set(true);
+    try {
+      try {
+        await this.ipc.orgRefresh();
+      } catch {
+        /* offline / no server → fall through to the local replica */
+      }
+      let orgs: OrgStatus[];
+      try {
+        orgs = await this.ipc.orgListStatuses();
+      } catch {
+        return; // keep the last-known orgs on a transient failure
+      }
+      if (seq !== this.orgLoadSeq) {
+        return;
+      }
+      const [itemLists, ownShares] = await Promise.all([
+        Promise.all(
+          orgs.map((o) =>
+            this.ipc.listOrgItems(o.orgId).catch(() => [] as OrgItemHeader[]),
+          ),
+        ),
+        this.ipc.listMeetingOrgShares().catch(() => [] as MeetingOrgShareRow[]),
+      ]);
+      if (seq !== this.orgLoadSeq) {
+        return;
+      }
+      const byOrg: Record<string, OrgItemHeader[]> = {};
+      orgs.forEach((o, i) => {
+        byOrg[o.orgId] = itemLists[i];
+      });
+      this._orgs.set(orgs);
+      this._orgItems.set(byOrg);
+      this._myOrgShares.set(ownShares);
+      // If the chip row's selected org has since disappeared, fall back to "All meetings".
+      const sel = this.activeOrgId();
+      if (sel !== null && !orgs.some((o) => o.orgId === sel)) {
+        this.activeOrgId.set(null);
+      }
+    } finally {
+      if (seq === this.orgLoadSeq) {
+        this.orgsLoading.set(false);
+      }
+    }
+  }
+
+  /**
+   * Select an org chip (Shared Brain): the pane shows ONLY that org's shared
+   * meetings, in a list distinct from "All meetings". Mutually exclusive with a
+   * folder/tag selection — clears both back to the root + closes any open
+   * row menu / move popover / delete confirm.
+   */
+  selectOrg(orgId: string): void {
+    this.cancelDelete();
+    this.rowMenuId.set(null);
+    this.movePopoverId.set(null);
+    // Clears the SHARED sidebar-tree folder selection too (not just this
+    // component's tag/org state) — the folder tree now lives outside this
+    // component (`MeetingsSidebarTreeComponent`), so its selection can only be
+    // reset through `FoldersService`.
+    this.folders.selectFolder(null);
+    this.activeTag.set(null);
+    this.tagMeetings.set([]);
+    this.tagLoading.set(false);
+    this.activeOrgId.set(orgId);
+  }
+
+  /** Clear the org selection back to "All meetings" (mirrors `selectFolder(null)`). */
+  clearOrgSelection(): void {
+    this.activeOrgId.set(null);
+  }
+
+  /** A friendly role hint for the chip row ("Owner" / "Member"). */
+  orgRoleLabel(org: OrgStatus): string {
+    return org.role === "owner" ? "Owner" : "Member";
+  }
+
+  // --- Own-meeting org-share badges (Library row + Detail) ------------------
+  /**
+   * Every active meeting→org share pairing across ALL of the caller's OWN
+   * meetings (`listMeetingOrgShares`, bulk — avoids an N+1 per-row fetch).
+   * Loaded alongside the org chip row in {@link loadOrgs}; empty for a meeting
+   * never shared, or masked away server-side for a locked one.
+   */
+  private readonly _myOrgShares = signal<MeetingOrgShareRow[]>([]);
+  /** `meetingId` → the orgs it's shared into — O(1) lookup for the row badge. */
+  readonly orgSharesByMeetingId = computed(() => {
+    const map = new Map<string, MeetingOrgShareRow[]>();
+    for (const row of this._myOrgShares()) {
+      const list = map.get(row.meetingId);
+      if (list) {
+        list.push(row);
+      } else {
+        map.set(row.meetingId, [row]);
+      }
+    }
+    return map;
+  });
+  /** The orgs a meeting is shared into (empty when never shared). Drives the row badge. */
+  orgSharesOf(meetingId: string): MeetingOrgShareRow[] {
+    return this.orgSharesByMeetingId().get(meetingId) ?? [];
+  }
 
   /**
    * Every folder node keyed by id (flattened) — for O(1) exposure/mask lookups
@@ -283,14 +526,21 @@ export class LibraryComponent implements OnInit {
     return this.tagLoading();
   });
 
-  /** Heading for the no-query list: folder name → tag → "Meetings". */
+  /** Heading for the no-query list: org name → folder name → tag → "Meetings". */
   readonly listHeading = computed(() => {
+    const org = this.activeOrg();
+    if (org !== null) {
+      return org.name;
+    }
     const fid = this.activeFolderId();
     if (fid !== null) {
       return this.folderById().get(fid)?.name ?? "Folder";
     }
     return this.activeTag() ?? "Meetings";
   });
+
+  /** True when an org chip is selected and its meeting-kind list has zero rows. */
+  readonly orgListEmpty = computed(() => this.orgListItems().length === 0);
 
   /** Exposure of the active folder (for the header lock badge); null when none. */
   readonly activeFolderExposure = computed<FolderExposure | null>(() => {
@@ -382,11 +632,38 @@ export class LibraryComponent implements OnInit {
       }
     });
 
-    // Load the meetings list and the tag set in parallel; a tag-load failure
-    // must not break the meetings list, so settle each independently.
+    // Live-refresh: the background org-sync loop fires `org-feed-updated` on a
+    // productive tick. Subscribe ONCE (push straight into a reload — NEVER
+    // subscribe-into-a-field), and re-load on window focus too. Both cleaned up
+    // on destroy (release the UnlistenFn + the focus handler).
+    this.destroyRef.onDestroy(() => {
+      this.orgFeedDestroyed = true;
+      this.orgFeedUnlisten?.();
+      this.orgFeedUnlisten = null;
+      window.removeEventListener("focus", this.onOrgWindowFocus);
+    });
+    window.addEventListener("focus", this.onOrgWindowFocus);
+    void this.ipc
+      .onOrgFeedUpdated(() => void this.loadOrgs())
+      .then((un) => {
+        // If the view was already torn down before the listener resolved, release
+        // it immediately (never leak a subscription past destroy).
+        if (this.orgFeedDestroyed) {
+          un();
+        } else {
+          this.orgFeedUnlisten = un;
+        }
+      })
+      .catch(() => {
+        /* best-effort: no Tauri host (e.g. plain browser) → no live refresh */
+      });
+
+    // Load the meetings list, the tag set, and the org chip row in parallel; any one
+    // failing must not break the others, so settle each independently.
     const [meetings] = await Promise.allSettled([
       this.ipc.listMeetings(),
       this.loadTags(),
+      this.loadOrgs(),
     ]);
     if (meetings.status === "fulfilled") {
       this.meetings.set(meetings.value);
@@ -431,10 +708,12 @@ export class LibraryComponent implements OnInit {
     this.movePopoverId.set(null);
     // Tag + folder scopes are mutually exclusive: picking a tag clears any
     // active folder (the SHARED sidebar-tree selection) so they never compose
-    // into an empty surprise.
+    // into an empty surprise. An org selection is a THIRD mutually-exclusive
+    // scope — picking a tag drops it too.
     if (tag !== null) {
       this.folders.selectFolder(null);
     }
+    this.activeOrgId.set(null);
     this.activeTag.set(tag);
 
     if (tag === null) {

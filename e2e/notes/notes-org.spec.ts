@@ -91,6 +91,57 @@ test("All notes merges org shared items (with org-name badge) + the chip row lis
   expect(consoleErrors).toEqual([]);
 });
 
+test("a kind:'meeting' org item is excluded from Notes (it belongs in Library's Shared brains chip row)", async ({
+  page,
+}) => {
+  const consoleErrors: string[] = [];
+  page.on("console", (msg) => {
+    if (msg.type() === "error") {
+      consoleErrors.push(msg.text());
+    }
+  });
+  page.on("pageerror", (err) => consoleErrors.push(String(err)));
+
+  await mockNotes(page, {
+    ...ORG_MOCKS,
+    list_org_items: (args: { orgId: string }) =>
+      args.orgId === "org1"
+        ? [
+            {
+              itemId: "oi-doc",
+              title: "Team Roadmap Q3",
+              authorHint: "alice",
+              createdAt: "2026-07-09T10:00:00Z",
+              seq: 5,
+              kind: "document",
+            },
+            {
+              itemId: "oi-meeting",
+              title: "Weekly Sync Notes",
+              authorHint: "bob",
+              createdAt: "2026-07-10T10:00:00Z",
+              seq: 6,
+              kind: "meeting",
+            },
+          ]
+        : [],
+  });
+  await page.goto("/notes");
+
+  await expect(page.locator(".notes-content")).toBeVisible();
+
+  // "All notes": the document-kind item shows, the meeting-kind one does NOT.
+  await expect(page.getByText("Team Roadmap Q3")).toBeVisible();
+  await expect(page.getByText("Weekly Sync Notes")).toHaveCount(0);
+
+  // Selecting the org chip: same exclusion applies to the org-scoped view.
+  await page.locator(".org-chip", { hasText: "Siema" }).click();
+  await expect(page.getByText("Team Roadmap Q3")).toBeVisible();
+  await expect(page.getByText("Weekly Sync Notes")).toHaveCount(0);
+
+  expect(consoleErrors).toEqual([]);
+});
+
 test("clicking an org shared item routes to the read-only /org-item viewer", async ({
   page,
 }) => {

@@ -2483,6 +2483,7 @@ mod tests {
             1,
             1,
             sha,
+            None,
             Some(&crate::embed::StubEmbedder),
         )
         .unwrap();

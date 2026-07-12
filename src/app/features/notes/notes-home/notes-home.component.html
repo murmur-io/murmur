@@ -42,7 +42,7 @@
          in the sidebar's folder tree). Picking a chip scopes the list to that
          org's shared items only; picking it again returns to the note-folder
          scope. -->
-    @if (orgs().length > 0) {
+    @if (orgs().length > 0 || orgsLoading()) {
       <div class="org-chip-row" role="group" aria-label="Shared brains">
         @for (org of orgs(); track org.orgId) {
           <button
@@ -64,6 +64,9 @@
             </svg>
             {{ org.name }}
           </button>
+        }
+        @if (orgsLoading()) {
+          <mur-spinner [size]="12" class="org-chip-spinner" />
         }
       </div>
     }

@@ -543,6 +543,20 @@ pub struct OrgItemHeader {
     pub author_hint: String,
     pub created_at: String,
     pub seq: u64,
+    /// The item's source kind — `"document"` (a shared authored note) or `"meeting"` (a shared
+    /// meeting note) — so the FE can filter a per-org list into "shared meetings" vs "shared notes"
+    /// (Library/Meetings vs Notes view). The `OrgEnvelope` wire format now carries this natively as of
+    /// `ORG_ENVELOPE_VERSION = 2` (`share::org_envelope::OrgSourceKind`), stored straight off the
+    /// opened envelope into `org_items.source_kind` at ingest — so a COLLEAGUE'S item now classifies
+    /// too, not just items THIS device published. For items THIS device published, an UNGATED local
+    /// `org_shares`-anchored resolver (`meeting_id` XOR `document_id`) can still override/fall back
+    /// (metadata only, never gated on unlock state, unlike `owned_source` below which also carries the
+    /// live title). `None` means genuinely unclassified: an item ingested off an old v1 envelope
+    /// (published before the peer/this device upgraded, or before this column existed) carries no
+    /// source-type signal on the wire — the FE MUST treat `None` as "unclassified", never
+    /// assume/default it to one bucket.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
     /// The caller's OWN editable local source for this item, when THIS device published it (resolved
     /// via `org_share_by_item` → the anchored note/meeting) AND that source is currently readable
     /// (unlock-gated — a locked source resolves to `None`, never leaking its title). `None` for an
@@ -646,13 +660,25 @@ pub struct NoteFolder {
 #[serde(rename_all = "camelCase")]
 pub struct NoteAssistRequest {
     pub note_id: String,
-    /// `"refine"` | `"shorten"` | `"enhance"`.
+    /// One of the note-assistant action ids (see the seam contract): the EDIT actions
+    /// (`refine`/`grammar`/`shorten`/`expand`/`simplify`/`tone`/`translate`), STRUCTURE
+    /// (`bullets`/`table`/`keypoints`), FROM YOUR BRAIN (`enhance`/`find_related`/`link_entities`/
+    /// `fact_check`/`ask`), EXTRACT (`action_items`/`decisions`), CREATE (`draft_followup`/
+    /// `spinoff_note`), or `custom`.
     pub action: String,
     pub selection: String,
     #[serde(default)]
     pub before: Option<String>,
     #[serde(default)]
     pub after: Option<String>,
+    /// Variant selector for the variant-heavy actions: `tone` name (Professional/Casual/…) or
+    /// `translate` target language. `None` for actions that take no variant.
+    #[serde(default)]
+    pub variant: Option<String>,
+    /// Free-text instruction: the `custom` action's instruction, or the `ask` action's question
+    /// about the selection. `None` for actions that need no instruction.
+    #[serde(default)]
+    pub instruction: Option<String>,
 }
 
 /// One enhance-context provenance citation — the source note/meeting the additive passage drew on.
@@ -680,6 +706,16 @@ pub struct NoteAssistResult {
     /// `"local"` | `"cloud"`.
     pub mode: String,
     pub redacted: bool,
+    /// How the FE renders + applies the result: `"replace"` (struck original vs suggestion →
+    /// Accept replaces the selection) | `"insert"` (append the suggestion after the selection) |
+    /// `"info"` (read-only answer + citations; Copy / Insert-as-note; NO destructive replace) |
+    /// `"artifact"` (a drafted email/note preview: `title` + `suggestion`). The FE renders
+    /// generically off THIS field — it does NOT re-derive the shape from the action.
+    pub shape: String,
+    /// The artifact title — an email subject (`draft_followup`) or note title (`spinoff_note`).
+    /// `None` for every non-artifact shape.
+    #[serde(default)]
+    pub title: Option<String>,
 }
 
 /// One proposed auto-organize move (WP5): a note and its proposed target note-folder. `toFolderId`

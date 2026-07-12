@@ -13,6 +13,7 @@ import { IpcService } from "../../../core/ipc.service";
 import type {
   AccountStatus,
   MyShareEntry,
+  OrgSourceShareStatus,
   OrgStatus,
 } from "../../../core/models";
 import {
@@ -201,6 +202,13 @@ export class NoteSharePanelComponent {
   /** The user's org membership; `null` when in no org (hides the section). */
   private readonly orgStatus = signal<OrgStatus | null>(null);
   readonly org = this.orgStatus.asReadonly();
+  /**
+   * Live (uploaded) org shares of THIS note specifically — powers the CTA "In Org
+   * Brain ✓" state + blocks a duplicate re-share (edits sync automatically).
+   */
+  private readonly _orgSourceShares = signal<OrgSourceShareStatus[]>([]);
+  /** True when THIS note is already live in ≥1 org (flips the CTA to shared). */
+  readonly sourceInOrg = computed(() => this._orgSourceShares().length > 0);
   /** True while the org-share preview sheet is open. */
   readonly orgSheetOpen = signal(false);
 
@@ -310,8 +318,21 @@ export class NoteSharePanelComponent {
         return;
       }
       this.orgStatus.set(status);
+      if (status) {
+        // Per-source live shares → the CTA "In Org Brain ✓" state + re-share block.
+        const live = await this.ipc.orgLiveSharesForSource({ documentId: id });
+        if (this.noteId() !== id) {
+          return;
+        }
+        // Defensive: never let a malformed/non-array response null-deref a
+        // downstream array read over this signal.
+        this._orgSourceShares.set(Array.isArray(live) ? live : []);
+      } else {
+        this._orgSourceShares.set([]);
+      }
     } catch {
       this.orgStatus.set(null);
+      this._orgSourceShares.set([]);
     }
   }
 
