@@ -4,7 +4,7 @@ import { NavHistoryService } from "./nav-history.service";
 import { TabRouteReuseStrategy } from "./tab-route-reuse.strategy";
 import { type TabKind, tabKeyFor } from "./tab-keys";
 
-/** One open browser-style "document" tab (a meeting or a note). */
+/** One open browser-style "document" tab (a meeting, a note, or an org-shared item). */
 export interface Tab {
   /** Stable identity — SAME string as the `TabRouteReuseStrategy` cache key. */
   readonly id: string;
@@ -29,7 +29,7 @@ function isValidTab(v: unknown): v is Tab {
   const t = v as Record<string, unknown>;
   return (
     typeof t["id"] === "string" &&
-    (t["kind"] === "meeting" || t["kind"] === "note") &&
+    (t["kind"] === "meeting" || t["kind"] === "note" || t["kind"] === "org-item") &&
     typeof t["entityId"] === "string" &&
     typeof t["title"] === "string" &&
     Array.isArray(t["route"]) &&
@@ -95,6 +95,15 @@ export class TabsService {
     extra?: NavigationExtras,
   ): Promise<void> {
     await this.openTab("note", id, title, ["/notes", id], extra);
+  }
+
+  /**
+   * Open (or activate) a read-only org (Shared Brain) item's tab — added
+   * 2026-07-12: previously an org item had no tab at all and opened as a
+   * full-page navigation, unlike its owned meeting/note counterparts.
+   */
+  async openOrgItem(id: string, title = "Shared note"): Promise<void> {
+    await this.openTab("org-item", id, title, ["/org-item", id]);
   }
 
   private async openTab(

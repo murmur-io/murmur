@@ -57,10 +57,21 @@
   color: var(--text-muted);
 }
 /* Raise the row whose own overflow menu is open ABOVE a page-level click-away
-   scrim, so the (page-level, opaque T3) menu receives clicks instead of it. */
+   scrim, so the (page-level, opaque T3) menu receives clicks instead of it.
+   ALSO relax the cell's `overflow: hidden` (live-found bug, 2026-07-12): that
+   clipping enforces the fixed 44px row height for every OTHER row, but it
+   also clips a menu/popover projected into THIS row's action cell — the
+   dropdown opened fine, it was just invisible, clipped to the 44px box (the
+   "clicking … does nothing" bug). `overflow: visible` here does NOT break
+   the height constant: `height`/`max-height` on the cell still caps its
+   LAYOUT box; only whether overflowing content is clipped or allowed to
+   render past that box changes, and only for the one row with its menu open. */
 .mur-table tbody tr.is-menu-open {
   position: relative;
   z-index: 50;
+}
+.mur-table tbody tr.is-menu-open td {
+  overflow: visible;
 }
 
 /* Screen-reader-only header label (e.g. an icon-only actions column). */
