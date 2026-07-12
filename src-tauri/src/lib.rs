@@ -216,6 +216,8 @@ pub fn run() {
             commands::share_meeting_to_org,
             commands::share_document_to_org,
             commands::list_org_shares,
+            commands::meeting_org_shares,
+            commands::list_meeting_org_shares,
             commands::revoke_org_share,
             commands::org_sweep_pending,
             commands::org_sync_now,

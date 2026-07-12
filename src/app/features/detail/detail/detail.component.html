@@ -69,14 +69,21 @@
               {{ fb.name }}
             </span>
           }
-          <!-- "In Org Brain" badge — this meeting has an active org-brain share.
-               Hidden while locked (nothing to advertise on a masked note). -->
-          @if (orgShared() && !locked()) {
-            <span class="meta-sep" aria-hidden="true">·</span>
-            <span
-              class="pill is-accent"
-              title="This note is in your organization's shared brain"
-            >In Org Brain</span>
+          <!-- "Shared with [org]" badge(s) — this meeting has an active org-brain
+               share. Hidden while locked (nothing to advertise on a masked note).
+               ONE pill per org (a meeting may be shared into several); the
+               tooltip + caption below are explicit that only the TEXT note was
+               shared — the audio recording never leaves the device. -->
+          @if (!locked()) {
+            @for (share of orgShares(); track share.orgId) {
+              <span class="meta-sep" aria-hidden="true">·</span>
+              <span
+                class="pill is-accent org-share-pill"
+                [title]="
+                  'Shared with ' + share.orgName + ' — text note only, audio never leaves this device'
+                "
+              >Shared with {{ share.orgName }}</span>
+            }
           }
           <!-- ENHANCE-MY-NOTES: provenance badge — shown only when the backend
                stamped murmur_enhanced: true in the front-matter. Derives from
@@ -90,6 +97,15 @@
             >✨ Enhanced from your notes</span>
           }
         </div>
+
+        <!-- Explicit, unambiguous caption: org sharing carries the TEXT note
+             only — the audio recording never leaves the device. Shown whenever
+             the meeting is shared into at least one org. -->
+        @if (orgShared() && !locked()) {
+          <p class="org-share-caption">
+            Only the text note was shared — the audio recording stays on this device.
+          </p>
+        }
 
         <!-- TAG EDITOR: chips + inline add (persists via setMeetingTags).
              Hidden while locked — there is nothing to tag on a masked note. -->
