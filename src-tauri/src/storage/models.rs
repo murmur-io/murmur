@@ -681,12 +681,15 @@ pub struct NoteAssistRequest {
     pub instruction: Option<String>,
 }
 
-/// One enhance-context provenance citation — the source note/meeting the additive passage drew on.
+/// One enhance-context provenance citation — the source note/meeting/org-item the additive passage
+/// drew on.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NoteCitation {
-    /// `"meeting"` | `"note"`.
+    /// `"meeting"` | `"note"` | `"org"`.
     pub kind: String,
+    /// For `kind == "org"` this is the org item id (`OrgChunkHit::item_id`), routed by the FE to
+    /// `/org-item/:id` — never a local meeting/note id.
     pub id: String,
     pub title: String,
     pub snippet: String,
@@ -887,6 +890,19 @@ pub struct AskVaultResult {
 pub struct DigestResult {
     pub markdown: String,
     pub exported_path: Option<String>,
+}
+
+/// Result of the CLOUD-synthesized `entity_dossier` command (B2, Shared Brain). `has_org_context`
+/// is an HONEST signal: `true` iff the synthesis prompt included any `[org · author]`-attributed
+/// colleague content ALONGSIDE the user's own verified facts — so the FE/response never silently
+/// blends org-sourced claims into the dossier without a distinguishing signal. READ-ONLY: org
+/// content that contributes here is NEVER written into `entities`/`entity_mentions`/`facts`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EntityDossierResult {
+    pub markdown: String,
+    #[serde(default)]
+    pub has_org_context: bool,
 }
 
 /// An upcoming Calendar event (best-effort; absent if Calendar access is denied).

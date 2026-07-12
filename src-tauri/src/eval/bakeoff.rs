@@ -338,6 +338,9 @@ mod tests {
                  embedder and their numbers are NOT a quality signal. Download the model first."
             );
         }
+        // Opt out of the `cargo test --lib` real-Metal-forward-pass safety net (embed.rs
+        // `active_embedder`) — this is the one legitimate manual test that wants the real model.
+        std::env::set_var("MURMUR_TEST_REAL_EMBED", "1");
         let embedder = crate::embed::active_embedder();
         // Empty unlocked set = eval OPEN content only. To include a sealed folder, unlock it in the
         // app and copy the WAL'd DB, or extend this to accept a folder-id list.
@@ -390,6 +393,9 @@ mod tests {
                  embedder; only the fts row is a quality signal. Download the model and re-run."
             );
         }
+        // Opt out of the `cargo test --lib` real-Metal-forward-pass safety net (embed.rs
+        // `active_embedder`) — this is a legitimate manual test that wants the real model.
+        std::env::set_var("MURMUR_TEST_REAL_EMBED", "1");
         let embedder = crate::embed::active_embedder();
         let ids = crate::eval::corpus::seed_synthetic_corpus(&db, embedder.as_ref())
             .expect("seed synthetic corpus");
