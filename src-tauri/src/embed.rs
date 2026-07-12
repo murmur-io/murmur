@@ -346,7 +346,20 @@ impl Embedder for StubEmbedder {
 /// silently.) Cheap to construct (the stub is zero-sized; the candle backend defers the heavy load),
 /// so callers build one per operation. NEVER invoked when `semantic_search_enabled` is off (the gate
 /// short-circuits before this is called) — building the real embedder does NOT flip that flag.
+///
+/// TEST-BUILD SAFETY NET: `cargo test --lib` must never attempt a real Metal forward pass (see the
+/// header doc on `embed::candle_bert` — "NEVER runs a forward pass here"). That was previously true
+/// only incidentally (CI has no model on disk), so on a dev Mac that HAS downloaded the real e5 model,
+/// any ordinary test exercising a note/meeting index path (e.g. `update_note_doc_inner`) reaches this
+/// function, tries a real Metal forward pass inside the test binary, and can abort the process
+/// (observed: `MTLCompilerService` XPC failure). Force the stub under `cfg(test)` unless a caller has
+/// explicitly opted in via `MURMUR_TEST_REAL_EMBED=1` — only the manual, `#[ignore]`d bake-off tests
+/// (`eval::bakeoff`) set that var, since they are the one legitimate case that wants the real model.
 pub fn active_embedder() -> Box<dyn Embedder> {
+    #[cfg(test)]
+    if std::env::var_os("MURMUR_TEST_REAL_EMBED").is_none() {
+        return Box::new(StubEmbedder);
+    }
     let model = selected_embed_model();
     if embed_model_present() {
         let built = embed_model_dir().and_then(|dir| {

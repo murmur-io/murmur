@@ -10,9 +10,10 @@ use crate::state::AppState;
 use crate::storage::models::{
     ActionItem, Analytics, AskVaultResult, BrainOverview, BuiltinRecipe, CalendarContext,
     CalendarEvent, CalendarEventFull, ChatTurn, Commitment, DigestResult, DocumentInfo,
-    EntityDetail, Folder, FolderNode, GraphData, Meeting, MeetingStatus, MeetingTimeline,
-    NoteAssistRequest, NoteAssistResult, NoteCitation, NoteDoc, NoteFolder, NoteRecord, NoteSummary,
-    OrganizeMove, OrganizePlan, PersonCard, PinResult, RecipeRecord, SearchHit, TopicThread,
+    EntityDetail, EntityDossierResult, Folder, FolderNode, GraphData, Meeting, MeetingStatus,
+    MeetingTimeline, NoteAssistRequest, NoteAssistResult, NoteCitation, NoteDoc, NoteFolder,
+    NoteRecord, NoteSummary, OrganizeMove, OrganizePlan, PersonCard, PinResult, RecipeRecord,
+    SearchHit, TopicThread,
 };
 use crate::summarize::all_providers;
 use crate::transcribe::types::Segment;
@@ -3206,7 +3207,7 @@ async fn note_assistant_action_impl(
     //     with `mode="local"`, `redacted=false`. This never raises the local user-turn priority
     //     flag (no decode contends for Metal) and never calls a model → a privacy win.
     if action == "find_related" {
-        let citations = gather_note_enhance_citations(state, &req)?;
+        let citations = gather_note_enhance_citations(state, &config, &req)?;
         let suggestion = match citations.len() {
             0 => "No related sources found in your brain.".to_string(),
             1 => "1 related source in your brain.".to_string(),
@@ -3264,7 +3265,7 @@ async fn note_assistant_action_impl(
     //     `visibility_clause`, so a sealed source never grounds a result.
     let (citations, entity_names) = match retrieval {
         NoteAssistRetrieval::BrainCitations => {
-            (gather_note_enhance_citations(state, &req)?, Vec::new())
+            (gather_note_enhance_citations(state, &config, &req)?, Vec::new())
         }
         NoteAssistRetrieval::Entities => {
             let unlocked = unlocked_snapshot(state)?;
@@ -3381,6 +3382,7 @@ fn derive_artifact_title(action: &str, note_title: &str, body: &str) -> String {
 /// unlock set through `visibility_clause`), so a sealed source never grounds an enhancement.
 fn gather_note_enhance_citations(
     state: &AppState,
+    config: &AppConfig,
     req: &NoteAssistRequest,
 ) -> Result<Vec<NoteCitation>, AppError> {
     const MAX_CITATIONS: usize = 6;
@@ -3415,7 +3417,7 @@ fn gather_note_enhance_citations(
     // Other notes/documents (semantic when the e5 model is present, else FTS). EXCLUDE the current
     // note's own document id (never cite the note being edited).
     if out.len() < MAX_CITATIONS {
-        let doc_hits = if crate::embed::embed_model_present() {
+        let doc_hits = if config.semantic_search_enabled && crate::embed::embed_model_present() {
             let embedder = crate::embed::active_embedder();
             let qvecs = embedder.embed_query(std::slice::from_ref(&query))?;
             match qvecs.into_iter().next() {
@@ -3437,6 +3439,25 @@ fn gather_note_enhance_citations(
                 kind: "note".into(),
                 id: hit.document_id,
                 title: hit.name,
+                snippet: hit.snippet,
+            });
+            if out.len() >= MAX_CITATIONS {
+                break;
+            }
+        }
+    }
+
+    // Org shared brain (deliberately-disclosed colleague content — outside the folder-lock domain,
+    // gated on membership only via `org_brain_available`, same seam as the `org_brain_search` agent
+    // tool / MCP `org_search`). RETRIEVAL-ONLY: no provider call, no egress — this is a private,
+    // user-navigated discovery surface, matching `find_related`'s zero-provider-call invariant.
+    if out.len() < MAX_CITATIONS && crate::tools::org_brain_available(&state.db, config) {
+        let org_hits = crate::tools::search_org_brain_hits(&state.db, config, &query)?;
+        for hit in org_hits {
+            out.push(NoteCitation {
+                kind: "org".into(),
+                id: hit.item_id,
+                title: hit.title,
                 snippet: hit.snippet,
             });
             if out.len() >= MAX_CITATIONS {
@@ -5810,6 +5831,7 @@ fn ask_vault_agentic_attempt(
     let opts = crate::reason::GenOptions::ask_answer()
         .with_transcript_compaction(config.loop_transcript_compaction)
         .with_grammar_constraint(config.brain_heavy_grammar_enabled);
+    let org_available = crate::tools::org_brain_available(&state.db, &config);
     match ask_vault_loop(
         &*reasoner,
         &executor,
@@ -5819,6 +5841,7 @@ fn ask_vault_agentic_attempt(
         history,
         &memory_brief,
         &jit_listing,
+        org_available,
         Some(&sink as &dyn crate::agent::DeltaSink),
         opts,
     ) {
@@ -5843,7 +5866,10 @@ fn ask_vault_agentic_attempt(
 /// `jit_listing` (Brain v2 L3) is the compact gated meeting listing for JIT retrieval — `""` (the
 /// `ask_jit_retrieval`-off path) keeps the persona BYTE-IDENTICAL to the legacy agentic prompt
 /// (`agentic_system_jit`'s empty-listing contract). `opts` carries the caller's per-step
-/// generation bounds (the P0.3 ASK preset + the L3 compaction/grammar flags).
+/// generation bounds (the P0.3 ASK preset + the L3 compaction/grammar flags). `org_available` (A2)
+/// is threaded straight to `agentic_system_jit` — the caller passes the SAME `org_brain_available`
+/// predicate that gates the tool's own advertisement, so the hint and the actual tool availability
+/// can never diverge.
 #[allow(clippy::too_many_arguments)]
 fn ask_vault_loop(
     reasoner: &dyn crate::reason::LocalReasoner,
@@ -5854,10 +5880,12 @@ fn ask_vault_loop(
     history: &[ChatTurn],
     memory_brief: &str,
     jit_listing: &str,
+    org_available: bool,
     sink: Option<&dyn crate::agent::DeltaSink>,
     opts: crate::reason::GenOptions,
 ) -> Result<Option<AskVaultResult>, AppError> {
-    let system = crate::summarize::vault_chat::agentic_system_jit(memory_brief, jit_listing);
+    let system =
+        crate::summarize::vault_chat::agentic_system_jit(memory_brief, jit_listing, org_available);
     let user = crate::summarize::vault_chat::render_conversation(history, question);
     let Some(outcome) = crate::agent::run_agentic_loop(
         reasoner,
@@ -6219,6 +6247,7 @@ mod ask_vault_tests {
             &[],
             "",
             &listing,
+            false,
             None,
             crate::reason::GenOptions::ask_answer(),
         )
@@ -6399,6 +6428,7 @@ mod ask_vault_tests {
             &[],
             "",
             "",
+            false,
             None,
             crate::reason::GenOptions::ask_answer(),
         )
@@ -6447,6 +6477,7 @@ mod ask_vault_tests {
             &[],
             "",
             "",
+            false,
             None,
             crate::reason::GenOptions::ask_answer(),
         )
@@ -6482,6 +6513,7 @@ mod ask_vault_tests {
             &[],
             "",
             "",
+            false,
             None,
             crate::reason::GenOptions::ask_answer(),
         );
@@ -6623,6 +6655,7 @@ mod ask_vault_tests {
             &[],
             "",
             "",
+            false,
             None,
             crate::reason::GenOptions::ask_answer(),
         )
@@ -6677,14 +6710,20 @@ mod ask_vault_tests {
 /// assembled through the SAME visibility gate as Ask-My-Vault (sealed-not-unlocked meetings
 /// contribute nothing), then synthesized by the configured provider — so this is a CLOUD-egress
 /// path that goes through the redaction firewall + consent gate (E6/E7/E10) exactly like `ask_vault`.
+///
+/// B2 (Shared Brain, READ-ONLY): when the caller has joined an org, ALSO searches the org partition
+/// for this entity and folds `[org · author]`-labelled hits into the SYNTHESIS PROMPT ONLY as
+/// additional citable context — an entity with ZERO local facts/mentions can still resolve here
+/// purely from org content. This NEVER calls `build_and_persist_entities` and NEVER writes anything
+/// derived from org content into `entities`/`entity_mentions`/`facts` — those tables are untouched
+/// by this path. `has_org_context` on the response is the honest signal that org-sourced content
+/// contributed, so the caller never silently blends a colleague's claims with the user's own
+/// verified facts.
 #[tauri::command]
 pub async fn entity_dossier(
     state: State<'_, AppState>,
     entity: String,
-) -> Result<String, AppError> {
-    if entity.trim().is_empty() {
-        return Err(AppError::InvalidArg("entity is empty".into()));
-    }
+) -> Result<EntityDossierResult, AppError> {
     let config = {
         state
             .config
@@ -6695,20 +6734,343 @@ pub async fn entity_dossier(
     // Pass the LIVE session unlock set (E9): a folder the user has session-unlocked is included
     // again; sealed-and-NOT-unlocked content stays excluded by the same visibility predicate.
     let unlocked = unlocked_snapshot(state.inner())?;
-    let entity_id = crate::summarize::dossier::resolve_entity_id(&state.db, &entity, &unlocked)?
-        .ok_or_else(|| AppError::InvalidArg(format!("no visible entity matching \"{entity}\"")))?;
-    let data = crate::summarize::dossier::build_dossier_data(&state.db, &entity_id, &unlocked)?
-        .ok_or_else(|| AppError::InvalidArg(format!("no visible entity matching \"{entity}\"")))?;
+    let notes_conn =
+        crate::summarize::roles::provider_target(crate::summarize::roles::Role::Notes, &config)
+            .connection;
+    let (system, user, has_org_context) =
+        build_entity_dossier_prompt(&state.db, &entity, &unlocked, &config, &notes_conn)?;
     // Build the provider (firewall + consent gate) BEFORE synthesizing — the factory refuses a
     // cloud provider until the user has consented to egress. NOTES role (the dossier is a
     // written synthesis); the corpus budget keys on the same resolved connection.
     let provider = crate::summarize::provider_for(crate::summarize::roles::Role::Notes, &config)?;
-    let notes_conn =
-        crate::summarize::roles::provider_target(crate::summarize::roles::Role::Notes, &config)
-            .connection;
-    let system = crate::summarize::dossier::dossier_system_prompt(&config.note_language);
-    let user = crate::summarize::dossier::render_dossier_user(&data, &notes_conn);
-    provider.complete(&system, &user).await
+    let markdown = provider.complete(&system, &user).await?;
+    Ok(EntityDossierResult {
+        markdown,
+        has_org_context,
+    })
+}
+
+/// The testable, SYNCHRONOUS core of [`entity_dossier`]: resolve the entity + gated local dossier
+/// data, ALSO run the READ-ONLY org leg (B2), and assemble the (system, user, has_org_context)
+/// synthesis-prompt triple — everything short of the actual `provider.complete` cloud call, so this
+/// can be tested without a real provider/network.
+///
+/// B2 (Shared Brain, READ-ONLY): when the caller has joined an org (`org_brain_available`), ALSO
+/// searches the org partition ONCE for this entity and folds `[org · author]`-labelled hits into
+/// the synthesis prompt ONLY — an entity with ZERO local facts/mentions can still resolve here
+/// purely from org content (`data` may be `None` while `org_context` is `Some`). This function NEVER
+/// calls `build_and_persist_entities` and NEVER writes to `entities`/`entity_mentions`/`facts` — it
+/// only reads. `has_org_context` is `true` iff org-sourced lines were folded in, so the caller can
+/// honestly signal that the dossier drew on colleague content.
+fn build_entity_dossier_prompt(
+    db: &crate::storage::Db,
+    entity: &str,
+    unlocked: &std::collections::HashSet<String>,
+    config: &AppConfig,
+    notes_conn: &str,
+) -> Result<(String, String, bool), AppError> {
+    if entity.trim().is_empty() {
+        return Err(AppError::InvalidArg("entity is empty".into()));
+    }
+    // B2: resolve the ORG leg once, up front — an entity that is ORG-ONLY (no local entity row at
+    // all) must still be resolvable, so the local-entity lookup below is allowed to miss as long as
+    // org content is present. Gated on the SAME `org_brain_available` predicate as every other org
+    // leg (A1/A2); one call, no per-query looping. READ-ONLY: `search_org_brain` never writes.
+    let org_query = entity.trim().to_string();
+    let org_context = if crate::tools::org_brain_available(db, config) {
+        match crate::tools::search_org_brain(db, config, &org_query) {
+            Ok(text) => {
+                let text = text.trim();
+                // `search_org_brain` degrades to a "No org-brain results …" sentinel (never an Err)
+                // when there is nothing to find — that carries no `- [org` line, so it is dropped
+                // here exactly like every other "nothing found" sentinel this codebase filters
+                // (`voice_action::is_empty_tool_result`). A real hit's text is passed THROUGH
+                // WHOLE (never re-split by line) — a snippet can legitimately wrap onto a second
+                // line that doesn't itself start with "- [org", and truncating there would silently
+                // drop cited content from the synthesis prompt.
+                if text.is_empty() || !text.contains("- [org") {
+                    None
+                } else {
+                    Some(text.to_string())
+                }
+            }
+            Err(e) => {
+                tracing::debug!(
+                    target: "dossier",
+                    error = %e,
+                    "entity dossier org-brain search failed; continuing without org context"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let entity_id = crate::summarize::dossier::resolve_entity_id(db, entity, unlocked)?;
+    let data = match entity_id {
+        Some(id) => crate::summarize::dossier::build_dossier_data(db, &id, unlocked)?,
+        None => None,
+    };
+    // Neither a local entity NOR any org context ⇒ genuinely unknown — the pre-org error semantics.
+    if data.is_none() && org_context.is_none() {
+        return Err(AppError::InvalidArg(format!(
+            "no visible entity matching \"{entity}\""
+        )));
+    }
+    let mut system = crate::summarize::dossier::dossier_system_prompt(&config.note_language);
+    let mut user = match &data {
+        Some(d) => crate::summarize::dossier::render_dossier_user(d, notes_conn),
+        // Org-only entity: no local dossier data at all — hand the model just the entity name so it
+        // has a subject to synthesize the org section against.
+        None => format!(
+            "ENTITY: {}\n(no local meetings/facts found for this entity)\n",
+            entity.trim()
+        ),
+    };
+    let has_org_context = if let Some(org_lines) = &org_context {
+        system.push_str(
+            " Additional context may include lines starting \"- [org ·\" — these are colleague-\
+             shared facts from your organization's Shared Brain, NOT the user's own verified data. \
+             Attribute any claim drawn from them by their \"[org · author]\" provenance, clearly \
+             distinguished from the user's own meetings/facts.",
+        );
+        user.push_str(&format!(
+            "\n\nADDITIONAL CONTEXT FROM YOUR ORGANIZATION'S SHARED BRAIN (colleague-shared, \
+             attribute by provenance):\n{org_lines}\n"
+        ));
+        true
+    } else {
+        false
+    };
+    Ok((system, user, has_org_context))
+}
+
+#[cfg(test)]
+mod entity_dossier_tests {
+    use super::*;
+    use crate::storage::models::{Meeting, MeetingStatus, NoteRecord};
+    use crate::storage::Db;
+    use std::collections::HashSet;
+
+    const TEST_DEK: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    fn tmp_db() -> Db {
+        let p = crate::storage::db::unique_temp_path("murmur-dossier", "sqlite");
+        Db::open_with_key(&p, TEST_DEK).unwrap()
+    }
+
+    fn seed_note(db: &Db, id: &str, title: &str, markdown: &str) {
+        db.insert_meeting(&Meeting {
+            id: id.into(),
+            started_at: "2026-06-26T09:00:00Z".into(),
+            ended_at: None,
+            title: Some(title.into()),
+            duration_s: 60,
+            audio_path: None,
+            status: MeetingStatus::Summarized,
+            folder_id: None,
+        })
+        .unwrap();
+        db.upsert_note(&NoteRecord {
+            meeting_id: id.into(),
+            provider_id: "claude_code".into(),
+            markdown: markdown.into(),
+            created_at: "2026-06-26T09:05:00Z".into(),
+            exported_path: None,
+            model_requested: None,
+            model_served: None,
+            gateway_host: None,
+        })
+        .unwrap();
+    }
+
+    /// Join org-1 for this session (mirrors `tools::tests::seed_org`).
+    fn seed_org(db: &Db) {
+        db.upsert_org_state(&crate::storage::OrgState {
+            org_id: "org-1".to_string(),
+            name: "Acme".to_string(),
+            role: "member".to_string(),
+            joined_at: "2026-07-10T00:00:00Z".to_string(),
+            consented: true,
+            last_seq: 0,
+            generation: 1,
+        })
+        .unwrap();
+    }
+
+    /// Ingest one org-brain item into the local replica (mirrors `tools::tests::ingest_org`).
+    fn ingest_org(db: &Db, item_id: &str, author: &str, title: &str, body: &str, sha: &[u8]) {
+        db.upsert_org_item(
+            item_id,
+            "org-1",
+            1,
+            author,
+            title,
+            body,
+            "2026-07-10T09:00:00Z",
+            1,
+            1,
+            sha,
+            None,
+            Some(&crate::embed::StubEmbedder),
+        )
+        .unwrap();
+    }
+
+    fn empty_unlocked() -> HashSet<String> {
+        HashSet::new()
+    }
+
+    /// RED-before-GREEN (B2, the load-bearing leak/write-safety test): an entity that exists ONLY in
+    /// the org brain — ZERO local `entities`/`entity_mentions`/`facts` rows for it at all — must now
+    /// resolve via the dossier prompt builder with `[org · author]`-cited content, AND the local
+    /// `entities`/`entity_mentions` tables (proxied via `list_entities_visible` — row count + summed
+    /// visible mention count) must be BYTE-IDENTICAL (same COUNT) before and after the call, proving
+    /// the org leg is READ-ONLY and never calls `build_and_persist_entities` / writes derived rows.
+    /// Pre-fix, an org-only entity had NO local row at all and `resolve_entity_id` returned `None`
+    /// unconditionally ⇒ `InvalidArg("no visible entity matching …")` — RED.
+    #[test]
+    fn org_only_entity_resolves_via_dossier_and_writes_nothing_to_local_tables() {
+        let db = tmp_db();
+        seed_org(&db);
+        ingest_org(
+            &db,
+            "it-1",
+            "anna",
+            "Anna's roadmap",
+            "Project Apollo: the apollo migration ships friday, owned by anna",
+            &[3u8; 32],
+        );
+        let unlocked = empty_unlocked();
+        let cfg = AppConfig {
+            semantic_search_enabled: false,
+            ..AppConfig::default()
+        };
+
+        // BASELINE row counts — a fresh DB with an org item but NO local entities/mentions at all.
+        let entities_before = db.list_entities_visible(&unlocked).unwrap();
+        let count_before = entities_before.len();
+        let mentions_before: i64 = entities_before.iter().map(|e| e.mention_count).sum();
+
+        // "Project Apollo" is ORG-ONLY — no local meeting/entity ever mentions it.
+        let (system, user, has_org_context) =
+            build_entity_dossier_prompt(&db, "Project Apollo", &unlocked, &cfg, "claude_code")
+                .expect("an org-only entity must now resolve (RED on the pre-fix hard miss)");
+
+        assert!(has_org_context, "has_org_context must be true when org content contributed");
+        assert!(
+            user.contains("[org · anna]") && user.contains("apollo migration"),
+            "the org-cited content must reach the synthesis USER prompt: {user}"
+        );
+        assert!(
+            system.contains("[org ·"),
+            "the synthesis SYSTEM prompt must instruct org-provenance attribution: {system}"
+        );
+
+        // THE LOAD-BEARING ASSERTION: local entities/entity_mentions rows are UNCHANGED — the org
+        // leg never persisted anything derived from org content.
+        let entities_after = db.list_entities_visible(&unlocked).unwrap();
+        let count_after = entities_after.len();
+        let mentions_after: i64 = entities_after.iter().map(|e| e.mention_count).sum();
+        assert_eq!(
+            count_before, count_after,
+            "entities row count must be UNCHANGED by a read-only org-context dossier call"
+        );
+        assert_eq!(
+            mentions_before, mentions_after,
+            "entity_mentions row count (proxied via summed visible mention_count) must be UNCHANGED"
+        );
+        assert!(
+            count_after == 0 && mentions_after == 0,
+            "an org-only entity must create NO local entity/mention row at all: entities={count_after} mentions={mentions_after}"
+        );
+    }
+
+    /// Companion: seed a REAL local entity (with its own mention + zero facts) so the baseline
+    /// tables are non-empty, then run a dossier call for a DIFFERENT org-only entity — the
+    /// pre-existing local entity's own facts (`list_facts_visible`) must stay untouched (still
+    /// empty), proving the org leg doesn't bleed into or mutate UNRELATED existing rows either.
+    #[test]
+    fn org_context_dossier_call_never_touches_an_unrelated_local_entitys_facts() {
+        let db = tmp_db();
+        seed_org(&db);
+        ingest_org(
+            &db,
+            "it-2",
+            "bob",
+            "Bob's plan",
+            "Project Zephyr: the zephyr rollout ships monday",
+            &[7u8; 32],
+        );
+        seed_note(&db, "m1", "Atlas Kickoff", "We discussed Atlas migration and pricing.");
+        let entity_id = db
+            .upsert_entity("Atlas", crate::storage::models::EntityKind::Project)
+            .unwrap();
+        db.add_mention(&entity_id, "m1").unwrap();
+
+        let unlocked = empty_unlocked();
+        let cfg = AppConfig {
+            semantic_search_enabled: false,
+            ..AppConfig::default()
+        };
+        let facts_before = db.list_facts_visible(&entity_id, &unlocked).unwrap().len();
+        assert_eq!(facts_before, 0, "seed self-check: no facts yet for the local entity");
+
+        // Dossier call for a DIFFERENT, org-only entity.
+        let (_, _, has_org_context) =
+            build_entity_dossier_prompt(&db, "Project Zephyr", &unlocked, &cfg, "claude_code")
+                .expect("org-only entity must resolve");
+        assert!(has_org_context);
+
+        // The pre-existing LOCAL entity's facts are untouched by the unrelated org-context call.
+        let facts_after = db.list_facts_visible(&entity_id, &unlocked).unwrap().len();
+        assert_eq!(
+            facts_after, 0,
+            "an unrelated local entity's facts must stay UNCHANGED by an org-context dossier call"
+        );
+        // And the local entity itself still resolves exactly as before (not clobbered/duplicated).
+        let entities = db.list_entities_visible(&unlocked).unwrap();
+        assert_eq!(
+            entities.iter().filter(|e| e.name == "Atlas").count(),
+            1,
+            "the pre-existing local entity must not be duplicated or removed"
+        );
+    }
+
+    /// A local-only entity (no org membership at all) keeps the EXACT pre-org behavior:
+    /// `has_org_context` is false and no org text reaches the prompt.
+    #[test]
+    fn local_only_entity_has_org_context_false_and_no_org_text_when_not_a_member() {
+        let db = tmp_db();
+        seed_note(&db, "m1", "Atlas Kickoff", "We discussed Atlas migration and pricing.");
+        let entity_id = db
+            .upsert_entity("Atlas", crate::storage::models::EntityKind::Project)
+            .unwrap();
+        db.add_mention(&entity_id, "m1").unwrap();
+
+        let unlocked = empty_unlocked();
+        let cfg = AppConfig {
+            semantic_search_enabled: false,
+            ..AppConfig::default()
+        };
+        let (system, user, has_org_context) =
+            build_entity_dossier_prompt(&db, "Atlas", &unlocked, &cfg, "claude_code").unwrap();
+        assert!(!has_org_context, "no org membership ⇒ has_org_context must be false");
+        assert!(!user.contains("[org ·") && !system.contains("[org ·"));
+    }
+
+    /// Neither a local entity NOR any org context ⇒ the pre-org `InvalidArg` error semantics are
+    /// preserved exactly (genuinely unknown entity).
+    #[test]
+    fn unknown_entity_with_no_org_context_still_errors() {
+        let db = tmp_db();
+        let unlocked = empty_unlocked();
+        let cfg = AppConfig::default();
+        let err = build_entity_dossier_prompt(&db, "Nonexistent Thing", &unlocked, &cfg, "claude_code")
+            .unwrap_err();
+        assert!(matches!(err, AppError::InvalidArg(_)));
+    }
 }
 
 /// Generate a Weekly Vault Digest synthesizing meetings from the last `days` days; writes it
@@ -19708,7 +20070,8 @@ mod lifecycle_tests {
             variant: None,
             instruction: None,
         };
-        let cites = gather_note_enhance_citations(&state, &req).unwrap();
+        let cfg = AppConfig::default();
+        let cites = gather_note_enhance_citations(&state, &cfg, &req).unwrap();
         let ids: Vec<&str> = cites.iter().map(|c| c.id.as_str()).collect();
         assert!(
             !ids.contains(&self_id.as_str()),
@@ -19721,6 +20084,122 @@ mod lifecycle_tests {
         assert!(
             ids.contains(&other_id.as_str()),
             "a different VISIBLE note that matches IS cited"
+        );
+    }
+
+    /// A3 (RED-before-GREEN): `gather_note_enhance_citations` gains a THIRD leg — the org shared
+    /// brain, via the same `search_org_brain_hits` seam as `org_brain_search`/MCP `org_search`. A
+    /// colleague's org item that matches the query must surface as a `kind: "org"` citation whose
+    /// `id` is the org item id (routed by the FE to `/org-item/:id`), title/snippet carried straight
+    /// through. Pre-fix, `gather_note_enhance_citations` only queried `search_visible` + doc chunks,
+    /// so an org-only match (zero local rows) was invisible — RED on the org leg simply not existing.
+    #[test]
+    fn enhance_retrieval_includes_org_leg_as_org_kind_citation() {
+        let state = build_state("note-enhance-retrieval-org");
+        state
+            .db
+            .upsert_org_state(&crate::storage::OrgState {
+                org_id: "org-1".to_string(),
+                name: "Acme".to_string(),
+                role: "member".to_string(),
+                joined_at: "2026-07-10T00:00:00Z".to_string(),
+                consented: true,
+                last_seq: 0,
+                generation: 1,
+            })
+            .unwrap();
+        state
+            .db
+            .upsert_org_item(
+                "it-launchcode",
+                "org-1",
+                1,
+                "anna",
+                "Anna's launchcode notes",
+                "the launchcode rollout plan",
+                "2026-07-10T09:00:00Z",
+                1,
+                1,
+                &[9u8; 32],
+                None,
+                Some(&crate::embed::StubEmbedder),
+            )
+            .unwrap();
+
+        let fid = create_note_folder_inner(&state, "Work", None).unwrap().id;
+        let self_id = create_note_inner(&state, Some(&fid), "Self").unwrap();
+        update_note_doc_inner(&state, &self_id, "Self", "unrelated body").unwrap();
+
+        let req = NoteAssistRequest {
+            note_id: self_id.clone(),
+            action: "enhance".into(),
+            selection: "launchcode".into(),
+            before: None,
+            after: None,
+            variant: None,
+            instruction: None,
+        };
+        let cfg = AppConfig {
+            org_egress_consented: true,
+            semantic_search_enabled: false,
+            ..AppConfig::default()
+        };
+        let cites = gather_note_enhance_citations(&state, &cfg, &req).unwrap();
+        let org_cite = cites
+            .iter()
+            .find(|c| c.kind == "org")
+            .expect("an org-brain match must surface as a kind:\"org\" citation");
+        assert_eq!(org_cite.id, "it-launchcode", "id is the org item id, for /org-item routing");
+        assert_eq!(org_cite.title, "Anna's launchcode notes");
+    }
+
+    /// A3 (RED-before-GREEN, leak guard): a NON-MEMBER (no `org_state` joined) must get ZERO org
+    /// citations even though a colleague's item sits in the local replica — the org leg is gated by
+    /// `org_brain_available` (membership), identical to `search_org_brain`'s own fail-closed gate.
+    #[test]
+    fn enhance_retrieval_org_leg_fails_closed_for_a_non_member() {
+        let state = build_state("note-enhance-retrieval-org-nonmember");
+        // Item is in the replica, but NO org joined for this session.
+        state
+            .db
+            .upsert_org_item(
+                "it-x",
+                "org-1",
+                1,
+                "anna",
+                "Anna's roadmap",
+                "the apollo migration ships friday",
+                "2026-07-10T09:00:00Z",
+                1,
+                1,
+                &[3u8; 32],
+                None,
+                Some(&crate::embed::StubEmbedder),
+            )
+            .unwrap();
+
+        let fid = create_note_folder_inner(&state, "Work", None).unwrap().id;
+        let self_id = create_note_inner(&state, Some(&fid), "Self").unwrap();
+        update_note_doc_inner(&state, &self_id, "Self", "unrelated body").unwrap();
+
+        let req = NoteAssistRequest {
+            note_id: self_id.clone(),
+            action: "enhance".into(),
+            selection: "apollo migration".into(),
+            before: None,
+            after: None,
+            variant: None,
+            instruction: None,
+        };
+        let cfg = AppConfig {
+            org_egress_consented: true,
+            semantic_search_enabled: false,
+            ..AppConfig::default()
+        };
+        let cites = gather_note_enhance_citations(&state, &cfg, &req).unwrap();
+        assert!(
+            !cites.iter().any(|c| c.kind == "org"),
+            "a non-member must get no org citations even with a populated replica: {cites:?}"
         );
     }
 
