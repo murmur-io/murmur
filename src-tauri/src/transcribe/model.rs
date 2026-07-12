@@ -48,6 +48,9 @@ const PARAKEET_FILES: &[&str] = &[
 /// the reasoner's whisper-large refuse). A BROKEN RAM probe (`None`) fails OPEN — never refuse
 /// captions on a measurement we couldn't take.
 const PARAKEET_MIN_RAM_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+/// Floor for the startup topic-chunk backfill — much lighter than parakeet (a small e5 embed
+/// pass, not real-time streaming ASR), so the floor is lower too.
+const TOPIC_BACKFILL_MIN_RAM_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
 /// QUANT-SUFFIXED model sizes accepted by [`model_filename`] (T2 quant plumbing; the CONDITIONAL
 /// default flip lives in [`default_model_size`]). Each maps `"<size>-<quant>"` →
@@ -367,6 +370,19 @@ pub fn parakeet_model_url(filename: &str) -> String {
 pub fn parakeet_ram_permits_now() -> bool {
     match total_ram_bytes() {
         Some(b) => b >= PARAKEET_MIN_RAM_BYTES,
+        None => true,
+    }
+}
+
+/// RAM guard for the startup topic-chunk backfill (`Db::backfill_topic_chunks_idempotent`) —
+/// `false` ONLY when total RAM is affirmatively below [`TOPIC_BACKFILL_MIN_RAM_BYTES`]. Fails
+/// OPEN when the probe can't read RAM (a broken measurement never silently disables catch-up
+/// indexing). A genuinely RAM-starved machine defers the whole backfill rather than starting a
+/// Metal/Candle embed pass on launch — it catches up on a later, healthier launch since the
+/// backfill is content-hash idempotent. Mirrors [`parakeet_ram_permits_now`].
+pub fn topic_backfill_ram_permits_now() -> bool {
+    match total_ram_bytes() {
+        Some(b) => b >= TOPIC_BACKFILL_MIN_RAM_BYTES,
         None => true,
     }
 }

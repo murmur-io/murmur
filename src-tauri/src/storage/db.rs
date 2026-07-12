@@ -3463,11 +3463,26 @@ impl Db {
         embedder: &dyn Embedder,
         unlocked: &HashSet<String>,
     ) -> Result<()> {
+        self.index_meeting_topic_chunks_reporting(meeting_id, segments, embedder, unlocked)
+            .map(|_wrote| ())
+    }
+
+    /// Same as [`Self::index_meeting_topic_chunks`] but reports whether it actually (re)wrote
+    /// chunks (`true`) vs. was a no-op — sealed/missing meeting, or the idempotency probe found
+    /// nothing changed (`false`). [`Self::backfill_topic_chunks_idempotent`] uses this to cap
+    /// how much REAL embedding work (not idempotent skips) one run performs.
+    fn index_meeting_topic_chunks_reporting(
+        &self,
+        meeting_id: &str,
+        segments: &[Segment],
+        embedder: &dyn Embedder,
+        unlocked: &HashSet<String>,
+    ) -> Result<bool> {
         if !self.meeting_is_visible(meeting_id, unlocked)? {
-            return Ok(()); // sealed-not-unlocked: never index its plaintext.
+            return Ok(false); // sealed-not-unlocked: never index its plaintext.
         }
         let Some(meeting) = self.get_meeting(meeting_id)? else {
-            return Ok(());
+            return Ok(false);
         };
         let title = meeting
             .title
@@ -3509,7 +3524,7 @@ impl Db {
                 existing.push(r.map_err(map_err)?.unwrap_or_default());
             }
             if existing == hashes {
-                return Ok(());
+                return Ok(false);
             }
         }
 
@@ -3542,7 +3557,7 @@ impl Db {
             )
             .map_err(map_err)?;
         if sealed_at_rest {
-            return Ok(());
+            return Ok(false);
         }
         tx.execute(
             "DELETE FROM topic_vec_chunks WHERE chunk_id IN
@@ -3597,7 +3612,7 @@ impl Db {
             topics = topics.len(),
             "topic chunks indexed"
         );
-        Ok(())
+        Ok(true)
     }
 
     /// Brain v2 L1.1 — STARTUP BACKFILL: index topic chunks for every VISIBLE meeting that has
@@ -3607,12 +3622,21 @@ impl Db {
     /// set (nothing is session-unlocked at startup; sealed meetings are skipped by the gate and
     /// their topic rows are re-derived on unlock via `reindex_meetings_after_unseal`). Returns how
     /// many meetings were (re)indexed. Per-meeting failures WARN (ids only, no PII) and continue.
+    ///
+    /// CAPPED at [`TOPIC_BACKFILL_MAX_REEMBED_PER_RUN`] REAL (re)embeds per call — a vault-wide
+    /// hash change (Brain freshly enabled, or a segmentation/augmentation version bump) would
+    /// otherwise re-embed the ENTIRE vault in one unthrottled pass on a single app launch, pegging
+    /// CPU/Metal for however long that takes before the user can do anything (the 2026-07-13
+    /// launch-freeze incident). The idempotency probe means the cap just defers the remainder to
+    /// the NEXT launch — no cursor needed, each run picks up wherever the hash still differs.
     pub fn backfill_topic_chunks_idempotent(&self, embedder: &dyn Embedder) -> Result<usize> {
         const TOPIC_BACKFILL_BATCH: usize = 20;
+        const TOPIC_BACKFILL_MAX_REEMBED_PER_RUN: usize = 50;
         let unlocked: HashSet<String> = HashSet::new();
         let meetings = self.list_meetings_visible(100_000, &unlocked)?;
         let mut indexed = 0usize;
-        for batch in meetings.chunks(TOPIC_BACKFILL_BATCH) {
+        let mut reembedded = 0usize;
+        'outer: for batch in meetings.chunks(TOPIC_BACKFILL_BATCH) {
             for m in batch {
                 let segments = match self.get_segments(&m.id) {
                     Ok(s) => s,
@@ -3624,11 +3648,30 @@ impl Db {
                 if segments.is_empty() {
                     continue;
                 }
-                match self.index_meeting_topic_chunks(&m.id, &segments, embedder, &unlocked) {
-                    Ok(()) => indexed += 1,
+                match self.index_meeting_topic_chunks_reporting(&m.id, &segments, embedder, &unlocked) {
+                    Ok(wrote) => {
+                        indexed += 1;
+                        if wrote {
+                            reembedded += 1;
+                            // Breathing room between REAL embeds specifically (idempotent no-ops
+                            // are free and stay unpaced) — a batch that's entirely fresh work
+                            // (e.g. Brain just enabled) would otherwise fire up to
+                            // TOPIC_BACKFILL_BATCH Candle/Metal calls back-to-back with zero
+                            // scheduler gap before the batch-level sleep below ever runs.
+                            std::thread::sleep(std::time::Duration::from_millis(50));
+                        }
+                    }
                     Err(e) => {
                         tracing::warn!(target: "rag", error = %e, "topic backfill: indexing one meeting failed (skipped)");
                     }
+                }
+                if reembedded >= TOPIC_BACKFILL_MAX_REEMBED_PER_RUN {
+                    tracing::info!(
+                        target: "rag",
+                        reembedded,
+                        "topic backfill: per-run cap reached, deferring remainder to next launch"
+                    );
+                    break 'outer;
                 }
             }
             std::thread::sleep(std::time::Duration::from_millis(25));
@@ -14943,6 +14986,57 @@ mod tests {
             "old topic text must be gone after the clean replace"
         );
         assert_eq!(topic_chunk_count(&db, "m1"), topic_vec_count(&db, "m1"));
+    }
+
+    /// 2026-07-13 launch-freeze fix: `backfill_topic_chunks_idempotent` bounds REAL (re)embeds to
+    /// a per-run cap — a vault where EVERY meeting genuinely needs (re)embedding (e.g. Brain
+    /// freshly enabled on this device) must not try to embed the whole vault in one unthrottled
+    /// pass on a single app launch. The cap is a no-op cost-wise: the idempotency probe means the
+    /// NEXT call just resumes past the meetings already done.
+    #[test]
+    fn topic_backfill_caps_real_reembeds_per_run_and_resumes_next_call() {
+        let db = mem_db();
+        const TOTAL: usize = 55;
+        const CAP: usize = 50; // mirrors TOPIC_BACKFILL_MAX_REEMBED_PER_RUN
+        for i in 0..TOTAL {
+            let id = format!("m{i}");
+            db.insert_meeting(&sample_meeting(&id, "2026-06-24T10:00:00Z"))
+                .unwrap();
+            db.insert_segments(&id, &[long_seg(0, 0.0, 60.0, "quarterly planning topic")])
+                .unwrap();
+        }
+
+        let first_pass = db
+            .backfill_topic_chunks_idempotent(&crate::embed::StubEmbedder)
+            .unwrap();
+        assert_eq!(
+            first_pass, CAP,
+            "the first run must stop at the per-run cap, not index the whole vault in one pass"
+        );
+        let indexed_after_first = (0..TOTAL)
+            .filter(|i| topic_chunk_count(&db, &format!("m{i}")) > 0)
+            .count();
+        assert_eq!(
+            indexed_after_first, CAP,
+            "exactly the capped count of meetings should have topic rows after the first run"
+        );
+
+        // Idempotent resume: the SECOND run skips the already-indexed meetings for free (their
+        // hash matches — no cursor needed, the hash probe IS the cursor) and reaches the rest.
+        let second_pass = db
+            .backfill_topic_chunks_idempotent(&crate::embed::StubEmbedder)
+            .unwrap();
+        assert_eq!(
+            second_pass, TOTAL,
+            "the second run must finish touching every remaining meeting"
+        );
+        let indexed_after_second = (0..TOTAL)
+            .filter(|i| topic_chunk_count(&db, &format!("m{i}")) > 0)
+            .count();
+        assert_eq!(
+            indexed_after_second, TOTAL,
+            "every meeting must be indexed after the second run"
+        );
     }
 
     /// L1.5 RED-contrast: WITHOUT a date filter an out-of-window meeting that matches lexically IS
