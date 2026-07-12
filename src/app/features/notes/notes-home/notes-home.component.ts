@@ -24,6 +24,7 @@ import type {
   OrgStatus,
 } from "../../../core/models";
 import { MurSidebarComponent } from "../../../design-system/sidebar/sidebar.component";
+import { MurSpinnerComponent } from "../../../design-system/spinner/spinner.component";
 import { FoldersService } from "../../../services/folders.service";
 import { FolderLockFlowService } from "../../../services/folder-lock-flow.service";
 import { NotesService } from "../../../services/notes.service";
@@ -80,6 +81,7 @@ export type NotesListItem =
   imports: [
     RouterLink,
     MurSidebarComponent,
+    MurSpinnerComponent,
     OrganizeSheetComponent,
     LockSharesDialogComponent,
   ],
@@ -162,10 +164,15 @@ export class NotesHomeComponent implements OnInit {
     const orgs = this._orgs();
     const orgNameById = new Map(orgs.map((o) => [o.orgId, o.name]));
 
-    // A specific org selected: show ONLY that org's items.
+    // A specific org selected: show ONLY that org's items — EXCLUDING `kind === "meeting"`
+    // ones ("notes has notes, meetings has meetings": a shared meeting note belongs in the
+    // Library "Shared brains" rail, not here). An unclassified item (`kind` absent/`null` —
+    // shared under the pre-v2 wire format, before source-kind existed) stays visible here,
+    // same as it always has, since it can't be proven to be a meeting.
     if (orgId !== null) {
       const name = orgNameById.get(orgId) ?? "";
       return (orgItemsByOrg[orgId] ?? [])
+        .filter((item) => item.kind !== "meeting")
         .map((item) => this.toOrgCard(item, name))
         .sort((a, b) => b.sortAt - a.sortAt);
     }
@@ -186,10 +193,13 @@ export class NotesHomeComponent implements OnInit {
     // replicas the caller authored (`ownedSource`): the editable original already
     // appears (as a note card, or under Meetings), so showing the replica too would
     // duplicate the row and surface a stale publish-time title. Replicas shared by
-    // OTHERS stay (that's the point of the merged view).
+    // OTHERS stay (that's the point of the merged view). ALSO drop `kind === "meeting"`
+    // items — those now live exclusively in the Library "Shared brains" rail ("notes has
+    // notes, meetings has meetings"); an unclassified item (no `kind`, pre-v2 wire format)
+    // stays here, matching its historical behavior.
     const orgCards: NotesListItem[] = orgs.flatMap((o) =>
       (orgItemsByOrg[o.orgId] ?? [])
-        .filter((item) => !item.ownedSource)
+        .filter((item) => !item.ownedSource && item.kind !== "meeting")
         .map((item) => this.toOrgCard(item, o.name)),
     );
     return [...noteCards, ...orgCards].sort((a, b) => b.sortAt - a.sortAt);

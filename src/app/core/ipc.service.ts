@@ -91,6 +91,8 @@ import type {
   OrgSourceShareStatus,
   OrgItemDetail,
   OrgItemHeader,
+  MeetingOrgShareInfo,
+  MeetingOrgShareRow,
   OrgSourceRef,
   OrgSyncReport,
   OrgFeedUpdatedPayload,
@@ -652,6 +654,26 @@ export class IpcService {
   /** This user's outgoing org shares (drives the "In Org Brain" state + per-item revoke). */
   listOrgShares(): Promise<OrgShareEntry[]> {
     return invoke<OrgShareEntry[]>("list_org_shares");
+  }
+
+  /**
+   * Every org THIS meeting is actively shared into (org id + display name) — drives the
+   * "Shared with [org]" badge on the Library row + the Detail view. Gated exactly like
+   * `getMeetingDetail`: a sealed-and-not-session-unlocked meeting returns `[]`, never leaking
+   * its share status. Only the text note/summary is ever shared — the caller renders this
+   * alongside an explicit "audio never leaves the device" caption, never implying otherwise.
+   */
+  meetingOrgShares(meetingId: string): Promise<MeetingOrgShareInfo[]> {
+    return invoke<MeetingOrgShareInfo[]>("meeting_org_shares", { meetingId });
+  }
+
+  /**
+   * The BULK Library-row variant: every active meeting→org share pairing across ALL of the
+   * caller's meetings in one call — avoids fetching {@link meetingOrgShares} per row. Same gate
+   * (a sealed-and-not-session-unlocked meeting contributes no rows).
+   */
+  listMeetingOrgShares(): Promise<MeetingOrgShareRow[]> {
+    return invoke<MeetingOrgShareRow[]>("list_meeting_org_shares");
   }
 
   /**

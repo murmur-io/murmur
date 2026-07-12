@@ -23332,7 +23332,9 @@ mod lifecycle_tests {
     /// row id), proving the two AADs match.
     #[test]
     fn org_envelope_aad_nonce_is_content_hash_so_cross_member_open_succeeds() {
-        use crate::share::org_envelope::{open_org_envelope, seal_org_envelope, OrgEnvelope, OrgItemKind};
+        use crate::share::org_envelope::{
+            open_org_envelope, seal_org_envelope, OrgEnvelope, OrgItemKind, OrgSourceKind,
+        };
 
         let ock = crate::crypto::random_key().unwrap();
         let env = OrgEnvelope::new(
@@ -23342,6 +23344,7 @@ mod lifecycle_tests {
             "anna",
             "2026-07-10T09:00:00Z",
             1,
+            OrgSourceKind::Meeting,
         );
         let content_sha = env.content_sha256();
 
@@ -23392,6 +23395,7 @@ mod lifecycle_tests {
                 1,
                 &[5u8; 32],
                 None,
+                None,
             )
             .unwrap();
         let got = state.db.get_org_item("it-g").unwrap().unwrap();
@@ -23418,19 +23422,19 @@ mod lifecycle_tests {
         // Two items in org-1 at seq 1 and 2, plus an item in a DIFFERENT org, plus a tombstoned one.
         state
             .db
-            .upsert_org_item("a", "org-1", 1, "anna", "Kickoff", "the kickoff agenda", "2026-07-10T09:00:00Z", 1, 1, &[1u8; 32], None)
+            .upsert_org_item("a", "org-1", 1, "anna", "Kickoff", "the kickoff agenda", "2026-07-10T09:00:00Z", 1, 1, &[1u8; 32], None, None)
             .unwrap();
         state
             .db
-            .upsert_org_item("b", "org-1", 2, "bob", "Retro", "the sprint retro", "2026-07-11T09:00:00Z", 1, 1, &[2u8; 32], None)
+            .upsert_org_item("b", "org-1", 2, "bob", "Retro", "the sprint retro", "2026-07-11T09:00:00Z", 1, 1, &[2u8; 32], None, None)
             .unwrap();
         state
             .db
-            .upsert_org_item("z", "org-2", 9, "zed", "Other org", "not our org", "2026-07-11T09:00:00Z", 1, 1, &[3u8; 32], None)
+            .upsert_org_item("z", "org-2", 9, "zed", "Other org", "not our org", "2026-07-11T09:00:00Z", 1, 1, &[3u8; 32], None, None)
             .unwrap();
         state
             .db
-            .upsert_org_item("d", "org-1", 3, "dan", "Dead", "revoked", "2026-07-11T10:00:00Z", 1, 1, &[4u8; 32], None)
+            .upsert_org_item("d", "org-1", 3, "dan", "Dead", "revoked", "2026-07-11T10:00:00Z", 1, 1, &[4u8; 32], None, None)
             .unwrap();
         state.db.tombstone_org_item("d").unwrap();
 
@@ -23470,7 +23474,7 @@ mod lifecycle_tests {
         // The received replica (frozen at publish time = "Untitled") + the matching OUTBOUND share.
         state
             .db
-            .upsert_org_item("item-own", "org-1", 2, "kgm004a", "Untitled", "# body", "2026-07-11T09:00:00Z", 1, 1, &[9u8; 32], None)
+            .upsert_org_item("item-own", "org-1", 2, "kgm004a", "Untitled", "# body", "2026-07-11T09:00:00Z", 1, 1, &[9u8; 32], None, None)
             .unwrap();
         state
             .db
@@ -23483,7 +23487,7 @@ mod lifecycle_tests {
         // Someone ELSE's replica — no local share ⇒ stays read-only, title untouched.
         state
             .db
-            .upsert_org_item("item-other", "org-1", 1, "kgm004a+2", "Ich notatka", "body", "2026-07-10T09:00:00Z", 1, 1, &[7u8; 32], None)
+            .upsert_org_item("item-other", "org-1", 1, "kgm004a+2", "Ich notatka", "body", "2026-07-10T09:00:00Z", 1, 1, &[7u8; 32], None, None)
             .unwrap();
 
         let items = list_org_items_inner(&state, "org-1").unwrap();
@@ -23499,6 +23503,73 @@ mod lifecycle_tests {
         let other = items.iter().find(|i| i.item_id == "item-other").unwrap();
         assert!(other.owned_source.is_none(), "a non-author's item is a read-only replica");
         assert_eq!(other.title, "Ich notatka", "a non-owned title is left as-is");
+    }
+
+    /// `OrgItemHeader.kind` round-trips for BOTH an owned document-kind share and an owned
+    /// meeting-kind share, and stays `None` for a colleague's item that was upserted with no stored
+    /// `source_kind` (mirrors an item ingested off a v1 envelope / before this column existed — the
+    /// genuinely-unclassified case; a colleague's item ingested off a v2 envelope now DOES classify,
+    /// since `Db::list_org_items` SELECTs the stored `org_items.source_kind` column directly for
+    /// every item). For owned items, `kind` is resolved from `org_shares.document_id` / `meeting_id`
+    /// presence — metadata only, independent of the `owned_source` unlock gate.
+    #[test]
+    fn list_org_items_resolves_kind_for_document_and_meeting_owned_shares_and_none_for_others() {
+        let state = build_state("org-list-kind");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        make_open_folder(&state.db, "f-own", "Team");
+
+        // Owned DOCUMENT (note) share.
+        state
+            .db
+            .insert_note("n-own", "f-own", "Untitled", "A Note", "# body", 1)
+            .unwrap();
+        state
+            .db
+            .upsert_org_item("item-doc", "org-1", 3, "kgm004a", "A Note", "# body", "2026-07-11T09:00:00Z", 1, 1, &[9u8; 32], None, None)
+            .unwrap();
+        state
+            .db
+            .insert_org_share("s-doc", "org-1", None, Some("n-own"), "note", Some("A Note"), 1, 1, &[9u8; 32], "2026-07-11T09:00:00Z")
+            .unwrap();
+        state.db.set_org_share_uploaded("s-doc", "item-doc", "2026-07-11T09:00:00Z").unwrap();
+
+        // Owned MEETING share (unlocked meeting: no folder_id).
+        state
+            .db
+            .insert_meeting(&Meeting {
+                id: "m-own".to_string(),
+                started_at: "2026-07-11T09:00:00Z".to_string(),
+                ended_at: None,
+                title: Some("Standup".to_string()),
+                duration_s: 60,
+                audio_path: None,
+                status: MeetingStatus::Exported,
+                folder_id: None,
+            })
+            .unwrap();
+        state
+            .db
+            .upsert_org_item("item-meeting", "org-1", 2, "kgm004a", "Standup", "# body", "2026-07-11T09:00:00Z", 1, 1, &[8u8; 32], None, None)
+            .unwrap();
+        state
+            .db
+            .insert_org_share("s-meeting", "org-1", Some("m-own"), None, "meeting", Some("Standup"), 1, 1, &[8u8; 32], "2026-07-11T09:00:00Z")
+            .unwrap();
+        state.db.set_org_share_uploaded("s-meeting", "item-meeting", "2026-07-11T09:00:00Z").unwrap();
+
+        // A colleague's item — no local `org_shares` row.
+        state
+            .db
+            .upsert_org_item("item-other", "org-1", 1, "kgm004a+2", "Ich notatka", "body", "2026-07-10T09:00:00Z", 1, 1, &[7u8; 32], None, None)
+            .unwrap();
+
+        let items = list_org_items_inner(&state, "org-1").unwrap();
+        let doc = items.iter().find(|i| i.item_id == "item-doc").unwrap();
+        assert_eq!(doc.kind.as_deref(), Some("document"), "owned note share ⇒ kind=document");
+        let meeting = items.iter().find(|i| i.item_id == "item-meeting").unwrap();
+        assert_eq!(meeting.kind.as_deref(), Some("meeting"), "owned meeting share ⇒ kind=meeting");
+        let other = items.iter().find(|i| i.item_id == "item-other").unwrap();
+        assert!(other.kind.is_none(), "a colleague's item has no locally-knowable kind");
     }
 
     /// F-org-editable GATE: an owned item whose source folder is LOCKED (not session-unlocked) is NOT
@@ -23526,7 +23597,7 @@ mod lifecycle_tests {
             .unwrap();
         state
             .db
-            .upsert_org_item("item-lock", "org-1", 1, "kgm004a", "Old Snapshot", "# body", "2026-07-11T09:00:00Z", 1, 1, &[5u8; 32], None)
+            .upsert_org_item("item-lock", "org-1", 1, "kgm004a", "Old Snapshot", "# body", "2026-07-11T09:00:00Z", 1, 1, &[5u8; 32], None, None)
             .unwrap();
         state
             .db
@@ -23542,6 +23613,11 @@ mod lifecycle_tests {
         assert!(
             it.owned_source.is_none(),
             "a locked owned source is not resolved (no editable link)"
+        );
+        assert_eq!(
+            it.kind.as_deref(),
+            Some("document"),
+            "kind is METADATA (not content) — still resolved even when the owned source is locked"
         );
         assert_ne!(
             it.title, "Secret Title",
@@ -23559,7 +23635,7 @@ mod lifecycle_tests {
         seed_org(&state.db, "org-mine", "Mine", "owner", 1);
         state
             .db
-            .upsert_org_item("m1", "org-mine", 1, "anna", "Mine A", "body", "2026-07-11T09:00:00Z", 1, 1, &[1u8; 32], None)
+            .upsert_org_item("m1", "org-mine", 1, "anna", "Mine A", "body", "2026-07-11T09:00:00Z", 1, 1, &[1u8; 32], None, None)
             .unwrap();
         // A member org resolves + returns the item.
         let ok = list_org_items_inner(&state, "org-mine").unwrap();
@@ -23577,6 +23653,144 @@ mod lifecycle_tests {
         ));
     }
 
+    /// `meeting_org_shares`: an OPEN meeting's active org shares are visible (org id + display
+    /// name), and a SEALED-and-not-session-unlocked meeting's org-share status is MASKED to an empty
+    /// list — exactly like `get_meeting_detail`'s `locked: true` masking. RED on any pre-gate version
+    /// that reads `org_shares_for_source` unconditionally (it would leak the org name for a locked
+    /// meeting even though every OTHER content channel on that meeting is closed).
+    #[test]
+    fn meeting_org_shares_gated_by_meeting_is_unlocked() {
+        let state = build_state("meeting-org-shares-gate");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+
+        // An OPEN meeting, actively shared into org-1.
+        make_open_folder(&state.db, "f-open", "Open");
+        seed_meeting(&state.db, "m-open", "# note", Some("f-open"));
+        state
+            .db
+            .insert_org_share(
+                "s-open", "org-1", Some("m-open"), None, "meeting", Some("Quarterly strategy"),
+                1, 1, &[7u8; 32], "2026-07-11T09:00:00Z",
+            )
+            .unwrap();
+        state
+            .db
+            .set_org_share_uploaded("s-open", "item-open", "2026-07-11T09:00:00Z")
+            .unwrap();
+
+        let open_shares = meeting_org_shares_inner(&state, "m-open").unwrap();
+        assert_eq!(open_shares.len(), 1, "the open meeting's active org share is visible");
+        assert_eq!(open_shares[0].org_id, "org-1");
+        assert_eq!(open_shares[0].org_name, "Acme", "the org's display name resolves");
+
+        // A SEALED, NOT session-unlocked meeting, also actively shared into org-1.
+        state
+            .db
+            .insert_folder(&Folder {
+                id: "f-sealed".to_string(),
+                name: "Sealed".to_string(),
+                path: "Sealed".to_string(),
+                parent_id: None,
+                locked: true,
+                created_at: "2026-06-27T08:00:00Z".to_string(),
+            })
+            .unwrap();
+        seed_meeting(&state.db, "m-sealed", "# note", Some("f-sealed"));
+        state
+            .db
+            .insert_org_share(
+                "s-sealed", "org-1", Some("m-sealed"), None, "meeting", Some("Confidential"),
+                1, 1, &[8u8; 32], "2026-07-11T09:00:00Z",
+            )
+            .unwrap();
+        state
+            .db
+            .set_org_share_uploaded("s-sealed", "item-sealed", "2026-07-11T09:00:00Z")
+            .unwrap();
+
+        let sealed_shares = meeting_org_shares_inner(&state, "m-sealed").unwrap();
+        assert!(
+            sealed_shares.is_empty(),
+            "a sealed-and-not-session-unlocked meeting's org-share status must be masked, not leaked"
+        );
+
+        // Session-unlock the folder — the same meeting's org-share status becomes visible again.
+        state
+            .unlocked_folders
+            .lock()
+            .unwrap()
+            .insert("f-sealed".to_string());
+        let unlocked_shares = meeting_org_shares_inner(&state, "m-sealed").unwrap();
+        assert_eq!(
+            unlocked_shares.len(),
+            1,
+            "a session-unlocked meeting's org-share status is visible again"
+        );
+        assert_eq!(unlocked_shares[0].org_id, "org-1");
+    }
+
+    /// `list_meeting_org_shares`: the BULK Library-row variant of `meeting_org_shares` — one row per
+    /// (meeting, org). An open meeting's active share is listed; a sealed-and-not-session-unlocked
+    /// meeting's row is DROPPED (never leaked in the bulk list either), and a document-anchored share
+    /// (no `meeting_id`) is skipped as not a Library concern.
+    #[test]
+    fn list_meeting_org_shares_drops_locked_meetings() {
+        let state = build_state("list-meeting-org-shares-gate");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+
+        make_open_folder(&state.db, "f-open", "Open");
+        seed_meeting(&state.db, "m-open", "# note", Some("f-open"));
+        state
+            .db
+            .insert_org_share(
+                "s-open", "org-1", Some("m-open"), None, "meeting", Some("Quarterly strategy"),
+                1, 1, &[7u8; 32], "2026-07-11T09:00:00Z",
+            )
+            .unwrap();
+        state.db.set_org_share_uploaded("s-open", "item-open", "2026-07-11T09:00:00Z").unwrap();
+
+        state
+            .db
+            .insert_folder(&Folder {
+                id: "f-sealed".to_string(),
+                name: "Sealed".to_string(),
+                path: "Sealed".to_string(),
+                parent_id: None,
+                locked: true,
+                created_at: "2026-06-27T08:00:00Z".to_string(),
+            })
+            .unwrap();
+        seed_meeting(&state.db, "m-sealed", "# note", Some("f-sealed"));
+        state
+            .db
+            .insert_org_share(
+                "s-sealed", "org-1", Some("m-sealed"), None, "meeting", Some("Confidential"),
+                1, 1, &[8u8; 32], "2026-07-11T09:00:00Z",
+            )
+            .unwrap();
+        state.db.set_org_share_uploaded("s-sealed", "item-sealed", "2026-07-11T09:00:00Z").unwrap();
+
+        // A document-anchored share — not a meeting, must be skipped from the Library-scoped list.
+        state
+            .db
+            .insert_org_share(
+                "s-doc", "org-1", None, Some("n-doc"), "note", Some("A note"),
+                1, 1, &[9u8; 32], "2026-07-11T09:00:00Z",
+            )
+            .unwrap();
+        state.db.set_org_share_uploaded("s-doc", "item-doc", "2026-07-11T09:00:00Z").unwrap();
+
+        let rows = list_meeting_org_shares_inner(&state).unwrap();
+        assert_eq!(rows.len(), 1, "only the OPEN meeting's share is listed");
+        assert_eq!(rows[0].meeting_id, "m-open");
+        assert_eq!(rows[0].org_id, "org-1");
+        assert_eq!(rows[0].org_name, "Acme");
+        assert!(
+            !rows.iter().any(|r| r.meeting_id == "m-sealed"),
+            "a sealed-and-not-session-unlocked meeting's share must not appear in the bulk list"
+        );
+    }
+
     /// FIX B (received-items COUNT): `OrgStatus.received_count` reflects the LOCAL replica (what
     /// colleagues shared IN), DISTINCT from `item_count` (the caller's OWN uploaded outbound shares).
     /// Seed org_items (received) + an outbound uploaded share and assert the two counts are independent.
@@ -23588,11 +23802,11 @@ mod lifecycle_tests {
         // TWO received items (from colleagues) in the local replica.
         state
             .db
-            .upsert_org_item("r1", "org-1", 1, "anna", "Doc A", "body a", "2026-07-10T09:00:00Z", 1, 1, &[1u8; 32], None)
+            .upsert_org_item("r1", "org-1", 1, "anna", "Doc A", "body a", "2026-07-10T09:00:00Z", 1, 1, &[1u8; 32], None, None)
             .unwrap();
         state
             .db
-            .upsert_org_item("r2", "org-1", 2, "bob", "Doc B", "body b", "2026-07-11T09:00:00Z", 1, 1, &[2u8; 32], None)
+            .upsert_org_item("r2", "org-1", 2, "bob", "Doc B", "body b", "2026-07-11T09:00:00Z", 1, 1, &[2u8; 32], None, None)
             .unwrap();
         // ONE of the caller's OWN outbound shares, state 'uploaded' (item_count = 1).
         let now = "2026-07-11T12:00:00Z";
@@ -26233,6 +26447,14 @@ pub(crate) async fn publish_org_body(
         document_id.as_deref(),
         scrub,
     )?;
+    // `build_org_share_body` already enforces exactly one of meeting_id/document_id is `Some` (else it
+    // errors before this line is reached), so this mirrors that same exclusivity to stamp the wire
+    // envelope's SOURCE type (document vs meeting — a new axis, distinct from `kind`/content-shape).
+    let source_kind = if meeting_id.is_some() {
+        crate::share::org_envelope::OrgSourceKind::Meeting
+    } else {
+        crate::share::org_envelope::OrgSourceKind::Document
+    };
 
     // (2) consent fail-closed (the global one-time org-egress consent).
     {
@@ -26278,6 +26500,7 @@ pub(crate) async fn publish_org_body(
         author_hint,
         created_at,
         rev,
+        source_kind,
     );
     let content_sha = env.content_sha256();
     // SB-3 row-amplification fix: REUSE any existing retriable (`queued`/`failed`) row for this
@@ -26389,6 +26612,7 @@ pub(crate) async fn publish_org_body(
         rev,
         generation,
         &content_sha,
+        env.source_kind.map(crate::share::org_envelope::OrgSourceKind::as_str),
         None,
     ) {
         tracing::warn!(target: "org", error = %e, "share: local replica upsert failed (server copy live)");
@@ -26494,6 +26718,13 @@ pub(crate) async fn republish_org_shares_for_source(
                 continue;
             }
         };
+        // `org_shares_for_source` rows always anchor exactly one of meeting_id/document_id (mirrors the
+        // exclusivity `build_org_share_body` already enforced when this row was first published).
+        let source_kind = if row.meeting_id.is_some() {
+            crate::share::org_envelope::OrgSourceKind::Meeting
+        } else {
+            crate::share::org_envelope::OrgSourceKind::Document
+        };
 
         // Consent could have been withdrawn since the share → SKIP (never egress without consent).
         {
@@ -26531,6 +26762,7 @@ pub(crate) async fn republish_org_shares_for_source(
             author_hint.clone(),
             created_at.clone(),
             row.rev,
+            source_kind,
         );
         if row.content_sha256.as_deref() == Some(cmp_env.content_sha256().as_slice()) {
             continue;
@@ -26544,6 +26776,7 @@ pub(crate) async fn republish_org_shares_for_source(
             author_hint,
             created_at,
             new_rev,
+            source_kind,
         );
         let content_sha = env.content_sha256();
 
@@ -26632,6 +26865,10 @@ pub(crate) async fn republish_org_shares_for_source(
             .db
             .set_org_share_uploaded(&row.id, &published.item_id, &now)?;
         crate::share::ledger_row(&state.db, &client.host(), "org_share_publish", content_sha.len());
+        // This row produced a NEW published rev this call — counted so the caller can decide whether
+        // to emit `org-feed-updated` (only when > 0; a save that changed nothing / skipped every row
+        // must not ping the FE).
+        republished += 1;
 
         // LOCAL REPLICA CONSISTENCY (F-org-editable): the author's OWN `org_items` replica would
         // otherwise stay frozen on the OLD item_id until the next feed pull — so the just-repointed
@@ -26652,6 +26889,7 @@ pub(crate) async fn republish_org_shares_for_source(
             new_rev,
             generation,
             &content_sha,
+            env.source_kind.map(crate::share::org_envelope::OrgSourceKind::as_str),
             None,
         ) {
             tracing::warn!(target: "org", error = %e, "republish: local replica upsert failed (server copy live)");
@@ -26713,6 +26951,120 @@ pub fn list_org_shares(state: State<'_, AppState>) -> Result<Vec<OrgShareEntry>,
             state: r.state,
         })
         .collect())
+}
+
+/// One org this meeting is actively shared into (`meeting_org_shares`) — just enough for the
+/// Library row badge + the Detail "Shared with…" indicator. Content-free beyond the org's own
+/// display name (which the caller already sees everywhere else in the org UI).
+#[derive(serde::Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct MeetingOrgShareInfo {
+    pub org_id: String,
+    pub org_name: String,
+}
+
+/// `meeting_org_shares(meeting_id)` — every org THIS meeting is currently (actively) shared into,
+/// i.e. the `uploaded` `org_shares` rows anchored on it. Same disclosure class as `get_meeting_tags`
+/// (a metadata-only read of the user's OWN share state — never note/transcript content), but gated
+/// exactly like `get_meeting_detail`: a sealed-and-not-session-unlocked meeting returns an EMPTY
+/// list rather than leaking whether/where it's shared, mirroring `meeting_is_unlocked` at every
+/// other content read site. A meeting the caller never shared (or an unknown id) also returns `[]`.
+#[tauri::command]
+pub fn meeting_org_shares(
+    state: State<'_, AppState>,
+    meeting_id: String,
+) -> Result<Vec<MeetingOrgShareInfo>, AppError> {
+    meeting_org_shares_inner(state.inner(), &meeting_id)
+}
+
+/// Inner of [`meeting_org_shares`] taking `&AppState` (unit-testable read-gate). See the command doc
+/// for the disclosure-class rationale.
+pub(crate) fn meeting_org_shares_inner(
+    st: &AppState,
+    meeting_id: &str,
+) -> Result<Vec<MeetingOrgShareInfo>, AppError> {
+    if !meeting_is_unlocked(st, meeting_id)? {
+        return Ok(Vec::new());
+    }
+    let rows = st.db.org_shares_for_source(Some(meeting_id), None)?;
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for row in rows {
+        if !seen.insert(row.org_id.clone()) {
+            continue; // one badge per org even if somehow >1 uploaded row exists for it.
+        }
+        let name = st
+            .db
+            .get_org_state(&row.org_id)?
+            .map(|o| o.name)
+            .unwrap_or_else(|| "Shared brain".to_string());
+        out.push(MeetingOrgShareInfo {
+            org_id: row.org_id,
+            org_name: name,
+        });
+    }
+    Ok(out)
+}
+
+/// One row of [`list_meeting_org_shares`] — a single meeting-to-org share pairing (a meeting may
+/// have several rows, one per org it's shared into).
+#[derive(serde::Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct MeetingOrgShareRow {
+    pub meeting_id: String,
+    pub org_id: String,
+    pub org_name: String,
+}
+
+/// `list_meeting_org_shares()` — EVERY active meeting→org share pairing across ALL of the caller's
+/// meetings, in one bulk call (avoids an N+1 `meeting_org_shares` fetch per Library row). Same
+/// disclosure class + gate as [`meeting_org_shares`]: a sealed-and-not-session-unlocked meeting's
+/// rows are dropped, exactly mirroring `mask_locked_meetings` for `list_meetings`.
+#[tauri::command]
+pub fn list_meeting_org_shares(
+    state: State<'_, AppState>,
+) -> Result<Vec<MeetingOrgShareRow>, AppError> {
+    list_meeting_org_shares_inner(state.inner())
+}
+
+/// Inner of [`list_meeting_org_shares`] taking `&AppState` (unit-testable read-gate).
+pub(crate) fn list_meeting_org_shares_inner(
+    st: &AppState,
+) -> Result<Vec<MeetingOrgShareRow>, AppError> {
+    let rows = st.db.list_org_shares_in_state("uploaded")?;
+    let mut out = Vec::new();
+    let mut org_names: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut seen = std::collections::HashSet::new();
+    for row in rows {
+        let Some(meeting_id) = row.meeting_id else {
+            continue; // a document-anchored share — not a Library concern.
+        };
+        if !seen.insert((meeting_id.clone(), row.org_id.clone())) {
+            continue; // one badge per (meeting, org) even if somehow >1 uploaded row exists.
+        }
+        // GATE: a sealed-and-not-session-unlocked meeting's share status must not leak, exactly
+        // like every other content/metadata read on it (`meeting_is_unlocked`).
+        if !meeting_is_unlocked(st, &meeting_id)? {
+            continue;
+        }
+        let name = if let Some(n) = org_names.get(&row.org_id) {
+            n.clone()
+        } else {
+            let n = st
+                .db
+                .get_org_state(&row.org_id)?
+                .map(|o| o.name)
+                .unwrap_or_else(|| "Shared brain".to_string());
+            org_names.insert(row.org_id.clone(), n.clone());
+            n
+        };
+        out.push(MeetingOrgShareRow {
+            meeting_id,
+            org_id: row.org_id,
+            org_name: name,
+        });
+    }
+    Ok(out)
 }
 
 /// `org_live_shares_for_source(meeting_id?, document_id?)` — which orgs already hold a LIVE (`uploaded`)
@@ -27354,6 +27706,11 @@ async fn org_sync_one(
                     rev,
                     generation,
                     &sha,
+                    // Straight off the opened envelope: `Some("document"|"meeting")` for an item
+                    // published from a v2 wire envelope (this device's own publishes, or a peer already
+                    // on v2); `None` for one opened off an old v1 envelope (no wire signal) — honest
+                    // "unclassified", never guessed.
+                    env.source_kind.map(crate::share::org_envelope::OrgSourceKind::as_str),
                     embedder_ref,
                 )?;
                 report.ingested += 1;
@@ -27420,13 +27777,45 @@ pub(crate) fn list_org_items_inner(
     // a stale publish-time snapshot. GATED — a locked-not-unlocked source resolves to `None` (its title
     // must never leak through this org-disclosed list). A non-author's item has no local share ⇒ `None`
     // ⇒ stays a read-only replica.
+    //
+    // KIND (source-type) ENRICHMENT: separate from the above — `kind` is METADATA (meeting vs document),
+    // never content. `Db::list_org_items` now populates `item.kind` DIRECTLY from the stored
+    // `org_items.source_kind` column for EVERY item (opened off a v2 `OrgEnvelope` at ingest, so a
+    // colleague's item now classifies too). This local `org_shares`-anchored resolver is kept as a
+    // fallback/override ONLY for the CALLER'S OWN items — it stays correct (and UNGATED, unlike
+    // `owned_source`: a locked source still reports its kind) even if the stored column is somehow null
+    // for a row ingested before this column existed. It must NOT clobber a correctly-populated stored
+    // value for a colleague's item with `None`.
     for item in &mut items {
+        if let Some(own_kind) = resolve_own_item_kind(st, &item.item_id)? {
+            item.kind = Some(own_kind);
+        }
         if let Some(src) = resolve_owned_source(st, &item.item_id)? {
             item.title = src.title;
             item.owned_source = Some(src.owned);
         }
     }
     Ok(items)
+}
+
+/// The source kind (`"document"` | `"meeting"`) of an org item THIS device published, from the local
+/// `org_shares` anchor — metadata only (no title/body), so UNGATED (a locked source still reports its
+/// kind; only `owned_source`'s title is lock-gated). `None` when no local share row exists (an item
+/// published by a colleague) or the row anchors neither `meeting_id` nor `document_id` (shouldn't
+/// happen — `insert_org_share` always sets exactly one — but fails closed to `None` rather than guess).
+/// A fallback/override for the CALLER'S OWN items only — see the call site in `list_org_items_inner`;
+/// `Db::list_org_items` now populates `kind` for colleagues' items too, straight from storage.
+fn resolve_own_item_kind(st: &AppState, item_id: &str) -> Result<Option<String>, AppError> {
+    let Some(row) = st.db.org_share_by_item(item_id)? else {
+        return Ok(None);
+    };
+    if row.document_id.is_some() {
+        Ok(Some("document".to_string()))
+    } else if row.meeting_id.is_some() {
+        Ok(Some("meeting".to_string()))
+    } else {
+        Ok(None)
+    }
 }
 
 /// The caller's editable local source + its CURRENT title for an org item they published, if any. `None`

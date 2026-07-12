@@ -1440,6 +1440,13 @@ impl Db {
              CREATE INDEX IF NOT EXISTS idx_org_chunks_item ON org_chunks(item_id);",
         )
         .map_err(map_err)?;
+        // ADDITIVE: `source_kind` (`"document"` | `"meeting"` | NULL) — the item's SOURCE type, opened
+        // straight off the `OrgEnvelope` wire field once a peer publishes on the v2 wire format (see
+        // `share::org_envelope::OrgSourceKind`). NULL for every row ingested before this column existed,
+        // and for any item still arriving from a peer on an old client (v1 envelope, no wire signal) —
+        // both are honestly "unclassified", never guessed. Guarded (`add_column_if_missing`) so an
+        // already-migrated DB just gets the new column with existing rows defaulting to NULL.
+        Self::add_column_if_missing(conn, "org_items", "source_kind", "TEXT")?;
         // vec0 int8 KNN table (width = EMBED_DIM; compile-time const, no user input). int8 per the
         // scale spike — see the doc comment. Values are inserted via `vec_int8(?)` (a raw i8 blob).
         conn.execute_batch(&format!(
@@ -4934,6 +4941,7 @@ impl Db {
         rev: u32,
         generation: u32,
         content_sha256: &[u8],
+        source_kind: Option<&str>,
         embedder: Option<&dyn Embedder>,
     ) -> Result<()> {
         // Chunk + embed OUTSIDE the write lock (embedding is CPU/Metal work). The header carries the
@@ -4952,13 +4960,13 @@ impl Db {
         tx.execute(
             "INSERT INTO org_items
                (item_id, org_id, seq, author_hint, title, markdown, created_at, rev, generation,
-                content_sha256, tombstoned)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,0)
+                content_sha256, source_kind, tombstoned)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,0)
              ON CONFLICT(item_id) DO UPDATE SET
                org_id=excluded.org_id, seq=excluded.seq, author_hint=excluded.author_hint,
                title=excluded.title, markdown=excluded.markdown, created_at=excluded.created_at,
                rev=excluded.rev, generation=excluded.generation,
-               content_sha256=excluded.content_sha256, tombstoned=0",
+               content_sha256=excluded.content_sha256, source_kind=excluded.source_kind, tombstoned=0",
             rusqlite::params![
                 item_id,
                 org_id,
@@ -4970,6 +4978,7 @@ impl Db {
                 rev as i64,
                 generation as i64,
                 content_sha256,
+                source_kind,
             ],
         )
         .map_err(map_err)?;
@@ -5210,6 +5219,13 @@ impl Db {
     /// what colleagues shared into the org instead of only search-hitting it. Org items are
     /// deliberately org-disclosed content (no folder lock gate applies); the COMMAND layer re-checks
     /// the caller is a local member of `org_id` before calling this.
+    ///
+    /// `kind` is now populated DIRECTLY from the stored `source_kind` column (opened off the item's
+    /// `OrgEnvelope` at ingest — see `upsert_org_item`) for EVERY item, not just ones this device
+    /// published: a v2-envelope item from a colleague now classifies correctly. Stays `None` for a row
+    /// ingested before this column existed, or from a peer still on an old v1-only client (honest
+    /// "unclassified", never guessed). `list_org_items_inner` may still override this with the
+    /// owned-item resolver for the caller's OWN items (correct even when the column is somehow null).
     pub fn list_org_items(
         &self,
         org_id: &str,
@@ -5217,7 +5233,7 @@ impl Db {
         let conn = self.lock();
         let mut stmt = conn
             .prepare(
-                "SELECT item_id, title, author_hint, created_at, seq
+                "SELECT item_id, title, author_hint, created_at, seq, source_kind
                    FROM org_items
                   WHERE org_id = ?1 AND tombstoned = 0
                   ORDER BY seq DESC",
@@ -5231,8 +5247,9 @@ impl Db {
                     author_hint: r.get(2)?,
                     created_at: r.get(3)?,
                     seq: r.get::<_, i64>(4)? as u64,
-                    // Enriched in `list_org_items_inner` (needs `&AppState` for the unlock gate); the
-                    // raw DB row carries no ownership resolution.
+                    // Direct from storage now (see doc comment above); `list_org_items_inner` may still
+                    // enrich/override for the caller's own items via the local `org_shares` resolver.
+                    kind: r.get::<_, Option<String>>(5)?,
                     owned_source: None,
                 })
             })
@@ -10598,6 +10615,7 @@ mod tests {
             1,
             1,
             &sha,
+            None,
             Some(&emb),
         )
         .unwrap();
@@ -10646,6 +10664,7 @@ mod tests {
             1,
             1,
             &sha32(2),
+            None, // source_kind: unclassified in this test
             None, // no embedder → FTS-only
         )
         .unwrap();
@@ -10683,6 +10702,7 @@ mod tests {
             1,
             1,
             &sha32(3),
+            None,
             Some(&emb),
         )
         .unwrap();
@@ -10734,18 +10754,18 @@ mod tests {
         let emb = crate::embed::StubEmbedder;
         db.upsert_org_item(
             "it-a", "org-1", 1, "anna", "Roadmap", "the falcon rollout plan alpha", "t", 1, 1,
-            &sha32(6), Some(&emb),
+            &sha32(6), None, Some(&emb),
         )
         .unwrap();
         db.upsert_org_item(
             "it-b", "org-1", 2, "bob", "Budget", "the falcon rollout budget beta", "t", 1, 1,
-            &sha32(7), Some(&emb),
+            &sha32(7), None, Some(&emb),
         )
         .unwrap();
         // A DIFFERENT org's item must SURVIVE the scoped purge.
         db.upsert_org_item(
             "it-other", "org-2", 1, "carol", "Other", "unrelated other-org content", "t", 1, 1,
-            &sha32(8), Some(&emb),
+            &sha32(8), None, Some(&emb),
         )
         .unwrap();
 
@@ -10798,12 +10818,12 @@ mod tests {
         let emb = crate::embed::StubEmbedder;
         db.upsert_org_item(
             "it-r", "org-1", 1, "dan", "V1", "first version body alpha", "t", 1, 1, &sha32(4),
-            Some(&emb),
+            None, Some(&emb),
         )
         .unwrap();
         db.upsert_org_item(
             "it-r", "org-1", 2, "dan", "V2", "second version body bravo", "t", 2, 1, &sha32(5),
-            Some(&emb),
+            None, Some(&emb),
         )
         .unwrap();
         // Only the v2 body is chunked (no duplicate/stale chunks).
