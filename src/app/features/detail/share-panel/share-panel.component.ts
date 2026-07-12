@@ -14,6 +14,7 @@ import type {
   AccountStatus,
   MyShareEntry,
   OrgShareEntry,
+  OrgSourceShareStatus,
   OrgStatus,
   RecipientPreview,
 } from "../../../core/models";
@@ -295,6 +296,14 @@ export class SharePanelComponent {
   readonly org = this.orgStatus.asReadonly();
   /** This user's outgoing org shares (drives the "In Org Brain" state for THIS meeting). */
   private readonly orgShares = signal<OrgShareEntry[]>([]);
+  /**
+   * Live (uploaded) org shares of THIS meeting specifically — powers the CTA "In
+   * Org Brain ✓" state (a re-share is blocked; edits sync automatically). Joined to
+   * the meeting id backend-side, unlike the content-free `orgShares` list.
+   */
+  private readonly _orgSourceShares = signal<OrgSourceShareStatus[]>([]);
+  /** True when THIS meeting is already live in ≥1 org (flips the CTA to shared). */
+  readonly sourceInOrg = computed(() => this._orgSourceShares().length > 0);
   /** True while the org-share PREVIEW SHEET is open (the confirm flow). */
   readonly orgSheetOpen = signal(false);
 
@@ -395,13 +404,21 @@ export class SharePanelComponent {
           return;
         }
         this.orgShares.set(shares);
+        // Per-source live shares → the CTA "In Org Brain ✓" state + re-share block.
+        const live = await this.ipc.orgLiveSharesForSource({ meetingId: id });
+        if (this.meetingId() !== id) {
+          return;
+        }
+        this._orgSourceShares.set(live);
       } else {
         this.orgShares.set([]);
+        this._orgSourceShares.set([]);
       }
     } catch {
       // Org unavailable (older backend / not joined) — hide the section.
       this.orgStatus.set(null);
       this.orgShares.set([]);
+      this._orgSourceShares.set([]);
     }
   }
 

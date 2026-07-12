@@ -218,6 +218,7 @@ pub fn run() {
             commands::list_org_shares,
             commands::meeting_org_shares,
             commands::list_meeting_org_shares,
+            commands::org_live_shares_for_source,
             commands::revoke_org_share,
             commands::org_sweep_pending,
             commands::org_sync_now,
