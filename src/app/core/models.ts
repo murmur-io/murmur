@@ -1968,6 +1968,19 @@ export interface OrgShareEntry {
 }
 
 /**
+ * Which org already holds a LIVE (`uploaded`) share of a given LOCAL source
+ * (meeting/note), so the share sheet can mark that org "Already added ✓" and
+ * BLOCK a re-share (the double-click duplicate fix). Content-free: only the org
+ * id + server item id + rev. Populated by `orgLiveSharesForSource`. Mirrors the
+ * Rust `OrgSourceShareStatus`.
+ */
+export interface OrgSourceShareStatus {
+  orgId: string;
+  itemId: string | null;
+  rev: number;
+}
+
+/**
  * The full decrypted org item for the read-only viewer route (`orgGetItem`).
  * `markdown` is the plaintext envelope body — this is deliberately-disclosed org
  * content (no lock gate applies to org items), rendered read-only with an
