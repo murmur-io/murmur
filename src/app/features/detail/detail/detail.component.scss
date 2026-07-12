@@ -56,6 +56,19 @@
   font-size: 0.8125rem;
 }
 
+/* "Shared with [org]" pill(s) + the explicit audio-never-shared caption. */
+.org-share-pill {
+  max-width: 22ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.org-share-caption {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 0.75rem;
+}
+
 /* --- Tag editor (chips + inline add) --- */
 .tag-editor {
   display: flex;

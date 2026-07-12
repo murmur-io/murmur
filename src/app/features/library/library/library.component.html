@@ -79,6 +79,45 @@
         />
       }
     </div>
+
+    <!-- ===== Shared brains (orgs) — read-only shared MEETING notes only.
+         "notes has notes, meetings has meetings": a `kind === "document"` org
+         item never appears here (Notes owns those); selecting an org shows a
+         DISTINCT list, never merged into "All meetings" (the bug #259 fixed). -->
+    @if (orgs().length > 0 || orgsLoading()) {
+      <div class="folders-head org-head">
+        <h3 class="folders-title">Shared brains</h3>
+        @if (orgsLoading()) {
+          <mur-spinner [size]="12" class="org-head-spinner" />
+        }
+      </div>
+      <nav class="folders-body org-body" aria-label="Shared brains">
+        @for (org of orgs(); track org.orgId) {
+          <button
+            type="button"
+            class="folder-row org-row"
+            [class.is-selected]="activeOrgId() === org.orgId"
+            [attr.aria-pressed]="activeOrgId() === org.orgId"
+            (click)="selectOrg(org.orgId)"
+          >
+            <span class="folder-icon" aria-hidden="true">
+              <svg viewBox="0 0 16 16" width="15" height="15" fill="none">
+                <circle cx="5" cy="6" r="2" stroke="currentColor" stroke-width="1.3" />
+                <circle cx="11" cy="6" r="2" stroke="currentColor" stroke-width="1.3" />
+                <path
+                  d="M2 13c0-1.8 1.3-3 3-3s3 1.2 3 3M8 13c0-1.8 1.3-3 3-3s3 1.2 3 3"
+                  stroke="currentColor"
+                  stroke-width="1.3"
+                  stroke-linecap="round"
+                />
+              </svg>
+            </span>
+            <span class="folder-name">{{ org.name }}</span>
+            <span class="pill org-role" [title]="orgRoleLabel(org)">{{ orgRoleLabel(org) }}</span>
+          </button>
+        }
+      </nav>
+    }
   </mur-sidebar>
 
   <!-- ============ RIGHT PANE — search, filters, meeting list ============ -->
@@ -239,6 +278,71 @@
                   }
                 </span>
                 <span class="chevron" aria-hidden="true">›</span>
+              </a>
+            </li>
+          }
+        </ul>
+      }
+    } @else if (activeOrgId() !== null) {
+      <!-- ===================== SHARED BRAIN — org's meeting notes =====================
+           A DISTINCT list from "All meetings" (never merged — the bug #259 fixed):
+           read-only replicas of a colleague's shared meeting notes, or a straight
+           link to your OWN editable original when you authored the item. -->
+      <header class="library-head">
+        <h2>{{ listHeading() }}</h2>
+        @if (!orgsLoading() && !orgListEmpty()) {
+          <span class="count">{{ orgListItems().length }}</span>
+        }
+      </header>
+
+      @if (orgUnclassifiedCount() > 0) {
+        <p class="org-unclassified-note text-muted">
+          {{ orgUnclassifiedCount() }}
+          {{ orgUnclassifiedCount() === 1 ? "item" : "items" }} from this
+          shared brain couldn’t be classified as a meeting or a note (shared
+          before that distinction existed) — not shown here.
+        </p>
+      }
+
+      @if (orgsLoading()) {
+        <div class="card state-card">
+          <p class="empty">Loading…</p>
+        </div>
+      } @else if (orgListEmpty()) {
+        <div class="card empty-state">
+          <span class="empty-mark" aria-hidden="true"></span>
+          <p class="empty-title">Nothing shared here yet</p>
+          <p class="empty">
+            No one has shared a meeting note into “{{ listHeading() }}” yet.
+            Shared meeting notes appear here automatically as they sync.
+          </p>
+        </div>
+      } @else {
+        <ul class="list">
+          @for (it of orgListItems(); track it.id; let i = $index) {
+            <li>
+              <a
+                class="row"
+                [routerLink]="orgItemLink(it.item)"
+                [style.animation-delay.ms]="i * 35"
+              >
+                <span class="row-main">
+                  <span class="title">{{ it.item.title || "(untitled)" }}</span>
+                  <span class="meta">
+                    @if (it.item.authorHint) {
+                      <span class="date">{{ it.item.authorHint }}</span>
+                      <span class="dot" aria-hidden="true">·</span>
+                    }
+                    <span class="date">{{ formatDate(it.item.createdAt) }}</span>
+                  </span>
+                </span>
+                <span class="row-aside">
+                  <span
+                    class="pill org-badge"
+                    [title]="'Shared brain · ' + it.orgName"
+                  >{{ it.orgName }}</span>
+                  <span class="chevron" aria-hidden="true">›</span>
+                </span>
               </a>
             </li>
           }
@@ -433,6 +537,25 @@
                       }
                       <span class="folder-label-name">{{ fname }}</span>
                     </span>
+                  }
+
+                  <!-- "Shared with [org]" row badge — this OWN meeting has an
+                       active org-brain share. Text note only; audio never
+                       leaves the device (see the tooltip + the Detail caption). -->
+                  @if (orgSharesOf(m.id); as shares) {
+                    @if (shares.length > 0) {
+                      <span
+                        class="pill is-accent org-share-row-pill"
+                        [title]="
+                          'Shared with ' +
+                          shares[0].orgName +
+                          (shares.length > 1
+                            ? ' + ' + (shares.length - 1) + ' more'
+                            : '') +
+                          ' — text note only, audio never leaves this device'
+                        "
+                      >Shared{{ shares.length > 1 ? " ×" + shares.length : "" }}</span>
+                    }
                   }
 
                   <span class="pill" [class]="statusPillClass(m.status)">

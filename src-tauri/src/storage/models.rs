@@ -543,6 +543,20 @@ pub struct OrgItemHeader {
     pub author_hint: String,
     pub created_at: String,
     pub seq: u64,
+    /// The item's source kind — `"document"` (a shared authored note) or `"meeting"` (a shared
+    /// meeting note) — so the FE can filter a per-org list into "shared meetings" vs "shared notes"
+    /// (Library/Meetings vs Notes view). The `OrgEnvelope` wire format now carries this natively as of
+    /// `ORG_ENVELOPE_VERSION = 2` (`share::org_envelope::OrgSourceKind`), stored straight off the
+    /// opened envelope into `org_items.source_kind` at ingest — so a COLLEAGUE'S item now classifies
+    /// too, not just items THIS device published. For items THIS device published, an UNGATED local
+    /// `org_shares`-anchored resolver (`meeting_id` XOR `document_id`) can still override/fall back
+    /// (metadata only, never gated on unlock state, unlike `owned_source` below which also carries the
+    /// live title). `None` means genuinely unclassified: an item ingested off an old v1 envelope
+    /// (published before the peer/this device upgraded, or before this column existed) carries no
+    /// source-type signal on the wire — the FE MUST treat `None` as "unclassified", never
+    /// assume/default it to one bucket.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
     /// The caller's OWN editable local source for this item, when THIS device published it (resolved
     /// via `org_share_by_item` → the anchored note/meeting) AND that source is currently readable
     /// (unlock-gated — a locked source resolves to `None`, never leaking its title). `None` for an
