@@ -6,7 +6,7 @@
 
 <p align="center">
   <b>A local-first macOS app that records your meetings, transcribes & reasons over them <i>entirely on your Mac</i>,<br/>
-  and gives you an AI you can <i>talk to live, in the meeting</i> — and across everything you've ever recorded.</b>
+  and gives you an AI you can <i>talk to live, in the meeting</i> — and across everything you've ever recorded and written.</b>
 </p>
 
 <p align="center">
@@ -15,7 +15,7 @@
   <img src="https://img.shields.io/badge/on--device_brain-Bielik%20%C2%B7%20Qwen-9d7bff?style=flat-square" alt="on-device brain">
   <img src="https://img.shields.io/badge/MCP-127.0.0.1%3A8765-24C8DB?style=flat-square" alt="MCP server">
   <img src="https://img.shields.io/badge/Tauri-2.11-24C8DB?style=flat-square&logo=tauri&logoColor=white" alt="Tauri 2.11">
-  <img src="https://img.shields.io/badge/Rust-1.96-000000?style=flat-square&logo=rust&logoColor=white" alt="Rust 1.96">
+  <img src="https://img.shields.io/badge/Angular-22%20zoneless-dd0031?style=flat-square&logo=angular&logoColor=white" alt="Angular 22 zoneless">
   <img src="https://img.shields.io/badge/privacy-local--first-3fb950?style=flat-square" alt="local-first">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-8ca0ff?style=flat-square" alt="license AGPL-3.0"></a>
 </p>
@@ -25,6 +25,8 @@
   <a href="#-quick-start">Quick start</a> ·
   <a href="#-the-brain--your-meeting-memory-you-can-talk-to">The brain</a> ·
   <a href="#-features">Features</a> ·
+  <a href="#-notes">Notes</a> ·
+  <a href="#-shared-brain-org">Shared Brain</a> ·
   <a href="#-architecture">Architecture</a> ·
   <a href="#-the-mcp-server">MCP</a> ·
   <a href="#-privacy--the-lock-model">Privacy</a>
@@ -36,11 +38,14 @@ Most meeting tools just transcribe and ship your audio to someone else's cloud. 
 meetings a brain — and keeps it on your Mac.** While you're still in the call you can jot a note, drop
 `@brain` in front of a question, and get a **grounded answer with sources** drawn from everything
 you've recorded before — the recording never stops. After the call it writes a clean structured note
-and remembers it forever: searchable, linkable, and queryable by your own AI. With Ollama or the
-bundled on-device model, **none of it ever leaves the device.**
+and remembers it forever: searchable, linkable, and queryable by your own AI. Write standalone notes
+too — same brain, same lock model, same ownership. With Ollama, the bundled on-device model, or
+`claude_code`, **none of it ever leaves the device.** And when you want to share what you know, an
+opt-in, end-to-end-encrypted **Shared Brain** lets your whole org search each other's notes — free,
+zero-knowledge, no plaintext ever touching a server.
 
 > 🎙️ **Record** → 🧠 **transcribe & reason on-device** → 💬 **ask your brain — live in the meeting** →
-> 🔎 **and across your whole history.** _(And yes — every note is plain Markdown you own.)_
+> 🔎 **and across your whole history — meetings and notes.** _(And yes — every note is plain Markdown you own.)_
 
 <p align="center">
   <img src="docs/screenshots/record-brain.png" alt="The conversation-first record screen: take notes while recording, drop @brain to open a thread, and the on-device brain answers with sources" width="860">
@@ -57,8 +62,14 @@ bundled on-device model, **none of it ever leaves the device.**
   something useful it offers a quiet **"✓ Add to notes"** — nothing enters your notes unless you say so.
 - 🔒 **Truly local-first.** The brain, transcription, and search all run on your Mac. Pick a fully-local
   stack (Ollama or the bundled GGUF model) and **nothing ever leaves the device.**
-- 🔎 **Memory across every meeting.** Ask one question and get an answer synthesized from months of calls,
-  each claim linked back to the meeting it came from.
+- 📝 **A real notes product, not an afterthought.** A standalone Markdown editor with its own folders,
+  its own lock lifecycle, a 19-action AI command menu, and per-note end-to-end-encrypted sharing — for
+  writing that never came from a recording.
+- 🌐 **A Shared Brain for your org — free, E2EE.** Opt in and publish notes or meetings into a
+  zero-knowledge shared pool your teammates' apps replicate and search locally. The server only ever
+  sees ciphertext.
+- 🔎 **Memory across every meeting *and* every note.** Ask one question and get an answer synthesized from
+  months of calls and writing, each claim linked back to where it came from.
 - 🎧 **It hears the whole call.** Your mic *and* the other side's system audio are captured and transcribed
   separately, then merged into a **Me / Others** transcript.
 - 🧩 **One store, three surfaces.** An encrypted SQLite DB is the single source of truth; the app, a
@@ -87,16 +98,18 @@ To run the in-meeting brain fully offline, download an on-device model (Bielik /
 **agentic loop** (the brain chooses which tools to call) runs with a **provider connection** — including
 local **Ollama** — while a downloaded on-device model uses a grounded retrieval floor. See
 [Providers & the on-device brain](#-providers--the-on-device-brain).
+Want Shared Brain / cross-device sharing? A free account (opt-in, no card) unlocks it — see
+[Shared Brain (org)](#-shared-brain-org).
 Building from source? Jump to [Development](#-development).
 
 ---
 
 ## 🧠 The brain — your meeting memory you can talk to
 
-This is the part most note-takers don't have. Murmur treats **everything you record as one brain**:
-your transcripts and notes are the memory, an on-device (or cloud) model is the reasoning, and internal
-retrieval + consent-gated connectors are the tools. You talk to it live in the meeting, ask it across
-your whole history, and browse what it knows — all over the same store.
+This is the part most note-takers don't have. Murmur treats **everything you record and write as one
+brain**: your transcripts and notes are the memory, an on-device (or cloud) model is the reasoning, and
+internal retrieval + consent-gated connectors are the tools. You talk to it live in the meeting, ask it
+across your whole history, and browse what it knows — all over the same store.
 
 ### 💬 Live, in the meeting
 
@@ -112,16 +125,21 @@ your whole history, and browse what it knows — all over the same store.
   **provider connection** (including local **Ollama**) it's a model-driven **agentic loop** that decides
   which gated tools to call, with a live tool-trace ("Searching notes… ✓"); a downloaded on-device model
   answers from a grounded retrieval floor instead.
+- **Three-tier cascade.** The live assistant checks the current meeting first, then your whole vault
+  (meetings + notes), then — only if you've enabled connectors — the web, Jira, Slack, or your org's
+  Shared Brain. It escalates deterministically only when the closer tier can't answer.
 - **Grounded, not hallucinated.** Every answer is retrieved from your own transcripts and notes first,
   then summarized — with the source meetings cited as chips you can open.
 - **✨ Ask brain on any note.** Hover a note and hit **✨ ask brain** to open a thread seeded from that
   line — the note stays a note; the thread just hangs under it.
+- **Read-only, always.** At every tier the model can draft something for you, but it never writes to a
+  note or a meeting on its own — you click "Add to notes."
 
 ### 🗂️ The `/brain` hub — what it knows
 
 <p align="center">
   <img src="docs/screenshots/brain.png" alt="The /brain page: status header with counts, three knowledge-source cards, and a connections graph" width="860">
-  <br/><em>Everything the assistant can reason over, in one place — meetings, imported documents, and typed notes.</em>
+  <br/><em>Everything the assistant can reason over, in one place — meetings, imported documents, typed notes, and standalone Notes.</em>
 </p>
 
 - **One page for your whole brain.** A status header counts your (visible) **meetings**, **documents**,
@@ -131,20 +149,20 @@ your whole history, and browse what it knows — all over the same store.
   gated by the same per-folder lock.
 - **See the connections.** A collapsible graph shows how people and projects link across everything.
 
-### 🔎 Ask across every meeting
+### 🔎 Ask across every meeting — and every note
 
 <p align="center">
   <img src="docs/screenshots/ask.png" alt="Ask Your Vault — grounded Q&A with source citations across all meetings" width="860">
-  <br/><em>Ask Your Vault — one question, answered across months of meetings, every claim linked to its source.</em>
+  <br/><em>Ask Your Vault — one question, answered across months of meetings and notes, every claim linked to its source.</em>
 </p>
 
-- **Ask Your Vault** — full-page grounded chat across all your (visible) meetings, answered by the same
-  agentic loop, every answer linked back to the meetings it came from. Single-meeting chat cites
+- **Ask Your Vault** — full-page grounded chat across all your (visible) meetings and notes, answered by
+  the same agentic loop, every answer linked back to where it came from. Single-meeting chat cites
   time-indexed transcript segments.
-- **Hybrid retrieval** — keyword search (FTS) fused with on-device **semantic vectors**
-  (`multilingual-e5-small`, 384-dim, `sqlite-vec` KNN, Reciprocal Rank Fusion). On device and **on by
-  default**; it downloads a ~470 MB on-device embedding model from Settings to activate, and falls back to
-  keyword search until then.
+- **Hybrid retrieval** — keyword search (FTS5/BM25) fused with on-device **semantic vectors**
+  (`multilingual-e5-small`, 384-dim, `sqlite-vec` KNN) and a deterministic entity co-mention graph. On
+  device and **on by default**; it downloads a ~470 MB on-device embedding model from Settings to
+  activate, and falls back to keyword search until then.
 - **Related meetings** (semantic neighbors) and **entity dossiers** that synthesize a person or project
   across everything they touched.
 
@@ -163,27 +181,36 @@ your whole history, and browse what it knows — all over the same store.
   <img src="docs/screenshots/hero-record.png" alt="Live recording with on-device transcription, waveform, and live captions" width="860">
 </p>
 
-- **Dual-stream recording** — microphone (`cpal`) **plus** the other side's system audio (a Swift
-  **ScreenCaptureKit** sidecar, or a **Core Audio process tap** on macOS 14.4+), transcribed independently
-  and merged by host wall-clock into **Me / Others**.
-- **On-device Whisper** (`whisper.cpp` via `whisper-rs`, **Metal**). A *Fast* pass drives ~3-second live
-  captions while you record; an *Accurate* beam-search pass (anti-hallucination gates) runs once after you stop.
+- **Dual-stream recording** — microphone (`cpal`) **plus** the other side's system audio (a **Core Audio
+  process tap** on macOS 14.4+, falling back to a Swift **ScreenCaptureKit** sidecar on 13–14.3), each
+  transcribed independently on its own wall-clock anchor and merged into a time-ordered **Me / Others**
+  transcript. Denied system-audio permission degrades gracefully to mic-only.
+- **On-device Whisper** (`whisper.cpp` via `whisper-rs`, **Metal**). A *Fast* pass drives live captions
+  while you record (VAD-gated, thermally governed); an *Accurate* beam-search pass (anti-hallucination
+  gates, previous-text conditioning) runs once after you stop, pre-segmented by Silero VAD with a bounded
+  decode window so memory stays capped even on very long meetings.
 - **Live captions are mic-only until you stop.** During the call, the live captions (and the live `@brain`
   context) transcribe *your* microphone; the other side's system audio is captured in parallel and folded
   into the full **Me / Others** transcript only after you stop.
-- **Best-effort extras, graceful by default** — Silero **VAD**, optional **speaker diarization** of the
-  others stream, **offline echo cancellation**, and opt-in hi-fidelity native-rate masters; each degrades
-  cleanly when its model is absent.
-- **Guardrails** — a 4-hour cap, live mic-mute that preserves sync, an input-device picker, and detection
-  of a running meeting app (Zoom / Teams / Webex). Whisper sizes `tiny`…`large-v3` (**default `small`**,
-  ~470 MB — a RAM-safe default; all sizes stay selectable) download once from Settings.
+- **Optional CPU-only NVIDIA Parakeet live-ASR engine** for live captions on capable Macs (falls back to
+  Whisper silently) — the authoritative post-meeting transcript always runs through Whisper.
+- **Best-effort extras, graceful by default** — cross-stream echo suppression (headphone users untouched),
+  optional **N-way speaker diarization** of the others stream, offline **and** online echo cancellation
+  with raw-mic fallback, opt-in on-device voiceprints, and opt-in hi-fidelity native-rate masters; each
+  degrades cleanly when its model is absent.
+- **Crash-safe.** A raw mic-buffer spill written every ~1s means a crash, a `SIGKILL`, or a dev rebuild
+  mid-recording still salvages a real transcript and note on next launch.
+- **Guardrails** — a 4-hour cap, live mic-mute that preserves sync, an input-device picker, and a thermal
+  governor that backs off the *live* loop under heat (recording and the batch pipeline are never
+  throttled). Whisper sizes `tiny`…`large-v3` (+ quantized variants) download once from Settings, with a
+  machine-conditional smart default.
 
 <p align="center">
   <img src="docs/screenshots/bar.png" alt="Floating always-on-top recorder bar" width="560">
   <br/><em>The signature floating recorder bar (<code>⌘⇧R</code>) — record (and ask) from anywhere.</em>
 </p>
 
-### 📝 Notes & structure
+### 📝 Notes & structure — meetings
 
 <table>
   <tr>
@@ -198,7 +225,7 @@ your whole history, and browse what it knows — all over the same store.
 
 - **Structured notes** generated from the transcript: summary, decisions, action items, and notable quotes —
   re-summarize any meeting with a different model.
-- **Recipes** turn a transcript into emails, decision logs, or action lists; action items can push to **Apple Reminders**.
+- **Recipes** turn a transcript into emails, decision logs, or work tickets; action items can push to **Apple Reminders**.
 - **Timeline & more** — an interactive **speaker + topic timeline**, pin-a-moment block refs, weekly
   **digests**, and deterministic cross-meeting **Topic Threads**. Your on-device macOS **calendar**
   (EventKit, zero-OAuth) is reachable on demand as the brain's `calendar_lookup` tool when you ask in
@@ -214,7 +241,7 @@ your whole history, and browse what it knows — all over the same store.
     <td width="50%"><img src="docs/screenshots/analytics.png" alt="Analytics dashboard"></td>
   </tr>
   <tr>
-    <td align="center"><em>Library — folders, tags, and lock-aware rows (🔒 sealed folders).</em></td>
+    <td align="center"><em>Library — folders, tags, lock-aware rows (🔒 sealed folders), and shared-brain items merged in.</em></td>
     <td align="center"><em>Totals, a 30-day activity chart, and a status breakdown.</em></td>
   </tr>
 </table>
@@ -228,49 +255,124 @@ are still just Markdown you own. (The encrypted SQLite DB — not the vault — 
 
 ---
 
+## 📝 Notes
+
+A full standalone Markdown note-taking product that lives next to your meetings — not a byproduct of
+recording. Same store, same lock model, same brain.
+
+<p align="center">
+  <img src="docs/screenshots/notes-editor-brain-menu.png" alt="Note editor with AI assistant" width="820">
+</p>
+
+- **A real editor** at its own route, with collapsible YAML front-matter, a formatting toolbar, markdown
+  keyboard shortcuts, an 11-type slash-`/` block-insert menu, Edit/Preview toggle, and debounced
+  autosave.
+- **Note folders**, entirely separate from meeting folders, that reuse the exact same **Touch-ID-gated
+  per-folder lock** — a locked note folder masks its title to `🔒 Locked` and blanks body, tags, and
+  properties, just like a locked meeting.
+- **AI auto-organize** — the brain proposes a folder/tag reorganization plan, you review it, nothing
+  moves until you approve.
+- **A 19-action AI command menu on selected text** — ClickUp-style, grouped into Edit / Structure / From
+  your brain / Extract / Create, with a compact 5-action default, tone and translation submenus, and a
+  free-text custom instruction. The same command backs all 19 actions, gated on the folder being
+  unlocked and routed through the identical provider seam, redaction firewall, and egress ledger as
+  meeting summarization — retrieval-only actions never touch the network.
+- **Per-note end-to-end-encrypted sharing** — an expiring, optionally password-protected link, or a
+  publish into your org's Shared Brain — gated on the folder being unlocked and on explicit share
+  consent before anything is ever encrypted and sent.
+
+---
+
+## 🌐 Shared Brain (org)
+
+An opt-in, **free**, end-to-end-encrypted way for your org to build one shared knowledge pool out of
+everyone's notes and meetings — without anyone's plaintext ever touching a server.
+
+<p align="center">
+  <img src="docs/screenshots/shared-brain-rail.png" alt="Shared brains rail in Library" width="820">
+  <img src="docs/screenshots/settings-privacy.png" alt="Org sharing settings" width="820">
+</p>
+
+- **Free, no seats, no paid tier.** A free account (opt-in login) is all that's required — Shared Brain
+  isn't gated behind a plan.
+- **Publish a note or a meeting** into your org's shared pool with one click; a preview shows the exact
+  outgoing Markdown, its size, and what was scrubbed — before anything leaves your Mac.
+- **Zero-knowledge relay.** The backend (`murmur-server`, a separate, Railway-deployed service) stores
+  only ciphertext blobs, wrapped per-org content keys, and metadata — never a plaintext field, ever.
+- **Verify-before-egress.** Every shared item is sealed, then immediately decrypted back and
+  byte-compared *before* it's ever uploaded.
+- **Stays fresh automatically.** Editing a note or meeting you've shared re-publishes it (best-effort, on
+  save boundaries, never per-keystroke); your own device sees the refresh instantly, teammates pick it
+  up on a background sync (about once a minute). No manual "Sync now" needed.
+- **Idempotent, dedup'd sharing.** Re-clicking "share" never republishes a duplicate; accidental
+  duplicates from earlier versions auto-collapse.
+- **Multi-org aware.** Every org you're a member of (owned or invited) is discovered, synced, and
+  browsable — not just the first one you joined.
+- **Shows up where you'd expect it.** A "Shared brains" section sits alongside your own notes and
+  meetings in both Library and the Notes view; your own shares link straight to your editable original,
+  teammates' shares open a read-only viewer with the author's current title.
+- **Leaving an org purges everything** it ever gave your device — decrypted replica, vectors, search
+  index, cached keys.
+- **Per-meeting revocation** — the detail view shows any active org shares sourced from a
+  meeting and lets you revoke them individually.
+- **Owner-managed membership** — invite by email, remove members, from Settings → Organization.
+
+The wire format (`murmur-protocol`, MIT/Apache) is compiled into both this app and the server, so it's
+a real, versioned, backward-compatible envelope — not a bolted-on export format.
+
+---
+
 ## 🏗️ Architecture
 
 Murmur is a **Tauri 2.11** desktop app: a **Rust** core (crate `murmur`, lib `meetnotes_lib`, bin `Murmur`)
 talks to an **Angular 22 zoneless** frontend over Tauri IPC. There's no NgRx — every screen is a standalone
 *signals* component calling a single `IpcService`. The Rust side captures, transcribes, summarizes, and
 persists everything to **one SQLCipher-encrypted SQLite database** — the canonical store. Over it sit the
-**brain** (a grounded RAG + reasoning layer powering the in-meeting assistant and Ask — full model-driven
-agentic tool-choice with a provider connection incl. local Ollama, a grounded retrieval floor on a
-downloaded on-device model), plus three read surfaces: the app UI, a read-only **MCP server**, and your
-Obsidian vault.
+**brain** (a grounded RAG + agentic reasoning layer powering the in-meeting assistant, Ask, and the Notes
+AI command menu — full model-driven agentic tool-choice with a provider connection incl. local Ollama, a
+grounded retrieval floor on a downloaded on-device model), plus three read surfaces: the app UI, a
+read-only **MCP server**, and your Obsidian vault. Opt in to a free account and a fourth path opens: a
+zero-knowledge **sync relay** (`murmur-server`, a separate sibling repo) that lets Shared Brain content —
+and nothing else — flow, always as ciphertext, between your org's devices.
 
 ```mermaid
 flowchart LR
   mic["🎙️ Mic (cpal)"] --> asr
-  sys["🔊 System audio<br/>ScreenCaptureKit / Core Audio tap"] --> asr
+  sys["🔊 System audio<br/>Core Audio tap / ScreenCaptureKit"] --> asr
   asr["🗣️ whisper.cpp · Metal<br/>Fast live + Accurate batch"] --> merge
   merge["⏱️ Wall-clock merge → Me / Others"] --> db
   merge --> redact
+  notes["📝 Notes editor"] --> db
   redact["🛡️ Redaction firewall"] --> prov
-  prov["✍️ Summarizer<br/>claude_code · anthropic · ollama · gateway"] --> db
+  prov["✍️ Summarizer / Brain assistant<br/>claude_code · anthropic · ollama · gateway"] --> db
   db[("🗄️ SQLite + SQLCipher<br/>per-folder AES-256-GCM lock")]
-  db --> brain["🧠 Brain (grounded RAG + reasoning)<br/>GGUF/cloud reasoner · e5 vectors"]
+  db --> brain["🧠 Brain (agentic RAG + reasoning)<br/>GGUF/cloud reasoner · e5 vectors"]
   brain --> live["💬 In-meeting @brain threads"]
-  brain --> ask["🔎 Ask across all meetings"]
+  brain --> ask["🔎 Ask across meetings + notes"]
   db --> mcp["🧩 MCP server · 127.0.0.1:8765"]
   db --> vault["📁 Obsidian vault (.md · .canvas)"]
+  db -.opt-in, E2EE.-> relay["☁️ murmur-server<br/>ciphertext-only relay"]
+  relay -.opt-in, E2EE.-> orgdb[("🗄️ Org members' local replicas")]
 ```
 
 **The pipeline, stage by stage:** capture (mic + optional system audio) → resample/segment → transcribe
 each stream on-device → merge by wall-clock into Me/Others → persist to the SQLCipher DB → summarize (any
-cloud-bound text first passes the redaction firewall) → export the note atomically. Status events stream to
-the UI at each stage.
+cloud-bound text first passes the redaction firewall) → export the note atomically. Notes follow the same
+persist → (optional AI assist, same redaction firewall) → export path without a recording stage. Status
+events stream to the UI at each stage. If you opt into Shared Brain, publishing a note or meeting adds one
+more stage — seal, verify, upload as ciphertext — never a change to how anything is stored locally.
 
 ---
 
 ## 🧩 The MCP server
 
 Murmur runs a **read-only [Model Context Protocol](https://modelcontextprotocol.io) server** on
-`127.0.0.1:8765` so **Claude Desktop / Claude Code** (or any MCP client) can query your meeting memory
-**with zero egress** — your notes stay on your Mac, and the client reads them locally.
+`127.0.0.1:8765` so **Claude Desktop / Claude Code** (or any MCP client) can query your meeting and note
+memory **with zero egress** — your notes stay on your Mac, and the client reads them locally.
 
-- **Six tools** — `search_meetings`, `get_meeting`, `list_recent_meetings`, `search_semantic`,
-  `get_open_commitments`, `get_entity_dossier`.
+- **Seven tools** — `search_meetings`, `get_meeting`, `list_recent_meetings`, `search_semantic`,
+  `get_open_commitments`, `get_entity_dossier`, and `org_search` (searches your Shared Brain, if you've
+  opted in).
 - **Same visibility gates as the app** — sealed-and-not-unlocked meetings are **invisible** here too, routed
   through the exact `visibility_clause` the UI uses.
 - **Token-protected by default** — a bearer token is **required** unless you turn it off.
@@ -291,7 +393,7 @@ The MCP config is shown (with a copy button) in **Settings → Privacy & Integra
 ## 🔒 Privacy & the lock model
 
 Privacy isn't a setting in Murmur — it's the architecture. The brain, transcription, and search are designed
-to run **without a network**.
+to run **without a network**, and every network path Murmur *does* have is opt-in and named.
 
 <p align="center">
   <img src="docs/screenshots/settings-privacy.png" alt="Privacy & integrations settings — honest about what leaves the device, plus the MCP config" width="860">
@@ -300,29 +402,34 @@ to run **without a network**.
 
 **What runs where — honestly:**
 
-| Brain / provider | Where it runs | Does meeting text leave your Mac? |
+| Brain / provider | Where it runs | Does meeting/note text leave your Mac? |
 | --- | --- | --- |
 | **On-device brain** (Bielik / Qwen GGUF) | Fully local | **No.** Grounded reasoning + the in-meeting assistant, on-device. |
-| **Ollama** | Fully local | **No.** Nothing leaves the device. |
+| **Ollama** | Fully local | **No.** Nothing leaves the device (loopback only — a remote Ollama host is treated as cloud). |
 | **Claude Code** (default summarizer) | Local CLI → Anthropic's cloud | **Yes** — the *redacted* transcript is sent to Anthropic. |
 | **Anthropic API** (BYO key) | Direct HTTPS → Anthropic | **Yes** — the *redacted* transcript is sent to Anthropic. |
-| **AI Gateway** (BYO OpenAI-compatible) | HTTPS → your gateway | **Yes** — the *redacted* transcript is sent to your endpoint. |
+| **AI Gateway** (BYO OpenAI-chat-compatible endpoint) | HTTPS → your endpoint | **Yes** — the *redacted* transcript is sent to your endpoint. |
 
 - 🧱 **Two encryption layers at rest.** The **whole** SQLite DB is **SQLCipher**-encrypted (key in the
-  macOS Keychain). On top, a **per-folder lock** adds **AES-256-GCM** content keys wrapped by a master KEK
-  released only by a **Touch ID** prompt — no app-side password.
-- 🚪 **Every read is gated.** A sealed-and-not-unlocked meeting leaks nothing — across the app, search, the
-  graph, MCP, and even the audio asset path. Its title shows as `🔒 Locked`.
+  macOS Keychain). On top, a **per-folder lock** adds **AES-256-GCM** content keys wrapped by a master
+  KEK, released only by a **Touch ID** prompt via the Keychain's own `SecAccessControl` — no app-side
+  password, no custom biometric code path.
+- 🚪 **Every read is gated.** A sealed-and-not-unlocked meeting or note leaks nothing — across the app,
+  search, the graph, MCP, and even the audio asset path. Its title shows as `🔒 Locked`.
 - ♻️ **Seals verify-before-destroy.** Murmur proves the ciphertext decrypts *before* it ever blanks the
   plaintext — content is never lost — and re-locking is fully reversible.
 - 🛡️ **Redaction firewall.** Emails, card-like numbers, and phone numbers are *always* scrubbed before any
-  cloud call; **person-name** redaction kicks in when the on-device NER model is installed.
-- ✅ **Cloud egress is fail-closed.** No meeting text reaches a cloud provider until you grant a one-time,
-  revocable consent — a flag a normal settings save can't flip.
-- 📊 **Content-free egress ledger.** A local ledger records *metadata only* — call counts, tokens, and how
-  many PII items were scrubbed — never the text that left.
+  cloud call; **person-name** redaction kicks in when the on-device NER model is installed. The exact
+  same firewall wraps Notes AI actions and Shared Brain publishes.
+- ✅ **Cloud egress is fail-closed.** No meeting or note text reaches a cloud provider — or your org's
+  Shared Brain — until you grant a one-time, revocable consent per surface. A normal settings save can't
+  flip it.
+- 📊 **Content-free egress ledger.** A local ledger records *metadata only* — call counts, tokens, bytes,
+  and how many PII items were scrubbed — never the text that left.
 - 📺 **Screen-share aware.** A best-effort watcher can auto-relock sealed folders and zeroize the cached key
-  the moment screen sharing is detected.
+  the moment screen sharing is detected; manual "Lock all" is the authoritative backstop.
+- 🌐 **Shared Brain stays zero-knowledge.** The relay never sees plaintext — only sealed, verified
+  ciphertext, wrapped keys, and metadata. Leaving an org purges its entire local replica from your Mac.
 
 > ⚠️ **Honest caveat:** Touch ID, lock-at-rest, and screen-share auto-relock only *truly* verify on a
 > **Developer-ID-signed build** (the published releases). An unsigned local dev build degrades biometrics to
@@ -343,17 +450,20 @@ to run **without a network**.
   </tr>
 </table>
 
-The **summarizer** is one `SummarizerProvider` trait with swappable backends — **`claude_code`**
-(default), **`anthropic`** (BYO Keychain key), **`ollama`** (local), and a BYO **OpenAI-compatible gateway**
-(LiteLLM / Kong / Portkey / vLLM). Per-feature **roles** (Notes / Ask / Live) can each point at a different
-connection. Separately, the heavy on-device ML — the **mistralrs** GGUF brain, the **candle** e5 embedder,
-and the **candle** DeBERTa NER redactor — is **always compiled in** (no cargo feature flags) and activates at
-runtime **only when its model files are present**, otherwise degrading to a clean no-op.
+The **summarizer / brain assistant** is one `SummarizerProvider` trait with swappable backends —
+**`claude_code`** (default), **`anthropic`** (BYO Keychain key), **`ollama`** (local), and a BYO
+**OpenAI-chat-compatible gateway** (works with LiteLLM, Portkey, vLLM, LM Studio, and others — the UI
+label "Kong AI Gateway" is just a display name for this generic connector, not a Kong partnership). Per-feature
+**roles** (Notes / Ask / Live) can each point at a different connection. Separately, the heavy on-device
+ML — the **mistralrs** GGUF brain (run as a killable, RAM-reclaiming sidecar process), the **candle** e5
+embedder, and the **candle** DeBERTa NER redactor — is **always compiled in** (no cargo feature flags) and
+activates at runtime **only when its model files are present**, otherwise degrading to a clean no-op.
 
 - 🧠 **On-device reasoners.** A curated GGUF registry — **Bielik-11B**, **Qwen3-14B**, **Qwen2.5-3B** — runs
-  locally via `mistralrs` (Metal). Download one and the on-device brain activates with grounded, cited
-  answers; nothing leaves your Mac. The full model-driven agentic tool-choice runs with a provider
-  connection (including local **Ollama**).
+  locally via `mistralrs` (Metal), in a separate process the app can fully kill to reclaim RAM on idle,
+  timeout, or quit. Download one and the on-device brain activates with grounded, cited answers; nothing
+  leaves your Mac. The full model-driven agentic tool-choice runs with a provider connection (including
+  local **Ollama**).
 - 🌐 **Optional live web** (off by default). A consent-gated **Brave** connector (BYO key) lets the brain
   reach the web when you ask it to; web hits are shown distinctly as "via web", and queries are redacted
   before they leave.
@@ -387,7 +497,7 @@ MURMUR_DEV_DEK=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef 
 **Quality gates**
 
 ```bash
-( cd src-tauri && cargo test --lib )   # ~128 fast unit tests (the inner loop)
+( cd src-tauri && cargo test --lib )   # fast unit tests (the inner loop)
 npx ng lint
 npx ng build
 bash scripts/ci.sh                      # full gate: clippy -D warnings + tests + lint + build + headless E2E
@@ -402,10 +512,11 @@ bash scripts/ci.sh                      # full gate: clippy -D warnings + tests 
 | Layer | Tech |
 | --- | --- |
 | **Shell** | Tauri 2.11 · Rust (edition 2021, toolchain 1.96) · macOS-first, universal (arm64 + x86_64), min macOS 13.4 |
-| **Frontend** | Angular 22 **zoneless** · standalone + signals · TypeScript 6.0 · `marked` + `DOMPurify` · **no NgRx** |
-| **Audio** | `cpal` · `whisper-rs` (Metal) · ScreenCaptureKit / Core Audio tap · `sherpa-onnx` diarization · offline AEC |
-| **On-device brain** | `mistralrs` (GGUF reasoner) · `candle` (e5 embeddings + DeBERTa NER) · `sqlite-vec` |
-| **Storage / crypto** | `rusqlite` + **SQLCipher** · `aes-gcm` + `zeroize` · macOS Keychain · Touch ID (`LAContext`) |
+| **Frontend** | Angular 22 **zoneless** · standalone + signals · TypeScript · `marked` + `DOMPurify` · **no NgRx** |
+| **Audio** | `cpal` · `whisper-rs` (Metal) · Core Audio tap / ScreenCaptureKit · `sherpa-onnx` diarization · optional Parakeet live-ASR · offline + online AEC |
+| **On-device brain** | `mistralrs` (GGUF reasoner, killable sidecar) · `candle` (e5 embeddings + DeBERTa NER) · `sqlite-vec` |
+| **Storage / crypto** | `rusqlite` + **SQLCipher** · `aes-gcm` + `zeroize` · macOS Keychain `SecAccessControl` (Touch ID) |
+| **Sharing backend** | `murmur-server` (sibling repo) — Rust/axum + Postgres, zero-knowledge relay, deployed on Railway; shared `murmur-protocol` wire format compiled into both this app and the server |
 
 ### 📂 Project layout
 
@@ -414,22 +525,49 @@ murmur/
 ├─ src/             Angular 22 frontend (standalone, zoneless, signals)
 │  └─ app/
 │     ├─ core/        ipc.service.ts · models.ts · recorder.store.ts · meeting-conversation.store.ts
-│     └─ features/    record · library · detail · folders · graph · ask · brain · analytics · settings · onboarding · bar
+│     └─ features/    record · library · detail · folders · graph · ask · brain · notes · org · people ·
+│                      briefs · sharing · analytics · settings · onboarding · bar
 ├─ src-tauri/       Rust core (Tauri 2)
-│  └─ src/           commands.rs · pipeline.rs · reason.rs · embed.rs · mcp.rs · crypto.rs · audio/ · transcribe/ · summarize/ · storage/ · secrets/ · export/
+│  └─ src/           commands.rs · pipeline.rs · agent.rs · tools.rs · router.rs · embed/ · mcp.rs · crypto.rs ·
+│                      audio/ · transcribe/ · summarize/ · share/ · storage/ · secrets/ · export/
 └─ docs/            design notes, research, branding, screenshots
 ```
+
+`../murmur-server/` (a sibling checkout, not part of this repo) holds the accounts + sharing backend —
+`crates/murmur-protocol` (the E2EE envelope + wire format, MIT/Apache) and `crates/murmur-server` (the
+axum + Postgres relay, AGPL-3.0).
 
 ---
 
 ## 🗺️ Status
 
-Murmur ships at **v0.6.4** — a signed, notarized macOS app. The full record → transcribe → summarize
-pipeline, the conversation-first record screen with in-meeting `@brain` threads, the on-device brain +
-semantic search, the `/brain` knowledge hub, the per-folder Touch ID lock, the knowledge graph,
-Ask-Your-Vault, and the MCP server are all implemented. Some capabilities — live ScreenCaptureKit capture,
-the Touch ID prompt, and screen-share auto-relock — can only be *fully* exercised on a signed build on a
-real Mac, and are documented as such.
+Murmur ships at **v0.9.6** — a signed, notarized macOS app, roughly 20 releases past the record →
+transcribe → summarize MVP.
+
+**Shipped and in daily use:**
+- The full record → transcribe → summarize pipeline, dual-stream capture, the conversation-first record
+  screen with in-meeting `@brain` threads, and the floating recorder bar.
+- The on-device brain (agentic tool-use loop + hybrid FTS/semantic/entity-graph retrieval), the `/brain`
+  knowledge hub, Ask-Your-Vault, and the knowledge graph.
+- **Notes** as a full standalone product — editor, note folders with their own lock lifecycle, AI
+  auto-organize, and the 19-action AI command menu.
+- **Shared Brain** — free, opt-in, end-to-end-encrypted org sharing of notes and meetings, multi-org
+  aware, auto-refreshing, with its own MCP tool.
+- The per-folder Touch ID lock model (two encryption layers, gated reads, verify-before-destroy seals),
+  the content-free egress ledger, and the read-only MCP server.
+- Per-note and per-meeting expiring E2EE link sharing.
+
+**Honest gaps, not yet shipped or only partially proven:**
+- A retrieval router module exists in code but is explicitly shadow-mode — not yet wired into live
+  dispatch. Treat it as internal plumbing, not a user-facing capability.
+- The on-device reranker seam is wired but currently measured to add no retrieval-quality lift yet.
+- Cloud transcription is **not** a shipped path — all transcription today is on-device
+  (`whisper.cpp` / optional Parakeet); a cloud-ASR option exists only as a research note, not code.
+- Live ScreenCaptureKit / Core Audio tap capture, the Touch ID prompt, and screen-share auto-relock can
+  only be *fully* exercised on a signed build on a real Mac, and are documented as such rather than
+  claimed from unit tests alone.
+- A live, two-account, signed-build round-trip of Shared Brain sharing is still validated manually per
+  release rather than by an automated headless test.
 
 ## 📄 License
 
