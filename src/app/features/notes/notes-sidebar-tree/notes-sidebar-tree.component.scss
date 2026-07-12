@@ -2,8 +2,11 @@
    the ALWAYS-VISIBLE main sidebar (see AppShellComponent). The ROW VISUAL
    (container/indent/hover/selected pill/icon/label) lives in the shared
    `<mur-tree-row>` (design-system, 2026-07-12 consolidation — the SAME
-   component the Meetings tree's rows use); this file keeps only the trailing
-   action cluster + the inline create/rename/delete-confirm forms.
+   component the Meetings tree's rows use); this file keeps only the lock/
+   unlock icon + the inline create/rename/delete-confirm forms. Rename/Delete
+   live behind the shared `<mur-row-menu>` dropdown (design-system,
+   `row-menu.component.ts`) — its trigger/panel chrome is NOT duplicated
+   here.
    NO host padding-left (2026-07-12, user request: the folder rows sat too
    far right of their section header) — the rows' own 20px caret gutter
    already provides the visual nesting step; matches
@@ -62,10 +65,6 @@ mur-tree-row:focus-within .tree-actions {
 .tree-act:disabled {
   opacity: 0.45;
   cursor: default;
-}
-.tree-act--danger:hover:not(:disabled) {
-  color: var(--danger);
-  background: var(--danger-soft);
 }
 
 /* Inline folder create / rename field + delete confirm. */

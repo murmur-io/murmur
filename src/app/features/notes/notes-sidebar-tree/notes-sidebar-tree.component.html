@@ -47,6 +47,10 @@
         (activate)="select(folder.id)"
       >
         <div class="tree-actions">
+          <!-- Lock/unlock stays its own always-in-cluster control — this
+               tree's lock state was never a glanceable badge outside hover
+               to begin with (unlike Meetings' `.lock-toggle`), so folding it
+               into the shared dropdown below loses nothing. -->
           @if (folder.locked) {
             <button
               type="button"
@@ -76,28 +80,34 @@
               </svg>
             </button>
           }
-          <button
-            type="button"
-            class="tree-act"
-            (click)="startRename(folder, $event)"
-            aria-label="Rename folder"
-            title="Rename"
+
+          <!-- Rename + Delete — behind the SAME shared `<mur-row-menu>` gear
+               dropdown the Meetings tree renders (design-system,
+               `row-menu.component.ts`). Same items, same order, so the two
+               trees' dropdowns are actually — not just measurably —
+               identical. -->
+          <mur-row-menu
+            #actions
+            [label]="'Actions for ' + folder.name"
+            [disabled]="lockBusyId() === folder.id || folderBusy()"
           >
-            <svg viewBox="0 0 16 16" width="12" height="12" fill="none" aria-hidden="true">
-              <path d="M11 2.7l2.3 2.3-7.4 7.4-2.8.6.6-2.8z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" />
-            </svg>
-          </button>
-          <button
-            type="button"
-            class="tree-act tree-act--danger"
-            (click)="askDeleteFolder(folder, $event)"
-            aria-label="Delete folder"
-            title="Delete"
-          >
-            <svg viewBox="0 0 16 16" width="12" height="12" fill="none" aria-hidden="true">
-              <path d="M4 4.5h8M6.5 4.5V3.2h3v1.3M5 4.5l.5 8h5l.5-8" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" />
-            </svg>
-          </button>
+            <button
+              type="button"
+              class="menu-item"
+              role="menuitem"
+              (click)="actions.close(); startRename(folder, $event)"
+            >
+              Rename
+            </button>
+            <button
+              type="button"
+              class="menu-item menu-item-danger"
+              role="menuitem"
+              (click)="actions.close(); askDeleteFolder(folder, $event)"
+            >
+              Delete
+            </button>
+          </mur-row-menu>
         </div>
       </mur-tree-row>
     }
