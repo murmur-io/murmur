@@ -19,6 +19,9 @@ import { BrainRevealCardComponent } from "../brain-reveal-card/brain-reveal-card
 import { ReTruthCardComponent } from "../re-truth-card/re-truth-card.component";
 import { MeetingConversationStore } from "../../../core/meeting-conversation.store";
 
+/** localStorage key for the permanent "no vault set" notice dismissal. */
+const VAULT_NOTICE_DISMISSED_KEY = "murmur-vault-notice-dismissed";
+
 @Component({
   selector: "app-record",
   changeDetection: ChangeDetectionStrategy.OnPush,
@@ -155,16 +158,30 @@ export class RecordComponent implements OnInit {
     return !c || !c.vaultPath || c.vaultPath.trim() === "";
   });
 
-  /** Dismissed for this session — the no-vault info notice stays hidden once closed. */
-  private readonly vaultNoticeDismissed = signal(false);
+  /**
+   * Dismissed permanently (localStorage — live-found bug, 2026-07-12: this used
+   * to be a plain component-local signal, so it "forgot" the dismissal on the
+   * very next remount, e.g. navigating away and back to /record within the
+   * same session — mirrors {@link BrainRevealCardComponent}'s one-time-seen
+   * pattern). Re-appears only if a vault gets configured then unset again.
+   */
+  private readonly vaultNoticeDismissed = signal(this.readVaultNoticeDismissed());
 
   /**
    * Show the calm, non-blocking "no vault set" info notice: only when no vault is configured
-   * and the user hasn't dismissed it this session. It never gates recording.
+   * and the user hasn't dismissed it. It never gates recording.
    */
   readonly showVaultNotice = computed(
     () => this.vaultMissing() && !this.vaultNoticeDismissed(),
   );
+
+  private readVaultNoticeDismissed(): boolean {
+    try {
+      return localStorage.getItem(VAULT_NOTICE_DISMISSED_KEY) === "1";
+    } catch {
+      return false;
+    }
+  }
 
   /**
    * True when the last failure was the backend's cloud-egress consent gate. We
@@ -405,9 +422,14 @@ export class RecordComponent implements OnInit {
     this.nudgeDismissed.set(true);
   }
 
-  /** No-vault info-notice dismiss — hide it for the rest of this session. */
+  /** No-vault info-notice dismiss — permanent (localStorage), not just this session. */
   dismissVaultNotice(): void {
     this.vaultNoticeDismissed.set(true);
+    try {
+      localStorage.setItem(VAULT_NOTICE_DISMISSED_KEY, "1");
+    } catch {
+      /* private-mode / storage-disabled — session-only dismissal is fine. */
+    }
   }
 
   /** ⌘R / Ctrl+R toggles recording. */

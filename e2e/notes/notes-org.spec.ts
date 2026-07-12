@@ -160,15 +160,24 @@ test("clicking an org shared item routes to the read-only /org-item viewer", asy
   await page.goto("/notes");
   await expect(page.locator(".notes-content")).toBeVisible();
 
-  // Click the org row's title link → the read-only org-item viewer route.
+  // Click the org row's title button → the read-only org-item viewer route
+  // (2026-07-12: now a <button> routed through TabsService, not a plain
+  // [routerLink] <a> — org items open as a tracked tab like a note/meeting).
   await page
     .locator(".mur-table tbody tr", { hasText: "Team Roadmap Q3" })
-    .locator(".title-link")
+    .locator(".title-btn")
     .click();
   await expect(page).toHaveURL(/\/org-item\/oi1$/);
   // The viewer rendered the decrypted org item body (read-only, no editor).
   await expect(page.locator("app-org-item-viewer")).toBeVisible();
   await expect(page.getByText("Ship the org brain.")).toBeVisible();
+
+  // RED-before-GREEN (live-found bug, 2026-07-12): an org item used to open
+  // as a full-page navigation with NO tab-strip entry, unlike an owned note —
+  // it must now register as a tracked, switchable tab exactly like one.
+  await expect(
+    page.locator(".tab-strip .tab-label", { hasText: "Team Roadmap Q3" }),
+  ).toBeVisible();
 
   expect(consoleErrors).toEqual([]);
 });

@@ -10,6 +10,8 @@ import { toSignal } from "@angular/core/rxjs-interop";
 import { ActivatedRoute, Router } from "@angular/router";
 import { map } from "rxjs";
 import { IpcService } from "../../../core/ipc.service";
+import { TabsService } from "../../../core/tabs.service";
+import { tabKeyFor } from "../../../core/tab-keys";
 import type { OrgItemDetail } from "../../../core/models";
 import { MarkdownComponent } from "../../../shared/markdown/markdown.component";
 
@@ -43,6 +45,7 @@ export class OrgItemViewerComponent {
   private readonly route = inject(ActivatedRoute);
   private readonly router = inject(Router);
   private readonly injector = inject(Injector);
+  private readonly tabsService = inject(TabsService);
 
   /** The `:id` route param as a signal (re-fetches when it changes in place). */
   private readonly itemId = toSignal(
@@ -125,6 +128,10 @@ export class OrgItemViewerComponent {
         return; // stale — the route moved on under us
       }
       this._item.set(item);
+      // Adopt the real title (mirrors note-editor's setTitle) — the caller
+      // already passes a best-known title when opening the tab, but this
+      // corrects it once the authoritative decrypted detail loads.
+      this.tabsService.setTitle(tabKeyFor("org-item", id), item.title || "Shared note");
       void this.resolveOrgName(id);
     } catch (e) {
       if (this.itemId() !== id) {

@@ -243,16 +243,9 @@
         }
       </header>
 
-      @if (orgUnclassifiedCount() > 0) {
-        <p class="org-unclassified-note text-muted">
-          {{ orgUnclassifiedCount() }}
-          {{ orgUnclassifiedCount() === 1 ? "item" : "items" }} from this
-          shared brain couldn’t be classified as a meeting or a note (shared
-          before that distinction existed) — not shown here.
-        </p>
-      }
-
-      @if (orgsLoading()) {
+      @if (orgListEmpty() && orgsLoading()) {
+        <!-- Stale-while-revalidate: gate on loading ONLY when there's nothing
+             cached yet — see the pattern note in angular-zoneless.md §8. -->
         <div class="card state-card">
           <p class="empty">Loading…</p>
         </div>
@@ -271,7 +264,9 @@
             <li>
               <a
                 class="row"
-                [routerLink]="orgItemLink(it.item)"
+                tabindex="0"
+                (click)="openOrgCard($event, it.item)"
+                (keydown.enter)="openOrgCard($event, it.item)"
                 [style.animation-delay.ms]="i * 35"
               >
                 <span class="row-main">
@@ -282,6 +277,13 @@
                       <span class="dot" aria-hidden="true">·</span>
                     }
                     <span class="date">{{ formatDate(it.item.createdAt) }}</span>
+                    @if (it.unclassified) {
+                      <span class="dot" aria-hidden="true">·</span>
+                      <span
+                        class="unclassified-hint"
+                        title="Shared before Murmur could tell meetings and notes apart — shown here as a best guess."
+                      >unclassified</span>
+                    }
                   </span>
                 </span>
                 <span class="row-aside">
@@ -308,7 +310,9 @@
         }
       </header>
 
-      @if (listLoading()) {
+      @if (listEmpty() && listLoading()) {
+        <!-- Stale-while-revalidate: gate on loading ONLY when there's nothing
+             cached yet — see the pattern note in angular-zoneless.md §8. -->
         <div class="card state-card">
           <p class="empty">Loading…</p>
         </div>
