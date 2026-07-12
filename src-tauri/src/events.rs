@@ -360,9 +360,10 @@ mod tests {
         assert_eq!(json, r#"{"orgsChanged":3}"#);
     }
 
-    /// The global org auto-sync cadence is 2 minutes (guards the 300→120 change from regressing).
+    /// The global org auto-sync cadence is 1 minute (guards the 120→60 change — members have no push,
+    /// only this pull, so it bounds a colleague's shared-note visibility to ~1 min).
     #[test]
-    fn org_sync_tick_cadence_is_two_minutes() {
-        assert_eq!(crate::commands::ORG_SYNC_TICK_SECS, 120);
+    fn org_sync_tick_cadence_is_one_minute() {
+        assert_eq!(crate::commands::ORG_SYNC_TICK_SECS, 60);
     }
 }
