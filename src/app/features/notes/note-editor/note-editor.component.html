@@ -10,29 +10,10 @@
     ></button>
   }
 
-  <!-- ===== Sticky header: back · breadcrumb+Move · Edit/Preview · Share · ⋯ ===== -->
+  <!-- ===== Sticky header: breadcrumb+Move · Edit/Preview · Share · ⋯ =====
+       No local "← Notes" back button (2026-07-12): the main sidebar is ALWAYS
+       visible now, so it IS the way back — see NavHistoryService. -->
   <header class="editor-head">
-    <button
-      type="button"
-      class="rail-back"
-      (click)="back()"
-      aria-label="Back to Notes"
-    >
-      <svg
-        class="rail-back-icon"
-        viewBox="0 0 16 16"
-        fill="none"
-        stroke="currentColor"
-        stroke-width="1.6"
-        stroke-linecap="round"
-        stroke-linejoin="round"
-        aria-hidden="true"
-      >
-        <path d="M9.5 3.5 5 8l4.5 4.5" />
-      </svg>
-      <span class="rail-back-label">Notes</span>
-    </button>
-
     @if (note(); as doc) {
       @if (!doc.locked) {
         <!-- Folder breadcrumb + Move menu (opaque overlay, T3). -->
@@ -146,12 +127,29 @@
           </button>
           @if (menu() === "more") {
             <div class="menu head-menu is-right" role="menu">
-              @if (doc.shared) {
-                <p class="menu-group-label">Shared</p>
-              }
-              <button type="button" class="menu-item" role="menuitem" (click)="exportNote()">
-                Save to vault &amp; reveal
+              <p class="menu-group-label">Display</p>
+              <button
+                type="button"
+                class="menu-item menu-item-check"
+                role="menuitemcheckbox"
+                [attr.aria-checked]="fullWidth()"
+                (click)="toggleFullWidth()"
+              >
+                Full width
+                @if (fullWidth()) {
+                  <svg class="menu-check" viewBox="0 0 16 16" width="13" height="13" fill="none" aria-hidden="true">
+                    <path d="M3.5 8.5l3 3 6-7" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" />
+                  </svg>
+                }
               </button>
+              <div class="menu-group">
+                @if (doc.shared) {
+                  <p class="menu-group-label">Shared</p>
+                }
+                <button type="button" class="menu-item" role="menuitem" (click)="exportNote()">
+                  Save to vault &amp; reveal
+                </button>
+              </div>
               @if (doc.exportedPath) {
                 <p class="menu-path">{{ doc.exportedPath }}</p>
               }
@@ -220,7 +218,7 @@
           </button>
         </div>
       } @else {
-        <article class="note-doc">
+        <article class="note-doc" [class.is-full-width]="fullWidth()">
           <!-- Title -->
           <input
             #titleInput

@@ -246,6 +246,7 @@ app-shell {
 .sidebar-settings,
 .sidebar-collapse {
   display: flex;
+  flex: none;
   align-items: center;
   gap: var(--space-3);
   width: 100%;
@@ -290,6 +291,26 @@ app-shell {
 .sidebar-nav a.active .nav-icon,
 .sidebar-settings.active .nav-icon {
   color: var(--shell-active-icon);
+}
+/* The expandable-section shell (header row + "All meetings"/"All notes" root
+   row) that used to be duplicated here for Notes AND Meetings is now ONE
+   component, `<mur-sidebar-section>` (src/app/design-system/sidebar-section —
+   consolidated 2026-07-12 after four rounds of style drift between the two
+   copies). Its own `.nav-row-*`/`.root-row` classes live in that component's
+   scoped scss now; `.group-chev`'s rotate-on-open animation stays global
+   (shared with the Insights group toggle below, which isn't part of that
+   component). */
+/* `<mur-sidebar-section>` is a direct child of the `.sidebar-nav` flex
+   COLUMN — `flex: none` defensively pins its own box to its content's
+   natural (fixed-row-height) size, so it's never a candidate for the
+   column's default `flex-shrink: 1` to compress at a short window height
+   (investigated 2026-07-12: not reproduced empirically — `.sidebar-nav`'s
+   `min-height: 0` + `overflow-y: auto` already makes IT the sole scrolling
+   region at every tested height down to 320px — but this is the right
+   belt-and-suspenders row-height guarantee regardless). The projected tree-
+   body components pick up the SAME guarantee from their own `:host` rules. */
+mur-sidebar-section {
+  flex: none;
 }
 /* --- Sidebar groups (QUIET GLASS): labeled clusters; Insights collapses ---- */
 .sidebar-group-label {
@@ -517,16 +538,69 @@ app-shell {
   white-space: nowrap;
 }
 
-/* --- Main content column: centered max-width, beside the sidebar ----------- */
+/* --- Main column: [tab strip, app-main] stacked, beside the sidebar --------
+   `.main-col` is the flex ROW item that used to be `.app-main` directly —
+   now a flex COLUMN so `mur-tab-strip` (when it renders, i.e. tabs are open)
+   is a REAL sibling above `.app-main`, genuinely pushing it down via normal
+   box flow. `.app-main` itself is UNCHANGED (same max-width/centering/
+   padding every routed page already assumes). */
+.main-col {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+/* Pill mode: no sidebar in the flex row — clear the floating pill instead.
+   Moved here (was on `.app-main`) so it also clears the tab strip, which
+   now lives ABOVE `.app-main` inside this same column. */
+app-shell.pill-mode .main-col { padding-top: 84px; }
+/* Sidebar/rail mode: align `mur-tab-strip`'s row with the sidebar PANEL's own
+   top edge (2026-07-12, second alignment fix — the first attempt matched the
+   58px offset of the sidebar's internal "Search" row, which is itself pushed
+   down by `.sidebar-drag`'s 48px traffic-light clearance. That clearance only
+   exists because the macOS traffic lights sit over the LEFT side of the
+   window, inside the sidebar's own drag region — the tab strip, over on the
+   right, has no traffic lights to clear, so matching the Search row put the
+   tabs ~48px too low and they read as floating well below the sidebar's own
+   top edge instead of level with it). The sidebar panel's visible top edge is
+   `margin-top: 10px` (`.app-sidebar`) — that is the correct alignment target.
+   `[class.sidebar-visible]` (AppShellComponent host binding) is false for
+   drill-down/pill-bar routes, so this margin never fights `--tabs-strip-height`
+   (the literal those routes' fixed hosts read for their own offset) or the
+   pill-mode padding above. */
+app-shell.sidebar-visible .main-col { margin-top: 10px; }
+/* `.app-main` fills the whole content pane on EVERY main route (2026-07-12,
+   user request "W innych głównych widokach też popraw aby było jednolicie
+   wszędzie" — the third and FINAL step of the width unification: Notes first,
+   then Meetings, now everything). It used to carry a global
+   `max-width: var(--content-max)` (840px) reading-column cap that
+   Notes/Meetings escaped via a per-route `notes-wide-route` class — that
+   class, its AppShellComponent host binding and its override rule are now
+   DELETED. A child's `max-width` can never exceed a narrower ANCESTOR's
+   rendered box, so the ancestor cap silently re-clamped whatever width each
+   view asked for (`.notes-table`'s 100%, the editor's `--editor-max`/"Full
+   width" `min(1600px, 92%)`, …). With the cap gone, any view that WANTS a
+   narrower column owns that constraint itself, in its own component scss
+   — `/settings` and the note editor already do (`settings.component.scss`'s
+   own `--content-max`, `note-editor.component.scss`'s `--editor-max`); at
+   1440px+ `/record` and `/ask` were measured to fill the full pane without
+   their content looking stretched/broken, so neither needed one — a future
+   pass can add a cap to THAT component's scss if it decides otherwise, not
+   back onto `.app-main`. The horizontal padding below is untouched so
+   content still never hugs the viewport/sidebar edges. `width: 100%` is load-bearing, not
+   decorative: `margin: 0 auto` sets auto CROSS-AXIS margins on this
+   column-flex item, which per the flexbox spec suppress
+   `align-items: stretch` — without an explicit width `.app-main` would
+   shrink-to-fit its content's preferred width (~530px measured on the editor
+   route in a 1440px window) instead of filling `.main-col`. */
 .app-main {
   flex: 1 1 auto;
   min-width: 0;
-  max-width: var(--content-max);
+  max-width: none;
+  width: 100%;
   margin: 0 auto;
   padding: var(--space-7) var(--space-5) var(--space-8);
 }
-/* Pill mode: no sidebar in the flex row — clear the floating pill instead. */
-app-shell.pill-mode .app-main { padding-top: 84px; }
 .toast-viewport {
   position: fixed;
   right: var(--space-5);

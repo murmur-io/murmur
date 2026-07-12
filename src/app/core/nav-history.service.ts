@@ -7,28 +7,30 @@ import { filter, map, scan, startWith } from "rxjs";
 const DEFAULT_APP_ROUTE = "/record";
 
 /**
- * A "drill-down" is a route that HIDES the primary rail so the current flow owns
- * the window with its own back-affordance: Settings, Meetings/Library, a
- * meeting's detail (`/meeting/:id`), AND Notes (`/notes` home + `/notes/:id`
- * editor) — the Notes home owns its own [rail | content] layout and the editor
- * stays "inside" the Notes flow, so the primary rail must NOT reappear there.
- * The "← Murmur" back target must be a NON-drill-down route, so both this service
- * and app-shell's rail-hide gate share this single predicate. Keep the two in
- * lockstep — a new drill-down route added here is also hidden in app-shell.
+ * A "drill-down" is a route that HIDES the primary rail so the current flow
+ * owns the window with its own back-affordance. The "← Murmur" back target
+ * must be a NON-drill-down route, so both this service and app-shell's
+ * rail-hide gate share this single predicate. Keep the two in lockstep — a
+ * new drill-down route added here is also hidden in app-shell.
+ *
+ * Notes (`/notes` home + `/notes/:id` editor, Stage 1, 2026-07-12) and
+ * Meetings/meeting-detail (`/library`, `/meeting/:id`, Stage 2, same day) are
+ * DELIBERATELY NOT drill-downs — Notion/Obsidian-style always-visible
+ * sidebar: the primary rail now hosts BOTH folder trees directly
+ * (`NotesSidebarTreeComponent`, `MeetingsSidebarTreeComponent`), so
+ * `NotesHomeComponent`/`NoteEditorComponent`/`LibraryComponent` render as
+ * normal in-flow content beside the sidebar, like `/record`, with no local
+ * back-affordance (`DetailComponent`, `/meeting/:id`, never had one to begin
+ * with — its own "← Meetings" is a plain in-page breadcrumb link, not the
+ * rail-hiding drill-down chrome, so it needed no structural change here).
+ *
+ * `/settings` and the org-item viewer (`/org-item`, reached from an org card
+ * inside Notes) are STILL drill-downs for now — each retains its own
+ * "← Murmur" back button and hides the primary rail, until a later stage
+ * folds them into the same model too.
  */
 export function isDrilldownRoute(url: string): boolean {
-  return (
-    url.startsWith("/settings") ||
-    url.startsWith("/library") ||
-    url.startsWith("/meeting") ||
-    url.startsWith("/notes") ||
-    // The org-item viewer is "inside" the Notes flow (reached from an org card; its
-    // own Back returns to /notes). Treating it as a drill-down (a) hides the primary
-    // rail so it owns the window like the note editor, and (b) keeps it OUT of
-    // `_lastAppRoute` so the Notes "← Murmur" affordance returns to the real prior
-    // app view (/record), not back into an org-item viewer.
-    url.startsWith("/org-item")
-  );
+  return url.startsWith("/settings") || url.startsWith("/org-item");
 }
 
 /**

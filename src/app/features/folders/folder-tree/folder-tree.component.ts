@@ -16,7 +16,6 @@ import { FoldersService } from "../../../services/folders.service";
 import { ToastService } from "../../../services/toast.service";
 import type { FolderNode } from "../../../core/models";
 import { FolderRowComponent } from "../folder-row/folder-row.component";
-import { FolderDropDirective } from "../folder-drop.directive";
 
 /**
  * The recursive folder tree. Renders `nodes` as {@link FolderRowComponent}s; the
@@ -24,13 +23,18 @@ import { FolderDropDirective } from "../folder-drop.directive";
  * `app-folder-tree`, never a nested `@for` of rows. This component is reused at
  * every depth (the row passes `depth + 1`).
  *
- * At the ROOT (depth 0) it also owns:
- *  - a "Vault root" pseudo-row so notes can be selected/moved to no folder, and
- *  - an inline "New folder" create affordance (text field + confirm). Focus is
- *    moved into the field with `afterNextRender` (no `setTimeout`); creation
- *    delegates to {@link FoldersService.create}, which reloads the tree.
+ * At the ROOT (depth 0) it also owns an inline "New folder" create affordance
+ * (text field + confirm — the entry TRIGGER is `<mur-sidebar-section>`'s "+"
+ * icon now, forwarded via `openCreate()`). Focus is moved into the field with
+ * `afterNextRender` (no `setTimeout`); creation delegates to
+ * {@link FoldersService.create}, which reloads the tree. The "Vault root"
+ * pseudo-row (2026-07-12: MOVED to `<mur-sidebar-section>`'s "All meetings"
+ * root row, alongside Notes' identical "All notes" — see that component)
+ * used to live here too.
  *
- * Selection bubbles up via the `select` output (folder id, or null for root).
+ * Selection bubbles up via the `select` output (a real folder id only now —
+ * the root/`null` case is handled by `<mur-sidebar-section>`'s own
+ * `rootSelect` output instead).
  */
 @Component({
   selector: "app-folder-tree",
@@ -42,7 +46,7 @@ import { FolderDropDirective } from "../folder-drop.directive";
   // below instantiates an `app-folder-row` — exactly the "view breaks after
   // adding the first folder" bug. `forwardRef` defers the lookup, breaking the
   // cycle. (See folder-row for the mirror.)
-  imports: [FolderDropDirective, forwardRef(() => FolderRowComponent)],
+  imports: [forwardRef(() => FolderRowComponent)],
   templateUrl: "./folder-tree.component.html",
   styleUrl: "./folder-tree.component.scss",
 })
@@ -57,6 +61,16 @@ export class FolderTreeComponent {
   readonly selectedId = input<string | null>(null);
   /** Indent depth (0 at the roots; the inline create only shows at the root). */
   readonly depth = input<number>(0);
+  /**
+   * Whether `selectedId` should render as visually SELECTED (the pill) —
+   * default `true` (unchanged for any other consumer). `MeetingsSidebarTree
+   * Component` passes `false` while `/library`/`/meeting/:id` isn't the
+   * current route (2026-07-12 fix), so a remembered last-selected folder
+   * doesn't misleadingly show as "active" while looking at a different page.
+   * Threaded through recursively to `FolderRowComponent` → nested
+   * `app-folder-tree` levels, same as `depth`.
+   */
+  readonly selectionActive = input<boolean>(true);
 
   /** Bubbles the chosen folder id (or null for the vault root) to the screen. */
   readonly selected = output<string | null>();
@@ -79,7 +93,14 @@ export class FolderTreeComponent {
   private readonly nameInput =
     viewChild<ElementRef<HTMLInputElement>>("nameInput");
 
-  /** Open the inline create field and move focus into it once it has rendered. */
+  /**
+   * Open the inline create field and move focus into it once it has rendered.
+   * Public so `MeetingsSidebarTreeComponent` can forward the main sidebar's
+   * compact "+" icon (next to the "Meetings" section header,
+   * `AppShellComponent`, 2026-07-12) into this call — the tree no longer
+   * renders its own entry-trigger button (was a full-width dashed row that
+   * read as duplicate UI next to Notes' identical one).
+   */
   openCreate(): void {
     this.draftName.set("");
     this.creating.set(true);

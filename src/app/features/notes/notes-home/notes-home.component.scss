@@ -1,182 +1,29 @@
-/* Notes is a full drill-down (L2): app-shell hides the primary rail and this
-   fixed host fills the window as a flush-left [note-folder rail | content]
-   layout, below the toast viewport. Mirrors library.component. */
-:host {
-  position: fixed;
-  inset: 0;
-  z-index: 5;
-  display: block;
-  background: var(--surface-base);
-}
-
-/* Two-pane shell: full-height folder rail + scrolling notes content. */
+/* Notes is now a normal in-flow route (2026-07-12, Notion/Obsidian-style
+   always-visible sidebar) — it renders in `.app-main` beside `<mur-sidebar>`,
+   exactly like `/record`. No fixed full-window host, no local rail: the
+   note-folder tree lives in the main sidebar's `NotesSidebarTreeComponent`. */
 .notes {
-  display: grid;
-  grid-template-columns: 268px minmax(0, 1fr);
-  height: 100vh;
-  height: 100dvh;
-}
-
-/* --- Left pane: note-folder rail (shared floating glass panel) --- */
-.folders-pane {
-  gap: var(--space-2);
+  display: flex;
+  flex-direction: column;
+  min-height: calc(100vh - var(--space-8));
   animation: notes-enter 300ms cubic-bezier(0.22, 1, 0.36, 1) both;
 }
 
-/* Enter transition — TRANSFORM ONLY (the fixed :host is opaque, so an opacity
-   fade would flash the base color). Mirrors the library rail glide. */
 @keyframes notes-enter {
   from {
+    opacity: 0;
     transform: translateY(8px);
   }
   to {
+    opacity: 1;
     transform: translateY(0);
   }
 }
 
-/* Top drag strip — mirrors the primary rail (traffic-light clearance). */
-.rail-drag {
-  flex: none;
-  height: 30px;
-}
-
-/* "← Murmur" drill-down up-affordance. */
-.rail-back {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
-  width: 100%;
-  height: 34px;
-  padding: 0 var(--space-2);
-  border: 0;
-  border-radius: var(--radius-md);
-  background: transparent;
-  color: var(--text-secondary);
-  font: inherit;
-  font-size: 0.9rem;
-  font-weight: 600;
-  letter-spacing: -0.01em;
-  text-align: left;
-  cursor: pointer;
-  transition:
-    background var(--transition-fast),
-    color var(--transition-fast);
-}
-.rail-back:hover {
-  background: var(--surface-hover);
-  color: var(--text-primary);
-}
-.rail-back:focus-visible {
-  outline: none;
-  color: var(--text-primary);
-  box-shadow: 0 0 0 3px var(--accent-ring);
-}
-.rail-back-icon {
-  flex: none;
-  width: 16px;
-  height: 16px;
-}
-
-.folders-head {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
-  margin-bottom: var(--space-2);
-  min-height: 24px;
-}
-.folders-title {
-  margin: 0;
-  padding: 0 var(--space-2);
-  color: var(--text-muted);
-  font-size: 0.75rem;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-}
-
-/* The lean note-folder list scrolls independently within the fixed rail. */
-.folders-body {
-  flex: 1 1 auto;
-  min-height: 0;
-  overflow-y: auto;
-  display: flex;
-  flex-direction: column;
-  gap: 1px;
-}
-
-.folder-row {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
-  width: 100%;
-  padding: var(--space-2);
-  border: 0;
-  border-radius: var(--radius-md);
-  background: transparent;
-  color: var(--text-secondary);
-  font: inherit;
-  font-size: 0.9rem;
-  text-align: left;
-  cursor: pointer;
-  transition:
-    background var(--transition-fast),
-    color var(--transition-fast);
-}
-.folder-row:hover {
-  background: var(--surface-hover);
-  color: var(--text-primary);
-}
-.folder-row:focus-visible {
-  outline: none;
-  box-shadow: 0 0 0 3px var(--accent-ring);
-}
-.folder-row.is-selected {
-  background: var(--accent-soft);
-  color: var(--text-primary);
-}
-.folder-icon {
-  flex: none;
-  display: inline-flex;
-  color: var(--text-muted);
-}
-.folder-name {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-/* --- Rail: "Shared brains" (orgs) section --- */
-.org-head {
-  /* A quiet divider above the section so it reads as a distinct group. */
-  margin-top: var(--space-3);
-  padding-top: var(--space-3);
-  border-top: 1px solid var(--border-subtle);
-}
-.org-body {
-  /* The org list sits under the folder list; it does not need its own scroll. */
-  flex: 0 0 auto;
-  overflow: visible;
-}
-.org-row {
-  cursor: pointer;
-}
-/* A quiet role hint (Owner / Member) trailing the org name. */
-.org-role {
-  flex: none;
-  margin-left: auto;
-  font-size: 0.62rem;
-  letter-spacing: 0.03em;
-  text-transform: uppercase;
-  color: var(--text-muted);
-  background: var(--surface-raised);
-}
-
-/* --- Right pane: note list --- */
+/* --- Content pane --- */
 .notes-content {
   display: flex;
   flex-direction: column;
-  height: 100vh;
-  height: 100dvh;
   min-width: 0;
 }
 
@@ -185,9 +32,7 @@
   align-items: center;
   justify-content: space-between;
   gap: var(--space-3);
-  padding: var(--space-6) var(--space-6) var(--space-4);
-  /* Reserve room for the overlay traffic lights on the right-pane top edge. */
-  padding-top: var(--space-6);
+  margin-bottom: var(--space-4);
 }
 .content-title {
   margin: 0;
@@ -200,11 +45,43 @@
   gap: var(--space-2);
 }
 
+/* --- Shared brains (orgs) chip row --- */
+.org-chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin-bottom: var(--space-4);
+}
+.org-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  cursor: pointer;
+  border: 1px solid var(--border-subtle);
+  background: var(--surface-raised);
+  color: var(--text-secondary);
+  transition:
+    background var(--transition-fast),
+    color var(--transition-fast),
+    border-color var(--transition-fast);
+}
+.org-chip:hover {
+  color: var(--text-primary);
+  border-color: var(--border-strong);
+}
+.org-chip:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+.org-chip.is-selected {
+  background: var(--accent-soft);
+  color: var(--text-primary);
+  border-color: var(--accent);
+}
+
 .content-body {
   flex: 1 1 auto;
   min-height: 0;
-  overflow-y: auto;
-  padding: 0 var(--space-6) var(--space-6);
 }
 
 .notes-status {
@@ -224,80 +101,52 @@
   max-width: 42ch;
 }
 
-/* Note cards — a single-column list of frosted .card containers. Each card holds
-   a full-bleed clickable "open" button plus a floating "Move to…" affordance
-   (the two can't be nested — invalid interactive nesting — so the card is a
-   div and the open target is its own button). */
-.note-list {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-3);
-  max-width: var(--content-max);
-}
-.note-item {
-  list-style: none;
-}
-.note-card {
-  position: relative;
-  padding: 0;
-  transition:
-    border-color var(--transition-fast),
-    transform var(--transition-fast);
-}
-.note-card:hover {
-  border-color: var(--border-strong);
-  transform: translateY(-1px);
-}
-.note-card.is-locked {
-  color: var(--text-muted);
-}
-/* Raise the card whose move-menu is open ABOVE the click-away scrim (z 30), so
-   the menu (z 40 within this card) receives clicks instead of the scrim. */
-.note-card.menu-open {
-  z-index: 50;
-}
+/* Notion/database-style TABLE (2026-07-12: replaced the card grid, then
+   extracted into `<mur-table>` — src/app/design-system/table — a real Design
+   System component, §6b. The `<table>`/`<tr>`/`<td>` structure + the fixed
+   row-height enforcement now live in `<mur-table>`'s OWN scss; this file only
+   styles the RICH CELL CONTENT this component projects into each column's
+   `<ng-template>` (that content is still authored/scoped here — Angular view
+   encapsulation follows the AUTHORING component, not the runtime outlet).
+   Row click target is the Title cell's own button/link (not the whole row)
+   so the date/actions columns stay plain data — same click-affordance shape
+   the card grid used (`.note-open`), just reshaped into a table cell. */
 
-/* The full-card open target. */
-.note-open {
+/* The row's click target — fills the title cell, no card padding/border. Title
+   ONLY (2026-07-12: the body-snippet preview was dropped entirely per user
+   request, not just inlined) as a SINGLE truncated line: `flex-wrap: nowrap` +
+   `.title-text`'s own ellipsis, so a long title clips instead of wrapping,
+   while the icon/pills (flex: none) never get clipped. `<mur-table>` also
+   enforces a fixed row height regardless (belt-and-suspenders). */
+.title-btn {
   display: flex;
-  flex-direction: column;
+  align-items: center;
+  flex-wrap: nowrap;
   gap: var(--space-2);
   width: 100%;
-  padding: var(--space-4);
-  /* Leave room for the floating move button in the top-right. */
-  padding-right: calc(var(--space-4) + 28px);
+  min-width: 0;
   text-align: left;
+  text-decoration: none;
   cursor: pointer;
   font: inherit;
   color: inherit;
   background: transparent;
   border: 0;
-  border-radius: inherit;
 }
-.note-open:focus-visible {
+.title-btn:focus-visible {
   outline: none;
   box-shadow: 0 0 0 3px var(--accent-ring);
+  border-radius: var(--radius-sm);
 }
-
-.note-card-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--space-2);
-}
-.note-title {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--space-2);
-  font-size: 1rem;
-  font-weight: 650;
-  color: var(--text-primary);
+.title-text {
+  flex: 1 1 auto;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  font-size: 0.92rem;
+  font-weight: 600;
+  color: var(--text-primary);
 }
 .note-lock {
   flex: none;
@@ -307,19 +156,9 @@
   flex: none;
 }
 
-/* --- Org (Shared Brain) card: a read-only replica, styled as a note card --- */
-.note-card--org {
-  display: block;
-  text-decoration: none;
-  color: inherit;
-}
-.note-card--org:focus-visible {
-  outline: none;
-  box-shadow: 0 0 0 3px var(--accent-ring);
-}
-/* The org card has no floating move button, so it needs no right-side reserve. */
-.note-open--org {
-  padding-right: var(--space-4);
+/* Org (Shared Brain) title link — same `.title-btn` shape, an `<a>` instead
+   of a `<button>` since it's a real navigation target. */
+.title-link {
   cursor: pointer;
 }
 /* The "shared brain" origin badge — distinct from the outbound "Shared" pill:
@@ -342,198 +181,21 @@
   color: var(--text-muted);
 }
 .note-author {
-  min-width: 0;
+  flex: none;
+  max-width: 16ch;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   font-size: 0.8rem;
 }
 
-.note-snippet {
-  margin: 0;
-  color: var(--text-secondary);
-  font-size: 0.9rem;
-  line-height: 1.45;
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  line-clamp: 2;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
-}
-
-.note-card-foot {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--space-3);
-  margin-top: var(--space-1);
-}
 .note-tags {
+  flex: none;
   display: flex;
-  flex-wrap: wrap;
   gap: var(--space-1);
-  min-width: 0;
 }
 .note-tag {
-  font-size: 0.72rem;
-}
-.note-date {
-  flex: none;
-  color: var(--text-muted);
-  font-size: 0.78rem;
-}
-
-/* --- Folder rail: add button + per-folder managed row + inline edits --- */
-.folders-head {
-  justify-content: space-between;
-}
-.folder-add {
-  flex: none;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 24px;
-  height: 24px;
-  border: 0;
-  border-radius: var(--radius-sm);
-  background: transparent;
-  color: var(--text-muted);
-  cursor: pointer;
-  transition:
-    background var(--transition-fast),
-    color var(--transition-fast);
-}
-.folder-add:hover {
-  background: var(--surface-hover);
-  color: var(--text-primary);
-}
-.folder-add:focus-visible {
-  outline: none;
-  box-shadow: 0 0 0 3px var(--accent-ring);
-}
-
-/* A managed folder row: the select target + a hover-revealed action cluster. */
-.folder-row--managed {
-  cursor: default;
-  padding: 0;
-  gap: 0;
-}
-.folder-row--managed:hover {
-  background: var(--surface-hover);
-}
-.folder-row--managed.is-selected {
-  background: var(--accent-soft);
-}
-.folder-select {
-  flex: 1 1 auto;
-  min-width: 0;
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
-  padding: var(--space-2);
-  border: 0;
-  border-radius: var(--radius-md);
-  background: transparent;
-  color: inherit;
-  font: inherit;
-  font-size: 0.9rem;
-  text-align: left;
-  cursor: pointer;
-}
-.folder-select:focus-visible {
-  outline: none;
-  box-shadow: 0 0 0 3px var(--accent-ring);
-}
-.folder-lock-badge {
-  flex: none;
-  margin-left: auto;
-  font-size: 0.66rem;
-  letter-spacing: 0.03em;
-}
-
-/* Per-folder actions — quiet, revealed on row hover/focus-within. */
-.folder-actions {
-  flex: none;
-  display: flex;
-  align-items: center;
-  gap: 2px;
-  padding-right: var(--space-1);
-  opacity: 0;
-  transition: opacity var(--transition-fast);
-}
-.folder-row--managed:hover .folder-actions,
-.folder-row--managed:focus-within .folder-actions {
-  opacity: 1;
-}
-.folder-act {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 24px;
-  height: 24px;
-  border: 0;
-  border-radius: var(--radius-sm);
-  background: transparent;
-  color: var(--text-muted);
-  cursor: pointer;
-  transition:
-    background var(--transition-fast),
-    color var(--transition-fast);
-}
-.folder-act:hover:not(:disabled) {
-  background: var(--surface-raised);
-  color: var(--text-primary);
-}
-.folder-act:focus-visible {
-  outline: none;
-  opacity: 1;
-  box-shadow: 0 0 0 2px var(--accent-ring);
-}
-.folder-act:disabled {
-  opacity: 0.45;
-  cursor: default;
-}
-.folder-act--danger:hover:not(:disabled) {
-  color: var(--danger);
-  background: var(--danger-soft);
-}
-
-/* Inline folder create / rename field + delete confirm. */
-.folder-edit,
-.folder-confirm {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-2);
-  padding: var(--space-2);
-  border-radius: var(--radius-md);
-  background: var(--surface-input);
-}
-.folder-edit-input {
-  width: 100%;
-  padding: var(--space-2) var(--space-3);
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius-sm);
-  background: var(--surface-base);
-  color: var(--text-primary);
-  font: inherit;
-  font-size: 0.9rem;
-}
-.folder-edit-input:focus-visible {
-  outline: none;
-  border-color: var(--accent);
-  box-shadow: 0 0 0 3px var(--accent-ring);
-}
-.folder-edit-actions {
-  display: flex;
-  gap: var(--space-2);
-}
-.folder-confirm-copy {
-  font-size: 0.82rem;
-  line-height: 1.45;
-}
-.btn-tiny {
-  padding: var(--space-1) var(--space-3);
-  font-size: 0.8rem;
+  font-size: 0.7rem;
 }
 
 /* --- Right-pane header actions --- */
@@ -548,7 +210,7 @@
   gap: var(--space-2);
 }
 
-/* --- Locked-folder gate (right pane) --- */
+/* --- Locked-folder gate --- */
 .lock-gate {
   align-items: center;
   text-align: center;
@@ -558,13 +220,13 @@
   margin-bottom: var(--space-3);
 }
 
-/* --- Per-note "Move to…" affordance + opaque menu (T3) --- */
-.note-move {
-  position: absolute;
-  top: var(--space-3);
-  right: var(--space-3);
+/* --- Per-row "Move to…" affordance (actions column) + opaque menu (T3) --- */
+.row-move {
+  position: relative;
+  display: flex;
+  justify-content: flex-end;
 }
-.note-move-btn {
+.row-menu-btn {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -579,11 +241,11 @@
     background var(--transition-fast),
     color var(--transition-fast);
 }
-.note-move-btn:hover {
-  background: var(--surface-hover);
+.row-menu-btn:hover {
+  background: var(--surface-raised);
   color: var(--text-primary);
 }
-.note-move-btn:focus-visible {
+.row-menu-btn:focus-visible {
   outline: none;
   box-shadow: 0 0 0 2px var(--accent-ring);
 }
@@ -632,16 +294,8 @@
   }
 }
 
-/* Narrow widths: stack the rail above the content so neither pane squeezes. */
-@media (max-width: 720px) {
-  .notes {
-    grid-template-columns: 1fr;
-    grid-template-rows: auto 1fr;
-  }
-}
-
 @media (prefers-reduced-motion: reduce) {
-  .folders-pane {
+  .notes {
     animation: none;
   }
   .spin-ring {
