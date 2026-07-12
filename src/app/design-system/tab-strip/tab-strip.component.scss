@@ -1,0 +1,156 @@
+/* IN-FLOW chrome — Apple Liquid Glass tabs, a REAL header row (fixed
+   2026-07-12, second structural pass: was `position: fixed`, a floating
+   overlay with no way to make the page underneath aware space was taken —
+   see `tab-strip.component.ts` for the full "why in-flow now" rationale and
+   `app-shell.component.html`/`.scss` for the `.main-col` wrapper this sits
+   in). `height: 48px` here MUST stay in sync with
+   `app-shell.component.ts`'s `_syncTabsStripHeight` effect (`--tabs-strip-
+   height`), which every drill-down's fixed host reads for its own `top`
+   offset — a mismatch between this literal and that effect's `"48px"`
+   re-opens the header-overlap bug this pass fixed.
+
+   VISUAL LANGUAGE: the same `--shell-glass-*` / `--shell-active-*` chrome
+   `.pill-bar` and the sidebar's active nav item already use — but applied
+   PER TAB, never to the row container. `.tab-strip` is LAYOUT ONLY — no
+   background, no border, no shadow, no blur of its own (fixed 2026-07-12,
+   third pass: painting the glass recipe on the whole row left a visible
+   flat gray band around/behind the tabs — a redundant second surface the
+   user correctly called out. Verified via computed styles: `.tab-strip`
+   now has no `background`/`border`/`box-shadow`/`backdrop-filter` rule at
+   all, so nothing paints except the individual `.tab-item`/`.tab-new`
+   elements). Each tab is its own capsule REGION with the glass fill —
+   inactive stays fully transparent (the PAGE behind it shows straight
+   through, not a toolbar layer), active gets the neutral "glass on glass"
+   lift (`--shell-active-bg`/`--shell-active-shadow`), matching the rest of
+   this app's chrome instead of an invented one-off look. */
+.tab-strip {
+  display: flex;
+  align-items: center;
+  flex: none;
+  gap: var(--space-1);
+  height: 48px;
+  padding: 0 var(--space-5);
+  overflow-x: auto;
+}
+
+.tab-item {
+  display: flex;
+  align-items: center;
+  flex: none;
+  max-width: 220px;
+  height: 36px;
+  border-radius: var(--radius-pill);
+  background: transparent;
+  transition: background var(--transition-fast);
+}
+
+.tab-item:not(.active):hover {
+  background: var(--surface-hover);
+}
+
+.tab-item.active {
+  /* The SAME neutral "glass on glass" lift the sidebar/pill-bar give their
+     active nav item — a lensing highlight, not an opaque flat fill. */
+  background: var(--shell-active-bg);
+  box-shadow: var(--shell-active-shadow);
+}
+
+.tab-label {
+  min-width: 0;
+  max-width: 160px;
+  padding: 0 var(--space-2) 0 var(--space-3);
+  border: none;
+  background: transparent;
+  color: var(--text-secondary);
+  font-family: inherit;
+  font-size: 0.82rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+}
+
+.tab-item.active .tab-label {
+  color: var(--shell-active-text);
+}
+
+.tab-label:hover {
+  color: var(--text-primary);
+}
+
+.tab-label:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+
+.tab-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 20px;
+  height: 20px;
+  margin: 0 var(--space-2) 0 2px;
+  padding: 0;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-secondary);
+  opacity: 0.7;
+  cursor: pointer;
+  transition: color var(--transition), background var(--transition), opacity var(--transition);
+}
+
+.tab-close:hover {
+  color: var(--text-primary);
+  background: var(--surface-hover);
+  opacity: 1;
+}
+
+.tab-close:focus-visible {
+  outline: none;
+  opacity: 1;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+
+/* Trailing "+" (new note tab) — same glass-pill region treatment as a tab,
+   same visual weight as the close glyph, sitting inside the ONE glass
+   surface (never its own blurred layer). Only ever rendered inside the
+   `@if (tabs().length > 0)` block, so it is automatically invisible at 0
+   tabs — no separate visibility rule needed. */
+.tab-new {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 30px;
+  height: 30px;
+  margin: 0 2px;
+  padding: 0;
+  border: none;
+  border-radius: var(--radius-pill);
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: color var(--transition), background var(--transition);
+}
+
+.tab-new:hover {
+  color: var(--text-primary);
+  background: var(--surface-hover);
+}
+
+.tab-new:focus-visible {
+  outline: none;
+  color: var(--text-primary);
+  background: var(--shell-active-bg);
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tab-item {
+    transition: none;
+  }
+}

@@ -5,15 +5,16 @@ import {
   ElementRef,
   OnInit,
   computed,
+  effect,
   inject,
   signal,
+  untracked,
   viewChild,
 } from "@angular/core";
 import { RouterLink } from "@angular/router";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { IpcService } from "../../../core/ipc.service";
-import { NavHistoryService } from "../../../core/nav-history.service";
-import { MurSidebarComponent } from "../../../design-system/sidebar/sidebar.component";
+import { TabsService } from "../../../core/tabs.service";
 import { MurSpinnerComponent } from "../../../design-system/spinner/spinner.component";
 import type {
   FolderNode,
@@ -28,7 +29,6 @@ import {
   FoldersService,
   type FolderExposure,
 } from "../../../services/folders.service";
-import { FolderTreeComponent } from "../../folders/folder-tree/folder-tree.component";
 import { LockBadgeComponent } from "../../folders/lock-badge/lock-badge.component";
 import { MoveToMenuComponent } from "../../folders/move-to-menu/move-to-menu.component";
 import { NoteDragService } from "../../folders/note-drag.service";
@@ -86,10 +86,8 @@ export interface OrgMeetingListItem {
     "(document:click)": "onDocumentClick($event)",
   },
   imports: [
-    MurSidebarComponent,
-    MurSpinnerComponent,
     RouterLink,
-    FolderTreeComponent,
+    MurSpinnerComponent,
     LockBadgeComponent,
     MoveToMenuComponent,
   ],
@@ -102,16 +100,26 @@ export class LibraryComponent implements OnInit {
   private readonly folders = inject(FoldersService);
   private readonly drag = inject(NoteDragService);
   private readonly toast = inject(ToastService);
-
-  /** Drill-down back navigation ("← Murmur" + Esc) — no library state coupling. */
-  readonly nav = inject(NavHistoryService);
+  private readonly tabsService = inject(TabsService);
 
   /**
-   * Esc while in Meetings. An open row ⋯ menu / move popover closes first (one
-   * Esc = one dismissal); otherwise backs out to where you came from — EXCEPT
-   * while you're typing: in the search box the first Esc clears it (or blurs
-   * when empty), and Esc is ignored inside any other form field, so it never
-   * ejects you mid-edit. Mirrors settings.component's onEscape.
+   * Open a meeting as a browser-style tab (replaces the row's plain
+   * `[routerLink]` so re-opening an already-open meeting activates its
+   * existing tab instead of navigating fresh).
+   */
+  openMeeting(event: Event, id: string, title: string | null): void {
+    event.preventDefault();
+    void this.tabsService.openMeeting(id, title || "Meeting");
+  }
+
+  /**
+   * Esc while in Meetings closes open transient UI first (one Esc = one
+   * dismissal: the row ⋯ menu, then the move popover) — but NEVER while
+   * you're typing: in the search box the first Esc clears it (or blurs when
+   * empty), and Esc is ignored inside any other form field, so it never
+   * ejects you mid-edit. `/library` is no longer a drill-down (Stage 2,
+   * 2026-07-12, mirrors Notes/Stage 1): there is no "back to Murmur"
+   * fallback anymore — the persistent sidebar IS the way back.
    */
   onEscape(): void {
     if (this.rowMenuId() !== null) {
@@ -129,13 +137,7 @@ export class LibraryComponent implements OnInit {
       } else {
         el.blur();
       }
-      return;
     }
-    const tag = el?.tagName;
-    if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") {
-      return;
-    }
-    this.nav.back();
   }
 
   /** The meeting id whose "Move to…" popover is open (null = none). */
@@ -172,25 +174,51 @@ export class LibraryComponent implements OnInit {
   readonly meetings = signal<Meeting[]>([]);
   readonly loading = signal(true);
 
-  // --- Folder filter (left pane) ------------------------------------------
-  /** The lock-aware folder forest from the signal store. */
+  // --- Folder filter ---------------------------------------------------
+  // The folder TREE UI (create/rename/delete/lock/unlock/drag-drop, "Lock
+  // all") now lives in the main sidebar's `MeetingsSidebarTreeComponent`
+  // (Stage 2, 2026-07-12 — mirrors Notes/Stage 1). This view only reads the
+  // SHARED selection to filter its own content.
+  /** The lock-aware folder forest from the signal store (for name/exposure lookups). */
   readonly folderTree = this.folders.tree;
-  /** True while the folder tree is loading (drives the left-pane state). */
-  readonly foldersLoading = this.folders.loading;
-  /** How many sealed folders are session-unlocked right now (drives "Lock all"). */
-  readonly unlockedCount = this.folders.unlockedCount;
-  /** True while a "Lock all" op is in flight. */
-  readonly relockingAll = signal(false);
   /**
-   * Selected folder id (null = no folder filter — show the tag/all list).
+   * Selected folder id (null = no folder filter — show the tag/all list),
+   * SHARED with the sidebar tree via {@link FoldersService.activeFolderId}.
    * Mutually exclusive with the tag filter: selecting one clears the other.
    */
-  readonly activeFolderId = signal<string | null>(null);
+  readonly activeFolderId = this.folders.activeFolderId;
 
-  // --- Org (Shared Brain) rail — "Shared Brains" meeting lists -------------
   /**
-   * Every org (Shared Brain) this user belongs to — the rail's "Shared brains"
-   * section. Loaded stale-guarded on init, on the `org-feed-updated` event, and
+   * Picking a folder in the sidebar tree bypasses this component entirely
+   * (it calls `FoldersService.selectFolder` directly), so the tag-filter /
+   * transient-row-UI clearing {@link selectFolder} used to do inline now runs
+   * as a reactive sync on the SHARED signal instead — mirrors
+   * `NotesHomeComponent`'s `_clearOrgOnFolderChange` (Stage 1). Legitimate
+   * signal-writing effect (T1): a cross-component UI-state sync, not async
+   * orchestration. `untracked` keeps `activeFolderId()` the only dependency.
+   */
+  private readonly _syncOnFolderChange = effect(() => {
+    const fid = this.activeFolderId();
+    untracked(() => {
+      this.cancelDelete();
+      this.rowMenuId.set(null);
+      this.movePopoverId.set(null);
+      // A folder pick is a THIRD mutually-exclusive scope alongside tag/org —
+      // always drop the org chip selection here too (mirrors NotesHomeComponent's
+      // `_clearOrgOnFolderChange`), so the content pane never shows two scopes.
+      this.activeOrgId.set(null);
+      if (fid !== null) {
+        this.activeTag.set(null);
+        this.tagMeetings.set([]);
+        this.tagLoading.set(false);
+      }
+    });
+  });
+
+  // --- Org (Shared Brain) chip row — "Shared Brains" meeting lists ---------
+  /**
+   * Every org (Shared Brain) this user belongs to — the content pane's
+   * "Shared brains" chip row. Loaded stale-guarded on init, on the `org-feed-updated` event, and
    * on window focus. Deliberately separate from Notes' own org state (each view
    * loads independently; "notes has notes, meetings has meetings" — PR #259).
    */
@@ -202,16 +230,17 @@ export class LibraryComponent implements OnInit {
    */
   private readonly _orgItems = signal<Record<string, OrgItemHeader[]>>({});
   /**
-   * Selected org id in the rail (null ⇒ not viewing a specific org). MUTUALLY
+   * Selected org id, chosen via the content pane's "Shared brains" chip row
+   * (null ⇒ not viewing a specific org). MUTUALLY
    * exclusive with a folder/tag selection: selecting an org clears both back to
    * the "All meetings" root, and vice-versa — the content pane has exactly one
    * active scope, and an org's items are NEVER merged into "All meetings" (the
    * bug #259 fixed).
    */
   readonly activeOrgId = signal<string | null>(null);
-  /** True while the org list + items are (re)loading (rail hint only). */
+  /** True while the org list + items are (re)loading (chip-row hint only). */
   readonly orgsLoading = signal(false);
-  /** The org whose items are shown when an org is rail-selected (null otherwise). */
+  /** The org whose items are shown when an org chip is selected (null otherwise). */
   readonly activeOrg = computed<OrgStatus | null>(() => {
     const oid = this.activeOrgId();
     return oid === null
@@ -337,7 +366,7 @@ export class LibraryComponent implements OnInit {
       this._orgs.set(orgs);
       this._orgItems.set(byOrg);
       this._myOrgShares.set(ownShares);
-      // If the rail's selected org has since disappeared, fall back to "All meetings".
+      // If the chip row's selected org has since disappeared, fall back to "All meetings".
       const sel = this.activeOrgId();
       if (sel !== null && !orgs.some((o) => o.orgId === sel)) {
         this.activeOrgId.set(null);
@@ -350,7 +379,7 @@ export class LibraryComponent implements OnInit {
   }
 
   /**
-   * Rail-select an org (Shared Brain): the pane shows ONLY that org's shared
+   * Select an org chip (Shared Brain): the pane shows ONLY that org's shared
    * meetings, in a list distinct from "All meetings". Mutually exclusive with a
    * folder/tag selection — clears both back to the root + closes any open
    * row menu / move popover / delete confirm.
@@ -359,7 +388,11 @@ export class LibraryComponent implements OnInit {
     this.cancelDelete();
     this.rowMenuId.set(null);
     this.movePopoverId.set(null);
-    this.activeFolderId.set(null);
+    // Clears the SHARED sidebar-tree folder selection too (not just this
+    // component's tag/org state) — the folder tree now lives outside this
+    // component (`MeetingsSidebarTreeComponent`), so its selection can only be
+    // reset through `FoldersService`.
+    this.folders.selectFolder(null);
     this.activeTag.set(null);
     this.tagMeetings.set([]);
     this.tagLoading.set(false);
@@ -371,7 +404,7 @@ export class LibraryComponent implements OnInit {
     this.activeOrgId.set(null);
   }
 
-  /** A friendly role hint for the rail ("Owner" / "Member"). */
+  /** A friendly role hint for the chip row ("Owner" / "Member"). */
   orgRoleLabel(org: OrgStatus): string {
     return org.role === "owner" ? "Owner" : "Member";
   }
@@ -380,7 +413,7 @@ export class LibraryComponent implements OnInit {
   /**
    * Every active meeting→org share pairing across ALL of the caller's OWN
    * meetings (`listMeetingOrgShares`, bulk — avoids an N+1 per-row fetch).
-   * Loaded alongside the org rail in {@link loadOrgs}; empty for a meeting
+   * Loaded alongside the org chip row in {@link loadOrgs}; empty for a meeting
    * never shared, or masked away server-side for a locked one.
    */
   private readonly _myOrgShares = signal<MeetingOrgShareRow[]>([]);
@@ -513,7 +546,7 @@ export class LibraryComponent implements OnInit {
     return this.activeTag() ?? "Meetings";
   });
 
-  /** True when an org is rail-selected and its meeting-kind list has zero rows. */
+  /** True when an org chip is selected and its meeting-kind list has zero rows. */
   readonly orgListEmpty = computed(() => this.orgListItems().length === 0);
 
   /** Exposure of the active folder (for the header lock badge); null when none. */
@@ -578,6 +611,26 @@ export class LibraryComponent implements OnInit {
   /** Tracked so we can cancel a pending debounce on re-trigger / destroy. */
   private searchTimer: ReturnType<typeof setTimeout> | null = null;
 
+  /** True once the initial `ngOnInit` meetings load has settled — guards {@link _reloadMeetingsOnTreeChange}. */
+  private hasLoadedOnce = false;
+
+  /**
+   * Re-fetch the meetings list whenever the SHARED folder tree changes (a
+   * move dropped on the sidebar tree, a lock/unlock, a rename…) — this is how
+   * a moved note leaves the current folder view now that the drop TARGET
+   * (`MeetingsSidebarTreeComponent`) is a sibling, not a child, and can't
+   * patch this component's local `meetings` signal directly (see the comment
+   * at {@link onRowDragEnd}). Skipped until the initial `ngOnInit` load has
+   * settled, so this doesn't race/duplicate that first fetch. Legitimate
+   * signal-writing effect (T1) — async orchestration with a guard.
+   */
+  private readonly _reloadMeetingsOnTreeChange = effect(() => {
+    this.folders.tree();
+    if (this.hasLoadedOnce) {
+      untracked(() => void this.reloadMeetings());
+    }
+  });
+
   async ngOnInit(): Promise<void> {
     // Clean up any in-flight debounce timer when the view is torn down.
     this.destroyRef.onDestroy(() => {
@@ -612,7 +665,7 @@ export class LibraryComponent implements OnInit {
         /* best-effort: no Tauri host (e.g. plain browser) → no live refresh */
       });
 
-    // Load the meetings list, the tag set, and the org rail in parallel; any one
+    // Load the meetings list, the tag set, and the org chip row in parallel; any one
     // failing must not break the others, so settle each independently.
     const [meetings] = await Promise.allSettled([
       this.ipc.listMeetings(),
@@ -623,6 +676,16 @@ export class LibraryComponent implements OnInit {
       this.meetings.set(meetings.value);
     }
     this.loading.set(false);
+    this.hasLoadedOnce = true;
+  }
+
+  /** Best-effort reload of the meetings list (a failure leaves the last-known list standing). */
+  private async reloadMeetings(): Promise<void> {
+    try {
+      this.meetings.set(await this.ipc.listMeetings());
+    } catch {
+      // Stale list self-heals on the next successful reload.
+    }
   }
 
   /** Fetch the distinct tag set; on failure leave `tags` empty (no filter bar). */
@@ -651,10 +714,11 @@ export class LibraryComponent implements OnInit {
     this.rowMenuId.set(null);
     this.movePopoverId.set(null);
     // Tag + folder scopes are mutually exclusive: picking a tag clears any
-    // active folder so they never compose into an empty surprise. An org
-    // selection is a THIRD mutually-exclusive scope — picking a tag drops it.
+    // active folder (the SHARED sidebar-tree selection) so they never compose
+    // into an empty surprise. An org selection is a THIRD mutually-exclusive
+    // scope — picking a tag drops it too.
     if (tag !== null) {
-      this.activeFolderId.set(null);
+      this.folders.selectFolder(null);
     }
     this.activeOrgId.set(null);
     this.activeTag.set(tag);
@@ -681,38 +745,6 @@ export class LibraryComponent implements OnInit {
         this.tagLoading.set(false);
       }
     }
-  }
-
-  // --- Folder filtering (left pane) ---------------------------------------
-
-  /**
-   * Select a folder (or `null` for "All notes" / the vault root). Mirrors the
-   * tag-filter machinery: it dismisses any open delete confirm, clears the
-   * mutually-exclusive tag filter, and (for a non-null folder) leaves the search
-   * alone — the right pane re-derives `folderMeetings` reactively. A null target
-   * (the tree's "All notes" row) returns to the full list. There is no async
-   * fetch (folder filtering is client-side over `meetings`), so no latest-wins
-   * race exists; the same idempotent-guard shape is kept for consistency.
-   */
-  selectFolder(folderId: string | null): void {
-    // A re-select of the SAME folder while no org is active is a no-op — but a
-    // re-select of "All meetings" WHILE an org is active still runs, to drop it.
-    if (this.activeFolderId() === folderId && this.activeOrgId() === null) {
-      return;
-    }
-    this.cancelDelete();
-    this.rowMenuId.set(null);
-    this.movePopoverId.set(null);
-    // Folder + tag scopes are mutually exclusive — picking a folder clears the
-    // tag selection (and its fetched list) so they never compose. An org
-    // selection is a THIRD mutually-exclusive scope — always dropped here.
-    if (folderId !== null) {
-      this.activeTag.set(null);
-      this.tagMeetings.set([]);
-      this.tagLoading.set(false);
-    }
-    this.activeOrgId.set(null);
-    this.activeFolderId.set(folderId);
   }
 
   // --- Filing: the per-row ⋯ actions menu + "Move to…" popover -------------
@@ -749,22 +781,6 @@ export class LibraryComponent implements OnInit {
 
   closeMovePopover(): void {
     this.movePopoverId.set(null);
-  }
-
-  /** Re-seal every session-unlocked folder at once (privacy "panic" affordance). */
-  async relockAll(): Promise<void> {
-    if (this.relockingAll()) {
-      return;
-    }
-    this.relockingAll.set(true);
-    try {
-      await this.folders.relockAll();
-      this.toast.success("All folders re-sealed");
-    } catch {
-      this.toast.danger("Couldn’t re-seal folders. Please try again.");
-    } finally {
-      this.relockingAll.set(false);
-    }
   }
 
   /**
@@ -813,33 +829,14 @@ export class LibraryComponent implements OnInit {
     this.drag.end();
   }
 
-  /**
-   * A note was dropped onto a folder (or "All notes"). Run the move through the
-   * FoldersService (which owns the cross-encryption-boundary semantics + tree
-   * reload), then reconcile the local list. A no-op when it's already there.
-   */
-  async onDropNote(payload: {
-    meetingId: string;
-    folderId: string | null;
-  }): Promise<void> {
-    const { meetingId, folderId } = payload;
-    const current =
-      this.meetings().find((m) => m.id === meetingId)?.folderId ?? null;
-    if (current === folderId) {
-      return; // already filed here — nothing to do.
-    }
-    try {
-      await this.folders.moveNote(meetingId, folderId);
-      await this.applyMove(meetingId, folderId);
-      const name =
-        folderId === null
-          ? "All notes"
-          : (this.folderById().get(folderId)?.name ?? "folder");
-      this.toast.success(`Moved to ${name}`);
-    } catch {
-      this.toast.danger("Couldn’t move this note. Please try again.");
-    }
-  }
+  // The DROP target (the folder tree) now lives in the main sidebar's
+  // `MeetingsSidebarTreeComponent` (Stage 2, 2026-07-12) — a SIBLING
+  // component, not a child, so it can no longer reach into this component's
+  // local `meetings` signal to patch it directly the way `onDropNote` used
+  // to. Reloading `meetings` whenever the shared folder tree changes (see
+  // `_reloadMeetingsOnTreeChange` below) is how this self-heals instead —
+  // mirrors the "backend is truth, reload rather than patch" rule the rest
+  // of this app's stores already follow.
 
   // --- Lock-aware row rendering -------------------------------------------
 
@@ -897,7 +894,7 @@ export class LibraryComponent implements OnInit {
     // but COMPOSES with the tag filter: the tagbar stays visible while
     // searching and the active tag narrows the hits (see `displayedResults`).
     if (this.activeFolderId() !== null) {
-      this.activeFolderId.set(null);
+      this.folders.selectFolder(null);
     }
 
     this.searching.set(true);

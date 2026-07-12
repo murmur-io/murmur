@@ -27,6 +27,11 @@ const ORG_STATUSES = () => [
     itemCount: 2,
     receivedCount: 2,
     pendingShares: 0,
+    // Per-instance active/inactive toggle (origin/murmur#273 follow-up) —
+    // Library/Notes' org chip rows filter to contextEnabled orgs only, so a
+    // fixture missing this field renders an empty chip row (looks like the
+    // org vanished, not like a stale fixture — 2026-07-12).
+    contextEnabled: true,
   },
 ];
 
@@ -48,14 +53,23 @@ const ORG_ITEMS = () => [
 ];
 
 test.describe("org-editable + library unification (mocked IPC)", () => {
-  test("F1 — Library (Meetings) is recordings ONLY: no Shared brains, no org items", async ({
+  /**
+   * F1 superseded 2026-07-12 by "feat(org): shared meetings in Library, separate
+   * from Notes" (#269): Library's "All meetings" list is STILL recordings only
+   * (unchanged), but the content pane now ALSO surfaces a "Shared brains" chip
+   * row (mirrors Notes') for org's `kind === "meeting"` items specifically —
+   * `kind === "document"` items stay Notes-only. These two mocked ORG_ITEMS carry
+   * no `kind` at all (the pre-v2 wire format, unclassified) — proves the
+   * unclassified-items-stay-hidden guard, not just the "document" exclusion.
+   */
+  test("F1 — Library's chip row lists the org; unclassified org items never appear in its meeting list", async ({
     page,
   }) => {
     await mockTauri(page, {
       org_refresh: () => null,
-      // Org statuses + items are mocked but MUST be ignored by the Meetings view.
       org_list_statuses: ORG_STATUSES,
       list_org_items: ORG_ITEMS,
+      list_meeting_org_shares: () => [],
       list_meetings: () => [
         {
           id: "m-1",
@@ -71,19 +85,27 @@ test.describe("org-editable + library unification (mocked IPC)", () => {
     });
     await page.goto("/library");
 
-    // The recording renders — this IS the Meetings view.
+    // The recording renders — this IS the Meetings view, still recordings by default.
     await expect(page.getByText("Weekly sync recording")).toBeVisible({
       timeout: 10_000,
     });
 
-    // NO "Shared brains" rail section.
-    await expect(page.getByText("Shared brains")).toHaveCount(0);
-    // NO org rows, NO merged org cards, NO org-item links — org content is
-    // Notes-only now.
-    await expect(page.locator(".org-row")).toHaveCount(0);
+    // The "Shared brains" chip row lists the org.
+    const orgChip = page.locator(".org-chip", { hasText: "Acme Inc." });
+    await expect(orgChip).toHaveCount(1);
+    // NO org rows/cards merged into the default "All meetings" list up front.
     await expect(page.locator("a[href^='/org-item/']")).toHaveCount(0);
     await expect(page.getByText("Acme onboarding brief")).toHaveCount(0);
     await expect(page.getByText("Pricing rework notes")).toHaveCount(0);
+
+    // Selecting the org chip shows ITS scoped list — but both mocked items are
+    // unclassified (no `kind`), so NEITHER renders; the "couldn't be
+    // classified" note explains the two hidden items instead.
+    await orgChip.click();
+    await expect(page.getByText(/couldn.t be classified/i)).toBeVisible();
+    await expect(page.getByText("Acme onboarding brief")).toHaveCount(0);
+    await expect(page.getByText("Pricing rework notes")).toHaveCount(0);
+    await expect(page.locator("a[href^='/org-item/']")).toHaveCount(0);
   });
 
   test("B1+F3 — read-only viewer (null resolve) renders + Back goes to /notes", async ({

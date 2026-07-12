@@ -1,0 +1,65 @@
+/* Consolidated 2026-07-12 (was duplicated across app-shell's inline Notes/
+   Meetings header blocks) — see the class doc for why. The "All X" root row
+   this file used to style was REMOVED (same day, user request: a redundant
+   layer duplicating the header's own routerLink); the header now carries the
+   "all items" affordance + (optionally) the vault-root drop target.
+   `:host` mirrors the tree-body components' own pattern: a flex COLUMN,
+   `flex: none` so it's never a flex-shrink candidate as a direct child of
+   `.sidebar-nav` (styles.css) at a short window height. */
+:host {
+  display: flex;
+  flex: none;
+  flex-direction: column;
+}
+
+/* --- Header row: nav link + "+" + expand/collapse chevron ---------------- */
+.nav-row-expandable {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 2px;
+}
+.nav-row-expandable .nav-row-link {
+  flex: 1 1 auto;
+  min-width: 0;
+  /* Pre-reserve the drop-armed border so the dashed hint never shifts layout
+     (the global `.sidebar-nav a` sets `border: none`). */
+  border: 1px solid transparent;
+}
+/* Vault-root drop target (Meetings header, `enableHeaderDrop`) — classes set
+   by the feature-side FolderDropDirective. Armed: faint dashed hint while any
+   note drags; lit under the pointer. Mirrors `<mur-tree-row>`'s treatment. */
+.nav-row-expandable .nav-row-link.is-drop-armed {
+  border-color: var(--border-strong);
+  border-style: dashed;
+}
+.nav-row-expandable .nav-row-link.is-drop-target {
+  border-style: solid;
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent-hover);
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+.nav-row-toggle,
+.nav-row-add {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 38px;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: color var(--transition-fast);
+}
+.nav-row-toggle:hover,
+.nav-row-add:hover {
+  color: var(--text-secondary);
+}
+.nav-row-toggle:focus-visible,
+.nav-row-add:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}

@@ -339,6 +339,24 @@ export class RecordComponent implements OnInit {
   });
 
   async ngOnInit(): Promise<void> {
+    // Register the teardown FIRST — before ANY await. This ngOnInit suspends
+    // several times below, and the component can be destroyed mid-await (the
+    // boot tab-restore navigation in `AppComponent.ngOnInit` replaces the
+    // freshly-mounted /record with the persisted active tab's route).
+    // Registering `DestroyRef.onDestroy` AFTER an await then throws NG0911
+    // ("View has already been destroyed") from the resumed continuation — and,
+    // worse, the meeting-app poll interval created just above that line was
+    // never handed to a cleanup, so it kept polling `detect_meeting_app`
+    // forever on a dead view. `destroyed` additionally gates the late
+    // continuation so the poll is never even started after destruction.
+    let destroyed = false;
+    this.destroyRef.onDestroy(() => {
+      destroyed = true;
+      if (this.meetingAppPoll !== null) {
+        clearInterval(this.meetingAppPoll);
+        this.meetingAppPoll = null;
+      }
+    });
     await this.store.init();
     // Subscribe the notes/threads store to the wake/result + BOTH tool-trace
     // streams now, regardless of whether the surface is visible yet — otherwise
@@ -354,18 +372,18 @@ export class RecordComponent implements OnInit {
       this.analytics.set(null);
     }
 
-    // Meeting-app detection: check once now, then poll on a tracked interval.
+    // Meeting-app detection: check once now, then poll on a tracked interval
+    // (cleared by the onDestroy registered at the top of this method). Skipped
+    // entirely when the view died during the awaits above — the cleanup has
+    // already run by then, so a poll started here could never be cleared.
+    if (destroyed) {
+      return;
+    }
     void this.checkMeetingApp();
     this.meetingAppPoll = setInterval(
       () => void this.checkMeetingApp(),
       12_000,
     );
-    this.destroyRef.onDestroy(() => {
-      if (this.meetingAppPoll !== null) {
-        clearInterval(this.meetingAppPoll);
-        this.meetingAppPoll = null;
-      }
-    });
   }
 
   /** Best-effort poll for a running meeting app; failures leave the nudge hidden. */

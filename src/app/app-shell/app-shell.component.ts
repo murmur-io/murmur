@@ -1,10 +1,13 @@
 import {
   ChangeDetectionStrategy,
   Component,
+  Injector,
+  afterNextRender,
   computed,
   effect,
   inject,
   signal,
+  viewChild,
 } from "@angular/core";
 import { toSignal } from "@angular/core/rxjs-interop";
 import {
@@ -16,6 +19,7 @@ import {
 } from "@angular/router";
 import { filter, map } from "rxjs";
 import { isDrilldownRoute } from "../core/nav-history.service";
+import { TabsService } from "../core/tabs.service";
 import {
   MurIconComponent,
   type ShellIcon,
@@ -23,8 +27,15 @@ import {
 import { MurKbdComponent } from "../design-system/kbd/kbd.component";
 import { MurQuickSearchComponent } from "../design-system/quick-search/quick-search.component";
 import { MurSidebarComponent } from "../design-system/sidebar/sidebar.component";
+import { MurSidebarSectionComponent } from "../design-system/sidebar-section/sidebar-section.component";
+import { MurTabStripComponent } from "../design-system/tab-strip/tab-strip.component";
+import { LockSharesDialogComponent } from "../features/folders/lock-shares-dialog/lock-shares-dialog.component";
+import { MeetingsSidebarTreeComponent } from "../features/folders/meetings-sidebar-tree/meetings-sidebar-tree.component";
+import { NotesSidebarTreeComponent } from "../features/notes/notes-sidebar-tree/notes-sidebar-tree.component";
 import { ChromeService } from "../services/chrome.service";
+import { FolderLockFlowService } from "../services/folder-lock-flow.service";
 import { FoldersService } from "../services/folders.service";
+import { NotesService } from "../services/notes.service";
 import { ToastService, type Toast } from "../services/toast.service";
 
 /** localStorage key for the chrome mode: "1" = pill bar, "0" = sidebar. */
@@ -32,6 +43,20 @@ const SIDEBAR_KEY = "murmur-sidebar-collapsed";
 
 /** localStorage key for the Insights sidebar group: "1" = expanded. */
 const INSIGHTS_KEY = "murmur-sidebar-insights";
+
+/**
+ * localStorage key for the Notes nav row's note-folder tree: "1" = expanded.
+ * Default OPEN (Obsidian shows its vault tree by default) — unlike Insights,
+ * which defaults collapsed.
+ */
+const NOTES_TREE_KEY = "murmur-sidebar-notes-tree";
+
+/**
+ * localStorage key for the Meetings nav row's folder tree: "1" = expanded.
+ * Default OPEN — mirrors `NOTES_TREE_KEY` (Stage 2 of the always-visible-
+ * sidebar work, 2026-07-12).
+ */
+const MEETINGS_TREE_KEY = "murmur-sidebar-meetings-tree";
 
 /** A primary navigation destination. `icon` selects the inline SVG. */
 interface NavItem {
@@ -132,12 +157,31 @@ const INSIGHT_PATHS = NAV_GROUPS.filter((g) => g.collapsible).flatMap((g) =>
     MurKbdComponent,
     MurQuickSearchComponent,
     MurSidebarComponent,
+    MurTabStripComponent,
+    MeetingsSidebarTreeComponent,
+    NotesSidebarTreeComponent,
+    MurSidebarSectionComponent,
+    LockSharesDialogComponent,
   ],
   host: {
     // Scoped to !inDrilldown so the pill-clearance padding never leaks onto
     // drill-down routes (which render no pill bar). Rail-style collapse keeps
     // the sidebar in the flex row, so it needs no clearance either.
     "[class.pill-mode]": "barMode() && !inDrilldown()",
+    // True exactly when the floating sidebar/rail actually renders (mirrors
+    // the template's own `@if (!inDrilldown()) { @if (!barMode()) { … } }`
+    // gate) — drives `.main-col`'s top offset (styles.css) so the tab strip
+    // lines up with the sidebar's first content row instead of sitting
+    // noticeably higher (2026-07-12 fix). Deliberately excludes drill-down
+    // AND pill/bar mode: neither renders the floating sidebar this alignment
+    // targets, and drill-down routes read `--tabs-strip-height` (a literal,
+    // not this margin) for their own fixed-host offset — adding the margin
+    // there too would desync the two.
+    "[class.sidebar-visible]": "!inDrilldown() && !barMode()",
+    // (The former `notes-wide-route` binding is GONE, 2026-07-12: `.app-main`
+    // is `max-width: none; width: 100%` for EVERY main route now — see the
+    // `.app-main` comment in styles.css. Views that want a narrower reading
+    // column own that cap in their own component scss.)
     "(document:keydown)": "onGlobalKeydown($event)",
   },
   templateUrl: "./app-shell.component.html",
@@ -145,9 +189,24 @@ const INSIGHT_PATHS = NAV_GROUPS.filter((g) => g.collapsible).flatMap((g) =>
 })
 export class AppShellComponent {
   private readonly folders = inject(FoldersService);
+  private readonly notesService = inject(NotesService);
   private readonly toast = inject(ToastService);
   private readonly router = inject(Router);
   private readonly chrome = inject(ChromeService);
+  private readonly tabs = inject(TabsService);
+  private readonly injector = inject(Injector);
+
+  /**
+   * Shared lock×shares flow (probe → warn/revoke dialog → lock) — rendered
+   * exactly ONCE here (2026-07-12 fix), regardless of which sidebar tree
+   * (`NotesSidebarTreeComponent` / `MeetingsSidebarTreeComponent`'s folder
+   * rows) triggered it. Both used to render their OWN `<app-lock-shares-
+   * dialog>` bound to this same root-singleton service — harmless while only
+   * one tree existed, but the main sidebar now ALWAYS mounts both
+   * simultaneously, so a single lock request rendered TWO dialogs (caught by
+   * `e2e/org/org-surfaces.spec.ts`'s strict-mode-violation failure).
+   */
+  readonly lockFlow = inject(FolderLockFlowService);
 
   /**
    * The current URL, updated on every completed navigation. Seeded from
@@ -164,6 +223,43 @@ export class AppShellComponent {
   /** True while on any drill-down route (`/settings*`, `/library*`). */
   readonly inDrilldown = computed(() => isDrilldownRoute(this.currentUrl()));
 
+  /**
+   * True on EVERY Notes route: `/notes` (the table list) and
+   * `/notes/:id`/`/notes/new` (the editor). Drives
+   * `NotesSidebarTreeComponent`'s `sectionActive` input — see
+   * {@link isMeetingsRoute} for the full rationale (the two are symmetric).
+   * Covers `/notes/new` too (`NoteEditorComponent` handles that path
+   * directly, `app.routes.ts`). (Its former second job — the
+   * `notes-wide-route` width escape — is gone: `.app-main` is uncapped on
+   * every main route now, see styles.css.)
+   */
+  readonly isNotesRoute = computed(() => {
+    // Strip a query/fragment before comparing so `/notes?x=y` still counts as
+    // the exact list route rather than falling through to neither branch.
+    const path = this.currentUrl().split(/[?#]/)[0];
+    return path === "/notes" || path.startsWith("/notes/");
+  });
+
+  /**
+   * True on EVERY Meetings route: `/library` (the list) and `/meeting/:id`
+   * (the detail view) — mirrors {@link isNotesRoute}. Drives
+   * `MeetingsSidebarTreeComponent`'s `sectionActive` input (2026-07-12 fix):
+   * the tree's folder rows remembered the last-selected folder via the SHARED
+   * `FoldersService.activeFolderId` regardless of which page was open, so
+   * "All meetings"/a folder kept showing the active/selected pill even while
+   * looking at `/notes` or `/record` — misleadingly claiming something was
+   * "current" when nothing about Meetings was. Gating the VISUAL selected
+   * state on this (while still remembering the folder internally so
+   * returning to `/library` reselects it) makes both trees symmetric: fused
+   * header+root pill while that section is the current route, fully plain
+   * otherwise — never "sometimes fused, sometimes disconnected" depending on
+   * which page happens to be open.
+   */
+  readonly isMeetingsRoute = computed(() => {
+    const path = this.currentUrl().split(/[?#]/)[0];
+    return path === "/library" || path.startsWith("/library/") || path.startsWith("/meeting/");
+  });
+
   /** Primary destinations (Settings lives in the chrome footer / pill end). */
   readonly navItems: readonly NavItem[] = NAV_ITEMS;
 
@@ -172,6 +268,33 @@ export class AppShellComponent {
 
   /** Persisted Insights-group preference (default collapsed). */
   private readonly _insightsOpen = signal(this.readStoredInsightsOpen());
+
+  /**
+   * Persisted Notes note-folder-tree preference (default EXPANDED — Obsidian
+   * always shows its vault tree). Nested under the "Notes" nav row via
+   * {@link NotesSidebarTreeComponent}.
+   */
+  private readonly _notesTreeOpen = signal(this.readStoredNotesTreeOpen());
+  readonly notesTreeOpen = this._notesTreeOpen.asReadonly();
+
+  /**
+   * Persisted Meetings folder-tree preference (default EXPANDED). Nested
+   * under the "Meetings" nav row via {@link MeetingsSidebarTreeComponent}
+   * (Stage 2, 2026-07-12 — mirrors the Notes tree above).
+   */
+  private readonly _meetingsTreeOpen = signal(this.readStoredMeetingsTreeOpen());
+  readonly meetingsTreeOpen = this._meetingsTreeOpen.asReadonly();
+
+  /**
+   * References to the two FOLDER-TREE-BODY components — resolve to
+   * `undefined` while their section is collapsed (each only renders inside
+   * `<mur-sidebar-section>`'s own `@if (expanded())`, projected as content).
+   * The section header's compact "+" icon forwards into
+   * {@link newNoteFolder}/{@link newMeetingFolder}; the header's vault-root
+   * drop target forwards into {@link onMeetingsHeaderDrop}.
+   */
+  private readonly notesSidebarTree = viewChild(NotesSidebarTreeComponent);
+  private readonly meetingsSidebarTree = viewChild(MeetingsSidebarTreeComponent);
 
   /**
    * Whether the Insights group renders expanded: the stored preference, OR
@@ -239,6 +362,42 @@ export class AppShellComponent {
     }
   });
 
+  /** Persist the Notes-tree preference whenever it changes. */
+  private readonly _persistNotesTreeOpen = effect(() => {
+    const value = this._notesTreeOpen();
+    try {
+      localStorage.setItem(NOTES_TREE_KEY, value ? "1" : "0");
+    } catch {
+      // Private-mode / storage-disabled — the preference is not persisted.
+    }
+  });
+
+  /** Persist the Meetings-tree preference whenever it changes. */
+  private readonly _persistMeetingsTreeOpen = effect(() => {
+    const value = this._meetingsTreeOpen();
+    try {
+      localStorage.setItem(MEETINGS_TREE_KEY, value ? "1" : "0");
+    } catch {
+      // Private-mode / storage-disabled — the preference is not persisted.
+    }
+  });
+
+  /**
+   * `--tabs-strip-height` on `<html>` — the ONE signal-driven source of
+   * truth every drill-down's fixed `position: fixed` host (library / notes
+   * home / note editor / settings) reads for its own `top` offset, so it
+   * structurally leaves `mur-tab-strip`'s real height uncovered instead of
+   * floating a per-route pixel guess on top of it (fixed 2026-07-12). A
+   * fixed design constant, not content-measured — `mur-tab-strip`'s own
+   * rendered height never varies (one row, no wrapping), so this is a plain
+   * signal-driven toggle, same directness `GlassService` already uses for
+   * `--glass-user-alpha`, not a `ResizeObserver`. MUST stay in px-sync with
+   * `tab-strip.component.scss`'s `.tab-strip { height: … }`. */
+  private readonly _syncTabsStripHeight = effect(() => {
+    const height = this.tabs.tabs().length > 0 ? "48px" : "0px";
+    document.documentElement.style.setProperty("--tabs-strip-height", height);
+  });
+
   /** Toggle between the floating sidebar and the top pill bar. */
   togglePillMode(): void {
     this._pillMode.update((c) => !c);
@@ -253,6 +412,88 @@ export class AppShellComponent {
     this._insightsOpen.set(!this.insightsExpanded());
   }
 
+  /** Toggle the Notes nav row's nested note-folder tree. */
+  toggleNotesTree(): void {
+    this._notesTreeOpen.update((v) => !v);
+  }
+
+  /** Toggle the Meetings nav row's nested folder tree. */
+  toggleMeetingsTree(): void {
+    this._meetingsTreeOpen.update((v) => !v);
+  }
+
+  /**
+   * The "Notes" section header's compact "+" icon — opens the note-folder
+   * tree's inline "New folder" field. Expands the tree first if it's
+   * collapsed (the tree component only exists in the DOM while open, so
+   * {@link notesSidebarTree} resolves to `undefined` until then) —
+   * `afterNextRender` defers the forward to AFTER that `@if` flips and the
+   * component actually mounts.
+   */
+  newNoteFolder(): void {
+    if (this.notesTreeOpen()) {
+      this.notesSidebarTree()?.startCreateFolder();
+      return;
+    }
+    this._notesTreeOpen.set(true);
+    afterNextRender(() => this.notesSidebarTree()?.startCreateFolder(), {
+      injector: this.injector,
+    });
+  }
+
+  /** The "Meetings" section header's compact "+" icon — mirrors {@link newNoteFolder}. */
+  newMeetingFolder(): void {
+    if (this.meetingsTreeOpen()) {
+      this.meetingsSidebarTree()?.openCreateFolder();
+      return;
+    }
+    this._meetingsTreeOpen.set(true);
+    afterNextRender(() => this.meetingsSidebarTree()?.openCreateFolder(), {
+      injector: this.injector,
+    });
+  }
+
+  /**
+   * The "Notes" section HEADER was clicked (2026-07-12: the header IS the
+   * "all items" affordance now — the separate "All notes" root row was
+   * removed as a redundant layer). Clears the note-folder filter; the
+   * header's own routerLink handles the `/notes` navigation.
+   */
+  onNotesHeaderSelect(): void {
+    void this.notesService.selectFolder(null);
+  }
+
+  /** The "Meetings" section header was clicked — mirrors {@link onNotesHeaderSelect}. */
+  onMeetingsHeaderSelect(): void {
+    this.folders.selectFolder(null);
+  }
+
+  /**
+   * A note was dropped onto the Meetings section HEADER (the vault-root drop
+   * target moved onto the header when the "All meetings" root row was
+   * removed, 2026-07-12) — forwards into
+   * `MeetingsSidebarTreeComponent.onDropNote` (which owns the toast +
+   * folder-name lookup) the same way the "+" forwarding does. Unlike the
+   * "+", the header renders even while the tree is COLLAPSED — expand it
+   * first in that case so the tree-body component exists to run the move
+   * (and so the user sees where the note landed).
+   */
+  onMeetingsHeaderDrop(meetingId: string): void {
+    if (this.meetingsTreeOpen()) {
+      void this.meetingsSidebarTree()?.onDropNote({ meetingId, folderId: null });
+      return;
+    }
+    this._meetingsTreeOpen.set(true);
+    afterNextRender(
+      () =>
+        void this.meetingsSidebarTree()?.onDropNote({
+          meetingId,
+          folderId: null,
+        }),
+      { injector: this.injector },
+    );
+  }
+
   /** Open the ⌘K spotlight. */
   openSearch(): void {
     this.searchOpen.set(true);
@@ -265,9 +506,22 @@ export class AppShellComponent {
   }
 
   /**
-   * Global shortcuts: ⌘K/Ctrl+K toggles search, ⌘N/Ctrl+N new note. Escape
-   * closes the spotlight at the DOCUMENT level — the scrim's own handler only
-   * fires while focus sits inside it (e.g. it dies once focus falls to <body>).
+   * Global shortcuts: ⌘K/Ctrl+K toggles search, ⌘N/Ctrl+N new note, ⌘T/Ctrl+T
+   * a new note TAB (same target as ⌘N — the browser-tab-bar convention, kept
+   * as a distinct shortcut from ⌘N since the tab strip is its own mental
+   * model), ⌘W/Ctrl+W closes the active tab (mirrors `mur-tab-strip`'s own ×
+   * button) and is a NO-OP — never a window-close — when no tab is open
+   * (`preventDefault()` only fires once a tab is actually found to close).
+   * NOTE: no native macOS window/app menu is registered anywhere in
+   * `src-tauri` (grepped `lib.rs` for `Menu`/`Accelerator` — the only `Menu`
+   * usage is the unrelated tray/status-bar icon), so there is no known
+   * competing native ⌘W accelerator for this JS handler to lose a race
+   * against; this was NOT verified against the real signed/packaged app
+   * (only `ng serve` + Playwright, which never exercises native window-menu
+   * chrome at all) — confirm empirically in a live dev/signed build before
+   * relying on this. Escape closes the spotlight at the DOCUMENT level — the
+   * scrim's own handler only fires while focus sits inside it (e.g. it dies
+   * once focus falls to <body>).
    */
   onGlobalKeydown(e: KeyboardEvent): void {
     if (e.key === "Escape" && this.searchOpen()) {
@@ -279,10 +533,30 @@ export class AppShellComponent {
     if (key === "k") {
       e.preventDefault();
       this.searchOpen.update((v) => !v);
-    } else if (key === "n") {
+    } else if (key === "n" || key === "t") {
       e.preventDefault();
       this.newNote();
+    } else if (key === "w") {
+      const activeId = this.tabs.activeTabId();
+      if (activeId) {
+        e.preventDefault();
+        void this.tabs.closeTab(activeId);
+      }
     }
+  }
+
+  /**
+   * Fires on every `<router-outlet>` DETACH-for-reuse (a tab switch away from
+   * a `/meeting/:id` or `/notes/:id` route kept alive by
+   * `TabRouteReuseStrategy` — NOT just a real destroy). Notifies the
+   * backgrounded component so it can pause audio (tabs plan risk #3) and
+   * collapse unbounded transcript DOM (perf-audit fix 2). Duck-typed, since
+   * the shell (eagerly loaded) can't import a lazily-loaded feature
+   * component's type — see `DetailComponent.onTabBackgrounded`.
+   */
+  onOutletDetach(component: unknown): void {
+    const tabAware = component as { onTabBackgrounded?: () => void } | null;
+    tabAware?.onTabBackgrounded?.();
   }
 
   /** Dismiss a toast by id (also cancels its auto-dismiss timer). */
@@ -311,6 +585,24 @@ export class AppShellComponent {
       return localStorage.getItem(INSIGHTS_KEY) === "1";
     } catch {
       return false;
+    }
+  }
+
+  /** Read the persisted Notes-tree preference; default EXPANDED. */
+  private readStoredNotesTreeOpen(): boolean {
+    try {
+      return localStorage.getItem(NOTES_TREE_KEY) !== "0";
+    } catch {
+      return true;
+    }
+  }
+
+  /** Read the persisted Meetings-tree preference; default EXPANDED. */
+  private readStoredMeetingsTreeOpen(): boolean {
+    try {
+      return localStorage.getItem(MEETINGS_TREE_KEY) !== "0";
+    } catch {
+      return true;
     }
   }
 }

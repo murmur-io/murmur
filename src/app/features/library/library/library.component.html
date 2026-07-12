@@ -1,145 +1,11 @@
 <section class="library">
-  <!-- ============ LEFT PANE — folder tree (lock-aware) ============ -->
-  <mur-sidebar class="folders-pane" aria-label="Folders">
-    <!-- Drag strip mirrors the primary rail so the overlay traffic lights
-         stay clear of the Back button when the rail is flush to the edge. -->
-    <div class="rail-drag" data-tauri-drag-region></div>
-
-    <!-- Drill-down "up": returns to the last non-drill-down route (or /record). -->
-    <button
-      type="button"
-      class="rail-back"
-      (click)="nav.back()"
-      aria-label="Back to Murmur"
-    >
-      <svg
-        class="rail-back-icon"
-        viewBox="0 0 16 16"
-        fill="none"
-        stroke="currentColor"
-        stroke-width="1.6"
-        stroke-linecap="round"
-        stroke-linejoin="round"
-        aria-hidden="true"
-      >
-        <path d="M9.5 3.5 5 8l4.5 4.5" />
-      </svg>
-      <span class="rail-back-label">Murmur</span>
-    </button>
-
-    <div class="folders-head">
-      <h3 class="folders-title">Folders</h3>
-      @if (unlockedCount() > 0) {
-        <button
-          type="button"
-          class="relock-pill"
-          [disabled]="relockingAll()"
-          [attr.aria-label]="
-            'Re-seal all ' + unlockedCount() + ' unlocked folders now'
-          "
-          title="Re-seal every unlocked folder now"
-          (click)="relockAll()"
-        >
-          <svg
-            viewBox="0 0 16 16"
-            width="12"
-            height="12"
-            fill="none"
-            aria-hidden="true"
-          >
-            <rect
-              x="3.5"
-              y="7"
-              width="9"
-              height="6"
-              rx="1.4"
-              stroke="currentColor"
-              stroke-width="1.4"
-            />
-            <path
-              d="M5.5 7V5.4a2.5 2.5 0 0 1 5 0V7"
-              stroke="currentColor"
-              stroke-width="1.4"
-              stroke-linecap="round"
-            />
-          </svg>
-          Lock all
-        </button>
-      }
-    </div>
-    <div class="folders-body">
-      @if (foldersLoading()) {
-        <p class="folders-state empty">Loading folders…</p>
-      } @else {
-        <app-folder-tree
-          [nodes]="folderTree()"
-          [selectedId]="activeFolderId()"
-          (selected)="selectFolder($event)"
-          (dropNote)="onDropNote($event)"
-        />
-      }
-    </div>
-
-    <!-- ===== Shared brains (orgs) — read-only shared MEETING notes only.
-         "notes has notes, meetings has meetings": a `kind === "document"` org
-         item never appears here (Notes owns those); selecting an org shows a
-         DISTINCT list, never merged into "All meetings" (the bug #259 fixed). -->
-    @if (orgs().length > 0 || orgsLoading()) {
-      <div class="folders-head org-head">
-        <h3 class="folders-title">Shared brains</h3>
-        <span class="org-head-trailing">
-          @if (orgsLoading()) {
-            <mur-spinner [size]="12" class="org-head-spinner" />
-          }
-          <a
-            class="org-head-settings-link"
-            routerLink="/settings"
-            [queryParams]="{ section: 'organization' }"
-            title="Choose which organizations are active on this device"
-            aria-label="Manage organizations in Settings"
-          >
-            <svg viewBox="0 0 16 16" width="13" height="13" fill="none" aria-hidden="true">
-              <circle cx="8" cy="8" r="2.1" stroke="currentColor" stroke-width="1.3" />
-              <path
-                d="M8 2.2v1.4M8 12.4v1.4M13.8 8h-1.4M3.6 8H2.2M12.1 3.9l-1 1M4.9 11.1l-1 1M12.1 12.1l-1-1M4.9 4.9l-1-1"
-                stroke="currentColor"
-                stroke-width="1.3"
-                stroke-linecap="round"
-              />
-            </svg>
-          </a>
-        </span>
-      </div>
-      <nav class="folders-body org-body" aria-label="Shared brains">
-        @for (org of orgs(); track org.orgId) {
-          <button
-            type="button"
-            class="folder-row org-row"
-            [class.is-selected]="activeOrgId() === org.orgId"
-            [attr.aria-pressed]="activeOrgId() === org.orgId"
-            (click)="selectOrg(org.orgId)"
-          >
-            <span class="folder-icon" aria-hidden="true">
-              <svg viewBox="0 0 16 16" width="15" height="15" fill="none">
-                <circle cx="5" cy="6" r="2" stroke="currentColor" stroke-width="1.3" />
-                <circle cx="11" cy="6" r="2" stroke="currentColor" stroke-width="1.3" />
-                <path
-                  d="M2 13c0-1.8 1.3-3 3-3s3 1.2 3 3M8 13c0-1.8 1.3-3 3-3s3 1.2 3 3"
-                  stroke="currentColor"
-                  stroke-width="1.3"
-                  stroke-linecap="round"
-                />
-              </svg>
-            </span>
-            <span class="folder-name">{{ org.name }}</span>
-            <span class="pill org-role" [title]="orgRoleLabel(org)">{{ orgRoleLabel(org) }}</span>
-          </button>
-        }
-      </nav>
-    }
-  </mur-sidebar>
-
-  <!-- ============ RIGHT PANE — search, filters, meeting list ============ -->
+  <!-- The folder tree (create/rename/delete/lock/unlock/drag-drop, "Lock all")
+       now lives in the ALWAYS-VISIBLE main sidebar
+       (MeetingsSidebarTreeComponent, nested under "Meetings" — see
+       AppShellComponent, Stage 2 2026-07-12). This view is pure in-flow
+       content beside it, like /record. The "Shared brains" org section that
+       used to live in this rail (origin/murmur#273) is now the content-pane
+       chip row further down — see its own comment for why. -->
   <div class="meetings-pane">
     <!-- Frosted search field, pinned to the top of the screen -->
     <div class="search" [class.is-active]="searching()">
@@ -223,6 +89,67 @@
       </div>
     }
 
+    <!-- ===== Shared brains (orgs) — read-only shared MEETING notes only.
+         A content-pane chip row (mirrors NotesHomeComponent's — orgs aren't
+         meeting-folders, so they don't live in the sidebar's folder tree).
+         "notes has notes, meetings has meetings": a `kind === "document"` org
+         item never appears here (Notes owns those); picking a chip shows a
+         DISTINCT list, never merged into "All meetings" (the bug #259 fixed).
+         Hidden while searching — the search results pane has no org items to
+         narrow, so a chip pick would have no visible effect there. -->
+    @if (!hasQuery() && (orgs().length > 0 || orgsLoading())) {
+      <div class="org-chip-row" role="group" aria-label="Shared brains">
+        @for (org of orgs(); track org.orgId) {
+          <button
+            type="button"
+            class="pill org-chip"
+            [class.is-selected]="activeOrgId() === org.orgId"
+            [attr.aria-pressed]="activeOrgId() === org.orgId"
+            (click)="
+              activeOrgId() === org.orgId
+                ? clearOrgSelection()
+                : selectOrg(org.orgId)
+            "
+          >
+            <svg viewBox="0 0 16 16" width="13" height="13" fill="none" aria-hidden="true">
+              <circle cx="5" cy="6" r="1.8" stroke="currentColor" stroke-width="1.2" />
+              <circle cx="11" cy="6" r="1.8" stroke="currentColor" stroke-width="1.2" />
+              <path
+                d="M2.3 12.5c0-1.6 1.2-2.7 2.7-2.7s2.7 1.1 2.7 2.7M8.3 12.5c0-1.6 1.2-2.7 2.7-2.7s2.7 1.1 2.7 2.7"
+                stroke="currentColor"
+                stroke-width="1.2"
+                stroke-linecap="round"
+              />
+            </svg>
+            {{ org.name }}
+            <span class="pill org-role" [title]="orgRoleLabel(org)">{{ orgRoleLabel(org) }}</span>
+          </button>
+        }
+        @if (orgsLoading()) {
+          <mur-spinner [size]="12" class="org-chip-spinner" />
+        }
+        <!-- Manage which orgs are active on this device (origin/murmur#273's
+             per-instance toggle) — same settings-link the deleted rail had. -->
+        <a
+          class="org-chip-settings-link"
+          routerLink="/settings"
+          [queryParams]="{ section: 'organization' }"
+          title="Choose which organizations are active on this device"
+          aria-label="Manage organizations in Settings"
+        >
+          <svg viewBox="0 0 16 16" width="13" height="13" fill="none" aria-hidden="true">
+            <circle cx="8" cy="8" r="2.1" stroke="currentColor" stroke-width="1.3" />
+            <path
+              d="M8 2.2v1.4M8 12.4v1.4M13.8 8h-1.4M3.6 8H2.2M12.1 3.9l-1 1M4.9 11.1l-1 1M12.1 12.1l-1-1M4.9 4.9l-1-1"
+              stroke="currentColor"
+              stroke-width="1.3"
+              stroke-linecap="round"
+            />
+          </svg>
+        </a>
+      </div>
+    }
+
     @if (hasQuery()) {
       <!-- ===================== SEARCH RESULTS ===================== -->
       <header class="library-head">
@@ -264,7 +191,9 @@
             <li>
               <a
                 class="row"
-                [routerLink]="['/meeting', hit.meeting.id]"
+                tabindex="0"
+                (click)="openMeeting($event, hit.meeting.id, hit.meeting.title)"
+                (keydown.enter)="openMeeting($event, hit.meeting.id, hit.meeting.title)"
                 [style.animation-delay.ms]="i * 35"
               >
                 <span class="row-main">
@@ -473,7 +402,9 @@
             >
               <a
                 class="row"
-                [routerLink]="['/meeting', m.id]"
+                tabindex="0"
+                (click)="openMeeting($event, m.id, m.title)"
+                (keydown.enter)="openMeeting($event, m.id, m.title)"
                 [style.animation-delay.ms]="i * 45"
                 draggable="true"
                 (dragstart)="onRowDragStart($event, m)"
