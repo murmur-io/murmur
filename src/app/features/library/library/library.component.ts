@@ -305,7 +305,14 @@ export class LibraryComponent implements OnInit {
       }
       let orgs: OrgStatus[];
       try {
-        orgs = await this.ipc.orgListStatuses();
+        // PER-INSTANCE ORG TOGGLE: the rail is a content BROWSER, not the management
+        // surface (that's Settings → Organization, which fetches its own UNFILTERED
+        // list so every joined org's toggle is reachable) — a disabled org must not
+        // appear as a pickable "Shared brains" entry here at all, matching the user's
+        // mental model ("F disabled ⇒ not used on this instance"). The actual content
+        // gate is already backend-enforced (list_org_items_inner returns empty for a
+        // disabled org); this filter just keeps the rail honest about what's usable.
+        orgs = (await this.ipc.orgListStatuses()).filter((o) => o.contextEnabled);
       } catch {
         return; // keep the last-known orgs on a transient failure
       }

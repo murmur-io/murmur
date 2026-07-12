@@ -23862,6 +23862,7 @@ mod lifecycle_tests {
     #[test]
     fn org_get_item_returns_detail_and_none_for_tombstone() {
         let state = build_state("org-get-item");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
         state
             .db
             .upsert_org_item(
@@ -23891,6 +23892,47 @@ mod lifecycle_tests {
         assert!(state.db.get_org_item("it-g").unwrap().is_none());
         // Unknown id → None.
         assert!(state.db.get_org_item("nope").unwrap().is_none());
+    }
+
+    /// PER-INSTANCE ORG TOGGLE (RED-before-GREEN): `get_org_item` — the single-item read behind
+    /// `/org-item/:id` — must return `None` for a DISABLED org's item, closing the gap a stale
+    /// citation/bookmark/browser-history entry could otherwise exploit to read through the toggle
+    /// (this read has no org-id list-scoping to gate at, unlike `list_org_items_inner`). Re-enabling
+    /// instantly restores it — the item itself was never touched.
+    #[test]
+    fn org_get_item_returns_none_for_a_disabled_orgs_item_and_restores_on_reenable() {
+        let state = build_state("org-get-item-disabled");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        state
+            .db
+            .upsert_org_item(
+                "it-d",
+                "org-1",
+                1,
+                "anna",
+                "Weekly Sync",
+                "the roadmap for the platform team",
+                "2026-07-10T09:00:00Z",
+                1,
+                1,
+                &[6u8; 32],
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(state.db.get_org_item("it-d").unwrap().is_some(), "visible while enabled");
+
+        state.db.set_org_context_enabled("org-1", false).unwrap();
+        assert!(
+            state.db.get_org_item("it-d").unwrap().is_none(),
+            "a disabled org's item must NEVER be readable via a direct/stale link"
+        );
+
+        state.db.set_org_context_enabled("org-1", true).unwrap();
+        assert!(
+            state.db.get_org_item("it-d").unwrap().is_some(),
+            "re-enabling instantly restores it — the item itself was never touched"
+        );
     }
 
     /// FIX A (browsable org-items LIST): `db.list_org_items` returns the org's LIVE items as headers
