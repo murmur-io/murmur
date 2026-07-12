@@ -1,87 +1,9 @@
 <section class="library">
-  <!-- ============ LEFT PANE — folder tree (lock-aware) ============ -->
-  <mur-sidebar class="folders-pane" aria-label="Folders">
-    <!-- Drag strip mirrors the primary rail so the overlay traffic lights
-         stay clear of the Back button when the rail is flush to the edge. -->
-    <div class="rail-drag" data-tauri-drag-region></div>
-
-    <!-- Drill-down "up": returns to the last non-drill-down route (or /record). -->
-    <button
-      type="button"
-      class="rail-back"
-      (click)="nav.back()"
-      aria-label="Back to Murmur"
-    >
-      <svg
-        class="rail-back-icon"
-        viewBox="0 0 16 16"
-        fill="none"
-        stroke="currentColor"
-        stroke-width="1.6"
-        stroke-linecap="round"
-        stroke-linejoin="round"
-        aria-hidden="true"
-      >
-        <path d="M9.5 3.5 5 8l4.5 4.5" />
-      </svg>
-      <span class="rail-back-label">Murmur</span>
-    </button>
-
-    <div class="folders-head">
-      <h3 class="folders-title">Folders</h3>
-      @if (unlockedCount() > 0) {
-        <button
-          type="button"
-          class="relock-pill"
-          [disabled]="relockingAll()"
-          [attr.aria-label]="
-            'Re-seal all ' + unlockedCount() + ' unlocked folders now'
-          "
-          title="Re-seal every unlocked folder now"
-          (click)="relockAll()"
-        >
-          <svg
-            viewBox="0 0 16 16"
-            width="12"
-            height="12"
-            fill="none"
-            aria-hidden="true"
-          >
-            <rect
-              x="3.5"
-              y="7"
-              width="9"
-              height="6"
-              rx="1.4"
-              stroke="currentColor"
-              stroke-width="1.4"
-            />
-            <path
-              d="M5.5 7V5.4a2.5 2.5 0 0 1 5 0V7"
-              stroke="currentColor"
-              stroke-width="1.4"
-              stroke-linecap="round"
-            />
-          </svg>
-          Lock all
-        </button>
-      }
-    </div>
-    <div class="folders-body">
-      @if (foldersLoading()) {
-        <p class="folders-state empty">Loading folders…</p>
-      } @else {
-        <app-folder-tree
-          [nodes]="folderTree()"
-          [selectedId]="activeFolderId()"
-          (selected)="selectFolder($event)"
-          (dropNote)="onDropNote($event)"
-        />
-      }
-    </div>
-  </mur-sidebar>
-
-  <!-- ============ RIGHT PANE — search, filters, meeting list ============ -->
+  <!-- The folder tree (create/rename/delete/lock/unlock/drag-drop, "Lock all")
+       now lives in the ALWAYS-VISIBLE main sidebar
+       (MeetingsSidebarTreeComponent, nested under "Meetings" — see
+       AppShellComponent, Stage 2 2026-07-12). This view is pure in-flow
+       content beside it, like /record. -->
   <div class="meetings-pane">
     <!-- Frosted search field, pinned to the top of the screen -->
     <div class="search" [class.is-active]="searching()">
@@ -206,7 +128,9 @@
             <li>
               <a
                 class="row"
-                [routerLink]="['/meeting', hit.meeting.id]"
+                tabindex="0"
+                (click)="openMeeting($event, hit.meeting.id, hit.meeting.title)"
+                (keydown.enter)="openMeeting($event, hit.meeting.id, hit.meeting.title)"
                 [style.animation-delay.ms]="i * 35"
               >
                 <span class="row-main">
@@ -350,7 +274,9 @@
             >
               <a
                 class="row"
-                [routerLink]="['/meeting', m.id]"
+                tabindex="0"
+                (click)="openMeeting($event, m.id, m.title)"
+                (keydown.enter)="openMeeting($event, m.id, m.title)"
                 [style.animation-delay.ms]="i * 45"
                 draggable="true"
                 (dragstart)="onRowDragStart($event, m)"

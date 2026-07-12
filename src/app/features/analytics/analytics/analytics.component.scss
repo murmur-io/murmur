@@ -127,6 +127,29 @@
   opacity: 1;
   transform: translate(-50%, -6px);
 }
+/* Edge-aware tooltip alignment (2026-07-12, found by the width-unification
+   audit but PRE-EXISTING): the tip is a ~150px nowrap box centered over its
+   bar, and an absolutely-positioned box contributes to the page's scrollable
+   overflow even at `opacity: 0` — so the tips over the last bars permanently
+   poked past the viewport's right edge and gave the WHOLE page a phantom
+   horizontal scrollbar (10px at 1440w, 17px at 1000w, measured). Pin the
+   outermost columns' tips to their bar's inner edge instead of centering,
+   so no tip box ever extends past the chart card on either side. */
+.chart-col:nth-last-child(-n + 3) .chart-tip {
+  left: auto;
+  right: 0;
+  transform: translate(0, 0);
+}
+.chart-col:nth-last-child(-n + 3):hover .chart-tip {
+  transform: translate(0, -6px);
+}
+.chart-col:nth-child(-n + 3) .chart-tip {
+  left: 0;
+  transform: translate(0, 0);
+}
+.chart-col:nth-child(-n + 3):hover .chart-tip {
+  transform: translate(0, -6px);
+}
 @keyframes grow-bar {
   from {
     transform: scaleY(0);

@@ -1,44 +1,9 @@
-<div
-  class="row-line"
-  [class.is-exposure-locked]="exposure() === 'locked'"
-  [class.is-exposure-session]="exposure() === 'session'"
-  [style.--depth]="depth()"
-  appFolderDrop
-  [dropFolderId]="node().id"
-  (dropNote)="dropNote.emit({ meetingId: $event, folderId: node().id })"
->
-  <!-- Disclosure caret (only when the folder has children) -->
-  @if (childCount()) {
-    <button
-      type="button"
-      class="caret"
-      [class.is-open]="expanded()"
-      [attr.aria-expanded]="expanded()"
-      [attr.aria-label]="
-        (expanded() ? 'Collapse ' : 'Expand ') + node().name
-      "
-      (click)="toggleExpanded()"
-    >
-      <svg viewBox="0 0 12 12" width="11" height="11" aria-hidden="true">
-        <path
-          d="M4.5 2.5 8 6l-3.5 3.5"
-          stroke="currentColor"
-          stroke-width="1.5"
-          stroke-linecap="round"
-          stroke-linejoin="round"
-          fill="none"
-        />
-      </svg>
-    </button>
-  } @else {
+@if (renaming()) {
+  <!-- Inline rename: a slim stand-in for the row (the shared <mur-tree-row>
+       below owns the normal-state visual; this transient edit state keeps its
+       own field styling, mirroring the Notes tree's own inline edit forms). -->
+  <div class="rename-line" [style.--depth]="depth()">
     <span class="caret caret--leaf" aria-hidden="true"></span>
-  }
-
-  <!-- The selectable folder button: glyph + name + count chip.
-       NO lock badge here — the single lock control (below) owns lock state.
-       When renaming, the name is REPLACED by an inline edit field (Enter=save,
-       Esc=cancel; focused via afterNextRender). -->
-  @if (renaming()) {
     <form class="rename-form" (submit)="confirmRename($event)">
       <span class="folder-icon" aria-hidden="true">
         <svg viewBox="0 0 16 16" width="15" height="15" fill="none">
@@ -64,31 +29,26 @@
         (blur)="cancelRename()"
       />
     </form>
-  } @else {
-    <button
-      type="button"
-      class="folder"
-      [class.is-selected]="selectedId() === node().id"
-      [attr.aria-pressed]="selectedId() === node().id"
-      (click)="selected.emit(node().id)"
-    >
-      <span class="folder-icon" aria-hidden="true">
-        <svg viewBox="0 0 16 16" width="15" height="15" fill="none">
-          <path
-            d="M1.75 4.25c0-.7.55-1.25 1.25-1.25h2.8c.4 0 .77.18 1 .5l.6.75h4.6c.7 0 1.25.55 1.25 1.25v5.5c0 .7-.55 1.25-1.25 1.25H3c-.7 0-1.25-.55-1.25-1.25z"
-            stroke="currentColor"
-            stroke-width="1.3"
-            stroke-linejoin="round"
-          />
-        </svg>
-      </span>
-      <span class="folder-name">{{ node().name }}</span>
-      @if (node().noteCount > 0) {
-        <span class="count folder-count">{{ node().noteCount }}</span>
-      }
-    </button>
-  }
-
+  </div>
+} @else {
+  <!-- The ROW VISUAL is the shared <mur-tree-row> (2026-07-12, design-system
+       consolidation — this component keeps the recursion/drag-drop/lock LOGIC
+       and projects only its trailing affordances). The drop directive rides
+       the shared row's host; its is-drop-* classes are styled by the shared
+       component. -->
+  <mur-tree-row
+    [label]="node().name"
+    [depth]="depth()"
+    [count]="node().noteCount > 0 ? node().noteCount : null"
+    [selected]="selectionActive() && selectedId() === node().id"
+    [expandable]="childCount() > 0"
+    [expanded]="expanded()"
+    (toggleExpand)="toggleExpanded()"
+    (activate)="selected.emit(node().id)"
+    appFolderDrop
+    [dropFolderId]="node().id"
+    (dropNote)="dropNote.emit({ meetingId: $event, folderId: node().id })"
+  >
   <!-- ONE lock control. It is the state AND the action: a single padlock per
        row. Always visible while locked/session (so the privacy state always
        reads); revealed on hover for an open folder (the "encrypt" action). -->
@@ -342,7 +302,8 @@
       }
     </div>
   </div>
-</div>
+  </mur-tree-row>
+}
 
 @if (lockError()) {
   <p class="row-error" role="alert" [style.--depth]="depth()">
@@ -356,23 +317,9 @@
     [nodes]="children()"
     [selectedId]="selectedId()"
     [depth]="depth() + 1"
+    [selectionActive]="selectionActive()"
     (selected)="selected.emit($event)"
     (dropNote)="dropNote.emit($event)"
   />
 }
 
-<!-- Lock×shares blocking dialog — shown when locking a folder that still has
-     active shares (or when the share probe failed; Shared Brain v1 + PK-F1).
-     Owned by the shared FolderLockFlowService. OPAQUE overlay (trap T3). -->
-@if (showLockDialog()) {
-  <app-lock-shares-dialog
-    [folderName]="node().name"
-    [report]="lockFlow.report()"
-    [probeFailed]="lockFlow.pending()?.probeFailed ?? false"
-    [busy]="lockFlow.busy()"
-    (revokeAndLock)="lockFlow.revokeAndLock()"
-    (lockAnyway)="lockFlow.lockAnyway()"
-    (cancelled)="lockFlow.cancel()"
-  />
-}
-  

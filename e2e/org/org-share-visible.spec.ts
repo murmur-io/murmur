@@ -182,7 +182,7 @@ test.describe("Org share — browse + picker (mocked IPC)", () => {
 
     // Open a meeting, go to the Share tab → the Org Brain sheet.
     await page.goto("/library");
-    await page.locator("a[href^='/meeting/']").first().click();
+    await page.locator("li.row-item a.row").first().click();
     await page
       .getByRole("tab", { name: /share/i })
       .first()

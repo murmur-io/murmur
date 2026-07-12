@@ -1,18 +1,13 @@
-/* The note editor is a full drill-down (like /meeting/:id): the fixed host fills
-   the window (app-shell hides the primary rail on /notes). Single centered
-   document column, capped at --content-max. Design-tokens only. */
+/* The note editor is now a normal in-flow route (2026-07-12, Notion/Obsidian-
+   style always-visible sidebar) — it renders in `.app-main` beside
+   `<mur-sidebar>`, like `/record`, not a fixed full-window drill-down host.
+   Single centered document column, capped at --content-max. Design-tokens only. */
 :host {
-  position: fixed;
-  inset: 0;
-  z-index: 5;
   display: flex;
   flex-direction: column;
-  background: var(--surface-base);
+  min-height: calc(100vh - var(--space-8));
 }
 
-/* The single child of the fixed host — must itself be the flex column that
-   fills the window, otherwise the sticky header + scroll region below never
-   get a bounded height and the body overflows the viewport un-scrollably. */
 .editor {
   flex: 1 1 auto;
   min-height: 0;
@@ -38,47 +33,11 @@
   display: flex;
   align-items: center;
   gap: var(--space-2);
-  /* Extra left inset clears the overlay macOS traffic lights (trafficLightPosition
-     {32,30} in tauri.conf.json — this fixed drill-down covers the whole window,
-     so nothing else reserves room for them on this row). ~20px past the last dot
-     so the "‹ Notes" back button doesn't crowd the green light. */
-  padding: var(--space-4) var(--space-6) var(--space-3) 104px;
+  padding: var(--space-4) var(--space-6) var(--space-3);
   border-bottom: 1px solid var(--border-subtle);
 }
 .head-spacer {
   flex: 1 1 auto;
-}
-
-.rail-back {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--space-2);
-  height: 34px;
-  padding: 0 var(--space-2);
-  border: 0;
-  border-radius: var(--radius-md);
-  background: transparent;
-  color: var(--text-secondary);
-  font: inherit;
-  font-size: 0.9rem;
-  font-weight: 600;
-  letter-spacing: -0.01em;
-  cursor: pointer;
-  transition: background var(--transition-fast), color var(--transition-fast);
-}
-.rail-back:hover {
-  background: var(--surface-hover);
-  color: var(--text-primary);
-}
-.rail-back:focus-visible {
-  outline: none;
-  color: var(--text-primary);
-  box-shadow: 0 0 0 3px var(--accent-ring);
-}
-.rail-back-icon {
-  flex: none;
-  width: 16px;
-  height: 16px;
 }
 
 /* Breadcrumb / more triggers. */
@@ -251,9 +210,34 @@
 }
 
 /* ===== The document ===== */
+/* DEFAULT width: --editor-max (920px) — wider than the card-grid --content-max
+   (840px, Settings/Notes-home lists) since a full-page WRITING surface reads
+   as cramped at list-tuned widths once the sidebar is always visible and the
+   window is wide. This ONLY works because `.app-main`'s former ancestor cap
+   (`max-width: var(--content-max)`) is gone — `max-width: none; width: 100%`
+   on every main route now (styles.css) — a child's `max-width` can never
+   exceed a narrower ancestor's rendered box, which is exactly why this rule
+   had NO visible effect before that fix (840px ancestor silently clamped
+   this 920px child).
+   "Full width" (⋯ menu, Notion-style) computes ~92% of the now-UNCAPPED
+   available pane — a proportional relationship to the container, not a
+   second fixed token. Wrapped in `max(--editor-max, …)` so it can never come
+   out NARROWER than the default: at smaller-but-still-wide windows (e.g. a
+   1280px viewport with the sidebar visible → ~986px available → 92% ≈ 907px)
+   92% alone would undercut the 920px default, which would make the toggle
+   read as broken (turning "Full width" ON making the document narrower). The
+   `max()` means Full Width is a no-op (not a regression) until the window is
+   wide enough to actually offer more room (~1440px+ viewports give ≈1054px;
+   1920px gives ≈1496px, both genuinely wider than the default). Transition is
+   `max-width` only (layout, not paint) so the toggle reads as an intentional
+   resize, not a jump-cut. */
 .note-doc {
-  max-width: var(--content-max);
+  max-width: var(--editor-max);
   margin: 0 auto;
+  transition: max-width var(--transition);
+}
+.note-doc.is-full-width {
+  max-width: max(var(--editor-max), min(1600px, 92%));
 }
 .note-title-input {
   width: 100%;
@@ -485,6 +469,13 @@
   background: var(--surface-hover);
 }
 
+/* "Full width" toggle item (⋯ menu) — a checkbox-style row: the checkmark
+   floats to the trailing edge when the preference is ON. */
+.menu-check {
+  margin-left: auto;
+  color: var(--accent-hover);
+}
+
 /* Preview. */
 .note-preview {
   min-height: 40vh;
@@ -496,6 +487,9 @@
   .save-spin,
   .props-chevron {
     animation: none;
+    transition: none;
+  }
+  .note-doc {
     transition: none;
   }
 }

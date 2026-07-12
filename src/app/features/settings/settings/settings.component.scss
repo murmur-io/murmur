@@ -2,10 +2,16 @@
    (app-shell) and this host fills the whole window as a flush-left
    [section rail | content] layout. Fixed so it ignores .app-main's
    centered max-width + padding and hugs the viewport edges; below the
-   toast viewport (z-index 60). */
+   toast viewport (z-index 60).
+   `top: var(--tabs-strip-height, 0px)` (not `inset: 0`) — real reserved
+   space for `mur-tab-strip`'s in-flow header row; see library.component.scss
+   for the full rationale. */
 :host {
   position: fixed;
-  inset: 0;
+  top: var(--tabs-strip-height, 0px);
+  right: 0;
+  bottom: 0;
+  left: 0;
   z-index: 5;
   display: block;
   background: var(--surface-base);

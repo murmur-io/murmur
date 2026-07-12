@@ -1,0 +1,132 @@
+/* THE folder-tree row's visual box — one source of truth for BOTH sidebar
+   trees (see the class doc). Box metrics deliberately match the pre-existing
+   Meetings row (`.row-line`/`.folder`, the older of the two implementations);
+   the selected pill paints the WHOLE row (host), matching `.sidebar-nav
+   a.active`'s whole-row convention. Design tokens only. */
+:host {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: var(--space-1);
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
+  transition:
+    background var(--transition),
+    border-color var(--transition),
+    box-shadow var(--transition);
+}
+:host(:hover) {
+  background: var(--surface-hover);
+}
+/* Selected: the shell's neutral glass-on-glass pill (matches every other
+   nav row in the app — `.sidebar-nav a.active`, styles.css). */
+:host(.is-selected) {
+  color: var(--shell-active-text);
+  background: var(--shell-active-bg);
+  box-shadow: var(--shell-active-shadow);
+}
+:host(.is-selected) .row-main,
+:host(.is-selected) .row-icon {
+  color: var(--shell-active-text);
+}
+
+/* Drop-target states — class names set by the feature-side FolderDropDirective
+   when a consumer attaches it to this host (styled here by NAME only; no
+   feature import). Armed: faint dashed hint while any note drags. */
+:host(.is-drop-armed) {
+  border-color: var(--border-strong);
+  border-style: dashed;
+}
+:host(.is-drop-target) {
+  border-style: solid;
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+:host(.is-drop-target) .row-main,
+:host(.is-drop-target) .row-icon {
+  color: var(--accent-hover);
+}
+
+/* --- Leading gutter: disclosure caret, or an equal-width leaf spacer ----- */
+.caret {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition:
+    transform var(--transition),
+    color var(--transition),
+    background var(--transition);
+}
+.caret:hover {
+  color: var(--text-primary);
+  background: var(--surface-input);
+}
+.caret.is-open {
+  transform: rotate(90deg);
+}
+.caret:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+.caret--leaf {
+  cursor: default;
+}
+
+/* --- The main select button: icon + label + optional count chip ---------- */
+.row-main {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: var(--space-2) var(--space-2);
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--text-secondary);
+  font-family: inherit;
+  font-size: 0.9rem;
+  font-weight: 550;
+  letter-spacing: -0.01em;
+  text-align: left;
+  cursor: pointer;
+  transition: color var(--transition);
+}
+.row-main:hover {
+  color: var(--text-primary);
+}
+.row-main:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+.row-icon {
+  display: inline-flex;
+  flex: none;
+  color: var(--text-muted);
+}
+.row-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.row-count {
+  margin-left: auto;
+  min-width: 22px;
+  height: 20px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .caret {
+    transition: none;
+  }
+}

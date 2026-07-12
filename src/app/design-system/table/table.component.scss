@@ -1,0 +1,84 @@
+/* Notion/database-style dense table (2026-07-12). Design tokens only. */
+:host {
+  display: block;
+}
+
+.mur-table {
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: fixed;
+}
+
+.mur-table thead th {
+  padding: var(--space-2) var(--space-3);
+  border-bottom: 1px solid var(--border-subtle);
+  color: var(--text-muted);
+  font-size: 0.7rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  text-align: left;
+}
+.mur-table thead th.is-end {
+  text-align: right;
+}
+
+/* ROW HEIGHT IS A FIXED DESIGN CONSTANT (the point of this component, per its
+   class doc): every row is EXACTLY this tall regardless of a cell's content —
+   a long snippet, a long title, or a lock glyph never grows one row taller
+   than its neighbors. `height` (not `min-height`) + `overflow: hidden` on the
+   cell is what actually enforces this even if a consumer's cell template
+   forgets to keep its own content single-line: it clips instead of growing. */
+.mur-table tbody tr {
+  height: 44px;
+  transition: background var(--transition-fast);
+}
+.mur-table tbody tr:hover {
+  background: var(--surface-hover);
+}
+.mur-table tbody td {
+  height: 44px;
+  max-height: 44px;
+  padding: 0 var(--space-3);
+  border-bottom: 1px solid var(--border-subtle);
+  overflow: hidden;
+  vertical-align: middle;
+}
+.mur-table tbody td.is-end {
+  text-align: right;
+}
+
+/* Generic per-row semantics a consumer opts into via `rowClass` — a `<tr>`
+   is rendered by THIS component's own template, so a consumer's scoped CSS
+   can't reach it directly (Angular view encapsulation); these two class
+   names are this component's own small, reusable vocabulary rather than
+   forcing every consumer to reinvent "muted row" / "raise above a scrim". */
+.mur-table tbody tr.is-muted {
+  color: var(--text-muted);
+}
+/* Raise the row whose own overflow menu is open ABOVE a page-level click-away
+   scrim, so the (page-level, opaque T3) menu receives clicks instead of it. */
+.mur-table tbody tr.is-menu-open {
+  position: relative;
+  z-index: 50;
+}
+
+/* Screen-reader-only header label (e.g. an icon-only actions column). */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  border: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .mur-table tbody tr {
+    transition: none;
+  }
+}
