@@ -1895,6 +1895,18 @@ export interface OrgItemHeader {
   /** The item's feed sequence — stable ordering key for the browse list. */
   seq: number;
   /**
+   * The item's source kind — `"document"` (a shared authored note, for the Notes
+   * view) or `"meeting"` (a shared meeting note, for the Library/Meetings view) —
+   * so a per-org list can be filtered into "shared meetings" vs "shared notes".
+   * Populated backend-side (`Db::list_org_items` reads the stored `org_items
+   * .source_kind` column) for ANY item ingested off a v2 `OrgEnvelope` — including
+   * a colleague's item, not just one THIS device published. Still absent/`null`
+   * for an item ingested off an old v1 envelope (published before the source-kind
+   * wire field existed) — treat `null` as "unclassified", do NOT default it into
+   * either bucket. Mirrors the Rust `OrgItemHeader.kind`.
+   */
+  kind?: "document" | "meeting" | null;
+  /**
    * When THIS user published the item AND their local source is readable, the
    * editable original behind it (resolved backend-side, unlock-gated). Present ⇒
    * the row links straight to `/notes/:id` | `/meeting/:id` and `title` is the
@@ -1965,6 +1977,30 @@ export interface OrgShareEntry {
   sharedAt: string;
   rev: number;
   state: "queued" | "uploaded" | "failed" | "revoke_pending" | "revoked";
+}
+
+/**
+ * One org a meeting is ACTIVELY shared into (`meetingOrgShares`) — drives the "Shared with
+ * [org]" badge on the Library row + the Detail view. Content-free beyond the org's own display
+ * name. Gated exactly like `MeetingDetail`: a sealed-and-not-session-unlocked meeting resolves
+ * to `[]`, never leaking its share status. Only the text note/summary is ever shared through
+ * this path — the audio recording never leaves the device. Mirrors the Rust `MeetingOrgShareInfo`.
+ */
+export interface MeetingOrgShareInfo {
+  orgId: string;
+  orgName: string;
+}
+
+/**
+ * One row of `listMeetingOrgShares` — the BULK Library-row variant of
+ * {@link MeetingOrgShareInfo}: every active meeting→org share pairing across ALL of the
+ * caller's meetings in one call (avoids an N+1 per-row fetch). Same gate: a sealed-and-
+ * not-session-unlocked meeting contributes no rows. Mirrors the Rust `MeetingOrgShareRow`.
+ */
+export interface MeetingOrgShareRow {
+  meetingId: string;
+  orgId: string;
+  orgName: string;
 }
 
 /**
