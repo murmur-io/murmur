@@ -94,18 +94,19 @@ test.describe("org-editable + library unification (mocked IPC)", () => {
     const orgChip = page.locator(".org-chip", { hasText: "Acme Inc." });
     await expect(orgChip).toHaveCount(1);
     // NO org rows/cards merged into the default "All meetings" list up front.
-    await expect(page.locator("a[href^='/org-item/']")).toHaveCount(0);
     await expect(page.getByText("Acme onboarding brief")).toHaveCount(0);
     await expect(page.getByText("Pricing rework notes")).toHaveCount(0);
 
-    // Selecting the org chip shows ITS scoped list — but both mocked items are
-    // unclassified (no `kind`), so NEITHER renders; the "couldn't be
-    // classified" note explains the two hidden items instead.
+    // Selecting the org chip shows ITS scoped list. Both mocked items are
+    // unclassified (no `kind` — the pre-v2 wire format) — live-found bug fix,
+    // 2026-07-12: these used to be silently EXCLUDED (a passive "couldn't be
+    // classified" note was the only hint they existed). Shared content must
+    // never just vanish, so they now render, each badged "unclassified"
+    // rather than shown as a confirmed meeting.
     await orgChip.click();
-    await expect(page.getByText(/couldn.t be classified/i)).toBeVisible();
-    await expect(page.getByText("Acme onboarding brief")).toHaveCount(0);
-    await expect(page.getByText("Pricing rework notes")).toHaveCount(0);
-    await expect(page.locator("a[href^='/org-item/']")).toHaveCount(0);
+    await expect(page.getByText("Acme onboarding brief")).toBeVisible();
+    await expect(page.getByText("Pricing rework notes")).toBeVisible();
+    await expect(page.locator(".unclassified-hint")).toHaveCount(2);
   });
 
   test("B1+F3 — read-only viewer (null resolve) renders + Back goes to /notes", async ({

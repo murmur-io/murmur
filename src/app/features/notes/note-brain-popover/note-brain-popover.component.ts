@@ -15,6 +15,7 @@ import {
 } from "@angular/core";
 import { Router } from "@angular/router";
 import { IpcService } from "../../../core/ipc.service";
+import { TabsService } from "../../../core/tabs.service";
 import type {
   NoteAssistAction,
   NoteAssistResult,
@@ -116,6 +117,7 @@ export class NoteBrainPopoverComponent {
   private readonly injector = inject(Injector);
   private readonly destroyRef = inject(DestroyRef);
   private readonly router = inject(Router);
+  private readonly tabsService = inject(TabsService);
   /** Root-owned timer service — the sanctioned home for the step-animation tick (rule §5). */
   private readonly timers = inject(TimerService);
 
@@ -486,22 +488,31 @@ export class NoteBrainPopoverComponent {
     }
   }
 
-  /** Open a citation's source note/meeting/org-item; dismiss the popover first. */
+  /**
+   * Open a citation's source note/meeting/org-item; dismiss the popover
+   * first. A note/meeting/org-item opens as a TRACKED TAB (live-found bug,
+   * 2026-07-12: this used to be a plain `router.navigate`, so a citation
+   * click — for ANY kind, not just org — never registered with
+   * {@link TabsService}, unlike opening the same note/meeting from its own
+   * list row). `person`/`entity` still go to `/graph`, which isn't part of
+   * the tab system.
+   */
   openCitation(cite: NoteCitation): void {
     this.dismiss.emit();
-    // "org" routes to the read-only org-item viewer (mirrors library.component.ts orgItemLink) —
-    // it is NOT a local note/meeting id, so it must never fall into the "/notes" default below.
     if (cite.kind === "org") {
-      void this.router.navigate(["/org-item", cite.id]);
+      // NOT a local note/meeting id — the read-only org-item viewer tab.
+      void this.tabsService.openOrgItem(cite.id, cite.title || "Shared note");
       return;
     }
-    const path =
-      cite.kind === "meeting"
-        ? "/meeting"
-        : cite.kind === "person" || cite.kind === "entity"
-          ? "/graph"
-          : "/notes";
-    void this.router.navigate([path, cite.id]);
+    if (cite.kind === "meeting") {
+      void this.tabsService.openMeeting(cite.id, cite.title || "Meeting");
+      return;
+    }
+    if (cite.kind === "note") {
+      void this.tabsService.openNote(cite.id, cite.title || "Note");
+      return;
+    }
+    void this.router.navigate(["/graph", cite.id]);
   }
 
   // ── Positioning + teardown ───────────────────────────────────────────────

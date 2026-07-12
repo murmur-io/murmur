@@ -102,9 +102,11 @@
   flex: none;
   font-size: 0.7rem;
 }
-.org-unclassified-note {
-  margin: 0;
-  font-size: 0.8125rem;
+/* Badges an org row shared before the meeting/document distinction existed —
+ * still shown (never silently dropped), just marked as a best guess. */
+.unclassified-hint {
+  color: var(--text-muted);
+  font-style: italic;
 }
 
 .meetings-pane {

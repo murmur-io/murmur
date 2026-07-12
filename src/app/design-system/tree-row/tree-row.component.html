@@ -50,7 +50,7 @@
       }
     }
   </span>
-  <span class="row-label">{{ label() }}</span>
+  <span class="row-label" [title]="label()">{{ label() }}</span>
   @if (count() !== null && count()! > 0) {
     <span class="count row-count">{{ count() }}</span>
   }
