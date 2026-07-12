@@ -1997,6 +1997,105 @@ impl Db {
         Ok(out)
     }
 
+    /// Every LIVE (`uploaded`) org share of ONE exact source (`meeting_id` XOR `document_id`) in ONE
+    /// org, OLDEST-FIRST (stable tie-break on `id`). The `(org, source)`-scoped twin of
+    /// `org_shares_for_source` (which spans all orgs): powers the share IDEMPOTENCY guard + the
+    /// duplicate collapse — `[0]` is the canonical KEEPER (earliest published, the identity other
+    /// members first saw), `[1..]` are accidental duplicates to tombstone. `state = 'uploaded'` only
+    /// (a queued/failed row has no live server item; a revoked one was intentionally torn down).
+    /// `meeting_id`/`document_id` matched NULL-safe via `IS`; both-None ⇒ empty (no source).
+    pub fn uploaded_org_shares_for_source_in_org(
+        &self,
+        org_id: &str,
+        meeting_id: Option<&str>,
+        document_id: Option<&str>,
+    ) -> Result<Vec<crate::storage::OrgShareRow>> {
+        if meeting_id.is_none() && document_id.is_none() {
+            return Ok(Vec::new());
+        }
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT {} FROM org_shares
+                   WHERE org_id = ?1 AND state = 'uploaded'
+                     AND meeting_id IS ?2 AND document_id IS ?3
+                   ORDER BY created_at ASC, id ASC",
+                Self::ORG_SHARE_COLS
+            ))
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params![org_id, meeting_id, document_id],
+                Self::map_org_share,
+            )
+            .map_err(map_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(map_err)?);
+        }
+        Ok(out)
+    }
+
+    /// Every DUPLICATE live org share across the whole DB: an `uploaded` row that has an EARLIER
+    /// `uploaded` sibling for the same `(org_id, meeting_id, document_id)` — i.e. the extras to
+    /// tombstone, keeping only the earliest per group. Powers the on-launch dedup sweep that cleans
+    /// duplicates created before the idempotency guard existed (e.g. a double-click on Share). Tie-break
+    /// on `id` so two rows sharing a `created_at` still pick ONE deterministic keeper. NEVER returns a
+    /// keeper (the earliest of its group). `meeting_id`/`document_id` grouped NULL-safe via `IS`.
+    pub fn duplicate_uploaded_org_shares(&self) -> Result<Vec<crate::storage::OrgShareRow>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT {} FROM org_shares o
+                   WHERE o.state = 'uploaded'
+                     AND EXISTS (
+                       SELECT 1 FROM org_shares e
+                        WHERE e.state = 'uploaded'
+                          AND e.org_id = o.org_id
+                          AND e.meeting_id IS o.meeting_id
+                          AND e.document_id IS o.document_id
+                          AND (e.created_at < o.created_at
+                            OR (e.created_at = o.created_at AND e.id < o.id)))
+                   ORDER BY o.created_at ASC, o.id ASC",
+                Self::ORG_SHARE_COLS
+            ))
+            .map_err(map_err)?;
+        let rows = stmt.query_map([], Self::map_org_share).map_err(map_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(map_err)?);
+        }
+        Ok(out)
+    }
+
+    /// Cancel (mark `revoked`) any NOT-yet-uploaded (`queued`/`failed`) org share for a given
+    /// (org, source). Used after a collapse when a live `uploaded` keeper already exists for that
+    /// source: a pending sibling is redundant (the source is already live) and would otherwise linger
+    /// as a stuck "pending" row that the launch sweep re-attempts every start. These rows have NO server
+    /// `item_id`, so cancelling is LOCAL-ONLY (no tombstone). Returns the number of rows cancelled.
+    /// `meeting_id`/`document_id` matched NULL-safe via `IS`; both-None ⇒ 0 (no source).
+    pub fn cancel_pending_org_shares_for_source_in_org(
+        &self,
+        org_id: &str,
+        meeting_id: Option<&str>,
+        document_id: Option<&str>,
+        updated_at: &str,
+    ) -> Result<usize> {
+        if meeting_id.is_none() && document_id.is_none() {
+            return Ok(0);
+        }
+        let conn = self.lock();
+        let n = conn
+            .execute(
+                "UPDATE org_shares SET state = 'revoked', updated_at = ?4
+                   WHERE org_id = ?1 AND state IN ('queued', 'failed')
+                     AND meeting_id IS ?2 AND document_id IS ?3",
+                rusqlite::params![org_id, meeting_id, document_id, updated_at],
+            )
+            .map_err(map_err)?;
+        Ok(n)
+    }
+
     /// SB-3 dedup: the EXISTING retriable (`queued`/`failed`) org-share row for a logical share key
     /// (org + meeting-or-document), if any. `share_to_org_inner` REUSES it on a re-publish instead of
     /// minting a fresh row every sweep tick — without this, each failed retry inserted a NEW row while
@@ -10781,6 +10880,128 @@ mod tests {
         assert_eq!(mrows.len(), 1);
         assert_eq!(mrows[0].meeting_id.as_deref(), Some("m1"));
         assert!(db.org_shares_for_source(None, None).unwrap().is_empty());
+    }
+
+    /// `uploaded_org_shares_for_source_in_org` is (org, source)-SCOPED and OLDEST-FIRST: only the
+    /// `uploaded` rows for the EXACT (org, source), earliest `created_at` first (so `[0]` is the dedup
+    /// keeper), excluding another org, another source, and any non-uploaded (queued / revoked) row.
+    #[test]
+    fn uploaded_org_shares_for_source_in_org_scopes_and_orders_oldest_first() {
+        let db = mem_db();
+        // (org-1, d1): three uploaded rows at increasing timestamps → all returned, oldest-first.
+        db.insert_org_share("u-b", "org-1", None, Some("d1"), "note", Some("T"), 1, 1, &sha32(2), "2026-07-11T00:02:00Z").unwrap();
+        db.set_org_share_uploaded("u-b", "item-b", "2026-07-11T00:02:00Z").unwrap();
+        db.insert_org_share("u-a", "org-1", None, Some("d1"), "note", Some("T"), 1, 1, &sha32(1), "2026-07-11T00:01:00Z").unwrap();
+        db.set_org_share_uploaded("u-a", "item-a", "2026-07-11T00:01:00Z").unwrap();
+        db.insert_org_share("u-c", "org-1", None, Some("d1"), "note", Some("T"), 1, 1, &sha32(3), "2026-07-11T00:03:00Z").unwrap();
+        db.set_org_share_uploaded("u-c", "item-c", "2026-07-11T00:03:00Z").unwrap();
+        // A still-`queued` row for the same (org, source) — EXCLUDED (no live server item).
+        db.insert_org_share("u-q", "org-1", None, Some("d1"), "note", Some("T"), 1, 1, &sha32(4), "2026-07-11T00:00:40Z").unwrap();
+        // A `revoked` row for the same (org, source) — EXCLUDED (intentionally torn down).
+        db.insert_org_share("u-r", "org-1", None, Some("d1"), "note", Some("T"), 1, 1, &sha32(5), "2026-07-11T00:00:30Z").unwrap();
+        db.set_org_share_uploaded("u-r", "item-r", "2026-07-11T00:00:30Z").unwrap();
+        db.set_org_share_state("u-r", "revoked", "2026-07-11T00:05:00Z").unwrap();
+        // Same source d1 in ANOTHER org — EXCLUDED (org-scoped).
+        db.insert_org_share("u-o2", "org-2", None, Some("d1"), "note", Some("T"), 1, 1, &sha32(6), "2026-07-11T00:00:10Z").unwrap();
+        db.set_org_share_uploaded("u-o2", "item-o2", "2026-07-11T00:00:10Z").unwrap();
+        // ANOTHER source in org-1 — EXCLUDED.
+        db.insert_org_share("u-d2", "org-1", None, Some("d2"), "note", Some("T"), 1, 1, &sha32(7), "2026-07-11T00:00:20Z").unwrap();
+        db.set_org_share_uploaded("u-d2", "item-d2", "2026-07-11T00:00:20Z").unwrap();
+
+        let rows = db
+            .uploaded_org_shares_for_source_in_org("org-1", None, Some("d1"))
+            .unwrap();
+        let ids: Vec<_> = rows.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, vec!["u-a", "u-b", "u-c"], "only (org-1,d1) uploaded rows, oldest-first");
+        // The both-None guard returns empty (no source ⇒ nothing).
+        assert!(db
+            .uploaded_org_shares_for_source_in_org("org-1", None, None)
+            .unwrap()
+            .is_empty());
+    }
+
+    /// `duplicate_uploaded_org_shares` returns EXACTLY the extras (every `uploaded` row with an EARLIER
+    /// `uploaded` sibling in its (org, source) group) — never a keeper, never a single (non-dup) share,
+    /// never a revoked row. This is the on-launch dedup worklist.
+    #[test]
+    fn duplicate_uploaded_org_shares_returns_only_the_extras() {
+        let db = mem_db();
+        // Group A: (org-1, d1) has THREE uploaded rows → keeper = earliest (a1); extras = a2, a3.
+        db.insert_org_share("a1", "org-1", None, Some("d1"), "note", Some("T"), 1, 1, &sha32(1), "2026-07-11T00:01:00Z").unwrap();
+        db.set_org_share_uploaded("a1", "item-a1", "2026-07-11T00:01:00Z").unwrap();
+        db.insert_org_share("a2", "org-1", None, Some("d1"), "note", Some("T"), 1, 1, &sha32(2), "2026-07-11T00:02:00Z").unwrap();
+        db.set_org_share_uploaded("a2", "item-a2", "2026-07-11T00:02:00Z").unwrap();
+        db.insert_org_share("a3", "org-1", None, Some("d1"), "note", Some("T"), 1, 1, &sha32(3), "2026-07-11T00:03:00Z").unwrap();
+        db.set_org_share_uploaded("a3", "item-a3", "2026-07-11T00:03:00Z").unwrap();
+        // Group B: (org-1, m1) meeting has a SINGLE uploaded row → NOT a duplicate.
+        db.insert_org_share("b1", "org-1", Some("m1"), None, "note", Some("T"), 1, 1, &sha32(4), "2026-07-11T00:01:00Z").unwrap();
+        db.set_org_share_uploaded("b1", "item-b1", "2026-07-11T00:01:00Z").unwrap();
+        // Group C: (org-2, d1) SAME doc but DIFFERENT org → its own single-member group → NOT a duplicate.
+        db.insert_org_share("c1", "org-2", None, Some("d1"), "note", Some("T"), 1, 1, &sha32(5), "2026-07-11T00:01:00Z").unwrap();
+        db.set_org_share_uploaded("c1", "item-c1", "2026-07-11T00:01:00Z").unwrap();
+        // A REVOKED extra in group A must NOT count (only live uploaded rows dedup).
+        db.insert_org_share("a-rev", "org-1", None, Some("d1"), "note", Some("T"), 1, 1, &sha32(6), "2026-07-11T00:04:00Z").unwrap();
+        db.set_org_share_uploaded("a-rev", "item-arev", "2026-07-11T00:04:00Z").unwrap();
+        db.set_org_share_state("a-rev", "revoked", "2026-07-11T00:05:00Z").unwrap();
+
+        let extras = db.duplicate_uploaded_org_shares().unwrap();
+        let ids: std::collections::HashSet<_> = extras.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["a2", "a3"].into_iter().collect(),
+            "only the later extras of group A (keep the earliest per group)"
+        );
+        assert!(!ids.contains("a1"), "the earliest (keeper) is never returned");
+        assert!(
+            !ids.contains("b1") && !ids.contains("c1"),
+            "single-share groups are not duplicates"
+        );
+        assert!(!ids.contains("a-rev"), "a revoked row is not a live duplicate");
+    }
+
+    /// `cancel_pending_org_shares_for_source_in_org` cancels ONLY the (org, source) `queued`/`failed`
+    /// rows, leaving `uploaded` keepers and other orgs/sources untouched.
+    #[test]
+    fn cancel_pending_org_shares_scopes_to_org_and_source() {
+        let db = mem_db();
+        // Target (org-1, d1): one queued + one failed → both cancelled.
+        db.insert_org_share("q", "org-1", None, Some("d1"), "note", Some("T"), 1, 1, &sha32(1), "2026-07-11T00:01:00Z").unwrap();
+        db.insert_org_share("f", "org-1", None, Some("d1"), "note", Some("T"), 1, 1, &sha32(2), "2026-07-11T00:02:00Z").unwrap();
+        db.set_org_share_failed("f", "boom", "2026-07-11T00:02:30Z").unwrap();
+        // An UPLOADED row for the same (org, source) — NOT cancelled.
+        db.insert_org_share("u", "org-1", None, Some("d1"), "note", Some("T"), 1, 1, &sha32(3), "2026-07-11T00:00:30Z").unwrap();
+        db.set_org_share_uploaded("u", "item-u", "2026-07-11T00:00:30Z").unwrap();
+        // A queued row for ANOTHER source and ANOTHER org — NOT touched.
+        db.insert_org_share("q-d2", "org-1", None, Some("d2"), "note", Some("T"), 1, 1, &sha32(4), "2026-07-11T00:01:00Z").unwrap();
+        db.insert_org_share("q-o2", "org-2", None, Some("d1"), "note", Some("T"), 1, 1, &sha32(5), "2026-07-11T00:01:00Z").unwrap();
+
+        let n = db
+            .cancel_pending_org_shares_for_source_in_org("org-1", None, Some("d1"), "2026-07-11T01:00:00Z")
+            .unwrap();
+        assert_eq!(n, 2, "both the queued and failed (org-1,d1) rows are cancelled");
+        assert_eq!(db.get_org_share("q").unwrap().unwrap().state, "revoked");
+        assert_eq!(db.get_org_share("f").unwrap().unwrap().state, "revoked");
+        assert_eq!(
+            db.get_org_share("u").unwrap().unwrap().state,
+            "uploaded",
+            "the uploaded keeper is untouched"
+        );
+        assert_eq!(
+            db.get_org_share("q-d2").unwrap().unwrap().state,
+            "queued",
+            "another source is untouched"
+        );
+        assert_eq!(
+            db.get_org_share("q-o2").unwrap().unwrap().state,
+            "queued",
+            "another org is untouched"
+        );
+        // both-None guard → no-op.
+        assert_eq!(
+            db.cancel_pending_org_shares_for_source_in_org("org-1", None, None, "x")
+                .unwrap(),
+            0
+        );
     }
 
     /// NOTES feature — the additive columns exist after migrate() and re-migrating is a no-op
