@@ -46,10 +46,14 @@ echo "── cargo audit (RUSTSEC advisories) ──"
 # defeats the entire point of the tool: a stale binary can't parse newer advisory-db entries
 # (hit 2026-07-12 — RUSTSEC-2026-0073 uses `cvss = "CVSS:4.0/…"`, which an old cargo-audit's
 # RUSTSEC-parser rejects as "unsupported CVSS version: 4.0", failing CI on an unrelated PR).
-# `cargo install --locked` is a no-op fetch-and-skip when already current, so this costs
-# nothing when the cache is fresh and self-heals when it isn't.
+# `--force` is required, not optional: without it, `cargo install` errors "binary already
+# exists in destination" the instant a rust-cache restore leaves a binary on disk whose
+# install-tracking metadata (~/.cargo/.crates2.json) doesn't fully agree with it (observed on
+# CI: it re-downloaded the crate, then refused to place the binary over the existing file) —
+# so a bare `cargo install --locked` is NOT reliably a no-op across a restored cache; `--force`
+# makes the outcome deterministic (always freshly placed) regardless of that metadata's state.
 echo "  installing/updating cargo-audit…"
-cargo install --locked cargo-audit
+cargo install --locked --force cargo-audit
 # Gate on actual VULNERABILITIES (default behavior: non-zero exit on any RUSTSEC vulnerability).
 # We deliberately do NOT pass `--deny warnings`: the Tauri framework pulls in transitive crates
 # with unmaintained/unsound *warnings* (unic-ucd-*, glib) that we cannot fix here and that are not
@@ -63,9 +67,9 @@ cargo audit --file Cargo.lock
 echo "── cargo deny check (advisories, licenses, bans, sources) ──"
 # Same always-(re)install rationale as cargo-audit above — same cached-~/.cargo/bin staleness
 # risk, same category of supply-chain tool where "quietly stopped updating" is the failure mode
-# to avoid, not a build-time optimization to chase.
+# to avoid, not a build-time optimization to chase. Same `--force` reasoning too.
 echo "  installing/updating cargo-deny…"
-cargo install --locked cargo-deny
+cargo install --locked --force cargo-deny
 cargo deny --manifest-path src-tauri/Cargo.toml check
 
 echo "── cargo build ──"
