@@ -41,10 +41,15 @@ echo "── cargo test ──"
 
 # ── Supply-chain gates (D11/F5): advisories + license/ban/source policy, BEFORE the build. ──
 echo "── cargo audit (RUSTSEC advisories) ──"
-if ! command -v cargo-audit >/dev/null 2>&1; then
-  echo "  cargo-audit not found — installing…"
-  cargo install --locked cargo-audit
-fi
+# ALWAYS (re)install, never "if missing" — CI caches ~/.cargo/bin (Swatinem/rust-cache), so a
+# presence check reuses whatever cargo-audit binary was built months ago indefinitely. That
+# defeats the entire point of the tool: a stale binary can't parse newer advisory-db entries
+# (hit 2026-07-12 — RUSTSEC-2026-0073 uses `cvss = "CVSS:4.0/…"`, which an old cargo-audit's
+# RUSTSEC-parser rejects as "unsupported CVSS version: 4.0", failing CI on an unrelated PR).
+# `cargo install --locked` is a no-op fetch-and-skip when already current, so this costs
+# nothing when the cache is fresh and self-heals when it isn't.
+echo "  installing/updating cargo-audit…"
+cargo install --locked cargo-audit
 # Gate on actual VULNERABILITIES (default behavior: non-zero exit on any RUSTSEC vulnerability).
 # We deliberately do NOT pass `--deny warnings`: the Tauri framework pulls in transitive crates
 # with unmaintained/unsound *warnings* (unic-ucd-*, glib) that we cannot fix here and that are not
@@ -56,10 +61,11 @@ fi
 cargo audit --file Cargo.lock
 
 echo "── cargo deny check (advisories, licenses, bans, sources) ──"
-if ! command -v cargo-deny >/dev/null 2>&1; then
-  echo "  cargo-deny not found — installing…"
-  cargo install --locked cargo-deny
-fi
+# Same always-(re)install rationale as cargo-audit above — same cached-~/.cargo/bin staleness
+# risk, same category of supply-chain tool where "quietly stopped updating" is the failure mode
+# to avoid, not a build-time optimization to chase.
+echo "  installing/updating cargo-deny…"
+cargo install --locked cargo-deny
 cargo deny --manifest-path src-tauri/Cargo.toml check
 
 echo "── cargo build ──"
