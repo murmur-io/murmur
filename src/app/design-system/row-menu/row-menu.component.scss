@@ -1,0 +1,57 @@
+/* :host is the trigger's positioning context — `position: relative` so the
+   panel below anchors to THIS element, not the row. Quiet until the row is
+   hovered/focused (`:host-context` reaches out to the ANCESTOR `mur-tree-row`
+   — Angular emulated encapsulation supports it — so no consumer file has to
+   re-declare a hover-reveal rule for this component's internals) or the
+   panel is open (never hide out from under an open menu). */
+:host {
+  position: relative;
+  display: inline-flex;
+  flex: none;
+  opacity: 0;
+  transition: opacity var(--transition-fast);
+}
+:host-context(mur-tree-row:hover),
+:host-context(mur-tree-row:focus-within),
+:host(.is-open) {
+  opacity: 1;
+}
+
+.row-menu-trigger {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 21px;
+  height: 21px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition:
+    background var(--transition-fast),
+    color var(--transition-fast);
+}
+.row-menu-trigger:hover:not(:disabled),
+.row-menu-trigger.is-open {
+  background: var(--surface-raised);
+  color: var(--text-primary);
+}
+.row-menu-trigger:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--accent-ring);
+}
+.row-menu-trigger:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+/* The panel floats OVER the tree — anchored to the trigger's bottom-right so
+   it never runs off the sidebar's right edge. `.menu` (primitives.css)
+   supplies the opaque surface/border/shadow; this file only positions it. */
+.row-menu-panel {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  z-index: 30;
+}
