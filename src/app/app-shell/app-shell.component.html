@@ -75,15 +75,54 @@
           }
           @if (!group.collapsible || insightsExpanded() || railMode()) {
             @for (item of group.items; track item.path) {
-              <a
-                [routerLink]="item.path"
-                routerLinkActive="active"
-                [attr.aria-label]="item.label"
-                [attr.title]="railMode() ? item.label : null"
-              >
-                <mur-icon [icon]="item.icon" />
-                <span class="nav-label">{{ item.label }}</span>
-              </a>
+              @if (item.path === "/notes" && !railMode()) {
+                <!-- Notes: the shared expandable-section shell (header + "All
+                     notes" root row) — consolidated 2026-07-12 out of a
+                     duplicated inline block that kept drifting from Meetings'
+                     equivalent (padding/icon-size/selected-pill fixes needed
+                     re-applying twice). The main sidebar is ALWAYS visible
+                     now, so Notes' folders live here instead of a separate
+                     local rail. -->
+                <mur-sidebar-section
+                  routePath="/notes"
+                  icon="notes"
+                  label="Notes"
+                  addFolderLabel="New note folder"
+                  [expanded]="notesTreeOpen()"
+                  (toggleExpanded)="toggleNotesTree()"
+                  (addFolder)="newNoteFolder()"
+                  (headerSelect)="onNotesHeaderSelect()"
+                >
+                  <app-notes-sidebar-tree [sectionActive]="isNotesRoute()" />
+                </mur-sidebar-section>
+              } @else if (item.path === "/library" && !railMode()) {
+                <!-- Meetings: the SAME shared shell as Notes (mirrors it
+                     exactly — see the comment there). -->
+                <mur-sidebar-section
+                  routePath="/library"
+                  icon="meetings"
+                  label="Meetings"
+                  addFolderLabel="New meeting folder"
+                  [expanded]="meetingsTreeOpen()"
+                  [enableHeaderDrop]="true"
+                  (toggleExpanded)="toggleMeetingsTree()"
+                  (addFolder)="newMeetingFolder()"
+                  (headerSelect)="onMeetingsHeaderSelect()"
+                  (headerDropNote)="onMeetingsHeaderDrop($event)"
+                >
+                  <app-meetings-sidebar-tree [sectionActive]="isMeetingsRoute()" />
+                </mur-sidebar-section>
+              } @else {
+                <a
+                  [routerLink]="item.path"
+                  routerLinkActive="active"
+                  [attr.aria-label]="item.label"
+                  [attr.title]="railMode() ? item.label : null"
+                >
+                  <mur-icon [icon]="item.icon" />
+                  <span class="nav-label">{{ item.label }}</span>
+                </a>
+              }
             }
           }
         }
@@ -236,9 +275,28 @@
   }
 }
 
-<main class="app-main">
-  <router-outlet></router-outlet>
-</main>
+<!-- Real in-flow layout, not a floating overlay (fixed 2026-07-12 — a
+     `position: fixed` strip could never make the page underneath aware
+     space was taken, so every route needed its own pixel-guess clearance,
+     forever fragile). `.main-col` is the flex COLUMN [tab strip, app-main]
+     occupying the SAME row-item slot `.app-main` used to occupy directly
+     (beside the sidebar in sidebar/rail mode; full width in pill/drill-down
+     mode) — `mur-tab-strip` now genuinely PUSHES `.app-main` down by its
+     real rendered height when tabs are open, and contributes ZERO height
+     when `tabs().length === 0` (its own `@if`). The one remaining wrinkle:
+     drill-down routes (library / notes home / note editor / settings) render
+     their OWN `position: fixed; inset: 0` full-window host, which ignores
+     normal DOM flow and would paint over this strip regardless — those hosts
+     read `top: var(--tabs-strip-height, 0px)` (set on `:root` by
+     `AppShellComponent`, see its ctor) instead of `inset: 0`, so they
+     structurally leave the strip's real height uncovered rather than
+     floating a guess on top of it. -->
+<div class="main-col">
+  <mur-tab-strip />
+  <main class="app-main">
+    <router-outlet (detach)="onOutletDetach($event)"></router-outlet>
+  </main>
+</div>
 
 <!-- ⌘K quick-search spotlight (works from every route, drill-downs too). -->
 @if (searchOpen()) {
@@ -278,5 +336,19 @@
       </div>
     }
   </div>
+}
+
+<!-- Lock×shares blocking dialog (PK-F1) — rendered ONCE for the whole app
+     (2026-07-12 fix; see the `lockFlow` field doc). Opaque overlay (T3). -->
+@if (lockFlow.pending(); as pending) {
+  <app-lock-shares-dialog
+    [folderName]="pending.folderName"
+    [report]="lockFlow.report()"
+    [probeFailed]="pending.probeFailed"
+    [busy]="lockFlow.busy()"
+    (revokeAndLock)="lockFlow.revokeAndLock()"
+    (lockAnyway)="lockFlow.lockAnyway()"
+    (cancelled)="lockFlow.cancel()"
+  />
 }
   

@@ -172,7 +172,7 @@ test.describe("Shared Brain v1 — org FE surfaces (mocked IPC)", () => {
     });
     // Open a meeting, go to the Share tab.
     await page.goto("/library");
-    await page.locator("a[href^='/meeting/']").first().click();
+    await page.locator("li.row-item a.row").first().click();
     await page.getByRole("tab", { name: /share/i }).first().click().catch(async () => {
       // Fallback if the tab is a button, not a role=tab.
       await page.getByText("Share", { exact: false }).first().click();

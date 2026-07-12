@@ -324,7 +324,9 @@ export class NoteSharePanelComponent {
         if (this.noteId() !== id) {
           return;
         }
-        this._orgSourceShares.set(live);
+        // Defensive: never let a malformed/non-array response null-deref a
+        // downstream array read over this signal.
+        this._orgSourceShares.set(Array.isArray(live) ? live : []);
       } else {
         this._orgSourceShares.set([]);
       }

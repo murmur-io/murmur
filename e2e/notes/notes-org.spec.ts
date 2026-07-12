@@ -4,10 +4,14 @@ import { mockNotes } from "./mock-invoke";
 /**
  * Notes home — org (Shared Brain) surfacing. Confirms that with a mocked org
  * (`org_list_statuses`) carrying a shared item (`list_org_items`), the Notes view:
- *   1. renders the "Shared brains" rail section listing the org (name + role);
- *   2. MERGES the org's shared item into the "All notes" content pane alongside
- *      YOUR authored notes, with the ORG-NAME badge on the org card;
- *   3. routes to the READ-ONLY `/org-item/:id` viewer when the org card is clicked
+ *   1. renders the content pane's "Shared brains" CHIP ROW listing the org
+ *      (2026-07-12 — moved out of the rail when the rail itself moved into the
+ *      main sidebar's note-FOLDER tree; orgs aren't note-folders, so they stay
+ *      a content-pane affordance, not part of the sidebar tree);
+ *   2. MERGES the org's shared item into the "All notes" TABLE (2026-07-12,
+ *      replaces the card grid) alongside YOUR authored notes, with the
+ *      ORG-NAME badge on the org row;
+ *   3. routes to the READ-ONLY `/org-item/:id` viewer when the org row is clicked
  *      (your own notes still open the `/notes/:id` editor).
  * All under the mocked IPC with NO console/page errors — the runtime check that
  * catches NG0600 / ɵcmp / forwardRef / routerLink regressions a green build misses.
@@ -31,6 +35,9 @@ const ORG_MOCKS = {
       itemCount: 0,
       receivedCount: 1,
       pendingShares: 0,
+      // Per-instance active/inactive toggle (origin/murmur#273 follow-up) —
+      // Library/Notes' org chip rows filter to contextEnabled orgs only.
+      contextEnabled: true,
     },
   ],
   list_org_items: (args: { orgId: string }) =>
@@ -55,7 +62,7 @@ const ORG_MOCKS = {
   }),
 };
 
-test("All notes merges org shared items (with org-name badge) + the rail lists the org", async ({
+test("All notes merges org shared items (with org-name badge) + the chip row lists the org", async ({
   page,
 }) => {
   const consoleErrors: string[] = [];
@@ -71,26 +78,23 @@ test("All notes merges org shared items (with org-name badge) + the rail lists t
 
   await expect(page.locator(".notes-content")).toBeVisible();
 
-  // 1) The rail's "Shared brains" section lists the org (name + role hint).
-  await expect(page.locator(".folders-title", { hasText: "Shared brains" })).toBeVisible();
-  const orgRow = page.locator(".org-row");
-  await expect(orgRow).toHaveCount(1);
-  await expect(orgRow.locator(".folder-name")).toHaveText("Siema");
-  await expect(orgRow.locator(".org-role")).toHaveText("Member");
+  // 1) The content pane's "Shared brains" chip row lists the org.
+  const orgChip = page.locator(".org-chip", { hasText: "Siema" });
+  await expect(orgChip).toHaveCount(1);
 
-  // 2) "All notes" shows YOUR authored note AND the org shared item, merged.
+  // 2) "All notes" shows YOUR authored note AND the org shared item, merged,
+  // as table rows.
   await expect(page.getByText("My First Note")).toBeVisible();
-  const orgCard = page.locator(".note-card--org");
-  await expect(orgCard).toHaveCount(1);
-  await expect(orgCard.getByText("Team Roadmap Q3")).toBeVisible();
-  // The org card carries the ORG-NAME badge + the author hint.
-  await expect(orgCard.locator(".org-badge")).toContainText("Siema");
-  await expect(orgCard.locator(".note-author")).toHaveText("alice");
+  const orgRow = page.locator(".mur-table tbody tr", { hasText: "Team Roadmap Q3" });
+  await expect(orgRow).toHaveCount(1);
+  // The org row carries the ORG-NAME badge + the author hint.
+  await expect(orgRow.locator(".org-badge")).toContainText("Siema");
+  await expect(orgRow.locator(".note-author")).toHaveText("alice");
 
   expect(consoleErrors).toEqual([]);
 });
 
-test("a kind:'meeting' org item is excluded from Notes (it belongs in Library's Shared brains rail)", async ({
+test("a kind:'meeting' org item is excluded from Notes (it belongs in Library's Shared brains chip row)", async ({
   page,
 }) => {
   const consoleErrors: string[] = [];
@@ -133,8 +137,8 @@ test("a kind:'meeting' org item is excluded from Notes (it belongs in Library's 
   await expect(page.getByText("Team Roadmap Q3")).toBeVisible();
   await expect(page.getByText("Weekly Sync Notes")).toHaveCount(0);
 
-  // Selecting the org in the rail: same exclusion applies to the org-scoped view.
-  await page.locator(".org-row").click();
+  // Selecting the org chip: same exclusion applies to the org-scoped view.
+  await page.locator(".org-chip", { hasText: "Siema" }).click();
   await expect(page.getByText("Team Roadmap Q3")).toBeVisible();
   await expect(page.getByText("Weekly Sync Notes")).toHaveCount(0);
 
@@ -156,8 +160,11 @@ test("clicking an org shared item routes to the read-only /org-item viewer", asy
   await page.goto("/notes");
   await expect(page.locator(".notes-content")).toBeVisible();
 
-  // Click the org card → the read-only org-item viewer route.
-  await page.locator(".note-card--org").click();
+  // Click the org row's title link → the read-only org-item viewer route.
+  await page
+    .locator(".mur-table tbody tr", { hasText: "Team Roadmap Q3" })
+    .locator(".title-link")
+    .click();
   await expect(page).toHaveURL(/\/org-item\/oi1$/);
   // The viewer rendered the decrypted org item body (read-only, no editor).
   await expect(page.locator("app-org-item-viewer")).toBeVisible();
@@ -166,9 +173,7 @@ test("clicking an org shared item routes to the read-only /org-item viewer", asy
   expect(consoleErrors).toEqual([]);
 });
 
-test("selecting the org in the rail shows ONLY that org's items", async ({
-  page,
-}) => {
+test("selecting the org chip shows ONLY that org's items", async ({ page }) => {
   const consoleErrors: string[] = [];
   page.on("console", (msg) => {
     if (msg.type() === "error") {
@@ -181,10 +186,12 @@ test("selecting the org in the rail shows ONLY that org's items", async ({
   await page.goto("/notes");
   await expect(page.locator(".notes-content")).toBeVisible();
 
-  // Select the org in the rail → the pane scopes to its items only.
-  await page.locator(".org-row").click();
+  // Select the org chip → the pane scopes to its items only.
+  await page.locator(".org-chip", { hasText: "Siema" }).click();
   await expect(page.locator(".content-title")).toHaveText("Siema");
-  await expect(page.locator(".note-card--org")).toHaveCount(1);
+  await expect(
+    page.locator(".mur-table tbody tr", { hasText: "Team Roadmap Q3" }),
+  ).toHaveCount(1);
   // Your authored notes are NOT in the org-scoped view.
   await expect(page.getByText("My First Note")).toHaveCount(0);
 

@@ -19,9 +19,10 @@ import {
 import { FolderLockFlowService } from "../../../services/folder-lock-flow.service";
 import { ToastService } from "../../../services/toast.service";
 import type { FolderNode } from "../../../core/models";
+import { MurTreeRowComponent } from "../../../design-system/tree-row/tree-row.component";
+import { MurRowMenuComponent } from "../../../design-system/row-menu/row-menu.component";
 import { FolderTreeComponent } from "../folder-tree/folder-tree.component";
 import { FolderDropDirective } from "../folder-drop.directive";
-import { LockSharesDialogComponent } from "../lock-shares-dialog/lock-shares-dialog.component";
 
 /**
  * One folder row in the tree: disclosure caret · folder glyph · name · note-count
@@ -48,6 +49,26 @@ import { LockSharesDialogComponent } from "../lock-shares-dialog/lock-shares-dia
  * Lock affordances delegate straight to {@link FoldersService}; the service
  * reloads the tree, so this row re-renders with fresh flags (no local toggling
  * of the backend-owned `locked` / `unlocked`).
+ *
+ * TRAILING ACTIONS (2026-07-12, unification round 2 — see
+ * `design-system/row-menu/row-menu.component.ts`'s class doc for the full
+ * history): rename + delete live behind ONE shared `<mur-row-menu>` gear
+ * dropdown — the exact same component instance type `NotesSidebarTreeComponent`
+ * renders, not a hand-copied icon row. (Round 1 tried matching two SEPARATE
+ * flat-icon implementations pixel-for-pixel by measured box size; they still
+ * read as visibly different in color/weight between the two trees — a real
+ * "looks the same on paper, isn't" bug, correctly caught and rejected. A
+ * shared component makes that class of drift structurally impossible: there
+ * is only one file that can render this dropdown's chrome.) The lock control
+ * (open/locked/session `.lock-toggle`) stays its OWN always-visible control,
+ * outside the dropdown — unlike rename/delete it is a security-relevant
+ * glanceable state badge (see its doc below), and hiding it behind a menu
+ * would regress a folder's sealed-state from "visible at a glance" to
+ * "visible after two clicks." Deleting still opens the SAME
+ * consequence-naming confirm as before ({@link deleteConfirmText}/
+ * {@link canDelete} — notes move, or "unlock first" when sealed), now
+ * replacing the row in place (mirrors the inline rename field) rather than
+ * living inside the dropdown panel.
  */
 @Component({
   selector: "app-folder-row",
@@ -60,7 +81,8 @@ import { LockSharesDialogComponent } from "../lock-shares-dialog/lock-shares-dia
   // until the def exists, breaking the cycle. (See folder-tree for the mirror.)
   imports: [
     FolderDropDirective,
-    LockSharesDialogComponent,
+    MurTreeRowComponent,
+    MurRowMenuComponent,
     forwardRef(() => FolderTreeComponent),
   ],
   templateUrl: "./folder-row.component.html",
@@ -70,7 +92,16 @@ export class FolderRowComponent {
   private readonly folders = inject(FoldersService);
   private readonly toast = inject(ToastService);
   private readonly injector = inject(Injector);
-  /** Shared lock×shares flow (probe → warn/revoke dialog → lock), reused by the Notes rail too. */
+  /**
+   * Shared lock×shares flow (probe → warn/revoke dialog → lock) — a root
+   * singleton, also driven by `NotesSidebarTreeComponent`'s folder rows. The
+   * DIALOG itself is rendered exactly ONCE, by `AppShellComponent` (2026-07-12
+   * fix: both this component and the Notes tree used to each render their own
+   * `<app-lock-shares-dialog>` bound to the same singleton `pending()` — since
+   * the main sidebar now ALWAYS mounts both trees simultaneously, that meant
+   * TWO dialogs rendered for one lock request; caught by
+   * `e2e/org/org-surfaces.spec.ts`'s strict-mode-violation failure).
+   */
   readonly lockFlow = inject(FolderLockFlowService);
 
   /** This row's folder node. */
@@ -79,6 +110,8 @@ export class FolderRowComponent {
   readonly selectedId = input<string | null>(null);
   /** Indent depth (0 at the roots). */
   readonly depth = input<number>(0);
+  /** Whether `selectedId` should render as visually selected — see `FolderTreeComponent`'s doc. */
+  readonly selectionActive = input<boolean>(true);
 
   /** Emits the folder id when this row (or a descendant) is chosen. */
   readonly selected = output<string | null>();
@@ -93,25 +126,14 @@ export class FolderRowComponent {
   /** Per-row lock/action error (cleared on the next attempt). */
   readonly lockError = signal<string | null>(null);
 
-  // --- Lock×shares dialog (Shared Brain v1) --------------------------------
-  /**
-   * The blocking lock×shares dialog is owned by the shared {@link FolderLockFlowService}
-   * (a root singleton, one pending request at a time). Render it for THIS row only when
-   * the pending request targets this folder id, so a dialog opened for one row doesn't
-   * appear under every row.
-   */
-  readonly showLockDialog = computed(
-    () => this.lockFlow.pending()?.folderId === this.node().id,
-  );
-
-  // --- ⋯ folder-actions menu + inline rename + delete confirm ---------------
-  /** Whether the ⋯ actions menu popover is open. */
-  readonly menuOpen = signal(false);
+  // --- inline rename + delete confirm (flat icons — 2026-07-12: the ⋯
+  // dropdown these used to live behind is gone; see the class doc's
+  // unification note) --------------------------------------------------------
   /** Whether the inline rename field is showing (replaces the name button). */
   readonly renaming = signal(false);
   /** Draft folder name bound to the rename field. */
   readonly renameDraft = signal("");
-  /** Whether the delete-confirm step is showing inside the menu. */
+  /** Whether the delete-confirm step is showing (replaces the row — see the template). */
   readonly confirmingDelete = signal(false);
   /** Error surfaced inside the delete confirm (e.g. a backend reject). */
   readonly actionError = signal<string | null>(null);
@@ -215,49 +237,11 @@ export class FolderRowComponent {
     }
   }
 
-  // --- ⋯ menu --------------------------------------------------------------
-  /** Open/close the actions menu. Closing resets any in-menu delete-confirm. */
-  toggleMenu(): void {
-    const next = !this.menuOpen();
-    this.menuOpen.set(next);
-    if (!next) {
-      this.confirmingDelete.set(false);
-      this.actionError.set(null);
-    }
-  }
-
-  /** Close the menu (and any confirm) — used after an action resolves. */
-  private closeMenu(): void {
-    this.menuOpen.set(false);
-    this.confirmingDelete.set(false);
-    this.actionError.set(null);
-  }
-
-  // --- Lock actions from the menu (reuse the existing run() lock affordances) ---
-  /** "Make private" — seal the whole folder. */
-  async onLockFromMenu(): Promise<void> {
-    this.closeMenu();
-    await this.onLock();
-  }
-
-  /** "Locked — unlock" — session-unlock via Touch ID. */
-  async onUnlockFromMenu(): Promise<void> {
-    this.closeMenu();
-    await this.onUnlock();
-  }
-
-  /** "Re-seal now" — re-lock a session-unlocked folder. */
-  async onRelockFromMenu(): Promise<void> {
-    this.closeMenu();
-    await this.onRelock();
-  }
-
   // --- Inline rename -------------------------------------------------------
   /** Open the inline rename field (seeded with the current name) + focus it once rendered. */
   startRename(): void {
     this.renameDraft.set(this.node().name);
     this.renaming.set(true);
-    this.menuOpen.set(false);
     afterNextRender(
       () => {
         const el = this.renameInput()?.nativeElement;
@@ -309,13 +293,13 @@ export class FolderRowComponent {
   }
 
   // --- Delete --------------------------------------------------------------
-  /** Switch the menu into its delete-confirm step. */
+  /** Open the delete-confirm step (triggered by the flat trash icon). */
   startDelete(): void {
     this.actionError.set(null);
     this.confirmingDelete.set(true);
   }
 
-  /** Back out of the delete confirm (keeps the menu open on the action list). */
+  /** Back out of the delete confirm, back to the normal row. */
   cancelDelete(): void {
     if (this.busy()) {
       return;
@@ -337,7 +321,8 @@ export class FolderRowComponent {
     this.actionError.set(null);
     try {
       await this.folders.delete(this.node().id);
-      this.closeMenu();
+      this.confirmingDelete.set(false);
+      this.actionError.set(null);
       this.toast.success("Folder deleted. Its notes are in All notes.");
       // If this folder was selected, fall back to the vault root.
       if (this.selectedId() === this.node().id) {

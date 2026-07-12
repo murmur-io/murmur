@@ -209,7 +209,10 @@ export class OrgShareSheetComponent {
       if (this.target().id !== t.id) {
         return; // stale — the target changed under us
       }
-      this._liveShares.set(live);
+      // Defensive: never let a malformed/non-array response (e.g. an unmocked
+      // IPC command resolving to its generic `null` default) null-deref a
+      // downstream `.some()`/`.find()` over this signal.
+      this._liveShares.set(Array.isArray(live) ? live : []);
     } catch {
       if (this.target().id === t.id) {
         this._liveShares.set([]);

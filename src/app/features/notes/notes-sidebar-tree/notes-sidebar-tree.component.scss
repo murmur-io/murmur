@@ -1,0 +1,106 @@
+/* Obsidian-style indented folder list, nested under the "Notes" nav row in
+   the ALWAYS-VISIBLE main sidebar (see AppShellComponent). The ROW VISUAL
+   (container/indent/hover/selected pill/icon/label) lives in the shared
+   `<mur-tree-row>` (design-system, 2026-07-12 consolidation — the SAME
+   component the Meetings tree's rows use); this file keeps only the lock/
+   unlock icon + the inline create/rename/delete-confirm forms. Rename/Delete
+   live behind the shared `<mur-row-menu>` dropdown (design-system,
+   `row-menu.component.ts`) — its trigger/panel chrome is NOT duplicated
+   here.
+   NO host padding-left (2026-07-12, user request: the folder rows sat too
+   far right of their section header) — the rows' own 20px caret gutter
+   already provides the visual nesting step; matches
+   `MeetingsSidebarTreeComponent`'s host exactly. */
+:host {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  margin-bottom: var(--space-1);
+}
+
+.notes-tree {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+/* Trailing action cluster — hover-revealed, keyed off the SHARED row's host. */
+.tree-actions {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 1px;
+  padding-right: 2px;
+  opacity: 0;
+  transition: opacity var(--transition-fast);
+}
+mur-tree-row:hover .tree-actions,
+mur-tree-row:focus-within .tree-actions {
+  opacity: 1;
+}
+.tree-act {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 21px;
+  height: 21px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition:
+    background var(--transition-fast),
+    color var(--transition-fast);
+}
+.tree-act:hover:not(:disabled) {
+  background: var(--surface-raised);
+  color: var(--text-primary);
+}
+.tree-act:focus-visible {
+  outline: none;
+  opacity: 1;
+  box-shadow: 0 0 0 2px var(--accent-ring);
+}
+.tree-act:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+/* Inline folder create / rename field + delete confirm. */
+.tree-edit,
+.tree-confirm {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-2);
+  border-radius: var(--radius-md);
+  background: var(--surface-input);
+}
+.tree-edit-input {
+  width: 100%;
+  padding: var(--space-1) var(--space-2);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface-base);
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 0.84rem;
+}
+.tree-edit-input:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+.tree-edit-actions {
+  display: flex;
+  gap: var(--space-2);
+}
+.tree-confirm-copy {
+  font-size: 0.78rem;
+  line-height: 1.4;
+}
+.btn-tiny {
+  padding: var(--space-1) var(--space-3);
+  font-size: 0.78rem;
+}
