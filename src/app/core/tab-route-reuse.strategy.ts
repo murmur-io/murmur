@@ -9,18 +9,18 @@ import { tabKeyFor } from "./tab-keys";
 
 /**
  * The router-native tab cache for Murmur's "document" routes (`/meeting/:id`,
- * `/notes/:id`) — browser-style tabs (see `tabs.service.ts`) need each open
- * meeting/note to keep its own live component instance (scroll position,
- * in-progress edits, audio playback) while backgrounded, and to switch back to
- * it instantly. Angular's DEFAULT `RouteReuseStrategy` only compares
- * `routeConfig` (not params), so `/meeting/A` → `/meeting/B` already silently
- * REUSES the same component instance — which is also what forced
- * `DetailComponent` to carry a manual "reload in place" workaround before this
- * strategy existed.
+ * `/notes/:id`, `/org-item/:id`) — browser-style tabs (see `tabs.service.ts`)
+ * need each open meeting/note/org-item to keep its own live component
+ * instance (scroll position, in-progress edits, audio playback) while
+ * backgrounded, and to switch back to it instantly. Angular's DEFAULT
+ * `RouteReuseStrategy` only compares `routeConfig` (not params), so
+ * `/meeting/A` → `/meeting/B` already silently REUSES the same component
+ * instance — which is also what forced `DetailComponent` to carry a manual
+ * "reload in place" workaround before this strategy existed.
  *
- * Only `meeting/:id` and `notes/:id` are in scope — every other route falls
- * through to Angular's default `routeConfig`-only comparison, so unrelated
- * routes behave exactly as before.
+ * Only `meeting/:id`, `notes/:id`, and `org-item/:id` are in scope — every
+ * other route falls through to Angular's default `routeConfig`-only
+ * comparison, so unrelated routes behave exactly as before.
  *
  * DELIBERATELY OUT OF SCOPE: `notes/new`. It always transitions onward to a
  * real `/notes/:id` (via `NoteEditorComponent.createAndOpen`'s `replaceUrl`
@@ -43,6 +43,10 @@ function tabKey(route: ActivatedRouteSnapshot): string | null {
   if (path === "notes/:id") {
     const id = route.paramMap.get("id");
     return id ? tabKeyFor("note", id) : null;
+  }
+  if (path === "org-item/:id") {
+    const id = route.paramMap.get("id");
+    return id ? tabKeyFor("org-item", id) : null;
   }
   return null;
 }
