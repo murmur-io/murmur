@@ -21,6 +21,68 @@
 }
 
 /* --- Content pane: search, filters, the meeting list --- */
+
+/* --- Shared brains (orgs) chip row (mirrors NotesHomeComponent's) --- */
+.org-chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+.org-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  cursor: pointer;
+  border: 1px solid var(--border-subtle);
+  background: var(--surface-raised);
+  color: var(--text-secondary);
+  transition:
+    background var(--transition-fast),
+    color var(--transition-fast),
+    border-color var(--transition-fast);
+}
+.org-chip:hover {
+  color: var(--text-primary);
+  border-color: var(--border-strong);
+}
+.org-chip:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+.org-chip.is-selected {
+  background: var(--accent-soft);
+  color: var(--text-primary);
+  border-color: var(--accent);
+}
+/* Trails the chip row while the org list/items are (re)loading. */
+.org-chip-spinner {
+  margin-left: var(--space-1);
+  color: var(--text-muted);
+}
+
+/* --- Shared-brain meeting list: the org-name badge + the row's own share pill --- */
+.org-badge {
+  flex: none;
+  color: var(--text-secondary);
+  background: var(--surface-raised);
+  border: 1px solid var(--border-subtle);
+  font-size: 0.7rem;
+  font-weight: 600;
+  max-width: 16ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.org-share-row-pill {
+  flex: none;
+  font-size: 0.7rem;
+}
+.org-unclassified-note {
+  margin: 0;
+  font-size: 0.8125rem;
+}
+
 .meetings-pane {
   display: flex;
   flex-direction: column;

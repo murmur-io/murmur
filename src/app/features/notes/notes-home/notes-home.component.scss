@@ -78,6 +78,11 @@
   color: var(--text-primary);
   border-color: var(--accent);
 }
+/* Trails the chip row while the org list/items are (re)loading. */
+.org-chip-spinner {
+  margin-left: var(--space-1);
+  color: var(--text-muted);
+}
 
 .content-body {
   flex: 1 1 auto;

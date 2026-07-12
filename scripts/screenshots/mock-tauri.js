@@ -441,6 +441,153 @@ deferred it twice is now removed, so it's unblocked for the GA cut.
     { id: "actions", label: "Action items", prompt: "List the action items with owners." },
   ];
 
+  // ── Notes (standalone authored documents — separate from meeting notes) ────
+  const NOTE_FOLDERS = [
+    { id: "nf-product", name: "Product Notes", path: "Notes/Product", parentId: null, locked: false, kind: "note" },
+    { id: "nf-eng", name: "Engineering Notes", path: "Notes/Engineering", parentId: null, locked: false, kind: "note" },
+  ];
+
+  const DEMO_NOTE_ID = "n-atlas-prd";
+
+  const NOTE_DOC_MD = `# Atlas — PRD v3
+
+## Overview
+**Project Atlas** is the sync-layer rewrite that unblocks the Windows loopback
+capture path. This revision folds in Priya's merged sync-layer work and trims
+scope to the GA-critical path only.
+
+## Goals
+- Ship a stable Windows loopback capture path by the May 30 GA cut.
+- Remove the shared sync-layer dependency that deferred the spike twice.
+- Keep the merge additive — no destructive schema changes to the capture pipeline.
+
+## Non-goals
+- Linux capture support (tracked separately, post-GA).
+- Any change to the macOS ScreenCaptureKit path (already stable).
+
+## Open questions
+- Windows notarization equivalent — do we need a signed driver?
+- Does the Sales Engine pilot depend on this landing first?
+
+## Rollout plan
+1. Land the sync-layer merge behind a flag.
+2. Dogfood internally for one week.
+3. Flip the flag for the GA cut on May 30.`;
+
+  const NOTES = [
+    {
+      id: DEMO_NOTE_ID,
+      title: "Atlas — PRD v3",
+      folderId: "nf-product",
+      snippet: "The sync-layer rewrite that unblocks the Windows loopback capture path…",
+      tags: ["atlas", "prd"],
+      updatedAt: ANCHOR.getTime() - 1 * 864e5,
+      createdAt: ANCHOR.getTime() - 6 * 864e5,
+      locked: false,
+      shared: false,
+    },
+    {
+      id: "n-sales-arch",
+      title: "Sales Engine — architecture notes",
+      folderId: "nf-eng",
+      snippet: "Two design partners, Acme and Northwind, pilot the ingestion path first…",
+      tags: ["sales-engine"],
+      updatedAt: ANCHOR.getTime() - 3 * 864e5,
+      createdAt: ANCHOR.getTime() - 9 * 864e5,
+      locked: false,
+      shared: true,
+    },
+  ];
+
+  function noteDocFor(id) {
+    const summary = NOTES.find((n) => n.id === id);
+    if (id === DEMO_NOTE_ID) {
+      return {
+        id: DEMO_NOTE_ID,
+        title: "Atlas — PRD v3",
+        folderId: "nf-product",
+        markdown: NOTE_DOC_MD,
+        tags: ["atlas", "prd"],
+        properties: { status: "in-review" },
+        updatedAt: summary ? summary.updatedAt : ANCHOR.getTime(),
+        createdAt: summary ? summary.createdAt : ANCHOR.getTime(),
+        exportedPath: `${VAULT}/Notes/Product/Atlas-PRD-v3.md`,
+        locked: false,
+        shared: false,
+      };
+    }
+    const title = summary ? summary.title : "Untitled";
+    return {
+      id,
+      title,
+      folderId: (summary && summary.folderId) || "nf-product",
+      markdown: `# ${title}\n\n## Notes\nAuthored note body.`,
+      tags: (summary && summary.tags) || [],
+      properties: {},
+      updatedAt: summary ? summary.updatedAt : ANCHOR.getTime(),
+      createdAt: summary ? summary.createdAt : ANCHOR.getTime(),
+      exportedPath: null,
+      locked: false,
+      shared: (summary && summary.shared) || false,
+    };
+  }
+
+  // ── Shared Brain (org) ──────────────────────────────────────────────────────
+  const ORGS = [
+    {
+      orgId: "org-sonora",
+      name: "Sonora",
+      role: "owner",
+      memberCount: 5,
+      consented: true,
+      lastSeq: 12,
+      itemCount: 4,
+      receivedCount: 9,
+      pendingShares: 0,
+    },
+  ];
+
+  const ORG_ITEMS_BY_ORG = {
+    "org-sonora": [
+      {
+        itemId: "oi-1",
+        title: "Acme — contract redlines",
+        authorHint: "devon@sonora",
+        createdAt: daysAgo(2),
+        seq: 9,
+        kind: "document",
+        ownedSource: null,
+      },
+      {
+        itemId: "oi-2",
+        title: "Northwind — discovery brief",
+        authorHint: "sarah@sonora",
+        createdAt: daysAgo(4),
+        seq: 8,
+        kind: "document",
+        ownedSource: null,
+      },
+      {
+        itemId: "oi-3",
+        title: "Sales Engine — architecture notes",
+        authorHint: "you",
+        createdAt: daysAgo(3),
+        seq: 7,
+        kind: "document",
+        ownedSource: { kind: "document", id: "n-sales-arch" },
+      },
+      {
+        itemId: "oi-4",
+        title: "Pricing workshop — takeaways",
+        authorHint: "marcus@sonora",
+        createdAt: daysAgo(11),
+        seq: 6,
+        kind: "document",
+        ownedSource: null,
+      },
+    ],
+  };
+
   function handle(cmd, args) {
     switch (cmd) {
       // ── config / product ──
@@ -584,6 +731,48 @@ deferred it twice is now removed, so it's unblocked for the GA cut.
       case "list_calendar_events": return [];
       case "calendar_context_for": return null;
       case "pre_meeting_brief": return { markdown: "## Prep\n- Last time: agreed May 30 GA.\n- Open: Windows loopback spike.", sources: [] };
+
+      // ── notes (standalone authored documents) ──
+      case "list_note_folders": return NOTE_FOLDERS;
+      case "create_note_folder": return { id: "nf-new", name: args.name, path: `Notes/${args.name}`, parentId: args.parentId || null, locked: false, kind: "note" };
+      case "rename_note_folder": case "delete_note_folder": case "move_note_folder": return null;
+      case "list_notes": return NOTES;
+      case "get_note": return noteDocFor(args.id);
+      case "create_note": return "n-new";
+      case "update_note_doc": return noteDocFor(args.id);
+      case "save_note_text": return Date.now();
+      case "move_note_doc": case "delete_note": return null;
+      case "export_note_doc": return `${VAULT}/Notes/Product/Atlas-PRD-v3.md`;
+      case "plan_organize_notes": return { moves: [] };
+      case "apply_organize_plan": return null;
+      case "note_assistant_action":
+        return {
+          action: args.req.action,
+          shape: args.req.action === "find_related" || args.req.action === "ask" ? "info"
+            : args.req.action === "draft_followup" || args.req.action === "spinoff_note" ? "artifact"
+            : args.req.action === "enhance" ? "insert"
+            : "replace",
+          title: args.req.action === "draft_followup" ? "Follow-up: Atlas PRD review" : null,
+          suggestion: "Project Atlas removed the shared sync-layer dependency, unblocking the Windows loopback capture path for the May 30 GA cut.",
+          citations: [
+            { kind: "meeting", id: "m-atlas-kickoff", title: "Project Atlas — Kickoff", snippet: "…the shared sync layer is the keystone dependency…" },
+          ],
+          modelLabel: "Claude",
+          mode: "cloud",
+          redacted: true,
+        };
+
+      // ── Shared Brain (org) ──
+      case "org_refresh": return null;
+      case "org_list_statuses": return ORGS;
+      case "list_org_items": return ORG_ITEMS_BY_ORG[args.orgId] || [];
+      case "org_resolve_source": return null;
+      // Per-meeting (Detail header pill) / bulk (Library row badge) share
+      // pairings — both array-shaped; unmocked callers must see `[]`, never
+      // the generic `null` default (a bare array-returning command doesn't
+      // match the `list_`/`get_` fallback prefixes below).
+      case "meeting_org_shares": return [];
+      case "org_live_shares_for_source": return [];
 
       // ── exports / misc ──
       case "export_audio": case "export_note": case "export_mic_master": case "export_sys_master": return null;
