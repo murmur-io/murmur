@@ -5221,13 +5221,17 @@ impl Db {
         Ok(hits)
     }
 
-    /// The full decrypted org item (for the read-only FE viewer). `None` for an unknown or TOMBSTONED
-    /// item. No lock gate — org items are deliberately org-disclosed content.
+    /// The full decrypted org item (for the read-only FE viewer). `None` for an unknown, TOMBSTONED,
+    /// OR per-instance-DISABLED item's org (a stale citation/bookmark to `/org-item/:id` must not read
+    /// through the toggle — same `context_enabled = 1` gate as `search_org_chunks_knn`/`_fts`). No lock
+    /// gate otherwise — org items are deliberately org-disclosed content.
     pub fn get_org_item(&self, item_id: &str) -> Result<Option<crate::storage::models::OrgItemDetail>> {
         let conn = self.lock();
         conn.query_row(
-            "SELECT item_id, author_hint, title, created_at, rev, markdown
-               FROM org_items WHERE item_id = ?1 AND tombstoned = 0",
+            "SELECT oi.item_id, oi.author_hint, oi.title, oi.created_at, oi.rev, oi.markdown
+               FROM org_items oi
+               JOIN org_state os ON os.org_id = oi.org_id
+              WHERE oi.item_id = ?1 AND oi.tombstoned = 0 AND os.context_enabled = 1",
             rusqlite::params![item_id],
             |r| {
                 Ok(crate::storage::models::OrgItemDetail {
