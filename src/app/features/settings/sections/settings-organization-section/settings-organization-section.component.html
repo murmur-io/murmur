@@ -62,6 +62,43 @@
                   }
                 </p>
 
+                <!-- Per-instance org toggle: which orgs contribute content (browsing + brain
+                     context) on THIS Murmur install. Purely local — never touches the synced
+                     replica, so re-enabling is instant. -->
+                <div class="context-toggle-row">
+                  @if (o.contextEnabled) {
+                    <span class="pill is-success signed-pill">
+                      <span class="pill-dot"></span>
+                      Active on this device
+                    </span>
+                  } @else {
+                    <span class="pill signed-pill context-disabled-pill">
+                      Disabled on this device
+                    </span>
+                  }
+                  <button
+                    type="button"
+                    class="btn btn-ghost mini-btn"
+                    (click)="toggleContextEnabled(o)"
+                    [disabled]="contextTogglingOrgId() !== null"
+                  >
+                    {{
+                      contextTogglingOrgId() === o.orgId
+                        ? "…"
+                        : o.contextEnabled
+                          ? "Disable here"
+                          : "Enable here"
+                    }}
+                  </button>
+                </div>
+                @if (!o.contextEnabled) {
+                  <p class="text-muted account-note context-disabled-note">
+                    Notes and recordings won't use this org's shared brain for
+                    context on this device — its content stays synced, just
+                    inactive here.
+                  </p>
+                }
+
                 <div class="org-actions">
                   <button
                     type="button"

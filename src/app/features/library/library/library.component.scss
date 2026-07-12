@@ -163,10 +163,34 @@
   flex-direction: column;
   gap: 1px;
 }
-/* Trails the "Shared brains" heading while the org list/items are (re)loading. */
+/* Trailing group on the "Shared brains" heading: the loading spinner + the settings shortcut. */
+.org-head-trailing {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
 .org-head-spinner {
-  margin-left: auto;
   color: var(--text-muted);
+}
+/* Shortcut to Settings → Organization (which orgs are active on this device). */
+.org-head-settings-link {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border-radius: var(--radius-sm);
+  color: var(--text-muted);
+  text-decoration: none;
+  transition: color var(--transition-fast), background var(--transition-fast);
+}
+.org-head-settings-link:hover {
+  color: var(--text-secondary);
+  background: var(--surface-hover);
+}
+.org-head-settings-link:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
 }
 .folder-row {
   display: flex;

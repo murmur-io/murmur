@@ -87,9 +87,28 @@
     @if (orgs().length > 0 || orgsLoading()) {
       <div class="folders-head org-head">
         <h3 class="folders-title">Shared brains</h3>
-        @if (orgsLoading()) {
-          <mur-spinner [size]="12" class="org-head-spinner" />
-        }
+        <span class="org-head-trailing">
+          @if (orgsLoading()) {
+            <mur-spinner [size]="12" class="org-head-spinner" />
+          }
+          <a
+            class="org-head-settings-link"
+            routerLink="/settings"
+            [queryParams]="{ section: 'organization' }"
+            title="Choose which organizations are active on this device"
+            aria-label="Manage organizations in Settings"
+          >
+            <svg viewBox="0 0 16 16" width="13" height="13" fill="none" aria-hidden="true">
+              <circle cx="8" cy="8" r="2.1" stroke="currentColor" stroke-width="1.3" />
+              <path
+                d="M8 2.2v1.4M8 12.4v1.4M13.8 8h-1.4M3.6 8H2.2M12.1 3.9l-1 1M4.9 11.1l-1 1M12.1 12.1l-1-1M4.9 4.9l-1-1"
+                stroke="currentColor"
+                stroke-width="1.3"
+                stroke-linecap="round"
+              />
+            </svg>
+          </a>
+        </span>
       </div>
       <nav class="folders-body org-body" aria-label="Shared brains">
         @for (org of orgs(); track org.orgId) {

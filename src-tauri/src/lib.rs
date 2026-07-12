@@ -205,6 +205,7 @@ pub fn run() {
             commands::org_create,
             commands::org_status,
             commands::org_list_statuses,
+            commands::org_set_context_enabled,
             commands::org_refresh,
             commands::org_invite_member,
             commands::org_list_members,
