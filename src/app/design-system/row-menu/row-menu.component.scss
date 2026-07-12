@@ -48,10 +48,20 @@
 
 /* The panel floats OVER the tree — anchored to the trigger's bottom-right so
    it never runs off the sidebar's right edge. `.menu` (primitives.css)
-   supplies the opaque surface/border/shadow; this file only positions it. */
+   supplies the opaque surface/border/shadow; this file only positions it.
+   OVERRIDES `.menu`'s 240px min-width (live-found bug, 2026-07-12): that
+   width is sized for the note editor's multi-item "⋯" menu, but a nested
+   tree row can have very little room to the panel's LEFT (it's right-
+   anchored, so it grows leftward) before hitting the sidebar's own
+   `overflow: hidden` glass panel (`.drill-rail`, styles.css) — which clips
+   silently, no scrollbar, no visual cue (the "ename"/"elete" bug: the panel
+   was wide enough to lose "R"/"D" off its clipped left edge). This menu only
+   ever holds 2-3 short items (Rename/Lock/Delete), so a much narrower panel
+   comfortably fits even at deep indentation. */
 .row-menu-panel {
   position: absolute;
   top: calc(100% + 4px);
   right: 0;
   z-index: 30;
+  min-width: 140px;
 }

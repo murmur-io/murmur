@@ -67,25 +67,33 @@ mur-tree-row:focus-within .tree-actions {
   cursor: default;
 }
 
-/* Inline folder create / rename field + delete confirm. */
+/* Inline folder create / rename field + delete confirm. Polish pass
+   (2026-07-12, live-found "looks bad" feedback): the original cramped every
+   element to `--space-1` (4px) padding, so the input read as squashed next
+   to its own action buttons — breathing room + a border/shadow that matches
+   the rest of the sidebar's control language (mirrors `.tree-edit-input`'s
+   sibling `<mur-input>` sizing) fixes that without growing the sidebar. */
 .tree-edit,
 .tree-confirm {
   display: flex;
   flex-direction: column;
   gap: var(--space-2);
-  padding: var(--space-2);
+  padding: var(--space-3);
   border-radius: var(--radius-md);
   background: var(--surface-input);
+  border: 1px solid var(--border-subtle);
 }
 .tree-edit-input {
   width: 100%;
-  padding: var(--space-1) var(--space-2);
+  height: 32px;
+  padding: 0 var(--space-2);
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-sm);
   background: var(--surface-base);
   color: var(--text-primary);
   font: inherit;
   font-size: 0.84rem;
+  transition: border-color var(--transition-fast), box-shadow var(--transition-fast);
 }
 .tree-edit-input:focus-visible {
   outline: none;
@@ -95,12 +103,14 @@ mur-tree-row:focus-within .tree-actions {
 .tree-edit-actions {
   display: flex;
   gap: var(--space-2);
+  justify-content: flex-end;
 }
 .tree-confirm-copy {
   font-size: 0.78rem;
   line-height: 1.4;
 }
 .btn-tiny {
-  padding: var(--space-1) var(--space-3);
+  height: 28px;
+  padding: 0 var(--space-3);
   font-size: 0.78rem;
 }
