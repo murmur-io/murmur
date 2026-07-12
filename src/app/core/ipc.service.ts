@@ -88,8 +88,11 @@ import type {
   OrgMember,
   OrgSharePreview,
   OrgShareEntry,
+  OrgSourceShareStatus,
   OrgItemDetail,
   OrgItemHeader,
+  MeetingOrgShareInfo,
+  MeetingOrgShareRow,
   OrgSourceRef,
   OrgSyncReport,
   OrgFeedUpdatedPayload,
@@ -651,6 +654,41 @@ export class IpcService {
   /** This user's outgoing org shares (drives the "In Org Brain" state + per-item revoke). */
   listOrgShares(): Promise<OrgShareEntry[]> {
     return invoke<OrgShareEntry[]>("list_org_shares");
+  }
+
+  /**
+   * Every org THIS meeting is actively shared into (org id + display name) — drives the
+   * "Shared with [org]" badge on the Library row + the Detail view. Gated exactly like
+   * `getMeetingDetail`: a sealed-and-not-session-unlocked meeting returns `[]`, never leaking
+   * its share status. Only the text note/summary is ever shared — the caller renders this
+   * alongside an explicit "audio never leaves the device" caption, never implying otherwise.
+   */
+  meetingOrgShares(meetingId: string): Promise<MeetingOrgShareInfo[]> {
+    return invoke<MeetingOrgShareInfo[]>("meeting_org_shares", { meetingId });
+  }
+
+  /**
+   * The BULK Library-row variant: every active meeting→org share pairing across ALL of the
+   * caller's meetings in one call — avoids fetching {@link meetingOrgShares} per row. Same gate
+   * (a sealed-and-not-session-unlocked meeting contributes no rows).
+   */
+  listMeetingOrgShares(): Promise<MeetingOrgShareRow[]> {
+    return invoke<MeetingOrgShareRow[]>("list_meeting_org_shares");
+  }
+
+  /**
+   * Which orgs already hold a LIVE (`uploaded`) share of THIS local source
+   * (meeting XOR note) — so the share sheet can mark those orgs "Already added ✓"
+   * and BLOCK a re-share (the double-click duplicate fix). Read-only, no egress.
+   */
+  orgLiveSharesForSource(args: {
+    meetingId?: string;
+    documentId?: string;
+  }): Promise<OrgSourceShareStatus[]> {
+    return invoke<OrgSourceShareStatus[]>("org_live_shares_for_source", {
+      meetingId: args.meetingId ?? null,
+      documentId: args.documentId ?? null,
+    });
   }
 
   /** Revoke an org share: tombstone the feed item + drop the local ciphertext. Idempotent. */
@@ -1844,11 +1882,15 @@ export class IpcService {
   }
 
   /**
-   * The selection Brain-assistant action: refine / shorten (replace the selection)
-   * or enhance (retrieve related brain context + propose an ADDITIVE passage with
-   * citations). Routes via `provider_for(Role::Notes)` (local Qwen vs cloud Claude
-   * per posture, redaction firewall + egress ledger for free). The result carries
-   * the resolved `modelLabel`/`mode`/`redacted` for the popover mode chip.
+   * The selection Brain-assistant action (full set — edit / structure / brain /
+   * extract / create; see the shared action catalog). `req` carries the action,
+   * the selection + bounded context, and optionally `variant` (tone/language) or
+   * `instruction` (custom free-text / an `ask` question). Routes via
+   * `provider_for(Role::Notes)` (local vs cloud per posture, redaction firewall +
+   * egress ledger for free; `find_related` is retrieval-only, no provider). The
+   * result carries the `shape` the FE renders off, `title` for artifacts, and the
+   * resolved `modelLabel`/`mode`/`redacted` for the mode chip. Optional `req`
+   * fields ride through unchanged (the whole object is forwarded).
    */
   noteAssistantAction(req: NoteAssistRequest): Promise<NoteAssistResult> {
     return invoke<NoteAssistResult>("note_assistant_action", { req });

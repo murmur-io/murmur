@@ -10,15 +10,16 @@
   role="dialog"
   aria-label="Brain assistant"
 >
-  <!-- Header: the "Brain" identity + (once a result lands) the action name. The
-       model attribution moved to a quiet footer caption so the header stays clean. -->
+  <!-- Header: the "Brain" identity + a quiet caption (submenu/result action). -->
   <div class="pop-head">
     <span class="pop-brand">
       <span class="pop-brand-glyph" aria-hidden="true"></span>
       Brain
     </span>
-    @if (result(); as res) {
-      <span class="pop-head-action">{{ actionLabel(res.action) }}</span>
+    @if (headerCaption(); as caption) {
+      <span class="pop-head-action">{{ caption }}</span>
+    } @else {
+      <span class="pop-head-tag">selection</span>
     }
     <button
       type="button"
@@ -38,34 +39,169 @@
   </div>
 
   @switch (phase()) {
-    <!-- PHASE 1 — the action picker. -->
-    @case ("actions") {
-      <div class="pop-actions" role="group" aria-label="Assistant actions">
-        @if (toggles().refine) {
-          <button type="button" class="pop-action" (click)="run('refine')">
-            <span class="pop-action-ico" aria-hidden="true">✎</span>
-            Refine
+    <!-- PHASE — the command menu (input + filtered/compact/grouped rows). -->
+    @case ("menu") {
+      <div class="pop-cmd">
+        <svg
+          class="pop-cmd-ico"
+          width="15"
+          height="15"
+          viewBox="0 0 16 16"
+          fill="none"
+          aria-hidden="true"
+        >
+          <circle cx="7" cy="7" r="5" stroke="currentColor" stroke-width="1.4" />
+          <path
+            d="M11 11l3 3"
+            stroke="currentColor"
+            stroke-width="1.4"
+            stroke-linecap="round"
+          />
+        </svg>
+        <input
+          #cmdInput
+          type="text"
+          class="pop-cmd-input"
+          placeholder="Ask Brain to edit…"
+          autocomplete="off"
+          aria-label="Ask Brain to edit or filter actions"
+          [value]="filter()"
+          (input)="onFilterInput($event)"
+          (keydown)="onFilterKeydown($event)"
+        />
+        <kbd class="pop-cmd-kbd" aria-hidden="true">↵</kbd>
+      </div>
+
+      <div class="pop-scroll" role="menu" aria-label="Assistant actions">
+        @if (filtering()) {
+          <!-- Filtered: a "run as custom instruction" row + label/desc matches. -->
+          <button
+            type="button"
+            class="pop-row pop-row-custom"
+            (click)="run('custom', null, filter().trim())"
+          >
+            <span class="pop-row-ico" aria-hidden="true">↵</span>
+            <span class="pop-row-body">
+              <span class="pop-row-label"
+                >“<b>{{ filter().trim() }}</b>”</span
+              >
+              <span class="pop-row-desc">Run as a custom instruction</span>
+            </span>
           </button>
-        }
-        @if (toggles().shorten) {
-          <button type="button" class="pop-action" (click)="run('shorten')">
-            <span class="pop-action-ico" aria-hidden="true">⤶</span>
-            Shorten
+          @for (a of filterHits(); track a.id) {
+            <button type="button" class="pop-row" (click)="choose(a)">
+              <span class="pop-row-ico" aria-hidden="true">{{ a.icon }}</span>
+              <span class="pop-row-body">
+                <span class="pop-row-label">{{ a.label }}</span>
+                <span class="pop-row-desc">{{ a.desc }}</span>
+              </span>
+              @if (a.sub) {
+                <span class="pop-row-chev" aria-hidden="true">▸</span>
+              } @else {
+                <span
+                  class="pop-shape-dot"
+                  [class]="'is-' + a.shape"
+                  aria-hidden="true"
+                ></span>
+              }
+            </button>
+          } @empty {
+            <p class="pop-empty">
+              No action matches — press ↵ to run it as a custom instruction.
+            </p>
+          }
+        } @else if (!expanded()) {
+          <!-- Compact: the 5 quick actions + a "More actions" row. -->
+          @for (a of quickActions(); track a.id) {
+            <button type="button" class="pop-row" (click)="choose(a)">
+              <span class="pop-row-ico" aria-hidden="true">{{ a.icon }}</span>
+              <span class="pop-row-body">
+                <span class="pop-row-label">{{ a.label }}</span>
+                <span class="pop-row-desc">{{ a.desc }}</span>
+              </span>
+              @if (a.sub) {
+                <span class="pop-row-chev" aria-hidden="true">▸</span>
+              } @else {
+                <span
+                  class="pop-shape-dot"
+                  [class]="'is-' + a.shape"
+                  aria-hidden="true"
+                ></span>
+              }
+            </button>
+          }
+          <button
+            type="button"
+            class="pop-row pop-row-more"
+            (click)="showMore()"
+          >
+            <span class="pop-row-ico" aria-hidden="true">•••</span>
+            <span class="pop-row-body">
+              <span class="pop-row-label">More actions</span>
+              <span class="pop-row-desc">All actions, grouped</span>
+            </span>
+            <span class="pop-row-chev" aria-hidden="true">▾</span>
           </button>
-        }
-        @if (toggles().enhance) {
-          <button type="button" class="pop-action" (click)="run('enhance')">
-            <span class="pop-action-ico" aria-hidden="true">✦</span>
-            Enhance context
-          </button>
+        } @else {
+          <!-- Expanded: every enabled action grouped under quiet labels. -->
+          @for (g of groups; track g) {
+            @if (groupActions(g).length > 0) {
+              <div class="pop-grp-label">{{ g }}</div>
+              @for (a of groupActions(g); track a.id) {
+                <button type="button" class="pop-row" (click)="choose(a)">
+                  <span class="pop-row-ico" aria-hidden="true">{{ a.icon }}</span>
+                  <span class="pop-row-body">
+                    <span class="pop-row-label">{{ a.label }}</span>
+                    <span class="pop-row-desc">{{ a.desc }}</span>
+                  </span>
+                  @if (a.sub) {
+                    <span class="pop-row-chev" aria-hidden="true">▸</span>
+                  } @else {
+                    <span
+                      class="pop-shape-dot"
+                      [class]="'is-' + a.shape"
+                      aria-hidden="true"
+                    ></span>
+                  }
+                </button>
+              }
+            }
+          }
         }
       </div>
     }
 
-    <!-- PHASE 2 — the animated step tracker. -->
+    <!-- PHASE — a variant submenu (tone / translate) with a Back row. -->
+    @case ("submenu") {
+      @if (submenu(); as parent) {
+        <button type="button" class="pop-row pop-row-back" (click)="back()">
+          <span class="pop-row-ico" aria-hidden="true">‹</span>
+          <span class="pop-row-label">Back</span>
+        </button>
+        <div class="pop-scroll" role="menu" [attr.aria-label]="parent.label">
+          @for (opt of parent.sub; track opt) {
+            <button
+              type="button"
+              class="pop-row"
+              (click)="runVariant(parent, opt)"
+            >
+              <span class="pop-row-ico" aria-hidden="true">{{ parent.icon }}</span>
+              <span class="pop-row-label pop-row-variant">{{ opt }}</span>
+              <span
+                class="pop-shape-dot"
+                [class]="'is-' + parent.shape"
+                aria-hidden="true"
+              ></span>
+            </button>
+          }
+        </div>
+      }
+    }
+
+    <!-- PHASE — the animated step tracker. -->
     @case ("running") {
       <div class="pop-flow" role="status" aria-live="polite">
-        <p class="pop-flow-title">{{ actionLabel(activeAction()!) }}</p>
+        <p class="pop-flow-title">{{ headerCaption() }}</p>
         <ul class="pop-steps">
           @for (step of steps(); track step.id) {
             <li
@@ -90,47 +226,206 @@
       </div>
     }
 
-    <!-- PHASE 3 — the reviewable diff + Accept / Discard / Retry. -->
+    <!-- PHASE — the result, rendered generically off `result().shape`. -->
     @case ("result") {
       @if (result(); as res) {
         <div class="pop-result">
-          @if (isEnhanceResult()) {
-            <!-- Enhance is ADDITIVE: keep the selection, show the passage to insert. -->
-            <div class="pop-diff">
-              <span class="pop-diff-tag is-add">Keeps your text · adds</span>
-              <div class="pop-suggestion is-add">{{ res.suggestion }}</div>
-            </div>
-            @if (res.citations.length > 0) {
-              <div class="pop-cites" aria-label="Sources">
-                @for (cite of res.citations; track cite.id) {
-                  <button
-                    type="button"
-                    class="pop-cite"
-                    (click)="openCitation(cite)"
-                    [attr.title]="cite.snippet"
-                  >
-                    <span class="pop-cite-kind">{{ cite.kind }}</span>
-                    <span class="pop-cite-title">{{ cite.title }}</span>
-                  </button>
-                }
+          @switch (res.shape) {
+            <!-- replace — struck original vs suggestion; Accept replaces. -->
+            @case ("replace") {
+              <div class="pop-diff">
+                <div class="pop-diff-col">
+                  <span class="pop-diff-tag">Original</span>
+                  <div class="pop-original">{{ original() }}</div>
+                </div>
+                <span class="pop-diff-arrow" aria-hidden="true">↓</span>
+                <div class="pop-diff-col">
+                  <span class="pop-diff-tag is-accent">Suggested</span>
+                  <div class="pop-suggestion">{{ res.suggestion }}</div>
+                </div>
+              </div>
+              <div class="pop-buttons">
+                <button
+                  type="button"
+                  class="btn btn-primary pop-btn"
+                  (click)="acceptReplace()"
+                >
+                  Accept
+                </button>
+                <button
+                  type="button"
+                  class="btn btn-ghost pop-btn"
+                  (click)="retry()"
+                >
+                  Retry
+                </button>
+                <button
+                  type="button"
+                  class="btn btn-ghost pop-btn"
+                  (click)="discard()"
+                >
+                  Discard
+                </button>
               </div>
             }
-          } @else {
-            <!-- Refine/Shorten REPLACE: original (muted) → suggestion (accent),
-                 each clearly labelled so the change reads at a glance. -->
-            <div class="pop-diff">
-              <div class="pop-diff-col">
-                <span class="pop-diff-tag">Original</span>
-                <div class="pop-original">{{ original() }}</div>
+
+            <!-- insert — keeps the selection, adds the passage below; Insert appends. -->
+            @case ("insert") {
+              <div class="pop-diff">
+                <span class="pop-diff-tag is-add">Keeps your text · adds</span>
+                <div class="pop-suggestion is-add">{{ res.suggestion }}</div>
               </div>
-              <span class="pop-diff-arrow" aria-hidden="true">↓</span>
-              <div class="pop-diff-col">
-                <span class="pop-diff-tag is-accent">Suggested</span>
-                <div class="pop-suggestion">{{ res.suggestion }}</div>
+              @if (res.citations.length > 0) {
+                <div class="pop-cites" aria-label="Sources">
+                  @for (cite of res.citations; track cite.id) {
+                    <button
+                      type="button"
+                      class="pop-cite"
+                      (click)="openCitation(cite)"
+                      [attr.title]="cite.snippet"
+                    >
+                      <span class="pop-cite-kind">{{ cite.kind }}</span>
+                      <span class="pop-cite-title">{{ cite.title }}</span>
+                    </button>
+                  }
+                </div>
+              }
+              <div class="pop-buttons">
+                <button
+                  type="button"
+                  class="btn btn-primary pop-btn"
+                  (click)="acceptInsert()"
+                >
+                  Insert
+                </button>
+                <button
+                  type="button"
+                  class="btn btn-ghost pop-btn"
+                  (click)="retry()"
+                >
+                  Retry
+                </button>
+                <button
+                  type="button"
+                  class="btn btn-ghost pop-btn"
+                  (click)="discard()"
+                >
+                  Discard
+                </button>
               </div>
-            </div>
+            }
+
+            <!-- info — read-only. `find_related` is a DISCOVERY aid (the citations ARE the payload —
+                 tap to open a source; nothing to insert). `fact_check`/`ask` produce a real answer
+                 you can copy or insert into the note. -->
+            @case ("info") {
+              @if (res.action === "find_related") {
+                @if (res.citations.length > 0) {
+                  <p class="pop-info-lead">{{ res.suggestion }}</p>
+                  <div class="pop-cites" aria-label="Related sources">
+                    @for (cite of res.citations; track cite.id) {
+                      <button
+                        type="button"
+                        class="pop-cite"
+                        (click)="openCitation(cite)"
+                        [attr.title]="cite.snippet"
+                      >
+                        <span class="pop-cite-kind">{{ cite.kind }}</span>
+                        <span class="pop-cite-title">{{ cite.title }}</span>
+                      </button>
+                    }
+                  </div>
+                  <p class="pop-hint">Tap a source to open it.</p>
+                } @else {
+                  <div class="pop-info-answer">
+                    Nothing related found in your brain yet.
+                  </div>
+                }
+                <div class="pop-buttons">
+                  <button
+                    type="button"
+                    class="btn btn-ghost pop-btn"
+                    (click)="discard()"
+                  >
+                    Done
+                  </button>
+                </div>
+              } @else {
+                <div class="pop-info-answer">{{ res.suggestion }}</div>
+                @if (res.citations.length > 0) {
+                  <div class="pop-cites" aria-label="Sources">
+                    @for (cite of res.citations; track cite.id) {
+                      <button
+                        type="button"
+                        class="pop-cite"
+                        (click)="openCitation(cite)"
+                        [attr.title]="cite.snippet"
+                      >
+                        <span class="pop-cite-kind">{{ cite.kind }}</span>
+                        <span class="pop-cite-title">{{ cite.title }}</span>
+                      </button>
+                    }
+                  </div>
+                }
+                <div class="pop-buttons">
+                  <button type="button" class="btn pop-btn" (click)="copyResult()">
+                    Copy
+                  </button>
+                  <button
+                    type="button"
+                    class="btn pop-btn"
+                    (click)="acceptInsert()"
+                  >
+                    Insert
+                  </button>
+                  <button
+                    type="button"
+                    class="btn btn-ghost pop-btn"
+                    (click)="discard()"
+                  >
+                    Dismiss
+                  </button>
+                </div>
+              }
+            }
+
+            <!-- artifact — a titled draft (email / new note); Copy or Create note. -->
+            @case ("artifact") {
+              @if (res.title) {
+                <div class="pop-artifact-title">{{ res.title }}</div>
+              }
+              <div class="pop-info-answer">{{ res.suggestion }}</div>
+              <div class="pop-buttons">
+                @if (res.action === "spinoff_note") {
+                  <button
+                    type="button"
+                    class="btn btn-primary pop-btn"
+                    (click)="createNote()"
+                  >
+                    Create note
+                  </button>
+                } @else {
+                  <button
+                    type="button"
+                    class="btn btn-primary pop-btn"
+                    (click)="copyResult()"
+                  >
+                    Copy
+                  </button>
+                }
+                <button
+                  type="button"
+                  class="btn btn-ghost pop-btn"
+                  (click)="discard()"
+                >
+                  Dismiss
+                </button>
+              </div>
+            }
           }
 
+          <!-- The redaction shield rides every CLOUD-egress result. `find_related`
+               is retrieval-only (redacted=false) → never shows it (contract). -->
           @if (res.redacted) {
             <p class="pop-redacted">
               <span aria-hidden="true">🛡</span>
@@ -139,36 +434,14 @@
           }
 
           <p class="pop-model" [title]="res.modelLabel">{{ res.modelLabel }}</p>
-
-          <div class="pop-buttons">
-            <button
-              type="button"
-              class="btn btn-primary pop-btn"
-              (click)="accept()"
-            >
-              {{ isEnhanceResult() ? "Insert" : "Accept" }}
-            </button>
-            <button type="button" class="btn btn-ghost pop-btn" (click)="retry()">
-              Retry
-            </button>
-            <button
-              type="button"
-              class="btn btn-ghost pop-btn"
-              (click)="discard()"
-            >
-              Discard
-            </button>
-          </div>
         </div>
       }
     }
 
-    <!-- PHASE 4 — an inline error with Retry. -->
+    <!-- PHASE — an inline error with Retry. -->
     @case ("error") {
       <div class="pop-error" role="alert">
-        <p class="pop-error-text">
-          Couldn’t complete that. {{ errorMsg() }}
-        </p>
+        <p class="pop-error-text">Couldn’t complete that. {{ errorMsg() }}</p>
         <div class="pop-buttons">
           <button
             type="button"

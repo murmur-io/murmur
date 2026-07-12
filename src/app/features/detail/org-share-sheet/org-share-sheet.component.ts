@@ -14,7 +14,11 @@ import {
 } from "@angular/core";
 import { FormsModule } from "@angular/forms";
 import { IpcService } from "../../../core/ipc.service";
-import type { OrgSharePreview, OrgStatus } from "../../../core/models";
+import type {
+  OrgSharePreview,
+  OrgSourceShareStatus,
+  OrgStatus,
+} from "../../../core/models";
 import { MurSelectComponent } from "../../../design-system/select/select.component";
 
 /**
@@ -92,6 +96,22 @@ export class OrgShareSheetComponent {
   /** True when there's exactly one org (show it as a label, no picker). */
   readonly singleOrg = computed(() => this._orgs().length === 1);
 
+  /**
+   * Orgs that ALREADY hold a live copy of this source (the double-click BLOCK).
+   * Loaded once per open via `orgLiveSharesForSource`; the confirm button is
+   * disabled — and the picker marks the org "Already added ✓" — for any org in
+   * this set, so a re-click can never publish a duplicate.
+   */
+  private readonly _liveShares = signal<OrgSourceShareStatus[]>([]);
+  /** Set of org ids that already hold a live share of this source. */
+  readonly sharedOrgIds = computed(
+    () => new Set(this._liveShares().map((s) => s.orgId)),
+  );
+  /** True when the CURRENTLY-selected org already holds this source. */
+  readonly alreadyShared = computed(() =>
+    this.sharedOrgIds().has(this.selectedOrgId()),
+  );
+
   /** Whether the regex PII scrub is on (default ON per the redaction policy). */
   readonly scrub = signal(true);
 
@@ -143,6 +163,16 @@ export class OrgShareSheetComponent {
       { injector: this.injector },
     );
 
+    // Load which orgs ALREADY hold this source → block a re-share (dup fix). Keyed
+    // on the target so it re-reads if the sheet is reused for another source.
+    effect(
+      () => {
+        const t = this.target();
+        void this.loadLiveShares(t);
+      },
+      { injector: this.injector },
+    );
+
     // Land focus in the sheet so Escape works + it's announced.
     afterNextRender(() => this.panel()?.nativeElement.focus(), {
       injector: this.injector,
@@ -163,6 +193,30 @@ export class OrgShareSheetComponent {
       this.orgsError.set(String(e));
     } finally {
       this.orgsLoading.set(false);
+    }
+  }
+
+  /**
+   * Load which orgs already hold a live copy of this source (the re-share block).
+   * Best-effort + stale-guarded on the target: a failure just leaves the set empty
+   * (never blocks sharing) — the backend idempotency guard is the real safety net.
+   */
+  private async loadLiveShares(t: OrgShareTarget): Promise<void> {
+    try {
+      const live = await this.ipc.orgLiveSharesForSource(
+        t.kind === "meeting" ? { meetingId: t.id } : { documentId: t.id },
+      );
+      if (this.target().id !== t.id) {
+        return; // stale — the target changed under us
+      }
+      // Defensive: never let a malformed/non-array response (e.g. an unmocked
+      // IPC command resolving to its generic `null` default) null-deref a
+      // downstream `.some()`/`.find()` over this signal.
+      this._liveShares.set(Array.isArray(live) ? live : []);
+    } catch {
+      if (this.target().id === t.id) {
+        this._liveShares.set([]);
+      }
     }
   }
 
@@ -205,7 +259,16 @@ export class OrgShareSheetComponent {
    */
   async confirm(): Promise<void> {
     const orgId = this.selectedOrgId();
-    if (this.sharing() || this.loading() || !this._preview() || !orgId) {
+    if (
+      this.sharing() ||
+      this.loading() ||
+      !this._preview() ||
+      !orgId ||
+      this.alreadyShared()
+    ) {
+      // `alreadyShared` blocks a duplicate publish — the note is already in this
+      // org and edits sync automatically (re-publish-on-edit), so there is nothing
+      // to do. The backend guard is idempotent regardless, but we never even ask.
       return;
     }
     const t = this.target();

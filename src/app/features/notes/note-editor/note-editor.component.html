@@ -443,7 +443,7 @@
         <app-note-brain-popover
           [noteId]="doc.id"
           [selection]="s"
-          [toggles]="assistToggles()"
+          [enabledActions]="enabledActions()"
           (accepted)="applyEdit($event)"
           (dismiss)="closePopover()"
         />
