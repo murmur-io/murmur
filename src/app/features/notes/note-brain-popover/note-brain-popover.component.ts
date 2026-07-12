@@ -486,9 +486,15 @@ export class NoteBrainPopoverComponent {
     }
   }
 
-  /** Open a citation's source note/meeting; dismiss the popover first. */
+  /** Open a citation's source note/meeting/org-item; dismiss the popover first. */
   openCitation(cite: NoteCitation): void {
     this.dismiss.emit();
+    // "org" routes to the read-only org-item viewer (mirrors library.component.ts orgItemLink) —
+    // it is NOT a local note/meeting id, so it must never fall into the "/notes" default below.
+    if (cite.kind === "org") {
+      void this.router.navigate(["/org-item", cite.id]);
+      return;
+    }
     const path =
       cite.kind === "meeting"
         ? "/meeting"

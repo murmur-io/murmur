@@ -76,7 +76,13 @@ pub fn render_conversation(history: &[ChatTurn], question: &str) -> String {
 /// `memory_brief` is the gated cross-meeting USER MEMORY brief, injected identically to [`build`]:
 /// non-empty ⇒ a "WHAT YOU KNOW ABOUT THE USER" block; EMPTY ⇒ byte-identical to the pre-memory
 /// persona. Gated by the caller (VISIBLE facts only), rides the surface's existing egress.
-pub fn agentic_system(memory_brief: &str) -> String {
+///
+/// `org_available` (A2, Shared Brain): when `true`, appends one explicit fallback-steering sentence
+/// telling the model to ALSO try `org_brain_search` before concluding it doesn't know — the model
+/// already has the tool advertised (gated identically by `org_brain_available`, tools.rs) but may
+/// never CHOOSE to call it without this nudge. `false` ⇒ BYTE-IDENTICAL to the pre-org persona (the
+/// non-member / org-unavailable path is completely unchanged).
+pub fn agentic_system(memory_brief: &str, org_available: bool) -> String {
     format!(
         "You answer questions across a user's PAST MEETINGS, imported documents, and brain notes \
      (their private, on-device vault).\n\
@@ -90,9 +96,21 @@ pub fn agentic_system(memory_brief: &str) -> String {
      - Be concise and concrete.\n\
      - Format as clean, scannable Markdown: a one-line **bold takeaway** first, then tight \
      bullets or short `##` sections. A tasteful emoji in a section header is welcome (e.g. \
-     ## ✅ Decisions). Never output YAML or front-matter.{memory}",
+     ## ✅ Decisions). Never output YAML or front-matter.{org}{memory}",
+        org = org_fallback_suffix(org_available),
         memory = agentic_memory_suffix(memory_brief),
     )
+}
+
+/// The agentic persona's optional ORG FALLBACK sentence (A2). `false` ⇒ EMPTY string (byte-identical
+/// to the pre-org persona); `true` ⇒ one explicit steering sentence appended after the base rules.
+fn org_fallback_suffix(org_available: bool) -> String {
+    if !org_available {
+        return String::new();
+    }
+    "\n     - If the user's own vault doesn't answer this, ALSO try org_brain_search (the Shared \
+     Brain) before concluding you don't know."
+        .to_string()
 }
 
 /// Brain v2 L3 — the agentic persona WITH just-in-time retrieval seeding (behind the
@@ -103,8 +121,11 @@ pub fn agentic_system(memory_brief: &str) -> String {
 /// meetings it needs instead of a pre-stuffed corpus. EMPTY (the flag-off path and the
 /// nothing-visible vault) ⇒ BYTE-IDENTICAL to [`agentic_system`] — the flag-off legacy-prompt
 /// contract, pinned by `agentic_system_jit_empty_listing_is_byte_identical`.
-pub fn agentic_system_jit(memory_brief: &str, listing: &str) -> String {
-    let base = agentic_system(memory_brief);
+///
+/// `org_available` (A2) is threaded straight through to [`agentic_system`] — see its doc for the
+/// byte-identical-when-false contract.
+pub fn agentic_system_jit(memory_brief: &str, listing: &str, org_available: bool) -> String {
+    let base = agentic_system(memory_brief, org_available);
     let listing = listing.trim();
     if listing.is_empty() {
         return base;
@@ -179,11 +200,14 @@ mod tests {
     #[test]
     fn agentic_system_jit_empty_listing_is_byte_identical() {
         for brief in ["", "- You prefer: Polish replies"] {
-            assert_eq!(agentic_system_jit(brief, ""), agentic_system(brief));
-            assert_eq!(agentic_system_jit(brief, "   "), agentic_system(brief));
+            assert_eq!(agentic_system_jit(brief, "", false), agentic_system(brief, false));
+            assert_eq!(agentic_system_jit(brief, "   ", false), agentic_system(brief, false));
         }
-        let with = agentic_system_jit("", "- m1 | Standup | 2026-07-01");
-        assert!(with.starts_with(&agentic_system("")), "the base persona prefix is unchanged");
+        let with = agentic_system_jit("", "- m1 | Standup | 2026-07-01", false);
+        assert!(
+            with.starts_with(&agentic_system("", false)),
+            "the base persona prefix is unchanged"
+        );
         assert!(with.contains("MEETING LISTING"));
         assert!(with.contains("get_meeting"));
         assert!(with.contains("- m1 | Standup | 2026-07-01"));
@@ -193,12 +217,80 @@ mod tests {
     /// the labelled block appears.
     #[test]
     fn agentic_system_injects_memory_brief_and_empty_is_byte_identical() {
-        let base = agentic_system("");
-        assert_eq!(base, agentic_system("   "));
+        let base = agentic_system("", false);
+        assert_eq!(base, agentic_system("   ", false));
         assert!(!base.contains("WHAT YOU KNOW ABOUT THE USER"));
-        let with = agentic_system("- You prefer: Polish replies");
+        let with = agentic_system("- You prefer: Polish replies", false);
         assert!(with.contains("WHAT YOU KNOW ABOUT THE USER"));
         assert!(with.contains("Polish replies"));
         assert!(with.starts_with(&base), "the persona prefix is unchanged");
+    }
+
+    // ── A2 — org fallback steering ───────────────────────────────────────────────────────────────
+
+    /// RED-before-GREEN: `org_available=true` must append the explicit org_brain_search fallback
+    /// sentence to the agentic persona; `org_available=false` must produce a BYTE-IDENTICAL prompt to
+    /// today (no parameter at all, pre-fix). Mirrors the `agentic_system_jit_empty_listing_is_byte_
+    /// identical` pattern for this new parameter.
+    #[test]
+    fn agentic_system_org_hint_appears_only_when_available() {
+        for memory in ["", "- You prefer: Polish replies"] {
+            let off = agentic_system(memory, false);
+            assert!(
+                !off.contains("org_brain_search"),
+                "org_available=false must never mention org_brain_search: {off}"
+            );
+            let on = agentic_system(memory, true);
+            assert!(
+                on.contains("org_brain_search"),
+                "org_available=true must add the org fallback sentence: {on}"
+            );
+            // The base persona (everything before the memory suffix) must be UNCHANGED — the org
+            // sentence is inserted between the base rules and the memory block, never mutating
+            // either. Compare against the memory-off shape of each so insertion position doesn't
+            // trip up a direct substring/prefix check when a memory brief is also present.
+            let base = agentic_system("", false);
+            assert!(
+                on.starts_with(&base),
+                "the base persona prefix must be unchanged when org is available: {on}"
+            );
+            if !memory.trim().is_empty() {
+                assert!(
+                    on.contains("WHAT YOU KNOW ABOUT THE USER") && on.contains(memory),
+                    "the memory block must still be present when org is ALSO available: {on}"
+                );
+            }
+        }
+    }
+
+    /// `org_available=false` is BYTE-IDENTICAL to the pre-org-parameter persona (no `org` param at
+    /// all) — proven by pinning it against the exact historical rule text, so a future edit can't
+    /// silently start emitting the org sentence for `false`.
+    #[test]
+    fn agentic_system_org_unavailable_is_byte_identical_to_pre_org_persona() {
+        let historical = "You answer questions across a user's PAST MEETINGS, imported documents, and brain notes \
+     (their private, on-device vault).\n\
+     Rules:\n\
+     - Ground every claim in tool results — search before answering unless you already have \
+     enough grounding. If the answer isn't in the vault, say you don't know. Never invent \
+     facts, decisions, or attributions.\n\
+     - Cite the meetings you rely on inline using their [[Title]] exactly as the tools return \
+     it; attribute web facts as \"(via web)\".\n\
+     - When something evolved across meetings, trace it chronologically.\n\
+     - Be concise and concrete.\n\
+     - Format as clean, scannable Markdown: a one-line **bold takeaway** first, then tight \
+     bullets or short `##` sections. A tasteful emoji in a section header is welcome (e.g. \
+     ## ✅ Decisions). Never output YAML or front-matter.";
+        assert_eq!(agentic_system("", false), historical);
+    }
+
+    /// `agentic_system_jit` threads `org_available` through unchanged: false ⇒ no org sentence in
+    /// either the flag-off (empty listing) or flag-on (listing present) shapes.
+    #[test]
+    fn agentic_system_jit_org_hint_threads_through() {
+        let off = agentic_system_jit("", "- m1 | Standup | 2026-07-01", false);
+        assert!(!off.contains("org_brain_search"));
+        let on = agentic_system_jit("", "- m1 | Standup | 2026-07-01", true);
+        assert!(on.contains("org_brain_search"));
     }
 }

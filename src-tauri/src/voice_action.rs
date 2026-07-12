@@ -908,6 +908,50 @@ fn rag_answer(
             }
         }
     }
+    // ORG LEG (SHARED BRAIN): when the caller has JOINED an org, ALSO search the org partition and
+    // fold its LOUD, provenance-labelled hits into the grounding. Runs for BOTH `recall` and
+    // `research` (unlike the web leg, which is research-only) — a colleague's shared note is exactly
+    // the kind of fact "what do we know about X" (recall) should surface, not just open-ended
+    // research. ONE call (not looped per retrieval query) to avoid multiplying embedding calls, using
+    // the same `display_query` the other single-call legs (web/calendar) key off. The org text is
+    // UNTRUSTED multi-writer content but `search_org_brain` ALREADY fence-neutralizes it
+    // (`neutralize_murmur_fences`, tools.rs) before returning — treat the string as already-safe data,
+    // exactly like the web leg treats web results; do not re-neutralize or skip that step.
+    let mut org_lines: Vec<String> = Vec::new();
+    if crate::tools::org_brain_available(db, config) {
+        let org_query = if !display_query.is_empty() {
+            display_query.clone()
+        } else {
+            literal_command.trim().to_string()
+        };
+        if !org_query.is_empty() {
+            match crate::tools::search_org_brain(db, config, &org_query) {
+                Ok(text) => {
+                    let text = text.trim();
+                    if !text.is_empty() && !is_empty_tool_result(text) {
+                        // Capture the loud "[org · …]" lines for citations, and add to grounding.
+                        for line in text.lines() {
+                            if line.trim_start().starts_with("- [org") {
+                                org_lines.push(line.to_string());
+                            }
+                        }
+                        if !grounding.is_empty() {
+                            grounding.push_str("\n\n");
+                        }
+                        grounding.push_str(text);
+                        grounding.push_str("\n\n");
+                    }
+                }
+                // An org lookup failure is non-fatal — the vault (+ web/calendar) grounding still
+                // answers.
+                Err(e) => tracing::debug!(
+                    target: "voice",
+                    error = %e,
+                    "voice-action org-brain search failed; continuing with vault grounding"
+                ),
+            }
+        }
+    }
     let grounding = grounding.trim();
 
     // CURRENT-MEETING-FIRST (fixes the "describes other meetings" symptom on the local/reasoner-only
@@ -969,6 +1013,14 @@ fn rag_answer(
     // from the `[[Title]]` vault wikilinks and the "(web) …" web citations.
     for line in &calendar_lines {
         if let Some(c) = calendar_citation_from_line(line) {
+            push_cite(c);
+        }
+    }
+    // ORG citations: each loud "- [org · <author>] Title — snippet" line becomes a distinct
+    // "(org · <author>) Title" citation, so org-derived facts stay attributed to their untrusted
+    // colleague-provenance and are visibly distinguishable from the `[[Title]]` vault wikilinks.
+    for line in &org_lines {
+        if let Some(c) = org_citation_from_line(line) {
             push_cite(c);
         }
     }
@@ -1062,13 +1114,15 @@ fn rag_answer(
     };
     let system = format!(
         "You are an in-meeting assistant. Answer the user's request CONCISELY (2-4 sentences) using \
-         ONLY the provided context: the current meeting, the user's own meeting notes AND any WEB \
-         results (lines beginning \"[web\").{current_clause} Cite vault meetings by their [[Title]] \
-         wikilink and attribute web facts as \"(via web)\". If the context doesn't cover it, say so \
-         plainly. Do not invent facts. Write your final answer in the SAME language the USER actually \
-         wrote in — look at the user's OWN words in their request below, NOT at the language of these \
-         instructions or the surrounding context (which are in English). If the user wrote in Polish, \
-         answer in Polish; match the user's language exactly and NEVER default to English."
+         ONLY the provided context: the current meeting, the user's own meeting notes, any WEB results \
+         (lines beginning \"[web\") AND any org/Shared Brain results from colleagues (lines beginning \
+         \"- [org ·\").{current_clause} Cite vault meetings by their [[Title]] wikilink, attribute web \
+         facts as \"(via web)\", and attribute org facts by their \"[org · author]\" provenance so it's \
+         clear they came from a colleague, not the user's own notes. If the context doesn't cover it, \
+         say so plainly. Do not invent facts. Write your final answer in the SAME language the USER \
+         actually wrote in — look at the user's OWN words in their request below, NOT at the language \
+         of these instructions or the surrounding context (which are in English). If the user wrote in \
+         Polish, answer in Polish; match the user's language exactly and NEVER default to English."
     );
     // The user message leads with the user's ORIGINAL dictated words (so the model can match their
     // language even when `display_query` is a normalized/translated topic), then the CURRENT meeting's
@@ -1310,13 +1364,39 @@ fn web_citation_from_line(line: &str) -> Option<String> {
     })
 }
 
+/// Turn a loud org-brain grounding line `- [org · <author>] Title — snippet` into a compact citation
+/// `(org · <author>) Title`. Returns `None` for a non-org line. Deterministic, no regex. Kept distinct
+/// from [`web_citation_from_line`]/[`calendar_citation_from_line`] so org-derived facts stay
+/// attributed to their untrusted colleague-provenance, never blended with the user's own `[[Title]]`
+/// vault wikilinks.
+fn org_citation_from_line(line: &str) -> Option<String> {
+    let line = line.trim();
+    let after_label = line.strip_prefix("- [org")?;
+    let close = after_label.find(']')?;
+    // `after_label` looks like " · <author>] Title — snippet" — the author sits between " · " and "]".
+    let author = after_label[..close]
+        .trim()
+        .trim_start_matches('·')
+        .trim();
+    let rest = after_label[close + 1..].trim();
+    let title = rest.split(" — ").next().unwrap_or(rest).trim();
+    if title.is_empty() {
+        return None;
+    }
+    if author.is_empty() {
+        Some(format!("(org) {title}"))
+    } else {
+        Some(format!("(org · {author}) {title}"))
+    }
+}
+
 /// Whether a tool result is a "nothing found" / "disabled" placeholder rather than real content,
 /// so it can be excluded from the brain grounding (an included placeholder would falsely count as
 /// grounding and trigger a brain call on an empty vault). Matches the deterministic prefixes
 /// `execute_tool` emits (`No meetings or documents match` — including `search_semantic`'s flag-off
 /// keyword-fallback variant — `No data`, `No open commitments`, `No visible entity`; the legacy
 /// `No meetings match` / `Semantic search is disabled` prefixes are kept so an old-shape sentinel
-/// can never miscount as grounding).
+/// can never miscount as grounding) plus `search_org_brain`'s own sentinels (`No org-brain results`).
 fn is_empty_tool_result(text: &str) -> bool {
     let t = text.trim_start();
     t.starts_with("No meetings match")
@@ -1330,6 +1410,7 @@ fn is_empty_tool_result(text: &str) -> bool {
         || t.starts_with("No Slack results")
         || t.starts_with("Slack search is not available")
         || t.starts_with("No calendar events")
+        || t.starts_with("No org-brain results")
 }
 
 /// Pull distinct `[[Title]]` wikilinks out of the gated tool grounding text, in first-seen order.
@@ -2880,5 +2961,264 @@ mod tests {
         assert_eq!(res.summary, NO_MODEL_ANSWER_NOTICE);
         assert_eq!(res.citations, vec!["[[Budget Review]]".to_string()]);
         assert_eq!(res.answered_from, Some(AnsweredFrom::CurrentMeeting));
+    }
+
+    // ── A1 — deterministic floor ORG LEG (Shared Brain) ─────────────────────────────────────────
+
+    /// Join org-1 for this session (mirrors `tools::tests::seed_org`).
+    fn seed_org(db: &Db) {
+        db.upsert_org_state(&crate::storage::OrgState {
+            org_id: "org-1".to_string(),
+            name: "Acme".to_string(),
+            role: "member".to_string(),
+            joined_at: "2026-07-10T00:00:00Z".to_string(),
+            consented: true,
+            last_seq: 0,
+            generation: 1,
+            context_enabled: true,
+        })
+        .unwrap();
+    }
+
+    /// Ingest one org-brain item into the local replica (mirrors `tools::tests::ingest_org`).
+    fn ingest_org(db: &Db, item_id: &str, author: &str, title: &str, body: &str, sha: &[u8]) {
+        db.upsert_org_item(
+            item_id,
+            "org-1",
+            1,
+            author,
+            title,
+            body,
+            "2026-07-10T09:00:00Z",
+            1,
+            1,
+            sha,
+            None,
+            Some(&crate::embed::StubEmbedder),
+        )
+        .unwrap();
+    }
+
+    /// RED-before-GREEN (A1, the reported bug): the deterministic floor must fold ORG BRAIN results
+    /// into its grounding — an org item with NO vault match must still reach the brain input,
+    /// attributed with the `[org · author]` provenance line, and surface as a citation. Pre-fix,
+    /// `rag_answer` had no org leg at all, so a colleague's shared note (org-only, nothing in the
+    /// user's own vault) was silently omitted.
+    #[test]
+    fn floor_folds_org_brain_results_into_grounding_with_provenance() {
+        let db = tmp_db();
+        seed_org(&db);
+        // Semantic off so the test is embedder-independent (FTS leg only, mirrors tools.rs org tests).
+        ingest_org(
+            &db,
+            "it-1",
+            "anna",
+            "Anna's roadmap",
+            "the apollo migration ships friday",
+            &[3u8; 32],
+        );
+        let reasoner = CaptureReasoner::new();
+        let res = handle_voice_action(
+            &VoiceIntent::Research {
+                topic: "apollo migration".into(),
+            },
+            &reasoner,
+            &db,
+            &empty_unlocked(),
+            &AppConfig {
+                semantic_search_enabled: false,
+                ..AppConfig::default()
+            },
+            "live-mtg",
+            "",
+            "",
+            false,
+            None,
+        );
+        assert_eq!(res.status, "ok");
+        let user = reasoner
+            .last_user
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the brain MUST be called with org grounding present");
+        assert!(
+            user.contains("[org · anna]") && user.contains("Anna's roadmap"),
+            "org-only content (no vault match) must reach the brain input, attributed: {user}"
+        );
+        assert!(
+            res.citations.iter().any(|c| c.contains("(org · anna)")),
+            "the org hit must surface as a distinct '(org · author)' citation: {:?}",
+            res.citations
+        );
+        // The system prompt must also name org notes as a third context class.
+        let system = reasoner.last_system.lock().unwrap().clone().unwrap();
+        assert!(
+            system.contains("[org ·") || system.contains("org"),
+            "the system prompt must mention org-sourced context: {system}"
+        );
+    }
+
+    /// RED companion — recall must ALSO get the org leg (not just research, unlike the web leg).
+    #[test]
+    fn floor_folds_org_brain_results_for_recall_intent_too() {
+        let db = tmp_db();
+        seed_org(&db);
+        ingest_org(
+            &db,
+            "it-2",
+            "bob",
+            "Bob's plan",
+            "the siema onboarding checklist",
+            &[7u8; 32],
+        );
+        let reasoner = CaptureReasoner::new();
+        let res = handle_voice_action(
+            &VoiceIntent::Recall {
+                entity: "siema onboarding".into(),
+            },
+            &reasoner,
+            &db,
+            &empty_unlocked(),
+            &AppConfig {
+                semantic_search_enabled: false,
+                ..AppConfig::default()
+            },
+            "live-mtg",
+            "",
+            "",
+            false,
+            None,
+        );
+        assert_eq!(res.status, "ok");
+        let user = reasoner.last_user.lock().unwrap().clone().unwrap();
+        assert!(
+            user.contains("[org · bob]") && user.contains("Bob's plan"),
+            "recall must ALSO fold in org grounding: {user}"
+        );
+    }
+
+    /// Fail-closed companion (mirrors `tools::tests::search_org_brain_seam_fails_closed_for_a_non_member`):
+    /// a caller who has NOT joined any org (`org_brain_available` false) never gets an org leg
+    /// attempted — the deterministic floor stays vault/web/calendar-only, byte-shape unchanged.
+    #[test]
+    fn floor_never_attempts_org_leg_for_a_non_member() {
+        let db = tmp_db();
+        seed_visible_and_sealed(&db); // vault grounding present, but NO org_state joined.
+        let reasoner = CaptureReasoner::new();
+        let res = handle_voice_action(
+            &VoiceIntent::Research {
+                topic: "Atlas".into(),
+            },
+            &reasoner,
+            &db,
+            &empty_unlocked(),
+            &AppConfig {
+                semantic_search_enabled: false,
+                ..AppConfig::default()
+            },
+            "live-mtg",
+            "",
+            "",
+            false,
+            None,
+        );
+        assert_eq!(res.status, "ok");
+        let user = reasoner.last_user.lock().unwrap().clone().unwrap();
+        assert!(
+            !user.contains("[org ·") && !user.contains("org-brain"),
+            "a non-member must NEVER get an org leg, even attempted: {user}"
+        );
+        assert!(
+            res.citations.iter().all(|c| !c.contains("(org")),
+            "a non-member must never surface an org citation: {:?}",
+            res.citations
+        );
+    }
+
+    /// PER-INSTANCE ORG TOGGLE, end-to-end through the deterministic floor (RED-before-GREEN, the
+    /// user's hard mandate — this is A1's original bug scenario, now with the toggle): a member of
+    /// TWO orgs who has disabled ONE of them on this install must NEVER see that org's content reach
+    /// the brain grounding — even though it matches the query and would surface if enabled. The
+    /// STILL-enabled org's content must keep working normally. Proves "disabled means truly gone",
+    /// not just deprioritized, at the actual consumer surface a real user hits.
+    #[test]
+    fn floor_never_folds_a_disabled_orgs_content_into_grounding_while_the_enabled_org_still_works() {
+        let db = tmp_db();
+        seed_org(&db); // org-1, enabled by default
+        db.upsert_org_state(&crate::storage::OrgState {
+            org_id: "org-2".to_string(),
+            name: "Beta".to_string(),
+            role: "member".to_string(),
+            joined_at: "2026-07-11T00:00:00Z".to_string(),
+            consented: true,
+            last_seq: 0,
+            generation: 1,
+            context_enabled: true,
+        })
+        .unwrap();
+        ingest_org(
+            &db,
+            "it-disabled",
+            "anna",
+            "Disabled org roadmap",
+            "the horizon launch plan for the beta release",
+            &[31u8; 32],
+        );
+        db.upsert_org_item(
+            "it-enabled",
+            "org-2",
+            1,
+            "carol",
+            "Enabled org roadmap",
+            "the horizon launch timeline for the beta release",
+            "2026-07-10T09:00:00Z",
+            1,
+            1,
+            &[32u8; 32],
+            None,
+            Some(&crate::embed::StubEmbedder),
+        )
+        .unwrap();
+        db.set_org_context_enabled("org-1", false).unwrap();
+
+        let reasoner = CaptureReasoner::new();
+        let res = handle_voice_action(
+            &VoiceIntent::Research {
+                topic: "horizon launch".into(),
+            },
+            &reasoner,
+            &db,
+            &empty_unlocked(),
+            &AppConfig {
+                semantic_search_enabled: false,
+                ..AppConfig::default()
+            },
+            "live-mtg",
+            "",
+            "",
+            false,
+            None,
+        );
+        assert_eq!(res.status, "ok");
+        let user = reasoner.last_user.lock().unwrap().clone().unwrap();
+        assert!(
+            !user.contains("Disabled org roadmap") && !user.contains("[org · anna]"),
+            "the disabled org's content must NEVER reach the brain input: {user}"
+        );
+        assert!(
+            user.contains("[org · carol]") && user.contains("Enabled org roadmap"),
+            "the still-enabled org's content must keep reaching the brain input: {user}"
+        );
+        assert!(
+            res.citations.iter().all(|c| !c.contains("anna")),
+            "the disabled org's author must never surface as a citation: {:?}",
+            res.citations
+        );
+        assert!(
+            res.citations.iter().any(|c| c.contains("(org · carol)")),
+            "the enabled org's citation must still surface: {:?}",
+            res.citations
+        );
     }
 }
