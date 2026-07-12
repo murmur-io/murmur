@@ -70,3 +70,17 @@
   align-items: center;
   gap: 6px;
 }
+
+/* SHARED — a settled "done" state (a subtle success tint), not a call to action:
+   the note is already in the org brain, so the card reads as status. */
+.org-cta.is-shared {
+  border-color: var(--success-soft);
+  background:
+    linear-gradient(180deg, var(--success-soft), transparent 70%),
+    var(--surface-raised);
+}
+
+.org-cta.is-shared .org-cta-mark {
+  background: var(--success-soft);
+  color: var(--success);
+}
