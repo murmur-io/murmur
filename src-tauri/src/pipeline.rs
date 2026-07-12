@@ -555,16 +555,13 @@ async fn run_inner(
                 }
             }
         });
-        // Diarizer (best-effort): created once when models resolved — used on the system stream only.
-        let diarizer = diarize_models.and_then(|(seg, emb)| {
-            match crate::transcribe::diarize::Diarizer::load(&seg, &emb) {
-                Ok(d) => Some(d),
-                Err(e) => {
-                    tracing::warn!(target: "transcribe", error = %e, "diarizer load failed; single 'others' label");
-                    None
-                }
-            }
-        });
+        // NOTE: the diarizer is loaded further below, lazily, right before `d.diarize(&sys)` — NOT
+        // here. Loading it this early meant it sat resident through BOTH stream transcriptions, and
+        // (before the drop() below existed) Whisper stayed resident through diarization too — two
+        // heavy ML runtimes (whisper.cpp + sherpa-onnx/Pyannote) peaking RAM/CPU simultaneously
+        // (2026-07-13 RCA: matched a reported system freeze + macOS cpu_resource.diag hotspots
+        // through Diarizer::diarize). Their ASR/diarize work is inherently sequential — deferring
+        // the diarizer's load until Whisper is actually dropped costs nothing.
 
         // BATCH path → Accurate profile for BOTH streams, VAD-segmented so each speech region is a
         // FRESH decode (context reset across long gaps; never decode through silence). Live captions
@@ -585,6 +582,24 @@ async fn run_inner(
         if let (Some(sys), Some(sys_started)) = (sys_16k, system_started_at) {
             let mut sys_segments =
                 transcribe_stream(&transcriber, vad.as_mut(), &sys, lang_owned.as_deref())?;
+
+            // ASR is done for both streams — free Whisper (+ VAD, also unused from here on) BEFORE
+            // loading the diarizer, so the two heavy ML runtimes are never resident together.
+            drop(transcriber);
+            drop(vad);
+
+            // Diarizer (best-effort): loaded HERE, only once Whisper has been released, and only
+            // when there's actually a system stream to diarize.
+            let diarizer = diarize_models.and_then(|(seg, emb)| {
+                match crate::transcribe::diarize::Diarizer::load(&seg, &emb) {
+                    Ok(d) => Some(d),
+                    Err(e) => {
+                        tracing::warn!(target: "transcribe", error = %e, "diarizer load failed; single 'others' label");
+                        None
+                    }
+                }
+            });
+
             // N-way diarization on the "others" stream ONLY — relabel segments to others-0/1/2.
             if let Some(d) = &diarizer {
                 match d.diarize(&sys) {
