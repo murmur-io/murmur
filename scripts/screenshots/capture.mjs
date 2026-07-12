@@ -229,6 +229,46 @@ const SHOTS = {
     },
   },
 
+  // Notes editor — a body selection with the Brain command-menu popover open,
+  // expanded to the grouped/several-actions view (the "More actions" state).
+  "notes-editor-brain-menu": {
+    viewport: APP,
+    async run(page) {
+      await page.goto(`${BASE}/notes/n-atlas-prd`, { waitUntil: "networkidle" });
+      await page.waitForSelector("textarea.body-area", { timeout: 15000 });
+      const body = page.locator("textarea.body-area");
+      // Select a real chunk of NOTE_DOC_MD via setSelectionRange + a `select`
+      // event (onBodySelect fires on mouseup/keyup/select — a native drag-select
+      // over a wrapped textarea isn't reliable in Playwright).
+      await body.evaluate((el) => {
+        const text = el.value;
+        const start = text.indexOf("Project Atlas");
+        const end = start + 120;
+        el.focus();
+        el.setSelectionRange(start, end);
+        el.dispatchEvent(new Event("select", { bubbles: true }));
+      });
+      await settle(page, 300);
+      await page.locator("button.sel-ai").click();
+      await page.waitForSelector(".brain-pop", { timeout: 5000 });
+      await settle(page, 300);
+      await page.locator(".pop-row-more").click();
+      await settle(page, 500);
+    },
+  },
+
+  // Notes-home — the "Shared brains" rail with an org selected, showing that
+  // org's synced items (org-badge cards).
+  "shared-brain-rail": {
+    viewport: APP,
+    async run(page) {
+      await page.goto(`${BASE}/notes`, { waitUntil: "networkidle" });
+      await page.waitForSelector(".org-row", { timeout: 15000 });
+      await page.locator(".org-row").first().click();
+      await settle(page, 900);
+    },
+  },
+
   // The floating always-on-top recorder bar (chromeless). The bar window is
   // transparent (it floats over the desktop) — give it a dark backdrop so the
   // frosted pill reads as it does over a dark desktop.
