@@ -204,7 +204,9 @@ pub fn tool_specs() -> Vec<ToolSpec> {
         ToolSpec {
             name: "search_meetings".into(),
             description: "Full-text search across the user's past meeting titles, notes, transcripts, \
-                          and imported documents/brain notes.".into(),
+                          and imported documents/brain notes. If nothing relevant turns up and the \
+                          user has joined an org, also try org_brain_search — a colleague may have \
+                          already shared the answer.".into(),
             parameters: str_arg("query", "Search terms, in the user's own language."),
             write: false,
         },
@@ -212,7 +214,9 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             name: "search_semantic".into(),
             description: "Hybrid semantic + keyword search over meetings and imported documents/brain \
                           notes (finds related-by-meaning content). Falls back to keyword-only \
-                          matching when semantic search is disabled.".into(),
+                          matching when semantic search is disabled. If nothing relevant turns up and \
+                          the user has joined an org, also try org_brain_search — a colleague may have \
+                          already shared the answer.".into(),
             parameters: str_arg("query", "A natural-language description of what to find."),
             write: false,
         },
@@ -278,12 +282,14 @@ pub fn tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "org_brain_search".into(),
-            description: "Search the ORGANIZATION brain — notes your colleagues explicitly shared to \
-                          the shared org brain (synced + decrypted on this device, no data leaves). \
-                          Only available when you have joined an org and consented; results are \
-                          loud-attributed '[org · <author>]' and MUST be cited as coming from that \
-                          colleague. Use for 'what does the team / someone else know / decide about \
-                          X' questions that your own vault can't answer.".into(),
+            description: "Fallback for when search_meetings / search_semantic find nothing relevant in \
+                          the user's OWN vault and they have joined an org: search the ORGANIZATION \
+                          brain — notes your colleagues explicitly shared to the shared org brain \
+                          (synced + decrypted on this device, no data leaves). Only available when you \
+                          have joined an org and consented; results are loud-attributed \
+                          '[org · <author>]' and MUST be cited as coming from that colleague. Use for \
+                          'what does the team / someone else know / decide about X' questions that \
+                          your own vault can't answer.".into(),
             parameters: str_arg("query", "What to look for in the shared org brain, in the user's own language."),
             write: false,
         },
@@ -850,35 +856,45 @@ fn format_web_hits_raw(hits: &[crate::connectors::ConnectorHit]) -> String {
 /// here. The egress/publish path keeps its own consent gate (`share_to_org_inner` step 2), unchanged.
 pub(crate) fn org_brain_available(db: &Db, config: &AppConfig) -> bool {
     let _ = config; // consent is a WRITE gate; reading the org brain needs only membership.
+    // PER-INSTANCE ORG TOGGLE: at least one JOINED org must also be ENABLED on this install — a
+    // member of orgs that are ALL disabled here must see the tool as unavailable, not attempt a
+    // search that the `context_enabled = 1` SQL filter would silently empty anyway. When SOME orgs
+    // are enabled and some disabled, this stays `true`; per-item filtering happens in
+    // `search_org_chunks_knn`/`_fts`.
     db.list_org_states()
-        .map(|orgs| !orgs.is_empty())
+        .map(|orgs| orgs.iter().any(|o| o.context_enabled))
         .unwrap_or(false)
 }
 
-/// SHARED BRAIN — the single org retrieval + format seam used by BOTH `org_brain_search` (agent) and
-/// the MCP `org_search` tool. Runs the int8 vector KNN leg (with the member's OWN query embedding,
-/// skipped on the StubEmbedder / semantic-off path) + the keyword FTS leg (LIMIT-pushdown), RRF-fuses
-/// them, DROPS self-shared items (whose `content_sha256` matches a local `org_shares` row — a member
-/// never re-surfaces their own published note as an "org" result), formats each hit LOUDLY as
-/// `[org · <author>] <title> — <snippet>`, and FENCE-NEUTRALIZES the whole payload
-/// ([`neutralize_murmur_fences`]) so an UNTRUSTED org author cannot smuggle managed-block markers or
-/// a system-prompt override into the loop. The output is DATA for the loop — NEVER a system prompt.
-pub(crate) fn search_org_brain(db: &Db, config: &AppConfig, query: &str) -> Result<String> {
-    // AVAILABILITY GATE (belt-and-braces, applied at the SEAM not just at advertisement): the org
-    // partition is searchable ONLY when the caller has JOINED an org. The AGENT tool gates this at
-    // `specs()` advertisement time, but the MCP `org_search` path reaches this seam DIRECTLY via
-    // `dispatch_tool` → `execute_tool` with NO advertisement filter — so without this in-seam check a
-    // departed member (whose replica hadn't yet been purged) could still search colleagues' content.
-    // FIX G: this is a READ gate = membership only; egress CONSENT gates PUBLISHING, not reading. Org
-    // items are disclosed content, so a joined-but-not-consented member reads legitimately; a departed
-    // member has no `org_state` (and a purged replica) so is excluded here. Fail-closed to an empty
-    // (never-a-leak) result.
+/// SHARED BRAIN — the single org retrieval seam used by BOTH `search_org_brain` (text-rendering, for
+/// `org_brain_search` (agent) and the MCP `org_search` tool) AND `gather_note_enhance_citations`
+/// (structured, for the Notes selection-assistant `find_related` action). Runs the int8 vector KNN
+/// leg (with the caller's OWN query embedding, skipped on the StubEmbedder / semantic-off path) + the
+/// keyword FTS leg (LIMIT-pushdown), RRF-fuses them, and DROPS self-shared items (whose
+/// `content_sha256` matches a local `org_shares` row — a member never re-surfaces their own published
+/// note as an "org" result). Returns the raw structured hits — callers decide how to render/gate them
+/// further; text-rendering + fence-neutralization lives in [`search_org_brain`], NOT here.
+///
+/// AVAILABILITY GATE (belt-and-braces, applied at the SEAM not just at advertisement): the org
+/// partition is searchable ONLY when the caller has JOINED an org. The AGENT tool gates this at
+/// `specs()` advertisement time, but the MCP `org_search` path reaches this seam DIRECTLY via
+/// `dispatch_tool` → `execute_tool` with NO advertisement filter — so without this in-seam check a
+/// departed member (whose replica hadn't yet been purged) could still search colleagues' content.
+/// FIX G: this is a READ gate = membership only; egress CONSENT gates PUBLISHING, not reading. Org
+/// items are disclosed content, so a joined-but-not-consented member reads legitimately; a departed
+/// member has no `org_state` (and a purged replica) so is excluded here. Fail-closed to an empty
+/// (never-a-leak) result.
+pub(crate) fn search_org_brain_hits(
+    db: &Db,
+    config: &AppConfig,
+    query: &str,
+) -> Result<Vec<crate::storage::models::OrgChunkHit>> {
     if !org_brain_available(db, config) {
-        return Ok("No org-brain results (not a member of an org).".to_string());
+        return Ok(Vec::new());
     }
     let q = query.trim();
     if q.is_empty() {
-        return Ok("No org-brain results for an empty query.".to_string());
+        return Ok(Vec::new());
     }
     // Vector leg: only with a real embedder + semantic on (mirrors the vault semantic gate). The
     // query is embedded with the e5 `query:` prefix, then int8-quantized inside the Db reader.
@@ -906,7 +922,23 @@ pub(crate) fn search_org_brain(db: &Db, config: &AppConfig, query: &str) -> Resu
     if !mine.is_empty() {
         hits.retain(|h| h.content_sha256.is_empty() || !mine.contains(&h.content_sha256));
     }
+    Ok(hits)
+}
 
+/// SHARED BRAIN — thin text-rendering wrapper over [`search_org_brain_hits`], used by BOTH
+/// `org_brain_search` (agent) and the MCP `org_search` tool. Formats each hit LOUDLY as
+/// `[org · <author>] <title> — <snippet>`, and FENCE-NEUTRALIZES the whole payload
+/// ([`neutralize_murmur_fences`]) so an UNTRUSTED org author cannot smuggle managed-block markers or
+/// a system-prompt override into the loop. The output is DATA for the loop — NEVER a system prompt.
+pub(crate) fn search_org_brain(db: &Db, config: &AppConfig, query: &str) -> Result<String> {
+    let q = query.trim();
+    if !org_brain_available(db, config) {
+        return Ok("No org-brain results (not a member of an org).".to_string());
+    }
+    if q.is_empty() {
+        return Ok("No org-brain results for an empty query.".to_string());
+    }
+    let hits = search_org_brain_hits(db, config, query)?;
     if hits.is_empty() {
         return Ok(format!("No org-brain results for \"{q}\"."));
     }
@@ -2467,6 +2499,7 @@ mod tests {
             consented: true,
             last_seq: 0,
             generation: 1,
+            context_enabled: true,
         })
         .unwrap();
     }
@@ -2644,6 +2677,144 @@ mod tests {
         assert!(org_brain_available(&db, &cfg), "joined member reads without publish consent");
         cfg.org_egress_consented = true;
         assert!(org_brain_available(&db, &cfg));
+    }
+
+    /// PER-INSTANCE ORG TOGGLE (RED-before-GREEN): a member of orgs that are ALL disabled on this
+    /// install must see the org brain as UNAVAILABLE — not just empty results, but the tool itself
+    /// stops being advertised/attempted. With a SECOND, still-enabled org, availability returns —
+    /// proves the check is "any enabled", not "any joined".
+    #[test]
+    fn org_brain_available_requires_at_least_one_enabled_org() {
+        let db = tmp_db();
+        let cfg = AppConfig::default();
+        seed_org(&db); // org-1, enabled by default
+        assert!(org_brain_available(&db, &cfg));
+
+        db.set_org_context_enabled("org-1", false).unwrap();
+        assert!(
+            !org_brain_available(&db, &cfg),
+            "a member of only-disabled orgs must see the org brain as unavailable"
+        );
+
+        // A second, ENABLED org restores availability.
+        db.upsert_org_state(&crate::storage::OrgState {
+            org_id: "org-2".to_string(),
+            name: "Beta".to_string(),
+            role: "member".to_string(),
+            joined_at: "2026-07-11T00:00:00Z".to_string(),
+            consented: true,
+            last_seq: 0,
+            generation: 1,
+            context_enabled: true,
+        })
+        .unwrap();
+        assert!(
+            org_brain_available(&db, &cfg),
+            "a still-enabled second org keeps the brain available"
+        );
+    }
+
+    /// PER-INSTANCE ORG TOGGLE, end-to-end through the actual retrieval seam (RED-before-GREEN): with
+    /// TWO joined orgs, one disabled, `search_org_brain_hits`/`search_org_brain` must surface ONLY the
+    /// enabled org's content — the disabled org's item never reaches the rendered text or the
+    /// structured hits, even though it matches the query and would surface if both were enabled. This
+    /// is the user's hard mandate: a disabled org's context must NEVER leak through the brain seam.
+    #[test]
+    fn search_org_brain_excludes_a_disabled_org_while_surfacing_the_enabled_one() {
+        let db = tmp_db();
+        seed_org(&db); // org-1, enabled
+        db.upsert_org_state(&crate::storage::OrgState {
+            org_id: "org-2".to_string(),
+            name: "Beta".to_string(),
+            role: "member".to_string(),
+            joined_at: "2026-07-11T00:00:00Z".to_string(),
+            consented: true,
+            last_seq: 0,
+            generation: 1,
+            context_enabled: true,
+        })
+        .unwrap();
+        ingest_org(
+            &db,
+            "it-disabled",
+            "anna",
+            "Disabled org roadmap",
+            "the nebula pricing rollout plan",
+            &[21u8; 32],
+        );
+        db.upsert_org_item(
+            "it-enabled",
+            "org-2",
+            1,
+            "bob",
+            "Enabled org roadmap",
+            "the nebula pricing rollout timeline",
+            "2026-07-10T09:00:00Z",
+            1,
+            1,
+            &[22u8; 32],
+            None,
+            Some(&crate::embed::StubEmbedder),
+        )
+        .unwrap();
+
+        db.set_org_context_enabled("org-1", false).unwrap();
+        let cfg = AppConfig {
+            semantic_search_enabled: false,
+            ..AppConfig::default()
+        };
+
+        let hits = search_org_brain_hits(&db, &cfg, "nebula pricing rollout").unwrap();
+        assert!(
+            hits.iter().all(|h| h.item_id != "it-disabled"),
+            "the disabled org's item must never reach the structured hits: {:?}",
+            hits.iter().map(|h| &h.item_id).collect::<Vec<_>>()
+        );
+        assert!(
+            hits.iter().any(|h| h.item_id == "it-enabled"),
+            "the still-enabled org's item must keep surfacing"
+        );
+
+        let text = search_org_brain(&db, &cfg, "nebula pricing rollout").unwrap();
+        assert!(
+            !text.contains("Disabled org roadmap") && !text.contains("nebula pricing rollout plan"),
+            "the disabled org's content must never reach the rendered grounding text: {text}"
+        );
+        assert!(
+            text.contains("Enabled org roadmap"),
+            "the enabled org's content must still render: {text}"
+        );
+    }
+
+    /// A4 (RED-before-GREEN): the in-app agentic-loop catalog (`tool_specs`) must carry the SAME
+    /// fallback-steering wording as the MCP catalog (`mcp.rs` `tools_spec`) — `search_meetings` /
+    /// `search_semantic` mention `org_brain_search` as a fallback, and `org_brain_search`'s own
+    /// description LEADS with that fallback framing rather than presenting an unrelated alternative.
+    #[test]
+    fn tool_specs_nudges_org_brain_search_as_a_fallback() {
+        let specs = tool_specs();
+        let desc = |name: &str| -> String {
+            specs
+                .iter()
+                .find(|s| s.name == name)
+                .map(|s| s.description.clone())
+                .unwrap_or_default()
+        };
+        let search_meetings = desc("search_meetings");
+        let search_semantic = desc("search_semantic");
+        let org_brain_search = desc("org_brain_search");
+        assert!(
+            search_meetings.contains("org_brain_search"),
+            "search_meetings must mention org_brain_search as a fallback: {search_meetings}"
+        );
+        assert!(
+            search_semantic.contains("org_brain_search"),
+            "search_semantic must mention org_brain_search as a fallback: {search_semantic}"
+        );
+        assert!(
+            org_brain_search.to_lowercase().starts_with("fallback"),
+            "org_brain_search's own description must LEAD with the fallback framing: {org_brain_search}"
+        );
     }
 
     /// The `org_brain_search` tool is CONNECTOR-CLASS: reachable ONLY at Tier 3 / Full, never at the
