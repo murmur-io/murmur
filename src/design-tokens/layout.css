@@ -37,4 +37,35 @@
 
   /* --- Layout ------------------------------------------------------------- */
   --content-max: 840px;
+
+  /* The note editor's DEFAULT reading/editing column (2026-07-12) — wider than
+     --content-max (840px, tuned for card-grid/list views like Settings/Notes-
+     home) because a full-page WRITING surface reads as cramped at the same
+     width once the sidebar is always visible and the window is wide (the
+     complaint: huge empty gutters either side of a slim column). Notion's own
+     default document width lands in the same ~900-960px band. The "Full width"
+     toggle (NoteEditorComponent) overrides this to `min(1600px, 92%)` instead
+     of introducing a second token, since that's a computed relationship
+     (92% of the available pane), not a fixed design value. */
+  --editor-max: 920px;
+
+  /* Per-NESTING-LEVEL indent step for the sidebar's folder trees (2026-07-12
+     fix) — ONE shared token so Meetings' recursive `--depth` calc
+     (folder-row.component.scss) and Notes' flat single-level list
+     (notes-sidebar-tree.component.scss) can never drift apart again (the
+     whole point of the `<mur-sidebar-section>` consolidation just above
+     them in git history). Was `--space-4` (16px) in both places — measured
+     via Playwright as a flat 16px step between a folder and its nested
+     subfolder, which read as a big, loose jump in a 236px-wide sidebar.
+     10px sits between `--space-2`/`--space-3` — tight enough to read as a
+     deliberate nesting cue (closer to Obsidian/Notion's own per-level step)
+     without a new folder-icon+label block visually detaching from its parent. */
+  --tree-indent: 10px;
+
+  /* `mur-tab-strip`'s REAL rendered height, set on `<html>` at runtime by
+     `AppShellComponent`'s `_syncTabsStripHeight` effect (0px when no tabs
+     are open). This `:root` default is only the pre-JS/fallback value — every
+     consumer (the drill-down hosts' `top` offset) reads `var(--tabs-strip-
+     height, 0px)` regardless, so a missing property degrades safely too. */
+  --tabs-strip-height: 0px;
 }

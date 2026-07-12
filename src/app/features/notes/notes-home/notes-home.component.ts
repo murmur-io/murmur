@@ -2,19 +2,16 @@ import {
   ChangeDetectionStrategy,
   Component,
   DestroyRef,
-  ElementRef,
-  Injector,
   OnInit,
-  afterNextRender,
   computed,
+  effect,
   inject,
   signal,
-  viewChild,
 } from "@angular/core";
 import { Router, RouterLink } from "@angular/router";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { IpcService } from "../../../core/ipc.service";
-import { NavHistoryService } from "../../../core/nav-history.service";
+import { TabsService } from "../../../core/tabs.service";
 import type {
   NoteFolder,
   NoteSummary,
@@ -23,12 +20,11 @@ import type {
   OrgItemHeader,
   OrgStatus,
 } from "../../../core/models";
-import { MurSidebarComponent } from "../../../design-system/sidebar/sidebar.component";
+import { MurTableColumnComponent } from "../../../design-system/table/table-column.component";
+import { MurTableComponent } from "../../../design-system/table/table.component";
 import { FoldersService } from "../../../services/folders.service";
-import { FolderLockFlowService } from "../../../services/folder-lock-flow.service";
 import { NotesService } from "../../../services/notes.service";
 import { ToastService } from "../../../services/toast.service";
-import { LockSharesDialogComponent } from "../../folders/lock-shares-dialog/lock-shares-dialog.component";
 import { OrganizeSheetComponent } from "../organize-sheet/organize-sheet.component";
 
 /**
@@ -57,21 +53,22 @@ export type NotesListItem =
     };
 
 /**
- * The Notes landing view — a Meetings-style drill-down `[note-folder rail |
- * note list]`. The left rail lists + manages the note-kind folders (create /
- * rename / delete / lock / unlock — a lean list, NOT the meetings
- * `FolderTreeComponent`, whose service/commands are meeting-folder bound); the
- * content pane shows the note cards for the selected folder, a "New note"
- * action, a per-note "Move to…" menu, and an "Auto-organize" flow that reviews
- * a proposed plan before applying it. Clicking a card opens `/notes/:id`.
+ * The Notes landing view — NOW a normal in-flow route beside the ALWAYS-VISIBLE
+ * main sidebar (changed 2026-07-12, Notion/Obsidian-style navigation), not a
+ * drill-down: it flows in `.app-main` next to `<mur-sidebar>` exactly like
+ * `/record`. The note-folder tree (create / rename / delete / lock / unlock)
+ * now lives IN the main sidebar (`NotesSidebarTreeComponent`, nested under the
+ * "Notes" nav row) — this component owns only the content pane: the note cards
+ * for the shared {@link NotesService.activeFolderId} scope, a "New note"
+ * action, a per-note "Move to…" menu, an "Auto-organize" flow, and the
+ * Shared-Brain org picker (a content-pane chip row, since orgs are not
+ * note-folders and don't belong in the folder tree).
  *
- * A full drill-down (app-shell hides the primary rail on `/notes`): the fixed
- * host fills the window, mirroring `LibraryComponent`.
- *
- * Folder LOCK/UNLOCK reuses the existing folder lock lifecycle (`FoldersService`
- * owns the biometric IPC — the same commands the meetings side uses, kind-
- * agnostic); after a lock transition we refresh the NOTE lists (the note-folder
- * `locked` flag + the masked note rows come back through our own IPC).
+ * Folder LOCK/UNLOCK for the CONTENT PANE's lock gate reuses the existing
+ * folder lock lifecycle (`FoldersService` owns the biometric IPC); after an
+ * unlock we refresh the NOTE lists (the note-folder `locked` flag + the masked
+ * note rows come back through our own IPC). Locking itself now only happens
+ * from the sidebar tree.
  */
 @Component({
   selector: "app-notes-home",
@@ -79,9 +76,9 @@ export type NotesListItem =
   host: { "(document:keydown.escape)": "onEscape()" },
   imports: [
     RouterLink,
-    MurSidebarComponent,
     OrganizeSheetComponent,
-    LockSharesDialogComponent,
+    MurTableComponent,
+    MurTableColumnComponent,
   ],
   templateUrl: "./notes-home.component.html",
   styleUrl: "./notes-home.component.scss",
@@ -92,35 +89,30 @@ export class NotesHomeComponent implements OnInit {
   private readonly ipc = inject(IpcService);
   private readonly router = inject(Router);
   private readonly toast = inject(ToastService);
-  private readonly injector = inject(Injector);
+  private readonly tabsService = inject(TabsService);
   private readonly destroyRef = inject(DestroyRef);
-  /**
-   * Shared lock×shares flow (probe → warn/revoke dialog → lock). The SAME flow the
-   * meetings tree runs, so locking a note-folder with live shares also warns before
-   * sealing (PK-F1). Public so the template can bind the dialog + its actions.
-   */
-  readonly lockFlow = inject(FolderLockFlowService);
-
-  /** Drill-down back navigation ("← Murmur" + Esc). */
-  readonly nav = inject(NavHistoryService);
 
   /** The note list from the store (gated — masked rows carry no snippet/tags). */
   readonly noteList = this.notes.notes;
-  /** The note-kind folder list from the store. */
+  /** The note-kind folder list from the store (Move-to-folder menu + breadcrumb). */
   readonly noteFolders = this.notes.noteFolders;
   /** True while the note list is (re)loading. */
   readonly loading = this.notes.loading;
 
-  /** Selected note-folder id (null ⇒ all notes). Drives the content pane. */
-  readonly activeFolderId = signal<string | null>(null);
+  /**
+   * Selected note-folder id (null ⇒ all notes) — SHARED with the main sidebar's
+   * `NotesSidebarTreeComponent` via {@link NotesService.activeFolderId}. This
+   * component reads it; only the sidebar tree calls `notes.selectFolder`.
+   */
+  readonly activeFolderId = this.notes.activeFolderId;
   /** True while a create-note IPC call is in flight (guards the "New note" button). */
   readonly creating = signal(false);
 
   // --- Org (Shared Brain) shared-brain notes ------------------------------
   /**
-   * Every org (Shared Brain) this user belongs to — the rail's "Shared brains"
-   * section + the source of merged org items in "All notes". Loaded stale-guarded
-   * on init, on the `org-feed-updated` event, and on window focus.
+   * Every org (Shared Brain) this user belongs to — the content pane's "Shared
+   * brains" chip row + the source of merged org items in "All notes". Loaded
+   * stale-guarded on init, on the `org-feed-updated` event, and on window focus.
    */
   private readonly _orgs = signal<OrgStatus[]>([]);
   readonly orgs = this._orgs.asReadonly();
@@ -131,15 +123,16 @@ export class NotesHomeComponent implements OnInit {
    */
   private readonly _orgItems = signal<Record<string, OrgItemHeader[]>>({});
   /**
-   * Selected org id in the rail (null ⇒ not viewing a specific org). MUTUALLY
-   * exclusive with a note-folder selection: selecting an org clears
-   * {@link activeFolderId} back to the "All notes" root and vice-versa, so the
-   * content pane has exactly one active scope.
+   * Selected org id (null ⇒ not viewing a specific org), chosen via the content
+   * pane's "Shared brains" chip row. Exiting to a DIFFERENT note-folder (picked
+   * in the main sidebar's tree) clears this back to null — see
+   * {@link _clearOrgOnFolderChange} — so the content pane always has exactly
+   * one active scope.
    */
   readonly activeOrgId = signal<string | null>(null);
-  /** True while the org list + items are (re)loading (rail hint only). */
+  /** True while the org list + items are (re)loading (chip-row hint only). */
   readonly orgsLoading = signal(false);
-  /** The org whose items are shown when an org is rail-selected (null otherwise). */
+  /** The org whose items are shown when an org chip is selected (null otherwise). */
   readonly activeOrg = computed<OrgStatus | null>(() => {
     const oid = this.activeOrgId();
     return oid === null
@@ -197,6 +190,21 @@ export class NotesHomeComponent implements OnInit {
 
   /** True when the unified list has zero rows (drives the empty state). */
   readonly listEmpty = computed(() => this.listItems().length === 0);
+
+  /** `<mur-table>`'s required track key — the union's own namespaced `id`. */
+  readonly trackByItemId = (row: NotesListItem): string => row.id;
+
+  /**
+   * `<mur-table>`'s per-row class hook: `is-muted` dims a masked/locked note
+   * row (the table renders it, so notes-home's own scoped CSS can't reach the
+   * `<tr>` directly — see `MurTableComponent`'s class doc); `is-menu-open`
+   * raises the row whose "Move to…" popover is open above the click-away
+   * scrim (both class names are `<mur-table>`'s own small reusable vocabulary).
+   */
+  readonly rowClassFor = (row: NotesListItem): Record<string, boolean> => ({
+    "is-muted": row.kind === "note" && row.note.locked,
+    "is-menu-open": row.kind === "note" && this.movePopoverId() === row.note.id,
+  });
 
   /**
    * Router target for an org card. When the caller AUTHORED the item (`ownedSource`,
@@ -257,33 +265,13 @@ export class NotesHomeComponent implements OnInit {
   /** True when the active folder is sealed (drives the locked-folder banner). */
   readonly activeFolderLocked = computed(() => !!this.activeFolder()?.locked);
 
-  // --- New-folder inline create -------------------------------------------
-  /** True when the rail's "New folder" field is open. */
-  readonly creatingFolder = signal(false);
-  /** Draft folder name bound to the field. */
-  readonly folderDraft = signal("");
-  /** True while a folder create/rename/delete IPC call is in flight. */
-  readonly folderBusy = signal(false);
-  /** The new-folder name field — focused after it renders (afterNextRender). */
-  private readonly folderInput =
-    viewChild<ElementRef<HTMLInputElement>>("folderInput");
-
-  // --- Rename inline ------------------------------------------------------
-  /** Id of the folder being renamed inline (null = none). */
-  readonly renamingId = signal<string | null>(null);
-  /** Draft name bound to the rename field. */
-  readonly renameDraft = signal("");
-
-  // --- Delete confirm -----------------------------------------------------
-  /** Id of the folder whose delete confirm is open (null = none). */
-  readonly pendingDeleteId = signal<string | null>(null);
-
   // --- Per-note "Move to…" popover ----------------------------------------
   /** The note id whose move popover is open (null = none). */
   readonly movePopoverId = signal<string | null>(null);
 
-  // --- Folder lock/unlock -------------------------------------------------
-  /** Id of the folder whose lock/unlock op is in flight (guards double-clicks). */
+  // --- Folder unlock (lock-gate CTA only — locking itself lives in the
+  // sidebar tree now) --------------------------------------------------------
+  /** Id of the folder whose unlock op is in flight (guards double-clicks). */
   readonly lockBusyId = signal<string | null>(null);
 
   // --- Auto-organize ------------------------------------------------------
@@ -295,6 +283,18 @@ export class NotesHomeComponent implements OnInit {
   readonly organizeApplying = signal(false);
   /** True when the review sheet is showing (a plan has been fetched). */
   readonly organizeOpen = computed(() => this.organizePlan() !== null);
+
+  /**
+   * Picking a DIFFERENT note-folder in the main sidebar's tree exits any active
+   * org view, so the content pane always shows exactly one scope (mirrors the
+   * old rail's mutual-exclusion, now split across two components). Legitimate
+   * signal-writing effect (T1) — no async orchestration, just a cross-component
+   * UI-state sync driven by the shared {@link NotesService.activeFolderId}.
+   */
+  private readonly _clearOrgOnFolderChange = effect(() => {
+    this.activeFolderId();
+    this.activeOrgId.set(null);
+  });
 
   async ngOnInit(): Promise<void> {
     // Live-refresh: the background org-sync loop fires `org-feed-updated` on a
@@ -324,11 +324,15 @@ export class NotesHomeComponent implements OnInit {
         /* best-effort: no Tauri host (e.g. plain browser) → no live refresh */
       });
 
-    // Load the note-folder rail + the (all-notes) list + the org list in parallel;
-    // settle each independently so one load's failure never blanks the others.
+    // Load the note-folder list (Move-to-folder menu + breadcrumb — the sidebar
+    // tree also loads it independently, but this component may mount first),
+    // the note list for the CURRENT shared scope (persists across navigations —
+    // the sidebar may have already selected a folder), and the org list, all in
+    // parallel; settle each independently so one load's failure never blanks
+    // the others.
     await Promise.allSettled([
       this.notes.loadFolders(),
-      this.notes.loadNotes(null),
+      this.notes.loadNotes(this.notes.activeFolderId()),
       this.loadOrgs(),
     ]);
   }
@@ -387,58 +391,40 @@ export class NotesHomeComponent implements OnInit {
     }
   }
 
-  /**
-   * Rail-select an org (Shared Brain): the pane shows ONLY that org's shared
-   * items. Mutually exclusive with a note-folder selection — clears
-   * {@link activeFolderId} back to the root + closes any open move popover.
-   */
-  selectOrg(orgId: string): void {
-    this.movePopoverId.set(null);
-    this.activeFolderId.set(null);
-    this.activeOrgId.set(orgId);
-  }
-
-  /** A friendly role hint for the rail ("Owner" / "Member"). */
+  /** A friendly role hint for the chip row ("Owner" / "Member"). */
   orgRoleLabel(org: OrgStatus): string {
     return org.role === "owner" ? "Owner" : "Member";
   }
 
-  /** Esc backs out — but never mid-edit in a field, and it closes open transient UI first. */
+  /**
+   * Esc closes open transient UI first (the organize sheet, a move popover) —
+   * never mid-edit in a field. `/notes` is no longer a drill-down, so there is
+   * no "back to Murmur" fallback here anymore; the persistent sidebar IS the
+   * way back.
+   */
   onEscape(): void {
     const tag = (document.activeElement as HTMLElement | null)?.tagName;
     if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") {
       return;
     }
-    // Dismiss any open transient surface before backing out of the view.
     if (this.organizeOpen()) {
       this.closeOrganize();
       return;
     }
     if (this.movePopoverId() !== null) {
       this.movePopoverId.set(null);
-      return;
     }
-    if (this.creatingFolder() || this.renamingId() || this.pendingDeleteId()) {
-      this.cancelFolderEdits();
-      return;
-    }
-    this.nav.back();
   }
 
-  /**
-   * Select a note-folder (or null for "All notes") and reload its notes. Clears
-   * any active org selection (the two rail scopes are mutually exclusive). A
-   * no-op re-select of the SAME folder while no org is active is skipped — but a
-   * re-select of "All notes" WHILE an org is active still runs, to drop the org.
-   */
-  async selectFolder(folderId: string | null): Promise<void> {
+  /** Select an org (chip row) — its shared items become the sole content-pane scope. */
+  selectOrg(orgId: string): void {
     this.movePopoverId.set(null);
-    if (this.activeFolderId() === folderId && this.activeOrgId() === null) {
-      return;
-    }
+    this.activeOrgId.set(orgId);
+  }
+
+  /** Clear the org selection back to the current note-folder scope. */
+  clearOrg(): void {
     this.activeOrgId.set(null);
-    this.activeFolderId.set(folderId);
-    await this.notes.loadNotes(folderId);
   }
 
   // --- Notes --------------------------------------------------------------
@@ -464,12 +450,12 @@ export class NotesHomeComponent implements OnInit {
   }
 
   /** Open a note in the editor (a masked/locked row instead routes to unlock). */
-  openNote(id: string, locked: boolean): void {
+  openNote(id: string, locked: boolean, title?: string | null): void {
     if (locked) {
       void this.unlockActiveOrFolder(this.activeFolderId());
       return;
     }
-    void this.router.navigate(["/notes", id]);
+    void this.tabsService.openNote(id, title || "Note");
   }
 
   // --- Per-note "Move to…" popover ----------------------------------------
@@ -502,132 +488,16 @@ export class NotesHomeComponent implements OnInit {
     }
   }
 
-  // --- Folder create / rename / delete ------------------------------------
-
-  /** Open the inline "New folder" field and focus it (afterNextRender; no setTimeout). */
-  startCreateFolder(): void {
-    this.cancelFolderEdits();
-    this.folderDraft.set("");
-    this.creatingFolder.set(true);
-    afterNextRender(() => this.folderInput()?.nativeElement.focus(), {
-      injector: this.injector,
-    });
-  }
-
-  /** Confirm the inline folder create (creates under the active folder as parent). */
-  async confirmCreateFolder(event: Event): Promise<void> {
-    event.preventDefault();
-    const name = this.folderDraft().trim();
-    if (!name || this.folderBusy()) {
-      return;
-    }
-    this.folderBusy.set(true);
-    try {
-      const folder = await this.notes.createFolder(name, this.activeFolderId());
-      this.creatingFolder.set(false);
-      this.folderDraft.set("");
-      // Jump into the just-created folder so it's obviously there.
-      await this.selectFolder(folder.id);
-    } catch {
-      this.toast.danger("Couldn’t create the folder. Please try again.");
-    } finally {
-      this.folderBusy.set(false);
-    }
-  }
-
-  /** Begin an inline rename of `folder`. */
-  startRename(folder: NoteFolder, event: Event): void {
-    event.stopPropagation();
-    this.cancelFolderEdits();
-    this.renamingId.set(folder.id);
-    this.renameDraft.set(folder.name);
-  }
-
-  /** Confirm the inline rename. */
-  async confirmRename(id: string, event: Event): Promise<void> {
-    event.preventDefault();
-    const name = this.renameDraft().trim();
-    if (!name || this.folderBusy()) {
-      return;
-    }
-    this.folderBusy.set(true);
-    try {
-      await this.notes.renameFolder(id, name);
-      this.renamingId.set(null);
-    } catch {
-      this.toast.danger("Couldn’t rename the folder. Please try again.");
-    } finally {
-      this.folderBusy.set(false);
-    }
-  }
-
-  /** Open the delete-confirm for `folder`. */
-  askDeleteFolder(folder: NoteFolder, event: Event): void {
-    event.stopPropagation();
-    this.cancelFolderEdits();
-    this.pendingDeleteId.set(folder.id);
-  }
-
-  /** Confirm folder delete: its notes reparent to the default folder. */
-  async confirmDeleteFolder(id: string): Promise<void> {
-    if (this.folderBusy()) {
-      return;
-    }
-    this.folderBusy.set(true);
-    try {
-      await this.notes.deleteFolder(id);
-      this.pendingDeleteId.set(null);
-      // If the deleted folder was active, fall back to "All notes".
-      if (this.activeFolderId() === id) {
-        await this.selectFolder(null);
-      }
-    } catch {
-      this.toast.danger("Couldn’t delete the folder. Please try again.");
-    } finally {
-      this.folderBusy.set(false);
-    }
-  }
-
-  /** Cancel any open inline folder edit (create / rename / delete confirm). */
-  cancelFolderEdits(): void {
-    this.creatingFolder.set(false);
-    this.renamingId.set(null);
-    this.pendingDeleteId.set(null);
-  }
-
-  // --- Folder lock / unlock -----------------------------------------------
+  // --- Folder unlock (lock-gate CTA only) ---------------------------------
+  // Folder CREATE / RENAME / DELETE / LOCK now live in the main sidebar's
+  // `NotesSidebarTreeComponent`. This view keeps only the UNLOCK path, for the
+  // content pane's "This folder is locked" gate (below) and a masked note row.
 
   /**
-   * Lock a note-folder (seal its notes) THROUGH the shared lock×shares flow (PK-F1):
-   * the flow FIRST probes `folder_active_shares` and — if the folder still has live
-   * shares, or the probe itself fails (FAIL-CLOSED, F5) — opens the warn/revoke dialog
-   * instead of sealing straight away. Previously this called `FoldersService.lock`
-   * directly and BYPASSED that dialog, so a shared note-folder could be sealed without
-   * the owner deciding what happens to the outstanding shares. The `onLocked` callback
-   * refreshes the NOTE lists once a lock actually lands (from any path) so the rail
-   * badge + masked rows reflect the new sealed state.
-   */
-  async lockFolder(folder: NoteFolder, event: Event): Promise<void> {
-    event.stopPropagation();
-    if (this.lockBusyId() !== null || this.lockFlow.busy()) {
-      return;
-    }
-    this.lockBusyId.set(folder.id);
-    try {
-      await this.lockFlow.requestLock(folder.id, folder.name, async () => {
-        await this.refreshAfterLockChange();
-        this.toast.success(`Locked “${folder.name}”`);
-      });
-    } catch {
-      this.toast.danger("Couldn’t lock this folder. Please try again.");
-    } finally {
-      this.lockBusyId.set(null);
-    }
-  }
-
-  /**
-   * Session-unlock a sealed note-folder (Touch ID via the shared folder command).
-   * On success refresh the NOTE lists so the previously-masked notes appear.
+   * Session-unlock a sealed note-folder (Touch ID via the shared folder command),
+   * called from the content pane's lock gate or a masked note row. Refreshes the
+   * note lists (+ the sidebar tree's own folder list, via {@link NotesService})
+   * so the previously-masked notes + the tree's lock badge both update.
    */
   async unlockFolder(folder: NoteFolder, event: Event): Promise<void> {
     event.stopPropagation();
@@ -645,21 +515,16 @@ export class NotesHomeComponent implements OnInit {
     this.lockBusyId.set(folderId);
     try {
       await this.folders.unlock(folderId);
-      await this.refreshAfterLockChange();
+      await Promise.allSettled([
+        this.notes.loadFolders(),
+        this.notes.loadNotes(this.activeFolderId()),
+      ]);
     } catch {
       // A cancelled/denied Touch ID prompt — stay masked, no scary toast.
       this.toast.danger("Couldn’t unlock this folder.");
     } finally {
       this.lockBusyId.set(null);
     }
-  }
-
-  /** Refresh the folder rail + the active note list after a lock transition. */
-  private async refreshAfterLockChange(): Promise<void> {
-    await Promise.allSettled([
-      this.notes.loadFolders(),
-      this.notes.loadNotes(this.activeFolderId()),
-    ]);
   }
 
   // --- Auto-organize ------------------------------------------------------

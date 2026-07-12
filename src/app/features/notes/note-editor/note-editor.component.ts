@@ -3,12 +3,14 @@ import {
   Component,
   DestroyRef,
   ElementRef,
+  EnvironmentInjector,
   Injector,
   afterNextRender,
   computed,
   effect,
   inject,
   signal,
+  untracked,
   viewChild,
 } from "@angular/core";
 import { toSignal } from "@angular/core/rxjs-interop";
@@ -16,7 +18,14 @@ import { ActivatedRoute, Router } from "@angular/router";
 import { map } from "rxjs";
 import { IpcService } from "../../../core/ipc.service";
 import { NavHistoryService } from "../../../core/nav-history.service";
-import type { AppConfigDto, NoteDoc, NoteFolder } from "../../../core/models";
+import { tabKeyFor } from "../../../core/tab-keys";
+import { TabsService } from "../../../core/tabs.service";
+import type {
+  AppConfigDto,
+  FolderNode,
+  NoteDoc,
+  NoteFolder,
+} from "../../../core/models";
 import { DebounceService } from "../../../services/debounce.service";
 import { FoldersService } from "../../../services/folders.service";
 import { NotesService } from "../../../services/notes.service";
@@ -83,6 +92,16 @@ const CONTEXT_CHARS = 500;
 const AUTOSAVE_MS = 600;
 
 /**
+ * localStorage key for the "Full width" display preference: "1" = full width.
+ * A GLOBAL preference (not per-note) — Notion persists this per-page, but that
+ * needs a backend column + IPC round-trip for a purely cosmetic toggle; a
+ * global `localStorage` flag mirrors the existing chrome prefs (`AppShellComponent`'s
+ * `SIDEBAR_KEY`/`INSIGHTS_KEY`) and is zero-risk to wire correctly. Revisit if
+ * per-note persistence is explicitly requested.
+ */
+const FULL_WIDTH_KEY = "murmur-note-full-width";
+
+/**
  * The full note editor (FP2): a centered document with a borderless title, a
  * collapsible Obsidian-style properties bar (tags + key/value), a source-of-truth
  * `<textarea>` body with a formatting toolbar + markdown keyboard behaviors + a
@@ -118,7 +137,10 @@ export class NoteEditorComponent {
   private readonly toast = inject(ToastService);
   private readonly route = inject(ActivatedRoute);
   private readonly router = inject(Router);
+  private readonly tabsService = inject(TabsService);
   private readonly injector = inject(Injector);
+  /** Environment (root) injector — hosts the detach-proof root lock effect. */
+  private readonly envInjector = inject(EnvironmentInjector);
   private readonly destroyRef = inject(DestroyRef);
 
   /** Drill-down back navigation ("← Notes"). */
@@ -170,6 +192,13 @@ export class NoteEditorComponent {
   readonly confirmingDelete = signal(false);
   /** True while the Share modal is open over the document. */
   readonly shareOpen = signal(false);
+  /**
+   * Notion-style "Full width" display toggle (item lives in the ⋯ menu, not a
+   * new header icon — the ⋯ menu already hosts view/action items). A GLOBAL
+   * preference (see {@link FULL_WIDTH_KEY}); overrides `--editor-max` with
+   * `min(1600px, 92%)` on `.note-doc` (note-editor.component.scss).
+   */
+  readonly fullWidth = signal(this.readStoredFullWidth());
 
   /** The note-kind folders (for the Move menu + breadcrumb). */
   readonly noteFolders = signal<NoteFolder[]>([]);
@@ -320,6 +349,16 @@ export class NoteEditorComponent {
     void this.fetchNote(id, seq);
   });
 
+  /** Persist the "Full width" preference whenever it changes (mirrors AppShellComponent). */
+  private readonly _persistFullWidth = effect(() => {
+    const value = this.fullWidth();
+    try {
+      localStorage.setItem(FULL_WIDTH_KEY, value ? "1" : "0");
+    } catch {
+      // Private-mode / storage-disabled — the preference is not persisted.
+    }
+  });
+
   constructor() {
     // Warm the note-folder list (Move menu + breadcrumb) + the note list (tag
     // autocomplete) + the config (note-assistant toggles). Best-effort; a
@@ -336,6 +375,102 @@ export class NoteEditorComponent {
         this.flushFull();
       }
     });
+
+    // LOCK-REACTIVE re-mask — a ROOT effect via the EnvironmentInjector, NOT a
+    // view effect: a view effect is FROZEN while `TabRouteReuseStrategy` keeps
+    // this editor detached in a backgrounded tab (view effects only run inside
+    // `refreshView()`'s CD traversal of ATTACHED views; verified against this
+    // repo's @angular/core 22.0.5 — see the twin effect in
+    // `detail.component.ts` for the full source-trace note). A root effect is
+    // flushed by `ApplicationRef.synchronizeOnce()` BEFORE any view refresh,
+    // so a "Lock all"/screen-share auto-relock re-masks this note even while
+    // backgrounded, with no stale-plaintext frame on reattach. Env-injector
+    // effects are NOT auto-destroyed with the component — hence the explicit
+    // EffectRef destroy below (skipping it would leak a live effect per
+    // closed tab). `untracked` keeps `folders.tree()` the ONLY dependency.
+    const lockEffectRef = effect(
+      () => {
+        const tree = this.folders.tree();
+        untracked(() => this.onLockTreeChanged(tree));
+      },
+      { injector: this.envInjector },
+    );
+    this.destroyRef.onDestroy(() => lockEffectRef.destroy());
+  }
+
+  /**
+   * React to a folder-tree lock-state change for THIS note. Only a genuine
+   * seal/unseal TRANSITION acts (comparing the tree's exposure against the
+   * loaded doc's `locked` flag) — an unrelated folder op (create/rename/move)
+   * refreshes the tree too, and re-hydrating on those would clobber in-flight
+   * keystrokes. On a seal: cancel pending saves, SYNCHRONOUSLY blank every
+   * plaintext signal (hydrate a locally-masked doc — this also re-titles the
+   * tab strip to "🔒 Locked" via `hydrate`'s `setTitle`, F3), then re-fetch to
+   * converge on the backend's masked DTO. On an unseal: just re-fetch (the
+   * unmasked doc re-hydrates). Note folders live in the same `folders` table
+   * as meeting folders (`db.list_folders` has no kind filter), so the tree
+   * carries this note's folder + its session-unlock state.
+   */
+  private onLockTreeChanged(tree: FolderNode[]): void {
+    const doc = this.note();
+    if (!doc) {
+      return;
+    }
+    const node = this.findFolderNode(tree, doc.folderId);
+    if (!node) {
+      // Folder unresolvable from this tree (not yet loaded / unknown id) —
+      // INDETERMINATE → the SAFE path: re-fetch (the gated backend returns
+      // the masked doc if the folder is sealed). NEVER the skip path — a
+      // possible unlocked→locked transition must not be suppressed (lock
+      // review constraint). No local mask (that's only done on a POSITIVELY
+      // derived seal, so a transient miss can't blank an open editor); the
+      // re-hydrate may cost the caret, but this only occurs in the
+      // pathological folder-missing-from-a-loaded-tree case.
+      const missSeq = ++this.requestSeq;
+      void this.fetchNote(doc.id, missSeq);
+      return;
+    }
+    const sealed = node.locked && !node.unlocked;
+    if (sealed === doc.locked) {
+      // Consistent — no lock transition for THIS note. The skip keys ONLY on
+      // the derived lock state (perf-audit fix 1a: skipping here is what
+      // prevents both the per-tree-change IPC stampede AND a re-hydrate
+      // clobbering in-flight keystrokes on unrelated folder ops).
+      return;
+    }
+    if (sealed) {
+      // Mask FIRST, synchronously — no pending save may resurrect plaintext,
+      // and even a detached tab's signals hold nothing from this moment on.
+      this.debounce.cancel("note-editor-save");
+      this.pendingSave = null;
+      this.dirtyFull = false;
+      this.hydrate({
+        ...doc,
+        locked: true,
+        title: "🔒 Locked",
+        markdown: "",
+        tags: [],
+        properties: {},
+        exportedPath: null,
+      });
+      this.clearSelection();
+    }
+    const seq = ++this.requestSeq;
+    void this.fetchNote(doc.id, seq);
+  }
+
+  /** Depth-first lookup of a folder node by id across the forest. */
+  private findFolderNode(nodes: FolderNode[], id: string): FolderNode | null {
+    for (const n of nodes) {
+      if (n.id === id) {
+        return n;
+      }
+      const hit = this.findFolderNode(n.children ?? [], id);
+      if (hit) {
+        return hit;
+      }
+    }
+    return null;
   }
 
   /**
@@ -360,7 +495,13 @@ export class NoteEditorComponent {
     }
   }
 
-  /** Create an empty note (`/notes/new`) and replace the URL with its id. */
+  /**
+   * Create an empty note (`/notes/new`) and replace the URL with its id.
+   * Routes the transition through `TabsService.openNote` (not a plain
+   * `router.navigate`) so the note gets its own tracked tab the MOMENT its
+   * real id exists — `/notes/new` itself is deliberately never tab-tracked
+   * (see `TabRouteReuseStrategy`'s header comment, risk #2 of the tabs plan).
+   */
   private async createAndOpen(seq: number): Promise<void> {
     this.loading.set(true);
     this.error.set(null);
@@ -369,7 +510,7 @@ export class NoteEditorComponent {
       if (seq !== this.requestSeq) {
         return;
       }
-      await this.router.navigate(["/notes", id], { replaceUrl: true });
+      await this.tabsService.openNote(id, "Untitled", { replaceUrl: true });
     } catch (e) {
       if (seq === this.requestSeq) {
         this.error.set(String(e));
@@ -418,6 +559,9 @@ export class NoteEditorComponent {
     this.saveState.set("idle");
     this.dirtyFull = false;
     this.hydrating = false;
+    // Adopt the loaded title into the tab strip (a no-op if this note isn't
+    // tab-tracked, e.g. a direct routerLink open elsewhere in the app).
+    this.tabsService.setTitle(tabKeyFor("note", doc.id), doc.title || "Untitled");
   }
 
   // ── Title ────────────────────────────────────────────────────────────────
@@ -527,6 +671,12 @@ export class NoteEditorComponent {
       const updatedAt = await this.ipc.saveNoteText(doc.id, title, markdown);
       this.note.update((cur) => (cur ? { ...cur, updatedAt } : cur));
       this.saveState.set("saved");
+      // Live tab-title sync (bug fix, 2026-07-12): `hydrate()` only sets the tab
+      // title on INITIAL load/re-mask, so a rename previously kept showing the
+      // stale title until the tab was closed + reopened. Every committed save
+      // (debounced autosave, not every keystroke) re-syncs it — a no-op if this
+      // note isn't tab-tracked (see `TabsService.setTitle`).
+      this.tabsService.setTitle(tabKeyFor("note", doc.id), title || "Untitled");
     } catch (e) {
       this.saveState.set("error");
       if (String(e).includes("Locked")) {
@@ -573,6 +723,8 @@ export class NoteEditorComponent {
           : cur,
       );
       this.saveState.set("saved");
+      // Live tab-title sync (bug fix, 2026-07-12) — see the twin call in {@link saveText}.
+      this.tabsService.setTitle(tabKeyFor("note", doc.id), title || "Untitled");
     } catch (e) {
       this.saveState.set("error");
       if (String(e).includes("Locked")) {
@@ -1009,6 +1161,20 @@ export class NoteEditorComponent {
   closeMenus(): void {
     this.menu.set("none");
     this.confirmingDelete.set(false);
+  }
+
+  /** Toggle the "Full width" display preference (⋯ menu item). Does not close the menu. */
+  toggleFullWidth(): void {
+    this.fullWidth.update((v) => !v);
+  }
+
+  /** Read the persisted "Full width" preference; default OFF (the tuned `--editor-max`). */
+  private readStoredFullWidth(): boolean {
+    try {
+      return localStorage.getItem(FULL_WIDTH_KEY) === "1";
+    } catch {
+      return false;
+    }
   }
 
   /** Move this note into `folderId` via `moveNoteDoc`; reload the doc. */

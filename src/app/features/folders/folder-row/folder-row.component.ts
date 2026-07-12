@@ -19,9 +19,9 @@ import {
 import { FolderLockFlowService } from "../../../services/folder-lock-flow.service";
 import { ToastService } from "../../../services/toast.service";
 import type { FolderNode } from "../../../core/models";
+import { MurTreeRowComponent } from "../../../design-system/tree-row/tree-row.component";
 import { FolderTreeComponent } from "../folder-tree/folder-tree.component";
 import { FolderDropDirective } from "../folder-drop.directive";
-import { LockSharesDialogComponent } from "../lock-shares-dialog/lock-shares-dialog.component";
 
 /**
  * One folder row in the tree: disclosure caret · folder glyph · name · note-count
@@ -60,7 +60,7 @@ import { LockSharesDialogComponent } from "../lock-shares-dialog/lock-shares-dia
   // until the def exists, breaking the cycle. (See folder-tree for the mirror.)
   imports: [
     FolderDropDirective,
-    LockSharesDialogComponent,
+    MurTreeRowComponent,
     forwardRef(() => FolderTreeComponent),
   ],
   templateUrl: "./folder-row.component.html",
@@ -70,7 +70,16 @@ export class FolderRowComponent {
   private readonly folders = inject(FoldersService);
   private readonly toast = inject(ToastService);
   private readonly injector = inject(Injector);
-  /** Shared lock×shares flow (probe → warn/revoke dialog → lock), reused by the Notes rail too. */
+  /**
+   * Shared lock×shares flow (probe → warn/revoke dialog → lock) — a root
+   * singleton, also driven by `NotesSidebarTreeComponent`'s folder rows. The
+   * DIALOG itself is rendered exactly ONCE, by `AppShellComponent` (2026-07-12
+   * fix: both this component and the Notes tree used to each render their own
+   * `<app-lock-shares-dialog>` bound to the same singleton `pending()` — since
+   * the main sidebar now ALWAYS mounts both trees simultaneously, that meant
+   * TWO dialogs rendered for one lock request; caught by
+   * `e2e/org/org-surfaces.spec.ts`'s strict-mode-violation failure).
+   */
   readonly lockFlow = inject(FolderLockFlowService);
 
   /** This row's folder node. */
@@ -79,6 +88,8 @@ export class FolderRowComponent {
   readonly selectedId = input<string | null>(null);
   /** Indent depth (0 at the roots). */
   readonly depth = input<number>(0);
+  /** Whether `selectedId` should render as visually selected — see `FolderTreeComponent`'s doc. */
+  readonly selectionActive = input<boolean>(true);
 
   /** Emits the folder id when this row (or a descendant) is chosen. */
   readonly selected = output<string | null>();
@@ -92,17 +103,6 @@ export class FolderRowComponent {
   readonly busy = signal(false);
   /** Per-row lock/action error (cleared on the next attempt). */
   readonly lockError = signal<string | null>(null);
-
-  // --- Lock×shares dialog (Shared Brain v1) --------------------------------
-  /**
-   * The blocking lock×shares dialog is owned by the shared {@link FolderLockFlowService}
-   * (a root singleton, one pending request at a time). Render it for THIS row only when
-   * the pending request targets this folder id, so a dialog opened for one row doesn't
-   * appear under every row.
-   */
-  readonly showLockDialog = computed(
-    () => this.lockFlow.pending()?.folderId === this.node().id,
-  );
 
   // --- ⋯ folder-actions menu + inline rename + delete confirm ---------------
   /** Whether the ⋯ actions menu popover is open. */

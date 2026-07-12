@@ -3,6 +3,7 @@ import {
   Component,
   DestroyRef,
   ElementRef,
+  EnvironmentInjector,
   Injector,
   OnInit,
   afterNextRender,
@@ -10,12 +11,15 @@ import {
   effect,
   inject,
   signal,
+  untracked,
   viewChild,
 } from "@angular/core";
 import { ActivatedRoute, Router, RouterLink } from "@angular/router";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { save } from "@tauri-apps/plugin-dialog";
 import { IpcService } from "../../../core/ipc.service";
+import { tabKeyFor } from "../../../core/tab-keys";
+import { TabsService } from "../../../core/tabs.service";
 import type {
   AppConfigDto,
   AssistantInteraction,
@@ -73,9 +77,12 @@ export class DetailComponent implements OnInit {
   private readonly route = inject(ActivatedRoute);
   private readonly router = inject(Router);
   private readonly injector = inject(Injector);
+  /** Environment (root) injector — hosts the detach-proof root lock effect. */
+  private readonly envInjector = inject(EnvironmentInjector);
   private readonly destroyRef = inject(DestroyRef);
   private readonly folders = inject(FoldersService);
   private readonly toast = inject(ToastService);
+  private readonly tabsService = inject(TabsService);
 
   readonly detail = signal<MeetingDetail | null>(null);
   readonly loading = signal(true);
@@ -107,6 +114,29 @@ export class DetailComponent implements OnInit {
   /** Focusable unlock button — focused after the gate renders (afterNextRender). */
   private readonly unlockButton =
     viewChild<ElementRef<HTMLButtonElement>>("unlockButton");
+
+  /**
+   * The Audio tab's player, when that tab is the active `@switch` case (null
+   * otherwise). Used by `onTabBackgrounded` (tabs plan risk #3 + perf-audit
+   * fix 2) and the lock-mask path (`maskLocally` → `stopAndUnload`).
+   */
+  private readonly audioPanel = viewChild<AudioPanelComponent>("audioPanel");
+
+  /**
+   * This meeting's TAB was backgrounded (detached-for-reuse). Called from
+   * `AppShellComponent`'s `<router-outlet (detach)>` — which fires on every
+   * tab switch, not just a real destroy — via a duck-typed check (the shell
+   * can't import a lazy feature component). Two duties:
+   *  - pause playback (a backgrounded tab must not keep narrating);
+   *  - collapse an expanded transcript back to the windowed cap (perf-audit
+   *    fix 2 — an expanded transcript kept ~21k detached DOM nodes alive).
+   * A no-op when the Audio tab isn't the active case (no panel instance).
+   */
+  onTabBackgrounded(): void {
+    const panel = this.audioPanel();
+    panel?.pausePlayback();
+    panel?.collapseTranscript();
+  }
 
   // --- Move-to-folder popover ---------------------------------------------
   /** True while the folder-picker popover is open. */
@@ -333,6 +363,145 @@ export class DetailComponent implements OnInit {
       void this.loadTimeline();
     }
   });
+
+  /**
+   * LOCK-REACTIVE re-mask (required by the tabs plan §6 — a real leak surface
+   * once meetings can stay open in a BACKGROUNDED tab). Created in the
+   * CONSTRUCTOR as a **ROOT effect** via the `EnvironmentInjector` — NOT a
+   * component/view effect. A view effect (`VIEW_EFFECT_NODE`) only ever runs
+   * inside `refreshView()`'s CD traversal, and a tab detached by
+   * `TabRouteReuseStrategy` is REMOVED from its LContainer, so a view effect
+   * is FROZEN the whole time the tab is backgrounded (and on reattach the
+   * template executes BEFORE view effects — a stale-plaintext frame). A root
+   * effect is scheduled on the root `EffectScheduler` and flushed by
+   * `ApplicationRef.synchronizeOnce()` BEFORE the view-refresh loop — verified
+   * against this repo's @angular/core 22.0.5 (`_pending_tasks-chunk.mjs`
+   * `createRootEffect`/`ROOT_EFFECT_NODE.consumerMarkedDirty`,
+   * `_debug_node-chunk.mjs` `synchronizeOnce`: `rootEffectScheduler.flush()`
+   * precedes `detectChangesInternal`). So it fires on every
+   * lock/unlock/relock/"Lock all"/screen-share auto-relock regardless of view
+   * attachment, and its SYNCHRONOUS mask lands before any template paints.
+   *
+   * Because the effect hangs off the ENVIRONMENT injector, it is NOT
+   * auto-destroyed with this component — see the constructor's explicit
+   * `DestroyRef.onDestroy(() => ref.destroy())` (skipping that would leak a
+   * live effect per closed tab).
+   *
+   * `untracked` wraps the handler so `folders.tree()` is the ONLY dependency —
+   * never `detail()` (which changes on every note/tag/timeline edit).
+   */
+  private readonly _lockMaskHandler = (tree: FolderNode[]): void => {
+    const d = this.detail();
+    const id = d?.meeting.id;
+    if (!d || !id) {
+      return;
+    }
+    // PERF (perf-audit fix 1a — the O(N²) refetch stampede): every real
+    // `folders.load()` produces a NEW tree array reference, so this effect
+    // fires in EVERY open tab on EVERY tree change (folder create/rename/
+    // move, another tab's open priming the tree, …). Refetching the full
+    // ~568 KB-per-hour-meeting DTO unconditionally measured 27 fetches where
+    // 6 suffice on a 6-tab session. So: derive THIS meeting's sealed state
+    // from the new tree and SKIP only when it is consistent with the
+    // in-memory `locked` flag — the skip is keyed EXCLUSIVELY on the derived
+    // lock state, so an unlocked→locked transition can never be suppressed:
+    //   sealed=true,  locked=false → ACT (sync mask + refetch)   ← the leak path
+    //   sealed=false, locked=true  → ACT (refetch → unmasked)
+    //   consistent                 → SKIP (nothing lock-relevant changed)
+    //   indeterminate              → SAFE PATH (refetch; never skip)
+    const fid = d.meeting.folderId;
+    if (fid == null) {
+      // Vault-root meeting (null/absent folderId): locks are per-folder, the
+      // root can never be sealed → derived sealed = false. Skip when consistent.
+      if (d.locked !== true) {
+        return;
+      }
+      void this.refetchForLockChange(id);
+      return;
+    }
+    const node = this.findFolder(tree, fid);
+    if (!node) {
+      // Folder unresolvable from this tree (not loaded yet / unknown id) —
+      // INDETERMINATE → the safe path: refetch (the gated backend masks if
+      // needed). Never the skip path (security constraint: when in doubt,
+      // never suppress a possible unlocked→locked transition). No local mask
+      // here — masking is only done on a POSITIVELY derived seal.
+      void this.refetchForLockChange(id);
+      return;
+    }
+    const sealed = node.locked && !node.unlocked;
+    if (sealed === (d.locked === true)) {
+      return; // consistent — no lock transition for THIS meeting
+    }
+    if (sealed) {
+      // Locked transition: mask SYNCHRONOUSLY before any refetch/render, so
+      // even a detached tab's signals hold no plaintext from this moment on.
+      this.maskLocally(d);
+    }
+    // Converge on the backend's real (masked or unmasked) DTO.
+    void this.refetchForLockChange(id);
+  };
+
+  /**
+   * Synchronously blank every plaintext-bearing signal for a just-sealed
+   * meeting (the masked shape mirrors the backend's masked DTO), stop+unload
+   * any audio element (F4 hardening — a paused-but-resumable `<audio>` must
+   * not outlive the lock), and re-title the tab strip so no real title
+   * lingers in the strip or the persisted `murmur.tabs.v1` (F3).
+   */
+  private maskLocally(d: MeetingDetail): void {
+    this.audioPanel()?.stopAndUnload();
+    this.detail.set({
+      ...d,
+      meeting: { ...d.meeting, title: "🔒 Locked", audioPath: null },
+      note: null,
+      segments: [],
+      assistantInteractions: [],
+      locked: true,
+    });
+    // Plaintext-bearing side signals the lock gate doesn't unmount fast enough
+    // to excuse: timeline topics/speakers, tags, graph entities, editor draft.
+    this.timeline.set(null);
+    this.speakerSuggestions.set([]);
+    this.tags.set([]);
+    this.graph.set(null);
+    this.editing.set(false);
+    this.draft.set("");
+    this.tabsService.setTitle(tabKeyFor("meeting", d.meeting.id), "🔒 Locked");
+  }
+
+  /** The lock-effect refetch body — re-fetch + swap `detail`, stale-guarded. */
+  private async refetchForLockChange(id: string): Promise<void> {
+    try {
+      const fresh = await this.ipc.getMeetingDetail(id);
+      // Stale-result guard: drop this if the user has since navigated elsewhere
+      // within this same (possibly backgrounded) component instance.
+      if (this.detail()?.meeting.id === id) {
+        this.detail.set(fresh);
+        // Keep the tab strip + persisted tab title truthful (F3): after a
+        // lock this is the backend's "🔒 Locked", after an unlock the real one.
+        if (fresh?.meeting.title) {
+          this.tabsService.setTitle(tabKeyFor("meeting", id), fresh.meeting.title);
+        }
+      }
+    } catch {
+      // Best-effort — a failed re-check leaves the previous (possibly now
+      // stale) detail in place rather than risk clobbering it with nothing.
+    }
+  }
+
+  constructor() {
+    // ROOT lock effect (see `_lockMaskHandler`'s doc) + its explicit teardown.
+    const lockEffectRef = effect(
+      () => {
+        const tree = this.folders.tree();
+        untracked(() => this._lockMaskHandler(tree));
+      },
+      { injector: this.envInjector },
+    );
+    this.destroyRef.onDestroy(() => lockEffectRef.destroy());
+  }
+
   readonly timelineError = signal(false);
   /**
    * PERF/OOM: true when deriving THIS install's timeline would load a residency-bound on-device
@@ -406,18 +575,19 @@ export class DetailComponent implements OnInit {
   }
 
   /**
-   * Navigate to a semantically-related meeting and reload the view in place.
-   * The `/meeting/:id` route reuses THIS component (the default
-   * RouteReuseStrategy keeps it when only the param changes), so a same-route
-   * navigation does NOT re-run `ngOnInit` — we reload explicitly. The related
-   * section then re-fetches via its `meetingId` input.
+   * Open a semantically-related meeting as its own tab. `TabRouteReuseStrategy`
+   * gives every distinct `/meeting/:id` its OWN component instance (keyed by
+   * id, not just the route config) — so unlike the old default
+   * `RouteReuseStrategy` (which silently reused THIS component across ids and
+   * forced a manual `loadMeeting` reload here), navigating away now spins up a
+   * fresh `DetailComponent` whose own `ngOnInit` loads the related meeting.
+   * Nothing to reload in place anymore.
    */
   async openRelated(id: string): Promise<void> {
     if (!id || this.detail()?.meeting.id === id) {
       return;
     }
-    await this.router.navigate(["/meeting", id]);
-    await this.loadMeeting(id);
+    await this.tabsService.openMeeting(id);
   }
 
   /**
@@ -499,6 +669,12 @@ export class DetailComponent implements OnInit {
     } finally {
       this.loading.set(false);
     }
+    // Adopt the loaded title into the tab strip (a no-op if this meeting isn't
+    // tab-tracked, e.g. a direct routerLink open elsewhere in the app).
+    const loadedTitle = this.detail()?.meeting.title;
+    if (loadedTitle) {
+      this.tabsService.setTitle(tabKeyFor("meeting", id), loadedTitle);
+    }
     // Whether this install keeps hi-res masters — gates the master-export
     // actions. Install-global, so load it regardless of lock state (best-effort;
     // a failure simply hides the actions). The backend remains the real gate.
@@ -535,9 +711,12 @@ export class DetailComponent implements OnInit {
     // (`_timelineOnAudioTab` effect below). See docs/research/2026-07-07-perf-memory-audit.md.
     if (this.detail()) {
       // Prime the folder tree so the read-only folder/lock badge + the move
-      // picker have state on a direct navigation (idempotent; the root component
-      // also loads it). Non-blocking — a failure just hides the badge.
-      void this.folders.load();
+      // picker have state on a direct navigation. `ensureLoaded` (NOT
+      // `load()`) — the root component already loads the tree at boot, and an
+      // unconditional reload here published a new tree per tab-open, firing
+      // every open tab's lock effect (the perf-audit O(N²) refetch stampede,
+      // fix 1b). Non-blocking — a failure just hides the badge.
+      void this.folders.ensureLoaded();
       // Load the meeting's tags (best-effort; failure leaves the chips empty).
       try {
         this.tags.set(await this.ipc.getMeetingTags(id));
@@ -952,6 +1131,7 @@ export class DetailComponent implements OnInit {
         ...current,
         meeting: { ...current.meeting, title },
       });
+      this.tabsService.setTitle(tabKeyFor("meeting", id), title);
       this.renaming.set(false);
     } catch (e) {
       this.msg.set("Couldn’t rename: " + String(e));
