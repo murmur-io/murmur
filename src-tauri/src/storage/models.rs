@@ -1023,6 +1023,13 @@ pub struct TopicThread {
 }
 
 /// M6 Shared Brain — a locally-joined org (row of `org_state`). Membership metadata only; no content.
+///
+/// `context_enabled` (per-instance org toggle): whether this JOINED org contributes content on THIS
+/// Murmur install — browsing (`list_org_items`) AND brain/assistant context
+/// (`search_org_chunks_knn`/`_fts`). Default `true` (every existing/new membership stays active).
+/// Distinct from `consented` (org EGRESS consent — sharing OUT); this gates READING IN. A disabled
+/// org's rows are NEVER deleted/purged — only excluded from every read path — so re-enabling is
+/// instant with no re-sync.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrgState {
     pub org_id: String,
@@ -1032,6 +1039,7 @@ pub struct OrgState {
     pub consented: bool,
     pub last_seq: i64,
     pub generation: u32,
+    pub context_enabled: bool,
 }
 
 /// M6 Shared Brain — one row of the outbound org-share state machine (`org_shares`). Anchors on a

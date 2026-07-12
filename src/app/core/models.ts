@@ -1877,6 +1877,13 @@ export interface OrgStatus {
   receivedCount: number;
   /** Local outbound org shares still queued/failed (awaiting the launch sweep). */
   pendingShares: number;
+  /**
+   * PER-INSTANCE org toggle: whether this org contributes content (browsing +
+   * brain/assistant context) on THIS Murmur install. `true` by default; flip via
+   * {@link IpcService.orgSetContextEnabled}. Disabling never deletes the local
+   * replica — it is purely a local, reversible read gate.
+   */
+  contextEnabled: boolean;
 }
 
 /**

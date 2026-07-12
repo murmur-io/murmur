@@ -2975,6 +2975,7 @@ mod tests {
             consented: true,
             last_seq: 0,
             generation: 1,
+            context_enabled: true,
         })
         .unwrap();
     }
@@ -3131,6 +3132,92 @@ mod tests {
         assert!(
             res.citations.iter().all(|c| !c.contains("(org")),
             "a non-member must never surface an org citation: {:?}",
+            res.citations
+        );
+    }
+
+    /// PER-INSTANCE ORG TOGGLE, end-to-end through the deterministic floor (RED-before-GREEN, the
+    /// user's hard mandate — this is A1's original bug scenario, now with the toggle): a member of
+    /// TWO orgs who has disabled ONE of them on this install must NEVER see that org's content reach
+    /// the brain grounding — even though it matches the query and would surface if enabled. The
+    /// STILL-enabled org's content must keep working normally. Proves "disabled means truly gone",
+    /// not just deprioritized, at the actual consumer surface a real user hits.
+    #[test]
+    fn floor_never_folds_a_disabled_orgs_content_into_grounding_while_the_enabled_org_still_works() {
+        let db = tmp_db();
+        seed_org(&db); // org-1, enabled by default
+        db.upsert_org_state(&crate::storage::OrgState {
+            org_id: "org-2".to_string(),
+            name: "Beta".to_string(),
+            role: "member".to_string(),
+            joined_at: "2026-07-11T00:00:00Z".to_string(),
+            consented: true,
+            last_seq: 0,
+            generation: 1,
+            context_enabled: true,
+        })
+        .unwrap();
+        ingest_org(
+            &db,
+            "it-disabled",
+            "anna",
+            "Disabled org roadmap",
+            "the horizon launch plan for the beta release",
+            &[31u8; 32],
+        );
+        db.upsert_org_item(
+            "it-enabled",
+            "org-2",
+            1,
+            "carol",
+            "Enabled org roadmap",
+            "the horizon launch timeline for the beta release",
+            "2026-07-10T09:00:00Z",
+            1,
+            1,
+            &[32u8; 32],
+            None,
+            Some(&crate::embed::StubEmbedder),
+        )
+        .unwrap();
+        db.set_org_context_enabled("org-1", false).unwrap();
+
+        let reasoner = CaptureReasoner::new();
+        let res = handle_voice_action(
+            &VoiceIntent::Research {
+                topic: "horizon launch".into(),
+            },
+            &reasoner,
+            &db,
+            &empty_unlocked(),
+            &AppConfig {
+                semantic_search_enabled: false,
+                ..AppConfig::default()
+            },
+            "live-mtg",
+            "",
+            "",
+            false,
+            None,
+        );
+        assert_eq!(res.status, "ok");
+        let user = reasoner.last_user.lock().unwrap().clone().unwrap();
+        assert!(
+            !user.contains("Disabled org roadmap") && !user.contains("[org · anna]"),
+            "the disabled org's content must NEVER reach the brain input: {user}"
+        );
+        assert!(
+            user.contains("[org · carol]") && user.contains("Enabled org roadmap"),
+            "the still-enabled org's content must keep reaching the brain input: {user}"
+        );
+        assert!(
+            res.citations.iter().all(|c| !c.contains("anna")),
+            "the disabled org's author must never surface as a citation: {:?}",
+            res.citations
+        );
+        assert!(
+            res.citations.iter().any(|c| c.contains("(org · carol)")),
+            "the enabled org's citation must still surface: {:?}",
             res.citations
         );
     }

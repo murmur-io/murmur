@@ -856,8 +856,13 @@ fn format_web_hits_raw(hits: &[crate::connectors::ConnectorHit]) -> String {
 /// here. The egress/publish path keeps its own consent gate (`share_to_org_inner` step 2), unchanged.
 pub(crate) fn org_brain_available(db: &Db, config: &AppConfig) -> bool {
     let _ = config; // consent is a WRITE gate; reading the org brain needs only membership.
+    // PER-INSTANCE ORG TOGGLE: at least one JOINED org must also be ENABLED on this install — a
+    // member of orgs that are ALL disabled here must see the tool as unavailable, not attempt a
+    // search that the `context_enabled = 1` SQL filter would silently empty anyway. When SOME orgs
+    // are enabled and some disabled, this stays `true`; per-item filtering happens in
+    // `search_org_chunks_knn`/`_fts`.
     db.list_org_states()
-        .map(|orgs| !orgs.is_empty())
+        .map(|orgs| orgs.iter().any(|o| o.context_enabled))
         .unwrap_or(false)
 }
 
@@ -2494,6 +2499,7 @@ mod tests {
             consented: true,
             last_seq: 0,
             generation: 1,
+            context_enabled: true,
         })
         .unwrap();
     }
@@ -2671,6 +2677,113 @@ mod tests {
         assert!(org_brain_available(&db, &cfg), "joined member reads without publish consent");
         cfg.org_egress_consented = true;
         assert!(org_brain_available(&db, &cfg));
+    }
+
+    /// PER-INSTANCE ORG TOGGLE (RED-before-GREEN): a member of orgs that are ALL disabled on this
+    /// install must see the org brain as UNAVAILABLE — not just empty results, but the tool itself
+    /// stops being advertised/attempted. With a SECOND, still-enabled org, availability returns —
+    /// proves the check is "any enabled", not "any joined".
+    #[test]
+    fn org_brain_available_requires_at_least_one_enabled_org() {
+        let db = tmp_db();
+        let cfg = AppConfig::default();
+        seed_org(&db); // org-1, enabled by default
+        assert!(org_brain_available(&db, &cfg));
+
+        db.set_org_context_enabled("org-1", false).unwrap();
+        assert!(
+            !org_brain_available(&db, &cfg),
+            "a member of only-disabled orgs must see the org brain as unavailable"
+        );
+
+        // A second, ENABLED org restores availability.
+        db.upsert_org_state(&crate::storage::OrgState {
+            org_id: "org-2".to_string(),
+            name: "Beta".to_string(),
+            role: "member".to_string(),
+            joined_at: "2026-07-11T00:00:00Z".to_string(),
+            consented: true,
+            last_seq: 0,
+            generation: 1,
+            context_enabled: true,
+        })
+        .unwrap();
+        assert!(
+            org_brain_available(&db, &cfg),
+            "a still-enabled second org keeps the brain available"
+        );
+    }
+
+    /// PER-INSTANCE ORG TOGGLE, end-to-end through the actual retrieval seam (RED-before-GREEN): with
+    /// TWO joined orgs, one disabled, `search_org_brain_hits`/`search_org_brain` must surface ONLY the
+    /// enabled org's content — the disabled org's item never reaches the rendered text or the
+    /// structured hits, even though it matches the query and would surface if both were enabled. This
+    /// is the user's hard mandate: a disabled org's context must NEVER leak through the brain seam.
+    #[test]
+    fn search_org_brain_excludes_a_disabled_org_while_surfacing_the_enabled_one() {
+        let db = tmp_db();
+        seed_org(&db); // org-1, enabled
+        db.upsert_org_state(&crate::storage::OrgState {
+            org_id: "org-2".to_string(),
+            name: "Beta".to_string(),
+            role: "member".to_string(),
+            joined_at: "2026-07-11T00:00:00Z".to_string(),
+            consented: true,
+            last_seq: 0,
+            generation: 1,
+            context_enabled: true,
+        })
+        .unwrap();
+        ingest_org(
+            &db,
+            "it-disabled",
+            "anna",
+            "Disabled org roadmap",
+            "the nebula pricing rollout plan",
+            &[21u8; 32],
+        );
+        db.upsert_org_item(
+            "it-enabled",
+            "org-2",
+            1,
+            "bob",
+            "Enabled org roadmap",
+            "the nebula pricing rollout timeline",
+            "2026-07-10T09:00:00Z",
+            1,
+            1,
+            &[22u8; 32],
+            None,
+            Some(&crate::embed::StubEmbedder),
+        )
+        .unwrap();
+
+        db.set_org_context_enabled("org-1", false).unwrap();
+        let cfg = AppConfig {
+            semantic_search_enabled: false,
+            ..AppConfig::default()
+        };
+
+        let hits = search_org_brain_hits(&db, &cfg, "nebula pricing rollout").unwrap();
+        assert!(
+            hits.iter().all(|h| h.item_id != "it-disabled"),
+            "the disabled org's item must never reach the structured hits: {:?}",
+            hits.iter().map(|h| &h.item_id).collect::<Vec<_>>()
+        );
+        assert!(
+            hits.iter().any(|h| h.item_id == "it-enabled"),
+            "the still-enabled org's item must keep surfacing"
+        );
+
+        let text = search_org_brain(&db, &cfg, "nebula pricing rollout").unwrap();
+        assert!(
+            !text.contains("Disabled org roadmap") && !text.contains("nebula pricing rollout plan"),
+            "the disabled org's content must never reach the rendered grounding text: {text}"
+        );
+        assert!(
+            text.contains("Enabled org roadmap"),
+            "the enabled org's content must still render: {text}"
+        );
     }
 
     /// A4 (RED-before-GREEN): the in-app agentic-loop catalog (`tool_specs`) must carry the SAME
