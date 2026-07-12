@@ -42,6 +42,30 @@
     color var(--transition-fast),
     border-color var(--transition-fast);
 }
+/* Shortcut to Settings → Organization (which orgs are active on this device) —
+   lives at the end of the org-chip row now that the rail it used to sit in
+   ("Shared brains" heading trailing group) is gone (origin/murmur#273 merge,
+   2026-07-12: the rail was already deleted on this branch before that PR
+   landed, so its rail-scoped org-head/org-body/folder-row CSS is dead here). */
+.org-chip-settings-link {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border-radius: var(--radius-sm);
+  color: var(--text-muted);
+  text-decoration: none;
+  transition: color var(--transition-fast), background var(--transition-fast);
+}
+.org-chip-settings-link:hover {
+  color: var(--text-secondary);
+  background: var(--surface-hover);
+}
+.org-chip-settings-link:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
 .org-chip:hover {
   color: var(--text-primary);
   border-color: var(--border-strong);
