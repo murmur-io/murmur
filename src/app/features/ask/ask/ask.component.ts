@@ -27,6 +27,13 @@ import { SourcesComponent } from "../../../shared/sources/sources.component";
  * (rendered as chips that deep-link into each meeting).
  */
 interface AskTurn {
+  /**
+   * Stable id for `@for` tracking (never key a turn on $index) — the log is
+   * NOT append-only: `retry()` pops the dangling user turn and re-appends it,
+   * which would land back at the same index and fool an index-tracked `@for`
+   * into reusing the old DOM node (silently skipping its entrance animation).
+   */
+  id: number;
   role: "user" | "assistant";
   content: string;
   /** Present on assistant turns only — the meetings that grounded the answer. */
@@ -105,6 +112,8 @@ export class AskComponent implements OnInit {
   private activeAskId: string | null = null;
   /** Monotonic id source for trace chips (stable `@for` keys). */
   private nextTraceId = 1;
+  /** Monotonic id source for conversation turns (stable `@for` keys). */
+  private nextTurnId = 1;
   private unlistenAskTool: UnlistenFn | null = null;
 
   /** Starter prompts for the empty state. */
@@ -316,7 +325,7 @@ export class AskComponent implements OnInit {
     this.draft.set("");
     this.conversation.update((turns) => [
       ...turns,
-      { role: "user", content: question },
+      { id: this.nextTurnId++, role: "user", content: question },
     ]);
     this.pending.set(true);
     this.scrollToLatest();
@@ -330,6 +339,7 @@ export class AskComponent implements OnInit {
       this.conversation.update((turns) => [
         ...turns,
         {
+          id: this.nextTurnId++,
           role: "assistant",
           content: result.answer,
           sources: result.sources,
