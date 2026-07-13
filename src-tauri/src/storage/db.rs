@@ -6901,15 +6901,28 @@ impl Db {
         Ok(n)
     }
 
-    /// Count of notes assigned to each folder id (only folders with ≥1 note appear).
-    pub fn count_notes_per_folder(&self) -> Result<std::collections::HashMap<String, usize>> {
+    /// Count of notes assigned to each folder id (only folders with ≥1 VISIBLE note appear).
+    ///
+    /// Gated the same way as `analytics`'s `notes_count` / `list_entities_visible`: a folder that
+    /// is sealed and NOT session-unlocked contributes ZERO to its own count, never the true
+    /// sealed count. `seal_note` blanks a note's markdown/content_blob on lock but never deletes
+    /// or reparents the `notes` row, so an ungated `COUNT(*) GROUP BY folder_id` (the pre-fix
+    /// query) leaked the exact sealed-note count into the folder tree (`FolderNode.note_count`)
+    /// even though the lock model's invariant is that a sealed-and-not-unlocked folder leaks
+    /// NOTHING — see `.claude/rules/lock-model.md`.
+    pub fn count_notes_per_folder(
+        &self,
+        unlocked: &HashSet<String>,
+    ) -> Result<std::collections::HashMap<String, usize>> {
         let conn = self.lock();
-        let mut stmt = conn
-            .prepare(
-                "SELECT folder_id, COUNT(*) FROM notes
-                  WHERE folder_id IS NOT NULL GROUP BY folder_id",
-            )
-            .map_err(map_err)?;
+        let visible = visibility_clause("n", unlocked);
+        let sql = format!(
+            "SELECT n.folder_id, COUNT(*) FROM notes n
+               LEFT JOIN folders f ON f.id = n.folder_id
+              WHERE n.folder_id IS NOT NULL AND {visible}
+              GROUP BY n.folder_id"
+        );
+        let mut stmt = conn.prepare(&sql).map_err(map_err)?;
         let rows = stmt
             .query_map([], |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as usize))
@@ -15694,6 +15707,86 @@ mod tests {
         assert_eq!(a2.total_meetings, 3);
         assert_eq!(a2.total_duration_s, 7500);
         assert_eq!(a2.longest_duration_s, 6000);
+    }
+
+    /// The folder tree's `note_count` badge must never reveal a sealed-and-not-unlocked folder's
+    /// TRUE note count — same leak class `analytics_excludes_sealed_not_unlocked_folder` closes
+    /// for the Analytics tab. Regression for the audit finding: `Db::count_notes_per_folder()`
+    /// used to run a bare `SELECT folder_id, COUNT(*) FROM notes GROUP BY folder_id` with no join
+    /// to `folders` and no unlock-set gate at all — `seal_note` blanks a note's markdown on lock
+    /// but never deletes/reparents the `notes` row, so the sealed folder's exact note count leaked
+    /// into the sidebar tree (`list_folders` → `FolderNode.note_count`) even though the lock
+    /// model's invariant is that a sealed-and-not-unlocked folder must leak NOTHING.
+    #[test]
+    fn count_notes_per_folder_excludes_sealed_not_unlocked_folder() {
+        let db = mem_db();
+        db.insert_folder(&crate::storage::Folder {
+            id: "f-open".into(),
+            name: "Open".into(),
+            path: "Open".into(),
+            parent_id: None,
+            locked: false,
+            created_at: "2026-06-01T00:00:00Z".into(),
+        })
+        .unwrap();
+        db.insert_folder(&crate::storage::Folder {
+            id: "f-secret".into(),
+            name: "Secret".into(),
+            path: "Secret".into(),
+            parent_id: None,
+            locked: true,
+            created_at: "2026-06-01T00:00:00Z".into(),
+        })
+        .unwrap();
+
+        // 1 note in the OPEN folder, 3 notes in the LOCKED folder.
+        for (id, folder) in [
+            ("open-1", "f-open"),
+            ("secret-1", "f-secret"),
+            ("secret-2", "f-secret"),
+            ("secret-3", "f-secret"),
+        ] {
+            db.insert_meeting(&crate::storage::Meeting {
+                id: id.into(),
+                started_at: "2026-06-20T10:00:00Z".into(),
+                ended_at: None,
+                title: Some("t".into()),
+                duration_s: 60,
+                audio_path: None,
+                status: crate::storage::MeetingStatus::Summarized,
+                folder_id: None,
+            })
+            .unwrap();
+            db.upsert_note(&crate::storage::NoteRecord {
+                meeting_id: id.into(),
+                provider_id: "claude_code".into(),
+                markdown: "m".into(),
+                created_at: "2026-06-20T10:00:00Z".into(),
+                exported_path: None,
+                model_requested: None,
+                model_served: None,
+                gateway_host: None,
+            })
+            .unwrap();
+            db.set_note_folder(id, Some(folder)).unwrap();
+        }
+
+        // Sealed and NOT session-unlocked: the locked folder must be ABSENT from the map (or read
+        // back as 0), never its true count of 3.
+        let nothing = std::collections::HashSet::new();
+        let counts = db.count_notes_per_folder(&nothing).unwrap();
+        assert_eq!(counts.get("f-open").copied().unwrap_or(0), 1);
+        assert_eq!(
+            counts.get("f-secret").copied().unwrap_or(0),
+            0,
+            "a sealed-and-not-unlocked folder must not leak its true note count"
+        );
+
+        // Once the folder is SESSION-unlocked, the true count becomes visible again (reversible).
+        let mut unlocked = std::collections::HashSet::new();
+        unlocked.insert("f-secret".to_string());
+        let counts2 = db.count_notes_per_folder(&unlocked).unwrap();
+        assert_eq!(counts2.get("f-secret").copied().unwrap_or(0), 3);
     }
 
     /// Race-safety regression (TOCTOU: prune snapshots a plaintext path, a concurrent seal
