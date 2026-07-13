@@ -190,24 +190,28 @@ impl DebertaNameRedactor {
         let special = encoding.get_special_tokens_mask(); // 1 for [CLS]/[SEP]/pad
 
         let seq = ids.len();
-        let input_ids = Tensor::from_vec(ids.to_vec(), (1, seq), device)
-            .map_err(|e| AppError::Storage(format!("ner input tensor: {e}")))?;
-        let attention_mask = Tensor::ones((1, seq), candle_core::DType::U32, device)
-            .map_err(|e| AppError::Storage(format!("ner mask tensor: {e}")))?;
+        // See the matching autoreleasepool wrap + rationale comment in embed/candle_bert.rs — same
+        // Metal-autorelease-drain concern, same zero-new-crate objc2 fix.
+        let label_ids: Vec<u32> = objc2::rc::autoreleasepool(|_pool| -> Result<Vec<u32>> {
+            let input_ids = Tensor::from_vec(ids.to_vec(), (1, seq), device)
+                .map_err(|e| AppError::Storage(format!("ner input tensor: {e}")))?;
+            let attention_mask = Tensor::ones((1, seq), candle_core::DType::U32, device)
+                .map_err(|e| AppError::Storage(format!("ner mask tensor: {e}")))?;
 
-        // logits: [1, seq, num_labels]
-        let logits = loaded
-            .model
-            .forward(&input_ids, None, Some(attention_mask))
-            .map_err(|e| AppError::Storage(format!("ner forward failed: {e}")))?;
-        let logits = logits
-            .to_dtype(candle_core::DType::F32)
-            .and_then(|t| t.squeeze(0)) // [seq, num_labels]
-            .map_err(|e| AppError::Storage(format!("ner logits reshape: {e}")))?;
-        let label_ids: Vec<u32> = logits
-            .argmax(candle_core::D::Minus1)
-            .and_then(|t| t.to_vec1::<u32>())
-            .map_err(|e| AppError::Storage(format!("ner argmax failed: {e}")))?;
+            // logits: [1, seq, num_labels]
+            let logits = loaded
+                .model
+                .forward(&input_ids, None, Some(attention_mask))
+                .map_err(|e| AppError::Storage(format!("ner forward failed: {e}")))?;
+            let logits = logits
+                .to_dtype(candle_core::DType::F32)
+                .and_then(|t| t.squeeze(0)) // [seq, num_labels]
+                .map_err(|e| AppError::Storage(format!("ner logits reshape: {e}")))?;
+            logits
+                .argmax(candle_core::D::Minus1)
+                .and_then(|t| t.to_vec1::<u32>())
+                .map_err(|e| AppError::Storage(format!("ner argmax failed: {e}")))
+        })?;
 
         // Decode BIO PERSON spans into char ranges, then map distinct names → stable tokens.
         let spans = decode_person_spans(&label_ids, offsets, special, &loaded.id2label);
