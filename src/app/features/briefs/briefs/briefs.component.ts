@@ -45,8 +45,17 @@ export class BriefsComponent {
   protected readonly store = inject(BriefsStore);
   private readonly toast = inject(ToastService);
 
-  /** Collapsed by default UNLESS a proposed brief is waiting (see template). */
+  /** The user's manual collapse/expand toggle (click on `.br-toggle`). */
   readonly open = signal(false);
+
+  /**
+   * Collapsed by default UNLESS a proposed brief is waiting: the pending-run
+   * card peeks through even while `open()` is false (see template), so the
+   * header chrome (aria-expanded + chevron rotation) must reflect that same
+   * condition — otherwise the header looks collapsed while content renders
+   * underneath it.
+   */
+  readonly isExpanded = computed(() => this.open() || this.pendingCount() > 0);
 
   // ── create form (signals-backed native inputs — no FormsModule) ─────────
   readonly formLabel = signal("");
