@@ -138,6 +138,12 @@
   flex: 1 1 auto;
   min-height: 0;
   overflow-y: auto;
+  /* A scrolled-off last item hard-clips at the rail's rounded bottom edge
+     with no visible scrollbar (macOS hides overlay scrollbars until
+     actively scrolling) — nothing hints there's more below. Fade the last
+     ~28px instead of a hard cut, the standard "there's more, scroll" tell. */
+  mask-image: linear-gradient(to bottom, #000 calc(100% - 28px), transparent);
+  -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 28px), transparent);
 }
 .nav-item {
   display: flex;
