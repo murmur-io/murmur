@@ -374,12 +374,14 @@ pub fn parakeet_ram_permits_now() -> bool {
     }
 }
 
-/// RAM guard for the startup topic-chunk backfill (`Db::backfill_topic_chunks_idempotent`) —
-/// `false` ONLY when total RAM is affirmatively below [`TOPIC_BACKFILL_MIN_RAM_BYTES`]. Fails
-/// OPEN when the probe can't read RAM (a broken measurement never silently disables catch-up
-/// indexing). A genuinely RAM-starved machine defers the whole backfill rather than starting a
-/// Metal/Candle embed pass on launch — it catches up on a later, healthier launch since the
-/// backfill is content-hash idempotent. Mirrors [`parakeet_ram_permits_now`].
+/// RAM guard for any bulk Candle/Metal embed pass over the vault — the startup topic-chunk
+/// backfill (`Db::backfill_topic_chunks_idempotent`) and the user-triggered "Reindex" command
+/// (`commands::reindex_embeddings`) both gate on this before starting. `false` ONLY when total
+/// RAM is affirmatively below [`TOPIC_BACKFILL_MIN_RAM_BYTES`]. Fails OPEN when the probe can't
+/// read RAM (a broken measurement never silently disables catch-up indexing). A genuinely
+/// RAM-starved machine defers the whole pass rather than starting a Metal/Candle embed burst —
+/// both callers are safe to retry later (the backfill is content-hash idempotent; reindex is a
+/// user-initiated retry). Mirrors [`parakeet_ram_permits_now`].
 pub fn topic_backfill_ram_permits_now() -> bool {
     match total_ram_bytes() {
         Some(b) => b >= TOPIC_BACKFILL_MIN_RAM_BYTES,

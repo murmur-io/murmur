@@ -4814,8 +4814,15 @@ pub async fn build_and_persist_entities(
             .clone()
     };
     let provider = crate::summarize::provider_for(crate::summarize::roles::Role::Notes, &config)?;
+    let entities_started = std::time::Instant::now();
     let payload =
         crate::summarize::graph::extract_entities(provider.as_ref(), title, markdown).await?;
+    tracing::info!(
+        target: "perf",
+        stage = "extract_entities",
+        elapsed_ms = entities_started.elapsed().as_millis() as u64,
+        "pipeline stage complete"
+    );
 
     // Sink A — ALWAYS persist to the encrypted DB (the graph's source of truth). Collect the
     // resolved (entity_id, name) pairs so the bitemporal-facts pass below can extract + reconcile
@@ -4853,8 +4860,10 @@ pub async fn build_and_persist_entities(
     let title_owned = title.to_string();
     let markdown_owned = markdown.to_string();
     let entity_refs_owned = entity_refs.clone();
+    let facts_started = std::time::Instant::now();
     if let Err(e) = crate::perf::run_heavy(&state.heavy_inference, move || -> Result<(), AppError> {
         let state = app_for_facts.state::<AppState>();
+        let t0 = std::time::Instant::now();
         if let Err(e) = persist_facts_for_meeting(
             &state,
             &meeting_id_owned,
@@ -4864,17 +4873,26 @@ pub async fn build_and_persist_entities(
         ) {
             tracing::warn!(target: "facts", error = %e, "fact reconcile failed (note unaffected)");
         }
+        tracing::info!(target: "perf", stage = "persist_facts", elapsed_ms = t0.elapsed().as_millis() as u64, "pipeline stage complete");
+        let t1 = std::time::Instant::now();
         if let Err(e) =
             persist_user_facts_for_meeting(&state, &meeting_id_owned, &title_owned, &markdown_owned)
         {
             tracing::warn!(target: "user_memory", error = %e, "user-fact reconcile failed (note unaffected)");
         }
+        tracing::info!(target: "perf", stage = "persist_user_facts", elapsed_ms = t1.elapsed().as_millis() as u64, "pipeline stage complete");
         Ok(())
     })
     .await
     {
         tracing::warn!(target: "facts", error = %e, "facts/user-memory blocking task failed (note unaffected)");
     }
+    tracing::info!(
+        target: "perf",
+        stage = "facts_and_user_memory_total",
+        elapsed_ms = facts_started.elapsed().as_millis() as u64,
+        "pipeline stage complete"
+    );
 
     // Sink B — vault [[ ]] stubs, ONLY when a vault is configured AND the meeting's folder is
     // NOT sealed on disk. Disk-truth `locked` (not session `unlocked`): a session-unlock must
@@ -9894,18 +9912,36 @@ pub async fn reindex_embeddings(
         .map(|g| g.clone())
         .unwrap_or_default();
 
-    reindex_embeddings_inner(
-        &state.db,
-        &unlocked,
-        crate::embed::embed_model_present(),
-        crate::embed::active_embedder().as_ref(),
-        |done, total| {
-            let _ = app.emit(
-                crate::events::EVENT_REINDEX,
-                crate::events::ReindexPayload { done, total },
-            );
-        },
-    )
+    // 2026-07-13 perf audit (MODERATE): this ran `reindex_embeddings_inner` — a vault-wide loop
+    // (up to 100_000 meetings + every visible document) doing real Candle/Metal embed calls —
+    // INLINE on the async command's Tokio worker, the same shape as the original startup-freeze
+    // bug this whole investigation started from (now fixed there via a RAM floor + per-run cap;
+    // the per-meeting embed BATCH SIZE is already safe here too, since index_meeting_chunks/
+    // index_meeting_topic_chunks were sub-batched earlier today). This one is user-TRIGGERED (the
+    // Settings "Reindex" button), not automatic, so the risk is lower, but the fix is the same
+    // shape: move off the async runtime + gate on a RAM floor before starting.
+    if !crate::transcribe::model::topic_backfill_ram_permits_now() {
+        return Err(AppError::Unavailable(
+            "not enough free memory to reindex right now — close some apps and try again".into(),
+        ));
+    }
+    let db = state.db.clone();
+    let heavy_inference = state.heavy_inference.clone();
+    crate::perf::run_heavy(&heavy_inference, move || {
+        reindex_embeddings_inner(
+            &db,
+            &unlocked,
+            crate::embed::embed_model_present(),
+            crate::embed::active_embedder().as_ref(),
+            |done, total| {
+                let _ = app.emit(
+                    crate::events::EVENT_REINDEX,
+                    crate::events::ReindexPayload { done, total },
+                );
+            },
+        )
+    })
+    .await
 }
 
 /// "Powiązane wg znaczenia": the up-to-5 meetings most semantically similar to `meeting_id`.
