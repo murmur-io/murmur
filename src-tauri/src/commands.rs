@@ -24553,6 +24553,51 @@ mod lifecycle_tests {
         assert_eq!(status2.received_count, 1, "a tombstoned received item is excluded");
     }
 
+    /// STUCK-REPUBLISH FIX: `OrgStatus.item_count` also counts a `failed` row that still carries a
+    /// non-null `item_id` (a republish that failed transiently but whose OLD publish is still live on
+    /// the server — `set_org_share_failed` never clears `item_id`). Pre-fix this undercounted "N shared
+    /// by you" for exactly the rows the republish-failure bug got stuck. A `failed` row that never
+    /// published (`item_id` NULL) must still be excluded — no live item to count.
+    #[test]
+    fn org_status_item_count_includes_stuck_failed_rows_with_a_live_item_id() {
+        let state = build_state("org-item-count-stuck");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        let now = "2026-07-12T00:00:00Z";
+
+        // One cleanly-uploaded share.
+        state
+            .db
+            .insert_org_share("s-up", "org-1", None, Some("n-up"), "note", Some("T"), 1, 1, &[1u8; 32], now)
+            .unwrap();
+        state.db.set_org_share_uploaded("s-up", "item-up", now).unwrap();
+
+        // One STUCK share: published once, then a republish attempt failed (item_id retained).
+        state
+            .db
+            .insert_org_share("s-stuck", "org-1", None, Some("n-stuck"), "note", Some("T"), 1, 1, &[2u8; 32], now)
+            .unwrap();
+        state.db.set_org_share_uploaded("s-stuck", "item-stuck", now).unwrap();
+        state.db.set_org_share_failed("s-stuck", "republish_upload_failed", now).unwrap();
+
+        // One NEVER-published failed share (item_id NULL) — must stay excluded.
+        state
+            .db
+            .insert_org_share("s-dead", "org-1", None, Some("n-dead"), "note", Some("T"), 1, 1, &[3u8; 32], now)
+            .unwrap();
+        state.db.set_org_share_failed("s-dead", "publish_failed", now).unwrap();
+
+        let status = block_on(org_status_for(
+            &state,
+            state.db.get_org_state("org-1").unwrap().unwrap(),
+        ))
+        .unwrap();
+        assert_eq!(
+            status.item_count, 2,
+            "item_count includes the uploaded row AND the stuck failed-with-item_id row, \
+             excluding the never-published failed row"
+        );
+    }
+
     /// `org_state` upsert preserves the LOCAL consent + sync cursor across a status refresh (a refresh
     /// carrying role/name/generation must NOT reset consent or rewind last_seq), and the consent +
     /// generation + last_seq setters work as the single mutators.
@@ -25486,6 +25531,88 @@ mod lifecycle_tests {
         assert_eq!(log.tombstoned, vec!["item-1".to_string()]);
     }
 
+    /// STUCK-REPUBLISH FIX (the sweep side): `org_sweep_pending_inner` retries a `failed` row that
+    /// STILL carries an `item_id` (a republish that failed transiently, leaving the OLD publish live)
+    /// via `republish_org_shares_for_source` — which SUPERSEDES (new item, bumped rev, old tombstoned)
+    /// — rather than via `share_to_org_inner`, which would wrongly restart at `rev = 1` and mint a
+    /// DUPLICATE item alongside the still-live stuck one. Sequence: (1) share n-sw successfully
+    /// (item-1, rev 1); (2) evict the cached OCK so the NEXT OCK acquire 404s against the mock server
+    /// (no `/key-grants` route) — forcing a deterministic republish failure that lands the row in
+    /// `state='failed'` WITH `item_id` still `Some("item-1")`, exactly the stuck shape; (3) re-seed the
+    /// OCK (simulating the transient blip clearing) and run the sweep — assert it advances the row via
+    /// a NEW published item (rev 2, superseding item-1) rather than a second, independent rev-1 item.
+    #[test]
+    fn org_sweep_pending_retries_stuck_failed_rows_via_republish_not_fresh_share() {
+        let mock = MockOrgServer::start();
+        let state = build_state("org-sweep-stuck-republish");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        make_open_folder(&state.db, "f-sw", "Team");
+        state
+            .db
+            .insert_note("n-sw", "f-sw", "plan", "Plan", "# original body", 1)
+            .unwrap();
+        state.config.lock().unwrap().org_egress_consented = true;
+        state.config.lock().unwrap().share_base_url = mock.base.clone();
+        seed_live_session(&state);
+        seed_ock(&state, "org-1", 1);
+
+        // (1) Initial share succeeds: item-1, rev 1, one uploaded row.
+        let entry = block_on(share_to_org_inner(
+            &state,
+            "org-1",
+            None,
+            Some("n-sw".to_string()),
+            true,
+        ))
+        .expect("initial share should publish against the mock server");
+        assert_eq!(entry.item_id.as_deref(), Some("item-1"));
+        let row_id = state.db.list_org_shares_for_org("org-1").unwrap()[0].id.clone();
+
+        // Edit the note so the republish has new content to publish.
+        update_note_doc_inner(&state, "n-sw", "Plan", "# EDITED body").unwrap();
+
+        // (2) Evict the OCK cache so the republish's `acquire_org_ock` cache-misses and hits the
+        // (unmocked) key-grants endpoint, which 404s → deterministic republish failure.
+        state.org_ock_cache.lock().unwrap().clear();
+        let republished = block_on(republish_org_shares_for_source(&state, None, Some("n-sw"))).unwrap();
+        assert_eq!(republished, 0, "the forced OCK failure republished nothing this call");
+        let stuck = state.db.get_org_share(&row_id).unwrap().unwrap();
+        assert_eq!(stuck.state, "failed", "the row landed in failed state");
+        assert_eq!(
+            stuck.item_id.as_deref(),
+            Some("item-1"),
+            "the OLD, still-server-live item_id is retained (set_org_share_failed doesn't clear it)"
+        );
+        assert_eq!(stuck.rev, 1, "rev was NOT bumped — the republish attempt failed before publishing");
+
+        // (3) The transient blip clears (OCK re-seeded) — run the sweep.
+        seed_ock(&state, "org-1", 1);
+        let advanced = block_on(org_sweep_pending_inner(&state)).unwrap();
+        assert_eq!(advanced, 1, "the sweep advanced the stuck row");
+
+        let healed = state.db.get_org_share(&row_id).unwrap().unwrap();
+        assert_eq!(healed.state, "uploaded", "the row is live again after the sweep");
+        assert_eq!(healed.rev, 2, "republish bumped rev to 2 — NOT a fresh rev-1 share");
+        assert_eq!(
+            healed.item_id.as_deref(),
+            Some("item-2"),
+            "the row was repointed to a NEW item that SUPERSEDES item-1"
+        );
+        // Still exactly ONE org_shares row for this source — no duplicate row was minted.
+        let all_rows = state.db.list_org_shares_for_org("org-1").unwrap();
+        assert_eq!(all_rows.len(), 1, "no duplicate org_shares row for the source");
+
+        // The mock server saw item-1 published, then item-2 published, then item-1 tombstoned — the
+        // supersede sequence, NOT a second independent rev-1 publish with item-1 left live forever.
+        let log = mock.log.lock().unwrap();
+        assert_eq!(log.published, vec!["item-1".to_string(), "item-2".to_string()]);
+        assert_eq!(
+            log.tombstoned,
+            vec!["item-1".to_string()],
+            "the OLD stuck item was tombstoned once the new one superseded it"
+        );
+    }
+
     /// ITEM 2 — `org_resolve_source` maps an uploaded org item back to its LOCAL editable source, and
     /// returns `None` for an unknown item id (a colleague's item this device never published).
     #[test]
@@ -25519,6 +25646,46 @@ mod lifecycle_tests {
 
         // An unknown item (not published by THIS device) → None.
         assert!(org_resolve_source_inner(&state, "item-unknown").unwrap().is_none());
+    }
+
+    /// STUCK-REPUBLISH FIX: `org_resolve_source` still resolves a `failed` row whose LAST republish
+    /// attempt failed but which retained its OLD, still-server-live `item_id` (`set_org_share_failed`
+    /// never clears it — see `org_shares_for_source`'s doc). This is what makes the author's own note
+    /// open in the real editor instead of getting stuck in the read-only Org Brain viewer. A `revoked`
+    /// row (intentionally torn down) is the one state that must still return `None`.
+    #[test]
+    fn org_resolve_source_resolves_stuck_failed_rows_but_not_revoked() {
+        let state = build_state("org-resolve-source-stuck");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        let now = "2026-07-12T00:00:00Z";
+
+        // A row that published successfully once, then a REPUBLISH attempt failed — item_id retained.
+        state
+            .db
+            .insert_org_share("s-stuck", "org-1", None, Some("n-stuck"), "note", Some("T"), 1, 1, &[1u8; 32], now)
+            .unwrap();
+        state.db.set_org_share_uploaded("s-stuck", "item-stuck", now).unwrap();
+        state.db.set_org_share_failed("s-stuck", "republish_upload_failed", now).unwrap();
+
+        let resolved = org_resolve_source_inner(&state, "item-stuck").unwrap();
+        assert_eq!(
+            resolved.map(|r| (r.kind, r.source_id)),
+            Some(("document".to_string(), "n-stuck".to_string())),
+            "a failed-with-item_id row still resolves to its real editable source"
+        );
+
+        // A row that was uploaded, then intentionally revoked — must NOT resolve.
+        state
+            .db
+            .insert_org_share("s-revoked", "org-1", None, Some("n-revoked"), "note", Some("T"), 1, 1, &[2u8; 32], now)
+            .unwrap();
+        state.db.set_org_share_uploaded("s-revoked", "item-revoked", now).unwrap();
+        state.db.set_org_share_state("s-revoked", "revoked", now).unwrap();
+
+        assert!(
+            org_resolve_source_inner(&state, "item-revoked").unwrap().is_none(),
+            "an intentionally revoked share must not resolve back to an editable source"
+        );
     }
 
     /// F1 (org_leave targets the SPECIFIED org's local state). `org_leave` deletes the local org row +
@@ -26520,11 +26687,15 @@ async fn org_status_for(
         .iter()
         .filter(|s| s.state == "queued" || s.state == "revoke_pending")
         .count() as u32;
+    // `item_count` also counts a `failed`-with-`item_id` row: `set_org_share_failed` never clears
+    // `item_id` on a republish failure, so such a row's PRIOR publish is still genuinely live on the
+    // server — excluding it undercounted "N shared by you" for exactly the rows stuck by the
+    // republish-failure bug (see `org_shares_for_source`'s doc for the full state-machine rationale).
     let item_count = state
         .db
         .list_org_shares_for_org(&refreshed.org_id)?
         .iter()
-        .filter(|s| s.state == "uploaded")
+        .filter(|s| s.state == "uploaded" || (s.state == "failed" && s.item_id.is_some()))
         .count() as u32;
     // RECEIVED items in the local replica (what colleagues shared IN) — distinct from item_count
     // (the caller's OWN uploads). Fixes the "0 items" lie a receiving member saw.
@@ -27897,7 +28068,13 @@ pub(crate) fn org_resolve_source_inner(
     let Some(row) = state.db.org_share_by_item(item_id)? else {
         return Ok(None);
     };
-    if row.state != "uploaded" {
+    // Only a `revoked` row is refused here — it was INTENTIONALLY torn down, so it must not redirect
+    // the author back into "editing" it. Every other state (including `failed` with a still-set
+    // `item_id` — a republish that failed transiently but whose PRIOR publish is still genuinely live
+    // on the server, see `org_shares_for_source`) falls through: the row's `document_id`/`meeting_id`
+    // (checked below) is what actually decides "nothing to route to", so a stuck-but-live row still
+    // resolves to the real editable source instead of the read-only Org Brain viewer.
+    if row.state == "revoked" {
         return Ok(None);
     }
     if let Some(document_id) = row.document_id {
@@ -28075,8 +28252,14 @@ pub(crate) async fn org_background_sync_tick(state: &AppState) -> bool {
 
 /// `org_sweep_pending()` — the on-launch org queue sweep (extends the mode-B `share_rewrap_pending`
 /// launch pattern). Idempotent + OFFLINE-TOLERANT: logged out / no server / a per-row failure leaves
-/// the row where it is for the next pass (never an error). Two queues:
-///   - `queued` (or `failed` retry) → re-seal under the current OCK + upload + publish → `uploaded`;
+/// the row where it is for the next pass (never an error). Three queues:
+///   - `queued`, or a `failed` row that NEVER published (`item_id` still `NULL`) → fresh publish via
+///     `share_to_org_inner` (re-seal under the current OCK + upload + publish → `uploaded`);
+///   - a `failed` row that WAS live before (`item_id` set — the row's LAST republish attempt failed,
+///     but `set_org_share_failed` never clears the OLD, still-server-live `item_id`) → retried via
+///     `republish_org_shares_for_source` instead, so it supersedes (bumps `rev`, tombstones the old
+///     item after the new one lands) rather than restarting at `rev = 1` and minting a duplicate item
+///     alongside the still-live stuck one;
 ///   - `revoke_pending` → tombstone the item server-side → `revoked`.
 /// Returns the number of rows ADVANCED. Reads ONLY the retained local rows' key/hash context — for a
 /// re-seal it re-reads the SOURCE note, so the per-row re-share still passes the READ-GATE (a source
@@ -28130,8 +28313,26 @@ pub(crate) async fn org_sweep_pending_inner(state: &AppState) -> Result<u32, App
     //    queueing NEVER egresses (the read-gate refuses → the row stays `failed`).
     for state_label in ["queued", "failed"] {
         for row in state.db.list_org_shares_in_state(state_label)? {
-            // Skip rows already published (defensive — shouldn't be in these states with an item_id).
             if row.item_id.is_some() {
+                // Was live before: this row's LAST attempt was a REPUBLISH (not the initial publish)
+                // and it failed — `set_org_share_failed` deliberately retains the OLD, still-server-live
+                // `item_id` (only the success path's `reset_org_share_for_retry` clears it). The correct
+                // retry here is `republish_org_shares_for_source` (bumps `rev`, tombstones the OLD item
+                // only AFTER the new one lands) — `share_to_org_inner` would wrongly restart at `rev = 1`
+                // and mint a genuine DUPLICATE item since the old one is still live on the server.
+                // `org_shares_for_source` (the enumerator it reads through) now surfaces exactly this
+                // shape (`failed` + non-null `item_id`), so this retry can actually find the row.
+                let advanced_this_source = republish_org_shares_for_source(
+                    state,
+                    row.meeting_id.as_deref(),
+                    row.document_id.as_deref(),
+                )
+                .await
+                .map(|n| n > 0)
+                .unwrap_or(false);
+                if advanced_this_source {
+                    advanced += 1;
+                }
                 continue;
             }
             let res = share_to_org_inner(
