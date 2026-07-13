@@ -48,6 +48,25 @@ export class PeopleComponent {
   protected readonly total = computed(() => this.people().length);
 
   /**
+   * 2026-07-13 perf audit (LOW-MODERATE): `list_people` has no backend LIMIT, so a vault with
+   * many people rendered every card unbounded — mirrors the pattern already established for the
+   * transcript (`audio-panel.component.ts` RENDER_CAP=80) and the brain entity map
+   * (`brain.component.ts` MAP_NODE_CAP=60), just not applied here yet.
+   */
+  private readonly RENDER_CAP = 100;
+  protected readonly expanded = signal(false);
+  protected readonly renderedPeople = computed<PersonCard[]>(() => {
+    const all = this.people();
+    if (this.expanded() || all.length <= this.RENDER_CAP) {
+      return all;
+    }
+    return all.slice(0, this.RENDER_CAP);
+  });
+  protected readonly hiddenCount = computed(
+    () => this.people().length - this.renderedPeople().length,
+  );
+
+  /**
    * Load the people list, and re-load whenever the folder lock-state changes.
    * Reading the folders `tree` signal registers this effect as its dependent, so
    * its initial value drives the first fetch (no separate `ngOnInit`), and a
@@ -89,6 +108,11 @@ export class PeopleComponent {
 
   clearSelection(): void {
     this.selectedId.set(null);
+  }
+
+  /** Reveal the full people list (drops the RENDER_CAP window). */
+  showAll(): void {
+    this.expanded.set(true);
   }
 
   /** The uppercase leading letter for the avatar (fallback "?" for empty names). */
