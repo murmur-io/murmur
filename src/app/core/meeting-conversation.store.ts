@@ -1069,7 +1069,13 @@ export class MeetingConversationStore {
   /**
    * Fire the manual "Ask AI" trigger: open a fresh anchorless thread to host the
    * voice turn, open the listener, and mark a manual ask in flight so the surface
-   * stays visible for the whole round-trip. Errors clear the in-flight flag.
+   * stays visible for the whole round-trip. When `begin_voice_command` itself
+   * REJECTS, the listener never armed and no {@link onResult} will ever land to
+   * backfill the "🎙 …" placeholder anchor — resolving its turn in place would
+   * strand an unlabeled mic bubble in the flow with no dismiss/retry for the rest
+   * of the session, so instead we DROP the whole placeholder thread (it never
+   * became a real note — `persisted: false`) and just clear the in-flight flag,
+   * leaving the flow exactly as it was before the click.
    */
   async askNow(): Promise<void> {
     this._manualAskInFlight.set(true);
@@ -1122,13 +1128,10 @@ export class MeetingConversationStore {
       this._manualAskInFlight.set(false);
       this._listening.set(false);
       this.voiceTargetNoteId = null;
-      this.resolveTurn(noteId, agentTurn.id, {
-        status: "error",
-        text: "Couldn't start the listener.",
-        citations: [],
-        proposedNote: null,
-        answeredFrom: null,
-      });
+      // The listener never started — there is nothing to resolve or retry, so
+      // remove the placeholder thread rather than leaving an orphaned "🎙 …"
+      // bubble permanently stuck in the flow.
+      this._notes.update((ns) => ns.filter((n) => n.id !== noteId));
       throw e;
     }
   }
