@@ -1728,8 +1728,11 @@ export class IpcService {
    * Persist a meeting's live typed-notes buffer (debounced autosave from the
    * record screen "My notes" editor). GATED server-side: a
    * sealed-and-not-session-unlocked meeting is refused with `AppError::Locked`
-   * (never resurrect typed plaintext behind a lock) — the FE swallows that and
-   * keeps the local draft. The text is the user's OWN words (no new egress).
+   * (never resurrect typed plaintext behind a lock) — the caller
+   * (`MeetingConversationStore.persistNotes`) keeps the local draft either way
+   * but surfaces the rejection via a toast rather than swallowing it, since the
+   * flow already shows the note as saved from local state. The text is the
+   * user's OWN words (no new egress).
    */
   saveManualNotes(meetingId: string, text: string): Promise<void> {
     return invoke<void>("save_manual_notes", { meetingId, text });
