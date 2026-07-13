@@ -197,7 +197,7 @@
                 <button
                   type="button"
                   class="tl-block"
-                  [class.is-active]="isActive(blk.startS, blk.endS)"
+                  [class.is-active]="activeBlockOrders().has(blk.order)"
                   [style.left.%]="blk.left"
                   [style.width.%]="blk.width"
                   [style.--i]="blk.order"
@@ -244,7 +244,7 @@
               type="button"
               class="tl-chapter"
               role="listitem"
-              [class.is-active]="isActiveChapter(ch.startS, ch.endS)"
+              [class.is-active]="activeTopicOrders().has(ch.order)"
               [style.--i]="ch.order"
               [attr.aria-label]="
                 'Chapter ' + ch.label + ', starts ' + fmt(ch.startS)
@@ -286,7 +286,7 @@
             <button
               type="button"
               class="tl-topic"
-              [class.is-active]="isActive(top.startS, top.endS)"
+              [class.is-active]="activeTopicOrders().has(top.order)"
               [style.left.%]="top.left"
               [style.width.%]="top.width"
               [style.--i]="top.order"
