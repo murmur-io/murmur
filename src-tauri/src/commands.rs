@@ -10172,7 +10172,6 @@ pub fn toggle_bar(app: AppHandle) {
 #[tauri::command]
 pub fn list_folders(state: State<'_, AppState>) -> Result<Vec<FolderNode>, AppError> {
     let folders = state.db.list_folders()?;
-    let counts = state.db.count_notes_per_folder()?;
     let unlocked = {
         state
             .unlocked_folders
@@ -10180,6 +10179,9 @@ pub fn list_folders(state: State<'_, AppState>) -> Result<Vec<FolderNode>, AppEr
             .map_err(|_| AppError::Storage("unlocked-folders mutex poisoned".into()))?
             .clone()
     };
+    // Gated by the session unlock set — a sealed-and-not-unlocked folder's notes must not
+    // contribute to note_count (see count_notes_per_folder doc + .claude/rules/lock-model.md).
+    let counts = state.db.count_notes_per_folder(&unlocked)?;
     Ok(build_folder_tree(&folders, &counts, &unlocked))
 }
 
@@ -11018,8 +11020,9 @@ pub async fn unlock_folder(
         }
         tracing::info!(target: "lock", folder = %folder_id, "unlock_folder: session unlock complete");
 
-        // Return the refreshed node.
-        let counts = state.db.count_notes_per_folder()?;
+        // Return the refreshed node. This folder was just added to the unlock set above, so its
+        // own count is legitimately visible — pass the current unlock set through the same gate
+        // every other caller uses (count_notes_per_folder).
         let unlocked = {
             state
                 .unlocked_folders
@@ -11027,6 +11030,7 @@ pub async fn unlock_folder(
                 .map_err(|_| AppError::Storage("unlocked-folders mutex poisoned".into()))?
                 .clone()
         };
+        let counts = state.db.count_notes_per_folder(&unlocked)?;
         Ok(FolderNode {
             id: folder.id.clone(),
             name: folder.name.clone(),
@@ -11471,7 +11475,17 @@ pub(crate) async fn discard_unrecoverable_folder_lock_inner(
         "discard_unrecoverable_folder_lock: key proven unrecoverable — discarded the sealed payload and reopened the folder (never-sealed plaintext preserved)"
     );
 
-    let counts = state.db.count_notes_per_folder()?;
+    // This folder was just reopened (discard_folder_seal cleared its lock), so its own count is
+    // legitimately visible under the (now-empty-for-this-folder) unlock gate — pass the current
+    // session unlock set through the same gate every other caller uses.
+    let unlocked = {
+        state
+            .unlocked_folders
+            .lock()
+            .map_err(|_| AppError::Storage("unlocked-folders mutex poisoned".into()))?
+            .clone()
+    };
+    let counts = state.db.count_notes_per_folder(&unlocked)?;
     Ok(FolderNode {
         id: folder.id.clone(),
         name: folder.name.clone(),
