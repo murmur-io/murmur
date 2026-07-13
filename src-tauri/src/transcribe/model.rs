@@ -383,10 +383,14 @@ pub fn parakeet_ram_permits_now() -> bool {
 /// both callers are safe to retry later (the backfill is content-hash idempotent; reindex is a
 /// user-initiated retry). Mirrors [`parakeet_ram_permits_now`].
 pub fn topic_backfill_ram_permits_now() -> bool {
-    match total_ram_bytes() {
+    let floor_ok = match total_ram_bytes() {
         Some(b) => b >= TOPIC_BACKFILL_MIN_RAM_BYTES,
         None => true,
-    }
+    };
+    // 2026-07-13: also consult the kernel's own pressure signal (crate::perf::heavy_op_permitted)
+    // alongside the total-RAM floor — see that function's doc comment for why this is a
+    // DIFFERENT, complementary signal, not a duplicate of the check above.
+    crate::perf::heavy_op_permitted(floor_ok)
 }
 
 /// Ensure all four parakeet model files exist under [`parakeet_dir`], downloading any missing one
