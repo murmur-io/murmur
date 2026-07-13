@@ -2,12 +2,12 @@
   <button
     type="button"
     class="br-toggle"
-    [attr.aria-expanded]="open()"
+    [attr.aria-expanded]="isExpanded()"
     (click)="open.set(!open())"
   >
     <svg
       class="br-chevron"
-      [class.is-open]="open()"
+      [class.is-open]="isExpanded()"
       viewBox="0 0 16 16"
       width="14"
       height="14"

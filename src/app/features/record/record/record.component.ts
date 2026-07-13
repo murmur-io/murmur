@@ -316,13 +316,18 @@ export class RecordComponent implements OnInit {
         : "Transcribing on-device, then summarizing…";
     if (this.modelPresent() === false) return "Download the model to start.";
     if (this.store.stage() === "done") {
+      // A vault being CONFIGURED doesn't mean THIS note exported — the backend
+      // legitimately skips export (locked folder, resummarize on an already-sealed
+      // folder) and returns `exportedPath: null` even with a vault set. Only claim
+      // "in the vault" when this note's own exportedPath says so.
+      const exported = !this.vaultMissing() && !!this.store.lastNote()?.exportedPath;
       if (this.enhanceSettled())
-        return this.vaultMissing()
-          ? "Saved ✓ — your enhanced note is in Murmur."
-          : "Saved ✓ — your enhanced note is in the vault.";
-      return this.vaultMissing()
-        ? "Saved ✓ — your note is in Murmur."
-        : "Saved ✓ — your note is in the vault.";
+        return exported
+          ? "Saved ✓ — your enhanced note is in the vault."
+          : "Saved ✓ — your enhanced note is in Murmur.";
+      return exported
+        ? "Saved ✓ — your note is in the vault."
+        : "Saved ✓ — your note is in Murmur.";
     }
     return "On-device transcription · your audio never leaves this Mac.";
   });

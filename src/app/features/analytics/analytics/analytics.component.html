@@ -10,6 +10,15 @@
     <div class="card state-card">
       <p class="empty">Loading…</p>
     </div>
+  } @else if (error(); as err) {
+    <div class="card empty-state">
+      <span class="empty-mark" aria-hidden="true"></span>
+      <p class="empty-title">Couldn’t load your analytics</p>
+      <p class="empty">{{ err }}</p>
+      <button type="button" class="btn btn-ghost" (click)="load()">
+        Retry
+      </button>
+    </div>
   } @else if (isEmpty()) {
     <div class="card empty-state">
       <span class="empty-mark" aria-hidden="true"></span>
