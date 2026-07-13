@@ -24149,6 +24149,57 @@ mod lifecycle_tests {
         assert_eq!(other.title, "Ich notatka", "a non-owned title is left as-is");
     }
 
+    /// STUCK-REPUBLISH FIX (the `resolve_owned_source` gate, mirroring the identical fix already
+    /// applied to `Db::org_shares_for_source` and `OrgStatus.item_count`): a share whose latest
+    /// republish attempt failed transiently — `state = 'failed'` but `item_id` still set, since
+    /// `set_org_share_failed` never clears it — must still enrich as the caller's OWN item with the
+    /// source's CURRENT title, not fall back to the stale publish-time snapshot / a read-only replica.
+    /// RED on the pre-fix `if row.state != "uploaded"` gate (returns `owned_source: None` + stale
+    /// title even though the row's prior publish is still genuinely live on the server).
+    #[test]
+    fn list_org_items_enriches_a_stuck_failed_republish_as_still_owned() {
+        let state = build_state("org-list-owned-stuck-failed");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        make_open_folder(&state.db, "f-own", "Team");
+        // The author's local note, retitled AFTER the last successful publish.
+        state
+            .db
+            .insert_note("n-stuck", "f-own", "Untitled", "New Title", "# body", 1)
+            .unwrap();
+        // The received replica frozen at the LAST successful publish ("Untitled").
+        state
+            .db
+            .upsert_org_item("item-stuck", "org-1", 2, "kgm004a", "Untitled", "# body", "2026-07-13T09:00:00Z", 1, 1, &[9u8; 32], None, None)
+            .unwrap();
+        // The share: uploaded once, THEN a republish attempt failed transiently — item_id survives
+        // (mirrors the real sequence `set_org_share_failed` produces).
+        state
+            .db
+            .insert_org_share("s-stuck", "org-1", None, Some("n-stuck"), "note", Some("Untitled"), 1, 1, &[9u8; 32], "2026-07-13T09:00:00Z")
+            .unwrap();
+        state
+            .db
+            .set_org_share_uploaded("s-stuck", "item-stuck", "2026-07-13T09:00:00Z")
+            .unwrap();
+        state
+            .db
+            .set_org_share_failed("s-stuck", "republish_upload_failed", "2026-07-13T09:05:00Z")
+            .unwrap();
+
+        let items = list_org_items_inner(&state, "org-1").unwrap();
+        let it = items.iter().find(|i| i.item_id == "item-stuck").unwrap();
+        assert_eq!(
+            it.title, "New Title",
+            "a stuck-failed-republish row still resolves the source's CURRENT title, not the stale snapshot"
+        );
+        let owned = it
+            .owned_source
+            .as_ref()
+            .expect("a stuck-failed-republish row is still recognized as the caller's OWN item");
+        assert_eq!(owned.kind, "document");
+        assert_eq!(owned.id, "n-stuck");
+    }
+
     /// `OrgItemHeader.kind` round-trips for BOTH an owned document-kind share and an owned
     /// meeting-kind share, and stays `None` for a colleague's item that was upserted with no stored
     /// `source_kind` (mirrors an item ingested off a v1 envelope / before this column existed — the
@@ -28799,7 +28850,15 @@ fn resolve_owned_source(
     let Some(row) = st.db.org_share_by_item(item_id)? else {
         return Ok(None);
     };
-    if row.state != "uploaded" {
+    // STUCK-REPUBLISH FIX: mirror `Db::org_shares_for_source` / `OrgStatus.item_count` — a `failed`
+    // row that still carries a non-null `item_id` is a row whose MOST RECENT republish attempt
+    // failed transiently, but whose PRIOR publish is still genuinely live on the server
+    // (`set_org_share_failed` deliberately never clears `item_id`). Excluding it here made the
+    // caller's own item look un-owned during the stuck window: `owned_source` came back `None` and
+    // the list fell back to the stale publish-time snapshot title, even though the item is still
+    // the caller's live share. A `failed` row that never published at all (`item_id` still NULL)
+    // has no live server item to link to and correctly stays excluded.
+    if row.state != "uploaded" && !(row.state == "failed" && row.item_id.is_some()) {
         return Ok(None);
     }
     if let Some(document_id) = row.document_id {
