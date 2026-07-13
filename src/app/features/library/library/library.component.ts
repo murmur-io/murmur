@@ -352,11 +352,6 @@ export class LibraryComponent implements OnInit {
     this.activeOrgId.set(null);
   }
 
-  /** A friendly role hint for the chip row ("Owner" / "Member"). */
-  orgRoleLabel(org: OrgStatus): string {
-    return org.role === "owner" ? "Owner" : "Member";
-  }
-
   // --- Own-meeting org-share badges (Library row + Detail) ------------------
   /**
    * Every active meeting→org share pairing across ALL of the caller's OWN
