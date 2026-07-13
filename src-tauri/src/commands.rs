@@ -6073,6 +6073,7 @@ fn build_ask_vault_floor_prompt(
 /// completion, with the original error/consent semantics (`make_provider`'s fail-closed consent
 /// gate errors exactly as before). Runs on the local/off brain backend and whenever the agentic
 /// attempt did not converge or errored.
+#[allow(clippy::too_many_arguments)] // cohesive gated-Ask surface: corpus/consent state + the heavy-inference permit.
 async fn ask_vault_floor(
     db: &std::sync::Arc<crate::storage::Db>,
     config: &AppConfig,
