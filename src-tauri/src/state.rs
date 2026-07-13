@@ -323,11 +323,17 @@ impl AppState {
         let db = Arc::new(Db::open_with_key(db_path, dek)?);
         let config = Arc::new(Mutex::new(AppConfig::load(&db)?));
 
+        // GLOBAL "one heavy inference at a time" gate — constructed BEFORE the reasoner so it can
+        // be threaded into `ReasonerCell::new` (see the field's doc comment below for the full
+        // rationale).
+        let heavy_inference = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+
         // The live reasoner dispatch shares the config handle, so consent/provider/backend changes
         // written by the settings commands reach the very next reasoning call — no restart. Cheap +
         // panic-free: backends resolve lazily per call; a missing/failed local model degrades to
         // the StubReasoner.
-        let reasoner = crate::reason::ReasonerCell::new(Arc::clone(&config));
+        let reasoner =
+            crate::reason::ReasonerCell::new(Arc::clone(&config), Arc::clone(&heavy_inference));
 
         // SHOULD-FIX startup reconciliation: re-assert the at-rest sealed shape of every locked
         // folder. If the app crashed (or was force-quit) WHILE a folder was session-unlocked, the
@@ -368,7 +374,7 @@ impl AppState {
             share_refresh_lock: tokio::sync::Mutex::new(()),
             lifecycle: Mutex::new(()),
             seal_epoch: AtomicU64::new(0),
-            heavy_inference: Arc::new(tokio::sync::Semaphore::new(1)),
+            heavy_inference,
         })
     }
 

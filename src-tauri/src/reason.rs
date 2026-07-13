@@ -593,13 +593,19 @@ where
 /// - **`Local`** → the real `MistralReasoner` when a GGUF is present on disk ([`local_reasoner`]),
 ///   else the dependency-free `StubReasoner`.
 /// - **`Off`** → `StubReasoner` (the deterministic floor).
-pub fn active_reasoner(config: &AppConfig) -> Box<dyn LocalReasoner> {
+pub fn active_reasoner(
+    config: &AppConfig,
+    heavy: &Arc<tokio::sync::Semaphore>,
+) -> Box<dyn LocalReasoner> {
     match config.brain_backend {
         BrainBackend::Cloud => {
             // Cheap: just clones the config; the provider (+ consent gate + RedactingProvider) is
             // built per-call inside CloudReasoner via the same `make_provider` the summary uses.
             tracing::info!(target: "reason", "brain backend = cloud; reasoning via the summarizer-provider seam");
-            Box::new(CloudReasoner::new(Arc::new(Mutex::new(config.clone()))))
+            Box::new(CloudReasoner::new(
+                Arc::new(Mutex::new(config.clone())),
+                Arc::clone(heavy),
+            ))
         }
         BrainBackend::Local => local_reasoner(config),
         BrainBackend::Off => {
@@ -642,6 +648,9 @@ pub struct ReasonerCell {
     /// only when the resolved path changes — which also means a model downloaded or selected
     /// mid-session activates on the next call.
     local: Mutex<CachedLocalReasoner>,
+    /// The shared `AppState::heavy_inference` gate, threaded into every [`CloudReasoner`] this
+    /// cell builds — see `crate::perf::run_heavy`'s doc comment.
+    heavy: Arc<tokio::sync::Semaphore>,
     /// TEST-ONLY pinned reasoner (mirrors `CloudReasoner::provider_override`): `Some` makes
     /// `current()` always return this instance, so command tests keep a deterministic stub.
     /// `#[cfg(test)]` makes "no fixed reasoner in production" STRUCTURAL — the field does not
@@ -653,22 +662,26 @@ pub struct ReasonerCell {
 impl ReasonerCell {
     /// Build the live dispatch over the shared config handle. Cheap: nothing is resolved until the
     /// first [`current`](Self::current) call.
-    pub fn new(config: Arc<Mutex<AppConfig>>) -> Self {
+    pub fn new(config: Arc<Mutex<AppConfig>>, heavy: Arc<tokio::sync::Semaphore>) -> Self {
         Self {
             config,
             local: Mutex::new(None),
+            heavy,
             #[cfg(test)]
             fixed: None,
         }
     }
 
     /// TEST-ONLY: pin `current()` to a fixed reasoner instance (the old `Box<StubReasoner>` test
-    /// shape). Production dispatch always goes through [`new`] + live config resolution.
+    /// shape). Production dispatch always goes through [`new`] + live config resolution. `fixed()`
+    /// always short-circuits [`current_for`](Self::current_for) to the pinned reasoner and never
+    /// reaches the `CloudReasoner::for_role` arm, so the `heavy` field just needs SOME valid value.
     #[cfg(test)]
     pub(crate) fn fixed(reasoner: Arc<dyn LocalReasoner>) -> Self {
         Self {
             config: Arc::new(Mutex::new(AppConfig::default())),
             local: Mutex::new(None),
+            heavy: Arc::new(tokio::sync::Semaphore::new(1)),
             fixed: Some(reasoner),
         }
     }
@@ -710,7 +723,11 @@ impl ReasonerCell {
             roles::CONN_AFM => afm::afm_reasoner_arc(&cfg),
             // Cheap per call: the provider (+ consent gate) is built lazily inside, from a fresh
             // config read, so this instance can never pin a stale provider/consent state.
-            _ => Arc::new(CloudReasoner::for_role(Arc::clone(&self.config), role)),
+            _ => Arc::new(CloudReasoner::for_role(
+                Arc::clone(&self.config),
+                role,
+                Arc::clone(&self.heavy),
+            )),
         }
     }
 
@@ -1166,6 +1183,10 @@ pub struct CloudReasoner {
     /// The model ROLE this reasoner serves — `build_provider` resolves the provider FOR THIS ROLE
     /// (with role keys absent that is exactly the legacy default provider, byte-identical).
     role: Role,
+    /// The shared `AppState::heavy_inference` gate, threaded into every provider `build_provider`
+    /// resolves (in particular a `local`-connection role, which reaches `LocalSummarizerProvider`)
+    /// — see `crate::perf::run_heavy`'s doc comment.
+    heavy: Arc<tokio::sync::Semaphore>,
     /// TEST-ONLY injected provider. When `Some`, `build_provider` returns it instead of calling
     /// the factory, so the wiring/parse can be exercised with a mock — NO real Claude/network.
     /// `None` in every production path (the only constructors reachable in release are [`new`] /
@@ -1177,13 +1198,13 @@ impl CloudReasoner {
     /// Build the cloud brain over the shared live config handle for the legacy default role
     /// (Notes — whose fallback is the default provider triple). Cheap + infallible: the provider
     /// (and thus the consent gate) is constructed lazily, per call, from the config AS IT IS THEN.
-    pub fn new(config: Arc<Mutex<AppConfig>>) -> Self {
-        Self::for_role(config, Role::Notes)
+    pub fn new(config: Arc<Mutex<AppConfig>>, heavy: Arc<tokio::sync::Semaphore>) -> Self {
+        Self::for_role(config, Role::Notes, heavy)
     }
 
     /// Build the cloud brain serving `role`. The id names the connection the role RESOLVES to
     /// (`cloud:<connection>`) — under the legacy fallback that is `provider_id`, unchanged.
-    pub fn for_role(config: Arc<Mutex<AppConfig>>, role: Role) -> Self {
+    pub fn for_role(config: Arc<Mutex<AppConfig>>, role: Role, heavy: Arc<tokio::sync::Semaphore>) -> Self {
         let connection = config
             .lock()
             .map(|c| roles::provider_target(role, &c).connection)
@@ -1192,6 +1213,7 @@ impl CloudReasoner {
             id: format!("cloud:{connection}"),
             config,
             role,
+            heavy,
             provider_override: None,
         }
     }
@@ -1199,12 +1221,15 @@ impl CloudReasoner {
     /// TEST-ONLY: build a CloudReasoner that delegates to an injected provider instead of the real
     /// factory, so `reason`/`structured` can be asserted without a network/CLI call. NOT
     /// compiled in non-test builds, so production can never inject a provider that skips the gate.
+    /// `build_provider` always short-circuits to `provider_override` here, so `heavy` just needs
+    /// SOME valid value (never reaches the factory that would consume it).
     #[cfg(test)]
     fn with_provider(config: AppConfig, provider: Arc<dyn SummarizerProvider>) -> Self {
         Self {
             id: format!("cloud:{}", config.provider_id),
             config: Arc::new(Mutex::new(config)),
             role: Role::Notes,
+            heavy: Arc::new(tokio::sync::Semaphore::new(1)),
             provider_override: Some(provider),
         }
     }
@@ -1224,7 +1249,7 @@ impl CloudReasoner {
             .lock()
             .map_err(|_| AppError::Config("config mutex poisoned".into()))?
             .clone();
-        crate::summarize::provider_for(self.role, &cfg)
+        crate::summarize::provider_for(self.role, &cfg, &self.heavy)
     }
 }
 
@@ -1678,7 +1703,7 @@ mod tests {
             brain_model_id: None,
             ..Default::default()
         };
-        assert_eq!(active_reasoner(&cfg).id(), "stub");
+        assert_eq!(active_reasoner(&cfg, &Arc::new(tokio::sync::Semaphore::new(1))).id(), "stub");
     }
 
     // ---- CloudReasoner (the cloud brain) ----------------------------------------------------
@@ -1729,7 +1754,7 @@ mod tests {
             provider_id: "claude_code".to_string(),
             ..Default::default()
         };
-        assert_eq!(CloudReasoner::new(shared(cfg)).id(), "cloud:claude_code");
+        assert_eq!(CloudReasoner::new(shared(cfg), Arc::new(tokio::sync::Semaphore::new(1))).id(), "cloud:claude_code");
     }
 
     #[test]
@@ -1812,7 +1837,7 @@ mod tests {
             cloud_egress_consented: false,
             ..Default::default()
         };
-        let r = CloudReasoner::new(shared(cfg));
+        let r = CloudReasoner::new(shared(cfg), Arc::new(tokio::sync::Semaphore::new(1)));
         match r.reason("s", "u") {
             Err(AppError::Unavailable(_)) => {}
             other => panic!("expected the make_provider consent gate to refuse, got {other:?}"),
@@ -1846,7 +1871,7 @@ mod tests {
     #[test]
     fn cloud_reasoner_sees_consent_granted_after_construction() {
         let cfg = shared(gate_probe_cfg(false));
-        let r = CloudReasoner::new(Arc::clone(&cfg));
+        let r = CloudReasoner::new(Arc::clone(&cfg), Arc::new(tokio::sync::Semaphore::new(1)));
         match r.reason("s", "u") {
             Err(AppError::Unavailable(_)) => {}
             other => panic!("pre-grant call must be refused by the consent gate, got {other:?}"),
@@ -1867,7 +1892,7 @@ mod tests {
     #[test]
     fn cloud_reasoner_refuses_next_call_after_consent_revoked() {
         let cfg = shared(gate_probe_cfg(true));
-        let r = CloudReasoner::new(Arc::clone(&cfg));
+        let r = CloudReasoner::new(Arc::clone(&cfg), Arc::new(tokio::sync::Semaphore::new(1)));
         match r.reason("s", "u") {
             Err(AppError::InvalidArg(_)) => {} // consented: past the gate
             other => panic!("pre-revoke call must pass the consent gate, got {other:?}"),
@@ -1890,7 +1915,7 @@ mod tests {
             brain_backend: BrainBackend::Off,
             ..Default::default()
         });
-        let cell = ReasonerCell::new(Arc::clone(&cfg));
+        let cell = ReasonerCell::new(Arc::clone(&cfg), Arc::new(tokio::sync::Semaphore::new(1)));
         assert_eq!(
             cell.current().id(),
             "stub",
@@ -1920,7 +1945,7 @@ mod tests {
             provider_id: "claude_code".to_string(),
             ..Default::default()
         });
-        let cell = ReasonerCell::new(Arc::clone(&cfg));
+        let cell = ReasonerCell::new(Arc::clone(&cfg), Arc::new(tokio::sync::Semaphore::new(1)));
         assert_eq!(cell.current().id(), "cloud:claude_code");
 
         cfg.lock().unwrap().provider_id = "anthropic".to_string();
@@ -1947,7 +1972,7 @@ mod tests {
             brain_model_id: None,
             ..Default::default()
         });
-        let cell = ReasonerCell::new(Arc::clone(&cfg));
+        let cell = ReasonerCell::new(Arc::clone(&cfg), Arc::new(tokio::sync::Semaphore::new(1)));
         let a = cell.current();
         let b = cell.current();
         assert_eq!(
@@ -1997,7 +2022,7 @@ mod tests {
                 brain_model_id: None,
                 ..Default::default()
             });
-            let cell = ReasonerCell::new(Arc::clone(&cfg));
+            let cell = ReasonerCell::new(Arc::clone(&cfg), Arc::new(tokio::sync::Semaphore::new(1)));
             let legacy = cell.current().id().to_string();
             for role in [Role::Notes, Role::Ask, Role::Live] {
                 assert_eq!(
@@ -2024,7 +2049,7 @@ mod tests {
             role_ask_connection: "off".to_string(),
             ..Default::default()
         });
-        let cell = ReasonerCell::new(Arc::clone(&cfg));
+        let cell = ReasonerCell::new(Arc::clone(&cfg), Arc::new(tokio::sync::Semaphore::new(1)));
         assert_eq!(
             cell.current_for(Role::Ask).id(),
             "stub",
@@ -2048,7 +2073,7 @@ mod tests {
             role_ask_connection: "anthropic".to_string(),
             ..Default::default()
         };
-        let r = CloudReasoner::for_role(shared(cfg), Role::Ask);
+        let r = CloudReasoner::for_role(shared(cfg), Role::Ask, Arc::new(tokio::sync::Semaphore::new(1)));
         assert_eq!(r.id(), "cloud:anthropic");
     }
 
@@ -2064,7 +2089,7 @@ mod tests {
             cloud_egress_consented: false,
             ..Default::default()
         });
-        let r = CloudReasoner::for_role(Arc::clone(&cfg), Role::Live);
+        let r = CloudReasoner::for_role(Arc::clone(&cfg), Role::Live, Arc::new(tokio::sync::Semaphore::new(1)));
         match r.reason("s", "u") {
             Err(AppError::Unavailable(_)) => {}
             other => panic!("role-keyed cloud call must be consent-gated, got {other:?}"),
@@ -2100,7 +2125,7 @@ mod tests {
             provider_id: "claude_code".to_string(),
             ..Default::default()
         };
-        assert_eq!(active_reasoner(&cfg).id(), "cloud:claude_code");
+        assert_eq!(active_reasoner(&cfg, &Arc::new(tokio::sync::Semaphore::new(1))).id(), "cloud:claude_code");
     }
 
     #[test]
@@ -2109,7 +2134,7 @@ mod tests {
             brain_backend: BrainBackend::Off,
             ..Default::default()
         };
-        assert_eq!(active_reasoner(&cfg).id(), "stub");
+        assert_eq!(active_reasoner(&cfg, &Arc::new(tokio::sync::Semaphore::new(1))).id(), "stub");
     }
 
     #[test]
@@ -2127,13 +2152,13 @@ mod tests {
             brain_model_id: None,
             ..Default::default()
         };
-        assert_eq!(active_reasoner(&cfg).id(), "stub");
+        assert_eq!(active_reasoner(&cfg, &Arc::new(tokio::sync::Semaphore::new(1))).id(), "stub");
     }
 
     /// Default config (the user's choice) selects the Cloud brain.
     #[test]
     fn active_reasoner_default_is_cloud() {
-        let id = active_reasoner(&AppConfig::default()).id().to_string();
+        let id = active_reasoner(&AppConfig::default(), &Arc::new(tokio::sync::Semaphore::new(1))).id().to_string();
         assert!(
             id.starts_with("cloud:"),
             "default brain must be cloud, got {id}"
@@ -2156,7 +2181,7 @@ mod tests {
             brain_backend: BrainBackend::AppleFoundation,
             ..Default::default()
         };
-        assert_eq!(active_reasoner(&cfg).id(), "stub");
+        assert_eq!(active_reasoner(&cfg, &Arc::new(tokio::sync::Semaphore::new(1))).id(), "stub");
     }
 
     /// ANTI-EGRESS ORDERING regression (the load-bearing `CONN_AFM`-before-`_` arm): a mid-session
@@ -2175,7 +2200,7 @@ mod tests {
             brain_backend: BrainBackend::Off,
             ..Default::default()
         });
-        let cell = ReasonerCell::new(Arc::clone(&cfg));
+        let cell = ReasonerCell::new(Arc::clone(&cfg), Arc::new(tokio::sync::Semaphore::new(1)));
         assert_eq!(cell.current().id(), "stub", "Off dispatches the stub");
 
         cfg.lock().unwrap().brain_backend = BrainBackend::AppleFoundation;
@@ -2216,7 +2241,7 @@ mod tests {
             // default class ids (qwen3-1.7b / qwen3-4b-instruct-2507) — absent on disk in CI ⇒ stub.
             ..Default::default()
         });
-        let cell = ReasonerCell::new(Arc::clone(&cfg));
+        let cell = ReasonerCell::new(Arc::clone(&cfg), Arc::new(tokio::sync::Semaphore::new(1)));
         for id in [cell.light().id().to_string(), cell.heavy().id().to_string()] {
             assert!(
                 id == "stub" || id.starts_with("sidecar:"),
@@ -2240,7 +2265,7 @@ mod tests {
             ..Default::default()
         });
         assert!(
-            ReasonerCell::new(off).extraction_reasoner().id().starts_with("cloud:"),
+            ReasonerCell::new(off, Arc::new(tokio::sync::Semaphore::new(1))).extraction_reasoner().id().starts_with("cloud:"),
             "Brain Live OFF keeps the legacy cloud Notes extraction"
         );
         // ON ⇒ the local light engine (local-or-stub), never cloud — even with cloud consent.
@@ -2250,7 +2275,7 @@ mod tests {
             cloud_egress_consented: true,
             ..Default::default()
         });
-        let id = ReasonerCell::new(on).extraction_reasoner().id().to_string();
+        let id = ReasonerCell::new(on, Arc::new(tokio::sync::Semaphore::new(1))).extraction_reasoner().id().to_string();
         assert!(
             !id.starts_with("cloud:"),
             "Brain Live ON must route fact extraction LOCAL, never cloud (got {id})"
