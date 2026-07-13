@@ -884,7 +884,7 @@ fn resolve_summarize_egress(
             .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
         guard.clone()
     };
-    let provider = provider_for(Role::Notes, &config)?;
+    let provider = provider_for(Role::Notes, &config, &state.heavy_inference)?;
     Ok((config, provider))
 }
 
@@ -2004,7 +2004,7 @@ mod tests {
         // THE LEAK the fix closes (kept as the RED half): the stale Stop-time snapshot sails
         // PAST the gate — `InvalidArg` is the factory rejecting the bogus id, proving a real
         // provider id would have been built and egressed.
-        match provider_for(Role::Notes, &stop_snapshot) {
+        match provider_for(Role::Notes, &stop_snapshot, &state.heavy_inference) {
             Err(AppError::InvalidArg(_)) => {}
             Err(other) => panic!("stale snapshot should pass the gate (the leak), got {other:?}"),
             Ok(_) => panic!("bogus provider id must not construct"),
