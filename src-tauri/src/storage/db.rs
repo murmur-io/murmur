@@ -2026,13 +2026,22 @@ impl Db {
         .map_err(map_err)
     }
 
-    /// Every UPLOADED (live-on-server) org share anchored to a given source (`meeting_id` XOR
+    /// Every LIVE-OR-STUCK-LIVE org share anchored to a given source (`meeting_id` XOR
     /// `document_id`). Powers the re-publish-on-edit fix: one logical note may be shared into SEVERAL
-    /// orgs, so this returns rows ACROSS ALL of them (never restricted to the first). Only `uploaded`
-    /// rows are returned — a still-`queued`/`failed` row has no live server item to supersede yet (the
-    /// launch sweep publishes the current plaintext for it), and a `revoked`/`revoke_pending` share was
-    /// intentionally torn down (an edit must not resurrect it). Exactly one of `meeting_id`/`document_id`
-    /// must be `Some`; both-`None` returns an empty vec (no source ⇒ nothing to republish).
+    /// orgs, so this returns rows ACROSS ALL of them (never restricted to the first). Returns `uploaded`
+    /// rows AND `failed` rows that still carry a non-null `item_id` — the latter is a row whose MOST
+    /// RECENT republish attempt failed transiently (network blip during OCK acquire / seal / blob
+    /// upload / item publish) but whose PRIOR publish is still genuinely live on the server:
+    /// `set_org_share_failed` deliberately does not clear `item_id` on a republish failure (only the
+    /// SUCCESS path's `reset_org_share_for_retry` does), so such a row represents a live item whose
+    /// latest edit hasn't synced yet — not a dead row. Excluding it here (the pre-fix behavior) made it
+    /// permanently invisible to every caller keyed off this function (the edit-save republish path, the
+    /// re-share-block check, the Library share badge), so it could never self-heal and a manual re-share
+    /// would mint a genuine duplicate item. A `queued`/never-published `failed` row (no `item_id`, no
+    /// live server item to supersede yet — the launch sweep publishes the current plaintext for it) and
+    /// a `revoked`/`revoke_pending` share (intentionally torn down; an edit must not resurrect it) are
+    /// still excluded. Exactly one of `meeting_id`/`document_id` must be `Some`; both-`None` returns an
+    /// empty vec (no source ⇒ nothing to republish).
     pub fn org_shares_for_source(
         &self,
         meeting_id: Option<&str>,
@@ -2045,7 +2054,7 @@ impl Db {
         let mut stmt = conn
             .prepare(&format!(
                 "SELECT {} FROM org_shares
-                   WHERE state = 'uploaded'
+                   WHERE (state = 'uploaded' OR (state = 'failed' AND item_id IS NOT NULL))
                      AND ((?1 IS NOT NULL AND meeting_id = ?1)
                        OR (?2 IS NOT NULL AND document_id = ?2))
                    ORDER BY created_at ASC",
@@ -11120,6 +11129,49 @@ mod tests {
         assert_eq!(mrows.len(), 1);
         assert_eq!(mrows[0].meeting_id.as_deref(), Some("m1"));
         assert!(db.org_shares_for_source(None, None).unwrap().is_empty());
+    }
+
+    /// STUCK-REPUBLISH FIX: `org_shares_for_source` also surfaces a `failed` row that still carries a
+    /// non-null `item_id` — the exact shape `set_org_share_failed` produces when a REPUBLISH (not the
+    /// initial publish) fails transiently, since that function never clears `item_id` (only the success
+    /// path's `reset_org_share_for_retry` does). Such a row's OLD item is still genuinely live on the
+    /// server, so it must stay visible (not silently excluded forever). A `failed` row that never
+    /// published at all (`item_id` still NULL, e.g. the initial publish itself failed) must stay
+    /// EXCLUDED — there is no live item to supersede yet; the launch sweep's fresh-share retry handles
+    /// that case instead.
+    #[test]
+    fn org_shares_for_source_includes_failed_rows_with_a_live_item_id() {
+        let db = mem_db();
+        let now = "2026-07-12T00:00:00Z";
+
+        // Row f1: published once (item-f1), THEN a republish attempt failed — mirrors the real sequence
+        // (insert → uploaded → failed-on-republish). `item_id` stays set (set_org_share_failed doesn't
+        // touch it).
+        db.insert_org_share("f1", "org-1", None, Some("d-stuck"), "note", Some("T"), 1, 1, &sha32(1), now)
+            .unwrap();
+        db.set_org_share_uploaded("f1", "item-f1", now).unwrap();
+        db.set_org_share_failed("f1", "republish_upload_failed", now).unwrap();
+
+        // Row f2: NEVER successfully published — failed before ever getting an item_id. Must stay
+        // excluded (no live server item to supersede).
+        db.insert_org_share("f2", "org-2", None, Some("d-never-live"), "note", Some("T"), 1, 1, &sha32(2), now)
+            .unwrap();
+        db.set_org_share_failed("f2", "publish_failed", now).unwrap();
+
+        let stuck_rows = db.org_shares_for_source(None, Some("d-stuck")).unwrap();
+        assert_eq!(
+            stuck_rows.len(),
+            1,
+            "a failed-with-item_id row (stuck republish) IS returned"
+        );
+        assert_eq!(stuck_rows[0].state, "failed");
+        assert_eq!(stuck_rows[0].item_id.as_deref(), Some("item-f1"));
+
+        let never_live_rows = db.org_shares_for_source(None, Some("d-never-live")).unwrap();
+        assert!(
+            never_live_rows.is_empty(),
+            "a failed row that never published (item_id NULL) stays excluded"
+        );
     }
 
     /// `uploaded_org_shares_for_source_in_org` is (org, source)-SCOPED and OLDEST-FIRST: only the
