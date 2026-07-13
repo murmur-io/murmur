@@ -99,6 +99,7 @@
          narrow, so a chip pick would have no visible effect there. -->
     @if (!hasQuery() && (orgs().length > 0 || orgsLoading())) {
       <div class="org-chip-row" role="group" aria-label="Shared brains">
+        <span class="org-chip-row-label text-muted">Shared brains</span>
         @for (org of orgs(); track org.orgId) {
           <button
             type="button"
@@ -122,7 +123,6 @@
               />
             </svg>
             {{ org.name }}
-            <span class="pill org-role" [title]="orgRoleLabel(org)">{{ orgRoleLabel(org) }}</span>
           </button>
         }
         @if (orgsLoading()) {
