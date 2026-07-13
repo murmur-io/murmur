@@ -231,30 +231,41 @@ impl Embedder for CandleBertEmbedder {
         let flat_ids: Vec<u32> = id_rows.into_iter().flatten().collect();
         let flat_mask: Vec<u32> = mask_rows.iter().flatten().copied().collect();
 
-        let input_ids = Tensor::from_vec(flat_ids, (batch, max_len), device)
-            .map_err(|e| AppError::Storage(format!("embed input tensor: {e}")))?;
-        let attention_mask = Tensor::from_vec(flat_mask.clone(), (batch, max_len), device)
-            .map_err(|e| AppError::Storage(format!("embed mask tensor: {e}")))?;
-        let token_type_ids = input_ids
-            .zeros_like()
-            .map_err(|e| AppError::Storage(format!("embed token-type tensor: {e}")))?;
+        // Metal's command buffers/encoders are Objective-C objects the Metal framework
+        // autoreleases internally; without an explicit pool, they only drain on the NEXT
+        // top-level pool pop (e.g. the WKWebView's run-loop pool), so repeated forward passes on
+        // a background thread with no run loop can accumulate autoreleased Metal objects for the
+        // life of the thread. Wrapping the whole tensor-build → forward → extract sequence closes
+        // this window per call — belt-and-suspenders alongside the known, still-open candle Metal
+        // leak (huggingface/candle#2271) this embedder is otherwise exposed to. `objc2` is already
+        // a workspace dependency (objc2-app-kit/-core-foundation/-core-audio), so this is a
+        // zero-new-crate fix.
+        let out: Vec<Vec<f32>> = objc2::rc::autoreleasepool(|_pool| -> Result<Vec<Vec<f32>>> {
+            let input_ids = Tensor::from_vec(flat_ids, (batch, max_len), device)
+                .map_err(|e| AppError::Storage(format!("embed input tensor: {e}")))?;
+            let attention_mask = Tensor::from_vec(flat_mask.clone(), (batch, max_len), device)
+                .map_err(|e| AppError::Storage(format!("embed mask tensor: {e}")))?;
+            let token_type_ids = input_ids
+                .zeros_like()
+                .map_err(|e| AppError::Storage(format!("embed token-type tensor: {e}")))?;
 
-        // [batch, seq, hidden]
-        let sequence = loaded
-            .model
-            .forward(&input_ids, &token_type_ids, Some(&attention_mask))
-            .map_err(|e| AppError::Storage(format!("embed forward failed: {e}")))?;
+            // [batch, seq, hidden]
+            let sequence = loaded
+                .model
+                .forward(&input_ids, &token_type_ids, Some(&attention_mask))
+                .map_err(|e| AppError::Storage(format!("embed forward failed: {e}")))?;
 
-        // MEAN-POOL over tokens with the attention mask (e5 requires mean-pooling, NOT the CLS token),
-        // then L2-normalize each row.
-        let pooled = mean_pool(&sequence, &attention_mask)
-            .map_err(|e| AppError::Storage(format!("embed mean-pool failed: {e}")))?;
-        let normed = l2_normalize(&pooled)
-            .map_err(|e| AppError::Storage(format!("embed normalize failed: {e}")))?;
+            // MEAN-POOL over tokens with the attention mask (e5 requires mean-pooling, NOT the CLS
+            // token), then L2-normalize each row.
+            let pooled = mean_pool(&sequence, &attention_mask)
+                .map_err(|e| AppError::Storage(format!("embed mean-pool failed: {e}")))?;
+            let normed = l2_normalize(&pooled)
+                .map_err(|e| AppError::Storage(format!("embed normalize failed: {e}")))?;
 
-        let out: Vec<Vec<f32>> = normed
-            .to_vec2::<f32>()
-            .map_err(|e| AppError::Storage(format!("embed extract vectors: {e}")))?;
+            normed
+                .to_vec2::<f32>()
+                .map_err(|e| AppError::Storage(format!("embed extract vectors: {e}")))
+        })?;
 
         // Width contract: every vector MUST be EMBED_DIM (the vec0 column width).
         for v in &out {

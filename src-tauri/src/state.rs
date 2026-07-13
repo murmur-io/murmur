@@ -269,6 +269,18 @@ pub struct AppState {
     /// resurrecting just-sealed content into a rollup (the pass-vs-seal TOCTOU). Content-free
     /// (a bare counter) — no PII, nothing to seal.
     pub seal_epoch: AtomicU64,
+    /// 2026-07-13 — GLOBAL "one heavy inference at a time" gate. A single permit shared across
+    /// every native-runtime call site that loads/runs a heavy ML model (whisper ASR, the
+    /// diarizer, the Candle embedder/NER, the brain sidecar dispatch). `spawn_blocking` alone gets
+    /// CPU-bound native work off the async runtime but is NOT a concurrency limiter — nothing
+    /// stops N heavy calls from landing on the blocking pool simultaneously and fighting each
+    /// other for the same RAM/Metal context (the exact mechanism behind the whisper/diarizer
+    /// co-residency bug fixed this session, generalized: per-call-site RAM checks alone can't
+    /// close the TOCTOU window between "checked headroom" and "actually allocated peak" the way a
+    /// semaphore does by construction). Acquire via [`crate::perf::run_heavy`] — do not bypass by
+    /// calling `spawn_blocking` directly for a heavy native call (same "one shared chokepoint"
+    /// discipline as `meeting_is_unlocked` for content reads).
+    pub heavy_inference: Arc<tokio::sync::Semaphore>,
 }
 
 impl AppState {
@@ -356,6 +368,7 @@ impl AppState {
             share_refresh_lock: tokio::sync::Mutex::new(()),
             lifecycle: Mutex::new(()),
             seal_epoch: AtomicU64::new(0),
+            heavy_inference: Arc::new(tokio::sync::Semaphore::new(1)),
         })
     }
 
