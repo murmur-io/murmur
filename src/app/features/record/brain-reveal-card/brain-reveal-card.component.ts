@@ -102,8 +102,11 @@ export class BrainRevealCardComponent {
 
   private async fetch(): Promise<void> {
     try {
-      const rows = await this.ipc.listPeople();
-      this._peopleCount.set(rows.length);
+      const { people: rows, totalVisiblePeople } = await this.ipc.listPeople();
+      // Use the TRUE visible-person count (not `rows.length`, which the backend's 500-row
+      // render cap can trim below it) so this "Murmur mapped N people" reveal never
+      // understates on a large vault.
+      this._peopleCount.set(totalVisiblePeople);
       this._commitmentCount.set(
         rows.reduce((n, p) => n + p.openCommitmentCount, 0),
       );
