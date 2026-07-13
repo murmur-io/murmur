@@ -125,6 +125,34 @@ fn chunk_hash(text: &str) -> u64 {
     h
 }
 
+/// Embed a batch of augmented chunk texts in small sub-batches instead of ONE call sized to the
+/// whole meeting/document/topic list. A long meeting or document can produce dozens of chunks
+/// (topic chunks merge to a 60s floor — a 1h+ recording can have 40-60; transcript chunks target
+/// ~1000 chars each — a 1h+ recording's transcript alone can produce a comparable or larger
+/// count), and `CandleBertEmbedder::embed` builds ONE rectangular Candle/Metal tensor per call
+/// sized to the whole input batch — so without this, one long meeting/document still drives an
+/// unbounded-size Metal burst regardless of any caller-side "how many ITEMS per run" cap
+/// (2026-07-13: the launch-freeze fix for topic chunks; the identical gap in transcript/note
+/// chunk indexing — the far more common path, since it runs on every recording Stop, not just
+/// the startup catch-up — is closed here too, both callers now sharing this one helper).
+fn embed_in_sub_batches(embedder: &dyn Embedder, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+    const SUB_BATCH: usize = 8;
+    if texts.is_empty() {
+        return Ok(Vec::new());
+    }
+    if texts.len() <= SUB_BATCH {
+        return embedder.embed_passage(texts);
+    }
+    let mut vectors = Vec::with_capacity(texts.len());
+    for (i, sub_batch) in texts.chunks(SUB_BATCH).enumerate() {
+        if i > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
+        vectors.extend(embedder.embed_passage(sub_batch)?);
+    }
+    Ok(vectors)
+}
+
 fn register_vec_extension() {
     use std::sync::Once;
     static REGISTER: Once = Once::new();
@@ -3273,16 +3301,8 @@ impl Db {
         // Chunks are passages → e5 `passage:` prefix convention. The stub ignores the prefix; the real
         // CandleBertEmbedder needs it for retrieval recall. Embed each class only when non-empty —
         // on the AUGMENTED text (L1.2: the situating header rides the embedding AND the FTS legs).
-        let note_vectors = if note_aug.is_empty() {
-            Vec::new()
-        } else {
-            embedder.embed_passage(&note_aug)?
-        };
-        let transcript_vectors = if transcript_aug.is_empty() {
-            Vec::new()
-        } else {
-            embedder.embed_passage(&transcript_aug)?
-        };
+        let note_vectors = embed_in_sub_batches(embedder, &note_aug)?;
+        let transcript_vectors = embed_in_sub_batches(embedder, &transcript_aug)?;
 
         // Always purge this meeting's prior rows first (clean replace of BOTH classes), then insert the
         // fresh set in ONE transaction.
@@ -3528,29 +3548,14 @@ impl Db {
             }
         }
 
-        // Embed in small sub-batches rather than one call for the WHOLE meeting. Topic chunks are
-        // merged to >= TOPIC_MERGE_MIN_DURATION_S (60s), so a single long meeting (a 1h+ recording
-        // can easily produce 40-60 chunks) would otherwise build ONE rectangular Candle/Metal tensor
-        // sized (chunk_count, longest_chunk_tokens) in one blocking forward pass — a burst whose size
-        // scales with that ONE meeting's length, untouched by the per-run meeting-count cap above
-        // (2026-07-13: a reported launch freeze persisted after that cap because the freezing vault
-        // had a 1h+ recording — the cap bounds how many MEETINGS get re-embedded per run, not how
-        // much work one meeting's own embed call does).
-        const TOPIC_EMBED_SUB_BATCH: usize = 8;
-        let vectors = if augs.is_empty() {
-            Vec::new()
-        } else if augs.len() <= TOPIC_EMBED_SUB_BATCH {
-            embedder.embed_passage(&augs)?
-        } else {
-            let mut vectors = Vec::with_capacity(augs.len());
-            for (i, sub_batch) in augs.chunks(TOPIC_EMBED_SUB_BATCH).enumerate() {
-                if i > 0 {
-                    std::thread::sleep(std::time::Duration::from_millis(30));
-                }
-                vectors.extend(embedder.embed_passage(sub_batch)?);
-            }
-            vectors
-        };
+        // Embed in small sub-batches rather than one call for the WHOLE meeting — see
+        // `embed_in_sub_batches`'s doc comment. Topic chunks merge to >= TOPIC_MERGE_MIN_DURATION_S
+        // (60s), so a single long meeting (a 1h+ recording can easily produce 40-60 chunks) would
+        // otherwise build ONE rectangular Candle/Metal tensor sized (chunk_count,
+        // longest_chunk_tokens) in one blocking forward pass, untouched by the per-run
+        // meeting-count cap above (2026-07-13: a reported launch freeze persisted after that cap
+        // because the freezing vault had a 1h+ recording).
+        let vectors = embed_in_sub_batches(embedder, &augs)?;
 
         // PURGE-then-INSERT this meeting's topic rows in ONE transaction (clean replace).
         let mut conn = self.lock();
@@ -15080,7 +15085,7 @@ mod tests {
     /// call sized to the whole meeting — that burst scales with ONE meeting's length and is
     /// untouched by the per-run meeting-count cap (a freshly-Brain-enabled vault containing a long
     /// recording kept freezing on launch even after that cap shipped). Proves the embed calls are
-    /// sub-batched to TOPIC_EMBED_SUB_BATCH (8) at a time.
+    /// sub-batched (via the shared `embed_in_sub_batches` helper) 8 at a time.
     #[test]
     fn long_meeting_topic_chunks_are_embedded_in_small_sub_batches() {
         let db = mem_db();
@@ -15124,6 +15129,60 @@ mod tests {
         assert!(
             calls.len() > 1,
             "10 chunks over an 8-per-batch cap must take more than one embed call, got: {calls:?}"
+        );
+    }
+
+    /// 2026-07-13 launch-freeze fix (round 3): `index_meeting_chunks` (the REGULAR transcript/note
+    /// indexer, run on every meeting Stop — not just the startup catch-up) had the identical
+    /// unbounded-single-call bug as the topic-chunk indexer above. A long transcript (~1000
+    /// chars/chunk target) from a 1h+ recording can produce dozens of chunks; this proves BOTH the
+    /// note and transcript embed calls now share `embed_in_sub_batches` too.
+    #[test]
+    fn long_transcript_chunks_are_embedded_in_small_sub_batches() {
+        let db = mem_db();
+        db.insert_meeting(&sample_meeting("m-long-transcript", "2026-06-24T10:00:00Z"))
+            .unwrap();
+        // 20 segments alternating speaker (chunk_transcript's turn-grouping only breaks a turn on
+        // a SPEAKER CHANGE, not a time gap — same-speaker segments merge into one turn and "a
+        // single oversized turn becomes its own chunk, never split mid-turn", so a same-speaker
+        // fixture would collapse to ONE chunk regardless of length). Alternating speakers forces
+        // 20 distinct turns totaling well over TRANSCRIPT_CHUNK_CHAR_TARGET(1000) x 8 chars, so
+        // the sliding window packs them into well more than 8 chunks.
+        let mut segs = Vec::new();
+        for i in 0..20i64 {
+            let body = format!("segment number {i} discusses a distinct agenda topic in detail. ")
+                .repeat(10);
+            let speaker = if i % 2 == 0 { "me" } else { "others" };
+            segs.push(Segment {
+                idx: i,
+                start_s: i as f64 * 20.0,
+                end_s: i as f64 * 20.0 + 18.0,
+                text: body,
+                speaker: Some(speaker.into()),
+                confidence: None,
+            });
+        }
+        db.insert_segments("m-long-transcript", &segs).unwrap();
+
+        let embedder = RecordingEmbedder {
+            call_sizes: std::sync::Mutex::new(Vec::new()),
+        };
+        db.index_meeting_chunks("m-long-transcript", &segs, &embedder)
+            .unwrap();
+
+        let calls = embedder.call_sizes.into_inner().unwrap();
+        assert!(
+            calls.iter().all(|&n| n <= 8),
+            "no single embed call may exceed the sub-batch size, got call sizes: {calls:?}"
+        );
+        assert!(
+            calls.len() > 1,
+            "a long transcript must take more than one embed call, got: {calls:?}"
+        );
+        assert_eq!(
+            chunk_count(&db, "m-long-transcript"),
+            calls.iter().sum::<usize>() as i64,
+            "every produced chunk (note + transcript classes) must be embedded exactly once across the sub-batches"
         );
     }
 
