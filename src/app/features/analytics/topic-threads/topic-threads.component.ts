@@ -7,7 +7,7 @@ import {
 } from "@angular/core";
 import { RouterLink } from "@angular/router";
 import { IpcService } from "../../../core/ipc.service";
-import type { TopicThread } from "../../../core/models";
+import { TopicThreadsStore } from "../../../services/topic-threads-store.service";
 
 /**
  * "Topic threads" — cross-meeting topic clusters surfaced on the Analytics
@@ -34,13 +34,19 @@ import type { TopicThread } from "../../../core/models";
 })
 export class TopicThreadsComponent implements OnInit {
   private readonly ipc = inject(IpcService);
+  private readonly store = inject(TopicThreadsStore);
 
-  /** All loaded threads, sorted multi-mention first (most-discussed topics up top). */
-  readonly threads = signal<TopicThread[]>([]);
+  /**
+   * All loaded threads, sorted multi-mention first (most-discussed topics up
+   * top). Root-persisted so a navigate-away-and-back shows the LAST-KNOWN
+   * threads instantly instead of blanking to "Loading…" — see
+   * `TopicThreadsStore`.
+   */
+  readonly threads = this.store.threads;
   /** True while {@link IpcService.topicThreads} is in flight. */
-  readonly loading = signal(true);
+  readonly loading = this.store.loading;
   /** Inline error message; null when clear. */
-  readonly error = signal<string | null>(null);
+  readonly error = this.store.error;
 
   /** Labels of the currently-expanded threads. */
   private readonly openLabels = signal<ReadonlySet<string>>(new Set());

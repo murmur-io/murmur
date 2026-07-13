@@ -4,10 +4,9 @@ import {
   OnInit,
   computed,
   inject,
-  signal,
 } from "@angular/core";
 import { IpcService } from "../../../core/ipc.service";
-import type { Analytics } from "../../../core/models";
+import { AnalyticsStore } from "../../../services/analytics-store.service";
 import { EgressLedgerComponent } from "../egress-ledger/egress-ledger.component";
 import { TopicThreadsComponent } from "../topic-threads/topic-threads.component";
 import { WeeklyDigestComponent } from "../weekly-digest/weekly-digest.component";
@@ -53,9 +52,14 @@ const STATUS_ORDER = [
 })
 export class AnalyticsComponent implements OnInit {
   private readonly ipc = inject(IpcService);
+  private readonly store = inject(AnalyticsStore);
 
-  readonly data = signal<Analytics | null>(null);
-  readonly loading = signal(true);
+  /**
+   * Root-persisted so a navigate-away-and-back shows the LAST-KNOWN numbers
+   * instantly instead of blanking to "Loading…" — see `AnalyticsStore`.
+   */
+  readonly data = this.store.data;
+  readonly loading = this.store.loading;
 
   readonly isEmpty = computed(() => {
     const a = this.data();

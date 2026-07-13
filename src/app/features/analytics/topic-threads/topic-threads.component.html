@@ -6,7 +6,7 @@
     }
   </div>
 
-  @if (loading()) {
+  @if (threads().length === 0 && loading()) {
     <p class="empty">Loading…</p>
   } @else if (error()) {
     <div class="banner is-danger" role="alert">{{ error() }}</div>

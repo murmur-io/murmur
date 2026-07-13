@@ -4,10 +4,9 @@ import {
   computed,
   effect,
   inject,
-  signal,
 } from "@angular/core";
 import { IpcService } from "../../../core/ipc.service";
-import type { EgressLedger } from "../../../core/models";
+import { EgressLedgerStore } from "../../../services/egress-ledger-store.service";
 
 /** Selectable rolling-window lengths (in days). */
 const RANGES = [7, 30, 90] as const;
@@ -30,18 +29,24 @@ type Range = (typeof RANGES)[number];
 })
 export class EgressLedgerComponent {
   private readonly ipc = inject(IpcService);
+  private readonly store = inject(EgressLedgerStore);
 
   readonly ranges = RANGES;
 
-  /** The selected rolling window. Writing this signal re-triggers the load effect. */
-  readonly days = signal<Range>(30);
+  /**
+   * The selected rolling window. Writing this signal re-triggers the load
+   * effect. Root-persisted (see `EgressLedgerStore`) so a navigate-away-and
+   * -back keeps both the chosen window AND the last-known ledger instead of
+   * resetting to 30d + blanking to "Loading…".
+   */
+  readonly days = this.store.days;
 
-  private readonly _ledger = signal<EgressLedger | null>(null);
+  private readonly _ledger = this.store.ledger;
   /** The loaded ledger (null while loading or on error). */
   readonly ledger = this._ledger.asReadonly();
 
-  readonly loading = signal(false);
-  readonly error = signal<string | null>(null);
+  readonly loading = this.store.loading;
+  readonly error = this.store.error;
 
   /**
    * Per-model bars with their width % precomputed (denominator = the max model's tokens).
@@ -87,6 +92,17 @@ export class EgressLedgerComponent {
     return r.email + r.card + r.phone + r.name;
   });
 
+  /**
+   * The window this effect last fetched for, or `undefined` before the
+   * first run. NOT a signal — it's private bookkeeping the effect itself
+   * reads/writes to distinguish "the user just switched 7↔30↔90" (clear the
+   * stale bars before refetching) from "this component instance just
+   * (re)mounted onto an already-populated `EgressLedgerStore`" (keep the
+   * cached ledger on screen while the background refetch runs — the
+   * stale-while-revalidate contract in `angular-zoneless.md` §8).
+   */
+  private lastFetchedDays: Range | undefined;
+
   // This effect writes `loading` / `error` / `_ledger` (all signals) before and
   // after the async IPC call — signal writes in effects are allowed since Angular 19.
   private readonly _load = effect(
@@ -94,9 +110,18 @@ export class EgressLedgerComponent {
       const d = this.days();
       this.loading.set(true);
       this.error.set(null);
-      // Clear the previous window's data so the loading state doesn't render stale bars
-      // alongside the spinner during the refetch (clean transition on 7↔30↔90 toggles).
-      this._ledger.set(null);
+      // Clear the previous window's data on a REAL window switch, so the
+      // loading state doesn't render stale bars from a different window
+      // alongside the spinner (clean transition on 7↔30↔90 toggles) — but
+      // NOT on the effect's first run for this instance, so a cached ledger
+      // from a prior mount (same window) stays visible during the refetch.
+      if (
+        this.lastFetchedDays !== undefined &&
+        this.lastFetchedDays !== d
+      ) {
+        this._ledger.set(null);
+      }
+      this.lastFetchedDays = d;
       void this.fetch(d);
     },
   );
