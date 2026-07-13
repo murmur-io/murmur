@@ -8296,6 +8296,12 @@ impl Db {
     pub fn list_entities_visible(&self, unlocked: &HashSet<String>) -> Result<Vec<GraphNode>> {
         let conn = self.lock();
         let visible = visibility_clause("n", unlocked);
+        // 2026-07-13 perf audit (MODERATE): this fed BOTH get_graph's node list and list_people
+        // with NO limit, unlike the sibling graph_edges_visible (MAX_GRAPH_EDGES=600, added for
+        // the same reason — see its own comment). Visibility is already enforced in WHERE; a
+        // trailing LIMIT trims magnitude only, ordered by mention count so the most-relevant
+        // entities/people survive the cut on a vault with many.
+        const MAX_VISIBLE_ENTITIES: usize = 500;
         let sql = format!(
             "SELECT e.id, e.name, e.kind, COUNT(em.meeting_id) AS cnt
                FROM entities e
@@ -8311,7 +8317,8 @@ impl Db {
                     )
               GROUP BY e.id, e.name, e.kind
              HAVING cnt > 0
-              ORDER BY cnt DESC, e.name COLLATE NOCASE ASC"
+              ORDER BY cnt DESC, e.name COLLATE NOCASE ASC
+              LIMIT {MAX_VISIBLE_ENTITIES}"
         );
         let mut stmt = conn.prepare(&sql).map_err(map_err)?;
         let rows = stmt
