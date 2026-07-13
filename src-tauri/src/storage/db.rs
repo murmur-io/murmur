@@ -6344,31 +6344,64 @@ impl Db {
 
     // ── analytics ──────────────────────────────────────────────────────────────
 
-    /// Aggregate stats for the dashboard + Analytics tab.
-    pub fn analytics(&self) -> Result<Analytics> {
+    /// Aggregate stats for the dashboard + Analytics tab. VISIBLE-content only: mirrors the
+    /// `list_meetings_visible`/`brain_counts` predicate (a meeting counts iff it has no notes at
+    /// all, or at least one note whose folder is open/session-unlocked) so a sealed-and-not-
+    /// unlocked folder's meetings never contribute to totals/durations/status-breakdown/per-day
+    /// activity — the same leak class `visibility_clause` closes for search/graph/brain reads.
+    pub fn analytics(&self, unlocked: &HashSet<String>) -> Result<Analytics> {
         let conn = self.lock();
+        let visible = visibility_clause("n", unlocked);
+        // "meeting m is visible" = no notes at all, OR at least one visible note — reused below.
+        let visible_meeting = format!(
+            "(NOT EXISTS (SELECT 1 FROM notes nn WHERE nn.meeting_id = m.id)
+                 OR EXISTS (SELECT 1 FROM notes n
+                              LEFT JOIN folders f ON f.id = n.folder_id
+                             WHERE n.meeting_id = m.id AND {visible}))"
+        );
+
         let total_meetings: i64 = conn
-            .query_row("SELECT COUNT(*) FROM meetings", [], |r| r.get(0))
+            .query_row(
+                &format!("SELECT COUNT(*) FROM meetings m WHERE {visible_meeting}"),
+                [],
+                |r| r.get(0),
+            )
             .map_err(map_err)?;
         let total_duration_s: i64 = conn
             .query_row(
-                "SELECT COALESCE(SUM(duration_s), 0) FROM meetings",
+                &format!(
+                    "SELECT COALESCE(SUM(m.duration_s), 0) FROM meetings m WHERE {visible_meeting}"
+                ),
                 [],
                 |r| r.get(0),
             )
             .map_err(map_err)?;
         let longest_duration_s: i64 = conn
             .query_row(
-                "SELECT COALESCE(MAX(duration_s), 0) FROM meetings",
+                &format!(
+                    "SELECT COALESCE(MAX(m.duration_s), 0) FROM meetings m WHERE {visible_meeting}"
+                ),
                 [],
                 |r| r.get(0),
             )
             .map_err(map_err)?;
+        // Notes count — same folder-visibility gate as brain_counts's note/document split.
         let notes_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM notes", [], |r| r.get(0))
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM notes n LEFT JOIN folders f ON f.id = n.folder_id
+                      WHERE {visible}"
+                ),
+                [],
+                |r| r.get(0),
+            )
             .map_err(map_err)?;
         let first_meeting_at: Option<String> = conn
-            .query_row("SELECT MIN(started_at) FROM meetings", [], |r| r.get(0))
+            .query_row(
+                &format!("SELECT MIN(m.started_at) FROM meetings m WHERE {visible_meeting}"),
+                [],
+                |r| r.get(0),
+            )
             .map_err(map_err)?;
         let avg_duration_s = if total_meetings > 0 {
             total_duration_s / total_meetings
@@ -6381,14 +6414,20 @@ impl Db {
         let cutoff_7d = (chrono::Utc::now() - chrono::Duration::days(7)).to_rfc3339();
         let meetings_7d: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM meetings WHERE started_at >= ?1",
+                &format!(
+                    "SELECT COUNT(*) FROM meetings m
+                      WHERE m.started_at >= ?1 AND {visible_meeting}"
+                ),
                 rusqlite::params![cutoff_7d],
                 |r| r.get(0),
             )
             .map_err(map_err)?;
         let duration_7d_s: i64 = conn
             .query_row(
-                "SELECT COALESCE(SUM(duration_s), 0) FROM meetings WHERE started_at >= ?1",
+                &format!(
+                    "SELECT COALESCE(SUM(m.duration_s), 0) FROM meetings m
+                      WHERE m.started_at >= ?1 AND {visible_meeting}"
+                ),
                 rusqlite::params![cutoff_7d],
                 |r| r.get(0),
             )
@@ -6396,7 +6435,10 @@ impl Db {
 
         let by_status = {
             let mut stmt = conn
-                .prepare("SELECT status, COUNT(*) FROM meetings GROUP BY status")
+                .prepare(&format!(
+                    "SELECT m.status, COUNT(*) FROM meetings m
+                      WHERE {visible_meeting} GROUP BY m.status"
+                ))
                 .map_err(map_err)?;
             let rows = stmt
                 .query_map([], |row| {
@@ -6416,10 +6458,11 @@ impl Db {
         let cutoff_30d = (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
         let per_day = {
             let mut stmt = conn
-                .prepare(
-                    "SELECT substr(started_at, 1, 10) AS d, COUNT(*), COALESCE(SUM(duration_s), 0)
-                       FROM meetings WHERE started_at >= ?1 GROUP BY d ORDER BY d",
-                )
+                .prepare(&format!(
+                    "SELECT substr(m.started_at, 1, 10) AS d, COUNT(*), COALESCE(SUM(m.duration_s), 0)
+                       FROM meetings m WHERE m.started_at >= ?1 AND {visible_meeting}
+                       GROUP BY d ORDER BY d"
+                ))
                 .map_err(map_err)?;
             let rows = stmt
                 .query_map(rusqlite::params![cutoff_30d], |row| {
@@ -15542,6 +15585,92 @@ mod tests {
             "locked 'secret' excluded; oldest-first order"
         );
         let _ = std::fs::remove_file(&p);
+    }
+
+    /// The Analytics tab must never reveal a sealed-and-not-unlocked folder's meetings — same
+    /// leak class `visibility_clause` closes for search/graph/brain reads. Regression for the
+    /// audit finding: `Db::analytics()` used to run bare `SELECT COUNT(*)`/`SUM(duration_s)`
+    /// over ALL meetings with no folder join at all (confirmed RED against the pre-fix
+    /// no-arg `analytics()`: it counted the sealed meeting too).
+    #[test]
+    fn analytics_excludes_sealed_not_unlocked_folder() {
+        let db = mem_db();
+        // Two OPEN meetings (folder_id NULL) + one meeting in a LOCKED, not-session-unlocked folder.
+        for (id, at, dur) in [
+            ("open-1", "2026-06-20T10:00:00Z", 600i64),
+            ("open-2", "2026-06-21T10:00:00Z", 900i64),
+            ("secret", "2026-06-22T10:00:00Z", 6000i64),
+        ] {
+            db.insert_meeting(&crate::storage::Meeting {
+                id: id.into(),
+                started_at: at.into(),
+                ended_at: None,
+                title: Some("t".into()),
+                duration_s: dur,
+                audio_path: None,
+                status: crate::storage::MeetingStatus::Summarized,
+                folder_id: None,
+            })
+            .unwrap();
+            db.upsert_note(&crate::storage::NoteRecord {
+                meeting_id: id.into(),
+                provider_id: "claude_code".into(),
+                markdown: "m".into(),
+                created_at: at.into(),
+                exported_path: None,
+                model_requested: None,
+                model_served: None,
+                gateway_host: None,
+            })
+            .unwrap();
+        }
+        db.insert_folder(&crate::storage::Folder {
+            id: "f-secret".into(),
+            name: "Secret".into(),
+            path: "Secret".into(),
+            parent_id: None,
+            locked: true,
+            created_at: "2026-06-01T00:00:00Z".into(),
+        })
+        .unwrap();
+        db.set_note_folder("secret", Some("f-secret")).unwrap();
+
+        // Sealed and NOT session-unlocked: the "secret" meeting (6000s, its own day, status
+        // Summarized) must be invisible everywhere in the aggregate.
+        let nothing = std::collections::HashSet::new();
+        let a = db.analytics(&nothing).unwrap();
+        assert_eq!(a.total_meetings, 2, "sealed meeting must not be counted");
+        assert_eq!(
+            a.total_duration_s, 1500,
+            "sealed meeting's duration must not contribute to the total"
+        );
+        assert_eq!(
+            a.longest_duration_s, 900,
+            "the sealed meeting's 6000s must not surface as the longest"
+        );
+        assert_eq!(a.avg_duration_s, 750);
+        let by_status_total: i64 = a.by_status.iter().map(|s| s.count).sum();
+        assert_eq!(
+            by_status_total, 2,
+            "status breakdown must not include the sealed meeting"
+        );
+        let per_day_total: i64 = a.per_day.iter().map(|d| d.count).sum();
+        assert_eq!(
+            per_day_total, 2,
+            "per-day activity chart must not include the sealed meeting's day"
+        );
+        assert!(
+            !a.per_day.iter().any(|d| d.date == "2026-06-22"),
+            "the sealed meeting's day must not appear in the 30-day activity chart at all"
+        );
+
+        // Once the folder is SESSION-unlocked, the same meeting becomes visible again (reversible).
+        let mut unlocked = std::collections::HashSet::new();
+        unlocked.insert("f-secret".to_string());
+        let a2 = db.analytics(&unlocked).unwrap();
+        assert_eq!(a2.total_meetings, 3);
+        assert_eq!(a2.total_duration_s, 7500);
+        assert_eq!(a2.longest_duration_s, 6000);
     }
 
     /// Race-safety regression (TOCTOU: prune snapshots a plaintext path, a concurrent seal
