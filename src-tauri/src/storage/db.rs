@@ -2297,9 +2297,18 @@ impl Db {
         Ok(out)
     }
 
-    /// The ACTIVE (queued/uploaded/revoke_pending — not revoked/failed) org shares anchored to a
-    /// folder's meetings + notes, for the lock×shares warn/revoke dialog. Content-free enough for the
-    /// dialog (an `(item_id?, title?)` pair per share; titles render only to the local owner).
+    /// The ACTIVE-OR-STUCK-LIVE (queued/uploaded/revoke_pending, PLUS a `failed` row that still
+    /// carries a non-null `item_id`) org shares anchored to a folder's meetings + notes, for the
+    /// lock×shares warn/revoke dialog. Content-free enough for the dialog (an `(item_id?, title?)`
+    /// pair per share; titles render only to the local owner).
+    ///
+    /// The `failed AND item_id IS NOT NULL` clause mirrors the definition of "live" established by
+    /// `org_shares_for_source`/`list_live_org_shares` (see their doc comments): `set_org_share_failed`
+    /// deliberately never clears `item_id` on a republish failure, so such a row's PRIOR publish is
+    /// still genuinely live on the server even though the row's state says `failed`. Before this fix
+    /// that shape was invisible to the lock×shares dialog and to bulk-revoke
+    /// (`active_org_share_ids_for_folder`), so locking a folder with a stuck failed-republish share
+    /// never warned the user and never tombstoned the still-live server item.
     pub fn active_org_shares_for_folder(
         &self,
         folder_id: &str,
@@ -2311,7 +2320,8 @@ impl Db {
                    FROM org_shares s
                    LEFT JOIN notes n  ON n.meeting_id = s.meeting_id
                    LEFT JOIN documents d ON d.id = s.document_id
-                  WHERE s.state IN ('queued','uploaded','revoke_pending')
+                  WHERE (s.state IN ('queued','uploaded','revoke_pending')
+                     OR (s.state = 'failed' AND s.item_id IS NOT NULL))
                     AND (n.folder_id = ?1 OR d.folder_id = ?1)",
             )
             .map_err(map_err)?;
@@ -2355,10 +2365,13 @@ impl Db {
         Ok(out)
     }
 
-    /// The folder's ACTIVE org shares as `(row_id, item_id?, title)` for bulk-revoke: an uploaded row
-    /// (item_id present) is tombstoned server-side; a still-`queued` row (no item_id) is cancelled
-    /// locally so the launch sweep never egresses it. Same folder join + state set as
-    /// [`Self::active_org_shares_for_folder`], but carries the local row id + item id for revocation.
+    /// The folder's ACTIVE-OR-STUCK-LIVE org shares as `(row_id, item_id?, title)` for bulk-revoke:
+    /// an uploaded row (item_id present) is tombstoned server-side; a still-`queued` row (no item_id)
+    /// is cancelled locally so the launch sweep never egresses it; a `failed` row with a non-null
+    /// `item_id` (a republish attempt failed but the PRIOR publish is still live — see
+    /// [`Self::active_org_shares_for_folder`]) is tombstoned server-side same as an uploaded row.
+    /// Same folder join + state set as [`Self::active_org_shares_for_folder`], but carries the local
+    /// row id + item id for revocation.
     pub fn active_org_share_ids_for_folder(
         &self,
         folder_id: &str,
@@ -2370,7 +2383,8 @@ impl Db {
                    FROM org_shares s
                    LEFT JOIN notes n     ON n.meeting_id = s.meeting_id
                    LEFT JOIN documents d ON d.id = s.document_id
-                  WHERE s.state IN ('queued','uploaded','revoke_pending')
+                  WHERE (s.state IN ('queued','uploaded','revoke_pending')
+                     OR (s.state = 'failed' AND s.item_id IS NOT NULL))
                     AND (n.folder_id = ?1 OR d.folder_id = ?1)",
             )
             .map_err(map_err)?;

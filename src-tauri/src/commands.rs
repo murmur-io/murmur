@@ -25970,6 +25970,70 @@ mod lifecycle_tests {
         assert!(active.iter().any(|(item, _)| item.is_none())); // the queued note share (no item yet)
     }
 
+    /// cd21b10 established that a `failed` row with a non-null `item_id` (a republish attempt failed
+    /// transiently but the PRIOR publish is still genuinely live on the server — `set_org_share_failed`
+    /// deliberately never clears `item_id`) counts as LIVE everywhere: `org_shares_for_source`,
+    /// `list_live_org_shares`, `OrgStatus.item_count`, `org_resolve_source_inner`. This proves
+    /// `active_org_shares_for_folder` and `active_org_share_ids_for_folder` (the lock×shares dialog +
+    /// bulk-revoke) also surface that shape — before the fix they used the pre-cd21b10 narrow
+    /// `state IN ('queued','uploaded','revoke_pending')` predicate, so a stuck failed-with-item_id share
+    /// was invisible to the dialog and never revoked when the folder was locked.
+    #[test]
+    fn active_org_shares_for_folder_includes_stuck_failed_republish_with_live_item_id() {
+        let state = build_state("org-active-folder-stuck-failed");
+        make_open_folder(&state.db, "f1", "Team");
+        state
+            .db
+            .insert_note("n1", "f1", "doc", "Doc", "# body", 1)
+            .unwrap();
+        let sha = vec![1u8; 32];
+        // Published once (item-stuck), then a republish-on-edit attempt failed transiently: state
+        // becomes 'failed' but item_id STAYS 'item-stuck' (the prior publish is still live).
+        state
+            .db
+            .insert_org_share("s-stuck", "org-1", None, Some("n1"), "note", Some("Doc"), 1, 1, &sha, "t")
+            .unwrap();
+        state
+            .db
+            .set_org_share_uploaded("s-stuck", "item-stuck", "t")
+            .unwrap();
+        state
+            .db
+            .set_org_share_failed("s-stuck", "republish_upload_failed", "t")
+            .unwrap();
+        // A never-published failed row (no item_id) must stay excluded — no live server item.
+        state
+            .db
+            .insert_note("n2", "f1", "doc", "Doc2", "# body2", 1)
+            .unwrap();
+        state
+            .db
+            .insert_org_share("s-dead", "org-1", None, Some("n2"), "note", Some("Doc2"), 1, 1, &sha, "t")
+            .unwrap();
+        state
+            .db
+            .set_org_share_failed("s-dead", "publish_failed", "t")
+            .unwrap();
+
+        let active = state.db.active_org_shares_for_folder("f1").unwrap();
+        assert_eq!(
+            active.len(),
+            1,
+            "the stuck failed-with-item_id share IS surfaced; the never-published failed row stays excluded: {active:?}"
+        );
+        assert_eq!(active[0].0.as_deref(), Some("item-stuck"));
+
+        // Same fix must apply to the bulk-revoke enumeration (`revoke_shares_for_folder`'s source).
+        let ids = state.db.active_org_share_ids_for_folder("f1").unwrap();
+        assert_eq!(
+            ids.len(),
+            1,
+            "bulk-revoke must also see the stuck failed-with-item_id share: {ids:?}"
+        );
+        assert_eq!(ids[0].0, "s-stuck");
+        assert_eq!(ids[0].1.as_deref(), Some("item-stuck"));
+    }
+
     /// Closes the pre-existing lock×shares HOLE: before `active_link_user_shares_for_folder`, a folder
     /// could be sealed with NO warning that its notes were still shared 1:1 (link/user). This proves
     /// the enumeration that `folder_active_shares` (→ the dialog) reads: it surfaces the folder's
