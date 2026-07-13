@@ -230,4 +230,56 @@ test.describe("Org share — browse + picker (mocked IPC)", () => {
       fullPage: true,
     });
   });
+
+  test("invite-only member (not first in org_status) still sees the Add to Org Brain CTA", async ({
+    page,
+  }) => {
+    // Regression for the legacy-single-org bug: `SharePanelComponent` used to gate
+    // its "Add to Org Brain" section on `org_status` — which the backend documents
+    // as `list_org_states().into_iter().next()`, i.e. only the FIRST locally-joined
+    // org (kept for legacy callers). A user whose only membership came from an
+    // invite (never created an org locally) can have `org_status` resolve to null
+    // even though `org_list_statuses` correctly lists their org. Every other
+    // multi-org surface (Settings, the org-share sheet, the org-item viewer) reads
+    // `org_list_statuses`; the Share panels must too.
+    await mockTauri(page, {
+      account_status: ACCOUNT_STATUS,
+      // Simulates the invite-only member: the legacy single-org lookup finds
+      // nothing (the joined org isn't first — or the local `next()` genuinely
+      // returns null for this membership shape), but the full list has it.
+      org_status: () => null,
+      org_list_statuses: () => [
+        {
+          orgId: "org-invited",
+          name: "Invited Co.",
+          role: "member",
+          memberCount: 6,
+          consented: true,
+          lastSeq: 12,
+          itemCount: 0,
+          receivedCount: 2,
+          pendingShares: 0,
+        },
+      ],
+      list_my_shares: () => [],
+      list_org_shares: () => [],
+      org_live_shares_for_source: () => [],
+    });
+
+    await page.goto("/library");
+    await page.locator("li.row-item a.row").first().click();
+    await page
+      .getByRole("tab", { name: /share/i })
+      .first()
+      .click()
+      .catch(async () => {
+        await page.getByText("Share", { exact: false }).first().click();
+      });
+
+    // The CTA must render even though `org_status` resolved to null — it should
+    // be driven by `org_list_statuses` like every other multi-org surface.
+    await expect(
+      page.getByRole("button", { name: "Add to Org Brain" }).first(),
+    ).toBeVisible({ timeout: 10_000 });
+  });
 });

@@ -206,3 +206,72 @@ test("selecting the org chip shows ONLY that org's items", async ({ page }) => {
 
   expect(consoleErrors).toEqual([]);
 });
+
+test("a long org name truncates with an ellipsis, not a hard clip (matches .title-text/.note-author)", async ({
+  page,
+}) => {
+  const consoleErrors: string[] = [];
+  page.on("console", (msg) => {
+    if (msg.type() === "error") {
+      consoleErrors.push(msg.text());
+    }
+  });
+  page.on("pageerror", (err) => consoleErrors.push(String(err)));
+
+  // Overrides are serialized via `.toString()` and re-executed page-side
+  // (see `mockTauri`), so the literal MUST be inlined in the function body —
+  // a closure over an outer test-scope const would stringify to the bare
+  // identifier, not its value.
+  const LONG_NAME = "Globex Design With A Really Long Organization Name";
+  await mockNotes(page, {
+    ...ORG_MOCKS,
+    org_list_statuses: () => [
+      {
+        orgId: "org1",
+        name: "Globex Design With A Really Long Organization Name",
+        role: "member",
+        memberCount: 3,
+        consented: true,
+        lastSeq: 5,
+        itemCount: 0,
+        receivedCount: 1,
+        pendingShares: 0,
+        contextEnabled: true,
+      },
+    ],
+  });
+  await page.goto("/notes");
+  await expect(page.locator(".notes-content")).toBeVisible();
+
+  const orgRow = page.locator(".mur-table tbody tr", { hasText: "Team Roadmap Q3" });
+  const badge = orgRow.locator(".org-badge");
+  await expect(badge).toBeVisible();
+
+  // The badge's text content is fully in the DOM (not server-truncated) — the
+  // truncation must be purely visual via CSS, exactly like `.title-text` /
+  // `.note-author`. `title` carries the full name for the a11y/hover cue.
+  await expect(badge).toHaveAttribute("title", `Shared brain · ${LONG_NAME}`);
+
+  // The box is genuinely overflowing (content wider than the clipped max-width),
+  // so a REAL truncation cue is required — this is the regression guard: with
+  // `overflow: hidden` but no `text-overflow: ellipsis`, the box still clips
+  // visually (scrollWidth > clientWidth) but with no ellipsis glyph, which is
+  // indistinguishable from a broken layout. Assert the computed style pairs
+  // `overflow: hidden` with `text-overflow: ellipsis` + `white-space: nowrap`,
+  // the same triplet `.title-text`/`.note-author` use.
+  const style = await badge.evaluate((el) => {
+    const cs = getComputedStyle(el);
+    return {
+      overflow: cs.overflowX,
+      textOverflow: cs.textOverflow,
+      whiteSpace: cs.whiteSpace,
+      isOverflowing: el.scrollWidth > el.clientWidth,
+    };
+  });
+  expect(style.overflow).toBe("hidden");
+  expect(style.textOverflow).toBe("ellipsis");
+  expect(style.whiteSpace).toBe("nowrap");
+  expect(style.isOverflowing).toBe(true);
+
+  expect(consoleErrors).toEqual([]);
+});
