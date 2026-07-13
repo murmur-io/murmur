@@ -4800,6 +4800,7 @@ pub fn pin_moment(
 /// Returns the extracted `GraphPayload`. The caller decides whether extraction failures are fatal
 /// (the `link_meeting_entities` command surfaces them; the pipeline hook swallows them).
 pub async fn build_and_persist_entities(
+    app: &AppHandle,
     state: &AppState,
     meeting_id: &str,
     title: &str,
@@ -4835,22 +4836,44 @@ pub async fn build_and_persist_entities(
         entity_refs.push((id, pr.clone()));
     }
 
-    // brain2 R2 — BITEMPORAL FACTS. BEST-EFFORT + NEVER fails the note: extract entity·predicate·
-    // object candidates (on-device reasoner; empty with the stub / no model), load the existing facts
-    // for these entities, run the PURE DETERMINISTIC reconcile, stamp the source meeting, and apply
-    // the ops in ONE tx. `valid_from = recorded_at = the meeting's time` (started_at) — the deterministic
-    // `at`. A reconcile/extract hiccup is logged (non-PII) and swallowed.
-    if let Err(e) = persist_facts_for_meeting(state, meeting_id, title, markdown, &entity_refs) {
-        tracing::warn!(target: "facts", error = %e, "fact reconcile failed (note unaffected)");
-    }
-
-    // Phase 3 CROSS-MEETING USER MEMORY — extract → reconcile → apply USER-SCOPED facts (preferences,
-    // ongoing work, commitments about the USER) from the note + the user's own typed notes. Same
-    // BEST-EFFORT + NEVER-fails-the-note contract as the entity facts above: empty with the stub / no
-    // model, a hiccup is logged (non-PII) and swallowed. Runs even with zero entities (user memory is
-    // not entity-scoped).
-    if let Err(e) = persist_user_facts_for_meeting(state, meeting_id, title, markdown) {
-        tracing::warn!(target: "user_memory", error = %e, "user-fact reconcile failed (note unaffected)");
+    // brain2 R2 — BITEMPORAL FACTS + Phase 3 CROSS-MEETING USER MEMORY. Both are BEST-EFFORT +
+    // NEVER fail the note: extract entity·predicate·object / user-preference candidates via the
+    // on-device reasoner (empty with the stub / no model), reconcile, apply in one tx each. A
+    // reconcile/extract hiccup is logged (non-PII) and swallowed EITHER WAY — that part is
+    // unchanged. What changed: the reasoner dispatch (the brain sidecar, up to the hard-cap
+    // timeout — currently 180s) used to run INLINE on this async command's Tokio worker, TWICE
+    // per meeting, on EVERY recording Stop (2026-07-13 perf audit, HIGH severity). Moved to the
+    // blocking pool via `perf::run_heavy` (serializes against other heavy native calls too), using
+    // the AppHandle re-fetch pattern (`State<'_, AppState>` can't be captured by a `'static`
+    // closure). Both calls already catch + log their own errors internally, so the closure always
+    // returns `Ok(())` — a join-panic from `run_heavy` itself is logged and swallowed the same way,
+    // preserving the exact "never fail the note" contract.
+    let app_for_facts = app.clone();
+    let meeting_id_owned = meeting_id.to_string();
+    let title_owned = title.to_string();
+    let markdown_owned = markdown.to_string();
+    let entity_refs_owned = entity_refs.clone();
+    if let Err(e) = crate::perf::run_heavy(&state.heavy_inference, move || -> Result<(), AppError> {
+        let state = app_for_facts.state::<AppState>();
+        if let Err(e) = persist_facts_for_meeting(
+            &state,
+            &meeting_id_owned,
+            &title_owned,
+            &markdown_owned,
+            &entity_refs_owned,
+        ) {
+            tracing::warn!(target: "facts", error = %e, "fact reconcile failed (note unaffected)");
+        }
+        if let Err(e) =
+            persist_user_facts_for_meeting(&state, &meeting_id_owned, &title_owned, &markdown_owned)
+        {
+            tracing::warn!(target: "user_memory", error = %e, "user-fact reconcile failed (note unaffected)");
+        }
+        Ok(())
+    })
+    .await
+    {
+        tracing::warn!(target: "facts", error = %e, "facts/user-memory blocking task failed (note unaffected)");
     }
 
     // Sink B — vault [[ ]] stubs, ONLY when a vault is configured AND the meeting's folder is
@@ -5553,6 +5576,7 @@ fn gated_memory_brief_for_injection(
 /// even with no vault set — hence no hard "set a vault folder" error anymore.
 #[tauri::command]
 pub async fn link_meeting_entities(
+    app: AppHandle,
     state: State<'_, AppState>,
     meeting_id: String,
 ) -> Result<crate::summarize::graph::GraphPayload, AppError> {
@@ -5575,7 +5599,7 @@ pub async fn link_meeting_entities(
         .title
         .clone()
         .unwrap_or_else(|| "Meeting".to_string());
-    build_and_persist_entities(&state, &meeting_id, &title, &note.markdown).await
+    build_and_persist_entities(&app, &state, &meeting_id, &title, &note.markdown).await
 }
 
 /// Max co-occurring neighbors returned with an entity's detail (the neighborhood satellites).
@@ -5724,7 +5748,7 @@ pub async fn ask_vault(
         &question,
         &history,
         &memory_brief,
-        Some(reranker.as_ref()),
+        Some(reranker),
     )
     .await
 }
@@ -6023,23 +6047,43 @@ fn build_ask_vault_floor_prompt(
 /// gate errors exactly as before). Runs on the local/off brain backend and whenever the agentic
 /// attempt did not converge or errored.
 async fn ask_vault_floor(
-    db: &crate::storage::Db,
+    db: &std::sync::Arc<crate::storage::Db>,
     config: &AppConfig,
     unlocked: &std::collections::HashSet<String>,
     question: &str,
     history: &[ChatTurn],
     memory_brief: &str,
-    reranker: Option<&dyn crate::rerank::Reranker>,
+    reranker: Option<Box<dyn crate::rerank::Reranker>>,
 ) -> Result<AskVaultResult, AppError> {
-    match build_ask_vault_floor_prompt(
-        db,
-        config,
-        unlocked,
-        question,
-        history,
-        memory_brief,
-        reranker,
-    )? {
+    // `build_ask_vault_floor_prompt` does the LOCAL/on-device work — query embedding (Candle/
+    // Metal) + hybrid FTS∪vector retrieval + reranker inference — synchronously. This is exactly
+    // the path privacy-first users hit (a local/reasoner-only Ask role skips the agentic branch
+    // above and lands here), and it used to run INLINE on this async command's Tokio worker
+    // (2026-07-13 perf audit, HIGH severity — the local path for exactly the users this app
+    // targets was the one NOT already spawn_blocking'd, unlike the agentic/cloud branch above).
+    // Everything captured here is owned (`Arc<Db>` clone, owned `AppConfig`/`HashSet`/`String`s,
+    // a `Send + Sync` boxed reranker) so the closure is `'static` with no AppHandle re-fetch
+    // needed — this function doesn't otherwise need one.
+    let db_for_prompt = db.clone();
+    let config_for_prompt = config.clone();
+    let unlocked_for_prompt = unlocked.clone();
+    let question_owned = question.to_string();
+    let history_owned = history.to_vec();
+    let memory_brief_owned = memory_brief.to_string();
+    let prompt = tokio::task::spawn_blocking(move || {
+        build_ask_vault_floor_prompt(
+            &db_for_prompt,
+            &config_for_prompt,
+            &unlocked_for_prompt,
+            &question_owned,
+            &history_owned,
+            &memory_brief_owned,
+            reranker.as_deref(),
+        )
+    })
+    .await
+    .map_err(|e| AppError::Other(anyhow::anyhow!("ask-vault-floor task panicked: {e}")))??;
+    match prompt {
         AskFloorPrompt::Empty(result) => Ok(result),
         AskFloorPrompt::Ready {
             system,
@@ -6384,6 +6428,7 @@ mod ask_vault_tests {
             !cfg.cloud_egress_consented,
             "fresh config defaults to consent OFF"
         );
+        let db = std::sync::Arc::new(db);
         let res = block_on(ask_vault_floor(
             &db,
             &cfg,
@@ -10708,6 +10753,7 @@ fn clear_stale_live_transcript(state: &AppState) {
 /// Does NOT re-export to the vault. Returns the refreshed folder node.
 #[tauri::command]
 pub async fn unlock_folder(
+    app: AppHandle,
     state: State<'_, AppState>,
     folder_id: String,
 ) -> Result<FolderNode, AppError> {
@@ -10850,73 +10896,97 @@ pub async fn unlock_folder(
             .map_err(|_| AppError::Storage("unwrapped content key has wrong length".into()))?,
     );
 
-    // BLK-1: from here on we MUTATE plaintext columns (restore markdown / segments / timeline).
-    // Acquire the lifecycle guard for the whole synchronous restore so a concurrent
-    // `relock_all_inner` (screen-share / lifecycle) cannot blank these rows mid-restore. Acquired
-    // AFTER the keychain `.await` above — holding a std `MutexGuard` across an await would make this
-    // command's future `!Send`; everything below is synchronous, so the guard never crosses a
-    // suspend point.
-    let _lifecycle = lifecycle_guard(state.inner());
+    // The rest of the restore (decrypt every note/segment/timeline blob, materialize the session
+    // WAV, re-embed the folder's meetings) is synchronous CPU/AES/Candle-Metal work that used to
+    // run INLINE on this async command's Tokio worker — for a folder with several long-meeting
+    // recordings this can stall the whole IPC layer for seconds to low minutes (2026-07-13 perf
+    // audit finding, HIGH severity). Moved to the blocking pool, routed through the shared
+    // heavy-inference gate (perf::run_heavy) since it re-embeds via Candle/Metal. The `AppHandle`
+    // re-fetch pattern (`app.state::<AppState>()`) is how this codebase already gets a `'static`
+    // handle to `AppState` inside a spawn_blocking closure (see `ask_vault_agentic_attempt`) — a
+    // bare `&AppState` from `State<'_, AppState>` cannot be captured by a `'static` closure.
+    let heavy_inference = state.heavy_inference.clone();
+    let app_for_restore = app.clone();
+    let folder_for_restore = folder.clone();
+    let folder_id_for_restore = folder_id.clone();
+    let restored: FolderNode = crate::perf::run_heavy(&heavy_inference, move || -> Result<FolderNode, AppError> {
+        let state = app_for_restore.state::<AppState>();
+        let folder = folder_for_restore;
+        let folder_id = folder_id_for_restore;
 
-    // Decrypt EACH sealed provider row's own blob back into its own markdown column for the
-    // session (no dedup by meeting — every provider's distinct content is restored independently).
-    // Bound to (folder|meeting|provider|note); legacy blobs fall back to empty AAD.
-    let notes = state.db.notes_in_folder(&folder_id)?;
-    for n in &notes {
-        let Some(blob) = &n.content_blob else {
-            continue; // open note (shouldn't happen in a sealed folder) — skip.
+        // BLK-1: from here on we MUTATE plaintext columns (restore markdown / segments /
+        // timeline). Acquire the lifecycle guard for the whole synchronous restore so a
+        // concurrent `relock_all_inner` (screen-share / lifecycle) cannot blank these rows
+        // mid-restore. This closure runs entirely on the blocking pool with no `.await` inside
+        // it, so the guard never crosses a suspend point (same invariant the old inline code
+        // relied on, preserved by construction — a spawn_blocking closure body is plain sync code).
+        let _lifecycle = lifecycle_guard(&state);
+
+        // Decrypt EACH sealed provider row's own blob back into its own markdown column for the
+        // session (no dedup by meeting — every provider's distinct content is restored
+        // independently). Bound to (folder|meeting|provider|note); legacy blobs fall back to
+        // empty AAD.
+        let notes = state.db.notes_in_folder(&folder_id)?;
+        for n in &notes {
+            let Some(blob) = &n.content_blob else {
+                continue; // open note (shouldn't happen in a sealed folder) — skip.
+            };
+            let aad = aad_content(&folder_id, &n.meeting_id, &n.provider_id, "note");
+            let pt = crate::crypto::decrypt(&ck, blob, &aad)?;
+            let markdown = String::from_utf8(pt)
+                .map_err(|_| AppError::Storage("decrypted note is not valid UTF-8".into()))?;
+            state
+                .db
+                .restore_note_markdown(&n.meeting_id, &n.provider_id, &markdown)?;
+        }
+
+        // Phase 0.5 — decrypt the TRANSCRIPT + TIMELINE back into their plaintext columns and
+        // materialize a playable WAV (decrypt .enc → file) for the session, under the SAME CK.
+        // The model-gated meeting embedder (Some only when the REAL e5 model is present → never
+        // stub vectors) re-indexes the folder's meetings so semantic / related-meetings recover
+        // in-session.
+        let meeting_embedder =
+            crate::embed::embed_model_present().then(crate::embed::active_embedder);
+        unseal_folder_extras(&state, &folder_id, &ck, meeting_embedder.as_deref())?;
+
+        // Cache the KEK for the session (zeroized on relock-all + on drop) + add to the unlock set.
+        {
+            let mut g = state
+                .master_kek
+                .lock()
+                .map_err(|_| AppError::Storage("master-kek mutex poisoned".into()))?;
+            *g = Some(kek.clone());
+        }
+        {
+            let mut g = state
+                .unlocked_folders
+                .lock()
+                .map_err(|_| AppError::Storage("unlocked-folders mutex poisoned".into()))?;
+            g.insert(folder_id.clone());
+        }
+        tracing::info!(target: "lock", folder = %folder_id, "unlock_folder: session unlock complete");
+
+        // Return the refreshed node.
+        let counts = state.db.count_notes_per_folder()?;
+        let unlocked = {
+            state
+                .unlocked_folders
+                .lock()
+                .map_err(|_| AppError::Storage("unlocked-folders mutex poisoned".into()))?
+                .clone()
         };
-        let aad = aad_content(&folder_id, &n.meeting_id, &n.provider_id, "note");
-        let pt = crate::crypto::decrypt(&ck, blob, &aad)?;
-        let markdown = String::from_utf8(pt)
-            .map_err(|_| AppError::Storage("decrypted note is not valid UTF-8".into()))?;
-        state
-            .db
-            .restore_note_markdown(&n.meeting_id, &n.provider_id, &markdown)?;
-    }
-
-    // Phase 0.5 — decrypt the TRANSCRIPT + TIMELINE back into their plaintext columns and
-    // materialize a playable WAV (decrypt .enc → file) for the session, under the SAME CK. The
-    // model-gated meeting embedder (Some only when the REAL e5 model is present → never stub vectors)
-    // re-indexes the folder's meetings so semantic / related-meetings recover in-session.
-    let meeting_embedder = crate::embed::embed_model_present().then(crate::embed::active_embedder);
-    unseal_folder_extras(state.inner(), &folder_id, &ck, meeting_embedder.as_deref())?;
-
-    // Cache the KEK for the session (zeroized on relock-all + on drop) + add to the unlock set.
-    {
-        let mut g = state
-            .master_kek
-            .lock()
-            .map_err(|_| AppError::Storage("master-kek mutex poisoned".into()))?;
-        *g = Some(kek.clone());
-    }
-    {
-        let mut g = state
-            .unlocked_folders
-            .lock()
-            .map_err(|_| AppError::Storage("unlocked-folders mutex poisoned".into()))?;
-        g.insert(folder_id.clone());
-    }
-    tracing::info!(target: "lock", folder = %folder_id, "unlock_folder: session unlock complete");
-
-    // Return the refreshed node.
-    let counts = state.db.count_notes_per_folder()?;
-    let unlocked = {
-        state
-            .unlocked_folders
-            .lock()
-            .map_err(|_| AppError::Storage("unlocked-folders mutex poisoned".into()))?
-            .clone()
-    };
-    Ok(FolderNode {
-        id: folder.id.clone(),
-        name: folder.name.clone(),
-        parent_id: folder.parent_id.clone(),
-        note_count: counts.get(&folder.id).copied().unwrap_or(0),
-        locked: true,
-        unlocked: unlocked.contains(&folder.id),
-        children: Vec::new(),
+        Ok(FolderNode {
+            id: folder.id.clone(),
+            name: folder.name.clone(),
+            parent_id: folder.parent_id.clone(),
+            note_count: counts.get(&folder.id).copied().unwrap_or(0),
+            locked: true,
+            unlocked: unlocked.contains(&folder.id),
+            children: Vec::new(),
+        })
     })
+    .await?;
+    Ok(restored)
 }
 
 /// Re-seal a session-unlocked folder for the rest of this session: re-blank the plaintext
@@ -11811,6 +11881,7 @@ fn move_authored_note_md_to_folder(
 /// (returns `None`); a sealed folder returns the refreshed `FolderNode`.
 #[tauri::command]
 pub async fn unlock_meeting(
+    app: AppHandle,
     state: State<'_, AppState>,
     meeting_id: String,
 ) -> Result<Option<FolderNode>, AppError> {
@@ -11825,7 +11896,7 @@ pub async fn unlock_meeting(
         return Ok(None); // open folder — already visible.
     }
     // Reuse the SAME biometric unlock path (do not fork the lifecycle).
-    unlock_folder(state, folder_id).await.map(Some)
+    unlock_folder(app, state, folder_id).await.map(Some)
 }
 
 /// `discard_unrecoverable_meeting_lock(meeting_id) -> Option<FolderNode>` — the meeting-aware entry to

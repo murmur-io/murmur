@@ -1209,7 +1209,7 @@ async fn summarize_and_export(
         // Best-effort self-assembling graph: the encrypted DB (Sink A) is the canonical store and
         // works without a vault; never fail the saved note on a graph hiccup.
         if let Err(e) =
-            crate::commands::build_and_persist_entities(state, meeting_id, &title, &markdown).await
+            crate::commands::build_and_persist_entities(app, state, meeting_id, &title, &markdown).await
         {
             tracing::warn!(target: "graph", error = %e, "graph entity persist failed (note saved unaffected)");
         }
@@ -1238,7 +1238,7 @@ async fn summarize_and_export(
         // Same best-effort graph persist as the no-vault path (Sink B's own gate skips vault stubs
         // for a locked folder; Sink A rows are visibility-gated on read).
         if let Err(e) =
-            crate::commands::build_and_persist_entities(state, meeting_id, &title, &markdown).await
+            crate::commands::build_and_persist_entities(app, state, meeting_id, &title, &markdown).await
         {
             tracing::warn!(target: "graph", error = %e, "graph entity persist failed (note saved unaffected)");
         }
@@ -1343,7 +1343,7 @@ async fn summarize_and_export(
             meeting_id,
         );
         if let Err(e) =
-            crate::commands::build_and_persist_entities(state, meeting_id, &title, &markdown).await
+            crate::commands::build_and_persist_entities(app, state, meeting_id, &title, &markdown).await
         {
             tracing::warn!(target: "graph", error = %e, "graph entity persist failed (note saved unaffected)");
         }
@@ -1375,7 +1375,7 @@ async fn summarize_and_export(
     // a graph-extraction LLM hiccup must not block note export. `add_mention` idempotency makes
     // the `resummarize_existing` path safe (re-extraction refreshes without double-counting).
     if let Err(e) =
-        crate::commands::build_and_persist_entities(state, meeting_id, &title, &markdown).await
+        crate::commands::build_and_persist_entities(app, state, meeting_id, &title, &markdown).await
     {
         tracing::warn!(target: "graph", error = %e, "graph entity persist failed (note export unaffected)");
     }
