@@ -2340,7 +2340,12 @@ impl Db {
     /// The folder's ACTIVE 1:1 shares (LINK + Murmur↔Murmur USER) as `(share_id, mode)`, joined to
     /// the folder through the shared meeting/document. Powers the lock×shares dialog + bulk-revoke —
     /// closing the pre-existing hole where `lock_folder` never surfaced live 1:1 shares. Mirrors
-    /// [`Self::active_org_shares_for_folder`]. `state = 'active'` only (revoked rows excluded).
+    /// [`Self::active_org_shares_for_folder`]. Mode-A LINK shares use `state = 'active'`
+    /// ([`Self::insert_outbound_share`] / [`Self::insert_outbound_note_share`]); mode-B Murmur↔Murmur
+    /// USER shares NEVER carry `'active'` — [`Self::insert_outbound_user_share`] writes `'sent'`
+    /// (recipient already registered) or `'awaiting_key'` (pending, later flipped to `'sent'` by
+    /// `share_rewrap_pending`) — so all three live states must match or every real mode-B row is
+    /// silently excluded. `'revoked'` (terminal, [`Self::set_outbound_share_state`]) stays excluded.
     pub fn active_link_user_shares_for_folder(&self, folder_id: &str) -> Result<Vec<(String, String)>> {
         let conn = self.lock();
         let mut stmt = conn
@@ -2349,7 +2354,7 @@ impl Db {
                    FROM outbound_shares s
                    LEFT JOIN notes n     ON n.meeting_id = s.meeting_id
                    LEFT JOIN documents d ON d.id = s.document_id
-                  WHERE s.state = 'active'
+                  WHERE s.state IN ('active', 'sent', 'awaiting_key')
                     AND (n.folder_id = ?1 OR d.folder_id = ?1)",
             )
             .map_err(map_err)?;
