@@ -544,6 +544,11 @@ scope to the GA-critical path only.
       itemCount: 4,
       receivedCount: 9,
       pendingShares: 0,
+      // Per-instance active/inactive toggle (origin/murmur#273 follow-up) —
+      // `true` by default on real orgs (see OrgStatus.contextEnabled in
+      // models.ts); a fixture missing this field renders the demo's own
+      // healthy example org as "Disabled on this device" out of the box.
+      contextEnabled: true,
     },
   ];
 
