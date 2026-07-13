@@ -56,6 +56,20 @@ export class SettingsAccountSectionComponent {
   private readonly _status = signal<AccountStatus | null>(null);
   readonly status = this._status.asReadonly();
 
+  /**
+   * True once the first `reload()` has settled (success OR failure). Distinct
+   * from `status()` itself: a resolved-but-falsy status (e.g. an unmocked
+   * `account_status` call in the demo/screenshot world falling through to a
+   * benign `null`) must NOT read as "still loading" forever — only render the
+   * "Loading account…" copy before the first settle, mirroring the
+   * `loaded`-signal shape in `settings-organization-section.component.ts`.
+   */
+  private readonly _loaded = signal(false);
+  readonly loaded = this._loaded.asReadonly();
+
+  /** Derived signed-in check the template gates on (post-`loaded()`). */
+  readonly isLoggedIn = computed(() => !!this._status()?.loggedIn);
+
   /** True while a logout IPC call is in flight (debounces the Sign out button). */
   private readonly _busy = signal(false);
   readonly busy = this._busy.asReadonly();
@@ -163,6 +177,8 @@ export class SettingsAccountSectionComponent {
       this._status.set(st);
     } catch (e) {
       this._accountError.set(String(e));
+    } finally {
+      this._loaded.set(true);
     }
     // Load the incoming-share inbox only when it's usable (signed in + a server).
     if (st?.loggedIn && st.serverConfigured) {
