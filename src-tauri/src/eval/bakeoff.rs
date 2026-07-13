@@ -493,8 +493,11 @@ mod tests {
             brain_model_id: std::env::var("MURMUR_BAKEOFF_LIGHT_ID").ok(),
             ..Default::default()
         };
+        // Offline eval harness (not the live app runtime) — a fresh semaphore here is correct:
+        // there is no real concurrency to guard against in a standalone benchmark process.
+        let heavy = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
         let reranker = crate::rerank::active_reranker(std::sync::Arc::from(
-            crate::reason::active_reasoner(&cfg),
+            crate::reason::active_reasoner(&cfg, &heavy),
         ));
         if reranker.id() == "stub" {
             eprintln!(

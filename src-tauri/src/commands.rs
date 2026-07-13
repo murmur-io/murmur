@@ -3289,7 +3289,11 @@ async fn note_assistant_action_impl(
         build_note_assist_prompt(&action, &req, &citations, &entity_names, &config.note_language);
     let provider = match provider_override {
         Some(p) => p,
-        None => crate::summarize::provider_for(crate::summarize::roles::Role::Notes, &config)?,
+        None => crate::summarize::provider_for(
+            crate::summarize::roles::Role::Notes,
+            &config,
+            &state.heavy_inference,
+        )?,
     };
     let opts = crate::reason::GenOptions::edit_rewrite(note_edit_max_tokens(
         &action,
@@ -3867,7 +3871,7 @@ pub async fn plan_organize_notes(
         .map(|f| (f.id.clone(), f.name.clone()))
         .collect();
 
-    let provider = crate::summarize::provider_for(crate::summarize::roles::Role::Notes, &config)?;
+    let provider = crate::summarize::provider_for(crate::summarize::roles::Role::Notes, &config, &state.heavy_inference)?;
 
     let mut moves = Vec::new();
     for n in &notes {
@@ -4251,7 +4255,11 @@ pub async fn chat_meeting(
     };
     // ASK role: meeting chat is a Q&A surface. With role keys absent this resolves to the same
     // default provider as before (the legacy chat path always ignored `brain_backend`).
-    let provider = crate::summarize::provider_for(crate::summarize::roles::Role::Ask, &config)?;
+    let provider = crate::summarize::provider_for(
+        crate::summarize::roles::Role::Ask,
+        &config,
+        &state.heavy_inference,
+    )?;
     // Inject the gated cross-meeting USER MEMORY brief (parity with the @brain agentic loop): derived
     // from VISIBLE user facts only under the LIVE unlock snapshot, empty when memory is disabled ⇒
     // byte-identical prompt. Rides this surface's existing redaction + consent egress (no new class).
@@ -4516,7 +4524,7 @@ pub async fn run_recipe(
             .map_err(|_| AppError::Config("config mutex poisoned".into()))?
             .clone()
     };
-    let provider = crate::summarize::provider_for(crate::summarize::roles::Role::Notes, &config)?;
+    let provider = crate::summarize::provider_for(crate::summarize::roles::Role::Notes, &config, &state.heavy_inference)?;
     let (system, user) =
         crate::summarize::recipes::build_recipe_prompt(&transcript, &prompt, &config.note_language);
     provider.complete(&system, &user).await
@@ -4813,7 +4821,7 @@ pub async fn build_and_persist_entities(
             .map_err(|_| AppError::Config("config mutex poisoned".into()))?
             .clone()
     };
-    let provider = crate::summarize::provider_for(crate::summarize::roles::Role::Notes, &config)?;
+    let provider = crate::summarize::provider_for(crate::summarize::roles::Role::Notes, &config, &state.heavy_inference)?;
     let entities_started = std::time::Instant::now();
     let payload =
         crate::summarize::graph::extract_entities(provider.as_ref(), title, markdown).await?;
@@ -5767,6 +5775,7 @@ pub async fn ask_vault(
         &history,
         &memory_brief,
         Some(reranker),
+        &state.heavy_inference,
     )
     .await
 }
@@ -6072,6 +6081,7 @@ async fn ask_vault_floor(
     history: &[ChatTurn],
     memory_brief: &str,
     reranker: Option<Box<dyn crate::rerank::Reranker>>,
+    heavy: &std::sync::Arc<tokio::sync::Semaphore>,
 ) -> Result<AskVaultResult, AppError> {
     // `build_ask_vault_floor_prompt` does the LOCAL/on-device work — query embedding (Candle/
     // Metal) + hybrid FTS∪vector retrieval + reranker inference — synchronously. This is exactly
@@ -6111,7 +6121,7 @@ async fn ask_vault_floor(
             // ASK role. With role keys absent this builds the legacy default provider for EVERY
             // brain_backend (the pre-role floor ignored it) — original error/consent semantics.
             let provider =
-                crate::summarize::provider_for(crate::summarize::roles::Role::Ask, config)?;
+                crate::summarize::provider_for(crate::summarize::roles::Role::Ask, config, heavy)?;
             let answer = provider.complete(&system, &user).await?;
             Ok(AskVaultResult {
                 answer,
@@ -6455,6 +6465,7 @@ mod ask_vault_tests {
             &[],
             "",
             None,
+            &std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
         ));
         assert!(
             matches!(res, Err(AppError::Unavailable(_))),
@@ -6805,7 +6816,7 @@ pub async fn entity_dossier(
     // Build the provider (firewall + consent gate) BEFORE synthesizing — the factory refuses a
     // cloud provider until the user has consented to egress. NOTES role (the dossier is a
     // written synthesis); the corpus budget keys on the same resolved connection.
-    let provider = crate::summarize::provider_for(crate::summarize::roles::Role::Notes, &config)?;
+    let provider = crate::summarize::provider_for(crate::summarize::roles::Role::Notes, &config, &state.heavy_inference)?;
     let markdown = provider.complete(&system, &user).await?;
     Ok(EntityDossierResult {
         markdown,
@@ -7202,7 +7213,7 @@ pub async fn generate_digest(
         )));
     }
     let range_label = format!("the last {days} days");
-    let provider = crate::summarize::provider_for(crate::summarize::roles::Role::Notes, &config)?;
+    let provider = crate::summarize::provider_for(crate::summarize::roles::Role::Notes, &config, &state.heavy_inference)?;
     let (system, user) =
         crate::summarize::digest::build_digest_prompt(&corpus, &range_label, &config.note_language);
     let markdown = provider.complete(&system, &user).await?;
@@ -9231,7 +9242,7 @@ pub async fn generate_timeline(
             .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
         c.clone()
     };
-    let provider = crate::summarize::provider_for(crate::summarize::roles::Role::Notes, &config)?;
+    let provider = crate::summarize::provider_for(crate::summarize::roles::Role::Notes, &config, &state.heavy_inference)?;
     let timeline =
         crate::summarize::timeline::generate(provider.as_ref(), &segments, duration_s).await?;
     // SEAM-F1 (2026-07-11 audit, plaintext-at-rest): the provider `.await` above can span a relock,
@@ -17688,7 +17699,8 @@ mod lifecycle_tests {
             brain_live: false,
             ..Default::default()
         }));
-        state.reasoner = crate::reason::ReasonerCell::new(Arc::clone(&cloud_cfg));
+        state.reasoner =
+            crate::reason::ReasonerCell::new(Arc::clone(&cloud_cfg), state.heavy_inference.clone());
 
         // PRECONDITION (the trap): this config cloud-routes the general extraction seam.
         assert!(

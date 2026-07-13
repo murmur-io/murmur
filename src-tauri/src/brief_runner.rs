@@ -188,7 +188,11 @@ async fn run_one_brief(
 
     // Build the provider (consent gate + redaction firewall) BEFORE composing the prompt — an
     // unconsented cloud provider fails closed here and NOTHING egresses.
-    let provider = crate::summarize::provider_for(crate::summarize::roles::Role::Notes, &config)?;
+    let provider = crate::summarize::provider_for(
+        crate::summarize::roles::Role::Notes,
+        &config,
+        &state.heavy_inference,
+    )?;
     let range_label = format!("the last {} days", schedule.scope_days.clamp(1, 90));
     let (system, mut user) = crate::summarize::digest::build_digest_prompt(
         &built.corpus,
