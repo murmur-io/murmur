@@ -314,6 +314,46 @@ export class MeetingTimelineComponent {
     })),
   );
 
+  /**
+   * The `order` of every speaker block whose [startS, endS) currently contains the playhead — a
+   * single `computed`, scanned ONCE per `currentTime` tick (O(n) over all blocks across all
+   * lanes); the template then does an O(1) `.has(blk.order)` per rendered block. Replaces the
+   * former `isActive(startS, endS)` METHOD binding, which Angular re-ran once per rendered block
+   * on EVERY change-detection pass — for a 1h+ meeting's timeline (proportional to meeting
+   * length, unlike the transcript's RENDER_CAP window) driven by `currentTime` writes on every
+   * native `timeupdate` (~4×/s during playback), this was the exact `isActiveSegment()`-class
+   * eval storm already fixed once in `audio-panel.component.ts`'s `activeSegKeys` — reintroduced
+   * here, unfixed (2026-07-13 perf follow-up).
+   */
+  readonly activeBlockOrders = computed<Set<number>>(() => {
+    const t = this.currentTime();
+    const out = new Set<number>();
+    for (const lane of this.lanes()) {
+      for (const blk of lane.blocks) {
+        if (t >= blk.startS && t < blk.endS) {
+          out.add(blk.order);
+        }
+      }
+    }
+    return out;
+  });
+
+  /**
+   * Same pattern as [`activeBlockOrders`] for the topic ribbon AND the chapter list — both derive
+   * their `order` from the same [`topics`] computed, so ONE Set covers both templates' `.has()`
+   * lookups.
+   */
+  readonly activeTopicOrders = computed<Set<number>>(() => {
+    const t = this.currentTime();
+    const out = new Set<number>();
+    for (const top of this.topics()) {
+      if (t >= top.startS && t < top.endS) {
+        out.add(top.order);
+      }
+    }
+    return out;
+  });
+
   /** True once we have at least one lane or topic to draw. */
   readonly ready = computed(
     () =>
@@ -366,12 +406,6 @@ export class MeetingTimelineComponent {
   protected readonly currentRounded = computed(() =>
     Math.round(clamp(this.currentTime(), 0, this.span())),
   );
-
-  /** True when playback is inside [startS, endS) — drives the live highlight. */
-  isActive(startS: number, endS: number): boolean {
-    const t = this.currentTime();
-    return t >= startS && t < endS;
-  }
 
   /** Click a block → request a seek to its start (parent decides if audio moves). */
   onBlock(event: MouseEvent, startS: number): void {
@@ -486,11 +520,6 @@ export class MeetingTimelineComponent {
       return;
     }
     this.renameSpeaker.emit({ oldLabel, newLabel });
-  }
-
-  /** True when the playhead sits inside a chapter — highlights its label. */
-  isActiveChapter(startS: number, endS: number): boolean {
-    return this.isActive(startS, endS);
   }
 
   /** Keyboard seeking on the focusable axis (← / → by 5s, Home/End). */
