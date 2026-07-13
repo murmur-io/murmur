@@ -8859,10 +8859,14 @@ fn mask_locked_meetings(
         .collect())
 }
 
-/// Aggregate analytics for the dashboard + Analytics tab.
+/// Aggregate analytics for the dashboard + Analytics tab. VISIBLE-content only — a sealed-and-
+/// not-session-unlocked folder's meetings are excluded from every count/duration/breakdown (same
+/// gate as `brain_overview`/`list_meetings`), so the Analytics tab can never reveal the size or
+/// activity pattern of content the user has deliberately locked.
 #[tauri::command]
 pub fn get_analytics(state: State<'_, AppState>) -> Result<Analytics, AppError> {
-    state.db.analytics()
+    let unlocked = unlocked_snapshot(state.inner())?;
+    state.db.analytics(&unlocked)
 }
 
 /// Rename a speaker across a meeting's cached timeline (e.g. "User 1" → "Sarah"). Persists to
