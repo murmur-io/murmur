@@ -199,6 +199,8 @@
   gap: var(--space-1);
   max-width: 14ch;
   overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   color: var(--text-secondary);
   background: var(--surface-raised);
   border: 1px solid var(--border-subtle);
