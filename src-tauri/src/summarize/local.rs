@@ -1,7 +1,9 @@
 //! The on-device HEAVY engine as a [`SummarizerProvider`] (spec §3.2, P3) — lets the Notes/Ask roles
 //! be served FULLY LOCALLY under the Fully-Local posture. Wraps a shared local [`LocalReasoner`]
 //! (whose weights live in the process-global mistral MODEL_CACHE, loaded once) and bridges the sync
-//! reasoner to the async trait via `spawn_blocking`.
+//! reasoner to the async trait via [`crate::perf::run_heavy`] — the shared "one heavy inference at
+//! a time" gate, not a bare `spawn_blocking` — so a local Notes/Ask generation can never run
+//! concurrently with an in-progress whisper transcription/diarization/embedding pass.
 //!
 //! ## Privacy (load-bearing)
 //! Built UNWRAPPED — no [`crate::summarize::redact::RedactingProvider`], no egress-ledger sink —
@@ -26,11 +28,16 @@ use crate::summarize::template;
 /// A [`SummarizerProvider`] backed by the on-device heavy reasoner.
 pub struct LocalSummarizerProvider {
     reasoner: Arc<dyn LocalReasoner>,
+    /// The shared `AppState::heavy_inference` gate — see `crate::perf::run_heavy`'s doc comment.
+    /// Every call into `reasoner.reason(...)` routes through it so a local Notes/Ask generation
+    /// can never run concurrently with an in-progress whisper transcription/diarization/embedding
+    /// pass on the same machine.
+    heavy: Arc<tokio::sync::Semaphore>,
 }
 
 impl LocalSummarizerProvider {
-    pub fn new(reasoner: Arc<dyn LocalReasoner>) -> Self {
-        Self { reasoner }
+    pub fn new(reasoner: Arc<dyn LocalReasoner>, heavy: Arc<tokio::sync::Semaphore>) -> Self {
+        Self { reasoner, heavy }
     }
 }
 
@@ -51,15 +58,17 @@ impl SummarizerProvider for LocalSummarizerProvider {
         // titles + transcript in one blob) — the on-device reasoner has one system+user channel.
         let prompt = template::render_prompt(req);
         let reasoner = Arc::clone(&self.reasoner);
-        let note = tokio::task::spawn_blocking(move || {
+        // Routed through the shared heavy-inference gate (perf::run_heavy), not a bare
+        // spawn_blocking — a local Notes generation must serialize against any OTHER heavy
+        // native-runtime call (whisper ASR, the diarizer, the embedder/NER) running concurrently.
+        let note = crate::perf::run_heavy(&self.heavy, move || {
             reasoner.reason(
                 "You are a meeting-notes writer. Produce clean Obsidian-ready Markdown; follow the \
                  instructions exactly.",
                 &prompt,
             )
         })
-        .await
-        .map_err(|e| AppError::Summarize(format!("local summarize task join failed: {e}")))??;
+        .await?;
         let note = note.trim_start_matches('\u{feff}').trim();
         if note.is_empty() {
             return Err(AppError::Summarize(
@@ -73,9 +82,7 @@ impl SummarizerProvider for LocalSummarizerProvider {
         let reasoner = Arc::clone(&self.reasoner);
         let system = system.to_string();
         let user = user.to_string();
-        let out = tokio::task::spawn_blocking(move || reasoner.reason(&system, &user))
-            .await
-            .map_err(|e| AppError::Summarize(format!("local complete task join failed: {e}")))??;
+        let out = crate::perf::run_heavy(&self.heavy, move || reasoner.reason(&system, &user)).await?;
         Ok(out.trim().to_string())
     }
 
@@ -92,9 +99,9 @@ impl SummarizerProvider for LocalSummarizerProvider {
         let reasoner = Arc::clone(&self.reasoner);
         let system = system.to_string();
         let user = user.to_string();
-        let out = tokio::task::spawn_blocking(move || reasoner.reason_with(&system, &user, opts))
-            .await
-            .map_err(|e| AppError::Summarize(format!("local complete task join failed: {e}")))??;
+        let out =
+            crate::perf::run_heavy(&self.heavy, move || reasoner.reason_with(&system, &user, opts))
+                .await?;
         Ok((
             out.trim().to_string(),
             crate::summarize::meta::CallMeta::default(),
@@ -106,10 +113,15 @@ impl SummarizerProvider for LocalSummarizerProvider {
 mod tests {
     use super::*;
     use crate::reason::StubReasoner;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     #[tokio::test]
     async fn id_is_local_and_available() {
-        let p = LocalSummarizerProvider::new(Arc::new(StubReasoner));
+        let p = LocalSummarizerProvider::new(
+            Arc::new(StubReasoner),
+            Arc::new(tokio::sync::Semaphore::new(1)),
+        );
         assert_eq!(p.id(), "local");
         assert!(matches!(p.availability().await, Availability::Available));
     }
@@ -118,8 +130,78 @@ mod tests {
     async fn complete_bridges_the_sync_reasoner() {
         // The stub echoes deterministically — proves the async↔sync spawn_blocking bridge works and
         // returns the reasoner's text (no network, no egress).
-        let p = LocalSummarizerProvider::new(Arc::new(StubReasoner));
+        let p = LocalSummarizerProvider::new(
+            Arc::new(StubReasoner),
+            Arc::new(tokio::sync::Semaphore::new(1)),
+        );
         let out = p.complete("sys", "user").await.unwrap();
         assert!(out.contains("stub-reason"), "got {out}");
+    }
+
+    /// A fake [`LocalReasoner`] whose `reason` call tracks max-concurrency via a shared
+    /// `AtomicUsize`, sleeping ~50ms mid-call so two overlapping calls would be observable if the
+    /// semaphore did NOT serialize them (mirrors `perf::run_heavy_serializes_two_concurrent_calls`).
+    struct ConcurrencyTrackingReasoner {
+        concurrent: Arc<AtomicUsize>,
+        max_concurrent: Arc<AtomicUsize>,
+    }
+
+    impl crate::reason::LocalReasoner for ConcurrencyTrackingReasoner {
+        fn id(&self) -> &str {
+            "concurrency-tracking-stub"
+        }
+
+        fn reason(&self, _system: &str, _user: &str) -> crate::error::Result<String> {
+            let now = self.concurrent.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_concurrent.fetch_max(now, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(50));
+            self.concurrent.fetch_sub(1, Ordering::SeqCst);
+            Ok("tracked".to_string())
+        }
+
+        fn structured(
+            &self,
+            _system: &str,
+            _user: &str,
+            _json_schema: &serde_json::Value,
+        ) -> crate::error::Result<serde_json::Value> {
+            Ok(serde_json::json!({}))
+        }
+    }
+
+    /// The core contract this change adds: TWO separate `LocalSummarizerProvider` instances that
+    /// share ONE `heavy_inference` semaphore never run their reasoner calls concurrently — proving
+    /// the wiring is real, not just "it compiles". Without routing `complete` through
+    /// `perf::run_heavy`, two concurrent `tokio::spawn`ed calls would both land on the blocking
+    /// pool and race (max_concurrent would read 2).
+    #[tokio::test]
+    async fn two_providers_sharing_one_semaphore_never_run_concurrently() {
+        let heavy = Arc::new(tokio::sync::Semaphore::new(1));
+        let concurrent: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+        let max_concurrent: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+
+        let make_provider = |heavy: Arc<tokio::sync::Semaphore>| {
+            LocalSummarizerProvider::new(
+                Arc::new(ConcurrencyTrackingReasoner {
+                    concurrent: concurrent.clone(),
+                    max_concurrent: max_concurrent.clone(),
+                }),
+                heavy,
+            )
+        };
+        let p1 = make_provider(heavy.clone());
+        let p2 = make_provider(heavy.clone());
+
+        let t1 = tokio::spawn(async move { p1.complete("sys", "user").await });
+        let t2 = tokio::spawn(async move { p2.complete("sys", "user").await });
+        t1.await.unwrap().unwrap();
+        t2.await.unwrap().unwrap();
+
+        assert_eq!(
+            max_concurrent.load(Ordering::SeqCst),
+            1,
+            "two LocalSummarizerProvider instances sharing one heavy_inference semaphore must \
+             never run their reasoner calls concurrently"
+        );
     }
 }
