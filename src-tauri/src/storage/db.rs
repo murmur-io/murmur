@@ -3528,10 +3528,28 @@ impl Db {
             }
         }
 
+        // Embed in small sub-batches rather than one call for the WHOLE meeting. Topic chunks are
+        // merged to >= TOPIC_MERGE_MIN_DURATION_S (60s), so a single long meeting (a 1h+ recording
+        // can easily produce 40-60 chunks) would otherwise build ONE rectangular Candle/Metal tensor
+        // sized (chunk_count, longest_chunk_tokens) in one blocking forward pass — a burst whose size
+        // scales with that ONE meeting's length, untouched by the per-run meeting-count cap above
+        // (2026-07-13: a reported launch freeze persisted after that cap because the freezing vault
+        // had a 1h+ recording — the cap bounds how many MEETINGS get re-embedded per run, not how
+        // much work one meeting's own embed call does).
+        const TOPIC_EMBED_SUB_BATCH: usize = 8;
         let vectors = if augs.is_empty() {
             Vec::new()
-        } else {
+        } else if augs.len() <= TOPIC_EMBED_SUB_BATCH {
             embedder.embed_passage(&augs)?
+        } else {
+            let mut vectors = Vec::with_capacity(augs.len());
+            for (i, sub_batch) in augs.chunks(TOPIC_EMBED_SUB_BATCH).enumerate() {
+                if i > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(30));
+                }
+                vectors.extend(embedder.embed_passage(sub_batch)?);
+            }
+            vectors
         };
 
         // PURGE-then-INSERT this meeting's topic rows in ONE transaction (clean replace).
@@ -15036,6 +15054,76 @@ mod tests {
         assert_eq!(
             indexed_after_second, TOTAL,
             "every meeting must be indexed after the second run"
+        );
+    }
+
+    /// Test-only `Embedder` that records the SIZE of every `embed()` call it receives (via
+    /// `embed_passage`'s default impl) instead of the actual text content — used to prove
+    /// `index_meeting_topic_chunks_reporting` sub-batches a long meeting's topic chunks rather
+    /// than embedding them all in one call.
+    struct RecordingEmbedder {
+        call_sizes: std::sync::Mutex<Vec<usize>>,
+    }
+
+    impl crate::embed::Embedder for RecordingEmbedder {
+        fn dim(&self) -> usize {
+            crate::embed::EMBED_DIM
+        }
+        fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            self.call_sizes.lock().unwrap().push(texts.len());
+            Ok(texts.iter().map(|_| vec![0.0f32; crate::embed::EMBED_DIM]).collect())
+        }
+    }
+
+    /// 2026-07-13 launch-freeze fix (round 2): a single LONG meeting (topic chunks merge to >= 60s
+    /// each, so a 1h+ recording can produce 40-60 of them) must NOT be embedded in one Candle/Metal
+    /// call sized to the whole meeting — that burst scales with ONE meeting's length and is
+    /// untouched by the per-run meeting-count cap (a freshly-Brain-enabled vault containing a long
+    /// recording kept freezing on launch even after that cap shipped). Proves the embed calls are
+    /// sub-batched to TOPIC_EMBED_SUB_BATCH (8) at a time.
+    #[test]
+    fn long_meeting_topic_chunks_are_embedded_in_small_sub_batches() {
+        let db = mem_db();
+        db.insert_meeting(&sample_meeting("m-long", "2026-06-24T10:00:00Z"))
+            .unwrap();
+        // 10 topic blocks: each a single 65s segment (>= the 60s merge floor, so it survives as
+        // its own topic) separated by a 35s lull (>= the 30s lull-boundary threshold) from the next.
+        const BLOCKS: i64 = 10;
+        let mut segs = Vec::new();
+        let mut cursor = 0.0f64;
+        for i in 0..BLOCKS {
+            let start = cursor;
+            let end = start + 65.0;
+            segs.push(long_seg(i, start, end, &format!("topic block number {i}")));
+            cursor = end + 35.0;
+        }
+        db.insert_segments("m-long", &segs).unwrap();
+        let nothing = std::collections::HashSet::new();
+
+        let embedder = RecordingEmbedder {
+            call_sizes: std::sync::Mutex::new(Vec::new()),
+        };
+        db.index_meeting_topic_chunks("m-long", &segs, &embedder, &nothing)
+            .unwrap();
+
+        assert_eq!(
+            topic_chunk_count(&db, "m-long"),
+            BLOCKS,
+            "sanity: the fixture must actually produce one topic chunk per block"
+        );
+        let calls = embedder.call_sizes.into_inner().unwrap();
+        assert!(
+            calls.iter().all(|&n| n <= 8),
+            "no single embed call may exceed the sub-batch size, got call sizes: {calls:?}"
+        );
+        assert_eq!(
+            calls.iter().sum::<usize>(),
+            BLOCKS as usize,
+            "every topic chunk must still get embedded exactly once across the sub-batches"
+        );
+        assert!(
+            calls.len() > 1,
+            "10 chunks over an 8-per-batch cap must take more than one embed call, got: {calls:?}"
         );
     }
 
