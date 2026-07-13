@@ -17,7 +17,7 @@
     </div>
   </div>
 
-  @if (loading()) {
+  @if (!ledger() && loading()) {
     <p class="empty">Loading…</p>
   }
   @if (error(); as err) {
