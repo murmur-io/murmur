@@ -9187,6 +9187,13 @@ impl Db {
     /// sources only; a sealed source contributes nothing to any of them. Ordered by most-recent
     /// contact (last_talked DESC), then name.
     ///
+    /// `open_commitment_count` MUST use the exact same predicate as the person-dossier's "who owes
+    /// what" section (`summarize::dossier::build_dossier_data`) — an open item belongs to this
+    /// person iff it's from one of their VISIBLE mentioning meetings OR its owner name-matches —
+    /// otherwise the card badge and the dossier opened from that same card can disagree (a person
+    /// mentioned in a meeting with an open, unowned/differently-owned action item was undercounted
+    /// here while the dossier counted it).
+    ///
     /// Returns [`PeopleList`], not a bare `Vec`, because the candidate set is itself capped
     /// UPSTREAM by `list_entities_visible`'s `MAX_VISIBLE_ENTITIES` (500, ordered by mention
     /// count across ALL kinds) — on a vault with >500 visible entities, some visible Persons can
@@ -9201,18 +9208,10 @@ impl Db {
             .into_iter()
             .filter(|n| n.kind == EntityKind::Person)
             .collect();
-        // Owner-scoped commitments are cheap to compute ONCE (the full visible rollup) and bucket
-        // by lowercased owner name, rather than re-scanning every note per person.
-        let mut commitments_by_owner: std::collections::HashMap<String, i64> =
-            std::collections::HashMap::new();
-        for c in self.list_open_commitments(unlocked, None)? {
-            if let Some(owner) = c.owner.as_deref() {
-                let key = owner.trim().to_lowercase();
-                if !key.is_empty() {
-                    *commitments_by_owner.entry(key).or_insert(0) += 1;
-                }
-            }
-        }
+        // The full VISIBLE open-commitment rollup, computed ONCE and reused per person below —
+        // mirrors `build_dossier_data`'s corpus (mention-id match OR owner-name match), NOT a
+        // narrower owner-only bucket.
+        let all_commitments = self.list_open_commitments(unlocked, None)?;
         let mut out: Vec<PersonCard> = Vec::with_capacity(people.len());
         for p in people {
             // meeting_count + last_talked: VISIBLE mentions only, newest first.
@@ -9221,11 +9220,21 @@ impl Db {
             let last_talked = mentions.first().map(|m| m.started_at.clone());
             // current_fact_count: currently-valid facts about this person from VISIBLE meetings.
             let current_fact_count = self.list_facts_visible(&p.id, unlocked)?.len() as i64;
-            // open_commitment_count: open action items owned by this person (case-insensitive name).
-            let open_commitment_count = commitments_by_owner
-                .get(&p.name.trim().to_lowercase())
-                .copied()
-                .unwrap_or(0);
+            // open_commitment_count: same predicate as the dossier's "who owes what" — an open item
+            // from one of this person's mentioning meetings, OR owned by this person (name match).
+            let mention_ids: std::collections::HashSet<&str> =
+                mentions.iter().map(|m| m.meeting_id.as_str()).collect();
+            let name_lc = p.name.trim().to_lowercase();
+            let open_commitment_count = all_commitments
+                .iter()
+                .filter(|c| {
+                    mention_ids.contains(c.meeting_id.as_str())
+                        || c.owner
+                            .as_deref()
+                            .map(|o| o.trim().to_lowercase() == name_lc)
+                            .unwrap_or(false)
+                })
+                .count() as i64;
             out.push(PersonCard {
                 id: p.id,
                 name: p.name,
@@ -18044,6 +18053,48 @@ mod graph_tests {
         assert_eq!(
             bob_u.current_fact_count, 2,
             "both facts visible when unlocked"
+        );
+    }
+
+    /// The People card's `open_commitment_count` badge MUST agree with the count backing the same
+    /// person's dossier "who owes what" section one click away
+    /// (`summarize::dossier::build_dossier_data`), which counts an open item as this person's iff
+    /// it's from one of their mentioning meetings OR owner-name-matches — NOT owner-name-match
+    /// alone. RED-before-GREEN: a narrower owner-only bucket undercounts a person mentioned in a
+    /// meeting with an open, unowned action item, so the card badge (0) disagrees with the dossier
+    /// (1) for the exact same person.
+    #[test]
+    fn list_people_open_commitment_count_matches_dossier_mention_or_owner_filter() {
+        let db = file_db("people-dossier-parity");
+        seed_note(
+            &db,
+            "m1",
+            "## Action items\n- [ ] Follow up on pricing 2026-08-01\n",
+            None,
+        );
+        let priya = db.upsert_entity("Priya", EntityKind::Person).unwrap();
+        db.add_mention(&priya, "m1").unwrap();
+
+        let empty: HashSet<String> = HashSet::new();
+        let cards = db.list_people(&empty).unwrap().people;
+        let priya_card = cards
+            .iter()
+            .find(|p| p.id == priya)
+            .expect("Priya is visible via her mention");
+        assert_eq!(
+            priya_card.open_commitment_count, 1,
+            "the card badge must count the open, unowned action item from Priya's mentioned \
+             meeting, same as the dossier's 'who owes what' section"
+        );
+
+        let dossier = crate::summarize::dossier::build_dossier_data(&db, &priya, &empty)
+            .unwrap()
+            .expect("Priya has a visible dossier");
+        assert_eq!(
+            dossier.commitments.len() as i64,
+            priya_card.open_commitment_count,
+            "the People card badge and the dossier 'who owes what' count must never disagree \
+             for the same person"
         );
     }
 
