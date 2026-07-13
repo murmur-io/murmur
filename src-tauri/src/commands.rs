@@ -25974,6 +25974,15 @@ mod lifecycle_tests {
     /// could be sealed with NO warning that its notes were still shared 1:1 (link/user). This proves
     /// the enumeration that `folder_active_shares` (→ the dialog) reads: it surfaces the folder's
     /// ACTIVE link + user shares, and excludes revoked shares AND shares in other folders.
+    ///
+    /// The mode-B (Murmur↔Murmur USER) fixture is seeded via the REAL production helper
+    /// (`insert_outbound_user_share`, called from `share_note_to_user_inner`) rather than
+    /// `insert_outbound_share` (which hardcodes `state='active'` and is only ever used for mode-A LINK
+    /// shares) — `insert_outbound_user_share` never writes `'active'`, only `'sent'`/`'awaiting_key'`.
+    /// A prior version of this test seeded its "user"-mode row via `insert_outbound_share`, which gave
+    /// false confidence: it never exercised the state values a genuine mode-B row actually carries, so
+    /// it didn't catch `active_link_user_shares_for_folder`'s `WHERE state = 'active'` excluding every
+    /// real 1:1-person share (100%-reproducible, not an edge case).
     #[test]
     fn active_link_user_shares_for_folder_lists_active_1to1_and_excludes_revoked_and_other_folders() {
         let state = build_state("folder-1to1-shares");
@@ -26010,23 +26019,50 @@ mod lifecycle_tests {
         };
         mk_note("m1", "f1", "Sync");
         mk_note("m2", "f2", "Elsewhere");
-        // f1/m1: an active LINK + active USER share, plus a REVOKED link that must be excluded.
+        // f1/m1: an active LINK share, a REVOKED link that must be excluded, a mode-B USER share
+        // already 'sent' (registered recipient), and a mode-B USER share still 'awaiting_key'
+        // (unregistered recipient, pending re-wrap) — both are LIVE and must surface.
         state.db.insert_outbound_share("lnk", "m1", "link", 1, "t").unwrap();
-        state.db.insert_outbound_share("usr", "m1", "user", 1, "t").unwrap();
         state.db.insert_outbound_share("old", "m1", "link", 1, "t").unwrap();
         state.db.set_outbound_share_state("old", "revoked").unwrap();
+        state
+            .db
+            .insert_outbound_user_share("usr-sent", "m1", 1, "t", "sent", b"nk", "acct-1", "a@x.com", b"hash")
+            .unwrap();
+        state
+            .db
+            .insert_outbound_user_share(
+                "usr-pending",
+                "m1",
+                1,
+                "t",
+                "awaiting_key",
+                b"nk",
+                "acct-2",
+                "b@x.com",
+                b"hash",
+            )
+            .unwrap();
         // f2/m2: a share in ANOTHER folder must not leak into f1's report.
         state.db.insert_outbound_share("f2lnk", "m2", "link", 1, "t").unwrap();
 
         let shares = state.db.active_link_user_shares_for_folder("f1").unwrap();
         assert_eq!(
             shares.len(),
-            2,
-            "two active 1:1 shares in f1 (revoked + other-folder excluded): {shares:?}"
+            3,
+            "one active LINK + two live USER shares (sent + awaiting_key) in f1, revoked + other-folder excluded: {shares:?}"
         );
         let links = shares.iter().filter(|(_, m)| m == "link").count();
         let users = shares.iter().filter(|(_, m)| m == "user").count();
-        assert_eq!((links, users), (1, 1), "one link + one user share");
+        assert_eq!((links, users), (1, 2), "one link + two user shares (sent + awaiting_key)");
+        assert!(
+            shares.iter().any(|(id, _)| id == "usr-sent"),
+            "a 'sent' mode-B share must surface: {shares:?}"
+        );
+        assert!(
+            shares.iter().any(|(id, _)| id == "usr-pending"),
+            "an 'awaiting_key' mode-B share must surface: {shares:?}"
+        );
         assert!(
             shares.iter().all(|(id, _)| id != "old" && id != "f2lnk"),
             "revoked + other-folder shares excluded"
