@@ -15443,6 +15443,7 @@ mod lifecycle_tests {
             lifecycle: Mutex::new(()),
             share_refresh_lock: tokio::sync::Mutex::new(()),
             seal_epoch: std::sync::atomic::AtomicU64::new(0),
+            heavy_inference: Arc::new(tokio::sync::Semaphore::new(1)),
         }
     }
 

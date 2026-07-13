@@ -17,6 +17,7 @@ pub mod facts;
 pub mod mcp;
 pub mod memory;
 pub mod orchestrate;
+pub mod perf;
 pub mod pipeline;
 pub mod proactive;
 pub mod prompts;
