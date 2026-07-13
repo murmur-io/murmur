@@ -541,7 +541,11 @@ async fn run_inner(
         None
     };
 
-    let (merged_segments, echo_suppressed, cluster_voiceprints) = tokio::task::spawn_blocking(move || -> Result<(Vec<crate::transcribe::types::Segment>, usize, Vec<crate::transcribe::diarize::ClusterVoiceprint>)> {
+    // Routed through the shared heavy-inference gate (perf::run_heavy), not a bare spawn_blocking
+    // — this closure loads Whisper AND (further in) the diarizer, so it must serialize against any
+    // OTHER heavy native-runtime call (embedder, NER, brain sidecar) running concurrently, not just
+    // against itself.
+    let (merged_segments, echo_suppressed, cluster_voiceprints) = crate::perf::run_heavy(&state.heavy_inference, move || -> Result<(Vec<crate::transcribe::types::Segment>, usize, Vec<crate::transcribe::diarize::ClusterVoiceprint>)> {
         use crate::audio::merge::{merge_streams, StreamInput, SPEAKER_ME, SPEAKER_OTHERS};
 
         let transcriber = Transcriber::load(&model_path_owned)?;
@@ -639,8 +643,7 @@ async fn run_inner(
             crate::audio::merge::suppress_cross_stream_echo(merge_streams(streams), leak.as_ref());
         Ok((merged, echo_suppressed, cluster_voiceprints))
     })
-    .await
-    .map_err(|e| AppError::Transcribe(format!("transcription task panicked: {e}")))??;
+    .await?;
 
     // Persist the (opt-in) per-cluster voiceprints — one row per diarized "others" cluster, label
     // NULL until enrolled by rename. Best-effort: a persist failure is logged (no PII) and never
