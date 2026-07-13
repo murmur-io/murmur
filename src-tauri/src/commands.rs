@@ -24511,6 +24511,57 @@ mod lifecycle_tests {
         );
     }
 
+    /// STUCK-REPUBLISH FIX (Library badge/CTA parity): a share row whose MOST RECENT republish
+    /// attempt failed transiently but still carries a live server `item_id` (`set_org_share_failed`
+    /// never clears `item_id`) must still show the Library "shared into org" badge — mirroring the
+    /// same "live" definition `org_shares_for_source` already applies for the note-share-panel CTA
+    /// (`org_shares_for_source_includes_failed_rows_with_a_live_item_id`, storage/db.rs). Before the
+    /// fix, `list_meeting_org_shares_inner` used a hardcoded `state = 'uploaded'` filter that dropped
+    /// this exact reachable row, so the Library badge vanished while the share-panel CTA (reading the
+    /// already-fixed `org_shares_for_source`) still claimed the meeting was shared — a real two-surface
+    /// disagreement. A `failed` row that NEVER published (no `item_id`) must stay excluded (no live
+    /// item to badge).
+    #[test]
+    fn list_meeting_org_shares_includes_failed_rows_with_a_live_item_id() {
+        let state = build_state("list-meeting-org-shares-stuck-republish");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        make_open_folder(&state.db, "f-open", "Open");
+
+        // Meeting m1: published once, then a REPUBLISH attempt failed transiently. item_id stays set
+        // (set_org_share_failed doesn't clear it) — this is a genuinely LIVE share.
+        seed_meeting(&state.db, "m-stuck", "# note", Some("f-open"));
+        state
+            .db
+            .insert_org_share(
+                "s-stuck", "org-1", Some("m-stuck"), None, "meeting", Some("Stuck"),
+                1, 1, &[11u8; 32], "2026-07-12T09:00:00Z",
+            )
+            .unwrap();
+        state.db.set_org_share_uploaded("s-stuck", "item-stuck", "2026-07-12T09:00:00Z").unwrap();
+        state.db.set_org_share_failed("s-stuck", "republish_upload_failed", "2026-07-12T09:05:00Z").unwrap();
+
+        // Meeting m2: failed on the INITIAL publish — never got an item_id. No live item to badge.
+        seed_meeting(&state.db, "m-never-live", "# note", Some("f-open"));
+        state
+            .db
+            .insert_org_share(
+                "s-never-live", "org-1", Some("m-never-live"), None, "meeting", Some("Never live"),
+                1, 1, &[12u8; 32], "2026-07-12T09:00:00Z",
+            )
+            .unwrap();
+        state.db.set_org_share_failed("s-never-live", "publish_failed", "2026-07-12T09:00:00Z").unwrap();
+
+        let rows = list_meeting_org_shares_inner(&state).unwrap();
+        assert!(
+            rows.iter().any(|r| r.meeting_id == "m-stuck"),
+            "a failed-with-item_id (stuck republish) row's badge must still be visible in Library"
+        );
+        assert!(
+            !rows.iter().any(|r| r.meeting_id == "m-never-live"),
+            "a failed row that never published (no item_id) stays excluded — no live item"
+        );
+    }
+
     /// FIX B (received-items COUNT): `OrgStatus.received_count` reflects the LOCAL replica (what
     /// colleagues shared IN), DISTINCT from `item_count` (the caller's OWN uploaded outbound shares).
     /// Seed org_items (received) + an outbound uploaded share and assert the two counts are independent.
@@ -27948,6 +27999,14 @@ pub struct MeetingOrgShareRow {
 /// meetings, in one bulk call (avoids an N+1 `meeting_org_shares` fetch per Library row). Same
 /// disclosure class + gate as [`meeting_org_shares`]: a sealed-and-not-session-unlocked meeting's
 /// rows are dropped, exactly mirroring `mask_locked_meetings` for `list_meetings`.
+///
+/// STUCK-REPUBLISH FIX: uses `Db::list_live_org_shares` (not a hardcoded `state = 'uploaded'`
+/// filter) so a row whose most recent republish attempt failed transiently but still carries a
+/// live server `item_id` (`set_org_share_failed` never clears it) keeps showing the badge — the
+/// same "live" definition already applied by `org_shares_for_source` / `OrgStatus.item_count` /
+/// `org_resolve_source_inner`. Before this fix, that exact reachable state (edit → republish →
+/// transient network blip) made the Library badge vanish while the note-share-panel's own CTA
+/// (which reads `org_shares_for_source`) still showed the item as shared — two surfaces disagreed.
 #[tauri::command]
 pub fn list_meeting_org_shares(
     state: State<'_, AppState>,
@@ -27959,7 +28018,7 @@ pub fn list_meeting_org_shares(
 pub(crate) fn list_meeting_org_shares_inner(
     st: &AppState,
 ) -> Result<Vec<MeetingOrgShareRow>, AppError> {
-    let rows = st.db.list_org_shares_in_state("uploaded")?;
+    let rows = st.db.list_live_org_shares()?;
     let mut out = Vec::new();
     let mut org_names: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut seen = std::collections::HashSet::new();
