@@ -8,6 +8,10 @@
   flex: none;
   align-items: center;
   gap: var(--space-1);
+  /* A little breathing room on top of the tree's own 2px row gap — at the
+     tight gap alone, the hover/selected pill's rounded corners read as
+     crowding into the row right above/below it. */
+  margin-block: 1px;
   border: 1px solid transparent;
   border-radius: var(--radius-md);
   transition:
@@ -89,7 +93,7 @@
   gap: var(--space-2);
   flex: 1 1 auto;
   min-width: 0;
-  padding: var(--space-2) var(--space-2);
+  padding: 6px var(--space-2);
   border: 1px solid transparent;
   border-radius: var(--radius-md);
   background: transparent;
