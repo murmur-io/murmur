@@ -24149,6 +24149,74 @@ mod lifecycle_tests {
         assert_eq!(other.title, "Ich notatka", "a non-owned title is left as-is");
     }
 
+    /// STUCK-REPUBLISH FIX (`resolve_owned_source`): `resolve_owned_source` must mirror
+    /// `org_resolve_source_inner` (fixed in cd21b10) and NOT gate on `state == "uploaded"` — a
+    /// republish that failed transiently leaves the row `state = "failed"` with its OLD,
+    /// still-server-live `item_id` retained (`set_org_share_failed` never clears it). Before this
+    /// fix `resolve_owned_source` returned `None` for such a row, so the author's own stuck card
+    /// showed up as NOT owned in `list_org_items` — `openOrgCard` would then route to the read-only
+    /// viewer instead of the real editable original. A `revoked` row (intentionally torn down) is
+    /// the one state that must still fail to enrich.
+    #[test]
+    fn list_org_items_enriches_a_stuck_failed_owned_item_but_not_a_revoked_one() {
+        let state = build_state("org-list-owned-stuck-failed");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        make_open_folder(&state.db, "f-stuck", "Team");
+        let now = "2026-07-13T00:00:00Z";
+
+        // Published successfully once, then a REPUBLISH attempt failed — item_id retained.
+        state
+            .db
+            .insert_note("n-stuck", "f-stuck", "Untitled", "Fixed Title", "# body", 1)
+            .unwrap();
+        state
+            .db
+            .upsert_org_item("item-stuck", "org-1", 1, "kgm004a", "Untitled", "# body", now, 1, 1, &[9u8; 32], None, None)
+            .unwrap();
+        state
+            .db
+            .insert_org_share("s-stuck", "org-1", None, Some("n-stuck"), "note", Some("Untitled"), 1, 1, &[9u8; 32], now)
+            .unwrap();
+        state.db.set_org_share_uploaded("s-stuck", "item-stuck", now).unwrap();
+        state.db.set_org_share_failed("s-stuck", "republish_upload_failed", now).unwrap();
+
+        // A SEPARATE row that was uploaded, then intentionally revoked — must NOT enrich.
+        state
+            .db
+            .insert_note("n-revoked", "f-stuck", "Gone", "Gone Title", "# body", 1)
+            .unwrap();
+        state
+            .db
+            .upsert_org_item("item-revoked", "org-1", 1, "kgm004a", "Gone", "# body", now, 1, 1, &[8u8; 32], None, None)
+            .unwrap();
+        state
+            .db
+            .insert_org_share("s-revoked", "org-1", None, Some("n-revoked"), "note", Some("Gone"), 1, 1, &[8u8; 32], now)
+            .unwrap();
+        state.db.set_org_share_uploaded("s-revoked", "item-revoked", now).unwrap();
+        state.db.set_org_share_state("s-revoked", "revoked", now).unwrap();
+
+        let items = list_org_items_inner(&state, "org-1").unwrap();
+
+        let stuck = items.iter().find(|i| i.item_id == "item-stuck").unwrap();
+        assert_eq!(
+            stuck.title, "Fixed Title",
+            "a stuck failed-with-item_id row still shows the source's CURRENT title"
+        );
+        let owned = stuck
+            .owned_source
+            .as_ref()
+            .expect("a stuck failed-with-item_id row still resolves as owned (not a leftover read-only replica)");
+        assert_eq!(owned.kind, "document");
+        assert_eq!(owned.id, "n-stuck");
+
+        let revoked = items.iter().find(|i| i.item_id == "item-revoked").unwrap();
+        assert!(
+            revoked.owned_source.is_none(),
+            "an intentionally revoked share must not enrich as owned"
+        );
+    }
+
     /// `OrgItemHeader.kind` round-trips for BOTH an owned document-kind share and an owned
     /// meeting-kind share, and stays `None` for a colleague's item that was upserted with no stored
     /// `source_kind` (mirrors an item ingested off a v1 envelope / before this column existed — the
@@ -28858,7 +28926,13 @@ fn resolve_owned_source(
     let Some(row) = st.db.org_share_by_item(item_id)? else {
         return Ok(None);
     };
-    if row.state != "uploaded" {
+    // Mirrors `org_resolve_source_inner`: only a `revoked` row is refused — it was INTENTIONALLY
+    // torn down, so it must not enrich as owned. A `failed` row with its `item_id` still set (a
+    // republish that failed transiently but whose PRIOR publish is still genuinely live on the
+    // server, see `org_shares_for_source`) falls through, so the author's own stuck row still
+    // resolves to its real editable source + current title instead of quietly looking unowned in
+    // the list and routing the click to the read-only viewer.
+    if row.state == "revoked" {
         return Ok(None);
     }
     if let Some(document_id) = row.document_id {
