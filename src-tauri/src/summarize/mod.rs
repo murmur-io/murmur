@@ -95,6 +95,7 @@ pub(crate) fn egress_is_cloud(id: &str, config: &AppConfig) -> bool {
 pub fn make_provider(
     id: &str,
     config: &AppConfig,
+    heavy: &Arc<tokio::sync::Semaphore>,
 ) -> crate::error::Result<Arc<dyn SummarizerProvider>> {
     // The legacy per-arm model semantics: only claude_code/anthropic ever read `provider_model`;
     // ollama/gateway resolve from ollama_model/gateway_model ("" = inherit below).
@@ -107,7 +108,7 @@ pub fn make_provider(
         model,
         effort: config.provider_effort.clone(),
     };
-    make_provider_resolved(&target, config)
+    make_provider_resolved(&target, config, heavy)
 }
 
 /// Build the `SummarizerProvider` serving `role`, resolved through the role layer
@@ -121,6 +122,7 @@ pub fn make_provider(
 pub fn provider_for(
     role: roles::Role,
     config: &AppConfig,
+    heavy: &Arc<tokio::sync::Semaphore>,
 ) -> crate::error::Result<Arc<dyn SummarizerProvider>> {
     let target = roles::provider_target(role, config);
     // Refuse ONLY the targets that build no provider (off/apple). `local` now builds the on-device
@@ -133,7 +135,7 @@ pub fn provider_for(
             target.connection
         )));
     }
-    make_provider_resolved(&target, config)
+    make_provider_resolved(&target, config, heavy)
 }
 
 /// The EFFECTIVE model id a resolved target sends: the target's own model, or — when empty —
@@ -162,6 +164,7 @@ pub(crate) fn effective_model_requested(target: &roles::RoleTarget, config: &App
 fn make_provider_resolved(
     target: &roles::RoleTarget,
     config: &AppConfig,
+    heavy: &Arc<tokio::sync::Semaphore>,
 ) -> crate::error::Result<Arc<dyn SummarizerProvider>> {
     let id = target.connection.as_str();
     // E10 — fail-closed consent gate, now classification-aware: no cloud provider is built (so no
@@ -262,7 +265,10 @@ fn make_provider_resolved(
                     let reasoner: Arc<dyn crate::reason::LocalReasoner> = Arc::new(
                         crate::reason::sidecar::SidecarReasoner::new(path, timeouts)?,
                     );
-                    return Ok(Arc::new(local::LocalSummarizerProvider::new(reasoner)));
+                    return Ok(Arc::new(local::LocalSummarizerProvider::new(
+                        reasoner,
+                        heavy.clone(),
+                    )));
                 }
                 None => {
                     return Err(crate::error::AppError::Unavailable(
@@ -440,7 +446,7 @@ mod tests {
             cloud_egress_consented: false,
             ..AppConfig::default()
         };
-        let res = make_provider(PROVIDER_OLLAMA, &cfg);
+        let res = make_provider(PROVIDER_OLLAMA, &cfg, &Arc::new(tokio::sync::Semaphore::new(1)));
         assert!(
             matches!(res, Err(crate::error::AppError::Unavailable(_))),
             "expected Unavailable for remote ollama without consent"
@@ -455,7 +461,7 @@ mod tests {
             ..AppConfig::default()
         };
         // local ollama must build without consent
-        assert!(make_provider(PROVIDER_OLLAMA, &cfg).is_ok());
+        assert!(make_provider(PROVIDER_OLLAMA, &cfg, &Arc::new(tokio::sync::Semaphore::new(1))).is_ok());
     }
 
     fn consented_config() -> AppConfig {
@@ -471,9 +477,9 @@ mod tests {
         // transparent to `id()`, so we assert construction succeeds (with consent granted) and
         // the wrapped provider reports the inner id.
         let cfg = consented_config();
-        let cc = make_provider(PROVIDER_CLAUDE_CODE, &cfg).unwrap();
+        let cc = make_provider(PROVIDER_CLAUDE_CODE, &cfg, &Arc::new(tokio::sync::Semaphore::new(1))).unwrap();
         assert_eq!(cc.id(), PROVIDER_CLAUDE_CODE);
-        let an = make_provider(PROVIDER_ANTHROPIC, &cfg).unwrap();
+        let an = make_provider(PROVIDER_ANTHROPIC, &cfg, &Arc::new(tokio::sync::Semaphore::new(1))).unwrap();
         assert_eq!(an.id(), PROVIDER_ANTHROPIC);
     }
 
@@ -483,7 +489,7 @@ mod tests {
         // A remote ollama_base_url is covered by remote_ollama_requires_consent.
         let cfg = AppConfig::default();
         assert!(!cfg.cloud_egress_consented);
-        let ol = make_provider(PROVIDER_OLLAMA, &cfg).unwrap();
+        let ol = make_provider(PROVIDER_OLLAMA, &cfg, &Arc::new(tokio::sync::Semaphore::new(1))).unwrap();
         assert_eq!(ol.id(), PROVIDER_OLLAMA);
     }
 
@@ -494,7 +500,7 @@ mod tests {
         let cfg = AppConfig::default(); // consent OFF
         for id in [PROVIDER_CLAUDE_CODE, PROVIDER_ANTHROPIC] {
             // `dyn SummarizerProvider` isn't Debug, so inspect the Result without `{:?}`.
-            let res = make_provider(id, &cfg);
+            let res = make_provider(id, &cfg, &Arc::new(tokio::sync::Semaphore::new(1)));
             assert!(
                 matches!(res, Err(crate::error::AppError::Unavailable(_))),
                 "expected Unavailable for {id} without consent (got Ok or wrong error)"
@@ -517,12 +523,12 @@ mod tests {
         let mut cfg = AppConfig::load(&db).unwrap();
         cfg.grant_cloud_egress_consent(&db).unwrap();
         assert!(
-            make_provider(PROVIDER_CLAUDE_CODE, &cfg).is_ok(),
+            make_provider(PROVIDER_CLAUDE_CODE, &cfg, &Arc::new(tokio::sync::Semaphore::new(1))).is_ok(),
             "granted consent must build the cloud provider"
         );
         cfg.revoke_cloud_egress(&db).unwrap();
         for id in [PROVIDER_CLAUDE_CODE, PROVIDER_ANTHROPIC] {
-            let res = make_provider(id, &cfg);
+            let res = make_provider(id, &cfg, &Arc::new(tokio::sync::Semaphore::new(1)));
             assert!(
                 matches!(res, Err(crate::error::AppError::Unavailable(_))),
                 "expected Unavailable for {id} after revoke (got Ok or wrong error)"
@@ -531,7 +537,7 @@ mod tests {
         for role in [roles::Role::Notes, roles::Role::Ask, roles::Role::Live] {
             assert!(
                 matches!(
-                    provider_for(role, &cfg),
+                    provider_for(role, &cfg, &Arc::new(tokio::sync::Semaphore::new(1))),
                     Err(crate::error::AppError::Unavailable(_))
                 ),
                 "provider_for {role:?} must refuse after revoke"
@@ -551,7 +557,7 @@ mod tests {
             cloud_egress_consented: false,
             ..AppConfig::default()
         };
-        let err = make_provider(PROVIDER_GATEWAY, &c)
+        let err = make_provider(PROVIDER_GATEWAY, &c, &Arc::new(tokio::sync::Semaphore::new(1)))
             .map(|_| ())
             .expect_err("expected Err for gateway without consent");
         assert!(
@@ -573,7 +579,7 @@ mod tests {
         };
         // Must build without error — the make_provider consent gate + URL validation passed.
         assert!(
-            make_provider(PROVIDER_GATEWAY, &c).is_ok(),
+            make_provider(PROVIDER_GATEWAY, &c, &Arc::new(tokio::sync::Semaphore::new(1))).is_ok(),
             "consented localhost gateway must build successfully"
         );
     }
@@ -586,7 +592,7 @@ mod tests {
             cloud_egress_consented: true,
             ..AppConfig::default()
         };
-        let err = make_provider(PROVIDER_GATEWAY, &c)
+        let err = make_provider(PROVIDER_GATEWAY, &c, &Arc::new(tokio::sync::Semaphore::new(1)))
             .map(|_| ())
             .expect_err("expected Err for remote http gateway");
         assert!(
@@ -603,7 +609,7 @@ mod tests {
             cloud_egress_consented: true,
             ..AppConfig::default()
         };
-        let err = make_provider(PROVIDER_GATEWAY, &c)
+        let err = make_provider(PROVIDER_GATEWAY, &c, &Arc::new(tokio::sync::Semaphore::new(1)))
             .map(|_| ())
             .expect_err("expected Err for empty gateway URL");
         assert!(
@@ -629,7 +635,7 @@ mod tests {
                 ..AppConfig::default()
             };
             for role in [roles::Role::Notes, roles::Role::Ask, roles::Role::Live] {
-                let p = provider_for(role, &cfg)
+                let p = provider_for(role, &cfg, &Arc::new(tokio::sync::Semaphore::new(1)))
                     .unwrap_or_else(|e| panic!("{role:?}/{backend:?} must build: {e}"));
                 assert_eq!(p.id(), PROVIDER_CLAUDE_CODE, "{role:?}/{backend:?}");
             }
@@ -646,7 +652,7 @@ mod tests {
         for role in [roles::Role::Notes, roles::Role::Ask, roles::Role::Live] {
             assert!(
                 matches!(
-                    provider_for(role, &cfg),
+                    provider_for(role, &cfg, &Arc::new(tokio::sync::Semaphore::new(1))),
                     Err(crate::error::AppError::Unavailable(_))
                 ),
                 "fallback {role:?} must be consent-gated"
@@ -673,7 +679,7 @@ mod tests {
             extra(&mut cfg);
             assert!(
                 matches!(
-                    provider_for(roles::Role::Ask, &cfg),
+                    provider_for(roles::Role::Ask, &cfg, &Arc::new(tokio::sync::Semaphore::new(1))),
                     Err(crate::error::AppError::Unavailable(_))
                 ),
                 "explicit Ask→{conn} must be consent-gated"
@@ -682,7 +688,7 @@ mod tests {
             // transparent to id(), which reports the inner connection — the wrap itself is proven
             // by the redact.rs tests, exactly like the legacy factory tests above).
             cfg.cloud_egress_consented = true;
-            let p = provider_for(roles::Role::Ask, &cfg)
+            let p = provider_for(roles::Role::Ask, &cfg, &Arc::new(tokio::sync::Semaphore::new(1)))
                 .unwrap_or_else(|e| panic!("consented Ask→{conn} must build: {e}"));
             assert_eq!(p.id(), conn);
         }
@@ -698,7 +704,7 @@ mod tests {
             cloud_egress_consented: false,
             ..AppConfig::default()
         };
-        let p = provider_for(roles::Role::Ask, &cfg).expect("loopback ollama needs no consent");
+        let p = provider_for(roles::Role::Ask, &cfg, &Arc::new(tokio::sync::Semaphore::new(1))).expect("loopback ollama needs no consent");
         assert_eq!(p.id(), PROVIDER_OLLAMA);
     }
 
@@ -713,7 +719,7 @@ mod tests {
                 cloud_egress_consented: true,
                 ..AppConfig::default()
             };
-            let err = provider_for(roles::Role::Ask, &cfg)
+            let err = provider_for(roles::Role::Ask, &cfg, &Arc::new(tokio::sync::Semaphore::new(1)))
                 .map(|_| ())
                 .expect_err("explicit reasoner-only target must not build a provider");
             assert!(
