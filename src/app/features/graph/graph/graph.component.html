@@ -8,7 +8,14 @@
       </p>
     </div>
     @if (!loading() && total() > 0) {
-      <span class="count g-total" [attr.title]="total() + ' entities'">
+      <span
+        class="count g-total"
+        [attr.title]="
+          isCapped()
+            ? total() + ' of ' + graphData()!.totalVisibleEntities + ' entities'
+            : total() + ' entities'
+        "
+      >
         {{ total() }}
       </span>
     }
@@ -43,6 +50,14 @@
         <span>
           Some entities are hidden — unlock a folder to include them.
         </span>
+      </div>
+    }
+
+    <!-- A SEPARATE disclosure: the 500-row render cap, independent of locked folders. -->
+    @if (capDisclosure(); as msg) {
+      <div class="banner is-accent g-banner" role="status">
+        <span class="g-banner-glyph" aria-hidden="true"></span>
+        <span>{{ msg }}</span>
       </div>
     }
 

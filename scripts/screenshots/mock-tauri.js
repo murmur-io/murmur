@@ -259,6 +259,7 @@ deferred it twice is now removed, so it's unblocked for the GA cut.
       { source: "pr-atlas", target: "pr-sales", weight: 3 },
     ],
     hasHidden: true,
+    totalVisibleEntities: 10,
   };
 
   const ENTITY_DETAIL = {

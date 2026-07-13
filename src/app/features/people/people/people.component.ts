@@ -42,10 +42,29 @@ export class PeopleComponent {
   readonly loading = signal(true);
   readonly error = signal<string | null>(null);
 
+  /**
+   * The TRUE count of VISIBLE people, from `listPeople()`'s `totalVisiblePeople` — may exceed
+   * `people().length` when the BACKEND's 500-row cap (`list_entities_visible`'s
+   * `MAX_VISIBLE_ENTITIES`, upstream of `list_people`) trimmed the roster before it ever reached
+   * this component. Defaults to 0 (matches `people`'s empty initial state).
+   */
+  readonly totalVisiblePeople = signal(0);
+
   /** The selected person id — opens the structured person-dossier pane. */
   readonly selectedId = signal<string | null>(null);
 
   protected readonly total = computed(() => this.people().length);
+
+  /**
+   * Whether the BACKEND capped the roster below the true visible-person count — independent of,
+   * and reported ALONGSIDE, the client-side `RENDER_CAP` expander below. 2026-07-13 UX audit: the
+   * old "Show all {{ total() }} people" button used `total()` (== `people().length`, the ALREADY
+   * backend-capped roster) as if it were the true count, so a 650-person vault silently showed
+   * "Show all 500 people" with 150 missing and no indication anything was cut.
+   */
+  protected readonly backendCapped = computed(
+    () => this.totalVisiblePeople() > this.people().length,
+  );
 
   /**
    * 2026-07-13 perf audit (LOW-MODERATE): `list_people` has no backend LIMIT, so a vault with
@@ -85,8 +104,9 @@ export class PeopleComponent {
   private async fetch(): Promise<void> {
     this.error.set(null);
     try {
-      const rows = await this.ipc.listPeople();
+      const { people: rows, totalVisiblePeople } = await this.ipc.listPeople();
       this.people.set(rows);
+      this.totalVisiblePeople.set(totalVisiblePeople);
       // If the selected person is no longer visible (e.g. their folder re-sealed),
       // close the detail panel so we never point at a vanished person.
       const sel = this.selectedId();
@@ -95,6 +115,7 @@ export class PeopleComponent {
       }
     } catch (e) {
       this.people.set([]);
+      this.totalVisiblePeople.set(0);
       this.error.set(String(e));
     } finally {
       this.loading.set(false);
