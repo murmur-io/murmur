@@ -259,6 +259,7 @@ deferred it twice is now removed, so it's unblocked for the GA cut.
       { source: "pr-atlas", target: "pr-sales", weight: 3 },
     ],
     hasHidden: true,
+    totalVisibleEntities: 10,
   };
 
   const ENTITY_DETAIL = {
@@ -544,6 +545,11 @@ scope to the GA-critical path only.
       itemCount: 4,
       receivedCount: 9,
       pendingShares: 0,
+      // Per-instance active/inactive toggle (origin/murmur#273 follow-up) —
+      // `true` by default on real orgs (see OrgStatus.contextEnabled in
+      // models.ts); a fixture missing this field renders the demo's own
+      // healthy example org as "Disabled on this device" out of the box.
+      contextEnabled: true,
     },
   ];
 
@@ -760,6 +766,24 @@ scope to the GA-critical path only.
           modelLabel: "Claude",
           mode: "cloud",
           redacted: true,
+        };
+
+      // ── M3-CLIENT: sharing account (Settings → Account section) ──
+      // Signed-out shape (matches Rust `commands::AccountStatus`, camelCase over
+      // IPC): the demo world has no sharing-server account, so the section shows
+      // its normal signed-out "Create or sign in" affordance rather than falling
+      // through to the generic `default:` handler (a bare `account_status` name
+      // doesn't match the `list_`/`get_`/`has_`/`is_` fallback prefixes below, so
+      // an unhandled case would previously resolve `null` — which the FE now
+      // treats as a real signed-out status, never a permanent "Loading…" state).
+      case "account_status":
+        return {
+          loggedIn: false,
+          email: null,
+          unlockedForSharing: false,
+          shareConsented: false,
+          serverConfigured: false,
+          biometricUnlockAvailable: false,
         };
 
       // ── Shared Brain (org) ──

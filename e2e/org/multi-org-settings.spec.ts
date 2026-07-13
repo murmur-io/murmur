@@ -141,4 +141,23 @@ test.describe("Settings › Organizations — multi-org (mocked IPC)", () => {
       fullPage: true,
     });
   });
+
+  // Regression: the demo/screenshot mock's own default `ORGS` fixture
+  // ("Sonora", scripts/screenshots/mock-tauri.js) omitted `contextEnabled`,
+  // so the flagship demo org rendered as "Disabled on this device" out of
+  // the box. This test drives `org_list_statuses` with NO override — i.e.
+  // the real demo mock's default fixture — so it fails against the
+  // pre-fix fixture (missing field => falsy => "Disabled") and passes once
+  // the fixture carries `contextEnabled: true`.
+  test("the demo mock's own default org fixture is active on this device", async ({
+    page,
+  }) => {
+    await mockTauri(page, { account_status: ACCOUNT_STATUS });
+    await openOrgSection(page);
+
+    const sonora = page.locator(".org-card", { hasText: "Sonora" });
+    await expect(sonora).toBeVisible();
+    await expect(sonora.getByText("Active on this device")).toBeVisible();
+    await expect(sonora.getByText("Disabled on this device")).toHaveCount(0);
+  });
 });

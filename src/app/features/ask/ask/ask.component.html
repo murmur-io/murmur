@@ -70,7 +70,7 @@
             </div>
           </div>
         } @else {
-          @for (turn of conversation(); track $index) {
+          @for (turn of conversation(); track turn.id) {
             <div
               class="ask-row"
               [class.is-user]="turn.role === 'user'"

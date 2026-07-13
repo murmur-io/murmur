@@ -291,9 +291,17 @@ export class SharePanelComponent {
   readonly verifyMode = signal<ShareVerifyMode | null>(null);
 
   // --- Org Brain (Shared Brain v1) ------------------------------------------
-  /** The user's org membership + sync state; `null` when in no org (hides the section). */
-  private readonly orgStatus = signal<OrgStatus | null>(null);
-  readonly org = this.orgStatus.asReadonly();
+  /**
+   * EVERY org this user actively belongs to (created OR invited-into) — drives
+   * whether the "Add to Org Brain" section renders at all. Uses `orgListStatuses`
+   * (not the legacy single-org `orgStatus`, which only ever returns the FIRST
+   * locally-joined org): an invite-only member whose org isn't first in the local
+   * list must still see the CTA. The actual org PICK happens inside
+   * `OrgShareSheetComponent`, which already loads this same full list.
+   */
+  private readonly _orgs = signal<OrgStatus[]>([]);
+  /** True while the user belongs to at least one org (gates the CTA section). */
+  readonly org = computed(() => this._orgs().length > 0);
   /** This user's outgoing org shares (drives the "In Org Brain" state for THIS meeting). */
   private readonly orgShares = signal<OrgShareEntry[]>([]);
   /**
@@ -390,15 +398,15 @@ export class SharePanelComponent {
     }
   }
 
-  /** Load the org status + this user's org shares (stale-guarded on the meeting id). */
+  /** Load every joined org + this user's org shares (stale-guarded on the meeting id). */
   private async refreshOrg(id: string): Promise<void> {
     try {
-      const status = await this.ipc.orgStatus();
+      const orgs = await this.ipc.orgListStatuses();
       if (this.meetingId() !== id) {
         return;
       }
-      this.orgStatus.set(status);
-      if (status) {
+      this._orgs.set(orgs);
+      if (orgs.length > 0) {
         const shares = await this.ipc.listOrgShares();
         if (this.meetingId() !== id) {
           return;
@@ -416,7 +424,7 @@ export class SharePanelComponent {
       }
     } catch {
       // Org unavailable (older backend / not joined) — hide the section.
-      this.orgStatus.set(null);
+      this._orgs.set([]);
       this.orgShares.set([]);
       this._orgSourceShares.set([]);
     }
