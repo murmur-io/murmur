@@ -56,6 +56,7 @@ export class AnalyticsComponent implements OnInit {
 
   readonly data = signal<Analytics | null>(null);
   readonly loading = signal(true);
+  readonly error = signal<string | null>(null);
 
   readonly isEmpty = computed(() => {
     const a = this.data();
@@ -188,8 +189,18 @@ export class AnalyticsComponent implements OnInit {
   });
 
   async ngOnInit(): Promise<void> {
+    await this.load();
+  }
+
+  /** (Re-)fetch analytics. Also the Retry button's handler on a load failure. */
+  async load(): Promise<void> {
+    this.loading.set(true);
+    this.error.set(null);
     try {
       this.data.set(await this.ipc.getAnalytics());
+    } catch (e) {
+      this.data.set(null);
+      this.error.set(String(e));
     } finally {
       this.loading.set(false);
     }
