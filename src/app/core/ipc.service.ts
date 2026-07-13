@@ -55,7 +55,7 @@ import type {
   NoteAssistRequest,
   NoteAssistResult,
   OrganizePlan,
-  PersonCard,
+  PeopleList,
   PinResult,
   PruneSummary,
   StorageReport,
@@ -1014,9 +1014,11 @@ export class IpcService {
    * sealed-not-unlocked meetings never appears, and every count reflects visible
    * sources only — so re-fetch on a FoldersService lock-state change to shift the
    * list live (mirrors {@link getGraph}). Each `id` links to the entity detail.
+   * Returns {@link PeopleList}, not a bare array — `people` may itself be capped by
+   * the backend's 500-row limit, and `totalVisiblePeople` is the true count.
    */
-  listPeople(): Promise<PersonCard[]> {
-    return invoke<PersonCard[]>("list_people");
+  listPeople(): Promise<PeopleList> {
+    return invoke<PeopleList>("list_people");
   }
 
   /**

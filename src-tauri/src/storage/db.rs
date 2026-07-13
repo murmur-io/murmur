@@ -12,7 +12,8 @@ use crate::storage::models::{
     Analytics, AssistantInteraction, AssistantThreadRow, Commitment, CorrectionRecord, DayCount,
     DocChunkHit, DocumentInfo, EntityDetail, EntityKind, EntityNeighbor, Folder, GraphData,
     GraphEdge, GraphEntity, GraphNode, Meeting, MeetingStatus, NoteFolder, NoteRecord, NoteSummary,
-    OrgChunkHit, PendingShareAccept, PersonCard, RecipeRecord, SearchHit, StatusCount, VaultSource,
+    OrgChunkHit, PendingShareAccept, PeopleList, PersonCard, RecipeRecord, SearchHit, StatusCount,
+    VaultSource,
 };
 use crate::transcribe::types::Segment;
 
@@ -8352,6 +8353,50 @@ impl Db {
         Ok(out)
     }
 
+    /// The TRUE count of entities with ≥1 VISIBLE mention — same predicate as
+    /// `list_entities_visible` but with NO `LIMIT`, so callers can detect the 500-row cap
+    /// truncating the result and disclose it (added 2026-07-13: the cap trimmed `get_graph`'s
+    /// node list and `list_people`'s roster silently, with no signal the FE could show — the
+    /// existing `hasHidden`/`has_hidden_folders` flag only reports LOCKED folders, so on a vault
+    /// with >500 visible entities and zero locked folders it stayed false while 100+ entities were
+    /// dropped). `list_entities_visible(unlocked).len() < count_entities_visible(unlocked, None)`
+    /// means the cap trimmed rows. `kind` optionally narrows to one `EntityKind` (e.g. `Person`,
+    /// mirroring how `list_people` filters `list_entities_visible`'s output to persons) — the cap
+    /// applies BEFORE that filter, so the all-kinds and Person-only totals must be counted
+    /// separately rather than derived from each other.
+    pub fn count_entities_visible(
+        &self,
+        unlocked: &HashSet<String>,
+        kind: Option<EntityKind>,
+    ) -> Result<i64> {
+        let conn = self.lock();
+        let visible = visibility_clause("n", unlocked);
+        let kind_filter = match kind {
+            Some(k) => format!("AND e.kind = '{}'", k.as_str()),
+            None => String::new(),
+        };
+        let sql = format!(
+            "SELECT COUNT(*) FROM (
+               SELECT e.id
+                 FROM entities e
+                 JOIN entity_mentions em ON em.entity_id = e.id
+                 JOIN meetings m ON m.id = em.meeting_id
+                WHERE (
+                        NOT EXISTS (SELECT 1 FROM notes nn WHERE nn.meeting_id = m.id)
+                     OR EXISTS (
+                          SELECT 1 FROM notes n
+                           LEFT JOIN folders f ON f.id = n.folder_id
+                           WHERE n.meeting_id = m.id AND {visible}
+                        )
+                      )
+                      {kind_filter}
+                GROUP BY e.id
+               HAVING COUNT(em.meeting_id) > 0
+             )"
+        );
+        conn.query_row(&sql, [], |r| r.get(0)).map_err(map_err)
+    }
+
     /// The VISIBLE meetings mentioning `entity_id`, newest first, as `VaultSource` chips
     /// (the same shape the FE uses for backlink chips). Sealed-not-unlocked meetings excluded.
     pub fn entity_mentions_visible(
@@ -8689,10 +8734,12 @@ impl Db {
         let nodes = self.list_entities_visible(unlocked)?;
         let edges = self.graph_edges_visible(unlocked)?;
         let has_hidden = self.has_hidden_folders(unlocked)?;
+        let total_visible_entities = self.count_entities_visible(unlocked, None)?;
         Ok(GraphData {
             nodes,
             edges,
             has_hidden,
+            total_visible_entities,
         })
     }
 
@@ -9061,7 +9108,15 @@ impl Db {
     /// and `list_open_commitments` (owner-scoped, name match) — so every count reflects VISIBLE
     /// sources only; a sealed source contributes nothing to any of them. Ordered by most-recent
     /// contact (last_talked DESC), then name.
-    pub fn list_people(&self, unlocked: &HashSet<String>) -> Result<Vec<PersonCard>> {
+    ///
+    /// Returns [`PeopleList`], not a bare `Vec`, because the candidate set is itself capped
+    /// UPSTREAM by `list_entities_visible`'s `MAX_VISIBLE_ENTITIES` (500, ordered by mention
+    /// count across ALL kinds) — on a vault with >500 visible entities, some visible Persons can
+    /// be trimmed before the `EntityKind::Person` filter even runs, with zero signal on the old
+    /// bare-`Vec` return (added 2026-07-13: `total_visible_people` is the TRUE Person count so the
+    /// FE's "Show all N people" expander can disclose the cap instead of presenting the trimmed
+    /// roster as complete).
+    pub fn list_people(&self, unlocked: &HashSet<String>) -> Result<PeopleList> {
         // GATE: the visible-only entity set, Persons only. A sealed-only person is absent here.
         let people: Vec<GraphNode> = self
             .list_entities_visible(unlocked)?
@@ -9113,7 +9168,11 @@ impl Db {
                 (None, None) => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
             },
         );
-        Ok(out)
+        let total_visible_people = self.count_entities_visible(unlocked, Some(EntityKind::Person))?;
+        Ok(PeopleList {
+            people: out,
+            total_visible_people,
+        })
     }
 
     // ── CROSS-MEETING USER MEMORY (Phase 3) ────────────────────────────────────
@@ -17717,7 +17776,7 @@ mod graph_tests {
         seal_folder(&db, "secret", &kek);
 
         let empty: HashSet<String> = HashSet::new();
-        let sealed_view = db.list_people(&empty).unwrap();
+        let sealed_view = db.list_people(&empty).unwrap().people;
 
         // (1) A person known only through the sealed meeting must NOT surface.
         assert!(
@@ -17761,7 +17820,7 @@ mod graph_tests {
         )
         .unwrap();
         let unlocked = unlocked_set(&["secret"]);
-        let unlocked_view = db.list_people(&unlocked).unwrap();
+        let unlocked_view = db.list_people(&unlocked).unwrap().people;
         assert!(
             unlocked_view.iter().any(|p| p.id == secret_p),
             "the secret person reappears once its folder id is in the unlocked set"
@@ -17783,6 +17842,63 @@ mod graph_tests {
         assert_eq!(
             bob_u.current_fact_count, 2,
             "both facts visible when unlocked"
+        );
+    }
+
+    /// 2026-07-13 UX audit fix: on a vault with MORE than `MAX_VISIBLE_ENTITIES` (500) visible
+    /// entities and ZERO locked folders, `has_hidden` (which only reflects LOCKED folders) stays
+    /// false while `list_entities_visible`'s `LIMIT 500` silently trims the roster — so the OLD
+    /// `GraphData`/`Vec<PersonCard>` shapes gave the FE no way to tell `total()`/"Show all N" was
+    /// understating completeness. RED-before-GREEN: before `total_visible_entities` /
+    /// `total_visible_people` existed, there was no field to assert on at all (a compile-time
+    /// absence); post-fix, both must exceed the capped roster length with `has_hidden` still false.
+    #[test]
+    fn graph_and_people_disclose_the_500_cap_even_with_no_locked_folders() {
+        let db = file_db("cap-disclosure");
+        seed_note(&db, "m1", "one shared meeting", None);
+
+        // 520 distinct Person entities, all mentioned in the SAME open (never-locked) meeting —
+        // every one has exactly one VISIBLE mention, so none is trimmed by the `HAVING cnt > 0`
+        // gate; only the trailing `LIMIT 500` in `list_entities_visible` caps the roster.
+        const SEEDED: usize = 520;
+        for i in 0..SEEDED {
+            let id = db
+                .upsert_entity(&format!("Person {i:04}"), EntityKind::Person)
+                .unwrap();
+            db.add_mention(&id, "m1").unwrap();
+        }
+
+        let empty: HashSet<String> = HashSet::new();
+
+        // No folder was ever locked, so the OLD disclosure signal stays false...
+        assert!(
+            !db.has_hidden_folders(&empty).unwrap(),
+            "no folder is locked, so the locked-folder disclosure has nothing to report"
+        );
+
+        // ...yet the graph payload is truncated below the true 520, and now says so explicitly.
+        let graph = db.build_graph(&empty).unwrap();
+        assert!(!graph.has_hidden, "still no locked folder");
+        assert_eq!(graph.nodes.len(), 500, "the render cap trims to 500 nodes");
+        assert_eq!(
+            graph.total_visible_entities, SEEDED as i64,
+            "the TRUE visible-entity count is reported even though the roster is capped"
+        );
+        assert!(
+            graph.total_visible_entities > graph.nodes.len() as i64,
+            "total must exceed the capped roster so the FE can detect + disclose truncation"
+        );
+
+        // Same shape on `/people`: the roster is capped, but `total_visible_people` is the truth.
+        let people = db.list_people(&empty).unwrap();
+        assert_eq!(people.people.len(), 500, "people roster is also capped at 500");
+        assert_eq!(
+            people.total_visible_people, SEEDED as i64,
+            "the TRUE visible-person count, independent of the render cap"
+        );
+        assert!(
+            people.total_visible_people > people.people.len() as i64,
+            "\"Show all N people\" must be able to disclose N > the capped roster length"
         );
     }
 
