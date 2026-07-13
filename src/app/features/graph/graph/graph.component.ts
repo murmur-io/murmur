@@ -65,7 +65,7 @@ export class GraphComponent {
     { key: "project", label: "Projects" },
   ];
 
-  /** Total VISIBLE entities returned by the backend (before any local filter). */
+  /** VISIBLE entities actually rendered (may be capped — see {@link capDisclosure}). */
   protected readonly total = computed(
     () => this.graphData()?.nodes.length ?? 0,
   );
@@ -73,6 +73,26 @@ export class GraphComponent {
   protected readonly hasHidden = computed(
     () => this.graphData()?.hasHidden ?? false,
   );
+
+  /**
+   * Whether the backend's 500-row render cap trimmed the roster (independent of
+   * {@link hasHidden}, which only reflects LOCKED folders — a vault can have >500
+   * visible entities and zero locked folders, in which case `hasHidden` stays false
+   * while the cap still silently dropped rows without this check).
+   */
+  protected readonly isCapped = computed(() => {
+    const d = this.graphData();
+    return !!d && d.totalVisibleEntities > d.nodes.length;
+  });
+
+  /** One honest caption disclosing the render cap, mirroring `brain.component.ts`'s pattern. */
+  protected readonly capDisclosure = computed<string | null>(() => {
+    const d = this.graphData();
+    if (!d || !this.isCapped()) {
+      return null;
+    }
+    return `Showing the ${d.nodes.length} most-mentioned of ${d.totalVisibleEntities} entities.`;
+  });
 
   /** The filtered + searched + sorted nodes (the view-model for the directory). */
   protected readonly visibleEntities = computed<GraphNode[]>(() => {

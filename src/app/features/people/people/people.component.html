@@ -8,7 +8,14 @@
       </p>
     </div>
     @if (!loading() && total() > 0) {
-      <span class="count p-total" [attr.title]="total() + ' people'">
+      <span
+        class="count p-total"
+        [attr.title]="
+          backendCapped()
+            ? total() + ' of ' + totalVisiblePeople() + ' people'
+            : total() + ' people'
+        "
+      >
         {{ total() }}
       </span>
     }
@@ -118,6 +125,17 @@
         <button type="button" class="btn btn-ghost p-show-all" (click)="showAll()">
           Show all {{ total() }} people
         </button>
+      }
+
+      <!-- A SEPARATE disclosure: the BACKEND's 500-row cap, distinct from the client-side
+           RENDER_CAP expander above — "Show all N" only ever reveals up to N = total(),
+           which is itself already backend-capped, so this is the only signal that more
+           people exist beyond what "Show all" can ever surface. -->
+      @if (backendCapped()) {
+        <p class="p-cap-note">
+          Showing the {{ total() }} most-mentioned of
+          {{ totalVisiblePeople() }} people.
+        </p>
       }
 
       @if (selectedId(); as id) {
