@@ -309,11 +309,26 @@ export class OnboardingComponent implements OnInit {
     await this.refreshModelPresence();
   }
 
+  /**
+   * Stale-result guard for `refreshModelPresence` (mirrors
+   * `entity-detail.component.ts`'s `_load`): rapidly switching the language or
+   * quality dropdown fires two overlapping calls, each awaiting
+   * `persistConfig()` then `ipc.modelPresent()`; without a guard, whichever
+   * `modelPresent()` resolves LAST wins regardless of which selection is
+   * actually current. Bumped at the start of every call; a call only commits
+   * its own result if it is still the most recent one after each await.
+   */
+  private modelPresenceRequestId = 0;
+
   /** Persist the chosen language + size, then re-check what's on disk. */
   private async refreshModelPresence(): Promise<void> {
+    const requestId = ++this.modelPresenceRequestId;
     this.modelPresent.set(null);
     await this.persistConfig();
-    this.modelPresent.set(await this.ipc.modelPresent());
+    if (requestId !== this.modelPresenceRequestId) return; // superseded mid-flight
+    const present = await this.ipc.modelPresent();
+    if (requestId !== this.modelPresenceRequestId) return; // superseded mid-flight
+    this.modelPresent.set(present);
   }
 
   async downloadModel(): Promise<void> {
