@@ -762,6 +762,24 @@ scope to the GA-critical path only.
           redacted: true,
         };
 
+      // ── M3-CLIENT: sharing account (Settings → Account section) ──
+      // Signed-out shape (matches Rust `commands::AccountStatus`, camelCase over
+      // IPC): the demo world has no sharing-server account, so the section shows
+      // its normal signed-out "Create or sign in" affordance rather than falling
+      // through to the generic `default:` handler (a bare `account_status` name
+      // doesn't match the `list_`/`get_`/`has_`/`is_` fallback prefixes below, so
+      // an unhandled case would previously resolve `null` — which the FE now
+      // treats as a real signed-out status, never a permanent "Loading…" state).
+      case "account_status":
+        return {
+          loggedIn: false,
+          email: null,
+          unlockedForSharing: false,
+          shareConsented: false,
+          serverConfigured: false,
+          biometricUnlockAvailable: false,
+        };
+
       // ── Shared Brain (org) ──
       case "org_refresh": return null;
       case "org_list_statuses": return ORGS;
