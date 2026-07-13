@@ -32,10 +32,18 @@ use std::sync::{Arc, Mutex};
 use candle_core::{Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config, DTYPE};
-use tokenizers::Tokenizer;
+use tokenizers::{Tokenizer, TruncationDirection, TruncationParams, TruncationStrategy};
 
 use crate::embed::{Embedder, EMBED_DIM, EMBED_MODEL_FILES};
 use crate::error::{AppError, Result};
+
+/// BERT's absolute position embeddings top out at 512 tokens (e5-small included) — a text longer
+/// than this cannot be encoded at all, so truncation isn't just a perf safety net, it's required
+/// for correctness. Without it, a single unbounded-length topic chunk (e.g. a continuous
+/// monologue-style meeting with no natural topic boundary — [`crate::embed::segment_topics`] has
+/// no upper bound on a chunk's own text length) still drives an oversized tensor row inside ONE
+/// `embed_passage` call regardless of how small the sub-batch is (2026-07-13 follow-up finding).
+const MAX_SEQ_LEN: usize = 512;
 
 /// An [`Embedder`] running multilingual-e5-small in-process via candle BERT (Metal, CPU fallback).
 /// The model + tokenizer load lazily on the first `embed` and are cached behind an `Arc` so repeated
@@ -119,8 +127,17 @@ impl CandleBertEmbedder {
         let config: Config = serde_json::from_str(&config_str)
             .map_err(|e| AppError::Storage(format!("parse embed config.json: {e}")))?;
 
-        let tokenizer = Tokenizer::from_file(&tokenizer_path)
+        let mut tokenizer = Tokenizer::from_file(&tokenizer_path)
             .map_err(|e| AppError::Storage(format!("load embed tokenizer.json: {e}")))?;
+        // Truncate to the model's own position-embedding limit — see MAX_SEQ_LEN's doc comment.
+        tokenizer
+            .with_truncation(Some(TruncationParams {
+                max_length: MAX_SEQ_LEN,
+                strategy: TruncationStrategy::LongestFirst,
+                direction: TruncationDirection::Right,
+                stride: 0,
+            }))
+            .map_err(|e| AppError::Storage(format!("configure embed tokenizer truncation: {e}")))?;
 
         let device = Self::pick_device();
         // SAFETY: `from_mmaped_safetensors` mmaps the weights read-only; the file is a trusted model
