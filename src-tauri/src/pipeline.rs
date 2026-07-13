@@ -545,6 +545,15 @@ async fn run_inner(
     // — this closure loads Whisper AND (further in) the diarizer, so it must serialize against any
     // OTHER heavy native-runtime call (embedder, NER, brain sidecar) running concurrently, not just
     // against itself.
+    //
+    // 2026-07-13 — per-stage wall-clock telemetry: a user reported a ~15min recording taking
+    // ~15min end-to-end (Stop → note ready) and force-quit thinking the app hung. Diagnosis
+    // couldn't pin the dominant cost without real numbers from the affected machine (candidates:
+    // Accurate-profile whisper decode of BOTH streams, diarization, note-gen, brain-sidecar fact
+    // extraction, embedding — all now strictly sequential through this same closure + the
+    // downstream summarize_and_export call). Logging elapsed_ms per stage (never audio/transcript
+    // content) so the NEXT report comes with a real breakdown instead of another guess.
+    let asr_diarize_started = std::time::Instant::now();
     let (merged_segments, echo_suppressed, cluster_voiceprints) = crate::perf::run_heavy(&state.heavy_inference, move || -> Result<(Vec<crate::transcribe::types::Segment>, usize, Vec<crate::transcribe::diarize::ClusterVoiceprint>)> {
         use crate::audio::merge::{merge_streams, StreamInput, SPEAKER_ME, SPEAKER_OTHERS};
 
@@ -644,6 +653,13 @@ async fn run_inner(
         Ok((merged, echo_suppressed, cluster_voiceprints))
     })
     .await?;
+    tracing::info!(
+        target: "perf",
+        stage = "asr_diarize",
+        elapsed_ms = asr_diarize_started.elapsed().as_millis() as u64,
+        duration_s,
+        "pipeline stage complete"
+    );
 
     // Persist the (opt-in) per-cluster voiceprints — one row per diarized "others" cluster, label
     // NULL until enrolled by rename. Best-effort: a persist failure is logged (no PII) and never
@@ -714,7 +730,8 @@ async fn run_inner(
     // ── 4 + 5. Summarize with the configured provider, then export ───────────
     // NOTE: no config is passed — the summarize step re-reads the LIVE config (consent may have
     // been revoked during the minutes of transcription above; see `resolve_summarize_egress`).
-    summarize_and_export(
+    let summarize_started = std::time::Instant::now();
+    let result = summarize_and_export(
         app,
         state,
         meeting_id,
@@ -724,7 +741,15 @@ async fn run_inner(
         &date_iso,
         &ended_at,
     )
-    .await
+    .await;
+    tracing::info!(
+        target: "perf",
+        stage = "summarize_and_export",
+        elapsed_ms = summarize_started.elapsed().as_millis() as u64,
+        ok = result.is_ok(),
+        "pipeline stage complete"
+    );
+    result
 }
 
 /// TIER 0 — the summarizer's transcript, in two forms.
