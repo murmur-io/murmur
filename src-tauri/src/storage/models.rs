@@ -62,6 +62,12 @@ pub struct GraphData {
     /// True when ≥1 folder is sealed-and-not-unlocked → some entities/mentions may be hidden.
     /// The FE renders one honest disclosure banner; the count itself is never leaked.
     pub has_hidden: bool,
+    /// The TRUE count of VISIBLE entities, BEFORE the `MAX_VISIBLE_ENTITIES` (500) render cap
+    /// trims `nodes`. `total_visible_entities > nodes.len()` means the cap silently dropped rows —
+    /// distinct from `has_hidden` (which only reflects LOCKED folders, not the render cap). The FE
+    /// uses this to show an honest "showing N of TOTAL" caption instead of presenting the
+    /// capped `nodes.len()` as the whole graph.
+    pub total_visible_entities: i64,
 }
 
 /// A co-occurring neighbor of a selected entity (the neighborhood satellites), with the
@@ -106,6 +112,20 @@ pub struct PersonCard {
     pub open_commitment_count: i64,
     /// Currently-valid (open) facts about this person from VISIBLE meetings.
     pub current_fact_count: i64,
+}
+
+/// The payload returned by `list_people`: the (possibly render-capped) roster of `PersonCard`s
+/// plus the TRUE count of VISIBLE people. `list_people` derives its candidate set from
+/// `list_entities_visible`, which applies a `MAX_VISIBLE_ENTITIES` (500) cap ordered by mention
+/// count — on a vault with >500 visible entities, `people` can be a strict subset of every
+/// visible Person. `total_visible_people > people.len()` is the ONLY signal of that truncation;
+/// without it the FE's "Show all N people" expander silently understates completeness (added
+/// 2026-07-13, mirrors `GraphData::total_visible_entities`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PeopleList {
+    pub people: Vec<PersonCard>,
+    pub total_visible_people: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

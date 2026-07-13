@@ -12,7 +12,7 @@ use crate::storage::models::{
     CalendarEvent, CalendarEventFull, ChatTurn, Commitment, DigestResult, DocumentInfo,
     EntityDetail, EntityDossierResult, Folder, FolderNode, GraphData, Meeting, MeetingStatus,
     MeetingTimeline, NoteAssistRequest, NoteAssistResult, NoteCitation, NoteDoc, NoteFolder,
-    NoteRecord, NoteSummary, OrganizeMove, OrganizePlan, PersonCard, PinResult, RecipeRecord,
+    NoteRecord, NoteSummary, OrganizeMove, OrganizePlan, PeopleList, PinResult, RecipeRecord,
     SearchHit, TopicThread,
 };
 use crate::summarize::all_providers;
@@ -5648,7 +5648,7 @@ pub fn get_graph(state: State<'_, AppState>) -> Result<GraphData, AppError> {
 /// sealed-and-not-session-unlocked meetings never appears and every count reflects visible sources
 /// only. Read-only, no model, no new egress.
 #[tauri::command]
-pub fn list_people(state: State<'_, AppState>) -> Result<Vec<PersonCard>, AppError> {
+pub fn list_people(state: State<'_, AppState>) -> Result<PeopleList, AppError> {
     let unlocked = unlocked_snapshot(state.inner())?;
     state.db.list_people(&unlocked)
 }
