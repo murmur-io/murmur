@@ -5408,10 +5408,19 @@ impl Db {
     /// (what colleagues shared IN). Distinct from the outbound `org_shares` count (what THIS member
     /// published OUT); the two were conflated so the Settings item count showed the caller's own
     /// uploads and read "0 items" to a receiver. Content-free.
+    ///
+    /// PER-INSTANCE ORG TOGGLE: joined to `org_state` and filtered on `context_enabled = 1` — same
+    /// gate as `search_org_chunks_knn`/`_fts`/`get_org_item`/`list_org_items_inner`. Without this a
+    /// disabled org's `received_count` stayed stale/inflated (the raw local-replica row count) even
+    /// though every other read of the same table (search, browse) correctly reports it as empty —
+    /// the count and the actual gated content must agree for the same org.
     pub fn count_org_items(&self, org_id: &str) -> Result<u32> {
         let conn = self.lock();
         conn.query_row(
-            "SELECT COUNT(*) FROM org_items WHERE org_id = ?1 AND tombstoned = 0",
+            "SELECT COUNT(*)
+               FROM org_items oi
+               JOIN org_state os ON os.org_id = oi.org_id
+              WHERE oi.org_id = ?1 AND oi.tombstoned = 0 AND os.context_enabled = 1",
             rusqlite::params![org_id],
             |r| r.get::<_, i64>(0),
         )
@@ -11093,6 +11102,44 @@ mod tests {
         db.set_org_context_enabled("org-1", true).unwrap();
         let fts_reenabled = db.search_org_chunks_fts("quantum ledger migration", 10).unwrap();
         assert_eq!(fts_reenabled.len(), 2, "re-enabling instantly restores visibility, no re-sync");
+    }
+
+    /// PER-INSTANCE ORG TOGGLE (RED-before-GREEN): `count_org_items` must agree with the actual
+    /// gated content — `search_org_chunks_knn`/`_fts`/`get_org_item`/`list_org_items_inner` all
+    /// exclude a disabled org's items, so the count (used as `OrgStatus.received_count`) must too.
+    /// Before the fix this counted raw `org_items` rows with no `context_enabled` join, so a
+    /// disabled org's count stayed stale/inflated instead of dropping to zero like every sibling read.
+    #[test]
+    fn count_org_items_excludes_a_disabled_org_and_restores_on_reenable() {
+        let db = mem_db();
+        seed_org_state(&db, "org-1");
+        let emb = crate::embed::StubEmbedder;
+        db.upsert_org_item(
+            "it-1", "org-1", 1, "anna", "Kickoff", "roadmap body", "t", 1, 1, &sha32(21), None,
+            Some(&emb),
+        )
+        .unwrap();
+        db.upsert_org_item(
+            "it-2", "org-1", 1, "bob", "Follow-up", "roadmap follow-up", "t", 2, 1, &sha32(22),
+            None, Some(&emb),
+        )
+        .unwrap();
+
+        assert_eq!(db.count_org_items("org-1").unwrap(), 2, "both items counted while enabled");
+
+        db.set_org_context_enabled("org-1", false).unwrap();
+        assert_eq!(
+            db.count_org_items("org-1").unwrap(),
+            0,
+            "a disabled org's received_count must drop to zero, matching search/list, not stay inflated"
+        );
+
+        db.set_org_context_enabled("org-1", true).unwrap();
+        assert_eq!(
+            db.count_org_items("org-1").unwrap(),
+            2,
+            "re-enabling instantly restores the count — the replica was never touched"
+        );
     }
 
     /// The self-share dedup source: `all_org_shared_content_hashes` returns every non-null
