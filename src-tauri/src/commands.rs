@@ -10708,6 +10708,7 @@ fn clear_stale_live_transcript(state: &AppState) {
 /// Does NOT re-export to the vault. Returns the refreshed folder node.
 #[tauri::command]
 pub async fn unlock_folder(
+    app: AppHandle,
     state: State<'_, AppState>,
     folder_id: String,
 ) -> Result<FolderNode, AppError> {
@@ -10850,73 +10851,97 @@ pub async fn unlock_folder(
             .map_err(|_| AppError::Storage("unwrapped content key has wrong length".into()))?,
     );
 
-    // BLK-1: from here on we MUTATE plaintext columns (restore markdown / segments / timeline).
-    // Acquire the lifecycle guard for the whole synchronous restore so a concurrent
-    // `relock_all_inner` (screen-share / lifecycle) cannot blank these rows mid-restore. Acquired
-    // AFTER the keychain `.await` above — holding a std `MutexGuard` across an await would make this
-    // command's future `!Send`; everything below is synchronous, so the guard never crosses a
-    // suspend point.
-    let _lifecycle = lifecycle_guard(state.inner());
+    // The rest of the restore (decrypt every note/segment/timeline blob, materialize the session
+    // WAV, re-embed the folder's meetings) is synchronous CPU/AES/Candle-Metal work that used to
+    // run INLINE on this async command's Tokio worker — for a folder with several long-meeting
+    // recordings this can stall the whole IPC layer for seconds to low minutes (2026-07-13 perf
+    // audit finding, HIGH severity). Moved to the blocking pool, routed through the shared
+    // heavy-inference gate (perf::run_heavy) since it re-embeds via Candle/Metal. The `AppHandle`
+    // re-fetch pattern (`app.state::<AppState>()`) is how this codebase already gets a `'static`
+    // handle to `AppState` inside a spawn_blocking closure (see `ask_vault_agentic_attempt`) — a
+    // bare `&AppState` from `State<'_, AppState>` cannot be captured by a `'static` closure.
+    let heavy_inference = state.heavy_inference.clone();
+    let app_for_restore = app.clone();
+    let folder_for_restore = folder.clone();
+    let folder_id_for_restore = folder_id.clone();
+    let restored: FolderNode = crate::perf::run_heavy(&heavy_inference, move || -> Result<FolderNode, AppError> {
+        let state = app_for_restore.state::<AppState>();
+        let folder = folder_for_restore;
+        let folder_id = folder_id_for_restore;
 
-    // Decrypt EACH sealed provider row's own blob back into its own markdown column for the
-    // session (no dedup by meeting — every provider's distinct content is restored independently).
-    // Bound to (folder|meeting|provider|note); legacy blobs fall back to empty AAD.
-    let notes = state.db.notes_in_folder(&folder_id)?;
-    for n in &notes {
-        let Some(blob) = &n.content_blob else {
-            continue; // open note (shouldn't happen in a sealed folder) — skip.
+        // BLK-1: from here on we MUTATE plaintext columns (restore markdown / segments /
+        // timeline). Acquire the lifecycle guard for the whole synchronous restore so a
+        // concurrent `relock_all_inner` (screen-share / lifecycle) cannot blank these rows
+        // mid-restore. This closure runs entirely on the blocking pool with no `.await` inside
+        // it, so the guard never crosses a suspend point (same invariant the old inline code
+        // relied on, preserved by construction — a spawn_blocking closure body is plain sync code).
+        let _lifecycle = lifecycle_guard(&state);
+
+        // Decrypt EACH sealed provider row's own blob back into its own markdown column for the
+        // session (no dedup by meeting — every provider's distinct content is restored
+        // independently). Bound to (folder|meeting|provider|note); legacy blobs fall back to
+        // empty AAD.
+        let notes = state.db.notes_in_folder(&folder_id)?;
+        for n in &notes {
+            let Some(blob) = &n.content_blob else {
+                continue; // open note (shouldn't happen in a sealed folder) — skip.
+            };
+            let aad = aad_content(&folder_id, &n.meeting_id, &n.provider_id, "note");
+            let pt = crate::crypto::decrypt(&ck, blob, &aad)?;
+            let markdown = String::from_utf8(pt)
+                .map_err(|_| AppError::Storage("decrypted note is not valid UTF-8".into()))?;
+            state
+                .db
+                .restore_note_markdown(&n.meeting_id, &n.provider_id, &markdown)?;
+        }
+
+        // Phase 0.5 — decrypt the TRANSCRIPT + TIMELINE back into their plaintext columns and
+        // materialize a playable WAV (decrypt .enc → file) for the session, under the SAME CK.
+        // The model-gated meeting embedder (Some only when the REAL e5 model is present → never
+        // stub vectors) re-indexes the folder's meetings so semantic / related-meetings recover
+        // in-session.
+        let meeting_embedder =
+            crate::embed::embed_model_present().then(crate::embed::active_embedder);
+        unseal_folder_extras(&state, &folder_id, &ck, meeting_embedder.as_deref())?;
+
+        // Cache the KEK for the session (zeroized on relock-all + on drop) + add to the unlock set.
+        {
+            let mut g = state
+                .master_kek
+                .lock()
+                .map_err(|_| AppError::Storage("master-kek mutex poisoned".into()))?;
+            *g = Some(kek.clone());
+        }
+        {
+            let mut g = state
+                .unlocked_folders
+                .lock()
+                .map_err(|_| AppError::Storage("unlocked-folders mutex poisoned".into()))?;
+            g.insert(folder_id.clone());
+        }
+        tracing::info!(target: "lock", folder = %folder_id, "unlock_folder: session unlock complete");
+
+        // Return the refreshed node.
+        let counts = state.db.count_notes_per_folder()?;
+        let unlocked = {
+            state
+                .unlocked_folders
+                .lock()
+                .map_err(|_| AppError::Storage("unlocked-folders mutex poisoned".into()))?
+                .clone()
         };
-        let aad = aad_content(&folder_id, &n.meeting_id, &n.provider_id, "note");
-        let pt = crate::crypto::decrypt(&ck, blob, &aad)?;
-        let markdown = String::from_utf8(pt)
-            .map_err(|_| AppError::Storage("decrypted note is not valid UTF-8".into()))?;
-        state
-            .db
-            .restore_note_markdown(&n.meeting_id, &n.provider_id, &markdown)?;
-    }
-
-    // Phase 0.5 — decrypt the TRANSCRIPT + TIMELINE back into their plaintext columns and
-    // materialize a playable WAV (decrypt .enc → file) for the session, under the SAME CK. The
-    // model-gated meeting embedder (Some only when the REAL e5 model is present → never stub vectors)
-    // re-indexes the folder's meetings so semantic / related-meetings recover in-session.
-    let meeting_embedder = crate::embed::embed_model_present().then(crate::embed::active_embedder);
-    unseal_folder_extras(state.inner(), &folder_id, &ck, meeting_embedder.as_deref())?;
-
-    // Cache the KEK for the session (zeroized on relock-all + on drop) + add to the unlock set.
-    {
-        let mut g = state
-            .master_kek
-            .lock()
-            .map_err(|_| AppError::Storage("master-kek mutex poisoned".into()))?;
-        *g = Some(kek.clone());
-    }
-    {
-        let mut g = state
-            .unlocked_folders
-            .lock()
-            .map_err(|_| AppError::Storage("unlocked-folders mutex poisoned".into()))?;
-        g.insert(folder_id.clone());
-    }
-    tracing::info!(target: "lock", folder = %folder_id, "unlock_folder: session unlock complete");
-
-    // Return the refreshed node.
-    let counts = state.db.count_notes_per_folder()?;
-    let unlocked = {
-        state
-            .unlocked_folders
-            .lock()
-            .map_err(|_| AppError::Storage("unlocked-folders mutex poisoned".into()))?
-            .clone()
-    };
-    Ok(FolderNode {
-        id: folder.id.clone(),
-        name: folder.name.clone(),
-        parent_id: folder.parent_id.clone(),
-        note_count: counts.get(&folder.id).copied().unwrap_or(0),
-        locked: true,
-        unlocked: unlocked.contains(&folder.id),
-        children: Vec::new(),
+        Ok(FolderNode {
+            id: folder.id.clone(),
+            name: folder.name.clone(),
+            parent_id: folder.parent_id.clone(),
+            note_count: counts.get(&folder.id).copied().unwrap_or(0),
+            locked: true,
+            unlocked: unlocked.contains(&folder.id),
+            children: Vec::new(),
+        })
     })
+    .await?;
+    Ok(restored)
 }
 
 /// Re-seal a session-unlocked folder for the rest of this session: re-blank the plaintext
@@ -11811,6 +11836,7 @@ fn move_authored_note_md_to_folder(
 /// (returns `None`); a sealed folder returns the refreshed `FolderNode`.
 #[tauri::command]
 pub async fn unlock_meeting(
+    app: AppHandle,
     state: State<'_, AppState>,
     meeting_id: String,
 ) -> Result<Option<FolderNode>, AppError> {
@@ -11825,7 +11851,7 @@ pub async fn unlock_meeting(
         return Ok(None); // open folder — already visible.
     }
     // Reuse the SAME biometric unlock path (do not fork the lifecycle).
-    unlock_folder(state, folder_id).await.map(Some)
+    unlock_folder(app, state, folder_id).await.map(Some)
 }
 
 /// `discard_unrecoverable_meeting_lock(meeting_id) -> Option<FolderNode>` — the meeting-aware entry to
