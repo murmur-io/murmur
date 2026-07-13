@@ -162,4 +162,14 @@
   display: block;
   margin: var(--space-3) auto 0;
 }
+
+// The BACKEND 500-row cap disclosure — a distinct, honest caption (mirrors
+// brain.component.ts's MAP_NODE_CAP caption), separate from the client-side
+// RENDER_CAP expander above since "Show all" can never surface people past the cap.
+.p-cap-note {
+  margin: var(--space-2) auto 0;
+  text-align: center;
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+}
     

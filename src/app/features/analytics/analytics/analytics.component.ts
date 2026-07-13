@@ -56,10 +56,13 @@ export class AnalyticsComponent implements OnInit {
 
   /**
    * Root-persisted so a navigate-away-and-back shows the LAST-KNOWN numbers
-   * instantly instead of blanking to "Loading…" — see `AnalyticsStore`.
+   * (and any still-active load error) instantly instead of blanking to
+   * "Loading…" or silently dropping back to the empty state — see
+   * `AnalyticsStore`.
    */
   readonly data = this.store.data;
   readonly loading = this.store.loading;
+  readonly error = this.store.error;
 
   readonly isEmpty = computed(() => {
     const a = this.data();
@@ -192,8 +195,18 @@ export class AnalyticsComponent implements OnInit {
   });
 
   async ngOnInit(): Promise<void> {
+    await this.load();
+  }
+
+  /** (Re-)fetch analytics. Also the Retry button's handler on a load failure. */
+  async load(): Promise<void> {
+    this.loading.set(true);
+    this.error.set(null);
     try {
       this.data.set(await this.ipc.getAnalytics());
+    } catch (e) {
+      this.data.set(null);
+      this.error.set(String(e));
     } finally {
       this.loading.set(false);
     }

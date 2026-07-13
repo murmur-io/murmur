@@ -24,4 +24,8 @@ import type { Analytics } from "../core/models";
 export class AnalyticsStore {
   readonly data = signal<Analytics | null>(null);
   readonly loading = signal(true);
+  /** Set on a real `getAnalytics()` failure (distinct from the empty-vault `isEmpty` state) —
+   * root-persisted for the same reason as `data`/`loading`: it must survive a remount so a
+   * navigate-away-and-back doesn't silently drop a still-active error back to the empty state. */
+  readonly error = signal<string | null>(null);
 }

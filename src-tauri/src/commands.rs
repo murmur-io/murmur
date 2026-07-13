@@ -12,7 +12,7 @@ use crate::storage::models::{
     CalendarEvent, CalendarEventFull, ChatTurn, Commitment, DigestResult, DocumentInfo,
     EntityDetail, EntityDossierResult, Folder, FolderNode, GraphData, Meeting, MeetingStatus,
     MeetingTimeline, NoteAssistRequest, NoteAssistResult, NoteCitation, NoteDoc, NoteFolder,
-    NoteRecord, NoteSummary, OrganizeMove, OrganizePlan, PersonCard, PinResult, RecipeRecord,
+    NoteRecord, NoteSummary, OrganizeMove, OrganizePlan, PeopleList, PinResult, RecipeRecord,
     SearchHit, TopicThread,
 };
 use crate::summarize::all_providers;
@@ -5648,7 +5648,7 @@ pub fn get_graph(state: State<'_, AppState>) -> Result<GraphData, AppError> {
 /// sealed-and-not-session-unlocked meetings never appears and every count reflects visible sources
 /// only. Read-only, no model, no new egress.
 #[tauri::command]
-pub fn list_people(state: State<'_, AppState>) -> Result<Vec<PersonCard>, AppError> {
+pub fn list_people(state: State<'_, AppState>) -> Result<PeopleList, AppError> {
     let unlocked = unlocked_snapshot(state.inner())?;
     state.db.list_people(&unlocked)
 }
@@ -8859,10 +8859,14 @@ fn mask_locked_meetings(
         .collect())
 }
 
-/// Aggregate analytics for the dashboard + Analytics tab.
+/// Aggregate analytics for the dashboard + Analytics tab. VISIBLE-content only — a sealed-and-
+/// not-session-unlocked folder's meetings are excluded from every count/duration/breakdown (same
+/// gate as `brain_overview`/`list_meetings`), so the Analytics tab can never reveal the size or
+/// activity pattern of content the user has deliberately locked.
 #[tauri::command]
 pub fn get_analytics(state: State<'_, AppState>) -> Result<Analytics, AppError> {
-    state.db.analytics()
+    let unlocked = unlocked_snapshot(state.inner())?;
+    state.db.analytics(&unlocked)
 }
 
 /// Rename a speaker across a meeting's cached timeline (e.g. "User 1" → "Sarah"). Persists to
@@ -24149,6 +24153,74 @@ mod lifecycle_tests {
         assert_eq!(other.title, "Ich notatka", "a non-owned title is left as-is");
     }
 
+    /// STUCK-REPUBLISH FIX (`resolve_owned_source`): `resolve_owned_source` must mirror
+    /// `org_resolve_source_inner` (fixed in cd21b10) and NOT gate on `state == "uploaded"` — a
+    /// republish that failed transiently leaves the row `state = "failed"` with its OLD,
+    /// still-server-live `item_id` retained (`set_org_share_failed` never clears it). Before this
+    /// fix `resolve_owned_source` returned `None` for such a row, so the author's own stuck card
+    /// showed up as NOT owned in `list_org_items` — `openOrgCard` would then route to the read-only
+    /// viewer instead of the real editable original. A `revoked` row (intentionally torn down) is
+    /// the one state that must still fail to enrich.
+    #[test]
+    fn list_org_items_enriches_a_stuck_failed_owned_item_but_not_a_revoked_one() {
+        let state = build_state("org-list-owned-stuck-failed");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        make_open_folder(&state.db, "f-stuck", "Team");
+        let now = "2026-07-13T00:00:00Z";
+
+        // Published successfully once, then a REPUBLISH attempt failed — item_id retained.
+        state
+            .db
+            .insert_note("n-stuck", "f-stuck", "Untitled", "Fixed Title", "# body", 1)
+            .unwrap();
+        state
+            .db
+            .upsert_org_item("item-stuck", "org-1", 1, "kgm004a", "Untitled", "# body", now, 1, 1, &[9u8; 32], None, None)
+            .unwrap();
+        state
+            .db
+            .insert_org_share("s-stuck", "org-1", None, Some("n-stuck"), "note", Some("Untitled"), 1, 1, &[9u8; 32], now)
+            .unwrap();
+        state.db.set_org_share_uploaded("s-stuck", "item-stuck", now).unwrap();
+        state.db.set_org_share_failed("s-stuck", "republish_upload_failed", now).unwrap();
+
+        // A SEPARATE row that was uploaded, then intentionally revoked — must NOT enrich.
+        state
+            .db
+            .insert_note("n-revoked", "f-stuck", "Gone", "Gone Title", "# body", 1)
+            .unwrap();
+        state
+            .db
+            .upsert_org_item("item-revoked", "org-1", 1, "kgm004a", "Gone", "# body", now, 1, 1, &[8u8; 32], None, None)
+            .unwrap();
+        state
+            .db
+            .insert_org_share("s-revoked", "org-1", None, Some("n-revoked"), "note", Some("Gone"), 1, 1, &[8u8; 32], now)
+            .unwrap();
+        state.db.set_org_share_uploaded("s-revoked", "item-revoked", now).unwrap();
+        state.db.set_org_share_state("s-revoked", "revoked", now).unwrap();
+
+        let items = list_org_items_inner(&state, "org-1").unwrap();
+
+        let stuck = items.iter().find(|i| i.item_id == "item-stuck").unwrap();
+        assert_eq!(
+            stuck.title, "Fixed Title",
+            "a stuck failed-with-item_id row still shows the source's CURRENT title"
+        );
+        let owned = stuck
+            .owned_source
+            .as_ref()
+            .expect("a stuck failed-with-item_id row still resolves as owned (not a leftover read-only replica)");
+        assert_eq!(owned.kind, "document");
+        assert_eq!(owned.id, "n-stuck");
+
+        let revoked = items.iter().find(|i| i.item_id == "item-revoked").unwrap();
+        assert!(
+            revoked.owned_source.is_none(),
+            "an intentionally revoked share must not enrich as owned"
+        );
+    }
+
     /// `OrgItemHeader.kind` round-trips for BOTH an owned document-kind share and an owned
     /// meeting-kind share, and stays `None` for a colleague's item that was upserted with no stored
     /// `source_kind` (mirrors an item ingested off a v1 envelope / before this column existed — the
@@ -24508,6 +24580,57 @@ mod lifecycle_tests {
         assert!(
             !rows.iter().any(|r| r.meeting_id == "m-sealed"),
             "a sealed-and-not-session-unlocked meeting's share must not appear in the bulk list"
+        );
+    }
+
+    /// STUCK-REPUBLISH FIX (Library badge/CTA parity): a share row whose MOST RECENT republish
+    /// attempt failed transiently but still carries a live server `item_id` (`set_org_share_failed`
+    /// never clears `item_id`) must still show the Library "shared into org" badge — mirroring the
+    /// same "live" definition `org_shares_for_source` already applies for the note-share-panel CTA
+    /// (`org_shares_for_source_includes_failed_rows_with_a_live_item_id`, storage/db.rs). Before the
+    /// fix, `list_meeting_org_shares_inner` used a hardcoded `state = 'uploaded'` filter that dropped
+    /// this exact reachable row, so the Library badge vanished while the share-panel CTA (reading the
+    /// already-fixed `org_shares_for_source`) still claimed the meeting was shared — a real two-surface
+    /// disagreement. A `failed` row that NEVER published (no `item_id`) must stay excluded (no live
+    /// item to badge).
+    #[test]
+    fn list_meeting_org_shares_includes_failed_rows_with_a_live_item_id() {
+        let state = build_state("list-meeting-org-shares-stuck-republish");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        make_open_folder(&state.db, "f-open", "Open");
+
+        // Meeting m1: published once, then a REPUBLISH attempt failed transiently. item_id stays set
+        // (set_org_share_failed doesn't clear it) — this is a genuinely LIVE share.
+        seed_meeting(&state.db, "m-stuck", "# note", Some("f-open"));
+        state
+            .db
+            .insert_org_share(
+                "s-stuck", "org-1", Some("m-stuck"), None, "meeting", Some("Stuck"),
+                1, 1, &[11u8; 32], "2026-07-12T09:00:00Z",
+            )
+            .unwrap();
+        state.db.set_org_share_uploaded("s-stuck", "item-stuck", "2026-07-12T09:00:00Z").unwrap();
+        state.db.set_org_share_failed("s-stuck", "republish_upload_failed", "2026-07-12T09:05:00Z").unwrap();
+
+        // Meeting m2: failed on the INITIAL publish — never got an item_id. No live item to badge.
+        seed_meeting(&state.db, "m-never-live", "# note", Some("f-open"));
+        state
+            .db
+            .insert_org_share(
+                "s-never-live", "org-1", Some("m-never-live"), None, "meeting", Some("Never live"),
+                1, 1, &[12u8; 32], "2026-07-12T09:00:00Z",
+            )
+            .unwrap();
+        state.db.set_org_share_failed("s-never-live", "publish_failed", "2026-07-12T09:00:00Z").unwrap();
+
+        let rows = list_meeting_org_shares_inner(&state).unwrap();
+        assert!(
+            rows.iter().any(|r| r.meeting_id == "m-stuck"),
+            "a failed-with-item_id (stuck republish) row's badge must still be visible in Library"
+        );
+        assert!(
+            !rows.iter().any(|r| r.meeting_id == "m-never-live"),
+            "a failed row that never published (no item_id) stays excluded — no live item"
         );
     }
 
@@ -27948,6 +28071,14 @@ pub struct MeetingOrgShareRow {
 /// meetings, in one bulk call (avoids an N+1 `meeting_org_shares` fetch per Library row). Same
 /// disclosure class + gate as [`meeting_org_shares`]: a sealed-and-not-session-unlocked meeting's
 /// rows are dropped, exactly mirroring `mask_locked_meetings` for `list_meetings`.
+///
+/// STUCK-REPUBLISH FIX: uses `Db::list_live_org_shares` (not a hardcoded `state = 'uploaded'`
+/// filter) so a row whose most recent republish attempt failed transiently but still carries a
+/// live server `item_id` (`set_org_share_failed` never clears it) keeps showing the badge — the
+/// same "live" definition already applied by `org_shares_for_source` / `OrgStatus.item_count` /
+/// `org_resolve_source_inner`. Before this fix, that exact reachable state (edit → republish →
+/// transient network blip) made the Library badge vanish while the note-share-panel's own CTA
+/// (which reads `org_shares_for_source`) still showed the item as shared — two surfaces disagreed.
 #[tauri::command]
 pub fn list_meeting_org_shares(
     state: State<'_, AppState>,
@@ -27959,7 +28090,7 @@ pub fn list_meeting_org_shares(
 pub(crate) fn list_meeting_org_shares_inner(
     st: &AppState,
 ) -> Result<Vec<MeetingOrgShareRow>, AppError> {
-    let rows = st.db.list_org_shares_in_state("uploaded")?;
+    let rows = st.db.list_live_org_shares()?;
     let mut out = Vec::new();
     let mut org_names: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut seen = std::collections::HashSet::new();
@@ -28799,7 +28930,13 @@ fn resolve_owned_source(
     let Some(row) = st.db.org_share_by_item(item_id)? else {
         return Ok(None);
     };
-    if row.state != "uploaded" {
+    // Mirrors `org_resolve_source_inner`: only a `revoked` row is refused — it was INTENTIONALLY
+    // torn down, so it must not enrich as owned. A `failed` row with its `item_id` still set (a
+    // republish that failed transiently but whose PRIOR publish is still genuinely live on the
+    // server, see `org_shares_for_source`) falls through, so the author's own stuck row still
+    // resolves to its real editable source + current title instead of quietly looking unowned in
+    // the list and routing the click to the read-only viewer.
+    if row.state == "revoked" {
         return Ok(None);
     }
     if let Some(document_id) = row.document_id {
