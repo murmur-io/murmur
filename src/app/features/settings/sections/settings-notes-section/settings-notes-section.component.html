@@ -15,6 +15,24 @@
                 <option value="brief">Brief (TL;DR + actions)</option>
                 <option value="detailed">Detailed (full depth)</option>
                 <option value="action">Action-focused</option>
+                @if (
+                  form.controls.noteStyle.value !== "standard" &&
+                  form.controls.noteStyle.value !== "brief" &&
+                  form.controls.noteStyle.value !== "detailed" &&
+                  form.controls.noteStyle.value !== "action"
+                ) {
+                  <!--
+                    note_style is a free-form String on the Rust side (commands.rs
+                    `AppConfigDto.note_style`) with no enum validation — a hand-edited
+                    config.json, legacy/removed style, or seed data can carry a value
+                    outside the four options above. Without this, the native <select>
+                    shows no visible selection at all. Surface the raw stored value as
+                    its own option instead of rendering blank.
+                  -->
+                  <option [value]="form.controls.noteStyle.value">
+                    {{ form.controls.noteStyle.value }} (custom)
+                  </option>
+                }
               </select>
               <span class="field-help text-muted">
                 @switch (form.controls.noteStyle.value) {
@@ -28,9 +46,13 @@
                   @case ("action") {
                     Front-loads who-does-what — owners, tasks and due dates first.
                   }
-                  @default {
+                  @case ("standard") {
                     A balanced summary, key points and action items — good for most
                     meetings.
+                  }
+                  @default {
+                    An unrecognized saved style — pick one of the options above to
+                    reset it to a supported style.
                   }
                 }
               </span>
