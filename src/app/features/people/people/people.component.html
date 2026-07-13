@@ -36,7 +36,7 @@
   } @else {
     <div class="p-layout" [class.has-detail]="selectedId() !== null">
       <ul class="p-cards" role="list">
-        @for (p of people(); track p.id) {
+        @for (p of renderedPeople(); track p.id) {
           <li>
             <button
               type="button"
@@ -113,6 +113,12 @@
           </li>
         }
       </ul>
+
+      @if (hiddenCount() > 0) {
+        <button type="button" class="btn btn-ghost p-show-all" (click)="showAll()">
+          Show all {{ total() }} people
+        </button>
+      }
 
       @if (selectedId(); as id) {
         <app-person-dossier

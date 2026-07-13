@@ -156,4 +156,10 @@
     transition: none;
   }
 }
+
+// "Show all N people" — the RENDER_CAP expander (mirrors audio-panel's .show-all).
+.p-show-all {
+  display: block;
+  margin: var(--space-3) auto 0;
+}
     
