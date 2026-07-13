@@ -44,100 +44,98 @@
       </div>
     </div>
 
-    @if (status(); as st) {
-      @if (st.loggedIn) {
-        <!-- (2a) Signed-in state. IDENTITY (who you are) is separated from
-             the SESSION share-key state (loaded this run or not) — the two
-             used to be conflated into a contradictory "signed in / sign in
-             to share". -->
-        <div class="account-section">
-          <span class="account-section-label text-muted">Signed in as</span>
-          <div class="signed-in-row">
-            <span class="pill is-success signed-pill">
-              <span class="pill-dot"></span>
-              {{ st.email ?? "Signed in" }}
-            </span>
-            <button
-              type="button"
-              class="btn btn-ghost"
-              (click)="logout()"
-              [disabled]="busy()"
-            >
-              Sign out
-            </button>
-          </div>
-          <p class="text-secondary account-note">
-            Your notes live on this Mac. Signing out only turns off sharing —
-            it never deletes, moves, or uploads a note.
-          </p>
-
-          <!-- SESSION share-key state — distinct from identity above. -->
-          @if (st.unlockedForSharing) {
-            <span class="pill is-success signed-pill">
-              <span class="pill-dot"></span>
-              Ready to share this session
-            </span>
-          } @else {
-            <p class="text-secondary account-note">
-              @if (canBiometricUnlock()) {
-                Sharing is locked this session — unlock with Touch ID to
-                share without re-entering your password.
-              } @else {
-                Sharing is locked this session — sign in again to load your
-                account key.
-              }
-            </p>
-            <div class="account-actions">
-              @if (canBiometricUnlock()) {
-                <button
-                  type="button"
-                  class="btn btn-primary"
-                  (click)="unlockWithBiometric()"
-                  [disabled]="unlocking()"
-                >
-                  {{ unlocking() ? "Unlocking…" : "Unlock with Touch ID" }}
-                </button>
-              } @else {
-                <button
-                  type="button"
-                  class="btn btn-primary"
-                  (click)="openFlow()"
-                >
-                  Sign in to share
-                </button>
-              }
-            </div>
-            @if (unlockError(); as uerr) {
-              <p class="text-secondary account-note" role="status">
-                {{ uerr }}
-              </p>
-            }
-          }
+    @if (!loaded()) {
+      <p class="text-muted account-note">Loading account…</p>
+    } @else if (isLoggedIn()) {
+      <!-- (2a) Signed-in state. IDENTITY (who you are) is separated from
+           the SESSION share-key state (loaded this run or not) — the two
+           used to be conflated into a contradictory "signed in / sign in
+           to share". -->
+      <div class="account-section">
+        <span class="account-section-label text-muted">Signed in as</span>
+        <div class="signed-in-row">
+          <span class="pill is-success signed-pill">
+            <span class="pill-dot"></span>
+            {{ status()?.email ?? "Signed in" }}
+          </span>
+          <button
+            type="button"
+            class="btn btn-ghost"
+            (click)="logout()"
+            [disabled]="busy()"
+          >
+            Sign out
+          </button>
         </div>
-      } @else {
-        <!-- (2b) Signed-out: ONE button opens the reusable flow -->
-        <div class="account-section">
-          <span class="account-section-label text-muted">Account</span>
+        <p class="text-secondary account-note">
+          Your notes live on this Mac. Signing out only turns off sharing —
+          it never deletes, moves, or uploads a note.
+        </p>
+
+        <!-- SESSION share-key state — distinct from identity above. -->
+        @if (status()?.unlockedForSharing) {
+          <span class="pill is-success signed-pill">
+            <span class="pill-dot"></span>
+            Ready to share this session
+          </span>
+        } @else {
           <p class="text-secondary account-note">
-            Create a sharing account or sign in to this Mac to start sharing
-            notes as end-to-end-encrypted links.
+            @if (canBiometricUnlock()) {
+              Sharing is locked this session — unlock with Touch ID to
+              share without re-entering your password.
+            } @else {
+              Sharing is locked this session — sign in again to load your
+              account key.
+            }
           </p>
           <div class="account-actions">
-            <button
-              type="button"
-              class="btn btn-primary"
-              (click)="openFlow()"
-            >
-              Create or sign in to a sharing account
-            </button>
+            @if (canBiometricUnlock()) {
+              <button
+                type="button"
+                class="btn btn-primary"
+                (click)="unlockWithBiometric()"
+                [disabled]="unlocking()"
+              >
+                {{ unlocking() ? "Unlocking…" : "Unlock with Touch ID" }}
+              </button>
+            } @else {
+              <button
+                type="button"
+                class="btn btn-primary"
+                (click)="openFlow()"
+              >
+                Sign in to share
+              </button>
+            }
           </div>
-          @if (accountError(); as aerr) {
-            <p class="text-danger account-note">{{ aerr }}</p>
+          @if (unlockError(); as uerr) {
+            <p class="text-secondary account-note" role="status">
+              {{ uerr }}
+            </p>
           }
-        </div>
-      }
+        }
+      </div>
     } @else {
-      <p class="text-muted account-note">Loading account…</p>
+      <!-- (2b) Signed-out: ONE button opens the reusable flow. Also the
+           fallback when `status()` settled but resolved falsy (e.g. an
+           unmocked `account_status` in the demo/screenshot world) — the
+           `loaded()` gate above guarantees this never means "still
+           pending" the way an `@if (status(); as st)` truthiness check did. -->
+      <div class="account-section">
+        <span class="account-section-label text-muted">Account</span>
+        <p class="text-secondary account-note">
+          Create a sharing account or sign in to this Mac to start sharing
+          notes as end-to-end-encrypted links.
+        </p>
+        <div class="account-actions">
+          <button type="button" class="btn btn-primary" (click)="openFlow()">
+            Create or sign in to a sharing account
+          </button>
+        </div>
+        @if (accountError(); as aerr) {
+          <p class="text-danger account-note">{{ aerr }}</p>
+        }
+      </div>
     }
   </div>
 

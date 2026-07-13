@@ -12,7 +12,8 @@ use crate::storage::models::{
     Analytics, AssistantInteraction, AssistantThreadRow, Commitment, CorrectionRecord, DayCount,
     DocChunkHit, DocumentInfo, EntityDetail, EntityKind, EntityNeighbor, Folder, GraphData,
     GraphEdge, GraphEntity, GraphNode, Meeting, MeetingStatus, NoteFolder, NoteRecord, NoteSummary,
-    OrgChunkHit, PendingShareAccept, PersonCard, RecipeRecord, SearchHit, StatusCount, VaultSource,
+    OrgChunkHit, PendingShareAccept, PeopleList, PersonCard, RecipeRecord, SearchHit, StatusCount,
+    VaultSource,
 };
 use crate::transcribe::types::Segment;
 
@@ -2241,6 +2242,32 @@ impl Db {
         let rows = stmt
             .query_map(rusqlite::params![state], Self::map_org_share)
             .map_err(map_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(map_err)?);
+        }
+        Ok(out)
+    }
+
+    /// Every LIVE org share across ALL sources/orgs — the un-scoped twin of `org_shares_for_source`,
+    /// for callers that need the whole "is this live" set rather than one source (the Library bulk
+    /// share-badge listing). Same STUCK-REPUBLISH definition of "live" as `org_shares_for_source`:
+    /// `uploaded` rows AND `failed` rows that still carry a non-null `item_id` — a row whose MOST
+    /// RECENT republish attempt failed transiently but whose PRIOR publish is still genuinely live on
+    /// the server (`set_org_share_failed` deliberately never clears `item_id`; only the success path's
+    /// `reset_org_share_for_retry` does). A `queued`/never-published `failed` row (no `item_id`) or a
+    /// `revoked`/`revoke_pending` share is excluded. See `org_shares_for_source` for the full rationale.
+    pub fn list_live_org_shares(&self) -> Result<Vec<crate::storage::OrgShareRow>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT {} FROM org_shares
+                   WHERE state = 'uploaded' OR (state = 'failed' AND item_id IS NOT NULL)
+                   ORDER BY created_at ASC",
+                Self::ORG_SHARE_COLS
+            ))
+            .map_err(map_err)?;
+        let rows = stmt.query_map([], Self::map_org_share).map_err(map_err)?;
         let mut out = Vec::new();
         for r in rows {
             out.push(r.map_err(map_err)?);
@@ -5382,10 +5409,19 @@ impl Db {
     /// (what colleagues shared IN). Distinct from the outbound `org_shares` count (what THIS member
     /// published OUT); the two were conflated so the Settings item count showed the caller's own
     /// uploads and read "0 items" to a receiver. Content-free.
+    ///
+    /// PER-INSTANCE ORG TOGGLE: joined to `org_state` and filtered on `context_enabled = 1` — same
+    /// gate as `search_org_chunks_knn`/`_fts`/`get_org_item`/`list_org_items_inner`. Without this a
+    /// disabled org's `received_count` stayed stale/inflated (the raw local-replica row count) even
+    /// though every other read of the same table (search, browse) correctly reports it as empty —
+    /// the count and the actual gated content must agree for the same org.
     pub fn count_org_items(&self, org_id: &str) -> Result<u32> {
         let conn = self.lock();
         conn.query_row(
-            "SELECT COUNT(*) FROM org_items WHERE org_id = ?1 AND tombstoned = 0",
+            "SELECT COUNT(*)
+               FROM org_items oi
+               JOIN org_state os ON os.org_id = oi.org_id
+              WHERE oi.org_id = ?1 AND oi.tombstoned = 0 AND os.context_enabled = 1",
             rusqlite::params![org_id],
             |r| r.get::<_, i64>(0),
         )
@@ -6308,31 +6344,64 @@ impl Db {
 
     // ── analytics ──────────────────────────────────────────────────────────────
 
-    /// Aggregate stats for the dashboard + Analytics tab.
-    pub fn analytics(&self) -> Result<Analytics> {
+    /// Aggregate stats for the dashboard + Analytics tab. VISIBLE-content only: mirrors the
+    /// `list_meetings_visible`/`brain_counts` predicate (a meeting counts iff it has no notes at
+    /// all, or at least one note whose folder is open/session-unlocked) so a sealed-and-not-
+    /// unlocked folder's meetings never contribute to totals/durations/status-breakdown/per-day
+    /// activity — the same leak class `visibility_clause` closes for search/graph/brain reads.
+    pub fn analytics(&self, unlocked: &HashSet<String>) -> Result<Analytics> {
         let conn = self.lock();
+        let visible = visibility_clause("n", unlocked);
+        // "meeting m is visible" = no notes at all, OR at least one visible note — reused below.
+        let visible_meeting = format!(
+            "(NOT EXISTS (SELECT 1 FROM notes nn WHERE nn.meeting_id = m.id)
+                 OR EXISTS (SELECT 1 FROM notes n
+                              LEFT JOIN folders f ON f.id = n.folder_id
+                             WHERE n.meeting_id = m.id AND {visible}))"
+        );
+
         let total_meetings: i64 = conn
-            .query_row("SELECT COUNT(*) FROM meetings", [], |r| r.get(0))
+            .query_row(
+                &format!("SELECT COUNT(*) FROM meetings m WHERE {visible_meeting}"),
+                [],
+                |r| r.get(0),
+            )
             .map_err(map_err)?;
         let total_duration_s: i64 = conn
             .query_row(
-                "SELECT COALESCE(SUM(duration_s), 0) FROM meetings",
+                &format!(
+                    "SELECT COALESCE(SUM(m.duration_s), 0) FROM meetings m WHERE {visible_meeting}"
+                ),
                 [],
                 |r| r.get(0),
             )
             .map_err(map_err)?;
         let longest_duration_s: i64 = conn
             .query_row(
-                "SELECT COALESCE(MAX(duration_s), 0) FROM meetings",
+                &format!(
+                    "SELECT COALESCE(MAX(m.duration_s), 0) FROM meetings m WHERE {visible_meeting}"
+                ),
                 [],
                 |r| r.get(0),
             )
             .map_err(map_err)?;
+        // Notes count — same folder-visibility gate as brain_counts's note/document split.
         let notes_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM notes", [], |r| r.get(0))
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM notes n LEFT JOIN folders f ON f.id = n.folder_id
+                      WHERE {visible}"
+                ),
+                [],
+                |r| r.get(0),
+            )
             .map_err(map_err)?;
         let first_meeting_at: Option<String> = conn
-            .query_row("SELECT MIN(started_at) FROM meetings", [], |r| r.get(0))
+            .query_row(
+                &format!("SELECT MIN(m.started_at) FROM meetings m WHERE {visible_meeting}"),
+                [],
+                |r| r.get(0),
+            )
             .map_err(map_err)?;
         let avg_duration_s = if total_meetings > 0 {
             total_duration_s / total_meetings
@@ -6345,14 +6414,20 @@ impl Db {
         let cutoff_7d = (chrono::Utc::now() - chrono::Duration::days(7)).to_rfc3339();
         let meetings_7d: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM meetings WHERE started_at >= ?1",
+                &format!(
+                    "SELECT COUNT(*) FROM meetings m
+                      WHERE m.started_at >= ?1 AND {visible_meeting}"
+                ),
                 rusqlite::params![cutoff_7d],
                 |r| r.get(0),
             )
             .map_err(map_err)?;
         let duration_7d_s: i64 = conn
             .query_row(
-                "SELECT COALESCE(SUM(duration_s), 0) FROM meetings WHERE started_at >= ?1",
+                &format!(
+                    "SELECT COALESCE(SUM(m.duration_s), 0) FROM meetings m
+                      WHERE m.started_at >= ?1 AND {visible_meeting}"
+                ),
                 rusqlite::params![cutoff_7d],
                 |r| r.get(0),
             )
@@ -6360,7 +6435,10 @@ impl Db {
 
         let by_status = {
             let mut stmt = conn
-                .prepare("SELECT status, COUNT(*) FROM meetings GROUP BY status")
+                .prepare(&format!(
+                    "SELECT m.status, COUNT(*) FROM meetings m
+                      WHERE {visible_meeting} GROUP BY m.status"
+                ))
                 .map_err(map_err)?;
             let rows = stmt
                 .query_map([], |row| {
@@ -6380,10 +6458,11 @@ impl Db {
         let cutoff_30d = (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
         let per_day = {
             let mut stmt = conn
-                .prepare(
-                    "SELECT substr(started_at, 1, 10) AS d, COUNT(*), COALESCE(SUM(duration_s), 0)
-                       FROM meetings WHERE started_at >= ?1 GROUP BY d ORDER BY d",
-                )
+                .prepare(&format!(
+                    "SELECT substr(m.started_at, 1, 10) AS d, COUNT(*), COALESCE(SUM(m.duration_s), 0)
+                       FROM meetings m WHERE m.started_at >= ?1 AND {visible_meeting}
+                       GROUP BY d ORDER BY d"
+                ))
                 .map_err(map_err)?;
             let rows = stmt
                 .query_map(rusqlite::params![cutoff_30d], |row| {
@@ -8352,6 +8431,50 @@ impl Db {
         Ok(out)
     }
 
+    /// The TRUE count of entities with ≥1 VISIBLE mention — same predicate as
+    /// `list_entities_visible` but with NO `LIMIT`, so callers can detect the 500-row cap
+    /// truncating the result and disclose it (added 2026-07-13: the cap trimmed `get_graph`'s
+    /// node list and `list_people`'s roster silently, with no signal the FE could show — the
+    /// existing `hasHidden`/`has_hidden_folders` flag only reports LOCKED folders, so on a vault
+    /// with >500 visible entities and zero locked folders it stayed false while 100+ entities were
+    /// dropped). `list_entities_visible(unlocked).len() < count_entities_visible(unlocked, None)`
+    /// means the cap trimmed rows. `kind` optionally narrows to one `EntityKind` (e.g. `Person`,
+    /// mirroring how `list_people` filters `list_entities_visible`'s output to persons) — the cap
+    /// applies BEFORE that filter, so the all-kinds and Person-only totals must be counted
+    /// separately rather than derived from each other.
+    pub fn count_entities_visible(
+        &self,
+        unlocked: &HashSet<String>,
+        kind: Option<EntityKind>,
+    ) -> Result<i64> {
+        let conn = self.lock();
+        let visible = visibility_clause("n", unlocked);
+        let kind_filter = match kind {
+            Some(k) => format!("AND e.kind = '{}'", k.as_str()),
+            None => String::new(),
+        };
+        let sql = format!(
+            "SELECT COUNT(*) FROM (
+               SELECT e.id
+                 FROM entities e
+                 JOIN entity_mentions em ON em.entity_id = e.id
+                 JOIN meetings m ON m.id = em.meeting_id
+                WHERE (
+                        NOT EXISTS (SELECT 1 FROM notes nn WHERE nn.meeting_id = m.id)
+                     OR EXISTS (
+                          SELECT 1 FROM notes n
+                           LEFT JOIN folders f ON f.id = n.folder_id
+                           WHERE n.meeting_id = m.id AND {visible}
+                        )
+                      )
+                      {kind_filter}
+                GROUP BY e.id
+               HAVING COUNT(em.meeting_id) > 0
+             )"
+        );
+        conn.query_row(&sql, [], |r| r.get(0)).map_err(map_err)
+    }
+
     /// The VISIBLE meetings mentioning `entity_id`, newest first, as `VaultSource` chips
     /// (the same shape the FE uses for backlink chips). Sealed-not-unlocked meetings excluded.
     pub fn entity_mentions_visible(
@@ -8689,10 +8812,12 @@ impl Db {
         let nodes = self.list_entities_visible(unlocked)?;
         let edges = self.graph_edges_visible(unlocked)?;
         let has_hidden = self.has_hidden_folders(unlocked)?;
+        let total_visible_entities = self.count_entities_visible(unlocked, None)?;
         Ok(GraphData {
             nodes,
             edges,
             has_hidden,
+            total_visible_entities,
         })
     }
 
@@ -9061,25 +9186,32 @@ impl Db {
     /// and `list_open_commitments` (owner-scoped, name match) — so every count reflects VISIBLE
     /// sources only; a sealed source contributes nothing to any of them. Ordered by most-recent
     /// contact (last_talked DESC), then name.
-    pub fn list_people(&self, unlocked: &HashSet<String>) -> Result<Vec<PersonCard>> {
+    ///
+    /// `open_commitment_count` MUST use the exact same predicate as the person-dossier's "who owes
+    /// what" section (`summarize::dossier::build_dossier_data`) — an open item belongs to this
+    /// person iff it's from one of their VISIBLE mentioning meetings OR its owner name-matches —
+    /// otherwise the card badge and the dossier opened from that same card can disagree (a person
+    /// mentioned in a meeting with an open, unowned/differently-owned action item was undercounted
+    /// here while the dossier counted it).
+    ///
+    /// Returns [`PeopleList`], not a bare `Vec`, because the candidate set is itself capped
+    /// UPSTREAM by `list_entities_visible`'s `MAX_VISIBLE_ENTITIES` (500, ordered by mention
+    /// count across ALL kinds) — on a vault with >500 visible entities, some visible Persons can
+    /// be trimmed before the `EntityKind::Person` filter even runs, with zero signal on the old
+    /// bare-`Vec` return (added 2026-07-13: `total_visible_people` is the TRUE Person count so the
+    /// FE's "Show all N people" expander can disclose the cap instead of presenting the trimmed
+    /// roster as complete).
+    pub fn list_people(&self, unlocked: &HashSet<String>) -> Result<PeopleList> {
         // GATE: the visible-only entity set, Persons only. A sealed-only person is absent here.
         let people: Vec<GraphNode> = self
             .list_entities_visible(unlocked)?
             .into_iter()
             .filter(|n| n.kind == EntityKind::Person)
             .collect();
-        // Owner-scoped commitments are cheap to compute ONCE (the full visible rollup) and bucket
-        // by lowercased owner name, rather than re-scanning every note per person.
-        let mut commitments_by_owner: std::collections::HashMap<String, i64> =
-            std::collections::HashMap::new();
-        for c in self.list_open_commitments(unlocked, None)? {
-            if let Some(owner) = c.owner.as_deref() {
-                let key = owner.trim().to_lowercase();
-                if !key.is_empty() {
-                    *commitments_by_owner.entry(key).or_insert(0) += 1;
-                }
-            }
-        }
+        // The full VISIBLE open-commitment rollup, computed ONCE and reused per person below —
+        // mirrors `build_dossier_data`'s corpus (mention-id match OR owner-name match), NOT a
+        // narrower owner-only bucket.
+        let all_commitments = self.list_open_commitments(unlocked, None)?;
         let mut out: Vec<PersonCard> = Vec::with_capacity(people.len());
         for p in people {
             // meeting_count + last_talked: VISIBLE mentions only, newest first.
@@ -9088,11 +9220,21 @@ impl Db {
             let last_talked = mentions.first().map(|m| m.started_at.clone());
             // current_fact_count: currently-valid facts about this person from VISIBLE meetings.
             let current_fact_count = self.list_facts_visible(&p.id, unlocked)?.len() as i64;
-            // open_commitment_count: open action items owned by this person (case-insensitive name).
-            let open_commitment_count = commitments_by_owner
-                .get(&p.name.trim().to_lowercase())
-                .copied()
-                .unwrap_or(0);
+            // open_commitment_count: same predicate as the dossier's "who owes what" — an open item
+            // from one of this person's mentioning meetings, OR owned by this person (name match).
+            let mention_ids: std::collections::HashSet<&str> =
+                mentions.iter().map(|m| m.meeting_id.as_str()).collect();
+            let name_lc = p.name.trim().to_lowercase();
+            let open_commitment_count = all_commitments
+                .iter()
+                .filter(|c| {
+                    mention_ids.contains(c.meeting_id.as_str())
+                        || c.owner
+                            .as_deref()
+                            .map(|o| o.trim().to_lowercase() == name_lc)
+                            .unwrap_or(false)
+                })
+                .count() as i64;
             out.push(PersonCard {
                 id: p.id,
                 name: p.name,
@@ -9113,7 +9255,11 @@ impl Db {
                 (None, None) => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
             },
         );
-        Ok(out)
+        let total_visible_people = self.count_entities_visible(unlocked, Some(EntityKind::Person))?;
+        Ok(PeopleList {
+            people: out,
+            total_visible_people,
+        })
     }
 
     // ── CROSS-MEETING USER MEMORY (Phase 3) ────────────────────────────────────
@@ -11067,6 +11213,44 @@ mod tests {
         db.set_org_context_enabled("org-1", true).unwrap();
         let fts_reenabled = db.search_org_chunks_fts("quantum ledger migration", 10).unwrap();
         assert_eq!(fts_reenabled.len(), 2, "re-enabling instantly restores visibility, no re-sync");
+    }
+
+    /// PER-INSTANCE ORG TOGGLE (RED-before-GREEN): `count_org_items` must agree with the actual
+    /// gated content — `search_org_chunks_knn`/`_fts`/`get_org_item`/`list_org_items_inner` all
+    /// exclude a disabled org's items, so the count (used as `OrgStatus.received_count`) must too.
+    /// Before the fix this counted raw `org_items` rows with no `context_enabled` join, so a
+    /// disabled org's count stayed stale/inflated instead of dropping to zero like every sibling read.
+    #[test]
+    fn count_org_items_excludes_a_disabled_org_and_restores_on_reenable() {
+        let db = mem_db();
+        seed_org_state(&db, "org-1");
+        let emb = crate::embed::StubEmbedder;
+        db.upsert_org_item(
+            "it-1", "org-1", 1, "anna", "Kickoff", "roadmap body", "t", 1, 1, &sha32(21), None,
+            Some(&emb),
+        )
+        .unwrap();
+        db.upsert_org_item(
+            "it-2", "org-1", 1, "bob", "Follow-up", "roadmap follow-up", "t", 2, 1, &sha32(22),
+            None, Some(&emb),
+        )
+        .unwrap();
+
+        assert_eq!(db.count_org_items("org-1").unwrap(), 2, "both items counted while enabled");
+
+        db.set_org_context_enabled("org-1", false).unwrap();
+        assert_eq!(
+            db.count_org_items("org-1").unwrap(),
+            0,
+            "a disabled org's received_count must drop to zero, matching search/list, not stay inflated"
+        );
+
+        db.set_org_context_enabled("org-1", true).unwrap();
+        assert_eq!(
+            db.count_org_items("org-1").unwrap(),
+            2,
+            "re-enabling instantly restores the count — the replica was never touched"
+        );
     }
 
     /// The self-share dedup source: `all_org_shared_content_hashes` returns every non-null
@@ -15412,6 +15596,92 @@ mod tests {
         let _ = std::fs::remove_file(&p);
     }
 
+    /// The Analytics tab must never reveal a sealed-and-not-unlocked folder's meetings — same
+    /// leak class `visibility_clause` closes for search/graph/brain reads. Regression for the
+    /// audit finding: `Db::analytics()` used to run bare `SELECT COUNT(*)`/`SUM(duration_s)`
+    /// over ALL meetings with no folder join at all (confirmed RED against the pre-fix
+    /// no-arg `analytics()`: it counted the sealed meeting too).
+    #[test]
+    fn analytics_excludes_sealed_not_unlocked_folder() {
+        let db = mem_db();
+        // Two OPEN meetings (folder_id NULL) + one meeting in a LOCKED, not-session-unlocked folder.
+        for (id, at, dur) in [
+            ("open-1", "2026-06-20T10:00:00Z", 600i64),
+            ("open-2", "2026-06-21T10:00:00Z", 900i64),
+            ("secret", "2026-06-22T10:00:00Z", 6000i64),
+        ] {
+            db.insert_meeting(&crate::storage::Meeting {
+                id: id.into(),
+                started_at: at.into(),
+                ended_at: None,
+                title: Some("t".into()),
+                duration_s: dur,
+                audio_path: None,
+                status: crate::storage::MeetingStatus::Summarized,
+                folder_id: None,
+            })
+            .unwrap();
+            db.upsert_note(&crate::storage::NoteRecord {
+                meeting_id: id.into(),
+                provider_id: "claude_code".into(),
+                markdown: "m".into(),
+                created_at: at.into(),
+                exported_path: None,
+                model_requested: None,
+                model_served: None,
+                gateway_host: None,
+            })
+            .unwrap();
+        }
+        db.insert_folder(&crate::storage::Folder {
+            id: "f-secret".into(),
+            name: "Secret".into(),
+            path: "Secret".into(),
+            parent_id: None,
+            locked: true,
+            created_at: "2026-06-01T00:00:00Z".into(),
+        })
+        .unwrap();
+        db.set_note_folder("secret", Some("f-secret")).unwrap();
+
+        // Sealed and NOT session-unlocked: the "secret" meeting (6000s, its own day, status
+        // Summarized) must be invisible everywhere in the aggregate.
+        let nothing = std::collections::HashSet::new();
+        let a = db.analytics(&nothing).unwrap();
+        assert_eq!(a.total_meetings, 2, "sealed meeting must not be counted");
+        assert_eq!(
+            a.total_duration_s, 1500,
+            "sealed meeting's duration must not contribute to the total"
+        );
+        assert_eq!(
+            a.longest_duration_s, 900,
+            "the sealed meeting's 6000s must not surface as the longest"
+        );
+        assert_eq!(a.avg_duration_s, 750);
+        let by_status_total: i64 = a.by_status.iter().map(|s| s.count).sum();
+        assert_eq!(
+            by_status_total, 2,
+            "status breakdown must not include the sealed meeting"
+        );
+        let per_day_total: i64 = a.per_day.iter().map(|d| d.count).sum();
+        assert_eq!(
+            per_day_total, 2,
+            "per-day activity chart must not include the sealed meeting's day"
+        );
+        assert!(
+            !a.per_day.iter().any(|d| d.date == "2026-06-22"),
+            "the sealed meeting's day must not appear in the 30-day activity chart at all"
+        );
+
+        // Once the folder is SESSION-unlocked, the same meeting becomes visible again (reversible).
+        let mut unlocked = std::collections::HashSet::new();
+        unlocked.insert("f-secret".to_string());
+        let a2 = db.analytics(&unlocked).unwrap();
+        assert_eq!(a2.total_meetings, 3);
+        assert_eq!(a2.total_duration_s, 7500);
+        assert_eq!(a2.longest_duration_s, 6000);
+    }
+
     /// Race-safety regression (TOCTOU: prune snapshots a plaintext path, a concurrent seal
     /// re-points the column to `.enc`, prune must NOT null the sealed pointer). The conditional
     /// clear only nulls when the column still holds the snapshotted plaintext path.
@@ -17717,7 +17987,7 @@ mod graph_tests {
         seal_folder(&db, "secret", &kek);
 
         let empty: HashSet<String> = HashSet::new();
-        let sealed_view = db.list_people(&empty).unwrap();
+        let sealed_view = db.list_people(&empty).unwrap().people;
 
         // (1) A person known only through the sealed meeting must NOT surface.
         assert!(
@@ -17761,7 +18031,7 @@ mod graph_tests {
         )
         .unwrap();
         let unlocked = unlocked_set(&["secret"]);
-        let unlocked_view = db.list_people(&unlocked).unwrap();
+        let unlocked_view = db.list_people(&unlocked).unwrap().people;
         assert!(
             unlocked_view.iter().any(|p| p.id == secret_p),
             "the secret person reappears once its folder id is in the unlocked set"
@@ -17783,6 +18053,105 @@ mod graph_tests {
         assert_eq!(
             bob_u.current_fact_count, 2,
             "both facts visible when unlocked"
+        );
+    }
+
+    /// The People card's `open_commitment_count` badge MUST agree with the count backing the same
+    /// person's dossier "who owes what" section one click away
+    /// (`summarize::dossier::build_dossier_data`), which counts an open item as this person's iff
+    /// it's from one of their mentioning meetings OR owner-name-matches — NOT owner-name-match
+    /// alone. RED-before-GREEN: a narrower owner-only bucket undercounts a person mentioned in a
+    /// meeting with an open, unowned action item, so the card badge (0) disagrees with the dossier
+    /// (1) for the exact same person.
+    #[test]
+    fn list_people_open_commitment_count_matches_dossier_mention_or_owner_filter() {
+        let db = file_db("people-dossier-parity");
+        seed_note(
+            &db,
+            "m1",
+            "## Action items\n- [ ] Follow up on pricing 2026-08-01\n",
+            None,
+        );
+        let priya = db.upsert_entity("Priya", EntityKind::Person).unwrap();
+        db.add_mention(&priya, "m1").unwrap();
+
+        let empty: HashSet<String> = HashSet::new();
+        let cards = db.list_people(&empty).unwrap().people;
+        let priya_card = cards
+            .iter()
+            .find(|p| p.id == priya)
+            .expect("Priya is visible via her mention");
+        assert_eq!(
+            priya_card.open_commitment_count, 1,
+            "the card badge must count the open, unowned action item from Priya's mentioned \
+             meeting, same as the dossier's 'who owes what' section"
+        );
+
+        let dossier = crate::summarize::dossier::build_dossier_data(&db, &priya, &empty)
+            .unwrap()
+            .expect("Priya has a visible dossier");
+        assert_eq!(
+            dossier.commitments.len() as i64,
+            priya_card.open_commitment_count,
+            "the People card badge and the dossier 'who owes what' count must never disagree \
+             for the same person"
+        );
+    }
+
+    /// 2026-07-13 UX audit fix: on a vault with MORE than `MAX_VISIBLE_ENTITIES` (500) visible
+    /// entities and ZERO locked folders, `has_hidden` (which only reflects LOCKED folders) stays
+    /// false while `list_entities_visible`'s `LIMIT 500` silently trims the roster — so the OLD
+    /// `GraphData`/`Vec<PersonCard>` shapes gave the FE no way to tell `total()`/"Show all N" was
+    /// understating completeness. RED-before-GREEN: before `total_visible_entities` /
+    /// `total_visible_people` existed, there was no field to assert on at all (a compile-time
+    /// absence); post-fix, both must exceed the capped roster length with `has_hidden` still false.
+    #[test]
+    fn graph_and_people_disclose_the_500_cap_even_with_no_locked_folders() {
+        let db = file_db("cap-disclosure");
+        seed_note(&db, "m1", "one shared meeting", None);
+
+        // 520 distinct Person entities, all mentioned in the SAME open (never-locked) meeting —
+        // every one has exactly one VISIBLE mention, so none is trimmed by the `HAVING cnt > 0`
+        // gate; only the trailing `LIMIT 500` in `list_entities_visible` caps the roster.
+        const SEEDED: usize = 520;
+        for i in 0..SEEDED {
+            let id = db
+                .upsert_entity(&format!("Person {i:04}"), EntityKind::Person)
+                .unwrap();
+            db.add_mention(&id, "m1").unwrap();
+        }
+
+        let empty: HashSet<String> = HashSet::new();
+
+        // No folder was ever locked, so the OLD disclosure signal stays false...
+        assert!(
+            !db.has_hidden_folders(&empty).unwrap(),
+            "no folder is locked, so the locked-folder disclosure has nothing to report"
+        );
+
+        // ...yet the graph payload is truncated below the true 520, and now says so explicitly.
+        let graph = db.build_graph(&empty).unwrap();
+        assert!(!graph.has_hidden, "still no locked folder");
+        assert_eq!(graph.nodes.len(), 500, "the render cap trims to 500 nodes");
+        assert_eq!(
+            graph.total_visible_entities, SEEDED as i64,
+            "the TRUE visible-entity count is reported even though the roster is capped"
+        );
+        assert!(
+            graph.total_visible_entities > graph.nodes.len() as i64,
+            "total must exceed the capped roster so the FE can detect + disclose truncation"
+        );
+
+        // Same shape on `/people`: the roster is capped, but `total_visible_people` is the truth.
+        let people = db.list_people(&empty).unwrap();
+        assert_eq!(people.people.len(), 500, "people roster is also capped at 500");
+        assert_eq!(
+            people.total_visible_people, SEEDED as i64,
+            "the TRUE visible-person count, independent of the render cap"
+        );
+        assert!(
+            people.total_visible_people > people.people.len() as i64,
+            "\"Show all N people\" must be able to disclose N > the capped roster length"
         );
     }
 

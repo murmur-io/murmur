@@ -1222,6 +1222,12 @@ export interface GraphData {
   edges: GraphEdge[];
   /** True when ≥1 folder is sealed-and-not-unlocked → render one honest disclosure banner. */
   hasHidden: boolean;
+  /**
+   * The TRUE count of VISIBLE entities, BEFORE the backend's 500-row render cap trims `nodes`.
+   * `totalVisibleEntities > nodes.length` means the cap silently dropped rows — independent of
+   * `hasHidden` (which only reflects LOCKED folders, never the render cap).
+   */
+  totalVisibleEntities: number;
 }
 
 /** A co-occurring neighbor of a selected entity (a neighborhood satellite). */
@@ -1264,6 +1270,18 @@ export interface PersonCard {
   openCommitmentCount: number;
   /** Currently-valid (open) facts about this person from VISIBLE meetings. */
   currentFactCount: number;
+}
+
+/**
+ * The payload from `listPeople()`: the (possibly render-capped) roster of {@link PersonCard}s
+ * plus the TRUE count of visible people. `list_people`'s candidate set is itself capped upstream
+ * by the same 500-row limit that backs {@link GraphData.totalVisibleEntities}, so
+ * `totalVisiblePeople > people.length` is the only signal that the roster — and therefore any
+ * "Show all N people" affordance — understates the real total.
+ */
+export interface PeopleList {
+  people: PersonCard[];
+  totalVisiblePeople: number;
 }
 
 /**

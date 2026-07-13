@@ -88,9 +88,19 @@
   height: 132px;
 }
 .chart-col {
+  position: relative;
   flex: 1 1 0;
   height: 100%;
   min-width: 0;
+}
+/* Each .chart-bar is its own stacking context (position: relative), painted
+   in DOM order — so a taller LATER sibling bar visually covers an earlier
+   bar's absolutely-positioned .chart-tip regardless of the tip's own
+   z-index (that z-index only wins inside its own bar's context). Lift the
+   whole hovered column above every sibling so its tip always paints on top,
+   no matter how tall its neighbors are. */
+.chart-col:hover {
+  z-index: 3;
 }
 .chart-track {
   position: relative;

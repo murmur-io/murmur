@@ -55,7 +55,7 @@ import type {
   NoteAssistRequest,
   NoteAssistResult,
   OrganizePlan,
-  PersonCard,
+  PeopleList,
   PinResult,
   PruneSummary,
   StorageReport,
@@ -1014,9 +1014,11 @@ export class IpcService {
    * sealed-not-unlocked meetings never appears, and every count reflects visible
    * sources only — so re-fetch on a FoldersService lock-state change to shift the
    * list live (mirrors {@link getGraph}). Each `id` links to the entity detail.
+   * Returns {@link PeopleList}, not a bare array — `people` may itself be capped by
+   * the backend's 500-row limit, and `totalVisiblePeople` is the true count.
    */
-  listPeople(): Promise<PersonCard[]> {
-    return invoke<PersonCard[]>("list_people");
+  listPeople(): Promise<PeopleList> {
+    return invoke<PeopleList>("list_people");
   }
 
   /**
@@ -1728,8 +1730,11 @@ export class IpcService {
    * Persist a meeting's live typed-notes buffer (debounced autosave from the
    * record screen "My notes" editor). GATED server-side: a
    * sealed-and-not-session-unlocked meeting is refused with `AppError::Locked`
-   * (never resurrect typed plaintext behind a lock) — the FE swallows that and
-   * keeps the local draft. The text is the user's OWN words (no new egress).
+   * (never resurrect typed plaintext behind a lock) — the caller
+   * (`MeetingConversationStore.persistNotes`) keeps the local draft either way
+   * but surfaces the rejection via a toast rather than swallowing it, since the
+   * flow already shows the note as saved from local state. The text is the
+   * user's OWN words (no new egress).
    */
   saveManualNotes(meetingId: string, text: string): Promise<void> {
     return invoke<void>("save_manual_notes", { meetingId, text });

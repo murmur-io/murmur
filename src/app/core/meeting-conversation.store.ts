@@ -2,6 +2,7 @@ import { Injectable, computed, effect, inject, signal } from "@angular/core";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { IpcService } from "./ipc.service";
 import { FoldersService } from "../services/folders.service";
+import { ToastService } from "../services/toast.service";
 import type {
   AnsweredFrom,
   AssistantThreadRow,
@@ -221,6 +222,7 @@ function coerceStatus(s: string): VoiceActionStatus {
 export class MeetingConversationStore {
   private readonly ipc = inject(IpcService);
   private readonly folders = inject(FoldersService);
+  private readonly toast = inject(ToastService);
 
   /** The user's NOTES — the main flow (oldest → newest). Each item may host a thread. */
   private readonly _notes = signal<NoteItem[]>([]);
@@ -682,6 +684,15 @@ export class MeetingConversationStore {
    * (`persisted: false`) are excluded — only content the user wrote or accepted
    * lands in the durable buffer. A no-op when there's no meeting yet (the flow is
    * shown locally; it persists once a meeting exists / on the next change).
+   *
+   * On a REJECTED save (e.g. `AppError::Locked` when the folder's session-unlock
+   * lapses between the click and the write — `save_manual_notes_inner`,
+   * `commands.rs`) the FE flow already shows the note line / "✓ Added to notes"
+   * from local state, so a swallowed rejection would silently lie about a save
+   * that never landed (the buffer is NOT durable — lost on next load/restart).
+   * Surface it via the toast (mirrors `note-editor.component.ts`'s
+   * `saveText`/`saveFull`) so the user knows to unlock and retry; the local note
+   * line is intentionally kept either way (never destroy content the user typed).
    */
   private persistNotes(): void {
     this.notesBuffer = this._notes()
@@ -690,9 +701,14 @@ export class MeetingConversationStore {
       .join("\n");
     const id = this._meetingId();
     if (!id) return;
-    void this.ipc.saveManualNotes(id, this.notesBuffer).catch(() => {
-      // Locked/sealed or transient — the flow keeps the local note; we never
-      // noisily fail a note save. (The buffer kept the local change.)
+    void this.ipc.saveManualNotes(id, this.notesBuffer).catch((e) => {
+      if (String(e).includes("Locked")) {
+        this.toast.danger(
+          "This meeting's folder is locked — unlock it so your note saves.",
+        );
+      } else {
+        this.toast.danger("Couldn't save your note — it's not synced yet.");
+      }
     });
   }
 
@@ -1069,7 +1085,13 @@ export class MeetingConversationStore {
   /**
    * Fire the manual "Ask AI" trigger: open a fresh anchorless thread to host the
    * voice turn, open the listener, and mark a manual ask in flight so the surface
-   * stays visible for the whole round-trip. Errors clear the in-flight flag.
+   * stays visible for the whole round-trip. When `begin_voice_command` itself
+   * REJECTS, the listener never armed and no {@link onResult} will ever land to
+   * backfill the "🎙 …" placeholder anchor — resolving its turn in place would
+   * strand an unlabeled mic bubble in the flow with no dismiss/retry for the rest
+   * of the session, so instead we DROP the whole placeholder thread (it never
+   * became a real note — `persisted: false`) and just clear the in-flight flag,
+   * leaving the flow exactly as it was before the click.
    */
   async askNow(): Promise<void> {
     this._manualAskInFlight.set(true);
@@ -1122,13 +1144,10 @@ export class MeetingConversationStore {
       this._manualAskInFlight.set(false);
       this._listening.set(false);
       this.voiceTargetNoteId = null;
-      this.resolveTurn(noteId, agentTurn.id, {
-        status: "error",
-        text: "Couldn't start the listener.",
-        citations: [],
-        proposedNote: null,
-        answeredFrom: null,
-      });
+      // The listener never started — there is nothing to resolve or retry, so
+      // remove the placeholder thread rather than leaving an orphaned "🎙 …"
+      // bubble permanently stuck in the flow.
+      this._notes.update((ns) => ns.filter((n) => n.id !== noteId));
       throw e;
     }
   }
