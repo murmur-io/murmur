@@ -33,11 +33,77 @@ where
         .map_err(|e| AppError::Other(anyhow::anyhow!("heavy inference task panicked: {e}")))?
 }
 
+/// macOS kernel memory-pressure level via `sysctl -n kern.memorystatus_vm_pressure_level` — the
+/// SAME no-new-crate/no-new-FFI shell-out convention as `total_ram_bytes`/`available_ram_bytes`
+/// (`transcribe/model.rs`, `reason/sidecar.rs`). `1` = normal, `2` = warn, `4` = critical.
+///
+/// This is a DIFFERENT signal than the existing `vm_stat`-derived free/inactive/speculative
+/// arithmetic: that answers "does THIS job's footprint fit the numbers we can see", this answers
+/// "does the KERNEL ITSELF already think the whole system is under pressure" (e.g. another app
+/// about to be jetsam-killed, or pressure that hasn't yet shown up as reduced free/inactive
+/// pages). Meant to be consulted ALONGSIDE an existing RAM-floor check, not instead of it — see
+/// [`heavy_op_permitted`].
+///
+/// Returns `None` on ANY parse/exec failure — callers must fail OPEN on `None`, matching every
+/// other RAM-probe convention in this codebase (a broken measurement must never silently refuse
+/// a legitimate task).
+fn kernel_memory_pressure_level() -> Option<u8> {
+    let out = std::process::Command::new("sysctl")
+        .arg("-n")
+        .arg("kern.memorystatus_vm_pressure_level")
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8(out.stdout).ok()?.trim().parse().ok()
+}
+
+/// Combine an existing RAM-floor verdict (`ram_floor_ok`, e.g. `topic_backfill_ram_permits_now()`
+/// or `parakeet_ram_permits_now()`) with the kernel's own pressure signal — refuses ONLY when the
+/// floor check already said no, OR the kernel reports CRITICAL (4) pressure. `WARN` (2) is common
+/// and deliberately NOT itself a refusal (per the research brief this codifies: blocking on WARN
+/// would be over-eager for a user-initiated action like starting a recording). Fails OPEN on a
+/// broken pressure probe — a `None` never adds a NEW refusal on top of an already-permitting floor
+/// check.
+pub fn heavy_op_permitted(ram_floor_ok: bool) -> bool {
+    if !ram_floor_ok {
+        return false;
+    }
+    kernel_memory_pressure_level().map_or(true, |level| level < 4)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+
+    /// The deterministic half of `heavy_op_permitted`'s logic: an already-failing RAM floor
+    /// short-circuits to `false` regardless of the kernel pressure signal (which we can't
+    /// deterministically mock — it shells out to the real `sysctl` on whatever machine runs this
+    /// test). This is the ONE branch fully testable without depending on real system state.
+    #[test]
+    fn heavy_op_permitted_short_circuits_on_a_failing_ram_floor() {
+        assert!(
+            !heavy_op_permitted(false),
+            "an already-failing RAM floor must refuse regardless of kernel pressure"
+        );
+    }
+
+    /// `kernel_memory_pressure_level` must never panic and must return a value in the documented
+    /// range (or None on a broken probe) — the one thing we CAN assert about the real machine
+    /// this test runs on, without asserting a specific pressure level (which is real system state,
+    /// not something this test controls).
+    #[test]
+    fn kernel_memory_pressure_level_never_panics() {
+        if let Some(level) = kernel_memory_pressure_level() {
+            assert!(
+                level == 1 || level == 2 || level == 4,
+                "unexpected kern.memorystatus_vm_pressure_level value: {level}"
+            );
+        }
+    }
 
     /// The core contract: two `run_heavy` calls sharing ONE semaphore never overlap — the second
     /// call's closure only starts once the first has fully finished, even though both are handed

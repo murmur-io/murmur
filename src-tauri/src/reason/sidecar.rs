@@ -593,9 +593,13 @@ fn dispatch(
 
     // Spawn lazily on first use / after any kill. The RAM pre-check refuses-to-Cloud BEFORE paying a
     // spawn that would swap-death the machine (the child self-checks too; this avoids the fork).
+    // 2026-07-13: also consult the kernel's OWN pressure signal (crate::perf::heavy_op_permitted)
+    // alongside the vm_stat-derived floor — a different question ("does the kernel already think
+    // the whole system is under pressure") than "does this job's footprint fit the free/inactive
+    // arithmetic". Refuses only on CRITICAL kernel pressure; fails open on a broken probe either way.
     if !state.is_live() {
         if let Some(bytes) = model_disk_bytes(model_path) {
-            if !ram_permits_load(available_ram_bytes(), bytes) {
+            if !crate::perf::heavy_op_permitted(ram_permits_load(available_ram_bytes(), bytes)) {
                 let gb = bytes as f64 / 1_073_741_824.0;
                 tracing::warn!(
                     target: "reason",
