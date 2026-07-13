@@ -297,6 +297,7 @@ impl Db {
                audio_path TEXT,
                status TEXT NOT NULL
              );
+             CREATE INDEX IF NOT EXISTS idx_meetings_started_at ON meetings(started_at);
              CREATE TABLE IF NOT EXISTS segments (
                meeting_id TEXT NOT NULL,
                idx INTEGER NOT NULL,
@@ -540,6 +541,13 @@ impl Db {
         // `ALTER ADD COLUMN` errors if the column already exists, so check pragma_table_info first.
         Self::add_column_if_missing(&conn, "notes", "folder_id", "TEXT")?;
         Self::add_column_if_missing(&conn, "notes", "content_blob", "BLOB")?;
+        // 2026-07-13 perf audit (MODERATE): `folder_id` has no index, so `notes_in_folder`/
+        // `meeting_ids_in_folder` — called on every folder lock/unlock/relock — full-scan the
+        // whole `notes` table. `CREATE INDEX IF NOT EXISTS` after the guarded ALTER above (the
+        // column must exist first); safe on an existing index (no-op) and additive-only per the
+        // migration discipline (no data touched).
+        conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_notes_folder_id ON notes(folder_id);")
+            .map_err(map_err)?;
         // Phase B: 2-way stream attribution ("me"/"others"). Guarded ALTER (same idempotent
         // pattern) — NULL for legacy rows transcribed before dual-stream, which read back as
         // `speaker: None` (unattributed). NOT per-remote-person diarization; see types::Segment.
@@ -10689,6 +10697,31 @@ mod tests {
         let db = mem_db();
         db.migrate().unwrap();
         db.migrate().unwrap();
+    }
+
+    /// 2026-07-13 perf audit: `meetings.started_at` (every list/search sorts on it) and
+    /// `notes.folder_id` (every folder lock/unlock full-scans on it) previously had no index
+    /// beyond each table's PK — confirms both indices actually exist after migrate(), not just
+    /// that the SQL didn't error.
+    #[test]
+    fn migrate_creates_the_new_perf_indices() {
+        let db = mem_db();
+        let conn = db.lock();
+        let names: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'index'")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            names.contains(&"idx_meetings_started_at".to_string()),
+            "missing idx_meetings_started_at, got indices: {names:?}"
+        );
+        assert!(
+            names.contains(&"idx_notes_folder_id".to_string()),
+            "missing idx_notes_folder_id, got indices: {names:?}"
+        );
     }
 
     // ── M6 Shared Brain — org ingest + retrieval ────────────────────────────────────────────────
