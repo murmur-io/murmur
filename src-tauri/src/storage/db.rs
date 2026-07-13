@@ -2248,6 +2248,32 @@ impl Db {
         Ok(out)
     }
 
+    /// Every LIVE org share across ALL sources/orgs — the un-scoped twin of `org_shares_for_source`,
+    /// for callers that need the whole "is this live" set rather than one source (the Library bulk
+    /// share-badge listing). Same STUCK-REPUBLISH definition of "live" as `org_shares_for_source`:
+    /// `uploaded` rows AND `failed` rows that still carry a non-null `item_id` — a row whose MOST
+    /// RECENT republish attempt failed transiently but whose PRIOR publish is still genuinely live on
+    /// the server (`set_org_share_failed` deliberately never clears `item_id`; only the success path's
+    /// `reset_org_share_for_retry` does). A `queued`/never-published `failed` row (no `item_id`) or a
+    /// `revoked`/`revoke_pending` share is excluded. See `org_shares_for_source` for the full rationale.
+    pub fn list_live_org_shares(&self) -> Result<Vec<crate::storage::OrgShareRow>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT {} FROM org_shares
+                   WHERE state = 'uploaded' OR (state = 'failed' AND item_id IS NOT NULL)
+                   ORDER BY created_at ASC",
+                Self::ORG_SHARE_COLS
+            ))
+            .map_err(map_err)?;
+        let rows = stmt.query_map([], Self::map_org_share).map_err(map_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(map_err)?);
+        }
+        Ok(out)
+    }
+
     /// Every org share for an org (the FE list). Newest first.
     pub fn list_org_shares_for_org(
         &self,
