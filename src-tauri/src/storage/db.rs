@@ -2248,6 +2248,35 @@ impl Db {
         Ok(out)
     }
 
+    /// Every LIVE org share across ALL sources — `uploaded` rows plus a `failed` row that still
+    /// carries a non-null `item_id` (the stuck-republish shape `set_org_share_failed` produces: a
+    /// republish, as opposed to the initial publish, failed transiently but the row's PRIOR item is
+    /// still genuinely live on the server). The bulk/all-sources twin of `org_shares_for_source`'s
+    /// same `(state = 'uploaded' OR (state = 'failed' AND item_id IS NOT NULL))` predicate — see the
+    /// STUCK-REPUBLISH FIX doc there. Used by `list_meeting_org_shares_inner` for the Library
+    /// share-badge bulk read, which was missed by that fix (still called
+    /// `list_org_shares_in_state("uploaded")`, exact-match only) and so silently dropped a stuck-but-
+    /// live share's badge.
+    pub fn list_live_org_shares(&self) -> Result<Vec<crate::storage::OrgShareRow>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT {} FROM org_shares
+                   WHERE state = 'uploaded' OR (state = 'failed' AND item_id IS NOT NULL)
+                   ORDER BY created_at ASC",
+                Self::ORG_SHARE_COLS
+            ))
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map([], Self::map_org_share)
+            .map_err(map_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(map_err)?);
+        }
+        Ok(out)
+    }
+
     /// Every org share for an org (the FE list). Newest first.
     pub fn list_org_shares_for_org(
         &self,

@@ -24511,6 +24511,67 @@ mod lifecycle_tests {
         );
     }
 
+    /// STUCK-REPUBLISH FIX (Library bulk read): `list_meeting_org_shares_inner` must keep showing
+    /// the "Shared" badge for a meeting whose most recent org-republish attempt failed transiently
+    /// but whose PRIOR item is still genuinely live on the server — the exact shape
+    /// `set_org_share_failed` produces on a republish (state='failed', item_id still set from the
+    /// earlier successful publish; see cd21b10, which fixed `org_shares_for_source` and its callers
+    /// but missed this bulk Library-badge read, which still called
+    /// `list_org_shares_in_state("uploaded")` — exact-match only). RED on the pre-fix code (the
+    /// stuck row is silently excluded, badge vanishes); GREEN once the bulk read also surfaces a
+    /// failed-with-item_id row, mirroring the per-meeting sibling `meeting_org_shares_inner`.
+    #[test]
+    fn list_meeting_org_shares_keeps_badge_for_stuck_failed_republish() {
+        let state = build_state("list-meeting-org-shares-stuck-republish");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+
+        make_open_folder(&state.db, "f-open", "Open");
+        seed_meeting(&state.db, "m-stuck", "# note", Some("f-open"));
+        state
+            .db
+            .insert_org_share(
+                "s-stuck", "org-1", Some("m-stuck"), None, "meeting", Some("Roadmap"),
+                1, 1, &[11u8; 32], "2026-07-12T09:00:00Z",
+            )
+            .unwrap();
+        // Published successfully once (item_id set)...
+        state.db.set_org_share_uploaded("s-stuck", "item-stuck", "2026-07-12T09:00:00Z").unwrap();
+        // ...then a REPUBLISH (on note edit) failed transiently. `set_org_share_failed` never
+        // clears `item_id` — the prior item is still live on the server.
+        state
+            .db
+            .set_org_share_failed("s-stuck", "republish_upload_failed", "2026-07-12T10:00:00Z")
+            .unwrap();
+
+        // A row that NEVER successfully published (failed before any item_id) must stay excluded —
+        // there is no live server item for it to badge.
+        seed_meeting(&state.db, "m-never-live", "# note", Some("f-open"));
+        state
+            .db
+            .insert_org_share(
+                "s-never-live", "org-1", Some("m-never-live"), None, "meeting", Some("Draft"),
+                1, 1, &[12u8; 32], "2026-07-12T09:00:00Z",
+            )
+            .unwrap();
+        state
+            .db
+            .set_org_share_failed("s-never-live", "publish_failed", "2026-07-12T09:05:00Z")
+            .unwrap();
+
+        let rows = list_meeting_org_shares_inner(&state).unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "the stuck-failed-with-item_id row keeps its badge; the never-published one stays excluded"
+        );
+        assert_eq!(rows[0].meeting_id, "m-stuck");
+        assert_eq!(rows[0].org_id, "org-1");
+        assert!(
+            !rows.iter().any(|r| r.meeting_id == "m-never-live"),
+            "a failed row that never published (item_id NULL) must not get a badge"
+        );
+    }
+
     /// FIX B (received-items COUNT): `OrgStatus.received_count` reflects the LOCAL replica (what
     /// colleagues shared IN), DISTINCT from `item_count` (the caller's OWN uploaded outbound shares).
     /// Seed org_items (received) + an outbound uploaded share and assert the two counts are independent.
@@ -27959,7 +28020,12 @@ pub fn list_meeting_org_shares(
 pub(crate) fn list_meeting_org_shares_inner(
     st: &AppState,
 ) -> Result<Vec<MeetingOrgShareRow>, AppError> {
-    let rows = st.db.list_org_shares_in_state("uploaded")?;
+    // `list_live_org_shares` (not a bare `list_org_shares_in_state("uploaded")`) so a
+    // stuck-failed-republish row whose PRIOR item is still live on the server (state='failed',
+    // item_id still set — see cd21b10) keeps its Library share badge instead of silently
+    // vanishing. Mirrors `org_shares_for_source`'s predicate, used by the per-meeting sibling
+    // `meeting_org_shares_inner`.
+    let rows = st.db.list_live_org_shares()?;
     let mut out = Vec::new();
     let mut org_names: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut seen = std::collections::HashSet::new();
