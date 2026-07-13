@@ -6,7 +6,7 @@
     }
   </header>
 
-  @if (loading()) {
+  @if (isEmpty() && loading()) {
     <div class="card state-card">
       <p class="empty">Loading…</p>
     </div>
