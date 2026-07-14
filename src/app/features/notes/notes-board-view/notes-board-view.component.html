@@ -1,0 +1,40 @@
+@if (groupField(); as field) {
+  <div class="board" role="list">
+    @for (group of groups(); track trackByGroup(group)) {
+      <section class="board-col" role="listitem">
+        <header class="board-col-head">
+          <span class="board-col-title">{{ group.label }}</span>
+          <span class="count">{{ group.rows.length }}</span>
+        </header>
+        <div class="board-col-body">
+          @for (row of group.rows; track trackByRow(row)) {
+            <mur-card class="board-card">
+              <a class="board-card-link" [routerLink]="['/notes', row.id]">
+                <span class="board-card-title">{{ row.title || "(untitled)" }}</span>
+                @if (row.tags.length > 0) {
+                  <span class="board-card-tags">
+                    @for (tag of row.tags; track tag) {
+                      <span class="pill board-card-tag">{{ tag }}</span>
+                    }
+                  </span>
+                }
+              </a>
+            </mur-card>
+          } @empty {
+            <p class="board-col-empty text-muted">No notes</p>
+          }
+        </div>
+      </section>
+    }
+  </div>
+} @else {
+  <!-- No select-kind field to group by. -->
+  <div class="empty-state">
+    <h3 class="empty-title">No Select property to group by</h3>
+    <p class="empty-body">
+      The board groups notes by a Select property. Add one to this folder’s
+      schema (open a note, add a “Select” property) to organize notes into
+      columns.
+    </p>
+  </div>
+}

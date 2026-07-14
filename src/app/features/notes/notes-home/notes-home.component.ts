@@ -21,11 +21,17 @@ import type {
 import { MurTableColumnComponent } from "../../../design-system/table/table-column.component";
 import { MurTableComponent } from "../../../design-system/table/table.component";
 import { MurSpinnerComponent } from "../../../design-system/spinner/spinner.component";
+import {
+  MurSegmentedComponent,
+  type SegmentOption,
+} from "../../../design-system/segmented/segmented.component";
 import { FoldersService } from "../../../services/folders.service";
 import { NotesService } from "../../../services/notes.service";
 import { OrgBrainService } from "../../../services/org-brain.service";
 import { ToastService } from "../../../services/toast.service";
 import { OrganizeSheetComponent } from "../organize-sheet/organize-sheet.component";
+import { NotesTableViewComponent } from "../notes-table-view/notes-table-view.component";
+import { NotesBoardViewComponent } from "../notes-board-view/notes-board-view.component";
 
 /**
  * One row of the unified content list — a discriminated union over the two
@@ -51,6 +57,16 @@ export type NotesListItem =
       /** The origin org's display name (drives the "shared brain" badge label). */
       orgName: string;
     };
+
+/** The content-pane layout for a folder that has a typed-property schema (Feature C). */
+export type NotesViewMode = "list" | "table" | "board";
+
+/** The List / Table / Board segmented control options. */
+const VIEW_MODE_OPTIONS: readonly SegmentOption[] = [
+  { value: "list", label: "List" },
+  { value: "table", label: "Table" },
+  { value: "board", label: "Board" },
+];
 
 /**
  * The Notes landing view — NOW a normal in-flow route beside the ALWAYS-VISIBLE
@@ -80,6 +96,9 @@ export type NotesListItem =
     OrganizeSheetComponent,
     MurTableComponent,
     MurTableColumnComponent,
+    MurSegmentedComponent,
+    NotesTableViewComponent,
+    NotesBoardViewComponent,
   ],
   templateUrl: "./notes-home.component.html",
   styleUrl: "./notes-home.component.scss",
@@ -282,6 +301,77 @@ export class NotesHomeComponent implements OnInit {
   readonly activeFolderLocked = computed(() => {
     const f = this.activeFolder();
     return !!f?.locked && !f?.unlocked;
+  });
+
+  // --- Typed views (Feature C): List / Table / Board -----------------------
+  /** The current folder's property schema + typed rows (root-persisted in the store). */
+  readonly folderSchema = this.notes.folderSchema;
+  readonly typedRows = this.notes.typedRows;
+
+  readonly viewModeOptions = VIEW_MODE_OPTIONS;
+
+  /**
+   * The per-FOLDER view mode. A component-local Map is fine here (it's a
+   * transient UI preference, not list-backing data that must survive a remount —
+   * §8): a fresh mount defaults every folder to "list", which is exactly the
+   * unchanged existing rendering. Keyed by folder id; the null ("All notes")
+   * scope never gets the switcher.
+   */
+  private readonly viewModeByFolder = signal<Map<string, NotesViewMode>>(
+    new Map(),
+  );
+
+  /**
+   * True when the List/Table/Board switcher is OFFERED: a concrete folder is
+   * selected (not "All notes"), no org chip is active, the folder is unlocked,
+   * AND it has a non-empty typed-property schema. A locked folder yields an
+   * empty schema (backend-gated) → no switcher, no typed view.
+   */
+  readonly typedViewsAvailable = computed(
+    () =>
+      this.activeFolderId() !== null &&
+      this.activeOrgId() === null &&
+      !this.activeFolderLocked() &&
+      this.folderSchema().length > 0,
+  );
+
+  /**
+   * The resolved view mode for the active folder — "list" unless the user picked
+   * Table/Board for THIS folder AND the switcher is still available (a folder
+   * that lost its schema, or "All notes", always falls back to the list).
+   */
+  readonly viewMode = computed<NotesViewMode>(() => {
+    if (!this.typedViewsAvailable()) {
+      return "list";
+    }
+    const fid = this.activeFolderId();
+    return (fid && this.viewModeByFolder().get(fid)) || "list";
+  });
+
+  /** Set the active folder's view mode (List / Table / Board), persisted per-folder. */
+  setViewMode(mode: string): void {
+    const fid = this.activeFolderId();
+    if (fid === null) {
+      return;
+    }
+    this.viewModeByFolder.update((map) => {
+      const next = new Map(map);
+      next.set(fid, mode as NotesViewMode);
+      return next;
+    });
+  }
+
+  /**
+   * Load the active folder's typed-property SCHEMA + typed ROWS whenever the
+   * folder scope changes (Feature C). Skips (clears) for the null / org scope.
+   * Delegated to the root {@link NotesService} (stale-while-revalidate). A
+   * signal-writing effect via the service (T1) — async IPC keyed on one input.
+   * The typed views self-hide for a locked folder (the backend returns `[]`).
+   */
+  private readonly _loadTyped = effect(() => {
+    const fid = this.activeOrgId() === null ? this.activeFolderId() : null;
+    void this.notes.loadSchema(fid);
+    void this.notes.loadTypedRows(fid);
   });
 
   // --- Per-note "Move to…" popover ----------------------------------------
