@@ -8,9 +8,10 @@ import {
   signal,
   viewChild,
 } from "@angular/core";
-import type { GraphPayload } from "../../../core/models";
+import type { BacklinkSource, GraphPayload } from "../../../core/models";
 import { MarkdownComponent } from "../../../shared/markdown/markdown.component";
 import { AssistantSourcesComponent } from "../../../shared/assistant-sources/assistant-sources.component";
+import { BacklinksComponent } from "../../../shared/backlinks/backlinks.component";
 import { MoveToMenuComponent } from "../../folders/move-to-menu/move-to-menu.component";
 import { MeetingActionsComponent } from "../meeting-actions/meeting-actions.component";
 import { MeetingChatComponent } from "../meeting-chat/meeting-chat.component";
@@ -78,6 +79,7 @@ export interface AssistantQa {
   imports: [
     MarkdownComponent,
     AssistantSourcesComponent,
+    BacklinksComponent,
     MoveToMenuComponent,
     MeetingActionsComponent,
     MeetingChatComponent,
@@ -96,6 +98,12 @@ export class NotePanelComponent {
   readonly note = input<ParsedNote | null>(null);
   /** The persisted in-meeting assistant Q&A. */
   readonly interactions = input<AssistantQa[]>([]);
+  /**
+   * Note↔note backlinks ("Linked mentions") — the VISIBLE inbound sources
+   * (meetings + notes) that link this meeting. Empty when the meeting is
+   * locked (the shell skips the gated fetch there). Rendered below the note body.
+   */
+  readonly backlinks = input<BacklinkSource[]>([]);
   /** The vault export path from the note DTO (Saved-to-vault line). */
   readonly exportedPath = input<string | null>(null);
   /** Model provenance for the ghost badge (null → hidden). */

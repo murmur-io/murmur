@@ -321,6 +321,13 @@
     }
   </section>
 
+  <!-- LINKED MENTIONS — inbound note↔note backlinks (meetings + notes that link
+       this one). Only present when non-empty; the shell skips the gated fetch
+       while the meeting is locked, so nothing surfaces behind a lock. -->
+  @if (backlinks().length) {
+    <app-backlinks [sources]="backlinks()" />
+  }
+
   <!-- LIVE CONTEXT — enrich this note with fresh detail from connected tools (Jira / Slack / web).
        Sits right after the note summary; egress is on-demand + kept loud. Only rendered for an
        unlocked meeting (note-panel itself is under the detail view's `@else (!locked())`). Bubbles
