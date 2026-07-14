@@ -939,6 +939,30 @@ pub struct VaultSource {
     pub origin: Option<SourceOrigin>,
 }
 
+/// Which kind of owned-content row a backlink SOURCE (or target) is — a meeting (its AI note in
+/// `notes.markdown`) or a standalone note (`documents.text` where `kind='note'`). Serialized as a
+/// stable lowercase string so the FE can branch a chip icon/route without a second field.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceKind {
+    Meeting,
+    Note,
+}
+
+/// A row whose body contains a `[[Title]]` wikilink pointing AT the queried target — a "what links
+/// here" backlink chip. `timestamp` is unified so the FE needs no kind-branch: the meeting's
+/// `started_at` for a meeting, the note's `updated_at` (rendered as a string) for a note. Only ever
+/// built from VISIBLE (session-unlocked) rows — a sealed source can never appear here, and a sealed
+/// target yields an empty list (never reveals it HAS backlinks).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BacklinkSource {
+    pub id: String,
+    pub kind: SourceKind,
+    pub title: String,
+    pub timestamp: String,
+}
+
 /// Result of an Ask-My-Vault query: the grounded answer + the source meetings used.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

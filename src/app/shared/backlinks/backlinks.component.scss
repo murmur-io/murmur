@@ -1,0 +1,83 @@
+:host {
+  display: block;
+}
+.bl {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+.bl-label {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  margin-right: var(--space-1);
+}
+.bl-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  max-width: 22rem;
+  padding: 6px var(--space-3);
+  background: var(--surface-raised);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-pill);
+  color: var(--text-secondary);
+  text-decoration: none;
+  font-size: 13px;
+  transition:
+    border-color var(--transition-fast),
+    color var(--transition-fast),
+    background var(--transition-fast);
+}
+.bl-chip:hover {
+  border-color: var(--accent-ring);
+  color: var(--text-primary);
+  background: var(--surface-hover);
+}
+/* Kind badge — a tiny pill so a meeting chip reads distinctly from a note. */
+.bl-kind {
+  flex: 0 0 auto;
+  padding: 1px 6px;
+  border-radius: var(--radius-pill);
+  font-size: 9px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.bl-kind--meeting {
+  background: var(--accent);
+  color: var(--text-on-accent);
+}
+.bl-kind--note {
+  background: var(--accent-soft);
+  color: var(--accent-hover);
+}
+.bl-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.bl-date {
+  flex: 0 0 auto;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.bl-more {
+  padding: 6px var(--space-3);
+  background: transparent;
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius-pill);
+  color: var(--accent-hover);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background var(--transition-fast);
+}
+.bl-more:hover {
+  background: var(--accent-soft);
+}

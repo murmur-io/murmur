@@ -1186,6 +1186,29 @@ export interface SourceOrigin {
   orgItemId?: string | null;
 }
 
+/**
+ * Note↔note backlinks ("Linked mentions") — the KIND of a local owned source
+ * that links to (mentions) the current target. `"meeting"` routes to
+ * `/meeting/:id`; `"note"` routes to `/notes/:id`. Mirrors the Rust
+ * `SourceKind` (serde camelCase / lowercase).
+ */
+export type SourceKind = "meeting" | "note";
+
+/**
+ * Note↔note backlinks — one INBOUND source that mentions the current target
+ * (`get_backlinks(targetKind, targetId)`). A chip in the "Linked mentions" row:
+ * `id` + `kind` decide the click-through route, `title` + `timestamp` (ISO-8601)
+ * render the chip. GATED server-side like every content read — a
+ * sealed-and-not-session-unlocked source never appears in the list. Mirrors the
+ * Rust `BacklinkSource` (serde camelCase).
+ */
+export interface BacklinkSource {
+  id: string;
+  kind: SourceKind;
+  title: string;
+  timestamp: string;
+}
+
 /** The two entity kinds the self-assembling graph resolves (Rust `EntityKind`, camelCase). */
 export type EntityKind = "person" | "project";
 
