@@ -1855,6 +1855,12 @@ export interface NoteFolder {
    * the Notes lock gate (`locked && !unlocked`) so unlocking actually lifts it.
    */
   unlocked: boolean;
+  /**
+   * The reserved always-open note-root that backs the "Notes" section (2026-07-14).
+   * Exactly one note-folder has this set. The sidebar tree HIDES it (it IS the
+   * section root — where unfiled new notes live), and it can never be locked.
+   */
+  isRoot: boolean;
   kind: string;
 }
 

@@ -112,9 +112,17 @@ for this note: <body excerpt>"). **Local-only, zero egress.**
 1. **Reserved-root marker:** additive **`folders.is_root INTEGER DEFAULT 0`** column — explicit +
    easy to guard (`lock_folder` refuses when `is_root=1`). `ensure_notes_root()` creates/returns the
    single `is_root=1` note-folder idempotently.
-2. **Legacy "Notes" folder:** **left untouched** — becomes a normal folder with its notes; the user
-   renames/deletes it manually (after unlocking if sealed). No migration of user rows. A one-time
-   redundant "Notes" folder remains for existing users; fresh installs are clean.
+2. **Legacy "Notes" folder + where the root lives** (refined after finding `folders.path` is
+   `NOT NULL UNIQUE`): `ensure_notes_root()` —
+   - an `is_root=1` folder already exists → return it;
+   - the path-`"Notes"` folder exists and is **unlocked** → set `is_root=1` on it (root lives at
+     "Notes"; a flag flip, no note movement, no risk) — covers most users;
+   - the path-`"Notes"` folder exists and is **locked** (this user) → can't repurpose (would expose
+     sealed content) and can't reuse the unique "Notes" path → create a **separate** always-open
+     root at path `"Inbox"` (first free of "Inbox", "Inbox 2", …); the locked "Notes" stays a normal
+     folder until the user unlocks/deletes it;
+   - no path-"Notes" folder (fresh install) → create the root at path "Notes".
+   Never moves user rows; never touches sealed content.
 3. **Auto-title on a note in a locked folder:** **skip** — the read-gate refuses, so the note stays
    "Untitled"; never auto-unlock just to title. (Rare in practice: new notes land in the always-open
    root, not a locked folder.)

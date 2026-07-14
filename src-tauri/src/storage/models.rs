@@ -719,6 +719,10 @@ pub struct NoteFolder {
     /// always sets this `false`; the `list_note_folders` command overwrites it by joining the live
     /// `AppState::unlocked_folders` set (a sealed folder that is NOT session-unlocked stays `false`).
     pub unlocked: bool,
+    /// The reserved always-open note-root that backs the "Notes" section (2026-07-14). Exactly one
+    /// note-folder has this set; the FE HIDES it from the folder tree (it IS the section root, where
+    /// unfiled notes live) and it can never be locked. Everything else is `false`.
+    pub is_root: bool,
     pub kind: String,
 }
 
