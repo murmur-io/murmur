@@ -812,6 +812,14 @@ export interface FolderNode {
   noteCount: number;
   locked: boolean;
   unlocked: boolean;
+  /**
+   * `"meeting"` or `"note"` — the backend returns EVERY folder here (both
+   * namespaces share one table so lock-reactive consumers see all of them), so a
+   * view that should only show ONE namespace filters on `kind`: the Meetings
+   * sidebar tree renders `kind !== "note"`, and a note folder must never leak
+   * into it. Legacy rows default to `"meeting"`.
+   */
+  kind: string;
   children: FolderNode[];
 }
 
@@ -2237,18 +2245,24 @@ export interface OrgActiveShare {
 
 /**
  * A user-saved view over the meetings list (Table / Board layout + a
- * persisted filter/sort/group/columns config). Mirrors the Rust `SavedView`
+ * persisted filter/sort/columns config). Mirrors the Rust `SavedView`
  * (serde camelCase). `config` is a JSON STRING on the wire — parsed
  * client-side into a {@link ViewConfig} via {@link parseViewConfig}, which
  * NEVER trusts the payload beyond `JSON.parse` (a malformed/partial config
- * degrades to the safe default, it never throws). `scope` is fixed to
- * `"meetings"` for this feature (a Calendar / notes-list scope is deferred).
+ * degrades to the safe default, it never throws). `scope` is `"meetings"` or
+ * `"notes"` — each list surface persists its own view roster (Notes was added
+ * 2026-07-14, mirroring Meetings).
  */
 export interface SavedView {
   id: string;
-  scope: "meetings";
-  name: string;
+  scope: "meetings" | "notes";
+  /**
+   * Presentation mode. Only `"table"` is created now — Board layout was removed
+   * 2026-07-14. `"board"` is still accepted so a legacy row on disk parses; it
+   * renders as a table.
+   */
   layout: "table" | "board";
+  name: string;
   /** JSON-encoded {@link ViewConfig}; parse with {@link parseViewConfig}. */
   config: string;
   sortOrder: number;
@@ -2303,6 +2317,45 @@ export const DEFAULT_VIEW_CONFIG: ViewConfig = {
   groupBy: null,
   columns: ["title", "date", "folder", "status", "actions"],
 };
+
+/**
+ * The default config for a freshly-created NOTES saved view (mirrors
+ * {@link DEFAULT_VIEW_CONFIG} but over note fields — see `NOTE_VIEW_FIELDS`).
+ * Sorts by last-modified desc, no filters. `columns` is unused by the notes
+ * table today (fixed columns), kept for shape-compatibility.
+ */
+export const DEFAULT_NOTES_VIEW_CONFIG: ViewConfig = {
+  filters: [],
+  sort: [{ field: "updated", direction: "desc" }],
+  groupBy: null,
+  columns: ["title", "folder", "updated"],
+};
+
+/**
+ * One row of the unified Notes content list — a discriminated union over the
+ * two sources the pane merges. A `"note"` row is YOUR authored note (opens the
+ * editor); an `"org"` row is a READ-ONLY org (Shared Brain) replica (opens the
+ * `/org-item/:id` viewer). Both carry an epoch-ms `sortAt` so the merged list
+ * orders by date regardless of source; `id` is namespaced (`note:`/`org:`) for
+ * a stable, collision-free `@for` / table track key. Lives here (not in
+ * `notes-home`) so the notes view engine can filter/sort it without a
+ * component→engine import cycle.
+ */
+export type NotesListItem =
+  | {
+      kind: "note";
+      id: string;
+      sortAt: number;
+      note: NoteSummary;
+    }
+  | {
+      kind: "org";
+      id: string;
+      sortAt: number;
+      item: OrgItemHeader;
+      /** The origin org's display name (drives the "shared brain" badge label). */
+      orgName: string;
+    };
 
 /**
  * Parse a {@link SavedView.config} JSON string into a {@link ViewConfig},

@@ -12,7 +12,7 @@ import { Router, RouterLink } from "@angular/router";
 import { TabsService } from "../../../core/tabs.service";
 import type {
   NoteFolder,
-  NoteSummary,
+  NotesListItem,
   OrganizeMove,
   OrganizePlan,
   OrgItemHeader,
@@ -21,52 +21,14 @@ import type {
 import { MurTableColumnComponent } from "../../../design-system/table/table-column.component";
 import { MurTableComponent } from "../../../design-system/table/table.component";
 import { MurSpinnerComponent } from "../../../design-system/spinner/spinner.component";
-import {
-  MurSegmentedComponent,
-  type SegmentOption,
-} from "../../../design-system/segmented/segmented.component";
 import { FoldersService } from "../../../services/folders.service";
 import { NotesService } from "../../../services/notes.service";
+import { NotesSavedViewsService } from "../../../services/notes-saved-views.service";
+import { NotesViewEngine } from "../../../services/notes-view-engine";
 import { OrgBrainService } from "../../../services/org-brain.service";
 import { ToastService } from "../../../services/toast.service";
 import { OrganizeSheetComponent } from "../organize-sheet/organize-sheet.component";
-import { NotesTableViewComponent } from "../notes-table-view/notes-table-view.component";
-import { NotesBoardViewComponent } from "../notes-board-view/notes-board-view.component";
-
-/**
- * One row of the unified content list — a discriminated union over the two
- * sources the pane merges. A `"note"` card is YOUR authored note (opens the
- * editor); an `"org"` card is a READ-ONLY org (Shared Brain) replica (opens the
- * `/org-item/:id` viewer, carries the origin org's name for its badge). Both
- * expose an epoch-ms `sortAt` so the merged list orders by date desc regardless
- * of source. `id` is namespaced (`note:`/`org:`) so the `@for` track key is
- * stable + collision-free across the two id spaces.
- */
-export type NotesListItem =
-  | {
-      kind: "note";
-      id: string;
-      sortAt: number;
-      note: NoteSummary;
-    }
-  | {
-      kind: "org";
-      id: string;
-      sortAt: number;
-      item: OrgItemHeader;
-      /** The origin org's display name (drives the "shared brain" badge label). */
-      orgName: string;
-    };
-
-/** The content-pane layout for a folder that has a typed-property schema (Feature C). */
-export type NotesViewMode = "list" | "table" | "board";
-
-/** The List / Table / Board segmented control options. */
-const VIEW_MODE_OPTIONS: readonly SegmentOption[] = [
-  { value: "list", label: "List" },
-  { value: "table", label: "Table" },
-  { value: "board", label: "Board" },
-];
+import { NotesViewSwitcherComponent } from "../notes-view-switcher/notes-view-switcher.component";
 
 /**
  * The Notes landing view — NOW a normal in-flow route beside the ALWAYS-VISIBLE
@@ -96,15 +58,14 @@ const VIEW_MODE_OPTIONS: readonly SegmentOption[] = [
     OrganizeSheetComponent,
     MurTableComponent,
     MurTableColumnComponent,
-    MurSegmentedComponent,
-    NotesTableViewComponent,
-    NotesBoardViewComponent,
+    NotesViewSwitcherComponent,
   ],
   templateUrl: "./notes-home.component.html",
   styleUrl: "./notes-home.component.scss",
 })
 export class NotesHomeComponent implements OnInit {
   private readonly notes = inject(NotesService);
+  private readonly notesSavedViews = inject(NotesSavedViewsService);
   private readonly orgBrain = inject(OrgBrainService);
   private readonly folders = inject(FoldersService);
   private readonly router = inject(Router);
@@ -303,76 +264,63 @@ export class NotesHomeComponent implements OnInit {
     return !!f?.locked && !f?.unlocked;
   });
 
-  // --- Typed views (Feature C): List / Table / Board -----------------------
-  /** The current folder's property schema + typed rows (root-persisted in the store). */
-  readonly folderSchema = this.notes.folderSchema;
-  readonly typedRows = this.notes.typedRows;
-
-  readonly viewModeOptions = VIEW_MODE_OPTIONS;
+  // --- Saved Views (mirrors Meetings; ported 2026-07-14) -------------------
+  /** The active NOTES saved view (null ⇒ the plain List default). */
+  readonly activeSavedView = this.notesSavedViews.activeView;
 
   /**
-   * The per-FOLDER view mode. A component-local Map is fine here (it's a
-   * transient UI preference, not list-backing data that must survive a remount —
-   * §8): a fresh mount defaults every folder to "list", which is exactly the
-   * unchanged existing rendering. Keyed by folder id; the null ("All notes")
-   * scope never gets the switcher.
+   * Resolve a note row's display FOLDER name (org rows have none). Injected into
+   * the {@link NotesViewEngine} so the pure engine doesn't need the folder tree.
+   * `this`-bound (an arrow field) since the engine calls it detached.
    */
-  private readonly viewModeByFolder = signal<Map<string, NotesViewMode>>(
-    new Map(),
-  );
-
-  /**
-   * True when the List/Table/Board switcher is OFFERED: a concrete folder is
-   * selected (not "All notes"), no org chip is active, the folder is unlocked,
-   * AND it has a non-empty typed-property schema. A locked folder yields an
-   * empty schema (backend-gated) → no switcher, no typed view.
-   */
-  readonly typedViewsAvailable = computed(
-    () =>
-      this.activeFolderId() !== null &&
-      this.activeOrgId() === null &&
-      !this.activeFolderLocked() &&
-      this.folderSchema().length > 0,
-  );
-
-  /**
-   * The resolved view mode for the active folder — "list" unless the user picked
-   * Table/Board for THIS folder AND the switcher is still available (a folder
-   * that lost its schema, or "All notes", always falls back to the list).
-   */
-  readonly viewMode = computed<NotesViewMode>(() => {
-    if (!this.typedViewsAvailable()) {
-      return "list";
+  readonly folderNameFn = (item: NotesListItem): string | null => {
+    if (item.kind !== "note") {
+      return null;
     }
-    const fid = this.activeFolderId();
-    return (fid && this.viewModeByFolder().get(fid)) || "list";
+    return (
+      this.noteFolders().find((f) => f.id === item.note.folderId)?.name ?? null
+    );
+  };
+
+  /**
+   * The rows the pane actually renders: the SAME already-gated {@link listItems}
+   * union, filtered + sorted by the active saved view's config (via the pure
+   * {@link NotesViewEngine}). With no active view it's `listItems()` verbatim —
+   * so "List" is the unchanged default and a saved view is just a named
+   * filter/sort preset over it (a masked/locked note stays masked in every view;
+   * the engine only re-reads the fields the row already carries).
+   */
+  readonly viewItems = computed<NotesListItem[]>(() => {
+    const view = this.activeSavedView();
+    const items = this.listItems();
+    // A saved view applies ONLY in the note-folder / All-notes scope — the SAME
+    // scope the switcher is shown in (`activeOrgId() === null`). In an org
+    // (Shared Brain) scope the switcher is hidden, so applying a persisted view
+    // there would silently filter the org's items out with no way to clear it
+    // (found by adversarial review 2026-07-14). Org rows always render raw.
+    if (!view || this.activeOrgId() !== null) {
+      return items;
+    }
+    return NotesViewEngine.rows(
+      items,
+      this.notesSavedViews.configOf(view),
+      this.folderNameFn,
+    );
   });
 
-  /** Set the active folder's view mode (List / Table / Board), persisted per-folder. */
-  setViewMode(mode: string): void {
-    const fid = this.activeFolderId();
-    if (fid === null) {
-      return;
-    }
-    this.viewModeByFolder.update((map) => {
-      const next = new Map(map);
-      next.set(fid, mode as NotesViewMode);
-      return next;
-    });
+  /**
+   * True when an active saved view's filter removed EVERY row (but the raw list
+   * had some) — drives a "no notes match this view" hint distinct from the plain
+   * "no notes yet" empty state.
+   */
+  readonly viewEmpty = computed(
+    () => !this.listEmpty() && this.viewItems().length === 0,
+  );
+
+  /** Re-derive on any switcher change (select/config) — a no-op hook; `viewItems` is reactive. */
+  onViewChanged(): void {
+    this.movePopoverId.set(null);
   }
-
-  /**
-   * Load the active folder's typed-property SCHEMA + typed ROWS whenever the
-   * folder scope changes (Feature C). Skips (clears) for the null / org scope.
-   * Delegated to the root {@link NotesService} (stale-while-revalidate). A
-   * signal-writing effect via the service (T1) — async IPC keyed on one input.
-   * The typed views self-hide for a locked folder (the backend returns `[]`).
-   */
-  private readonly _loadTyped = effect(() => {
-    const fid = this.activeOrgId() === null ? this.activeFolderId() : null;
-    void this.notes.loadSchema(fid);
-    void this.notes.loadTypedRows(fid);
-  });
 
   // --- Per-note "Move to…" popover ----------------------------------------
   /** The note id whose move popover is open (null = none). */
@@ -419,6 +367,9 @@ export class NotesHomeComponent implements OnInit {
       this.notes.loadFolders(),
       this.notes.loadNotes(this.notes.activeFolderId()),
       this.loadOrgs(),
+      // The saved-view roster is root-persisted (survives the list route's
+      // remount, §8) — a reload here just refreshes it.
+      this.notesSavedViews.load(),
     ]);
   }
 

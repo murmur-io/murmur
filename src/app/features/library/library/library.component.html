@@ -310,28 +310,20 @@
         }
       </header>
 
-      <!-- Saved-views switcher (Feature B): "List" default + saved Table/Board
-           views. When no view is active the list below renders unchanged. -->
+      <!-- Saved-views switcher (Feature B): "List" default + saved Table views.
+           When no view is active the list below renders unchanged. -->
       <app-meetings-view-switcher
         class="views-switcher"
         (changed)="onViewChanged()"
       />
 
-      @if (activeSavedView(); as view) {
-        <!-- A saved view is active: render Table or Board over the SAME gated
+      @if (activeSavedView()) {
+        <!-- A saved view is active: render the Table over the SAME gated
              `displayedMeetings` the List uses (masked meetings stay masked). -->
         @if (listEmpty() && listLoading()) {
           <div class="card state-card">
             <p class="empty">Loading…</p>
           </div>
-        } @else if (view.layout === "board" && viewBoardGroups(); as groups) {
-          <app-meetings-board-view
-            [groups]="groups"
-            [folderNameOf]="folderNameFn"
-            [folderExposureOf]="folderExposureFn"
-            [isMasked]="isMaskedFn"
-            (openMeeting)="onViewOpenMeeting($event)"
-          />
         } @else if (viewTableRows(); as rows) {
           <app-meetings-table-view
             [rows]="rows"

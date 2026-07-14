@@ -8,7 +8,7 @@
   <p class="tree-state">Loading folders…</p>
 } @else {
   <app-folder-tree
-    [nodes]="folders.tree()"
+    [nodes]="meetingFolders()"
     [selectedId]="folders.activeFolderId()"
     [selectionActive]="sectionActive()"
     (selected)="select($event)"

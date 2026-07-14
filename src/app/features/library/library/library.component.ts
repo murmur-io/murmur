@@ -38,7 +38,6 @@ import { NoteDragService } from "../../folders/note-drag.service";
 import { ToastService } from "../../../services/toast.service";
 import { MeetingsViewSwitcherComponent } from "../meetings-view-switcher/meetings-view-switcher.component";
 import { MeetingsTableViewComponent } from "../meetings-table-view/meetings-table-view.component";
-import { MeetingsBoardViewComponent } from "../meetings-board-view/meetings-board-view.component";
 
 /** Debounce window for search-as-you-type — quick enough to feel instant. */
 const SEARCH_DEBOUNCE_MS = 180;
@@ -102,7 +101,6 @@ export interface OrgMeetingListItem {
     MoveToMenuComponent,
     MeetingsViewSwitcherComponent,
     MeetingsTableViewComponent,
-    MeetingsBoardViewComponent,
   ],
   templateUrl: "./library.component.html",
   styleUrl: "./library.component.scss",
@@ -488,28 +486,13 @@ export class LibraryComponent implements OnInit {
    */
   readonly viewTableRows = computed(() => {
     const view = this.activeSavedView();
-    if (!view || view.layout !== "table") {
+    if (!view) {
       return null;
     }
+    // Board was removed (2026-07-14) — every saved view is a Table now. A legacy
+    // row still on disk with `layout:"board"` falls through here and renders as a
+    // table (no data loss, no dangling board branch).
     return ViewEngine.rows(
-      this.displayedMeetings(),
-      this.savedViews.configOf(view),
-      this.actionSummaries(),
-      this.folderNameFn,
-    );
-  });
-
-  /**
-   * The board columns a saved BOARD view renders (filter/sort/group applied by
-   * the ViewEngine over the same gated meetings). `null` when no view is active
-   * or the active view is a table.
-   */
-  readonly viewBoardGroups = computed(() => {
-    const view = this.activeSavedView();
-    if (!view || view.layout !== "board") {
-      return null;
-    }
-    return ViewEngine.groups(
       this.displayedMeetings(),
       this.savedViews.configOf(view),
       this.actionSummaries(),
