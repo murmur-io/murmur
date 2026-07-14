@@ -6109,6 +6109,19 @@ pub fn get_backlinks(
     state.db.backlinks_for_visible(kind, &target_id, &unlocked)
 }
 
+/// Resolve a clicked `[[Title]]` wikilink to a VISIBLE note/meeting to navigate to. Returns `None`
+/// when nothing matches OR the only match is a sealed-and-not-session-unlocked target (gated in
+/// `Db::resolve_wikilink`) — so a wikilink click never reveals or opens locked content. The FE
+/// routes on `kind`, or offers to create a note when `None`.
+#[tauri::command]
+pub fn resolve_wikilink(
+    state: State<'_, AppState>,
+    title: String,
+) -> Result<Option<crate::storage::models::WikiTarget>, AppError> {
+    let unlocked = unlocked_snapshot(state.inner())?;
+    state.db.resolve_wikilink(&title, &unlocked)
+}
+
 /// Structured, GATED, egress-free person dossier for the `/people` detail pane. Unlike
 /// [`entity_dossier`] (which CLOUD-synthesizes a markdown String via the provider and discards the
 /// struct), this returns the STRUCTURED [`DossierData`](crate::summarize::dossier::DossierData) with
