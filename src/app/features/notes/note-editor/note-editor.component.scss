@@ -45,6 +45,21 @@
 .head-more {
   position: relative;
 }
+/* Privacy hint for an unfiled (always-open) note — subtle, muted, non-alarming. */
+.unfiled-hint {
+  display: inline-flex;
+  align-items: center;
+  margin-left: var(--space-1);
+  padding: 0 var(--space-2);
+  height: 20px;
+  border-radius: var(--radius-pill);
+  background: var(--surface-input);
+  color: var(--text-muted);
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  cursor: help;
+}
 .crumb-btn {
   display: inline-flex;
   align-items: center;

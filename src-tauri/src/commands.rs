@@ -2382,7 +2382,10 @@ pub(crate) fn create_note_inner(
     // BLK-1 / TOCTOU (2026-07-10 audit F4): hold the lifecycle guard across gate+insert so a
     // concurrent lock/relock cannot land between the unlock check and the row insert.
     let _lifecycle = lifecycle_guard(state);
-    // Resolve the anchor note-folder (default when None). ensure_default_note_folder is idempotent.
+    // Resolve the anchor note-folder. A None/empty selection ⇒ the reserved always-open Notes ROOT
+    // (unfiled), NOT the old default "Notes" folder — so "New note" can NEVER fail because the default
+    // folder is sealed (the 2026-07-14 "Couldn't create the note" dead-end). `ensure_notes_root` is
+    // idempotent + never locked.
     let folder_id = match folder_id {
         Some(f) if !f.is_empty() => {
             // Must be a NOTE folder — never create a note inside a meeting folder.
@@ -2391,7 +2394,7 @@ pub(crate) fn create_note_inner(
             }
             f.to_string()
         }
-        _ => state.db.ensure_default_note_folder()?,
+        _ => state.db.ensure_notes_root()?,
     };
 
     // WRITE-GATE: a sealed-and-not-session-unlocked folder is refused.
@@ -2431,6 +2434,146 @@ pub(crate) fn create_note_inner(
     // No chunks to index for an empty body — `update_note` re-indexes once the user writes.
     tracing::info!(target: "notes", note_id = %id, folder_id = %folder_id, "note created");
     Ok(id)
+}
+
+/// System prompt for the on-device auto-title (Feature B, 2026-07-14). Short + strict output so the
+/// result is a clean headline, not a sentence.
+const AUTO_TITLE_SYSTEM: &str = "You write a short, specific title (3 to 6 words) for a note. \
+Output ONLY the title text — no surrounding quotes, no trailing punctuation, no 'Title:' prefix.";
+
+/// The on-device summarizer for a LOCAL-ONLY, zero-egress title — `None` when the on-device model
+/// isn't downloaded (the caller then uses the first-line heuristic). NEVER the cloud: an auto-title
+/// must never egress the note. Mirrors the local-provider construction in `summarize::provider_for`.
+fn local_title_provider(
+    state: &AppState,
+) -> Option<std::sync::Arc<dyn crate::summarize::provider::SummarizerProvider>> {
+    let (configured_path, model_id, timeouts) = {
+        let config = state.config.lock().ok()?;
+        (
+            config.brain_model_path.clone(),
+            config.brain_model_id.clone(),
+            crate::reason::sidecar::SidecarTimeouts {
+                idle_secs: config.brain_idle_timeout_secs,
+                ready_secs: config.brain_ready_timeout_secs,
+                hard_cap_secs: config.brain_hard_cap_secs,
+            },
+        )
+    };
+    let configured = configured_path.as_deref().map(std::path::Path::new);
+    let path = crate::reason::resolve_brain_model(configured, model_id.as_deref()).ok()??;
+    let reasoner: std::sync::Arc<dyn crate::reason::LocalReasoner> =
+        std::sync::Arc::new(crate::reason::sidecar::SidecarReasoner::new(path, timeouts).ok()?);
+    Some(std::sync::Arc::new(
+        crate::summarize::local::LocalSummarizerProvider::new(
+            reasoner,
+            std::sync::Arc::clone(&state.heavy_inference),
+        ),
+    ))
+}
+
+/// Clean an LLM title suggestion into a single tidy line, or `None` if it collapsed to nothing.
+fn sanitize_title_suggestion(raw: &str) -> Option<String> {
+    let line = raw.trim().lines().next().unwrap_or("").trim();
+    let line = line
+        .trim_matches('"')
+        .trim_matches('\'')
+        .trim_start_matches('#')
+        .trim();
+    let line = line.trim_end_matches(['.', ':', '-']).trim();
+    if line.is_empty() {
+        return None;
+    }
+    Some(line.chars().take(80).collect())
+}
+
+/// Fallback title: the first non-empty line of the body, stripped of leading markdown, capped.
+fn first_line_title(body: &str) -> String {
+    let line = body
+        .lines()
+        .map(|l| l.trim())
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    let line = line.trim_start_matches(['#', '-', '*', '>', ' ']).trim();
+    let capped: String = line.chars().take(60).collect();
+    if capped.is_empty() {
+        "Untitled".to_string()
+    } else {
+        capped
+    }
+}
+
+/// `suggest_note_title(note_id)` — auto-title an "Untitled" note from its body (Feature B): the
+/// on-device model when present, else a first-line heuristic. LOCAL-ONLY (never egresses). Persists
+/// the new title ONLY if the note is still "Untitled" (never clobbers a user's title) and skips a note
+/// in a LOCKED folder (spec decision #3 — no auto-unlock / seal-on-write for a title). Returns the
+/// title (the current one unchanged when it skips). Called fire-and-forget by the editor on close.
+#[tauri::command]
+pub async fn suggest_note_title(
+    state: State<'_, AppState>,
+    note_id: String,
+) -> Result<String, AppError> {
+    suggest_note_title_inner(state.inner(), &note_id).await
+}
+
+pub(crate) async fn suggest_note_title_inner(
+    state: &AppState,
+    note_id: &str,
+) -> Result<String, AppError> {
+    let Some(row) = state.db.get_note_row(note_id)? else {
+        return Err(AppError::InvalidArg(format!("no note {note_id}")));
+    };
+    // `NoteRow.title` is Option<String> (NULL-able column) — treat a missing title as "".
+    let current = row.title.clone().unwrap_or_default();
+    // Only ever fill in an "Untitled" note — never overwrite a title the user chose.
+    let cur = current.trim();
+    if !cur.is_empty() && cur != "Untitled" {
+        return Ok(current);
+    }
+    // Skip a locked folder: new notes live in the always-open root, so this only skips the rare
+    // deliberately-filed-then-locked case; auto-titling it would need seal-on-write / an unlock.
+    let folder_locked = state
+        .db
+        .folder_by_id(&row.folder_id)?
+        .map(|f| f.locked)
+        .unwrap_or(false);
+    if folder_locked {
+        return Ok(current);
+    }
+    let body = row.text.trim();
+    if body.is_empty() {
+        return Ok(current);
+    }
+
+    // On-device first (zero egress); first-line heuristic otherwise / on failure.
+    let title = match local_title_provider(state) {
+        Some(provider) => {
+            let excerpt: String = body.chars().take(1200).collect();
+            match provider.complete(AUTO_TITLE_SYSTEM, &excerpt).await {
+                Ok(t) => sanitize_title_suggestion(&t).unwrap_or_else(|| first_line_title(body)),
+                Err(e) => {
+                    tracing::info!(target: "notes", error = %e, "auto-title: on-device failed, using first line");
+                    first_line_title(body)
+                }
+            }
+        }
+        None => first_line_title(body),
+    };
+    if title.trim().is_empty() || title == "Untitled" {
+        return Ok(current);
+    }
+
+    // Persist — re-read + re-check under the write so a title the user set meanwhile always wins.
+    if let Some(fresh) = state.db.get_note_row(note_id)? {
+        let fresh_title = fresh.title.clone().unwrap_or_default();
+        let ft = fresh_title.trim();
+        if ft.is_empty() || ft == "Untitled" {
+            let now = chrono::Utc::now().timestamp_millis();
+            state.db.update_note_row(note_id, &title, &fresh.text, now)?;
+            return Ok(title);
+        }
+        return Ok(fresh_title); // user titled it in the meantime
+    }
+    Ok(title)
 }
 
 /// Read ONE note (editor DTO). GATED: a sealed-and-not-session-unlocked note returns the MASKED DTO
@@ -2899,6 +3042,8 @@ pub(crate) fn create_note_folder_inner(
         locked: false,
         // A freshly created folder is never sealed, so never session-unlocked.
         unlocked: false,
+        // Only the reserved Notes root is `is_root`; a user-created folder never is.
+        is_root: false,
         kind: "note".into(),
     };
     state
@@ -10804,6 +10949,14 @@ pub(crate) fn lock_folder_inner(state: &AppState, folder_id: String) -> Result<(
         .db
         .folder_by_id(&folder_id)?
         .ok_or_else(|| AppError::InvalidArg(format!("no folder {folder_id}")))?;
+    // The reserved Notes root is the always-open home for unfiled notes — it can NEVER be sealed
+    // (unfiled notes are deliberately plaintext; sealing requires filing into a lockable folder). Refuse
+    // rather than silently no-op so the FE can guide the user (2026-07-14).
+    if state.db.folder_is_root(&folder_id)? {
+        return Err(AppError::InvalidArg(
+            "the Notes root can't be locked — move notes into a folder to seal them".into(),
+        ));
+    }
     if folder.locked {
         return Ok(()); // already sealed — idempotent.
     }
@@ -24445,6 +24598,135 @@ mod lifecycle_tests {
         );
     }
 
+    /// Feature B (auto-title): a still-"Untitled" note gets a first-line title (no on-device model in
+    /// tests → the heuristic path), a user-titled note is NEVER overwritten, and an empty body stays
+    /// "Untitled". LOCAL-only; no egress in any branch.
+    #[test]
+    fn suggest_note_title_fills_untitled_and_never_clobbers() {
+        let state = build_state("auto-title");
+        make_open_folder(&state.db, "f", "Team");
+
+        // Untitled + body in an open folder → first non-empty line becomes the title, persisted.
+        state
+            .db
+            .insert_note("n1", "f", "n1", "Untitled", "# Kickoff planning\nmore body", 1)
+            .unwrap();
+        let t = block_on(suggest_note_title_inner(&state, "n1")).unwrap();
+        assert_eq!(t, "Kickoff planning");
+        assert_eq!(
+            state.db.get_note_row("n1").unwrap().unwrap().title.as_deref(),
+            Some("Kickoff planning"),
+            "the title is persisted"
+        );
+
+        // A user-set title is NEVER overwritten.
+        state
+            .db
+            .insert_note("n2", "f", "n2", "My Title", "some body", 1)
+            .unwrap();
+        assert_eq!(
+            block_on(suggest_note_title_inner(&state, "n2")).unwrap(),
+            "My Title"
+        );
+        assert_eq!(
+            state.db.get_note_row("n2").unwrap().unwrap().title.as_deref(),
+            Some("My Title")
+        );
+
+        // Untitled + EMPTY body → stays Untitled (nothing to title).
+        state
+            .db
+            .insert_note("n3", "f", "n3", "Untitled", "   \n  ", 1)
+            .unwrap();
+        assert_eq!(
+            block_on(suggest_note_title_inner(&state, "n3")).unwrap(),
+            "Untitled"
+        );
+        assert_eq!(
+            state.db.get_note_row("n3").unwrap().unwrap().title.as_deref(),
+            Some("Untitled")
+        );
+    }
+
+    /// Feature A (the primary bug fix, RED-before-GREEN): `create_note(None)` when the legacy "Notes"
+    /// folder is LOCKED must STILL succeed — it now anchors to the reserved always-open root, not the
+    /// sealed "Notes" (pre-fix it hit the write-gate and returned `Locked` — the "Couldn't create the
+    /// note" dead-end).
+    #[test]
+    fn create_note_with_a_locked_legacy_notes_still_succeeds_via_the_root() {
+        let state = build_state("create-note-locked-default");
+        let notes_id = state.db.ensure_default_note_folder().unwrap();
+        state
+            .db
+            .set_folder_locked(&notes_id, true, Some(&b"wrapped"[..]))
+            .unwrap();
+
+        let id = create_note_inner(&state, None, "Untitled").unwrap();
+        let row = state.db.get_note_row(&id).unwrap().unwrap();
+        assert_ne!(
+            row.folder_id, notes_id,
+            "a new note must NOT be created into the locked legacy Notes folder"
+        );
+        let root = state.db.note_root_id().unwrap().unwrap();
+        assert_eq!(row.folder_id, root, "it lands in the reserved always-open root");
+        assert!(
+            !state.db.folder_by_id(&root).unwrap().unwrap().locked,
+            "the root is always open"
+        );
+    }
+
+    /// Feature A: the reserved Notes root can NEVER be locked (unfiled notes are deliberately open;
+    /// sealing means filing into a lockable folder). `lock_folder_inner` refuses it.
+    #[test]
+    fn lock_folder_refuses_the_reserved_notes_root() {
+        let state = build_state("lock-refuses-root");
+        let root = state.db.ensure_notes_root().unwrap();
+        let err = lock_folder_inner(&state, root.clone())
+            .expect_err("locking the Notes root must be refused");
+        assert!(
+            matches!(err, AppError::InvalidArg(_)),
+            "expected InvalidArg refusing the root lock, got {err:?}"
+        );
+        assert!(
+            !state.db.folder_by_id(&root).unwrap().unwrap().locked,
+            "the root stays unlocked after a refused lock"
+        );
+    }
+
+    /// Feature A: `ensure_notes_root` repurposes an UNLOCKED legacy "Notes" in place (flag flip), but
+    /// creates a SEPARATE always-open root when the legacy "Notes" is LOCKED — never flagging the
+    /// locked folder as the root (the invariant "is_root ⟹ never sealed"). Idempotent.
+    #[test]
+    fn ensure_notes_root_repurposes_unlocked_but_separates_when_locked() {
+        // Fresh: creates "Notes" as an unlocked root; idempotent.
+        let fresh = build_state("root-fresh");
+        let r = fresh.db.ensure_notes_root().unwrap();
+        assert!(fresh.db.folder_is_root(&r).unwrap());
+        assert!(!fresh.db.folder_by_id(&r).unwrap().unwrap().locked);
+        assert_eq!(fresh.db.ensure_notes_root().unwrap(), r, "idempotent");
+
+        // Unlocked legacy "Notes" → repurposed in place (same id becomes the root).
+        let open = build_state("root-repurpose");
+        let notes = open.db.ensure_default_note_folder().unwrap();
+        assert_eq!(open.db.ensure_notes_root().unwrap(), notes);
+        assert!(open.db.folder_is_root(&notes).unwrap());
+
+        // Locked legacy "Notes" → a SEPARATE open root; the locked folder is never the root.
+        let locked = build_state("root-locked");
+        let notes3 = locked.db.ensure_default_note_folder().unwrap();
+        locked
+            .db
+            .set_folder_locked(&notes3, true, Some(&b"w"[..]))
+            .unwrap();
+        let r3 = locked.db.ensure_notes_root().unwrap();
+        assert_ne!(r3, notes3, "a locked legacy Notes is NOT repurposed");
+        assert!(
+            !locked.db.folder_is_root(&notes3).unwrap(),
+            "the locked Notes is never flagged is_root"
+        );
+        assert!(!locked.db.folder_by_id(&r3).unwrap().unwrap().locked);
+    }
+
     /// STUCK-REPUBLISH FIX (`resolve_owned_source`): `resolve_owned_source` must mirror
     /// `org_resolve_source_inner` (fixed in cd21b10) and NOT gate on `state == "uploaded"` — a
     /// republish that failed transiently leaves the row `state = "failed"` with its OLD,
@@ -27488,7 +27770,9 @@ pub async fn org_list_members(
         .into_iter()
         .map(|m| OrgMember {
             user_id: m.user_id,
-            email: None, // the server does not return member emails (content-min); FE shows the id
+            // The server now discloses member emails to fellow org members (2026-07-14) — the FE shows
+            // the email, falling back to the id when an older server omits it (`None`).
+            email: m.email,
             role: m.role,
             added_at: m.created_at,
             removed: false,
