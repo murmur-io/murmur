@@ -108,11 +108,13 @@ for this note: <body excerpt>"). **Local-only, zero egress.**
 - Changing the per-folder lock model.
 - Cloud-based title generation; bulk-retitling existing "Untitled" notes.
 
-## Open questions for review
-1. **Reserved-root marker:** an additive `folders.is_root` column (clean, explicit) vs a reserved
-   id/path sentinel (no schema touch at all). Recommendation: `is_root` column — explicit + guardable.
-2. **Legacy "Notes" folder:** leave untouched (recommended — no risky migration) vs auto-promote an
-   *unlocked* legacy "Notes" folder to the reserved root (cleaner tree, more logic). Recommendation:
-   leave untouched for now.
-3. **Auto-title on a note in a locked folder:** the read-gate refuses → we simply skip (leave
-   "Untitled"). Acceptable? (Recommendation: yes — don't auto-unlock for a title.)
+## Decisions (resolved 2026-07-14, user-approved)
+1. **Reserved-root marker:** additive **`folders.is_root INTEGER DEFAULT 0`** column — explicit +
+   easy to guard (`lock_folder` refuses when `is_root=1`). `ensure_notes_root()` creates/returns the
+   single `is_root=1` note-folder idempotently.
+2. **Legacy "Notes" folder:** **left untouched** — becomes a normal folder with its notes; the user
+   renames/deletes it manually (after unlocking if sealed). No migration of user rows. A one-time
+   redundant "Notes" folder remains for existing users; fresh installs are clean.
+3. **Auto-title on a note in a locked folder:** **skip** — the read-gate refuses, so the note stays
+   "Untitled"; never auto-unlock just to title. (Rare in practice: new notes land in the always-open
+   root, not a locked folder.)
