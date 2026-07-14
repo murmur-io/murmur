@@ -695,6 +695,11 @@ impl Db {
         // folders are created with kind='note'. Lock/seal/CK machinery is folder-id-keyed and
         // kind-agnostic → reused verbatim. Additive + guarded (idempotent).
         Self::add_column_if_missing(&conn, "folders", "kind", "TEXT NOT NULL DEFAULT 'meeting'")?;
+        // ADDITIVE (2026-07-14): `is_root` marks the ONE reserved always-open note-folder that backs
+        // the "Notes" section root — new UNFILED notes land there, it can never be locked, and the FE
+        // hides it from the folder tree (it IS the section, not a nested child). Exactly one row has
+        // is_root=1 (see `ensure_notes_root`). Guarded/idempotent; every existing folder defaults to 0.
+        Self::add_column_if_missing(&conn, "folders", "is_root", "INTEGER NOT NULL DEFAULT 0")?;
         // Phase 2b — content-free egress audit log. One row per cloud provider call written by
         // `DbEgressSink`. The table carries ONLY counts, ids, labels, byte sizes, and token counts —
         // NEVER transcript, prompt, scrubbed values, API keys, or any meeting content (§8: no PII
@@ -5935,6 +5940,113 @@ impl Db {
         .map_err(map_err)
     }
 
+    /// The ONE reserved, always-open note-folder that backs the "Notes" section root — the home for
+    /// UNFILED new notes (2026-07-14). Idempotent; returns the existing `is_root` folder, else picks
+    /// one: an UNLOCKED legacy path-`"Notes"` is flagged `is_root=1` in place (no note movement — the
+    /// common/fresh case); a LOCKED legacy `"Notes"` can't be repurposed (would expose sealed content)
+    /// nor reuse the UNIQUE "Notes" path, so a SEPARATE always-open root is created at the first free
+    /// "Inbox" path (the locked "Notes" stays an ordinary folder); with no `"Notes"` folder at all
+    /// (fresh install) the root is created at "Notes". Never moves user rows, never touches sealed
+    /// content; the root can never be locked (`lock_folder` refuses `is_root`).
+    pub fn ensure_notes_root(&self) -> Result<String> {
+        if let Some(id) = self.note_root_id()? {
+            return Ok(id);
+        }
+        match self.folder_by_path("Notes")? {
+            Some(f) if !f.locked => {
+                self.set_folder_is_root(&f.id)?;
+                Ok(f.id)
+            }
+            Some(_locked) => {
+                let path = self.first_free_note_root_path()?;
+                self.insert_note_root(&path)
+            }
+            None => self.insert_note_root("Notes"),
+        }
+    }
+
+    /// The id of the reserved note-root (`is_root=1`), or `None` if it hasn't been created yet.
+    pub fn note_root_id(&self) -> Result<Option<String>> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT id FROM folders WHERE is_root = 1 AND COALESCE(kind,'meeting') = 'note' LIMIT 1",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(map_err)
+    }
+
+    /// True when this folder is the reserved always-open note-root (`is_root=1`). Drives the
+    /// `lock_folder` refusal so the root can never be sealed.
+    pub fn folder_is_root(&self, id: &str) -> Result<bool> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT COALESCE(is_root, 0) FROM folders WHERE id = ?1",
+            rusqlite::params![id],
+            |r| Ok(r.get::<_, i64>(0)? != 0),
+        )
+        .optional()
+        .map(|o| o.unwrap_or(false))
+        .map_err(map_err)
+    }
+
+    /// Flag an existing (unlocked) note-folder as the reserved root. The `AND locked = 0` makes
+    /// "is_root ⟹ never sealed" a SQL-enforced invariant even under a concurrent lock race — a locked
+    /// folder can NEVER become the always-open root (lock-security review, 2026-07-14).
+    fn set_folder_is_root(&self, id: &str) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE folders SET is_root = 1 WHERE id = ?1 AND locked = 0",
+            rusqlite::params![id],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// The first free "Inbox"-style path for a separate note-root (when the legacy "Notes" is locked).
+    fn first_free_note_root_path(&self) -> Result<String> {
+        for n in 0..1000 {
+            let path = if n == 0 {
+                "Inbox".to_string()
+            } else {
+                format!("Inbox {}", n + 1)
+            };
+            if self.folder_by_path(&path)?.is_none() {
+                return Ok(path);
+            }
+        }
+        Err(AppError::Storage("could not allocate a notes-root path".into()))
+    }
+
+    /// Insert a fresh reserved note-root at `path` (name = `path`, `is_root=1`, unlocked, no parent).
+    /// `INSERT OR IGNORE` on the UNIQUE path guards a race, then reads the id back.
+    fn insert_note_root(&self, path: &str) -> Result<String> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let conn = self.lock();
+        conn.execute(
+            "INSERT OR IGNORE INTO folders (id, name, path, parent_id, locked, wrapped_key, created_at, kind, is_root)
+             VALUES (?1, ?2, ?2, NULL, 0, NULL, ?3, 'note', 1)",
+            rusqlite::params![id, path, chrono::Utc::now().to_rfc3339()],
+        )
+        .map_err(map_err)?;
+        // Ensure is_root=1 even if a same-path row pre-existed (the OR IGNORE kept the old one). The
+        // `AND locked = 0` keeps the "is_root ⟹ never sealed" invariant under a concurrent race where
+        // a LOCKED folder was created at this path between the free-path check and here.
+        conn.execute(
+            "UPDATE folders SET is_root = 1 WHERE path = ?1 AND locked = 0 \
+               AND COALESCE(kind, 'meeting') = 'note'",
+            rusqlite::params![path],
+        )
+        .map_err(map_err)?;
+        conn.query_row(
+            "SELECT id FROM folders WHERE path = ?1",
+            rusqlite::params![path],
+            |r| r.get::<_, String>(0),
+        )
+        .map_err(map_err)
+    }
+
     /// Insert a note-folder (`kind='note'`). Mirrors [`Db::insert_folder`] but stamps the kind.
     pub fn insert_note_folder(&self, f: &NoteFolder, created_at: &str) -> Result<()> {
         let conn = self.lock();
@@ -5960,7 +6072,7 @@ impl Db {
         let conn = self.lock();
         let mut stmt = conn
             .prepare(
-                "SELECT id, name, path, parent_id, locked, kind
+                "SELECT id, name, path, parent_id, locked, kind, COALESCE(is_root, 0)
                    FROM folders WHERE kind = 'note' ORDER BY created_at, name",
             )
             .map_err(map_err)?;
@@ -5977,7 +6089,7 @@ impl Db {
     pub fn note_folder_by_id(&self, id: &str) -> Result<Option<NoteFolder>> {
         let conn = self.lock();
         conn.query_row(
-            "SELECT id, name, path, parent_id, locked, kind
+            "SELECT id, name, path, parent_id, locked, kind, COALESCE(is_root, 0)
                FROM folders WHERE id = ?1 AND kind = 'note'",
             rusqlite::params![id],
             row_to_note_folder,
@@ -11294,6 +11406,7 @@ fn row_to_note_folder(row: &Row<'_>) -> rusqlite::Result<NoteFolder> {
         // fills this in from the live session set; every other reader gets `false` (safe default).
         unlocked: false,
         kind: row.get::<_, Option<String>>(5)?.unwrap_or_else(|| "note".into()),
+        is_root: row.get::<_, i64>(6)? != 0,
     })
 }
 
