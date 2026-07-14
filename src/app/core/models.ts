@@ -2159,3 +2159,129 @@ export interface OrgActiveShare {
   itemId: string;
   title: string;
 }
+
+// ---------------------------------------------------------------------------
+// Saved views over the meetings list (Feature B — Table + Board views)
+// ---------------------------------------------------------------------------
+
+/**
+ * A user-saved view over the meetings list (Table / Board layout + a
+ * persisted filter/sort/group/columns config). Mirrors the Rust `SavedView`
+ * (serde camelCase). `config` is a JSON STRING on the wire — parsed
+ * client-side into a {@link ViewConfig} via {@link parseViewConfig}, which
+ * NEVER trusts the payload beyond `JSON.parse` (a malformed/partial config
+ * degrades to the safe default, it never throws). `scope` is fixed to
+ * `"meetings"` for this feature (a Calendar / notes-list scope is deferred).
+ */
+export interface SavedView {
+  id: string;
+  scope: "meetings";
+  name: string;
+  layout: "table" | "board";
+  /** JSON-encoded {@link ViewConfig}; parse with {@link parseViewConfig}. */
+  config: string;
+  sortOrder: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/**
+ * The parsed shape of {@link SavedView.config}. Purely presentational — the
+ * {@link import("../services/view-engine").ViewEngine} applies it CLIENT-SIDE
+ * over the already-gated `Meeting[]` the backend returned; it never re-queries
+ * or unmasks. `columns` names the visible table columns (see
+ * {@link MEETING_VIEW_FIELDS}); `groupBy` is the board's column axis (a field
+ * id, e.g. `"status"` or `"tag"`) or null for the table.
+ */
+export interface ViewConfig {
+  filters: ViewFilter[];
+  sort: ViewSort[];
+  groupBy: string | null;
+  columns: string[];
+}
+
+/** One filter clause in a {@link ViewConfig}. `value` is unused for the *Empty ops. */
+export interface ViewFilter {
+  field: string;
+  op: "eq" | "neq" | "contains" | "before" | "after" | "isEmpty" | "isNotEmpty";
+  value: string;
+}
+
+/** One sort key in a {@link ViewConfig} (applied in array order, stable). */
+export interface ViewSort {
+  field: string;
+  direction: "asc" | "desc";
+}
+
+/**
+ * Per-meeting open/done action-item counts, merged into a Table column and a
+ * Board card. Gated exactly like every meeting read: a sealed-and-not-session-
+ * unlocked meeting contributes no summary (the backend omits it), so a locked
+ * row shows no counts. Mirrors the Rust `MeetingActionSummary`.
+ */
+export interface MeetingActionSummary {
+  meetingId: string;
+  openCount: number;
+  doneCount: number;
+}
+
+/** The safe default config used when a {@link SavedView.config} string can't be parsed. */
+export const DEFAULT_VIEW_CONFIG: ViewConfig = {
+  filters: [],
+  sort: [{ field: "date", direction: "desc" }],
+  groupBy: null,
+  columns: ["title", "date", "folder", "status", "actions"],
+};
+
+/**
+ * Parse a {@link SavedView.config} JSON string into a {@link ViewConfig},
+ * NEVER trusting the wire beyond `JSON.parse`: any parse error, non-object, or
+ * missing/mistyped field falls back to a safe default rather than throwing (a
+ * corrupt config must never take down the whole meetings list). Unknown filter
+ * ops / fields are kept as-is (the ViewEngine treats an unknown op as a no-op),
+ * but the container shape is always coerced to valid arrays.
+ */
+export function parseViewConfig(config: string): ViewConfig {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(config);
+  } catch {
+    return { ...DEFAULT_VIEW_CONFIG };
+  }
+  if (typeof raw !== "object" || raw === null) {
+    return { ...DEFAULT_VIEW_CONFIG };
+  }
+  const obj = raw as Record<string, unknown>;
+  const filters = Array.isArray(obj["filters"])
+    ? (obj["filters"] as unknown[]).filter(
+        (f): f is ViewFilter =>
+          typeof f === "object" &&
+          f !== null &&
+          typeof (f as Record<string, unknown>)["field"] === "string" &&
+          typeof (f as Record<string, unknown>)["op"] === "string",
+      )
+    : [];
+  const sort = Array.isArray(obj["sort"])
+    ? (obj["sort"] as unknown[]).filter(
+        (s): s is ViewSort =>
+          typeof s === "object" &&
+          s !== null &&
+          typeof (s as Record<string, unknown>)["field"] === "string" &&
+          ((s as Record<string, unknown>)["direction"] === "asc" ||
+            (s as Record<string, unknown>)["direction"] === "desc"),
+      )
+    : [];
+  const groupBy =
+    typeof obj["groupBy"] === "string" ? (obj["groupBy"] as string) : null;
+  const columns = Array.isArray(obj["columns"])
+    ? (obj["columns"] as unknown[]).filter(
+        (c): c is string => typeof c === "string",
+      )
+    : [...DEFAULT_VIEW_CONFIG.columns];
+  return {
+    filters,
+    sort,
+    groupBy,
+    columns: columns.length > 0 ? columns : [...DEFAULT_VIEW_CONFIG.columns],
+  };
+}
