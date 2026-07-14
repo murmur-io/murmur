@@ -2382,7 +2382,10 @@ pub(crate) fn create_note_inner(
     // BLK-1 / TOCTOU (2026-07-10 audit F4): hold the lifecycle guard across gate+insert so a
     // concurrent lock/relock cannot land between the unlock check and the row insert.
     let _lifecycle = lifecycle_guard(state);
-    // Resolve the anchor note-folder (default when None). ensure_default_note_folder is idempotent.
+    // Resolve the anchor note-folder. A None/empty selection ⇒ the reserved always-open Notes ROOT
+    // (unfiled), NOT the old default "Notes" folder — so "New note" can NEVER fail because the default
+    // folder is sealed (the 2026-07-14 "Couldn't create the note" dead-end). `ensure_notes_root` is
+    // idempotent + never locked.
     let folder_id = match folder_id {
         Some(f) if !f.is_empty() => {
             // Must be a NOTE folder — never create a note inside a meeting folder.
@@ -2391,7 +2394,7 @@ pub(crate) fn create_note_inner(
             }
             f.to_string()
         }
-        _ => state.db.ensure_default_note_folder()?,
+        _ => state.db.ensure_notes_root()?,
     };
 
     // WRITE-GATE: a sealed-and-not-session-unlocked folder is refused.
@@ -2899,6 +2902,8 @@ pub(crate) fn create_note_folder_inner(
         locked: false,
         // A freshly created folder is never sealed, so never session-unlocked.
         unlocked: false,
+        // Only the reserved Notes root is `is_root`; a user-created folder never is.
+        is_root: false,
         kind: "note".into(),
     };
     state
@@ -10667,6 +10672,14 @@ pub(crate) fn lock_folder_inner(state: &AppState, folder_id: String) -> Result<(
         .db
         .folder_by_id(&folder_id)?
         .ok_or_else(|| AppError::InvalidArg(format!("no folder {folder_id}")))?;
+    // The reserved Notes root is the always-open home for unfiled notes — it can NEVER be sealed
+    // (unfiled notes are deliberately plaintext; sealing requires filing into a lockable folder). Refuse
+    // rather than silently no-op so the FE can guide the user (2026-07-14).
+    if state.db.folder_is_root(&folder_id)? {
+        return Err(AppError::InvalidArg(
+            "the Notes root can't be locked — move notes into a folder to seal them".into(),
+        ));
+    }
     if folder.locked {
         return Ok(()); // already sealed — idempotent.
     }
