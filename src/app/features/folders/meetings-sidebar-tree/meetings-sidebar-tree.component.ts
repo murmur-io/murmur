@@ -75,6 +75,20 @@ export class MeetingsSidebarTreeComponent {
     this.folderTree()?.openCreate();
   }
 
+  /**
+   * MEETING folders only. `list_folders` (which backs `folders.tree()`) returns
+   * EVERY folder — meeting AND note — because the lock-reactive consumers (the
+   * note editor / meeting detail effects) need the whole set to react to any
+   * folder's seal state. So the Meetings tree filters out note folders at render
+   * (`kind !== "note"`) — otherwise a folder created in Notes leaked into this
+   * tree (2026-07-14). The two namespaces never nest across each other, so a
+   * top-level filter is sufficient. Notes has the mirror: its sidebar reads the
+   * kind-scoped `list_note_folders`, so meeting folders never leak the other way.
+   */
+  readonly meetingFolders = computed(() =>
+    this.folders.tree().filter((n) => n.kind !== "note"),
+  );
+
   /** Every folder node keyed by id (flattened) — for the drop-toast's folder name. */
   private readonly folderById = computed(() => {
     const map = new Map<string, FolderNode>();

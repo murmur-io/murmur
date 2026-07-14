@@ -6,13 +6,11 @@ import {
   output,
   signal,
 } from "@angular/core";
-import { SavedViewsService } from "../../../services/saved-views.service";
+import { NotesSavedViewsService } from "../../../services/notes-saved-views.service";
+import { NOTE_VIEW_FIELDS } from "../../../services/notes-view-engine";
+import type { ViewField } from "../../../services/view-engine";
 import {
-  MEETING_VIEW_FIELDS,
-  type ViewField,
-} from "../../../services/view-engine";
-import {
-  DEFAULT_VIEW_CONFIG,
+  DEFAULT_NOTES_VIEW_CONFIG,
   parseViewConfig,
   type SavedView,
   type ViewConfig,
@@ -38,38 +36,37 @@ const OP_LABELS: Record<ViewFilter["op"], string> = {
 };
 
 /**
- * Feature B — the meetings-list VIEW SWITCHER. Renders a strip of "List"
- * (default) + every saved view as selectable tabs, a "+" to save a new Table
- * view, and — when a saved view is active — a filter/sort control that opens an
- * OPAQUE overlay menu (trap T3: floats over content → `.menu` primitive /
- * `var(--surface-overlay)`, never the frosted `.card`). Board layout was
- * removed 2026-07-14 (a kanban of meetings had no real use); every saved view
- * is a Table.
+ * The Notes-list VIEW SWITCHER — the Notes-surface twin of the meetings
+ * `MeetingsViewSwitcherComponent` (ported 2026-07-14 so Notes has the same
+ * Saved Views UX Meetings does). Renders a strip of "List" (default) + every
+ * saved view as selectable tabs, a "+" to save a new Table view, and — when a
+ * saved view is active — a filter/sort control that opens an OPAQUE overlay menu
+ * (trap T3: floats over content → `.menu` primitive / `var(--surface-overlay)`,
+ * never the frosted `.card`). Board layout is intentionally absent (removed
+ * 2026-07-14) — every saved view is a Table.
  *
- * It reads the roster from the root-persisted {@link SavedViewsService} and
+ * It reads the roster from the root-persisted {@link NotesSavedViewsService} and
  * drives it directly (select / create / delete / config edits), so the parent
- * `LibraryComponent` only has to render Table/Board off the SAME service state.
- * A config change persists through the service (backend is truth); the parent
- * re-derives its rows from the active view reactively.
+ * `NotesHomeComponent` only re-derives its rows from the active view reactively.
  */
 @Component({
-  selector: "app-meetings-view-switcher",
+  selector: "app-notes-view-switcher",
   changeDetection: ChangeDetectionStrategy.OnPush,
   host: {
     "(document:click)": "onDocumentClick($event)",
   },
-  templateUrl: "./meetings-view-switcher.component.html",
-  styleUrl: "./meetings-view-switcher.component.scss",
+  templateUrl: "./notes-view-switcher.component.html",
+  styleUrl: "./notes-view-switcher.component.scss",
 })
-export class MeetingsViewSwitcherComponent {
-  private readonly savedViews = inject(SavedViewsService);
+export class NotesViewSwitcherComponent {
+  private readonly savedViews = inject(NotesSavedViewsService);
 
   readonly views = this.savedViews.views;
   readonly activeViewId = this.savedViews.activeViewId;
   readonly activeView = this.savedViews.activeView;
 
   /** The field catalog for filter/sort. */
-  readonly fields = MEETING_VIEW_FIELDS;
+  readonly fields = NOTE_VIEW_FIELDS;
 
   /** Emitted after any change that alters what the parent should render (select/config). */
   readonly changed = output<void>();
@@ -84,7 +81,7 @@ export class MeetingsViewSwitcherComponent {
   /** The active view's parsed config (safe default when none / unparseable). */
   readonly activeConfig = computed<ViewConfig>(() => {
     const v = this.activeView();
-    return v ? parseViewConfig(v.config) : { ...DEFAULT_VIEW_CONFIG };
+    return v ? parseViewConfig(v.config) : { ...DEFAULT_NOTES_VIEW_CONFIG };
   });
 
   /** Select "List" (null) or a saved view. */
@@ -100,12 +97,11 @@ export class MeetingsViewSwitcherComponent {
     this.openPanel.set(this.openPanel() === "add" ? null : "add");
   }
 
-  /** Open the filter/sort/group config menu for the active view. */
+  /** Open the filter/sort config menu for the active view. */
   toggleConfig(): void {
     this.openPanel.set(this.openPanel() === "config" ? null : "config");
   }
 
-  /** Close any open floating panel on an outside click (buttons stopPropagation). */
   onDocumentClick(event: MouseEvent): void {
     if (this.openPanel() === null) {
       return;
@@ -117,7 +113,7 @@ export class MeetingsViewSwitcherComponent {
     this.openPanel.set(null);
   }
 
-  /** Create a saved Table view from the "+" prompt (default config). */
+  /** Create a saved Table view from the "+" prompt (default notes config). */
   async createView(): Promise<void> {
     const name = this.newViewName().trim();
     if (!name || this.busy()) {
@@ -127,8 +123,7 @@ export class MeetingsViewSwitcherComponent {
     try {
       await this.savedViews.create(
         name,
-        "table",
-        JSON.stringify(DEFAULT_VIEW_CONFIG),
+        JSON.stringify(DEFAULT_NOTES_VIEW_CONFIG),
       );
       this.openPanel.set(null);
       this.changed.emit();
