@@ -2,20 +2,19 @@ import { test, expect } from "@playwright/test";
 import { mockNotes } from "./mock-invoke";
 
 /**
- * Feature C — typed note front-matter properties + folder Table/Board views.
+ * Feature C — typed note front-matter properties (the NOTE-EDITOR side) + the
+ * Notes list SAVED VIEWS switcher.
  *
  * The schema/typed commands (`get_note_folder_schema` / `set_note_folder_schema`
  * / `list_notes_typed`) are layered as per-spec `extra` overrides on top of the
  * shared Notes mock. `nf1` ("Notes") gets a 3-field schema (a Select "Status", a
- * Checkbox "Reviewed", a Date "Due"); the locked folder `nf2` returns `[]` from
- * BOTH the schema + typed reads (backend-gated), so no typed view is offered.
+ * Checkbox "Reviewed", a Date "Due"); the locked folder `nf2` returns `[]`.
  *
- * These are the runtime checks a green `ng build` can't make: the schema-driven
- * WIDGET per property row (a checkbox renders `mur-toggle`, NOT a text input),
- * the List/Table/Board switcher gated on a non-empty schema, the Table's
- * column-per-field, the Board's group-by-Status, and — critically — that toggling
- * a typed value re-serializes the note's front-matter unchanged in shape (the
- * `properties` map stays `Record<string,string>`).
+ * NOTE (2026-07-14): the notes-home per-folder List/Table/Board VIEW MODE (the
+ * old `mur-segmented` schema-gated switcher + `app-notes-table-view` /
+ * `app-notes-board-view`) was REMOVED and replaced by the Meetings-style Saved
+ * Views bar (`app-notes-view-switcher`, Board dropped). The EDITOR's typed
+ * property widgets (test 1 below) are unchanged and still shipped.
  */
 
 /** The schema + typed-row overrides shared by these specs. */
@@ -159,7 +158,7 @@ test("editor renders a SCHEMA-DRIVEN widget per property (checkbox → mur-toggl
   expect(consoleErrors).toEqual([]);
 });
 
-test("notes home offers List/Table/Board only for a folder WITH a schema; Table shows a column per field; Board groups by Status", async ({
+test("notes home shows the Saved Views bar (List default + add) on a folder scope, Board is gone", async ({
   page,
 }) => {
   const consoleErrors: string[] = [];
@@ -172,47 +171,21 @@ test("notes home offers List/Table/Board only for a folder WITH a schema; Table 
   await page.goto("/notes");
   await expect(page.locator(".notes-content")).toBeVisible();
 
-  // "All notes" (no folder) → NO switcher.
-  await expect(page.locator(".view-switcher")).toHaveCount(0);
-
-  // Select the "Notes" (nf1) folder in the sidebar tree → its schema loads.
-  await page
-    .locator("app-notes-sidebar-tree mur-tree-row .row-label", { hasText: "Notes" })
-    .first()
-    .click();
-
-  // The switcher now appears (nf1 has a non-empty schema).
-  const switcher = page.locator(".view-switcher");
+  // The Saved Views bar (the Meetings-style switcher) shows on the "All notes"
+  // scope — a "List" default tab + a "Save a new view" (+) button, no Board.
+  const switcher = page.locator("app-notes-view-switcher");
   await expect(switcher).toBeVisible();
-  await expect(switcher.getByRole("button", { name: "Table" })).toBeVisible();
-  await expect(switcher.getByRole("button", { name: "Board" })).toBeVisible();
-
-  // Switch to TABLE → a column per schema field + Title + Updated.
-  await switcher.getByRole("button", { name: "Table" }).click();
-  const table = page.locator("app-notes-table-view");
-  await expect(table).toBeVisible();
-  await expect(table.locator("thead th", { hasText: "Title" })).toBeVisible();
-  await expect(table.locator("thead th", { hasText: "Status" })).toBeVisible();
-  await expect(table.locator("thead th", { hasText: "Reviewed" })).toBeVisible();
-  await expect(table.locator("thead th", { hasText: "Due" })).toBeVisible();
-  // A select value renders as a pill; a checkbox as a glyph (n1 Reviewed=true).
-  await expect(table.locator(".select-pill", { hasText: "In progress" })).toBeVisible();
-  await expect(table.locator(".check-glyph").first()).toBeVisible();
-
-  // Switch to BOARD → grouped by the Select field "Status": one column per option.
-  await switcher.getByRole("button", { name: "Board" }).click();
-  const board = page.locator("app-notes-board-view");
-  await expect(board).toBeVisible();
-  await expect(board.locator(".board-col-title", { hasText: "Todo" })).toBeVisible();
-  await expect(board.locator(".board-col-title", { hasText: "In progress" })).toBeVisible();
-  await expect(board.locator(".board-col-title", { hasText: "Done" })).toBeVisible();
-  // n1 (In progress) card is under the right column.
-  await expect(board.getByText("My First Note")).toBeVisible();
+  await expect(switcher.getByRole("tab", { name: "List" })).toBeVisible();
+  await expect(
+    switcher.getByRole("button", { name: "Save a new view" }),
+  ).toBeVisible();
+  // Board was removed — no "As board" / "Board" affordance anywhere in the bar.
+  await expect(switcher.getByRole("button", { name: /board/i })).toHaveCount(0);
 
   expect(consoleErrors).toEqual([]);
 });
 
-test("a LOCKED folder (schema [] / rows []) offers NO typed view — only the lock gate / list", async ({
+test("a LOCKED folder shows the lock gate and hides the Saved Views bar", async ({
   page,
 }) => {
   const consoleErrors: string[] = [];
@@ -225,16 +198,15 @@ test("a LOCKED folder (schema [] / rows []) offers NO typed view — only the lo
   await page.goto("/notes");
   await expect(page.locator(".notes-content")).toBeVisible();
 
-  // Select the locked "Work" folder (nf2) → schema gated to [].
+  // Select the locked "Work" folder (nf2).
   await page
     .locator("app-notes-sidebar-tree mur-tree-row .row-label", { hasText: "Work" })
     .first()
     .click();
 
-  // NO switcher (empty schema), NO table/board view.
-  await expect(page.locator(".view-switcher")).toHaveCount(0);
-  await expect(page.locator("app-notes-table-view")).toHaveCount(0);
-  await expect(page.locator("app-notes-board-view")).toHaveCount(0);
+  // The lock gate shows; the Saved Views bar is hidden while the folder is sealed.
+  await expect(page.locator(".lock-gate")).toBeVisible();
+  await expect(page.locator("app-notes-view-switcher")).toHaveCount(0);
 
   expect(consoleErrors).toEqual([]);
 });

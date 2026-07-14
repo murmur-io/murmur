@@ -4802,9 +4802,16 @@ pub fn delete_recipe(state: State<'_, AppState>, id: String) -> Result<(), AppEr
 // content aggregation the meetings surface consumes is `list_meeting_action_summaries`, which IS
 // gated (routes through `unlocked_snapshot` → the gated `Db::list_meeting_action_summaries`).
 
-/// Only `"meetings"` is a valid saved-view scope today; reject anything else as an argument error so
-/// a typo can't quietly create an un-listable orphan row.
+/// The valid saved-view scopes — one per list surface. A scope not in this set is rejected as an
+/// argument error so a typo can't quietly create an un-listable orphan row. `"notes"` was added
+/// 2026-07-14 (Saved Views ported to the Notes surface, mirroring Meetings).
 const SAVED_VIEW_SCOPE_MEETINGS: &str = "meetings";
+const SAVED_VIEW_SCOPE_NOTES: &str = "notes";
+
+/// Whether `scope` names a list surface that supports saved views.
+fn is_valid_saved_view_scope(scope: &str) -> bool {
+    scope == SAVED_VIEW_SCOPE_MEETINGS || scope == SAVED_VIEW_SCOPE_NOTES
+}
 
 /// List the user's saved views for a list surface (`scope` = "meetings"). NOT content-gated: view
 /// metadata only (see the LOCK-SECURITY NOTE above).
@@ -4813,7 +4820,7 @@ pub fn list_saved_views(
     state: State<'_, AppState>,
     scope: String,
 ) -> Result<Vec<SavedView>, AppError> {
-    if scope != SAVED_VIEW_SCOPE_MEETINGS {
+    if !is_valid_saved_view_scope(&scope) {
         return Err(AppError::InvalidArg(format!(
             "unsupported saved-view scope: {scope}"
         )));
@@ -4832,7 +4839,7 @@ pub fn upsert_saved_view(
     let scope = view.scope.trim();
     let name = view.name.trim();
     let layout = view.layout.trim();
-    if scope != SAVED_VIEW_SCOPE_MEETINGS {
+    if !is_valid_saved_view_scope(scope) {
         return Err(AppError::InvalidArg(format!(
             "unsupported saved-view scope: {scope}"
         )));
@@ -4885,7 +4892,7 @@ pub fn reorder_saved_views(
     scope: String,
     ordered_ids: Vec<String>,
 ) -> Result<(), AppError> {
-    if scope != SAVED_VIEW_SCOPE_MEETINGS {
+    if !is_valid_saved_view_scope(&scope) {
         return Err(AppError::InvalidArg(format!(
             "unsupported saved-view scope: {scope}"
         )));
@@ -10636,7 +10643,8 @@ pub fn list_folders(state: State<'_, AppState>) -> Result<Vec<FolderNode>, AppEr
     // Gated by the session unlock set — a sealed-and-not-unlocked folder's notes must not
     // contribute to note_count (see count_notes_per_folder doc + .claude/rules/lock-model.md).
     let counts = state.db.count_notes_per_folder(&unlocked)?;
-    Ok(build_folder_tree(&folders, &counts, &unlocked))
+    let kinds = state.db.folder_kinds()?;
+    Ok(build_folder_tree(&folders, &counts, &unlocked, &kinds))
 }
 
 /// Assemble `FolderNode` roots (parent_id == None) and recurse children. Sealed-but-session-
@@ -10645,17 +10653,19 @@ fn build_folder_tree(
     folders: &[Folder],
     counts: &std::collections::HashMap<String, usize>,
     unlocked: &std::collections::HashSet<String>,
+    kinds: &std::collections::HashMap<String, String>,
 ) -> Vec<FolderNode> {
     fn node(
         f: &Folder,
         folders: &[Folder],
         counts: &std::collections::HashMap<String, usize>,
         unlocked: &std::collections::HashSet<String>,
+        kinds: &std::collections::HashMap<String, String>,
     ) -> FolderNode {
         let children = folders
             .iter()
             .filter(|c| c.parent_id.as_deref() == Some(f.id.as_str()))
-            .map(|c| node(c, folders, counts, unlocked))
+            .map(|c| node(c, folders, counts, unlocked, kinds))
             .collect();
         FolderNode {
             id: f.id.clone(),
@@ -10664,13 +10674,17 @@ fn build_folder_tree(
             note_count: counts.get(&f.id).copied().unwrap_or(0),
             locked: f.locked,
             unlocked: f.locked && unlocked.contains(&f.id),
+            kind: kinds
+                .get(&f.id)
+                .cloned()
+                .unwrap_or_else(|| "meeting".to_string()),
             children,
         }
     }
     folders
         .iter()
         .filter(|f| f.parent_id.is_none())
-        .map(|f| node(f, folders, counts, unlocked))
+        .map(|f| node(f, folders, counts, unlocked, kinds))
         .collect()
 }
 
@@ -10722,6 +10736,25 @@ pub fn create_folder(
     Ok(folder)
 }
 
+/// Reject filing a MEETING under a NOTE folder — the folder namespaces are disjoint (a meeting's
+/// `.md` lives under a meeting folder; a note under a note folder). Called before any DB reassign
+/// or FS move so a cross-namespace target can never take effect. `None` (the vault root) is always
+/// valid. Returns `Ok(())` for a meeting folder or an unknown id (the caller's own resolve reports
+/// a genuinely-missing folder).
+fn ensure_meeting_folder_target(
+    db: &crate::storage::db::Db,
+    folder_id: Option<&str>,
+) -> Result<(), AppError> {
+    if let Some(fid) = folder_id {
+        if db.folder_kind(fid)?.as_deref() == Some("note") {
+            return Err(AppError::InvalidArg(
+                "cannot move a meeting into a note folder".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Move a note into a folder (or to the root with `folder_id = None`).
 ///
 /// Three cases by TARGET:
@@ -10741,6 +10774,14 @@ pub fn move_note(
 ) -> Result<(), AppError> {
     // Resolve current + target folder lock state.
     let note = state.db.get_latest_note_for_meeting(&meeting_id)?;
+
+    // A MEETING may only be filed under a MEETING folder — never a note folder
+    // (the folder namespaces are disjoint; filing a meeting into the Notes
+    // namespace is the folder-leak's mirror). The FE meeting move-menu already
+    // hides note folders, but gate the write too so a bypassed/typo'd id can't
+    // cross the namespace boundary (2026-07-14).
+    ensure_meeting_folder_target(&state.db, folder_id.as_deref())?;
+
     let target_locked = match folder_id.as_deref() {
         Some(fid) => {
             state
@@ -11493,6 +11534,10 @@ pub async fn unlock_folder(
                 .clone()
         };
         let counts = state.db.count_notes_per_folder(&unlocked)?;
+        let kind = state
+            .db
+            .folder_kind(&folder.id)?
+            .unwrap_or_else(|| "meeting".to_string());
         Ok(FolderNode {
             id: folder.id.clone(),
             name: folder.name.clone(),
@@ -11500,6 +11545,7 @@ pub async fn unlock_folder(
             note_count: counts.get(&folder.id).copied().unwrap_or(0),
             locked: true,
             unlocked: unlocked.contains(&folder.id),
+            kind,
             children: Vec::new(),
         })
     })
@@ -11948,6 +11994,10 @@ pub(crate) async fn discard_unrecoverable_folder_lock_inner(
             .clone()
     };
     let counts = state.db.count_notes_per_folder(&unlocked)?;
+    let kind = state
+        .db
+        .folder_kind(&folder.id)?
+        .unwrap_or_else(|| "meeting".to_string());
     Ok(FolderNode {
         id: folder.id.clone(),
         name: folder.name.clone(),
@@ -11955,6 +12005,7 @@ pub(crate) async fn discard_unrecoverable_folder_lock_inner(
         note_count: counts.get(&folder.id).copied().unwrap_or(0),
         locked: false,
         unlocked: false,
+        kind,
         children: Vec::new(),
     })
 }
@@ -19542,6 +19593,143 @@ mod lifecycle_tests {
             state.db.get_note_row(&id).unwrap().unwrap().sealed,
             "a note created in a session-unlocked LOCKED folder is sealed from birth"
         );
+    }
+
+    /// 2026-07-14 Notes Saved Views (RED-before-GREEN): the `"notes"` scope is now a valid saved-view
+    /// scope (was meetings-only), and the `saved_views.scope` column partitions the roster so a notes
+    /// view never appears in the meetings roster and vice-versa. Before the scope guard was relaxed
+    /// this scope was rejected, so a notes view couldn't be persisted at all — this test is RED
+    /// against that.
+    #[test]
+    fn saved_views_notes_scope_is_valid_and_partitioned_from_meetings() {
+        assert!(is_valid_saved_view_scope("meetings"));
+        assert!(
+            is_valid_saved_view_scope("notes"),
+            "the notes surface must be a valid saved-view scope"
+        );
+        assert!(!is_valid_saved_view_scope("calendar"));
+
+        let state = build_state("saved-views-notes-scope");
+        let notes_view = SavedView {
+            id: "nv1".into(),
+            scope: "notes".into(),
+            name: "By folder".into(),
+            layout: "table".into(),
+            config: "{}".into(),
+            sort_order: 0,
+            created_at: "2026-07-14T00:00:00Z".into(),
+            updated_at: "2026-07-14T00:00:00Z".into(),
+        };
+        let meetings_view = SavedView {
+            id: "mv1".into(),
+            scope: "meetings".into(),
+            name: "Recent".into(),
+            layout: "table".into(),
+            config: "{}".into(),
+            sort_order: 0,
+            created_at: "2026-07-14T00:00:00Z".into(),
+            updated_at: "2026-07-14T00:00:00Z".into(),
+        };
+        state.db.upsert_saved_view(&notes_view).unwrap();
+        state.db.upsert_saved_view(&meetings_view).unwrap();
+
+        let notes = state.db.list_saved_views("notes").unwrap();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].id, "nv1");
+        let meetings = state.db.list_saved_views("meetings").unwrap();
+        assert_eq!(meetings.len(), 1);
+        assert_eq!(
+            meetings[0].id, "mv1",
+            "a notes-scoped view must never leak into the meetings roster"
+        );
+    }
+
+    /// 2026-07-14 folder-leak (RED-before-GREEN): `list_folders` returns EVERY folder — meeting AND
+    /// note — because the lock-reactive FE consumers need the whole set. So `build_folder_tree` MUST
+    /// stamp each node's `kind` (from `folder_kinds()`) so the Meetings sidebar can filter note
+    /// folders out (`kind != "note"`). Before the fix `FolderNode` had no `kind` and note folders
+    /// leaked into the Meetings tree with no way to distinguish them — this test is RED against that.
+    #[test]
+    fn folder_tree_tags_note_folders_so_meetings_can_filter_them_out() {
+        let state = build_state("folder-kind-tree");
+        // A meeting folder — `insert_folder` leaves `kind` NULL, which `folder_kinds()` reads as
+        // "meeting" via COALESCE (the legacy-row default).
+        state
+            .db
+            .insert_folder(&Folder {
+                id: "mf1".into(),
+                name: "Project X".into(),
+                path: "Project X".into(),
+                parent_id: None,
+                locked: false,
+                created_at: "2026-07-14T00:00:00Z".into(),
+            })
+            .unwrap();
+        // A note folder — `create_note_folder_inner` stamps `kind='note'`.
+        let nf = create_note_folder_inner(&state, "Ideas", None).unwrap();
+
+        let folders = state.db.list_folders().unwrap();
+        let unlocked = std::collections::HashSet::new();
+        let counts = state.db.count_notes_per_folder(&unlocked).unwrap();
+        let kinds = state.db.folder_kinds().unwrap();
+        let tree = build_folder_tree(&folders, &counts, &unlocked, &kinds);
+
+        let meeting_node = tree
+            .iter()
+            .find(|n| n.id == "mf1")
+            .expect("meeting folder present in the tree");
+        assert_eq!(meeting_node.kind, "meeting");
+        let note_node = tree
+            .iter()
+            .find(|n| n.id == nf.id)
+            .expect("note folder present in the tree");
+        assert_eq!(
+            note_node.kind, "note",
+            "the note folder must be tagged so the Meetings tree can filter it out"
+        );
+
+        // The Meetings sidebar renders `kind != "note"`: only the meeting folder survives, the note
+        // folder never appears there.
+        let meetings_only: Vec<_> = tree.iter().filter(|n| n.kind != "note").collect();
+        assert!(meetings_only.iter().any(|n| n.id == "mf1"));
+        assert!(
+            !meetings_only.iter().any(|n| n.id == nf.id),
+            "a note folder must NEVER render in the Meetings tree"
+        );
+    }
+
+    /// 2026-07-14 folder-leak mirror (RED-before-GREEN): a MEETING must never be filed under a NOTE
+    /// folder. `ensure_meeting_folder_target` (the `move_note` write-gate) rejects a note-folder id
+    /// with `InvalidArg`, accepts a meeting-folder id, and accepts `None` (the vault root). Before
+    /// this gate `move_note` resolved the target kind-agnostically and would move a meeting's `.md`
+    /// under the Notes namespace — this test is RED against that.
+    #[test]
+    fn move_note_write_gate_rejects_a_note_folder_target() {
+        let state = build_state("move-note-kind-gate");
+        state
+            .db
+            .insert_folder(&Folder {
+                id: "mf1".into(),
+                name: "Meetings".into(),
+                path: "Meetings".into(),
+                parent_id: None,
+                locked: false,
+                created_at: "2026-07-14T00:00:00Z".into(),
+            })
+            .unwrap();
+        let nf = create_note_folder_inner(&state, "Ideas", None).unwrap();
+
+        // A note-folder target is refused with InvalidArg.
+        assert!(
+            matches!(
+                ensure_meeting_folder_target(&state.db, Some(nf.id.as_str())).unwrap_err(),
+                AppError::InvalidArg(_)
+            ),
+            "a meeting must not be movable into a note folder"
+        );
+        // A meeting-folder target and the vault root are allowed.
+        assert!(ensure_meeting_folder_target(&state.db, Some("mf1")).is_ok());
+        assert!(ensure_meeting_folder_target(&state.db, None).is_ok());
     }
 
     /// Feature C (RED-before-GREEN): `set_note_folder_schema` on a SEALED-and-not-session-unlocked
