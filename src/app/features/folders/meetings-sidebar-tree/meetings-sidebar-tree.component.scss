@@ -10,42 +10,9 @@
   margin-bottom: var(--space-1);
 }
 
-/* "Lock all" — quiet accent pill, only present when a folder is exposed. */
-.relock-pill {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--space-1);
-  align-self: flex-start;
-  height: 24px;
-  margin: 2px 0 var(--space-1);
-  padding: 0 var(--space-2);
-  border: 1px solid transparent;
-  border-radius: var(--radius-pill);
-  background: var(--accent-soft);
-  color: var(--accent-hover);
-  font-family: inherit;
-  font-size: 0.7rem;
-  font-weight: 600;
-  letter-spacing: 0.01em;
-  cursor: pointer;
-  transition:
-    filter var(--transition),
-    transform var(--transition-fast);
-}
-.relock-pill:hover:not(:disabled) {
-  filter: brightness(1.12);
-}
-.relock-pill:active:not(:disabled) {
-  transform: scale(0.95);
-}
-.relock-pill:focus-visible {
-  outline: none;
-  box-shadow: 0 0 0 3px var(--accent-ring);
-}
-.relock-pill:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
+/* (The `.relock-pill` "Lock all" affordance was removed 2026-07-14 — see the
+   template comment; the single "Lock all" action now lives in the sidebar
+   footer, styled by `.unlocked-pill` in styles.css.) */
 
 .tree-state {
   margin: var(--space-1) var(--space-2);

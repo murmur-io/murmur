@@ -129,19 +129,25 @@
       </nav>
 
       <div class="sidebar-footer">
-        <!-- Session-privacy indicator: locked folders currently unlocked. -->
+        <!-- Session-privacy: the sidebar's SINGLE accent focal point + its only
+             "Lock all" action (2026-07-14 declutter — the former top-of-tree
+             pill was removed). Status (N unlocked) + action (Lock all now) in
+             one control; only shown while something is actually exposed. -->
         @if (unlockedCount() > 0) {
-          <span
+          <button
+            type="button"
             class="unlocked-pill"
-            role="status"
+            [disabled]="relockingAll()"
+            (click)="relockAll()"
             [attr.aria-label]="
+              'Re-seal all ' +
               unlockedCount() +
-              ' locked folder' +
+              ' unlocked folder' +
               (unlockedCount() === 1 ? '' : 's') +
-              ' unlocked this session'
+              ' now'
             "
             [attr.title]="
-              'These folders are decrypted into plaintext until you re-lock or a screen share starts.'
+              'These folders are decrypted into plaintext until you re-lock or a screen share starts. Click to re-seal all now.'
             "
           >
             <svg
@@ -157,7 +163,8 @@
             </svg>
             <span class="unlocked-count">{{ unlockedCount() }}</span>
             <span class="nav-label unlocked-label">unlocked</span>
-          </span>
+            <span class="nav-label unlocked-action">Lock all</span>
+          </button>
         }
 
         <a
@@ -258,18 +265,22 @@
       </a>
 
       @if (unlockedCount() > 0) {
-        <span
+        <button
+          type="button"
           class="pill-unlocked"
-          role="status"
-          [attr.aria-label]="unlockedCount() + ' unlocked this session'"
-          title="Locked folders decrypted for this session"
+          [disabled]="relockingAll()"
+          (click)="relockAll()"
+          [attr.aria-label]="
+            'Re-seal all ' + unlockedCount() + ' unlocked folders now'
+          "
+          title="Locked folders decrypted for this session — click to re-seal all now"
         >
           <svg viewBox="0 0 16 16" width="12" height="12" fill="none" aria-hidden="true">
             <rect x="3.5" y="7" width="9" height="6" rx="1.4" stroke="currentColor" stroke-width="1.3" />
             <path d="M5.5 7V5.4a2.5 2.5 0 0 1 4.9-0.65" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
           </svg>
           <span class="unlocked-count">{{ unlockedCount() }}</span>
-        </span>
+        </button>
       }
     </nav>
   }

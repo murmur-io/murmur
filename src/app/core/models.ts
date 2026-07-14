@@ -1846,7 +1846,15 @@ export interface NoteFolder {
   name: string;
   path: string;
   parentId: string | null;
+  /** Sealed (encrypted) on disk. */
   locked: boolean;
+  /**
+   * Sealed on disk BUT session-unlocked (decrypted for this session). Mirrors
+   * {@link FolderNode.unlocked} — the backend joins the live session set in
+   * `list_note_folders`. An open folder is `locked=false, unlocked=false`. Drives
+   * the Notes lock gate (`locked && !unlocked`) so unlocking actually lifts it.
+   */
+  unlocked: boolean;
   kind: string;
 }
 
@@ -2055,6 +2063,14 @@ export interface OrgItemDetail {
   createdAt: string;
   rev: number;
   markdown: string;
+  /**
+   * True when THIS user authored the item (server-authoritative author id) — the
+   * viewer then offers edit-in-place + re-publish (`orgUpdateOwnItem`) on ANY of
+   * the author's machines, even one that never held the local share anchor. On the
+   * origin machine the viewer redirects to the local source before this renders;
+   * a non-author always sees `false`. Mirrors the Rust `OrgItemDetail.editable`.
+   */
+  editable: boolean;
 }
 
 /**
