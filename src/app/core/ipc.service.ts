@@ -7,6 +7,8 @@ import type {
   AiMapRow,
   Analytics,
   AppConfigDto,
+  BacklinkSource,
+  SourceKind,
   ContextHit,
   MyShareEntry,
   RecipientPreview,
@@ -1020,6 +1022,21 @@ export class IpcService {
   /** Detail for one entity: the entity + its visible backlinked meetings + top neighbors. */
   getEntityDetail(entityId: string): Promise<EntityDetail> {
     return invoke<EntityDetail>("get_entity_detail", { entityId });
+  }
+
+  /**
+   * Note↔note backlinks ("Linked mentions") — the VISIBLE inbound sources
+   * (meetings + authored notes) that mention/link the given target. GATED
+   * server-side like every content read: a sealed-and-not-session-unlocked
+   * source never appears, so the caller MUST skip the fetch entirely while the
+   * target itself is locked/masked (never surface backlinks behind a lock).
+   * Returns `[]` when nothing links to the target.
+   */
+  getBacklinks(
+    targetKind: SourceKind,
+    targetId: string,
+  ): Promise<BacklinkSource[]> {
+    return invoke<BacklinkSource[]>("get_backlinks", { targetKind, targetId });
   }
 
   /**

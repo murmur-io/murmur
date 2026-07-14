@@ -379,6 +379,14 @@
             }
           </div>
 
+          <!-- LINKED MENTIONS — inbound note↔note backlinks (meetings + notes
+               that link this note). Under the properties bar, above the body.
+               Only present when non-empty; cleared on a live seal (the effect
+               skips + `onLockTreeChanged` blanks it) so nothing shows behind a lock. -->
+          @if (backlinks().length) {
+            <app-backlinks [sources]="backlinks()" />
+          }
+
           <!-- Body: preview (cached computed) OR the source-of-truth textarea.
                Formatting lives in the floating bubble on selection (below) +
                ⌘B/⌘I shortcuts + the `/` slash menu — no persistent toolbar. -->
