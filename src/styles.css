@@ -380,11 +380,16 @@ mur-sidebar-section {
   border-top: 1px solid var(--border-subtle);
 }
 
-/* --- Session-privacy "N unlocked" indicator (footer) ----------------------- */
+/* --- Session-privacy "N unlocked · Lock all" button (footer) ---------------
+   The sidebar's SINGLE accent focal point AND its only "Lock all" action
+   (2026-07-14 declutter). Full-width so it reads as an action row like the
+   Settings/Collapse rows below it; status on the left, "Lock all" on the
+   right. Only rendered while a folder is actually exposed. */
 .unlocked-pill {
   display: flex;
   align-items: center;
   gap: var(--space-2);
+  width: 100%;
   height: 32px;
   margin-bottom: var(--space-1);
   padding: 0 var(--space-3);
@@ -392,15 +397,37 @@ mur-sidebar-section {
   border-radius: var(--radius-md);
   background: var(--accent-soft);
   color: var(--accent-hover);
+  font-family: inherit;
   font-size: 0.8rem;
   font-weight: 600;
   letter-spacing: -0.01em;
   line-height: 1;
   white-space: nowrap;
+  text-align: left;
+  cursor: pointer;
+  transition:
+    filter var(--transition),
+    background var(--transition);
+}
+.unlocked-pill:hover:not(:disabled) {
+  filter: brightness(1.12);
+}
+.unlocked-pill:active:not(:disabled) {
+  transform: translateY(1px);
+}
+.unlocked-pill:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+.unlocked-pill:disabled {
+  opacity: 0.6;
+  cursor: default;
 }
 .unlocked-glyph { display: block; flex: none; }
 .unlocked-count { font-variant-numeric: tabular-nums; }
 .unlocked-label { color: var(--accent-hover); opacity: 0.85; }
+/* The action half — pushed to the trailing edge, a touch bolder. */
+.unlocked-action { margin-left: auto; font-weight: 700; letter-spacing: 0; }
 
 /* --- Icon-rail collapse (Settings → Appearance → Sidebar → "Icon rail") ----
    The ALTERNATIVE collapsed chrome: the same floating glass panel, shrunk to
@@ -529,13 +556,28 @@ mur-sidebar-section {
   height: 28px;
   margin-left: 3px;
   padding: 0 var(--space-2);
+  border: 0;
   border-radius: var(--radius-pill);
   background: var(--accent-soft);
   color: var(--accent-hover);
+  font-family: inherit;
   font-size: 0.76rem;
   font-weight: 600;
   line-height: 1;
   white-space: nowrap;
+  cursor: pointer;
+  transition: filter var(--transition);
+}
+.pill-unlocked:hover:not(:disabled) {
+  filter: brightness(1.12);
+}
+.pill-unlocked:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+.pill-unlocked:disabled {
+  opacity: 0.6;
+  cursor: default;
 }
 
 /* --- Main column: [tab strip, app-main] stacked, beside the sidebar --------

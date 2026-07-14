@@ -1488,6 +1488,13 @@ impl Db {
         // both are honestly "unclassified", never guessed. Guarded (`add_column_if_missing`) so an
         // already-migrated DB just gets the new column with existing rows defaulting to NULL.
         Self::add_column_if_missing(conn, "org_items", "source_kind", "TEXT")?;
+        // ADDITIVE: `author_user_id` — the SERVER account id of the item's author, taken straight off the
+        // feed entry (`OrgItemEntry.author_user_id`) at ingest. Lets ANY of the author's own machines
+        // recognise their own item and offer edit-in-place, even one that never had the local `org_shares`
+        // anchor (the machine that first shared it). NULL for rows ingested before this column existed and
+        // for the local-replica upserts done at share/republish time (the next feed sync fills it in;
+        // those machines already edit via their local source). Guarded so a re-migrated DB is a no-op.
+        Self::add_column_if_missing(conn, "org_items", "author_user_id", "TEXT")?;
         // vec0 int8 KNN table (width = EMBED_DIM; compile-time const, no user input). int8 per the
         // scale spike — see the doc comment. Values are inserted via `vec_int8(?)` (a raw i8 blob).
         conn.execute_batch(&format!(
@@ -5370,6 +5377,48 @@ impl Db {
                     created_at: r.get(3)?,
                     rev: r.get::<_, i64>(4)? as u32,
                     markdown: r.get(5)?,
+                    // The DB layer has no session context — the `org_get_item` command computes the real
+                    // value by comparing the stored `author_user_id` with the caller's `server_user_id`.
+                    editable: false,
+                })
+            },
+        )
+        .optional()
+        .map_err(map_err)
+    }
+
+    /// Stamp an org item's `author_user_id` (the server account id of its author, from the feed). Called
+    /// right after `upsert_org_item` at feed-ingest so a second machine can recognise its OWN items and
+    /// offer edit-in-place. Idempotent; a no-op for an unknown id. (2026-07-14.)
+    pub fn set_org_item_author(&self, item_id: &str, author_user_id: &str) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE org_items SET author_user_id = ?2 WHERE item_id = ?1",
+            rusqlite::params![item_id, author_user_id],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// The context the `org_update_own_item` egress command needs to re-publish an edited org item the
+    /// caller authored (org id, current rev, original created_at + source_kind, stored author id). `None`
+    /// for an unknown / tombstoned item. (2026-07-14.)
+    pub fn org_item_edit_ctx(
+        &self,
+        item_id: &str,
+    ) -> Result<Option<crate::storage::models::OrgItemEditCtx>> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT org_id, rev, created_at, source_kind, author_user_id
+               FROM org_items WHERE item_id = ?1 AND tombstoned = 0",
+            rusqlite::params![item_id],
+            |r| {
+                Ok(crate::storage::models::OrgItemEditCtx {
+                    org_id: r.get(0)?,
+                    rev: r.get::<_, i64>(1)? as u32,
+                    created_at: r.get(2)?,
+                    source_kind: r.get::<_, Option<String>>(3)?,
+                    author_user_id: r.get::<_, Option<String>>(4)?,
                 })
             },
         )
@@ -10835,6 +10884,9 @@ fn row_to_note_folder(row: &Row<'_>) -> rusqlite::Result<NoteFolder> {
         path: row.get(2)?,
         parent_id: row.get(3)?,
         locked: row.get::<_, i64>(4)? != 0,
+        // DB-only view: the session-unlock state is not a column. The `list_note_folders` command
+        // fills this in from the live session set; every other reader gets `false` (safe default).
+        unlocked: false,
         kind: row.get::<_, Option<String>>(5)?.unwrap_or_else(|| "note".into()),
     })
 }

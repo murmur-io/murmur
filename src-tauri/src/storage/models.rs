@@ -548,6 +548,26 @@ pub struct OrgItemDetail {
     pub created_at: String,
     pub rev: u32,
     pub markdown: String,
+    /// True when the CALLER authored this item (their `server_user_id` matches the item's stored
+    /// `author_user_id`) — so the viewer can offer edit-in-place on ANY of the author's machines, not
+    /// just the one that first shared it (the origin machine redirects to the local source instead;
+    /// a second machine has no local `org_shares` row, so this server-authoritative author check is
+    /// what unlocks editing there). Computed by the `org_get_item` command (needs the session);
+    /// `Db::get_org_item` always sets it `false`. 2026-07-14.
+    pub editable: bool,
+}
+
+/// Internal (not FE-facing) context the `org_update_own_item` egress command needs to re-publish an
+/// edited org item the caller authored: which org to publish into, the current rev (→ rev+1 supersede),
+/// the original `created_at` + `source_kind` to preserve on the wire, and the stored `author_user_id`
+/// for the ownership gate. Resolved by [`Db::org_item_edit_ctx`] for a LIVE (non-tombstoned) item.
+#[derive(Debug, Clone)]
+pub struct OrgItemEditCtx {
+    pub org_id: String,
+    pub rev: u32,
+    pub created_at: String,
+    pub source_kind: Option<String>,
+    pub author_user_id: Option<String>,
 }
 
 /// Shared Brain v1 — a LIST-row header for one live org item (the browsable org-items list, so a
@@ -670,7 +690,13 @@ pub struct NoteFolder {
     pub name: String,
     pub path: String,
     pub parent_id: Option<String>,
+    /// Sealed (encrypted) on disk — the DB `locked` column.
     pub locked: bool,
+    /// Sealed on disk BUT session-unlocked (decrypted for this session only). Mirrors
+    /// [`FolderNode::unlocked`] — the DB knows nothing about the session, so `row_to_note_folder`
+    /// always sets this `false`; the `list_note_folders` command overwrites it by joining the live
+    /// `AppState::unlocked_folders` set (a sealed folder that is NOT session-unlocked stays `false`).
+    pub unlocked: bool,
     pub kind: String,
 }
 
