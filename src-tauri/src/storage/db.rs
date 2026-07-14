@@ -5977,11 +5977,13 @@ impl Db {
         .map_err(map_err)
     }
 
-    /// Flag an existing (unlocked) note-folder as the reserved root.
+    /// Flag an existing (unlocked) note-folder as the reserved root. The `AND locked = 0` makes
+    /// "is_root ⟹ never sealed" a SQL-enforced invariant even under a concurrent lock race — a locked
+    /// folder can NEVER become the always-open root (lock-security review, 2026-07-14).
     fn set_folder_is_root(&self, id: &str) -> Result<()> {
         let conn = self.lock();
         conn.execute(
-            "UPDATE folders SET is_root = 1 WHERE id = ?1",
+            "UPDATE folders SET is_root = 1 WHERE id = ?1 AND locked = 0",
             rusqlite::params![id],
         )
         .map_err(map_err)?;
@@ -6014,9 +6016,12 @@ impl Db {
             rusqlite::params![id, path, chrono::Utc::now().to_rfc3339()],
         )
         .map_err(map_err)?;
-        // Ensure is_root=1 even if a same-path row pre-existed (the OR IGNORE kept the old one).
+        // Ensure is_root=1 even if a same-path row pre-existed (the OR IGNORE kept the old one). The
+        // `AND locked = 0` keeps the "is_root ⟹ never sealed" invariant under a concurrent race where
+        // a LOCKED folder was created at this path between the free-path check and here.
         conn.execute(
-            "UPDATE folders SET is_root = 1 WHERE path = ?1",
+            "UPDATE folders SET is_root = 1 WHERE path = ?1 AND locked = 0 \
+               AND COALESCE(kind, 'meeting') = 'note'",
             rusqlite::params![path],
         )
         .map_err(map_err)?;
