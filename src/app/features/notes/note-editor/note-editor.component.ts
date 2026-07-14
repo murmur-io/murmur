@@ -1542,8 +1542,14 @@ export class NoteEditorComponent {
       await this.ipc.updateNoteDoc(id, title, body);
       void this.notes.loadNotes(null);
       void this.router.navigate(["/notes", id]);
-    } catch {
-      this.toast.danger("Couldn’t create the note");
+    } catch (e) {
+      // Surface a sealed-folder refusal (`Locked`) plainly, like the main
+      // "New note" action and the share panel — never a bare "couldn't create".
+      this.toast.danger(
+        /locked/i.test(String(e))
+          ? "This folder is locked — unlock it first to add a note."
+          : "Couldn’t create the note",
+      );
     }
   }
 
