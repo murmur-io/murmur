@@ -388,8 +388,16 @@ export class NotesHomeComponent implements OnInit {
     try {
       const id = await this.notes.create(this.activeFolderId(), "Untitled");
       await this.router.navigate(["/notes", id]);
-    } catch {
-      this.toast.danger("Couldn’t create the note. Please try again.");
+    } catch (e) {
+      // A sealed target folder (the selected one, or the default "Notes" folder
+      // if it's locked) refuses the write with a `Locked` AppError. Say WHY —
+      // the old generic "couldn't create" hid the real cause, so a user whose
+      // default folder was locked just saw an unexplained failure (2026-07-14).
+      this.toast.danger(
+        /locked/i.test(String(e))
+          ? "This folder is locked — unlock it first to add a note."
+          : "Couldn’t create the note. Please try again.",
+      );
     } finally {
       this.creating.set(false);
     }
