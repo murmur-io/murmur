@@ -272,6 +272,10 @@ pub struct FolderNode {
     pub locked: bool,
     /// Sealed AND unlocked in the current session (decrypted for view + MCP until relock).
     pub unlocked: bool,
+    /// `"meeting"` or `"note"` — `list_folders` returns EVERY folder (both namespaces share the
+    /// `folders` table, so lock-reactive consumers see all of them), so the FE uses `kind` to render
+    /// ONLY meeting folders in the Meetings tree — a note folder must never leak into it (2026-07-14).
+    pub kind: String,
     pub children: Vec<FolderNode>,
 }
 
@@ -916,7 +920,9 @@ pub struct RecipeRecord {
 #[serde(rename_all = "camelCase")]
 pub struct SavedView {
     pub id: String,
-    /// Which list surface this view targets (currently only `"meetings"`).
+    /// Which list surface this view targets — `"meetings"` or `"notes"` (added 2026-07-14 when
+    /// Saved Views were ported to the Notes surface). The `scope` column partitions the roster so
+    /// each surface lists only its own views.
     pub scope: String,
     pub name: String,
     /// Presentation mode chosen for the view (e.g. `"list"` | `"board"` | `"table"`) — FE-owned.

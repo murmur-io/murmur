@@ -21,16 +21,7 @@ export interface ViewRow {
   doneCount: number;
 }
 
-/** A board column: a group key/label + the rows that fall under it. */
-export interface ViewGroup {
-  /** Stable group key (also the `@for` track key). */
-  key: string;
-  /** Human label for the column header. */
-  label: string;
-  rows: ViewRow[];
-}
-
-/** One selectable field a view can filter / sort / group / show a column by. */
+/** One selectable field a view can filter / sort / show a column by. */
 export interface ViewField {
   readonly id: string;
   readonly label: string;
@@ -58,16 +49,12 @@ export const MEETING_VIEW_FIELDS: readonly ViewField[] = [
   { id: "done", label: "Done actions", type: "number" },
 ];
 
-/** The subset of fields that make sense as a board group axis (low-cardinality). */
-export const MEETING_GROUP_FIELDS: readonly ViewField[] =
-  MEETING_VIEW_FIELDS.filter((f) => f.id === "status" || f.id === "folder");
-
 /**
  * Pure, deterministic view engine. Given the (already-gated) meeting rows, a
  * parsed {@link ViewConfig}, and the action summaries, it returns the
- * filtered+sorted rows (Table) or filtered+sorted+grouped columns (Board). NO
- * IPC, NO signals, NO mutation of the inputs — a plain function so it's trivial
- * to reason about and unit-test.
+ * filtered+sorted rows for a Table view. NO IPC, NO signals, NO mutation of the
+ * inputs — a plain function so it's trivial to reason about and unit-test.
+ * (Board layout was removed 2026-07-14.)
  *
  * It NEVER unmasks: it only reads the fields the backend already disclosed on a
  * `Meeting` (a locked meeting arrives with a masked title "🔒 Locked", null
@@ -100,72 +87,6 @@ export class ViewEngine {
     );
     return sortRows(filtered, config.sort, folderName);
   }
-
-  /**
-   * Build the board columns for a Board view: the same filtered+sorted rows as
-   * {@link rows}, partitioned by `config.groupBy` (a field id). An empty/absent
-   * `groupBy` yields a single "All" column. Group order is stable: for `status`
-   * it follows the canonical status order; otherwise groups appear in first-seen
-   * order, with an "Ungrouped" column last for rows missing the field.
-   */
-  static groups(
-    meetings: readonly Meeting[],
-    config: ViewConfig,
-    summaries: readonly MeetingActionSummary[],
-    folderName: (m: Meeting) => string | null,
-  ): ViewGroup[] {
-    const rows = ViewEngine.rows(meetings, config, summaries, folderName);
-    const groupBy = config.groupBy;
-    if (!groupBy) {
-      return [{ key: "__all__", label: "All", rows }];
-    }
-    const order: string[] = [];
-    const buckets = new Map<string, ViewRow[]>();
-    for (const row of rows) {
-      const key = groupKey(row, groupBy, folderName);
-      let bucket = buckets.get(key);
-      if (!bucket) {
-        bucket = [];
-        buckets.set(key, bucket);
-        order.push(key);
-      }
-      bucket.push(row);
-    }
-    if (groupBy === "status") {
-      order.sort(
-        (a, b) => statusRank(a) - statusRank(b) || (a < b ? -1 : a > b ? 1 : 0),
-      );
-    } else {
-      // Push the "Ungrouped" bucket to the end; keep the rest first-seen.
-      order.sort((a, b) => {
-        if (a === UNGROUPED_KEY) return 1;
-        if (b === UNGROUPED_KEY) return -1;
-        return 0;
-      });
-    }
-    return order.map((key) => ({
-      key,
-      label: groupLabel(key, groupBy),
-      rows: buckets.get(key) ?? [],
-    }));
-  }
-}
-
-const UNGROUPED_KEY = "__ungrouped__";
-
-/** Canonical status ordering for a status-grouped board. */
-const STATUS_ORDER = [
-  "DRAFT",
-  "RECORDING",
-  "TRANSCRIBED",
-  "SUMMARIZED",
-  "EXPORTED",
-  "ERROR",
-];
-
-function statusRank(status: string): number {
-  const i = STATUS_ORDER.indexOf(status);
-  return i === -1 ? STATUS_ORDER.length : i;
 }
 
 function summaryMap(
@@ -288,28 +209,4 @@ function compareValues(
   const sa = String(a).toLowerCase();
   const sb = String(b).toLowerCase();
   return sa < sb ? -1 : sa > sb ? 1 : 0;
-}
-
-/** The bucket key for a row under a groupBy field. */
-function groupKey(
-  row: ViewRow,
-  groupBy: string,
-  folderName: (m: Meeting) => string | null,
-): string {
-  const v = fieldValue(row, groupBy, folderName);
-  if (v === null || v === "") {
-    return UNGROUPED_KEY;
-  }
-  return String(v);
-}
-
-/** The human label for a group column. */
-function groupLabel(key: string, groupBy: string): string {
-  if (key === UNGROUPED_KEY) {
-    return groupBy === "folder" ? "No folder" : "Ungrouped";
-  }
-  if (groupBy === "status") {
-    return key.charAt(0) + key.slice(1).toLowerCase();
-  }
-  return key;
 }

@@ -7038,6 +7038,27 @@ impl Db {
         Ok(out)
     }
 
+    /// Every folder's `kind` (`"meeting"` | `"note"`), keyed by id — so the FE can render ONLY meeting
+    /// folders in the Meetings tree (note folders share the `folders` table and would otherwise leak
+    /// into it). Legacy rows with a NULL kind default to `"meeting"`. (2026-07-14.)
+    pub fn folder_kinds(&self) -> Result<std::collections::HashMap<String, String>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare("SELECT id, COALESCE(kind, 'meeting') FROM folders")
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })
+            .map_err(map_err)?;
+        let mut out = std::collections::HashMap::new();
+        for r in rows {
+            let (id, kind) = r.map_err(map_err)?;
+            out.insert(id, kind);
+        }
+        Ok(out)
+    }
+
     pub fn folder_by_id(&self, id: &str) -> Result<Option<Folder>> {
         let conn = self.lock();
         conn.query_row(

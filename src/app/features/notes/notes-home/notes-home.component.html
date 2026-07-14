@@ -6,17 +6,6 @@
     <header class="content-head">
       <h2 class="content-title">{{ listHeading() }}</h2>
       <div class="content-actions">
-        <!-- List / Table / Board switcher — only when the active folder has a
-             typed-property schema (Feature C). Persisted per-folder. -->
-        @if (typedViewsAvailable()) {
-          <mur-segmented
-            class="view-switcher"
-            [options]="viewModeOptions"
-            [value]="viewMode()"
-            (valueChange)="setViewMode($event)"
-            ariaLabel="Note view"
-          />
-        }
         <button
           type="button"
           class="btn btn-ghost organize-btn"
@@ -47,6 +36,17 @@
         </button>
       </div>
     </header>
+
+    <!-- Saved-views switcher — the Notes twin of the Meetings one (ported
+         2026-07-14). "List" default + saved Table views (filter/sort). Shown for
+         the note-folder / All-notes scope only (not an org replica list, not a
+         locked folder). When no view is active the list below is unchanged. -->
+    @if (activeOrgId() === null && !activeFolderLocked()) {
+      <app-notes-view-switcher
+        class="views-switcher"
+        (changed)="onViewChanged()"
+      />
+    }
 
     <!-- ===== Shared brains (orgs) — read-only replicated org notes =====
          A content-pane chip row (orgs aren't note-folders, so they don't live
@@ -127,12 +127,6 @@
             </button>
           }
         </div>
-      } @else if (viewMode() === "table") {
-        <!-- Typed TABLE view (Feature C) — one column per folder-schema field. -->
-        <app-notes-table-view [rows]="typedRows()" [schema]="folderSchema()" />
-      } @else if (viewMode() === "board") {
-        <!-- Typed BOARD view (Feature C) — grouped by the first Select field. -->
-        <app-notes-board-view [rows]="typedRows()" [schema]="folderSchema()" />
       } @else if (listEmpty() && (loading() || orgsLoading())) {
         <!-- Stale-while-revalidate: only gate on loading when there is NOTHING
              cached to show yet (e.g. the very first visit). Once listItems()
@@ -167,6 +161,16 @@
             </button>
           </div>
         }
+      } @else if (viewEmpty()) {
+        <!-- An active saved view's filter matched nothing (the raw list has
+             rows, but none pass) — distinct from the "no notes yet" state. -->
+        <div class="empty-state">
+          <h3 class="empty-title">No notes match this view</h3>
+          <p class="empty-body">
+            No notes match this view’s filters. Adjust the filters, or switch back
+            to List.
+          </p>
+        </div>
       } @else {
         <!-- Notion/database-style TABLE (2026-07-12: replaced the card grid,
              then extracted into <mur-table> — a real Design System component,
@@ -175,8 +179,9 @@
              Spans the FULL available content width (`.app-main` is uncapped
              on every main route now — styles.css) instead of a narrow
              reading column: this view is a dense list to scan, not
-             prose. -->
-        <mur-table [rows]="listItems()" [trackBy]="trackByItemId" [rowClass]="rowClassFor">
+             prose. Rows are `viewItems()` = `listItems()` filtered/sorted by
+             the active saved view (List default = unchanged). -->
+        <mur-table [rows]="viewItems()" [trackBy]="trackByItemId" [rowClass]="rowClassFor">
           <mur-table-column key="title" header="Title">
             <ng-template let-row>
               @switch (row.kind) {
