@@ -232,6 +232,8 @@ fn tool_label(call: &ToolCall) -> &'static str {
         // Shared Brain — org search is an EXPLICIT interactive tool, never auto-planned into note
         // generation (`map_to_tool_call` doesn't map it), so this label is only for completeness.
         ToolCall::OrgBrainSearch { .. } => "Org brain",
+        // Feature C — typed note-folder database query (explicit tool; label for completeness).
+        ToolCall::QueryDatabase { .. } => "Note database",
     }
 }
 

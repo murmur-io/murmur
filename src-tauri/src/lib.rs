@@ -345,6 +345,10 @@ pub fn run() {
             commands::rename_note_folder,
             commands::delete_note_folder,
             commands::move_note_folder,
+            // Feature C — typed note front-matter properties (note-folder schemas + Table/Board).
+            commands::get_note_folder_schema,
+            commands::set_note_folder_schema,
+            commands::list_notes_typed,
             // Notes — selection Brain-assistant (WP4) + auto-organize (WP5) + link sharing (WP6).
             commands::note_assistant_action,
             commands::plan_organize_notes,
