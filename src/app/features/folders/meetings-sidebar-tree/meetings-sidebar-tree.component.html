@@ -1,22 +1,9 @@
-@if (folders.unlockedCount() > 0) {
-  <button
-    type="button"
-    class="relock-pill"
-    [disabled]="relockingAll()"
-    [attr.aria-label]="
-      'Re-seal all ' + folders.unlockedCount() + ' unlocked folders now'
-    "
-    title="Re-seal every unlocked folder now"
-    (click)="relockAll()"
-  >
-    <svg viewBox="0 0 16 16" width="12" height="12" fill="none" aria-hidden="true">
-      <rect x="3.5" y="7" width="9" height="6" rx="1.4" stroke="currentColor" stroke-width="1.4" />
-      <path d="M5.5 7V5.4a2.5 2.5 0 0 1 5 0V7" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" />
-    </svg>
-    Lock all
-  </button>
-}
-
+<!-- The "Lock all" pill that used to sit here was REMOVED (2026-07-14, sidebar
+     declutter): it was one of three concurrent accent privacy signals (this
+     pill + the footer "N unlocked" pill + every folder row's lock glyph) all
+     firing for the ONE fact "a folder is decrypted right now". "Lock all" now
+     lives as the single footer button (see AppShellComponent) — one accent
+     focal point, and it doubles as the status indicator. -->
 @if (folders.loading()) {
   <p class="tree-state">Loading folders…</p>
 } @else {

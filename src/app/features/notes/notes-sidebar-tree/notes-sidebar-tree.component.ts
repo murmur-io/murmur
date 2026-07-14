@@ -14,7 +14,10 @@ import type { NoteFolder } from "../../../core/models";
 import { MurTreeRowComponent } from "../../../design-system/tree-row/tree-row.component";
 import { MurRowMenuComponent } from "../../../design-system/row-menu/row-menu.component";
 import { FolderLockFlowService } from "../../../services/folder-lock-flow.service";
-import { FoldersService } from "../../../services/folders.service";
+import {
+  FoldersService,
+  type FolderExposure,
+} from "../../../services/folders.service";
 import { NotesService } from "../../../services/notes.service";
 import { ToastService } from "../../../services/toast.service";
 
@@ -88,6 +91,21 @@ export class NotesSidebarTreeComponent {
 
   /** Id of the folder whose lock/unlock op is in flight. */
   readonly lockBusyId = signal<string | null>(null);
+
+  /**
+   * A note-folder's three-state privacy exposure (open / locked / session),
+   * derived from its lock flags — same model the Meetings tree uses. `session`
+   * (sealed on disk but decrypted for this session) is the only state that stays
+   * glanceable + accent-tinted; open/locked are quiet. Needs `NoteFolder.unlocked`
+   * (2026-07-14) — before that this tree only knew locked/open and could never
+   * show that a folder was session-unlocked.
+   */
+  exposureOf(folder: NoteFolder): FolderExposure {
+    if (!folder.locked) {
+      return "open";
+    }
+    return folder.unlocked ? "session" : "locked";
+  }
 
   // --- New-folder inline create -------------------------------------------
   readonly creatingFolder = signal(false);
@@ -237,6 +255,27 @@ export class NotesSidebarTreeComponent {
     } catch {
       // A cancelled/denied Touch ID prompt — stay masked, no scary toast.
       this.toast.danger("Couldn’t unlock this folder.");
+    } finally {
+      this.lockBusyId.set(null);
+    }
+  }
+
+  /**
+   * Re-seal a session-unlocked note-folder right now (drops the decrypted
+   * plaintext for this session; the `.enc`/blobs stay). Mirrors the Meetings
+   * tree's per-row re-seal — the action behind the `session` exposure state.
+   */
+  async relockFolder(folder: NoteFolder, event: Event): Promise<void> {
+    event.stopPropagation();
+    if (this.lockBusyId() !== null) {
+      return;
+    }
+    this.lockBusyId.set(folder.id);
+    try {
+      await this.folders.relock(folder.id);
+      await this.refreshAfterLockChange();
+    } catch {
+      this.toast.danger("Couldn’t re-seal this folder. Please try again.");
     } finally {
       this.lockBusyId.set(null);
     }

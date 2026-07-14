@@ -272,8 +272,17 @@ export class NotesHomeComponent implements OnInit {
     () => this.activeOrg()?.name ?? this.activeFolder()?.name ?? "All notes",
   );
 
-  /** True when the active folder is sealed (drives the locked-folder banner). */
-  readonly activeFolderLocked = computed(() => !!this.activeFolder()?.locked);
+  /**
+   * True when the active folder is sealed AND not session-unlocked (drives the
+   * locked-folder gate). Gating on `locked && !unlocked` — not `locked` alone —
+   * is what makes "Unlock folder" actually lift the gate: a session-unlock never
+   * flips the DB `locked` column, only the session `unlocked` flag, so the old
+   * `!!locked` check kept the gate up forever after unlocking (2026-07-14 fix).
+   */
+  readonly activeFolderLocked = computed(() => {
+    const f = this.activeFolder();
+    return !!f?.locked && !f?.unlocked;
+  });
 
   // --- Per-note "Move to…" popover ----------------------------------------
   /** The note id whose move popover is open (null = none). */

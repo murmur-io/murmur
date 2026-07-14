@@ -336,8 +336,18 @@ export class AppShellComponent {
   /** Whether the ⌘K quick-search spotlight is open. */
   readonly searchOpen = signal(false);
 
-  /** How many locked folders are unlocked (plaintext-exposed) this session. */
+  /**
+   * How many locked folders are unlocked (plaintext-exposed) this session —
+   * drives the footer "N unlocked · Lock all" button. `FoldersService`'s tree
+   * comes from `list_folders`, which returns EVERY folder (meeting AND note —
+   * no `kind` filter in the SQL), each with its session `unlocked` flag, so this
+   * one count already covers both trees. (Do NOT add `NotesService`'s note-folder
+   * count on top — note folders are already in this tree, so that double-counts.)
+   */
   readonly unlockedCount = this.folders.unlockedCount;
+
+  /** True while the footer "Lock all" re-seal is in flight (guards double-clicks). */
+  readonly relockingAll = signal(false);
 
   /** The app-wide toast queue, rendered in the main-window viewport. */
   readonly toasts = this.toast.toasts;
@@ -503,6 +513,30 @@ export class AppShellComponent {
   newNote(): void {
     this.searchOpen.set(false);
     void this.router.navigate(["/notes/new"]);
+  }
+
+  /**
+   * The footer "N unlocked · Lock all" button (2026-07-14): re-seal EVERY
+   * session-unlocked folder now and zeroize the cached key — the sidebar's
+   * single privacy action (the former top-of-tree "Lock all" pill was removed).
+   * `FoldersService.relockAll` reloads the meetings tree; we then reload the
+   * Notes tree too so a re-sealed note-folder's per-row state updates as well
+   * (the backend `relock_all` re-seals both — folder ids share one session set).
+   */
+  async relockAll(): Promise<void> {
+    if (this.relockingAll()) {
+      return;
+    }
+    this.relockingAll.set(true);
+    try {
+      await this.folders.relockAll();
+      await this.notesService.loadFolders();
+      this.toast.success("All folders re-sealed");
+    } catch {
+      this.toast.danger("Couldn’t re-seal folders. Please try again.");
+    } finally {
+      this.relockingAll.set(false);
+    }
   }
 
   /**
