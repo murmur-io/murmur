@@ -2,7 +2,7 @@
      consolidation — this component projects into it, see AppShellComponent).
      This template owns only the note-FOLDER list below it. -->
 <nav class="notes-tree" aria-label="Note folders">
-  @for (folder of noteFolders(); track folder.id) {
+  @for (folder of visibleFolders(); track folder.id) {
     @if (renamingId() === folder.id) {
       <form class="tree-edit" (submit)="confirmRename(folder.id, $event)">
         <input

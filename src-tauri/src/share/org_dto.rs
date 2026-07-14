@@ -87,6 +87,10 @@ pub struct OrgMemberEntry {
     pub user_id: String,
     pub role: String,
     pub created_at: String,
+    /// The member's email, when the server discloses it (2026-07-14). `#[serde(default)]` keeps an
+    /// older server (which omits the field) deserializing cleanly — the FE then falls back to the id.
+    #[serde(default)]
+    pub email: Option<String>,
 }
 
 #[derive(Deserialize, Clone, Debug)]

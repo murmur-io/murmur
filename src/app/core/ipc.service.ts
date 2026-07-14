@@ -1891,6 +1891,16 @@ export class IpcService {
   }
 
   /**
+   * Auto-title an "Untitled" note from its body — the on-device model when present,
+   * else a first-line heuristic. LOCAL-ONLY (never egresses). No-ops (returns the
+   * current title) when the note already has a title, is empty, or sits in a locked
+   * folder. Returns the resulting title. Called fire-and-forget when the editor closes.
+   */
+  suggestNoteTitle(noteId: string): Promise<string> {
+    return invoke<string>("suggest_note_title", { noteId });
+  }
+
+  /**
    * Read ONE note in full for the editor. GATED: a sealed-and-not-session-unlocked
    * note returns a MASKED {@link NoteDoc} (`locked: true`, title "🔒 Locked", empty
    * markdown/tags/properties) — render the lock gate, not the body.

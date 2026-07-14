@@ -4,6 +4,7 @@ import {
   ElementRef,
   Injector,
   afterNextRender,
+  computed,
   inject,
   input,
   signal,
@@ -74,6 +75,16 @@ export class NotesSidebarTreeComponent {
 
   /** The note-kind folder list. */
   readonly noteFolders = this.notes.noteFolders;
+
+  /**
+   * The folders the tree RENDERS — everything except the reserved always-open
+   * root (2026-07-14): the root IS the "Notes" section itself (where unfiled new
+   * notes live), so showing it as a nested "Notes" row would just re-create the
+   * confusing "Notes-inside-Notes" redundancy the root was introduced to kill.
+   */
+  readonly visibleFolders = computed(() =>
+    this.noteFolders().filter((f) => !f.isRoot),
+  );
   /** The shared active-folder selection (null = "All notes"). */
   readonly activeFolderId = this.notes.activeFolderId;
 

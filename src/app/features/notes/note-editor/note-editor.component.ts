@@ -292,9 +292,20 @@ export class NoteEditorComponent {
     return this.noteFolders().find((f) => f.id === id) ?? null;
   });
 
-  /** Human breadcrumb: the folder's display path (Notes/… ) or "Notes". */
+  /**
+   * True when this note lives in the reserved always-open root — it's "unfiled"
+   * and therefore NOT sealable (unfiled notes are deliberately open plaintext;
+   * sealing requires filing into a lockable folder). Drives the breadcrumb label
+   * + the "not sealed" privacy hint (2026-07-14).
+   */
+  readonly isUnfiled = computed(() => this.currentFolder()?.isRoot ?? false);
+
+  /** Human breadcrumb: "Unfiled" for a root note, else the folder's name (or "Notes"). */
   readonly breadcrumb = computed(() => {
     const folder = this.currentFolder();
+    if (folder?.isRoot) {
+      return "Unfiled";
+    }
     return folder ? folder.name : "Notes";
   });
 
@@ -439,6 +450,10 @@ export class NoteEditorComponent {
       if (this.dirtyFull) {
         this.flushFull();
       }
+      // Auto-title an untitled note on close (Feature B) — fire-and-forget; the backend reads the
+      // last-saved body (cheap autosaves already persisted it), generates a LOCAL title, and keeps it
+      // only if the note is still "Untitled". Best-effort, never blocks teardown.
+      this.maybeAutoTitle();
     });
 
     // LOCK-REACTIVE re-mask — a ROOT effect via the EnvironmentInjector, NOT a
@@ -461,6 +476,37 @@ export class NoteEditorComponent {
       { injector: this.envInjector },
     );
     this.destroyRef.onDestroy(() => lockEffectRef.destroy());
+  }
+
+  /**
+   * Feature B — on close, ask the backend to auto-title a still-"Untitled" note from its body (the
+   * on-device model when present, else a first-line heuristic; LOCAL-only). Fire-and-forget: the
+   * editor is being torn down, so we only reflect the new title back onto the (persisting) tab strip
+   * when it resolves. Skips a locked/masked note and an empty body up front (the backend re-checks).
+   */
+  private maybeAutoTitle(): void {
+    const doc = this.note();
+    if (!doc || doc.locked) {
+      return;
+    }
+    const t = this.title().trim();
+    if (t !== "" && t.toLowerCase() !== "untitled") {
+      return; // the note already has a real title — never overwrite it
+    }
+    if (this.body().trim() === "") {
+      return; // nothing to title
+    }
+    const id = doc.id;
+    void this.ipc
+      .suggestNoteTitle(id)
+      .then((title) => {
+        if (title && title.toLowerCase() !== "untitled") {
+          this.tabsService.setTitle(tabKeyFor("note", id), title);
+        }
+      })
+      .catch(() => {
+        /* best-effort: an auto-title failure never surfaces */
+      });
   }
 
   /**
