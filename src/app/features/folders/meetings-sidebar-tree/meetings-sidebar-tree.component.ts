@@ -4,7 +4,6 @@ import {
   computed,
   inject,
   input,
-  signal,
   viewChild,
 } from "@angular/core";
 import { Router } from "@angular/router";
@@ -43,9 +42,6 @@ export class MeetingsSidebarTreeComponent {
 
   /** Shared folder store (tree data + the lock lifecycle FolderTreeComponent drives). */
   readonly folders = inject(FoldersService);
-
-  /** True while a "Lock all" op is in flight. */
-  readonly relockingAll = signal(false);
 
   /**
    * True while `/library`/`/meeting/:id` is the CURRENT route (bound from
@@ -132,22 +128,6 @@ export class MeetingsSidebarTreeComponent {
       this.toast.success(`Moved to ${name}`);
     } catch {
       this.toast.danger("Couldn’t move this note. Please try again.");
-    }
-  }
-
-  /** Re-seal every session-unlocked folder at once (privacy "panic" affordance). */
-  async relockAll(): Promise<void> {
-    if (this.relockingAll()) {
-      return;
-    }
-    this.relockingAll.set(true);
-    try {
-      await this.folders.relockAll();
-      this.toast.success("All folders re-sealed");
-    } catch {
-      this.toast.danger("Couldn’t re-seal folders. Please try again.");
-    } finally {
-      this.relockingAll.set(false);
     }
   }
 }

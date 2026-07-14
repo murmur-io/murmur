@@ -67,6 +67,54 @@ mur-tree-row:focus-within .tree-actions {
   cursor: default;
 }
 
+/* The ONE per-row lock control (2026-07-14) — same box as `.tree-act` but it
+   lives OUTSIDE the hover-only cluster so locked/session stay glanceable.
+   `open` is hover-revealed (quiet); `locked` is always-visible grey; `session`
+   is always-visible accent (the one "plaintext exposed" cue on the row). */
+.tree-lock {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 21px;
+  height: 21px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  opacity: 0;
+  transition:
+    opacity var(--transition-fast),
+    background var(--transition-fast),
+    color var(--transition-fast);
+}
+mur-tree-row:hover .tree-lock,
+mur-tree-row:focus-within .tree-lock {
+  opacity: 1;
+}
+.tree-lock.is-locked {
+  opacity: 1;
+  color: var(--text-secondary);
+}
+.tree-lock.is-session {
+  opacity: 1;
+  color: var(--accent-hover);
+}
+.tree-lock:hover:not(:disabled) {
+  background: var(--surface-raised);
+  color: var(--text-primary);
+}
+.tree-lock:focus-visible {
+  outline: none;
+  opacity: 1;
+  box-shadow: 0 0 0 2px var(--accent-ring);
+}
+.tree-lock:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
 /* Inline folder create / rename field + delete confirm. Polish pass
    (2026-07-12, live-found "looks bad" feedback): the original cramped every
    element to `--space-1` (4px) padding, so the input read as squashed next
