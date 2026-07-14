@@ -8,6 +8,7 @@ import type {
   Analytics,
   AppConfigDto,
   BacklinkSource,
+  WikiTarget,
   SourceKind,
   ContextHit,
   MyShareEntry,
@@ -1072,6 +1073,15 @@ export class IpcService {
     targetId: string,
   ): Promise<BacklinkSource[]> {
     return invoke<BacklinkSource[]>("get_backlinks", { targetKind, targetId });
+  }
+
+  /**
+   * Resolve a clicked `[[Title]]` wikilink to the VISIBLE note/meeting to navigate to,
+   * or `null` when nothing matches / the only match is sealed-and-not-session-unlocked
+   * (gated server-side). The caller routes on `kind` or offers to create a note.
+   */
+  resolveWikilink(title: string): Promise<WikiTarget | null> {
+    return invoke<WikiTarget | null>("resolve_wikilink", { title });
   }
 
   /**
