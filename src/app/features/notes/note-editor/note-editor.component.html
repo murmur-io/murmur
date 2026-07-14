@@ -317,18 +317,76 @@
                   </div>
                 </div>
 
-                <!-- Custom properties -->
+                <!-- Custom properties — SCHEMA-DRIVEN widget per row (Feature C).
+                     The underlying value is always the raw front-matter STRING;
+                     each widget coerces on read + writes a canonical string back,
+                     so serializeDoc's byte-exact round-trip is untouched. -->
                 @for (row of propertyRows(); track row.key) {
                   <div class="prop-row">
                     <span class="prop-key">{{ row.key }}</span>
-                    <input
-                      type="text"
-                      class="prop-input prop-value"
-                      [value]="row.value"
-                      [attr.aria-label]="row.key + ' value'"
-                      (input)="editProp(row.key, $event)"
-                      (blur)="onBlur()"
-                    />
+                    @switch (row.kind) {
+                      @case ("checkbox") {
+                        <span class="prop-value prop-value-toggle">
+                          <mur-toggle
+                            [ngModel]="checkboxValue(row.value)"
+                            (ngModelChange)="setCheckboxProp(row.key, $event)"
+                            [ariaLabel]="row.key + ' value'"
+                          />
+                        </span>
+                      }
+                      @case ("date") {
+                        <input
+                          type="date"
+                          class="prop-input prop-value"
+                          [value]="row.value"
+                          [attr.aria-label]="row.key + ' value'"
+                          (input)="editProp(row.key, row.kind, $event)"
+                          (blur)="onBlur()"
+                        />
+                      }
+                      @case ("number") {
+                        <input
+                          type="number"
+                          class="prop-input prop-value"
+                          [value]="row.value"
+                          [attr.aria-label]="row.key + ' value'"
+                          (input)="editProp(row.key, row.kind, $event)"
+                          (blur)="onBlur()"
+                        />
+                      }
+                      @case ("select") {
+                        <!-- OPAQUE dropdown (T3): the global <select> options paint
+                             var(--surface-overlay). An out-of-schema value is kept
+                             as an extra option so a passthrough value is never lost.
+                             `[selected]` on the option (not `[value]` on the select)
+                             so the current value is picked reliably even though the
+                             options render via @for (a bare `[value]` on <select>
+                             resets to "" when its option isn't in the DOM yet). -->
+                        <select
+                          class="prop-input prop-value prop-select"
+                          [attr.aria-label]="row.key + ' value'"
+                          (change)="editProp(row.key, row.kind, $event)"
+                        >
+                          <option value="" [selected]="row.value === ''">—</option>
+                          @if (selectValueIsOffSchema(row.value, row.options)) {
+                            <option [value]="row.value" [selected]="true">{{ row.value }}</option>
+                          }
+                          @for (opt of row.options; track opt) {
+                            <option [value]="opt" [selected]="opt === row.value">{{ opt }}</option>
+                          }
+                        </select>
+                      }
+                      @default {
+                        <input
+                          type="text"
+                          class="prop-input prop-value"
+                          [value]="row.value"
+                          [attr.aria-label]="row.key + ' value'"
+                          (input)="editProp(row.key, row.kind, $event)"
+                          (blur)="onBlur()"
+                        />
+                      }
+                    }
                     <button
                       type="button"
                       class="prop-remove"
@@ -340,46 +398,80 @@
                   </div>
                 }
 
-                <!-- Add property -->
+                <!-- Add property — the folder schema's DEFINED keys first (with a
+                     kind badge), then a "New property" escape hatch that prompts a
+                     kind + persists it to the folder schema. -->
                 @if (addingProp()) {
-                  <div class="prop-row prop-add">
-                    <input
-                      type="text"
-                      class="prop-input prop-add-key"
-                      placeholder="key"
-                      aria-label="Property key"
-                      [value]="propKeyDraft()"
-                      (input)="onPropKeyInput($event)"
-                    />
-                    <input
-                      type="text"
-                      class="prop-input prop-value"
-                      placeholder="value"
-                      aria-label="Property value"
-                      [value]="propValDraft()"
-                      (input)="onPropValInput($event)"
-                      (keydown.enter)="commitProp()"
-                    />
-                    <button type="button" class="btn btn-ghost prop-add-btn" (click)="commitProp()">
-                      Add
-                    </button>
-                    <button type="button" class="prop-remove" (click)="cancelAddProp()" aria-label="Cancel">
-                      ×
-                    </button>
+                  <div class="prop-add-panel">
+                    @if (definingProp()) {
+                      <!-- New-property sub-form: key + kind, persisted to the schema. -->
+                      <div class="prop-row prop-add">
+                        <input
+                          type="text"
+                          class="prop-input prop-add-key"
+                          placeholder="property name"
+                          aria-label="New property name"
+                          [value]="propKeyDraft()"
+                          (input)="onPropKeyInput($event)"
+                          (keydown.enter)="createSchemaProperty()"
+                        />
+                        <select
+                          class="prop-input prop-add-kind prop-select"
+                          aria-label="New property type"
+                          [value]="propKindDraft()"
+                          (change)="onPropKindInput($event)"
+                        >
+                          @for (k of propertyKindOptions; track k.kind) {
+                            <option [value]="k.kind">{{ k.label }}</option>
+                          }
+                        </select>
+                        <button type="button" class="btn btn-ghost prop-add-btn" (click)="createSchemaProperty()">
+                          Add
+                        </button>
+                        <button type="button" class="prop-remove" (click)="cancelAddProp()" aria-label="Cancel">
+                          ×
+                        </button>
+                      </div>
+                    } @else {
+                      <div class="menu prop-add-menu" role="menu" aria-label="Add property">
+                        @if (unusedSchemaFields().length > 0) {
+                          <p class="menu-group-label">Folder properties</p>
+                          @for (field of unusedSchemaFields(); track field.key) {
+                            <button
+                              type="button"
+                              class="menu-item prop-schema-item"
+                              role="menuitem"
+                              (click)="addSchemaProp(field)"
+                            >
+                              <span class="prop-schema-key">{{ field.key }}</span>
+                              <span class="pill prop-kind-badge">{{ field.kind }}</span>
+                            </button>
+                          }
+                          <div class="menu-group"></div>
+                        }
+                        <button
+                          type="button"
+                          class="menu-item prop-new-item"
+                          role="menuitem"
+                          (click)="startDefineProp()"
+                        >
+                          + New property…
+                        </button>
+                        <button
+                          type="button"
+                          class="menu-item prop-cancel-item"
+                          role="menuitem"
+                          (click)="cancelAddProp()"
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    }
                   </div>
                 } @else {
                   <div class="prop-add-row">
                     <button type="button" class="prop-add-chip" (click)="startAddProp()">
                       + Add property
-                    </button>
-                    <button type="button" class="prop-add-chip is-quiet" (click)="addPropPreset('status')">
-                      status
-                    </button>
-                    <button type="button" class="prop-add-chip is-quiet" (click)="addPropPreset('date')">
-                      date
-                    </button>
-                    <button type="button" class="prop-add-chip is-quiet" (click)="addPropPreset('aliases')">
-                      aliases
                     </button>
                   </div>
                 }

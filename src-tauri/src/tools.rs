@@ -65,7 +65,7 @@ impl AssistantScope {
     /// and the connector tools are partitioned here; `propose_note` / write tools are governed by the
     /// surface flags, not the tier, so they are allowed through the tier gate and left to those flags.
     fn allows(self, tool: &str) -> bool {
-        const VAULT_READS: [&str; 7] = [
+        const VAULT_READS: [&str; 8] = [
             "search_meetings",
             "search_semantic",
             "get_meeting",
@@ -73,6 +73,8 @@ impl AssistantScope {
             "list_recent_meetings",
             "get_open_commitments",
             "get_entity_dossier",
+            // Feature C — the typed note-folder database query (an owned-vault read, egress-free).
+            "query_database",
         ];
         const CONNECTORS: [&str; 5] = [
             "web_search",
@@ -175,6 +177,13 @@ pub enum ToolCall {
     /// ([`neutralize_murmur_fences`]) before entering the loop, and NEVER injected into a system
     /// prompt.
     OrgBrainSearch { query: String },
+    /// Feature C — QUERY a note-folder's TYPED front-matter properties (the Table/Board substrate) as
+    /// a structured database. EGRESS-FREE: reads the LOCAL typed rows through the gated
+    /// [`Db::list_notes_visible_typed`] (a sealed-and-not-session-unlocked folder yields NO rows), then
+    /// applies a DETERMINISTIC, RUST-parsed filter grammar (`key op value`, `AND`/`OR`) — NEVER a second
+    /// LLM call, so there is no prompt-injection surface and nothing egresses. An unparseable filter
+    /// degrades to "no rows matched (could not parse)", NEVER all rows.
+    QueryDatabase { folder: String, filter: String },
 }
 
 /// Model-facing description of one tool the agentic brain may call. `parameters` is a JSON-schema
@@ -310,6 +319,27 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                           'what does the team / someone else know / decide about X' questions that \
                           your own vault can't answer.".into(),
             parameters: str_arg("query", "What to look for in the shared org brain, in the user's own language."),
+            write: false,
+        },
+        ToolSpec {
+            name: "query_database".into(),
+            description: "Query the TYPED PROPERTIES of the notes in a note-folder as a small \
+                          database (the folder's Table/Board columns: status, owner, due date, \
+                          priority, etc.). Give the folder NAME (or id) and a filter. The filter is a \
+                          simple grammar: 'key op value' clauses joined by AND / OR, where op is one \
+                          of = != > < >= <= or 'contains' (e.g. 'status=Done', 'openItems>3', \
+                          'owner contains ann', 'status=Open AND priority=High'). Leave the filter \
+                          empty to list every row. Use for 'which notes are still open', 'what does \
+                          Anna own', 'high-priority items' questions over a note-folder's columns."
+                .into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "folder": { "type": "string", "description": "The note-folder NAME (or id) to query." },
+                    "filter": { "type": "string", "description": "A 'key op value' filter (AND/OR); empty = all rows." }
+                },
+                "required": ["folder"]
+            }),
             write: false,
         },
         ToolSpec {
@@ -620,6 +650,37 @@ pub fn execute_tool(
             // at ADVERTISEMENT time; a call that reaches here on an unavailable org simply finds an
             // empty partition and returns "no results" (never an error, never a leak).
             search_org_brain(db, config, query)
+        }
+        ToolCall::QueryDatabase { folder, filter } => {
+            // Resolve the note-folder by NAME (case-insensitive) or exact id. Note-folders only, so a
+            // meeting folder can never be queried through here. An unresolvable name is a FRIENDLY
+            // sentinel (never an error) so the model can retry with a different name.
+            let target = match db.note_folder_by_name_or_id(folder) {
+                Ok(Some(f)) => f,
+                Ok(None) => return Ok(format!("No note folder named \"{}\".", folder.trim())),
+                Err(e) => return Err(AppError::Storage(format!("folder resolve failed: {e}"))),
+            };
+            // GATE: the typed rows come from `list_notes_visible_typed`, which is built on the gated
+            // `list_notes_visible` (`visibility_clause` against `unlocked`) — a sealed-and-not-session-
+            // unlocked folder yields NO rows here (never a masked row), so no sealed content can leak.
+            let rows = db
+                .list_notes_visible_typed(&target.id, unlocked)
+                .map_err(|e| AppError::Storage(format!("typed rows read failed: {e}")))?;
+            // DETERMINISTIC, RUST-PARSED filter (no second LLM call → egress-free, no injection
+            // surface). An UNPARSEABLE filter yields ZERO matches (never all rows).
+            let matched = filter_rows(&rows, filter);
+            if matched.is_empty() {
+                // Distinguish "parsed but nothing matched" from "could not parse the filter".
+                let f = filter.trim();
+                if !f.is_empty() && parse_filter(f).is_none() {
+                    return Ok(format!(
+                        "No rows matched in \"{}\" (could not parse the filter).",
+                        target.name
+                    ));
+                }
+                return Ok(format!("No rows matched in \"{}\".", target.name));
+            }
+            Ok(format_typed_rows(&target.name, &matched))
         }
     }
 }
@@ -1046,6 +1107,274 @@ fn format_commitments(items: &[crate::storage::models::Commitment]) -> String {
         .join("\n")
 }
 
+// ── Feature C — QUERY_DATABASE deterministic filter grammar (Rust-parsed; NEVER a second LLM call) ─
+//
+// The bounded grammar: `key op value` clauses joined by `AND` / `OR` (case-insensitive keywords).
+// `op` ∈ { =, !=, >, <, >=, <=, contains }. This is parsed ENTIRELY in Rust — no model call — so the
+// filter is deterministic, egress-free, and carries no prompt-injection surface. An UNPARSEABLE
+// filter yields `None` (the caller degrades to ZERO matches, never all rows). Comparisons run against
+// the note's TYPED property values (numeric when both sides parse as f64, else case-insensitive
+// string); a missing key never matches.
+
+/// One comparison operator in the filter grammar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FilterOp {
+    Eq,
+    Ne,
+    Gt,
+    Lt,
+    Ge,
+    Le,
+    Contains,
+}
+
+/// One `key op value` clause.
+#[derive(Debug, Clone, PartialEq)]
+struct FilterClause {
+    key: String,
+    op: FilterOp,
+    value: String,
+}
+
+/// How clauses combine. A single clause has no connective; a compound filter is UNIFORM (all `AND`
+/// or all `OR` — mixing is rejected as unparseable, keeping the grammar unambiguous without
+/// precedence rules).
+#[derive(Debug, Clone, PartialEq)]
+enum FilterExpr {
+    Clauses {
+        clauses: Vec<FilterClause>,
+        all: bool, // true = AND (every clause), false = OR (any clause)
+    },
+}
+
+/// Parse a filter string into a [`FilterExpr`], or `None` when it is unparseable (empty, a bad
+/// operator, a missing key/value, or a mix of `AND` and `OR`). Splitting on ` AND `/` OR ` FIRST
+/// (case-insensitive, space-padded so a `key`/`value` containing the substring "and" is safe), then
+/// each clause on its operator.
+fn parse_filter(filter: &str) -> Option<FilterExpr> {
+    let f = filter.trim();
+    if f.is_empty() {
+        return None;
+    }
+    // Detect the connective by scanning for space-padded AND/OR (case-insensitive). Mixed ⇒ reject.
+    let has_and = contains_connective(f, "and");
+    let has_or = contains_connective(f, "or");
+    if has_and && has_or {
+        return None; // ambiguous without precedence — reject.
+    }
+    let all = !has_or; // OR when an OR is present; AND otherwise (single clause is trivially AND).
+    let sep = if has_or { "or" } else { "and" };
+    let parts = split_on_connective(f, sep);
+    let mut clauses = Vec::new();
+    for part in parts {
+        clauses.push(parse_clause(part.trim())?);
+    }
+    if clauses.is_empty() {
+        return None;
+    }
+    Some(FilterExpr::Clauses { clauses, all })
+}
+
+/// Is a space-padded connective keyword (`and`/`or`, case-insensitive) present as a standalone token?
+fn contains_connective(s: &str, kw: &str) -> bool {
+    s.to_ascii_lowercase().contains(&format!(" {kw} "))
+}
+
+/// Split `s` on the space-padded, case-insensitive connective `kw` (` and `/` or `). Returns the
+/// segments (never splitting inside a word — the padding spaces guarantee token boundaries).
+fn split_on_connective(s: &str, kw: &str) -> Vec<String> {
+    let lower = s.to_ascii_lowercase();
+    let pad = format!(" {kw} ");
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut search = 0usize;
+    while let Some(rel) = lower[search..].find(&pad) {
+        let at = search + rel;
+        out.push(s[start..at].to_string());
+        start = at + pad.len();
+        search = start;
+    }
+    out.push(s[start..].to_string());
+    out
+}
+
+/// Parse one `key op value` clause. Tries the multi-char operators FIRST (so `>=` is not read as
+/// `>`), then the word operator `contains`. `None` on any malformed clause.
+fn parse_clause(clause: &str) -> Option<FilterClause> {
+    // Operator table, longest first so `>=`/`<=`/`!=` win over `>`/`<`, and `=` last.
+    for (sym, op) in [
+        (">=", FilterOp::Ge),
+        ("<=", FilterOp::Le),
+        ("!=", FilterOp::Ne),
+        (">", FilterOp::Gt),
+        ("<", FilterOp::Lt),
+        ("=", FilterOp::Eq),
+    ] {
+        if let Some((k, v)) = clause.split_once(sym) {
+            let key = k.trim();
+            let value = v.trim();
+            if key.is_empty() || value.is_empty() {
+                return None;
+            }
+            return Some(FilterClause {
+                key: key.to_string(),
+                op,
+                value: strip_quotes(value).to_string(),
+            });
+        }
+    }
+    // Word operator: `key contains value` (case-insensitive keyword, space-padded).
+    let lower = clause.to_ascii_lowercase();
+    if let Some(rel) = lower.find(" contains ") {
+        let key = clause[..rel].trim();
+        let value = clause[rel + " contains ".len()..].trim();
+        if key.is_empty() || value.is_empty() {
+            return None;
+        }
+        return Some(FilterClause {
+            key: key.to_string(),
+            op: FilterOp::Contains,
+            value: strip_quotes(value).to_string(),
+        });
+    }
+    None
+}
+
+/// Strip one layer of surrounding single or double quotes from a filter value.
+fn strip_quotes(s: &str) -> &str {
+    let s = s.trim();
+    if s.len() >= 2 {
+        let b = s.as_bytes();
+        if (b[0] == b'"' && b[s.len() - 1] == b'"') || (b[0] == b'\'' && b[s.len() - 1] == b'\'') {
+            return &s[1..s.len() - 1];
+        }
+    }
+    s
+}
+
+/// Render one typed property value to a plain string for filter comparison / display. `Checkbox`
+/// renders `true`/`false`; `Number` renders without a trailing `.0` for whole numbers.
+fn property_value_str(v: &crate::storage::models::PropertyValue) -> String {
+    use crate::storage::models::PropertyValue as PV;
+    match v {
+        PV::Text(s) | PV::Select(s) | PV::Date(s) => s.clone(),
+        PV::Checkbox(b) => b.to_string(),
+        PV::Number(n) => {
+            if n.fract() == 0.0 && n.is_finite() {
+                format!("{}", *n as i64)
+            } else {
+                n.to_string()
+            }
+        }
+    }
+}
+
+/// Does one typed note row satisfy `clause`? A missing key never matches. Numeric comparison when
+/// BOTH the row value and the filter value parse as `f64`; otherwise case-insensitive string. The
+/// tag list is queryable via the reserved key `tags` (a `contains`/`=` over the row's tags).
+fn clause_matches(row: &crate::storage::models::TypedNoteRow, clause: &FilterClause) -> bool {
+    // The reserved `tags` key queries the front-matter tag list (any tag satisfies).
+    if clause.key.eq_ignore_ascii_case("tags") {
+        return row.tags.iter().any(|t| {
+            compare(t, &clause.value, clause.op)
+        });
+    }
+    // Otherwise a declared property value (case-insensitive key lookup over the BTreeMap).
+    let Some(val) = row
+        .values
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(&clause.key))
+        .map(|(_, v)| property_value_str(v))
+    else {
+        return false; // missing key never matches.
+    };
+    compare(&val, &clause.value, clause.op)
+}
+
+/// Compare a row's value string against the filter value under `op`. Numeric when both parse as
+/// f64; else case-insensitive string. `contains` is always a substring test.
+fn compare(row_val: &str, filter_val: &str, op: FilterOp) -> bool {
+    if op == FilterOp::Contains {
+        return row_val
+            .to_ascii_lowercase()
+            .contains(&filter_val.to_ascii_lowercase());
+    }
+    if let (Ok(a), Ok(b)) = (row_val.trim().parse::<f64>(), filter_val.trim().parse::<f64>()) {
+        return match op {
+            FilterOp::Eq => a == b,
+            FilterOp::Ne => a != b,
+            FilterOp::Gt => a > b,
+            FilterOp::Lt => a < b,
+            FilterOp::Ge => a >= b,
+            FilterOp::Le => a <= b,
+            FilterOp::Contains => unreachable!(),
+        };
+    }
+    // String comparison (case-insensitive). Ordering ops fall back to lexicographic.
+    let a = row_val.to_ascii_lowercase();
+    let b = filter_val.to_ascii_lowercase();
+    match op {
+        FilterOp::Eq => a == b,
+        FilterOp::Ne => a != b,
+        FilterOp::Gt => a > b,
+        FilterOp::Lt => a < b,
+        FilterOp::Ge => a >= b,
+        FilterOp::Le => a <= b,
+        FilterOp::Contains => unreachable!(),
+    }
+}
+
+/// Feature C — apply the DETERMINISTIC filter grammar to a set of typed rows, returning the matching
+/// rows (in input order). An UNPARSEABLE filter yields ZERO matches — NEVER all rows (the safe
+/// degrade: a filter the model wrote that we cannot parse must not silently return everything). An
+/// EMPTY/whitespace filter returns ALL rows (an explicit "no filter" = list the whole table).
+fn filter_rows<'a>(
+    rows: &'a [crate::storage::models::TypedNoteRow],
+    filter: &str,
+) -> Vec<&'a crate::storage::models::TypedNoteRow> {
+    if filter.trim().is_empty() {
+        return rows.iter().collect(); // no filter ⇒ the whole table.
+    }
+    let Some(FilterExpr::Clauses { clauses, all }) = parse_filter(filter) else {
+        return Vec::new(); // UNPARSEABLE ⇒ zero matches, never all rows.
+    };
+    rows.iter()
+        .filter(|row| {
+            if all {
+                clauses.iter().all(|c| clause_matches(row, c))
+            } else {
+                clauses.iter().any(|c| clause_matches(row, c))
+            }
+        })
+        .collect()
+}
+
+/// Feature C — render matched typed rows into the tool's text payload: a header, then one line per
+/// row: `- [[Title]] · key: value · key: value` (only the row's populated typed values + a `tags:`
+/// suffix when present). Egress-free, plain text; the model cites `[[Title]]`.
+fn format_typed_rows(
+    folder_name: &str,
+    rows: &[&crate::storage::models::TypedNoteRow],
+) -> String {
+    let mut out = format!("{} rows in \"{folder_name}\":", rows.len());
+    for row in rows {
+        let mut parts: Vec<String> = Vec::new();
+        for (k, v) in &row.values {
+            parts.push(format!("{k}: {}", property_value_str(v)));
+        }
+        if !row.tags.is_empty() {
+            parts.push(format!("tags: {}", row.tags.join(", ")));
+        }
+        let suffix = if parts.is_empty() {
+            String::new()
+        } else {
+            format!(" · {}", parts.join(" · "))
+        };
+        out.push_str(&format!("\n- [[{}]]{suffix}", row.title));
+    }
+    out
+}
+
 /// Feature D — render a meeting's transcript segments as a STRUCTURED, one-line-per-segment block:
 /// `[<start_s>–<end_s>] <Speaker>: <text>`. RAW SECONDS (never MM:SS) so a 2h+ meeting can never
 /// wrap/clip a minutes field. Speaker maps the cheap 2-way stream attribution
@@ -1355,6 +1684,18 @@ impl crate::agent::ToolExecutor for GatedToolExecutor<'_> {
                 &unlocked,
                 self.config,
             ),
+            // Feature C — TYPED note-folder database query (owned-vault read, egress-free). Runs
+            // through the SAME gated `execute_tool`; `list_notes_visible_typed` gates every row on the
+            // re-read `unlocked` set, so a sealed-not-unlocked folder yields nothing.
+            "query_database" => execute_tool(
+                &ToolCall::QueryDatabase {
+                    folder: s("folder"),
+                    filter: s("filter"),
+                },
+                self.db,
+                &unlocked,
+                self.config,
+            ),
             // Shared Brain — egress-free LOCAL read of the org partition (the allowlist above already
             // proved it was advertised this turn: Tier 3/Full + org joined + consented). Runs through
             // the synchronous, egress-free `execute_tool`, which provenance-labels + fence-neutralizes
@@ -1549,6 +1890,82 @@ mod tests {
             .build()
             .unwrap()
             .block_on(f)
+    }
+
+    // ── Feature C — query_database filter grammar (Rust-parsed, deterministic) ───────────────────
+
+    fn typed_row(id: &str, title: &str, pairs: &[(&str, crate::storage::models::PropertyValue)]) -> crate::storage::models::TypedNoteRow {
+        crate::storage::models::TypedNoteRow {
+            id: id.into(),
+            title: title.into(),
+            folder_id: "nf".into(),
+            values: pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.clone()))
+                .collect(),
+            tags: Vec::new(),
+            updated_at: 0,
+        }
+    }
+
+    #[test]
+    fn filter_rows_grammar() {
+        use crate::storage::models::PropertyValue as PV;
+        let rows = vec![
+            typed_row(
+                "a",
+                "Alpha",
+                &[
+                    ("status", PV::Select("Done".into())),
+                    ("openItems", PV::Number(5.0)),
+                    ("owner", PV::Text("Anna".into())),
+                ],
+            ),
+            typed_row(
+                "b",
+                "Beta",
+                &[
+                    ("status", PV::Select("Open".into())),
+                    ("openItems", PV::Number(2.0)),
+                    ("owner", PV::Text("Bob".into())),
+                ],
+            ),
+        ];
+        let ids = |v: Vec<&crate::storage::models::TypedNoteRow>| {
+            v.iter().map(|r| r.id.clone()).collect::<Vec<_>>()
+        };
+
+        // status=Done → case-insensitive equality picks Alpha only.
+        assert_eq!(ids(filter_rows(&rows, "status=Done")), vec!["a"]);
+        // openItems>3 → numeric comparison picks Alpha (5) not Beta (2).
+        assert_eq!(ids(filter_rows(&rows, "openItems>3")), vec!["a"]);
+        // owner contains ann → substring, case-insensitive → Anna only.
+        assert_eq!(ids(filter_rows(&rows, "owner contains ann")), vec!["a"]);
+        // A AND B → both clauses must hold.
+        assert_eq!(
+            ids(filter_rows(&rows, "status=Open AND openItems<3")),
+            vec!["b"]
+        );
+        // A OR B → either clause.
+        assert_eq!(
+            ids(filter_rows(&rows, "owner=Anna OR owner=Bob")).len(),
+            2
+        );
+        // Empty filter → ALL rows (explicit "no filter").
+        assert_eq!(ids(filter_rows(&rows, "")).len(), 2);
+        assert_eq!(ids(filter_rows(&rows, "   ")).len(), 2);
+        // UNPARSEABLE filter → ZERO matches, NEVER all rows.
+        assert!(
+            filter_rows(&rows, "this is not a filter").is_empty(),
+            "unparseable filter must match nothing, never all rows"
+        );
+        // Mixed AND/OR is ambiguous → unparseable → zero matches (never all rows).
+        assert!(
+            filter_rows(&rows, "status=Open AND owner=Bob OR owner=Anna").is_empty(),
+            "mixed AND/OR must be rejected as unparseable, not silently return all rows"
+        );
+        // A missing key never matches.
+        assert!(filter_rows(&rows, "nonexistent=x").is_empty());
     }
 
     /// EGRESS GUARD: the synchronous, egress-free `execute_tool` (the MCP surface's only entry) MUST

@@ -6,6 +6,17 @@
     <header class="content-head">
       <h2 class="content-title">{{ listHeading() }}</h2>
       <div class="content-actions">
+        <!-- List / Table / Board switcher — only when the active folder has a
+             typed-property schema (Feature C). Persisted per-folder. -->
+        @if (typedViewsAvailable()) {
+          <mur-segmented
+            class="view-switcher"
+            [options]="viewModeOptions"
+            [value]="viewMode()"
+            (valueChange)="setViewMode($event)"
+            ariaLabel="Note view"
+          />
+        }
         <button
           type="button"
           class="btn btn-ghost organize-btn"
@@ -116,6 +127,12 @@
             </button>
           }
         </div>
+      } @else if (viewMode() === "table") {
+        <!-- Typed TABLE view (Feature C) — one column per folder-schema field. -->
+        <app-notes-table-view [rows]="typedRows()" [schema]="folderSchema()" />
+      } @else if (viewMode() === "board") {
+        <!-- Typed BOARD view (Feature C) — grouped by the first Select field. -->
+        <app-notes-board-view [rows]="typedRows()" [schema]="folderSchema()" />
       } @else if (listEmpty() && (loading() || orgsLoading())) {
         <!-- Stale-while-revalidate: only gate on loading when there is NOTHING
              cached to show yet (e.g. the very first visit). Once listItems()
