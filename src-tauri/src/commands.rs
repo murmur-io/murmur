@@ -2825,7 +2825,22 @@ fn index_note_body_chunks(
 /// List every note-folder (`kind='note'`). Lock state comes through unchanged from `folders.locked`.
 #[tauri::command]
 pub fn list_note_folders(state: State<'_, AppState>) -> Result<Vec<NoteFolder>, AppError> {
-    state.db.list_note_folders()
+    let mut folders = state.db.list_note_folders()?;
+    // Join the live session unlock set so a sealed-but-session-unlocked note folder reports
+    // `unlocked: true` — mirrors `list_folders` for the Meetings tree. Without this the Notes
+    // lock gate reads only the DB `locked` column (which never flips on session-unlock), so
+    // "Unlock folder" appeared to do nothing (the gate never lifted). (2026-07-14 fix.)
+    let unlocked = {
+        state
+            .unlocked_folders
+            .lock()
+            .map_err(|_| AppError::Storage("unlocked-folders mutex poisoned".into()))?
+            .clone()
+    };
+    for f in &mut folders {
+        f.unlocked = f.locked && unlocked.contains(&f.id);
+    }
+    Ok(folders)
 }
 
 /// Create a note-folder (`kind='note'`). `parent_id` must itself be a note-folder (or None = a
@@ -2882,6 +2897,8 @@ pub(crate) fn create_note_folder_inner(
         path: rel_path,
         parent_id: parent_id.map(|s| s.to_string()),
         locked: false,
+        // A freshly created folder is never sealed, so never session-unlocked.
+        unlocked: false,
         kind: "note".into(),
     };
     state
@@ -24167,6 +24184,130 @@ mod lifecycle_tests {
         assert_eq!(other.title, "Ich notatka", "a non-owned title is left as-is");
     }
 
+    /// F-org-editable-any-device storage: `set_org_item_author` stamps the author id and
+    /// `org_item_edit_ctx` reads it back (with org/rev/created_at/source_kind). An item that was never
+    /// stamped reports `author_user_id: None` — the fail-closed default the ownership gate relies on.
+    #[test]
+    fn org_item_edit_ctx_round_trips_author_and_meta() {
+        let state = build_state("org-edit-ctx");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        state
+            .db
+            .upsert_org_item("item-x", "org-1", 3, "anna", "T", "# body", "2026-07-11T09:00:00Z", 2, 1, &[9u8; 32], Some("document"), None)
+            .unwrap();
+
+        // Un-stamped ⇒ author is None (a member could never pass the ownership gate on it).
+        let ctx0 = state.db.org_item_edit_ctx("item-x").unwrap().unwrap();
+        assert_eq!(ctx0.author_user_id, None);
+        assert_eq!(ctx0.org_id, "org-1");
+        assert_eq!(ctx0.rev, 2);
+        assert_eq!(ctx0.created_at, "2026-07-11T09:00:00Z");
+        assert_eq!(ctx0.source_kind.as_deref(), Some("document"));
+
+        // After stamping, the exact author id reads back.
+        state.db.set_org_item_author("item-x", "author-uuid-123").unwrap();
+        let ctx1 = state.db.org_item_edit_ctx("item-x").unwrap().unwrap();
+        assert_eq!(ctx1.author_user_id.as_deref(), Some("author-uuid-123"));
+
+        // A survivor of ON CONFLICT re-upsert (feed re-pull) keeps the author (not in the SET list).
+        state
+            .db
+            .upsert_org_item("item-x", "org-1", 4, "anna", "T2", "# body2", "2026-07-11T09:00:00Z", 3, 1, &[8u8; 32], Some("document"), None)
+            .unwrap();
+        let ctx2 = state.db.org_item_edit_ctx("item-x").unwrap().unwrap();
+        assert_eq!(
+            ctx2.author_user_id.as_deref(),
+            Some("author-uuid-123"),
+            "a re-pull upsert must NOT wipe the stamped author"
+        );
+        assert_eq!(ctx2.rev, 3, "the re-pull DID update rev");
+    }
+
+    /// SECURITY GATE (F-org-editable): `org_update_own_item_inner` refuses to re-publish an item the
+    /// caller did NOT author — it returns `Auth` BEFORE any network egress. Seed a live session whose
+    /// `server_user_id` differs from the item's stamped author; the ownership check (step 0) must reject.
+    #[test]
+    fn org_update_own_item_refuses_a_non_author() {
+        let state = build_state("org-edit-not-author");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        state
+            .db
+            .upsert_org_item("item-theirs", "org-1", 1, "bob", "Bob's note", "# body", "2026-07-11T09:00:00Z", 1, 1, &[7u8; 32], Some("document"), None)
+            .unwrap();
+        // Authored by SOMEONE ELSE.
+        state.db.set_org_item_author("item-theirs", "bob-user-id").unwrap();
+        // Consent ON + a live session for a DIFFERENT user — proves the refusal is the OWNERSHIP gate,
+        // not a missing session or consent.
+        state.config.lock().unwrap().org_egress_consented = true;
+        *state.account_session.lock().unwrap() = Some(crate::share::AccountSession {
+            account_id: "me@example.com".into(),
+            email: "me@example.com".into(),
+            server_user_id: Some("me-user-id".into()),
+            device_id: "dev-1".into(),
+            mk: Zeroizing::new([7u8; 32]),
+            generation: 1,
+            access_token: "a".into(),
+            access_expires_at: Some("2099-01-01T00:00:00Z".into()),
+            refresh_token: "r".into(),
+        });
+
+        let err = block_on(org_update_own_item_inner(&state, "item-theirs", "hacked", "# pwned"))
+            .expect_err("a non-author must NOT be able to re-publish someone else's org item");
+        assert!(
+            matches!(err, AppError::Auth(_)),
+            "expected an Auth refusal, got {err:?}"
+        );
+        // The stored item is untouched (no local overwrite of the colleague's copy).
+        let detail = state.db.get_org_item("item-theirs").unwrap().unwrap();
+        assert_eq!(detail.title, "Bob's note");
+    }
+
+    /// FAIL-CLOSED CONSENT (F-org-editable): even the AUTHOR cannot re-publish an edit while org-egress
+    /// consent is OFF — `org_update_own_item_inner` returns `Unavailable` before any network egress.
+    #[test]
+    fn org_update_own_item_is_consent_fail_closed_for_the_author() {
+        let state = build_state("org-edit-consent");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        state
+            .db
+            .upsert_org_item("item-mine", "org-1", 1, "me", "Mine", "# body", "2026-07-11T09:00:00Z", 1, 1, &[9u8; 32], Some("document"), None)
+            .unwrap();
+        state.db.set_org_item_author("item-mine", "me-user-id").unwrap();
+        // The caller IS the author, but consent is OFF (the default).
+        assert!(!state.config.lock().unwrap().org_egress_consented);
+        *state.account_session.lock().unwrap() = Some(crate::share::AccountSession {
+            account_id: "me@example.com".into(),
+            email: "me@example.com".into(),
+            server_user_id: Some("me-user-id".into()),
+            device_id: "dev-1".into(),
+            mk: Zeroizing::new([7u8; 32]),
+            generation: 1,
+            access_token: "a".into(),
+            access_expires_at: Some("2099-01-01T00:00:00Z".into()),
+            refresh_token: "r".into(),
+        });
+
+        let err = block_on(org_update_own_item_inner(&state, "item-mine", "edit", "# edit"))
+            .expect_err("no egress while consent is off, even for the author");
+        assert!(
+            matches!(err, AppError::Unavailable(_)),
+            "expected an Unavailable (consent) refusal, got {err:?}"
+        );
+    }
+
+    /// A missing / tombstoned item id is an `InvalidArg`, resolved BEFORE any session or network work.
+    #[test]
+    fn org_update_own_item_rejects_an_unknown_item() {
+        let state = build_state("org-edit-unknown");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        let err = block_on(org_update_own_item_inner(&state, "does-not-exist", "t", "b"))
+            .expect_err("an unknown item id must be rejected");
+        assert!(
+            matches!(err, AppError::InvalidArg(_)),
+            "expected InvalidArg for an unknown item, got {err:?}"
+        );
+    }
+
     /// STUCK-REPUBLISH FIX (`resolve_owned_source`): `resolve_owned_source` must mirror
     /// `org_resolve_source_inner` (fixed in cd21b10) and NOT gate on `state == "uploaded"` — a
     /// republish that failed transiently leaves the row `state = "failed"` with its OLD,
@@ -28759,6 +28900,9 @@ async fn org_sync_one(
             generation: u32,
             env: crate::share::org_envelope::OrgEnvelope,
             sha: Vec<u8>,
+            /// The author's server account id, off the feed entry — stored on the local replica so the
+            /// author's OTHER machines can recognise + edit their own item (2026-07-14).
+            author_user_id: String,
         },
     }
     let mut actions: Vec<FeedAction> = Vec::new();
@@ -28861,6 +29005,7 @@ async fn org_sync_one(
                 generation: item.generation,
                 env,
                 sha,
+                author_user_id: item.author_user_id.clone(),
             });
         }
         if (feed.items.len() as u32) < ORG_FEED_PAGE {
@@ -28897,6 +29042,7 @@ async fn org_sync_one(
                 generation,
                 env,
                 sha,
+                author_user_id,
             } => {
                 state.db.upsert_org_item(
                     &item_id,
@@ -28916,6 +29062,12 @@ async fn org_sync_one(
                     env.source_kind.map(crate::share::org_envelope::OrgSourceKind::as_str),
                     embedder_ref,
                 )?;
+                // Stamp the server-authoritative author id so the author's OTHER machines can edit
+                // their own item in-place (they have no local `org_shares` anchor). Server never sends
+                // an empty author id, but guard anyway — an empty stamp would just leave it unmatched.
+                if !author_user_id.is_empty() {
+                    state.db.set_org_item_author(&item_id, &author_user_id)?;
+                }
                 report.ingested += 1;
                 applied = applied.max(seq);
             }
@@ -28948,7 +29100,213 @@ pub fn org_get_item(
     state: State<'_, AppState>,
     item_id: String,
 ) -> Result<Option<crate::storage::models::OrgItemDetail>, AppError> {
-    state.inner().db.get_org_item(&item_id)
+    let st = state.inner();
+    let Some(mut detail) = st.db.get_org_item(&item_id)? else {
+        return Ok(None);
+    };
+    // EDITABLE (F-org-editable-any-device, 2026-07-14): the caller may edit this item in-place when
+    // they AUTHORED it — proven by the server-authoritative `author_user_id` stored at feed-ingest
+    // matching the caller's own `server_user_id`, NOT by a local `org_shares` anchor (which only exists
+    // on the machine that first shared it). On the origin machine the viewer redirects to the local
+    // source before this ever renders; a second machine has no anchor, so this is what unlocks editing
+    // there. Fail-closed: any missing piece (no stored author, no live session) ⇒ not editable.
+    if let Some(ctx) = st.db.org_item_edit_ctx(&item_id)? {
+        if let (Some(author), Ok(me)) =
+            (ctx.author_user_id.as_deref(), session_server_user_id(st))
+        {
+            detail.editable = author == me;
+        }
+    }
+    Ok(Some(detail))
+}
+
+/// `org_update_own_item(item_id, title, markdown)` — edit-in-place + re-publish for an org item the
+/// caller AUTHORED, from ANY of their machines (the "can't edit my own org note on my other Mac" fix).
+/// Same egress discipline as the share/republish paths (spec gate order): ownership gate → consent
+/// fail-closed → clean + scrub → seal under the OCK with LOCAL open-verify (verify-before-egress) →
+/// upload blob + publish the NEXT rev → tombstone the OLD item (publish-BEFORE-tombstone, so a crash
+/// leaves a recoverable transient dup, never a window with no org copy) → refresh the local replica.
+/// Returns the NEW server item id (the server mints one per publish) so the FE can navigate to it.
+///
+/// This deliberately does NOT touch any local vault note (Variant 1 — the user chose edit-in-place, not
+/// "adopt into this machine's vault"): the org item is edited as its own thing; nothing is materialised
+/// as a `documents` row here.
+#[tauri::command]
+pub async fn org_update_own_item(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    item_id: String,
+    title: String,
+    markdown: String,
+) -> Result<String, AppError> {
+    let new_item_id = org_update_own_item_inner(state.inner(), &item_id, &title, &markdown).await?;
+    // Ping every open org view (Notes list + Settings shared-brain) to re-fetch — the edit superseded
+    // the item (new id) + tombstoned the old. Content-free; best-effort (never affects the result).
+    crate::events::emit_org_feed_updated(&app, 1);
+    Ok(new_item_id)
+}
+
+pub(crate) async fn org_update_own_item_inner(
+    state: &AppState,
+    item_id: &str,
+    title: &str,
+    markdown: &str,
+) -> Result<String, AppError> {
+    // Resolve the item's edit context (org, current rev, original created_at/source_kind, author id).
+    let ctx = state
+        .db
+        .org_item_edit_ctx(item_id)?
+        .ok_or_else(|| AppError::InvalidArg("no such org item (or it was removed)".into()))?;
+
+    // (0) OWNERSHIP GATE — only the AUTHOR may re-publish. Server-authoritative id (stored at ingest),
+    // compared to this session's `server_user_id`. A missing stored author ⇒ refuse (fail-closed): we
+    // must never let a member overwrite a colleague's item.
+    let me = session_server_user_id(state)?;
+    if ctx.author_user_id.as_deref() != Some(me.as_str()) {
+        return Err(AppError::Auth(
+            "you can only edit org notes you authored".into(),
+        ));
+    }
+
+    // (2) CONSENT fail-closed (the same global one-time org-egress consent the share path checks).
+    {
+        let cfg = state
+            .config
+            .lock()
+            .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
+        if !cfg.org_egress_consented {
+            return Err(AppError::Unavailable(
+                "org sharing not consented — confirm the one-time upload notice first".into(),
+            ));
+        }
+    }
+
+    // (3) CLEAN + (4) SCRUB the edited body — same leak-safe transform + PII scrub the share/republish
+    // paths apply (scrub ON: fail-safe toward LESS egress; an edit must never DOWNGRADE scrubbing).
+    let cleaned = crate::share::envelope::clean_note_body(markdown);
+    let (final_md, _counts) = scrub_org_markdown(&cleaned);
+
+    // Resolve the org (membership-checked) + a live session; seal at the org's CURRENT generation.
+    let org = resolve_org(state, &ctx.org_id)?;
+    let generation = org.generation;
+    let base = share_base_url(state)?;
+    let (_account_id, _gen_id, _mk, access_token) = require_session_mk(state).await?;
+    let client = crate::share::client::ShareClient::new(&base)?;
+
+    // Author hint = the account email local-part (display label; never note content) — recomputed from
+    // the session like the share path, not read from the (potentially stale) stored hint.
+    let author_hint = {
+        let g = state
+            .account_session
+            .lock()
+            .map_err(|_| AppError::Storage("account-session mutex poisoned".into()))?;
+        crate::share::require_login(&g)
+            .map(|s| org_author_hint(&s.email))
+            .unwrap_or_else(|_| "member".to_string())
+    };
+    let source_kind = match ctx.source_kind.as_deref() {
+        Some("meeting") => crate::share::org_envelope::OrgSourceKind::Meeting,
+        _ => crate::share::org_envelope::OrgSourceKind::Document,
+    };
+
+    let new_rev = ctx.rev.saturating_add(1);
+    let env = crate::share::org_envelope::OrgEnvelope::new(
+        crate::share::org_envelope::OrgItemKind::Note,
+        title.to_string(),
+        final_md,
+        author_hint,
+        ctx.created_at.clone(),
+        new_rev,
+        source_kind,
+    );
+    let content_sha = env.content_sha256();
+
+    // (5) SEAL under the OCK + LOCAL OPEN-VERIFY (verify-before-egress). AAD nonce = hex(content_sha256),
+    // deterministic + rides the feed so every member reconstructs it.
+    let ock = acquire_org_ock(state, &org.org_id, generation).await?;
+    let item_nonce = org_item_nonce(&content_sha);
+    let (ciphertext, _sha) =
+        crate::share::org_envelope::seal_org_envelope(&ock, &env, &org.org_id, &item_nonce)?;
+
+    // (6) upload → publish the NEXT rev. A failure here leaves the OLD item live (never tombstoned yet),
+    // so the org is never left with no copy.
+    let now = chrono::Utc::now().to_rfc3339();
+    let blob_id = client.put_blob(&access_token, ciphertext).await?;
+    let published = client
+        .org_publish_item(
+            &access_token,
+            &org.org_id,
+            crate::share::org_dto::PublishItemRequest {
+                blob_id,
+                content_sha256: content_sha.clone(),
+                rev: new_rev,
+                generation,
+            },
+        )
+        .await?;
+    crate::share::ledger_row(&state.db, &client.host(), "org_share_publish", content_sha.len());
+
+    // LOCAL REPLICA CONSISTENCY: upsert the NEW item (so the Notes list resolves it immediately) +
+    // re-stamp our authorship on it (so it stays editable here) + tombstone the OLD replica. FTS-only
+    // (`None` embedder) to keep the editor-close path light; the next `org_sync_now` re-ingests + embeds.
+    // Best-effort — a local-replica error must never fail the save (the server copy is already live).
+    if let Err(e) = state.db.upsert_org_item(
+        &published.item_id,
+        &org.org_id,
+        published.seq,
+        &env.author_hint,
+        &env.title,
+        &env.markdown,
+        &env.created_at,
+        new_rev,
+        generation,
+        &content_sha,
+        env.source_kind
+            .map(crate::share::org_envelope::OrgSourceKind::as_str),
+        None,
+    ) {
+        tracing::warn!(target: "org", error = %e, "org edit: local replica upsert failed (server copy live)");
+    }
+    let _ = state.db.set_org_item_author(&published.item_id, &me);
+    // Repoint any local `org_shares` anchor for the OLD id (usually none on a non-origin machine, but if
+    // this IS the origin machine keep the anchor pointing at the live item so the vault-note republish
+    // path stays consistent).
+    if let Ok(Some(row)) = state.db.org_share_by_item(item_id) {
+        let _ = state.db.reset_org_share_for_retry(
+            &row.id,
+            row.title.as_deref(),
+            new_rev,
+            generation,
+            &content_sha,
+            &now,
+        );
+        let _ = state.db.set_org_share_uploaded(&row.id, &published.item_id, &now);
+    }
+    if published.item_id != item_id {
+        if let Err(e) = state.db.tombstone_org_item(item_id) {
+            tracing::warn!(target: "org", error = %e, "org edit: local old-item tombstone failed");
+        }
+    }
+
+    // THEN tombstone the OLD item on the server so members evict the stale copy. Publish-BEFORE-tombstone
+    // (done above): a crash here leaves a transient dup (recoverable), never a window with no org copy. A
+    // tombstone failure is non-fatal — the new copy is already live; the stale one lingers until a sweep.
+    if published.item_id != item_id {
+        match client
+            .org_tombstone_item(&access_token, &org.org_id, item_id)
+            .await
+        {
+            Ok(()) => crate::share::ledger_row(&state.db, &client.host(), "org_share_revoke", 0),
+            Err(e) => tracing::warn!(
+                target: "org",
+                error = %e,
+                org_id = %org.org_id,
+                "org edit: superseded item published but old-item tombstone failed (transient dup)"
+            ),
+        }
+    }
+
+    Ok(published.item_id)
 }
 
 /// `list_org_items(org_id)` — the browsable LIST of one org's live items (headers only), so a member
