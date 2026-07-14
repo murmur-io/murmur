@@ -13,7 +13,8 @@ use crate::storage::models::{
     EntityDetail, EntityDossierResult, Folder, FolderNode, GraphData, Meeting,
     MeetingActionSummary, MeetingStatus, MeetingTimeline, NoteAssistRequest, NoteAssistResult,
     NoteCitation, NoteDoc, NoteFolder, NoteRecord, NoteSummary, OrganizeMove, OrganizePlan,
-    PeopleList, PinResult, RecipeRecord, SavedView, SearchHit, TopicThread,
+    PeopleList, PinResult, PropertyKind, PropertySchemaField, RecipeRecord, SavedView, SearchHit,
+    TopicThread, TypedNoteRow,
 };
 use crate::summarize::all_providers;
 use crate::transcribe::types::Segment;
@@ -2841,6 +2842,147 @@ pub fn list_note_folders(state: State<'_, AppState>) -> Result<Vec<NoteFolder>, 
         f.unlocked = f.locked && unlocked.contains(&f.id);
     }
     Ok(folders)
+}
+
+// ── Feature C — TYPED note front-matter properties (note-folder schemas + Table/Board substrate) ──
+
+/// Max property columns a note-folder schema may declare (a UI-scale bound, not a hard DB limit).
+const NOTE_SCHEMA_MAX_FIELDS: usize = 40;
+/// Max length of a schema property key.
+const NOTE_SCHEMA_MAX_KEY_LEN: usize = 60;
+
+/// Read a note-folder's typed property SCHEMA (Feature C). GATED (the SAFER choice): a
+/// sealed-and-not-session-unlocked folder returns `Ok(vec![])` — we deliberately do NOT expose a
+/// locked folder's schema (the schema is only needed to view/edit an UNLOCKED folder). `InvalidArg`
+/// when `folder_id` is not a note-folder.
+#[tauri::command]
+pub fn get_note_folder_schema(
+    state: State<'_, AppState>,
+    folder_id: String,
+) -> Result<Vec<PropertySchemaField>, AppError> {
+    get_note_folder_schema_inner(state.inner(), &folder_id)
+}
+
+/// Inner of [`get_note_folder_schema`] taking `&AppState` (unit-testable gate).
+pub(crate) fn get_note_folder_schema_inner(
+    state: &AppState,
+    folder_id: &str,
+) -> Result<Vec<PropertySchemaField>, AppError> {
+    if state.db.note_folder_by_id(folder_id)?.is_none() {
+        return Err(AppError::InvalidArg(format!("no note folder {folder_id}")));
+    }
+    // GATE: a locked-and-not-session-unlocked folder's schema is NOT exposed (return empty).
+    if !folder_is_unlocked(state, folder_id)? {
+        return Ok(Vec::new());
+    }
+    state.db.get_note_folder_schema(folder_id)
+}
+
+/// Set a note-folder's typed property SCHEMA (Feature C). WRITE-GATED: a sealed-and-not-session-
+/// unlocked folder is refused (`AppError::Locked`) — never mutate metadata behind a lock. Validates:
+/// ≤40 fields, each `key` non-empty/trimmed/≤60 chars, case-insensitively UNIQUE, never the reserved
+/// `"tags"`, and every `Select` field carries ≥1 non-empty option.
+#[tauri::command]
+pub fn set_note_folder_schema(
+    state: State<'_, AppState>,
+    folder_id: String,
+    fields: Vec<PropertySchemaField>,
+) -> Result<(), AppError> {
+    set_note_folder_schema_inner(state.inner(), &folder_id, fields)
+}
+
+/// Inner of [`set_note_folder_schema`] taking `&AppState` (unit-testable gate + validation).
+pub(crate) fn set_note_folder_schema_inner(
+    state: &AppState,
+    folder_id: &str,
+    fields: Vec<PropertySchemaField>,
+) -> Result<(), AppError> {
+    if state.db.note_folder_by_id(folder_id)?.is_none() {
+        return Err(AppError::InvalidArg(format!("no note folder {folder_id}")));
+    }
+    // WRITE-GATE (before any validation or write): a sealed-not-unlocked folder is refused so a
+    // schema can never be edited behind a lock.
+    if !folder_is_unlocked(state, folder_id)? {
+        return Err(AppError::Locked(
+            "this folder is locked — unlock it to edit its properties".into(),
+        ));
+    }
+    if fields.len() > NOTE_SCHEMA_MAX_FIELDS {
+        return Err(AppError::InvalidArg(format!(
+            "too many properties (max {NOTE_SCHEMA_MAX_FIELDS})"
+        )));
+    }
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for f in &fields {
+        let key = f.key.trim();
+        if key.is_empty() {
+            return Err(AppError::InvalidArg("property key must not be empty".into()));
+        }
+        if key.len() > NOTE_SCHEMA_MAX_KEY_LEN {
+            return Err(AppError::InvalidArg(format!(
+                "property key too long (max {NOTE_SCHEMA_MAX_KEY_LEN} chars)"
+            )));
+        }
+        // `tags` is reserved for the front-matter tag list (parsed separately, never a property).
+        if key.eq_ignore_ascii_case("tags") {
+            return Err(AppError::InvalidArg(
+                "property key \"tags\" is reserved".into(),
+            ));
+        }
+        if !seen.insert(key.to_ascii_lowercase()) {
+            return Err(AppError::InvalidArg(format!(
+                "duplicate property key \"{key}\""
+            )));
+        }
+        if f.kind == PropertyKind::Select
+            && !f.options.iter().any(|o| !o.trim().is_empty())
+        {
+            return Err(AppError::InvalidArg(format!(
+                "select property \"{key}\" needs at least one option"
+            )));
+        }
+    }
+    // Persist the TRIMMED keys (so the read-time coercion keys match the front-matter keys exactly).
+    let normalized: Vec<PropertySchemaField> = fields
+        .into_iter()
+        .map(|f| PropertySchemaField {
+            key: f.key.trim().to_string(),
+            kind: f.kind,
+            options: f
+                .options
+                .into_iter()
+                .map(|o| o.trim().to_string())
+                .filter(|o| !o.is_empty())
+                .collect(),
+        })
+        .collect();
+    state.db.set_note_folder_schema(folder_id, &normalized)?;
+    tracing::info!(target: "notes", folder_id = %folder_id, fields = normalized.len(), "note-folder schema updated");
+    Ok(())
+}
+
+/// List a note-folder's notes projected through its typed schema (Feature C — the Table/Board
+/// substrate). GATED: a sealed-and-not-session-unlocked folder returns `[]` (no rows, never a masked
+/// row) via [`Db::list_notes_visible_typed`], which is built on the gated `list_notes_visible`.
+/// `InvalidArg` when `folder_id` is not a note-folder.
+#[tauri::command]
+pub fn list_notes_typed(
+    state: State<'_, AppState>,
+    folder_id: String,
+) -> Result<Vec<TypedNoteRow>, AppError> {
+    list_notes_typed_inner(state.inner(), &folder_id)
+}
+
+/// Inner of [`list_notes_typed`] taking `&AppState` (unit-testable gate).
+pub(crate) fn list_notes_typed_inner(
+    state: &AppState,
+    folder_id: &str,
+) -> Result<Vec<TypedNoteRow>, AppError> {
+    if state.db.note_folder_by_id(folder_id)?.is_none() {
+        return Err(AppError::InvalidArg(format!("no note folder {folder_id}")));
+    }
+    let unlocked = unlocked_snapshot(state)?;
+    state.db.list_notes_visible_typed(folder_id, &unlocked)
 }
 
 /// Create a note-folder (`kind='note'`). `parent_id` must itself be a note-folder (or None = a
@@ -19234,6 +19376,178 @@ mod lifecycle_tests {
             state.db.get_note_row(&id).unwrap().unwrap().sealed,
             "a note created in a session-unlocked LOCKED folder is sealed from birth"
         );
+    }
+
+    /// Feature C (RED-before-GREEN): `set_note_folder_schema` on a SEALED-and-not-session-unlocked
+    /// folder MUST be refused with `AppError::Locked` and leave the schema UNCHANGED — an impl that
+    /// forgets the `folder_is_unlocked` gate would let a schema be edited behind a lock (this test is
+    /// RED against that). Session-unlock allows the edit.
+    #[test]
+    fn set_note_folder_schema_refuses_on_locked_folder() {
+        let state = build_state("schema-locked-refuse");
+        let fid = create_note_folder_inner(&state, "Secret", None).unwrap().id;
+        // Seed an initial schema WHILE the folder is open, then lock it.
+        let original = vec![PropertySchemaField {
+            key: "status".into(),
+            kind: PropertyKind::Text,
+            options: vec![],
+        }];
+        set_note_folder_schema_inner(&state, &fid, original.clone()).unwrap();
+        lock_folder_inner(&state, fid.clone()).unwrap();
+
+        // Attempt to overwrite the schema while sealed-not-unlocked → Locked refusal.
+        let attempt = vec![PropertySchemaField {
+            key: "owner".into(),
+            kind: PropertyKind::Text,
+            options: vec![],
+        }];
+        assert!(
+            matches!(
+                set_note_folder_schema_inner(&state, &fid, attempt.clone()).unwrap_err(),
+                AppError::Locked(_)
+            ),
+            "sealed-not-unlocked folder must refuse a schema write"
+        );
+        // The stored schema is UNCHANGED (read it directly — the command read gate returns [] when
+        // locked, so assert against the DB layer to prove the write was rejected, not just masked).
+        assert_eq!(
+            state.db.get_note_folder_schema(&fid).unwrap(),
+            original,
+            "the schema must be untouched after a refused write"
+        );
+
+        // Session-unlock ⇒ the write is allowed and takes effect.
+        let _ck = session_unlock(&state, &fid);
+        set_note_folder_schema_inner(&state, &fid, attempt.clone()).unwrap();
+        assert_eq!(state.db.get_note_folder_schema(&fid).unwrap(), attempt);
+    }
+
+    /// Feature C (RED-before-GREEN): `get_note_folder_schema` is GATED — a sealed-and-not-session-
+    /// unlocked folder returns `Ok(vec![])` (we deliberately do NOT expose a locked folder's schema);
+    /// session-unlock reveals the real schema. RED against an ungated read that would return the
+    /// schema while locked.
+    #[test]
+    fn get_note_folder_schema_gated_on_lock() {
+        let state = build_state("schema-read-gate");
+        let fid = create_note_folder_inner(&state, "Secret", None).unwrap().id;
+        let schema = vec![PropertySchemaField {
+            key: "status".into(),
+            kind: PropertyKind::Select,
+            options: vec!["Open".into(), "Done".into()],
+        }];
+        set_note_folder_schema_inner(&state, &fid, schema.clone()).unwrap();
+        lock_folder_inner(&state, fid.clone()).unwrap();
+
+        // Locked-not-unlocked → empty (schema not exposed), even though a row exists in the DB.
+        assert!(
+            get_note_folder_schema_inner(&state, &fid).unwrap().is_empty(),
+            "sealed-not-unlocked folder's schema must not be exposed"
+        );
+
+        // Session-unlock → the real schema.
+        let _ck = session_unlock(&state, &fid);
+        assert_eq!(get_note_folder_schema_inner(&state, &fid).unwrap(), schema);
+    }
+
+    /// Feature C: `list_notes_typed` returns `[]` for a sealed-and-not-session-unlocked folder (no
+    /// rows, never a masked row) and the real typed rows once session-unlocked.
+    #[test]
+    fn list_notes_typed_gated_on_lock() {
+        let state = build_state("typed-list-gate");
+        let fid = create_note_folder_inner(&state, "Tasks", None).unwrap().id;
+        set_note_folder_schema_inner(
+            &state,
+            &fid,
+            vec![PropertySchemaField {
+                key: "status".into(),
+                kind: PropertyKind::Select,
+                options: vec!["Open".into(), "Done".into()],
+            }],
+        )
+        .unwrap();
+        let id = create_note_inner(&state, Some(&fid), "Task A").unwrap();
+        update_note_doc_inner(&state, &id, "Task A", "---\nstatus: Done\n---\nbody").unwrap();
+        lock_folder_inner(&state, fid.clone()).unwrap();
+
+        // Locked → no rows.
+        assert!(
+            list_notes_typed_inner(&state, &fid).unwrap().is_empty(),
+            "sealed-not-unlocked folder must yield no typed rows"
+        );
+
+        // Session-unlock → the real typed row with the coerced Select value.
+        let _ck = session_unlock(&state, &fid);
+        let rows = list_notes_typed_inner(&state, &fid).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].title, "Task A");
+        assert_eq!(
+            rows[0].values.get("status"),
+            Some(&crate::storage::models::PropertyValue::Select("Done".into()))
+        );
+    }
+
+    /// Feature C: `set_note_folder_schema` validation — reserved `tags` key, duplicate keys,
+    /// empty-option Select, and the field-count cap all refuse with `InvalidArg`.
+    #[test]
+    fn set_note_folder_schema_validation() {
+        let state = build_state("schema-validate");
+        let fid = create_note_folder_inner(&state, "V", None).unwrap().id;
+
+        // Reserved key "tags".
+        assert!(matches!(
+            set_note_folder_schema_inner(
+                &state,
+                &fid,
+                vec![PropertySchemaField {
+                    key: "tags".into(),
+                    kind: PropertyKind::Text,
+                    options: vec![]
+                }]
+            )
+            .unwrap_err(),
+            AppError::InvalidArg(_)
+        ));
+
+        // Duplicate keys (case-insensitive).
+        assert!(matches!(
+            set_note_folder_schema_inner(
+                &state,
+                &fid,
+                vec![
+                    PropertySchemaField { key: "Owner".into(), kind: PropertyKind::Text, options: vec![] },
+                    PropertySchemaField { key: "owner".into(), kind: PropertyKind::Text, options: vec![] },
+                ]
+            )
+            .unwrap_err(),
+            AppError::InvalidArg(_)
+        ));
+
+        // Select with no non-empty option.
+        assert!(matches!(
+            set_note_folder_schema_inner(
+                &state,
+                &fid,
+                vec![PropertySchemaField {
+                    key: "status".into(),
+                    kind: PropertyKind::Select,
+                    options: vec!["  ".into()]
+                }]
+            )
+            .unwrap_err(),
+            AppError::InvalidArg(_)
+        ));
+
+        // A valid schema goes through.
+        set_note_folder_schema_inner(
+            &state,
+            &fid,
+            vec![PropertySchemaField {
+                key: "status".into(),
+                kind: PropertyKind::Select,
+                options: vec!["Open".into()],
+            }],
+        )
+        .unwrap();
     }
 
     /// WP0 gate — a note in a SEALED-and-not-session-unlocked folder MUST be MASKED: `get_note`
