@@ -14,6 +14,7 @@ import { TabsService } from "../../../core/tabs.service";
 import { tabKeyFor } from "../../../core/tab-keys";
 import type { OrgItemDetail } from "../../../core/models";
 import { MarkdownComponent } from "../../../shared/markdown/markdown.component";
+import { ToastService } from "../../../services/toast.service";
 
 /**
  * Viewer for ONE org-brain item (`/org-item/:id`). Reached from an org-origin
@@ -46,6 +47,7 @@ export class OrgItemViewerComponent {
   private readonly router = inject(Router);
   private readonly injector = inject(Injector);
   private readonly tabsService = inject(TabsService);
+  private readonly toast = inject(ToastService);
 
   /** The `:id` route param as a signal (re-fetches when it changes in place). */
   private readonly itemId = toSignal(
@@ -64,6 +66,15 @@ export class OrgItemViewerComponent {
   readonly orgName = this._orgName.asReadonly();
   readonly loading = signal(true);
   readonly error = signal<string | null>(null);
+
+  // --- Edit-in-place (author only; F-org-editable-any-device) ---------------
+  /** True while the author is editing this item in place (drives the editor UI). */
+  readonly editing = signal(false);
+  /** Draft title/body bound to the inline editor while {@link editing}. */
+  readonly titleDraft = signal("");
+  readonly markdownDraft = signal("");
+  /** True while `orgUpdateOwnItem` (seal → publish → tombstone-old) is in flight. */
+  readonly saving = signal(false);
 
   constructor() {
     // Resolve + fetch the org item whenever the route id changes. Async IPC
@@ -97,6 +108,8 @@ export class OrgItemViewerComponent {
     this.error.set(null);
     this._item.set(null);
     this._orgName.set("");
+    // A route change (incl. the post-save redirect to the superseded item) always exits edit mode.
+    this.editing.set(false);
     try {
       const ref = await this.ipc.orgResolveSource(id);
       if (this.itemId() !== id) {
@@ -166,6 +179,54 @@ export class OrgItemViewerComponent {
       }
     } catch {
       /* best-effort: leave the org label empty */
+    }
+  }
+
+  /** Enter edit mode (author only), seeding the drafts from the loaded item. */
+  startEdit(): void {
+    const it = this._item();
+    if (!it || !it.editable) {
+      return;
+    }
+    this.titleDraft.set(it.title);
+    this.markdownDraft.set(it.markdown);
+    this.editing.set(true);
+  }
+
+  /** Leave edit mode without saving (ignored mid-save). */
+  cancelEdit(): void {
+    if (this.saving()) {
+      return;
+    }
+    this.editing.set(false);
+  }
+
+  /**
+   * Save the edit: re-publish the org item (rev+1) through the backend's consent +
+   * seal + verify-before-egress gates. The server mints a NEW item id (feed items
+   * are immutable), so on success we navigate to it (`replaceUrl`) — the route-id
+   * effect re-loads the fresh, still-editable item. A blank title/body or a
+   * no-change save is allowed (the backend short-circuits identical content).
+   */
+  async saveEdit(): Promise<void> {
+    const it = this._item();
+    if (!it || this.saving()) {
+      return;
+    }
+    const title = this.titleDraft().trim();
+    const markdown = this.markdownDraft();
+    this.saving.set(true);
+    try {
+      const newId = await this.ipc.orgUpdateOwnItem(it.itemId, title, markdown);
+      this.editing.set(false);
+      this.toast.success("Changes shared to the org");
+      // The superseded item has a new id — land on it so the viewer reloads fresh.
+      await this.router.navigate(["/org-item", newId], { replaceUrl: true });
+    } catch (e) {
+      this.toast.danger("Couldn’t save your changes. Please try again.");
+      console.error("org edit save failed", e);
+    } finally {
+      this.saving.set(false);
     }
   }
 

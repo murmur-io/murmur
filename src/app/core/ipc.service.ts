@@ -717,6 +717,22 @@ export class IpcService {
   }
 
   /**
+   * Edit-in-place + re-publish an org item the caller AUTHORED (works from any of
+   * their machines, unlike the redirect-to-local-source path which only works on
+   * the machine that first shared it). Goes through the same consent + seal +
+   * verify-before-egress gates as sharing; supersedes the old item (rev+1) and
+   * returns the NEW server item id so the caller can navigate to it. Mirrors
+   * `org_update_own_item`.
+   */
+  orgUpdateOwnItem(
+    itemId: string,
+    title: string,
+    markdown: string,
+  ): Promise<string> {
+    return invoke<string>("org_update_own_item", { itemId, title, markdown });
+  }
+
+  /**
    * Resolve an org item back to THIS device's local editable source (the note or
    * meeting it was shared FROM), or `null` when the caller is NOT the author (no
    * local source). Lets the `/org-item/:id` viewer send an author straight to

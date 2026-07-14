@@ -16,7 +16,53 @@
   } @else if (item(); as it) {
     <article class="card oi-card">
       <header class="oi-head">
-        <h1 class="oi-title">{{ it.title }}</h1>
+        <div class="oi-head-top">
+          @if (editing()) {
+            <input
+              class="oi-title-input"
+              type="text"
+              [value]="titleDraft()"
+              (input)="titleDraft.set($any($event.target).value)"
+              placeholder="Title"
+              aria-label="Note title"
+            />
+          } @else {
+            <h1 class="oi-title">{{ it.title }}</h1>
+          }
+
+          <!-- Edit-in-place (author only; works on any of the author's machines). -->
+          @if (it.editable) {
+            <div class="oi-actions">
+              @if (editing()) {
+                <button
+                  type="button"
+                  class="btn btn-ghost"
+                  [disabled]="saving()"
+                  (click)="cancelEdit()"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  class="btn btn-primary"
+                  [disabled]="saving()"
+                  (click)="saveEdit()"
+                >
+                  {{ saving() ? "Saving…" : "Save" }}
+                </button>
+              } @else {
+                <button
+                  type="button"
+                  class="btn btn-ghost"
+                  (click)="startEdit()"
+                >
+                  Edit
+                </button>
+              }
+            </div>
+          }
+        </div>
+
         <div class="oi-meta">
           <span class="oi-org-chip">
             <span class="oi-org-dot" aria-hidden="true"></span>
@@ -37,7 +83,17 @@
         </div>
       </header>
       <div class="oi-body">
-        <app-markdown [markdown]="it.markdown" />
+        @if (editing()) {
+          <textarea
+            class="oi-editor"
+            [value]="markdownDraft()"
+            (input)="markdownDraft.set($any($event.target).value)"
+            aria-label="Note content (markdown)"
+            spellcheck="false"
+          ></textarea>
+        } @else {
+          <app-markdown [markdown]="it.markdown" />
+        }
       </div>
     </article>
   }

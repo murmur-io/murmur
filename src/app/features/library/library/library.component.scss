@@ -130,14 +130,21 @@
   min-width: 0;
 }
 
-/* --- Drag grip (signals a row is draggable; reveals on row hover) ----- */
+/* --- Drag grip (signals a row is draggable; reveals on row hover) -----
+   ABSOLUTELY positioned in the row's left padding gutter so it never pushes
+   the title inward (2026-07-14: the title read as indented ~34px even while
+   the grip was invisible, because its 18px box + the row gap still reserved
+   flow width — user asked for titles flush-left). Now the title starts at the
+   row's own padding edge; the grip fades in over the gutter on hover only. */
 .grip {
+  position: absolute;
+  left: var(--space-1);
+  top: 50%;
+  transform: translateY(-50%);
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  flex: none;
-  width: 18px;
-  margin-left: calc(var(--space-2) * -1);
+  width: 14px;
   color: var(--text-muted);
   cursor: grab;
   opacity: 0;
@@ -428,6 +435,7 @@
   border-bottom: 1px solid var(--border-subtle);
 }
 .row {
+  position: relative;
   display: flex;
   align-items: center;
   justify-content: space-between;
