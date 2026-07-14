@@ -1,0 +1,262 @@
+<div class="sv-bar">
+  <!-- Saved-view tabs: "List" default + each saved view -->
+  <div class="sv-tabs" role="tablist" aria-label="Meetings views">
+    <button
+      type="button"
+      class="sv-tab"
+      role="tab"
+      [class.is-active]="activeViewId() === null"
+      [attr.aria-selected]="activeViewId() === null"
+      (click)="select(null)"
+    >
+      List
+    </button>
+    @for (view of views(); track view.id) {
+      <button
+        type="button"
+        class="sv-tab"
+        role="tab"
+        [class.is-active]="activeViewId() === view.id"
+        [attr.aria-selected]="activeViewId() === view.id"
+        (click)="select(view.id)"
+      >
+        <span class="sv-tab-glyph" aria-hidden="true">
+          @if (view.layout === "board") {
+            <svg viewBox="0 0 16 16" width="13" height="13" fill="none">
+              <rect x="2" y="2.5" width="4" height="11" rx="1" stroke="currentColor" stroke-width="1.3" />
+              <rect x="10" y="2.5" width="4" height="7" rx="1" stroke="currentColor" stroke-width="1.3" />
+            </svg>
+          } @else {
+            <svg viewBox="0 0 16 16" width="13" height="13" fill="none">
+              <path d="M2.5 4h11M2.5 8h11M2.5 12h11" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
+            </svg>
+          }
+        </span>
+        {{ view.name }}
+      </button>
+    }
+
+    <!-- "+" — save a new view -->
+    <div class="sv-add">
+      <button
+        type="button"
+        class="sv-tab sv-add-btn sv-panel-trigger"
+        aria-label="Save a new view"
+        title="Save a new view"
+        [attr.aria-expanded]="openPanel() === 'add'"
+        (click)="$event.stopPropagation(); openAdd()"
+      >
+        <svg viewBox="0 0 16 16" width="14" height="14" fill="none" aria-hidden="true">
+          <path d="M8 3v10M3 8h10" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
+        </svg>
+      </button>
+
+      @if (openPanel() === "add") {
+        <!-- OPAQUE overlay (T3): .menu → var(--surface-overlay), no blur. -->
+        <div class="menu sv-panel" role="dialog" aria-label="New view">
+          <p class="menu-group-label">New view</p>
+          <input
+            type="text"
+            class="sv-name-input"
+            placeholder="View name…"
+            aria-label="View name"
+            [value]="newViewName()"
+            (input)="newViewName.set($any($event.target).value)"
+            (keydown.enter)="createView('table')"
+            (click)="$event.stopPropagation()"
+          />
+          <div class="sv-add-actions">
+            <button
+              type="button"
+              class="btn btn-ghost"
+              [disabled]="busy() || !newViewName().trim()"
+              (click)="$event.stopPropagation(); createView('board')"
+            >
+              As board
+            </button>
+            <button
+              type="button"
+              class="btn btn-primary"
+              [disabled]="busy() || !newViewName().trim()"
+              (click)="$event.stopPropagation(); createView('table')"
+            >
+              As table
+            </button>
+          </div>
+        </div>
+      }
+    </div>
+  </div>
+
+  <!-- Active-view controls: layout toggle + config menu + delete -->
+  @if (activeView(); as view) {
+    <div class="sv-controls">
+      <!-- Layout toggle (Table ↔ Board) — global .seg/.seg-btn primitive. -->
+      <div class="seg sv-layout" role="group" aria-label="Layout">
+        <button
+          type="button"
+          class="seg-btn"
+          [class.is-active]="view.layout === 'table'"
+          [attr.aria-pressed]="view.layout === 'table'"
+          (click)="setLayout('table')"
+        >
+          Table
+        </button>
+        <button
+          type="button"
+          class="seg-btn"
+          [class.is-active]="view.layout === 'board'"
+          [attr.aria-pressed]="view.layout === 'board'"
+          (click)="setLayout('board')"
+        >
+          Board
+        </button>
+      </div>
+
+      <!-- Filter / sort / group -->
+      <div class="sv-config">
+        <button
+          type="button"
+          class="btn btn-ghost sv-config-btn sv-panel-trigger"
+          [attr.aria-expanded]="openPanel() === 'config'"
+          (click)="$event.stopPropagation(); toggleConfig()"
+        >
+          <svg viewBox="0 0 16 16" width="14" height="14" fill="none" aria-hidden="true">
+            <path d="M2 4h12M4.5 8h7M6.5 12h3" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" />
+          </svg>
+          Filter &amp; sort
+          @if (activeConfig().filters.length > 0) {
+            <span class="count sv-filter-count">{{ activeConfig().filters.length }}</span>
+          }
+        </button>
+
+        @if (openPanel() === "config") {
+          <!-- OPAQUE config overlay (T3). -->
+          <div class="menu sv-panel sv-config-panel" role="dialog" aria-label="Filter, sort and group">
+            <!-- FILTERS -->
+            <section class="sv-section">
+              <p class="menu-group-label">Filters</p>
+              @for (f of activeConfig().filters; track $index) {
+                <div class="sv-filter-row">
+                  <select
+                    class="sv-select"
+                    aria-label="Filter field"
+                    [value]="f.field"
+                    (change)="setFilterField($index, $any($event.target).value)"
+                    (click)="$event.stopPropagation()"
+                  >
+                    @for (field of fields; track field.id) {
+                      <option [value]="field.id">{{ field.label }}</option>
+                    }
+                  </select>
+                  <select
+                    class="sv-select"
+                    aria-label="Filter operator"
+                    [value]="f.op"
+                    (change)="setFilterOp($index, $any($event.target).value)"
+                    (click)="$event.stopPropagation()"
+                  >
+                    @for (op of opsFor(f.field); track op.value) {
+                      <option [value]="op.value">{{ op.label }}</option>
+                    }
+                  </select>
+                  @if (opNeedsValue(f.op)) {
+                    <input
+                      type="text"
+                      class="sv-value-input"
+                      placeholder="value"
+                      aria-label="Filter value"
+                      [value]="f.value"
+                      (input)="setFilterValue($index, $any($event.target).value)"
+                      (click)="$event.stopPropagation()"
+                    />
+                  }
+                  <button
+                    type="button"
+                    class="sv-remove"
+                    aria-label="Remove filter"
+                    (click)="$event.stopPropagation(); removeFilter($index)"
+                  >
+                    <svg viewBox="0 0 14 14" width="12" height="12" aria-hidden="true">
+                      <path d="M3.5 3.5l7 7M10.5 3.5l-7 7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
+                    </svg>
+                  </button>
+                </div>
+              } @empty {
+                <p class="sv-hint text-muted">No filters — showing all meetings.</p>
+              }
+              <button
+                type="button"
+                class="menu-item sv-add-filter"
+                (click)="$event.stopPropagation(); addFilter()"
+              >
+                + Add filter
+              </button>
+            </section>
+
+            <!-- SORT -->
+            <section class="sv-section">
+              <p class="menu-group-label">Sort</p>
+              <div class="sv-sort-row">
+                <select
+                  class="sv-select"
+                  aria-label="Sort field"
+                  [value]="sortField()"
+                  (change)="setSort($any($event.target).value, sortDirection())"
+                  (click)="$event.stopPropagation()"
+                >
+                  <option value="">Unsorted</option>
+                  @for (field of fields; track field.id) {
+                    <option [value]="field.id">{{ field.label }}</option>
+                  }
+                </select>
+                <select
+                  class="sv-select"
+                  aria-label="Sort direction"
+                  [disabled]="sortField() === ''"
+                  [value]="sortDirection()"
+                  (change)="setSort(sortField(), $any($event.target).value)"
+                  (click)="$event.stopPropagation()"
+                >
+                  <option value="asc">Ascending</option>
+                  <option value="desc">Descending</option>
+                </select>
+              </div>
+            </section>
+
+            <!-- GROUP (board only) -->
+            @if (view.layout === "board") {
+              <section class="sv-section">
+                <p class="menu-group-label">Group by (board)</p>
+                <select
+                  class="sv-select"
+                  aria-label="Group by"
+                  [value]="groupBy()"
+                  (change)="setGroupBy($any($event.target).value)"
+                  (click)="$event.stopPropagation()"
+                >
+                  <option value="">None</option>
+                  @for (field of groupFields; track field.id) {
+                    <option [value]="field.id">{{ field.label }}</option>
+                  }
+                </select>
+              </section>
+            }
+
+            <!-- DELETE -->
+            <div class="menu-group">
+              <button
+                type="button"
+                class="menu-item menu-item-danger"
+                [disabled]="busy()"
+                (click)="$event.stopPropagation(); deleteActive()"
+              >
+                Delete this view
+              </button>
+            </div>
+          </div>
+        }
+      </div>
+    </div>
+  }
+</div>

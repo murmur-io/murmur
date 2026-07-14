@@ -1,0 +1,120 @@
+:host {
+  display: block;
+}
+
+.board {
+  display: flex;
+  gap: var(--space-4);
+  align-items: flex-start;
+  overflow-x: auto;
+  padding-bottom: var(--space-3);
+}
+
+.board-col {
+  flex: 0 0 300px;
+  min-width: 280px;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.board-col-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 0 var(--space-1);
+}
+.board-col-title {
+  font-weight: 600;
+  color: var(--text-primary);
+  font-size: 0.9375rem;
+}
+
+.board-col-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.board-card {
+  padding: 0;
+  transition: transform var(--transition-fast);
+}
+.board-card:hover {
+  transform: translateY(-1px);
+}
+
+.board-card-btn {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  width: 100%;
+  padding: var(--space-3);
+  border: 0;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+  font: inherit;
+  color: inherit;
+  border-radius: var(--radius-lg);
+}
+.board-card-btn:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--accent-ring);
+}
+
+.board-card-title-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+}
+.board-card-title {
+  font-weight: 600;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.board-card-title--masked {
+  letter-spacing: 0.1em;
+  color: var(--text-muted);
+}
+
+.board-card-meta {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--text-muted);
+  font-size: 0.8125rem;
+}
+.board-card-meta .folder {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.board-card-foot {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+.board-card-actions {
+  display: inline-flex;
+  gap: var(--space-1);
+}
+
+.board-col-empty {
+  padding: var(--space-3);
+  font-size: 0.875rem;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .board-card {
+    transition: none;
+  }
+  .board-card:hover {
+    transform: none;
+  }
+}

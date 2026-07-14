@@ -1,0 +1,83 @@
+<mur-table [rows]="rows()" [trackBy]="trackByRow" [rowClass]="rowClassFor">
+  @for (col of resolvedColumns(); track col.key) {
+    <mur-table-column
+      [key]="col.key"
+      [header]="col.label"
+      [alignEnd]="col.alignEnd"
+      [width]="col.width"
+    >
+      <ng-template let-row>
+        @let m = row.meeting;
+        @switch (col.key) {
+          @case ("title") {
+            @if (isMasked()(m)) {
+              <span class="title title--masked" aria-hidden="true"
+                >•••••••••••••</span
+              >
+              <span class="sr-only">Locked note — title hidden</span>
+            } @else {
+              <a
+                class="title-link"
+                href="#"
+                (click)="onOpen($event, m)"
+                (keydown.enter)="onOpen($event, m)"
+                >{{ m.title || "(untitled)" }}</a
+              >
+            }
+          }
+          @case ("date") {
+            <span class="cell-muted">{{ formatDate(m.startedAt) }}</span>
+          }
+          @case ("folder") {
+            @if (folderNameOf()(m); as fname) {
+              <span class="folder-cell">
+                @if (folderExposureOf()(m); as exp) {
+                  <app-lock-badge [exposure]="exp" />
+                }
+                <span class="folder-cell-name">{{ fname }}</span>
+              </span>
+            } @else {
+              <span class="cell-muted">—</span>
+            }
+          }
+          @case ("status") {
+            <span class="pill" [class]="statusPillClass(m.status)">
+              <span class="pill-dot"></span>
+              {{ statusLabel(m.status) }}
+            </span>
+          }
+          @case ("duration") {
+            <span class="cell-muted">
+              @if (m.durationS > 0) {
+                {{ formatDuration(m.durationS) }}
+              } @else {
+                —
+              }
+            </span>
+          }
+          @case ("actions") {
+            <!-- Open / done action counts merged from MeetingActionSummary.
+                 A locked meeting contributes no summary → both zero → the
+                 dash placeholder (no leak). -->
+            @if (row.openCount > 0 || row.doneCount > 0) {
+              <span class="action-counts">
+                <span class="pill is-warning" title="Open action items">
+                  {{ row.openCount }} open
+                </span>
+                <span class="pill is-success" title="Completed action items">
+                  {{ row.doneCount }} done
+                </span>
+              </span>
+            } @else {
+              <span class="cell-muted">—</span>
+            }
+          }
+          @default {
+            <!-- Unknown column (e.g. "tags" — not on the gated Meeting list DTO). -->
+            <span class="cell-muted">—</span>
+          }
+        }
+      </ng-template>
+    </mur-table-column>
+  }
+</mur-table>
