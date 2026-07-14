@@ -5,6 +5,8 @@ import type {
   NoteSummary,
   OrganizeMove,
   OrganizePlan,
+  PropertySchemaField,
+  TypedNoteRow,
 } from "../core/models";
 
 /**
@@ -36,6 +38,17 @@ export class NotesService {
    */
   private readonly _activeFolderId = signal<string | null>(null);
 
+  // ── Feature C — typed note properties (folder schema + typed rows) ──────────
+  // Root-persisted (stale-while-revalidate, angular-zoneless.md §8): these outlive
+  // a component destroy+recreate so the Table/Board views show the last-known
+  // schema/rows instantly on remount while the reload replaces them underneath.
+  // Both are per-CURRENT-scope (whichever folder the caller last loaded); a
+  // LOCKED folder yields `[]` from the backend, so the typed views self-hide.
+  private readonly _folderSchema = signal<PropertySchemaField[]>([]);
+  private readonly _typedRows = signal<TypedNoteRow[]>([]);
+  private readonly _schemaLoading = signal(false);
+  private readonly _typedLoading = signal(false);
+
   /** The note list, as last returned by the backend (gated — masked rows included). */
   readonly notes = this._notes.asReadonly();
   /** The note-kind folder list (`kind='note'` only). */
@@ -48,6 +61,15 @@ export class NotesService {
   readonly error = this._error.asReadonly();
   /** The active note-folder scope (null = "All notes"). */
   readonly activeFolderId = this._activeFolderId.asReadonly();
+
+  /** The current folder's property schema (`[]` for a locked folder — gated backend-side). */
+  readonly folderSchema = this._folderSchema.asReadonly();
+  /** The current folder's typed rows for the Table/Board views (`[]` for a sealed folder). */
+  readonly typedRows = this._typedRows.asReadonly();
+  /** True while the folder schema is (re)loading. */
+  readonly schemaLoading = this._schemaLoading.asReadonly();
+  /** True while the typed rows are (re)loading. */
+  readonly typedLoading = this._typedLoading.asReadonly();
 
   /**
    * Select a note-folder (or null for "All notes") as the shared sidebar/content
@@ -235,5 +257,75 @@ export class NotesService {
       throw e;
     }
     await Promise.allSettled([this.loadFolders(), this.loadNotes()]);
+  }
+
+  // ── Feature C — typed properties (schema + typed rows) ─────────────────────
+
+  /**
+   * (Re)load the property SCHEMA for `folderId`. A LOCKED folder returns `[]`
+   * (the backend gates it), which correctly hides every typed view. `null` (the
+   * "All notes" scope) has no single folder schema → clears to `[]` without an
+   * IPC call. Error-tolerant: a failure captures into `error` and leaves the
+   * last-known schema untouched (stale-while-revalidate) rather than blanking it.
+   */
+  async loadSchema(folderId: string | null): Promise<void> {
+    if (folderId === null) {
+      this._folderSchema.set([]);
+      return;
+    }
+    this._schemaLoading.set(true);
+    this._error.set(null);
+    try {
+      this._folderSchema.set(await this.ipc.getNoteFolderSchema(folderId));
+    } catch (e) {
+      this._error.set(String(e));
+    } finally {
+      this._schemaLoading.set(false);
+    }
+  }
+
+  /**
+   * (Re)load the TYPED note rows for `folderId` (feeds the Table/Board views). A
+   * SEALED folder returns `[]` (gated in the query). `null` clears to `[]` (the
+   * typed views are only offered for a concrete folder). Error-tolerant like
+   * {@link loadSchema} — the stale rows self-heal on the next load.
+   */
+  async loadTypedRows(folderId: string | null): Promise<void> {
+    if (folderId === null) {
+      this._typedRows.set([]);
+      return;
+    }
+    this._typedLoading.set(true);
+    this._error.set(null);
+    try {
+      this._typedRows.set(await this.ipc.listNotesTyped(folderId));
+    } catch (e) {
+      this._error.set(String(e));
+    } finally {
+      this._typedLoading.set(false);
+    }
+  }
+
+  /**
+   * Persist a note-folder's property schema (replaces the whole field set), then
+   * refresh the local schema signal so the editor + views see it at once. The
+   * SAVE is the only failure that rejects (so the caller can surface it); the
+   * follow-on reload is best-effort (a refresh error is captured in `error`).
+   */
+  async saveSchema(
+    folderId: string,
+    fields: PropertySchemaField[],
+  ): Promise<void> {
+    this._error.set(null);
+    try {
+      await this.ipc.setNoteFolderSchema(folderId, fields);
+    } catch (e) {
+      this._error.set(String(e));
+      throw e;
+    }
+    // Reflect the saved set locally at once (optimistic-but-verified: the SAVE
+    // already succeeded), then reconcile from the backend best-effort.
+    this._folderSchema.set([...fields]);
+    await this.loadSchema(folderId);
   }
 }

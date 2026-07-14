@@ -722,6 +722,69 @@ pub struct NoteFolder {
     pub kind: String,
 }
 
+// ── Feature C — TYPED note front-matter properties + folder Table/Board substrate ────────────────
+//
+// A note-folder can declare a SCHEMA: an ordered list of typed property columns (Text/Select/Date/
+// Checkbox/Number) that overlay the note's YAML front-matter. The schema is content-free metadata
+// (like `saved_views`) stored in `note_folder_schemas`. Typing is a READ-TIME COERCION layer over
+// the SAME `Record<String,String>` YAML scalars `parse_front_matter` already yields — the owned-.md
+// byte round-trip and the `text_blob` seal path are UNAWARE of it (load-bearing: the front-matter
+// parsers are never touched). A `Select` value that is not in the declared `options` is PRESERVED as
+// `Text`, never dropped.
+
+/// The type of a note-folder schema property column. `snake_case` on the wire so the FE reads
+/// `"text"`/`"select"`/`"date"`/`"checkbox"`/`"number"`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PropertyKind {
+    Text,
+    Select,
+    Date,
+    Checkbox,
+    Number,
+}
+
+/// One declared property column in a note-folder's schema. `options` is meaningful ONLY for
+/// `Select` (the allowed values); empty for the other kinds.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PropertySchemaField {
+    pub key: String,
+    pub kind: PropertyKind,
+    #[serde(default)]
+    pub options: Vec<String>,
+}
+
+/// A COERCED front-matter value — the typed reading of a raw YAML scalar against a schema column.
+/// ADJACENTLY-tagged: serialized as `{ "kind": "...", "value": ... }` so the FE gets both the type
+/// and the concrete value. A raw scalar that fails to coerce to the declared kind is preserved as
+/// `Text` (the value is never lost).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum PropertyValue {
+    Text(String),
+    Select(String),
+    Date(String),
+    Checkbox(bool),
+    Number(f64),
+}
+
+/// A note row projected through a folder's typed schema (the Table/Board substrate). `values` maps a
+/// schema `key` → its coerced [`PropertyValue`] (only keys present in BOTH the schema and the note's
+/// front-matter appear; a key not declared in the schema is not projected). `tags` is the raw
+/// front-matter tag list. Built ONLY from gated readers — a sealed-not-unlocked folder yields NO
+/// rows (never a masked row), so a typed row can never carry sealed content.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TypedNoteRow {
+    pub id: String,
+    pub title: String,
+    pub folder_id: String,
+    pub values: std::collections::BTreeMap<String, PropertyValue>,
+    pub tags: Vec<String>,
+    pub updated_at: i64,
+}
+
 /// The selection Brain-assistant request (WP4): the selected text + its surrounding context +
 /// which action. `before`/`after` are up to ~500 chars each around the selection.
 #[derive(Debug, Clone, Serialize, Deserialize)]

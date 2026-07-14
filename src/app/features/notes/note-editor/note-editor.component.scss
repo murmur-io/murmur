@@ -400,6 +400,53 @@
   font-size: 0.78rem;
 }
 
+/* ── Typed properties (Feature C) ─────────────────────────────────────────── */
+
+/* Checkbox row: the mur-toggle sits where a text value would, left-aligned. */
+.prop-value-toggle {
+  display: inline-flex;
+  align-items: center;
+  flex: 1 1 auto;
+}
+
+/* Native select for a typed Select / the new-property kind — options paint
+   var(--surface-overlay) via the global `select option` primitive (T3). */
+.prop-select {
+  appearance: auto;
+  cursor: pointer;
+}
+.prop-add-kind {
+  flex: none;
+  min-width: 108px;
+}
+
+/* The Add-property picker: an OPAQUE menu (rides the global `.menu` primitive,
+   --surface-overlay, no blur — T3) floating below the last property row. */
+.prop-add-panel {
+  position: relative;
+}
+.prop-add-menu {
+  min-width: 220px;
+}
+.prop-schema-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+.prop-schema-key {
+  font-family: var(--font-mono);
+  font-size: 0.82rem;
+}
+.prop-kind-badge {
+  font-size: 0.68rem;
+  text-transform: capitalize;
+  color: var(--text-muted);
+}
+.prop-cancel-item {
+  color: var(--text-muted);
+}
+
 /* Body textarea (document surface) with CSS auto-grow. */
 .body-wrap {
   position: relative;
