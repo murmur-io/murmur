@@ -14685,6 +14685,7 @@ mod tests {
                 parent_id: None,
                 locked: false,
                 unlocked: false,
+                is_root: false,
                 kind: "note".into(),
             },
             "2026-07-14T00:00:00Z",
