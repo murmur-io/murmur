@@ -66,11 +66,22 @@ export class MoveToMenuComponent {
     node: FolderNode | null;
   } | null>(null);
 
-  /** Flattened, depth-indented folder options (depth-first). */
+  /**
+   * Flattened, depth-indented folder options (depth-first). MEETING folders
+   * only: `folders.tree()` returns every folder (meeting AND note — the
+   * lock-reactive set), but this menu moves a MEETING, so a note folder is never
+   * a valid target and must not appear (else a meeting would be filed under the
+   * Notes namespace — the folder-leak's mirror; 2026-07-14). The two namespaces
+   * never nest across each other, so skipping a note-kind node drops its whole
+   * subtree.
+   */
   readonly options = computed<FolderOption[]>(() => {
     const out: FolderOption[] = [];
     const walk = (nodes: FolderNode[], depth: number): void => {
       for (const node of nodes) {
+        if (node.kind === "note") {
+          continue;
+        }
         out.push({ node, depth });
         // Defensive: tolerate a node without a `children` array.
         if (node.children?.length) {

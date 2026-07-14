@@ -946,10 +946,10 @@ export class IpcService {
     return invoke<void>("delete_meeting", { meetingId });
   }
 
-  // --- Saved views over the meetings list (Feature B) --------------------
+  // --- Saved views over a list surface (Feature B; Notes added 2026-07-14) ---
 
-  /** All saved views for a scope, in `sortOrder`. `scope` is `"meetings"` for this feature. */
-  listSavedViews(scope: "meetings"): Promise<SavedView[]> {
+  /** All saved views for a scope, in `sortOrder`. `scope` is `"meetings"` or `"notes"`. */
+  listSavedViews(scope: "meetings" | "notes"): Promise<SavedView[]> {
     return invoke<SavedView[]>("list_saved_views", { scope });
   }
 
@@ -964,7 +964,10 @@ export class IpcService {
   }
 
   /** Persist a new left-to-right ordering of a scope's saved views. */
-  reorderSavedViews(scope: "meetings", orderedIds: string[]): Promise<void> {
+  reorderSavedViews(
+    scope: "meetings" | "notes",
+    orderedIds: string[],
+  ): Promise<void> {
     return invoke<void>("reorder_saved_views", { scope, orderedIds });
   }
 
