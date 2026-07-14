@@ -10,7 +10,8 @@ use std::collections::HashSet;
 use crate::embed::Embedder;
 use crate::storage::models::{
     Analytics, AssistantInteraction, AssistantThreadRow, Commitment, CorrectionRecord, DayCount,
-    DocChunkHit, DocumentInfo, EntityDetail, EntityKind, EntityNeighbor, Folder, GraphData,
+    DocChunkHit, DocumentInfo, DocumentSummary, EntityDetail, EntityKind, EntityNeighbor, Folder,
+    GraphData,
     GraphEdge, GraphEntity, GraphNode, Meeting, MeetingStatus, NoteFolder, NoteRecord, NoteSummary,
     OrgChunkHit, PendingShareAccept, PeopleList, PersonCard, RecipeRecord, SearchHit, StatusCount,
     VaultSource,
@@ -4659,6 +4660,46 @@ impl Db {
         .map_err(map_err)
     }
 
+    /// GATED full-body read of ONE document/note by id (Feature D — the `get_document` tool). A
+    /// STRUCTURAL CLONE of [`Db::search_doc_chunks_fts_visible`]'s gate: the same
+    /// `documents d JOIN folders f ON f.id = d.folder_id` + `WHERE d.id = ?1 AND {visible}`
+    /// predicate, so a document in a sealed-and-not-session-unlocked folder resolves to `None` — a
+    /// FULL None, never a masked partial (so the tool's "No data for document" sentinel is
+    /// indistinguishable from a never-existed id). Reads BOTH `kind='note'` and `kind='document'`
+    /// (NOT kind-restricted). The body is the plaintext `documents.text`; while a folder is sealed
+    /// that column is blanked and the row is invisible here anyway, so no sealed
+    /// ciphertext-behind-a-blank leaks. The JOIN is INNER (not LEFT) — matching the doc-search
+    /// readers — because `documents.folder_id` is `NOT NULL` with a `folders(id)` FK, so every
+    /// document has exactly one real folder to gate on (unlike `notes`, whose nullable root folder
+    /// needs a LEFT JOIN); an INNER JOIN is fail-closed (no folder row ⇒ no result).
+    pub fn get_document_if_visible(
+        &self,
+        id: &str,
+        unlocked: &HashSet<String>,
+    ) -> Result<Option<DocumentSummary>> {
+        let conn = self.lock();
+        let visible = visibility_clause("f", unlocked);
+        let sql = format!(
+            "SELECT d.id, d.folder_id, d.kind, d.name, d.title, COALESCE(d.text, ''), d.updated_at
+               FROM documents d
+               JOIN folders f ON f.id = d.folder_id
+              WHERE d.id = ?1 AND {visible}"
+        );
+        conn.query_row(&sql, rusqlite::params![id], |r| {
+            Ok(DocumentSummary {
+                id: r.get(0)?,
+                folder_id: r.get(1)?,
+                kind: r.get(2)?,
+                name: r.get(3)?,
+                title: r.get(4)?,
+                markdown: r.get(5)?,
+                updated_at: r.get(6)?,
+            })
+        })
+        .optional()
+        .map_err(map_err)
+    }
+
     /// The owning folder id for a document, or `None` if unknown. The folder-lock gate anchor.
     pub fn folder_for_document(&self, id: &str) -> Result<Option<String>> {
         let conn = self.lock();
@@ -4986,7 +5027,7 @@ impl Db {
                   WHERE embedding MATCH ?1 AND k = ?2
                   ORDER BY distance
              )
-             SELECT d.id, d.name, d.folder_id, dc.text, knn.distance
+             SELECT d.id, d.name, d.folder_id, dc.text, d.kind, knn.distance
                FROM knn
                JOIN doc_chunks dc ON dc.id = knn.chunk_id
                JOIN documents d ON d.id = dc.document_id
@@ -5003,6 +5044,7 @@ impl Db {
                     name: row.get(1)?,
                     folder_id: row.get(2)?,
                     snippet: row.get(3)?,
+                    kind: row.get(4)?,
                 })
             })
             .map_err(map_err)?;
@@ -5039,7 +5081,7 @@ impl Db {
         let conn = self.lock();
         let visible = visibility_clause("f", unlocked);
         let sql = format!(
-            "SELECT d.id, d.name, d.folder_id, dc.text, bm25(fts_doc_chunks) AS rank
+            "SELECT d.id, d.name, d.folder_id, dc.text, d.kind, bm25(fts_doc_chunks) AS rank
                FROM fts_doc_chunks
                JOIN doc_chunks dc ON dc.id = fts_doc_chunks.rowid
                JOIN documents d ON d.id = dc.document_id
@@ -5055,6 +5097,7 @@ impl Db {
                     name: row.get(1)?,
                     folder_id: row.get(2)?,
                     snippet: row.get(3)?,
+                    kind: row.get(4)?,
                 })
             })
             .map_err(map_err)?;

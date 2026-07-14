@@ -65,10 +65,11 @@ impl AssistantScope {
     /// and the connector tools are partitioned here; `propose_note` / write tools are governed by the
     /// surface flags, not the tier, so they are allowed through the tier gate and left to those flags.
     fn allows(self, tool: &str) -> bool {
-        const VAULT_READS: [&str; 6] = [
+        const VAULT_READS: [&str; 7] = [
             "search_meetings",
             "search_semantic",
             "get_meeting",
+            "get_document",
             "list_recent_meetings",
             "get_open_commitments",
             "get_entity_dossier",
@@ -107,22 +108,32 @@ impl AssistantScope {
     }
 }
 
-/// A single read-only tool INVOCATION. This enum holds the 8 read-only calls the brain can run
-/// against the vault: the 6 the MCP surface advertises (`mcp.rs::tools_spec`) — `search_meetings`,
-/// `get_meeting`, `list_recent_meetings`, `search_semantic`, `get_open_commitments`,
-/// `get_entity_dossier` — plus the 2 consent-gated CONNECTOR tools (`WebSearch`, `CalendarLookup`),
-/// which dispatch through the async connector executors rather than the synchronous `execute_tool`.
+/// A single read-only tool INVOCATION. This enum holds the read-only calls the brain can run
+/// against the vault: the ones the MCP surface advertises (`mcp.rs::tools_spec`) — `search_meetings`,
+/// `get_meeting`, `get_document`, `list_recent_meetings`, `search_semantic`, `get_open_commitments`,
+/// `get_entity_dossier` — plus the consent-gated CONNECTOR tools (`WebSearch`, `CalendarLookup`,
+/// `JiraSearch`, `SlackSearch`) and the LOCAL `OrgBrainSearch`. The connectors dispatch through the
+/// async connector executors rather than the synchronous `execute_tool`.
 ///
-/// The FULL model-facing catalog is [`tool_specs`] — 11 entries: these 8 read tools, the DB-free
-/// `propose_note` draft tool, and the 2 gated WRITE tools (`save_note`, `create_reminder`). The
-/// writes live on [`GatedToolExecutor`] (dispatched ONLY when it was built with `allow_writes`), NOT
-/// on this enum — so no read-only surface (e.g. MCP) can ever dispatch a write.
+/// The FULL model-facing catalog is [`tool_specs`]: these read tools, the DB-free `propose_note`
+/// draft tool, and the 2 gated WRITE tools (`save_note`, `create_reminder`). The writes live on
+/// [`GatedToolExecutor`] (dispatched ONLY when it was built with `allow_writes`), NOT on this enum —
+/// so no read-only surface (e.g. MCP) can ever dispatch a write.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolCall {
     /// Full-text search across titles/transcripts/notes.
     SearchMeetings { query: String },
-    /// A meeting's AI note + full transcript by id.
-    GetMeeting { meeting_id: String },
+    /// A meeting's AI note + full transcript by id. `transcript_format` selects the transcript
+    /// renderer (Feature D): `"plain"` = the legacy flat space-joined text; anything else (incl. an
+    /// absent/default value) = the STRUCTURED per-segment `[<start>–<end>] <Speaker>: <text>` form.
+    GetMeeting {
+        meeting_id: String,
+        transcript_format: String,
+    },
+    /// The full body of one standalone note OR imported/uploaded document by id (Feature D). Gated
+    /// by [`Db::get_document_if_visible`] — a sealed-and-not-session-unlocked document is invisible
+    /// (the masked "No data" sentinel), never distinguished from a never-existed id.
+    GetDocument { document_id: String },
     /// The most recent meetings (already clamped to 1..=100 by the caller/parser).
     ListRecentMeetings { limit: i64 },
     /// Hybrid semantic + FTS search. Gated behind the `semantic_search_enabled` config flag.
@@ -224,6 +235,14 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             name: "get_meeting".into(),
             description: "Fetch one meeting's AI note and full transcript by its id (from a prior search hit).".into(),
             parameters: str_arg("meetingId", "The meeting id from a prior search result."),
+            write: false,
+        },
+        ToolSpec {
+            name: "get_document".into(),
+            description: "Get the full body of one standalone note or imported/uploaded document by \
+                          id (from a search hit labelled 'document:...'). Use this — not get_meeting \
+                          — for ids from the DOCUMENTS section of a search result.".into(),
+            parameters: str_arg("documentId", "The document id from a prior search result (a 'document:...' hit)."),
             write: false,
         },
         ToolSpec {
@@ -422,7 +441,10 @@ pub fn execute_tool(
                 Err(e) => Err(AppError::Storage(format!("semantic search failed: {e}"))),
             }
         }
-        ToolCall::GetMeeting { meeting_id } => {
+        ToolCall::GetMeeting {
+            meeting_id,
+            transcript_format,
+        } => {
             let mid = meeting_id.as_str();
             // A sealed-and-not-unlocked meeting is invisible — including its transcript AND its
             // title (the masked reply carries only the caller-supplied id, never a title).
@@ -445,12 +467,19 @@ pub fn execute_tool(
                         .unwrap_or_default();
                     let note = db.get_note_if_visible(mid, unlocked).ok().flatten();
                     let segs = db.get_segments(mid).unwrap_or_default();
-                    let transcript = segs
-                        .iter()
-                        .map(|s| s.text.trim())
-                        .filter(|t| !t.is_empty())
-                        .collect::<Vec<_>>()
-                        .join(" ");
+                    // Feature D: DEFAULT to the STRUCTURED per-segment transcript (speaker + raw-second
+                    // timestamps). `transcript_format == "plain"` keeps the LEGACY byte-identical flat
+                    // space-join for backward compatibility; every other value (incl. absent/default,
+                    // which the MCP/dispatch layer maps to "structured") uses the structured renderer.
+                    let transcript = if transcript_format == "plain" {
+                        segs.iter()
+                            .map(|s| s.text.trim())
+                            .filter(|t| !t.is_empty())
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    } else {
+                        format_structured_transcript(&segs)
+                    };
                     match note {
                         Some(n) => Ok(format!(
                             "{title_line}NOTE:\n{}\n\nTRANSCRIPT:\n{transcript}",
@@ -461,6 +490,31 @@ pub fn execute_tool(
                         }
                         None => Ok(format!("No data for meeting {mid}.")),
                     }
+                }
+            }
+        }
+        ToolCall::GetDocument { document_id } => {
+            let id = document_id.as_str();
+            // GATE: `get_document_if_visible` applies the SAME `visibility_clause` JOIN as the doc
+            // search readers, so a document in a sealed-and-not-session-unlocked folder resolves to a
+            // FULL `None` here — the masked "No data" sentinel is INDISTINGUISHABLE from a
+            // never-existed id (never leaks locked-vs-absent, mirroring the `get_meeting` masking).
+            match db.get_document_if_visible(id, unlocked) {
+                Err(e) => Err(AppError::Storage(format!("document read failed: {e}"))),
+                Ok(None) => Ok(format!("No data for document {id}.")),
+                Ok(Some(doc)) => {
+                    // Title falls back to `name` when the authoring `title` column is NULL/blank (an
+                    // uploaded `kind='document'` carries no title). `[[Title]]` wikilink for citation.
+                    let title = doc
+                        .title
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|t| !t.is_empty())
+                        .unwrap_or(doc.name.trim());
+                    Ok(format!(
+                        "TITLE: [[{title}]]\nKIND: {}\n\nBODY:\n{}",
+                        doc.kind, doc.markdown
+                    ))
                 }
             }
         }
@@ -992,12 +1046,40 @@ fn format_commitments(items: &[crate::storage::models::Commitment]) -> String {
         .join("\n")
 }
 
+/// Feature D — render a meeting's transcript segments as a STRUCTURED, one-line-per-segment block:
+/// `[<start_s>–<end_s>] <Speaker>: <text>`. RAW SECONDS (never MM:SS) so a 2h+ meeting can never
+/// wrap/clip a minutes field. Speaker maps the cheap 2-way stream attribution
+/// (`Segment.speaker`): `Some("me")` → `Me`, `Some("others")` → `Others`, `None`/anything else →
+/// `Unknown`. Empty-text segments are skipped (they carry no content, only silence bounds).
+fn format_structured_transcript(segs: &[crate::transcribe::types::Segment]) -> String {
+    segs.iter()
+        .filter(|s| !s.text.trim().is_empty())
+        .map(|s| {
+            let speaker = match s.speaker.as_deref() {
+                Some("me") => "Me",
+                Some("others") => "Others",
+                _ => "Unknown",
+            };
+            format!(
+                "[{}–{}] {speaker}: {}",
+                s.start_s,
+                s.end_s,
+                s.text.trim()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Render a list of search hits (FTS or hybrid) into the tool text payload — one line per meeting.
+/// Feature D: each line carries a `[meeting:{id}]` id-type tag so a model reading a mixed
+/// meeting+document result knows to call `get_meeting` (not `get_document`) for these ids.
 fn format_hits(hits: &[crate::storage::models::SearchHit]) -> String {
     hits.iter()
         .map(|h| {
             format!(
-                "- {} ({}) [id:{}] — {}",
+                "- [meeting:{}] {} ({}) [id:{}] — {}",
+                h.meeting.id,
                 h.meeting
                     .title
                     .clone()
@@ -1012,8 +1094,10 @@ fn format_hits(hits: &[crate::storage::models::SearchHit]) -> String {
 }
 
 /// Format meeting hits + gated document-chunk hits (the document-ingestion search leg). Documents are
-/// NOT meetings (no id/date citation), so they get their own `DOCUMENTS:` section listing the source
-/// name + snippet. Both inputs are already visibility-gated by the caller.
+/// NOT meetings (no date citation), so they get their own `DOCUMENTS:` section. Feature D: each
+/// document line carries a `[document:{kind}:{id}]` id-type tag (kind = `note` | `document`) so a
+/// model knows to call `get_document` (NOT `get_meeting`) with that id — distinct from the meeting
+/// lines' `[meeting:{id}]` tag. Both inputs are already visibility-gated by the caller.
 fn format_hits_and_docs(
     hits: &[crate::storage::models::SearchHit],
     docs: &[crate::storage::models::DocChunkHit],
@@ -1030,7 +1114,12 @@ fn format_hits_and_docs(
         out.push_str(
             &docs
                 .iter()
-                .map(|d| format!("- {} — {}", d.name, d.snippet))
+                .map(|d| {
+                    format!(
+                        "- [document:{}:{}] {} — {}",
+                        d.kind, d.document_id, d.name, d.snippet
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join("\n"),
         );
@@ -1205,9 +1294,29 @@ impl crate::agent::ToolExecutor for GatedToolExecutor<'_> {
                 &unlocked,
                 self.config,
             ),
-            "get_meeting" => execute_tool(
-                &ToolCall::GetMeeting {
-                    meeting_id: s("meetingId"),
+            "get_meeting" => {
+                // Feature D: honor an optional transcriptFormat ("structured"|"plain"); ABSENT
+                // defaults to STRUCTURED (the empty string routes to the structured renderer, since
+                // only the exact literal "plain" selects the legacy flat join).
+                let fmt = args
+                    .get("transcriptFormat")
+                    .and_then(|v| v.as_str())
+                    .filter(|f| *f == "plain")
+                    .unwrap_or("structured")
+                    .to_string();
+                execute_tool(
+                    &ToolCall::GetMeeting {
+                        meeting_id: s("meetingId"),
+                        transcript_format: fmt,
+                    },
+                    self.db,
+                    &unlocked,
+                    self.config,
+                )
+            }
+            "get_document" => execute_tool(
+                &ToolCall::GetDocument {
+                    document_id: s("documentId"),
                 },
                 self.db,
                 &unlocked,
@@ -2852,5 +2961,415 @@ mod tests {
         .unwrap();
         assert!(out.contains("[org · erin]"), "MCP org_search must carry provenance: {out}");
         assert!(out.contains("Launch plan"), "MCP org_search must find the item: {out}");
+    }
+
+    // ── Feature D — get_document / structured transcript / search hit disambiguation ─────────────
+
+    use crate::transcribe::types::Segment;
+
+    /// Seed a folder Feature-D tests can lock. `locked:false` at insert so we can INDEX while
+    /// visible, then flip the seal — mirrors the existing gate tests.
+    fn seed_folder(db: &Db, id: &str, name: &str) {
+        db.insert_folder(&Folder {
+            id: id.to_string(),
+            name: name.to_string(),
+            path: name.to_string(),
+            parent_id: None,
+            locked: false,
+            created_at: "2026-06-26T00:00:00Z".to_string(),
+        })
+        .unwrap();
+    }
+
+    /// Seed a meeting + its note in `folder` (folder-scoped so it can be sealed). Mirrors the mcp.rs
+    /// `seed` helper (a meeting's folder = its note's folder via `set_note_folder`).
+    fn seed_meeting(db: &Db, mid: &str, title: &str, md: &str, folder: Option<&str>) {
+        db.insert_meeting(&Meeting {
+            id: mid.to_string(),
+            started_at: "2026-06-27T09:00:00Z".to_string(),
+            ended_at: None,
+            title: Some(title.to_string()),
+            duration_s: 60,
+            audio_path: None,
+            status: MeetingStatus::Summarized,
+            folder_id: None,
+        })
+        .unwrap();
+        db.upsert_note(&NoteRecord {
+            meeting_id: mid.to_string(),
+            provider_id: "claude_code".to_string(),
+            markdown: md.to_string(),
+            created_at: "2026-06-27T09:05:00Z".to_string(),
+            exported_path: None,
+            model_requested: None,
+            model_served: None,
+            gateway_host: None,
+        })
+        .unwrap();
+        db.set_note_folder(mid, folder).unwrap();
+    }
+
+    /// #1 — `get_document` is visibility-gated for BOTH a `kind='note'` and a `kind='document'`: in a
+    /// LOCKED (not-session-unlocked) folder BOTH return the masked "No data" sentinel; once the
+    /// folder id is added to the unlocked set the full body reappears verbatim for both.
+    #[test]
+    fn get_document_visibility_gated() {
+        let db = tmp_db();
+        let cfg = AppConfig::default();
+        seed_folder(&db, "f-lock", "Secret");
+        db.insert_note(
+            "doc-note",
+            "f-lock",
+            "meeting-recap",
+            "Q3 Recap",
+            "The Q3 recap body — hiring freeze decided.",
+            1_700_000_000,
+        )
+        .unwrap();
+        db.insert_document(
+            "doc-upload",
+            "f-lock",
+            "spec.md",
+            "Uploaded spec body — API contract v2.",
+            "document",
+            1_700_000_100,
+        )
+        .unwrap();
+        db.set_folder_locked("f-lock", true, None).unwrap();
+
+        // LOCKED, not unlocked → both are the masked sentinel (never their bodies/titles).
+        let nothing = HashSet::new();
+        let note_locked = execute_tool(
+            &ToolCall::GetDocument { document_id: "doc-note".into() },
+            &db,
+            &nothing,
+            &cfg,
+        )
+        .unwrap();
+        let upload_locked = execute_tool(
+            &ToolCall::GetDocument { document_id: "doc-upload".into() },
+            &db,
+            &nothing,
+            &cfg,
+        )
+        .unwrap();
+        assert_eq!(
+            note_locked, "No data for document doc-note.",
+            "sealed note must return the masked sentinel, not its body: {note_locked}"
+        );
+        assert_eq!(
+            upload_locked, "No data for document doc-upload.",
+            "sealed upload must return the masked sentinel, not its body: {upload_locked}"
+        );
+        assert!(!note_locked.contains("hiring freeze"), "note body leaked while locked");
+        assert!(!upload_locked.contains("API contract"), "upload body leaked while locked");
+
+        // Session-unlock → both bodies reappear verbatim.
+        let mut unlocked = HashSet::new();
+        unlocked.insert("f-lock".to_string());
+        let note_open = execute_tool(
+            &ToolCall::GetDocument { document_id: "doc-note".into() },
+            &db,
+            &unlocked,
+            &cfg,
+        )
+        .unwrap();
+        let upload_open = execute_tool(
+            &ToolCall::GetDocument { document_id: "doc-upload".into() },
+            &db,
+            &unlocked,
+            &cfg,
+        )
+        .unwrap();
+        assert!(
+            note_open.contains("The Q3 recap body — hiring freeze decided."),
+            "unlocked note body must reappear verbatim: {note_open}"
+        );
+        assert!(note_open.contains("TITLE: [[Q3 Recap]]"), "note title must render: {note_open}");
+        assert!(
+            upload_open.contains("Uploaded spec body — API contract v2."),
+            "unlocked upload body must reappear verbatim: {upload_open}"
+        );
+    }
+
+    /// #2 — an OPEN-folder note/document round-trips its exact stored body + title (title falls back
+    /// to `name` for an untitled upload).
+    #[test]
+    fn get_document_returns_full_body_open_folder() {
+        let db = tmp_db();
+        let cfg = AppConfig::default();
+        seed_folder(&db, "f-open", "Open");
+        db.insert_note(
+            "n1",
+            "f-open",
+            "n1-name",
+            "Design Notes",
+            "Body: the exact stored markdown line.",
+            1_700_000_000,
+        )
+        .unwrap();
+        db.insert_document(
+            "u1",
+            "f-open",
+            "readme.txt",
+            "Plain uploaded body, no title column.",
+            "document",
+            1_700_000_100,
+        )
+        .unwrap();
+        let unlocked = HashSet::new(); // f-open is not locked → visible.
+
+        let note = execute_tool(
+            &ToolCall::GetDocument { document_id: "n1".into() },
+            &db,
+            &unlocked,
+            &cfg,
+        )
+        .unwrap();
+        assert_eq!(
+            note, "TITLE: [[Design Notes]]\nKIND: note\n\nBODY:\nBody: the exact stored markdown line."
+        );
+
+        let upload = execute_tool(
+            &ToolCall::GetDocument { document_id: "u1".into() },
+            &db,
+            &unlocked,
+            &cfg,
+        )
+        .unwrap();
+        // Untitled upload → title falls back to `name` ("readme.txt").
+        assert_eq!(
+            upload,
+            "TITLE: [[readme.txt]]\nKIND: document\n\nBODY:\nPlain uploaded body, no title column."
+        );
+    }
+
+    /// #3 — DEFAULT (no transcript_format) `get_meeting` renders the STRUCTURED per-segment
+    /// transcript: Me/Others/Unknown speaker labels AND a raw-second timestamp token — which the
+    /// legacy flat join dropped entirely.
+    #[test]
+    fn get_meeting_structured_transcript_default() {
+        let db = tmp_db();
+        let cfg = AppConfig::default();
+        seed_meeting(&db, "m1", "Standup", "the note", None);
+        db.insert_segments(
+            "m1",
+            &[
+                Segment {
+                    idx: 0,
+                    start_s: 12.0,
+                    end_s: 15.0,
+                    text: "let us begin".into(),
+                    speaker: Some("me".into()),
+                    confidence: None,
+                },
+                Segment {
+                    idx: 1,
+                    start_s: 15.0,
+                    end_s: 20.0,
+                    text: "sounds good".into(),
+                    speaker: Some("others".into()),
+                    confidence: None,
+                },
+                Segment {
+                    idx: 2,
+                    start_s: 20.0,
+                    end_s: 22.0,
+                    text: "unclear voice".into(),
+                    speaker: None,
+                    confidence: None,
+                },
+            ],
+        )
+        .unwrap();
+
+        let out = execute_tool(
+            &ToolCall::GetMeeting {
+                meeting_id: "m1".into(),
+                transcript_format: "structured".into(),
+            },
+            &db,
+            &HashSet::new(),
+            &cfg,
+        )
+        .unwrap();
+        assert!(out.contains("Me: let us begin"), "structured must label the me speaker: {out}");
+        assert!(out.contains("Others: sounds good"), "structured must label others: {out}");
+        assert!(out.contains("Unknown: unclear voice"), "None speaker → Unknown: {out}");
+        assert!(out.contains("[12–15]"), "structured must carry a raw-second timestamp token: {out}");
+    }
+
+    /// #4 — `transcript_format:"plain"` is BYTE-IDENTICAL to the legacy flat
+    /// `segs.map(text.trim()).join(" ")` renderer (backward-compat guard).
+    #[test]
+    fn get_meeting_transcript_format_plain_is_byte_identical() {
+        let db = tmp_db();
+        let cfg = AppConfig::default();
+        // TITLELESS meeting so the pre-existing (Brain v2 L3) `TITLE: [[..]]` prefix — orthogonal to
+        // the transcript FORMAT under test — is absent, isolating the byte-compat check to the
+        // transcript rendering itself. A titleless meeting emits no title line.
+        db.insert_meeting(&Meeting {
+            id: "m2".to_string(),
+            started_at: "2026-06-27T09:00:00Z".to_string(),
+            ended_at: None,
+            title: None,
+            duration_s: 60,
+            audio_path: None,
+            status: MeetingStatus::Summarized,
+            folder_id: None,
+        })
+        .unwrap();
+        db.upsert_note(&NoteRecord {
+            meeting_id: "m2".to_string(),
+            provider_id: "claude_code".to_string(),
+            markdown: "the note".to_string(),
+            created_at: "2026-06-27T09:05:00Z".to_string(),
+            exported_path: None,
+            model_requested: None,
+            model_served: None,
+            gateway_host: None,
+        })
+        .unwrap();
+        let segs = [
+            Segment {
+                idx: 0,
+                start_s: 1.0,
+                end_s: 2.0,
+                text: "  hello  ".into(),
+                speaker: Some("me".into()),
+                confidence: None,
+            },
+            Segment {
+                idx: 1,
+                start_s: 2.0,
+                end_s: 3.0,
+                text: "world".into(),
+                speaker: Some("others".into()),
+                confidence: None,
+            },
+            Segment {
+                idx: 2,
+                start_s: 3.0,
+                end_s: 4.0,
+                text: "   ".into(), // whitespace-only → dropped by both renderers
+                speaker: None,
+                confidence: None,
+            },
+        ];
+        db.insert_segments("m2", &segs).unwrap();
+
+        let out = execute_tool(
+            &ToolCall::GetMeeting {
+                meeting_id: "m2".into(),
+                transcript_format: "plain".into(),
+            },
+            &db,
+            &HashSet::new(),
+            &cfg,
+        )
+        .unwrap();
+        // Reconstruct the EXACT legacy shape from the same segments.
+        let legacy_transcript = segs
+            .iter()
+            .map(|s| s.text.trim())
+            .filter(|t| !t.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let expected = format!("NOTE:\nthe note\n\nTRANSCRIPT:\n{legacy_transcript}");
+        assert_eq!(out, expected, "plain format must be byte-identical to the legacy join");
+    }
+
+    /// #5 — a search result's DOCUMENTS lines carry a `[document:{kind}:{id}]` id-type tag
+    /// (`document:note:...` vs `document:document:...`), distinguishable from a meeting hit's
+    /// `[meeting:{id}]` tag, so a model knows which get_* tool to call.
+    #[test]
+    fn search_documents_section_labels_kind_and_id_type() {
+        let db = tmp_db();
+        let cfg = AppConfig::default(); // semantic default; FTS leg covers docs regardless.
+        seed_folder(&db, "f-open", "Open");
+        // A meeting hit (so we can assert the meeting tag too) + a note doc + an upload doc.
+        seed_meeting(&db, "m-hit", "Zephyr Kickoff", "zephyr launch planning", None);
+        db.insert_note(
+            "d-note",
+            "f-open",
+            "note-name",
+            "Zephyr Note",
+            "zephyr launch retro notes",
+            1_700_000_000,
+        )
+        .unwrap();
+        db.insert_document(
+            "d-doc",
+            "f-open",
+            "zephyr.md",
+            "zephyr launch upload contents",
+            "document",
+            1_700_000_100,
+        )
+        .unwrap();
+        db.index_document_chunks("d-note", None).unwrap();
+        db.index_document_chunks("d-doc", None).unwrap();
+
+        let out = execute_tool(
+            &ToolCall::SearchMeetings { query: "zephyr launch".into() },
+            &db,
+            &HashSet::new(),
+            &cfg,
+        )
+        .unwrap();
+        assert!(out.contains("[meeting:m-hit]"), "meeting hit must carry the meeting id-type tag: {out}");
+        assert!(out.contains("[document:note:d-note]"), "note doc must carry document:note tag: {out}");
+        assert!(
+            out.contains("[document:document:d-doc]"),
+            "upload doc must carry document:document tag: {out}"
+        );
+    }
+
+    /// #6 — regression guard: after the `DocChunkHit.kind` addition, a locked-not-unlocked folder's
+    /// document stays ABSENT from search (the `visibility_clause` gate still excludes it).
+    #[test]
+    fn sealed_document_excluded_from_search() {
+        let db = tmp_db();
+        let cfg = AppConfig::default();
+        seed_folder(&db, "f-lock", "Secret");
+        db.insert_document(
+            "d-secret",
+            "f-lock",
+            "secret.md",
+            "zephyr classified launch codes",
+            "document",
+            1_700_000_000,
+        )
+        .unwrap();
+        db.index_document_chunks("d-secret", None).unwrap();
+        // Lock AFTER indexing (a stray chunk may survive) — the gate must still exclude it.
+        db.set_folder_locked("f-lock", true, None).unwrap();
+
+        let out = execute_tool(
+            &ToolCall::SearchMeetings { query: "zephyr launch".into() },
+            &db,
+            &HashSet::new(),
+            &cfg,
+        )
+        .unwrap();
+        assert!(
+            !out.contains("d-secret") && !out.contains("classified"),
+            "sealed-not-unlocked document leaked into search (gate violation): {out}"
+        );
+
+        // Session-unlock → it reappears with its id-type tag.
+        let mut unlocked = HashSet::new();
+        unlocked.insert("f-lock".to_string());
+        let out2 = execute_tool(
+            &ToolCall::SearchMeetings { query: "zephyr launch".into() },
+            &db,
+            &unlocked,
+            &cfg,
+        )
+        .unwrap();
+        assert!(
+            out2.contains("[document:document:d-secret]"),
+            "unlocked document must reappear in search: {out2}"
+        );
     }
 }
