@@ -5685,6 +5685,30 @@ pub fn get_entity_detail(
         .ok_or_else(|| AppError::InvalidArg(format!("no entity with id {entity_id}")))
 }
 
+/// "What links here" for a note or meeting: every VISIBLE meeting-note / standalone-note whose body
+/// carries a `[[<this row's title>]]` wikilink. GATE is folded into the DB builder
+/// (`Db::backlinks_for_visible`) exactly like [`get_entity_detail`] — no separate command-layer
+/// pre-check. Snapshots the LIVE session unlock set, so a sealed target yields `[]` (never reveals it
+/// HAS backlinks) and a sealed source never contributes. `target_kind` is `"meeting"` | `"note"`.
+#[tauri::command]
+pub fn get_backlinks(
+    state: State<'_, AppState>,
+    target_kind: String,
+    target_id: String,
+) -> Result<Vec<crate::storage::models::BacklinkSource>, AppError> {
+    let kind = match target_kind.as_str() {
+        "meeting" => crate::storage::models::SourceKind::Meeting,
+        "note" => crate::storage::models::SourceKind::Note,
+        other => {
+            return Err(AppError::InvalidArg(format!(
+                "unknown backlink target_kind {other:?} (expected \"meeting\" or \"note\")"
+            )))
+        }
+    };
+    let unlocked = unlocked_snapshot(state.inner())?;
+    state.db.backlinks_for_visible(kind, &target_id, &unlocked)
+}
+
 /// Structured, GATED, egress-free person dossier for the `/people` detail pane. Unlike
 /// [`entity_dossier`] (which CLOUD-synthesizes a markdown String via the provider and discards the
 /// struct), this returns the STRUCTURED [`DossierData`](crate::summarize::dossier::DossierData) with

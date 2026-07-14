@@ -1,7 +1,8 @@
 use std::path::Path;
 use std::str::FromStr;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
+use regex::Regex;
 use rusqlite::{Connection, OptionalExtension, Row};
 
 use crate::error::{AppError, Result};
@@ -9,11 +10,13 @@ use std::collections::HashSet;
 
 use crate::embed::Embedder;
 use crate::storage::models::{
-    Analytics, AssistantInteraction, AssistantThreadRow, Commitment, CorrectionRecord, DayCount,
+    Analytics, AssistantInteraction, AssistantThreadRow, BacklinkSource, Commitment,
+    CorrectionRecord, DayCount,
     DocChunkHit, DocumentInfo, DocumentSummary, EntityDetail, EntityKind, EntityNeighbor, Folder,
     GraphData,
     GraphEdge, GraphEntity, GraphNode, Meeting, MeetingStatus, NoteFolder, NoteRecord, NoteSummary,
-    OrgChunkHit, PendingShareAccept, PeopleList, PersonCard, RecipeRecord, SearchHit, StatusCount,
+    OrgChunkHit, PendingShareAccept, PeopleList, PersonCard, RecipeRecord, SearchHit, SourceKind,
+    StatusCount,
     VaultSource,
 };
 use crate::transcribe::types::Segment;
@@ -8089,6 +8092,192 @@ impl Db {
         Ok(!has_notes || has_visible)
     }
 
+    /// "What links here" — every VISIBLE meeting note (`notes.markdown`) or standalone note
+    /// (`documents.text` where `kind='note'`) whose body carries a `[[<target's exact title>]]`
+    /// wikilink pointing AT the row identified by (`target_kind`, `target_id`). ON-DEMAND scan (no
+    /// index, no migration, no persisted table). Newest-first (meeting `started_at` / note
+    /// `updated_at`).
+    ///
+    /// FAIL-CLOSED, two gates:
+    /// 1. **TARGET GATE (first).** The target's own exact title is resolved through the SAME
+    ///    visibility predicate as [`Self::meeting_by_title_visible`] / [`Self::list_notes_visible`].
+    ///    An unknown target, or one whose folder is sealed-and-not-session-unlocked, returns
+    ///    `Ok(vec![])` BEFORE any source is scanned — so a locked target never even reveals that it
+    ///    HAS backlinks (no existence leak).
+    /// 2. **SOURCE GATE.** The candidate bodies come EXACTLY from the gated readers
+    ///    (`visibility_clause` on the meeting-note leg and the note leg), so a sealed-and-not-unlocked
+    ///    source can never contribute — its body is simply not in the scan set.
+    ///
+    /// Title collisions keep ALL same-titled matches (a dropped real backlink would be a silent false
+    /// negative). Logs IDs/counts only — never body text or titles.
+    pub fn backlinks_for_visible(
+        &self,
+        target_kind: SourceKind,
+        target_id: &str,
+        unlocked: &HashSet<String>,
+    ) -> Result<Vec<BacklinkSource>> {
+        // ── GATE 1: resolve the target's exact title THROUGH the visibility gate; empty on any miss. ──
+        let target_title = match self.resolve_visible_title(target_kind, target_id, unlocked)? {
+            Some(t) if !t.is_empty() => t,
+            // Unknown, sealed-not-unlocked, or empty-titled → nothing to link to. Fail closed.
+            _ => return Ok(Vec::new()),
+        };
+
+        let conn = self.lock();
+        // ── GATE 2, meeting-note leg: VISIBLE meeting notes only (same predicate as list_meetings_visible). ──
+        // Newest note per meeting; body = `notes.markdown`; timestamp = `meetings.started_at`.
+        let visible_notes = visibility_clause("n", unlocked);
+        let meeting_sql = format!(
+            "SELECT m.id, m.title, m.started_at, n.markdown
+               FROM meetings m
+               JOIN notes n ON n.meeting_id = m.id
+               LEFT JOIN folders f ON f.id = n.folder_id
+              WHERE {visible_notes}
+              ORDER BY m.started_at DESC, m.id DESC"
+        );
+        let mut stmt = conn.prepare(&meeting_sql).map_err(map_err)?;
+        let meeting_rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            })
+            .map_err(map_err)?;
+
+        // A meeting can have several visible provider notes; scan EVERY visible note and include the
+        // meeting once as soon as ANY of its notes links the target — mark `seen` only on a MATCH, so
+        // a link that lives only in a non-first provider note is never missed. title/started_at are
+        // meeting-level (identical across the meeting's notes), so the matching row is representative.
+        let mut out: Vec<BacklinkSource> = Vec::new();
+        let mut seen_meetings: HashSet<String> = HashSet::new();
+        for row in meeting_rows {
+            let (id, title, started_at, body) = row.map_err(map_err)?;
+            if target_kind == SourceKind::Meeting && id == target_id {
+                continue; // never list the target itself.
+            }
+            if seen_meetings.contains(&id) {
+                continue; // already emitted this meeting.
+            }
+            if extract_wikilink_titles(&body).contains(&target_title) {
+                seen_meetings.insert(id.clone());
+                out.push(BacklinkSource {
+                    id,
+                    kind: SourceKind::Meeting,
+                    title,
+                    timestamp: started_at,
+                });
+            }
+        }
+        drop(stmt);
+
+        // ── GATE 2, note leg: VISIBLE standalone notes only (same predicate as list_notes_visible). ──
+        // Body = `documents.text`; title = `documents.title` (fallback `name`); timestamp = `updated_at`.
+        let visible_docs = visibility_clause("f", unlocked);
+        let doc_sql = format!(
+            "SELECT d.id, d.title, d.name, COALESCE(d.text, ''),
+                    COALESCE(d.updated_at, d.created_at)
+               FROM documents d
+               JOIN folders f ON f.id = d.folder_id
+              WHERE d.kind = 'note' AND {visible_docs}
+              ORDER BY COALESCE(d.updated_at, d.created_at) DESC, d.id ASC"
+        );
+        let mut doc_stmt = conn.prepare(&doc_sql).map_err(map_err)?;
+        let doc_rows = doc_stmt
+            .query_map([], |r| {
+                let id: String = r.get(0)?;
+                let title: Option<String> = r.get(1)?;
+                let name: String = r.get(2)?;
+                let text: String = r.get(3)?;
+                let ts: i64 = r.get(4)?;
+                Ok((id, title, name, text, ts))
+            })
+            .map_err(map_err)?;
+        let mut note_hits: Vec<BacklinkSource> = Vec::new();
+        for row in doc_rows {
+            let (id, title, name, text, ts) = row.map_err(map_err)?;
+            if target_kind == SourceKind::Note && id == target_id {
+                continue; // never list the target itself.
+            }
+            if extract_wikilink_titles(&text).contains(&target_title) {
+                note_hits.push(BacklinkSource {
+                    id,
+                    kind: SourceKind::Note,
+                    title: title.filter(|t| !t.is_empty()).unwrap_or(name),
+                    // Emit RFC3339 (like the meeting leg) so the wire `timestamp` is uniformly
+                    // ISO-8601 — the FE `new Date(iso)` renders it directly; a bare epoch-millis
+                    // string would parse to `Invalid Date` and show a blank chip date.
+                    timestamp: chrono::DateTime::from_timestamp_millis(ts)
+                        .map(|dt| dt.to_rfc3339())
+                        .unwrap_or_default(),
+                });
+            }
+        }
+        drop(doc_stmt);
+        drop(conn);
+
+        // Merge the two legs newest-first. Both legs now emit an RFC3339 `timestamp`, so
+        // `backlink_sort_key` parses a single format to a comparable epoch-millis key.
+        out.extend(note_hits);
+        out.sort_by_key(|b| std::cmp::Reverse(backlink_sort_key(b)));
+
+        tracing::debug!(
+            target: "backlinks",
+            count = out.len(),
+            "backlinks_for_visible resolved"
+        );
+        Ok(out)
+    }
+
+    /// Resolve the exact, current title of a backlink TARGET through the SAME visibility gate the
+    /// list readers use. `None` iff the target is unknown OR sealed-and-not-session-unlocked (the two
+    /// are indistinguishable to the caller — no existence leak). Meeting → gated `meetings.title`;
+    /// note → gated `documents.title`/`name` (`kind='note'`).
+    fn resolve_visible_title(
+        &self,
+        kind: SourceKind,
+        id: &str,
+        unlocked: &HashSet<String>,
+    ) -> Result<Option<String>> {
+        match kind {
+            SourceKind::Meeting => {
+                // Visible iff the meeting has no notes OR at least one visible note (mirrors
+                // `meeting_by_title_visible` / `meeting_is_visible`).
+                if !self.meeting_is_visible(id, unlocked)? {
+                    return Ok(None);
+                }
+                let conn = self.lock();
+                conn.query_row(
+                    "SELECT COALESCE(title, '') FROM meetings WHERE id = ?1",
+                    rusqlite::params![id],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(map_err)
+            }
+            SourceKind::Note => {
+                let conn = self.lock();
+                let visible = visibility_clause("f", unlocked);
+                let sql = format!(
+                    "SELECT d.title, d.name
+                       FROM documents d
+                       JOIN folders f ON f.id = d.folder_id
+                      WHERE d.id = ?1 AND d.kind = 'note' AND {visible}
+                      LIMIT 1"
+                );
+                conn.query_row(&sql, rusqlite::params![id], |r| {
+                    let title: Option<String> = r.get(0)?;
+                    let name: String = r.get(1)?;
+                    Ok(title.filter(|t| !t.is_empty()).unwrap_or(name))
+                })
+                .optional()
+                .map_err(map_err)
+            }
+        }
+    }
+
     /// Phase E (Flow B, `NoteAside`) — record a spoken aside against a meeting in the additive
     /// `notes_asides` store. PURELY ADDITIVE: it never touches the note `markdown`/`content_blob`,
     /// so it can never blank or clobber sealed content. The CALLER gates on the live unlocked set
@@ -10360,6 +10549,43 @@ pub struct Voiceprint {
 /// session-unlocked. `alias` is the notes-table alias (`n`); a sibling `folders f` join is
 /// assumed for the alias. The unlocked ids are inlined as quoted literals — safe because they
 /// are app-generated UUIDs, but we still escape single quotes defensively.
+/// Regex matching an Obsidian-native `[[wikilink]]` opener, capturing the raw TARGET up to the first
+/// `]`, `|` (alias), or `#` (heading anchor) — so `[[Title|alias]]` and `[[Title#heading]]` both
+/// degrade to the bare `Title`. Lazy `OnceLock` per the repo's static-regex convention (mirrors
+/// `summarize::redact::email_re`; NOT `LazyLock` — MSRV/clippy on ci.sh).
+fn wikilink_re() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| Regex::new(r"\[\[([^\]\|#]+)").unwrap())
+}
+
+/// Extract the DISTINCT `[[Title]]` wikilink targets from a note/markdown body, in first-seen order.
+/// PURE (no DB). `[[Title|alias]]` and `[[Title#heading]]` yield the bare `Title`; each target is
+/// trimmed; duplicates are dropped keeping the first occurrence. An empty/no-match body yields `[]`.
+pub(crate) fn extract_wikilink_titles(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for cap in wikilink_re().captures_iter(text) {
+        // `cap[1]` is guaranteed by the single capture group in the pattern.
+        let title = cap[1].trim();
+        if title.is_empty() {
+            continue;
+        }
+        if !out.iter().any(|t| t == title) {
+            out.push(title.to_string());
+        }
+    }
+    out
+}
+
+/// A comparable newest-first sort key (epoch-millis) for a backlink chip. Both legs emit an RFC3339
+/// `timestamp` (meeting `started_at`, note `updated_at` rendered to RFC3339), so a single parse
+/// suffices. Unparseable → `i64::MIN` (sorts oldest), keeping the order total + deterministic
+/// without panicking.
+fn backlink_sort_key(b: &BacklinkSource) -> i64 {
+    chrono::DateTime::parse_from_rfc3339(&b.timestamp)
+        .map(|dt| dt.timestamp_millis())
+        .unwrap_or(i64::MIN)
+}
+
 fn visibility_clause(_alias: &str, unlocked: &HashSet<String>) -> String {
     let mut clause = String::from("(f.locked IS NULL OR f.locked = 0");
     if !unlocked.is_empty() {
@@ -12367,6 +12593,241 @@ mod tests {
             both.len(),
             2,
             "session-unlocked meeting's correction must reappear"
+        );
+    }
+
+    // ── Feature A — note↔note backlinks reader ───────────────────────────────────────────────────
+
+    /// PURE parse: bare `[[T]]`, alias `[[T|a]]`→`T`, heading `[[T#h]]`→`T`, dedup first-seen, empty
+    /// on no match. RED before `wikilink_re`/`extract_wikilink_titles` existed.
+    #[test]
+    fn extract_wikilink_titles_covers_forms() {
+        assert_eq!(extract_wikilink_titles("see [[Alpha]] here"), vec!["Alpha"]);
+        assert_eq!(
+            extract_wikilink_titles("[[Alpha|the alias]]"),
+            vec!["Alpha"]
+        );
+        assert_eq!(extract_wikilink_titles("[[Alpha#Heading]]"), vec!["Alpha"]);
+        // Duplicates (across forms) dedup, first-seen order preserved.
+        assert_eq!(
+            extract_wikilink_titles("[[Beta]] then [[Alpha]] then [[Beta|x]]"),
+            vec!["Beta", "Alpha"]
+        );
+        // Surrounding whitespace inside the brackets is trimmed.
+        assert_eq!(extract_wikilink_titles("[[  Gamma  ]]"), vec!["Gamma"]);
+        // No wikilink → empty.
+        assert!(extract_wikilink_titles("plain text, no links").is_empty());
+        assert!(extract_wikilink_titles("").is_empty());
+    }
+
+    /// GATE 1 (target). A VISIBLE meeting note genuinely links `[[TargetTitle]]`, but the TARGET note
+    /// lives in a sealed-and-not-unlocked folder → the reader must return `[]` (never reveal the
+    /// locked target HAS backlinks). RED against a scan-then-filter impl that resolves the target's
+    /// title / lists backlinks BEFORE the visibility early-return.
+    #[test]
+    fn backlinks_sealed_target_hides_all() {
+        let db = mem_db();
+        seed_folder(&db, "f-open", "Open");
+        seed_folder(&db, "f-locked", "Secret");
+        db.set_folder_locked("f-locked", true, Some(b"wrapped"))
+            .unwrap();
+
+        // SOURCE: a visible meeting whose note body links to the target's title.
+        db.insert_meeting(&sample_meeting("m-src", "2026-06-24T10:00:00Z"))
+            .unwrap();
+        note_for(&db, "m-src", "claude_code", "recap — see [[TargetTitle]]");
+        db.set_note_folder("m-src", Some("f-open")).unwrap();
+
+        // TARGET: a standalone note titled exactly "TargetTitle", in the SEALED folder.
+        db.insert_note(
+            "n-target",
+            "f-locked",
+            "target",
+            "TargetTitle",
+            "the target body",
+            1_000,
+        )
+        .unwrap();
+
+        let nothing = std::collections::HashSet::new();
+        let got = db
+            .backlinks_for_visible(SourceKind::Note, "n-target", &nothing)
+            .unwrap();
+        assert!(
+            got.is_empty(),
+            "sealed target must not reveal it HAS backlinks; got {got:?}"
+        );
+    }
+
+    /// GATE 2 (source). A SEALED-and-not-unlocked SOURCE note links `[[VisibleTarget]]`. Querying the
+    /// visible target's backlinks must NOT include that sealed source. RED against an impl that scans
+    /// all note bodies ignoring `visibility_clause` on the source side.
+    #[test]
+    fn backlinks_sealed_source_never_contributes() {
+        let db = mem_db();
+        seed_folder(&db, "f-open", "Open");
+        seed_folder(&db, "f-locked", "Secret");
+        db.set_folder_locked("f-locked", true, Some(b"wrapped"))
+            .unwrap();
+
+        // TARGET: a VISIBLE meeting titled "VisibleTarget".
+        let mut target = sample_meeting("m-target", "2026-06-24T09:00:00Z");
+        target.title = Some("VisibleTarget".to_string());
+        db.insert_meeting(&target).unwrap();
+        note_for(&db, "m-target", "claude_code", "target note body");
+        db.set_note_folder("m-target", Some("f-open")).unwrap();
+
+        // A VISIBLE source that DOES link the target (the true positive that must appear).
+        db.insert_note(
+            "n-open-src",
+            "f-open",
+            "open-src",
+            "OpenSource",
+            "links [[VisibleTarget]] openly",
+            2_000,
+        )
+        .unwrap();
+
+        // A SEALED source that ALSO links the target — must NOT contribute while locked.
+        db.insert_note(
+            "n-sealed-src",
+            "f-locked",
+            "sealed-src",
+            "SealedSource",
+            "secretly links [[VisibleTarget]]",
+            3_000,
+        )
+        .unwrap();
+
+        let nothing = std::collections::HashSet::new();
+        let got = db
+            .backlinks_for_visible(SourceKind::Meeting, "m-target", &nothing)
+            .unwrap();
+        let ids: Vec<&str> = got.iter().map(|b| b.id.as_str()).collect();
+        assert!(
+            ids.contains(&"n-open-src"),
+            "the visible source must be present; got {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"n-sealed-src"),
+            "sealed source leaked into backlinks; got {ids:?}"
+        );
+    }
+
+    /// Session-unlock reverses BOTH gates: the sealed TARGET now yields its backlink, and the sealed
+    /// SOURCE now contributes. Mirrors the entity/correction unlock-reappearance pattern.
+    #[test]
+    fn backlinks_unlock_reverses() {
+        let db = mem_db();
+        seed_folder(&db, "f-open", "Open");
+        seed_folder(&db, "f-locked", "Secret");
+        db.set_folder_locked("f-locked", true, Some(b"wrapped"))
+            .unwrap();
+
+        // A visible source linking a SEALED target (the gate-1 half).
+        db.insert_meeting(&sample_meeting("m-src", "2026-06-24T10:00:00Z"))
+            .unwrap();
+        note_for(&db, "m-src", "claude_code", "see [[TargetTitle]]");
+        db.set_note_folder("m-src", Some("f-open")).unwrap();
+        db.insert_note(
+            "n-target",
+            "f-locked",
+            "target",
+            "TargetTitle",
+            "target body",
+            1_000,
+        )
+        .unwrap();
+
+        // A SEALED source linking a VISIBLE target (the gate-2 half).
+        let mut vis_target = sample_meeting("m-vis-target", "2026-06-24T08:00:00Z");
+        vis_target.title = Some("VisibleTarget".to_string());
+        db.insert_meeting(&vis_target).unwrap();
+        note_for(&db, "m-vis-target", "claude_code", "vis target body");
+        db.set_note_folder("m-vis-target", Some("f-open")).unwrap();
+        db.insert_note(
+            "n-sealed-src",
+            "f-locked",
+            "sealed-src",
+            "SealedSource",
+            "links [[VisibleTarget]]",
+            3_000,
+        )
+        .unwrap();
+
+        // Locked: sealed target hides all; sealed source absent.
+        let nothing = std::collections::HashSet::new();
+        assert!(
+            db.backlinks_for_visible(SourceKind::Note, "n-target", &nothing)
+                .unwrap()
+                .is_empty(),
+            "sealed target still hidden while locked"
+        );
+        let vis_locked = db
+            .backlinks_for_visible(SourceKind::Meeting, "m-vis-target", &nothing)
+            .unwrap();
+        assert!(
+            !vis_locked.iter().any(|b| b.id == "n-sealed-src"),
+            "sealed source must be absent while locked"
+        );
+
+        // Session-unlock the sealed folder → BOTH halves flip.
+        let mut unlocked = std::collections::HashSet::new();
+        unlocked.insert("f-locked".to_string());
+
+        let target_now = db
+            .backlinks_for_visible(SourceKind::Note, "n-target", &unlocked)
+            .unwrap();
+        assert_eq!(
+            target_now.iter().map(|b| b.id.as_str()).collect::<Vec<_>>(),
+            vec!["m-src"],
+            "unlocked target must now surface its backlink"
+        );
+        assert_eq!(target_now[0].kind, SourceKind::Meeting);
+
+        let vis_now = db
+            .backlinks_for_visible(SourceKind::Meeting, "m-vis-target", &unlocked)
+            .unwrap();
+        assert!(
+            vis_now.iter().any(|b| b.id == "n-sealed-src"),
+            "unlocked source must now contribute"
+        );
+    }
+
+    /// GATE 2 (meeting leg) COMPLETENESS: a meeting with SEVERAL provider notes must surface as a
+    /// backlink when ANY of its notes links the target — even if the first (newest-ordered) note does
+    /// NOT. RED against a dedup-before-check impl that keeps only the first provider note per meeting.
+    #[test]
+    fn backlinks_meeting_leg_scans_all_provider_notes() {
+        let db = mem_db();
+        seed_folder(&db, "f-open", "Open");
+
+        // TARGET: a visible standalone note titled exactly "MultiTarget".
+        db.insert_note(
+            "n-multi-target",
+            "f-open",
+            "mt",
+            "MultiTarget",
+            "the target body",
+            1_000,
+        )
+        .unwrap();
+
+        // SOURCE: one meeting, TWO provider notes — only the SECOND provider links the target.
+        db.insert_meeting(&sample_meeting("m-multi", "2026-06-24T10:00:00Z"))
+            .unwrap();
+        note_for(&db, "m-multi", "claude_code", "recap with no link at all");
+        note_for(&db, "m-multi", "anthropic", "deep dive — see [[MultiTarget]]");
+        db.set_note_folder("m-multi", Some("f-open")).unwrap();
+
+        let nothing = std::collections::HashSet::new();
+        let got = db
+            .backlinks_for_visible(SourceKind::Note, "n-multi-target", &nothing)
+            .unwrap();
+        let ids: Vec<&str> = got.iter().map(|b| b.id.as_str()).collect();
+        assert!(
+            ids.contains(&"m-multi"),
+            "a meeting whose link lives in a non-first provider note must still surface; got {ids:?}"
         );
     }
 
