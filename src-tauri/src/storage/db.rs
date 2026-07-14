@@ -18,7 +18,7 @@ use crate::storage::models::{
     NoteRecord, NoteSummary,
     OrgChunkHit, PendingShareAccept, PeopleList, PersonCard, PropertyKind, PropertySchemaField,
     PropertyValue, RecipeRecord, SavedView, SearchHit,
-    SourceKind, TypedNoteRow,
+    SourceKind, TypedNoteRow, WikiTarget,
     StatusCount,
     VaultSource,
 };
@@ -8441,6 +8441,56 @@ impl Db {
             .transpose()
     }
 
+    /// Resolve a `[[Title]]` wikilink to a VISIBLE navigation target — a standalone note (preferred,
+    /// the more natural link target) else a meeting whose exact title matches. GATED by
+    /// `visibility_clause` on both legs: a sealed-and-not-session-unlocked note/meeting with that
+    /// title resolves to `None`, so clicking a wikilink can never reveal or navigate to locked
+    /// content. `None` also when nothing matches. Title match uses the note's display title
+    /// (`title`, falling back to `name`), matching how it is shown/exported.
+    pub fn resolve_wikilink(
+        &self,
+        title: &str,
+        unlocked: &HashSet<String>,
+    ) -> Result<Option<WikiTarget>> {
+        let title = title.trim();
+        if title.is_empty() {
+            return Ok(None);
+        }
+        // Note leg first (a standalone note is the more natural wikilink target). VISIBLE notes only.
+        {
+            let conn = self.lock();
+            let visible = visibility_clause("f", unlocked);
+            let sql = format!(
+                "SELECT d.id
+                   FROM documents d
+                   JOIN folders f ON f.id = d.folder_id
+                  WHERE d.kind = 'note'
+                    AND COALESCE(NULLIF(TRIM(d.title), ''), d.name) = ?1
+                    AND {visible}
+                  ORDER BY d.updated_at DESC, d.id ASC
+                  LIMIT 1"
+            );
+            let note_id: Option<String> = conn
+                .query_row(&sql, rusqlite::params![title], |r| r.get(0))
+                .optional()
+                .map_err(map_err)?;
+            if let Some(id) = note_id {
+                return Ok(Some(WikiTarget {
+                    kind: SourceKind::Note,
+                    id,
+                }));
+            }
+        }
+        // Meeting leg — reuse the proven gated title resolver (acquires its own lock).
+        if let Some(m) = self.meeting_by_title_visible(title, unlocked)? {
+            return Ok(Some(WikiTarget {
+                kind: SourceKind::Meeting,
+                id: m.id,
+            }));
+        }
+        Ok(None)
+    }
+
     /// The latest visible note for a meeting (MCP `get_meeting`); `None` if the meeting's note
     /// is sealed-and-not-session-unlocked.
     pub fn get_note_if_visible(
@@ -13344,6 +13394,73 @@ mod tests {
         );
     }
 
+    /// `resolve_wikilink` prefers a standalone NOTE, falls back to a MEETING, and is `None` for a
+    /// title that matches nothing (or is blank).
+    #[test]
+    fn resolve_wikilink_prefers_note_then_meeting_else_none() {
+        let db = mem_db();
+        seed_folder(&db, "f-open", "Open");
+
+        // A visible standalone note titled "Alpha".
+        db.insert_note("n-alpha", "f-open", "alpha", "Alpha", "body", 1_000)
+            .unwrap();
+        // A visible meeting titled "Beta" (its AI note lives in `notes`, not `documents`).
+        let mut beta = sample_meeting("m-beta", "2026-06-24T10:00:00Z");
+        beta.title = Some("Beta".to_string());
+        db.insert_meeting(&beta).unwrap();
+        note_for(&db, "m-beta", "claude_code", "beta note");
+        db.set_note_folder("m-beta", Some("f-open")).unwrap();
+
+        let nothing = std::collections::HashSet::new();
+        let a = db
+            .resolve_wikilink("Alpha", &nothing)
+            .unwrap()
+            .expect("Alpha resolves");
+        assert_eq!(a.kind, SourceKind::Note);
+        assert_eq!(a.id, "n-alpha");
+
+        let b = db
+            .resolve_wikilink("Beta", &nothing)
+            .unwrap()
+            .expect("Beta resolves");
+        assert_eq!(b.kind, SourceKind::Meeting);
+        assert_eq!(b.id, "m-beta");
+
+        assert!(db.resolve_wikilink("Nope", &nothing).unwrap().is_none());
+        assert!(db.resolve_wikilink("   ", &nothing).unwrap().is_none());
+    }
+
+    /// GATED: a `[[Title]]` pointing at a SEALED-and-not-session-unlocked note resolves to `None`
+    /// (a wikilink click can never reveal/open locked content); session-unlock reverses it. RED
+    /// against an ungated title lookup.
+    #[test]
+    fn resolve_wikilink_hides_sealed_target() {
+        let db = mem_db();
+        seed_folder(&db, "f-open", "Open");
+        seed_folder(&db, "f-locked", "Secret");
+        db.set_folder_locked("f-locked", true, Some(b"wrapped"))
+            .unwrap();
+
+        // A sealed note titled "Secret" — plaintext still present, so the gate is the sole suppressor.
+        db.insert_note("n-secret", "f-locked", "secret", "Secret", "classified", 1_000)
+            .unwrap();
+
+        let nothing = std::collections::HashSet::new();
+        assert!(
+            db.resolve_wikilink("Secret", &nothing).unwrap().is_none(),
+            "a sealed note must not be resolvable/navigable from a wikilink"
+        );
+
+        let mut unlocked = std::collections::HashSet::new();
+        unlocked.insert("f-locked".to_string());
+        let t = db
+            .resolve_wikilink("Secret", &unlocked)
+            .unwrap()
+            .expect("unlocked target resolves");
+        assert_eq!(t.kind, SourceKind::Note);
+        assert_eq!(t.id, "n-secret");
+    }
+
     /// FAIL-CLOSED: a correction row with a NULL `meeting_id` (legacy/unattributed) is never returned
     /// by the gated reader, even with nothing locked.
     #[test]
@@ -14685,6 +14802,7 @@ mod tests {
                 parent_id: None,
                 locked: false,
                 unlocked: false,
+                is_root: false,
                 kind: "note".into(),
             },
             "2026-07-14T00:00:00Z",

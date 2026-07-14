@@ -1209,6 +1209,17 @@ export interface BacklinkSource {
   timestamp: string;
 }
 
+/**
+ * A resolved `[[Title]]` wikilink navigation target — the VISIBLE note/meeting to
+ * open (`resolveWikilink(title)`). `null` when nothing matches OR the only match is
+ * sealed-and-not-session-unlocked (gated server-side, so a click can never reveal or
+ * open locked content). Mirrors the Rust `WikiTarget` (serde camelCase).
+ */
+export interface WikiTarget {
+  kind: SourceKind;
+  id: string;
+}
+
 /** The two entity kinds the self-assembling graph resolves (Rust `EntityKind`, camelCase). */
 export type EntityKind = "person" | "project";
 
