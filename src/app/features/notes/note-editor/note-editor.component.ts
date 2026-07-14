@@ -22,6 +22,7 @@ import { tabKeyFor } from "../../../core/tab-keys";
 import { TabsService } from "../../../core/tabs.service";
 import type {
   AppConfigDto,
+  BacklinkSource,
   FolderNode,
   NoteDoc,
   NoteFolder,
@@ -30,6 +31,7 @@ import { DebounceService } from "../../../services/debounce.service";
 import { FoldersService } from "../../../services/folders.service";
 import { NotesService } from "../../../services/notes.service";
 import { ToastService } from "../../../services/toast.service";
+import { BacklinksComponent } from "../../../shared/backlinks/backlinks.component";
 import { MarkdownComponent } from "../../../shared/markdown/markdown.component";
 import { NOTE_ASSIST_CATALOG } from "../note-brain-popover/note-assist-catalog";
 import {
@@ -122,6 +124,7 @@ const FULL_WIDTH_KEY = "murmur-note-full-width";
   selector: "app-note-editor",
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [
+    BacklinksComponent,
     MarkdownComponent,
     NoteBrainPopoverComponent,
     NoteSelectionToolbarComponent,
@@ -163,6 +166,21 @@ export class NoteEditorComponent {
   readonly note = signal<NoteDoc | null>(null);
   readonly loading = signal(true);
   readonly error = signal<string | null>(null);
+
+  // --- Note↔note backlinks ("Linked mentions") ----------------------------
+  /**
+   * The VISIBLE inbound sources (meetings + notes) that link/mention THIS note.
+   * Rendered under the properties bar. Empty until the first fetch resolves,
+   * while the note is locked/masked (the fetch is skipped — never surface
+   * backlinks behind a lock), and CLEARED in the `onLockTreeChanged` seal
+   * branch so a live seal drops stale chips immediately.
+   */
+  readonly backlinks = signal<BacklinkSource[]>([]);
+  /**
+   * Monotonic request token — a late `getBacklinks` reply for a superseded note
+   * id / lock transition is dropped (stale-result guard, trap #4).
+   */
+  private backlinksSeq = 0;
 
   // --- Editable surfaces (source state) -----------------------------------
   /** The title (borderless input). */
@@ -364,6 +382,38 @@ export class NoteEditorComponent {
     void this.fetchNote(id, seq);
   });
 
+  /**
+   * Load this note's backlinks whenever the loaded doc (id / lock state)
+   * changes, and SKIP the fetch entirely while it is locked/masked (never
+   * surface backlinks behind a lock — the same discipline as the seal branch's
+   * clear). A legitimate signal-writing effect (T1): async IPC keyed on inputs
+   * with a stale-result guard. A late reply for a superseded note id / lock
+   * transition is dropped by the seq check.
+   */
+  private readonly _loadBacklinks = effect(() => {
+    const doc = this.note();
+    const seq = ++this.backlinksSeq;
+    if (!doc || doc.locked) {
+      this.backlinks.set([]);
+      return;
+    }
+    void this.fetchBacklinks(doc.id, seq);
+  });
+
+  private async fetchBacklinks(id: string, seq: number): Promise<void> {
+    try {
+      const rows = await this.ipc.getBacklinks("note", id);
+      if (seq !== this.backlinksSeq) {
+        return; // superseded by a newer note / lock transition
+      }
+      this.backlinks.set(Array.isArray(rows) ? rows : []);
+    } catch {
+      if (seq === this.backlinksSeq) {
+        this.backlinks.set([]);
+      }
+    }
+  }
+
   /** Persist the "Full width" preference whenever it changes (mirrors AppShellComponent). */
   private readonly _persistFullWidth = effect(() => {
     const value = this.fullWidth();
@@ -459,6 +509,10 @@ export class NoteEditorComponent {
       this.debounce.cancel("note-editor-save");
       this.pendingSave = null;
       this.dirtyFull = false;
+      // Drop stale backlink chips immediately on a live seal (belt-and-braces
+      // with the `_loadBacklinks` effect's own skip-while-locked, so a detached
+      // tab holds no linked-mention titles behind the lock from this instant).
+      this.backlinks.set([]);
       this.hydrate({
         ...doc,
         locked: true,

@@ -1,0 +1,25 @@
+@if (sources().length) {
+  <div class="bl">
+    <span class="bl-label">Linked mentions</span>
+    @for (s of visible(); track s.id) {
+      <a class="bl-chip" [routerLink]="routeFor(s)">
+        @if (s.kind === "meeting") {
+          <span class="bl-kind bl-kind--meeting" aria-hidden="true">meeting</span>
+        } @else {
+          <span class="bl-kind bl-kind--note" aria-hidden="true">note</span>
+        }
+        <span class="bl-title">{{ s.title }}</span>
+        <span class="bl-date">{{ fmt(s.timestamp) }}</span>
+      </a>
+    }
+    @if (sources().length > limit()) {
+      <button type="button" class="bl-more" (click)="toggle()">
+        {{
+          expanded()
+            ? "Show less"
+            : "+" + (sources().length - limit()) + " more"
+        }}
+      </button>
+    }
+  </div>
+}
