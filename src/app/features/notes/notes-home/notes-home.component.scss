@@ -240,8 +240,10 @@
 .new-note-btn {
   gap: var(--space-2);
 }
-.view-switcher {
-  margin-right: var(--space-1);
+/* The saved-views switcher bar — same in-flow spacing as Meetings' (library.scss). */
+.views-switcher {
+  display: block;
+  margin: var(--space-3) 0 var(--space-4);
 }
 
 /* --- Locked-folder gate --- */
