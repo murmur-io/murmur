@@ -14,8 +14,10 @@ use crate::storage::models::{
     CorrectionRecord, DayCount,
     DocChunkHit, DocumentInfo, DocumentSummary, EntityDetail, EntityKind, EntityNeighbor, Folder,
     GraphData,
-    GraphEdge, GraphEntity, GraphNode, Meeting, MeetingStatus, NoteFolder, NoteRecord, NoteSummary,
-    OrgChunkHit, PendingShareAccept, PeopleList, PersonCard, RecipeRecord, SearchHit, SourceKind,
+    GraphEdge, GraphEntity, GraphNode, Meeting, MeetingActionSummary, MeetingStatus, NoteFolder,
+    NoteRecord, NoteSummary,
+    OrgChunkHit, PendingShareAccept, PeopleList, PersonCard, RecipeRecord, SavedView, SearchHit,
+    SourceKind,
     StatusCount,
     VaultSource,
 };
@@ -342,6 +344,17 @@ impl Db {
                prompt TEXT NOT NULL,
                created_at TEXT NOT NULL
              );
+             CREATE TABLE IF NOT EXISTS saved_views (
+               id TEXT PRIMARY KEY,
+               scope TEXT NOT NULL,
+               name TEXT NOT NULL,
+               layout TEXT NOT NULL,
+               config TEXT NOT NULL,
+               sort_order INTEGER NOT NULL DEFAULT 0,
+               created_at TEXT NOT NULL,
+               updated_at TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_saved_views_scope ON saved_views(scope, sort_order);
              CREATE TABLE IF NOT EXISTS folders (
                id TEXT PRIMARY KEY,
                name TEXT NOT NULL,
@@ -6415,6 +6428,130 @@ impl Db {
         Ok(())
     }
 
+    // ── saved views (Feature B) ──────────────────────────────────────────────
+    //
+    // CONTENT-FREE, single-user metadata (mirrors `saved_recipes`): these store only a VIEW
+    // DEFINITION (an opaque FE-owned `config` JSON blob + presentation fields), never meeting
+    // content. They are therefore NOT visibility-gated — there is nothing sealed to leak. The
+    // ACTUAL content aggregation the meetings surface renders (`list_meeting_action_summaries`,
+    // below) IS gated, exactly like `list_open_commitments`.
+
+    /// All saved views for one list `scope`, ordered as the user arranged them (sort_order, then
+    /// creation for stability). No visibility gate — view metadata only.
+    pub fn list_saved_views(&self, scope: &str) -> Result<Vec<SavedView>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, scope, name, layout, config, sort_order, created_at, updated_at
+                   FROM saved_views
+                  WHERE scope = ?1
+                  ORDER BY sort_order, created_at",
+            )
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![scope], |r| {
+                Ok(SavedView {
+                    id: r.get(0)?,
+                    scope: r.get(1)?,
+                    name: r.get(2)?,
+                    layout: r.get(3)?,
+                    config: r.get(4)?,
+                    sort_order: r.get(5)?,
+                    created_at: r.get(6)?,
+                    updated_at: r.get(7)?,
+                })
+            })
+            .map_err(map_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(map_err)?);
+        }
+        Ok(out)
+    }
+
+    /// Insert-or-replace a saved view (create on a fresh id, edit on an existing one).
+    pub fn upsert_saved_view(&self, v: &SavedView) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT OR REPLACE INTO saved_views
+               (id, scope, name, layout, config, sort_order, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params![
+                v.id,
+                v.scope,
+                v.name,
+                v.layout,
+                v.config,
+                v.sort_order,
+                v.created_at,
+                v.updated_at,
+            ],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Delete a saved view by id (idempotent).
+    pub fn delete_saved_view(&self, id: &str) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "DELETE FROM saved_views WHERE id = ?1",
+            rusqlite::params![id],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Persist a user reordering: assign `sort_order = position` to each id in `ordered_ids`, scoped
+    /// to `scope` (so a stray id from another scope can't be moved). Batched in ONE transaction so a
+    /// crash mid-reorder leaves the previous order intact (all-or-nothing).
+    pub fn reorder_saved_views(&self, scope: &str, ordered_ids: &[String]) -> Result<()> {
+        let conn = self.lock();
+        let tx = conn.unchecked_transaction().map_err(map_err)?;
+        for (pos, id) in ordered_ids.iter().enumerate() {
+            tx.execute(
+                "UPDATE saved_views SET sort_order = ?1 WHERE id = ?2 AND scope = ?3",
+                rusqlite::params![pos as i64, id, scope],
+            )
+            .map_err(map_err)?;
+        }
+        tx.commit().map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Per-meeting open/done action-item counts for the saved-views meetings surface. GATED exactly
+    /// like [`Self::list_open_commitments`]: only VISIBLE meetings are enumerated
+    /// (`list_meetings_visible`) and only the VISIBLE note is read (`get_note_if_visible` → `None`
+    /// for sealed-and-not-session-unlocked). A sealed meeting contributes NO row at all (aggregate
+    /// posture — NOT a masked/zeroed row), so its existence, title, and task counts never leak.
+    pub fn list_meeting_action_summaries(
+        &self,
+        unlocked: &HashSet<String>,
+    ) -> Result<Vec<MeetingActionSummary>> {
+        let mut out: Vec<MeetingActionSummary> = Vec::new();
+        // GATE 1: only VISIBLE meetings. GATE 2: only the VISIBLE note (None for sealed-not-unlocked).
+        for m in self.list_meetings_visible(1000, unlocked)? {
+            let Some(note) = self.get_note_if_visible(&m.id, unlocked)? else {
+                continue; // sealed-and-not-unlocked → no row (aggregate posture).
+            };
+            let mut open_count = 0i64;
+            let mut done_count = 0i64;
+            for item in crate::summarize::action_items::parse_action_items(&note.markdown) {
+                if item.done {
+                    done_count += 1;
+                } else {
+                    open_count += 1;
+                }
+            }
+            out.push(MeetingActionSummary {
+                meeting_id: m.id,
+                open_count,
+                done_count,
+            });
+        }
+        Ok(out)
+    }
+
     // ── settings k/v table ───────────────────────────────────────────────────
 
     pub fn get_setting(&self, key: &str) -> Result<Option<String>> {
@@ -11212,6 +11349,26 @@ mod tests {
         let db = mem_db();
         db.migrate().unwrap();
         db.migrate().unwrap();
+
+        // Feature B (saved views): the additive `saved_views` table must exist after migrate and
+        // STILL exist (idempotently) after a re-migrate — `CREATE TABLE IF NOT EXISTS` never drops.
+        let has_saved_views = |db: &Db| -> bool {
+            db.lock()
+                .query_row(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'saved_views'",
+                    [],
+                    |_| Ok(()),
+                )
+                .optional()
+                .unwrap()
+                .is_some()
+        };
+        assert!(has_saved_views(&db), "saved_views table missing after migrate");
+        db.migrate().unwrap();
+        assert!(
+            has_saved_views(&db),
+            "saved_views table missing after a second migrate (idempotency broken)"
+        );
     }
 
     /// 2026-07-13 perf audit: `meetings.started_at` (every list/search sorts on it) and
@@ -16618,6 +16775,119 @@ mod lock_tests {
         assert_eq!(anna.len(), 1);
         assert!(anna[0].text.contains("ship the deck"));
         assert_eq!(anna[0].meeting_title, "title-open1");
+    }
+
+    /// Feature B saved-views CRUD: upsert → list returns it; edit updates in place; delete removes
+    /// it; reorder rewrites `sort_order` and the list respects the new order. Content-free metadata
+    /// (no gate) — the `config` blob is stored opaquely and round-trips byte-identical.
+    #[test]
+    fn saved_views_crud_round_trip() {
+        let db = file_db("saved-views-crud");
+        let mk = |id: &str, name: &str, order: i64| SavedView {
+            id: id.to_string(),
+            scope: "meetings".to_string(),
+            name: name.to_string(),
+            layout: "list".to_string(),
+            config: r#"{"filters":[{"field":"status","op":"eq","value":"summarized"}],"sort":"started_at"}"#
+                .to_string(),
+            sort_order: order,
+            created_at: "2026-07-14T09:00:00Z".to_string(),
+            updated_at: "2026-07-14T09:00:00Z".to_string(),
+        };
+
+        // Empty to start; a different scope never leaks in.
+        assert!(db.list_saved_views("meetings").unwrap().is_empty());
+
+        // Upsert two → list returns both in sort_order.
+        db.upsert_saved_view(&mk("v-a", "Recent", 0)).unwrap();
+        db.upsert_saved_view(&mk("v-b", "Untitled", 1)).unwrap();
+        let views = db.list_saved_views("meetings").unwrap();
+        assert_eq!(views.len(), 2);
+        assert_eq!(views[0].id, "v-a");
+        assert_eq!(views[1].id, "v-b");
+        // The opaque config round-trips byte-identical (never parsed/mutated by the backend).
+        assert!(views[0].config.contains(r#""field":"status""#));
+
+        // Edit v-a in place (INSERT OR REPLACE): name changes, count stays 2.
+        let mut edited = mk("v-a", "Renamed", 0);
+        edited.updated_at = "2026-07-14T10:00:00Z".to_string();
+        db.upsert_saved_view(&edited).unwrap();
+        let views = db.list_saved_views("meetings").unwrap();
+        assert_eq!(views.len(), 2, "edit must not create a duplicate row");
+        assert_eq!(views.iter().find(|v| v.id == "v-a").unwrap().name, "Renamed");
+
+        // Reorder: v-b before v-a → sort_order rewritten, list order follows.
+        db.reorder_saved_views("meetings", &["v-b".to_string(), "v-a".to_string()])
+            .unwrap();
+        let views = db.list_saved_views("meetings").unwrap();
+        assert_eq!(views[0].id, "v-b");
+        assert_eq!(views[0].sort_order, 0);
+        assert_eq!(views[1].id, "v-a");
+        assert_eq!(views[1].sort_order, 1);
+
+        // Delete v-a → only v-b remains; delete is idempotent.
+        db.delete_saved_view("v-a").unwrap();
+        let views = db.list_saved_views("meetings").unwrap();
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].id, "v-b");
+        db.delete_saved_view("v-a").unwrap(); // no-op, no error
+        assert_eq!(db.list_saved_views("meetings").unwrap().len(), 1);
+    }
+
+    /// GATE regression (RED against a naive impl that reads note markdown without the
+    /// `get_note_if_visible`/`visibility` gate): a sealed-and-not-session-unlocked meeting must
+    /// contribute ZERO rows to the per-meeting action-item summary (aggregate posture — NOT a
+    /// masked/zeroed row). After a session unlock its real open/done counts appear.
+    #[test]
+    fn list_meeting_action_summaries_excludes_sealed_meeting() {
+        let db = file_db("action-summaries-gate");
+        seed_folder(&db, "f-lock", "Secret");
+        // An OPEN meeting (vault root): 2 open + 1 done.
+        seed_note(
+            &db,
+            "open1",
+            "## Action items\n- [ ] Anna — ship the deck 2026-07-01\n- [ ] loose task\n- [x] Bob — done thing\n",
+            None,
+        );
+        // A meeting we will SEAL (folder locked): 1 open + 1 done — must contribute NOTHING until
+        // session-unlocked. Uses a distinct owner/text so a leak would be unambiguous.
+        seed_note(
+            &db,
+            "sealed",
+            "## Action items\n- [ ] Dave — secret task 2026-07-02\n- [x] Eve — secret done\n",
+            Some("f-lock"),
+        );
+        db.set_folder_locked("f-lock", true, None).unwrap();
+
+        // GATED (folder locked, not session-unlocked): the sealed meeting is absent entirely.
+        let locked = db.list_meeting_action_summaries(&HashSet::new()).unwrap();
+        assert!(
+            locked.iter().all(|s| s.meeting_id != "sealed"),
+            "sealed-not-unlocked meeting leaked into the action summary (gate violation)"
+        );
+        let open1 = locked
+            .iter()
+            .find(|s| s.meeting_id == "open1")
+            .expect("open meeting must be summarized");
+        assert_eq!(open1.open_count, 2, "open1 has 2 open items");
+        assert_eq!(open1.done_count, 1, "open1 has 1 done item");
+        assert_eq!(
+            locked.len(),
+            1,
+            "only the visible open meeting contributes a row while the folder is sealed"
+        );
+
+        // SESSION-UNLOCK → the sealed meeting's real counts appear (reversible).
+        let mut unlocked = HashSet::new();
+        unlocked.insert("f-lock".to_string());
+        let all = db.list_meeting_action_summaries(&unlocked).unwrap();
+        let sealed = all
+            .iter()
+            .find(|s| s.meeting_id == "sealed")
+            .expect("unlocked sealed meeting must now contribute a row");
+        assert_eq!(sealed.open_count, 1, "sealed meeting has 1 open item");
+        assert_eq!(sealed.done_count, 1, "sealed meeting has 1 done item");
+        assert_eq!(all.len(), 2, "both meetings visible after unlock");
     }
 
     #[test]

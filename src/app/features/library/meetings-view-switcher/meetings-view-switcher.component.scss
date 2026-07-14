@@ -1,0 +1,202 @@
+:host {
+  display: block;
+}
+
+.sv-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+  flex-wrap: wrap;
+}
+
+/* --- View tabs (mirrors the tagbar .chip language) ------------------------- */
+.sv-tabs {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+
+.sv-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  height: 30px;
+  padding: 0 var(--space-3);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-pill);
+  background: var(--surface-input);
+  color: var(--text-secondary);
+  font-family: inherit;
+  font-size: 0.8125rem;
+  font-weight: 550;
+  line-height: 1;
+  white-space: nowrap;
+  cursor: pointer;
+  transition:
+    background var(--transition),
+    border-color var(--transition),
+    color var(--transition);
+}
+.sv-tab:hover {
+  background: var(--surface-hover);
+  border-color: var(--border-strong);
+  color: var(--text-primary);
+}
+.sv-tab:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+.sv-tab.is-active {
+  background: var(--accent-soft);
+  border-color: transparent;
+  color: var(--accent-hover);
+  font-weight: 600;
+}
+.sv-tab-glyph {
+  display: inline-flex;
+  color: var(--text-muted);
+}
+.sv-tab.is-active .sv-tab-glyph {
+  color: var(--accent-hover);
+}
+
+.sv-add {
+  position: relative;
+  display: inline-flex;
+}
+.sv-add-btn {
+  width: 30px;
+  padding: 0;
+  justify-content: center;
+  color: var(--text-muted);
+}
+
+/* --- Active-view controls -------------------------------------------------- */
+.sv-controls {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+.sv-config {
+  position: relative;
+  display: inline-flex;
+}
+.sv-config-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+.sv-filter-count {
+  margin-left: var(--space-1);
+}
+
+/* --- Floating panels: opaque overlays (T3) --------------------------------- */
+/* .menu already paints var(--surface-overlay) + no blur; only position them. */
+.sv-panel {
+  position: absolute;
+  top: calc(100% + var(--space-2));
+  z-index: 60;
+}
+.sv-add .sv-panel {
+  left: 0;
+}
+.sv-config-panel {
+  right: 0;
+  min-width: 340px;
+  max-width: 420px;
+}
+
+.sv-section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding-bottom: var(--space-2);
+}
+.sv-section + .sv-section {
+  border-top: 1px solid var(--border-subtle);
+  padding-top: var(--space-2);
+}
+
+.sv-name-input,
+.sv-value-input,
+.sv-select {
+  height: 30px;
+  padding: 0 var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-input);
+  color: var(--text-primary);
+  font-family: inherit;
+  font-size: 0.8125rem;
+}
+.sv-name-input {
+  width: 100%;
+  margin-bottom: var(--space-2);
+}
+.sv-name-input:focus-visible,
+.sv-value-input:focus-visible,
+.sv-select:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--accent-ring);
+}
+/* <select> options paint the opaque overlay too (T3). */
+.sv-select option {
+  background: var(--surface-overlay);
+  color: var(--text-primary);
+}
+
+.sv-add-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-2);
+}
+
+.sv-filter-row,
+.sv-sort-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+.sv-filter-row .sv-select {
+  flex: 1 1 0;
+  min-width: 0;
+}
+.sv-value-input {
+  flex: 1 1 0;
+  min-width: 0;
+}
+.sv-sort-row .sv-select {
+  flex: 1 1 0;
+  min-width: 0;
+}
+
+.sv-remove {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  flex: none;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+.sv-remove:hover {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.sv-add-filter {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.sv-hint {
+  padding: 0 var(--space-1);
+  font-size: 0.8125rem;
+}

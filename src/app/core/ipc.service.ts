@@ -70,6 +70,8 @@ import type {
   VerifyFindingDto,
   ProviderStatus,
   SavedRecipe,
+  SavedView,
+  MeetingActionSummary,
   SearchHit,
   StartResult,
   StatusPayload,
@@ -940,6 +942,37 @@ export class IpcService {
   /** Permanently delete a meeting (audio + vault note + all DB rows). Irreversible. */
   deleteMeeting(meetingId: string): Promise<void> {
     return invoke<void>("delete_meeting", { meetingId });
+  }
+
+  // --- Saved views over the meetings list (Feature B) --------------------
+
+  /** All saved views for a scope, in `sortOrder`. `scope` is `"meetings"` for this feature. */
+  listSavedViews(scope: "meetings"): Promise<SavedView[]> {
+    return invoke<SavedView[]>("list_saved_views", { scope });
+  }
+
+  /** Create or update a saved view (id present ⇒ update). Returns the persisted row. */
+  upsertSavedView(view: SavedView): Promise<SavedView> {
+    return invoke<SavedView>("upsert_saved_view", { view });
+  }
+
+  /** Permanently delete a saved view. */
+  deleteSavedView(id: string): Promise<void> {
+    return invoke<void>("delete_saved_view", { id });
+  }
+
+  /** Persist a new left-to-right ordering of a scope's saved views. */
+  reorderSavedViews(scope: "meetings", orderedIds: string[]): Promise<void> {
+    return invoke<void>("reorder_saved_views", { scope, orderedIds });
+  }
+
+  /**
+   * Per-meeting open/done action-item counts, for the Table/Board views. Gated
+   * server-side exactly like every meeting read — a sealed-and-not-session-
+   * unlocked meeting contributes no summary (so a locked row shows no counts).
+   */
+  listMeetingActionSummaries(): Promise<MeetingActionSummary[]> {
+    return invoke<MeetingActionSummary[]>("list_meeting_action_summaries");
   }
 
   /** Rename a meeting's title. */

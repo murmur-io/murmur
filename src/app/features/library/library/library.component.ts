@@ -30,10 +30,15 @@ import {
 } from "../../../services/folders.service";
 import { MeetingsListStore } from "../../../services/meetings-list-store.service";
 import { OrgBrainService } from "../../../services/org-brain.service";
+import { SavedViewsService } from "../../../services/saved-views.service";
+import { ViewEngine } from "../../../services/view-engine";
 import { LockBadgeComponent } from "../../folders/lock-badge/lock-badge.component";
 import { MoveToMenuComponent } from "../../folders/move-to-menu/move-to-menu.component";
 import { NoteDragService } from "../../folders/note-drag.service";
 import { ToastService } from "../../../services/toast.service";
+import { MeetingsViewSwitcherComponent } from "../meetings-view-switcher/meetings-view-switcher.component";
+import { MeetingsTableViewComponent } from "../meetings-table-view/meetings-table-view.component";
+import { MeetingsBoardViewComponent } from "../meetings-board-view/meetings-board-view.component";
 
 /** Debounce window for search-as-you-type — quick enough to feel instant. */
 const SEARCH_DEBOUNCE_MS = 180;
@@ -95,6 +100,9 @@ export interface OrgMeetingListItem {
     MurSpinnerComponent,
     LockBadgeComponent,
     MoveToMenuComponent,
+    MeetingsViewSwitcherComponent,
+    MeetingsTableViewComponent,
+    MeetingsBoardViewComponent,
   ],
   templateUrl: "./library.component.html",
   styleUrl: "./library.component.scss",
@@ -108,6 +116,7 @@ export class LibraryComponent implements OnInit {
   private readonly tabsService = inject(TabsService);
   private readonly meetingsStore = inject(MeetingsListStore);
   private readonly orgBrain = inject(OrgBrainService);
+  private readonly savedViews = inject(SavedViewsService);
 
   /**
    * Open a meeting as a browser-style tab (replaces the row's plain
@@ -457,6 +466,90 @@ export class LibraryComponent implements OnInit {
   /** True when the no-query list has zero rows (drives the empty state). */
   readonly listEmpty = computed(() => this.listItems().length === 0);
 
+  // --- Saved views (Feature B — Table + Board over the meetings list) -------
+  /**
+   * The currently-active saved view (null ⇒ the plain List default — the
+   * existing rendering is then byte-identical). Root-persisted in
+   * {@link SavedViewsService} so it survives the list route's destroy+recreate.
+   */
+  readonly activeSavedView = this.savedViews.activeView;
+  /**
+   * Per-meeting open/done action-item counts, merged into the Table/Board
+   * views. Root-persisted alongside the roster; empty until loaded (a locked
+   * meeting is omitted server-side → its row shows no counts).
+   */
+  readonly actionSummaries = this.savedViews.actionSummaries;
+
+  /**
+   * The rows a saved TABLE view renders — the ViewEngine applies the active
+   * view's parsed config (filter/sort) over the SAME `displayedMeetings` the
+   * List uses (already gated; a masked meeting stays masked). `null` when no
+   * view is active or the active view is a board.
+   */
+  readonly viewTableRows = computed(() => {
+    const view = this.activeSavedView();
+    if (!view || view.layout !== "table") {
+      return null;
+    }
+    return ViewEngine.rows(
+      this.displayedMeetings(),
+      this.savedViews.configOf(view),
+      this.actionSummaries(),
+      this.folderNameFn,
+    );
+  });
+
+  /**
+   * The board columns a saved BOARD view renders (filter/sort/group applied by
+   * the ViewEngine over the same gated meetings). `null` when no view is active
+   * or the active view is a table.
+   */
+  readonly viewBoardGroups = computed(() => {
+    const view = this.activeSavedView();
+    if (!view || view.layout !== "board") {
+      return null;
+    }
+    return ViewEngine.groups(
+      this.displayedMeetings(),
+      this.savedViews.configOf(view),
+      this.actionSummaries(),
+      this.folderNameFn,
+    );
+  });
+
+  /** The active view's visible column ids (table only; safe default otherwise). */
+  readonly viewColumns = computed<string[]>(() => {
+    const view = this.activeSavedView();
+    return view ? this.savedViews.configOf(view).columns : [];
+  });
+
+  /**
+   * Bound function references handed to the Table/Board child inputs (they
+   * need `this` bound since Angular calls them detached from the instance).
+   * All three are pure display resolvers over already-loaded state.
+   */
+  readonly folderNameFn = (m: Meeting): string | null => this.folderNameOf(m);
+  readonly folderExposureFn = (m: Meeting): FolderExposure | null =>
+    this.folderExposureOf(m);
+  readonly isMaskedFn = (m: Meeting): boolean => this.isMasked(m);
+
+  /** A Table/Board row asked to open a meeting — same tab-open path as the list. */
+  onViewOpenMeeting(payload: { event: Event; meeting: Meeting }): void {
+    this.openMeeting(
+      payload.event,
+      payload.meeting.id,
+      payload.meeting.title,
+    );
+  }
+
+  /** The switcher changed the active view / its config — refresh action counts lazily. */
+  onViewChanged(): void {
+    // The roster + config already live in SavedViewsService (the switcher drove
+    // them); nothing to reload here except keep the action counts warm on first
+    // activation. Cheap + idempotent (stale-while-revalidate).
+    void this.savedViews.loadActionSummaries();
+  }
+
   /** Epoch-ms sort key for a meeting (its start time; 0 when unparseable). */
   private meetingSortAt(m: Meeting): number {
     const t = Date.parse(m.startedAt);
@@ -585,12 +678,16 @@ export class LibraryComponent implements OnInit {
     // Live-refresh (org-feed-updated + window-focus) is subscribed ONCE, for the
     // app's lifetime, by the shared OrgBrainService now — no per-mount wiring here.
 
-    // Load the meetings list, the tag set, and the org chip row in parallel; any one
-    // failing must not break the others, so settle each independently.
+    // Load the meetings list, the tag set, the org chip row, the saved-view
+    // roster + action counts in parallel; any one failing must not break the
+    // others, so settle each independently. (The saved-view roster + counts
+    // live in the root SavedViewsService — they survive this route's remount.)
     const [meetings] = await Promise.allSettled([
       this.ipc.listMeetings(),
       this.loadTags(),
       this.loadOrgs(),
+      this.savedViews.load(),
+      this.savedViews.loadActionSummaries(),
     ]);
     if (meetings.status === "fulfilled") {
       this.meetings.set(meetings.value);
