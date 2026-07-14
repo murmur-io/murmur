@@ -414,6 +414,12 @@
   margin: 0;
 }
 
+/* Saved-views switcher sits between the heading and the list/table/board. */
+.views-switcher {
+  display: block;
+  margin: var(--space-3) 0 var(--space-4);
+}
+
 /* Muted "audio freed" chip on a pruned meeting row. */
 .audio-freed {
   font-size: 0.7rem;
