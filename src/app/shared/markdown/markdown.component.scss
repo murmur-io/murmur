@@ -150,6 +150,16 @@
   font-size: 0.9em;
   font-weight: 500;
   white-space: nowrap;
+  cursor: pointer;
+  transition:
+    background var(--transition-fast),
+    color var(--transition-fast);
+}
+.md-wikilink:hover,
+.md-wikilink:focus-visible {
+  background: var(--accent);
+  color: var(--text-on-accent);
+  outline: none;
 }
 .md-wikilink::before {
   content: "🔗";
