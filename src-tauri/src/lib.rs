@@ -326,6 +326,7 @@ pub fn run() {
             commands::move_note,
             // Notes feature — authored `documents(kind='note')` CRUD + note folders + vault export.
             commands::create_note,
+            commands::suggest_note_title,
             commands::get_note,
             commands::update_note_doc,
             commands::save_note_text,

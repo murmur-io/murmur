@@ -36,6 +36,14 @@
               <path d="M4 6l4 4 4-4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" />
             </svg>
           </button>
+          <!-- Privacy hint: an unfiled note lives in the always-open root and is NOT sealed. -->
+          @if (isUnfiled()) {
+            <span
+              class="unfiled-hint"
+              title="Unfiled notes aren't encrypted. Move this note into a locked folder to seal it."
+              >not sealed</span
+            >
+          }
           @if (menu() === "move") {
             <div class="menu head-menu" role="menu" aria-label="Move to folder">
               <p class="menu-group-label">Move to…</p>
@@ -47,7 +55,7 @@
                   [disabled]="folder.id === doc.folderId"
                   (click)="moveTo(folder.id)"
                 >
-                  {{ folder.name }}
+                  {{ folder.isRoot ? "Unfiled" : folder.name }}
                   @if (folder.id === doc.folderId) {
                     <span class="menu-here">Here</span>
                   }

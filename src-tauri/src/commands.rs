@@ -2436,6 +2436,146 @@ pub(crate) fn create_note_inner(
     Ok(id)
 }
 
+/// System prompt for the on-device auto-title (Feature B, 2026-07-14). Short + strict output so the
+/// result is a clean headline, not a sentence.
+const AUTO_TITLE_SYSTEM: &str = "You write a short, specific title (3 to 6 words) for a note. \
+Output ONLY the title text — no surrounding quotes, no trailing punctuation, no 'Title:' prefix.";
+
+/// The on-device summarizer for a LOCAL-ONLY, zero-egress title — `None` when the on-device model
+/// isn't downloaded (the caller then uses the first-line heuristic). NEVER the cloud: an auto-title
+/// must never egress the note. Mirrors the local-provider construction in `summarize::provider_for`.
+fn local_title_provider(
+    state: &AppState,
+) -> Option<std::sync::Arc<dyn crate::summarize::provider::SummarizerProvider>> {
+    let (configured_path, model_id, timeouts) = {
+        let config = state.config.lock().ok()?;
+        (
+            config.brain_model_path.clone(),
+            config.brain_model_id.clone(),
+            crate::reason::sidecar::SidecarTimeouts {
+                idle_secs: config.brain_idle_timeout_secs,
+                ready_secs: config.brain_ready_timeout_secs,
+                hard_cap_secs: config.brain_hard_cap_secs,
+            },
+        )
+    };
+    let configured = configured_path.as_deref().map(std::path::Path::new);
+    let path = crate::reason::resolve_brain_model(configured, model_id.as_deref()).ok()??;
+    let reasoner: std::sync::Arc<dyn crate::reason::LocalReasoner> =
+        std::sync::Arc::new(crate::reason::sidecar::SidecarReasoner::new(path, timeouts).ok()?);
+    Some(std::sync::Arc::new(
+        crate::summarize::local::LocalSummarizerProvider::new(
+            reasoner,
+            std::sync::Arc::clone(&state.heavy_inference),
+        ),
+    ))
+}
+
+/// Clean an LLM title suggestion into a single tidy line, or `None` if it collapsed to nothing.
+fn sanitize_title_suggestion(raw: &str) -> Option<String> {
+    let line = raw.trim().lines().next().unwrap_or("").trim();
+    let line = line
+        .trim_matches('"')
+        .trim_matches('\'')
+        .trim_start_matches('#')
+        .trim();
+    let line = line.trim_end_matches(['.', ':', '-']).trim();
+    if line.is_empty() {
+        return None;
+    }
+    Some(line.chars().take(80).collect())
+}
+
+/// Fallback title: the first non-empty line of the body, stripped of leading markdown, capped.
+fn first_line_title(body: &str) -> String {
+    let line = body
+        .lines()
+        .map(|l| l.trim())
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    let line = line.trim_start_matches(['#', '-', '*', '>', ' ']).trim();
+    let capped: String = line.chars().take(60).collect();
+    if capped.is_empty() {
+        "Untitled".to_string()
+    } else {
+        capped
+    }
+}
+
+/// `suggest_note_title(note_id)` — auto-title an "Untitled" note from its body (Feature B): the
+/// on-device model when present, else a first-line heuristic. LOCAL-ONLY (never egresses). Persists
+/// the new title ONLY if the note is still "Untitled" (never clobbers a user's title) and skips a note
+/// in a LOCKED folder (spec decision #3 — no auto-unlock / seal-on-write for a title). Returns the
+/// title (the current one unchanged when it skips). Called fire-and-forget by the editor on close.
+#[tauri::command]
+pub async fn suggest_note_title(
+    state: State<'_, AppState>,
+    note_id: String,
+) -> Result<String, AppError> {
+    suggest_note_title_inner(state.inner(), &note_id).await
+}
+
+pub(crate) async fn suggest_note_title_inner(
+    state: &AppState,
+    note_id: &str,
+) -> Result<String, AppError> {
+    let Some(row) = state.db.get_note_row(note_id)? else {
+        return Err(AppError::InvalidArg(format!("no note {note_id}")));
+    };
+    // `NoteRow.title` is Option<String> (NULL-able column) — treat a missing title as "".
+    let current = row.title.clone().unwrap_or_default();
+    // Only ever fill in an "Untitled" note — never overwrite a title the user chose.
+    let cur = current.trim();
+    if !cur.is_empty() && cur != "Untitled" {
+        return Ok(current);
+    }
+    // Skip a locked folder: new notes live in the always-open root, so this only skips the rare
+    // deliberately-filed-then-locked case; auto-titling it would need seal-on-write / an unlock.
+    let folder_locked = state
+        .db
+        .folder_by_id(&row.folder_id)?
+        .map(|f| f.locked)
+        .unwrap_or(false);
+    if folder_locked {
+        return Ok(current);
+    }
+    let body = row.text.trim();
+    if body.is_empty() {
+        return Ok(current);
+    }
+
+    // On-device first (zero egress); first-line heuristic otherwise / on failure.
+    let title = match local_title_provider(state) {
+        Some(provider) => {
+            let excerpt: String = body.chars().take(1200).collect();
+            match provider.complete(AUTO_TITLE_SYSTEM, &excerpt).await {
+                Ok(t) => sanitize_title_suggestion(&t).unwrap_or_else(|| first_line_title(body)),
+                Err(e) => {
+                    tracing::info!(target: "notes", error = %e, "auto-title: on-device failed, using first line");
+                    first_line_title(body)
+                }
+            }
+        }
+        None => first_line_title(body),
+    };
+    if title.trim().is_empty() || title == "Untitled" {
+        return Ok(current);
+    }
+
+    // Persist — re-read + re-check under the write so a title the user set meanwhile always wins.
+    if let Some(fresh) = state.db.get_note_row(note_id)? {
+        let fresh_title = fresh.title.clone().unwrap_or_default();
+        let ft = fresh_title.trim();
+        if ft.is_empty() || ft == "Untitled" {
+            let now = chrono::Utc::now().timestamp_millis();
+            state.db.update_note_row(note_id, &title, &fresh.text, now)?;
+            return Ok(title);
+        }
+        return Ok(fresh_title); // user titled it in the meantime
+    }
+    Ok(title)
+}
+
 /// Read ONE note (editor DTO). GATED: a sealed-and-not-session-unlocked note returns the MASKED DTO
 /// (title "🔒 Locked", no body/tags), never the stored text.
 #[tauri::command]
@@ -24318,6 +24458,56 @@ mod lifecycle_tests {
         assert!(
             matches!(err, AppError::InvalidArg(_)),
             "expected InvalidArg for an unknown item, got {err:?}"
+        );
+    }
+
+    /// Feature B (auto-title): a still-"Untitled" note gets a first-line title (no on-device model in
+    /// tests → the heuristic path), a user-titled note is NEVER overwritten, and an empty body stays
+    /// "Untitled". LOCAL-only; no egress in any branch.
+    #[test]
+    fn suggest_note_title_fills_untitled_and_never_clobbers() {
+        let state = build_state("auto-title");
+        make_open_folder(&state.db, "f", "Team");
+
+        // Untitled + body in an open folder → first non-empty line becomes the title, persisted.
+        state
+            .db
+            .insert_note("n1", "f", "n1", "Untitled", "# Kickoff planning\nmore body", 1)
+            .unwrap();
+        let t = block_on(suggest_note_title_inner(&state, "n1")).unwrap();
+        assert_eq!(t, "Kickoff planning");
+        assert_eq!(
+            state.db.get_note_row("n1").unwrap().unwrap().title.as_deref(),
+            Some("Kickoff planning"),
+            "the title is persisted"
+        );
+
+        // A user-set title is NEVER overwritten.
+        state
+            .db
+            .insert_note("n2", "f", "n2", "My Title", "some body", 1)
+            .unwrap();
+        assert_eq!(
+            block_on(suggest_note_title_inner(&state, "n2")).unwrap(),
+            "My Title"
+        );
+        assert_eq!(
+            state.db.get_note_row("n2").unwrap().unwrap().title.as_deref(),
+            Some("My Title")
+        );
+
+        // Untitled + EMPTY body → stays Untitled (nothing to title).
+        state
+            .db
+            .insert_note("n3", "f", "n3", "Untitled", "   \n  ", 1)
+            .unwrap();
+        assert_eq!(
+            block_on(suggest_note_title_inner(&state, "n3")).unwrap(),
+            "Untitled"
+        );
+        assert_eq!(
+            state.db.get_note_row("n3").unwrap().unwrap().title.as_deref(),
+            Some("Untitled")
         );
     }
 
