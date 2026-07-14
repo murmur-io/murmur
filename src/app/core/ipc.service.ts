@@ -56,6 +56,8 @@ import type {
   NoteFolder,
   NoteAssistRequest,
   NoteAssistResult,
+  PropertySchemaField,
+  TypedNoteRow,
   OrganizePlan,
   PeopleList,
   PinResult,
@@ -2002,6 +2004,44 @@ export class IpcService {
    */
   applyOrganizePlan(plan: OrganizePlan): Promise<void> {
     return invoke<void>("apply_organize_plan", { plan });
+  }
+
+  // ── Feature C — typed note front-matter properties (folder-level schema +
+  // the typed notes list feeding the Table/Board views). All three are GATED
+  // backend-side on the folder unlock: a LOCKED folder returns `[]` from BOTH
+  // reads (empty schema + empty rows), so no typed view is offered for it and
+  // no sealed content leaks. `properties` (the plaintext front-matter map) is
+  // untouched — the schema is a NEW parallel layer describing how to render it.
+
+  /**
+   * The property SCHEMA for a note-folder: one {@link PropertySchemaField} per
+   * defined property (its key + kind + select options). Returns `[]` for a
+   * LOCKED (sealed-and-not-session-unlocked) folder — the backend gates it, so a
+   * locked folder never exposes a typed view.
+   */
+  getNoteFolderSchema(folderId: string): Promise<PropertySchemaField[]> {
+    return invoke<PropertySchemaField[]>("get_note_folder_schema", { folderId });
+  }
+
+  /**
+   * Persist a note-folder's property schema (replaces the whole field set).
+   * Gated — rejects (`Locked`) for a sealed-and-not-session-unlocked folder.
+   */
+  setNoteFolderSchema(
+    folderId: string,
+    fields: PropertySchemaField[],
+  ): Promise<void> {
+    return invoke<void>("set_note_folder_schema", { folderId, fields });
+  }
+
+  /**
+   * The TYPED notes list for a folder — one {@link TypedNoteRow} per note, each
+   * carrying its property key → {@link PropertyValue} map, tags, and updatedAt,
+   * for the folder's Table/Board views. GATED IN THE QUERY: a SEALED folder
+   * returns `[]` and a masked row carries no values/tags — never a per-row leak.
+   */
+  listNotesTyped(folderId: string): Promise<TypedNoteRow[]> {
+    return invoke<TypedNoteRow[]>("list_notes_typed", { folderId });
   }
 
   /** The note-kind folder list (`kind='note'` only). */

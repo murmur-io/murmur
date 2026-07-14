@@ -1887,6 +1887,60 @@ export interface NoteFolder {
   kind: string;
 }
 
+// ── Feature C — typed note front-matter properties (a NEW, PARALLEL layer over
+// the plaintext `NoteDoc.properties: Record<string,string>`, which is UNCHANGED).
+// A folder-level SCHEMA names each property's KIND so the note editor can render
+// the right widget and the folder Table/Board views can render typed cells; the
+// underlying front-matter string round-trip (`front-matter.ts`) is untouched.
+// The pure coercion helpers live beside the editor
+// (`features/notes/note-editor/property-field-types.ts`) and re-export these.
+
+/** The kind a note-folder's property schema assigns to a property (drives the widget). */
+export type PropertyKind = "text" | "select" | "date" | "checkbox" | "number";
+
+/**
+ * One field in a note-folder's property schema (`get_note_folder_schema` /
+ * `set_note_folder_schema`). Mirrors the Rust `PropertySchemaField`. `options`
+ * is only meaningful for `kind === "select"` (empty for the others). `key`
+ * matches the front-matter property key.
+ */
+export interface PropertySchemaField {
+  key: string;
+  kind: PropertyKind;
+  /** Allowed values for a `select`; empty for other kinds. */
+  options: string[];
+}
+
+/**
+ * A typed property value (mirrors the Rust `PropertyValue`, adjacently tagged
+ * `{ kind, value }`). The `value`'s runtime type follows the `kind`:
+ * checkbox → boolean, number → number, everything else → string.
+ */
+export type PropertyValue =
+  | { kind: "text"; value: string }
+  | { kind: "select"; value: string }
+  | { kind: "date"; value: string }
+  | { kind: "checkbox"; value: boolean }
+  | { kind: "number"; value: number };
+
+/**
+ * One row of the typed notes list (`list_notes_typed`). Mirrors the Rust
+ * `TypedNoteRow`. `values` is keyed by property key (an absent key = no value
+ * for that field). Leak-free: a sealed folder returns `[]` and a masked row
+ * carries no `values`/`tags` — the backend gates it, so a locked folder shows
+ * no typed view.
+ */
+export interface TypedNoteRow {
+  id: string;
+  title: string;
+  folderId: string;
+  /** Property key → its typed value (absent key = no value). */
+  values: Record<string, PropertyValue>;
+  tags: string[];
+  /** Epoch ms of the last edit. */
+  updatedAt: number;
+}
+
 // ── Shared Brain v1 — org-wide E2EE replicated brain (DTOs mirror the spec
 // contract `docs/superpowers/specs/2026-07-10-shared-brain-v1-spec.md`, Rust
 // `#[serde(rename_all = "camelCase")]`). Org items live OUTSIDE the folder-lock

@@ -16,8 +16,9 @@ use crate::storage::models::{
     GraphData,
     GraphEdge, GraphEntity, GraphNode, Meeting, MeetingActionSummary, MeetingStatus, NoteFolder,
     NoteRecord, NoteSummary,
-    OrgChunkHit, PendingShareAccept, PeopleList, PersonCard, RecipeRecord, SavedView, SearchHit,
-    SourceKind,
+    OrgChunkHit, PendingShareAccept, PeopleList, PersonCard, PropertyKind, PropertySchemaField,
+    PropertyValue, RecipeRecord, SavedView, SearchHit,
+    SourceKind, TypedNoteRow,
     StatusCount,
     VaultSource,
 };
@@ -355,6 +356,11 @@ impl Db {
                updated_at TEXT NOT NULL
              );
              CREATE INDEX IF NOT EXISTS idx_saved_views_scope ON saved_views(scope, sort_order);
+             CREATE TABLE IF NOT EXISTS note_folder_schemas (
+               folder_id TEXT PRIMARY KEY REFERENCES folders(id) ON DELETE CASCADE,
+               schema_json TEXT NOT NULL DEFAULT '[]',
+               updated_at INTEGER NOT NULL
+             );
              CREATE TABLE IF NOT EXISTS folders (
                id TEXT PRIMARY KEY,
                name TEXT NOT NULL,
@@ -5913,6 +5919,125 @@ impl Db {
         Ok(out)
     }
 
+    // ── Feature C — TYPED note front-matter properties (note-folder schemas) ─────────────────────
+
+    /// Read a note-folder's declared property SCHEMA (Feature C). Returns the parsed field list, or
+    /// an EMPTY vec when the folder has no schema row. Content-free metadata: the schema declares
+    /// column names/types, never any note content. NOT lock-gated at this layer — the COMMAND layer
+    /// gates on the folder's session-unlock state (a locked folder's schema is deliberately not
+    /// exposed). A malformed `schema_json` (should never happen — we only ever write it via
+    /// [`Self::set_note_folder_schema`]) degrades to an empty vec rather than erroring the read.
+    pub fn get_note_folder_schema(&self, folder_id: &str) -> Result<Vec<PropertySchemaField>> {
+        let conn = self.lock();
+        let json: Option<String> = conn
+            .query_row(
+                "SELECT schema_json FROM note_folder_schemas WHERE folder_id = ?1",
+                rusqlite::params![folder_id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(map_err)?;
+        match json {
+            None => Ok(Vec::new()),
+            Some(s) => Ok(serde_json::from_str::<Vec<PropertySchemaField>>(&s).unwrap_or_default()),
+        }
+    }
+
+    /// UPSERT a note-folder's property schema (Feature C). Serializes `fields` to the `schema_json`
+    /// column, inserting a new row or replacing the existing one via `ON CONFLICT(folder_id)`. The
+    /// COMMAND layer validates the fields (count/key/options) and gates the write on the folder's
+    /// session-unlock state BEFORE calling this — this is the raw persistence.
+    pub fn set_note_folder_schema(
+        &self,
+        folder_id: &str,
+        fields: &[PropertySchemaField],
+    ) -> Result<()> {
+        let schema_json = serde_json::to_string(fields)
+            .map_err(|e| AppError::Storage(format!("schema serialize failed: {e}")))?;
+        let now = chrono::Utc::now().timestamp_millis();
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO note_folder_schemas (folder_id, schema_json, updated_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(folder_id) DO UPDATE SET schema_json = ?2, updated_at = ?3",
+            rusqlite::params![folder_id, schema_json, now],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// List a note-folder's VISIBLE notes projected through its typed schema (Feature C — the
+    /// Table/Board substrate). GATE: the visible rows come from the EXISTING gated
+    /// [`Self::list_notes_visible`] (`visibility_clause` against `unlocked`), so a sealed-and-not-
+    /// session-unlocked folder yields NO rows here (never a masked row) — a typed row can never carry
+    /// sealed content. Per visible row: re-read its markdown through the SAME visibility gate
+    /// (defense-in-depth — a row that somehow slipped the summary gate is still gated on the text
+    /// read), `parse_front_matter` the raw `Record<String,String>`, and coerce each schema key's raw
+    /// scalar via [`coerce_property_value`] against the folder schema. A `Select` value outside the
+    /// declared `options` is PRESERVED as `Text` (never dropped). The front-matter parsers are
+    /// untouched — typing is a pure read-time overlay.
+    pub fn list_notes_visible_typed(
+        &self,
+        folder_id: &str,
+        unlocked: &HashSet<String>,
+    ) -> Result<Vec<TypedNoteRow>> {
+        // The schema drives which keys are typed + how. Empty schema ⇒ rows carry no `values` (still
+        // their id/title/tags), never an error.
+        let schema = self.get_note_folder_schema(folder_id)?;
+        // GATE 1 — only VISIBLE notes for this folder (sealed-not-unlocked ⇒ absent).
+        let summaries = self.list_notes_visible(Some(folder_id), unlocked)?;
+        let mut out = Vec::with_capacity(summaries.len());
+        for s in summaries {
+            // GATE 2 (defense-in-depth) — re-read the markdown through the SAME visibility gate; a
+            // row that slipped the summary gate resolves to None and is dropped, never read plain.
+            let Some(markdown) = self.note_markdown_if_visible(&s.id, unlocked)? else {
+                continue;
+            };
+            let (tags, raw) = parse_front_matter(&markdown);
+            let mut values: std::collections::BTreeMap<String, PropertyValue> =
+                std::collections::BTreeMap::new();
+            for field in &schema {
+                if let Some(raw_val) = raw.get(&field.key) {
+                    values.insert(
+                        field.key.clone(),
+                        coerce_property_value(raw_val, field.kind, &field.options),
+                    );
+                }
+            }
+            out.push(TypedNoteRow {
+                id: s.id,
+                title: s.title,
+                folder_id: s.folder_id,
+                values,
+                tags,
+                updated_at: s.updated_at,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Read ONE note's raw markdown ONLY when its owning folder is VISIBLE (open or session-unlocked)
+    /// — the gated text read [`Self::list_notes_visible_typed`] uses per row. Applies the SAME
+    /// `visibility_clause` JOIN as [`Self::list_notes_visible`]: a note in a sealed-and-not-unlocked
+    /// folder resolves to `None` (never the stored/blanked text). `kind='note'` enforced.
+    pub fn note_markdown_if_visible(
+        &self,
+        note_id: &str,
+        unlocked: &HashSet<String>,
+    ) -> Result<Option<String>> {
+        let conn = self.lock();
+        let visible = visibility_clause("f", unlocked);
+        let sql = format!(
+            "SELECT COALESCE(d.text, '')
+               FROM documents d
+               JOIN folders f ON f.id = d.folder_id
+              WHERE d.id = ?1 AND d.kind = 'note' AND {visible}"
+        );
+        conn.query_row(&sql, rusqlite::params![note_id], |r| r.get::<_, String>(0))
+            .optional()
+            .map_err(map_err)
+    }
+
     // ── NOTE FOLDERS (`folders` with `kind='note'`) ──────────────────────────────────────────────
 
     /// Ensure the root note-folder exists (name "Notes", `kind='note'`, path "Notes") and return its
@@ -6096,6 +6221,24 @@ impl Db {
         )
         .optional()
         .map_err(map_err)
+    }
+
+    /// Resolve a note-folder by NAME (case-insensitive, over [`Self::list_note_folders`]) OR by exact
+    /// id (Feature C — the `query_database` brain tool's `folder` argument). Name match is tried
+    /// first (the FIRST match wins on a name collision); if no name matches, an exact id is tried.
+    /// `Ok(None)` when neither resolves — the tool turns that into a friendly "no note folder named X".
+    /// Note-folders only (`kind='note'`), so a meeting folder can never be driven through the tool.
+    pub fn note_folder_by_name_or_id(&self, folder: &str) -> Result<Option<NoteFolder>> {
+        let needle = folder.trim();
+        if needle.is_empty() {
+            return Ok(None);
+        }
+        for f in self.list_note_folders()? {
+            if f.name.eq_ignore_ascii_case(needle) {
+                return Ok(Some(f));
+            }
+        }
+        self.note_folder_by_id(needle)
     }
 
     /// The `kind` of a folder (or `None` if unknown). Lets the command layer reject cross-tree ops.
@@ -10954,6 +11097,83 @@ fn push_tag(tags: &mut Vec<String>, raw: &str) {
     }
 }
 
+/// Feature C — COERCE a raw front-matter scalar into a typed [`PropertyValue`] against a schema
+/// column's declared `kind`. PURE + unit-testable (no DB). NEVER drops a value: a raw string that
+/// cannot be coerced to the declared kind (a malformed number/date/bool, or a `Select` value not in
+/// `options`) is PRESERVED as [`PropertyValue::Text`] — the user's data survives even when it does
+/// not match the schema.
+///
+/// Coercion rules:
+/// - `Checkbox` — `true`/`1`/`yes` (case-insensitive) ⇒ `true`; `false`/`0`/`no` ⇒ `false`; else
+///   preserved as `Text`.
+/// - `Number` — a parseable `f64` ⇒ `Number`; else `Text`.
+/// - `Date` — an ISO-ish `YYYY-MM-DD` (optionally with a time suffix) ⇒ `Date`; else `Text`.
+/// - `Select` — the exact raw value when it is one of `options` (case-insensitive match, canonical
+///   option casing kept) ⇒ `Select`; otherwise the raw value PRESERVED as `Text`.
+/// - `Text` — the raw value verbatim.
+pub fn coerce_property_value(raw: &str, kind: PropertyKind, options: &[String]) -> PropertyValue {
+    let v = raw.trim();
+    match kind {
+        PropertyKind::Text => PropertyValue::Text(v.to_string()),
+        PropertyKind::Checkbox => match v.to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" => PropertyValue::Checkbox(true),
+            "false" | "0" | "no" => PropertyValue::Checkbox(false),
+            _ => PropertyValue::Text(v.to_string()), // not a bool → preserve, never drop.
+        },
+        PropertyKind::Number => match v.parse::<f64>() {
+            Ok(n) if n.is_finite() => PropertyValue::Number(n),
+            _ => PropertyValue::Text(v.to_string()),
+        },
+        PropertyKind::Date => {
+            if is_iso_ish_date(v) {
+                PropertyValue::Date(v.to_string())
+            } else {
+                PropertyValue::Text(v.to_string())
+            }
+        }
+        PropertyKind::Select => {
+            // A Select value not in the declared options is PRESERVED as Text (never dropped).
+            match options
+                .iter()
+                .find(|o| o.eq_ignore_ascii_case(v))
+            {
+                Some(canonical) => PropertyValue::Select(canonical.clone()),
+                None => PropertyValue::Text(v.to_string()),
+            }
+        }
+    }
+}
+
+/// Is `s` an ISO-ish date — `YYYY-MM-DD`, optionally followed by a `T`/space time (`YYYY-MM-DDThh…`)?
+/// Deliberately LENIENT on the time part (any suffix after the date is accepted) but STRICT on the
+/// `YYYY-MM-DD` head (4-2-2 digits, dash-separated, plausible month/day ranges) so a plain number or
+/// free text never coerces to Date.
+fn is_iso_ish_date(s: &str) -> bool {
+    // Split off any time/zone suffix at the first 'T' or space; validate the date head only.
+    let head = s
+        .split_once(['T', ' '])
+        .map(|(d, _)| d)
+        .unwrap_or(s);
+    let parts: Vec<&str> = head.split('-').collect();
+    if parts.len() != 3 {
+        return false;
+    }
+    let (y, m, d) = (parts[0], parts[1], parts[2]);
+    if y.len() != 4 || m.len() != 2 || d.len() != 2 {
+        return false;
+    }
+    if !y.chars().all(|c| c.is_ascii_digit())
+        || !m.chars().all(|c| c.is_ascii_digit())
+        || !d.chars().all(|c| c.is_ascii_digit())
+    {
+        return false;
+    }
+    // Plausible ranges (no calendar-exact day count — the goal is "looks like a date", not validity).
+    let month: u8 = m.parse().unwrap_or(0);
+    let day: u8 = d.parse().unwrap_or(0);
+    (1..=12).contains(&month) && (1..=31).contains(&day)
+}
+
 /// Strip a single pair of matching surrounding quotes (`"…"` or `'…'`) from a YAML scalar.
 fn unquote(s: &str) -> String {
     let s = s.trim();
@@ -11481,6 +11701,29 @@ mod tests {
         assert!(
             has_saved_views(&db),
             "saved_views table missing after a second migrate (idempotency broken)"
+        );
+
+        // Feature C (typed properties): the additive `note_folder_schemas` table must exist after
+        // migrate and STILL exist idempotently after a re-migrate — additive, never destructive.
+        let has_schemas = |db: &Db| -> bool {
+            db.lock()
+                .query_row(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'note_folder_schemas'",
+                    [],
+                    |_| Ok(()),
+                )
+                .optional()
+                .unwrap()
+                .is_some()
+        };
+        assert!(
+            has_schemas(&db),
+            "note_folder_schemas table missing after migrate"
+        );
+        db.migrate().unwrap();
+        assert!(
+            has_schemas(&db),
+            "note_folder_schemas table missing after a second migrate (idempotency broken)"
         );
     }
 
@@ -14428,6 +14671,200 @@ mod tests {
     }
 
     use crate::storage::models::Folder;
+
+    // ── Feature C — typed note front-matter properties ──────────────────────────────────────────
+
+    /// Seed a NOTE folder (`kind='note'`) at `id`/`name`, so `note_folder_by_id` / the schema fns
+    /// resolve it. Mirrors the command layer's `insert_note_folder`.
+    fn seed_note_folder(db: &Db, id: &str, name: &str) {
+        db.insert_note_folder(
+            &NoteFolder {
+                id: id.to_string(),
+                name: name.to_string(),
+                path: format!("Notes/{name}"),
+                parent_id: None,
+                locked: false,
+                unlocked: false,
+                kind: "note".into(),
+            },
+            "2026-07-14T00:00:00Z",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn note_folder_schema_round_trip() {
+        let db = mem_db();
+        seed_note_folder(&db, "nf1", "Tasks");
+
+        // No schema row yet → empty vec.
+        assert!(db.get_note_folder_schema("nf1").unwrap().is_empty());
+
+        let fields = vec![
+            PropertySchemaField {
+                key: "status".into(),
+                kind: PropertyKind::Select,
+                options: vec!["Open".into(), "Done".into()],
+            },
+            PropertySchemaField {
+                key: "due".into(),
+                kind: PropertyKind::Date,
+                options: vec![],
+            },
+            PropertySchemaField {
+                key: "priority".into(),
+                kind: PropertyKind::Number,
+                options: vec![],
+            },
+        ];
+        db.set_note_folder_schema("nf1", &fields).unwrap();
+        let got = db.get_note_folder_schema("nf1").unwrap();
+        assert_eq!(got, fields, "set→get must round-trip the schema");
+
+        // ON CONFLICT upsert: a second set REPLACES (never appends/duplicates).
+        let replaced = vec![PropertySchemaField {
+            key: "owner".into(),
+            kind: PropertyKind::Text,
+            options: vec![],
+        }];
+        db.set_note_folder_schema("nf1", &replaced).unwrap();
+        let got2 = db.get_note_folder_schema("nf1").unwrap();
+        assert_eq!(got2, replaced, "upsert must replace the whole schema");
+    }
+
+    #[test]
+    fn coerce_property_value_checkbox() {
+        // true-ish and false-ish forms coerce; anything else preserved as Text (never dropped).
+        for t in ["true", "1", "yes", "TRUE", "Yes"] {
+            assert_eq!(
+                coerce_property_value(t, PropertyKind::Checkbox, &[]),
+                PropertyValue::Checkbox(true),
+                "{t} → true"
+            );
+        }
+        for f in ["false", "0", "no", "NO"] {
+            assert_eq!(
+                coerce_property_value(f, PropertyKind::Checkbox, &[]),
+                PropertyValue::Checkbox(false),
+                "{f} → false"
+            );
+        }
+        // Malformed bool → preserved as Text, not dropped.
+        assert_eq!(
+            coerce_property_value("maybe", PropertyKind::Checkbox, &[]),
+            PropertyValue::Text("maybe".into())
+        );
+    }
+
+    #[test]
+    fn coerce_property_value_number() {
+        assert_eq!(
+            coerce_property_value("42", PropertyKind::Number, &[]),
+            PropertyValue::Number(42.0)
+        );
+        assert_eq!(
+            coerce_property_value("3.5", PropertyKind::Number, &[]),
+            PropertyValue::Number(3.5)
+        );
+        // Non-numeric → preserved as Text.
+        assert_eq!(
+            coerce_property_value("high", PropertyKind::Number, &[]),
+            PropertyValue::Text("high".into())
+        );
+        // NaN/inf strings must not become a Number.
+        assert_eq!(
+            coerce_property_value("NaN", PropertyKind::Number, &[]),
+            PropertyValue::Text("NaN".into())
+        );
+    }
+
+    #[test]
+    fn coerce_property_value_date() {
+        assert_eq!(
+            coerce_property_value("2026-07-14", PropertyKind::Date, &[]),
+            PropertyValue::Date("2026-07-14".into())
+        );
+        assert_eq!(
+            coerce_property_value("2026-07-14T09:30:00Z", PropertyKind::Date, &[]),
+            PropertyValue::Date("2026-07-14T09:30:00Z".into())
+        );
+        // Not a date → preserved as Text.
+        assert_eq!(
+            coerce_property_value("someday", PropertyKind::Date, &[]),
+            PropertyValue::Text("someday".into())
+        );
+        assert_eq!(
+            coerce_property_value("2026-13-40", PropertyKind::Date, &[]),
+            PropertyValue::Text("2026-13-40".into()),
+            "implausible month/day is not a date"
+        );
+    }
+
+    #[test]
+    fn coerce_property_value_select_out_of_options_preserved_as_text() {
+        let opts = vec!["Open".to_string(), "Done".to_string()];
+        // In-options (case-insensitive) → Select with the CANONICAL option casing.
+        assert_eq!(
+            coerce_property_value("done", PropertyKind::Select, &opts),
+            PropertyValue::Select("Done".into())
+        );
+        // Out-of-options value is PRESERVED as Text, never dropped.
+        assert_eq!(
+            coerce_property_value("Blocked", PropertyKind::Select, &opts),
+            PropertyValue::Text("Blocked".into())
+        );
+    }
+
+    /// GATE (RED against reading text_blob-derived plaintext without the gate): a typed note in a
+    /// LOCKED note-folder must yield NO rows via `list_notes_visible_typed` before session-unlock,
+    /// and the REAL typed row once the folder id is in the unlock set.
+    #[test]
+    fn list_notes_typed_empty_for_sealed_folder() {
+        let db = mem_db();
+        seed_note_folder(&db, "nf-lock", "Secret Tasks");
+        db.set_note_folder_schema(
+            "nf-lock",
+            &[PropertySchemaField {
+                key: "status".into(),
+                kind: PropertyKind::Select,
+                options: vec!["Open".into(), "Done".into()],
+            }],
+        )
+        .unwrap();
+        // A note whose front-matter carries the typed `status` property.
+        db.insert_note(
+            "n1",
+            "nf-lock",
+            "secret-task",
+            "Secret Task",
+            "---\nstatus: Done\n---\nbody",
+            1_000,
+        )
+        .unwrap();
+        // Seal the folder (locked=1). The plaintext `text` column is NOT blanked by this bare
+        // set_folder_locked, so the ONLY thing keeping it invisible is the visibility gate.
+        db.set_folder_locked("nf-lock", true, Some(b"wrapped")).unwrap();
+
+        let nothing = std::collections::HashSet::new();
+        assert!(
+            db.list_notes_visible_typed("nf-lock", &nothing)
+                .unwrap()
+                .is_empty(),
+            "sealed-not-unlocked note-folder must yield NO typed rows (gate violation)"
+        );
+
+        // Session-unlock → the real typed row (status coerced to Select Done) appears.
+        let mut unlocked = std::collections::HashSet::new();
+        unlocked.insert("nf-lock".to_string());
+        let rows = db.list_notes_visible_typed("nf-lock", &unlocked).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].title, "Secret Task");
+        assert_eq!(
+            rows[0].values.get("status"),
+            Some(&PropertyValue::Select("Done".into())),
+            "unlocked row must carry the coerced typed value"
+        );
+    }
 
     fn seed_folder(db: &Db, id: &str, name: &str) {
         db.insert_folder(&Folder {

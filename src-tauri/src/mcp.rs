@@ -273,6 +273,11 @@ fn tools_spec() -> Value {
             "name": "org_search",
             "description": "Fallback for when search_meetings / search_semantic find nothing relevant in your OWN vault and you have joined an org: search the ORGANIZATION brain — notes your colleagues explicitly shared to the shared org brain (synced + decrypted locally; no data leaves this device). Results are attributed '[org · <author>]' and MUST be cited as coming from that colleague. Only meaningful when you have joined an org and consented to org sharing (otherwise returns no results). Use for 'what does the team / someone else know or decide about X' questions.",
             "inputSchema": { "type": "object", "properties": { "query": { "type": "string" } }, "required": ["query"] }
+        },
+        {
+            "name": "query_database",
+            "description": "Query the TYPED PROPERTIES of a note-folder's notes as a small database (the folder's Table/Board columns: status, owner, due date, priority, etc.). Give the folder NAME (or id) and a filter: 'key op value' clauses joined by AND / OR, op ∈ = != > < >= <= or 'contains' (e.g. 'status=Done', 'openItems>3', 'owner contains ann', 'status=Open AND priority=High'). Empty filter = every row. Sealed-and-locked note folders are excluded. Use for 'which notes are still open', 'what does Anna own', 'high-priority items' questions over a note-folder's columns.",
+            "inputSchema": { "type": "object", "properties": { "folder": { "type": "string" }, "filter": { "type": "string" } }, "required": ["folder"] }
         }
     ])
 }
@@ -395,6 +400,23 @@ fn dispatch_tool(
                 .unwrap_or("")
                 .to_string(),
         },
+        // Feature C — TYPED note-folder database query. `folder` is required (name or id); `filter`
+        // is optional (empty = all rows). Gated by `list_notes_visible_typed` against `unlocked_set`,
+        // so a sealed-not-unlocked note folder yields no rows here.
+        "query_database" => {
+            let folder = args.get("folder").and_then(Value::as_str).unwrap_or("");
+            if folder.trim().is_empty() {
+                return Err((-32602, "missing required argument: folder".to_string()));
+            }
+            ToolCall::QueryDatabase {
+                folder: folder.to_string(),
+                filter: args
+                    .get("filter")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            }
+        }
         other => return Err((-32602, format!("unknown tool: {other}"))),
     };
     // The `semantic_search_enabled` flag lives in the whole-DB-encrypted settings table; load it from
@@ -432,10 +454,10 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_has_eight_tools() {
+    fn tools_list_has_nine_tools() {
         let r = rpc(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#).unwrap();
         let tools = r["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 8);
+        assert_eq!(tools.len(), 9);
         // The Phase 2b semantic tool is advertised.
         assert!(tools.iter().any(|t| t["name"] == "search_semantic"));
         // The Phase 5a open-commitments rollup tool is advertised.
@@ -448,6 +470,11 @@ mod tests {
         assert!(
             tools.iter().any(|t| t["name"] == "get_document"),
             "get_document must be advertised in the MCP tool catalog"
+        );
+        // Feature C — the typed note-folder database query tool is advertised (the 9th tool).
+        assert!(
+            tools.iter().any(|t| t["name"] == "query_database"),
+            "query_database must be advertised in the MCP tool catalog"
         );
     }
 
@@ -785,6 +812,73 @@ mod tests {
             !out3.contains("sign the contract"),
             "owner filter must drop Carol's item"
         );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Feature C: `query_database` is visibility-gated exactly like the other read tools (mirror of
+    /// `get_open_commitments_is_visibility_gated`). A typed note in a sealed-and-not-unlocked
+    /// note-folder is INVISIBLE to the query (its title + typed values never surface), and reappears
+    /// once the folder is session-unlocked. RED if the tool bypasses `list_notes_visible_typed`.
+    #[test]
+    fn query_database_is_visibility_gated() {
+        use crate::storage::models::{NoteFolder, PropertyKind, PropertySchemaField};
+        let (db, p) = temp_db();
+        // A LOCKED note-folder with a typed `status` schema and one typed note.
+        db.insert_note_folder(
+            &NoteFolder {
+                id: "nf-lock".into(),
+                name: "Secret Tasks".into(),
+                path: "Notes/Secret Tasks".into(),
+                parent_id: None,
+                locked: false,
+                unlocked: false,
+                kind: "note".into(),
+            },
+            "2026-07-14T00:00:00Z",
+        )
+        .unwrap();
+        db.set_note_folder_schema(
+            "nf-lock",
+            &[PropertySchemaField {
+                key: "status".into(),
+                kind: PropertyKind::Select,
+                options: vec!["Open".into(), "Done".into()],
+            }],
+        )
+        .unwrap();
+        // Note title deliberately DISJOINT from the folder name so a substring test can't collide.
+        db.insert_note(
+            "n-secret",
+            "nf-lock",
+            "launch-plan",
+            "Launch Plan",
+            "---\nstatus: Open\n---\nbody",
+            1_000,
+        )
+        .unwrap();
+        db.set_folder_locked("nf-lock", true, Some(b"wrapped"))
+            .unwrap();
+
+        // Not unlocked → the sealed folder's typed row is invisible; the row's title never leaks.
+        let args = json!({ "folder": "Secret Tasks", "filter": "status=Open" });
+        let out = dispatch_tool(&db, "query_database", &args, &HashSet::new()).unwrap();
+        assert!(
+            !out.contains("Launch Plan"),
+            "sealed-not-unlocked note-folder's typed row leaked (gate violation): {out}"
+        );
+
+        // Session-unlock → the typed row reappears in the query result.
+        let mut unlocked = HashSet::new();
+        unlocked.insert("nf-lock".to_string());
+        let out2 = dispatch_tool(&db, "query_database", &args, &unlocked).unwrap();
+        assert!(
+            out2.contains("[[Launch Plan]]"),
+            "unlocked typed row must reappear in query_database: {out2}"
+        );
+
+        // Missing required `folder` arg is an InvalidArg (JSON-RPC -32602), never a silent all-rows.
+        let bad = dispatch_tool(&db, "query_database", &json!({ "filter": "x=y" }), &unlocked);
+        assert!(bad.is_err(), "query_database requires a folder argument");
         let _ = std::fs::remove_file(&p);
     }
 
