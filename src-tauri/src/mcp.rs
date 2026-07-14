@@ -241,8 +241,13 @@ fn tools_spec() -> Value {
         },
         {
             "name": "get_meeting",
-            "description": "Get a meeting's AI note (summary) and full transcript by id.",
-            "inputSchema": { "type": "object", "properties": { "meetingId": { "type": "string" } }, "required": ["meetingId"] }
+            "description": "Get a meeting's AI note (summary) and full transcript by id (from a search hit labelled 'meeting:...'). The transcript is STRUCTURED by default — one line per segment, '[<start_s>–<end_s>] <Speaker>: <text>' with Me/Others/Unknown speakers and raw-second timestamps; pass transcriptFormat 'plain' for the old flat text.",
+            "inputSchema": { "type": "object", "properties": { "meetingId": { "type": "string" }, "transcriptFormat": { "type": "string", "enum": ["structured", "plain"], "description": "Transcript rendering (default 'structured')." } }, "required": ["meetingId"] }
+        },
+        {
+            "name": "get_document",
+            "description": "Get the full body of one standalone note or imported/uploaded document by id (from a search hit labelled 'document:...'). Use this — not get_meeting — for ids from the DOCUMENTS section of a search result.",
+            "inputSchema": { "type": "object", "properties": { "documentId": { "type": "string" } }, "required": ["documentId"] }
         },
         {
             "name": "list_recent_meetings",
@@ -339,6 +344,21 @@ fn dispatch_tool(
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string(),
+            // Feature D: default to the STRUCTURED transcript. Only the exact literal "plain" selects
+            // the legacy flat join; an absent/other value routes to "structured".
+            transcript_format: args
+                .get("transcriptFormat")
+                .and_then(Value::as_str)
+                .filter(|f| *f == "plain")
+                .unwrap_or("structured")
+                .to_string(),
+        },
+        "get_document" => ToolCall::GetDocument {
+            document_id: args
+                .get("documentId")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
         },
         "list_recent_meetings" => ToolCall::ListRecentMeetings {
             limit: args
@@ -412,10 +432,10 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_has_seven_tools() {
+    fn tools_list_has_eight_tools() {
         let r = rpc(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#).unwrap();
         let tools = r["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 7);
+        assert_eq!(tools.len(), 8);
         // The Phase 2b semantic tool is advertised.
         assert!(tools.iter().any(|t| t["name"] == "search_semantic"));
         // The Phase 5a open-commitments rollup tool is advertised.
@@ -424,6 +444,11 @@ mod tests {
         assert!(tools.iter().any(|t| t["name"] == "get_entity_dossier"));
         // Shared Brain — the org partition search tool is advertised.
         assert!(tools.iter().any(|t| t["name"] == "org_search"));
+        // Feature D — the full-note/document reader tool is advertised (the 8th tool).
+        assert!(
+            tools.iter().any(|t| t["name"] == "get_document"),
+            "get_document must be advertised in the MCP tool catalog"
+        );
     }
 
     /// A4 (RED-before-GREEN): the MCP catalog must steer callers toward `org_search` as a FALLBACK
@@ -847,6 +872,110 @@ mod tests {
             none.contains("No visible entity"),
             "unknown entity → friendly message"
         );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Feature D: the MCP `get_document` dispatch is visibility-gated — a document in a
+    /// sealed-and-not-session-unlocked folder returns the masked "No data" sentinel, and reappears
+    /// once the folder is session-unlocked. Mirrors the other MCP gate tests but through the real
+    /// `dispatch_tool` (JSON args → `ToolCall::GetDocument` → gated `execute_tool`).
+    #[test]
+    fn mcp_get_document_is_visibility_gated() {
+        use crate::storage::models::Folder;
+        let (db, p) = temp_db();
+        db.insert_folder(&Folder {
+            id: "f-lock".to_string(),
+            name: "Secret".to_string(),
+            path: "Secret".to_string(),
+            parent_id: None,
+            locked: false,
+            created_at: "2026-06-26T00:00:00Z".to_string(),
+        })
+        .unwrap();
+        db.insert_note(
+            "note-1",
+            "f-lock",
+            "note-name",
+            "Secret Note",
+            "the classified body text",
+            1_700_000_000,
+        )
+        .unwrap();
+        db.set_folder_locked("f-lock", true, None).unwrap();
+
+        let args = json!({ "documentId": "note-1" });
+        // Locked, not unlocked → masked sentinel, no body/title.
+        let out = dispatch_tool(&db, "get_document", &args, &HashSet::new()).unwrap();
+        assert_eq!(out, "No data for document note-1.");
+        assert!(!out.contains("classified"), "sealed document body leaked via MCP get_document");
+
+        // Session-unlock → body reappears.
+        let mut unlocked = HashSet::new();
+        unlocked.insert("f-lock".to_string());
+        let out2 = dispatch_tool(&db, "get_document", &args, &unlocked).unwrap();
+        assert!(out2.contains("the classified body text"), "unlocked body must reappear: {out2}");
+        assert!(out2.contains("TITLE: [[Secret Note]]"), "title must render: {out2}");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Feature D: the MCP `get_meeting` dispatch defaults to the STRUCTURED transcript, and honors an
+    /// explicit `transcriptFormat: "plain"` for the legacy flat text.
+    #[test]
+    fn mcp_get_meeting_transcript_format_switches() {
+        use crate::storage::models::Meeting;
+        use crate::transcribe::types::Segment;
+        let (db, p) = temp_db();
+        // Titleless meeting → no TITLE prefix; a note so get_meeting returns content.
+        db.insert_meeting(&Meeting {
+            id: "mm".to_string(),
+            started_at: "2026-06-27T09:00:00Z".to_string(),
+            ended_at: None,
+            title: None,
+            duration_s: 60,
+            audio_path: None,
+            status: crate::storage::models::MeetingStatus::Summarized,
+            folder_id: None,
+        })
+        .unwrap();
+        db.upsert_note(&crate::storage::models::NoteRecord {
+            meeting_id: "mm".to_string(),
+            provider_id: "claude_code".to_string(),
+            markdown: "n".to_string(),
+            created_at: "2026-06-27T09:05:00Z".to_string(),
+            exported_path: None,
+            model_requested: None,
+            model_served: None,
+            gateway_host: None,
+        })
+        .unwrap();
+        db.insert_segments(
+            "mm",
+            &[Segment {
+                idx: 0,
+                start_s: 5.0,
+                end_s: 8.0,
+                text: "opening remarks".into(),
+                speaker: Some("me".into()),
+                confidence: None,
+            }],
+        )
+        .unwrap();
+
+        // Default (no transcriptFormat) → STRUCTURED (speaker label + timestamp token).
+        let def = dispatch_tool(&db, "get_meeting", &json!({ "meetingId": "mm" }), &HashSet::new())
+            .unwrap();
+        assert!(def.contains("Me: opening remarks"), "default must be structured: {def}");
+        assert!(def.contains("[5–8]"), "default must carry a timestamp token: {def}");
+
+        // Explicit plain → the legacy flat text (no speaker label, no timestamp).
+        let plain = dispatch_tool(
+            &db,
+            "get_meeting",
+            &json!({ "meetingId": "mm", "transcriptFormat": "plain" }),
+            &HashSet::new(),
+        )
+        .unwrap();
+        assert_eq!(plain, "NOTE:\nn\n\nTRANSCRIPT:\nopening remarks");
         let _ = std::fs::remove_file(&p);
     }
 

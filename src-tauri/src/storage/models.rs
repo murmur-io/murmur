@@ -516,6 +516,28 @@ pub struct DocChunkHit {
     pub name: String,
     pub folder_id: String,
     pub snippet: String,
+    /// The source document's `documents.kind` — `"document"` (uploaded file) or `"note"` (typed
+    /// brain note). ADDITIVE (Feature D): lets a search-result renderer tag a document hit with its
+    /// concrete kind (`[document:note:<id>]` vs `[document:document:<id>]`) so a model knows which
+    /// `get_*` tool to call. Populated straight off the existing `documents.kind` column.
+    pub kind: String,
+}
+
+/// The full body of ONE standalone note OR imported/uploaded document, by id — the transport DTO
+/// for the gated `get_document` tool (Feature D). Returned ONLY by [`Db::get_document_if_visible`],
+/// which visibility-gates on the owning folder's lock (a sealed-and-not-session-unlocked document
+/// resolves to `None`, never a masked partial). `markdown` is the plaintext `documents.text` body;
+/// `title`/`updated_at` are the nullable authoring columns (a `kind='document'` upload leaves them
+/// NULL — the caller falls back to `name`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocumentSummary {
+    pub id: String,
+    pub folder_id: String,
+    pub kind: String,
+    pub name: String,
+    pub title: Option<String>,
+    pub markdown: String,
+    pub updated_at: Option<i64>,
 }
 
 /// Shared Brain v1 — one ORG-partition retrieval hit: the nearest/best chunk's snippet + the

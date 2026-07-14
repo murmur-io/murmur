@@ -223,6 +223,7 @@ fn tool_label(call: &ToolCall) -> &'static str {
         ToolCall::GetEntityDossier { .. } => "Entity dossier",
         ToolCall::GetOpenCommitments { .. } => "Open commitments",
         ToolCall::GetMeeting { .. } => "Meeting",
+        ToolCall::GetDocument { .. } => "Document",
         ToolCall::ListRecentMeetings { .. } => "Recent meetings",
         ToolCall::WebSearch { .. } => "Web search",
         ToolCall::CalendarLookup { .. } => "Calendar",
