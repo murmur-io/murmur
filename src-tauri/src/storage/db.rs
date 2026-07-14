@@ -5925,15 +5925,13 @@ impl Db {
     }
 
     /// The ONE reserved, always-open note-folder that backs the "Notes" section root — the home for
-    /// UNFILED new notes (2026-07-14). Idempotent; returns the existing `is_root` folder, else:
-    ///   - the legacy path-`"Notes"` folder is UNLOCKED → flag it `is_root=1` in place (no note
-    ///     movement, no risk) and use it (root at "Notes" — the common/fresh case);
-    ///   - the legacy `"Notes"` is LOCKED → can't repurpose (would expose sealed content) and can't
-    ///     reuse the UNIQUE "Notes" path → create a SEPARATE always-open root at the first free
-    ///     "Inbox" path, leaving the locked "Notes" as an ordinary folder;
-    ///   - no `"Notes"` folder (fresh) → create the root at "Notes".
-    /// Never moves user rows, never touches sealed content. The root can never be locked
-    /// (`lock_folder` refuses `is_root`).
+    /// UNFILED new notes (2026-07-14). Idempotent; returns the existing `is_root` folder, else picks
+    /// one: an UNLOCKED legacy path-`"Notes"` is flagged `is_root=1` in place (no note movement — the
+    /// common/fresh case); a LOCKED legacy `"Notes"` can't be repurposed (would expose sealed content)
+    /// nor reuse the UNIQUE "Notes" path, so a SEPARATE always-open root is created at the first free
+    /// "Inbox" path (the locked "Notes" stays an ordinary folder); with no `"Notes"` folder at all
+    /// (fresh install) the root is created at "Notes". Never moves user rows, never touches sealed
+    /// content; the root can never be locked (`lock_folder` refuses `is_root`).
     pub fn ensure_notes_root(&self) -> Result<String> {
         if let Some(id) = self.note_root_id()? {
             return Ok(id);
