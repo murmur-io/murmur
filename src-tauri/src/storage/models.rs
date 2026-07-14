@@ -1066,6 +1066,17 @@ pub struct BacklinkSource {
     pub timestamp: String,
 }
 
+/// A resolved `[[Title]]` wikilink navigation target — the VISIBLE note or meeting whose exact title
+/// the link names, so the FE can route `/notes/:id` or `/meeting/:id`. Resolution is
+/// visibility-gated: a sealed-and-not-session-unlocked note/meeting with that title resolves to
+/// `None`, so clicking a wikilink can never reveal or navigate to locked content.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WikiTarget {
+    pub kind: SourceKind,
+    pub id: String,
+}
+
 /// Result of an Ask-My-Vault query: the grounded answer + the source meetings used.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
