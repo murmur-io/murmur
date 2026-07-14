@@ -838,6 +838,42 @@ pub struct RecipeRecord {
     pub created_at: String,
 }
 
+/// A user-saved VIEW over a list surface (Feature B — "Saved views over the meetings list").
+///
+/// LOCK MODEL: this is CONTENT-FREE user metadata (like `saved_recipes`) — a single-user,
+/// non-shared row that stores only a VIEW DEFINITION, never meeting content. `config` is an OPAQUE
+/// JSON TEXT blob owned by the FE (filters / sort / groupBy / columns); the backend never parses it
+/// and it MUST never carry note/transcript/title text. Because it holds no meeting content, its
+/// read/write path is NOT visibility-gated (mirrors `list_saved_recipes` / `insert_recipe`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SavedView {
+    pub id: String,
+    /// Which list surface this view targets (currently only `"meetings"`).
+    pub scope: String,
+    pub name: String,
+    /// Presentation mode chosen for the view (e.g. `"list"` | `"board"` | `"table"`) — FE-owned.
+    pub layout: String,
+    /// OPAQUE FE-owned JSON view definition (filters/sort/groupBy/columns). NEVER meeting content.
+    pub config: String,
+    pub sort_order: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Per-meeting open/done action-item counts, rolled up across the VISIBLE library for the saved-views
+/// meetings surface. Produced by the deterministic `Db::list_meeting_action_summaries` aggregation:
+/// only VISIBLE meetings contribute — a sealed-and-not-session-unlocked meeting yields NO row
+/// (aggregate posture, NOT a masked row), gated exactly like `Db::list_open_commitments`
+/// (`list_meetings_visible` + `get_note_if_visible`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MeetingActionSummary {
+    pub meeting_id: String,
+    pub open_count: i64,
+    pub done_count: i64,
+}
+
 /// One row of the local correction-log "flywheel" (`correction_log`): a single
 /// model-output→human-correction example captured for later on-device fine-tuning (LoRA). Local +
 /// SQLCipher-encrypted like the rest of the DB; never egresses. `final_output` is `None` until the
