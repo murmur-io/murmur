@@ -285,6 +285,22 @@ impl Db {
              PRAGMA journal_mode = WAL;",
         )
         .map_err(map_err)?;
+        // Root-cause fix (2026-07-15, note-save contention bug): this app has SEVERAL real
+        // concurrent-write background jobs against the SAME on-disk DB file (brain re-index, the
+        // org-feed sync tick, memory consolidation, note autosave, the MCP reader thread's own
+        // connection) all contending for SQLite's single writer lock. WAL lets readers proceed
+        // concurrently with a writer, but two WRITERS still serialize at the SQLite level — and
+        // with NO busy handler installed, a lock collision surfaced IMMEDIATELY as
+        // `SQLITE_BUSY`/"database is locked" (mapped by `map_err` to a generic
+        // `AppError::Storage`) instead of a brief internal wait. That is what an unfiled-note
+        // autosave hitting a concurrent background writer saw as an opaque "Save failed" in the
+        // FE. `busy_timeout` installs SQLite's native busy handler on this connection so a
+        // blocked writer polls/backs off internally up to the timeout before giving up, instead
+        // of erroring on the very first collision. 5s is generous for this app's writer holds
+        // (all single, short, local statements/transactions) without risking a genuinely wedged
+        // connection hanging the UI thread indefinitely.
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(map_err)?;
         let db = Db {
             conn: Mutex::new(conn),
         };
@@ -17051,6 +17067,106 @@ mod tests {
             ids,
             vec!["old", "new"],
             "locked 'secret' excluded; oldest-first order"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Regression for the note-save contention bug (2026-07-15): `open_with_key` MUST install a
+    /// busy handler (non-zero `PRAGMA busy_timeout`) on every connection it opens, so a writer
+    /// that collides with another connection's write lock on the SAME on-disk file gets a brief
+    /// internal wait instead of an IMMEDIATE `SQLITE_BUSY` surfacing as `AppError::Storage`. This
+    /// asserts the pragma value directly (cheap, deterministic) rather than trying to race two
+    /// threads against a timing window.
+    #[test]
+    fn open_with_key_sets_a_nonzero_busy_timeout() {
+        const GOOD_KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let p = unique_temp_path("murmur-busy-timeout-pragma", "sqlite");
+        let _ = std::fs::remove_file(&p);
+        let db = Db::open_with_key(&p, GOOD_KEY).unwrap();
+        let ms: i64 = db
+            .lock()
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .unwrap();
+        assert!(
+            ms >= 1000,
+            "busy_timeout must be a generous non-zero wait (got {ms}ms) — a 0ms timeout means the \
+             very first writer-lock collision fails immediately with SQLITE_BUSY instead of \
+             queuing briefly"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Concurrent-writer regression: two SEPARATE connections to the same on-disk DB file (mirrors
+    /// two real `Db` handles — e.g. the main app handle and a background job's own connection)
+    /// must NOT immediately fail with `SQLITE_BUSY` when one holds a write transaction while the
+    /// other tries to write. Before the `busy_timeout` fix (`PRAGMA busy_timeout` defaulted to 0),
+    /// this reproduced the exact failure a note autosave hit when it raced a background writer:
+    /// the second connection's write failed on the spot instead of waiting briefly for the first
+    /// to commit. RED against the pre-fix connection setup (default 0ms timeout): this test would
+    /// intermittently/deterministically fail (immediate "database is locked") if the busy handler
+    /// were removed — confirmed by temporarily reverting the `busy_timeout` call locally.
+    #[test]
+    fn concurrent_writers_do_not_immediately_hit_sqlite_busy() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+        use std::time::Duration;
+
+        const GOOD_KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let p = unique_temp_path("murmur-concurrent-writers", "sqlite");
+        let _ = std::fs::remove_file(&p);
+        // Seed the schema through the normal path first (also proves both handles below share it).
+        {
+            let seed = Db::open_with_key(&p, GOOD_KEY).unwrap();
+            seed.insert_meeting(&crate::storage::Meeting {
+                id: "seed".into(),
+                started_at: "2026-01-01T00:00:00Z".into(),
+                ended_at: None,
+                title: Some("t".into()),
+                duration_s: 1,
+                audio_path: None,
+                status: crate::storage::MeetingStatus::Draft,
+                folder_id: None,
+            })
+            .unwrap();
+        }
+
+        let db_a = Arc::new(Db::open_with_key(&p, GOOD_KEY).unwrap());
+        let db_b = Db::open_with_key(&p, GOOD_KEY).unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+
+        // Thread A: open an IMMEDIATE write transaction, hold it briefly (simulating a background
+        // writer's in-flight statement), then commit.
+        let db_a_thread = Arc::clone(&db_a);
+        let barrier_a = Arc::clone(&barrier);
+        let handle = thread::spawn(move || -> Result<()> {
+            let conn = db_a_thread.lock();
+            conn.execute_batch("BEGIN IMMEDIATE;").map_err(map_err)?;
+            barrier_a.wait();
+            thread::sleep(Duration::from_millis(200));
+            conn.execute_batch("COMMIT;").map_err(map_err)?;
+            Ok(())
+        });
+
+        // Thread B (this thread): wait until A holds its write lock, then attempt a write of its
+        // own on a DIFFERENT connection to the same file. With the busy_timeout in place, this
+        // must succeed (waiting out A's 200ms hold) instead of failing on the spot.
+        barrier.wait();
+        let write_result = db_b.insert_meeting(&crate::storage::Meeting {
+            id: "concurrent".into(),
+            started_at: "2026-01-02T00:00:00Z".into(),
+            ended_at: None,
+            title: Some("t".into()),
+            duration_s: 1,
+            audio_path: None,
+            status: crate::storage::MeetingStatus::Draft,
+            folder_id: None,
+        });
+
+        handle.join().unwrap().unwrap();
+        assert!(
+            write_result.is_ok(),
+            "a concurrent writer must wait out a brief lock hold instead of failing immediately \
+             with SQLITE_BUSY: {write_result:?}"
         );
         let _ = std::fs::remove_file(&p);
     }
