@@ -5470,6 +5470,31 @@ impl Db {
         Ok(())
     }
 
+    /// The item ids of this org's LIVE (non-tombstoned) local replica rows that are still missing
+    /// `author_user_id` — the stale-ingest gap (rows ingested before the column/stamping existed, or
+    /// via the local-replica upsert at share/republish time, whose cursor has already advanced past
+    /// them so a normal cursor-based feed pull never re-visits them). Used by the sync-tick backfill
+    /// (`backfill_null_org_item_authors`) to know whether a full-feed re-pull is worth doing at all —
+    /// an empty result short-circuits the backfill on every ordinary sync once a device has caught up.
+    /// (2026-07-15.)
+    pub fn org_item_ids_with_null_author(&self, org_id: &str) -> Result<Vec<String>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT item_id FROM org_items
+                   WHERE org_id = ?1 AND tombstoned = 0 AND author_user_id IS NULL",
+            )
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![org_id], |r| r.get::<_, String>(0))
+            .map_err(map_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(map_err)?);
+        }
+        Ok(out)
+    }
+
     /// The context the `org_update_own_item` egress command needs to re-publish an edited org item the
     /// caller authored (org id, current rev, original created_at + source_kind, stored author id). `None`
     /// for an unknown / tombstoned item. (2026-07-14.)
