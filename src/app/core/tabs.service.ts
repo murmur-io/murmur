@@ -1,5 +1,6 @@
-import { Injectable, effect, inject, signal } from "@angular/core";
+import { DestroyRef, Injectable, effect, inject, signal } from "@angular/core";
 import { type NavigationExtras, Router } from "@angular/router";
+import { IpcService } from "./ipc.service";
 import { NavHistoryService } from "./nav-history.service";
 import { TabRouteReuseStrategy } from "./tab-route-reuse.strategy";
 import { type TabKind, tabKeyFor } from "./tab-keys";
@@ -52,6 +53,8 @@ export class TabsService {
   private readonly router = inject(Router);
   private readonly tabRouteReuse = inject(TabRouteReuseStrategy);
   private readonly navHistory = inject(NavHistoryService);
+  private readonly ipc = inject(IpcService);
+  private readonly destroyRef = inject(DestroyRef);
 
   private readonly _tabs = signal<Tab[]>(this.restoreTabs());
   private readonly _activeTabId = signal<string | null>(this.restoreActiveTabId());
@@ -77,6 +80,40 @@ export class TabsService {
       // Private-mode / storage-disabled — tabs simply won't survive a restart.
     }
   });
+
+  /**
+   * DELETE FAN-OUT FIX (2026-07-15): subscribed ONCE here (a root singleton
+   * lives for the app's lifetime — mirrors `OrgBrainService`'s constructor
+   * subscription) so a note/meeting deleted from ANY surface closes its stale
+   * tab everywhere else too, instead of leaving a clickable tab that would
+   * later 404. Content-free payload (id + kind only); a no-op when no
+   * matching tab is open.
+   */
+  private feedUnlisten: (() => void) | null = null;
+  private feedDestroyed = false;
+
+  constructor() {
+    this.destroyRef.onDestroy(() => {
+      // A root service is never actually destroyed in practice (it outlives every
+      // component), but honor the contract in case a test harness tears it down.
+      this.feedDestroyed = true;
+      this.feedUnlisten?.();
+    });
+    void this.ipc
+      .onContentDeleted((p) => {
+        void this.closeTab(tabKeyFor(p.kind, p.id));
+      })
+      .then((un) => {
+        if (this.feedDestroyed) {
+          un();
+        } else {
+          this.feedUnlisten = un;
+        }
+      })
+      .catch(() => {
+        /* best-effort: no Tauri host (e.g. plain browser) → no live fan-out */
+      });
+  }
 
   /** Open (or activate, if already open) a meeting tab and navigate to it. */
   async openMeeting(id: string, title = "Meeting"): Promise<void> {
