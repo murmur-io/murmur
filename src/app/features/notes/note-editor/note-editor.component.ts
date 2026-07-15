@@ -657,7 +657,7 @@ export class NoteEditorComponent {
     if (sealed) {
       // Mask FIRST, synchronously — no pending save may resurrect plaintext,
       // and even a detached tab's signals hold nothing from this moment on.
-      this.debounce.cancel("note-editor-save");
+      this.debounce.cancel(this.saveDebounceKey(doc.id));
       this.pendingSave = null;
       this.dirtyFull = false;
       // Drop stale backlink chips immediately on a live seal (belt-and-braces
@@ -834,13 +834,14 @@ export class NoteEditorComponent {
    * export) runs once on the next boundary. No-op while hydrating or locked.
    */
   private scheduleSave(): void {
-    if (this.hydrating || this.note()?.locked) {
+    const doc = this.note();
+    if (this.hydrating || !doc || doc.locked) {
       return;
     }
     this.dirtyFull = true;
     this.saveState.set("saving");
     this.debounce.schedule(
-      "note-editor-save",
+      this.saveDebounceKey(doc.id),
       () => void this.queueSave("text"),
       AUTOSAVE_MS,
     );
@@ -906,26 +907,37 @@ export class NoteEditorComponent {
   }
 
   /**
-   * One bounded retry (root-cause fix, 2026-07-15; per-note key fix,
-   * 2026-07-15) for a transient save failure: schedule a single re-attempt of
-   * `attempt` after a short backoff via the app's ONE sanctioned debounce
-   * timer (`DebounceService` — never a raw component `setTimeout`,
+   * The `DebounceService` key for every autosave/retry timer THIS note owns —
+   * scoped PER NOTE ID (root-cause fix, 2026-07-15, widened from the retry-only
+   * fix of the same date after adversarial review of PR #332 found the other 7
+   * call sites still shared one bare literal). `DebounceService` is a
+   * `providedIn: 'root'` SINGLETON shared by every open `NoteEditorComponent`
+   * instance, and `notes/:id` tabs stay ALIVE-BUT-DETACHED when backgrounded
+   * (`TabRouteReuseStrategy` — `shouldDetach`/`shouldAttach`), so a bare
+   * literal key let ANY open note's `schedule`/`cancel` call silently
+   * `clearTimeout` a DIFFERENT open note's pending timer under the same key —
+   * for the retry key that stranded `saveState` on `"saving"` forever; for the
+   * PRIMARY autosave key (`scheduleSave`/`onBlur`/`flushFull`/`exportNote`/
+   * `share`/`doDelete`/`onLockTreeChanged`) it is worse: a cancelled autosave
+   * timer with no replacement scheduled is a SILENT, invisible content-loss —
+   * no error, no stuck indicator, just a keystroke that never persists.
+   * Scoping every one of these 8 call sites per note id gives each open tab
+   * its own independent timer slot in the shared singleton.
+   */
+  private saveDebounceKey(noteId: string): string {
+    return `note-editor-save:${noteId}`;
+  }
+
+  /**
+   * One bounded retry for a transient save failure: schedule a single
+   * re-attempt of `attempt` after a short backoff via the app's ONE sanctioned
+   * debounce timer (`DebounceService` — never a raw component `setTimeout`,
    * angular-zoneless §5). Resolves the retry's own result; the caller decides
    * what "still failed after the retry" means. NOT a retry loop — exactly one
-   * extra attempt, then the caller surfaces the real error.
-   *
-   * The debounce key is scoped PER NOTE ID (`note-editor-save-retry:<id>`),
-   * not a bare literal. `DebounceService` is a `providedIn: 'root'` SINGLETON
-   * shared by every open `NoteEditorComponent` instance, and `notes/:id` tabs
-   * stay ALIVE-BUT-DETACHED when backgrounded (`TabRouteReuseStrategy` —
-   * `shouldDetach`/`shouldAttach`), so with two note tabs open, an unscoped
-   * key let Note B's failed-save retry schedule `clearTimeout` Note A's
-   * still-pending retry (`DebounceService.schedule`'s coalesce-under-the-
-   * same-key behavior) — Note A's `retryOnce` promise then never settled,
-   * and `saveState` stuck on `"saving"` forever with no path to "saved" or
-   * "error" (found by adversarial review of PR #332). Scoping the key per
-   * note id gives each open tab its own independent retry slot in the shared
-   * singleton, so concurrent tabs can no longer cancel each other's retries.
+   * extra attempt, then the caller surfaces the real error. Keyed per note id
+   * (see {@link saveDebounceKey}'s doc) — deliberately a DIFFERENT key than
+   * the primary autosave/cancel timer so a retry can never coalesce with (or
+   * get cancelled by) an in-flight autosave for the SAME note.
    */
   private retryOnce<T>(noteId: string, attempt: () => Promise<T>): Promise<T> {
     return new Promise<T>((resolve, reject) => {
@@ -1034,7 +1046,10 @@ export class NoteEditorComponent {
    * single-writer chain as the cheap saves, superseding any pending cheap save.
    */
   private flushFull(): void {
-    this.debounce.cancel("note-editor-save");
+    const doc = this.note();
+    if (doc) {
+      this.debounce.cancel(this.saveDebounceKey(doc.id));
+    }
     void this.queueSave("full");
   }
 
@@ -1093,8 +1108,9 @@ export class NoteEditorComponent {
 
   /** Blur handler (title / body) — flush the pending CHEAP save immediately. */
   onBlur(): void {
-    if (this.saveState() === "saving") {
-      this.debounce.cancel("note-editor-save");
+    const doc = this.note();
+    if (doc && this.saveState() === "saving") {
+      this.debounce.cancel(this.saveDebounceKey(doc.id));
       void this.queueSave("text");
     }
   }
@@ -1654,7 +1670,7 @@ export class NoteEditorComponent {
     this.closeMenus();
     // Persist the latest text first (cheap) so the exported file is current —
     // awaited through the single-writer chain so it lands after any in-flight save.
-    this.debounce.cancel("note-editor-save");
+    this.debounce.cancel(this.saveDebounceKey(doc.id));
     await this.queueSave("text");
     try {
       const path = await this.ipc.exportNoteDoc(doc.id);
@@ -1679,7 +1695,7 @@ export class NoteEditorComponent {
     }
     // Persist the latest text (cheap, via the single-writer chain) so the
     // shared body is current.
-    this.debounce.cancel("note-editor-save");
+    this.debounce.cancel(this.saveDebounceKey(doc.id));
     void this.queueSave("text");
     this.shareOpen.set(true);
   }
@@ -1730,7 +1746,7 @@ export class NoteEditorComponent {
     // the dirty flag so neither the queue nor the teardown full-save resurrects
     // the just-deleted note. (An already in-flight save cannot be recalled —
     // same as before — but nothing new is started.)
-    this.debounce.cancel("note-editor-save");
+    this.debounce.cancel(this.saveDebounceKey(doc.id));
     this.pendingSave = null;
     this.dirtyFull = false;
     try {
