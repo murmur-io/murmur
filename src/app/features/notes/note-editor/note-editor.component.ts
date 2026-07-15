@@ -218,6 +218,16 @@ export class NoteEditorComponent {
   readonly propsOpen = signal(false);
   /** The autosave indicator. */
   readonly saveState = signal<SaveState>("idle");
+  /**
+   * The real `AppError` message behind the last failed save (root-cause fix,
+   * 2026-07-15) — surfaced as a tooltip on the "Save failed" pill instead of
+   * being swallowed. `AppError` is `Serialize` and crosses IPC as its display
+   * string (see `.claude/rules/rust-tauri.md` §1), so `String(e)` already IS
+   * the real backend message; the bug was that only a `"Locked"` substring
+   * check ever surfaced ANYTHING to the user — every other rejection (e.g. a
+   * transient storage error) showed a blank, undiagnosable red banner.
+   */
+  readonly saveErrorMessage = signal<string | null>(null);
   /** The tag-input draft. */
   readonly tagDraft = signal("");
   /** Which floating menu (if any) is open in the header. */
@@ -647,7 +657,7 @@ export class NoteEditorComponent {
     if (sealed) {
       // Mask FIRST, synchronously — no pending save may resurrect plaintext,
       // and even a detached tab's signals hold nothing from this moment on.
-      this.debounce.cancel("note-editor-save");
+      this.debounce.cancel(this.saveDebounceKey(doc.id));
       this.pendingSave = null;
       this.dirtyFull = false;
       // Drop stale backlink chips immediately on a live seal (belt-and-braces
@@ -795,7 +805,21 @@ export class NoteEditorComponent {
   // ── Title ────────────────────────────────────────────────────────────────
 
   onTitleInput(event: Event): void {
-    this.title.set((event.target as HTMLInputElement).value);
+    const value = (event.target as HTMLInputElement).value;
+    this.title.set(value);
+    // Live tab-title sync (root-cause fix, 2026-07-15): update the tab-strip label
+    // OPTIMISTICALLY from the typed value, independent of whether the debounced
+    // autosave has landed yet. Previously `tabsService.setTitle` was only called
+    // from inside `saveText`/`saveFull` on a SUCCESSFUL save, so a save that failed
+    // (see the busy-DB fix above) — or simply hadn't fired yet — left the tab
+    // showing its stale/creation-time label even though the user had typed a real
+    // title. The user's typed text IS the intent; the tab should reflect it right
+    // away, and keep it even if the save later fails (a no-op call if this note
+    // isn't tab-tracked, or if the title is empty/unchanged — see `TabsService.setTitle`).
+    const doc = this.note();
+    if (doc) {
+      this.tabsService.setTitle(tabKeyFor("note", doc.id), value || "Untitled");
+    }
     this.scheduleSave();
   }
 
@@ -828,13 +852,14 @@ export class NoteEditorComponent {
    * export) runs once on the next boundary. No-op while hydrating or locked.
    */
   private scheduleSave(): void {
-    if (this.hydrating || this.note()?.locked) {
+    const doc = this.note();
+    if (this.hydrating || !doc || doc.locked) {
       return;
     }
     this.dirtyFull = true;
     this.saveState.set("saving");
     this.debounce.schedule(
-      "note-editor-save",
+      this.saveDebounceKey(doc.id),
       () => void this.queueSave("text"),
       AUTOSAVE_MS,
     );
@@ -883,6 +908,116 @@ export class NoteEditorComponent {
   }
 
   /**
+   * True for a save rejection that is inherently NOT retryable: a lock refusal
+   * (`AppError::Locked`, e.g. a screen-share auto-relock racing the save) or a
+   * missing-row refusal (`AppError::InvalidArg("no note {id}")` — the
+   * stale-tab-after-delete case). Retrying either would fail identically every
+   * time, so a bounded retry is only useful for the REMAINING error domains
+   * (chiefly a transient `AppError::Storage` from write contention with a
+   * concurrent background writer — the brain re-index / org-feed sync tick /
+   * memory consolidation — now itself mitigated at the source by the
+   * `busy_timeout` fix in `Db::open_with_key`, but a retry is still a correct,
+   * cheap belt-and-suspenders for whatever transient storage hiccup slips
+   * through).
+   */
+  private isUnretryableSaveError(message: string): boolean {
+    return message.includes("Locked") || message.includes("no note ");
+  }
+
+  /**
+   * The `DebounceService` key for every autosave/retry timer THIS note owns —
+   * scoped PER NOTE ID (root-cause fix, 2026-07-15, widened from the retry-only
+   * fix of the same date after adversarial review of PR #332 found the other 7
+   * call sites still shared one bare literal). `DebounceService` is a
+   * `providedIn: 'root'` SINGLETON shared by every open `NoteEditorComponent`
+   * instance, and `notes/:id` tabs stay ALIVE-BUT-DETACHED when backgrounded
+   * (`TabRouteReuseStrategy` — `shouldDetach`/`shouldAttach`), so a bare
+   * literal key let ANY open note's `schedule`/`cancel` call silently
+   * `clearTimeout` a DIFFERENT open note's pending timer under the same key —
+   * for the retry key that stranded `saveState` on `"saving"` forever; for the
+   * PRIMARY autosave key (`scheduleSave`/`onBlur`/`flushFull`/`exportNote`/
+   * `share`/`doDelete`/`onLockTreeChanged`) it is worse: a cancelled autosave
+   * timer with no replacement scheduled is a SILENT, invisible content-loss —
+   * no error, no stuck indicator, just a keystroke that never persists.
+   * Scoping every one of these 8 call sites per note id gives each open tab
+   * its own independent timer slot in the shared singleton.
+   */
+  private saveDebounceKey(noteId: string): string {
+    return `note-editor-save:${noteId}`;
+  }
+
+  /**
+   * One bounded retry for a transient save failure: schedule a single
+   * re-attempt of `attempt` after a short backoff via the app's ONE sanctioned
+   * debounce timer (`DebounceService` — never a raw component `setTimeout`,
+   * angular-zoneless §5). Resolves the retry's own result; the caller decides
+   * what "still failed after the retry" means. NOT a retry loop — exactly one
+   * extra attempt, then the caller surfaces the real error. Keyed per note id
+   * (see {@link saveDebounceKey}'s doc) — deliberately a DIFFERENT key than
+   * the primary autosave/cancel timer so a retry can never coalesce with (or
+   * get cancelled by) an in-flight autosave for the SAME note.
+   */
+  private retryOnce<T>(noteId: string, attempt: () => Promise<T>): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      this.debounce.schedule(
+        `note-editor-save-retry:${noteId}`,
+        () => {
+          attempt().then(resolve, reject);
+        },
+        800,
+      );
+    });
+  }
+
+  /**
+   * Shared failure path for both save paths: classify the error, retry ONCE
+   * for a retryable (non-lock, non-missing-row) failure, and only THEN settle
+   * `saveState`/`saveErrorMessage`/toast with the real backend message —
+   * `AppError` is `Serialize` and crosses IPC as its display string (rust-tauri
+   * §1), so `String(e)` already carries the actual diagnostic instead of the
+   * old blanket "Save failed" with nothing behind it. `noteId` scopes the
+   * bounded retry's debounce key so concurrent open note tabs never cancel
+   * each other's retry (see {@link retryOnce}).
+   */
+  private async handleSaveFailure<T>(
+    noteId: string,
+    e: unknown,
+    retryAttempt: () => Promise<T>,
+    onRetrySuccess: (result: T) => void,
+  ): Promise<void> {
+    const message = String(e);
+    if (message.includes("no note ")) {
+      // Stale-tab-after-delete: this note id no longer exists server-side —
+      // retrying a save against it can never succeed.
+      this.saveState.set("error");
+      this.saveErrorMessage.set("This note no longer exists.");
+      this.toast.danger("This note no longer exists — it may have been deleted elsewhere.");
+      return;
+    }
+    if (message.includes("Locked")) {
+      this.saveState.set("error");
+      this.saveErrorMessage.set(message);
+      this.toast.danger("This note is locked — unlock its folder to edit.");
+      return;
+    }
+    if (!this.isUnretryableSaveError(message)) {
+      try {
+        const result = await this.retryOnce(noteId, retryAttempt);
+        onRetrySuccess(result);
+        this.saveState.set("saved");
+        this.saveErrorMessage.set(null);
+        return;
+      } catch (retryError) {
+        this.saveState.set("error");
+        this.saveErrorMessage.set(String(retryError));
+        return;
+      }
+    }
+    this.saveState.set("error");
+    this.saveErrorMessage.set(message);
+  }
+
+  /**
    * CHEAP persist — text only (no re-index, no export). Used by the frequent
    * autosave + blur so typing never triggers the e5 re-embed. The DB text is
    * canonical, so nothing is lost; the brain index catches up on the next full save.
@@ -899,17 +1034,25 @@ export class NoteEditorComponent {
       const updatedAt = await this.ipc.saveNoteText(doc.id, title, markdown);
       this.note.update((cur) => (cur ? { ...cur, updatedAt } : cur));
       this.saveState.set("saved");
+      this.saveErrorMessage.set(null);
       // Live tab-title sync (bug fix, 2026-07-12): `hydrate()` only sets the tab
       // title on INITIAL load/re-mask, so a rename previously kept showing the
       // stale title until the tab was closed + reopened. Every committed save
       // (debounced autosave, not every keystroke) re-syncs it — a no-op if this
-      // note isn't tab-tracked (see `TabsService.setTitle`).
+      // note isn't tab-tracked (see `TabsService.setTitle`). Also mirrored
+      // OPTIMISTICALLY from every keystroke in `onTitleInput` now, so this call
+      // is a reconciling no-op in the common case.
       this.tabsService.setTitle(tabKeyFor("note", doc.id), title || "Untitled");
     } catch (e) {
-      this.saveState.set("error");
-      if (String(e).includes("Locked")) {
-        this.toast.danger("This note is locked — unlock its folder to edit.");
-      }
+      await this.handleSaveFailure(
+        doc.id,
+        e,
+        () => this.ipc.saveNoteText(doc.id, title, markdown),
+        (updatedAt) => {
+          this.note.update((cur) => (cur ? { ...cur, updatedAt } : cur));
+          this.tabsService.setTitle(tabKeyFor("note", doc.id), title || "Untitled");
+        },
+      );
     }
   }
 
@@ -921,7 +1064,10 @@ export class NoteEditorComponent {
    * single-writer chain as the cheap saves, superseding any pending cheap save.
    */
   private flushFull(): void {
-    this.debounce.cancel("note-editor-save");
+    const doc = this.note();
+    if (doc) {
+      this.debounce.cancel(this.saveDebounceKey(doc.id));
+    }
     void this.queueSave("full");
   }
 
@@ -951,20 +1097,38 @@ export class NoteEditorComponent {
           : cur,
       );
       this.saveState.set("saved");
+      this.saveErrorMessage.set(null);
       // Live tab-title sync (bug fix, 2026-07-12) — see the twin call in {@link saveText}.
       this.tabsService.setTitle(tabKeyFor("note", doc.id), title || "Untitled");
     } catch (e) {
-      this.saveState.set("error");
-      if (String(e).includes("Locked")) {
-        this.toast.danger("This note is locked — unlock its folder to edit.");
-      }
+      await this.handleSaveFailure(
+        doc.id,
+        e,
+        () => this.ipc.updateNoteDoc(doc.id, title, markdown),
+        (fresh) => {
+          this.dirtyFull = false;
+          this.note.update((cur) =>
+            cur
+              ? {
+                  ...cur,
+                  updatedAt: fresh.updatedAt,
+                  exportedPath: fresh.exportedPath,
+                  shared: fresh.shared,
+                  locked: fresh.locked,
+                }
+              : cur,
+          );
+          this.tabsService.setTitle(tabKeyFor("note", doc.id), title || "Untitled");
+        },
+      );
     }
   }
 
   /** Blur handler (title / body) — flush the pending CHEAP save immediately. */
   onBlur(): void {
-    if (this.saveState() === "saving") {
-      this.debounce.cancel("note-editor-save");
+    const doc = this.note();
+    if (doc && this.saveState() === "saving") {
+      this.debounce.cancel(this.saveDebounceKey(doc.id));
       void this.queueSave("text");
     }
   }
@@ -1524,7 +1688,7 @@ export class NoteEditorComponent {
     this.closeMenus();
     // Persist the latest text first (cheap) so the exported file is current —
     // awaited through the single-writer chain so it lands after any in-flight save.
-    this.debounce.cancel("note-editor-save");
+    this.debounce.cancel(this.saveDebounceKey(doc.id));
     await this.queueSave("text");
     try {
       const path = await this.ipc.exportNoteDoc(doc.id);
@@ -1549,7 +1713,7 @@ export class NoteEditorComponent {
     }
     // Persist the latest text (cheap, via the single-writer chain) so the
     // shared body is current.
-    this.debounce.cancel("note-editor-save");
+    this.debounce.cancel(this.saveDebounceKey(doc.id));
     void this.queueSave("text");
     this.shareOpen.set(true);
   }
@@ -1600,7 +1764,7 @@ export class NoteEditorComponent {
     // the dirty flag so neither the queue nor the teardown full-save resurrects
     // the just-deleted note. (An already in-flight save cannot be recalled —
     // same as before — but nothing new is started.)
-    this.debounce.cancel("note-editor-save");
+    this.debounce.cancel(this.saveDebounceKey(doc.id));
     this.pendingSave = null;
     this.dirtyFull = false;
     try {
