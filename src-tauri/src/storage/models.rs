@@ -1077,14 +1077,21 @@ pub struct BacklinkSource {
     pub timestamp: String,
 }
 
-/// A resolved `[[Title]]` wikilink navigation target — the VISIBLE note or meeting whose exact title
-/// the link names, so the FE can route `/notes/:id` or `/meeting/:id`. Resolution is
-/// visibility-gated: a sealed-and-not-session-unlocked note/meeting with that title resolves to
-/// `None`, so clicking a wikilink can never reveal or navigate to locked content.
+/// A resolved `[[Title]]` wikilink navigation target — the VISIBLE note, meeting, or (2026-07-15)
+/// org (Shared Brain) item whose exact title the link names, so the FE can route `/notes/:id`,
+/// `/meeting/:id`, or `/org-item/:id`. Resolution is visibility-gated: a sealed-and-not-
+/// session-unlocked note/meeting with that title resolves to `None`, so clicking a wikilink can
+/// never reveal or navigate to locked content. `kind` is a raw string (`"meeting"` | `"note"` |
+/// `"org"`), NOT [`SourceKind`] — mirrors the convention [`NoteCitation`] already established for
+/// the identical tri-state (`SourceKind` stays a strict local meeting/note enum, used only for
+/// backlinks, which have no org leg). For `kind == "org"`, `id` is the org item id
+/// (`org_items.item_id`), never a local id — the FE routes it through
+/// `TabsService.openOrgItem`, exactly like `NoteCitation`'s org rows.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WikiTarget {
-    pub kind: SourceKind,
+    /// `"meeting"` | `"note"` | `"org"`.
+    pub kind: String,
     pub id: String,
 }
 
