@@ -646,7 +646,7 @@ pub struct OrgOwnedSource {
 /// Shared Brain v1 — the content-free result of a manual `org_sync_now()` (counts + errors only).
 /// `fts_only` is true when the local member has no real embedder (StubEmbedder ⇒ the org partition
 /// is indexed FTS-only until a model appears + a re-embed runs). Mirrors the FE `OrgSyncReport`
-/// (camelCase: `pulled, ingested, tombstoned, lastSeq, ftsOnly, errors`).
+/// (camelCase: `pulled, ingested, tombstoned, lastSeq, ftsOnly, errors, authorsBackfilled`).
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct OrgSyncReport {
@@ -657,6 +657,11 @@ pub struct OrgSyncReport {
     pub fts_only: bool,
     /// Content-free error strings (per-item OPEN/ingest failures that were SKIPPED, not fatal).
     pub errors: Vec<String>,
+    /// Count of local `org_items` rows whose `author_user_id` was NULL (stale-ingest, from before the
+    /// column/stamping existed, or a cursor already past the item) and got backfilled THIS sync from a
+    /// full-feed re-pull (`org_sync_one` → the null-author backfill pass). Content-free — an id/author
+    /// count only. (2026-07-15.)
+    pub authors_backfilled: u32,
 }
 
 /// A standalone authored note — the LIST-row DTO (leak-free: no body for a sealed note). A note is a

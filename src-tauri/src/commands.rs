@@ -26215,6 +26215,131 @@ mod lifecycle_tests {
         );
     }
 
+    /// STALE-INGEST AUTHOR BACKFILL (root-cause fix, RED→GREEN): an `org_items` row ingested before
+    /// `author_user_id` existed (or one whose seq is already behind the sync cursor) has NULL
+    /// `author_user_id` forever under the OLD cursor-only pull, because the feed is only ever asked for
+    /// `seq > cursor` — the author's own second machine can never recognise the item as its own, so
+    /// `org_get_item`'s `editable` stays false no matter how many times sync runs. Seed a LIVE local
+    /// `org_items` row with `author_user_id = NULL` at seq 3, and advance the cursor to 5 (simulating an
+    /// already-caught-up device — a plain cursor pull would fetch NOTHING new). The mock server answers
+    /// TWO feed requests: the normal `sinceSeq=5` pull (nothing new) and the backfill's full re-pull
+    /// `sinceSeq=0` (returns the SAME item, now carrying its authorUserId). After `org_sync_one_now_inner`
+    /// runs, the local row's `author_user_id` must be backfilled to the session's own id, and
+    /// `org_get_item`'s `editable` must flip true — proving the mechanism, not just the storage.
+    #[test]
+    fn org_sync_backfills_null_author_for_an_already_ingested_item() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let me_uuid = "c534b6d2-02c1-4c2c-a256-3af8592b1567";
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut sock, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 8192];
+                let n = sock.read(&mut buf).unwrap();
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let body = if req.contains("sinceSeq=0") {
+                    // The backfill's full re-pull: the SAME item, now WITH its real author id.
+                    // `contentSha256` is base64URL-NO-PAD (`murmur_protocol::b64`) — 32 zero bytes.
+                    format!(
+                        r#"{{"items":[{{"itemId":"item-stale","seq":3,"authorUserId":"{me_uuid}","rev":1,"generation":1,"createdAt":"2026-07-11T09:00:00Z","tombstoned":false,"blobId":"b1","contentSha256":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}}],"nextSeq":3}}"#
+                    )
+                } else {
+                    // The normal cursor pull from seq 5: nothing new (device already caught up).
+                    r#"{"items":[],"nextSeq":5}"#.to_string()
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes());
+                let _ = sock.flush();
+                let _ = sock.shutdown(std::net::Shutdown::Write);
+                // Let the client fully drain the response before this socket is dropped (dropping
+                // immediately can race a `connection: close` RST ahead of the client's read).
+                let mut drain = [0u8; 64];
+                loop {
+                    match sock.read(&mut drain) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => continue,
+                    }
+                }
+            }
+        });
+
+        let state = build_state("org-sync-author-backfill");
+        seed_org(&state.db, "org-y", "Y", "member", 1);
+        // A LIVE local replica row ingested BEFORE author stamping existed: author_user_id NULL.
+        state
+            .db
+            .upsert_org_item(
+                "item-stale",
+                "org-y",
+                3,
+                "anna",
+                "Old note",
+                "# body",
+                "2026-07-11T09:00:00Z",
+                1,
+                1,
+                &[9u8; 32],
+                Some("document"),
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            state.db.org_item_edit_ctx("item-stale").unwrap().unwrap().author_user_id,
+            None,
+            "precondition: the stale row starts with no stamped author"
+        );
+        // Cursor already PAST the item's seq — a plain cursor pull will never re-see it.
+        state.db.set_org_last_seq("org-y", 5).unwrap();
+        state.config.lock().unwrap().share_base_url = format!("http://{addr}");
+        *state.account_session.lock().unwrap() = Some(crate::share::AccountSession {
+            account_id: "user@example.com".into(),
+            email: "user@example.com".into(),
+            server_user_id: Some(me_uuid.into()),
+            device_id: "dev-2".into(),
+            mk: Zeroizing::new([7u8; 32]),
+            generation: 1,
+            access_token: "a".into(),
+            access_expires_at: Some("2099-01-01T00:00:00Z".into()),
+            refresh_token: "r".into(),
+        });
+
+        let report = block_on(org_sync_one_now_inner(&state, "org-y")).unwrap();
+        server.join().unwrap();
+
+        assert_eq!(
+            report.authors_backfilled, 1,
+            "the sync tick backfilled exactly the one stale-NULL row: {:?}",
+            report.errors
+        );
+        // The local row now carries the real author id (GREEN — RED on the pre-fix code: this stayed
+        // None forever, since the cursor pull alone never re-visits an already-ingested seq).
+        let ctx = state.db.org_item_edit_ctx("item-stale").unwrap().unwrap();
+        assert_eq!(ctx.author_user_id.as_deref(), Some(me_uuid));
+        // The cursor itself is UNCHANGED by the backfill (it's a read-only side query, not a re-ingest).
+        assert_eq!(state.db.get_org_state("org-y").unwrap().unwrap().last_seq, 5);
+
+        // End-to-end: replays `org_get_item`'s own editable-resolution logic (it takes a Tauri `State`
+        // wrapper the test suite has no constructor for elsewhere, so we drive the same two calls the
+        // command body makes) — the actual user-facing bug was "can't edit my own note from a second
+        // device", so the test must prove `editable` flips true, not just that storage round-trips.
+        let mut detail = state.db.get_org_item("item-stale").unwrap().expect("item still resolves");
+        if let Some(edit_ctx) = state.db.org_item_edit_ctx("item-stale").unwrap() {
+            if let (Some(author), Ok(me)) =
+                (edit_ctx.author_user_id.as_deref(), session_server_user_id(&state))
+            {
+                detail.editable = author == me;
+            }
+        }
+        assert!(
+            detail.editable,
+            "editable must flip true once author_user_id is backfilled to match the caller's session"
+        );
+    }
+
     /// F1 (MULTI-ORG TARGETING, RED→GREEN for the `.next()` misroute): with TWO local orgs, the org
     /// commands must resolve the SPECIFIC org the FE passed, never the FIRST. `resolve_org` — the
     /// shared resolution seam every per-org command now uses — must return the SECOND org's row when
@@ -29951,70 +30076,159 @@ async fn org_sync_one(
     }
 
     // ── SYNC INGEST PHASE — embedder built ONCE, never crosses an await ───────────────────────────
-    let embedder: Option<Box<dyn crate::embed::Embedder>> = if report.fts_only {
-        None
-    } else {
-        Some(crate::embed::active_embedder())
-    };
-    let embedder_ref: Option<&dyn crate::embed::Embedder> = embedder.as_deref();
-    let mut applied = cursor;
-    for action in actions {
-        match action {
-            FeedAction::Tombstone { item_id, seq } => {
-                state.db.tombstone_org_item(&item_id)?;
-                report.tombstoned += 1;
-                applied = applied.max(seq);
-            }
-            // FIX D: a permanently un-ingestable item advances the cursor past its seq (no DB write),
-            // so it never stalls the feed — the good item behind it ingests on the SAME sync.
-            FeedAction::SkipTerminal { seq } => {
-                applied = applied.max(seq);
-                state.db.set_org_last_seq(&org.org_id, applied as i64)?;
-            }
-            FeedAction::Ingest {
-                item_id,
-                seq,
-                rev,
-                generation,
-                env,
-                sha,
-                author_user_id,
-            } => {
-                state.db.upsert_org_item(
-                    &item_id,
-                    &org.org_id,
+    // Scoped in its own block: `embedder`/`embedder_ref` (`dyn Embedder`, !Send) MUST be fully dropped
+    // before the backfill's `.await` below, or the whole `org_sync_now` future stops being `Send` (Tauri
+    // commands must be `Send`) — a bare `drop(x)` call does NOT shrink NLL liveness the way going out of
+    // scope does, so this needs the block, not just an explicit drop.
+    {
+        let embedder: Option<Box<dyn crate::embed::Embedder>> = if report.fts_only {
+            None
+        } else {
+            Some(crate::embed::active_embedder())
+        };
+        let embedder_ref: Option<&dyn crate::embed::Embedder> = embedder.as_deref();
+        let mut applied = cursor;
+        for action in actions {
+            match action {
+                FeedAction::Tombstone { item_id, seq } => {
+                    state.db.tombstone_org_item(&item_id)?;
+                    report.tombstoned += 1;
+                    applied = applied.max(seq);
+                }
+                // FIX D: a permanently un-ingestable item advances the cursor past its seq (no DB
+                // write), so it never stalls the feed — the good item behind it ingests on the SAME sync.
+                FeedAction::SkipTerminal { seq } => {
+                    applied = applied.max(seq);
+                    state.db.set_org_last_seq(&org.org_id, applied as i64)?;
+                }
+                FeedAction::Ingest {
+                    item_id,
                     seq,
-                    &env.author_hint,
-                    &env.title,
-                    &env.markdown,
-                    &env.created_at,
                     rev,
                     generation,
-                    &sha,
-                    // Straight off the opened envelope: `Some("document"|"meeting")` for an item
-                    // published from a v2 wire envelope (this device's own publishes, or a peer already
-                    // on v2); `None` for one opened off an old v1 envelope (no wire signal) — honest
-                    // "unclassified", never guessed.
-                    env.source_kind.map(crate::share::org_envelope::OrgSourceKind::as_str),
-                    embedder_ref,
-                )?;
-                // Stamp the server-authoritative author id so the author's OTHER machines can edit
-                // their own item in-place (they have no local `org_shares` anchor). Server never sends
-                // an empty author id, but guard anyway — an empty stamp would just leave it unmatched.
-                if !author_user_id.is_empty() {
-                    state.db.set_org_item_author(&item_id, &author_user_id)?;
+                    env,
+                    sha,
+                    author_user_id,
+                } => {
+                    state.db.upsert_org_item(
+                        &item_id,
+                        &org.org_id,
+                        seq,
+                        &env.author_hint,
+                        &env.title,
+                        &env.markdown,
+                        &env.created_at,
+                        rev,
+                        generation,
+                        &sha,
+                        // Straight off the opened envelope: `Some("document"|"meeting")` for an item
+                        // published from a v2 wire envelope (this device's own publishes, or a peer
+                        // already on v2); `None` for one opened off an old v1 envelope (no wire signal) —
+                        // honest "unclassified", never guessed.
+                        env.source_kind.map(crate::share::org_envelope::OrgSourceKind::as_str),
+                        embedder_ref,
+                    )?;
+                    // Stamp the server-authoritative author id so the author's OTHER machines can edit
+                    // their own item in-place (they have no local `org_shares` anchor). Server never
+                    // sends an empty author id, but guard anyway — an empty stamp just leaves it unmatched.
+                    if !author_user_id.is_empty() {
+                        state.db.set_org_item_author(&item_id, &author_user_id)?;
+                    }
+                    report.ingested += 1;
+                    applied = applied.max(seq);
                 }
-                report.ingested += 1;
-                applied = applied.max(seq);
             }
+            // Advance the cursor per successfully-applied item (monotonic; Core's setter no-ops backward).
+            state.db.set_org_last_seq(&org.org_id, applied as i64)?;
         }
-        // Advance the cursor per successfully-applied item (monotonic; Core's setter no-ops backward).
-        state.db.set_org_last_seq(&org.org_id, applied as i64)?;
     }
+
+    // STALE-INGEST BACKFILL (2026-07-15): the cursor-based pull above only ever asks for `seq > cursor`,
+    // so an item ingested BEFORE `author_user_id` existed (or via a local-replica upsert at
+    // share/republish time) has its seq already behind the cursor and is NEVER re-visited by the normal
+    // pull — its `author_user_id` would stay NULL forever, permanently blocking `org_get_item`'s
+    // editable check for that item on every OTHER machine of its own author (see `org_get_item`,
+    // `session_server_user_id`). Root-cause fix (not a workaround): actively re-derive the missing
+    // authors from the server's full feed, which DOES carry `author_user_id` for every item regardless
+    // of cursor position (`ShareClient::org_feed` takes an explicit `since_seq`; passing 0 replays the
+    // whole feed). Cheap on the common case (no NULL rows ⇒ zero extra requests) and bounded (stops the
+    // moment every local NULL row has been matched, never scans past what it needs).
+    backfill_null_org_item_authors(state, client, access, &org.org_id, report).await;
 
     // `report.last_seq` reflects the LAST org synced (per-org field on an aggregate report).
     report.last_seq = state.db.org_last_seq_for(&org.org_id)?;
     Ok(())
+}
+
+/// Re-derive `author_user_id` for any of this org's locally-held LIVE items still missing it, from a
+/// full-feed re-pull starting at `since_seq=0`. Never touches the org's real sync cursor
+/// (`org_last_seq_for`/`set_org_last_seq`) — this is a read-only side query purely to recover author
+/// ids the cursor-based pull will never see again. Best-effort: any error here is swallowed into
+/// `report.errors` (content-free) rather than failing the whole sync, since a missing author id only
+/// degrades edit-in-place, it never blocks reading the item.
+async fn backfill_null_org_item_authors(
+    state: &AppState,
+    client: &crate::share::client::ShareClient,
+    access: &str,
+    org_id: &str,
+    report: &mut crate::storage::models::OrgSyncReport,
+) {
+    let missing = match state.db.org_item_ids_with_null_author(org_id) {
+        Ok(ids) => ids,
+        Err(e) => {
+            report
+                .errors
+                .push(format!("author backfill: local lookup failed ({})", brief_err(&e)));
+            return;
+        }
+    };
+    if missing.is_empty() {
+        return; // the common case — nothing to do, no extra network round-trip.
+    }
+    let mut remaining: std::collections::HashSet<String> = missing.into_iter().collect();
+    let mut cursor = 0u64;
+    // Bounded: stop once every target is found, OR the feed is exhausted (a page shorter than the
+    // page size), OR a hard page cap in case the org's feed is huge and pathologically never contains
+    // some of the ids (e.g. they were tombstoned between the local ingest and now — `org_item_ids_with_
+    // null_author` only reads live rows, so this should not happen, but a cap keeps this provably
+    // bounded regardless).
+    const MAX_PAGES: u32 = 50; // 50 * 200 = 10,000 items of feed history — generous, still bounded.
+    for _ in 0..MAX_PAGES {
+        if remaining.is_empty() {
+            break;
+        }
+        let feed = match client.org_feed(access, org_id, cursor, ORG_FEED_PAGE).await {
+            Ok(f) => f,
+            Err(e) => {
+                report
+                    .errors
+                    .push(format!("author backfill: feed re-pull failed ({})", brief_err(&e)));
+                return;
+            }
+        };
+        if feed.items.is_empty() {
+            break;
+        }
+        for item in &feed.items {
+            if item.author_user_id.is_empty() {
+                continue;
+            }
+            if remaining.remove(&item.item_id) {
+                if let Err(e) = state.db.set_org_item_author(&item.item_id, &item.author_user_id) {
+                    report
+                        .errors
+                        .push(format!("author backfill: stamp failed ({})", brief_err(&e)));
+                    continue;
+                }
+                report.authors_backfilled += 1;
+            }
+        }
+        let page_len = feed.items.len() as u32;
+        cursor = cursor.max(feed.next_seq);
+        if page_len < ORG_FEED_PAGE {
+            break; // fewer than a full page ⇒ feed drained.
+        }
+    }
 }
 
 /// A short, PII-free rendering of an error for a sync report string (never note content — AppError
