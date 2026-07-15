@@ -2218,6 +2218,22 @@ export interface OrgFeedUpdatedPayload {
 }
 
 /**
+ * Payload of the `murmur://content-deleted` event (`onContentDeleted`). Emitted
+ * once a note/meeting delete has FULLY succeeded on the backend (local rows
+ * gone AND any live org shares of it already revoked) — the delete-fan-out fix
+ * so OTHER open surfaces (most visibly the tab-strip) learn content vanished
+ * even when the delete happened from a different surface than the one showing
+ * a stale tab. Content-free: an id + a kind discriminator only, never a title.
+ * Mirrors the Rust `ContentDeletedPayload`.
+ */
+export interface ContentDeletedPayload {
+  /** `"note"` | `"meeting"`. */
+  kind: "note" | "meeting";
+  /** The deleted note's or meeting's id. */
+  id: string;
+}
+
+/**
  * The active-shares report for the lock×shares dialog (`folderActiveShares`),
  * gathered when the user tries to lock a folder that has outgoing shares. Titles
  * render only to the local owner (who can already read them) — content-free
