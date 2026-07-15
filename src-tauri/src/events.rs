@@ -342,6 +342,44 @@ pub fn emit_org_feed_updated(app: &AppHandle, orgs_changed: u32) {
     }
 }
 
+/// DELETE FAN-OUT FIX (2026-07-15): emitted once a note/meeting delete has FULLY succeeded — local
+/// rows gone AND (per the org-share revoke-cascade fix) any live org shares of it already revoked.
+/// Root cause this closes: no delete flow ever told OTHER open consumers (most visibly the tab-strip,
+/// `TabsService`) that content vanished, so a stale tab opened from a different surface than the one
+/// that deleted it stayed open and clickable, landing on a 404/error state. Content-free: an id + a
+/// kind discriminator only — never a title or any other content.
+pub const EVENT_CONTENT_DELETED: &str = "murmur://content-deleted";
+
+/// Payload for [`EVENT_CONTENT_DELETED`]. `kind` is `"note"` | `"meeting"`; `id` is the deleted note's
+/// or meeting's id (an opaque identifier, not content).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContentDeletedPayload {
+    /// `"note"` | `"meeting"`.
+    pub kind: &'static str,
+    /// The deleted note/meeting's id.
+    pub id: String,
+}
+
+/// Emit [`EVENT_CONTENT_DELETED`] to the FE (best-effort). Swallows the emit failure with a
+/// `tracing::warn!` so a failed emit can NEVER turn a successful delete into a reported failure. NO
+/// PII (id + kind only).
+pub fn emit_content_deleted(app: &AppHandle, kind: &'static str, id: &str) {
+    if let Err(e) = app.emit(
+        EVENT_CONTENT_DELETED,
+        ContentDeletedPayload {
+            kind,
+            id: id.to_string(),
+        },
+    ) {
+        tracing::warn!(
+            target: "notes",
+            error = %e,
+            "failed to emit content-deleted notice"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -350,6 +388,24 @@ mod tests {
     #[test]
     fn org_feed_updated_event_name_is_stable() {
         assert_eq!(EVENT_ORG_FEED_UPDATED, "murmur://org-feed-updated");
+    }
+
+    /// The FE listens on this exact event name; a rename silently drops the tab-strip fan-out.
+    #[test]
+    fn content_deleted_event_name_is_stable() {
+        assert_eq!(EVENT_CONTENT_DELETED, "murmur://content-deleted");
+    }
+
+    /// The payload must serialize as camelCase `{"kind":"note","id":"n1"}` (the FE contract) —
+    /// content-free (id + kind discriminator only).
+    #[test]
+    fn content_deleted_payload_is_camel_case_id_and_kind_only() {
+        let json = serde_json::to_string(&ContentDeletedPayload {
+            kind: "note",
+            id: "n1".to_string(),
+        })
+        .unwrap();
+        assert_eq!(json, r#"{"kind":"note","id":"n1"}"#);
     }
 
     /// The payload must serialize `orgs_changed` as camelCase `orgsChanged` (the FE contract) and
