@@ -104,6 +104,7 @@ import type {
   OrgSyncReport,
   OrgFeedUpdatedPayload,
   ActiveSharesReport,
+  ContentDeletedPayload,
 } from "./models";
 
 export const EVENT_STATUS = "meetnotes://status";
@@ -144,6 +145,9 @@ export const EVENT_BRIEF_PROPOSED = "murmur://brief-proposed";
 // Shared Brain — the background org-sync loop INGESTED/TOMBSTONED ≥1 org item this tick
 // (content-free "something changed, re-fetch" ping; drives the Notes org picker live refresh).
 export const EVENT_ORG_FEED_UPDATED = "murmur://org-feed-updated";
+// Delete fan-out fix — a note/meeting delete FULLY succeeded (local rows gone + any org shares
+// revoked); lets OTHER open surfaces (the tab-strip) prune themselves. Content-free (id + kind only).
+export const EVENT_CONTENT_DELETED = "murmur://content-deleted";
 
 /**
  * Thin wrapper over @tauri-apps/api invoke/listen. One method per Tauri command
@@ -2329,6 +2333,21 @@ export class IpcService {
     cb: (p: OrgFeedUpdatedPayload) => void,
   ): Promise<UnlistenFn> {
     return listen<OrgFeedUpdatedPayload>(EVENT_ORG_FEED_UPDATED, (e) =>
+      cb(e.payload),
+    );
+  }
+
+  /**
+   * Fires once a note/meeting delete has FULLY succeeded on the backend
+   * (delete-fan-out fix). Content-free — id + kind only; a subscriber prunes
+   * its OWN state for that id (the tab-strip closes a matching tab; a list
+   * store removes a matching row as a safety net for the case where the
+   * delete happened from a different surface than the one holding it).
+   */
+  onContentDeleted(
+    cb: (p: ContentDeletedPayload) => void,
+  ): Promise<UnlistenFn> {
+    return listen<ContentDeletedPayload>(EVENT_CONTENT_DELETED, (e) =>
       cb(e.payload),
     );
   }

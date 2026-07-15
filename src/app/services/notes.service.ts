@@ -1,4 +1,4 @@
-import { Injectable, inject, signal } from "@angular/core";
+import { DestroyRef, Injectable, inject, signal } from "@angular/core";
 import { IpcService } from "../core/ipc.service";
 import type {
   NoteFolder,
@@ -23,6 +23,7 @@ import type {
 @Injectable({ providedIn: "root" })
 export class NotesService {
   private readonly ipc = inject(IpcService);
+  private readonly destroyRef = inject(DestroyRef);
 
   private readonly _notes = signal<NoteSummary[]>([]);
   private readonly _noteFolders = signal<NoteFolder[]>([]);
@@ -70,6 +71,41 @@ export class NotesService {
   readonly schemaLoading = this._schemaLoading.asReadonly();
   /** True while the typed rows are (re)loading. */
   readonly typedLoading = this._typedLoading.asReadonly();
+
+  /**
+   * DELETE FAN-OUT FIX (2026-07-15) SAFETY NET: subscribed ONCE here (a root
+   * singleton lives for the app's lifetime — mirrors `OrgBrainService`'s
+   * constructor subscription) so a note deleted from a DIFFERENT surface than
+   * the one holding this list (e.g. the note's own editor tab, or the Brain
+   * page) still prunes it here. Layered on top of {@link remove}'s existing
+   * local pruning — never replaces it.
+   */
+  private feedUnlisten: (() => void) | null = null;
+  private feedDestroyed = false;
+
+  constructor() {
+    this.destroyRef.onDestroy(() => {
+      this.feedDestroyed = true;
+      this.feedUnlisten?.();
+    });
+    void this.ipc
+      .onContentDeleted((p) => {
+        if (p.kind !== "note") {
+          return;
+        }
+        this._notes.update((list) => list.filter((n) => n.id !== p.id));
+      })
+      .then((un) => {
+        if (this.feedDestroyed) {
+          un();
+        } else {
+          this.feedUnlisten = un;
+        }
+      })
+      .catch(() => {
+        /* best-effort: no Tauri host (e.g. plain browser) → no live fan-out */
+      });
+  }
 
   /**
    * Select a note-folder (or null for "All notes") as the shared sidebar/content
