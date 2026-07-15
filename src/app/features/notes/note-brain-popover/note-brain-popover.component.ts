@@ -50,16 +50,20 @@ export interface PopoverSelection {
 /**
  * One accepted assistant outcome, applied by the editor. Discriminated by `kind`
  * so the editor branches without re-deriving intent from the action:
- * - `replace` — replace the selection with `suggestion`.
- * - `insert`  — append `suggestion` after the selection (additive; also "Insert as note").
- * - `copy`    — copy `text` to the clipboard (draft follow-up / an info answer).
- * - `spinoff` — create a NEW note from `title` + `body` and open it.
+ * - `replace`    — replace the selection with `suggestion`.
+ * - `insert`     — append `suggestion` after the selection (additive; also "Insert as note").
+ * - `copy`       — copy `text` to the clipboard (draft follow-up / an info answer).
+ * - `spinoff`    — create a NEW note from `title` + `body` and open it.
+ * - `insertLink` — insert a `[[title]]` wikilink after the selection (Fix 3: the
+ *                  "Insert link" action on a `find_related` citation row, reusing
+ *                  the SAME wikilink text the link-picker/toolbar op builds).
  */
 export type AcceptedEdit =
   | { kind: "replace"; suggestion: string }
   | { kind: "insert"; suggestion: string }
   | { kind: "copy"; text: string }
-  | { kind: "spinoff"; title: string; body: string };
+  | { kind: "spinoff"; title: string; body: string }
+  | { kind: "insertLink"; title: string };
 
 /** One step in the animated progress tracker (mirrors the Ask trace-chip language). */
 interface FlowStep {
@@ -513,6 +517,18 @@ export class NoteBrainPopoverComponent {
       return;
     }
     void this.router.navigate(["/graph", cite.id]);
+  }
+
+  /**
+   * Insert a `[[Title]]` wikilink to this citation's source, then dismiss the
+   * popover (Fix 3 — the "Insert link" PRIMARY action alongside "Open" on every
+   * `find_related` citation row: reuses the SAME gated citation data, only the
+   * interaction changes). The editor applies it exactly like an `insert` outcome
+   * (appended after the selection), so this needs no new textarea-splice logic.
+   */
+  insertLinkFor(cite: NoteCitation): void {
+    this.accepted.emit({ kind: "insertLink", title: cite.title });
+    this.dismiss.emit();
   }
 
   // ── Positioning + teardown ───────────────────────────────────────────────

@@ -1,0 +1,72 @@
+/* The link-insertion autocomplete floats OVER the editor body → OPAQUE overlay
+   (T3): --surface-overlay, --border-strong, --shadow-lg, backdrop-filter:none.
+   Never the frosted .card. Positioned in JS (top/left set from the caret rect). */
+:host {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  pointer-events: none; /* only the popover box itself is interactive */
+}
+
+.link-pop {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 280px;
+  max-width: calc(100vw - 2 * var(--space-3));
+  max-height: 240px;
+  overflow-y: auto;
+  pointer-events: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: var(--space-1);
+  background: var(--surface-overlay);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg);
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+}
+
+.link-pop-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  width: 100%;
+  padding: var(--space-2);
+  border: 0;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 0.8125rem;
+  text-align: left;
+  cursor: pointer;
+}
+.link-pop-row:hover,
+.link-pop-row.is-active {
+  background: var(--surface-hover);
+}
+.link-pop-kind {
+  flex: none;
+  font-size: 0.63rem;
+  font-weight: 660;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+.link-pop-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.link-pop-empty {
+  margin: 0;
+  padding: var(--space-3) var(--space-2);
+  color: var(--text-muted);
+  font-size: 0.8125rem;
+  text-align: center;
+}

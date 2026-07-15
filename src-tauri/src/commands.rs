@@ -6194,6 +6194,53 @@ pub fn resolve_wikilink(
     state.db.resolve_wikilink(&title, &unlocked)
 }
 
+/// Live keystroke-prefix candidates for the inline `[[` / slash-menu link-insertion autocomplete
+/// (note-editor Fix 2). Distinct from [`resolve_wikilink`] (exact-title resolve on Enter/click) and
+/// from `note_assistant_action`'s `find_related` (SELECTION+semantic retrieval — the wrong shape
+/// for filtering on a short, growing keystroke prefix): this is a lightweight, gated title-prefix
+/// scan, capped at `MAX_LINK_CANDIDATES` total rows across notes + meetings + (when joined) the
+/// Shared Brain. GATED exactly like every other content read: notes/meetings go through
+/// `Db::list_link_candidates_visible` (`visibility_clause` on both legs, same as `resolve_wikilink`);
+/// org items go through `search_org_brain_hits`, the SAME retrieval-only, membership+enabled-gated,
+/// zero-egress reader `find_related` already uses (never a provider/egress call). Reuses
+/// [`crate::storage::models::NoteCitation`] — the popover renders it exactly like a `find_related`
+/// citation row, and `kind == "org"` carries an org item id (never a local id), matching that
+/// contract verbatim.
+#[tauri::command]
+pub fn list_link_candidates(
+    state: State<'_, AppState>,
+    prefix: String,
+) -> Result<Vec<crate::storage::models::NoteCitation>, AppError> {
+    const MAX_LINK_CANDIDATES: i64 = 8;
+    let unlocked = unlocked_snapshot(state.inner())?;
+    let mut out = state
+        .db
+        .list_link_candidates_visible(&prefix, MAX_LINK_CANDIDATES, &unlocked)?;
+    if (out.len() as i64) < MAX_LINK_CANDIDATES {
+        let config = {
+            state
+                .config
+                .lock()
+                .map_err(|_| AppError::Config("config mutex poisoned".into()))?
+                .clone()
+        };
+        let q = prefix.trim();
+        if !q.is_empty() && crate::tools::org_brain_available(&state.db, &config) {
+            let remaining = (MAX_LINK_CANDIDATES - out.len() as i64).max(0) as usize;
+            let org_hits = crate::tools::search_org_brain_hits(&state.db, &config, q)?;
+            for hit in org_hits.into_iter().take(remaining) {
+                out.push(crate::storage::models::NoteCitation {
+                    kind: "org".into(),
+                    id: hit.item_id,
+                    title: hit.title,
+                    snippet: hit.snippet,
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Structured, GATED, egress-free person dossier for the `/people` detail pane. Unlike
 /// [`entity_dossier`] (which CLOUD-synthesizes a markdown String via the provider and discards the
 /// struct), this returns the STRUCTURED [`DossierData`](crate::summarize::dossier::DossierData) with

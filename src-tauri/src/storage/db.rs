@@ -14,7 +14,8 @@ use crate::storage::models::{
     CorrectionRecord, DayCount,
     DocChunkHit, DocumentInfo, DocumentSummary, EntityDetail, EntityKind, EntityNeighbor, Folder,
     GraphData,
-    GraphEdge, GraphEntity, GraphNode, Meeting, MeetingActionSummary, MeetingStatus, NoteFolder,
+    GraphEdge, GraphEntity, GraphNode, Meeting, MeetingActionSummary, MeetingStatus, NoteCitation,
+    NoteFolder,
     NoteRecord, NoteSummary,
     OrgChunkHit, PendingShareAccept, PeopleList, PersonCard, PropertyKind, PropertySchemaField,
     PropertyValue, RecipeRecord, SavedView, SearchHit,
@@ -8553,6 +8554,113 @@ impl Db {
         Ok(None)
     }
 
+    /// Live keystroke-prefix title match over VISIBLE notes + meetings, for the inline `[[` /
+    /// slash-menu link-insertion autocomplete (distinct from [`resolve_wikilink`]'s exact-title
+    /// resolve and from `gather_note_enhance_citations`'s SELECTION+semantic retrieval — this is a
+    /// lightweight `LIKE prefix%` title scan, the right shape for filtering-as-you-type). GATED
+    /// identically to every other title/content read: `visibility_clause` on both legs, so a
+    /// sealed-and-not-session-unlocked note/meeting never appears as a candidate. An empty/blank
+    /// `prefix` returns the most-recently-updated visible notes+meetings (so the popover has
+    /// something to show the instant it opens, before the user has typed anything). Capped at
+    /// `limit` total rows across BOTH kinds, notes first (mirrors `resolve_wikilink`'s note-first
+    /// preference), newest-updated first within each kind.
+    pub fn list_link_candidates_visible(
+        &self,
+        prefix: &str,
+        limit: i64,
+        unlocked: &HashSet<String>,
+    ) -> Result<Vec<NoteCitation>> {
+        let prefix = prefix.trim();
+        let mut out: Vec<NoteCitation> = Vec::new();
+
+        // Notes leg.
+        {
+            let conn = self.lock();
+            let visible = visibility_clause("f", unlocked);
+            let like_pred = if prefix.is_empty() {
+                String::new()
+            } else {
+                " AND COALESCE(NULLIF(TRIM(d.title), ''), d.name) LIKE ?2 ESCAPE '\\'".to_string()
+            };
+            let sql = format!(
+                "SELECT d.id, COALESCE(NULLIF(TRIM(d.title), ''), d.name)
+                   FROM documents d
+                   JOIN folders f ON f.id = d.folder_id
+                  WHERE d.kind = 'note' AND {visible}{like_pred}
+                  ORDER BY d.updated_at DESC, d.id ASC
+                  LIMIT ?1"
+            );
+            let mut stmt = conn.prepare(&sql).map_err(map_err)?;
+            let map_row = |r: &Row<'_>| -> rusqlite::Result<(String, String)> {
+                Ok((r.get(0)?, r.get(1)?))
+            };
+            let rows = if prefix.is_empty() {
+                stmt.query_map(rusqlite::params![limit], map_row)
+            } else {
+                let pat = format!("{}%", escape_like(prefix));
+                stmt.query_map(rusqlite::params![limit, pat], map_row)
+            }
+            .map_err(map_err)?;
+            for r in rows {
+                let (id, title) = r.map_err(map_err)?;
+                out.push(NoteCitation {
+                    kind: "note".into(),
+                    id,
+                    title,
+                    snippet: String::new(),
+                });
+            }
+        }
+
+        // Meetings leg (only if the notes leg hasn't already filled the cap).
+        if (out.len() as i64) < limit {
+            let remaining = limit - out.len() as i64;
+            let conn = self.lock();
+            let visible = visibility_clause("n", unlocked);
+            let like_pred = if prefix.is_empty() {
+                String::new()
+            } else {
+                " AND m.title LIKE ?2 ESCAPE '\\'".to_string()
+            };
+            let sql = format!(
+                "SELECT m.id, m.title
+                   FROM meetings m
+                  WHERE m.title IS NOT NULL AND TRIM(m.title) != ''{like_pred}
+                    AND (
+                      NOT EXISTS (SELECT 1 FROM notes nn WHERE nn.meeting_id = m.id)
+                      OR EXISTS (
+                        SELECT 1 FROM notes n
+                         LEFT JOIN folders f ON f.id = n.folder_id
+                         WHERE n.meeting_id = m.id AND {visible}
+                      )
+                    )
+                  ORDER BY m.started_at DESC, m.id DESC
+                  LIMIT ?1"
+            );
+            let mut stmt = conn.prepare(&sql).map_err(map_err)?;
+            let map_row = |r: &Row<'_>| -> rusqlite::Result<(String, Option<String>)> {
+                Ok((r.get(0)?, r.get(1)?))
+            };
+            let rows = if prefix.is_empty() {
+                stmt.query_map(rusqlite::params![remaining], map_row)
+            } else {
+                let pat = format!("{}%", escape_like(prefix));
+                stmt.query_map(rusqlite::params![remaining, pat], map_row)
+            }
+            .map_err(map_err)?;
+            for r in rows {
+                let (id, title) = r.map_err(map_err)?;
+                out.push(NoteCitation {
+                    kind: "meeting".into(),
+                    id,
+                    title: title.unwrap_or_else(|| "Meeting".into()),
+                    snippet: String::new(),
+                });
+            }
+        }
+        Ok(out)
+    }
+
     /// The latest visible note for a meeting (MCP `get_meeting`); `None` if the meeting's note
     /// is sealed-and-not-session-unlocked.
     pub fn get_note_if_visible(
@@ -13521,6 +13629,100 @@ mod tests {
             .expect("unlocked target resolves");
         assert_eq!(t.kind, SourceKind::Note);
         assert_eq!(t.id, "n-secret");
+    }
+
+    /// `list_link_candidates_visible` prefix-filters (case-insensitively) over notes + meetings,
+    /// notes-first, and an empty prefix returns everything up to the cap (recency order).
+    #[test]
+    fn list_link_candidates_prefix_filters_notes_and_meetings() {
+        let db = mem_db();
+        seed_folder(&db, "f-open", "Open");
+
+        db.insert_note("n-alpha", "f-open", "alpha", "Alpha Project", "body", 1_000)
+            .unwrap();
+        db.insert_note("n-alt", "f-open", "alt", "Alternate Plan", "body", 2_000)
+            .unwrap();
+        let mut beta = sample_meeting("m-beta", "2026-06-24T10:00:00Z");
+        beta.title = Some("Alpine Standup".to_string());
+        db.insert_meeting(&beta).unwrap();
+        note_for(&db, "m-beta", "claude_code", "beta note");
+        db.set_note_folder("m-beta", Some("f-open")).unwrap();
+
+        let nothing = std::collections::HashSet::new();
+
+        // "Alp" matches "Alpha Project" (note) and "Alpine Standup" (meeting), not "Alternate Plan".
+        let hits = db
+            .list_link_candidates_visible("Alp", 10, &nothing)
+            .unwrap();
+        let titles: Vec<&str> = hits.iter().map(|c| c.title.as_str()).collect();
+        assert!(titles.contains(&"Alpha Project"));
+        assert!(titles.contains(&"Alpine Standup"));
+        assert!(!titles.contains(&"Alternate Plan"));
+        // Notes leg is queried first (mirrors `resolve_wikilink`'s note-first preference).
+        assert_eq!(hits[0].kind, "note");
+
+        // Case-insensitive (SQLite LIKE is ASCII-case-insensitive by default, same as the
+        // existing `search_snippet`/path LIKE readers in this file).
+        let ci = db
+            .list_link_candidates_visible("alp", 10, &nothing)
+            .unwrap();
+        assert_eq!(ci.len(), hits.len());
+
+        // Empty prefix returns everything (capped), not nothing.
+        let all = db
+            .list_link_candidates_visible("", 10, &nothing)
+            .unwrap();
+        assert!(all.len() >= 3, "empty prefix should list existing candidates");
+
+        // A cap of 1 returns exactly 1 row (notes leg fills it before the meetings leg runs).
+        let capped = db
+            .list_link_candidates_visible("Alp", 1, &nothing)
+            .unwrap();
+        assert_eq!(capped.len(), 1);
+    }
+
+    /// GATED: a sealed-and-not-session-unlocked note/meeting never appears as a link candidate,
+    /// even when its title matches the prefix exactly — session-unlock reverses it. RED against an
+    /// ungated prefix scan (this is the same discipline `resolve_wikilink_hides_sealed_target`
+    /// enforces for the exact-title resolver).
+    #[test]
+    fn list_link_candidates_hides_sealed_sources() {
+        let db = mem_db();
+        seed_folder(&db, "f-open", "Open");
+        seed_folder(&db, "f-locked", "Secret");
+        db.set_folder_locked("f-locked", true, Some(b"wrapped"))
+            .unwrap();
+
+        db.insert_note(
+            "n-secret",
+            "f-locked",
+            "secret",
+            "Secret Roadmap",
+            "classified",
+            1_000,
+        )
+        .unwrap();
+        let mut sealed_meeting = sample_meeting("m-secret", "2026-06-24T10:00:00Z");
+        sealed_meeting.title = Some("Secret Standup".to_string());
+        db.insert_meeting(&sealed_meeting).unwrap();
+        note_for(&db, "m-secret", "claude_code", "secret meeting note");
+        db.set_note_folder("m-secret", Some("f-locked")).unwrap();
+
+        let nothing = std::collections::HashSet::new();
+        let hidden = db
+            .list_link_candidates_visible("Secret", 10, &nothing)
+            .unwrap();
+        assert!(
+            hidden.is_empty(),
+            "sealed-and-not-unlocked note/meeting must not be a link candidate"
+        );
+
+        let mut unlocked = std::collections::HashSet::new();
+        unlocked.insert("f-locked".to_string());
+        let visible = db
+            .list_link_candidates_visible("Secret", 10, &unlocked)
+            .unwrap();
+        assert_eq!(visible.len(), 2, "unlocking reveals both the note and the meeting");
     }
 
     /// FAIL-CLOSED: a correction row with a NULL `meeting_id` (legacy/unattributed) is never returned
