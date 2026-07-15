@@ -1,0 +1,34 @@
+<!-- OPAQUE floating popover (T3): --surface-overlay + backdrop-filter:none.
+     Positioned in JS (afterNextRender) at the caret's anchor rect. Re-positions
+     on any scroll/resize via the shared directive (DestroyRef-cleaned listeners).
+     PRESENTATIONAL: the caret stays in the editor textarea (Obsidian parity) —
+     this renders the live candidate list only; the host owns query + keyboard nav. -->
+<div
+  #popover
+  class="link-pop"
+  appRepositionOnScroll
+  (reposition)="reposition()"
+  (mousedown)="$event.preventDefault()"
+  role="listbox"
+  aria-label="Link to note"
+>
+  @if (candidates().length > 0) {
+    @for (c of candidates(); track c.kind + c.id; let i = $index) {
+      <button
+        type="button"
+        class="link-pop-row"
+        role="option"
+        [class.is-active]="i === activeIndex()"
+        [attr.aria-selected]="i === activeIndex()"
+        (click)="pick(c)"
+      >
+        <span class="link-pop-kind">{{ c.kind }}</span>
+        <span class="link-pop-title">{{ c.title }}</span>
+      </button>
+    }
+  } @else if (loading()) {
+    <p class="link-pop-empty">Searching…</p>
+  } @else {
+    <p class="link-pop-empty">No matches. Keep typing to create a new note.</p>
+  }
+</div>
