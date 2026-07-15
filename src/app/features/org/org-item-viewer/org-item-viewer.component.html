@@ -60,6 +60,8 @@
                 </button>
               }
             </div>
+          } @else if (notEditableReason(); as reason) {
+            <span class="oi-readonly-reason text-muted">{{ reason }}</span>
           }
         </div>
 
