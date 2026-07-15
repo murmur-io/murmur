@@ -174,6 +174,7 @@ export class OrgItemViewerComponent {
       // corrects it once the authoritative decrypted detail loads.
       this.tabsService.setTitle(tabKeyFor("org-item", id), item.title || "Shared note");
       void this.resolveOrgName(id);
+      void this.refreshLoggedIn(id);
     } catch (e) {
       if (this.itemId() !== id) {
         return;
@@ -207,6 +208,24 @@ export class OrgItemViewerComponent {
       }
     } catch {
       /* best-effort: leave the org label empty */
+    }
+  }
+
+  /**
+   * Best-effort session check backing {@link notEditableReason} — never blocks or
+   * affects `editable` itself, only which read-only explanation is shown. Any
+   * failure leaves `_loggedIn` at its "assume signed in" default so a transient
+   * IPC error never wrongly claims "sign in" when the real reason is something
+   * else. Stale-guarded on `id` like every other fetch here.
+   */
+  private async refreshLoggedIn(id: string): Promise<void> {
+    try {
+      const status = await this.ipc.accountStatus();
+      if (this.itemId() === id) {
+        this._loggedIn.set(status.loggedIn);
+      }
+    } catch {
+      /* best-effort: leave the default */
     }
   }
 
