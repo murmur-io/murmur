@@ -906,18 +906,31 @@ export class NoteEditorComponent {
   }
 
   /**
-   * One bounded retry (root-cause fix, 2026-07-15) for a transient save failure:
-   * schedule a single re-attempt of `attempt` after a short backoff via the
-   * app's ONE sanctioned debounce timer (`DebounceService` — never a raw
-   * component `setTimeout`, angular-zoneless §5), keyed so it can never collide
-   * with the normal autosave debounce. Resolves the retry's own result; the
-   * caller decides what "still failed after the retry" means. NOT a retry
-   * loop — exactly one extra attempt, then the caller surfaces the real error.
+   * One bounded retry (root-cause fix, 2026-07-15; per-note key fix,
+   * 2026-07-15) for a transient save failure: schedule a single re-attempt of
+   * `attempt` after a short backoff via the app's ONE sanctioned debounce
+   * timer (`DebounceService` — never a raw component `setTimeout`,
+   * angular-zoneless §5). Resolves the retry's own result; the caller decides
+   * what "still failed after the retry" means. NOT a retry loop — exactly one
+   * extra attempt, then the caller surfaces the real error.
+   *
+   * The debounce key is scoped PER NOTE ID (`note-editor-save-retry:<id>`),
+   * not a bare literal. `DebounceService` is a `providedIn: 'root'` SINGLETON
+   * shared by every open `NoteEditorComponent` instance, and `notes/:id` tabs
+   * stay ALIVE-BUT-DETACHED when backgrounded (`TabRouteReuseStrategy` —
+   * `shouldDetach`/`shouldAttach`), so with two note tabs open, an unscoped
+   * key let Note B's failed-save retry schedule `clearTimeout` Note A's
+   * still-pending retry (`DebounceService.schedule`'s coalesce-under-the-
+   * same-key behavior) — Note A's `retryOnce` promise then never settled,
+   * and `saveState` stuck on `"saving"` forever with no path to "saved" or
+   * "error" (found by adversarial review of PR #332). Scoping the key per
+   * note id gives each open tab its own independent retry slot in the shared
+   * singleton, so concurrent tabs can no longer cancel each other's retries.
    */
-  private retryOnce<T>(attempt: () => Promise<T>): Promise<T> {
+  private retryOnce<T>(noteId: string, attempt: () => Promise<T>): Promise<T> {
     return new Promise<T>((resolve, reject) => {
       this.debounce.schedule(
-        "note-editor-save-retry",
+        `note-editor-save-retry:${noteId}`,
         () => {
           attempt().then(resolve, reject);
         },
@@ -932,9 +945,12 @@ export class NoteEditorComponent {
    * `saveState`/`saveErrorMessage`/toast with the real backend message —
    * `AppError` is `Serialize` and crosses IPC as its display string (rust-tauri
    * §1), so `String(e)` already carries the actual diagnostic instead of the
-   * old blanket "Save failed" with nothing behind it.
+   * old blanket "Save failed" with nothing behind it. `noteId` scopes the
+   * bounded retry's debounce key so concurrent open note tabs never cancel
+   * each other's retry (see {@link retryOnce}).
    */
   private async handleSaveFailure<T>(
+    noteId: string,
     e: unknown,
     retryAttempt: () => Promise<T>,
     onRetrySuccess: (result: T) => void,
@@ -956,7 +972,7 @@ export class NoteEditorComponent {
     }
     if (!this.isUnretryableSaveError(message)) {
       try {
-        const result = await this.retryOnce(retryAttempt);
+        const result = await this.retryOnce(noteId, retryAttempt);
         onRetrySuccess(result);
         this.saveState.set("saved");
         this.saveErrorMessage.set(null);
@@ -999,6 +1015,7 @@ export class NoteEditorComponent {
       this.tabsService.setTitle(tabKeyFor("note", doc.id), title || "Untitled");
     } catch (e) {
       await this.handleSaveFailure(
+        doc.id,
         e,
         () => this.ipc.saveNoteText(doc.id, title, markdown),
         (updatedAt) => {
@@ -1052,6 +1069,7 @@ export class NoteEditorComponent {
       this.tabsService.setTitle(tabKeyFor("note", doc.id), title || "Untitled");
     } catch (e) {
       await this.handleSaveFailure(
+        doc.id,
         e,
         () => this.ipc.updateNoteDoc(doc.id, title, markdown),
         (fresh) => {
