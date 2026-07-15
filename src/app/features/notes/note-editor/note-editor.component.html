@@ -79,7 +79,12 @@
               <span class="save-check" aria-hidden="true">✓</span> Saved
             }
             @case ("error") {
-              <button type="button" class="save-retry" (click)="retrySave()">
+              <button
+                type="button"
+                class="save-retry"
+                [attr.title]="saveErrorMessage()"
+                (click)="retrySave()"
+              >
                 Save failed · Retry
               </button>
             }
