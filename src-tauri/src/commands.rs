@@ -2286,13 +2286,32 @@ pub(crate) fn brain_overview_inner(state: &AppState) -> Result<BrainOverview, Ap
 /// Permanently delete a document and cascade-delete its chunks + vectors. GATED: a
 /// sealed-and-NOT-session-unlocked folder is refused (`AppError::Locked`) so the lock state can't be
 /// mutated from behind the gate (consistent with `import_document`'s write-gate).
+///
+/// DELETE-CASCADE FIX (2026-07-15): `delete_document` is generic over BOTH `kind='document'`
+/// (imported/ingested files) and `kind='note'` rows (`brain.component.ts`'s `removeItem` can reach
+/// either), so it needs the SAME org-share revoke cascade as [`delete_note`] before dropping the local
+/// row — a `kind='note'` document deleted through THIS surface must not resurrect via the org feed
+/// either. `async` (was sync) because the revoke is a network round-trip.
 #[tauri::command]
-pub fn delete_document(state: State<'_, AppState>, id: String) -> Result<(), AppError> {
-    delete_document_inner(state.inner(), &id)
+pub async fn delete_document(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<(), AppError> {
+    // Only a `kind='note'` row is ever tab-tracked (a plain ingested `kind='document'` has no tab —
+    // see `TabKind` in `tab-keys.ts`), so only fire the delete-fan-out event for that case: emitting
+    // it for an id nothing tracks is harmless, but this stays precise about what was actually deleted.
+    let was_note = matches!(state.db.get_note_row(&id), Ok(Some(_)));
+    delete_document_inner(state.inner(), &id).await?;
+    if was_note {
+        crate::events::emit_content_deleted(&app, "note", &id);
+    }
+    Ok(())
 }
 
-/// Inner of [`delete_document`] taking `&AppState` (unit-testable gate).
-pub(crate) fn delete_document_inner(state: &AppState, id: &str) -> Result<(), AppError> {
+/// Inner of [`delete_document`] taking `&AppState` (unit-testable gate). `async` for the org-share
+/// revoke cascade (network round-trip); the gate + DB delete themselves stay synchronous internally.
+pub(crate) async fn delete_document_inner(state: &AppState, id: &str) -> Result<(), AppError> {
     let Some(folder_id) = state.db.folder_for_document(id)? else {
         return Ok(()); // unknown id → idempotent no-op.
     };
@@ -2301,6 +2320,11 @@ pub(crate) fn delete_document_inner(state: &AppState, id: &str) -> Result<(), Ap
             "this folder is locked — unlock it to delete a document".into(),
         ));
     }
+    // REVOKE-BEFORE-DELETE (Bug A root cause): tear down every LIVE org share of this exact source
+    // BEFORE the local row disappears, so the background org-sync tick can never re-pull a still-live
+    // server item back into the local replica after the user asked to delete it. Fails LOUD: a revoke
+    // failure (e.g. offline) aborts the delete rather than silently leaving a dangling live share.
+    revoke_org_shares_for_source(state, None, Some(id)).await?;
     state.db.delete_document(id)?;
     tracing::info!(target: "documents", document_id = %id, "document deleted");
     Ok(())
@@ -2850,13 +2874,27 @@ fn remove_note_export_before_move(old_path: Option<&str>) -> Result<(), AppError
 
 /// Permanently delete a note (cascade its chunks + vectors + vault `.md`). GATED: a
 /// sealed-and-not-session-unlocked folder is refused. Reuses `delete_document` semantics.
+///
+/// DELETE-CASCADE FIX (2026-07-15): the local hard-delete used to leave any live org share of this
+/// note `uploaded` — the server ciphertext survived + the 60s background org-sync tick re-pulled it
+/// back into the local replica, resurrecting a "deleted" note. Now revokes every live org share of
+/// this exact note FIRST (fails loud on a revoke error — see `revoke_org_shares_for_source`), then
+/// fans out a content-free delete event so any other open surface (the tab-strip) can prune itself.
+/// `async` (was sync) because the revoke is a network round-trip.
 #[tauri::command]
-pub fn delete_note(state: State<'_, AppState>, id: String) -> Result<(), AppError> {
-    delete_note_inner(state.inner(), &id)
+pub async fn delete_note(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<(), AppError> {
+    delete_note_inner(state.inner(), &id).await?;
+    crate::events::emit_content_deleted(&app, "note", &id);
+    Ok(())
 }
 
-/// Inner of [`delete_note`] taking `&AppState` (unit-testable gate).
-pub(crate) fn delete_note_inner(state: &AppState, id: &str) -> Result<(), AppError> {
+/// Inner of [`delete_note`] taking `&AppState` (unit-testable gate). `async` for the org-share revoke
+/// cascade (network round-trip); the gate + DB delete themselves stay synchronous internally.
+pub(crate) async fn delete_note_inner(state: &AppState, id: &str) -> Result<(), AppError> {
     let Some(row) = state.db.get_note_row(id)? else {
         return Ok(()); // unknown id → idempotent no-op.
     };
@@ -2865,6 +2903,11 @@ pub(crate) fn delete_note_inner(state: &AppState, id: &str) -> Result<(), AppErr
             "this folder is locked — unlock it to delete a note".into(),
         ));
     }
+    // REVOKE-BEFORE-DELETE (Bug A root cause): tear down every LIVE org share of this exact note
+    // BEFORE the local row disappears, so the background org-sync tick can never re-pull a still-live
+    // server item back into the local replica after the user asked to delete it. Fails LOUD: a revoke
+    // failure (e.g. offline) aborts the delete rather than silently leaving a dangling live share.
+    revoke_org_shares_for_source(state, None, Some(id)).await?;
     // Remove the vault file first (best-effort), then cascade-delete the row + its chunks/vectors.
     if let Some(path) = &row.exported_path {
         let _ = std::fs::remove_file(path);
@@ -4452,23 +4495,45 @@ pub fn search_meetings(
 
 /// Permanently delete a meeting: its audio file, its exported vault note, and all DB rows
 /// (segments, notes, timeline cascade via FK). Irreversible.
+///
+/// DELETE-CASCADE FIX (2026-07-15): revokes every live org share of this meeting FIRST (see
+/// [`delete_meeting_inner`]), then fans out a content-free delete event so any other open surface
+/// (the tab-strip) can prune itself. `async` (was sync) because the revoke is a network round-trip.
 #[tauri::command]
-pub fn delete_meeting(state: State<'_, AppState>, meeting_id: String) -> Result<(), AppError> {
+pub async fn delete_meeting(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    meeting_id: String,
+) -> Result<(), AppError> {
+    delete_meeting_inner(state.inner(), &meeting_id).await?;
+    crate::events::emit_content_deleted(&app, "meeting", &meeting_id);
+    Ok(())
+}
+
+/// Inner of [`delete_meeting`] taking `&AppState` (unit-testable). `async` for the org-share revoke
+/// cascade (network round-trip); the file/DB cascade itself stays synchronous internally.
+pub(crate) async fn delete_meeting_inner(state: &AppState, meeting_id: &str) -> Result<(), AppError> {
+    // REVOKE-BEFORE-DELETE (Bug A root cause): tear down every LIVE org share of this exact meeting
+    // BEFORE the local rows disappear, so the background org-sync tick can never re-pull a still-live
+    // server item back into the local replica after the user asked to delete it. Fails LOUD: a revoke
+    // failure (e.g. offline) aborts the delete rather than silently leaving a dangling live share.
+    revoke_org_shares_for_source(state, Some(meeting_id), None).await?;
+
     // Capture + remove on-disk files before the rows disappear (best-effort).
     // C4: the playback audio may exist as BOTH the plaintext WAV *and* its sealed `.enc` at once —
     // during a session-unlock, `session_unseal` decrypts the `.enc` to a plaintext WAV for playback
     // but KEEPS the `.enc`. So `audio_path` (plaintext form) alone would orphan the `.enc` on
     // record→lock→unlock→delete. Remove BOTH forms, exactly as the masters block below already does.
-    if let Some(m) = state.db.get_meeting(&meeting_id)? {
+    if let Some(m) = state.db.get_meeting(meeting_id)? {
         remove_meeting_audio_files(m.audio_path.as_deref());
     }
     // Masters too — a master path may be the plaintext WAV or its `.enc`; clear both forms.
-    if let Ok((mic, sys)) = state.db.get_meeting_master_paths(&meeting_id) {
+    if let Ok((mic, sys)) = state.db.get_meeting_master_paths(meeting_id) {
         for p in [mic, sys].into_iter().flatten() {
             remove_meeting_audio_files(Some(&p));
         }
     }
-    if let Some(note) = state.db.get_latest_note_for_meeting(&meeting_id)? {
+    if let Some(note) = state.db.get_latest_note_for_meeting(meeting_id)? {
         if let Some(path) = note.exported_path.as_deref() {
             let _ = std::fs::remove_file(path);
         }
@@ -4476,7 +4541,7 @@ pub fn delete_meeting(state: State<'_, AppState>, meeting_id: String) -> Result<
     // Brain v2 L2.1: the delete tx purges ALL memory rollups (they may paraphrase this meeting's
     // facts) and returns their exported vault paths — remove those files here, the same layer that
     // removed the note `.md`/audio above. Rollups regenerate from visible facts on the next pass.
-    let rollup_exports = state.db.delete_meeting(&meeting_id)?;
+    let rollup_exports = state.db.delete_meeting(meeting_id)?;
     remove_rollup_export_files(&rollup_exports);
     Ok(())
 }
@@ -17713,6 +17778,44 @@ mod lifecycle_tests {
         assert_eq!(now.audio_path.as_deref(), Some("/data/m-sealed.wav.enc"));
     }
 
+    /// DELETE-CASCADE FIX (Bug A) — deleting a meeting that has a LIVE org share must revoke it (never
+    /// leave a dangling `uploaded` row the background org-sync tick would resurrect). No live
+    /// server/session in this unit test, so the tombstone call fails closed — the row is still driven
+    /// to (at least) `revoke_pending` FIRST, and the delete itself fails loud + the local meeting
+    /// SURVIVES (never half-deleted-locally-with-a-dangling-server-copy). RED before the fix: the
+    /// unpatched `delete_meeting` never touched `org_shares`, so the meeting would vanish locally
+    /// while its share stayed `uploaded` (the resurrection bug).
+    #[test]
+    fn delete_meeting_revokes_a_live_org_share() {
+        let state = build_state("meeting-delete-org-revoke");
+        let db = &state.db;
+        make_open_folder(db, "f-open", "Standups");
+        seed_titled_meeting(db, "m1", "Shared standup", "/data/m1.wav", "f-open");
+
+        db.insert_org_share(
+            "share-meeting-1", "org-1", Some("m1"), None, "meeting", Some("Shared standup"), 1, 1,
+            &[5u8; 32], "2026-07-15T00:00:00Z",
+        )
+        .unwrap();
+        db.set_org_share_uploaded("share-meeting-1", "item-meeting-1", "2026-07-15T00:00:00Z")
+            .unwrap();
+
+        let err = block_on(delete_meeting_inner(&state, "m1")).unwrap_err();
+        assert!(
+            matches!(err, AppError::Unavailable(_)),
+            "delete fails loud when the revoke can't reach the server (no session), got {err:?}"
+        );
+        let row = db.get_org_share("share-meeting-1").unwrap().unwrap();
+        assert_ne!(
+            row.state, "uploaded",
+            "a live org share must be moved off `uploaded` before the delete gives up"
+        );
+        assert!(
+            db.get_meeting("m1").unwrap().is_some(),
+            "a failed (revoke-blocked) delete must not have removed the local meeting"
+        );
+    }
+
     /// Quiet-Glass verifier finding (2026-07-11): `list_meetings_by_tag` returned rows WITHOUT the
     /// backend mask — a sealed meeting's real AI title + `.enc` audio path crossed IPC whenever the
     /// Library was filtered by tag (the FE then leaked the title into the delete-confirm
@@ -19257,7 +19360,7 @@ mod lifecycle_tests {
             "sealed import must be Locked, got {err:?}"
         );
         // DELETE is refused with Locked too.
-        let derr = delete_document_inner(&state, &existing).unwrap_err();
+        let derr = block_on(delete_document_inner(&state, &existing)).unwrap_err();
         assert!(
             matches!(derr, AppError::Locked(_)),
             "sealed delete must be Locked, got {derr:?}"
@@ -19516,7 +19619,7 @@ mod lifecycle_tests {
         let id = import_document_inner(&state, md.to_str().unwrap(), "f-open").unwrap();
         assert_eq!(list_documents_inner(&state, "f-open").unwrap().len(), 1);
 
-        delete_document_inner(&state, &id).unwrap();
+        block_on(delete_document_inner(&state, &id)).unwrap();
         assert!(
             list_documents_inner(&state, "f-open").unwrap().is_empty(),
             "document deleted"
@@ -19525,6 +19628,48 @@ mod lifecycle_tests {
             state.db.doc_chunk_count(&id).unwrap(),
             0,
             "doc chunks cascade-deleted with the document"
+        );
+    }
+
+    /// DELETE-CASCADE FIX (Bug A) — deleting a document that has a LIVE org share must revoke it
+    /// (never leave a dangling `uploaded` row the background org-sync tick would resurrect). No live
+    /// server/session in this unit test, so the tombstone network call itself fails — the row is
+    /// still driven to `revoke_pending` FIRST (crash-safe: the launch sweep would finish a stuck one),
+    /// exactly mirroring `share_to_org_inner_collapses_existing_duplicates_keeping_the_earliest`'s
+    /// no-session assertion shape. RED before the fix: the unpatched `delete_document_inner` never
+    /// touches `org_shares` at all, so the row would still read `uploaded` after the delete.
+    #[test]
+    fn delete_document_revokes_a_live_org_share() {
+        let state = build_state("doc-delete-org-revoke");
+        make_open_folder(&state.db, "f-open", "Project");
+        let md = write_temp_doc("del-org", "md", "alpha bravo charlie");
+        let id = import_document_inner(&state, md.to_str().unwrap(), "f-open").unwrap();
+
+        state
+            .db
+            .insert_org_share(
+                "share-1", "org-1", None, Some(&id), "document", Some("A Doc"), 1, 1,
+                &[3u8; 32], "2026-07-15T00:00:00Z",
+            )
+            .unwrap();
+        state
+            .db
+            .set_org_share_uploaded("share-1", "item-1", "2026-07-15T00:00:00Z")
+            .unwrap();
+        assert_eq!(
+            state.db.get_org_share("share-1").unwrap().unwrap().state,
+            "uploaded",
+            "sanity: the share starts live"
+        );
+
+        block_on(delete_document_inner(&state, &id)).unwrap_err();
+        // The delete FAILS LOUD here (no live session/server → the tombstone call errors), but the
+        // row must already have moved off `uploaded` — never left dangling as if nothing happened.
+        let row = state.db.get_org_share("share-1").unwrap().unwrap();
+        assert_ne!(
+            row.state, "uploaded",
+            "a live org share must be (at least) marked revoke_pending before the delete gives up, \
+             never left uploaded — that's the resurrection bug"
         );
     }
 
@@ -19563,6 +19708,50 @@ mod lifecycle_tests {
             state.db.list_note_folders().unwrap().len(),
             1,
             "the default note-folder is not duplicated"
+        );
+    }
+
+    /// DELETE-CASCADE FIX (Bug A) — deleting a note that has a LIVE org share must revoke it (never
+    /// leave a dangling `uploaded` row the background org-sync tick would resurrect on the SAME
+    /// machine). No live server/session in this unit test, so the tombstone network call itself fails
+    /// closed — the row is still driven to (at least) `revoke_pending` FIRST (crash-safe: the launch
+    /// sweep would finish a stuck one) BEFORE the delete gives up. RED before the fix: the unpatched
+    /// `delete_note_inner` never touches `org_shares` at all, so a live share would still read
+    /// `uploaded` and the local note row would ALSO already be gone (a strictly worse outcome — the
+    /// content deleted locally while its server copy stays live-and-undetectable).
+    #[test]
+    fn delete_note_revokes_a_live_org_share() {
+        let state = build_state("note-delete-org-revoke");
+        let id = create_note_inner(&state, None, "Shared note").unwrap();
+
+        state
+            .db
+            .insert_org_share(
+                "share-note-1", "org-1", None, Some(&id), "note", Some("Shared note"), 1, 1,
+                &[4u8; 32], "2026-07-15T00:00:00Z",
+            )
+            .unwrap();
+        state
+            .db
+            .set_org_share_uploaded("share-note-1", "item-note-1", "2026-07-15T00:00:00Z")
+            .unwrap();
+
+        let err = block_on(delete_note_inner(&state, &id)).unwrap_err();
+        assert!(
+            matches!(err, AppError::Unavailable(_)),
+            "delete fails loud when the revoke can't reach the server (no session), got {err:?}"
+        );
+        let row = state.db.get_org_share("share-note-1").unwrap().unwrap();
+        assert_ne!(
+            row.state, "uploaded",
+            "a live org share must be moved off `uploaded` before the delete gives up — \
+             never left dangling live, that's the resurrection bug"
+        );
+        // The local note row must SURVIVE the failed delete — fail loud means fail WHOLE, not
+        // half-deleted-locally-with-a-dangling-server-copy.
+        assert!(
+            get_note_inner(&state, &id).is_ok(),
+            "a failed (revoke-blocked) delete must not have removed the local note"
         );
     }
 
@@ -29515,6 +29704,60 @@ pub async fn revoke_shares_for_folder(
             }
         };
         if let Err(e) = res {
+            first_err.get_or_insert(e);
+        }
+    }
+    match first_err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// DELETE-CASCADE FIX (2026-07-15): bulk-revoke every LIVE org share of ONE exact source
+/// (`meeting_id` XOR `document_id`), across ALL orgs it was shared into. This is the delete-time twin
+/// of [`revoke_shares_for_folder`] (which is folder-scoped, for the lock×shares dialog) — here the
+/// scope is a single note/meeting/document that is about to be permanently, locally deleted.
+///
+/// ROOT CAUSE this closes: `delete_note_inner`/`delete_meeting_inner`/`delete_document_inner` used to
+/// hard-delete the LOCAL rows (vault `.md`, WAV/`.enc`, DB rows) without ever touching `org_shares` —
+/// so a shared note/meeting's server ciphertext stayed `uploaded` and the 60s background org-sync tick
+/// (`org_background_sync_tick`) re-pulled the author's OWN still-live item back into the local
+/// `org_items` replica, resurrecting "deleted" content in Shared Brain / Ask / MCP on the SAME machine.
+///
+/// Reuses [`revoke_org_share_inner`]'s server-tombstone + local-`revoked` flip (never duplicated) —
+/// mirrors the `revoke_shares_for_folder` org loop exactly: an uploaded row is tombstoned on the
+/// server; a still-`queued`/never-uploaded row (no live server item) is simply cancelled LOCALLY so
+/// the launch sweep never egresses it after the source is gone.
+///
+/// BEST-EFFORT-BUT-LOUD: attempts EVERY live share even if one fails (never abandon a revoke sweep
+/// partway), then returns the FIRST error to the caller so a revoke failure (e.g. offline) is
+/// surfaced — the caller (delete) fails loud rather than silently deleting local content while a
+/// dangling live share survives on the server. Idempotent: an already-revoked row is excluded by
+/// `org_shares_for_source` (only `uploaded`/stuck-`failed` rows are live).
+pub(crate) async fn revoke_org_shares_for_source(
+    state: &AppState,
+    meeting_id: Option<&str>,
+    document_id: Option<&str>,
+) -> Result<(), AppError> {
+    let rows = state.db.org_shares_for_source(meeting_id, document_id)?;
+    let mut first_err: Option<AppError> = None;
+    for row in rows {
+        let res = match row.item_id {
+            Some(item_id) => revoke_org_share_inner(state, item_id).await,
+            None => {
+                // Never uploaded (a queued/stuck row with no live server item) — cancel locally so
+                // the launch sweep never tries to publish it for a source that no longer exists.
+                let now = chrono::Utc::now().to_rfc3339();
+                state.db.set_org_share_state(&row.id, "revoked", &now)
+            }
+        };
+        if let Err(e) = res {
+            tracing::warn!(
+                target: "org",
+                org_id = %row.org_id,
+                error = %brief_err(&e),
+                "delete-cascade: failed to revoke a live org share of the deleted source"
+            );
             first_err.get_or_insert(e);
         }
     }

@@ -741,7 +741,7 @@ export class NoteEditorComponent {
       this.hydrate(doc);
     } catch (e) {
       if (seq === this.requestSeq) {
-        this.error.set(String(e));
+        this.error.set(this.friendlyLoadError(e));
         this.note.set(null);
       }
     } finally {
@@ -749,6 +749,24 @@ export class NoteEditorComponent {
         this.loading.set(false);
       }
     }
+  }
+
+  /**
+   * A clean, non-technical message for the "couldn't open this note" state.
+   * `get_note` rejects with the raw backend `AppError` string (`"invalid
+   * argument: no note {id}"`) for an unknown id — normally the tab-strip's
+   * `content-deleted` fan-out (`TabsService`) closes a stale tab before this
+   * is ever reached, but a note opened a different way (a stale bookmark, a
+   * link from another surface not going through `TabsService`) can still land
+   * here after a delete, so this stays a friendly fallback rather than the raw
+   * technical string.
+   */
+  private friendlyLoadError(e: unknown): string {
+    const msg = String(e);
+    if (/no note /i.test(msg)) {
+      return "This note was deleted.";
+    }
+    return msg;
   }
 
   /** Apply a loaded/reconciled doc into the edit signals (no autosave feedback). */
