@@ -7,10 +7,10 @@ import {
   inject,
   input,
 } from "@angular/core";
-import { Router } from "@angular/router";
 import { marked } from "marked";
 import DOMPurify from "dompurify";
 import { IpcService } from "../../core/ipc.service";
+import { TabsService } from "../../core/tabs.service";
 import { ToastService } from "../../services/toast.service";
 
 /**
@@ -25,11 +25,23 @@ import { ToastService } from "../../services/toast.service";
  *   `<iframe>`/`<object>`/`<embed>`, and any other XSS vector BEFORE the string ever reaches the
  *   DOM. This is the primary sanitizer; we never call `bypassSecurityTrustHtml`, so Angular's
  *   built-in `[innerHTML]` sanitizer also runs as a second, redundant pass.
- * - `[[Wikilinks]]` become accent chips carrying a `data-wikilink` attribute (title HTML-escaped
- *   first, then DOMPurify keeps the `<span class="md-wikilink" data-wikilink=…>` because `span`/
- *   `class` are default-allowed and `data-wikilink`/`role`/`tabindex` are added to the allow-list).
+ * - `[[Wikilinks]]` become accent chips (`<span class="md-wikilink" role="link" tabindex="0">`).
+ *   ROOT-CAUSE FIX (2026-07-15, found while fixing the "clicking a wikilink pill does nothing"
+ *   bug): the chip used to carry the title in a `data-wikilink="…"` attribute, but Angular's OWN
+ *   `[innerHTML]` sanitizer (the second pass above) SILENTLY STRIPS unrecognized `data-*`
+ *   attributes even when DOMPurify's `ADD_ATTR` allow-lists them — DOMPurify only gates what
+ *   REACHES `[innerHTML]`, it doesn't control what Angular's sanitizer then does with it. So
+ *   `chip.getAttribute("data-wikilink")` always read `null` and the click silently no-opped —
+ *   independent of (and deeper than) the separate `router.navigate`-vs-`TabsService` bug fixed
+ *   alongside it. The fix: read the title from the chip's own `textContent` instead (the chip's
+ *   visible text ALREADY IS the escaped title — no extra attribute needed, so there's nothing
+ *   left for a sanitizer to strip).
  *   A host click/Enter handler resolves the title to a VISIBLE note/meeting (gated server-side)
- *   and navigates, or offers to create the note — so the chips are clickable like Obsidian links.
+ *   and opens it through {@link TabsService} (not a raw `router.navigate` — same sibling-function
+ *   fix as `NoteBrainPopoverComponent.openCitation`, 2026-07-12: a plain navigate never registers
+ *   the resulting view with the tab strip, so a wikilink click opened an orphaned, untracked view
+ *   and looked like a no-op), or offers to create the note — so the chips are clickable like
+ *   Obsidian links.
  * - A stray YAML front-matter block (some models leak one) is stripped defensively.
  *
  * Encapsulation is None with a `.md-body` scope so the styles reach the injected HTML.
@@ -46,8 +58,8 @@ import { ToastService } from "../../services/toast.service";
   },
 })
 export class MarkdownComponent {
-  private readonly router = inject(Router);
   private readonly ipc = inject(IpcService);
+  private readonly tabsService = inject(TabsService);
   private readonly toast = inject(ToastService);
 
   readonly markdown = input<string>("");
@@ -65,7 +77,7 @@ export class MarkdownComponent {
       return;
     }
     ev.preventDefault();
-    const title = chip.getAttribute("data-wikilink");
+    const title = this.chipTitle(chip);
     if (title) {
       void this.openWikilink(title);
     }
@@ -78,20 +90,34 @@ export class MarkdownComponent {
       return;
     }
     ev.preventDefault();
-    const title = chip.getAttribute("data-wikilink");
+    const title = this.chipTitle(chip);
     if (title) {
       void this.openWikilink(title);
     }
+  }
+
+  /**
+   * The wikilink title for a `.md-wikilink` chip — its OWN `textContent`, not a
+   * `data-*` attribute (see the class doc: Angular's `[innerHTML]` sanitizer
+   * silently strips those regardless of DOMPurify's allow-list, which is what
+   * made the chip look permanently unclickable).
+   */
+  private chipTitle(chip: HTMLElement): string | null {
+    const title = chip.textContent?.trim();
+    return title ? title : null;
   }
 
   private async openWikilink(title: string): Promise<void> {
     try {
       const target = await this.ipc.resolveWikilink(title);
       if (target) {
-        void this.router.navigate([
-          target.kind === "meeting" ? "/meeting" : "/notes",
-          target.id,
-        ]);
+        // Route through TabsService (not a raw `router.navigate`) so the opened
+        // note/meeting is a TRACKED TAB, matching every other open path in the app.
+        if (target.kind === "meeting") {
+          await this.tabsService.openMeeting(target.id, title);
+        } else {
+          await this.tabsService.openNote(target.id, title);
+        }
         return;
       }
       // No such note/meeting (or it is locked) — offer to create it, Obsidian-style.
@@ -107,7 +133,7 @@ export class MarkdownComponent {
   private async createAndOpen(title: string): Promise<void> {
     try {
       const id = await this.ipc.createNote(null, title);
-      void this.router.navigate(["/notes", id]);
+      await this.tabsService.openNote(id, title);
     } catch {
       this.toast.danger(`Nie udało się utworzyć „${title}"`);
     }
@@ -116,19 +142,21 @@ export class MarkdownComponent {
   private render(src: string): string {
     let text = this.stripFrontMatter(src);
     // [[Wikilink]] / [[Wikilink|alias]] → clickable accent chip (marked passes raw HTML through).
+    // The chip's TEXT is the title — no `data-*` attribute (Angular's `[innerHTML]` sanitizer
+    // strips those; see the class doc's ROOT-CAUSE FIX note), so `chipTitle()` reads `textContent`.
     text = text.replace(/\[\[([^\]|]+)(?:\|[^\]]+)?\]\]/g, (_m, t: string) => {
       const safe = this.escapeHtml(t.trim());
-      return `<span class="md-wikilink" data-wikilink="${safe}" role="link" tabindex="0">${safe}</span>`;
+      return `<span class="md-wikilink" role="link" tabindex="0">${safe}</span>`;
     });
     const out = marked.parse(text, { async: false, gfm: true, breaks: true });
     const raw = typeof out === "string" ? out : src;
     // Sanitize the parsed HTML before it is bound to [innerHTML]. The source is untrusted
     // (LLM output / transcript), so DOMPurify is the authoritative XSS gate — no
-    // bypassSecurityTrustHtml is ever applied. `data-wikilink`/`role`/`tabindex` are explicitly
-    // allow-listed so the clickable chip survives sanitization.
+    // bypassSecurityTrustHtml is ever applied. `role`/`tabindex` are explicitly allow-listed
+    // (both survive Angular's OWN sanitizer pass too, unlike a custom `data-*` attribute).
     return DOMPurify.sanitize(raw, {
       USE_PROFILES: { html: true },
-      ADD_ATTR: ["data-wikilink", "role", "tabindex"],
+      ADD_ATTR: ["role", "tabindex"],
     });
   }
 

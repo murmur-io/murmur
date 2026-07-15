@@ -158,17 +158,93 @@ test("Find related: an org-kind citation routes to the read-only /org-item viewe
   await popover.getByRole("button", { name: "Find related" }).dispatchEvent("click");
 
   await expect(popover.getByText("2 related sources in your brain.")).toBeVisible();
-  const orgCite = popover.locator(".pop-cite", { hasText: "Anna's launchcode notes" });
-  await expect(orgCite).toBeVisible();
-  await expect(orgCite.locator(".pop-cite-kind")).toHaveText("org");
+  // Fix 3 (2026-07-15): `find_related` rows are now ACTIONABLE — "Insert link" (primary)
+  // + "Open" (secondary), replacing the old single passive `.pop-cite` chip.
+  const orgRow = popover.locator(".pop-cite-row", { hasText: "Anna's launchcode notes" });
+  await expect(orgRow).toBeVisible();
+  await expect(orgRow.locator(".pop-cite-kind")).toHaveText("org");
 
-  await orgCite.dispatchEvent("click");
+  await orgRow.getByRole("button", { name: "Open" }).dispatchEvent("click");
 
   // The old bug: an unrecognized `kind` fell through to `/notes/<id>` — assert the
   // FIX routes to the org-item viewer instead.
   await expect(page).toHaveURL(/\/org-item\/oi-launchcode$/);
   await expect(page).not.toHaveURL(/\/notes\/oi-launchcode$/);
   await expect(page.locator("app-org-item-viewer")).toBeVisible();
+
+  expect(consoleErrors).toEqual([]);
+});
+
+/**
+ * Fix 3 — "Insert link" on a `find_related` citation row inserts a `[[Title]]`
+ * wikilink into the editor body (via the SAME wikilink-text builder the link
+ * picker/toolbar op uses) instead of navigating away, and "Open" is still present
+ * as the secondary action.
+ */
+test("Find related: Insert link drops a [[Title]] wikilink into the body instead of navigating", async ({
+  page,
+}) => {
+  const consoleErrors: string[] = [];
+  page.on("console", (msg) => {
+    if (msg.type() === "error") {
+      consoleErrors.push(msg.text());
+    }
+  });
+  page.on("pageerror", (err) => consoleErrors.push(String(err)));
+
+  await mockNotes(page, {
+    note_assistant_action: (args: { req: { action: string } }) => ({
+      action: args.req.action,
+      shape: "info",
+      title: null,
+      suggestion: "1 related source in your brain.",
+      citations: [
+        {
+          kind: "note",
+          id: "n2",
+          title: "Weekly plan",
+          snippet: "Ship the notes feature",
+        },
+      ],
+      modelLabel: "Your brain (local search)",
+      mode: "local",
+      redacted: false,
+    }),
+  });
+  await page.goto("/notes/n1");
+
+  const body = page.locator(".body-area");
+  await expect(body).toBeVisible();
+
+  await body.evaluate((el: HTMLTextAreaElement) => {
+    const start = el.value.indexOf("body text");
+    el.focus();
+    el.setSelectionRange(start, start + "body text".length);
+    el.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+  });
+
+  const bubble = page.locator("app-note-selection-toolbar");
+  await expect(bubble).toBeVisible();
+  await bubble.getByRole("button", { name: "Ask Brain" }).dispatchEvent("click");
+
+  const popover = page.locator("app-note-brain-popover");
+  await expect(popover).toBeVisible();
+  await popover.getByRole("button", { name: "Find related" }).dispatchEvent("click");
+  await expect(popover.getByText("1 related source in your brain.")).toBeVisible();
+
+  const row = popover.locator(".pop-cite-row", { hasText: "Weekly plan" });
+  await expect(row).toBeVisible();
+  // Both actions are present — Insert link (primary) AND Open (secondary), never
+  // removing the existing capability.
+  await expect(row.getByRole("button", { name: "Insert link" })).toBeVisible();
+  await expect(row.getByRole("button", { name: "Open" })).toBeVisible();
+
+  await row.getByRole("button", { name: "Insert link" }).dispatchEvent("click");
+
+  // The popover dismisses and the editor body now carries the wikilink — no navigation.
+  await expect(popover).toHaveCount(0);
+  await expect(body).toHaveValue(/\[\[Weekly plan\]\]/);
+  await expect(page).toHaveURL(/\/notes\/n1$/);
 
   expect(consoleErrors).toEqual([]);
 });

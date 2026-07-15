@@ -281,6 +281,7 @@ pub fn run() {
             commands::get_entity_detail,
             commands::get_backlinks,
             commands::resolve_wikilink,
+            commands::list_link_candidates,
             commands::get_person_dossier,
             commands::list_people,
             commands::ask_vault,

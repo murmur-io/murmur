@@ -571,6 +571,21 @@
     }
   }
 
+  <!-- ===== Link picker (Fix 2) — Obsidian-style `[[` / "Link to note" autocomplete.
+       Opened by the raw `[[` keystroke OR the slash-menu "Link to note" entry (ONE
+       shared trigger signal, ONE component). Caret stays in the textarea (Obsidian
+       parity); this component is a pure presentational overlay, positioned at the
+       caret's viewport rect. ===== -->
+  @if (linkPickerTrigger(); as trigger) {
+    <app-link-picker
+      [anchorRect]="trigger.rect"
+      [query]="linkPickerQuery()"
+      [activeIndex]="linkPickerActiveIndex()"
+      (picked)="pickLinkCandidate($event)"
+      (candidatesChange)="onLinkPickerCandidates($event)"
+    />
+  }
+
   <!-- ===== Share modal (WP6) — link-share this note, opaque overlay (T3).
        Never shown for a locked note (share() no-ops + button is hidden). ===== -->
   @if (shareOpen()) {

@@ -315,27 +315,40 @@
               </div>
             }
 
-            <!-- info — read-only. `find_related` is a DISCOVERY aid (the citations ARE the payload —
-                 tap to open a source; nothing to insert). `fact_check`/`ask` produce a real answer
-                 you can copy or insert into the note. -->
+            <!-- info — read-only. `find_related` is an ACTIONABLE discovery aid: each row's
+                 PRIMARY action is "Insert link" (drops a [[Title]] wikilink into the note at
+                 the caret — the same wikilink text the link-picker/toolbar op builds), with
+                 "Open" kept as a secondary action (2026-07-15: this used to be a single passive
+                 "tap to open" row — direct user feedback called that confusing/low-value).
+                 `fact_check`/`ask` produce a real answer you can copy or insert into the note. -->
             @case ("info") {
               @if (res.action === "find_related") {
                 @if (res.citations.length > 0) {
                   <p class="pop-info-lead">{{ res.suggestion }}</p>
-                  <div class="pop-cites" aria-label="Related sources">
+                  <ul class="pop-cite-rows" aria-label="Related sources">
                     @for (cite of res.citations; track cite.id) {
-                      <button
-                        type="button"
-                        class="pop-cite"
-                        (click)="openCitation(cite)"
-                        [attr.title]="cite.snippet"
-                      >
+                      <li class="pop-cite-row" [attr.title]="cite.snippet">
                         <span class="pop-cite-kind">{{ cite.kind }}</span>
                         <span class="pop-cite-title">{{ cite.title }}</span>
-                      </button>
+                        <span class="pop-cite-actions">
+                          <button
+                            type="button"
+                            class="btn btn-primary pop-cite-btn"
+                            (click)="insertLinkFor(cite)"
+                          >
+                            Insert link
+                          </button>
+                          <button
+                            type="button"
+                            class="btn btn-ghost pop-cite-btn"
+                            (click)="openCitation(cite)"
+                          >
+                            Open
+                          </button>
+                        </span>
+                      </li>
                     }
-                  </div>
-                  <p class="pop-hint">Tap a source to open it.</p>
+                  </ul>
                 } @else {
                   <div class="pop-info-answer">
                     Nothing related found in your brain yet.
