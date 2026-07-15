@@ -57,6 +57,7 @@ import type {
   NoteFolder,
   NoteAssistRequest,
   NoteAssistResult,
+  NoteCitation,
   PropertySchemaField,
   TypedNoteRow,
   OrganizePlan,
@@ -1089,6 +1090,20 @@ export class IpcService {
    */
   resolveWikilink(title: string): Promise<WikiTarget | null> {
     return invoke<WikiTarget | null>("resolve_wikilink", { title });
+  }
+
+  /**
+   * Live keystroke-prefix candidates for the inline `[[` / slash-menu link-insertion
+   * autocomplete — a lightweight, GATED title-prefix scan over VISIBLE notes + meetings +
+   * (when joined) the Shared Brain, capped server-side. Distinct from {@link resolveWikilink}
+   * (exact-title resolve on Enter/click) and from `noteAssistantAction`'s `find_related`
+   * (SELECTION+semantic retrieval — the wrong shape for filtering on a short, growing
+   * prefix). Reuses the {@link NoteCitation} shape so the popover renders it exactly like a
+   * `find_related` row. An empty/blank `prefix` returns the most-recently-updated visible
+   * candidates (so the popover has something to show the instant it opens).
+   */
+  listLinkCandidates(prefix: string): Promise<NoteCitation[]> {
+    return invoke<NoteCitation[]>("list_link_candidates", { prefix });
   }
 
   /**

@@ -25,6 +25,7 @@ import type {
   AppConfigDto,
   BacklinkSource,
   FolderNode,
+  NoteCitation,
   NoteDoc,
   NoteFolder,
 } from "../../../core/models";
@@ -34,6 +35,7 @@ import { NotesService } from "../../../services/notes.service";
 import { ToastService } from "../../../services/toast.service";
 import { BacklinksComponent } from "../../../shared/backlinks/backlinks.component";
 import { MarkdownComponent } from "../../../shared/markdown/markdown.component";
+import { LinkPickerComponent } from "../link-picker/link-picker.component";
 import { NOTE_ASSIST_CATALOG } from "../note-brain-popover/note-assist-catalog";
 import {
   NoteBrainPopoverComponent,
@@ -72,12 +74,16 @@ export type FormatOp =
   | "wikilink"
   | "divider";
 
-/** One slash-menu block insertion. */
+/** One slash-menu block insertion, OR the special "Link to note" entry (no `snippet`). */
 interface SlashItem {
   id: string;
   label: string;
-  /** The markdown snippet inserted at the caret (with `$` marking the caret). */
-  snippet: string;
+  /**
+   * The markdown snippet inserted at the caret (with `$` marking the caret).
+   * Absent for `linkToNote` — that entry opens the link picker instead of
+   * inserting a static snippet (`pickSlash` branches on `id === "linkToNote"`).
+   */
+  snippet?: string;
 }
 
 const SLASH_ITEMS: readonly SlashItem[] = [
@@ -96,6 +102,10 @@ const SLASH_ITEMS: readonly SlashItem[] = [
   },
   { id: "divider", label: "Divider", snippet: "---\n$" },
   { id: "callout", label: "Callout", snippet: "> [!note]\n> $" },
+  // No `snippet` — opens the inline link-picker popover (Obsidian-style `[[` autocomplete)
+  // instead of inserting static markdown. Reuses the SAME picker as the raw `[[` keystroke
+  // trigger (one shared component/service, per the parity requirement).
+  { id: "linkToNote", label: "Link to note" },
 ];
 
 /** Up to this many chars of before/after context ship with an assistant request. */
@@ -142,6 +152,7 @@ const FULL_WIDTH_KEY = "murmur-note-full-width";
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [
     BacklinksComponent,
+    LinkPickerComponent,
     MarkdownComponent,
     NoteBrainPopoverComponent,
     NoteSelectionToolbarComponent,
@@ -262,6 +273,42 @@ export class NoteEditorComponent {
   // --- Slash menu ----------------------------------------------------------
   readonly slashOpen = signal(false);
   readonly slashIndex = signal(0);
+
+  // --- Link picker (Obsidian-style `[[` autocomplete, Fix 2) ----------------
+  /**
+   * The open link-picker's trigger span (`start`..caret in the body text to be
+   * REPLACED with `[[Title]]` on pick) + the caret's viewport anchor rect for
+   * positioning. `null` when the picker is closed. Set by BOTH trigger paths —
+   * the raw `[[` keystroke ({@link maybeOpenLinkPicker}) and the slash-menu
+   * "Link to note" entry ({@link pickSlash}) — so there is exactly ONE picker
+   * instance/codepath regardless of how it was opened (parity requirement).
+   */
+  readonly linkPickerTrigger = signal<{
+    start: number;
+    rect: { top: number; left: number; right: number; bottom: number };
+  } | null>(null);
+  /** Keyboard-highlighted row in the open picker (↑/↓, mirrors {@link slashIndex}). */
+  readonly linkPickerActiveIndex = signal(0);
+  /** The picker's live candidate list — updated via its `candidatesChange` output so
+   *  this component's ↑/↓/Enter handler (shared with the slash menu) can act on it
+   *  without duplicating the fetch. */
+  readonly linkPickerCandidates = signal<NoteCitation[]>([]);
+  /**
+   * The live filter text derived from what's been typed since the trigger.
+   * Tracks `body()` (a signal, so it re-runs on every keystroke) rather than
+   * reading `el.value` directly — a `computed()` only re-runs when a SIGNAL
+   * dependency changes, and raw DOM reads aren't one.
+   */
+  readonly linkPickerQuery = computed(() => {
+    const trigger = this.linkPickerTrigger();
+    const body = this.body();
+    const el = this.bodyArea()?.nativeElement;
+    if (!trigger || !el) {
+      return "";
+    }
+    const caret = Math.max(trigger.start, el.selectionStart);
+    return body.slice(trigger.start, caret);
+  });
 
   // --- Selection toolbar + Brain popover -----------------------------------
   /**
@@ -674,6 +721,7 @@ export class NoteEditorComponent {
         exportedPath: null,
       });
       this.clearSelection();
+      this.closeLinkPicker();
     }
     const seq = ++this.requestSeq;
     void this.fetchNote(doc.id, seq);
@@ -830,6 +878,7 @@ export class NoteEditorComponent {
     this.body.set(el.value);
     this.autoGrow();
     this.maybeOpenSlash(el);
+    this.maybeOpenLinkPicker(el);
     this.scheduleSave();
   }
 
@@ -1318,8 +1367,10 @@ export class NoteEditorComponent {
   setPreview(on: boolean): void {
     this.preview.set(on);
     if (on) {
-      // No textarea to select in Preview — drop the floating bubble / Brain popover.
+      // No textarea to select in Preview — drop the floating bubble / Brain popover
+      // and the link picker (its trigger position lives in the textarea).
       this.clearSelection();
+      this.closeLinkPicker();
     }
     // Switching to Preview is a natural "I'm reviewing" pause: run the deferred FULL
     // save (re-index + vault export) once if there are unindexed edits, so the note
@@ -1377,7 +1428,7 @@ export class NoteEditorComponent {
         caretEnd = caretStart + (selected || "text").length;
         break;
       case "wikilink":
-        replacement = `[[${selected || "Note"}]]`;
+        replacement = this.wikilinkText(selected || "Note");
         caretStart = start + 2;
         caretEnd = caretStart + (selected || "Note").length;
         break;
@@ -1408,6 +1459,15 @@ export class NoteEditorComponent {
     }
 
     this.replaceRange(el, start, end, replacement, caretStart, caretEnd);
+  }
+
+  /**
+   * The `[[Title]]` wikilink markdown for `title` — the ONE place this string is
+   * built, shared by the `wikilink` toolbar op (wraps a selection) and the link
+   * picker (Fix 2: replaces the `[[` trigger + typed query with a picked title).
+   */
+  private wikilinkText(title: string): string {
+    return `[[${title}]]`;
   }
 
   /**
@@ -1477,6 +1537,15 @@ export class NoteEditorComponent {
     const el = this.bodyArea()?.nativeElement;
     if (!el) {
       return;
+    }
+
+    // The link picker takes priority over everything else when open (mirrors
+    // the slash menu's own priority below) — Backspace back past the trigger
+    // closes it (handled in onBodyInput once the trigger text is gone).
+    if (this.linkPickerTrigger()) {
+      if (this.handleLinkPickerKey(event)) {
+        return;
+      }
     }
 
     // Slash menu navigation takes priority when open.
@@ -1618,7 +1687,11 @@ export class NoteEditorComponent {
     return false;
   }
 
-  /** Insert a slash-menu block, replacing the `/` trigger, caret at the `$`. */
+  /**
+   * Insert a slash-menu block, replacing the `/` trigger, caret at the `$` — OR,
+   * for the `linkToNote` entry (no `snippet`), open the SAME link picker the raw
+   * `[[` keystroke opens, anchored where the `/` trigger was (parity requirement).
+   */
   pickSlash(item: SlashItem): void {
     const el = this.bodyArea()?.nativeElement;
     if (!el) {
@@ -1627,12 +1700,131 @@ export class NoteEditorComponent {
     const value = el.value;
     const pos = el.selectionStart;
     const lineStart = value.lastIndexOf("\n", pos - 1) + 1;
+    this.slashOpen.set(false);
+    if (item.id === "linkToNote" || item.snippet === undefined) {
+      // Replace the `/` trigger with `[[` (the natural Obsidian trigger text),
+      // then open the picker anchored right after it.
+      const openBrackets = "[[";
+      this.replaceRange(
+        el,
+        lineStart,
+        pos,
+        openBrackets,
+        lineStart + openBrackets.length,
+        lineStart + openBrackets.length,
+      );
+      this.openLinkPickerAt(el, lineStart + openBrackets.length);
+      return;
+    }
     // Replace from the `/` (line start) through the caret with the snippet.
     const caretMarker = item.snippet.indexOf("$");
     const snippet = item.snippet.replace("$", "");
     const caret = lineStart + (caretMarker === -1 ? snippet.length : caretMarker);
-    this.slashOpen.set(false);
     this.replaceRange(el, lineStart, pos, snippet, caret, caret);
+  }
+
+  // ── Link picker (Obsidian-style `[[` autocomplete, Fix 2) ────────────────
+
+  /**
+   * Open the link picker when the two characters immediately before the caret
+   * are `[[` and it isn't already open — the raw-keystroke trigger path (the
+   * slash-menu path opens it directly via {@link openLinkPickerAt}). Closes it
+   * when the trigger text no longer starts with `[[` right before the caret
+   * (e.g. Backspace past it, or the caret moved away) or a newline/`]]` was typed.
+   */
+  private maybeOpenLinkPicker(el: HTMLTextAreaElement): void {
+    const trigger = this.linkPickerTrigger();
+    const pos = el.selectionStart;
+    const value = el.value;
+    if (!trigger) {
+      if (pos >= 2 && value.slice(pos - 2, pos) === "[[") {
+        this.openLinkPickerAt(el, pos);
+      }
+      return;
+    }
+    // Already open — close it if the caret backed up before the trigger start,
+    // a newline was typed since, or the query just got a closing `]]`.
+    const from = trigger.start;
+    if (
+      pos < from ||
+      value.slice(from - 2, from) !== "[[" ||
+      value.slice(from, pos).includes("\n") ||
+      value.slice(from, pos).includes("]]")
+    ) {
+      this.closeLinkPicker();
+    }
+  }
+
+  /** Open the picker with its trigger anchored at `start` (the text position right after `[[`). */
+  private openLinkPickerAt(el: HTMLTextAreaElement, start: number): void {
+    const rect = this.selectionRect(el, start, start);
+    if (!rect) {
+      return;
+    }
+    this.linkPickerActiveIndex.set(0);
+    this.linkPickerCandidates.set([]);
+    this.linkPickerTrigger.set({ start, rect });
+  }
+
+  /** ↑/↓/Enter/Esc while the picker is open. Returns true when consumed. */
+  private handleLinkPickerKey(event: KeyboardEvent): boolean {
+    const rows = this.linkPickerCandidates();
+    switch (event.key) {
+      case "ArrowDown":
+        event.preventDefault();
+        if (rows.length > 0) {
+          this.linkPickerActiveIndex.update((i) => (i + 1) % rows.length);
+        }
+        return true;
+      case "ArrowUp":
+        event.preventDefault();
+        if (rows.length > 0) {
+          this.linkPickerActiveIndex.update((i) => (i - 1 + rows.length) % rows.length);
+        }
+        return true;
+      case "Enter":
+      case "Tab":
+        if (rows.length > 0) {
+          event.preventDefault();
+          this.pickLinkCandidate(rows[this.linkPickerActiveIndex()]);
+        }
+        return true;
+      case "Escape":
+        event.preventDefault();
+        this.closeLinkPicker();
+        return true;
+    }
+    return false;
+  }
+
+  /** The picker's resolved candidates for the current query (drives keyboard nav). */
+  onLinkPickerCandidates(rows: NoteCitation[]): void {
+    this.linkPickerCandidates.set(rows);
+  }
+
+  /**
+   * A candidate was picked (click or Enter): replace the trigger span (`[[` +
+   * whatever was typed since) with the wikilink text via the SAME `wikilink`
+   * formatting op `format("wikilink")` builds (Fix 2 reuses it, never duplicates
+   * the `[[Title]]` construction), then collapse the caret after it.
+   */
+  pickLinkCandidate(candidate: NoteCitation): void {
+    const el = this.bodyArea()?.nativeElement;
+    const trigger = this.linkPickerTrigger();
+    if (!el || !trigger) {
+      return;
+    }
+    const link = this.wikilinkText(candidate.title);
+    const from = trigger.start - 2; // include the `[[` itself.
+    const to = el.selectionStart;
+    this.closeLinkPicker();
+    this.replaceRange(el, from, to, link, from + link.length, from + link.length);
+  }
+
+  /** Close the picker without inserting anything (Esc / outside click / caret moved away). */
+  closeLinkPicker(): void {
+    this.linkPickerTrigger.set(null);
+    this.linkPickerCandidates.set([]);
   }
 
   // ── Header: Move / ⋯ / Share / Export / Delete ──────────────────────────
@@ -1912,7 +2104,13 @@ export class NoteEditorComponent {
       }
       end = start + sel.text.length;
     }
-    if (edit.kind === "insert") {
+    if (edit.kind === "insertLink") {
+      // Fix 3 — insert a `[[Title]]` wikilink after the selection, on its own
+      // paragraph (same additive placement as `insert`), via the ONE shared
+      // wikilink-text builder (never re-duplicated).
+      const link = `\n\n${this.wikilinkText(edit.title)}\n`;
+      this.replaceRange(el, end, end, link, end + link.length, end + link.length);
+    } else if (edit.kind === "insert") {
       // Insert the additive passage after the selection on its own paragraph.
       const insert = `\n\n${edit.suggestion.trim()}\n`;
       this.replaceRange(el, end, end, insert, end + insert.length, end + insert.length);
