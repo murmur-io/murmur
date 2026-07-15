@@ -2,6 +2,7 @@ import {
   ChangeDetectionStrategy,
   Component,
   Injector,
+  computed,
   effect,
   inject,
   signal,
@@ -66,6 +67,33 @@ export class OrgItemViewerComponent {
   readonly orgName = this._orgName.asReadonly();
   readonly loading = signal(true);
   readonly error = signal<string | null>(null);
+
+  /**
+   * Whether THIS device has a live sharing-account session — loaded alongside the item so a
+   * non-editable read-only view can give an honest reason instead of silently hiding the Edit
+   * button with no explanation. Best-effort (defaults to `true`, i.e. "assume signed in") so a
+   * failed `accountStatus()` call never wrongly claims "sign in" when the real reason is
+   * something else.
+   */
+  private readonly _loggedIn = signal(true);
+
+  /**
+   * A short, honest reason the Edit button isn't shown, or `null` when it's simply editable.
+   * Deliberately does NOT claim to distinguish "someone else's note" from "no author info yet
+   * (an older/stale sync)" — the backend's `editable` flag doesn't carry that distinction (both
+   * collapse to `author_user_id !== me`), so guessing which one it is would be a fabricated
+   * message. It only ever tells the ONE thing this device can know for certain: whether it has a
+   * live session at all.
+   */
+  readonly notEditableReason = computed<string | null>(() => {
+    const it = this._item();
+    if (!it || it.editable) {
+      return null;
+    }
+    return this._loggedIn()
+      ? "Only the author can edit this note."
+      : "Sign in to edit notes you authored.";
+  });
 
   // --- Edit-in-place (author only; F-org-editable-any-device) ---------------
   /** True while the author is editing this item in place (drives the editor UI). */
@@ -146,6 +174,7 @@ export class OrgItemViewerComponent {
       // corrects it once the authoritative decrypted detail loads.
       this.tabsService.setTitle(tabKeyFor("org-item", id), item.title || "Shared note");
       void this.resolveOrgName(id);
+      void this.refreshLoggedIn(id);
     } catch (e) {
       if (this.itemId() !== id) {
         return;
@@ -179,6 +208,24 @@ export class OrgItemViewerComponent {
       }
     } catch {
       /* best-effort: leave the org label empty */
+    }
+  }
+
+  /**
+   * Best-effort session check backing {@link notEditableReason} — never blocks or
+   * affects `editable` itself, only which read-only explanation is shown. Any
+   * failure leaves `_loggedIn` at its "assume signed in" default so a transient
+   * IPC error never wrongly claims "sign in" when the real reason is something
+   * else. Stale-guarded on `id` like every other fetch here.
+   */
+  private async refreshLoggedIn(id: string): Promise<void> {
+    try {
+      const status = await this.ipc.accountStatus();
+      if (this.itemId() === id) {
+        this._loggedIn.set(status.loggedIn);
+      }
+    } catch {
+      /* best-effort: leave the default */
     }
   }
 
