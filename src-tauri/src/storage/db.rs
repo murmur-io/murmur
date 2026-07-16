@@ -13799,6 +13799,7 @@ mod tests {
             1,
             &sha32(9),
             None,
+            None,
             Some(&emb),
         )
         .unwrap();
@@ -13834,6 +13835,7 @@ mod tests {
             1,
             &sha32(10),
             None,
+            None,
             Some(&emb),
         )
         .unwrap();
@@ -13848,6 +13850,7 @@ mod tests {
             1,
             1,
             &sha32(11),
+            None,
             None,
             Some(&emb),
         )
