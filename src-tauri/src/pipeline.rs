@@ -86,6 +86,147 @@ fn emit_status(app: &AppHandle, stage: &str, message: &str, meeting_id: &str) {
     }
 }
 
+/// Drop-armed TERMINAL-STATUS guard for the detached post-Stop pipeline task (2026-07-16).
+///
+/// The production defect this closes: a PANIC (or unexpected early exit) anywhere inside the
+/// pipeline unwound out of the task with NO terminal `error` status emitted and the meeting row
+/// still at `RECORDING` — tokio swallows the panic at the task boundary, Tauri never settles the
+/// invoke Promise for a panicked command future, and the FE wedged on "Transcribing…" forever.
+///
+/// Armed at the pipeline task's entry; DISARMED on both the Ok and the Err path of
+/// `run_after_stop` (the Err arm already persists `Error` + emits the `error` stage itself —
+/// see `run_after_stop` — so the guard firing there would double-emit). If the scope exits any
+/// OTHER way (panic-unwind), `Drop` best-effort writes `MeetingStatus::Error` and emits a short
+/// non-PII `error` status so both the DB row and the FE always reach a terminal state.
+///
+/// `Drop` MUST NEVER PANIC (a panic inside Drop during an unwind aborts the process): it holds
+/// fully OWNED handles (`Arc<Db>` — whose internal connection lock is poison-safe via
+/// `into_inner`, an owned `AppHandle`), both effects are `Result`s that are logged rather than
+/// propagated, and the whole body is additionally wrapped in `catch_unwind` as the last line of
+/// defense. `app` is `Option` only so headless unit tests can exercise the DB half without a
+/// Tauri `AppHandle`.
+pub(crate) struct TerminalStatusGuard {
+    app: Option<AppHandle>,
+    db: std::sync::Arc<crate::storage::Db>,
+    meeting_id: String,
+    armed: bool,
+}
+
+impl TerminalStatusGuard {
+    pub(crate) fn arm(
+        app: Option<AppHandle>,
+        db: std::sync::Arc<crate::storage::Db>,
+        meeting_id: &str,
+    ) -> Self {
+        Self {
+            app,
+            db,
+            meeting_id: meeting_id.to_string(),
+            armed: true,
+        }
+    }
+
+    /// Consume the guard WITHOUT firing it — the pipeline reached a normal terminal path
+    /// (Ok emitted `done`; Err already persisted `Error` + emitted `error`).
+    pub(crate) fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TerminalStatusGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Reached ONLY on a panic-unwind (or an unexpected early exit) out of the pipeline task.
+        let body = std::panic::AssertUnwindSafe(|| {
+            if let Err(e) = self
+                .db
+                .update_meeting_status(&self.meeting_id, MeetingStatus::Error)
+            {
+                tracing::warn!(
+                    target: "pipeline",
+                    error = %e,
+                    "terminal-status guard: persisting Error status failed"
+                );
+            }
+            if let Some(app) = &self.app {
+                emit_status(
+                    app,
+                    "error",
+                    "Note processing failed unexpectedly. The recording was kept — try \
+                     re-summarizing from the meeting page.",
+                    &self.meeting_id,
+                );
+            }
+            // IDs + stage only — never content (no-PII rule §8).
+            tracing::error!(
+                target: "pipeline",
+                meeting_id = %self.meeting_id,
+                "pipeline task exited without a terminal status — guard persisted Error + emitted the error stage"
+            );
+        });
+        if std::panic::catch_unwind(body).is_err() {
+            tracing::error!(
+                target: "pipeline",
+                "terminal-status guard: drop body panicked (suppressed to avoid a double-panic abort)"
+            );
+        }
+    }
+}
+
+/// Floor of the ASR/diarize stage watchdog: even a tiny recording gets this much wall-clock
+/// before the stage is declared stuck (model download-free load + decode on a busy machine).
+const ASR_WATCHDOG_FLOOR_S: u64 = 15 * 60;
+
+/// Per-second-of-audio multiplier for the ASR/diarize watchdog: a legitimate Accurate-profile
+/// decode of BOTH streams + diarization stays well under 4× realtime even on a throttled machine.
+const ASR_WATCHDOG_PER_AUDIO_S: u64 = 4;
+
+/// DURATION-SCALED watchdog bound for the heavy ASR/diarize stage:
+/// `max(15 min, 4 × audio duration)`. Generous enough that a legitimately slow large-model
+/// decode of a long meeting is never killed; bounded so a truly-stuck stage (the production
+/// hang this closes) surfaces as a terminal error instead of wedging the pipeline forever.
+/// Pure + deterministic for unit tests; a negative duration (clock skew) clamps to the floor.
+pub(crate) fn asr_watchdog_bound(duration_s: i64) -> std::time::Duration {
+    let scaled = (duration_s.max(0) as u64).saturating_mul(ASR_WATCHDOG_PER_AUDIO_S);
+    std::time::Duration::from_secs(scaled.max(ASR_WATCHDOG_FLOOR_S))
+}
+
+/// Bound a pipeline stage's future with a hang watchdog. On timeout the stage surfaces as
+/// [`AppError::Transcribe`] and propagates through `run_after_stop`'s existing Err arm
+/// (persist `Error` + emit the terminal `error` stage) — the FE is never left waiting forever.
+///
+/// IMPORTANT — what a timeout does and does NOT do: dropping the timed-out future CANCELS the
+/// async wrapper only. The heavy work runs in `perf::run_heavy`'s `spawn_blocking` closure,
+/// which is NOT cancelled by dropping the await — the orphaned whisper/diarizer thread keeps
+/// running to completion in the background. That is accepted: the heavy-inference semaphore
+/// permit is held INSIDE that closure (see `perf::run_heavy`), so no new heavy inference can
+/// co-run with the orphan; it simply finishes (or dies with the process) and releases the
+/// permit. This watchdog restores UI/pipeline liveness — it does NOT kill the computation.
+async fn with_stage_watchdog<T>(
+    bound: std::time::Duration,
+    stage: &'static str,
+    fut: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    match tokio::time::timeout(bound, fut).await {
+        Ok(res) => res,
+        Err(_elapsed) => {
+            tracing::error!(
+                target: "pipeline",
+                stage,
+                bound_s = bound.as_secs(),
+                "stage watchdog fired — the stage is stuck; surfacing a terminal error"
+            );
+            Err(AppError::Transcribe(format!(
+                "transcription timed out after {} minutes (stage: {stage}) — the recording was \
+                 kept; try re-summarizing, or pick a smaller model in Settings",
+                bound.as_secs() / 60
+            )))
+        }
+    }
+}
+
 /// `<app-data>/<app_dir_name()>/audio`, created if absent (`MeetNotes` release, `MeetNotes-dev` dev).
 pub(crate) fn audio_dir() -> Result<PathBuf> {
     let base = dirs::data_dir()
@@ -553,8 +694,17 @@ async fn run_inner(
     // extraction, embedding — all now strictly sequential through this same closure + the
     // downstream summarize_and_export call). Logging elapsed_ms per stage (never audio/transcript
     // content) so the NEXT report comes with a real breakdown instead of another guess.
+    // ASR-stage WATCHDOG (2026-07-16): bound the whole heavy await — semaphore queue-wait +
+    // whisper load/decode of both streams + diarization — with a duration-scaled ceiling
+    // (`max(15 min, 4 × audio)`). A production hang left this await pending forever (all tokio
+    // workers parked, zero whisper frames) with the meeting wedged at RECORDING and no terminal
+    // event; the watchdog turns that into `AppError::Transcribe` → `run_after_stop`'s Err arm →
+    // a real terminal `error` status. Queue-wait is deliberately INSIDE the bound: a wedged
+    // permit-holder is exactly the class of stuck stage this must surface. See
+    // `with_stage_watchdog` for why the timeout does NOT kill the underlying blocking compute.
+    let asr_watchdog = asr_watchdog_bound(duration_s);
     let asr_diarize_started = std::time::Instant::now();
-    let (merged_segments, echo_suppressed, cluster_voiceprints) = crate::perf::run_heavy(&state.heavy_inference, move || -> Result<(Vec<crate::transcribe::types::Segment>, usize, Vec<crate::transcribe::diarize::ClusterVoiceprint>)> {
+    let (merged_segments, echo_suppressed, cluster_voiceprints) = with_stage_watchdog(asr_watchdog, "asr_diarize", crate::perf::run_heavy(&state.heavy_inference, move || -> Result<(Vec<crate::transcribe::types::Segment>, usize, Vec<crate::transcribe::diarize::ClusterVoiceprint>)> {
         use crate::audio::merge::{merge_streams, StreamInput, SPEAKER_ME, SPEAKER_OTHERS};
 
         let transcriber = Transcriber::load(&model_path_owned)?;
@@ -651,7 +801,7 @@ async fn run_inner(
         let (merged, echo_suppressed) =
             crate::audio::merge::suppress_cross_stream_echo(merge_streams(streams), leak.as_ref());
         Ok((merged, echo_suppressed, cluster_voiceprints))
-    })
+    }))
     .await?;
     tracing::info!(
         target: "perf",
@@ -2239,6 +2389,139 @@ mod tests {
 
     fn temp_db_path(label: &str) -> std::path::PathBuf {
         crate::storage::db::unique_temp_path(&format!("murmur-pipeline-test-{label}"), "sqlite")
+    }
+
+    // ── guaranteed terminal status + ASR watchdog (2026-07-16 pipeline-wedge fix) ─────────────
+
+    fn guard_test_meeting(id: &str) -> crate::storage::models::Meeting {
+        crate::storage::models::Meeting {
+            id: id.to_string(),
+            started_at: "2026-07-16T09:00:00Z".to_string(),
+            ended_at: None,
+            title: Some("t".to_string()),
+            duration_s: 1200,
+            audio_path: None,
+            status: MeetingStatus::Recording,
+            folder_id: None,
+        }
+    }
+
+    /// RED-before-GREEN for the production wedge: a PANIC unwinding out of the pipeline scope
+    /// (tokio swallows it at the task boundary — no Err arm ever runs) used to leave the meeting
+    /// row at RECORDING forever with no terminal signal. The ARMED `TerminalStatusGuard`'s Drop
+    /// runs during that unwind and must persist `MeetingStatus::Error`. (The event half needs a
+    /// live `AppHandle`; the DB half is the headless-provable contract — `app: None`.)
+    #[test]
+    fn terminal_guard_armed_drop_during_panic_marks_meeting_error() {
+        let db = std::sync::Arc::new(
+            crate::storage::Db::open_with_key(&temp_db_path("guard-armed"), TEST_DEK).unwrap(),
+        );
+        db.insert_meeting(&guard_test_meeting("m-guard")).unwrap();
+
+        let db_in = db.clone();
+        let unwound = std::panic::catch_unwind(move || {
+            let _guard = TerminalStatusGuard::arm(None, db_in, "m-guard");
+            panic!("simulated pipeline panic");
+        });
+        assert!(unwound.is_err(), "the closure must have panicked");
+
+        let status = db.get_meeting("m-guard").unwrap().unwrap().status;
+        assert_eq!(
+            status,
+            MeetingStatus::Error,
+            "an armed guard dropped by a panic-unwind must persist the terminal Error status"
+        );
+    }
+
+    /// The normal paths DISARM the guard (Ok emitted `done`; Err already persisted Error +
+    /// emitted `error` itself) — a disarmed guard must leave the row untouched (no double-write,
+    /// and crucially no clobbering of a healthy terminal status).
+    #[test]
+    fn terminal_guard_disarmed_leaves_status_untouched() {
+        let db = std::sync::Arc::new(
+            crate::storage::Db::open_with_key(&temp_db_path("guard-disarmed"), TEST_DEK).unwrap(),
+        );
+        db.insert_meeting(&guard_test_meeting("m-ok")).unwrap();
+
+        let guard = TerminalStatusGuard::arm(None, db.clone(), "m-ok");
+        guard.disarm();
+
+        let status = db.get_meeting("m-ok").unwrap().unwrap().status;
+        assert_eq!(
+            status,
+            MeetingStatus::Recording,
+            "a disarmed guard must not touch the meeting status"
+        );
+    }
+
+    /// The guard's Drop is best-effort and must NEVER panic — even when the meeting row does not
+    /// exist (a delete raced the pipeline) the drop completes quietly. A panic inside Drop during
+    /// an unwind would abort the whole process.
+    #[test]
+    fn terminal_guard_drop_never_panics_on_a_missing_row() {
+        let db = std::sync::Arc::new(
+            crate::storage::Db::open_with_key(&temp_db_path("guard-missing"), TEST_DEK).unwrap(),
+        );
+        drop(TerminalStatusGuard::arm(None, db, "m-nonexistent"));
+    }
+
+    /// A stuck ASR stage (the verified production hang: the heavy await pending forever) must
+    /// surface as `AppError::Transcribe` through the watchdog instead of wedging the pipeline.
+    #[tokio::test]
+    async fn stage_watchdog_times_out_a_stuck_stage() {
+        let res: Result<()> = with_stage_watchdog(
+            std::time::Duration::from_millis(20),
+            "test_stage",
+            std::future::pending::<Result<()>>(),
+        )
+        .await;
+        match res {
+            Err(AppError::Transcribe(msg)) => {
+                assert!(
+                    msg.contains("timed out"),
+                    "the timeout error must say the stage timed out (got: {msg})"
+                );
+            }
+            other => panic!("a stuck stage must yield AppError::Transcribe, got {other:?}"),
+        }
+    }
+
+    /// A stage that completes within the bound passes its value — and its own `Err` — through
+    /// UNCHANGED (the watchdog must never re-label a real stage failure as a timeout).
+    #[tokio::test]
+    async fn stage_watchdog_passes_through_a_completing_stage() {
+        let ok = with_stage_watchdog(std::time::Duration::from_secs(5), "test_stage", async {
+            Ok(7)
+        })
+        .await;
+        assert_eq!(ok.unwrap(), 7);
+
+        let err: Result<u32> =
+            with_stage_watchdog(std::time::Duration::from_secs(5), "test_stage", async {
+                Err(AppError::Audio("real failure".into()))
+            })
+            .await;
+        match err {
+            Err(AppError::Audio(msg)) => assert_eq!(msg, "real failure"),
+            other => panic!("an inner Err must pass through unchanged, got {other:?}"),
+        }
+    }
+
+    /// The watchdog bound is duration-scaled with a generous floor: `max(15 min, 4 × audio)` —
+    /// a legitimately slow decode of a long meeting is never killed, a truly-stuck short one
+    /// still surfaces within the floor. Negative durations (clock skew) clamp to the floor and
+    /// the multiply saturates instead of overflowing.
+    #[test]
+    fn asr_watchdog_bound_scales_with_duration() {
+        assert_eq!(asr_watchdog_bound(0).as_secs(), 15 * 60);
+        assert_eq!(asr_watchdog_bound(-5).as_secs(), 15 * 60);
+        assert_eq!(asr_watchdog_bound(60).as_secs(), 15 * 60, "floor dominates short meetings");
+        assert_eq!(
+            asr_watchdog_bound(20 * 60).as_secs(),
+            80 * 60,
+            "the reported ~20-min meeting gets 4× its length"
+        );
+        assert_eq!(asr_watchdog_bound(i64::MAX).as_secs(), u64::MAX, "saturates, never overflows");
     }
 
     /// REGRESSION (adversarial find, seal content-leak class): `summarize_and_export` upserts the
