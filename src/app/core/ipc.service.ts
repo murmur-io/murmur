@@ -71,8 +71,10 @@ import type {
   BriefSchedule,
   BriefRun,
   BriefProposedPayload,
+  AuditExplanation,
   AuditFinding,
   AuditRunSummary,
+  AuditSchedule,
   VerifyFindingDto,
   ProviderStatus,
   SavedRecipe,
@@ -1338,6 +1340,29 @@ export class IpcService {
    */
   onAuditUpdated(cb: () => void): Promise<UnlistenFn> {
     return listen(EVENT_AUDIT_UPDATED, () => cb());
+  }
+
+  /** The weekly-audit schedule state (enabled + last-run / next-due epochs). */
+  getAuditSchedule(): Promise<AuditSchedule> {
+    return invoke<AuditSchedule>("get_audit_schedule");
+  }
+
+  /**
+   * Turn the weekly scheduled audit on or off. Resolves with the CONFIRMED
+   * schedule — the FE reflects the response, never an optimistic flip.
+   * Scheduled runs emit the same audit-updated event manual runs do.
+   */
+  setAuditSchedule(enabled: boolean): Promise<AuditSchedule> {
+    return invoke<AuditSchedule>("set_audit_schedule", { enabled });
+  }
+
+  /**
+   * Ask the configured AI provider to explain ONE staged finding (any kind).
+   * May reject with a consent-missing or `AppError::Locked` message — surface
+   * it verbatim. Cloud providers only ever see redacted content.
+   */
+  explainAuditFinding(id: string): Promise<AuditExplanation> {
+    return invoke<AuditExplanation>("explain_audit_finding", { id });
   }
 
   // ── brain2 documents — expand the brain with imported .md/.txt files ────
