@@ -106,6 +106,30 @@ pub fn run() {
         None => tracing_subscriber::fmt().with_env_filter(log_filter).init(),
     }
 
+    // PANIC VISIBILITY (2026-07-16): tokio swallows a panic at the task boundary and the default
+    // hook prints only to stderr — which LaunchServices discards for a double-clicked app, so a
+    // production pipeline panic left ZERO evidence in murmur.log (the "wedged on Transcribing…"
+    // forensics found an idle process and an empty trail). Route every panic through `tracing`
+    // (which tees to murmur.log) FIRST, then chain to the previous hook so dev stderr/backtrace
+    // behavior is preserved. PII: message + source location only — panic payloads from our code
+    // carry no note/transcript content, and no content fields are added here.
+    let previous_panic_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}", l.file(), l.line()))
+            .unwrap_or_else(|| "unknown".to_string());
+        let message = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            (*s).to_string()
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "non-string panic payload".to_string()
+        };
+        tracing::error!(target: "panic", %location, %message, "panic");
+        previous_panic_hook(info);
+    }));
+
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(
