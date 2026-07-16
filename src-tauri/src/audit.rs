@@ -352,6 +352,7 @@ pub fn weekly_due(now_ms: i64, last_scheduled_finished_at: Option<i64>, enabled:
 /// - runs the SAME gated deterministic pass as the manual command (EMPTY unlock set inside
 ///   `run_audit_pass`), then the judge tier, then emits the count-only
 ///   [`crate::events::EVENT_AUDIT_UPDATED`] exactly like the manual command.
+///
 /// NEVER panics; every failure is a warn (ids/counts only — no PII).
 pub async fn audit_weekly_tick(handle: &tauri::AppHandle) {
     use tauri::Manager;
@@ -2261,7 +2262,7 @@ mod tests {
         let r3 = stage_judged_finding(&db, "k-resolved", "stale");
         db.resolve_audit_finding_row(&r3.id, "accepted", 5).unwrap();
         let demote = VerdictReasoner::keeping(vec![Some(false)]);
-        let stats = judge_findings_sync(&db, &demote, &[r3.clone()], JUDGE_STAGE_BUDGET_MS);
+        let stats = judge_findings_sync(&db, &demote, std::slice::from_ref(&r3), JUDGE_STAGE_BUDGET_MS);
         assert_eq!(stats.demoted, 0, "a resolved row is never deleted");
         assert_eq!(
             db.get_audit_finding(&r3.id).unwrap().unwrap().status,

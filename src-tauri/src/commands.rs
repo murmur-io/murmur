@@ -6767,6 +6767,7 @@ pub(crate) fn set_audit_schedule_inner(
 /// 3. the provider builds through the [`crate::summarize::provider_for`] chain BEFORE any prompt
 ///    content is assembled — the fail-closed consent gate, the redaction firewall, and the
 ///    egress ledger all live inside that seam (the brief runner's posture).
+///
 /// The prompt carries the finding's own evidence + a bounded, GATED excerpt of the source note
 /// (current session set). RETURN-ONLY: the explanation is never persisted (no new derived
 /// plaintext at rest). A seal interleaving with the in-flight provider call affects only the
@@ -32288,6 +32289,7 @@ pub(crate) async fn org_background_sync_tick(state: &AppState) -> bool {
 ///     item after the new one lands) rather than restarting at `rev = 1` and minting a duplicate item
 ///     alongside the still-live stuck one;
 ///   - `revoke_pending` → tombstone the item server-side → `revoked`.
+///
 /// Returns the number of rows ADVANCED. Reads ONLY the retained local rows' key/hash context — for a
 /// re-seal it re-reads the SOURCE note, so the per-row re-share still passes the READ-GATE (a source
 /// sealed since queueing refuses and the row is left `failed`, never egressing sealed content).
