@@ -1,0 +1,141 @@
+<section class="au">
+  <div class="au-head">
+    <button
+      type="button"
+      class="au-toggle"
+      [attr.aria-expanded]="open()"
+      (click)="open.set(!open())"
+    >
+      <svg
+        class="au-chevron"
+        [class.is-open]="open()"
+        viewBox="0 0 16 16"
+        width="14"
+        height="14"
+        fill="none"
+        aria-hidden="true"
+      >
+        <path
+          d="M5.5 4l5 4-5 4"
+          stroke="currentColor"
+          stroke-width="1.7"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+        />
+      </svg>
+      <span class="au-title">Vault audit</span>
+      @if (store.pendingCount() > 0) {
+        <span class="count au-count">{{ store.pendingCount() }}</span>
+      }
+      <span class="au-sub">
+        Broken links, stale notes and contradictions — found for your review.
+      </span>
+    </button>
+    <button
+      type="button"
+      class="btn btn-ghost au-run"
+      (click)="runNow()"
+      [disabled]="store.running()"
+    >
+      @if (store.running()) {
+        <mur-spinner [size]="14" />
+        <span>Auditing…</span>
+      } @else {
+        <span>Audit now</span>
+      }
+    </button>
+  </div>
+
+  @if (open()) {
+    @if (summaryLine(); as line) {
+      <p class="au-summary text-secondary">{{ line }}</p>
+    }
+
+    @if (listEmpty() && store.loading()) {
+      <div class="card state-card">
+        <p class="empty">Loading audit findings…</p>
+      </div>
+    } @else if (store.error()) {
+      <div class="card empty-state">
+        <span class="empty-mark" aria-hidden="true"></span>
+        <p class="empty-title">Couldn’t load the audit inbox</p>
+        <p class="empty">{{ store.error() }}</p>
+      </div>
+    } @else if (listEmpty()) {
+      <div class="card empty-state">
+        <span class="empty-mark" aria-hidden="true"></span>
+        <p class="empty-title">Nothing pending — run your first audit</p>
+        <p class="empty">
+          Murmur scans your vault for broken [[wikilinks]], orphaned notes,
+          stale content, contradictions and unlinked mentions. Every finding
+          waits here for your review — nothing changes until you accept it.
+        </p>
+        <button
+          type="button"
+          class="btn btn-primary"
+          (click)="runNow()"
+          [disabled]="store.running()"
+        >
+          {{ store.running() ? "Auditing…" : "Run your first audit" }}
+        </button>
+      </div>
+    } @else {
+      @for (group of store.byKind(); track group.kind) {
+        <div class="card au-group">
+          <header class="au-group-head">
+            <h3 class="au-group-title">{{ kindMeta[group.kind].label }}</h3>
+            <span class="count">{{ group.findings.length }}</span>
+            <span class="au-group-explain text-secondary">
+              {{ kindMeta[group.kind].explain }}
+            </span>
+          </header>
+          <ul class="au-list">
+            @for (f of group.findings; track f.id) {
+              <li class="au-item">
+                <div class="au-item-head">
+                  <span class="pill au-chip">{{ kindMeta[f.kind].chip }}</span>
+                  <span class="au-item-source">{{ f.sourceTitle }}</span>
+                  @if (f.targetTitle) {
+                    <span class="au-item-arrow" aria-hidden="true">→</span>
+                    <span class="au-item-target">{{ f.targetTitle }}</span>
+                  }
+                </div>
+                <app-markdown
+                  class="au-evidence"
+                  [markdown]="f.evidenceMd"
+                  compact
+                />
+                <div class="au-item-actions">
+                  @if (f.acceptAction) {
+                    <span class="au-accept-hint text-secondary">
+                      {{ f.acceptAction }}
+                    </span>
+                  }
+                  <button
+                    type="button"
+                    class="btn btn-ghost"
+                    (click)="dismiss(f)"
+                    [disabled]="busyId() === f.id"
+                  >
+                    Dismiss
+                  </button>
+                  @if (f.acceptAction) {
+                    <button
+                      type="button"
+                      class="btn btn-primary"
+                      [title]="f.acceptAction"
+                      (click)="accept(f)"
+                      [disabled]="busyId() === f.id"
+                    >
+                      {{ busyId() === f.id ? "Applying…" : "Accept" }}
+                    </button>
+                  }
+                </div>
+              </li>
+            }
+          </ul>
+        </div>
+      }
+    }
+  }
+</section>
