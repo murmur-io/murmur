@@ -1553,6 +1553,84 @@ pub async fn update_note(
     Ok(dto)
 }
 
+/// Export-collision guard — the ONE way a MEETING note's exported vault `.md` is FULLY
+/// overwritten with DB-derived markdown. Before the overwrite, compares the CURRENT file bytes
+/// against the stored `exported_hash` baseline (what Murmur last wrote): a mismatch means the user
+/// (or their own vault-side agent, e.g. Claude Code over the vault) edited the file externally,
+/// and the external version is preserved as a `<stem> (external edit …)` sibling instead of
+/// silently destroyed. After the overwrite the baseline is re-stamped from the exact content
+/// written. A NULL baseline (legacy row exported before the guard) is grandfathered — no sibling.
+/// No PII in logs: meeting id + a boolean only, never the path (it embeds the note title).
+pub(crate) fn overwrite_exported_note_guarded(
+    state: &AppState,
+    meeting_id: &str,
+    provider_id: &str,
+    path: &str,
+    markdown: &str,
+) -> Result<(), AppError> {
+    let expected = state.db.get_note_exported_hash(meeting_id, provider_id)?;
+    let path = std::path::Path::new(path);
+    let sibling = crate::export::preserve_external_edit_if_any(path, expected.as_deref())?;
+    crate::export::overwrite_note(path, markdown)?;
+    state.db.set_note_exported_hash(
+        meeting_id,
+        provider_id,
+        Some(&crate::export::note_content_hash(markdown)),
+    )?;
+    if sibling.is_some() {
+        tracing::info!(
+            target: "export",
+            meeting_id = %meeting_id,
+            sibling_created = true,
+            "external vault edit preserved as a sibling before overwrite"
+        );
+    }
+    Ok(())
+}
+
+/// Export-collision guard, APPEND side: after a read-modify-write of the CURRENT file (Re-Truth
+/// stamps — which respect external edits by construction, so NO sibling is ever needed), re-stamp
+/// the stored `exported_hash` baseline from the FINAL written content — but ONLY when the
+/// PRE-APPEND bytes still matched the old baseline (or the row is legacy/NULL — grandfathered,
+/// there is no signal to preserve). Re-stamping over a MISMATCH would LAUNDER an external edit
+/// into the baseline: the next DB-derived full overwrite would see hash == baseline and destroy
+/// the edit with no sibling (the adversarial MEDIUM). Keeping the stale baseline instead makes
+/// that next overwrite preserve the whole file — external edit + appended callout — as a sibling.
+/// Skipping the refresh in the CLEAN case would be the opposite bug (a false sibling out of
+/// Murmur's own append), so the match check is what separates the two. Keyed on the LATEST
+/// provider row — the same row `note_file_for` resolved the exported `.md` from.
+pub(crate) fn refresh_meeting_note_exported_hash(
+    state: &AppState,
+    meeting_id: &str,
+    pre_append: &str,
+    written: &str,
+) -> Result<(), AppError> {
+    if let Some(latest) = state.db.get_latest_note_for_meeting(meeting_id)? {
+        let baseline = state
+            .db
+            .get_note_exported_hash(meeting_id, &latest.provider_id)?;
+        if let Some(b) = &baseline {
+            if *b != crate::export::note_content_hash(pre_append) {
+                // External edit present BEFORE the append — keep the stale baseline so the next
+                // full overwrite preserves (edit + callout) as a sibling. Ids + boolean only.
+                tracing::info!(
+                    target: "export",
+                    meeting_id = %meeting_id,
+                    baseline_kept_stale = true,
+                    "append over an externally-edited note — baseline deliberately not re-stamped"
+                );
+                return Ok(());
+            }
+        }
+        state.db.set_note_exported_hash(
+            meeting_id,
+            &latest.provider_id,
+            Some(&crate::export::note_content_hash(written)),
+        )?;
+    }
+    Ok(())
+}
+
 /// Inner of [`update_note`] taking `&AppState` — the FULL command body (gate + lifecycle guard +
 /// seal-on-write upsert + vault re-write), so the seal-on-write regression binds the COMMAND
 /// surface, not just the `upsert_note_reseal_if_locked` helper (residual W6).
@@ -1596,7 +1674,7 @@ pub(crate) fn update_note_inner(
     )?;
 
     if let Some(path) = existing.exported_path.as_deref() {
-        crate::export::overwrite_note(std::path::Path::new(path), markdown)?;
+        overwrite_exported_note_guarded(state, meeting_id, &existing.provider_id, path, markdown)?;
     }
 
     Ok(NoteDto {
@@ -1748,7 +1826,7 @@ pub(crate) fn apply_note_verify_markers_inner(
         },
     )?;
     if let Some(path) = existing.exported_path.as_deref() {
-        crate::export::overwrite_note(std::path::Path::new(path), &marked)?;
+        overwrite_exported_note_guarded(state, &meeting_id, &existing.provider_id, path, &marked)?;
     }
     Ok(NoteDto {
         meeting_id,
@@ -1928,7 +2006,7 @@ pub(crate) fn apply_note_enrichment_inner(
         },
     )?;
     if let Some(path) = existing.exported_path.as_deref() {
-        crate::export::overwrite_note(std::path::Path::new(path), &enriched)?;
+        overwrite_exported_note_guarded(state, &meeting_id, &existing.provider_id, path, &enriched)?;
     }
     Ok(NoteDto {
         meeting_id,
@@ -2044,7 +2122,7 @@ pub(crate) fn link_related_notes_inner(state: &AppState, meeting_id: &str) -> Re
         },
     )?;
     if let Some(path) = existing.exported_path.as_deref() {
-        crate::export::overwrite_note(std::path::Path::new(path), &linked)?;
+        overwrite_exported_note_guarded(state, meeting_id, &existing.provider_id, path, &linked)?;
     }
     Ok(())
 }
@@ -3041,6 +3119,13 @@ fn write_note_to_vault(
     )?;
     let path_str = path.to_string_lossy().to_string();
     state.db.set_note_doc_exported_path(&row.id, Some(&path_str))?;
+    // Export-collision guard: stamp the baseline from the text this export wrote. `write_note`
+    // never overwrites different content (it collision-suffixes), so the file at `path` is
+    // byte-equal to `row.text` in every branch — including the unlock/remove-lock re-export,
+    // where any pre-lock baseline is stale and must be re-stamped fresh.
+    state
+        .db
+        .set_note_doc_exported_hash(&row.id, Some(&crate::export::note_content_hash(&row.text)))?;
     Ok(Some(path_str))
 }
 
@@ -5147,7 +5232,13 @@ pub fn patch_note_tasks(
         },
     )?;
     if let Some(path) = existing.exported_path.as_deref() {
-        crate::export::overwrite_note(std::path::Path::new(path), &patched)?;
+        overwrite_exported_note_guarded(
+            state.inner(),
+            &meeting_id,
+            &existing.provider_id,
+            path,
+            &patched,
+        )?;
     }
     Ok(NoteDto {
         meeting_id,
@@ -5310,7 +5401,13 @@ pub fn pin_moment(
     )?;
     let url = match existing.exported_path.as_deref() {
         Some(path) => {
-            crate::export::overwrite_note(std::path::Path::new(path), &new_md)?;
+            overwrite_exported_note_guarded(
+                state.inner(),
+                &meeting_id,
+                &existing.provider_id,
+                path,
+                &new_md,
+            )?;
             let vault = {
                 state
                     .config
@@ -5918,6 +6015,16 @@ pub(crate) fn apply_supersessions_inner(
             superseding_file.as_ref().map(|(_, s)| s.as_str()),
         );
         crate::export::obsidian::overwrite_note(std::path::Path::new(&source_path), &new_source)?;
+        // Export-collision guard: this is a read-modify-write APPEND of the CURRENT file (external
+        // edits are preserved in place by construction — no sibling). The baseline is re-stamped
+        // from the final written content ONLY when the pre-append bytes still matched it — see
+        // the helper's laundering rationale.
+        refresh_meeting_note_exported_hash(
+            state,
+            &row.source_meeting_id,
+            &current_source,
+            &new_source,
+        )?;
 
         // Stamp the SUPERSEDING backlink (its pristine pre-image is now durably stored). Append to its
         // CURRENT content (idempotent).
@@ -5933,6 +6040,13 @@ pub(crate) fn apply_supersessions_inner(
                 &source_stem,
             );
             crate::export::obsidian::overwrite_note(std::path::Path::new(sup_path), &new_sup)?;
+            // Same conditional append-side baseline refresh as the source stamp above.
+            refresh_meeting_note_exported_hash(
+                state,
+                &row.superseding_meeting_id,
+                &current_sup,
+                &new_sup,
+            )?;
         }
 
         // APPLIED is the LAST write — flipped only after the note(s) are safely stamped.
@@ -6066,7 +6180,14 @@ pub(crate) fn undo_supersessions_inner(state: &AppState, ids: &[String]) -> Resu
                 }
             }
         }
-        crate::export::obsidian::overwrite_note(std::path::Path::new(path), &text)?;
+        // Export-collision guard: the undo rebuild is a FULL overwrite from the stored pre-image
+        // (+ survivor replays), so an external edit made since apply is preserved as a sibling
+        // first, and the baseline re-stamped from the rebuilt content.
+        if let Some(latest) = state.db.get_latest_note_for_meeting(meeting_id)? {
+            overwrite_exported_note_guarded(state, meeting_id, &latest.provider_id, path, &text)?;
+        } else {
+            crate::export::obsidian::overwrite_note(std::path::Path::new(path), &text)?;
+        }
     }
 
     // Clear the applied state on the undone rows ONLY (pre-images dropped); survivors stay applied.
@@ -11195,6 +11316,9 @@ fn seal_moved_note(
     seal_meeting_extras(state, folder_id, meeting_id, ck)?;
     // AFTER the column writes, remove the vault `.md` files (a leftover .md is reconcilable; lost
     // content is not — so this is last).
+    // Export-collision guard: NO external-edit sibling on a seal delete — privacy wins over
+    // preservation (a plaintext sibling of a to-be-sealed note would be a leak; see the same
+    // decision in `lock_folder_inner`).
     for p in exported_paths {
         let _ = std::fs::remove_file(&p);
     }
@@ -11256,6 +11380,11 @@ fn move_note_file(
     std::fs::create_dir_all(&dest_dir)
         .map_err(|e| AppError::Export(format!("create move dir failed: {e}")))?;
     // Write the destination atomically, THEN remove the source (never lose bytes).
+    // Export-collision guard: a move copies the CURRENT file bytes verbatim (external edits ride
+    // along), so it is NOT a Murmur-authored write — the stored `exported_hash` baseline is
+    // deliberately LEFT ALONE. It still describes what Murmur last authored, so an external edit
+    // made before the move is still detected (and preserved) by the next DB-derived overwrite at
+    // the new path. Re-stamping from the moved bytes would erase that signal.
     crate::export::overwrite_note(&dest, &bytes)?;
     let _ = std::fs::remove_file(src);
     // Re-point the exported path for every provider row of this meeting.
@@ -11423,6 +11552,10 @@ pub(crate) fn lock_folder_inner(state: &AppState, folder_id: String) -> Result<(
 
     // AFTER the column writes, delete the vault `.md` files (a leftover .md is reconcilable;
     // lost content is not — so this is last).
+    // Export-collision guard: the seal delete deliberately does NOT preserve an external-edit
+    // sibling — privacy wins over preservation. A plaintext sibling of a to-be-sealed note would
+    // be exactly the leak the lock exists to prevent. External edits to a locked note's `.md`
+    // are accepted-loss by design; the DB blob remains the canonical recoverable copy.
     for p in exported_paths {
         let _ = std::fs::remove_file(&p);
     }
@@ -12028,6 +12161,15 @@ pub(crate) fn remove_lock_inner(state: &AppState, folder_id: String) -> Result<(
                 &latest.provider_id,
                 &path.to_string_lossy(),
             )?;
+            // Export-collision guard: the pre-lock baseline is stale (the `.md` was deleted on
+            // seal) — re-stamp it FRESH from the markdown this re-export just wrote. A file that
+            // already existed at the target with different content was collision-suffixed by
+            // `write_note`, never overwritten, so the file at `path` equals `latest.markdown`.
+            state.db.set_note_exported_hash(
+                &n.meeting_id,
+                &latest.provider_id,
+                Some(&crate::export::note_content_hash(&latest.markdown)),
+            )?;
         }
     }
 
@@ -12495,6 +12637,9 @@ fn move_note_file_to_root(
             .map_err(|e| AppError::Export(format!("create move dir failed: {e}")))?;
     }
     // Write the destination atomically, THEN remove the source (never lose bytes).
+    // Export-collision guard: bytes move verbatim → the `exported_hash` baseline is deliberately
+    // left alone (see `move_note_file` — re-stamping from moved bytes would erase the
+    // external-edit signal).
     crate::export::overwrite_note(&dest, &bytes)?;
     let _ = std::fs::remove_file(src);
     if let Some(existing) = state.db.get_latest_note_for_meeting(meeting_id)? {
@@ -12614,6 +12759,9 @@ fn move_authored_note_md_to_folder(
             .map_err(|e| AppError::Export(format!("create move dir failed: {e}")))?;
     }
     // Write the destination atomically, THEN remove the source (never lose bytes).
+    // Export-collision guard: bytes move verbatim → the `exported_hash` baseline is deliberately
+    // left alone (see `move_note_file` — re-stamping from moved bytes would erase the
+    // external-edit signal).
     crate::export::overwrite_note(&dest, &content)?;
     let _ = std::fs::remove_file(&src_path);
     state
@@ -23431,6 +23579,281 @@ mod lifecycle_tests {
             "Projects/Q3",
             "the child's path moves under the renamed parent"
         );
+    }
+
+    // ── Export-collision guard ("never clobber external edits") ─────────────
+
+    /// The vault files whose name carries the external-edit preservation marker.
+    fn external_edit_siblings(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.contains("(external edit "))
+            })
+            .collect()
+    }
+
+    /// Simulate a completed export of `md` for the seeded meeting: the on-disk `.md`, the stored
+    /// `exported_path`, and the guard's baseline `exported_hash`.
+    fn seed_exported_note(state: &AppState, mid: &str, path: &std::path::Path, md: &str) {
+        std::fs::write(path, md).unwrap();
+        state
+            .db
+            .set_note_exported_path(mid, "claude_code", &path.to_string_lossy())
+            .unwrap();
+        state
+            .db
+            .set_note_exported_hash(
+                mid,
+                "claude_code",
+                Some(&crate::export::note_content_hash(md)),
+            )
+            .unwrap();
+    }
+
+    /// RED-before-GREEN core of the export-collision guard: an EXTERNAL edit to an exported `.md`
+    /// (the user, or their own vault-side agent) must be preserved as a sibling file when a
+    /// DB-derived full overwrite (`update_note`) lands — never silently destroyed. The canonical
+    /// file then carries the DB content and the stored baseline hash matches it.
+    #[test]
+    fn external_edit_is_preserved_as_sibling_on_overwrite() {
+        let vault = tmp_vault("collision-ext");
+        let state = build_state_with_vault("collision-ext", &vault);
+        seed_meeting(&state.db, "m-ext", "# v1\n", None);
+        let md = vault.join("2026-07-16 0900 - Sync.md");
+        seed_exported_note(&state, "m-ext", &md, "# v1\n");
+
+        // The user's agent rewrites the file in the vault behind Murmur's back.
+        std::fs::write(&md, "# my external edit\n").unwrap();
+
+        update_note_inner(&state, "m-ext", "# v2 from murmur\n").unwrap();
+
+        // Canonical file = the DB-derived content (Murmur stays canonical)…
+        assert_eq!(
+            std::fs::read_to_string(&md).unwrap(),
+            "# v2 from murmur\n",
+            "canonical file carries the DB content"
+        );
+        // …and the external version survives byte-exact as a sibling.
+        let siblings = external_edit_siblings(&vault);
+        assert_eq!(siblings.len(), 1, "exactly one preservation sibling");
+        assert_eq!(
+            std::fs::read_to_string(&siblings[0]).unwrap(),
+            "# my external edit\n",
+            "sibling carries EXACTLY the external bytes"
+        );
+        // The baseline is re-stamped to what Murmur just wrote.
+        assert_eq!(
+            state.db.get_note_exported_hash("m-ext", "claude_code").unwrap(),
+            Some(crate::export::note_content_hash("# v2 from murmur\n")),
+            "stored hash re-baselined to the new canonical content"
+        );
+        let _ = std::fs::remove_dir_all(&vault);
+    }
+
+    /// No external edit (file still matches the stored baseline) ⇒ a full overwrite creates NO
+    /// sibling, and the baseline moves to the new content.
+    #[test]
+    fn no_external_edit_no_sibling() {
+        let vault = tmp_vault("collision-clean");
+        let state = build_state_with_vault("collision-clean", &vault);
+        seed_meeting(&state.db, "m-clean", "# v1\n", None);
+        let md = vault.join("2026-07-16 0900 - Sync.md");
+        seed_exported_note(&state, "m-clean", &md, "# v1\n");
+
+        update_note_inner(&state, "m-clean", "# v2\n").unwrap();
+
+        assert!(
+            external_edit_siblings(&vault).is_empty(),
+            "no sibling when the file was untouched"
+        );
+        assert_eq!(std::fs::read_to_string(&md).unwrap(), "# v2\n");
+        assert_eq!(
+            state.db.get_note_exported_hash("m-clean", "claude_code").unwrap(),
+            Some(crate::export::note_content_hash("# v2\n")),
+            "baseline refreshed after the overwrite"
+        );
+        let _ = std::fs::remove_dir_all(&vault);
+    }
+
+    /// A LEGACY row (exported before the guard shipped → NULL `exported_hash`) is grandfathered:
+    /// the overwrite creates NO sibling even though the file drifted, and the first post-guard
+    /// write stamps the baseline.
+    #[test]
+    fn legacy_null_hash_grandfathered() {
+        let vault = tmp_vault("collision-legacy");
+        let state = build_state_with_vault("collision-legacy", &vault);
+        seed_meeting(&state.db, "m-legacy", "# v1\n", None);
+        let md = vault.join("2026-07-16 0900 - Sync.md");
+        // Legacy export: file + path recorded, but NO baseline hash.
+        std::fs::write(&md, "# drifted legacy content\n").unwrap();
+        state
+            .db
+            .set_note_exported_path("m-legacy", "claude_code", &md.to_string_lossy())
+            .unwrap();
+        assert_eq!(
+            state.db.get_note_exported_hash("m-legacy", "claude_code").unwrap(),
+            None,
+            "legacy row starts with no baseline"
+        );
+
+        update_note_inner(&state, "m-legacy", "# v2\n").unwrap();
+
+        assert!(
+            external_edit_siblings(&vault).is_empty(),
+            "legacy rows are grandfathered — no sibling"
+        );
+        assert_eq!(std::fs::read_to_string(&md).unwrap(), "# v2\n");
+        assert_eq!(
+            state.db.get_note_exported_hash("m-legacy", "claude_code").unwrap(),
+            Some(crate::export::note_content_hash("# v2\n")),
+            "the first post-guard write stamps the baseline"
+        );
+        let _ = std::fs::remove_dir_all(&vault);
+    }
+
+    /// APPEND paths (Re-Truth supersession stamps) read-modify-write the CURRENT file, so they
+    /// respect external edits by construction — they must NOT create a sibling, but they MUST
+    /// refresh the stored baseline to the final written content, or the NEXT full overwrite would
+    /// false-positive an "external edit" sibling out of Murmur's own append.
+    #[test]
+    fn append_paths_refresh_hash() {
+        let vault = tmp_vault("collision-append");
+        let state = build_state_with_vault("collision-append", &vault);
+
+        // SOURCE note (gets the [!superseded] callout) + SUPERSEDING note (gets the backlink),
+        // both at the vault root (open + unlocked).
+        seed_meeting(&state.db, "m-src", "# Kickoff\n", None);
+        let src_md = vault.join("2026-07-01 0900 - Kickoff.md");
+        seed_exported_note(&state, "m-src", &src_md, "# Kickoff\n");
+        seed_meeting(&state.db, "m-sup", "# Review\n", None);
+        let sup_md = vault.join("2026-07-15 0900 - Review.md");
+        seed_exported_note(&state, "m-sup", &sup_md, "# Review\n");
+
+        state
+            .db
+            .record_supersessions(&[crate::storage::models::SupersessionRow {
+                id: "s1".to_string(),
+                superseding_meeting_id: "m-sup".to_string(),
+                source_meeting_id: "m-src".to_string(),
+                entity: "Atlas".to_string(),
+                predicate: "status".to_string(),
+                old_value: "in-progress".to_string(),
+                new_value: "shipped".to_string(),
+                created_at: "2026-07-15T10:00:00Z".to_string(),
+                applied_at: None,
+                source_pre_image: None,
+                superseding_pre_image: None,
+            }])
+            .unwrap();
+
+        let result = apply_supersessions_inner(&state, &["s1".to_string()]).unwrap();
+        assert_eq!(result.applied, 1, "the stamp applied");
+
+        // The append landed on disk, and NO sibling was created (append respects the file).
+        let src_after = std::fs::read_to_string(&src_md).unwrap();
+        assert!(src_after.contains("[!superseded]"), "callout appended");
+        let sup_after = std::fs::read_to_string(&sup_md).unwrap();
+        assert!(sup_after.contains("[!supersedes]"), "backlink appended");
+        assert!(
+            external_edit_siblings(&vault).is_empty(),
+            "append paths never create siblings"
+        );
+        // Baselines re-stamped from the FINAL written content on BOTH sides…
+        assert_eq!(
+            state.db.get_note_exported_hash("m-src", "claude_code").unwrap(),
+            Some(crate::export::note_content_hash(&src_after)),
+            "source baseline matches the on-disk content after the append"
+        );
+        assert_eq!(
+            state.db.get_note_exported_hash("m-sup", "claude_code").unwrap(),
+            Some(crate::export::note_content_hash(&sup_after)),
+            "superseding baseline matches the on-disk content after the append"
+        );
+        // …so a subsequent DB-derived full overwrite sees no phantom external edit.
+        update_note_inner(&state, "m-src", "# Kickoff rewritten\n").unwrap();
+        assert!(
+            external_edit_siblings(&vault).is_empty(),
+            "no false 'external edit' sibling after Murmur's own append"
+        );
+        let _ = std::fs::remove_dir_all(&vault);
+    }
+
+    /// Adversarial regression (RED-before-GREEN) — pre-append external-edit LAUNDERING: when the
+    /// file was externally edited BEFORE a Re-Truth append, the append must NOT re-stamp the
+    /// baseline from the (edit + callout) content it wrote — that would make the next DB-derived
+    /// full overwrite see hash == baseline and silently destroy the external edit with no sibling.
+    /// The stale baseline is kept instead, so the next overwrite preserves the file (external
+    /// edit + appended callout) as a sibling.
+    #[test]
+    fn append_over_external_edit_keeps_stale_baseline_so_overwrite_preserves_sibling() {
+        let vault = tmp_vault("collision-launder");
+        let state = build_state_with_vault("collision-launder", &vault);
+
+        seed_meeting(&state.db, "m-src", "# Kickoff\n", None);
+        let src_md = vault.join("2026-07-01 0900 - Kickoff.md");
+        seed_exported_note(&state, "m-src", &src_md, "# Kickoff\n");
+        // Superseding meeting with NO exported `.md` → only the SOURCE-side append fires.
+        seed_meeting(&state.db, "m-sup2", "# Review\n", None);
+
+        // The user edits the exported file in the vault BEFORE any Re-Truth stamp lands.
+        std::fs::write(&src_md, "# Kickoff\nMY EXTERNAL NOTE\n").unwrap();
+
+        state
+            .db
+            .record_supersessions(&[crate::storage::models::SupersessionRow {
+                id: "s-launder".to_string(),
+                superseding_meeting_id: "m-sup2".to_string(),
+                source_meeting_id: "m-src".to_string(),
+                entity: "Atlas".to_string(),
+                predicate: "status".to_string(),
+                old_value: "in-progress".to_string(),
+                new_value: "shipped".to_string(),
+                created_at: "2026-07-15T10:00:00Z".to_string(),
+                applied_at: None,
+                source_pre_image: None,
+                superseding_pre_image: None,
+            }])
+            .unwrap();
+        let result = apply_supersessions_inner(&state, &["s-launder".to_string()]).unwrap();
+        assert_eq!(result.applied, 1, "the stamp applied");
+
+        // The append itself respects the file: external edit + callout are both on disk, and the
+        // append never creates a sibling.
+        let after_append = std::fs::read_to_string(&src_md).unwrap();
+        assert!(after_append.contains("MY EXTERNAL NOTE"), "edit preserved in place");
+        assert!(after_append.contains("[!superseded]"), "callout appended");
+        assert!(
+            external_edit_siblings(&vault).is_empty(),
+            "the append creates no sibling"
+        );
+        // The baseline must STAY at the pre-edit Murmur write — NOT be laundered to the
+        // (edit + callout) content the append wrote.
+        assert_eq!(
+            state.db.get_note_exported_hash("m-src", "claude_code").unwrap(),
+            Some(crate::export::note_content_hash("# Kickoff\n")),
+            "the baseline is NOT re-stamped over an externally-edited file"
+        );
+
+        // The next DB-derived full overwrite therefore detects the divergence and preserves the
+        // (edit + callout) file as a sibling instead of destroying it.
+        update_note_inner(&state, "m-src", "# Kickoff rewritten\n").unwrap();
+        let siblings = external_edit_siblings(&vault);
+        assert_eq!(siblings.len(), 1, "the external edit survives as a sibling");
+        let preserved = std::fs::read_to_string(&siblings[0]).unwrap();
+        assert!(
+            preserved.contains("MY EXTERNAL NOTE") && preserved.contains("[!superseded]"),
+            "the sibling carries the external edit AND the appended callout: {preserved}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&src_md).unwrap(),
+            "# Kickoff rewritten\n",
+            "canonical file carries the DB content"
+        );
+        let _ = std::fs::remove_dir_all(&vault);
     }
 
     /// Deleting an OPEN folder moves its notes to the vault ROOT (folder_id = NULL), survives the

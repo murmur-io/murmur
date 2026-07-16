@@ -132,7 +132,7 @@ pub fn write_note(
     // (date, title, content): if a file with the exact base name already exists
     // and its content is byte-identical to `markdown`, return it without writing
     // a duplicate. Otherwise, suffix " (N)".
-    let final_path = resolve_unique_path(&target_dir, &stem, markdown)?;
+    let final_path = resolve_unique_path(&target_dir, &stem, markdown.as_bytes())?;
 
     // If resolve returned an existing identical file, we're done (idempotent).
     if final_path_is_existing_identical(&final_path, markdown)? {
@@ -160,8 +160,14 @@ pub fn write_note(
 
 /// Returns true if `path` already exists and its bytes equal `markdown`.
 fn final_path_is_existing_identical(path: &Path, markdown: &str) -> Result<bool> {
+    final_path_is_existing_identical_bytes(path, markdown.as_bytes())
+}
+
+/// Byte-slice core of [`final_path_is_existing_identical`] (the external-edit preservation path
+/// compares RAW bytes — an externally-edited file is not guaranteed to be UTF-8).
+fn final_path_is_existing_identical_bytes(path: &Path, content: &[u8]) -> Result<bool> {
     match std::fs::read(path) {
-        Ok(bytes) => Ok(bytes == markdown.as_bytes()),
+        Ok(bytes) => Ok(bytes == content),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(e) => Err(AppError::Export(format!("read existing note failed: {e}"))),
     }
@@ -172,12 +178,12 @@ fn final_path_is_existing_identical(path: &Path, markdown: &str) -> Result<bool>
 /// (idempotent re-export). If it exists with DIFFERENT content, we look for an
 /// identical sibling `<stem> (N).md`; if found, return it; else allocate the next
 /// free `(N)` slot.
-fn resolve_unique_path(dir: &Path, stem: &str, markdown: &str) -> Result<PathBuf> {
+fn resolve_unique_path(dir: &Path, stem: &str, content: &[u8]) -> Result<PathBuf> {
     let base = dir.join(format!("{stem}.md"));
     if !path_exists(&base)? {
         return Ok(base);
     }
-    if final_path_is_existing_identical(&base, markdown)? {
+    if final_path_is_existing_identical_bytes(&base, content)? {
         return Ok(base);
     }
 
@@ -187,7 +193,7 @@ fn resolve_unique_path(dir: &Path, stem: &str, markdown: &str) -> Result<PathBuf
         if !path_exists(&candidate)? {
             return Ok(candidate);
         }
-        if final_path_is_existing_identical(&candidate, markdown)? {
+        if final_path_is_existing_identical_bytes(&candidate, content)? {
             // Identical content already exported under this suffix → idempotent.
             return Ok(candidate);
         }
@@ -221,6 +227,12 @@ fn sanitize_for_tmp(stem: &str) -> String {
 /// Write `contents` to `path` and fsync both the file and its parent directory so
 /// the subsequent rename is durable.
 fn write_and_sync(path: &Path, contents: &str) -> Result<()> {
+    write_and_sync_bytes(path, contents.as_bytes())
+}
+
+/// Byte-slice core of [`write_and_sync`] — the external-edit preservation path copies the CURRENT
+/// file bytes verbatim (not guaranteed UTF-8), with the same durability discipline.
+fn write_and_sync_bytes(path: &Path, contents: &[u8]) -> Result<()> {
     use std::io::Write;
 
     let mut file = std::fs::OpenOptions::new()
@@ -230,7 +242,7 @@ fn write_and_sync(path: &Path, contents: &str) -> Result<()> {
         .open(path)
         .map_err(|e| AppError::Export(format!("open temp file failed: {e}")))?;
 
-    file.write_all(contents.as_bytes())
+    file.write_all(contents)
         .map_err(|e| AppError::Export(format!("write temp file failed: {e}")))?;
     file.sync_all()
         .map_err(|e| AppError::Export(format!("fsync temp file failed: {e}")))?;
@@ -243,6 +255,106 @@ fn write_and_sync(path: &Path, contents: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+// ── Export-collision guard: never clobber an external vault edit ─────────────
+
+/// SHA-256 (lowercase hex) of the EXACT bytes Murmur writes to an exported vault `.md`. Stored in
+/// `notes.exported_hash` / `documents.exported_hash` after every Murmur write, and compared against
+/// the CURRENT file bytes before the next full overwrite — a mismatch means the user (or their own
+/// vault-side agent) edited the file externally, and [`preserve_external_edit_if_any`] copies their
+/// version aside before Murmur's DB-derived markdown lands.
+pub fn note_content_hash(md: &str) -> String {
+    sha256_hex(md.as_bytes())
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(digest.len() * 2);
+    for b in digest {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
+/// Export-collision guard: if the file at `path` was edited EXTERNALLY since Murmur last wrote it
+/// (its current bytes hash differently from `expected_hash`), copy the CURRENT bytes to a sibling
+/// `<stem> (external edit YYYY-MM-DD HHMM).md` in the same directory BEFORE the caller overwrites
+/// the canonical file. Returns `Some(sibling_path)` when an external edit was preserved (or already
+/// is, byte-identical), `None` otherwise.
+///
+/// No sibling is created when:
+/// - `expected_hash` is `None` — a LEGACY row exported before the guard shipped (grandfathered:
+///   there is no baseline to compare against, so treat the file as Murmur's own);
+/// - the file does not exist (nothing to preserve);
+/// - the current bytes hash to `expected_hash` (untouched since Murmur's last write).
+///
+/// Naming reuses [`resolve_unique_path`]'s `" (N)"` collision logic, so a second preservation in
+/// the same minute suffixes rather than clobbers, and a byte-identical existing sibling is reused
+/// (no duplicate). The sibling is written with the same tmp+fsync+rename discipline as
+/// [`write_note`], so it is durably on disk before the caller truncates the canonical file.
+pub fn preserve_external_edit_if_any(
+    path: &Path,
+    expected_hash: Option<&str>,
+) -> Result<Option<PathBuf>> {
+    let stamp = chrono::Local::now().format("%Y-%m-%d %H%M").to_string();
+    preserve_external_edit_with_stamp(path, expected_hash, &stamp)
+}
+
+/// Testable core of [`preserve_external_edit_if_any`] with the local-time minute stamp injected
+/// (mirrors the injectable-`now` pattern of [`sweep_export_tmp_dir`], so the `" (N)"` collision
+/// behavior is provable without racing a real minute boundary).
+fn preserve_external_edit_with_stamp(
+    path: &Path,
+    expected_hash: Option<&str>,
+    stamp: &str,
+) -> Result<Option<PathBuf>> {
+    let Some(expected) = expected_hash else {
+        return Ok(None); // legacy row (pre-guard export) — grandfathered.
+    };
+    let current = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(AppError::Export(format!(
+                "read note before overwrite failed: {e}"
+            )))
+        }
+    };
+    if sha256_hex(&current) == expected {
+        return Ok(None); // untouched since Murmur's last write.
+    }
+
+    // External edit detected — preserve the CURRENT bytes as a sibling BEFORE any overwrite.
+    let parent = path
+        .parent()
+        .ok_or_else(|| AppError::Export("note path has no parent".into()))?;
+    let stem = path
+        .file_stem()
+        .and_then(OsStr::to_str)
+        .ok_or_else(|| AppError::Export("note path has no file stem".into()))?;
+    let sibling_stem = format!("{stem} (external edit {stamp})");
+    let sibling = resolve_unique_path(parent, &sibling_stem, &current)?;
+    if final_path_is_existing_identical_bytes(&sibling, &current)? {
+        // Already preserved byte-identical (e.g. two overwrites in one minute with no edit in
+        // between the preservations) — no duplicate sibling.
+        return Ok(Some(sibling));
+    }
+    let tmp_name = format!(
+        ".{}.{}.murmur.tmp",
+        sanitize_for_tmp(&sibling_stem),
+        std::process::id()
+    );
+    let tmp_path = parent.join(tmp_name);
+    write_and_sync_bytes(&tmp_path, &current).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp_path);
+    })?;
+    std::fs::rename(&tmp_path, &sibling).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp_path);
+        AppError::Export(format!("atomic rename failed: {e}"))
+    })?;
+    Ok(Some(sibling))
 }
 
 // ── Vault title listing ──────────────────────────────────────────────────────
@@ -1380,6 +1492,128 @@ mod tests {
             out, md,
             "cloud with no host/count → nothing to honestly stamp"
         );
+    }
+
+    // ── Export-collision guard: preserve_external_edit_if_any ───────────────
+
+    /// The hash helper is a stable lowercase-hex SHA-256 of the exact bytes.
+    #[test]
+    fn note_content_hash_is_lowercase_hex_sha256() {
+        // sha256("abc") — a well-known vector.
+        assert_eq!(
+            note_content_hash("abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_ne!(note_content_hash("a"), note_content_hash("b"));
+    }
+
+    /// A mismatching hash (external edit) preserves the CURRENT bytes as a timestamped sibling; the
+    /// canonical file itself is untouched by the preservation (the caller overwrites it after).
+    #[test]
+    fn preserve_creates_sibling_on_hash_mismatch() {
+        let dir = tmp_dir("preserve-mismatch");
+        let path = dir.join("2026-07-16 0900 - Sync.md");
+        std::fs::write(&path, "externally edited").unwrap();
+
+        let murmur_last_wrote = note_content_hash("murmur content");
+        let sibling = preserve_external_edit_if_any(&path, Some(&murmur_last_wrote))
+            .unwrap()
+            .expect("external edit must be preserved");
+
+        let name = sibling.file_name().unwrap().to_str().unwrap();
+        assert!(
+            name.starts_with("2026-07-16 0900 - Sync (external edit "),
+            "sibling name carries the marker: {name}"
+        );
+        assert!(name.ends_with(".md"), "sibling is a .md: {name}");
+        assert_eq!(
+            std::fs::read_to_string(&sibling).unwrap(),
+            "externally edited",
+            "sibling carries EXACTLY the external bytes"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "externally edited",
+            "the canonical file is not touched by the preservation itself"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A matching hash (no external edit) creates NO sibling.
+    #[test]
+    fn preserve_noop_when_hash_matches() {
+        let dir = tmp_dir("preserve-match");
+        let path = dir.join("Sync.md");
+        std::fs::write(&path, "murmur content").unwrap();
+        let h = note_content_hash("murmur content");
+        assert_eq!(preserve_external_edit_if_any(&path, Some(&h)).unwrap(), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A `None` expected hash (legacy row exported before the guard) is grandfathered: no sibling.
+    #[test]
+    fn preserve_noop_for_legacy_null_hash() {
+        let dir = tmp_dir("preserve-legacy");
+        let path = dir.join("Sync.md");
+        std::fs::write(&path, "anything at all").unwrap();
+        assert_eq!(preserve_external_edit_if_any(&path, None).unwrap(), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A missing file is a no-op (nothing to preserve), never an error.
+    #[test]
+    fn preserve_noop_when_file_missing() {
+        let dir = tmp_dir("preserve-missing");
+        let path = dir.join("Gone.md");
+        let h = note_content_hash("whatever");
+        assert_eq!(preserve_external_edit_if_any(&path, Some(&h)).unwrap(), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two preservations in the same minute (fixed stamp via the injectable core): identical
+    /// external bytes REUSE the existing sibling (no duplicate); different external bytes get a
+    /// `" (N)"` suffix — the first sibling is never clobbered.
+    #[test]
+    fn preserve_sibling_name_collision_suffixes_or_dedups() {
+        let dir = tmp_dir("preserve-collide");
+        let path = dir.join("Sync.md");
+        let stale = note_content_hash("what murmur last wrote");
+        let stamp = "2026-07-16 0930"; // one fixed minute — the collision case by construction.
+
+        // First preservation.
+        std::fs::write(&path, "external v1").unwrap();
+        let s1 = preserve_external_edit_with_stamp(&path, Some(&stale), stamp)
+            .unwrap()
+            .expect("first preservation");
+        assert_eq!(
+            s1.file_name().unwrap().to_str().unwrap(),
+            "Sync (external edit 2026-07-16 0930).md"
+        );
+
+        // Same external bytes again (a retry / a second overwrite before any new edit): the
+        // byte-identical existing sibling is reused, not duplicated.
+        let s1_again = preserve_external_edit_with_stamp(&path, Some(&stale), stamp)
+            .unwrap()
+            .expect("still an external edit");
+        assert_eq!(s1, s1_again, "byte-identical sibling is reused");
+
+        // A DIFFERENT external edit in the same minute must NOT clobber the first sibling — it
+        // takes the next " (N)" slot.
+        std::fs::write(&path, "external v2").unwrap();
+        let s2 = preserve_external_edit_with_stamp(&path, Some(&stale), stamp)
+            .unwrap()
+            .expect("second preservation");
+        assert_eq!(
+            s2.file_name().unwrap().to_str().unwrap(),
+            "Sync (external edit 2026-07-16 0930) (1).md",
+            "second distinct edit is collision-suffixed"
+        );
+        assert_eq!(std::fs::read_to_string(&s1).unwrap(), "external v1");
+        assert_eq!(std::fs::read_to_string(&s2).unwrap(), "external v2");
+
+        // No temp residue from the preservation writes.
+        assert!(!dir_has_tmp(&dir), "preservation leaves no temp dotfiles");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ── Re-Truth: append-only supersession callouts ─────────────────────────
