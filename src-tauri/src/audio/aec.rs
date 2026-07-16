@@ -88,8 +88,14 @@ const CAPTURE_HELPERS: [&str; 4] = [
 /// LIVE Murmur process (a genuinely concurrent instance, or this process) is spared — so a
 /// mid-recording helper of ours or of another running Murmur is never touched.
 pub fn reap_orphaned_capture_helpers() {
+    // Identity comes from `comm=` — the executable path ONLY, no arguments — so a process that
+    // merely MENTIONS a helper name in its args (`grep -r meetnotes-audiocap …`) can never be
+    // selected, and a parent at a path with an embedded space (`/Applications/Murmur 2.app/…`,
+    // Finder "keep both") still resolves to its true basename. Parsing the args-bearing
+    // `command=` column token-wise for identity was the root cause of both 2026-07-16 review
+    // findings (live-Murmur helpers killed / innocent processes killed).
     let Ok(out) = std::process::Command::new("/bin/ps")
-        .args(["-axo", "pid=,ppid=,command="])
+        .args(["-axo", "pid=,ppid=,comm="])
         .output()
     else {
         return;
@@ -98,12 +104,24 @@ pub fn reap_orphaned_capture_helpers() {
     let self_exe = std::env::current_exe()
         .ok()
         .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()));
+    // The scratch-WAV path only exists in the args-bearing `command=` view; it is fetched lazily
+    // (only when a helper actually survived) and consulted ONLY for pids already identified as
+    // helpers via `comm=` — never for identity.
+    let command_snapshot = || {
+        std::process::Command::new("/bin/ps")
+            .args(["-axo", "pid=,command="])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default()
+    };
     let mut reaped = 0u32;
-    for (helper, verdict) in reap_decisions(&snapshot, self_exe.as_deref(), pid_alive) {
+    for (helper, verdict) in reap_decisions(&snapshot, command_snapshot, self_exe.as_deref(), pid_alive) {
         match verdict {
             HelperVerdict::Spare => {
-                // Ids only (no paths/PII): a spared helper belongs to a live Murmur process.
-                tracing::warn!(
+                // Ids only (no paths/PII). DEBUG, not WARN: a spared helper is ROUTINE state —
+                // our own live capture children and the long-lived `meetnotes-brain` sidecar land
+                // here on every sweep.
+                tracing::debug!(
                     target: "audio",
                     helper_pid = helper.pid,
                     parent_pid = helper.ppid,
@@ -173,25 +191,30 @@ fn helper_verdict(ppid: i32, ppid_alive: bool, ppid_is_murmur: bool) -> HelperVe
     }
 }
 
-/// Testable core of [`reap_orphaned_capture_helpers`]: parse the `ps` snapshot and attach a
+/// Testable core of [`reap_orphaned_capture_helpers`]: parse the `comm=` snapshot and attach a
 /// [`HelperVerdict`] to every surviving capture helper. `ppid_alive_probe` is the injected
 /// liveness oracle (`kill -0` in production); parent liveness is the probe OR-ed with the parent's
 /// presence in the SAME snapshot, so a broken probe binary can never misread a live concurrent
 /// Murmur's parent as dead and kill its mid-recording helper (the spare-biased direction — a
 /// missed orphan is retried at the next sweep; a wrongly killed live helper loses a recording).
-fn reap_decisions<F: Fn(i32) -> bool>(
-    ps_output: &str,
+/// `command_snapshot` (the args-bearing `ps -axo pid=,command=` view) is invoked lazily, only when
+/// a helper survived, and ONLY to recover the scratch-WAV argument — never for identity.
+fn reap_decisions<F: Fn(i32) -> bool, G: FnOnce() -> String>(
+    comm_snapshot: &str,
+    command_snapshot: G,
     self_exe: Option<&str>,
     ppid_alive_probe: F,
 ) -> Vec<(HelperProc, HelperVerdict)> {
-    let helpers = parse_capture_helpers(ps_output);
+    let helpers = parse_capture_helpers(comm_snapshot);
     if helpers.is_empty() {
         return Vec::new();
     }
-    let basenames = parse_process_basenames(ps_output);
+    let basenames = parse_process_basenames(comm_snapshot);
+    let wavs = parse_scratch_wavs(&command_snapshot());
     helpers
         .into_iter()
-        .map(|h| {
+        .map(|mut h| {
+            h.wav = wavs.get(&h.pid).cloned();
             let alive = basenames.contains_key(&h.ppid) || ppid_alive_probe(h.ppid);
             let murmur = basenames
                 .get(&h.ppid)
@@ -201,6 +224,24 @@ fn reap_decisions<F: Fn(i32) -> bool>(
             (h, verdict)
         })
         .collect()
+}
+
+/// Split one `ps` line into its leading numeric columns and the final free-text column. The final
+/// column (`comm`/`command`) is the ONLY variable-width field and it is LAST, so everything after
+/// the fixed numeric prefix — embedded spaces included — belongs to it unambiguously.
+fn split_numeric_prefix(line: &str, numeric_cols: usize) -> Option<(Vec<i32>, &str)> {
+    let mut rest = line.trim_start();
+    let mut nums = Vec::with_capacity(numeric_cols);
+    for _ in 0..numeric_cols {
+        let (tok, tail) = rest.split_once(char::is_whitespace)?;
+        nums.push(tok.parse::<i32>().ok()?);
+        rest = tail.trim_start();
+    }
+    let text = rest.trim_end();
+    if text.is_empty() {
+        return None;
+    }
+    Some((nums, text))
 }
 
 /// Whether a process basename is a Murmur app process: the shipped/dev bin name (`Murmur`) or the
@@ -222,57 +263,68 @@ fn pid_alive(pid: i32) -> bool {
         .unwrap_or(false)
 }
 
-/// Pure parser for `ps -axo pid=,ppid=,command=` output: every line whose command basename is one
-/// of the [`CAPTURE_HELPERS`], with its ppid and optional scratch-WAV argument. (Assumes the
-/// scratch/binary paths carry no embedded spaces — true for the OS temp dir + the app resource
-/// dir; this is best-effort cleanup.)
-fn parse_capture_helpers(ps_output: &str) -> Vec<HelperProc> {
+/// Pure parser for `ps -axo pid=,ppid=,comm=` output: every line whose EXECUTABLE basename is one
+/// of the [`CAPTURE_HELPERS`]. `comm` is the executable path alone — no arguments — so a process
+/// that merely mentions a helper name in its args (`grep -r meetnotes-audiocap …`) can never
+/// match, and a helper installed at a path with an embedded space still resolves correctly (the
+/// path is the whole final column; see [`split_numeric_prefix`]). The `wav` field is filled later
+/// from the separate `command=` snapshot ([`parse_scratch_wavs`]).
+fn parse_capture_helpers(comm_snapshot: &str) -> Vec<HelperProc> {
     let mut out = Vec::new();
-    for line in ps_output.lines() {
-        let tokens: Vec<&str> = line.split_whitespace().collect();
-        if tokens.len() < 3 {
-            continue;
-        }
-        let (Ok(pid), Ok(ppid)) = (tokens[0].parse::<i32>(), tokens[1].parse::<i32>()) else {
+    for line in comm_snapshot.lines() {
+        let Some((nums, comm)) = split_numeric_prefix(line, 2) else {
             continue;
         };
-        // A command token whose basename IS one of our capture helpers.
-        let is_helper = tokens.iter().any(|t| {
-            let base = t.rsplit('/').next().unwrap_or(t);
-            CAPTURE_HELPERS.contains(&base)
-        });
-        if !is_helper {
+        let base = comm.rsplit('/').next().unwrap_or(comm);
+        if !CAPTURE_HELPERS.contains(&base) {
             continue;
         }
-        // The scratch WAV arg (same pattern sweep_stale_scratch reclaims), if the helper carries one.
-        let wav = tokens
-            .iter()
-            .find(|t| {
-                let base = t.rsplit('/').next().unwrap_or(t);
-                (base.starts_with("meetnotes-sys-") || base.starts_with("meetnotes-aec-"))
-                    && base.ends_with(".wav")
-            })
-            .map(std::path::PathBuf::from);
-        out.push(HelperProc { pid, ppid, wav });
+        out.push(HelperProc {
+            pid: nums[0],
+            ppid: nums[1],
+            wav: None,
+        });
     }
     out
 }
 
-/// Pure parser for the SAME `ps` snapshot: `pid → command basename` for every process, so a
+/// Pure parser for the SAME `comm=` snapshot: `pid → executable basename` for every process, so a
 /// helper's ppid can be resolved to the process that owns it (and its liveness read off the
-/// snapshot) without a second `ps` round-trip.
-fn parse_process_basenames(ps_output: &str) -> std::collections::HashMap<i32, String> {
+/// snapshot) without a second `ps` round-trip. Because `comm` carries no arguments, a Murmur at
+/// `/Applications/Murmur 2.app/Contents/MacOS/Murmur` resolves to `Murmur` — the 2026-07-16
+/// review proved the old args-bearing token parse resolved it wrong and KILLED that live Murmur's
+/// mid-recording helpers.
+fn parse_process_basenames(comm_snapshot: &str) -> std::collections::HashMap<i32, String> {
     let mut out = std::collections::HashMap::new();
-    for line in ps_output.lines() {
-        let tokens: Vec<&str> = line.split_whitespace().collect();
-        if tokens.len() < 3 {
-            continue;
-        }
-        let Ok(pid) = tokens[0].parse::<i32>() else {
+    for line in comm_snapshot.lines() {
+        let Some((nums, comm)) = split_numeric_prefix(line, 2) else {
             continue;
         };
-        let base = tokens[2].rsplit('/').next().unwrap_or(tokens[2]);
-        out.insert(pid, base.to_string());
+        let base = comm.rsplit('/').next().unwrap_or(comm);
+        out.insert(nums[0], base.to_string());
+    }
+    out
+}
+
+/// Pure parser for `ps -axo pid=,command=` output: `pid → scratch-WAV argument` (the same
+/// `meetnotes-sys-*.wav` / `meetnotes-aec-*.wav` pattern `sweep_stale_scratch` reclaims), for
+/// deleting a killed helper's scratch. Consulted ONLY for pids already identified as helpers via
+/// the `comm=` snapshot — never for identity. (Token scan assumes the scratch path itself carries
+/// no embedded spaces — true for the OS temp dir; this is best-effort cleanup.)
+fn parse_scratch_wavs(command_snapshot: &str) -> std::collections::HashMap<i32, std::path::PathBuf> {
+    let mut out = std::collections::HashMap::new();
+    for line in command_snapshot.lines() {
+        let Some((nums, command)) = split_numeric_prefix(line, 1) else {
+            continue;
+        };
+        let wav = command.split_whitespace().find(|t| {
+            let base = t.rsplit('/').next().unwrap_or(t);
+            (base.starts_with("meetnotes-sys-") || base.starts_with("meetnotes-aec-"))
+                && base.ends_with(".wav")
+        });
+        if let Some(wav) = wav {
+            out.insert(nums[0], std::path::PathBuf::from(wav));
+        }
     }
     out
 }
@@ -399,7 +451,8 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    // A realistic `ps -axo pid=,ppid=,command=` fixture covering every verdict class:
+    // A realistic `ps -axo pid=,ppid=,comm=` fixture (executable path ONLY — no args) covering
+    // every verdict class:
     //   32431 — a live Murmur app process (the parent that MUST protect its helper);
     //    5916 — the classic launchd-reparented audiocap orphan (the one we actually found);
     //    7001 — a LIVE helper owned by the running Murmur 32431: MUST be spared;
@@ -408,16 +461,32 @@ mod tests {
     //    9100 — an audiocap whose parent 4242 is GONE (absent from the snapshot, probe dead) —
     //           the dead-but-not-yet-reparented window the old `ppid == 1` filter missed;
     //    9200 — an aeccap adopted by a live NON-Murmur process (zsh, 5555): kill;
-    //    5555 — the live non-Murmur adopter.
+    //    5555 — the live non-Murmur adopter;
+    //    6001 — a grep whose ARGUMENTS mention a helper name (in PS_COMMAND below): must never
+    //           be selected — `comm` is `/usr/bin/grep`.
     const PS: &str = "\
 32431     1 /Applications/Murmur.app/Contents/MacOS/Murmur
- 5916     1 /Users/x/target/debug/meetnotes-audiocap /var/folders/sl/T/meetnotes-sys-83191e88.wav 14400
- 7001 32431 /Users/x/target/debug/meetnotes-audiocap /var/folders/sl/T/meetnotes-sys-live-abc.wav 14400
+ 5916     1 /Users/x/target/debug/meetnotes-audiocap
+ 7001 32431 /Users/x/target/debug/meetnotes-audiocap
   412     1 /usr/libexec/somethingd
  8080     1 /Users/x/target/debug/meetnotes-sysaudio
- 9100  4242 /Users/x/target/debug/meetnotes-audiocap /var/folders/sl/T/meetnotes-sys-dead.wav 14400
- 9200  5555 /Users/x/target/debug/meetnotes-aeccap /var/folders/sl/T/meetnotes-aec-zzz.wav 14400
- 5555     1 /bin/zsh";
+ 9100  4242 /Users/x/target/debug/meetnotes-audiocap
+ 9200  5555 /Users/x/target/debug/meetnotes-aeccap
+ 5555     1 /bin/zsh
+ 6001  5555 /usr/bin/grep";
+
+    // The matching args-bearing `ps -axo pid=,command=` view — consulted ONLY for scratch-WAV
+    // recovery of already-identified helpers, never for identity.
+    const PS_COMMAND: &str = "\
+32431 /Applications/Murmur.app/Contents/MacOS/Murmur
+ 5916 /Users/x/target/debug/meetnotes-audiocap /var/folders/sl/T/meetnotes-sys-83191e88.wav 14400
+ 7001 /Users/x/target/debug/meetnotes-audiocap /var/folders/sl/T/meetnotes-sys-live-abc.wav 14400
+  412 /usr/libexec/somethingd
+ 8080 /Users/x/target/debug/meetnotes-sysaudio
+ 9100 /Users/x/target/debug/meetnotes-audiocap /var/folders/sl/T/meetnotes-sys-dead.wav 14400
+ 9200 /Users/x/target/debug/meetnotes-aeccap /var/folders/sl/T/meetnotes-aec-zzz.wav 14400
+ 5555 -zsh
+ 6001 grep -r meetnotes-audiocap /Users/x/backup/meetnotes-sys-precious.wav";
 
     /// The injected liveness probe for the fixture: every pid PRESENT in the snapshot is alive
     /// (matches reality — `ps` and `kill -0` agree for the fixture's processes), 4242 is gone.
@@ -426,7 +495,7 @@ mod tests {
     }
 
     fn verdict_of(pid: i32) -> HelperVerdict {
-        reap_decisions(PS, None, fixture_probe)
+        reap_decisions(PS, || PS_COMMAND.to_string(), None, fixture_probe)
             .into_iter()
             .find(|(h, _)| h.pid == pid)
             .map(|(_, v)| v)
@@ -435,7 +504,7 @@ mod tests {
 
     #[test]
     fn kills_launchd_reparented_orphans_and_extracts_scratch() {
-        let decisions = reap_decisions(PS, None, fixture_probe);
+        let decisions = reap_decisions(PS, || PS_COMMAND.to_string(), None, fixture_probe);
         let killed: Vec<(i32, Option<PathBuf>)> = decisions
             .into_iter()
             .filter(|(_, v)| *v == HelperVerdict::Kill)
@@ -474,12 +543,52 @@ mod tests {
     fn spares_helper_of_a_live_murmur_even_when_the_probe_binary_fails() {
         // Spare-bias: parent 32431 IS in the snapshot as Murmur, so even a probe that reports
         // everything dead (a broken /bin/kill) must not turn a live recording's helper into a kill.
-        let v = reap_decisions(PS, None, |_| false)
+        let v = reap_decisions(PS, || PS_COMMAND.to_string(), None, |_| false)
             .into_iter()
             .find(|(h, _)| h.pid == 7001)
             .map(|(_, v)| v)
             .unwrap();
         assert_eq!(v, HelperVerdict::Spare);
+    }
+
+    #[test]
+    fn spares_live_murmur_helper_when_the_murmur_path_has_spaces() {
+        // REGRESSION (2026-07-16 review, HIGH): a live Murmur at a spaced path (Finder
+        // "keep both" → `Murmur 2.app`) must still resolve to basename `Murmur` — the old
+        // args-bearing token parse resolved the parent wrong and KILLED its mid-recording helper
+        // (and the app's own live brain sidecar on every start_recording).
+        let comm = "\
+77001     1 /Applications/Murmur 2.app/Contents/MacOS/Murmur
+77002 77001 /Applications/Murmur 2.app/Contents/Resources/meetnotes-audiocap
+77003 77001 /Applications/Murmur 2.app/Contents/Resources/meetnotes-brain";
+        let command = "\
+77001 /Applications/Murmur 2.app/Contents/MacOS/Murmur
+77002 /Applications/Murmur 2.app/Contents/Resources/meetnotes-audiocap /var/folders/sl/T/meetnotes-sys-x.wav 14400
+77003 /Applications/Murmur 2.app/Contents/Resources/meetnotes-brain";
+        let decisions = reap_decisions(comm, || command.to_string(), None, |_| true);
+        assert_eq!(decisions.len(), 2, "both helpers of the spaced-path Murmur found");
+        for (h, v) in decisions {
+            assert_eq!(
+                v,
+                HelperVerdict::Spare,
+                "helper {} of a LIVE spaced-path Murmur must be spared",
+                h.pid
+            );
+        }
+    }
+
+    #[test]
+    fn never_selects_a_process_that_merely_mentions_a_helper_in_its_args() {
+        // REGRESSION (2026-07-16 review, MEDIUM): `grep -r meetnotes-audiocap …` (pid 6001,
+        // live non-Murmur parent) must not be selected as a helper — the old any-token match on
+        // the args-bearing `command=` column made it a Kill (SIGTERM of an innocent process, plus
+        // deletion of its matching `.wav` ARGUMENT). Identity now comes from `comm=` only.
+        let decisions = reap_decisions(PS, || PS_COMMAND.to_string(), None, fixture_probe);
+        assert!(
+            !decisions.iter().any(|(h, _)| h.pid == 6001),
+            "a process mentioning a helper name in its ARGS is not a capture helper"
+        );
+        assert!(parse_capture_helpers(PS).iter().all(|h| h.pid != 6001));
     }
 
     #[test]
@@ -508,7 +617,7 @@ mod tests {
         assert!(parse_capture_helpers("  412     1 /usr/libexec/somethingd").is_empty());
         assert!(parse_capture_helpers("garbage\n\n123 abc def").is_empty());
         assert!(parse_capture_helpers("").is_empty());
-        assert!(reap_decisions("", None, |_| true).is_empty());
+        assert!(reap_decisions("", || String::new(), None, |_| true).is_empty());
     }
 
     #[test]
@@ -517,6 +626,23 @@ mod tests {
         assert_eq!(map.get(&32431).map(String::as_str), Some("Murmur"));
         assert_eq!(map.get(&5555).map(String::as_str), Some("zsh"));
         assert!(!map.contains_key(&4242)); // the dead parent is absent from the snapshot
+        // Spaced executable path: the WHOLE final column is the path (comm carries no args).
+        let spaced = parse_process_basenames(
+            "  617     1 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        );
+        assert_eq!(map.get(&6001).map(String::as_str), Some("grep"));
+        assert_eq!(spaced.get(&617).map(String::as_str), Some("Google Chrome"));
+    }
+
+    #[test]
+    fn scratch_wavs_extracted_by_pid_from_the_command_view() {
+        let wavs = parse_scratch_wavs(PS_COMMAND);
+        assert_eq!(
+            wavs.get(&5916),
+            Some(&PathBuf::from("/var/folders/sl/T/meetnotes-sys-83191e88.wav"))
+        );
+        assert!(!wavs.contains_key(&8080)); // sysaudio with no scratch arg
+        assert!(!wavs.contains_key(&412)); // non-helper without a matching arg
     }
 
     /// Whether `pid` still has a process-table entry (any state). None once fully reaped.
