@@ -29,32 +29,34 @@
   backdrop-filter: none;
 }
 
+/* Minimalist rows (2026-07-16): flat single-line rows, tight --space-1/2 padding,
+   no per-row border/card. Hover is NEUTRAL; the keyboard selection uses the native
+   flat accent fill (the house quick-search pattern). */
 .link-pop-row {
   display: flex;
   align-items: center;
   gap: var(--space-2);
   width: 100%;
-  padding: var(--space-2);
+  padding: var(--space-1) var(--space-2);
   border: 0;
-  border-radius: var(--radius-md);
+  border-radius: var(--radius-sm);
   background: transparent;
   color: var(--text-primary);
   font: inherit;
   font-size: 0.8125rem;
   text-align: left;
   cursor: pointer;
+  transition: background var(--transition-fast);
 }
-.link-pop-row:hover,
-.link-pop-row.is-active {
+.link-pop-row:hover {
   background: var(--surface-hover);
 }
-.link-pop-kind {
-  flex: none;
-  font-size: 0.63rem;
-  font-weight: 660;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  color: var(--text-muted);
+.link-pop-row.is-active {
+  background: var(--accent);
+  color: var(--text-on-accent);
+}
+.link-pop-row.is-active .link-pop-kind {
+  color: var(--text-on-accent);
 }
 .link-pop-title {
   flex: 1;
@@ -63,10 +65,15 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* The kind ("note"/"meeting"/"org") is a quiet trailing hint, not a badge. */
+.link-pop-kind {
+  flex: none;
+  font-size: 0.68rem;
+  color: var(--text-muted);
+}
 .link-pop-empty {
   margin: 0;
-  padding: var(--space-3) var(--space-2);
+  padding: var(--space-1) var(--space-2);
   color: var(--text-muted);
-  font-size: 0.8125rem;
-  text-align: center;
+  font-size: 0.78rem;
 }

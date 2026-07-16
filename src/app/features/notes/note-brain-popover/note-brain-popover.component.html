@@ -315,54 +315,42 @@
               </div>
             }
 
-            <!-- info — read-only. `find_related` is an ACTIONABLE discovery aid: each row's
-                 PRIMARY action is "Insert link" (drops a [[Title]] wikilink into the note at
-                 the caret — the same wikilink text the link-picker/toolbar op builds), with
-                 "Open" kept as a secondary action (2026-07-15: this used to be a single passive
-                 "tap to open" row — direct user feedback called that confusing/low-value).
-                 `fact_check`/`ask` produce a real answer you can copy or insert into the note. -->
+            <!-- info — read-only. `find_related` is ONE quiet compact list (minimalist,
+                 2026-07-16 — direct owner feedback: the two-buttons-per-card shape was too
+                 busy): the ROW ITSELF is the primary action (click inserts a [[Title]]
+                 wikilink — the same wikilink text the link-picker/toolbar op builds; the
+                 accessible name stays "Insert link to <title>"), with a small quiet "Open"
+                 as the secondary action. No count lead-line, no per-row card, no Done button
+                 (the header ✕ and Esc already close). `fact_check`/`ask` produce a real
+                 answer you can copy or insert into the note. -->
             @case ("info") {
               @if (res.action === "find_related") {
                 @if (res.citations.length > 0) {
-                  <p class="pop-info-lead">{{ res.suggestion }}</p>
                   <ul class="pop-cite-rows" aria-label="Related sources">
                     @for (cite of res.citations; track cite.id) {
                       <li class="pop-cite-row" [attr.title]="cite.snippet">
-                        <span class="pop-cite-kind">{{ cite.kind }}</span>
-                        <span class="pop-cite-title">{{ cite.title }}</span>
-                        <span class="pop-cite-actions">
-                          <button
-                            type="button"
-                            class="btn btn-primary pop-cite-btn"
-                            (click)="insertLinkFor(cite)"
-                          >
-                            Insert link
-                          </button>
-                          <button
-                            type="button"
-                            class="btn btn-ghost pop-cite-btn"
-                            (click)="openCitation(cite)"
-                          >
-                            Open
-                          </button>
-                        </span>
+                        <button
+                          type="button"
+                          class="pop-cite-main"
+                          [attr.aria-label]="'Insert link to ' + cite.title"
+                          (click)="insertLinkFor(cite)"
+                        >
+                          <span class="pop-cite-title">{{ cite.title }}</span>
+                          <span class="pop-cite-kind">{{ cite.kind }}</span>
+                        </button>
+                        <button
+                          type="button"
+                          class="pop-cite-open"
+                          (click)="openCitation(cite)"
+                        >
+                          Open
+                        </button>
                       </li>
                     }
                   </ul>
                 } @else {
-                  <div class="pop-info-answer">
-                    Nothing related found in your brain yet.
-                  </div>
+                  <p class="pop-empty">Nothing related found in your brain yet.</p>
                 }
-                <div class="pop-buttons">
-                  <button
-                    type="button"
-                    class="btn btn-ghost pop-btn"
-                    (click)="discard()"
-                  >
-                    Done
-                  </button>
-                </div>
               } @else {
                 <div class="pop-info-answer">{{ res.suggestion }}</div>
                 @if (res.citations.length > 0) {
