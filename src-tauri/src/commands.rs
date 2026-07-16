@@ -14433,6 +14433,16 @@ fn reblank_folder_extras(state: &AppState, folder_id: &str) -> Result<(), AppErr
         if let Some(enc) = reblank_audio(sys)? {
             state.db.set_meeting_sys_master_path(&mid, Some(&enc))?;
         }
+        // FAIL-CLOSED sweep (2026-07-16 review): segments carrying PLAINTEXT with NO sealed blob —
+        // the crash window of a salvage/live pipeline killed before its seal step — are invisible
+        // to the blob-guarded re-blanks above and would sit plaintext-at-rest behind the lock
+        // forever. They are DERIVED data and their source audio survives sealed (re-blanked just
+        // above), so the relock deletes them; unlock + retry re-derives the transcript. This makes
+        // the invariant universal: after a relock, NO plaintext segment row exists in the folder.
+        let purged = state.db.delete_unsealed_segments(&mid)?;
+        if purged > 0 {
+            tracing::warn!(target: "lock", meeting_id = %mid, purged, "relock purged unsealed plaintext segments left by an interrupted pipeline (audio stays sealed; unlock + retry to re-transcribe)");
+        }
     }
     // Document ingestion: re-blank the plaintext text of every sealed document ONLY WHERE its
     // `text_blob` exists (never destroy the only copy), and PURGE the doc chunks the session unlock
@@ -23955,6 +23965,79 @@ mod lifecycle_tests {
         assert!(!wav.exists(), "the plaintext WAV is removed (a sealed copy exists)");
         assert!(enc.exists(), "the sealed .enc twin is never touched");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// LOCK MODEL (2026-07-16 review, MEDIUM): a RELOCK must purge blob-less plaintext segments —
+    /// the crash window where a salvage/live pipeline died between its segment insert and its
+    /// seal/finalize step. The blob-guarded re-blank can never cover those rows; before this fix
+    /// they sat plaintext-at-rest behind the lock through every later relock.
+    #[test]
+    fn relock_reblank_purges_unsealed_plaintext_segments() {
+        let state = build_state("relock-unsealed-purge");
+        seed_meeting(&state.db, "m-crashed", "# crashed salvage", None);
+        state
+            .db
+            .insert_folder(&Folder {
+                id: "f-crash".into(),
+                name: "Crash".into(),
+                path: "Crash".into(),
+                parent_id: None,
+                locked: true,
+                created_at: "2026-07-16T00:00:00Z".into(),
+            })
+            .unwrap();
+        state
+            .db
+            .set_meeting_folder("m-crashed", Some("f-crash"))
+            .unwrap();
+        assert!(
+            !state.db.raw_segments("m-crashed").unwrap().is_empty(),
+            "precondition: fresh blob-less plaintext segments exist behind the lock"
+        );
+
+        reblank_folder_extras(&state, "f-crash").unwrap();
+
+        assert!(
+            state.db.raw_segments("m-crashed").unwrap().is_empty(),
+            "the relock re-blank purges blob-less plaintext rows — nothing plaintext survives a relock"
+        );
+    }
+
+    /// DEFENSE-IN-DEPTH (2026-07-16 review, MEDIUM): the salvage lock finalizer is Drop-armed —
+    /// a panic unwinding out of the pipeline scope still runs it, so the mid-run-relock purge
+    /// cannot be skipped by a crash between the segment insert and the sequential finalizer call.
+    #[test]
+    fn salvage_lock_finalizer_guard_runs_on_a_panic_unwind() {
+        let state = build_state("salvage-guard-panic");
+        seed_meeting(&state.db, "m-panic", "# raced", None);
+        state
+            .db
+            .insert_folder(&Folder {
+                id: "f-panic".into(),
+                name: "Panic".into(),
+                path: "Panic".into(),
+                parent_id: None,
+                locked: true, // locked, NOT session-unlocked → the purge branch
+                created_at: "2026-07-16T00:00:00Z".into(),
+            })
+            .unwrap();
+        state
+            .db
+            .set_meeting_folder("m-panic", Some("f-panic"))
+            .unwrap();
+
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = crate::pipeline::SalvageLockFinalizer {
+                state: &state,
+                meeting_id: "m-panic",
+            };
+            panic!("simulated pipeline death between segment insert and finalizer");
+        }));
+        assert!(unwound.is_err(), "the panic really unwound through the guard scope");
+        assert!(
+            state.db.raw_segments("m-panic").unwrap().is_empty(),
+            "the Drop-armed finalizer purged the unsealed plaintext despite the panic"
+        );
     }
 
     /// `finalize_salvage_lock_state` never removes a plaintext WAV WITHOUT a surviving sealed
