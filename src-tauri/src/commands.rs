@@ -30639,8 +30639,9 @@ async fn org_sync_one(
 ) -> Result<(), AppError> {
     // ── ASYNC PULL PHASE — drain the feed, opening each cell; buffer decrypted items ──────────────
     // The embedder (`dyn Embedder`, !Send) is deliberately NOT constructed here: the whole async
-    // section is Send-safe, and the synchronous INGEST phase below owns the embedder entirely (never
-    // held across an `.await`). A tombstone applies immediately (no key/blob needed).
+    // section is Send-safe, and the INGEST phase below owns the embedder entirely INSIDE its
+    // `perf::run_heavy` blocking closure (never held across an `.await`). A tombstone applies
+    // immediately (no key/blob needed).
     //
     // FIX D — per-item failures are classified TRANSIENT vs TERMINAL so one poison item never stalls
     // the WHOLE feed forever (pre-fix: EVERY failure did `break 'pages`, so a single un-openable cell
@@ -30784,79 +30785,100 @@ async fn org_sync_one(
         cursor = cursor.max(feed.next_seq);
     }
 
-    // ── SYNC INGEST PHASE — embedder built ONCE, never crosses an await ───────────────────────────
-    // Scoped in its own block: `embedder`/`embedder_ref` (`dyn Embedder`, !Send) MUST be fully dropped
-    // before the backfill's `.await` below, or the whole `org_sync_now` future stops being `Send` (Tauri
-    // commands must be `Send`) — a bare `drop(x)` call does NOT shrink NLL liveness the way going out of
-    // scope does, so this needs the block, not just an explicit drop.
-    {
-        let embedder: Option<Box<dyn crate::embed::Embedder>> = if report.fts_only {
-            None
-        } else {
-            Some(crate::embed::active_embedder())
-        };
-        let embedder_ref: Option<&dyn crate::embed::Embedder> = embedder.as_deref();
-        let mut applied = cursor;
-        for action in actions {
-            match action {
-                FeedAction::Tombstone { item_id, seq } => {
-                    state.db.tombstone_org_item(&item_id)?;
-                    report.tombstoned += 1;
-                    applied = applied.max(seq);
+    // ── INGEST PHASE — on the blocking pool, through the ONE global heavy-inference gate ──────────
+    // Ingesting an item embeds it via Candle/Metal (`upsert_org_item` → `embed_passage`), which used
+    // to run INLINE on this async command's Tokio worker AND outside `perf::run_heavy` — a large feed
+    // pull could run an ungated Metal forward pass concurrently with transcription/diarization. Route
+    // the whole apply loop through the shared gate like every other heavy native call site (the
+    // `unlock_folder` restore is the exemplar). SKIPPED entirely when the pull produced no actions —
+    // the every-60s background tick's common case — so an idle tick no longer constructs an embedder
+    // (or takes the heavy permit) per org. The embedder lives entirely INSIDE the blocking closure,
+    // so the old "must drop before the backfill's `.await` or the future stops being `Send`" block
+    // dance is now moot by construction; `active_embedder()` itself is a cheap handle to the ONE
+    // process-wide cached engine (see `embed::REAL_EMBEDDER_CACHE`), not a fresh per-org instance.
+    if !actions.is_empty() {
+        let db = state.db.clone();
+        let org_id = org.org_id.clone();
+        let fts_only = report.fts_only;
+        let (tombstoned, ingested) = crate::perf::run_heavy(
+            &state.heavy_inference,
+            move || -> Result<(u32, u32), AppError> {
+                let embedder: Option<Box<dyn crate::embed::Embedder>> = if fts_only {
+                    None
+                } else {
+                    Some(crate::embed::active_embedder())
+                };
+                let embedder_ref: Option<&dyn crate::embed::Embedder> = embedder.as_deref();
+                let mut tombstoned: u32 = 0;
+                let mut ingested: u32 = 0;
+                let mut applied = cursor;
+                for action in actions {
+                    match action {
+                        FeedAction::Tombstone { item_id, seq } => {
+                            db.tombstone_org_item(&item_id)?;
+                            tombstoned += 1;
+                            applied = applied.max(seq);
+                        }
+                        // FIX D: a permanently un-ingestable item advances the cursor past its seq (no DB
+                        // write), so it never stalls the feed — the good item behind it ingests on the SAME sync.
+                        FeedAction::SkipTerminal { seq } => {
+                            applied = applied.max(seq);
+                            db.set_org_last_seq(&org_id, applied as i64)?;
+                        }
+                        FeedAction::Ingest {
+                            item_id,
+                            seq,
+                            rev,
+                            generation,
+                            env,
+                            sha,
+                            author_user_id,
+                        } => {
+                            // AUTHOR (root-cause fix, 2026-07-15): pass the feed's server-authoritative author
+                            // id DIRECTLY into the upsert (in both the INSERT and the `ON CONFLICT`'s
+                            // `COALESCE`, so it can never be clobbered back to NULL by a later light re-upsert)
+                            // instead of a separate follow-up `set_org_item_author` call — this row is correct
+                            // the moment it's written, not one extra statement later. Server never sends an
+                            // empty author id, but guard anyway — an empty string is passed through as `None`
+                            // rather than stamping a blank value.
+                            let author_ref = if author_user_id.is_empty() {
+                                None
+                            } else {
+                                Some(author_user_id.as_str())
+                            };
+                            db.upsert_org_item(
+                                &item_id,
+                                &org_id,
+                                seq,
+                                &env.author_hint,
+                                &env.title,
+                                &env.markdown,
+                                &env.created_at,
+                                rev,
+                                generation,
+                                &sha,
+                                // Straight off the opened envelope: `Some("document"|"meeting")` for an item
+                                // published from a v2 wire envelope (this device's own publishes, or a peer
+                                // already on v2); `None` for one opened off an old v1 envelope (no wire signal) —
+                                // honest "unclassified", never guessed.
+                                env.source_kind
+                                    .map(crate::share::org_envelope::OrgSourceKind::as_str),
+                                author_ref,
+                                embedder_ref,
+                            )?;
+                            ingested += 1;
+                            applied = applied.max(seq);
+                        }
+                    }
+                    // Advance the cursor per successfully-applied item (monotonic; Core's setter no-ops backward).
+                    db.set_org_last_seq(&org_id, applied as i64)?;
                 }
-                // FIX D: a permanently un-ingestable item advances the cursor past its seq (no DB
-                // write), so it never stalls the feed — the good item behind it ingests on the SAME sync.
-                FeedAction::SkipTerminal { seq } => {
-                    applied = applied.max(seq);
-                    state.db.set_org_last_seq(&org.org_id, applied as i64)?;
-                }
-                FeedAction::Ingest {
-                    item_id,
-                    seq,
-                    rev,
-                    generation,
-                    env,
-                    sha,
-                    author_user_id,
-                } => {
-                    // AUTHOR (root-cause fix, 2026-07-15): pass the feed's server-authoritative author
-                    // id DIRECTLY into the upsert (in both the INSERT and the `ON CONFLICT`'s
-                    // `COALESCE`, so it can never be clobbered back to NULL by a later light re-upsert)
-                    // instead of a separate follow-up `set_org_item_author` call — this row is correct
-                    // the moment it's written, not one extra statement later. Server never sends an
-                    // empty author id, but guard anyway — an empty string is passed through as `None`
-                    // rather than stamping a blank value.
-                    let author_ref = if author_user_id.is_empty() {
-                        None
-                    } else {
-                        Some(author_user_id.as_str())
-                    };
-                    state.db.upsert_org_item(
-                        &item_id,
-                        &org.org_id,
-                        seq,
-                        &env.author_hint,
-                        &env.title,
-                        &env.markdown,
-                        &env.created_at,
-                        rev,
-                        generation,
-                        &sha,
-                        // Straight off the opened envelope: `Some("document"|"meeting")` for an item
-                        // published from a v2 wire envelope (this device's own publishes, or a peer
-                        // already on v2); `None` for one opened off an old v1 envelope (no wire signal) —
-                        // honest "unclassified", never guessed.
-                        env.source_kind.map(crate::share::org_envelope::OrgSourceKind::as_str),
-                        author_ref,
-                        embedder_ref,
-                    )?;
-                    report.ingested += 1;
-                    applied = applied.max(seq);
-                }
-            }
-            // Advance the cursor per successfully-applied item (monotonic; Core's setter no-ops backward).
-            state.db.set_org_last_seq(&org.org_id, applied as i64)?;
-        }
+                Ok((tombstoned, ingested))
+            },
+        )
+        .await?;
+        report.tombstoned += tombstoned;
+        report.ingested += ingested;
     }
 
     // STALE-INGEST BACKFILL (2026-07-15): the cursor-based pull above only ever asks for `seq > cursor`,
