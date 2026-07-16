@@ -170,7 +170,10 @@ mod tests {
         assert!(!reactions.routable);
         let tr = row(&rows, "transcription");
         assert_eq!(tr.engine, "Whisper");
-        assert_eq!(tr.model, "small");
+        // The default whisper size is machine-conditional (downloaded models + RAM decide, see
+        // transcribe::model::default_model_size_now) — assert the row mirrors that ONE decision
+        // instead of hardcoding "small", which only holds on a model-less machine.
+        assert_eq!(tr.model, crate::transcribe::model::default_model_size_now());
         assert!(tr.on_device);
     }
 
