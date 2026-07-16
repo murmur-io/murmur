@@ -961,6 +961,16 @@ export class IpcService {
     return invoke<StopResult>("resummarize", { meetingId });
   }
 
+  /**
+   * Re-run the FULL pipeline (ASR + summarize + export) from a failed recording's on-disk archive
+   * audio — the recovery for a pipeline that died mid-transcription (re-summarize alone cannot
+   * re-run ASR). Backend gates: meeting must be in the Error state, its folder unlocked, its
+   * archive audio present on disk, and no recording in progress.
+   */
+  retryTranscription(meetingId: string): Promise<StopResult> {
+    return invoke<StopResult>("retry_transcription", { meetingId });
+  }
+
   listMeetings(): Promise<Meeting[]> {
     return invoke<Meeting[]>("list_meetings");
   }

@@ -287,6 +287,7 @@ pub fn run() {
             commands::has_slack_token,
             commands::provider_statuses,
             commands::resummarize,
+            commands::retry_transcription,
             commands::list_meetings,
             commands::search_meetings,
             commands::delete_meeting,
@@ -435,14 +436,21 @@ pub fn run() {
                 ));
             }
 
-            // Crash-recovery (STAGE 2 salvage + STAGE 1 reconcile) + orphan reap. A session that died
-            // mid-record (crash / SIGKILL / `tauri dev` hot-rebuild) never ran `stop_recording`, so the
-            // meeting row `start_recording` inserted up-front sits as a `RECORDING` "ghost" AND its mic
-            // audio (RAM-only) + far-side scratch would be lost. ORDER IS LOAD-BEARING:
-            //   1) CLAIM salvage: find inflight mic spills of crashed recordings + MOVE the paired
-            //      far-side scratch out of $TMPDIR (before the reaper below deletes it). Runs FIRST so
-            //      the reaper can't eat a recoverable far-side track.
-            //   2) RECONCILE the remaining ghosts to terminal `ERROR` — SKIPPING the claimed rows
+            // Crash-recovery (STAGE 2 spill salvage + STAGE 3 disk salvage + STAGE 1 reconcile) +
+            // orphan reap. A session that died mid-record (crash / SIGKILL / `tauri dev` hot-rebuild)
+            // never ran `stop_recording`, so the meeting row `start_recording` inserted up-front sits
+            // as a `RECORDING` "ghost" AND its mic audio (RAM-only) + far-side scratch would be lost.
+            // ORDER IS LOAD-BEARING:
+            //   1) CLAIM spill salvage: find inflight mic spills of crashed recordings + MOVE the
+            //      paired far-side scratch out of $TMPDIR (before the reaper below deletes it). Runs
+            //      FIRST so the reaper can't eat a recoverable far-side track.
+            //   1b) CLAIM disk salvage (2026-07-16): among the ghosts the spill did NOT claim (spill
+            //      wins — it has both streams), any whose ARCHIVE WAV survived on disk (the pipeline
+            //      died AFTER finalize_meeting) is re-run from disk instead of being flipped to
+            //      ERROR with intact, never-re-transcribed audio. Sealed audio / a locked folder is
+            //      NEVER decrypted here — those rows fall through to reconcile (terminal ERROR, audio
+            //      untouched) and stay recoverable via `retry_transcription` after an unlock.
+            //   2) RECONCILE the remaining ghosts to terminal `ERROR` — SKIPPING every claimed row
             //      (salvage sets their final status itself), so a claimed row isn't clobbered.
             //   3) REAP orphaned capture helpers + sweep stale scratch (post-claim, so only truly-
             //      abandoned files remain).
@@ -450,13 +458,16 @@ pub fn run() {
             //      the EXISTING post-Stop pipeline → a real transcript+note. After the reap so the
             //      paired helper is already down. Best-effort; never deletes un-salvaged audio.
             //   (3+4 run inside ONE detached task below — sequenced, off the setup thread.)
-            let salvage_jobs = {
+            let (salvage_jobs, disk_salvage_jobs) = {
                 let state = app.state::<AppState>();
-                let (jobs, claimed) = crate::audio::spill::claim_inflight(&state.db);
+                let (jobs, mut claimed) = crate::audio::spill::claim_inflight(&state.db);
+                let (disk_jobs, disk_claimed) =
+                    crate::audio::spill::claim_disk_salvage(&state.db, &claimed);
+                claimed.extend(disk_claimed);
                 if let Err(e) = state.db.reconcile_stuck_recordings_except(&claimed) {
                     tracing::warn!(target: "startup", error = %e, "could not reconcile stuck recordings");
                 }
-                jobs
+                (jobs, disk_jobs)
             };
 
             // Reap any capture helper ORPHANED by a previous session that died without a clean Stop
@@ -489,10 +500,10 @@ pub fn run() {
                     if let Err(e) = joined {
                         tracing::warn!(target: "startup", error = %e, "orphan-helper reap join failed; salvage continues");
                     }
-                    // STAGE 2 salvage worker (async, detached): now that the reaper has downed any
-                    // orphan helper, reconstruct + pipeline each claimed crashed recording. No-op
-                    // when nothing crashed.
-                    crate::audio::spill::spawn_salvage(app_handle, salvage_jobs);
+                    // STAGE 2 + 3 salvage worker (async, detached): now that the reaper has downed
+                    // any orphan helper, reconstruct + pipeline each claimed crashed recording —
+                    // spill jobs first, then the from-disk re-runs. No-op when nothing crashed.
+                    crate::audio::spill::spawn_salvage(app_handle, salvage_jobs, disk_salvage_jobs);
                 });
             }
             // R1: reclaim any STALE `*.part` model-download residue (a crash / force-quit / aborted
