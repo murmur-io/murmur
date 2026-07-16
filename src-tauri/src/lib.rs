@@ -112,9 +112,14 @@ pub fn run() {
     // production pipeline panic left ZERO evidence in murmur.log (the "wedged on Transcribing…"
     // forensics found an idle process and an empty trail). Route every panic through `tracing`
     // (which tees to murmur.log) FIRST, then chain to the previous hook so dev stderr/backtrace
-    // behavior is preserved. PII: message + source location only — panic payloads from our code
-    // carry no note/transcript content, and no content fields are added here.
+    // behavior is preserved. PII: the PAYLOAD is sanitized before persisting (home-dir prefix
+    // redacted + length-capped — an `expect` on an `io::Error` embeds the failing path, and under
+    // the vault that filename is note-title-derived); the source LOCATION is compiled-in and
+    // carries no user content, so it stays verbatim.
     let previous_panic_hook = std::panic::take_hook();
+    // Resolved ONCE here, not inside the hook — the hook must do no avoidable work while the
+    // process is already panicking.
+    let panic_home = dirs::home_dir().map(|h| h.to_string_lossy().into_owned());
     std::panic::set_hook(Box::new(move |info| {
         let location = info
             .location()
@@ -127,6 +132,7 @@ pub fn run() {
         } else {
             "non-string panic payload".to_string()
         };
+        let message = sanitize_panic_message(&message, panic_home.as_deref());
         tracing::error!(target: "panic", %location, %message, "panic");
         previous_panic_hook(info);
     }));
@@ -185,6 +191,10 @@ pub fn run() {
             commands::run_vault_audit,
             commands::list_audit_findings,
             commands::resolve_audit_finding,
+            // Vault Audit Phase 3 — weekly schedule + user-initiated cloud explain.
+            commands::get_audit_schedule,
+            commands::set_audit_schedule,
+            commands::explain_audit_finding,
             commands::get_config,
             commands::get_mcp_config,
             commands::save_config,
@@ -447,6 +457,7 @@ pub fn run() {
             //   4) SPAWN the async salvage worker: reconstruct each claimed recording + run it through
             //      the EXISTING post-Stop pipeline → a real transcript+note. After the reap so the
             //      paired helper is already down. Best-effort; never deletes un-salvaged audio.
+            //   (3+4 run inside ONE detached task below — sequenced, off the setup thread.)
             let (salvage_jobs, disk_salvage_jobs) = {
                 let state = app.state::<AppState>();
                 let (jobs, mut claimed) = crate::audio::spill::claim_inflight(&state.db);
@@ -462,13 +473,39 @@ pub fn run() {
             // Reap any capture helper ORPHANED by a previous session that died without a clean Stop
             // (crash / force-quit / a `tauri dev` hot-rebuild SIGKILLing the app mid-record). Such a
             // helper keeps capturing to a temp WAV for up to its 4h self-cap — GBs of dead-session
-            // audio the file-age sweep below can't catch (its mtime stays fresh). Run FIRST so the
-            // kill releases the file, THEN reclaim any stale scratch left behind. A helper whose
-            // parent is launchd, dead, or not a Murmur process is reaped; one owned by a LIVE
-            // Murmur process (a genuinely concurrent instance) is spared — see `helper_verdict`.
-            // (Salvage above already moved any RECOVERABLE far-side scratch out of the reaper's reach.)
-            crate::audio::aec::reap_orphaned_capture_helpers();
-            crate::audio::aec::sweep_stale_scratch();
+            // audio the file-age sweep can't catch (its mtime stays fresh). The reap runs FIRST so
+            // the kill releases the file, THEN stale scratch is reclaimed. A helper whose parent is
+            // launchd, dead, or not a Murmur process is reaped; one owned by a LIVE Murmur process
+            // (a genuinely concurrent instance) is spared — see `helper_verdict`. (Salvage above
+            // already moved any RECOVERABLE far-side scratch out of the reaper's reach.)
+            //
+            // Hardening 2026-07-16: steps 3+4 moved OFF the setup thread — the reap shells out to
+            // /bin/ps (×2) plus a per-candidate `kill -0`, which blocked launch. The LOAD-BEARING
+            // order (see the block comment above: reap[3] completes BEFORE the salvage worker[4]
+            // spawns, so a crashed session's paired helper is already down) is preserved INSIDE
+            // one detached task: the blocking reap+sweep is AWAITED to completion, then the
+            // salvage worker spawns. Steps 1+2 (claim + reconcile) already ran synchronously
+            // above, so the claim still beats the reaper to any recoverable far-side scratch.
+            // Racing an early user-initiated `start_recording` is safe by construction — the reap
+            // spares every helper owned by a live Murmur process, and `start_recording` runs its
+            // own awaited sweep anyway.
+            {
+                let app_handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    let joined = tauri::async_runtime::spawn_blocking(|| {
+                        crate::audio::aec::reap_orphaned_capture_helpers();
+                        crate::audio::aec::sweep_stale_scratch();
+                    })
+                    .await;
+                    if let Err(e) = joined {
+                        tracing::warn!(target: "startup", error = %e, "orphan-helper reap join failed; salvage continues");
+                    }
+                    // STAGE 2 + 3 salvage worker (async, detached): now that the reaper has downed
+                    // any orphan helper, reconstruct + pipeline each claimed crashed recording —
+                    // spill jobs first, then the from-disk re-runs. No-op when nothing crashed.
+                    crate::audio::spill::spawn_salvage(app_handle, salvage_jobs, disk_salvage_jobs);
+                });
+            }
             // R1: reclaim any STALE `*.part` model-download residue (a crash / force-quit / aborted
             // model switch mid-download orphans up to ~3.1 GB). Only removes a `.part` older than 1 h
             // so a live in-progress download is never raced. Best-effort; never fatal to launch.
@@ -486,11 +523,6 @@ pub fn run() {
                     crate::export::obsidian::sweep_stale_export_tmp(std::path::Path::new(&vault));
                 }
             }
-
-            // STAGE 2 + 3 salvage worker (async, detached): now that the reaper has downed any orphan
-            // helper, reconstruct + pipeline each claimed crashed recording — spill jobs first, then
-            // the from-disk re-runs. No-op when nothing crashed.
-            crate::audio::spill::spawn_salvage(app.handle().clone(), salvage_jobs, disk_salvage_jobs);
 
             create_bar_window(app.handle())?;
             if let Err(e) = app.global_shortcut().register(SUMMON_SHORTCUT) {
@@ -586,6 +618,12 @@ pub fn run() {
                         if let Err(e) = joined {
                             tracing::warn!(target: "memory", error = %e, "consolidation tick join failed");
                         }
+                        // Vault Audit Phase 3 — the WEEKLY scheduled-audit due-check rides this
+                        // same hourly cadence (no new cadence class; first check a full interval
+                        // after launch, so run-on-launch-if-due comes free at +1h). The tick
+                        // claims-before-run, gates on thermal/RAM, runs the pass on a blocking
+                        // worker, and never errors (warn-and-continue inside).
+                        crate::audit::audit_weekly_tick(&handle).await;
                     }
                 });
             }
@@ -674,6 +712,34 @@ pub fn run() {
                 crate::reason::sidecar::kill_on_quit();
             }
         });
+}
+
+/// Max chars of a panic PAYLOAD persisted to murmur.log by the global hook. Generous for every
+/// panic message our code produces, while a pathological payload (a formatted struct dump, a
+/// whole file body threaded into an `expect`) can no longer flood the log.
+const PANIC_MESSAGE_MAX_CHARS: usize = 400;
+
+/// Sanitize a panic payload before the global hook persists it to murmur.log (hardening
+/// 2026-07-16): redact the user's home-directory prefix (→ `~`) and length-cap the result
+/// ([`PANIC_MESSAGE_MAX_CHARS`]). An `expect` on an `io::Error` embeds the failing PATH in the
+/// payload, and under the vault that filename is note-title-derived — i.e. PII the log must not
+/// carry (rule: logs carry IDs/stages/counts only). The panic LOCATION is handled separately by
+/// the caller and stays verbatim — compiled-in source paths carry no user content.
+///
+/// PURE + PANIC-FREE (this runs inside the panic hook): char-boundary-safe truncation, no
+/// allocation tricks, no unwraps. A `home` of `None` or a degenerate one-char home (redacting
+/// `/` would blank every path separator) skips redaction.
+fn sanitize_panic_message(message: &str, home: Option<&str>) -> String {
+    let redacted = match home {
+        Some(h) if h.len() > 1 => message.replace(h, "~"),
+        _ => message.to_string(),
+    };
+    // `char_indices` finds the byte offset of the cap-th char (if any) — boundary-safe for
+    // multi-byte payloads, and O(cap) instead of counting the whole string.
+    match redacted.char_indices().nth(PANIC_MESSAGE_MAX_CHARS) {
+        Some((byte_idx, _)) => format!("{}…[truncated]", &redacted[..byte_idx]),
+        None => redacted,
+    }
 }
 
 /// Lifecycle-hook context tags. `app-exit` is the TRUE quit (stop capture + relock); `window-close`
@@ -887,5 +953,68 @@ fn position_bar_top_center(win: &tauri::WebviewWindow) {
         let x = ((screen.width as f64 - size.width as f64) / 2.0).max(0.0);
         let y = (48.0 * scale).min(screen.height as f64 * 0.3);
         let _ = win.set_position(tauri::PhysicalPosition::new(x, y));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Hardening item 1 (RED-before-GREEN): the panic hook used to persist the RAW payload to
+    /// murmur.log, so an `expect` on an `io::Error` leaked the failing vault path — whose
+    /// filename is note-title-derived, i.e. PII. Every home-dir occurrence must now be redacted
+    /// to `~` before the payload reaches `tracing`.
+    #[test]
+    fn panic_message_redacts_the_home_dir_prefix() {
+        let msg = "failed to export note: No such file or directory (os error 2) \
+                   at /Users/jane/Vault/Meetings/Salary review with Bob.md \
+                   (backup: /Users/jane/Vault/.trash/Salary review with Bob.md)";
+        let out = sanitize_panic_message(msg, Some("/Users/jane"));
+        assert!(
+            !out.contains("/Users/jane"),
+            "the home prefix must not survive: {out}"
+        );
+        assert!(
+            out.contains("~/Vault/Meetings/Salary review with Bob.md"),
+            "the path is kept readable, just home-relative: {out}"
+        );
+        assert!(
+            out.contains("~/Vault/.trash/"),
+            "EVERY occurrence is redacted, not just the first: {out}"
+        );
+    }
+
+    /// The payload is length-capped so a pathological panic (a struct dump / file body threaded
+    /// into an `expect`) cannot flood murmur.log. The cap is marked, and multi-byte chars at the
+    /// boundary must never split (this fn runs INSIDE the panic hook — it must not panic).
+    #[test]
+    fn panic_message_is_length_capped_char_boundary_safe() {
+        // 600 two-byte chars ('ł') — a byte-indexed truncation at 400 would split a char.
+        let long = "ł".repeat(600);
+        let out = sanitize_panic_message(&long, None);
+        assert!(out.ends_with("…[truncated]"), "a capped payload is marked: {out}");
+        let kept = out.trim_end_matches("…[truncated]");
+        assert_eq!(
+            kept.chars().count(),
+            PANIC_MESSAGE_MAX_CHARS,
+            "exactly the cap survives"
+        );
+        assert!(kept.chars().all(|c| c == 'ł'), "no mangled chars at the cut");
+    }
+
+    /// A short, home-free payload passes through byte-identical (the common case — our own panic
+    /// messages), and degenerate homes (`None` / `"/"`) never trigger redaction ("/"-replacement
+    /// would blank every path separator).
+    #[test]
+    fn panic_message_passthrough_and_degenerate_home() {
+        let msg = "recorder mutex poisoned";
+        assert_eq!(sanitize_panic_message(msg, None), msg);
+        assert_eq!(sanitize_panic_message(msg, Some("/")), msg);
+        let pathy = "open /etc/hosts failed";
+        assert_eq!(
+            sanitize_panic_message(pathy, Some("/")),
+            pathy,
+            "a one-char home must not be substituted into every separator"
+        );
     }
 }
