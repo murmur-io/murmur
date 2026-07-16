@@ -1647,35 +1647,12 @@ pub(crate) fn refresh_meeting_note_exported_hash(
     Ok(())
 }
 
-/// The AUTHORED-NOTE twin of [`refresh_meeting_note_exported_hash`] — the same conditional
-/// (anti-laundering) append-side baseline rule, against `documents.exported_hash`: re-stamp from
-/// the final written content ONLY when the pre-append bytes still matched the stored baseline
-/// (or the row is legacy/NULL — grandfathered). A mismatch keeps the stale baseline so the next
-/// full overwrite preserves (external edit + appended stamp) as a sibling.
-pub(crate) fn refresh_note_doc_exported_hash(
-    state: &AppState,
-    note_id: &str,
-    pre_append: &str,
-    written: &str,
-) -> Result<(), AppError> {
-    let baseline = state.db.get_note_doc_exported_hash(note_id)?;
-    if let Some(b) = &baseline {
-        if *b != crate::export::note_content_hash(pre_append) {
-            // External edit present BEFORE the append — keep the stale baseline. Ids only.
-            tracing::info!(
-                target: "export",
-                note_id = %note_id,
-                baseline_kept_stale = true,
-                "append over an externally-edited note — baseline deliberately not re-stamped"
-            );
-            return Ok(());
-        }
-    }
-    state
-        .db
-        .set_note_doc_exported_hash(note_id, Some(&crate::export::note_content_hash(written)))?;
-    Ok(())
-}
+// NOTE: the former `refresh_note_doc_exported_hash` (the authored-note twin of the meeting
+// append-side refresh) was REMOVED with the note-accept canonical-store fix (2026-07-16): an
+// authored note is never append-stamped on its exported file anymore — every note write goes
+// through `update_note_doc_inner` → `write_note_to_vault`, which stamps `documents.exported_hash`
+// fresh from the exact content it wrote (and `write_note` never clobbers different bytes, so an
+// externally-edited exported file is preserved untouched rather than baseline-juggled).
 
 /// Inner of [`update_note`] taking `&AppState` — the FULL command body (gate + lifecycle guard +
 /// seal-on-write upsert + vault re-write), so the seal-on-write regression binds the COMMAND
@@ -6387,10 +6364,11 @@ pub(crate) fn resolve_audit_finding_inner(
     id: &str,
     action: &str,
 ) -> Result<crate::audit::AuditFinding, AppError> {
-    // Seal-vs-write TOCTOU: hold the lifecycle guard across the re-gate + the vault append, so a
-    // concurrent lock/relock cannot land between the check and the write (the same discipline as
-    // `update_note_inner` / `apply_supersessions_inner`).
-    let _lifecycle = lifecycle_guard(state);
+    // Seal-vs-write TOCTOU: the lifecycle guard is taken INSIDE the accept path, per source kind
+    // (see `apply_audit_accept`) — NOT here. The note-canonical writer delegates to
+    // `update_note_doc_inner`, which takes the same NON-REENTRANT guard itself; holding it across
+    // that call would self-deadlock. The dismiss path and the status flip are single atomic DB
+    // statements and need no guard.
     let row = state
         .db
         .get_audit_finding(id)?
@@ -6435,6 +6413,28 @@ fn apply_audit_accept(
     state: &AppState,
     row: &crate::audit::AuditFindingRow,
 ) -> Result<(), AppError> {
+    // Seal-vs-write TOCTOU, split by source kind: MEETING flows stamp the exported FILE and have
+    // no inner guard — hold the lifecycle guard across their gate+append (the
+    // `apply_supersessions_inner` discipline). NOTE flows write through the canonical store via
+    // `update_note_doc_inner`, which takes the SAME non-reentrant guard itself — holding it here
+    // would self-deadlock; their gate+write atomicity lives inside that writer, and a seal racing
+    // the pre-read fails CLOSED at its re-gate.
+    let _lifecycle = (row.source_kind == "meeting").then(|| lifecycle_guard(state));
+    // Re-gate the SOURCE up front, so a sealed-since-the-pass source refuses with the honest
+    // `Locked` BEFORE any per-kind validation (link re-resolution etc.) can mask it with a
+    // misleading InvalidArg. The write paths re-gate again at their own boundary.
+    let source_open = match row.source_kind.as_str() {
+        "meeting" => source_is_stampable(state, &row.source_id)?,
+        _ => {
+            let unlocked = unlocked_snapshot(state)?;
+            state.db.note_is_visible(&row.source_id, &unlocked)?
+        }
+    };
+    if !source_open {
+        return Err(AppError::Locked(
+            "this note's folder is locked — unlock it to apply the audit action".into(),
+        ));
+    }
     let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
     match row.kind.as_str() {
         "broken_link" => {
@@ -6483,12 +6483,13 @@ fn apply_audit_accept(
                 .as_deref()
                 .ok_or_else(|| AppError::InvalidArg("this finding has no counterpart".into()))?;
             // Re-gate BOTH sides BEFORE stamping either (never stamp into, or reference, a
-            // sealed note — and never leave a half-stamped pair).
-            let source_path = audit_source_file(state, &row.source_kind, &row.source_id)?;
-            let other_path = audit_source_file(state, "meeting", other_id)?;
+            // sealed note — and never leave a half-stamped pair). Both sides are MEETINGS by
+            // construction (the contradiction pass is facts-over-meetings only).
+            let source_path = audit_meeting_source_file(state, &row.source_id)?;
+            let other_path = audit_meeting_source_file(state, other_id)?;
             let source_stem = file_stem_of(&source_path);
             let other_stem = file_stem_of(&other_path);
-            append_to_audit_source(state, &row.source_kind, &row.source_id, &source_path, |md| {
+            append_to_audit_meeting_file(state, &row.source_id, &source_path, |md| {
                 crate::export::obsidian::append_audit_callout(
                     md,
                     &date,
@@ -6496,7 +6497,7 @@ fn apply_audit_accept(
                     &format!("> conflicting facts recorded here and in [[{other_stem}]] — review which is current"),
                 )
             })?;
-            append_to_audit_source(state, "meeting", other_id, &other_path, |md| {
+            append_to_audit_meeting_file(state, other_id, &other_path, |md| {
                 crate::export::obsidian::append_audit_callout(
                     md,
                     &date,
@@ -6546,25 +6547,67 @@ fn apply_audit_accept(
     }
 }
 
-/// Resolve + stamp a finding's (single) source in one step.
+/// Resolve + stamp a finding's (single) source in one step, dispatched by SOURCE KIND: a
+/// meeting note is stamped on its exported `.md` (the Re-Truth precedent — the file IS its
+/// projection surface); an authored NOTE is stamped through its CANONICAL DB text (live-bug fix
+/// 2026-07-16: a Brain note created in-app may have NO exported file, and the DB text is
+/// canonical for every note regardless).
 fn stamp_audit_source(
     state: &AppState,
     row: &crate::audit::AuditFindingRow,
     stamp: impl Fn(&str) -> String,
 ) -> Result<(), AppError> {
-    let path = audit_source_file(state, &row.source_kind, &row.source_id)?;
-    append_to_audit_source(state, &row.source_kind, &row.source_id, &path, stamp)
+    match row.source_kind.as_str() {
+        "meeting" => {
+            let path = audit_meeting_source_file(state, &row.source_id)?;
+            append_to_audit_meeting_file(state, &row.source_id, &path, stamp)
+        }
+        "note" => stamp_audit_note_source(state, &row.source_id, stamp),
+        other => Err(AppError::InvalidArg(format!(
+            "unknown finding source kind {other}"
+        ))),
+    }
 }
 
-/// Read-modify-write APPEND of one audit stamp: read the CURRENT file, apply the (idempotent)
-/// append, write only on change, then refresh the export-collision baseline with the Phase-0
-/// CONDITIONAL rule — meetings via [`refresh_meeting_note_exported_hash`], authored notes via
-/// [`refresh_note_doc_exported_hash`] (an externally-edited file keeps its stale baseline, so the
-/// next full overwrite preserves edit + stamp as a sibling instead of laundering the edit away).
-fn append_to_audit_source(
+/// Stamp a NOTE-source finding through the note's CANONICAL store — never through the exported
+/// file. Reads the markdown through the GATED reader (sealed-and-not-session-unlocked → Locked),
+/// applies the idempotent append to the TEXT (the marker lives in the DB text), and persists via
+/// [`update_note_doc_inner`] — the note editor's own save path — so the seal-on-write gate, the
+/// re-index, and the vault re-export all ride along. The re-export CREATES the `.md` and stamps
+/// `exported_path`/`exported_hash` for a never-exported note (healing it), and `write_note`
+/// never clobbers different bytes, so an externally-edited exported file survives untouched.
+fn stamp_audit_note_source(
     state: &AppState,
-    source_kind: &str,
-    source_id: &str,
+    note_id: &str,
+    stamp: impl Fn(&str) -> String,
+) -> Result<(), AppError> {
+    let unlocked = unlocked_snapshot(state)?;
+    let Some(markdown) = state.db.note_markdown_if_visible(note_id, &unlocked)? else {
+        return Err(AppError::Locked(
+            "this note's folder is locked — unlock it to apply the audit action".into(),
+        ));
+    };
+    let written = stamp(&markdown);
+    if written == markdown {
+        return Ok(()); // already stamped — idempotent no-op.
+    }
+    let row = state
+        .db
+        .get_note_row(note_id)?
+        .ok_or_else(|| AppError::InvalidArg(format!("no note {note_id}")))?;
+    let title = note_display_title(&row);
+    update_note_doc_inner(state, note_id, &title, &written)?;
+    Ok(())
+}
+
+/// Read-modify-write APPEND of one audit stamp on a MEETING note's exported `.md`: read the
+/// CURRENT file, apply the (idempotent) append, write only on change, then refresh the
+/// export-collision baseline with the Phase-0 CONDITIONAL rule
+/// ([`refresh_meeting_note_exported_hash`] — an externally-edited file keeps its stale baseline,
+/// so the next full overwrite preserves edit + stamp as a sibling instead of laundering).
+fn append_to_audit_meeting_file(
+    state: &AppState,
+    meeting_id: &str,
     path: &str,
     stamp: impl Fn(&str) -> String,
 ) -> Result<(), AppError> {
@@ -6575,61 +6618,23 @@ fn append_to_audit_source(
         return Ok(()); // already stamped — idempotent no-op.
     }
     crate::export::obsidian::overwrite_note(std::path::Path::new(path), &written)?;
-    match source_kind {
-        "meeting" => refresh_meeting_note_exported_hash(state, source_id, &current, &written),
-        _ => refresh_note_doc_exported_hash(state, source_id, &current, &written),
-    }
+    refresh_meeting_note_exported_hash(state, meeting_id, &current, &written)
 }
 
-/// Re-gate + resolve a finding source's exported `.md` at APPLY time (the TOCTOU re-check —
-/// the Re-Truth `source_is_stampable` posture, extended to authored notes): a meeting source
-/// must be session-unlocked AND open-on-disk with an exported file; a note source's folder must
-/// be session-unlocked AND open-on-disk (a sealed note's `.md` was deleted on seal, and a write
-/// into a locked-on-disk folder would be dropped at relock). Refusals are `AppError::Locked`.
-fn audit_source_file(
-    state: &AppState,
-    source_kind: &str,
-    source_id: &str,
-) -> Result<String, AppError> {
-    match source_kind {
-        "meeting" => {
-            if !source_is_stampable(state, source_id)? {
-                return Err(AppError::Locked(
-                    "this note's folder is locked — unlock it to apply the audit action".into(),
-                ));
-            }
-            match note_file_for(state, source_id)? {
-                Some((path, _)) => Ok(path),
-                None => Err(AppError::InvalidArg(
-                    "this note has no exported vault file to stamp".into(),
-                )),
-            }
-        }
-        "note" => {
-            let row = state
-                .db
-                .get_note_row(source_id)?
-                .ok_or_else(|| AppError::InvalidArg(format!("no note {source_id}")))?;
-            let locked_on_disk = state
-                .db
-                .folder_by_id(&row.folder_id)?
-                .map(|f| f.locked)
-                .unwrap_or(true);
-            if locked_on_disk || !folder_is_unlocked(state, &row.folder_id)? {
-                return Err(AppError::Locked(
-                    "this note's folder is locked — unlock it to apply the audit action".into(),
-                ));
-            }
-            match row.exported_path {
-                Some(p) if !p.trim().is_empty() => Ok(p),
-                _ => Err(AppError::InvalidArg(
-                    "this note has no exported vault file to stamp".into(),
-                )),
-            }
-        }
-        other => Err(AppError::InvalidArg(format!(
-            "unknown finding source kind {other}"
-        ))),
+/// Re-gate + resolve a MEETING finding source's exported `.md` at APPLY time (the TOCTOU
+/// re-check — the Re-Truth `source_is_stampable` posture): session-unlocked AND open-on-disk,
+/// with an exported file. Refusals are `AppError::Locked`; a missing file says what to do.
+fn audit_meeting_source_file(state: &AppState, source_id: &str) -> Result<String, AppError> {
+    if !source_is_stampable(state, source_id)? {
+        return Err(AppError::Locked(
+            "this note's folder is locked — unlock it to apply the audit action".into(),
+        ));
+    }
+    match note_file_for(state, source_id)? {
+        Some((path, _)) => Ok(path),
+        None => Err(AppError::InvalidArg(
+            "this meeting's note has no exported vault file — configure a vault and re-export the note first".into(),
+        )),
     }
 }
 
@@ -25338,18 +25343,150 @@ mod lifecycle_tests {
         let _ = std::fs::remove_dir_all(&vault);
     }
 
-    /// The AUTHORED-NOTE (documents) side of accept: the stamp lands in the note's exported
-    /// `.md` and the baseline refresh rides `documents.exported_hash` with the SAME conditional
-    /// anti-laundering rule as the meeting side.
+    /// LIVE BUG (2026-07-16): accept on a NEVER-exported Brain note (documents kind='note',
+    /// created in-app — no vault `.md`) must succeed by writing through the note's CANONICAL
+    /// store, and — with a vault configured — the re-export MATERIALIZES the `.md` with the
+    /// appended content + a fresh baseline. Today it fails `InvalidArg: no exported vault file`.
     #[test]
-    fn audit_accept_on_note_source_uses_doc_baseline_conditionally() {
-        let vault = tmp_vault("audit-doc");
-        let state = build_state_with_vault("audit-doc", &vault);
+    fn audit_accept_on_never_exported_note_stamps_canonical_text() {
+        let vault = tmp_vault("audit-noexport");
+        let state = build_state_with_vault("audit-noexport", &vault);
+        make_open_folder(&state.db, "fn1", "Notes");
+        state
+            .db
+            .insert_document("n1", "fn1", "My Brain Note", "# My Brain Note\nbody\n", "note", 1)
+            .unwrap();
+        // A resolvable suggestion target for the orphan accept's anti-hallucination re-check.
+        db_insert_titled_meeting(&state.db, "m-t", "Weekly Planning Sync");
+
+        // Orphan accept (suggestions live in the evidence as [[links]]).
+        let id = stage_audit_finding(
+            &state,
+            "orphan",
+            "note",
+            "n1",
+            None,
+            "This note has no wikilinks in or out.\n\nSuggested connections: [[Weekly Planning Sync]]",
+            "Append suggested [[links]] under ## Audit",
+            "orphan|n1|",
+        );
+        let resolved = resolve_audit_finding_inner(&state, &id, "accept").unwrap();
+        assert_eq!(resolved.status, "accepted");
+        assert!(resolved.evidence_md.is_empty(), "accept blanks the evidence");
+
+        // The CANONICAL text carries the managed section + the resolving link.
+        let row = state.db.get_note_row("n1").unwrap().unwrap();
+        assert!(row.text.contains("## Audit"), "managed section in DB text: {}", row.text);
+        assert!(
+            row.text.contains("- Suggested links: [[Weekly Planning Sync]]"),
+            "suggested link in DB text: {}",
+            row.text
+        );
+        // The vault file MATERIALIZED (export healed the never-exported note).
+        let path = row.exported_path.expect("re-export set exported_path");
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(on_disk, row.text, "the exported file mirrors the canonical text");
+        assert_eq!(
+            state.db.get_note_doc_exported_hash("n1").unwrap(),
+            Some(crate::export::note_content_hash(&row.text)),
+            "fresh baseline stamped by the re-export"
+        );
+        let _ = std::fs::remove_dir_all(&vault);
+    }
+
+    /// Same live bug, unlinked_mention shape: the target re-resolves and the suggested-link line
+    /// lands in the CANONICAL text; a second accept of a re-staged twin is an idempotent no-op
+    /// (the marker lives in the DB text now).
+    #[test]
+    fn audit_unlinked_mention_accept_on_note_is_canonical_and_idempotent() {
+        let vault = tmp_vault("audit-noexport-mention");
+        let state = build_state_with_vault("audit-noexport-mention", &vault);
+        make_open_folder(&state.db, "fn1", "Notes");
+        state
+            .db
+            .insert_document("n1", "fn1", "My Brain Note", "# mentions Weekly Planning Sync\n", "note", 1)
+            .unwrap();
+        db_insert_titled_meeting(&state.db, "m-t", "Weekly Planning Sync");
+
+        let stage = |key: &str| {
+            stage_audit_finding(
+                &state,
+                "unlinked_mention",
+                "note",
+                "n1",
+                Some("Weekly Planning Sync"),
+                "> mentions Weekly Planning Sync\n\nSuggested link: [[Weekly Planning Sync]]",
+                "Append the suggested [[link]] under ## Audit",
+                key,
+            )
+        };
+        let id = stage("unlinked_mention|n1|wps");
+        resolve_audit_finding_inner(&state, &id, "accept").unwrap();
+        let text_after = state.db.get_note_row("n1").unwrap().unwrap().text;
+        assert!(
+            text_after.contains("- Suggested link: [[Weekly Planning Sync]]"),
+            "link line in DB text: {text_after}"
+        );
+
+        // Idempotence: an accepted twin recurs (dedupe allows it); accepting it again changes
+        // NOTHING (the marker is the line already present in the canonical text).
+        let id2 = stage("unlinked_mention|n1|wps");
+        resolve_audit_finding_inner(&state, &id2, "accept").unwrap();
+        assert_eq!(
+            state.db.get_note_row("n1").unwrap().unwrap().text,
+            text_after,
+            "double-accept never double-stamps the canonical text"
+        );
+        let _ = std::fs::remove_dir_all(&vault);
+    }
+
+    /// A sealed-and-not-session-unlocked note refuses accept with `Locked` and the row stays
+    /// pending (unchanged posture — now enforced by the gated canonical read).
+    #[test]
+    fn audit_accept_on_sealed_note_refuses_locked() {
+        let state = build_state("audit-note-sealed");
+        make_open_folder(&state.db, "fn1", "Secret");
+        state
+            .db
+            .insert_document("n1", "fn1", "Sealed Note", "# sealed body\n", "note", 1)
+            .unwrap();
+        let id = stage_audit_finding(
+            &state,
+            "orphan",
+            "note",
+            "n1",
+            None,
+            "Suggested connections: [[Whatever Note]]",
+            "Append suggested [[links]] under ## Audit",
+            "orphan|n1|sealed",
+        );
+        state.db.set_folder_locked("fn1", true, None).unwrap();
+        assert!(matches!(
+            resolve_audit_finding_inner(&state, &id, "accept"),
+            Err(AppError::Locked(_))
+        ));
+        assert_eq!(
+            state.db.get_audit_finding(&id).unwrap().unwrap().status,
+            "pending",
+            "a refused accept leaves the row pending"
+        );
+    }
+
+    /// Guard interplay on an EXPORTED note with an EXTERNAL file edit: the accept stamps the
+    /// CANONICAL text and re-exports; `write_note` NEVER clobbers different bytes, so the
+    /// externally-edited file survives byte-identical (the re-export lands on a fresh sibling
+    /// path) — no external data is ever lost.
+    #[test]
+    fn audit_accept_on_externally_edited_exported_note_never_clobbers() {
+        let vault = tmp_vault("audit-note-extedit");
+        let state = build_state_with_vault("audit-note-extedit", &vault);
         make_open_folder(&state.db, "fn1", "Notes");
         state
             .db
             .insert_document("n1", "fn1", "My Note", "# My Note\n", "note", 1)
             .unwrap();
+        db_insert_titled_meeting(&state.db, "m-t", "Weekly Planning Sync");
+        // Simulate a completed export: file + path + baseline.
         let md = vault.join("My Note.md");
         std::fs::write(&md, "# My Note\n").unwrap();
         state
@@ -25358,53 +25495,43 @@ mod lifecycle_tests {
             .unwrap();
         state
             .db
-            .set_note_doc_exported_hash(
-                "n1",
-                Some(&crate::export::note_content_hash("# My Note\n")),
-            )
+            .set_note_doc_exported_hash("n1", Some(&crate::export::note_content_hash("# My Note\n")))
             .unwrap();
+        // The user edits the exported file behind Murmur's back.
+        std::fs::write(&md, "# My Note\nMY EXTERNAL NOTE\n").unwrap();
 
-        // Clean accept → append + baseline re-stamped from the appended content.
         let id = stage_audit_finding(
             &state,
-            "broken_link",
+            "unlinked_mention",
             "note",
             "n1",
-            Some("Ghost"),
-            "> [[Ghost]]",
-            "Append a [!broken-link] note under ## Audit",
-            "broken_link|n1|Ghost",
+            Some("Weekly Planning Sync"),
+            "> mention\n\nSuggested link: [[Weekly Planning Sync]]",
+            "Append the suggested [[link]] under ## Audit",
+            "unlinked_mention|n1|ext",
         );
         resolve_audit_finding_inner(&state, &id, "accept").unwrap();
-        let after = std::fs::read_to_string(&md).unwrap();
-        assert!(after.contains("[!broken-link]"), "stamp appended: {after}");
-        assert_eq!(
-            state.db.get_note_doc_exported_hash("n1").unwrap(),
-            Some(crate::export::note_content_hash(&after)),
-            "clean-case doc baseline re-stamped"
-        );
 
-        // External edit BEFORE the next accept → the append lands in place but the baseline
-        // stays at Murmur's last write (not laundered).
-        std::fs::write(&md, format!("{after}EXTERNAL EDIT LINE\n")).unwrap();
-        let id2 = stage_audit_finding(
-            &state,
-            "broken_link",
-            "note",
-            "n1",
-            Some("Ghost Two"),
-            "> [[Ghost Two]]",
-            "Append a [!broken-link] note under ## Audit",
-            "broken_link|n1|Ghost Two",
+        // Canonical text stamped…
+        let row = state.db.get_note_row("n1").unwrap().unwrap();
+        assert!(row.text.contains("[[Weekly Planning Sync]]"), "stamp in DB text");
+        // …the externally-edited file is UNTOUCHED byte-identical…
+        assert_eq!(
+            std::fs::read_to_string(&md).unwrap(),
+            "# My Note\nMY EXTERNAL NOTE\n",
+            "the external edit is never clobbered"
         );
-        resolve_audit_finding_inner(&state, &id2, "accept").unwrap();
-        let after2 = std::fs::read_to_string(&md).unwrap();
-        assert!(after2.contains("EXTERNAL EDIT LINE"), "edit preserved in place");
-        assert!(after2.contains("Ghost Two"), "second stamp appended");
+        // …and the re-export landed the stamped content on a fresh path with a fresh baseline.
+        let new_path = row.exported_path.expect("re-export recorded a path");
+        assert_ne!(
+            std::path::Path::new(&new_path).canonicalize().ok(),
+            md.canonicalize().ok(),
+            "the re-export did not reuse the externally-edited file"
+        );
+        assert_eq!(std::fs::read_to_string(&new_path).unwrap(), row.text);
         assert_eq!(
             state.db.get_note_doc_exported_hash("n1").unwrap(),
-            Some(crate::export::note_content_hash(&after)),
-            "doc baseline NOT laundered over the externally-edited file"
+            Some(crate::export::note_content_hash(&row.text))
         );
         let _ = std::fs::remove_dir_all(&vault);
     }
