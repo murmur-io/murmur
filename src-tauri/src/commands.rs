@@ -24766,6 +24766,163 @@ mod lifecycle_tests {
         );
     }
 
+    /// RED-before-GREEN for the "blank shared card" bug: a meeting with NO generated note at all
+    /// (`get_latest_note_for_meeting` returns `None`) already refuses via `InvalidArg("no note for
+    /// meeting …")` — this asserts that pre-existing behavior stays intact and is NOT an empty-envelope
+    /// publish. Unlocked + unfoldered so only `build_org_share_body`'s note lookup is exercised.
+    #[test]
+    fn build_org_share_body_refuses_a_meeting_with_no_note_at_all() {
+        let state = build_state("org-share-no-note");
+        state
+            .db
+            .insert_meeting(&Meeting {
+                id: "m-nonote".to_string(),
+                started_at: "2026-07-15T09:00:00Z".to_string(),
+                ended_at: None,
+                title: Some("Untitled sync".to_string()),
+                duration_s: 300,
+                audio_path: None,
+                status: MeetingStatus::Transcribed,
+                folder_id: None,
+            })
+            .unwrap();
+        let err = build_org_share_body(&state, Some("m-nonote"), None, true).unwrap_err();
+        assert!(
+            matches!(err, AppError::InvalidArg(_)),
+            "a meeting with no generated note must refuse, got: {err:?}"
+        );
+    }
+
+    /// RED-before-GREEN (the CONFIRMED root cause): a meeting whose generated note is
+    /// FRONTMATTER-ONLY cleans down to `""` via `clean_note_body` (see
+    /// `share::envelope::frontmatter_only_document_yields_empty_body`). Pre-fix, `build_org_share_body`
+    /// would happily return that empty string and the caller would go on to seal + publish an envelope
+    /// with full header metadata (title/created_at) but a blank content area — a silent, confusing
+    /// share. Post-fix it MUST refuse loudly instead, with a MEETING-worded message (not "note").
+    #[test]
+    fn build_org_share_body_refuses_a_frontmatter_only_meeting_note() {
+        let state = build_state("org-share-empty-meeting-note");
+        make_open_folder(&state.db, "f-empty", "Empty");
+        state
+            .db
+            .insert_meeting(&Meeting {
+                id: "m-empty".to_string(),
+                started_at: "2026-07-15T09:00:00Z".to_string(),
+                ended_at: None,
+                title: Some("Standup".to_string()),
+                duration_s: 300,
+                audio_path: None,
+                status: MeetingStatus::Summarized,
+                folder_id: Some("f-empty".to_string()),
+            })
+            .unwrap();
+        state
+            .db
+            .upsert_note(&NoteRecord {
+                meeting_id: "m-empty".to_string(),
+                provider_id: "claude_code".to_string(),
+                // Frontmatter-only: `strip_frontmatter` correctly reduces this to "".
+                markdown: "---\nattendees:\n  - Bob\n---\n".to_string(),
+                created_at: "2026-07-15T09:10:00Z".to_string(),
+                exported_path: None,
+                model_requested: None,
+                model_served: None,
+                gateway_host: None,
+            })
+            .unwrap();
+        state.db.set_note_folder("m-empty", Some("f-empty")).unwrap();
+        // Folder is NOT locked, so only the empty-body refusal is under test (not the read-gate).
+
+        let err = build_org_share_body(&state, Some("m-empty"), None, true).unwrap_err();
+        assert!(
+            matches!(err, AppError::InvalidArg(_)),
+            "a frontmatter-only meeting note must refuse rather than publish empty, got: {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("meeting"),
+            "the meeting-share refusal must be worded for a meeting: {msg:?}"
+        );
+
+        // Same fixture through the real command-layer entry point (`preview_org_share_inner`), which
+        // is what the FE calls first — confirms the refusal propagates all the way up, not just at the
+        // private helper.
+        let preview_err =
+            preview_org_share_inner(&state, Some("m-empty".to_string()), None, true).unwrap_err();
+        assert!(matches!(preview_err, AppError::InvalidArg(_)));
+    }
+
+    /// The note (document) twin: an authored note whose text is frontmatter-only must ALSO refuse, with
+    /// a NOTE-worded message (not "meeting") — `build_org_share_body` shares the empty-check for both
+    /// branches, so the wording must stay branch-correct.
+    #[test]
+    fn build_org_share_body_refuses_a_frontmatter_only_note() {
+        let state = build_state("org-share-empty-note");
+        state
+            .db
+            .insert_folder(&Folder {
+                id: "f-note-empty".to_string(),
+                name: "Notes".to_string(),
+                path: "Notes".to_string(),
+                parent_id: None,
+                locked: false,
+                created_at: "2026-07-15T08:00:00Z".to_string(),
+            })
+            .unwrap();
+        state
+            .db
+            .insert_note(
+                "n-empty",
+                "f-note-empty",
+                "empty",
+                "Empty",
+                "---\naliases:\n  - x\n---\n",
+                1,
+            )
+            .unwrap();
+
+        let err = build_org_share_body(&state, None, Some("n-empty"), true).unwrap_err();
+        assert!(
+            matches!(err, AppError::InvalidArg(_)),
+            "a frontmatter-only note must refuse rather than publish empty, got: {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("note") && !msg.contains("meeting"),
+            "the note-share refusal must be worded for a note, not a meeting: {msg:?}"
+        );
+    }
+
+    /// The happy path must be UNCHANGED by the empty-body refusal: a meeting with a real generated note
+    /// (non-empty after clean) still shares successfully — `share_to_org_inner` runs to the (expected,
+    /// pre-existing) consent-gate failure, never the new `InvalidArg`, proving the refusal only fires on
+    /// a genuinely empty body.
+    #[test]
+    fn share_to_org_inner_happy_path_unaffected_by_empty_body_guard() {
+        let state = build_state("org-share-happy-unaffected");
+        seed_locked_meeting_with_note(&state, "f-happy", "m-happy");
+        seed_org(&state.db, "org-1", "Acme", "owner", 1);
+        state
+            .unlocked_folders
+            .lock()
+            .unwrap()
+            .insert("f-happy".to_string());
+        let err = block_on(share_to_org_inner(
+            &state,
+            "org-1",
+            Some("m-happy".to_string()),
+            None,
+            true,
+        ))
+        .unwrap_err();
+        // Past the (now-passing) read-gate AND the (now-passing) empty-body guard, the next real gate is
+        // org-egress consent (no consent granted in this fixture) — NOT InvalidArg.
+        assert!(
+            matches!(err, AppError::Unavailable(_)),
+            "a real, non-empty note must sail past the empty-body guard to the consent gate, got: {err:?}"
+        );
+    }
+
     /// `preview_org_share` never egresses AND still enforces the read-gate: a sealed meeting refuses.
     /// Once unlocked, the preview returns the CLEANED + SCRUBBED body (frontmatter gone, the phone
     /// number masked, the scrub count = 1 phone) — and the preview requires NO login/consent.
@@ -25341,6 +25498,47 @@ mod lifecycle_tests {
             matches!(err, AppError::Unavailable(_)),
             "expected an Unavailable (consent) refusal, got {err:?}"
         );
+    }
+
+    /// SIBLING-GAP FIX (2026-07-16): `org_update_own_item_inner` is a SEPARATE org-publish path from
+    /// `build_org_share_body` (edit-in-place on an already-shared item, never routing through the
+    /// share/republish seam) — it needs its OWN copy of the "refuse an empty publish" guard, or an
+    /// author could reproduce the identical "blank card" bug (found first via `build_org_share_body`,
+    /// PR #342) by editing their own item's body down to nothing. RED against the pre-fix code (which
+    /// had no emptiness check on this path at all): editing to whitespace-only content would have
+    /// sailed through to `client.org_publish_item(...)` and published a real, live, empty-bodied item.
+    #[test]
+    fn org_update_own_item_refuses_an_empty_edit() {
+        let state = build_state("org-edit-empty");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        state
+            .db
+            .upsert_org_item("item-mine", "org-1", 1, "me", "Mine", "# body", "2026-07-11T09:00:00Z", 1, 1, &[9u8; 32], Some("document"), None, None)
+            .unwrap();
+        state.db.set_org_item_author("item-mine", "me-user-id").unwrap();
+        state.config.lock().unwrap().org_egress_consented = true;
+        *state.account_session.lock().unwrap() = Some(crate::share::AccountSession {
+            account_id: "me@example.com".into(),
+            email: "me@example.com".into(),
+            server_user_id: Some("me-user-id".into()),
+            device_id: "dev-1".into(),
+            mk: Zeroizing::new([7u8; 32]),
+            generation: 1,
+            access_token: "a".into(),
+            access_expires_at: Some("2099-01-01T00:00:00Z".into()),
+            refresh_token: "r".into(),
+        });
+
+        // Whitespace-only body — cleans down to "" the same way a frontmatter-only note does.
+        let err = block_on(org_update_own_item_inner(&state, "item-mine", "Mine", "   \n\n  "))
+            .expect_err("editing an org item's body down to nothing must be refused");
+        assert!(
+            matches!(err, AppError::InvalidArg(_)),
+            "expected InvalidArg for an empty edit, got {err:?}"
+        );
+        // The item's stored body is untouched — no empty republish reached the network/local upsert.
+        let detail = state.db.get_org_item("item-mine").unwrap().unwrap();
+        assert_eq!(detail.markdown, "# body");
     }
 
     /// A missing / tombstoned item id is an `InvalidArg`, resolved BEFORE any session or network work.
@@ -29007,6 +29205,20 @@ fn build_org_share_body(
     } else {
         (cleaned, OrgScrubCounts::default())
     };
+    // (5) REFUSE AN EMPTY SHARE — root-cause fix for the "blank card" bug: a meeting with no
+    // generated note yet, or a note that is frontmatter-only, cleans down to "" (see
+    // `strip_frontmatter`'s `frontmatter_only_document_yields_empty_body`). Publishing that anyway
+    // produces an envelope with full header metadata (title/created_at/rev) but zero content — a
+    // silent, confusing blank share for the recipient. Refuse loudly instead of ever
+    // sealing/publishing an empty body; do NOT fall back to the transcript (a distinct, separate
+    // feature decision, not this fix's scope).
+    if final_md.trim().is_empty() {
+        return Err(AppError::InvalidArg(if meeting_id.is_some() {
+            "this meeting doesn't have a generated note yet — generate one before sharing".into()
+        } else {
+            "this note has no content to share — add some content before sharing".into()
+        }));
+    }
     Ok((title, final_md, created_at, counts, kind))
 }
 
@@ -30785,6 +30997,18 @@ pub(crate) async fn org_update_own_item_inner(
     // paths apply (scrub ON: fail-safe toward LESS egress; an edit must never DOWNGRADE scrubbing).
     let cleaned = crate::share::envelope::clean_note_body(markdown);
     let (final_md, _counts) = scrub_org_markdown(&cleaned);
+
+    // (4b) REFUSE AN EMPTY EDIT — sibling of `build_org_share_body`'s "refuse an empty share"
+    // guard (2026-07-16): this is a SEPARATE org-publish path (edit-in-place on an already-shared
+    // item, reached straight from the FE's `orgUpdateOwnItem`, never routing through
+    // `build_org_share_body`), so it needs its own copy of the same refusal or an author could
+    // reproduce the identical "blank card" bug by editing their own item down to nothing. Refuse
+    // loudly instead of ever sealing/publishing an empty body.
+    if final_md.trim().is_empty() {
+        return Err(AppError::InvalidArg(
+            "this note has no content to share — add some content before saving".into(),
+        ));
+    }
 
     // Resolve the org (membership-checked) + a live session; seal at the org's CURRENT generation.
     let org = resolve_org(state, &ctx.org_id)?;
