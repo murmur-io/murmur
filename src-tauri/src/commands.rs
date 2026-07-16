@@ -14405,6 +14405,20 @@ fn reexport_notes_in_folder(state: &AppState, folder_id: &str) {
 /// remove the decrypted session WAV, re-pointing audio_path back at the `.enc`. The `*_blob`
 /// columns + the `.enc` stay (the folder is still `locked=1`). Idempotent.
 fn reblank_folder_extras(state: &AppState, folder_id: &str) -> Result<(), AppError> {
+    // SEAL-NET KEY (2026-07-16 lock review of #356): resolve the folder CK from the SESSION-CACHED
+    // KEK only — never a keychain/biometric prompt (this runs on relock / app-close / screen-share).
+    // `relock_all_inner` zeroizes the KEK BEFORE its sweep by design (screen-share posture), so the
+    // net is live on the `relock_folder` path and absent on relock-all — there, non-rederivable
+    // rows are left in place and warned about instead (a bounded residue beats destroying content).
+    let seal_ck: Option<Zeroizing<[u8; 32]>> = (|| {
+        let kek = state.master_kek.lock().ok()?.clone()?;
+        let wrapped = state.db.folder_wrapped_key(folder_id).ok().flatten()?;
+        let bytes = Zeroizing::new(
+            crate::crypto::decrypt(&kek, &wrapped, &aad_wrapped_ck(folder_id)).ok()?,
+        );
+        let arr: [u8; 32] = bytes.as_slice().try_into().ok()?;
+        Some(Zeroizing::new(arr))
+    })();
     for mid in state.db.meeting_ids_in_folder(folder_id)? {
         for s in state.db.raw_segments(&mid)? {
             if s.text_blob.is_some() && !s.text.is_empty() {
@@ -14433,15 +14447,54 @@ fn reblank_folder_extras(state: &AppState, folder_id: &str) -> Result<(), AppErr
         if let Some(enc) = reblank_audio(sys)? {
             state.db.set_meeting_sys_master_path(&mid, Some(&enc))?;
         }
-        // FAIL-CLOSED sweep (2026-07-16 review): segments carrying PLAINTEXT with NO sealed blob —
-        // the crash window of a salvage/live pipeline killed before its seal step — are invisible
-        // to the blob-guarded re-blanks above and would sit plaintext-at-rest behind the lock
-        // forever. They are DERIVED data and their source audio survives sealed (re-blanked just
-        // above), so the relock deletes them; unlock + retry re-derives the transcript. This makes
-        // the invariant universal: after a relock, NO plaintext segment row exists in the folder.
-        let purged = state.db.delete_unsealed_segments(&mid)?;
-        if purged > 0 {
-            tracing::warn!(target: "lock", meeting_id = %mid, purged, "relock purged unsealed plaintext segments left by an interrupted pipeline (audio stays sealed; unlock + retry to re-transcribe)");
+        // FAIL-CLOSED sweep (2026-07-16 reviews: #352 adversarial MEDIUM, then the #356 lock-review
+        // FAIL that scoped it): segment rows carrying PLAINTEXT with NO sealed blob — a
+        // pipeline/move killed before its seal step — are invisible to the blob-guarded re-blanks
+        // above. Decided per meeting, on PROOF, never on the comment's say-so:
+        //   1. provably RE-DERIVABLE (status Error/Recording — exactly the states the retry gate
+        //      accepts — AND this meeting's audio survives on disk, plaintext or `.enc`): DELETE.
+        //      Unlock + retry re-transcribes; nothing unrecoverable is destroyed.
+        //   2. otherwise, with the folder CK resolvable from the session KEK: SEAL them in place
+        //      (verify-before-blank via `seal_meeting_extras`, which also covers the same crash's
+        //      unsealed timeline/manual-notes/audio) — e.g. a kill mid-`move_note` leaves a
+        //      COMPLETED meeting's transcript unsealed; deleting it would destroy the only copy.
+        //   3. neither: LEAVE + WARN. A bounded plaintext residue behind the SQLCipher layer is
+        //      strictly better than loss — content is NEVER deleted without a provable copy.
+        let has_unsealed = state
+            .db
+            .raw_segments(&mid)?
+            .iter()
+            .any(|s| s.text_blob.is_none());
+        if has_unsealed {
+            let rederivable = state.db.get_meeting(&mid)?.is_some_and(|m| {
+                matches!(
+                    m.status,
+                    MeetingStatus::Recording | MeetingStatus::Error
+                ) && m.audio_path.as_deref().is_some_and(|p| {
+                    let plain = p.strip_suffix(ENC_SUFFIX).unwrap_or(p);
+                    std::path::Path::new(plain).exists()
+                        || std::path::Path::new(&format!("{plain}{ENC_SUFFIX}")).exists()
+                })
+            });
+            if rederivable {
+                let purged = state.db.delete_unsealed_segments(&mid)?;
+                if purged > 0 {
+                    tracing::warn!(target: "lock", meeting_id = %mid, purged, "relock purged unsealed plaintext segments left by an interrupted pipeline (audio survives on disk; unlock + retry to re-transcribe)");
+                }
+            } else if let Some(ck) = seal_ck.as_ref() {
+                // Best-effort by design: a seal failure must not abort the relock (that would
+                // leave MORE plaintext) — the rows stay, warned about, recoverable via unlock.
+                match seal_meeting_extras(state, folder_id, &mid, ck) {
+                    Ok(()) => {
+                        tracing::warn!(target: "lock", meeting_id = %mid, "relock sealed crash-window plaintext (interrupted move/seal) in place under the folder CK");
+                    }
+                    Err(e) => {
+                        tracing::warn!(target: "lock", meeting_id = %mid, error = %e, "relock could not seal crash-window plaintext segments — left in place (never deleted without a provable copy)");
+                    }
+                }
+            } else {
+                tracing::warn!(target: "lock", meeting_id = %mid, "relock found unsealed plaintext segments that are not provably re-derivable and no session KEK is cached — left in place (unlock the folder to seal or retry)");
+            }
         }
     }
     // Document ingestion: re-blank the plaintext text of every sealed document ONLY WHERE its
@@ -23967,14 +24020,34 @@ mod lifecycle_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// LOCK MODEL (2026-07-16 review, MEDIUM): a RELOCK must purge blob-less plaintext segments —
-    /// the crash window where a salvage/live pipeline died between its segment insert and its
-    /// seal/finalize step. The blob-guarded re-blank can never cover those rows; before this fix
-    /// they sat plaintext-at-rest behind the lock through every later relock.
+    /// LOCK MODEL (2026-07-16 reviews): a RELOCK purges blob-less plaintext segments ONLY when
+    /// re-derivation is PROVEN — status Error/Recording (the retry gate's accepted states) AND the
+    /// meeting's audio surviving on disk. This is the #352 crash window (pipeline died between
+    /// segment insert and seal); before the fix those rows sat plaintext-at-rest behind the lock.
     #[test]
     fn relock_reblank_purges_unsealed_plaintext_segments() {
         let state = build_state("relock-unsealed-purge");
+        let dir =
+            std::env::temp_dir().join(format!("murmur-relock-purge-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let wav = dir.join("m-crashed.wav");
+        std::fs::write(&wav, b"RIFF-archived-audio").unwrap();
+
         seed_meeting(&state.db, "m-crashed", "# crashed salvage", None);
+        state
+            .db
+            .finalize_meeting(
+                "m-crashed",
+                "2026-07-16T10:00:00Z",
+                60,
+                &wav.to_string_lossy(),
+            )
+            .unwrap();
+        state
+            .db
+            .update_meeting_status("m-crashed", MeetingStatus::Error)
+            .unwrap();
         state
             .db
             .insert_folder(&Folder {
@@ -23999,7 +24072,80 @@ mod lifecycle_tests {
 
         assert!(
             state.db.raw_segments("m-crashed").unwrap().is_empty(),
-            "the relock re-blank purges blob-less plaintext rows — nothing plaintext survives a relock"
+            "provably re-derivable blob-less rows (Error status + on-disk audio) are purged"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// LOCK MODEL (2026-07-16 lock-review FAIL on the first #356 cut): the relock purge must
+    /// NEVER destroy the only copy. A COMPLETED (Summarized) meeting whose blob-less plaintext
+    /// landed in a locked folder (kill mid-`move_note`: folder set before the seal) with NO audio
+    /// on disk and NO session KEK is neither retryable nor sealable — the rows must SURVIVE.
+    #[test]
+    fn relock_reblank_never_deletes_the_only_copy_without_proof() {
+        let state = build_state("relock-noloss");
+        seed_meeting(&state.db, "m-only", "# completed meeting", None);
+        state
+            .db
+            .update_meeting_status("m-only", MeetingStatus::Summarized)
+            .unwrap();
+        state
+            .db
+            .insert_folder(&Folder {
+                id: "f-only".into(),
+                name: "Only".into(),
+                path: "Only".into(),
+                parent_id: None,
+                locked: true,
+                created_at: "2026-07-16T00:00:00Z".into(),
+            })
+            .unwrap();
+        state
+            .db
+            .set_meeting_folder("m-only", Some("f-only"))
+            .unwrap();
+
+        reblank_folder_extras(&state, "f-only").unwrap();
+
+        let segs = state.db.raw_segments("m-only").unwrap();
+        assert!(
+            !segs.is_empty() && segs.iter().any(|s| !s.text.is_empty()),
+            "non-rederivable blob-less plaintext is LEFT IN PLACE (a bounded residue beats loss)"
+        );
+    }
+
+    /// LOCK MODEL (2026-07-16 lock-review fix direction): with the session KEK cached (the
+    /// `relock_folder` path), non-rederivable crash-window plaintext is SEALED in place under the
+    /// folder CK (verify-before-blank) instead of deleted or left plaintext.
+    #[test]
+    fn relock_reblank_seals_non_rederivable_plaintext_when_kek_is_cached() {
+        let state = build_state("relock-sealnet");
+        make_open_folder(&state.db, "f-net", "Net");
+        seed_meeting(&state.db, "m-prior", "# already sealed", Some("f-net"));
+        lock_folder_inner(&state, "f-net".to_string()).unwrap(); // real lock: CK minted + wrapped
+
+        // The mid-move crash shape: a COMPLETED meeting's blob-less plaintext segments appear in
+        // the locked folder (move_note set the folder, died before seal_moved_note).
+        seed_meeting(&state.db, "m-moved", "# moved note", None);
+        state
+            .db
+            .update_meeting_status("m-moved", MeetingStatus::Summarized)
+            .unwrap();
+        state
+            .db
+            .set_meeting_folder("m-moved", Some("f-net"))
+            .unwrap();
+        // Session KEK cached (as after any interactive lock/unlock this session).
+        let kek = secrets::get_or_create_master_kek().unwrap();
+        *state.master_kek.lock().unwrap() = Some(Zeroizing::new(kek));
+
+        reblank_folder_extras(&state, "f-net").unwrap();
+
+        let segs = state.db.raw_segments("m-moved").unwrap();
+        assert!(!segs.is_empty(), "rows survive — sealed, never deleted");
+        assert!(
+            segs.iter().all(|s| s.text_blob.is_some() && s.text.is_empty()),
+            "crash-window rows are sealed in place under the folder CK (blob set, plaintext blanked)"
         );
     }
 
