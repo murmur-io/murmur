@@ -11,6 +11,7 @@ import type {
   AuditFinding,
   AuditFindingKind,
   AuditRunSummary,
+  AuditSchedule,
 } from "../../core/models";
 
 /** Stable render order for the grouped inbox — most consequential kinds first. */
@@ -63,6 +64,13 @@ export class AuditStore {
   private readonly _error = signal<string | null>(null);
   readonly error = this._error.asReadonly();
 
+  /**
+   * The weekly-schedule state — read by the inbox chip AND the Settings
+   * toggle row. Null until the first {@link loadSchedule} resolves.
+   */
+  private readonly _schedule = signal<AuditSchedule | null>(null);
+  readonly schedule = this._schedule.asReadonly();
+
   readonly pendingCount = computed(
     () => this._findings().filter((f) => f.status === "pending").length,
   );
@@ -83,17 +91,23 @@ export class AuditStore {
   init(): void {
     if (this.initialized) {
       void this.load();
+      void this.loadSchedule();
       return;
     }
     this.initialized = true;
     void this.ipc
-      .onAuditUpdated(() => void this.load())
+      .onAuditUpdated(() => {
+        void this.load();
+        // Scheduled runs emit the same event — keep "last run" fresh too.
+        void this.loadSchedule();
+      })
       .then((un) => (this.unlisten = un));
     this.destroyRef.onDestroy(() => {
       this.unlisten?.();
       this.unlisten = null;
     });
     void this.load();
+    void this.loadSchedule();
   }
 
   /** Reload the pending findings. Cached rows stay visible while in flight. */
@@ -123,6 +137,31 @@ export class AuditStore {
     } finally {
       this._running.set(false);
     }
+  }
+
+  /**
+   * Reload the weekly-schedule state. A failure leaves the signal as-is — the
+   * chip / toggle simply don't render fresher state, the inbox stays usable.
+   */
+  async loadSchedule(): Promise<void> {
+    try {
+      const s = await this.ipc.getAuditSchedule();
+      this._schedule.set(s);
+    } catch {
+      // Decorative state — never let it error the inbox.
+    }
+  }
+
+  /**
+   * Turn the weekly audit on/off — confirm-then-update, never optimistic:
+   * the signal only takes the CONFIRMED schedule from the response; on
+   * rejection it keeps the previous state and the error propagates so the
+   * caller can toast + revert its visual.
+   */
+  async setSchedule(enabled: boolean): Promise<AuditSchedule> {
+    const s = await this.ipc.setAuditSchedule(enabled);
+    this._schedule.set(s);
+    return s;
   }
 
   /**
