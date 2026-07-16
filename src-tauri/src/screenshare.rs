@@ -193,6 +193,10 @@ fn on_capture_started(app: &AppHandle) {
             "failed to emit screen-share-started event"
         );
     }
+    // The auto-relock purged ALL pending audit findings — ping the FE inbox too (count-only,
+    // same posture as the share-started emit above; best-effort).
+    let pending = state.db.count_pending_audit_findings().unwrap_or(0);
+    crate::events::emit_audit_updated(app, pending as u32);
 }
 
 /// Pure heuristic decision: does an on-screen window (owner + title) look like a LIVE screen-share
