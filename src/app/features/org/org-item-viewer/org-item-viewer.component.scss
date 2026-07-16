@@ -90,6 +90,16 @@
   gap: var(--space-2);
   flex: none;
 }
+/* Remove-from-org (author only) — a quieter ghost affordance next to Edit; the
+   confirm step itself uses the global .btn-danger primitive. */
+.oi-remove-btn {
+  color: var(--danger);
+}
+.oi-remove-confirm {
+  color: var(--text-secondary);
+  font-size: 0.85rem;
+  white-space: nowrap;
+}
 
 /* --- Edit-in-place (author only) ----------------------------------------- */
 .oi-title-input {

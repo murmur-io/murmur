@@ -5173,6 +5173,19 @@ impl Db {
     /// bumped `rev` (an update-share) overwrites the markdown + re-indexes. `content_sha256` is the
     /// PLAINTEXT hash (the self-share dedup key). `embedder` is the member's OWN active embedder —
     /// `None`/StubEmbedder ⇒ FTS-only (no int8 vectors written; the sync report flags `ftsOnly`).
+    ///
+    /// `author_user_id` (2026-07-15 root-cause fix, replaces the separate `set_org_item_author`
+    /// follow-up call as the ONLY writer of this column): the server-authoritative author id, when
+    /// the caller already knows it at upsert time — feed-ingest passes the feed entry's own
+    /// `author_user_id`; a share-time/republish-time local-replica upsert passes the CURRENT
+    /// session's own server user id (the caller IS the author in both those paths). `None` when the
+    /// caller genuinely doesn't know it (a light re-upsert, or a legacy call site). The
+    /// `ON CONFLICT` clause uses `COALESCE(excluded.author_user_id, org_items.author_user_id)` so a
+    /// `None` re-upsert can NEVER clobber an already-stamped author back to NULL — only a `Some`
+    /// value ever overwrites a previous value (and only with a fresher one, since every caller here
+    /// passes the authoritative id it has). This makes new/republished rows correct from the moment
+    /// they're born, with zero dependency on the `backfill_null_org_item_authors` self-heal (which
+    /// stays in place as a safety net for rows that predate this fix).
     #[allow(clippy::too_many_arguments)]
     pub fn upsert_org_item(
         &self,
@@ -5187,6 +5200,7 @@ impl Db {
         generation: u32,
         content_sha256: &[u8],
         source_kind: Option<&str>,
+        author_user_id: Option<&str>,
         embedder: Option<&dyn Embedder>,
     ) -> Result<()> {
         // Chunk + embed OUTSIDE the write lock (embedding is CPU/Metal work). The header carries the
@@ -5205,13 +5219,15 @@ impl Db {
         tx.execute(
             "INSERT INTO org_items
                (item_id, org_id, seq, author_hint, title, markdown, created_at, rev, generation,
-                content_sha256, source_kind, tombstoned)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,0)
+                content_sha256, source_kind, author_user_id, tombstoned)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,0)
              ON CONFLICT(item_id) DO UPDATE SET
                org_id=excluded.org_id, seq=excluded.seq, author_hint=excluded.author_hint,
                title=excluded.title, markdown=excluded.markdown, created_at=excluded.created_at,
                rev=excluded.rev, generation=excluded.generation,
-               content_sha256=excluded.content_sha256, source_kind=excluded.source_kind, tombstoned=0",
+               content_sha256=excluded.content_sha256, source_kind=excluded.source_kind,
+               author_user_id=COALESCE(excluded.author_user_id, org_items.author_user_id),
+               tombstoned=0",
             rusqlite::params![
                 item_id,
                 org_id,
@@ -5224,6 +5240,7 @@ impl Db {
                 generation as i64,
                 content_sha256,
                 source_kind,
+                author_user_id,
             ],
         )
         .map_err(map_err)?;
@@ -12015,6 +12032,7 @@ mod tests {
             1,
             &sha,
             None,
+            None,
             Some(&emb),
         )
         .unwrap();
@@ -12065,6 +12083,7 @@ mod tests {
             1,
             &sha32(2),
             None, // source_kind: unclassified in this test
+            None, // author_user_id: unknown in this test
             None, // no embedder → FTS-only
         )
         .unwrap();
@@ -12103,6 +12122,7 @@ mod tests {
             1,
             1,
             &sha32(3),
+            None,
             None,
             Some(&emb),
         )
@@ -12157,18 +12177,18 @@ mod tests {
         let emb = crate::embed::StubEmbedder;
         db.upsert_org_item(
             "it-a", "org-1", 1, "anna", "Roadmap", "the falcon rollout plan alpha", "t", 1, 1,
-            &sha32(6), None, Some(&emb),
+            &sha32(6), None, None, Some(&emb),
         )
         .unwrap();
         db.upsert_org_item(
             "it-b", "org-1", 2, "bob", "Budget", "the falcon rollout budget beta", "t", 1, 1,
-            &sha32(7), None, Some(&emb),
+            &sha32(7), None, None, Some(&emb),
         )
         .unwrap();
         // A DIFFERENT org's item must SURVIVE the scoped purge.
         db.upsert_org_item(
             "it-other", "org-2", 1, "carol", "Other", "unrelated other-org content", "t", 1, 1,
-            &sha32(8), None, Some(&emb),
+            &sha32(8), None, None, Some(&emb),
         )
         .unwrap();
 
@@ -12222,12 +12242,12 @@ mod tests {
         let emb = crate::embed::StubEmbedder;
         db.upsert_org_item(
             "it-r", "org-1", 1, "dan", "V1", "first version body alpha", "t", 1, 1, &sha32(4),
-            None, Some(&emb),
+            None, None, Some(&emb),
         )
         .unwrap();
         db.upsert_org_item(
             "it-r", "org-1", 2, "dan", "V2", "second version body bravo", "t", 2, 1, &sha32(5),
-            None, Some(&emb),
+            None, None, Some(&emb),
         )
         .unwrap();
         // Only the v2 body is chunked (no duplicate/stale chunks).
@@ -12244,6 +12264,94 @@ mod tests {
         assert_eq!(detail.title, "V2");
     }
 
+    /// ROOT-CAUSE FIX REGRESSION (2026-07-15, Bug A): `upsert_org_item`'s `author_user_id` param is
+    /// now written directly in BOTH the INSERT and the `ON CONFLICT` clause, via
+    /// `COALESCE(excluded.author_user_id, org_items.author_user_id)`. RED-before-GREEN against the
+    /// OLD mechanism (a separate `set_org_item_author` follow-up call, never threaded through
+    /// `upsert_org_item` itself): a caller who upserts WITH a known author (e.g. feed-ingest, or a
+    /// share-time local-replica upsert where the caller IS the author) must have that author survive
+    /// a LATER upsert of the SAME item that does NOT know the author (`None` — e.g. a light re-upsert
+    /// from an older call site, or a partial feed page). Pre-fix there was no such param at all, so
+    /// EVERY upsert left `author_user_id` NULL until a separate, easy-to-forget follow-up call — this
+    /// test pins the COALESCE behavior that makes the row correct from birth and un-clobberable.
+    #[test]
+    fn upsert_org_item_author_survives_a_later_upsert_that_passes_none() {
+        let db = mem_db();
+        seed_org_state(&db, "org-1");
+        let emb = crate::embed::StubEmbedder;
+
+        // First upsert KNOWS the author (mirrors feed-ingest / share-time local-replica upsert).
+        db.upsert_org_item(
+            "it-auth",
+            "org-1",
+            1,
+            "anna",
+            "T1",
+            "first body",
+            "2026-07-10T09:00:00Z",
+            1,
+            1,
+            &sha32(41),
+            None,
+            Some("author-uuid-1"),
+            Some(&emb),
+        )
+        .unwrap();
+        let ctx0 = db.org_item_edit_ctx("it-auth").unwrap().unwrap();
+        assert_eq!(ctx0.author_user_id.as_deref(), Some("author-uuid-1"));
+
+        // A LATER re-upsert of the SAME item (e.g. a partial feed page, or a legacy call site) that
+        // does NOT know the author (`None`) must NEVER clobber the already-known author back to NULL.
+        db.upsert_org_item(
+            "it-auth",
+            "org-1",
+            2,
+            "anna",
+            "T2",
+            "second body",
+            "2026-07-10T09:00:00Z",
+            2,
+            1,
+            &sha32(42),
+            None,
+            None,
+            Some(&emb),
+        )
+        .unwrap();
+        let ctx1 = db.org_item_edit_ctx("it-auth").unwrap().unwrap();
+        assert_eq!(
+            ctx1.author_user_id.as_deref(),
+            Some("author-uuid-1"),
+            "a None re-upsert must NOT clobber an already-known author back to NULL"
+        );
+        assert_eq!(ctx1.rev, 2, "the re-upsert DID update rev — only the author is COALESCE-protected");
+
+        // A THIRD upsert that DOES supply a (possibly fresher) author overwrites it normally — the
+        // COALESCE only protects against clobbering with NULL, it never freezes a stale value.
+        db.upsert_org_item(
+            "it-auth",
+            "org-1",
+            3,
+            "anna",
+            "T3",
+            "third body",
+            "2026-07-10T09:00:00Z",
+            3,
+            1,
+            &sha32(43),
+            None,
+            Some("author-uuid-2"),
+            Some(&emb),
+        )
+        .unwrap();
+        let ctx2 = db.org_item_edit_ctx("it-auth").unwrap().unwrap();
+        assert_eq!(
+            ctx2.author_user_id.as_deref(),
+            Some("author-uuid-2"),
+            "a Some(...) re-upsert DOES overwrite the author with the fresher value"
+        );
+    }
+
     /// PER-INSTANCE ORG TOGGLE (RED-before-GREEN, the user's hard mandate: a disabled org's context
     /// must NEVER leak through). Two orgs, BOTH with matching content; org-1 disabled, org-2 stays
     /// enabled. The disabled org's item must be COMPLETELY absent from both retrieval legs — not
@@ -12257,12 +12365,12 @@ mod tests {
         let emb = crate::embed::StubEmbedder;
         db.upsert_org_item(
             "it-disabled", "org-1", 1, "anna", "Disabled org note",
-            "the quantum ledger migration plan", "t", 1, 1, &sha32(11), None, Some(&emb),
+            "the quantum ledger migration plan", "t", 1, 1, &sha32(11), None, None, Some(&emb),
         )
         .unwrap();
         db.upsert_org_item(
             "it-enabled", "org-2", 1, "bob", "Enabled org note",
-            "the quantum ledger migration rollout", "t", 1, 1, &sha32(12), None, Some(&emb),
+            "the quantum ledger migration rollout", "t", 1, 1, &sha32(12), None, None, Some(&emb),
         )
         .unwrap();
 
@@ -12313,12 +12421,12 @@ mod tests {
         let emb = crate::embed::StubEmbedder;
         db.upsert_org_item(
             "it-1", "org-1", 1, "anna", "Kickoff", "roadmap body", "t", 1, 1, &sha32(21), None,
-            Some(&emb),
+            None, Some(&emb),
         )
         .unwrap();
         db.upsert_org_item(
             "it-2", "org-1", 1, "bob", "Follow-up", "roadmap follow-up", "t", 2, 1, &sha32(22),
-            None, Some(&emb),
+            None, None, Some(&emb),
         )
         .unwrap();
 
