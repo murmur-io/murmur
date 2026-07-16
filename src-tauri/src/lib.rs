@@ -421,10 +421,11 @@ pub fn run() {
 
             // Reap any capture helper ORPHANED by a previous session that died without a clean Stop
             // (crash / force-quit / a `tauri dev` hot-rebuild SIGKILLing the app mid-record). Such a
-            // helper reparents to launchd and keeps capturing to a temp WAV for up to 4h — GBs of
-            // dead-session audio the file-age sweep below can't catch (its mtime stays fresh). Run
-            // FIRST so the kill releases the file, THEN reclaim any stale scratch left behind.
-            // Nothing records yet at setup, so any live capture helper is by definition an orphan.
+            // helper keeps capturing to a temp WAV for up to its 4h self-cap — GBs of dead-session
+            // audio the file-age sweep below can't catch (its mtime stays fresh). Run FIRST so the
+            // kill releases the file, THEN reclaim any stale scratch left behind. A helper whose
+            // parent is launchd, dead, or not a Murmur process is reaped; one owned by a LIVE
+            // Murmur process (a genuinely concurrent instance) is spared — see `helper_verdict`.
             // (Salvage above already moved any RECOVERABLE far-side scratch out of the reaper's reach.)
             crate::audio::aec::reap_orphaned_capture_helpers();
             crate::audio::aec::sweep_stale_scratch();
