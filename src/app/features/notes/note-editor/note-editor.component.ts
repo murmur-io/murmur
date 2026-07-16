@@ -20,6 +20,7 @@ import { map } from "rxjs";
 import { IpcService } from "../../../core/ipc.service";
 import { NavHistoryService } from "../../../core/nav-history.service";
 import { tabKeyFor } from "../../../core/tab-keys";
+import { TabRouteReuseStrategy } from "../../../core/tab-route-reuse.strategy";
 import { TabsService } from "../../../core/tabs.service";
 import type {
   AppConfigDto,
@@ -172,6 +173,7 @@ export class NoteEditorComponent {
   private readonly route = inject(ActivatedRoute);
   private readonly router = inject(Router);
   private readonly tabsService = inject(TabsService);
+  private readonly tabRouteReuse = inject(TabRouteReuseStrategy);
   private readonly injector = inject(Injector);
   /** Environment (root) injector — hosts the detach-proof root lock effect. */
   private readonly envInjector = inject(EnvironmentInjector);
@@ -594,19 +596,34 @@ export class NoteEditorComponent {
     void this.loadFolders();
     void this.notes.loadNotes(null);
     void this.loadConfig();
-    // On teardown (route-leave) run the FULL save ONCE if there are unindexed edits —
-    // fire-and-forget so navigation is instant; the backend re-indexes + re-exports in
-    // the background. Nothing is lost either way (cheap autosaves already persisted the
-    // text). No pending edits ⇒ no needless re-embed on open-then-close.
-    this.destroyRef.onDestroy(() => {
-      if (this.dirtyFull) {
-        this.flushFull();
+    // On teardown (route-leave / app-quit — hard close) run the boundary work ONCE —
+    // fire-and-forget so navigation is instant; the backend re-indexes + re-exports (+
+    // auto-titles) in the background. Nothing is lost either way (cheap autosaves already
+    // persisted the text).
+    this.destroyRef.onDestroy(() => void this.runNoteBoundaryWork());
+
+    // Root-cause fix (2026-07-15): the callback above ONLY ever fired on a hard close (✕)
+    // or app quit — `notes/:id` tabs are DETACHED, not destroyed, on a plain tab switch
+    // (`TabRouteReuseStrategy.shouldDetach` returns true for this route), so
+    // `DestroyRef.onDestroy` never runs for the overwhelmingly common "type a note, click
+    // a different tab" flow, and a note's title never auto-generated unless the user
+    // literally closed the tab. `TabRouteReuseStrategy.onDetach` is the one place that
+    // genuinely knows a tab is being backgrounded RIGHT NOW (its `store()`, called by the
+    // router mid-navigation) — subscribe here and run the SAME boundary work at that
+    // earlier moment too. Filtered to THIS note's own tab key (a detach notification with
+    // no filter would run when ANY other note/meeting/org-item tab in the app detaches).
+    // Additive, not a replacement — the `onDestroy` trigger above still covers hard-close
+    // and app-quit, which never route through the router's detach path at all. Running
+    // this work twice for the same note (detach, then later a real destroy) is at worst a
+    // wasted no-op IPC round-trip (see {@link runNoteBoundaryWork}'s doc).
+    const unsubDetach = this.tabRouteReuse.onDetach((key) => {
+      const doc = this.note();
+      if (!doc || key !== tabKeyFor("note", doc.id)) {
+        return;
       }
-      // Auto-title an untitled note on close (Feature B) — fire-and-forget; the backend reads the
-      // last-saved body (cheap autosaves already persisted it), generates a LOCAL title, and keeps it
-      // only if the note is still "Untitled". Best-effort, never blocks teardown.
-      this.maybeAutoTitle();
+      void this.runNoteBoundaryWork();
     });
+    this.destroyRef.onDestroy(unsubDetach);
 
     // LOCK-REACTIVE re-mask — a ROOT effect via the EnvironmentInjector, NOT a
     // view effect: a view effect is FROZEN while `TabRouteReuseStrategy` keeps
@@ -631,10 +648,31 @@ export class NoteEditorComponent {
   }
 
   /**
-   * Feature B — on close, ask the backend to auto-title a still-"Untitled" note from its body (the
-   * on-device model when present, else a first-line heuristic; LOCAL-only). Fire-and-forget: the
-   * editor is being torn down, so we only reflect the new title back onto the (persisting) tab strip
-   * when it resolves. Skips a locked/masked note and an empty body up front (the backend re-checks).
+   * The shared "the user is done with this note for now" boundary work, run from BOTH
+   * triggers in the constructor (hard close/quit, and a plain tab-switch detach): flush
+   * the deferred full save (re-index + export) if there are unindexed edits, then attempt
+   * auto-title. Sequenced (not parallel) so auto-title's `suggestNoteTitle` read — which
+   * reads the last-SAVED body off the backend — sees the full-save's write if one just
+   * happened, not a race between the two.
+   */
+  private async runNoteBoundaryWork(): Promise<void> {
+    if (this.dirtyFull) {
+      await this.flushFull();
+    }
+    this.maybeAutoTitle();
+  }
+
+  /**
+   * Feature B — ask the backend to auto-title a still-"Untitled" note from its body (the
+   * on-device model when present, else a first-line heuristic; LOCAL-only). Called on
+   * every natural "the user is done with this note for now" boundary — a hard close/quit
+   * (the `destroyRef.onDestroy` callback) AND a plain tab switch (the `tabRouteReuse.onDetach`
+   * callback, since `notes/:id` tabs are detached-not-destroyed on switch — see the
+   * constructor comment). Fire-and-forget either way: we only reflect the new title back
+   * onto the (persisting) tab strip when it resolves. Skips a locked/masked note and an
+   * empty body up front (the backend re-checks both, plus re-checks the CURRENT title
+   * immediately before writing, so calling this twice for the same note is at worst a
+   * wasted on-device inference call, never a clobber).
    */
   private maybeAutoTitle(): void {
     const doc = this.note();
@@ -1112,12 +1150,12 @@ export class NoteEditorComponent {
    * navigation, so leaving is instant and the backend catches up. Joins the same
    * single-writer chain as the cheap saves, superseding any pending cheap save.
    */
-  private flushFull(): void {
+  private flushFull(): Promise<void> {
     const doc = this.note();
     if (doc) {
       this.debounce.cancel(this.saveDebounceKey(doc.id));
     }
-    void this.queueSave("full");
+    return this.queueSave("full");
   }
 
   /**
@@ -1184,7 +1222,7 @@ export class NoteEditorComponent {
 
   /** Retry a failed save — the full path (re-index + export). */
   retrySave(): void {
-    this.flushFull();
+    void this.flushFull();
   }
 
   // ── Tags ─────────────────────────────────────────────────────────────────
@@ -1376,7 +1414,7 @@ export class NoteEditorComponent {
     // save (re-index + vault export) once if there are unindexed edits, so the note
     // becomes brain-searchable + vault-synced without waiting for editor close.
     if (on && this.dirtyFull) {
-      this.flushFull();
+      void this.flushFull();
     }
   }
 

@@ -19,9 +19,32 @@ import { mockNotes } from "./mock-invoke";
  * `` `note-editor-save:${noteId}` `` (see `saveDebounceKey`), so each open
  * tab's autosave timer is independent in the shared singleton.
  *
- * RED contract: reverting the scoping back to a bare literal key reproduces
- * Note A's edit never reaching `save_note_text` at all (confirmed locally
- * against the unscoped-key code before landing this test).
+ * ORIGINAL RED contract (still true in isolation — see `note-save-retry-
+ * cross-tab.spec.ts` for the sibling retry-key collision, which remains
+ * fully exercisable): reverting the scoping back to a bare literal key
+ * reproduces Note A's edit never reaching `save_note_text` at all.
+ *
+ * STALE AS OF 2026-07-15 (auto-title-on-detach fix) — read before touching
+ * this test: a note with unindexed edits (`dirtyFull`) now ALSO gets FULLY
+ * flushed the instant its tab is backgrounded (`TabRouteReuseStrategy.
+ * onDetach` → `runNoteBoundaryWork` → `flushFull`), not only on hard close.
+ * That flush synchronously cancels the note's OWN pending debounce timer
+ * and immediately queues a full save (`update_note_doc`) — which completes
+ * (kicks off) before the user can possibly have switched tabs AND typed
+ * into the next note, so Note A's timer is always gone by the time Note B
+ * could ever call `schedule()` under a shared key. Verified empirically:
+ * this test PASSES even with `saveDebounceKey` reverted to a bare literal —
+ * the specific collision it was written to catch can no longer occur via
+ * ordinary tab-switching, because the eager detach-flush structurally
+ * prevents two notes' PRIMARY autosave timers from ever being pending
+ * concurrently. This test is still a legitimate, valuable regression check
+ * (both notes' edits must survive a rapid tab-switch, regardless of WHICH
+ * save path lands them), but it no longer discriminates the debounce-key-
+ * scoping fix specifically — do not read a pass here as proof that scoping
+ * fix still works; that guarantee now lives structurally in the eager-flush
+ * design instead. Tracks BOTH `save_note_text` and `update_note_doc` calls
+ * since either is a genuine persist (the mock's default `update_note_doc`
+ * echoes the real markdown back).
  */
 test.describe("Note editor — concurrent open tabs never cancel each other's PENDING autosave", () => {
   test("editing note A then switching to note B before A's autosave fires still persists A's edit", async ({
@@ -66,14 +89,37 @@ test.describe("Note editor — concurrent open tabs never cancel each other's PE
               locked: false,
               shared: false,
             },
-      // Record every save_note_text call per id (page-side array, read back
-      // via page.evaluate — mockTauri overrides run page-side, no closures).
+      // Record every save (page-side array, read back via page.evaluate —
+      // mockTauri overrides run page-side, no closures). Tracks BOTH the
+      // cheap autosave (save_note_text) and the full save (update_note_doc)
+      // — a note backgrounded with unindexed edits is now flushed via the
+      // latter (see the class doc's 2026-07-15 note), so either path is a
+      // legitimate persist of the edit under test.
       save_note_text: (args: { id: string; markdown: string }) => {
         const w = window as unknown as { __saves?: Record<string, string[]> };
         w.__saves ??= { n1: [], n2: [] };
         w.__saves[args.id] ??= [];
         w.__saves[args.id].push(args.markdown);
         return Date.now();
+      },
+      update_note_doc: (args: { id: string; title: string; markdown: string }) => {
+        const w = window as unknown as { __saves?: Record<string, string[]> };
+        w.__saves ??= { n1: [], n2: [] };
+        w.__saves[args.id] ??= [];
+        w.__saves[args.id].push(args.markdown);
+        return {
+          id: args.id,
+          title: args.title,
+          folderId: "nf1",
+          markdown: args.markdown,
+          tags: [],
+          properties: {},
+          updatedAt: Date.now(),
+          createdAt: 1_719_000_000_000,
+          exportedPath: null,
+          locked: false,
+          shared: false,
+        };
       },
     });
 
