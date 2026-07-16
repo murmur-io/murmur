@@ -9,6 +9,7 @@ import type {
   AppConfigDto,
   BacklinkSource,
   WikiTarget,
+  CompanionAppendResult,
   SourceKind,
   ContextHit,
   MyShareEntry,
@@ -1949,6 +1950,27 @@ export class IpcService {
    */
   getManualNotes(meetingId: string): Promise<string> {
     return invoke<string>("get_manual_notes", { meetingId });
+  }
+
+  /**
+   * Append a recording-time jot (or an accepted `@brain` draft) to the meeting's
+   * ONE living companion note. The backend lazily gets-or-creates the companion
+   * note (in the always-open Notes ROOT, `meeting_id` set, managed title synced to
+   * the meeting), appends the markdown block atomically (single-writer — no FE
+   * read-modify-write race), refreshes the front-matter `[[Meeting]]` link, and
+   * re-exports the vault `.md`. Returns the note's id + the display wikilink for
+   * the "✓ Saved to Notes" card. The text is the user's OWN words / an accepted
+   * draft — no new cloud egress. GATED like every content write; a failure must
+   * not blank prior content (verify-before-destroy N/A — additive only).
+   */
+  appendToCompanionNote(
+    meetingId: string,
+    markdown: string,
+  ): Promise<CompanionAppendResult> {
+    return invoke<CompanionAppendResult>("append_to_companion_note", {
+      meetingId,
+      markdown,
+    });
   }
 
   // ── folders + per-folder lock lifecycle (PHASE0-PLAN Stage C) ──
