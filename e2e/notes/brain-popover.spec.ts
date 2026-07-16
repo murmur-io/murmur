@@ -157,9 +157,9 @@ test("Find related: an org-kind citation routes to the read-only /org-item viewe
   await expect(popover).toBeVisible();
   await popover.getByRole("button", { name: "Find related" }).dispatchEvent("click");
 
-  await expect(popover.getByText("2 related sources in your brain.")).toBeVisible();
-  // Fix 3 (2026-07-15): `find_related` rows are now ACTIONABLE — "Insert link" (primary)
-  // + "Open" (secondary), replacing the old single passive `.pop-cite` chip.
+  // Minimalist reshape (2026-07-16): the count lead-line is gone — the rows ARE the
+  // result. Each row's primary action inserts a link (accessible name "Insert link
+  // to <title>"); "Open" stays as the quiet secondary action.
   const orgRow = popover.locator(".pop-cite-row", { hasText: "Anna's launchcode notes" });
   await expect(orgRow).toBeVisible();
   await expect(orgRow.locator(".pop-cite-kind")).toHaveText("org");
@@ -230,12 +230,13 @@ test("Find related: Insert link drops a [[Title]] wikilink into the body instead
   const popover = page.locator("app-note-brain-popover");
   await expect(popover).toBeVisible();
   await popover.getByRole("button", { name: "Find related" }).dispatchEvent("click");
-  await expect(popover.getByText("1 related source in your brain.")).toBeVisible();
 
+  // Minimalist reshape (2026-07-16): no count lead-line — wait on the row itself.
   const row = popover.locator(".pop-cite-row", { hasText: "Weekly plan" });
   await expect(row).toBeVisible();
-  // Both actions are present — Insert link (primary) AND Open (secondary), never
-  // removing the existing capability.
+  // Both actions are present — Insert link (the row's primary action, accessible
+  // name "Insert link to Weekly plan") AND Open (secondary), never removing the
+  // existing capability.
   await expect(row.getByRole("button", { name: "Insert link" })).toBeVisible();
   await expect(row.getByRole("button", { name: "Open" })).toBeVisible();
 
