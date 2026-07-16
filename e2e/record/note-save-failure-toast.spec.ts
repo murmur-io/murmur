@@ -36,6 +36,12 @@ test.describe("Record — a rejected note save surfaces an error, not a silent l
         Promise.reject(
           "Locked: this meeting's folder is locked — unlock it to edit your notes",
         ),
+      // The companion-note append is a SEPARATE, additive persist path; keep it
+      // succeeding so this test isolates the `manual_notes` save-failure toast.
+      append_to_companion_note: () => ({
+        noteId: "n-companion",
+        meetingWikilink: "[[Meeting]]",
+      }),
     });
 
     await page.goto("/record");
@@ -45,7 +51,7 @@ test.describe("Record — a rejected note save surfaces an error, not a silent l
       timeout: 10_000,
     });
 
-    const composer = page.locator("textarea.composer-input");
+    const composer = page.locator("mur-markdown-composer textarea.body-area");
     await expect(composer).toBeEnabled({ timeout: 10_000 });
     await composer.fill("ship the 3 flows people actually use");
     await composer.press("Enter");
