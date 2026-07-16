@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod audio;
+pub mod audit;
 pub mod brain_reactions;
 pub mod brief_runner;
 pub mod calendar;
@@ -180,6 +181,10 @@ pub fn run() {
             commands::preview_supersessions,
             commands::apply_supersessions,
             commands::undo_supersessions,
+            // Vault Audit v1 — deterministic vault-health inbox (run + list + resolve).
+            commands::run_vault_audit,
+            commands::list_audit_findings,
+            commands::resolve_audit_finding,
             commands::get_config,
             commands::get_mcp_config,
             commands::save_config,

@@ -90,8 +90,9 @@ pub enum FactOp {
 
 /// Normalize a subject/predicate/object for IDENTITY comparison: trim + full-Unicode lowercase
 /// (so "Status"/"status" and "Shipped"/"shipped" compare equal). The ORIGINAL casing is preserved
-/// in the stored row; this is only the dedup/supersession key.
-fn norm(s: &str) -> String {
+/// in the stored row; this is only the dedup/supersession key. `pub(crate)` so the Vault Audit's
+/// stale/contradiction passes key facts IDENTICALLY to this reconcile (`crate::audit`).
+pub(crate) fn norm(s: &str) -> String {
     s.trim().to_lowercase()
 }
 

@@ -673,6 +673,12 @@ pub fn append_supersedes_callout(
 /// body without its date); `block` is the full multi-line callout to append. Append-only: the input
 /// markdown is never rewritten, only extended. Creates [`RETRUTH_SECTION`] once if absent.
 fn append_under_section(markdown: &str, marker: &str, block: &str) -> String {
+    append_under_named_section(markdown, RETRUTH_SECTION, marker, block)
+}
+
+/// The generalized core behind [`append_under_section`] (Re-Truth) and the Vault-Audit appends:
+/// idempotent on `marker`, append-only, creates `section` once if absent.
+fn append_under_named_section(markdown: &str, section: &str, marker: &str, block: &str) -> String {
     // Idempotent: the exact body line already present → nothing to do (applying twice is a no-op).
     if markdown.contains(marker) {
         return markdown.to_string();
@@ -681,12 +687,36 @@ fn append_under_section(markdown: &str, marker: &str, block: &str) -> String {
     if !out.ends_with('\n') {
         out.push('\n');
     }
-    if !out.contains(RETRUTH_SECTION) {
-        out.push_str(&format!("\n{RETRUTH_SECTION}\n"));
+    if !out.contains(section) {
+        out.push_str(&format!("\n{section}\n"));
     }
     out.push('\n');
     out.push_str(block);
     out
+}
+
+// ── Vault Audit: append-only findings stamps ────────────────────────────────
+
+/// The managed heading Vault-Audit stamps live under. Created once per note (idempotent) so
+/// repeated stamps stay contiguous and never duplicate the heading — the [`RETRUTH_SECTION`]
+/// convention, one section per feature.
+pub const AUDIT_SECTION: &str = "## Audit";
+
+/// APPEND an audit callout (`[!stale]` / `[!conflict]` / `[!broken-link]`) under the managed
+/// [`AUDIT_SECTION`]. Pure + APPEND-ONLY + idempotent on the callout BODY (everything but the
+/// date), exactly like [`append_supersession_callout`]. `body` must already be a quoted (`> `)
+/// callout body line.
+pub fn append_audit_callout(markdown: &str, date: &str, callout: &str, body: &str) -> String {
+    let block = format!("> [!{callout}] {date}\n{body}\n");
+    append_under_named_section(markdown, AUDIT_SECTION, body, &block)
+}
+
+/// APPEND a plain suggested-links line (the unlinked-mention / orphan accepts) under the managed
+/// [`AUDIT_SECTION`]. Pure, append-only, idempotent on the exact line. The CALLER is responsible
+/// for the anti-hallucination rule: every `[[link]]` in `line` must have been re-resolved against
+/// the live vault/session before this is written.
+pub fn append_audit_line(markdown: &str, line: &str) -> String {
+    append_under_named_section(markdown, AUDIT_SECTION, line, &format!("{line}\n"))
 }
 
 // ── Vault detection (from ~/Library/Application Support/obsidian/obsidian.json) ──
