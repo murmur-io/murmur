@@ -16,7 +16,7 @@
       } @else if (enhanceAware() && store.hasPersistedNotes()) {
         ✨ These bullets will shape your summary
       } @else {
-        Type <span class="kbd">&#64;brain</span> to ask in a thread
+        Saved as linked notes · <span class="kbd">&#64;brain</span> to ask
       }
     </span>
   </div>
@@ -79,9 +79,9 @@
   <div class="flow" #flow [class.is-enhancing]="enhancing()">
     @if (!store.hasNotes()) {
       <p class="flow-empty text-muted">
-        Jot your notes here — they're saved with the meeting. Type
-        <span class="kbd">&#64;brain</span> + a question to open a thread; the
-        assistant answers there and you choose what to add to your notes.
+        Jot your notes here — each one is saved as a real, linked note in your
+        vault. Type <span class="kbd">&#64;brain</span> + a question to open a
+        thread; the assistant answers there and you choose what to keep.
       </p>
     }
     @for (n of store.notes(); track n.id; let i = $index) {
@@ -93,7 +93,7 @@
     }
   </div>
 
-  <form class="composer" (submit)="submit($event)">
+  <div class="composer">
     <button
       type="button"
       class="mic-btn"
@@ -118,75 +118,13 @@
         />
       </svg>
     </button>
-    <div class="composer-editor">
-      <textarea
-        #ta
-        class="composer-input"
-        rows="1"
-        autocomplete="off"
-        spellcheck="true"
-        [disabled]="!store.loaded()"
-        [placeholder]="
-          store.loaded()
-            ? 'write a note… (@brain to open a thread)'
-            : 'Loading notes…'
-        "
-        [value]="draft()"
-        (input)="onInput($event)"
-        (keydown)="onKeydown($event)"
-        (blur)="onBlur()"
-        aria-label="Note or @brain question"
-      ></textarea>
-
-      @if (menuOpen()) {
-        <div
-          class="mention-menu"
-          role="listbox"
-          aria-label="Mention"
-          [style.top.px]="menuTop()"
-          [style.left.px]="menuLeft()"
-        >
-          <button
-            type="button"
-            class="mention-item"
-            role="option"
-            [attr.aria-selected]="true"
-            (mousedown)="$event.preventDefault()"
-            (click)="chooseBrain()"
-          >
-            <span class="mention-ico" aria-hidden="true">🧠</span>
-            <span class="mention-text">
-              <span class="mention-label">brain</span>
-              <span class="mention-hint">open a thread + ask</span>
-            </span>
-          </button>
-        </div>
-      }
-    </div>
-    <button
-      type="submit"
-      class="btn btn-primary composer-send"
-      [class.is-brain]="draftIsBrain()"
-      [disabled]="!canSend()"
-      [attr.aria-label]="draftIsBrain() ? 'Open a @brain thread' : 'Save note'"
-      [title]="draftIsBrain() ? 'Ask (Enter)' : 'Save note (Enter)'"
-    >
-      <svg
-        width="16"
-        height="16"
-        viewBox="0 0 24 24"
-        fill="none"
-        aria-hidden="true"
-      >
-        <path
-          d="M5 12h14M13 6l6 6-6 6"
-          stroke="currentColor"
-          stroke-width="2.2"
-          stroke-linecap="round"
-          stroke-linejoin="round"
-        />
-      </svg>
-    </button>
-  </form>
+    <mur-markdown-composer
+      class="composer-editor"
+      [placeholder]="composerPlaceholder()"
+      [disabled]="!store.loaded()"
+      (send)="onSend($event)"
+      (escape)="onEscape()"
+    />
+  </div>
 </div>
   

@@ -173,6 +173,7 @@ pub fn run() {
             commands::link_related_notes,
             commands::save_manual_notes,
             commands::get_manual_notes,
+            commands::append_to_companion_note,
             commands::import_document,
             commands::import_text,
             commands::brain_overview,

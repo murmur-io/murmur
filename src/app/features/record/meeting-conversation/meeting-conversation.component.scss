@@ -95,72 +95,19 @@
   color: var(--text-secondary);
 }
 
-/* ── input row: voice mic + text composer, pinned at the foot ───────── */
+/* ── input row: voice mic + the shared markdown composer, pinned at the
+   foot. The composer (`mur-markdown-composer`) owns its own auto-grow
+   textarea + the OPAQUE `/`/`[[` menus (trap T3 handled inside it); here we
+   only lay it out beside the voice mic. ──────────────────────────────── */
 .composer {
   display: flex;
   align-items: flex-end;
   gap: var(--space-2);
   flex: none;
 }
-/* Positioned wrapper so the caret-anchored @brain popover can be placed
-   relative to the textarea. */
 .composer-editor {
-  position: relative;
   flex: 1;
   min-width: 0;
-}
-
-/* ── @brain mention popover — FLOATS over the composer → OPAQUE (trap T3).
-   NOT the frosted .card: a translucent surface would bleed the notes flow
-   behind it through (a broken-looking menu). ──────────────────────────── */
-.mention-menu {
-  position: absolute;
-  z-index: 20;
-  min-width: 200px;
-  max-width: 260px;
-  padding: var(--space-1);
-  background: var(--surface-overlay);
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius-md);
-  box-shadow: var(--shadow-lg);
-  -webkit-backdrop-filter: none;
-  backdrop-filter: none;
-}
-.mention-item {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
-  width: 100%;
-  padding: var(--space-2) var(--space-3);
-  border: none;
-  border-radius: var(--radius-sm);
-  background: transparent;
-  color: var(--text-primary);
-  cursor: pointer;
-  text-align: left;
-  transition: background var(--transition);
-}
-.mention-item:hover,
-.mention-item:focus-visible {
-  outline: none;
-  background: var(--accent-soft);
-}
-.mention-ico {
-  font-size: 1.05rem;
-  line-height: 1;
-}
-.mention-text {
-  display: flex;
-  flex-direction: column;
-  gap: 1px;
-}
-.mention-label {
-  font-weight: 600;
-  font-size: 0.9rem;
-}
-.mention-hint {
-  font-size: 0.76rem;
-  color: var(--text-muted);
 }
 .mic-btn {
   flex: 0 0 auto;
@@ -211,33 +158,6 @@
     box-shadow: 0 0 0 8px rgba(110, 118, 255, 0);
   }
 }
-.composer-input {
-  display: block;
-  width: 100%;
-  min-height: 40px;
-  max-height: 140px;
-  padding: var(--space-2) var(--space-3);
-  resize: none;
-  line-height: 1.45;
-  font-size: 0.9rem;
-}
-.composer-send {
-  flex: 0 0 auto;
-  width: 40px;
-  height: 40px;
-  padding: 0;
-  justify-content: center;
-}
-/* When the line is an @brain ask, the send button reads as the accent
-   "ask" affordance (vs the calmer save-note default). */
-.composer-send.is-brain {
-  box-shadow: 0 0 0 2px var(--accent-ring);
-}
-.composer-send:disabled {
-  opacity: 0.5;
-  cursor: default;
-}
-
 @media (prefers-reduced-motion: reduce) {
   .mic-btn.is-listening {
     animation: none;

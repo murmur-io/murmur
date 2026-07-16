@@ -13,6 +13,7 @@ import {
 } from "@angular/core";
 import { MeetingConversationStore } from "../../../core/meeting-conversation.store";
 import type { NoteItem, ThreadTurn } from "../../../core/meeting-conversation.store";
+import { TabsService } from "../../../core/tabs.service";
 import { MarkdownComponent } from "../../../shared/markdown/markdown.component";
 import { AssistantSourcesComponent } from "../../../shared/assistant-sources/assistant-sources.component";
 
@@ -53,6 +54,7 @@ import { AssistantSourcesComponent } from "../../../shared/assistant-sources/ass
 })
 export class NoteItemComponent {
   protected readonly store = inject(MeetingConversationStore);
+  private readonly tabs = inject(TabsService);
   private readonly injector = inject(Injector);
 
   /** The note line (with its thread, if any) — the single source of truth. */
@@ -201,5 +203,42 @@ export class NoteItemComponent {
       default:
         return "";
     }
+  }
+
+  /**
+   * The `[[Meeting]]` chip label: the meeting's display name with the wikilink
+   * brackets stripped (e.g. `[[Weekly sync]]` → `Weekly sync`). Empty when the
+   * line carries no companion reference yet.
+   */
+  protected meetingChipLabel(): string {
+    const raw = this.note().meetingWikilink ?? "";
+    return raw.replace(/^\[\[/, "").replace(/\]\]$/, "").trim();
+  }
+
+  /**
+   * "✓ Saved to Notes" — open the companion note in a new tab BY ID (never by a
+   * fragile title string). Navigating away from the recording is acceptable per
+   * the spec. A no-op if the reference hasn't been stamped yet.
+   */
+  protected openSavedNote(): void {
+    const id = this.note().savedNoteId;
+    if (!id) return;
+    void this.tabs.openNote(id);
+  }
+
+  /**
+   * The `🔗 [[Meeting]] →` chip — navigate to THIS recording's meeting by id
+   * (the store's anchored `meetingId`, the authoritative structured relation),
+   * never by resolving the wikilink string. A no-op when there's no meeting.
+   */
+  protected openMeeting(): void {
+    const id = this.store.meetingId();
+    if (!id) return;
+    void this.tabs.openMeeting(id, this.meetingChipLabel() || "Meeting");
+  }
+
+  /** Retry a failed companion-note append (the card's error state). */
+  protected retrySave(): void {
+    this.store.retrySave(this.note().id);
   }
 }

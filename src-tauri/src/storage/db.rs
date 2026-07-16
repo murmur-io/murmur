@@ -984,6 +984,17 @@ impl Db {
             "kind",
             "TEXT NOT NULL DEFAULT 'document'",
         )?;
+        // Recording-time COMPANION NOTE (2026-07-16): the authoritative, STRUCTURED link from a
+        // standalone note (kind='note') back to the meeting it was jotted during. Nullable — only
+        // companion notes carry it; every other note/document stays NULL. Drives navigation
+        // (by id, never by a fragile title string), the meeting's backlinks, and survives
+        // meeting rename/auto-title. Additive + guarded so migrate() stays idempotent; legacy rows
+        // default to NULL. NON-content (an id) — rides the SQLCipher-at-rest layer, never sealed.
+        Self::add_column_if_missing(conn, "documents", "meeting_id", "TEXT")?;
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_documents_meeting_id ON documents(meeting_id);",
+        )
+        .map_err(map_err)?;
         // The vec0 column width is the embedder's EMBED_DIM (== the note vec_chunks width). Format the
         // DDL (no user input). Parallel to `vec_chunks` but keyed to `doc_chunks.id`.
         conn.execute_batch(&format!(
@@ -5853,6 +5864,39 @@ impl Db {
         .map_err(map_err)
     }
 
+    /// Recording-time COMPANION NOTE — set the STRUCTURED `documents.meeting_id` link on a
+    /// standalone note (`kind='note'`). Idempotent on an unknown id / non-note row (0 rows). The
+    /// column is a non-content id (rides the SQLCipher-at-rest layer, never sealed/blanked). Callers
+    /// set this immediately after `create_note_inner` births the companion note.
+    pub fn set_document_meeting_id(&self, id: &str, meeting_id: &str) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE documents SET meeting_id = ?2 WHERE id = ?1 AND kind = 'note'",
+            rusqlite::params![id, meeting_id],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Recording-time COMPANION NOTE — the note id of the ONE companion note (`kind='note'`) linked
+    /// to `meeting_id`, or `None` when none exists yet (the append command then lazily creates it).
+    /// Structured lookup by the indexed `meeting_id` column — never a fragile title-string match.
+    /// One-note-per-meeting is a model invariant (the append command is the only writer); should a
+    /// duplicate ever exist, the newest-updated row wins (deterministic).
+    pub fn companion_note_for_meeting(&self, meeting_id: &str) -> Result<Option<String>> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT id FROM documents
+               WHERE kind = 'note' AND meeting_id = ?1
+               ORDER BY COALESCE(updated_at, created_at) DESC, id ASC
+               LIMIT 1",
+            rusqlite::params![meeting_id],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(map_err)
+    }
+
     /// Update an authored note's `title` + `text` + `updated_at` (write path, OPEN folders only).
     /// Leaves `text_blob` alone. A write into a session-unlocked LOCKED folder must NOT come here —
     /// the relock reblank discards the plaintext and restores the stale blob (content loss) — it goes
@@ -8834,6 +8878,13 @@ impl Db {
         {
             let conn = self.lock();
             let visible = visibility_clause("f", unlocked);
+            // SELF-LINK AVOIDANCE (2026-07-16 companion note): a companion note's managed title
+            // equals its meeting's title, so a user-typed `[[Meeting]]` could otherwise hit the
+            // companion note via this note-leg-first order. EXCLUDE a note carrying a non-null
+            // `meeting_id` WHEN the queried title equals THAT note's own meeting's title — so
+            // `[[Meeting]]` always falls through to the meeting leg below, never resolving to its
+            // own companion note. (A companion note IS still a valid target for OTHER titles that
+            // happen to name it — only the self-title collision is excluded.)
             let sql = format!(
                 "SELECT d.id
                    FROM documents d
@@ -8841,6 +8892,11 @@ impl Db {
                   WHERE d.kind = 'note'
                     AND COALESCE(NULLIF(TRIM(d.title), ''), d.name) = ?1
                     AND {visible}
+                    AND NOT (
+                          d.meeting_id IS NOT NULL
+                          AND EXISTS (SELECT 1 FROM meetings m
+                                       WHERE m.id = d.meeting_id AND m.title = ?1)
+                        )
                   ORDER BY d.updated_at DESC, d.id ASC
                   LIMIT 1"
             );
@@ -9169,6 +9225,50 @@ impl Db {
             }
         }
         drop(doc_stmt);
+
+        // ── GATE 2, STRUCTURED companion-note leg (2026-07-16): for a MEETING target, a companion
+        // note is linked by the authoritative `documents.meeting_id` id — NOT by a fragile
+        // front-matter `[[Title]]` string that the two title-scan legs above depend on. Surface it
+        // structurally so the meeting's "Linked mentions" always includes its companion note even
+        // if the title drifted mid-rename or never round-tripped as a wikilink. Lock-gated exactly
+        // like the string leg (`visibility_clause` on the note's folder), and DEDUPED against
+        // `note_hits` so a companion note that ALSO matched the string scan is listed once. ──
+        if target_kind == SourceKind::Meeting {
+            let already: HashSet<String> = note_hits.iter().map(|b| b.id.clone()).collect();
+            let visible_docs = visibility_clause("f", unlocked);
+            let comp_sql = format!(
+                "SELECT d.id, d.title, d.name, COALESCE(d.updated_at, d.created_at)
+                   FROM documents d
+                   JOIN folders f ON f.id = d.folder_id
+                  WHERE d.kind = 'note' AND d.meeting_id = ?1 AND {visible_docs}
+                  ORDER BY COALESCE(d.updated_at, d.created_at) DESC, d.id ASC"
+            );
+            let mut comp_stmt = conn.prepare(&comp_sql).map_err(map_err)?;
+            let comp_rows = comp_stmt
+                .query_map(rusqlite::params![target_id], |r| {
+                    let id: String = r.get(0)?;
+                    let title: Option<String> = r.get(1)?;
+                    let name: String = r.get(2)?;
+                    let ts: i64 = r.get(3)?;
+                    Ok((id, title, name, ts))
+                })
+                .map_err(map_err)?;
+            for row in comp_rows {
+                let (id, title, name, ts) = row.map_err(map_err)?;
+                if already.contains(&id) {
+                    continue; // already counted by the string-scan leg — never duplicate.
+                }
+                note_hits.push(BacklinkSource {
+                    id,
+                    kind: SourceKind::Note,
+                    title: title.filter(|t| !t.is_empty()).unwrap_or(name),
+                    timestamp: chrono::DateTime::from_timestamp_millis(ts)
+                        .map(|dt| dt.to_rfc3339())
+                        .unwrap_or_default(),
+                });
+            }
+            drop(comp_stmt);
+        }
         drop(conn);
 
         // Merge the two legs newest-first. Both legs now emit an RFC3339 `timestamp`, so
@@ -14521,6 +14621,148 @@ mod tests {
 
         assert!(db.resolve_wikilink("Nope", &nothing).unwrap().is_none());
         assert!(db.resolve_wikilink("   ", &nothing).unwrap().is_none());
+    }
+
+    /// SELF-LINK AVOIDANCE (2026-07-16 companion note): a companion note (`documents` row with a
+    /// non-null `meeting_id`) whose managed title EQUALS its meeting's title must be EXCLUDED from the
+    /// note-leg, so `[[Meeting Title]]` resolves to the MEETING (kind='meeting'), never to its own
+    /// companion note. RED against the pre-fix note-leg-first resolver (which returned the companion
+    /// note, kind='note', because the note leg matched first). A companion note is STILL a valid
+    /// target for an UNRELATED title that names it (the exclusion is only the self-title collision).
+    #[test]
+    fn resolve_wikilink_companion_note_self_title_resolves_to_meeting() {
+        let db = mem_db();
+        seed_folder(&db, "f-open", "Open");
+
+        // A meeting titled "Q3 Planning" (its AI note lives in `notes` so it is visible).
+        let mut m = sample_meeting("m-q3", "2026-07-16T10:00:00Z");
+        m.title = Some("Q3 Planning".to_string());
+        db.insert_meeting(&m).unwrap();
+        note_for(&db, "m-q3", "claude_code", "ai note body");
+        db.set_note_folder("m-q3", Some("f-open")).unwrap();
+
+        // A COMPANION note whose managed title == the meeting title, structurally linked by meeting_id.
+        db.insert_note("n-comp", "f-open", "q3-planning", "Q3 Planning", "jotted body", 2_000)
+            .unwrap();
+        db.set_document_meeting_id("n-comp", "m-q3").unwrap();
+
+        let nothing = std::collections::HashSet::new();
+        let t = db
+            .resolve_wikilink("Q3 Planning", &nothing)
+            .unwrap()
+            .expect("[[Q3 Planning]] resolves");
+        assert_eq!(
+            t.kind, "meeting",
+            "[[Meeting Title]] must resolve to the MEETING, never its own companion note"
+        );
+        assert_eq!(t.id, "m-q3");
+
+        // A companion note is STILL a valid target for a DIFFERENT title that names it.
+        db.insert_note("n-other", "f-open", "sidebar", "Sidebar", "x", 3_000)
+            .unwrap();
+        db.set_document_meeting_id("n-other", "m-q3").unwrap(); // linked, but title != meeting title.
+        let o = db
+            .resolve_wikilink("Sidebar", &nothing)
+            .unwrap()
+            .expect("[[Sidebar]] resolves");
+        assert_eq!(o.kind, "note");
+        assert_eq!(o.id, "n-other");
+    }
+
+    /// STRUCTURED backlink leg (2026-07-16 companion note): a companion note linked by
+    /// `documents.meeting_id` surfaces under its meeting's "Linked mentions" EVEN WHEN its body/
+    /// front-matter carries no matching `[[Title]]` string (the string-scan legs would miss it). RED
+    /// against the pre-fix backlinks (title-scan only). Lock-gated: sealed companion note → absent.
+    #[test]
+    fn backlinks_include_meeting_id_linked_companion_note() {
+        let db = mem_db();
+        seed_folder(&db, "f-open", "Open");
+
+        let mut m = sample_meeting("m-bl", "2026-07-16T09:00:00Z");
+        m.title = Some("Weekly Sync".to_string());
+        db.insert_meeting(&m).unwrap();
+        note_for(&db, "m-bl", "claude_code", "ai note"); // makes the meeting visible.
+        db.set_note_folder("m-bl", Some("f-open")).unwrap();
+
+        // A companion note with NO `[[Weekly Sync]]` string anywhere — only the structured meeting_id.
+        db.insert_note("n-bl", "f-open", "weekly-sync", "Weekly Sync", "just a jot, no wikilink", 5_000)
+            .unwrap();
+        db.set_document_meeting_id("n-bl", "m-bl").unwrap();
+
+        let nothing = std::collections::HashSet::new();
+        let got = db
+            .backlinks_for_visible(SourceKind::Meeting, "m-bl", &nothing)
+            .unwrap();
+        let ids: Vec<&str> = got.iter().map(|b| b.id.as_str()).collect();
+        assert!(
+            ids.contains(&"n-bl"),
+            "the meeting_id-linked companion note must surface in backlinks even without a [[]] string; got {ids:?}"
+        );
+        // No duplicate: exactly one entry for the companion note.
+        assert_eq!(
+            ids.iter().filter(|id| **id == "n-bl").count(),
+            1,
+            "companion note must appear exactly once (structured leg deduped against the string leg)"
+        );
+    }
+
+    /// The structured companion-backlink leg is LOCK-GATED: a companion note in a sealed-not-unlocked
+    /// folder never surfaces under its meeting's backlinks; a session-unlock reverses it.
+    #[test]
+    fn backlinks_companion_note_leg_is_lock_gated() {
+        let db = mem_db();
+        seed_folder(&db, "f-open", "Open");
+        seed_folder(&db, "f-locked", "Secret");
+        db.set_folder_locked("f-locked", true, Some(b"wrapped"))
+            .unwrap();
+
+        let mut m = sample_meeting("m-g", "2026-07-16T08:00:00Z");
+        m.title = Some("Board Prep".to_string());
+        db.insert_meeting(&m).unwrap();
+        note_for(&db, "m-g", "claude_code", "ai note");
+        db.set_note_folder("m-g", Some("f-open")).unwrap();
+
+        // Companion note filed into the LOCKED folder, linked by meeting_id.
+        db.insert_note("n-g", "f-locked", "board-prep", "Board Prep", "sensitive jot", 6_000)
+            .unwrap();
+        db.set_document_meeting_id("n-g", "m-g").unwrap();
+
+        let nothing = std::collections::HashSet::new();
+        let sealed = db
+            .backlinks_for_visible(SourceKind::Meeting, "m-g", &nothing)
+            .unwrap();
+        assert!(
+            !sealed.iter().any(|b| b.id == "n-g"),
+            "a sealed-not-unlocked companion note must NOT surface in backlinks"
+        );
+
+        let mut unlocked = std::collections::HashSet::new();
+        unlocked.insert("f-locked".to_string());
+        let visible = db
+            .backlinks_for_visible(SourceKind::Meeting, "m-g", &unlocked)
+            .unwrap();
+        assert!(
+            visible.iter().any(|b| b.id == "n-g"),
+            "a session-unlock surfaces the companion note in backlinks"
+        );
+    }
+
+    /// The additive `documents.meeting_id` migration + helpers: set/read round-trips, `None` when
+    /// unset, and one-note-per-meeting lookup by the structured column.
+    #[test]
+    fn companion_note_meeting_id_set_and_lookup() {
+        let db = mem_db();
+        seed_folder(&db, "f-open", "Open");
+        db.insert_note("n1", "f-open", "n1", "N1", "body", 1_000)
+            .unwrap();
+        assert!(db.companion_note_for_meeting("m1").unwrap().is_none());
+        db.set_document_meeting_id("n1", "m1").unwrap();
+        assert_eq!(
+            db.companion_note_for_meeting("m1").unwrap().as_deref(),
+            Some("n1")
+        );
+        // An unrelated meeting id still resolves to None.
+        assert!(db.companion_note_for_meeting("m2").unwrap().is_none());
     }
 
     /// GATED: a `[[Title]]` pointing at a SEALED-and-not-session-unlocked note resolves to `None`
