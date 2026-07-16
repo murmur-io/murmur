@@ -36,8 +36,9 @@ import { ToastService } from "../../services/toast.service";
  *   alongside it. The fix: read the title from the chip's own `textContent` instead (the chip's
  *   visible text ALREADY IS the escaped title — no extra attribute needed, so there's nothing
  *   left for a sanitizer to strip).
- *   A host click/Enter handler resolves the title to a VISIBLE note/meeting (gated server-side)
- *   and opens it through {@link TabsService} (not a raw `router.navigate` — same sibling-function
+ *   A host click/Enter handler resolves the title to a VISIBLE note/meeting/org-item (gated
+ *   server-side; the org leg added 2026-07-15) and opens it through {@link TabsService} (not a
+ *   raw `router.navigate` — same sibling-function
  *   fix as `NoteBrainPopoverComponent.openCitation`, 2026-07-12: a plain navigate never registers
  *   the resulting view with the tab strip, so a wikilink click opened an orphaned, untracked view
  *   and looked like a no-op), or offers to create the note — so the chips are clickable like
@@ -112,15 +113,19 @@ export class MarkdownComponent {
       const target = await this.ipc.resolveWikilink(title);
       if (target) {
         // Route through TabsService (not a raw `router.navigate`) so the opened
-        // note/meeting is a TRACKED TAB, matching every other open path in the app.
+        // note/meeting/org-item is a TRACKED TAB, matching every other open path in
+        // the app. "org" (2026-07-15) opens the read-only Shared Brain viewer — never
+        // offer to CREATE a note when an org item already matched the title.
         if (target.kind === "meeting") {
           await this.tabsService.openMeeting(target.id, title);
+        } else if (target.kind === "org") {
+          await this.tabsService.openOrgItem(target.id, title);
         } else {
           await this.tabsService.openNote(target.id, title);
         }
         return;
       }
-      // No such note/meeting (or it is locked) — offer to create it, Obsidian-style.
+      // No such note/meeting/org-item (or it is locked) — offer to create it, Obsidian-style.
       this.toast.push(`Notatka „${title}" jeszcze nie istnieje`, "info", 0, {
         label: "Utwórz",
         run: () => void this.createAndOpen(title),

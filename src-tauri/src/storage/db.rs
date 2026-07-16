@@ -8505,11 +8505,19 @@ impl Db {
     }
 
     /// Resolve a `[[Title]]` wikilink to a VISIBLE navigation target — a standalone note (preferred,
-    /// the more natural link target) else a meeting whose exact title matches. GATED by
-    /// `visibility_clause` on both legs: a sealed-and-not-session-unlocked note/meeting with that
-    /// title resolves to `None`, so clicking a wikilink can never reveal or navigate to locked
-    /// content. `None` also when nothing matches. Title match uses the note's display title
-    /// (`title`, falling back to `name`), matching how it is shown/exported.
+    /// the more natural link target), else a meeting whose exact title matches, else (2026-07-15)
+    /// an org (Shared Brain) item whose exact title matches. GATED on all three legs: notes/meetings
+    /// via `visibility_clause` (a sealed-and-not-session-unlocked note/meeting with that title
+    /// resolves to `None`, so clicking a wikilink can never reveal or navigate to locked content);
+    /// the org leg via the SAME membership+per-instance-enabled gate `get_org_item`/
+    /// `search_org_chunks_knn`/`_fts` already use (`JOIN org_state ... WHERE context_enabled = 1`),
+    /// excluding tombstoned rows — never a laxer gate than the existing Shared Brain read path
+    /// (`crate::tools::org_brain_available`/`search_org_brain_hits`). `None` when nothing matches.
+    /// Title match uses the note's display title (`title`, falling back to `name`), matching how it
+    /// is shown/exported. This closes the sibling-gap left by the newer prefix-search picker
+    /// (`list_link_candidates_visible` + the org leg folded in at `commands::list_link_candidates`):
+    /// that picker already offered org items as autocomplete candidates, but this EXACT-title
+    /// resolver — used by both click-to-open and the "does this already exist" pre-check — did not.
     pub fn resolve_wikilink(
         &self,
         title: &str,
@@ -8539,7 +8547,7 @@ impl Db {
                 .map_err(map_err)?;
             if let Some(id) = note_id {
                 return Ok(Some(WikiTarget {
-                    kind: SourceKind::Note,
+                    kind: "note".to_string(),
                     id,
                 }));
             }
@@ -8547,9 +8555,39 @@ impl Db {
         // Meeting leg — reuse the proven gated title resolver (acquires its own lock).
         if let Some(m) = self.meeting_by_title_visible(title, unlocked)? {
             return Ok(Some(WikiTarget {
-                kind: SourceKind::Meeting,
+                kind: "meeting".to_string(),
                 id: m.id,
             }));
+        }
+        // Org (Shared Brain) leg — deliberately-disclosed content living OUTSIDE the folder-lock
+        // domain, so no `unlocked`/`visibility_clause` gate applies here; instead it is scoped to
+        // orgs the caller has actually JOINED and left ENABLED on this install, and excludes
+        // tombstoned items — the IDENTICAL gate `get_org_item` applies for the read-only viewer.
+        // Deliberately NOT the broader/unscoped `documents`/`meetings` query: this leg only ever
+        // touches `org_items`.
+        {
+            let conn = self.lock();
+            let org_id: Option<String> = conn
+                .query_row(
+                    "SELECT oi.item_id
+                       FROM org_items oi
+                       JOIN org_state os ON os.org_id = oi.org_id
+                      WHERE oi.tombstoned = 0
+                        AND os.context_enabled = 1
+                        AND oi.title = ?1
+                      ORDER BY oi.created_at DESC, oi.item_id ASC
+                      LIMIT 1",
+                    rusqlite::params![title],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(map_err)?;
+            if let Some(id) = org_id {
+                return Ok(Some(WikiTarget {
+                    kind: "org".to_string(),
+                    id,
+                }));
+            }
         }
         Ok(None)
     }
@@ -13586,14 +13624,14 @@ mod tests {
             .resolve_wikilink("Alpha", &nothing)
             .unwrap()
             .expect("Alpha resolves");
-        assert_eq!(a.kind, SourceKind::Note);
+        assert_eq!(a.kind, "note");
         assert_eq!(a.id, "n-alpha");
 
         let b = db
             .resolve_wikilink("Beta", &nothing)
             .unwrap()
             .expect("Beta resolves");
-        assert_eq!(b.kind, SourceKind::Meeting);
+        assert_eq!(b.kind, "meeting");
         assert_eq!(b.id, "m-beta");
 
         assert!(db.resolve_wikilink("Nope", &nothing).unwrap().is_none());
@@ -13627,8 +13665,108 @@ mod tests {
             .resolve_wikilink("Secret", &unlocked)
             .unwrap()
             .expect("unlocked target resolves");
-        assert_eq!(t.kind, SourceKind::Note);
+        assert_eq!(t.kind, "note");
         assert_eq!(t.id, "n-secret");
+    }
+
+    /// SIBLING-GAP FIX (2026-07-15): `resolve_wikilink` gained a THIRD leg over `org_items` — an
+    /// exact title match on a joined-and-enabled org's Shared Brain content must now resolve,
+    /// mirroring what the prefix-search picker (`list_link_candidates` folding in
+    /// `search_org_brain_hits`) already offered as an autocomplete candidate. RED against the
+    /// pre-fix code (which had only the note+meeting legs and returned `None` here).
+    #[test]
+    fn resolve_wikilink_falls_back_to_org_item_exact_title_match() {
+        let db = mem_db();
+        seed_org_state(&db, "org-1");
+        let emb = crate::embed::StubEmbedder;
+        db.upsert_org_item(
+            "it-shared",
+            "org-1",
+            1,
+            "anna",
+            "Nebula Rollout",
+            "the nebula rollout plan for q3",
+            "2026-07-10T09:00:00Z",
+            1,
+            1,
+            &sha32(9),
+            None,
+            Some(&emb),
+        )
+        .unwrap();
+
+        let nothing = std::collections::HashSet::new();
+        let t = db
+            .resolve_wikilink("Nebula Rollout", &nothing)
+            .unwrap()
+            .expect("an exact-title org item must resolve");
+        assert_eq!(t.kind, "org");
+        assert_eq!(t.id, "it-shared", "org leg must carry the ORG item id, never a local id");
+    }
+
+    /// NEGATIVE (mirrors `org_tombstone_evicts_from_retrieval_and_viewer` /
+    /// `org_brain_available_requires_at_least_one_enabled_org`): a TOMBSTONED org item, or one
+    /// whose org is joined but per-instance DISABLED, must NOT resolve — the new leg must not be any
+    /// laxer than the existing `get_org_item`/`search_org_brain_hits` gate.
+    #[test]
+    fn resolve_wikilink_excludes_tombstoned_and_disabled_org_items() {
+        let db = mem_db();
+        seed_org_state(&db, "org-1");
+        seed_org_state(&db, "org-2");
+        let emb = crate::embed::StubEmbedder;
+        db.upsert_org_item(
+            "it-gone",
+            "org-1",
+            1,
+            "anna",
+            "Ghost Doc",
+            "this item will be tombstoned",
+            "2026-07-10T09:00:00Z",
+            1,
+            1,
+            &sha32(10),
+            None,
+            Some(&emb),
+        )
+        .unwrap();
+        db.upsert_org_item(
+            "it-disabled",
+            "org-2",
+            1,
+            "bob",
+            "Disabled Org Doc",
+            "this org is disabled on this install",
+            "2026-07-10T09:00:00Z",
+            1,
+            1,
+            &sha32(11),
+            None,
+            Some(&emb),
+        )
+        .unwrap();
+
+        let nothing = std::collections::HashSet::new();
+        // Sanity: both resolve before we exclude them.
+        assert!(db.resolve_wikilink("Ghost Doc", &nothing).unwrap().is_some());
+        assert!(
+            db.resolve_wikilink("Disabled Org Doc", &nothing)
+                .unwrap()
+                .is_some()
+        );
+
+        db.tombstone_org_item("it-gone").unwrap();
+        assert!(
+            db.resolve_wikilink("Ghost Doc", &nothing).unwrap().is_none(),
+            "a tombstoned org item must not resolve as a wikilink target"
+        );
+
+        db.set_org_context_enabled("org-2", false).unwrap();
+        assert!(
+            db.resolve_wikilink("Disabled Org Doc", &nothing)
+                .unwrap()
+                .is_none(),
+            "a per-instance-disabled org's item must not resolve as a wikilink target"
+        );
     }
 
     /// `list_link_candidates_visible` prefix-filters (case-insensitively) over notes + meetings,

@@ -6181,10 +6181,12 @@ pub fn get_backlinks(
     state.db.backlinks_for_visible(kind, &target_id, &unlocked)
 }
 
-/// Resolve a clicked `[[Title]]` wikilink to a VISIBLE note/meeting to navigate to. Returns `None`
-/// when nothing matches OR the only match is a sealed-and-not-session-unlocked target (gated in
-/// `Db::resolve_wikilink`) — so a wikilink click never reveals or opens locked content. The FE
-/// routes on `kind`, or offers to create a note when `None`.
+/// Resolve a clicked `[[Title]]` wikilink to a VISIBLE note/meeting/org-item to navigate to.
+/// Returns `None` when nothing matches OR the only local match is a
+/// sealed-and-not-session-unlocked target (gated in `Db::resolve_wikilink`) — so a wikilink click
+/// never reveals or opens locked content. The org leg (2026-07-15) is gated by membership +
+/// per-instance-enabled, the same seam `list_link_candidates`/`search_org_brain_hits` use. The FE
+/// routes on `kind` (`"meeting"` | `"note"` | `"org"`), or offers to create a note when `None`.
 #[tauri::command]
 pub fn resolve_wikilink(
     state: State<'_, AppState>,
