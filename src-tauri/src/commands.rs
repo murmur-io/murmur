@@ -24114,6 +24114,93 @@ mod lifecycle_tests {
         );
     }
 
+    /// Pins the STATUS leg of the delete condition ALONE (adversarial re-review R2): a COMPLETED
+    /// (Summarized) meeting with audio ON DISK still must not be purged — retry refuses non-Error
+    /// status, so deletion would be loss even though the audio survives.
+    #[test]
+    fn relock_reblank_leaves_completed_meeting_even_with_audio_on_disk() {
+        let state = build_state("relock-noloss-status-leg");
+        let dir =
+            std::env::temp_dir().join(format!("murmur-relock-statusleg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let wav = dir.join("m-sum.wav");
+        std::fs::write(&wav, b"RIFF-archived-audio").unwrap();
+
+        seed_meeting(&state.db, "m-sum", "# completed", None);
+        state
+            .db
+            .finalize_meeting("m-sum", "2026-07-16T10:00:00Z", 60, &wav.to_string_lossy())
+            .unwrap();
+        state
+            .db
+            .update_meeting_status("m-sum", MeetingStatus::Summarized)
+            .unwrap();
+        state
+            .db
+            .insert_folder(&Folder {
+                id: "f-sum".into(),
+                name: "Sum".into(),
+                path: "Sum".into(),
+                parent_id: None,
+                locked: true,
+                created_at: "2026-07-16T00:00:00Z".into(),
+            })
+            .unwrap();
+        state.db.set_meeting_folder("m-sum", Some("f-sum")).unwrap();
+
+        reblank_folder_extras(&state, "f-sum").unwrap();
+
+        let segs = state.db.raw_segments("m-sum").unwrap();
+        assert!(
+            !segs.is_empty() && segs.iter().any(|s| !s.text.is_empty()),
+            "a Summarized meeting's blob-less rows survive even with audio on disk (retry refuses non-Error)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Pins the AUDIO leg of the delete condition ALONE (adversarial re-review R3): an Error
+    /// meeting whose archived audio is GONE from disk (pruned/dangling path) must not be purged —
+    /// there is nothing to re-transcribe from, so deletion would be loss.
+    #[test]
+    fn relock_reblank_leaves_error_meeting_whose_audio_is_gone() {
+        let state = build_state("relock-noloss-audio-leg");
+        seed_meeting(&state.db, "m-err", "# failed run", None);
+        state
+            .db
+            .finalize_meeting(
+                "m-err",
+                "2026-07-16T10:00:00Z",
+                60,
+                "/nonexistent/murmur-pruned/m-err.wav",
+            )
+            .unwrap();
+        state
+            .db
+            .update_meeting_status("m-err", MeetingStatus::Error)
+            .unwrap();
+        state
+            .db
+            .insert_folder(&Folder {
+                id: "f-err".into(),
+                name: "Err".into(),
+                path: "Err".into(),
+                parent_id: None,
+                locked: true,
+                created_at: "2026-07-16T00:00:00Z".into(),
+            })
+            .unwrap();
+        state.db.set_meeting_folder("m-err", Some("f-err")).unwrap();
+
+        reblank_folder_extras(&state, "f-err").unwrap();
+
+        let segs = state.db.raw_segments("m-err").unwrap();
+        assert!(
+            !segs.is_empty() && segs.iter().any(|s| !s.text.is_empty()),
+            "an Error meeting's blob-less rows survive when its audio is gone (nothing to re-derive from)"
+        );
+    }
+
     /// LOCK MODEL (2026-07-16 lock-review fix direction): with the session KEK cached (the
     /// `relock_folder` path), non-rederivable crash-window plaintext is SEALED in place under the
     /// folder CK (verify-before-blank) instead of deleted or left plaintext.
