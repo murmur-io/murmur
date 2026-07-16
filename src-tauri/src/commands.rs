@@ -25381,9 +25381,16 @@ mod lifecycle_tests {
 
         let err = block_on(delete_org_item_as_author_inner(&state, "item-theirs"))
             .expect_err("a non-author must NOT be able to remove someone else's org item");
+        // Match the EXACT ownership-gate message, not just the AppError variant — this test's
+        // harness has no reachable server (share_base_url unset), so a coincidental error from a
+        // LATER step (e.g. the tombstone network call) could ALSO surface as an Auth variant,
+        // silently defeating this test if the gate itself were ever removed. Pinning the literal
+        // message proves the refusal came from the ownership check specifically (adversarial
+        // review of PR #340 found the un-tightened version of this assertion still passed with
+        // the ownership gate deleted entirely).
         assert!(
-            matches!(err, AppError::Auth(_)),
-            "expected an Auth refusal, got {err:?}"
+            matches!(&err, AppError::Auth(msg) if msg == "you can only remove org notes you authored"),
+            "expected the ownership-gate's exact Auth refusal, got {err:?}"
         );
         // Untouched: still live, still Bob's — the ownership gate ran before any tombstone attempt.
         let detail = state.db.get_org_item("item-theirs").unwrap().unwrap();
