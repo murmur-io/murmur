@@ -27,10 +27,23 @@
   cursor: default;
 }
 
-/* ===== Sticky header ===== */
+/* ===== Sticky header =====
+   Horizontal-only layout bug (confirmed — NOT a tab-strip desync): this is a
+   single flex row with `.head-spacer { flex: 1 1 auto }` and no wrap, so at a
+   narrow window the crumb/save-state/Edit-Preview/Share/⋯ cluster runs out of
+   room and jams together. `flex-wrap: wrap` (the `gap` shorthand already sets
+   BOTH row- and column-gap, so no separate `row-gap` override is needed —
+   adding one alongside the shorthand elsewhere folded the build's CSS
+   optimizer into an invalid empty `column-gap`) lets the cluster drop to a
+   second line instead of overlapping/clipping; `.head-spacer` shrinks to 0
+   (not just flex-basis 0 — an empty flex item still claims its content
+   min-width) so it never forces an early wrap by itself, and `.save-state`
+   (the least critical element — a hint, not an action) is de-prioritized via
+   `order` so wrapping affects it before the action buttons themselves. */
 .editor-head {
   flex: none;
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: var(--space-2);
   padding: var(--space-4) var(--space-6) var(--space-3);
@@ -38,6 +51,15 @@
 }
 .head-spacer {
   flex: 1 1 auto;
+  min-width: 0;
+}
+/* De-prioritized: the autosave hint (`.save-state`, styled below under
+   "Autosave indicator") wraps onto its own line before the action buttons
+   (Edit/Preview/Share/⋯) ever get cramped. */
+.head-seg,
+.head-btn,
+.head-more {
+  order: 2;
 }
 
 /* Breadcrumb / more triggers. */
@@ -150,11 +172,16 @@
   font-size: 0.82rem;
 }
 
-/* Autosave indicator. */
+/* Autosave indicator. `order: 1` (default is 0 for every other header child,
+   `.head-seg`/`.head-btn`/`.head-more` are explicitly 2) makes this the
+   FIRST thing to drop to a second line when `.editor-head` wraps at a narrow
+   width — it's a hint, not an action, so it's the least-critical element to
+   de-prioritize ahead of the Edit/Preview/Share/⋯ cluster. */
 .save-state {
   display: inline-flex;
   align-items: center;
   gap: var(--space-1);
+  order: 1;
   min-width: 70px;
   font-size: 0.78rem;
   color: var(--text-muted);
