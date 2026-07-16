@@ -24,7 +24,12 @@ guard args.count >= 2 else {
     exit(2)
 }
 let outURL = URL(fileURLWithPath: args[1])
-let maxSeconds: Double = args.count >= 3 ? (Double(args[2]) ?? 0) : 0
+// Wall-clock self-cap. An explicit `maxSeconds` argument wins; absent / unparsable / ≤ 0 falls
+// back to a DEFAULT 4h cap (mirrors `MAX_RECORDING_SECONDS`, audio/recorder.rs) — NEVER uncapped:
+// an uncapped orphan means unbounded disk writes (a real one outlived its parent by 7h20m and
+// wrote 2+ GB of dead-session audio).
+let requestedMaxSeconds: Double = args.count >= 3 ? (Double(args[2]) ?? 0) : 0
+let maxSeconds: Double = requestedMaxSeconds > 0 ? requestedMaxSeconds : 4 * 60 * 60
 
 guard #available(macOS 14.4, *) else {
     FileHandle.standardError.write(Data("audiocap: requires macOS 14.4+\n".utf8))
@@ -262,6 +267,27 @@ for sig in [SIGINT, SIGTERM] {
     _ = Unmanaged.passRetained(src)  // keep alive for process lifetime
 }
 
+// Parent-liveness watchdog: this helper must never outlive the Murmur process that spawned it.
+// The parent normally SIGTERMs us on Stop/quit — but a SIGKILL'd / crashed / hot-rebuilt parent
+// sends nothing, and the orphan then keeps capturing until the self-cap (the 7h20m incident).
+// kqueue-backed EVFILT_PROC/NOTE_EXIT via DispatchSource — event-driven, no polling — routed into
+// the SAME clean-stop path the signals use, so the WAV is flushed + closed before exit.
+let parentPid = getppid()
+// Already reparented to launchd (ppid 1) = the parent died while we were still launching. The
+// Rust core always spawns this helper as a DIRECT child, so ppid 1 can only mean "orphaned before
+// we could even observe the real parent" — watching launchd would wait forever (empirically
+// verified: a parent that exits right after fork leaves the helper seeing ppid 1).
+if parentPid == 1 { requestStop(0) }
+let parentWatch = DispatchSource.makeProcessSource(
+    identifier: parentPid, eventMask: .exit, queue: sigQueue)
+parentWatch.setEventHandler { requestStop(0) }
+parentWatch.resume()
+_ = Unmanaged.passRetained(parentWatch)  // keep alive for process lifetime
+// Close the registration race: if the parent died BEFORE the source was armed, its NOTE_EXIT
+// already fired unseen and we were reparented (getppid() changed) — stop now instead of waiting
+// on an event that will never come.
+if getppid() != parentPid { requestStop(0) }
+
 do {
     try capturer.start()
 } catch {
@@ -289,8 +315,9 @@ watchdog.setEventHandler {
 watchdog.resume()
 _ = Unmanaged.passRetained(watchdog)
 
-if maxSeconds > 0 {
-    sigQueue.asyncAfter(deadline: .now() + maxSeconds) { requestStop(0) }
-}
+// Self-cap — ALWAYS armed (default 4h; see the `maxSeconds` derivation at the top).
+// `wallDeadline` (not `deadline`): `DispatchTime` PAUSES while the machine sleeps, silently
+// stretching the cap past its wall-clock intent — `DispatchWallTime` does not.
+sigQueue.asyncAfter(wallDeadline: .now() + maxSeconds) { requestStop(0) }
 
 RunLoop.main.run()
