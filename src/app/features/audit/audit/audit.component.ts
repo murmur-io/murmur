@@ -5,7 +5,12 @@ import {
   inject,
   signal,
 } from "@angular/core";
-import type { AuditFinding, AuditFindingKind } from "../../../core/models";
+import type {
+  AuditExplanation,
+  AuditFinding,
+  AuditFindingKind,
+} from "../../../core/models";
+import { IpcService } from "../../../core/ipc.service";
 import { MurSpinnerComponent } from "../../../design-system/spinner/spinner.component";
 import { ToastService } from "../../../services/toast.service";
 import { MarkdownComponent } from "../../../shared/markdown/markdown.component";
@@ -44,6 +49,37 @@ const KIND_META: Record<
 };
 
 /**
+ * Epoch → "today" / "yesterday" / "N days ago" / a short date (the
+ * people-page idiom). The backend timestamps are epoch numbers; values below
+ * 10^12 are seconds, above are millis — normalize so either shape renders.
+ */
+function relativeDayLabel(epoch: number): string {
+  const ms = epoch < 1_000_000_000_000 ? epoch * 1000 : epoch;
+  const d = new Date(ms);
+  if (isNaN(d.getTime())) {
+    return "";
+  }
+  const now = new Date();
+  const startOfDay = (x: Date): number =>
+    new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime();
+  const days = Math.round((startOfDay(now) - startOfDay(d)) / 86_400_000);
+  if (days <= 0) {
+    return "today";
+  }
+  if (days === 1) {
+    return "yesterday";
+  }
+  if (days < 7) {
+    return `${days} days ago`;
+  }
+  const opts: Intl.DateTimeFormatOptions =
+    d.getFullYear() === now.getFullYear()
+      ? { month: "short", day: "numeric" }
+      : { month: "short", day: "numeric", year: "numeric" };
+  return d.toLocaleDateString(undefined, opts);
+}
+
+/**
  * VAULT AUDIT — a collapsible Brain-page section (mirrors the scheduled-briefs
  * section): an "Audit now" trigger plus the propose-accept FINDINGS INBOX,
  * grouped by kind. Every finding is review-then-apply: Accept (only offered
@@ -66,6 +102,7 @@ const KIND_META: Record<
 })
 export class AuditComponent {
   protected readonly store = inject(AuditStore);
+  private readonly ipc = inject(IpcService);
   private readonly toast = inject(ToastService);
 
   /** The user's manual collapse/expand toggle (auto-opens on "Audit now"). */
@@ -74,7 +111,33 @@ export class AuditComponent {
   /** The finding id with a resolve in flight (disables just that row's buttons). */
   readonly busyId = signal<string | null>(null);
 
+  /** Finding ids with an explain in flight — at most ONE per row. */
+  readonly explaining = signal<ReadonlySet<string>>(new Set());
+
+  /** Resolved AI explanations by finding id (rendered inline, collapsible). */
+  readonly explanations = signal<ReadonlyMap<string, AuditExplanation>>(
+    new Map(),
+  );
+
+  /** Finding ids whose loaded explanation the user collapsed. */
+  readonly explainCollapsed = signal<ReadonlySet<string>>(new Set());
+
   readonly listEmpty = computed(() => this.store.pendingCount() === 0);
+
+  /**
+   * The passive weekly-schedule chip: "Weekly: on · last run yesterday".
+   * Read-only ON PURPOSE — the toggle lives in Settings (no navigation
+   * coupling from the inbox). Null until the schedule loads.
+   */
+  readonly weeklyChip = computed<string | null>(() => {
+    const s = this.store.schedule();
+    if (!s) {
+      return null;
+    }
+    const state = s.enabled ? "on" : "off";
+    const last = s.lastRunAt ? relativeDayLabel(s.lastRunAt) : "";
+    return last ? `Weekly: ${state} · last run ${last}` : `Weekly: ${state}`;
+  });
 
   /** "N new findings · M pending" — shown once a manual run completed. */
   readonly summaryLine = computed(() => {
@@ -126,6 +189,49 @@ export class AuditComponent {
       this.toast.danger(String(e));
     } finally {
       this.busyId.set(null);
+    }
+  }
+
+  /**
+   * "Explain (AI)" — fetch (once) an AI explanation for one finding and render
+   * it inline; once loaded the button toggles the collapsible block instead of
+   * re-fetching. One in flight per row; a rejection toasts the backend message
+   * VERBATIM (consent-missing / Locked included) and leaves the row unchanged.
+   * Stale guard: a response landing after the row resolved or vanished
+   * (accept/dismiss/seal-purge mid-flight) is dropped.
+   */
+  async explain(f: AuditFinding): Promise<void> {
+    const id = f.id;
+    if (this.explaining().has(id)) {
+      return;
+    }
+    if (this.explanations().has(id)) {
+      this.explainCollapsed.update((s) => {
+        const next = new Set(s);
+        if (!next.delete(id)) {
+          next.add(id);
+        }
+        return next;
+      });
+      return;
+    }
+    this.explaining.update((s) => new Set(s).add(id));
+    try {
+      const ex = await this.ipc.explainAuditFinding(id);
+      const stillPending = this.store
+        .findings()
+        .some((x) => x.id === id && x.status === "pending");
+      if (stillPending) {
+        this.explanations.update((m) => new Map(m).set(id, ex));
+      }
+    } catch (e) {
+      this.toast.danger(String(e));
+    } finally {
+      this.explaining.update((s) => {
+        const next = new Set(s);
+        next.delete(id);
+        return next;
+      });
     }
   }
 }

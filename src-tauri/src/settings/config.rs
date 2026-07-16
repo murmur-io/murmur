@@ -319,6 +319,16 @@ pub struct AppConfig {
     /// persists (a stored `false` is honored across reload; see `semantic_flag_off_round_trips`).
     #[serde(default = "default_true")]
     pub semantic_search_enabled: bool,
+    /// Vault Audit Phase 3 — the WEEKLY scheduled audit pass (an hourly due-check inside the
+    /// consolidation-loop cadence; see `crate::audit::audit_weekly_tick`). Default ON — the
+    /// feature's promise is ambient vault health (the pass is deterministic, zero-egress and
+    /// thermal/RAM-gated, so default-on costs a model-less install nothing beyond one weekly
+    /// deterministic scan). `#[serde(default = "default_true")]` ⇒ a config persisted before this
+    /// field existed loads as `true`. Preserve-only on the settings DTO: the dedicated
+    /// `set_audit_schedule` command is the ONLY mutator (a partial/older settings save can never
+    /// silently flip the schedule).
+    #[serde(default = "default_true")]
+    pub vault_audit_weekly_enabled: bool,
     /// brain2 RAG Phase 2 — the SELECTED on-device embedding model id (from
     /// [`crate::embed::EMBED_MODELS`], e.g. `"multilingual-e5-small"` (default) / `"mmlw-retrieval-e5-small"`).
     /// `None`/empty (the default) resolves to `multilingual-e5-small` ⇒ BYTE-IDENTICAL to the
@@ -657,6 +667,7 @@ impl Default for AppConfig {
             org_egress_consented: false,
             sharing_choice_made: false,
             semantic_search_enabled: true,
+            vault_audit_weekly_enabled: true,
             embed_model_id: None,
             brain_model_path: None,
             brain_model_id: None,
@@ -749,6 +760,7 @@ const K_SHARE_EGRESS_CONSENTED: &str = "share_egress_consented";
 const K_ORG_EGRESS_CONSENTED: &str = "org_egress_consented";
 const K_SHARING_CHOICE_MADE: &str = "sharing_choice_made";
 const K_SEMANTIC_SEARCH_ENABLED: &str = "semantic_search_enabled";
+const K_VAULT_AUDIT_WEEKLY_ENABLED: &str = "vault_audit_weekly_enabled";
 const K_EMBED_MODEL_ID: &str = "embed_model_id";
 const K_BRAIN_MODEL_PATH: &str = "brain_model_path";
 const K_BRAIN_MODEL_ID: &str = "brain_model_id";
@@ -954,6 +966,9 @@ impl AppConfig {
         }
         if let Some(v) = db.get_setting(K_SEMANTIC_SEARCH_ENABLED)? {
             cfg.semantic_search_enabled = v == "true";
+        }
+        if let Some(v) = db.get_setting(K_VAULT_AUDIT_WEEKLY_ENABLED)? {
+            cfg.vault_audit_weekly_enabled = v == "true";
         }
         cfg.embed_model_id = opt(db.get_setting(K_EMBED_MODEL_ID)?);
         // Publish the selection to the process-global seam the zero-arg embedder resolvers read
@@ -1263,6 +1278,14 @@ impl AppConfig {
             },
         )?;
         db.set_setting(
+            K_VAULT_AUDIT_WEEKLY_ENABLED,
+            if self.vault_audit_weekly_enabled {
+                "true"
+            } else {
+                "false"
+            },
+        )?;
+        db.set_setting(
             K_EMBED_MODEL_ID,
             self.embed_model_id.as_deref().unwrap_or(""),
         )?;
@@ -1502,6 +1525,19 @@ impl AppConfig {
     pub fn set_sharing_choice_made(&mut self, db: &Db) -> Result<()> {
         db.set_setting(K_SHARING_CHOICE_MADE, "true")?;
         self.sharing_choice_made = true;
+        Ok(())
+    }
+
+    /// Vault Audit Phase 3 — flip the weekly scheduled-audit flag. The ONLY mutator (the field is
+    /// preserve-only on the settings DTO, so a generic settings save can never flip it). Mirrors
+    /// [`set_sharing_choice_made`]'s fail-safe ordering: persist FIRST, flip the in-memory flag
+    /// ONLY on a durable write success. Idempotent.
+    pub fn set_vault_audit_weekly(&mut self, db: &Db, enabled: bool) -> Result<()> {
+        db.set_setting(
+            K_VAULT_AUDIT_WEEKLY_ENABLED,
+            if enabled { "true" } else { "false" },
+        )?;
+        self.vault_audit_weekly_enabled = enabled;
         Ok(())
     }
 
@@ -2037,6 +2073,43 @@ mod tests {
         };
         cfg.save(&db).unwrap();
         assert!(!AppConfig::load(&db).unwrap().semantic_search_enabled);
+    }
+
+    /// Vault Audit Phase 3: the weekly-audit flag defaults ON (a fresh DB and a config persisted
+    /// before the field existed both load `true`), an explicit opt-out round-trips, and the
+    /// dedicated mutator (the only supported one) persists durably.
+    #[test]
+    fn vault_audit_weekly_defaults_on_and_mutator_round_trips() {
+        let db = temp_db();
+        assert!(AppConfig::default().vault_audit_weekly_enabled);
+        assert!(
+            AppConfig::load(&db).unwrap().vault_audit_weekly_enabled,
+            "an empty DB (no stored key) must default the weekly audit ON"
+        );
+        // A config JSON that OMITS the field (persisted before it existed) loads as true —
+        // the same pre-field payload shape `missing_semantic_flag_defaults_on` exercises.
+        let json = r#"{
+            "providerId":"claude_code","vaultPath":null,"vaultSubfolder":null,
+            "whisperModelPath":null,"language":null,"anthropicModel":"claude-opus-4-8",
+            "ollamaBaseUrl":"http://localhost:11434","ollamaModel":"llama3.1","claudeBinary":"claude",
+            "inputDevice":null,"captureSystemAudio":false,"vadEnabled":true,"keepHiresMasters":false,
+            "diarizeOthers":false,"aecEnabled":false,"postAecEnabled":true,"modelSize":"large-v3","voiceTrigger":false,
+            "onboarded":false,"noteStyle":"standard","autoOrganize":false,"noteLanguage":"auto",
+            "mcpRequireToken":true,"lockRequireBiometric":true,"relockOnScreenshare":true,
+            "cloudEgressConsented":false
+        }"#;
+        let omitted: AppConfig = serde_json::from_str(json).unwrap();
+        assert!(omitted.vault_audit_weekly_enabled, "serde default must be true");
+
+        let mut cfg = AppConfig::load(&db).unwrap();
+        cfg.set_vault_audit_weekly(&db, false).unwrap();
+        assert!(!cfg.vault_audit_weekly_enabled, "mutator flips the in-memory flag");
+        assert!(
+            !AppConfig::load(&db).unwrap().vault_audit_weekly_enabled,
+            "the opt-out persists across reload"
+        );
+        cfg.set_vault_audit_weekly(&db, true).unwrap();
+        assert!(AppConfig::load(&db).unwrap().vault_audit_weekly_enabled);
     }
 
     /// Tier 3b (B): `ground_summary` defaults OFF / opt-in (empty DB ⇒ false, thresholds uncalibrated),
