@@ -460,8 +460,19 @@ pub fn active_embedder() -> Box<dyn Embedder> {
     if std::env::var_os("MURMUR_TEST_REAL_EMBED").is_none() {
         return Box::new(StubEmbedder);
     }
-    let model = selected_embed_model();
-    if embed_model_present() {
+    active_embedder_impl(embed_model_present(), selected_embed_model())
+}
+
+/// Testable core of [`active_embedder`]'s presence-keyed selection (split out so the
+/// model-absent → cache-release rule can be driven deterministically in tests, past both the
+/// `cfg(test)` stub guard and this machine's real on-disk model state).
+///
+/// Hardening 2026-07-16: when the selected model is NOT present (the user deleted the model dir
+/// mid-session, or switched to a not-yet-downloaded model), the process-wide cache entry is
+/// RELEASED before serving the stub — previously the evicted-only-on-dir-change cache kept the
+/// once-loaded instance (~470 MB of e5 weights) pinned until restart.
+fn active_embedder_impl(model_present: bool, model: &'static EmbedModel) -> Box<dyn Embedder> {
+    if model_present {
         let built = embed_model_dir().and_then(|dir| cached_real_embedder(dir, model));
         match built {
             Ok(e) => return Box::new(SharedEmbedder(e)),
@@ -470,9 +481,26 @@ pub fn active_embedder() -> Box<dyn Embedder> {
             }
         }
     } else {
+        release_real_embedder_cache();
         tracing::info!(target: "embed", model_id = %model.id, "no local embed model present; using stub embedder");
     }
     Box::new(StubEmbedder)
+}
+
+/// Drop the process-wide cached real-embedder entry so a deleted/deselected model actually
+/// returns its RAM (the `Arc` + lazily-loaded weights) instead of pinning it until restart.
+/// Poison-safe (the cache holds no invariant worth failing over — recover the guard and clear)
+/// and panic-free; a no-op when nothing is cached. An in-flight forward pass holding its own
+/// `Arc` clone finishes safely — the weights free when the LAST clone drops.
+fn release_real_embedder_cache() {
+    let evicted = REAL_EMBEDDER_CACHE
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+        .is_some();
+    if evicted {
+        tracing::info!(target: "embed", "released cached embed model (model no longer present)");
+    }
 }
 
 /// FNV-1a 64-bit hash of a string (stable across runs/platforms — no `DefaultHasher` randomization).
@@ -2170,6 +2198,46 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir1);
         let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    /// Hardening item 3 (RED-before-GREEN): deleting the model dir MID-SESSION must RELEASE the
+    /// process-wide cached instance. Pre-fix, `active_embedder`'s model-absent branch served the
+    /// stub while `REAL_EMBEDDER_CACHE` kept the previous instance (~470 MB once loaded) pinned
+    /// until restart — the cache only ever evicted on a dir CHANGE, never on absence. Drives the
+    /// REAL selection core (`active_embedder_impl`, exactly what `active_embedder` calls past its
+    /// `cfg(test)` stub guard) with `model_present == false` and asserts the entry is gone.
+    #[test]
+    fn model_absent_releases_the_cached_embedder() {
+        let _g = EMBED_SELECTION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Populate: the cache holds the instance for a (fake) on-disk model dir.
+        let dir = fake_model_dir("release");
+        let cached = cached_real_embedder(dir.clone(), default_embed_model()).unwrap();
+        {
+            let g = REAL_EMBEDDER_CACHE
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            let (key, arc) = g.as_ref().expect("precondition: the cache holds an entry");
+            assert_eq!(key, &dir);
+            assert!(Arc::ptr_eq(arc, &cached));
+        }
+        drop(cached); // the cache now holds the LAST Arc — exactly the mid-session steady state
+
+        // The model dir disappears mid-session (user deleted it to reclaim disk).
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // The next embedder resolution sees model_present == false → stub AND a cleared cache.
+        let e = active_embedder_impl(false, default_embed_model());
+        assert_eq!(e.dim(), EMBED_DIM, "the stub is served when the model is absent");
+        assert!(
+            REAL_EMBEDDER_CACHE
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_none(),
+            "the cached instance must be RELEASED when the model is no longer present \
+             (otherwise ~470 MB stays pinned until restart)"
+        );
     }
 
     /// A missing model file makes the cache resolution fail LOUD (Err, never a panic) and never
