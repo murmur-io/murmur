@@ -151,6 +151,27 @@ export interface NoteItem {
   threadPending: boolean;
   persisted: boolean;
   threadId: string | null;
+  /**
+   * COMPANION NOTE reference. A sent plain jot / accepted `@brain` draft is
+   * appended to the meeting's ONE living companion note via
+   * `append_to_companion_note`; on success the returned reference is stamped here
+   * so the line renders a "✓ Saved to Notes" card:
+   *   - `savedNoteId`     — the companion note's document id (open it by id via
+   *                         `TabsService.openNote`); `undefined` while the append
+   *                         is in flight or if it hasn't been routed through the
+   *                         companion path (a hydrated / thread-anchor line);
+   *   - `meetingWikilink` — the visible `[[Meeting]]` display link for the card's
+   *                         meeting chip (navigation goes by `meetingId`, not this
+   *                         string);
+   *   - `saveState`       — the append lifecycle: `"saving"` (optimistic, in
+   *                         flight), `"saved"` (reference stamped), or `"error"`
+   *                         (the append failed — the line is kept, never dropped,
+   *                         and the card shows a retry). Absent for lines that
+   *                         never went through the companion path.
+   */
+  savedNoteId?: string;
+  meetingWikilink?: string;
+  saveState?: "saving" | "saved" | "error";
 }
 
 /**
@@ -713,25 +734,99 @@ export class MeetingConversationStore {
   }
 
   /**
-   * Add a plain NOTE line to the main flow (the non-@brain path) + persist. The
-   * line is the user's own note (never sent to the agent). A no-op for blank text.
+   * Add a plain NOTE line to the main flow (the non-@brain path). The line is the
+   * user's own note (never sent to the agent). A no-op for blank text.
+   *
+   * The line is now a REAL, LINKED note: OPTIMISTICALLY appended to the flow
+   * (`saveState: "saving"`), then persisted to the meeting's ONE living companion
+   * note via {@link appendCompanion} — on success the returned
+   * `{ noteId, meetingWikilink }` is stamped onto THIS line so it renders the
+   * "✓ Saved to Notes" card; on failure the line stays (never dropped) with
+   * `saveState: "error"` + a retry. `manual_notes` is ALSO refreshed additively
+   * (the summary / enhance pipeline still reads it — see {@link persistNotes}).
    */
   addNote(text: string): void {
     const t = text.trim();
     if (!t) return;
+    const noteId = this.nextNoteId++;
     this._notes.update((ns) => [
       ...ns,
       {
-        id: this.nextNoteId++,
+        id: noteId,
         text: t,
         thread: null,
         threadOpen: false,
         threadPending: false,
         persisted: true,
         threadId: null,
+        saveState: "saving",
       },
     ]);
+    // Additive: keep the manual_notes buffer in sync (enhance/summary reads it).
     this.persistNotes();
+    // Durable, linked artifact: append to the companion note + stamp the card ref.
+    void this.appendCompanion(noteId, t);
+  }
+
+  /**
+   * Append a flow line's markdown to the meeting's companion note and stamp the
+   * returned reference onto THAT line so its "✓ Saved to Notes" card can render.
+   *
+   * STALE-RESULT GUARDED two ways: (1) the meeting id is captured at call time —
+   * a response that lands after the store points at a DIFFERENT meeting is
+   * dropped (the line belongs to the old meeting, whose flow was cleared); (2) the
+   * target line is re-found by its stable, never-reused `id` at resolve time — if
+   * it's gone (a new recording / meeting change cleared the flow) the response is
+   * a no-op, never mis-stamped onto a different line. On success:
+   * `saveState: "saved"` + `savedNoteId` + `meetingWikilink`; on failure:
+   * `saveState: "error"` (the line is KEPT — never destroy content the user typed;
+   * the card offers a retry). A no-op when there's no meeting yet (nothing to link
+   * to — the line still shows locally; a later {@link retrySave} once a meeting
+   * exists can persist it).
+   */
+  private async appendCompanion(noteId: number, markdown: string): Promise<void> {
+    const meetingId = this._meetingId();
+    if (!meetingId) {
+      // No meeting to link to yet — leave the optimistic "saving" state off (the
+      // line simply isn't a companion note yet). Clear the transient flag so it
+      // doesn't spin forever with nothing in flight.
+      this.patchNote(noteId, { saveState: undefined });
+      return;
+    }
+    try {
+      const res = await this.ipc.appendToCompanionNote(meetingId, markdown);
+      // Drop a response that landed after we left this meeting (its line is gone).
+      if (this._meetingId() !== meetingId) return;
+      this.patchNote(noteId, {
+        saveState: "saved",
+        savedNoteId: res.noteId,
+        meetingWikilink: res.meetingWikilink,
+      });
+    } catch {
+      if (this._meetingId() !== meetingId) return;
+      // Keep the line; surface the failure on the card (retryable), never drop it.
+      this.patchNote(noteId, { saveState: "error" });
+    }
+  }
+
+  /** Immutably patch ONE flow line by its stable id (a no-op if it's gone). */
+  private patchNote(noteId: number, patch: Partial<NoteItem>): void {
+    this._notes.update((ns) =>
+      ns.map((n) => (n.id === noteId ? { ...n, ...patch } : n)),
+    );
+  }
+
+  /**
+   * Retry a FAILED companion-note append (the "✓ Saved to Notes" card's error
+   * state offers this). Re-optimistic (`saveState: "saving"`) then re-run the
+   * append for the line's current text. A no-op for a line that isn't in the
+   * error state.
+   */
+  retrySave(noteId: number): void {
+    const note = this._notes().find((n) => n.id === noteId);
+    if (!note || note.saveState !== "error") return;
+    this.patchNote(noteId, { saveState: "saving" });
+    void this.appendCompanion(noteId, note.text);
   }
 
   /**
@@ -1032,6 +1127,7 @@ export class MeetingConversationStore {
     // Append the PROPOSED note draft, never the whole conversational reply.
     const text = (turn.proposedNote ?? "").trim();
     if (!text) return;
+    const acceptedNoteId = this.nextNoteId++;
     this._notes.update((ns) => {
       const marked = ns.map((n) => {
         if (n.id !== noteId || !n.thread) return n;
@@ -1045,17 +1141,22 @@ export class MeetingConversationStore {
       return [
         ...marked,
         {
-          id: this.nextNoteId++,
+          id: acceptedNoteId,
           text,
           thread: null,
           threadOpen: false,
           threadPending: false,
           persisted: true,
           threadId: null,
+          // An accepted draft is a real, linked companion note too (same card).
+          saveState: "saving",
         },
       ];
     });
+    // Additive: keep manual_notes in sync (enhance/summary reads it).
     this.persistNotes();
+    // Route the accepted draft through the SAME companion-note path as a jot.
+    void this.appendCompanion(acceptedNoteId, text);
   }
 
   /**

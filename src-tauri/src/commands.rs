@@ -559,6 +559,15 @@ pub async fn start_recording(
     let meeting_id = meeting_uuid.to_string();
     let started_at = chrono::Utc::now().to_rfc3339();
 
+    // STABLE PROVISIONAL TITLE (2026-07-16 companion note, Task 4): at record start `meetings.title`
+    // was previously NULL — so `[[Meeting]]` had no meaningful target during the recording (the FE
+    // showed a placeholder). Give the in-progress meeting a stable, human, date/time-based title up
+    // front so a jotted companion note's `[[<name>]]` link is meaningful IMMEDIATELY. This is a
+    // PROVISIONAL name: the existing auto-title-on-close (`pipeline::set_meeting_title` from the
+    // generated note's front-matter) UPGRADES it, and the companion-note title-sync then refreshes
+    // the note's managed title + link. Local time (matches how the user experiences "when").
+    let provisional_title = provisional_meeting_title(&chrono::Local::now());
+
     // Persist the meeting in RECORDING state up-front so a crash mid-capture leaves a row behind
     // rather than losing the meeting silently. If this process dies before `stop_recording`, that
     // row is reconciled to the terminal ERROR state at the next launch
@@ -569,7 +578,7 @@ pub async fn start_recording(
         id: meeting_id.clone(),
         started_at,
         ended_at: None,
-        title: None,
+        title: Some(provisional_title),
         duration_s: 0,
         audio_path: None,
         status: MeetingStatus::Recording,
@@ -2198,6 +2207,253 @@ pub(crate) fn save_manual_notes_inner(
     set_manual_notes_reseal_if_locked(state, meeting_id, text)?;
     // PII rule: log only the meeting id + buffer length, never the typed text.
     tracing::debug!(target: "notes", meeting_id = %meeting_id, len = text.len(), "manual notes saved");
+    Ok(())
+}
+
+// ── Recording-time COMPANION NOTE (2026-07-16) ───────────────────────────────────────────────────
+//
+// During a recording, a jotted note must become a REAL, linked, standalone note — one living
+// companion note per meeting (a `documents` row, kind='note', in the always-open Notes ROOT). The
+// companion note is authored content only (what the user typed / accepted @brain drafts) — NEVER
+// the sealed transcript — so it lives in the open root and is not itself a seal target. The link is
+// TWO artifacts derived from ONE structured relation: the authoritative `documents.meeting_id`
+// column, and a user-visible YAML front-matter `meeting: "[[<name>]]"` wikilink kept in sync.
+
+/// The stable display NAME for a meeting used in the companion note's `[[<name>]]` wikilink + managed
+/// title. `meetings.title` when non-empty (Task 4 gives every in-progress meeting a provisional
+/// title at record start, upgraded by auto-title-on-close), else a safe fallback ("Untitled meeting")
+/// so the link is never `[[]]`. PURE — the caller supplies the current title.
+fn meeting_display_name(title: Option<&str>) -> String {
+    match title.map(str::trim) {
+        Some(t) if !t.is_empty() => t.to_string(),
+        _ => "Untitled meeting".to_string(),
+    }
+}
+
+/// A stable, human PROVISIONAL title for a meeting at record start ("Meeting 2026-07-16 14:05") from
+/// the local start time. PURE (the caller supplies `now`) so it is unit-testable without racing the
+/// clock. Meaningful immediately (so `[[<name>]]` links work during the recording) and stable (never
+/// changes mid-recording); auto-title-on-close upgrades it to a content-derived headline.
+fn provisional_meeting_title<Tz: chrono::TimeZone>(now: &chrono::DateTime<Tz>) -> String
+where
+    Tz::Offset: std::fmt::Display,
+{
+    format!("Meeting {}", now.format("%Y-%m-%d %H:%M"))
+}
+
+/// Result of [`append_to_companion_note`] — the companion note's id (for opening it) and the
+/// user-visible `[[<meeting display name>]]` wikilink the FE renders on the saved-note card.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompanionAppendResult {
+    pub note_id: String,
+    pub meeting_wikilink: String,
+}
+
+/// IDEMPOTENTLY ensure the note markdown's YAML front-matter carries `meeting: "[[<name>]]"`, then
+/// APPEND `block` to the body with a blank-line separator. PURE (no DB / no state) so the composition
+/// is unit-testable in isolation. Never blanks existing content: the prior body + prior front-matter
+/// keys are preserved; only the single managed `meeting:` key is (re)written to the current name, and
+/// the new block is added after the existing body.
+///
+/// - No front-matter yet → a fresh `---\nmeeting: "[[name]]"\n---` block is prepended.
+/// - Front-matter present, no `meeting:` key → the key is inserted (other keys untouched).
+/// - Front-matter present WITH a `meeting:` key → that line is rewritten to the current name
+///   (keeps the link correct across a rename); no duplicate key is ever added.
+fn compose_companion_markdown(current: &str, meeting_name: &str, block: &str) -> String {
+    let link_value = format!("\"[[{meeting_name}]]\"");
+    let (yaml, body) = crate::storage::db::split_front_matter(current);
+
+    // Rebuild the front-matter lines: rewrite an existing top-level `meeting:` key, else append it.
+    let mut fm_lines: Vec<String> = Vec::new();
+    let mut wrote_meeting = false;
+    if !yaml.is_empty() {
+        for raw in yaml.lines() {
+            // A top-level (unindented) `meeting:` key is the managed link line — rewrite it.
+            let is_meeting_key = !raw.starts_with(char::is_whitespace)
+                && raw
+                    .split_once(':')
+                    .map(|(k, _)| k.trim().eq_ignore_ascii_case("meeting"))
+                    .unwrap_or(false);
+            if is_meeting_key {
+                fm_lines.push(format!("meeting: {link_value}"));
+                wrote_meeting = true;
+            } else {
+                fm_lines.push(raw.to_string());
+            }
+        }
+    }
+    if !wrote_meeting {
+        fm_lines.push(format!("meeting: {link_value}"));
+    }
+    let front_matter = format!("---\n{}\n---", fm_lines.join("\n"));
+
+    // Append the block to the body with a blank-line separator (never overwrite prior body).
+    let body_trimmed = body.trim_end();
+    let block_trimmed = block.trim();
+    let new_body = if body_trimmed.is_empty() {
+        block_trimmed.to_string()
+    } else if block_trimmed.is_empty() {
+        body_trimmed.to_string()
+    } else {
+        format!("{body_trimmed}\n\n{block_trimmed}")
+    };
+
+    if new_body.is_empty() {
+        format!("{front_matter}\n")
+    } else {
+        format!("{front_matter}\n\n{new_body}\n")
+    }
+}
+
+/// `append_to_companion_note(meeting_id, markdown)` — turn an in-recording jot (or an accepted
+/// `@brain` draft) into a REAL, linked, standalone companion note. GATED: refuses a
+/// sealed-and-not-session-unlocked meeting (`AppError::Locked`) — mirrors the `save_note` tool's
+/// gate. Lazily gets-or-creates the ONE companion note (Notes ROOT, `meeting_id` set, managed title =
+/// the meeting's display name), APPENDS the block atomically under the lifecycle guard, refreshes the
+/// front-matter `[[Meeting]]` link, re-indexes + re-exports through the guarded standalone-note path,
+/// AND additively appends the same block to `manual_notes` (so the enhance/summary pipeline keeps
+/// seeing in-meeting notes — mirrors `tools::save_note`). Returns the note id + the display wikilink
+/// for the confirmation card. Never blanks prior content on any failure.
+#[tauri::command]
+pub fn append_to_companion_note(
+    state: State<'_, AppState>,
+    meeting_id: String,
+    markdown: String,
+) -> Result<CompanionAppendResult, AppError> {
+    append_to_companion_note_inner(state.inner(), &meeting_id, &markdown)
+}
+
+/// Inner of [`append_to_companion_note`] taking `&AppState` (unit-testable gate + lazy-create).
+pub(crate) fn append_to_companion_note_inner(
+    state: &AppState,
+    meeting_id: &str,
+    markdown: &str,
+) -> Result<CompanionAppendResult, AppError> {
+    let block = markdown.trim();
+    if block.is_empty() {
+        return Err(AppError::InvalidArg("nothing to note".into()));
+    }
+    if meeting_id.trim().is_empty() {
+        return Err(AppError::Locked(
+            "no meeting is being recorded — there is nothing to attach the note to".into(),
+        ));
+    }
+    // BLK-1 / TOCTOU: hold the lifecycle guard across gate + get-or-create + append so a concurrent
+    // lock/relock cannot land between the unlock check and the writes. `create_note_inner` /
+    // `update_note_doc_inner` also take this (reentrant `MutexGuard` is NOT allowed) — so we do NOT
+    // hold it here; instead we re-run the gate first, then delegate to those guarded helpers. The
+    // gate is re-checked inside each helper's own guard as well (defense-in-depth).
+    // GATE: refuse a sealed-and-not-session-unlocked meeting — never resurrect content behind a lock.
+    if !meeting_is_unlocked(state, meeting_id)? {
+        return Err(AppError::Locked(
+            "this meeting is locked — unlock it to save a note".into(),
+        ));
+    }
+
+    // The meeting's current display title drives the managed note title + the `[[<name>]]` link.
+    let Some(meeting) = state.db.get_meeting(meeting_id)? else {
+        return Err(AppError::InvalidArg(format!("no meeting {meeting_id}")));
+    };
+    let meeting_name = meeting_display_name(meeting.title.as_deref());
+    let meeting_wikilink = format!("[[{meeting_name}]]");
+
+    // GET-OR-CREATE the companion note in the always-open Notes ROOT (folder_id = None). A new
+    // companion note is birthed with the managed title = the meeting name, then structurally linked
+    // by `meeting_id`. `create_note_inner` holds its own lifecycle guard.
+    let note_id = match state.db.companion_note_for_meeting(meeting_id)? {
+        Some(id) => id,
+        None => {
+            let id = create_note_inner(state, None, &meeting_name)?;
+            state.db.set_document_meeting_id(&id, meeting_id)?;
+            tracing::info!(target: "notes", note_id = %id, meeting_id = %meeting_id, "companion note created");
+            id
+        }
+    };
+
+    // APPEND the block: read the current body, compose (front-matter link refreshed idempotently +
+    // block appended), and save through the standalone-note update path (re-index + guarded
+    // re-export). Read the CURRENT text via the row (the note is in the open root, so no mask). The
+    // managed title stays the meeting name — never blank it, never a user-facing title edit.
+    let Some(row) = state.db.get_note_row(&note_id)? else {
+        return Err(AppError::InvalidArg(format!("no note {note_id}")));
+    };
+    let new_markdown = compose_companion_markdown(&row.text, &meeting_name, block);
+    // `update_note_doc_inner` re-checks the folder gate under its own lifecycle guard, re-indexes,
+    // and re-exports through the guarded standalone-note path (external-edit preservation intact).
+    update_note_doc_inner(state, &note_id, &meeting_name, &new_markdown)?;
+
+    // ADDITIVELY append the SAME block to `manual_notes` so the enhance/summary pipeline keeps
+    // seeing in-meeting notes — mirrors `tools::save_note` (append, never overwrite; reseal-aware).
+    let existing = state.db.get_manual_notes(meeting_id).unwrap_or_default();
+    let merged = if existing.trim().is_empty() {
+        block.to_string()
+    } else {
+        format!("{existing}\n{block}")
+    };
+    set_manual_notes_reseal_if_locked(state, meeting_id, &merged)?;
+
+    // PII rule: ids + block length only — never the note text or the meeting title.
+    tracing::info!(target: "notes", note_id = %note_id, meeting_id = %meeting_id, len = block.len(), "appended to companion note");
+    Ok(CompanionAppendResult {
+        note_id,
+        meeting_wikilink,
+    })
+}
+
+/// Best-effort: refresh the COMPANION note's managed title + its front-matter `meeting: "[[…]]"`
+/// wikilink so the link/label stays correct when a meeting is (auto-)titled or renamed. A sync
+/// failure NEVER fails the rename (the meeting title is already persisted). No-op when the meeting
+/// has no companion note. Skips when the companion note's folder is sealed-not-unlocked (never write
+/// plaintext behind a lock — the sync re-applies on the next unlock+append).
+pub(crate) fn sync_companion_note_title_best_effort(state: &AppState, meeting_id: &str) {
+    if let Err(e) = sync_companion_note_title(state, meeting_id) {
+        // ids only — never the title text.
+        tracing::warn!(target: "notes", meeting_id = %meeting_id, error = %e, "companion note title sync failed (meeting title unaffected)");
+    }
+}
+
+fn sync_companion_note_title(state: &AppState, meeting_id: &str) -> Result<(), AppError> {
+    let Some(note_id) = state.db.companion_note_for_meeting(meeting_id)? else {
+        return Ok(()); // no companion note — nothing to sync.
+    };
+    let Some(meeting) = state.db.get_meeting(meeting_id)? else {
+        return Ok(());
+    };
+    let meeting_name = meeting_display_name(meeting.title.as_deref());
+    let Some(row) = state.db.get_note_row(&note_id)? else {
+        return Ok(());
+    };
+    // Skip a sealed-not-unlocked companion note (its plaintext is blanked; unlocking + a later
+    // append re-applies the correct title/link). `update_note_doc_inner` would refuse anyway.
+    if !folder_is_unlocked(state, &row.folder_id)? {
+        return Ok(());
+    }
+    // Nothing to do if the title AND the front-matter link already match (idempotent).
+    let (yaml, _body) = crate::storage::db::split_front_matter(&row.text);
+    let link_ok = yaml.lines().any(|l| {
+        !l.starts_with(char::is_whitespace)
+            && l.split_once(':')
+                .map(|(k, v)| {
+                    k.trim().eq_ignore_ascii_case("meeting")
+                        && v.contains(&format!("[[{meeting_name}]]"))
+                })
+                .unwrap_or(false)
+    });
+    let title_ok = row
+        .title
+        .as_deref()
+        .map(str::trim)
+        .map(|t| t == meeting_name)
+        .unwrap_or(false);
+    if link_ok && title_ok {
+        return Ok(());
+    }
+    // Re-write the managed title + refresh the `meeting:` front-matter line; body is UNCHANGED
+    // (empty block append). Routes through the guarded update path (re-index + re-export).
+    let new_markdown = compose_companion_markdown(&row.text, &meeting_name, "");
+    update_note_doc_inner(state, &note_id, &meeting_name, &new_markdown)?;
+    tracing::info!(target: "notes", note_id = %note_id, meeting_id = %meeting_id, "companion note title/link synced");
     Ok(())
 }
 
@@ -4759,7 +5015,11 @@ pub fn rename_meeting(
     if title.is_empty() {
         return Err(AppError::InvalidArg("title cannot be empty".into()));
     }
-    state.db.set_meeting_title(&meeting_id, title)
+    state.db.set_meeting_title(&meeting_id, title)?;
+    // Keep the companion note's managed title + front-matter `[[Meeting]]` link in sync with the new
+    // title. Best-effort — a sync failure NEVER fails the rename (the title is already persisted).
+    sync_companion_note_title_best_effort(state.inner(), &meeting_id);
+    Ok(())
 }
 
 /// Grounded Q&A over a meeting's transcript ("chat with the meeting"). The configured
@@ -5492,6 +5752,11 @@ pub async fn build_and_persist_entities(
     title: &str,
     markdown: &str,
 ) -> Result<crate::summarize::graph::GraphPayload, AppError> {
+    // COMPANION NOTE title sync (2026-07-16): every pipeline finish path calls this AFTER the
+    // meeting's final title is persisted (auto-title-on-close via `set_meeting_title`), so this is
+    // the one funnel to refresh a companion note's managed title + `[[Meeting]]` front-matter link
+    // to the final title. Best-effort — never fails the graph/note (which already succeeded).
+    sync_companion_note_title_best_effort(state, meeting_id);
     let config = {
         state
             .config
@@ -18964,6 +19229,169 @@ mod lifecycle_tests {
         })
         .unwrap();
         db.set_meeting_folder(mid, Some(folder_id)).unwrap();
+    }
+
+    // ── Recording-time COMPANION NOTE (2026-07-16) ───────────────────────────────────────────────
+
+    /// PURE: `provisional_meeting_title` yields a stable, human, date/time-based headline.
+    #[test]
+    fn provisional_meeting_title_is_stable_and_human() {
+        let dt = chrono::DateTime::parse_from_rfc3339("2026-07-16T14:05:33-04:00").unwrap();
+        assert_eq!(provisional_meeting_title(&dt), "Meeting 2026-07-16 14:05");
+    }
+
+    /// PURE: `meeting_display_name` uses the title when present, else a safe non-empty fallback
+    /// (so `[[<name>]]` is never `[[]]`).
+    #[test]
+    fn meeting_display_name_falls_back_when_blank() {
+        assert_eq!(meeting_display_name(Some("Q3 Planning")), "Q3 Planning");
+        assert_eq!(meeting_display_name(Some("  Trimmed  ")), "Trimmed");
+        assert_eq!(meeting_display_name(Some("   ")), "Untitled meeting");
+        assert_eq!(meeting_display_name(None), "Untitled meeting");
+    }
+
+    /// PURE: `compose_companion_markdown` inserts/refreshes the managed `meeting:` front-matter key
+    /// IDEMPOTENTLY and APPENDS blocks with a blank-line separator, never blanking prior content.
+    #[test]
+    fn compose_companion_markdown_idempotent_link_and_append() {
+        // First append onto empty content: fresh front-matter + the block as the body.
+        let m1 = compose_companion_markdown("", "Q3 Planning", "First jot.");
+        assert!(m1.contains("meeting: \"[[Q3 Planning]]\""));
+        assert!(m1.contains("First jot."));
+        assert_eq!(m1.matches("meeting:").count(), 1, "exactly one meeting key");
+
+        // Second append: prior body preserved, block appended, still ONE meeting key (no duplicate).
+        let m2 = compose_companion_markdown(&m1, "Q3 Planning", "Second jot.");
+        assert!(m2.contains("First jot."), "prior content is never blanked");
+        assert!(m2.contains("Second jot."));
+        assert_eq!(m2.matches("meeting:").count(), 1, "no duplicate meeting key on re-append");
+
+        // A rename REWRITES the link line to the new name (no duplicate, body intact).
+        let m3 = compose_companion_markdown(&m2, "Q3 Planning (final)", "");
+        assert!(m3.contains("meeting: \"[[Q3 Planning (final)]]\""));
+        assert!(!m3.contains("[[Q3 Planning]]\""), "the stale link is replaced");
+        assert!(m3.contains("First jot.") && m3.contains("Second jot."));
+        assert_eq!(m3.matches("meeting:").count(), 1);
+
+        // A note that ALREADY has OTHER front-matter keys keeps them + gains the meeting key.
+        let with_tags = "---\ntags: [a, b]\n---\n\nBody here.";
+        let m4 = compose_companion_markdown(with_tags, "Sync", "New line.");
+        assert!(m4.contains("tags: [a, b]"), "existing keys preserved");
+        assert!(m4.contains("meeting: \"[[Sync]]\""));
+        assert!(m4.contains("Body here.") && m4.contains("New line."));
+    }
+
+    /// LAZY-CREATE + APPEND (RED→GREEN for the append/lazy-create path): the FIRST append creates ONE
+    /// companion note in the open Notes ROOT, links it by `meeting_id`, stamps the `[[Meeting]]`
+    /// front-matter, and mirrors the block into `manual_notes`. A SECOND append reuses the SAME note
+    /// (one-note-per-meeting) and preserves the first block. RED against no-lazy-create / overwrite.
+    #[test]
+    fn append_to_companion_note_lazy_creates_then_reuses() {
+        let state = build_state("companion-append");
+        // An OPEN, in-progress meeting with a provisional title (as start_recording now sets).
+        state
+            .db
+            .insert_meeting(&Meeting {
+                id: "m-rec".to_string(),
+                started_at: "2026-07-16T10:00:00Z".to_string(),
+                ended_at: None,
+                title: Some("Meeting 2026-07-16 10:00".to_string()),
+                duration_s: 0,
+                audio_path: None,
+                status: MeetingStatus::Recording,
+                folder_id: None,
+            })
+            .unwrap();
+
+        let r1 = append_to_companion_note_inner(&state, "m-rec", "First jotted note.").unwrap();
+        assert_eq!(r1.meeting_wikilink, "[[Meeting 2026-07-16 10:00]]");
+        // Structurally linked + exactly one companion note.
+        assert_eq!(
+            state
+                .db
+                .companion_note_for_meeting("m-rec")
+                .unwrap()
+                .as_deref(),
+            Some(r1.note_id.as_str())
+        );
+        // manual_notes mirrors the block (enhance/summary pipeline still sees it).
+        assert!(state
+            .db
+            .get_manual_notes("m-rec")
+            .unwrap()
+            .contains("First jotted note."));
+
+        // Second append reuses the SAME note and preserves the first block.
+        let r2 = append_to_companion_note_inner(&state, "m-rec", "Second jotted note.").unwrap();
+        assert_eq!(r2.note_id, r1.note_id, "one living companion note per meeting");
+        let row = state.db.get_note_row(&r1.note_id).unwrap().unwrap();
+        assert!(row.text.contains("First jotted note."), "first block preserved");
+        assert!(row.text.contains("Second jotted note."));
+        assert_eq!(row.text.matches("meeting:").count(), 1, "no duplicate front-matter link");
+        // manual_notes appended (never overwritten): both blocks present.
+        let mn = state.db.get_manual_notes("m-rec").unwrap();
+        assert!(mn.contains("First jotted note.") && mn.contains("Second jotted note."));
+    }
+
+    /// GATE (RED→GREEN for the leak class): `append_to_companion_note` on a SEALED-and-not-session-
+    /// unlocked meeting REFUSES with `AppError::Locked` and writes NOTHING; a session-unlock reverses
+    /// it. Mirrors the `save_note` tool's gate. RED against dropping the `meeting_is_unlocked` check.
+    #[test]
+    fn append_to_companion_note_refused_for_sealed_meeting() {
+        let state = build_state("companion-lockgate");
+        make_open_folder(&state.db, "f-lock", "Secret");
+        seed_titled_meeting(&state.db, "m-locked", "Board strategy", "/data/m.wav", "f-lock");
+        state
+            .db
+            .set_folder_locked("f-lock", true, Some(&b"wrapped"[..]))
+            .unwrap();
+        // NOT session-unlocked.
+
+        let err =
+            append_to_companion_note_inner(&state, "m-locked", "secret note").unwrap_err();
+        assert!(
+            matches!(err, AppError::Locked(_)),
+            "a sealed meeting must refuse with Locked, got: {err:?}"
+        );
+        // Nothing written: no companion note exists.
+        assert!(state
+            .db
+            .companion_note_for_meeting("m-locked")
+            .unwrap()
+            .is_none());
+    }
+
+    /// TITLE SYNC (Task 6): renaming a meeting refreshes its companion note's managed title +
+    /// front-matter `[[Meeting]]` link. Best-effort — never fails the rename.
+    #[test]
+    fn companion_note_title_syncs_on_rename() {
+        let state = build_state("companion-titlesync");
+        state
+            .db
+            .insert_meeting(&Meeting {
+                id: "m-sync".to_string(),
+                started_at: "2026-07-16T11:00:00Z".to_string(),
+                ended_at: None,
+                title: Some("Meeting 2026-07-16 11:00".to_string()),
+                duration_s: 0,
+                audio_path: None,
+                status: MeetingStatus::Recording,
+                folder_id: None,
+            })
+            .unwrap();
+        let r = append_to_companion_note_inner(&state, "m-sync", "a jot").unwrap();
+
+        // Rename the meeting → sync updates the note's title + link.
+        state.db.set_meeting_title("m-sync", "Renamed Topic").unwrap();
+        sync_companion_note_title_best_effort(&state, "m-sync");
+
+        let row = state.db.get_note_row(&r.note_id).unwrap().unwrap();
+        assert_eq!(row.title.as_deref(), Some("Renamed Topic"), "managed title synced");
+        assert!(
+            row.text.contains("meeting: \"[[Renamed Topic]]\""),
+            "front-matter link synced to the new title"
+        );
+        assert!(row.text.contains("a jot"), "body content preserved through the sync");
     }
 
     /// #2 (0.7 security fast-follow): `list_meetings` MUST mask a sealed-and-NOT-session-unlocked
