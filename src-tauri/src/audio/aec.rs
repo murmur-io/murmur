@@ -163,6 +163,7 @@ enum HelperVerdict {
 ///     missed;
 ///   - `!ppid_is_murmur` — the ppid is alive but is NOT a Murmur process (a recycled pid, or an
 ///     adopter that will never SIGTERM the helper).
+///
 /// SPARE only when a LIVE Murmur process owns it.
 fn helper_verdict(ppid: i32, ppid_alive: bool, ppid_is_murmur: bool) -> HelperVerdict {
     if ppid == 1 || !ppid_alive || !ppid_is_murmur {
