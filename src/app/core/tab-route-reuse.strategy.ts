@@ -56,6 +56,39 @@ export class TabRouteReuseStrategy extends RouteReuseStrategy {
   /** Detached-but-alive component handles, keyed by `tabKeyFor(...)`. */
   private readonly cache = new Map<string, DetachedRouteHandle>();
 
+  /**
+   * Subscribers notified the moment a tab is BACKGROUNDED (detached) by the
+   * router. This is the ONLY place that genuinely knows "this tab is being
+   * detached right now" — `store()` is called by the router the instant a
+   * `notes/:id`/`meeting/:id`/`org-item/:id` route is navigated away from. A
+   * detached-but-alive component (e.g. `NoteEditorComponent`) cannot observe
+   * its own detach through any Angular lifecycle hook — it is NOT destroyed
+   * (so `DestroyRef.onDestroy` never fires), and there is no `ngOnDetach` —
+   * so it has to learn about it from here.
+   *
+   * A plain callback list, not a `signal`: this is a genuine discrete EVENT
+   * ("tab X was just backgrounded"), not a piece of state a template reads —
+   * mirrors this codebase's existing cross-component notification shape for
+   * exactly that case (`IpcService.onContentDeleted`/`EVENT_CONTENT_DELETED`,
+   * subscribed once by `TabsService`'s constructor). A signal that is set
+   * then immediately reset to notify of an edge would coalesce to its final
+   * value for an `effect()`-based listener (effects only see the value at
+   * flush time) — silently dropping same-tick detaches; a callback list has
+   * no such trap.
+   */
+  private readonly detachListeners = new Set<(key: string) => void>();
+
+  /**
+   * Subscribe to every future tab-detach. Returns an unsubscribe function —
+   * callers (e.g. `NoteEditorComponent`) MUST call it in their own
+   * `DestroyRef.onDestroy`, since this registry — like `cache` — outlives any
+   * single component.
+   */
+  onDetach(listener: (key: string) => void): () => void {
+    this.detachListeners.add(listener);
+    return () => this.detachListeners.delete(listener);
+  }
+
   override shouldDetach(route: ActivatedRouteSnapshot): boolean {
     return tabKey(route) !== null;
   }
@@ -70,6 +103,11 @@ export class TabRouteReuseStrategy extends RouteReuseStrategy {
     }
     if (handle) {
       this.cache.set(key, handle);
+      // Notify AFTER caching so a listener that reacts synchronously always
+      // sees a fully up-to-date cache.
+      for (const listener of this.detachListeners) {
+        listener(key);
+      }
     } else {
       // Per the RouteReuseStrategy contract, storing `null` erases the entry.
       this.cache.delete(key);
