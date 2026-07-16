@@ -949,7 +949,7 @@ async fn await_pipeline_task<T>(
     task.await.map_err(|e| {
         AppError::Other(anyhow::anyhow!(
             "note pipeline crashed unexpectedly ({e}) — the meeting was marked failed; \
-             try re-summarizing from the meeting page"
+             use Retry transcription on the recording to run it again"
         ))
     })?
 }
@@ -10218,7 +10218,21 @@ pub async fn resummarize(
             "this meeting's folder is locked — unlock it to re-summarize".into(),
         ));
     }
-    let result = pipeline::resummarize_existing(&app, &state, &meeting_id).await?;
+    // DETACHED, panic-mapped execution (the same #346 pattern as `stop_recording`): awaited
+    // INLINE, a panic inside `resummarize_existing` would leave the invoke Promise unsettled
+    // forever (Tauri never settles a panicked command future) — the sibling wedge. In a real
+    // spawned task the panic surfaces as a `JoinError` → `await_pipeline_task` maps it to an
+    // `AppError` so the Promise REJECTS. NO status-guard analog on purpose: every status
+    // resummarize can leave behind is already TERMINAL — it only writes `Summarized`/`Exported`
+    // on success and persists `Error` in its own Err arm, so a panic leaves the row at its prior
+    // terminal state and a Drop-guard would have nothing non-terminal to repair.
+    let task_app = app.clone();
+    let task_meeting_id = meeting_id.clone();
+    let resummarize_task = tauri::async_runtime::spawn(async move {
+        let state = task_app.state::<AppState>();
+        pipeline::resummarize_existing(&task_app, &state, &task_meeting_id).await
+    });
+    let result = await_pipeline_task(resummarize_task).await?;
     // COMMIT BOUNDARY: a re-summarize rewrites the meeting's note → BEST-EFFORT re-publish any org
     // shares of it so members see the fresh summary. Best-effort — never fails the re-summarize. If
     // ≥1 org copy was re-published, ping open org views so the fresh summary shows without a manual sync.
@@ -10236,6 +10250,126 @@ pub async fn resummarize(
             .exported_path
             .map(|p| p.to_string_lossy().to_string()),
     })
+}
+
+/// FROM-DISK re-transcription of a meeting in the terminal `Error` state whose ARCHIVE audio
+/// survived on disk (salvage-from-disk, 2026-07-16). The manual twin of the startup disk salvage:
+/// re-runs the SAME post-Stop pipeline (`pipeline::run_salvage_from_disk` → `run_after_stop`)
+/// off the archived WAV — heavy ASR rides the shared `perf::run_heavy` gate + the ASR watchdog
+/// exactly like a live Stop. Detached + panic-mapped like `stop_recording` (#346): a panic
+/// rejects the invoke Promise via `await_pipeline_task`, and the in-task `TerminalStatusGuard`
+/// (status-aware) restores a terminal state.
+///
+/// GATES (fail-closed, in order): refuse while a recording is ACTIVE (same check as
+/// `start_recording` — a salvage must not race a live capture); refuse a sealed-and-not-
+/// session-unlocked meeting (`meeting_is_unlocked` — this command NEVER decrypts a `.enc`; for a
+/// session-unlocked locked folder the playable WAV was already materialized by `unlock_folder`);
+/// refuse a non-`Error` row; refuse when no archive audio exists on disk. The single-flight
+/// CLAIM is the atomic `Error → Recording` status transition, so two concurrent retries can
+/// never both run — and a crash mid-retry leaves a stuck `RECORDING` row with an on-disk WAV,
+/// which the NEXT launch's disk salvage re-claims automatically.
+#[tauri::command]
+pub async fn retry_transcription(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    meeting_id: String,
+) -> Result<StopResult, AppError> {
+    let wav_path = retry_transcription_prep(state.inner(), &meeting_id)?;
+
+    let task_app = app.clone();
+    let task_meeting_id = meeting_id.clone();
+    let pipeline_task = tauri::async_runtime::spawn(async move {
+        let state = task_app.state::<AppState>();
+        // Armed NOW; disarmed after the run. The claim above flipped the row to the non-terminal
+        // `Recording`, so a panic-unwind must restore a terminal state (the guard's Drop persists
+        // `Error` — status-aware, so it never clobbers a row that already reached Summarized+).
+        let terminal_guard = pipeline::TerminalStatusGuard::arm(
+            Some(task_app.clone()),
+            state.db.clone(),
+            &task_meeting_id,
+        );
+        let result =
+            pipeline::run_salvage_from_disk(&task_app, &state, &task_meeting_id, &wav_path).await;
+        terminal_guard.disarm();
+        result
+    });
+    let result = await_pipeline_task(pipeline_task).await?;
+
+    Ok(StopResult {
+        meeting_id: result.meeting_id,
+        markdown: result.note_markdown,
+        exported_path: result
+            .exported_path
+            .map(|p| p.to_string_lossy().to_string()),
+    })
+}
+
+/// Synchronous prep/gate half of [`retry_transcription`], split out for headless tests: runs every
+/// fail-closed check, resolves the on-disk archive WAV, and — as the LAST step — atomically claims
+/// the row (`Error → Recording`). Nothing is mutated unless every gate passed.
+pub(crate) fn retry_transcription_prep(
+    state: &AppState,
+    meeting_id: &str,
+) -> Result<std::path::PathBuf, AppError> {
+    // No retry while a recording is in progress (mirror of `start_recording`'s own check).
+    {
+        let recorder = state
+            .recorder
+            .lock()
+            .map_err(|_| AppError::Audio("recorder mutex poisoned".into()))?;
+        if recorder.is_some() {
+            return Err(AppError::Audio(
+                "a recording is in progress — stop it before retrying transcription".into(),
+            ));
+        }
+    }
+    // Lock gate: never re-pipeline (or decrypt) a sealed-and-not-session-unlocked meeting.
+    if !meeting_is_unlocked(state, meeting_id)? {
+        return Err(AppError::Locked(
+            "this meeting's folder is locked — unlock it to retry transcription".into(),
+        ));
+    }
+    let meeting = state
+        .db
+        .get_meeting(meeting_id)?
+        .ok_or_else(|| AppError::InvalidArg(format!("no meeting with id {meeting_id}")))?;
+    if meeting.status != MeetingStatus::Error {
+        return Err(AppError::InvalidArg(
+            "retry transcription is only available for a failed recording".into(),
+        ));
+    }
+    let path = meeting.audio_path.filter(|p| !p.trim().is_empty()).ok_or_else(|| {
+        AppError::Storage(
+            "this recording has no archived audio on disk — nothing to re-transcribe".into(),
+        )
+    })?;
+    // Resolve a PLAINTEXT playable WAV. A `.enc`-only state past the gate (e.g. an unfiled row
+    // pointing at a sealed file) still refuses — this path never decrypts.
+    let plaintext = path.trim_end_matches(ENC_SUFFIX).to_string();
+    if !std::path::Path::new(&plaintext).exists() {
+        let enc = format!("{plaintext}{ENC_SUFFIX}");
+        if std::path::Path::new(&enc).exists() {
+            return Err(AppError::Locked(
+                "this recording's audio is sealed — unlock its folder, then retry".into(),
+            ));
+        }
+        return Err(AppError::Storage(
+            "this recording's audio file is no longer on disk — nothing to re-transcribe".into(),
+        ));
+    }
+    // Single-flight claim, LAST: only one retry may flip Error → Recording. (A crash after this
+    // leaves a stuck RECORDING row + an on-disk WAV — exactly what startup disk salvage re-claims.)
+    if !state.db.transition_meeting_status(
+        meeting_id,
+        MeetingStatus::Error,
+        MeetingStatus::Recording,
+    )? {
+        return Err(AppError::InvalidArg(
+            "a retry for this recording is already running".into(),
+        ));
+    }
+    tracing::info!(target: "pipeline", meeting_id = %meeting_id, "retry transcription claimed — re-running the pipeline from the archived audio");
+    Ok(std::path::PathBuf::from(plaintext))
 }
 
 /// Recent meetings for the Library list (newest first, capped). Sealed-and-not-session-unlocked
@@ -11975,6 +12109,88 @@ pub fn seal_auto_filed_note(
     folder_id: &str,
 ) -> Result<(), AppError> {
     move_into_locked_folder(state, meeting_id, folder_id)
+}
+
+/// LOCK-STATE FINALIZER for a from-disk pipeline re-run (`pipeline::run_salvage_from_disk` —
+/// `retry_transcription` + startup disk salvage). The re-run inserts fresh plaintext
+/// segments/audio exactly like a live Stop; for a meeting whose folder is LOCKED that fresh
+/// output must end up governed by the folder CK, matching what the normal pipeline's
+/// `SealInto` auto-file path produces. Called AFTER the pipeline on BOTH arms (an Err run may
+/// already have persisted segments before failing). Three branches, keyed on the folder's
+/// CURRENT lock state:
+///
+/// - **No folder / open folder** (every startup-salvage row — a stuck `RECORDING` meeting has no
+///   note rows, so no folder): nothing to do.
+/// - **Locked + session-unlocked** (a `retry_transcription` of a meeting in an unlocked locked
+///   folder): durably re-seal the fresh note/segments/timeline/audio under the folder CK via
+///   [`seal_auto_filed_note`] — the SAME verify-before-blank path a manual move / auto-file
+///   takes, which also restores the session plaintext afterward. Content is never lost.
+/// - **Locked + NOT unlocked** (a relock/screen-share auto-relock landed MID-RUN — the entry gate
+///   had passed): fail CLOSED. The relock's re-blank only covers rows with sealed blobs, so the
+///   fresh unsealed rows would otherwise sit plaintext-at-rest behind the lock forever. Purge the
+///   blob-less segments ([`Db::delete_unsealed_segments`] — derived data; the audio survives) and
+///   remove the plaintext WAV ONLY when its sealed `.enc` twin exists (never destroy the only
+///   copy). The row is already terminal `Error` (the note persist fail-closed with
+///   `AppError::Locked` inside the pipeline) and recoverable: unlock → retry.
+///
+/// Best-effort by contract: every failure is logged (ids/counts only) and swallowed — the
+/// finalizer must never mask the pipeline's own result.
+pub(crate) fn finalize_salvage_lock_state(state: &AppState, meeting_id: &str) {
+    let locked_folder = match state
+        .db
+        .folder_for_meeting(meeting_id)
+        .and_then(|fid| match fid {
+            Some(fid) => state.db.folder_by_id(&fid),
+            None => Ok(None),
+        }) {
+        Ok(f) => f.filter(|f| f.locked),
+        Err(e) => {
+            tracing::warn!(target: "lock", meeting_id = %meeting_id, error = %e, "salvage lock finalizer: folder lookup failed");
+            return;
+        }
+    };
+    let Some(folder) = locked_folder else {
+        return; // unfiled or open folder — the normal plaintext outcome is correct.
+    };
+    let session_unlocked = state
+        .unlocked_folders
+        .lock()
+        .map(|u| u.contains(&folder.id))
+        .unwrap_or(false); // poisoned set ⇒ treat as NOT unlocked (fail closed).
+    if session_unlocked {
+        // Same SealInto path as auto-file: seal fresh note+extras+audio (verify-before-blank),
+        // then restore the session plaintext. Idempotent for already-sealed rows.
+        if let Err(e) = seal_auto_filed_note(state, meeting_id, &folder.id) {
+            tracing::warn!(target: "lock", meeting_id = %meeting_id, error = %e, "salvage lock finalizer: re-seal into the unlocked locked folder failed");
+        } else {
+            tracing::info!(target: "lock", meeting_id = %meeting_id, "salvage output re-sealed into its session-unlocked locked folder");
+        }
+        return;
+    }
+    // Mid-run relock: purge the unsealed plaintext leftovers, fail closed.
+    match state.db.delete_unsealed_segments(meeting_id) {
+        Ok(n) if n > 0 => {
+            tracing::warn!(target: "lock", meeting_id = %meeting_id, purged = n, "salvage raced a relock — purged unsealed plaintext segments (audio stays sealed at rest; unlock + retry to re-transcribe)");
+        }
+        Ok(_) => {}
+        Err(e) => {
+            tracing::warn!(target: "lock", meeting_id = %meeting_id, error = %e, "salvage lock finalizer: unsealed-segment purge failed");
+        }
+    }
+    // Remove the freshly-written plaintext WAV ONLY when the sealed `.enc` twin exists — the
+    // audio content must never be destroyed without a surviving sealed copy.
+    if let Ok(Some(m)) = state.db.get_meeting(meeting_id) {
+        if let Some(path) = m.audio_path.as_deref().filter(|p| !p.ends_with(ENC_SUFFIX)) {
+            let enc = format!("{path}{ENC_SUFFIX}");
+            let sealed_copy_exists = std::path::Path::new(&enc).exists();
+            if sealed_copy_exists
+                && std::path::Path::new(path).exists()
+                && std::fs::remove_file(path).is_ok()
+            {
+                tracing::warn!(target: "lock", meeting_id = %meeting_id, "salvage raced a relock — removed the plaintext session WAV (sealed .enc retained)");
+            }
+        }
+    }
 }
 
 /// Seal ONE just-moved meeting's note (every provider row) + its transcript/timeline/audio under the
@@ -14393,7 +14609,9 @@ fn unlocked_snapshot(state: &AppState) -> Result<std::collections::HashSet<Strin
         .clone())
 }
 
-fn meeting_is_unlocked(state: &AppState, meeting_id: &str) -> Result<bool, AppError> {
+// `pub(crate)`: the disk-salvage worker (`audio::spill::salvage_disk_one`) re-checks this SAME
+// gate fail-closed right before re-running a claimed meeting through the pipeline.
+pub(crate) fn meeting_is_unlocked(state: &AppState, meeting_id: &str) -> Result<bool, AppError> {
     let folder_id = match state.db.folder_for_meeting(meeting_id)? {
         Some(f) => f,
         None => return Ok(true), // no folder / vault root → always open.
@@ -23599,6 +23817,188 @@ mod lifecycle_tests {
                 .markdown,
             MD
         );
+    }
+
+    // ── retry_transcription prep gates (salvage-from-disk, 2026-07-16) ──────────────────────────
+
+    /// Every fail-closed gate of `retry_transcription_prep`, in order: locked folder → `Locked`;
+    /// non-Error status → refused; missing audio → refused; happy path claims `Error → Recording`
+    /// exactly once (single-flight).
+    #[test]
+    fn retry_prep_gates_fail_closed_then_claims_single_flight() {
+        let state = build_state("retry-prep");
+
+        // Unknown meeting.
+        assert!(matches!(
+            retry_transcription_prep(&state, "m-none"),
+            Err(AppError::InvalidArg(_))
+        ));
+
+        // LOCKED folder → AppError::Locked (never re-pipeline sealed content).
+        seed_meeting(&state.db, "m-locked", "# sealed", None);
+        make_open_folder(&state.db, "f-retry-locked", "RetryLocked");
+        state
+            .db
+            .set_meeting_folder("m-locked", Some("f-retry-locked"))
+            .unwrap();
+        lock_folder_inner(&state, "f-retry-locked".to_string()).unwrap();
+        assert!(
+            matches!(
+                retry_transcription_prep(&state, "m-locked"),
+                Err(AppError::Locked(_))
+            ),
+            "a sealed-and-not-session-unlocked meeting must refuse with Locked"
+        );
+
+        // Non-Error status refused (seed_meeting leaves the row Summarized).
+        seed_meeting(&state.db, "m-summarized", "# fine", None);
+        assert!(matches!(
+            retry_transcription_prep(&state, "m-summarized"),
+            Err(AppError::InvalidArg(_))
+        ));
+
+        // Error status but NO audio on disk → refused, row untouched.
+        seed_meeting(&state.db, "m-no-audio", "# err", None);
+        state
+            .db
+            .update_meeting_status("m-no-audio", MeetingStatus::Error)
+            .unwrap();
+        assert!(matches!(
+            retry_transcription_prep(&state, "m-no-audio"),
+            Err(AppError::Storage(_))
+        ));
+        assert_eq!(
+            state.db.get_meeting("m-no-audio").unwrap().unwrap().status,
+            MeetingStatus::Error,
+            "a refused prep must not have claimed the row"
+        );
+
+        // Happy path: Error + a real on-disk WAV → claimed (Error → Recording), path resolved.
+        let wav = std::env::temp_dir().join(format!("murmur-retry-prep-{}.wav", std::process::id()));
+        std::fs::write(&wav, b"RIFF-fake").unwrap();
+        seed_meeting(&state.db, "m-retry", "# err", None);
+        state
+            .db
+            .finalize_meeting("m-retry", "2026-07-16T10:00:00Z", 60, &wav.to_string_lossy())
+            .unwrap();
+        state
+            .db
+            .update_meeting_status("m-retry", MeetingStatus::Error)
+            .unwrap();
+        let got = retry_transcription_prep(&state, "m-retry").unwrap();
+        assert_eq!(got, wav);
+        assert_eq!(
+            state.db.get_meeting("m-retry").unwrap().unwrap().status,
+            MeetingStatus::Recording,
+            "the claim flips Error → Recording (crash-safe: next launch's disk salvage re-claims it)"
+        );
+        // Single-flight: the row is no longer Error, so a second prep refuses.
+        assert!(retry_transcription_prep(&state, "m-retry").is_err());
+        let _ = std::fs::remove_file(&wav);
+    }
+
+    /// LOCK MODEL — the mid-run-relock fail-closed purge branch of `finalize_salvage_lock_state`:
+    /// a salvage/retry whose folder got LOCKED (and not session-unlocked) while the pipeline ran
+    /// must not leave fresh plaintext at rest behind the lock. Blob-less segments are purged and
+    /// the plaintext WAV is removed ONLY because its sealed `.enc` twin survives; an OPEN folder
+    /// (or no folder) is a strict no-op.
+    #[test]
+    fn finalize_salvage_lock_state_purges_unsealed_output_behind_a_relock() {
+        let state = build_state("salvage-finalize");
+
+        // No-op case first: an OPEN folder's meeting keeps its plaintext output.
+        seed_meeting(&state.db, "m-open", "# open", None);
+        finalize_salvage_lock_state(&state, "m-open");
+        assert_eq!(
+            state.db.get_segments("m-open").unwrap().len(),
+            2,
+            "an open/rootless meeting's fresh segments are untouched"
+        );
+
+        // Relock-raced case: meeting in a folder that is LOCKED and NOT session-unlocked, with
+        // fresh blob-less segments + a plaintext WAV whose sealed .enc twin exists.
+        let dir = std::env::temp_dir().join(format!("murmur-salvage-finalize-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let wav = dir.join("m-raced.wav");
+        let enc = dir.join("m-raced.wav.enc");
+        std::fs::write(&wav, b"RIFF-fresh-plaintext").unwrap();
+        std::fs::write(&enc, b"AES-GCM-ciphertext").unwrap();
+
+        seed_meeting(&state.db, "m-raced", "# raced", None);
+        state
+            .db
+            .finalize_meeting("m-raced", "2026-07-16T10:00:00Z", 60, &wav.to_string_lossy())
+            .unwrap();
+        state
+            .db
+            .insert_folder(&Folder {
+                id: "f-raced".into(),
+                name: "Raced".into(),
+                path: "Raced".into(),
+                parent_id: None,
+                locked: true, // locked, and deliberately NOT in the session unlock set
+                created_at: "2026-07-16T00:00:00Z".into(),
+            })
+            .unwrap();
+        state
+            .db
+            .set_meeting_folder("m-raced", Some("f-raced"))
+            .unwrap();
+
+        finalize_salvage_lock_state(&state, "m-raced");
+
+        assert!(
+            state.db.raw_segments("m-raced").unwrap().is_empty(),
+            "fresh blob-less plaintext segments are purged fail-closed"
+        );
+        assert!(!wav.exists(), "the plaintext WAV is removed (a sealed copy exists)");
+        assert!(enc.exists(), "the sealed .enc twin is never touched");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `finalize_salvage_lock_state` never removes a plaintext WAV WITHOUT a surviving sealed
+    /// `.enc` twin — content preservation beats the purge when no sealed copy exists.
+    #[test]
+    fn finalize_salvage_lock_state_keeps_the_only_audio_copy() {
+        let state = build_state("salvage-finalize-keep");
+        let dir = std::env::temp_dir().join(format!(
+            "murmur-salvage-finalize-keep-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let wav = dir.join("m-only.wav");
+        std::fs::write(&wav, b"RIFF-the-only-copy").unwrap();
+
+        seed_meeting(&state.db, "m-only", "# only", None);
+        state
+            .db
+            .finalize_meeting("m-only", "2026-07-16T10:00:00Z", 60, &wav.to_string_lossy())
+            .unwrap();
+        state
+            .db
+            .insert_folder(&Folder {
+                id: "f-only".into(),
+                name: "Only".into(),
+                path: "Only".into(),
+                parent_id: None,
+                locked: true,
+                created_at: "2026-07-16T00:00:00Z".into(),
+            })
+            .unwrap();
+        state
+            .db
+            .set_meeting_folder("m-only", Some("f-only"))
+            .unwrap();
+
+        finalize_salvage_lock_state(&state, "m-only");
+
+        assert!(
+            wav.exists(),
+            "with no sealed .enc twin the plaintext WAV is the ONLY copy — never deleted"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// BLK-3: an `AppConfigDto` payload that OMITS `mcpRequireToken` deserializes to `true`
