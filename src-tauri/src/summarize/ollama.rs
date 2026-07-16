@@ -17,12 +17,21 @@ const AVAILABILITY_TIMEOUT: Duration = Duration::from_millis(500);
 /// the readiness probe (a cold Ollama can be slow to answer) but still bounded so the UI never
 /// hangs on a dead server.
 const LIST_MODELS_TIMEOUT: Duration = Duration::from_secs(5);
+/// Overall timeout for the `/api/generate` calls (`summarize` / `complete`). The other providers
+/// are already bounded (anthropic 120 s via `build_client`, claude_code 180 s via
+/// `CLAUDE_TIMEOUT`); Ollama was NOT, so a dead/wedged local server hung a summarize forever.
+/// Local models on modest hardware can be genuinely slow on a long transcript, so this is
+/// deliberately the most generous of the three — but still bounded.
+const GENERATE_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Talks to a local Ollama server's HTTP API (default `http://localhost:11434`).
 pub struct OllamaProvider {
     client: reqwest::Client,
     base_url: String,
     model: String,
+    /// Per-request cap on `/api/generate` ([`GENERATE_TIMEOUT`]; overridable in tests so the
+    /// stalled-server regression doesn't wait 10 minutes).
+    generate_timeout: Duration,
 }
 
 impl OllamaProvider {
@@ -43,7 +52,15 @@ impl OllamaProvider {
             client: reqwest::Client::new(),
             base_url,
             model,
+            generate_timeout: GENERATE_TIMEOUT,
         }
+    }
+
+    /// Test-only: shrink the `/api/generate` timeout so a stalled-server regression fails fast.
+    #[cfg(test)]
+    fn with_generate_timeout(mut self, timeout: Duration) -> Self {
+        self.generate_timeout = timeout;
+        self
     }
 
     /// `GET {base}/api/tags` → list of locally installed model names for the Settings dropdown.
@@ -156,6 +173,7 @@ impl SummarizerProvider for OllamaProvider {
             .client
             .post(&url)
             .json(&body)
+            .timeout(self.generate_timeout)
             .send()
             .await
             .map_err(|e| AppError::Summarize(format!("Ollama request failed: {e}")))?;
@@ -196,6 +214,7 @@ impl SummarizerProvider for OllamaProvider {
             .client
             .post(&url)
             .json(&body)
+            .timeout(self.generate_timeout)
             .send()
             .await
             .map_err(|e| AppError::Summarize(format!("Ollama request failed: {e}")))?;
@@ -259,5 +278,54 @@ mod tests {
             names.is_empty(),
             "an OpenAI-shaped body must degrade to an empty list, not misparse"
         );
+    }
+
+    /// Hardening item 2 (RED-before-GREEN, Ollama leg): a local server that ACCEPTS the
+    /// `/api/generate` POST and then never answers must fail `summarize` within the request
+    /// timeout. Pre-fix, the generate call carried NO timeout (unlike anthropic's 120 s /
+    /// claude_code's 180 s), so a dead/wedged local server hung a summarize forever. The outer
+    /// 10 s `tokio::time::timeout` is the RED detector: unpatched, it fires (test FAILs); with
+    /// `.timeout(self.generate_timeout)` the request errors in ~0.4 s (PASS).
+    #[tokio::test]
+    async fn summarize_times_out_on_a_stalled_server_instead_of_hanging() {
+        use crate::summarize::provider::{MeetingMeta, SummarizeRequest, SummarizerProvider};
+        use std::io::Read;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Accept ONE connection, read the request, then go silent (socket held open) for LONGER
+        // than the outer 10 s RED detector — a shorter stall would end in a connection close,
+        // which even the unpatched (timeout-less) code surfaces as an error, masking the hang.
+        // The handle is dropped (not joined) — the thread dies with the test process.
+        let _server = std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                let mut buf = [0u8; 8192];
+                let _ = sock.read(&mut buf);
+                std::thread::sleep(std::time::Duration::from_secs(30)); // never respond
+            }
+        });
+
+        let provider = OllamaProvider::new(format!("http://{addr}"), "llama3.1".to_string())
+            .with_generate_timeout(std::time::Duration::from_millis(400));
+        let req = SummarizeRequest {
+            transcript: "We shipped v2 and agreed Anna owns the rollout.".to_string(),
+            meta: MeetingMeta {
+                date_iso: "2026-07-16".to_string(),
+                title_hint: None,
+                duration_s: 60,
+                language: Some("en".to_string()),
+            },
+            template: "TEMPLATE".to_string(),
+            vault_titles: vec![],
+            related_context: None,
+            user_notes: None,
+            live_bullets: None,
+        };
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            provider.summarize(&req),
+        )
+        .await
+        .expect("a stalled Ollama server must RESOLVE (as Err) within the timeout — not hang");
+        assert!(res.is_err(), "a stalled generate must surface an error");
     }
 }
