@@ -25500,6 +25500,47 @@ mod lifecycle_tests {
         );
     }
 
+    /// SIBLING-GAP FIX (2026-07-16): `org_update_own_item_inner` is a SEPARATE org-publish path from
+    /// `build_org_share_body` (edit-in-place on an already-shared item, never routing through the
+    /// share/republish seam) — it needs its OWN copy of the "refuse an empty publish" guard, or an
+    /// author could reproduce the identical "blank card" bug (found first via `build_org_share_body`,
+    /// PR #342) by editing their own item's body down to nothing. RED against the pre-fix code (which
+    /// had no emptiness check on this path at all): editing to whitespace-only content would have
+    /// sailed through to `client.org_publish_item(...)` and published a real, live, empty-bodied item.
+    #[test]
+    fn org_update_own_item_refuses_an_empty_edit() {
+        let state = build_state("org-edit-empty");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        state
+            .db
+            .upsert_org_item("item-mine", "org-1", 1, "me", "Mine", "# body", "2026-07-11T09:00:00Z", 1, 1, &[9u8; 32], Some("document"), None, None)
+            .unwrap();
+        state.db.set_org_item_author("item-mine", "me-user-id").unwrap();
+        state.config.lock().unwrap().org_egress_consented = true;
+        *state.account_session.lock().unwrap() = Some(crate::share::AccountSession {
+            account_id: "me@example.com".into(),
+            email: "me@example.com".into(),
+            server_user_id: Some("me-user-id".into()),
+            device_id: "dev-1".into(),
+            mk: Zeroizing::new([7u8; 32]),
+            generation: 1,
+            access_token: "a".into(),
+            access_expires_at: Some("2099-01-01T00:00:00Z".into()),
+            refresh_token: "r".into(),
+        });
+
+        // Whitespace-only body — cleans down to "" the same way a frontmatter-only note does.
+        let err = block_on(org_update_own_item_inner(&state, "item-mine", "Mine", "   \n\n  "))
+            .expect_err("editing an org item's body down to nothing must be refused");
+        assert!(
+            matches!(err, AppError::InvalidArg(_)),
+            "expected InvalidArg for an empty edit, got {err:?}"
+        );
+        // The item's stored body is untouched — no empty republish reached the network/local upsert.
+        let detail = state.db.get_org_item("item-mine").unwrap().unwrap();
+        assert_eq!(detail.markdown, "# body");
+    }
+
     /// A missing / tombstoned item id is an `InvalidArg`, resolved BEFORE any session or network work.
     #[test]
     fn org_update_own_item_rejects_an_unknown_item() {
@@ -30956,6 +30997,18 @@ pub(crate) async fn org_update_own_item_inner(
     // paths apply (scrub ON: fail-safe toward LESS egress; an edit must never DOWNGRADE scrubbing).
     let cleaned = crate::share::envelope::clean_note_body(markdown);
     let (final_md, _counts) = scrub_org_markdown(&cleaned);
+
+    // (4b) REFUSE AN EMPTY EDIT — sibling of `build_org_share_body`'s "refuse an empty share"
+    // guard (2026-07-16): this is a SEPARATE org-publish path (edit-in-place on an already-shared
+    // item, reached straight from the FE's `orgUpdateOwnItem`, never routing through
+    // `build_org_share_body`), so it needs its own copy of the same refusal or an author could
+    // reproduce the identical "blank card" bug by editing their own item down to nothing. Refuse
+    // loudly instead of ever sealing/publishing an empty body.
+    if final_md.trim().is_empty() {
+        return Err(AppError::InvalidArg(
+            "this note has no content to share — add some content before saving".into(),
+        ));
+    }
 
     // Resolve the org (membership-checked) + a live session; seal at the org's CURRENT generation.
     let org = resolve_org(state, &ctx.org_id)?;
