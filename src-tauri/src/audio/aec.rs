@@ -617,7 +617,7 @@ mod tests {
         assert!(parse_capture_helpers("  412     1 /usr/libexec/somethingd").is_empty());
         assert!(parse_capture_helpers("garbage\n\n123 abc def").is_empty());
         assert!(parse_capture_helpers("").is_empty());
-        assert!(reap_decisions("", || String::new(), None, |_| true).is_empty());
+        assert!(reap_decisions("", String::new, None, |_| true).is_empty());
     }
 
     #[test]
