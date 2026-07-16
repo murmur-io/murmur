@@ -3021,6 +3021,43 @@ impl Db {
         Ok(())
     }
 
+    /// Compare-and-swap a meeting's status: set it to `to` ONLY if it is currently `from`.
+    /// Returns `true` when the transition landed (exactly one row changed), `false` when the row
+    /// was in a different status (or absent) — the loser of a concurrent claim. Used by
+    /// `retry_transcription` as its single-flight claim (`Error → Recording`): two simultaneous
+    /// retries of the same meeting can never both run the pipeline.
+    pub fn transition_meeting_status(
+        &self,
+        id: &str,
+        from: MeetingStatus,
+        to: MeetingStatus,
+    ) -> Result<bool> {
+        let conn = self.lock();
+        let n = conn
+            .execute(
+                "UPDATE meetings SET status = ?3 WHERE id = ?1 AND status = ?2",
+                rusqlite::params![id, from.as_str(), to.as_str()],
+            )
+            .map_err(map_err)?;
+        Ok(n == 1)
+    }
+
+    /// Ids of every meeting still stuck in the non-terminal `RECORDING` status — the crash "ghosts"
+    /// startup recovery must resolve (spill salvage / disk salvage / reconcile-to-`ERROR`).
+    /// UUIDs only, no content.
+    pub fn stuck_recording_ids(&self) -> Result<Vec<String>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare("SELECT id FROM meetings WHERE status = ?1")
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![MeetingStatus::Recording.as_str()], |r| {
+                r.get::<_, String>(0)
+            })
+            .map_err(map_err)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(map_err)
+    }
+
     /// Crash-recovery reconcile: flip every meeting still stuck in `RECORDING` to the terminal
     /// `ERROR` state. Returns the number of rows reconciled.
     ///
@@ -3048,20 +3085,11 @@ impl Db {
     /// (no spill / not recoverable) is still flipped to the terminal `ERROR` state exactly as before.
     /// Idempotent + additive (the per-row `AND status = RECORDING` guard). Logs ids + counts, no PII.
     pub fn reconcile_stuck_recordings_except(&self, claimed: &[String]) -> Result<usize> {
-        let conn = self.lock();
         // Collect the ghost ids first (UUIDs — not PII) so the reconcile is auditable in the log.
-        let ids: Vec<String> = {
-            let mut stmt = conn
-                .prepare("SELECT id FROM meetings WHERE status = ?1")
-                .map_err(map_err)?;
-            let rows = stmt
-                .query_map(rusqlite::params![MeetingStatus::Recording.as_str()], |r| {
-                    r.get::<_, String>(0)
-                })
-                .map_err(map_err)?;
-            rows.collect::<rusqlite::Result<Vec<_>>>()
-                .map_err(map_err)?
-        };
+        // Done BEFORE taking the connection lock (`stuck_recording_ids` locks internally; the Mutex
+        // is not re-entrant).
+        let ids: Vec<String> = self.stuck_recording_ids()?;
+        let conn = self.lock();
         // Exclude the rows salvage claimed this launch — it owns their final status.
         let to_reconcile: Vec<&String> = ids.iter().filter(|id| !claimed.contains(id)).collect();
         if to_reconcile.is_empty() {
@@ -6497,6 +6525,63 @@ impl Db {
         }
         tx.commit().map_err(map_err)?;
         Ok(())
+    }
+
+    /// ATOMICALLY replace a meeting's transcript with `segments` — delete + insert in ONE
+    /// transaction, so either the full fresh set lands or the previous rows survive untouched
+    /// (never a half-replaced transcript, never a loss window). Needed by the from-disk
+    /// re-transcription path (`retry_transcription` / disk salvage): a keyed
+    /// `INSERT OR REPLACE` alone would leave a STALE TAIL when the fresh run yields fewer
+    /// segments than a prior partial run (old idx 12..40 interleaved into the new transcript).
+    /// The `_ad`/`_ai` FTS triggers fire inside the same transaction, so the search index stays
+    /// consistent with the swap.
+    pub fn replace_segments(&self, meeting_id: &str, segments: &[Segment]) -> Result<()> {
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        tx.execute(
+            "DELETE FROM segments WHERE meeting_id = ?1",
+            rusqlite::params![meeting_id],
+        )
+        .map_err(map_err)?;
+        {
+            let mut stmt = tx
+                .prepare(
+                    "INSERT INTO segments
+                       (meeting_id, idx, start_s, end_s, text, speaker, confidence)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                )
+                .map_err(map_err)?;
+            for seg in segments {
+                stmt.execute(rusqlite::params![
+                    meeting_id,
+                    seg.idx,
+                    seg.start_s,
+                    seg.end_s,
+                    seg.text,
+                    seg.speaker,
+                    seg.confidence,
+                ])
+                .map_err(map_err)?;
+            }
+        }
+        tx.commit().map_err(map_err)?;
+        Ok(())
+    }
+
+    /// FAIL-CLOSED cleanup for a salvage/retry pipeline that raced a mid-run relock: delete this
+    /// meeting's segments that carry PLAINTEXT with NO sealed blob (`text_blob IS NULL`) — the
+    /// unsealed fresh rows the relock's re-blank (guarded on `text_blob IS NOT NULL`) can never
+    /// cover. Rows WITH a blob (the durable sealed copies) are untouched. The deleted rows are
+    /// DERIVED data whose source audio survives sealed at rest (`.enc`), so nothing unrecoverable
+    /// is destroyed — privacy wins over keeping a re-derivable plaintext transcript behind a lock.
+    /// Returns the number of rows removed (ids/counts only in logs, never text).
+    pub fn delete_unsealed_segments(&self, meeting_id: &str) -> Result<usize> {
+        let conn = self.lock();
+        conn.execute(
+            "DELETE FROM segments WHERE meeting_id = ?1 AND text_blob IS NULL",
+            rusqlite::params![meeting_id],
+        )
+        .map_err(map_err)
     }
 
     /// All segments for a meeting, ordered by `idx`.
@@ -15757,6 +15842,99 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM segments", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    /// Salvage-from-disk: a pipeline RE-RUN over the same meeting must not interleave a stale tail
+    /// from a prior (longer) transcript — `replace_segments` swaps the whole set atomically in one
+    /// transaction (delete + insert), unlike the keyed `INSERT OR REPLACE` which would have left
+    /// old idx 2 alive.
+    #[test]
+    fn replace_segments_swaps_out_a_stale_tail_atomically() {
+        let db = mem_db();
+        db.insert_meeting(&sample_meeting("m-replace", "2026-07-16T10:00:00Z"))
+            .unwrap();
+        let seg = |idx: i64, text: &str| Segment {
+            idx,
+            start_s: idx as f64,
+            end_s: idx as f64 + 1.0,
+            text: text.into(),
+            speaker: None,
+            confidence: None,
+        };
+        db.insert_segments(
+            "m-replace",
+            &[seg(0, "old a"), seg(1, "old b"), seg(2, "stale tail")],
+        )
+        .unwrap();
+
+        // The fresh re-run yields FEWER segments — the stale idx-2 tail must be gone.
+        db.replace_segments("m-replace", &[seg(0, "new a"), seg(1, "new b")])
+            .unwrap();
+
+        let read = db.get_segments("m-replace").unwrap();
+        assert_eq!(read.len(), 2, "the stale higher-idx tail is swapped out");
+        assert_eq!(read[0].text, "new a");
+        assert_eq!(read[1].text, "new b");
+    }
+
+    /// `transition_meeting_status` is a compare-and-swap: only the caller that observes the
+    /// expected `from` status wins — the single-flight claim `retry_transcription` relies on.
+    #[test]
+    fn transition_meeting_status_is_a_single_flight_claim() {
+        let db = mem_db();
+        db.insert_meeting(&sample_meeting("m-cas", "2026-07-16T10:00:00Z"))
+            .unwrap();
+        db.update_meeting_status("m-cas", MeetingStatus::Error)
+            .unwrap();
+
+        assert!(
+            db.transition_meeting_status("m-cas", MeetingStatus::Error, MeetingStatus::Recording)
+                .unwrap(),
+            "the first claim (Error → Recording) wins"
+        );
+        assert!(
+            !db.transition_meeting_status("m-cas", MeetingStatus::Error, MeetingStatus::Recording)
+                .unwrap(),
+            "a second claim loses — the row is no longer in Error"
+        );
+        assert_eq!(
+            db.get_meeting("m-cas").unwrap().unwrap().status,
+            MeetingStatus::Recording
+        );
+        assert!(
+            !db.transition_meeting_status("m-none", MeetingStatus::Error, MeetingStatus::Recording)
+                .unwrap(),
+            "a missing row never transitions"
+        );
+    }
+
+    /// Mid-run-relock fail-closed purge: `delete_unsealed_segments` removes ONLY the blob-less
+    /// plaintext rows a relock's re-blank (guarded on `text_blob IS NOT NULL`) can never cover —
+    /// a sealed row (blob present) survives byte-untouched.
+    #[test]
+    fn delete_unsealed_segments_removes_only_blobless_rows() {
+        let db = mem_db();
+        db.insert_meeting(&sample_meeting("m-purge", "2026-07-16T10:00:00Z"))
+            .unwrap();
+        let seg = |idx: i64, text: &str| Segment {
+            idx,
+            start_s: idx as f64,
+            end_s: idx as f64 + 1.0,
+            text: text.into(),
+            speaker: None,
+            confidence: None,
+        };
+        db.insert_segments("m-purge", &[seg(0, "sealed row"), seg(1, "fresh plaintext")])
+            .unwrap();
+        // Seal row 0 (blob set, text blanked) — the durable copy a relock governs.
+        db.seal_segment("m-purge", 0, b"fake-ciphertext").unwrap();
+
+        assert_eq!(db.delete_unsealed_segments("m-purge").unwrap(), 1);
+
+        let raw = db.raw_segments("m-purge").unwrap();
+        assert_eq!(raw.len(), 1, "only the unsealed plaintext row was purged");
+        assert_eq!(raw[0].idx, 0, "the sealed row survives");
+        assert!(raw[0].text_blob.is_some(), "its sealed blob is untouched");
     }
 
     /// Tier 3b/A: `segments.confidence` persists through `insert_segments` → `get_segments`. A stored

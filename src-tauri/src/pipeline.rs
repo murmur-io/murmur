@@ -140,6 +140,35 @@ impl Drop for TerminalStatusGuard {
         }
         // Reached ONLY on a panic-unwind (or an unexpected early exit) out of the pipeline task.
         let body = std::panic::AssertUnwindSafe(|| {
+            // STATUS-AWARE (2026-07-16): if the row ALREADY reached a terminal status
+            // (Summarized/Exported/Error), skip the write AND the emit — a tail panic after
+            // "saved" (e.g. in a post-persist best-effort step) must not un-save the meeting by
+            // clobbering a healthy terminal state to Error, and must not flash a spurious error
+            // toast over a note that actually exists. Poison-safe read (`Db::lock` recovers via
+            // `into_inner`); a read failure or a missing row falls through to the conservative
+            // Error write exactly as before.
+            let already_terminal = self
+                .db
+                .get_meeting(&self.meeting_id)
+                .ok()
+                .flatten()
+                .map(|m| {
+                    matches!(
+                        m.status,
+                        MeetingStatus::Summarized
+                            | MeetingStatus::Exported
+                            | MeetingStatus::Error
+                    )
+                })
+                .unwrap_or(false);
+            if already_terminal {
+                tracing::warn!(
+                    target: "pipeline",
+                    meeting_id = %self.meeting_id,
+                    "pipeline task exited without disarming its guard, but the row is already terminal — skipping the Error overwrite"
+                );
+                return;
+            }
             if let Err(e) = self
                 .db
                 .update_meeting_status(&self.meeting_id, MeetingStatus::Error)
@@ -154,8 +183,8 @@ impl Drop for TerminalStatusGuard {
                 emit_status(
                     app,
                     "error",
-                    "Note processing failed unexpectedly. The recording was kept — try \
-                     re-summarizing from the meeting page.",
+                    "Note processing failed unexpectedly. The recording was kept — use \
+                     Retry transcription on the recording to run it again.",
                     &self.meeting_id,
                 );
             }
@@ -218,9 +247,13 @@ async fn with_stage_watchdog<T>(
                 bound_s = bound.as_secs(),
                 "stage watchdog fired — the stage is stuck; surfacing a terminal error"
             );
+            // Recovery pointer: re-summarizing can NOT re-run ASR (no segments were persisted by a
+            // stage that never finished) — the honest recovery is the from-disk re-transcription
+            // (`retry_transcription`), which re-runs the whole pipeline off the archived audio.
             Err(AppError::Transcribe(format!(
                 "transcription timed out after {} minutes (stage: {stage}) — the recording was \
-                 kept; try re-summarizing, or pick a smaller model in Settings",
+                 kept; use Retry transcription on the recording, or pick a smaller model in \
+                 Settings",
                 bound.as_secs() / 60
             )))
         }
@@ -281,6 +314,73 @@ pub async fn run_after_stop(
             Err(e)
         }
     }
+}
+
+/// FROM-DISK re-run of the post-Stop pipeline (2026-07-16, salvage-from-disk): re-transcribe a
+/// meeting whose ARCHIVE WAV survived on disk after its original pipeline died (crash / panic /
+/// force-quit between `finalize_meeting` and a terminal status), or whose user asked for a retry
+/// (`retry_transcription`). Reads the archived mix back into memory, then runs the EXACT SAME
+/// [`run_after_stop`] a live Stop takes — so the re-run inherits the heavy-inference gate
+/// (`perf::run_heavy`), the ASR watchdog, seal-aware note persist (`upsert_note_reseal_if_locked`)
+/// and the locked-folder export-skip branches with zero forking.
+///
+/// KNOWN, DOCUMENTED DEGRADATION: the archive is the COMBINED mic+system mix, so the re-run is
+/// single-stream — every segment is attributed to `me` (no `others` split, no diarization). A
+/// mono-attributed real transcript beats a dead `Error` row; the spill salvage (which still has
+/// both streams) always wins when present.
+///
+/// LOCK MODEL: callers MUST have passed the `meeting_is_unlocked` gate BEFORE handing a WAV path
+/// here (fail-closed — this fn never decrypts a sealed `.enc`). After the run — Ok or Err — the
+/// lock-state finalizer ([`crate::commands::finalize_salvage_lock_state`]) reconciles the fresh
+/// output with the folder's CURRENT lock state: a session-unlocked locked folder gets the fresh
+/// segments/timeline/audio durably re-sealed via the same `SealInto` path auto-file uses; a
+/// mid-run relock gets the unsealed plaintext leftovers purged fail-closed (audio survives as the
+/// sealed `.enc`).
+///
+/// A PRE-pipeline failure (unreadable/empty WAV) persists `Error` + emits the terminal `error`
+/// stage itself, mirroring `run_after_stop`'s Err arm, so the row never wedges non-terminal.
+pub async fn run_salvage_from_disk(
+    app: &AppHandle,
+    state: &AppState,
+    meeting_id: &str,
+    wav_path: &Path,
+) -> Result<PipelineResult> {
+    let prep: Result<(Vec<f32>, u32)> =
+        audio::read_wav_mono(wav_path).and_then(|(samples, rate)| {
+            if samples.is_empty() || rate == 0 {
+                Err(AppError::Audio(
+                    "archived recording audio is empty or unreadable — nothing to re-transcribe"
+                        .into(),
+                ))
+            } else {
+                Ok((samples, rate))
+            }
+        });
+    let (samples, rate) = match prep {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = state
+                .db
+                .update_meeting_status(meeting_id, MeetingStatus::Error);
+            emit_status(app, "error", &e.to_string(), meeting_id);
+            return Err(e);
+        }
+    };
+    let duration_s = (samples.len() as f64 / rate as f64).round() as i64;
+    // Single stream, anchored to a fresh Instant (the original capture clocks are gone) — the
+    // merge sees one stream, so the anchor only offsets absolute timestamps uniformly.
+    let now = std::time::Instant::now();
+    let result = run_after_stop(
+        app, state, meeting_id, samples, rate, duration_s, None, // no system stream
+        None, // no AEC helper track
+        now, None,
+    )
+    .await;
+    // Reconcile the fresh output with the folder's CURRENT lock state on BOTH arms (an Err run may
+    // already have inserted plaintext segments before failing). Best-effort: a finalizer failure is
+    // logged inside and must never mask the pipeline result.
+    crate::commands::finalize_salvage_lock_state(state, meeting_id);
+    result
 }
 
 /// Transcribe one 16 kHz stream at the Accurate profile, VAD-segmented. With a `VadSegmenter`,
@@ -844,7 +944,11 @@ async fn run_inner(
         tracing::info!(target: "transcribe", segments = merged_segments.len(), "merged mic + system streams (me/others)");
     }
 
-    state.db.insert_segments(meeting_id, &merged_segments)?;
+    // ATOMIC replace (delete + insert in one tx), not a keyed `INSERT OR REPLACE`: a fresh meeting
+    // is byte-identical (nothing to delete), but a RE-RUN of the pipeline over the same meeting
+    // (`retry_transcription` / disk salvage after a partial prior run) must not leave a stale
+    // higher-idx tail from the previous transcript interleaved into the new one.
+    state.db.replace_segments(meeting_id, &merged_segments)?;
     if echo_suppressed > 0 {
         tracing::info!(target: "transcribe", suppressed = echo_suppressed, "cross-stream echo segments removed");
         let _ = app.emit(
@@ -2460,6 +2564,33 @@ mod tests {
             status,
             MeetingStatus::Recording,
             "a disarmed guard must not touch the meeting status"
+        );
+    }
+
+    /// RED-before-GREEN (2026-07-16 status-aware guard): a guard left ARMED by a tail panic AFTER
+    /// the row already reached a TERMINAL status must not fire its Error write — "a tail panic
+    /// after 'saved' must not un-save". Pre-fix the Drop flipped the row to Error unconditionally,
+    /// so this failed with `Summarized != Error`.
+    #[test]
+    fn terminal_guard_drop_after_terminal_status_keeps_the_saved_status() {
+        let db = std::sync::Arc::new(
+            crate::storage::Db::open_with_key(&temp_db_path("guard-terminal"), TEST_DEK).unwrap(),
+        );
+        db.insert_meeting(&guard_test_meeting("m-saved")).unwrap();
+        db.update_meeting_status("m-saved", MeetingStatus::Summarized)
+            .unwrap();
+
+        let db_in = db.clone();
+        let unwound = std::panic::catch_unwind(move || {
+            let _guard = TerminalStatusGuard::arm(None, db_in, "m-saved");
+            panic!("simulated tail panic after the note was persisted");
+        });
+        assert!(unwound.is_err(), "the closure must have panicked");
+
+        assert_eq!(
+            db.get_meeting("m-saved").unwrap().unwrap().status,
+            MeetingStatus::Summarized,
+            "an armed guard dropped after the row reached a terminal status must NOT overwrite it with Error"
         );
     }
 

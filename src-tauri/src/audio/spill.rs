@@ -376,6 +376,120 @@ fn claim_system_scratch(src: &Path, dir: &Path, meeting_id: &str) -> Option<Path
     }
 }
 
+// ── Disk salvage (STAGE 3, 2026-07-16): re-run the pipeline off a surviving ARCHIVE WAV ─────────
+
+/// A stuck-`RECORDING` meeting claimed for a FROM-DISK pipeline re-run: its original pipeline died
+/// AFTER `finalize_meeting` wrote the archive WAV (so `audio_path` points at real audio) but before
+/// a terminal status. Pre-fix these rows were reconciled straight to `ERROR` with intact audio on
+/// disk that was never re-transcribed.
+pub struct DiskSalvageJob {
+    pub meeting_id: String,
+    pub wav_path: PathBuf,
+}
+
+/// The startup disk-salvage decision for ONE stuck-`RECORDING` row, as a PURE fn (unit-tested).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiskSalvagePlan {
+    /// A plaintext archive WAV exists AND the meeting's folder is open (or absent) → re-run the
+    /// pipeline from disk. Salvage owns the row's final status; reconcile must skip it.
+    Salvage,
+    /// The audio exists only sealed (`.enc`), or the folder is locked (at launch the session
+    /// unlock set is ALWAYS empty, so a locked folder can never be salvaged here). NEVER decrypt
+    /// for salvage — leave the row to reconcile (terminal `ERROR`, audio untouched), recoverable
+    /// via `retry_transcription` after a Touch ID unlock.
+    DeferSealed,
+    /// No archive audio on disk at all → nothing to re-transcribe; reconcile flips it to `ERROR`
+    /// exactly as before.
+    NoAudio,
+}
+
+/// PURE disk-salvage decision. `folder_open` = the meeting has no folder OR its folder is not
+/// locked. FAIL-CLOSED: a locked folder defers even when a plaintext WAV exists (a crash-window
+/// leftover) — re-pipelining would write fresh plaintext (segments/note) behind the lock.
+pub fn disk_salvage_plan(wav_exists: bool, enc_exists: bool, folder_open: bool) -> DiskSalvagePlan {
+    if !folder_open {
+        return DiskSalvagePlan::DeferSealed;
+    }
+    if wav_exists {
+        DiskSalvagePlan::Salvage
+    } else if enc_exists {
+        DiskSalvagePlan::DeferSealed
+    } else {
+        DiskSalvagePlan::NoAudio
+    }
+}
+
+/// SYNCHRONOUS startup disk-salvage claim — runs in `lib.rs` setup AFTER [`claim_inflight`]
+/// (SPILL SALVAGE WINS: a spill job has both streams — mic + far side — so a meeting already in
+/// `already_claimed` is skipped here) and BEFORE `reconcile_stuck_recordings_except`, so a claimed
+/// row is not flipped to `ERROR` under the salvage worker. Per remaining stuck-`RECORDING` row it
+/// decides via [`disk_salvage_plan`]; `DeferSealed`/`NoAudio` rows are NOT claimed (reconcile makes
+/// them honest terminal `ERROR` rows — audio and `.enc` files are never touched here).
+///
+/// Returns `(jobs, claimed_meeting_ids)`. Best-effort + panic-free; logs carry UUIDs + counts only.
+pub fn claim_disk_salvage(db: &Db, already_claimed: &[String]) -> (Vec<DiskSalvageJob>, Vec<String>) {
+    let mut jobs = Vec::new();
+    let mut claimed = Vec::new();
+    let ids = match db.stuck_recording_ids() {
+        Ok(ids) => ids,
+        Err(e) => {
+            tracing::warn!(target: "startup", error = %e, "disk salvage: could not list stuck recordings; skipping claim");
+            return (jobs, claimed);
+        }
+    };
+    for id in ids {
+        if already_claimed.contains(&id) {
+            continue; // the spill salvage owns this row (it has the richer dual-stream audio).
+        }
+        let meeting = match db.get_meeting(&id) {
+            Ok(Some(m)) => m,
+            _ => continue,
+        };
+        let Some(path) = meeting.audio_path.filter(|p| !p.trim().is_empty()) else {
+            continue; // NoAudio — reconcile flips it to ERROR exactly as before.
+        };
+        // Normalize: `audio_path` may name the plaintext WAV or (post-seal) the `.enc` itself.
+        let plaintext = path.trim_end_matches(".enc").to_string();
+        let wav_exists = Path::new(&plaintext).exists();
+        let enc_exists = Path::new(&format!("{plaintext}.enc")).exists();
+        // At launch the session unlock set is EMPTY, so "open" is purely the folder's lock bit.
+        let folder_open = match db.folder_for_meeting(&id) {
+            Ok(Some(fid)) => match db.folder_by_id(&fid) {
+                Ok(Some(f)) => !f.locked,
+                Ok(None) => true,
+                Err(_) => false, // unreadable folder row ⇒ fail closed (defer).
+            },
+            Ok(None) => true,
+            Err(_) => false, // fail closed.
+        };
+        match disk_salvage_plan(wav_exists, enc_exists, folder_open) {
+            DiskSalvagePlan::Salvage => {
+                jobs.push(DiskSalvageJob {
+                    meeting_id: id.clone(),
+                    wav_path: PathBuf::from(plaintext),
+                });
+                claimed.push(id);
+            }
+            DiskSalvagePlan::DeferSealed => {
+                tracing::info!(
+                    target: "startup",
+                    meeting_id = %id,
+                    "disk salvage deferred: the recording's audio is sealed / its folder is locked — the row becomes ERROR; unlock the folder and use Retry transcription"
+                );
+            }
+            DiskSalvagePlan::NoAudio => {}
+        }
+    }
+    if !claimed.is_empty() {
+        tracing::info!(
+            target: "startup",
+            salvaging = claimed.len(),
+            "claimed crashed recording(s) with surviving archive audio for from-disk re-transcription"
+        );
+    }
+    (jobs, claimed)
+}
+
 /// GC pass over the inflight dir: delete any orphaned `<id>.sys.wav` whose paired spill (`<id>.f32le`)
 /// AND sidecar (`<id>.json`) are BOTH gone — i.e. its salvage lifecycle is over (the job succeeded, was
 /// discarded, or preserved the far-side track on a mic-read error) and the file is now garbage that
@@ -414,16 +528,16 @@ fn reap_orphaned_system_wavs(dir: &Path) {
 /// pipeline sequentially. Best-effort + panic-free: a job failure marks that meeting `Error` (via
 /// `run_after_stop`) with its salvaged audio still attached — it NEVER deletes audio and NEVER
 /// crashes launch. A no-op when there are no jobs.
-pub fn spawn_salvage(app: AppHandle, jobs: Vec<SalvageJob>) {
-    if jobs.is_empty() {
+pub fn spawn_salvage(app: AppHandle, jobs: Vec<SalvageJob>, disk_jobs: Vec<DiskSalvageJob>) {
+    if jobs.is_empty() && disk_jobs.is_empty() {
         return;
     }
     let _ = std::thread::Builder::new()
         .name("murmur-crash-salvage".into())
-        .spawn(move || run_salvage_jobs(app, jobs));
+        .spawn(move || run_salvage_jobs(app, jobs, disk_jobs));
 }
 
-fn run_salvage_jobs(app: AppHandle, jobs: Vec<SalvageJob>) {
+fn run_salvage_jobs(app: AppHandle, jobs: Vec<SalvageJob>, disk_jobs: Vec<DiskSalvageJob>) {
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -436,8 +550,13 @@ fn run_salvage_jobs(app: AppHandle, jobs: Vec<SalvageJob>) {
             return;
         }
     };
+    // Spill jobs FIRST (richer dual-stream audio), then the from-disk re-runs. Sequential on one
+    // thread — heavy ASR additionally serializes through the shared `perf::run_heavy` gate.
     for job in jobs {
         rt.block_on(salvage_one(&app, job));
+    }
+    for job in disk_jobs {
+        rt.block_on(salvage_disk_one(&app, job));
     }
 }
 
@@ -500,6 +619,70 @@ async fn salvage_one(app: &AppHandle, job: SalvageJob) {
         Err(e) => tracing::warn!(target: "startup", meeting_id = %job.meeting_id, error = %e, "salvage pipeline failed; audio attached, meeting marked Error"),
     }
     cleanup_job_files(&job);
+}
+
+/// FROM-DISK re-run of one claimed stuck-`RECORDING` meeting (STAGE 3 — see [`claim_disk_salvage`]).
+/// Re-runs the EXISTING post-Stop pipeline off the surviving archive WAV
+/// ([`crate::pipeline::run_salvage_from_disk`] — same heavy-inference gate, ASR watchdog, and
+/// seal-aware persist as a live Stop). Fail-closed re-checks at run time (the detached worker can
+/// start seconds after the claim): the lock gate (a folder locked since the claim defers — flip to
+/// `ERROR`, audio untouched, recoverable via unlock + retry) and the recorder (a user already
+/// recording defers the same way — a salvage must not contend with a live capture; the row stays
+/// retryable). A pipeline error is already persisted terminal by `run_after_stop`'s Err arm; a
+/// PANIC is caught by the armed `TerminalStatusGuard`. NEVER deletes audio.
+async fn salvage_disk_one(app: &AppHandle, job: DiskSalvageJob) {
+    let state = app.state::<AppState>();
+
+    let defer_to_error = |reason: &str| {
+        let _ = state
+            .db
+            .update_meeting_status(&job.meeting_id, MeetingStatus::Error);
+        tracing::warn!(
+            target: "startup",
+            meeting_id = %job.meeting_id,
+            reason,
+            "disk salvage deferred; the recording stays terminal-Error with its audio intact (Retry transcription re-runs it)"
+        );
+    };
+
+    // Lock gate, re-checked fail-closed at run time (claim-time state can be stale).
+    match crate::commands::meeting_is_unlocked(&state, &job.meeting_id) {
+        Ok(true) => {}
+        Ok(false) => {
+            defer_to_error("folder locked");
+            return;
+        }
+        Err(_) => {
+            defer_to_error("lock state unreadable");
+            return;
+        }
+    }
+    // A recording the user started in the seconds since launch wins over the salvage.
+    let recording_active = state.recorder.lock().map(|r| r.is_some()).unwrap_or(true);
+    if recording_active {
+        defer_to_error("recording in progress");
+        return;
+    }
+
+    // Guard the non-terminal RECORDING row across the run: a panic inside the pipeline must still
+    // leave a terminal status (the guard is status-aware, so a healthy Summarized/Exported finish
+    // is never clobbered).
+    let terminal_guard = crate::pipeline::TerminalStatusGuard::arm(
+        Some(app.clone()),
+        state.db.clone(),
+        &job.meeting_id,
+    );
+    let result =
+        crate::pipeline::run_salvage_from_disk(app, &state, &job.meeting_id, &job.wav_path).await;
+    terminal_guard.disarm();
+    match result {
+        Ok(_) => {
+            tracing::info!(target: "startup", meeting_id = %job.meeting_id, "re-transcribed a crashed recording from its on-disk archive")
+        }
+        Err(e) => {
+            tracing::warn!(target: "startup", meeting_id = %job.meeting_id, error = %e, "from-disk salvage pipeline failed; audio intact, meeting marked Error")
+        }
+    }
 }
 
 /// Remove a job's inflight artifacts after processing. Best-effort + idempotent: the moved system WAV
@@ -839,5 +1022,185 @@ mod tests {
         assert!(half.exists(), "a half-live job (spill still present) is never reaped");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── STAGE 3: disk-salvage claims (2026-07-16 salvage-from-disk) ────────────────────────────
+
+    fn insert_meeting_with_audio(db: &Db, id: &str, status: MeetingStatus, audio: &Path) {
+        db.insert_meeting(&crate::storage::Meeting {
+            id: id.into(),
+            started_at: "2026-07-16T09:00:00Z".into(),
+            ended_at: None,
+            title: None,
+            duration_s: 60,
+            audio_path: Some(audio.to_string_lossy().to_string()),
+            status,
+            folder_id: None,
+        })
+        .unwrap();
+    }
+
+    /// Put `id` into a LOCKED folder — folder membership rides the meeting's NOTE row
+    /// (`folder_for_meeting` reads `notes.folder_id`), so a note row is required.
+    fn file_into_locked_folder(db: &Db, id: &str, folder_id: &str) {
+        db.insert_folder(&crate::storage::Folder {
+            id: folder_id.into(),
+            name: folder_id.into(),
+            path: folder_id.into(),
+            parent_id: None,
+            locked: true,
+            created_at: "2026-07-16T00:00:00Z".into(),
+        })
+        .unwrap();
+        db.upsert_note(&crate::storage::NoteRecord {
+            meeting_id: id.into(),
+            provider_id: "claude_code".into(),
+            markdown: String::new(),
+            created_at: "2026-07-16T00:00:00Z".into(),
+            exported_path: None,
+            model_requested: None,
+            model_served: None,
+            gateway_host: None,
+        })
+        .unwrap();
+        db.set_meeting_folder(id, Some(folder_id)).unwrap();
+    }
+
+    #[test]
+    fn disk_salvage_plan_truth_table() {
+        use DiskSalvagePlan::*;
+        assert_eq!(disk_salvage_plan(true, false, true), Salvage, "plaintext WAV + open folder ⇒ re-run");
+        assert_eq!(disk_salvage_plan(true, true, true), Salvage, "plaintext WAV present ⇒ re-run (the .enc twin is irrelevant)");
+        assert_eq!(disk_salvage_plan(false, true, true), DeferSealed, "only the sealed .enc ⇒ never decrypt for salvage");
+        assert_eq!(disk_salvage_plan(true, false, false), DeferSealed, "locked folder defers even with a plaintext WAV (fail closed)");
+        assert_eq!(disk_salvage_plan(false, true, false), DeferSealed);
+        assert_eq!(disk_salvage_plan(false, false, true), NoAudio, "nothing on disk ⇒ reconcile to ERROR as before");
+        assert_eq!(disk_salvage_plan(false, false, false), DeferSealed, "locked wins over missing audio (still fail closed)");
+    }
+
+    /// RED-before-GREEN (the ITEM-1 headline): pre-fix, a stuck-RECORDING row whose archive WAV
+    /// survived on disk (the pipeline died AFTER `finalize_meeting`) was reconciled straight to
+    /// ERROR — intact audio never re-transcribed. Post-fix the claim runs BEFORE reconcile and the
+    /// row is scheduled for a from-disk re-run instead of the ERROR flip.
+    #[test]
+    fn stuck_recording_with_surviving_archive_is_claimed_not_errored() {
+        let dir = tmp_dir("disk-claim");
+        let (db, db_path) = tmp_db();
+        let id = "disk-crash-1";
+        let wav = dir.join(format!("{id}.wav"));
+        std::fs::write(&wav, b"RIFF-fake-archive").unwrap();
+        insert_meeting_with_audio(&db, id, MeetingStatus::Recording, &wav);
+
+        // The exact lib.rs setup ordering: spill claim → disk claim → reconcile-except.
+        let (spill_jobs, mut claimed) = claim_inflight_in(&dir, &db);
+        assert!(spill_jobs.is_empty(), "no spill survives in this scenario");
+        let (disk_jobs, disk_claimed) = claim_disk_salvage(&db, &claimed);
+        claimed.extend(disk_claimed);
+        db.reconcile_stuck_recordings_except(&claimed).unwrap();
+
+        assert_eq!(disk_jobs.len(), 1, "the surviving archive is claimed for a from-disk re-run");
+        assert_eq!(disk_jobs[0].meeting_id, id);
+        assert_eq!(disk_jobs[0].wav_path, wav);
+        assert_eq!(
+            db.get_meeting(id).unwrap().unwrap().status,
+            MeetingStatus::Recording,
+            "a disk-claimed row must NOT be flipped to ERROR — the salvage worker owns its final status"
+        );
+        assert!(wav.exists(), "the claim never touches the audio file");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    /// A stuck-RECORDING row with NO usable audio (no `audio_path`, or the file is gone) is NOT
+    /// claimed — reconcile flips it to the honest terminal ERROR exactly as before.
+    #[test]
+    fn stuck_recording_without_audio_still_reconciles_to_error() {
+        let dir = tmp_dir("disk-noaudio");
+        let (db, db_path) = tmp_db();
+        insert_meeting(&db, "no-path", MeetingStatus::Recording); // audio_path: None
+        let gone = dir.join("gone.wav"); // named but never written
+        insert_meeting_with_audio(&db, "file-gone", MeetingStatus::Recording, &gone);
+
+        let (disk_jobs, claimed) = claim_disk_salvage(&db, &[]);
+        db.reconcile_stuck_recordings_except(&claimed).unwrap();
+
+        assert!(disk_jobs.is_empty() && claimed.is_empty(), "nothing to re-transcribe ⇒ nothing claimed");
+        for id in ["no-path", "file-gone"] {
+            assert_eq!(
+                db.get_meeting(id).unwrap().unwrap().status,
+                MeetingStatus::Error,
+                "an audio-less ghost still becomes a terminal ERROR row"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    /// LOCK MODEL: a stuck-RECORDING meeting in a LOCKED folder is NEVER claimed — with sealed
+    /// `.enc`-only audio there is nothing to decrypt with at launch (the session unlock set is
+    /// empty), and even a plaintext crash-window WAV must not be re-pipelined into fresh plaintext
+    /// behind the lock. The claim leaves every audio file byte-untouched; reconcile makes the row a
+    /// terminal ERROR that stays recoverable via unlock + `retry_transcription`.
+    #[test]
+    fn sealed_folder_salvage_defers_without_decrypting_or_leaking() {
+        let dir = tmp_dir("disk-sealed");
+        let (db, db_path) = tmp_db();
+
+        // Meeting A: audio exists ONLY as the sealed `.enc`.
+        let wav_a = dir.join("sealed-a.wav");
+        let enc_a = dir.join("sealed-a.wav.enc");
+        std::fs::write(&enc_a, b"AES-GCM-ciphertext").unwrap();
+        insert_meeting_with_audio(&db, "m-sealed-a", MeetingStatus::Recording, &wav_a);
+        file_into_locked_folder(&db, "m-sealed-a", "f-locked-a");
+
+        // Meeting B: a PLAINTEXT WAV survived the crash window inside a locked folder.
+        let wav_b = dir.join("sealed-b.wav");
+        std::fs::write(&wav_b, b"RIFF-fake-archive").unwrap();
+        insert_meeting_with_audio(&db, "m-sealed-b", MeetingStatus::Recording, &wav_b);
+        file_into_locked_folder(&db, "m-sealed-b", "f-locked-b");
+
+        let (disk_jobs, claimed) = claim_disk_salvage(&db, &[]);
+        assert!(
+            disk_jobs.is_empty() && claimed.is_empty(),
+            "a locked folder's meetings are never claimed for salvage (fail closed)"
+        );
+        assert!(enc_a.exists(), "the sealed .enc is byte-untouched");
+        assert!(!wav_a.exists(), "no plaintext was materialized for the sealed meeting");
+        assert!(wav_b.exists(), "the claim never deletes audio either");
+
+        db.reconcile_stuck_recordings_except(&claimed).unwrap();
+        for id in ["m-sealed-a", "m-sealed-b"] {
+            assert_eq!(
+                db.get_meeting(id).unwrap().unwrap().status,
+                MeetingStatus::Error,
+                "the deferred row becomes a terminal ERROR — recoverable via unlock + retry"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    /// Spill priority: a meeting the SPILL salvage already claimed (dual-stream audio — strictly
+    /// richer than the mixed archive) is skipped by the disk claim.
+    #[test]
+    fn spill_claim_wins_over_disk_claim() {
+        let dir = tmp_dir("disk-priority");
+        let (db, db_path) = tmp_db();
+        let id = "both-sources";
+        let wav = dir.join(format!("{id}.wav"));
+        std::fs::write(&wav, b"RIFF-fake-archive").unwrap();
+        insert_meeting_with_audio(&db, id, MeetingStatus::Recording, &wav);
+
+        let (disk_jobs, claimed) = claim_disk_salvage(&db, &[id.to_string()]);
+        assert!(
+            disk_jobs.is_empty() && claimed.is_empty(),
+            "a spill-claimed meeting is never double-claimed by the disk salvage"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&db_path);
     }
 }
