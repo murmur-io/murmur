@@ -745,6 +745,19 @@ export class IpcService {
   }
 
   /**
+   * Remove the caller's OWN org item from the shared org space, from a device
+   * that never itself shared it (e.g. the author's other Mac). Deliberately
+   * "leave/remove from org", NOT "destroy the original" — the origin device's
+   * local note/meeting source is untouched; only the shared org-space copy
+   * (this device's replica now, the origin device's replica on its own next
+   * sync) is tombstoned. Refuses (Auth) for anyone but the stored author.
+   * Mirrors `delete_org_item_as_author`.
+   */
+  deleteOrgItemAsAuthor(itemId: string): Promise<void> {
+    return invoke<void>("delete_org_item_as_author", { itemId });
+  }
+
+  /**
    * Resolve an org item back to THIS device's local editable source (the note or
    * meeting it was shared FROM), or `null` when the caller is NOT the author (no
    * local source). Lets the `/org-item/:id` viewer send an author straight to
