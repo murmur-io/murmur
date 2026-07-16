@@ -81,6 +81,7 @@ import type {
   StatusPayload,
   EchoSuppressedPayload,
   RecordingCappedPayload,
+  RecordingStatus,
   StopResult,
   TopicThread,
   VoiceActionResultPayload,
@@ -184,6 +185,17 @@ export class IpcService {
 
   recordingLevel(): Promise<number> {
     return invoke<number>("recording_level");
+  }
+
+  /**
+   * The backend's truth for "is a recording in flight RIGHT NOW" (+ the
+   * in-progress meeting id / start time). `RecorderStore.init()` calls this once
+   * per webview load to reconcile a stale optimistic stage: a webview reload (or
+   * a pipeline task that died before this webview session even loaded) leaves
+   * the FE stage disagreeing with the long-lived Rust process.
+   */
+  recordingStatus(): Promise<RecordingStatus> {
+    return invoke<RecordingStatus>("recording_status");
   }
 
   /**

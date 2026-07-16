@@ -789,14 +789,17 @@ pub async fn stop_recording(
     };
 
     // STAGE 2 crash-salvage: take the spill writer into a guard whose `Drop` stops the writer thread
-    // and DELETES the plaintext spill + sidecar on EVERY exit path of this Stop (success, `?`-error,
-    // panic) — mirroring `pipeline::ScratchWav`. It is held across `run_after_stop` below (dropped at
-    // end of scope), so it survives until the archive WAV is written; after a normal Stop the spill is
-    // gone. ONLY a crash (this function never runs) leaves it behind for next-launch salvage.
+    // and DELETES the plaintext spill + sidecar on EVERY exit path of the pipeline (success,
+    // `?`-error, panic-unwind) — mirroring `pipeline::ScratchWav`. It is MOVED INTO the detached
+    // pipeline task below (2026-07-16) and dropped there right after `run_after_stop` returns, so
+    // its drop timing relative to the pipeline is unchanged (it survives until the archive WAV is
+    // written) — but it is now immune to THIS command future being dropped mid-await (webview
+    // teardown): the spill lives exactly as long as the pipeline that is consuming the audio.
+    // ONLY a process crash (the task never finishes) leaves it behind for next-launch salvage.
     // A POISONED `spill_writer` mutex (`.lock().ok()` ⇒ None) merely DEFERS this clean-stop cleanup:
     // the spill lingers to next launch, where `claim_inflight` sees the row is no longer RECORDING and
     // DiscardOrphans it — benign (no leak, no content loss), so tolerating the poison here is correct.
-    let _spill_guard = state.spill_writer.lock().ok().and_then(|mut s| s.take());
+    let spill_guard = state.spill_writer.lock().ok().and_then(|mut s| s.take());
 
     // The recording is definitively over — clear the accumulated live-caption buffer NOW so a
     // stale tail can never be injected into assistant prompts after Stop (nor keep egressing once
@@ -858,22 +861,57 @@ pub async fn stop_recording(
     // Duration from the persisted started_at, falling back to a sample-count estimate.
     let duration_s = compute_duration_s(&state, &meeting_id, samples.len(), src_rate);
 
-    let result = pipeline::run_after_stop(
-        &app,
-        &state,
-        &meeting_id,
-        samples,
-        src_rate,
-        duration_s,
-        system_wav,
-        aec_mic_wav,
-        mic_started_at,
-        system_started_at,
-    )
-    .await?;
-
-    // Resume voice listening if it's still enabled (the mic is free again).
-    restart_voice_listener(app);
+    // DETACHED, panic-mapped pipeline execution (2026-07-16). The verified production wedge:
+    // `run_after_stop` was awaited INLINE in this command future, and Tauri never settles the JS
+    // invoke Promise for a command future that PANICS (tokio swallows the panic at the task
+    // boundary) or is DROPPED mid-await — the FE stayed on "Transcribing…" forever with the
+    // meeting row stuck at RECORDING and no terminal event. Running the pipeline in a REAL
+    // spawned task fixes both halves:
+    //   • a pipeline PANIC surfaces here as a `JoinError` → mapped to an `AppError` so the
+    //     invoke Promise REJECTS (FE catch → "error"), and the in-task `TerminalStatusGuard`
+    //     has already persisted `Error` + emitted the terminal `error` event during the unwind;
+    //   • if THIS command future is dropped (webview teardown/reload), the detached task keeps
+    //     running to completion and still performs its own status writes + event emits — the
+    //     (re)loaded FE recovers via the event path even without the Promise.
+    let task_app = app.clone();
+    let task_meeting_id = meeting_id.clone();
+    let pipeline_task = tauri::async_runtime::spawn(async move {
+        // Owns the crash-salvage spill for exactly the pipeline's lifetime — see the comment at
+        // the `take()` above. Dropped (spill deleted) when this scope exits: success, error, or
+        // panic-unwind — never before the pipeline has finished with the audio.
+        let _spill_guard = spill_guard;
+        let state = task_app.state::<AppState>();
+        // Armed NOW; disarmed on BOTH normal arms below. Fires ONLY on a panic-unwind (or an
+        // unexpected early exit) — `run_after_stop`'s Err arm already persists `Error` + emits
+        // the `error` stage itself, so there is no double-emit.
+        let terminal_guard = pipeline::TerminalStatusGuard::arm(
+            Some(task_app.clone()),
+            state.db.clone(),
+            &task_meeting_id,
+        );
+        let result = pipeline::run_after_stop(
+            &task_app,
+            &state,
+            &task_meeting_id,
+            samples,
+            src_rate,
+            duration_s,
+            system_wav,
+            aec_mic_wav,
+            mic_started_at,
+            system_started_at,
+        )
+        .await;
+        terminal_guard.disarm();
+        // Resume voice listening if it's still enabled (the mic is free again). Inside the task
+        // (Ok arm only, preserving the pre-change `?` semantics) so it still runs when the outer
+        // command future was dropped mid-pipeline.
+        if result.is_ok() {
+            restart_voice_listener(task_app.clone());
+        }
+        result
+    });
+    let result = await_pipeline_task(pipeline_task).await?;
 
     Ok(StopResult {
         meeting_id: result.meeting_id,
@@ -882,6 +920,22 @@ pub async fn stop_recording(
             .exported_path
             .map(|p| p.to_string_lossy().to_string()),
     })
+}
+
+/// Await the detached pipeline task, mapping a join failure (= the pipeline task PANICKED; it is
+/// never aborted) into a real [`AppError`] so the invoke Promise REJECTS instead of never
+/// settling (the FE's `stop()` catch then shows the error state). The panic's message +
+/// location are logged by the global panic hook (`lib.rs`); the `JoinError` here carries no
+/// note/transcript content, so the surfaced message is PII-safe.
+async fn await_pipeline_task<T>(
+    task: tauri::async_runtime::JoinHandle<Result<T, AppError>>,
+) -> Result<T, AppError> {
+    task.await.map_err(|e| {
+        AppError::Other(anyhow::anyhow!(
+            "note pipeline crashed unexpectedly ({e}) — the meeting was marked failed; \
+             try re-summarizing from the meeting page"
+        ))
+    })?
 }
 
 /// Best-effort recording duration in whole seconds: prefer `now - started_at` from the
@@ -31546,5 +31600,48 @@ mod storage_cmd_tests {
         .unwrap();
         assert_eq!(s.freed_bytes, 0);
         let _ = std::fs::remove_file(&p);
+    }
+}
+
+#[cfg(test)]
+mod pipeline_task_tests {
+    use super::*;
+
+    /// The panic-mapping contract of the detached pipeline execution (2026-07-16 wedge fix): a
+    /// PANIC inside the spawned pipeline task must surface from `await_pipeline_task` as a real
+    /// `Err(AppError)` — which is what makes the JS invoke Promise REJECT (FE catch → "error")
+    /// instead of never settling. Pre-fix there was no spawn at all: the panic unwound through
+    /// the command future, tokio swallowed it at the task boundary, and the Promise hung forever.
+    #[tokio::test]
+    async fn pipeline_task_panic_maps_to_a_rejecting_err() {
+        let task: tauri::async_runtime::JoinHandle<Result<u32, AppError>> =
+            tauri::async_runtime::spawn(async { panic!("simulated pipeline panic") });
+        let res = await_pipeline_task(task).await;
+        match res {
+            Err(AppError::Other(e)) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("pipeline crashed"),
+                    "the mapped error must say the pipeline crashed (got: {msg})"
+                );
+            }
+            other => panic!("a panicked pipeline task must map to Err(AppError::Other), got {other:?}"),
+        }
+    }
+
+    /// Ok and Err results of the spawned task pass through `await_pipeline_task` unchanged —
+    /// the join mapping only covers the panic case.
+    #[tokio::test]
+    async fn pipeline_task_results_pass_through_unchanged() {
+        let ok = tauri::async_runtime::spawn(async { Ok::<u32, AppError>(42) });
+        assert_eq!(await_pipeline_task(ok).await.unwrap(), 42);
+
+        let err = tauri::async_runtime::spawn(async {
+            Err::<u32, AppError>(AppError::Transcribe("real stage failure".into()))
+        });
+        match await_pipeline_task(err).await {
+            Err(AppError::Transcribe(msg)) => assert_eq!(msg, "real stage failure"),
+            other => panic!("an inner Err must pass through unchanged, got {other:?}"),
+        }
     }
 }
