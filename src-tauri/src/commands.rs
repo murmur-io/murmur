@@ -527,8 +527,16 @@ pub async fn start_recording(
     // instance crashed / was SIGKILL'd mid-recording) would otherwise capture alongside the new
     // recording until its 4h self-cap. Safe by construction — a helper owned by any LIVE Murmur
     // process (including the one this call is about to spawn for) is always spared. Best-effort,
-    // never fails the recording.
-    crate::audio::aec::reap_orphaned_capture_helpers();
+    // never fails the recording. Hardening 2026-07-16: the sweep shells out to /bin/ps (×2) plus
+    // a per-candidate `kill -0`, so it runs on a BLOCKING worker instead of stalling this async
+    // runtime thread — but it is still AWAITED: the sweep MUST complete before this recording's
+    // own helpers spawn (ordering guarantee unchanged).
+    if let Err(e) =
+        tauri::async_runtime::spawn_blocking(crate::audio::aec::reap_orphaned_capture_helpers)
+            .await
+    {
+        tracing::warn!(target: "audio", error = %e, "orphan-helper sweep join failed; recording continues");
+    }
 
     // Fresh recording ⇒ re-arm the 4h-cap rising-edge notice (see `recording_level`). If a previous
     // recording hit the cap and set this, the next recording must be able to fire the notice again.

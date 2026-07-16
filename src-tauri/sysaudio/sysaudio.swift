@@ -124,11 +124,21 @@ final class Capturer: NSObject, SCStreamOutput, SCStreamDelegate {
 
 let capturer = Capturer(outURL: outURL)
 
-// Clean shutdown on SIGINT/SIGTERM from the parent (Rust) process.
+// Clean shutdown on SIGINT/SIGTERM from the parent (Rust) process. `stopping` is written from
+// BOTH the signal/kqueue dispatch queue (`sigQueue`) and the main thread (the ppid re-checks
+// below), so the double-stop guard is NSLock-protected — an unsynchronized check-then-set could
+// let two racing stop requests both pass the guard and tear down twice. Mirrors the exact
+// pattern in audiocap.swift / aeccap.swift.
 var stopping = false
+let stopLock = NSLock()
 func requestStop() {
-    if stopping { return }
+    stopLock.lock()
+    if stopping {
+        stopLock.unlock()
+        return
+    }
     stopping = true
+    stopLock.unlock()
     Task { await capturer.stop(); exit(0) }
 }
 let sigQueue = DispatchQueue(label: "meetnotes.sig")
