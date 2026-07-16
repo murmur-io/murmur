@@ -245,8 +245,10 @@ fn split_numeric_prefix(line: &str, numeric_cols: usize) -> Option<(Vec<i32>, &s
 }
 
 /// Whether a process basename is a Murmur app process: the shipped/dev bin name (`Murmur`) or the
-/// basename of OUR OWN executable (covers a renamed dev profile). NOTE: `ps` renders a zombie as
-/// `(Murmur)` — parenthesized, so it correctly does NOT match (a zombie parent is a dead parent).
+/// basename of OUR OWN executable (covers a renamed dev profile). NOTE: `ps` renders a zombie's
+/// `comm` specially — the BSD man page documents a parenthesized name (`(Murmur)`), but Darwin 25
+/// actually renders `<defunct>` — and NEITHER equals the live basename, so a zombie parent
+/// correctly reads as dead under both renderings.
 fn is_murmur_basename(base: &str, self_exe: Option<&str>) -> bool {
     base == "Murmur" || self_exe == Some(base)
 }
@@ -608,7 +610,9 @@ mod tests {
         assert!(is_murmur_basename("Murmur", None));
         assert!(is_murmur_basename("murmur-dev", Some("murmur-dev")));
         assert!(!is_murmur_basename("murmur", None)); // exact case — no fuzzy matching
-        assert!(!is_murmur_basename("(Murmur)", None)); // a zombie parent is a dead parent
+        // A zombie parent is a dead parent — BOTH zombie renderings must fail the match:
+        assert!(!is_murmur_basename("(Murmur)", None)); // the BSD-man-page-documented form
+        assert!(!is_murmur_basename("<defunct>", None)); // what Darwin 25 actually renders
         assert!(!is_murmur_basename("zsh", Some("Murmur")));
     }
 
