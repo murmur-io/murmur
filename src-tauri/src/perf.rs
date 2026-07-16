@@ -23,14 +23,25 @@ where
     F: FnOnce() -> Result<T> + Send + 'static,
     T: Send + 'static,
 {
-    let _permit = semaphore
+    let permit = semaphore
         .clone()
         .acquire_owned()
         .await
         .map_err(|_| AppError::Other(anyhow::anyhow!("heavy-inference semaphore closed")))?;
-    tokio::task::spawn_blocking(f)
-        .await
-        .map_err(|e| AppError::Other(anyhow::anyhow!("heavy inference task panicked: {e}")))?
+    tokio::task::spawn_blocking(move || {
+        // The permit is moved INTO the blocking closure (2026-07-16) — not held by this async
+        // future. If the CALLER's future is dropped mid-await (e.g. the pipeline's ASR watchdog
+        // `tokio::time::timeout` firing), the orphaned blocking closure keeps running to
+        // completion (blocking closures are not cancellable) and MUST keep the one
+        // heavy-inference permit until it actually finishes — otherwise a newly-started heavy
+        // call would co-run with the orphan (the whisper/diarizer co-residency class this
+        // semaphore exists to prevent). Held-in-future vs held-in-closure is identical on the
+        // normal Ok/Err paths (the JoinHandle resolves only after the closure ends).
+        let _permit = permit;
+        f()
+    })
+    .await
+    .map_err(|e| AppError::Other(anyhow::anyhow!("heavy inference task panicked: {e}")))?
 }
 
 /// macOS kernel memory-pressure level via `sysctl -n kern.memorystatus_vm_pressure_level` — the
@@ -139,6 +150,56 @@ mod tests {
             max_concurrent.load(Ordering::SeqCst),
             1,
             "two run_heavy calls on the same semaphore must never overlap"
+        );
+    }
+
+    /// 2026-07-16 (pipeline hang watchdog, RED-before-GREEN): when the CALLER's future is dropped
+    /// mid-flight — exactly what `tokio::time::timeout` around the pipeline's ASR stage does — the
+    /// orphaned `spawn_blocking` closure keeps running (blocking closures are not cancellable) and
+    /// MUST keep the one heavy-inference permit until it actually finishes. Before the fix the
+    /// permit lived in `run_heavy`'s async future, so the timeout-drop released it while the
+    /// blocking thread still ran — letting a second heavy inference co-run with the orphan (the
+    /// whisper/diarizer co-residency class this semaphore exists to prevent).
+    #[tokio::test]
+    async fn run_heavy_keeps_the_permit_while_an_orphaned_closure_still_runs() {
+        let sem = Arc::new(tokio::sync::Semaphore::new(1));
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let finished_in = finished.clone();
+        let fut = run_heavy(&sem, move || -> Result<()> {
+            std::thread::sleep(Duration::from_millis(400));
+            finished_in.store(true, Ordering::SeqCst);
+            Ok(())
+        });
+        // Time the caller out long before the closure finishes — the future is DROPPED here,
+        // but the blocking closure is already running (or queued) and will run to completion.
+        let timed_out = tokio::time::timeout(Duration::from_millis(50), fut).await;
+        assert!(timed_out.is_err(), "the caller must observe the timeout");
+
+        // The orphaned closure is still running → the permit MUST still be held.
+        assert!(
+            !finished.load(Ordering::SeqCst),
+            "closure must still be running at this point (timing precondition)"
+        );
+        assert_eq!(
+            sem.available_permits(),
+            0,
+            "the permit must stay with the still-running orphaned closure, not the dropped future"
+        );
+
+        // Once the closure finishes, the permit is released (poll with a deadline — no flaky sleep).
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while sem.available_permits() == 0 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            finished.load(Ordering::SeqCst),
+            "the orphaned closure must have run to completion"
+        );
+        assert_eq!(
+            sem.available_permits(),
+            1,
+            "the permit must be released once the orphaned closure completes"
         );
     }
 

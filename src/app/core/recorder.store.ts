@@ -101,6 +101,13 @@ export class RecorderStore {
     { initialValue: 0 },
   );
 
+  /**
+   * True once ANY `EVENT_STATUS` payload has been observed this webview session.
+   * The event stream is the live truth: `reconcileStage()` (the one-shot backend
+   * resync on init) must never override a stage the backend itself just pushed.
+   */
+  private statusSeen = false;
+
   private unlisten: UnlistenFn | null = null;
   private unlistenVoice: UnlistenFn | null = null;
   private unlistenToggle: UnlistenFn | null = null;
@@ -152,10 +159,52 @@ export class RecorderStore {
         void this.stop();
       }
     });
+    await this.reconcileStage();
     await this.refreshLastNote();
   }
 
+  /**
+   * One-shot reconcile of the FE stage against the BACKEND's truth on webview
+   * (re)load. Two desync shapes this closes:
+   *
+   * 1. The webview reloaded (tauri-dev hot reload, Cmd-R, webview crash) while
+   *    the long-lived Rust process is GENUINELY recording — the fresh store
+   *    boots at "idle" while `AppState.recorder` is `Some(..)`, so the next
+   *    Start hits `start_recording`'s "already recording" guard. Resync to
+   *    "recording" (anchoring the elapsed timer to the persisted `startedAt`).
+   * 2. A stale optimistic BUSY stage with the backend idle — e.g. the note
+   *    pipeline died before this webview session even loaded (its terminal
+   *    "error" event fired into a void). Clear it to "idle" so the surface can
+   *    never boot wedged on "Transcribing…".
+   *
+   * `statusSeen` guards both branches: once any live `EVENT_STATUS` payload has
+   * arrived (including a detached pipeline still emitting "summarizing"), the
+   * event stream is authoritative and this probe must not fight it. Best-effort:
+   * a failed probe never blocks init.
+   */
+  private async reconcileStage(): Promise<void> {
+    try {
+      const st = await this.ipc.recordingStatus();
+      if (this.statusSeen) return;
+      if (st?.recording) {
+        this._meetingId.set(st.meetingId);
+        const startedMs = st.startedAt ? Date.parse(st.startedAt) : NaN;
+        this._recStartMs = Number.isFinite(startedMs) ? startedMs : Date.now();
+        this._stage.set("recording");
+      } else if (
+        ["recording", "transcribing", "summarizing", "exporting"].includes(
+          this._stage(),
+        )
+      ) {
+        this._stage.set("idle");
+      }
+    } catch {
+      // Best-effort resync — never block init on the probe.
+    }
+  }
+
   private applyStatus(p: StatusPayload): void {
+    this.statusSeen = true;
     const wasRecording = this._stage() === "recording";
     this._stage.set(p.stage);
     this._message.set(p.message);

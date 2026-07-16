@@ -22,6 +22,19 @@ export interface EchoSuppressedPayload {
 }
 
 /**
+ * Mirror of Rust `commands::RecordingStatus` (serde camelCase): whether the
+ * backend recorder is capturing RIGHT NOW, plus the in-progress meeting id and
+ * its RFC3339 start time. A freshly-(re)loaded webview queries this once in
+ * `RecorderStore.init()` to reconcile its stage with the backend's truth (a
+ * webview reload/crash swaps the FE without restarting the Rust process).
+ */
+export interface RecordingStatus {
+  recording: boolean;
+  meetingId: string | null;
+  startedAt: string | null;
+}
+
+/**
  * Payload of murmur://recording-capped — the 4h `MAX_RECORDING_SECONDS` hard
  * TIME cap was reached and the capture self-stopped. Length only, NO PII (no
  * content, meeting id, or path). Fires once per recording (rising edge).
