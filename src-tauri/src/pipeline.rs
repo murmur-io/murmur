@@ -367,20 +367,41 @@ pub async fn run_salvage_from_disk(
         }
     };
     let duration_s = (samples.len() as f64 / rate as f64).round() as i64;
+    // Reconcile the fresh output with the folder's CURRENT lock state on EVERY exit — Ok, Err, a
+    // panic unwinding through the detached task, or this future being dropped mid-await. A plain
+    // sequential call after the await left a crash window (2026-07-16 review): a kill between the
+    // segment insert and the finalizer skipped the re-seal/purge, stranding fresh plaintext behind
+    // a lock (the relock-side sweep in `reblank_folder_extras` is the second, universal net).
+    // Best-effort by contract: a finalizer failure is logged inside and never masks the result.
+    let _finalizer = SalvageLockFinalizer { state, meeting_id };
     // Single stream, anchored to a fresh Instant (the original capture clocks are gone) — the
     // merge sees one stream, so the anchor only offsets absolute timestamps uniformly.
     let now = std::time::Instant::now();
-    let result = run_after_stop(
+    run_after_stop(
         app, state, meeting_id, samples, rate, duration_s, None, // no system stream
         None, // no AEC helper track
         now, None,
     )
-    .await;
-    // Reconcile the fresh output with the folder's CURRENT lock state on BOTH arms (an Err run may
-    // already have inserted plaintext segments before failing). Best-effort: a finalizer failure is
-    // logged inside and must never mask the pipeline result.
-    crate::commands::finalize_salvage_lock_state(state, meeting_id);
-    result
+    .await
+}
+
+/// Drop-armed wrapper for [`crate::commands::finalize_salvage_lock_state`] — the salvage lock
+/// finalizer MUST run on every exit from [`run_salvage_from_disk`]'s pipeline scope, including a
+/// panic unwind and a mid-await future drop, or the crash window leaves unsealed plaintext behind
+/// a lock. Drop is unwind-safe: the body is `catch_unwind`-wrapped (a panic escaping `Drop`
+/// during an unwind would abort the process) and the finalizer itself is best-effort.
+pub(crate) struct SalvageLockFinalizer<'a> {
+    pub(crate) state: &'a AppState,
+    pub(crate) meeting_id: &'a str,
+}
+
+impl Drop for SalvageLockFinalizer<'_> {
+    fn drop(&mut self) {
+        let (state, meeting_id) = (self.state, self.meeting_id);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::commands::finalize_salvage_lock_state(state, meeting_id);
+        }));
+    }
 }
 
 /// Transcribe one 16 kHz stream at the Accurate profile, VAD-segmented. With a `VadSegmenter`,
