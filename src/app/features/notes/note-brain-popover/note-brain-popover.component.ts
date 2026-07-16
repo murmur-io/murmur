@@ -521,10 +521,12 @@ export class NoteBrainPopoverComponent {
 
   /**
    * Insert a `[[Title]]` wikilink to this citation's source, then dismiss the
-   * popover (Fix 3 — the "Insert link" PRIMARY action alongside "Open" on every
-   * `find_related` citation row: reuses the SAME gated citation data, only the
-   * interaction changes). The editor applies it exactly like an `insert` outcome
-   * (appended after the selection), so this needs no new textarea-splice logic.
+   * popover — the PRIMARY action of a `find_related` row (the row itself; its
+   * accessible name is "Insert link to <title>"), with "Open" as the quiet
+   * secondary (minimalist reshape 2026-07-16; reuses the SAME gated citation
+   * data, only the interaction changed). The editor applies it exactly like an
+   * `insert` outcome (appended after the selection), so this needs no new
+   * textarea-splice logic.
    */
   insertLinkFor(cite: NoteCitation): void {
     this.accepted.emit({ kind: "insertLink", title: cite.title });
