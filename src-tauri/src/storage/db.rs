@@ -679,6 +679,9 @@ impl Db {
         // table (see `crate::connectors::mcp`). Additive + guarded so migrate() stays idempotent.
         Self::migrate_briefs(&conn)?;
         Self::migrate_mcp_servers(&conn)?;
+        // Vault Audit v1 — deterministic vault-health findings + run bookkeeping (see
+        // `crate::audit`). Additive + guarded so migrate() stays idempotent.
+        Self::migrate_audit(&conn)?;
         // M6 Shared Brain — the local org state + the outbound org-share state machine (mirrors
         // `outbound_shares`). NOT the org_items/chunks ingest tables (a later slice owns those).
         // Additive + guarded so migrate() stays idempotent.
@@ -1421,6 +1424,53 @@ impl Db {
              CREATE INDEX IF NOT EXISTS idx_brief_runs_schedule ON brief_runs(schedule_id);",
         )
         .map_err(map_err)
+    }
+
+    /// Vault Audit v1 — idempotent audit schema (see `crate::audit`). `audit_findings` stages one
+    /// propose→accept finding per row; `evidence_md`/`accept_action`/BOTH TITLES are DERIVED
+    /// PLAINTEXT that only PENDING rows may hold (resolve blanks all four; every seal path purges
+    /// pending rows whose source or target seals — `purge_pending_audit_findings_tx`, the
+    /// brief-runs purge class). `dedupe_key` is the stable cross-run identity and OUTLIVES
+    /// resolve, so its variable part is HASHED (title-free — `crate::audit::dedupe_disc`): an
+    /// existing PENDING or DISMISSED twin suppresses re-creation (dismissed = don't nag again);
+    /// an ACCEPTED one may recur. Enforced in code (`insert_audit_finding_if_new`), not by a
+    /// UNIQUE constraint — accepted twins must be able to coexist with a recurring pending row.
+    /// `audit_runs` is content-free bookkeeping (id + timestamps + per-kind counts).
+    fn migrate_audit(conn: &Connection) -> Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS audit_findings (
+               id TEXT PRIMARY KEY,
+               kind TEXT NOT NULL,
+               source_kind TEXT NOT NULL,
+               source_id TEXT NOT NULL,
+               source_title TEXT NOT NULL,
+               target_title TEXT,
+               target_id TEXT,
+               evidence_md TEXT NOT NULL,
+               accept_action TEXT NOT NULL DEFAULT '',
+               dedupe_key TEXT NOT NULL,
+               status TEXT NOT NULL DEFAULT 'pending',
+               run_id TEXT NOT NULL,
+               created_at INTEGER NOT NULL,
+               resolved_at INTEGER
+             );
+             CREATE INDEX IF NOT EXISTS idx_audit_findings_status ON audit_findings(status);
+             CREATE INDEX IF NOT EXISTS idx_audit_findings_dedupe ON audit_findings(dedupe_key);
+             CREATE INDEX IF NOT EXISTS idx_audit_findings_source ON audit_findings(source_id);
+             CREATE INDEX IF NOT EXISTS idx_audit_findings_target ON audit_findings(target_id);
+             CREATE TABLE IF NOT EXISTS audit_runs (
+               id TEXT PRIMARY KEY,
+               started_at INTEGER NOT NULL,
+               finished_at INTEGER,
+               counts_json TEXT NOT NULL DEFAULT '{}'
+             );",
+        )
+        .map_err(map_err)?;
+        // `target_kind` ("meeting" | "note") rides with `target_id` so the list layer can re-gate
+        // the TARGET side against the right table (lock review, same branch). Guarded for dev DBs
+        // that created the table before the column existed.
+        Self::add_column_if_missing(conn, "audit_findings", "target_kind", "TEXT")?;
+        Ok(())
     }
 
     /// Brain v2 L5 — idempotent MCP-SERVER config schema. One row per user-configured external MCP
@@ -3217,6 +3267,10 @@ impl Db {
         // tx — its `note_md` paraphrases the deleted meeting's note (accepted rows were consumed
         // on accept and keep only ids + timestamps).
         Self::purge_pending_brief_runs_tx(&tx, &[id.to_string()])?;
+        // Vault Audit: purge any PENDING finding whose source OR target is this meeting in the
+        // same tx — its `evidence_md` quotes the deleted meeting's note/title (resolved rows were
+        // blanked on resolve and carry no content).
+        Self::purge_pending_audit_findings_tx(&tx, &[id.to_string()])?;
         // Brain v2 L2.1: purge ALL memory rollups in this same tx — a rollup may paraphrase the
         // deleted meeting's (now-gone) facts; the survivors regenerate on the next hourly pass
         // from the remaining visible facts only. The caller deletes the exported `.md`s.
@@ -3882,6 +3936,11 @@ impl Db {
         // referencing a just-sealed meeting in this SAME seal tx (accepted rows were consumed on
         // accept and carry no content). Same purge-on-seal contract as the rollups below.
         Self::purge_pending_brief_runs_tx(&tx, meeting_ids)?;
+        // Vault Audit LOCK-SAFETY: purge ALL pending findings in this SAME seal tx — the
+        // memory-rollups posture (adversarial HIGH: evidence may cite THIRD-PARTY titles with no
+        // id to match, e.g. a stale finding's `see [[superseding note]]`; a seal anywhere
+        // invalidates the pass's visibility snapshot). Resolved rows were blanked on resolve.
+        Self::purge_all_pending_audit_findings_tx(&tx)?;
         // Brain v2 L2.1 LOCK-SAFETY: memory ROLLUPS are cross-meeting synthesis that may paraphrase
         // the just-sealed facts — purge ALL of them in this SAME seal tx (cheap, re-derivable: the
         // next hourly pass regenerates from the still-VISIBLE facts only). The caller deletes the
@@ -4859,6 +4918,9 @@ impl Db {
         let mut conn = self.lock();
         let tx = conn.transaction().map_err(map_err)?;
         Self::purge_doc_chunks_tx(&tx, &[id.to_string()])?;
+        // Vault Audit: a pending finding sourcing or targeting this document/note quotes its
+        // content/title — drop it in the same delete tx (mirrors `delete_meeting`'s purge).
+        Self::purge_pending_audit_findings_tx(&tx, &[id.to_string()])?;
         tx.execute("DELETE FROM documents WHERE id = ?1", rusqlite::params![id])
             .map_err(map_err)?;
         tx.commit().map_err(map_err)?;
@@ -5038,6 +5100,11 @@ impl Db {
         let mut conn = self.lock();
         let tx = conn.transaction().map_err(map_err)?;
         Self::purge_doc_chunks_tx(&tx, document_ids)?;
+        // Vault Audit LOCK-SAFETY: the callers are seal-side (`lock_folder`'s document leg, the
+        // relock reblank) — purge ALL pending findings in this SAME tx (rollup posture; evidence
+        // may cite third-party titles no document id can match). Findings are cheap re-derivable
+        // rows — the next pass re-stages anything still true (never content loss).
+        Self::purge_all_pending_audit_findings_tx(&tx)?;
         tx.commit().map_err(map_err)?;
         Ok(())
     }
@@ -5812,9 +5879,11 @@ impl Db {
         updated_at: i64,
     ) -> Result<()> {
         let conn = self.lock();
+        // `exported_hash` is NULLed with `exported_path` (path-coupled collision-guard baseline —
+        // a note sealed into the locked target has no on-disk export to compare against).
         conn.execute(
             "UPDATE documents SET folder_id = ?2, title = ?3, text = ?4, text_blob = ?5,
-                    updated_at = ?6, exported_path = NULL
+                    updated_at = ?6, exported_path = NULL, exported_hash = NULL
                WHERE id = ?1 AND kind = 'note'",
             rusqlite::params![id, folder_id, title, text, text_blob, updated_at],
         )
@@ -5824,11 +5893,18 @@ impl Db {
 
     /// Persist (or clear with `None`) an authored NOTE's exported vault `.md` path. Set on
     /// export/unlock re-export; cleared (NULL) when the folder seals and the vault file is deleted.
-    /// Named `_doc` to disambiguate from the MEETING-note [`Db::set_note_exported_path`].
+    /// Clearing the path ALSO clears the path-coupled `exported_hash` baseline in the same
+    /// statement (the export-collision guard has no file to compare once the `.md` is gone; the
+    /// next export re-stamps both fresh). Setting a path leaves the hash to the caller's explicit
+    /// stamp (`write_note_to_vault`). Named `_doc` to disambiguate from the MEETING-note
+    /// [`Db::set_note_exported_path`].
     pub fn set_note_doc_exported_path(&self, id: &str, path: Option<&str>) -> Result<()> {
         let conn = self.lock();
         conn.execute(
-            "UPDATE documents SET exported_path = ?2 WHERE id = ?1 AND kind = 'note'",
+            "UPDATE documents
+                SET exported_path = ?2,
+                    exported_hash = CASE WHEN ?2 IS NULL THEN NULL ELSE exported_hash END
+              WHERE id = ?1 AND kind = 'note'",
             rusqlite::params![id, path],
         )
         .map_err(map_err)?;
@@ -5912,12 +5988,13 @@ impl Db {
         Ok(out)
     }
 
-    /// NULL the `exported_path` of every authored NOTE in a folder (called on seal, after the vault
-    /// `.md` files are deleted — a sealed note has no on-disk export). Re-set on unlock re-export.
+    /// NULL the `exported_path` (+ its path-coupled `exported_hash` baseline) of every authored
+    /// NOTE in a folder (called on seal, after the vault `.md` files are deleted — a sealed note
+    /// has no on-disk export). Both re-set on unlock re-export.
     pub fn clear_note_exported_paths_in_folder(&self, folder_id: &str) -> Result<()> {
         let conn = self.lock();
         conn.execute(
-            "UPDATE documents SET exported_path = NULL
+            "UPDATE documents SET exported_path = NULL, exported_hash = NULL
                WHERE folder_id = ?1 AND kind = 'note'",
             rusqlite::params![folder_id],
         )
@@ -7321,10 +7398,11 @@ impl Db {
             }
         }
 
-        // Notes: blank plaintext + export path ONLY of rows that WERE sealed (blob present); a
-        // never-sealed row (blob NULL) keeps its readable plaintext. Then drop the unrecoverable blob.
+        // Notes: blank plaintext + export path (+ its collision-guard hash baseline, which is
+        // path-coupled) ONLY of rows that WERE sealed (blob present); a never-sealed row (blob
+        // NULL) keeps its readable plaintext. Then drop the unrecoverable blob.
         tx.execute(
-            "UPDATE notes SET markdown = '', exported_path = NULL WHERE folder_id = ?1 AND content_blob IS NOT NULL",
+            "UPDATE notes SET markdown = '', exported_path = NULL, exported_hash = NULL WHERE folder_id = ?1 AND content_blob IS NOT NULL",
             rusqlite::params![folder_id],
         )
         .map_err(map_err)?;
@@ -7418,6 +7496,13 @@ impl Db {
         // (Deliberate, mirrors `memory_rollups`: PENDING `brief_runs` are NOT purged on discard —
         // discard returns every source meeting to OPEN plaintext, so a pending brief over now-open
         // content is not a leak. Every SEAL path purges them: `purge_pending_brief_runs_tx`.)
+
+        // Vault Audit (lock review + adversarial HIGH): pending findings ARE purged on discard,
+        // unlike brief runs — ALL of them (the rollup posture): a TOCTOU-orphaned row (staged in
+        // the pass↔seal race the epoch withdrawal narrows but cannot fully close) may CITE this
+        // folder's titles in its evidence with no matching id, so a scoped purge cannot cover it.
+        // Cheap re-derivable rows; the next pass re-stages anything still true.
+        Self::purge_all_pending_audit_findings_tx(&tx)?;
 
         // Documents anchored on this folder: drop sealed ciphertext + plaintext + their chunks/vectors.
         tx.execute(
@@ -7679,8 +7764,13 @@ impl Db {
         content_blob: &[u8],
     ) -> Result<()> {
         let conn = self.lock();
+        // Export-collision guard: the baseline `exported_hash` is blanked in the SAME seal
+        // UPDATE that clears `exported_path` — a sealed note has no on-disk export, and a stale
+        // baseline surviving the seal would mis-classify the fresh unlock re-export
+        // (`write_note_to_vault` / `remove_lock` re-stamp both columns fresh).
         conn.execute(
-            "UPDATE notes SET content_blob = ?3, markdown = '', exported_path = NULL
+            "UPDATE notes SET content_blob = ?3, markdown = '', exported_path = NULL,
+                    exported_hash = NULL
              WHERE meeting_id = ?1 AND provider_id = ?2",
             rusqlite::params![meeting_id, provider_id, content_blob],
         )
@@ -7816,6 +7906,11 @@ impl Db {
             // paraphrases the sealed notes (accepted rows were consumed on accept). Same
             // purge-on-seal contract as the rollups below.
             Self::purge_pending_brief_runs_tx(&tx, &meeting_ids)?;
+            // Vault Audit LOCK-SAFETY: purge ALL pending findings in this SAME relock tx — the
+            // memory-rollups posture (adversarial HIGH: evidence may cite third-party titles no
+            // meeting/document id can match; a relock invalidates the pass's visibility
+            // snapshot). Resolved rows were blanked on resolve and survive.
+            Self::purge_all_pending_audit_findings_tx(&tx)?;
 
             // Brain v2 L2.1 LOCK-SAFETY: purge ALL memory rollups in this SAME relock tx — a rollup
             // may paraphrase the just-re-sealed facts. Cheap re-derivable synthesis; regenerates
@@ -7991,6 +8086,25 @@ impl Db {
             [],
         )
         .map_err(map_err)?;
+        // Vault Audit LOCK-SAFETY: purge ALL pending audit findings in this same reconciliation
+        // transaction — the memory-rollups posture (adversarial HIGH: a finding staged while a
+        // since-sealed folder was visible may CITE its titles in evidence with no matching id,
+        // e.g. a stale finding's `see [[superseding note]]`; scoping the purge to the locked
+        // folders' ids cannot cover that). A crash-while-unlocked therefore leaves no finding
+        // plaintext at rest after a restart. GUARDED on any locked folder existing: this
+        // reconcile runs at EVERY launch, and with zero locked folders there is no seal whose
+        // snapshot a finding could violate — a lock-free vault keeps its inbox across restarts.
+        // Resolved rows were blanked on resolve and survive either way.
+        let any_locked: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM folders WHERE locked = 1)",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(map_err)?;
+        if any_locked {
+            Self::purge_all_pending_audit_findings_tx(&tx)?;
+        }
         // brain2 realtime notes LOCK-SAFETY: re-blank the typed-notes plaintext of every meeting in a
         // locked folder ONLY WHERE its `manual_notes_blob` exists (the sealed copy is present) — so a
         // crash-while-unlocked (which restored the plaintext) cannot leave typed plaintext at rest
@@ -11193,6 +11307,349 @@ impl Db {
             .map_err(map_err)?;
         Ok(n)
     }
+
+    // ── Vault Audit v1 (see `crate::audit`) ─────────────────────────────────────────────────────
+
+    /// Stage one audit finding UNLESS a PENDING or DISMISSED twin (same `dedupe_key`) already
+    /// exists — pending = already surfaced, dismissed = the user said "don't nag again". An
+    /// ACCEPTED twin does NOT suppress (the evidence may legitimately recur later). Returns
+    /// whether a row was inserted.
+    pub fn insert_audit_finding_if_new(
+        &self,
+        f: &crate::audit::NewAuditFinding,
+        run_id: &str,
+        created_at: i64,
+    ) -> Result<bool> {
+        let conn = self.lock();
+        let suppressed: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM audit_findings
+                   WHERE dedupe_key = ?1 AND status IN ('pending', 'dismissed'))",
+                rusqlite::params![f.dedupe_key],
+                |r| r.get(0),
+            )
+            .map_err(map_err)?;
+        if suppressed {
+            return Ok(false);
+        }
+        conn.execute(
+            "INSERT INTO audit_findings
+               (id, kind, source_kind, source_id, source_title, target_title, target_id,
+                target_kind, evidence_md, accept_action, dedupe_key, status, run_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'pending', ?12, ?13)",
+            rusqlite::params![
+                uuid::Uuid::new_v4().to_string(),
+                f.kind,
+                f.source_kind,
+                f.source_id,
+                f.source_title,
+                f.target_title,
+                f.target_id,
+                f.target_kind,
+                f.evidence_md,
+                f.accept_action,
+                f.dedupe_key,
+                run_id,
+                created_at,
+            ],
+        )
+        .map_err(map_err)?;
+        Ok(true)
+    }
+
+    /// All findings with `status`, newest first. RAW row read — the COMMAND layer defensively
+    /// re-filters each row's SOURCE visibility against the live session unlock set before
+    /// returning (belt-and-braces on top of purge-on-seal).
+    pub fn list_audit_finding_rows(
+        &self,
+        status: &str,
+    ) -> Result<Vec<crate::audit::AuditFindingRow>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, kind, source_kind, source_id, source_title, target_title, target_id,
+                        target_kind, evidence_md, accept_action, dedupe_key, status, run_id,
+                        created_at, resolved_at
+                   FROM audit_findings WHERE status = ?1
+                  ORDER BY created_at DESC, id ASC",
+            )
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![status], row_to_audit_finding)
+            .map_err(map_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(map_err)?);
+        }
+        Ok(out)
+    }
+
+    /// One finding by id (any status).
+    pub fn get_audit_finding(&self, id: &str) -> Result<Option<crate::audit::AuditFindingRow>> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT id, kind, source_kind, source_id, source_title, target_title, target_id,
+                    target_kind, evidence_md, accept_action, dedupe_key, status, run_id,
+                    created_at, resolved_at
+               FROM audit_findings WHERE id = ?1",
+            rusqlite::params![id],
+            row_to_audit_finding,
+        )
+        .optional()
+        .map_err(map_err)
+    }
+
+    /// Flip a finding to `accepted`/`dismissed` and BLANK the derived plaintext — `evidence_md`,
+    /// `accept_action` AND BOTH TITLES — in the SAME statement (the brief-runs consume-on-accept
+    /// posture). Titles are content material too (lock review, 2026-07-16): resolved rows survive
+    /// every purge (pending-only) and the list's source re-gate, so a resolved row keeping a
+    /// later-sealed target's title would serve it forever. Only PENDING rows carry ANY
+    /// title/evidence material at rest; ids/kind/timestamps are all a resolved row keeps.
+    pub fn resolve_audit_finding_row(
+        &self,
+        id: &str,
+        status: &str,
+        resolved_at: i64,
+    ) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE audit_findings
+                SET status = ?2, resolved_at = ?3, evidence_md = '', accept_action = '',
+                    source_title = '', target_title = NULL
+              WHERE id = ?1",
+            rusqlite::params![id, status, resolved_at],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Delete every PENDING row a given audit run staged — the end-of-pass seal-epoch
+    /// reconciliation (see `crate::audit::run_audit_pass`): when the epoch is observed advanced
+    /// at pass end, the whole run's staged rows are withdrawn in ONE statement, turning the
+    /// residual insert-vs-seal-purge race into a no-op. Pending-only by construction (a
+    /// just-staged run's rows cannot be resolved yet; the filter is belt-and-braces).
+    pub fn delete_pending_audit_findings_for_run(&self, run_id: &str) -> Result<usize> {
+        let conn = self.lock();
+        let n = conn
+            .execute(
+                "DELETE FROM audit_findings WHERE run_id = ?1 AND status = 'pending'",
+                rusqlite::params![run_id],
+            )
+            .map_err(map_err)?;
+        Ok(n)
+    }
+
+    /// Count of pending findings (the summary/event payload — a count, never content).
+    pub fn count_pending_audit_findings(&self) -> Result<usize> {
+        let conn = self.lock();
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM audit_findings WHERE status = 'pending'",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(map_err)?;
+        Ok(n as usize)
+    }
+
+    /// Record one audit run (content-free bookkeeping: id + timestamps + per-kind counts JSON).
+    pub fn insert_audit_run(
+        &self,
+        id: &str,
+        started_at: i64,
+        finished_at: i64,
+        counts_json: &str,
+    ) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO audit_runs (id, started_at, finished_at, counts_json)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![id, started_at, finished_at, counts_json],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Vault Audit DELETE-SAFETY: delete every PENDING `audit_findings` row whose SOURCE or
+    /// TARGET is any of `ids`, within an EXISTING transaction. This precise id-matched purge is
+    /// for the DELETE paths ONLY (`delete_meeting` / `delete_document`) — a delete invalidates
+    /// nothing else, so unrelated findings survive. SEAL paths use
+    /// [`Db::purge_all_pending_audit_findings_tx`] instead (a pending finding may cite
+    /// THIRD-PARTY titles no id can match). RESOLVED rows are left alone (blanked on resolve —
+    /// ids + kind only).
+    pub(crate) fn purge_pending_audit_findings_tx(
+        tx: &rusqlite::Transaction<'_>,
+        ids: &[String],
+    ) -> Result<()> {
+        for id in ids {
+            tx.execute(
+                "DELETE FROM audit_findings
+                  WHERE status = 'pending' AND (source_id = ?1 OR target_id = ?1)",
+                rusqlite::params![id],
+            )
+            .map_err(map_err)?;
+        }
+        Ok(())
+    }
+
+    /// Vault Audit LOCK-SAFETY (adversarial HIGH, 2026-07-16): on ANY lock-surface mutation
+    /// (seal, relock, startup reconcile, discard, move-into-locked), purge ALL pending findings —
+    /// the memory-rollups posture, not the per-id brief-runs one. A pending finding's
+    /// `evidence_md` may cite THIRD-PARTY titles (a stale finding's `see [[superseding note]]`,
+    /// an orphan's suggested `[[titles]]`) carried with `target_id = NULL`, which an id-matched
+    /// purge can never cover — and a seal anywhere invalidates the pass's whole visibility
+    /// snapshot. Findings are cheap re-derivable rows: the next manual run re-stages everything
+    /// still true over the post-seal corpus. RESOLVED rows survive (blanked on resolve).
+    pub(crate) fn purge_all_pending_audit_findings_tx(
+        tx: &rusqlite::Transaction<'_>,
+    ) -> Result<()> {
+        tx.execute("DELETE FROM audit_findings WHERE status = 'pending'", [])
+            .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Standalone-transaction wrapper of [`Db::purge_all_pending_audit_findings_tx`] for the
+    /// lock-surface call sites with no open transaction of their own (the note move-into-locked
+    /// seal in `move_note_doc_inner`).
+    pub fn purge_all_pending_audit_findings(&self) -> Result<()> {
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        Self::purge_all_pending_audit_findings_tx(&tx)?;
+        tx.commit().map_err(map_err)?;
+        Ok(())
+    }
+
+    /// GATED: every OPEN fact whose source meeting is VISIBLE — the SAME meeting-visibility
+    /// predicate as [`Db::list_facts_visible`] (a NULL `meeting_id` is fail-closed via the INNER
+    /// JOIN). The audit's stale/contradiction substrate.
+    pub fn list_open_facts_visible(
+        &self,
+        unlocked: &HashSet<String>,
+    ) -> Result<Vec<crate::facts::Fact>> {
+        let conn = self.lock();
+        let visible = visibility_clause("n", unlocked);
+        let sql = format!(
+            "SELECT ft.id, ft.entity_id, ft.subject, ft.predicate, ft.object, ft.valid_from, \
+                    ft.valid_to, ft.recorded_at, ft.meeting_id, ft.confidence \
+               FROM facts ft \
+               JOIN meetings m ON m.id = ft.meeting_id \
+              WHERE ft.valid_to IS NULL \
+                AND ( \
+                      NOT EXISTS (SELECT 1 FROM notes nn WHERE nn.meeting_id = m.id) \
+                   OR EXISTS ( \
+                        SELECT 1 FROM notes n \
+                         LEFT JOIN folders f ON f.id = n.folder_id \
+                         WHERE n.meeting_id = m.id AND {visible} \
+                      ) \
+                    ) \
+              ORDER BY ft.valid_from ASC, ft.id ASC"
+        );
+        let mut stmt = conn.prepare(&sql).map_err(map_err)?;
+        let rows = stmt.query_map([], row_to_fact).map_err(map_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(map_err)?);
+        }
+        Ok(out)
+    }
+
+    /// GATED: ONE meeting's FULL fact rows (open + closed), visible-predicate-gated exactly like
+    /// [`Db::list_facts_visible`] — a sealed-and-not-session-unlocked meeting returns EMPTY
+    /// (its facts are also purged on seal; this gate is defense-in-depth). Distinct from the
+    /// rendered-strings reader [`Db::facts_for_meeting_visible`]: the audit's staleness math
+    /// needs the `valid_to` axis, not a display string.
+    pub fn fact_rows_for_meeting_visible(
+        &self,
+        meeting_id: &str,
+        unlocked: &HashSet<String>,
+    ) -> Result<Vec<crate::facts::Fact>> {
+        let conn = self.lock();
+        let visible = visibility_clause("n", unlocked);
+        let sql = format!(
+            "SELECT ft.id, ft.entity_id, ft.subject, ft.predicate, ft.object, ft.valid_from, \
+                    ft.valid_to, ft.recorded_at, ft.meeting_id, ft.confidence \
+               FROM facts ft \
+               JOIN meetings m ON m.id = ft.meeting_id \
+              WHERE ft.meeting_id = ?1 \
+                AND ( \
+                      NOT EXISTS (SELECT 1 FROM notes nn WHERE nn.meeting_id = m.id) \
+                   OR EXISTS ( \
+                        SELECT 1 FROM notes n \
+                         LEFT JOIN folders f ON f.id = n.folder_id \
+                         WHERE n.meeting_id = m.id AND {visible} \
+                      ) \
+                    ) \
+              ORDER BY ft.valid_from ASC, ft.id ASC"
+        );
+        let mut stmt = conn.prepare(&sql).map_err(map_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![meeting_id], row_to_fact)
+            .map_err(map_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(map_err)?);
+        }
+        Ok(out)
+    }
+
+    /// The DISTINCT entity ids mentioned by ONE meeting (the orphan pass's Jaccard substrate).
+    /// Non-content metadata (opaque ids); the caller only ever passes ids already gated into its
+    /// visible corpus. Crate-internal on purpose — not a general read surface.
+    pub(crate) fn entity_ids_for_meeting(&self, meeting_id: &str) -> Result<Vec<String>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT DISTINCT entity_id FROM entity_mentions
+                   WHERE meeting_id = ?1 ORDER BY entity_id",
+            )
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![meeting_id], |r| r.get::<_, String>(0))
+            .map_err(map_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(map_err)?);
+        }
+        Ok(out)
+    }
+
+    /// Is the SAME conflict pair already staged for Re-Truth review? True when a PENDING
+    /// (`applied_at IS NULL`) supersession row carries the same normalized predicate and the same
+    /// two meetings (either orientation) — the audit's contradiction pass then skips the pair
+    /// (one review surface per conflict).
+    pub fn pending_supersession_for_pair(
+        &self,
+        norm_predicate: &str,
+        meeting_a: &str,
+        meeting_b: &str,
+    ) -> Result<bool> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM supersessions
+               WHERE applied_at IS NULL
+                 AND lower(trim(predicate)) = ?1
+                 AND ((source_meeting_id = ?2 AND superseding_meeting_id = ?3)
+                   OR (source_meeting_id = ?3 AND superseding_meeting_id = ?2)))",
+            rusqlite::params![norm_predicate, meeting_a, meeting_b],
+            |r| r.get(0),
+        )
+        .map_err(map_err)
+    }
+
+    /// Whether ONE authored note is VISIBLE (open or session-unlocked folder) — the lightweight
+    /// existence twin of [`Db::note_markdown_if_visible`], used by the audit list's defensive
+    /// re-filter. Fail-closed on an unknown id.
+    pub fn note_is_visible(&self, note_id: &str, unlocked: &HashSet<String>) -> Result<bool> {
+        let conn = self.lock();
+        let visible = visibility_clause("f", unlocked);
+        let sql = format!(
+            "SELECT EXISTS(SELECT 1 FROM documents d
+               JOIN folders f ON f.id = d.folder_id
+              WHERE d.id = ?1 AND d.kind = 'note' AND {visible})"
+        );
+        conn.query_row(&sql, rusqlite::params![note_id], |r| r.get(0))
+            .map_err(map_err)
+    }
 }
 
 /// Collision-proof unique temp path for file-backed tests.
@@ -11636,6 +12093,28 @@ fn row_to_meeting(row: &Row<'_>) -> rusqlite::Result<Result<Meeting>> {
 }
 
 /// Map a `facts` row (column order matches every facts SELECT) to a [`crate::facts::Fact`].
+/// Map one `audit_findings` row (the full column order of `list_audit_finding_rows` /
+/// `get_audit_finding`) to its DB-shaped struct.
+fn row_to_audit_finding(row: &Row<'_>) -> rusqlite::Result<crate::audit::AuditFindingRow> {
+    Ok(crate::audit::AuditFindingRow {
+        id: row.get(0)?,
+        kind: row.get(1)?,
+        source_kind: row.get(2)?,
+        source_id: row.get(3)?,
+        source_title: row.get(4)?,
+        target_title: row.get(5)?,
+        target_id: row.get(6)?,
+        target_kind: row.get(7)?,
+        evidence_md: row.get(8)?,
+        accept_action: row.get(9)?,
+        dedupe_key: row.get(10)?,
+        status: row.get(11)?,
+        run_id: row.get(12)?,
+        created_at: row.get(13)?,
+        resolved_at: row.get(14)?,
+    })
+}
+
 fn row_to_fact(row: &Row<'_>) -> rusqlite::Result<crate::facts::Fact> {
     Ok(crate::facts::Fact {
         id: row.get(0)?,

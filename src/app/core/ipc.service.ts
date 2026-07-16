@@ -71,6 +71,8 @@ import type {
   BriefSchedule,
   BriefRun,
   BriefProposedPayload,
+  AuditFinding,
+  AuditRunSummary,
   VerifyFindingDto,
   ProviderStatus,
   SavedRecipe,
@@ -144,6 +146,9 @@ export const EVENT_STORAGE_PRUNED = "murmur://storage-pruned";
 export const EVENT_RECORDING_CAPPED = "murmur://recording-capped";
 // Brain v2 L5 — a scheduled brief was STAGED (propose-accept; run id + label + size only).
 export const EVENT_BRIEF_PROPOSED = "murmur://brief-proposed";
+// Vault Audit — the audit state changed (a run finished / findings purged by a seal or delete).
+// Payload shape is deliberately untrusted — listeners refetch via list_audit_findings.
+export const EVENT_AUDIT_UPDATED = "murmur://audit-updated";
 // Shared Brain — the background org-sync loop INGESTED/TOMBSTONED ≥1 org item this tick
 // (content-free "something changed, re-fetch" ping; drives the Notes org picker live refresh).
 export const EVENT_ORG_FEED_UPDATED = "murmur://org-feed-updated";
@@ -1296,6 +1301,43 @@ export class IpcService {
     return listen<BriefProposedPayload>(EVENT_BRIEF_PROPOSED, (e) =>
       cb(e.payload),
     );
+  }
+
+  // ── Vault Audit — deterministic hygiene passes (propose-accept inbox) ────
+
+  /**
+   * Run a full audit pass NOW (broken links / orphans / stale / contradictions
+   * / unlinked mentions) and resolve with the run's summary. Findings are only
+   * STAGED for review — nothing in the vault changes until one is accepted.
+   */
+  runVaultAudit(): Promise<AuditRunSummary> {
+    return invoke<AuditRunSummary>("run_vault_audit");
+  }
+
+  /** Audit findings by status — defaults to the PENDING inbox rows. */
+  listAuditFindings(status = "pending"): Promise<AuditFinding[]> {
+    return invoke<AuditFinding[]>("list_audit_findings", { status });
+  }
+
+  /**
+   * Accept (apply its `acceptAction`) or dismiss ONE finding. Resolves with the
+   * updated row — the FE swaps the row in only AFTER this confirms; a rejection
+   * leaves it pending (no optimistic success UI).
+   */
+  resolveAuditFinding(
+    id: string,
+    action: "accept" | "dismiss",
+  ): Promise<AuditFinding> {
+    return invoke<AuditFinding>("resolve_audit_finding", { id, action });
+  }
+
+  /**
+   * The audit state changed (a run finished / findings were purged by a seal
+   * or a delete). The payload shape is deliberately NOT trusted — refetch via
+   * {@link listAuditFindings} instead of reading it.
+   */
+  onAuditUpdated(cb: () => void): Promise<UnlistenFn> {
+    return listen(EVENT_AUDIT_UPDATED, () => cb());
   }
 
   // ── brain2 documents — expand the brain with imported .md/.txt files ────

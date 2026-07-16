@@ -380,6 +380,31 @@ pub fn emit_content_deleted(app: &AppHandle, kind: &'static str, id: &str) {
     }
 }
 
+/// Emitted after a Vault-Audit pass completes and after each finding resolve (accept/dismiss) —
+/// a "something changed, re-fetch" ping for the FE audit inbox, exactly the
+/// [`EVENT_ORG_FEED_UPDATED`] shape. Carries the pending COUNT only — never a finding's content.
+pub const EVENT_AUDIT_UPDATED: &str = "murmur://audit-updated";
+
+/// Payload for [`EVENT_AUDIT_UPDATED`]. A single count only — NO PII.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuditUpdatedPayload {
+    /// Pending findings after the pass/resolve.
+    pub pending: u32,
+}
+
+/// Emit [`EVENT_AUDIT_UPDATED`] to the FE (best-effort). Swallows the emit failure with a
+/// `tracing::warn!` so a failed emit can NEVER fail the audit pass or a resolve. NO PII (a count).
+pub fn emit_audit_updated(app: &AppHandle, pending: u32) {
+    if let Err(e) = app.emit(EVENT_AUDIT_UPDATED, AuditUpdatedPayload { pending }) {
+        tracing::warn!(
+            target: "audit",
+            error = %e,
+            "failed to emit audit-updated notice"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -388,6 +413,14 @@ mod tests {
     #[test]
     fn org_feed_updated_event_name_is_stable() {
         assert_eq!(EVENT_ORG_FEED_UPDATED, "murmur://org-feed-updated");
+    }
+
+    /// The FE listens on this exact event name; a rename silently drops the audit-inbox refresh.
+    #[test]
+    fn audit_updated_event_name_and_payload_are_stable() {
+        assert_eq!(EVENT_AUDIT_UPDATED, "murmur://audit-updated");
+        let json = serde_json::to_string(&AuditUpdatedPayload { pending: 4 }).unwrap();
+        assert_eq!(json, r#"{"pending":4}"#);
     }
 
     /// The FE listens on this exact event name; a rename silently drops the tab-strip fan-out.
