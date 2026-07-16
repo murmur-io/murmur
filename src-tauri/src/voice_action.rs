@@ -2994,8 +2994,8 @@ mod tests {
             1,
             sha,
             None,
-            Some(&crate::embed::StubEmbedder),
-        )
+            None,
+            Some(&crate::embed::StubEmbedder))
         .unwrap();
     }
 
@@ -3177,8 +3177,8 @@ mod tests {
             1,
             &[32u8; 32],
             None,
-            Some(&crate::embed::StubEmbedder),
-        )
+            None,
+            Some(&crate::embed::StubEmbedder))
         .unwrap();
         db.set_org_context_enabled("org-1", false).unwrap();
 

@@ -7562,6 +7562,7 @@ mod entity_dossier_tests {
             1,
             sha,
             None,
+            None,
             Some(&crate::embed::StubEmbedder),
         )
         .unwrap();
@@ -21321,6 +21322,7 @@ mod lifecycle_tests {
                 1,
                 &[9u8; 32],
                 None,
+                None,
                 Some(&crate::embed::StubEmbedder),
             )
             .unwrap();
@@ -21372,6 +21374,7 @@ mod lifecycle_tests {
                 1,
                 1,
                 &[3u8; 32],
+                None,
                 None,
                 Some(&crate::embed::StubEmbedder),
             )
@@ -25075,6 +25078,7 @@ mod lifecycle_tests {
                 &[5u8; 32],
                 None,
                 None,
+                None,
             )
             .unwrap();
         let got = state.db.get_org_item("it-g").unwrap().unwrap();
@@ -25115,6 +25119,7 @@ mod lifecycle_tests {
                 &[6u8; 32],
                 None,
                 None,
+                None,
             )
             .unwrap();
         assert!(state.db.get_org_item("it-d").unwrap().is_some(), "visible while enabled");
@@ -25142,19 +25147,19 @@ mod lifecycle_tests {
         // Two items in org-1 at seq 1 and 2, plus an item in a DIFFERENT org, plus a tombstoned one.
         state
             .db
-            .upsert_org_item("a", "org-1", 1, "anna", "Kickoff", "the kickoff agenda", "2026-07-10T09:00:00Z", 1, 1, &[1u8; 32], None, None)
+            .upsert_org_item("a", "org-1", 1, "anna", "Kickoff", "the kickoff agenda", "2026-07-10T09:00:00Z", 1, 1, &[1u8; 32], None, None, None)
             .unwrap();
         state
             .db
-            .upsert_org_item("b", "org-1", 2, "bob", "Retro", "the sprint retro", "2026-07-11T09:00:00Z", 1, 1, &[2u8; 32], None, None)
+            .upsert_org_item("b", "org-1", 2, "bob", "Retro", "the sprint retro", "2026-07-11T09:00:00Z", 1, 1, &[2u8; 32], None, None, None)
             .unwrap();
         state
             .db
-            .upsert_org_item("z", "org-2", 9, "zed", "Other org", "not our org", "2026-07-11T09:00:00Z", 1, 1, &[3u8; 32], None, None)
+            .upsert_org_item("z", "org-2", 9, "zed", "Other org", "not our org", "2026-07-11T09:00:00Z", 1, 1, &[3u8; 32], None, None, None)
             .unwrap();
         state
             .db
-            .upsert_org_item("d", "org-1", 3, "dan", "Dead", "revoked", "2026-07-11T10:00:00Z", 1, 1, &[4u8; 32], None, None)
+            .upsert_org_item("d", "org-1", 3, "dan", "Dead", "revoked", "2026-07-11T10:00:00Z", 1, 1, &[4u8; 32], None, None, None)
             .unwrap();
         state.db.tombstone_org_item("d").unwrap();
 
@@ -25194,7 +25199,7 @@ mod lifecycle_tests {
         // The received replica (frozen at publish time = "Untitled") + the matching OUTBOUND share.
         state
             .db
-            .upsert_org_item("item-own", "org-1", 2, "kgm004a", "Untitled", "# body", "2026-07-11T09:00:00Z", 1, 1, &[9u8; 32], None, None)
+            .upsert_org_item("item-own", "org-1", 2, "kgm004a", "Untitled", "# body", "2026-07-11T09:00:00Z", 1, 1, &[9u8; 32], None, None, None)
             .unwrap();
         state
             .db
@@ -25207,7 +25212,7 @@ mod lifecycle_tests {
         // Someone ELSE's replica — no local share ⇒ stays read-only, title untouched.
         state
             .db
-            .upsert_org_item("item-other", "org-1", 1, "kgm004a+2", "Ich notatka", "body", "2026-07-10T09:00:00Z", 1, 1, &[7u8; 32], None, None)
+            .upsert_org_item("item-other", "org-1", 1, "kgm004a+2", "Ich notatka", "body", "2026-07-10T09:00:00Z", 1, 1, &[7u8; 32], None, None, None)
             .unwrap();
 
         let items = list_org_items_inner(&state, "org-1").unwrap();
@@ -25234,7 +25239,7 @@ mod lifecycle_tests {
         seed_org(&state.db, "org-1", "Acme", "member", 1);
         state
             .db
-            .upsert_org_item("item-x", "org-1", 3, "anna", "T", "# body", "2026-07-11T09:00:00Z", 2, 1, &[9u8; 32], Some("document"), None)
+            .upsert_org_item("item-x", "org-1", 3, "anna", "T", "# body", "2026-07-11T09:00:00Z", 2, 1, &[9u8; 32], Some("document"), None, None)
             .unwrap();
 
         // Un-stamped ⇒ author is None (a member could never pass the ownership gate on it).
@@ -25253,7 +25258,7 @@ mod lifecycle_tests {
         // A survivor of ON CONFLICT re-upsert (feed re-pull) keeps the author (not in the SET list).
         state
             .db
-            .upsert_org_item("item-x", "org-1", 4, "anna", "T2", "# body2", "2026-07-11T09:00:00Z", 3, 1, &[8u8; 32], Some("document"), None)
+            .upsert_org_item("item-x", "org-1", 4, "anna", "T2", "# body2", "2026-07-11T09:00:00Z", 3, 1, &[8u8; 32], Some("document"), None, None)
             .unwrap();
         let ctx2 = state.db.org_item_edit_ctx("item-x").unwrap().unwrap();
         assert_eq!(
@@ -25273,7 +25278,7 @@ mod lifecycle_tests {
         seed_org(&state.db, "org-1", "Acme", "member", 1);
         state
             .db
-            .upsert_org_item("item-theirs", "org-1", 1, "bob", "Bob's note", "# body", "2026-07-11T09:00:00Z", 1, 1, &[7u8; 32], Some("document"), None)
+            .upsert_org_item("item-theirs", "org-1", 1, "bob", "Bob's note", "# body", "2026-07-11T09:00:00Z", 1, 1, &[7u8; 32], Some("document"), None, None)
             .unwrap();
         // Authored by SOMEONE ELSE.
         state.db.set_org_item_author("item-theirs", "bob-user-id").unwrap();
@@ -25311,7 +25316,7 @@ mod lifecycle_tests {
         seed_org(&state.db, "org-1", "Acme", "member", 1);
         state
             .db
-            .upsert_org_item("item-mine", "org-1", 1, "me", "Mine", "# body", "2026-07-11T09:00:00Z", 1, 1, &[9u8; 32], Some("document"), None)
+            .upsert_org_item("item-mine", "org-1", 1, "me", "Mine", "# body", "2026-07-11T09:00:00Z", 1, 1, &[9u8; 32], Some("document"), None, None)
             .unwrap();
         state.db.set_org_item_author("item-mine", "me-user-id").unwrap();
         // The caller IS the author, but consent is OFF (the default).
@@ -25346,6 +25351,129 @@ mod lifecycle_tests {
         assert!(
             matches!(err, AppError::InvalidArg(_)),
             "expected InvalidArg for an unknown item, got {err:?}"
+        );
+    }
+
+    /// `delete_org_item_as_author_inner` — OWNERSHIP GATE (Bug B, root-cause fix 2026-07-15): refuses
+    /// to remove an item the caller did NOT author — `AppError::Auth`, BEFORE any network egress, and
+    /// no local mutation. Mirrors `org_update_own_item_refuses_a_non_author`'s shape exactly, since
+    /// both share the same `org_item_edit_ctx`-based ownership signal.
+    #[test]
+    fn delete_org_item_as_author_refuses_a_non_author() {
+        let state = build_state("org-delete-not-author");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        state
+            .db
+            .upsert_org_item("item-theirs", "org-1", 1, "bob", "Bob's note", "# body", "2026-07-11T09:00:00Z", 1, 1, &[7u8; 32], Some("document"), None, None)
+            .unwrap();
+        state.db.set_org_item_author("item-theirs", "bob-user-id").unwrap();
+        *state.account_session.lock().unwrap() = Some(crate::share::AccountSession {
+            account_id: "me@example.com".into(),
+            email: "me@example.com".into(),
+            server_user_id: Some("me-user-id".into()),
+            device_id: "dev-1".into(),
+            mk: Zeroizing::new([7u8; 32]),
+            generation: 1,
+            access_token: "a".into(),
+            access_expires_at: Some("2099-01-01T00:00:00Z".into()),
+            refresh_token: "r".into(),
+        });
+
+        let err = block_on(delete_org_item_as_author_inner(&state, "item-theirs"))
+            .expect_err("a non-author must NOT be able to remove someone else's org item");
+        assert!(
+            matches!(err, AppError::Auth(_)),
+            "expected an Auth refusal, got {err:?}"
+        );
+        // Untouched: still live, still Bob's — the ownership gate ran before any tombstone attempt.
+        let detail = state.db.get_org_item("item-theirs").unwrap().unwrap();
+        assert_eq!(detail.title, "Bob's note");
+    }
+
+    /// A missing / already-tombstoned item id is an `InvalidArg`, resolved BEFORE any session/network
+    /// work — same shape as `org_update_own_item_rejects_an_unknown_item`.
+    #[test]
+    fn delete_org_item_as_author_rejects_an_unknown_item() {
+        let state = build_state("org-delete-unknown");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        let err = block_on(delete_org_item_as_author_inner(&state, "does-not-exist"))
+            .expect_err("an unknown item id must be rejected");
+        assert!(
+            matches!(err, AppError::InvalidArg(_)),
+            "expected InvalidArg for an unknown item, got {err:?}"
+        );
+    }
+
+    /// `delete_org_item_as_author_inner` — FULL SUCCESS PATH (RED→GREEN, Bug B): the author's own
+    /// item, with a mock server confirming the tombstone DELETE, is removed from BOTH the server (the
+    /// mock asserts the exact `DELETE /v1/orgs/{org}/items/{item}` request landed) and this device's
+    /// own local `org_items` replica (`get_org_item` returns `None` afterward — `tombstoned` items are
+    /// filtered the same way `tombstone_org_item`'s other caller, the feed's own `FeedAction::
+    /// Tombstone` arm, already proves). RED before this command existed: there was NO way at all for
+    /// an author to remove an org item without a local `org_shares`/`documents` anchor — this test
+    /// pins the new command actually completing that removal end-to-end, not just accepting the call.
+    #[test]
+    fn delete_org_item_as_author_removes_the_authors_own_item() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 8192];
+            let n = sock.read(&mut buf).unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]);
+            // The exact tombstone request: DELETE on this org's item.
+            assert!(
+                req.starts_with("DELETE /v1/orgs/org-1/items/item-mine"),
+                "expected a DELETE tombstone request, got: {}",
+                req.lines().next().unwrap_or("")
+            );
+            let resp = "HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+            let _ = sock.write_all(resp.as_bytes());
+        });
+
+        let state = build_state("org-delete-success");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        state
+            .db
+            .upsert_org_item(
+                "item-mine",
+                "org-1",
+                1,
+                "me",
+                "Mine",
+                "# body",
+                "2026-07-11T09:00:00Z",
+                1,
+                1,
+                &[9u8; 32],
+                Some("document"),
+                Some("me-user-id"),
+                None,
+            )
+            .unwrap();
+        state.config.lock().unwrap().share_base_url = format!("http://{addr}");
+        *state.account_session.lock().unwrap() = Some(crate::share::AccountSession {
+            account_id: "me@example.com".into(),
+            email: "me@example.com".into(),
+            server_user_id: Some("me-user-id".into()),
+            device_id: "dev-1".into(),
+            mk: Zeroizing::new([7u8; 32]),
+            generation: 1,
+            access_token: "a".into(),
+            access_expires_at: Some("2099-01-01T00:00:00Z".into()),
+            refresh_token: "r".into(),
+        });
+
+        block_on(delete_org_item_as_author_inner(&state, "item-mine"))
+            .expect("the author's own item must be removable");
+        server.join().unwrap();
+
+        // Gone from this device's own replica — the same "tombstoned rows are invisible" contract
+        // every other org-item read path relies on.
+        assert!(
+            state.db.get_org_item("item-mine").unwrap().is_none(),
+            "the item must be gone from this device's local replica after a successful removal"
         );
     }
 
@@ -25500,7 +25628,7 @@ mod lifecycle_tests {
             .unwrap();
         state
             .db
-            .upsert_org_item("item-stuck", "org-1", 1, "kgm004a", "Untitled", "# body", now, 1, 1, &[9u8; 32], None, None)
+            .upsert_org_item("item-stuck", "org-1", 1, "kgm004a", "Untitled", "# body", now, 1, 1, &[9u8; 32], None, None, None)
             .unwrap();
         state
             .db
@@ -25516,7 +25644,7 @@ mod lifecycle_tests {
             .unwrap();
         state
             .db
-            .upsert_org_item("item-revoked", "org-1", 1, "kgm004a", "Gone", "# body", now, 1, 1, &[8u8; 32], None, None)
+            .upsert_org_item("item-revoked", "org-1", 1, "kgm004a", "Gone", "# body", now, 1, 1, &[8u8; 32], None, None, None)
             .unwrap();
         state
             .db
@@ -25566,7 +25694,7 @@ mod lifecycle_tests {
             .unwrap();
         state
             .db
-            .upsert_org_item("item-doc", "org-1", 3, "kgm004a", "A Note", "# body", "2026-07-11T09:00:00Z", 1, 1, &[9u8; 32], None, None)
+            .upsert_org_item("item-doc", "org-1", 3, "kgm004a", "A Note", "# body", "2026-07-11T09:00:00Z", 1, 1, &[9u8; 32], None, None, None)
             .unwrap();
         state
             .db
@@ -25590,7 +25718,7 @@ mod lifecycle_tests {
             .unwrap();
         state
             .db
-            .upsert_org_item("item-meeting", "org-1", 2, "kgm004a", "Standup", "# body", "2026-07-11T09:00:00Z", 1, 1, &[8u8; 32], None, None)
+            .upsert_org_item("item-meeting", "org-1", 2, "kgm004a", "Standup", "# body", "2026-07-11T09:00:00Z", 1, 1, &[8u8; 32], None, None, None)
             .unwrap();
         state
             .db
@@ -25601,7 +25729,7 @@ mod lifecycle_tests {
         // A colleague's item — no local `org_shares` row.
         state
             .db
-            .upsert_org_item("item-other", "org-1", 1, "kgm004a+2", "Ich notatka", "body", "2026-07-10T09:00:00Z", 1, 1, &[7u8; 32], None, None)
+            .upsert_org_item("item-other", "org-1", 1, "kgm004a+2", "Ich notatka", "body", "2026-07-10T09:00:00Z", 1, 1, &[7u8; 32], None, None, None)
             .unwrap();
 
         let items = list_org_items_inner(&state, "org-1").unwrap();
@@ -25638,7 +25766,7 @@ mod lifecycle_tests {
             .unwrap();
         state
             .db
-            .upsert_org_item("item-lock", "org-1", 1, "kgm004a", "Old Snapshot", "# body", "2026-07-11T09:00:00Z", 1, 1, &[5u8; 32], None, None)
+            .upsert_org_item("item-lock", "org-1", 1, "kgm004a", "Old Snapshot", "# body", "2026-07-11T09:00:00Z", 1, 1, &[5u8; 32], None, None, None)
             .unwrap();
         state
             .db
@@ -25676,7 +25804,7 @@ mod lifecycle_tests {
         seed_org(&state.db, "org-mine", "Mine", "owner", 1);
         state
             .db
-            .upsert_org_item("m1", "org-mine", 1, "anna", "Mine A", "body", "2026-07-11T09:00:00Z", 1, 1, &[1u8; 32], None, None)
+            .upsert_org_item("m1", "org-mine", 1, "anna", "Mine A", "body", "2026-07-11T09:00:00Z", 1, 1, &[1u8; 32], None, None, None)
             .unwrap();
         // A member org resolves + returns the item.
         let ok = list_org_items_inner(&state, "org-mine").unwrap();
@@ -25704,7 +25832,7 @@ mod lifecycle_tests {
         seed_org(&state.db, "org-1", "Acme", "member", 1);
         state
             .db
-            .upsert_org_item("m1", "org-1", 1, "anna", "Kickoff", "body", "2026-07-11T09:00:00Z", 1, 1, &[1u8; 32], None, None)
+            .upsert_org_item("m1", "org-1", 1, "anna", "Kickoff", "body", "2026-07-11T09:00:00Z", 1, 1, &[1u8; 32], None, None, None)
             .unwrap();
 
         assert_eq!(list_org_items_inner(&state, "org-1").unwrap().len(), 1, "visible while enabled");
@@ -25970,11 +26098,11 @@ mod lifecycle_tests {
         // TWO received items (from colleagues) in the local replica.
         state
             .db
-            .upsert_org_item("r1", "org-1", 1, "anna", "Doc A", "body a", "2026-07-10T09:00:00Z", 1, 1, &[1u8; 32], None, None)
+            .upsert_org_item("r1", "org-1", 1, "anna", "Doc A", "body a", "2026-07-10T09:00:00Z", 1, 1, &[1u8; 32], None, None, None)
             .unwrap();
         state
             .db
-            .upsert_org_item("r2", "org-1", 2, "bob", "Doc B", "body b", "2026-07-11T09:00:00Z", 1, 1, &[2u8; 32], None, None)
+            .upsert_org_item("r2", "org-1", 2, "bob", "Doc B", "body b", "2026-07-11T09:00:00Z", 1, 1, &[2u8; 32], None, None, None)
             .unwrap();
         // ONE of the caller's OWN outbound shares, state 'uploaded' (item_count = 1).
         let now = "2026-07-11T12:00:00Z";
@@ -26520,6 +26648,7 @@ mod lifecycle_tests {
                 1,
                 &[9u8; 32],
                 Some("document"),
+                None, // author_user_id: unknown at ingest — this row IS the stale-ingest gap under test.
                 None,
             )
             .unwrap();
@@ -29204,6 +29333,13 @@ pub(crate) async fn publish_org_body(
     // as an owned/editable card. FTS-only (`None` embedder) to keep this share path light; the next real
     // `org_sync_now` re-ingests authoritatively (idempotent upsert) and re-embeds. Best-effort: a local
     // replica error must never fail the share (the server copy is already live + correct).
+    //
+    // AUTHOR (root-cause fix, 2026-07-15): the CALLER of a share IS the author, so stamp the
+    // current session's own server user id directly at upsert time — this row is born correct and
+    // never depends on a later feed-ingest/backfill to learn who wrote it. Best-effort: an
+    // unresolvable session id (`.ok()` → `None`) just leaves the column for the backfill, exactly
+    // as before this fix; it never blocks the local-replica upsert itself.
+    let my_author_id = session_server_user_id(state).ok();
     if let Err(e) = state.db.upsert_org_item(
         &published.item_id,
         &org.org_id,
@@ -29216,6 +29352,7 @@ pub(crate) async fn publish_org_body(
         generation,
         &content_sha,
         env.source_kind.map(crate::share::org_envelope::OrgSourceKind::as_str),
+        my_author_id.as_deref(),
         None,
     ) {
         tracing::warn!(target: "org", error = %e, "share: local replica upsert failed (server copy live)");
@@ -29481,6 +29618,12 @@ pub(crate) async fn republish_org_shares_for_source(
         // the fresh title. FTS-only (`None` embedder) to keep this editor-close path light; the next
         // real `org_sync_now` re-ingests authoritatively (idempotent upsert) and re-embeds. Best-effort:
         // a local-replica error must never fail the save (the server copy is already live + correct).
+        //
+        // AUTHOR (root-cause fix, 2026-07-15): this row's caller is the SAME session that just
+        // successfully republished it (`require_session_mk` above already proved a live session),
+        // so stamp its own server user id directly — the repointed row is correct from the moment
+        // it's written, never dependent on a later backfill.
+        let my_author_id = session_server_user_id(state).ok();
         if let Err(e) = state.db.upsert_org_item(
             &published.item_id,
             &org.org_id,
@@ -29493,6 +29636,7 @@ pub(crate) async fn republish_org_shares_for_source(
             generation,
             &content_sha,
             env.source_kind.map(crate::share::org_envelope::OrgSourceKind::as_str),
+            my_author_id.as_deref(),
             None,
         ) {
             tracing::warn!(target: "org", error = %e, "republish: local replica upsert failed (server copy live)");
@@ -30400,6 +30544,18 @@ async fn org_sync_one(
                     sha,
                     author_user_id,
                 } => {
+                    // AUTHOR (root-cause fix, 2026-07-15): pass the feed's server-authoritative author
+                    // id DIRECTLY into the upsert (in both the INSERT and the `ON CONFLICT`'s
+                    // `COALESCE`, so it can never be clobbered back to NULL by a later light re-upsert)
+                    // instead of a separate follow-up `set_org_item_author` call — this row is correct
+                    // the moment it's written, not one extra statement later. Server never sends an
+                    // empty author id, but guard anyway — an empty string is passed through as `None`
+                    // rather than stamping a blank value.
+                    let author_ref = if author_user_id.is_empty() {
+                        None
+                    } else {
+                        Some(author_user_id.as_str())
+                    };
                     state.db.upsert_org_item(
                         &item_id,
                         &org.org_id,
@@ -30416,14 +30572,9 @@ async fn org_sync_one(
                         // already on v2); `None` for one opened off an old v1 envelope (no wire signal) —
                         // honest "unclassified", never guessed.
                         env.source_kind.map(crate::share::org_envelope::OrgSourceKind::as_str),
+                        author_ref,
                         embedder_ref,
                     )?;
-                    // Stamp the server-authoritative author id so the author's OTHER machines can edit
-                    // their own item in-place (they have no local `org_shares` anchor). Server never
-                    // sends an empty author id, but guard anyway — an empty stamp just leaves it unmatched.
-                    if !author_user_id.is_empty() {
-                        state.db.set_org_item_author(&item_id, &author_user_id)?;
-                    }
                     report.ingested += 1;
                     applied = applied.max(seq);
                 }
@@ -30687,9 +30838,12 @@ pub(crate) async fn org_update_own_item_inner(
     crate::share::ledger_row(&state.db, &client.host(), "org_share_publish", content_sha.len());
 
     // LOCAL REPLICA CONSISTENCY: upsert the NEW item (so the Notes list resolves it immediately) +
-    // re-stamp our authorship on it (so it stays editable here) + tombstone the OLD replica. FTS-only
-    // (`None` embedder) to keep the editor-close path light; the next `org_sync_now` re-ingests + embeds.
-    // Best-effort — a local-replica error must never fail the save (the server copy is already live).
+    // stamp our authorship on it directly (root-cause fix, 2026-07-15 — `me` was already proven to be
+    // this item's author by the ownership gate above, so pass it straight into the upsert rather than
+    // a separate follow-up `set_org_item_author` call; the row is correct the instant it's written) +
+    // tombstone the OLD replica. FTS-only (`None` embedder) to keep the editor-close path light; the
+    // next `org_sync_now` re-ingests + embeds. Best-effort — a local-replica error must never fail the
+    // save (the server copy is already live).
     if let Err(e) = state.db.upsert_org_item(
         &published.item_id,
         &org.org_id,
@@ -30703,11 +30857,11 @@ pub(crate) async fn org_update_own_item_inner(
         &content_sha,
         env.source_kind
             .map(crate::share::org_envelope::OrgSourceKind::as_str),
+        Some(me.as_str()),
         None,
     ) {
         tracing::warn!(target: "org", error = %e, "org edit: local replica upsert failed (server copy live)");
     }
-    let _ = state.db.set_org_item_author(&published.item_id, &me);
     // Repoint any local `org_shares` anchor for the OLD id (usually none on a non-origin machine, but if
     // this IS the origin machine keep the anchor pointing at the live item so the vault-note republish
     // path stays consistent).
@@ -30747,6 +30901,100 @@ pub(crate) async fn org_update_own_item_inner(
     }
 
     Ok(published.item_id)
+}
+
+/// `delete_org_item_as_author(item_id)` — let an author remove their own shared note/meeting from
+/// the org space FROM A DEVICE THAT NEVER SHARED IT (the "author has no delete affordance on a
+/// second machine" gap). The pre-existing delete paths (`delete_note_inner`/`delete_meeting_inner`/
+/// `delete_document_inner` → `revoke_org_shares_for_source`) only ever act through a LOCAL
+/// `documents`/`meetings` row + a LOCAL `org_shares` anchor — both of which exist ONLY on the
+/// origin device that first shared the item. A different machine that merely ingested the
+/// `org_items` REPLICA (e.g. the author's other Mac, or the author signed in fresh) has neither, so
+/// none of those commands can act on it, and `org_resolve_source_inner` correctly returns `None`
+/// there too (same local-anchor gap, out of scope here) — leaving the author with no way at all to
+/// take an item they wrote down from the shared space.
+///
+/// DELIBERATE, ASYMMETRIC SEMANTICS (this is "leave/remove from org", NOT "destroy the original"):
+/// this command tombstones the item in the SHARED org space — this device's own `org_items` replica
+/// immediately, and (via the existing tombstone-apply path in `org_sync_one`'s `FeedAction::Tombstone`
+/// arm) the ORIGIN device's replica on its own next sync. It NEVER touches the origin device's local
+/// `documents`/`meetings` source row or its vault `.md` file — that local source is simply out of
+/// reach from a non-origin device, and is not what "delete" means here. An author who wants to
+/// destroy the original note/meeting itself still does that from the origin device, which cascades
+/// into `revoke_org_shares_for_source` as before.
+///
+/// ORDER (fail-closed, verify-before-destroy discipline mirrored for a REMOVAL instead of a seal):
+/// (1) ownership gate — the stored `author_user_id` (now reliably populated at write time by the
+/// `upsert_org_item` fix above) must equal this session's `server_user_id`, else `AppError::Auth`,
+/// no mutation at all. (2) tombstone on the SERVER FIRST (`org_tombstone_item`, idempotent — a 404
+/// counts as already-gone) — a network failure here propagates and stops BEFORE any local mutation,
+/// so this device's copy is never removed while the server (and thus every other member/device)
+/// still serves it; that would be a worse, silently-reappearing state than simply failing loud. (3)
+/// only once the server confirms gone does the LOCAL `org_items` replica get tombstoned
+/// (`Db::tombstone_org_item`, already used by the feed's own tombstone-apply arm), so it drops out of
+/// this device's Notes/Meetings list immediately. (4) best-effort `org-feed-updated` emit so every
+/// open org view re-fetches, exactly like every other org-item mutation in this file.
+#[tauri::command]
+pub async fn delete_org_item_as_author(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    item_id: String,
+) -> Result<(), AppError> {
+    delete_org_item_as_author_inner(state.inner(), &item_id).await?;
+    crate::events::emit_org_feed_updated(&app, 1);
+    Ok(())
+}
+
+/// Inner of [`delete_org_item_as_author`] taking `&AppState` (unit-testable ownership gate + the
+/// fail-closed server-then-local tombstone ordering).
+pub(crate) async fn delete_org_item_as_author_inner(
+    state: &AppState,
+    item_id: &str,
+) -> Result<(), AppError> {
+    let item_id = item_id.trim();
+    if item_id.is_empty() {
+        return Err(AppError::InvalidArg("item id required".into()));
+    }
+
+    // (1) OWNERSHIP GATE — identical signal Bug-A's fix now makes reliable at write time: the
+    // server-authoritative `author_user_id` stored on the local replica must match this session's
+    // own server user id. A missing stored author, an unknown/tombstoned item, or no live session
+    // all refuse — fail-closed, never let a member remove a colleague's item (or a stale/ambiguous
+    // one).
+    let ctx = state
+        .db
+        .org_item_edit_ctx(item_id)?
+        .ok_or_else(|| AppError::InvalidArg("no such org item (or it was already removed)".into()))?;
+    let me = session_server_user_id(state)?;
+    if ctx.author_user_id.as_deref() != Some(me.as_str()) {
+        return Err(AppError::Auth(
+            "you can only remove org notes you authored".into(),
+        ));
+    }
+
+    // (2) SERVER TOMBSTONE FIRST — fail loud, no local mutation yet. `org_tombstone_item` is
+    // idempotent (a 404 — already gone — is treated as success), so a repeat call after a prior
+    // partial failure (server succeeded, local step below didn't run yet) is safe to retry.
+    let org = resolve_org(state, &ctx.org_id)?;
+    let base = share_base_url(state)?;
+    let access_token = valid_access_token(state).await?;
+    let client = crate::share::client::ShareClient::new(&base)?;
+    client
+        .org_tombstone_item(&access_token, &org.org_id, item_id)
+        .await?;
+    crate::share::ledger_row(&state.db, &client.host(), "org_share_revoke", 0);
+
+    // (3) ONLY NOW tombstone the local replica — the server confirmed gone, so dropping this
+    // device's own copy can never leave a dangling "removed here but still live on the server"
+    // state. Reuses the SAME local tombstone primitive the feed's own `FeedAction::Tombstone` arm
+    // uses (`Db::tombstone_org_item`) — not a bespoke delete.
+    state.db.tombstone_org_item(item_id)?;
+
+    // The ORIGIN device (if this isn't it) still has its own separate local `documents`/`meetings`
+    // source row, untouched by design — it picks up this tombstone on its OWN next `org_sync_one`
+    // pull via the existing `FeedAction::Tombstone` handling and drops its own `org_items` replica
+    // then. See the doc comment above: this is "leave/remove from org", not "destroy the original".
+    Ok(())
 }
 
 /// `list_org_items(org_id)` — the browsable LIST of one org's live items (headers only), so a member
