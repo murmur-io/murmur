@@ -1218,13 +1218,17 @@ export interface BacklinkSource {
 }
 
 /**
- * A resolved `[[Title]]` wikilink navigation target — the VISIBLE note/meeting to
- * open (`resolveWikilink(title)`). `null` when nothing matches OR the only match is
- * sealed-and-not-session-unlocked (gated server-side, so a click can never reveal or
- * open locked content). Mirrors the Rust `WikiTarget` (serde camelCase).
+ * A resolved `[[Title]]` wikilink navigation target — the VISIBLE note/meeting/org
+ * (Shared Brain) item to open (`resolveWikilink(title)`). `null` when nothing matches
+ * OR the only local match is sealed-and-not-session-unlocked (gated server-side, so a
+ * click can never reveal or open locked content). `kind` is a raw string (NOT
+ * `SourceKind` — mirrors `NoteCitation`'s convention for the same tri-state, since
+ * `SourceKind` stays local-only for backlinks): `"org"` carries the org item's id,
+ * routed to `TabsService.openOrgItem`, never a local id. Mirrors the Rust `WikiTarget`
+ * (serde camelCase).
  */
 export interface WikiTarget {
-  kind: SourceKind;
+  kind: "meeting" | "note" | "org";
   id: string;
 }
 
