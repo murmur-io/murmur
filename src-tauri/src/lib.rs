@@ -185,6 +185,10 @@ pub fn run() {
             commands::run_vault_audit,
             commands::list_audit_findings,
             commands::resolve_audit_finding,
+            // Vault Audit Phase 3 — weekly schedule + user-initiated cloud explain.
+            commands::get_audit_schedule,
+            commands::set_audit_schedule,
+            commands::explain_audit_finding,
             commands::get_config,
             commands::get_mcp_config,
             commands::save_config,
@@ -574,6 +578,12 @@ pub fn run() {
                         if let Err(e) = joined {
                             tracing::warn!(target: "memory", error = %e, "consolidation tick join failed");
                         }
+                        // Vault Audit Phase 3 — the WEEKLY scheduled-audit due-check rides this
+                        // same hourly cadence (no new cadence class; first check a full interval
+                        // after launch, so run-on-launch-if-due comes free at +1h). The tick
+                        // claims-before-run, gates on thermal/RAM, runs the pass on a blocking
+                        // worker, and never errors (warn-and-continue inside).
+                        crate::audit::audit_weekly_tick(&handle).await;
                     }
                 });
             }
