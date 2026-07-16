@@ -801,6 +801,18 @@ scope to the GA-critical path only.
       case "meeting_org_shares": return [];
       case "org_live_shares_for_source": return [];
 
+      // ── Vault audit — weekly schedule + AI explain ──
+      // Object-shaped (a bare `get_` name would fall through to the `[]`
+      // fallback below — the FE expects an AuditSchedule, not an array).
+      case "get_audit_schedule": return { enabled: false, lastRunAt: null, nextDueAt: null };
+      case "set_audit_schedule": return { enabled: !!args.enabled, lastRunAt: null, nextDueAt: null };
+      case "explain_audit_finding":
+        return {
+          findingId: args.id,
+          explanationMd: "This finding flags content worth a second look — review the evidence above and accept or dismiss.",
+          provider: "On-device",
+        };
+
       // ── exports / misc ──
       case "export_audio": case "export_note": case "export_mic_master": case "export_sys_master": return null;
       case "export_canvas": return `${VAULT}/Canvas/Q2-Roadmap.canvas`;

@@ -146,3 +146,180 @@ test("Vault audit: inbox mounts, groups, resolves, and refetches on event", asyn
 
   expect(consoleErrors).toEqual([]);
 });
+
+/**
+ * Phase 3 — weekly schedule chip + per-finding "Explain (AI)" (mocked IPC):
+ *  - the passive header chip renders from `get_audit_schedule`
+ *    ("Weekly: on · last run yesterday") without expanding the section;
+ *  - "Explain (AI)" fetches `explain_audit_finding` and renders the returned
+ *    markdown INLINE in the row, with the provider name subtly attached;
+ *  - once loaded the button toggles the collapsible block (no re-fetch);
+ *  - a rejection (consent-missing / Locked, verbatim) raises a danger toast
+ *    and leaves the row unchanged — no explanation block appears.
+ */
+test("Vault audit: schedule chip renders and Explain (AI) loads inline or toasts", async ({
+  page,
+}) => {
+  const consoleErrors: string[] = [];
+  page.on("console", (msg) => {
+    if (msg.type() === "error") consoleErrors.push(msg.text());
+  });
+  page.on("pageerror", (err) => consoleErrors.push(String(err)));
+
+  await mockTauri(page, {
+    get_audit_schedule: () => ({
+      enabled: true,
+      // Exactly one day back → the chip's relative label is "yesterday".
+      lastRunAt: Math.floor(Date.now() / 1000) - 86_400,
+      nextDueAt: Math.floor(Date.now() / 1000) + 6 * 86_400,
+    }),
+    list_audit_findings: () => [
+      {
+        id: "f-ok",
+        kind: "contradiction",
+        sourceKind: "note",
+        sourceId: "n-1",
+        sourceTitle: "Project Atlas decision",
+        targetTitle: "Atlas kickoff meeting",
+        evidenceMd: "One note says **ship in Q3**, the other **Q4**.",
+        acceptAction: "",
+        status: "pending",
+        createdAt: 1752600000,
+        resolvedAt: null,
+      },
+      {
+        id: "f-err",
+        kind: "orphan",
+        sourceKind: "note",
+        sourceId: "n-2",
+        sourceTitle: "Scratch note",
+        targetTitle: null,
+        evidenceMd: "No links in, no links out.",
+        acceptAction: "",
+        status: "pending",
+        createdAt: 1752600001,
+        resolvedAt: null,
+      },
+    ],
+    explain_audit_finding: (args: { id: string }) => {
+      if (args.id === "f-err") {
+        throw new Error(
+          "AI consent required — enable cloud assistance in Settings",
+        );
+      }
+      return {
+        findingId: args.id,
+        explanationMd:
+          "These two notes disagree because **Q3 slipped to Q4** after the June review.",
+        provider: "Claude",
+      };
+    },
+  });
+
+  await page.goto("/brain");
+  const section = page.locator("app-audit");
+  await expect(section).toBeVisible();
+
+  // The passive schedule chip renders in the (still collapsed) header.
+  await expect(section.locator(".au-weekly")).toHaveText(
+    /Weekly: on · last run yesterday/,
+  );
+
+  // Expand the inbox.
+  await section.locator(".au-toggle").click();
+  const okRow = section
+    .locator(".au-item")
+    .filter({ hasText: "Project Atlas decision" });
+  const errRow = section
+    .locator(".au-item")
+    .filter({ hasText: "Scratch note" });
+
+  // Explain success: the markdown renders inline + the provider is credited.
+  await okRow.getByRole("button", { name: "Explain (AI)" }).click();
+  await expect(okRow.locator(".au-explain strong")).toHaveText(
+    "Q3 slipped to Q4",
+  );
+  await expect(okRow.locator(".au-explain-provider")).toHaveText(/via Claude/);
+
+  // Once loaded the button toggles the collapsible block instead of re-fetching.
+  await okRow.getByRole("button", { name: "Hide explanation" }).click();
+  await expect(okRow.locator(".au-explain")).toHaveCount(0);
+  await okRow.getByRole("button", { name: "Show explanation" }).click();
+  await expect(okRow.locator(".au-explain")).toBeVisible();
+
+  // Explain rejection: danger toast with the backend message, row unchanged.
+  await errRow.getByRole("button", { name: "Explain (AI)" }).click();
+  await expect(page.locator(".toast.is-danger .toast-msg")).toHaveText(
+    /AI consent required — enable cloud assistance in Settings/,
+  );
+  await expect(errRow.locator(".au-explain")).toHaveCount(0);
+  await expect(
+    errRow.getByRole("button", { name: "Explain (AI)" }),
+  ).toBeEnabled();
+  await expect(errRow.getByRole("button", { name: "Dismiss" })).toBeVisible();
+
+  expect(consoleErrors).toEqual([]);
+});
+
+/**
+ * Phase 3 — the Settings → AI & Models "Weekly vault audit" toggle
+ * (confirm-then-update, never optimistic):
+ *  - the switch loads DISABLED until `get_audit_schedule` resolves, then
+ *    mirrors the backend state;
+ *  - flipping it calls `set_audit_schedule { enabled }` and settles on the
+ *    RESPONSE;
+ *  - a rejected commit raises a danger toast and the switch reverts to the
+ *    last confirmed state.
+ */
+test("Settings: weekly-audit toggle commits via set_audit_schedule and reverts on failure", async ({
+  page,
+}) => {
+  await mockTauri(page, {
+    get_audit_schedule: () => ({
+      enabled: false,
+      lastRunAt: null,
+      nextDueAt: null,
+    }),
+    set_audit_schedule: (args: { enabled: boolean }) => {
+      const w = window as unknown as { __setAuditCalls: boolean[] };
+      w.__setAuditCalls = [...(w.__setAuditCalls ?? []), args.enabled];
+      if (args.enabled === false) {
+        // Second flip (on → off) rejects, proving the revert path.
+        throw new Error("Locked: unlock the vault to change the schedule");
+      }
+      return { enabled: args.enabled, lastRunAt: null, nextDueAt: null };
+    },
+  });
+
+  await page.goto("/settings");
+  await page.getByText("AI & Models").first().click();
+
+  const row = page
+    .locator("app-on-device-intelligence-block label.toggle-row")
+    .filter({ hasText: "Weekly vault audit" });
+  const input = row.locator("mur-toggle input");
+
+  // Loaded state mirrors the backend: off, and interactive.
+  await expect(input).toBeEnabled();
+  await expect(input).not.toBeChecked();
+
+  // Flip ON → set_audit_schedule({ enabled: true }) confirms → stays on.
+  await input.click();
+  await expect(input).toBeChecked();
+  await expect(input).toBeEnabled();
+
+  // Flip OFF → the backend rejects → toast + revert to the confirmed ON.
+  await input.click();
+  await expect(page.locator(".toast.is-danger .toast-msg")).toHaveText(
+    /Locked: unlock the vault to change the schedule/,
+  );
+  await expect(input).toBeChecked();
+  await expect(input).toBeEnabled();
+
+  // The command saw exactly the two user flips, in order.
+  expect(
+    await page.evaluate(
+      () => (window as unknown as { __setAuditCalls: boolean[] }).__setAuditCalls,
+    ),
+  ).toEqual([true, false]);
+});

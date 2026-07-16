@@ -88,6 +88,17 @@
   font-size: 0.85rem;
 }
 
+/* --- Weekly vault audit — scheduled hygiene subsection --- */
+.audit-weekly {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-4);
+  border-radius: var(--radius-md);
+  background: var(--surface-input);
+  border: 1px solid var(--border-subtle);
+}
+
 /* Toggle row (for semantic-search checkbox). */
 .toggle-row {
   display: flex;

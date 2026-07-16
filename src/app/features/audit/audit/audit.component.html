@@ -31,6 +31,14 @@
         Broken links, stale notes and contradictions — found for your review.
       </span>
     </button>
+    @if (weeklyChip(); as chip) {
+      <span
+        class="pill au-weekly"
+        title="Turn the weekly audit on or off in Settings → AI &amp; Models"
+      >
+        {{ chip }}
+      </span>
+    }
     <button
       type="button"
       class="btn btn-ghost au-run"
@@ -105,12 +113,43 @@
                   [markdown]="f.evidenceMd"
                   compact
                 />
+                @let ex = explanations().get(f.id);
+                @if (ex && !explainCollapsed().has(f.id)) {
+                  <div class="au-explain">
+                    <app-markdown [markdown]="ex.explanationMd" compact />
+                    <span class="au-explain-provider text-muted">
+                      via {{ ex.provider }}
+                    </span>
+                  </div>
+                }
                 <div class="au-item-actions">
                   @if (f.acceptAction) {
                     <span class="au-accept-hint text-secondary">
                       {{ f.acceptAction }}
                     </span>
                   }
+                  <button
+                    type="button"
+                    class="btn btn-ghost au-explain-btn"
+                    title="May use your configured AI provider; cloud providers see only redacted content"
+                    (click)="explain(f)"
+                    [disabled]="explaining().has(f.id)"
+                  >
+                    @if (explaining().has(f.id)) {
+                      <mur-spinner [size]="12" />
+                      <span>Explaining…</span>
+                    } @else if (ex) {
+                      <span>
+                        {{
+                          explainCollapsed().has(f.id)
+                            ? "Show explanation"
+                            : "Hide explanation"
+                        }}
+                      </span>
+                    } @else {
+                      <span>Explain (AI)</span>
+                    }
+                  </button>
                   <button
                     type="button"
                     class="btn btn-ghost"

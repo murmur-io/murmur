@@ -527,8 +527,16 @@ pub async fn start_recording(
     // instance crashed / was SIGKILL'd mid-recording) would otherwise capture alongside the new
     // recording until its 4h self-cap. Safe by construction — a helper owned by any LIVE Murmur
     // process (including the one this call is about to spawn for) is always spared. Best-effort,
-    // never fails the recording.
-    crate::audio::aec::reap_orphaned_capture_helpers();
+    // never fails the recording. Hardening 2026-07-16: the sweep shells out to /bin/ps (×2) plus
+    // a per-candidate `kill -0`, so it runs on a BLOCKING worker instead of stalling this async
+    // runtime thread — but it is still AWAITED: the sweep MUST complete before this recording's
+    // own helpers spawn (ordering guarantee unchanged).
+    if let Err(e) =
+        tauri::async_runtime::spawn_blocking(crate::audio::aec::reap_orphaned_capture_helpers)
+            .await
+    {
+        tracing::warn!(target: "audio", error = %e, "orphan-helper sweep join failed; recording continues");
+    }
 
     // Fresh recording ⇒ re-arm the 4h-cap rising-edge notice (see `recording_level`). If a previous
     // recording hit the cap and set this, the next recording must be able to fire the notice again.
@@ -6291,7 +6299,7 @@ pub async fn run_vault_audit(
     app: AppHandle,
 ) -> Result<crate::audit::AuditRunSummary, AppError> {
     let handle = app.clone();
-    let summary = tokio::task::spawn_blocking(move || {
+    let mut summary = tokio::task::spawn_blocking(move || {
         let state = handle.state::<AppState>();
         let vault = vault_path(&state);
         crate::audit::run_audit_pass(
@@ -6303,6 +6311,18 @@ pub async fn run_vault_audit(
     })
     .await
     .map_err(|e| AppError::Other(anyhow::anyhow!("audit task join failed: {e}")))??;
+    // Phase 3 judge tier: score THIS run's contradiction/stale findings on the LOCAL light
+    // engine (skip on stub, budget-bounded, degrade-to-keep — see `judge_run_findings`), then
+    // report/emit the POST-judge pending count.
+    {
+        let state = app.state::<AppState>();
+        let stats = crate::audit::judge_run_findings(state.inner(), &summary.run_id).await;
+        summary.judged = stats.judged;
+        summary.demoted = stats.demoted;
+        if stats.demoted > 0 {
+            summary.findings_total_pending = state.db.count_pending_audit_findings()?;
+        }
+    }
     crate::events::emit_audit_updated(&app, summary.findings_total_pending as u32);
     Ok(summary)
 }
@@ -6333,25 +6353,13 @@ pub(crate) fn list_audit_findings_inner(
     let rows = state.db.list_audit_finding_rows(status)?;
     let mut out = Vec::new();
     for r in rows {
-        let visible = match r.source_kind.as_str() {
-            "meeting" => state.db.meeting_is_visible(&r.source_id, &unlocked)?,
-            _ => state.db.note_is_visible(&r.source_id, &unlocked)?,
-        };
-        if !visible {
+        // SOURCE + TARGET re-gate (lock review, defense in depth): a pending row's titles/
+        // evidence reference both sides, so either side sealing between pass and list hides the
+        // row. `audit_row_visible` fails CLOSED on an untyped target (`target_id` without
+        // `target_kind` — such a row cannot be re-gated against the right table), and the
+        // explain command shares the same helper so the two gates can never diverge.
+        if !audit_row_visible(state, &r, &unlocked)? {
             continue; // sealed since the pass — hide, never mask.
-        }
-        // TARGET side too (lock review, defense in depth): a pending row's title/evidence
-        // reference its target, so a target whose folder sealed between pass and list must hide
-        // the row — `target_kind` picks the right table (`meeting_is_visible` treats an unknown
-        // id as visible, so an untyped check would fail open for note targets).
-        if let (Some(tid), Some(tkind)) = (&r.target_id, &r.target_kind) {
-            let target_visible = match tkind.as_str() {
-                "meeting" => state.db.meeting_is_visible(tid, &unlocked)?,
-                _ => state.db.note_is_visible(tid, &unlocked)?,
-            };
-            if !target_visible {
-                continue;
-            }
         }
         out.push(r.into_dto());
     }
@@ -6665,6 +6673,185 @@ fn audit_link_target_ok(state: &AppState, title: &str) -> Result<bool, AppError>
 fn emit_audit_updated_after_purge(app: &AppHandle, state: &AppState) {
     let pending = state.db.count_pending_audit_findings().unwrap_or(0);
     crate::events::emit_audit_updated(app, pending as u32);
+}
+
+/// Re-gate ONE finding row against a session unlock set: the SOURCE must be visible, and when a
+/// target id rides on the row its TARGET must be visible too, checked against the table its
+/// `target_kind` names. FAIL-CLOSED on an UNTYPED target (`target_id` set, `target_kind` NULL):
+/// such a row cannot be target-re-gated, so it is treated as not visible (lock-review NIT,
+/// 2026-07-16 — the previous inline check silently SKIPPED the target re-gate for untyped rows,
+/// which fails open exactly when the target seals between pass and read). Shared by the list
+/// re-gate and `explain_audit_finding` so the two can never diverge.
+fn audit_row_visible(
+    state: &AppState,
+    row: &crate::audit::AuditFindingRow,
+    unlocked: &std::collections::HashSet<String>,
+) -> Result<bool, AppError> {
+    let source_visible = match row.source_kind.as_str() {
+        "meeting" => state.db.meeting_is_visible(&row.source_id, unlocked)?,
+        _ => state.db.note_is_visible(&row.source_id, unlocked)?,
+    };
+    if !source_visible {
+        return Ok(false);
+    }
+    if let Some(tid) = &row.target_id {
+        let Some(tkind) = row.target_kind.as_deref() else {
+            return Ok(false); // untyped target — cannot be re-gated ⇒ fail closed.
+        };
+        let target_visible = match tkind {
+            "meeting" => state.db.meeting_is_visible(tid, unlocked)?,
+            _ => state.db.note_is_visible(tid, unlocked)?,
+        };
+        if !target_visible {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+// ── Vault Audit Phase 3 — weekly schedule + cloud explain ───────────────────────────────────────
+
+/// The weekly-audit schedule for the FE settings surface: the enabled flag + the last SCHEDULED
+/// run + the derived next due time (see [`crate::audit::AuditSchedule`] for the `nextDueAt`
+/// semantics). Read-only; content-free.
+#[tauri::command]
+pub fn get_audit_schedule(
+    state: State<'_, AppState>,
+) -> Result<crate::audit::AuditSchedule, AppError> {
+    get_audit_schedule_inner(state.inner())
+}
+
+pub(crate) fn get_audit_schedule_inner(
+    state: &AppState,
+) -> Result<crate::audit::AuditSchedule, AppError> {
+    let enabled = state
+        .config
+        .lock()
+        .map_err(|_| AppError::Config("config mutex poisoned".into()))?
+        .vault_audit_weekly_enabled;
+    let last_run_at = state.db.last_scheduled_audit_run_finished_at()?;
+    let next_due_at = if enabled {
+        last_run_at.map(|l| l + crate::audit::WEEKLY_AUDIT_INTERVAL_MS)
+    } else {
+        None
+    };
+    Ok(crate::audit::AuditSchedule {
+        enabled,
+        last_run_at,
+        next_due_at,
+    })
+}
+
+/// Enable/disable the weekly scheduled audit. The ONLY mutator of the flag (preserve-only on the
+/// settings DTO), persisted through the dedicated `AppConfig::set_vault_audit_weekly` (persist
+/// first, flip in-memory on durable success). Returns the updated schedule.
+#[tauri::command]
+pub fn set_audit_schedule(
+    state: State<'_, AppState>,
+    enabled: bool,
+) -> Result<crate::audit::AuditSchedule, AppError> {
+    set_audit_schedule_inner(state.inner(), enabled)
+}
+
+pub(crate) fn set_audit_schedule_inner(
+    state: &AppState,
+    enabled: bool,
+) -> Result<crate::audit::AuditSchedule, AppError> {
+    {
+        let mut cache = state
+            .config
+            .lock()
+            .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
+        cache.set_vault_audit_weekly(&state.db, enabled)?;
+    }
+    tracing::info!(target: "audit", enabled, "weekly audit schedule updated");
+    get_audit_schedule_inner(state)
+}
+
+/// USER-INITIATED cloud explanation of one PENDING finding. Gates, in order:
+/// 1. the finding exists and is still pending (`InvalidArg` otherwise);
+/// 2. its source AND typed target are visible under the CURRENT session unlock set —
+///    [`audit_row_visible`], untyped targets fail closed — else `AppError::Locked`;
+/// 3. the provider builds through the [`crate::summarize::provider_for`] chain BEFORE any prompt
+///    content is assembled — the fail-closed consent gate, the redaction firewall, and the
+///    egress ledger all live inside that seam (the brief runner's posture).
+/// The prompt carries the finding's own evidence + a bounded, GATED excerpt of the source note
+/// (current session set). RETURN-ONLY: the explanation is never persisted (no new derived
+/// plaintext at rest). A seal interleaving with the in-flight provider call affects only the
+/// already-read excerpt — the same accepted posture as an in-flight brief/digest synthesis.
+#[tauri::command]
+pub async fn explain_audit_finding(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<crate::audit::AuditExplanation, AppError> {
+    explain_audit_finding_inner(state.inner(), &id).await
+}
+
+pub(crate) async fn explain_audit_finding_inner(
+    state: &AppState,
+    id: &str,
+) -> Result<crate::audit::AuditExplanation, AppError> {
+    let row = state
+        .db
+        .get_audit_finding(id)?
+        .ok_or_else(|| AppError::InvalidArg(format!("no audit finding {id}")))?;
+    if row.status != "pending" {
+        return Err(AppError::InvalidArg(
+            "only a pending finding can be explained".into(),
+        ));
+    }
+    // User-initiated read ⇒ the CURRENT session unlock set (unlike the background pass's
+    // deliberately EMPTY set).
+    let unlocked = unlocked_snapshot(state)?;
+    if !audit_row_visible(state, &row, &unlocked)? {
+        return Err(AppError::Locked(
+            "this finding's source is locked — unlock it to explain".into(),
+        ));
+    }
+    // Provider FIRST: an unconsented cloud target refuses HERE (`Unavailable`) and no content is
+    // even assembled; a consented one is redaction-wrapped + ledgered inside the factory.
+    let config = state
+        .config
+        .lock()
+        .map_err(|_| AppError::Config("config mutex poisoned".into()))?
+        .clone();
+    let provider = crate::summarize::provider_for(
+        crate::summarize::roles::Role::Notes,
+        &config,
+        &state.heavy_inference,
+    )?;
+    // Bounded, GATED source excerpt. The visibility check above passed, so a `None` here means
+    // the source sealed (or its note vanished) in between — fail CLOSED rather than explain
+    // from evidence alone.
+    let body = match row.source_kind.as_str() {
+        "meeting" => state
+            .db
+            .get_note_if_visible(&row.source_id, &unlocked)?
+            .map(|n| n.markdown),
+        _ => state.db.note_markdown_if_visible(&row.source_id, &unlocked)?,
+    }
+    .ok_or_else(|| {
+        AppError::Locked("this finding's source is locked — unlock it to explain".into())
+    })?;
+    let snippet: String = body
+        .chars()
+        .take(crate::audit::EXPLAIN_SNIPPET_CHARS)
+        .collect();
+    let (system, user) = crate::audit::build_explain_prompt(&row, &snippet);
+    let explanation_md = provider.complete(&system, &user).await?;
+    tracing::info!(
+        target: "audit",
+        finding_id = %id,
+        provider = %provider.id(),
+        chars = explanation_md.len(),
+        "audit finding explained"
+    );
+    // RETURN-ONLY — nothing stored.
+    Ok(crate::audit::AuditExplanation {
+        finding_id: row.id,
+        explanation_md,
+        provider: provider.id().to_string(),
+    })
 }
 
 /// Does a wikilink title resolve AT ALL right now — the gated `resolve_wikilink` (live session
@@ -9378,6 +9565,10 @@ fn dto_to_config(d: AppConfigDto, current: &AppConfig) -> AppConfig {
         // (`#[serde(default)]`), so a partial/older save can never silently enable it. Unlike
         // `cloud_egress_consented` (preserved-only), this one is settable.
         semantic_search_enabled: d.semantic_search_enabled,
+        // Vault Audit Phase 3: the weekly-audit schedule is NOT carried on the settings DTO —
+        // preserve the live value; only the dedicated `set_audit_schedule` command may flip it
+        // (an omitting/older FE save can never silently disable the weekly pass).
+        vault_audit_weekly_enabled: current.vault_audit_weekly_enabled,
         // brain2 RAG Phase 2: the SELECTED embedder id is NOT carried on the settings DTO — it is
         // owned exclusively by the dedicated `select_embed_model` command (which validates the id and
         // reports whether a re-index is needed). Preserve the live value, so a generic settings save
@@ -11747,13 +11938,13 @@ fn move_note_inner_impl(
 
     // Best-effort FS move only when a plaintext .md exists (target is open here).
     if let Some(src_path) = exported {
-        if let Some(vault) = vault_path(&state) {
+        if let Some(vault) = vault_path(state) {
             let target_rel = match folder_id.as_deref() {
                 Some(fid) => state.db.folder_by_id(fid)?.map(|f| f.path),
                 None => None,
             };
             move_note_file(
-                &state,
+                state,
                 &meeting_id,
                 &src_path,
                 &vault,
@@ -24839,6 +25030,7 @@ mod lifecycle_tests {
     // ── Vault Audit — accept/dismiss/list (command layer) ─────────────────────
 
     /// Stage one pending audit finding directly (the pass is tested in `crate::audit`).
+    #[allow(clippy::too_many_arguments)]
     fn stage_audit_finding(
         state: &AppState,
         kind: &str,
@@ -25299,6 +25491,173 @@ mod lifecycle_tests {
             let rows = state.db.list_audit_finding_rows("pending").unwrap();
             rows.iter().find(|r| r.dedupe_key == "k-keep").unwrap().id.clone()
         });
+    }
+
+    /// Stage a pending finding whose target is UNTYPED (`target_id` set, `target_kind` NULL) —
+    /// the shape a pre-`target_kind` DB row (or a bug upstream) would take. Returns the row id.
+    fn stage_untyped_target_finding(state: &AppState, source_id: &str, target_id: &str) -> String {
+        state
+            .db
+            .insert_audit_finding_if_new(
+                &crate::audit::NewAuditFinding {
+                    kind: "unlinked_mention".into(),
+                    source_kind: "meeting".into(),
+                    source_id: source_id.into(),
+                    source_title: "T".into(),
+                    target_title: Some("Sealed Target Title".into()),
+                    target_id: Some(target_id.into()),
+                    target_kind: None,
+                    evidence_md: "> mentions Sealed Target Title".into(),
+                    accept_action: "".into(),
+                    dedupe_key: "k-untyped".into(),
+                },
+                "r-test",
+                1,
+            )
+            .unwrap();
+        state
+            .db
+            .list_audit_finding_rows("pending")
+            .unwrap()
+            .into_iter()
+            .find(|r| r.dedupe_key == "k-untyped")
+            .unwrap()
+            .id
+    }
+
+    /// RED-first (lock-review NIT, 2026-07-16): a pending row carrying `target_id` but NO
+    /// `target_kind` cannot be target-re-gated — the list must FAIL CLOSED (hide it), not skip
+    /// the target check. The old inline `if let (Some, Some)` fell OPEN exactly when the target
+    /// sealed: this row's title/evidence reference the sealed note and would still be served.
+    #[test]
+    fn audit_list_hides_untyped_target_rows_fail_closed() {
+        let state = build_state("audit-untyped-target");
+        make_open_folder(&state.db, "f1", "Secret");
+        seed_meeting(&state.db, "m-t", "# target body\n", Some("f1"));
+        seed_meeting(&state.db, "m-src", "# open body\n", None);
+        // Seal FIRST, then stage (the TOCTOU-orphan shape the re-gate exists for — the seal's
+        // own purge ran before this row existed).
+        state.db.set_folder_locked("f1", true, None).unwrap();
+        stage_untyped_target_finding(&state, "m-src", "m-t");
+
+        let listed = list_audit_findings_inner(&state, None).unwrap();
+        assert!(
+            listed.is_empty(),
+            "an untyped-target row must be hidden (fail closed): {listed:#?}"
+        );
+    }
+
+    // ── Vault Audit Phase 3 — schedule + explain (command layer) ─────────────
+
+    /// `get_audit_schedule` / `set_audit_schedule`: default ON; `lastRunAt`/`nextDueAt` derive
+    /// from the SCHEDULED claim rows only; disable persists durably and clears `nextDueAt`.
+    #[test]
+    fn audit_schedule_get_set_round_trips() {
+        let state = build_state("audit-sched");
+        let s = get_audit_schedule_inner(&state).unwrap();
+        assert!(s.enabled, "weekly audit defaults ON");
+        assert_eq!(s.last_run_at, None);
+        assert_eq!(s.next_due_at, None, "never-ran ⇒ due at the next hourly check");
+
+        // A scheduled claim stamps lastRunAt and derives nextDueAt = last + 7 days.
+        state
+            .db
+            .insert_scheduled_audit_run_claim("c1", 1_700_000_000_000)
+            .unwrap();
+        let s = get_audit_schedule_inner(&state).unwrap();
+        assert_eq!(s.last_run_at, Some(1_700_000_000_000));
+        assert_eq!(
+            s.next_due_at,
+            Some(1_700_000_000_000 + crate::audit::WEEKLY_AUDIT_INTERVAL_MS)
+        );
+
+        // Disable → persists (a fresh load sees it) + nextDueAt clears; re-enable restores.
+        let s = set_audit_schedule_inner(&state, false).unwrap();
+        assert!(!s.enabled);
+        assert_eq!(s.next_due_at, None, "disabled ⇒ no next due time");
+        assert!(
+            !AppConfig::load(&state.db).unwrap().vault_audit_weekly_enabled,
+            "the opt-out persists durably"
+        );
+        let s = set_audit_schedule_inner(&state, true).unwrap();
+        assert!(s.enabled);
+        assert_eq!(
+            s.next_due_at,
+            Some(1_700_000_000_000 + crate::audit::WEEKLY_AUDIT_INTERVAL_MS),
+            "re-enable derives from the surviving claim row"
+        );
+    }
+
+    /// `explain_audit_finding` gate matrix: missing id → InvalidArg; already-resolved →
+    /// InvalidArg; sealed-since source → Locked; untyped target (target_id without target_kind)
+    /// → Locked (fail closed — the same rule the list re-gate enforces).
+    #[test]
+    fn explain_gate_refuses_missing_resolved_locked_and_untyped() {
+        let state = build_state("explain-gate");
+
+        // Missing.
+        assert!(matches!(
+            block_on(explain_audit_finding_inner(&state, "nope")),
+            Err(AppError::InvalidArg(_))
+        ));
+
+        // Already resolved.
+        seed_meeting(&state.db, "m-open", "# open body\n", None);
+        let id = stage_audit_finding(
+            &state, "stale", "meeting", "m-open", None, "> ev", "", "k-exp-resolved",
+        );
+        state
+            .db
+            .resolve_audit_finding_row(&id, "dismissed", 5)
+            .unwrap();
+        assert!(matches!(
+            block_on(explain_audit_finding_inner(&state, &id)),
+            Err(AppError::InvalidArg(_))
+        ));
+
+        // Sealed-since source (staged after the seal — the orphan shape) → Locked.
+        make_open_folder(&state.db, "f-exp", "Secret");
+        seed_meeting(&state.db, "m-sealed", "# sealed body\n", Some("f-exp"));
+        state.db.set_folder_locked("f-exp", true, None).unwrap();
+        let id_locked = stage_audit_finding(
+            &state, "stale", "meeting", "m-sealed", None, "> ev", "", "k-exp-locked",
+        );
+        assert!(matches!(
+            block_on(explain_audit_finding_inner(&state, &id_locked)),
+            Err(AppError::Locked(_))
+        ));
+
+        // Untyped target on a visible source → Locked (fail closed), never explained.
+        let id_untyped = stage_untyped_target_finding(&state, "m-open", "m-sealed");
+        assert!(matches!(
+            block_on(explain_audit_finding_inner(&state, &id_untyped)),
+            Err(AppError::Locked(_))
+        ));
+    }
+
+    /// Egress fail-closed: with the default (unconsented) config the cloud Notes provider refuses
+    /// to BUILD — the explain returns `Unavailable` before any content is assembled — and the
+    /// pending row is untouched (still pending, evidence intact; nothing stored anywhere).
+    #[test]
+    fn explain_fails_closed_without_cloud_consent_and_stores_nothing() {
+        let state = build_state("explain-consent");
+        assert!(!state.config.lock().unwrap().cloud_egress_consented);
+        seed_meeting(&state.db, "m-open", "# open body\n", None);
+        let id = stage_audit_finding(
+            &state, "contradiction", "meeting", "m-open", None, "> a vs b", "", "k-exp-consent",
+        );
+
+        let res = block_on(explain_audit_finding_inner(&state, &id));
+        assert!(
+            matches!(res, Err(AppError::Unavailable(_))),
+            "unconsented cloud provider must fail closed"
+        );
+
+        // Nothing stored / mutated — the row is byte-identical to its staged state.
+        let row = state.db.get_audit_finding(&id).unwrap().unwrap();
+        assert_eq!(row.status, "pending");
+        assert_eq!(row.evidence_md, "> a vs b", "evidence untouched by a refused explain");
+        assert!(row.resolved_at.is_none());
     }
 
     /// Phase-0 follow-up (a): every seal path that NULLs `exported_path` blanks the path-coupled
