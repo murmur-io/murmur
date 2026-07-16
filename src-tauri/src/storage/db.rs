@@ -641,6 +641,16 @@ impl Db {
         Self::add_column_if_missing(&conn, "notes", "model_requested", "TEXT")?;
         Self::add_column_if_missing(&conn, "notes", "model_served", "TEXT")?;
         Self::add_column_if_missing(&conn, "notes", "gateway_host", "TEXT")?;
+        // Export-collision guard (2026-07-16): `exported_hash` = SHA-256 (lowercase hex) of the
+        // EXACT markdown Murmur last wrote to the exported vault `.md` at `exported_path`. Before
+        // every full DB-derived overwrite, the guard compares the CURRENT file bytes against this
+        // baseline — a mismatch means an EXTERNAL edit (the user or their own vault-side agent),
+        // which is preserved as a sibling file instead of silently clobbered
+        // (`export::preserve_external_edit_if_any`). NULL = legacy row exported before the guard
+        // shipped (grandfathered: no sibling until the next Murmur write stamps a baseline).
+        // NON-CONTENT metadata (a digest, never words): like `exported_path` it is not
+        // sealed/blanked — it rides the SQLCipher-at-rest layer. Additive + guarded (idempotent).
+        Self::add_column_if_missing(&conn, "notes", "exported_hash", "TEXT")?;
         // @brain THREADS: scope each persisted assistant exchange to a conversation thread.
         // `thread_id` is an OPAQUE id (FE-supplied for an @brain thread, backend-generated UUID for
         // the voice/wake path); `anchor_text` is the note text an @brain thread was anchored to
@@ -713,6 +723,11 @@ impl Db {
         Self::add_column_if_missing(&conn, "documents", "title", "TEXT")?;
         Self::add_column_if_missing(&conn, "documents", "updated_at", "INTEGER")?;
         Self::add_column_if_missing(&conn, "documents", "exported_path", "TEXT")?;
+        // Export-collision guard (2026-07-16): the authored-note twin of `notes.exported_hash` —
+        // the SHA-256 (lowercase hex) of the text Murmur last wrote to this note's exported vault
+        // `.md`. Refreshed on every vault (re)export; NULL for legacy rows (grandfathered). See the
+        // `notes.exported_hash` migration comment for the full contract. Additive + guarded.
+        Self::add_column_if_missing(&conn, "documents", "exported_hash", "TEXT")?;
         // NOTES feature — separate the Notes folder tree from the Meetings tree. `kind` defaults
         // 'meeting' so every existing folder + all meeting behavior stays byte-identical; note
         // folders are created with kind='note'. Lock/seal/CK machinery is folder-id-keyed and
@@ -5820,6 +5835,33 @@ impl Db {
         Ok(())
     }
 
+    /// The export-collision-guard baseline for an AUTHORED note (`documents(kind='note')`): the
+    /// SHA-256 (lowercase hex) of the text Murmur last wrote to its exported vault `.md`. `None`
+    /// for a legacy/never-exported row (grandfathered). Twin of [`Db::get_note_exported_hash`].
+    pub fn get_note_doc_exported_hash(&self, id: &str) -> Result<Option<String>> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT exported_hash FROM documents WHERE id = ?1 AND kind = 'note'",
+            rusqlite::params![id],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map_err(map_err)
+        .map(Option::flatten)
+    }
+
+    /// Persist (or clear with `None`) an authored NOTE's export-collision-guard baseline —
+    /// refreshed on every vault (re)export. Twin of [`Db::set_note_exported_hash`].
+    pub fn set_note_doc_exported_hash(&self, id: &str, hash: Option<&str>) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE documents SET exported_hash = ?2 WHERE id = ?1 AND kind = 'note'",
+            rusqlite::params![id, hash],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
     /// The vault `.md` paths of every authored NOTE in a folder that has one (`exported_path`
     /// non-NULL). Captured BEFORE seal so `lock_folder` can delete the on-disk `.md` (mirrors the
     /// meeting-notes `.md` deletion). No text — just paths (never PII-in-a-log; the caller doesn't
@@ -6556,6 +6598,46 @@ impl Db {
             "UPDATE notes SET exported_path = ?3
              WHERE meeting_id = ?1 AND provider_id = ?2",
             rusqlite::params![meeting_id, provider_id, path],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// The export-collision-guard baseline for a MEETING note: the SHA-256 (lowercase hex) of the
+    /// markdown Murmur last wrote to this row's exported vault `.md`. `None` for a legacy row
+    /// exported before the guard shipped (grandfathered — no sibling is preserved until the next
+    /// Murmur write stamps a baseline) or when the row is unknown.
+    pub fn get_note_exported_hash(
+        &self,
+        meeting_id: &str,
+        provider_id: &str,
+    ) -> Result<Option<String>> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT exported_hash FROM notes WHERE meeting_id = ?1 AND provider_id = ?2",
+            rusqlite::params![meeting_id, provider_id],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map_err(map_err)
+        .map(Option::flatten)
+    }
+
+    /// Persist (or clear with `None`) a MEETING note's export-collision-guard baseline. Set after
+    /// EVERY write Murmur makes to the exported `.md` (full overwrites AND appends), computed from
+    /// the exact content written — a stale baseline causes false "external edit" siblings on the
+    /// next overwrite.
+    pub fn set_note_exported_hash(
+        &self,
+        meeting_id: &str,
+        provider_id: &str,
+        hash: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE notes SET exported_hash = ?3
+             WHERE meeting_id = ?1 AND provider_id = ?2",
+            rusqlite::params![meeting_id, provider_id, hash],
         )
         .map_err(map_err)?;
         Ok(())
@@ -12000,6 +12082,88 @@ mod tests {
             has_schemas(&db),
             "note_folder_schemas table missing after a second migrate (idempotency broken)"
         );
+
+        // Export-collision guard: the additive `exported_hash` column must exist on BOTH exporting
+        // tables after migrate and still be there (idempotently) after the re-migrates above —
+        // `add_column_if_missing` never duplicates or drops.
+        let has_column = |db: &Db, table: &str| -> bool {
+            db.lock()
+                .prepare(&format!("PRAGMA table_info({table})"))
+                .unwrap()
+                .query_map([], |r| r.get::<_, String>(1))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .any(|c| c == "exported_hash")
+        };
+        assert!(has_column(&db, "notes"), "notes.exported_hash missing");
+        assert!(
+            has_column(&db, "documents"),
+            "documents.exported_hash missing"
+        );
+    }
+
+    /// Export-collision guard: the `exported_hash` helpers round-trip on both exporting tables,
+    /// and a legacy row (exported before the guard) reads back `None` (grandfathered).
+    #[test]
+    fn exported_hash_round_trips_and_legacy_rows_read_none() {
+        let db = mem_db();
+
+        // MEETING note (`notes` table).
+        db.insert_meeting(&sample_meeting("m1", "2026-07-16T09:00:00Z"))
+            .unwrap();
+        db.upsert_note(&NoteRecord {
+            meeting_id: "m1".to_string(),
+            provider_id: "claude_code".to_string(),
+            markdown: "# hello".to_string(),
+            created_at: "2026-07-16T09:05:00Z".to_string(),
+            exported_path: Some("/tmp/x.md".to_string()),
+            model_requested: None,
+            model_served: None,
+            gateway_host: None,
+        })
+        .unwrap();
+        // Legacy shape: exported but never hashed → None.
+        assert_eq!(db.get_note_exported_hash("m1", "claude_code").unwrap(), None);
+        db.set_note_exported_hash("m1", "claude_code", Some("abc123")).unwrap();
+        assert_eq!(
+            db.get_note_exported_hash("m1", "claude_code").unwrap(),
+            Some("abc123".to_string())
+        );
+        // A row-preserving upsert (same PK) must NOT wipe the baseline (the hash column is owned
+        // by the export writes, not the note upsert).
+        db.upsert_note(&NoteRecord {
+            meeting_id: "m1".to_string(),
+            provider_id: "claude_code".to_string(),
+            markdown: "# hello v2".to_string(),
+            created_at: "2026-07-16T09:06:00Z".to_string(),
+            exported_path: Some("/tmp/x.md".to_string()),
+            model_requested: None,
+            model_served: None,
+            gateway_host: None,
+        })
+        .unwrap();
+        assert_eq!(
+            db.get_note_exported_hash("m1", "claude_code").unwrap(),
+            Some("abc123".to_string()),
+            "upsert_note leaves the guard baseline in place"
+        );
+        db.set_note_exported_hash("m1", "claude_code", None).unwrap();
+        assert_eq!(db.get_note_exported_hash("m1", "claude_code").unwrap(), None);
+        // Unknown row → None, never an error.
+        assert_eq!(db.get_note_exported_hash("nope", "x").unwrap(), None);
+
+        // AUTHORED note (`documents(kind='note')`).
+        let folder_id = db.ensure_default_note_folder().unwrap();
+        db.insert_note("n1", &folder_id, "n1", "T", "body", 1).unwrap();
+        assert_eq!(db.get_note_doc_exported_hash("n1").unwrap(), None);
+        db.set_note_doc_exported_hash("n1", Some("def456")).unwrap();
+        assert_eq!(
+            db.get_note_doc_exported_hash("n1").unwrap(),
+            Some("def456".to_string())
+        );
+        db.set_note_doc_exported_hash("n1", None).unwrap();
+        assert_eq!(db.get_note_doc_exported_hash("n1").unwrap(), None);
+        assert_eq!(db.get_note_doc_exported_hash("nope").unwrap(), None);
     }
 
     /// 2026-07-13 perf audit: `meetings.started_at` (every list/search sorts on it) and
