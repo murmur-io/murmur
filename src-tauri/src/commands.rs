@@ -11796,13 +11796,13 @@ fn move_note_inner_impl(
 
     // Best-effort FS move only when a plaintext .md exists (target is open here).
     if let Some(src_path) = exported {
-        if let Some(vault) = vault_path(&state) {
+        if let Some(vault) = vault_path(state) {
             let target_rel = match folder_id.as_deref() {
                 Some(fid) => state.db.folder_by_id(fid)?.map(|f| f.path),
                 None => None,
             };
             move_note_file(
-                &state,
+                state,
                 &meeting_id,
                 &src_path,
                 &vault,
@@ -24622,6 +24622,7 @@ mod lifecycle_tests {
     // ── Vault Audit — accept/dismiss/list (command layer) ─────────────────────
 
     /// Stage one pending audit finding directly (the pass is tested in `crate::audit`).
+    #[allow(clippy::too_many_arguments)]
     fn stage_audit_finding(
         state: &AppState,
         kind: &str,
