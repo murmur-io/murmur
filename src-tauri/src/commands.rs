@@ -1639,6 +1639,36 @@ pub(crate) fn refresh_meeting_note_exported_hash(
     Ok(())
 }
 
+/// The AUTHORED-NOTE twin of [`refresh_meeting_note_exported_hash`] — the same conditional
+/// (anti-laundering) append-side baseline rule, against `documents.exported_hash`: re-stamp from
+/// the final written content ONLY when the pre-append bytes still matched the stored baseline
+/// (or the row is legacy/NULL — grandfathered). A mismatch keeps the stale baseline so the next
+/// full overwrite preserves (external edit + appended stamp) as a sibling.
+pub(crate) fn refresh_note_doc_exported_hash(
+    state: &AppState,
+    note_id: &str,
+    pre_append: &str,
+    written: &str,
+) -> Result<(), AppError> {
+    let baseline = state.db.get_note_doc_exported_hash(note_id)?;
+    if let Some(b) = &baseline {
+        if *b != crate::export::note_content_hash(pre_append) {
+            // External edit present BEFORE the append — keep the stale baseline. Ids only.
+            tracing::info!(
+                target: "export",
+                note_id = %note_id,
+                baseline_kept_stale = true,
+                "append over an externally-edited note — baseline deliberately not re-stamped"
+            );
+            return Ok(());
+        }
+    }
+    state
+        .db
+        .set_note_doc_exported_hash(note_id, Some(&crate::export::note_content_hash(written)))?;
+    Ok(())
+}
+
 /// Inner of [`update_note`] taking `&AppState` — the FULL command body (gate + lifecycle guard +
 /// seal-on-write upsert + vault re-write), so the seal-on-write regression binds the COMMAND
 /// surface, not just the `upsert_note_reseal_if_locked` helper (residual W6).
@@ -2446,6 +2476,8 @@ pub async fn delete_document(
     if was_note {
         crate::events::emit_content_deleted(&app, "note", &id);
     }
+    // The delete purged its audit findings (id-matched) — ping the FE inbox (count-only).
+    emit_audit_updated_after_purge(&app, state.inner());
     Ok(())
 }
 
@@ -2908,11 +2940,16 @@ pub(crate) fn save_note_text_inner(
 /// folder path (the old vault file is removed by the export path's move). Idempotent.
 #[tauri::command]
 pub fn move_note_doc(
+    app: AppHandle,
     state: State<'_, AppState>,
     id: String,
     folder_id: String,
 ) -> Result<(), AppError> {
-    move_note_doc_inner(state.inner(), &id, &folder_id)
+    move_note_doc_inner(state.inner(), &id, &folder_id)?;
+    // A move INTO a locked folder seals + purges ALL pending audit findings; an open-target move
+    // purges nothing — the count-only ping is correct (and cheap) either way.
+    emit_audit_updated_after_purge(&app, state.inner());
+    Ok(())
 }
 
 /// Inner of [`move_note_doc`] taking `&AppState` (unit-testable gate).
@@ -2980,6 +3017,10 @@ pub(crate) fn move_note_doc_inner(
         state
             .db
             .move_note_row_sealed(id, folder_id, &title, &row.text, &blob, updated_at)?;
+        // Vault Audit LOCK-SAFETY: a move-into-locked is a SEAL — purge ALL pending findings
+        // (the rollup posture; this note's title may be cited in third-party evidence no id can
+        // match). The other seal paths purge inside their chunk-purge txs; this path has none.
+        state.db.purge_all_pending_audit_findings()?;
     } else {
         remove_note_export_before_move(row.exported_path.as_deref())?;
         state.db.set_note_doc_folder(id, folder_id)?;
@@ -3029,6 +3070,8 @@ pub async fn delete_note(
 ) -> Result<(), AppError> {
     delete_note_inner(state.inner(), &id).await?;
     crate::events::emit_content_deleted(&app, "note", &id);
+    // The delete purged its audit findings (id-matched) — ping the FE inbox (count-only).
+    emit_audit_updated_after_purge(&app, state.inner());
     Ok(())
 }
 
@@ -4654,6 +4697,8 @@ pub async fn delete_meeting(
 ) -> Result<(), AppError> {
     delete_meeting_inner(state.inner(), &meeting_id).await?;
     crate::events::emit_content_deleted(&app, "meeting", &meeting_id);
+    // The delete purged its audit findings (id-matched) — ping the FE inbox (count-only).
+    emit_audit_updated_after_purge(&app, state.inner());
     Ok(())
 }
 
@@ -5931,6 +5976,11 @@ pub(crate) fn apply_supersessions_inner(
     state: &AppState,
     ids: &[String],
 ) -> Result<ApplyResult, AppError> {
+    // Seal-vs-write TOCTOU (Phase-0 lock-review follow-up): hold the lifecycle guard across the
+    // per-row re-gate + `.md` writes, so a concurrent lock/relock cannot land between
+    // `source_is_stampable` and the append (the same guard `update_note_inner` and every other
+    // vault-writing command already holds).
+    let _lifecycle = lifecycle_guard(state);
     let mut applied = 0usize;
     let mut skipped_sealed = 0usize;
     let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
@@ -6100,6 +6150,10 @@ pub fn undo_supersessions(state: State<'_, AppState>, ids: Vec<String>) -> Resul
 }
 
 pub(crate) fn undo_supersessions_inner(state: &AppState, ids: &[String]) -> Result<(), AppError> {
+    // Seal-vs-write TOCTOU (Phase-0 lock-review follow-up): same guard as
+    // `apply_supersessions_inner` — the folder-open checks below and the restore writes must not
+    // interleave with a concurrent lock/relock.
+    let _lifecycle = lifecycle_guard(state);
     let undo_set: std::collections::HashSet<&str> = ids.iter().map(String::as_str).collect();
 
     // Collect the DISTINCT affected note files touched by the UNDO SET (`path -> (meeting_id,
@@ -6190,12 +6244,18 @@ pub(crate) fn undo_supersessions_inner(state: &AppState, ids: &[String]) -> Resu
         }
         // Export-collision guard: the undo rebuild is a FULL overwrite from the stored pre-image
         // (+ survivor replays), so an external edit made since apply is preserved as a sibling
-        // first, and the baseline re-stamped from the rebuilt content.
-        if let Some(latest) = state.db.get_latest_note_for_meeting(meeting_id)? {
-            overwrite_exported_note_guarded(state, meeting_id, &latest.provider_id, path, &text)?;
-        } else {
-            crate::export::obsidian::overwrite_note(std::path::Path::new(path), &text)?;
-        }
+        // first, and the baseline re-stamped from the rebuilt content. The no-note-row branch is
+        // dead-defensive (`affected` is only ever keyed via `note_file_for`, which requires a
+        // note row) — it still routes through the ONE guarded overwrite (Phase-0 follow-up): a
+        // missing row reads a NULL baseline (grandfathered, no sibling) and its hash re-stamp
+        // updates zero rows, so behavior is identical while the invariant "every full overwrite
+        // of an exported note goes through the guard" holds structurally.
+        let provider_id = state
+            .db
+            .get_latest_note_for_meeting(meeting_id)?
+            .map(|n| n.provider_id)
+            .unwrap_or_default();
+        overwrite_exported_note_guarded(state, meeting_id, &provider_id, path, &text)?;
     }
 
     // Clear the applied state on the undone rows ONLY (pre-images dropped); survivors stay applied.
@@ -6219,6 +6279,421 @@ fn superseding_link_stem(
         return Ok(None);
     }
     Ok(note_file_for(state, &s.superseding_meeting_id)?.map(|(_, stem)| stem))
+}
+
+// ── Vault Audit v1 — deterministic vault-health inbox (see `crate::audit`) ──────────────────────
+
+/// Run ONE deterministic audit pass over the visible corpus (EMPTY unlock set — the background-job
+/// discipline; see the `crate::audit` module doc) on a blocking worker, then ping the FE inbox.
+/// Zero egress, zero LLM.
+#[tauri::command]
+pub async fn run_vault_audit(
+    app: AppHandle,
+) -> Result<crate::audit::AuditRunSummary, AppError> {
+    let handle = app.clone();
+    let summary = tokio::task::spawn_blocking(move || {
+        let state = handle.state::<AppState>();
+        let vault = vault_path(&state);
+        crate::audit::run_audit_pass(
+            &state.db,
+            vault.as_deref().map(std::path::Path::new),
+            chrono::Utc::now().timestamp_millis(),
+            &state.seal_epoch,
+        )
+    })
+    .await
+    .map_err(|e| AppError::Other(anyhow::anyhow!("audit task join failed: {e}")))??;
+    crate::events::emit_audit_updated(&app, summary.findings_total_pending as u32);
+    Ok(summary)
+}
+
+/// List findings by status (default `pending`). DEFENSIVELY re-filters each row's SOURCE
+/// visibility against the LIVE session unlock set before returning — belt-and-braces on top of
+/// purge-on-seal (which already drops pending rows, by source AND target id, inside every seal
+/// tx), so a finding whose folder sealed between pass and list can never surface.
+#[tauri::command]
+pub fn list_audit_findings(
+    state: State<'_, AppState>,
+    status: Option<String>,
+) -> Result<Vec<crate::audit::AuditFinding>, AppError> {
+    list_audit_findings_inner(state.inner(), status.as_deref())
+}
+
+pub(crate) fn list_audit_findings_inner(
+    state: &AppState,
+    status: Option<&str>,
+) -> Result<Vec<crate::audit::AuditFinding>, AppError> {
+    let status = status.unwrap_or("pending");
+    if !matches!(status, "pending" | "accepted" | "dismissed") {
+        return Err(AppError::InvalidArg(
+            "status must be pending, accepted or dismissed".into(),
+        ));
+    }
+    let unlocked = unlocked_snapshot(state)?;
+    let rows = state.db.list_audit_finding_rows(status)?;
+    let mut out = Vec::new();
+    for r in rows {
+        let visible = match r.source_kind.as_str() {
+            "meeting" => state.db.meeting_is_visible(&r.source_id, &unlocked)?,
+            _ => state.db.note_is_visible(&r.source_id, &unlocked)?,
+        };
+        if !visible {
+            continue; // sealed since the pass — hide, never mask.
+        }
+        // TARGET side too (lock review, defense in depth): a pending row's title/evidence
+        // reference its target, so a target whose folder sealed between pass and list must hide
+        // the row — `target_kind` picks the right table (`meeting_is_visible` treats an unknown
+        // id as visible, so an untyped check would fail open for note targets).
+        if let (Some(tid), Some(tkind)) = (&r.target_id, &r.target_kind) {
+            let target_visible = match tkind.as_str() {
+                "meeting" => state.db.meeting_is_visible(tid, &unlocked)?,
+                _ => state.db.note_is_visible(tid, &unlocked)?,
+            };
+            if !target_visible {
+                continue;
+            }
+        }
+        out.push(r.into_dto());
+    }
+    Ok(out)
+}
+
+/// Resolve one PENDING finding: `"accept"` applies its append-only vault action (re-gated at
+/// apply time), `"dismiss"` just flips the status. BOTH paths blank `evidence_md` +
+/// `accept_action` — only pending rows ever hold derived plaintext. Returns the updated finding.
+#[tauri::command]
+pub fn resolve_audit_finding(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+    action: String,
+) -> Result<crate::audit::AuditFinding, AppError> {
+    let out = resolve_audit_finding_inner(state.inner(), &id, &action)?;
+    let pending = state.db.count_pending_audit_findings().unwrap_or(0);
+    crate::events::emit_audit_updated(&app, pending as u32);
+    Ok(out)
+}
+
+pub(crate) fn resolve_audit_finding_inner(
+    state: &AppState,
+    id: &str,
+    action: &str,
+) -> Result<crate::audit::AuditFinding, AppError> {
+    // Seal-vs-write TOCTOU: hold the lifecycle guard across the re-gate + the vault append, so a
+    // concurrent lock/relock cannot land between the check and the write (the same discipline as
+    // `update_note_inner` / `apply_supersessions_inner`).
+    let _lifecycle = lifecycle_guard(state);
+    let row = state
+        .db
+        .get_audit_finding(id)?
+        .ok_or_else(|| AppError::InvalidArg(format!("no audit finding {id}")))?;
+    if row.status != "pending" {
+        return Err(AppError::InvalidArg("this finding was already handled".into()));
+    }
+    let status = match action {
+        "dismiss" => "dismissed",
+        "accept" => {
+            if row.accept_action.is_empty() {
+                return Err(AppError::InvalidArg(
+                    "this finding is dismiss-only — it has no accept action".into(),
+                ));
+            }
+            apply_audit_accept(state, &row)?;
+            "accepted"
+        }
+        _ => {
+            return Err(AppError::InvalidArg(
+                "action must be \"accept\" or \"dismiss\"".into(),
+            ))
+        }
+    };
+    state
+        .db
+        .resolve_audit_finding_row(id, status, chrono::Utc::now().timestamp_millis())?;
+    let updated = state
+        .db
+        .get_audit_finding(id)?
+        .ok_or_else(|| AppError::Storage("finding vanished during resolve".into()))?;
+    tracing::info!(target: "audit", finding_id = %id, kind = %updated.kind, status = %status, "audit finding resolved");
+    Ok(updated.into_dto())
+}
+
+/// APPLY one finding's accept action: an APPEND-ONLY stamp under `## Audit` in the source's
+/// exported `.md` (both sources for a contradiction). Every path RE-GATES at apply time
+/// (the prune↔seal TOCTOU discipline — a source sealed since the pass refuses with
+/// `AppError::Locked`, never stamps), and every appended `[[link]]` is re-resolved against the
+/// LIVE vault/session first (the `list_vault_titles` anti-hallucination rule).
+fn apply_audit_accept(
+    state: &AppState,
+    row: &crate::audit::AuditFindingRow,
+) -> Result<(), AppError> {
+    let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    match row.kind.as_str() {
+        "broken_link" => {
+            let target = row.target_title.as_deref().unwrap_or("").trim().to_string();
+            if target.is_empty() {
+                return Err(AppError::InvalidArg("this finding has no link target".into()));
+            }
+            // LIVE re-resolve (lock review): the target may have been created since the pass —
+            // the stamp would then assert a falsehood. REFUSE, loss-safe: nothing is written and
+            // the row stays pending with its evidence, so the user dismisses or re-runs the
+            // audit (chosen over auto-dismiss so no status flips without an explicit choice).
+            if broken_link_target_resolves(state, &target)? {
+                return Err(AppError::InvalidArg(
+                    "the link target now resolves — dismiss this finding or re-run the audit"
+                        .into(),
+                ));
+            }
+            // The [[..]] rides in a CODE SPAN so the stamp itself never becomes another
+            // (broken) wikilink — the one deliberate exception to "appended links resolve".
+            // Worded as an observation at audit time, not a standing claim.
+            let body = format!("> `[[{target}]]` — link target was not found at audit time");
+            stamp_audit_source(state, row, |md| {
+                crate::export::obsidian::append_audit_callout(md, &date, "broken-link", &body)
+            })
+        }
+        "stale" => {
+            // Counts recomputed LIVE through the gated reader (they may have moved since the
+            // pass); the callout carries counts only — never superseding titles (leak-safe even
+            // if a superseding source sealed since the pass).
+            let unlocked = unlocked_snapshot(state)?;
+            let facts = state
+                .db
+                .fact_rows_for_meeting_visible(&row.source_id, &unlocked)?;
+            let total = facts.len();
+            let closed = facts.iter().filter(|f| f.valid_to.is_some()).count();
+            let body = format!(
+                "> {closed} of {total} facts recorded in this note have since been superseded by later meetings"
+            );
+            stamp_audit_source(state, row, |md| {
+                crate::export::obsidian::append_audit_callout(md, &date, "stale", &body)
+            })
+        }
+        "contradiction" => {
+            let other_id = row
+                .target_id
+                .as_deref()
+                .ok_or_else(|| AppError::InvalidArg("this finding has no counterpart".into()))?;
+            // Re-gate BOTH sides BEFORE stamping either (never stamp into, or reference, a
+            // sealed note — and never leave a half-stamped pair).
+            let source_path = audit_source_file(state, &row.source_kind, &row.source_id)?;
+            let other_path = audit_source_file(state, "meeting", other_id)?;
+            let source_stem = file_stem_of(&source_path);
+            let other_stem = file_stem_of(&other_path);
+            append_to_audit_source(state, &row.source_kind, &row.source_id, &source_path, |md| {
+                crate::export::obsidian::append_audit_callout(
+                    md,
+                    &date,
+                    "conflict",
+                    &format!("> conflicting facts recorded here and in [[{other_stem}]] — review which is current"),
+                )
+            })?;
+            append_to_audit_source(state, "meeting", other_id, &other_path, |md| {
+                crate::export::obsidian::append_audit_callout(
+                    md,
+                    &date,
+                    "conflict",
+                    &format!("> conflicting facts recorded here and in [[{source_stem}]] — review which is current"),
+                )
+            })
+        }
+        "unlinked_mention" => {
+            let target = row.target_title.as_deref().unwrap_or("").trim().to_string();
+            if target.is_empty() {
+                return Err(AppError::InvalidArg("this finding has no link target".into()));
+            }
+            if !audit_link_target_ok(state, &target)? {
+                return Err(AppError::InvalidArg(
+                    "the suggested link target no longer exists — dismiss this finding instead".into(),
+                ));
+            }
+            let line = format!("- Suggested link: [[{target}]]");
+            stamp_audit_source(state, row, |md| {
+                crate::export::obsidian::append_audit_line(md, &line)
+            })
+        }
+        "orphan" => {
+            // The suggestions live as [[links]] inside the (still-pending) evidence — re-extract
+            // and RE-RESOLVE each against the live vault/session; only survivors are appended.
+            let mut suggestions = Vec::new();
+            for t in crate::storage::db::extract_wikilink_titles(&row.evidence_md) {
+                if audit_link_target_ok(state, &t)? {
+                    suggestions.push(format!("[[{t}]]"));
+                }
+            }
+            if suggestions.is_empty() {
+                return Err(AppError::InvalidArg(
+                    "no suggested link still resolves — dismiss this finding instead".into(),
+                ));
+            }
+            let line = format!("- Suggested links: {}", suggestions.join(" · "));
+            stamp_audit_source(state, row, |md| {
+                crate::export::obsidian::append_audit_line(md, &line)
+            })
+        }
+        _ => Err(AppError::InvalidArg(format!(
+            "unknown finding kind {}",
+            row.kind
+        ))),
+    }
+}
+
+/// Resolve + stamp a finding's (single) source in one step.
+fn stamp_audit_source(
+    state: &AppState,
+    row: &crate::audit::AuditFindingRow,
+    stamp: impl Fn(&str) -> String,
+) -> Result<(), AppError> {
+    let path = audit_source_file(state, &row.source_kind, &row.source_id)?;
+    append_to_audit_source(state, &row.source_kind, &row.source_id, &path, stamp)
+}
+
+/// Read-modify-write APPEND of one audit stamp: read the CURRENT file, apply the (idempotent)
+/// append, write only on change, then refresh the export-collision baseline with the Phase-0
+/// CONDITIONAL rule — meetings via [`refresh_meeting_note_exported_hash`], authored notes via
+/// [`refresh_note_doc_exported_hash`] (an externally-edited file keeps its stale baseline, so the
+/// next full overwrite preserves edit + stamp as a sibling instead of laundering the edit away).
+fn append_to_audit_source(
+    state: &AppState,
+    source_kind: &str,
+    source_id: &str,
+    path: &str,
+    stamp: impl Fn(&str) -> String,
+) -> Result<(), AppError> {
+    let current = std::fs::read_to_string(path)
+        .map_err(|e| AppError::Export(format!("read note before audit stamp failed: {e}")))?;
+    let written = stamp(&current);
+    if written == current {
+        return Ok(()); // already stamped — idempotent no-op.
+    }
+    crate::export::obsidian::overwrite_note(std::path::Path::new(path), &written)?;
+    match source_kind {
+        "meeting" => refresh_meeting_note_exported_hash(state, source_id, &current, &written),
+        _ => refresh_note_doc_exported_hash(state, source_id, &current, &written),
+    }
+}
+
+/// Re-gate + resolve a finding source's exported `.md` at APPLY time (the TOCTOU re-check —
+/// the Re-Truth `source_is_stampable` posture, extended to authored notes): a meeting source
+/// must be session-unlocked AND open-on-disk with an exported file; a note source's folder must
+/// be session-unlocked AND open-on-disk (a sealed note's `.md` was deleted on seal, and a write
+/// into a locked-on-disk folder would be dropped at relock). Refusals are `AppError::Locked`.
+fn audit_source_file(
+    state: &AppState,
+    source_kind: &str,
+    source_id: &str,
+) -> Result<String, AppError> {
+    match source_kind {
+        "meeting" => {
+            if !source_is_stampable(state, source_id)? {
+                return Err(AppError::Locked(
+                    "this note's folder is locked — unlock it to apply the audit action".into(),
+                ));
+            }
+            match note_file_for(state, source_id)? {
+                Some((path, _)) => Ok(path),
+                None => Err(AppError::InvalidArg(
+                    "this note has no exported vault file to stamp".into(),
+                )),
+            }
+        }
+        "note" => {
+            let row = state
+                .db
+                .get_note_row(source_id)?
+                .ok_or_else(|| AppError::InvalidArg(format!("no note {source_id}")))?;
+            let locked_on_disk = state
+                .db
+                .folder_by_id(&row.folder_id)?
+                .map(|f| f.locked)
+                .unwrap_or(true);
+            if locked_on_disk || !folder_is_unlocked(state, &row.folder_id)? {
+                return Err(AppError::Locked(
+                    "this note's folder is locked — unlock it to apply the audit action".into(),
+                ));
+            }
+            match row.exported_path {
+                Some(p) if !p.trim().is_empty() => Ok(p),
+                _ => Err(AppError::InvalidArg(
+                    "this note has no exported vault file to stamp".into(),
+                )),
+            }
+        }
+        other => Err(AppError::InvalidArg(format!(
+            "unknown finding source kind {other}"
+        ))),
+    }
+}
+
+/// The anti-hallucination re-check for an appended `[[link]]`: the title must resolve NOW —
+/// through the GATED `resolve_wikilink` (notes/meetings/org, live session set) to a target whose
+/// folder is also open ON DISK (a link into a merely session-unlocked folder would break at
+/// relock — the `superseding_link_stem` bar), or be an existing vault file stem.
+fn audit_link_target_ok(state: &AppState, title: &str) -> Result<bool, AppError> {
+    let unlocked = unlocked_snapshot(state)?;
+    match state.db.resolve_wikilink(title, &unlocked)? {
+        Some(t) if t.kind == "meeting" => Ok(!folder_locked_on_disk(state, &t.id)?),
+        Some(t) if t.kind == "note" => {
+            let Some(row) = state.db.get_note_row(&t.id)? else {
+                return Ok(false);
+            };
+            Ok(state
+                .db
+                .folder_by_id(&row.folder_id)?
+                .map(|f| !f.locked)
+                .unwrap_or(false))
+        }
+        Some(_) => Ok(true), // org item — deliberately-disclosed, outside the folder-lock domain.
+        None => {
+            // Not a note/meeting/org — an existing user-authored vault file still resolves.
+            let Some(vault) = vault_path(state) else {
+                return Ok(false);
+            };
+            Ok(
+                crate::export::obsidian::list_vault_titles(std::path::Path::new(&vault))?
+                    .iter()
+                    .any(|t| t == title),
+            )
+        }
+    }
+}
+
+/// Ping the FE audit inbox after a purge-bearing lock/relock/delete/discard/move-into-locked
+/// mutation (count-only payload, adversarial B): pending findings vanish reactively instead of
+/// on the next manual refetch. Mirrors the screen-share relock's emit posture — best-effort by
+/// construction (`emit_audit_updated` swallows failures).
+fn emit_audit_updated_after_purge(app: &AppHandle, state: &AppState) {
+    let pending = state.db.count_pending_audit_findings().unwrap_or(0);
+    crate::events::emit_audit_updated(app, pending as u32);
+}
+
+/// Does a wikilink title resolve AT ALL right now — the gated `resolve_wikilink` (live session
+/// set) OR an existing vault file stem: the SAME union the pass's broken-link resolver uses, so
+/// accept and pass agree on "broken". Distinct from [`audit_link_target_ok`] (which adds the
+/// open-on-disk bar for APPENDING a link — here we only ask whether the "broken" claim is still
+/// true; a sealed-not-unlocked target stays "not found", consistent with the gate posture).
+fn broken_link_target_resolves(state: &AppState, title: &str) -> Result<bool, AppError> {
+    let unlocked = unlocked_snapshot(state)?;
+    if state.db.resolve_wikilink(title, &unlocked)?.is_some() {
+        return Ok(true);
+    }
+    let Some(vault) = vault_path(state) else {
+        return Ok(false);
+    };
+    Ok(
+        crate::export::obsidian::list_vault_titles(std::path::Path::new(&vault))?
+            .iter()
+            .any(|t| t == title),
+    )
+}
+
+/// A path's file stem (the wikilink target Obsidian resolves) — empty on a pathological path.
+fn file_stem_of(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_string()
 }
 
 /// Read the meeting's OWN @brain THREAD TURNS for user-fact extraction (design spec D5), GATED by the
@@ -11066,7 +11541,31 @@ fn ensure_meeting_folder_target(
 ///   with, so we refuse rather than leave plaintext in a locked folder. The FE must unlock first.
 #[tauri::command]
 pub fn move_note(
+    app: AppHandle,
     state: State<'_, AppState>,
+    meeting_id: String,
+    folder_id: Option<String>,
+) -> Result<(), AppError> {
+    move_note_command_body(&app, state, meeting_id, folder_id)
+}
+
+/// Body of [`move_note`], split so the audit-inbox ping fires once after EVERY successful move
+/// (a move INTO a locked folder seals + purges ALL pending findings via
+/// `purge_chunks_for_meetings`; an open-target move purges nothing — the count-only ping is
+/// correct either way).
+fn move_note_command_body(
+    app: &AppHandle,
+    state: State<'_, AppState>,
+    meeting_id: String,
+    folder_id: Option<String>,
+) -> Result<(), AppError> {
+    move_note_inner_impl(&state, meeting_id, folder_id)?;
+    emit_audit_updated_after_purge(app, state.inner());
+    Ok(())
+}
+
+fn move_note_inner_impl(
+    state: &State<'_, AppState>,
     meeting_id: String,
     folder_id: Option<String>,
 ) -> Result<(), AppError> {
@@ -11412,8 +11911,15 @@ fn move_note_file(
 /// DB write but before the `.md` delete leaves a stale plaintext `.md` (reconcilable) — never
 /// lost content.
 #[tauri::command]
-pub fn lock_folder(state: State<'_, AppState>, folder_id: String) -> Result<(), AppError> {
-    lock_folder_inner(state.inner(), folder_id)
+pub fn lock_folder(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    folder_id: String,
+) -> Result<(), AppError> {
+    lock_folder_inner(state.inner(), folder_id)?;
+    // The seal purged ALL pending audit findings — ping the FE inbox (count-only).
+    emit_audit_updated_after_purge(&app, state.inner());
+    Ok(())
 }
 
 /// BLK-1: acquire the coarse [`AppState::lifecycle`] guard so a folder-lock state-machine op never
@@ -11564,6 +12070,16 @@ pub(crate) fn lock_folder_inner(state: &AppState, folder_id: String) -> Result<(
     // sibling — privacy wins over preservation. A plaintext sibling of a to-be-sealed note would
     // be exactly the leak the lock exists to prevent. External edits to a locked note's `.md`
     // are accepted-loss by design; the DB blob remains the canonical recoverable copy.
+    // Phase-0 follow-up: siblings ALREADY preserved by an earlier overwrite are user-authored
+    // files we never delete — but they are plaintext that survives this seal on disk, so WARN
+    // (counts only) so the exposure is at least visible in the log.
+    let doc_export_rows = state.db.note_exported_path_rows_in_folder(&folder_id)?;
+    warn_external_edit_siblings(
+        "lock",
+        exported_paths
+            .iter()
+            .chain(doc_export_rows.iter().map(|(_, p)| p)),
+    );
     for p in exported_paths {
         let _ = std::fs::remove_file(&p);
     }
@@ -11577,7 +12093,7 @@ pub(crate) fn lock_folder_inner(state: &AppState, folder_id: String) -> Result<(
     // the next relock/startup pass retries the file (the pre-fix bulk clear forgot the leaked
     // `.md` forever). The lock itself still completes (the DB blob is the recoverable copy).
     // Count-only log — never paths (they embed note titles).
-    for (doc_id, p) in state.db.note_exported_path_rows_in_folder(&folder_id)? {
+    for (doc_id, p) in doc_export_rows {
         let removed = match std::fs::remove_file(&p) {
             Ok(()) => true,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
@@ -11599,6 +12115,41 @@ pub(crate) fn lock_folder_inner(state: &AppState, folder_id: String) -> Result<(
     // the moment a folder seals (post clear-on-Stop it is normally already empty; idempotent).
     clear_stale_live_transcript(state);
     Ok(())
+}
+
+/// Phase-0 lock-review follow-up: count `<stem> (external edit …).md` siblings sitting next to
+/// the given exported `.md` paths and WARN (counts only — paths embed note titles). The seal /
+/// relock paths delete ONLY the canonical exports; an external-edit sibling is USER-AUTHORED
+/// content the collision guard preserved, so it is deliberately NEVER deleted — but it is
+/// plaintext that survives the seal on disk, and that exposure must at least be visible.
+fn warn_external_edit_siblings<'a>(stage: &str, paths: impl Iterator<Item = &'a String>) {
+    let mut siblings = 0usize;
+    for p in paths {
+        let path = std::path::Path::new(p);
+        let (Some(parent), Some(stem)) = (path.parent(), path.file_stem().and_then(|s| s.to_str()))
+        else {
+            continue;
+        };
+        let prefix = format!("{stem} (external edit ");
+        let Ok(entries) = std::fs::read_dir(parent) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            if let Some(name) = e.file_name().to_str() {
+                if name.starts_with(&prefix) && name.ends_with(".md") {
+                    siblings += 1;
+                }
+            }
+        }
+    }
+    if siblings > 0 {
+        tracing::warn!(
+            target: "lock",
+            stage,
+            siblings,
+            "external-edit sibling .md files remain next to sealed notes' exports — left in place (user-authored, never deleted by the seal), but they are plaintext outside the seal"
+        );
+    }
 }
 
 /// Lock-surface RAM hygiene: clear the live-transcript buffer ONLY when no recording is active —
@@ -11867,7 +12418,11 @@ pub async fn unlock_folder(
 /// markdown of its sealed notes and drop the folder from the unlock set. The `content_blob`
 /// stays — the folder is still `locked=1` on disk.
 #[tauri::command]
-pub fn relock_folder(state: State<'_, AppState>, folder_id: String) -> Result<(), AppError> {
+pub fn relock_folder(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    folder_id: String,
+) -> Result<(), AppError> {
     // BLK-1: serialize with the rest of the lock state machine (it re-blanks the same columns
     // `remove_lock` is mid-restoring).
     let _lifecycle = lifecycle_guard(state.inner());
@@ -11896,14 +12451,21 @@ pub fn relock_folder(state: State<'_, AppState>, folder_id: String) -> Result<()
     // Phase 0.5 — re-blank the transcript + timeline plaintext and drop the decrypted session WAV
     // (the .enc + the *_blob columns stay; the folder is still locked=1 on disk).
     reblank_folder_extras(state.inner(), &folder_id)?;
+    // The relock purged ALL pending audit findings — ping the FE inbox (count-only).
+    emit_audit_updated_after_purge(&app, state.inner());
     Ok(())
 }
 
 /// Relock ALL session-unlocked folders + zeroize the cached KEK (called on screen-share start in
 /// Stage E, and exposed as a command). Re-blanks the plaintext markdown of every sealed note.
 #[tauri::command]
-pub fn relock_all(state: State<'_, AppState>) -> Result<(), AppError> {
-    relock_all_inner(&state)
+pub fn relock_all(app: AppHandle, state: State<'_, AppState>) -> Result<(), AppError> {
+    relock_all_inner(&state)?;
+    // The relock-all purged ALL pending audit findings — ping the FE inbox (count-only). The
+    // off-thread `relock_all_inner` callers emit from their own handles (screen-share) or are
+    // app teardown (window-close/exit — nothing left to notify).
+    emit_audit_updated_after_purge(&app, state.inner());
+    Ok(())
 }
 
 /// Inner relock-all usable without a command boundary (Stage E screen-share watcher, window-close,
@@ -12216,10 +12778,14 @@ pub(crate) fn remove_lock_inner(state: &AppState, folder_id: String) -> Result<(
 /// (readable plaintext with a NULL blob) is PRESERVED (`Db::discard_folder_seal`).
 #[tauri::command]
 pub async fn discard_unrecoverable_folder_lock(
+    app: AppHandle,
     state: State<'_, AppState>,
     folder_id: String,
 ) -> Result<FolderNode, AppError> {
-    discard_unrecoverable_folder_lock_inner(state.inner(), folder_id).await
+    let node = discard_unrecoverable_folder_lock_inner(state.inner(), folder_id).await?;
+    // The discard purged ALL pending audit findings — ping the FE inbox (count-only).
+    emit_audit_updated_after_purge(&app, state.inner());
+    Ok(node)
 }
 
 pub(crate) async fn discard_unrecoverable_folder_lock_inner(
@@ -12810,6 +13376,7 @@ pub async fn unlock_meeting(
 /// folder is already open.
 #[tauri::command]
 pub async fn discard_unrecoverable_meeting_lock(
+    app: AppHandle,
     state: State<'_, AppState>,
     meeting_id: String,
 ) -> Result<Option<FolderNode>, AppError> {
@@ -12823,9 +13390,10 @@ pub async fn discard_unrecoverable_meeting_lock(
     if !folder.locked {
         return Ok(None);
     }
-    discard_unrecoverable_folder_lock_inner(state.inner(), folder_id)
-        .await
-        .map(Some)
+    let node = discard_unrecoverable_folder_lock_inner(state.inner(), folder_id).await?;
+    // The discard purged ALL pending audit findings — ping the FE inbox (count-only).
+    emit_audit_updated_after_purge(&app, state.inner());
+    Ok(Some(node))
 }
 
 // ── Phase 0.5 full per-folder lock: transcript + timeline + audio seal helpers ──
@@ -13480,7 +14048,11 @@ fn reblank_folder_extras(state: &AppState, folder_id: &str) -> Result<(), AppErr
     // the path is cleared ONLY after its `.md` was actually deleted (or is already absent) — a
     // FAILED delete keeps the path recorded so the next relock/startup pass retries (the pre-fix
     // bulk clear forgot the leaked `.md` forever). Count-only log — never paths (note titles).
-    for (doc_id, p) in state.db.note_exported_path_rows_in_folder(folder_id)? {
+    // Phase-0 follow-up: warn (counts only) when external-edit siblings sit next to these
+    // exports — the relock deletes only the canonical `.md`s, never a preserved sibling.
+    let relock_doc_rows = state.db.note_exported_path_rows_in_folder(folder_id)?;
+    warn_external_edit_siblings("relock", relock_doc_rows.iter().map(|(_, p)| p));
+    for (doc_id, p) in relock_doc_rows {
         let removed = match std::fs::remove_file(&p) {
             Ok(()) => true,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
@@ -23862,6 +24434,523 @@ mod lifecycle_tests {
             "canonical file carries the DB content"
         );
         let _ = std::fs::remove_dir_all(&vault);
+    }
+
+    // ── Vault Audit — accept/dismiss/list (command layer) ─────────────────────
+
+    /// Stage one pending audit finding directly (the pass is tested in `crate::audit`).
+    fn stage_audit_finding(
+        state: &AppState,
+        kind: &str,
+        source_kind: &str,
+        source_id: &str,
+        target_title: Option<&str>,
+        evidence: &str,
+        accept_action: &str,
+        key: &str,
+    ) -> String {
+        state
+            .db
+            .insert_audit_finding_if_new(
+                &crate::audit::NewAuditFinding {
+                    kind: kind.into(),
+                    source_kind: source_kind.into(),
+                    source_id: source_id.into(),
+                    source_title: "T".into(),
+                    target_title: target_title.map(str::to_string),
+                    target_id: None,
+                    target_kind: None,
+                    evidence_md: evidence.into(),
+                    accept_action: accept_action.into(),
+                    dedupe_key: key.into(),
+                },
+                "r-test",
+                1,
+            )
+            .unwrap();
+        state
+            .db
+            .list_audit_finding_rows("pending")
+            .unwrap()
+            .into_iter()
+            .find(|r| r.dedupe_key == key)
+            .unwrap()
+            .id
+    }
+
+    /// Stage a pending finding CARRYING a target id+kind (the list layer's target re-gate seam).
+    fn stage_audit_finding_with_target(
+        state: &AppState,
+        source_id: &str,
+        target_id: &str,
+        target_kind: &str,
+        key: &str,
+    ) -> String {
+        state
+            .db
+            .insert_audit_finding_if_new(
+                &crate::audit::NewAuditFinding {
+                    kind: "unlinked_mention".into(),
+                    source_kind: "meeting".into(),
+                    source_id: source_id.into(),
+                    source_title: "T".into(),
+                    target_title: Some("Sealed Target Title".into()),
+                    target_id: Some(target_id.into()),
+                    target_kind: Some(target_kind.into()),
+                    evidence_md: "> mentions Sealed Target Title".into(),
+                    accept_action: "Append the suggested [[link]] under ## Audit".into(),
+                    dedupe_key: key.into(),
+                },
+                "r-test",
+                1,
+            )
+            .unwrap();
+        state
+            .db
+            .list_audit_finding_rows("pending")
+            .unwrap()
+            .into_iter()
+            .find(|r| r.dedupe_key == key)
+            .unwrap()
+            .id
+    }
+
+    /// Accept appends the callout under `## Audit`, re-stamps the baseline (clean case), blanks
+    /// the evidence, and a SECOND identical accept is refused while a re-staged twin's accept is
+    /// an idempotent no-op on the file.
+    #[test]
+    fn audit_accept_appends_stamp_blanks_evidence_and_is_idempotent() {
+        let vault = tmp_vault("audit-accept");
+        let state = build_state_with_vault("audit-accept", &vault);
+        seed_meeting(&state.db, "m-a", "# Kickoff\n", None);
+        let md = vault.join("2026-07-01 0900 - Kickoff.md");
+        seed_exported_note(&state, "m-a", &md, "# Kickoff\n");
+
+        let id = stage_audit_finding(
+            &state,
+            "broken_link",
+            "meeting",
+            "m-a",
+            Some("Ghost Note"),
+            "> see [[Ghost Note]]",
+            "Append a [!broken-link] note under ## Audit",
+            "broken_link|m-a|Ghost Note",
+        );
+        let resolved = resolve_audit_finding_inner(&state, &id, "accept").unwrap();
+        assert_eq!(resolved.status, "accepted");
+        assert!(resolved.evidence_md.is_empty(), "accept blanks the evidence");
+        assert!(resolved.accept_action.is_empty());
+
+        let after = std::fs::read_to_string(&md).unwrap();
+        assert!(after.contains("## Audit"), "managed section created: {after}");
+        assert!(after.contains("[!broken-link]"), "callout appended: {after}");
+        assert!(after.contains("`[[Ghost Note]]`"), "target in a code span: {after}");
+        assert_eq!(
+            state.db.get_note_exported_hash("m-a", "claude_code").unwrap(),
+            Some(crate::export::note_content_hash(&after)),
+            "clean-case baseline re-stamped from the appended content"
+        );
+        assert!(external_edit_siblings(&vault).is_empty(), "append creates no sibling");
+
+        // Already handled → refused.
+        assert!(matches!(
+            resolve_audit_finding_inner(&state, &id, "accept"),
+            Err(AppError::InvalidArg(_))
+        ));
+        // An ACCEPTED twin may recur (dedupe allows it); accepting the recurrence is an
+        // idempotent no-op on the file (the callout body is the marker).
+        let id2 = stage_audit_finding(
+            &state,
+            "broken_link",
+            "meeting",
+            "m-a",
+            Some("Ghost Note"),
+            "> see [[Ghost Note]]",
+            "Append a [!broken-link] note under ## Audit",
+            "broken_link|m-a|Ghost Note",
+        );
+        resolve_audit_finding_inner(&state, &id2, "accept").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&md).unwrap(),
+            after,
+            "re-accepting the same finding never double-stamps"
+        );
+        let _ = std::fs::remove_dir_all(&vault);
+    }
+
+    /// The external-edit interplay (mirrors
+    /// `append_over_external_edit_keeps_stale_baseline_so_overwrite_preserves_sibling`): an
+    /// audit accept over an externally-edited file appends in place but must NOT launder the
+    /// baseline — the next DB-derived full overwrite preserves (edit + stamp) as a sibling.
+    #[test]
+    fn audit_accept_over_external_edit_keeps_stale_baseline() {
+        let vault = tmp_vault("audit-launder");
+        let state = build_state_with_vault("audit-launder", &vault);
+        seed_meeting(&state.db, "m-a", "# Kickoff\n", None);
+        let md = vault.join("2026-07-01 0900 - Kickoff.md");
+        seed_exported_note(&state, "m-a", &md, "# Kickoff\n");
+        // The user edits the exported file BEFORE the accept lands.
+        std::fs::write(&md, "# Kickoff\nMY EXTERNAL NOTE\n").unwrap();
+
+        let id = stage_audit_finding(
+            &state,
+            "broken_link",
+            "meeting",
+            "m-a",
+            Some("Ghost Note"),
+            "> see [[Ghost Note]]",
+            "Append a [!broken-link] note under ## Audit",
+            "broken_link|m-a|Ghost Note",
+        );
+        resolve_audit_finding_inner(&state, &id, "accept").unwrap();
+
+        let after = std::fs::read_to_string(&md).unwrap();
+        assert!(after.contains("MY EXTERNAL NOTE"), "edit preserved in place");
+        assert!(after.contains("[!broken-link]"), "stamp appended");
+        assert!(external_edit_siblings(&vault).is_empty(), "the append creates no sibling");
+        assert_eq!(
+            state.db.get_note_exported_hash("m-a", "claude_code").unwrap(),
+            Some(crate::export::note_content_hash("# Kickoff\n")),
+            "baseline NOT laundered over the externally-edited file"
+        );
+        // The next full overwrite preserves (edit + stamp) as a sibling.
+        update_note_inner(&state, "m-a", "# Kickoff rewritten\n").unwrap();
+        let siblings = external_edit_siblings(&vault);
+        assert_eq!(siblings.len(), 1, "external edit + stamp survive as a sibling");
+        let preserved = std::fs::read_to_string(&siblings[0]).unwrap();
+        assert!(preserved.contains("MY EXTERNAL NOTE") && preserved.contains("[!broken-link]"));
+        let _ = std::fs::remove_dir_all(&vault);
+    }
+
+    /// Dismiss blanks the evidence with NO vault write; accepting a finding whose source folder
+    /// sealed between pass and resolve is REFUSED with `Locked` (the row stays pending); the
+    /// list defensively hides a finding whose folder sealed between pass and list.
+    #[test]
+    fn audit_dismiss_locked_accept_and_list_regating() {
+        let vault = tmp_vault("audit-gate");
+        let state = build_state_with_vault("audit-gate", &vault);
+        make_open_folder(&state.db, "f1", "Secret");
+        seed_meeting(&state.db, "m-a", "# Kickoff\n", Some("f1"));
+        let md = vault.join("2026-07-01 0900 - Kickoff.md");
+        seed_exported_note(&state, "m-a", &md, "# Kickoff\n");
+
+        // Dismiss path: no vault write, evidence blanked.
+        let id_dismiss = stage_audit_finding(
+            &state,
+            "orphan",
+            "meeting",
+            "m-a",
+            None,
+            "This note has no wikilinks in or out.",
+            "",
+            "orphan|m-a|",
+        );
+        let before = std::fs::read_to_string(&md).unwrap();
+        let resolved = resolve_audit_finding_inner(&state, &id_dismiss, "dismiss").unwrap();
+        assert_eq!(resolved.status, "dismissed");
+        assert!(resolved.evidence_md.is_empty());
+        assert_eq!(std::fs::read_to_string(&md).unwrap(), before, "dismiss never writes");
+
+        // Accepting a dismiss-only finding is refused.
+        let id_dismiss_only = stage_audit_finding(
+            &state, "orphan", "meeting", "m-a", None, "no links", "", "orphan|m-a|2",
+        );
+        assert!(matches!(
+            resolve_audit_finding_inner(&state, &id_dismiss_only, "accept"),
+            Err(AppError::InvalidArg(_))
+        ));
+
+        // Seal the folder DIRECTLY at the DB layer — simulating the pass→resolve race window
+        // where the disk-truth flipped but this row was staged in between (the command-level
+        // seal would have purged it; the TOCTOU re-gate must hold regardless).
+        let id_locked = stage_audit_finding(
+            &state,
+            "broken_link",
+            "meeting",
+            "m-a",
+            Some("Ghost Note"),
+            "> see [[Ghost Note]]",
+            "Append a [!broken-link] note under ## Audit",
+            "broken_link|m-a|Ghost Note",
+        );
+        state.db.set_folder_locked("f1", true, None).unwrap();
+        assert!(matches!(
+            resolve_audit_finding_inner(&state, &id_locked, "accept"),
+            Err(AppError::Locked(_))
+        ));
+        let row = state.db.get_audit_finding(&id_locked).unwrap().unwrap();
+        assert_eq!(row.status, "pending", "a refused accept leaves the row pending");
+        assert!(!row.evidence_md.is_empty(), "…with its evidence intact");
+
+        // The LIST defensively hides it (source no longer visible), while an open-source
+        // finding still lists.
+        seed_meeting(&state.db, "m-open", "# Open\n", None);
+        stage_audit_finding(
+            &state, "orphan", "meeting", "m-open", None, "no links", "", "orphan|m-open|",
+        );
+        let listed = list_audit_findings_inner(&state, None).unwrap();
+        assert_eq!(listed.len(), 1, "sealed-source finding hidden: {listed:#?}");
+        assert_eq!(listed[0].source_id, "m-open");
+        let _ = std::fs::remove_dir_all(&vault);
+    }
+
+    /// The anti-hallucination re-check: accepting an unlinked-mention whose target no longer
+    /// resolves is refused (never append a dead `[[link]]`); a resolvable target appends the
+    /// suggested-link line under `## Audit`.
+    #[test]
+    fn audit_unlinked_mention_accept_reresolves_target() {
+        let vault = tmp_vault("audit-mention");
+        let state = build_state_with_vault("audit-mention", &vault);
+        seed_meeting(&state.db, "m-src", "# Kickoff\n", None);
+        let md = vault.join("2026-07-01 0900 - Kickoff.md");
+        seed_exported_note(&state, "m-src", &md, "# Kickoff\n");
+
+        // Target that resolves: another visible meeting with that exact title.
+        db_insert_titled_meeting(&state.db, "m-t", "Project Atlas Review");
+        let id_ok = stage_audit_finding(
+            &state,
+            "unlinked_mention",
+            "meeting",
+            "m-src",
+            Some("Project Atlas Review"),
+            "> mentioned Project Atlas Review\n\nSuggested link: [[Project Atlas Review]]",
+            "Append the suggested [[link]] under ## Audit",
+            "unlinked_mention|m-src|Project Atlas Review",
+        );
+        resolve_audit_finding_inner(&state, &id_ok, "accept").unwrap();
+        let after = std::fs::read_to_string(&md).unwrap();
+        assert!(
+            after.contains("- Suggested link: [[Project Atlas Review]]"),
+            "link line appended: {after}"
+        );
+
+        // Target that does NOT resolve anywhere → refused, row stays pending.
+        let id_gone = stage_audit_finding(
+            &state,
+            "unlinked_mention",
+            "meeting",
+            "m-src",
+            Some("Vanished Note Title"),
+            "> mentioned Vanished Note Title\n\nSuggested link: [[Vanished Note Title]]",
+            "Append the suggested [[link]] under ## Audit",
+            "unlinked_mention|m-src|Vanished Note Title",
+        );
+        assert!(matches!(
+            resolve_audit_finding_inner(&state, &id_gone, "accept"),
+            Err(AppError::InvalidArg(_))
+        ));
+        assert_eq!(
+            state.db.get_audit_finding(&id_gone).unwrap().unwrap().status,
+            "pending"
+        );
+        let _ = std::fs::remove_dir_all(&vault);
+    }
+
+    /// The AUTHORED-NOTE (documents) side of accept: the stamp lands in the note's exported
+    /// `.md` and the baseline refresh rides `documents.exported_hash` with the SAME conditional
+    /// anti-laundering rule as the meeting side.
+    #[test]
+    fn audit_accept_on_note_source_uses_doc_baseline_conditionally() {
+        let vault = tmp_vault("audit-doc");
+        let state = build_state_with_vault("audit-doc", &vault);
+        make_open_folder(&state.db, "fn1", "Notes");
+        state
+            .db
+            .insert_document("n1", "fn1", "My Note", "# My Note\n", "note", 1)
+            .unwrap();
+        let md = vault.join("My Note.md");
+        std::fs::write(&md, "# My Note\n").unwrap();
+        state
+            .db
+            .set_note_doc_exported_path("n1", Some(&md.to_string_lossy()))
+            .unwrap();
+        state
+            .db
+            .set_note_doc_exported_hash(
+                "n1",
+                Some(&crate::export::note_content_hash("# My Note\n")),
+            )
+            .unwrap();
+
+        // Clean accept → append + baseline re-stamped from the appended content.
+        let id = stage_audit_finding(
+            &state,
+            "broken_link",
+            "note",
+            "n1",
+            Some("Ghost"),
+            "> [[Ghost]]",
+            "Append a [!broken-link] note under ## Audit",
+            "broken_link|n1|Ghost",
+        );
+        resolve_audit_finding_inner(&state, &id, "accept").unwrap();
+        let after = std::fs::read_to_string(&md).unwrap();
+        assert!(after.contains("[!broken-link]"), "stamp appended: {after}");
+        assert_eq!(
+            state.db.get_note_doc_exported_hash("n1").unwrap(),
+            Some(crate::export::note_content_hash(&after)),
+            "clean-case doc baseline re-stamped"
+        );
+
+        // External edit BEFORE the next accept → the append lands in place but the baseline
+        // stays at Murmur's last write (not laundered).
+        std::fs::write(&md, format!("{after}EXTERNAL EDIT LINE\n")).unwrap();
+        let id2 = stage_audit_finding(
+            &state,
+            "broken_link",
+            "note",
+            "n1",
+            Some("Ghost Two"),
+            "> [[Ghost Two]]",
+            "Append a [!broken-link] note under ## Audit",
+            "broken_link|n1|Ghost Two",
+        );
+        resolve_audit_finding_inner(&state, &id2, "accept").unwrap();
+        let after2 = std::fs::read_to_string(&md).unwrap();
+        assert!(after2.contains("EXTERNAL EDIT LINE"), "edit preserved in place");
+        assert!(after2.contains("Ghost Two"), "second stamp appended");
+        assert_eq!(
+            state.db.get_note_doc_exported_hash("n1").unwrap(),
+            Some(crate::export::note_content_hash(&after)),
+            "doc baseline NOT laundered over the externally-edited file"
+        );
+        let _ = std::fs::remove_dir_all(&vault);
+    }
+
+    /// Minimal titled-meeting seed for wikilink-resolution targets (no note needed beyond one
+    /// row so `list_meetings_visible` keeps it).
+    fn db_insert_titled_meeting(db: &Db, id: &str, title: &str) {
+        db.insert_meeting(&crate::storage::models::Meeting {
+            id: id.to_string(),
+            started_at: "2026-07-02T09:00:00Z".to_string(),
+            ended_at: None,
+            title: Some(title.to_string()),
+            duration_s: 60,
+            audio_path: None,
+            status: crate::storage::models::MeetingStatus::Summarized,
+            folder_id: None,
+        })
+        .unwrap();
+    }
+
+    /// Lock review: accepting a broken_link whose target NOW resolves must refuse (the stamp
+    /// would assert a falsehood) — loss-safe: nothing written, the row stays pending.
+    #[test]
+    fn audit_broken_link_accept_refuses_when_target_now_resolves() {
+        let vault = tmp_vault("audit-resolves-now");
+        let state = build_state_with_vault("audit-resolves-now", &vault);
+        seed_meeting(&state.db, "m-src", "# Kickoff\n", None);
+        let md = vault.join("2026-07-01 0900 - Kickoff.md");
+        seed_exported_note(&state, "m-src", &md, "# Kickoff\n");
+        // The once-missing target EXISTS by accept time (created after the pass staged it).
+        db_insert_titled_meeting(&state.db, "m-t", "Now Existing Note");
+
+        let id = stage_audit_finding(
+            &state,
+            "broken_link",
+            "meeting",
+            "m-src",
+            Some("Now Existing Note"),
+            "> see [[Now Existing Note]]",
+            "Append a [!broken-link] note under ## Audit",
+            "broken_link|m-src|now-existing",
+        );
+        let before = std::fs::read_to_string(&md).unwrap();
+        assert!(matches!(
+            resolve_audit_finding_inner(&state, &id, "accept"),
+            Err(AppError::InvalidArg(_))
+        ));
+        assert_eq!(
+            std::fs::read_to_string(&md).unwrap(),
+            before,
+            "a refused accept writes nothing"
+        );
+        assert_eq!(
+            state.db.get_audit_finding(&id).unwrap().unwrap().status,
+            "pending",
+            "the row stays pending (the user dismisses or re-runs the audit)"
+        );
+        let _ = std::fs::remove_dir_all(&vault);
+    }
+
+    /// Lock review (defense in depth): the list also re-gates the TARGET side — a pending finding
+    /// whose target's folder sealed between pass and list is hidden (its title/evidence reference
+    /// the now-sealed content), while purge-on-seal remains the primary cleaner.
+    #[test]
+    fn audit_list_hides_pending_finding_whose_target_sealed() {
+        let state = build_state("audit-target-gate");
+        make_open_folder(&state.db, "f1", "Secret");
+        seed_meeting(&state.db, "m-t", "# target body\n", Some("f1"));
+        seed_meeting(&state.db, "m-src", "# open body\n", None);
+        stage_audit_finding_with_target(&state, "m-src", "m-t", "meeting", "k-target-gate");
+        stage_audit_finding(
+            &state, "orphan", "meeting", "m-src", None, "no links", "", "k-keep",
+        );
+
+        // Both list while the target folder is open.
+        assert_eq!(list_audit_findings_inner(&state, None).unwrap().len(), 2);
+
+        // Seal the TARGET's folder db-level only (simulating the pass→list race window the
+        // in-tx purge did not see because the row was staged in between).
+        state.db.set_folder_locked("f1", true, None).unwrap();
+        let listed = list_audit_findings_inner(&state, None).unwrap();
+        assert_eq!(listed.len(), 1, "sealed-target finding hidden: {listed:#?}");
+        assert_eq!(listed[0].id, {
+            let rows = state.db.list_audit_finding_rows("pending").unwrap();
+            rows.iter().find(|r| r.dedupe_key == "k-keep").unwrap().id.clone()
+        });
+    }
+
+    /// Phase-0 follow-up (a): every seal path that NULLs `exported_path` blanks the path-coupled
+    /// `exported_hash` in the SAME statement — a stale baseline surviving the seal would
+    /// mis-classify the fresh unlock re-export.
+    #[test]
+    fn seal_paths_blank_exported_hash_with_exported_path() {
+        let state = build_state("seal-hash-blank");
+        make_open_folder(&state.db, "f1", "Secret");
+        seed_meeting(&state.db, "m-a", "# body\n", Some("f1"));
+        state
+            .db
+            .set_note_exported_path("m-a", "claude_code", "/tmp/x.md")
+            .unwrap();
+        state
+            .db
+            .set_note_exported_hash("m-a", "claude_code", Some("abc"))
+            .unwrap();
+        state.db.seal_note("m-a", "claude_code", b"blob").unwrap();
+        assert_eq!(
+            state.db.get_note_exported_hash("m-a", "claude_code").unwrap(),
+            None,
+            "seal_note blanks the baseline with the path"
+        );
+
+        // Documents: clearing the path (the per-row seal cleanup) clears the baseline too.
+        state
+            .db
+            .insert_document("n1", "f1", "note-a", "body", "note", 1)
+            .unwrap();
+        state
+            .db
+            .set_note_doc_exported_path("n1", Some("/tmp/n1.md"))
+            .unwrap();
+        state.db.set_note_doc_exported_hash("n1", Some("def")).unwrap();
+        state.db.set_note_doc_exported_path("n1", None).unwrap();
+        assert_eq!(
+            state.db.get_note_doc_exported_hash("n1").unwrap(),
+            None,
+            "clearing the doc path clears the baseline"
+        );
+        // …and setting a path again does NOT resurrect a hash.
+        state
+            .db
+            .set_note_doc_exported_path("n1", Some("/tmp/n1b.md"))
+            .unwrap();
+        assert_eq!(state.db.get_note_doc_exported_hash("n1").unwrap(), None);
+
+        // The folder-wide seal clear blanks both.
+        state.db.set_note_doc_exported_hash("n1", Some("ghi")).unwrap();
+        state.db.clear_note_exported_paths_in_folder("f1").unwrap();
+        assert_eq!(state.db.get_note_doc_exported_hash("n1").unwrap(), None);
     }
 
     /// Deleting an OPEN folder moves its notes to the vault ROOT (folder_id = NULL), survives the

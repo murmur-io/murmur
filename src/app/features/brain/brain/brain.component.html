@@ -249,6 +249,9 @@
   <!-- 5 — SCHEDULED BRIEFS: propose-accept recurring digests (Brain v2 L5) -->
   <app-briefs />
 
+  <!-- 6 — VAULT AUDIT: on-demand hygiene findings inbox (review-then-apply) -->
+  <app-audit />
+
   @if (noteEditorOpen()) {
     <app-brain-note-editor
       [saving]="savingNote()"

@@ -1,0 +1,154 @@
+:host {
+  display: block;
+}
+.au {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+/* Header row: the collapsible toggle + the "Audit now" trigger beside it
+   (a sibling, not nested — a button can't live inside a button). */
+.au-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+/* Collapsible header — mirrors the briefs / memory / Connections sections. */
+.au-toggle {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex: 1;
+  min-width: 0;
+  padding: var(--space-2) 0;
+  border: 0;
+  background: transparent;
+  color: var(--text-primary);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.au-toggle:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+  border-radius: var(--radius-sm);
+}
+.au-chevron {
+  flex: none;
+  color: var(--text-muted);
+  transition: transform var(--transition);
+}
+.au-chevron.is-open {
+  transform: rotate(90deg);
+}
+.au-title {
+  font-size: 1rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+.au-count {
+  flex: none;
+}
+.au-sub {
+  color: var(--text-muted);
+  font-size: 0.85rem;
+  margin-left: var(--space-2);
+}
+@media (max-width: 560px) {
+  .au-sub {
+    display: none;
+  }
+}
+.au-run {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+/* The "N new findings · M pending" line after a manual run. */
+.au-summary {
+  margin: 0;
+  font-size: 0.85rem;
+}
+
+/* One kind group. */
+.au-group {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+.au-group-head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+}
+.au-group-title {
+  margin: 0;
+  font-size: 0.95rem;
+  font-weight: 600;
+}
+.au-group-explain {
+  font-size: 0.82rem;
+  margin-left: var(--space-1);
+}
+
+/* Finding rows. */
+.au-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.au-item {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  border-radius: var(--radius-md);
+  background: var(--surface-input);
+  border: 1px solid var(--border-subtle);
+}
+.au-item-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+  flex-wrap: wrap;
+}
+.au-chip {
+  flex: none;
+}
+.au-item-source,
+.au-item-target {
+  font-size: 0.925rem;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.au-item-arrow {
+  flex: none;
+  color: var(--text-muted);
+}
+.au-evidence {
+  font-size: 0.9rem;
+}
+.au-item-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--space-3);
+}
+.au-accept-hint {
+  font-size: 0.82rem;
+  margin-right: auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

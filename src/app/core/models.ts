@@ -1126,6 +1126,49 @@ export interface BriefProposedPayload {
   charCount: number;
 }
 
+/** Vault Audit — the deterministic hygiene-pass kinds. */
+export type AuditFindingKind =
+  | "broken_link"
+  | "orphan"
+  | "stale"
+  | "contradiction"
+  | "unlinked_mention";
+
+/**
+ * Vault Audit — one run's summary (`run_vault_audit` / the audit-updated
+ * event). `counts` maps a finding kind → how many PENDING findings of that
+ * kind exist after the run. Timestamps are epoch numbers.
+ */
+export interface AuditRunSummary {
+  runId: string;
+  startedAt: number;
+  finishedAt: number;
+  findingsNew: number;
+  findingsTotalPending: number;
+  counts: Record<string, number>;
+}
+
+/**
+ * Vault Audit — one STAGED finding (`audit_findings`, propose-accept).
+ * `evidenceMd` is a short markdown snippet built backend-side from
+ * VISIBLE-only content; `acceptAction` is the human description of what
+ * Accept will do — "" means the finding is dismiss-only. Timestamps are
+ * epoch numbers.
+ */
+export interface AuditFinding {
+  id: string;
+  kind: AuditFindingKind;
+  sourceKind: "meeting" | "note";
+  sourceId: string;
+  sourceTitle: string;
+  targetTitle?: string | null;
+  evidenceMd: string;
+  acceptAction: string;
+  status: "pending" | "accepted" | "dismissed";
+  createdAt: number;
+  resolvedAt?: number | null;
+}
+
 /**
  * Phase D — progress for the on-device PERSON-name NER model (mDeBERTa-v3)
  * download (`EVENT_NER_DOWNLOAD`). Mirrors the backend `NerDownloadPayload`: the
