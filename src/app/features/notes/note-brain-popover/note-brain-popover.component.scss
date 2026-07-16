@@ -463,20 +463,6 @@
   font-weight: 600;
   color: var(--text-primary);
 }
-/* find_related lead line (the count) — plain text above the source chips, not a boxed answer. */
-.pop-info-lead {
-  margin: 0;
-  color: var(--text-primary);
-  font-size: 0.85rem;
-  line-height: 1.5;
-}
-/* Quiet caption under the source chips ("Tap a source to open it."). */
-.pop-hint {
-  margin: 0;
-  color: var(--text-muted);
-  font-size: 0.72rem;
-}
-
 /* --- Citation chips -------------------------------------------------------- */
 .pop-cites {
   display: flex;
@@ -517,12 +503,13 @@
   max-width: 180px;
 }
 
-/* --- find_related ACTIONABLE rows (Fix 3: Insert link primary + Open secondary,
-   replacing the old passive "tap the chip to open" pill) --- */
+/* --- find_related — ONE quiet compact list (minimalist, 2026-07-16): flat
+   single-line rows, no per-row card/border/shadow. The row itself is the
+   primary "insert link" action (neutral hover, like .pop-row); "Open" rides
+   along as a small quiet secondary. --- */
 .pop-cite-rows {
   display: flex;
   flex-direction: column;
-  gap: var(--space-1);
   margin: 0;
   padding: 0;
   list-style: none;
@@ -530,27 +517,63 @@
 .pop-cite-row {
   display: flex;
   align-items: center;
+  gap: var(--space-1);
+}
+.pop-cite-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
   gap: var(--space-2);
-  padding: var(--space-2);
-  border: 1px solid var(--border-subtle);
-  border-radius: var(--radius-md);
+  padding: var(--space-1) var(--space-2);
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 0.8125rem;
+  text-align: left;
+  cursor: pointer;
+  transition: background var(--transition-fast);
+}
+.pop-cite-main:hover {
   background: var(--surface-hover);
 }
-.pop-cite-row .pop-cite-title {
+.pop-cite-main:focus-visible {
+  outline: none;
+  box-shadow: inset 0 0 0 1.5px var(--accent-ring);
+}
+.pop-cite-main .pop-cite-title {
   flex: 1;
   min-width: 0;
   max-width: none;
-  color: var(--text-primary);
-  font-size: 0.78rem;
 }
-.pop-cite-actions {
-  display: flex;
+/* The kind ("note"/"meeting"/"org") is a quiet trailing hint, not an accent badge. */
+.pop-cite-main .pop-cite-kind {
   flex: none;
-  gap: var(--space-1);
-}
-.pop-cite-btn {
-  padding: 3px var(--space-2);
+  color: var(--text-muted);
   font-size: 0.72rem;
+  text-transform: none;
+}
+.pop-cite-open {
+  flex: none;
+  padding: var(--space-1) var(--space-2);
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: 0.72rem;
+  cursor: pointer;
+  transition: background var(--transition-fast), color var(--transition-fast);
+}
+.pop-cite-open:hover {
+  background: var(--surface-hover);
+  color: var(--text-primary);
+}
+.pop-cite-open:focus-visible {
+  outline: none;
+  box-shadow: inset 0 0 0 1.5px var(--accent-ring);
 }
 
 .pop-redacted {

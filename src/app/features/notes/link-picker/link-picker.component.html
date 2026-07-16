@@ -13,6 +13,8 @@
   aria-label="Link to note"
 >
   @if (candidates().length > 0) {
+    <!-- Minimalist rows (2026-07-16): title leads, the kind is a quiet trailing
+         hint — no leading uppercase badge competing with the title. -->
     @for (c of candidates(); track c.kind + c.id; let i = $index) {
       <button
         type="button"
@@ -22,8 +24,8 @@
         [attr.aria-selected]="i === activeIndex()"
         (click)="pick(c)"
       >
-        <span class="link-pop-kind">{{ c.kind }}</span>
         <span class="link-pop-title">{{ c.title }}</span>
+        <span class="link-pop-kind">{{ c.kind }}</span>
       </button>
     }
   } @else if (loading()) {
