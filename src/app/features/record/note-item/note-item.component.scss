@@ -87,6 +87,136 @@
   }
 }
 
+/* ── SAVED-NOTE card footer — a sent jot / accepted @brain draft became a
+   REAL, LINKED companion note. A subtle in-flow bar (NOT a floating overlay,
+   so trap T3 N/A) with the "✓ Saved to Notes" primary affordance + a
+   "🔗 [[Meeting]] →" chip. var(--token) only. ─────────────────────────────── */
+.saved-bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin-left: calc(var(--space-2) + 13px + var(--space-2));
+  padding: 2px 0;
+  font-size: 0.74rem;
+}
+/* The primary "✓ Saved to Notes" affordance — opens the companion note. */
+.saved-open {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px var(--space-2);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-pill);
+  background: var(--accent-soft);
+  color: var(--accent-hover);
+  font-size: 0.74rem;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  cursor: pointer;
+  transition:
+    background var(--transition),
+    color var(--transition);
+}
+.saved-open:hover {
+  background: var(--accent);
+  color: var(--text-on-accent);
+}
+.saved-open:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--accent-ring);
+}
+.saved-check {
+  font-size: 0.78rem;
+  line-height: 1;
+}
+/* The "🔗 [[Meeting]] →" chip — navigates to the meeting by id. */
+.meeting-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  padding: 2px var(--space-2);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-pill);
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 0.72rem;
+  cursor: pointer;
+  transition:
+    color var(--transition),
+    border-color var(--transition),
+    background var(--transition);
+}
+.meeting-chip:hover {
+  color: var(--accent-hover);
+  border-color: var(--accent-ring);
+  background: var(--surface-hover);
+}
+.meeting-chip:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--accent-ring);
+}
+.chip-name {
+  min-width: 0;
+  max-width: 16ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+}
+.chip-arrow {
+  color: var(--text-muted);
+}
+/* Transient "Saving to Notes…" state. */
+.saved-bar.is-saving {
+  color: var(--text-muted);
+}
+.saved-label {
+  color: var(--text-muted);
+}
+.saved-spin {
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  border: 2px solid var(--accent-ring);
+  border-top-color: var(--accent);
+  animation: spin 0.7s linear infinite;
+}
+/* Error state — the append failed; the line is kept, offer a retry. */
+.saved-bar.is-error {
+  color: var(--danger);
+}
+.saved-warn {
+  color: var(--danger);
+  font-size: 0.8rem;
+  line-height: 1;
+}
+.saved-bar.is-error .saved-label {
+  color: var(--text-secondary);
+}
+.saved-retry {
+  padding: 2px var(--space-2);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-pill);
+  background: transparent;
+  color: var(--accent-hover);
+  font-size: 0.72rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition:
+    background var(--transition),
+    color var(--transition);
+}
+.saved-retry:hover {
+  background: var(--accent);
+  color: var(--text-on-accent);
+}
+.saved-retry:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--accent-ring);
+}
+
 /* ── @brain THREAD toggle (Slack-style header): caret + "Thread (N)" + a
    short snippet of the user's question when collapsed. The question itself
    renders as the user's first RIGHT-aligned bubble once expanded. ───────── */

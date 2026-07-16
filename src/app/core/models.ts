@@ -1311,6 +1311,23 @@ export interface WikiTarget {
   id: string;
 }
 
+/**
+ * The result of appending a recording-time jot (or an accepted `@brain` draft) to
+ * a meeting's ONE living companion note (`append_to_companion_note`). The backend
+ * lazily gets-or-creates the companion note in the Notes ROOT on the first send,
+ * appends the markdown block, and returns:
+ *   - `noteId` — the companion note's document id, so the "✓ Saved to Notes" card
+ *     can open it by id (via `TabsService.openNote`), never by a fragile title;
+ *   - `meetingWikilink` — the visible `[[Meeting]]` display link, rendered on the
+ *     card's meeting chip (navigation to the meeting itself goes by the store's
+ *     `meetingId`, not by resolving this string). Mirrors the Rust
+ *     `CompanionAppendResult` (serde camelCase).
+ */
+export interface CompanionAppendResult {
+  noteId: string;
+  meetingWikilink: string;
+}
+
 /** The two entity kinds the self-assembling graph resolves (Rust `EntityKind`, camelCase). */
 export type EntityKind = "person" | "project";
 

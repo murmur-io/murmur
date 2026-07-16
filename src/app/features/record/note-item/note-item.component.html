@@ -40,6 +40,60 @@
         </button>
       }
     </div>
+
+    <!-- ── SAVED-NOTE card footer — a sent jot / accepted @brain draft is a
+         REAL, LINKED companion note now. IN-FLOW (not floating → trap T3 N/A),
+         token-styled. "✓ Saved to Notes" opens the companion note by id in a new
+         tab; the "🔗 [[Meeting]] →" chip navigates to the meeting by id. ────── -->
+    @switch (n.saveState) {
+      @case ("saving") {
+        <div class="saved-bar is-saving" role="status">
+          <span class="saved-spin" aria-hidden="true"></span>
+          <span class="saved-label">Saving to Notes…</span>
+        </div>
+      }
+      @case ("saved") {
+        <div class="saved-bar" role="group" aria-label="Saved note links">
+          <button
+            type="button"
+            class="saved-open"
+            (click)="openSavedNote()"
+            title="Open this note in a new tab"
+            aria-label="Open this note in Notes"
+          >
+            <span class="saved-check" aria-hidden="true">✓</span>
+            Saved to Notes
+          </button>
+          @if (meetingChipLabel(); as label) {
+            <button
+              type="button"
+              class="meeting-chip"
+              (click)="openMeeting()"
+              [title]="'Go to ' + label"
+              [attr.aria-label]="'Go to the meeting ' + label"
+            >
+              <span class="chip-link" aria-hidden="true">🔗</span>
+              <span class="chip-name">{{ label }}</span>
+              <span class="chip-arrow" aria-hidden="true">→</span>
+            </button>
+          }
+        </div>
+      }
+      @case ("error") {
+        <div class="saved-bar is-error" role="alert">
+          <span class="saved-warn" aria-hidden="true">⚠</span>
+          <span class="saved-label">Couldn't save to Notes.</span>
+          <button
+            type="button"
+            class="saved-retry"
+            (click)="retrySave()"
+            aria-label="Retry saving this note"
+          >
+            Retry
+          </button>
+        </div>
+      }
+    }
   }
 
   @if (n.thread) {
