@@ -1348,7 +1348,7 @@ async fn summarize_and_export(
                 when_iso,
                 &markdown,
             )?;
-            persist_note_exported_path(&state.db, config, meeting_id, &exported_path)?;
+            persist_note_exported_path(&state.db, config, meeting_id, &exported_path, &markdown)?;
             state.db.set_meeting_title(meeting_id, &title)?;
             state
                 .db
@@ -1449,9 +1449,18 @@ fn persist_note_exported_path(
     config: &AppConfig,
     meeting_id: &str,
     exported_path: &Path,
+    markdown: &str,
 ) -> Result<()> {
     let connection = crate::summarize::roles::provider_target(Role::Notes, config).connection;
-    db.set_note_exported_path(meeting_id, &connection, &exported_path.to_string_lossy())
+    db.set_note_exported_path(meeting_id, &connection, &exported_path.to_string_lossy())?;
+    // Export-collision guard: stamp the baseline from the EXACT markdown written — `write_note`
+    // either wrote it, found an identical file, or collision-suffixed a fresh one, so the file at
+    // `exported_path` is byte-equal to `markdown` in every branch.
+    db.set_note_exported_hash(
+        meeting_id,
+        &connection,
+        Some(&crate::export::note_content_hash(markdown)),
+    )
 }
 
 /// Finalize a summarized note when NO vault folder is configured. By this point the caller
@@ -2292,7 +2301,8 @@ mod tests {
             .unwrap();
 
         // The REAL production paired write.
-        persist_note_exported_path(&db, &config, mid, Path::new("/vault/Role export.md")).unwrap();
+        persist_note_exported_path(&db, &config, mid, Path::new("/vault/Role export.md"), "# body")
+            .unwrap();
 
         let note = db
             .get_latest_note_for_meeting(mid)
@@ -2313,6 +2323,13 @@ mod tests {
                 .any(|n| n.exported_path.as_deref() == Some("/vault/Role export.md")),
             "the seal deletion-target collection must see the exported .md"
         );
+        // Export-collision guard: the SAME paired write stamps the baseline hash on the SAME
+        // (role-resolved) row — a NULL here would grandfather every pipeline export forever.
+        assert_eq!(
+            db.get_note_exported_hash(mid, "anthropic").unwrap(),
+            Some(crate::export::note_content_hash("# body")),
+            "the pipeline export stamps the collision-guard baseline on the role-resolved row"
+        );
 
         // (b) LEGACY fallback (no role keys): the key is provider_id — unchanged behavior.
         let legacy_cfg = AppConfig::default(); // provider_id = claude_code, keys absent
@@ -2323,7 +2340,8 @@ mod tests {
             &crate::summarize::roles::provider_target(Role::Notes, &legacy_cfg).connection,
         ))
         .unwrap();
-        persist_note_exported_path(&db, &legacy_cfg, mid2, Path::new("/vault/Legacy.md")).unwrap();
+        persist_note_exported_path(&db, &legacy_cfg, mid2, Path::new("/vault/Legacy.md"), "# body")
+            .unwrap();
         let legacy_note = db
             .get_latest_note_for_meeting(mid2)
             .unwrap()
