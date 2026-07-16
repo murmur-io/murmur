@@ -282,6 +282,38 @@ export class OrgItemViewerComponent {
     void this.router.navigate(["/notes"]);
   }
 
+  // --- Remove-from-org (author only; the "author has no delete affordance on a
+  // second device" gap) — mirrors note-editor's askDelete/cancelDelete/doDelete
+  // confirm shape. DELIBERATELY "leave/remove from org", not "destroy the
+  // original": see IpcService.deleteOrgItemAsAuthor's doc.
+  readonly confirmingRemove = signal(false);
+
+  askRemove(): void {
+    this.confirmingRemove.set(true);
+  }
+
+  cancelRemove(): void {
+    this.confirmingRemove.set(false);
+  }
+
+  async doRemove(): Promise<void> {
+    const it = this._item();
+    if (!it || this.saving()) {
+      return;
+    }
+    this.saving.set(true);
+    try {
+      await this.ipc.deleteOrgItemAsAuthor(it.itemId);
+      this.toast.success("Removed from the org");
+      void this.router.navigate(["/notes"]);
+    } catch (e) {
+      this.toast.danger(`Couldn’t remove — ${String(e)}`);
+      this.confirmingRemove.set(false);
+    } finally {
+      this.saving.set(false);
+    }
+  }
+
   /** Presentational: an ISO timestamp → a friendly local date. */
   formatDate(iso: string): string {
     const d = new Date(iso);

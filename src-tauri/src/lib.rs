@@ -226,6 +226,7 @@ pub fn run() {
             commands::org_sync_now,
             commands::org_get_item,
             commands::org_update_own_item,
+            commands::delete_org_item_as_author,
             commands::org_resolve_source,
             commands::list_org_items,
             commands::folder_active_shares,
