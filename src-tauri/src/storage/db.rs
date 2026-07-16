@@ -1470,6 +1470,11 @@ impl Db {
         // the TARGET side against the right table (lock review, same branch). Guarded for dev DBs
         // that created the table before the column existed.
         Self::add_column_if_missing(conn, "audit_findings", "target_kind", "TEXT")?;
+        // Weekly schedule (Phase 3): `scheduled = 1` marks a run row staged by the WEEKLY runner —
+        // both the claim row inserted BEFORE the pass (crash-safe claim-before-run, the
+        // brief-runner discipline) and nothing else. Due-ness reads MAX(finished_at) over
+        // scheduled rows only, so manual runs never push the weekly cadence. Additive + guarded.
+        Self::add_column_if_missing(conn, "audit_runs", "scheduled", "INTEGER NOT NULL DEFAULT 0")?;
         Ok(())
     }
 
@@ -11468,6 +11473,50 @@ impl Db {
         )
         .map_err(map_err)?;
         Ok(())
+    }
+
+    /// Weekly runner CLAIM row — inserted BEFORE the scheduled pass runs (the brief runner's
+    /// claim-before-run discipline): once this row exists, `weekly_due` holds for the next 7 days
+    /// even if the pass itself crashes/fails, so a persistently-failing pass can never become an
+    /// hourly storm. Content-free (`scheduled = 1`, empty counts); the pass still records its own
+    /// normal (unscheduled) bookkeeping row on completion.
+    pub fn insert_scheduled_audit_run_claim(&self, id: &str, claimed_at: i64) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO audit_runs (id, started_at, finished_at, counts_json, scheduled)
+             VALUES (?1, ?2, ?2, '{}', 1)",
+            rusqlite::params![id, claimed_at],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// `finished_at` of the newest SCHEDULED audit run (the weekly claim rows) — the due-ness
+    /// anchor. Manual runs (`scheduled = 0`) never count, so running the audit by hand does not
+    /// push the weekly cadence.
+    pub fn last_scheduled_audit_run_finished_at(&self) -> Result<Option<i64>> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT MAX(finished_at) FROM audit_runs WHERE scheduled = 1",
+            [],
+            |r| r.get::<_, Option<i64>>(0),
+        )
+        .map_err(map_err)
+    }
+
+    /// Judge-tier DEMOTE: delete ONE pending finding outright (NOT dismiss — a dismissed row's
+    /// `dedupe_key` suppresses re-creation forever; deletion lets a real issue re-stage on the
+    /// next pass). Pending-only by construction: a row the user resolved (or a seal purged)
+    /// between the judge's read and this delete is left alone. Returns whether a row was deleted.
+    pub fn delete_pending_audit_finding(&self, id: &str) -> Result<bool> {
+        let conn = self.lock();
+        let n = conn
+            .execute(
+                "DELETE FROM audit_findings WHERE id = ?1 AND status = 'pending'",
+                rusqlite::params![id],
+            )
+            .map_err(map_err)?;
+        Ok(n > 0)
     }
 
     /// Vault Audit DELETE-SAFETY: delete every PENDING `audit_findings` row whose SOURCE or

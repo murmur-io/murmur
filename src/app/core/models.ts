@@ -1170,6 +1170,29 @@ export interface AuditFinding {
 }
 
 /**
+ * Vault Audit — the weekly-schedule state (`get_audit_schedule` /
+ * `set_audit_schedule`). Timestamps are epoch numbers; `lastRunAt` is
+ * null/absent before the first scheduled run, `nextDueAt` while disabled.
+ */
+export interface AuditSchedule {
+  enabled: boolean;
+  lastRunAt?: number | null;
+  nextDueAt?: number | null;
+}
+
+/**
+ * Vault Audit — one AI explanation of a staged finding
+ * (`explain_audit_finding`). `explanationMd` renders through the shared
+ * markdown component; `provider` names the AI provider that produced it
+ * (cloud providers only ever see redacted content).
+ */
+export interface AuditExplanation {
+  findingId: string;
+  explanationMd: string;
+  provider: string;
+}
+
+/**
  * Phase D — progress for the on-device PERSON-name NER model (mDeBERTa-v3)
  * download (`EVENT_NER_DOWNLOAD`). Mirrors the backend `NerDownloadPayload`: the
  * model is 3 files, so progress is reported per-file (`fileIndex` / `fileCount`).
