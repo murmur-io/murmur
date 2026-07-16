@@ -18,7 +18,7 @@
 use crate::error::Result;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 /// The REAL on-device embedder (multilingual-e5-small via candle). ALWAYS compiled; the real impl is
 /// selected at runtime by [`active_embedder`] when the e5 model dir is present, else the stub.
@@ -327,6 +327,102 @@ impl Embedder for StubEmbedder {
     }
 }
 
+/// Process-wide cache of the constructed REAL embedder, keyed by the resolved model DIR — the one
+/// input that can change at runtime (the Settings picker writes a new `embed_model_id` via
+/// [`set_selected_embed_model_id`], which resolves a DIFFERENT subdir; the cache rebuilds on the
+/// key change so a stale wrong-model embedder is never served).
+///
+/// WHY a cache: [`candle_bert::CandleBertEmbedder`]'s heavy safetensors/tokenizer load is lazy PER
+/// INSTANCE (its `inner: Mutex<Option<Arc<Loaded>>>`), so the historical "construct one per
+/// operation" idiom meant each instance's loaded Metal weights died with it and the NEXT operation
+/// re-loaded them from scratch. The 60s org-sync tick made the churn visible: one construction per
+/// joined org per tick (~7,200/day at 5 orgs), each re-stat'ing the model files and logging
+/// "ready (lazy load)". One shared instance loads the weights at most once per process (per model
+/// switch); its inner mutex already serializes the lazy load, and concurrent `embed` calls on the
+/// shared instance are safe (`&self` over immutable tensors — the `Loaded` engine is read-only
+/// after construction). Actual forward passes stay gated by the heavy-inference semaphore
+/// (`crate::perf::run_heavy`) at the call sites that run them.
+///
+/// LOCKING (no-deadlock contract): this lock is held ONLY for the key compare + `Arc` clone /
+/// insert — NEVER across a model load or a forward pass (construction happens before the write
+/// lock; the heavy lazy load happens later, inside the instance, on first `embed`). A poisoned
+/// lock degrades to serving an uncached instance — never a panic.
+///
+/// MEMORY residency (honest note): once the shared instance has embedded anything, the e5 weights
+/// stay resident for the life of the process instead of dropping with the last per-operation
+/// instance. Under real usage (indexing / retrieval / org sync) the weights were being re-loaded
+/// almost immediately anyway — the steady-state RAM is similar, minus the reload churn (and the
+/// known candle Metal-object leak per load/forward cycle, huggingface/candle#2271).
+static REAL_EMBEDDER_CACHE: RwLock<Option<(PathBuf, Arc<candle_bert::CandleBertEmbedder>)>> =
+    RwLock::new(None);
+
+/// Resolve the process-wide SHARED instance of the real embedder for `dir` (the SELECTED model's
+/// resolved on-disk dir): a hit is an `Arc` clone; a miss (first use, or the selection now resolves
+/// a different dir) constructs a fresh instance (cheap — three `is_file` stats; the weights load
+/// lazily on first `embed`) and installs it, evicting the previous model's entry. `dir` is a
+/// parameter (not re-resolved here) so tests can drive the cache against temp dirs
+/// deterministically. NEVER panics; NEVER holds the cache lock across construction.
+fn cached_real_embedder(
+    dir: PathBuf,
+    model: &'static EmbedModel,
+) -> Result<Arc<candle_bert::CandleBertEmbedder>> {
+    if let Ok(g) = REAL_EMBEDDER_CACHE.read() {
+        if let Some((key, arc)) = g.as_ref() {
+            if *key == dir {
+                return Ok(arc.clone());
+            }
+        }
+    }
+    // Miss (or poisoned read lock): construct OUTSIDE any lock, then install.
+    let built = Arc::new(candle_bert::CandleBertEmbedder::new(
+        dir.clone(),
+        model.query_prefix,
+        model.passage_prefix,
+    )?);
+    match REAL_EMBEDDER_CACHE.write() {
+        Ok(mut g) => {
+            // Double-check under the write lock: a racing caller may have installed the same dir
+            // first — keep the incumbent (its weights may already be loaded), drop ours (unloaded).
+            if let Some((key, arc)) = g.as_ref() {
+                if *key == dir {
+                    return Ok(arc.clone());
+                }
+            }
+            *g = Some((dir, built.clone()));
+            // The one-per-process (per model switch) readiness line — previously logged on EVERY
+            // construction, i.e. 5×/min from the 5-org background sync tick alone.
+            tracing::info!(target: "embed", model_id = %model.id, "local embed model ready (lazy load)");
+        }
+        Err(_) => {
+            tracing::warn!(target: "embed", model_id = %model.id, "embed cache lock poisoned; serving an uncached embedder");
+        }
+    }
+    Ok(built)
+}
+
+/// A thin [`Embedder`] handle over the process-wide cached [`candle_bert::CandleBertEmbedder`]
+/// (see [`REAL_EMBEDDER_CACHE`]), so [`active_embedder`]'s `Box<dyn Embedder>` contract is
+/// unchanged for its ~30 call sites while every returned box shares ONE lazily-loaded engine.
+/// ALL FOUR trait methods delegate — `embed_passage`/`embed_query` must reach the inner instance's
+/// per-model prefix overrides; falling back to this trait's default impls would silently re-apply
+/// the DEFAULT module-const prefixes to a non-default model.
+struct SharedEmbedder(Arc<candle_bert::CandleBertEmbedder>);
+
+impl Embedder for SharedEmbedder {
+    fn dim(&self) -> usize {
+        self.0.dim()
+    }
+    fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        self.0.embed(texts)
+    }
+    fn embed_passage(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        self.0.embed_passage(texts)
+    }
+    fn embed_query(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        self.0.embed_query(texts)
+    }
+}
+
 /// The single active embedding backend used by BOTH the index path (chunking a note on creation)
 /// and the query path (Ask-My-Vault / MCP `search_semantic`). Returning a boxed trait object keeps
 /// the model a swappable seam.
@@ -343,9 +439,13 @@ impl Embedder for StubEmbedder {
 /// width EQUALS [`EMBED_DIM`] — ZERO `vec_chunks` schema migration. (A future model whose dimension
 /// differs would be a `vec_chunks float[N]` SCHEMA change — an additive migration to a new-width vec0
 /// table plus a full re-index, NOT a code one-liner; a mismatched-width insert fails loud, never
-/// silently.) Cheap to construct (the stub is zero-sized; the candle backend defers the heavy load),
-/// so callers build one per operation. NEVER invoked when `semantic_search_enabled` is off (the gate
-/// short-circuits before this is called) — building the real embedder does NOT flip that flag.
+/// silently.) Still cheap to call per operation (the stub is zero-sized; the real backend is an
+/// `Arc` clone of the ONE process-wide cached instance — see [`REAL_EMBEDDER_CACHE`] — so repeated
+/// calls share the same lazily-loaded engine instead of re-loading weights per instance). Model
+/// presence + selection are RE-CHECKED on every call, so a model download or a Settings model
+/// switch takes effect on the next embed with no restart. NEVER invoked when
+/// `semantic_search_enabled` is off (the gate short-circuits before this is called) — building the
+/// real embedder does NOT flip that flag.
 ///
 /// TEST-BUILD SAFETY NET: `cargo test --lib` must never attempt a real Metal forward pass (see the
 /// header doc on `embed::candle_bert` — "NEVER runs a forward pass here"). That was previously true
@@ -362,14 +462,9 @@ pub fn active_embedder() -> Box<dyn Embedder> {
     }
     let model = selected_embed_model();
     if embed_model_present() {
-        let built = embed_model_dir().and_then(|dir| {
-            candle_bert::CandleBertEmbedder::new(dir, model.query_prefix, model.passage_prefix)
-        });
+        let built = embed_model_dir().and_then(|dir| cached_real_embedder(dir, model));
         match built {
-            Ok(e) => {
-                tracing::info!(target: "embed", model_id = %model.id, "local embed model ready (lazy load)");
-                return Box::new(e);
-            }
+            Ok(e) => return Box::new(SharedEmbedder(e)),
             Err(e) => {
                 tracing::warn!(target: "embed", model_id = %model.id, error = %e, "local embed init failed; using stub embedder");
             }
@@ -2010,5 +2105,95 @@ mod tests {
             let norm: f32 = a[0].iter().map(|x| x * x).sum::<f32>().sqrt();
             assert!((norm - 1.0).abs() < 1e-5);
         }
+    }
+
+    /// A unique temp "model dir" holding the three (dummy) files `CandleBertEmbedder::new` stats.
+    /// Construction only checks existence — the heavy load is lazy and these tests NEVER call
+    /// `embed`, so garbage file contents are fine (and no Metal is ever touched).
+    fn fake_model_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "murmur-embed-cache-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        for f in EMBED_MODEL_FILES {
+            std::fs::write(dir.join(f), b"dummy").unwrap();
+        }
+        dir
+    }
+
+    /// THE org-tick fix's mechanism: two consecutive resolutions for the SAME model dir return the
+    /// SAME shared instance (`Arc::ptr_eq`) — so per-org-per-tick `active_embedder()` calls now
+    /// share one lazily-loaded engine, and the "ready (lazy load)" log line (which lives on the
+    /// cache-INSTALL path this test proves runs once) fires once per process/model-switch instead
+    /// of once per call (5×/min at 5 orgs). Serialized on the shared test lock because the cache
+    /// is a process global.
+    #[test]
+    fn cached_real_embedder_reuses_one_instance_for_the_same_dir() {
+        let _g = EMBED_SELECTION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = fake_model_dir("same");
+        let a = cached_real_embedder(dir.clone(), default_embed_model()).unwrap();
+        let b = cached_real_embedder(dir.clone(), default_embed_model()).unwrap();
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "the same model dir must resolve to the SAME cached instance"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The runtime model-CHANGE path (a Settings switch writes a new `embed_model_id`, which
+    /// resolves a DIFFERENT model subdir): the cache is keyed on the resolved dir, so a changed dir
+    /// yields a FRESH instance (never a stale wrong-model embedder), which is then itself cached.
+    #[test]
+    fn cached_real_embedder_rebuilds_on_a_model_dir_change() {
+        let _g = EMBED_SELECTION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir1 = fake_model_dir("change-1");
+        let dir2 = fake_model_dir("change-2");
+        let first = cached_real_embedder(dir1.clone(), default_embed_model()).unwrap();
+        let switched = cached_real_embedder(dir2.clone(), default_embed_model()).unwrap();
+        assert!(
+            !Arc::ptr_eq(&first, &switched),
+            "a changed model dir must yield a FRESH instance, never the previous model's"
+        );
+        let again = cached_real_embedder(dir2.clone(), default_embed_model()).unwrap();
+        assert!(
+            Arc::ptr_eq(&switched, &again),
+            "the new dir's instance is itself cached"
+        );
+        let _ = std::fs::remove_dir_all(&dir1);
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    /// A missing model file makes the cache resolution fail LOUD (Err, never a panic) and never
+    /// installs a broken entry — the next call with a valid dir still caches normally.
+    #[test]
+    fn cached_real_embedder_errors_on_a_missing_file_without_poisoning_the_cache() {
+        let _g = EMBED_SELECTION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let bad = std::env::temp_dir().join(format!(
+            "murmur-embed-cache-bad-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&bad).unwrap(); // dir exists but has NO model files
+        assert!(cached_real_embedder(bad.clone(), default_embed_model()).is_err());
+        let good = fake_model_dir("recover");
+        let a = cached_real_embedder(good.clone(), default_embed_model()).unwrap();
+        let b = cached_real_embedder(good.clone(), default_embed_model()).unwrap();
+        assert!(Arc::ptr_eq(&a, &b), "cache recovers after a failed resolve");
+        let _ = std::fs::remove_dir_all(&bad);
+        let _ = std::fs::remove_dir_all(&good);
     }
 }
