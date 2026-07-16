@@ -608,6 +608,9 @@ scope to the GA-critical path only.
       case "start_recording": return { meetingId: DEMO_MEETING_ID };
       case "stop_recording": return { meetingId: DEMO_MEETING_ID, markdown: NOTE_MD, exportedPath: `${VAULT}/Meetings/Q2-Roadmap-Planning.md` };
       case "recording_level": return 0.28 + Math.random() * 0.55;
+      // Backend truth for "is a recording in flight" — the fresh-webview stage resync
+      // (RecorderStore.reconcileStage). Idle by default; tests override per scenario.
+      case "recording_status": return { recording: false, meetingId: null, startedAt: null };
       case "set_mic_muted": return null;
       case "is_mic_muted": return false;
       case "list_input_devices": return [{ name: "MacBook Pro Microphone", isDefault: true }, { name: "AirPods Pro", isDefault: false }, { name: "Shure MV7", isDefault: false }];
