@@ -3081,3 +3081,9 @@ mod tests {
         );
     }
 }
+
+/// Empirical repro harness for the silent post-Stop pipeline death (2026-07-16) — `#[ignore]`
+/// env-driven tests only; see the file header. Test-only, never compiled into the app.
+#[cfg(test)]
+#[path = "pipeline_repro_stop.rs"]
+mod repro_stop;
