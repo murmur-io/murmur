@@ -51,7 +51,7 @@ const MIN_MENTION_TITLE_CHARS: usize = 6;
 
 /// Staleness thresholds: a meeting note is flagged when it carries at least this many facts…
 const STALE_MIN_FACTS: usize = 3;
-/// …and at least half of them are closed (superseded). Expressed as closed*2 >= total.
+// …and at least half of them are closed (superseded). Expressed as closed*2 >= total.
 
 // ── Wire DTOs (the pinned FE seam — the Angular builder codes against exactly these) ─────────
 
@@ -62,12 +62,44 @@ pub struct AuditRunSummary {
     pub run_id: String,
     pub started_at: i64,
     pub finished_at: i64,
-    /// Findings newly staged THIS pass (post-dedupe).
+    /// Findings newly staged THIS pass (post-dedupe, PRE-judge — the deterministic pass's count;
+    /// `demoted` says how many of them the judge then deleted).
     pub findings_new: usize,
-    /// Total pending findings after the pass (includes survivors of earlier passes).
+    /// Total pending findings after the pass (includes survivors of earlier passes; refreshed
+    /// AFTER the judge tier when it ran).
     pub findings_total_pending: usize,
     /// New findings per kind, e.g. `{"broken_link": 2, "orphan": 1}`.
     pub counts: BTreeMap<String, usize>,
+    /// Judge tier (Phase 3): how many of this run's `contradiction`/`stale` findings the LOCAL
+    /// judge scored (0 when the light model is absent — the stub skip).
+    pub judged: usize,
+    /// …and how many it demoted (deleted outright as noise; they may re-stage next pass).
+    pub demoted: usize,
+}
+
+/// The weekly-schedule wire DTO (`get_audit_schedule` / `set_audit_schedule`). Both timestamps
+/// are EPOCH MILLISECONDS — the same unit as `AuditFinding.createdAt`/`resolvedAt` and the
+/// `audit_runs` columns (everything on the audit surface flows from
+/// `chrono::Utc::now().timestamp_millis()`). `next_due_at` is `last_run_at + 7 days` when
+/// enabled; `None` when disabled, OR when enabled but never run — the never-ran case is due at
+/// the NEXT hourly check (the FE reads `None` + `enabled` as "runs within the hour").
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuditSchedule {
+    pub enabled: bool,
+    pub last_run_at: Option<i64>,
+    pub next_due_at: Option<i64>,
+}
+
+/// The `explain_audit_finding` wire DTO. RETURN-ONLY — the explanation is never persisted
+/// anywhere (no new derived-plaintext at rest); `provider` names the connection that produced it
+/// (the egress-ledger row is the durable record of the call, content-free as always).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuditExplanation {
+    pub finding_id: String,
+    pub explanation_md: String,
+    pub provider: String,
 }
 
 /// One finding, FE-shaped. `evidence_md`/`accept_action` are blanked once resolved (only
@@ -258,6 +290,10 @@ pub fn run_audit_pass(
         findings_new,
         findings_total_pending,
         counts,
+        // The judge tier runs AFTER the deterministic pass (see `judge_run_findings`); the
+        // caller folds its stats in.
+        judged: 0,
+        demoted: 0,
     })
 }
 
@@ -284,6 +320,294 @@ pub(crate) fn reconcile_run_on_epoch_advance(
         "seal epoch advanced during the pass; the run's staged findings were withdrawn"
     );
     Ok((0, BTreeMap::new()))
+}
+
+// ── Phase 3: the weekly schedule ──────────────────────────────────────────────────────────────
+
+/// One week in milliseconds — the scheduled-audit cadence.
+pub const WEEKLY_AUDIT_INTERVAL_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
+
+/// Is a scheduled audit pass due? PURE (now + the last SCHEDULED run's `finished_at` are
+/// injected). Due when enabled AND (never scheduled-ran, OR a full week has elapsed since the
+/// last scheduled run — `>=`, the brief runner's catch-up semantics: a late tick still fires).
+/// A claim row inserted before a pass counts as "ran", so a crashed/failed pass holds the week
+/// (claim-before-run — no hourly retry storm).
+pub fn weekly_due(now_ms: i64, last_scheduled_finished_at: Option<i64>, enabled: bool) -> bool {
+    if !enabled {
+        return false;
+    }
+    match last_scheduled_finished_at {
+        None => true,
+        Some(last) => now_ms.saturating_sub(last) >= WEEKLY_AUDIT_INTERVAL_MS,
+    }
+}
+
+/// ONE hourly due-check (called from the `lib.rs` consolidation-cadence loop — the first check is
+/// a full interval after launch, so run-on-launch-if-due comes free at +1h). Discipline:
+/// - re-reads the LIVE flag + last-scheduled-run from `AppState` each tick;
+/// - skips WITHOUT claiming on thermal ≥ Serious or a refusing RAM gate (retries next hour —
+///   the deterministic pass is always allowed once the gates pass);
+/// - CLAIMS the week (inserts the `scheduled = 1` run row) BEFORE the pass, so a crash/failure
+///   cannot re-fire until next week;
+/// - runs the SAME gated deterministic pass as the manual command (EMPTY unlock set inside
+///   `run_audit_pass`), then the judge tier, then emits the count-only
+///   [`crate::events::EVENT_AUDIT_UPDATED`] exactly like the manual command.
+///
+/// NEVER panics; every failure is a warn (ids/counts only — no PII).
+pub async fn audit_weekly_tick(handle: &tauri::AppHandle) {
+    use tauri::Manager;
+    let Some(state) = handle.try_state::<crate::state::AppState>() else {
+        return; // init failed — nothing to audit.
+    };
+    let enabled = state
+        .config
+        .lock()
+        .map(|c| c.vault_audit_weekly_enabled)
+        .unwrap_or(false); // poisoned config ⇒ skip this tick (fail quiet, retry next hour).
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let last = match state.db.last_scheduled_audit_run_finished_at() {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(target: "audit", error = %e, "weekly tick: schedule read failed");
+            return;
+        }
+    };
+    if !weekly_due(now_ms, last, enabled) {
+        return;
+    }
+    // Gates — checked BEFORE the claim so a hot/starved machine retries next hour instead of
+    // burning its weekly slot on a skip.
+    if crate::thermal::read_thermal_level() >= crate::thermal::ThermalLevel::Serious {
+        tracing::info!(target: "audit", "weekly audit skipped: thermal pressure (retrying next hour)");
+        return;
+    }
+    if !crate::transcribe::model::topic_backfill_ram_permits_now() {
+        tracing::info!(target: "audit", "weekly audit skipped: low system RAM (retrying next hour)");
+        return;
+    }
+    // CLAIM the week before running — a pass that crashes below cannot storm.
+    let claim_id = uuid::Uuid::new_v4().to_string();
+    if let Err(e) = state.db.insert_scheduled_audit_run_claim(&claim_id, now_ms) {
+        tracing::warn!(target: "audit", error = %e, "weekly tick: claim insert failed; skipping");
+        return;
+    }
+    // The deterministic pass on a blocking worker (the manual command's exact shape).
+    let tick_handle = handle.clone();
+    let joined = tokio::task::spawn_blocking(move || {
+        let state = tick_handle.state::<crate::state::AppState>();
+        let vault = state
+            .config
+            .lock()
+            .ok()
+            .and_then(|c| c.vault_path.clone())
+            .filter(|p| !p.is_empty());
+        run_audit_pass(
+            &state.db,
+            vault.as_deref().map(Path::new),
+            chrono::Utc::now().timestamp_millis(),
+            &state.seal_epoch,
+        )
+    })
+    .await;
+    let summary = match joined {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            tracing::warn!(target: "audit", error = %e, "weekly audit pass failed; next attempt next week");
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(target: "audit", error = %e, "weekly audit task join failed; next attempt next week");
+            return;
+        }
+    };
+    let stats = judge_run_findings(state.inner(), &summary.run_id).await;
+    let pending = state.db.count_pending_audit_findings().unwrap_or(0);
+    crate::events::emit_audit_updated(handle, pending as u32);
+    tracing::info!(
+        target: "audit",
+        run_id = %summary.run_id,
+        new = summary.findings_new,
+        judged = stats.judged,
+        demoted = stats.demoted,
+        pending,
+        "weekly vault audit complete"
+    );
+}
+
+// ── Phase 3: the LOCAL judge tier (noise demoter — NEVER cloud) ───────────────────────────────
+
+/// Hard wall-clock budget for ONE whole judge stage (all findings together) — the rerank.rs
+/// budget pattern, sized up because a judged finding is a full evidence block rather than a
+/// snippet, and the stage runs at most weekly (plus on manual runs).
+pub const JUDGE_STAGE_BUDGET_MS: u64 = 10_000;
+
+/// Hard decode cap per pointwise judge call — the answer is a one-key JSON bool.
+const JUDGE_MAX_TOKENS: usize = 32;
+
+/// The finding kinds the judge may score. Deliberately ONLY the two heuristic-noise-prone kinds:
+/// broken links / orphans / unlinked mentions are exact string/graph facts a model cannot
+/// out-judge.
+const JUDGED_KINDS: [&str; 2] = ["contradiction", "stale"];
+
+/// Judge-stage outcome (counts only — the observability AND the summary fields).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct JudgeStats {
+    /// Findings whose judge call returned a parseable verdict.
+    pub judged: usize,
+    /// Findings deleted as noise (`keep = false`).
+    pub demoted: usize,
+}
+
+/// The pointwise judge core (SYNC — runs on the blocking pool under the heavy-inference permit).
+/// For each row: one strict tiny-JSON `{"keep": bool}` call on the LOCAL reasoner, deadline-
+/// checked BETWEEN rows, each call bounded by [`JUDGE_MAX_TOKENS`] + the remaining wall-clock
+/// budget (the rerank.rs pattern). The prompt carries ONLY the finding's own `kind` +
+/// `evidence_md` — already visible-by-construction (staged by the gated pass, purged on seal) —
+/// and reaches ONLY the on-device model (zero egress by construction; the orchestrator resolves
+/// `ReasonerCell::light`, local-or-stub, never cloud).
+///
+/// LOSS-SAFE degrade contract (the rerank posture): any error, malformed reply, or deadline
+/// expiry KEEPS the finding. `keep = false` DELETES the pending row outright — NOT dismiss, whose
+/// `dedupe_key` suppression would permanently silence a real issue; a deleted finding re-stages
+/// on the next pass if the evidence recurs. A row resolved/purged since the read is left alone
+/// (`delete_pending_audit_finding` is pending-only). Logs counts only.
+pub(crate) fn judge_findings_sync(
+    db: &Db,
+    reasoner: &dyn crate::reason::LocalReasoner,
+    rows: &[AuditFindingRow],
+    budget_ms: u64,
+) -> JudgeStats {
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + Duration::from_millis(budget_ms);
+    // Tiny schema (< 512 B serialized) — the strict-JSON pointwise shape.
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": { "keep": { "type": "boolean" } },
+        "required": ["keep"]
+    });
+    let system = "You review automated vault-audit findings for noise. Reply ONLY with JSON: \
+                  {\"keep\": true} if the finding flags a real, useful issue worth showing the \
+                  user, {\"keep\": false} if it is noise (trivial, self-evident, or not \
+                  actionable).";
+
+    let mut stats = JudgeStats::default();
+    for row in rows {
+        let now = Instant::now();
+        if now >= deadline {
+            break; // out of budget — the rest are kept (degrade toward keeping everything).
+        }
+        let user = format!("Finding kind: {}\n\nEvidence:\n{}", row.kind, row.evidence_md);
+        let opts = crate::reason::GenOptions {
+            max_tokens: Some(JUDGE_MAX_TOKENS),
+            temperature: Some(0.0),
+            enable_thinking: false,
+            timeout: Some(deadline - now),
+            ..crate::reason::GenOptions::default()
+        };
+        match reasoner.structured_with(system, &user, &schema, opts) {
+            Ok(v) => {
+                let Some(keep) = v.get("keep").and_then(|b| b.as_bool()) else {
+                    continue; // malformed shape ⇒ keep (uncounted).
+                };
+                stats.judged += 1;
+                if !keep {
+                    match db.delete_pending_audit_finding(&row.id) {
+                        Ok(true) => stats.demoted += 1,
+                        Ok(false) => {} // resolved/purged since the read — left alone.
+                        Err(e) => {
+                            tracing::warn!(target: "audit", error = %e, "judge demote delete failed; keeping");
+                        }
+                    }
+                }
+            }
+            Err(_) => {
+                // Any reasoner failure ⇒ keep. No PII in logs — the counts below are the
+                // observability (the rerank.rs posture).
+            }
+        }
+    }
+    tracing::info!(
+        target: "audit",
+        candidates = rows.len(),
+        judged = stats.judged,
+        demoted = stats.demoted,
+        "audit judge stage complete"
+    );
+    stats
+}
+
+/// Judge THIS run's newly staged `contradiction`/`stale` findings (each finding is judged exactly
+/// once, at staging time — survivors are not re-judged by later passes). Resolves the LIGHT local
+/// engine (local-or-stub, NEVER cloud — the consolidation-job discipline) and SKIPS on the stub;
+/// takes the ONE global heavy-inference permit for the whole stage. Degrades to keep-everything
+/// on any failure — this function never errors.
+pub async fn judge_run_findings(state: &crate::state::AppState, run_id: &str) -> JudgeStats {
+    let reasoner = state.reasoner.light();
+    if reasoner.id() == "stub" {
+        tracing::debug!(target: "audit", "no local light model; skipping the audit judge stage");
+        return JudgeStats::default();
+    }
+    let rows: Vec<AuditFindingRow> = match state.db.list_audit_finding_rows("pending") {
+        Ok(rows) => rows
+            .into_iter()
+            .filter(|r| r.run_id == run_id && JUDGED_KINDS.contains(&r.kind.as_str()))
+            .collect(),
+        Err(e) => {
+            tracing::warn!(target: "audit", error = %e, "judge stage: pending read failed; keeping everything");
+            return JudgeStats::default();
+        }
+    };
+    if rows.is_empty() {
+        return JudgeStats::default();
+    }
+    let db = state.db.clone();
+    match crate::perf::run_heavy(&state.heavy_inference, move || {
+        Ok(judge_findings_sync(&db, reasoner.as_ref(), &rows, JUDGE_STAGE_BUDGET_MS))
+    })
+    .await
+    {
+        Ok(stats) => stats,
+        Err(e) => {
+            tracing::warn!(target: "audit", error = %e, "judge stage failed; keeping everything");
+            JudgeStats::default()
+        }
+    }
+}
+
+// ── Phase 3: the explain prompt (user-initiated; the PROVIDER seam owns consent/redaction) ─────
+
+/// Char cap on the gated source-note excerpt the explanation prompt carries (a bounded snippet,
+/// not the whole note — the brief runner's budget posture, sized for one note).
+pub(crate) const EXPLAIN_SNIPPET_CHARS: usize = 4_000;
+
+/// Compose the (system, user) prompt for one finding explanation. PURE. `source_snippet` is the
+/// caller's ALREADY-GATED, already-capped excerpt of the source note (current session unlock
+/// set); everything else comes off the pending row itself (pending rows hold the derived
+/// plaintext by design).
+pub(crate) fn build_explain_prompt(row: &AuditFindingRow, source_snippet: &str) -> (String, String) {
+    let system = "You are Murmur's vault-health assistant. Explain ONE automated audit finding \
+                  to the user: what was detected, why it matters for their notes, and what \
+                  accepting the suggested action would do. Reply in concise markdown (a short \
+                  paragraph, optionally a few bullets). Ground every statement in the provided \
+                  evidence — do not invent content."
+        .to_string();
+    let mut user = format!(
+        "Finding kind: {}\nSource note: {}\n",
+        row.kind, row.source_title
+    );
+    if let Some(t) = row.target_title.as_deref().filter(|t| !t.is_empty()) {
+        user.push_str(&format!("Related note: {t}\n"));
+    }
+    user.push_str(&format!("\nEvidence:\n{}\n", row.evidence_md));
+    if !row.accept_action.is_empty() {
+        user.push_str(&format!("\nSuggested action on accept: {}\n", row.accept_action));
+    }
+    if !source_snippet.trim().is_empty() {
+        user.push_str(&format!(
+            "\nSource note excerpt (may be truncated):\n{source_snippet}\n"
+        ));
+    }
+    (system, user)
 }
 
 /// The gated corpus: every VISIBLE meeting note + standalone note, read with the EMPTY unlock
@@ -906,10 +1230,30 @@ mod tests {
             findings_new: 3,
             findings_total_pending: 4,
             counts: [("broken_link".to_string(), 3usize)].into_iter().collect(),
+            judged: 2,
+            demoted: 1,
         };
         assert_eq!(
             serde_json::to_string(&summary).unwrap(),
-            r#"{"runId":"r1","startedAt":1,"finishedAt":2,"findingsNew":3,"findingsTotalPending":4,"counts":{"broken_link":3}}"#
+            r#"{"runId":"r1","startedAt":1,"finishedAt":2,"findingsNew":3,"findingsTotalPending":4,"counts":{"broken_link":3},"judged":2,"demoted":1}"#
+        );
+        let schedule = AuditSchedule {
+            enabled: true,
+            last_run_at: Some(10),
+            next_due_at: Some(10 + WEEKLY_AUDIT_INTERVAL_MS),
+        };
+        assert_eq!(
+            serde_json::to_string(&schedule).unwrap(),
+            r#"{"enabled":true,"lastRunAt":10,"nextDueAt":604800010}"#
+        );
+        let explanation = AuditExplanation {
+            finding_id: "f1".into(),
+            explanation_md: "because".into(),
+            provider: "claude_code".into(),
+        };
+        assert_eq!(
+            serde_json::to_string(&explanation).unwrap(),
+            r#"{"findingId":"f1","explanationMd":"because","provider":"claude_code"}"#
         );
         let finding = AuditFinding {
             id: "f1".into(),
@@ -1682,5 +2026,287 @@ mod tests {
         let pending = db.list_audit_finding_rows("pending").unwrap();
         assert_eq!(pending.len(), 1, "only the other run's row survives: {pending:#?}");
         assert_eq!(pending[0].dedupe_key, "k-other-run");
+    }
+
+    // ── Phase 3: the weekly schedule ──
+
+    /// The pure due predicate: enabled + (never-ran OR a full week elapsed, `>=` catch-up).
+    #[test]
+    fn weekly_due_matrix() {
+        let now = 1_700_000_000_000i64;
+        // Never scheduled-ran + enabled → due.
+        assert!(weekly_due(now, None, true));
+        // Disabled → never due, even never-ran.
+        assert!(!weekly_due(now, None, false));
+        assert!(!weekly_due(now, Some(now - WEEKLY_AUDIT_INTERVAL_MS - 1), false));
+        // Ran 6 days ago → holds.
+        assert!(!weekly_due(now, Some(now - WEEKLY_AUDIT_INTERVAL_MS + 1), true));
+        // EXACTLY a week ago → fires (>= — a late hourly tick still catches up).
+        assert!(weekly_due(now, Some(now - WEEKLY_AUDIT_INTERVAL_MS), true));
+        // Over a week ago → fires.
+        assert!(weekly_due(now, Some(now - WEEKLY_AUDIT_INTERVAL_MS - 3_600_000), true));
+        // Clock skew (a claim stamped in the future) → holds, never a storm.
+        assert!(!weekly_due(now, Some(now + 60_000), true));
+    }
+
+    /// CLAIM-BEFORE-RUN: the scheduled claim row alone (no completed pass — the crash case) holds
+    /// the week; manual (unscheduled) run rows never count toward due-ness. Also proves the
+    /// additive `scheduled` migration is idempotent and the claim/read round-trips.
+    #[test]
+    fn scheduled_claim_holds_the_week_and_manual_runs_do_not() {
+        let db = file_db("sched-claim");
+        db.migrate().unwrap(); // second run — the scheduled column migration is idempotent.
+        assert_eq!(db.last_scheduled_audit_run_finished_at().unwrap(), None);
+
+        // A MANUAL pass's bookkeeping row (scheduled = 0) leaves the weekly runner due.
+        let t0 = 1_700_000_000_000i64;
+        db.insert_audit_run("r-manual", t0, t0, "{}").unwrap();
+        assert_eq!(
+            db.last_scheduled_audit_run_finished_at().unwrap(),
+            None,
+            "manual runs never push the weekly cadence"
+        );
+        assert!(weekly_due(t0 + 1, None, true));
+
+        // The CLAIM row (inserted BEFORE the pass) holds the week even though no pass completed.
+        db.insert_scheduled_audit_run_claim("r-claim", t0).unwrap();
+        assert_eq!(db.last_scheduled_audit_run_finished_at().unwrap(), Some(t0));
+        assert!(
+            !weekly_due(t0 + 3_600_000, Some(t0), true),
+            "a failed/crashed pass cannot re-fire within the claimed week"
+        );
+        assert!(weekly_due(t0 + WEEKLY_AUDIT_INTERVAL_MS, Some(t0), true));
+
+        // The NEWEST claim wins.
+        let t1 = t0 + WEEKLY_AUDIT_INTERVAL_MS;
+        db.insert_scheduled_audit_run_claim("r-claim-2", t1).unwrap();
+        assert_eq!(db.last_scheduled_audit_run_finished_at().unwrap(), Some(t1));
+    }
+
+    // ── Phase 3: the local judge tier ──
+
+    /// A test reasoner with a canned verdict stream (or a hard failure).
+    struct VerdictReasoner {
+        /// `Some(bool)` = `{"keep": bool}`; `None` = malformed reply (no `keep` key).
+        verdicts: Vec<Option<bool>>,
+        calls: std::sync::atomic::AtomicUsize,
+        fail: bool,
+        delay_ms: u64,
+    }
+    impl VerdictReasoner {
+        fn keeping(verdicts: Vec<Option<bool>>) -> Self {
+            Self { verdicts, calls: std::sync::atomic::AtomicUsize::new(0), fail: false, delay_ms: 0 }
+        }
+    }
+    impl crate::reason::LocalReasoner for VerdictReasoner {
+        fn id(&self) -> &str {
+            "judge-test"
+        }
+        fn reason(&self, _s: &str, _u: &str) -> Result<String> {
+            Ok(String::new())
+        }
+        fn structured(
+            &self,
+            _s: &str,
+            _u: &str,
+            _schema: &serde_json::Value,
+        ) -> Result<serde_json::Value> {
+            if self.delay_ms > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(self.delay_ms));
+            }
+            if self.fail {
+                return Err(crate::error::AppError::Unavailable("model wedged".into()));
+            }
+            let i = self.calls.fetch_add(1, Ordering::SeqCst);
+            match self.verdicts.get(i).copied().flatten() {
+                Some(keep) => Ok(serde_json::json!({ "keep": keep })),
+                None => Ok(serde_json::json!({ "not_the_schema": 1 })),
+            }
+        }
+    }
+
+    /// Stage one judged-kind finding and return its row.
+    fn stage_judged_finding(db: &Db, key: &str, kind: &str) -> AuditFindingRow {
+        db.insert_audit_finding_if_new(
+            &NewAuditFinding {
+                kind: kind.into(),
+                source_kind: "meeting".into(),
+                source_id: "m-j".into(),
+                source_title: "T".into(),
+                target_title: None,
+                target_id: None,
+                target_kind: None,
+                evidence_md: "> a vs b".into(),
+                accept_action: "".into(),
+                dedupe_key: key.to_string(),
+            },
+            "run-judge",
+            1,
+        )
+        .unwrap();
+        db.list_audit_finding_rows("pending")
+            .unwrap()
+            .into_iter()
+            .find(|r| r.dedupe_key == key)
+            .unwrap()
+    }
+
+    /// `keep = false` DELETES the row outright (not dismiss) — so the SAME dedupe key can be
+    /// re-staged by a later pass (a real issue recurs); `keep = true` keeps it pending.
+    #[test]
+    fn judge_demote_deletes_and_the_finding_can_restage() {
+        let db = file_db("judge-demote");
+        let kept = stage_judged_finding(&db, "k-keep", "contradiction");
+        let demoted = stage_judged_finding(&db, "k-demote", "stale");
+
+        let reasoner = VerdictReasoner::keeping(vec![Some(true), Some(false)]);
+        let stats = judge_findings_sync(
+            &db,
+            &reasoner,
+            &[kept.clone(), demoted.clone()],
+            JUDGE_STAGE_BUDGET_MS,
+        );
+        assert_eq!((stats.judged, stats.demoted), (2, 1));
+        assert!(db.get_audit_finding(&kept.id).unwrap().is_some(), "keep=true survives");
+        assert!(
+            db.get_audit_finding(&demoted.id).unwrap().is_none(),
+            "keep=false is DELETED (not dismissed)"
+        );
+        // Deletion (unlike dismissal) leaves NO dedupe twin — the issue can re-stage next pass.
+        assert!(
+            db.insert_audit_finding_if_new(
+                &NewAuditFinding {
+                    kind: "stale".into(),
+                    source_kind: "meeting".into(),
+                    source_id: "m-j".into(),
+                    source_title: "T".into(),
+                    target_title: None,
+                    target_id: None,
+                    target_kind: None,
+                    evidence_md: "> a vs b".into(),
+                    accept_action: "".into(),
+                    dedupe_key: "k-demote".into(),
+                },
+                "run-next",
+                2,
+            )
+            .unwrap(),
+            "a demoted finding re-stages on the next pass"
+        );
+    }
+
+    /// The degrade matrix: an exhausted budget, a malformed reply, and a hard reasoner failure
+    /// ALL keep every finding (loss-safe — the judge can only ever delete on an explicit false).
+    #[test]
+    fn judge_degrades_keep_everything_on_budget_malformed_and_error() {
+        let db = file_db("judge-degrade");
+        let r1 = stage_judged_finding(&db, "k-1", "contradiction");
+        let r2 = stage_judged_finding(&db, "k-2", "stale");
+        let rows = vec![r1, r2];
+
+        // Budget already exhausted (0 ms) → nothing judged, nothing deleted.
+        let demote_all = VerdictReasoner::keeping(vec![Some(false), Some(false)]);
+        let stats = judge_findings_sync(&db, &demote_all, &rows, 0);
+        assert_eq!((stats.judged, stats.demoted), (0, 0));
+        assert_eq!(db.list_audit_finding_rows("pending").unwrap().len(), 2);
+
+        // Malformed replies (no `keep` key) → kept, uncounted.
+        let malformed = VerdictReasoner::keeping(vec![None, None]);
+        let stats = judge_findings_sync(&db, &malformed, &rows, JUDGE_STAGE_BUDGET_MS);
+        assert_eq!((stats.judged, stats.demoted), (0, 0));
+        assert_eq!(db.list_audit_finding_rows("pending").unwrap().len(), 2);
+
+        // Hard failures → kept.
+        let failing = VerdictReasoner {
+            verdicts: vec![],
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            fail: true,
+            delay_ms: 0,
+        };
+        let stats = judge_findings_sync(&db, &failing, &rows, JUDGE_STAGE_BUDGET_MS);
+        assert_eq!((stats.judged, stats.demoted), (0, 0));
+        assert_eq!(db.list_audit_finding_rows("pending").unwrap().len(), 2);
+
+        // The STUB reasoner's reply carries no `keep` key either → the same keep-everything path
+        // (the orchestrator additionally skips the stage entirely on id() == "stub").
+        let stats = judge_findings_sync(&db, &crate::reason::StubReasoner, &rows, JUDGE_STAGE_BUDGET_MS);
+        assert_eq!((stats.judged, stats.demoted), (0, 0));
+        assert_eq!(db.list_audit_finding_rows("pending").unwrap().len(), 2);
+    }
+
+    /// A slow first call blows the stage deadline: later findings are NEVER judged (kept), and
+    /// a row resolved between the read and the verdict is left alone (pending-only delete).
+    #[test]
+    fn judge_deadline_and_resolved_row_are_loss_safe() {
+        let db = file_db("judge-deadline");
+        let r1 = stage_judged_finding(&db, "k-slow-1", "contradiction");
+        let r2 = stage_judged_finding(&db, "k-slow-2", "stale");
+
+        // 30 ms budget vs a 60 ms call: the FIRST verdict (false) lands past its own in-call
+        // timeout budget but the call itself is judged at t≈0; the SECOND row falls past the
+        // deadline and is kept.
+        let slow = VerdictReasoner {
+            verdicts: vec![Some(false), Some(false)],
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            fail: false,
+            delay_ms: 60,
+        };
+        let stats = judge_findings_sync(&db, &slow, &[r1.clone(), r2.clone()], 30);
+        assert!(stats.judged <= 1, "at most the first row is judged: {stats:?}");
+        assert!(
+            db.get_audit_finding(&r2.id).unwrap().is_some(),
+            "a past-deadline row is kept"
+        );
+
+        // Pending-only delete: a row the user resolved between read and verdict survives.
+        let r3 = stage_judged_finding(&db, "k-resolved", "stale");
+        db.resolve_audit_finding_row(&r3.id, "accepted", 5).unwrap();
+        let demote = VerdictReasoner::keeping(vec![Some(false)]);
+        let stats = judge_findings_sync(&db, &demote, std::slice::from_ref(&r3), JUDGE_STAGE_BUDGET_MS);
+        assert_eq!(stats.demoted, 0, "a resolved row is never deleted");
+        assert_eq!(
+            db.get_audit_finding(&r3.id).unwrap().unwrap().status,
+            "accepted",
+            "the resolved row is untouched"
+        );
+    }
+
+    // ── Phase 3: the explain prompt (pure) ──
+
+    #[test]
+    fn explain_prompt_carries_evidence_action_and_snippet_only() {
+        let row = AuditFindingRow {
+            id: "f1".into(),
+            kind: "contradiction".into(),
+            source_kind: "meeting".into(),
+            source_id: "m-a".into(),
+            source_title: "Meeting A".into(),
+            target_title: Some("Meeting B".into()),
+            target_id: Some("m-b".into()),
+            target_kind: Some("meeting".into()),
+            evidence_md: "> \"shipped\" vs \"cancelled\"".into(),
+            accept_action: "Append [!conflict] callouts cross-linking both sources".into(),
+            dedupe_key: "k".into(),
+            status: "pending".into(),
+            run_id: "r".into(),
+            created_at: 1,
+            resolved_at: None,
+        };
+        let (system, user) = build_explain_prompt(&row, "the gated excerpt");
+        assert!(system.contains("do not invent"), "grounding instruction present");
+        assert!(user.contains("contradiction"));
+        assert!(user.contains("Meeting A") && user.contains("Meeting B"));
+        assert!(user.contains("shipped") && user.contains("cancelled"));
+        assert!(user.contains("Append [!conflict]"));
+        assert!(user.contains("the gated excerpt"));
+
+        // No snippet / no action / no target → those sections are simply absent.
+        let mut bare = row.clone();
+        bare.target_title = None;
+        bare.accept_action = String::new();
+        let (_, user) = build_explain_prompt(&bare, "");
+        assert!(!user.contains("Related note:"));
+        assert!(!user.contains("Suggested action"));
+        assert!(!user.contains("excerpt"));
     }
 }

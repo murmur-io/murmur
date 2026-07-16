@@ -114,5 +114,25 @@
       }
     </div>
   </div>
+
+  <!-- ── Vault hygiene ─────────────────────────────────────────────── -->
+  <div class="use-group">
+    <span class="use-group-label text-muted">Vault hygiene</span>
+    <div class="audit-weekly">
+      <label class="toggle-row">
+        <span class="toggle-copy">
+          <span class="toggle-title">Weekly vault audit</span>
+          <span class="text-secondary toggle-sub">
+            Runs the deterministic vault audit once a week, on-device, zero
+            egress.
+          </span>
+        </span>
+        <mur-toggle
+          [formControl]="auditControl"
+          ariaLabel="Weekly vault audit"
+        />
+      </label>
+    </div>
+  </div>
 </div>
   

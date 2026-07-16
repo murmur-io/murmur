@@ -1,9 +1,11 @@
 import {
   ChangeDetectionStrategy,
   Component,
+  type ElementRef,
   forwardRef,
   input,
   signal,
+  viewChild,
 } from "@angular/core";
 import { NG_VALUE_ACCESSOR, type ControlValueAccessor } from "@angular/forms";
 
@@ -32,11 +34,24 @@ export class MurToggleComponent implements ControlValueAccessor {
   readonly checked = signal(false);
   readonly disabled = signal(false);
 
+  private readonly box =
+    viewChild<ElementRef<HTMLInputElement>>("box");
+
   private onChange: (v: boolean) => void = () => undefined;
   private onTouched: () => void = () => undefined;
 
   writeValue(v: unknown): void {
-    this.checked.set(!!v);
+    const val = !!v;
+    this.checked.set(val);
+    // A confirm-then-REVERT (user flips → backend rejects → setValue back)
+    // coalesces the signal's false→true→false into a net no-change inside one
+    // CD cycle, so the [checked] binding never rewrites the NATIVE property
+    // the click already flipped. Sync it directly — exactly what Angular's
+    // CheckboxControlValueAccessor does.
+    const el = this.box()?.nativeElement;
+    if (el && el.checked !== val) {
+      el.checked = val;
+    }
   }
   registerOnChange(fn: (v: boolean) => void): void {
     this.onChange = fn;

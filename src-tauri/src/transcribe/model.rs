@@ -405,6 +405,10 @@ where
     F: FnMut(u64, Option<u64>),
 {
     let dir = parakeet_dir()?;
+    // Connect-bounded, total-uncapped (same posture as the whisper fetch): a parakeet weights file
+    // is multi-hundred-MB — a legitimate slow download can outlast any fixed total cap, and this
+    // path is user-driven with live progress. ONE client is reused across the four files.
+    let client = download_client(None);
     // Aggregate progress across the four files: carry the bytes of already-finished files forward
     // so each file's per-file `downloaded` is offset onto the running total.
     let mut base: u64 = 0;
@@ -416,7 +420,7 @@ where
             base = base.saturating_add(std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0));
             continue;
         }
-        download_model_streaming(&parakeet_model_url(file), &dest, |d, _t| {
+        download_model_streaming(&client, &parakeet_model_url(file), &dest, |d, _t| {
             // The aggregate total is unknown across four files (mixed Content-Length availability),
             // so report the running byte sum with `None` total — the FE shows an indeterminate/byte
             // progress, consistent with the whisper multi-GB bar.
@@ -485,7 +489,9 @@ where
     let dir = models_dir()?;
     let file = model_filename(&size, language);
     let dest = dir.join(&file);
-    download_model_streaming(&model_url(&file), &dest, on_progress).await?;
+    // Connect-bounded, total-uncapped: a multi-GB whisper model on a slow link can legitimately
+    // outlast any fixed total cap (see the constants above).
+    download_model_streaming(&download_client(None), &model_url(&file), &dest, on_progress).await?;
     Ok(dest)
 }
 
@@ -525,13 +531,45 @@ pub async fn ensure_diarization_models() -> Result<(PathBuf, PathBuf)> {
     Ok((seg, emb))
 }
 
+/// Connect timeout for EVERY model download (mirrors the hardened cloud client in
+/// `summarize::anthropic::build_client`): a dead / blackholed host fails in seconds instead of
+/// hanging the first-use fetch on the pipeline path.
+const DOWNLOAD_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Overall wall-clock cap for the SMALL model downloads (Silero VAD ~2 MB, diarization
+/// segmentation ~6 MB / embedding ~28 MB): generous even on a slow link, but BOUNDED — these are
+/// awaited by `pipeline::run_inner` OUTSIDE the ASR stage watchdog, so before this cap a mid-body
+/// stall on first use hung a transcription silently ("wedged on Transcribing…" with zero trail).
+/// The multi-GB whisper fetch deliberately keeps NO total cap (a legitimate slow download of a
+/// 3+ GB model can exceed any fixed number; it is user-driven with live progress UI) — it gets
+/// the connect timeout only.
+const SMALL_MODEL_DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Build the reqwest client for a model download: always a bounded connect, plus an optional
+/// overall request cap (see [`SMALL_MODEL_DOWNLOAD_TIMEOUT`] for who passes what). Falls back to
+/// `Client::new()` only if the builder somehow fails (same never-un-constructible posture as
+/// `summarize::anthropic::build_client`).
+fn download_client(total_timeout: Option<std::time::Duration>) -> reqwest::Client {
+    let mut builder = reqwest::Client::builder().connect_timeout(DOWNLOAD_CONNECT_TIMEOUT);
+    if let Some(t) = total_timeout {
+        builder = builder.timeout(t);
+    }
+    builder.build().unwrap_or_else(|_| reqwest::Client::new())
+}
+
 /// Download `url` to `dest` atomically (`dest.part` → rename), invoking `on_progress(downloaded,
 /// total)` as bytes arrive (`total` is `None` when the server omits `Content-Length`). INBOUND
 /// ONLY: fetches a model file and sends NO request body / NO meeting content (no egress). Streams
 /// via `Response::chunk` (no extra stream-combinator dep) so a multi-GB whisper model reports live
 /// progress instead of buffering the whole body in memory. Overwrites any stale partial. Verifies a
-/// non-empty body before the rename. NO PII is logged (model id / byte counts only).
-async fn download_model_streaming<F>(url: &str, dest: &Path, mut on_progress: F) -> Result<()>
+/// non-empty body before the rename. NO PII is logged (model id / byte counts only). The `client`
+/// carries the caller's timeout posture (see [`download_client`]).
+async fn download_model_streaming<F>(
+    client: &reqwest::Client,
+    url: &str,
+    dest: &Path,
+    mut on_progress: F,
+) -> Result<()>
 where
     F: FnMut(u64, Option<u64>),
 {
@@ -539,7 +577,9 @@ where
 
     tracing::info!(target: "transcribe", file = %dest.display(), "downloading whisper model");
 
-    let mut resp = reqwest::get(url)
+    let mut resp = client
+        .get(url)
+        .send()
         .await
         .map_err(|e| AppError::Transcribe(format!("model download request failed: {e}")))?;
     if !resp.status().is_success() {
@@ -667,8 +707,14 @@ pub fn sweep_stale_model_parts(models_dir: &Path) {
 
 /// Non-progress download for the VAD + diarization models (small, no UI progress bar). Delegates to
 /// [`download_model_streaming`] with a no-op callback so all model fetches share one atomic path.
+/// FULLY time-bounded ([`SMALL_MODEL_DOWNLOAD_TIMEOUT`]): these first-use fetches run inside
+/// `pipeline::run_inner` OUTSIDE the ASR watchdog, where a stalled body used to hang the
+/// transcription silently — a timeout here degrades gracefully at both call sites
+/// ([`ensure_vad_model`] → whole-buffer transcribe; [`ensure_diarization_models`] → single
+/// "others" label).
 async fn download_model(url: &str, dest: &Path) -> Result<()> {
-    download_model_streaming(url, dest, |_, _| {}).await
+    let client = download_client(Some(SMALL_MODEL_DOWNLOAD_TIMEOUT));
+    download_model_streaming(&client, url, dest, |_, _| {}).await
 }
 
 #[cfg(test)]
@@ -720,7 +766,7 @@ mod tests {
         let dest = dir.join("ggml-tiny.bin");
         let url = format!("http://{addr}/model.bin");
 
-        let res = download_model_streaming(&url, &dest, |_, _| {}).await;
+        let res = download_model_streaming(&download_client(None), &url, &dest, |_, _| {}).await;
         assert!(res.is_err(), "a truncated body must surface an error");
 
         // `with_extension("part")` maps `ggml-tiny.bin` → `ggml-tiny.part`.
@@ -732,6 +778,60 @@ mod tests {
         assert!(!dest.exists(), "no model file is produced from a failed download");
 
         let _ = server.join();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Hardening item 2 (RED-before-GREEN, stalled-body path): a server that ACCEPTS the
+    /// connection, sends headers + a few bytes, then goes SILENT (socket held open, no more data,
+    /// no close) must ERROR within the client's overall timeout. Pre-fix, the bare `reqwest::get`
+    /// had NO timeout, so this future never resolved — and the VAD/diarization first-use fetch it
+    /// backs is awaited by `pipeline::run_inner` OUTSIDE the ASR watchdog → a silent transcription
+    /// hang. The outer 10 s `tokio::time::timeout` is the RED detector: on the unpatched code it
+    /// fires (test FAILs); with the timeout-bearing client the download errors in ~0.4 s (PASS)
+    /// and the `PartFileGuard` reclaims the partial.
+    #[tokio::test]
+    async fn download_times_out_on_a_stalled_body_instead_of_hanging() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Serve ONE connection: promise 1 MB, deliver 8 bytes, then hold the socket open silently.
+        // The handle is dropped (not joined) — the thread is killed with the test process.
+        let _server = std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf); // consume the request line/headers
+                let _ = sock.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\nConnection: close\r\n\r\n",
+                );
+                let _ = sock.write_all(b"PARTIAL0");
+                let _ = sock.flush();
+                // STALL: keep the socket open without delivering the remaining bytes — for LONGER
+                // than the outer 10 s RED detector, or a socket close would end the "hang" early
+                // and the unpatched code would pass on a mere connection-closed error (observed:
+                // an 8 s stall made this test useless as a regression).
+                std::thread::sleep(std::time::Duration::from_secs(30));
+            }
+        });
+
+        let dir = parts_tmp_dir("stall");
+        let dest = dir.join("silero-vad.onnx");
+        let url = format!("http://{addr}/model.onnx");
+
+        // Same client shape as the production small-model path, with a test-sized total cap.
+        let client = download_client(Some(std::time::Duration::from_millis(400)));
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            download_model_streaming(&client, &url, &dest, |_, _| {}),
+        )
+        .await
+        .expect("a stalled download must RESOLVE (as Err) within the client timeout — not hang");
+        assert!(res.is_err(), "a stalled body must surface an error");
+        assert!(
+            !dest.with_extension("part").exists(),
+            "the stalled `.part` must be reclaimed by the guard"
+        );
+        assert!(!dest.exists(), "no model file is produced from a stalled download");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
