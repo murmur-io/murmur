@@ -51,7 +51,7 @@ const MIN_MENTION_TITLE_CHARS: usize = 6;
 
 /// Staleness thresholds: a meeting note is flagged when it carries at least this many facts…
 const STALE_MIN_FACTS: usize = 3;
-/// …and at least half of them are closed (superseded). Expressed as closed*2 >= total.
+// …and at least half of them are closed (superseded). Expressed as closed*2 >= total.
 
 // ── Wire DTOs (the pinned FE seam — the Angular builder codes against exactly these) ─────────
 
