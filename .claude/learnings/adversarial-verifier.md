@@ -33,6 +33,19 @@
 ## Run journal
 <!-- Append-only, newest first. -->
 
+### [2026-07-17 link-picker pagination] Playwright `reuseExistingServer` on the fixed :4210 silently tested ANOTHER checkout's build
+- **Pattern:** mid-verification e2e runs flipped green→red for no code reason — `playwright.config.ts`
+  has `reuseExistingServer: true` on the fixed port 4210, and a CONCURRENT session's `ng serve`
+  (cwd = the main checkout, pre-fix bundle) was holding the port, so the specs silently exercised the
+  WRONG tree. Evidence gathered while any other checkout can own :4210 is unreliable in both
+  directions (false RED here; a false PASS is equally possible).
+- **Caught by:** adversarial-verifier (probe results contradicted the code under review; `lsof -p` of
+  the :4210 owner showed a foreign cwd).
+- **Lesson:** before trusting any e2e evidence, prove WHICH tree the server on the port is serving
+  (`lsof -ti :4210` → `lsof -p <pid> | grep cwd`). When more than one checkout/session is alive, run
+  the suite on a private port with `reuseExistingServer: false` (temp config), never the shared 4210.
+- **Status:** journal
+
 ### [2026-07-05 detail redesign — #194] a PASS on a tree that didn't build
 - **Pattern:** A build workflow's verify phase ran WHILE the build phases had left the tree
   NON-BUILDING (a Split agent died mid-response + a syntax error cascaded), yet a structure-level
