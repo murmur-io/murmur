@@ -190,6 +190,282 @@ pub fn set_meeting_id(ops: &mut [FactOp], meeting_id: &str) {
     }
 }
 
+// ── Knowledge Diff (Brain v3 PR-6) — deterministic bitemporal AS-OF + set algebra ───────────────
+//
+// A PRODUCT surface over the SHIPPED bitemporal store: "what did I know AS OF `from`" vs
+// "AS OF `to`", plus the chronological decision ledger (each supersession = old fact → new fact →
+// source meeting). All PURE + clock-injected (the caller passes the two instants) so the whole core
+// is headless-testable, exactly like [`reconcile_facts`]. The gating lives upstream: these functions
+// operate on the ALREADY-visibility-gated fact slice from [`crate::storage::Db::list_facts_visible`],
+// so a sealed-and-not-session-unlocked meeting's fact never enters here.
+
+/// One END of a supersession pair in a [`KnowledgeDiff`] change (or one added/removed fact),
+/// projected down to what a decision ledger needs: the human-readable value + provenance. The
+/// object's ORIGINAL casing is preserved (the `norm` key is only the identity, never the display).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct FactStateChange {
+    /// Entity name at assertion time (the fact's `subject`).
+    pub subject: String,
+    /// The attribute (the fact's `predicate`), e.g. "status", "owner".
+    pub predicate: String,
+    /// For `added`: `None`. For `removed`: the object that was current. For `changed`: the OLD object.
+    pub old_object: Option<String>,
+    /// For `removed`: `None`. For `added`: the object now current. For `changed`: the NEW object.
+    pub new_object: Option<String>,
+    /// The valid-time start of the state now in effect at snapshot `b` (added/changed), or of the
+    /// state that WAS in effect at `a` for a `removed` row — carries the ledger's date.
+    pub valid_from: String,
+    /// The source meeting the (new, for changed/added; removed's) fact was learned from — the
+    /// gating + provenance anchor. `None` only for legacy unattributed rows (already gate-dropped
+    /// upstream, so in practice always `Some`).
+    pub source_meeting_id: Option<String>,
+}
+
+/// The deterministic diff of two [`snapshot_as_of`] snapshots, keyed by `(norm(subject),
+/// norm(predicate))`: an attribute present in `b` but not `a` is **added**; present in `a` but not
+/// `b` is **removed**; present in both with a DIFFERENT (normalized) object is **changed**
+/// (old → new). Same key + same object = no entry (unchanged). Every list is sorted deterministically
+/// by `(norm(subject), norm(predicate))` so the output is stable for tests + the FE.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct KnowledgeDiff {
+    pub added: Vec<FactStateChange>,
+    pub removed: Vec<FactStateChange>,
+    pub changed: Vec<FactStateChange>,
+}
+
+/// DETERMINISTIC ordering of two RFC3339 timestamps as INSTANTS. Both sides are parsed to
+/// `DateTime<Utc>` and compared on the timeline, so the two equally-valid RFC3339 renderings of the
+/// SAME moment compare EQUAL regardless of surface form — `Z` vs `+00:00`, and fractional-second
+/// digits (`...00:00Z` vs `...00:00.000000000+00:00`). A naive byte-lexical compare would NOT: `Z`
+/// (0x5A) sorts above `+` (0x2B), and differing fractional digits reorder identical instants.
+///
+/// FALLBACK (mirrors [`crate::memory::compute_recency`]'s posture): if EITHER side fails to parse
+/// (a junk/corrupt stored timestamp, or a malformed caller instant), we do NOT panic and do NOT
+/// silently drop the fact — we fall back to the original byte-lexical `str` comparison for that one
+/// pair. That keeps the function total and deterministic on garbage input (a bad timestamp yields a
+/// defined, reproducible ordering rather than a crash or an undefined include/exclude).
+fn cmp_instant(a: &str, b: &str) -> std::cmp::Ordering {
+    match (
+        chrono::DateTime::parse_from_rfc3339(a),
+        chrono::DateTime::parse_from_rfc3339(b),
+    ) {
+        // Compare on the instant (with_timezone(&Utc) normalizes any offset to the timeline).
+        (Ok(pa), Ok(pb)) => pa
+            .with_timezone(&chrono::Utc)
+            .cmp(&pb.with_timezone(&chrono::Utc)),
+        // Either side unparseable → deterministic byte-lexical fallback (never panic, never drop).
+        _ => a.cmp(b),
+    }
+}
+
+/// The facts OPEN (valid) at instant `at`: `valid_from <= at AND (valid_to IS NULL OR valid_to >
+/// at)`. Pure, clock-injected (`at` is the caller's instant — no `now()`). Timestamps are compared
+/// as INSTANTS via [`cmp_instant`], NOT byte-lexically, so a fact stored in `+00:00` fractional form
+/// classifies correctly against a caller `at` in `Z` form (and vice versa) at the same moment — the
+/// FE date-range picker may pass either rendering. Boundary semantics match the bitemporal
+/// convention: a fact is OPEN on its `valid_from` (inclusive) and CLOSED exactly at its `valid_to`
+/// (`valid_to > at`, so `at == valid_to` excludes it — the superseding fact is the one open at that
+/// instant instead).
+pub fn snapshot_as_of<'a>(facts: &'a [Fact], at: &str) -> Vec<&'a Fact> {
+    use std::cmp::Ordering;
+    facts
+        .iter()
+        .filter(|f| {
+            // valid_from <= at
+            cmp_instant(&f.valid_from, at) != Ordering::Greater
+                && match &f.valid_to {
+                    None => true,
+                    // valid_to > at
+                    Some(vt) => cmp_instant(vt, at) == Ordering::Greater,
+                }
+        })
+        .collect()
+}
+
+/// The identity key for diffing/ledgering a fact: `(norm(subject), norm(predicate))` — the SAME
+/// normalization [`reconcile_facts`] uses, so a diff key lines up 1:1 with a supersession key.
+fn diff_key(f: &Fact) -> (String, String) {
+    (norm(&f.subject), norm(&f.predicate))
+}
+
+/// Project a `Fact` into a [`FactStateChange`] for one side of the diff. `old`/`new` decide which of
+/// old_object/new_object carries this fact's object.
+fn to_change(f: &Fact, old: Option<String>, new: Option<String>) -> FactStateChange {
+    FactStateChange {
+        subject: f.subject.clone(),
+        predicate: f.predicate.clone(),
+        old_object: old,
+        new_object: new,
+        valid_from: f.valid_from.clone(),
+        source_meeting_id: f.meeting_id.clone(),
+    }
+}
+
+/// DETERMINISTIC set algebra over two snapshots (each a slice of the SAME entity's facts, from
+/// [`snapshot_as_of`] at two instants `a` < `b`). Keyed by `(norm(subject), norm(predicate))`:
+///   * in `b` not `a` → **added** (new_object = b's object),
+///   * in `a` not `b` → **removed** (old_object = a's object),
+///   * in both, DIFFERENT normalized object → **changed** (old = a's object, new = b's object;
+///     provenance from the NEW/`b` fact — its valid_from + source meeting),
+///   * in both, SAME normalized object → no entry.
+///
+/// Within a snapshot a key can only be open once (one currently-valid fact per key, by the reconcile
+/// invariant); if a malformed input repeats a key the FIRST occurrence wins deterministically. All
+/// three output lists are sorted by key for stable, test-friendly output.
+pub fn diff_snapshots(a: &[&Fact], b: &[&Fact]) -> KnowledgeDiff {
+    use std::collections::BTreeMap;
+    // BTreeMap keeps the keys sorted → deterministic output without a post-sort.
+    let mut ma: BTreeMap<(String, String), &Fact> = BTreeMap::new();
+    for f in a {
+        ma.entry(diff_key(f)).or_insert(f);
+    }
+    let mut mb: BTreeMap<(String, String), &Fact> = BTreeMap::new();
+    for f in b {
+        mb.entry(diff_key(f)).or_insert(f);
+    }
+
+    let mut diff = KnowledgeDiff::default();
+    // added / changed: iterate b's keys (sorted).
+    for (key, fb) in &mb {
+        match ma.get(key) {
+            None => diff
+                .added
+                .push(to_change(fb, None, Some(fb.object.clone()))),
+            Some(fa) => {
+                if norm(&fa.object) != norm(&fb.object) {
+                    diff.changed.push(to_change(
+                        fb,
+                        Some(fa.object.clone()),
+                        Some(fb.object.clone()),
+                    ));
+                }
+            }
+        }
+    }
+    // removed: keys in a not in b (sorted).
+    for (key, fa) in &ma {
+        if !mb.contains_key(key) {
+            diff.removed
+                .push(to_change(fa, Some(fa.object.clone()), None));
+        }
+    }
+    diff
+}
+
+/// The chronological DECISION LEDGER for one entity: every supersession (a fact CLOSED because a
+/// later fact with the same key opened with a different object), oldest → newest by the NEW fact's
+/// `valid_from`. Each entry carries `old_object` (the closed fact's value), `new_object` (the value
+/// that replaced it), `valid_from` (when the new value took effect) and `source_meeting_id` (the
+/// meeting the new value was learned from). Pure + deterministic over the visibility-gated fact
+/// slice — a sealed-not-unlocked meeting's fact is already absent, so its supersession never appears.
+///
+/// Derivation: group by key, sort each group by `(valid_from, id)`, and emit one ledger row per
+/// adjacent (older, newer) pair whose normalized objects differ. Adjacent pairs with the SAME object
+/// (a re-assertion) are not decisions and are skipped.
+pub fn supersession_ledger(facts: &[Fact]) -> Vec<FactStateChange> {
+    use std::collections::BTreeMap;
+    let mut by_key: BTreeMap<(String, String), Vec<&Fact>> = BTreeMap::new();
+    for f in facts {
+        by_key.entry(diff_key(f)).or_default().push(f);
+    }
+    let mut rows: Vec<FactStateChange> = Vec::new();
+    for group in by_key.values_mut() {
+        group.sort_by(|x, y| {
+            x.valid_from
+                .cmp(&y.valid_from)
+                .then_with(|| x.id.cmp(&y.id))
+        });
+        for pair in group.windows(2) {
+            let (older, newer) = (pair[0], pair[1]);
+            if norm(&older.object) != norm(&newer.object) {
+                rows.push(to_change(
+                    newer,
+                    Some(older.object.clone()),
+                    Some(newer.object.clone()),
+                ));
+            }
+        }
+    }
+    // Chronological across ALL keys: oldest decision first, ties by (subject, predicate) for stability.
+    rows.sort_by(|x, y| {
+        x.valid_from
+            .cmp(&y.valid_from)
+            .then_with(|| norm(&x.subject).cmp(&norm(&y.subject)))
+            .then_with(|| norm(&x.predicate).cmp(&norm(&y.predicate)))
+    });
+    rows
+}
+
+/// The IPC/MCP payload for [`build_knowledge_diff`]: the between-two-instants set diff PLUS the full
+/// chronological decision ledger for one entity. All state comes from the visibility-gated fact
+/// slice, so a sealed-and-not-session-unlocked meeting's fact is absent from every field.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct EntityKnowledgeDiff {
+    pub entity_id: String,
+    /// The `from` instant the caller asked to snapshot at (echoed for the FE).
+    pub from: String,
+    /// The `to` instant the caller asked to snapshot at (echoed for the FE).
+    pub to: String,
+    /// added / removed / changed between the `from` and `to` snapshots.
+    pub diff: KnowledgeDiff,
+    /// Every supersession for this entity, oldest → newest — the decision ledger (independent of the
+    /// from/to window: it is the entity's whole history, so the FE can render the full timeline).
+    pub ledger: Vec<FactStateChange>,
+}
+
+/// GATED builder for the Knowledge Diff of one ALREADY-RESOLVED entity id. Reads the entity's facts
+/// through the EXISTING visibility-gated reader [`crate::storage::Db::list_facts_visible`] — a
+/// sealed-and-not-session-unlocked meeting's fact never enters, so it can appear in NO snapshot, diff
+/// entry, or ledger row. The interval algebra ([`snapshot_as_of`] + [`diff_snapshots`]) and the
+/// [`supersession_ledger`] are the deterministic, clock-injected pure core; this function only
+/// glues the gated read to them. `from`/`to` are ISO-8601 instants (the FE passes the two dates it
+/// is comparing).
+pub fn build_knowledge_diff(
+    db: &crate::storage::Db,
+    entity_id: &str,
+    from: &str,
+    to: &str,
+    unlocked: &std::collections::HashSet<String>,
+) -> crate::error::Result<EntityKnowledgeDiff> {
+    // Normalize the FE-supplied range to a canonical UTC rendering so a `Z`-form date works against
+    // stored `+00:00` timestamps regardless of surface form. Unparseable input passes through
+    // unchanged (deterministic — the instant-aware compare in `snapshot_as_of` still degrades to a
+    // lexical fallback for it, never a panic).
+    let from_norm = normalize_instant(from);
+    let to_norm = normalize_instant(to);
+    // THE GATE: the single user-facing fact read. Every downstream projection is over THIS slice.
+    let facts = db.list_facts_visible(entity_id, unlocked)?;
+    let snap_from = snapshot_as_of(&facts, &from_norm);
+    let snap_to = snapshot_as_of(&facts, &to_norm);
+    let diff = diff_snapshots(&snap_from, &snap_to);
+    let ledger = supersession_ledger(&facts);
+    Ok(EntityKnowledgeDiff {
+        entity_id: entity_id.to_string(),
+        from: from_norm,
+        to: to_norm,
+        diff,
+        ledger,
+    })
+}
+
+/// Canonicalize an RFC3339 instant to a stable UTC (`Z`) rendering. A parseable timestamp — in ANY
+/// valid RFC3339 form (`Z`, `+00:00`, an offset, with/without fractional seconds) — is re-serialized
+/// to a single canonical UTC string so echoed `from`/`to` and downstream compares are consistent.
+/// FALLBACK (same posture as [`cmp_instant`] / [`crate::memory::compute_recency`]): an UNPARSEABLE
+/// string is returned unchanged — never a panic, never a lossy rewrite; the instant-aware compares
+/// downstream still handle it via their own lexical fallback.
+fn normalize_instant(ts: &str) -> String {
+    match chrono::DateTime::parse_from_rfc3339(ts) {
+        Ok(dt) => dt
+            .with_timezone(&chrono::Utc)
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        Err(_) => ts.to_string(),
+    }
+}
+
 /// The shape the reasoner must emit. Best-effort: parse failures degrade to no facts.
 #[derive(Debug, Deserialize)]
 struct FactsReply {
@@ -537,5 +813,319 @@ mod tests {
             FactOp::Add(nf) => assert_eq!(nf.meeting_id.as_deref(), Some("m42")),
             other => panic!("expected Add, got {other:?}"),
         }
+    }
+
+    // ── Knowledge Diff (PR-6) ───────────────────────────────────────────────────
+
+    /// A closed fact with explicit valid_from/valid_to, for as-of interval tests.
+    fn dated_fact(
+        id: &str,
+        subject: &str,
+        predicate: &str,
+        object: &str,
+        valid_from: &str,
+        valid_to: Option<&str>,
+        meeting: &str,
+    ) -> Fact {
+        Fact {
+            id: id.to_string(),
+            entity_id: "atlas".to_string(),
+            subject: subject.to_string(),
+            predicate: predicate.to_string(),
+            object: object.to_string(),
+            valid_from: valid_from.to_string(),
+            valid_to: valid_to.map(|s| s.to_string()),
+            recorded_at: valid_from.to_string(),
+            meeting_id: Some(meeting.to_string()),
+            confidence: 1.0,
+        }
+    }
+
+    fn ids(fs: &[&Fact]) -> Vec<String> {
+        let mut v: Vec<String> = fs.iter().map(|f| f.id.clone()).collect();
+        v.sort();
+        v
+    }
+
+    /// snapshot_as_of: `valid_from <= at`. A fact whose valid_from is AFTER `at` is not yet open.
+    #[test]
+    fn snapshot_excludes_facts_not_yet_valid() {
+        let facts = vec![dated_fact(
+            "f1", "Atlas", "status", "shipped", "2026-06-20T00:00:00Z", None, "m1",
+        )];
+        // Before it became true.
+        let open = snapshot_as_of(&facts, "2026-06-10T00:00:00Z");
+        assert!(open.is_empty(), "a fact is not open before its valid_from");
+        // On its valid_from (inclusive) it IS open.
+        let open2 = snapshot_as_of(&facts, "2026-06-20T00:00:00Z");
+        assert_eq!(ids(&open2), vec!["f1".to_string()]);
+    }
+
+    /// snapshot_as_of compares INSTANTS, not bytes: a fact stored in `Z` form is OPEN when the
+    /// caller's `at` is the SAME instant rendered in `+00:00` form. This is the lexical-timestamp
+    /// bug (the FE date-range picker may pass either surface form): a naive `valid_from.as_str() <=
+    /// at` byte-compare puts `Z` (0x5A) ABOVE `+` (0x2B), so it would read `valid_from > at` for two
+    /// equal moments and WRONGLY exclude the fact — RED on the old code, GREEN on the instant compare.
+    #[test]
+    fn snapshot_matches_same_instant_across_z_and_offset_forms() {
+        // valid_from in Z form...
+        let facts = vec![dated_fact(
+            "f1",
+            "Atlas",
+            "status",
+            "shipped",
+            "2026-06-20T00:00:00Z",
+            None,
+            "m1",
+        )];
+        // ...and `at` the SAME instant in +00:00 form. Naive lexical: "…Z" > "…+00:00" → excluded.
+        let at_offset = "2026-06-20T00:00:00+00:00";
+        // Sanity: the two renderings really ARE the same instant.
+        assert_eq!(
+            chrono::DateTime::parse_from_rfc3339("2026-06-20T00:00:00Z").unwrap(),
+            chrono::DateTime::parse_from_rfc3339(at_offset).unwrap(),
+            "test fixture must be the same instant in two RFC3339 forms"
+        );
+        let open = snapshot_as_of(&facts, at_offset);
+        assert_eq!(
+            ids(&open),
+            vec!["f1".to_string()],
+            "a fact open AT this instant must be included regardless of Z vs +00:00 rendering"
+        );
+
+        // The valid_to boundary must ALSO be instant-exact: a closed fact whose valid_to is the same
+        // instant as `at` (different surface form) is EXCLUDED (valid_to is exclusive).
+        let closed = vec![dated_fact(
+            "f_closed",
+            "Atlas",
+            "status",
+            "in-progress",
+            "2026-06-01T00:00:00Z",
+            Some("2026-06-20T00:00:00Z"),
+            "m1",
+        )];
+        assert!(
+            snapshot_as_of(&closed, at_offset).is_empty(),
+            "at == valid_to (same instant, different form) must exclude the closed fact"
+        );
+    }
+
+    /// A corrupt/unparseable stored timestamp must NOT panic and must be deterministic — the
+    /// instant-compare falls back to a byte-lexical ordering for that pair (mirrors compute_recency's
+    /// neutral-default posture). Here a junk `valid_from` simply can't be greater-than the numeric
+    /// `at` lexically, so it stays included — the point is: no crash, a defined outcome.
+    #[test]
+    fn snapshot_tolerates_unparseable_timestamp_without_panic() {
+        let facts = vec![dated_fact(
+            "junk", "Atlas", "status", "shipped", "not-a-timestamp", None, "m1",
+        )];
+        // Must return deterministically (no panic) for a well-formed `at`.
+        let _ = snapshot_as_of(&facts, "2026-06-20T00:00:00Z");
+    }
+
+    /// snapshot_as_of: an OPEN fact (valid_to == None) is open at any instant >= valid_from.
+    #[test]
+    fn snapshot_includes_open_fact_forever_after() {
+        let facts = vec![dated_fact(
+            "f1", "Atlas", "status", "shipped", "2026-06-01T00:00:00Z", None, "m1",
+        )];
+        assert_eq!(
+            ids(&snapshot_as_of(&facts, "2030-01-01T00:00:00Z")),
+            vec!["f1".to_string()]
+        );
+    }
+
+    /// snapshot_as_of BOUNDARY: at == valid_to the closed fact is EXCLUDED (valid_to is exclusive),
+    /// and its successor (open at that instant) is the one returned. This is the load-bearing
+    /// half-open-interval semantics — RED-before-GREEN on the boundary.
+    #[test]
+    fn snapshot_boundary_at_equals_valid_to_excludes_closed_includes_successor() {
+        let cut = "2026-06-20T00:00:00Z";
+        let facts = vec![
+            // in-progress until the cut...
+            dated_fact(
+                "f_old",
+                "Atlas",
+                "status",
+                "in-progress",
+                "2026-06-01T00:00:00Z",
+                Some(cut),
+                "m1",
+            ),
+            // ...shipped from the cut on.
+            dated_fact("f_new", "Atlas", "status", "shipped", cut, None, "m2"),
+        ];
+        // Exactly AT the cut: the closed fact is gone (valid_to == at → excluded), the new one open.
+        let at_cut = snapshot_as_of(&facts, cut);
+        assert_eq!(
+            ids(&at_cut),
+            vec!["f_new".to_string()],
+            "at == valid_to must exclude the closed fact and include its successor"
+        );
+        // Just BEFORE the cut: the closed fact is still open, the new one not yet valid.
+        let before = snapshot_as_of(&facts, "2026-06-19T23:59:59Z");
+        assert_eq!(ids(&before), vec!["f_old".to_string()]);
+    }
+
+    /// diff_snapshots ADDED / REMOVED / CHANGED, keyed by (norm(subject), norm(predicate)).
+    #[test]
+    fn diff_classifies_added_removed_changed() {
+        // Snapshot A (earlier): Atlas.status=in-progress, Atlas.owner=Anna.
+        let a_facts = [
+            dated_fact(
+                "a1",
+                "Atlas",
+                "status",
+                "in-progress",
+                "2026-06-01T00:00:00Z",
+                None,
+                "m1",
+            ),
+            dated_fact(
+                "a2",
+                "Atlas",
+                "owner",
+                "Anna",
+                "2026-06-01T00:00:00Z",
+                None,
+                "m1",
+            ),
+        ];
+        // Snapshot B (later): Atlas.status=shipped (CHANGED), Atlas.owner gone (REMOVED),
+        // Atlas.deadline=2026-07-01 (ADDED). Casing/whitespace differs on the key → still same key.
+        let b_facts = [
+            dated_fact(
+                "b1",
+                "Atlas",
+                "Status", // different casing, same normalized key
+                "shipped",
+                "2026-06-20T00:00:00Z",
+                None,
+                "m2",
+            ),
+            dated_fact(
+                "b2",
+                "Atlas",
+                "deadline",
+                "2026-07-01",
+                "2026-06-20T00:00:00Z",
+                None,
+                "m2",
+            ),
+        ];
+        let a: Vec<&Fact> = a_facts.iter().collect();
+        let b: Vec<&Fact> = b_facts.iter().collect();
+        let diff = diff_snapshots(&a, &b);
+
+        assert_eq!(diff.changed.len(), 1, "status changed");
+        assert_eq!(diff.changed[0].predicate, "Status"); // display casing preserved from b
+        assert_eq!(diff.changed[0].old_object.as_deref(), Some("in-progress"));
+        assert_eq!(diff.changed[0].new_object.as_deref(), Some("shipped"));
+        assert_eq!(diff.changed[0].valid_from, "2026-06-20T00:00:00Z");
+        assert_eq!(diff.changed[0].source_meeting_id.as_deref(), Some("m2"));
+
+        assert_eq!(diff.added.len(), 1, "deadline added");
+        assert_eq!(diff.added[0].predicate, "deadline");
+        assert_eq!(diff.added[0].old_object, None);
+        assert_eq!(diff.added[0].new_object.as_deref(), Some("2026-07-01"));
+
+        assert_eq!(diff.removed.len(), 1, "owner removed");
+        assert_eq!(diff.removed[0].predicate, "owner");
+        assert_eq!(diff.removed[0].old_object.as_deref(), Some("Anna"));
+        assert_eq!(diff.removed[0].new_object, None);
+    }
+
+    /// diff_snapshots: same key, same normalized object across both snapshots → NO entry (unchanged).
+    #[test]
+    fn diff_ignores_unchanged_key() {
+        let a_facts = [dated_fact(
+            "a1", "Atlas", "status", "shipped", "2026-06-01T00:00:00Z", None, "m1",
+        )];
+        // Casing-only difference in the OBJECT is not a change (norm equal).
+        let b_facts = [dated_fact(
+            "b1", "Atlas", "status", "Shipped", "2026-06-20T00:00:00Z", None, "m2",
+        )];
+        let diff = diff_snapshots(
+            &a_facts.iter().collect::<Vec<_>>(),
+            &b_facts.iter().collect::<Vec<_>>(),
+        );
+        assert!(diff.added.is_empty() && diff.removed.is_empty() && diff.changed.is_empty());
+    }
+
+    /// supersession_ledger: the chronological decision list — one row per (older→newer) object
+    /// change per key, oldest first, carrying old/new/valid_from/source meeting.
+    #[test]
+    fn ledger_lists_supersessions_chronologically() {
+        // Atlas.status: in-progress → shipped → deprecated (two decisions).
+        let facts = vec![
+            dated_fact(
+                "f3",
+                "Atlas",
+                "status",
+                "deprecated",
+                "2026-07-05T00:00:00Z",
+                None,
+                "m3",
+            ),
+            dated_fact(
+                "f1",
+                "Atlas",
+                "status",
+                "in-progress",
+                "2026-06-01T00:00:00Z",
+                Some("2026-06-20T00:00:00Z"),
+                "m1",
+            ),
+            dated_fact(
+                "f2",
+                "Atlas",
+                "status",
+                "shipped",
+                "2026-06-20T00:00:00Z",
+                Some("2026-07-05T00:00:00Z"),
+                "m2",
+            ),
+        ];
+        let ledger = supersession_ledger(&facts);
+        assert_eq!(ledger.len(), 2, "two decisions");
+        // Oldest first: in-progress → shipped (learned at m2).
+        assert_eq!(ledger[0].old_object.as_deref(), Some("in-progress"));
+        assert_eq!(ledger[0].new_object.as_deref(), Some("shipped"));
+        assert_eq!(ledger[0].valid_from, "2026-06-20T00:00:00Z");
+        assert_eq!(ledger[0].source_meeting_id.as_deref(), Some("m2"));
+        // Then shipped → deprecated (learned at m3).
+        assert_eq!(ledger[1].old_object.as_deref(), Some("shipped"));
+        assert_eq!(ledger[1].new_object.as_deref(), Some("deprecated"));
+        assert_eq!(ledger[1].source_meeting_id.as_deref(), Some("m3"));
+    }
+
+    /// supersession_ledger: a re-assertion of the SAME object (adjacent pair, same value) is not a
+    /// decision and produces no ledger row.
+    #[test]
+    fn ledger_skips_reassertion_of_same_object() {
+        let facts = vec![
+            dated_fact(
+                "f1",
+                "Atlas",
+                "status",
+                "shipped",
+                "2026-06-01T00:00:00Z",
+                Some("2026-06-20T00:00:00Z"),
+                "m1",
+            ),
+            dated_fact(
+                "f2",
+                "Atlas",
+                "status",
+                "Shipped", // re-asserted (norm equal) — not a decision
+                "2026-06-20T00:00:00Z",
+                None,
+                "m2",
+            ),
+        ];
+        assert!(
+            supersession_ledger(&facts).is_empty(),
+            "re-asserting the same normalized object is not a supersession"
+        );
     }
 }

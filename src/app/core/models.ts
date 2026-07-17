@@ -1548,6 +1548,69 @@ export interface EntityDetail {
 }
 
 /**
+ * Brain v3 PR-6 — one END of a supersession pair (or one added/removed fact) in a
+ * {@link EntityKnowledgeDiff}, projected to what a decision ledger row needs: the
+ * human-readable old→new values + provenance. Mirrors the Rust `FactStateChange`
+ * (serde camelCase). Semantics of `oldObject`/`newObject` by list:
+ * `added` → `oldObject: null`; `removed` → `newObject: null`; `changed` → both present.
+ */
+export interface FactStateChange {
+  /** Entity name at assertion time (the fact's subject). */
+  subject: string;
+  /** The attribute (the fact's predicate), e.g. "status", "owner". */
+  predicate: string;
+  /** OLD object: `null` for an added fact; the (was-current) object for removed/changed. */
+  oldObject: string | null;
+  /** NEW object: `null` for a removed fact; the now-current object for added/changed. */
+  newObject: string | null;
+  /** Valid-time start (ISO 8601) of the state this row carries — the ledger's date. */
+  validFrom: string;
+  /**
+   * The source meeting the fact was learned from — the gating + provenance anchor.
+   * `null` only for legacy unattributed rows (already gate-dropped upstream, so in
+   * practice always present); a present id navigates to `/meeting/:id`.
+   */
+  sourceMeetingId: string | null;
+}
+
+/**
+ * Brain v3 PR-6 — the deterministic set diff of two `snapshot_as_of` snapshots for
+ * one entity, keyed by `(norm(subject), norm(predicate))`. Mirrors the Rust
+ * `KnowledgeDiff` (serde camelCase). All lists are deterministically sorted.
+ */
+export interface KnowledgeDiff {
+  /** Attributes present at `to` but not at `from`. */
+  added: FactStateChange[];
+  /** Attributes present at `from` but not at `to`. */
+  removed: FactStateChange[];
+  /** Attributes present at both with a DIFFERENT object (old → new). */
+  changed: FactStateChange[];
+}
+
+/**
+ * Brain v3 PR-6 — the payload of `getEntityKnowledgeDiff(entityId, from, to)`: the
+ * between-two-instants set diff PLUS the full chronological decision ledger for one
+ * entity. GATED server-side through the visible-facts reader — a
+ * sealed-and-not-session-unlocked meeting's fact enters no snapshot, diff entry, or
+ * ledger row. Mirrors the Rust `EntityKnowledgeDiff` (serde camelCase).
+ */
+export interface EntityKnowledgeDiff {
+  entityId: string;
+  /** The `from` instant echoed back (normalized UTC). */
+  from: string;
+  /** The `to` instant echoed back (normalized UTC). */
+  to: string;
+  /** added / removed / changed between the `from` and `to` snapshots. */
+  diff: KnowledgeDiff;
+  /**
+   * Every supersession for this entity, oldest → newest — the decision ledger.
+   * Independent of the from/to window (the entity's whole history), so the FE can
+   * render the full timeline. Empty when the entity has no supersessions.
+   */
+  ledger: FactStateChange[];
+}
+
+/**
  * One card in the `/people` personal-CRM list (`listPeople()`). Mirrors the Rust
  * `PersonCard` (camelCase via `#[serde(rename_all)]`) — a Person entity rolled up
  * over the SAME gated graph/facts/commitment readers as the graph. GATED
