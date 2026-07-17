@@ -1,17 +1,23 @@
 import {
   ChangeDetectionStrategy,
   Component,
+  ElementRef,
+  Injector,
+  afterNextRender,
   computed,
   effect,
   inject,
   input,
   signal,
+  viewChild,
 } from "@angular/core";
 import { RouterLink } from "@angular/router";
 
 import { IpcService } from "../../core/ipc.service";
-import type { LinkEdge, LinkKind } from "../../core/models";
+import type { LinkEdge, LinkKind, NoteCitation } from "../../core/models";
 import { FoldersService } from "../../services/folders.service";
+import { ToastService } from "../../services/toast.service";
+import { LinkPickerComponent } from "../../features/notes/link-picker/link-picker.component";
 
 /** One rendered semantic-suggestion confidence tier (chip color + label). */
 type ConfidenceTier = "high" | "med" | "low";
@@ -36,17 +42,31 @@ type ConfidenceTier = "high" | "med" | "low";
  * (never surface connections behind a lock) and re-runs on a session lock-tree
  * change (a folder unlock/relock, or screen-share relock-all) so sealed neighbours
  * drop out — or reappear — live, exactly like `graph.component`'s `_refetchOnLock`.
+ *
+ * PR-1 (user-initiated linking) adds two write affordances over the same edges:
+ *  - a `+ Link` header control that opens the single-pick {@link LinkPickerComponent}
+ *    (the SAME opaque, paginated autocomplete the note editor uses) filtered to
+ *    `meeting | note | document`; on pick it calls `link_items(anchor → candidate)`
+ *    and re-fetches. This panel OWNS the picker's `query` / `activeIndex` / keyboard
+ *    nav (the picker is presentational) via a small header `<input>`.
+ *  - a hover `×` on each DETERMINISTIC chip whose edge is `manual === true`
+ *    (a user-created link), which calls `unlink_items(anchor → neighbour)` and
+ *    re-fetches. Non-manual chips (auto wikilink/companion, semantic) get NO `×`.
+ * Both writes are gated by the same pending set as Accept/Dismiss and surface a
+ * failure through the {@link ToastService} rather than leaving a stuck spinner.
  */
 @Component({
   selector: "app-connections",
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [RouterLink],
+  imports: [RouterLink, LinkPickerComponent],
   templateUrl: "./connections.component.html",
   styleUrl: "./connections.component.scss",
 })
 export class ConnectionsComponent {
   private readonly ipc = inject(IpcService);
   private readonly folders = inject(FoldersService);
+  private readonly toast = inject(ToastService);
+  private readonly injector = inject(Injector);
 
   /** The link-endpoint kind this panel is anchored to. */
   readonly kind = input.required<LinkKind>();
@@ -61,8 +81,54 @@ export class ConnectionsComponent {
 
   /** The visible edges for the current `(kind, id)`; `[]` while locked/loading. */
   readonly edges = signal<LinkEdge[]>([]);
-  /** In-flight Accept/Dismiss link ids — disables that row's buttons meanwhile. */
+  /**
+   * In-flight Accept/Dismiss/Unlink edge ids — disables that row's buttons (and its
+   * `×`) meanwhile. Keyed by `LinkEdge.id` (unlink guards on the manual chip's id).
+   */
   private readonly pending = signal<ReadonlySet<number>>(new Set());
+
+  /** The single-pick `+ Link` chooser element (the header `<input>`) for anchoring. */
+  private readonly pickerAnchor =
+    viewChild<ElementRef<HTMLElement>>("pickerAnchor");
+
+  /** Whether the `+ Link` picker is open. */
+  readonly pickerOpen = signal(false);
+  /** True while a `link_items` call from a pick is in flight (disables the chooser). */
+  readonly linking = signal(false);
+  /** The picker's live filter text (this panel owns it — the picker is presentational). */
+  readonly pickerQuery = signal("");
+  /** Keyboard-highlighted row in the open picker (↑/↓). */
+  readonly pickerActiveIndex = signal(0);
+  /** The picker's resolved candidates for the current query (drives keyboard nav). */
+  readonly pickerCandidates = signal<NoteCitation[]>([]);
+  /**
+   * The chooser's viewport anchor rect for the popover. A NEW object re-positions
+   * it; recomputed from the header `<input>` on open and on every reposition tick.
+   */
+  readonly pickerRect = signal<{
+    top: number;
+    left: number;
+    right: number;
+    bottom: number;
+  }>({ top: 0, left: 0, right: 0, bottom: 0 });
+
+  /**
+   * A candidate kind that is NOT a valid `link_items` endpoint (a {@link LinkKind}
+   * is `meeting | note | document`). `list_link_candidates` may surface Shared-Brain
+   * `org` rows (and, in principle, `person`/`entity` from the shared shape); those
+   * are NOT linkable, so a pick is refused with a toast rather than silently
+   * dropped — the picker renders its own rows, so this guards them at pick time.
+   */
+  private static readonly NON_LINKABLE_KINDS: ReadonlySet<NoteCitation["kind"]> =
+    new Set<NoteCitation["kind"]>(["person", "entity", "org"]);
+
+  /** True when a candidate is a linkable meeting/note/document endpoint (not org/person/entity, not self). */
+  private isLinkable(c: NoteCitation): boolean {
+    return (
+      !ConnectionsComponent.NON_LINKABLE_KINDS.has(c.kind) &&
+      !(c.kind === this.kind() && c.id === this.id())
+    );
+  }
 
   /**
    * Monotonic request token — a late `list_links` reply for a superseded
@@ -158,11 +224,39 @@ export class ConnectionsComponent {
   }
 
   /**
-   * Run an Accept/Dismiss mutation guarded by the pending set, then re-fetch the
-   * edges for the CURRENT `(kind, id)` (never a stale closure) so the panel reflects
-   * the server truth. The seq token drops a reply for a since-changed item.
+   * PR-1 — whether a deterministic chip is USER-REMOVABLE (shows the hover `×`).
+   * Only manual links (`manual === true`, set by the backend on the deduped
+   * manual+wikilink chip) are removable here; auto wikilink/companion edges are not.
    */
-  private async mutate(id: number, run: () => Promise<void>): Promise<void> {
+  isRemovable(e: LinkEdge): boolean {
+    return e.manual === true;
+  }
+
+  /**
+   * PR-1 — remove a user-created link: `unlink_items(anchor → neighbour)`, then
+   * re-fetch so the chip drops out. Guarded by the same pending set (keyed on the
+   * chip's edge id) so its `×` disables mid-flight. Surfaces a failure via a toast.
+   */
+  unlink(e: LinkEdge): void {
+    void this.mutate(
+      e.id,
+      () => this.ipc.unlinkItems(this.kind(), this.id(), e.otherKind, e.otherId),
+      "Couldn't remove the link.",
+    );
+  }
+
+  /**
+   * Run an Accept/Dismiss/Unlink mutation guarded by the pending set, then re-fetch
+   * the edges for the CURRENT `(kind, id)` (never a stale closure) so the panel
+   * reflects the server truth. The seq token drops a reply for a since-changed item.
+   * A non-null `errorMsg` surfaces a toast on failure (used by Unlink; Accept/Dismiss
+   * stay silent, matching their prior behavior).
+   */
+  private async mutate(
+    id: number,
+    run: () => Promise<void>,
+    errorMsg?: string,
+  ): Promise<void> {
     if (this.isPending(id)) {
       return;
     }
@@ -173,6 +267,9 @@ export class ConnectionsComponent {
       await this.fetch(this.kind(), this.id(), seq);
     } catch {
       // Leave the current edges untouched; drop the pending flag below.
+      if (errorMsg) {
+        this.toast.danger(errorMsg);
+      }
     } finally {
       this.pending.update((s) => {
         const next = new Set(s);
@@ -180,5 +277,143 @@ export class ConnectionsComponent {
         return next;
       });
     }
+  }
+
+  // --- `+ Link` chooser (reuses the note editor's LinkPickerComponent) --------
+
+  /**
+   * Open the single-pick `+ Link` chooser: anchor the popover under the header
+   * `<input>`, reset its query/keyboard state. The picker is presentational, so
+   * THIS panel owns `pickerQuery` / `pickerActiveIndex` and feeds the picker an
+   * `anchorRect`; the header input is the query field + keyboard target.
+   */
+  openPicker(): void {
+    if (this.linking()) {
+      return;
+    }
+    this.pickerQuery.set("");
+    this.pickerActiveIndex.set(0);
+    this.pickerCandidates.set([]);
+    this.pickerOpen.set(true);
+    this.repositionPicker();
+    // Focus the query field once it's in the DOM (zoneless-safe, no setTimeout).
+    afterNextRender(() => this.pickerAnchor()?.nativeElement.focus?.(), {
+      injector: this.injector,
+    });
+  }
+
+  /** Close the chooser without linking anything (Esc / outside / after a pick). */
+  closePicker(): void {
+    this.pickerOpen.set(false);
+    this.pickerQuery.set("");
+    this.pickerCandidates.set([]);
+    this.pickerActiveIndex.set(0);
+  }
+
+  /** The chooser query changed (input event) → refresh the anchored query + reset selection. */
+  onQueryInput(event: Event): void {
+    const value = (event.target as HTMLInputElement).value;
+    this.pickerQuery.set(value);
+    this.pickerActiveIndex.set(0);
+  }
+
+  /**
+   * The picker's resolved candidates for the current query (drives keyboard nav).
+   * The picker renders + click-emits its OWN rows, so `pickerActiveIndex` indexes
+   * THIS same list (kept in lockstep with what the popover shows).
+   */
+  onPickerCandidates(rows: NoteCitation[]): void {
+    this.pickerCandidates.set(rows);
+    // A shrunk list can leave the highlight past the end — clamp it.
+    const max = rows.length - 1;
+    if (this.pickerActiveIndex() > max) {
+      this.pickerActiveIndex.set(Math.max(0, max));
+    }
+  }
+
+  /** ↑/↓/Enter/Esc while the chooser input has focus (nav over the picker's rows). */
+  onQueryKey(event: KeyboardEvent): void {
+    if (!this.pickerOpen()) {
+      return;
+    }
+    const rows = this.pickerCandidates();
+    switch (event.key) {
+      case "ArrowDown":
+        event.preventDefault();
+        if (rows.length > 0) {
+          this.pickerActiveIndex.update((i) => (i + 1) % rows.length);
+        }
+        break;
+      case "ArrowUp":
+        event.preventDefault();
+        if (rows.length > 0) {
+          this.pickerActiveIndex.update(
+            (i) => (i - 1 + rows.length) % rows.length,
+          );
+        }
+        break;
+      case "Enter":
+        event.preventDefault();
+        if (rows.length > 0) {
+          this.pickCandidate(rows[this.pickerActiveIndex()]);
+        }
+        break;
+      case "Escape":
+        event.preventDefault();
+        this.closePicker();
+        break;
+    }
+  }
+
+  /**
+   * A candidate was picked (click or Enter): create the link from this panel's
+   * anchor `(kind, id)` → the picked candidate, then re-fetch so the new chip
+   * appears. The picker renders its own rows, so a non-linkable kind (a Shared-Brain
+   * `org` hit / `person` / `entity`, or the anchor itself) is REFUSED here with a
+   * toast rather than sent to `link_items`. Guarded by `linking` (a stuck spinner is
+   * impossible — cleared in `finally`); a failure surfaces a toast.
+   */
+  pickCandidate(candidate: NoteCitation): void {
+    if (this.linking()) {
+      return;
+    }
+    if (!this.isLinkable(candidate)) {
+      this.toast.info("You can only link meetings, notes, and documents.");
+      return;
+    }
+    const dstKind = candidate.kind as LinkKind;
+    this.linking.set(true);
+    this.closePicker();
+    void (async () => {
+      try {
+        await this.ipc.linkItems(this.kind(), this.id(), dstKind, candidate.id);
+        const seq = ++this.seq;
+        await this.fetch(this.kind(), this.id(), seq);
+      } catch {
+        this.toast.danger("Couldn't create the link.");
+      } finally {
+        this.linking.set(false);
+      }
+    })();
+  }
+
+  /** Recompute the popover anchor rect from the header chooser input. */
+  repositionPicker(): void {
+    afterNextRender(
+      () => {
+        const el = this.pickerAnchor()?.nativeElement;
+        if (!el) {
+          return;
+        }
+        const r = el.getBoundingClientRect();
+        this.pickerRect.set({
+          top: r.top,
+          left: r.left,
+          right: r.right,
+          bottom: r.bottom,
+        });
+      },
+      { injector: this.injector },
+    );
   }
 }

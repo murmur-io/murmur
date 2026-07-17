@@ -1347,11 +1347,17 @@ export interface BacklinkSource {
  * - `direction` — `"out"` (the queried item is this edge's `src`) | `"in"` (it is `dst`).
  * - `otherKind` — the neighbour endpoint kind: `"meeting" | "note" | "document"`
  *   (route `meeting` → `/meeting/:id`, `note`/`document` → `/notes/:id`).
- * - `edgeType` — `"wikilink" | "companion" | "semantic"`. `wikilink`/`companion` are
- *   DETERMINISTIC edges (rendered as plain link chips); `semantic` is a SUGGESTED edge
- *   the user can Accept/Dismiss, with `score` the cosine confidence.
+ * - `edgeType` — `"wikilink" | "companion" | "semantic" | "manual"`. `wikilink`/
+ *   `companion`/`manual` are DETERMINISTIC edges (rendered as plain link chips);
+ *   `semantic` is a SUGGESTED edge the user can Accept/Dismiss, with `score` the
+ *   cosine confidence.
  * - `createdBy` — `"user" | "auto" | "accepted"`; `status` — `"active" | "suggested"`
  *   (`"dismissed"` rows are never returned). `score` is `1.0` for deterministic edges.
+ * - `manual` (PR-1) — `true` when this chip represents a USER-created link (via the
+ *   `+ Link` chooser → `link_items`) that is removable with a `×` (→ `unlink_items`).
+ *   The backend dedupes a manual+wikilink pair into ONE chip and sets `manual:true`
+ *   on it. Defaults to `false`/absent for auto (wikilink/companion) and semantic
+ *   edges, which are NOT user-removable from the panel. (`#[serde(default)]`.)
  *
  * Mirrors the Rust `LinkEdge` (serde camelCase).
  */
@@ -1361,11 +1367,16 @@ export interface LinkEdge {
   otherKind: "meeting" | "note" | "document";
   otherId: string;
   otherTitle: string;
-  edgeType: "wikilink" | "companion" | "semantic";
+  edgeType: "wikilink" | "companion" | "semantic" | "manual";
   createdBy: "user" | "auto" | "accepted";
   status: "active" | "suggested";
   score: number;
   createdAt: number;
+  /**
+   * PR-1 — `true` when the chip is a user-created link that should show a
+   * removable `×`. Backend field `manual` (`#[serde(default)]` ⇒ may be absent).
+   */
+  manual?: boolean;
 }
 
 /** The link-endpoint kind an `app-connections` panel is anchored to (`list_links` `kind`). */
