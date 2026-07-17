@@ -10,7 +10,8 @@ use crate::state::AppState;
 use crate::storage::models::{
     ActionItem, Analytics, AskVaultResult, BrainOverview, BuiltinRecipe, CalendarContext,
     CalendarEvent, CalendarEventFull, ChatTurn, Commitment, DigestResult, DocumentInfo,
-    EntityDetail, EntityDossierResult, Folder, FolderNode, GraphData, Meeting,
+    EntityDetail, EntityDossierResult, Folder, FolderNode, FullGraphData, FullGraphOpts, GraphData,
+    Meeting,
     MeetingActionSummary, MeetingStatus, MeetingTimeline, NoteAssistRequest, NoteAssistResult,
     NoteCitation, NoteDoc, NoteFolder, NoteRecord, NoteSummary, OrganizeMove, OrganizePlan,
     PeopleList, PinResult, PropertyKind, PropertySchemaField, RecipeRecord, SavedView, SearchHit,
@@ -7665,6 +7666,22 @@ const ENTITY_NEIGHBOR_LIMIT: i64 = 12;
 pub fn get_graph(state: State<'_, AppState>) -> Result<GraphData, AppError> {
     let unlocked = unlocked_snapshot(state.inner())?;
     state.db.build_graph(&unlocked)
+}
+
+/// The FULL-BRAIN graph (Brain v3 PR-4): a SEPARATE, additive read that unifies entities + VISIBLE
+/// meetings + notes + documents as TYPED nodes and every relation (entity co-occurrence + entity→
+/// meeting mentions + `links` rows) as TYPED edges. Snapshots the live session `unlocked` set exactly
+/// like `get_graph`, so a sealed-and-not-session-unlocked meeting/note/document contributes NOTHING —
+/// no node, and no edge touching it (BOTH endpoints are gated against the visible-node set). `opts`
+/// defaults to all-off; `includeSuggested` admits un-accepted (`status='suggested'`) semantic links.
+/// Pure read: no writes, no new storage. `get_graph` is untouched + byte-compatible for its FE.
+#[tauri::command]
+pub fn get_full_graph(
+    state: State<'_, AppState>,
+    opts: Option<FullGraphOpts>,
+) -> Result<FullGraphData, AppError> {
+    let unlocked = unlocked_snapshot(state.inner())?;
+    state.db.build_full_graph(&unlocked, opts.unwrap_or_default())
 }
 
 /// `/people` personal CRM: one card per VISIBLE Person entity, rolled up over the SAME gated

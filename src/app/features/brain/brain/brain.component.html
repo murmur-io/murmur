@@ -244,6 +244,44 @@
     }
   </section>
 
+  <!-- 3b — FULL BRAIN: entities + meetings + notes + documents as ONE typed,
+       lens-filterable graph (Brain v3 PR-4). Collapsed by default; the child
+       self-loads via IPC + the folder tree only once opened. -->
+  <section class="b-conn">
+    <button
+      type="button"
+      class="b-conn-toggle"
+      [attr.aria-expanded]="fullBrainOpen()"
+      (click)="fullBrainOpen.set(!fullBrainOpen())"
+    >
+      <svg
+        class="b-conn-chevron"
+        [class.is-open]="fullBrainOpen()"
+        viewBox="0 0 16 16"
+        width="14"
+        height="14"
+        fill="none"
+        aria-hidden="true"
+      >
+        <path
+          d="M5.5 4l5 4-5 4"
+          stroke="currentColor"
+          stroke-width="1.7"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+        />
+      </svg>
+      <span class="b-conn-title">Full brain graph</span>
+      <span class="b-conn-sub">
+        Everything — meetings, notes, documents and people — as one map.
+      </span>
+    </button>
+
+    @if (fullBrainOpen()) {
+      <app-full-brain-graph />
+    }
+  </section>
+
   <!-- 4 — MEMORY: "what the brain knows about you" (collapsible) --------- -->
   <app-brain-memory />
 
