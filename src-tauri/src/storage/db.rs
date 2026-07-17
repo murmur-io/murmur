@@ -13,6 +13,7 @@ use crate::storage::models::{
     Analytics, AssistantInteraction, AssistantThreadRow, BacklinkSource, Commitment,
     CorrectionRecord, DayCount,
     DocChunkHit, DocumentInfo, DocumentSummary, EntityDetail, EntityKind, EntityNeighbor, Folder,
+    FullGraphData, FullGraphEdge, FullGraphEdgeKind, FullGraphNode, FullGraphNodeKind, FullGraphOpts,
     GraphData,
     GraphEdge, GraphEntity, GraphNode, Meeting, MeetingActionSummary, MeetingStatus, NoteCitation,
     NoteFolder,
@@ -11217,6 +11218,368 @@ impl Db {
         })
     }
 
+    /// Build the FULL-BRAIN graph payload (`get_full_graph`, DESIGN §PR-4). A PURE READ — no writes,
+    /// no new storage — that unifies FOUR node kinds and FIVE edge kinds under one visibility model:
+    ///
+    /// NODES (each via its EXISTING gated reader; a sealed-and-not-session-unlocked item yields none):
+    ///   • entities  — `list_entities_visible` (already 500-capped, HAVING visible mention);
+    ///   • meetings  — `list_meetings_visible` (visible if no notes OR any visible note);
+    ///   • notes + documents — `full_graph_content_nodes` over `documents JOIN folders` under
+    ///     `visibility_clause` (a sealed folder's rows are absent), split by `kind`.
+    ///
+    /// EDGES (BOTH endpoints must be in the visible-node set built above — an edge to a sealed node
+    /// is DROPPED, so no edge can leak a hidden node's existence):
+    ///   • co_occurrence — entity↔entity (`graph_edges_visible`, already gated);
+    ///   • mention       — entity→meeting (`entity_mentions`, gated by the SAME meeting predicate);
+    ///   • wikilink/companion/semantic — `links` rows with `status='active'` (+ `status='suggested'`
+    ///     semantic ONLY when `opts.include_suggested`), each endpoint re-checked against the set.
+    ///
+    /// Deterministic: nodes ordered by (kind, id ASC), edges by (kind, src, dst, status). Honest caps:
+    /// `total_visible_nodes` is the pre-cap true count so the FE can disclose a silent trim; `has_hidden`
+    /// reflects LOCKED folders (mirrors the entity graph). No PII logged — ids/counts only.
+    pub fn build_full_graph(
+        &self,
+        unlocked: &HashSet<String>,
+        opts: FullGraphOpts,
+    ) -> Result<FullGraphData> {
+        // ── NODES: enumerate via the existing gated readers, keyed by (kind_str, id) so a cross-kind
+        //    id collision can never conflate two nodes when an edge is gated. ──
+        let mut nodes: Vec<FullGraphNode> = Vec::new();
+        let mut visible: HashSet<(&'static str, String)> = HashSet::new();
+
+        // Entities (already render-capped at 500 inside the reader).
+        for e in self.list_entities_visible(unlocked)? {
+            visible.insert((FullGraphNodeKind::Entity.as_str(), e.id.clone()));
+            nodes.push(FullGraphNode {
+                id: e.id,
+                kind: FullGraphNodeKind::Entity,
+                label: e.name,
+                date: None,
+                degree: 0,
+            });
+        }
+        // Meetings (visible-meeting predicate; capped to keep the payload bounded).
+        for m in self.list_meetings_visible(MAX_FULL_GRAPH_PER_KIND as i64, unlocked)? {
+            visible.insert((FullGraphNodeKind::Meeting.as_str(), m.id.clone()));
+            let label = m
+                .title
+                .as_deref()
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .unwrap_or("Meeting")
+                .to_string();
+            nodes.push(FullGraphNode {
+                id: m.id,
+                kind: FullGraphNodeKind::Meeting,
+                label,
+                date: Some(m.started_at),
+                degree: 0,
+            });
+        }
+        // Notes + documents (one gated pass over `documents`, split by kind).
+        for (kind, id, label, date) in self.full_graph_content_nodes(unlocked)? {
+            visible.insert((kind.as_str(), id.clone()));
+            nodes.push(FullGraphNode {
+                id,
+                kind,
+                label,
+                date,
+                degree: 0,
+            });
+        }
+        // TRUE (uncapped) visible-node count for honest disclosure — computed with NO per-kind LIMIT,
+        // so `total_visible_nodes > nodes.len()` whenever a per-kind cap silently trimmed a leg (the
+        // twin of the entity graph's `total_visible_entities`). Mirrors, never derives from, the capped
+        // `nodes.len()`.
+        let total_visible_nodes = self.count_full_graph_nodes_visible(unlocked)?;
+
+        // ── EDGES: every leg is dropped unless BOTH endpoints are in `visible`. Degree is tallied
+        //    INLINE with the true endpoint node-kinds (a links edge can connect meeting↔note, so the
+        //    endpoint kinds are NOT derivable from the edge kind alone — they must be carried here). ──
+        let mut edges: Vec<FullGraphEdge> = Vec::new();
+        let mut degree: std::collections::HashMap<(&'static str, String), i64> =
+            std::collections::HashMap::new();
+        let bump = |degree: &mut std::collections::HashMap<(&'static str, String), i64>,
+                    k: &'static str,
+                    id: &str| {
+            *degree.entry((k, id.to_string())).or_insert(0) += 1;
+        };
+        let ent = FullGraphNodeKind::Entity.as_str();
+        let mtg = FullGraphNodeKind::Meeting.as_str();
+
+        // co_occurrence — entity↔entity (already visibility-gated; re-check both endpoints against the
+        // capped node set so an edge to a >500-cap-dropped entity is also dropped).
+        for ge in self.graph_edges_visible(unlocked)? {
+            if visible.contains(&(ent, ge.source.clone())) && visible.contains(&(ent, ge.target.clone()))
+            {
+                bump(&mut degree, ent, &ge.source);
+                bump(&mut degree, ent, &ge.target);
+                edges.push(FullGraphEdge {
+                    src: ge.source,
+                    dst: ge.target,
+                    kind: FullGraphEdgeKind::CoOccurrence,
+                    score: ge.weight as f64,
+                    status: "active".to_string(),
+                });
+            }
+        }
+        // mention — entity→meeting (gated by the SAME meeting-visible predicate; both endpoints then
+        // re-checked against the node set, so a mention into a sealed OR cap-dropped meeting is gone).
+        for (entity_id, meeting_id, weight) in self.entity_meeting_mentions_visible(unlocked)? {
+            if visible.contains(&(ent, entity_id.clone())) && visible.contains(&(mtg, meeting_id.clone()))
+            {
+                bump(&mut degree, ent, &entity_id);
+                bump(&mut degree, mtg, &meeting_id);
+                edges.push(FullGraphEdge {
+                    src: entity_id,
+                    dst: meeting_id,
+                    kind: FullGraphEdgeKind::Mention,
+                    score: weight as f64,
+                    status: "active".to_string(),
+                });
+            }
+        }
+        // links rows — wikilink/companion/semantic. active always; suggested semantic behind the flag.
+        // BOTH endpoints re-checked against the visible-node set (the links kind strings map 1:1 onto
+        // the node-kind strings: meeting|note|document), so a link to a sealed/absent node is dropped.
+        for (src_kind, src_id, dst_kind, dst_id, edge_type, score, status) in
+            self.full_graph_links(opts.include_suggested)?
+        {
+            let (Some(src_k), Some(dst_k)) = (
+                full_graph_link_kind_str(&src_kind),
+                full_graph_link_kind_str(&dst_kind),
+            ) else {
+                continue; // corrupt/unknown kind → skip defensively.
+            };
+            if !visible.contains(&(src_k, src_id.clone()))
+                || !visible.contains(&(dst_k, dst_id.clone()))
+            {
+                continue;
+            }
+            let Some(kind) = full_graph_edge_kind_from_type(&edge_type) else {
+                continue; // unknown edge_type → skip.
+            };
+            bump(&mut degree, src_k, &src_id);
+            bump(&mut degree, dst_k, &dst_id);
+            edges.push(FullGraphEdge {
+                src: src_id,
+                dst: dst_id,
+                kind,
+                score,
+                status,
+            });
+        }
+
+        // ── Degrees: assign each node its in-graph incident-edge count (a layout hint, never the true
+        //    corpus degree). Keyed by (kind, id) to avoid cross-kind id collisions. ──
+        for n in &mut nodes {
+            n.degree = degree
+                .get(&(n.kind.as_str(), n.id.clone()))
+                .copied()
+                .unwrap_or(0);
+        }
+
+        // Deterministic ordering: nodes by (kind, id ASC); edges by (kind, src, dst, status).
+        nodes.sort_by(|a, b| {
+            a.kind
+                .as_str()
+                .cmp(b.kind.as_str())
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        edges.sort_by(|a, b| {
+            a.kind
+                .as_str()
+                .cmp(b.kind.as_str())
+                .then_with(|| a.src.cmp(&b.src))
+                .then_with(|| a.dst.cmp(&b.dst))
+                .then_with(|| a.status.cmp(&b.status))
+        });
+
+        let has_hidden = self.has_hidden_folders(unlocked)?;
+        tracing::debug!(
+            target: "graph",
+            nodes = nodes.len(),
+            edges = edges.len(),
+            has_hidden,
+            "build_full_graph resolved"
+        );
+        Ok(FullGraphData {
+            nodes,
+            edges,
+            has_hidden,
+            total_visible_nodes,
+        })
+    }
+
+    /// The VISIBLE note + document nodes for the full-brain graph: `(kind, id, label, date)` per row,
+    /// gated by `visibility_clause` over `documents JOIN folders` (a sealed-and-not-session-unlocked
+    /// folder's rows are ABSENT — never masked). `kind='note'` → [`FullGraphNodeKind::Note`], anything
+    /// else → [`FullGraphNodeKind::Document`]. `label` = title, else the filesystem `name`. `date` =
+    /// the `updated_at`/`created_at` epoch-ms as a string (a sortable hint for the FE). Per-kind capped
+    /// (`MAX_FULL_GRAPH_PER_KIND`) ordered newest-first so the most-relevant rows survive on a big
+    /// vault; visibility is enforced in WHERE, so the cap trims magnitude only.
+    fn full_graph_content_nodes(
+        &self,
+        unlocked: &HashSet<String>,
+    ) -> Result<Vec<FullGraphContentNode>> {
+        let conn = self.lock();
+        let visible = visibility_clause("f", unlocked);
+        // Two capped passes (one per kind) so notes and documents each get their own budget rather
+        // than one starving the other on a lopsided vault.
+        let mut out: Vec<FullGraphContentNode> = Vec::new();
+        for (kind_str, node_kind) in [
+            ("note", FullGraphNodeKind::Note),
+            ("document", FullGraphNodeKind::Document),
+        ] {
+            let sql = format!(
+                "SELECT d.id, COALESCE(NULLIF(TRIM(d.title), ''), d.name),
+                        COALESCE(d.updated_at, d.created_at)
+                   FROM documents d
+                   JOIN folders f ON f.id = d.folder_id
+                  WHERE d.kind = ?1 AND {visible}
+                  ORDER BY COALESCE(d.updated_at, d.created_at) DESC, d.id ASC
+                  LIMIT {MAX_FULL_GRAPH_PER_KIND}"
+            );
+            let mut stmt = conn.prepare(&sql).map_err(map_err)?;
+            let rows = stmt
+                .query_map(rusqlite::params![kind_str], |r| {
+                    let id: String = r.get(0)?;
+                    let label: String = r.get(1)?;
+                    let ts: Option<i64> = r.get(2)?;
+                    Ok((id, label, ts))
+                })
+                .map_err(map_err)?;
+            for r in rows {
+                let (id, label, ts) = r.map_err(map_err)?;
+                out.push((node_kind, id, label, ts.map(|t| t.to_string())));
+            }
+        }
+        Ok(out)
+    }
+
+    /// The TRUE (UNCAPPED) count of VISIBLE full-brain nodes: entities + meetings + notes +
+    /// documents, each under the SAME visibility predicate as its node reader but with NO per-kind
+    /// LIMIT. Drives `FullGraphData::total_visible_nodes` so the FE can disclose when a per-kind
+    /// render cap silently trimmed the graph (mirrors `count_entities_visible` for the entity graph).
+    /// A sealed-and-not-session-unlocked item is NOT counted (leak-free — a bare total).
+    fn count_full_graph_nodes_visible(&self, unlocked: &HashSet<String>) -> Result<i64> {
+        // Entities reuse the dedicated uncapped counter (same HAVING-visible-mention predicate).
+        let entities = self.count_entities_visible(unlocked, None)?;
+        let conn = self.lock();
+        // Meetings — the `list_meetings_visible` predicate, uncapped.
+        let m_visible = visibility_clause("f", unlocked);
+        let meetings: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM meetings m
+                       WHERE NOT EXISTS (SELECT 1 FROM notes nn WHERE nn.meeting_id = m.id)
+                          OR EXISTS (SELECT 1 FROM notes n
+                                       LEFT JOIN folders f ON f.id = n.folder_id
+                                      WHERE n.meeting_id = m.id AND {m_visible})"
+                ),
+                [],
+                |r| r.get(0),
+            )
+            .map_err(map_err)?;
+        // Notes + documents — folder-gated, uncapped, both kinds.
+        let d_visible = visibility_clause("f", unlocked);
+        let docs: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM documents d
+                       JOIN folders f ON f.id = d.folder_id
+                      WHERE d.kind IN ('note', 'document') AND {d_visible}"
+                ),
+                [],
+                |r| r.get(0),
+            )
+            .map_err(map_err)?;
+        Ok(entities + meetings + docs)
+    }
+
+    /// Entity→meeting MENTION edges for the full-brain graph: `(entity_id, meeting_id, weight)` for
+    /// every mention landing in a VISIBLE meeting (the SAME `EXISTS(visible note) OR NOT EXISTS(any
+    /// note)` predicate as `list_meetings_visible`/`graph_edges_visible`). `weight` is always 1 (one
+    /// mention row per (entity, meeting) — the PK guarantees it); kept as a field for edge-uniformity.
+    /// A mention into a sealed-and-not-session-unlocked meeting yields NO row, so it can never surface
+    /// a hidden meeting. Capped ordered by entity/meeting id for a bounded, deterministic payload.
+    fn entity_meeting_mentions_visible(
+        &self,
+        unlocked: &HashSet<String>,
+    ) -> Result<Vec<(String, String, i64)>> {
+        let conn = self.lock();
+        let visible = visibility_clause("n", unlocked);
+        const MAX_MENTION_EDGES: usize = 2000;
+        let sql = format!(
+            "SELECT em.entity_id, em.meeting_id
+               FROM entity_mentions em
+               JOIN meetings m ON m.id = em.meeting_id
+              WHERE (
+                      NOT EXISTS (SELECT 1 FROM notes nn WHERE nn.meeting_id = m.id)
+                   OR EXISTS (
+                        SELECT 1 FROM notes n
+                         LEFT JOIN folders f ON f.id = n.folder_id
+                         WHERE n.meeting_id = m.id AND {visible}
+                      )
+                    )
+              ORDER BY em.entity_id ASC, em.meeting_id ASC
+              LIMIT {MAX_MENTION_EDGES}"
+        );
+        let mut stmt = conn.prepare(&sql).map_err(map_err)?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, 1i64))
+            })
+            .map_err(map_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(map_err)?);
+        }
+        Ok(out)
+    }
+
+    /// Raw `links` rows for the full-brain graph, PRE-gating (the caller gates both endpoints against
+    /// the visible-node set). `status='active'` always; `status='suggested'` semantic rows ONLY when
+    /// `include_suggested`. `dismissed` rows are NEVER returned. Returns
+    /// `(src_kind, src_id, dst_kind, dst_id, edge_type, score, status)` ordered deterministically.
+    /// This reads no content columns — ids/kinds/metadata only — and is gated by the caller, so it is
+    /// leak-free at every call site.
+    fn full_graph_links(&self, include_suggested: bool) -> Result<Vec<FullGraphLinkRow>> {
+        let conn = self.lock();
+        // active: any edge_type. suggested: ONLY semantic (wikilink/companion are always active by
+        // construction; there is no "suggested wikilink"). dismissed tombstones stay excluded.
+        let status_pred = if include_suggested {
+            "(status = 'active' OR (status = 'suggested' AND edge_type = 'semantic'))"
+        } else {
+            "status = 'active'"
+        };
+        let sql = format!(
+            "SELECT src_kind, src_id, dst_kind, dst_id, edge_type, score, status
+               FROM links
+              WHERE {status_pred}
+              ORDER BY edge_type ASC, src_id ASC, dst_id ASC, id ASC"
+        );
+        let mut stmt = conn.prepare(&sql).map_err(map_err)?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, f64>(5)?,
+                    r.get::<_, String>(6)?,
+                ))
+            })
+            .map_err(map_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(map_err)?);
+        }
+        Ok(out)
+    }
+
     /// Build the detail payload for one entity (`get_entity_detail`): the entity, its visible
     /// backlinked meetings, and its top co-occurring neighbors. `None` if the entity is unknown
     /// OR has ZERO visible mentions (mentioned only in sealed-not-unlocked meetings). The
@@ -13061,6 +13424,47 @@ fn backlink_sort_key(b: &BacklinkSource) -> i64 {
 /// created_by, status, score, created_at)`. Aliased so the reader's row `Vec` stays under clippy's
 /// type-complexity bar.
 type LinkRowRaw = (i64, String, String, String, String, String, String, String, f64, i64);
+
+/// One VISIBLE note/document node row for the full-brain graph, pre-typed: `(kind, id, label, date)`
+/// (`date` = the `updated_at`/`created_at` epoch-ms as a string). Aliased to keep
+/// [`Db::full_graph_content_nodes`]'s return under clippy's type-complexity bar.
+type FullGraphContentNode = (FullGraphNodeKind, String, String, Option<String>);
+
+/// One raw `links` row for the full-brain graph, PRE-gating: `(src_kind, src_id, dst_kind, dst_id,
+/// edge_type, score, status)` (ids/kinds/metadata only — no content). Aliased to keep
+/// [`Db::full_graph_links`]'s return under clippy's type-complexity bar.
+type FullGraphLinkRow = (String, String, String, String, String, f64, String);
+
+/// Per-kind render cap for the full-brain graph (`build_full_graph`, DESIGN §PR-4). Meetings, notes,
+/// and documents are each capped independently (entities keep their own 500 cap inside
+/// `list_entities_visible`) so the payload stays bounded on a large vault; visibility is enforced in
+/// WHERE, so the cap trims magnitude only — it can never widen what is visible. Mirrors the
+/// `MAX_GRAPH_EDGES`/`MAX_VISIBLE_ENTITIES` posture, disclosed via `total_visible_nodes`.
+const MAX_FULL_GRAPH_PER_KIND: usize = 500;
+
+/// Map a persisted `links.src_kind`/`dst_kind` string onto the STABLE full-graph node-kind key
+/// (`meeting`/`note`/`document`). `None` for anything unknown (a corrupt row → its edge is dropped).
+/// Deliberately NOT reusing `LinkKind::parse` → `.as_str()` so the returned `&'static str` is the
+/// canonical node-kind key used in the visible-node set (they happen to coincide, kept explicit).
+fn full_graph_link_kind_str(kind: &str) -> Option<&'static str> {
+    match kind {
+        "meeting" => Some(FullGraphNodeKind::Meeting.as_str()),
+        "note" => Some(FullGraphNodeKind::Note.as_str()),
+        "document" => Some(FullGraphNodeKind::Document.as_str()),
+        _ => None,
+    }
+}
+
+/// Map a persisted `links.edge_type` onto the full-graph edge kind. `None` for an unknown type (the
+/// edge is dropped). co_occurrence/mention are computed edges, never stored, so they are not here.
+fn full_graph_edge_kind_from_type(edge_type: &str) -> Option<FullGraphEdgeKind> {
+    match edge_type {
+        "wikilink" => Some(FullGraphEdgeKind::Wikilink),
+        "companion" => Some(FullGraphEdgeKind::Companion),
+        "semantic" => Some(FullGraphEdgeKind::Semantic),
+        _ => None,
+    }
+}
 
 fn visibility_clause(_alias: &str, unlocked: &HashSet<String>) -> String {
     let mut clause = String::from("(f.locked IS NULL OR f.locked = 0");
@@ -23051,6 +23455,244 @@ mod graph_tests {
                 .len(),
             1
         );
+    }
+
+    // ── Brain v3 PR-4 — full-brain graph gating + honesty tests ────────────────────────────────
+
+    /// Seed one `links` row directly (test helper; mirrors the raw-insert pattern the PR-3 link
+    /// tests use). Bypasses the write-time indexers so a test can pin `build_full_graph`'s edge
+    /// gating in isolation.
+    fn seed_link(
+        db: &Db,
+        src: (&str, &str),
+        dst: (&str, &str),
+        edge_type: &str,
+        status: &str,
+        score: f64,
+    ) {
+        db.lock()
+            .execute(
+                "INSERT INTO links
+                   (src_kind, src_id, dst_kind, dst_id, edge_type, score, created_by, status, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'auto', ?7, 1)",
+                rusqlite::params![src.0, src.1, dst.0, dst.1, edge_type, score, status],
+            )
+            .unwrap();
+    }
+
+    /// GATE (the load-bearing PR-4 test): sealing a folder removes its meeting/note/document NODES
+    /// from the full-brain graph AND every edge that touches them (both endpoints gated) — while the
+    /// open folder's nodes/edges survive. Session-unlocking the folder id restores everything.
+    /// RED-before-GREEN: drop the visible-node-set both-endpoint check (or read `documents`/meetings
+    /// ungated) and the sealed meeting/note/document — or an edge into them — leaks.
+    #[test]
+    fn build_full_graph_excludes_sealed_nodes_and_their_edges() {
+        let db = file_db("fullgraph-gate");
+        let kek = crate::crypto::random_key().unwrap();
+        seed_folder(&db, "open", "Open");
+        seed_folder(&db, "secret", "Secret");
+
+        // OPEN folder: a meeting (via seed_note), an authored note, and a document.
+        seed_note(&db, "m-open", "# open meeting", Some("open"));
+        db.insert_note("n-open", "open", "open-note", "Open Note", "body", 1_000)
+            .unwrap();
+        db.insert_document("d-open", "open", "open.pdf", "doc body", "document", 1_000)
+            .unwrap();
+        // SECRET folder: a meeting, a note, a document — all sealed below.
+        seed_note(&db, "m-secret", "# secret meeting", Some("secret"));
+        db.insert_note("n-secret", "secret", "secret-note", "Secret Note", "body", 1_000)
+            .unwrap();
+        db.insert_document("d-secret", "secret", "secret.pdf", "hush", "document", 1_000)
+            .unwrap();
+
+        // An entity mentioned in BOTH meetings (co-occurrence needs ≥2 in a meeting, but a single
+        // mention still makes a `mention` edge). Add a second entity so both meetings co-occur them.
+        let atlas = db.upsert_entity("Atlas", EntityKind::Project).unwrap();
+        let nova = db.upsert_entity("Nova", EntityKind::Person).unwrap();
+        db.add_mention(&atlas, "m-open").unwrap();
+        db.add_mention(&nova, "m-open").unwrap();
+        db.add_mention(&atlas, "m-secret").unwrap();
+        db.add_mention(&nova, "m-secret").unwrap();
+
+        // Links spanning the boundary:
+        //  - a wikilink open-note → secret-note (must vanish when secret seals: sealed endpoint);
+        //  - a companion secret-note → secret-meeting (both sealed → vanishes);
+        //  - a wikilink open-note → open-meeting (both open → survives).
+        seed_link(&db, ("note", "n-open"), ("note", "n-secret"), "wikilink", "active", 1.0);
+        seed_link(&db, ("note", "n-secret"), ("meeting", "m-secret"), "companion", "active", 1.0);
+        seed_link(&db, ("note", "n-open"), ("meeting", "m-open"), "wikilink", "active", 1.0);
+
+        let empty: HashSet<String> = HashSet::new();
+        let opts = FullGraphOpts::default();
+
+        // BEFORE sealing: every node + edge present.
+        let g0 = db.build_full_graph(&empty, opts).unwrap();
+        for id in ["m-open", "m-secret", "n-open", "n-secret", "d-open", "d-secret"] {
+            assert!(g0.nodes.iter().any(|n| n.id == id), "node {id} present pre-seal");
+        }
+        assert!(
+            g0.edges
+                .iter()
+                .any(|e| e.src == "n-open" && e.dst == "n-secret"),
+            "cross-folder wikilink present pre-seal"
+        );
+        assert!(!g0.has_hidden, "no locked folder pre-seal");
+
+        // SEAL the secret folder.
+        seal_folder(&db, "secret", &kek);
+        db.set_folder_locked("secret", true, None).unwrap();
+
+        let g1 = db.build_full_graph(&empty, opts).unwrap();
+        // The secret folder's nodes are GONE; the open ones survive.
+        for id in ["m-secret", "n-secret", "d-secret"] {
+            assert!(
+                !g1.nodes.iter().any(|n| n.id == id),
+                "sealed node {id} must not appear (leak)"
+            );
+        }
+        for id in ["m-open", "n-open", "d-open"] {
+            assert!(g1.nodes.iter().any(|n| n.id == id), "open node {id} survives");
+        }
+        // EVERY edge touching a sealed node is dropped — both directions.
+        assert!(
+            !g1.edges
+                .iter()
+                .any(|e| e.src.contains("secret") || e.dst.contains("secret")),
+            "no edge may touch a sealed node (both-endpoint gate)"
+        );
+        // The all-open wikilink survives.
+        assert!(
+            g1.edges
+                .iter()
+                .any(|e| e.src == "n-open" && e.dst == "m-open"),
+            "all-open wikilink survives the seal"
+        );
+        // The mention edges into the sealed meeting are gone; the open one survives.
+        assert!(
+            g1.edges
+                .iter()
+                .any(|e| e.kind == FullGraphEdgeKind::Mention && e.dst == "m-open"),
+            "mention into the open meeting survives"
+        );
+        assert!(
+            !g1.edges
+                .iter()
+                .any(|e| e.kind == FullGraphEdgeKind::Mention && e.dst == "m-secret"),
+            "mention into the sealed meeting is dropped"
+        );
+        assert!(g1.has_hidden, "a sealed-not-unlocked folder sets has_hidden");
+
+        // SESSION-UNLOCK the folder id → everything reappears.
+        let unlocked = unlocked_set(&["secret"]);
+        let g2 = db.build_full_graph(&unlocked, opts).unwrap();
+        for id in ["m-secret", "n-secret", "d-secret"] {
+            assert!(
+                g2.nodes.iter().any(|n| n.id == id),
+                "sealed node {id} reappears once the folder id is unlocked"
+            );
+        }
+        assert!(
+            g2.edges
+                .iter()
+                .any(|e| e.src == "n-open" && e.dst == "n-secret"),
+            "cross-folder wikilink returns when unlocked"
+        );
+        assert!(!g2.has_hidden, "no hidden folder once the only lock is unlocked");
+    }
+
+    /// A `status='suggested'` semantic link is HIDDEN unless `include_suggested` is on; an `active`
+    /// link is always present. RED-before-GREEN: read all non-dismissed rows regardless of the flag
+    /// and the suggested edge leaks into the default graph.
+    #[test]
+    fn build_full_graph_suggested_semantic_behind_opts_flag() {
+        let db = file_db("fullgraph-suggested");
+        seed_folder(&db, "f", "Notes");
+        db.insert_note("n1", "f", "n1", "Note One", "body", 1_000)
+            .unwrap();
+        db.insert_note("n2", "f", "n2", "Note Two", "body", 1_000)
+            .unwrap();
+        // An ACTIVE wikilink (always shown) + a SUGGESTED semantic (flag-gated), both n1↔n2.
+        seed_link(&db, ("note", "n1"), ("note", "n2"), "wikilink", "active", 1.0);
+        seed_link(&db, ("note", "n1"), ("note", "n2"), "semantic", "suggested", 0.9);
+
+        let empty: HashSet<String> = HashSet::new();
+        // DEFAULT (flag off): only the active wikilink edge.
+        let off = db.build_full_graph(&empty, FullGraphOpts::default()).unwrap();
+        assert!(
+            off.edges
+                .iter()
+                .any(|e| e.kind == FullGraphEdgeKind::Wikilink),
+            "the active wikilink is always present"
+        );
+        assert!(
+            !off.edges
+                .iter()
+                .any(|e| e.kind == FullGraphEdgeKind::Semantic),
+            "a suggested semantic edge is hidden with the flag off"
+        );
+        // Flag ON: the suggested semantic edge appears with status='suggested'.
+        let on = db
+            .build_full_graph(
+                &empty,
+                FullGraphOpts {
+                    include_suggested: true,
+                },
+            )
+            .unwrap();
+        let sem = on
+            .edges
+            .iter()
+            .find(|e| e.kind == FullGraphEdgeKind::Semantic)
+            .expect("suggested semantic edge present with the flag on");
+        assert_eq!(sem.status, "suggested");
+        assert!((sem.score - 0.9).abs() < 1e-9, "semantic score = cosine");
+    }
+
+    /// HONEST CAPS: the per-kind node cap trims `nodes` while `total_visible_nodes` reports the TRUE
+    /// pre-cap count, and `has_hidden` reflects LOCKED folders independently. RED-before-GREEN: set
+    /// `total_visible_nodes = nodes.len()` and the silent cap-drop is invisible to the FE.
+    #[test]
+    fn build_full_graph_cap_and_has_hidden_are_honest() {
+        let db = file_db("fullgraph-cap");
+        seed_folder(&db, "f", "Notes");
+        // Seed one more note than the per-kind cap so the note leg is trimmed.
+        let over = MAX_FULL_GRAPH_PER_KIND + 3;
+        for i in 0..over {
+            db.insert_note(&format!("n{i:04}"), "f", &format!("n{i}"), &format!("Note {i}"), "body", 1_000)
+                .unwrap();
+        }
+        let empty: HashSet<String> = HashSet::new();
+        let g = db.build_full_graph(&empty, FullGraphOpts::default()).unwrap();
+        let note_nodes = g
+            .nodes
+            .iter()
+            .filter(|n| n.kind == FullGraphNodeKind::Note)
+            .count();
+        assert_eq!(
+            note_nodes, MAX_FULL_GRAPH_PER_KIND,
+            "the note leg is capped at MAX_FULL_GRAPH_PER_KIND"
+        );
+        assert_eq!(
+            g.nodes.len(),
+            MAX_FULL_GRAPH_PER_KIND,
+            "the emitted node list is trimmed by the cap (only notes here)"
+        );
+        assert_eq!(
+            g.total_visible_nodes, over as i64,
+            "total_visible_nodes reports the TRUE (UNCAPPED) count — > nodes.len() when the cap trimmed"
+        );
+        assert!(
+            g.total_visible_nodes > g.nodes.len() as i64,
+            "the honest disclosure exposes the silent cap-drop"
+        );
+        // has_hidden is false with no locked folder — even though the cap trimmed rows (the two
+        // signals are distinct: cap-drop is disclosed via total_visible_nodes, not has_hidden).
+        assert!(!g.has_hidden, "cap-drop must NOT masquerade as a locked-folder hide");
+
+        // Lock a folder → has_hidden flips true, independent of the cap.
+        db.set_folder_locked("f", true, None).unwrap();
+        let g2 = db.build_full_graph(&empty, FullGraphOpts::default()).unwrap();
+        assert!(g2.has_hidden, "a locked folder sets has_hidden");
     }
 
     /// `/people` CRM GATE: a Person mentioned ONLY in a sealed-and-not-session-unlocked meeting is

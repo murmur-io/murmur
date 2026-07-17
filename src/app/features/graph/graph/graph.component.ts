@@ -6,6 +6,9 @@ import {
   inject,
   signal,
 } from "@angular/core";
+import { toSignal } from "@angular/core/rxjs-interop";
+import { ActivatedRoute } from "@angular/router";
+import { map } from "rxjs";
 import { IpcService } from "../../../core/ipc.service";
 import type { GraphData, GraphNode } from "../../../core/models";
 import { FoldersService } from "../../../services/folders.service";
@@ -46,6 +49,18 @@ interface DirectorySection {
 export class GraphComponent {
   private readonly ipc = inject(IpcService);
   private readonly folders = inject(FoldersService);
+  private readonly route = inject(ActivatedRoute);
+
+  /**
+   * An optional `?entity=<id>` query param — the entry point the full-brain
+   * graph uses for its entity click-through ("reuse existing nav"). Read as a
+   * signal; an effect preselects it once the graph resolves (a `computed`
+   * `selectedId` can't be user-toggled, so it seeds a writable signal instead).
+   */
+  private readonly entityParam = toSignal(
+    this.route.queryParamMap.pipe(map((p) => p.get("entity"))),
+    { initialValue: null },
+  );
 
   readonly graphData = signal<GraphData | null>(null);
   readonly loading = signal(true);
@@ -158,6 +173,23 @@ export class GraphComponent {
     // fetchGraph() writes the loading/error/data signals (synchronously before
     // its first await), so this tracked effect must be allowed to write.
   );
+
+  /**
+   * Preselect the `?entity=<id>` deep-link once its node is visible in the
+   * loaded graph (the full-brain graph navigates here for entity click-through).
+   * Only applies while nothing is selected yet, so it seeds the initial view
+   * without stomping a later user selection; a missing/sealed entity is ignored.
+   */
+  private readonly _applyEntityParam = effect(() => {
+    const wanted = this.entityParam();
+    const data = this.graphData();
+    if (!wanted || !data) {
+      return;
+    }
+    if (this.selectedId() === null && data.nodes.some((n) => n.id === wanted)) {
+      this.selectedId.set(wanted);
+    }
+  });
 
   private async fetchGraph(): Promise<void> {
     this.error.set(null);

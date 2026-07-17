@@ -324,6 +324,7 @@ pub fn run() {
             commands::pin_moment,
             commands::link_meeting_entities,
             commands::get_graph,
+            commands::get_full_graph,
             commands::get_entity_detail,
             commands::get_backlinks,
             commands::list_links,
