@@ -328,6 +328,13 @@
     <app-backlinks [sources]="backlinks()" />
   }
 
+  <!-- CONNECTIONS (Brain v3 PR-3) — deterministic wikilink/companion link chips +
+       semantic suggestions (confidence chip + Accept/Dismiss), self-loaded & gated.
+       Beside "Linked mentions". note-panel only renders for an unlocked meeting
+       (detail's `@else (!locked())`), so `locked` stays the default false; the panel
+       still re-asks on a session lock-tree change. -->
+  <app-connections kind="meeting" [id]="meetingId()" />
+
   <!-- LIVE CONTEXT — enrich this note with fresh detail from connected tools (Jira / Slack / web).
        Sits right after the note summary; egress is on-demand + kept loud. Only rendered for an
        unlocked meeting (note-panel itself is under the detail view's `@else (!locked())`). Bubbles
