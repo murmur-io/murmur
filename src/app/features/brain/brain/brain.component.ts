@@ -519,8 +519,9 @@ export class BrainComponent {
 
   /**
    * Open the native file dialog (Markdown / text / PDF / Word / PowerPoint /
-   * Excel / HTML) → import the chosen path as a document. The backend extracts
-   * the text, then chunks + embeds it behind the RAM floor, streaming progress
+   * Excel / HTML / image) → import the chosen path as a document. The backend
+   * extracts the text — scanned PDFs and images run through on-device Vision
+   * OCR — then chunks + embeds it behind the RAM floor, streaming progress
    * over `EVENT_DOC_IMPORT` (surfaced on the card via {@link importProgressLabel}).
    */
   async pickAndImportDocument(): Promise<void> {
@@ -542,6 +543,14 @@ export class BrainComponent {
             "xlsx",
             "html",
             "htm",
+            "png",
+            "jpg",
+            "jpeg",
+            "heic",
+            "tiff",
+            "tif",
+            "bmp",
+            "gif",
           ],
         },
       ],
@@ -652,9 +661,12 @@ export class BrainComponent {
     if (/^locked:|\block/i.test(msg)) {
       return "That folder is locked — unlock it first to add to the brain.";
     }
-    // Scanned / image-only PDF — no text layer, OCR not supported yet.
-    if (/scanned pdf|no extractable text|has no extractable/i.test(msg)) {
-      return "That file has no extractable text (a scanned or image-only document). OCR isn’t supported yet.";
+    // OCR ran but found nothing — a scanned PDF or an image with no readable
+    // text ("no text found in this document, even with OCR" / "no text found
+    // in this image"). Scanned PDFs now OCR automatically, so this is the only
+    // remaining no-text failure.
+    if (/no text found/i.test(msg)) {
+      return "No readable text found in that file, even after OCR.";
     }
     // Encrypted / password-protected PDF.
     if (/password-protected|password|encrypted/i.test(msg)) {

@@ -2742,9 +2742,14 @@ pub(crate) fn get_note_receipts_inner(
 }
 
 /// The extensions document ingestion accepts (Brain v3 PR-2). Text (md/txt) plus the extracted
-/// formats: PDF (macOS PDFKit), DOCX/PPTX (pure-Rust OOXML), XLSX (calamine), HTML. Dispatch +
-/// extraction live in `crate::extract`; anything else is rejected with `InvalidArg`.
-const DOC_ALLOWED_EXTS: &[&str] = &["md", "txt", "pdf", "docx", "pptx", "xlsx", "html", "htm"];
+/// formats: PDF (macOS PDFKit, scanned-PDF pages fall back to on-device Vision OCR), DOCX/PPTX
+/// (pure-Rust OOXML), XLSX (calamine), HTML, and — Brain v3 OCR — direct image import
+/// (png/jpg/jpeg/heic/tiff/tif/bmp/gif) via on-device Apple Vision. Dispatch + extraction live in
+/// `crate::extract`; anything else is rejected with `InvalidArg`.
+const DOC_ALLOWED_EXTS: &[&str] = &[
+    "md", "txt", "pdf", "docx", "pptx", "xlsx", "html", "htm", "png", "jpg", "jpeg", "heic", "tiff",
+    "tif", "bmp", "gif",
+];
 
 /// Document ingestion — upload a local file INTO a folder so its EXTRACTED text is chunked + embedded
 /// into the on-device vector layer and the brain/Ask can retrieve it. Returns the new document id.
@@ -2863,7 +2868,7 @@ fn extract_document_text(path: &str) -> Result<(String, String), AppError> {
         Some(e) if DOC_ALLOWED_EXTS.contains(&e.as_str()) => e,
         _ => {
             return Err(AppError::InvalidArg(
-                "unsupported document type — import md, txt, pdf, docx, pptx, xlsx, or html".into(),
+                "unsupported document type — import md, txt, pdf, docx, pptx, xlsx, html, or an image (png/jpg/heic/tiff/bmp/gif)".into(),
             ))
         }
     };
