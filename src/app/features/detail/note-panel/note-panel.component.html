@@ -292,6 +292,39 @@
           </article>
         }
 
+        <!-- RECEIPTS (Brain v3 PR-5): every claim the transcript proves →
+             a chip that seeks the Audio tab to that second + flashes the
+             segment. Empty (nothing rendered) for a locked meeting (the
+             backend returns no receipts) or a note with no aligned claim. -->
+        @if (receiptChips().length) {
+          <article class="card receipts" aria-label="Audio receipts">
+            <div class="receipts-head">
+              <span class="section-label">Receipts</span>
+              <span class="count">{{ receiptChips().length }}</span>
+              <span class="receipts-hint">Click to hear the moment this was said</span>
+            </div>
+            <ul class="receipt-list">
+              @for (r of receiptChips(); track r.claimIndex) {
+                <li>
+                  <button
+                    type="button"
+                    class="receipt-chip"
+                    [attr.title]="'Play ' + r.time + (r.speaker ? ' · ' + r.speaker : '')"
+                    (click)="onReceipt(r)"
+                  >
+                    <span class="receipt-play" aria-hidden="true">▸</span>
+                    <span class="receipt-claim">{{ r.claim }}</span>
+                    @if (r.speaker) {
+                      <span class="receipt-speaker">{{ r.speaker }}</span>
+                    }
+                    <span class="receipt-time">{{ r.time }}</span>
+                  </button>
+                </li>
+              }
+            </ul>
+          </article>
+        }
+
         @if (justSaved()) {
           <div class="saved-toast" role="status">
             <span class="saved-toast-check" aria-hidden="true"></span>
