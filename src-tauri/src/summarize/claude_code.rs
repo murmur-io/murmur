@@ -25,7 +25,17 @@ const PASSTHROUGH_ENV: &[&str] = &[
 /// DB encryption keys decrypt the ENTIRE library and the account master key (`MURMUR_DEV_ACCOUNT_MK`)
 /// unwraps every retained share key — and the child talks to the cloud, so all three key-material dev
 /// hatches are stripped unconditionally. Everything else is the user's call (the inherit opt-in).
+///
+/// F2 catch-all: in ADDITION to these three explicit names, [`harden_env`] strips ANY var whose name
+/// begins with [`MURMUR_ENV_PREFIX`], so a FUTURE `MURMUR_*` secret env var can never leak to the
+/// child under inherit mode even if someone forgets to add it here. Keep this list for the explicit,
+/// documented-intent cases; the prefix sweep is the safety net.
 const NEVER_INHERIT_ENV: &[&str] = &["MURMUR_DEV_DEK", "MURMUR_DEV_KEK", "MURMUR_DEV_ACCOUNT_MK"];
+
+/// Prefix for the F2 catch-all env sweep: under inherit mode EVERY var whose name starts with this is
+/// removed from the child, so a new Murmur-owned secret env var never reaches the cloud-bound `claude`
+/// child without anyone touching this file.
+const MURMUR_ENV_PREFIX: &str = "MURMUR_";
 
 /// Apply the environment policy to a tokio `Command`.
 ///
@@ -42,6 +52,17 @@ fn harden_env(cmd: &mut Command, inherit: bool) {
         for key in NEVER_INHERIT_ENV {
             cmd.env_remove(key);
         }
+        // F2 catch-all: sweep EVERY inherited `MURMUR_*` var out of the child so a future
+        // Murmur-owned secret env var never reaches the cloud-bound `claude` without being added to
+        // NEVER_INHERIT_ENV above. `env_remove` overrides the inherited value with an explicit unset.
+        for (key, _) in std::env::vars_os() {
+            if key
+                .to_str()
+                .is_some_and(|k| k.starts_with(MURMUR_ENV_PREFIX))
+            {
+                cmd.env_remove(&key);
+            }
+        }
         return;
     }
     cmd.env_clear();
@@ -56,21 +77,28 @@ fn harden_env(cmd: &mut Command, inherit: bool) {
 /// Default binary name (resolved via PATH) used to invoke the Claude Code CLI.
 const DEFAULT_BINARY: &str = "claude";
 
-/// Tools we explicitly disallow so the headless `claude -p` run is hermetic — it must
-/// only read its prompt + stdin and emit the note, never touch the filesystem, network,
-/// or shell. Passed to `--disallowedTools` (space-separated list per the CLI).
-const DISALLOWED_TOOLS: &[&str] = &[
-    "Bash",
-    "Edit",
-    "Write",
-    "Read",
-    "Glob",
-    "Grep",
-    "WebFetch",
-    "WebSearch",
-    "Task",
-    "NotebookEdit",
-];
+/// Tool-isolation for the headless `claude -p` run. These runs ONLY read their prompt + stdin and
+/// emit text (a note, or — for the Ask agentic loop — a JSON step that Murmur's OWN
+/// `GatedToolExecutor` parses and dispatches), so they legitimately need ZERO claude tools.
+///
+/// We pass an EMPTY `--allowedTools ""` (an ALLOWLIST, not the former denylist). This is fail-CLOSED:
+/// unlike a denylist of the tools that happened to exist when it was written, an empty allowlist also
+/// blocks any FUTURE built-in claude tool. Empirically verified against the installed CLI — an empty
+/// allowlist + `--strict-mcp-config` still runs a normal `-p`/`--system-prompt`/stdin request and
+/// emits clean text (exit 0).
+///
+/// This alone does NOT stop MCP tools (`mcp__*`): the claude CLI discovers MCP servers from FILES
+/// (`~/.claude.json`, project `.mcp.json`) — untouched by `env_clear`. [`STRICT_MCP_CONFIG_FLAG`] is
+/// the load-bearing MCP closure: `--strict-mcp-config` with NO `--mcp-config` loads ZERO MCP servers,
+/// so the "hermetic, nothing-leaves" run can NEVER invoke the user's ambient Gmail/Drive/Slack/… (or
+/// a self-referential murmur) server. Both flags are applied at both spawn sites.
+const ALLOWED_TOOLS: &str = "";
+
+/// The flag that restricts MCP discovery to `--mcp-config` files only; passed WITHOUT any
+/// `--mcp-config`, it loads zero MCP servers (the F1 MCP side-channel closure). Verified present in
+/// the installed CLI (`claude --help`: "Only use MCP servers from --mcp-config, ignoring all other
+/// MCP configurations").
+const STRICT_MCP_CONFIG_FLAG: &str = "--strict-mcp-config";
 
 /// The user's real shell PATH + common install dirs. A macOS GUI app (launched from
 /// Finder / `open`) inherits only a minimal PATH (`/usr/bin:/bin:…`), so `claude` (and the
@@ -184,10 +212,11 @@ extern "C" {
 
 /// Spawns the local `claude -p` CLI in headless print mode to generate the note.
 ///
-/// Per the design lessons the run is kept hermetic via `--system-prompt` (the note-format
-/// template) and `--disallowedTools` (every tool, so it cannot read the vault or hit the
-/// network), and the produced Markdown is validated to start with a YAML front-matter
-/// fence line of three dashes.
+/// Per the design lessons the run is kept hermetic via `--system-prompt` (the note-format template),
+/// an EMPTY `--allowedTools ""` (fail-closed tool isolation — no built-in tool, now or in future),
+/// and `--strict-mcp-config` (no `--mcp-config` ⇒ ZERO ambient MCP servers, so the run cannot reach
+/// the user's Gmail/Drive/Slack/… servers or the local murmur MCP). The produced Markdown is
+/// validated to start with a YAML front-matter fence line of three dashes.
 pub struct ClaudeCodeProvider {
     binary: String,
     system_prompt: String,
@@ -300,20 +329,7 @@ impl SummarizerProvider for ClaudeCodeProvider {
         let stdin_content = template::render_user_content(req);
 
         let bin = resolve_binary(&self.binary)?;
-        let mut cmd = Command::new(&bin);
-        cmd.arg("-p")
-            .arg("--system-prompt")
-            .arg(&system_prompt)
-            .arg("--disallowedTools")
-            .arg(DISALLOWED_TOOLS.join(" "))
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true); // F6: a dropped future (cancel/panic) reaps the child.
-                                 // Brain/AI model override: only add `--model` when the user picked a specific model;
-                                 // an empty value lets the CLI use its own default.
-        cmd.args(model_args(&self.model));
-        harden_env(&mut cmd, self.inherit_env); // F2: env_clear + minimal PATH.
+        let mut cmd = build_claude_command(&bin, &system_prompt, &self.model, self.inherit_env);
         let mut child = cmd
             .spawn()
             .map_err(|e| AppError::Summarize(format!("failed to spawn `{bin}`: {e}")))?;
@@ -386,19 +402,11 @@ impl SummarizerProvider for ClaudeCodeProvider {
 
     async fn complete(&self, system: &str, user: &str) -> crate::error::Result<String> {
         let bin = resolve_binary(&self.binary)?;
-        let mut cmd = Command::new(&bin);
-        cmd.arg("-p")
-            .arg("--system-prompt")
-            .arg(system)
-            .arg("--disallowedTools")
-            .arg(DISALLOWED_TOOLS.join(" "))
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true); // F6
-                                 // Brain/AI model override (mirrors `summarize`): add `--model` only when set.
-        cmd.args(model_args(&self.model));
-        harden_env(&mut cmd, self.inherit_env); // F2
+        // Same hermetic seam as `summarize`: empty allowlist + `--strict-mcp-config`. The Ask agentic
+        // loop uses Murmur's OWN JSON tool protocol (the model emits `{"tool":…}` text that
+        // `GatedToolExecutor` parses + executes) — it needs ZERO claude native tools or MCP, so this
+        // isolation FIXES the Ask self-loop (no more `mcp__murmur*`) rather than breaking Ask.
+        let mut cmd = build_claude_command(&bin, system, &self.model, self.inherit_env);
         let mut child = cmd
             .spawn()
             .map_err(|e| AppError::Summarize(format!("failed to spawn `{bin}`: {e}")))?;
@@ -452,6 +460,37 @@ impl SummarizerProvider for ClaudeCodeProvider {
             .map(|s| s.trim().to_string())
             .map_err(|e| AppError::Summarize(format!("claude produced non-UTF8 output: {e}")))
     }
+}
+
+/// Build the fully-configured `claude -p` [`Command`] shared by BOTH spawn sites (`summarize` and
+/// `complete`) — the single testable SEAM for the hermeticity flags (F1). Sets, in order:
+/// `-p`, `--system-prompt <system>`, `--allowedTools ""` (fail-closed tool isolation),
+/// `--strict-mcp-config` (zero ambient MCP servers), the optional `--model <id>`, piped stdio,
+/// `kill_on_drop` (F6), and the hardened env (F2). The caller only writes stdin + reaps the child.
+///
+/// Keeping this in ONE place is what lets a unit test assert (via `get_args()`) that every real spawn
+/// carries `--allowedTools ""` + `--strict-mcp-config` — a drift-proof guard against the egress hole
+/// re-opening if a future edit adds a third spawn site.
+fn build_claude_command(bin: &str, system_prompt: &str, model: &str, inherit_env: bool) -> Command {
+    let mut cmd = Command::new(bin);
+    cmd.arg("-p")
+        .arg("--system-prompt")
+        .arg(system_prompt)
+        // F1 tool isolation: empty allowlist = no built-in tool (fail-closed against future tools).
+        .arg("--allowedTools")
+        .arg(ALLOWED_TOOLS)
+        // F1 MCP closure: `--strict-mcp-config` with NO `--mcp-config` ⇒ zero ambient MCP servers, so
+        // the CLI cannot discover the user's Gmail/Drive/Slack/… (or the local murmur) MCP from
+        // `~/.claude.json` / `.mcp.json`. Closes the un-redacted, un-consented egress + Ask self-loop.
+        .arg(STRICT_MCP_CONFIG_FLAG)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true); // F6: a dropped future (cancel/panic/timeout) reaps the child.
+                             // Brain/AI model override: add `--model` only when the user picked one.
+    cmd.args(model_args(model));
+    harden_env(&mut cmd, inherit_env); // F2: env_clear + minimal PATH (or inherit-minus-secrets).
+    cmd
 }
 
 /// The `--model <id>` argument pair to append for a given model override, or `&[]` when the
@@ -564,6 +603,100 @@ mod tests {
                 .with_inherit_env(true)
                 .inherit_env,
             "opt-in flag is threaded"
+        );
+    }
+
+    /// Collect a `Command`'s args as owned `String`s for assertions.
+    fn args_of(cmd: &Command) -> Vec<String> {
+        cmd.as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn build_claude_command_is_hermetic_summarize_shape() {
+        // F1: the `summarize` command MUST isolate tools (empty allowlist) AND close the MCP side
+        // channel (`--strict-mcp-config`) so the "hermetic, nothing-leaves" run cannot invoke the
+        // user's ambient MCP servers. RED before those flags were added, GREEN after.
+        let cmd = build_claude_command("claude", "SYSTEM PROMPT", "", false);
+        let args = args_of(&cmd);
+        assert!(args.contains(&"-p".to_string()), "headless print mode: {args:?}");
+        assert!(
+            args.contains(&"--strict-mcp-config".to_string()),
+            "F1: must pass --strict-mcp-config to load ZERO ambient MCP servers: {args:?}"
+        );
+        // Empty ALLOWLIST (fail-closed) — the flag with an empty value, NOT the old denylist.
+        let allow_at = args
+            .iter()
+            .position(|a| a == "--allowedTools")
+            .expect("F1: must pass --allowedTools (allowlist) — see args");
+        assert_eq!(
+            args.get(allow_at + 1),
+            Some(&String::new()),
+            "F1: --allowedTools value must be EMPTY (no tool allowed): {args:?}"
+        );
+        // The former denylist flag must be GONE (we switched to an allowlist).
+        assert!(
+            !args.contains(&"--disallowedTools".to_string()),
+            "the denylist flag was replaced by the empty allowlist: {args:?}"
+        );
+        // The system prompt is still threaded through.
+        assert!(
+            args.contains(&"SYSTEM PROMPT".to_string()),
+            "system prompt threaded: {args:?}"
+        );
+    }
+
+    #[test]
+    fn build_claude_command_is_hermetic_complete_shape() {
+        // F1: the `complete` (Ask agentic loop) command MUST carry the SAME isolation. Ask uses
+        // Murmur's own JSON tool protocol, so disabling claude's native tools + MCP FIXES the self-
+        // loop rather than breaking Ask. Both spawn sites share `build_claude_command`, so asserting
+        // it once with the complete-style inputs (no front-matter template) covers the second site.
+        let cmd = build_claude_command("claude", "ask system", "claude-opus-4-8", false);
+        let args = args_of(&cmd);
+        assert!(
+            args.contains(&"--strict-mcp-config".to_string()),
+            "F1: complete must also pass --strict-mcp-config: {args:?}"
+        );
+        let allow_at = args
+            .iter()
+            .position(|a| a == "--allowedTools")
+            .expect("F1: complete must pass --allowedTools: {args:?}");
+        assert_eq!(
+            args.get(allow_at + 1),
+            Some(&String::new()),
+            "F1: complete --allowedTools value must be EMPTY: {args:?}"
+        );
+        // The model override still rides through the shared seam.
+        assert_eq!(
+            args.windows(2)
+                .find(|w| w[0] == "--model")
+                .map(|w| w[1].clone()),
+            Some("claude-opus-4-8".to_string()),
+            "the --model override rides the shared seam: {args:?}"
+        );
+    }
+
+    #[test]
+    fn inherit_env_strips_all_murmur_prefixed_vars() {
+        // F2 catch-all: under inherit mode, a NEW `MURMUR_*` secret env var (not in NEVER_INHERIT_ENV)
+        // must STILL be stripped from the child by the prefix sweep, so a future secret never leaks to
+        // the cloud-bound `claude` without anyone touching this file.
+        let var = "MURMUR_SOMETHING_NEW";
+        // SAFETY: single-threaded test process; we set + read + remove this one var synchronously.
+        unsafe { std::env::set_var(var, "leak-me") };
+        let mut cmd = Command::new("true");
+        harden_env(&mut cmd, true);
+        let envs: std::collections::HashMap<&std::ffi::OsStr, Option<&std::ffi::OsStr>> =
+            cmd.as_std().get_envs().collect();
+        let stripped = envs.get(std::ffi::OsStr::new(var));
+        unsafe { std::env::remove_var(var) };
+        assert_eq!(
+            stripped,
+            Some(&None),
+            "a new MURMUR_* var must be stripped in inherit mode by the prefix sweep"
         );
     }
 
