@@ -8791,6 +8791,7 @@ enum AskFloorPrompt {
 /// assembly (hybrid when semantic search is ON, FTS otherwise — Phase 2b semantics unchanged), the
 /// empty-corpus early return, and the corpus prompt build. The floor-equivalence test binds this
 /// to the original statement sequence.
+#[allow(clippy::too_many_arguments)] // cohesive gated-Ask surface: corpus/consent state + explicit sources.
 fn build_ask_vault_floor_prompt(
     db: &crate::storage::Db,
     config: &AppConfig,
