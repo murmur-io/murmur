@@ -120,27 +120,25 @@ export interface ThreadTurn {
 }
 
 /**
- * One line of the user's NOTES — the MAIN flow (the primary content). A line is
- * either a plain jotting OR the anchor of a `@brain` THREAD (the question that
- * opened the thread is the line text; the Q&A lives in `thread`).
+ * One entry in the ASK BRAIN tab's conversation — the ANCHOR of a `@brain` THREAD
+ * (the question that opened the thread is the entry text; the Q&A lives in
+ * `thread`). Since the v2 document-first redesign the panel's NOTE writing lives in
+ * the embedded note editor (the companion note document), so this store only holds
+ * the Ask-Brain conversation — every entry has a thread (there are no plain jots
+ * here anymore).
  *
- *   - `text`         — the note line shown in the main flow. For a thread anchor
- *                      this is the user's question (marker stripped).
- *   - `thread`       — the Slack-style nested conversation, or `null` for a plain
- *                      note line that has no thread.
+ *   - `text`         — the anchor question shown in the conversation. For a voice
+ *                      turn this is the heard command (or a "🎙 …" placeholder).
+ *   - `thread`       — the Slack-style nested conversation, or `null` transiently.
  *   - `threadOpen`   — whether the nested thread is expanded (collapsible).
  *   - `threadPending`— true while THIS thread has an in-flight agent turn (so the
- *                      thread's own follow-up input + the main composer can guard).
- *   - `persisted`    — true when this line's text is part of the saved
- *                      `manual_notes` buffer. A thread-anchor question is NOT a
- *                      note until the user accepts an agent reply into the notes,
- *                      so it stays `false` (it doesn't pollute the saved buffer).
- *   - `threadId`     — the PERSISTENT key of this line's thread (an FE-generated
- *                      UUID, minted when the thread opens and shipped with every
+ *                      thread's own follow-up input + the ask input can guard).
+ *   - `threadId`     — the PERSISTENT key of this thread (an FE-generated UUID,
+ *                      minted when the thread opens and shipped with every
  *                      `ask_assistant_chat` call so the backend persists the
- *                      exchanges). Null for a plain note line, and for a voice
- *                      thread until the result payload stamps one. Also routes
- *                      threadId-carrying tool/result events to the RIGHT thread.
+ *                      exchanges). Null for a voice thread until the result payload
+ *                      stamps one. Also routes threadId-carrying tool/result events
+ *                      to the RIGHT thread.
  */
 export interface NoteItem {
   /** Stable id for `@for` tracking (never key on $index). */
@@ -149,29 +147,7 @@ export interface NoteItem {
   thread: ThreadTurn[] | null;
   threadOpen: boolean;
   threadPending: boolean;
-  persisted: boolean;
   threadId: string | null;
-  /**
-   * COMPANION NOTE reference. A sent plain jot / accepted `@brain` draft is
-   * appended to the meeting's ONE living companion note via
-   * `append_to_companion_note`; on success the returned reference is stamped here
-   * so the line renders a "✓ Saved to Notes" card:
-   *   - `savedNoteId`     — the companion note's document id (open it by id via
-   *                         `TabsService.openNote`); `undefined` while the append
-   *                         is in flight or if it hasn't been routed through the
-   *                         companion path (a hydrated / thread-anchor line);
-   *   - `meetingWikilink` — the visible `[[Meeting]]` display link for the card's
-   *                         meeting chip (navigation goes by `meetingId`, not this
-   *                         string);
-   *   - `saveState`       — the append lifecycle: `"saving"` (optimistic, in
-   *                         flight), `"saved"` (reference stamped), or `"error"`
-   *                         (the append failed — the line is kept, never dropped,
-   *                         and the card shows a retry). Absent for lines that
-   *                         never went through the companion path.
-   */
-  savedNoteId?: string;
-  meetingWikilink?: string;
-  saveState?: "saving" | "saved" | "error";
 }
 
 /**
@@ -224,20 +200,32 @@ function coerceStatus(s: string): VoiceActionStatus {
 }
 
 /**
- * The in-meeting NOTES + `@brain` THREADS store (Slack-style; the agent PROPOSES,
- * the user ACCEPTS). The MAIN flow is the user's notes — a vertical list of
- * {@link NoteItem} lines persisted to `manual_notes`. An `@brain` line opens an
- * anchored, multi-turn {@link ThreadTurn} thread under that note; an agent reply
- * that carries a `proposedNote` (the model decided the user asked it to MAKE a
- * note) offers "✓ Add to notes" — the ONLY path content enters the main notes
- * (the agent never auto-writes; the backend in-meeting loop is READ-ONLY). A
- * plain answer has no proposal and no add affordance — it reads as conversation.
+ * Strip a leading YAML front-matter block (`---\n…\n---`) from a note's markdown
+ * and trim, returning the user's PROSE only. Used to decide whether the companion
+ * note carries any real content (a note that holds only the managed
+ * `meeting: "[[…]]"` front-matter reads as EMPTY). Kept minimal + local so the
+ * `core` store never imports a feature's editor module.
+ */
+function stripFrontMatter(markdown: string): string {
+  const m = /^---\r?\n[\s\S]*?\r?\n---\r?\n?/.exec(markdown);
+  return (m ? markdown.slice(m[0].length) : markdown).trim();
+}
+
+/**
+ * The in-meeting ASK BRAIN store (Slack-style; the agent PROPOSES, the user
+ * ACCEPTS). Since the v2 document-first redesign the recording panel is a two-tab
+ * surface: the "Note" tab hosts the embedded note editor (the meeting's ONE
+ * companion note DOCUMENT — owned by `NoteEditorComponent`, NOT this store), and
+ * the "Ask Brain" tab hosts the conversation this store drives — a list of
+ * {@link NoteItem} thread anchors, each hosting a multi-turn {@link ThreadTurn}
+ * thread. An agent reply that carries a `proposedNote` offers "Add to note" — on
+ * accept the draft is appended to the companion note via `append_to_companion_note`
+ * (NOT a note-line badge anymore). A plain answer has no proposal — it reads as
+ * conversation.
  *
  * Subscribes ONCE (the RecorderStore.init() pattern) to the wake + result +
  * listening + processing + BOTH tool-trace streams and lands every payload in a
- * `signal` — no NgRx, no subscribe-into-a-field. A voice turn lands in the
- * currently-active thread (or opens a fresh anchorless thread), so the voice
- * question + answer are still acceptable into the notes.
+ * `signal` — no NgRx, no subscribe-into-a-field.
  */
 @Injectable({ providedIn: "root" })
 export class MeetingConversationStore {
@@ -245,47 +233,43 @@ export class MeetingConversationStore {
   private readonly folders = inject(FoldersService);
   private readonly toast = inject(ToastService);
 
-  /** The user's NOTES — the main flow (oldest → newest). Each item may host a thread. */
+  /** The ASK BRAIN conversation — thread anchors (oldest → newest), each hosting a thread. */
   private readonly _notes = signal<NoteItem[]>([]);
   readonly notes = this._notes.asReadonly();
-  /** Whether anything exists yet (drives the empty-state copy). */
+  /** Whether any Ask-Brain exchange exists yet (drives the tab's empty-state copy). */
   readonly hasNotes = computed(() => this._notes().length > 0);
-  /** ENHANCE-MY-NOTES: true once at least one REAL persisted note line exists — i.e. what
-   *  the summarizer will actually see (un-accepted @brain anchors are persisted:false). */
-  readonly hasPersistedNotes = computed(() =>
-    this._notes().some((n) => n.persisted && n.text.trim().length > 0),
-  );
 
   /**
-   * True once the active meeting's notes have finished hydrating from
-   * `manual_notes` (or there is no meeting to load). The composer is DISABLED
-   * until this is true — closing the hydrate-vs-type race: a note submitted
-   * before `getManualNotes` resolves would overwrite the server buffer with just
-   * the fresh line, and then `loadNotes` would skip hydration (flow length > 0),
-   * silently losing the pre-existing server notes. Starts `true` (no meeting yet
-   * → nothing to wait on); flipped to `false` the instant a meeting id is set,
-   * back to `true` in `loadNotes`'s finally.
+   * ENHANCE-MY-NOTES honesty signal: true once the meeting's companion NOTE
+   * document carries non-empty user body (front-matter stripped) — i.e. what the
+   * summarizer will actually fold in. The record screen's enhance banner reads
+   * this, so it must reflect the DOCUMENT the user writes in the "Note" tab, not
+   * the retired per-jot note lines. Refreshed by {@link refreshCompanionContent}
+   * (called on companion get-or-create, on tab-activation, and after an
+   * Ask-Brain "Add to note").
    */
-  private readonly _loaded = signal(true);
-  readonly loaded = this._loaded.asReadonly();
+  private readonly _hasCompanionContent = signal(false);
+  readonly hasPersistedNotes = this._hasCompanionContent.asReadonly();
 
   /**
    * The active recording's meeting id, set by the record screen via
-   * {@link setMeetingId}. Notes are persisted to THIS meeting's `manual_notes`
-   * buffer. Null when there's no live meeting → a note still shows in the flow
-   * but can't be persisted (no meeting to save to yet).
+   * {@link setMeetingId}. Drives the Ask-Brain scope + the companion-note
+   * append/get-or-create. Null when there's no live meeting.
    */
   private readonly _meetingId = signal<string | null>(null);
   readonly meetingId = this._meetingId.asReadonly();
 
   /**
-   * The meeting's manual-notes plaintext buffer, kept in sync so a new note line
-   * or an ACCEPTED agent draft APPENDS ("existing\ntext"). Seeded from
-   * `getManualNotes` by {@link loadNotes}; updated locally on every change.
+   * The meeting's ONE companion note id, eagerly resolved by
+   * {@link ensureCompanionNote} the first time the panel mounts for a meeting.
+   * The "Note" tab mounts the embedded editor on it; the Ask-Brain "Add to note"
+   * refreshes the content signal after appending. Null until resolved / when there
+   * is no meeting. Monotonic token drops a late response for a previous meeting.
    */
-  private notesBuffer = "";
-  /** Monotonic token so a late `getManualNotes` for a previous meeting is dropped. */
-  private notesLoadToken = 0;
+  private readonly _companionNoteId = signal<string | null>(null);
+  readonly companionNoteId = this._companionNoteId.asReadonly();
+  /** Monotonic token so a late companion-note response for a previous meeting is dropped. */
+  private companionLoadToken = 0;
 
   /**
    * The thread the NEXT voice answer should land in. Set when a voice ask is
@@ -504,9 +488,11 @@ export class MeetingConversationStore {
 
   /**
    * Point the store at the active recording's meeting (the record screen calls
-   * this on each meeting-id change). When the id changes we (re)load the existing
-   * `manual_notes` buffer + seed the note flow from it so a later note append
-   * extends — not clobbers — the prior notes. A null id clears the buffer.
+   * this on each meeting-id change). A genuinely-new id clears the Ask-Brain
+   * conversation (threads live only in RAM until persisted) then rehydrates this
+   * meeting's persisted threads. Eager companion-note get-or-create is owned by
+   * {@link ensureCompanionNote} (the panel calls it on mount), NOT here. A null id
+   * clears the companion note + content signal.
    */
   setMeetingId(id: string | null): void {
     if (id === this._meetingId()) return;
@@ -515,20 +501,16 @@ export class MeetingConversationStore {
     // assistant path that falls back off an explicit id, e.g. the voice/wake twin). Best-effort;
     // a failure never blocks the view. Cleared (null) when the store points at no meeting.
     void this.ipc.setFocusMeeting(id);
-    const token = ++this.notesLoadToken;
-    if (!id) {
-      // No meeting to load → nothing to wait on; the composer stays enabled.
-      this.notesBuffer = "";
-      this._loaded.set(true);
-      return;
-    }
+    const token = ++this.companionLoadToken;
+    // A meeting change invalidates the prior meeting's companion note + content.
+    this._companionNoteId.set(null);
+    this._hasCompanionContent.set(false);
+    if (!id) return;
     // A genuinely NEW meeting id → start a fresh conversation: clear the in-memory
-    // flow so a PRIOR meeting's threads (which live only here, not in manual_notes)
-    // don't bleed into the new meeting, then hydrate this meeting's notes. The
-    // same-id case early-returned above, so switching tabs and returning DURING a
-    // recording preserves the conversation (this is the fix for the "threads vanish
-    // when I leave and come back" data-loss bug — the old per-component clear-on-
-    // record effect mis-fired on re-mount because its edge state reset to false).
+    // flow so a PRIOR meeting's threads (which live only here) don't bleed into the
+    // new meeting, then hydrate this meeting's persisted threads. The same-id case
+    // early-returned above, so switching tabs and returning DURING a recording
+    // preserves the conversation.
     this._notes.set([]);
     this.voiceTargetNoteId = null;
     // A stale recall hint / whisper card must not carry into the new meeting's
@@ -539,61 +521,60 @@ export class MeetingConversationStore {
     // re-arm the calibration prompt for the fresh session.
     this._shadowCount.set(0);
     this._shadowDismissed.set(false);
-    this._loaded.set(false);
-    void this.hydrate(id, token);
+    void this.loadThreads(id, token);
   }
 
   /**
-   * Hydrate a genuinely-new meeting: the notes buffer FIRST (it seeds the note
-   * lines + re-enables the composer — timing unchanged), THEN the persisted
-   * `@brain` threads, which attach to the seeded lines by anchor text. Same-id
-   * re-entry never reaches here (RAM wins — see {@link setMeetingId}), so an
-   * in-progress conversation is never clobbered by its own persisted copy.
+   * EAGERLY get-or-create the meeting's ONE companion note so the "Note" tab can
+   * mount the embedded editor on a stable id (the HOST owns eager creation — the
+   * embedded editor never auto-creates). Stale-guarded by {@link companionLoadToken}
+   * so a late response for a meeting we've since left is dropped. Idempotent — a
+   * re-call for the same already-resolved meeting is a no-op. Refreshes the
+   * enhance-honesty content signal on success. On failure (locked/transient) the
+   * companion id stays null → the "Note" tab shows the editor's own loading/error
+   * state; a later mount re-attempts.
    */
-  private async hydrate(id: string, token: number): Promise<void> {
-    await this.loadNotes(id, token);
-    if (token !== this.notesLoadToken) return;
-    await this.loadThreads(id, token);
-  }
-
-  /**
-   * Seed the notes buffer + the note flow from the persisted `manual_notes`.
-   * Stale-guarded: a response for a meeting we've since left is dropped (it must
-   * NOT flip `loaded` for a meeting we've already navigated away from). Failure
-   * (locked/sealed/transient) leaves an empty buffer — local appends still work.
-   * Only HYDRATES when the flow is still empty (so we never clobber notes the
-   * user already typed in this session before the load resolved); the composer is
-   * disabled until this resolves, so the empty-flow precondition is guaranteed
-   * for the FIRST load (the hydrate-vs-type race is closed).
-   */
-  private async loadNotes(id: string, token: number): Promise<void> {
+  async ensureCompanionNote(): Promise<void> {
+    const id = this._meetingId();
+    if (!id) return;
+    // Already resolved for THIS meeting → nothing to do.
+    if (this._companionNoteId()) return;
+    const token = this.companionLoadToken;
     try {
-      const text = await this.ipc.getManualNotes(id);
-      if (token !== this.notesLoadToken) return;
-      this.notesBuffer = text;
-      if (this._notes().length === 0 && text.trim().length > 0) {
-        this._notes.set(
-          text.split("\n").map((line) => ({
-            id: this.nextNoteId++,
-            text: line,
-            thread: null,
-            threadOpen: false,
-            threadPending: false,
-            persisted: true,
-            threadId: null,
-          })),
-        );
-      }
+      const res = await this.ipc.getOrCreateCompanionNote(id);
+      if (token !== this.companionLoadToken) return; // left this meeting → drop
+      this._companionNoteId.set(res.noteId);
+      void this.refreshCompanionContent(res.noteId, token);
     } catch {
-      if (token !== this.notesLoadToken) return;
-      this.notesBuffer = "";
-    } finally {
-      // Re-enable the composer ONLY for the still-current load (a stale response
-      // for a meeting we've left must not unblock the new meeting prematurely).
-      if (token === this.notesLoadToken) {
-        this._loaded.set(true);
-      }
+      // Locked/transient — leave the id null; the editor surfaces its own state.
     }
+  }
+
+  /**
+   * Refresh the enhance-honesty {@link hasPersistedNotes} signal from the companion
+   * note's actual body (front-matter stripped). Best-effort + stale-guarded: a
+   * response for a meeting we've since left is dropped, a failure leaves the flag
+   * as-is. Called on companion get-or-create, when the user switches back to the
+   * "Note" tab (content may have changed via the editor or an Ask-Brain append),
+   * and after an Ask-Brain "Add to note".
+   */
+  async refreshCompanionContent(noteId: string, token: number): Promise<void> {
+    try {
+      const doc = await this.ipc.getNote(noteId);
+      if (token !== this.companionLoadToken) return;
+      // The note body may carry only the front-matter `[[Meeting]]` link with no
+      // user prose; treat a body that is empty once YAML front-matter is stripped
+      // as "no content yet" so the banner never over-claims.
+      this._hasCompanionContent.set(stripFrontMatter(doc.markdown).length > 0);
+    } catch {
+      // Locked/transient/older backend — leave the flag unchanged.
+    }
+  }
+
+  /** Re-read the companion note body (e.g. on returning to the "Note" tab). */
+  refreshCompanionContentNow(): void {
+    const id = this._companionNoteId();
+    if (id) void this.refreshCompanionContent(id, this.companionLoadToken);
   }
 
   /**
@@ -601,20 +582,19 @@ export class MeetingConversationStore {
    * meeting's thread rows (oldest → newest; a sealed-not-unlocked meeting
    * returns [] — gated server-side), group them by `threadId` (insertion
    * order), turn each row into a resolved user + agent turn pair, then ATTACH
-   * each group to the FIRST note line whose text equals the group's anchor and
-   * which has no thread yet (the ✨-ask-brain / anchored case). A group with no
-   * matching line (anchorless voice thread, an edited/deleted note, or an
-   * anchor another group already claimed) APPENDS as a standalone collapsed
-   * thread line at the end — never lost, never mis-attached.
+   * each group to the FIRST entry whose text equals the group's anchor and
+   * which has no thread yet (the anchored case). A group with no matching entry
+   * (anchorless voice thread, or an anchor another group already claimed) APPENDS
+   * as a standalone collapsed thread at the end — never lost, never mis-attached.
    *
-   * Hydrated turns are terminal history: `proposedNote: null` (no Add-to-notes
-   * affordance resurrects — an accepted draft already lives in `manual_notes`),
+   * Hydrated turns are terminal history: `proposedNote: null` (no Add-to-note
+   * affordance resurrects — an accepted draft already lives in the companion note),
    * empty trace, `accepted`/`dismissed` false. Threads stay CONTINUABLE: a
    * follow-up ships the rebuilt RAM turn list + the SAME `threadId`, so new
-   * exchanges append as new rows backend-side. Stale-guarded like
-   * {@link loadNotes}: a response for a meeting we've since left is dropped.
-   * Failure (old backend without the command / transient) leaves the notes
-   * flow as-is — threads simply don't rehydrate.
+   * exchanges append as new rows backend-side. Stale-guarded by
+   * {@link companionLoadToken}: a response for a meeting we've since left is dropped.
+   * Failure (old backend without the command / transient) leaves the conversation
+   * as-is — threads simply don't rehydrate.
    */
   private async loadThreads(id: string, token: number): Promise<void> {
     let rows: AssistantThreadRow[];
@@ -623,7 +603,7 @@ export class MeetingConversationStore {
     } catch {
       return;
     }
-    if (token !== this.notesLoadToken || rows.length === 0) return;
+    if (token !== this.companionLoadToken || rows.length === 0) return;
 
     // Group rows by threadId, preserving first-seen (insertion) order.
     const groups = new Map<string, AssistantThreadRow[]>();
@@ -689,7 +669,6 @@ export class MeetingConversationStore {
               thread,
               threadOpen: false,
               threadPending: false,
-              persisted: false,
               threadId,
             },
           ];
@@ -700,142 +679,12 @@ export class MeetingConversationStore {
   }
 
   /**
-   * Rebuild the `manual_notes` buffer from the PERSISTED note lines (plain notes
-   * + accepted agent drafts, "\n"-joined) and save it. Thread-anchor questions
-   * (`persisted: false`) are excluded — only content the user wrote or accepted
-   * lands in the durable buffer. A no-op when there's no meeting yet (the flow is
-   * shown locally; it persists once a meeting exists / on the next change).
-   *
-   * On a REJECTED save (e.g. `AppError::Locked` when the folder's session-unlock
-   * lapses between the click and the write — `save_manual_notes_inner`,
-   * `commands.rs`) the FE flow already shows the note line / "✓ Added to notes"
-   * from local state, so a swallowed rejection would silently lie about a save
-   * that never landed (the buffer is NOT durable — lost on next load/restart).
-   * Surface it via the toast (mirrors `note-editor.component.ts`'s
-   * `saveText`/`saveFull`) so the user knows to unlock and retry; the local note
-   * line is intentionally kept either way (never destroy content the user typed).
-   */
-  private persistNotes(): void {
-    this.notesBuffer = this._notes()
-      .filter((n) => n.persisted)
-      .map((n) => n.text)
-      .join("\n");
-    const id = this._meetingId();
-    if (!id) return;
-    void this.ipc.saveManualNotes(id, this.notesBuffer).catch((e) => {
-      if (String(e).includes("Locked")) {
-        this.toast.danger(
-          "This meeting's folder is locked — unlock it so your note saves.",
-        );
-      } else {
-        this.toast.danger("Couldn't save your note — it's not synced yet.");
-      }
-    });
-  }
-
-  /**
-   * Add a plain NOTE line to the main flow (the non-@brain path). The line is the
-   * user's own note (never sent to the agent). A no-op for blank text.
-   *
-   * The line is now a REAL, LINKED note: OPTIMISTICALLY appended to the flow
-   * (`saveState: "saving"`), then persisted to the meeting's ONE living companion
-   * note via {@link appendCompanion} — on success the returned
-   * `{ noteId, meetingWikilink }` is stamped onto THIS line so it renders the
-   * "✓ Saved to Notes" card; on failure the line stays (never dropped) with
-   * `saveState: "error"` + a retry. `manual_notes` is ALSO refreshed additively
-   * (the summary / enhance pipeline still reads it — see {@link persistNotes}).
-   */
-  addNote(text: string): void {
-    const t = text.trim();
-    if (!t) return;
-    const noteId = this.nextNoteId++;
-    this._notes.update((ns) => [
-      ...ns,
-      {
-        id: noteId,
-        text: t,
-        thread: null,
-        threadOpen: false,
-        threadPending: false,
-        persisted: true,
-        threadId: null,
-        saveState: "saving",
-      },
-    ]);
-    // Additive: keep the manual_notes buffer in sync (enhance/summary reads it).
-    this.persistNotes();
-    // Durable, linked artifact: append to the companion note + stamp the card ref.
-    void this.appendCompanion(noteId, t);
-  }
-
-  /**
-   * Append a flow line's markdown to the meeting's companion note and stamp the
-   * returned reference onto THAT line so its "✓ Saved to Notes" card can render.
-   *
-   * STALE-RESULT GUARDED two ways: (1) the meeting id is captured at call time —
-   * a response that lands after the store points at a DIFFERENT meeting is
-   * dropped (the line belongs to the old meeting, whose flow was cleared); (2) the
-   * target line is re-found by its stable, never-reused `id` at resolve time — if
-   * it's gone (a new recording / meeting change cleared the flow) the response is
-   * a no-op, never mis-stamped onto a different line. On success:
-   * `saveState: "saved"` + `savedNoteId` + `meetingWikilink`; on failure:
-   * `saveState: "error"` (the line is KEPT — never destroy content the user typed;
-   * the card offers a retry). A no-op when there's no meeting yet (nothing to link
-   * to — the line still shows locally; a later {@link retrySave} once a meeting
-   * exists can persist it).
-   */
-  private async appendCompanion(noteId: number, markdown: string): Promise<void> {
-    const meetingId = this._meetingId();
-    if (!meetingId) {
-      // No meeting to link to yet — leave the optimistic "saving" state off (the
-      // line simply isn't a companion note yet). Clear the transient flag so it
-      // doesn't spin forever with nothing in flight.
-      this.patchNote(noteId, { saveState: undefined });
-      return;
-    }
-    try {
-      const res = await this.ipc.appendToCompanionNote(meetingId, markdown);
-      // Drop a response that landed after we left this meeting (its line is gone).
-      if (this._meetingId() !== meetingId) return;
-      this.patchNote(noteId, {
-        saveState: "saved",
-        savedNoteId: res.noteId,
-        meetingWikilink: res.meetingWikilink,
-      });
-    } catch {
-      if (this._meetingId() !== meetingId) return;
-      // Keep the line; surface the failure on the card (retryable), never drop it.
-      this.patchNote(noteId, { saveState: "error" });
-    }
-  }
-
-  /** Immutably patch ONE flow line by its stable id (a no-op if it's gone). */
-  private patchNote(noteId: number, patch: Partial<NoteItem>): void {
-    this._notes.update((ns) =>
-      ns.map((n) => (n.id === noteId ? { ...n, ...patch } : n)),
-    );
-  }
-
-  /**
-   * Retry a FAILED companion-note append (the "✓ Saved to Notes" card's error
-   * state offers this). Re-optimistic (`saveState: "saving"`) then re-run the
-   * append for the line's current text. A no-op for a line that isn't in the
-   * error state.
-   */
-  retrySave(noteId: number): void {
-    const note = this._notes().find((n) => n.id === noteId);
-    if (!note || note.saveState !== "error") return;
-    this.patchNote(noteId, { saveState: "saving" });
-    void this.appendCompanion(noteId, note.text);
-  }
-
-  /**
-   * Open a `@brain` THREAD: append a NEW note line whose text is the question
+   * Open an ASK-BRAIN THREAD: append a NEW anchor entry whose text is the question
    * (the anchor) hosting a thread with the user's question + a pending agent
    * turn, then ship the thread's history to the multi-turn brain and resolve the
-   * pending agent turn with the reply. The anchor line is NOT persisted to
-   * `manual_notes` (it's a question, not a note) — content only enters the notes
-   * when the user ACCEPTS an agent reply. A no-op for a blank question.
+   * pending agent turn with the reply. The anchor is a QUESTION, not note content —
+   * content enters the companion note only when the user ACCEPTS an agent draft via
+   * "Add to note". A no-op for a blank question.
    */
   async openThread(question: string): Promise<void> {
     const q = question.trim();
@@ -876,75 +725,9 @@ export class MeetingConversationStore {
         thread: [userTurn, agentTurn],
         threadOpen: true,
         threadPending: true,
-        persisted: false,
         threadId,
       },
     ]);
-    await this.runAgentTurn(noteId, agentTurn.id);
-  }
-
-  /**
-   * "✨ ask brain" on an EXISTING plain note: retroactively open a thread on a
-   * note that has none yet, seeding the agent from the NOTE'S OWN TEXT as context.
-   * The note line STAYS the user's note (NOT converted/deleted, still `persisted`)
-   * — the thread just hangs under it like a `@brain` thread.
-   *
-   * The seeded first user turn carries the note text as the question so the agent
-   * can ANSWER about it or PROPOSE a note from it; it ships through the same
-   * `runAgentTurn` / `ask_assistant_chat` path as `@brain`, so the tool-trace,
-   * `proposedNote`-gated Add-to-notes, and follow-ups all behave identically. A
-   * no-op for a missing note, a note that ALREADY has a thread, or blank text.
-   */
-  async askBrainOnNote(noteId: number): Promise<void> {
-    const note = this._notes().find((n) => n.id === noteId);
-    if (!note || note.thread) return; // only notes WITHOUT a thread yet
-    const subject = note.text.trim();
-    if (!subject) return;
-    // A retroactive thread is a NEW thread → mint its persistent key. The note's
-    // text is the anchor, so hydration can re-attach the thread to this line.
-    const threadId = crypto.randomUUID();
-    const userTurn: ThreadTurn = {
-      id: this.nextTurnId++,
-      role: "user",
-      // Seed the agent from the note's own words (this becomes the thread's first
-      // user turn → shipped as the question). It's sliced from the rendered thread
-      // by visibleTurns() because the note line already shows the text above.
-      text: subject,
-      status: "ok",
-      trace: [],
-      citations: [],
-      proposedNote: null,
-      answeredFrom: null,
-      accepted: false,
-      dismissed: false,
-    };
-    const agentTurn: ThreadTurn = {
-      id: this.nextTurnId++,
-      role: "agent",
-      text: "",
-      status: "pending",
-      trace: [],
-      citations: [],
-      proposedNote: null,
-      answeredFrom: null,
-      accepted: false,
-      dismissed: false,
-    };
-    this._notes.update((ns) =>
-      ns.map((n) =>
-        n.id === noteId
-          ? {
-              ...n,
-              // The note stays exactly as it is (text + persisted unchanged); we
-              // only attach the thread + open it.
-              thread: [userTurn, agentTurn],
-              threadOpen: true,
-              threadPending: true,
-              threadId,
-            }
-          : n,
-      ),
-    );
     await this.runAgentTurn(noteId, agentTurn.id);
   }
 
@@ -1113,12 +896,16 @@ export class MeetingConversationStore {
   }
 
   /**
-   * ACCEPT an agent turn's PROPOSED NOTE into the MAIN notes (the agent PROPOSES;
-   * this is the user's accept — the only path content enters the notes). Append a
-   * NEW plain, PERSISTED note line carrying the turn's `proposedNote` DRAFT (NOT
-   * the whole reply) + mark the source turn accepted (so its "✓ Add to notes"
-   * affordance flips to "Added"), then persist. A no-op for an already-accepted
-   * turn or a turn with NO proposed note (a plain answer — nothing to add).
+   * ACCEPT an agent turn's PROPOSED NOTE — "Add to note" (the agent PROPOSES; this
+   * is the user's accept). APPENDS the turn's `proposedNote` DRAFT (NOT the whole
+   * reply) to the meeting's ONE companion note DOCUMENT via
+   * `append_to_companion_note`, marks the source turn accepted (its affordance flips
+   * to "Added to note"), shows an inline confirmation toast, and refreshes the
+   * enhance-honesty content signal — NO per-jot note-line badge (the note is the
+   * document, edited in the "Note" tab). A no-op for an already-accepted turn, a
+   * turn with NO proposed note (a plain answer), or when there's no meeting to link
+   * to. The turn is marked accepted OPTIMISTICALLY; on a failed append the mark is
+   * reverted + a toast surfaces so the user can retry (never silently claim a save).
    */
   acceptIntoNotes(noteId: number, agentTurnId: number): void {
     const note = this._notes().find((n) => n.id === noteId);
@@ -1127,36 +914,66 @@ export class MeetingConversationStore {
     // Append the PROPOSED note draft, never the whole conversational reply.
     const text = (turn.proposedNote ?? "").trim();
     if (!text) return;
-    const acceptedNoteId = this.nextNoteId++;
-    this._notes.update((ns) => {
-      const marked = ns.map((n) => {
+    const meetingId = this._meetingId();
+    if (!meetingId) {
+      this.toast.danger("No meeting is recording — there's nothing to add the note to.");
+      return;
+    }
+    // Optimistically flip the affordance to "Added to note".
+    this.markTurnAccepted(noteId, agentTurnId, true);
+    void this.appendCompanionDraft(meetingId, text, noteId, agentTurnId);
+  }
+
+  /**
+   * Append an accepted Ask-Brain draft to the meeting's companion note document.
+   * Stale-guarded by {@link companionLoadToken} (a response landing after we left
+   * the meeting is dropped). On success: confirm inline + refresh the content
+   * signal so the enhance banner stays honest. On failure: revert the turn's
+   * accepted mark + surface a toast so the user can retry (never a silent lie).
+   */
+  private async appendCompanionDraft(
+    meetingId: string,
+    markdown: string,
+    noteId: number,
+    agentTurnId: number,
+  ): Promise<void> {
+    const token = this.companionLoadToken;
+    try {
+      const res = await this.ipc.appendToCompanionNote(meetingId, markdown);
+      if (token !== this.companionLoadToken) return; // left this meeting → drop
+      // Keep the companion id fresh (a first append may have created the note).
+      if (!this._companionNoteId()) this._companionNoteId.set(res.noteId);
+      this.toast.success("Added to note");
+      void this.refreshCompanionContent(res.noteId, token);
+    } catch (e) {
+      if (token !== this.companionLoadToken) return;
+      // Revert the optimistic accept — the draft never landed in the note.
+      this.markTurnAccepted(noteId, agentTurnId, false);
+      if (String(e).includes("Locked")) {
+        this.toast.danger("This meeting's folder is locked — unlock it to add the note.");
+      } else {
+        this.toast.danger("Couldn't add to note — try again.");
+      }
+    }
+  }
+
+  /** Immutably (un)mark an agent turn as accepted (drives the "Add to note" affordance). */
+  private markTurnAccepted(
+    noteId: number,
+    agentTurnId: number,
+    accepted: boolean,
+  ): void {
+    this._notes.update((ns) =>
+      ns.map((n) => {
         if (n.id !== noteId || !n.thread) return n;
         return {
           ...n,
           thread: n.thread.map((t) =>
-            t.id === agentTurnId ? { ...t, accepted: true } : t,
+            t.id === agentTurnId ? { ...t, accepted } : t,
           ),
         };
-      });
-      return [
-        ...marked,
-        {
-          id: acceptedNoteId,
-          text,
-          thread: null,
-          threadOpen: false,
-          threadPending: false,
-          persisted: true,
-          threadId: null,
-          // An accepted draft is a real, linked companion note too (same card).
-          saveState: "saving",
-        },
-      ];
-    });
-    // Additive: keep manual_notes in sync (enhance/summary reads it).
-    this.persistNotes();
-    // Route the accepted draft through the SAME companion-note path as a jot.
-    void this.appendCompanion(acceptedNoteId, text);
+      }),
+    );
   }
 
   /**
@@ -1190,9 +1007,8 @@ export class MeetingConversationStore {
    * REJECTS, the listener never armed and no {@link onResult} will ever land to
    * backfill the "🎙 …" placeholder anchor — resolving its turn in place would
    * strand an unlabeled mic bubble in the flow with no dismiss/retry for the rest
-   * of the session, so instead we DROP the whole placeholder thread (it never
-   * became a real note — `persisted: false`) and just clear the in-flight flag,
-   * leaving the flow exactly as it was before the click.
+   * of the session, so instead we DROP the whole placeholder thread and just clear
+   * the in-flight flag, leaving the conversation exactly as it was before the click.
    */
   async askNow(): Promise<void> {
     this._manualAskInFlight.set(true);
@@ -1235,7 +1051,6 @@ export class MeetingConversationStore {
         thread: [userTurn, agentTurn],
         threadOpen: true,
         threadPending: true,
-        persisted: false,
         threadId: null,
       },
     ]);
@@ -1310,7 +1125,6 @@ export class MeetingConversationStore {
         thread: [userTurn, agentTurn],
         threadOpen: true,
         threadPending: true,
-        persisted: false,
         threadId: null,
       },
     ]);
@@ -1624,7 +1438,6 @@ export class MeetingConversationStore {
           thread,
           threadOpen: true,
           threadPending: false,
-          persisted: false,
           threadId: payloadThreadId,
         },
       ]);

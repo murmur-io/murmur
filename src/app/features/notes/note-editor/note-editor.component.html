@@ -1,7 +1,8 @@
-<section class="editor">
+<section class="editor" [class.is-embedded]="embedded()">
   <!-- Full-viewport dismissal backdrop for the header menus (click-outside).
-       A real focusable button so the a11y lint + keyboard users are satisfied. -->
-  @if (menu() !== "none") {
+       A real focusable button so the a11y lint + keyboard users are satisfied.
+       Header menus never open when embedded (the header itself is hidden). -->
+  @if (!embedded() && menu() !== "none") {
     <button
       type="button"
       class="menu-backdrop"
@@ -12,7 +13,9 @@
 
   <!-- ===== Sticky header: breadcrumb+Move · Edit/Preview · Share · ⋯ =====
        No local "← Notes" back button (2026-07-12): the main sidebar is ALWAYS
-       visible now, so it IS the way back — see NavHistoryService. -->
+       visible now, so it IS the way back — see NavHistoryService.
+       HIDDEN when embedded (the host tab owns its own chrome). -->
+  @if (!embedded()) {
   <header class="editor-head">
     @if (note(); as doc) {
       @if (!doc.locked) {
@@ -194,6 +197,7 @@
       }
     }
   </header>
+  }
 
   <!-- ===== Body ===== -->
   <div class="editor-body">
@@ -232,7 +236,9 @@
         </div>
       } @else {
         <article class="note-doc" [class.is-full-width]="fullWidth()">
-          <!-- Title -->
+          <!-- Title — HIDDEN when embedded (the companion note carries a managed
+               title equal to the meeting's; the user never edits it here). -->
+          @if (!embedded()) {
           <input
             #titleInput
             type="text"
@@ -246,8 +252,10 @@
             (input)="onTitleInput($event)"
             (blur)="onBlur()"
           />
+          }
 
-          <!-- Properties bar (collapsible). -->
+          <!-- Properties bar (collapsible) — HIDDEN when embedded. -->
+          @if (!embedded()) {
           <div class="panel-card props" [class.is-open]="propsOpen()">
             <button
               type="button"
@@ -483,19 +491,24 @@
               </div>
             }
           </div>
+          }
 
           <!-- LINKED MENTIONS — inbound note↔note backlinks (meetings + notes
                that link this note). Under the properties bar, above the body.
                Only present when non-empty; cleared on a live seal (the effect
-               skips + `onLockTreeChanged` blanks it) so nothing shows behind a lock. -->
-          @if (backlinks().length) {
+               skips + `onLockTreeChanged` blanks it) so nothing shows behind a lock.
+               HIDDEN when embedded (the recording panel's Ask Brain tab owns
+               meeting↔note relationships; the Note tab is pure writing). -->
+          @if (!embedded() && backlinks().length) {
             <app-backlinks [sources]="backlinks()" />
           }
 
           <!-- Body: preview (cached computed) OR the source-of-truth textarea.
                Formatting lives in the floating bubble on selection (below) +
-               ⌘B/⌘I shortcuts + the `/` slash menu — no persistent toolbar. -->
-          @if (preview()) {
+               ⌘B/⌘I shortcuts + the `/` slash menu — no persistent toolbar.
+               `previewActive()` is force-false when embedded (the Preview toggle
+               is hidden there), so the editable body always shows. -->
+          @if (previewActive()) {
             <div class="note-preview">
               <app-markdown [markdown]="previewMarkdown()" />
             </div>

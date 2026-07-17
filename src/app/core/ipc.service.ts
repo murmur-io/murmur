@@ -1942,14 +1942,13 @@ export class IpcService {
   // ── brain2 realtime typed @brain notes (record screen "My notes") ──────
 
   /**
-   * Persist a meeting's live typed-notes buffer (debounced autosave from the
-   * record screen "My notes" editor). GATED server-side: a
-   * sealed-and-not-session-unlocked meeting is refused with `AppError::Locked`
-   * (never resurrect typed plaintext behind a lock) — the caller
-   * (`MeetingConversationStore.persistNotes`) keeps the local draft either way
-   * but surfaces the rejection via a toast rather than swallowing it, since the
-   * flow already shows the note as saved from local state. The text is the
-   * user's OWN words (no new egress).
+   * Persist a meeting's live typed-notes buffer (the legacy `manual_notes` mirror).
+   * GATED server-side: a sealed-and-not-session-unlocked meeting is refused with
+   * `AppError::Locked` (never resurrect typed plaintext behind a lock). The text is
+   * the user's OWN words (no new egress). NOTE: since the v2 document-first redesign
+   * the recording panel's note-taking autosaves through the companion NOTE editor
+   * path (`save_note_text`/`update_note_doc`), and the summary reads the companion
+   * note; this wrapper stays for the backend command + any legacy caller.
    */
   saveManualNotes(meetingId: string, text: string): Promise<void> {
     return invoke<void>("save_manual_notes", { meetingId, text });
@@ -1965,15 +1964,29 @@ export class IpcService {
   }
 
   /**
-   * Append a recording-time jot (or an accepted `@brain` draft) to the meeting's
-   * ONE living companion note. The backend lazily gets-or-creates the companion
-   * note (in the always-open Notes ROOT, `meeting_id` set, managed title synced to
-   * the meeting), appends the markdown block atomically (single-writer — no FE
-   * read-modify-write race), refreshes the front-matter `[[Meeting]]` link, and
-   * re-exports the vault `.md`. Returns the note's id + the display wikilink for
-   * the "✓ Saved to Notes" card. The text is the user's OWN words / an accepted
-   * draft — no new cloud egress. GATED like every content write; a failure must
-   * not blank prior content (verify-before-destroy N/A — additive only).
+   * DOCUMENT-FIRST (v2): EAGERLY get-or-create the meeting's ONE companion note so
+   * the recording panel's "Note" tab has a stable note id to mount the embedded
+   * `app-note-editor` on. The backend gets-or-creates the note (Notes ROOT,
+   * `meeting_id` set, managed title synced to the meeting, front-matter `[[Meeting]]`
+   * link stamped) WITHOUT writing any body, and returns `{ noteId, meetingWikilink }`.
+   * Idempotent — a second call reuses the same note (one-note-per-meeting). GATED:
+   * a sealed-and-not-session-unlocked meeting is refused with `AppError::Locked`.
+   */
+  getOrCreateCompanionNote(meetingId: string): Promise<CompanionAppendResult> {
+    return invoke<CompanionAppendResult>("get_or_create_companion_note", {
+      meetingId,
+    });
+  }
+
+  /**
+   * Append an accepted Ask-Brain draft to the meeting's ONE living companion note.
+   * The backend lazily gets-or-creates the companion note (in the always-open Notes
+   * ROOT, `meeting_id` set, managed title synced to the meeting), appends the
+   * markdown block atomically (single-writer — no FE read-modify-write race),
+   * refreshes the front-matter `[[Meeting]]` link, and re-exports the vault `.md`.
+   * Returns the note's id + the display wikilink. The text is an accepted draft
+   * (the user's own request) — no new cloud egress. GATED like every content write;
+   * a failure must not blank prior content (verify-before-destroy N/A — additive only).
    */
   appendToCompanionNote(
     meetingId: string,
