@@ -8,7 +8,11 @@ import {
   signal,
   viewChild,
 } from "@angular/core";
-import type { BacklinkSource, GraphPayload } from "../../../core/models";
+import type {
+  BacklinkSource,
+  ClaimAlignment,
+  GraphPayload,
+} from "../../../core/models";
 import { MarkdownComponent } from "../../../shared/markdown/markdown.component";
 import { AssistantSourcesComponent } from "../../../shared/assistant-sources/assistant-sources.component";
 import { BacklinksComponent } from "../../../shared/backlinks/backlinks.component";
@@ -42,6 +46,30 @@ export interface ParsedNote {
   sections: NoteSection[];
   raw: string | null;
   enhanced: boolean;
+}
+
+/**
+ * One rendered "Receipt" (Brain v3 PR-5): a note claim that aligned to a
+ * transcript segment, decorated for display. Carries the claim's own text
+ * SNIPPET (from the raw markdown line at `claimIndex`) + the audio coordinate
+ * and speaker/timestamp labels — clicking it seeks the shipped audio player.
+ * `segId`/`startS`/`seq` drive the audio panel's flash + seek.
+ */
+export interface ReceiptChip {
+  /** Short label of the claim line this receipt proves. */
+  claim: string;
+  /** "Me" / "Others" / "" — from the segment speaker. */
+  speaker: string;
+  /** m:ss timestamp of the segment start. */
+  time: string;
+  /** The segment start in raw seconds (the player seek target). */
+  startS: number;
+  /** `Segment.idx` to flash in the transcript. */
+  segId: number;
+  /** The claim's line index — the stable UNIQUE key for `@for` track (two claims can share one segId). */
+  claimIndex: number;
+  /** Monotonic id so the parent can re-fire a repeat click on the same chip. */
+  seq: number;
 }
 
 /** One grounding citation, split into vault vs web shapes for rendering. */
@@ -106,6 +134,18 @@ export class NotePanelComponent {
    * locked (the shell skips the gated fetch there). Rendered below the note body.
    */
   readonly backlinks = input<BacklinkSource[]>([]);
+  /**
+   * Per-claim audio receipts (Brain v3 PR-5): each note line that aligned to a
+   * transcript segment (backend `get_note_receipts`, `meeting_is_unlocked`-gated,
+   * EMPTY for a locked meeting). `claimIndex` is an index into the note's raw
+   * `markdown.split("\n")` lines — mapped to a display snippet via {@link noteRaw}.
+   */
+  readonly receipts = input<ClaimAlignment[]>([]);
+  /**
+   * The note's RAW markdown (unparsed), used only to snippet the claim line a
+   * receipt's `claimIndex` points at. Null when there is no note / it is masked.
+   */
+  readonly noteRaw = input<string | null>(null);
   /** The vault export path from the note DTO (Saved-to-vault line). */
   readonly exportedPath = input<string | null>(null);
   /** Model provenance for the ghost badge (null → hidden). */
@@ -165,6 +205,12 @@ export class NotePanelComponent {
   readonly draftInput = output<string>();
   readonly copyPath = output<void>();
   readonly openRelated = output<string>();
+  /**
+   * A receipt chip was clicked (Brain v3 PR-5): asks the shell to switch to the
+   * Audio tab and seek/flash the proving segment. Carries only audio coordinates
+   * (`startS`/`segId`) + a `seq` so a repeat click on the same chip re-fires.
+   */
+  readonly seekReceipt = output<{ startS: number; segId: number; seq: number }>();
 
   // --- ⋯ More overlay menu (local presentational open/close) --------------
   private readonly moreAnchor =
@@ -184,6 +230,85 @@ export class NotePanelComponent {
   readonly hasTrailingBadge = computed(
     () => this.provenanceLabel() !== null,
   );
+
+  /** Monotonic click id so a repeat click on the SAME receipt re-fires downstream. */
+  private receiptSeq = 0;
+
+  /**
+   * The receipts decorated for display: each aligned claim → a chip labelled with
+   * a snippet of the claim line (from the raw markdown at `claimIndex`) + the
+   * speaker + m:ss timestamp of the proving segment. A receipt whose `claimIndex`
+   * is out of range (a stale note vs a just-recomputed alignment) is dropped so a
+   * chip never shows a wrong/blank claim. Pure `computed` (no template method).
+   */
+  readonly receiptChips = computed<ReceiptChip[]>(() => {
+    const raw = this.noteRaw();
+    if (!raw) {
+      return [];
+    }
+    const lines = raw.split("\n");
+    const out: ReceiptChip[] = [];
+    for (const r of this.receipts()) {
+      const line = lines[r.claimIndex];
+      const claim = line ? this.claimSnippet(line) : "";
+      if (!claim) {
+        continue; // out-of-range / non-content line ⇒ no chip
+      }
+      out.push({
+        claim,
+        speaker: this.speakerLabel(r.speaker),
+        time: this.fmtTime(r.startS),
+        startS: r.startS,
+        segId: r.segmentId,
+        claimIndex: r.claimIndex,
+        seq: 0, // filled at click time (a fresh id per click, see onReceipt)
+      });
+    }
+    return out;
+  });
+
+  /** Emit the seek/flash request for a clicked receipt (fresh `seq` each click). */
+  onReceipt(chip: ReceiptChip): void {
+    this.seekReceipt.emit({
+      startS: chip.startS,
+      segId: chip.segId,
+      seq: ++this.receiptSeq,
+    });
+  }
+
+  /** A short, marker-stripped snippet of a claim line for the chip label. */
+  private claimSnippet(line: string): string {
+    // Drop list/checkbox/quote markers and collapse whitespace; cap the length so
+    // the chip stays compact (the full claim stays in the note body above).
+    const cleaned = line
+      .replace(/^\s*(?:[-*+]\s+)?(?:\[[ xX]\]\s+)?/, "")
+      .replace(/^\s*>\s?/, "")
+      .replace(/[#*_`]/g, "")
+      .trim();
+    if (cleaned.length <= 64) {
+      return cleaned;
+    }
+    return cleaned.slice(0, 63).trimEnd() + "…";
+  }
+
+  /** "me"/"others"/legacy → "Me"/"Others"/"" for the chip. */
+  private speakerLabel(speaker: string | null | undefined): string {
+    if (speaker === "me") {
+      return "Me";
+    }
+    if (speaker === "others" || /^others-\d+$/.test(speaker ?? "")) {
+      return "Others";
+    }
+    return "";
+  }
+
+  /** Seconds → m:ss for the receipt timestamp. */
+  private fmtTime(s: number): string {
+    const total = Math.max(0, Math.floor(s || 0));
+    const m = Math.floor(total / 60);
+    const sec = total % 60;
+    return `${m}:${sec.toString().padStart(2, "0")}`;
+  }
 
   /** Map an interaction status to a global `.pill` variant. */
   qaStatusPillClass(status: string): string {

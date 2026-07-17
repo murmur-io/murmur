@@ -194,6 +194,8 @@
                     type="button"
                     class="frag"
                     [class.is-active]="activeSegKeys().has(s.idx)"
+                    [class.is-flash]="s.idx === flashSegId()"
+                    [attr.data-flash]="s.idx === flashSegId() ? flashKey() : null"
                     [disabled]="!audioSrc()"
                     (click)="seekTo(s.startS)"
                   >{{ s.text }} </button>

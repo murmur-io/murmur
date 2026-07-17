@@ -866,6 +866,32 @@ export interface Segment {
 }
 
 /**
+ * One note claim → the transcript segment it most likely derives from (Brain v3
+ * PR-5 "Receipts"). Mirrors the Rust `ClaimAlignment` (serde camelCase). Carries
+ * NO note or transcript TEXT — only the claim's raw-markdown-line index, the
+ * segment's audio coordinates (RAW SECONDS, for the player seek), and non-content
+ * metadata (speaker label + ASR confidence) — so it is safe to hand a caller that
+ * has already passed the read gate. EMPTY list for a sealed-and-not-session-
+ * unlocked meeting (the backend returns nothing behind a lock).
+ */
+export interface ClaimAlignment {
+  /** Index of the claim in the note's raw `markdown.split("\n")` lines. */
+  claimIndex: number;
+  /** `Segment.idx` of the best-matching transcript segment (flash target). */
+  segmentId: number;
+  /** Segment start in RAW SECONDS — the audio player seek target. */
+  startS: number;
+  /** Segment end in RAW SECONDS. */
+  endS: number;
+  /** `"me"` / `"others"` / `null` — straight from the segment. */
+  speaker?: "me" | "others" | string | null;
+  /** Per-segment ASR confidence in `[0,1]`, or `null` when whisper didn't compute it. */
+  confidence?: number | null;
+  /** The token-overlap ratio that won this alignment (`[0.5, 1.0]`). */
+  overlap: number;
+}
+
+/**
  * One persisted in-meeting voice-assistant interaction (Q&A): the user's spoken
  * command, the assistant's answer, the grounding citations, and the dispatch
  * status. Surfaced in the meeting detail's "Asystent — Q&A" section. EMPTY when

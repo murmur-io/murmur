@@ -253,6 +253,8 @@
             [note]="note()"
             [interactions]="interactions()"
             [backlinks]="backlinks()"
+            [receipts]="receipts()"
+            [noteRaw]="d.note?.markdown ?? null"
             [exportedPath]="d.note?.exportedPath ?? null"
             [provenanceLabel]="provenanceLabel()"
             [busy]="busy()"
@@ -302,6 +304,7 @@
             (draftInput)="draft.set($event)"
             (copyPath)="copy(d.note?.exportedPath ?? '')"
             (openRelated)="openRelated($event)"
+            (seekReceipt)="onSeekReceipt($event)"
             (noteChanged)="reloadDetail()"
           />
           @if (config()?.jiraEnabled && config()?.jiraConsented && !locked()) {
@@ -316,6 +319,7 @@
             #audioPanel
             [audioSrc]="audioSrc()"
             [segments]="d.segments"
+            [seekTarget]="seekTarget()"
             [timeline]="timeline()"
             [timelineTotal]="timelineTotal()"
             [timelineLoading]="timelineLoading()"

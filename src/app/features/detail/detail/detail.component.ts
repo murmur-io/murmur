@@ -24,6 +24,7 @@ import type {
   AppConfigDto,
   AssistantInteraction,
   BacklinkSource,
+  ClaimAlignment,
   FolderNode,
   GraphPayload,
   MeetingDetail,
@@ -345,6 +346,78 @@ export class DetailComponent implements OnInit {
     }
   }
 
+  // --- Receipts (Brain v3 PR-5): claim → second-of-audio ------------------
+  /**
+   * Per-claim audio receipts for the CURRENT note (backend `get_note_receipts`,
+   * `meeting_is_unlocked`-gated → EMPTY for a locked meeting). Fed to the note
+   * panel, which renders a chip per aligned claim. Empty until the first fetch
+   * resolves and whenever the meeting is locked/masked (the fetch is skipped).
+   */
+  readonly receipts = signal<ClaimAlignment[]>([]);
+  /** Stale-result guard token — a late reply for a superseded meeting is dropped. */
+  private receiptsSeq = 0;
+
+  /**
+   * A pending receipt seek handed to the Audio tab's player (Brain v3 PR-5). The
+   * panel is (re)created for the Audio `@switch` case, so a viewChild method call
+   * from the Note tab would hit a not-yet-existing instance — instead we pass the
+   * target as an INPUT the panel applies on mount. `seq` (bumped per click) makes
+   * a repeat click on the same receipt re-fire the panel effect. Null when idle.
+   */
+  readonly seekTarget = signal<{
+    startS: number;
+    segId: number;
+    seq: number;
+  } | null>(null);
+
+  /**
+   * Fetch this meeting's note receipts whenever the loaded meeting (or note
+   * body) changes, and SKIP the (gated) fetch while it is locked/masked — a
+   * locked meeting must surface no receipts (WHEN/BY-WHOM leak), and the backend
+   * returns an empty list there anyway. Re-fetches when the note markdown changes
+   * (an edit/re-summarize) so the chips track the current note. Legitimate
+   * signal-writing effect (T1): async IPC keyed on inputs with a stale-result guard.
+   */
+  private readonly _loadReceipts = effect(() => {
+    const id = this.detail()?.meeting.id ?? null;
+    const locked = this.locked();
+    // Track the note body so an edit/re-summarize re-derives the receipts.
+    const noteMd = this.detail()?.note?.markdown ?? null;
+    const seq = ++this.receiptsSeq;
+    if (!id || locked || !noteMd) {
+      this.receipts.set([]);
+      return;
+    }
+    void this.fetchReceipts(id, seq);
+  });
+
+  private async fetchReceipts(id: string, seq: number): Promise<void> {
+    try {
+      const rows = await this.ipc.getNoteReceipts(id);
+      if (seq !== this.receiptsSeq) {
+        return; // superseded by a newer meeting / lock / note-edit
+      }
+      this.receipts.set(Array.isArray(rows) ? rows : []);
+    } catch {
+      if (seq === this.receiptsSeq) {
+        this.receipts.set([]);
+      }
+    }
+  }
+
+  /**
+   * A receipt chip was clicked in the note panel: switch to the Audio tab and
+   * hand the player the seek/flash target. Carries only audio coordinates — no
+   * note/transcript text, no on-disk path. The Audio tab's panel is created by
+   * the `@switch`, so the target is an input it applies on mount (see the panel's
+   * `_applyReceiptSeek`); `seq` (already bumped by the note panel) survives so a
+   * repeat click on the same chip re-fires.
+   */
+  onSeekReceipt(target: { startS: number; segId: number; seq: number }): void {
+    this.seekTarget.set(target);
+    this.activeTab.set("audio");
+  }
+
   // --- Phase 5 model-provenance badge -------------------------------------
   /**
    * Human-readable label for the model-provenance badge in the Analysis header.
@@ -515,6 +588,10 @@ export class DetailComponent implements OnInit {
     this.graph.set(null);
     this.editing.set(false);
     this.draft.set("");
+    // Receipts leak WHEN/BY-WHOM: blank them (and any pending seek) synchronously
+    // on the mask, matching the note/segments/audio the masked DTO already nulls.
+    this.receipts.set([]);
+    this.seekTarget.set(null);
     this.tabsService.setTitle(tabKeyFor("meeting", d.meeting.id), "🔒 Locked");
   }
 
@@ -706,6 +783,11 @@ export class DetailComponent implements OnInit {
     this.renaming.set(false);
     this.moveOpen.set(false);
     this.confirmingDelete.set(false);
+    // Receipts (PR-5): drop the previous meeting's chips + any pending seek so a
+    // same-route reload never carries a stale claim→audio mapping (the `_loadReceipts`
+    // effect refetches for the new meeting once `detail()` resolves below).
+    this.receipts.set([]);
+    this.seekTarget.set(null);
     // Land on the Note tab for every meeting (identity-first default).
     this.activeTab.set("note");
     // (Audio-playback state now lives in <app-audio-panel>, which owns the
