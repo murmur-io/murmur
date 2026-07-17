@@ -154,3 +154,54 @@ does not apply, but the append command must not blank prior content on failure.
 - Backfilling companion notes for pre-existing meetings' `manual_notes` (new behavior applies going
   forward).
 - Streaming `@brain` answers (separate Phase-9 work).
+
+---
+
+# v2 redesign — document-first + separate Ask Brain tab (2026-07-17)
+
+**Why:** live test of v1 failed the *product* bar (v1 was code-green + dual-verified, but wrong UX). The
+thread-of-badges read as chat with stickers, not note-writing; a "second note" was confusing because the
+one-growing-document was invisible; and users want an in-note brain (like create-note) plus a separate
+place to ask about the meeting. User decisions: **document-first**, **tabs** (Note | Ask Brain), **reuse the
+real create-note editor**.
+
+## New model
+The recording panel (`MeetingConversationComponent`) becomes a **two-tab surface**:
+
+- **Tab "Note" (default, primary):** the companion note rendered as ONE editable document — the real
+  create-note editing experience: `/` blocks, `[[` links, formatting toolbar on selection, and the
+  **in-note Ask Brain** (selection → Ask Brain → `NoteBrainPopover` rewrites/answers INTO the note),
+  autosave, auto `[[Meeting]]` link. Title/properties/share/backlinks chrome hidden. It is ONE growing
+  document — no per-jot "Saved" badges.
+- **Tab "Ask Brain":** the conversational thread — ask about the meeting & related things, answers with
+  sources + follow-ups (the existing `@brain` thread logic). An answer's "Add to note" appends into the
+  companion note.
+
+## Reuse (root-cause, "tak jak w create note")
+- **Embed `NoteEditorComponent` in an additive `embedded` mode.** New inputs `embedded = input(false)` and
+  `noteIdInput = input<string|null>(null)`; when embedded, load the note from `noteIdInput` instead of the
+  route, and wrap the header/title/properties/share/backlinks chrome in `@if (!embedded())`. Body +
+  selection-toolbar + brain-popover + link-picker + autosave stay. The routed `/notes/:id` usage must be
+  byte-for-byte unchanged (regression-gated).
+- **Retire `mur-markdown-composer`** (the v1 send-and-clear input was the wrong primitive for a document) —
+  remove the component + its wiring. The Ask Brain question input is a plain single-line input.
+
+## Backend
+- New command `get_or_create_companion_note(meeting_id) -> { noteId, meetingWikilink }` (eager create so the
+  Note tab has a document to mount on). Reuse v1's lazy get-or-create + gate + `[[Meeting]]` front-matter.
+- Keep `append_to_companion_note` (used by the Ask Brain "Add to note").
+- **Single source of truth for the user's in-meeting notes:** `summarize`/pipeline reads the companion note
+  body (front-matter stripped) as `user_notes` (the `pipeline.rs` `get_manual_notes` read site), falling back
+  to `manual_notes` when no companion note exists (legacy). This keeps "enhance"/`## My notes` fold working
+  without a mirror. (Optional: reroute the agent `save_note` tool to append to the companion note so an
+  autonomous save isn't lost — do it if low-risk, else note it.)
+
+## Persistence
+The Note tab autosaves the companion note through the normal note editor path (`save_note_text` /
+`update_note_doc`). No `manual_notes` mirror. "Add to note" (Ask Brain) → `append_to_companion_note`; the Note
+tab reloads its body on tab-activation so appended content shows.
+
+## Verify (unchanged discipline)
+Adversarial-verifier + lock-security-reviewer (pipeline + optional agent-tool touch the summary/lock path);
+**regression-gate the routed `/notes/:id` Notes editor** (embedded mode must not change it); `scripts/ci.sh`.
+Spec-review MUST confirm the built surface matches: tabs, document-first, in-note brain, separate Ask Brain.
