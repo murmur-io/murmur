@@ -172,13 +172,35 @@ block2 = "0.6"
 # PDF text + outline extraction via Apple's PDFKit (same objc2 0.6/0.3 family we already ship; zero
 # new binaries, no dylib to sign). Only the PDFDocument/PDFPage/PDFOutline/PDFDestination surface is
 # needed — `src/extract/pdf.rs`. All calls wrapped in `objc2::exception::catch`. macOS-only.
-objc2-pdf-kit = { version = "0.3", default-features = false, features = ["PDFDocument", "PDFPage", "PDFOutline", "PDFDestination"] }
+# `objc2-core-graphics` feature: `PDFPage::drawWithBox:toContext:` — render a scanned page into the
+# OCR bitmap context (Brain v3 OCR fallback in `src/extract/ocr.rs`).
+objc2-pdf-kit = { version = "0.3", default-features = false, features = ["PDFDocument", "PDFPage", "PDFOutline", "PDFDestination", "objc2-core-graphics"] }
+# On-device OCR via Apple's Vision framework (Brain v3 — scanned-PDF + direct image import).
+# Same objc2 0.3 family we already ship (Zlib/Apache/MIT); NO new binary, no dylib to sign.
+# Only the text-recognition surface is compiled: VNRecognizeTextRequest (recognitionLevel/languages/
+# usesLanguageCorrection), VNImageRequestHandler (initWithCGImage:options: / initWithData:options:),
+# VNRecognizedTextObservation (topCandidates → VNRecognizedText.string). The `objc2-core-graphics`
+# feature enables the CGImage handler init (we render a PDFPage into a CGBitmapContext for OCR).
+# EVERY Vision/CoreGraphics/PDFKit call is wrapped in `objc2::exception::catch` (rules §7 crash-safe
+# FFI — the screenshare.rs war story): a stray ObjC NSException is CAUGHT and mapped to a fail-closed
+# `AppError::InvalidArg`, never an FFI abort. macOS-only — `src/extract/ocr.rs` + `src/extract/image.rs`.
+objc2-vision = { version = "0.3", default-features = false, features = ["VNRequest", "VNRequestHandler", "VNRecognizeTextRequest", "VNObservation", "objc2-core-graphics"] }
 # `NSProcessInfo` feature: the typed `thermalState` binding for the live-loop thermal governor
-# (`src/thermal.rs`) — a feature flip on an existing dep, no new crate.
-objc2-foundation = { version = "0.3", features = ["NSString", "NSError", "NSProcessInfo", "NSURL"] }
-objc2-app-kit = { version = "0.3", features = ["NSScreen"] }
-objc2-core-graphics = { version = "0.3", default-features = false, features = ["CGWindow"] }
-objc2-core-foundation = { version = "0.3", default-features = false, features = ["CFArray", "CFDictionary", "CFString"] }
+# (`src/thermal.rs`) — a feature flip on an existing dep, no new crate. `NSData`/`NSDictionary`/`NSArray`
+# feed the Vision OCR path (image bytes → NSData handler; empty options dict; the requests array).
+objc2-foundation = { version = "0.3", features = ["NSString", "NSError", "NSProcessInfo", "NSURL", "NSData", "NSDictionary", "NSArray"] }
+# `NSScreen`: the screen-share probe. `NSImage` + `NSImageRep` + `NSGraphicsContext` + the
+# `objc2-core-graphics` feature: decode a standalone image FILE → CGImage
+# (`NSImage::initWithContentsOfFile` → `CGImageForProposedRect:context:hints:`) so direct-image OCR
+# runs the SAME proven `ocr_cgimage` path the scanned-PDF page uses — Vision's `initWithData` handler
+# returns zero results on a valid PNG on this Mac, the CGImage handler does not. See `src/extract/ocr.rs`.
+objc2-app-kit = { version = "0.3", features = ["NSScreen", "NSImage", "NSImageRep", "NSGraphicsContext", "objc2-core-graphics"] }
+# `CGContext`/`CGImage`/`CGColorSpace`/`CGBitmapContext`: render a PDFPage into an RGBX bitmap → CGImage
+# for OCR (the scanned-PDF fallback). `CGWindow` is the screen-share window-list probe (screenshare.rs).
+objc2-core-graphics = { version = "0.3", default-features = false, features = ["CGWindow", "CGContext", "CGImage", "CGColorSpace", "CGBitmapContext"] }
+# `CFCGTypes` provides CGRect/CGPoint/CGSize (the PDFPage media box + the OCR bitmap rect) for the
+# scanned-PDF renderer in `src/extract/ocr.rs`. CFArray/CFDictionary/CFString are the screen-share probe.
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["CFArray", "CFDictionary", "CFString", "CFCGTypes"] }
 # v0.3.2 — BIOMETRIC-GATED master KEK. The KEK is stored as a generic-password Keychain item with a
 # kSecAttrAccessControl requiring user presence (Touch ID, device-passcode fallback). Reading it pops
 # the system Touch ID sheet directly (with our reason string) — that single sheet IS the unlock auth,
