@@ -1245,6 +1245,22 @@ pub struct WikiTarget {
     pub id: String,
 }
 
+/// note↔meeting-links PR-2 — one EXPLICIT source the user pinned in the Ask source picker: a
+/// `meeting|note|document` reference that SCOPES a Brain answer to exactly the listed items (plus
+/// their capped link-expansion) instead of a whole-vault search. Serialized camelCase `{kind, id}`
+/// so the FE can build it straight from a `LinkEdge`/`LinkKind`.
+///
+/// NO `deny_unknown_fields`: the FE picker sends an extra `title` field (for chip display) that the
+/// backend must harmlessly IGNORE. Every read of a pinned source stays visibility-gated in
+/// `build_vault_context_pinned_visible` — a sealed-and-not-session-unlocked source contributes
+/// nothing (E9), so pinning a locked item can never leak it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceRef {
+    pub kind: crate::links::LinkKind,
+    pub id: String,
+}
+
 /// Result of an Ask-My-Vault query: the grounded answer + the source meetings used.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
