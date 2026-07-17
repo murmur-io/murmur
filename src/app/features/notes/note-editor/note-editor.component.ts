@@ -37,6 +37,7 @@ import { FoldersService } from "../../../services/folders.service";
 import { NotesService } from "../../../services/notes.service";
 import { ToastService } from "../../../services/toast.service";
 import { BacklinksComponent } from "../../../shared/backlinks/backlinks.component";
+import { ConnectionsComponent } from "../../../shared/connections/connections.component";
 import { MarkdownComponent } from "../../../shared/markdown/markdown.component";
 import { LinkPickerComponent } from "../link-picker/link-picker.component";
 import { NOTE_ASSIST_CATALOG } from "../note-brain-popover/note-assist-catalog";
@@ -155,6 +156,7 @@ const FULL_WIDTH_KEY = "murmur-note-full-width";
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [
     BacklinksComponent,
+    ConnectionsComponent,
     LinkPickerComponent,
     MarkdownComponent,
     NoteBrainPopoverComponent,

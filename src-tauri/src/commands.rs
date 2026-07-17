@@ -1805,6 +1805,13 @@ pub(crate) fn update_note_inner_with(
     // sealed-folder gate inside; never fails the save (the plaintext is already durable).
     reindex_meeting_after_edit(state, meeting_id, embedder);
 
+    // Brain v3 PR-3 — LINK ENGINE: re-index this meeting note's `[[Title]]` wikilink edges (resolved
+    // target ids) + refresh its semantic suggestions from the re-derived vectors (model-gated). Both
+    // best-effort — a link failure never fails the note save. The wikilink pass runs regardless of
+    // the embedder (deterministic); the semantic pass self-gates on `embed_model_present`.
+    index_wikilinks_best_effort(state, crate::links::LinkKind::Meeting, meeting_id, markdown);
+    auto_link_semantic_best_effort(state, crate::links::LinkKind::Meeting, meeting_id);
+
     Ok(NoteDto {
         meeting_id: meeting_id.to_string(),
         provider_id: existing.provider_id,
@@ -2453,6 +2460,11 @@ pub(crate) fn get_or_create_companion_note_inner(
         None => {
             let id = create_note_inner(state, None, &meeting_name)?;
             state.db.set_document_meeting_id(&id, meeting_id)?;
+            // Brain v3 PR-3 — record the structured `companion` edge (note → meeting) alongside the
+            // `documents.meeting_id` column, so the link graph carries it beyond the migrate backfill.
+            if let Err(e) = state.db.set_companion_link(&id, meeting_id) {
+                tracing::warn!(target: "links", error = %e, "companion link edge failed (note linked)");
+            }
             // Stamp the front-matter `meeting: "[[…]]"` link on the fresh (empty) note so the
             // document-first editor mounts on a note that already carries the link (no body added).
             if let Some(row) = state.db.get_note_row(&id)? {
@@ -3232,6 +3244,10 @@ pub(crate) fn create_note_inner(
         state.db.insert_note(&id, &folder_id, &name, title, "", now)?;
     }
     // No chunks to index for an empty body — `update_note` re-indexes once the user writes.
+    // Brain v3 PR-3 — LINK ENGINE: index the (empty) body's wikilinks so a create with no body
+    // establishes a clean empty edge set; the first `update_note_doc` re-indexes real `[[Title]]`s.
+    // No semantic pass on birth (no vectors yet). Best-effort.
+    index_wikilinks_best_effort(state, crate::links::LinkKind::Note, &id, "");
     tracing::info!(target: "notes", note_id = %id, folder_id = %folder_id, "note created");
     Ok(id)
 }
@@ -3480,6 +3496,12 @@ pub(crate) fn update_note_doc_inner(
     if let Err(e) = index_note_body_chunks(state, id, title, markdown, embedder.as_deref()) {
         tracing::warn!(target: "rag", error = %e, "note re-index on update failed (text saved)");
     }
+
+    // Brain v3 PR-3 — LINK ENGINE: (a) re-index this note's `[[Title]]` wikilink edges by resolved
+    // TARGET id (rename-proof), and (b) refresh its semantic suggestions from the fresh vectors
+    // (model-gated). Both best-effort — a link failure never fails the note save.
+    index_wikilinks_best_effort(state, crate::links::LinkKind::Note, id, markdown);
+    auto_link_semantic_best_effort(state, crate::links::LinkKind::Note, id);
 
     // Re-export the vault `.md` (best-effort). A sealed folder has no export (gated above), so this
     // only runs for a visible note.
@@ -6264,6 +6286,13 @@ pub async fn build_and_persist_entities(
         }
     }
 
+    // Brain v3 PR-3 — LINK ENGINE (post-pipeline): index the finalized meeting note's `[[Title]]`
+    // wikilink edges (resolved target ids) and suggest content-similar neighbours from the meeting's
+    // chunks/vectors (indexed earlier in the pipeline; model-gated inside). Both best-effort — a link
+    // failure never fails the graph/note (both already succeeded).
+    index_wikilinks_best_effort(state, crate::links::LinkKind::Meeting, meeting_id, markdown);
+    auto_link_semantic_best_effort(state, crate::links::LinkKind::Meeting, meeting_id);
+
     Ok(payload)
 }
 
@@ -7687,6 +7716,278 @@ pub fn get_backlinks(
     };
     let unlocked = unlocked_snapshot(state.inner())?;
     state.db.backlinks_for_visible(kind, &target_id, &unlocked)
+}
+
+/// Parse an IPC link-endpoint kind string into [`crate::links::LinkKind`], or a clean `InvalidArg`.
+fn parse_link_kind(s: &str) -> Result<crate::links::LinkKind, AppError> {
+    crate::links::LinkKind::parse(s).ok_or_else(|| {
+        AppError::InvalidArg(format!(
+            "unknown link kind {s:?} (expected \"meeting\", \"note\", or \"document\")"
+        ))
+    })
+}
+
+/// Brain v3 PR-3 — every persisted link edge incident on `(kind, id)`, BOTH endpoints
+/// visibility-gated in [`crate::storage::db::Db::links_for_visible`] (the queried item must be
+/// visible or the list is empty — no existence leak — and each edge's neighbour is dropped unless it
+/// too is visible). Snapshots the LIVE session unlock set. `kind` is `"meeting" | "note" |
+/// "document"`. Dismissed edges are never returned; suggested (semantic) edges are, so the FE can
+/// render Accept/Dismiss.
+#[tauri::command]
+pub fn list_links(
+    state: State<'_, AppState>,
+    kind: String,
+    id: String,
+) -> Result<Vec<crate::storage::models::LinkEdge>, AppError> {
+    let link_kind = parse_link_kind(&kind)?;
+    let unlocked = unlocked_snapshot(state.inner())?;
+    state.db.links_for_visible(link_kind, &id, &unlocked)
+}
+
+/// Brain v3 PR-3 — ACCEPT a suggested (semantic) link: flip it `status='active'`,
+/// `created_by='accepted'`, AND materialize the neighbour's `[[Title]]` into the SOURCE's markdown
+/// via the managed `apply_link_markers` block (the ONLY path that writes a semantic link into a
+/// `.md` — the auto pass never does). GATED: the SOURCE endpoint must be session-visible (else refuse
+/// — never write plaintext behind a lock, and never reveal a locked neighbour). Idempotent.
+#[tauri::command]
+pub fn accept_link(state: State<'_, AppState>, id: i64) -> Result<(), AppError> {
+    accept_link_inner(state.inner(), id)
+}
+
+pub(crate) fn accept_link_inner(state: &AppState, id: i64) -> Result<(), AppError> {
+    let _lifecycle = lifecycle_guard(state);
+    let Some((src_kind, src_id, dst_kind, dst_id, _et, _status)) = state.db.link_by_id(id)? else {
+        return Err(AppError::InvalidArg(format!("no link {id}")));
+    };
+    let unlocked = unlocked_snapshot(state)?;
+    // Flip the row first: the graph edge is active even if the .md materialize below is skipped
+    // (e.g. neither endpoint is a locally-owned editable note). The panel reflects the accept.
+    state.db.accept_link(id)?;
+    // A semantic edge is undirected — materialize the neighbour's [[Title]] into whichever endpoint
+    // is a LOCAL, session-VISIBLE note we own the markdown of. Try src's note first, then dst's.
+    // Best-effort: a materialize skip/failure never rolls back the accept.
+    let endpoints = [
+        (src_kind.as_str(), src_id.as_str(), dst_kind.as_str(), dst_id.as_str()),
+        (dst_kind.as_str(), dst_id.as_str(), src_kind.as_str(), src_id.as_str()),
+    ];
+    for (owner_k, owner_id, other_k, other_id) in endpoints {
+        let (Some(owner_kind), Some(other_kind)) = (
+            crate::links::LinkKind::parse(owner_k),
+            crate::links::LinkKind::parse(other_k),
+        ) else {
+            continue;
+        };
+        // Resolve the neighbour's current gated title; skip if the neighbour is sealed (no leak).
+        let Some(title) =
+            state.db.link_endpoint_title_visible(other_kind, other_id, &unlocked)?
+        else {
+            continue;
+        };
+        if materialize_accepted_link(state, owner_kind, owner_id, &title)? {
+            break; // wrote (or found already-present) in one owned, visible source — done.
+        }
+    }
+    tracing::info!(target: "links", link_id = id, "accept_link");
+    Ok(())
+}
+
+/// Materialize the accepted neighbour's `[[Title]]` into the OWNER `(kind, id)`'s markdown via the
+/// managed `apply_link_markers` block — but ONLY when the owner is a LOCAL, session-VISIBLE note we
+/// own the markdown of (a meeting AI note, or an authored note). Returns `true` when the owner IS
+/// such a note (whether it wrote or the link was already present), `false` when the owner is not a
+/// writable/visible target (the caller then tries the other endpoint). Merges with the related-notes
+/// hits already rendered in the block so the auto block is preserved.
+fn materialize_accepted_link(
+    state: &AppState,
+    kind: crate::links::LinkKind,
+    id: &str,
+    title: &str,
+) -> Result<bool, AppError> {
+    let hit = crate::enrich::ContextHit {
+        source: match kind {
+            crate::links::LinkKind::Meeting => "meeting",
+            _ => "note",
+        }
+        .to_string(),
+        detail: format!("[[{title}]]"),
+        url: None,
+    };
+    match kind {
+        crate::links::LinkKind::Meeting => {
+            // GATE: the meeting's note must be session-visible to write plaintext.
+            if !meeting_is_unlocked(state, id)? {
+                return Ok(false);
+            }
+            let Some(existing) = state.db.get_latest_note_for_meeting(id)? else {
+                return Ok(false);
+            };
+            // Skip a sealed (blob-present) note (the seal-safety gate `link_related_notes_inner` uses).
+            let sealed = state
+                .db
+                .sealable_notes_for_meeting(id)?
+                .iter()
+                .any(|n| n.content_blob.is_some());
+            if sealed {
+                return Ok(false);
+            }
+            let merged = merge_related_hit(&existing.markdown, hit);
+            if merged != existing.markdown {
+                update_note_inner(state, id, &merged)?;
+            }
+            Ok(true)
+        }
+        crate::links::LinkKind::Note | crate::links::LinkKind::Document => {
+            let Some(row) = state.db.get_note_row(id)? else {
+                return Ok(false); // a raw document has no editable note markdown here.
+            };
+            if !folder_is_unlocked(state, &row.folder_id)? {
+                return Ok(false);
+            }
+            let title_disp = row
+                .title
+                .clone()
+                .filter(|t| !t.is_empty())
+                .unwrap_or_else(|| row.name.clone());
+            let merged = merge_related_hit(&row.text, hit);
+            if merged != row.text {
+                update_note_doc_inner(state, id, &title_disp, &merged)?;
+            }
+            Ok(true)
+        }
+    }
+}
+
+/// Append ONE `[[Title]]` [`ContextHit`] to a note's managed `murmur:links` block WITHOUT dropping
+/// any related-notes hits already rendered there. `apply_link_markers` is a full-block REPLACE, so we
+/// re-collect the existing rendered hits ([`crate::enrich::extract_link_hits`]), add the new one
+/// (deduped by rendered detail), and re-apply — the block stays idempotent and the auto related-notes
+/// entries survive an accept.
+fn merge_related_hit(markdown: &str, new_hit: crate::enrich::ContextHit) -> String {
+    let mut hits = crate::enrich::extract_link_hits(markdown);
+    if !hits.iter().any(|h| h.detail == new_hit.detail) {
+        hits.push(new_hit);
+    }
+    crate::enrich::apply_link_markers(markdown, &hits)
+}
+
+/// Brain v3 PR-3 — DISMISS a suggested link: TOMBSTONE it so no later auto pass re-suggests it. No
+/// markdown is touched (dismiss is graph-only). Idempotent.
+#[tauri::command]
+pub fn dismiss_link(state: State<'_, AppState>, id: i64) -> Result<(), AppError> {
+    state.db.dismiss_link(id)?;
+    tracing::info!(target: "links", link_id = id, "dismiss_link");
+    Ok(())
+}
+
+/// Brain v3 PR-3 — WRITE-TIME wikilink indexing hook, called from every note-save funnel AFTER the
+/// text is durable. Resolves `[[Title]]` → TARGET IDS and (delete-then-insert) stores this source's
+/// `wikilink` edges. BEST-EFFORT: a failure logs (ids/counts only, no PII) and never fails the save
+/// — the plaintext is already the canonical copy. `src_kind` is `Meeting` for an AI note funnel,
+/// `Note` for an authored-note funnel.
+fn index_wikilinks_best_effort(
+    state: &AppState,
+    src_kind: crate::links::LinkKind,
+    src_id: &str,
+    body: &str,
+) {
+    let unlocked = match unlocked_snapshot(state) {
+        Ok(u) => u,
+        Err(e) => {
+            tracing::warn!(target: "links", error = %e, "wikilink index skipped (unlock snapshot)");
+            return;
+        }
+    };
+    if let Err(e) = state
+        .db
+        .index_wikilinks_for_source(src_kind, src_id, body, &unlocked)
+    {
+        tracing::warn!(target: "links", error = %e, "wikilink index failed (text saved)");
+    }
+}
+
+/// Brain v3 PR-3 — SEMANTIC AUTO-LINK hook, called AFTER a successful REAL-embedder index of an item
+/// (never on the stub — model-gated at the CALL SITE, mirroring the chunk-index gate). Suggests up to
+/// `SEMANTIC_LINK_CAP` content-similar neighbours (mutual-kNN / floor / cap; see `auto_link_semantic`).
+/// BEST-EFFORT: a failure logs (counts only) and never fails the caller. O(k·log n) — no corpus scan.
+fn auto_link_semantic_best_effort(state: &AppState, kind: crate::links::LinkKind, id: &str) {
+    // GUARD: only run with the real embedder present — a stub vector carries no meaning, so a
+    // stub-space "neighbour" would be noise. (The chunk index itself already refuses stub vectors.)
+    if !crate::embed::embed_model_present() {
+        return;
+    }
+    let unlocked = match unlocked_snapshot(state) {
+        Ok(u) => u,
+        Err(e) => {
+            tracing::warn!(target: "links", error = %e, "semantic auto-link skipped (unlock snapshot)");
+            return;
+        }
+    };
+    if let Err(e) = state.db.auto_link_semantic(kind, id, &unlocked) {
+        tracing::warn!(target: "links", error = %e, "semantic auto-link failed (index intact)");
+    }
+}
+
+/// Brain v3 PR-3 — RE-DERIVE the link engine for every meeting + note in a JUST-UNSEALED folder
+/// (their `links` rows were purged on seal). Re-runs the WIKILINK pass (resolved target ids, from the
+/// restored body) + the SEMANTIC pass (model-gated inside) per item, against the supplied unlock set.
+/// Called from the unlock restore closure; each item's index is BEST-EFFORT so one bad row never
+/// aborts the whole unlock. Logs ids/counts only.
+fn rederive_links_for_folder(
+    state: &AppState,
+    folder_id: &str,
+    unlocked: &std::collections::HashSet<String>,
+) {
+    // Meetings in the folder → re-index each latest note's wikilinks + semantic neighbours.
+    match state.db.meeting_ids_in_folder(folder_id) {
+        Ok(mids) => {
+            for mid in mids {
+                if let Ok(Some(note)) = state.db.get_latest_note_for_meeting(&mid) {
+                    if let Err(e) = state.db.index_wikilinks_for_source(
+                        crate::links::LinkKind::Meeting,
+                        &mid,
+                        &note.markdown,
+                        unlocked,
+                    ) {
+                        tracing::warn!(target: "links", error = %e, "unlock wikilink re-derive (meeting) failed");
+                    }
+                }
+                if crate::embed::embed_model_present() {
+                    if let Err(e) =
+                        state.db.auto_link_semantic(crate::links::LinkKind::Meeting, &mid, unlocked)
+                    {
+                        tracing::warn!(target: "links", error = %e, "unlock semantic re-derive (meeting) failed");
+                    }
+                }
+            }
+        }
+        Err(e) => tracing::warn!(target: "links", error = %e, "unlock link re-derive: meeting-id list failed"),
+    }
+    // Documents/notes in the folder → re-index authored notes' wikilinks + semantic neighbours (a raw
+    // document has no wikilinks but still gets a semantic pass over its chunks).
+    match state.db.document_ids_in_folder(folder_id) {
+        Ok(dids) => {
+            for did in dids {
+                if let Ok(Some(row)) = state.db.get_note_row(&did) {
+                    if let Err(e) = state.db.index_wikilinks_for_source(
+                        crate::links::LinkKind::Note,
+                        &did,
+                        &row.text,
+                        unlocked,
+                    ) {
+                        tracing::warn!(target: "links", error = %e, "unlock wikilink re-derive (note) failed");
+                    }
+                }
+                if crate::embed::embed_model_present() {
+                    if let Err(e) =
+                        state.db.auto_link_semantic(crate::links::LinkKind::Note, &did, unlocked)
+                    {
+                        tracing::warn!(target: "links", error = %e, "unlock semantic re-derive (doc) failed");
+                    }
+                }
+            }
+        }
+        Err(e) => tracing::warn!(target: "links", error = %e, "unlock link re-derive: document-id list failed"),
+    }
 }
 
 /// Resolve a clicked `[[Title]]` wikilink to a VISIBLE note/meeting/org-item to navigate to.
@@ -13619,6 +13920,11 @@ pub async fn unlock_folder(
                 .map_err(|_| AppError::Storage("unlocked-folders mutex poisoned".into()))?
                 .clone()
         };
+        // Brain v3 PR-3 — RE-DERIVE the LINK ENGINE for the just-unsealed items: their `links` rows
+        // were purged on seal, so re-run the wikilink pass (deterministic) + the semantic pass
+        // (model-gated inside) for every meeting + note in this folder, using the now-updated unlock
+        // set. Best-effort — a re-derive failure never fails the unlock (the content is restored).
+        rederive_links_for_folder(&state, &folder_id, &unlocked);
         let counts = state.db.count_notes_per_folder(&unlocked)?;
         let kind = state
             .db
@@ -13984,6 +14290,25 @@ pub(crate) fn remove_lock_inner(state: &AppState, folder_id: String) -> Result<(
             .map_err(|_| AppError::Storage("unlocked-folders mutex poisoned".into()))?;
         g.remove(&folder_id);
     }
+
+    // NIT-8 (link lifecycle): the folder's `links` rows were purged on the ORIGINAL seal
+    // (`purge_links_tx`). The SESSION unlock (`unlock_folder`) re-derives them; the PERMANENT unseal
+    // must too, or a permanently-unlocked folder stays link-empty until the next note edit. Mirror
+    // `unlock_folder`: re-run the wikilink pass (deterministic) + the semantic pass (model-gated
+    // inside) for every meeting + note now that the folder is fully OPEN. The folder is `locked=0`
+    // above, so it is visible under ANY unlock set; add its id to the live snapshot to match the
+    // session path exactly. Best-effort — a re-derive failure never fails the permanent unlock (the
+    // content is already restored).
+    let live_set = {
+        let mut s = state
+            .unlocked_folders
+            .lock()
+            .map_err(|_| AppError::Storage("unlocked-folders mutex poisoned".into()))?
+            .clone();
+        s.insert(folder_id.clone());
+        s
+    };
+    rederive_links_for_folder(state, &folder_id, &live_set);
     Ok(())
 }
 
@@ -21615,6 +21940,61 @@ mod lifecycle_tests {
         assert!(
             rn.blob.is_none(),
             "manual_notes_blob cleared on remove-lock"
+        );
+    }
+
+    /// NIT-8 (RED-before-GREEN — link lifecycle): PERMANENTLY removing a folder's lock must
+    /// re-derive the folder's `links` (purged on the original seal), mirroring the session unlock —
+    /// otherwise a permanently-unlocked folder has no links until the next note edit. RED on the
+    /// pre-fix `remove_lock_inner` (restored plaintext + re-indexed chunks/vectors but never called
+    /// `rederive_links_for_folder`), so the wikilink edge stayed empty after remove-lock.
+    #[test]
+    fn remove_lock_rederives_wikilinks() {
+        let state = build_state("remove-lock-rederive-links");
+        // Open target the wikilink points at (a standalone note in an OPEN folder).
+        make_open_folder(&state.db, "f-open", "Open");
+        state
+            .db
+            .insert_note("other", "f-open", "Other Note", "Other Note", "body", 1_700_000_000_000)
+            .unwrap();
+        // Locked folder holds a meeting whose note links to the open target.
+        make_open_folder(&state.db, "f-lock", "Secret");
+        seed_meeting(&state.db, "m1", "see [[Other Note]] for context", Some("f-lock"));
+
+        // Index the wikilink while open (as a real save would), then verify it exists.
+        let nothing = std::collections::HashSet::new();
+        state
+            .db
+            .index_wikilinks_for_source(
+                crate::links::LinkKind::Meeting,
+                "m1",
+                "see [[Other Note]] for context",
+                &nothing,
+            )
+            .unwrap();
+        // Count m1's OUTBOUND wikilink edges through the PUBLIC gated reader (open folder → visible).
+        let wikilink_edges = |db: &crate::storage::Db, unlocked: &HashSet<String>| -> usize {
+            db.links_for_visible(crate::links::LinkKind::Meeting, "m1", unlocked)
+                .unwrap()
+                .into_iter()
+                .filter(|e| e.edge_type == "wikilink")
+                .count()
+        };
+        assert_eq!(wikilink_edges(&state.db, &nothing), 1, "wikilink edge exists before seal");
+
+        // LOCK → the seal's purge_links_tx drops the edge at rest (and the sealed source is masked).
+        lock_folder_inner(&state, "f-lock".to_string()).unwrap();
+        assert_eq!(wikilink_edges(&state.db, &nothing), 0, "wikilink edge purged by the seal");
+
+        // Cache the KEK, then PERMANENTLY remove the lock.
+        let kek = secrets::get_or_create_master_kek().unwrap();
+        *state.master_kek.lock().unwrap() = Some(Zeroizing::new(kek));
+        remove_lock_inner(&state, "f-lock".to_string()).unwrap();
+
+        assert_eq!(
+            wikilink_edges(&state.db, &nothing),
+            1,
+            "wikilink edge is RE-DERIVED after remove-lock (the folder is fully open again)"
         );
     }
 
