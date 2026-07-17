@@ -70,6 +70,116 @@ pub struct GraphData {
     pub total_visible_entities: i64,
 }
 
+// ── Brain v3 PR-4 — the FULL-BRAIN graph (typed, multi-kind) ─────────────────────────────────
+//
+// `get_graph` (above) is the ENTITY-ONLY graph and stays byte-compatible for its FE consumers.
+// The full-brain graph is a SEPARATE, additive payload that unifies entities + meetings + notes +
+// documents as TYPED nodes and every relation (co-occurrence + entity→meeting mentions + `links`
+// rows) as TYPED edges. It is a PURE READ — no writes, no new storage. Every node is emitted only
+// via its existing *_visible gate, and every edge requires BOTH endpoints to be in the visible-node
+// set (an edge to a sealed node is dropped). A sealed-and-not-session-unlocked meeting/note/document
+// contributes NOTHING — no node, and no edge that touches it.
+
+/// The kind of a full-brain graph NODE. `entity` = a person/project from the self-assembling graph;
+/// `meeting`/`note`/`document` = an owned-content item. Serialized lowercase for the FE lens toggles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FullGraphNodeKind {
+    Entity,
+    Meeting,
+    Note,
+    Document,
+}
+
+impl FullGraphNodeKind {
+    /// Stable lowercase discriminant (used in the visible-node-set key + deterministic ordering).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FullGraphNodeKind::Entity => "entity",
+            FullGraphNodeKind::Meeting => "meeting",
+            FullGraphNodeKind::Note => "note",
+            FullGraphNodeKind::Document => "document",
+        }
+    }
+}
+
+/// One TYPED node in the full-brain graph. `label` is the display title (already resolved through
+/// the visibility gate — a sealed item never produces a node, so a label is never a leak). `date` is
+/// an ISO-8601 / epoch-derived timestamp string when the source row carries one (`None` for
+/// entities). `degree` is the node's edge count WITHIN the returned (gated + capped) graph — a
+/// layout hint, never the true corpus degree.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FullGraphNode {
+    pub id: String,
+    pub kind: FullGraphNodeKind,
+    pub label: String,
+    pub date: Option<String>,
+    pub degree: i64,
+}
+
+/// The relation a full-brain edge encodes. `co_occurrence` = entity↔entity (shared visible meeting);
+/// `mention` = entity→meeting (`entity_mentions`); `wikilink`/`companion`/`semantic` = a `links` row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FullGraphEdgeKind {
+    CoOccurrence,
+    Mention,
+    Wikilink,
+    Companion,
+    Semantic,
+}
+
+impl FullGraphEdgeKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FullGraphEdgeKind::CoOccurrence => "co_occurrence",
+            FullGraphEdgeKind::Mention => "mention",
+            FullGraphEdgeKind::Wikilink => "wikilink",
+            FullGraphEdgeKind::Companion => "companion",
+            FullGraphEdgeKind::Semantic => "semantic",
+        }
+    }
+}
+
+/// One TYPED edge in the full-brain graph. `src`/`dst` are node ids that MUST both be present in
+/// the returned `nodes` (BOTH-endpoint-gated — an edge to a sealed node is never emitted). `status`
+/// is `active` for deterministic edges (co-occurrence/mention/wikilink/companion + accepted
+/// semantic) and `suggested` for un-accepted semantic edges (only present when the opts flag is on).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FullGraphEdge {
+    pub src: String,
+    pub dst: String,
+    pub kind: FullGraphEdgeKind,
+    pub score: f64,
+    pub status: String,
+}
+
+/// Options for `get_full_graph` / `build_full_graph`. Additive + all-default so the FE can call it
+/// with no args. `include_suggested` (default `false`) admits un-accepted (`status='suggested'`)
+/// semantic `links` rows — OFF by default so the graph shows only confirmed relations.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FullGraphOpts {
+    #[serde(default)]
+    pub include_suggested: bool,
+}
+
+/// The full-brain graph payload (`get_full_graph`): TYPED nodes + TYPED edges + the same honest
+/// disclosure the entity graph makes. `has_hidden` is true when ≥1 folder is sealed-and-not-unlocked
+/// (some nodes/edges may be hidden). `total_visible_nodes` is the TRUE count of visible nodes BEFORE
+/// the per-kind render caps trimmed `nodes` — `total_visible_nodes > nodes.len()` means a cap
+/// dropped rows (distinct from `has_hidden`, which only reflects LOCKED folders).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FullGraphData {
+    pub nodes: Vec<FullGraphNode>,
+    pub edges: Vec<FullGraphEdge>,
+    pub has_hidden: bool,
+    pub total_visible_nodes: i64,
+}
+
 /// A co-occurring neighbor of a selected entity (the neighborhood satellites), with the
 /// number of VISIBLE meetings the two share.
 #[derive(Debug, Clone, Serialize, Deserialize)]

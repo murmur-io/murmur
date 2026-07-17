@@ -1,0 +1,143 @@
+<section class="fbg">
+  @if (loading()) {
+    <div class="card state-card">
+      <p class="empty">Loading your brain…</p>
+    </div>
+  } @else if (error()) {
+    <div class="card empty-state">
+      <span class="empty-mark" aria-hidden="true"></span>
+      <p class="empty-title">Couldn’t load the graph</p>
+      <p class="empty">{{ error() }}</p>
+    </div>
+  } @else if (totalNodes() === 0) {
+    <div class="card empty-state">
+      <span class="empty-mark" aria-hidden="true"></span>
+      <p class="empty-title">Your brain graph builds itself</p>
+      <p class="empty">
+        As you record meetings and add notes and documents, they’ll appear here
+        — connected by the people, wikilinks and companions they share.
+      </p>
+    </div>
+  } @else {
+    <!-- Honest disclosures (mirror the entity graph). -->
+    @if (hasHidden()) {
+      <div class="banner is-accent fbg-banner" role="status">
+        <span class="fbg-banner-glyph" aria-hidden="true"></span>
+        <span>Some items are hidden — unlock a folder to include them.</span>
+      </div>
+    }
+    @if (capDisclosure(); as msg) {
+      <div class="banner is-accent fbg-banner" role="status">
+        <span class="fbg-banner-glyph" aria-hidden="true"></span>
+        <span>{{ msg }}</span>
+      </div>
+    }
+
+    <!-- LENSES — node-type + edge-type toggle chips (filter what's drawn). -->
+    <div class="fbg-lenses">
+      <div class="fbg-lens-group" role="group" aria-label="Show node types">
+        <span class="fbg-lens-label">Nodes</span>
+        @for (l of nodeLenses; track l.kind) {
+          <button
+            type="button"
+            class="fbg-chip"
+            [class.is-off]="!nodeLens()[l.kind]"
+            [attr.aria-pressed]="nodeLens()[l.kind]"
+            (click)="toggleNode(l.kind)"
+          >
+            <span
+              class="fbg-chip-dot"
+              [style.background]="'var(' + l.token + ')'"
+              aria-hidden="true"
+            ></span>
+            {{ l.label }}
+          </button>
+        }
+      </div>
+
+      <div class="fbg-lens-group" role="group" aria-label="Show edge types">
+        <span class="fbg-lens-label">Links</span>
+        @for (l of edgeLenses; track l.kind) {
+          <button
+            type="button"
+            class="fbg-chip"
+            [class.is-off]="!edgeLens()[l.kind]"
+            [attr.aria-pressed]="edgeLens()[l.kind]"
+            (click)="toggleEdge(l.kind)"
+          >
+            <span
+              class="fbg-chip-dot"
+              [style.background]="'var(' + l.token + ')'"
+              aria-hidden="true"
+            ></span>
+            {{ l.label }}
+          </button>
+        }
+        <button
+          type="button"
+          class="fbg-chip is-suggested"
+          [class.is-off]="!showSuggested()"
+          [attr.aria-pressed]="showSuggested()"
+          (click)="toggleSuggested()"
+        >
+          <span class="fbg-chip-dash" aria-hidden="true"></span>
+          Suggested
+        </button>
+      </div>
+    </div>
+
+    <div class="fbg-frame">
+      <canvas
+        appFullBrainScene
+        class="fbg-canvas"
+        role="img"
+        [attr.aria-label]="ariaLabel()"
+        [sceneNodes]="sceneNodes()"
+        [sceneEdges]="sceneEdges()"
+        [selectedId]="selectedId()"
+        (nodePick)="onPick($event)"
+        (nodeHover)="hoverId.set($event)"
+      ></canvas>
+
+      <div class="fbg-toolbar" role="toolbar" aria-label="Graph controls">
+        <div class="fbg-pill fbg-count" aria-hidden="true">
+          {{ drawnNodeCount() }} items · {{ drawnEdgeCount() }} links
+        </div>
+        <div class="fbg-pill fbg-zoom">
+          <button
+            type="button"
+            class="fbg-zbtn"
+            aria-label="Zoom in"
+            (click)="zoomIn()"
+          >
+            +
+          </button>
+          <button
+            type="button"
+            class="fbg-zbtn"
+            aria-label="Zoom out"
+            (click)="zoomOut()"
+          >
+            −
+          </button>
+          <button
+            type="button"
+            class="fbg-zbtn fbg-zreset"
+            aria-label="Reset view"
+            (click)="resetView()"
+          >
+            Reset
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <p class="fbg-hint" aria-live="polite">
+      @if (hoverLabel(); as label) {
+        {{ label }}
+      } @else {
+        Drag to pan · scroll to zoom · click a node to open it.
+      }
+    </p>
+  }
+</section>
