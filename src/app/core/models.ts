@@ -1421,6 +1421,89 @@ export interface GraphData {
   totalVisibleEntities: number;
 }
 
+// ── Brain v3 PR-4 — the FULL-BRAIN graph (typed, multi-kind) ─────────────────
+//
+// A SEPARATE, additive payload (`getFullGraph`) from the entity-only `getGraph`.
+// It unifies entities + VISIBLE meetings + notes + documents as TYPED nodes and
+// every relation (entity co-occurrence + entity→meeting mentions + `links` rows)
+// as TYPED edges. Fully lock-gated server-side: a sealed-and-not-session-unlocked
+// item contributes NOTHING — no node, no edge touching it.
+
+/**
+ * The kind of a full-brain graph NODE (Rust `FullGraphNodeKind`, snake_case →
+ * these lowercase literals). Drives the per-kind node color + the node lens.
+ */
+export type FullGraphNodeKind = "entity" | "meeting" | "note" | "document";
+
+/**
+ * One TYPED node in the full-brain graph. `label` is the display title (already
+ * resolved through the visibility gate — a sealed item never produces a node).
+ * `date` is an ISO-8601 / epoch-derived string when the source carries one
+ * (`null` for entities). `degree` is the node's edge count WITHIN the returned
+ * (gated + capped) graph — a layout hint, never the true corpus degree.
+ */
+export interface FullGraphNode {
+  id: string;
+  kind: FullGraphNodeKind;
+  label: string;
+  date: string | null;
+  degree: number;
+}
+
+/**
+ * The relation a full-brain edge encodes (Rust `FullGraphEdgeKind`, snake_case).
+ * `co_occurrence` = entity↔entity; `mention` = entity→meeting; `wikilink` /
+ * `companion` / `semantic` = a `links` row. Drives the per-kind edge style + the
+ * edge lens.
+ */
+export type FullGraphEdgeKind =
+  | "co_occurrence"
+  | "mention"
+  | "wikilink"
+  | "companion"
+  | "semantic";
+
+/**
+ * One TYPED edge in the full-brain graph. `src`/`dst` are node ids that BOTH
+ * appear in `nodes` (both-endpoint-gated). `status` is `"active"` for
+ * deterministic edges (co-occurrence/mention/wikilink/companion + accepted
+ * semantic) and `"suggested"` for un-accepted semantic edges (only present when
+ * `includeSuggested` was on) — a suggested edge is drawn dashed.
+ */
+export interface FullGraphEdge {
+  src: string;
+  dst: string;
+  kind: FullGraphEdgeKind;
+  score: number;
+  status: "active" | "suggested";
+}
+
+/**
+ * Options for `getFullGraph`. All-default so the FE can call it with none.
+ * `includeSuggested` (default `false`) admits un-accepted (`status: "suggested"`)
+ * semantic `links` rows — the "Suggested links" lens toggle. Toggling it is the
+ * ONE case that re-fetches (the backend must include/exclude the rows); every
+ * other lens filters the already-fetched graph client-side (no re-fetch).
+ */
+export interface FullGraphOpts {
+  includeSuggested: boolean;
+}
+
+/**
+ * The full-brain graph payload from `getFullGraph()`: TYPED nodes + TYPED edges +
+ * the same honest disclosure the entity graph makes. `hasHidden` is true when
+ * ≥1 folder is sealed-and-not-unlocked (some nodes/edges may be hidden).
+ * `totalVisibleNodes` is the TRUE count of visible nodes BEFORE the per-kind
+ * render caps trimmed `nodes` (`totalVisibleNodes > nodes.length` = a cap
+ * dropped rows — distinct from `hasHidden`, which only reflects LOCKED folders).
+ */
+export interface FullGraphData {
+  nodes: FullGraphNode[];
+  edges: FullGraphEdge[];
+  hasHidden: boolean;
+  totalVisibleNodes: number;
+}
+
 /** A co-occurring neighbor of a selected entity (a neighborhood satellite). */
 export interface EntityNeighbor {
   id: string;

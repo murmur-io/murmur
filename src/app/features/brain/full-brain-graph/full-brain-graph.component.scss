@@ -1,0 +1,188 @@
+:host {
+  display: block;
+}
+.fbg {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+/* Honest-disclosure banner (mirrors the entity graph's g-banner). */
+.fbg-banner {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+.fbg-banner-glyph {
+  width: 8px;
+  height: 8px;
+  border-radius: var(--radius-pill);
+  background: var(--accent);
+  flex: none;
+}
+
+/* ── LENSES — node/edge toggle chips (in-flow, above the frame) ── */
+.fbg-lenses {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-4);
+}
+.fbg-lens-group {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+.fbg-lens-label {
+  font: 600 0.75rem var(--font-sans);
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  margin-right: var(--space-1);
+}
+.fbg-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  appearance: none;
+  height: 28px;
+  padding: 0 var(--space-3);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-pill);
+  background: var(--surface-hover);
+  color: var(--text-primary);
+  font: 600 0.8125rem var(--font-sans);
+  cursor: pointer;
+  transition:
+    background var(--transition-fast),
+    color var(--transition-fast),
+    opacity var(--transition-fast);
+}
+.fbg-chip:hover {
+  background: var(--surface-raised);
+}
+.fbg-chip:focus-visible {
+  outline: 2px solid var(--accent-ring);
+  outline-offset: 1px;
+}
+/* An OFF lens reads muted + hollow — its content is filtered out. */
+.fbg-chip.is-off {
+  background: transparent;
+  color: var(--text-muted);
+  border-color: var(--border);
+  opacity: 0.7;
+}
+.fbg-chip.is-off .fbg-chip-dot,
+.fbg-chip.is-off .fbg-chip-dash {
+  opacity: 0.4;
+}
+.fbg-chip-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: var(--radius-pill);
+  flex: none;
+}
+.fbg-chip-dash {
+  width: 14px;
+  height: 0;
+  flex: none;
+  border-top: 2px dashed var(--graph-document);
+}
+
+/* ── the canvas frame + floating chrome ── */
+.fbg-frame {
+  position: relative;
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+  border: 1px solid var(--glass-border);
+}
+.fbg-canvas {
+  display: block;
+  width: 100%;
+  height: clamp(440px, 66vh, 720px);
+  /* The scene's FIXED deep-indigo floor (mirrors the directive's BG). NOT a
+     surface token: glow/tint only reads on dark, so the graph stays a dark
+     field even under the light theme (same rationale as the neural map). */
+  background: #080914;
+  touch-action: none;
+  user-select: none;
+  outline: none;
+}
+
+/* Floating chrome INSIDE the frame — OPAQUE pills (--surface-overlay, never
+   the frosted .card) so the graph never bleeds through them (rule T3). */
+.fbg-toolbar {
+  position: absolute;
+  top: var(--space-3);
+  left: var(--space-3);
+  right: var(--space-3);
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-3);
+  pointer-events: none;
+}
+.fbg-toolbar > * {
+  pointer-events: auto;
+}
+.fbg-pill {
+  display: inline-flex;
+  align-items: center;
+  background: var(--surface-overlay);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-pill);
+  box-shadow: var(--shadow-sm);
+  backdrop-filter: none;
+}
+.fbg-count {
+  padding: 0 var(--space-4);
+  height: 32px;
+  font-size: 0.8125rem;
+  color: var(--text-secondary);
+}
+.fbg-zoom {
+  padding: 2px;
+  gap: 2px;
+}
+.fbg-zbtn {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--text-secondary);
+  font: 500 0.9375rem/1 var(--font-sans);
+  min-width: 28px;
+  height: 26px;
+  padding: 0 var(--space-2);
+  border-radius: var(--radius-pill);
+  cursor: pointer;
+  transition:
+    background var(--transition-fast),
+    color var(--transition-fast);
+}
+.fbg-zbtn:hover {
+  background: var(--surface-hover);
+  color: var(--text-primary);
+}
+.fbg-zbtn:focus-visible {
+  outline: 2px solid var(--accent-ring);
+  outline-offset: 1px;
+}
+.fbg-zreset {
+  font-size: 0.75rem;
+  font-weight: 600;
+}
+
+.fbg-hint {
+  margin: 0;
+  min-height: 1.1em;
+  text-align: center;
+  color: var(--text-secondary);
+  font-size: 0.75rem;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .fbg-chip,
+  .fbg-zbtn {
+    transition: none;
+  }
+}

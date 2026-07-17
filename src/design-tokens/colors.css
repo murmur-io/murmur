@@ -56,4 +56,15 @@
   --shape-insert: #43c59e;
   --shape-info: #e0a944;
   --shape-artifact: #c86ff2;
+
+  /* --- Full-brain graph NODE-KIND hues (Brain v3 PR-4) --------------------
+     One hue per node kind in the full-brain graph — used for the DOM lens
+     chips + the legend dots. The canvas scene mirrors these as fixed scene
+     constants on its own dark field (see full-brain-scene.directive.ts, same
+     rationale as the neural-scene PERSON/PROJECT palette). ≥60° hue apart so
+     the four kinds read as distinct dots. */
+  --graph-entity: #5bbdff;   /* azure — people/projects (matches the map)   */
+  --graph-meeting: #ff9d5c;  /* warm amber — recorded meetings              */
+  --graph-note: #4ce0a0;     /* mint — authored notes                       */
+  --graph-document: #c86ff2; /* orchid — imported documents                 */
 }

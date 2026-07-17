@@ -46,6 +46,8 @@ import type {
   EntityDetail,
   Folder,
   FolderNode,
+  FullGraphData,
+  FullGraphOpts,
   GraphData,
   GraphPayload,
   Meeting,
@@ -1109,6 +1111,20 @@ export class IpcService {
    */
   getGraph(): Promise<GraphData> {
     return invoke<GraphData>("get_graph");
+  }
+
+  /**
+   * The FULL-BRAIN graph (Brain v3 PR-4): TYPED nodes (entities + VISIBLE
+   * meetings + notes + documents) and TYPED edges (co-occurrence + entity→meeting
+   * mentions + `links` rows). Snapshots the live session `unlocked` set exactly
+   * like {@link getGraph}, so re-fetch on a FoldersService lock-state change to
+   * drop / re-admit sealed nodes live. `opts.includeSuggested` (default `false`)
+   * admits un-accepted (`status: "suggested"`) semantic links — the ONLY option
+   * the FE must re-fetch on (every other lens filters the returned graph
+   * client-side). All-default, so a bare call returns the confirmed graph.
+   */
+  getFullGraph(opts?: FullGraphOpts): Promise<FullGraphData> {
+    return invoke<FullGraphData>("get_full_graph", { opts: opts ?? null });
   }
 
   /** Detail for one entity: the entity + its visible backlinked meetings + top neighbors. */

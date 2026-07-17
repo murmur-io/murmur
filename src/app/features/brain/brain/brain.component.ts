@@ -22,6 +22,7 @@ import { FoldersService } from "../../../services/folders.service";
 import { ToastService } from "../../../services/toast.service";
 import { BrainEnableCardComponent } from "../brain-enable-card/brain-enable-card.component";
 import { BrainMapComponent } from "../brain-map/brain-map.component";
+import { FullBrainGraphComponent } from "../full-brain-graph/full-brain-graph.component";
 import { BrainMemoryComponent } from "../brain-memory/brain-memory.component";
 import { BrainNoteEditorComponent } from "../brain-note-editor/brain-note-editor.component";
 import { BrainSourceCardComponent } from "../brain-source-card/brain-source-card.component";
@@ -83,6 +84,7 @@ interface FolderOption {
     BrainSourceCardComponent,
     BrainNoteEditorComponent,
     BrainMapComponent,
+    FullBrainGraphComponent,
     BrainMemoryComponent,
     BriefsComponent,
     AuditComponent,
@@ -306,6 +308,13 @@ export class BrainComponent {
   readonly graphLoading = signal(true);
   readonly graphError = signal<string | null>(null);
   readonly connOpen = signal(false);
+
+  /**
+   * The FULL-BRAIN graph section (entities + meetings + notes + documents as one
+   * typed graph, Brain v3 PR-4) — collapsed by default; its component self-loads
+   * via IPC + the folder tree, so it costs nothing until opened.
+   */
+  readonly fullBrainOpen = signal(false);
 
   protected readonly nodeCount = computed(
     () => this.graphData()?.nodes.length ?? 0,
