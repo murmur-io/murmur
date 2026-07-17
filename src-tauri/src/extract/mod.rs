@@ -12,6 +12,10 @@
 //!   so a malformed/encrypted PDF fails CLOSED with `AppError::InvalidArg`, never an FFI abort.
 //! - `xlsx` — [`calamine`](self::xlsx) (sheet name = heading, rows → pipe text).
 //! - `html` / `htm` — [`html`] via `html2text` (one plain-text block).
+//! - `png`/`jpg`/`jpeg`/`heic`/`tiff`/`tif`/`bmp`/`gif` — direct image import ([`image`], macOS-only):
+//!   on-device Apple Vision OCR ([`ocr`]) into ONE block. A scanned/image-only PDF (no text layer)
+//!   also falls back to the SAME Vision OCR inside [`pdf`]. NO cloud egress; every FFI call wrapped in
+//!   `objc2::exception::catch` — fail-closed to `AppError::InvalidArg`, never an abort.
 //! - anything else — [`AppError::InvalidArg`].
 //!
 //! Lock model: extraction is a pure `path → Vec<ExtractedBlock>` transform with no DB / keychain
@@ -23,6 +27,10 @@ use std::path::Path;
 use crate::error::{AppError, Result};
 
 pub mod html;
+#[cfg(target_os = "macos")]
+pub mod image;
+#[cfg(target_os = "macos")]
+pub mod ocr;
 pub mod ooxml;
 #[cfg(target_os = "macos")]
 pub mod pdf;
@@ -79,6 +87,16 @@ pub fn extract_blocks(path: &Path, ext: &str) -> Result<Vec<ExtractedBlock>> {
         "pdf" => Err(AppError::InvalidArg(
             "PDF extraction is only available on macOS".into(),
         )),
+        // Direct image import → on-device Vision OCR (macOS-only). `png`/`jpg`/`jpeg`/`heic`/`tiff`/
+        // `tif`/`bmp`/`gif` all route to the OCR path in `image::extract_image`.
+        #[cfg(target_os = "macos")]
+        "png" | "jpg" | "jpeg" | "heic" | "tiff" | "tif" | "bmp" | "gif" => {
+            image::extract_image(path)
+        }
+        #[cfg(not(target_os = "macos"))]
+        "png" | "jpg" | "jpeg" | "heic" | "tiff" | "tif" | "bmp" | "gif" => Err(
+            AppError::InvalidArg("image OCR is only available on macOS".into()),
+        ),
         other => Err(AppError::InvalidArg(format!(
             "unsupported document type: .{other}"
         ))),
