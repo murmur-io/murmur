@@ -11,13 +11,19 @@
 //!
 //! Output: one [`ExtractedBlock`] per page (`page = Some(i+1)`), text = the page's `string`. When the
 //! document has an outline (`outlineRoot`), each page's `heading_path` is the outline entry whose
-//! destination page is nearest-at-or-before that page (best-effort; `None` when no outline). A PDF
-//! with NO extractable text on ANY page (a scanned/image-only PDF) returns a specific `InvalidArg`
-//! the FE maps to "scanned PDF — OCR not yet supported". Vision OCR is explicitly NOT in scope.
+//! destination page is nearest-at-or-before that page (best-effort; `None` when no outline).
+//!
+//! SCANNED-PDF OCR FALLBACK (Brain v3): a PDF with NO extractable text layer on ANY page (a
+//! scanned/image-only PDF) is NOT rejected — it falls back to on-device Apple Vision OCR
+//! ([`crate::extract::ocr`]): each page is rendered to a CGImage and OCR'd, and any recognized text is
+//! emitted as page blocks (heading `None`). The OCR path runs ONLY on the no-text-layer fallback, so a
+//! normal text PDF is never slowed. Only if OCR ALSO yields nothing on EVERY page do we fail closed
+//! with `InvalidArg("no text found in this document, even with OCR")`.
 //!
 //! REAL-MAC CAVEAT: this compiles everywhere but only TRULY verifies on a signed build on a real Mac
-//! (PDFKit text/outline fidelity, RAM on a 500-page PDF). `cargo test` cannot exercise the FFI path —
-//! the headless test here only asserts the fail-closed behavior for a non-PDF input.
+//! (PDFKit text/outline fidelity, RAM on a 500-page PDF, and — new — Vision OCR fidelity on a real
+//! scanned page). `cargo test` cannot exercise the FFI path — the headless test here only asserts the
+//! fail-closed behavior for a non-PDF input.
 
 use std::panic::AssertUnwindSafe;
 use std::path::Path;
@@ -105,12 +111,53 @@ pub fn extract_pdf(path: &Path) -> Result<Vec<ExtractedBlock>> {
     }
 
     if !any_text {
-        // A PDF with text on NO page is a scanned/image PDF — OCR (Vision) is out of scope for v1.
-        return Err(AppError::InvalidArg(
-            "scanned PDF — OCR not yet supported".into(),
-        ));
+        // A PDF with text on NO page is a scanned/image PDF → fall back to on-device Vision OCR.
+        // This branch ONLY runs when the fast text-layer path found nothing, so a normal text PDF is
+        // never slowed by rendering + OCR.
+        return ocr_scanned_pdf(&doc, page_count, &headings);
     }
 
+    Ok(blocks)
+}
+
+/// OCR fallback for a text-layer-less (scanned) PDF: render each page to a CGImage and run Vision OCR
+/// ([`crate::extract::ocr::ocr_pdf_page`]). Emits one block per page that yielded recognized text
+/// (page number preserved, heading from the outline if any); a page OCR can fail/blank without failing
+/// the whole document. If OCR yields NOTHING on EVERY page, fail closed with a clear `InvalidArg`.
+/// Every PDFKit/Vision/CoreGraphics call is crash-safe (wrapped in `catch` inside `ocr`).
+fn ocr_scanned_pdf(
+    doc: &PDFDocument,
+    page_count: usize,
+    headings: &[(usize, String)],
+) -> Result<Vec<ExtractedBlock>> {
+    let mut blocks: Vec<ExtractedBlock> = Vec::new();
+    let mut any_ocr_text = false;
+    for i in 0..page_count {
+        // Fetch the page (inside catch) then OCR it. A page that fails to fetch / render / recognize
+        // simply contributes no text — it never aborts the loop.
+        let page = match catch_objc(|| unsafe { doc.pageAtIndex(i) }).flatten() {
+            Some(p) => p,
+            None => continue,
+        };
+        let ocr_text = crate::extract::ocr::ocr_pdf_page(&page).unwrap_or_default();
+        let trimmed = ocr_text.trim();
+        if !trimmed.is_empty() {
+            any_ocr_text = true;
+            blocks.push(ExtractedBlock {
+                text: trimmed.to_string(),
+                page: Some((i + 1) as u32),
+                heading_path: heading_for_page(headings, i),
+            });
+        }
+    }
+
+    if !any_ocr_text {
+        // No text layer AND OCR found nothing on any page — the document has no readable text.
+        return Err(AppError::InvalidArg(
+            "no text found in this document, even with OCR".into(),
+        ));
+    }
+    tracing::info!(target: "documents", pages = page_count, ocr_blocks = blocks.len(), "pdf: scanned-PDF OCR fallback produced text");
     Ok(blocks)
 }
 
