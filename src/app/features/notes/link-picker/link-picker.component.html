@@ -2,12 +2,15 @@
      Positioned in JS (afterNextRender) at the caret's anchor rect. Re-positions
      on any scroll/resize via the shared directive (DestroyRef-cleaned listeners).
      PRESENTATIONAL: the caret stays in the editor textarea (Obsidian parity) —
-     this renders the live candidate list only; the host owns query + keyboard nav. -->
+     this renders the live candidate list only; the host owns query + keyboard nav.
+     Its own (scroll) is the infinite-scroll probe: nearing the bottom appends
+     the next backend page (see loadMore). -->
 <div
   #popover
   class="link-pop"
   appRepositionOnScroll
   (reposition)="reposition()"
+  (scroll)="onScroll()"
   (mousedown)="$event.preventDefault()"
   role="listbox"
   aria-label="Link to note"
