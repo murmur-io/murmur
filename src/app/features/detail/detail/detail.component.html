@@ -249,6 +249,7 @@
         @case ("note") {
           <app-note-panel
             [meetingId]="d.meeting.id"
+            [meetingTitle]="d.meeting.title"
             [folderId]="d.meeting.folderId ?? null"
             [note]="note()"
             [interactions]="interactions()"

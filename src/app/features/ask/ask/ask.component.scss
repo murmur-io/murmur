@@ -353,6 +353,13 @@
 }
 
 /* --- Composer --- */
+/* Source-scoped Brain picker — sits just above the composer (aligned with it,
+   both inset by the panel padding). */
+.ask-sources {
+  display: block;
+  margin-bottom: var(--space-2);
+}
+
 .ask-composer {
   display: flex;
   align-items: flex-end;

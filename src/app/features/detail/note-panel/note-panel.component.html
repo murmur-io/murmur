@@ -422,7 +422,10 @@
 
   <!-- CHAT WITH THIS MEETING (grounded Q&A over the transcript). -->
   <section class="block">
-    <app-meeting-chat [meetingId]="meetingId()" />
+    <app-meeting-chat
+      [meetingId]="meetingId()"
+      [anchorTitle]="meetingTitle()"
+    />
   </section>
 
   <!-- RELATED BY MEANING (semantic neighbors; silent when empty). -->

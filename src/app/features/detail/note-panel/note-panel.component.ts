@@ -123,6 +123,8 @@ export interface AssistantQa {
 export class NotePanelComponent {
   // --- Identity / meeting inputs ------------------------------------------
   readonly meetingId = input.required<string>();
+  /** The meeting's title — the anchor-chip label for the Ask-this-meeting picker. */
+  readonly meetingTitle = input<string | null>(null);
   readonly folderId = input<string | null>(null);
   /** The parsed note body (null when there is no note / masked). */
   readonly note = input<ParsedNote | null>(null);

@@ -13,8 +13,16 @@
 use std::collections::HashSet;
 
 use crate::error::Result;
-use crate::storage::models::VaultSource;
+use crate::links::LinkKind;
+use crate::storage::models::{SourceRef, VaultSource};
 use crate::storage::Db;
+
+/// note↔meeting-links PR-2 — cap on the TOTAL number of link-expanded neighbours a PINNED Ask
+/// pulls in (deduped across all explicit sources AND against the explicit set). The explicit
+/// sources are packed FIRST at full budget; the neighbours fill only the remaining budget. Bounds
+/// the "brain knows the connections" auto-expansion so a densely-linked item can't drag the whole
+/// graph into one prompt.
+const LINK_CONTEXT_CAP: usize = 8;
 
 /// Char budget for the corpus, by provider. Local quantized models (Ollama) have tiny
 /// default context windows, so cap much tighter; API/Claude models get headroom.
@@ -316,6 +324,153 @@ fn pack_meetings(
     Ok((corpus, sources))
 }
 
+/// note↔meeting-links PR-2 — pack ONE standalone note/document (`documents` table row) into the
+/// budget-capped `corpus`, headed by a `### [[Title]] · id:` citation mirroring [`pack_meetings`].
+/// The read is GATED: `get_document_if_visible` returns `None` for a sealed-and-not-session-unlocked
+/// note/document, so its (possibly-stale-plaintext) body never enters the corpus (E9). Reads BOTH
+/// `kind='note'` and `kind='document'` rows (the gated reader is not kind-restricted). Returns
+/// `true` iff something was packed (so the caller can count what actually contributed).
+fn pack_notes(
+    db: &Db,
+    doc_id: &str,
+    budget: usize,
+    corpus: &mut String,
+    unlocked: &HashSet<String>,
+) -> Result<bool> {
+    if corpus.len() >= budget {
+        return Ok(false);
+    }
+    // GATE: sealed-and-not-unlocked note/document ⇒ `None` ⇒ contributes nothing.
+    let Some(doc) = db.get_document_if_visible(doc_id, unlocked)? else {
+        return Ok(false);
+    };
+    // Prefer the authored title; a `kind='document'` upload leaves title NULL → fall back to `name`.
+    let title = doc
+        .title
+        .filter(|t| !t.trim().is_empty())
+        .unwrap_or(doc.name);
+    let header = format!("\n\n### [[{title}]] · id:{}\n", doc.id);
+    let remaining = budget.saturating_sub(corpus.len() + header.len());
+    if remaining < 200 {
+        return Ok(false);
+    }
+    let chunk: String = doc.markdown.chars().take(remaining).collect();
+    if chunk.trim().is_empty() {
+        return Ok(false);
+    }
+    corpus.push_str(&header);
+    corpus.push_str(&chunk);
+    Ok(true)
+}
+
+/// note↔meeting-links PR-2 — build a PINNED corpus from an EXPLICIT source list plus its capped,
+/// gated link-expansion. This is the source-scoped Ask path: the corpus is EXACTLY the listed
+/// `sources` (packed FIRST, at full budget) plus up to [`LINK_CONTEXT_CAP`] of their ACTIVE linked
+/// neighbours (packed AFTER, filling remaining budget only) — NEVER a vault-wide search.
+///
+/// GATE (E9, load-bearing): every leg reads only through the `*_visible` readers against the live
+/// `unlocked` set. A meeting source packs through [`pack_meetings`] (its `get_note_if_visible`
+/// second gate drops a sealed meeting's note); a note/document source packs through [`pack_notes`]
+/// (`get_document_if_visible` gate). Link-expansion uses [`Db::links_for_visible`], which is ALREADY
+/// both-endpoint gated — so a sealed explicit source or a sealed neighbour contributes NOTHING and
+/// is never even enumerated. No content read bypasses these gates.
+///
+/// Returns `(corpus, sources)` — `sources` carries the VaultSource chips for the MEETING sources
+/// that actually packed (notes/documents are not meetings, so they add no chip, matching
+/// `pack_doc_chunks`).
+pub fn build_vault_context_pinned_visible(
+    db: &Db,
+    sources: &[SourceRef],
+    provider_id: &str,
+    unlocked: &HashSet<String>,
+) -> Result<(String, Vec<VaultSource>)> {
+    let budget = budget_for(provider_id);
+    let mut corpus = String::new();
+    let mut vault_sources: Vec<VaultSource> = Vec::new();
+
+    // The explicit set, for dedupe against the link-expansion below (a neighbour that IS an explicit
+    // source is already packed — never pack it twice).
+    let explicit: HashSet<(&str, &str)> = sources
+        .iter()
+        .map(|s| (s.kind.as_str(), s.id.as_str()))
+        .collect();
+
+    // ── 1) Pack the EXPLICIT sources first (full budget). ──
+    for src in sources {
+        if corpus.len() >= budget {
+            break;
+        }
+        match src.kind {
+            LinkKind::Meeting => {
+                // `pack_meetings` gates via `get_note_if_visible` — a sealed meeting packs nothing +
+                // adds no source. An unknown id yields `None` inside the packer → skipped.
+                if let Some(m) = db.get_meeting(&src.id)? {
+                    let (mut chunk_corpus, chunk_sources) =
+                        pack_meetings(db, vec![m], budget.saturating_sub(corpus.len()), unlocked)?;
+                    corpus.push_str(&chunk_corpus);
+                    chunk_corpus.clear();
+                    vault_sources.extend(chunk_sources);
+                }
+            }
+            LinkKind::Note | LinkKind::Document => {
+                pack_notes(db, &src.id, budget, &mut corpus, unlocked)?;
+            }
+        }
+    }
+
+    // ── 2) Link-aware expansion: gather ACTIVE neighbours of each explicit source, deduped across
+    // sources AND against the explicit set, capped at LINK_CONTEXT_CAP total, then pack AFTER the
+    // explicit sources (remaining budget only). `links_for_visible` is both-endpoint gated, so a
+    // sealed neighbour is never enumerated. ──
+    let mut seen_neighbours: HashSet<(String, String)> = HashSet::new();
+    let mut neighbours: Vec<(LinkKind, String)> = Vec::new();
+    'outer: for src in sources {
+        let edges = db.links_for_visible(src.kind, &src.id, unlocked)?;
+        for edge in edges {
+            // Only ACTIVE edges expand context (skip merely-suggested/dismissed relations).
+            if edge.status != "active" {
+                continue;
+            }
+            let Some(other_kind) = LinkKind::parse(&edge.other_kind) else {
+                continue;
+            };
+            // Never re-pack an explicit source, and dedupe the same neighbour across sources.
+            if explicit.contains(&(other_kind.as_str(), edge.other_id.as_str())) {
+                continue;
+            }
+            let key = (edge.other_kind.clone(), edge.other_id.clone());
+            if !seen_neighbours.insert(key) {
+                continue;
+            }
+            neighbours.push((other_kind, edge.other_id));
+            if neighbours.len() >= LINK_CONTEXT_CAP {
+                break 'outer;
+            }
+        }
+    }
+    for (kind, id) in neighbours {
+        if corpus.len() >= budget {
+            break;
+        }
+        match kind {
+            LinkKind::Meeting => {
+                if let Some(m) = db.get_meeting(&id)? {
+                    let (mut chunk_corpus, chunk_sources) =
+                        pack_meetings(db, vec![m], budget.saturating_sub(corpus.len()), unlocked)?;
+                    corpus.push_str(&chunk_corpus);
+                    chunk_corpus.clear();
+                    vault_sources.extend(chunk_sources);
+                }
+            }
+            LinkKind::Note | LinkKind::Document => {
+                pack_notes(db, &id, budget, &mut corpus, unlocked)?;
+            }
+        }
+    }
+
+    Ok((corpus, vault_sources))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -532,5 +687,203 @@ mod tests {
             corpus2.contains("LOCKED-SECRET"),
             "unlocked content must reappear in hybrid corpus"
         );
+    }
+
+    // ── note↔meeting-links PR-2 — source-scoped + link-aware PINNED retrieval ──
+
+    /// Seed a standalone note (`documents` `kind='note'`) into a folder. Returns nothing; the note is
+    /// addressable by `id` in the `documents` id space (the `LinkKind::Note` id space).
+    fn seed_doc_note(db: &Db, id: &str, folder_id: &str, name: &str, body: &str) {
+        db.insert_document(id, folder_id, name, body, "note", 1_700_000_000)
+            .unwrap();
+    }
+
+    fn m_src(id: &str) -> SourceRef {
+        SourceRef {
+            kind: LinkKind::Meeting,
+            id: id.to_string(),
+        }
+    }
+    fn n_src(id: &str) -> SourceRef {
+        SourceRef {
+            kind: LinkKind::Note,
+            id: id.to_string(),
+        }
+    }
+
+    /// The pinned corpus contains EXACTLY the listed sources — a meeting NOT in `sources` never
+    /// appears, even though it exists and would match a whole-vault search.
+    #[test]
+    fn pinned_corpus_only_includes_listed_sources() {
+        let db = temp_db();
+        seed_note(&db, "m-in", "In Meeting", "PINNED-BODY project apollo", None);
+        seed_note(&db, "m-out", "Out Meeting", "UNLISTED-BODY project zeus", None);
+
+        let nothing = HashSet::new();
+        let (corpus, sources) =
+            build_vault_context_pinned_visible(&db, &[m_src("m-in")], "anthropic", &nothing)
+                .unwrap();
+        assert!(corpus.contains("PINNED-BODY"), "listed source is packed");
+        assert!(
+            !corpus.contains("UNLISTED-BODY"),
+            "an unlisted meeting must NEVER enter a pinned corpus: {corpus}"
+        );
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].meeting_id, "m-in");
+
+        // A note source packs the standalone note body; the unlisted meeting still absent.
+        seed_folder(&db, "f-open");
+        seed_doc_note(&db, "note-in", "f-open", "Pinned Note", "NOTE-BODY design decisions");
+        let (corpus2, _) =
+            build_vault_context_pinned_visible(&db, &[n_src("note-in")], "anthropic", &nothing)
+                .unwrap();
+        assert!(corpus2.contains("NOTE-BODY"), "note source packs its body");
+        assert!(!corpus2.contains("UNLISTED-BODY"));
+    }
+
+    /// A SEALED explicit source contributes NOTHING to the pinned corpus (E9) — pinning a locked
+    /// item can never leak it.
+    #[test]
+    fn pinned_corpus_sealed_source_contributes_nothing() {
+        let db = temp_db();
+        seed_folder(&db, "f-locked");
+        seed_note(
+            &db,
+            "m-sealed",
+            "Sealed Meeting",
+            "SEALED-BODY acquisition price",
+            Some("f-locked"),
+        );
+        seed_doc_note(&db, "note-sealed", "f-locked", "Sealed Note", "SEALED-NOTE-BODY roadmap");
+        db.set_folder_locked("f-locked", true, None).unwrap();
+
+        // Nothing session-unlocked: both a sealed MEETING source and a sealed NOTE source pack nothing.
+        let nothing = HashSet::new();
+        let (corpus, sources) = build_vault_context_pinned_visible(
+            &db,
+            &[m_src("m-sealed"), n_src("note-sealed")],
+            "anthropic",
+            &nothing,
+        )
+        .unwrap();
+        assert!(
+            !corpus.contains("SEALED-BODY"),
+            "sealed meeting source leaked into pinned corpus (E9): {corpus}"
+        );
+        assert!(
+            !corpus.contains("SEALED-NOTE-BODY"),
+            "sealed note source leaked into pinned corpus (E9): {corpus}"
+        );
+        assert!(sources.is_empty(), "no source chip for a sealed source");
+
+        // Session-unlock the folder ⇒ the pinned sources legitimately reappear.
+        let mut unlocked = HashSet::new();
+        unlocked.insert("f-locked".to_string());
+        let (corpus2, _) = build_vault_context_pinned_visible(
+            &db,
+            &[m_src("m-sealed"), n_src("note-sealed")],
+            "anthropic",
+            &unlocked,
+        )
+        .unwrap();
+        assert!(corpus2.contains("SEALED-BODY"), "unlocked meeting source reappears");
+        assert!(corpus2.contains("SEALED-NOTE-BODY"), "unlocked note source reappears");
+    }
+
+    /// Link-aware expansion pulls in an explicit source's ACTIVE linked neighbour's content — and a
+    /// SEALED neighbour is DROPPED (the both-endpoint gate holds through the expansion).
+    #[test]
+    fn pinned_corpus_expands_active_links_gated() {
+        let db = temp_db();
+        // One explicit meeting, manually linked to (a) an OPEN neighbour meeting and (b) a SEALED one.
+        seed_note(&db, "m-anchor", "Anchor Meeting", "ANCHOR-BODY kickoff", None);
+        seed_note(&db, "m-open-neighbour", "Open Neighbour", "OPEN-NEIGHBOUR-BODY specs", None);
+        seed_folder(&db, "f-locked");
+        seed_note(
+            &db,
+            "m-sealed-neighbour",
+            "Sealed Neighbour",
+            "SEALED-NEIGHBOUR-BODY numbers",
+            Some("f-locked"),
+        );
+        // Manual links from the anchor to both neighbours (rows written BEFORE sealing).
+        db.upsert_manual_link("meeting", "m-anchor", "meeting", "m-open-neighbour")
+            .unwrap();
+        db.upsert_manual_link("meeting", "m-anchor", "meeting", "m-sealed-neighbour")
+            .unwrap();
+        db.set_folder_locked("f-locked", true, None).unwrap();
+
+        let nothing = HashSet::new();
+        let (corpus, _) =
+            build_vault_context_pinned_visible(&db, &[m_src("m-anchor")], "anthropic", &nothing)
+                .unwrap();
+        assert!(corpus.contains("ANCHOR-BODY"), "explicit source packed");
+        assert!(
+            corpus.contains("OPEN-NEIGHBOUR-BODY"),
+            "an ACTIVE linked neighbour's body is auto-expanded into the corpus: {corpus}"
+        );
+        assert!(
+            !corpus.contains("SEALED-NEIGHBOUR-BODY"),
+            "a SEALED linked neighbour must be dropped by the gate (E9): {corpus}"
+        );
+    }
+
+    /// Link-expansion is capped at LINK_CONTEXT_CAP: more active neighbours than the cap are
+    /// truncated to exactly the cap (the explicit source is always packed on top).
+    #[test]
+    fn link_expansion_capped_at_link_context_cap() {
+        let db = temp_db();
+        seed_note(&db, "m-hub", "Hub Meeting", "HUB-BODY central", None);
+        // Seed CAP + 3 neighbours, each with a UNIQUELY greppable body, all actively linked to the hub.
+        let extra = 3usize;
+        for i in 0..(LINK_CONTEXT_CAP + extra) {
+            let id = format!("m-nb-{i}");
+            let body = format!("NEIGHBOUR-MARK-{i} content");
+            seed_note(&db, &id, &format!("Neighbour {i}"), &body, None);
+            db.upsert_manual_link("meeting", "m-hub", "meeting", &id)
+                .unwrap();
+        }
+
+        let nothing = HashSet::new();
+        let (corpus, _) =
+            build_vault_context_pinned_visible(&db, &[m_src("m-hub")], "anthropic", &nothing)
+                .unwrap();
+        assert!(corpus.contains("HUB-BODY"), "hub packed");
+        let packed = (0..(LINK_CONTEXT_CAP + extra))
+            .filter(|i| corpus.contains(&format!("NEIGHBOUR-MARK-{i} ")))
+            .count();
+        assert_eq!(
+            packed, LINK_CONTEXT_CAP,
+            "exactly LINK_CONTEXT_CAP neighbours are expanded (got {packed}); the rest are truncated"
+        );
+    }
+
+    /// Regression guard: the whole-vault (`None`-sources) corpus is unchanged by PR-2 — the pinned
+    /// builder is a NEW, separate path. A whole-vault build over the same DB still contains every
+    /// visible meeting (the pre-change behavior), whereas a pinned build over a single source does
+    /// NOT. This binds "None preserves the whole vault" at the vault_context level.
+    #[test]
+    fn pinned_vs_whole_vault_none_preserves_whole_vault() {
+        let db = temp_db();
+        seed_note(&db, "m-a", "Meeting A", "WHOLE-A body one", None);
+        seed_note(&db, "m-b", "Meeting B", "WHOLE-B body two", None);
+
+        let nothing = HashSet::new();
+        // Whole-vault (the `None`/no-picker path): BOTH meetings present (empty query → recent list).
+        let (whole, whole_sources) =
+            build_vault_context_visible(&db, "", "anthropic", &nothing).unwrap();
+        assert!(whole.contains("WHOLE-A"), "whole-vault contains meeting A");
+        assert!(whole.contains("WHOLE-B"), "whole-vault contains meeting B");
+        assert_eq!(whole_sources.len(), 2);
+
+        // Pinned to A only: A present, B ABSENT — the scoped path is strictly narrower.
+        let (pinned, pinned_sources) =
+            build_vault_context_pinned_visible(&db, &[m_src("m-a")], "anthropic", &nothing).unwrap();
+        assert!(pinned.contains("WHOLE-A"));
+        assert!(
+            !pinned.contains("WHOLE-B"),
+            "pinned corpus must not contain the unlisted meeting"
+        );
+        assert_eq!(pinned_sources.len(), 1);
     }
 }

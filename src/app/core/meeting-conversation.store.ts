@@ -827,6 +827,9 @@ export class MeetingConversationStore {
         // meeting; omitting it would fall back to state.current_meeting → the
         // wrong-meeting bug). Null → undefined so the backend uses the recording.
         this._meetingId() ?? undefined,
+        // TODO(source-scope): record-time @brain picker once ask_assistant_chat
+        // full-pins — the backend scoping here is a documented partial, so the
+        // fifth `explicitSources` arg is intentionally omitted for now.
       );
       this.resolveTurn(noteId, agentTurnId, {
         status: reply.status,
