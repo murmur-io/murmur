@@ -1203,6 +1203,37 @@ export class IpcService {
   }
 
   /**
+   * PR-1 — CREATE a user-initiated link from `(srcKind, srcId)` → `(dstKind, dstId)`
+   * (the anchored item is the src). Directed: linking FROM a note materializes the
+   * neighbour's `[[Title]]` into the note body server-side; FROM a meeting it creates
+   * a pure relation row. GATED — refuses (`Locked`) when either endpoint is sealed.
+   * The caller re-runs {@link listLinks} afterward so the new chip appears.
+   */
+  linkItems(
+    srcKind: LinkKind,
+    srcId: string,
+    dstKind: LinkKind,
+    dstId: string,
+  ): Promise<void> {
+    return invoke<void>("link_items", { srcKind, srcId, dstKind, dstId });
+  }
+
+  /**
+   * PR-1 — REMOVE a user-created link from `(srcKind, srcId)` → `(dstKind, dstId)`
+   * (the inverse of {@link linkItems}). Only manual links (`LinkEdge.manual === true`)
+   * are removable this way. GATED — refuses (`Locked`) when either endpoint is sealed.
+   * The caller re-runs {@link listLinks} afterward so the chip drops out.
+   */
+  unlinkItems(
+    srcKind: LinkKind,
+    srcId: string,
+    dstKind: LinkKind,
+    dstId: string,
+  ): Promise<void> {
+    return invoke<void>("unlink_items", { srcKind, srcId, dstKind, dstId });
+  }
+
+  /**
    * Resolve a clicked `[[Title]]` wikilink to the VISIBLE note/meeting to navigate to,
    * or `null` when nothing matches / the only match is sealed-and-not-session-unlocked
    * (gated server-side). The caller routes on `kind` or offers to create a note.

@@ -8,6 +8,13 @@
   gap: var(--space-3);
 }
 
+/* Header row: the "Connections" label + the `+ Link` chooser. */
+.cx-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
 /* One labelled cluster (deterministic chips, or suggestion rows). */
 .cx-group {
   display: flex;
@@ -23,6 +30,79 @@
   letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--text-muted);
+}
+/* The header label sits INLINE beside the `+ Link` control, not full-width. */
+.cx-label--head {
+  flex: 0 1 auto;
+}
+
+/* `+ Link` chooser trigger — a quiet ghost pill (leans on the token language, not
+   a new global primitive since it needs the compact chip metrics). */
+.cx-add {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  margin-left: auto;
+  padding: 4px var(--space-3);
+  background: transparent;
+  border: 1px dashed var(--border-subtle);
+  border-radius: var(--radius-pill);
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition:
+    border-color var(--transition-fast),
+    color var(--transition-fast),
+    background var(--transition-fast);
+}
+.cx-add:hover:not(:disabled) {
+  border-color: var(--accent-ring);
+  color: var(--text-primary);
+  background: var(--surface-hover);
+}
+.cx-add:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+.cx-add-plus {
+  font-size: 14px;
+  line-height: 1;
+}
+
+/* The chooser's filter input (replaces the trigger while open). */
+.cx-link-input {
+  flex: 1 1 auto;
+  margin-left: auto;
+  min-width: 12rem;
+  max-width: 22rem;
+  padding: 5px var(--space-3);
+  background: var(--surface-raised);
+  border: 1px solid var(--accent-ring);
+  border-radius: var(--radius-pill);
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 13px;
+}
+.cx-link-input::placeholder {
+  color: var(--text-muted);
+}
+.cx-link-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+/* A deterministic chip + its optional hover × remove control. The × sits just
+   INSIDE the pill's trailing edge (revealed on hover of the wrap) so a manual
+   link reads as one removable unit. */
+.cx-chipwrap {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  transition: opacity var(--transition-fast);
+}
+.cx-chipwrap.is-pending {
+  opacity: 0.55;
 }
 
 /* Chip — mirrors `app-backlinks`'s `.bl-chip` language. */
@@ -47,6 +127,41 @@
   border-color: var(--accent-ring);
   color: var(--text-primary);
   background: var(--surface-hover);
+}
+
+/* Remove (×) on a manual chip — hidden until the wrap is hovered/focused. */
+.cx-remove {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  margin-left: calc(-1 * var(--space-1));
+  padding: 0;
+  background: transparent;
+  border: 0;
+  border-radius: var(--radius-pill);
+  color: var(--text-muted);
+  font-size: 15px;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0;
+  transition:
+    opacity var(--transition-fast),
+    color var(--transition-fast),
+    background var(--transition-fast);
+}
+.cx-chipwrap:hover .cx-remove,
+.cx-remove:focus-visible {
+  opacity: 1;
+}
+.cx-remove:hover:not(:disabled) {
+  color: var(--danger);
+  background: var(--surface-hover);
+}
+.cx-remove:disabled {
+  cursor: default;
+  opacity: 0.4;
 }
 
 /* Neighbour-kind badge. */
