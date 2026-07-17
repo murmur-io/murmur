@@ -13070,6 +13070,18 @@ fn backfill_document_chunks(
             // Repair-tick probe (counts only, no content): missing chunks entirely (chunk-only
             // backfill works model-less), or chunked-but-vectorless while the REAL model is present
             // (the model arrived after import) — never a wholesale re-embed.
+            //
+            // TODO(reflow): re-index EXISTING fragmented docs so their RETRIEVAL (not just preview)
+            // uses de-fragmented text. The preview is already fixed on read (`render_display_text` +
+            // `get_document_if_visible` reflow), and any FUTURE (re)index reflows the chunk input
+            // (`index_document_chunks`). But an ALREADY-chunked fragmented doc has chunks>0/vectors>0,
+            // so this needs-only probe skips it — its stored chunks stay built from mangled glyphs.
+            // A naive "re-index if `reflow::looks_fragmented(stored_text)` fires" is UNSAFE here: reflow
+            // is read-only, so `documents.text` STAYS fragmented after a re-index → the probe fires
+            // again every tick → an unbounded re-chunk loop. A safe version needs a one-shot guard
+            // (a new additive `documents.reflow_reindexed_at` column + write-back), which is NEW at-rest
+            // state on the seal-adjacent `documents` table — out of scope for this read-only change and
+            // deferred to a follow-up. Users can force it today via Settings → Reindex.
             let (chunks, vectors) = db.doc_chunk_vector_counts(&did)?;
             chunks == 0 || (model_present && vectors == 0)
         };
