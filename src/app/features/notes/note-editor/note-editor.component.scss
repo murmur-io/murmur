@@ -305,6 +305,11 @@
 .note-doc.is-full-width {
   max-width: max(var(--editor-max), min(1600px, 92%));
 }
+/* Ask-about-this-note panel — separated from the body it sits below. */
+.note-chat {
+  display: block;
+  margin-top: var(--space-6);
+}
 .note-title-input {
   width: 100%;
   border: 0;

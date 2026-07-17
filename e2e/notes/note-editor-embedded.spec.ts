@@ -143,11 +143,14 @@ test("(b) embedded mount shows ONLY the body + working Ask Brain — no header/t
   await expect(body).toHaveValue(/Some body text to select\./);
 
   // CHROME IS GONE: no header, no title input, no properties bar, no backlinks,
-  // no Preview/Share toggle.
+  // no Preview/Share toggle, and no Ask-about-this-note panel (source-scoped
+  // Brain PR-4 — the recording companion's Ask Brain tab owns Q&A, so the
+  // embedded Note tab never mounts the note-chat).
   await expect(embed.locator(".editor-head")).toHaveCount(0);
   await expect(embed.locator(".note-title-input")).toHaveCount(0);
   await expect(embed.locator(".props")).toHaveCount(0);
   await expect(embed.locator("app-backlinks")).toHaveCount(0);
+  await expect(embed.locator("app-note-chat")).toHaveCount(0);
   await expect(embed.getByRole("button", { name: "Preview", exact: true })).toHaveCount(0);
 
   // The IN-NOTE Ask Brain works embedded: select body text → the formatting
