@@ -88,6 +88,108 @@
           </ul>
         </section>
       }
+
+      <!--
+        Brain v3 PR-6 — Decision ledger. The chronological supersessions of this
+        entity's facts (old → new, dated, with a source-meeting chip). Hidden
+        entirely when the entity has no supersessions, so it never adds an empty
+        section to an entity that was never revised. Self-contained: no Receipts
+        (PR-5) dependency.
+      -->
+      @if (ledgerLoading() && !diff()) {
+        <section class="ed-section">
+          <div class="ed-ledger-head">
+            <h4 class="ed-section-title">Zmiany · Decision ledger</h4>
+          </div>
+          <p class="empty ed-section-empty">Loading changes…</p>
+        </section>
+      } @else if (ledger().length) {
+        <section class="ed-section ed-ledger">
+          <div class="ed-ledger-head">
+            <h4 class="ed-section-title">Zmiany · Decision ledger</h4>
+            <div
+              class="ed-range seg"
+              role="group"
+              aria-label="Ledger comparison window"
+            >
+              <button
+                type="button"
+                class="seg-btn"
+                [class.is-active]="ledgerRange() === '90d'"
+                [attr.aria-pressed]="ledgerRange() === '90d'"
+                (click)="setRange('90d')"
+              >
+                90d
+              </button>
+              <button
+                type="button"
+                class="seg-btn"
+                [class.is-active]="ledgerRange() === 'all'"
+                [attr.aria-pressed]="ledgerRange() === 'all'"
+                (click)="setRange('all')"
+              >
+                All time
+              </button>
+            </div>
+          </div>
+
+          <ol class="ed-ledger-list">
+            @for (c of ledger(); track ledgerKey(c)) {
+              <li class="ed-ledger-row">
+                <div class="ed-ledger-attr">
+                  <span class="ed-ledger-subject">{{ c.subject }}</span>
+                  <span class="ed-ledger-predicate">{{ c.predicate }}</span>
+                </div>
+                <div class="ed-ledger-change">
+                  @if (c.oldObject) {
+                    <span class="ed-ledger-old">{{ c.oldObject }}</span>
+                  } @else {
+                    <span class="ed-ledger-old ed-ledger-none">—</span>
+                  }
+                  <svg
+                    class="ed-ledger-arrow"
+                    viewBox="0 0 16 16"
+                    width="14"
+                    height="14"
+                    aria-label="became"
+                  >
+                    <path
+                      d="M3 8h9M9 5l3 3-3 3"
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-width="1.5"
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                    />
+                  </svg>
+                  @if (c.newObject) {
+                    <span class="ed-ledger-new">{{ c.newObject }}</span>
+                  } @else {
+                    <span class="ed-ledger-new ed-ledger-none">—</span>
+                  }
+                </div>
+                <div class="ed-ledger-meta">
+                  @if (ledgerDate(c.validFrom); as date) {
+                    <time class="ed-ledger-date" [attr.datetime]="c.validFrom">
+                      {{ date }}
+                    </time>
+                  }
+                  @if (c.sourceMeetingId; as mid) {
+                    <a
+                      class="ed-ledger-source pill"
+                      [routerLink]="['/meeting', mid]"
+                      title="Open the source meeting"
+                    >
+                      <span class="ed-ledger-source-dot" aria-hidden="true"></span>
+                      Source
+                    </a>
+                  }
+                </div>
+              </li>
+            }
+          </ol>
+        </section>
+      }
     }
   }
 </aside>

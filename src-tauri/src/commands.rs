@@ -7764,6 +7764,30 @@ pub fn get_entity_detail(
         .ok_or_else(|| AppError::InvalidArg(format!("no entity with id {entity_id}")))
 }
 
+/// Brain v3 PR-6 — the KNOWLEDGE DIFF / decision ledger for one entity: what the vault knew AS OF
+/// `from` vs AS OF `to` (added / removed / changed facts), plus the full chronological supersession
+/// ledger (each: old object → new object, when it took effect, the source meeting). `entity` is a
+/// name OR an id — resolved through the GATED [`crate::summarize::dossier::resolve_entity_id`] (an
+/// entity mentioned only in sealed-not-unlocked meetings never resolves). The facts themselves are
+/// read through the visibility-gated [`crate::storage::Db::list_facts_visible`] inside
+/// [`crate::facts::build_knowledge_diff`] — a sealed-and-not-session-unlocked meeting's fact enters
+/// no snapshot, diff entry, or ledger row. Snapshots the live session unlock set like `get_graph`.
+/// Read-only, deterministic, no model, no new egress. `InvalidArg` if the entity does not resolve.
+#[tauri::command]
+pub fn get_entity_knowledge_diff(
+    state: State<'_, AppState>,
+    entity: String,
+    from: String,
+    to: String,
+) -> Result<crate::facts::EntityKnowledgeDiff, AppError> {
+    let unlocked = unlocked_snapshot(state.inner())?;
+    // GATE (anti-leak, FIRST): resolve name/id → a VISIBLE entity id, or refuse. An entity whose
+    // mentions are all sealed-not-unlocked is indistinguishable from an unknown one.
+    let id = crate::summarize::dossier::resolve_entity_id(&state.db, &entity, &unlocked)?
+        .ok_or_else(|| AppError::InvalidArg(format!("no visible entity matching {entity:?}")))?;
+    crate::facts::build_knowledge_diff(&state.db, &id, &from, &to, &unlocked)
+}
+
 /// "What links here" for a note or meeting: every VISIBLE meeting-note / standalone-note whose body
 /// carries a `[[<this row's title>]]` wikilink. GATE is folded into the DB builder
 /// (`Db::backlinks_for_visible`) exactly like [`get_entity_detail`] — no separate command-layer

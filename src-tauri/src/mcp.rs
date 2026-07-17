@@ -270,6 +270,11 @@ fn tools_spec() -> Value {
             "inputSchema": { "type": "object", "properties": { "entity": { "type": "string" } }, "required": ["entity"] }
         },
         {
+            "name": "knowledge_diff",
+            "description": "The DECISION LEDGER for one person or project: what you knew about it changed over time (bitemporal facts). Pass an entity name (e.g. 'Anna' or 'Project Atlas') or id, plus two ISO-8601 instants 'from' and 'to' (e.g. '2026-06-01T00:00:00Z'). Returns what CHANGED between those two moments (added / removed / changed facts, e.g. status in-progress → shipped) PLUS the full chronological supersession ledger — each decision carries the old value, the new value, when it took effect, and the source meeting id. Answers 'what changed since', 'when did X flip', 'the history of Y's status'. Sealed-and-locked meetings' facts are excluded.",
+            "inputSchema": { "type": "object", "properties": { "entity": { "type": "string" }, "from": { "type": "string", "description": "ISO-8601 instant to snapshot the earlier state at." }, "to": { "type": "string", "description": "ISO-8601 instant to snapshot the later state at." } }, "required": ["entity", "from", "to"] }
+        },
+        {
             "name": "org_search",
             "description": "Fallback for when search_meetings / search_semantic find nothing relevant in your OWN vault and you have joined an org: search the ORGANIZATION brain — notes your colleagues explicitly shared to the shared org brain (synced + decrypted locally; no data leaves this device). Results are attributed '[org · <author>]' and MUST be cited as coming from that colleague. Only meaningful when you have joined an org and consented to org sharing (otherwise returns no results). Use for 'what does the team / someone else know or decide about X' questions.",
             "inputSchema": { "type": "object", "properties": { "query": { "type": "string" } }, "required": ["query"] }
@@ -403,6 +408,29 @@ fn dispatch_tool(
                 entity: entity.to_string(),
             }
         }
+        // Brain v3 PR-6 — the KNOWLEDGE DIFF / decision ledger for one entity. Routes through the
+        // SAME gated reader (`resolve_entity_id` + `build_knowledge_diff` → `list_facts_visible`) as
+        // the dossier, so a sealed-and-not-unlocked meeting's fact is invisible here too. `entity`,
+        // `from`, `to` are all required.
+        "knowledge_diff" => {
+            let entity = args.get("entity").and_then(Value::as_str).unwrap_or("");
+            if entity.trim().is_empty() {
+                return Err((-32602, "missing required argument: entity".to_string()));
+            }
+            let from = args.get("from").and_then(Value::as_str).unwrap_or("");
+            let to = args.get("to").and_then(Value::as_str).unwrap_or("");
+            if from.trim().is_empty() {
+                return Err((-32602, "missing required argument: from".to_string()));
+            }
+            if to.trim().is_empty() {
+                return Err((-32602, "missing required argument: to".to_string()));
+            }
+            ToolCall::KnowledgeDiff {
+                entity: entity.to_string(),
+                from: from.to_string(),
+                to: to.to_string(),
+            }
+        }
         // Shared Brain — LOCAL, egress-free search of the org partition (synced colleagues' shares).
         // Untrusted multi-writer content: `execute_tool` provenance-labels + fence-neutralizes it. Not
         // folder-lock gated (org items live outside the lock domain), so `unlocked_set` is irrelevant
@@ -468,10 +496,10 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_has_nine_tools() {
+    fn tools_list_has_ten_tools() {
         let r = rpc(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#).unwrap();
         let tools = r["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 9);
+        assert_eq!(tools.len(), 10);
         // The Phase 2b semantic tool is advertised.
         assert!(tools.iter().any(|t| t["name"] == "search_semantic"));
         // The Phase 5a open-commitments rollup tool is advertised.
@@ -489,6 +517,11 @@ mod tests {
         assert!(
             tools.iter().any(|t| t["name"] == "query_database"),
             "query_database must be advertised in the MCP tool catalog"
+        );
+        // Brain v3 PR-6 — the knowledge-diff / decision-ledger tool is advertised (the 10th tool).
+        assert!(
+            tools.iter().any(|t| t["name"] == "knowledge_diff"),
+            "knowledge_diff must be advertised in the MCP tool catalog"
         );
     }
 
@@ -981,6 +1014,124 @@ mod tests {
             none.contains("No visible entity"),
             "unknown entity → friendly message"
         );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Brain v3 PR-6 (RED-before-GREEN gate): the MCP `knowledge_diff` dispatch is visibility-gated.
+    /// A fact whose SOURCE meeting is in a sealed-and-not-session-unlocked folder must be ABSENT from
+    /// the diff AND the decision ledger — its object never renders — and reappear once the folder is
+    /// session-unlocked. Routes through the SAME gated reader (`list_facts_visible`) as the dossier.
+    /// EGRESS-FREE: `dispatch_tool` builds gated structured text only, never a provider/cloud call.
+    #[test]
+    fn mcp_knowledge_diff_is_visibility_gated() {
+        use crate::facts::{FactOp, NewFact};
+        use crate::storage::models::{EntityKind, Folder};
+        let (db, p) = temp_db();
+        db.insert_folder(&Folder {
+            id: "f-lock".to_string(),
+            name: "Secret".to_string(),
+            path: "Secret".to_string(),
+            parent_id: None,
+            locked: false,
+            created_at: "2026-06-26T00:00:00Z".to_string(),
+        })
+        .unwrap();
+        // OPEN meetings carry a supersession (Atlas.status in-progress → shipped) the ledger surfaces.
+        seed(&db, "m_open1", "Kickoff", "Atlas kickoff\n", None);
+        seed(&db, "m_open2", "Ship Review", "Atlas shipped\n", None);
+        // SEALED meeting carries a fact whose OBJECT must never leak while the folder is sealed.
+        seed(
+            &db,
+            "m_sealed",
+            "Secret Atlas Review",
+            "Atlas secret budget\n",
+            Some("f-lock"),
+        );
+        let atlas = db.upsert_entity("Atlas", EntityKind::Project).unwrap();
+        db.add_mention(&atlas, "m_open1").unwrap();
+        db.add_mention(&atlas, "m_open2").unwrap();
+        db.add_mention(&atlas, "m_sealed").unwrap();
+
+        let add = |predicate: &str, object: &str, vf: &str, meeting: &str| {
+            FactOp::Add(NewFact {
+                entity_id: atlas.clone(),
+                subject: "Atlas".to_string(),
+                predicate: predicate.to_string(),
+                object: object.to_string(),
+                valid_from: vf.to_string(),
+                recorded_at: vf.to_string(),
+                confidence: 1.0,
+                meeting_id: Some(meeting.to_string()),
+            })
+        };
+        // Seed Atlas.status = in-progress (open) on m_open1.
+        db.apply_fact_ops(&[add("status", "in-progress", "2026-06-01T00:00:00Z", "m_open1")])
+            .unwrap();
+        // The reconcile-style change: close in-progress @2026-06-20 (Invalidate the minted row) and
+        // open shipped on m_open2 — a real supersession, built exactly like `apply_fact_ops` does.
+        let ip_id = db
+            .facts_for_entities(std::slice::from_ref(&atlas))
+            .unwrap()
+            .into_iter()
+            .find(|f| f.object == "in-progress")
+            .expect("in-progress row exists")
+            .id;
+        db.apply_fact_ops(&[
+            FactOp::Invalidate {
+                id: ip_id,
+                valid_to: "2026-06-20T00:00:00Z".to_string(),
+            },
+            add("status", "shipped", "2026-06-20T00:00:00Z", "m_open2"),
+        ])
+        .unwrap();
+        // The SEALED-source fact whose object must never leak while the folder is sealed.
+        db.apply_fact_ops(&[add("budget", "SECRET-42M", "2026-06-15T00:00:00Z", "m_sealed")])
+            .unwrap();
+
+        db.set_folder_locked("f-lock", true, None).unwrap();
+
+        let args = json!({
+            "entity": "Atlas",
+            "from": "2026-06-10T00:00:00Z",
+            "to": "2026-06-25T00:00:00Z"
+        });
+
+        // NOT unlocked: the open supersession (in-progress → shipped) renders; the SEALED fact's
+        // object (SECRET-42M) and predicate (budget) never appear anywhere in the payload.
+        let out = dispatch_tool(&db, "knowledge_diff", &args, &HashSet::new()).unwrap();
+        assert!(
+            out.contains("in-progress") && out.contains("shipped"),
+            "the open-source supersession must render: {out}"
+        );
+        assert!(
+            !out.contains("SECRET-42M") && !out.contains("budget"),
+            "a sealed-not-unlocked meeting's fact leaked into the knowledge diff (gate violation): {out}"
+        );
+
+        // Session-unlock the folder → the sealed fact (budget = SECRET-42M) reappears.
+        let mut unlocked = HashSet::new();
+        unlocked.insert("f-lock".to_string());
+        let out2 = dispatch_tool(&db, "knowledge_diff", &args, &unlocked).unwrap();
+        assert!(
+            out2.contains("SECRET-42M"),
+            "unlocked sealed fact must reappear in the diff: {out2}"
+        );
+
+        // Missing required args are InvalidArg (-32602), never a silent all-facts read.
+        assert!(dispatch_tool(&db, "knowledge_diff", &json!({ "from": "x", "to": "y" }), &unlocked).is_err());
+        assert!(dispatch_tool(&db, "knowledge_diff", &json!({ "entity": "Atlas", "to": "y" }), &unlocked).is_err());
+        assert!(dispatch_tool(&db, "knowledge_diff", &json!({ "entity": "Atlas", "from": "x" }), &unlocked).is_err());
+
+        // Unknown entity → friendly non-leaking message (never an error).
+        let none = dispatch_tool(
+            &db,
+            "knowledge_diff",
+            &json!({ "entity": "Nonexistent", "from": "x", "to": "y" }),
+            &HashSet::new(),
+        )
+        .unwrap();
+        assert!(none.contains("No visible entity"), "unknown entity → friendly message");
+
         let _ = std::fs::remove_file(&p);
     }
 
