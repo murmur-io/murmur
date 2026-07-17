@@ -564,6 +564,20 @@
               }
             </div>
           }
+
+          <!-- ASK-ABOUT-THIS-NOTE (Brain v3, source-scoped Brain PR-4) — a
+               grounded Q&A panel below the body, scoped to this note + its
+               active links. ROUTED mode ONLY: hidden when embedded (the
+               recording companion's Note tab is pure writing — its Ask Brain
+               tab owns Q&A) and impossible behind a lock (this `@else` branch
+               is the not-locked, note-loaded state). -->
+          @if (!embedded()) {
+            <app-note-chat
+              class="note-chat"
+              [noteId]="doc.id"
+              [anchorTitle]="doc.title"
+            />
+          }
         </article>
       }
     }

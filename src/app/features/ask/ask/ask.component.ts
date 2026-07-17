@@ -16,8 +16,10 @@ import { IpcService } from "../../../core/ipc.service";
 import type {
   AssistantToolPayload,
   ChatTurn,
+  SourceRef,
   VaultSource,
 } from "../../../core/models";
+import { SourcePickerComponent } from "../../../design-system/source-picker/source-picker.component";
 import { MarkdownComponent } from "../../../shared/markdown/markdown.component";
 import { SourcesComponent } from "../../../shared/sources/sources.component";
 
@@ -79,7 +81,7 @@ const STARTERS: readonly string[] = [
 @Component({
   selector: "app-ask",
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [MarkdownComponent, SourcesComponent],
+  imports: [MarkdownComponent, SourcesComponent, SourcePickerComponent],
   templateUrl: "./ask.component.html",
   styleUrl: "./ask.component.scss",
 })
@@ -101,6 +103,14 @@ export class AskComponent implements OnInit {
   readonly error = signal<string | null>(null);
   /** Working copy of the composer text (textarea (input) → signal). */
   readonly draft = signal("");
+
+  /**
+   * Source-scoped Brain — the `<mur-source-picker>` selection. Default EMPTY:
+   * the Ask page answers across the WHOLE vault unless the user opts in by
+   * picking sources. A NON-empty selection pins the answer to those sources +
+   * their links; empty ⇒ pass `undefined` (whole-vault) to {@link askVault}.
+   */
+  readonly sources = signal<SourceRef[]>([]);
 
   /** Live tool-trace chips for the IN-FLIGHT question (cleared when it lands). */
   readonly trace = signal<AskTraceStep[]>([]);
@@ -330,11 +340,15 @@ export class AskComponent implements OnInit {
     this.pending.set(true);
     this.scrollToLatest();
 
+    // Source-scoped Brain: an empty selection ⇒ pass undefined (whole-vault);
+    // a non-empty selection pins the answer to those sources + their links.
+    const scope = this.sources();
     try {
       const result = await this.ipc.askVault(
         question,
         priorHistory,
         askThreadId,
+        scope.length ? scope : undefined,
       );
       this.conversation.update((turns) => [
         ...turns,

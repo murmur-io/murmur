@@ -159,6 +159,15 @@
         }
       </div>
 
+      <!-- Source-scoped Brain: OPTIONALLY narrow the answer to specific notes /
+           meetings (+ their links). Empty (the default) ⇒ the whole vault. -->
+      <mur-source-picker
+        class="ask-sources"
+        [(selected)]="sources"
+        triggerLabel="Sources"
+        placeholder="Scope to a note or meeting…"
+      />
+
       <!-- Composer: textarea (Enter sends · Shift+Enter newline) + Send. -->
       <form class="ask-composer" (submit)="onSubmit($event)">
         <textarea
