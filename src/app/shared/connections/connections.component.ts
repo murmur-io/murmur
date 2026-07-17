@@ -138,12 +138,18 @@ export class ConnectionsComponent {
   private seq = 0;
 
   /**
-   * Deterministic (removable/active) chips — `wikilink` / `companion` / `manual`, PLUS any chip the
-   * backend flagged `manual` (a user's active link is always a removable chip, never a suggestion,
-   * even in the pathological case where its surviving collapsed `edgeType` is still `semantic`).
+   * The active/link chips — the EXACT complement of {@link suggestions}, so every edge renders in
+   * exactly one partition (no fall-through, no double-render). This is everything that is NOT a
+   * pending semantic suggestion: `wikilink`/`companion`/`manual`, any `manual`-flagged chip (a user's
+   * active link is always removable, never a suggestion — even if its collapsed `edgeType` is still
+   * `semantic`), AND an ACCEPTED semantic edge (`status !== "suggested"`) — the last case closes a
+   * pre-existing gap where an accepted semantic link between two non-owned endpoints
+   * (no `[[Title]]` to materialize, e.g. meeting↔meeting) rendered no chip at all.
    */
   readonly deterministic = computed(() =>
-    this.edges().filter((e) => e.edgeType !== "semantic" || e.manual),
+    this.edges().filter(
+      (e) => !(e.edgeType === "semantic" && e.status === "suggested" && !e.manual),
+    ),
   );
 
   /**
