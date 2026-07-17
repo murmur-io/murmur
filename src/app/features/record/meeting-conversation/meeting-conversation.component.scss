@@ -19,15 +19,35 @@
 .head-orb {
   --orb-size: 22px;
 }
-.surface-title {
-  color: var(--text-primary);
-  font-weight: 600;
-  font-size: 0.95rem;
+.tabs {
+  flex: none;
 }
 .surface-hint {
   margin-left: auto;
   color: var(--text-muted);
   font-size: 0.78rem;
+  text-align: right;
+}
+
+/* ── NOTE TAB — the embedded companion-note editor fills the panel body. ── */
+.note-host {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden;
+}
+/* The editor is ALWAYS MOUNTED (one live flush target); it is HIDDEN — not
+   destroyed — while the Ask Brain tab is active. `display: flex` above overrides
+   the UA `[hidden] { display: none }`, so force it explicitly. */
+.note-host[hidden] {
+  display: none;
+}
+.note-host app-note-editor {
+  display: block;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
 }
 
 /* ── The scrollable notes flow (oldest → newest) ─────────────────────── */
@@ -95,19 +115,40 @@
   color: var(--text-secondary);
 }
 
-/* ── input row: voice mic + the shared markdown composer, pinned at the
-   foot. The composer (`mur-markdown-composer`) owns its own auto-grow
-   textarea + the OPAQUE `/`/`[[` menus (trap T3 handled inside it); here we
-   only lay it out beside the voice mic. ──────────────────────────────── */
+/* ── Ask-Brain input row: voice mic + a plain single-line question input +
+   Ask button, pinned at the foot of the Ask-Brain tab. ──────────────────── */
 .composer {
   display: flex;
-  align-items: flex-end;
+  align-items: center;
   gap: var(--space-2);
   flex: none;
 }
-.composer-editor {
+.ask-input {
   flex: 1;
   min-width: 0;
+  height: 40px;
+  padding: 0 var(--space-3);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--surface-input);
+  color: var(--text-primary);
+  font-family: inherit;
+  font-size: 0.9rem;
+  transition:
+    border-color var(--transition),
+    box-shadow var(--transition);
+}
+.ask-input::placeholder {
+  color: var(--text-muted);
+}
+.ask-input:focus {
+  outline: none;
+  border-color: var(--accent-ring);
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+.send-btn {
+  flex: none;
+  height: 40px;
 }
 .mic-btn {
   flex: 0 0 auto;
@@ -164,33 +205,11 @@
   }
 }
 
-/* ── ENHANCE-MY-NOTES: one-shot Quiet-Weave sweep over the note lines ── */
+/* ── ENHANCE-MY-NOTES: the head hint tints accent as the note shapes the
+   summary (the sweep-over-note-lines animation is retired — the note is now
+   ONE document, not per-jot lines). ─────────────────────────────────────── */
 .flow app-note-item {
   display: block;
-  transition: box-shadow var(--transition);
-}
-.flow.is-enhancing app-note-item {
-  border-radius: var(--radius-sm);
-  background-image: linear-gradient(
-    100deg,
-    transparent 32%,
-    color-mix(in srgb, var(--accent) 12%, transparent) 50%,
-    transparent 68%
-  );
-  background-size: 250% 100%;
-  background-repeat: no-repeat;
-  background-position: 200% 0; /* parked off-canvas after the single pass */
-  animation: enhance-sweep 900ms ease-in-out both;
-  box-shadow: inset 2px 0 0
-    color-mix(in srgb, var(--accent) 35%, transparent);
-}
-@keyframes enhance-sweep {
-  from {
-    background-position: -150% 0;
-  }
-  to {
-    background-position: 200% 0;
-  }
 }
 .surface-hint.is-enhancing,
 .surface-hint.is-settled {
@@ -198,13 +217,9 @@
   animation: rise 200ms var(--transition) both;
 }
 @media (prefers-reduced-motion: reduce) {
-  .flow.is-enhancing app-note-item {
-    animation: none;
-    background-image: none; /* the static inset accent edge remains as the cue */
-  }
   .surface-hint.is-enhancing,
   .surface-hint.is-settled {
     animation: none;
   }
 }
-    
+

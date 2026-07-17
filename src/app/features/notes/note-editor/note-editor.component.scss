@@ -15,6 +15,30 @@
   flex-direction: column;
 }
 
+/* EMBEDDED mode (2026-07-17): the editor is hosted inside another surface (the
+   recording panel's "Note" tab), NOT the `/notes/:id` route. It fills its host
+   container with no full-viewport / sticky-header assumptions — the `:host`
+   `min-height: calc(100vh - …)` above is a routed-layout affordance that would
+   over-tall the panel here, so neutralize it. The routed layout (no
+   `.is-embedded`) is untouched. The header/title/properties are removed from the
+   DOM by `@if (!embedded())`, so only the body scroll region remains — its own
+   `padding` is trimmed so the panel's own chrome owns the outer spacing. */
+:host:has(.editor.is-embedded) {
+  min-height: 0;
+  height: 100%;
+}
+.editor.is-embedded {
+  height: 100%;
+}
+.editor.is-embedded .editor-body {
+  padding: var(--space-4) var(--space-5) var(--space-6);
+}
+.editor.is-embedded .note-doc {
+  /* No centered document column when embedded — fill the panel width (the panel
+     is already a narrow tab, so the routed 920px cap would just leave dead space). */
+  max-width: none;
+}
+
 /* Transparent full-viewport backdrop that closes an open header menu on an
    outside click (a real focusable button for a11y; sits under the menus). */
 .menu-backdrop {
