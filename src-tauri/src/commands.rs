@@ -1574,7 +1574,22 @@ pub async fn update_note(
     meeting_id: String,
     markdown: String,
 ) -> Result<NoteDto, AppError> {
-    let dto = update_note_inner(state.inner(), &meeting_id, &markdown)?;
+    // PERF (PR-1 finding 2): `update_note_inner` does the durable seal-on-write upsert + vault
+    // re-write AND (Brain v3 gap #1) re-derives the meeting's chunks/vectors via Candle/Metal — a
+    // multi-second stall on a long meeting / cold e5 if run INLINE on this async command's Tokio
+    // worker. Route the whole synchronous body through the shared heavy-inference gate on the
+    // blocking pool (the `unlock_folder` / `reindex_embeddings` precedent). Re-fetch `AppState`
+    // inside the closure via `app.state()` — a bare `&AppState` cannot be captured by a `'static`
+    // closure. Behavior is identical; it just no longer blocks the runtime thread.
+    let heavy_inference = state.heavy_inference.clone();
+    let app_for_edit = app.clone();
+    let meeting_for_edit = meeting_id.clone();
+    let markdown_for_edit = markdown.clone();
+    let dto = crate::perf::run_heavy(&heavy_inference, move || -> Result<NoteDto, AppError> {
+        let state = app_for_edit.state::<AppState>();
+        update_note_inner(&state, &meeting_for_edit, &markdown_for_edit)
+    })
+    .await?;
     // If the edit re-published ≥1 org copy, ping open org views (Notes list + Settings) so the fresh
     // title/body shows without a manual "Sync now". Best-effort — a republish failure never fails the save.
     if republish_org_shares_for_source(state.inner(), Some(&meeting_id), None)
@@ -1672,13 +1687,80 @@ pub(crate) fn refresh_meeting_note_exported_hash(
 // fresh from the exact content it wrote (and `write_note` never clobbers different bytes, so an
 // externally-edited exported file is preserved untouched rather than baseline-juggled).
 
+/// Brain v3 (audit gap #1/#4) — BEST-EFFORT re-index of ONE meeting's note/transcript/topic chunks
+/// after a content-affecting edit (note edit via [`update_note_inner`], rename via
+/// [`rename_meeting`]). Without this, deleted note text / the old title kept surfacing in semantic
+/// search + snippets (chunks are only re-derived by the pipeline, the manual Reindex, and unlock).
+///
+/// MODEL POLICY — the `embedder` is resolved by the CALLER (`embed_model_present().then(active_embedder)`)
+/// and injected, exactly like [`reindex_meetings_after_unseal`]: `None` (model absent) writes NOTHING
+/// (`index_meeting_chunks` has no chunk-only mode → any write would be a forbidden stub vector), and
+/// injection keeps the model-present branch deterministically testable with the stub.
+///
+/// SEAL GATE (load-bearing): the re-index runs under the EMPTY unlock set, so
+/// `index_meeting_if_enabled`'s visibility check admits ONLY a meeting whose folder is OPEN — a
+/// SEALED folder's plaintext (even while session-unlocked) is never re-chunked by an edit. The
+/// unlock/relock lifecycle owns those rows (`reindex_meetings_after_unseal` rebuilds on unlock;
+/// `purge_chunks_tx` re-purges on relock), so the sealed-at-rest state never gains an index row here.
+///
+/// FLAG CONSISTENCY (Brain v3 audit gap, PR-1): the re-index respects `semantic_search_enabled`,
+/// exactly like the pipeline's `should_auto_index` and the startup repair tick. When semantic is OFF
+/// the `note_chunks`/`vec_chunks` are not retrieval-active (the semantic search paths short-circuit
+/// on the flag), and raw FTS over the note/transcript stays fresh via its own triggers on the
+/// plaintext write — so skipping the chunk re-index here is correct AND consistent (an edit/rename
+/// must not be the ONE meeting-index path that ignores the flag).
+///
+/// BEST-EFFORT: a failure WARNs (ids only, no PII) and NEVER fails the save/rename — the plaintext
+/// write already succeeded.
+pub(crate) fn reindex_meeting_after_edit(
+    state: &AppState,
+    meeting_id: &str,
+    embedder: Option<&dyn crate::embed::Embedder>,
+) {
+    let Some(embedder) = embedder else {
+        return; // model absent → never a stub vector (mirrors the pipeline/reindex/unseal policy).
+    };
+    // Respect the master flag — an OFF flag means the vector chunks are not retrieval-active, so a
+    // re-embed would be wasted work AND inconsistent with every other auto-index path.
+    let enabled = state
+        .config
+        .lock()
+        .map(|c| c.semantic_search_enabled)
+        .unwrap_or(false);
+    let empty = std::collections::HashSet::new();
+    if let Err(e) =
+        crate::pipeline::index_meeting_if_enabled(&state.db, meeting_id, enabled, &empty, embedder)
+    {
+        tracing::warn!(
+            target: "rag",
+            error = %e,
+            "meeting re-index after edit failed (content saved unaffected)"
+        );
+    }
+}
+
 /// Inner of [`update_note`] taking `&AppState` — the FULL command body (gate + lifecycle guard +
 /// seal-on-write upsert + vault re-write), so the seal-on-write regression binds the COMMAND
-/// surface, not just the `upsert_note_reseal_if_locked` helper (residual W6).
+/// surface, not just the `upsert_note_reseal_if_locked` helper (residual W6). Resolves the
+/// model-gated embedder and delegates to [`update_note_inner_with`] (embedder injected for
+/// deterministic tests — the `reindex_meetings_after_unseal` precedent).
 pub(crate) fn update_note_inner(
     state: &AppState,
     meeting_id: &str,
     markdown: &str,
+) -> Result<NoteDto, AppError> {
+    let embedder = crate::embed::embed_model_present().then(crate::embed::active_embedder);
+    update_note_inner_with(state, meeting_id, markdown, embedder.as_deref())
+}
+
+/// Core of [`update_note_inner`] with the re-index embedder INJECTED (`None` = model absent →
+/// no re-index; `Some` = re-derive the meeting's chunks/vectors after the save so deleted text
+/// stops surfacing in semantic search — Brain v3 audit gap #1).
+pub(crate) fn update_note_inner_with(
+    state: &AppState,
+    meeting_id: &str,
+    markdown: &str,
+    embedder: Option<&dyn crate::embed::Embedder>,
 ) -> Result<NoteDto, AppError> {
     // BLK-1 / TOCTOU (2026-07-10 audit F4): hold the lifecycle guard across gate+write so a
     // concurrent relock/seal cannot land between the unlock check and the upsert.
@@ -1717,6 +1799,11 @@ pub(crate) fn update_note_inner(
     if let Some(path) = existing.exported_path.as_deref() {
         overwrite_exported_note_guarded(state, meeting_id, &existing.provider_id, path, markdown)?;
     }
+
+    // Brain v3 (audit gap #1): re-derive the meeting's chunks/vectors from the FRESH markdown so
+    // deleted text stops surfacing in semantic search/snippets. Best-effort + empty-unlock-set
+    // sealed-folder gate inside; never fails the save (the plaintext is already durable).
+    reindex_meeting_after_edit(state, meeting_id, embedder);
 
     Ok(NoteDto {
         meeting_id: meeting_id.to_string(),
@@ -2717,8 +2804,14 @@ fn ingest_into_folder(
     // REAL e5 model is present (never write stub vectors). Best-effort: a failure logs (no PII) and
     // does NOT fail the ingest (the row + plaintext are durable; a later unlock re-chunk / reindex
     // recovers the index).
+    //
+    // KIND-ROUTED (PR-1 finding 4): a pasted note (`kind='note'`) can carry YAML front-matter in its
+    // raw `text`, which must NEVER be embedded/indexed (DESIGN §1a — tags/properties pollute the
+    // vectors + snippets). Route through the ONE front-matter-stripping seam so the ingest matches
+    // every other note-index path; an uploaded document (`kind='document'`) has no front-matter and
+    // takes the raw path unchanged inside the router.
     let embedder = crate::embed::embed_model_present().then(crate::embed::active_embedder);
-    if let Err(e) = state.db.index_document_chunks(&id, embedder.as_deref()) {
+    if let Err(e) = index_document_row_kind_routed(&state.db, &id, embedder.as_deref()) {
         tracing::warn!(target: "rag", error = %e, "ingest: chunk/embed failed (content stored)");
     }
 
@@ -5113,20 +5206,51 @@ fn remove_meeting_audio_files(audio_path: Option<&str>) {
 }
 
 /// Rename a meeting's title (in-app + Library list). Does not rename the vault file.
+///
+/// PERF (PR-1 finding 2): after Brain v3 gap #4 the rename re-derives every chunk header/vector
+/// (the title is baked into `chunk_note`/`augment_chunk_text`) — Candle/Metal work that stalls a
+/// SYNC command's IPC thread for seconds on a long meeting / cold e5. Now `async` + routed through
+/// the shared heavy-inference gate on the blocking pool (the `update_note` / `unlock_folder`
+/// precedent). `AppHandle` is injected by Tauri (the FE `invoke('rename_meeting', {...})` is
+/// unchanged); it gives the `run_heavy` closure a `'static` `AppState` via `app.state()`.
 #[tauri::command]
-pub fn rename_meeting(
+pub async fn rename_meeting(
+    app: AppHandle,
     state: State<'_, AppState>,
     meeting_id: String,
     title: String,
+) -> Result<(), AppError> {
+    let heavy_inference = state.heavy_inference.clone();
+    crate::perf::run_heavy(&heavy_inference, move || -> Result<(), AppError> {
+        let state = app.state::<AppState>();
+        let embedder = crate::embed::embed_model_present().then(crate::embed::active_embedder);
+        rename_meeting_inner(&state, &meeting_id, &title, embedder.as_deref())
+    })
+    .await
+}
+
+/// Inner of [`rename_meeting`] with the re-index embedder INJECTED (deterministic tests — the
+/// `reindex_meetings_after_unseal` precedent). Brain v3 (audit gap #4): the meeting TITLE is baked
+/// into every chunk's header + augmented text (`chunk_note`/`augment_chunk_text`), so a rename left
+/// the OLD title in every vector/snippet until a manual full reindex — re-derive best-effort after
+/// the title is persisted.
+pub(crate) fn rename_meeting_inner(
+    state: &AppState,
+    meeting_id: &str,
+    title: &str,
+    embedder: Option<&dyn crate::embed::Embedder>,
 ) -> Result<(), AppError> {
     let title = title.trim();
     if title.is_empty() {
         return Err(AppError::InvalidArg("title cannot be empty".into()));
     }
-    state.db.set_meeting_title(&meeting_id, title)?;
+    state.db.set_meeting_title(meeting_id, title)?;
     // Keep the companion note's managed title + front-matter `[[Meeting]]` link in sync with the new
     // title. Best-effort — a sync failure NEVER fails the rename (the title is already persisted).
-    sync_companion_note_title_best_effort(state.inner(), &meeting_id);
+    sync_companion_note_title_best_effort(state, meeting_id);
+    // Brain v3 (audit gap #4): refresh chunk headers/vectors so they carry the NEW title.
+    // Best-effort + sealed-folder gate inside (empty unlock set); never fails the rename.
+    reindex_meeting_after_edit(state, meeting_id, embedder);
     Ok(())
 }
 
@@ -11972,25 +12096,12 @@ pub(crate) fn reindex_embeddings_inner<F: FnMut(usize, usize)>(
     // DOCUMENT backfill first — doc_chunks + the FTS index are model-INDEPENDENT (keyword retrieval
     // must work on a default install), so this runs even when the e5 model is absent. Visible
     // documents only (`visible_document_ids` applies `visibility_clause`; a sealed folder's docs
-    // stay purged). Model present ⇒ full purge-then-reinsert re-embed. Model ABSENT ⇒ chunk-only
-    // backfill of documents with NO chunks yet (the write-only legacy rows) — never a
-    // purge-then-reinsert of an already-chunked document, which would DESTROY its existing real
-    // vectors without replacing them.
-    let doc_embedder = model_present.then_some(embedder);
-    let mut docs_indexed = 0usize;
-    for did in db.visible_document_ids(unlocked)? {
-        let should_index = model_present || !db.document_has_chunks(&did)?;
-        if !should_index {
-            continue;
-        }
-        match db.index_document_chunks(&did, doc_embedder) {
-            Ok(()) => docs_indexed += 1,
-            Err(e) => {
-                // Never abort the whole backfill on one bad document — log (no PII) and continue.
-                tracing::warn!(target: "rag", error = %e, "reindex: indexing one document failed (skipped)");
-            }
-        }
-    }
+    // stay purged). Model present ⇒ full purge-then-reinsert re-embed (`force_reembed`). Model
+    // ABSENT ⇒ chunk-only backfill of documents with NO chunks yet (the write-only legacy rows) —
+    // never a purge-then-reinsert of an already-chunked document, which would DESTROY its existing
+    // real vectors without replacing them. The shared leg is kind-ROUTED (Brain v3 audit gap #3):
+    // authored notes re-chunk through the front-matter-stripping path, never raw `documents.text`.
+    let docs_indexed = backfill_document_chunks(db, unlocked, model_present, embedder, true)?;
     if docs_indexed > 0 {
         tracing::info!(target: "rag", docs_indexed, "reindex: document chunks backfilled");
     }
@@ -12052,6 +12163,158 @@ pub(crate) fn reindex_embeddings_inner<F: FnMut(usize, usize)>(
         indexed,
         total,
     })
+}
+
+/// Brain v3 (audit gap #3) — KIND-ROUTED (re)index of one `documents`-table row. An authored note
+/// (`kind='note'`) carries YAML front-matter in its raw `text` column, which the note-save path
+/// deliberately STRIPS before chunking (`index_note_body_chunks` → `split_front_matter` — DESIGN
+/// §1a: tags/properties must never pollute the vectors). The reindex/unseal paths previously called
+/// raw [`Db::index_document_chunks`] for EVERY row regardless of kind, re-embedding notes WITH their
+/// front-matter — this helper is the ONE routing seam they all share now.
+///
+/// GATING: NOT a new read path — callers only pass ids already admitted by a gated reader
+/// (`visible_document_ids` / the unseal path's own CK-decrypted rows), the exact contract
+/// `index_document_chunks` already documents ("caller MUST only invoke this for visible content").
+pub(crate) fn index_document_row_kind_routed(
+    db: &crate::storage::Db,
+    document_id: &str,
+    embedder: Option<&dyn crate::embed::Embedder>,
+) -> Result<(), AppError> {
+    match db.get_note_row(document_id)? {
+        Some(row) => {
+            // `kind='note'` — mirror `update_note_doc_inner`'s title fallback + body strip exactly.
+            let title = row.title.as_deref().unwrap_or(&row.name);
+            let title = title.trim();
+            let title = if title.is_empty() { "Untitled" } else { title };
+            let (_yaml, body) = crate::storage::db::split_front_matter(&row.text);
+            db.index_note_chunks(document_id, title, &body, embedder)
+        }
+        // Uploaded document (`kind='document'`) — the raw-text path is correct (no front-matter).
+        None => db.index_document_chunks(document_id, embedder),
+    }
+}
+
+/// The DOCUMENT backfill leg shared by [`reindex_embeddings_inner`] (`force_reembed = true`: the
+/// user-triggered full pass — model present ⇒ purge-then-reinsert re-embed of EVERY visible doc)
+/// and the startup repair tick [`backfill_missing_brain_indexes`] (`force_reembed = false`:
+/// NEEDS-ONLY — touch a row only when it has no chunks at all, or has chunks but ZERO vectors while
+/// the real model is present, so an idempotent re-run does no work). Chunk-only backfill (no
+/// vectors) runs even with the model absent, exactly like the original reindex doc leg. Every row
+/// routes through [`index_document_row_kind_routed`] (front-matter never re-enters a note's chunks).
+///
+/// GATING (lock-model): the corpus is exactly `visible_document_ids(unlocked)` — a
+/// sealed-and-not-in-`unlocked` folder's documents are never returned, so their (blank) plaintext
+/// is never chunked and their index rows STAY purged.
+fn backfill_document_chunks(
+    db: &crate::storage::Db,
+    unlocked: &std::collections::HashSet<String>,
+    model_present: bool,
+    embedder: &dyn crate::embed::Embedder,
+    force_reembed: bool,
+) -> Result<usize, AppError> {
+    let doc_embedder = model_present.then_some(embedder);
+    let mut docs_indexed = 0usize;
+    for did in db.visible_document_ids(unlocked)? {
+        let should_index = if force_reembed {
+            model_present || !db.document_has_chunks(&did)?
+        } else {
+            // Repair-tick probe (counts only, no content): missing chunks entirely (chunk-only
+            // backfill works model-less), or chunked-but-vectorless while the REAL model is present
+            // (the model arrived after import) — never a wholesale re-embed.
+            let (chunks, vectors) = db.doc_chunk_vector_counts(&did)?;
+            chunks == 0 || (model_present && vectors == 0)
+        };
+        if !should_index {
+            continue;
+        }
+        match index_document_row_kind_routed(db, &did, doc_embedder) {
+            Ok(()) => docs_indexed += 1,
+            Err(e) => {
+                // Never abort the whole backfill on one bad document — log (no PII) and continue.
+                tracing::warn!(target: "rag", error = %e, "doc backfill: indexing one document failed (skipped)");
+            }
+        }
+    }
+    Ok(docs_indexed)
+}
+
+/// Brain v3 (audit gap #2) — the IDEMPOTENT startup REPAIR TICK. Vector/chunk coverage previously
+/// only recovered via the manual Settings → Reindex: an embed-model download, a flag flip, or a
+/// model-absent unlock left meetings/documents chunk- or vector-less until the user noticed.
+/// Generalizes the `backfill_topic_chunks_idempotent` startup pattern; wired into the SAME
+/// `lib.rs` setup `spawn_blocking` (behind the same `topic_backfill_ram_permits_now()` RAM floor).
+///
+/// THE CONSOLIDATION INVARIANT (load-bearing): every read runs under the EMPTY unlock set — a
+/// sealed folder's meetings/documents are invisible here EVEN MID-SESSION-UNLOCK, so sealed
+/// plaintext is never touched by a background task (this fn deliberately takes no unlock set).
+///
+/// Gating matrix (mirrors the existing code exactly):
+/// - DOC half: needs-only [`backfill_document_chunks`] — chunk/FTS backfill runs even with the
+///   model absent (the reindex doc-leg policy); vectors only when `model_present`.
+/// - MEETING half: `index_meeting_chunks` has no chunk-only mode, so it requires the REAL model
+///   (never a stub vector) AND — being an AUTOMATIC index — the `semantic_search_enabled` flag
+///   (the pipeline's `should_auto_index` posture, same as the topic backfill's flag gate).
+///
+/// Idempotent: a re-run finds full coverage and touches nothing (returns `(0, 0)`). Logs counts
+/// only — no PII.
+pub(crate) fn backfill_missing_brain_indexes(
+    db: &crate::storage::Db,
+    semantic_enabled: bool,
+    model_present: bool,
+    embedder: &dyn crate::embed::Embedder,
+) -> Result<(usize, usize), AppError> {
+    let empty = std::collections::HashSet::new();
+
+    // DOC half — needs-only (never the reindex command's wholesale re-embed).
+    let docs = backfill_document_chunks(db, &empty, model_present, embedder, false)?;
+
+    // MEETING half — flag + model gated (see the gating matrix above).
+    let mut meetings = 0usize;
+    if semantic_enabled && model_present {
+        for m in db.list_meetings_visible(100_000, &empty)? {
+            // Defense-in-depth (the reindex idiom): only a meeting whose latest note is visible
+            // under the SAME empty set is considered — and "has a note" is the tick's precondition.
+            match db.get_note_if_visible(&m.id, &empty) {
+                Ok(Some(_note)) => {}
+                Ok(None) => continue,
+                Err(e) => {
+                    tracing::warn!(target: "rag", error = %e, "repair tick: visibility check failed (skipped)");
+                    continue;
+                }
+            }
+            // Needs probe (counts only): note-but-zero-chunks, or chunks-but-zero-vectors.
+            let (chunks, vectors) = match db.meeting_chunk_vector_counts(&m.id) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(target: "rag", error = %e, "repair tick: chunk probe failed (skipped)");
+                    continue;
+                }
+            };
+            if chunks > 0 && vectors > 0 {
+                continue; // covered — the idempotent no-op leg.
+            }
+            match db.get_segments(&m.id) {
+                Ok(segments) => {
+                    if let Err(e) = db.index_meeting_chunks(&m.id, &segments, embedder) {
+                        tracing::warn!(target: "rag", error = %e, "repair tick: indexing one meeting failed (skipped)");
+                    } else {
+                        meetings += 1;
+                        // Topic chunks follow the note/transcript index (the reindex idiom) —
+                        // under the SAME empty unlock set (sealed context never persists).
+                        if let Err(e) =
+                            db.index_meeting_topic_chunks(&m.id, &segments, embedder, &empty)
+                        {
+                            tracing::warn!(target: "rag", error = %e, "repair tick: topic indexing failed (skipped)");
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(target: "rag", error = %e, "repair tick: reading segments failed (skipped)");
+                }
+            }
+        }
+    }
+    Ok((meetings, docs))
 }
 
 /// True iff the on-device PERSON-name NER model (Phase D) is present on disk. Pure existence probe;
@@ -14741,12 +15004,13 @@ fn unseal_folder_extras(
     }
     // Re-index the restored documents: chunks + the FTS index come back UNCONDITIONALLY (keyword
     // retrieval must survive a lock/unlock cycle on a model-less install); vectors ONLY when the
-    // REAL e5 model is present (never stub vectors; mirrors `import_document`). Best-effort: a
-    // failure logs (no PII) and does NOT fail the unlock — the plaintext text is already restored.
+    // REAL e5 model is present (never stub vectors; mirrors `import_document`). KIND-ROUTED (Brain
+    // v3 audit gap #3): an authored note re-chunks through the front-matter-stripping path.
+    // Best-effort: a failure logs (no PII) and does NOT fail the unlock — the text is restored.
     if !restored_doc_ids.is_empty() {
         let embedder = crate::embed::embed_model_present().then(crate::embed::active_embedder);
         for did in &restored_doc_ids {
-            if let Err(e) = state.db.index_document_chunks(did, embedder.as_deref()) {
+            if let Err(e) = index_document_row_kind_routed(&state.db, did, embedder.as_deref()) {
                 tracing::warn!(target: "rag", error = %e, "document re-index on unlock failed (text restored)");
             }
         }
@@ -15030,10 +15294,11 @@ fn unseal_folder_extras_permanent(
     }
     if !restored_doc_ids.is_empty() {
         // Chunks + FTS come back unconditionally (keyword retrieval works model-less); vectors only
-        // when the REAL e5 model is present (never stub vectors).
+        // when the REAL e5 model is present (never stub vectors). KIND-ROUTED (Brain v3 audit gap
+        // #3): an authored note re-chunks through the front-matter-stripping path.
         let embedder = crate::embed::embed_model_present().then(crate::embed::active_embedder);
         for did in &restored_doc_ids {
-            if let Err(e) = state.db.index_document_chunks(did, embedder.as_deref()) {
+            if let Err(e) = index_document_row_kind_routed(&state.db, did, embedder.as_deref()) {
                 tracing::warn!(target: "rag", error = %e, "document re-index on remove-lock failed (text restored)");
             }
         }
@@ -24117,6 +24382,421 @@ mod lifecycle_tests {
         );
     }
 
+    /// Brain v3 audit gap #1 (RED-before-GREEN): an in-app note EDIT (`update_note_inner`) upserted
+    /// the markdown + re-exported the vault `.md` but NEVER re-derived the meeting's chunks/vectors —
+    /// deleted text kept surfacing in semantic search (snippets read from `note_chunks` at hit time).
+    /// Deterministic via the injected-embedder seam (`update_note_inner_with`), the exact
+    /// `unseal_folder_extras` precedent: pre-fix the production body had NO re-index at all, so the
+    /// stale text stayed even with `Some(&StubEmbedder)` — RED. Also pins the model-ABSENT branch
+    /// (`None` ⇒ the index is untouched — never a stub vector).
+    #[test]
+    fn update_note_edit_reindexes_meeting_chunks_replacing_stale_text() {
+        let state = build_state("edit-reindex-meeting");
+        make_open_folder(&state.db, "f-edit", "Team");
+        seed_meeting(
+            &state.db,
+            "m1",
+            "# Plan\n\nzebrafish budget line for next quarter",
+            Some("f-edit"),
+        );
+        // Index the ORIGINAL note (the pipeline's job at summarize time).
+        let segments = state.db.get_segments("m1").unwrap();
+        state
+            .db
+            .index_meeting_chunks("m1", &segments, &crate::embed::StubEmbedder)
+            .unwrap();
+        let before = state.db.note_chunk_texts("m1").unwrap().join("\n");
+        assert!(
+            before.contains("zebrafish"),
+            "precondition: the original text is indexed"
+        );
+
+        // MODEL ABSENT (None): the save persists but the index is untouched (no chunk-only mode for
+        // meetings → any write would be a forbidden stub vector; mirrors the unseal/reindex policy).
+        update_note_inner_with(&state, "m1", "# Plan\n\ninterim model-less edit", None).unwrap();
+        let mid_pass = state.db.note_chunk_texts("m1").unwrap().join("\n");
+        assert!(
+            mid_pass.contains("zebrafish"),
+            "model-absent edit leaves the index untouched (never a stub vector)"
+        );
+
+        // MODEL PRESENT (Some): the edit re-derives the chunks — deleted text GONE, fresh text in.
+        update_note_inner_with(
+            &state,
+            "m1",
+            "# Plan\n\naardvark forecast line replaces it",
+            Some(&crate::embed::StubEmbedder),
+        )
+        .unwrap();
+        let after = state.db.note_chunk_texts("m1").unwrap().join("\n");
+        assert!(
+            !after.contains("zebrafish"),
+            "deleted note text must STOP surfacing (RED pre-fix: update_note_inner never re-indexed)"
+        );
+        assert!(
+            after.contains("aardvark"),
+            "the fresh markdown is indexed after the edit"
+        );
+        assert!(
+            state.db.note_vec_count("m1").unwrap() > 0,
+            "vectors refreshed alongside the chunks"
+        );
+    }
+
+    /// Brain v3 audit gap #1, the SEAL GATE leg: an edit made while a LOCKED folder is
+    /// session-unlocked re-seals the markdown (seal-on-write) but must NOT re-chunk the sealed
+    /// folder's plaintext — the edit re-index runs under the EMPTY unlock set, so a sealed folder
+    /// (even session-unlocked, plaintext restored — the worst case) is invisible to it. The
+    /// unlock/relock lifecycle owns those rows.
+    #[test]
+    fn update_note_edit_never_reindexes_sealed_folder_chunks() {
+        let state = build_state("edit-reindex-sealed-gate");
+        make_open_folder(&state.db, "f-lock", "Secret");
+        seed_meeting(&state.db, "m1", "T0 secret note", Some("f-lock"));
+        lock_folder_inner(&state, "f-lock".to_string()).unwrap();
+        assert_eq!(
+            state.db.note_chunk_count("m1").unwrap(),
+            0,
+            "purged on lock"
+        );
+
+        // Session-unlock + restore the note markdown exactly like `unlock_folder` does.
+        let ck = session_unlock(&state, "f-lock");
+        for n in state.db.notes_in_folder("f-lock").unwrap() {
+            if let Some(blob) = &n.content_blob {
+                let aad = aad_content("f-lock", &n.meeting_id, &n.provider_id, "note");
+                let pt = crate::crypto::decrypt(&ck, blob, &aad).unwrap();
+                state
+                    .db
+                    .restore_note_markdown(&n.meeting_id, &n.provider_id, &String::from_utf8(pt).unwrap())
+                    .unwrap();
+            }
+        }
+
+        // Edit while session-unlocked WITH the model "present" (stub injected): the write gate
+        // passes and the fresh markdown is re-sealed — but NO chunk/vector row may appear.
+        update_note_inner_with(
+            &state,
+            "m1",
+            "T1 secret edit under session unlock",
+            Some(&crate::embed::StubEmbedder),
+        )
+        .unwrap();
+        assert_eq!(
+            state.db.note_chunk_count("m1").unwrap(),
+            0,
+            "a sealed folder's edit never lands in note_chunks (empty-unlock-set gate)"
+        );
+        assert_eq!(
+            state.db.note_vec_count("m1").unwrap(),
+            0,
+            "…and never in vec_chunks"
+        );
+    }
+
+    /// Brain v3 audit gap #4 (RED-before-GREEN): a RENAME left the OLD title baked into every
+    /// chunk's header/augmented text/vector until a manual full reindex (`chunk_note` embeds
+    /// `<title> · <date>` into each chunk). Pre-fix `rename_meeting` only set the title + synced the
+    /// companion note — no re-index — so the old title stayed even with `Some(&StubEmbedder)`: RED.
+    #[test]
+    fn rename_meeting_refreshes_stale_chunk_titles() {
+        let state = build_state("rename-reindex");
+        make_open_folder(&state.db, "f-open", "Team");
+        // `seed_meeting` titles the meeting "Quarterly strategy".
+        seed_meeting(&state.db, "m1", "# Plan\n\nbudget details", Some("f-open"));
+        let segments = state.db.get_segments("m1").unwrap();
+        state
+            .db
+            .index_meeting_chunks("m1", &segments, &crate::embed::StubEmbedder)
+            .unwrap();
+        let before = state.db.note_chunk_texts("m1").unwrap().join("\n");
+        assert!(
+            before.contains("Quarterly strategy"),
+            "precondition: chunk headers carry the seeded title"
+        );
+
+        rename_meeting_inner(
+            &state,
+            "m1",
+            "Atlas kickoff renamed",
+            Some(&crate::embed::StubEmbedder),
+        )
+        .unwrap();
+
+        let after = state.db.note_chunk_texts("m1").unwrap().join("\n");
+        assert!(
+            after.contains("Atlas kickoff renamed"),
+            "chunk headers carry the NEW title (RED pre-fix: rename never re-indexed)"
+        );
+        assert!(
+            !after.contains("Quarterly strategy"),
+            "the OLD title is gone from every chunk"
+        );
+    }
+
+    /// Brain v3 flag-consistency (PR-1 finding 3): `reindex_meeting_after_edit` hardcoded `enabled=true`,
+    /// so an edit/rename with `semantic_search_enabled = false` + the model present STILL re-chunked the
+    /// meeting — the ONE meeting-index path ignoring the flag. Now it respects the flag exactly like the
+    /// repair tick + `should_auto_index`. RED-before-GREEN: restore the hardcoded `true` and the OFF-flag
+    /// edit re-derives the chunks (the assertion below that the ORIGINAL text survives untouched fails).
+    #[test]
+    fn edit_and_rename_reindex_respect_semantic_flag_off() {
+        let state = build_state("edit-rename-flag-off");
+        // Flag OFF: vectors are not retrieval-active, so an edit/rename must not re-chunk.
+        state.config.lock().unwrap().semantic_search_enabled = false;
+        make_open_folder(&state.db, "f-open", "Team");
+        seed_meeting(
+            &state.db,
+            "m1",
+            "# Plan\n\nzebrafish budget line for next quarter",
+            Some("f-open"),
+        );
+        let segments = state.db.get_segments("m1").unwrap();
+        state
+            .db
+            .index_meeting_chunks("m1", &segments, &crate::embed::StubEmbedder)
+            .unwrap();
+        let before = state.db.note_chunk_texts("m1").unwrap().join("\n");
+        assert!(before.contains("zebrafish"), "precondition: original indexed");
+
+        // EDIT with the model "present" (stub) but the flag OFF → index left untouched.
+        update_note_inner_with(
+            &state,
+            "m1",
+            "# Plan\n\naardvark forecast replaces it",
+            Some(&crate::embed::StubEmbedder),
+        )
+        .unwrap();
+        let after_edit = state.db.note_chunk_texts("m1").unwrap().join("\n");
+        assert!(
+            after_edit.contains("zebrafish") && !after_edit.contains("aardvark"),
+            "flag OFF: an edit must NOT re-chunk the meeting (RED pre-fix: hardcoded enabled=true)"
+        );
+
+        // RENAME likewise leaves the stale-title chunks untouched while the flag is OFF.
+        rename_meeting_inner(
+            &state,
+            "m1",
+            "Atlas kickoff renamed",
+            Some(&crate::embed::StubEmbedder),
+        )
+        .unwrap();
+        let after_rename = state.db.note_chunk_texts("m1").unwrap().join("\n");
+        assert!(
+            after_rename.contains("Quarterly strategy") && !after_rename.contains("Atlas kickoff renamed"),
+            "flag OFF: a rename must NOT re-chunk the meeting"
+        );
+
+        // Flip the flag ON → an edit re-derives again (proves the guard is the flag, not a no-op).
+        state.config.lock().unwrap().semantic_search_enabled = true;
+        update_note_inner_with(
+            &state,
+            "m1",
+            "# Plan\n\naardvark forecast replaces it",
+            Some(&crate::embed::StubEmbedder),
+        )
+        .unwrap();
+        let after_on = state.db.note_chunk_texts("m1").unwrap().join("\n");
+        assert!(
+            after_on.contains("aardvark") && !after_on.contains("zebrafish"),
+            "flag ON: the edit re-indexes as before"
+        );
+    }
+
+    /// Brain v3 audit gap #3 (RED-before-GREEN): the manual Reindex iterated `visible_document_ids`
+    /// with NO kind filter and chunked raw `documents.text` — for an authored note (`kind='note'`)
+    /// that raw text includes the YAML front-matter the note-save path deliberately strips
+    /// (`index_note_body_chunks` → `split_front_matter`). The fixed path routes `kind='note'` rows
+    /// through the stripping `index_note_chunks`; pre-fix the front-matter token landed in
+    /// `doc_chunks` — RED.
+    #[test]
+    fn reindex_strips_front_matter_from_authored_note_chunks() {
+        let state = build_state("reindex-kind-routing");
+        make_open_folder(&state.db, "f-notes", "Notes");
+        state
+            .db
+            .insert_note(
+                "n-fm",
+                "f-notes",
+                "plan",
+                "Plan",
+                "---\ntags: [zzfrontmattertag]\n---\n\nQuarterly zzbodytoken results paragraph.",
+                1,
+            )
+            .unwrap();
+        let empty: HashSet<String> = HashSet::new();
+        reindex_embeddings_inner(
+            &state.db,
+            &empty,
+            true,
+            &crate::embed::StubEmbedder,
+            |_, _| {},
+        )
+        .unwrap();
+        let chunks = state.db.doc_chunk_texts("n-fm").unwrap().join("\n");
+        assert!(
+            chunks.contains("zzbodytoken"),
+            "the note BODY is chunked by the reindex"
+        );
+        assert!(
+            !chunks.contains("zzfrontmattertag"),
+            "front-matter must NEVER reach an authored note's chunks (RED pre-fix: raw text was chunked)"
+        );
+    }
+
+    /// Brain v3 finding 4 (RED-before-GREEN): INGEST of a `kind='note'` via `import_text` raw-chunked
+    /// `documents.text`, so a pasted note with YAML front-matter got its tags/properties into
+    /// `doc_chunks` at ingest time — contradicting the "ONE routing seam" contract. The fix routes
+    /// ingest through `index_document_row_kind_routed` (front-matter stripped). RED pre-fix: the ingest
+    /// called raw `index_document_chunks` and the front-matter token landed in the chunks.
+    #[test]
+    fn ingest_note_strips_front_matter_from_chunks() {
+        let state = build_state("ingest-note-frontmatter");
+        make_open_folder(&state.db, "f-notes", "Notes");
+        let id = import_text_inner(
+            &state,
+            "pasted plan",
+            "---\ntags: [zzingestfmtag]\n---\n\nQuarterly zzingestbody results paragraph.",
+            "f-notes",
+        )
+        .unwrap();
+        let chunks = state.db.doc_chunk_texts(&id).unwrap().join("\n");
+        assert!(
+            chunks.contains("zzingestbody"),
+            "the pasted note BODY is chunked at ingest"
+        );
+        assert!(
+            !chunks.contains("zzingestfmtag"),
+            "front-matter must NEVER reach an ingested note's chunks (RED pre-fix: raw ingest chunking)"
+        );
+    }
+
+    /// Brain v3 audit gap #2 — the startup REPAIR TICK is complete and IDEMPOTENT:
+    /// - model-ABSENT pass: documents with no chunks get a chunk-only backfill (keyword retrieval
+    ///   works on a default install); meetings untouched (no chunk-only mode → stub vectors).
+    /// - model-PRESENT pass: chunked-but-vectorless docs re-embed, note-carrying meetings with no
+    ///   chunks index (note + transcript + vectors), kind-routing keeps front-matter out.
+    /// - re-run: full coverage ⇒ `(0, 0)` — a no-op.
+    #[test]
+    fn repair_tick_backfills_missing_indexes_idempotently() {
+        let state = build_state("repair-tick-idempotent");
+        make_open_folder(&state.db, "f-open", "Team");
+        seed_meeting(
+            &state.db,
+            "m1",
+            "# Plan\n\nquarterly zzmeetingtoken details",
+            Some("f-open"),
+        );
+        state
+            .db
+            .insert_document("d1", "f-open", "spec.md", "spec zzdoctoken body", "document", 1)
+            .unwrap();
+        state
+            .db
+            .insert_note(
+                "n1",
+                "f-open",
+                "note",
+                "Note",
+                "---\ntags: [zztickfmtag]\n---\n\nnote zznotetoken body",
+                1,
+            )
+            .unwrap();
+
+        // PASS 1 — MODEL ABSENT.
+        let (meetings, docs) =
+            backfill_missing_brain_indexes(&state.db, true, false, &crate::embed::StubEmbedder)
+                .unwrap();
+        assert_eq!(meetings, 0, "model absent: no meeting indexing (no stub vectors)");
+        assert_eq!(docs, 2, "model absent: both documents chunk-only backfilled");
+        let (d_chunks, d_vecs) = state.db.doc_chunk_vector_counts("d1").unwrap();
+        assert!(d_chunks > 0, "doc chunks present after the chunk-only pass");
+        assert_eq!(d_vecs, 0, "no vectors without the model");
+        assert_eq!(state.db.note_chunk_count("m1").unwrap(), 0);
+
+        // PASS 2 — MODEL PRESENT (the model-arrived-later recovery the audit gap describes).
+        let (meetings, docs) =
+            backfill_missing_brain_indexes(&state.db, true, true, &crate::embed::StubEmbedder)
+                .unwrap();
+        assert_eq!(meetings, 1, "the note-carrying meeting is indexed");
+        assert_eq!(docs, 2, "chunked-but-vectorless docs re-embed once the model arrives");
+        assert!(state.db.doc_chunk_vector_counts("d1").unwrap().1 > 0);
+        assert!(state.db.note_chunk_count("m1").unwrap() > 0);
+        assert!(state.db.note_vec_count("m1").unwrap() > 0);
+        // Kind routing respected (audit gap #3): the authored note's chunks carry no front-matter.
+        let note_chunks = state.db.doc_chunk_texts("n1").unwrap().join("\n");
+        assert!(note_chunks.contains("zznotetoken"));
+        assert!(!note_chunks.contains("zztickfmtag"));
+
+        // PASS 3 — IDEMPOTENT: full coverage ⇒ a re-run touches nothing.
+        let (meetings, docs) =
+            backfill_missing_brain_indexes(&state.db, true, true, &crate::embed::StubEmbedder)
+                .unwrap();
+        assert_eq!((meetings, docs), (0, 0), "re-run is a no-op");
+    }
+
+    /// Brain v3 audit gap #2, the FLAG leg: the tick is an AUTOMATIC index, so its meeting half
+    /// respects `semantic_search_enabled` exactly like the pipeline's `should_auto_index` and the
+    /// topic backfill — flag OFF ⇒ no meeting indexing even with the model present.
+    #[test]
+    fn repair_tick_meeting_half_respects_semantic_flag() {
+        let state = build_state("repair-tick-flag-off");
+        make_open_folder(&state.db, "f-open", "Team");
+        seed_meeting(&state.db, "m1", "# Plan\n\nnotes", Some("f-open"));
+        let (meetings, _docs) =
+            backfill_missing_brain_indexes(&state.db, false, true, &crate::embed::StubEmbedder)
+                .unwrap();
+        assert_eq!(
+            meetings, 0,
+            "flag OFF: an automatic tick never indexes meetings (should_auto_index posture)"
+        );
+        assert_eq!(state.db.note_chunk_count("m1").unwrap(), 0);
+    }
+
+    /// Brain v3 audit gap #2, the LOCK-DISCIPLINE leg (the consolidation invariant): the repair tick
+    /// reads with the EMPTY unlock set, so a SEALED folder's meeting is never touched — even in the
+    /// worst case where the folder is session-unlocked and its note plaintext is restored (a
+    /// live-unlock-set bug would index that plaintext; the empty set must not).
+    #[test]
+    fn repair_tick_never_touches_sealed_folder_even_mid_session_unlock() {
+        let state = build_state("repair-tick-sealed");
+        make_open_folder(&state.db, "f-lock", "Secret");
+        seed_meeting(&state.db, "m1", "# Secret\n\nzzsealedtoken plan", Some("f-lock"));
+        lock_folder_inner(&state, "f-lock".to_string()).unwrap();
+        assert_eq!(
+            state.db.note_chunk_count("m1").unwrap(),
+            0,
+            "purged on lock"
+        );
+
+        // Session-unlock (folder in the LIVE unlock set) + restore the note plaintext.
+        let ck = session_unlock(&state, "f-lock");
+        for n in state.db.notes_in_folder("f-lock").unwrap() {
+            if let Some(blob) = &n.content_blob {
+                let aad = aad_content("f-lock", &n.meeting_id, &n.provider_id, "note");
+                let pt = crate::crypto::decrypt(&ck, blob, &aad).unwrap();
+                state
+                    .db
+                    .restore_note_markdown(&n.meeting_id, &n.provider_id, &String::from_utf8(pt).unwrap())
+                    .unwrap();
+            }
+        }
+
+        let (meetings, docs) =
+            backfill_missing_brain_indexes(&state.db, true, true, &crate::embed::StubEmbedder)
+                .unwrap();
+        assert_eq!(
+            (meetings, docs),
+            (0, 0),
+            "a sealed folder's content is never touched — even while session-unlocked"
+        );
+        assert_eq!(
+            state.db.note_chunk_count("m1").unwrap(),
+            0,
+            "no chunks materialize for the sealed meeting"
+        );
+    }
+
     /// RELOCK re-purges the freshly-rebuilt meeting chunks: a lock → unlock (re-index) → relock cycle
     /// must leave ZERO meeting chunks/vectors at rest — `relock_folder` → `blank_sealed_notes_in_folders`
     /// → `purge_chunks_tx` covers the rows the unlock re-index rebuilt, so a re-sealed folder never
@@ -30949,6 +31629,74 @@ mod lifecycle_tests {
         );
     }
 
+    /// Brain v3 ORG PUSH SIZE PRE-CHECK (RED-before-GREEN): the server hard-caps an org item blob
+    /// at `MAX_ORG_ITEM_BLOB_BYTES` (1 MiB) — pre-fix an oversized share egressed the blob, got a
+    /// 413, landed `failed("upload_failed")`, and the launch sweep re-attempted it on EVERY start
+    /// (the poison loop; against this size-blind mock the sweep retry would even "succeed", which
+    /// is the RED shape). Post-fix: the share fails CLIENT-SIDE before any egress with the TERMINAL
+    /// `too_large` reason, and the sweep never requeues it.
+    #[test]
+    fn oversized_org_share_fails_terminal_too_large_and_sweep_never_requeues() {
+        let mock = MockOrgServer::start();
+        let state = build_state("org-share-too-large");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        make_open_folder(&state.db, "f-big", "Team");
+        // Plaintext > the cap ⇒ the sealed ciphertext (≥ plaintext) certainly exceeds it.
+        let big_body = format!(
+            "# Big\n\n{}",
+            "x".repeat(murmur_protocol::caps::MAX_ORG_ITEM_BLOB_BYTES + 64 * 1024)
+        );
+        state
+            .db
+            .insert_note("n-big", "f-big", "big", "Big", &big_body, 1)
+            .unwrap();
+        state.config.lock().unwrap().org_egress_consented = true;
+        state.config.lock().unwrap().share_base_url = mock.base.clone();
+        seed_live_session(&state);
+        seed_ock(&state, "org-1", 1);
+
+        // The share is refused client-side: no blob upload, no publish, terminal reason on the row.
+        let res = block_on(share_to_org_inner(
+            &state,
+            "org-1",
+            None,
+            Some("n-big".to_string()),
+            true,
+        ));
+        assert!(res.is_err(), "an oversized share is refused before any egress");
+        let rows = state.db.list_org_shares_for_org("org-1").unwrap();
+        assert_eq!(rows.len(), 1, "exactly one local row records the refusal");
+        assert_eq!(rows[0].state, "failed");
+        assert_eq!(
+            rows[0].last_error.as_deref(),
+            Some(ORG_SHARE_ERR_TOO_LARGE),
+            "the row carries the TERMINAL too_large reason"
+        );
+        assert!(rows[0].item_id.is_none(), "nothing was published");
+        assert!(
+            mock.log.lock().unwrap().published.is_empty(),
+            "the server never saw a publish"
+        );
+        let updated_at_before_sweep = rows[0].updated_at.clone();
+
+        // The launch sweep must NOT requeue it (RED pre-fix: every failed row was re-attempted).
+        let advanced = block_on(org_sweep_pending_inner(&state)).unwrap();
+        assert_eq!(advanced, 0, "too_large is TERMINAL for the sweep");
+        let row = &state.db.list_org_shares_for_org("org-1").unwrap()[0];
+        assert_eq!(row.state, "failed", "the row is left exactly where it was");
+        assert_eq!(row.last_error.as_deref(), Some(ORG_SHARE_ERR_TOO_LARGE));
+        // Binds the sweep EXCLUSION itself (not just the client-side refusal): a re-ATTEMPT would
+        // re-arm + re-fail the row, rewriting `updated_at` — a skipped row is byte-identical.
+        assert_eq!(
+            row.updated_at, updated_at_before_sweep,
+            "the sweep never even re-attempted the too_large row"
+        );
+        assert!(
+            mock.log.lock().unwrap().published.is_empty(),
+            "the sweep produced no egress for the oversized row"
+        );
+    }
+
     /// ITEM 2 — `org_resolve_source` maps an uploaded org item back to its LOCAL editable source, and
     /// returns `None` for an unknown item id (a colleague's item this device never published).
     #[test]
@@ -32805,6 +33553,15 @@ async fn collapse_org_share_dups_for_source(
     Ok(Some(keeper))
 }
 
+/// TERMINAL `org_shares.last_error` reason (Brain v3 org push size pre-check): the sealed
+/// ciphertext exceeds the server's per-item blob cap
+/// (`murmur_protocol::caps::MAX_ORG_ITEM_BLOB_BYTES`, 1 MiB). The launch sweep NEVER retries a row
+/// failed with this reason — retrying cannot shrink the content, so requeueing it every start was a
+/// poison loop (the server 413s forever). Recovery is content-driven: a manual re-share
+/// (`share_to_org_inner` reuses + re-arms the row) or an edit-save republish re-reads the trimmed
+/// source and clears the reason on success.
+pub(crate) const ORG_SHARE_ERR_TOO_LARGE: &str = "too_large";
+
 /// The org publish CORE, shared by the FIRST share (`share_to_org_inner`, `rev = 1`) and the
 /// re-publish-on-edit supersede (`republish_org_shares_for_source`, `rev = old_rev + 1`). It owns the
 /// FULL gate chain so a republish INHERITS it rather than re-implementing (the leak-safety single
@@ -32941,6 +33698,22 @@ pub(crate) async fn publish_org_body(
                 return Err(e);
             }
         };
+
+    // SIZE PRE-CHECK (Brain v3): the server hard-caps an org item blob at
+    // `MAX_ORG_ITEM_BLOB_BYTES` — an oversized ciphertext would 413 on EVERY attempt, and the
+    // launch sweep would requeue it forever (the poison loop). Fail CLIENT-SIDE, before any
+    // egress, with the TERMINAL `too_large` reason the sweep excludes from retry. Sizes only —
+    // never content.
+    if ciphertext.len() > murmur_protocol::caps::MAX_ORG_ITEM_BLOB_BYTES {
+        state
+            .db
+            .set_org_share_failed(&row_id, ORG_SHARE_ERR_TOO_LARGE, &now)?;
+        return Err(AppError::InvalidArg(format!(
+            "this item is too large to share ({} bytes sealed; the org limit is {} bytes) — shorten it and share again",
+            ciphertext.len(),
+            murmur_protocol::caps::MAX_ORG_ITEM_BLOB_BYTES
+        )));
+    }
 
     // (6) upload the ciphertext blob → publish the item. On failure, mark the row `failed` (the
     // launch sweep retries a `queued`/`failed` row later).
@@ -33210,6 +33983,23 @@ pub(crate) async fn republish_org_shares_for_source(
                     continue;
                 }
             };
+
+        // SIZE PRE-CHECK (Brain v3): oversized ciphertext would 413 forever — mark the row with
+        // the TERMINAL `too_large` reason (excluded from the launch sweep) instead of egressing.
+        // The OLD item stays live on the server (never tombstone-into-nothing); a later edit-save
+        // that shrinks the source re-enters via `org_shares_for_source` and heals the row.
+        if ciphertext.len() > murmur_protocol::caps::MAX_ORG_ITEM_BLOB_BYTES {
+            state
+                .db
+                .set_org_share_failed(&row.id, ORG_SHARE_ERR_TOO_LARGE, &now)?;
+            tracing::warn!(
+                target: "org",
+                sealed_bytes = ciphertext.len(),
+                cap_bytes = murmur_protocol::caps::MAX_ORG_ITEM_BLOB_BYTES,
+                "republish skipped: sealed item exceeds the org blob cap (terminal too_large)"
+            );
+            continue;
+        }
 
         // (6) upload → publish the NEW rev. On failure, mark the row `failed` (the launch sweep retries)
         // but do NOT tombstone (the OLD copy stays live — never leave the org with no copy).
@@ -33842,6 +34632,13 @@ pub(crate) async fn org_sweep_pending_inner(state: &AppState) -> Result<u32, App
     //    queueing NEVER egresses (the read-gate refuses → the row stays `failed`).
     for state_label in ["queued", "failed"] {
         for row in state.db.list_org_shares_in_state(state_label)? {
+            // Brain v3 size pre-check: `too_large` is TERMINAL for the sweep — retrying cannot
+            // shrink the content, so requeueing it every launch is exactly the poison loop the
+            // client-side cap check exists to kill. Recovery is content-driven (a manual re-share /
+            // an edit-save republish re-reads the possibly-trimmed source and re-arms the row).
+            if row.last_error.as_deref() == Some(ORG_SHARE_ERR_TOO_LARGE) {
+                continue;
+            }
             if row.item_id.is_some() {
                 // Was live before: this row's LAST attempt was a REPUBLISH (not the initial publish)
                 // and it failed — `set_org_share_failed` deliberately retains the OLD, still-server-live
