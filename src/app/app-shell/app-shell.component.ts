@@ -178,6 +178,12 @@ const INSIGHT_PATHS = NAV_GROUPS.filter((g) => g.collapsible).flatMap((g) =>
     // not this margin) for their own fixed-host offset — adding the margin
     // there too would desync the two.
     "[class.sidebar-visible]": "!inDrilldown() && !barMode()",
+    // True on drill-down routes (/settings, /org-item), where NO sidebar/pill
+    // chrome renders and `.main-col` spans from the window's LEFT edge —
+    // `mur-tab-strip` reads this via `:host-context` to reserve clearance for
+    // the overlay macOS traffic lights, which otherwise sit on the first tab
+    // (2026-07-17 fix; see tab-strip.component.scss).
+    "[class.drilldown]": "inDrilldown()",
     // (The former `notes-wide-route` binding is GONE, 2026-07-12: `.app-main`
     // is `max-width: none; width: 100%` for EVERY main route now — see the
     // `.app-main` comment in styles.css. Views that want a narrower reading
