@@ -11,6 +11,7 @@ import type {
   ClaimAlignment,
   LinkEdge,
   LinkKind,
+  SourceRef,
   WikiTarget,
   CompanionAppendResult,
   SourceKind,
@@ -1043,13 +1044,27 @@ export class IpcService {
     return invoke<void>("rename_meeting", { meetingId, title });
   }
 
-  /** Ask a grounded question about a meeting's transcript (chat with the meeting). */
+  /**
+   * Ask a grounded question about a meeting's transcript (chat with the meeting).
+   *
+   * `explicitSources` (source-scoped Brain) OPTIONALLY pins the answer to exactly
+   * the passed sources + their links (each `{kind, id}`; an extra `title` is
+   * ignored backend-side). Omitting it / `[]` / `null` keeps today's whole-vault
+   * behavior grounded on this meeting; a NON-empty array narrows the scope. Only
+   * sent when non-empty so existing callers are unaffected.
+   */
   chatMeeting(
     meetingId: string,
     question: string,
     history: ChatTurn[],
+    explicitSources?: SourceRef[],
   ): Promise<string> {
-    return invoke<string>("chat_meeting", { meetingId, question, history });
+    return invoke<string>("chat_meeting", {
+      meetingId,
+      question,
+      history,
+      ...(explicitSources?.length ? { explicitSources } : {}),
+    });
   }
 
   /** Built-in recipe templates (quick chips). */
@@ -1560,15 +1575,25 @@ export class IpcService {
    * 12 messages — send the full conversation and let it truncate; do NOT
    * trim FE-side.
    */
+  /**
+   * Ask a grounded question across the whole vault. `explicitSources`
+   * (source-scoped Brain) OPTIONALLY pins the answer to exactly the passed
+   * sources + their links (each `{kind, id}`; an extra `title` is ignored
+   * backend-side). Omitting it / `[]` / `null` keeps today's whole-vault
+   * behavior; a NON-empty array narrows the scope. Only sent when non-empty so
+   * existing callers are unaffected.
+   */
   askVault(
     question: string,
     history: ChatTurn[],
     askThreadId?: string,
+    explicitSources?: SourceRef[],
   ): Promise<AskVaultResult> {
     return invoke<AskVaultResult>("ask_vault", {
       question,
       history,
       askThreadId,
+      ...(explicitSources?.length ? { explicitSources } : {}),
     });
   }
 
@@ -2038,12 +2063,14 @@ export class IpcService {
     threadId?: string,
     anchorText?: string,
     meetingId?: string,
+    explicitSources?: SourceRef[],
   ): Promise<VoiceActionResultPayload> {
     return invoke<VoiceActionResultPayload>("ask_assistant_chat", {
       messages,
       threadId,
       anchorText,
       meetingId,
+      ...(explicitSources?.length ? { explicitSources } : {}),
     });
   }
 

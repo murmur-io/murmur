@@ -101,6 +101,15 @@
     }
   </div>
 
+  <!-- Source-scoped Brain: pick which notes/meetings ground the answer (pre-filled
+       with this meeting + its active links). Empty ⇒ the whole-meeting default. -->
+  <mur-source-picker
+    class="chat-sources"
+    [(selected)]="sources"
+    triggerLabel="Sources"
+    placeholder="Scope to a note or meeting…"
+  />
+
   <!-- Composer: textarea (Enter sends · Shift+Enter newline) + Send. -->
   <form class="chat-composer" (submit)="onSubmit($event)">
     <textarea
