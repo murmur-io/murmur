@@ -144,7 +144,12 @@ pub struct KeyGrantsResponse {
 #[serde(rename_all = "camelCase")]
 pub struct PublishItemRequest {
     pub blob_id: String,
-    /// SHA-256 of the CIPHERTEXT blob (integrity + client-side self-share dedup; content-free).
+    /// SHA-256 of the canonical PLAINTEXT envelope — NOT the ciphertext (see
+    /// `OrgEnvelope::content_sha256`, `share/org_envelope.rs`). It is the content-free self-share
+    /// dedup key AND the per-item AAD nonce source (`org_item_nonce(content_sha256)`): the publisher
+    /// seals under `hex(plaintext-sha)` and every consumer re-derives the SAME value from the feed,
+    /// so a cross-member open succeeds. Do NOT "fix" this to a ciphertext hash — that would break the
+    /// deterministic AAD and make every shared item undecryptable.
     #[serde(with = "b64")]
     pub content_sha256: Vec<u8>,
     pub rev: u32,
