@@ -8955,49 +8955,77 @@ impl Db {
     /// slash-menu link-insertion autocomplete (distinct from [`resolve_wikilink`]'s exact-title
     /// resolve and from `gather_note_enhance_citations`'s SELECTION+semantic retrieval — this is a
     /// lightweight `LIKE prefix%` title scan, the right shape for filtering-as-you-type). GATED
-    /// identically to every other title/content read: `visibility_clause` on both legs, so a
-    /// sealed-and-not-session-unlocked note/meeting never appears as a candidate. An empty/blank
-    /// `prefix` returns the most-recently-updated visible notes+meetings (so the popover has
-    /// something to show the instant it opens, before the user has typed anything). Capped at
-    /// `limit` total rows across BOTH kinds, notes first (mirrors `resolve_wikilink`'s note-first
-    /// preference), newest-updated first within each kind.
+    /// identically to every other title/content read: `visibility_clause` on both legs — on the
+    /// page queries AND their COUNT twins — so a sealed-and-not-session-unlocked note/meeting
+    /// neither appears as a candidate nor inflates the pagination totals. An empty/blank `prefix`
+    /// returns the most-recently-updated visible notes+meetings (so the popover has something to
+    /// show the instant it opens, before the user has typed anything).
+    ///
+    /// PAGINATED (2026-07-17 — the picker scrolls the whole vault now, not a fixed top-8):
+    /// returns the `limit`-sized page starting at `offset` of ONE stable combined ordering,
+    /// [all matching notes, newest-updated first] ++ [all matching meetings, newest-started
+    /// first] (notes first mirrors `resolve_wikilink`'s note-first preference), plus the TOTAL
+    /// number of matching local rows across both legs — `commands::list_link_candidates` needs
+    /// that total to know how far into the org (Shared Brain) leg it folds in after the local
+    /// rows that earlier pages have already consumed. Both legs run under ONE connection lock so
+    /// the counts and the page rows are a single consistent snapshot.
     pub fn list_link_candidates_visible(
         &self,
         prefix: &str,
         limit: i64,
+        offset: i64,
         unlocked: &HashSet<String>,
-    ) -> Result<Vec<NoteCitation>> {
+    ) -> Result<(Vec<NoteCitation>, i64)> {
         let prefix = prefix.trim();
+        let limit = limit.max(0);
+        let offset = offset.max(0);
+        // `None` ⇒ the `:pat IS NULL` arm short-circuits the LIKE, so ONE SQL string serves
+        // both the empty-prefix (recency browse) and the typed-prefix (filter) shapes.
+        let pat: Option<String> = if prefix.is_empty() {
+            None
+        } else {
+            Some(format!("{}%", escape_like(prefix)))
+        };
         let mut out: Vec<NoteCitation> = Vec::new();
+        let conn = self.lock();
 
-        // Notes leg.
-        {
-            let conn = self.lock();
-            let visible = visibility_clause("f", unlocked);
-            let like_pred = if prefix.is_empty() {
-                String::new()
-            } else {
-                " AND COALESCE(NULLIF(TRIM(d.title), ''), d.name) LIKE ?2 ESCAPE '\\'".to_string()
-            };
+        // Notes leg — the COUNT twin shares the page query's exact WHERE body, so the
+        // offset arithmetic below can never drift from what the page query returns.
+        let visible_notes = visibility_clause("f", unlocked);
+        let notes_where = format!(
+            "d.kind = 'note' AND {visible_notes}
+             AND (:pat IS NULL OR COALESCE(NULLIF(TRIM(d.title), ''), d.name) LIKE :pat ESCAPE '\\')"
+        );
+        let note_count: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*)
+                       FROM documents d
+                       JOIN folders f ON f.id = d.folder_id
+                      WHERE {notes_where}"
+                ),
+                rusqlite::named_params! { ":pat": pat },
+                |r| r.get(0),
+            )
+            .map_err(map_err)?;
+        if offset < note_count && (out.len() as i64) < limit {
             let sql = format!(
                 "SELECT d.id, COALESCE(NULLIF(TRIM(d.title), ''), d.name)
                    FROM documents d
                    JOIN folders f ON f.id = d.folder_id
-                  WHERE d.kind = 'note' AND {visible}{like_pred}
+                  WHERE {notes_where}
                   ORDER BY d.updated_at DESC, d.id ASC
-                  LIMIT ?1"
+                  LIMIT :limit OFFSET :offset"
             );
             let mut stmt = conn.prepare(&sql).map_err(map_err)?;
-            let map_row = |r: &Row<'_>| -> rusqlite::Result<(String, String)> {
-                Ok((r.get(0)?, r.get(1)?))
-            };
-            let rows = if prefix.is_empty() {
-                stmt.query_map(rusqlite::params![limit], map_row)
-            } else {
-                let pat = format!("{}%", escape_like(prefix));
-                stmt.query_map(rusqlite::params![limit, pat], map_row)
-            }
-            .map_err(map_err)?;
+            let rows = stmt
+                .query_map(
+                    rusqlite::named_params! { ":pat": pat, ":limit": limit, ":offset": offset },
+                    |r: &Row<'_>| -> rusqlite::Result<(String, String)> {
+                        Ok((r.get(0)?, r.get(1)?))
+                    },
+                )
+                .map_err(map_err)?;
             for r in rows {
                 let (id, title) = r.map_err(map_err)?;
                 out.push(NoteCitation {
@@ -9009,42 +9037,52 @@ impl Db {
             }
         }
 
-        // Meetings leg (only if the notes leg hasn't already filled the cap).
-        if (out.len() as i64) < limit {
-            let remaining = limit - out.len() as i64;
-            let conn = self.lock();
-            let visible = visibility_clause("n", unlocked);
-            let like_pred = if prefix.is_empty() {
-                String::new()
-            } else {
-                " AND m.title LIKE ?2 ESCAPE '\\'".to_string()
-            };
+        // Meetings leg — starts where the notes leg ends in the combined ordering: pages
+        // that fell entirely inside the notes leg read meetings from offset 0; pages past
+        // it skip exactly the meeting rows earlier pages consumed.
+        let visible_meetings = visibility_clause("n", unlocked);
+        let meetings_where = format!(
+            "m.title IS NOT NULL AND TRIM(m.title) != ''
+             AND (:pat IS NULL OR m.title LIKE :pat ESCAPE '\\')
+             AND (
+               NOT EXISTS (SELECT 1 FROM notes nn WHERE nn.meeting_id = m.id)
+               OR EXISTS (
+                 SELECT 1 FROM notes n
+                  LEFT JOIN folders f ON f.id = n.folder_id
+                  WHERE n.meeting_id = m.id AND {visible_meetings}
+               )
+             )"
+        );
+        let meeting_count: i64 = conn
+            .query_row(
+                &format!("SELECT COUNT(*) FROM meetings m WHERE {meetings_where}"),
+                rusqlite::named_params! { ":pat": pat },
+                |r| r.get(0),
+            )
+            .map_err(map_err)?;
+        let remaining = limit - out.len() as i64;
+        let meeting_offset = (offset - note_count).max(0);
+        if remaining > 0 && meeting_offset < meeting_count {
             let sql = format!(
                 "SELECT m.id, m.title
                    FROM meetings m
-                  WHERE m.title IS NOT NULL AND TRIM(m.title) != ''{like_pred}
-                    AND (
-                      NOT EXISTS (SELECT 1 FROM notes nn WHERE nn.meeting_id = m.id)
-                      OR EXISTS (
-                        SELECT 1 FROM notes n
-                         LEFT JOIN folders f ON f.id = n.folder_id
-                         WHERE n.meeting_id = m.id AND {visible}
-                      )
-                    )
+                  WHERE {meetings_where}
                   ORDER BY m.started_at DESC, m.id DESC
-                  LIMIT ?1"
+                  LIMIT :limit OFFSET :offset"
             );
             let mut stmt = conn.prepare(&sql).map_err(map_err)?;
-            let map_row = |r: &Row<'_>| -> rusqlite::Result<(String, Option<String>)> {
-                Ok((r.get(0)?, r.get(1)?))
-            };
-            let rows = if prefix.is_empty() {
-                stmt.query_map(rusqlite::params![remaining], map_row)
-            } else {
-                let pat = format!("{}%", escape_like(prefix));
-                stmt.query_map(rusqlite::params![remaining, pat], map_row)
-            }
-            .map_err(map_err)?;
+            let rows = stmt
+                .query_map(
+                    rusqlite::named_params! {
+                        ":pat": pat,
+                        ":limit": remaining,
+                        ":offset": meeting_offset,
+                    },
+                    |r: &Row<'_>| -> rusqlite::Result<(String, Option<String>)> {
+                        Ok((r.get(0)?, r.get(1)?))
+                    },
+                )
+                .map_err(map_err)?;
             for r in rows {
                 let (id, title) = r.map_err(map_err)?;
                 out.push(NoteCitation {
@@ -9055,7 +9093,7 @@ impl Db {
                 });
             }
         }
-        Ok(out)
+        Ok((out, note_count + meeting_count))
     }
 
     /// The latest visible note for a meeting (MCP `get_meeting`); `None` if the meeting's note
@@ -14919,8 +14957,8 @@ mod tests {
         let nothing = std::collections::HashSet::new();
 
         // "Alp" matches "Alpha Project" (note) and "Alpine Standup" (meeting), not "Alternate Plan".
-        let hits = db
-            .list_link_candidates_visible("Alp", 10, &nothing)
+        let (hits, total) = db
+            .list_link_candidates_visible("Alp", 10, 0, &nothing)
             .unwrap();
         let titles: Vec<&str> = hits.iter().map(|c| c.title.as_str()).collect();
         assert!(titles.contains(&"Alpha Project"));
@@ -14928,25 +14966,90 @@ mod tests {
         assert!(!titles.contains(&"Alternate Plan"));
         // Notes leg is queried first (mirrors `resolve_wikilink`'s note-first preference).
         assert_eq!(hits[0].kind, "note");
+        assert_eq!(total, 2, "local total counts exactly the matching rows");
 
         // Case-insensitive (SQLite LIKE is ASCII-case-insensitive by default, same as the
         // existing `search_snippet`/path LIKE readers in this file).
-        let ci = db
-            .list_link_candidates_visible("alp", 10, &nothing)
+        let (ci, _) = db
+            .list_link_candidates_visible("alp", 10, 0, &nothing)
             .unwrap();
         assert_eq!(ci.len(), hits.len());
 
         // Empty prefix returns everything (capped), not nothing.
-        let all = db
-            .list_link_candidates_visible("", 10, &nothing)
+        let (all, _) = db
+            .list_link_candidates_visible("", 10, 0, &nothing)
             .unwrap();
         assert!(all.len() >= 3, "empty prefix should list existing candidates");
 
-        // A cap of 1 returns exactly 1 row (notes leg fills it before the meetings leg runs).
-        let capped = db
-            .list_link_candidates_visible("Alp", 1, &nothing)
+        // A cap of 1 returns exactly 1 row (notes leg fills it before the meetings leg runs) —
+        // while the reported total still spans BOTH legs (it feeds the org-leg offset math).
+        let (capped, capped_total) = db
+            .list_link_candidates_visible("Alp", 1, 0, &nothing)
             .unwrap();
         assert_eq!(capped.len(), 1);
+        assert_eq!(capped_total, 2);
+    }
+
+    /// PAGINATION: `offset` walks the ONE combined [notes ++ meetings] ordering without
+    /// duplicating or skipping rows across page boundaries — including the page that straddles
+    /// the notes→meetings seam — and runs dry with an empty page past the end.
+    #[test]
+    fn list_link_candidates_paginates_across_the_notes_meetings_seam() {
+        let db = mem_db();
+        seed_folder(&db, "f-open", "Open");
+
+        // 3 notes (newest-updated first: n3, n2, n1) + 2 meetings (newest-started first: m2, m1).
+        for (id, name, title, at) in [
+            ("n1", "one", "Note One", 1_000i64),
+            ("n2", "two", "Note Two", 2_000),
+            ("n3", "three", "Note Three", 3_000),
+        ] {
+            db.insert_note(id, "f-open", name, title, "body", at).unwrap();
+        }
+        for (id, started, title) in [
+            ("m1", "2026-06-20T10:00:00Z", "Meeting One"),
+            ("m2", "2026-06-24T10:00:00Z", "Meeting Two"),
+        ] {
+            let mut m = sample_meeting(id, started);
+            m.title = Some(title.to_string());
+            db.insert_meeting(&m).unwrap();
+            note_for(&db, id, "claude_code", "note");
+            db.set_note_folder(id, Some("f-open")).unwrap();
+        }
+
+        let nothing = std::collections::HashSet::new();
+        let page = |offset: i64| {
+            db.list_link_candidates_visible("", 2, offset, &nothing)
+                .unwrap()
+        };
+
+        // Page 0: the two newest notes. Total spans both legs on every page.
+        let (p0, total) = page(0);
+        assert_eq!(
+            p0.iter().map(|c| c.title.as_str()).collect::<Vec<_>>(),
+            vec!["Note Three", "Note Two"]
+        );
+        assert_eq!(total, 5);
+
+        // Page 1 straddles the seam: the last note, then the newest meeting.
+        let (p1, _) = page(2);
+        assert_eq!(
+            p1.iter()
+                .map(|c| (c.kind.as_str(), c.title.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("note", "Note One"), ("meeting", "Meeting Two")]
+        );
+
+        // Page 2: entirely inside the meetings leg.
+        let (p2, _) = page(4);
+        assert_eq!(
+            p2.iter().map(|c| c.title.as_str()).collect::<Vec<_>>(),
+            vec!["Meeting One"]
+        );
+
+        // Past the end: an empty page, never an error (the FE's "has more" probe).
+        let (p3, _) = page(5);
+        assert!(p3.is_empty());
     }
 
     /// GATED: a sealed-and-not-session-unlocked note/meeting never appears as a link candidate,
@@ -14977,20 +15080,25 @@ mod tests {
         db.set_note_folder("m-secret", Some("f-locked")).unwrap();
 
         let nothing = std::collections::HashSet::new();
-        let hidden = db
-            .list_link_candidates_visible("Secret", 10, &nothing)
+        let (hidden, hidden_total) = db
+            .list_link_candidates_visible("Secret", 10, 0, &nothing)
             .unwrap();
         assert!(
             hidden.is_empty(),
             "sealed-and-not-unlocked note/meeting must not be a link candidate"
         );
+        assert_eq!(
+            hidden_total, 0,
+            "the pagination total must not leak that sealed rows exist"
+        );
 
         let mut unlocked = std::collections::HashSet::new();
         unlocked.insert("f-locked".to_string());
-        let visible = db
-            .list_link_candidates_visible("Secret", 10, &unlocked)
+        let (visible, visible_total) = db
+            .list_link_candidates_visible("Secret", 10, 0, &unlocked)
             .unwrap();
         assert_eq!(visible.len(), 2, "unlocking reveals both the note and the meeting");
+        assert_eq!(visible_total, 2);
     }
 
     /// FAIL-CLOSED: a correction row with a NULL `meeting_id` (legacy/unattributed) is never returned

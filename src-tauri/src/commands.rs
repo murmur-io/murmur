@@ -7315,25 +7315,36 @@ pub fn resolve_wikilink(
 /// (note-editor Fix 2). Distinct from [`resolve_wikilink`] (exact-title resolve on Enter/click) and
 /// from `note_assistant_action`'s `find_related` (SELECTION+semantic retrieval — the wrong shape
 /// for filtering on a short, growing keystroke prefix): this is a lightweight, gated title-prefix
-/// scan, capped at `MAX_LINK_CANDIDATES` total rows across notes + meetings + (when joined) the
-/// Shared Brain. GATED exactly like every other content read: notes/meetings go through
+/// scan. GATED exactly like every other content read: notes/meetings go through
 /// `Db::list_link_candidates_visible` (`visibility_clause` on both legs, same as `resolve_wikilink`);
 /// org items go through `search_org_brain_hits`, the SAME retrieval-only, membership+enabled-gated,
 /// zero-egress reader `find_related` already uses (never a provider/egress call). Reuses
 /// [`crate::storage::models::NoteCitation`] — the popover renders it exactly like a `find_related`
 /// citation row, and `kind == "org"` carries an org item id (never a local id), matching that
 /// contract verbatim.
+///
+/// PAGINATED (2026-07-17 — the picker is an infinite scroll over the whole vault now, not a fixed
+/// top-8): one call returns the `limit`-sized page at `offset` of the stable combined ordering
+/// [visible notes] ++ [visible meetings] ++ [org hits] (org only for a non-empty prefix, folded in
+/// after the local total the Db reader reports). The FE owns its page size; the clamp keeps one
+/// IPC reply from ever dumping an unbounded slice of the vault.
 #[tauri::command]
 pub fn list_link_candidates(
     state: State<'_, AppState>,
     prefix: String,
+    offset: Option<u32>,
+    limit: Option<u32>,
 ) -> Result<Vec<crate::storage::models::NoteCitation>, AppError> {
-    const MAX_LINK_CANDIDATES: i64 = 8;
+    const DEFAULT_PAGE: i64 = 40;
+    const MAX_PAGE: i64 = 100;
+    let limit = limit.map_or(DEFAULT_PAGE, i64::from).clamp(1, MAX_PAGE);
+    let offset = i64::from(offset.unwrap_or(0));
     let unlocked = unlocked_snapshot(state.inner())?;
-    let mut out = state
-        .db
-        .list_link_candidates_visible(&prefix, MAX_LINK_CANDIDATES, &unlocked)?;
-    if (out.len() as i64) < MAX_LINK_CANDIDATES {
+    let (mut out, local_total) =
+        state
+            .db
+            .list_link_candidates_visible(&prefix, limit, offset, &unlocked)?;
+    if (out.len() as i64) < limit {
         let config = {
             state
                 .config
@@ -7343,9 +7354,14 @@ pub fn list_link_candidates(
         };
         let q = prefix.trim();
         if !q.is_empty() && crate::tools::org_brain_available(&state.db, &config) {
-            let remaining = (MAX_LINK_CANDIDATES - out.len() as i64).max(0) as usize;
+            // Earlier pages consumed `local_total` local rows, then `offset - local_total`
+            // org rows once the offset ran past the local legs — skip exactly those. The
+            // org reader is bounded (≤20 per leg pre-fusion), so skip/take over its Vec
+            // is real pagination, not a hidden re-scan.
+            let org_skip = (offset - local_total).max(0) as usize;
+            let remaining = (limit - out.len() as i64).max(0) as usize;
             let org_hits = crate::tools::search_org_brain_hits(&state.db, &config, q)?;
-            for hit in org_hits.into_iter().take(remaining) {
+            for hit in org_hits.into_iter().skip(org_skip).take(remaining) {
                 out.push(crate::storage::models::NoteCitation {
                     kind: "org".into(),
                     id: hit.item_id,
