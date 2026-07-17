@@ -241,13 +241,13 @@ fn tools_spec() -> Value {
         },
         {
             "name": "get_meeting",
-            "description": "Get a meeting's AI note (summary) and full transcript by id (from a search hit labelled 'meeting:...'). The transcript is STRUCTURED by default — one line per segment, '[<start_s>–<end_s>] <Speaker>: <text>' with Me/Others/Unknown speakers and raw-second timestamps; pass transcriptFormat 'plain' for the old flat text.",
-            "inputSchema": { "type": "object", "properties": { "meetingId": { "type": "string" }, "transcriptFormat": { "type": "string", "enum": ["structured", "plain"], "description": "Transcript rendering (default 'structured')." } }, "required": ["meetingId"] }
+            "description": "Get a meeting's AI note (summary) and full transcript by id (from a search hit labelled 'meeting:...'). The transcript is STRUCTURED by default — one line per segment, '[<start_s>–<end_s>] <Speaker>: <text>' with Me/Others/Unknown speakers and raw-second timestamps; pass transcriptFormat 'plain' for the old flat text. For a very long transcript, page through it with offset + maxChars.",
+            "inputSchema": { "type": "object", "properties": { "meetingId": { "type": "string" }, "transcriptFormat": { "type": "string", "enum": ["structured", "plain"], "description": "Transcript rendering (default 'structured')." }, "offset": { "type": "number", "description": "Chars to skip into the transcript (default 0)." }, "maxChars": { "type": "number", "description": "Max transcript chars to return from offset (default all)." } }, "required": ["meetingId"] }
         },
         {
             "name": "get_document",
-            "description": "Get the full body of one standalone note or imported/uploaded document by id (from a search hit labelled 'document:...'). Use this — not get_meeting — for ids from the DOCUMENTS section of a search result.",
-            "inputSchema": { "type": "object", "properties": { "documentId": { "type": "string" } }, "required": ["documentId"] }
+            "description": "Get the full body of one standalone note or imported/uploaded document by id (from a search hit labelled 'document:...'). Use this — not get_meeting — for ids from the DOCUMENTS section of a search result. For a big document, page through it with offset + maxChars.",
+            "inputSchema": { "type": "object", "properties": { "documentId": { "type": "string" }, "offset": { "type": "number", "description": "Chars to skip into the body (default 0)." }, "maxChars": { "type": "number", "description": "Max body chars to return from offset (default all)." } }, "required": ["documentId"] }
         },
         {
             "name": "list_recent_meetings",
@@ -321,6 +321,15 @@ fn handle_tool_call(
 /// so a sealed-and-not-unlocked meeting is invisible to all of them. JSON-RPC error codes for the
 /// transport concerns (unknown tool, missing required arg) are produced HERE; runtime tool failures
 /// map to `-32000` exactly as before. Returns the tool's text payload or a `(code, message)` error.
+/// Brain v3 PR-2 — read an optional non-negative integer MCP arg (agent paging). Absent / non-numeric
+/// → 0 (the DEFAULT, mapped to today's byte-identical behavior by the tool).
+fn mcp_usize_arg(args: &Value, key: &str) -> usize {
+    args.get(key)
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .min(usize::MAX as u64) as usize
+}
+
 fn dispatch_tool(
     db: &Db,
     name: &str,
@@ -357,6 +366,9 @@ fn dispatch_tool(
                 .filter(|f| *f == "plain")
                 .unwrap_or("structured")
                 .to_string(),
+            // Brain v3 PR-2 — agent paging (absent → 0 → today's behavior).
+            offset: mcp_usize_arg(args, "offset"),
+            max_chars: mcp_usize_arg(args, "maxChars"),
         },
         "get_document" => ToolCall::GetDocument {
             document_id: args
@@ -364,6 +376,8 @@ fn dispatch_tool(
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string(),
+            offset: mcp_usize_arg(args, "offset"),
+            max_chars: mcp_usize_arg(args, "maxChars"),
         },
         "list_recent_meetings" => ToolCall::ListRecentMeetings {
             limit: args

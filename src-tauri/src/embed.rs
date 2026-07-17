@@ -601,6 +601,259 @@ pub fn chunk_note(title: &str, date: &str, markdown: &str) -> Vec<String> {
     chunks
 }
 
+// ── Brain v3 PR-2 — HIERARCHICAL document chunking ───────────────────────────────────────────────
+//
+// A document extracted into [`crate::extract::ExtractedBlock`]s becomes a 3-level tree persisted in
+// the SAME `doc_chunks` table (see `Db::index_document_chunks`):
+//   - L0 leaves: 800-char paragraph-greedy chunks that NEVER cross a heading boundary — embedded
+//     (with a deterministic contextual header) AND FTS-indexed.
+//   - L1 section-parents: one per heading section, heading-bounded, capped ~6000 chars — FTS +
+//     fetch-by-id ONLY, NOT embedded (the vector count stays flat; parents are pulled by expansion).
+//   - L2 doc-summary: a deterministic outline (heading tree + first sentence per section, 1..=3
+//     chunks) — embedded + FTS (the RAPTOR collapsed-tree effect at ZERO LLM cost).
+// The contextual header extends the shipped `chunk_note` header mechanism (Anthropic contextual
+// retrieval): every embed-text is prefixed `"<name> | <section_path> | p.<N>"\n<raw>` so a chunk
+// carries its provenance into both the vector and the FTS legs, while the RAW text is kept separate
+// for snippet display.
+
+/// L1 section-parent cap (chars). Heading-bounded parents beyond this are truncated for the FTS/fetch
+/// row (the leaves under them still carry the full text).
+const SECTION_PARENT_CHAR_CAP: usize = 6000;
+
+/// Level tag for a [`HierChunk`]: 0 = leaf, 1 = section-parent, 2 = doc-summary.
+pub const HIER_LEVEL_LEAF: i64 = 0;
+pub const HIER_LEVEL_SECTION: i64 = 1;
+pub const HIER_LEVEL_SUMMARY: i64 = 2;
+
+/// One node of a document's chunk hierarchy, ready to persist into `doc_chunks` (+ its `doc_vec_chunks`
+/// row when `embed`-worthy). Pure data — the DB layer assigns row ids and resolves `parent` indices to
+/// row ids.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HierChunk {
+    /// [`HIER_LEVEL_LEAF`] / [`HIER_LEVEL_SECTION`] / [`HIER_LEVEL_SUMMARY`].
+    pub level: i64,
+    /// Index (into the produced `Vec<HierChunk>`) of this chunk's parent, or `None`. A leaf points at
+    /// its L1 section; L1/L2 have no parent. The DB layer maps these indices to inserted row ids.
+    pub parent: Option<usize>,
+    /// The RAW chunk text (for snippet display + the FTS/`text` column).
+    pub raw: String,
+    /// The EMBED text: the contextual header + raw (what actually gets vectorized, for L0/L2).
+    pub embed_text: String,
+    /// Heading trail this chunk sits under ("A › B"), or `None`.
+    pub section_path: Option<String>,
+    /// 1-based page/slide, or `None` (flow formats).
+    pub page_no: Option<u32>,
+    /// Whether this level is EMBEDDED (L0 + L2 true; L1 false). The DB layer skips a `doc_vec_chunks`
+    /// row when false — this is what keeps L1 parents FTS-only.
+    pub embed: bool,
+}
+
+/// The deterministic contextual header prefixed onto a leaf/summary's embed-text:
+/// `"<name> | <section_path> | p.<N>"` (empty components omitted). Extends `chunk_note`'s
+/// `<title> · <date>` provenance mechanism to documents.
+fn hier_header(name: &str, section_path: Option<&str>, page_no: Option<u32>) -> String {
+    let mut parts: Vec<String> = Vec::with_capacity(3);
+    let name = name.trim();
+    if !name.is_empty() {
+        parts.push(name.to_string());
+    }
+    if let Some(sp) = section_path {
+        let sp = sp.trim();
+        if !sp.is_empty() {
+            parts.push(sp.to_string());
+        }
+    }
+    if let Some(p) = page_no {
+        parts.push(format!("p.{p}"));
+    }
+    parts.join(" | ")
+}
+
+/// Prefix `raw` with the contextual header for embedding (the header rides the embedding AND the FTS
+/// text). A leaf with no header context embeds the raw text unchanged.
+fn hier_embed_text(name: &str, section_path: Option<&str>, page_no: Option<u32>, raw: &str) -> String {
+    let header = hier_header(name, section_path, page_no);
+    if header.is_empty() {
+        raw.to_string()
+    } else {
+        format!("{header}\n{raw}")
+    }
+}
+
+/// Greedily pack blank-line-separated paragraphs of `text` into ≤[`CHUNK_CHAR_TARGET`] leaf strings
+/// (the SAME sizing as `chunk_note`, minus the header — the header is added per-leaf later). A single
+/// oversized paragraph becomes its own leaf.
+fn pack_leaves(text: &str) -> Vec<String> {
+    let paragraphs: Vec<&str> = text
+        .split("\n\n")
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .collect();
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for p in paragraphs {
+        if !cur.is_empty() && cur.len() + 1 + p.len() > CHUNK_CHAR_TARGET {
+            out.push(std::mem::take(&mut cur));
+        }
+        if !cur.is_empty() {
+            cur.push('\n');
+        }
+        cur.push_str(p);
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// The first sentence of `text` (up to the first `. ! ?` followed by whitespace/end, capped so a
+/// run-on line can't dominate the outline). Deterministic; used to build the L2 outline summary.
+fn first_sentence(text: &str) -> String {
+    const CAP: usize = 240;
+    let text = text.trim();
+    let bytes = text.as_bytes();
+    let mut end = text.len();
+    for (i, &b) in bytes.iter().enumerate() {
+        if (b == b'.' || b == b'!' || b == b'?')
+            && bytes.get(i + 1).map(|c| c.is_ascii_whitespace()).unwrap_or(true)
+        {
+            end = i + 1;
+            break;
+        }
+    }
+    // `end` is a byte index at an ASCII sentence terminator (or the full byte len) — always a char
+    // boundary, so `&text[..end]` is safe. Then char-cap so a run-on line can't dominate the outline.
+    text[..end].chars().take(CAP).collect::<String>().trim().to_string()
+}
+
+/// A running heading section being assembled by [`chunk_document_hierarchical`].
+struct Section {
+    path: Option<String>,
+    page_no: Option<u32>,
+    /// Accumulated raw block texts (joined by blank lines for leaf packing).
+    body: String,
+}
+
+/// Turn a document's extracted `blocks` into the full 3-level [`HierChunk`] tree. Deterministic; no
+/// LLM. Sections are delimited by a CHANGE in `heading_path` (a run of blocks sharing the same
+/// heading trail is one section). `name` is the document/display name for the contextual header.
+///
+/// Produced order: for each section — its L1 parent, then its L0 leaves (parent = that L1's index) —
+/// followed by the L2 summary chunk(s) at the end. The DB layer inserts in this order so a leaf's
+/// `parent` index precedes it.
+pub fn chunk_document_hierarchical(name: &str, blocks: &[crate::extract::ExtractedBlock]) -> Vec<HierChunk> {
+    // 1) Coalesce consecutive blocks that share a heading trail into sections (the page_no of the
+    //    section is the FIRST block's page).
+    let mut sections: Vec<Section> = Vec::new();
+    for b in blocks {
+        let text = b.text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        // Append to the current section iff it shares this block's heading trail; else start a new
+        // one. `last_mut()` gives both the same-trail check and the mutable append in one borrow (no
+        // `unwrap`/`expect` — a `None` last simply starts the first section).
+        match sections.last_mut() {
+            Some(sec) if sec.path.as_deref() == b.heading_path.as_deref() => {
+                sec.body.push_str("\n\n");
+                sec.body.push_str(text);
+            }
+            _ => sections.push(Section {
+                path: b.heading_path.clone(),
+                page_no: b.page,
+                body: text.to_string(),
+            }),
+        }
+    }
+    if sections.is_empty() {
+        return Vec::new();
+    }
+
+    let mut out: Vec<HierChunk> = Vec::new();
+
+    // 2) Per section: emit the L1 parent, then its L0 leaves.
+    for sec in &sections {
+        let leaves = pack_leaves(&sec.body);
+        if leaves.is_empty() {
+            continue;
+        }
+        // L1 section-parent (heading-bounded, capped, FTS-only — NOT embedded).
+        let parent_raw: String = {
+            let mut s = sec.body.clone();
+            if s.len() > SECTION_PARENT_CHAR_CAP {
+                // char-safe truncation
+                s = s.chars().take(SECTION_PARENT_CHAR_CAP).collect();
+            }
+            s
+        };
+        let parent_idx = out.len();
+        out.push(HierChunk {
+            level: HIER_LEVEL_SECTION,
+            parent: None,
+            embed_text: String::new(), // never embedded
+            raw: parent_raw,
+            section_path: sec.path.clone(),
+            page_no: sec.page_no,
+            embed: false,
+        });
+        // L0 leaves under this parent.
+        for leaf in leaves {
+            let embed_text = hier_embed_text(name, sec.path.as_deref(), sec.page_no, &leaf);
+            out.push(HierChunk {
+                level: HIER_LEVEL_LEAF,
+                parent: Some(parent_idx),
+                embed_text,
+                raw: leaf,
+                section_path: sec.path.clone(),
+                page_no: sec.page_no,
+                embed: true,
+            });
+        }
+    }
+
+    // 3) L2 doc-summary: deterministic outline = heading tree + first sentence per section. Packed
+    //    into 1..=3 chunks of ≤CHUNK_CHAR_TARGET (embedded + FTS). If there is no heading structure
+    //    at all (a flat md/txt), still emit ONE summary from the first sentences (bounded).
+    let mut outline_lines: Vec<String> = Vec::new();
+    for sec in &sections {
+        let sentence = first_sentence(&sec.body);
+        match &sec.path {
+            Some(p) if !p.trim().is_empty() => {
+                if sentence.is_empty() {
+                    outline_lines.push(format!("# {p}"));
+                } else {
+                    outline_lines.push(format!("# {p}: {sentence}"));
+                }
+            }
+            _ => {
+                if !sentence.is_empty() {
+                    outline_lines.push(sentence);
+                }
+            }
+        }
+    }
+    let outline = outline_lines.join("\n");
+    if !outline.trim().is_empty() {
+        // Pack the outline into ≤3 leaf-sized summary chunks (an unusually deep doc yields a few).
+        let mut summary_chunks = pack_leaves(&outline);
+        summary_chunks.truncate(3);
+        for sc in summary_chunks {
+            let embed_text = hier_embed_text(name, None, None, &sc);
+            out.push(HierChunk {
+                level: HIER_LEVEL_SUMMARY,
+                parent: None,
+                embed_text,
+                raw: sc,
+                section_path: None,
+                page_no: None,
+                embed: true,
+            });
+        }
+    }
+
+    out
+}
+
 /// Render `seconds` as `mm:ss` (minutes uncapped past 60 — a 75-minute meeting reads `75:xx`, not
 /// `01:15:xx`; provenance, not a clock). Negative/NaN clamp to `0`.
 fn mmss(seconds: f64) -> String {
@@ -1262,6 +1515,105 @@ mod tests {
         }
         // Blank markdown → no chunks.
         assert!(chunk_note("T", "D", "   \n\n  ").is_empty());
+    }
+
+    use crate::extract::ExtractedBlock;
+
+    fn blk(text: &str, page: Option<u32>, heading: Option<&str>) -> ExtractedBlock {
+        ExtractedBlock {
+            text: text.to_string(),
+            page,
+            heading_path: heading.map(|s| s.to_string()),
+        }
+    }
+
+    /// The hierarchical chunker emits: per section an L1 parent (NOT embedded) then its L0 leaves
+    /// (embedded, parent → the L1 index, contextual header on the embed text), plus an L2 summary
+    /// (embedded). Deterministic.
+    #[test]
+    fn hierarchical_chunker_builds_the_three_levels_with_headers_and_parents() {
+        let blocks = vec![
+            blk("The budget is 100k for the quarter.", Some(1), Some("Design")),
+            blk("Anna owns delivery of the API.", Some(1), Some("Design › Storage")),
+            blk("Closing thoughts on the roadmap.", Some(2), Some("Design › Storage")),
+        ];
+        let out = chunk_document_hierarchical("Spec.pdf", &blocks);
+        assert_eq!(out, chunk_document_hierarchical("Spec.pdf", &blocks), "deterministic");
+
+        // Two sections (Design, Design › Storage) → 2 L1 parents; the last two blocks coalesce.
+        let l1: Vec<&HierChunk> = out.iter().filter(|c| c.level == HIER_LEVEL_SECTION).collect();
+        assert_eq!(l1.len(), 2, "one L1 per heading section");
+        assert!(l1.iter().all(|c| !c.embed), "L1 parents are NEVER embedded (FTS-only)");
+        assert_eq!(l1[0].section_path.as_deref(), Some("Design"));
+        assert_eq!(l1[1].section_path.as_deref(), Some("Design › Storage"));
+
+        // L0 leaves: embedded, each points at an L1 parent, embed_text carries the contextual header.
+        let l0: Vec<(usize, &HierChunk)> = out
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.level == HIER_LEVEL_LEAF)
+            .collect();
+        assert!(!l0.is_empty(), "must have leaves");
+        for (_, leaf) in &l0 {
+            assert!(leaf.embed, "L0 leaves are embedded");
+            let parent = leaf.parent.expect("leaf must have a parent");
+            assert_eq!(
+                out[parent].level, HIER_LEVEL_SECTION,
+                "a leaf's parent must be its L1 section"
+            );
+            // Contextual header: "<name> | <section_path> | p.<N>\n<raw>".
+            assert!(
+                leaf.embed_text.starts_with("Spec.pdf | "),
+                "embed text must carry the doc name header: {:?}",
+                leaf.embed_text
+            );
+            assert!(
+                leaf.embed_text.contains(&format!("p.{}", leaf.page_no.unwrap())),
+                "embed text must carry the page: {:?}",
+                leaf.embed_text
+            );
+            assert!(
+                leaf.embed_text.ends_with(&leaf.raw),
+                "raw text must be preserved verbatim after the header"
+            );
+        }
+
+        // Exactly one L2 summary here (small doc), embedded, no parent.
+        let l2: Vec<&HierChunk> = out.iter().filter(|c| c.level == HIER_LEVEL_SUMMARY).collect();
+        assert!(!l2.is_empty() && l2.len() <= 3, "1..=3 summary chunks");
+        assert!(l2.iter().all(|c| c.embed && c.parent.is_none()));
+        // The outline references the headings.
+        assert!(
+            l2.iter().any(|c| c.raw.contains("Design")),
+            "L2 outline must reference the heading tree"
+        );
+    }
+
+    /// A flat (heading-less) document still produces leaves + an L2 summary, all with page None.
+    #[test]
+    fn hierarchical_chunker_handles_flat_documents() {
+        let blocks = vec![blk(
+            "First idea about the plan.\n\nSecond idea about hiring engineers.",
+            None,
+            None,
+        )];
+        let out = chunk_document_hierarchical("notes.txt", &blocks);
+        assert!(
+            out.iter().any(|c| c.level == HIER_LEVEL_LEAF && c.embed),
+            "a flat doc still yields embedded leaves"
+        );
+        assert!(
+            out.iter().any(|c| c.level == HIER_LEVEL_SUMMARY),
+            "a flat doc still yields an L2 summary"
+        );
+        assert!(out.iter().all(|c| c.page_no.is_none()), "flow format → page None");
+    }
+
+    /// Empty input → no chunks.
+    #[test]
+    fn hierarchical_chunker_empty_input_yields_nothing() {
+        assert!(chunk_document_hierarchical("x", &[]).is_empty());
+        assert!(chunk_document_hierarchical("x", &[blk("   ", None, None)]).is_empty());
     }
 
     #[test]

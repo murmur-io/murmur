@@ -14,6 +14,7 @@ pub mod error;
 pub mod eval;
 pub mod events;
 pub mod export;
+pub mod extract;
 pub mod facts;
 pub mod mcp;
 pub mod memory;
