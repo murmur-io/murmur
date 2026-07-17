@@ -327,6 +327,7 @@ pub fn run() {
             commands::get_graph,
             commands::get_full_graph,
             commands::get_entity_detail,
+            commands::get_entity_knowledge_diff,
             commands::get_backlinks,
             commands::list_links,
             commands::accept_link,
