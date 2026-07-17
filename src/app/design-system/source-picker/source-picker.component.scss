@@ -1,0 +1,156 @@
+/* mur-source-picker — chip multiselect over the link-candidate feed.
+   Leans on the global primitives (.pill / .menu / .menu-item / .btn.btn-ghost);
+   only the layout, chip trimmings, popover positioning + list scroller live here.
+   The popover FLOATS over content → OPAQUE (T3) via the .menu primitive
+   (--surface-overlay, --border-strong, --shadow-lg, backdrop-filter:none). */
+
+.sp {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+/* While the popover is open the chips + trigger must stay clickable ABOVE the
+   full-viewport scrim (removing a just-added source, re-toggling) — raise the
+   in-flow chip strip over the scrim (z-index 40) without leaving normal flow. */
+.sp.is-open {
+  position: relative;
+  z-index: 42;
+}
+
+/* --- Selected chips ------------------------------------------------------- */
+.sp-chips {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+/* .pill carries the pill surface; tighten padding for the badge + × affordance. */
+.sp-chip {
+  gap: var(--space-1);
+  padding: var(--space-1) var(--space-1) var(--space-1) var(--space-2);
+  max-width: 220px;
+}
+.sp-chip-badge {
+  display: inline-flex;
+  align-items: center;
+  color: var(--text-muted);
+  flex: none;
+}
+.sp-chip-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-primary);
+}
+.sp-chip-remove {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-pill);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  flex: none;
+  transition: background var(--transition-fast), color var(--transition-fast);
+}
+.sp-chip-remove:hover {
+  background: var(--surface-hover);
+  color: var(--text-primary);
+}
+.sp-chip-remove:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--accent-ring);
+}
+
+/* --- Trigger -------------------------------------------------------------- */
+.sp-trigger {
+  height: 28px;
+  padding: 0 var(--space-3);
+  font-size: 0.8125rem;
+  flex: none;
+}
+
+/* --- Popover (opaque overlay) --------------------------------------------- */
+/* A fixed full-viewport scrim so an outside click closes the popover; only the
+   panel is opaque — the scrim itself is transparent (T3: glass never on glass). */
+.sp-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  background: transparent;
+}
+.sp-pop {
+  position: fixed;
+  top: 0;
+  left: 0;
+  z-index: 41;
+  width: 300px;
+  max-width: calc(100vw - 2 * var(--space-3));
+  gap: var(--space-2);
+}
+
+.sp-search {
+  width: 100%;
+  height: 34px;
+}
+
+/* Scroller — the infinite-scroll list over the whole visible vault. */
+.sp-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 300px;
+  overflow-y: auto;
+}
+
+/* .menu-item carries the row surface; add the title/kind/check layout. */
+.sp-row {
+  justify-content: space-between;
+  font-size: 0.8125rem;
+}
+.sp-row.is-active {
+  background: var(--accent);
+  color: var(--text-on-accent);
+}
+.sp-row.is-active .sp-kind {
+  color: var(--text-on-accent);
+}
+.sp-row.is-picked {
+  color: var(--accent);
+}
+.sp-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* The kind ("note"/"meeting"/"document") is a quiet trailing hint, not a badge. */
+.sp-kind {
+  flex: none;
+  font-size: 0.68rem;
+  color: var(--text-muted);
+}
+.sp-check {
+  flex: none;
+  color: var(--accent);
+}
+.sp-row.is-active .sp-check {
+  color: var(--text-on-accent);
+}
+
+.sp-empty {
+  margin: 0;
+  padding: var(--space-1) var(--space-2);
+  color: var(--text-muted);
+  font-size: 0.78rem;
+}
