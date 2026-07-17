@@ -172,6 +172,32 @@
 .sc-item:hover {
   border-color: var(--border-strong);
 }
+/* The clickable region of a row (glyph + name + date) — a real <button> reset
+   to sit flush in the row and stretch to fill it, so the whole row area opens
+   the preview. The delete <button> is a separate sibling. */
+.sc-item-open {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  flex: 1 1 auto;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: none;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.sc-item-open:hover .sc-item-name {
+  color: var(--accent-hover);
+}
+.sc-item-open:focus-visible {
+  outline: 2px solid var(--accent-ring);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
 .sc-item-glyph {
   display: inline-flex;
   flex: none;

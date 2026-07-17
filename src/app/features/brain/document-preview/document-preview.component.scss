@@ -1,0 +1,156 @@
+:host {
+  display: block;
+}
+
+.dp-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-5);
+}
+
+.dp-scrim {
+  position: fixed;
+  inset: 0;
+  border: none;
+  margin: 0;
+  padding: 0;
+  cursor: default;
+  background: rgba(0, 0, 0, 0.55);
+  animation: dp-fade 160ms var(--transition) both;
+}
+
+.dp-panel {
+  /* Floating modal OVER the page → OPAQUE (T3), never the frosted .card. */
+  position: relative;
+  z-index: 1;
+  width: min(720px, 100%);
+  max-height: 82vh;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  padding: var(--space-5);
+  background: var(--surface-overlay);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg);
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+  animation: dp-rise 200ms var(--transition) both;
+}
+
+.dp-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+.dp-badge {
+  flex: none;
+  padding: 2px var(--space-2);
+  border-radius: var(--radius-sm);
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 0.6875rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.dp-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  margin: 0;
+  font-size: 1.0625rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.dp-close {
+  flex: none;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  color: var(--text-muted);
+}
+.dp-close:hover {
+  color: var(--text-primary);
+}
+
+/* The scrollable content well — long PDFs scroll INSIDE the modal (the page
+   body never scrolls). It's translucent (--surface-input) but composites over
+   the ALREADY-OPAQUE panel, so nothing behind the modal bleeds through. */
+.dp-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  max-height: 60vh;
+  overflow-y: auto;
+  margin: 0;
+  padding: var(--space-4);
+  background: var(--surface-input);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+/* Loading / error / locked / empty share one centered stack. */
+.dp-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-3);
+  min-height: 220px;
+  padding: var(--space-6) var(--space-4);
+  text-align: center;
+}
+
+.dp-state-glyph {
+  font-size: 1.75rem;
+  line-height: 1;
+}
+
+.dp-state-title {
+  font-size: 1rem;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.dp-state-text {
+  max-width: 40ch;
+  color: var(--text-secondary);
+  font-size: 0.875rem;
+  line-height: 1.5;
+}
+
+.dp-state-error .dp-state-text {
+  color: var(--text-secondary);
+}
+
+@keyframes dp-fade {
+  from {
+    opacity: 0;
+  }
+}
+@keyframes dp-rise {
+  from {
+    opacity: 0;
+    transform: translateY(8px) scale(0.98);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .dp-scrim,
+  .dp-panel {
+    animation: none;
+  }
+}
