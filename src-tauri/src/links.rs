@@ -67,15 +67,23 @@ impl LinkKind {
     }
 }
 
-/// The relation an edge encodes. `wikilink`/`companion` are DIRECTED (source → target, kept as
-/// written); `semantic` is UNDIRECTED (a symmetric similarity — stored ONCE with canonicalized
+/// The relation an edge encodes. `wikilink`/`companion`/`manual` are DIRECTED (source → target, kept
+/// as written); `semantic` is UNDIRECTED (a symmetric similarity — stored ONCE with canonicalized
 /// endpoints so A~B and B~A are the same row).
+///
+/// `manual` (note↔meeting-links PR-1) is a USER-INITIATED directed edge: the user explicitly links
+/// two items from the Connections panel. Unlike `wikilink` (derived from a note's `[[Title]]` on
+/// save) or `semantic` (auto-suggested), a `manual` row is written directly by the `link_items`
+/// command with `created_by='user'`, `status='active'`, `score=1.0`. When the SOURCE is an owned
+/// note, the command ALSO materializes a `[[Title]]` into its body — so the same pair later gains a
+/// `wikilink` edge too; the display dedupe (`links_for_visible`) collapses the two to one chip.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EdgeType {
     Wikilink,
     Companion,
     Semantic,
+    Manual,
 }
 
 impl EdgeType {
@@ -84,11 +92,24 @@ impl EdgeType {
             EdgeType::Wikilink => "wikilink",
             EdgeType::Companion => "companion",
             EdgeType::Semantic => "semantic",
+            EdgeType::Manual => "manual",
+        }
+    }
+
+    /// Parse a persisted/IPC edge-type string; `None` for anything unknown (the caller rejects it).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "wikilink" => Some(EdgeType::Wikilink),
+            "companion" => Some(EdgeType::Companion),
+            "semantic" => Some(EdgeType::Semantic),
+            "manual" => Some(EdgeType::Manual),
+            _ => None,
         }
     }
 
     /// `true` for the undirected (semantic) edge — the ONLY edge type whose endpoints are
-    /// canonicalized so the pair is stored once. Directed edges keep (src, dst) as written.
+    /// canonicalized so the pair is stored once. Directed edges (wikilink/companion/manual) keep
+    /// (src, dst) as written.
     pub fn is_undirected(self) -> bool {
         matches!(self, EdgeType::Semantic)
     }
@@ -183,6 +204,27 @@ mod tests {
         assert!(EdgeType::Semantic.is_undirected());
         assert!(!EdgeType::Wikilink.is_undirected());
         assert!(!EdgeType::Companion.is_undirected());
+    }
+
+    /// Every edge type round-trips through `as_str`/`parse`, and `manual` (note↔meeting-links PR-1)
+    /// is DIRECTED (never canonicalized) exactly like `wikilink`/`companion`.
+    #[test]
+    fn edge_type_round_trips_all_variants_and_manual_is_directed() {
+        for et in [
+            EdgeType::Wikilink,
+            EdgeType::Companion,
+            EdgeType::Semantic,
+            EdgeType::Manual,
+        ] {
+            assert_eq!(EdgeType::parse(et.as_str()), Some(et));
+        }
+        assert_eq!(EdgeType::parse("manual"), Some(EdgeType::Manual));
+        assert_eq!(EdgeType::Manual.as_str(), "manual");
+        assert_eq!(EdgeType::parse("bogus"), None);
+        // Manual is a DIRECTED user edge — endpoints are NEVER canonicalized (src/dst as written).
+        assert!(!EdgeType::Manual.is_undirected());
+        // Only the semantic similarity edge is undirected.
+        assert!(EdgeType::Semantic.is_undirected());
     }
 
     #[test]

@@ -1191,10 +1191,18 @@ pub struct BacklinkSource {
 /// title resolved through the SAME visibility gate as the queried endpoint (both-endpoint gating).
 /// `direction` says whether the queried item is this edge's `src` ("out") or `dst` ("in") so the FE
 /// can render an arrow; `other_kind`/`other_id` are the neighbour to navigate to. `edge_type` ∈
-/// `wikilink|companion|semantic`, `created_by` ∈ `user|auto|accepted`, `status` ∈
+/// `wikilink|companion|semantic|manual`, `created_by` ∈ `user|auto|accepted`, `status` ∈
 /// `active|suggested|dismissed` (dismissed rows are never returned). `score` is the semantic cosine
-/// (1.0 for the deterministic wikilink/companion edges). Only ever built when BOTH endpoints are
-/// VISIBLE — a sealed neighbour can never appear, and a sealed queried item yields an empty list.
+/// (1.0 for the deterministic wikilink/companion/manual edges). Only ever built when BOTH endpoints
+/// are VISIBLE — a sealed neighbour can never appear, and a sealed queried item yields an empty list.
+///
+/// `manual` (note↔meeting-links PR-1) is the DISPLAY-DEDUPE flag: when a user-initiated `manual` edge
+/// AND a derived `wikilink` (or another deterministic edge) exist for the SAME `(other_kind,
+/// other_id)` pair, `links_for_visible` collapses them to ONE row (preferring the deterministic
+/// `edge_type` for its stable id) but sets `manual = true` so the FE knows the chip is user-created +
+/// REMOVABLE (renders the `×` → `unlink_items`). A pair with no `manual` edge has `manual = false`
+/// (an auto wikilink/semantic chip — not user-removable). Always present, defaults `false` for any
+/// non-manual edge, so an old FE reads it as absent.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct LinkEdge {
@@ -1211,6 +1219,12 @@ pub struct LinkEdge {
     pub status: String,
     pub score: f64,
     pub created_at: i64,
+    /// note↔meeting-links PR-1 — `true` iff a user-initiated `manual` edge exists for this
+    /// `(other_kind, other_id)` pair (whether this collapsed row's `edge_type` is `manual` itself or a
+    /// deterministic edge the manual link was deduped into). The FE renders the removable `×` only on
+    /// a `manual` chip. Defaults `false` (serde default) for every non-manual pair.
+    #[serde(default)]
+    pub manual: bool,
 }
 
 /// A resolved `[[Title]]` wikilink navigation target — the VISIBLE note, meeting, or (2026-07-15)
