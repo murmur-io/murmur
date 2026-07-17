@@ -1284,13 +1284,20 @@ async fn summarize_and_export(
     // user_notes + vault_titles. See docs/research/2026-07-06-note-and-brain-architecture.md
     // (§3 Stage 1, §8 Phase 1).
 
-    // ENHANCE-MY-NOTES: fetch the typed-notes buffer BEFORE building the request — in
+    // ENHANCE-MY-NOTES: fetch the user's in-meeting notes BEFORE building the request — in
     // "enhance" mode the notes ride INSIDE the prompt as the skeleton (a NEW, deliberate,
     // REDACTED egress of user-typed content — see summarize/redact.rs); in "append" mode
     // (or with an empty buffer) they stay out of the prompt exactly as before. The buffer
     // read is ungated by design here (the pipeline is the producer of the note plaintext;
     // resummarize is gated upstream by meeting_is_unlocked).
-    let manual_notes = state.db.get_manual_notes(meeting_id).unwrap_or_default();
+    //
+    // SINGLE SOURCE OF TRUTH (v2 document-first): when this meeting has a COMPANION note (the "Note"
+    // tab's growing document), its body (front-matter stripped) IS the user's notes — read it, not the
+    // legacy `manual_notes` mirror. No companion note (legacy meetings, or the empty-companion was
+    // cleaned up at Stop) ⇒ fall back to `manual_notes` verbatim. Both downstream uses
+    // (`user_notes` in enhance mode + the `## My notes` fold) treat whitespace-only as byte-identical
+    // passthrough, so the "empty ⇒ unchanged output" contract is preserved in either branch.
+    let manual_notes = companion_user_notes_for_summary(&state.db, meeting_id);
 
     // Brain v2 L4 — the RUNNING LIVE BULLETS captured during the recording (the crash-recovery
     // `live_bullets` row `transcribe::bullets::bullets_tick` maintained; the RAM buffer was
@@ -1754,6 +1761,30 @@ fn finalize_note_without_vault(
     let title = derive_title(markdown, date_iso);
     db.set_meeting_title(meeting_id, &title)?;
     Ok(title)
+}
+
+/// SINGLE SOURCE OF TRUTH for the user's in-meeting notes when building the summary (v2 document-first
+/// companion note). Prefers the COMPANION note's body (YAML front-matter stripped) when the meeting
+/// has one — that document is what the recording "Note" tab edits — else falls back to the legacy
+/// `manual_notes` buffer. A companion note that exists but is body-empty (or whose row vanished) ⇒
+/// returns "" (byte-identical passthrough downstream), NOT the stale `manual_notes` mirror, so the
+/// companion note is authoritative once created. NO GATE here by design: the companion note lives in
+/// the always-open Notes ROOT and the pipeline is the PRODUCER of this meeting's own note plaintext
+/// (mirrors the ungated `get_manual_notes` read this replaces; resummarize is gated upstream by
+/// `meeting_is_unlocked`). Never egresses on its own — the caller redacts before any egress.
+pub(crate) fn companion_user_notes_for_summary(
+    db: &crate::storage::Db,
+    meeting_id: &str,
+) -> String {
+    // Prefer the companion note body when a companion note exists (id-linked, in the open root).
+    if let Ok(Some(note_id)) = db.companion_note_for_meeting(meeting_id) {
+        if let Ok(Some(row)) = db.get_note_row(&note_id) {
+            let (_yaml, body) = crate::storage::db::split_front_matter(&row.text);
+            return body.trim().to_string();
+        }
+    }
+    // Legacy fallback: no companion note (or its row vanished) ⇒ the manual_notes buffer verbatim.
+    db.get_manual_notes(meeting_id).unwrap_or_default()
 }
 
 /// brain2 realtime notes FINALIZE-FOLD: append the user's typed in-meeting notes to the generated
@@ -3023,6 +3054,84 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(temp_db_path("fold-manual"));
+    }
+
+    /// SINGLE SOURCE OF TRUTH (v2 document-first, RED→GREEN): the summary's `user_notes` comes from the
+    /// COMPANION note body (front-matter stripped) when a companion note exists, and falls back to the
+    /// legacy `manual_notes` buffer when it does not. RED against the pre-v2 read (`get_manual_notes`
+    /// only): with a companion note present AND a stale `manual_notes` mirror, the old read returned the
+    /// stale mirror; the fixed read returns the companion body.
+    #[test]
+    fn companion_body_is_the_summary_user_notes_else_manual_notes() {
+        use crate::storage::models::Meeting;
+        let db =
+            crate::storage::Db::open_with_key(&temp_db_path("companion-usernotes"), TEST_DEK)
+                .unwrap();
+
+        // Meeting A: HAS a companion note → its body (front-matter stripped) is the user notes.
+        db.insert_meeting(&Meeting {
+            id: "m-comp".to_string(),
+            started_at: "2026-07-17T09:00:00Z".to_string(),
+            ended_at: None,
+            title: Some("Sync".to_string()),
+            duration_s: 0,
+            audio_path: None,
+            status: MeetingStatus::Recording,
+            folder_id: None,
+        })
+        .unwrap();
+        let root = db.ensure_notes_root().unwrap();
+        db.insert_note(
+            "n-comp",
+            &root,
+            "sync",
+            "Sync",
+            "---\nmeeting: \"[[Sync]]\"\n---\n\nDECISION: ship v2 doc-first.",
+            0,
+        )
+        .unwrap();
+        db.set_document_meeting_id("n-comp", "m-comp").unwrap();
+        // A STALE legacy mirror that must be IGNORED once a companion note exists.
+        db.set_manual_notes("m-comp", "stale legacy jot").unwrap();
+
+        let notes = companion_user_notes_for_summary(&db, "m-comp");
+        assert_eq!(
+            notes, "DECISION: ship v2 doc-first.",
+            "companion body (front-matter stripped) is the summary user_notes"
+        );
+        assert!(
+            !notes.contains("meeting:") && !notes.contains("stale legacy jot"),
+            "front-matter stripped AND the stale manual_notes mirror ignored"
+        );
+
+        // Meeting B: NO companion note → falls back to the legacy manual_notes buffer verbatim.
+        db.insert_meeting(&Meeting {
+            id: "m-legacy".to_string(),
+            started_at: "2026-07-17T10:00:00Z".to_string(),
+            ended_at: None,
+            title: Some("Standup".to_string()),
+            duration_s: 0,
+            audio_path: None,
+            status: MeetingStatus::Recording,
+            folder_id: None,
+        })
+        .unwrap();
+        db.set_manual_notes("m-legacy", "TODO: legacy typed notes")
+            .unwrap();
+        assert_eq!(
+            companion_user_notes_for_summary(&db, "m-legacy"),
+            "TODO: legacy typed notes",
+            "no companion note ⇒ legacy manual_notes fallback"
+        );
+
+        // Meeting C: NEITHER companion note NOR manual_notes → "" (byte-identical passthrough contract).
+        assert_eq!(
+            companion_user_notes_for_summary(&db, "m-none"),
+            "",
+            "no notes at all ⇒ empty (preserves the empty ⇒ byte-identical contract)"
+        );
+
+        let _ = std::fs::remove_file(temp_db_path("companion-usernotes"));
     }
 
     // ── Phase 2b: gated semantic indexing on note creation ──────────────────────────────────────

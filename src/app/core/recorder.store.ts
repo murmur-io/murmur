@@ -12,6 +12,7 @@ import {
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { IpcService } from "./ipc.service";
 import type { NoteDto, Stage, StatusPayload } from "./models";
+import { RecordingFlushService } from "./recording-flush.service";
 import { ToastService } from "../services/toast.service";
 
 /**
@@ -33,6 +34,7 @@ function humanBytes(bytes: number): string {
 export class RecorderStore {
   private readonly ipc = inject(IpcService);
   private readonly toast = inject(ToastService);
+  private readonly flushService = inject(RecordingFlushService);
 
   private readonly _stage = signal<Stage>("idle");
   private readonly _message = signal<string>("");
@@ -250,6 +252,16 @@ export class RecorderStore {
     this._error.set(null);
     this._stage.set("transcribing");
     try {
+      // FLUSH-BEFORE-FINALIZE (root-cause fix, 2026-07-17): the recording panel's
+      // "Note" tab hosts the embedded companion note editor, which persists via a
+      // DEBOUNCED autosave. `stop_recording` deletes that companion note if it is
+      // still empty — so a Stop fired inside the debounce window (type → Stop within
+      // ~600ms) would delete the note while the user's prose was still only in the
+      // editor, losing it from the note, the vault, AND the summary. AWAIT the live
+      // editor's durable flush FIRST so the DB carries the user's text before the
+      // delete-if-empty predicate ever runs. A no-op when no companion editor is
+      // mounted (e.g. Stop from the floating bar window); never rejects.
+      await this.flushService.flush();
       const res = await this.ipc.stopRecording();
       // Optimistic preview from the StopResult; then reconcile with the
       // persisted note so the pane shows the canonical provider id / path.

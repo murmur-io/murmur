@@ -9,6 +9,7 @@ import {
   computed,
   effect,
   inject,
+  input,
   signal,
   untracked,
   viewChild,
@@ -19,6 +20,7 @@ import { ActivatedRoute, Router } from "@angular/router";
 import { map } from "rxjs";
 import { IpcService } from "../../../core/ipc.service";
 import { NavHistoryService } from "../../../core/nav-history.service";
+import { RecordingFlushService } from "../../../core/recording-flush.service";
 import { tabKeyFor } from "../../../core/tab-keys";
 import { TabRouteReuseStrategy } from "../../../core/tab-route-reuse.strategy";
 import { TabsService } from "../../../core/tabs.service";
@@ -178,6 +180,8 @@ export class NoteEditorComponent {
   /** Environment (root) injector — hosts the detach-proof root lock effect. */
   private readonly envInjector = inject(EnvironmentInjector);
   private readonly destroyRef = inject(DestroyRef);
+  /** The flush-before-finalize seam — registered while EMBEDDED (companion editor). */
+  private readonly flushService = inject(RecordingFlushService);
 
   /** Drill-down back navigation ("← Notes"). */
   readonly nav = inject(NavHistoryService);
@@ -186,12 +190,38 @@ export class NoteEditorComponent {
   protected readonly slashItems = SLASH_ITEMS;
 
   /**
+   * EMBEDDED mode (additive, 2026-07-17) — when true this editor is HOSTED
+   * inside another surface (the recording panel's "Note" tab) rather than the
+   * `/notes/:id` route: it reads its note id from {@link noteIdInput} instead
+   * of the route, hides the page chrome (header / title / properties bar /
+   * backlinks), forces Edit mode (no Preview toggle), and fills its host
+   * container (no full-viewport / sticky-header assumptions). The BODY editor,
+   * the selection toolbar, the in-note Brain popover, the link picker, autosave,
+   * and the locked/empty states all stay. Defaults false ⇒ the routed
+   * `/notes/:id` path is byte-for-byte unchanged.
+   */
+  readonly embedded = input(false);
+  /** The note id to load when {@link embedded}. Ignored on the route. */
+  readonly noteIdInput = input<string | null>(null);
+
+  /**
    * The route `:id`, tracked so a same-route navigation re-fetches even though
    * the RouteReuseStrategy keeps this instance. `null` on `/notes/new`.
    */
   private readonly routeId = toSignal(
     this.route.paramMap.pipe(map((p) => p.get("id"))),
     { initialValue: this.route.snapshot.paramMap.get("id") },
+  );
+
+  /**
+   * The note id the load/save effects act on: {@link noteIdInput} when
+   * {@link embedded} (the route is NOT read), else the route `:id`. A single
+   * `computed` so the whole load/save machinery is source-agnostic — the routed
+   * path (`embedded()===false`) resolves EXACTLY `routeId()` as before, so its
+   * behavior is unchanged.
+   */
+  private readonly activeNoteId = computed<string | null>(() =>
+    this.embedded() ? this.noteIdInput() : (this.routeId() ?? null),
   );
 
   /** The loaded note doc (identity + lock/shared flags + exported path). */
@@ -362,6 +392,15 @@ export class NoteEditorComponent {
    */
   private pendingSave: "text" | "full" | null = null;
 
+  /**
+   * Whether the PREVIEW pane is showing. EMBEDDED mode force-hides the
+   * Edit/Preview toggle and always shows the editable body, so preview can never
+   * be active there (the flag can't be toggled with the control gone — this is
+   * belt-and-braces so a stale `preview()` from before an embed can't leak the
+   * read-only pane). On the route (`embedded()===false`) this is just `preview()`.
+   */
+  readonly previewActive = computed(() => this.preview() && !this.embedded());
+
   /** The rendered preview HTML source — a cached `computed` off title + doc markdown. */
   readonly previewMarkdown = computed(() =>
     serializeDoc(this.tags(), this.properties(), this.body()),
@@ -510,15 +549,23 @@ export class NoteEditorComponent {
   readonly anyAssistEnabled = computed(() => true);
 
   /**
-   * Resolve the route id on every change: `/notes/new` creates + replaces the
-   * URL; otherwise fetch. Legitimate signal-writing effect (async IPC + stale
-   * guard, T1).
+   * Resolve the ACTIVE note id (route `:id`, or {@link noteIdInput} when
+   * embedded) on every change and load it. On the ROUTE with no id (`/notes/new`)
+   * the null branch creates a note + replaces the URL; when EMBEDDED a null id
+   * means the host hasn't handed us a companion note yet — do NOT auto-create
+   * (the host owns eager creation via `get_or_create_companion_note`), just wait
+   * (loading stays true until an id arrives). Legitimate signal-writing effect
+   * (async IPC + stale guard, T1).
    */
   private readonly _load = effect(() => {
-    const id = this.routeId();
+    const embedded = this.embedded();
+    const id = this.activeNoteId();
     const seq = ++this.requestSeq;
     if (!id) {
-      void this.createAndOpen(seq);
+      if (!embedded) {
+        void this.createAndOpen(seq);
+      }
+      // Embedded + no id yet: keep the loading state until the host supplies one.
       return;
     }
     void this.fetchNote(id, seq);
@@ -645,6 +692,51 @@ export class NoteEditorComponent {
       { injector: this.envInjector },
     );
     this.destroyRef.onDestroy(() => lockEffectRef.destroy());
+
+    // FLUSH-BEFORE-FINALIZE registration (root-cause fix, 2026-07-17): while this
+    // editor is EMBEDDED (the recording panel's companion note), register its
+    // durable flush with the root {@link RecordingFlushService} so `RecorderStore.stop()`
+    // can await the pending (debounced) save landing in the DB BEFORE `stop_recording`
+    // runs its delete-if-empty — otherwise a Stop fired inside the autosave debounce
+    // window loses the user's just-typed prose. `embedded()` is set once at mount and
+    // never changes, so the register runs exactly once; the returned unregister is
+    // wired to teardown so a destroyed editor is never flushed. The ROUTED
+    // (`embedded()===false`) path never registers — its behavior is unchanged.
+    let unregisterFlush: (() => void) | null = null;
+    const registerEffectRef = effect(() => {
+      if (this.embedded() && !unregisterFlush) {
+        unregisterFlush = this.flushService.register(() =>
+          this.flushPendingSave(),
+        );
+      }
+    });
+    this.destroyRef.onDestroy(() => {
+      registerEffectRef.destroy();
+      unregisterFlush?.();
+    });
+  }
+
+  /**
+   * FLUSH-BEFORE-FINALIZE (root-cause fix, 2026-07-17): force this editor's PENDING
+   * (debounced) save to the backend NOW and resolve once the DB write has landed.
+   * The recorder's Stop path awaits this via {@link RecordingFlushService} BEFORE
+   * `stop_recording` so the companion note's just-typed body is durable before the
+   * backend's delete-if-empty predicate is evaluated (else the user's prose is lost).
+   *
+   * Reuses the EXISTING save machinery — no second writer: it cancels the autosave
+   * debounce and joins the SAME single-writer chain via {@link flushFull} (the boundary
+   * full save: persist + re-index + export), then awaits that chain settling. Latest
+   * signal state wins (the payload is snapshotted when the queued save runs), so the
+   * character typed a millisecond before Stop is included. A no-op (resolves at once)
+   * while hydrating, when there is no loaded doc, or when the note is locked — the
+   * chain never rejects (both save paths handle their own errors).
+   */
+  async flushPendingSave(): Promise<void> {
+    const doc = this.note();
+    if (this.hydrating || !doc || doc.locked) {
+      return;
+    }
+    await this.flushFull();
   }
 
   /**
@@ -823,6 +915,26 @@ export class NoteEditorComponent {
         this.loading.set(false);
       }
     }
+  }
+
+  /**
+   * Re-load the currently-open note's body from the backend (EMBEDDED companion
+   * editor, 2026-07-17). The recording panel keeps a SINGLE embedded editor mounted
+   * for the whole recording (the Note tab is HIDDEN, not destroyed, when the user is
+   * on Ask Brain), so returning to the Note tab no longer re-mounts the editor to
+   * pick up an Ask-Brain "Add to note" append / an external edit — it calls this
+   * instead. A stale-guarded re-fetch (a new request token drops a late reply). No-op
+   * when there is no loaded doc yet. Deliberately re-hydrates the whole doc (the
+   * append lands server-side, so the fresh body IS canonical) — the same path a
+   * re-mount used to run, minus the destroy/recreate churn.
+   */
+  reload(): void {
+    const doc = this.note();
+    if (!doc) {
+      return;
+    }
+    const seq = ++this.requestSeq;
+    void this.fetchNote(doc.id, seq);
   }
 
   /** Fetch one note, hydrate the edit signals, dropping a stale reply. */
