@@ -1,7 +1,13 @@
-<div class="card surface" role="group" aria-label="In-meeting notes">
+<div class="card surface" role="group" aria-label="In-meeting note and Ask Brain">
   <div class="surface-head">
     <app-ai-orb class="head-orb" [state]="orbStateView()" />
-    <span class="surface-title">Notes</span>
+    <mur-segmented
+      class="tabs"
+      ariaLabel="Note or Ask Brain"
+      [options]="tabOptions"
+      [value]="tabValue()"
+      (valueChange)="selectTab($event)"
+    />
     <span
       class="surface-hint"
       role="status"
@@ -12,119 +18,139 @@
       @if (enhancing()) {
         Enhancing your notes…
       } @else if (settled()) {
-        ✨ Notes enhanced — your bullets became the outline.
+        ✨ Notes enhanced — your note became the outline.
       } @else if (enhanceAware() && store.hasPersistedNotes()) {
-        ✨ These bullets will shape your summary
-      } @else {
-        Saved as linked notes · <span class="kbd">&#64;brain</span> to ask
+        ✨ This note will shape your summary
       }
     </span>
   </div>
 
-  <!-- Reactions rail — PINNED above the notes flow (not inside the scroller,
-       so cards can't scroll away mid-meeting). Two lanes: the proactive RECALL
-       hint (at most one; hintsEnabled is the FE half of its global mute) and
-       the realtime CONTRADICTION whisper cards. Both are PURGED on any lock
-       transition (Lock all / screen-share auto-relock / seal) by the store so
-       content that already crossed to the FE never outlives the gate. -->
-  @if (
-    (hintsEnabled() && store.hint()) ||
-    store.whisperCards().length > 0 ||
-    store.showShadowCalibration()
-  ) {
-    <div class="reactions-rail">
-      @if (hintsEnabled() && store.hint(); as h) {
-        <app-proactive-hint-card
-          [hint]="h"
-          (dismissed)="store.dismissHint()"
-        />
-      }
-      @for (w of store.whisperCards(); track w.id) {
-        <app-whisper-card
-          [card]="w"
-          (dismissed)="store.dismissWhisper(w.id)"
-        />
-      }
-
-      <!-- Shadow-mode calibration — offer to switch on contradiction cards
-           once the user's OWN recording would have flagged enough of them. -->
-      @if (store.showShadowCalibration()) {
-        <div class="shadow-calibration" role="status">
-          <span class="shadow-copy">
-            The brain would have flagged {{ store.shadowCount() }}
-            {{ store.shadowCount() === 1 ? "contradiction" : "contradictions" }}
-            in this session — show them live?
-          </span>
-          <div class="shadow-actions">
-            <button
-              type="button"
-              class="btn btn-primary btn-sm"
-              (click)="store.enableContradictionCards()"
-            >
-              Show live
-            </button>
-            <button
-              type="button"
-              class="btn btn-ghost btn-sm"
-              (click)="store.dismissShadowCalibration()"
-            >
-              Not now
-            </button>
-          </div>
-        </div>
-      }
-    </div>
-  }
-
-  <div class="flow" #flow [class.is-enhancing]="enhancing()">
-    @if (!store.hasNotes()) {
-      <p class="flow-empty text-muted">
-        Jot your notes here — each one is saved as a real, linked note in your
-        vault. Type <span class="kbd">&#64;brain</span> + a question to open a
-        thread; the assistant answers there and you choose what to keep.
-      </p>
-    }
-    @for (n of store.notes(); track n.id; let i = $index) {
-      <app-note-item
-        [note]="n"
-        (followed)="scrollToBottom()"
-        [style.animation-delay.ms]="enhancing() ? sweepDelay(i) : null"
-      />
-    }
-  </div>
-
-  <div class="composer">
-    <button
-      type="button"
-      class="mic-btn"
-      [class.is-listening]="store.listening()"
-      [disabled]="store.processing()"
-      (click)="toggleAsk()"
-      [attr.aria-pressed]="store.listening()"
-      [attr.aria-label]="
-        store.listening() ? 'Stop listening and ask' : 'Ask by voice'
-      "
-      [title]="store.listening() ? 'Stop & ask' : 'Ask by voice'"
-    >
-      <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
-        <path
-          d="M12 3l1.6 4.4L18 9l-4.4 1.6L12 15l-1.6-4.4L6 9l4.4-1.6L12 3z"
-          fill="currentColor"
-        />
-        <path
-          d="M18.5 14l.8 2.2 2.2.8-2.2.8-.8 2.2-.8-2.2-2.2-.8 2.2-.8.8-2.2z"
-          fill="currentColor"
-          opacity="0.85"
-        />
-      </svg>
-    </button>
-    <mur-markdown-composer
-      class="composer-editor"
-      [placeholder]="composerPlaceholder()"
-      [disabled]="!store.loaded()"
-      (send)="onSend($event)"
-      (escape)="onEscape()"
+  <!-- ── NOTE TAB — the meeting's ONE companion note as an editable DOCUMENT.
+       The embedded note editor is ALWAYS MOUNTED for the whole recording (HIDDEN,
+       not destroyed, while the Ask Brain tab is active — see [hidden]) so there is
+       exactly ONE live editor instance. That single instance is the flush-at-Stop
+       target: RecorderStore.stop() awaits its durable save via RecordingFlushService
+       before finalizing, so a Stop fired inside the autosave debounce window never
+       loses the user's prose. Returning to the tab calls the editor's reload() (see
+       selectTab) — no destroy/re-mount — to reflect Ask-Brain "Add to note" appends
+       + external edits. -->
+  <div class="note-host" [hidden]="activeTab() !== 'note'">
+    <app-note-editor
+      [embedded]="true"
+      [noteIdInput]="store.companionNoteId()"
     />
   </div>
+
+  @if (activeTab() !== "note") {
+    <!-- ── ASK BRAIN TAB — the conversational @brain thread. ── -->
+
+    <!-- Reactions rail — PINNED above the conversation flow (not inside the
+         scroller). Two lanes: the proactive RECALL hint (hintsEnabled is the FE
+         half of its global mute) and the realtime CONTRADICTION whisper cards.
+         Both are PURGED on any lock transition by the store. -->
+    @if (
+      (hintsEnabled() && store.hint()) ||
+      store.whisperCards().length > 0 ||
+      store.showShadowCalibration()
+    ) {
+      <div class="reactions-rail">
+        @if (hintsEnabled() && store.hint(); as h) {
+          <app-proactive-hint-card
+            [hint]="h"
+            (dismissed)="store.dismissHint()"
+          />
+        }
+        @for (w of store.whisperCards(); track w.id) {
+          <app-whisper-card
+            [card]="w"
+            (dismissed)="store.dismissWhisper(w.id)"
+          />
+        }
+
+        <!-- Shadow-mode calibration — offer to switch on contradiction cards
+             once the user's OWN recording would have flagged enough of them. -->
+        @if (store.showShadowCalibration()) {
+          <div class="shadow-calibration" role="status">
+            <span class="shadow-copy">
+              The brain would have flagged {{ store.shadowCount() }}
+              {{ store.shadowCount() === 1 ? "contradiction" : "contradictions" }}
+              in this session — show them live?
+            </span>
+            <div class="shadow-actions">
+              <button
+                type="button"
+                class="btn btn-primary btn-sm"
+                (click)="store.enableContradictionCards()"
+              >
+                Show live
+              </button>
+              <button
+                type="button"
+                class="btn btn-ghost btn-sm"
+                (click)="store.dismissShadowCalibration()"
+              >
+                Not now
+              </button>
+            </div>
+          </div>
+        }
+      </div>
+    }
+
+    <div class="flow" #flow>
+      @if (!store.hasNotes()) {
+        <p class="flow-empty text-muted">
+          Ask the brain about this meeting and everything related — it answers
+          here with sources you can follow. An answer can be added straight into
+          your note.
+        </p>
+      }
+      @for (n of store.notes(); track n.id) {
+        <app-note-item [note]="n" (followed)="scrollToBottom()" />
+      }
+    </div>
+
+    <form class="composer" (submit)="submitAsk($event)">
+      <button
+        type="button"
+        class="mic-btn"
+        [class.is-listening]="store.listening()"
+        [disabled]="store.processing()"
+        (click)="toggleAsk()"
+        [attr.aria-pressed]="store.listening()"
+        [attr.aria-label]="
+          store.listening() ? 'Stop listening and ask' : 'Ask by voice'
+        "
+        [title]="store.listening() ? 'Stop & ask' : 'Ask by voice'"
+      >
+        <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+          <path
+            d="M12 3l1.6 4.4L18 9l-4.4 1.6L12 15l-1.6-4.4L6 9l4.4-1.6L12 3z"
+            fill="currentColor"
+          />
+          <path
+            d="M18.5 14l.8 2.2 2.2.8-2.2.8-.8 2.2-.8-2.2-2.2-.8 2.2-.8.8-2.2z"
+            fill="currentColor"
+            opacity="0.85"
+          />
+        </svg>
+      </button>
+      <input
+        #askInput
+        type="text"
+        class="ask-input"
+        placeholder="Ask about this meeting…"
+        aria-label="Ask about this meeting"
+        [value]="askDraft()"
+        (input)="onAskInput($event)"
+      />
+      <button
+        type="submit"
+        class="btn btn-primary send-btn"
+        [disabled]="!canAsk()"
+      >
+        Ask
+      </button>
+    </form>
+  }
 </div>
-  

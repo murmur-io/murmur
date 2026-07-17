@@ -846,6 +846,15 @@ pub async fn stop_recording(
     };
     let meeting_id = meeting_uuid.to_string();
 
+    // DOCUMENT-FIRST cleanup (v2 companion note): the "Note" tab EAGERLY creates a companion note to
+    // mount the editor on. If the user never wrote into it, remove it now so an unused recording
+    // leaves no clutter. BEST-EFFORT — a delete failure NEVER fails Stop (and only ever deletes a
+    // body-empty companion note, so no user content is at risk). Runs BEFORE the pipeline reads the
+    // companion body for the summary, so an empty companion correctly falls back to `manual_notes`.
+    if let Err(e) = delete_companion_note_if_empty_inner(state.inner(), &meeting_id).await {
+        tracing::warn!(target: "notes", meeting_id = %meeting_id, error = %e, "empty-companion cleanup skipped (Stop unaffected)");
+    }
+
     // Capture the mic stream's host start instant BEFORE consuming the recorder — it anchors the
     // mic ("me") segments onto the absolute timeline in the wall-clock merge (pipeline.rs).
     let mic_started_at = recorder.started_at();
@@ -2306,6 +2315,74 @@ fn compose_companion_markdown(current: &str, meeting_name: &str, block: &str) ->
     }
 }
 
+/// `get_or_create_companion_note(meeting_id)` — the DOCUMENT-FIRST entry point (v2 redesign): EAGERLY
+/// get-or-create the ONE companion note for `meeting_id` and return `{ note_id, meeting_wikilink }`
+/// WITHOUT appending any body, so the recording "Note" tab can mount the real create-note editor on a
+/// stable note id. GATED: refuses a sealed-and-not-session-unlocked meeting (`AppError::Locked`).
+/// Idempotent — a second call reuses the same note (one-note-per-meeting invariant). No `manual_notes`
+/// write (that mirror belongs to the append path; the editor autosaves via the normal note path).
+#[tauri::command]
+pub fn get_or_create_companion_note(
+    state: State<'_, AppState>,
+    meeting_id: String,
+) -> Result<CompanionAppendResult, AppError> {
+    get_or_create_companion_note_inner(state.inner(), &meeting_id)
+}
+
+/// Inner of [`get_or_create_companion_note`] taking `&AppState` (unit-testable gate + lazy-create).
+/// Factored OUT of [`append_to_companion_note_inner`] so both the document-first editor mount and the
+/// append path share ONE lazy get-or-create (gate → `companion_note_for_meeting` → else
+/// `create_note_inner(None, meeting_name)` + `set_document_meeting_id` + front-matter `[[Meeting]]`
+/// link). Returns the note id + the display wikilink; writes NO body.
+pub(crate) fn get_or_create_companion_note_inner(
+    state: &AppState,
+    meeting_id: &str,
+) -> Result<CompanionAppendResult, AppError> {
+    if meeting_id.trim().is_empty() {
+        return Err(AppError::Locked(
+            "no meeting is being recorded — there is nothing to attach the note to".into(),
+        ));
+    }
+    // GATE: refuse a sealed-and-not-session-unlocked meeting — never resurrect content behind a lock.
+    if !meeting_is_unlocked(state, meeting_id)? {
+        return Err(AppError::Locked(
+            "this meeting is locked — unlock it to save a note".into(),
+        ));
+    }
+
+    // The meeting's current display title drives the managed note title + the `[[<name>]]` link.
+    let Some(meeting) = state.db.get_meeting(meeting_id)? else {
+        return Err(AppError::InvalidArg(format!("no meeting {meeting_id}")));
+    };
+    let meeting_name = meeting_display_name(meeting.title.as_deref());
+    let meeting_wikilink = format!("[[{meeting_name}]]");
+
+    // GET-OR-CREATE the companion note in the always-open Notes ROOT (folder_id = None). A new
+    // companion note is birthed with the managed title = the meeting name, structurally linked by
+    // `meeting_id`, and its front-matter `[[Meeting]]` link stamped (empty-block compose — no body
+    // is written). `create_note_inner`/`update_note_doc_inner` each hold their own lifecycle guard.
+    let note_id = match state.db.companion_note_for_meeting(meeting_id)? {
+        Some(id) => id,
+        None => {
+            let id = create_note_inner(state, None, &meeting_name)?;
+            state.db.set_document_meeting_id(&id, meeting_id)?;
+            // Stamp the front-matter `meeting: "[[…]]"` link on the fresh (empty) note so the
+            // document-first editor mounts on a note that already carries the link (no body added).
+            if let Some(row) = state.db.get_note_row(&id)? {
+                let new_markdown = compose_companion_markdown(&row.text, &meeting_name, "");
+                update_note_doc_inner(state, &id, &meeting_name, &new_markdown)?;
+            }
+            tracing::info!(target: "notes", note_id = %id, meeting_id = %meeting_id, "companion note created");
+            id
+        }
+    };
+
+    Ok(CompanionAppendResult {
+        note_id,
+        meeting_wikilink,
+    })
+}
+
 /// `append_to_companion_note(meeting_id, markdown)` — turn an in-recording jot (or an accepted
 /// `@brain` draft) into a REAL, linked, standalone companion note. GATED: refuses a
 /// sealed-and-not-session-unlocked meeting (`AppError::Locked`) — mirrors the `save_note` tool's
@@ -2334,42 +2411,20 @@ pub(crate) fn append_to_companion_note_inner(
     if block.is_empty() {
         return Err(AppError::InvalidArg("nothing to note".into()));
     }
-    if meeting_id.trim().is_empty() {
-        return Err(AppError::Locked(
-            "no meeting is being recorded — there is nothing to attach the note to".into(),
-        ));
-    }
-    // BLK-1 / TOCTOU: hold the lifecycle guard across gate + get-or-create + append so a concurrent
-    // lock/relock cannot land between the unlock check and the writes. `create_note_inner` /
-    // `update_note_doc_inner` also take this (reentrant `MutexGuard` is NOT allowed) — so we do NOT
-    // hold it here; instead we re-run the gate first, then delegate to those guarded helpers. The
-    // gate is re-checked inside each helper's own guard as well (defense-in-depth).
-    // GATE: refuse a sealed-and-not-session-unlocked meeting — never resurrect content behind a lock.
-    if !meeting_is_unlocked(state, meeting_id)? {
-        return Err(AppError::Locked(
-            "this meeting is locked — unlock it to save a note".into(),
-        ));
-    }
-
-    // The meeting's current display title drives the managed note title + the `[[<name>]]` link.
-    let Some(meeting) = state.db.get_meeting(meeting_id)? else {
-        return Err(AppError::InvalidArg(format!("no meeting {meeting_id}")));
-    };
-    let meeting_name = meeting_display_name(meeting.title.as_deref());
-    let meeting_wikilink = format!("[[{meeting_name}]]");
-
-    // GET-OR-CREATE the companion note in the always-open Notes ROOT (folder_id = None). A new
-    // companion note is birthed with the managed title = the meeting name, then structurally linked
-    // by `meeting_id`. `create_note_inner` holds its own lifecycle guard.
-    let note_id = match state.db.companion_note_for_meeting(meeting_id)? {
-        Some(id) => id,
-        None => {
-            let id = create_note_inner(state, None, &meeting_name)?;
-            state.db.set_document_meeting_id(&id, meeting_id)?;
-            tracing::info!(target: "notes", note_id = %id, meeting_id = %meeting_id, "companion note created");
-            id
-        }
-    };
+    // BLK-1 / TOCTOU: `get_or_create_companion_note_inner` + `create_note_inner` /
+    // `update_note_doc_inner` each take the lifecycle guard under their own scope (reentrant
+    // `MutexGuard` is NOT allowed) — so we do NOT hold it here; instead the gate is re-checked
+    // inside each helper's own guard (defense-in-depth). The shared get-or-create runs the
+    // `meeting_is_unlocked` gate FIRST and lazily births the note (Notes ROOT, `meeting_id` set,
+    // managed title = the meeting name).
+    let CompanionAppendResult {
+        note_id,
+        meeting_wikilink,
+    } = get_or_create_companion_note_inner(state, meeting_id)?;
+    let meeting_name = meeting_wikilink
+        .trim_start_matches("[[")
+        .trim_end_matches("]]")
+        .to_string();
 
     // APPEND the block: read the current body, compose (front-matter link refreshed idempotently +
     // block appended), and save through the standalone-note update path (re-index + guarded
@@ -2399,6 +2454,59 @@ pub(crate) fn append_to_companion_note_inner(
         note_id,
         meeting_wikilink,
     })
+}
+
+/// TRUE iff the note markdown's body (YAML front-matter stripped) is whitespace-only — i.e. the
+/// document-first "Note" tab mounted a companion note that the user never wrote into. Pure + Db-free.
+/// The front-matter carries only the managed `meeting: "[[…]]"` link (never user content), so a
+/// body-empty companion note is content-free and safe to remove.
+fn companion_body_is_empty(markdown: &str) -> bool {
+    let (_yaml, body) = crate::storage::db::split_front_matter(markdown);
+    body.trim().is_empty()
+}
+
+/// `delete_companion_note_if_empty(meeting_id) -> bool` — remove an UNUSED auto-created companion note
+/// so a recording the user never jotted into leaves NO clutter. Deletes IFF the companion note's body
+/// (YAML front-matter stripped) is whitespace-only; a note with ANY user content is KEPT untouched.
+/// GATED: refuses a sealed-and-not-session-unlocked meeting (`AppError::Locked`) — never touch content
+/// behind a lock. Returns `true` when a body-empty companion note was deleted, `false` otherwise
+/// (no companion note, or it had content). NO-LOSS: only ever deletes a body-empty note. `async`
+/// because [`delete_note_inner`] runs the org-share revoke cascade.
+#[tauri::command]
+pub async fn delete_companion_note_if_empty(
+    state: State<'_, AppState>,
+    meeting_id: String,
+) -> Result<bool, AppError> {
+    delete_companion_note_if_empty_inner(state.inner(), &meeting_id).await
+}
+
+/// Inner of [`delete_companion_note_if_empty`] taking `&AppState` (unit-testable gate).
+pub(crate) async fn delete_companion_note_if_empty_inner(
+    state: &AppState,
+    meeting_id: &str,
+) -> Result<bool, AppError> {
+    if meeting_id.trim().is_empty() {
+        return Ok(false); // nothing recording → nothing to clean up.
+    }
+    // GATE: refuse a sealed-and-not-session-unlocked meeting — never touch content behind a lock.
+    if !meeting_is_unlocked(state, meeting_id)? {
+        return Err(AppError::Locked(
+            "this meeting is locked — unlock it before cleaning up its note".into(),
+        ));
+    }
+    let Some(note_id) = state.db.companion_note_for_meeting(meeting_id)? else {
+        return Ok(false); // no companion note was ever created.
+    };
+    let Some(row) = state.db.get_note_row(&note_id)? else {
+        return Ok(false); // race: note vanished → nothing to do.
+    };
+    // NO-LOSS: only ever delete a note whose BODY is whitespace-only. Any user content ⇒ KEEP it.
+    if !companion_body_is_empty(&row.text) {
+        return Ok(false);
+    }
+    delete_note_inner(state, &note_id).await?;
+    tracing::info!(target: "notes", note_id = %note_id, meeting_id = %meeting_id, "empty companion note deleted");
+    Ok(true)
 }
 
 /// Best-effort: refresh the COMPANION note's managed title + its front-matter `meeting: "[[…]]"`
@@ -19471,6 +19579,105 @@ mod lifecycle_tests {
             "front-matter link synced to the new title"
         );
         assert!(row.text.contains("a jot"), "body content preserved through the sync");
+    }
+
+    /// DOCUMENT-FIRST EAGER-CREATE (v2, Task 1): `get_or_create_companion_note` returns a REAL note id
+    /// and the `[[Meeting]]` wikilink WITHOUT writing any body — the freshly-birthed note carries only
+    /// the managed front-matter link (body empty), is linked by `meeting_id`, and a second call reuses
+    /// the SAME note (idempotent). No `manual_notes` mirror is written by this path.
+    #[test]
+    fn get_or_create_companion_note_eager_creates_empty_and_reuses() {
+        let state = build_state("companion-getorcreate");
+        state
+            .db
+            .insert_meeting(&Meeting {
+                id: "m-doc".to_string(),
+                started_at: "2026-07-17T09:00:00Z".to_string(),
+                ended_at: None,
+                title: Some("Sync 2026-07-17".to_string()),
+                duration_s: 0,
+                audio_path: None,
+                status: MeetingStatus::Recording,
+                folder_id: None,
+            })
+            .unwrap();
+
+        let r1 = get_or_create_companion_note_inner(&state, "m-doc").unwrap();
+        assert_eq!(r1.meeting_wikilink, "[[Sync 2026-07-17]]");
+        // The note exists, is id-linked, and carries the front-matter link but an EMPTY body.
+        assert_eq!(
+            state.db.companion_note_for_meeting("m-doc").unwrap().as_deref(),
+            Some(r1.note_id.as_str())
+        );
+        let row = state.db.get_note_row(&r1.note_id).unwrap().unwrap();
+        assert!(
+            row.text.contains("meeting: \"[[Sync 2026-07-17]]\""),
+            "front-matter link stamped on the eager-created note"
+        );
+        assert!(companion_body_is_empty(&row.text), "no body written by the eager create");
+        // No manual_notes mirror from this path.
+        assert_eq!(state.db.get_manual_notes("m-doc").unwrap(), "");
+
+        // Idempotent: a second call reuses the same note.
+        let r2 = get_or_create_companion_note_inner(&state, "m-doc").unwrap();
+        assert_eq!(r2.note_id, r1.note_id, "one living companion note per meeting");
+    }
+
+    /// EMPTY-COMPANION CLEANUP (v2, Task 2, RED→GREEN): `delete_companion_note_if_empty` deletes an
+    /// auto-created companion note whose BODY is whitespace-only (returns `true`), and KEEPS a companion
+    /// note that has ANY user content (returns `false`). RED against a naive "always delete" or a
+    /// front-matter-blind emptiness check (the managed `meeting:` link would falsely read as content).
+    #[test]
+    fn delete_companion_note_if_empty_deletes_empty_keeps_nonempty() {
+        // Case A: an EAGER-created, never-written companion note (body empty) is deleted.
+        let state = build_state("companion-delete-empty");
+        state
+            .db
+            .insert_meeting(&Meeting {
+                id: "m-empty".to_string(),
+                started_at: "2026-07-17T09:00:00Z".to_string(),
+                ended_at: None,
+                title: Some("Untouched".to_string()),
+                duration_s: 0,
+                audio_path: None,
+                status: MeetingStatus::Recording,
+                folder_id: None,
+            })
+            .unwrap();
+        let r = get_or_create_companion_note_inner(&state, "m-empty").unwrap();
+        assert!(state.db.get_note_row(&r.note_id).unwrap().is_some());
+
+        let deleted = block_on(delete_companion_note_if_empty_inner(&state, "m-empty")).unwrap();
+        assert!(deleted, "a body-empty companion note is deleted");
+        assert!(
+            state.db.companion_note_for_meeting("m-empty").unwrap().is_none(),
+            "the empty companion note is gone"
+        );
+
+        // Case B: a companion note WITH user content is KEPT untouched.
+        let state2 = build_state("companion-delete-nonempty");
+        state2
+            .db
+            .insert_meeting(&Meeting {
+                id: "m-used".to_string(),
+                started_at: "2026-07-17T10:00:00Z".to_string(),
+                ended_at: None,
+                title: Some("Used".to_string()),
+                duration_s: 0,
+                audio_path: None,
+                status: MeetingStatus::Recording,
+                folder_id: None,
+            })
+            .unwrap();
+        let used = append_to_companion_note_inner(&state2, "m-used", "A real jot.").unwrap();
+        let deleted2 = block_on(delete_companion_note_if_empty_inner(&state2, "m-used")).unwrap();
+        assert!(!deleted2, "a companion note with content is NOT deleted");
+        let row = state2.db.get_note_row(&used.note_id).unwrap().unwrap();
+        assert!(row.text.contains("A real jot."), "user content preserved");
+
+        // No companion note at all ⇒ false (nothing to clean up), not an error.
+        let none = block_on(delete_companion_note_if_empty_inner(&state2, "m-never")).unwrap();
+        assert!(!none, "no companion note ⇒ false");
     }
 
     /// #2 (0.7 security fast-follow): `list_meetings` MUST mask a sealed-and-NOT-session-unlocked

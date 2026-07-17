@@ -174,6 +174,8 @@ pub fn run() {
             commands::save_manual_notes,
             commands::get_manual_notes,
             commands::append_to_companion_note,
+            commands::get_or_create_companion_note,
+            commands::delete_companion_note_if_empty,
             commands::import_document,
             commands::import_text,
             commands::brain_overview,
