@@ -8,6 +8,7 @@ import type {
   Analytics,
   AppConfigDto,
   BacklinkSource,
+  ClaimAlignment,
   LinkEdge,
   LinkKind,
   WikiTarget,
@@ -1614,6 +1615,19 @@ export class IpcService {
 
   getMeetingDetail(meetingId: string): Promise<MeetingDetail | null> {
     return invoke<MeetingDetail | null>("get_meeting_detail", { meetingId });
+  }
+
+  /**
+   * Per-claim "Receipts" (Brain v3 PR-5): each note line that clears the
+   * token-overlap bar aligned to the transcript segment it derives from, so the
+   * UI can seek the audio player to `startS` and prove the claim. GATED — a
+   * sealed-and-not-session-unlocked meeting returns `[]` (no segment times,
+   * speakers, or overlaps leak behind the lock), as does a meeting with no note
+   * yet. Carries no note/transcript TEXT (line index + audio coordinates + ASR
+   * metadata only).
+   */
+  getNoteReceipts(meetingId: string): Promise<ClaimAlignment[]> {
+    return invoke<ClaimAlignment[]>("get_note_receipts", { meetingId });
   }
 
   /**

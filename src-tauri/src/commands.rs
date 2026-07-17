@@ -2688,6 +2688,59 @@ pub(crate) fn get_manual_notes_inner(
     state.db.get_manual_notes(meeting_id)
 }
 
+/// Brain v3 PR-5 (Receipts): the audio receipt for every claim in a meeting's CURRENT note — the
+/// transcript segment each note line most likely derives from, so the FE can seek the shipped audio
+/// player/timeline to that second and prove the claim (speaker + ASR confidence in the tooltip).
+///
+/// Deterministic + on-device (extends `summarize::grounding`'s token-overlap pass — no LLM, no
+/// egress). Recomputed on demand from the current note + segments, so there is NO new storage and
+/// therefore NO new seal path (nothing at rest to encrypt/verify-before-destroy).
+///
+/// LOCK-MODEL (audio-adjacent read): the `meeting_is_unlocked` gate is FIRST. A sealed-and-NOT-
+/// session-unlocked meeting returns an EMPTY list — never a segment time, speaker, or overlap that
+/// would leak WHEN something was said or by WHOM, matching the masked DTO that already nulls
+/// `audio_path`. Past the gate we read the note + segments through the SAME gated readers the detail
+/// DTO uses (`get_latest_note_for_meeting` / `get_segments`), align, and return alignments only —
+/// the DTO carries no note/transcript text (just a line index + the segment's audio coordinates +
+/// non-content metadata). No PII in logs (id + count only).
+#[tauri::command]
+pub fn get_note_receipts(
+    state: State<'_, AppState>,
+    meeting_id: String,
+) -> Result<Vec<crate::summarize::grounding::ClaimAlignment>, AppError> {
+    get_note_receipts_inner(state.inner(), &meeting_id)
+}
+
+/// Inner of [`get_note_receipts`] taking `&AppState` (unit-testable gate). Empty list for a
+/// sealed-not-unlocked meeting; empty list when there is no note yet (nothing to receipt).
+pub(crate) fn get_note_receipts_inner(
+    state: &AppState,
+    meeting_id: &str,
+) -> Result<Vec<crate::summarize::grounding::ClaimAlignment>, AppError> {
+    // GATE FIRST — a locked meeting leaks NOTHING (no segment times, no speakers, no overlaps).
+    if !meeting_is_unlocked(state, meeting_id)? {
+        return Ok(Vec::new());
+    }
+    let Some(note) = state.db.get_latest_note_for_meeting(meeting_id)? else {
+        return Ok(Vec::new()); // no note yet ⇒ nothing to receipt.
+    };
+    let segments = state.db.get_segments(meeting_id)?;
+    // `claim_index` refers to the RAW markdown lines (`markdown.split('\n')`) the FE renders, so a
+    // chip maps straight back to its note line. `align_claims_to_segments` itself skips
+    // front-matter/headings/blockquotes/etc., so passing every line is safe.
+    let lines: Vec<&str> = note.markdown.split('\n').collect();
+    let receipts = crate::summarize::grounding::align_claims_to_segments(&lines, &segments);
+    tracing::debug!(
+        target: "receipts",
+        meeting = %meeting_id,
+        note_lines = lines.len(),
+        segments = segments.len(),
+        receipts = receipts.len(),
+        "computed note receipts"
+    );
+    Ok(receipts)
+}
+
 /// The extensions document ingestion accepts (Brain v3 PR-2). Text (md/txt) plus the extracted
 /// formats: PDF (macOS PDFKit), DOCX/PPTX (pure-Rust OOXML), XLSX (calamine), HTML. Dispatch +
 /// extraction live in `crate::extract`; anything else is rejected with `InvalidArg`.
@@ -21752,6 +21805,162 @@ mod lifecycle_tests {
             get_manual_notes_inner(&state, "m1").unwrap(),
             "secret typed plaintext",
             "the refused write must not have mutated the buffer"
+        );
+    }
+
+    /// RECEIPTS happy path (Brain v3 PR-5): on an OPEN meeting, `get_note_receipts` aligns each
+    /// supported note line to the transcript segment it derives from, carrying that segment's raw-
+    /// second coordinates + speaker + confidence. A paraphrased/unsupported line earns no receipt.
+    #[test]
+    fn get_note_receipts_returns_alignments_when_unlocked() {
+        let state = build_state("receipts-open");
+        // No folder ⇒ always open. Seed a note + two distinctive segments directly.
+        state
+            .db
+            .insert_meeting(&Meeting {
+                id: "m1".to_string(),
+                started_at: "2026-06-27T09:00:00Z".to_string(),
+                ended_at: None,
+                title: Some("Receipts".to_string()),
+                duration_s: 60,
+                audio_path: None,
+                status: MeetingStatus::Summarized,
+                folder_id: None,
+            })
+            .unwrap();
+        state
+            .db
+            .upsert_note(&NoteRecord {
+                meeting_id: "m1".to_string(),
+                provider_id: "claude_code".to_string(),
+                // Line 0 heading, 1 blank, 2 supported claim, 3 blank, 4 unsupported paraphrase.
+                markdown: "## Summary\n\nWe shipped the login page and the payment flow.\n\nThe entirely separate teleporter prototype launched successfully.".to_string(),
+                created_at: "2026-06-27T09:05:00Z".to_string(),
+                exported_path: None,
+                model_requested: None,
+                model_served: None,
+                gateway_host: None,
+            })
+            .unwrap();
+        state
+            .db
+            .insert_segments(
+                "m1",
+                &[
+                    Segment {
+                        idx: 5,
+                        start_s: 11.0,
+                        end_s: 17.5,
+                        text: "we finally shipped the login page and the payment flow this week"
+                            .to_string(),
+                        speaker: Some("me".to_string()),
+                        confidence: Some(0.88),
+                    },
+                    Segment {
+                        idx: 6,
+                        start_s: 40.0,
+                        end_s: 44.0,
+                        text: "and then we grabbed some coffee downstairs".to_string(),
+                        speaker: Some("others".to_string()),
+                        confidence: None,
+                    },
+                ],
+            )
+            .unwrap();
+
+        let receipts = get_note_receipts_inner(&state, "m1").unwrap();
+        assert_eq!(
+            receipts.len(),
+            1,
+            "only the supported claim earns a receipt; got:\n{receipts:?}"
+        );
+        let r = &receipts[0];
+        assert_eq!(r.claim_index, 2, "receipt maps to the supported note line");
+        assert_eq!(r.segment_id, 5, "aligned to the login/payment segment");
+        assert_eq!(r.start_s, 11.0, "raw-second seek target");
+        assert_eq!(r.end_s, 17.5);
+        assert_eq!(r.speaker.as_deref(), Some("me"));
+        assert_eq!(r.confidence, Some(0.88));
+    }
+
+    /// RECEIPTS lock-gate (RED-before-GREEN): a sealed-and-NOT-session-unlocked meeting returns an
+    /// EMPTY receipt list — never a segment time, speaker, or overlap that would leak WHEN/BY WHOM —
+    /// EVEN THOUGH the note + segments still exist. Session-unlocking the folder restores receipts.
+    /// Remove the `meeting_is_unlocked` gate in `get_note_receipts_inner` and this fails (RED).
+    #[test]
+    fn get_note_receipts_masked_when_sealed_then_restored_on_unlock() {
+        let state = build_state("receipts-sealed");
+        make_open_folder(&state.db, "f-lock", "Secret");
+        state
+            .db
+            .insert_meeting(&Meeting {
+                id: "m1".to_string(),
+                started_at: "2026-06-27T09:00:00Z".to_string(),
+                ended_at: None,
+                title: Some("Secret".to_string()),
+                duration_s: 60,
+                audio_path: None,
+                status: MeetingStatus::Summarized,
+                folder_id: None,
+            })
+            .unwrap();
+        state
+            .db
+            .upsert_note(&NoteRecord {
+                meeting_id: "m1".to_string(),
+                provider_id: "claude_code".to_string(),
+                markdown: "We shipped the login page and the payment flow.".to_string(),
+                created_at: "2026-06-27T09:05:00Z".to_string(),
+                exported_path: None,
+                model_requested: None,
+                model_served: None,
+                gateway_host: None,
+            })
+            .unwrap();
+        state
+            .db
+            .insert_segments(
+                "m1",
+                &[Segment {
+                    idx: 1,
+                    start_s: 3.0,
+                    end_s: 9.0,
+                    text: "we shipped the login page and the payment flow today".to_string(),
+                    speaker: Some("me".to_string()),
+                    confidence: Some(0.9),
+                }],
+            )
+            .unwrap();
+        state.db.set_meeting_folder("m1", Some("f-lock")).unwrap();
+
+        // Precondition: while OPEN, the receipt is present (proves the mask below is the gate, not
+        // an empty computation).
+        assert_eq!(
+            get_note_receipts_inner(&state, "m1").unwrap().len(),
+            1,
+            "precondition: open folder yields a receipt"
+        );
+
+        // Seal the folder (locked, NOT in the session unlock set).
+        state
+            .db
+            .set_folder_locked("f-lock", true, Some(&b"wrapped"[..]))
+            .unwrap();
+        assert!(
+            get_note_receipts_inner(&state, "m1").unwrap().is_empty(),
+            "sealed-not-unlocked meeting must leak NO receipts (no times/speakers)"
+        );
+
+        // Session-unlock the folder ⇒ receipts return.
+        state
+            .unlocked_folders
+            .lock()
+            .unwrap()
+            .insert("f-lock".to_string());
+        assert_eq!(
+            get_note_receipts_inner(&state, "m1").unwrap().len(),
+            1,
+            "session-unlock restores receipts"
         );
     }
 
