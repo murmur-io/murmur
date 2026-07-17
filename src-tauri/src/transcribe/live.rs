@@ -959,6 +959,7 @@ fn run_assistant_turn(
         &thread_id,
         None,
         meeting_id.as_deref(),
+        None, // the voice/wake/card twin has no FE source picker → whole-vault, unchanged.
     );
     let _ = app.emit(crate::events::EVENT_VOICE_ACTION_RESULT, result);
 }
@@ -992,6 +993,7 @@ fn run_assistant_turn(
 /// voice/wake fallback path; and only when there is neither does the live-recording pointer apply.
 /// The RESOLVED id is used for the executor scope, `gated_live_context`, AND the persisted
 /// thread binding — so a thread durably answers about its OWN meeting.
+#[allow(clippy::too_many_arguments)] // cohesive @brain entry: fe pointers + thread/anchor + pinned sources.
 pub fn run_assistant_query(
     app: &AppHandle,
     command: &str,
@@ -1000,6 +1002,7 @@ pub fn run_assistant_query(
     thread_id: &str,
     anchor_text: Option<&str>,
     fe_meeting_id: Option<&str>,
+    explicit_sources: Option<&[crate::storage::models::SourceRef]>,
 ) -> crate::voice_action::VoiceActionResult {
     let state = app.state::<AppState>();
     let config = match state.config.lock() {
@@ -1019,6 +1022,32 @@ pub fn run_assistant_query(
                 .with_thread_id(thread_id)
         }
     };
+    // note↔meeting-links PR-2 (PARTIAL) — SOURCE-SCOPED context: when the FE pins explicit sources,
+    // build their GATED pinned corpus (+ capped, gated link-expansion) and APPEND it to the loop's
+    // conversation as clearly-labelled additional context, so the cloud agentic cascade reasons over
+    // the pinned notes/meetings. Every leg is `unlocked`-gated (a sealed source/neighbour contributes
+    // NOTHING). `None`/empty ⇒ `loop_user` is byte-identical. A build error degrades to no injection
+    // (never fails the turn). The tool executor's candidate constraint + the deterministic floor legs
+    // are a documented follow-up (see the command doc).
+    let augmented_user: String = match explicit_sources.filter(|s| !s.is_empty()) {
+        Some(sources) => {
+            let ask_conn = crate::summarize::roles::provider_target(
+                crate::summarize::roles::Role::Ask,
+                &config,
+            )
+            .connection;
+            match crate::summarize::vault_context::build_vault_context_pinned_visible(
+                &state.db, sources, &ask_conn, &unlocked,
+            ) {
+                Ok((pinned, _)) if !pinned.trim().is_empty() => format!(
+                    "{loop_user}\n\n=== PINNED NOTES & MEETINGS (the user scoped this question to these; ground your answer in them) ===\n{pinned}"
+                ),
+                _ => loop_user.to_string(),
+            }
+        }
+        None => loop_user.to_string(),
+    };
+    let loop_user: &str = &augmented_user;
     // Phase 6 precedence (generalizes Phase 4): FE-sent `fe_meeting_id` (a bound thread) WINS over
     // the FOCUS pointer (the meeting the user is viewing — the backend safety-net for any fallback
     // path, e.g. the voice/wake twin), which WINS over the recording pointer (`current_meeting`,

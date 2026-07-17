@@ -332,6 +332,8 @@ pub fn run() {
             commands::list_links,
             commands::accept_link,
             commands::dismiss_link,
+            commands::link_items,
+            commands::unlink_items,
             commands::resolve_wikilink,
             commands::list_link_candidates,
             commands::get_person_dossier,

@@ -1,0 +1,172 @@
+<!-- Chip multiselect: "scope the Brain to these sources". The picked SourceRefs
+     render as removable chips above the trigger; the trigger opens the OPAQUE
+     candidate popover (T3). -->
+<div class="sp" [class.is-open]="open()">
+  @if (selected().length > 0) {
+    <ul class="sp-chips" aria-label="Selected sources">
+      @for (c of selected(); track c.kind + c.id) {
+        <li class="sp-chip pill">
+          <span class="sp-chip-badge" aria-hidden="true">
+            @switch (c.kind) {
+              @case ("meeting") {
+                <svg
+                  width="12"
+                  height="12"
+                  viewBox="0 0 16 16"
+                  fill="none"
+                  aria-hidden="true"
+                >
+                  <path
+                    d="M8 3.5a2.2 2.2 0 1 0 0 4.4 2.2 2.2 0 0 0 0-4.4ZM3.2 13a4.8 4.8 0 0 1 9.6 0"
+                    stroke="currentColor"
+                    stroke-width="1.4"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                  />
+                </svg>
+              }
+              @default {
+                <svg
+                  width="12"
+                  height="12"
+                  viewBox="0 0 16 16"
+                  fill="none"
+                  aria-hidden="true"
+                >
+                  <path
+                    d="M4 2.5h5.2L12 5.3V13a.7.7 0 0 1-.7.7H4a.7.7 0 0 1-.7-.7V3.2A.7.7 0 0 1 4 2.5Z"
+                    stroke="currentColor"
+                    stroke-width="1.4"
+                    stroke-linejoin="round"
+                  />
+                  <path
+                    d="M9 2.6v2.8h2.8"
+                    stroke="currentColor"
+                    stroke-width="1.4"
+                    stroke-linejoin="round"
+                  />
+                </svg>
+              }
+            }
+          </span>
+          <span class="sp-chip-title">{{ c.title || c.id }}</span>
+          <button
+            type="button"
+            class="sp-chip-remove"
+            [attr.aria-label]="'Remove ' + (c.title || c.id)"
+            (click)="remove(c)"
+          >
+            <svg width="12" height="12" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+              <path
+                d="M4 4l8 8M12 4l-8 8"
+                stroke="currentColor"
+                stroke-width="1.6"
+                stroke-linecap="round"
+              />
+            </svg>
+          </button>
+        </li>
+      }
+    </ul>
+  }
+
+  <button
+    #trigger
+    type="button"
+    class="btn btn-ghost sp-trigger"
+    [attr.aria-expanded]="open()"
+    aria-haspopup="listbox"
+    (click)="toggle()"
+  >
+    {{ triggerLabel() }}
+  </button>
+</div>
+
+@if (open()) {
+  <!-- Scrim: a click OUTSIDE the popover closes it. Transparent (only the panel
+       carries the opaque overlay — T3). role=button + Enter/Space/Esc satisfy the
+       a11y lints (mirrors the quick-search scrim). -->
+  <div
+    class="sp-scrim"
+    role="button"
+    tabindex="0"
+    aria-label="Close source picker"
+    (click)="close()"
+    (keydown.enter)="close()"
+    (keydown.space)="close(); $event.preventDefault()"
+    (keydown.escape)="close()"
+  ></div>
+
+  <!-- OPAQUE floating popover (T3): --surface-overlay + backdrop-filter:none via
+       the global .menu primitive. Positioned in JS (afterNextRender) under the
+       trigger; re-positioned on scroll/resize via the shared directive. -->
+  <div
+    #popover
+    class="sp-pop menu"
+    appRepositionOnScroll
+    (reposition)="reposition()"
+  >
+    <input
+      #search
+      type="text"
+      class="sp-search"
+      role="combobox"
+      aria-autocomplete="list"
+      aria-controls="sp-listbox"
+      [attr.aria-expanded]="candidates().length > 0"
+      [placeholder]="placeholder()"
+      [value]="query()"
+      (input)="onQuery($any($event.target).value)"
+      (keydown)="onKeydown($event)"
+    />
+
+    <div
+      #list
+      id="sp-listbox"
+      class="sp-list"
+      role="listbox"
+      aria-label="Source candidates"
+      (scroll)="onScroll()"
+    >
+      @for (r of rows(); track r.candidate.kind + r.candidate.id; let i = $index) {
+        <button
+          type="button"
+          class="sp-row menu-item"
+          role="option"
+          [class.is-active]="i === activeIndex()"
+          [class.is-picked]="r.picked"
+          [attr.aria-selected]="i === activeIndex()"
+          (click)="pick(r.candidate)"
+        >
+          <span class="sp-title">{{ r.candidate.title }}</span>
+          @if (r.picked) {
+            <svg
+              class="sp-check"
+              width="14"
+              height="14"
+              viewBox="0 0 16 16"
+              fill="none"
+              aria-hidden="true"
+            >
+              <path
+                d="M3.5 8.5l3 3 6-6.5"
+                stroke="currentColor"
+                stroke-width="1.6"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              />
+            </svg>
+          } @else {
+            <span class="sp-kind">{{ r.candidate.kind }}</span>
+          }
+        </button>
+      } @empty {
+        @if (loading()) {
+          <p class="sp-empty">Searching…</p>
+        } @else {
+          <p class="sp-empty">No matching notes or meetings.</p>
+        }
+      }
+    </div>
+  </div>
+}

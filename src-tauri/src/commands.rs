@@ -1398,9 +1398,17 @@ pub async fn ask_assistant_chat(
     thread_id: Option<String>,
     anchor_text: Option<String>,
     meeting_id: Option<String>,
+    explicit_sources: Option<Vec<crate::storage::models::SourceRef>>,
 ) -> Result<crate::voice_action::VoiceActionResult, AppError> {
     let (latest, conversation) = format_chat(&messages)?;
     let thread_id = crate::transcribe::live::ensure_thread_id(thread_id);
+    // note↔meeting-links PR-2 — SOURCE-SCOPED augmentation (PARTIAL, the SHOULD leg). The @brain
+    // assistant loop (`run_assistant_query`) is a deep current-first cascade whose tool executor +
+    // deterministic floor legs would need wide surgery to fully candidate-constrain; PR-2 threads
+    // the pinned sources one level in so the cloud AGENTIC cascade reasons with the gated pinned
+    // corpus injected into its conversation context. `None`/empty ⇒ byte-identical to before. The
+    // remaining full candidate-constraint of the floor/tool legs is a documented follow-up.
+    let explicit_sources = explicit_sources.filter(|s| !s.is_empty());
     tokio::task::spawn_blocking(move || {
         crate::transcribe::live::run_assistant_query(
             &app,
@@ -1410,6 +1418,7 @@ pub async fn ask_assistant_chat(
             &thread_id,
             anchor_text.as_deref(),
             meeting_id.as_deref(),
+            explicit_sources.as_deref(),
         )
     })
     .await
@@ -5504,6 +5513,7 @@ pub async fn chat_meeting(
     meeting_id: String,
     question: String,
     history: Vec<ChatTurn>,
+    explicit_sources: Option<Vec<crate::storage::models::SourceRef>>,
 ) -> Result<String, AppError> {
     if question.trim().is_empty() {
         return Err(AppError::InvalidArg("question is empty".into()));
@@ -5521,7 +5531,7 @@ pub async fn chat_meeting(
             "this meeting has no transcript to chat about yet".into(),
         ));
     }
-    let transcript = segments
+    let mut transcript = segments
         .iter()
         .map(|s| format!("[{:.0}s] {}", s.start_s, s.text.trim()))
         .collect::<Vec<_>>()
@@ -5533,6 +5543,30 @@ pub async fn chat_meeting(
             .map_err(|_| AppError::Config("config mutex poisoned".into()))?
             .clone()
     };
+    // Inject the gated cross-meeting USER MEMORY brief (parity with the @brain agentic loop): derived
+    // from VISIBLE user facts only under the LIVE unlock snapshot, empty when memory is disabled ⇒
+    // byte-identical prompt. Rides this surface's existing redaction + consent egress (no new class).
+    let unlocked = unlocked_snapshot(state.inner())?;
+    // note↔meeting-links PR-2 — SOURCE-SCOPED augmentation: when the FE pins explicit sources (the
+    // linked notes/meetings the user chose above the chat input), APPEND their gated PINNED corpus
+    // (+ capped, gated link-expansion) to this meeting's transcript grounding — the meeting stays the
+    // primary context, the pinned items add cross-item context. Every leg is `unlocked`-gated (a
+    // sealed pinned source/neighbour contributes NOTHING — never a leak). `None`/empty ⇒ byte-
+    // identical to the pre-change transcript-only grounding.
+    if let Some(sources) = explicit_sources.filter(|s| !s.is_empty()) {
+        let ask_conn =
+            crate::summarize::roles::provider_target(crate::summarize::roles::Role::Ask, &config)
+                .connection;
+        let (pinned, _) = crate::summarize::vault_context::build_vault_context_pinned_visible(
+            &state.db, &sources, &ask_conn, &unlocked,
+        )?;
+        if !pinned.trim().is_empty() {
+            transcript.push_str(
+                "\n\n=== LINKED NOTES & MEETINGS (the user pinned these as additional context) ===\n",
+            );
+            transcript.push_str(&pinned);
+        }
+    }
     // ASK role: meeting chat is a Q&A surface. With role keys absent this resolves to the same
     // default provider as before (the legacy chat path always ignored `brain_backend`).
     let provider = crate::summarize::provider_for(
@@ -5540,10 +5574,6 @@ pub async fn chat_meeting(
         &config,
         &state.heavy_inference,
     )?;
-    // Inject the gated cross-meeting USER MEMORY brief (parity with the @brain agentic loop): derived
-    // from VISIBLE user facts only under the LIVE unlock snapshot, empty when memory is disabled ⇒
-    // byte-identical prompt. Rides this surface's existing redaction + consent egress (no new class).
-    let unlocked = unlocked_snapshot(state.inner())?;
     let memory_brief = gated_memory_brief_for_injection(state.inner(), &unlocked, &question);
     let (system, user) =
         crate::summarize::chat::build(&transcript, &history, &question, &memory_brief);
@@ -7978,6 +8008,221 @@ pub fn dismiss_link(state: State<'_, AppState>, id: i64) -> Result<(), AppError>
     Ok(())
 }
 
+/// note↔meeting-links PR-1 — is a link ENDPOINT `(kind, id)` session-VISIBLE right now? Mirrors
+/// [`materialize_accepted_link`]'s gate order: a `Meeting` endpoint gates on [`meeting_is_unlocked`];
+/// a `Note`/`Document` endpoint resolves its owning folder via `get_note_row` and gates on
+/// [`folder_is_unlocked`]. An UNKNOWN endpoint (no such note/document) reports `false` — fail-closed,
+/// there is nothing legitimate to link. Used by `link_items`/`unlink_items` to refuse `AppError::Locked`
+/// before any write, so a manual edge is never created behind a lock and never reveals a locked
+/// neighbour.
+fn link_endpoint_is_unlocked(
+    state: &AppState,
+    kind: crate::links::LinkKind,
+    id: &str,
+) -> Result<bool, AppError> {
+    match kind {
+        crate::links::LinkKind::Meeting => meeting_is_unlocked(state, id),
+        crate::links::LinkKind::Note => match state.db.get_note_row(id)? {
+            Some(row) => folder_is_unlocked(state, &row.folder_id),
+            None => Ok(false), // unknown note → nothing to surface. Fail-closed.
+        },
+        crate::links::LinkKind::Document => {
+            // An imported `document` (kind != 'note') is NOT a `get_note_row` row, so routing it
+            // through `get_note_row` refused it fail-closed EVEN WHEN VISIBLE (a spurious `Locked`
+            // on the +Link chooser). Gate it via the canonical visibility reader
+            // (`get_document_if_visible` applies `visibility_clause` against the live unlock set):
+            // `Some` ⇒ visible/unlocked, `None` ⇒ sealed-or-unknown ⇒ refuse. Documents stay
+            // linkable (the chooser AND the Ask source-picker both offer them) and still fail-closed.
+            let unlocked = unlocked_snapshot(state)?;
+            Ok(state.db.get_document_if_visible(id, &unlocked)?.is_some())
+        }
+    }
+}
+
+/// note↔meeting-links PR-1 — USER-INITIATED link: persist ONE directed `manual` edge
+/// `(src → dst)` AND, when the source is an OWNED note, materialize `[[dst Title]]` into its body.
+///
+/// GATE (BEFORE any write): BOTH endpoints must be session-VISIBLE — a `meeting` via
+/// [`meeting_is_unlocked`], a `note`/`document` via its folder ([`folder_is_unlocked`]). If either is
+/// sealed-and-not-session-unlocked → `AppError::Locked` (never link behind a lock, never reveal a
+/// locked neighbour). Unknown kinds are `AppError::InvalidArg`.
+///
+/// The `manual` row (`created_by='user'`, `status='active'`, `score=1.0`) is idempotent on the
+/// table's UNIQUE key. For a `note` SOURCE we own the markdown of, we ALSO materialize the neighbour's
+/// gated `[[Title]]` into the managed `murmur:links` block via the SAME [`materialize_accepted_link`]
+/// path the accept command uses — best-effort (a materialize skip never rolls back the row). A
+/// `meeting`/`document` source (no owned editable body) creates the row ONLY. The materialized
+/// wikilink is display-deduped against the manual edge in `links_for_visible`.
+#[tauri::command]
+pub fn link_items(
+    state: State<'_, AppState>,
+    src_kind: String,
+    src_id: String,
+    dst_kind: String,
+    dst_id: String,
+) -> Result<(), AppError> {
+    link_items_inner(state.inner(), &src_kind, &src_id, &dst_kind, &dst_id)
+}
+
+pub(crate) fn link_items_inner(
+    state: &AppState,
+    src_kind: &str,
+    src_id: &str,
+    dst_kind: &str,
+    dst_id: &str,
+) -> Result<(), AppError> {
+    let src = parse_link_kind(src_kind)?;
+    let dst = parse_link_kind(dst_kind)?;
+    // Refuse a self-link (a pair pointing at itself is meaningless and would pollute the graph).
+    if src == dst && src_id == dst_id {
+        return Err(AppError::InvalidArg("cannot link an item to itself".into()));
+    }
+    // BLK-1 / TOCTOU: SCOPE the lifecycle guard tightly around gate + row-write so a concurrent
+    // lock/relock cannot land between the visibility check and the edge upsert. It is RELEASED before
+    // the note-body materialize below — that callee (`update_note_doc_inner`) takes the guard ITSELF
+    // and re-checks the folder gate, so composing them under one held guard would re-enter a
+    // non-reentrant `Mutex<()>` (the lifecycle_guard doc: never hold it around a callee that takes
+    // it). Lock order `lifecycle ⊃ db`.
+    {
+        let _lifecycle = lifecycle_guard(state);
+        // ── GATE both endpoints BEFORE any write (fail-closed on a sealed/unknown endpoint). ──
+        if !link_endpoint_is_unlocked(state, src, src_id)?
+            || !link_endpoint_is_unlocked(state, dst, dst_id)?
+        {
+            return Err(AppError::Locked(
+                "one of these items is locked — unlock it to link".into(),
+            ));
+        }
+        // ── Persist the directed manual edge (idempotent on the UNIQUE key). ──
+        state
+            .db
+            .upsert_manual_link(src.as_str(), src_id, dst.as_str(), dst_id)?;
+    }
+    // ── Fork #2: a NOTE source ALSO gets the neighbour's [[Title]] in its body (best-effort). ──
+    // A meeting/document source has no owned editable markdown → row only. `materialize_accepted_link`
+    // re-gates the source folder itself before writing plaintext (never behind a lock).
+    if matches!(src, crate::links::LinkKind::Note) {
+        let unlocked = unlocked_snapshot(state)?;
+        // Resolve the dst's CURRENT gated title (skip if sealed — no leak; the gate above already
+        // proved it visible, so this normally resolves).
+        if let Some(title) = state.db.link_endpoint_title_visible(dst, dst_id, &unlocked)? {
+            // Reuse the EXACT accept-materialize path (managed `murmur:links` block, merge-preserving).
+            if let Err(e) = materialize_accepted_link(state, src, src_id, &title) {
+                // Best-effort: the graph row is authoritative; a markdown-write failure never fails the
+                // link (no PII — ids/error only).
+                tracing::warn!(
+                    target: "links",
+                    error = %e,
+                    "manual link materialize skipped (row persisted)"
+                );
+            }
+        }
+    }
+    tracing::info!(
+        target: "links",
+        src_kind = src.as_str(),
+        dst_kind = dst.as_str(),
+        "link_items"
+    );
+    Ok(())
+}
+
+/// note↔meeting-links PR-1 — REMOVE a user-initiated link: delete ONLY the directed `manual` edge
+/// `(src → dst)` and, when the source is an OWNED note, strip the matching `[[dst Title]]` from its
+/// managed `murmur:links` block. NEVER touches a `wikilink`/`companion`/`semantic` row for the pair.
+///
+/// GATE: BOTH endpoints must be session-VISIBLE (same gate as `link_items`) — never mutate a note's
+/// body behind a lock, never reveal a locked neighbour's title. The strip is BEST-EFFORT (a failure
+/// logs and never fails the unlink — the graph row is the authoritative removal). Unknown kinds are
+/// `AppError::InvalidArg`.
+#[tauri::command]
+pub fn unlink_items(
+    state: State<'_, AppState>,
+    src_kind: String,
+    src_id: String,
+    dst_kind: String,
+    dst_id: String,
+) -> Result<(), AppError> {
+    unlink_items_inner(state.inner(), &src_kind, &src_id, &dst_kind, &dst_id)
+}
+
+pub(crate) fn unlink_items_inner(
+    state: &AppState,
+    src_kind: &str,
+    src_id: &str,
+    dst_kind: &str,
+    dst_id: &str,
+) -> Result<(), AppError> {
+    let src = parse_link_kind(src_kind)?;
+    let dst = parse_link_kind(dst_kind)?;
+    // SCOPE the guard around gate + row-delete only; release before the note-body strip below (which
+    // re-enters the guard via `update_note_doc_inner`). Same non-reentrancy discipline as `link_items`.
+    {
+        let _lifecycle = lifecycle_guard(state);
+        // ── GATE both endpoints (never mutate a note body / reveal a neighbour behind a lock). ──
+        if !link_endpoint_is_unlocked(state, src, src_id)?
+            || !link_endpoint_is_unlocked(state, dst, dst_id)?
+        {
+            return Err(AppError::Locked(
+                "one of these items is locked — unlock it to unlink".into(),
+            ));
+        }
+        // ── Delete ONLY the manual edge (wikilink/companion/semantic rows for the pair untouched). ──
+        state
+            .db
+            .delete_manual_link(src.as_str(), src_id, dst.as_str(), dst_id)?;
+    }
+    // ── A NOTE source: strip the matching [[Title]] from its managed block (best-effort). ──
+    if matches!(src, crate::links::LinkKind::Note) {
+        let unlocked = unlocked_snapshot(state)?;
+        if let Some(title) = state.db.link_endpoint_title_visible(dst, dst_id, &unlocked)? {
+            if let Err(e) = strip_manual_link_marker(state, src_id, &title) {
+                tracing::warn!(
+                    target: "links",
+                    error = %e,
+                    "manual link marker strip skipped (row removed)"
+                );
+            }
+        }
+    }
+    tracing::info!(
+        target: "links",
+        src_kind = src.as_str(),
+        dst_kind = dst.as_str(),
+        "unlink_items"
+    );
+    Ok(())
+}
+
+/// note↔meeting-links PR-1 — remove ONE `[[title]]` [`ContextHit`] from an owned note's managed
+/// `murmur:links` block, re-applying the block with that hit filtered out (the INVERSE of
+/// [`merge_related_hit`]). Reuses [`crate::enrich::extract_link_hits`] +
+/// [`crate::enrich::apply_link_markers`] so the block stays idempotent and any auto related-notes /
+/// accepted-semantic hits that lived alongside it survive. WRITE-GATED via `update_note_doc_inner`
+/// (refuses a sealed folder). A no-op (the note is unchanged) when the block never carried the hit.
+fn strip_manual_link_marker(state: &AppState, note_id: &str, title: &str) -> Result<(), AppError> {
+    let Some(row) = state.db.get_note_row(note_id)? else {
+        return Ok(()); // no owned note markdown → nothing to strip.
+    };
+    let marker = format!("[[{title}]]");
+    let mut hits = crate::enrich::extract_link_hits(&row.text);
+    let before = hits.len();
+    hits.retain(|h| h.detail != marker);
+    if hits.len() == before {
+        return Ok(()); // the marker was not in the managed block → note unchanged.
+    }
+    let merged = crate::enrich::apply_link_markers(&row.text, &hits);
+    if merged != row.text {
+        let title_disp = row
+            .title
+            .clone()
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| row.name.clone());
+        update_note_doc_inner(state, note_id, &title_disp, &merged)?;
+    }
+    Ok(())
+}
+
 /// Brain v3 PR-3 — WRITE-TIME wikilink indexing hook, called from every note-save funnel AFTER the
 /// text is durable. Resolves `[[Title]]` → TARGET IDS and (delete-then-insert) stores this source's
 /// `wikilink` edges. BEST-EFFORT: a failure logs (ids/counts only, no PII) and never fails the save
@@ -8212,6 +8457,7 @@ pub async fn ask_vault(
     question: String,
     history: Vec<ChatTurn>,
     ask_thread_id: Option<String>,
+    explicit_sources: Option<Vec<crate::storage::models::SourceRef>>,
 ) -> Result<AskVaultResult, AppError> {
     if question.trim().is_empty() {
         return Err(AppError::InvalidArg("question is empty".into()));
@@ -8226,6 +8472,36 @@ pub async fn ask_vault(
     // The same 12-message discipline as the chat panel (CHAT_CONTEXT_TURNS): bounds prompt growth +
     // cloud egress on BOTH paths. The LATEST question still drives retrieval either way.
     let history: Vec<ChatTurn> = capped_ask_history(&history).to_vec();
+
+    // note↔meeting-links PR-2 — SOURCE-SCOPED (pinned) Ask. When the FE source picker sends a
+    // non-empty explicit source list, retrieval is PINNED to exactly those items (+ their capped,
+    // gated link-expansion) and answered DETERMINISTICALLY via the SAME floor answer path — the
+    // agentic vault-wide search is SKIPPED (the user controls the context, so a scoped Ask never
+    // pulls unlisted vault items). `None`/empty ⇒ this whole block is a no-op and the path below is
+    // BYTE-IDENTICAL to before.
+    let pinned_sources: Option<Vec<crate::storage::models::SourceRef>> =
+        explicit_sources.filter(|s| !s.is_empty());
+    if let Some(sources) = pinned_sources {
+        let unlocked = unlocked_snapshot(state.inner())?;
+        let memory_brief = gated_memory_brief_for_injection(state.inner(), &unlocked, &question);
+        let reranker = crate::rerank::active_reranker(
+            state
+                .reasoner
+                .current_for(crate::summarize::roles::Role::Ask),
+        );
+        return ask_vault_floor(
+            &state.db,
+            &config,
+            &unlocked,
+            &question,
+            &history,
+            &memory_brief,
+            Some(reranker),
+            &state.heavy_inference,
+            Some(sources),
+        )
+        .await;
+    }
 
     // Agentic path — CLOUD-connection roles only (the same rule as the in-meeting brain:
     // local-GGUF multi-step tool-call reliability is unproven). The eligibility gate keys on the
@@ -8275,6 +8551,7 @@ pub async fn ask_vault(
         &memory_brief,
         Some(reranker),
         &state.heavy_inference,
+        None, // whole-vault path: no explicit sources ⇒ the existing search corpus, unchanged.
     )
     .await
 }
@@ -8514,6 +8791,7 @@ enum AskFloorPrompt {
 /// assembly (hybrid when semantic search is ON, FTS otherwise — Phase 2b semantics unchanged), the
 /// empty-corpus early return, and the corpus prompt build. The floor-equivalence test binds this
 /// to the original statement sequence.
+#[allow(clippy::too_many_arguments)] // cohesive gated-Ask surface: corpus/consent state + explicit sources.
 fn build_ask_vault_floor_prompt(
     db: &crate::storage::Db,
     config: &AppConfig,
@@ -8522,20 +8800,24 @@ fn build_ask_vault_floor_prompt(
     history: &[ChatTurn],
     memory_brief: &str,
     reranker: Option<&dyn crate::rerank::Reranker>,
+    explicit_sources: Option<&[crate::storage::models::SourceRef]>,
 ) -> Result<AskFloorPrompt, AppError> {
-    // Phase 2b (gated): when semantic search is ON, pick candidates by HYBRID retrieval (FTS ∪
-    // vector KNN, RRF-fused) — embedding the query with the active embedder — then pack with the
-    // SAME budget/citation logic and the SAME visibility gate. When OFF (the default) OR the index
-    // is empty, this falls back to the existing FTS-only path UNCHANGED (the hybrid query
-    // degenerates to FTS when no vectors exist; the flag-off branch is byte-for-byte the prior
-    // behavior).
     // Budget on the ASK-role provider's RESOLVED connection — the corpus egresses to it. With
     // role keys absent this is the legacy `provider_id` for EVERY brain_backend (the pre-role
     // floor always ignored `brain_backend`), so the packed corpus is byte-identical.
     let ask_conn =
         crate::summarize::roles::provider_target(crate::summarize::roles::Role::Ask, config)
             .connection;
-    let (corpus, sources) = if config.semantic_search_enabled {
+    // note↔meeting-links PR-2 — PINNED corpus: when the caller supplied an explicit source list, the
+    // FTS/vector SEARCH is skipped entirely and the corpus is EXACTLY those sources (+ their capped,
+    // gated link-expansion) — the user controls the context. Same `unlocked` visibility gate as
+    // every search leg (a sealed source/neighbour contributes nothing). `None` ⇒ the exact existing
+    // whole-vault search below, byte-for-byte.
+    let (corpus, sources) = if let Some(sources) = explicit_sources.filter(|s| !s.is_empty()) {
+        crate::summarize::vault_context::build_vault_context_pinned_visible(
+            db, sources, &ask_conn, unlocked,
+        )?
+    } else if config.semantic_search_enabled {
         let embedder = crate::embed::active_embedder();
         // QUERY side: use the e5 `query:` prefix (asymmetric with the `passage:` index side).
         let query_vec = embedder
@@ -8582,6 +8864,7 @@ async fn ask_vault_floor(
     memory_brief: &str,
     reranker: Option<Box<dyn crate::rerank::Reranker>>,
     heavy: &std::sync::Arc<tokio::sync::Semaphore>,
+    explicit_sources: Option<Vec<crate::storage::models::SourceRef>>,
 ) -> Result<AskVaultResult, AppError> {
     // `build_ask_vault_floor_prompt` does the LOCAL/on-device work — query embedding (Candle/
     // Metal) + hybrid FTS∪vector retrieval + reranker inference — synchronously. This is exactly
@@ -8607,6 +8890,7 @@ async fn ask_vault_floor(
             &history_owned,
             &memory_brief_owned,
             reranker.as_deref(),
+            explicit_sources.as_deref(),
         )
     })
     .await
@@ -8892,7 +9176,9 @@ mod ask_vault_tests {
         let (want_system, want_user) =
             crate::summarize::vault_chat::build(&corpus, &history, q, "");
 
-        match build_ask_vault_floor_prompt(&db, &cfg, &unlocked, q, &history, "", None).unwrap() {
+        match build_ask_vault_floor_prompt(&db, &cfg, &unlocked, q, &history, "", None, None)
+            .unwrap()
+        {
             AskFloorPrompt::Ready {
                 system,
                 user,
@@ -8923,7 +9209,8 @@ mod ask_vault_tests {
 
         // The empty-vault early return keeps the EXACT pre-change canned answer.
         let empty = tmp_db();
-        match build_ask_vault_floor_prompt(&empty, &cfg, &unlocked, q, &[], "", None).unwrap() {
+        match build_ask_vault_floor_prompt(&empty, &cfg, &unlocked, q, &[], "", None, None).unwrap()
+        {
             AskFloorPrompt::Empty(r) => {
                 assert_eq!(
                     r.answer,
@@ -8966,6 +9253,7 @@ mod ask_vault_tests {
             "",
             None,
             &std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+            None,
         ));
         assert!(
             matches!(res, Err(AppError::Unavailable(_))),
@@ -19355,6 +19643,280 @@ mod lifecycle_tests {
                 .iter()
                 .any(|n| n.content_blob.is_some()),
             "the seal (content_blob) is left intact"
+        );
+    }
+
+    // ── note↔meeting-links PR-1 — MANUAL linking (command layer) ─────────────────────────────────
+
+    /// Seed a standalone note-doc (`kind='note'`) in a folder for the manual-link command tests. The
+    /// folder must already exist in the `folders` table (via `make_open_folder`) so the read gates
+    /// (`get_note_row` → `folder_is_unlocked`) resolve it.
+    fn seed_note_doc_cmd(db: &Db, id: &str, folder_id: &str, title: &str, body: &str) {
+        db.insert_note(id, folder_id, title, title, body, 1_700_000_000_000)
+            .unwrap();
+    }
+
+    /// Count the `manual` rows incident on `(kind, id)` (either endpoint).
+    fn manual_link_count(state: &AppState, kind: &str, id: &str) -> i64 {
+        state.db.link_edge_count(kind, id, "manual")
+    }
+
+    /// A MEETING source creates a `manual` row but writes NO markdown into the meeting's note (a
+    /// meeting has no owned editable body — row only, per fork #2).
+    #[test]
+    fn link_from_meeting_creates_row_but_no_markdown() {
+        let state = build_state("link-from-meeting");
+        make_open_folder(&state.db, "f-open", "Project");
+        seed_meeting(&state.db, "m1", "# Meeting note body\n", Some("f-open"));
+        state.db.set_meeting_title("m1", "Kickoff").unwrap();
+        seed_note_doc_cmd(&state.db, "n1", "f-open", "Design Doc", "the design body");
+
+        let before = state
+            .db
+            .get_latest_note_for_meeting("m1")
+            .unwrap()
+            .unwrap()
+            .markdown;
+
+        // Link meeting m1 → note n1.
+        link_items_inner(&state, "meeting", "m1", "note", "n1").unwrap();
+
+        // A manual row exists...
+        assert_eq!(manual_link_count(&state, "meeting", "m1"), 1, "manual row created");
+        // ...and the meeting's note markdown is UNTOUCHED (no injected [[...]] / links block).
+        let after = state
+            .db
+            .get_latest_note_for_meeting("m1")
+            .unwrap()
+            .unwrap()
+            .markdown;
+        assert_eq!(after, before, "a meeting source writes no markdown");
+        assert!(
+            !after.contains("murmur:links"),
+            "no managed links block injected into a meeting source"
+        );
+    }
+
+    /// A NOTE source creates a `manual` row AND materializes `[[Title]]` into the note body; after the
+    /// note's wikilinks are re-indexed, the pair shows as ONE deduped chip in `links_for_visible`.
+    #[test]
+    fn link_from_note_materializes_wikilink_and_dedupes() {
+        let state = build_state("link-from-note");
+        make_open_folder(&state.db, "f-open", "Project");
+        seed_note_doc_cmd(&state.db, "src", "f-open", "Source Note", "original body\n");
+        seed_note_doc_cmd(&state.db, "dst", "f-open", "Target Note", "target body");
+
+        // Link note src → note dst.
+        link_items_inner(&state, "note", "src", "note", "dst").unwrap();
+
+        // A manual row exists...
+        assert_eq!(manual_link_count(&state, "note", "src"), 1, "manual row created");
+        // ...and the source note body gained the [[Target Note]] marker (materialized).
+        let body = state.db.get_note_row("src").unwrap().unwrap().text;
+        assert!(
+            body.contains("[[Target Note]]"),
+            "the [[Title]] was materialized into the note body; got: {body}"
+        );
+        assert!(
+            body.starts_with("original body\n"),
+            "the original body is preserved; got: {body}"
+        );
+
+        // The materialize went through `update_note_doc_inner`, which re-indexes wikilinks — so a
+        // `wikilink` edge for the same pair now ALSO exists. The reader must collapse to ONE chip.
+        assert_eq!(link_count_in(&state, "note", "src", "wikilink"), 1, "wikilink edge also present");
+        let unlocked = unlocked_snapshot(&state).unwrap();
+        let edges = state
+            .db
+            .links_for_visible(crate::links::LinkKind::Note, "src", &unlocked)
+            .unwrap();
+        let to_dst: Vec<_> = edges.iter().filter(|e| e.other_id == "dst").collect();
+        assert_eq!(to_dst.len(), 1, "manual + wikilink collapse to ONE chip");
+        assert!(to_dst[0].manual, "the collapsed chip is flagged removable-manual");
+    }
+
+    /// Helper mirroring db.rs `link_count` for the command-test module.
+    fn link_count_in(state: &AppState, kind: &str, id: &str, edge_type: &str) -> i64 {
+        state.db.link_edge_count(kind, id, edge_type)
+    }
+
+    /// UNLINK removes the `manual` row and strips the materialized `[[Title]]` from the source note
+    /// body. The wikilink edge that the materialize produced is NOT deleted by unlink (only the manual
+    /// row is), but the strip removes the `[[Title]]`, so a follow-up re-index would drop the wikilink
+    /// too — here we assert the DIRECT contract: manual row gone + marker stripped.
+    #[test]
+    fn unlink_removes_row_and_strips_marker() {
+        let state = build_state("unlink-strips");
+        make_open_folder(&state.db, "f-open", "Project");
+        seed_note_doc_cmd(&state.db, "src", "f-open", "Source Note", "original body\n");
+        seed_note_doc_cmd(&state.db, "dst", "f-open", "Target Note", "target body");
+
+        link_items_inner(&state, "note", "src", "note", "dst").unwrap();
+        assert_eq!(manual_link_count(&state, "note", "src"), 1, "precondition: manual row exists");
+        assert!(
+            state.db.get_note_row("src").unwrap().unwrap().text.contains("[[Target Note]]"),
+            "precondition: marker materialized"
+        );
+
+        // Unlink note src → note dst.
+        unlink_items_inner(&state, "note", "src", "note", "dst").unwrap();
+
+        // The manual row is gone...
+        assert_eq!(manual_link_count(&state, "note", "src"), 0, "manual row deleted");
+        // ...and the [[Target Note]] marker is stripped from the body.
+        let body = state.db.get_note_row("src").unwrap().unwrap().text;
+        assert!(
+            !body.contains("[[Target Note]]"),
+            "the materialized marker is stripped on unlink; got: {body}"
+        );
+        assert!(
+            body.starts_with("original body\n"),
+            "the original body is preserved after strip; got: {body}"
+        );
+    }
+
+    /// A sealed-and-not-session-unlocked endpoint refuses the link with `AppError::Locked` BEFORE any
+    /// write — never link behind a lock, never reveal a locked neighbour.
+    #[test]
+    fn link_items_refuses_sealed_endpoint() {
+        let state = build_state("link-refuses-sealed");
+        // Open source note; sealed destination note (in a locked, NOT-session-unlocked folder).
+        make_open_folder(&state.db, "f-open", "Open");
+        make_open_folder(&state.db, "f-lock", "Secret");
+        seed_note_doc_cmd(&state.db, "src", "f-open", "Source Note", "body");
+        seed_note_doc_cmd(&state.db, "dst", "f-lock", "Secret Note", "secret body");
+        // Seal the destination note + lock its folder (NOT session-unlocked).
+        state.db.seal_document("dst", &b"ciphertext"[..]).unwrap();
+        state
+            .db
+            .set_folder_locked("f-lock", true, Some(&b"wrapped"[..]))
+            .unwrap();
+
+        // Link src → dst must refuse Locked.
+        let err = link_items_inner(&state, "note", "src", "note", "dst").unwrap_err();
+        assert!(
+            matches!(err, AppError::Locked(_)),
+            "a sealed destination endpoint must refuse with Locked; got {err:?}"
+        );
+        // No manual row was written (fail-closed BEFORE the write).
+        assert_eq!(manual_link_count(&state, "note", "src"), 0, "no row written behind the lock");
+        // And the source body was NOT materialized.
+        assert!(
+            !state.db.get_note_row("src").unwrap().unwrap().text.contains("[["),
+            "no marker written when the link is refused"
+        );
+
+        // Symmetric: a SEALED SOURCE also refuses (never mutate a locked note's body).
+        let err2 = link_items_inner(&state, "note", "dst", "note", "src").unwrap_err();
+        assert!(
+            matches!(err2, AppError::Locked(_)),
+            "a sealed source endpoint must refuse with Locked; got {err2:?}"
+        );
+    }
+
+    /// A `document` endpoint (an imported PDF/DOCX, `kind='document'` — NOT a `get_note_row` row) must
+    /// be LINKABLE when visible and REFUSED when sealed. Before the dedicated `Document` gate arm,
+    /// `link_endpoint_is_unlocked` routed documents through `get_note_row` (which filters `kind='note'`)
+    /// → `None` → a spurious `Locked` even for an OPEN document. RED: the "open document links"
+    /// assertion fails on the pre-fix code path; the sealed-document refusal proves the gate still holds.
+    #[test]
+    fn link_items_gates_document_endpoint() {
+        let state = build_state("link-doc-endpoint");
+        make_open_folder(&state.db, "f-open", "Open");
+        make_open_folder(&state.db, "f-lock", "Secret");
+        seed_note_doc_cmd(&state.db, "src", "f-open", "Source Note", "body\n");
+        // An OPEN imported document (linkable) + a SEALED imported document (must refuse).
+        state
+            .db
+            .insert_document("doc-open", "f-open", "Contract.pdf", "extracted text", "document", 0i64)
+            .unwrap();
+        state
+            .db
+            .insert_document("doc-seal", "f-lock", "Secret.pdf", "secret extracted", "document", 0i64)
+            .unwrap();
+        state
+            .db
+            .set_folder_locked("f-lock", true, Some(&b"wrapped"[..]))
+            .unwrap();
+
+        // Linking the OPEN document SUCCEEDS (RED before the Document gate arm — was a spurious Locked).
+        link_items_inner(&state, "note", "src", "document", "doc-open").unwrap();
+        let open = unlocked_snapshot(&state).unwrap();
+        assert_eq!(
+            state
+                .db
+                .links_for_visible(crate::links::LinkKind::Note, "src", &open)
+                .unwrap()
+                .iter()
+                .filter(|e| e.other_id == "doc-open")
+                .count(),
+            1,
+            "an open document must be linkable and visible from the note side"
+        );
+
+        // Linking the SEALED document REFUSES Locked (gate holds through the new arm; no row written).
+        let err = link_items_inner(&state, "note", "src", "document", "doc-seal").unwrap_err();
+        assert!(
+            matches!(err, AppError::Locked(_)),
+            "a sealed document endpoint must refuse with Locked; got {err:?}"
+        );
+    }
+
+    /// A MANUAL link is gated on read from BOTH sides after the fact: sealing EITHER endpoint hides
+    /// the edge in `links_for_visible` from BOTH directions; unsealing restores it. (Command-level
+    /// end-to-end mirror of the db-layer gate test — proves the command-created row rides the gate.)
+    #[test]
+    fn manual_link_created_and_gated_both_endpoints_cmd() {
+        let state = build_state("manual-gate-cmd");
+        make_open_folder(&state.db, "f-open", "Open");
+        make_open_folder(&state.db, "f-lock", "Secret");
+        // A note source (open) and a MEETING destination in the lockable folder.
+        seed_note_doc_cmd(&state.db, "src", "f-open", "Source Note", "body\n");
+        seed_meeting(&state.db, "m-dst", "# Meeting body\n", Some("f-lock"));
+        state.db.set_meeting_title("m-dst", "Secret Meeting").unwrap();
+
+        link_items_inner(&state, "note", "src", "meeting", "m-dst").unwrap();
+
+        // Both open → edge visible from either side.
+        let open = unlocked_snapshot(&state).unwrap();
+        assert_eq!(
+            state.db.links_for_visible(crate::links::LinkKind::Note, "src", &open).unwrap()
+                .iter().filter(|e| e.other_id == "m-dst").count(),
+            1,
+            "edge visible from the note side while both open"
+        );
+        assert_eq!(
+            state.db.links_for_visible(crate::links::LinkKind::Meeting, "m-dst", &open).unwrap()
+                .iter().filter(|e| e.other_id == "src").count(),
+            1,
+            "edge visible from the meeting side while both open"
+        );
+
+        // Seal the MEETING's folder (not session-unlocked) → edge hidden BOTH directions.
+        state
+            .db
+            .set_folder_locked("f-lock", true, Some(&b"wrapped"[..]))
+            .unwrap();
+        let sealed = unlocked_snapshot(&state).unwrap(); // still empty — f-lock not session-unlocked.
+        assert!(
+            state.db.links_for_visible(crate::links::LinkKind::Note, "src", &sealed).unwrap()
+                .iter().all(|e| e.other_id != "m-dst"),
+            "sealed meeting neighbour hidden from the note side"
+        );
+        assert!(
+            state.db.links_for_visible(crate::links::LinkKind::Meeting, "m-dst", &sealed).unwrap()
+                .is_empty(),
+            "a sealed queried meeting never reveals it HAS a manual link"
+        );
+
+        // Session-unlock the meeting's folder → edge restored on both sides.
+        state.unlocked_folders.lock().unwrap().insert("f-lock".to_string());
+        let unlocked = unlocked_snapshot(&state).unwrap();
+        assert_eq!(
+            state.db.links_for_visible(crate::links::LinkKind::Note, "src", &unlocked).unwrap()
+                .iter().filter(|e| e.other_id == "m-dst").count(),
+            1,
+            "edge restored from the note side once the meeting folder is unlocked"
         );
     }
 

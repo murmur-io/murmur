@@ -9915,6 +9915,83 @@ impl Db {
         Ok(())
     }
 
+    /// note↔meeting-links PR-1 — upsert ONE user-initiated DIRECTED `manual` edge (`created_by='user'`,
+    /// `status='active'`, `score=1.0`). Idempotent on the table's UNIQUE key (a repeat link is a no-op
+    /// refresh, never a duplicate row). Directed like wikilink/companion — endpoints are stored AS
+    /// PASSED (never canonicalized). The CALLER (`link_items_inner`) has already gated BOTH endpoints
+    /// session-visible before this write, so a `manual` row is never created behind a lock. Purged on
+    /// seal by the edge-type-agnostic `purge_links_tx`; read through the both-endpoint-gated
+    /// `links_for_visible`. This wrapper exposes the private `upsert_link_tx` to the command layer
+    /// exactly as `set_companion_link` does for the companion edge — no new SQL surface.
+    pub fn upsert_manual_link(
+        &self,
+        src_kind: &str,
+        src_id: &str,
+        dst_kind: &str,
+        dst_id: &str,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        Self::upsert_link_tx(
+            &tx, src_kind, src_id, dst_kind, dst_id, "manual", 1.0, "user", "active", now,
+        )?;
+        tx.commit().map_err(map_err)?;
+        tracing::info!(
+            target: "links",
+            src_kind = src_kind,
+            dst_kind = dst_kind,
+            "upsert_manual_link"
+        );
+        Ok(())
+    }
+
+    /// note↔meeting-links PR-1 — delete ONLY the DIRECTED `manual` edge for `(src → dst)`. NEVER
+    /// touches a `wikilink`/`companion`/`semantic` row for the same pair (the `edge_type='manual'`
+    /// predicate is exact): unlinking a manual link leaves any derived wikilink/companion/semantic
+    /// relation intact. Idempotent (0 rows for an already-absent edge). The CALLER strips the
+    /// materialized `[[Title]]` from the source note's body separately (best-effort).
+    pub fn delete_manual_link(
+        &self,
+        src_kind: &str,
+        src_id: &str,
+        dst_kind: &str,
+        dst_id: &str,
+    ) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "DELETE FROM links
+               WHERE src_kind = ?1 AND src_id = ?2 AND dst_kind = ?3 AND dst_id = ?4
+                 AND edge_type = 'manual'",
+            rusqlite::params![src_kind, src_id, dst_kind, dst_id],
+        )
+        .map_err(map_err)?;
+        tracing::info!(
+            target: "links",
+            src_kind = src_kind,
+            dst_kind = dst_kind,
+            "delete_manual_link"
+        );
+        Ok(())
+    }
+
+    /// TEST-ONLY raw count of `links` rows of `edge_type` incident on `(kind, id)` (either endpoint).
+    /// Exposes the private connection to sibling-crate test modules (`commands.rs`) so they can assert
+    /// the PRE-collapse row counts (manual vs wikilink separately) that `links_for_visible` hides. Not
+    /// compiled into the shipping binary.
+    #[cfg(test)]
+    pub(crate) fn link_edge_count(&self, kind: &str, id: &str, edge_type: &str) -> i64 {
+        self.lock()
+            .query_row(
+                "SELECT COUNT(*) FROM links
+                   WHERE edge_type = ?3
+                     AND ((src_kind = ?1 AND src_id = ?2) OR (dst_kind = ?1 AND dst_id = ?2))",
+                rusqlite::params![kind, id, edge_type],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
     /// PURGE every link row whose SRC OR DST is a sealed/deleted meeting or document (a note id IS a
     /// `documents` id, so `document_ids` covers the `note` kind too). Runs INSIDE an existing seal /
     /// delete tx so a link — which reveals a neighbour's existence + title — never outlives the
@@ -10314,10 +10391,85 @@ impl Db {
                 status: st,
                 score,
                 created_at,
+                // Set on the base build; the collapse pass below flips it true per (other_kind,
+                // other_id) pair that carries a `manual` edge.
+                manual: false,
             });
         }
+        let edges = Self::collapse_manual_duplicate_edges(edges);
         tracing::debug!(target: "links", count = edges.len(), "links_for_visible resolved");
         Ok(edges)
+    }
+
+    /// note↔meeting-links PR-1 — DISPLAY DEDUPE (avoid double chips): a note→meeting `manual` link
+    /// ALSO materializes `[[Title]]` into the note body, so the next save adds a `wikilink` edge for
+    /// the SAME `(other_kind, other_id)` pair. This collapses each such pair to ONE row so the FE
+    /// renders one chip, mirroring the `backlinks_for_visible` companion-vs-wikilink dedupe idiom.
+    ///
+    /// Rule per `(other_kind, other_id)` group:
+    /// - PREFER the DETERMINISTIC edge (`wikilink` > `companion` > `semantic`) for the surviving
+    ///   row's stable `id`/`edge_type` (its id is what accept/dismiss already key on), falling back to
+    ///   the `manual` row when it is the only edge for the pair.
+    /// - Set `manual = true` on the surviving row iff ANY edge in the group is a `manual` edge — so
+    ///   the FE knows the chip is user-created + REMOVABLE regardless of which `edge_type` won.
+    ///
+    /// Input order is already the reader's stable sort (active-then-suggested, score DESC, id ASC);
+    /// this preserves the FIRST-seen group's position so the output order stays deterministic. Pairs
+    /// with no `manual` edge are unchanged (`manual` stays false). Groups NEVER merge across different
+    /// `(other_kind, other_id)` — only true duplicates of the same neighbour collapse.
+    fn collapse_manual_duplicate_edges(
+        edges: Vec<crate::storage::models::LinkEdge>,
+    ) -> Vec<crate::storage::models::LinkEdge> {
+        // Preference rank: lower wins as the surviving deterministic representative.
+        fn edge_rank(edge_type: &str) -> u8 {
+            match edge_type {
+                "wikilink" => 0,
+                "companion" => 1,
+                // A `manual` edge is a user's ACTIVE, removable link — it MUST outrank a mere
+                // `semantic` SUGGESTION so a manually-linked pair that is ALSO auto-suggested collapses
+                // to the active manual chip (removable `×`), NOT an Accept/Dismiss suggestion row. It
+                // still loses to the deterministic wikilink/companion edges (which are also active).
+                "manual" => 2,
+                // A suggested semantic edge wins the representative slot ONLY when it is the SOLE edge
+                // for the pair (a genuine, unconfirmed suggestion).
+                "semantic" => 3,
+                _ => 4,
+            }
+        }
+        // Preserve first-seen group order for a deterministic output.
+        let mut order: Vec<(String, String)> = Vec::new();
+        let mut groups: std::collections::HashMap<
+            (String, String),
+            crate::storage::models::LinkEdge,
+        > = std::collections::HashMap::new();
+        for edge in edges {
+            let key = (edge.other_kind.clone(), edge.other_id.clone());
+            let has_manual = edge.edge_type == "manual";
+            match groups.get_mut(&key) {
+                None => {
+                    order.push(key.clone());
+                    let mut rep = edge;
+                    rep.manual = has_manual;
+                    groups.insert(key, rep);
+                }
+                Some(rep) => {
+                    // A manual edge anywhere in the group makes the surviving chip removable.
+                    if has_manual {
+                        rep.manual = true;
+                    }
+                    // Promote the representative to the more-deterministic edge (lower rank wins).
+                    if edge_rank(&edge.edge_type) < edge_rank(&rep.edge_type) {
+                        let manual_flag = rep.manual; // carry the group's removable flag forward.
+                        *rep = edge;
+                        rep.manual = manual_flag;
+                    }
+                }
+            }
+        }
+        order
+            .into_iter()
+            .filter_map(|k| groups.remove(&k))
+            .collect()
     }
 
     /// Resolve a link endpoint's CURRENT display title through the visibility gate; `None` iff the
@@ -19485,6 +19637,229 @@ mod tests {
             seen += 1;
         }
         assert_eq!(seen, crate::links::SEMANTIC_LINK_CAP);
+    }
+
+    // ── note↔meeting-links PR-1 — MANUAL edge (DB layer) ─────────────────────────────────────────
+
+    /// A user-initiated `manual` edge is created as a DIRECTED `active`/`user`/score=1.0 row, and its
+    /// gated reader hides it when EITHER endpoint is sealed-not-unlocked (both directions) — restored
+    /// when the sealed side is session-unlocked. Same both-endpoint gate the wikilink edge rides.
+    #[test]
+    fn manual_link_row_created_and_gated_both_endpoints() {
+        let db = mem_db();
+        seed_folder(&db, "f-open", "Open");
+        seed_folder(&db, "f-secret", "Secret");
+        seed_note_doc(&db, "open", "f-open", "Open Note", "");
+        seed_note_doc(&db, "secret", "f-secret", "Secret Note", "");
+
+        // Create the manual edge open → secret.
+        db.upsert_manual_link("note", "open", "note", "secret").unwrap();
+        assert_eq!(
+            link_count(&db, "note", "open", "manual"),
+            1,
+            "one directed manual row exists"
+        );
+        // It is `active`/`user`/1.0.
+        let (created_by, status, score): (String, String, f64) = db
+            .lock()
+            .query_row(
+                "SELECT created_by, status, score FROM links WHERE edge_type='manual'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(created_by, "user");
+        assert_eq!(status, "active");
+        assert!((score - 1.0).abs() < 1e-9);
+
+        // Both open → visible from either side.
+        let nothing = HashSet::new();
+        assert_eq!(
+            db.links_for_visible(crate::links::LinkKind::Note, "open", &nothing)
+                .unwrap()
+                .len(),
+            1,
+            "manual edge visible when both endpoints open (src side)"
+        );
+        assert_eq!(
+            db.links_for_visible(crate::links::LinkKind::Note, "secret", &nothing)
+                .unwrap()
+                .len(),
+            1,
+            "manual edge visible from the dst side too"
+        );
+
+        // Seal the SECRET folder → the manual edge vanishes from BOTH directions (neighbour gate on
+        // the open side; queried-item existence gate on the secret side).
+        db.set_folder_locked("f-secret", true, None).unwrap();
+        assert!(
+            db.links_for_visible(crate::links::LinkKind::Note, "open", &nothing)
+                .unwrap()
+                .is_empty(),
+            "manual edge hidden from the open side when its neighbour is sealed"
+        );
+        assert!(
+            db.links_for_visible(crate::links::LinkKind::Note, "secret", &nothing)
+                .unwrap()
+                .is_empty(),
+            "a sealed queried item never reveals it HAS a manual link"
+        );
+
+        // Session-unlock the secret folder → the manual edge is restored on both sides.
+        let mut unlocked = HashSet::new();
+        unlocked.insert("f-secret".to_string());
+        let edges = db
+            .links_for_visible(crate::links::LinkKind::Note, "open", &unlocked)
+            .unwrap();
+        assert_eq!(edges.len(), 1, "manual edge restored once secret is unlocked");
+        assert_eq!(edges[0].edge_type, "manual");
+        assert!(edges[0].manual, "the surviving chip is flagged user-removable");
+    }
+
+    /// DISPLAY DEDUPE: a `manual` edge AND a `wikilink` edge for the SAME `(other_kind, other_id)`
+    /// pair collapse to ONE `links_for_visible` chip — preferring the deterministic `wikilink`
+    /// `edge_type` (its stable id) but flagging `manual=true` so the FE renders the removable `×`.
+    #[test]
+    fn links_for_visible_dedupes_manual_and_wikilink() {
+        let db = mem_db();
+        seed_folder(&db, "f1", "Notes");
+        seed_note_doc(&db, "target", "f1", "Target", "the target body");
+        seed_note_doc(&db, "source", "f1", "Source", "");
+
+        let unlocked = HashSet::new();
+        // A manual edge source → target.
+        db.upsert_manual_link("note", "source", "note", "target").unwrap();
+        // AND a wikilink edge for the SAME pair (as if the [[Target]] materialized into the body).
+        db.index_wikilinks_for_source(
+            crate::links::LinkKind::Note,
+            "source",
+            "see [[Target]] for context",
+            &unlocked,
+        )
+        .unwrap();
+        // Two raw rows for the pair (manual + wikilink)...
+        assert_eq!(link_count(&db, "note", "source", "manual"), 1);
+        assert_eq!(link_count(&db, "note", "source", "wikilink"), 1);
+
+        // ...but ONE collapsed chip in the reader.
+        let edges = db
+            .links_for_visible(crate::links::LinkKind::Note, "source", &unlocked)
+            .unwrap();
+        let to_target: Vec<_> = edges.iter().filter(|e| e.other_id == "target").collect();
+        assert_eq!(to_target.len(), 1, "manual + wikilink collapse to ONE chip");
+        assert_eq!(
+            to_target[0].edge_type, "wikilink",
+            "the deterministic edge type wins the collapse"
+        );
+        assert!(
+            to_target[0].manual,
+            "the collapsed chip is flagged as a removable manual link"
+        );
+    }
+
+    /// A pair carrying BOTH a user `manual` (active) edge AND an auto `semantic` (suggested) edge —
+    /// realistic, since a manually-linked pair is often also content-similar — must collapse to the
+    /// ACTIVE, removable MANUAL chip, NOT a semantic Accept/Dismiss suggestion. RED before the
+    /// `edge_rank` swap (a `manual` link must outrank a semantic SUGGESTION): the surviving chip was
+    /// `edge_type="semantic" status="suggested"`, so the FE rendered the user's active link as an
+    /// un-removable suggestion. (The manual+wikilink dedupe test above never exercised this collision,
+    /// because both of its edges are non-semantic/active.)
+    #[test]
+    fn links_for_visible_manual_beats_suggested_semantic() {
+        let db = mem_db();
+        seed_folder(&db, "f1", "Notes");
+        seed_note_doc(&db, "target", "f1", "Target", "the target body");
+        seed_note_doc(&db, "source", "f1", "Source", "");
+        let unlocked = HashSet::new();
+        // A user MANUAL link source → target...
+        db.upsert_manual_link("note", "source", "note", "target").unwrap();
+        // ...AND an auto SEMANTIC SUGGESTION for the SAME pair.
+        {
+            let now = 1_700_000_000_000i64;
+            let mut conn = db.lock();
+            let tx = conn.transaction().unwrap();
+            Db::upsert_link_tx(
+                &tx, "note", "source", "note", "target", "semantic", 0.9, "auto", "suggested", now,
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        assert_eq!(link_count(&db, "note", "source", "manual"), 1);
+        assert_eq!(link_count(&db, "note", "source", "semantic"), 1);
+
+        let edges = db
+            .links_for_visible(crate::links::LinkKind::Note, "source", &unlocked)
+            .unwrap();
+        let to_target: Vec<_> = edges.iter().filter(|e| e.other_id == "target").collect();
+        assert_eq!(to_target.len(), 1, "manual + semantic collapse to ONE chip");
+        let chip = to_target[0];
+        assert!(chip.manual, "the collapsed chip is a removable manual link");
+        // Load-bearing: the chip must NOT read as a suggested-semantic row — the FE partitions
+        // `edge_type=='semantic' && status=='suggested'` as an Accept/Dismiss suggestion, EXCLUDED
+        // from the removable deterministic chips (so a user's active link would lose its `×`).
+        assert!(
+            !(chip.edge_type == "semantic" && chip.status == "suggested"),
+            "a manually-linked pair must never render as an unconfirmed suggestion; got {} / {}",
+            chip.edge_type,
+            chip.status
+        );
+        assert_eq!(chip.status, "active", "a user manual link is active");
+    }
+
+    /// A pair with ONLY a `wikilink` edge (no manual) is NOT flagged `manual` — the FE renders it as
+    /// an auto (non-removable) chip. Guards the collapse against over-flagging.
+    #[test]
+    fn links_for_visible_non_manual_pair_not_flagged() {
+        let db = mem_db();
+        seed_folder(&db, "f1", "Notes");
+        seed_note_doc(&db, "target", "f1", "Target", "the target body");
+        seed_note_doc(&db, "source", "f1", "Source", "");
+        let unlocked = HashSet::new();
+        db.index_wikilinks_for_source(
+            crate::links::LinkKind::Note,
+            "source",
+            "see [[Target]] for context",
+            &unlocked,
+        )
+        .unwrap();
+        let edges = db
+            .links_for_visible(crate::links::LinkKind::Note, "source", &unlocked)
+            .unwrap();
+        let chip = edges.iter().find(|e| e.other_id == "target").unwrap();
+        assert_eq!(chip.edge_type, "wikilink");
+        assert!(!chip.manual, "a pure wikilink chip is not a removable manual link");
+    }
+
+    /// PURGE-ON-SEAL is edge-type-AGNOSTIC: a `manual` edge is dropped at rest exactly like a
+    /// wikilink when either endpoint's folder is sealed (the `purge_links_tx` leg on relock reblank).
+    #[test]
+    fn purge_links_tx_drops_manual_on_seal() {
+        let db = mem_db();
+        seed_folder(&db, "f-open", "Open");
+        seed_folder(&db, "f-secret", "Secret");
+        seed_note_doc(&db, "open", "f-open", "Open Note", "");
+        seed_note_doc(&db, "secret", "f-secret", "Secret Note", "");
+
+        db.upsert_manual_link("note", "open", "note", "secret").unwrap();
+        assert_eq!(link_count(&db, "note", "secret", "manual"), 1, "manual edge exists pre-seal");
+
+        // Seal the SECRET folder and run the relock reblank (carries the `purge_links_tx` leg).
+        db.set_folder_locked("f-secret", true, None).unwrap();
+        let mut folders = HashSet::new();
+        folders.insert("f-secret".to_string());
+        db.blank_sealed_notes_in_folders(&folders).unwrap();
+
+        // The manual row is GONE at rest — both directions (the sealed dst side and the open src side).
+        assert_eq!(
+            link_count(&db, "note", "secret", "manual"),
+            0,
+            "sealed endpoint's manual edge purged (dst side)"
+        );
+        assert_eq!(
+            link_count(&db, "note", "open", "manual"),
+            0,
+            "open source's manual edge to the sealed note purged (src side)"
+        );
     }
 
     /// PURGE-ON-SEAL, BOTH DIRECTIONS (existence-leak RED→GREEN): a wikilink edge between two notes in

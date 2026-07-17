@@ -11,6 +11,7 @@ import type {
   ClaimAlignment,
   LinkEdge,
   LinkKind,
+  SourceRef,
   WikiTarget,
   CompanionAppendResult,
   SourceKind,
@@ -1043,13 +1044,27 @@ export class IpcService {
     return invoke<void>("rename_meeting", { meetingId, title });
   }
 
-  /** Ask a grounded question about a meeting's transcript (chat with the meeting). */
+  /**
+   * Ask a grounded question about a meeting's transcript (chat with the meeting).
+   *
+   * `explicitSources` (source-scoped Brain) OPTIONALLY pins the answer to exactly
+   * the passed sources + their links (each `{kind, id}`; an extra `title` is
+   * ignored backend-side). Omitting it / `[]` / `null` keeps today's whole-vault
+   * behavior grounded on this meeting; a NON-empty array narrows the scope. Only
+   * sent when non-empty so existing callers are unaffected.
+   */
   chatMeeting(
     meetingId: string,
     question: string,
     history: ChatTurn[],
+    explicitSources?: SourceRef[],
   ): Promise<string> {
-    return invoke<string>("chat_meeting", { meetingId, question, history });
+    return invoke<string>("chat_meeting", {
+      meetingId,
+      question,
+      history,
+      ...(explicitSources?.length ? { explicitSources } : {}),
+    });
   }
 
   /** Built-in recipe templates (quick chips). */
@@ -1200,6 +1215,37 @@ export class IpcService {
    */
   dismissLink(id: number): Promise<void> {
     return invoke<void>("dismiss_link", { id });
+  }
+
+  /**
+   * PR-1 — CREATE a user-initiated link from `(srcKind, srcId)` → `(dstKind, dstId)`
+   * (the anchored item is the src). Directed: linking FROM a note materializes the
+   * neighbour's `[[Title]]` into the note body server-side; FROM a meeting it creates
+   * a pure relation row. GATED — refuses (`Locked`) when either endpoint is sealed.
+   * The caller re-runs {@link listLinks} afterward so the new chip appears.
+   */
+  linkItems(
+    srcKind: LinkKind,
+    srcId: string,
+    dstKind: LinkKind,
+    dstId: string,
+  ): Promise<void> {
+    return invoke<void>("link_items", { srcKind, srcId, dstKind, dstId });
+  }
+
+  /**
+   * PR-1 — REMOVE a user-created link from `(srcKind, srcId)` → `(dstKind, dstId)`
+   * (the inverse of {@link linkItems}). Only manual links (`LinkEdge.manual === true`)
+   * are removable this way. GATED — refuses (`Locked`) when either endpoint is sealed.
+   * The caller re-runs {@link listLinks} afterward so the chip drops out.
+   */
+  unlinkItems(
+    srcKind: LinkKind,
+    srcId: string,
+    dstKind: LinkKind,
+    dstId: string,
+  ): Promise<void> {
+    return invoke<void>("unlink_items", { srcKind, srcId, dstKind, dstId });
   }
 
   /**
@@ -1529,15 +1575,25 @@ export class IpcService {
    * 12 messages — send the full conversation and let it truncate; do NOT
    * trim FE-side.
    */
+  /**
+   * Ask a grounded question across the whole vault. `explicitSources`
+   * (source-scoped Brain) OPTIONALLY pins the answer to exactly the passed
+   * sources + their links (each `{kind, id}`; an extra `title` is ignored
+   * backend-side). Omitting it / `[]` / `null` keeps today's whole-vault
+   * behavior; a NON-empty array narrows the scope. Only sent when non-empty so
+   * existing callers are unaffected.
+   */
   askVault(
     question: string,
     history: ChatTurn[],
     askThreadId?: string,
+    explicitSources?: SourceRef[],
   ): Promise<AskVaultResult> {
     return invoke<AskVaultResult>("ask_vault", {
       question,
       history,
       askThreadId,
+      ...(explicitSources?.length ? { explicitSources } : {}),
     });
   }
 
@@ -2007,12 +2063,14 @@ export class IpcService {
     threadId?: string,
     anchorText?: string,
     meetingId?: string,
+    explicitSources?: SourceRef[],
   ): Promise<VoiceActionResultPayload> {
     return invoke<VoiceActionResultPayload>("ask_assistant_chat", {
       messages,
       threadId,
       anchorText,
       meetingId,
+      ...(explicitSources?.length ? { explicitSources } : {}),
     });
   }
 

@@ -48,6 +48,7 @@ import {
 } from "../note-brain-popover/note-brain-popover.component";
 import { NoteSharePanelComponent } from "../note-share-panel/note-share-panel.component";
 import { NoteSelectionToolbarComponent } from "../note-selection-toolbar/note-selection-toolbar.component";
+import { NoteChatComponent } from "../note-chat/note-chat.component";
 import { MurToggleComponent } from "../../../design-system/toggle/toggle.component";
 import { parseDoc, serializeDoc } from "./front-matter";
 import {
@@ -162,6 +163,7 @@ const FULL_WIDTH_KEY = "murmur-note-full-width";
     NoteBrainPopoverComponent,
     NoteSelectionToolbarComponent,
     NoteSharePanelComponent,
+    NoteChatComponent,
     MurToggleComponent,
     FormsModule,
   ],

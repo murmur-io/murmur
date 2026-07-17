@@ -19,86 +19,85 @@ import { MarkdownComponent } from "../../../shared/markdown/markdown.component";
 
 /** The starter prompts shown in the empty state — tap to ask immediately. */
 const STARTERS: readonly string[] = [
-  "Summarize the key decisions",
-  "What are my action items?",
-  "What questions were left open?",
+  "Summarize this note",
+  "What's missing?",
+  "Find related meetings",
 ];
 
 /**
- * "Chat with this meeting" — a grounded Q&A panel over a single meeting's
- * transcript. It is a presentational sibling of the timeline + analysis cards:
- * the parent owns the meeting; this component owns only the conversation it
- * builds via {@link IpcService.chatMeeting}, which answers strictly from that
- * meeting's transcript.
+ * "Ask about this note" — a grounded Q&A panel anchored to a single authored
+ * note (Brain v3, source-scoped Brain PR-4). A presentational TWIN of
+ * {@link MeetingChatComponent}: the same conversation/draft/pending/error/
+ * canSend/send/retry/clear/auto-scroll idioms and MarkdownComponent replies.
  *
- * Lives in its own file so its inline styles get their own per-component
- * `anyComponentStyle` budget (the detail component's styles are near the cap).
+ * The one shape difference from the meeting twin is grounding: it answers via
+ * {@link IpcService.askVault} PINNED to this note's source scope (the note +
+ * its active links, pre-filled into the `<mur-source-picker>`), rather than a
+ * per-meeting transcript chat. Like meeting-chat it is STATELESS — no thread
+ * persistence — so `askVault`'s `askThreadId` is left `undefined` and the FULL
+ * prior conversation is re-sent as history each turn.
  *
- * Assistant replies are rendered as PLAIN TEXT with `white-space: pre-wrap`
- * (no markdown lib, no innerHTML/DomSanitizer) — line breaks + spacing from the
- * model are preserved verbatim and safely.
+ * Lives in its own file so its scoped styles get their own per-component
+ * `anyComponentStyle` budget.
  */
 @Component({
-  selector: "app-meeting-chat",
+  selector: "app-note-chat",
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [MarkdownComponent, SourcePickerComponent],
-  templateUrl: "./meeting-chat.component.html",
-  styleUrl: "./meeting-chat.component.scss",
+  templateUrl: "./note-chat.component.html",
+  styleUrl: "./note-chat.component.scss",
 })
-export class MeetingChatComponent {
+export class NoteChatComponent {
   private readonly ipc = inject(IpcService);
   private readonly injector = inject(Injector);
   private readonly sourceScope = inject(SourceScopeService);
 
-  /** The meeting whose transcript grounds every answer. */
-  readonly meetingId = input.required<string>();
+  /** The note whose content grounds every answer (the pre-fill anchor). */
+  readonly noteId = input.required<string>();
   /**
-   * The meeting's display title — the label of the anchor chip pre-filled into
-   * the picker (falls back to the id when absent). Display-only; identity is
+   * The note's display title — the label of the anchor chip pre-filled into the
+   * picker (falls back to the id when absent). Display-only; identity is
    * `kind + id`.
    */
   readonly anchorTitle = input<string | null>(null);
 
-  /**
-   * Source-scoped Brain — the `<mur-source-picker>` selection (this meeting +
-   * its active links, pre-filled on load). A NON-empty selection PINS the answer
-   * to exactly those sources + their links; empty keeps the whole-meeting
-   * grounding. `send()` passes `undefined` when empty (see below).
-   */
-  readonly sources = signal<SourceRef[]>([]);
-
-  /**
-   * Pre-fill the picker with the default scope for THIS meeting (the meeting
-   * itself + its active linked neighbours) whenever the meeting id changes.
-   * A legitimate signal-writing IPC effect (T1): keyed on `meetingId()`, with a
-   * monotonic stale-result guard so a late reply for a superseded meeting is
-   * dropped (the id can change while the component is reused across meetings).
-   */
-  private prefillSeq = 0;
-  private readonly _prefill = effect(() => {
-    const id = this.meetingId();
-    const title = this.anchorTitle() ?? undefined;
-    const seq = ++this.prefillSeq;
-    void this.sourceScope
-      .defaultSources("meeting", id, title)
-      .then((defaults) => {
-        if (seq === this.prefillSeq) {
-          this.sources.set(defaults);
-        }
-      });
-  });
-
   /** The running conversation (optimistic user turns + grounded replies). */
   readonly conversation = signal<ChatTurn[]>([]);
-  /** True while a {@link IpcService.chatMeeting} call is in flight. */
+  /** True while an {@link IpcService.askVault} call is in flight. */
   readonly pending = signal(false);
   /** Inline error message (with a Retry affordance); null when clear. */
   readonly error = signal<string | null>(null);
   /** Working copy of the composer text (textarea (input) → signal). */
   readonly draft = signal("");
 
+  /**
+   * Source-scoped Brain — the `<mur-source-picker>` selection (this note + its
+   * active links, pre-filled on load). A NON-empty selection PINS the answer to
+   * exactly those sources + their links; `send()` always passes it (the note
+   * itself is one of the sources, so the scope is never whole-vault by default).
+   */
+  readonly sources = signal<SourceRef[]>([]);
+
   /** Starter prompts for the empty state. */
   protected readonly starters = STARTERS;
+
+  /**
+   * Pre-fill the picker with the default scope for THIS note (the note itself +
+   * its active linked neighbours) whenever the note id changes. A legitimate
+   * signal-writing IPC effect (T1): keyed on `noteId()`, with a monotonic
+   * stale-result guard so a late reply for a superseded note is dropped.
+   */
+  private prefillSeq = 0;
+  private readonly _prefill = effect(() => {
+    const id = this.noteId();
+    const title = this.anchorTitle() ?? undefined;
+    const seq = ++this.prefillSeq;
+    void this.sourceScope.defaultSources("note", id, title).then((defaults) => {
+      if (seq === this.prefillSeq) {
+        this.sources.set(defaults);
+      }
+    });
+  });
 
   /** A submit is allowed only with non-empty text and no in-flight request. */
   readonly canSend = computed(
@@ -161,10 +160,11 @@ export class MeetingChatComponent {
   }
 
   /**
-   * Ask the current question. Captures the question + the PRIOR history
-   * (the conversation before this turn), optimistically appends the user turn,
-   * awaits the grounded reply, then appends the assistant turn. On failure the
-   * user's question is kept (an inline Retry re-runs it).
+   * Ask the current question, grounded in this note's source scope. Captures the
+   * question + the PRIOR history (the conversation before this turn),
+   * optimistically appends the user turn, awaits the grounded reply, then
+   * appends the assistant turn. On failure the user's question is kept (an inline
+   * Retry re-runs it). Stateless like the meeting twin: no `askThreadId`.
    */
   async send(): Promise<void> {
     const question = this.draft().trim();
@@ -174,6 +174,8 @@ export class MeetingChatComponent {
 
     // History as seen by the model = everything BEFORE this turn.
     const priorHistory = this.conversation();
+    // Source-scoped Brain: pin the answer to this note + its links.
+    const scope = this.sources();
 
     this.error.set(null);
     this.draft.set("");
@@ -184,19 +186,16 @@ export class MeetingChatComponent {
     this.pending.set(true);
     this.scrollToLatest();
 
-    // Source-scoped Brain: an empty selection ⇒ pass undefined so the backend
-    // keeps this-meeting grounding; a non-empty selection pins to those sources.
-    const scope = this.sources();
     try {
-      const answer = await this.ipc.chatMeeting(
-        this.meetingId(),
+      const result = await this.ipc.askVault(
         question,
         priorHistory,
+        undefined,
         scope.length ? scope : undefined,
       );
       this.conversation.update((turns) => [
         ...turns,
-        { role: "assistant", content: answer },
+        { role: "assistant", content: result.answer },
       ]);
     } catch (e) {
       // Keep the user's question in the log so Retry can re-send it.
@@ -216,8 +215,8 @@ export class MeetingChatComponent {
    * Pin the log to the newest message. Runs after the next render so the new
    * row/typing indicator is laid out before we measure scrollHeight — zoneless
    * safe, no setTimeout. afterNextRender registered with this component's
-   * injector is a one-shot and is auto-torn-down when the component is
-   * destroyed, so there is nothing to clean up manually.
+   * injector is a one-shot torn down with the component, so there is nothing to
+   * clean up manually.
    */
   private scrollToLatest(): void {
     afterNextRender(
