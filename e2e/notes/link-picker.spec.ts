@@ -113,6 +113,77 @@ test("slash menu 'Link to note' opens the autocomplete popover and inserts [[Tit
 });
 
 /**
+ * Infinite scroll (2026-07-17) — the picker walks the WHOLE candidate list page
+ * by page instead of the old fixed top-8: page 0 renders one full backend page,
+ * and scrolling near the popover's bottom appends the next page (offset = rows
+ * already loaded) until the backend runs dry. The mock serves 100 candidates in
+ * 40-row pages straight from the `offset`/`limit` args, so this pins the REAL
+ * request arithmetic, not a canned reply.
+ */
+test("scrolling the picker to the bottom loads further candidate pages", async ({
+  page,
+}) => {
+  const consoleErrors: string[] = [];
+  page.on("console", (msg) => {
+    if (msg.type() === "error") {
+      consoleErrors.push(msg.text());
+    }
+  });
+  page.on("pageerror", (err) => consoleErrors.push(String(err)));
+
+  await mockNotes(page, {
+    // Page-side + self-contained (mockTauri serializes it): 100 notes, sliced
+    // by the offset/limit the component actually sends.
+    list_link_candidates: (args: { prefix: string; offset: number; limit: number }) => {
+      const total = 100;
+      const rows = [];
+      const end = Math.min(total, (args.offset ?? 0) + (args.limit ?? 40));
+      for (let i = args.offset ?? 0; i < end; i++) {
+        rows.push({
+          kind: "note",
+          id: `bulk-${i}`,
+          title: `Bulk note ${String(i).padStart(3, "0")}`,
+          snippet: "",
+        });
+      }
+      return rows;
+    },
+  });
+  await page.goto("/notes/n1");
+
+  const body = page.locator(".body-area");
+  await expect(body).toBeVisible();
+  await body.click();
+  await body.evaluate((el: HTMLTextAreaElement) => {
+    el.setSelectionRange(el.value.length, el.value.length);
+  });
+  await body.press("[");
+  await body.press("[");
+
+  const picker = page.locator("app-link-picker");
+  await expect(picker).toBeVisible();
+  const rows = picker.locator(".link-pop-row");
+  // Page 0: exactly one backend page, not the old top-8.
+  await expect(rows).toHaveCount(40);
+
+  // Scroll the popover itself to the bottom → the next page appends.
+  const pop = picker.locator(".link-pop");
+  await pop.evaluate((el) => {
+    el.scrollTop = el.scrollHeight;
+  });
+  await expect(rows).toHaveCount(80);
+
+  // And again → the final short page lands; a further scroll stays at 100.
+  await pop.evaluate((el) => {
+    el.scrollTop = el.scrollHeight;
+  });
+  await expect(rows).toHaveCount(100);
+  await expect(rows.last()).toHaveText(/Bulk note 099/);
+
+  expect(consoleErrors).toEqual([]);
+});
+
+/**
  * Fix 2 (parity) — typing the raw `[[` keystroke ALSO opens the picker (not just
  * the slash-menu entry), confirming the ONE shared trigger/component contract.
  */

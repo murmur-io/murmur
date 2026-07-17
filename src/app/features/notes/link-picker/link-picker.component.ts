@@ -22,6 +22,16 @@ import { RepositionOnScrollDirective } from "../note-brain-popover/reposition-on
 const QUERY_DEBOUNCE_MS = 150;
 /** The debounce-service key — only one picker is ever open at a time. */
 const DEBOUNCE_KEY = "link-picker-query";
+/**
+ * One backend page of the infinite scroll. A page that comes back exactly this
+ * size means more may exist; a shorter page means the list ran dry. The backend
+ * clamps whatever it is asked for to its own ceiling (100).
+ */
+const PAGE_SIZE = 40;
+/** Load the next page once the scroll position is within this many px of the bottom. */
+const SCROLL_LOAD_THRESHOLD_PX = 56;
+/** Keyboard ↑/↓: pull the next page once the active row is within this many rows of the end. */
+const KEYBOARD_LOAD_AHEAD_ROWS = 3;
 
 /**
  * The inline `[[` / slash-menu "Link to note" autocomplete (note-editor Fix 2) —
@@ -43,6 +53,13 @@ const DEBOUNCE_KEY = "link-picker-query";
  * `query()`, dropping a late reply for a superseded query). The resolved
  * `candidates()` is re-exposed via `candidatesChange` so the host's keyboard
  * handler can navigate/pick without duplicating the fetch.
+ *
+ * INFINITE SCROLL (2026-07-17): the backend paginates (`offset`/`limit`), so the
+ * popover walks the WHOLE visible vault instead of a fixed top-8 — the query
+ * fetch loads page 0 and each scroll-near-bottom (or ↑/↓ reaching the tail of
+ * what's loaded) appends the next page, deduped by `kind+id` (the `@for` track
+ * key must stay unique even if a row shifts pages mid-scroll). A query change
+ * resets the accumulation via the same `requestSeq` stale-guard.
  *
  * OPAQUE overlay (T3): `--surface-overlay`, `--border-strong`, `--shadow-lg`,
  * `backdrop-filter:none` — never the frosted `.card`, since this floats over the
@@ -90,6 +107,14 @@ export class LinkPickerComponent {
 
   /** Monotonic request token — a late reply for a superseded query is dropped (T1 stale-guard). */
   private requestSeq = 0;
+  /**
+   * True when the last page came back full, so another page may exist. Plain
+   * private fields (same precedent as {@link requestSeq}) — neither is read by
+   * the template; they only guard the fetch orchestration.
+   */
+  private hasMore = false;
+  /** Re-entrancy guard: one append fetch at a time. */
+  private loadingMore = false;
 
   constructor() {
     // Fetch on every query change (debounced) — a legitimate signal-writing effect
@@ -107,6 +132,26 @@ export class LinkPickerComponent {
       this.anchorRect(); // track
       this.reposition();
     });
+    // Keyboard nav over a paginated list: keep the active row scrolled into
+    // view (the host moves `activeIndex` without focus ever entering the
+    // popover), and pull the next page once ↑/↓ nears the tail of what's
+    // loaded. `afterNextRender` so the `.is-active` class from THIS change-
+    // detection pass is painted before we scroll to it.
+    effect(() => {
+      const idx = this.activeIndex();
+      const total = this.candidates().length;
+      if (total > 0 && idx >= total - KEYBOARD_LOAD_AHEAD_ROWS) {
+        void this.loadMore();
+      }
+      afterNextRender(
+        () => {
+          this.popoverEl()
+            ?.nativeElement.querySelector(".link-pop-row.is-active")
+            ?.scrollIntoView({ block: "nearest" });
+        },
+        { injector: this.injector },
+      );
+    });
     this.destroyRef.onDestroy(() => this.debounce.cancel(DEBOUNCE_KEY));
   }
 
@@ -114,14 +159,19 @@ export class LinkPickerComponent {
     const seq = ++this.requestSeq;
     this._loading.set(true);
     try {
-      const rows = await this.ipc.listLinkCandidates(q);
+      const rows = await this.ipc.listLinkCandidates(q, 0, PAGE_SIZE);
       if (seq !== this.requestSeq) {
         return; // superseded by a newer query.
       }
+      this.hasMore = rows.length === PAGE_SIZE;
       this.candidates.set(rows);
       this.candidatesChange.emit(rows);
+      // The list height changed (fresh page) — re-fit around the caret so a
+      // flipped-above popover never grows down over the line being typed.
+      this.reposition();
     } catch {
       if (seq === this.requestSeq) {
+        this.hasMore = false;
         this.candidates.set([]);
         this.candidatesChange.emit([]);
       }
@@ -129,6 +179,62 @@ export class LinkPickerComponent {
       if (seq === this.requestSeq) {
         this._loading.set(false);
       }
+    }
+  }
+
+  /**
+   * Append the next backend page (scroll neared the bottom, or ↑/↓ neared the
+   * tail of the loaded rows). Guarded by the SAME `requestSeq` as {@link fetch}:
+   * a query change mid-flight bumps it and the stale append is dropped whole.
+   */
+  private async loadMore(): Promise<void> {
+    if (!this.hasMore || this.loadingMore || this._loading()) {
+      return;
+    }
+    const seq = this.requestSeq;
+    this.loadingMore = true;
+    try {
+      const page = await this.ipc.listLinkCandidates(
+        this.query(),
+        this.candidates().length,
+        PAGE_SIZE,
+      );
+      if (seq !== this.requestSeq) {
+        return; // a newer query reset the list while this page was in flight.
+      }
+      this.hasMore = page.length === PAGE_SIZE;
+      // Dedupe on append: a row that shifted pages mid-scroll (e.g. a title
+      // edit reordered recency) must not repeat — the template's
+      // `track c.kind + c.id` requires unique keys.
+      const seen = new Set(this.candidates().map((c) => c.kind + c.id));
+      const fresh = page.filter((c) => !seen.has(c.kind + c.id));
+      if (fresh.length > 0) {
+        const next = [...this.candidates(), ...fresh];
+        this.candidates.set(next);
+        this.candidatesChange.emit(next);
+        this.reposition();
+      }
+    } catch {
+      if (seq === this.requestSeq) {
+        // Keep what's loaded; stop probing so a failing backend isn't hammered
+        // on every scroll tick. The next query change resets the flow.
+        this.hasMore = false;
+      }
+    } finally {
+      this.loadingMore = false;
+    }
+  }
+
+  /** Infinite scroll: fetch the next page when nearing the bottom of the popover. */
+  onScroll(): void {
+    const el = this.popoverEl()?.nativeElement;
+    if (!el) {
+      return;
+    }
+    const nearBottom =
+      el.scrollTop + el.clientHeight >= el.scrollHeight - SCROLL_LOAD_THRESHOLD_PX;
+    if (nearBottom) {
+      void this.loadMore();
     }
   }
 
