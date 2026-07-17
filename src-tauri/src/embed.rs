@@ -550,6 +550,17 @@ pub(crate) fn vec_to_blob(v: &[f32]) -> Vec<u8> {
     out
 }
 
+/// Inverse of [`vec_to_blob`]: decode a little-endian f32 byte blob (as stored in / read back from a
+/// `vec0 float[N]` column) into an `f32` vector. A trailing partial group (length not a multiple of
+/// 4) is ignored defensively — the caller checks the length against [`EMBED_DIM`] anyway. Used by the
+/// link engine's centroid math (Brain v3 PR-3), which reads the STORED per-chunk vectors directly
+/// rather than re-embedding.
+pub(crate) fn blob_to_vec(blob: &[u8]) -> Vec<f32> {
+    blob.chunks_exact(4)
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect()
+}
+
 /// Scalar-quantize an L2-normalized f32 embedding (components in ≈[-1, 1]) into an int8 byte blob
 /// for binding to a `vec0 int8[N]` column via `vec_int8(?)` (the M6 org partition — int8 is 3.7×
 /// smaller than f32 and holds in-query-budget at 300k chunks, the scale-spike finding).
