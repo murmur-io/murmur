@@ -5,13 +5,16 @@ import {
   Injector,
   afterNextRender,
   computed,
+  effect,
   inject,
   input,
   signal,
   viewChild,
 } from "@angular/core";
 import { IpcService } from "../../../core/ipc.service";
-import type { ChatTurn } from "../../../core/models";
+import type { ChatTurn, SourceRef } from "../../../core/models";
+import { SourceScopeService } from "../../../services/source-scope.service";
+import { SourcePickerComponent } from "../../../design-system/source-picker/source-picker.component";
 import { MarkdownComponent } from "../../../shared/markdown/markdown.component";
 
 /** The starter prompts shown in the empty state — tap to ask immediately. */
@@ -38,16 +41,52 @@ const STARTERS: readonly string[] = [
 @Component({
   selector: "app-meeting-chat",
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [MarkdownComponent],
+  imports: [MarkdownComponent, SourcePickerComponent],
   templateUrl: "./meeting-chat.component.html",
   styleUrl: "./meeting-chat.component.scss",
 })
 export class MeetingChatComponent {
   private readonly ipc = inject(IpcService);
   private readonly injector = inject(Injector);
+  private readonly sourceScope = inject(SourceScopeService);
 
   /** The meeting whose transcript grounds every answer. */
   readonly meetingId = input.required<string>();
+  /**
+   * The meeting's display title — the label of the anchor chip pre-filled into
+   * the picker (falls back to the id when absent). Display-only; identity is
+   * `kind + id`.
+   */
+  readonly anchorTitle = input<string | null>(null);
+
+  /**
+   * Source-scoped Brain — the `<mur-source-picker>` selection (this meeting +
+   * its active links, pre-filled on load). A NON-empty selection PINS the answer
+   * to exactly those sources + their links; empty keeps the whole-meeting
+   * grounding. `send()` passes `undefined` when empty (see below).
+   */
+  readonly sources = signal<SourceRef[]>([]);
+
+  /**
+   * Pre-fill the picker with the default scope for THIS meeting (the meeting
+   * itself + its active linked neighbours) whenever the meeting id changes.
+   * A legitimate signal-writing IPC effect (T1): keyed on `meetingId()`, with a
+   * monotonic stale-result guard so a late reply for a superseded meeting is
+   * dropped (the id can change while the component is reused across meetings).
+   */
+  private prefillSeq = 0;
+  private readonly _prefill = effect(() => {
+    const id = this.meetingId();
+    const title = this.anchorTitle() ?? undefined;
+    const seq = ++this.prefillSeq;
+    void this.sourceScope
+      .defaultSources("meeting", id, title)
+      .then((defaults) => {
+        if (seq === this.prefillSeq) {
+          this.sources.set(defaults);
+        }
+      });
+  });
 
   /** The running conversation (optimistic user turns + grounded replies). */
   readonly conversation = signal<ChatTurn[]>([]);
@@ -145,11 +184,15 @@ export class MeetingChatComponent {
     this.pending.set(true);
     this.scrollToLatest();
 
+    // Source-scoped Brain: an empty selection ⇒ pass undefined so the backend
+    // keeps this-meeting grounding; a non-empty selection pins to those sources.
+    const scope = this.sources();
     try {
       const answer = await this.ipc.chatMeeting(
         this.meetingId(),
         question,
         priorHistory,
+        scope.length ? scope : undefined,
       );
       this.conversation.update((turns) => [
         ...turns,
