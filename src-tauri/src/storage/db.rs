@@ -5226,6 +5226,19 @@ impl Db {
         // identical leaves + a summary), then build the L0/L1/L2 tree. `name` provenance carries into
         // the deterministic contextual header on the embed text.
         let blocks = crate::extract::blocks_from_stored_text(&text);
+        // READ-TIME REFLOW (doc-preview fix): de-fragment pathologically letter-spaced PDF text on a
+        // COPY before chunking, so (re)indexed chunks/embeddings retrieve on clean words
+        // (`"Fron\nt\nend"` → `"Frontend"`) instead of shattered glyph fragments. The gate is
+        // conservative — md/txt/note/legacy + clean PDF pages are byte-identical no-ops, so a normal
+        // document's chunk input is unchanged. `documents.text` at rest is NEVER mutated: only the
+        // in-memory block text fed to the chunker is reflowed.
+        let blocks: Vec<crate::extract::ExtractedBlock> = blocks
+            .into_iter()
+            .map(|b| crate::extract::ExtractedBlock {
+                text: crate::extract::reflow::reflow_fragmented_text(&b.text),
+                ..b
+            })
+            .collect();
         let hier = crate::embed::chunk_document_hierarchical(&name, &blocks);
         // Embed ONLY the embed-worthy chunks (L0 leaves + L2 summary; L1 parents are FTS-only). We
         // sub-batch to bound the per-call Metal tensor for a large PDF (mirror index_meeting_chunks).
@@ -19079,6 +19092,73 @@ mod tests {
             .search_doc_chunks_fts_visible("?!*(", 10, &nothing)
             .unwrap()
             .is_empty());
+    }
+
+    /// READ-TIME REFLOW (doc-preview fix), chunk-input NO-OP: an md upload's stored text carries NO
+    /// block sentinel → it reconstructs as one plain block, the reflow gate no-ops on clean prose, and
+    /// the chunk text is byte-identical to the stored text (retrieval unchanged for normal docs).
+    #[test]
+    fn index_document_chunks_reflow_is_noop_on_clean_md() {
+        let db = mem_db();
+        seed_folder(&db, "f-open", "Project");
+        // A clean md doc (no sentinel, normal prose) — the gate must NOT fire.
+        db.insert_document(
+            "d1",
+            "f-open",
+            "spec.md",
+            "the pistachio launch is in March",
+            "document",
+            100,
+        )
+        .unwrap();
+        db.index_document_chunks("d1", None).unwrap();
+        let nothing = std::collections::HashSet::new();
+        let hits = db
+            .search_doc_chunks_fts_visible("pistachio", 10, &nothing)
+            .unwrap();
+        assert!(
+            hits.iter()
+                .any(|h| h.document_id == "d1" && h.snippet.contains("pistachio")),
+            "clean md chunk text is unchanged by the (no-op) reflow gate: {hits:?}"
+        );
+    }
+
+    /// READ-TIME REFLOW (doc-preview fix), chunk-input DE-FRAGMENTS: a document whose stored text is a
+    /// LOCATED (page) block of pathologically letter-spaced PDF glyphs (`"Fron\nt\nend"`) must chunk on
+    /// the RECOVERED word ("Frontend") so a query for the real word retrieves it — proving reflow runs
+    /// on the chunk input, not just the display. RED-before-GREEN: the raw fragment does NOT contain
+    /// "Frontend", so without reflow the FTS query for "Frontend" finds nothing.
+    #[test]
+    fn index_document_chunks_reflow_defragments_letter_spaced_pdf_text() {
+        let db = mem_db();
+        seed_folder(&db, "f-open", "CVs");
+        // Build a stored text that carries the block sentinel (a located PDF page block), so
+        // `blocks_from_stored_text` reconstructs a located block whose fragmented text reflow repairs.
+        // The fragment is heavily letter-spaced (many ≤3-char lines) so it trips the conservative
+        // fragmentation gate — a lightly-broken block would (correctly) NOT reflow.
+        let block = crate::extract::ExtractedBlock {
+            text: "S\ntaff Fron\nt\nend Engineer bu\ni\nl\nd\ning realt\nime web plat\nforms in\nA\nng\nular and TypeScript".to_string(),
+            page: Some(1),
+            heading_path: None,
+        };
+        let stored = crate::extract::blocks_to_stored_text(std::slice::from_ref(&block));
+        assert!(
+            !stored.contains("Frontend"),
+            "precondition: the raw stored fragment does NOT contain the recovered word (RED state)"
+        );
+        db.insert_document("d1", "f-open", "cv.pdf", &stored, "document", 100)
+            .unwrap();
+        db.index_document_chunks("d1", None).unwrap();
+
+        let nothing = std::collections::HashSet::new();
+        let hits = db
+            .search_doc_chunks_fts_visible("Frontend", 10, &nothing)
+            .unwrap();
+        assert!(
+            hits.iter().any(|h| h.document_id == "d1"),
+            "reflow must de-fragment the chunk input so a query for the recovered word retrieves the \
+             document — without reflow the shattered fragment never matches: {hits:?}"
+        );
     }
 
     /// TOCTOU (lock-security finding, PR-1): `index_document_chunks` must REFUSE the entire write —

@@ -51,6 +51,16 @@ export class BrainSourceCardComponent {
   readonly busyLabel = input("Adding…");
   readonly emptyLabel = input("Nothing here yet.");
   /**
+   * When true, each list row is a clickable `<button>` that emits {@link openItem}
+   * to open a content preview. When false (the default), rows are NON-interactive
+   * (the pre-preview-feature shape) — used for sources where an empty read is
+   * AMBIGUOUS (a Note can be genuinely empty, so `""` from `getDocument` can't be
+   * proven to mean "locked"; Documents can never be empty, so preview is safe
+   * there only). Kept OFF for Notes so a normal empty note is never mislabeled
+   * "🔒 Locked".
+   */
+  readonly previewable = input(false);
+  /**
    * Optional fine-grained progress line shown under the Add button while
    * {@link busy} (e.g. a document's extract → chunk → embed stage). Null hides it.
    */
@@ -59,6 +69,8 @@ export class BrainSourceCardComponent {
   readonly add = output<void>();
   readonly deleteItem = output<DocumentInfo>();
   readonly toggleList = output<void>();
+  /** A list row was activated (click / Enter / Space) → open its preview. */
+  readonly openItem = output<DocumentInfo>();
 
   /** Epoch-millis → a short local date string. */
   protected formatDate(epochMs: number): string {
