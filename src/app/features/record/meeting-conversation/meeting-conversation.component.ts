@@ -9,80 +9,58 @@ import {
   effect,
   inject,
   input,
+  signal,
   viewChild,
 } from "@angular/core";
 import { MeetingConversationStore } from "../../../core/meeting-conversation.store";
-import { MarkdownComposerComponent } from "../../../design-system/markdown-composer/markdown-composer.component";
+import { NoteEditorComponent } from "../../notes/note-editor/note-editor.component";
+import {
+  MurSegmentedComponent,
+  type SegmentOption,
+} from "../../../design-system/segmented/segmented.component";
 import { AiOrbComponent } from "../ai-orb/ai-orb.component";
 import { NoteItemComponent } from "../note-item/note-item.component";
 import { ProactiveHintCardComponent } from "../proactive-hint-card/proactive-hint-card.component";
 import { WhisperCardComponent } from "../whisper-card/whisper-card.component";
 
-/** The inline mention marker that turns a composer line into a `@brain` thread. */
-const BRAIN_MARKER = "@brain";
+/** The two tabs of the recording panel. */
+type PanelTab = "note" | "ask";
 
 /**
- * Match `@brain` ONLY as a STANDALONE token — preceded by start-or-whitespace AND
- * followed by whitespace-or-end. This is load-bearing for PRIVACY + correctness: a
- * plain note that merely CONTAINS the substring ("bob@brainpower.com",
- * "jane@brainstorm.io", "@brainstorming session") must stay a NOTE (saved as a
- * real companion note, NEVER shipped to `ask_assistant_chat` → no cloud egress, no
- * mid-string corruption). Only a real standalone `@brain` opens a thread. The
- * capture group frames the marker so the QUESTION is exactly the text AFTER the
- * standalone token (never a mid-substring splice).
- */
-const BRAIN_TOKEN_RE = /(^|\s)@brain(?=\s|$)/;
-
-/**
- * Resolve a submitted composer line to a `@brain` thread vs a plain note. Returns
- * the QUESTION (everything after the FIRST standalone `@brain`, marker removed,
- * trimmed) when the line carries a standalone `@brain` token, else `null` (→ a
- * plain note, kept verbatim). Anything matching only as a substring
- * ("a@brainx", "x@brain.io") returns `null` and is therefore treated as a note.
- */
-export function parseBrainLine(text: string): string | null {
-  const m = BRAIN_TOKEN_RE.exec(text);
-  if (!m) return null;
-  // m.index points at the leading boundary char; the marker starts after it.
-  const markerStart = m.index + m[1].length;
-  const question = text.slice(markerStart + BRAIN_MARKER.length).trim();
-  return question;
-}
-
-/**
- * The in-meeting NOTES + `@brain` THREADS surface — the full-height main view of
- * the record screen (Slack-style; the agent PROPOSES, the user ACCEPTS).
+ * The in-meeting panel — a DOCUMENT-FIRST two-tab surface (v2 redesign):
  *
- * The MAIN flow is the user's NOTES — a vertical list of note lines that are now
- * REAL, LINKED companion notes (each send appends a block to the meeting's ONE
- * living companion note in the Notes ROOT + renders a "✓ Saved to Notes" card).
- * The ONE composer at the foot is the shared design-system
- * {@link MarkdownComposerComponent} (`/` slash blocks, `[[` link picker, ⌘B/⌘I/⌘1-3,
- * list continuation, Enter = send / Shift+Enter = newline). On send the host splits
- * the emitted markdown by the only signal — a standalone `@brain`:
- *   - a line WITHOUT `@brain` is a plain NOTE → {@link MeetingConversationStore.addNote}
- *     (appended to the flow + persisted to the companion note);
- *   - a line WITH `@brain` OPENS an anchored, multi-turn THREAD (the marker
- *     stripped) → {@link MeetingConversationStore.openThread}, which ships the
- *     thread's history to the agent. Each agent reply offers "✓ Add to notes" — the
- *     only path an accepted draft enters the notes (also as a companion note).
+ *  - **"Note" (default):** the meeting's ONE companion note rendered as ONE editable
+ *    DOCUMENT via the embedded {@link NoteEditorComponent} (`[embedded]="true"`) — the
+ *    real create-note experience (`/` blocks, `[[` links, selection toolbar, in-note
+ *    Ask-Brain popover, autosave). The HOST eagerly gets-or-creates the companion note
+ *    (via {@link MeetingConversationStore.ensureCompanionNote}) so the editor mounts on
+ *    a stable id — there are NO per-jot "Saved" badges; the note IS the document.
+ *  - **"Ask Brain":** the conversational `@brain` thread (reuses the store's
+ *    open/run/resolve/follow-up/tool-trace/citation machinery). A plain single-line
+ *    input at the foot opens a thread (everything here is a question — no `@brain`
+ *    marker parsing). An answer's "Add to note" appends into the companion note.
  *
- * The `@brain` hint lives in the composer placeholder + the panel hint copy (the
- * composer owns its own textarea/caret, so the former caret-anchored `@brain`
- * autocomplete popover is replaced by that lightweight equivalent — typing
- * `@brain <q>` and sending still opens a thread). Each note line + its thread
- * renders via {@link NoteItemComponent}.
+ * The embedded editor is ALWAYS MOUNTED for the whole recording — the Note tab is
+ * HIDDEN (not destroyed) when the user is on Ask Brain, and returning to it calls the
+ * editor's `reload()` (not a re-mount) so an Ask-Brain "Add to note" append / a
+ * mid-session external edit is reflected. Keeping ONE live editor instance is what
+ * makes the flush-before-Stop deterministic: {@link RecorderStore.stop} awaits that
+ * single editor's durable save via {@link RecordingFlushService} before finalizing, so
+ * a Stop fired inside the autosave debounce window can never lose the user's prose (an
+ * earlier destroy/re-mount left an in-flight destroy-flush racing Stop when the user
+ * clicked Stop from the Ask Brain tab). The reactions rail (recall hints / whisper
+ * cards) lives in the Ask-Brain tab.
  *
- * This surface is IN-FLOW (not a floating overlay) — the frosted `.card` is
- * correct here (trap T3 N/A for the panel; the composer's own `/`/`[[` menus float
- * OPAQUE inside it).
+ * IN-FLOW (not a floating overlay) — the frosted `.card` chrome is correct (trap T3 is
+ * handled inside the editor's own `/`/`[[` menus + the Ask-Brain popover).
  */
 @Component({
   selector: "app-meeting-conversation",
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [
     AiOrbComponent,
-    MarkdownComposerComponent,
+    MurSegmentedComponent,
+    NoteEditorComponent,
     NoteItemComponent,
     ProactiveHintCardComponent,
     WhisperCardComponent,
@@ -94,11 +72,18 @@ export class MeetingConversationComponent implements OnInit {
   protected readonly store = inject(MeetingConversationStore);
   private readonly injector = inject(Injector);
   private readonly flow = viewChild<ElementRef<HTMLElement>>("flow");
+  private readonly askInput = viewChild<ElementRef<HTMLInputElement>>("askInput");
+  /**
+   * The ONE always-mounted embedded companion note editor. Used to `reload()` it on
+   * return to the Note tab (in place of the retired re-mount nonce). It stays in the
+   * DOM (hidden while on Ask Brain) so exactly one editor instance is live for the
+   * whole recording — the flush-at-Stop target.
+   */
+  private readonly noteEditor = viewChild(NoteEditorComponent);
 
   /**
    * The active recording's meeting id (null when there's no meeting yet). Pushed
-   * into the store so a note line appends to THIS meeting's companion note +
-   * `manual_notes`.
+   * into the store so the companion note + Ask-Brain scope bind to THIS meeting.
    */
   readonly meetingId = input<string | null>(null);
 
@@ -115,97 +100,106 @@ export class MeetingConversationComponent implements OnInit {
   readonly settled = input(false);
   readonly enhanceAware = input(false);
 
+  /** The active tab — the DOCUMENT-FIRST "Note" tab is the default. */
+  protected readonly activeTab = signal<PanelTab>("note");
+
+  /** The two-tab segmented control options. */
+  protected readonly tabOptions: readonly SegmentOption[] = [
+    { value: "note", label: "Note" },
+    { value: "ask", label: "Ask Brain" },
+  ];
+
+  /** The active tab as the segmented control's two-way value (mirrors {@link activeTab}). */
+  protected readonly tabValue = computed<string>(() => this.activeTab());
+
   /** During the enhance pass the orb shows its shipped 'processing' choreography. */
   readonly orbStateView = computed(() =>
     this.enhancing() ? ("processing" as const) : this.store.orbState(),
   );
 
-  /** Stagger for the one-shot sweep — capped so short summarizes still show a full pass. */
-  sweepDelay(i: number): number {
-    return Math.min(i, 10) * 180;
-  }
-
-  /**
-   * The composer placeholder: the notes are still hydrating from `manual_notes`
-   * until `loaded()` (the composer is disabled meanwhile — see the store's
-   * hydrate-vs-type race note), then a hint that a jot becomes a linked note and
-   * `@brain` opens a thread.
-   */
-  protected readonly composerPlaceholder = computed(() =>
-    this.store.loaded()
-      ? "Jot a note… / for blocks, [[ to link, @brain to ask"
-      : "Loading notes…",
-  );
+  /** This session's Ask-Brain question draft (signal-backed — zoneless). */
+  protected readonly askDraft = signal("");
+  /** Send is allowed with non-blank text. */
+  protected readonly canAsk = computed(() => this.askDraft().trim().length > 0);
 
   constructor() {
-    // Keep the store pointed at the active meeting so a note line appends to the
-    // right meeting's companion note + `manual_notes`. The effect reads the
-    // `meetingId` input and the store method writes the store's `_meetingId`
-    // signal (signal writes in effects are allowed since Angular 19).
+    // Keep the store pointed at the active meeting so the companion note + Ask-Brain
+    // scope bind to the right meeting. Signal writes in effects are allowed (v19+).
     effect(() => {
       this.store.setMeetingId(this.meetingId());
     });
 
-    // Auto-scroll the flow to the newest line whenever the notes change. Tracks
-    // the notes signal in the effect, schedules the DOM work via afterNextRender
-    // (zoneless-safe; no signal writes → no NG0600).
+    // EAGERLY get-or-create the companion note whenever a meeting is set, so the
+    // "Note" tab always has a document to mount on (the HOST owns eager creation;
+    // the embedded editor never auto-creates). The effect only reads the input +
+    // calls an async store method (the signal write happens inside the store).
+    effect(() => {
+      if (this.meetingId()) void this.store.ensureCompanionNote();
+    });
+
+    // Auto-scroll the Ask-Brain flow to the newest turn whenever the conversation
+    // changes AND the Ask tab is showing. Tracks the notes signal; schedules the
+    // DOM work via afterNextRender (zoneless-safe; no signal writes → no NG0600).
     effect(() => {
       this.store.notes();
-      afterNextRender(() => this.scrollToBottom(), { injector: this.injector });
+      if (this.activeTab() === "ask") {
+        afterNextRender(() => this.scrollToBottom(), { injector: this.injector });
+      }
     });
   }
 
   ngOnInit(): void {
     // Subscribe once to the wake/result/tool streams (idempotent). The store is a
-    // root singleton, so its subscriptions outlive this component — we don't
-    // unlisten on destroy here (the store owns lifetime; cf. RecorderStore).
+    // root singleton, so its subscriptions outlive this component.
     void this.store.init();
   }
 
-  /** Scroll the notes flow to its newest content. */
+  /** Switch tabs. Re-entering "Note" RELOADS the always-mounted editor (no re-mount)
+   *  + refreshes the enhance-honesty content signal; entering "Ask" focuses the
+   *  question input. */
+  protected selectTab(tab: string): void {
+    const next = tab as PanelTab;
+    if (next === this.activeTab()) return;
+    this.activeTab.set(next);
+    if (next === "note") {
+      // The editor stays mounted (hidden) while on Ask Brain, so returning re-reads
+      // its body in place — reflecting an Ask-Brain "Add to note" append / external
+      // edit — rather than destroying + recreating the one live flush target.
+      this.noteEditor()?.reload();
+      this.store.refreshCompanionContentNow();
+    } else {
+      afterNextRender(() => this.askInput()?.nativeElement.focus(), {
+        injector: this.injector,
+      });
+    }
+  }
+
+  /** Scroll the Ask-Brain flow to its newest content. */
   protected scrollToBottom(): void {
     const el = this.flow()?.nativeElement;
     if (el) el.scrollTop = el.scrollHeight;
   }
 
-  /**
-   * A composer line was SENT (Enter with no Shift/menu, or the Send button). The
-   * composer self-clears; the host routes the emitted markdown by the ONLY signal —
-   * a STANDALONE `@brain` token:
-   *   - line WITH a standalone `@brain` → the QUESTION is the text AFTER it; OPEN a
-   *     thread (the agent answers in the nested thread; the user accepts what to
-   *     keep);
-   *   - line WITHOUT a standalone `@brain` → it's a NOTE, kept VERBATIM (append to
-   *     the companion note + a flow line). A substring like "bob@brainpower.com"
-   *     stays a note — never spliced, never shipped to the agent (no cloud egress).
-   * Blank text / not-yet-hydrated is a no-op (the composer also guards non-empty).
-   * A note never waits on a thread (notes save while a thread still processes).
-   */
-  protected onSend(markdown: string): void {
-    if (!this.store.loaded()) return; // guard the hydrate-vs-type race (see store)
-    const text = markdown.trim();
-    if (!text) return;
-
-    const question = parseBrainLine(text);
-    if (question !== null) {
-      if (!question) return; // bare standalone "@brain" with no question → drop
-      void this.store.openThread(question).catch(() => {
-        /* the store resolves the agent turn with an error in the thread */
-      });
-      return;
-    }
-
-    // Plain line → a note, kept VERBATIM (saved + shown), independent of any thread.
-    this.store.addNote(text);
+  protected onAskInput(event: Event): void {
+    this.askDraft.set((event.target as HTMLInputElement).value);
   }
 
   /**
-   * Esc in the composer with no `/`/`[[` menu open. Nothing to close on this
-   * always-visible in-flow surface — kept as a no-op hook so the composer's
-   * `escape` output has a defined target (rewire contract).
+   * Submit the Ask-Brain question → open a thread (everything in this tab is a
+   * question — no `@brain` marker parsing). Self-clears; a no-op for blank text.
    */
-  protected onEscape(): void {
-    /* no floating surface to dismiss here — the panel stays in flow */
+  protected submitAsk(event: Event): void {
+    event.preventDefault();
+    const q = this.askDraft().trim();
+    if (!q) return;
+    this.askDraft.set("");
+    void this.store.openThread(q).catch(() => {
+      /* the store resolves the agent turn with an error in the thread */
+    });
+    // Keep the focus in the ask input for a fast back-and-forth.
+    afterNextRender(() => this.askInput()?.nativeElement.focus(), {
+      injector: this.injector,
+    });
   }
 
   /**
