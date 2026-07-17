@@ -226,9 +226,30 @@ fn pack_doc_chunks(
         db.search_doc_chunks_visible(query_vec, 20, unlocked)?
     };
     let fts = db.search_doc_chunks_fts_visible(query, 20, unlocked)?;
-    let hits = crate::embed::fuse_doc_hits(knn, fts);
+    let mut hits = crate::embed::fuse_doc_hits(knn, fts);
     if hits.is_empty() {
         return Ok(());
+    }
+    // Brain v3 PR-2 — GATED PARENT EXPANSION: for the top-3 fused doc hits, replace the isolated
+    // leaf snippet with the document's dominant L1 SECTION-parent text (coherent section beats a
+    // fragment; context-rot lesson keeps it to the top few). `expand_doc_parents_visible` re-applies
+    // the visibility gate, so a sealed-not-unlocked doc contributes nothing. A doc with no L1 parent
+    // (flat/legacy) keeps its original leaf snippet unchanged.
+    const EXPAND_TOP_N: usize = 3;
+    let top_ids: Vec<String> = hits
+        .iter()
+        .take(EXPAND_TOP_N)
+        .map(|h| h.document_id.clone())
+        .collect();
+    if !top_ids.is_empty() {
+        let parents = db.expand_doc_parents_visible(&top_ids, unlocked)?;
+        for p in parents {
+            if let Some(h) = hits.iter_mut().find(|h| h.document_id == p.document_id) {
+                if !p.snippet.trim().is_empty() {
+                    h.snippet = p.snippet;
+                }
+            }
+        }
     }
     for h in hits {
         if corpus.len() >= budget {

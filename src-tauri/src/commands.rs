@@ -2675,55 +2675,143 @@ pub(crate) fn get_manual_notes_inner(
     state.db.get_manual_notes(meeting_id)
 }
 
-/// The md/txt extensions document ingestion accepts. md/txt only — NO new parsing crate; the file is
-/// read as UTF-8 text via `std::fs::read_to_string`. Anything else is rejected with `InvalidArg`.
-const DOC_ALLOWED_EXTS: &[&str] = &["md", "txt"];
+/// The extensions document ingestion accepts (Brain v3 PR-2). Text (md/txt) plus the extracted
+/// formats: PDF (macOS PDFKit), DOCX/PPTX (pure-Rust OOXML), XLSX (calamine), HTML. Dispatch +
+/// extraction live in `crate::extract`; anything else is rejected with `InvalidArg`.
+const DOC_ALLOWED_EXTS: &[&str] = &["md", "txt", "pdf", "docx", "pptx", "xlsx", "html", "htm"];
 
-/// Document ingestion — upload a local md/txt file INTO a folder so its text is chunked + embedded
+/// Document ingestion — upload a local file INTO a folder so its EXTRACTED text is chunked + embedded
 /// into the on-device vector layer and the brain/Ask can retrieve it. Returns the new document id.
+/// ASYNC (Brain v3 PR-2): a large PDF's extract+chunk+embed runs off the UI thread behind the shared
+/// heavy-inference permit + the RAM floor, emitting counts-only progress via [`EVENT_DOC_IMPORT`].
 ///
 /// LOCK-MODEL:
 /// - WRITE-GATE: refuse a sealed-and-NOT-session-unlocked folder (`AppError::Locked`) — an ungated
 ///   write would land plaintext at rest behind the lock (mirrors `save_manual_notes`'s gate).
-/// - Extension allowlist (`md`/`txt`) — reject anything else with `AppError::InvalidArg`; NO new
-///   crate (read as UTF-8 text).
+/// - Extension allowlist — reject anything else with `AppError::InvalidArg`.
+/// - We store the EXTRACTED TEXT only (`documents.text`), never the source binary — no new seal path.
 /// - EMBED only when the REAL e5 model is present (`embed_model_present()`): otherwise the chunks are
 ///   stored WITHOUT vectors (no stub vectors polluting the index — mirrors `should_auto_index`).
 /// - The text is SEALED-AND-RESTORED with the folder on lock/unlock; its chunks are PURGED on lock,
 ///   re-embeddable on unlock.
 #[tauri::command]
-pub fn import_document(
+pub async fn import_document(
+    app: AppHandle,
     state: State<'_, AppState>,
     path: String,
     folder_id: String,
 ) -> Result<String, AppError> {
-    import_document_inner(state.inner(), &path, &folder_id)
+    // 0) WRITE-GATE up front, on the async task (touches the borrowed `&AppState`): a
+    //    sealed-and-NOT-session-unlocked folder is refused BEFORE any file work so the caller fails
+    //    fast (`AppError::Locked`), and an unknown folder is `InvalidArg`. The gate is RE-CHECKED
+    //    inside the blocking closure right before the plaintext INSERT (below) using the cloned
+    //    `unlocked_folders` handle, so a relock racing between here and the insert can't land
+    //    plaintext at rest behind the lock.
+    import_document_write_gate(state.inner(), &folder_id)?;
+
+    // Clone ONLY the `Arc` handles that cross into the blocking closure — `AppState` itself is not
+    // `Clone`. `db` for insert+index, `unlocked_folders` for the pre-insert gate re-check,
+    // `heavy_inference` for the ONE heavy permit. Everything past this point is `'static`.
+    let db = std::sync::Arc::clone(&state.inner().db);
+    let unlocked = std::sync::Arc::clone(&state.inner().unlocked_folders);
+    let sem = std::sync::Arc::clone(&state.inner().heavy_inference);
+
+    // RAM floor: under memory pressure, do the (still off-thread) extract+insert but SKIP the embed —
+    // the chunks + FTS are durable (keyword retrieval works) and the idempotent repair tick / a later
+    // Reindex fills the vectors. Never fail the import over a busy machine. Decided here (on the async
+    // task) and passed INTO the closure so the whole heavy pipeline stays inside ONE `run_heavy` scope.
+    let ram_permits = crate::transcribe::model::topic_backfill_ram_permits_now();
+
+    // The WHOLE pipeline — extract (whole-file read + zip/XML parse for OOXML/XLSX, or the per-page
+    // PDFKit loop; multi-second on a large doc), insert the row + chunk (FTS durable), then embed —
+    // runs OFF the Tokio worker behind the ONE heavy-inference permit (rust-tauri rule: long-running
+    // work never blocks the runtime thread). Progress events fire from inside across the stages
+    // (extracting → chunking → embedding → done); the `AppHandle` is `Clone` + `Send` so the emitter
+    // reaches the FE from the blocking thread. Best-effort per stage: the row/chunks stay durable even
+    // if the embed fails.
+    let app2 = app.clone();
+    let path2 = path.clone();
+    let folder2 = folder_id.clone();
+    crate::perf::run_heavy(&sem, move || {
+        crate::events::emit_doc_import(&app2, "", "extracting", 0, 0);
+        // EXTRACT (pure `path → text`, no DB/state).
+        let (name, stored) = extract_document_text(&path2)?;
+
+        crate::events::emit_doc_import(&app2, "", "chunking", 0, 0);
+        // GATE (re-checked from the cloned handle) + INSERT + CHUNK-ONLY index (FTS durable now).
+        let id = insert_extracted_document(&db, &unlocked, &folder2, &name, &stored)?;
+
+        // EMBED only if the RAM floor permitted (else defer to the repair tick). Best-effort: a
+        // failure logs (no PII) and leaves the durable chunks/FTS + row in place.
+        if ram_permits {
+            let embedder = crate::embed::embed_model_present().then(crate::embed::active_embedder);
+            crate::events::emit_doc_import(&app2, &id, "embedding", 0, 0);
+            if let Err(e) = index_document_row_kind_routed(&db, &id, embedder.as_deref()) {
+                tracing::warn!(target: "rag", error = %e, document_id = %id, "import: embed failed (content stored)");
+            }
+        } else {
+            tracing::info!(target: "documents", document_id = %id, "import: RAM floor — deferring embed to repair tick");
+        }
+        crate::events::emit_doc_import(&app2, &id, "done", 0, 0);
+        Ok(id)
+    })
+    .await
 }
 
-/// Inner of [`import_document`] taking `&AppState` (so the gate + allowlist are unit-testable without
-/// a `tauri::State`).
+/// Inner of [`import_document`] taking `&AppState` (so the gate + allowlist + EXTRACTION are
+/// unit-testable without a `tauri::State`). EXTRACTS the file to blocks, stores the serialized text,
+/// inserts the row (write-gated), and DOES NOT embed (the async wrapper embeds behind the RAM floor /
+/// permit; a unit test with the model absent still gets chunk-only indexing via `ingest_into_folder`).
+///
+/// This runs SYNCHRONOUSLY (the async command wrapper does the same extract→insert→embed pipeline
+/// entirely inside `perf::run_heavy` / `spawn_blocking` — see [`import_document`]); this seam exists
+/// only so the extract + gate + insert are testable without a `tauri::State` or a runtime. It has no
+/// production caller (the async wrapper composes `extract_document_text` + `insert_extracted_document`
+/// directly), so it is compiled only under `cfg(test)`.
+#[cfg(test)]
 pub(crate) fn import_document_inner(
     state: &AppState,
     path: &str,
     folder_id: &str,
 ) -> Result<String, AppError> {
-    // Extension allowlist (md/txt only). Lowercased; an extension-less path is rejected.
+    // EXTRACT (allowlist + `path → text`, pure, no DB/state).
+    let (name, stored) = extract_document_text(path)?;
+    // GATE + INSERT + chunk-only index (the shared seam the async wrapper also uses).
+    insert_extracted_document(&state.db, &state.unlocked_folders, folder_id, &name, &stored)
+}
+
+/// EXTRACT a supported document to its storable text form — PURE `path → (display_name, text)`, with
+/// NO `AppState`/DB/keychain touch, so the whole (potentially multi-second: whole-file read + zip
+/// decompress + XML parse for OOXML/XLSX, or the per-page PDFKit loop) extraction can run OFF the
+/// Tokio runtime inside `run_heavy`. Fails CLOSED with `AppError::InvalidArg` for an unsupported /
+/// extension-less / unreadable / no-extractable-text file. Returns the file-name component as the
+/// display name (never an on-disk path — no PII in the stored name/logs).
+fn extract_document_text(path: &str) -> Result<(String, String), AppError> {
+    // Extension allowlist. Lowercased; an extension-less path is rejected.
     let p = std::path::Path::new(path);
-    let ext_ok = p
+    let ext = p
         .extension()
         .and_then(|e| e.to_str())
-        .map(|e| e.to_ascii_lowercase())
-        .map(|e| DOC_ALLOWED_EXTS.contains(&e.as_str()))
-        .unwrap_or(false);
-    if !ext_ok {
+        .map(|e| e.to_ascii_lowercase());
+    let ext = match ext {
+        Some(e) if DOC_ALLOWED_EXTS.contains(&e.as_str()) => e,
+        _ => {
+            return Err(AppError::InvalidArg(
+                "unsupported document type — import md, txt, pdf, docx, pptx, xlsx, or html".into(),
+            ))
+        }
+    };
+
+    // EXTRACT to blocks (page/heading preserved), then serialize to the storable text form. A
+    // non-UTF-8 / unreadable / malformed / scanned-PDF / zip-bomb file fails closed inside
+    // `extract_blocks` (the OOXML/XLSX decompression-ratio guard lives there — see extract/ooxml.rs).
+    let blocks = crate::extract::extract_blocks(p, &ext)?;
+    if blocks.is_empty() || blocks.iter().all(|b| b.text.trim().is_empty()) {
         return Err(AppError::InvalidArg(
-            "only .md and .txt documents can be imported".into(),
+            "this document has no extractable text".into(),
         ));
     }
-
-    // Read the file as UTF-8 text (no parsing crate). A non-UTF-8 / unreadable file fails closed.
-    let text = std::fs::read_to_string(p)
-        .map_err(|e| AppError::InvalidArg(format!("could not read document: {e}")))?;
+    let stored = crate::extract::blocks_to_stored_text(&blocks);
 
     // The display name = the file name (component only — never an on-disk path with personal content
     // in logs). Fallback to "document" if the path has no file-name component.
@@ -2732,8 +2820,77 @@ pub(crate) fn import_document_inner(
         .and_then(|n| n.to_str())
         .map(|s| s.to_string())
         .unwrap_or_else(|| "document".to_string());
+    Ok((name, stored))
+}
 
-    ingest_into_folder(state, folder_id, &name, &text, "document")
+/// The WRITE-GATE for an uploaded document, evaluated from `Arc` handles (not a `&AppState`), so it
+/// can be RE-CHECKED inside the blocking closure right before the plaintext INSERT — a relock racing
+/// between the up-front async gate and the insert can't land plaintext at rest behind a lock. Mirrors
+/// [`ingest_into_folder_opts`]'s gate exactly: unknown folder ⇒ `InvalidArg`; sealed-and-NOT-session-
+/// unlocked ⇒ `AppError::Locked`; open OR session-unlocked ⇒ Ok.
+fn insert_extracted_document(
+    db: &std::sync::Arc<crate::storage::Db>,
+    unlocked_folders: &std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    folder_id: &str,
+    name: &str,
+    stored: &str,
+) -> Result<String, AppError> {
+    // The folder must exist (so the FK holds + the gating has an anchor).
+    let folder = db
+        .folder_by_id(folder_id)?
+        .ok_or_else(|| AppError::InvalidArg(format!("no folder {folder_id}")))?;
+
+    // WRITE-GATE: a sealed-and-not-session-unlocked folder is refused (never resurrect plaintext at
+    // rest behind a lock). Same predicate as `folder_is_unlocked`, evaluated from the cloned handle.
+    if folder.locked {
+        let session_unlocked = unlocked_folders
+            .lock()
+            .map_err(|_| AppError::Storage("unlocked-folders mutex poisoned".into()))?
+            .contains(folder_id);
+        if !session_unlocked {
+            return Err(AppError::Locked(
+                "this folder is locked — unlock it to add to the brain".into(),
+            ));
+        }
+    }
+
+    let id = uuid::Uuid::new_v4().to_string();
+    let created_at = chrono::Utc::now().timestamp_millis();
+    db.insert_document(&id, folder_id, name, stored, "document", created_at)?;
+
+    // CHUNK-ONLY inline (FTS durable now); the caller embeds under the RAM floor + heavy permit. A
+    // failure logs (no PII) and does NOT fail the ingest (the row + plaintext are durable; a later
+    // unlock re-chunk / reindex recovers the index).
+    if let Err(e) = index_document_row_kind_routed(db, &id, None) {
+        tracing::warn!(target: "rag", error = %e, "ingest: chunk failed (content stored)");
+    }
+
+    // PII rule: log only ids, the kind, and byte counts — never the text/name.
+    tracing::info!(
+        target: "documents",
+        document_id = %id,
+        folder_id = %folder_id,
+        kind = "document",
+        bytes = stored.len(),
+        "ingested document into brain"
+    );
+    Ok(id)
+}
+
+/// The WRITE-GATE for an uploaded document evaluated from a borrowed `&AppState` (the up-front,
+/// fail-fast check on the async task before any file work). Same predicate as
+/// [`insert_extracted_document`]'s re-check; delegates to the existing `folder_is_unlocked`.
+fn import_document_write_gate(state: &AppState, folder_id: &str) -> Result<(), AppError> {
+    let folder = state
+        .db
+        .folder_by_id(folder_id)?
+        .ok_or_else(|| AppError::InvalidArg(format!("no folder {folder_id}")))?;
+    if folder.locked && !folder_is_unlocked(state, folder_id)? {
+        return Err(AppError::Locked(
+            "this folder is locked — unlock it to add to the brain".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Ingest TYPED text as a brain `note` (the Brain page "+ Add note"). Same gated ingest path + seal
@@ -2766,12 +2923,15 @@ pub(crate) fn import_text_inner(
     ingest_into_folder(state, folder_id, name, text, "note")
 }
 
-/// The SINGLE gated ingest path for both an uploaded document (`kind="document"`) and a typed note
-/// (`kind="note"`): look up the folder, WRITE-GATE it (a sealed-not-unlocked folder is refused so
-/// content can never appear at rest behind a lock), insert the `documents` row, and index its chunks
-/// into the vector layer ONLY when the REAL e5 model is present (never stub vectors — mirrors
-/// `should_auto_index`). The row is sealed-and-restored + purged-on-lock identically regardless of
-/// kind. Returns the new id.
+/// The SINGLE gated ingest path for a typed note (`kind="note"`): look up the folder, WRITE-GATE it
+/// (a sealed-not-unlocked folder is refused so content can never appear at rest behind a lock),
+/// insert the `documents` row, and index its chunks into the vector layer ONLY when the REAL e5 model
+/// is present (never stub vectors — mirrors `should_auto_index`). The row is sealed-and-restored +
+/// purged-on-lock identically to an uploaded document. Returns the new id.
+///
+/// An uploaded DOCUMENT (`kind="document"`) takes the sibling [`insert_extracted_document`] seam
+/// instead — same gate + insert + chunk-only index, but reachable from `Arc` handles so the whole
+/// extract→insert→embed pipeline runs off the Tokio runtime inside `run_heavy` (Brain v3 PR-2).
 fn ingest_into_folder(
     state: &AppState,
     folder_id: &str,
@@ -2800,7 +2960,7 @@ fn ingest_into_folder(
         .insert_document(&id, folder_id, name, text, kind, created_at)?;
 
     // ALWAYS chunk (doc_chunks + the fts_doc_chunks triggers) so keyword retrieval works on a
-    // DEFAULT install — an ingested document must never be write-only memory. Vectors ONLY when the
+    // DEFAULT install — an ingested note must never be write-only memory. Vectors ONLY when the
     // REAL e5 model is present (never write stub vectors). Best-effort: a failure logs (no PII) and
     // does NOT fail the ingest (the row + plaintext are durable; a later unlock re-chunk / reindex
     // recovers the index).
@@ -2808,8 +2968,7 @@ fn ingest_into_folder(
     // KIND-ROUTED (PR-1 finding 4): a pasted note (`kind='note'`) can carry YAML front-matter in its
     // raw `text`, which must NEVER be embedded/indexed (DESIGN §1a — tags/properties pollute the
     // vectors + snippets). Route through the ONE front-matter-stripping seam so the ingest matches
-    // every other note-index path; an uploaded document (`kind='document'`) has no front-matter and
-    // takes the raw path unchanged inside the router.
+    // every other note-index path.
     let embedder = crate::embed::embed_model_present().then(crate::embed::active_embedder);
     if let Err(e) = index_document_row_kind_routed(&state.db, &id, embedder.as_deref()) {
         tracing::warn!(target: "rag", error = %e, "ingest: chunk/embed failed (content stored)");
@@ -2864,7 +3023,9 @@ pub(crate) fn get_document_inner(state: &AppState, id: &str) -> Result<String, A
     if !folder_is_unlocked(state, &folder_id)? {
         return Ok(String::new()); // sealed-not-unlocked ⇒ masked, never the stored text.
     }
-    Ok(text)
+    // Brain v3 PR-2: strip the block-structure markers a PR-2 upload stores in `text` — the FE gets
+    // clean readable text (a note / md / txt / legacy row has no markers → unchanged).
+    Ok(crate::extract::render_display_text(&text))
 }
 
 /// Headline counts + semantic flags for the Brain page ("what's in my brain"). All counts are over
@@ -21499,28 +21660,20 @@ mod lifecycle_tests {
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id, id);
         assert!(listed[0].name.ends_with(".md"));
-        // CHUNKING is unconditional (keyword/FTS retrieval must work on a default install);
-        // only the VECTORS stay model-presence-gated (never write stub vectors — mirrors
-        // `should_auto_index`'s no-stub contract). So:
-        //   - always          → ≥1 doc_chunks row;
-        //   - model present   → matching real e5 vectors;
-        //   - model ABSENT    → exactly 0 doc_vec_chunks rows (no stub poisoning).
+        // CHUNKING is unconditional (keyword/FTS retrieval must work on a default install). Brain v3
+        // PR-2: `import_document_inner` is CHUNK-ONLY by design — it NEVER embeds inline (the async
+        // `import_document` wrapper does the authoritative embed behind the RAM floor + heavy-inference
+        // permit). So the inner leaves ZERO doc_vec_chunks rows regardless of model presence; keyword
+        // FTS is durable immediately. (The no-stub contract still holds trivially — no vectors here.)
         assert!(
             state.db.doc_chunk_count(&id).unwrap() >= 1,
             "the document must be chunked regardless of model presence (always-chunk)"
         );
-        if crate::embed::embed_model_present() {
-            assert!(
-                state.db.doc_vec_count(&id).unwrap() >= 1,
-                "with the e5 model present, the chunks must carry real vectors"
-            );
-        } else {
-            assert_eq!(
-                state.db.doc_vec_count(&id).unwrap(),
-                0,
-                "with no e5 model, NO stub vectors are written (no-stub contract)"
-            );
-        }
+        assert_eq!(
+            state.db.doc_vec_count(&id).unwrap(),
+            0,
+            "the inner is chunk-only (embed deferred to the async wrapper): no vectors here"
+        );
 
         // A .txt import is also accepted.
         let txt = write_temp_doc("txt", "txt", "plain text notes about hiring");
@@ -21529,18 +21682,19 @@ mod lifecycle_tests {
         assert!(!id2.is_empty());
     }
 
-    /// ALLOWLIST: a non-md/txt extension (and an extension-less path) is rejected with InvalidArg,
-    /// and NO row is inserted (the folder stays empty).
+    /// ALLOWLIST (Brain v3 PR-2): an UNSUPPORTED extension (`.rtf`) and an extension-less path are
+    /// rejected with InvalidArg, and NO row is inserted (the folder stays empty). md/txt/pdf/docx/
+    /// pptx/xlsx/html are the supported set; anything else fails closed at the allowlist.
     #[test]
-    fn import_document_rejects_non_md_txt() {
+    fn import_document_rejects_unsupported_extension() {
         let state = build_state("doc-allowlist");
         make_open_folder(&state.db, "f-open", "Project");
 
-        let pdf = write_temp_doc("pdf", "pdf", "%PDF-1.4 ...");
-        let err = import_document_inner(&state, pdf.to_str().unwrap(), "f-open").unwrap_err();
+        let rtf = write_temp_doc("rtf", "rtf", "{\\rtf1 unsupported}");
+        let err = import_document_inner(&state, rtf.to_str().unwrap(), "f-open").unwrap_err();
         assert!(
             matches!(err, AppError::InvalidArg(_)),
-            "pdf must be rejected, got {err:?}"
+            "an unsupported extension must be rejected, got {err:?}"
         );
 
         // Extension-less path.
@@ -21620,6 +21774,54 @@ mod lifecycle_tests {
         );
         let md3 = write_temp_doc("seal3", "md", "after unlock");
         import_document_inner(&state, md3.to_str().unwrap(), "f-lock").unwrap();
+    }
+
+    /// WRITE-GATE (race-safe re-check): the `Arc`-handle seam the async `import_document` runs OFF
+    /// the runtime — `insert_extracted_document` — enforces the SAME gate as the on-`&AppState` path.
+    /// A sealed-and-not-session-unlocked folder is refused with `Locked` (so a relock racing between
+    /// the up-front gate and the off-thread insert can't land plaintext at rest); an unknown folder
+    /// is `InvalidArg`; a session-unlocked folder inserts. This pins the exact predicate the blocking
+    /// closure re-evaluates, independent of the sync `import_document_inner` seam.
+    #[test]
+    fn insert_extracted_document_gate_matches_on_arc_handles() {
+        let state = build_state("doc-arc-gate");
+        make_open_folder(&state.db, "f-arc", "Vault");
+        state
+            .db
+            .set_folder_locked("f-arc", true, Some(&b"wrapped"[..]))
+            .unwrap();
+
+        let db = std::sync::Arc::clone(&state.db);
+        let unlocked = std::sync::Arc::clone(&state.unlocked_folders);
+
+        // Unknown folder → InvalidArg.
+        let e0 = insert_extracted_document(&db, &unlocked, "nope", "x.md", "hi").unwrap_err();
+        assert!(matches!(e0, AppError::InvalidArg(_)), "got {e0:?}");
+
+        // Sealed + NOT in the session set → Locked (never insert plaintext behind the lock).
+        let e1 = insert_extracted_document(&db, &unlocked, "f-arc", "x.md", "secret").unwrap_err();
+        assert!(matches!(e1, AppError::Locked(_)), "sealed insert must be Locked, got {e1:?}");
+        assert!(
+            list_documents_inner(&state, "f-arc").unwrap().is_empty(),
+            "no row inserted while sealed"
+        );
+
+        // Session-unlock → the same seam inserts.
+        unlocked.lock().unwrap().insert("f-arc".to_string());
+        let id = insert_extracted_document(&db, &unlocked, "f-arc", "x.md", "now allowed").unwrap();
+        assert!(!id.is_empty());
+        assert_eq!(
+            get_document_inner(&state, &id).unwrap(),
+            "now allowed",
+            "unlocked insert is readable"
+        );
+
+        // And the up-front async-task gate agrees on every case.
+        assert!(import_document_write_gate(&state, "f-arc").is_ok(), "unlocked passes the up-front gate");
+        assert!(
+            matches!(import_document_write_gate(&state, "nope"), Err(AppError::InvalidArg(_))),
+            "unknown folder fails the up-front gate"
+        );
     }
 
     /// IMPORT_TEXT round-trip: typed text is ingested as a kind='note' document — stored + readable,

@@ -542,6 +542,21 @@ export interface ReindexProgress {
 }
 
 /**
+ * Brain v3 PR-2 — progress for an in-flight document import (`importDocument`):
+ * the extract → chunk → embed pipeline for ONE document. Mirrors the backend
+ * `DocImportPayload` (camelCase). Counts + a stage ONLY — NO PII (`documentId`
+ * is a random UUID; no filename / text). `done`/`total` are chunk counts within
+ * the embedding stage (`0`/`0` for the earlier stages). `stage`:
+ * `"extracting"` | `"chunking"` | `"embedding"` | `"done"`.
+ */
+export interface DocImportProgress {
+  documentId: string;
+  stage: "extracting" | "chunking" | "embedding" | "done";
+  done: number;
+  total: number;
+}
+
+/**
  * brain2 RAG — result of `reindexEmbeddings()`. Mirrors the backend `ReindexResult`
  * (camelCase). `status` is `"model_missing"` when the real e5 model is absent (no
  * indexing was attempted — the FE nudges the user to download it first), else

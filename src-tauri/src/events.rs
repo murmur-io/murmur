@@ -226,6 +226,40 @@ pub struct NerDownloadPayload {
     pub done: bool,
 }
 
+/// Brain v3 PR-2 — progress for an in-flight document import (`import_document`): the extract →
+/// chunk → embed pipeline for ONE document. Carries the document id + a stage + counts ONLY — NO PII
+/// (no filename, no text, no heading; the id is a random UUID). Lets the Brain tab show a progress
+/// bar for a large PDF instead of a frozen dialog.
+pub const EVENT_DOC_IMPORT: &str = "murmur://doc-import";
+
+/// Payload for [`EVENT_DOC_IMPORT`]. `stage` is `"extracting"` | `"chunking"` | `"embedding"` |
+/// `"done"`. `done`/`total` are chunk counts within the embedding stage (0/0 for the earlier
+/// stages). The `document_id` is a random UUID (no content). NO PII.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DocImportPayload {
+    pub document_id: String,
+    /// "extracting" | "chunking" | "embedding" | "done"
+    pub stage: String,
+    pub done: usize,
+    pub total: usize,
+}
+
+/// Emit [`EVENT_DOC_IMPORT`] to the FE (best-effort). Swallows the emit failure with a non-PII warn.
+pub fn emit_doc_import(app: &AppHandle, document_id: &str, stage: &str, done: usize, total: usize) {
+    if let Err(e) = app.emit(
+        EVENT_DOC_IMPORT,
+        DocImportPayload {
+            document_id: document_id.to_string(),
+            stage: stage.to_string(),
+            done,
+            total,
+        },
+    ) {
+        tracing::warn!(target: "documents", error = %e, stage, "emit doc-import failed");
+    }
+}
+
 /// Progress for the semantic-search backfill (`reindex_embeddings`) over all visible meetings.
 /// Carries COUNTS ONLY — no meeting ids, titles, or content (NO PII).
 pub const EVENT_REINDEX: &str = "murmur://reindex-embeddings";

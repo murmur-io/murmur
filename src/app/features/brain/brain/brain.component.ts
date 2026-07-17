@@ -1,16 +1,19 @@
 import {
   ChangeDetectionStrategy,
   Component,
+  DestroyRef,
   computed,
   effect,
   inject,
   signal,
 } from "@angular/core";
 import { RouterLink } from "@angular/router";
+import type { UnlistenFn } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { IpcService } from "../../../core/ipc.service";
 import type {
   BrainOverview,
+  DocImportProgress,
   DocumentInfo,
   FolderNode,
   GraphData,
@@ -91,6 +94,7 @@ export class BrainComponent {
   private readonly ipc = inject(IpcService);
   private readonly folders = inject(FoldersService);
   private readonly toast = inject(ToastService);
+  private readonly destroyRef = inject(DestroyRef);
 
   // ── "Enable the brain" nudge — shown only when an on-device model is missing ─
   /**
@@ -250,6 +254,42 @@ export class BrainComponent {
   readonly savingNote = signal(false);
   readonly deletingId = signal<string | null>(null);
 
+  /**
+   * Latest progress for the in-flight document import (from `EVENT_DOC_IMPORT`),
+   * or null when no import is running. Fed by the `onDocImportProgress` listener
+   * subscribed once in the constructor; cleared when the import settles. Counts +
+   * stage only — NO PII (see {@link DocImportProgress}).
+   */
+  private readonly importProgress = signal<DocImportProgress | null>(null);
+
+  /**
+   * A short, human progress line for the importing Documents card, e.g.
+   * "Extracting…" or "Embedding 12/40". Null unless an import is running.
+   */
+  readonly importProgressLabel = computed<string | null>(() => {
+    if (!this.importing()) {
+      return null;
+    }
+    const p = this.importProgress();
+    if (!p) {
+      return "Preparing…";
+    }
+    switch (p.stage) {
+      case "extracting":
+        return "Extracting text…";
+      case "chunking":
+        return "Chunking…";
+      case "embedding":
+        return p.total > 0
+          ? `Embedding ${p.done}/${p.total}`
+          : "Embedding…";
+      case "done":
+        return "Finishing…";
+      default:
+        return "Working…";
+    }
+  });
+
   readonly documents = computed(() =>
     this.items().filter((d) => d.kind !== "note"),
   );
@@ -357,6 +397,22 @@ export class BrainComponent {
         void this.fetchGraph();
       },
     );
+
+    // Subscribe ONCE to the document-import progress stream (extract → chunk →
+    // embed). Payloads are counts + stage only (NO PII); we push the latest into
+    // `importProgress` so the Documents card shows live progress instead of a
+    // frozen "Adding…". The listener is released on teardown (RecorderStore.init
+    // idiom). `import_document` is a one-shot, so no stale-result guard is needed
+    // — the `importing` flag already gates a second import.
+    let unlisten: UnlistenFn | null = null;
+    void this.ipc
+      .onDocImportProgress((p) => this.importProgress.set(p))
+      .then((fn) => {
+        unlisten = fn;
+      });
+    this.destroyRef.onDestroy(() => {
+      unlisten?.();
+    });
   }
 
   /** Probe both on-device models; null on any failure (nudge stays hidden). */
@@ -452,7 +508,12 @@ export class BrainComponent {
     this.selectedFolderId.set((event.target as HTMLSelectElement).value);
   }
 
-  /** Open the native file dialog (md/txt) → import the chosen path as a document. */
+  /**
+   * Open the native file dialog (Markdown / text / PDF / Word / PowerPoint /
+   * Excel / HTML) → import the chosen path as a document. The backend extracts
+   * the text, then chunks + embeds it behind the RAM floor, streaming progress
+   * over `EVENT_DOC_IMPORT` (surfaced on the card via {@link importProgressLabel}).
+   */
   async pickAndImportDocument(): Promise<void> {
     const folderId = this.addTargetId();
     if (!folderId || this.selectedBlocked() || this.importing()) {
@@ -460,12 +521,27 @@ export class BrainComponent {
     }
     const chosen = await open({
       multiple: false,
-      filters: [{ name: "Documents", extensions: ["md", "txt"] }],
+      filters: [
+        {
+          name: "Documents",
+          extensions: [
+            "md",
+            "txt",
+            "pdf",
+            "docx",
+            "pptx",
+            "xlsx",
+            "html",
+            "htm",
+          ],
+        },
+      ],
     });
     if (typeof chosen !== "string") {
       return;
     }
 
+    this.importProgress.set(null);
     this.importing.set(true);
     try {
       await this.ipc.importDocument(chosen, folderId);
@@ -476,6 +552,7 @@ export class BrainComponent {
       this.toast.danger(this.friendlyImportError(e));
     } finally {
       this.importing.set(false);
+      this.importProgress.set(null);
     }
   }
 
@@ -553,13 +630,38 @@ export class BrainComponent {
     await this.fetchOverview();
   }
 
+  /**
+   * Map a raw backend error string into a friendly, actionable message. The
+   * backend serializes `AppError` as `to_string()` — so the strings we match
+   * are the `import_document` / `extract` messages, prefixed by the variant tag
+   * (`"locked: …"`, `"invalid argument: …"`). Order matters: the SPECIFIC
+   * extraction failures are checked before the generic "unsupported type" one.
+   */
   private friendlyImportError(e: unknown): string {
     const msg = String(e);
-    if (/lock/i.test(msg)) {
+    // Write-gate: a sealed-not-unlocked folder ("locked: …").
+    if (/^locked:|\block/i.test(msg)) {
       return "That folder is locked — unlock it first to add to the brain.";
     }
-    if (/\.md and \.txt|only .*md|invalid/i.test(msg)) {
-      return "Only Markdown (.md) and text (.txt) files can be imported.";
+    // Scanned / image-only PDF — no text layer, OCR not supported yet.
+    if (/scanned pdf|no extractable text|has no extractable/i.test(msg)) {
+      return "That file has no extractable text (a scanned or image-only document). OCR isn’t supported yet.";
+    }
+    // Encrypted / password-protected PDF.
+    if (/password-protected|password|encrypted/i.test(msg)) {
+      return "That PDF is password-protected — unlock it and try again.";
+    }
+    // Corrupt / unreadable / malformed file (bad zip, malformed XML, unreadable PDF).
+    if (
+      /could not read|could not open|could not render|not a valid|corrupt|malformed|bad (docx|pptx)/i.test(
+        msg,
+      )
+    ) {
+      return "That file couldn’t be read — it may be corrupt or in an unexpected format.";
+    }
+    // Unsupported extension (allowlist reject) — the catch-all invalid-argument case.
+    if (/unsupported document type|only .*md|invalid argument/i.test(msg)) {
+      return "That file type can’t be imported. Try Markdown, text, PDF, Word, PowerPoint, Excel, or HTML.";
     }
     return "Couldn’t add that to the brain. Please try again.";
   }
