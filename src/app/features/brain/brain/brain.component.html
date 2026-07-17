@@ -143,9 +143,11 @@
         [emptyLabel]="
           isAll() ? 'No documents yet.' : 'No documents in this folder yet.'
         "
+        [previewable]="true"
         (add)="pickAndImportDocument()"
         (deleteItem)="removeItem($event)"
         (toggleList)="docsExpanded.set(!docsExpanded())"
+        (openItem)="openPreview($event)"
       />
 
       <app-brain-source-card
@@ -297,6 +299,10 @@
       (save)="onSaveNote($event)"
       (dismiss)="closeNoteEditor()"
     />
+  }
+
+  @if (previewDoc(); as doc) {
+    <app-document-preview [doc]="doc" (dismiss)="closePreview()" />
   }
 </section>
   
