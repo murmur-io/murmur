@@ -226,6 +226,12 @@
 }
 
 /* --- Composer --- */
+/* Source-scoped Brain picker — sits just above the composer. */
+.chat-sources {
+  display: block;
+  margin-bottom: calc(-1 * var(--space-1));
+}
+
 .chat-composer {
   display: flex;
   align-items: flex-end;
