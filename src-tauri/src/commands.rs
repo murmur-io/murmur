@@ -8022,11 +8022,19 @@ fn link_endpoint_is_unlocked(
 ) -> Result<bool, AppError> {
     match kind {
         crate::links::LinkKind::Meeting => meeting_is_unlocked(state, id),
-        crate::links::LinkKind::Note | crate::links::LinkKind::Document => {
-            match state.db.get_note_row(id)? {
-                Some(row) => folder_is_unlocked(state, &row.folder_id),
-                None => Ok(false), // unknown note/document → nothing to surface. Fail-closed.
-            }
+        crate::links::LinkKind::Note => match state.db.get_note_row(id)? {
+            Some(row) => folder_is_unlocked(state, &row.folder_id),
+            None => Ok(false), // unknown note → nothing to surface. Fail-closed.
+        },
+        crate::links::LinkKind::Document => {
+            // An imported `document` (kind != 'note') is NOT a `get_note_row` row, so routing it
+            // through `get_note_row` refused it fail-closed EVEN WHEN VISIBLE (a spurious `Locked`
+            // on the +Link chooser). Gate it via the canonical visibility reader
+            // (`get_document_if_visible` applies `visibility_clause` against the live unlock set):
+            // `Some` ⇒ visible/unlocked, `None` ⇒ sealed-or-unknown ⇒ refuse. Documents stay
+            // linkable (the chooser AND the Ask source-picker both offer them) and still fail-closed.
+            let unlocked = unlocked_snapshot(state)?;
+            Ok(state.db.get_document_if_visible(id, &unlocked)?.is_some())
         }
     }
 }
@@ -19802,6 +19810,54 @@ mod lifecycle_tests {
         assert!(
             matches!(err2, AppError::Locked(_)),
             "a sealed source endpoint must refuse with Locked; got {err2:?}"
+        );
+    }
+
+    /// A `document` endpoint (an imported PDF/DOCX, `kind='document'` — NOT a `get_note_row` row) must
+    /// be LINKABLE when visible and REFUSED when sealed. Before the dedicated `Document` gate arm,
+    /// `link_endpoint_is_unlocked` routed documents through `get_note_row` (which filters `kind='note'`)
+    /// → `None` → a spurious `Locked` even for an OPEN document. RED: the "open document links"
+    /// assertion fails on the pre-fix code path; the sealed-document refusal proves the gate still holds.
+    #[test]
+    fn link_items_gates_document_endpoint() {
+        let state = build_state("link-doc-endpoint");
+        make_open_folder(&state.db, "f-open", "Open");
+        make_open_folder(&state.db, "f-lock", "Secret");
+        seed_note_doc_cmd(&state.db, "src", "f-open", "Source Note", "body\n");
+        // An OPEN imported document (linkable) + a SEALED imported document (must refuse).
+        state
+            .db
+            .insert_document("doc-open", "f-open", "Contract.pdf", "extracted text", "document", 0i64)
+            .unwrap();
+        state
+            .db
+            .insert_document("doc-seal", "f-lock", "Secret.pdf", "secret extracted", "document", 0i64)
+            .unwrap();
+        state
+            .db
+            .set_folder_locked("f-lock", true, Some(&b"wrapped"[..]))
+            .unwrap();
+
+        // Linking the OPEN document SUCCEEDS (RED before the Document gate arm — was a spurious Locked).
+        link_items_inner(&state, "note", "src", "document", "doc-open").unwrap();
+        let open = unlocked_snapshot(&state).unwrap();
+        assert_eq!(
+            state
+                .db
+                .links_for_visible(crate::links::LinkKind::Note, "src", &open)
+                .unwrap()
+                .iter()
+                .filter(|e| e.other_id == "doc-open")
+                .count(),
+            1,
+            "an open document must be linkable and visible from the note side"
+        );
+
+        // Linking the SEALED document REFUSES Locked (gate holds through the new arm; no row written).
+        let err = link_items_inner(&state, "note", "src", "document", "doc-seal").unwrap_err();
+        assert!(
+            matches!(err, AppError::Locked(_)),
+            "a sealed document endpoint must refuse with Locked; got {err:?}"
         );
     }
 
