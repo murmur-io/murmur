@@ -355,6 +355,27 @@
   background: var(--accent-soft);
   box-shadow: 0 0 0 3px var(--accent-soft);
 }
+// Receipt pulse (Brain v3 PR-5): a one-shot glow drawing the eye to the exact
+// transcript line that proves a note claim, after a receipt chip seeks here.
+.frag.is-flash {
+  color: var(--text-primary);
+  border-radius: var(--radius-sm);
+  animation: receipt-flash 1400ms var(--transition) both;
+}
+@keyframes receipt-flash {
+  0% {
+    background: var(--accent);
+    box-shadow: 0 0 0 4px var(--accent-soft);
+  }
+  60% {
+    background: var(--accent-soft);
+    box-shadow: 0 0 0 3px var(--accent-soft);
+  }
+  100% {
+    background: transparent;
+    box-shadow: 0 0 0 0 transparent;
+  }
+}
 .turn-empty,
 .empty-card {
   padding: var(--space-5);
@@ -374,8 +395,15 @@
 }
 @media (prefers-reduced-motion: reduce) {
   .audio-panel,
-  .saved-toast {
+  .saved-toast,
+  .frag.is-flash {
     animation: none;
+  }
+  // Keep the pulse legible without motion: a static highlight that a subsequent
+  // user seek (which clears .is-flash) removes.
+  .frag.is-flash {
+    background: var(--accent-soft);
+    box-shadow: 0 0 0 3px var(--accent-soft);
   }
 }
 

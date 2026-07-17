@@ -31,6 +31,8 @@
 
 use std::collections::HashSet;
 
+use serde::{Deserialize, Serialize};
+
 use crate::summarize::related_context::{is_stopword, tokenize};
 use crate::transcribe::types::Segment;
 
@@ -162,6 +164,156 @@ pub fn annotate_unverified(note_markdown: &str, segments: &[Segment]) -> String 
         Some(fm) => format!("{fm}{annotated_body}"),
         None => annotated_body,
     }
+}
+
+// ── RECEIPTS (Brain v3 PR-5) ─────────────────────────────────────────────────────────────────────
+//
+// The GROUNDING pass above answers "is this claim supported?" with a `> unverified` marker. Receipts
+// answer the dual question — "WHERE (which second of audio) did this claim come from?" — using the
+// SAME deterministic token-overlap math, no LLM, no egress. For every candidate note line (a bullet,
+// a checklist item, a prose sentence) we find the transcript segment it overlaps most, and emit that
+// segment's audio coordinates (`start_s`/`end_s`), speaker, and ASR confidence so the UI can seek the
+// already-shipped audio player/timeline to that second and prove the claim.
+//
+// PURE + on-device: `align_claims_to_segments` reads NOTHING but the passed note lines + segments —
+// no DB, no clock, no LLM. The command wrapper (`commands::get_note_receipts`) is what gates the read.
+// Timestamps are RAW SECONDS straight off `Segment` (never a formatted MM:SS string — the 2h-wrap bug
+// the perf work fought), so the FE seeks with a plain `float` and formats for display itself.
+
+/// The minimum token-overlap ratio (overlapping distinct content tokens / the claim's distinct
+/// content tokens) for a claim to earn a receipt. Below this the claim is left UN-aligned (no
+/// `ClaimAlignment` emitted) rather than pointing the user at a weakly-related second of audio — a
+/// wrong receipt is worse than none. Chosen to match `GROUND_MIN_COVERAGE` (the same "half its words
+/// were actually spoken" bar the grounding pass already uses); calibration of the operating point on
+/// paraphrased LLM lines is a dev-app follow-up, not provable by `cargo test --lib`.
+const RECEIPT_MIN_OVERLAP: f32 = 0.5;
+
+/// One claim → the transcript segment it most likely derives from. Emitted only for note lines that
+/// clear [`RECEIPT_MIN_OVERLAP`]; a paraphrased/unsupported line gets no entry (the FE renders no
+/// receipt chip for it). Serialized camelCase to match `Segment`'s FE convention. Carries NO note or
+/// transcript TEXT — only the claim's line index, the segment's audio coordinates, and non-content
+/// metadata (speaker label + ASR probability) — so the DTO is safe to hand a caller that has already
+/// passed the read gate.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaimAlignment {
+    /// Index of the claim in the `note_lines` slice passed to [`align_claims_to_segments`] (the FE
+    /// maps this back to the rendered note line to place the receipt chip).
+    pub claim_index: usize,
+    /// `Segment.idx` of the best-matching transcript segment (stable id the FE can flash/highlight).
+    pub segment_id: i64,
+    /// Segment start in RAW SECONDS — the audio player/timeline seek target.
+    pub start_s: f64,
+    /// Segment end in RAW SECONDS.
+    pub end_s: f64,
+    /// `"me"` / `"others"` / `None` — straight from the segment (no new field, no diarization).
+    pub speaker: Option<String>,
+    /// Per-segment ASR confidence in `[0,1]`, or `None` when whisper did not compute it. Straight
+    /// from the segment; the FE shows it in the receipt tooltip.
+    pub confidence: Option<f32>,
+    /// The token-overlap ratio that won this alignment (`[RECEIPT_MIN_OVERLAP, 1.0]`) — lets the FE
+    /// tier receipt strength if it wants to.
+    pub overlap: f32,
+}
+
+/// Deterministically align each candidate note line to the transcript segment it most likely derives
+/// from, by normalized content-token overlap (the SAME `content_tokens` math the grounding pass uses).
+///
+/// - `note_lines`: the note body lines (front-matter already split off by the caller is fine — this
+///   fn also skips headings / code fences / blockquotes / wikilink-only / protected sections / too-
+///   short lines itself, so a claim index always refers to a REAL claim line and never a heading).
+/// - For each candidate line: score overlap against every non-empty, non-assistant-directed segment;
+///   pick the segment with the MOST overlapping distinct content tokens (ties → the EARLIEST segment,
+///   for determinism); emit a [`ClaimAlignment`] iff `overlapping / claim_tokens >= RECEIPT_MIN_OVERLAP`.
+/// - Below threshold ⇒ NO entry for that line (a paraphrased LLM line the transcript doesn't clearly
+///   support gets no — possibly wrong — receipt).
+///
+/// Pure: no DB, no clock, no LLM, no I/O. Deterministic: same inputs ⇒ byte-identical output.
+pub fn align_claims_to_segments(note_lines: &[&str], segments: &[Segment]) -> Vec<ClaimAlignment> {
+    // Per-segment content-token set, keeping the segment's audio coordinates + metadata. Filtered
+    // with the IDENTICAL predicate as the grounding pass (drop empty + assistant-directed spans — an
+    // assistant command is not transcript evidence to point a receipt at).
+    let seg_index: Vec<(HashSet<String>, &Segment)> = segments
+        .iter()
+        .filter(|s| {
+            let t = s.text.trim();
+            !t.is_empty() && !crate::audio::wake::is_assistant_directed(t)
+        })
+        .map(|s| (content_tokens(&s.text), s))
+        .collect();
+
+    if seg_index.is_empty() {
+        return Vec::new();
+    }
+
+    let mut out: Vec<ClaimAlignment> = Vec::new();
+    let mut in_code_fence = false;
+    let mut in_skipped_section = false;
+
+    for (i, &line) in note_lines.iter().enumerate() {
+        let trimmed = line.trim();
+
+        // Code fences: toggle state; never a claim.
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_code_fence = !in_code_fence;
+            continue;
+        }
+        if in_code_fence {
+            continue;
+        }
+        // Headings re-evaluate the protected-section state; a heading is never a claim.
+        if trimmed.starts_with('#') {
+            in_skipped_section = is_skipped_heading(trimmed);
+            continue;
+        }
+        if in_skipped_section {
+            continue;
+        }
+        // Blanks, blockquotes (incl. our own `> unverified` markers) — never a claim.
+        if trimmed.is_empty() || trimmed.starts_with('>') {
+            continue;
+        }
+
+        // Strip the list/checkbox marker; skip wikilink-only citation lines.
+        let unit = unit_content(trimmed);
+        if is_wikilink_only(unit) {
+            continue;
+        }
+        let toks = content_tokens(unit);
+        if toks.len() < GROUND_MIN_CONTENT_TOKENS {
+            continue;
+        }
+
+        // Best-matching segment = most overlapping distinct content tokens; ties → EARLIEST (first
+        // wins because we only replace on a STRICTLY greater overlap). Deterministic.
+        let mut best_overlap = 0usize;
+        let mut best: Option<&Segment> = None;
+        for (seg_toks, seg) in &seg_index {
+            let overlap = toks.iter().filter(|t| seg_toks.contains(*t)).count();
+            if overlap > best_overlap {
+                best_overlap = overlap;
+                best = Some(seg);
+            }
+        }
+
+        let Some(seg) = best else { continue };
+        let ratio = best_overlap as f32 / toks.len() as f32;
+        if ratio < RECEIPT_MIN_OVERLAP {
+            continue; // paraphrase / unsupported ⇒ no (possibly wrong) receipt.
+        }
+
+        out.push(ClaimAlignment {
+            claim_index: i,
+            segment_id: seg.idx,
+            start_s: seg.start_s,
+            end_s: seg.end_s,
+            speaker: seg.speaker.clone(),
+            confidence: seg.confidence,
+            overlap: ratio,
+        });
+    }
+
+    out
 }
 
 /// Distinct, lowercased, stopword-stripped content tokens (reusing the retrieval tokenizer +
@@ -325,6 +477,26 @@ mod tests {
         }
     }
 
+    /// A fully-specified segment for the receipts (`align_claims_to_segments`) tests: distinct
+    /// idx/timestamps/speaker/confidence so a receipt's audio coordinates can be asserted exactly.
+    fn seg_full(
+        idx: i64,
+        start_s: f64,
+        end_s: f64,
+        speaker: &str,
+        confidence: Option<f32>,
+        text: &str,
+    ) -> Segment {
+        Segment {
+            idx,
+            start_s,
+            end_s,
+            text: text.into(),
+            speaker: Some(speaker.into()),
+            confidence,
+        }
+    }
+
     /// RED-before-GREEN: an action item the transcript never supports gets a following `> unverified`
     /// line, while a SUPPORTED summary sentence stays clean. Reverting `annotate_unverified` to a
     /// no-op drops the marker (RED). The marker here is the PLAIN variant (no overlapping segment).
@@ -468,6 +640,143 @@ mod tests {
         assert_eq!(
             out, note,
             "a 2-token unsupported bullet is below the min and stays clean"
+        );
+    }
+
+    // ── RECEIPTS (align_claims_to_segments) ──────────────────────────────────────────────────────
+
+    /// RED-before-GREEN: a claim whose words are largely IN a segment aligns to THAT segment, carrying
+    /// its exact audio coordinates + speaker + confidence. Reverting `align_claims_to_segments` to
+    /// return `Vec::new()` drops the receipt (RED). Also proves the best-match picks the RIGHT segment
+    /// (the login one, not the migration one) and the claim_index points at the real claim line (not a
+    /// heading/blank).
+    #[test]
+    fn exact_overlap_claim_aligns_to_its_segment() {
+        let segments = vec![
+            seg_full(
+                7,
+                12.5,
+                18.0,
+                "me",
+                Some(0.91),
+                "we finally shipped the login page and the payment flow this week",
+            ),
+            seg_full(
+                8,
+                40.0,
+                47.0,
+                "others",
+                Some(0.80),
+                "the database migration is completely done now",
+            ),
+        ];
+        // Line indices: 0 heading, 1 blank, 2 the claim.
+        let lines: Vec<&str> = "## Summary\n\nWe shipped the login page and the payment flow."
+            .split('\n')
+            .collect();
+        let out = align_claims_to_segments(&lines, &segments);
+
+        assert_eq!(out.len(), 1, "exactly one claim line aligns; got:\n{out:?}");
+        let a = &out[0];
+        assert_eq!(a.claim_index, 2, "claim_index points at the real claim line");
+        assert_eq!(a.segment_id, 7, "aligned to the LOGIN segment, not migration");
+        assert_eq!(a.start_s, 12.5, "raw-seconds start seek target");
+        assert_eq!(a.end_s, 18.0);
+        assert_eq!(a.speaker.as_deref(), Some("me"));
+        assert_eq!(a.confidence, Some(0.91));
+        assert!(
+            a.overlap >= RECEIPT_MIN_OVERLAP,
+            "overlap ratio clears the receipt threshold"
+        );
+    }
+
+    /// A paraphrased claim whose distinct content tokens fall BELOW the overlap threshold earns NO
+    /// receipt (better none than a wrong second of audio). RED if the threshold is dropped/removed.
+    #[test]
+    fn paraphrase_below_threshold_gets_no_alignment() {
+        let segments = vec![seg_full(
+            1,
+            5.0,
+            9.0,
+            "others",
+            None,
+            "we should probably revisit the pricing tiers next quarter",
+        )];
+        // Shares only "quarter" (1 of 4 distinct content tokens after stopword-strip) → ratio < 0.5.
+        let lines: Vec<&str> =
+            "The acquisition negotiations concluded successfully this quarter."
+                .split('\n')
+                .collect();
+        let out = align_claims_to_segments(&lines, &segments);
+        assert!(
+            out.is_empty(),
+            "a below-threshold paraphrase must earn no receipt; got:\n{out:?}"
+        );
+    }
+
+    /// Determinism: same inputs ⇒ byte-identical output. And on an overlap TIE, the EARLIEST segment
+    /// wins (first-seen kept because we only replace on strictly-greater overlap).
+    #[test]
+    fn alignment_is_deterministic_and_ties_pick_earliest() {
+        // Both segments overlap the claim on the SAME two tokens (roadmap, budget) — a tie.
+        let segments = vec![
+            seg_full(3, 1.0, 4.0, "me", None, "we reviewed the roadmap and the budget"),
+            seg_full(4, 30.0, 34.0, "others", None, "roadmap and budget again later on"),
+        ];
+        let lines: Vec<&str> = "We reviewed the roadmap and the budget in detail."
+            .split('\n')
+            .collect();
+        let first = align_claims_to_segments(&lines, &segments);
+        let second = align_claims_to_segments(&lines, &segments);
+        assert_eq!(first, second, "same inputs must give identical output");
+        assert_eq!(first.len(), 1);
+        assert_eq!(
+            first[0].segment_id, 3,
+            "an overlap tie resolves to the EARLIEST segment"
+        );
+    }
+
+    /// Headings, blanks, code fences, blockquotes, wikilink-only lines and too-short bullets are never
+    /// claims — a receipt's claim_index always refers to a REAL claim line.
+    #[test]
+    fn non_claim_lines_never_get_receipts() {
+        let segments = vec![seg_full(
+            1,
+            0.0,
+            5.0,
+            "me",
+            None,
+            "we shipped the invoice export feature and the reporting dashboard",
+        )];
+        let note = "# Heading with shipped invoice export reporting words\n\n> a blockquote mentioning shipped invoice export dashboard\n\n[[Shipped Invoice Export Reporting Note]]\n\n- ok\n\n```\nshipped invoice export reporting dashboard code\n```\n\nWe shipped the invoice export and the reporting dashboard.";
+        let lines: Vec<&str> = note.split('\n').collect();
+        let out = align_claims_to_segments(&lines, &segments);
+        assert_eq!(out.len(), 1, "only the real prose claim aligns; got:\n{out:?}");
+        assert_eq!(
+            lines[out[0].claim_index].trim(),
+            "We shipped the invoice export and the reporting dashboard."
+        );
+    }
+
+    /// With no usable transcript (empty, or only assistant-directed spans) there are no receipts —
+    /// never point a chip at nothing.
+    #[test]
+    fn empty_or_assistant_only_segments_yield_no_receipts() {
+        let lines: Vec<&str> = "We shipped the login page and the payment flow today."
+            .split('\n')
+            .collect();
+        assert!(align_claims_to_segments(&lines, &[]).is_empty());
+        let cmd = vec![seg_full(
+            1,
+            0.0,
+            3.0,
+            "me",
+            None,
+            "Klaudku, shipped the login page and payment flow",
+        )];
+        assert!(
+            align_claims_to_segments(&lines, &cmd).is_empty(),
+            "assistant-directed spans are not transcript evidence for a receipt"
         );
     }
 }
