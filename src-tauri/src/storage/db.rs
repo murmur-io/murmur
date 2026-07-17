@@ -10425,8 +10425,14 @@ impl Db {
             match edge_type {
                 "wikilink" => 0,
                 "companion" => 1,
-                "semantic" => 2,
-                "manual" => 3, // manual only wins when it is the sole edge for the pair.
+                // A `manual` edge is a user's ACTIVE, removable link — it MUST outrank a mere
+                // `semantic` SUGGESTION so a manually-linked pair that is ALSO auto-suggested collapses
+                // to the active manual chip (removable `×`), NOT an Accept/Dismiss suggestion row. It
+                // still loses to the deterministic wikilink/companion edges (which are also active).
+                "manual" => 2,
+                // A suggested semantic edge wins the representative slot ONLY when it is the SOLE edge
+                // for the pair (a genuine, unconfirmed suggestion).
+                "semantic" => 3,
                 _ => 4,
             }
         }
@@ -19749,6 +19755,55 @@ mod tests {
             to_target[0].manual,
             "the collapsed chip is flagged as a removable manual link"
         );
+    }
+
+    /// A pair carrying BOTH a user `manual` (active) edge AND an auto `semantic` (suggested) edge —
+    /// realistic, since a manually-linked pair is often also content-similar — must collapse to the
+    /// ACTIVE, removable MANUAL chip, NOT a semantic Accept/Dismiss suggestion. RED before the
+    /// `edge_rank` swap (a `manual` link must outrank a semantic SUGGESTION): the surviving chip was
+    /// `edge_type="semantic" status="suggested"`, so the FE rendered the user's active link as an
+    /// un-removable suggestion. (The manual+wikilink dedupe test above never exercised this collision,
+    /// because both of its edges are non-semantic/active.)
+    #[test]
+    fn links_for_visible_manual_beats_suggested_semantic() {
+        let db = mem_db();
+        seed_folder(&db, "f1", "Notes");
+        seed_note_doc(&db, "target", "f1", "Target", "the target body");
+        seed_note_doc(&db, "source", "f1", "Source", "");
+        let unlocked = HashSet::new();
+        // A user MANUAL link source → target...
+        db.upsert_manual_link("note", "source", "note", "target").unwrap();
+        // ...AND an auto SEMANTIC SUGGESTION for the SAME pair.
+        {
+            let now = 1_700_000_000_000i64;
+            let mut conn = db.lock();
+            let tx = conn.transaction().unwrap();
+            Db::upsert_link_tx(
+                &tx, "note", "source", "note", "target", "semantic", 0.9, "auto", "suggested", now,
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        assert_eq!(link_count(&db, "note", "source", "manual"), 1);
+        assert_eq!(link_count(&db, "note", "source", "semantic"), 1);
+
+        let edges = db
+            .links_for_visible(crate::links::LinkKind::Note, "source", &unlocked)
+            .unwrap();
+        let to_target: Vec<_> = edges.iter().filter(|e| e.other_id == "target").collect();
+        assert_eq!(to_target.len(), 1, "manual + semantic collapse to ONE chip");
+        let chip = to_target[0];
+        assert!(chip.manual, "the collapsed chip is a removable manual link");
+        // Load-bearing: the chip must NOT read as a suggested-semantic row — the FE partitions
+        // `edge_type=='semantic' && status=='suggested'` as an Accept/Dismiss suggestion, EXCLUDED
+        // from the removable deterministic chips (so a user's active link would lose its `×`).
+        assert!(
+            !(chip.edge_type == "semantic" && chip.status == "suggested"),
+            "a manually-linked pair must never render as an unconfirmed suggestion; got {} / {}",
+            chip.edge_type,
+            chip.status
+        );
+        assert_eq!(chip.status, "active", "a user manual link is active");
     }
 
     /// A pair with ONLY a `wikilink` edge (no manual) is NOT flagged `manual` — the FE renders it as
