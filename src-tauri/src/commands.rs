@@ -1398,9 +1398,17 @@ pub async fn ask_assistant_chat(
     thread_id: Option<String>,
     anchor_text: Option<String>,
     meeting_id: Option<String>,
+    explicit_sources: Option<Vec<crate::storage::models::SourceRef>>,
 ) -> Result<crate::voice_action::VoiceActionResult, AppError> {
     let (latest, conversation) = format_chat(&messages)?;
     let thread_id = crate::transcribe::live::ensure_thread_id(thread_id);
+    // note↔meeting-links PR-2 — SOURCE-SCOPED augmentation (PARTIAL, the SHOULD leg). The @brain
+    // assistant loop (`run_assistant_query`) is a deep current-first cascade whose tool executor +
+    // deterministic floor legs would need wide surgery to fully candidate-constrain; PR-2 threads
+    // the pinned sources one level in so the cloud AGENTIC cascade reasons with the gated pinned
+    // corpus injected into its conversation context. `None`/empty ⇒ byte-identical to before. The
+    // remaining full candidate-constraint of the floor/tool legs is a documented follow-up.
+    let explicit_sources = explicit_sources.filter(|s| !s.is_empty());
     tokio::task::spawn_blocking(move || {
         crate::transcribe::live::run_assistant_query(
             &app,
@@ -1410,6 +1418,7 @@ pub async fn ask_assistant_chat(
             &thread_id,
             anchor_text.as_deref(),
             meeting_id.as_deref(),
+            explicit_sources.as_deref(),
         )
     })
     .await
@@ -5504,6 +5513,7 @@ pub async fn chat_meeting(
     meeting_id: String,
     question: String,
     history: Vec<ChatTurn>,
+    explicit_sources: Option<Vec<crate::storage::models::SourceRef>>,
 ) -> Result<String, AppError> {
     if question.trim().is_empty() {
         return Err(AppError::InvalidArg("question is empty".into()));
@@ -5521,7 +5531,7 @@ pub async fn chat_meeting(
             "this meeting has no transcript to chat about yet".into(),
         ));
     }
-    let transcript = segments
+    let mut transcript = segments
         .iter()
         .map(|s| format!("[{:.0}s] {}", s.start_s, s.text.trim()))
         .collect::<Vec<_>>()
@@ -5533,6 +5543,30 @@ pub async fn chat_meeting(
             .map_err(|_| AppError::Config("config mutex poisoned".into()))?
             .clone()
     };
+    // Inject the gated cross-meeting USER MEMORY brief (parity with the @brain agentic loop): derived
+    // from VISIBLE user facts only under the LIVE unlock snapshot, empty when memory is disabled ⇒
+    // byte-identical prompt. Rides this surface's existing redaction + consent egress (no new class).
+    let unlocked = unlocked_snapshot(state.inner())?;
+    // note↔meeting-links PR-2 — SOURCE-SCOPED augmentation: when the FE pins explicit sources (the
+    // linked notes/meetings the user chose above the chat input), APPEND their gated PINNED corpus
+    // (+ capped, gated link-expansion) to this meeting's transcript grounding — the meeting stays the
+    // primary context, the pinned items add cross-item context. Every leg is `unlocked`-gated (a
+    // sealed pinned source/neighbour contributes NOTHING — never a leak). `None`/empty ⇒ byte-
+    // identical to the pre-change transcript-only grounding.
+    if let Some(sources) = explicit_sources.filter(|s| !s.is_empty()) {
+        let ask_conn =
+            crate::summarize::roles::provider_target(crate::summarize::roles::Role::Ask, &config)
+                .connection;
+        let (pinned, _) = crate::summarize::vault_context::build_vault_context_pinned_visible(
+            &state.db, &sources, &ask_conn, &unlocked,
+        )?;
+        if !pinned.trim().is_empty() {
+            transcript.push_str(
+                "\n\n=== LINKED NOTES & MEETINGS (the user pinned these as additional context) ===\n",
+            );
+            transcript.push_str(&pinned);
+        }
+    }
     // ASK role: meeting chat is a Q&A surface. With role keys absent this resolves to the same
     // default provider as before (the legacy chat path always ignored `brain_backend`).
     let provider = crate::summarize::provider_for(
@@ -5540,10 +5574,6 @@ pub async fn chat_meeting(
         &config,
         &state.heavy_inference,
     )?;
-    // Inject the gated cross-meeting USER MEMORY brief (parity with the @brain agentic loop): derived
-    // from VISIBLE user facts only under the LIVE unlock snapshot, empty when memory is disabled ⇒
-    // byte-identical prompt. Rides this surface's existing redaction + consent egress (no new class).
-    let unlocked = unlocked_snapshot(state.inner())?;
     let memory_brief = gated_memory_brief_for_injection(state.inner(), &unlocked, &question);
     let (system, user) =
         crate::summarize::chat::build(&transcript, &history, &question, &memory_brief);
@@ -8419,6 +8449,7 @@ pub async fn ask_vault(
     question: String,
     history: Vec<ChatTurn>,
     ask_thread_id: Option<String>,
+    explicit_sources: Option<Vec<crate::storage::models::SourceRef>>,
 ) -> Result<AskVaultResult, AppError> {
     if question.trim().is_empty() {
         return Err(AppError::InvalidArg("question is empty".into()));
@@ -8433,6 +8464,36 @@ pub async fn ask_vault(
     // The same 12-message discipline as the chat panel (CHAT_CONTEXT_TURNS): bounds prompt growth +
     // cloud egress on BOTH paths. The LATEST question still drives retrieval either way.
     let history: Vec<ChatTurn> = capped_ask_history(&history).to_vec();
+
+    // note↔meeting-links PR-2 — SOURCE-SCOPED (pinned) Ask. When the FE source picker sends a
+    // non-empty explicit source list, retrieval is PINNED to exactly those items (+ their capped,
+    // gated link-expansion) and answered DETERMINISTICALLY via the SAME floor answer path — the
+    // agentic vault-wide search is SKIPPED (the user controls the context, so a scoped Ask never
+    // pulls unlisted vault items). `None`/empty ⇒ this whole block is a no-op and the path below is
+    // BYTE-IDENTICAL to before.
+    let pinned_sources: Option<Vec<crate::storage::models::SourceRef>> =
+        explicit_sources.filter(|s| !s.is_empty());
+    if let Some(sources) = pinned_sources {
+        let unlocked = unlocked_snapshot(state.inner())?;
+        let memory_brief = gated_memory_brief_for_injection(state.inner(), &unlocked, &question);
+        let reranker = crate::rerank::active_reranker(
+            state
+                .reasoner
+                .current_for(crate::summarize::roles::Role::Ask),
+        );
+        return ask_vault_floor(
+            &state.db,
+            &config,
+            &unlocked,
+            &question,
+            &history,
+            &memory_brief,
+            Some(reranker),
+            &state.heavy_inference,
+            Some(sources),
+        )
+        .await;
+    }
 
     // Agentic path — CLOUD-connection roles only (the same rule as the in-meeting brain:
     // local-GGUF multi-step tool-call reliability is unproven). The eligibility gate keys on the
@@ -8482,6 +8543,7 @@ pub async fn ask_vault(
         &memory_brief,
         Some(reranker),
         &state.heavy_inference,
+        None, // whole-vault path: no explicit sources ⇒ the existing search corpus, unchanged.
     )
     .await
 }
@@ -8729,20 +8791,24 @@ fn build_ask_vault_floor_prompt(
     history: &[ChatTurn],
     memory_brief: &str,
     reranker: Option<&dyn crate::rerank::Reranker>,
+    explicit_sources: Option<&[crate::storage::models::SourceRef]>,
 ) -> Result<AskFloorPrompt, AppError> {
-    // Phase 2b (gated): when semantic search is ON, pick candidates by HYBRID retrieval (FTS ∪
-    // vector KNN, RRF-fused) — embedding the query with the active embedder — then pack with the
-    // SAME budget/citation logic and the SAME visibility gate. When OFF (the default) OR the index
-    // is empty, this falls back to the existing FTS-only path UNCHANGED (the hybrid query
-    // degenerates to FTS when no vectors exist; the flag-off branch is byte-for-byte the prior
-    // behavior).
     // Budget on the ASK-role provider's RESOLVED connection — the corpus egresses to it. With
     // role keys absent this is the legacy `provider_id` for EVERY brain_backend (the pre-role
     // floor always ignored `brain_backend`), so the packed corpus is byte-identical.
     let ask_conn =
         crate::summarize::roles::provider_target(crate::summarize::roles::Role::Ask, config)
             .connection;
-    let (corpus, sources) = if config.semantic_search_enabled {
+    // note↔meeting-links PR-2 — PINNED corpus: when the caller supplied an explicit source list, the
+    // FTS/vector SEARCH is skipped entirely and the corpus is EXACTLY those sources (+ their capped,
+    // gated link-expansion) — the user controls the context. Same `unlocked` visibility gate as
+    // every search leg (a sealed source/neighbour contributes nothing). `None` ⇒ the exact existing
+    // whole-vault search below, byte-for-byte.
+    let (corpus, sources) = if let Some(sources) = explicit_sources.filter(|s| !s.is_empty()) {
+        crate::summarize::vault_context::build_vault_context_pinned_visible(
+            db, sources, &ask_conn, unlocked,
+        )?
+    } else if config.semantic_search_enabled {
         let embedder = crate::embed::active_embedder();
         // QUERY side: use the e5 `query:` prefix (asymmetric with the `passage:` index side).
         let query_vec = embedder
@@ -8789,6 +8855,7 @@ async fn ask_vault_floor(
     memory_brief: &str,
     reranker: Option<Box<dyn crate::rerank::Reranker>>,
     heavy: &std::sync::Arc<tokio::sync::Semaphore>,
+    explicit_sources: Option<Vec<crate::storage::models::SourceRef>>,
 ) -> Result<AskVaultResult, AppError> {
     // `build_ask_vault_floor_prompt` does the LOCAL/on-device work — query embedding (Candle/
     // Metal) + hybrid FTS∪vector retrieval + reranker inference — synchronously. This is exactly
@@ -8814,6 +8881,7 @@ async fn ask_vault_floor(
             &history_owned,
             &memory_brief_owned,
             reranker.as_deref(),
+            explicit_sources.as_deref(),
         )
     })
     .await
@@ -9099,7 +9167,9 @@ mod ask_vault_tests {
         let (want_system, want_user) =
             crate::summarize::vault_chat::build(&corpus, &history, q, "");
 
-        match build_ask_vault_floor_prompt(&db, &cfg, &unlocked, q, &history, "", None).unwrap() {
+        match build_ask_vault_floor_prompt(&db, &cfg, &unlocked, q, &history, "", None, None)
+            .unwrap()
+        {
             AskFloorPrompt::Ready {
                 system,
                 user,
@@ -9130,7 +9200,8 @@ mod ask_vault_tests {
 
         // The empty-vault early return keeps the EXACT pre-change canned answer.
         let empty = tmp_db();
-        match build_ask_vault_floor_prompt(&empty, &cfg, &unlocked, q, &[], "", None).unwrap() {
+        match build_ask_vault_floor_prompt(&empty, &cfg, &unlocked, q, &[], "", None, None).unwrap()
+        {
             AskFloorPrompt::Empty(r) => {
                 assert_eq!(
                     r.answer,
@@ -9173,6 +9244,7 @@ mod ask_vault_tests {
             "",
             None,
             &std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+            None,
         ));
         assert!(
             matches!(res, Err(AppError::Unavailable(_))),
