@@ -13,37 +13,34 @@ import {
 } from "@angular/core";
 import { MeetingConversationStore } from "../../../core/meeting-conversation.store";
 import type { NoteItem, ThreadTurn } from "../../../core/meeting-conversation.store";
-import { TabsService } from "../../../core/tabs.service";
 import { MarkdownComponent } from "../../../shared/markdown/markdown.component";
 import { AssistantSourcesComponent } from "../../../shared/assistant-sources/assistant-sources.component";
 
 /**
- * ONE line of the user's notes + its anchored `@brain` THREAD (Slack-style).
+ * ONE Ask-Brain THREAD (Slack-style) in the recording panel's "Ask Brain" tab.
  *
- *  - A PLAIN note line is the user's own jotting — a quiet "note" treatment (a
- *    subtle note glyph + token styling) so it reads clearly as the user's note,
- *    distinct from a thread/agent line.
- *  - A `@brain` THREAD renders as a Slack-style chat: a collapsible "▸ Thread (N)"
- *    toggle (collapsed → a short snippet of the question); expanded → the user's
- *    question as the FIRST right-aligned (purple) user bubble, then the brain's
- *    replies LEFT-aligned with a friendly "🧠 brain" identity, follow-up user
- *    bubbles on the right, and the thread's own Reply input. The question shows
- *    ONCE — the leading anchor turn is sliced out of the loop (no duplication).
+ * Since the v2 document-first redesign there are NO plain note lines here — every
+ * entry is a conversation. The thread renders as a Slack-style chat: a collapsible
+ * "▸ Thread (N)" toggle (collapsed → a short snippet of the question); expanded →
+ * the user's question as the FIRST right-aligned (purple) user bubble, then the
+ * brain's replies LEFT-aligned with a friendly "🧠 brain" identity, follow-up user
+ * bubbles on the right, and the thread's own Reply input. The question shows ONCE —
+ * the leading anchor turn is sliced out of the loop (no duplication).
  *
  * Propose → accept: an agent reply shows a DRAFT-NOTE card with a readable preview
- * of the proposed draft + "✓ Add to notes" / "Dismiss" ONLY when it carries a
+ * of the proposed draft + "✓ Add to note" / "Dismiss" ONLY when it carries a
  * `proposedNote` (the model decided the user asked it to MAKE a note); accept
- * appends THAT draft (not the whole reply) to the main notes; dismiss drops the
- * proposal (showing "Dismissed", never "✓ Added to notes"). A plain answer has no
- * proposal → no card, so the surface reads as a conversation, not a notes app with
- * a button under everything. The internal `propose_note` tool chip is filtered out
- * of the trace (it's plumbing, not a user-facing tool). The thread has its OWN
- * follow-up input so a follow-up goes to the agent WITHOUT re-typing `@brain`.
+ * appends THAT draft (not the whole reply) into the meeting's ONE companion note
+ * DOCUMENT (with a toast confirmation — no note-line badge); dismiss drops the
+ * proposal (showing "Dismissed", never "✓ Added to note"). A plain answer has no
+ * proposal → no card, so the surface reads as a conversation. The internal
+ * `propose_note` tool chip is filtered out of the trace (it's plumbing). The thread
+ * has its OWN follow-up input so a follow-up goes to the agent WITHOUT re-typing.
  *
  * Presentational — all state lives in the store; this component holds only its
- * follow-up draft. A note line holds TURNS, not notes, so there is NO mutual
- * recursion (no `forwardRef` / trap T2 needed). The thread is IN-FLOW (not a
- * floating overlay), so the in-flow surface tokens are correct (trap T3 N/A).
+ * follow-up draft. An entry holds TURNS, so there is NO mutual recursion (no
+ * `forwardRef` / trap T2 needed). The thread is IN-FLOW (not a floating overlay),
+ * so the in-flow surface tokens are correct (trap T3 N/A).
  */
 @Component({
   selector: "app-note-item",
@@ -54,7 +51,6 @@ import { AssistantSourcesComponent } from "../../../shared/assistant-sources/ass
 })
 export class NoteItemComponent {
   protected readonly store = inject(MeetingConversationStore);
-  private readonly tabs = inject(TabsService);
   private readonly injector = inject(Injector);
 
   /** The note line (with its thread, if any) — the single source of truth. */
@@ -205,40 +201,4 @@ export class NoteItemComponent {
     }
   }
 
-  /**
-   * The `[[Meeting]]` chip label: the meeting's display name with the wikilink
-   * brackets stripped (e.g. `[[Weekly sync]]` → `Weekly sync`). Empty when the
-   * line carries no companion reference yet.
-   */
-  protected meetingChipLabel(): string {
-    const raw = this.note().meetingWikilink ?? "";
-    return raw.replace(/^\[\[/, "").replace(/\]\]$/, "").trim();
-  }
-
-  /**
-   * "✓ Saved to Notes" — open the companion note in a new tab BY ID (never by a
-   * fragile title string). Navigating away from the recording is acceptable per
-   * the spec. A no-op if the reference hasn't been stamped yet.
-   */
-  protected openSavedNote(): void {
-    const id = this.note().savedNoteId;
-    if (!id) return;
-    void this.tabs.openNote(id);
-  }
-
-  /**
-   * The `🔗 [[Meeting]] →` chip — navigate to THIS recording's meeting by id
-   * (the store's anchored `meetingId`, the authoritative structured relation),
-   * never by resolving the wikilink string. A no-op when there's no meeting.
-   */
-  protected openMeeting(): void {
-    const id = this.store.meetingId();
-    if (!id) return;
-    void this.tabs.openMeeting(id, this.meetingChipLabel() || "Meeting");
-  }
-
-  /** Retry a failed companion-note append (the card's error state). */
-  protected retrySave(): void {
-    this.store.retrySave(this.note().id);
-  }
 }
