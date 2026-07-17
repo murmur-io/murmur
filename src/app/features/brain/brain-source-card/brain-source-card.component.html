@@ -82,6 +82,13 @@
       }
     </div>
 
+    @if (busy() && progress(); as prog) {
+      <p class="sc-progress" role="status" aria-live="polite">
+        <span class="sc-progress-dot" aria-hidden="true"></span>
+        <span class="sc-progress-text">{{ prog }}</span>
+      </p>
+    }
+
     @if (blocked()) {
       <div class="banner is-accent sc-locked" role="status">
         <span class="sc-locked-glyph" aria-hidden="true"></span>

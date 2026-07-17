@@ -115,6 +115,37 @@
   box-shadow: 0 0 0 4px var(--accent-soft);
 }
 
+/* Import progress line under the Add button (extract → chunk → embed). */
+.sc-progress {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 0.8125rem;
+}
+.sc-progress-dot {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: var(--radius-pill);
+  background: var(--accent-hover);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+  animation: sc-progress-pulse 1.2s ease-in-out infinite;
+}
+.sc-progress-text {
+  font-variant-numeric: tabular-nums;
+}
+@keyframes sc-progress-pulse {
+  0%,
+  100% {
+    opacity: 0.5;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
 .sc-state {
   margin: 0;
   padding: var(--space-2) 0;
@@ -183,6 +214,9 @@
   }
   .sc:hover {
     transform: none;
+  }
+  .sc-progress-dot {
+    animation: none;
   }
 }
     

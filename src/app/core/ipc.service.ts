@@ -28,6 +28,7 @@ import type {
   GatewayModel,
   ReindexProgress,
   ReindexResult,
+  DocImportProgress,
   InputDeviceInfo,
   AskVaultResult,
   AssistantThreadRow,
@@ -141,6 +142,8 @@ export const EVENT_WHISPER_CARD = "murmur://whisper-card";
 // brain2 RAG — semantic-search model download + reindex backfill event streams.
 export const EVENT_EMBED_DOWNLOAD = "murmur://embed-download";
 export const EVENT_REINDEX = "murmur://reindex-embeddings";
+// Brain v3 PR-2 — extract→chunk→embed progress for an in-flight document import (counts + stage, NO PII).
+export const EVENT_DOC_IMPORT = "murmur://doc-import";
 // Phase D — on-device PERSON-name NER (redaction) model download progress stream.
 export const EVENT_NER_DOWNLOAD = "murmur://ner-download";
 // Recording-storage: an AUTO-prune freed ≥1 old recording's audio to stay under the cap.
@@ -2476,6 +2479,18 @@ export class IpcService {
   /** Fires with COUNT-only progress for the in-flight semantic reindex backfill. */
   onReindex(cb: (p: ReindexProgress) => void): Promise<UnlistenFn> {
     return listen<ReindexProgress>(EVENT_REINDEX, (e) => cb(e.payload));
+  }
+
+  /**
+   * Fires with STAGE + COUNT-only progress for the in-flight document import
+   * (`importDocument`): extracting → chunking → embedding → done. Counts-only,
+   * NO PII (the `documentId` is a random UUID; no filename/text). Subscribe once
+   * per open Brain view and release the returned {@link UnlistenFn} on teardown.
+   */
+  onDocImportProgress(
+    cb: (p: DocImportProgress) => void,
+  ): Promise<UnlistenFn> {
+    return listen<DocImportProgress>(EVENT_DOC_IMPORT, (e) => cb(e.payload));
   }
 
   /** Fires with per-file progress for the in-flight PERSON-name NER model download. */

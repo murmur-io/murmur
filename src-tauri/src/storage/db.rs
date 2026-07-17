@@ -998,6 +998,21 @@ impl Db {
              CREATE INDEX IF NOT EXISTS idx_doc_chunks_document ON doc_chunks(document_id);",
         )
         .map_err(map_err)?;
+        // Brain v3 PR-2 — HIERARCHICAL doc chunks (additive, guarded, idempotent). A document's
+        // chunks form a 3-level tree in the SAME `doc_chunks` table (rows still ride the exact
+        // seal/unseal/purge/gating already proven for the flat layout):
+        //   - `level`        0 = leaf (embedded + FTS), 1 = section-parent (FTS + fetch-by-id ONLY,
+        //                    NOT embedded — no `doc_vec_chunks` row), 2 = doc-summary/outline
+        //                    (embedded + FTS). Legacy/flat rows default to 0.
+        //   - `parent_id`    a leaf's L1 section-parent row id (NULL for L1/L2 and legacy leaves).
+        //   - `section_path` the heading trail ("A › B") this chunk sits under (NULL when none).
+        //   - `page_no`      1-based page/slide (PDF/PPTX); NULL for flow formats.
+        // All four are pure PROVENANCE/structure over already-derived plaintext — nothing new is
+        // sealed. The vec0 table is UNCHANGED (only L0+L2 rows get a `doc_vec_chunks` entry).
+        Self::add_column_if_missing(conn, "doc_chunks", "level", "INTEGER NOT NULL DEFAULT 0")?;
+        Self::add_column_if_missing(conn, "doc_chunks", "parent_id", "INTEGER")?;
+        Self::add_column_if_missing(conn, "doc_chunks", "section_path", "TEXT")?;
+        Self::add_column_if_missing(conn, "doc_chunks", "page_no", "INTEGER")?;
         // `kind` distinguishes an UPLOADED file ('document') from a TYPED brain note ('note'). Additive
         // + guarded so migrate() stays idempotent; legacy rows default to 'document'. Both kinds ride
         // the SAME seal/unseal/purge/gating — `kind` is a presentation split for the Brain page only.
@@ -4930,6 +4945,12 @@ impl Db {
 
     /// A document's `(folder_id, name, plaintext text)`, or `None` if unknown. The COMMAND layer gates
     /// the folder before surfacing the text to the FE.
+    ///
+    /// Brain v3 PR-2: `documents.text` may store a PR-2 upload's block STRUCTURE (page/heading markers,
+    /// control-char sentinels invisible to any human text). This getter returns the RAW stored text
+    /// (structure intact) so re-index can reconstruct the hierarchy; the RENDERED display text is
+    /// produced by the command layer via [`crate::extract::render_display_text`] before it reaches the
+    /// FE. (md/txt/note/legacy rows have no markers → raw == display.)
     pub fn get_document(&self, id: &str) -> Result<Option<(String, String, String)>> {
         let conn = self.lock();
         conn.query_row(
@@ -4967,13 +4988,16 @@ impl Db {
               WHERE d.id = ?1 AND {visible}"
         );
         conn.query_row(&sql, rusqlite::params![id], |r| {
+            let raw: String = r.get(5)?;
             Ok(DocumentSummary {
                 id: r.get(0)?,
                 folder_id: r.get(1)?,
                 kind: r.get(2)?,
                 name: r.get(3)?,
                 title: r.get(4)?,
-                markdown: r.get(5)?,
+                // Brain v3 PR-2: render clean display text (strip the block-structure markers a PR-2
+                // upload stores). A note / legacy row has no markers → unchanged.
+                markdown: crate::extract::render_display_text(&raw),
                 updated_at: r.get(6)?,
             })
         })
@@ -5106,13 +5130,37 @@ impl Db {
         let Some((_folder_id, name, text)) = self.get_document(document_id)? else {
             return Ok(()); // unknown document — nothing to index.
         };
-        // Header carries the document name as provenance (the date axis is N/A for an upload, so the
-        // header is just the name — `chunk_note` tolerates an empty date).
-        let chunks = crate::embed::chunk_note(&name, "", &text);
-        let vectors = match embedder {
-            Some(e) if !chunks.is_empty() => e.embed_passage(&chunks)?,
+        // Brain v3 PR-2 — HIERARCHICAL chunking. Reconstruct the extracted BLOCKS (page/heading) from
+        // the stored text (lossless for a PR-2 upload; a legacy/flat row reconstructs as one block →
+        // identical leaves + a summary), then build the L0/L1/L2 tree. `name` provenance carries into
+        // the deterministic contextual header on the embed text.
+        let blocks = crate::extract::blocks_from_stored_text(&text);
+        let hier = crate::embed::chunk_document_hierarchical(&name, &blocks);
+        // Embed ONLY the embed-worthy chunks (L0 leaves + L2 summary; L1 parents are FTS-only). We
+        // sub-batch to bound the per-call Metal tensor for a large PDF (mirror index_meeting_chunks).
+        // Build the parallel embed-text list, remembering which HierChunk index each maps to.
+        let embed_indices: Vec<usize> = hier
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.embed)
+            .map(|(i, _)| i)
+            .collect();
+        let embed_texts: Vec<String> = embed_indices
+            .iter()
+            .map(|&i| hier[i].embed_text.clone())
+            .collect();
+        let embed_vecs: Vec<Vec<f32>> = match embedder {
+            Some(e) if !embed_texts.is_empty() => embed_in_sub_batches(e, &embed_texts)?,
             _ => Vec::new(), // model absent → chunk-only (FTS still covers it); vectors come later.
         };
+        // Map HierChunk-index → its vector (only for embed-worthy chunks that actually got embedded).
+        let mut vec_by_hier: std::collections::HashMap<usize, &Vec<f32>> =
+            std::collections::HashMap::new();
+        for (slot, &hi) in embed_indices.iter().enumerate() {
+            if let Some(v) = embed_vecs.get(slot) {
+                vec_by_hier.insert(hi, v);
+            }
+        }
 
         let this_doc = [document_id.to_string()];
         let mut conn = self.lock();
@@ -5124,19 +5172,35 @@ impl Db {
         {
             let mut ins_chunk = tx
                 .prepare(
-                    "INSERT INTO doc_chunks (document_id, chunk_index, text)
-                     VALUES (?1, ?2, ?3)",
+                    "INSERT INTO doc_chunks
+                       (document_id, chunk_index, text, level, parent_id, section_path, page_no)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 )
                 .map_err(map_err)?;
             let mut ins_vec = tx
                 .prepare("INSERT INTO doc_vec_chunks(chunk_id, embedding) VALUES (?1, ?2)")
                 .map_err(map_err)?;
-            for (idx, text) in chunks.iter().enumerate() {
+            // HierChunk-index → the inserted row id, so a leaf can point `parent_id` at its L1 row.
+            // The chunker emits every parent BEFORE its children, so the parent id is always known.
+            let mut row_id_by_hier: Vec<i64> = vec![0; hier.len()];
+            for (idx, c) in hier.iter().enumerate() {
+                let parent_row: Option<i64> = c.parent.map(|pi| row_id_by_hier[pi]);
                 ins_chunk
-                    .execute(rusqlite::params![document_id, idx as i64, text])
+                    .execute(rusqlite::params![
+                        document_id,
+                        idx as i64,
+                        c.raw,
+                        c.level,
+                        parent_row,
+                        c.section_path,
+                        c.page_no,
+                    ])
                     .map_err(map_err)?;
-                if let Some(vector) = vectors.get(idx) {
-                    let chunk_id = tx.last_insert_rowid();
+                let chunk_id = tx.last_insert_rowid();
+                row_id_by_hier[idx] = chunk_id;
+                // Vector ONLY for embed-worthy chunks that were actually embedded (L0+L2, model
+                // present). L1 parents NEVER get a vec0 row — the vector count stays flat.
+                if let Some(vector) = vec_by_hier.get(&idx) {
                     let blob = crate::embed::vec_to_blob(vector);
                     ins_vec
                         .execute(rusqlite::params![chunk_id, blob])
@@ -5409,6 +5473,89 @@ impl Db {
             }
         }
         Ok(hits)
+    }
+
+    /// Brain v3 PR-2 — GATED parent-document expansion (LlamaIndex parent-document / RAPTOR effect).
+    /// For each of the given `document_ids` (the TOP fused doc hits), return the document's DOMINANT
+    /// L1 section-parent text — the section covering the MOST leaf chunks — so the reasoner reads a
+    /// coherent SECTION instead of an isolated 800-char leaf. Documents with no L1 parents (a flat /
+    /// legacy doc, or one section only) are simply omitted (the caller keeps the original leaf hit).
+    ///
+    /// GATING (lock-model, load-bearing): the query applies EXACTLY the same `visibility_clause`
+    /// predicate over `doc_chunks → documents → folders` as the doc-search readers — a document in a
+    /// sealed-and-not-session-unlocked folder yields NOTHING here (its `level=1` rows are purged while
+    /// sealed anyway, and the gate is defense-in-depth on top). No raw-SQL bypass; parents are DERIVED
+    /// content, so this is a pure gated READ that never widens what the session can see.
+    ///
+    /// Returns `document_id → (name, folder_id, parent_text)`. `parent_text` is the L1 `text` (already
+    /// capped at ingest to ~6000 chars — the reasoner budget stays tight).
+    pub fn expand_doc_parents_visible(
+        &self,
+        document_ids: &[String],
+        unlocked: &HashSet<String>,
+    ) -> Result<Vec<DocChunkHit>> {
+        if document_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.lock();
+        let visible = visibility_clause("f", unlocked);
+        // For each doc's L1 parents, count how many L0 leaves point at each parent, then pick the
+        // parent with the most leaves (ties broken by lowest parent id, deterministic). One row per
+        // document. `child.parent_id = parent.id` is the hierarchy edge. Gate on the parent's folder.
+        let placeholders = document_ids
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("?{}", i + 1))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "WITH parent_counts AS (
+                 SELECT p.id AS parent_id,
+                        p.document_id AS document_id,
+                        p.text AS parent_text,
+                        COUNT(c.id) AS leaf_count
+                   FROM doc_chunks p
+                   JOIN documents d ON d.id = p.document_id
+                   JOIN folders f ON f.id = d.folder_id
+                   LEFT JOIN doc_chunks c
+                          ON c.parent_id = p.id AND c.level = 0
+                  WHERE p.level = 1
+                    AND p.document_id IN ({placeholders})
+                    AND {visible}
+                  GROUP BY p.id
+             ),
+             ranked AS (
+                 SELECT parent_counts.*,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY document_id
+                            ORDER BY leaf_count DESC, parent_id ASC
+                        ) AS rn
+                   FROM parent_counts
+             )
+             SELECT d.id, d.name, d.folder_id, r.parent_text, d.kind
+               FROM ranked r
+               JOIN documents d ON d.id = r.document_id
+              WHERE r.rn = 1"
+        );
+        let params: Vec<&dyn rusqlite::ToSql> =
+            document_ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        let mut stmt = conn.prepare(&sql).map_err(map_err)?;
+        let rows = stmt
+            .query_map(params.as_slice(), |row| {
+                Ok(DocChunkHit {
+                    document_id: row.get(0)?,
+                    name: row.get(1)?,
+                    folder_id: row.get(2)?,
+                    snippet: row.get(3)?,
+                    kind: row.get(4)?,
+                })
+            })
+            .map_err(map_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(map_err)?);
+        }
+        Ok(out)
     }
 
     // ── M6 Shared Brain — org feed INGEST + local RETRIEVAL ─────────────────────────────────────
@@ -17322,15 +17469,30 @@ mod tests {
         assert_eq!(name, "spec.md");
         assert_eq!(text, "budget planning for the quarter");
 
-        // Chunks + 1:1 vectors exist.
+        // Chunks + vectors exist. Brain v3 PR-2 HIERARCHY: L1 section-parents are FTS-only (NOT
+        // embedded), so vectors are 1:1 with the EMBED-WORTHY rows (L0 leaves + L2 summary), NOT with
+        // ALL doc_chunks. Assert exactly that: every L0/L2 row has a vec0 row, no L1 row does.
         let count = |sql: &str| -> i64 { db.lock().query_row(sql, [], |r| r.get(0)).unwrap() };
         let chunks = count("SELECT COUNT(*) FROM doc_chunks WHERE document_id = 'd1'");
         let vecs = count(
             "SELECT COUNT(*) FROM doc_vec_chunks WHERE chunk_id IN \
                (SELECT id FROM doc_chunks WHERE document_id = 'd1')",
         );
+        let embed_worthy = count(
+            "SELECT COUNT(*) FROM doc_chunks WHERE document_id = 'd1' AND level IN (0, 2)",
+        );
+        let l1 = count("SELECT COUNT(*) FROM doc_chunks WHERE document_id = 'd1' AND level = 1");
         assert!(chunks >= 1, "document must be chunked");
-        assert_eq!(chunks, vecs, "doc_vec_chunks is 1:1 with doc_chunks");
+        assert!(l1 >= 1, "a section-parent (L1) must exist");
+        assert_eq!(vecs, embed_worthy, "vectors are 1:1 with the EMBED-worthy L0+L2 rows");
+        assert_eq!(
+            count(
+                "SELECT COUNT(*) FROM doc_vec_chunks WHERE chunk_id IN \
+                   (SELECT id FROM doc_chunks WHERE document_id = 'd1' AND level = 1)"
+            ),
+            0,
+            "L1 section-parents are NEVER embedded (no vec0 row)"
+        );
 
         // Purge drops BOTH chunks and vectors.
         db.purge_doc_chunks_for_documents(&["d1".to_string()])
@@ -17348,6 +17510,144 @@ mod tests {
         assert_eq!(
             db.get_document("d1").unwrap().unwrap().2,
             "budget planning for the quarter"
+        );
+    }
+
+    /// Brain v3 PR-2 — HIERARCHY persists: an imported document (stored via `blocks_to_stored_text`
+    /// so its page/heading structure survives) indexes into L0 leaves (embedded), L1 section-parents
+    /// (FTS-only, page_no + section_path set), and an L2 summary (embedded). Purge drops ALL levels +
+    /// their vec0 rows.
+    #[test]
+    fn hierarchical_index_persists_levels_and_purges_all() {
+        let db = mem_db();
+        seed_folder(&db, "f-open", "Project");
+        let blocks = vec![
+            crate::extract::ExtractedBlock {
+                text: "The budget is 100k for the quarter.".into(),
+                page: Some(1),
+                heading_path: Some("Design".into()),
+            },
+            crate::extract::ExtractedBlock {
+                text: "Anna owns delivery of the API layer.".into(),
+                page: Some(2),
+                heading_path: Some("Design › Storage".into()),
+            },
+        ];
+        let stored = crate::extract::blocks_to_stored_text(&blocks);
+        db.insert_document("d1", "f-open", "spec.pdf", &stored, "document", 100)
+            .unwrap();
+        db.index_document_chunks("d1", Some(&crate::embed::StubEmbedder))
+            .unwrap();
+
+        // (level, parent_id, section_path, page_no) per doc_chunks row.
+        type DocChunkMetaRow = (i64, Option<i64>, Option<String>, Option<i64>);
+        let rows: Vec<DocChunkMetaRow> = {
+            let conn = db.lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT level, parent_id, section_path, page_no FROM doc_chunks \
+                       WHERE document_id = 'd1' ORDER BY chunk_index",
+                )
+                .unwrap();
+            let mapped = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            mapped
+        };
+        let l0 = rows.iter().filter(|r| r.0 == 0).count();
+        let l1 = rows.iter().filter(|r| r.0 == 1).count();
+        let l2 = rows.iter().filter(|r| r.0 == 2).count();
+        assert_eq!(l1, 2, "two heading sections → two L1 parents");
+        assert!(l0 >= 2, "leaves for each section");
+        assert!(l2 >= 1, "an L2 summary");
+        // Every L0 leaf points at an L1 parent; L1/L2 have no parent.
+        assert!(
+            rows.iter().filter(|r| r.0 == 0).all(|r| r.1.is_some()),
+            "every leaf has a parent_id"
+        );
+        assert!(
+            rows.iter().filter(|r| r.0 != 0).all(|r| r.1.is_none()),
+            "L1/L2 rows have no parent"
+        );
+        // Section path + page carried on the leaves.
+        assert!(rows.iter().any(|r| r.2.as_deref() == Some("Design › Storage")));
+        assert!(rows.iter().any(|r| r.3 == Some(2)));
+
+        // Vectors: exactly the L0+L2 rows (never L1).
+        let vec_count = |sql: &str| -> i64 { db.lock().query_row(sql, [], |r| r.get(0)).unwrap() };
+        assert_eq!(
+            vec_count(
+                "SELECT COUNT(*) FROM doc_vec_chunks WHERE chunk_id IN \
+                   (SELECT id FROM doc_chunks WHERE document_id='d1' AND level IN (0,2))"
+            ),
+            (l0 + l2) as i64
+        );
+        assert_eq!(
+            vec_count(
+                "SELECT COUNT(*) FROM doc_vec_chunks WHERE chunk_id IN \
+                   (SELECT id FROM doc_chunks WHERE document_id='d1' AND level=1)"
+            ),
+            0,
+            "L1 parents are never embedded"
+        );
+
+        // Purge removes ALL levels + all vec rows.
+        db.purge_doc_chunks_for_documents(&["d1".to_string()]).unwrap();
+        assert_eq!(db.doc_chunk_count("d1").unwrap(), 0);
+        assert_eq!(vec_count("SELECT COUNT(*) FROM doc_vec_chunks"), 0);
+    }
+
+    /// Brain v3 PR-2 — `expand_doc_parents_visible` returns the dominant L1 SECTION-parent text for a
+    /// top doc hit, and is GATED: a sealed-not-unlocked folder's document yields NOTHING (RED if the
+    /// `visibility_clause` were removed), and unlocking restores it.
+    #[test]
+    fn expand_doc_parents_is_gated_and_returns_section_text() {
+        let db = mem_db();
+        seed_folder(&db, "f-lock", "Secret");
+        let blocks = vec![
+            crate::extract::ExtractedBlock {
+                text: "First paragraph about the classified launch plan for the product.".into(),
+                page: Some(1),
+                heading_path: Some("Launch".into()),
+            },
+            crate::extract::ExtractedBlock {
+                text: "Second paragraph under the same launch heading with more detail here.".into(),
+                page: Some(1),
+                heading_path: Some("Launch".into()),
+            },
+        ];
+        let stored = crate::extract::blocks_to_stored_text(&blocks);
+        db.insert_document("d1", "f-lock", "plan.pdf", &stored, "document", 100)
+            .unwrap();
+        db.index_document_chunks("d1", Some(&crate::embed::StubEmbedder))
+            .unwrap();
+
+        let ids = vec!["d1".to_string()];
+        // Open folder → the dominant L1 "Launch" section text comes back.
+        let nothing = std::collections::HashSet::new();
+        let open = db.expand_doc_parents_visible(&ids, &nothing).unwrap();
+        assert_eq!(open.len(), 1, "one document → one dominant parent");
+        assert!(
+            open[0].snippet.contains("classified launch plan"),
+            "parent text is the SECTION body, got: {:?}",
+            open[0].snippet
+        );
+
+        // Seal → gated OUT with empty unlock set.
+        db.set_folder_locked("f-lock", true, None).unwrap();
+        assert!(
+            db.expand_doc_parents_visible(&ids, &nothing).unwrap().is_empty(),
+            "sealed-not-unlocked parent leaked through expand gate"
+        );
+        // Unlock → restored.
+        let mut unlocked = std::collections::HashSet::new();
+        unlocked.insert("f-lock".to_string());
+        assert_eq!(
+            db.expand_doc_parents_visible(&ids, &unlocked).unwrap().len(),
+            1,
+            "unlock restores the parent"
         );
     }
 

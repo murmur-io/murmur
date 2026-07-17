@@ -135,6 +135,16 @@ opaque-ke = { version = "4", features = ["argon2"] }
 # CSPRNG source for HPKE seal / keypair generation (rand_core 0.6 ecosystem, matches hpke 0.12).
 rand = "0.8"
 
+# ── Universal document extraction (Brain v3 PR-2 — `src/extract/`) ──
+# DOCX/PPTX are pure-Rust OOXML walks over the zip container + XML stream — NO parsing crate: `zip`
+# and `quick-xml` are ALREADY compiled transitively (zip via candle-core, quick-xml via plist/tauri),
+# here PROMOTED to direct deps pinned to the versions cargo already resolved (no new build cost).
+zip = { version = "7", default-features = false, features = ["deflate"] }
+quick-xml = "0.41"
+# XLSX (sheet → pipe rows) and HTML (→ plain text). Both MIT-family, pure-Rust.
+calamine = "0.36"
+html2text = "0.17"
+
 # ── Misc ──
 chrono = { version = "0.4", features = ["clock", "serde"] }
 dirs = "5"
@@ -153,11 +163,19 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # NSException risk): objc2-core-graphics CGWindow + objc2-core-foundation CFArray/CFDictionary/
 # CFString for reading window owner + title. macOS-only — gated under cfg(target_os = "macos").
 [target.'cfg(target_os = "macos")'.dependencies]
-objc2 = "0.6"
+# `exception` feature: `objc2::exception::catch` — Brain v3 PR-2 wraps EVERY PDFKit call so a stray
+# ObjC NSException (e.g. a malformed/encrypted PDF) is CAUGHT and mapped to `AppError::InvalidArg`
+# instead of unwinding across FFI and aborting the process (rules §7 crash-safe-FFI; the screenshare
+# war story). A feature flip on an existing dep, no new crate.
+objc2 = { version = "0.6", features = ["exception"] }
 block2 = "0.6"
+# PDF text + outline extraction via Apple's PDFKit (same objc2 0.6/0.3 family we already ship; zero
+# new binaries, no dylib to sign). Only the PDFDocument/PDFPage/PDFOutline/PDFDestination surface is
+# needed — `src/extract/pdf.rs`. All calls wrapped in `objc2::exception::catch`. macOS-only.
+objc2-pdf-kit = { version = "0.3", default-features = false, features = ["PDFDocument", "PDFPage", "PDFOutline", "PDFDestination"] }
 # `NSProcessInfo` feature: the typed `thermalState` binding for the live-loop thermal governor
 # (`src/thermal.rs`) — a feature flip on an existing dep, no new crate.
-objc2-foundation = { version = "0.3", features = ["NSString", "NSError", "NSProcessInfo"] }
+objc2-foundation = { version = "0.3", features = ["NSString", "NSError", "NSProcessInfo", "NSURL"] }
 objc2-app-kit = { version = "0.3", features = ["NSScreen"] }
 objc2-core-graphics = { version = "0.3", default-features = false, features = ["CGWindow"] }
 objc2-core-foundation = { version = "0.3", default-features = false, features = ["CFArray", "CFDictionary", "CFString"] }
