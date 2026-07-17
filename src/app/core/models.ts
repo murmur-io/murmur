@@ -1372,6 +1372,19 @@ export interface LinkEdge {
 export type LinkKind = "meeting" | "note" | "document";
 
 /**
+ * One source the Brain has been scoped to (the `mur-source-picker` chip model) —
+ * a note/meeting/document the user picked to constrain an Ask over. Reuses the
+ * existing {@link LinkKind} tri-state (the picker drops person/entity/org
+ * `NoteCitation` rows). `title` is carried purely for chip display; identity is
+ * `kind + id` (a picked candidate is deduped, and re-picking never doubles it).
+ */
+export interface SourceRef {
+  kind: LinkKind;
+  id: string;
+  title?: string;
+}
+
+/**
  * A resolved `[[Title]]` wikilink navigation target — the VISIBLE note/meeting/org
  * (Shared Brain) item to open (`resolveWikilink(title)`). `null` when nothing matches
  * OR the only local match is sealed-and-not-session-unlocked (gated server-side, so a
