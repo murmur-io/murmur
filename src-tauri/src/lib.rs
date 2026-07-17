@@ -16,6 +16,7 @@ pub mod events;
 pub mod export;
 pub mod extract;
 pub mod facts;
+pub mod links;
 pub mod mcp;
 pub mod memory;
 pub mod orchestrate;
@@ -325,6 +326,9 @@ pub fn run() {
             commands::get_graph,
             commands::get_entity_detail,
             commands::get_backlinks,
+            commands::list_links,
+            commands::accept_link,
+            commands::dismiss_link,
             commands::resolve_wikilink,
             commands::list_link_candidates,
             commands::get_person_dossier,

@@ -1077,6 +1077,32 @@ pub struct BacklinkSource {
     pub timestamp: String,
 }
 
+/// Brain v3 PR-3 — one persisted `links` row surfaced to the FE, with the OTHER endpoint's display
+/// title resolved through the SAME visibility gate as the queried endpoint (both-endpoint gating).
+/// `direction` says whether the queried item is this edge's `src` ("out") or `dst` ("in") so the FE
+/// can render an arrow; `other_kind`/`other_id` are the neighbour to navigate to. `edge_type` ∈
+/// `wikilink|companion|semantic`, `created_by` ∈ `user|auto|accepted`, `status` ∈
+/// `active|suggested|dismissed` (dismissed rows are never returned). `score` is the semantic cosine
+/// (1.0 for the deterministic wikilink/companion edges). Only ever built when BOTH endpoints are
+/// VISIBLE — a sealed neighbour can never appear, and a sealed queried item yields an empty list.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct LinkEdge {
+    pub id: i64,
+    /// "out" (queried item is `src`) | "in" (queried item is `dst`).
+    pub direction: String,
+    /// The neighbour endpoint kind: `meeting|note|document`.
+    pub other_kind: String,
+    pub other_id: String,
+    /// The neighbour's current display title, resolved through the visibility gate.
+    pub other_title: String,
+    pub edge_type: String,
+    pub created_by: String,
+    pub status: String,
+    pub score: f64,
+    pub created_at: i64,
+}
+
 /// A resolved `[[Title]]` wikilink navigation target — the VISIBLE note, meeting, or (2026-07-15)
 /// org (Shared Brain) item whose exact title the link names, so the FE can route `/notes/:id`,
 /// `/meeting/:id`, or `/org-item/:id`. Resolution is visibility-gated: a sealed-and-not-

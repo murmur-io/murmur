@@ -1312,6 +1312,40 @@ export interface BacklinkSource {
 }
 
 /**
+ * Brain v3 PR-3 — one persisted `links` edge incident on `(kind, id)`, surfaced to the
+ * "Connections" panel (`list_links(kind, id)`). Both endpoints are visibility-gated
+ * server-side: a sealed queried item yields `[]` (no existence leak) and a sealed
+ * neighbour is never included, so the caller MUST STILL skip/hide the panel while the
+ * item itself is locked/masked (never surface connections behind a lock).
+ *
+ * - `direction` — `"out"` (the queried item is this edge's `src`) | `"in"` (it is `dst`).
+ * - `otherKind` — the neighbour endpoint kind: `"meeting" | "note" | "document"`
+ *   (route `meeting` → `/meeting/:id`, `note`/`document` → `/notes/:id`).
+ * - `edgeType` — `"wikilink" | "companion" | "semantic"`. `wikilink`/`companion` are
+ *   DETERMINISTIC edges (rendered as plain link chips); `semantic` is a SUGGESTED edge
+ *   the user can Accept/Dismiss, with `score` the cosine confidence.
+ * - `createdBy` — `"user" | "auto" | "accepted"`; `status` — `"active" | "suggested"`
+ *   (`"dismissed"` rows are never returned). `score` is `1.0` for deterministic edges.
+ *
+ * Mirrors the Rust `LinkEdge` (serde camelCase).
+ */
+export interface LinkEdge {
+  id: number;
+  direction: "out" | "in";
+  otherKind: "meeting" | "note" | "document";
+  otherId: string;
+  otherTitle: string;
+  edgeType: "wikilink" | "companion" | "semantic";
+  createdBy: "user" | "auto" | "accepted";
+  status: "active" | "suggested";
+  score: number;
+  createdAt: number;
+}
+
+/** The link-endpoint kind an `app-connections` panel is anchored to (`list_links` `kind`). */
+export type LinkKind = "meeting" | "note" | "document";
+
+/**
  * A resolved `[[Title]]` wikilink navigation target — the VISIBLE note/meeting/org
  * (Shared Brain) item to open (`resolveWikilink(title)`). `null` when nothing matches
  * OR the only local match is sealed-and-not-session-unlocked (gated server-side, so a

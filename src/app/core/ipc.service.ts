@@ -8,6 +8,8 @@ import type {
   Analytics,
   AppConfigDto,
   BacklinkSource,
+  LinkEdge,
+  LinkKind,
   WikiTarget,
   CompanionAppendResult,
   SourceKind,
@@ -1127,6 +1129,38 @@ export class IpcService {
     targetId: string,
   ): Promise<BacklinkSource[]> {
     return invoke<BacklinkSource[]>("get_backlinks", { targetKind, targetId });
+  }
+
+  /**
+   * Brain v3 PR-3 — every persisted link edge incident on `(kind, id)` for the
+   * "Connections" panel: deterministic `wikilink`/`companion` edges + `semantic`
+   * suggestions (with a cosine `score`). BOTH endpoints are visibility-gated
+   * server-side — a sealed queried item yields `[]` (no existence leak) and a
+   * sealed neighbour is dropped — so the caller MUST STILL skip the fetch while
+   * the item itself is locked/masked (never surface connections behind a lock).
+   * `dismissed` edges are never returned.
+   */
+  listLinks(kind: LinkKind, id: string): Promise<LinkEdge[]> {
+    return invoke<LinkEdge[]>("list_links", { kind, id });
+  }
+
+  /**
+   * Brain v3 PR-3 — ACCEPT a suggested (semantic) link: flip it active and (when
+   * either endpoint is a locally-owned, session-visible note) materialize the
+   * neighbour's `[[Title]]` into that note's managed link block. GATED + idempotent
+   * server-side. The caller re-runs {@link listLinks} afterward to reflect the flip.
+   */
+  acceptLink(id: number): Promise<void> {
+    return invoke<void>("accept_link", { id });
+  }
+
+  /**
+   * Brain v3 PR-3 — DISMISS a suggested link: tombstone it so no later auto pass
+   * re-suggests it (graph-only, no markdown touched). Idempotent. The caller
+   * re-runs {@link listLinks} afterward to drop the row.
+   */
+  dismissLink(id: number): Promise<void> {
+    return invoke<void>("dismiss_link", { id });
   }
 
   /**

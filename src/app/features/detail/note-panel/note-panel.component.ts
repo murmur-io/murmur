@@ -12,6 +12,7 @@ import type { BacklinkSource, GraphPayload } from "../../../core/models";
 import { MarkdownComponent } from "../../../shared/markdown/markdown.component";
 import { AssistantSourcesComponent } from "../../../shared/assistant-sources/assistant-sources.component";
 import { BacklinksComponent } from "../../../shared/backlinks/backlinks.component";
+import { ConnectionsComponent } from "../../../shared/connections/connections.component";
 import { MoveToMenuComponent } from "../../folders/move-to-menu/move-to-menu.component";
 import { MeetingActionsComponent } from "../meeting-actions/meeting-actions.component";
 import { MeetingChatComponent } from "../meeting-chat/meeting-chat.component";
@@ -80,6 +81,7 @@ export interface AssistantQa {
     MarkdownComponent,
     AssistantSourcesComponent,
     BacklinksComponent,
+    ConnectionsComponent,
     MoveToMenuComponent,
     MeetingActionsComponent,
     MeetingChatComponent,
