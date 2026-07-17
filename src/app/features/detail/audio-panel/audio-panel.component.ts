@@ -91,6 +91,20 @@ export class AudioPanelComponent {
   readonly pinMsg = input("");
   /** Inline pin error. */
   readonly pinError = input("");
+  /**
+   * A note-receipt seek request (Brain v3 PR-5 "Receipts"): the second of audio
+   * a note claim derives from, plus the transcript `Segment.idx` to flash. The
+   * shell sets this (and switches to the Audio tab) when the user clicks a receipt
+   * chip; the panel is (re)created for the Audio `@switch` case, so this arrives as
+   * an INPUT the panel applies on mount/change — a viewChild method call from the
+   * Note tab would hit a not-yet-existing panel. `seq` is bumped by the shell so
+   * clicking the SAME receipt twice re-fires the effect (a net-zero value wouldn't).
+   * Null when there is no pending receipt seek. Carries only audio-coordinate ints —
+   * no note/transcript text, no on-disk path.
+   */
+  readonly seekTarget = input<{ startS: number; segId: number; seq: number } | null>(
+    null,
+  );
 
   // --- Outputs back to the shell (which owns the IPC) ---------------------
   /** Retry the timeline fetch (from the timeline's (retry)). */
@@ -107,6 +121,21 @@ export class AudioPanelComponent {
   readonly currentTime = signal(0);
   readonly duration = signal(0);
   readonly playing = signal(false);
+  /**
+   * The `Segment.idx` to briefly PULSE (Brain v3 PR-5 "Receipts"): when a note
+   * receipt chip drives a seek, `seekTo(startS)` already lands the playhead inside
+   * that segment so `activeSegKeys` gives the persistent karaoke highlight — this
+   * adds a one-shot flash animation over it so the eye is drawn to the exact line
+   * that proves the claim. A bump `flashSeq` re-arms the pure-CSS animation when the
+   * SAME segment is receipted twice in a row (a net-zero id write wouldn't restart
+   * it). Cleared to null on any user-driven seek so a stray flash never lingers.
+   */
+  readonly flashSegId = signal<number | null>(null);
+  private readonly flashSeq = signal(0);
+  /** Composite the flash targets so the template re-arms on a repeat receipt. */
+  readonly flashKey = computed(
+    () => `${this.flashSegId() ?? ""}#${this.flashSeq()}`,
+  );
   /** Playback rate, cycled 1× → 1.25× → 1.5× → 2× → 1×. */
   readonly rate = signal(1);
   /** The rate as a trimmed label ("1", "1.25", "1.5", "2"). */
@@ -264,6 +293,50 @@ export class AudioPanelComponent {
             behavior: "smooth",
           });
         }
+      },
+      { injector: this.injector },
+    );
+  });
+
+  /**
+   * Apply a pending note-receipt seek (Brain v3 PR-5): when the shell sets
+   * `seekTarget` (and switches to this tab), seek the player to the claim's
+   * second of audio and PULSE the matching transcript segment so the eye lands
+   * on the exact line that proves the claim. Tracks `seq` (bumped by the shell)
+   * so re-clicking the SAME receipt re-arms; `flashSeq` re-arms the pure-CSS
+   * animation when the SAME segment is receipted twice (a net-zero `flashSegId`
+   * write wouldn't restart it). Legitimate signal-writing effect (T1): it
+   * reacts to an input and drives the player — no async fetch, no stale race.
+   */
+  private readonly _applyReceiptSeek = effect(() => {
+    const target = this.seekTarget();
+    if (!target) {
+      return;
+    }
+    // `seq` in the dependency set makes a repeat of the same receipt re-fire.
+    void target.seq;
+    this.seekTo(target.startS); // (also clears any prior flash)
+    this.flashSegId.set(target.segId);
+    this.flashSeq.update((n) => n + 1);
+    // Restart the pure-CSS pulse deterministically (a repeat of the SAME segment
+    // keeps the `.is-flash` class, so the animation wouldn't retrigger on its own)
+    // and bring the flashed fragment into view. One-shot, zoneless-safe: no timer.
+    const key = this.flashKey();
+    afterNextRender(
+      () => {
+        const box = this.scroller()?.nativeElement;
+        const frag = box?.querySelector<HTMLElement>(
+          `.frag[data-flash="${CSS.escape(key)}"]`,
+        );
+        if (!frag) {
+          return;
+        }
+        // Force the browser to drop the running animation, then re-apply it on
+        // the next frame — the canonical restart with no `@angular/animations`.
+        frag.style.animation = "none";
+        void frag.offsetWidth; // reflow — commits the "none" before re-enabling
+        frag.style.animation = "";
+        frag.scrollIntoView({ block: "center", behavior: "smooth" });
       },
       { injector: this.injector },
     );
@@ -439,6 +512,10 @@ export class AudioPanelComponent {
    * `currentTime` signal so the timeline highlight + playhead respond.
    */
   seekTo(startS: number): void {
+    // Clear any lingering receipt pulse so a user-driven seek never leaves a
+    // stray flash on an unrelated segment. The receipt path (`_applyReceiptSeek`)
+    // re-arms the flash AFTER this call, so its own pulse survives.
+    this.flashSegId.set(null);
     const el = this.el;
     if (!el) {
       const total = this.timelineTotal();
