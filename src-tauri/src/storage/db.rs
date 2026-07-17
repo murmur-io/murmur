@@ -134,6 +134,29 @@ fn chunk_hash(text: &str) -> u64 {
     h
 }
 
+/// TOCTOU seal re-check for a `documents`-table row (a note OR an uploaded document), run INSIDE the
+/// caller's write transaction. The seal (`seal_document`, `blank_sealed_notes_in_folders`'s document
+/// leg) blanks the plaintext `text` into `text_blob` (`text=''`, `text_blob` kept) — a
+/// session-independent, DB-side sealed-at-rest invariant. When a `lock_folder` commits mid-embed the
+/// indexer's slow embedding already ran against the now-stale plaintext; keying the refusal on this
+/// invariant (not a caller's `unlocked` snapshot) stops the derived plaintext chunks/vectors from
+/// landing at rest behind the lock. Returns `true` ⇒ the caller must refuse the write (rollback via
+/// drop). UNSEAL/session-unlock un-blanks `text` before re-indexing, so this reads `false` there and
+/// the write proceeds — the same contract the meeting/note-`notes` re-check carries.
+fn doc_sealed_at_rest_tx(tx: &rusqlite::Transaction<'_>, document_id: &str) -> Result<bool> {
+    tx.query_row(
+        "SELECT EXISTS(
+           SELECT 1 FROM documents
+            WHERE id = ?1
+              AND text_blob IS NOT NULL
+              AND (text IS NULL OR text = '')
+         )",
+        rusqlite::params![document_id],
+        |r| Ok(r.get::<_, i64>(0)? != 0),
+    )
+    .map_err(map_err)
+}
+
 /// Embed a batch of augmented chunk texts in small sub-batches instead of ONE call sized to the
 /// whole meeting/document/topic list. A long meeting or document can produce dozens of chunks
 /// (topic chunks merge to a 60s floor — a 1h+ recording can have 40-60; transcript chunks target
@@ -3537,6 +3560,30 @@ impl Db {
         let this_meeting = [meeting_id.to_string()];
         let mut conn = self.lock();
         let tx = conn.transaction().map_err(map_err)?;
+        // TOCTOU re-check INSIDE the write tx (mirrors `index_meeting_topic_chunks_reporting`): the
+        // gated/visible read above ran BEFORE the slow embed, and any caller `unlocked` snapshot can be
+        // stale by now. A `lock_folder` committing mid-embed blanks the note plaintext (`markdown=''`,
+        // `content_blob` kept) — that DB-side sealed-at-rest invariant is session-independent, so key the
+        // re-check on it: if the meeting is sealed at rest RIGHT NOW, inserting its derived plaintext
+        // chunks/vectors would leave sealed content at rest until the next relock/startup reconcile.
+        // Refuse (rollback via drop) — a benign no-op for every best-effort caller. UNSEAL/session-unlock
+        // paths un-blank `markdown` before re-indexing, so `sealed_at_rest` is false there and the write
+        // proceeds (defense-in-depth beyond the purge-on-seal, not a new refusal for legitimate work).
+        let sealed_at_rest: bool = tx
+            .query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM notes
+                    WHERE meeting_id = ?1
+                      AND content_blob IS NOT NULL
+                      AND (markdown IS NULL OR markdown = '')
+                 )",
+                rusqlite::params![meeting_id],
+                |r| Ok(r.get::<_, i64>(0)? != 0),
+            )
+            .map_err(map_err)?;
+        if sealed_at_rest {
+            return Ok(()); // sealed-at-rest mid-flight: never persist its plaintext chunks.
+        }
         Self::purge_chunks_tx(&tx, &this_meeting)?;
         {
             let mut ins_chunk = tx
@@ -4779,6 +4826,78 @@ impl Db {
         .map_err(map_err)
     }
 
+    /// `(chunk_count, vector_count)` for ONE document's `doc_chunks` / `doc_vec_chunks` — COUNTS
+    /// ONLY, never content (no text leaves this probe). Production caller: the startup repair tick
+    /// (`backfill_missing_brain_indexes`), which passes ONLY ids already returned by the gated
+    /// [`Db::visible_document_ids`] — the same posture as [`Db::document_has_chunks`].
+    pub fn doc_chunk_vector_counts(&self, document_id: &str) -> Result<(i64, i64)> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT
+               (SELECT COUNT(*) FROM doc_chunks WHERE document_id = ?1),
+               (SELECT COUNT(*) FROM doc_vec_chunks WHERE chunk_id IN
+                  (SELECT id FROM doc_chunks WHERE document_id = ?1))",
+            rusqlite::params![document_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .map_err(map_err)
+    }
+
+    /// `(chunk_count, vector_count)` for ONE meeting's `note_chunks` / `vec_chunks` — COUNTS ONLY,
+    /// never content. The MEETING analogue of [`Db::doc_chunk_vector_counts`], powering the startup
+    /// repair tick's needs-a-reindex probe; callers pass ONLY ids already returned by the gated
+    /// `list_meetings_visible`.
+    pub fn meeting_chunk_vector_counts(&self, meeting_id: &str) -> Result<(i64, i64)> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT
+               (SELECT COUNT(*) FROM note_chunks WHERE meeting_id = ?1),
+               (SELECT COUNT(*) FROM vec_chunks v
+                  JOIN note_chunks nc ON nc.id = v.chunk_id
+                 WHERE nc.meeting_id = ?1)",
+            rusqlite::params![meeting_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .map_err(map_err)
+    }
+
+    /// The `text` column of every `note_chunks` row for a MEETING (insertion order). Test-only
+    /// reader: lets the edit/rename re-index regressions assert stale text is GONE from the index
+    /// without reaching the private connection.
+    #[cfg(test)]
+    pub(crate) fn note_chunk_texts(&self, meeting_id: &str) -> Result<Vec<String>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare("SELECT text FROM note_chunks WHERE meeting_id = ?1 ORDER BY id ASC")
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![meeting_id], |r| r.get::<_, String>(0))
+            .map_err(map_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(map_err)?);
+        }
+        Ok(out)
+    }
+
+    /// The `text` column of every `doc_chunks` row for a document (insertion order). Test-only
+    /// reader for the reindex kind-routing regression (front-matter must never reach the chunks).
+    #[cfg(test)]
+    pub(crate) fn doc_chunk_texts(&self, document_id: &str) -> Result<Vec<String>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare("SELECT text FROM doc_chunks WHERE document_id = ?1 ORDER BY id ASC")
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![document_id], |r| r.get::<_, String>(0))
+            .map_err(map_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(map_err)?);
+        }
+        Ok(out)
+    }
+
     /// Number of `note_chunks` rows currently indexed for a MEETING (0 when never indexed or purged
     /// on lock). The meeting analogue of [`Db::doc_chunk_count`] — used by the lock tests to assert
     /// purge-on-lock / re-index-on-unlock without reaching the private connection. Test-only.
@@ -4998,6 +5117,9 @@ impl Db {
         let this_doc = [document_id.to_string()];
         let mut conn = self.lock();
         let tx = conn.transaction().map_err(map_err)?;
+        if doc_sealed_at_rest_tx(&tx, document_id)? {
+            return Ok(()); // sealed-at-rest mid-flight: never persist its plaintext chunks.
+        }
         Self::purge_doc_chunks_tx(&tx, &this_doc)?;
         {
             let mut ins_chunk = tx
@@ -5047,6 +5169,9 @@ impl Db {
         let this_doc = [note_id.to_string()];
         let mut conn = self.lock();
         let tx = conn.transaction().map_err(map_err)?;
+        if doc_sealed_at_rest_tx(&tx, note_id)? {
+            return Ok(()); // sealed-at-rest mid-flight: never persist its plaintext chunks.
+        }
         Self::purge_doc_chunks_tx(&tx, &this_doc)?;
         {
             let mut ins_chunk = tx
@@ -17334,6 +17459,104 @@ mod tests {
             .is_empty());
     }
 
+    /// TOCTOU (lock-security finding, PR-1): `index_document_chunks` must REFUSE the entire write —
+    /// including its clean-replace PURGE — when the row is sealed at rest RIGHT NOW (a `lock_folder`
+    /// committing mid-embed blanks `text` into `text_blob`). The re-check runs BEFORE the purge, so a
+    /// refused racing index leaves the DB untouched rather than re-deriving from the (now-blank) read.
+    /// RED-before-GREEN distinguisher: index once (chunks present) → seal at rest WITHOUT purging
+    /// (`seal_document` blanks `text`/sets `text_blob`, mirroring the read-gate-independent-of-purge
+    /// pattern) → index again. WITH the guard the indexer early-returns before the purge, so the prior
+    /// chunks SURVIVE the refused write; WITHOUT it the purge runs and the blank re-read leaves ZERO —
+    /// the two outcomes differ, so removing `doc_sealed_at_rest_tx` fails this test.
+    #[test]
+    fn document_index_refuses_write_when_sealed_at_rest_mid_flight() {
+        let db = mem_db();
+        seed_folder(&db, "f-lock", "Secret");
+        db.insert_document(
+            "d1",
+            "f-lock",
+            "spec.md",
+            "the pistachio launch is in March",
+            "document",
+            100,
+        )
+        .unwrap();
+        db.index_document_chunks("d1", None).unwrap();
+        assert!(
+            db.doc_chunk_count("d1").unwrap() >= 1,
+            "precondition: the open document is chunked"
+        );
+
+        // Seal at rest exactly like `seal_document` (blank text, blob kept) WITHOUT purging chunks —
+        // isolates the guard from the seal-time purge (the `list_facts_visible_excludes_sealed_meeting`
+        // read-gate pattern). A racing `index_document_chunks` must now refuse the whole write.
+        db.seal_document("d1", &[0u8]).unwrap();
+        db.index_document_chunks("d1", None).unwrap();
+        assert!(
+            db.doc_chunk_count("d1").unwrap() >= 1,
+            "the in-tx sealed-at-rest re-check must REFUSE the write (guard runs before the purge) — \
+             without it the purge+blank-read would zero the chunks, so this survival IS the guard"
+        );
+
+        // Restore the plaintext (session unlock un-blanks `text`) → indexing proceeds again (re-derives).
+        db.set_document_text("d1", "the pistachio launch is in March; new pistachio milestone")
+            .unwrap();
+        db.index_document_chunks("d1", None).unwrap();
+        let texts: String = {
+            let conn = db.lock();
+            let mut stmt = conn
+                .prepare("SELECT text FROM doc_chunks WHERE document_id = 'd1' ORDER BY chunk_index")
+                .unwrap();
+            let rows = stmt
+                .query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect::<Vec<_>>();
+            rows.join("\n")
+        };
+        assert!(
+            texts.contains("milestone"),
+            "an unsealed (un-blanked) document re-indexes the fresh plaintext"
+        );
+    }
+
+    /// TOCTOU (lock-security finding, PR-1): the authored-NOTE twin — `index_note_chunks` (the
+    /// front-matter-stripped note path) must ALSO refuse when the note's `documents` row is sealed at
+    /// rest mid-flight. RED-before-GREEN: remove the `doc_sealed_at_rest_tx` guard in
+    /// `index_note_chunks` → the note's body chunks persist behind the seal.
+    #[test]
+    fn note_index_refuses_write_when_sealed_at_rest_mid_flight() {
+        let db = mem_db();
+        seed_folder(&db, "f-lock", "Secret");
+        db.insert_document(
+            "n1",
+            "f-lock",
+            "meeting-notes.md",
+            "budget owner is Dana; pistachio ship date confirmed",
+            "note",
+            100,
+        )
+        .unwrap();
+        db.seal_document("n1", &[0u8]).unwrap();
+
+        db.index_note_chunks("n1", "Meeting notes", "budget owner is Dana", None)
+            .unwrap();
+        assert_eq!(
+            db.doc_chunk_count("n1").unwrap(),
+            0,
+            "the in-tx sealed-at-rest re-check must refuse writing note body chunks"
+        );
+
+        db.set_document_text("n1", "budget owner is Dana; pistachio ship date confirmed")
+            .unwrap();
+        db.index_note_chunks("n1", "Meeting notes", "budget owner is Dana", None)
+            .unwrap();
+        assert!(
+            db.doc_chunk_count("n1").unwrap() >= 1,
+            "an unsealed (un-blanked) note indexes again"
+        );
+    }
+
     /// GATE twin of `doc_chunk_search_is_gated_by_visibility` for the KEYWORD leg: a doc chunk row
     /// that deliberately SURVIVES in a sealed-not-unlocked folder is EXCLUDED by
     /// `search_doc_chunks_fts_visible` (defense-in-depth `visibility_clause`) and reappears only
@@ -20038,6 +20261,30 @@ mod lock_tests {
         }]
     }
 
+    /// `(note_chunks, vec_chunks)` currently indexed for a meeting — the `index_meeting_chunks`
+    /// analogue of `topic_counts`, so the seal-TOCTOU test can assert ZERO rows survive a refused
+    /// write.
+    fn meeting_chunk_counts(db: &Db, meeting_id: &str) -> (i64, i64) {
+        let conn = db.lock();
+        let chunks: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM note_chunks WHERE meeting_id = ?1",
+                rusqlite::params![meeting_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let vecs: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM vec_chunks v
+                   JOIN note_chunks nc ON nc.id = v.chunk_id
+                  WHERE nc.meeting_id = ?1",
+                rusqlite::params![meeting_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        (chunks, vecs)
+    }
+
     /// PURGE-ON-SEAL (L1.1, lock-critical): sealing a folder via `blank_sealed_notes_in_folders`
     /// (the same tx that blanks the plaintext) must drop the meeting's topic_chunks AND their
     /// topic_vec_chunks rows AND the aug_text tokens from fts_topic_chunks. RED-before-GREEN:
@@ -20203,6 +20450,57 @@ mod lock_tests {
             topic_counts(&db, "m1").0,
             0,
             "the in-tx sealed-at-rest re-check must refuse writing topic plaintext"
+        );
+    }
+
+    /// TOCTOU (lock-security finding, PR-1): the SAME race for `index_meeting_chunks` (note-summary +
+    /// transcript chunks/vectors). A `lock_folder` committing between the caller's pre-check and this
+    /// indexer's write tx is simulated by sealing the note at rest (markdown blanked, `content_blob`
+    /// kept). The indexer must refuse to write the meeting's derived plaintext chunks/vectors.
+    /// RED-before-GREEN: remove the in-tx `sealed_at_rest` re-check in `index_meeting_chunks` and this
+    /// asserts non-zero rows (a sealed folder's plaintext chunks/vectors persisted at rest — the leak).
+    #[test]
+    fn meeting_index_refuses_write_when_sealed_at_rest_mid_flight() {
+        let db = file_db("meeting-toctou");
+        seed_folder(&db, "f-lock", "Secret");
+        seed_note(&db, "m1", "atlas planning notes", Some("f-lock"));
+        let segs = one_topic_segment("omawiamy harmonogram projektu atlas i budżet");
+        db.insert_segments("m1", &segs).unwrap();
+
+        // "lock_folder committed mid-embed": note sealed at rest (markdown='', content_blob kept) —
+        // exactly what `blank_sealed_notes_in_folders` leaves.
+        db.set_folder_locked("f-lock", true, None).unwrap();
+        {
+            let conn = db.lock();
+            conn.execute(
+                "UPDATE notes SET markdown = '', content_blob = X'00' WHERE meeting_id = 'm1'",
+                [],
+            )
+            .unwrap();
+        }
+        db.index_meeting_chunks("m1", &segs, &crate::embed::StubEmbedder)
+            .unwrap();
+        assert_eq!(
+            meeting_chunk_counts(&db, "m1"),
+            (0, 0),
+            "the in-tx sealed-at-rest re-check must refuse writing meeting chunks/vectors"
+        );
+
+        // Session-unlock un-blanks the plaintext BEFORE re-indexing → the write proceeds.
+        {
+            let conn = db.lock();
+            conn.execute(
+                "UPDATE notes SET markdown = 'atlas planning notes' WHERE meeting_id = 'm1'",
+                [],
+            )
+            .unwrap();
+        }
+        db.index_meeting_chunks("m1", &segs, &crate::embed::StubEmbedder)
+            .unwrap();
+        let (chunks, vecs) = meeting_chunk_counts(&db, "m1");
+        assert!(
+            chunks > 0 && vecs == chunks,
+            "an unsealed (un-blanked) meeting indexes again"
         );
     }
 
