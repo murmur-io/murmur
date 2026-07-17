@@ -34,6 +34,7 @@ pub mod ocr;
 pub mod ooxml;
 #[cfg(target_os = "macos")]
 pub mod pdf;
+pub mod reflow;
 pub mod xlsx;
 
 /// One extracted unit of a document: a run of plain text, optionally located by 1-based `page`
@@ -199,6 +200,13 @@ pub fn blocks_from_stored_text(text: &str) -> Vec<ExtractedBlock> {
 /// per-block metadata markers (page/heading sentinel lines) are stripped and blocks are joined by
 /// blank lines. Text with NO sentinel (md/txt/note/legacy) is returned UNCHANGED — so a `.md`
 /// upload, a typed note, and every pre-PR-2 row read byte-identically to before. Deterministic.
+///
+/// READ-TIME REFLOW (doc-preview fix): each LOCATED block's text is run through
+/// [`reflow::reflow_fragmented_text`] before joining — a self-targeting, conservative de-fragmentation
+/// of pathologically letter-spaced PDF text (`"Fron\nt\nend"` → `"Frontend"`). The gate no-ops on
+/// clean text, so a normal PDF page / invoice is byte-identical; a fragmented CV page reads clean. This
+/// is READ-ONLY (a copy of the block text) — `documents.text` at rest is never touched. The sentinel
+/// guard above leaves md/txt/note/legacy rows unreflowed (they never carry located blocks).
 pub fn render_display_text(stored: &str) -> String {
     if !stored.contains(BLOCK_SENTINEL) {
         return stored.to_string();
@@ -206,7 +214,8 @@ pub fn render_display_text(stored: &str) -> String {
     let blocks = blocks_from_stored_text(stored);
     let mut parts: Vec<String> = Vec::with_capacity(blocks.len());
     for b in blocks {
-        let t = b.text.trim();
+        let reflowed = reflow::reflow_fragmented_text(&b.text);
+        let t = reflowed.trim();
         if t.is_empty() {
             continue;
         }

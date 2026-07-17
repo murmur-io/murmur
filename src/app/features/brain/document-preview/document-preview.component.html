@@ -1,0 +1,67 @@
+@if (doc(); as d) {
+  <div class="dp-backdrop">
+    <!-- Full-viewport dismiss target: a real <button> so it's natively
+         focusable + keyboard-operable (a11y) — a click closes. Escape is
+         handled at document level (host listener), NOT here, so it still fires
+         after focus falls to <body> from clicking the preview text. -->
+    <button
+      type="button"
+      class="dp-scrim"
+      aria-label="Close preview"
+      (click)="dismiss.emit()"
+    ></button>
+
+    <div
+      class="dp-panel"
+      role="dialog"
+      aria-modal="true"
+      [attr.aria-label]="'Preview of ' + d.name"
+    >
+      <header class="dp-head">
+        <span class="dp-badge" aria-hidden="true">{{ badge() }}</span>
+        <h3 class="dp-title" [attr.title]="d.name">{{ d.name }}</h3>
+        <button
+          #closeBtn
+          type="button"
+          class="dp-close btn btn-ghost"
+          aria-label="Close"
+          (click)="dismiss.emit()"
+        >
+          <svg viewBox="0 0 16 16" width="15" height="15" fill="none" aria-hidden="true">
+            <path
+              d="M4 4l8 8M12 4l-8 8"
+              stroke="currentColor"
+              stroke-width="1.6"
+              stroke-linecap="round"
+            />
+          </svg>
+        </button>
+      </header>
+
+      @if (loading()) {
+        <div class="dp-state" role="status" aria-live="polite">
+          <mur-spinner [size]="22" />
+          <span class="dp-state-text">Loading document…</span>
+        </div>
+      } @else if (error()) {
+        <div class="dp-state dp-state-error" role="alert">
+          <span class="dp-state-glyph" aria-hidden="true">⚠️</span>
+          <span class="dp-state-text">Couldn’t open this document. Please try again.</span>
+        </div>
+      } @else if (masked()) {
+        <!-- Sealed-and-not-unlocked folder → the backend masks the text to "".
+             Show LOCKED, never a blank body (leak-relevant path). -->
+        <div class="dp-state dp-state-locked" role="status">
+          <span class="dp-state-glyph" aria-hidden="true">🔒</span>
+          <span class="dp-state-title">Locked</span>
+          <span class="dp-state-text">
+            This document is in a locked folder. Unlock it (in Meetings →
+            folders) to read its contents.
+          </span>
+        </div>
+      } @else {
+        <pre class="dp-body" tabindex="0">{{ content() }}</pre>
+      }
+    </div>
+  </div>
+}
