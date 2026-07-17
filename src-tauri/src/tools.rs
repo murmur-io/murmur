@@ -65,7 +65,7 @@ impl AssistantScope {
     /// and the connector tools are partitioned here; `propose_note` / write tools are governed by the
     /// surface flags, not the tier, so they are allowed through the tier gate and left to those flags.
     fn allows(self, tool: &str) -> bool {
-        const VAULT_READS: [&str; 8] = [
+        const VAULT_READS: [&str; 9] = [
             "search_meetings",
             "search_semantic",
             "get_meeting",
@@ -73,6 +73,9 @@ impl AssistantScope {
             "list_recent_meetings",
             "get_open_commitments",
             "get_entity_dossier",
+            // Brain v3 PR-6 — the knowledge diff / decision ledger (an owned-vault fact read,
+            // egress-free; gated by `list_facts_visible` like `get_entity_dossier`).
+            "knowledge_diff",
             // Feature C — the typed note-folder database query (an owned-vault read, egress-free).
             "query_database",
         ];
@@ -157,6 +160,16 @@ pub enum ToolCall {
     GetOpenCommitments { owner: Option<String> },
     /// Assemble the gated structured dossier for one entity (caller must pass a non-empty name/id).
     GetEntityDossier { entity: String },
+    /// Brain v3 PR-6 — the KNOWLEDGE DIFF / decision ledger for one entity: what changed between two
+    /// instants (`from`/`to` ISO-8601) plus the full chronological supersession ledger. EGRESS-FREE:
+    /// reads the entity's facts through the visibility-gated [`Db::list_facts_visible`] inside
+    /// [`crate::facts::build_knowledge_diff`], so a sealed-and-not-session-unlocked meeting's fact is
+    /// invisible here too. Caller passes a non-empty entity name/id; `from`/`to` are required.
+    KnowledgeDiff {
+        entity: String,
+        from: String,
+        to: String,
+    },
     /// CONNECTOR — live WEB SEARCH ("research about the world"). This is the ONE [`ToolCall`] that can
     /// EGRESS: it reaches an external search service through the consent-gated, redacting connector
     /// framework ([`crate::connectors`]). It is NOT runnable through the synchronous [`execute_tool`]
@@ -677,6 +690,22 @@ pub fn execute_tool(
                 Err(e) => Err(AppError::Storage(format!("dossier build failed: {e}"))),
             }
         }
+        ToolCall::KnowledgeDiff { entity, from, to } => {
+            // EGRESS-FREE + GATED: resolve the entity through the SAME gated resolver as the dossier
+            // (a sealed-only entity never resolves), then build the diff/ledger through the
+            // visibility-gated `build_knowledge_diff` (`list_facts_visible`). No provider is ever
+            // constructed; nothing egresses.
+            let entity = entity.as_str();
+            let id = match crate::summarize::dossier::resolve_entity_id(db, entity, unlocked) {
+                Ok(Some(id)) => id,
+                Ok(None) => return Ok(format!("No visible entity matching \"{entity}\".")),
+                Err(e) => return Err(AppError::Storage(format!("entity resolve failed: {e}"))),
+            };
+            match crate::facts::build_knowledge_diff(db, &id, from, to, unlocked) {
+                Ok(kd) => Ok(format_knowledge_diff(entity, &kd)),
+                Err(e) => Err(AppError::Storage(format!("knowledge diff failed: {e}"))),
+            }
+        }
         ToolCall::WebSearch { .. } => {
             // EGRESS GUARD: the synchronous, egress-free `execute_tool` is the MCP surface's only
             // entry, so it MUST NOT run a connector (which reaches off-device). Web search is
@@ -1165,6 +1194,56 @@ fn format_org_hits(hits: &[crate::storage::models::OrgChunkHit]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Render the KNOWLEDGE DIFF into the tool text payload for the client to narrate: the between-two-
+/// instants set diff (added / removed / changed) then the chronological decision ledger. Each line is
+/// `<subject> · <predicate>: <old> → <new>` (or `+ <new>` / `- <old>`), with the effective date and
+/// the `source:<meetingId>` provenance so the client can cite. No entity/predicate/object is logged —
+/// this is the RETURNED payload, not a log line.
+fn format_knowledge_diff(entity: &str, kd: &crate::facts::EntityKnowledgeDiff) -> String {
+    fn line(c: &crate::facts::FactStateChange) -> String {
+        let val = match (&c.old_object, &c.new_object) {
+            (Some(o), Some(n)) => format!("{o} → {n}"),
+            (None, Some(n)) => format!("+ {n}"),
+            (Some(o), None) => format!("- {o}"),
+            (None, None) => String::new(),
+        };
+        let src = c
+            .source_meeting_id
+            .as_deref()
+            .map(|m| format!(" · source:{m}"))
+            .unwrap_or_default();
+        format!("- {} · {}: {} ({}){}", c.subject, c.predicate, val, c.valid_from, src)
+    }
+    let d = &kd.diff;
+    let mut out = format!(
+        "KNOWLEDGE DIFF for \"{}\" — {} vs {}: {} changed, {} added, {} removed; {} total decision(s) on record.\n",
+        entity,
+        kd.from,
+        kd.to,
+        d.changed.len(),
+        d.added.len(),
+        d.removed.len(),
+        kd.ledger.len()
+    );
+    let mut section = |title: &str, rows: &[crate::facts::FactStateChange]| {
+        if !rows.is_empty() {
+            out.push_str(&format!("\n{title}:\n"));
+            for c in rows {
+                out.push_str(&line(c));
+                out.push('\n');
+            }
+        }
+    };
+    section("CHANGED", &d.changed);
+    section("ADDED", &d.added);
+    section("REMOVED", &d.removed);
+    section("DECISION LEDGER (oldest → newest)", &kd.ledger);
+    if d.changed.is_empty() && d.added.is_empty() && d.removed.is_empty() && kd.ledger.is_empty() {
+        out.push_str("\nNo tracked facts in this window.\n");
+    }
+    out
 }
 
 /// Render the open-commitments rollup into the tool text payload — one line per item:

@@ -45,6 +45,7 @@ import type {
   DocumentInfo,
   DossierData,
   EntityDetail,
+  EntityKnowledgeDiff,
   Folder,
   FolderNode,
   FullGraphData,
@@ -1131,6 +1132,27 @@ export class IpcService {
   /** Detail for one entity: the entity + its visible backlinked meetings + top neighbors. */
   getEntityDetail(entityId: string): Promise<EntityDetail> {
     return invoke<EntityDetail>("get_entity_detail", { entityId });
+  }
+
+  /**
+   * Brain v3 PR-6 (Knowledge Diff) — the between-two-instants set diff PLUS the full
+   * chronological decision ledger for one entity. GATED server-side through the
+   * visible-facts reader: a sealed-and-not-session-unlocked meeting's fact enters no
+   * snapshot, diff entry, or ledger row (and the entity itself won't resolve if all
+   * its mentions are sealed). `from`/`to` are ISO-8601 instants (the range the FE is
+   * comparing). The backend command parameter is `entity` (a name OR an entity id it
+   * resolves), NOT `entityId` — pass the resolved detail id through as `entity`.
+   */
+  getEntityKnowledgeDiff(
+    entityId: string,
+    from: string,
+    to: string,
+  ): Promise<EntityKnowledgeDiff> {
+    return invoke<EntityKnowledgeDiff>("get_entity_knowledge_diff", {
+      entity: entityId,
+      from,
+      to,
+    });
   }
 
   /**
