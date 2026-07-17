@@ -137,15 +137,24 @@ export class ConnectionsComponent {
    */
   private seq = 0;
 
-  /** Deterministic edges (`wikilink` / `companion`) → plain link chips. */
+  /**
+   * Deterministic (removable/active) chips — `wikilink` / `companion` / `manual`, PLUS any chip the
+   * backend flagged `manual` (a user's active link is always a removable chip, never a suggestion,
+   * even in the pathological case where its surviving collapsed `edgeType` is still `semantic`).
+   */
   readonly deterministic = computed(() =>
-    this.edges().filter((e) => e.edgeType !== "semantic"),
+    this.edges().filter((e) => e.edgeType !== "semantic" || e.manual),
   );
 
-  /** Semantic suggestions (`status === "suggested"`) → Accept/Dismiss rows. */
+  /**
+   * Semantic suggestions (`status === "suggested"`) → Accept/Dismiss rows. A chip flagged `manual`
+   * is EXCLUDED — a user has already actively linked that pair, so it renders as a removable
+   * deterministic chip above, never as an unconfirmed suggestion (defensive twin of the backend's
+   * `edge_rank` fix that makes a `manual` edge outrank a semantic suggestion in the collapse).
+   */
   readonly suggestions = computed(() =>
     this.edges().filter(
-      (e) => e.edgeType === "semantic" && e.status === "suggested",
+      (e) => e.edgeType === "semantic" && e.status === "suggested" && !e.manual,
     ),
   );
 
