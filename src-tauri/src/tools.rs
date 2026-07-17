@@ -444,6 +444,29 @@ pub fn execute_tool(
                     format_hits_and_docs(&hits, &docs)
                 ));
             }
+            // MODEL GUARD (Brain v3 audit gap #7, mirrors the citations site in `commands.rs`
+            // `gather_note_enhance_citations`, which checks BOTH flags): the flag can be ON with the
+            // REAL e5 model ABSENT — `active_embedder()` is then the deterministic hash STUB, and
+            // embedding the query with it would inject a garbage vector into the KNN/fusion legs.
+            // Degrade to the SAME gated keyword search as flag-off, honestly labelled — a stub
+            // query vector never enters fusion.
+            if !crate::embed::embed_model_present() {
+                let hits = db
+                    .search_visible_in_range(q, 20, unlocked, date_filter)
+                    .map_err(|e| AppError::Storage(format!("search failed: {e}")))?;
+                let docs = db
+                    .search_doc_chunks_fts_visible(q, 20, unlocked)
+                    .unwrap_or_default();
+                if hits.is_empty() && docs.is_empty() {
+                    return Ok(format!(
+                        "No meetings or documents match \"{q}\" (keyword match — the semantic model is not installed)."
+                    ));
+                }
+                return Ok(format!(
+                    "Keyword (exact-word) matches — the semantic model is not installed:\n{}",
+                    format_hits_and_docs(&hits, &docs)
+                ));
+            }
             // Embed the query with the SAME active embedder used to index, then HYBRID-search through
             // the SAME visibility gate as `search_meetings` (both FTS + vector legs are gated).
             let embedder = crate::embed::active_embedder();
@@ -1890,6 +1913,38 @@ mod tests {
             .build()
             .unwrap()
             .block_on(f)
+    }
+
+    /// Brain v3 audit gap #7: with `semantic_search_enabled` ON but the REAL e5 model ABSENT, the
+    /// SearchSemantic arm must DEGRADE to gated keyword matching — never `embed_query` with the
+    /// deterministic hash stub (a garbage query vector entering KNN/fusion; the sibling citations
+    /// site in `commands.rs` checks BOTH flags). Deterministic only in a model-less environment
+    /// (CI / default install): when a real model is installed on the dev box the guard leg is
+    /// unreachable, so the test exits early (the model-present hybrid path has its own coverage).
+    #[test]
+    fn search_semantic_degrades_to_keyword_when_model_absent() {
+        if crate::embed::embed_model_present() {
+            return; // real model installed in this env → the guard leg cannot fire.
+        }
+        let db = tmp_db();
+        let config = AppConfig {
+            semantic_search_enabled: true,
+            ..AppConfig::default()
+        };
+        let unlocked = HashSet::new();
+        let out = execute_tool(
+            &ToolCall::SearchSemantic {
+                query: "anything".into(),
+            },
+            &db,
+            &unlocked,
+            &config,
+        )
+        .unwrap();
+        assert!(
+            out.contains("semantic model is not installed"),
+            "model-absent semantic search must degrade honestly to keyword matching, never a stub-vector KNN: {out}"
+        );
     }
 
     // ── Feature C — query_database filter grammar (Rust-parsed, deterministic) ───────────────────

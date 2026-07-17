@@ -568,9 +568,6 @@ pub fn run() {
                     .map(|c| c.semantic_search_enabled)
                     .unwrap_or(false);
                 tauri::async_runtime::spawn_blocking(move || {
-                    if !semantic_enabled || !crate::embed::embed_model_present() {
-                        return;
-                    }
                     // 2026-07-13 launch-freeze incident: on a RAM-starved machine, defer the whole
                     // backfill (incl. the lazy Candle/Metal embedder load) rather than starting it
                     // at launch — it is content-hash idempotent, so a later, healthier launch just
@@ -579,8 +576,37 @@ pub fn run() {
                         tracing::info!(target: "rag", "topic-chunk backfill skipped: low system RAM");
                         return;
                     }
-                    let started = std::time::Instant::now();
+                    // Brain v3 (audit gap #2) — the IDEMPOTENT repair tick: backfill meetings with a
+                    // note but no chunks / chunks but no vectors, and documents via the needs-only
+                    // probe (chunk-only backfill runs even MODEL-ABSENT, like the reindex doc leg —
+                    // so it runs BEFORE the model/flag early-return below). All reads inside run
+                    // under the EMPTY unlock set (sealed content is never touched, even
+                    // mid-session-unlock). Counts only — no PII.
+                    let model_present = crate::embed::embed_model_present();
                     let embedder = crate::embed::active_embedder();
+                    match crate::commands::backfill_missing_brain_indexes(
+                        &db,
+                        semantic_enabled,
+                        model_present,
+                        embedder.as_ref(),
+                    ) {
+                        Ok((meetings, docs)) if meetings + docs > 0 => {
+                            tracing::info!(
+                                target: "rag",
+                                meetings,
+                                docs,
+                                "brain index repair tick backfilled missing chunks/vectors"
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::warn!(target: "rag", error = %e, "brain index repair tick failed");
+                        }
+                    }
+                    if !semantic_enabled || !model_present {
+                        return;
+                    }
+                    let started = std::time::Instant::now();
                     match db.backfill_topic_chunks_idempotent(embedder.as_ref()) {
                         Ok(indexed) if indexed > 0 => {
                             tracing::info!(
