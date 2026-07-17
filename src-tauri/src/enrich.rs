@@ -83,6 +83,51 @@ pub fn apply_link_markers(note_md: &str, hits: &[ContextHit]) -> String {
     apply_fenced_block(note_md, LINKS_FENCE_START, LINKS_FENCE_END, callout, &body)
 }
 
+/// Brain v3 PR-3 — INVERSE of the links block: parse the `> - {detail} (via {source})[ — {url}]`
+/// body lines of the managed `murmur:links` block back into [`ContextHit`]s, so an accepted semantic
+/// link can be MERGED into the block without clobbering the auto related-notes rows already there
+/// (the block is a full REPLACE — see [`apply_link_markers`]). Only the links fence is read (the
+/// connector `murmur:context` block is left untouched). A note with no links block yields `[]`.
+///
+/// Best-effort parse (the block is our OWN deterministic render, so the shape is stable): a body line
+/// that does not match the render shape is skipped rather than mis-parsed. The `callout` header line
+/// (`> [!related]-…`) is not a `> - ` bullet, so it is naturally excluded.
+pub fn extract_link_hits(note_md: &str) -> Vec<ContextHit> {
+    let Some(start) = note_md.rfind(LINKS_FENCE_START) else {
+        return Vec::new();
+    };
+    let Some(end_rel) = note_md[start..].find(LINKS_FENCE_END) else {
+        return Vec::new();
+    };
+    let block = &note_md[start..start + end_rel];
+    let mut out: Vec<ContextHit> = Vec::new();
+    for line in block.lines() {
+        let Some(rest) = line.strip_prefix("> - ") else {
+            continue;
+        };
+        // Split an optional trailing " — {url}" (em-dash separator the renderer used). rsplit once so
+        // an em-dash inside the detail itself is not mistaken for the url separator.
+        let (head, url) = match rest.rsplit_once(" — ") {
+            Some((h, u)) => (h, Some(u.trim().to_string())),
+            None => (rest, None),
+        };
+        // The " (via {source})" suffix carries the source label.
+        let (detail, source) = match head.rsplit_once(" (via ") {
+            Some((d, s)) => (d.trim().to_string(), s.trim_end_matches(')').trim().to_string()),
+            None => (head.trim().to_string(), String::new()),
+        };
+        if detail.is_empty() {
+            continue;
+        }
+        out.push(ContextHit {
+            source,
+            detail,
+            url,
+        });
+    }
+    out
+}
+
 /// Render ONE hit as a collapsed, sanitized, loudly-attributed callout body line (no trailing
 /// newline — the block writer adds the break). Shared by BOTH lanes (context + links) so the line
 /// shape + injection-hardening are identical everywhere.
@@ -207,6 +252,50 @@ mod tests {
             hit("Murmur", "We agreed the Q3 roadmap and the budget runway.", Some("[[Q2 Planning]]")),
             hit("Murmur", "The bed comfort trial went well.", Some("[[Bed Comfort]]")),
         ]
+    }
+
+    /// Brain v3 PR-3 — `extract_link_hits` is the INVERSE of the links block: applying hits then
+    /// extracting them round-trips the rendered detail/source/url, so an accept can MERGE a new
+    /// `[[Title]]` without clobbering the existing related-notes rows.
+    #[test]
+    fn extract_link_hits_round_trips_the_links_block() {
+        let md = "# Notes\n- a line\n";
+        let rendered = apply_link_markers(md, &related_hits());
+        let extracted = extract_link_hits(&rendered);
+        assert_eq!(extracted.len(), 2, "both related rows recovered");
+        // The url-bearing hit round-trips detail + source + url.
+        let q2 = extracted
+            .iter()
+            .find(|h| h.detail.contains("Q3 roadmap"))
+            .expect("Q2 row present");
+        assert_eq!(q2.source, "Murmur");
+        assert_eq!(q2.url.as_deref(), Some("[[Q2 Planning]]"));
+        // A note WITHOUT a links block yields no hits.
+        assert!(extract_link_hits(md).is_empty());
+    }
+
+    /// Brain v3 PR-3 — accept materialization MERGES a new `[[Title]]` into the block, PRESERVES the
+    /// existing related-notes rows, and is idempotent (a second merge of the same title is a no-op).
+    #[test]
+    fn merge_new_wikilink_preserves_existing_related_rows() {
+        let md = "# Notes\n- a line\n";
+        let with_related = apply_link_markers(md, &related_hits());
+        // Merge an accepted [[Design Spec]] into the block (mirrors commands::merge_related_hit).
+        let mut hits = extract_link_hits(&with_related);
+        let new = hit("note", "[[Design Spec]]", None);
+        if !hits.iter().any(|h| h.detail == new.detail) {
+            hits.push(new.clone());
+        }
+        let merged = apply_link_markers(&with_related, &hits);
+        assert!(merged.contains("[[Q2 Planning]]"), "existing related row preserved");
+        assert!(merged.contains("[[Design Spec]]"), "accepted wikilink materialized");
+        // Idempotent: re-merging the same accepted title adds nothing.
+        let mut hits2 = extract_link_hits(&merged);
+        if !hits2.iter().any(|h| h.detail == new.detail) {
+            hits2.push(new);
+        }
+        let merged2 = apply_link_markers(&merged, &hits2);
+        assert_eq!(merged, merged2, "re-accepting the same link is a byte-exact no-op");
     }
 
     #[test]

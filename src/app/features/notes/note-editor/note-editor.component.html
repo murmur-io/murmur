@@ -503,6 +503,16 @@
             <app-backlinks [sources]="backlinks()" />
           }
 
+          <!-- CONNECTIONS (Brain v3 PR-3) — deterministic wikilink/companion link
+               chips + semantic suggestions (confidence chip + Accept/Dismiss),
+               self-loaded & gated. Beside "Linked mentions". Hidden when embedded
+               (the recording panel's Ask Brain tab owns relationships). The panel
+               owns its gated fetch, skips it while `locked`, and re-asks on a
+               session lock-tree change. -->
+          @if (!embedded() && note(); as doc) {
+            <app-connections kind="note" [id]="doc.id" [locked]="doc.locked" />
+          }
+
           <!-- Body: preview (cached computed) OR the source-of-truth textarea.
                Formatting lives in the floating bubble on selection (below) +
                ⌘B/⌘I shortcuts + the `/` slash menu — no persistent toolbar.

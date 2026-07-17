@@ -957,6 +957,84 @@ impl Db {
             )
             .map_err(map_err)?;
         }
+
+        // Brain v3 PR-3 — the LINK ENGINE table (wikilink/companion/semantic edges between
+        // meetings/notes/documents) + its one-time companion backfill. Additive + guarded so
+        // migrate() stays idempotent. Runs LAST so the companion backfill can read the (now-migrated)
+        // `documents.meeting_id` column. See `migrate_links`.
+        Self::migrate_links(&conn)?;
+        Ok(())
+    }
+
+    /// Brain v3 PR-3 — idempotent LINK-ENGINE schema: the `links` table records DERIVED, content-
+    /// revealing relations between `meeting|note|document` rows. Three edge kinds:
+    ///   • `wikilink`  — a `[[Title]]` in a source body, RESOLVED to the target's id at write time
+    ///                   (rename-proof — the root-cause fix over title-string scanning). DIRECTED,
+    ///                   `status='active'`, `created_by='user'`.
+    ///   • `companion` — the structured `documents.meeting_id` link (recording-time companion note →
+    ///                   its meeting). DIRECTED, `active`, `user`.
+    ///   • `semantic`  — a vec0-kNN content-similarity SUGGESTION. UNDIRECTED (endpoints
+    ///                   canonicalized `src<dst`), `status='suggested'`, `created_by='auto'`,
+    ///                   `score`=cosine. Accept flips it `active`/`accepted`; dismiss tombstones it.
+    /// `UNIQUE(src_kind,src_id,dst_kind,dst_id,edge_type)` makes upsert idempotent; both-direction
+    /// indexes serve the gated `links_for_visible` reader from either endpoint.
+    ///
+    /// Lock model (load-bearing): a link ROW names a neighbour (its existence + title reveal a
+    /// possibly-sealed item), so it is PURGED on seal (`purge_links_tx`, run inside every seal/delete
+    /// tx) and RE-DERIVED on unlock; every read gates BOTH endpoints. The table itself is additive +
+    /// guarded — no DROP, no destructive rewrite of user rows.
+    fn migrate_links(conn: &Connection) -> Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS links (
+               id INTEGER PRIMARY KEY,
+               src_kind TEXT NOT NULL,
+               src_id TEXT NOT NULL,
+               dst_kind TEXT NOT NULL,
+               dst_id TEXT NOT NULL,
+               edge_type TEXT NOT NULL,
+               score REAL NOT NULL DEFAULT 1.0,
+               created_by TEXT NOT NULL DEFAULT 'user',
+               status TEXT NOT NULL DEFAULT 'active',
+               created_at INTEGER NOT NULL,
+               UNIQUE (src_kind, src_id, dst_kind, dst_id, edge_type)
+             );
+             CREATE INDEX IF NOT EXISTS idx_links_src ON links(src_kind, src_id);
+             CREATE INDEX IF NOT EXISTS idx_links_dst ON links(dst_kind, dst_id);",
+        )
+        .map_err(map_err)?;
+
+        // ONE-TIME idempotent COMPANION backfill: every existing companion note
+        // (`documents.kind='note'` with a non-null `meeting_id`) gets its directed
+        // note → meeting `companion` edge. Sentinel-guarded so it runs EXACTLY once (later maintenance
+        // is at the write site, `set_companion_link`); a fresh DB has no companion rows so the
+        // INSERT is a harmless no-op either way. `INSERT OR IGNORE` respects the UNIQUE constraint so
+        // even a re-run (were the sentinel ever lost) never duplicates. Uses the held `conn` directly
+        // (self.set_setting would re-lock and deadlock). created_at = the note's own created_at (a
+        // non-content epoch already on the row) so the backfilled edge carries a real timestamp.
+        let backfilled: Option<String> = conn
+            .query_row(
+                "SELECT value FROM settings WHERE key = 'links_companion_backfill_v1'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(map_err)?;
+        if backfilled.is_none() {
+            conn.execute(
+                "INSERT OR IGNORE INTO links
+                   (src_kind, src_id, dst_kind, dst_id, edge_type, score, created_by, status, created_at)
+                 SELECT 'note', d.id, 'meeting', d.meeting_id, 'companion', 1.0, 'user', 'active', d.created_at
+                   FROM documents d
+                  WHERE d.kind = 'note' AND d.meeting_id IS NOT NULL",
+                [],
+            )
+            .map_err(map_err)?;
+            conn.execute(
+                "INSERT INTO settings (key, value) VALUES ('links_companion_backfill_v1', '1')",
+                [],
+            )
+            .map_err(map_err)?;
+        }
         Ok(())
     }
 
@@ -3353,6 +3431,9 @@ impl Db {
         // same tx — its `evidence_md` quotes the deleted meeting's note/title (resolved rows were
         // blanked on resolve and carry no content).
         Self::purge_pending_audit_findings_tx(&tx, &[id.to_string()])?;
+        // Brain v3 PR-3: purge every `links` row whose SRC OR DST is this deleted meeting in the same
+        // tx — a link to a gone meeting is a dangling edge (and would name a now-absent neighbour).
+        Self::purge_links_tx(&tx, &[id.to_string()], &[])?;
         // Brain v2 L2.1: purge ALL memory rollups in this same tx — a rollup may paraphrase the
         // deleted meeting's (now-gone) facts; the survivors regenerate on the next hourly pass
         // from the remaining visible facts only. The caller deletes the exported `.md`s.
@@ -4047,6 +4128,12 @@ impl Db {
         // id to match, e.g. a stale finding's `see [[superseding note]]`; a seal anywhere
         // invalidates the pass's visibility snapshot). Resolved rows were blanked on resolve.
         Self::purge_all_pending_audit_findings_tx(&tx)?;
+        // Brain v3 PR-3 LINK-ENGINE LOCK-SAFETY: purge every `links` row whose SRC OR DST is a
+        // just-sealed meeting in this SAME seal tx — a link names a neighbour (its title/existence
+        // reveals a possibly-sealed item), so it must not survive at rest for a sealed endpoint.
+        // Re-derived on unlock (wikilink + semantic pass). Document endpoints of these folders are
+        // covered by the `purge_doc_chunks_for_documents` leg the lock caller runs alongside.
+        Self::purge_links_tx(&tx, meeting_ids, &[])?;
         // Brain v2 L2.1 LOCK-SAFETY: memory ROLLUPS are cross-meeting synthesis that may paraphrase
         // the just-sealed facts — purge ALL of them in this SAME seal tx (cheap, re-derivable: the
         // next hourly pass regenerates from the still-VISIBLE facts only). The caller deletes the
@@ -5105,6 +5192,9 @@ impl Db {
         let mut conn = self.lock();
         let tx = conn.transaction().map_err(map_err)?;
         Self::purge_doc_chunks_tx(&tx, &[id.to_string()])?;
+        // Brain v3 PR-3: purge every `links` row whose SRC OR DST is this deleted document/note in the
+        // same tx — a note id IS a document id, so both kinds are covered by `purge_links_tx`.
+        Self::purge_links_tx(&tx, &[], &[id.to_string()])?;
         // Vault Audit: a pending finding sourcing or targeting this document/note quotes its
         // content/title — drop it in the same delete tx (mirrors `delete_meeting`'s purge).
         Self::purge_pending_audit_findings_tx(&tx, &[id.to_string()])?;
@@ -5333,6 +5423,10 @@ impl Db {
         let mut conn = self.lock();
         let tx = conn.transaction().map_err(map_err)?;
         Self::purge_doc_chunks_tx(&tx, document_ids)?;
+        // Brain v3 PR-3 LINK-ENGINE LOCK-SAFETY: purge every `links` row whose SRC OR DST is a
+        // just-sealed document/note (a note id IS a document id) in this SAME seal tx — a link names
+        // a neighbour, so it must not survive at rest for a sealed endpoint. Re-derived on unlock.
+        Self::purge_links_tx(&tx, &[], document_ids)?;
         // Vault Audit LOCK-SAFETY: the callers are seal-side (`lock_folder`'s document leg, the
         // relock reblank) — purge ALL pending findings in this SAME tx (rollup posture; evidence
         // may cite third-party titles no document id can match). Findings are cheap re-derivable
@@ -8032,6 +8126,13 @@ impl Db {
             out
         };
         Self::purge_doc_chunks_tx(&tx, &document_ids)?;
+        // NIT-3 (link lifecycle): the derived documents about to be deleted may be an endpoint of a
+        // `links` row (e.g. a semantic edge to another doc, or a wikilink pointing AT one of them).
+        // Purge every edge incident on a to-be-deleted document id in the SAME tx so no link row is
+        // left dangling to a row that no longer exists. Only the deleted derived-document ids need
+        // purging: authored notes + meetings are REPARENTED out of the folder (above / by the command
+        // layer), never deleted here, so their edges stay valid. Same choke-point as the seal purge.
+        Self::purge_links_tx(&tx, &[], &document_ids)?;
         // Explicit (rather than FK-cascade) so the delete is deterministic and trigger-visible. Scoped
         // to non-authored documents — authored notes were reparented out above (and refused if not).
         tx.execute(
@@ -8318,6 +8419,11 @@ impl Db {
             // snapshot). Resolved rows were blanked on resolve and survive.
             Self::purge_all_pending_audit_findings_tx(&tx)?;
 
+            // Brain v3 PR-3 LINK-ENGINE LOCK-SAFETY: purge every `links` row whose SRC OR DST is a
+            // meeting OR document/note in these (re-blanked / sealed) folders in this SAME relock tx —
+            // a link names a neighbour (its title/existence reveals a possibly-sealed item). Same
+            // purge-on-seal contract as the chunks above; re-derived on unlock.
+            Self::purge_links_tx(&tx, &meeting_ids, &document_ids)?;
             // Brain v2 L2.1 LOCK-SAFETY: purge ALL memory rollups in this SAME relock tx — a rollup
             // may paraphrase the just-re-sealed facts. Cheap re-derivable synthesis; regenerates
             // from VISIBLE facts on the next hourly pass. The caller deletes the exported `.md`s.
@@ -8548,6 +8654,27 @@ impl Db {
             "DELETE FROM doc_chunks WHERE document_id IN \
                (SELECT id FROM documents WHERE folder_id IN \
                   (SELECT id FROM folders WHERE locked = 1))",
+            [],
+        )
+        .map_err(map_err)?;
+        // Brain v3 PR-3 LINK-ENGINE LOCK-SAFETY: purge every `links` row whose meeting endpoint is in
+        // a locked folder, OR whose document/note endpoint is in a locked folder, in this same
+        // reconciliation transaction — so a crash-while-unlocked (which may have re-derived
+        // wikilink/semantic edges against since-sealed items) cannot leave a link naming a sealed
+        // neighbour at rest after a restart. Re-derived on the next unlock. A note id IS a document
+        // id, so the document leg's `IN ('note','document')` covers both kinds.
+        tx.execute(
+            &format!(
+                "DELETE FROM links WHERE \
+                   ((src_kind = 'meeting' AND src_id IN ({LOCKED_MEETINGS})) \
+                    OR (dst_kind = 'meeting' AND dst_id IN ({LOCKED_MEETINGS}))) \
+                   OR (src_kind IN ('note','document') AND src_id IN \
+                        (SELECT id FROM documents WHERE folder_id IN \
+                           (SELECT id FROM folders WHERE locked = 1))) \
+                   OR (dst_kind IN ('note','document') AND dst_id IN \
+                        (SELECT id FROM documents WHERE folder_id IN \
+                           (SELECT id FROM folders WHERE locked = 1)))"
+            ),
             [],
         )
         .map_err(map_err)?;
@@ -9637,6 +9764,599 @@ impl Db {
                 })
                 .optional()
                 .map_err(map_err)
+            }
+        }
+    }
+
+    // ── Brain v3 PR-3 — LINK ENGINE ───────────────────────────────────────────────────────────
+    //
+    // Persisted `links` rows (wikilink/companion/semantic) between meetings/notes/documents. A row
+    // is a DERIVED, content-revealing relation, so: PURGED on seal (`purge_links_tx`), RE-DERIVED on
+    // unlock, and read with BOTH endpoints visibility-gated (`links_for_visible`). SQL only — the
+    // pure edge math (canonicalization, kNN selection) lives in `crate::links`.
+
+    /// Upsert ONE edge (idempotent on the UNIQUE key). For an UNDIRECTED (semantic) edge the caller
+    /// MUST have canonicalized endpoints (`src<dst`) so A~B and B~A collapse to one row. On a
+    /// conflict we REFRESH the mutable fields (`score`, `created_by`, `status`, `created_at`) — a
+    /// re-run of the semantic pass updates a suggestion's score; a wikilink re-index refreshes its
+    /// timestamp. EXCEPTION: a `dismissed` semantic row is a TOMBSTONE — never resurrected by a later
+    /// auto pass (the `WHERE ... status != 'dismissed'` guard on the DO UPDATE). Runs inside a tx.
+    #[allow(clippy::too_many_arguments)]
+    fn upsert_link_tx(
+        tx: &rusqlite::Transaction<'_>,
+        src_kind: &str,
+        src_id: &str,
+        dst_kind: &str,
+        dst_id: &str,
+        edge_type: &str,
+        score: f64,
+        created_by: &str,
+        status: &str,
+        created_at: i64,
+    ) -> Result<()> {
+        tx.execute(
+            // On conflict we REFRESH the score/created_at, but we must NOT clobber a user's decision:
+            //  - `WHERE links.status != 'dismissed'` — a dismissed TOMBSTONE is never resurrected (a
+            //    later auto pass can't re-suggest it).
+            //  - The `CASE` guards status/created_by against a DOWNGRADE: when the incoming write is a
+            //    `suggested` auto re-suggest but the existing edge is already `active` (user-accepted or
+            //    a materialized wikilink/companion), KEEP the existing `status`/`created_by`. Only the
+            //    score is refreshed. An INCOMING `active` (accept, or a fresh wikilink/companion) still
+            //    promotes normally. This preserves an accepted edge across every later semantic pass.
+            "INSERT INTO links
+               (src_kind, src_id, dst_kind, dst_id, edge_type, score, created_by, status, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT (src_kind, src_id, dst_kind, dst_id, edge_type) DO UPDATE SET
+               score = excluded.score,
+               created_by = CASE
+                 WHEN excluded.status = 'suggested' AND links.status = 'active'
+                   THEN links.created_by
+                 ELSE excluded.created_by
+               END,
+               status = CASE
+                 WHEN excluded.status = 'suggested' AND links.status = 'active'
+                   THEN links.status
+                 ELSE excluded.status
+               END,
+               created_at = excluded.created_at
+             WHERE links.status != 'dismissed'",
+            rusqlite::params![
+                src_kind, src_id, dst_kind, dst_id, edge_type, score, created_by, status, created_at
+            ],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// WRITE-TIME WIKILINK INDEXING (DESIGN §PR-3): resolve every `[[Title]]` in `body` to its TARGET
+    /// ID (rename-proof) through the gated [`Self::resolve_wikilink`], then DELETE-THEN-INSERT this
+    /// source's `edge_type='wikilink'` rows in one tx. Storing resolved IDs — not the title strings —
+    /// is the root-cause fix: a later target rename never strands the edge. Unresolved titles (no
+    /// visible target, or an org-only target — orgs are outside the folder-lock link domain) are
+    /// simply skipped; the next re-index picks them up once a matching local target exists.
+    ///
+    /// `src_kind`/`src_id` identify the SOURCE (`meeting` for an AI note, `note` for an authored
+    /// note). Called from the note-save funnels + `build_and_persist_entities`. Best-effort at the
+    /// call site (a failure logs, never fails the save). Logs ids/counts only.
+    pub fn index_wikilinks_for_source(
+        &self,
+        src_kind: crate::links::LinkKind,
+        src_id: &str,
+        body: &str,
+        unlocked: &HashSet<String>,
+    ) -> Result<()> {
+        // Resolve OUTSIDE the write tx (resolve_wikilink takes its own connection lock).
+        let titles = extract_wikilink_titles(body);
+        let mut targets: Vec<(crate::links::LinkKind, String)> = Vec::new();
+        for t in &titles {
+            if let Some(target) = self.resolve_wikilink(t, unlocked)? {
+                let kind = match target.kind.as_str() {
+                    "meeting" => crate::links::LinkKind::Meeting,
+                    "note" => crate::links::LinkKind::Note,
+                    // "org" targets live outside the folder-lock link domain (PR-4) — skip.
+                    _ => continue,
+                };
+                // Never self-link (a note whose title resolves to itself).
+                if kind == src_kind && target.id == src_id {
+                    continue;
+                }
+                if !targets.iter().any(|(k, i)| *k == kind && i == &target.id) {
+                    targets.push((kind, target.id));
+                }
+            }
+        }
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        // Clean replace: drop this source's OLD wikilink rows first, then insert the fresh set. A
+        // removed `[[Title]]` therefore vanishes from the graph on the next save (self-healing).
+        tx.execute(
+            "DELETE FROM links WHERE src_kind = ?1 AND src_id = ?2 AND edge_type = 'wikilink'",
+            rusqlite::params![src_kind.as_str(), src_id],
+        )
+        .map_err(map_err)?;
+        for (dst_kind, dst_id) in &targets {
+            Self::upsert_link_tx(
+                &tx,
+                src_kind.as_str(),
+                src_id,
+                dst_kind.as_str(),
+                dst_id,
+                "wikilink",
+                1.0,
+                "user",
+                "active",
+                now,
+            )?;
+        }
+        tx.commit().map_err(map_err)?;
+        tracing::debug!(
+            target: "links",
+            src_kind = src_kind.as_str(),
+            resolved = targets.len(),
+            total = titles.len(),
+            "index_wikilinks_for_source"
+        );
+        Ok(())
+    }
+
+    /// COMPANION edge maintenance: (re)assert the directed `note → meeting` `companion` edge when a
+    /// companion note's `documents.meeting_id` is set. Idempotent (UNIQUE upsert). Called wherever
+    /// `set_document_meeting_id` runs, so the edge is maintained beyond the one-time migrate backfill.
+    pub fn set_companion_link(&self, note_id: &str, meeting_id: &str) -> Result<()> {
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        Self::upsert_link_tx(
+            &tx, "note", note_id, "meeting", meeting_id, "companion", 1.0, "user", "active", now,
+        )?;
+        tx.commit().map_err(map_err)?;
+        Ok(())
+    }
+
+    /// PURGE every link row whose SRC OR DST is a sealed/deleted meeting or document (a note id IS a
+    /// `documents` id, so `document_ids` covers the `note` kind too). Runs INSIDE an existing seal /
+    /// delete tx so a link — which reveals a neighbour's existence + title — never outlives the
+    /// plaintext it was derived from. BOTH endpoint kinds for a meeting id are matched (`src`/`dst`);
+    /// likewise for a document/note id across `document`/`note` kinds. Re-derived on unlock.
+    /// Mirrors the `purge_chunks_tx` / `purge_doc_chunks_tx` choke-point idiom.
+    fn purge_links_tx(
+        tx: &rusqlite::Transaction<'_>,
+        meeting_ids: &[String],
+        document_ids: &[String],
+    ) -> Result<()> {
+        for mid in meeting_ids {
+            tx.execute(
+                "DELETE FROM links
+                   WHERE (src_kind = 'meeting' AND src_id = ?1)
+                      OR (dst_kind = 'meeting' AND dst_id = ?1)",
+                rusqlite::params![mid],
+            )
+            .map_err(map_err)?;
+        }
+        for did in document_ids {
+            // A note and a document share the `documents` id space — purge BOTH kinds for the id.
+            tx.execute(
+                "DELETE FROM links
+                   WHERE (src_kind IN ('note','document') AND src_id = ?1)
+                      OR (dst_kind IN ('note','document') AND dst_id = ?1)",
+                rusqlite::params![did],
+            )
+            .map_err(map_err)?;
+        }
+        Ok(())
+    }
+
+    /// SUGGEST-scope purge: a link's SOURCE re-runs its own auto pass, so drop this source's PRIOR
+    /// `semantic` SUGGESTIONS (never its accepted/active or dismissed rows) before re-suggesting —
+    /// keeps the suggestion set fresh without churning a user's decisions. Undirected semantic edges
+    /// are stored canonicalized, so a source may be either endpoint: match both. Runs inside a tx.
+    fn clear_semantic_suggestions_tx(
+        tx: &rusqlite::Transaction<'_>,
+        kind: &str,
+        id: &str,
+    ) -> Result<()> {
+        tx.execute(
+            "DELETE FROM links
+               WHERE edge_type = 'semantic' AND status = 'suggested'
+                 AND ((src_kind = ?1 AND src_id = ?2) OR (dst_kind = ?1 AND dst_id = ?2))",
+            rusqlite::params![kind, id],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// The centroid (L2-normalized mean of a `vec0` table's per-chunk vectors) for ONE item. Reuses
+    /// [`Self::related_meetings_visible`]'s centroid math but reads the STORED vectors directly (no
+    /// re-embed) from `vec_chunks` (meeting/note note_chunks) or `doc_vec_chunks` (documents/notes).
+    /// `None` (skip — never an error) when the item has no vectors or a degenerate all-zero centroid.
+    fn item_centroid(&self, kind: crate::links::LinkKind, id: &str) -> Result<Option<Vec<f32>>> {
+        let conn = self.lock();
+        // Which vector source table + join predicate this kind reads.
+        let sql = match kind {
+            crate::links::LinkKind::Meeting => {
+                "SELECT v.embedding FROM vec_chunks v
+                   JOIN note_chunks nc ON nc.id = v.chunk_id
+                  WHERE nc.meeting_id = ?1"
+            }
+            crate::links::LinkKind::Note | crate::links::LinkKind::Document => {
+                "SELECT v.embedding FROM doc_vec_chunks v
+                   JOIN doc_chunks dc ON dc.id = v.chunk_id
+                  WHERE dc.document_id = ?1"
+            }
+        };
+        let mut stmt = conn.prepare(sql).map_err(map_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![id], |r| r.get::<_, Vec<u8>>(0))
+            .map_err(map_err)?;
+        let dim = crate::embed::EMBED_DIM;
+        let mut centroid = vec![0f32; dim];
+        let mut counted = 0usize;
+        for r in rows {
+            let blob = r.map_err(map_err)?;
+            let v = crate::embed::blob_to_vec(&blob);
+            if v.len() != dim {
+                continue; // defensive: skip a malformed stored vector.
+            }
+            for (acc, x) in centroid.iter_mut().zip(v.iter()) {
+                *acc += *x;
+            }
+            counted += 1;
+        }
+        if counted == 0 {
+            return Ok(None);
+        }
+        for x in centroid.iter_mut() {
+            *x /= counted as f32;
+        }
+        let norm = centroid.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm == 0.0 {
+            return Ok(None);
+        }
+        for x in centroid.iter_mut() {
+            *x /= norm;
+        }
+        Ok(Some(centroid))
+    }
+
+    /// vec0 kNN of `centroid` over BOTH vector tables (`vec_chunks` ∪ `doc_vec_chunks`), rolled
+    /// chunk→ITEM keeping the BEST (min) distance, converted to cosine, self dropped. `(kind, id) →
+    /// cos`, best-first. GATED by `visibility_clause` on each leg's folder (a sealed neighbour is
+    /// invisible — defense-in-depth on top of the seal-time chunk purge). `k` is the vec0 fan-out.
+    /// This is the O(k·log n) neighbour probe the semantic auto-linker rolls up — no corpus scan.
+    fn knn_items_visible(
+        &self,
+        centroid: &[f32],
+        k: i64,
+        self_kind: crate::links::LinkKind,
+        self_id: &str,
+        unlocked: &HashSet<String>,
+    ) -> Result<Vec<(crate::links::LinkKind, String, f32)>> {
+        if centroid.is_empty() || k <= 0 {
+            return Ok(Vec::new());
+        }
+        let conn = self.lock();
+        let vis_note = visibility_clause("f", unlocked);
+        let vis_doc = visibility_clause("f", unlocked);
+        // Each vec0 table gets its own single-MATCH CTE (vec0 allows one MATCH+k per query); the
+        // meeting leg maps chunk→meeting and gates on the meeting's note folder; the doc leg maps
+        // chunk→document and gates on the document's folder, tagging note vs document by kind.
+        let sql = format!(
+            "WITH knn_note(chunk_id, distance) AS (
+                 SELECT chunk_id, distance FROM vec_chunks WHERE embedding MATCH ?1 AND k = ?2
+             ),
+             knn_doc(chunk_id, distance) AS (
+                 SELECT chunk_id, distance FROM doc_vec_chunks WHERE embedding MATCH ?1 AND k = ?2
+             ),
+             hits(kind, id, distance) AS (
+                 SELECT 'meeting', nc.meeting_id, kn.distance
+                   FROM knn_note kn JOIN note_chunks nc ON nc.id = kn.chunk_id
+                   JOIN meetings m ON m.id = nc.meeting_id
+                   WHERE EXISTS (
+                       SELECT 1 FROM notes n
+                        LEFT JOIN folders f ON f.id = n.folder_id
+                        WHERE n.meeting_id = m.id AND {vis_note}
+                   )
+                 UNION ALL
+                 SELECT CASE WHEN d.kind = 'note' THEN 'note' ELSE 'document' END, d.id, kd.distance
+                   FROM knn_doc kd JOIN doc_chunks dc ON dc.id = kd.chunk_id
+                   JOIN documents d ON d.id = dc.document_id
+                   JOIN folders f ON f.id = d.folder_id
+                   WHERE {vis_doc}
+             ),
+             best(kind, id, distance) AS (
+                 SELECT kind, id, MIN(distance) FROM hits GROUP BY kind, id
+             )
+             SELECT kind, id, distance FROM best ORDER BY distance ASC, kind ASC, id ASC"
+        );
+        let blob = crate::embed::vec_to_blob(centroid);
+        let mut stmt = conn.prepare(&sql).map_err(map_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![blob, k], |r| {
+                let kind: String = r.get(0)?;
+                let id: String = r.get(1)?;
+                let d: f64 = r.get(2)?;
+                Ok((kind, id, d as f32))
+            })
+            .map_err(map_err)?;
+        let mut out: Vec<(crate::links::LinkKind, String, f32)> = Vec::new();
+        for r in rows {
+            let (kind_s, id, d) = r.map_err(map_err)?;
+            let Some(kind) = crate::links::LinkKind::parse(&kind_s) else {
+                continue;
+            };
+            if kind == self_kind && id == self_id {
+                continue; // drop self.
+            }
+            out.push((kind, id, crate::links::cosine_from_l2_distance(d)));
+        }
+        Ok(out)
+    }
+
+    /// SEMANTIC AUTO-LINKER (DESIGN §PR-3) — after a real-embedder index of ONE item, suggest up to
+    /// `SEMANTIC_LINK_CAP` content-similar neighbours. Deterministic; O(k·log n) per call (two vec0
+    /// probes: the source's kNN + one back-probe per candidate for mutuality — bounded by `k`, no
+    /// corpus scan). Steps: source centroid → kNN(k) → for each candidate compute MUTUALITY (source ∈
+    /// candidate's OWN kNN) → `crate::links::select_semantic_candidates` (floor/strong-or-mutual/cap)
+    /// → upsert each survivor as a canonicalized UNDIRECTED `semantic` `suggested` edge (score=cos).
+    ///
+    /// GATED end to end: `knn_items_visible` applies `visibility_clause` on every leg, so a sealed
+    /// neighbour is never a candidate and never surfaces the source to a sealed item. Model-gated at
+    /// the CALL SITE (only invoked when `embed_model_present()` — never on stub vectors). Idempotent:
+    /// this source's prior SUGGESTIONS are cleared first (never its accepted/dismissed rows).
+    pub fn auto_link_semantic(
+        &self,
+        kind: crate::links::LinkKind,
+        id: &str,
+        unlocked: &HashSet<String>,
+    ) -> Result<usize> {
+        use crate::links::{select_semantic_candidates, SemanticCandidate, SEMANTIC_LINK_K};
+        // 1. Source centroid from its STORED vectors (skip silently if none / degenerate).
+        let Some(centroid) = self.item_centroid(kind, id)? else {
+            return Ok(0);
+        };
+        // 2. Source kNN. Ask for k+1 (self is the nearest) then self is dropped inside.
+        let neighbours = self.knn_items_visible(&centroid, SEMANTIC_LINK_K + 1, kind, id, unlocked)?;
+        // 3. Mutuality: for each candidate, back-probe ITS kNN and check the source appears.
+        let mut scored: Vec<SemanticCandidate> = Vec::new();
+        for (nk, nid, cos) in neighbours.into_iter().take(SEMANTIC_LINK_K as usize) {
+            let mutual = match self.item_centroid(nk, &nid)? {
+                Some(nc) => {
+                    let back =
+                        self.knn_items_visible(&nc, SEMANTIC_LINK_K + 1, nk, &nid, unlocked)?;
+                    back.into_iter()
+                        .take(SEMANTIC_LINK_K as usize)
+                        .any(|(bk, bid, _)| bk == kind && bid == id)
+                }
+                None => false,
+            };
+            scored.push(SemanticCandidate {
+                kind: nk,
+                id: nid,
+                cos,
+                mutual,
+            });
+        }
+        // 4. Pure selection (floor / strong-or-mutual / rank / cap).
+        let kept = select_semantic_candidates(&scored);
+        // 5. Upsert each survivor as a canonicalized UNDIRECTED semantic suggestion.
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        // Refresh: drop this source's stale suggestions (keeps accepted/dismissed) before re-adding.
+        Self::clear_semantic_suggestions_tx(&tx, kind.as_str(), id)?;
+        let mut written = 0usize;
+        for c in &kept {
+            let (src, dst) = crate::links::canonicalize_endpoints(
+                (kind, id.to_string()),
+                (c.kind, c.id.clone()),
+            );
+            Self::upsert_link_tx(
+                &tx,
+                src.0.as_str(),
+                &src.1,
+                dst.0.as_str(),
+                &dst.1,
+                "semantic",
+                c.cos as f64,
+                "auto",
+                "suggested",
+                now,
+            )?;
+            written += 1;
+        }
+        tx.commit().map_err(map_err)?;
+        tracing::debug!(
+            target: "links",
+            kind = kind.as_str(),
+            suggested = written,
+            "auto_link_semantic"
+        );
+        Ok(written)
+    }
+
+    /// Read ONE link row by id (for accept/dismiss). Returns `(src_kind, src_id, dst_kind, dst_id,
+    /// edge_type, status)`. `None` for an unknown id.
+    #[allow(clippy::type_complexity)]
+    pub fn link_by_id(
+        &self,
+        link_id: i64,
+    ) -> Result<Option<(String, String, String, String, String, String)>> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT src_kind, src_id, dst_kind, dst_id, edge_type, status FROM links WHERE id = ?1",
+            rusqlite::params![link_id],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, String>(5)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(map_err)
+    }
+
+    /// ACCEPT a suggested semantic link: flip `status='active'`, `created_by='accepted'`. Idempotent
+    /// (re-accepting is a no-op). The command layer materializes the `[[Title]]` into the source `.md`
+    /// AFTER this — never here (a DB write must not touch the vault).
+    pub fn accept_link(&self, link_id: i64) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE links SET status = 'active', created_by = 'accepted' WHERE id = ?1",
+            rusqlite::params![link_id],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// DISMISS a suggested link: TOMBSTONE it (`status='dismissed'`) so a later auto pass never
+    /// re-suggests it (the `upsert_link_tx` DO-UPDATE guard skips dismissed rows). Idempotent.
+    pub fn dismiss_link(&self, link_id: i64) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE links SET status = 'dismissed' WHERE id = ?1",
+            rusqlite::params![link_id],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// BOTH-ENDPOINT-GATED reader (DESIGN §PR-3, the `backlinks_for_visible` two-gate template):
+    /// every non-dismissed link edge incident on `(kind, id)`, with the OTHER endpoint's current
+    /// title resolved through the SAME visibility gate. Two hard gates, fail-closed:
+    ///
+    /// 1. **QUERIED-ITEM GATE (first).** If `(kind, id)` is itself sealed-and-not-session-unlocked
+    ///    (its title does not resolve through the gate), return `Ok(vec![])` BEFORE any edge is read —
+    ///    so a locked item never reveals that it HAS links (no existence leak).
+    /// 2. **NEIGHBOUR GATE.** For each incident edge, resolve the OTHER endpoint's title through the
+    ///    gate; an edge whose neighbour is sealed-not-unlocked is DROPPED (its title/existence never
+    ///    leaks). Only edges with BOTH endpoints visible are returned.
+    ///
+    /// Ordering: active-then-suggested (deterministic wikilink/companion first), then score DESC,
+    /// then id — stable for the FE. Logs ids/counts only, never titles.
+    pub fn links_for_visible(
+        &self,
+        kind: crate::links::LinkKind,
+        id: &str,
+        unlocked: &HashSet<String>,
+    ) -> Result<Vec<crate::storage::models::LinkEdge>> {
+        // ── GATE 1: the queried item must itself be visible. ──
+        if self.link_endpoint_title_visible(kind, id, unlocked)?.is_none() {
+            return Ok(Vec::new());
+        }
+        // Read every incident, non-dismissed edge (either endpoint). Direction tells the FE which
+        // side the queried item sits on. No content columns — ids/kinds/metadata only.
+        let rows: Vec<LinkRowRaw> = {
+            let conn = self.lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, src_kind, src_id, dst_kind, dst_id, edge_type, created_by, status,
+                            score, created_at
+                       FROM links
+                      WHERE status != 'dismissed'
+                        AND ((src_kind = ?1 AND src_id = ?2) OR (dst_kind = ?1 AND dst_id = ?2))
+                      ORDER BY (status = 'active') DESC, score DESC, id ASC",
+                )
+                .map_err(map_err)?;
+            let mapped = stmt
+                .query_map(rusqlite::params![kind.as_str(), id], |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, String>(4)?,
+                        r.get::<_, String>(5)?,
+                        r.get::<_, String>(6)?,
+                        r.get::<_, String>(7)?,
+                        r.get::<_, f64>(8)?,
+                        r.get::<_, i64>(9)?,
+                    ))
+                })
+                .map_err(map_err)?;
+            let mut out = Vec::new();
+            for r in mapped {
+                out.push(r.map_err(map_err)?);
+            }
+            out
+        };
+        let mut edges: Vec<crate::storage::models::LinkEdge> = Vec::new();
+        for (lid, sk, si, dk, di, et, cb, st, score, created_at) in rows {
+            // Identify the OTHER endpoint (the one that is NOT the queried item) + the direction.
+            let (direction, other_kind_s, other_id) = if sk == kind.as_str() && si == id {
+                ("out", dk, di)
+            } else {
+                ("in", sk, si)
+            };
+            let Some(other_kind) = crate::links::LinkKind::parse(&other_kind_s) else {
+                continue; // corrupt kind → skip defensively.
+            };
+            // ── GATE 2: the neighbour must be visible; else drop the edge (no title/existence leak). ──
+            let Some(other_title) =
+                self.link_endpoint_title_visible(other_kind, &other_id, unlocked)?
+            else {
+                continue;
+            };
+            edges.push(crate::storage::models::LinkEdge {
+                id: lid,
+                direction: direction.to_string(),
+                other_kind: other_kind_s,
+                other_id,
+                other_title,
+                edge_type: et,
+                created_by: cb,
+                status: st,
+                score,
+                created_at,
+            });
+        }
+        tracing::debug!(target: "links", count = edges.len(), "links_for_visible resolved");
+        Ok(edges)
+    }
+
+    /// Resolve a link endpoint's CURRENT display title through the visibility gate; `None` iff the
+    /// endpoint is unknown OR sealed-and-not-session-unlocked (indistinguishable — no existence leak).
+    /// Meeting → the gated `meetings.title`/`meeting_is_visible`; note/document → the gated
+    /// `documents.title`/`name` under `visibility_clause`. The single title source for BOTH gates in
+    /// [`Self::links_for_visible`], and for the accept command's neighbour-title resolve.
+    pub fn link_endpoint_title_visible(
+        &self,
+        kind: crate::links::LinkKind,
+        id: &str,
+        unlocked: &HashSet<String>,
+    ) -> Result<Option<String>> {
+        match kind {
+            crate::links::LinkKind::Meeting => {
+                if !self.meeting_is_visible(id, unlocked)? {
+                    return Ok(None);
+                }
+                let conn = self.lock();
+                conn.query_row(
+                    "SELECT COALESCE(NULLIF(TRIM(title), ''), 'Meeting') FROM meetings WHERE id = ?1",
+                    rusqlite::params![id],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(map_err)
+            }
+            crate::links::LinkKind::Note | crate::links::LinkKind::Document => {
+                let conn = self.lock();
+                let visible = visibility_clause("f", unlocked);
+                let sql = format!(
+                    "SELECT COALESCE(NULLIF(TRIM(d.title), ''), d.name)
+                       FROM documents d
+                       JOIN folders f ON f.id = d.folder_id
+                      WHERE d.id = ?1 AND {visible}
+                      LIMIT 1"
+                );
+                conn.query_row(&sql, rusqlite::params![id], |r| r.get::<_, String>(0))
+                    .optional()
+                    .map_err(map_err)
             }
         }
     }
@@ -12335,6 +13055,12 @@ fn backlink_sort_key(b: &BacklinkSource) -> i64 {
         .map(|dt| dt.timestamp_millis())
         .unwrap_or(i64::MIN)
 }
+
+/// Brain v3 PR-3 — the raw `links` row shape read by [`Db::links_for_visible`] before it is resolved
+/// into a [`crate::storage::models::LinkEdge`]: `(id, src_kind, src_id, dst_kind, dst_id, edge_type,
+/// created_by, status, score, created_at)`. Aliased so the reader's row `Vec` stays under clippy's
+/// type-complexity bar.
+type LinkRowRaw = (i64, String, String, String, String, String, String, String, f64, i64);
 
 fn visibility_clause(_alias: &str, unlocked: &HashSet<String>) -> String {
     let mut clause = String::from("(f.locked IS NULL OR f.locked = 0");
@@ -15964,6 +16690,46 @@ mod tests {
         );
     }
 
+    /// NIT-3 (RED-before-GREEN — link lifecycle): deleting a folder purges every `links` edge
+    /// incident on a to-be-deleted DERIVED document, so no link row is left dangling to a row that
+    /// no longer exists. RED on the pre-fix `delete_folder` (docs + chunks purged, but `links` were
+    /// not) — the `d1`-incident edges survived the delete.
+    #[test]
+    fn delete_folder_purges_links_referencing_deleted_documents() {
+        let db = mem_db();
+        seed_folder(&db, "f-docs", "Research");
+        seed_folder(&db, "f-keep", "Keep");
+        db.insert_document("d1", "f-docs", "spec.md", "the spec body", "document", 1)
+            .unwrap();
+        // A surviving note in ANOTHER folder that links AT the doc, plus a semantic edge between two
+        // docs in the deleted folder — both are incident on `d1` and must be purged with it.
+        db.insert_document("d2", "f-docs", "notes.md", "adjacent doc", "document", 1)
+            .unwrap();
+        seed_note_doc(&db, "keeper", "f-keep", "Keeper", "");
+        let now = 1_700_000_000_000i64;
+        {
+            let mut conn = db.lock();
+            let tx = conn.transaction().unwrap();
+            // keeper (survives) --wikilink--> d1 (deleted): src stays, dst vanishes.
+            Db::upsert_link_tx(&tx, "note", "keeper", "document", "d1", "wikilink", 1.0, "user", "active", now).unwrap();
+            // d1 <--semantic--> d2 (both deleted).
+            Db::upsert_link_tx(&tx, "document", "d1", "document", "d2", "semantic", 0.8, "auto", "suggested", now).unwrap();
+            tx.commit().unwrap();
+        }
+        assert_eq!(link_count(&db, "document", "d1", "wikilink"), 1, "edge to d1 exists before delete");
+        assert_eq!(link_count(&db, "document", "d1", "semantic"), 1, "semantic edge on d1 exists before delete");
+
+        db.delete_folder("f-docs").unwrap();
+
+        assert_eq!(
+            count_raw(&db, "SELECT COUNT(*) FROM links WHERE src_id IN ('d1','d2') OR dst_id IN ('d1','d2')"),
+            0,
+            "no links row references a deleted document id after delete_folder"
+        );
+        // The surviving note in the OTHER folder keeps its own row-space clean (its dangling edge gone).
+        assert_eq!(link_count(&db, "note", "keeper", "wikilink"), 0, "the surviving note's edge to the deleted doc is purged");
+    }
+
     /// F5 (RED-before-GREEN): the RELOCK tx (`blank_sealed_notes_in_folders`, both the
     /// `relock_folder` and `relock_all_inner` legs) must purge the four derived-content families the
     /// LOCK tx (`purge_chunks_for_meetings`) and the STARTUP reconcile
@@ -18167,6 +18933,326 @@ mod tests {
             .related_meetings_visible("bare", &stub, 5, &nothing)
             .unwrap();
         assert!(hits.is_empty(), "no chunks ⇒ empty related result");
+    }
+
+    // ── Brain v3 PR-3 — LINK ENGINE (persisted `links` rows) ──────────────────────────────────
+
+    /// Count `links` rows incident on `(kind, id)` with the given `edge_type` (any status).
+    fn link_count(db: &Db, kind: &str, id: &str, edge_type: &str) -> i64 {
+        db.lock()
+            .query_row(
+                "SELECT COUNT(*) FROM links
+                   WHERE edge_type = ?3
+                     AND ((src_kind = ?1 AND src_id = ?2) OR (dst_kind = ?1 AND dst_id = ?2))",
+                rusqlite::params![kind, id, edge_type],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    /// A note-doc (`kind='note'`) with a title, in a folder, indexed via the stub so it has vectors.
+    fn seed_note_doc(db: &Db, id: &str, folder_id: &str, title: &str, body: &str) {
+        db.insert_note(id, folder_id, title, title, body, 1_700_000_000_000)
+            .unwrap();
+        db.index_note_chunks(id, title, body, Some(&crate::embed::StubEmbedder))
+            .unwrap();
+    }
+
+    /// The `links` table is created by migrate and survives a re-migrate (idempotency).
+    #[test]
+    fn migrate_creates_links_table_idempotently() {
+        let db = mem_db();
+        let has_links = |db: &Db| -> bool {
+            db.lock()
+                .query_row(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'links'",
+                    [],
+                    |_| Ok(()),
+                )
+                .optional()
+                .unwrap()
+                .is_some()
+        };
+        assert!(has_links(&db), "links table missing after migrate");
+        db.migrate().unwrap();
+        db.migrate().unwrap();
+        assert!(has_links(&db), "links table missing after re-migrate (idempotency broken)");
+        // The companion-backfill sentinel is set exactly once and re-migrate does not error.
+        let sentinel: Option<String> = db
+            .lock()
+            .query_row(
+                "SELECT value FROM settings WHERE key = 'links_companion_backfill_v1'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap();
+        assert_eq!(sentinel.as_deref(), Some("1"), "companion backfill sentinel missing");
+    }
+
+    /// WIKILINK edges are stored by RESOLVED TARGET ID and SURVIVE a target rename — the root-cause
+    /// fix. Index `[[Target]]` in a source note, rename the target, and the edge still resolves via
+    /// the stored id (a title-string edge would have gone stale).
+    #[test]
+    fn wikilink_edges_stored_by_id_survive_rename() {
+        let db = mem_db();
+        seed_folder(&db, "f1", "Notes");
+        // Target note titled "Target" + a source note whose body links [[Target]].
+        seed_note_doc(&db, "target", "f1", "Target", "the target body");
+        db.insert_note("source", "f1", "Source", "Source", "see [[Target]] for context", 1)
+            .unwrap();
+
+        let unlocked = HashSet::new();
+        db.index_wikilinks_for_source(crate::links::LinkKind::Note, "source", "see [[Target]] for context", &unlocked)
+            .unwrap();
+
+        // One wikilink edge source → target, storing the TARGET's id (not the title).
+        let (dk, di): (String, String) = db
+            .lock()
+            .query_row(
+                "SELECT dst_kind, dst_id FROM links
+                   WHERE src_kind='note' AND src_id='source' AND edge_type='wikilink'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(dk, "note");
+        assert_eq!(di, "target", "edge must store the resolved target ID, not the title string");
+
+        // RENAME the target: the edge id is unchanged, so the link still resolves through the reader.
+        db.lock()
+            .execute("UPDATE documents SET title = 'Renamed' WHERE id='target'", [])
+            .unwrap();
+        let edges = db.links_for_visible(crate::links::LinkKind::Note, "source", &unlocked).unwrap();
+        let hit = edges.iter().find(|e| e.other_id == "target").expect("edge survives rename");
+        assert_eq!(hit.other_title, "Renamed", "reader resolves the CURRENT title from the stored id");
+        assert_eq!(hit.edge_type, "wikilink");
+
+        // Re-index a body that no longer links [[Target]] → the stale edge is dropped (self-healing).
+        db.index_wikilinks_for_source(crate::links::LinkKind::Note, "source", "no links now", &unlocked)
+            .unwrap();
+        assert_eq!(link_count(&db, "note", "source", "wikilink"), 0, "removed wikilink is dropped");
+    }
+
+    /// SEMANTIC auto-linker: two meetings with IDENTICAL stub-embedded text are mutual nearest
+    /// neighbours (cos 1.0 ≥ STRONG), so each suggests the other as a `semantic` `suggested` edge;
+    /// self is never suggested; the CAP bounds the fan-out.
+    #[test]
+    fn semantic_auto_linker_mutual_knn_suggests_and_caps() {
+        let db = mem_db();
+        let body = "quarterly revenue growth and the hiring plan for the platform team";
+        // 8 identical-text meetings — every pair is a mutual nearest neighbour in stub space.
+        for i in 0..8 {
+            let id = format!("m{i}");
+            db.insert_meeting(&sample_meeting(&id, "2026-06-24T10:00:00Z")).unwrap();
+            note_for(&db, &id, "claude_code", body);
+            db.index_meeting_chunks(&id, &[], &crate::embed::StubEmbedder).unwrap();
+        }
+        let unlocked = HashSet::new();
+        let written = db.auto_link_semantic(crate::links::LinkKind::Meeting, "m0", &unlocked).unwrap();
+        assert_eq!(written, crate::links::SEMANTIC_LINK_CAP, "cap bounds the fan-out to SEMANTIC_LINK_CAP");
+
+        // Every suggested edge is semantic/suggested/auto, undirected (canonicalized), score≈1.0, and
+        // never points at self. Assert per-row inside the query_map (no complex-tuple intermediate).
+        let conn = db.lock();
+        let mut stmt = conn
+            .prepare("SELECT src_kind, src_id, dst_kind, dst_id, edge_type, status, created_by, score FROM links")
+            .unwrap();
+        let mut seen = 0usize;
+        let mut rows = stmt.query([]).unwrap();
+        while let Some(r) = rows.next().unwrap() {
+            let sk: String = r.get(0).unwrap();
+            let si: String = r.get(1).unwrap();
+            let dk: String = r.get(2).unwrap();
+            let di: String = r.get(3).unwrap();
+            let et: String = r.get(4).unwrap();
+            let st: String = r.get(5).unwrap();
+            let cb: String = r.get(6).unwrap();
+            let score: f64 = r.get(7).unwrap();
+            assert_eq!(et, "semantic");
+            assert_eq!(st, "suggested");
+            assert_eq!(cb, "auto");
+            assert!(score >= 0.80, "score is the cosine, above floor");
+            assert!(!(sk == "meeting" && si == "m0" && dk == "meeting" && di == "m0"), "never self-links");
+            // Canonicalized: src <= dst by (kind, id).
+            assert!((sk.as_str(), si.as_str()) <= (dk.as_str(), di.as_str()), "undirected edge canonicalized");
+            // m0 is one of the two endpoints.
+            assert!(si == "m0" || di == "m0", "edge incident on the source");
+            seen += 1;
+        }
+        assert_eq!(seen, crate::links::SEMANTIC_LINK_CAP);
+    }
+
+    /// PURGE-ON-SEAL, BOTH DIRECTIONS (existence-leak RED→GREEN): a wikilink edge between two notes in
+    /// DIFFERENT folders is purged when EITHER folder is sealed — from the sealed side AND from the
+    /// still-open side (the open note's reader must not surface the sealed neighbour).
+    #[test]
+    fn purge_links_tx_drops_edges_on_seal_both_directions() {
+        let db = mem_db();
+        seed_folder(&db, "f-open", "Open");
+        seed_folder(&db, "f-secret", "Secret");
+        seed_note_doc(&db, "open", "f-open", "Open Note", "links [[Secret Note]]");
+        seed_note_doc(&db, "secret", "f-secret", "Secret Note", "the secret body");
+
+        let nothing = HashSet::new();
+        db.index_wikilinks_for_source(crate::links::LinkKind::Note, "open", "links [[Secret Note]]", &nothing)
+            .unwrap();
+        assert_eq!(link_count(&db, "note", "open", "wikilink"), 1, "edge exists before seal");
+
+        // Seal the SECRET folder (its document is a to-be-sealed endpoint). Set locked + run the
+        // relock reblank, which carries the `purge_links_tx` leg.
+        db.seal_note("secret", "claude_code", b"x").ok(); // best-effort (documents have no notes row)
+        db.set_folder_locked("f-secret", true, None).unwrap();
+        let mut folders = HashSet::new();
+        folders.insert("f-secret".to_string());
+        db.blank_sealed_notes_in_folders(&folders).unwrap();
+
+        // Edge is gone at rest (no `links` row survives for the sealed endpoint) — BOTH directions.
+        assert_eq!(link_count(&db, "note", "secret", "wikilink"), 0, "sealed endpoint's edge purged (dst side)");
+        assert_eq!(link_count(&db, "note", "open", "wikilink"), 0, "open source's edge to the sealed note purged (src side)");
+
+        // And the gated reader on the OPEN note surfaces nothing about the sealed neighbour.
+        let edges = db.links_for_visible(crate::links::LinkKind::Note, "open", &nothing).unwrap();
+        assert!(edges.is_empty(), "open note's link list must not name the sealed neighbour");
+    }
+
+    /// BOTH-ENDPOINT READ GATE: even if a stray `links` row survived (defense-in-depth), the reader
+    /// hides an edge whose OTHER endpoint is sealed-not-unlocked, AND returns empty when the QUERIED
+    /// item is itself sealed (existence-leak guard) — the two-gate model.
+    #[test]
+    fn links_for_visible_gates_both_endpoints() {
+        let db = mem_db();
+        seed_folder(&db, "f-open", "Open");
+        seed_folder(&db, "f-secret", "Secret");
+        seed_note_doc(&db, "open", "f-open", "Open Note", "");
+        seed_note_doc(&db, "secret", "f-secret", "Secret Note", "");
+        // Insert a raw edge open → secret WITHOUT purging (simulate a stray survivor).
+        let now = 1_700_000_000_000i64;
+        {
+            let mut conn = db.lock();
+            let tx = conn.transaction().unwrap();
+            Db::upsert_link_tx(&tx, "note", "open", "note", "secret", "wikilink", 1.0, "user", "active", now).unwrap();
+            tx.commit().unwrap();
+        }
+        db.set_folder_locked("f-secret", true, None).unwrap();
+
+        // GATE 2 (neighbour sealed): querying the OPEN note with an empty unlock set drops the edge.
+        let nothing = HashSet::new();
+        let edges = db.links_for_visible(crate::links::LinkKind::Note, "open", &nothing).unwrap();
+        assert!(edges.is_empty(), "edge to a sealed neighbour must not surface (neighbour gate)");
+
+        // GATE 1 (queried item sealed): querying the SECRET note itself returns empty (existence leak
+        // guard) — even though the stray edge is incident on it.
+        let edges = db.links_for_visible(crate::links::LinkKind::Note, "secret", &nothing).unwrap();
+        assert!(edges.is_empty(), "a sealed queried item must not reveal it HAS links (queried-item gate)");
+
+        // Session-unlock the secret folder → both endpoints visible → the edge appears from either side.
+        let mut unlocked = HashSet::new();
+        unlocked.insert("f-secret".to_string());
+        let edges = db.links_for_visible(crate::links::LinkKind::Note, "open", &unlocked).unwrap();
+        assert_eq!(edges.len(), 1, "both-visible edge surfaces once");
+        assert_eq!(edges[0].other_id, "secret");
+        assert_eq!(edges[0].other_title, "Secret Note");
+    }
+
+    /// DISMISS TOMBSTONES: a dismissed semantic suggestion is never re-suggested by a later auto pass.
+    #[test]
+    fn dismiss_tombstones_a_semantic_suggestion() {
+        let db = mem_db();
+        let body = "identical clustering text for the semantic neighbour test";
+        for id in ["a", "b"] {
+            db.insert_meeting(&sample_meeting(id, "2026-06-24T10:00:00Z")).unwrap();
+            note_for(&db, id, "claude_code", body);
+            db.index_meeting_chunks(id, &[], &crate::embed::StubEmbedder).unwrap();
+        }
+        let unlocked = HashSet::new();
+        db.auto_link_semantic(crate::links::LinkKind::Meeting, "a", &unlocked).unwrap();
+        let (link_id, _): (i64, String) = db
+            .lock()
+            .query_row(
+                "SELECT id, status FROM links WHERE edge_type='semantic' LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get::<_, String>(1)?)),
+            )
+            .unwrap();
+        db.dismiss_link(link_id).unwrap();
+        // Re-run the auto pass on 'a' → the dismissed edge stays dismissed (never resurrected).
+        db.auto_link_semantic(crate::links::LinkKind::Meeting, "a", &unlocked).unwrap();
+        let status: String = db
+            .lock()
+            .query_row("SELECT status FROM links WHERE id = ?1", rusqlite::params![link_id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(status, "dismissed", "a dismissed suggestion is a permanent tombstone");
+        // The reader never returns a dismissed edge.
+        let edges = db.links_for_visible(crate::links::LinkKind::Meeting, "a", &unlocked).unwrap();
+        assert!(edges.iter().all(|e| e.id != link_id), "dismissed edge is never surfaced");
+    }
+
+    /// NIT (RED-before-GREEN — no downgrade of a user's decision): once a user ACCEPTS a semantic
+    /// edge (`status='active'`, `created_by='accepted'`), a LATER auto semantic pass that re-suggests
+    /// the SAME edge must NOT downgrade it back to `suggested`. The `upsert_link_tx` DO-UPDATE guard
+    /// preserves an existing `active` row's status/created_by against an incoming `suggested` write
+    /// (refreshing only the score). RED on the pre-fix upsert (`status = excluded.status` clobbered
+    /// the accepted edge back to `suggested` on every re-run).
+    #[test]
+    fn accepted_semantic_edge_survives_auto_resuggest() {
+        let db = mem_db();
+        let body = "identical clustering text for the semantic neighbour test";
+        for id in ["a", "b"] {
+            db.insert_meeting(&sample_meeting(id, "2026-06-24T10:00:00Z")).unwrap();
+            note_for(&db, id, "claude_code", body);
+            db.index_meeting_chunks(id, &[], &crate::embed::StubEmbedder).unwrap();
+        }
+        let unlocked = HashSet::new();
+        db.auto_link_semantic(crate::links::LinkKind::Meeting, "a", &unlocked).unwrap();
+        let link_id: i64 = db
+            .lock()
+            .query_row("SELECT id FROM links WHERE edge_type='semantic' LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        // User ACCEPTS it: active + accepted.
+        db.accept_link(link_id).unwrap();
+
+        // Re-run the auto pass on 'a' → the accepted edge is re-suggested by the linker but MUST NOT
+        // be downgraded.
+        db.auto_link_semantic(crate::links::LinkKind::Meeting, "a", &unlocked).unwrap();
+        let (status, cb): (String, String) = db
+            .lock()
+            .query_row(
+                "SELECT status, created_by FROM links WHERE id = ?1",
+                rusqlite::params![link_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "active", "an accepted semantic edge stays active across a re-suggest");
+        assert_eq!(cb, "accepted", "created_by is preserved as 'accepted', never reset to 'auto'");
+    }
+
+    /// ACCEPT flips status + created_by (the .md materialize is command-layer; this pins the DB flip).
+    #[test]
+    fn accept_flips_status_and_created_by() {
+        let db = mem_db();
+        let now = 1_700_000_000_000i64;
+        {
+            let mut conn = db.lock();
+            let tx = conn.transaction().unwrap();
+            Db::upsert_link_tx(&tx, "meeting", "m1", "meeting", "m2", "semantic", 0.9, "auto", "suggested", now).unwrap();
+            tx.commit().unwrap();
+        }
+        let link_id: i64 = db
+            .lock()
+            .query_row("SELECT id FROM links WHERE edge_type='semantic' LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        db.accept_link(link_id).unwrap();
+        let (status, cb): (String, String) = db
+            .lock()
+            .query_row(
+                "SELECT status, created_by FROM links WHERE id = ?1",
+                rusqlite::params![link_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "active");
+        assert_eq!(cb, "accepted");
     }
 
     /// PURGE-ON-LOCK: index a meeting's chunks while visible, then re-blank its folder (the relock
