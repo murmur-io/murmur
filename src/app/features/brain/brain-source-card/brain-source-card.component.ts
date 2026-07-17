@@ -50,6 +50,11 @@ export class BrainSourceCardComponent {
   readonly addLabel = input("Add");
   readonly busyLabel = input("Adding…");
   readonly emptyLabel = input("Nothing here yet.");
+  /**
+   * Optional fine-grained progress line shown under the Add button while
+   * {@link busy} (e.g. a document's extract → chunk → embed stage). Null hides it.
+   */
+  readonly progress = input<string | null>(null);
 
   readonly add = output<void>();
   readonly deleteItem = output<DocumentInfo>();

@@ -131,11 +131,24 @@ pub enum ToolCall {
     GetMeeting {
         meeting_id: String,
         transcript_format: String,
+        /// Brain v3 PR-2 — agent PAGING: skip this many chars into the TRANSCRIPT before returning
+        /// (default 0 = today's behavior). Lets the agentic loop iterate a long transcript past the
+        /// per-result budget. The NOTE is always returned in full (it's short).
+        offset: usize,
+        /// Max chars of transcript to return from `offset` (0 = unlimited = today's behavior).
+        max_chars: usize,
     },
     /// The full body of one standalone note OR imported/uploaded document by id (Feature D). Gated
     /// by [`Db::get_document_if_visible`] — a sealed-and-not-session-unlocked document is invisible
     /// (the masked "No data" sentinel), never distinguished from a never-existed id.
-    GetDocument { document_id: String },
+    GetDocument {
+        document_id: String,
+        /// Brain v3 PR-2 — agent PAGING: skip this many chars into the BODY (default 0). Lets the
+        /// agent read a big document past the per-result budget by calling again with a larger offset.
+        offset: usize,
+        /// Max chars of body to return from `offset` (0 = unlimited = today's behavior).
+        max_chars: usize,
+    },
     /// The most recent meetings (already clamped to 1..=100 by the caller/parser).
     ListRecentMeetings { limit: i64 },
     /// Hybrid semantic + FTS search. Gated behind the `semantic_search_enabled` config flag.
@@ -242,16 +255,35 @@ pub fn tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "get_meeting".into(),
-            description: "Fetch one meeting's AI note and full transcript by its id (from a prior search hit).".into(),
-            parameters: str_arg("meetingId", "The meeting id from a prior search result."),
+            description: "Fetch one meeting's AI note and full transcript by its id (from a prior \
+                          search hit). For a very long transcript, page through it with offset + \
+                          maxChars.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "meetingId": { "type": "string", "description": "The meeting id from a prior search result." },
+                    "offset": { "type": "integer", "description": "Chars to skip into the transcript (default 0)." },
+                    "maxChars": { "type": "integer", "description": "Max transcript chars to return from offset (default all)." }
+                },
+                "required": ["meetingId"]
+            }),
             write: false,
         },
         ToolSpec {
             name: "get_document".into(),
             description: "Get the full body of one standalone note or imported/uploaded document by \
                           id (from a search hit labelled 'document:...'). Use this — not get_meeting \
-                          — for ids from the DOCUMENTS section of a search result.".into(),
-            parameters: str_arg("documentId", "The document id from a prior search result (a 'document:...' hit)."),
+                          — for ids from the DOCUMENTS section of a search result. For a big document, \
+                          page through it with offset + maxChars.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "documentId": { "type": "string", "description": "The document id from a prior search result (a 'document:...' hit)." },
+                    "offset": { "type": "integer", "description": "Chars to skip into the body (default 0)." },
+                    "maxChars": { "type": "integer", "description": "Max body chars to return from offset (default all)." }
+                },
+                "required": ["documentId"]
+            }),
             write: false,
         },
         ToolSpec {
@@ -485,7 +517,24 @@ pub fn execute_tool(
             let fts_docs = db
                 .search_doc_chunks_fts_visible(q, 20, unlocked)
                 .unwrap_or_default();
-            let docs = crate::embed::fuse_doc_hits(knn_docs, fts_docs);
+            let mut docs = crate::embed::fuse_doc_hits(knn_docs, fts_docs);
+            // Brain v3 PR-2 — GATED PARENT EXPANSION: for the top-3 fused doc hits, swap the isolated
+            // leaf snippet for the document's dominant L1 SECTION-parent text so the agent reads a
+            // coherent section. `expand_doc_parents_visible` re-applies the visibility gate (a
+            // sealed-not-unlocked doc yields nothing); a flat/legacy doc keeps its leaf snippet.
+            let top_ids: Vec<String> =
+                docs.iter().take(3).map(|h| h.document_id.clone()).collect();
+            if !top_ids.is_empty() {
+                if let Ok(parents) = db.expand_doc_parents_visible(&top_ids, unlocked) {
+                    for p in parents {
+                        if let Some(h) = docs.iter_mut().find(|h| h.document_id == p.document_id) {
+                            if !p.snippet.trim().is_empty() {
+                                h.snippet = p.snippet;
+                            }
+                        }
+                    }
+                }
+            }
             match db.search_hybrid_visible(q, &query_vec, 20, unlocked, date_filter) {
                 Ok(hits) if hits.is_empty() && docs.is_empty() => {
                     Ok(format!("No meetings or documents match \"{q}\"."))
@@ -497,6 +546,8 @@ pub fn execute_tool(
         ToolCall::GetMeeting {
             meeting_id,
             transcript_format,
+            offset,
+            max_chars,
         } => {
             let mid = meeting_id.as_str();
             // A sealed-and-not-unlocked meeting is invisible — including its transcript AND its
@@ -524,7 +575,7 @@ pub fn execute_tool(
                     // timestamps). `transcript_format == "plain"` keeps the LEGACY byte-identical flat
                     // space-join for backward compatibility; every other value (incl. absent/default,
                     // which the MCP/dispatch layer maps to "structured") uses the structured renderer.
-                    let transcript = if transcript_format == "plain" {
+                    let full_transcript = if transcript_format == "plain" {
                         segs.iter()
                             .map(|s| s.text.trim())
                             .filter(|t| !t.is_empty())
@@ -533,6 +584,9 @@ pub fn execute_tool(
                     } else {
                         format_structured_transcript(&segs)
                     };
+                    // Brain v3 PR-2 — agent PAGING: default (offset 0, max_chars 0) is byte-identical
+                    // to today. A non-default window returns a char-safe slice of the transcript.
+                    let transcript = page_text(&full_transcript, *offset, *max_chars);
                     match note {
                         Some(n) => Ok(format!(
                             "{title_line}NOTE:\n{}\n\nTRANSCRIPT:\n{transcript}",
@@ -546,7 +600,11 @@ pub fn execute_tool(
                 }
             }
         }
-        ToolCall::GetDocument { document_id } => {
+        ToolCall::GetDocument {
+            document_id,
+            offset,
+            max_chars,
+        } => {
             let id = document_id.as_str();
             // GATE: `get_document_if_visible` applies the SAME `visibility_clause` JOIN as the doc
             // search readers, so a document in a sealed-and-not-session-unlocked folder resolves to a
@@ -564,10 +622,10 @@ pub fn execute_tool(
                         .map(str::trim)
                         .filter(|t| !t.is_empty())
                         .unwrap_or(doc.name.trim());
-                    Ok(format!(
-                        "TITLE: [[{title}]]\nKIND: {}\n\nBODY:\n{}",
-                        doc.kind, doc.markdown
-                    ))
+                    // Brain v3 PR-2 — agent PAGING: default (0, 0) returns the full body (today's
+                    // behavior); a window returns a char-safe slice so the agent can iterate a big doc.
+                    let body = page_text(&doc.markdown, *offset, *max_chars);
+                    Ok(format!("TITLE: [[{title}]]\nKIND: {}\n\nBODY:\n{}", doc.kind, body))
                 }
             }
         }
@@ -1398,6 +1456,27 @@ fn format_typed_rows(
     out
 }
 
+/// Brain v3 PR-2 — agent PAGING helper. Return a CHAR-safe slice of `text` starting at char `offset`,
+/// at most `max_chars` chars (0 = unlimited). The DEFAULT `(offset=0, max_chars=0)` returns the whole
+/// string unchanged (byte-identical to the pre-paging behavior). An `offset` past the end returns an
+/// explicit end-of-content marker so the agent stops paging instead of looping on an empty result.
+/// Char-based (never byte) so a multi-byte Polish transcript never slices mid-codepoint.
+fn page_text(text: &str, offset: usize, max_chars: usize) -> String {
+    if offset == 0 && max_chars == 0 {
+        return text.to_string();
+    }
+    let total = text.chars().count();
+    if offset >= total {
+        return "[end of content]".to_string();
+    }
+    let mut it = text.chars().skip(offset);
+    if max_chars == 0 {
+        it.collect()
+    } else {
+        it.by_ref().take(max_chars).collect()
+    }
+}
+
 /// Feature D — render a meeting's transcript segments as a STRUCTURED, one-line-per-segment block:
 /// `[<start_s>–<end_s>] <Speaker>: <text>`. RAW SECONDS (never MM:SS) so a 2h+ meeting can never
 /// wrap/clip a minutes field. Speaker maps the cheap 2-way stream attribution
@@ -1618,6 +1697,14 @@ impl crate::agent::ToolExecutor for GatedToolExecutor<'_> {
                 .unwrap_or("")
                 .to_string()
         };
+        // Brain v3 PR-2 — optional non-negative integer arg (agent paging). Absent / non-numeric → 0
+        // (the DEFAULT, which the tool maps to today's behavior).
+        let u = |k: &str| {
+            args.get(k)
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0)
+                .min(usize::MAX as u64) as usize
+        };
         // Brain v2 L5 — DYNAMIC MCP dispatch. The allowlist above already proved this exact tool
         // was advertised THIS turn (scope Connectors/Full + row enabled + consented); the row is
         // re-read + re-checked here anyway (fail-closed against a mid-turn revoke), then the query
@@ -1660,6 +1747,8 @@ impl crate::agent::ToolExecutor for GatedToolExecutor<'_> {
                     &ToolCall::GetMeeting {
                         meeting_id: s("meetingId"),
                         transcript_format: fmt,
+                        offset: u("offset"),
+                        max_chars: u("maxChars"),
                     },
                     self.db,
                     &unlocked,
@@ -1669,6 +1758,8 @@ impl crate::agent::ToolExecutor for GatedToolExecutor<'_> {
             "get_document" => execute_tool(
                 &ToolCall::GetDocument {
                     document_id: s("documentId"),
+                    offset: u("offset"),
+                    max_chars: u("maxChars"),
                 },
                 self.db,
                 &unlocked,
@@ -3512,14 +3603,14 @@ mod tests {
         // LOCKED, not unlocked → both are the masked sentinel (never their bodies/titles).
         let nothing = HashSet::new();
         let note_locked = execute_tool(
-            &ToolCall::GetDocument { document_id: "doc-note".into() },
+            &ToolCall::GetDocument { document_id: "doc-note".into(), offset: 0, max_chars: 0 },
             &db,
             &nothing,
             &cfg,
         )
         .unwrap();
         let upload_locked = execute_tool(
-            &ToolCall::GetDocument { document_id: "doc-upload".into() },
+            &ToolCall::GetDocument { document_id: "doc-upload".into(), offset: 0, max_chars: 0 },
             &db,
             &nothing,
             &cfg,
@@ -3540,14 +3631,14 @@ mod tests {
         let mut unlocked = HashSet::new();
         unlocked.insert("f-lock".to_string());
         let note_open = execute_tool(
-            &ToolCall::GetDocument { document_id: "doc-note".into() },
+            &ToolCall::GetDocument { document_id: "doc-note".into(), offset: 0, max_chars: 0 },
             &db,
             &unlocked,
             &cfg,
         )
         .unwrap();
         let upload_open = execute_tool(
-            &ToolCall::GetDocument { document_id: "doc-upload".into() },
+            &ToolCall::GetDocument { document_id: "doc-upload".into(), offset: 0, max_chars: 0 },
             &db,
             &unlocked,
             &cfg,
@@ -3592,7 +3683,7 @@ mod tests {
         let unlocked = HashSet::new(); // f-open is not locked → visible.
 
         let note = execute_tool(
-            &ToolCall::GetDocument { document_id: "n1".into() },
+            &ToolCall::GetDocument { document_id: "n1".into(), offset: 0, max_chars: 0 },
             &db,
             &unlocked,
             &cfg,
@@ -3603,7 +3694,7 @@ mod tests {
         );
 
         let upload = execute_tool(
-            &ToolCall::GetDocument { document_id: "u1".into() },
+            &ToolCall::GetDocument { document_id: "u1".into(), offset: 0, max_chars: 0 },
             &db,
             &unlocked,
             &cfg,
@@ -3659,6 +3750,8 @@ mod tests {
             &ToolCall::GetMeeting {
                 meeting_id: "m1".into(),
                 transcript_format: "structured".into(),
+                offset: 0,
+                max_chars: 0,
             },
             &db,
             &HashSet::new(),
@@ -3734,6 +3827,8 @@ mod tests {
             &ToolCall::GetMeeting {
                 meeting_id: "m2".into(),
                 transcript_format: "plain".into(),
+                offset: 0,
+                max_chars: 0,
             },
             &db,
             &HashSet::new(),
@@ -3843,5 +3938,57 @@ mod tests {
             out2.contains("[document:document:d-secret]"),
             "unlocked document must reappear in search: {out2}"
         );
+    }
+
+    /// Brain v3 PR-2 — agent PAGING helper: default (0,0) is byte-identical (full text); a window
+    /// returns a char-safe slice; offset past the end signals end-of-content; multi-byte safe.
+    #[test]
+    fn page_text_paging_is_char_safe_and_default_is_full() {
+        let text = "abcdefghij"; // 10 chars
+        assert_eq!(page_text(text, 0, 0), "abcdefghij", "default returns the whole text");
+        assert_eq!(page_text(text, 3, 0), "defghij", "offset with no cap → to the end");
+        assert_eq!(page_text(text, 3, 4), "defg", "offset + max_chars window");
+        assert_eq!(page_text(text, 20, 5), "[end of content]", "offset past end → marker");
+        // Multi-byte (Polish) — never slices mid-codepoint.
+        let pl = "zażółć gęślą"; // has multi-byte chars
+        let windowed = page_text(pl, 0, 6);
+        assert_eq!(windowed.chars().count(), 6, "counts CHARS, not bytes");
+        assert!(windowed.starts_with("zażół"), "no mid-codepoint slice: {windowed}");
+    }
+
+    /// Brain v3 PR-2 — `get_document` honors offset/max_chars: default returns the full body; a
+    /// window returns a slice; the DEFAULT path is unchanged from before paging.
+    #[test]
+    fn get_document_paging_windows_the_body() {
+        let db = tmp_db();
+        let cfg = AppConfig::default();
+        seed_folder(&db, "f-open", "Docs");
+        db.insert_document(
+            "d-big",
+            "f-open",
+            "big.md",
+            "0123456789ABCDEFGHIJ",
+            "document",
+            1_700_000_000,
+        )
+        .unwrap();
+        let nothing = HashSet::new();
+        let full = execute_tool(
+            &ToolCall::GetDocument { document_id: "d-big".into(), offset: 0, max_chars: 0 },
+            &db,
+            &nothing,
+            &cfg,
+        )
+        .unwrap();
+        assert!(full.contains("0123456789ABCDEFGHIJ"), "default returns the whole body: {full}");
+        let windowed = execute_tool(
+            &ToolCall::GetDocument { document_id: "d-big".into(), offset: 10, max_chars: 5 },
+            &db,
+            &nothing,
+            &cfg,
+        )
+        .unwrap();
+        assert!(windowed.contains("BODY:\nABCDE"), "windowed body: {windowed}");
+        assert!(!windowed.contains("01234"), "the offset skipped the first 10 chars: {windowed}");
     }
 }
