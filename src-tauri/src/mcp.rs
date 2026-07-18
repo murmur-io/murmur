@@ -350,12 +350,21 @@ fn mcp_usize_arg(args: &Value, key: &str) -> usize {
 /// DELIBERATE default change (documented): the pre-fix MCP default `(0,0)` returned the whole body.
 const MCP_DEFAULT_WINDOW_CHARS: usize = 6000;
 
-/// Resolve the MCP paging window for a body tool: honor explicit `offset`/`maxChars`, but when the
-/// client passes NEITHER, default `maxChars` to [`MCP_DEFAULT_WINDOW_CHARS`] so a huge payload is
-/// bounded + disclosed instead of flooding the client. Returns `(offset, max_chars)`.
+/// Resolve the MCP paging window for a body tool: honor an explicit `maxChars`, but whenever the
+/// client gives no (or a zero) `maxChars`, bound it to [`MCP_DEFAULT_WINDOW_CHARS`] so a huge payload
+/// is windowed + disclosed instead of flooding the client (a raw MCP tools/call has no RESULT_BUDGET).
+/// `offset` is honored verbatim, so a client can still page a large body a window at a time. Returns
+/// `(offset, max_chars)`.
 fn mcp_body_window(args: &Value) -> (usize, usize) {
     let offset = mcp_usize_arg(args, "offset");
     let max_chars = mcp_usize_arg(args, "maxChars");
+    // maxChars == 0 means "absent" (mcp_usize_arg's default) or an explicit unbounded request — both
+    // are the flood case, so bound them to the default window. An explicit positive maxChars wins.
+    let max_chars = if max_chars == 0 {
+        MCP_DEFAULT_WINDOW_CHARS
+    } else {
+        max_chars
+    };
     (offset, max_chars)
 }
 
