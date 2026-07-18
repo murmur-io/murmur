@@ -8006,14 +8006,46 @@ pub fn accept_link(state: State<'_, AppState>, id: i64) -> Result<(), AppError> 
 }
 
 pub(crate) fn accept_link_inner(state: &AppState, id: i64) -> Result<(), AppError> {
-    let _lifecycle = lifecycle_guard(state);
-    let Some((src_kind, src_id, dst_kind, dst_id, _et, _status)) = state.db.link_by_id(id)? else {
-        return Err(AppError::InvalidArg(format!("no link {id}")));
-    };
+    // BLK-1 / TOCTOU + non-reentrant guard: SCOPE the lifecycle guard tightly around validate + gate
+    // + row-flip so a concurrent lock/relock cannot land between the endpoint gate and the flip. It is
+    // RELEASED before the note-body materialize below — `materialize_accepted_link` →
+    // `update_note_inner`/`update_note_doc_inner` take the guard THEMSELVES, so composing them under one
+    // held guard re-enters the non-reentrant `Mutex<()>` and self-DEADLOCKS on a valid accept (mirrors
+    // `link_items_inner`/`unlink_items_inner`). Lock order `lifecycle ⊃ db`.
+    let (src_kind, src_id, dst_kind, dst_id) = {
+        let _lifecycle = lifecycle_guard(state);
+        let Some((src_kind, src_id, dst_kind, dst_id, et, status)) = state.db.link_by_id(id)? else {
+            return Err(AppError::InvalidArg(format!("no link {id}")));
+        };
+        // ── Fix 5 (brain-v3 audit): accept is ONLY for an unconfirmed SUGGESTION. Refuse anything else
+        //    (a deterministic wikilink/companion, an already-active manual/accepted, or a dismissed
+        //    tombstone) — "accepting" those is meaningless and would let a caller flip arbitrary rows. ──
+        if !(et == "semantic" && status == "suggested") {
+            return Err(AppError::InvalidArg(format!(
+                "link {id} is not an acceptable suggestion (edge_type={et}, status={status})"
+            )));
+        }
+        // ── GATE both endpoints BEFORE flipping the row (never accept behind a lock, never reveal a
+        //    locked neighbour by activating an edge to it). Fail-closed on a sealed/unknown endpoint. ──
+        let (Some(sk), Some(dk)) = (
+            crate::links::LinkKind::parse(&src_kind),
+            crate::links::LinkKind::parse(&dst_kind),
+        ) else {
+            return Err(AppError::InvalidArg(format!("link {id} has a corrupt endpoint kind")));
+        };
+        if !link_endpoint_is_unlocked(state, sk, &src_id)?
+            || !link_endpoint_is_unlocked(state, dk, &dst_id)?
+        {
+            return Err(AppError::Locked(
+                "one of these items is locked — unlock it to accept the link".into(),
+            ));
+        }
+        // Flip the row first: the graph edge is active even if the .md materialize below is skipped
+        // (e.g. neither endpoint is a locally-owned editable note). The panel reflects the accept.
+        state.db.accept_link(id)?;
+        (src_kind, src_id, dst_kind, dst_id)
+    }; // ── lifecycle guard RELEASED here, before materialize (which re-takes it) ──
     let unlocked = unlocked_snapshot(state)?;
-    // Flip the row first: the graph edge is active even if the .md materialize below is skipped
-    // (e.g. neither endpoint is a locally-owned editable note). The panel reflects the accept.
-    state.db.accept_link(id)?;
     // A semantic edge is undirected — materialize the neighbour's [[Title]] into whichever endpoint
     // is a LOCAL, session-VISIBLE note we own the markdown of. Try src's note first, then dst's.
     // Best-effort: a materialize skip/failure never rolls back the accept.
@@ -8123,8 +8155,45 @@ fn merge_related_hit(markdown: &str, new_hit: crate::enrich::ContextHit) -> Stri
 
 /// Brain v3 PR-3 — DISMISS a suggested link: TOMBSTONE it so no later auto pass re-suggests it. No
 /// markdown is touched (dismiss is graph-only). Idempotent.
+///
+/// Fix 5 (brain-v3 audit): dismissal is for SUGGESTIONS only, and is GATED. Refuse a dismiss on a
+/// DETERMINISTIC edge (`wikilink`/`companion`) — those are re-derived from the note body / companion
+/// link on every save, so a tombstone would be resurrected next save (a confusing no-op) AND could
+/// be abused to silently suppress a real structural link. A `manual` edge is removed via
+/// `unlink_items`, not dismissed. Both endpoints are gated (fail-closed) so a caller can neither
+/// dismiss behind a lock nor probe a locked neighbour's existence via the accept/refuse response.
 #[tauri::command]
 pub fn dismiss_link(state: State<'_, AppState>, id: i64) -> Result<(), AppError> {
+    dismiss_link_inner(state.inner(), id)
+}
+
+pub(crate) fn dismiss_link_inner(state: &AppState, id: i64) -> Result<(), AppError> {
+    let _lifecycle = lifecycle_guard(state);
+    let Some((src_kind, src_id, dst_kind, dst_id, et, _status)) = state.db.link_by_id(id)? else {
+        return Err(AppError::InvalidArg(format!("no link {id}")));
+    };
+    // Only a suggestion (semantic) or an accepted-then-regretted semantic edge is dismissable. A
+    // deterministic wikilink/companion edge is NOT (it would just come back); a manual edge is
+    // removed by `unlink_items`. Refuse the rest with a clear InvalidArg.
+    if et != "semantic" {
+        return Err(AppError::InvalidArg(format!(
+            "link {id} is a deterministic {et} edge — dismissal is for semantic suggestions (remove a manual link via unlink)"
+        )));
+    }
+    // ── GATE both endpoints (fail-closed on a sealed/unknown endpoint). ──
+    let (Some(sk), Some(dk)) = (
+        crate::links::LinkKind::parse(&src_kind),
+        crate::links::LinkKind::parse(&dst_kind),
+    ) else {
+        return Err(AppError::InvalidArg(format!("link {id} has a corrupt endpoint kind")));
+    };
+    if !link_endpoint_is_unlocked(state, sk, &src_id)?
+        || !link_endpoint_is_unlocked(state, dk, &dst_id)?
+    {
+        return Err(AppError::Locked(
+            "one of these items is locked — unlock it to dismiss the suggestion".into(),
+        ));
+    }
     state.db.dismiss_link(id)?;
     tracing::info!(target: "links", link_id = id, "dismiss_link");
     Ok(())
@@ -20175,6 +20244,140 @@ mod lifecycle_tests {
             1,
             "edge restored from the note side once the meeting folder is unlocked"
         );
+    }
+
+    /// Insert a raw semantic edge (`status`) between two note ids and return its row id — so the
+    /// accept/dismiss gate tests have a concrete link to act on without running the real auto pass.
+    fn insert_semantic_link(state: &AppState, src_id: &str, dst_id: &str, status: &str) -> i64 {
+        state
+            .db
+            .insert_link_for_test("note", src_id, "note", dst_id, "semantic", 0.9, "auto", status)
+    }
+
+    /// Insert a raw wikilink edge (deterministic) and return its row id.
+    fn insert_wikilink_link(state: &AppState, src_id: &str, dst_id: &str) -> i64 {
+        state
+            .db
+            .insert_link_for_test("note", src_id, "note", dst_id, "wikilink", 1.0, "user", "active")
+    }
+
+    /// Fix 5 (RED before the accept/dismiss gate): DISMISS on a link whose ENDPOINT is
+    /// sealed-and-not-session-unlocked must REFUSE (`AppError::Locked`) — before, any link id could be
+    /// flipped with no endpoint gate at all.
+    #[test]
+    fn dismiss_link_refuses_sealed_endpoint() {
+        let state = build_state("dismiss-sealed");
+        make_open_folder(&state.db, "f-open", "Open");
+        make_open_folder(&state.db, "f-lock", "Secret");
+        seed_note_doc_cmd(&state.db, "open", "f-open", "Open Note", "body");
+        seed_note_doc_cmd(&state.db, "secret", "f-lock", "Secret Note", "secret");
+        let id = insert_semantic_link(&state, "open", "secret", "suggested");
+        // Seal the secret endpoint's folder (NOT session-unlocked).
+        state.db.seal_document("secret", &b"ct"[..]).unwrap();
+        state.db.set_folder_locked("f-lock", true, Some(&b"wrapped"[..])).unwrap();
+
+        let err = dismiss_link_inner(&state, id).unwrap_err();
+        assert!(
+            matches!(err, AppError::Locked(_)),
+            "dismiss on a sealed-endpoint link must refuse with Locked; got {err:?}"
+        );
+        // The row was NOT tombstoned (fail-closed before the write).
+        let (_sk, _si, _dk, _di, _et, status) = state.db.link_by_id(id).unwrap().unwrap();
+        assert_eq!(status, "suggested", "the suggestion must be untouched after a refused dismiss");
+    }
+
+    /// Fix 5: DISMISS on a DETERMINISTIC (wikilink) edge is refused (InvalidArg) — dismissal is for
+    /// semantic suggestions only; a wikilink would be resurrected on the next save anyway.
+    #[test]
+    fn dismiss_link_refuses_deterministic_wikilink() {
+        let state = build_state("dismiss-wikilink");
+        make_open_folder(&state.db, "f-open", "Open");
+        seed_note_doc_cmd(&state.db, "a", "f-open", "A", "body");
+        seed_note_doc_cmd(&state.db, "b", "f-open", "B", "body");
+        let id = insert_wikilink_link(&state, "a", "b");
+        let err = dismiss_link_inner(&state, id).unwrap_err();
+        assert!(
+            matches!(err, AppError::InvalidArg(_)),
+            "dismiss on a wikilink edge must refuse with InvalidArg; got {err:?}"
+        );
+        // Still active (never tombstoned).
+        let (_sk, _si, _dk, _di, _et, status) = state.db.link_by_id(id).unwrap().unwrap();
+        assert_eq!(status, "active", "a wikilink edge is never dismissed");
+    }
+
+    /// Fix 5: DISMISS on a genuine open suggestion SUCCEEDS (tombstones it) — the gate only blocks the
+    /// sealed/deterministic cases, never a legitimate dismiss.
+    #[test]
+    fn dismiss_link_tombstones_an_open_suggestion() {
+        let state = build_state("dismiss-open");
+        make_open_folder(&state.db, "f-open", "Open");
+        seed_note_doc_cmd(&state.db, "a", "f-open", "A", "body");
+        seed_note_doc_cmd(&state.db, "b", "f-open", "B", "body");
+        let id = insert_semantic_link(&state, "a", "b", "suggested");
+        dismiss_link_inner(&state, id).unwrap();
+        let (_sk, _si, _dk, _di, _et, status) = state.db.link_by_id(id).unwrap().unwrap();
+        assert_eq!(status, "dismissed", "an open suggestion is tombstoned by dismiss");
+    }
+
+    /// Fix 5: ACCEPT validates the id is a real SUGGESTION — accepting a non-existent id is InvalidArg,
+    /// and accepting a deterministic (active wikilink) edge is refused (it is not a suggestion).
+    #[test]
+    fn accept_link_validates_suggestion() {
+        let state = build_state("accept-validates");
+        make_open_folder(&state.db, "f-open", "Open");
+        seed_note_doc_cmd(&state.db, "a", "f-open", "A", "body");
+        seed_note_doc_cmd(&state.db, "b", "f-open", "B", "body");
+        // Unknown id → InvalidArg.
+        let err = accept_link_inner(&state, 999_999).unwrap_err();
+        assert!(matches!(err, AppError::InvalidArg(_)), "unknown id must be InvalidArg; got {err:?}");
+        // A wikilink (active, deterministic) is NOT an acceptable suggestion.
+        let wid = insert_wikilink_link(&state, "a", "b");
+        let err2 = accept_link_inner(&state, wid).unwrap_err();
+        assert!(
+            matches!(err2, AppError::InvalidArg(_)),
+            "accepting a deterministic wikilink edge must be InvalidArg; got {err2:?}"
+        );
+    }
+
+    /// Fix 5: ACCEPT on a suggestion whose ENDPOINT is sealed refuses (`Locked`) before flipping — the
+    /// row stays `suggested`, and no locked neighbour is revealed via materialization.
+    #[test]
+    fn accept_link_refuses_sealed_endpoint() {
+        let state = build_state("accept-sealed");
+        make_open_folder(&state.db, "f-open", "Open");
+        make_open_folder(&state.db, "f-lock", "Secret");
+        seed_note_doc_cmd(&state.db, "open", "f-open", "Open Note", "body");
+        seed_note_doc_cmd(&state.db, "secret", "f-lock", "Secret Note", "secret");
+        let id = insert_semantic_link(&state, "open", "secret", "suggested");
+        state.db.seal_document("secret", &b"ct"[..]).unwrap();
+        state.db.set_folder_locked("f-lock", true, Some(&b"wrapped"[..])).unwrap();
+
+        let err = accept_link_inner(&state, id).unwrap_err();
+        assert!(
+            matches!(err, AppError::Locked(_)),
+            "accept on a sealed-endpoint suggestion must refuse with Locked; got {err:?}"
+        );
+        let (_sk, _si, _dk, _di, _et, status) = state.db.link_by_id(id).unwrap().unwrap();
+        assert_eq!(status, "suggested", "the suggestion must stay suggested after a refused accept");
+    }
+
+    /// Fix 5 + lock-review regression: a VALID accept (semantic suggestion between two owned, visible
+    /// notes) must COMPLETE (not self-deadlock) and flip the row off `suggested`. The pre-fix code held
+    /// the non-reentrant `lifecycle_guard` across `materialize_accepted_link` → `update_note_doc_inner`
+    /// (which re-acquires it) → self-deadlock; every accept test only exercised REFUSAL paths, so cargo
+    /// test stayed green while a user clicking Accept hung the command forever. If this test hangs, the
+    /// guard is being held across materialize again.
+    #[test]
+    fn accept_link_valid_suggestion_materializes_without_deadlock() {
+        let state = build_state("accept-materialize");
+        make_open_folder(&state.db, "f-open", "Open");
+        seed_note_doc_cmd(&state.db, "a", "f-open", "Alpha", "alpha body");
+        seed_note_doc_cmd(&state.db, "b", "f-open", "Beta", "beta body");
+        let id = insert_semantic_link(&state, "a", "b", "suggested");
+        // Must RETURN (pre-fix: deadlock) — the guard is released before the materialize loop.
+        accept_link_inner(&state, id).expect("a valid accept between two open notes must succeed");
+        let (_sk, _si, _dk, _di, _et, status) = state.db.link_by_id(id).unwrap().unwrap();
+        assert_ne!(status, "suggested", "an accepted suggestion must no longer be 'suggested'");
     }
 
     /// M3-CLIENT lock gate (spec §7 inv. 1): `share_note_to_link` on a SEALED-and-not-session-unlocked
