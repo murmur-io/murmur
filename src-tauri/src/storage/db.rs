@@ -9401,6 +9401,40 @@ impl Db {
             .transpose()
     }
 
+    /// CASE-FOLDED twin of [`Self::meeting_by_title_visible`] (brain-v3 audit Fix 6): the same
+    /// gated resolver but comparing `LOWER(m.title) = LOWER(?1)` so `[[project x]]` resolves a
+    /// meeting titled "Project X". Used ONLY as [`Self::resolve_wikilink`]'s meeting-leg fallback
+    /// after the exact match misses. Same visibility predicate — a sealed meeting never resolves.
+    /// (SQLite `LOWER()` folds ASCII only; full Unicode fold is deferred with the note leg's.)
+    fn meeting_by_title_folded_visible(
+        &self,
+        title: &str,
+        unlocked: &HashSet<String>,
+    ) -> Result<Option<Meeting>> {
+        let conn = self.lock();
+        let visible = visibility_clause("n", unlocked);
+        let sql = format!(
+            "SELECT m.id, m.started_at, m.ended_at, m.title, m.duration_s, m.audio_path, m.status,
+                    (SELECT nf.folder_id FROM notes nf
+                      WHERE nf.meeting_id = m.id AND nf.folder_id IS NOT NULL LIMIT 1)
+                      AS folder_id
+               FROM meetings m
+              WHERE LOWER(m.title) = LOWER(?1)
+                AND (NOT EXISTS (SELECT 1 FROM notes nn WHERE nn.meeting_id = m.id)
+                     OR EXISTS (
+                          SELECT 1 FROM notes n
+                           LEFT JOIN folders f ON f.id = n.folder_id
+                           WHERE n.meeting_id = m.id AND {visible}
+                        ))
+              ORDER BY m.started_at DESC, m.id DESC
+              LIMIT 1"
+        );
+        conn.query_row(&sql, rusqlite::params![title], row_to_meeting)
+            .optional()
+            .map_err(map_err)?
+            .transpose()
+    }
+
     /// Resolve a `[[Title]]` wikilink to a VISIBLE navigation target — a standalone note (preferred,
     /// the more natural link target), else a meeting whose exact title matches, else (2026-07-15)
     /// an org (Shared Brain) item whose exact title matches. GATED on all three legs: notes/meetings
@@ -9424,10 +9458,16 @@ impl Db {
         if title.is_empty() {
             return Ok(None);
         }
-        // Note leg first (a standalone note is the more natural wikilink target). VISIBLE notes only.
-        {
-            let conn = self.lock();
-            let visible = visibility_clause("f", unlocked);
+        // CASE-INSENSITIVE resolution (brain-v3 audit Fix 6): Obsidian resolves `[[links]]`
+        // case-insensitively, but this resolver matched titles BYTE-EXACTLY, so `[[project x]]`
+        // silently failed to resolve to a note titled "Project X". We PREFER an exact match (the
+        // `= ?1` predicate below), then FALL BACK to a case-folded match (`LOWER(...) = LOWER(?1)`)
+        // when the exact one misses. Note on scope: SQLite's built-in `LOWER()` folds ASCII only —
+        // full Unicode case/diacritic folding (`.nfc().to_lowercase()`) would need the
+        // `unicode-normalization` crate (a new dep, deferred), so accented titles still fold only as
+        // far as ASCII here; the common Obsidian case (letter-case differences) is covered. The
+        // fallback runs ONLY on an exact miss (no cost on the hot exact path).
+        let folded_note_sql = |exact: bool, visible: &str| {
             // SELF-LINK AVOIDANCE (2026-07-16 companion note): a companion note's managed title
             // equals its meeting's title, so a user-typed `[[Meeting]]` could otherwise hit the
             // companion note via this note-leg-first order. EXCLUDE a note carrying a non-null
@@ -9435,25 +9475,48 @@ impl Db {
             // `[[Meeting]]` always falls through to the meeting leg below, never resolving to its
             // own companion note. (A companion note IS still a valid target for OTHER titles that
             // happen to name it — only the self-title collision is excluded.)
-            let sql = format!(
+            let (title_pred, self_pred) = if exact {
+                (
+                    "COALESCE(NULLIF(TRIM(d.title), ''), d.name) = ?1",
+                    "EXISTS (SELECT 1 FROM meetings m WHERE m.id = d.meeting_id AND m.title = ?1)",
+                )
+            } else {
+                (
+                    "LOWER(COALESCE(NULLIF(TRIM(d.title), ''), d.name)) = LOWER(?1)",
+                    "EXISTS (SELECT 1 FROM meetings m WHERE m.id = d.meeting_id AND LOWER(m.title) = LOWER(?1))",
+                )
+            };
+            format!(
                 "SELECT d.id
                    FROM documents d
                    JOIN folders f ON f.id = d.folder_id
                   WHERE d.kind = 'note'
-                    AND COALESCE(NULLIF(TRIM(d.title), ''), d.name) = ?1
+                    AND {title_pred}
                     AND {visible}
-                    AND NOT (
-                          d.meeting_id IS NOT NULL
-                          AND EXISTS (SELECT 1 FROM meetings m
-                                       WHERE m.id = d.meeting_id AND m.title = ?1)
-                        )
+                    AND NOT (d.meeting_id IS NOT NULL AND {self_pred})
                   ORDER BY d.updated_at DESC, d.id ASC
                   LIMIT 1"
-            );
+            )
+        };
+        // Note leg first (a standalone note is the more natural wikilink target). VISIBLE notes only.
+        {
+            let conn = self.lock();
+            let visible = visibility_clause("f", unlocked);
+            // Exact first, then the case-folded fallback (only if exact missed).
             let note_id: Option<String> = conn
-                .query_row(&sql, rusqlite::params![title], |r| r.get(0))
+                .query_row(&folded_note_sql(true, &visible), rusqlite::params![title], |r| r.get(0))
                 .optional()
-                .map_err(map_err)?;
+                .map_err(map_err)?
+                .or_else(|| {
+                    conn.query_row(
+                        &folded_note_sql(false, &visible),
+                        rusqlite::params![title],
+                        |r| r.get(0),
+                    )
+                    .optional()
+                    .ok()
+                    .flatten()
+                });
             if let Some(id) = note_id {
                 return Ok(Some(WikiTarget {
                     kind: "note".to_string(),
@@ -9461,8 +9524,15 @@ impl Db {
                 }));
             }
         }
-        // Meeting leg — reuse the proven gated title resolver (acquires its own lock).
+        // Meeting leg — exact via the proven gated title resolver; then a case-folded fallback that
+        // rides the SAME visibility predicate (a sealed meeting never resolves, exact or folded).
         if let Some(m) = self.meeting_by_title_visible(title, unlocked)? {
+            return Ok(Some(WikiTarget {
+                kind: "meeting".to_string(),
+                id: m.id,
+            }));
+        }
+        if let Some(m) = self.meeting_by_title_folded_visible(title, unlocked)? {
             return Ok(Some(WikiTarget {
                 kind: "meeting".to_string(),
                 id: m.id,
@@ -9689,6 +9759,142 @@ impl Db {
         Ok(!has_notes || has_visible)
     }
 
+    /// INDEXED backlink fast path (brain-v3 audit Fix 3): every `wikilink`/`companion` edge in the
+    /// `links` table that points AT `(target_kind, target_id)` (backed by `idx_links_dst`), resolved
+    /// to a [`BacklinkSource`] with the SAME both-endpoint gating as the body-scan path. Returns the
+    /// resolved sources PLUS the sets of source ids served (meeting ids, note/document ids) so the
+    /// caller's body scan skips them — no double-count, no rescan of an indexed body. A `document`
+    /// source (never a backlink body) is ignored. A source failing its own visibility gate is dropped.
+    ///
+    /// A `links` backlink edge is stored `src → dst` (the SOURCE mentions the TARGET), so we match on
+    /// `dst`. The map back to [`SourceKind`]: a `meeting`/`note` src is a real backlink source; a
+    /// `document` src is skipped (documents are not editable note bodies here). Timestamp: the
+    /// meeting's `started_at`, a note's `updated_at`/`created_at` rendered RFC3339 — uniform with the
+    /// body-scan legs so `backlink_sort_key` parses one format.
+    fn backlinks_from_links_index(
+        &self,
+        target_kind: SourceKind,
+        target_id: &str,
+        unlocked: &HashSet<String>,
+    ) -> Result<(Vec<BacklinkSource>, HashSet<String>, HashSet<String>)> {
+        let target_kind_s = match target_kind {
+            SourceKind::Meeting => "meeting",
+            SourceKind::Note => "note",
+        };
+        // Read the raw incident (src → target) edges first (ids/kinds only — no content, no title).
+        let raw: Vec<(String, String)> = {
+            let conn = self.lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT DISTINCT src_kind, src_id FROM links
+                       WHERE dst_kind = ?1 AND dst_id = ?2
+                         AND edge_type IN ('wikilink', 'companion')
+                         AND status != 'dismissed'",
+                )
+                .map_err(map_err)?;
+            let rows = stmt
+                .query_map(rusqlite::params![target_kind_s, target_id], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })
+                .map_err(map_err)?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r.map_err(map_err)?);
+            }
+            out
+        };
+        let mut sources: Vec<BacklinkSource> = Vec::new();
+        let mut meeting_ids: HashSet<String> = HashSet::new();
+        let mut note_ids: HashSet<String> = HashSet::new();
+        for (src_kind, src_id) in raw {
+            // Never list the target as its own backlink (a self-referential edge).
+            if src_kind == target_kind_s && src_id == target_id {
+                continue;
+            }
+            match src_kind.as_str() {
+                "meeting" => {
+                    // SOURCE GATE: the meeting must be visible; its title/started_at via a gated read.
+                    let Some((title, started_at)) =
+                        self.backlink_meeting_meta_visible(&src_id, unlocked)?
+                    else {
+                        continue;
+                    };
+                    if meeting_ids.insert(src_id.clone()) {
+                        sources.push(BacklinkSource {
+                            id: src_id,
+                            kind: SourceKind::Meeting,
+                            title,
+                            timestamp: started_at,
+                        });
+                    }
+                }
+                "note" => {
+                    // SOURCE GATE: the note's folder must be visible; title/updated_at via a gated read.
+                    let Some((title, ts)) = self.backlink_note_meta_visible(&src_id, unlocked)? else {
+                        continue;
+                    };
+                    if note_ids.insert(src_id.clone()) {
+                        sources.push(BacklinkSource {
+                            id: src_id,
+                            kind: SourceKind::Note,
+                            title,
+                            timestamp: chrono::DateTime::from_timestamp_millis(ts)
+                                .map(|dt| dt.to_rfc3339())
+                                .unwrap_or_default(),
+                        });
+                    }
+                }
+                // A `document` (non-note) src has no wikilink body backlink semantics here — skip.
+                _ => continue,
+            }
+        }
+        Ok((sources, meeting_ids, note_ids))
+    }
+
+    /// A meeting backlink SOURCE's `(title, started_at)` — ONLY when the meeting is session-VISIBLE
+    /// (`meeting_is_visible`), else `None` (source gate). `started_at` is already RFC3339.
+    fn backlink_meeting_meta_visible(
+        &self,
+        meeting_id: &str,
+        unlocked: &HashSet<String>,
+    ) -> Result<Option<(String, String)>> {
+        if !self.meeting_is_visible(meeting_id, unlocked)? {
+            return Ok(None);
+        }
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT COALESCE(NULLIF(TRIM(title), ''), ''), started_at FROM meetings WHERE id = ?1",
+            rusqlite::params![meeting_id],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+        )
+        .optional()
+        .map_err(map_err)
+    }
+
+    /// A note backlink SOURCE's `(title, updated_at_epoch_ms)` — ONLY when the note's folder is
+    /// session-VISIBLE (`visibility_clause`), else `None` (source gate). `kind='note'` only.
+    fn backlink_note_meta_visible(
+        &self,
+        note_id: &str,
+        unlocked: &HashSet<String>,
+    ) -> Result<Option<(String, i64)>> {
+        let conn = self.lock();
+        let visible = visibility_clause("f", unlocked);
+        let sql = format!(
+            "SELECT COALESCE(NULLIF(TRIM(d.title), ''), d.name),
+                    COALESCE(d.updated_at, d.created_at)
+               FROM documents d
+               JOIN folders f ON f.id = d.folder_id
+              WHERE d.id = ?1 AND d.kind = 'note' AND {visible}
+              LIMIT 1"
+        );
+        conn.query_row(&sql, rusqlite::params![note_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        })
+        .optional()
+        .map_err(map_err)
+    }
+
     /// "What links here" — every VISIBLE meeting note (`notes.markdown`) or standalone note
     /// (`documents.text` where `kind='note'`) whose body carries a `[[<target's exact title>]]`
     /// wikilink pointing AT the row identified by (`target_kind`, `target_id`). ON-DEMAND scan (no
@@ -9705,6 +9911,16 @@ impl Db {
     ///    (`visibility_clause` on the meeting-note leg and the note leg), so a sealed-and-not-unlocked
     ///    source can never contribute — its body is simply not in the scan set.
     ///
+    /// INDEXED FAST PATH (brain-v3 audit Fix 3): the wikilink + companion legs of a backlink are
+    /// already materialized in the `links` table (`edge_type IN ('wikilink','companion')`, keyed by
+    /// RESOLVED target id + backed by `idx_links_dst`), so they are served from that index FIRST —
+    /// without touching any source body. The O(entire-vault-text) regex body scan then runs ONLY over
+    /// sources NOT already served from the index (legacy note/meeting bodies whose wikilinks predate
+    /// the `links` write-time indexer, or a not-yet-re-indexed source) — a strict fallback, so no real
+    /// backlink is lost while the hottest new read path stops re-scanning every note body on every open.
+    /// BOTH gates are preserved: the fast-path source is dropped unless it resolves through the SAME
+    /// visibility gate (source gate), and Gate 1 on the target is unchanged.
+    ///
     /// Title collisions keep ALL same-titled matches (a dropped real backlink would be a silent false
     /// negative). Logs IDs/counts only — never body text or titles.
     pub fn backlinks_for_visible(
@@ -9719,6 +9935,12 @@ impl Db {
             // Unknown, sealed-not-unlocked, or empty-titled → nothing to link to. Fail closed.
             _ => return Ok(Vec::new()),
         };
+
+        // ── INDEXED FAST PATH: wikilink + companion backlinks straight from `links` (Fix 3). ──
+        // Each returned source id is remembered so the body-scan legs below skip it (no double-count,
+        // no rescan). A source that fails its own visibility gate is dropped here (source gate).
+        let (mut out, indexed_meeting_ids, indexed_note_ids) =
+            self.backlinks_from_links_index(target_kind, target_id, unlocked)?;
 
         let conn = self.lock();
         // ── GATE 2, meeting-note leg: VISIBLE meeting notes only (same predicate as list_meetings_visible). ──
@@ -9748,15 +9970,16 @@ impl Db {
         // meeting once as soon as ANY of its notes links the target — mark `seen` only on a MATCH, so
         // a link that lives only in a non-first provider note is never missed. title/started_at are
         // meeting-level (identical across the meeting's notes), so the matching row is representative.
-        let mut out: Vec<BacklinkSource> = Vec::new();
-        let mut seen_meetings: HashSet<String> = HashSet::new();
+        // A meeting already served from the `links` index (Fix 3) is pre-seeded into `seen_meetings`
+        // so the scan neither re-scans its body nor emits a duplicate row.
+        let mut seen_meetings: HashSet<String> = indexed_meeting_ids;
         for row in meeting_rows {
             let (id, title, started_at, body) = row.map_err(map_err)?;
             if target_kind == SourceKind::Meeting && id == target_id {
                 continue; // never list the target itself.
             }
             if seen_meetings.contains(&id) {
-                continue; // already emitted this meeting.
+                continue; // already emitted this meeting (fast path or an earlier note).
             }
             if extract_wikilink_titles(&body).contains(&target_title) {
                 seen_meetings.insert(id.clone());
@@ -9798,6 +10021,9 @@ impl Db {
             if target_kind == SourceKind::Note && id == target_id {
                 continue; // never list the target itself.
             }
+            if indexed_note_ids.contains(&id) {
+                continue; // already served from the `links` index (Fix 3) — never rescan/duplicate.
+            }
             if extract_wikilink_titles(&text).contains(&target_title) {
                 note_hits.push(BacklinkSource {
                     id,
@@ -9822,7 +10048,11 @@ impl Db {
         // like the string leg (`visibility_clause` on the note's folder), and DEDUPED against
         // `note_hits` so a companion note that ALSO matched the string scan is listed once. ──
         if target_kind == SourceKind::Meeting {
-            let already: HashSet<String> = note_hits.iter().map(|b| b.id.clone()).collect();
+            // Dedup against BOTH the body-scan `note_hits` AND the `links`-index note sources already
+            // in `out` (a companion note is often ALSO served from the fast path via its companion
+            // edge) so a companion note is listed exactly once.
+            let mut already: HashSet<String> = note_hits.iter().map(|b| b.id.clone()).collect();
+            already.extend(indexed_note_ids.iter().cloned());
             let visible_docs = visibility_clause("f", unlocked);
             let comp_sql = format!(
                 "SELECT d.id, d.title, d.name, COALESCE(d.updated_at, d.created_at)
@@ -10125,6 +10355,39 @@ impl Db {
         Ok(())
     }
 
+    /// TEST-ONLY: insert one raw `links` row and return its row id, so sibling-crate test modules
+    /// (`commands.rs`) can seed a specific edge (a semantic suggestion, a wikilink) to drive the
+    /// accept/dismiss gate tests without reaching the private `upsert_link_tx`. Not compiled into the
+    /// shipping binary.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn insert_link_for_test(
+        &self,
+        src_kind: &str,
+        src_id: &str,
+        dst_kind: &str,
+        dst_id: &str,
+        edge_type: &str,
+        score: f64,
+        created_by: &str,
+        status: &str,
+    ) -> i64 {
+        let mut conn = self.lock();
+        let tx = conn.transaction().unwrap();
+        Self::upsert_link_tx(
+            &tx, src_kind, src_id, dst_kind, dst_id, edge_type, score, created_by, status,
+            1_700_000_000_000,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        conn.query_row(
+            "SELECT id FROM links WHERE src_kind=?1 AND src_id=?2 AND dst_kind=?3 AND dst_id=?4 AND edge_type=?5",
+            rusqlite::params![src_kind, src_id, dst_kind, dst_id, edge_type],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
     /// TEST-ONLY raw count of `links` rows of `edge_type` incident on `(kind, id)` (either endpoint).
     /// Exposes the private connection to sibling-crate test modules (`commands.rs`) so they can assert
     /// the PRE-collapse row counts (manual vs wikilink separately) that `links_for_visible` hides. Not
@@ -10194,6 +10457,39 @@ impl Db {
         Ok(())
     }
 
+    /// PER-NODE cap on INBOUND suggestions (brain-v3 audit Fix 2): the spec caps at
+    /// `SEMANTIC_LINK_CAP` semantic edges per NODE, but the source-side pass only ever caps the
+    /// SOURCE's own fan-out — a hub (a weekly-standup series) still accretes dozens of suggested chips
+    /// from OTHER items' passes. This trims a node's SUGGESTED-SEMANTIC edges back down to
+    /// `SEMANTIC_LINK_CAP`, deleting the WEAKEST (lowest `score`; ties broken by `id` DESC so the drop
+    /// is deterministic) — run for BOTH endpoints right after each upsert so the newly-added 6th edge
+    /// trims the node's weakest. SCOPED HARD: only `status='suggested' AND edge_type='semantic'` rows
+    /// are ever eligible (an `active`/`accepted`/`manual`/`wikilink`/`companion` edge, or a `dismissed`
+    /// tombstone, is NEVER touched). Runs inside the caller's tx.
+    fn trim_node_semantic_suggestions_tx(
+        tx: &rusqlite::Transaction<'_>,
+        kind: &str,
+        id: &str,
+    ) -> Result<()> {
+        // Keep the top-CAP suggested-semantic edges incident on (kind, id) by score DESC (id DESC as a
+        // deterministic tiebreak); DELETE the rest. The subselect ranks only this node's suggestions,
+        // so a shared edge counts against both its endpoints' caps independently (correct — the spec is
+        // a per-node budget). LIMIT -1 OFFSET CAP yields "everything past the top CAP".
+        tx.execute(
+            "DELETE FROM links
+               WHERE id IN (
+                   SELECT id FROM links
+                    WHERE edge_type = 'semantic' AND status = 'suggested'
+                      AND ((src_kind = ?1 AND src_id = ?2) OR (dst_kind = ?1 AND dst_id = ?2))
+                    ORDER BY score DESC, id DESC
+                    LIMIT -1 OFFSET ?3
+               )",
+            rusqlite::params![kind, id, crate::links::SEMANTIC_LINK_CAP as i64],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
     /// The centroid (L2-normalized mean of a `vec0` table's per-chunk vectors) for ONE item. Reuses
     /// [`Self::related_meetings_visible`]'s centroid math but reads the STORED vectors directly (no
     /// re-embed) from `vec_chunks` (meeting/note note_chunks) or `doc_vec_chunks` (documents/notes).
@@ -10248,27 +10544,57 @@ impl Db {
     }
 
     /// vec0 kNN of `centroid` over BOTH vector tables (`vec_chunks` ∪ `doc_vec_chunks`), rolled
-    /// chunk→ITEM keeping the BEST (min) distance, converted to cosine, self dropped. `(kind, id) →
-    /// cos`, best-first. GATED by `visibility_clause` on each leg's folder (a sealed neighbour is
-    /// invisible — defense-in-depth on top of the seal-time chunk purge). `k` is the vec0 fan-out.
-    /// This is the O(k·log n) neighbour probe the semantic auto-linker rolls up — no corpus scan.
+    /// chunk→ITEM keeping the BEST (min) distance, converted to cosine, self dropped. Returns up to
+    /// `want_items` DISTINCT NON-SELF items as `(kind, id) → cos`, best-first. GATED by
+    /// `visibility_clause` on each leg's folder (a sealed neighbour is invisible — defense-in-depth on
+    /// top of the seal-time chunk purge).
+    ///
+    /// COST (honest): sqlite-vec `vec0` is BRUTE-FORCE (no ANN index), so each MATCH is O(k·n) over the
+    /// whole vec-table — NOT the "O(k·log n), no corpus scan" the earlier comment claimed. A larger `k`
+    /// is therefore nearly free (the scan is the same size regardless of k), which is what makes the
+    /// item-granular fan-out below cheap.
+    ///
+    /// ITEM-GRANULAR fan-out (brain-v3 audit Fix 1 — the crux): vec0 returns the top-`k` CHUNKS, not
+    /// items. An item's OWN chunks are the nearest to its own centroid, so a probe with a fixed chunk-`k`
+    /// (the old `k = SEMANTIC_LINK_K + 1`) is entirely consumed by ≥11-chunk items (every long
+    /// note/document — exactly what linking is for) and returns few or ZERO distinct NON-SELF items. Two
+    /// mitigations here: (a) the source item's OWN chunks are EXCLUDED inside each CTE (they can never
+    /// consume the k budget), and (b) the chunk-`k` is ESCALATED (doubled from a base) until at least
+    /// `want_items` distinct non-self items are collected OR `k` reaches the table's total row count
+    /// (exhaustion — nothing more to fetch). Deterministic: identical vectors → identical result set +
+    /// order regardless of the escalation path (the final GROUP BY + ORDER BY is over the union of hits).
     fn knn_items_visible(
         &self,
         centroid: &[f32],
-        k: i64,
+        want_items: i64,
         self_kind: crate::links::LinkKind,
         self_id: &str,
         unlocked: &HashSet<String>,
     ) -> Result<Vec<(crate::links::LinkKind, String, f32)>> {
-        if centroid.is_empty() || k <= 0 {
+        if centroid.is_empty() || want_items <= 0 {
             return Ok(Vec::new());
         }
         let conn = self.lock();
         let vis_note = visibility_clause("f", unlocked);
         let vis_doc = visibility_clause("f", unlocked);
+        // The source item's OWN chunk ids, per vec-table, so they never consume the vec0 k budget.
+        // A meeting's chunks live in `note_chunks` (→ vec_chunks); a note/document's in `doc_chunks`
+        // (→ doc_vec_chunks). The other table's exclusion clause is a no-op (empty set) for that kind.
+        let (self_note_pred, self_doc_pred) = match self_kind {
+            crate::links::LinkKind::Meeting => (
+                "AND kn.chunk_id NOT IN (SELECT id FROM note_chunks WHERE meeting_id = ?3)".to_string(),
+                String::new(),
+            ),
+            crate::links::LinkKind::Note | crate::links::LinkKind::Document => (
+                String::new(),
+                "AND kd.chunk_id NOT IN (SELECT id FROM doc_chunks WHERE document_id = ?3)".to_string(),
+            ),
+        };
         // Each vec0 table gets its own single-MATCH CTE (vec0 allows one MATCH+k per query); the
         // meeting leg maps chunk→meeting and gates on the meeting's note folder; the doc leg maps
-        // chunk→document and gates on the document's folder, tagging note vs document by kind.
+        // chunk→document and gates on the document's folder, tagging note vs document by kind. The
+        // self-chunk exclusion is applied AFTER the MATCH (vec0 wants a bare MATCH+k), so we fetch a
+        // few extra chunks and drop the source's own — hence the escalation below covers the shortfall.
         let sql = format!(
             "WITH knn_note(chunk_id, distance) AS (
                  SELECT chunk_id, distance FROM vec_chunks WHERE embedding MATCH ?1 AND k = ?2
@@ -10285,12 +10611,14 @@ impl Db {
                         LEFT JOIN folders f ON f.id = n.folder_id
                         WHERE n.meeting_id = m.id AND {vis_note}
                    )
+                   {self_note_pred}
                  UNION ALL
                  SELECT CASE WHEN d.kind = 'note' THEN 'note' ELSE 'document' END, d.id, kd.distance
                    FROM knn_doc kd JOIN doc_chunks dc ON dc.id = kd.chunk_id
                    JOIN documents d ON d.id = dc.document_id
                    JOIN folders f ON f.id = d.folder_id
                    WHERE {vis_doc}
+                   {self_doc_pred}
              ),
              best(kind, id, distance) AS (
                  SELECT kind, id, MIN(distance) FROM hits GROUP BY kind, id
@@ -10298,35 +10626,66 @@ impl Db {
              SELECT kind, id, distance FROM best ORDER BY distance ASC, kind ASC, id ASC"
         );
         let blob = crate::embed::vec_to_blob(centroid);
-        let mut stmt = conn.prepare(&sql).map_err(map_err)?;
-        let rows = stmt
-            .query_map(rusqlite::params![blob, k], |r| {
-                let kind: String = r.get(0)?;
-                let id: String = r.get(1)?;
-                let d: f64 = r.get(2)?;
-                Ok((kind, id, d as f32))
-            })
+        // The total vec-row count bounds the escalation: once k covers every stored chunk in both
+        // tables, a larger k yields nothing new (exhaustion), so we stop. Cheap single COUNT.
+        let total_rows: i64 = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM vec_chunks) + (SELECT COUNT(*) FROM doc_vec_chunks)",
+                [],
+                |r| r.get(0),
+            )
             .map_err(map_err)?;
-        let mut out: Vec<(crate::links::LinkKind, String, f32)> = Vec::new();
-        for r in rows {
-            let (kind_s, id, d) = r.map_err(map_err)?;
-            let Some(kind) = crate::links::LinkKind::parse(&kind_s) else {
-                continue;
-            };
-            if kind == self_kind && id == self_id {
-                continue; // drop self.
+        let mut stmt = conn.prepare(&sql).map_err(map_err)?;
+        // Escalate the chunk-k until we have `want_items` distinct non-self items OR k ≥ total rows.
+        // Base is a small multiple of the target so a first probe usually suffices; doubling bounds the
+        // number of re-scans to O(log(total_rows / want_items)).
+        let mut k = (want_items.saturating_mul(4)).max(16);
+        let out = loop {
+            let rows = stmt
+                .query_map(rusqlite::params![blob, k, self_id], |r| {
+                    let kind: String = r.get(0)?;
+                    let id: String = r.get(1)?;
+                    let d: f64 = r.get(2)?;
+                    Ok((kind, id, d as f32))
+                })
+                .map_err(map_err)?;
+            let mut items: Vec<(crate::links::LinkKind, String, f32)> = Vec::new();
+            for r in rows {
+                let (kind_s, id, d) = r.map_err(map_err)?;
+                let Some(kind) = crate::links::LinkKind::parse(&kind_s) else {
+                    continue;
+                };
+                if kind == self_kind && id == self_id {
+                    continue; // belt-and-braces: the CTE already excludes self chunks.
+                }
+                items.push((kind, id, crate::links::cosine_from_l2_distance(d)));
             }
-            out.push((kind, id, crate::links::cosine_from_l2_distance(d)));
-        }
+            // Enough distinct items, or we've scanned every stored chunk → done.
+            if (items.len() as i64) >= want_items || k >= total_rows {
+                break items;
+            }
+            k = k.saturating_mul(2);
+        };
         Ok(out)
     }
 
     /// SEMANTIC AUTO-LINKER (DESIGN §PR-3) — after a real-embedder index of ONE item, suggest up to
-    /// `SEMANTIC_LINK_CAP` content-similar neighbours. Deterministic; O(k·log n) per call (two vec0
-    /// probes: the source's kNN + one back-probe per candidate for mutuality — bounded by `k`, no
-    /// corpus scan). Steps: source centroid → kNN(k) → for each candidate compute MUTUALITY (source ∈
-    /// candidate's OWN kNN) → `crate::links::select_semantic_candidates` (floor/strong-or-mutual/cap)
-    /// → upsert each survivor as a canonicalized UNDIRECTED `semantic` `suggested` edge (score=cos).
+    /// `SEMANTIC_LINK_CAP` content-similar neighbours. Deterministic. Steps: source centroid →
+    /// item-granular kNN → for each candidate compute MUTUALITY (source ∈ candidate's OWN kNN) →
+    /// `crate::links::select_semantic_candidates` (floor/strong-or-mutual/cap) → upsert each survivor as
+    /// a canonicalized UNDIRECTED `semantic` `suggested` edge (score=cos).
+    ///
+    /// COST (honest — audit Fix 4): sqlite-vec `vec0` is BRUTE-FORCE, so this is NOT the "O(k·log n),
+    /// no corpus scan" the earlier comment claimed. One pass ≈ 1 forward probe + up to `SEMANTIC_LINK_K`
+    /// mutuality back-probes, EACH a full vec-table scan (`knn_items_visible` may itself re-scan a few
+    /// times while escalating its chunk-k to reach K distinct items). Bounded and fine for interactive
+    /// vault sizes, but linear in the corpus — not logarithmic.
+    ///
+    /// CENTROID SOURCE (audit Fix 7): an item's centroid is the mean of its NOTE-derived vectors only —
+    /// a MEETING reads `vec_chunks` (the AI NOTE's chunks), a note/document reads `doc_vec_chunks`. So
+    /// meeting↔meeting linking rides the AI note's WORDING, never the raw transcript segments (which are
+    /// never vectorized). This is intentional (the note is the curated summary) but means a link is only
+    /// as good as the note text, not the full spoken content.
     ///
     /// GATED end to end: `knn_items_visible` applies `visibility_clause` on every leg, so a sealed
     /// neighbour is never a candidate and never surfaces the source to a sealed item. Model-gated at
@@ -10343,18 +10702,18 @@ impl Db {
         let Some(centroid) = self.item_centroid(kind, id)? else {
             return Ok(0);
         };
-        // 2. Source kNN. Ask for k+1 (self is the nearest) then self is dropped inside.
-        let neighbours = self.knn_items_visible(&centroid, SEMANTIC_LINK_K + 1, kind, id, unlocked)?;
-        // 3. Mutuality: for each candidate, back-probe ITS kNN and check the source appears.
+        // 2. Source kNN — ask for SEMANTIC_LINK_K distinct NON-SELF ITEMS (self chunks are excluded
+        //    inside `knn_items_visible`, which escalates its chunk-k until it has that many items).
+        let neighbours = self.knn_items_visible(&centroid, SEMANTIC_LINK_K, kind, id, unlocked)?;
+        // 3. Mutuality: for each candidate, back-probe ITS kNN and check the source appears in the
+        //    candidate's OWN top-K distinct items. `knn_items_visible` already returns DISTINCT items,
+        //    so a candidate never repeats within this pass — no back-probe dedup cache is needed.
         let mut scored: Vec<SemanticCandidate> = Vec::new();
-        for (nk, nid, cos) in neighbours.into_iter().take(SEMANTIC_LINK_K as usize) {
+        for (nk, nid, cos) in neighbours.into_iter() {
             let mutual = match self.item_centroid(nk, &nid)? {
                 Some(nc) => {
-                    let back =
-                        self.knn_items_visible(&nc, SEMANTIC_LINK_K + 1, nk, &nid, unlocked)?;
-                    back.into_iter()
-                        .take(SEMANTIC_LINK_K as usize)
-                        .any(|(bk, bid, _)| bk == kind && bid == id)
+                    let back = self.knn_items_visible(&nc, SEMANTIC_LINK_K, nk, &nid, unlocked)?;
+                    back.into_iter().any(|(bk, bid, _)| bk == kind && bid == id)
                 }
                 None => false,
             };
@@ -10391,6 +10750,10 @@ impl Db {
                 "suggested",
                 now,
             )?;
+            // Enforce the per-node cap on the NEIGHBOUR endpoint too (audit Fix 2): a hub that this
+            // pass just suggested a 6th+ edge to has its weakest suggested-semantic edge trimmed.
+            Self::trim_node_semantic_suggestions_tx(&tx, dst.0.as_str(), &dst.1)?;
+            Self::trim_node_semantic_suggestions_tx(&tx, src.0.as_str(), &src.1)?;
             written += 1;
         }
         tx.commit().map_err(map_err)?;
@@ -20032,6 +20395,278 @@ mod tests {
             seen += 1;
         }
         assert_eq!(seen, crate::links::SEMANTIC_LINK_CAP);
+    }
+
+    /// Build a note markdown of `n` ~800-char paragraphs (blank-line separated) so `chunk_note` emits
+    /// `n` separate chunks — the shape that reproduces the ≥11-chunk STARVATION. Every paragraph of ONE
+    /// item is IDENTICAL (so the item's own chunks all sit exactly at its own centroid — distance 0 —
+    /// and are STRICTLY closer to it than any OTHER item's chunk). The `marker` word is per-item (it
+    /// separates the two items' clusters); the shared `common` phrase makes the cross-item cosine still
+    /// clear the FLOOR. On the OLD fixed chunk-`k` probe the item's own `n`>k distance-0 chunks fill the
+    /// entire top-K, so after GROUP BY + self-drop ZERO neighbours survive — the starvation this fixes.
+    fn many_chunk_body(marker: &str, common: &str, n: usize) -> String {
+        // One ~800-char paragraph: the shared phrase + a per-item marker, REPEATED across n paragraphs.
+        let para = format!("{common} {marker} ").repeat(13);
+        (0..n).map(|_| para.clone()).collect::<Vec<_>>().join("\n\n")
+    }
+
+    /// Fix 1 (RED before the item-granular kNN fan-out): an item with ≥11 chunks (a long note — the
+    /// exact case linking is FOR) must still surface its legitimate same-table neighbour. On the OLD
+    /// `k = SEMANTIC_LINK_K + 1` CHUNK probe, the source's own 12 chunks fill the top-11, so
+    /// `auto_link_semantic` returned ZERO candidates; the fan-out now over-fetches distinct NON-SELF
+    /// items (and excludes self chunks), so the neighbour is found and suggested.
+    #[test]
+    fn semantic_auto_linker_item_with_many_chunks_gets_neighbour() {
+        let db = mem_db();
+        let common = "quarterly revenue growth and the platform hiring plan roadmap budget";
+        // Two long meetings sharing `common` but with DISTINCT per-item markers, each 12 chunks. The
+        // source's own 12 distance-0 chunks would fill the OLD top-11 probe and starve out the
+        // neighbour; the fix over-fetches distinct non-self items so the neighbour survives.
+        let body_a = many_chunk_body("projectalpha", common, 12);
+        let body_b = many_chunk_body("projectbeta", common, 12);
+        for (id, body) in [("m-long-a", &body_a), ("m-long-b", &body_b)] {
+            db.insert_meeting(&sample_meeting(id, "2026-06-24T10:00:00Z")).unwrap();
+            note_for(&db, id, "claude_code", body);
+            db.index_meeting_chunks(id, &[], &crate::embed::StubEmbedder).unwrap();
+        }
+        // Sanity: the source really has ≥11 chunks (the condition the bug needs to bite).
+        assert!(
+            db.note_vec_count("m-long-a").unwrap() >= 11,
+            "test precondition: the source must have >=11 chunks to reproduce the starvation"
+        );
+
+        let unlocked = HashSet::new();
+        let written = db
+            .auto_link_semantic(crate::links::LinkKind::Meeting, "m-long-a", &unlocked)
+            .unwrap();
+        assert!(
+            written >= 1,
+            "a >=11-chunk item must still surface its same-table neighbour (starvation regression)"
+        );
+        // The suggested edge is incident on the actual neighbour m-long-b.
+        let edges = db
+            .links_for_visible(crate::links::LinkKind::Meeting, "m-long-a", &unlocked)
+            .unwrap();
+        assert!(
+            edges.iter().any(|e| e.other_id == "m-long-b" && e.edge_type == "semantic"),
+            "the legitimate neighbour must be a suggested semantic edge, not starved out"
+        );
+    }
+
+    /// Fix 2 (RED before the both-endpoint cap): a HUB node that receives suggestions from MANY other
+    /// items' passes must keep only the top-`SEMANTIC_LINK_CAP` by score — the source-side cap alone
+    /// left a hub with unbounded INBOUND suggestions. We seed `CAP + 3` suggested-semantic edges all
+    /// pointing at one hub with descending scores, then run the trim (as each upsert now does) and
+    /// assert only the top CAP survive, weakest dropped.
+    #[test]
+    fn semantic_suggestions_capped_per_node_on_both_endpoints() {
+        let db = mem_db();
+        let cap = crate::links::SEMANTIC_LINK_CAP;
+        let now = 1_700_000_000_000i64;
+        // Insert CAP+3 suggested-semantic edges other_i → hub, descending score.
+        {
+            let mut conn = db.lock();
+            let tx = conn.transaction().unwrap();
+            for i in 0..(cap + 3) {
+                let src = format!("m{i:02}");
+                // canonicalize so the pair order is stable (hub id "zhub" sorts last → src < dst).
+                let score = 0.99 - (i as f64) * 0.01;
+                Db::upsert_link_tx(
+                    &tx, "meeting", &src, "meeting", "zhub", "semantic", score, "auto", "suggested",
+                    now,
+                )
+                .unwrap();
+            }
+            // Now enforce the per-node cap on the hub (what auto_link_semantic does after each upsert).
+            Db::trim_node_semantic_suggestions_tx(&tx, "meeting", "zhub").unwrap();
+            tx.commit().unwrap();
+        }
+        // Only CAP suggested-semantic edges remain incident on the hub.
+        assert_eq!(
+            db.link_edge_count("meeting", "zhub", "semantic") as usize,
+            cap,
+            "a hub must keep only the top-CAP suggested-semantic edges (both-endpoint cap)"
+        );
+        // The survivors are the HIGHEST scores (weakest dropped): the last-inserted (lowest-score)
+        // src m{cap+2} must be gone; the first (highest) m00 must remain.
+        let survivors: Vec<String> = {
+            let conn = db.lock();
+            let mut stmt = conn
+                .prepare("SELECT src_id FROM links WHERE dst_id='zhub' AND edge_type='semantic'")
+                .unwrap();
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+            rows.map(|r| r.unwrap()).collect()
+        };
+        assert!(survivors.contains(&"m00".to_string()), "highest-score edge kept");
+        assert!(
+            !survivors.contains(&format!("m{:02}", cap + 2)),
+            "lowest-score edge trimmed"
+        );
+    }
+
+    /// Fix 2 guard: the per-node trim NEVER touches an active/accepted/manual/wikilink edge — only
+    /// `status='suggested' AND edge_type='semantic'` rows are eligible. A hub with many ACTIVE edges
+    /// plus a few suggestions keeps every active edge and only its suggestions are capped.
+    #[test]
+    fn per_node_trim_never_touches_active_or_non_semantic() {
+        let db = mem_db();
+        let now = 1_700_000_000_000i64;
+        {
+            let mut conn = db.lock();
+            let tx = conn.transaction().unwrap();
+            // 8 ACTIVE manual edges into the hub (never suggestions).
+            for i in 0..8 {
+                Db::upsert_link_tx(
+                    &tx, "note", &format!("a{i:02}"), "meeting", "zhub", "manual", 1.0, "user",
+                    "active", now,
+                )
+                .unwrap();
+            }
+            // Plus CAP+2 suggested-semantic edges.
+            for i in 0..(crate::links::SEMANTIC_LINK_CAP + 2) {
+                Db::upsert_link_tx(
+                    &tx, "meeting", &format!("s{i:02}"), "meeting", "zhub", "semantic",
+                    0.9 - (i as f64) * 0.01, "auto", "suggested", now,
+                )
+                .unwrap();
+            }
+            Db::trim_node_semantic_suggestions_tx(&tx, "meeting", "zhub").unwrap();
+            tx.commit().unwrap();
+        }
+        assert_eq!(
+            db.link_edge_count("meeting", "zhub", "manual"),
+            8,
+            "active manual edges must NEVER be trimmed by the semantic-suggestion cap"
+        );
+        assert_eq!(
+            db.link_edge_count("meeting", "zhub", "semantic") as usize,
+            crate::links::SEMANTIC_LINK_CAP,
+            "only the suggested-semantic edges are capped"
+        );
+    }
+
+    /// Fix 3 (RED before the indexed backlink fast path): a wikilink backlink present as a `links`
+    /// ROW is returned even when the SOURCE BODY no longer literally contains `[[Title]]` (the target
+    /// was renamed, so the body's stale old title would fail the regex scan). The old body-scan-only
+    /// path missed it; the fast path serves it from the id-keyed `links` row.
+    #[test]
+    fn backlinks_served_from_links_index_without_body_scan() {
+        let db = mem_db();
+        seed_folder(&db, "f1", "Notes");
+        seed_note_doc(&db, "target", "f1", "Target", "the target body");
+        // Source body links [[Target]] → index it (stores the RESOLVED target id in `links`).
+        db.insert_note("source", "f1", "Source", "Source", "see [[Target]] for context", 1)
+            .unwrap();
+        let unlocked = HashSet::new();
+        db.index_wikilinks_for_source(
+            crate::links::LinkKind::Note,
+            "source",
+            "see [[Target]] for context",
+            &unlocked,
+        )
+        .unwrap();
+        // Now RENAME the target AND rewrite the source body so it no longer contains any [[Target]]
+        // OR [[Renamed]] string — only the id-keyed `links` row still connects them. The body-scan
+        // legs (which match the CURRENT target title against the body) can NOT find this backlink.
+        db.lock()
+            .execute("UPDATE documents SET title='Renamed' WHERE id='target'", [])
+            .unwrap();
+        db.lock()
+            .execute("UPDATE documents SET text='no literal wikilink here anymore' WHERE id='source'", [])
+            .unwrap();
+
+        let back = db
+            .backlinks_for_visible(SourceKind::Note, "target", &unlocked)
+            .unwrap();
+        assert!(
+            back.iter().any(|b| b.id == "source"),
+            "a backlink present as a links row must be served from the index even when the body no longer matches"
+        );
+    }
+
+    /// Fix 3 gating: the indexed fast path STILL fails closed on a sealed endpoint — a backlink whose
+    /// SOURCE is sealed-not-unlocked is hidden, and a sealed TARGET yields an empty list (no existence
+    /// leak) exactly as the body-scan path did.
+    #[test]
+    fn backlinks_index_fast_path_stays_visibility_gated() {
+        let db = mem_db();
+        seed_folder(&db, "f-open", "Open");
+        seed_folder(&db, "f-secret", "Secret");
+        seed_note_doc(&db, "target", "f-open", "Target", "the target body");
+        db.insert_note("secret-src", "f-secret", "Secret Src", "Secret Src", "see [[Target]]", 1)
+            .unwrap();
+        let unlocked = HashSet::new();
+        db.index_wikilinks_for_source(
+            crate::links::LinkKind::Note,
+            "secret-src",
+            "see [[Target]]",
+            &unlocked,
+        )
+        .unwrap();
+        // With everything open, the backlink is served (from the index).
+        assert!(
+            db.backlinks_for_visible(SourceKind::Note, "target", &unlocked)
+                .unwrap()
+                .iter()
+                .any(|b| b.id == "secret-src"),
+            "open backlink is served"
+        );
+        // Seal the SOURCE folder → the index fast path drops it (source gate).
+        db.set_folder_locked("f-secret", true, None).unwrap();
+        assert!(
+            db.backlinks_for_visible(SourceKind::Note, "target", &unlocked)
+                .unwrap()
+                .iter()
+                .all(|b| b.id != "secret-src"),
+            "a sealed-source backlink must never leak through the indexed fast path"
+        );
+        // Seal the TARGET folder → an empty list (no existence leak), still gated at Gate 1.
+        db.set_folder_locked("f-open", true, None).unwrap();
+        assert!(
+            db.backlinks_for_visible(SourceKind::Note, "target", &unlocked)
+                .unwrap()
+                .is_empty(),
+            "a sealed target reveals nothing (Gate 1) even with the fast path"
+        );
+    }
+
+    /// Fix 6 (RED before case-insensitive wikilink resolution): Obsidian resolves `[[links]]`
+    /// case-insensitively — `[[project x]]` must resolve to a note titled "Project X". The old
+    /// byte-exact match returned `None`.
+    #[test]
+    fn resolve_wikilink_is_case_insensitive() {
+        let db = mem_db();
+        seed_folder(&db, "f1", "Notes");
+        seed_note_doc(&db, "px", "f1", "Project X", "the project x body");
+        let unlocked = HashSet::new();
+        // Lowercased link text resolves to the mixed-case title.
+        let target = db.resolve_wikilink("project x", &unlocked).unwrap();
+        assert!(target.is_some(), "[[project x]] must resolve to the 'Project X' note");
+        let t = target.unwrap();
+        assert_eq!(t.kind, "note");
+        assert_eq!(t.id, "px");
+        // An EXACT match still wins/works unchanged.
+        assert_eq!(
+            db.resolve_wikilink("Project X", &unlocked).unwrap().map(|t| t.id),
+            Some("px".to_string())
+        );
+    }
+
+    /// Fix 6 meeting leg: a lowercased `[[meeting title]]` resolves the meeting when no note matches.
+    #[test]
+    fn resolve_wikilink_case_insensitive_meeting_leg() {
+        let db = mem_db();
+        let mut m = sample_meeting("mm1", "2026-06-24T10:00:00Z");
+        m.title = Some("Weekly Standup".to_string());
+        db.insert_meeting(&m).unwrap();
+        note_for(&db, "mm1", "claude_code", "notes");
+        let unlocked = HashSet::new();
+        let target = db.resolve_wikilink("weekly standup", &unlocked).unwrap();
+        assert_eq!(
+            target.map(|t| (t.kind, t.id)),
+            Some(("meeting".to_string(), "mm1".to_string())),
+            "[[weekly standup]] must resolve the 'Weekly Standup' meeting case-insensitively"
+        );
     }
 
     // ── note↔meeting-links PR-1 — MANUAL edge (DB layer) ─────────────────────────────────────────
