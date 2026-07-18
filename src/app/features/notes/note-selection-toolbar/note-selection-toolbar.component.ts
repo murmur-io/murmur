@@ -12,6 +12,7 @@ import {
 } from "@angular/core";
 import type { PopoverSelection } from "../note-brain-popover/note-brain-popover.component";
 import { RepositionOnScrollDirective } from "../note-brain-popover/reposition-on-scroll.directive";
+import { TeleportToBodyDirective } from "../../../design-system/teleport-to-body.directive";
 import type { FormatOp } from "../note-editor/note-editor.component";
 
 /** Viewport gap kept between the bubble and the selection rect. */
@@ -41,7 +42,7 @@ const BAR_WIDTH = 480;
 @Component({
   selector: "app-note-selection-toolbar",
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [RepositionOnScrollDirective],
+  imports: [RepositionOnScrollDirective, TeleportToBodyDirective],
   templateUrl: "./note-selection-toolbar.component.html",
   styleUrl: "./note-selection-toolbar.component.scss",
 })

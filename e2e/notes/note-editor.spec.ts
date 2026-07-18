@@ -36,7 +36,7 @@ test("note editor loads a note, floats the formatting bubble on selection, and P
     el.setSelectionRange(start, start + "body text".length);
     el.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
   });
-  const bubble = page.locator("app-note-selection-toolbar");
+  const bubble = page.locator(".sel-bar");
   await expect(bubble).toBeVisible();
   // The button label is its text ("H1"); the descriptive "Heading 1" is its title.
   await expect(bubble.getByRole("button", { name: "H1", exact: true })).toBeVisible();
