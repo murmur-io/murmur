@@ -1774,7 +1774,7 @@ pub(crate) fn update_note_inner_with(
 ) -> Result<NoteDto, AppError> {
     // BLK-1 / TOCTOU (2026-07-10 audit F4): hold the lifecycle guard across gate+write so a
     // concurrent relock/seal cannot land between the unlock check and the upsert.
-    let _lifecycle = lifecycle_guard(state);
+    let lifecycle = lifecycle_guard(state);
     // D4 READ/WRITE-GATE: refuse to mutate a sealed-and-not-session-unlocked meeting's note. Its
     // plaintext markdown is blanked while sealed, so an edit here would overwrite the (sealed)
     // content with the blanked value and corrupt it. Fail closed.
@@ -1809,6 +1809,15 @@ pub(crate) fn update_note_inner_with(
     if let Some(path) = existing.exported_path.as_deref() {
         overwrite_exported_note_guarded(state, meeting_id, &existing.provider_id, path, markdown)?;
     }
+
+    // PERF (brain-v3 audit fix 2): release the GLOBAL lifecycle guard BEFORE the heavy leg — the
+    // re-embed is multi-second Candle/Metal work on a long meeting, and holding the guard across
+    // it delays screen-share auto-relock (`relock_all_inner`) and every lock/unlock op. Race-safe
+    // without it: the indexers re-check the sealed-at-rest invariant INSIDE their write tx (a
+    // mid-flight seal makes the write a refused no-op), and `rename_meeting_inner` already runs
+    // the identical re-index with no guard. The fast leg above (gate + seal-on-write upsert +
+    // guarded vault overwrite) stays under the guard.
+    drop(lifecycle);
 
     // Brain v3 (audit gap #1): re-derive the meeting's chunks/vectors from the FRESH markdown so
     // deleted text stops surfacing in semantic search/snippets. Best-effort + empty-unlock-set
@@ -3515,7 +3524,20 @@ pub async fn update_note_doc(
     title: String,
     markdown: String,
 ) -> Result<NoteDoc, AppError> {
-    let doc = update_note_doc_inner(state.inner(), &id, &title, &markdown)?;
+    // PERF (brain-v3 audit H3): the inner runs Candle/Metal embedding + the semantic-link pass —
+    // route the whole synchronous body through the shared heavy-inference gate on the blocking
+    // pool, exactly like the meeting twin `update_note` (PR-1 #362). Re-fetch `AppState` inside
+    // the closure via `app.state()` — a bare `&AppState` cannot be captured by a `'static` closure.
+    let heavy_inference = state.heavy_inference.clone();
+    let app_for_edit = app.clone();
+    let id_for_edit = id.clone();
+    let title_for_edit = title.clone();
+    let markdown_for_edit = markdown.clone();
+    let doc = crate::perf::run_heavy(&heavy_inference, move || -> Result<NoteDoc, AppError> {
+        let state = app_for_edit.state::<AppState>();
+        update_note_doc_inner(&state, &id_for_edit, &title_for_edit, &markdown_for_edit)
+    })
+    .await?;
     // See `update_note`: ping open org views when the edit re-published ≥1 org copy. Best-effort.
     if republish_org_shares_for_source(state.inner(), None, Some(&id))
         .await
@@ -3527,16 +3549,31 @@ pub async fn update_note_doc(
     Ok(doc)
 }
 
-/// Inner of [`update_note_doc`] taking `&AppState` (unit-testable gate).
+/// Inner of [`update_note_doc`] taking `&AppState` (unit-testable gate). Resolves the model-gated
+/// embedder and delegates to [`update_note_doc_inner_with`] (embedder injected for deterministic
+/// tests — the [`update_note_inner`] precedent).
 pub(crate) fn update_note_doc_inner(
     state: &AppState,
     id: &str,
     title: &str,
     markdown: &str,
 ) -> Result<NoteDoc, AppError> {
+    let embedder = crate::embed::embed_model_present().then(crate::embed::active_embedder);
+    update_note_doc_inner_with(state, id, title, markdown, embedder.as_deref())
+}
+
+/// Core of [`update_note_doc_inner`] with the re-index embedder INJECTED (`None` = model absent →
+/// chunk-only re-index, FTS still covers keyword retrieval; `Some` = fresh vectors too).
+pub(crate) fn update_note_doc_inner_with(
+    state: &AppState,
+    id: &str,
+    title: &str,
+    markdown: &str,
+    embedder: Option<&dyn crate::embed::Embedder>,
+) -> Result<NoteDoc, AppError> {
     // BLK-1 / TOCTOU (2026-07-10 audit F4): hold the lifecycle guard across gate+write so a
     // concurrent relock/seal cannot land between the unlock check and the row write.
-    let _lifecycle = lifecycle_guard(state);
+    let lifecycle = lifecycle_guard(state);
     let Some(row) = state.db.get_note_row(id)? else {
         return Err(AppError::InvalidArg(format!("no note {id}")));
     };
@@ -3555,13 +3592,30 @@ pub(crate) fn update_note_doc_inner(
     // missing session KEK.
     reseal_document_if_locked(state, &row.folder_id, id, title, markdown, now)?;
 
+    // Re-export the vault `.md` (best-effort). A sealed folder has no export (gated above), so this
+    // only runs for a visible note.
+    if let Err(e) = export_note_to_vault(state, id) {
+        tracing::warn!(target: "notes", error = %e, "note vault re-export failed (text saved)");
+    }
+    // Read the fresh DTO while still guarded (the row cannot be resealed under us); the heavy leg
+    // below never mutates the note row, so the DTO stays accurate.
+    let doc = get_note_inner(state, id)?;
+
+    // PERF (brain-v3 audit H3, the `update_note_inner_with` twin): release the GLOBAL lifecycle
+    // guard BEFORE the heavy leg — the note-body re-embed + semantic-link pass is multi-second
+    // Candle/Metal work on a long note, and holding the guard across it delays screen-share
+    // auto-relock and every lock/unlock op. Race-safe without it: `index_note_chunks` re-checks
+    // the sealed-at-rest invariant (`doc_sealed_at_rest_tx`) INSIDE its write tx, so a mid-flight
+    // seal makes the write a refused no-op. The fast leg above (gate + seal-on-write + vault
+    // export + DTO read) stays under the guard.
+    drop(lifecycle);
+
     // WP3 — the note is a first-class brain source: purge the old chunks and re-index the new BODY
     // (front-matter stripped inside `index_note_body_chunks`). Chunks + FTS come back
     // unconditionally (keyword works model-less); vectors ONLY when the REAL e5 model is present
     // (never stub vectors; mirrors `ingest_into_folder`/`should_auto_index`). Best-effort: a failure
     // logs (no PII) and does NOT fail the update — the plaintext is durable.
-    let embedder = crate::embed::embed_model_present().then(crate::embed::active_embedder);
-    if let Err(e) = index_note_body_chunks(state, id, title, markdown, embedder.as_deref()) {
+    if let Err(e) = index_note_body_chunks(state, id, title, markdown, embedder) {
         tracing::warn!(target: "rag", error = %e, "note re-index on update failed (text saved)");
     }
 
@@ -3571,14 +3625,8 @@ pub(crate) fn update_note_doc_inner(
     index_wikilinks_best_effort(state, crate::links::LinkKind::Note, id, markdown);
     auto_link_semantic_best_effort(state, crate::links::LinkKind::Note, id);
 
-    // Re-export the vault `.md` (best-effort). A sealed folder has no export (gated above), so this
-    // only runs for a visible note.
-    if let Err(e) = export_note_to_vault(state, id) {
-        tracing::warn!(target: "notes", error = %e, "note vault re-export failed (text saved)");
-    }
-
     tracing::info!(target: "notes", note_id = %id, "note updated + re-indexed");
-    get_note_inner(state, id)
+    Ok(doc)
 }
 
 /// FAST autosave path — persist the note's title + markdown + `updated_at` ONLY. NO re-chunk, NO
@@ -12950,7 +12998,7 @@ pub(crate) fn reindex_embeddings_inner<F: FnMut(usize, usize)>(
     // never a purge-then-reinsert of an already-chunked document, which would DESTROY its existing
     // real vectors without replacing them. The shared leg is kind-ROUTED (Brain v3 audit gap #3):
     // authored notes re-chunk through the front-matter-stripping path, never raw `documents.text`.
-    let docs_indexed = backfill_document_chunks(db, unlocked, model_present, embedder, true)?;
+    let docs_indexed = backfill_document_chunks(db, unlocked, model_present, embedder, true, None)?;
     if docs_indexed > 0 {
         tracing::info!(target: "rag", docs_indexed, "reindex: document chunks backfilled");
     }
@@ -13054,16 +13102,33 @@ pub(crate) fn index_document_row_kind_routed(
 /// GATING (lock-model): the corpus is exactly `visible_document_ids(unlocked)` — a
 /// sealed-and-not-in-`unlocked` folder's documents are never returned, so their (blank) plaintext
 /// is never chunked and their index rows STAY purged.
+///
+/// `repair_budget` scopes the repair tick's per-run resource envelope to THAT caller (the
+/// per-call-bounds discipline): `Some` ⇒ the tick's posture — spend one budget slot (and pace by
+/// [`REPAIR_TICK_PACING_MS`]) per REAL index op, stop at zero, and never count/spend a ZERO-YIELD
+/// row (its needs-probe is unchanged, so it would re-burn the cap every launch); `None` ⇒ the
+/// user-triggered reindex, unbounded and counted exactly as before.
 fn backfill_document_chunks(
     db: &crate::storage::Db,
     unlocked: &std::collections::HashSet<String>,
     model_present: bool,
     embedder: &dyn crate::embed::Embedder,
     force_reembed: bool,
+    mut repair_budget: Option<&mut usize>,
 ) -> Result<usize, AppError> {
     let doc_embedder = model_present.then_some(embedder);
     let mut docs_indexed = 0usize;
     for did in db.visible_document_ids(unlocked)? {
+        if let Some(budget) = repair_budget.as_deref_mut() {
+            if *budget == 0 {
+                tracing::info!(
+                    target: "rag",
+                    docs_indexed,
+                    "doc backfill: per-run repair cap reached; remainder deferred to the next launch"
+                );
+                break;
+            }
+        }
         let should_index = if force_reembed {
             model_present || !db.document_has_chunks(&did)?
         } else {
@@ -13089,7 +13154,21 @@ fn backfill_document_chunks(
             continue;
         }
         match index_document_row_kind_routed(db, &did, doc_embedder) {
-            Ok(()) => docs_indexed += 1,
+            Ok(()) => match repair_budget.as_deref_mut() {
+                Some(budget) => {
+                    // Fix 3c — spend the budget ONLY on a row whose index pass actually produced
+                    // rows: re-run the needs-probe and treat "still missing" as zero-yield.
+                    let (chunks, vectors) = db.doc_chunk_vector_counts(&did)?;
+                    let still_missing = chunks == 0 || (model_present && vectors == 0);
+                    if !still_missing {
+                        docs_indexed += 1;
+                        *budget -= 1;
+                        // Pacing between REAL index ops (the topic backfill's posture).
+                        std::thread::sleep(std::time::Duration::from_millis(REPAIR_TICK_PACING_MS));
+                    }
+                }
+                None => docs_indexed += 1,
+            },
             Err(e) => {
                 // Never abort the whole backfill on one bad document — log (no PII) and continue.
                 tracing::warn!(target: "rag", error = %e, "doc backfill: indexing one document failed (skipped)");
@@ -13118,21 +13197,75 @@ fn backfill_document_chunks(
 ///
 /// Idempotent: a re-run finds full coverage and touches nothing (returns `(0, 0)`). Logs counts
 /// only — no PII.
+///
+/// CAPPED at [`REPAIR_TICK_MAX_INDEX_PER_RUN`] REAL index operations per run with a
+/// [`REPAIR_TICK_PACING_MS`] pacing sleep between them — the exact
+/// [`Db::backfill_topic_chunks_idempotent`] launch-freeze posture (2026-07-13): a vault with
+/// hundreds of missing rows must never re-embed everything in ONE unthrottled launch pass. The
+/// needs-probe is the cursor — a capped run just defers the remainder to the next launch. A
+/// ZERO-YIELD row (one whose index pass produces no chunks/vectors — e.g. an empty-bodied note)
+/// is never counted as work and never spends the cap, otherwise permanently-empty rows would
+/// re-burn the cap on every launch and starve the real tail.
 pub(crate) fn backfill_missing_brain_indexes(
     db: &crate::storage::Db,
     semantic_enabled: bool,
     model_present: bool,
     embedder: &dyn crate::embed::Embedder,
 ) -> Result<(usize, usize), AppError> {
+    backfill_missing_brain_indexes_capped(
+        db,
+        semantic_enabled,
+        model_present,
+        embedder,
+        REPAIR_TICK_MAX_INDEX_PER_RUN,
+    )
+}
+
+/// Max REAL index operations (rows that actually produced chunks/vectors) per repair-tick run —
+/// mirrors `TOPIC_BACKFILL_MAX_REEMBED_PER_RUN` in [`Db::backfill_topic_chunks_idempotent`].
+const REPAIR_TICK_MAX_INDEX_PER_RUN: usize = 50;
+
+/// Pacing sleep between REAL repair-tick index operations — breathing room for the shared DB
+/// connection + the Metal queue, mirroring the topic backfill's per-embed pause.
+const REPAIR_TICK_PACING_MS: u64 = 50;
+
+/// [`backfill_missing_brain_indexes`] with the per-run cap INJECTED (the test seam — production
+/// always passes [`REPAIR_TICK_MAX_INDEX_PER_RUN`]).
+pub(crate) fn backfill_missing_brain_indexes_capped(
+    db: &crate::storage::Db,
+    semantic_enabled: bool,
+    model_present: bool,
+    embedder: &dyn crate::embed::Embedder,
+    max_real_index_ops: usize,
+) -> Result<(usize, usize), AppError> {
     let empty = std::collections::HashSet::new();
+    // ONE budget across both halves — a launch tick is one resource envelope, however the missing
+    // rows are split between documents and meetings.
+    let mut remaining = max_real_index_ops;
 
     // DOC half — needs-only (never the reindex command's wholesale re-embed).
-    let docs = backfill_document_chunks(db, &empty, model_present, embedder, false)?;
+    let docs = backfill_document_chunks(
+        db,
+        &empty,
+        model_present,
+        embedder,
+        false,
+        Some(&mut remaining),
+    )?;
 
     // MEETING half — flag + model gated (see the gating matrix above).
     let mut meetings = 0usize;
     if semantic_enabled && model_present {
         for m in db.list_meetings_visible(100_000, &empty)? {
+            if remaining == 0 {
+                tracing::info!(
+                    target: "rag",
+                    meetings,
+                    docs,
+                    "repair tick: per-run cap reached; remainder deferred to the next launch"
+                );
+                break;
+            }
             // Defense-in-depth (the reindex idiom): only a meeting whose latest note is visible
             // under the SAME empty set is considered — and "has a note" is the tick's precondition.
             match db.get_note_if_visible(&m.id, &empty) {
@@ -13159,13 +13292,33 @@ pub(crate) fn backfill_missing_brain_indexes(
                     if let Err(e) = db.index_meeting_chunks(&m.id, &segments, embedder) {
                         tracing::warn!(target: "rag", error = %e, "repair tick: indexing one meeting failed (skipped)");
                     } else {
-                        meetings += 1;
-                        // Topic chunks follow the note/transcript index (the reindex idiom) —
-                        // under the SAME empty unlock set (sealed context never persists).
-                        if let Err(e) =
-                            db.index_meeting_topic_chunks(&m.id, &segments, embedder, &empty)
-                        {
-                            tracing::warn!(target: "rag", error = %e, "repair tick: topic indexing failed (skipped)");
+                        // Fix 3c — count + spend the cap ONLY when the pass actually produced
+                        // rows. A zero-yield meeting (empty note body AND no segments → no
+                        // chunks) stays "missing" forever; counting it would re-burn the cap on
+                        // every launch. Zero-yield ⇒ the segments were empty, so the topic
+                        // indexer (segment-derived) is skipped as the no-op it would be.
+                        match db.meeting_chunk_vector_counts(&m.id) {
+                            Ok((chunks, vectors)) if chunks > 0 && vectors > 0 => {
+                                meetings += 1;
+                                remaining -= 1;
+                                // Topic chunks follow the note/transcript index (the reindex
+                                // idiom) — under the SAME empty unlock set (sealed context
+                                // never persists).
+                                if let Err(e) = db.index_meeting_topic_chunks(
+                                    &m.id, &segments, embedder, &empty,
+                                ) {
+                                    tracing::warn!(target: "rag", error = %e, "repair tick: topic indexing failed (skipped)");
+                                }
+                                // Pacing between REAL index ops (the topic backfill's posture) —
+                                // idempotent no-ops stay unpaced.
+                                std::thread::sleep(std::time::Duration::from_millis(
+                                    REPAIR_TICK_PACING_MS,
+                                ));
+                            }
+                            Ok(_) => {} // zero-yield: not work, no cap spend, no pacing.
+                            Err(e) => {
+                                tracing::warn!(target: "rag", error = %e, "repair tick: yield probe failed (skipped)");
+                            }
                         }
                     }
                 }
@@ -25905,6 +26058,158 @@ mod lifecycle_tests {
         );
     }
 
+    /// Test-only `Embedder` recording the SIZE of every `embed()` call (the db.rs sub-batch test
+    /// precedent) — proves a save path sub-batches its embeds instead of one item-sized call.
+    struct RecordingEmbedder {
+        call_sizes: std::sync::Mutex<Vec<usize>>,
+    }
+
+    impl crate::embed::Embedder for RecordingEmbedder {
+        fn dim(&self) -> usize {
+            crate::embed::EMBED_DIM
+        }
+        fn embed(&self, texts: &[String]) -> crate::error::Result<Vec<Vec<f32>>> {
+            self.call_sizes.lock().unwrap().push(texts.len());
+            Ok(texts
+                .iter()
+                .map(|_| vec![0.0f32; crate::embed::EMBED_DIM])
+                .collect())
+        }
+    }
+
+    /// Test-only `Embedder` that probes, from INSIDE each embed call, whether the GLOBAL
+    /// [`AppState::lifecycle`] mutex is currently held (a same-thread `try_lock` on a held
+    /// `std::sync::Mutex` returns `WouldBlock`). Proves the multi-second embed leg runs with the
+    /// lifecycle guard RELEASED — holding it there delays screen-share auto-relock and every
+    /// lock/unlock op.
+    struct GuardProbeEmbedder<'a> {
+        state: &'a AppState,
+        calls: std::sync::atomic::AtomicUsize,
+        saw_guard_held: std::sync::atomic::AtomicBool,
+    }
+
+    impl crate::embed::Embedder for GuardProbeEmbedder<'_> {
+        fn dim(&self) -> usize {
+            crate::embed::EMBED_DIM
+        }
+        fn embed(&self, texts: &[String]) -> crate::error::Result<Vec<Vec<f32>>> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            match self.state.lifecycle.try_lock() {
+                Ok(free) => drop(free),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    self.saw_guard_held
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                Err(std::sync::TryLockError::Poisoned(p)) => drop(p.into_inner()),
+            }
+            Ok(texts
+                .iter()
+                .map(|_| vec![0.0f32; crate::embed::EMBED_DIM])
+                .collect())
+        }
+    }
+
+    /// Brain v3 perf audit H3 (RED-before-GREEN): the authored-note save (`update_note_doc`)
+    /// embedded a long note's chunks in ONE Candle/Metal call sized to the whole note — the exact
+    /// unbounded-tensor class the 2026-07-13 launch-freeze fix closed for topic/transcript/document
+    /// chunks (`embed_in_sub_batches`); the note indexer was the one remaining miss. Pre-fix the
+    /// recorder saw a single 10-sized call: RED.
+    #[test]
+    fn update_note_doc_embeds_long_note_in_small_sub_batches() {
+        let state = build_state("note-doc-sub-batch");
+        make_open_folder(&state.db, "f-notes", "Notes");
+        // 10 paragraphs of ~690 chars: each fills its own ~800-char chunk → 10 chunks, more than
+        // one 8-sized sub-batch.
+        let body: String = (0..10)
+            .map(|i| format!("paragraph {i} {}", "x".repeat(680)))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        state
+            .db
+            .insert_note("n-long", "f-notes", "long", "Long", &body, 1)
+            .unwrap();
+        let expected = crate::embed::chunk_note("Long", "", &body).len();
+        assert!(
+            expected > 8,
+            "fixture sanity: the body must exceed one sub-batch, got {expected} chunks"
+        );
+
+        let rec = RecordingEmbedder {
+            call_sizes: std::sync::Mutex::new(Vec::new()),
+        };
+        update_note_doc_inner_with(&state, "n-long", "Long", &body, Some(&rec)).unwrap();
+
+        let calls = rec.call_sizes.into_inner().unwrap();
+        assert!(!calls.is_empty(), "the injected embedder must actually be exercised");
+        assert!(
+            calls.iter().all(|&n| n <= 8),
+            "no single embed call on the note-save path may exceed the sub-batch size (8): {calls:?}"
+        );
+        assert_eq!(
+            calls.iter().sum::<usize>(),
+            expected,
+            "every chunk is embedded exactly once across the sub-batches"
+        );
+    }
+
+    /// Brain v3 perf audit fix 2 (RED-before-GREEN): the meeting-note edit held the GLOBAL
+    /// lifecycle mutex across the multi-second Candle/Metal re-embed, delaying screen-share
+    /// auto-relock (`relock_all_inner`) and every lock/unlock op behind a long meeting's re-index.
+    /// The in-tx sealed-at-rest re-check inside the indexers is what makes the embed race-safe
+    /// (`rename_meeting_inner` runs the identical re-index with NO guard), so the guard must be
+    /// RELEASED before the heavy leg. Pre-fix the probe observed the guard held: RED.
+    #[test]
+    fn update_note_edit_releases_lifecycle_guard_before_the_embed_leg() {
+        let state = build_state("edit-guard-release");
+        make_open_folder(&state.db, "f-edit", "Team");
+        seed_meeting(&state.db, "m1", "# Plan\n\noriginal body", Some("f-edit"));
+        let probe = GuardProbeEmbedder {
+            state: &state,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            saw_guard_held: std::sync::atomic::AtomicBool::new(false),
+        };
+        update_note_inner_with(&state, "m1", "# Plan\n\nedited body", Some(&probe)).unwrap();
+        assert!(
+            probe.calls.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "the re-index must actually run (the probe is exercised)"
+        );
+        assert!(
+            !probe.saw_guard_held.load(std::sync::atomic::Ordering::SeqCst),
+            "the lifecycle guard must be RELEASED before the embed leg — holding it delays \
+             auto-relock and every lock/unlock op"
+        );
+    }
+
+    /// The authored-note twin of the guard-release test above: `update_note_doc` held the same
+    /// global lifecycle mutex across its note-body re-embed + link pass. Same race-safety argument
+    /// (the `doc_sealed_at_rest_tx` in-tx re-check refuses a mid-flight seal), same fix: the fast
+    /// leg (gate + seal-on-write + vault export) stays guarded, the heavy leg runs released.
+    #[test]
+    fn update_note_doc_releases_lifecycle_guard_before_the_embed_leg() {
+        let state = build_state("note-doc-guard-release");
+        make_open_folder(&state.db, "f-notes", "Notes");
+        state
+            .db
+            .insert_note("n1", "f-notes", "plan", "Plan", "quarterly plan body", 1)
+            .unwrap();
+        let probe = GuardProbeEmbedder {
+            state: &state,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            saw_guard_held: std::sync::atomic::AtomicBool::new(false),
+        };
+        update_note_doc_inner_with(&state, "n1", "Plan", "quarterly plan body", Some(&probe))
+            .unwrap();
+        assert!(
+            probe.calls.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "the note re-index must actually run (the probe is exercised)"
+        );
+        assert!(
+            !probe.saw_guard_held.load(std::sync::atomic::Ordering::SeqCst),
+            "the lifecycle guard must be RELEASED before the note-body embed leg"
+        );
+    }
+
     /// Brain v3 audit gap #4 (RED-before-GREEN): a RENAME left the OLD title baked into every
     /// chunk's header/augmented text/vector until a manual full reindex (`chunk_note` embeds
     /// `<title> · <date>` into each chunk). Pre-fix `rename_meeting` only set the title + synced the
@@ -26113,13 +26418,23 @@ mod lifecycle_tests {
                 1,
             )
             .unwrap();
+        // Fix 3c: a permanently-EMPTY note (zero chunks forever) rides along — it must never be
+        // counted as backfilled work in ANY pass (pre-fix it re-counted on every run, so the
+        // pass-1/2 doc counts read 3 and the tick never became a reported no-op: RED).
+        state
+            .db
+            .insert_note("n-empty", "f-open", "empty", "Empty", "", 1)
+            .unwrap();
 
         // PASS 1 — MODEL ABSENT.
         let (meetings, docs) =
             backfill_missing_brain_indexes(&state.db, true, false, &crate::embed::StubEmbedder)
                 .unwrap();
         assert_eq!(meetings, 0, "model absent: no meeting indexing (no stub vectors)");
-        assert_eq!(docs, 2, "model absent: both documents chunk-only backfilled");
+        assert_eq!(
+            docs, 2,
+            "model absent: both non-empty documents chunk-only backfilled (the empty row is zero-yield, never counted)"
+        );
         let (d_chunks, d_vecs) = state.db.doc_chunk_vector_counts("d1").unwrap();
         assert!(d_chunks > 0, "doc chunks present after the chunk-only pass");
         assert_eq!(d_vecs, 0, "no vectors without the model");
@@ -26206,6 +26521,141 @@ mod lifecycle_tests {
             0,
             "no chunks materialize for the sealed meeting"
         );
+    }
+
+    /// Brain v3 perf audit fix 3 (RED-before-GREEN): the repair tick had NO per-run cap — a vault
+    /// with hundreds of missing rows re-embedded EVERYTHING on one launch (the class the 2026-07-13
+    /// launch freeze pinned on the topic backfill, whose `TOPIC_BACKFILL_MAX_REEMBED_PER_RUN` this
+    /// mirrors). With the cap forced small, one run performs exactly `cap` REAL index ops and the
+    /// next run RESUMES where it left off (the needs-probe is the cursor — no state carried).
+    /// Pre-fix everything indexed in one pass: RED.
+    #[test]
+    fn repair_tick_caps_real_index_ops_per_run_and_resumes_next_launch() {
+        let state = build_state("repair-tick-cap");
+        make_open_folder(&state.db, "f-open", "Team");
+        for i in 0..4 {
+            state
+                .db
+                .insert_document(
+                    &format!("d{i}"),
+                    "f-open",
+                    &format!("doc{i}.md"),
+                    &format!("doc {i} body paragraph"),
+                    "document",
+                    (i + 1) as i64,
+                )
+                .unwrap();
+        }
+        seed_meeting(&state.db, "m1", "# Plan\n\nbudget line", Some("f-open"));
+
+        // RUN 1 (cap 2): exactly two docs (oldest-first) — no budget left for the meeting half.
+        let (m, d) = backfill_missing_brain_indexes_capped(
+            &state.db,
+            true,
+            true,
+            &crate::embed::StubEmbedder,
+            2,
+        )
+        .unwrap();
+        assert_eq!((m, d), (0, 2), "run 1 spends the whole cap on the first two docs");
+        let covered = (0..4)
+            .filter(|i| {
+                state
+                    .db
+                    .doc_chunk_vector_counts(&format!("d{i}"))
+                    .unwrap()
+                    .0
+                    > 0
+            })
+            .count();
+        assert_eq!(covered, 2, "exactly cap-many docs are indexed in one run");
+        assert_eq!(
+            state.db.note_chunk_count("m1").unwrap(),
+            0,
+            "the meeting half gets no leftover budget in run 1"
+        );
+
+        // RUN 2: resumes with the remaining two docs (the needs-probe skips the covered ones).
+        let (m, d) = backfill_missing_brain_indexes_capped(
+            &state.db,
+            true,
+            true,
+            &crate::embed::StubEmbedder,
+            2,
+        )
+        .unwrap();
+        assert_eq!((m, d), (0, 2), "run 2 continues from where run 1 stopped");
+
+        // RUN 3: docs covered → the leftover budget finally reaches the meeting half.
+        let (m, d) = backfill_missing_brain_indexes_capped(
+            &state.db,
+            true,
+            true,
+            &crate::embed::StubEmbedder,
+            2,
+        )
+        .unwrap();
+        assert_eq!((m, d), (1, 0), "run 3 indexes the meeting with the freed budget");
+        assert!(state.db.note_chunk_count("m1").unwrap() > 0);
+
+        // RUN 4: full coverage ⇒ a no-op (idempotence preserved under the cap).
+        let (m, d) = backfill_missing_brain_indexes_capped(
+            &state.db,
+            true,
+            true,
+            &crate::embed::StubEmbedder,
+            2,
+        )
+        .unwrap();
+        assert_eq!((m, d), (0, 0), "a capped tick still converges to the no-op");
+    }
+
+    /// Fix 3c (RED-before-GREEN): a row that yields NOTHING (an empty-bodied note produces zero
+    /// chunks, forever) must neither consume the per-run cap nor count as backfilled work —
+    /// otherwise a vault with permanently-empty rows re-burns the cap on every launch and the
+    /// tail of REAL missing rows behind them never gets indexed. Pre-fix every attempted row was
+    /// counted: RED.
+    #[test]
+    fn repair_tick_zero_yield_rows_never_consume_the_cap() {
+        let state = build_state("repair-tick-zero-yield");
+        make_open_folder(&state.db, "f-open", "Team");
+        // Oldest row first: an EMPTY note (zero chunks forever), then a real doc behind it.
+        state
+            .db
+            .insert_note("n-empty", "f-open", "empty", "Empty", "", 1)
+            .unwrap();
+        state
+            .db
+            .insert_document("d-real", "f-open", "doc.md", "real doc body paragraph", "document", 2)
+            .unwrap();
+
+        // Cap 1: the empty note is probed first but yields nothing — the ONE budget slot must
+        // still reach the real doc behind it.
+        let (m, d) = backfill_missing_brain_indexes_capped(
+            &state.db,
+            true,
+            true,
+            &crate::embed::StubEmbedder,
+            1,
+        )
+        .unwrap();
+        assert_eq!((m, d), (0, 1), "only the REAL doc counts as backfilled work");
+        assert!(
+            state.db.doc_chunk_vector_counts("d-real").unwrap().0 > 0,
+            "the real doc got the cap slot despite the zero-yield row ahead of it"
+        );
+
+        // Re-run: the empty row is re-probed (still zero-yield) — never counted, so the tick
+        // reports the honest no-op.
+        let (m, d) = backfill_missing_brain_indexes_capped(
+            &state.db,
+            true,
+            true,
+            &crate::embed::StubEmbedder,
+            1,
+        )
+        .unwrap();
+        assert_eq!((m, d), (0, 0), "zero-yield rows are not 'work' — the re-run is a no-op");
     }
 
     /// RELOCK re-purges the freshly-rebuilt meeting chunks: a lock → unlock (re-index) → relock cycle
