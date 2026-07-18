@@ -672,6 +672,22 @@ pub struct DocumentSummary {
     pub updated_at: Option<i64>,
 }
 
+/// Brain v3 audit Fix 3(b) — ONE entry in a document's structural OUTLINE (the heading/section tree
+/// persisted in `doc_chunks`): a section-parent (L1) or the doc summary (L2). Deterministic, derived
+/// PROVENANCE over already-derived plaintext — carries the section trail + page, NOT the section body
+/// text, so an outline is a cheap MAP the agent reads to plan targeted `get_document(offset,maxChars)`
+/// reads instead of blind char paging. Returned ONLY by [`Db::get_document_outline_if_visible`], which
+/// visibility-gates on the owning folder's lock (a sealed-and-not-session-unlocked document → empty).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocOutlineEntry {
+    /// `doc_chunks.level` — 1 = section-parent (a heading), 2 = doc summary/outline node.
+    pub level: i64,
+    /// The heading trail this node sits under (`"A › B"`); `None` for a flat/heading-less node.
+    pub section_path: Option<String>,
+    /// 1-based page/slide (PDF/PPTX); `None` for flow formats.
+    pub page_no: Option<u32>,
+}
+
 /// Shared Brain v1 — one ORG-partition retrieval hit: the nearest/best chunk's snippet + the
 /// source org item's id, `author_hint`, and title. The parallel of [`DocChunkHit`] for the org
 /// leg. The `org_search` / `org_brain_search` TOOL renders each hit as a LOUD `[org · <author>]`

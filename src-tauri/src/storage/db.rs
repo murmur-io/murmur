@@ -12,7 +12,8 @@ use crate::embed::Embedder;
 use crate::storage::models::{
     Analytics, AssistantInteraction, AssistantThreadRow, BacklinkSource, Commitment,
     CorrectionRecord, DayCount,
-    DocChunkHit, DocumentInfo, DocumentSummary, EntityDetail, EntityKind, EntityNeighbor, Folder,
+    DocChunkHit, DocOutlineEntry, DocumentInfo, DocumentSummary, EntityDetail, EntityKind,
+    EntityNeighbor, Folder,
     FullGraphData, FullGraphEdge, FullGraphEdgeKind, FullGraphNode, FullGraphNodeKind, FullGraphOpts,
     GraphData,
     GraphEdge, GraphEntity, GraphNode, Meeting, MeetingActionSummary, MeetingStatus, NoteCitation,
@@ -5744,6 +5745,60 @@ impl Db {
                 level: 1,
                 sibling_hits: h.sibling_hits,
             });
+        }
+        Ok(out)
+    }
+
+    /// Brain v3 audit Fix 3(b) — a document's structural OUTLINE: its section-parent (L1) + doc
+    /// summary (L2) `doc_chunks` rows, in document order, carrying `section_path` + `page_no` (NOT
+    /// the section body text — an outline is a MAP, not content). Deterministic; the agent reads it
+    /// to plan targeted `get_document(offset, maxChars)` reads instead of blind char paging.
+    ///
+    /// GATING (lock-model, load-bearing): applies EXACTLY the same `visibility_clause` predicate over
+    /// `doc_chunks → documents → folders` as every other doc reader, so a document in a
+    /// sealed-and-not-session-unlocked folder yields an EMPTY outline (indistinguishable from a
+    /// never-existed id / a flat legacy doc — never leaks locked-vs-absent). While sealed a folder's
+    /// `doc_chunks` rows are purged anyway; the gate is defense-in-depth on top. A pure gated READ —
+    /// no plaintext content leaves the DB (headings ARE user content, but they are the SAME
+    /// section_path already surfaced on a search hit, and are gated identically).
+    ///
+    /// BOUNDED: at most `cap` entries (a huge deck can't blow the tool result). Legacy/flat docs (all
+    /// rows level 0) have no L1/L2 rows → an empty outline, which the tool renders as "no outline".
+    pub fn get_document_outline_if_visible(
+        &self,
+        id: &str,
+        unlocked: &HashSet<String>,
+        cap: usize,
+    ) -> Result<Vec<DocOutlineEntry>> {
+        if cap == 0 {
+            return Ok(Vec::new());
+        }
+        let conn = self.lock();
+        let visible = visibility_clause("f", unlocked);
+        // L1 (section-parent) + L2 (doc summary) rows only — the heading/structure tree, never the
+        // L0 leaf body. Ordered by document position (`chunk_index`) so the outline reads top-down.
+        let sql = format!(
+            "SELECT dc.level, dc.section_path, dc.page_no
+               FROM doc_chunks dc
+               JOIN documents d ON d.id = dc.document_id
+               JOIN folders f ON f.id = d.folder_id
+              WHERE dc.document_id = ?1 AND dc.level >= 1 AND {visible}
+              ORDER BY dc.chunk_index ASC
+              LIMIT ?2"
+        );
+        let mut stmt = conn.prepare(&sql).map_err(map_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![id, cap as i64], |r| {
+                Ok(DocOutlineEntry {
+                    level: r.get(0)?,
+                    section_path: r.get(1)?,
+                    page_no: r.get(2)?,
+                })
+            })
+            .map_err(map_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(map_err)?);
         }
         Ok(out)
     }
@@ -19325,6 +19380,62 @@ mod tests {
                 .any(|h| h.document_id == "d1" && h.snippet.contains("pistachio")),
             "clean md chunk text is unchanged by the (no-op) reflow gate: {hits:?}"
         );
+    }
+
+    /// Brain v3 audit Fix 3(b) — `get_document_outline_if_visible` returns the L1 section tree
+    /// (section_path + page) in document order, is GATED (a sealed-not-unlocked doc → EMPTY; unlock →
+    /// the tree), and is BOUNDED by `cap`. RED-before-GREEN: the gate assertion fails if the reader
+    /// forgets `visibility_clause` (the sealed doc's headings leak).
+    #[test]
+    fn get_document_outline_is_visibility_gated_and_ordered() {
+        let db = mem_db();
+        seed_folder(&db, "f-lock", "Specs");
+        // A multi-section doc: two headings across two pages → two L1 rows.
+        let blocks = vec![
+            crate::extract::ExtractedBlock {
+                text: "The system stores everything in SQLite.".to_string(),
+                page: Some(1),
+                heading_path: Some("Design".to_string()),
+            },
+            crate::extract::ExtractedBlock {
+                text: "Chunks form a three-level tree.".to_string(),
+                page: Some(2),
+                heading_path: Some("Design › Storage".to_string()),
+            },
+        ];
+        let stored = crate::extract::blocks_to_stored_text(&blocks);
+        db.insert_document("d1", "f-lock", "spec.pdf", &stored, "document", 100)
+            .unwrap();
+        db.index_document_chunks("d1", None).unwrap();
+
+        // OPEN folder → the outline lists the section-parents in document order with their pages.
+        let nothing = std::collections::HashSet::new();
+        let outline = db.get_document_outline_if_visible("d1", &nothing, 64).unwrap();
+        let l1: Vec<_> = outline.iter().filter(|e| e.level == 1).collect();
+        assert!(l1.len() >= 2, "two headings → at least two L1 rows: {outline:?}");
+        assert_eq!(l1[0].section_path.as_deref(), Some("Design"));
+        assert_eq!(l1[0].page_no, Some(1));
+        assert_eq!(l1[1].section_path.as_deref(), Some("Design › Storage"));
+        assert_eq!(l1[1].page_no, Some(2), "document order preserved");
+
+        // SEAL the folder → the outline is EMPTY (the gate excludes it; the same masking as every
+        // other doc reader — headings never leak from a sealed-not-unlocked folder).
+        db.set_folder_locked("f-lock", true, None).unwrap();
+        let sealed = db.get_document_outline_if_visible("d1", &nothing, 64).unwrap();
+        assert!(sealed.is_empty(), "sealed-not-unlocked doc must yield an EMPTY outline: {sealed:?}");
+
+        // Session-unlock → the tree reappears.
+        let mut unlocked = std::collections::HashSet::new();
+        unlocked.insert("f-lock".to_string());
+        let reopened = db.get_document_outline_if_visible("d1", &unlocked, 64).unwrap();
+        assert!(
+            reopened.iter().any(|e| e.section_path.as_deref() == Some("Design")),
+            "unlock restores the outline: {reopened:?}"
+        );
+
+        // cap = 0 → empty; cap = 1 → at most one entry (bounded).
+        assert!(db.get_document_outline_if_visible("d1", &unlocked, 0).unwrap().is_empty());
+        assert!(db.get_document_outline_if_visible("d1", &unlocked, 1).unwrap().len() <= 1);
     }
 
     /// READ-TIME REFLOW (doc-preview fix), chunk-input DE-FRAGMENTS: a document whose stored text is a

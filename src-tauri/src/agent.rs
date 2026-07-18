@@ -81,6 +81,13 @@ pub trait DeltaSink: Send + Sync {
 /// Bound on re-fed tool output per step — caps context growth + cloud egress amplification.
 const RESULT_BUDGET: usize = 4000;
 
+/// Hard cap on the retained citation-source accumulator (`gathered`). The model NEVER sees this
+/// buffer — it exists only so `extract_citations` can scan the raw tool text for `[[Title]]` /
+/// `(via …)` markers after the loop. Bounding it (was unbounded: a multi-MB `get_document` body
+/// accumulated in full) keeps a giant tool result from ballooning memory when only the first few KB
+/// carry any citation markers. Generous enough that a normal multi-tool turn is unaffected.
+const GATHERED_BUDGET: usize = 64_000;
+
 /// Brain v2 L3 — char budget on the WHOLE loop transcript before deterministic compaction kicks in
 /// (~8k tokens: inside a small local model's effective context, and a hard cap on per-step cloud
 /// egress growth). `pub(crate)` so [`crate::reason::GenOptions::transcript_compaction`]'s doc can
@@ -319,11 +326,20 @@ pub fn run_agentic_loop(
                     if let Some(s) = sink {
                         s.tool_done(&name, true, out.chars().count());
                     }
-                    gathered.push_str(out);
-                    gathered.push_str("\n\n");
+                    // CITATION source: keep the FULL output only up to a hard cap so a multi-MB
+                    // tool result can't grow `gathered` without bound (the model only ever sees the
+                    // RESULT_BUDGET-truncated block; citation extraction scans `gathered`). Citations
+                    // are `[[Title]]`/`(via …)` markers that appear in the FIRST kilobytes of a
+                    // formatted hit list, so bounding the retained copy at GATHERED_BUDGET can only
+                    // drop citations from the tail of an over-cap payload — never the answer.
+                    push_bounded(&mut gathered, out, GATHERED_BUDGET);
+                    // HONEST TRUNCATION (Brain v3 audit Fix 1): when the result exceeds
+                    // RESULT_BUDGET, append a machine-actionable marker carrying the TRUE total so
+                    // the model can tell "this doc IS N chars" from "I saw the first 4000 of N" and
+                    // page the rest — never confidently assert absence after seeing a fraction.
                     transcript.push_result(format!(
                         "[{name} result]\n{}",
-                        truncate(out, RESULT_BUDGET)
+                        truncate_with_marker(out, RESULT_BUDGET)
                     ));
                     steps.push(AgentStep {
                         tool: name,
@@ -375,6 +391,44 @@ fn truncate(s: &str, max: usize) -> &str {
         end -= 1;
     }
     &s[..end]
+}
+
+/// HONEST truncation for a re-fed tool RESULT block (Brain v3 audit Fix 1). A result at or under
+/// `max` bytes is returned UNCHANGED (byte-identical to the pre-fix `truncate`, so a small result
+/// never carries a marker). When it exceeds `max`, the char-safe prefix is followed by a
+/// machine-actionable marker that discloses:
+///   - the TRUE total length (in CHARS — the unit the paging `offset`/`maxChars` args use), so the
+///     model can tell "the doc IS this long" from "I only saw a slice", and
+///   - the exact `offset=<shown_chars>` to pass on the next call to continue reading.
+///
+/// Without this the model confidently asserts absence ("the document doesn't mention X") after
+/// seeing a tiny fraction of a large result — the documented "truncation makes agents lie" failure.
+fn truncate_with_marker(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let shown = truncate(s, max);
+    // CHARS, not bytes, so the disclosed numbers line up with the char-based paging args the tools
+    // advertise. `shown_chars` is the correct next `offset`.
+    let shown_chars = shown.chars().count();
+    let total_chars = s.chars().count();
+    format!(
+        "{shown}\n[truncated: showing {shown_chars} of {total_chars} chars — call the same tool \
+         again with offset={shown_chars} to continue]"
+    )
+}
+
+/// Append `out` to the citation-source accumulator `buf`, but never let `buf` grow past `cap`
+/// (Brain v3 audit Fix 1). Char-safe. Once `buf` is at/over `cap` nothing more is retained (the
+/// model already saw the truncated block; citations live in the head). This bounds memory for a
+/// multi-MB tool result whose full body would otherwise accumulate here in full.
+fn push_bounded(buf: &mut String, out: &str, cap: usize) {
+    if buf.len() >= cap {
+        return;
+    }
+    let room = cap - buf.len();
+    buf.push_str(truncate(out, room));
+    buf.push_str("\n\n");
 }
 
 #[cfg(test)]
@@ -884,6 +938,113 @@ mod tests {
             out.steps.len(),
             1,
             "the duplicate call must not be executed again"
+        );
+    }
+
+    // ── Brain v3 audit Fix 1: HONEST tool-result truncation ──────────────────────────────────────
+
+    /// A result AT OR UNDER the budget is byte-identical to today (no marker); a result OVER the
+    /// budget carries the disclosure marker with the TRUE total char count and the correct next
+    /// `offset`. Without this the model can't tell "the whole result IS this short" from "I saw a
+    /// slice of a huge result" and asserts absence after seeing a fraction.
+    #[test]
+    fn truncate_with_marker_discloses_the_true_total_only_when_it_cuts() {
+        // Under budget → unchanged, NO marker (the byte-identical-today guarantee).
+        let small = "abc";
+        assert_eq!(truncate_with_marker(small, RESULT_BUDGET), "abc");
+        assert!(!truncate_with_marker(small, RESULT_BUDGET).contains("truncated"));
+        // Exactly at the budget → still unchanged, no marker.
+        let exact = "z".repeat(RESULT_BUDGET);
+        assert_eq!(truncate_with_marker(&exact, RESULT_BUDGET), exact);
+        assert!(!truncate_with_marker(&exact, RESULT_BUDGET).contains("truncated"));
+
+        // Over budget (ASCII: chars == bytes) → the prefix + a marker with the TRUE total and the
+        // next offset.
+        let big = "q".repeat(RESULT_BUDGET + 2500); // 6500 chars
+        let out = truncate_with_marker(&big, RESULT_BUDGET);
+        assert!(out.starts_with(&"q".repeat(RESULT_BUDGET)), "keeps the char-safe prefix");
+        assert!(
+            out.contains(&format!(
+                "[truncated: showing {RESULT_BUDGET} of 6500 chars — call the same tool again with \
+                 offset={RESULT_BUDGET} to continue]"
+            )),
+            "the marker must carry the TRUE total (6500) + the next offset: {out}"
+        );
+    }
+
+    /// The disclosed numbers are CHAR counts (the unit the paging args use), never byte counts —
+    /// so a multibyte result reports a total the model can pass straight back as `offset`.
+    #[test]
+    fn truncate_with_marker_counts_chars_not_bytes() {
+        // 3000 × '€' (3 bytes each) = 9000 bytes, 3000 chars. Byte-len (9000) exceeds a 4000-byte
+        // budget, so it truncates; the DISCLOSED total must be 3000 CHARS, not 9000 bytes.
+        let s = "€".repeat(3000);
+        assert!(s.len() > RESULT_BUDGET, "precondition: byte-len exceeds the budget");
+        let out = truncate_with_marker(&s, RESULT_BUDGET);
+        assert!(out.contains("of 3000 chars"), "total is char count, not byte count: {out}");
+        // The next offset is the number of CHARS shown, and re-slicing the source at that char
+        // offset must land exactly where the shown prefix ended (a valid continuation window).
+        let shown_chars = out
+            .split("showing ")
+            .nth(1)
+            .and_then(|t| t.split(' ').next())
+            .and_then(|n| n.parse::<usize>().ok())
+            .expect("marker carries a shown-chars count");
+        assert!(shown_chars > 0 && shown_chars < 3000);
+        assert!(out.contains(&format!("offset={shown_chars}")), "next offset = chars shown: {out}");
+    }
+
+    /// The citation accumulator never grows past its cap even when a single tool result is enormous
+    /// (a multi-MB `get_document` body). It stops appending once full — the head (where citation
+    /// markers live) is retained; only the tail of an over-cap payload is dropped.
+    #[test]
+    fn push_bounded_caps_the_citation_accumulator() {
+        let mut buf = String::new();
+        let huge = "x".repeat(GATHERED_BUDGET * 3);
+        push_bounded(&mut buf, &huge, GATHERED_BUDGET);
+        assert!(buf.len() <= GATHERED_BUDGET + 2, "buffer bounded (+ the \\n\\n joiner): {}", buf.len());
+        // A second push over an already-full buffer is a no-op.
+        let before = buf.len();
+        push_bounded(&mut buf, "more", GATHERED_BUDGET);
+        assert_eq!(buf.len(), before, "nothing retained once at cap");
+    }
+
+    /// IN-LOOP (RED on the pre-fix silent cut): a tool result LARGER than RESULT_BUDGET reaches the
+    /// model with the honest disclosure marker + the TRUE total, so the brain knows it saw only a
+    /// slice and can page — never confidently answers "not found" on a fraction.
+    #[test]
+    fn loop_over_budget_tool_result_reaches_the_model_with_the_disclosure_marker() {
+        /// Returns a result far larger than RESULT_BUDGET (a big document body).
+        struct HugeExec;
+        impl ToolExecutor for HugeExec {
+            fn specs(&self) -> Vec<crate::tools::ToolSpec> {
+                crate::tools::tool_specs()
+            }
+            fn run(&self, _n: &str, _a: &Value) -> Result<String> {
+                Ok("h".repeat(RESULT_BUDGET * 10)) // 40000 chars
+            }
+        }
+        // Ask a tool, then answer — so the transcript the SECOND model call sees carries the result.
+        let r = ScriptReasoner::ok(vec![
+            serde_json::json!({ "tool": "get_document", "args": { "documentId": "d1" } }),
+            serde_json::json!({ "answer": "done" }),
+        ]);
+        // Route the recorded transcripts through the ScriptReasoner's `seen`.
+        let out = run_agentic_loop(&r, "sys", "q", &HugeExec, 4, None, GenOptions::default())
+            .unwrap()
+            .expect("converges");
+        assert_eq!(out.answer, "done");
+        let seen = r.seen.lock().unwrap();
+        // The transcript handed to the model on the SECOND step (index 1) carries the result block.
+        let with_result = &seen[1];
+        assert!(
+            with_result.contains(&format!("of {} chars", RESULT_BUDGET * 10)),
+            "the model must see the TRUE total ({}), not a silent 4000-char cut",
+            RESULT_BUDGET * 10
+        );
+        assert!(
+            with_result.contains(&format!("offset={RESULT_BUDGET} to continue")),
+            "the model must be told how to page the rest: {with_result}"
         );
     }
 }
