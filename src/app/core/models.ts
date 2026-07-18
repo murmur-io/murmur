@@ -542,11 +542,14 @@ export interface ReindexProgress {
 }
 
 /**
- * Brain v3 PR-2 — progress for an in-flight document import (`importDocument`):
+ * Brain v3 PR-2/PR-4 — progress for an in-flight document import (`importDocument`):
  * the extract → chunk → embed pipeline for ONE document. Mirrors the backend
  * `DocImportPayload` (camelCase). Counts + a stage ONLY — NO PII (`documentId`
- * is a random UUID; no filename / text). `done`/`total` are chunk counts within
- * the embedding stage (`0`/`0` for the earlier stages). `stage`:
+ * is a random UUID; no filename / text). `done`/`total` are REAL counts within a
+ * stage: PAGES for `"extracting"` (page k of N — including a scanned-PDF OCR) and
+ * embed SUB-BATCHES for `"embedding"` (batch k of M); `0`/`0` for `"chunking"`.
+ * `truncated` is `true` ONLY on the final `"done"` event when the scanned-PDF OCR
+ * page cap was reached (some scanned pages were skipped — partial content). `stage`:
  * `"extracting"` | `"chunking"` | `"embedding"` | `"done"`.
  */
 export interface DocImportProgress {
@@ -554,6 +557,7 @@ export interface DocImportProgress {
   stage: "extracting" | "chunking" | "embedding" | "done";
   done: number;
   total: number;
+  truncated: boolean;
 }
 
 /**

@@ -233,8 +233,12 @@ pub struct NerDownloadPayload {
 pub const EVENT_DOC_IMPORT: &str = "murmur://doc-import";
 
 /// Payload for [`EVENT_DOC_IMPORT`]. `stage` is `"extracting"` | `"chunking"` | `"embedding"` |
-/// `"done"`. `done`/`total` are chunk counts within the embedding stage (0/0 for the earlier
-/// stages). The `document_id` is a random UUID (no content). NO PII.
+/// `"done"`. `done`/`total` are real counts WITHIN a stage: PAGES for `"extracting"` (page k of N of
+/// a PDF/scanned OCR), and embed SUB-BATCHES for `"embedding"` (batch k of M). `0`/`0` for stages
+/// with no natural count (chunking). `truncated` is `true` ONLY on the final `"done"` event when the
+/// scanned-PDF OCR page cap was reached (some scanned pages were skipped — partial content); the FE
+/// surfaces a "some scanned pages exceeded the limit" notice. The `document_id` is a random UUID (no
+/// content). NO PII.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DocImportPayload {
@@ -243,9 +247,14 @@ pub struct DocImportPayload {
     pub stage: String,
     pub done: usize,
     pub total: usize,
+    /// `true` on the final `"done"` event when the OCR page cap truncated a huge scanned document
+    /// (partial content). `false` on every non-final stage and on a complete import.
+    pub truncated: bool,
 }
 
-/// Emit [`EVENT_DOC_IMPORT`] to the FE (best-effort). Swallows the emit failure with a non-PII warn.
+/// Emit [`EVENT_DOC_IMPORT`] for a NON-FINAL stage (`extracting`/`chunking`/`embedding`) with real
+/// `done`/`total` counts (best-effort; swallows the emit failure with a non-PII warn). `truncated` is
+/// always `false` here — only the terminal `done` event (via [`emit_doc_import_done`]) can flag it.
 pub fn emit_doc_import(app: &AppHandle, document_id: &str, stage: &str, done: usize, total: usize) {
     if let Err(e) = app.emit(
         EVENT_DOC_IMPORT,
@@ -254,9 +263,27 @@ pub fn emit_doc_import(app: &AppHandle, document_id: &str, stage: &str, done: us
             stage: stage.to_string(),
             done,
             total,
+            truncated: false,
         },
     ) {
         tracing::warn!(target: "documents", error = %e, stage, "emit doc-import failed");
+    }
+}
+
+/// Emit the TERMINAL [`EVENT_DOC_IMPORT`] `"done"` event, carrying `truncated` — `true` when the
+/// scanned-PDF OCR page cap skipped pages (partial content). Best-effort; swallows the emit failure.
+pub fn emit_doc_import_done(app: &AppHandle, document_id: &str, truncated: bool) {
+    if let Err(e) = app.emit(
+        EVENT_DOC_IMPORT,
+        DocImportPayload {
+            document_id: document_id.to_string(),
+            stage: "done".to_string(),
+            done: 0,
+            total: 0,
+            truncated,
+        },
+    ) {
+        tracing::warn!(target: "documents", error = %e, stage = "done", "emit doc-import done failed");
     }
 }
 
@@ -488,5 +515,43 @@ mod tests {
     #[test]
     fn org_sync_tick_cadence_is_one_minute() {
         assert_eq!(crate::commands::ORG_SYNC_TICK_SECS, 60);
+    }
+
+    /// The FE listens on this exact event name; a rename silently drops the import progress bar.
+    #[test]
+    fn doc_import_event_name_is_stable() {
+        assert_eq!(EVENT_DOC_IMPORT, "murmur://doc-import");
+    }
+
+    /// The doc-import payload serializes as camelCase with the real per-stage counts AND the terminal
+    /// `truncated` flag (the FE contract — [`crate::events::DocImportPayload`] ⇒ `DocImportProgress`).
+    /// A non-final stage carries `truncated: false`; the terminal `done` event can carry `true`.
+    #[test]
+    fn doc_import_payload_is_camel_case_counts_and_truncated() {
+        let extracting = DocImportPayload {
+            document_id: "d1".into(),
+            stage: "extracting".into(),
+            done: 12,
+            total: 300,
+            truncated: false,
+        };
+        let json = serde_json::to_string(&extracting).unwrap();
+        assert_eq!(
+            json,
+            r#"{"documentId":"d1","stage":"extracting","done":12,"total":300,"truncated":false}"#
+        );
+        // The terminal done event can flag a truncated (partial) OCR import.
+        let done = DocImportPayload {
+            document_id: "d1".into(),
+            stage: "done".into(),
+            done: 0,
+            total: 0,
+            truncated: true,
+        };
+        let json = serde_json::to_string(&done).unwrap();
+        assert_eq!(
+            json,
+            r#"{"documentId":"d1","stage":"done","done":0,"total":0,"truncated":true}"#
+        );
     }
 }
