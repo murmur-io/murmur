@@ -5330,8 +5330,11 @@ impl Db {
         embedder: Option<&dyn Embedder>,
     ) -> Result<()> {
         let chunks = crate::embed::chunk_note(title, "", body);
+        // Sub-batch to bound the per-call Metal tensor for a long note (mirror
+        // index_meeting_chunks/index_document_chunks — this indexer was the one remaining
+        // whole-item single-call embed, brain-v3 audit H3).
         let vectors = match embedder {
-            Some(e) if !chunks.is_empty() => e.embed_passage(&chunks)?,
+            Some(e) if !chunks.is_empty() => embed_in_sub_batches(e, &chunks)?,
             _ => Vec::new(), // model absent → chunk-only (FTS still covers it); vectors come later.
         };
         let this_doc = [note_id.to_string()];
