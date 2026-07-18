@@ -219,38 +219,51 @@ pub struct ClaimAlignment {
 /// Deterministically align each candidate note line to the transcript segment it most likely derives
 /// from, by normalized content-token overlap (the SAME `content_tokens` math the grounding pass uses).
 ///
-/// - `note_lines`: the note body lines (front-matter already split off by the caller is fine — this
-///   fn also skips headings / code fences / blockquotes / wikilink-only / protected sections / too-
-///   short lines itself, so a claim index always refers to a REAL claim line and never a heading).
+/// - `note_lines`: the note's RAW lines are fine — a LEADING `---` YAML front-matter block is
+///   skipped here (metadata like `title:`/`attendees:` is never a claim, even when the attendees'
+///   names are spoken), and this fn also skips headings / code fences / blockquotes / wikilink-only
+///   / protected sections / too-short lines itself. Skipping (not re-slicing) keeps every emitted
+///   `claim_index` in the ORIGINAL numbering of the passed lines.
 /// - For each candidate line: score overlap against every non-empty, non-assistant-directed segment;
 ///   pick the segment with the MOST overlapping distinct content tokens (ties → the EARLIEST segment,
 ///   for determinism); emit a [`ClaimAlignment`] iff `overlapping / claim_tokens >= RECEIPT_MIN_OVERLAP`.
 /// - Below threshold ⇒ NO entry for that line (a paraphrased LLM line the transcript doesn't clearly
 ///   support gets no — possibly wrong — receipt).
+/// - POLARITY VETO: a segment whose negator presence mismatches the claim's (see
+///   [`NEGATOR_TOKENS`]) can never be its receipt — "we will NOT ship X" must not "prove"
+///   "we will ship X" just because "not" is a stopword.
 ///
 /// Pure: no DB, no clock, no LLM, no I/O. Deterministic: same inputs ⇒ byte-identical output.
 pub fn align_claims_to_segments(note_lines: &[&str], segments: &[Segment]) -> Vec<ClaimAlignment> {
-    // Per-segment content-token set, keeping the segment's audio coordinates + metadata. Filtered
-    // with the IDENTICAL predicate as the grounding pass (drop empty + assistant-directed spans — an
-    // assistant command is not transcript evidence to point a receipt at).
-    let seg_index: Vec<(HashSet<String>, &Segment)> = segments
+    // Per-segment content-token set + negator flag, keeping the segment's audio coordinates +
+    // metadata. Filtered with the IDENTICAL predicate as the grounding pass (drop empty +
+    // assistant-directed spans — an assistant command is not transcript evidence to point a
+    // receipt at).
+    let seg_index: Vec<(HashSet<String>, bool, &Segment)> = segments
         .iter()
         .filter(|s| {
             let t = s.text.trim();
             !t.is_empty() && !crate::audio::wake::is_assistant_directed(t)
         })
-        .map(|s| (content_tokens(&s.text), s))
+        .map(|s| (content_tokens(&s.text), has_negator(&s.text), s))
         .collect();
 
     if seg_index.is_empty() {
         return Vec::new();
     }
 
+    // A leading YAML front-matter block is metadata, never a claim. Skipped by index (not
+    // re-sliced) so claim indices keep the original numbering the FE renders.
+    let fm_end = frontmatter_end(note_lines);
+
     let mut out: Vec<ClaimAlignment> = Vec::new();
     let mut in_code_fence = false;
     let mut in_skipped_section = false;
 
     for (i, &line) in note_lines.iter().enumerate() {
+        if i < fm_end {
+            continue;
+        }
         let trimmed = line.trim();
 
         // Code fences: toggle state; never a claim.
@@ -284,11 +297,20 @@ pub fn align_claims_to_segments(note_lines: &[&str], segments: &[Segment]) -> Ve
             continue;
         }
 
+        let claim_negated = has_negator(unit);
+
         // Best-matching segment = most overlapping distinct content tokens; ties → EARLIEST (first
-        // wins because we only replace on a STRICTLY greater overlap). Deterministic.
+        // wins because we only replace on a STRICTLY greater overlap). Deterministic. A candidate
+        // whose negator presence mismatches the claim's is VETOED outright (it can never be the
+        // receipt) — negators are stopwords, so without this a claim and its negation are
+        // token-identical and a receipt could "prove" the opposite of what was said. A
+        // polarity-CONSISTENT weaker segment may still win.
         let mut best_overlap = 0usize;
         let mut best: Option<&Segment> = None;
-        for (seg_toks, seg) in &seg_index {
+        for (seg_toks, seg_negated, seg) in &seg_index {
+            if *seg_negated != claim_negated {
+                continue;
+            }
             let overlap = toks.iter().filter(|t| seg_toks.contains(*t)).count();
             if overlap > best_overlap {
                 best_overlap = overlap;
@@ -323,6 +345,45 @@ fn content_tokens(s: &str) -> HashSet<String> {
         .into_iter()
         .filter(|t| !is_stopword(t))
         .collect()
+}
+
+/// Negator tokens for the receipts polarity veto — a deterministic, documented HEURISTIC used by
+/// the receipts pass ONLY (retrieval's tokenizer/stopwords are untouched). Standalone EN + PL
+/// forms; the EN contractions (can't / won't / don't / doesn't / didn't / isn't / aren't / wasn't
+/// / wouldn't / shouldn't) are covered by the `n't` substring scan in [`has_negator`], because
+/// `tokenize` splits on the apostrophe (`won't` → `won`,`t`) so no listed token could ever match
+/// them — and their stems (`won`, `can`) are common affirmative words we must not flag.
+const NEGATOR_TOKENS: &[&str] = &[
+    // English
+    "not", "no", "never", "none", "cannot",
+    // Polish
+    "nie", "nigdy", "żaden", "żadna", "żadne", "bez",
+];
+
+/// Whether `text` carries at least one negator: an `n't` contraction (ASCII or typographic
+/// apostrophe) in the raw lowercased text, or a [`NEGATOR_TOKENS`] token. Pure + deterministic.
+fn has_negator(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    if lower.contains("n't") || lower.contains("n’t") {
+        return true;
+    }
+    tokenize(text)
+        .iter()
+        .any(|t| NEGATOR_TOKENS.contains(&t.as_str()))
+}
+
+/// The number of leading lines occupied by a YAML front-matter block (a `---` fence on line 0
+/// through the closing `---`), or 0 when there is none. Mirrors [`split_frontmatter`]'s semantics
+/// over a pre-split line slice, including the conservative unterminated case (an opened-but-never-
+/// closed block makes EVERY line front-matter — never chip a line we cannot prove is body).
+fn frontmatter_end(lines: &[&str]) -> usize {
+    if lines.first().copied() != Some("---") {
+        return 0;
+    }
+    match lines[1..].iter().position(|l| *l == "---") {
+        Some(close) => close + 2, // fence line 0 + offset into the tail + the closing fence
+        None => lines.len(),
+    }
 }
 
 /// Strip a leading list / checklist / numbered marker from a trimmed line so the marker glyphs
@@ -777,6 +838,155 @@ mod tests {
         assert!(
             align_claims_to_segments(&lines, &cmd).is_empty(),
             "assistant-directed spans are not transcript evidence for a receipt"
+        );
+    }
+
+    /// RED-before-GREEN (audit MED, front-matter receipts): YAML front-matter lines (`title:`,
+    /// `attendees:`) are METADATA, not claims — even when the attendees' names are spoken in the
+    /// meeting they must never earn a receipt chip. Before the fix the walk treated every raw line
+    /// as a claim, so `attendees: Anna, Bob, …` aligned to the segment that spoke those names.
+    /// The body claim's `claim_index` must keep the ORIGINAL note's line numbering (the FE maps it
+    /// straight into `markdown.split('\n')`).
+    #[test]
+    fn frontmatter_lines_never_earn_receipts() {
+        let segments = vec![seg_full(
+            1,
+            10.0,
+            16.0,
+            "me",
+            Some(0.9),
+            "anna and bob agreed the quarterly budget review is approved",
+        )];
+        // Raw note exactly as the FE renders it: lines 0..=3 are the front-matter block,
+        // line 5 the heading, line 7 the real claim.
+        let note = "---\ntitle: Budget sync\nattendees: Anna, Bob, quarterly budget\n---\n\n## Summary\n\nAnna and Bob approved the quarterly budget review.";
+        let lines: Vec<&str> = note.split('\n').collect();
+        let out = align_claims_to_segments(&lines, &segments);
+        assert!(
+            out.iter().all(|a| a.claim_index > 3),
+            "front-matter lines (0..=3) must never earn a receipt; got:\n{out:?}"
+        );
+        assert_eq!(
+            out.len(),
+            1,
+            "the real body claim still earns its receipt; got:\n{out:?}"
+        );
+        assert_eq!(
+            out[0].claim_index, 7,
+            "claim_index keeps the ORIGINAL note's line numbering"
+        );
+    }
+
+    /// Conservative unterminated front-matter (mirrors `split_frontmatter`): a note that OPENS a
+    /// `---` block and never closes it is all metadata — no receipts, rather than chipping lines
+    /// we cannot prove are body.
+    #[test]
+    fn unterminated_frontmatter_yields_no_receipts() {
+        let segments = vec![seg_full(
+            1,
+            0.0,
+            5.0,
+            "me",
+            None,
+            "anna and bob agreed the quarterly budget review is approved",
+        )];
+        let note = "---\ntitle: Budget sync\nAnna and Bob approved the quarterly budget review.";
+        let lines: Vec<&str> = note.split('\n').collect();
+        assert!(
+            align_claims_to_segments(&lines, &segments).is_empty(),
+            "an unterminated front-matter block must yield no receipts"
+        );
+    }
+
+    /// RED-before-GREEN (audit MED, negation-blind alignment fails UNSAFE): "not" is a stopword,
+    /// so a claim and its negation are token-identical — before the veto, the affirmative claim
+    /// "we will ship X in May" earned a receipt from the segment "we will NOT ship X in May",
+    /// i.e. the receipt "proved" the opposite of what was said. Polarity mismatch ⇒ no receipt.
+    #[test]
+    fn negation_mismatch_vetoes_the_receipt() {
+        let segments = vec![seg_full(
+            2,
+            33.0,
+            37.0,
+            "others",
+            Some(0.9),
+            "we will not ship the billing exporter in May",
+        )];
+        let lines: Vec<&str> = "We will ship the billing exporter in May."
+            .split('\n')
+            .collect();
+        let out = align_claims_to_segments(&lines, &segments);
+        assert!(
+            out.is_empty(),
+            "a negated segment must never receipt an affirmative claim; got:\n{out:?}"
+        );
+    }
+
+    /// Symmetric polarity is ALLOWED: when the claim and the segment are BOTH negated, the claim
+    /// faithfully reports the negation and the receipt stands — proves the veto is a MISMATCH
+    /// check, not a blanket negation blocklist.
+    #[test]
+    fn matching_negation_on_both_sides_keeps_the_receipt() {
+        let segments = vec![seg_full(
+            2,
+            33.0,
+            37.0,
+            "others",
+            Some(0.9),
+            "we will not ship the billing exporter in May",
+        )];
+        let lines: Vec<&str> = "We will not ship the billing exporter in May."
+            .split('\n')
+            .collect();
+        let out = align_claims_to_segments(&lines, &segments);
+        assert_eq!(
+            out.len(),
+            1,
+            "both-negated claim+segment must still align; got:\n{out:?}"
+        );
+        assert_eq!(out[0].segment_id, 2);
+    }
+
+    /// RED-before-GREEN (contraction negators): `tokenize` splits on the apostrophe (`won't` →
+    /// `won`,`t`), so contraction negators can never match a token list — the veto must scan the
+    /// RAW text for the `n't` form. An affirmative claim vs a "won't" segment gets no receipt.
+    #[test]
+    fn contraction_negator_mismatch_vetoes_the_receipt() {
+        let segments = vec![seg_full(
+            3,
+            50.0,
+            55.0,
+            "me",
+            None,
+            "we won't renew the vendor contract this quarter",
+        )];
+        let lines: Vec<&str> = "We will renew the vendor contract this quarter."
+            .split('\n')
+            .collect();
+        let out = align_claims_to_segments(&lines, &segments);
+        assert!(
+            out.is_empty(),
+            "a contraction-negated segment must never receipt an affirmative claim; got:\n{out:?}"
+        );
+    }
+
+    /// The Polish negator list binds too: "nigdy nie wdrożymy …" must not receipt the affirmative
+    /// "wdrożymy …" claim ("nie" is a PL stopword, so without the veto they are token-compatible).
+    #[test]
+    fn polish_negator_mismatch_vetoes_the_receipt() {
+        let segments = vec![seg_full(
+            5,
+            60.0,
+            66.0,
+            "me",
+            None,
+            "nigdy nie wdrożymy tego eksportu faktur w maju",
+        )];
+        let lines: Vec<&str> = "Wdrożymy eksport faktur w maju.".split('\n').collect();
+        let out = align_claims_to_segments(&lines, &segments);
+        assert!(
+            out.is_empty(),
+            "a PL-negated segment must never receipt an affirmative claim; got:\n{out:?}"
         );
     }
 }
