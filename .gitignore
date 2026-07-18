@@ -30,3 +30,9 @@
 /.playwright/
 # E2E-generated screenshot artifacts (verification output, never committed)
 e2e/**/__screens__/
+
+# Stray dev database must never be committed (PII-bearing SQLite)
+meetnotes.db
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
