@@ -12,6 +12,9 @@
   position: fixed;
   top: 0;
   left: 0;
+  /* Teleported to <body> (appTeleportToBody) so `position: fixed` anchors to the
+     viewport, never a filtered/transformed ancestor; must beat all app chrome. */
+  z-index: var(--z-overlay);
   pointer-events: auto;
   display: inline-flex;
   align-items: center;

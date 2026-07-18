@@ -82,17 +82,25 @@
 /* --- Popover (opaque overlay) --------------------------------------------- */
 /* A fixed full-viewport scrim so an outside click closes the popover; only the
    panel is opaque — the scrim itself is transparent (T3: glass never on glass). */
+/* Teleport wrapper (appTeleportToBody): no box of its own — the scrim + popover
+   inside keep their own `position: fixed` and are anchored to the viewport once
+   this wrapper is a direct child of <body>. */
+.sp-overlay {
+  display: contents;
+}
 .sp-scrim {
   position: fixed;
   inset: 0;
-  z-index: 40;
+  /* Teleported to <body>: must cover ALL app chrome so an outside click closes. */
+  z-index: var(--z-overlay);
   background: transparent;
 }
 .sp-pop {
   position: fixed;
   top: 0;
   left: 0;
-  z-index: 41;
+  /* One above the scrim (same top layer, teleported to <body>). */
+  z-index: calc(var(--z-overlay) + 1);
   width: 300px;
   max-width: calc(100vw - 2 * var(--space-3));
   gap: var(--space-2);

@@ -98,7 +98,7 @@ test("slash menu 'Link to note' opens the autocomplete popover and inserts [[Tit
   await slashMenu.getByRole("option", { name: "Link to note" }).click();
 
   // The link picker is now open (OPAQUE overlay, T3) with the mocked candidates.
-  const picker = page.locator("app-link-picker");
+  const picker = page.locator(".link-pop");
   await expect(picker).toBeVisible();
   await expect(picker.getByText("Weekly plan")).toBeVisible();
   await expect(picker.getByText("Kickoff")).toBeVisible();
@@ -160,14 +160,15 @@ test("scrolling the picker to the bottom loads further candidate pages", async (
   await body.press("[");
   await body.press("[");
 
-  const picker = page.locator("app-link-picker");
+  const picker = page.locator(".link-pop");
   await expect(picker).toBeVisible();
   const rows = picker.locator(".link-pop-row");
   // Page 0: exactly one backend page, not the old top-8.
   await expect(rows).toHaveCount(40);
 
-  // Scroll the popover itself to the bottom → the next page appends.
-  const pop = picker.locator(".link-pop");
+  // Scroll the popover itself to the bottom → the next page appends. The picker
+  // locator IS the teleported `.link-pop` box now (moved to <body>).
+  const pop = picker;
   await pop.evaluate((el) => {
     el.scrollTop = el.scrollHeight;
   });
@@ -212,7 +213,7 @@ test("typing [[ also opens the link-picker autocomplete", async ({ page }) => {
   await body.press("[");
   await body.press("[");
 
-  const picker = page.locator("app-link-picker");
+  const picker = page.locator(".link-pop");
   await expect(picker).toBeVisible();
   await expect(picker.getByText("Weekly plan")).toBeVisible();
 
