@@ -161,10 +161,12 @@ test("(b) embedded mount shows ONLY the body + working Ask Brain — no header/t
     el.setSelectionRange(start, start + "body text".length);
     el.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
   });
-  const bubble = embed.locator("app-note-selection-toolbar");
+  // The bubble + Brain popover boxes are TELEPORTED to <body> (appTeleportToBody),
+  // so they're located by class at page level, not under the embed host.
+  const bubble = page.locator(".sel-bar");
   await expect(bubble).toBeVisible();
   await bubble.getByRole("button", { name: "Ask Brain" }).dispatchEvent("click");
-  await expect(embed.locator("app-note-brain-popover")).toBeVisible();
+  await expect(page.locator(".brain-pop")).toBeVisible();
 
   // Tear the embedded instance down cleanly (no leaked effect across tests).
   await page.evaluate(() => {
