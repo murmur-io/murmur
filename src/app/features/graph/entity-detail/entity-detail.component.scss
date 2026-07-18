@@ -232,8 +232,10 @@
   height: 24px;
   padding: 0 var(--space-3);
   font-size: 0.75rem;
+  font-family: inherit;
   text-decoration: none;
   color: var(--text-secondary);
+  cursor: pointer;
   transition:
     background var(--transition),
     border-color var(--transition),
@@ -254,5 +256,51 @@
   height: 6px;
   border-radius: var(--radius-pill);
   background: var(--accent);
+}
+
+/* --- AS-OF window diff (Brain v3 audit PR-8) --- */
+.ed-window {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin-top: var(--space-3);
+}
+.ed-window-title {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 0.6875rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.ed-window-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.ed-window-kind {
+  flex: none;
+  padding: 1px var(--space-2);
+  border-radius: var(--radius-pill);
+  font-size: 0.6875rem;
+  font-weight: 600;
+}
+.ed-window-kind.is-added {
+  color: var(--success);
+  background: var(--success-soft);
+}
+.ed-window-kind.is-removed {
+  color: var(--danger);
+  background: var(--danger-soft);
+}
+.ed-window-kind.is-changed {
+  color: var(--accent-hover);
+  background: var(--accent-soft);
+}
+.ed-window-empty {
+  margin: 0;
 }
     

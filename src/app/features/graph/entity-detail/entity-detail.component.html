@@ -90,11 +90,12 @@
       }
 
       <!--
-        Brain v3 PR-6 — Decision ledger. The chronological supersessions of this
-        entity's facts (old → new, dated, with a source-meeting chip). Hidden
-        entirely when the entity has no supersessions, so it never adds an empty
-        section to an entity that was never revised. Self-contained: no Receipts
-        (PR-5) dependency.
+        Brain v3 PR-6 — Decision ledger, completed by the audit's PR-8: the
+        90d/All-time control scopes an AS-OF window diff (added / removed /
+        changed between the window's two snapshots) rendered ABOVE the
+        (window-independent, whole-history) chronological ledger. Hidden
+        entirely only when BOTH are empty, so an entity that was never revised
+        still shows nothing, while a window with adds-only still surfaces them.
       -->
       @if (ledgerLoading() && !diff()) {
         <section class="ed-section">
@@ -103,7 +104,7 @@
           </div>
           <p class="empty ed-section-empty">Loading changes…</p>
         </section>
-      } @else if (ledger().length) {
+      } @else if (ledger().length || windowRows().length) {
         <section class="ed-section ed-ledger">
           <div class="ed-ledger-head">
             <h4 class="ed-section-title">Zmiany · Decision ledger</h4>
@@ -133,6 +134,90 @@
             </div>
           </div>
 
+          <!-- The AS-OF diff the active window actually scopes (PR-8). -->
+          <div class="ed-window">
+            <h5 class="ed-window-title">Zmiany w oknie · {{ windowLabel() }}</h5>
+            @if (windowRows().length) {
+              <ul class="ed-window-list">
+                @for (r of windowRows(); track r.key) {
+                  <li class="ed-ledger-row">
+                    <div class="ed-ledger-attr">
+                      <span
+                        class="ed-window-kind"
+                        [class.is-added]="r.kind === 'added'"
+                        [class.is-removed]="r.kind === 'removed'"
+                        [class.is-changed]="r.kind === 'changed'"
+                      >
+                        {{ r.kindLabel }}
+                      </span>
+                      <span class="ed-ledger-subject">{{ r.change.subject }}</span>
+                      <span class="ed-ledger-predicate">
+                        {{ r.change.predicate }}
+                      </span>
+                    </div>
+                    <div class="ed-ledger-change">
+                      @if (r.change.oldObject) {
+                        <span class="ed-ledger-old">{{ r.change.oldObject }}</span>
+                      } @else {
+                        <span class="ed-ledger-old ed-ledger-none">—</span>
+                      }
+                      <svg
+                        class="ed-ledger-arrow"
+                        viewBox="0 0 16 16"
+                        width="14"
+                        height="14"
+                        aria-label="became"
+                      >
+                        <path
+                          d="M3 8h9M9 5l3 3-3 3"
+                          fill="none"
+                          stroke="currentColor"
+                          stroke-width="1.5"
+                          stroke-linecap="round"
+                          stroke-linejoin="round"
+                        />
+                      </svg>
+                      @if (r.change.newObject) {
+                        <span class="ed-ledger-new">{{ r.change.newObject }}</span>
+                      } @else {
+                        <span class="ed-ledger-new ed-ledger-none">—</span>
+                      }
+                    </div>
+                    <div class="ed-ledger-meta">
+                      @if (r.date) {
+                        <time
+                          class="ed-ledger-date"
+                          [attr.datetime]="r.change.validFrom"
+                        >
+                          {{ r.date }}
+                        </time>
+                      }
+                      @if (r.change.sourceMeetingId) {
+                        <button
+                          type="button"
+                          class="ed-ledger-source pill"
+                          title="Open the source meeting — seeks the audio to the moment when a receipt aligns"
+                          (click)="openSource(r.change)"
+                        >
+                          <span
+                            class="ed-ledger-source-dot"
+                            aria-hidden="true"
+                          ></span>
+                          Source
+                        </button>
+                      }
+                    </div>
+                  </li>
+                }
+              </ul>
+            } @else {
+              <p class="empty ed-window-empty">
+                No changes in this window — the full history is below.
+              </p>
+            }
+          </div>
+
+          @if (ledger().length) {
           <ol class="ed-ledger-list">
             @for (c of ledger(); track ledgerKey(c)) {
               <li class="ed-ledger-row">
@@ -174,20 +259,22 @@
                       {{ date }}
                     </time>
                   }
-                  @if (c.sourceMeetingId; as mid) {
-                    <a
+                  @if (c.sourceMeetingId) {
+                    <button
+                      type="button"
                       class="ed-ledger-source pill"
-                      [routerLink]="['/meeting', mid]"
-                      title="Open the source meeting"
+                      title="Open the source meeting — seeks the audio to the moment when a receipt aligns"
+                      (click)="openSource(c)"
                     >
                       <span class="ed-ledger-source-dot" aria-hidden="true"></span>
                       Source
-                    </a>
+                    </button>
                   }
                 </div>
               </li>
             }
           </ol>
+          }
         </section>
       }
     }

@@ -241,12 +241,22 @@ pub struct KnowledgeDiff {
 /// digits (`...00:00Z` vs `...00:00.000000000+00:00`). A naive byte-lexical compare would NOT: `Z`
 /// (0x5A) sorts above `+` (0x2B), and differing fractional digits reorder identical instants.
 ///
-/// FALLBACK (mirrors [`crate::memory::compute_recency`]'s posture): if EITHER side fails to parse
-/// (a junk/corrupt stored timestamp, or a malformed caller instant), we do NOT panic and do NOT
-/// silently drop the fact — we fall back to the original byte-lexical `str` comparison for that one
-/// pair. That keeps the function total and deterministic on garbage input (a bad timestamp yields a
-/// defined, reproducible ordering rather than a crash or an undefined include/exclude).
+/// FALLBACK (mirrors [`crate::memory::compute_recency`]'s never-panic posture) — but as a genuine
+/// TOTAL order: the comparison is two-class, `(0, instant)` for parseable timestamps then
+/// `(1, bytes)` for unparseable ones. Every parseable timestamp sorts BEFORE every unparseable
+/// one; parseable pairs compare on the instant, unparseable pairs compare byte-lexically. A junk/
+/// corrupt timestamp still never panics and never drops a fact — it gets a defined, reproducible
+/// position (after all real instants).
+///
+/// Why the classes (and not "fall back to bytes when EITHER side is unparseable", the pre-fix
+/// posture): mixing instant-compares with byte-compares across a pair set is NOT transitive —
+/// x = "2026-06-20T00:00:00Z", y = "2026-06-19T20:00:00-05:00" (the later instant, byte-lexically
+/// smaller) and junk j = "2026-06-19T21:junk" gave cmp(x,y)=Less, cmp(y,j)=Less, cmp(j,x)=Less, a
+/// cycle — and `sort_by` over a non-total comparator may panic or return permutation-dependent
+/// output (the ledger sorts ride this comparator). Test:
+/// `cmp_instant_is_total_on_mixed_parseable_and_junk`.
 fn cmp_instant(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
     match (
         chrono::DateTime::parse_from_rfc3339(a),
         chrono::DateTime::parse_from_rfc3339(b),
@@ -255,8 +265,12 @@ fn cmp_instant(a: &str, b: &str) -> std::cmp::Ordering {
         (Ok(pa), Ok(pb)) => pa
             .with_timezone(&chrono::Utc)
             .cmp(&pb.with_timezone(&chrono::Utc)),
-        // Either side unparseable → deterministic byte-lexical fallback (never panic, never drop).
-        _ => a.cmp(b),
+        // Cross-class: parseable sorts before unparseable — never a byte compare against an
+        // instant-compared value (that mix is what broke transitivity).
+        (Ok(_), Err(_)) => Ordering::Less,
+        (Err(_), Ok(_)) => Ordering::Greater,
+        // Both unparseable → deterministic byte-lexical order within the junk class.
+        (Err(_), Err(_)) => a.cmp(b),
     }
 }
 
@@ -363,7 +377,11 @@ pub fn diff_snapshots(a: &[&Fact], b: &[&Fact]) -> KnowledgeDiff {
 ///
 /// Derivation: group by key, sort each group by `(valid_from, id)`, and emit one ledger row per
 /// adjacent (older, newer) pair whose normalized objects differ. Adjacent pairs with the SAME object
-/// (a re-assertion) are not decisions and are skipped.
+/// (a re-assertion) are not decisions and are skipped. BOTH sorts compare `valid_from` as an
+/// INSTANT ([`cmp_instant`], deterministic id / key tiebreaks) — a byte-lexical sort misorders a
+/// fact stored in a different RFC3339 rendering (`Z` vs `+00:00` vs a foreign offset, e.g. an
+/// imported/shared-meeting fact), which pairs `windows(2)` backwards and renders the decision
+/// INVERTED (test: `ledger_orders_by_instant_not_bytes`).
 pub fn supersession_ledger(facts: &[Fact]) -> Vec<FactStateChange> {
     use std::collections::BTreeMap;
     let mut by_key: BTreeMap<(String, String), Vec<&Fact>> = BTreeMap::new();
@@ -373,9 +391,7 @@ pub fn supersession_ledger(facts: &[Fact]) -> Vec<FactStateChange> {
     let mut rows: Vec<FactStateChange> = Vec::new();
     for group in by_key.values_mut() {
         group.sort_by(|x, y| {
-            x.valid_from
-                .cmp(&y.valid_from)
-                .then_with(|| x.id.cmp(&y.id))
+            cmp_instant(&x.valid_from, &y.valid_from).then_with(|| x.id.cmp(&y.id))
         });
         for pair in group.windows(2) {
             let (older, newer) = (pair[0], pair[1]);
@@ -390,8 +406,7 @@ pub fn supersession_ledger(facts: &[Fact]) -> Vec<FactStateChange> {
     }
     // Chronological across ALL keys: oldest decision first, ties by (subject, predicate) for stability.
     rows.sort_by(|x, y| {
-        x.valid_from
-            .cmp(&y.valid_from)
+        cmp_instant(&x.valid_from, &y.valid_from)
             .then_with(|| norm(&x.subject).cmp(&norm(&y.subject)))
             .then_with(|| norm(&x.predicate).cmp(&norm(&y.predicate)))
     });
@@ -422,7 +437,12 @@ pub struct EntityKnowledgeDiff {
 /// entry, or ledger row. The interval algebra ([`snapshot_as_of`] + [`diff_snapshots`]) and the
 /// [`supersession_ledger`] are the deterministic, clock-injected pure core; this function only
 /// glues the gated read to them. `from`/`to` are ISO-8601 instants (the FE passes the two dates it
-/// is comparing).
+/// is comparing). A REVERSED range (`from` later than `to`, by instant) is normalized by SWAPPING
+/// the bounds — the diff always answers "earlier vs later" and the echoed `from`/`to` reflect the
+/// normalized window, the same way [`normalize_instant`] already echoes canonical renderings — so
+/// a caller mixing the arguments up can never silently receive inverted added/removed/changed
+/// semantics. (Unparseable bounds keep the lexical-fallback posture: compared with [`cmp_instant`],
+/// never a panic.)
 pub fn build_knowledge_diff(
     db: &crate::storage::Db,
     entity_id: &str,
@@ -434,8 +454,13 @@ pub fn build_knowledge_diff(
     // stored `+00:00` timestamps regardless of surface form. Unparseable input passes through
     // unchanged (deterministic — the instant-aware compare in `snapshot_as_of` still degrades to a
     // lexical fallback for it, never a panic).
-    let from_norm = normalize_instant(from);
-    let to_norm = normalize_instant(to);
+    let mut from_norm = normalize_instant(from);
+    let mut to_norm = normalize_instant(to);
+    // Reversed range ⇒ swap (see the fn doc): the diff is always earlier-vs-later, never silently
+    // inverted added/removed/changed semantics.
+    if cmp_instant(&from_norm, &to_norm) == std::cmp::Ordering::Greater {
+        std::mem::swap(&mut from_norm, &mut to_norm);
+    }
     // THE GATE: the single user-facing fact read. Every downstream projection is over THIS slice.
     let facts = db.list_facts_visible(entity_id, unlocked)?;
     let snap_from = snapshot_as_of(&facts, &from_norm);
@@ -1127,5 +1152,218 @@ mod tests {
             supersession_ledger(&facts).is_empty(),
             "re-asserting the same normalized object is not a supersession"
         );
+    }
+
+    /// supersession_ledger orders by INSTANT, not bytes — the `cmp_instant` fix must cover the
+    /// ledger's TWO sorts (the per-key group sort AND the final cross-key chronological sort), not
+    /// just `snapshot_as_of`. A fact carrying a FOREIGN-OFFSET RFC3339 rendering (an imported /
+    /// shared-meeting fact: "2026-06-19T20:00:00-05:00" = 2026-06-20T01:00:00Z) sorts byte-lexically
+    /// BELOW an EARLIER Z-form instant ("2026-06-20T00:00:00Z"), so a lexical group sort pairs
+    /// (newer, older) backwards and the ledger renders the decision INVERTED (shipped →
+    /// in-progress); the final sort misorders rows across keys the same way. RED on byte-lexical
+    /// `.cmp()` sorts, GREEN on `cmp_instant`.
+    #[test]
+    fn ledger_orders_by_instant_not_bytes() {
+        // The Z form is the EARLIER instant yet the byte-lexically GREATER string.
+        let z_form = "2026-06-20T00:00:00Z"; // instant 2026-06-20T00:00:00Z
+        let offset_form = "2026-06-19T20:00:00-05:00"; // instant 2026-06-20T01:00:00Z (LATER)
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(offset_form).unwrap()
+                > chrono::DateTime::parse_from_rfc3339(z_form).unwrap(),
+            "fixture: the offset form must be the LATER instant"
+        );
+        assert!(
+            offset_form < z_form,
+            "fixture: the offset form must be the byte-lexically SMALLER string"
+        );
+
+        let facts = vec![
+            // status: in-progress (Z form, 00:00Z) superseded by shipped (offset form, 01:00Z).
+            dated_fact(
+                "s_old",
+                "Atlas",
+                "status",
+                "in-progress",
+                z_form,
+                Some(offset_form),
+                "m1",
+            ),
+            dated_fact("s_new", "Atlas", "status", "shipped", offset_form, None, "m2"),
+            // owner: Anna → Piotr at 00:30Z — BETWEEN the status instants, so the correct
+            // cross-key order is [owner @00:30Z, status @01:00Z]; the lexical order inverts it.
+            dated_fact(
+                "o_old",
+                "Atlas",
+                "owner",
+                "Anna",
+                "2026-06-01T00:00:00Z",
+                Some("2026-06-20T00:30:00Z"),
+                "m1",
+            ),
+            dated_fact(
+                "o_new",
+                "Atlas",
+                "owner",
+                "Piotr",
+                "2026-06-20T00:30:00Z",
+                None,
+                "m3",
+            ),
+        ];
+        let ledger = supersession_ledger(&facts);
+        assert_eq!(ledger.len(), 2, "two decisions");
+        // Chronological by INSTANT: the owner decision (00:30Z) first...
+        assert_eq!(ledger[0].predicate, "owner");
+        assert_eq!(ledger[0].old_object.as_deref(), Some("Anna"));
+        assert_eq!(ledger[0].new_object.as_deref(), Some("Piotr"));
+        // ...then status (01:00Z), paired the RIGHT way round: the foreign-offset (LATER) fact is
+        // the NEW side of the decision, never the old.
+        assert_eq!(ledger[1].predicate, "status");
+        assert_eq!(
+            ledger[1].old_object.as_deref(),
+            Some("in-progress"),
+            "a lexical group sort pairs the decision backwards (shipped → in-progress)"
+        );
+        assert_eq!(ledger[1].new_object.as_deref(), Some("shipped"));
+        assert_eq!(ledger[1].valid_from, offset_form);
+        assert_eq!(ledger[1].source_meeting_id.as_deref(), Some("m2"));
+    }
+
+    /// cmp_instant is a TOTAL order even on MIXED parseable/junk timestamps. The pre-fix
+    /// comparator fell back to byte-lexical whenever EITHER side was unparseable, which broke
+    /// transitivity: x = "2026-06-20T00:00:00Z", y = "2026-06-19T20:00:00-05:00" (the LATER
+    /// instant, lexically smaller), j = junk "2026-06-19T21:junk" gave cmp(x,y)=Less (instants),
+    /// cmp(y,j)=Less (bytes), cmp(j,x)=Less (bytes) — a CYCLE (x < y < j < x), and `sort_by`
+    /// over a non-total comparator is allowed to panic or return permutation-dependent output
+    /// (the ledger sorts ride exactly this comparator). The fix makes the order two-class —
+    /// (0, instant) for parseable, then (1, bytes) for unparseable — which is genuinely total.
+    /// RED on the old comparator: the pairwise compares below WERE the cycle [Less, Less, Less],
+    /// and the permutations sorted to different outputs.
+    #[test]
+    fn cmp_instant_is_total_on_mixed_parseable_and_junk() {
+        use std::cmp::Ordering;
+        let x = "2026-06-20T00:00:00Z";
+        let y = "2026-06-19T20:00:00-05:00"; // later instant than x, byte-lexically smaller
+        let j = "2026-06-19T21:junk"; // unparseable
+
+        // Acyclicity of the three pairwise compares (the pre-fix cycle: all three Less).
+        let c = [cmp_instant(x, y), cmp_instant(y, j), cmp_instant(j, x)];
+        assert_ne!(
+            c,
+            [Ordering::Less, Ordering::Less, Ordering::Less],
+            "cyclic comparator: x < y < j < x"
+        );
+        assert_ne!(
+            c,
+            [Ordering::Greater, Ordering::Greater, Ordering::Greater],
+            "cyclic comparator: x > y > j > x"
+        );
+
+        // Every input permutation must sort to the SAME deterministic order.
+        let perms: [[&str; 3]; 6] = [
+            [x, y, j],
+            [x, j, y],
+            [y, x, j],
+            [y, j, x],
+            [j, x, y],
+            [j, y, x],
+        ];
+        let mut outputs: Vec<Vec<&str>> = Vec::new();
+        for perm in perms {
+            let mut v = perm.to_vec();
+            v.sort_by(|a, b| cmp_instant(a, b));
+            outputs.push(v);
+        }
+        for out in &outputs[1..] {
+            assert_eq!(
+                out, &outputs[0],
+                "sort under cmp_instant must be permutation-independent (total order)"
+            );
+        }
+        // And the total order is the documented one: parseable instants first (x = 00:00Z before
+        // y = 01:00Z, by INSTANT), unparseable junk last.
+        assert_eq!(outputs[0], vec![x, y, j]);
+    }
+
+    /// build_knowledge_diff NORMALIZES a reversed range: when `from` is the LATER instant the
+    /// bounds are swapped, so the diff semantics (added/removed/changed direction) are those of
+    /// the ordered window and the echoed payload carries the normalized bounds. RED on the old
+    /// pass-through (a reversed range silently inverted the semantics: added ↔ removed, changed
+    /// old ↔ new) — this pins both the echo and the direction.
+    #[test]
+    fn knowledge_diff_normalizes_reversed_range() {
+        use crate::facts::{FactOp, NewFact};
+        use crate::storage::models::{EntityKind, Meeting, MeetingStatus};
+        use std::collections::HashSet;
+        const TEST_DEK: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let p = crate::storage::db::unique_temp_path("murmur-facts-kdiff", "sqlite");
+        let db = crate::storage::Db::open_with_key(&p, TEST_DEK).unwrap();
+        // One visible meeting (no folder, no note ⇒ visible to `list_facts_visible`).
+        db.insert_meeting(&Meeting {
+            id: "m1".to_string(),
+            started_at: "2026-06-01T09:00:00Z".to_string(),
+            ended_at: None,
+            title: Some("Kickoff".to_string()),
+            duration_s: 60,
+            audio_path: None,
+            status: MeetingStatus::Summarized,
+            folder_id: None,
+        })
+        .unwrap();
+        let atlas = db.upsert_entity("Atlas", EntityKind::Project).unwrap();
+        db.add_mention(&atlas, "m1").unwrap();
+        let add = |object: &str, vf: &str| {
+            FactOp::Add(NewFact {
+                entity_id: atlas.clone(),
+                subject: "Atlas".to_string(),
+                predicate: "status".to_string(),
+                object: object.to_string(),
+                valid_from: vf.to_string(),
+                recorded_at: vf.to_string(),
+                confidence: 1.0,
+                meeting_id: Some("m1".to_string()),
+            })
+        };
+        // Atlas.status: in-progress (06-01, closed 06-20) → shipped (06-20, open).
+        db.apply_fact_ops(&[add("in-progress", "2026-06-01T00:00:00Z")])
+            .unwrap();
+        let ip_id = db
+            .facts_for_entities(std::slice::from_ref(&atlas))
+            .unwrap()
+            .into_iter()
+            .find(|f| f.object == "in-progress")
+            .expect("in-progress row exists")
+            .id;
+        db.apply_fact_ops(&[
+            FactOp::Invalidate {
+                id: ip_id,
+                valid_to: "2026-06-20T00:00:00Z".to_string(),
+            },
+            add("shipped", "2026-06-20T00:00:00Z"),
+        ])
+        .unwrap();
+
+        // REVERSED bounds: `from` is the LATER instant.
+        let kd = build_knowledge_diff(
+            &db,
+            &atlas,
+            "2026-06-25T00:00:00Z",
+            "2026-06-10T00:00:00Z",
+            &HashSet::new(),
+        )
+        .unwrap();
+        // The payload echoes the NORMALIZED (swapped) window, the way normalize_instant already
+        // echoes canonical forms...
+        assert_eq!(kd.from, "2026-06-10T00:00:00Z", "from must echo the EARLIER bound");
+        assert_eq!(kd.to, "2026-06-25T00:00:00Z", "to must echo the LATER bound");
+        // ...and the semantics are the ordered window's: status CHANGED in-progress → shipped.
+        assert_eq!(kd.diff.changed.len(), 1);
+        assert_eq!(
+            kd.diff.changed[0].old_object.as_deref(),
+            Some("in-progress"),
+            "a reversed range must not invert the change direction"
+        );
+        assert_eq!(kd.diff.changed[0].new_object.as_deref(), Some("shipped"));
+        let _ = std::fs::remove_file(&p);
     }
 }

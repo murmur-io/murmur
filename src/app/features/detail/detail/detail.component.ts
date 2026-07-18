@@ -14,6 +14,7 @@ import {
   untracked,
   viewChild,
 } from "@angular/core";
+import { toSignal } from "@angular/core/rxjs-interop";
 import { ActivatedRoute, Router, RouterLink } from "@angular/router";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { save } from "@tauri-apps/plugin-dialog";
@@ -417,6 +418,65 @@ export class DetailComponent implements OnInit {
     this.seekTarget.set(target);
     this.activeTab.set("audio");
   }
+
+  /**
+   * Deep-link seek (Brain v3 audit PR-8): `/meeting/:id?seekS=<s>&seekSeg=<idx>`
+   * — the entity-detail ledger's Source chip navigates here with the fact's
+   * receipt coordinates (already computed by the GATED `get_fact_receipt`).
+   * Applied only once the detail has loaded and ONLY while unmasked (`locked()`
+   * skips WITHOUT stripping — the pending seek stays in the URL so a later
+   * unlock still applies it; a sealed meeting never seeks, matching the
+   * receipts blanking), then handed to the Audio tab through the exact
+   * `onSeekReceipt` path a note chip uses. `queryParamMap` rides `toSignal`
+   * because `TabRouteReuseStrategy` REUSES this component when the meeting tab
+   * is already open — a snapshot read in `ngOnInit` would drop those
+   * navigations.
+   *
+   * The params are ONE-SHOT: after an apply they are STRIPPED from the URL
+   * (`replaceUrl`, other params preserved) instead of latched — so re-clicking
+   * the SAME Source chip puts the params back and is a fresh apply (parity
+   * with note-receipt chips, which re-fire via `seq`). `routeSeekInFlight`
+   * only bridges the apply→strip window (a `detail()` re-set mid-strip must
+   * not double-apply) and resets when the strip lands.
+   */
+  private readonly routeSeekParams = toSignal(this.route.queryParamMap);
+  private routeSeekInFlight = false;
+  /** Monotonic seq for route-driven seeks (own space; the panel keys on object identity). */
+  private routeSeekSeq = 0;
+  private readonly _applyRouteSeek = effect(() => {
+    const qp = this.routeSeekParams();
+    const d = this.detail();
+    if (!qp) {
+      return;
+    }
+    const sRaw = qp.get("seekS");
+    const segRaw = qp.get("seekSeg");
+    if (sRaw === null || segRaw === null) {
+      // Params gone (the strip landed, or a plain navigation) → next arrival is fresh.
+      this.routeSeekInFlight = false;
+      return;
+    }
+    if (!d || this.locked()) {
+      return; // not loaded / sealed: leave the params pending (see the doc above).
+    }
+    if (this.routeSeekInFlight) {
+      return; // apply already done, strip still in flight — never double-apply.
+    }
+    this.routeSeekInFlight = true;
+    const startS = Number(sRaw);
+    const segId = Number(segRaw);
+    // Malformed coords apply nothing but still fall through to the strip below,
+    // so junk params don't sit in the URL forever.
+    if (Number.isFinite(startS) && Number.isFinite(segId)) {
+      this.onSeekReceipt({ startS, segId, seq: ++this.routeSeekSeq });
+    }
+    void this.router.navigate([], {
+      relativeTo: this.route,
+      queryParams: { seekS: null, seekSeg: null },
+      queryParamsHandling: "merge",
+      replaceUrl: true,
+    });
+  });
 
   // --- Phase 5 model-provenance badge -------------------------------------
   /**
