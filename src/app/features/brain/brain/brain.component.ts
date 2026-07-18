@@ -267,6 +267,15 @@ export class BrainComponent {
   private readonly importProgress = signal<DocImportProgress | null>(null);
 
   /**
+   * Set when the in-flight import's terminal `"done"` event reported `truncated`
+   * (the scanned-PDF OCR page cap skipped pages — partial content). Read in
+   * {@link pickAndImportDocument}'s success branch to show a distinct "partial
+   * import" toast instead of the plain success one. Reset at the start of each
+   * import. Content-free (a boolean) — NO PII.
+   */
+  private readonly importTruncated = signal(false);
+
+  /**
    * A short, human progress line for the importing Documents card, e.g.
    * "Extracting…" or "Embedding 12/40". Null unless an import is running.
    */
@@ -280,7 +289,10 @@ export class BrainComponent {
     }
     switch (p.stage) {
       case "extracting":
-        return "Extracting text…";
+        // Real page counts when known ("page 12/300" during a scanned-PDF OCR).
+        return p.total > 0
+          ? `Extracting ${p.done}/${p.total}`
+          : "Extracting text…";
       case "chunking":
         return "Chunking…";
       case "embedding":
@@ -425,7 +437,15 @@ export class BrainComponent {
     // — the `importing` flag already gates a second import.
     let unlisten: UnlistenFn | null = null;
     void this.ipc
-      .onDocImportProgress((p) => this.importProgress.set(p))
+      .onDocImportProgress((p) => {
+        this.importProgress.set(p);
+        // Latch a truncation reported on the terminal "done" event (partial import
+        // — the scanned-PDF OCR page cap skipped pages), read after the import call
+        // resolves to pick the toast copy.
+        if (p.stage === "done" && p.truncated) {
+          this.importTruncated.set(true);
+        }
+      })
       .then((fn) => {
         unlisten = fn;
       });
@@ -570,10 +590,19 @@ export class BrainComponent {
     }
 
     this.importProgress.set(null);
+    this.importTruncated.set(false);
     this.importing.set(true);
     try {
       await this.ipc.importDocument(chosen, folderId);
-      this.toast.success("Document added to the brain.");
+      // A scanned PDF past the OCR page cap imports PARTIALLY — say so, don't
+      // claim a clean success (the pages beyond the cap have no text).
+      if (this.importTruncated()) {
+        this.toast.danger(
+          "Document added, but it had more scanned pages than we can read — some pages were skipped.",
+        );
+      } else {
+        this.toast.success("Document added to the brain.");
+      }
       this.docsExpanded.set(true);
       await this.afterMutation();
     } catch (e) {
