@@ -8006,37 +8006,46 @@ pub fn accept_link(state: State<'_, AppState>, id: i64) -> Result<(), AppError> 
 }
 
 pub(crate) fn accept_link_inner(state: &AppState, id: i64) -> Result<(), AppError> {
-    let _lifecycle = lifecycle_guard(state);
-    let Some((src_kind, src_id, dst_kind, dst_id, et, status)) = state.db.link_by_id(id)? else {
-        return Err(AppError::InvalidArg(format!("no link {id}")));
-    };
-    // ── Fix 5 (brain-v3 audit): accept is ONLY for an unconfirmed SUGGESTION. Refuse anything else
-    //    (a deterministic wikilink/companion, an already-active manual/accepted, or a dismissed
-    //    tombstone) — "accepting" those is meaningless and would let a caller flip arbitrary rows. ──
-    if !(et == "semantic" && status == "suggested") {
-        return Err(AppError::InvalidArg(format!(
-            "link {id} is not an acceptable suggestion (edge_type={et}, status={status})"
-        )));
-    }
-    // ── GATE both endpoints BEFORE flipping the row (never accept behind a lock, never reveal a
-    //    locked neighbour by activating an edge to it). Fail-closed on a sealed/unknown endpoint. ──
-    let (Some(sk), Some(dk)) = (
-        crate::links::LinkKind::parse(&src_kind),
-        crate::links::LinkKind::parse(&dst_kind),
-    ) else {
-        return Err(AppError::InvalidArg(format!("link {id} has a corrupt endpoint kind")));
-    };
-    if !link_endpoint_is_unlocked(state, sk, &src_id)?
-        || !link_endpoint_is_unlocked(state, dk, &dst_id)?
-    {
-        return Err(AppError::Locked(
-            "one of these items is locked — unlock it to accept the link".into(),
-        ));
-    }
+    // BLK-1 / TOCTOU + non-reentrant guard: SCOPE the lifecycle guard tightly around validate + gate
+    // + row-flip so a concurrent lock/relock cannot land between the endpoint gate and the flip. It is
+    // RELEASED before the note-body materialize below — `materialize_accepted_link` →
+    // `update_note_inner`/`update_note_doc_inner` take the guard THEMSELVES, so composing them under one
+    // held guard re-enters the non-reentrant `Mutex<()>` and self-DEADLOCKS on a valid accept (mirrors
+    // `link_items_inner`/`unlink_items_inner`). Lock order `lifecycle ⊃ db`.
+    let (src_kind, src_id, dst_kind, dst_id) = {
+        let _lifecycle = lifecycle_guard(state);
+        let Some((src_kind, src_id, dst_kind, dst_id, et, status)) = state.db.link_by_id(id)? else {
+            return Err(AppError::InvalidArg(format!("no link {id}")));
+        };
+        // ── Fix 5 (brain-v3 audit): accept is ONLY for an unconfirmed SUGGESTION. Refuse anything else
+        //    (a deterministic wikilink/companion, an already-active manual/accepted, or a dismissed
+        //    tombstone) — "accepting" those is meaningless and would let a caller flip arbitrary rows. ──
+        if !(et == "semantic" && status == "suggested") {
+            return Err(AppError::InvalidArg(format!(
+                "link {id} is not an acceptable suggestion (edge_type={et}, status={status})"
+            )));
+        }
+        // ── GATE both endpoints BEFORE flipping the row (never accept behind a lock, never reveal a
+        //    locked neighbour by activating an edge to it). Fail-closed on a sealed/unknown endpoint. ──
+        let (Some(sk), Some(dk)) = (
+            crate::links::LinkKind::parse(&src_kind),
+            crate::links::LinkKind::parse(&dst_kind),
+        ) else {
+            return Err(AppError::InvalidArg(format!("link {id} has a corrupt endpoint kind")));
+        };
+        if !link_endpoint_is_unlocked(state, sk, &src_id)?
+            || !link_endpoint_is_unlocked(state, dk, &dst_id)?
+        {
+            return Err(AppError::Locked(
+                "one of these items is locked — unlock it to accept the link".into(),
+            ));
+        }
+        // Flip the row first: the graph edge is active even if the .md materialize below is skipped
+        // (e.g. neither endpoint is a locally-owned editable note). The panel reflects the accept.
+        state.db.accept_link(id)?;
+        (src_kind, src_id, dst_kind, dst_id)
+    }; // ── lifecycle guard RELEASED here, before materialize (which re-takes it) ──
     let unlocked = unlocked_snapshot(state)?;
-    // Flip the row first: the graph edge is active even if the .md materialize below is skipped
-    // (e.g. neither endpoint is a locally-owned editable note). The panel reflects the accept.
-    state.db.accept_link(id)?;
     // A semantic edge is undirected — materialize the neighbour's [[Title]] into whichever endpoint
     // is a LOCAL, session-VISIBLE note we own the markdown of. Try src's note first, then dst's.
     // Best-effort: a materialize skip/failure never rolls back the accept.
@@ -20350,6 +20359,25 @@ mod lifecycle_tests {
         );
         let (_sk, _si, _dk, _di, _et, status) = state.db.link_by_id(id).unwrap().unwrap();
         assert_eq!(status, "suggested", "the suggestion must stay suggested after a refused accept");
+    }
+
+    /// Fix 5 + lock-review regression: a VALID accept (semantic suggestion between two owned, visible
+    /// notes) must COMPLETE (not self-deadlock) and flip the row off `suggested`. The pre-fix code held
+    /// the non-reentrant `lifecycle_guard` across `materialize_accepted_link` → `update_note_doc_inner`
+    /// (which re-acquires it) → self-deadlock; every accept test only exercised REFUSAL paths, so cargo
+    /// test stayed green while a user clicking Accept hung the command forever. If this test hangs, the
+    /// guard is being held across materialize again.
+    #[test]
+    fn accept_link_valid_suggestion_materializes_without_deadlock() {
+        let state = build_state("accept-materialize");
+        make_open_folder(&state.db, "f-open", "Open");
+        seed_note_doc_cmd(&state.db, "a", "f-open", "Alpha", "alpha body");
+        seed_note_doc_cmd(&state.db, "b", "f-open", "Beta", "beta body");
+        let id = insert_semantic_link(&state, "a", "b", "suggested");
+        // Must RETURN (pre-fix: deadlock) — the guard is released before the materialize loop.
+        accept_link_inner(&state, id).expect("a valid accept between two open notes must succeed");
+        let (_sk, _si, _dk, _di, _et, status) = state.db.link_by_id(id).unwrap().unwrap();
+        assert_ne!(status, "suggested", "an accepted suggestion must no longer be 'suggested'");
     }
 
     /// M3-CLIENT lock gate (spec §7 inv. 1): `share_note_to_link` on a SEALED-and-not-session-unlocked
