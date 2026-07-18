@@ -623,6 +623,7 @@ pub struct BrainOverview {
 /// One gated document-chunk retrieval hit (the document analogue of [`SearchHit`], minus the
 /// meeting): the nearest chunk's snippet + the source document name + its (visible) folder id.
 /// Returned by `search_doc_chunks_visible` and folded into the brain/Ask grounding corpus.
+/// Backend-internal: this struct never crosses IPC to the FE (no `models.ts` counterpart).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DocChunkHit {
@@ -635,6 +636,23 @@ pub struct DocChunkHit {
     /// concrete kind (`[document:note:<id>]` vs `[document:document:<id>]`) so a model knows which
     /// `get_*` tool to call. Populated straight off the existing `documents.kind` column.
     pub kind: String,
+    /// Brain v3 audit Fix 1 — the WINNING (post-dedup) chunk's `doc_chunks.id`, so parent expansion
+    /// can align to the chunk that was actually retrieved instead of the document's dominant section.
+    pub chunk_id: i64,
+    /// The winning chunk's L1 section-parent row id (`doc_chunks.parent_id`); `None` for an L1/L2
+    /// winner and for legacy flat rows.
+    pub parent_id: Option<i64>,
+    /// The heading trail the winning chunk sits under; `None` = flat/heading-less content, for
+    /// which parent expansion NEVER fires (the flat L1 is the doc head, not a real section).
+    pub section_path: Option<String>,
+    /// The winning chunk's own 1-based page/slide; `None` for flow formats.
+    pub page_no: Option<u32>,
+    /// The winning chunk's `doc_chunks.level` (0 leaf / 1 section-parent / 2 doc-summary).
+    pub level: i64,
+    /// Distinct L0 leaves under the winning chunk's parent that appeared in the PRE-dedup candidate
+    /// set of the SAME query (the winner itself included). `>= 2` is the auto-merging trigger:
+    /// only a section corroborated by a second sibling hit is expanded to its L1 parent.
+    pub sibling_hits: u32,
 }
 
 /// The full body of ONE standalone note OR imported/uploaded document, by id — the transport DTO

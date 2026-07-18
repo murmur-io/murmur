@@ -624,8 +624,8 @@ pub fn chunk_note(title: &str, date: &str, markdown: &str) -> Vec<String> {
 //     chunks) — embedded + FTS (the RAPTOR collapsed-tree effect at ZERO LLM cost).
 // The contextual header extends the shipped `chunk_note` header mechanism (Anthropic contextual
 // retrieval): every embed-text is prefixed `"<name> | <section_path> | p.<N>"\n<raw>` so a chunk
-// carries its provenance into both the vector and the FTS legs, while the RAW text is kept separate
-// for snippet display.
+// carries its provenance into the VECTOR leg. The FTS leg indexes the RAW text only (see
+// `hier_embed_text` for why), and the RAW text is what snippet display serves.
 
 /// L1 section-parent cap (chars). Heading-bounded parents beyond this are truncated for the FTS/fetch
 /// row (the leaves under them still carry the full text).
@@ -680,8 +680,11 @@ fn hier_header(name: &str, section_path: Option<&str>, page_no: Option<u32>) -> 
     parts.join(" | ")
 }
 
-/// Prefix `raw` with the contextual header for embedding (the header rides the embedding AND the FTS
-/// text). A leaf with no header context embeds the raw text unchanged.
+/// Prefix `raw` with the contextual header for embedding. The header rides the VECTOR leg ONLY:
+/// `doc_chunks.text` (and therefore the external-content FTS index) stores the RAW text — repeating
+/// the doc name/section in every FTS row would inflate those terms' document frequency and distort
+/// bm25 ranking doc-wide, and changing it now would require a full FTS reindex. A leaf with no
+/// header context embeds the raw text unchanged.
 fn hier_embed_text(name: &str, section_path: Option<&str>, page_no: Option<u32>, raw: &str) -> String {
     let header = hier_header(name, section_path, page_no);
     if header.is_empty() {
@@ -691,30 +694,142 @@ fn hier_embed_text(name: &str, section_path: Option<&str>, page_no: Option<u32>,
     }
 }
 
-/// Greedily pack blank-line-separated paragraphs of `text` into ≤[`CHUNK_CHAR_TARGET`] leaf strings
-/// (the SAME sizing as `chunk_note`, minus the header — the header is added per-leaf later). A single
-/// oversized paragraph becomes its own leaf.
-fn pack_leaves(text: &str) -> Vec<String> {
-    let paragraphs: Vec<&str> = text
-        .split("\n\n")
-        .map(str::trim)
-        .filter(|p| !p.is_empty())
-        .collect();
+/// Greedily pack whole `lines` into chunks of ≤`target` CHARS (never split mid-line), order
+/// preserved, joined by `'\n'`. A single over-target line becomes its own chunk. Char-counted —
+/// never bytes — so multi-byte text packs to the same effective size as ASCII. Used for the L2
+/// outline (audit Fix 2: the old join-then-split-on-blank-lines path always yielded ONE unbounded
+/// chunk the embedder truncated at 512 tokens).
+fn pack_lines(lines: &[String], target: usize) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut cur = String::new();
-    for p in paragraphs {
-        if !cur.is_empty() && cur.len() + 1 + p.len() > CHUNK_CHAR_TARGET {
+    let mut cur_chars = 0usize;
+    for line in lines {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let n = line.chars().count();
+        if cur_chars > 0 && cur_chars + 1 + n > target {
             out.push(std::mem::take(&mut cur));
+            cur_chars = 0;
         }
-        if !cur.is_empty() {
+        if cur_chars > 0 {
             cur.push('\n');
+            cur_chars += 1;
         }
-        cur.push_str(p);
+        cur.push_str(line);
+        cur_chars += n;
     }
-    if !cur.is_empty() {
+    if cur_chars > 0 {
         out.push(cur);
     }
     out
+}
+
+/// Hard-split ONE over-`target` paragraph into ≤`target`-CHAR pieces (audit Fix 3: PDF extraction
+/// emits whole pages as a single blank-line-free paragraph, so without this the "800-char" leaves
+/// were routinely whole pages whose tails never reached the vector index). Each cut lands at the
+/// most natural boundary available inside the char window: the last single line break, else the
+/// last sentence end (ASCII terminator + whitespace, the [`first_sentence`] convention), else the
+/// last whitespace, else — truly unbroken text — a plain char-window cut. Every candidate cut is a
+/// char boundary (newline/whitespace byte positions and `char_indices` offsets), so multi-byte text
+/// never slices mid-codepoint.
+fn hard_split_paragraph(para: &str, target: usize) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut rest = para.trim();
+    while !rest.is_empty() {
+        if rest.chars().count() <= target {
+            out.push(rest.to_string());
+            break;
+        }
+        // Byte offset of the (target+1)-th char — the exclusive char-window cap, always a boundary.
+        let cap_byte = rest
+            .char_indices()
+            .nth(target)
+            .map(|(i, _)| i)
+            .unwrap_or(rest.len());
+        let window = &rest[..cap_byte];
+        let cut = window
+            .rfind('\n')
+            .or_else(|| last_sentence_end(window))
+            .or_else(|| window.rfind(char::is_whitespace))
+            .filter(|&i| i > 0)
+            .unwrap_or(cap_byte);
+        let piece = window[..cut].trim();
+        if !piece.is_empty() {
+            out.push(piece.to_string());
+        }
+        rest = rest[cut..].trim_start();
+    }
+    out
+}
+
+/// Byte offset just AFTER the last sentence terminator (`. ! ?` followed by ASCII whitespace) in
+/// `window`, or `None`. The returned offset points AT the whitespace byte — a char boundary.
+fn last_sentence_end(window: &str) -> Option<usize> {
+    let b = window.as_bytes();
+    (1..b.len())
+        .rev()
+        .find(|&i| matches!(b[i - 1], b'.' | b'!' | b'?') && b[i].is_ascii_whitespace())
+}
+
+/// Greedily pack paragraph `units` — each `(text, source-block page)` — into ≤[`CHUNK_CHAR_TARGET`]
+/// leaves (the same sizing idea as `chunk_note`, minus the header). Over-target units are
+/// hard-split FIRST ([`hard_split_paragraph`]) so no leaf ever exceeds the target; all counting is
+/// CHARS, never bytes (audit Fix 3). Each leaf carries the page of its FIRST contributing unit
+/// (audit Fix 4a: per-leaf page provenance for the embed header, instead of the section head's
+/// page stamped on every leaf).
+fn pack_leaves_paged(units: &[(String, Option<u32>)]) -> Vec<(String, Option<u32>)> {
+    let mut pieces: Vec<(String, Option<u32>)> = Vec::new();
+    for (text, page) in units {
+        let t = text.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if t.chars().count() <= CHUNK_CHAR_TARGET {
+            pieces.push((t.to_string(), *page));
+        } else {
+            for p in hard_split_paragraph(t, CHUNK_CHAR_TARGET) {
+                pieces.push((p, *page));
+            }
+        }
+    }
+    let mut out: Vec<(String, Option<u32>)> = Vec::new();
+    let mut cur = String::new();
+    let mut cur_chars = 0usize;
+    let mut cur_page: Option<u32> = None;
+    for (p, page) in pieces {
+        let n = p.chars().count();
+        if cur_chars > 0 && cur_chars + 1 + n > CHUNK_CHAR_TARGET {
+            out.push((std::mem::take(&mut cur), cur_page));
+            cur_chars = 0;
+        }
+        if cur_chars == 0 {
+            cur_page = page;
+        } else {
+            cur.push('\n');
+            cur_chars += 1;
+        }
+        cur.push_str(&p);
+        cur_chars += n;
+    }
+    if cur_chars > 0 {
+        out.push((cur, cur_page));
+    }
+    out
+}
+
+/// Render one L2 outline line: `# {heading}: {sentence}` with the sentence CAPPED at `cap` chars
+/// (`0` → heading-only `# {heading}`); a heading-less section renders the capped sentence alone
+/// (possibly empty — the caller skips empties). Deterministic; the degradation ladder in
+/// [`chunk_document_hierarchical`] calls this with shrinking caps so EVERY section keeps a line.
+fn outline_line(path: Option<&str>, sentence: &str, cap: usize) -> String {
+    let s: String = sentence.chars().take(cap).collect();
+    match path {
+        Some(p) if s.trim().is_empty() => format!("# {p}"),
+        Some(p) => format!("# {p}: {s}"),
+        None => s,
+    }
 }
 
 /// The first sentence of `text` (up to the first `. ! ?` followed by whitespace/end, capped so a
@@ -740,9 +855,22 @@ fn first_sentence(text: &str) -> String {
 /// A running heading section being assembled by [`chunk_document_hierarchical`].
 struct Section {
     path: Option<String>,
+    /// The FIRST block's page — anchors the L1 parent row (leaves carry their OWN block's page).
     page_no: Option<u32>,
-    /// Accumulated raw block texts (joined by blank lines for leaf packing).
-    body: String,
+    /// Per source block: (trimmed text, its own page). Kept per-block so a leaf can carry the page
+    /// of the block it was packed from (audit Fix 4a) instead of the section head's.
+    blocks: Vec<(String, Option<u32>)>,
+}
+
+impl Section {
+    /// The section's full body — blocks joined by blank lines (the L1 parent / outline source).
+    fn body(&self) -> String {
+        self.blocks
+            .iter()
+            .map(|(t, _)| t.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
 }
 
 /// Turn a document's extracted `blocks` into the full 3-level [`HierChunk`] tree. Deterministic; no
@@ -766,13 +894,12 @@ pub fn chunk_document_hierarchical(name: &str, blocks: &[crate::extract::Extract
         // `unwrap`/`expect` — a `None` last simply starts the first section).
         match sections.last_mut() {
             Some(sec) if sec.path.as_deref() == b.heading_path.as_deref() => {
-                sec.body.push_str("\n\n");
-                sec.body.push_str(text);
+                sec.blocks.push((text.to_string(), b.page));
             }
             _ => sections.push(Section {
                 path: b.heading_path.clone(),
                 page_no: b.page,
-                body: text.to_string(),
+                blocks: vec![(text.to_string(), b.page)],
             }),
         }
     }
@@ -784,18 +911,29 @@ pub fn chunk_document_hierarchical(name: &str, blocks: &[crate::extract::Extract
 
     // 2) Per section: emit the L1 parent, then its L0 leaves.
     for sec in &sections {
-        let leaves = pack_leaves(&sec.body);
+        // Paragraph units: each block split on blank lines, every unit tagged with ITS block's
+        // page so a leaf's page follows its source content (audit Fix 4a).
+        let units: Vec<(String, Option<u32>)> = sec
+            .blocks
+            .iter()
+            .flat_map(|(t, page)| {
+                t.split("\n\n")
+                    .map(str::trim)
+                    .filter(|p| !p.is_empty())
+                    .map(|p| (p.to_string(), *page))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let leaves = pack_leaves_paged(&units);
         if leaves.is_empty() {
             continue;
         }
-        // L1 section-parent (heading-bounded, capped, FTS-only — NOT embedded).
-        let parent_raw: String = {
-            let mut s = sec.body.clone();
-            if s.len() > SECTION_PARENT_CHAR_CAP {
-                // char-safe truncation
-                s = s.chars().take(SECTION_PARENT_CHAR_CAP).collect();
-            }
-            s
+        let body = sec.body();
+        // L1 section-parent (heading-bounded, capped, FTS-only — NOT embedded). Char-counted cap.
+        let parent_raw: String = if body.chars().count() > SECTION_PARENT_CHAR_CAP {
+            body.chars().take(SECTION_PARENT_CHAR_CAP).collect()
+        } else {
+            body
         };
         let parent_idx = out.len();
         out.push(HierChunk {
@@ -807,59 +945,74 @@ pub fn chunk_document_hierarchical(name: &str, blocks: &[crate::extract::Extract
             page_no: sec.page_no,
             embed: false,
         });
-        // L0 leaves under this parent.
-        for leaf in leaves {
-            let embed_text = hier_embed_text(name, sec.path.as_deref(), sec.page_no, &leaf);
+        // L0 leaves under this parent, each with its OWN page in the contextual header.
+        for (leaf, leaf_page) in leaves {
+            let embed_text = hier_embed_text(name, sec.path.as_deref(), leaf_page, &leaf);
             out.push(HierChunk {
                 level: HIER_LEVEL_LEAF,
                 parent: Some(parent_idx),
                 embed_text,
                 raw: leaf,
                 section_path: sec.path.clone(),
-                page_no: sec.page_no,
+                page_no: leaf_page,
                 embed: true,
             });
         }
     }
 
-    // 3) L2 doc-summary: deterministic outline = heading tree + first sentence per section. Packed
-    //    into 1..=3 chunks of ≤CHUNK_CHAR_TARGET (embedded + FTS). If there is no heading structure
-    //    at all (a flat md/txt), still emit ONE summary from the first sentences (bounded).
-    let mut outline_lines: Vec<String> = Vec::new();
-    for sec in &sections {
-        let sentence = first_sentence(&sec.body);
-        match &sec.path {
-            Some(p) if !p.trim().is_empty() => {
-                if sentence.is_empty() {
-                    outline_lines.push(format!("# {p}"));
-                } else {
-                    outline_lines.push(format!("# {p}: {sentence}"));
-                }
-            }
-            _ => {
-                if !sentence.is_empty() {
-                    outline_lines.push(sentence);
-                }
-            }
+    // 3) L2 doc-summary: deterministic outline = heading tree + first sentence per section,
+    //    packed LINE-BASED into 1..=3 chunks of ≤CHUNK_CHAR_TARGET chars (embedded + FTS) — audit
+    //    Fix 2: the old join-then-split-on-blank-lines always produced ONE unbounded chunk the
+    //    embedder truncated at 512 tokens. EVERY section (the last included) must survive into some
+    //    chunk, so an over-deep outline DEGRADES deterministically instead of dropping its tail:
+    //    full lines → proportionally condensed sentences → heading-only lines; the final
+    //    truncate(3) is only the pathological floor (hundreds of long headings). If there is no
+    //    heading structure at all (a flat md/txt), the first sentences still form the summary.
+    let entries: Vec<(Option<&str>, String)> = sections
+        .iter()
+        .map(|sec| {
+            let path = sec.path.as_deref().map(str::trim).filter(|p| !p.is_empty());
+            (path, first_sentence(&sec.body()))
+        })
+        .collect();
+    let lines_at = |cap_for: &dyn Fn(Option<&str>) -> usize| -> Vec<String> {
+        entries
+            .iter()
+            .map(|(p, s)| outline_line(*p, s, cap_for(*p)))
+            .filter(|l| !l.trim().is_empty())
+            .collect()
+    };
+    let mut summary_chunks = pack_lines(&lines_at(&|_| usize::MAX), CHUNK_CHAR_TARGET);
+    if summary_chunks.len() > 3 && !entries.is_empty() {
+        // Condensed pass: split ~90% of the 3-chunk char budget evenly across the lines (the 10%
+        // discount absorbs greedy packing waste at chunk boundaries), spend each line's share on
+        // its heading first and the remainder on its sentence — a sub-8-char sentence stub earns
+        // no recall, so it degrades to the heading-only form instead.
+        let per_line = (CHUNK_CHAR_TARGET * 3 * 9 / 10) / entries.len();
+        summary_chunks = pack_lines(
+            &lines_at(&|p| {
+                let prefix = p.map(|p| p.chars().count() + 4).unwrap_or(0);
+                let cap = per_line.saturating_sub(prefix);
+                if cap < 8 { 0 } else { cap }
+            }),
+            CHUNK_CHAR_TARGET,
+        );
+        if summary_chunks.len() > 3 {
+            summary_chunks = pack_lines(&lines_at(&|_| 0), CHUNK_CHAR_TARGET);
         }
     }
-    let outline = outline_lines.join("\n");
-    if !outline.trim().is_empty() {
-        // Pack the outline into ≤3 leaf-sized summary chunks (an unusually deep doc yields a few).
-        let mut summary_chunks = pack_leaves(&outline);
-        summary_chunks.truncate(3);
-        for sc in summary_chunks {
-            let embed_text = hier_embed_text(name, None, None, &sc);
-            out.push(HierChunk {
-                level: HIER_LEVEL_SUMMARY,
-                parent: None,
-                embed_text,
-                raw: sc,
-                section_path: None,
-                page_no: None,
-                embed: true,
-            });
-        }
+    summary_chunks.truncate(3);
+    for sc in summary_chunks {
+        let embed_text = hier_embed_text(name, None, None, &sc);
+        out.push(HierChunk {
+            level: HIER_LEVEL_SUMMARY,
+            parent: None,
+            embed_text,
+            raw: sc,
+            section_path: None,
+            page_no: None,
+            embed: true,
+        });
     }
 
     out
@@ -1625,6 +1778,167 @@ mod tests {
     fn hierarchical_chunker_empty_input_yields_nothing() {
         assert!(chunk_document_hierarchical("x", &[]).is_empty());
         assert!(chunk_document_hierarchical("x", &[blk("   ", None, None)]).is_empty());
+    }
+
+    /// Audit Fix 3 — a PDF page extracts as ONE paragraph with only single line breaks; it must
+    /// hard-split into ≤[`CHUNK_CHAR_TARGET`]-char leaves instead of one whole-page leaf whose
+    /// tail the embedder never sees.
+    #[test]
+    fn oversized_single_paragraph_hard_splits_into_bounded_leaves() {
+        let line = "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima.";
+        let para = std::iter::repeat_n(line, 54).collect::<Vec<_>>().join("\n"); // ~4000 chars, no blank lines
+        let out = chunk_document_hierarchical("big.pdf", &[blk(&para, Some(1), None)]);
+        let leaves: Vec<&HierChunk> =
+            out.iter().filter(|c| c.level == HIER_LEVEL_LEAF).collect();
+        assert!(
+            leaves.len() > 1,
+            "a 4000-char paragraph must hard-split, got {} leaf/leaves of sizes {:?}",
+            leaves.len(),
+            leaves.iter().map(|l| l.raw.chars().count()).collect::<Vec<_>>()
+        );
+        assert!(
+            leaves.iter().all(|l| l.raw.chars().count() <= CHUNK_CHAR_TARGET),
+            "every leaf must be within CHUNK_CHAR_TARGET chars, got sizes {:?}",
+            leaves.iter().map(|l| l.raw.chars().count()).collect::<Vec<_>>()
+        );
+        // The page TAIL must survive into some leaf (the whole point of the split): the last
+        // line's text appears in the LAST leaf, not only inside one oversized blob.
+        assert!(
+            leaves.last().map(|l| l.raw.contains("kilo lima.")).unwrap_or(false),
+            "the paragraph tail must land in the last leaf"
+        );
+    }
+
+    /// Audit Fix 3 — when a paragraph has no line breaks, the hard-split falls back to sentence
+    /// boundaries; with neither, to plain char windows (char-SAFE on multi-byte text — no panic,
+    /// no mid-codepoint slice).
+    #[test]
+    fn hard_split_falls_back_to_sentences_then_char_windows() {
+        // ~2000 chars of ". "-separated sentences, zero '\n'.
+        let sent = "The plan covers hiring and the budget for the second quarter of the year. ";
+        let para = sent.repeat(27);
+        let out = chunk_document_hierarchical("run-on.txt", &[blk(para.trim(), None, None)]);
+        let leaves: Vec<&HierChunk> =
+            out.iter().filter(|c| c.level == HIER_LEVEL_LEAF).collect();
+        assert!(leaves.len() > 1, "sentence fallback must split a run-on paragraph");
+        assert!(leaves.iter().all(|l| l.raw.chars().count() <= CHUNK_CHAR_TARGET));
+
+        // 1200 unbroken multi-byte chars: last-resort char windows, split points char-safe.
+        let solid: String = "ąćęłńóśźż".chars().cycle().take(1200).collect();
+        let out = chunk_document_hierarchical("solid.txt", &[blk(&solid, None, None)]);
+        let leaves: Vec<&HierChunk> =
+            out.iter().filter(|c| c.level == HIER_LEVEL_LEAF).collect();
+        assert!(leaves.len() > 1, "char-window fallback must split an unbroken run");
+        assert!(leaves.iter().all(|l| l.raw.chars().count() <= CHUNK_CHAR_TARGET));
+    }
+
+    /// Audit Fix 3 — leaf packing counts CHARS, not bytes: two 350-char Polish paragraphs
+    /// (~700 BYTES each) fit ONE ≤800-char leaf; byte counting wrongly split them.
+    #[test]
+    fn leaf_packing_counts_chars_not_bytes() {
+        let p1: String = "ąę".chars().cycle().take(350).collect();
+        let p2: String = "ół".chars().cycle().take(350).collect();
+        let body = format!("{p1}\n\n{p2}");
+        let out = chunk_document_hierarchical("pl.txt", &[blk(&body, None, None)]);
+        let leaves: Vec<&HierChunk> =
+            out.iter().filter(|c| c.level == HIER_LEVEL_LEAF).collect();
+        assert_eq!(
+            leaves.len(),
+            1,
+            "350+1+350 CHARS fits one ≤{CHUNK_CHAR_TARGET}-char leaf — packing must count chars, not bytes"
+        );
+    }
+
+    /// Audit Fix 2 — the L2 outline must pack line-based into >1 (≤3) chunks of
+    /// ≤[`CHUNK_CHAR_TARGET`] chars, so the embedder sees ALL of it instead of truncating one
+    /// unbounded chunk at 512 tokens; EVERY section (the LAST included) survives into some chunk,
+    /// degrading sentences before ever dropping a section.
+    #[test]
+    fn l2_outline_packs_into_bounded_line_based_chunks() {
+        let outline_l2 = |n: usize, name: &str| -> Vec<HierChunk> {
+            let blocks: Vec<ExtractedBlock> = (0..n)
+                .map(|i| {
+                    blk(
+                        &format!("Content of section number {i} goes right here."),
+                        None,
+                        Some(&format!("Heading {i}")),
+                    )
+                })
+                .collect();
+            chunk_document_hierarchical(name, &blocks)
+                .into_iter()
+                .filter(|c| c.level == HIER_LEVEL_SUMMARY)
+                .collect()
+        };
+
+        // 30 sections (~1.8k chars of full lines): packs into 2..=3 bounded chunks with the LAST
+        // section's SENTENCE intact (no degradation needed).
+        let l2 = outline_l2(30, "deep.pdf");
+        assert!(
+            l2.len() >= 2 && l2.len() <= 3,
+            "a ~1.8k-char outline must pack into 2..=3 bounded chunks, got {} of sizes {:?}",
+            l2.len(),
+            l2.iter().map(|c| c.raw.chars().count()).collect::<Vec<_>>()
+        );
+        assert!(
+            l2.iter().all(|c| c.raw.chars().count() <= CHUNK_CHAR_TARGET),
+            "every L2 chunk must be ≤CHUNK_CHAR_TARGET chars, got {:?}",
+            l2.iter().map(|c| c.raw.chars().count()).collect::<Vec<_>>()
+        );
+        assert!(
+            l2.iter()
+                .any(|c| c.raw.contains("Heading 29: Content of section number 29")),
+            "the LAST section keeps its sentence when the outline fits the 3-chunk budget"
+        );
+
+        // 100 sections (~6k chars of full lines): the degradation ladder condenses lines instead of
+        // dropping the tail — still ≤3 bounded chunks, and the LAST section's heading survives.
+        let l2 = outline_l2(100, "deeper.pdf");
+        assert!(
+            l2.len() >= 2 && l2.len() <= 3,
+            "a 100-section outline must degrade into 2..=3 bounded chunks, got {} of sizes {:?}",
+            l2.len(),
+            l2.iter().map(|c| c.raw.chars().count()).collect::<Vec<_>>()
+        );
+        assert!(
+            l2.iter().all(|c| c.raw.chars().count() <= CHUNK_CHAR_TARGET),
+            "every L2 chunk must be ≤CHUNK_CHAR_TARGET chars, got {:?}",
+            l2.iter().map(|c| c.raw.chars().count()).collect::<Vec<_>>()
+        );
+        assert!(
+            l2.iter().any(|c| c.raw.contains("Heading 99")),
+            "the LAST of 100 sections must survive into some L2 chunk (never tail-dropped)"
+        );
+    }
+
+    /// Audit Fix 4a — a leaf carries the page of ITS OWN source block, not the page of the
+    /// section's first block (the embed header must cite `p.2` for page-2 content).
+    #[test]
+    fn leaf_page_no_follows_its_source_block() {
+        let p1 = "alpha ".repeat(120);
+        let p2 = "omega ".repeat(120);
+        let blocks = vec![
+            blk(p1.trim_end(), Some(1), Some("Long Section")),
+            blk(p2.trim_end(), Some(2), Some("Long Section")),
+        ];
+        let out = chunk_document_hierarchical("paged.pdf", &blocks);
+        let leaves: Vec<&HierChunk> =
+            out.iter().filter(|c| c.level == HIER_LEVEL_LEAF).collect();
+        assert_eq!(leaves.len(), 2, "two ~720-char paragraphs cannot merge into one leaf");
+        let leaf2 = leaves
+            .iter()
+            .find(|l| l.raw.starts_with("omega"))
+            .expect("the page-2 leaf must exist");
+        assert_eq!(
+            leaf2.page_no,
+            Some(2),
+            "a leaf must carry its OWN source block's page, not the section head's"
+        );
+        assert!(
+            leaf2.embed_text.contains("p.2"),
+            "the embed header must cite the leaf's page: {:?}",
+            leaf2.embed_text
+        );
     }
 
     #[test]
