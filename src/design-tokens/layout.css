@@ -68,4 +68,12 @@
      consumer (the drill-down hosts' `top` offset) reads `var(--tabs-strip-
      height, 0px)` regardless, so a missing property degrades safely too. */
   --tabs-strip-height: 0px;
+
+  /* Stacking band for overlays teleported to <body> via `[appTeleportToBody]`
+     (source-picker popover/scrim, the note selection toolbar, the in-note Brain
+     popover, the [[ link-picker). Once an overlay is a direct child of <body> it
+     leaves its component's local stacking context, so it must beat ALL in-app
+     chrome (the highest in the app is 120) — one shared token keeps the four
+     portaled overlays on the same top layer instead of drifting apart. */
+  --z-overlay: 2000;
 }
