@@ -688,6 +688,16 @@ export class BrainComponent {
     if (/no text found/i.test(msg)) {
       return "No readable text found in that file, even after OCR.";
     }
+    // Decompression-bomb guard ("document too large / possible zip bomb") —
+    // NOT an unsupported file type; say what actually stopped the import.
+    if (/zip bomb|document too large/i.test(msg)) {
+      return "That file expands beyond the safe import limit — it can’t be imported.";
+    }
+    // Extraction succeeded but yielded nothing ("this document has no
+    // extractable text") — the type IS supported, the file is just empty of text.
+    if (/no extractable text/i.test(msg)) {
+      return "No extractable text found in that file.";
+    }
     // Encrypted / password-protected PDF.
     if (/password-protected|password|encrypted/i.test(msg)) {
       return "That PDF is password-protected — unlock it and try again.";
