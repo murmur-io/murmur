@@ -363,7 +363,9 @@ export class DetailComponent implements OnInit {
    * panel is (re)created for the Audio `@switch` case, so a viewChild method call
    * from the Note tab would hit a not-yet-existing instance — instead we pass the
    * target as an INPUT the panel applies on mount. `seq` (bumped per click) makes
-   * a repeat click on the same receipt re-fire the panel effect. Null when idle.
+   * a repeat click on the same receipt re-fire the panel effect. Null when idle
+   * AND after the panel acks consumption (`onSeekConsumed`) — a consumed target
+   * must not replay on the next Audio-tab visit.
    */
   readonly seekTarget = signal<{
     startS: number;
@@ -477,6 +479,20 @@ export class DetailComponent implements OnInit {
       replaceUrl: true,
     });
   });
+
+  /**
+   * The audio panel APPLIED the pending receipt seek: clear it so a later
+   * Audio-tab revisit (which recreates the panel) never replays the consumed
+   * seek/flash. The seq match guards the (theoretical) race where a newer chip
+   * click landed between the panel applying and this ack — the newer target
+   * survives to be applied. Repeat clicks on the SAME chip keep working: the
+   * note panel bumps `seq` per click, so a fresh non-null target always arrives.
+   */
+  onSeekConsumed(seq: number): void {
+    if (this.seekTarget()?.seq === seq) {
+      this.seekTarget.set(null);
+    }
+  }
 
   // --- Phase 5 model-provenance badge -------------------------------------
   /**

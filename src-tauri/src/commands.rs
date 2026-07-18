@@ -2744,8 +2744,9 @@ pub(crate) fn get_note_receipts_inner(
     };
     let segments = state.db.get_segments(meeting_id)?;
     // `claim_index` refers to the RAW markdown lines (`markdown.split('\n')`) the FE renders, so a
-    // chip maps straight back to its note line. `align_claims_to_segments` itself skips
-    // front-matter/headings/blockquotes/etc., so passing every line is safe.
+    // chip maps straight back to its note line. `align_claims_to_segments` skips a leading YAML
+    // front-matter block BY INDEX (metadata like `attendees:` never earns a receipt) plus headings/
+    // blockquotes/fences/etc., so passing every raw line is safe and indices keep this numbering.
     let lines: Vec<&str> = note.markdown.split('\n').collect();
     let receipts = crate::summarize::grounding::align_claims_to_segments(&lines, &segments);
     tracing::debug!(
