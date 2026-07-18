@@ -169,19 +169,43 @@ fn doc_sealed_at_rest_tx(tx: &rusqlite::Transaction<'_>, document_id: &str) -> R
 /// chunk indexing — the far more common path, since it runs on every recording Stop, not just
 /// the startup catch-up — is closed here too, both callers now sharing this one helper).
 fn embed_in_sub_batches(embedder: &dyn Embedder, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+    embed_in_sub_batches_progress(embedder, texts, &no_embed_progress)
+}
+
+/// A per-sub-batch embed-progress callback: `(sub_batches_done, sub_batches_total)`. Used by the
+/// document-import path so the FE can render "Embedding k/M" during a large document's embed loop
+/// (Brain v3 PR-4, Fix 3). A no-op ([`no_embed_progress`]) is used everywhere else (meeting/topic
+/// indexing, tests) so no other caller changes behavior.
+pub(crate) type EmbedProgressFn<'a> = dyn Fn(usize, usize) + 'a;
+
+/// The no-op [`EmbedProgressFn`] — the default for every embed caller that doesn't report progress.
+pub(crate) fn no_embed_progress(_done: usize, _total: usize) {}
+
+/// [`embed_in_sub_batches`] with a per-sub-batch progress callback. Same sub-batching + pacing; after
+/// each sub-batch completes it reports `(done, total)` sub-batch counts. `total` is `1` for the
+/// single-call small path so a small document still reports 1/1 at completion.
+fn embed_in_sub_batches_progress(
+    embedder: &dyn Embedder,
+    texts: &[String],
+    progress: &EmbedProgressFn<'_>,
+) -> Result<Vec<Vec<f32>>> {
     const SUB_BATCH: usize = 8;
     if texts.is_empty() {
         return Ok(Vec::new());
     }
     if texts.len() <= SUB_BATCH {
-        return embedder.embed_passage(texts);
+        let v = embedder.embed_passage(texts)?;
+        progress(1, 1);
+        return Ok(v);
     }
+    let total = texts.len().div_ceil(SUB_BATCH);
     let mut vectors = Vec::with_capacity(texts.len());
     for (i, sub_batch) in texts.chunks(SUB_BATCH).enumerate() {
         if i > 0 {
             std::thread::sleep(std::time::Duration::from_millis(30));
         }
         vectors.extend(embedder.embed_passage(sub_batch)?);
+        progress(i + 1, total);
     }
     Ok(vectors)
 }
@@ -5218,6 +5242,18 @@ impl Db {
         document_id: &str,
         embedder: Option<&dyn Embedder>,
     ) -> Result<()> {
+        self.index_document_chunks_progress(document_id, embedder, &no_embed_progress)
+    }
+
+    /// [`Db::index_document_chunks`] with a per-sub-batch embed-progress callback (Brain v3 PR-4,
+    /// Fix 3): reports `(done, total)` embed sub-batches so the import path can stream "Embedding k/M"
+    /// to the FE. Identical behavior otherwise — the no-op default preserves every existing caller.
+    pub fn index_document_chunks_progress(
+        &self,
+        document_id: &str,
+        embedder: Option<&dyn Embedder>,
+        embed_progress: &EmbedProgressFn<'_>,
+    ) -> Result<()> {
         let Some((_folder_id, name, text)) = self.get_document(document_id)? else {
             return Ok(()); // unknown document — nothing to index.
         };
@@ -5254,7 +5290,9 @@ impl Db {
             .map(|&i| hier[i].embed_text.clone())
             .collect();
         let embed_vecs: Vec<Vec<f32>> = match embedder {
-            Some(e) if !embed_texts.is_empty() => embed_in_sub_batches(e, &embed_texts)?,
+            Some(e) if !embed_texts.is_empty() => {
+                embed_in_sub_batches_progress(e, &embed_texts, embed_progress)?
+            }
             _ => Vec::new(), // model absent → chunk-only (FTS still covers it); vectors come later.
         };
         // Map HierChunk-index → its vector (only for embed-worthy chunks that actually got embedded).
@@ -5329,12 +5367,28 @@ impl Db {
         body: &str,
         embedder: Option<&dyn Embedder>,
     ) -> Result<()> {
+        self.index_note_chunks_progress(note_id, title, body, embedder, &no_embed_progress)
+    }
+
+    /// [`Db::index_note_chunks`] with a per-sub-batch embed-progress callback (Brain v3 PR-4, Fix 3):
+    /// an imported NOTE document streams "Embedding k/M" like an uploaded document. Identical behavior
+    /// otherwise — the no-op default preserves every existing caller (recording Stop, reindex).
+    pub fn index_note_chunks_progress(
+        &self,
+        note_id: &str,
+        title: &str,
+        body: &str,
+        embedder: Option<&dyn Embedder>,
+        embed_progress: &EmbedProgressFn<'_>,
+    ) -> Result<()> {
         let chunks = crate::embed::chunk_note(title, "", body);
         // Sub-batch to bound the per-call Metal tensor for a long note (mirror
         // index_meeting_chunks/index_document_chunks — this indexer was the one remaining
         // whole-item single-call embed, brain-v3 audit H3).
         let vectors = match embedder {
-            Some(e) if !chunks.is_empty() => embed_in_sub_batches(e, &chunks)?,
+            Some(e) if !chunks.is_empty() => {
+                embed_in_sub_batches_progress(e, &chunks, embed_progress)?
+            }
             _ => Vec::new(), // model absent → chunk-only (FTS still covers it); vectors come later.
         };
         let this_doc = [note_id.to_string()];
@@ -21170,6 +21224,46 @@ mod tests {
             calls.len() > 1,
             "10 chunks over an 8-per-batch cap must take more than one embed call, got: {calls:?}"
         );
+    }
+
+    /// Brain v3 PR-4 Fix 3 (RED→GREEN): `embed_in_sub_batches_progress` reports `(done, total)`
+    /// sub-batch counts as each embed sub-batch completes — the real counts the import path streams to
+    /// the FE ("Embedding k/M") instead of the old always-`0/0`. 20 texts over an 8-per-batch cap →
+    /// 3 sub-batches, so progress must land 1/3, 2/3, 3/3 in order and end at total==done.
+    #[test]
+    fn embed_sub_batch_progress_reports_real_running_counts() {
+        let embedder = RecordingEmbedder {
+            call_sizes: std::sync::Mutex::new(Vec::new()),
+        };
+        let texts: Vec<String> = (0..20).map(|i| format!("chunk {i}")).collect();
+        let seen: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
+        let progress = |done: usize, total: usize| seen.lock().unwrap().push((done, total));
+
+        let vecs = embed_in_sub_batches_progress(&embedder, &texts, &progress).unwrap();
+        assert_eq!(vecs.len(), 20, "every text is embedded exactly once");
+
+        let seen = seen.into_inner().unwrap();
+        assert_eq!(
+            seen,
+            vec![(1, 3), (2, 3), (3, 3)],
+            "progress reports each sub-batch as done/total, in order, ending at total==done"
+        );
+    }
+
+    /// Fix 3: the small-input path (<= one sub-batch) still reports a single 1/1 completion, so a tiny
+    /// document's progress bar reaches 100% rather than never firing.
+    #[test]
+    fn embed_sub_batch_progress_small_input_reports_one_of_one() {
+        let embedder = RecordingEmbedder {
+            call_sizes: std::sync::Mutex::new(Vec::new()),
+        };
+        let texts: Vec<String> = (0..3).map(|i| format!("chunk {i}")).collect();
+        let seen: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
+        let progress = |done: usize, total: usize| seen.lock().unwrap().push((done, total));
+
+        let vecs = embed_in_sub_batches_progress(&embedder, &texts, &progress).unwrap();
+        assert_eq!(vecs.len(), 3);
+        assert_eq!(seen.into_inner().unwrap(), vec![(1, 1)], "small input → single 1/1 completion");
     }
 
     /// 2026-07-13 launch-freeze fix (round 3): `index_meeting_chunks` (the REGULAR transcript/note

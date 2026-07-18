@@ -2871,25 +2871,47 @@ pub async fn import_document(
     let folder2 = folder_id.clone();
     crate::perf::run_heavy(&sem, move || {
         crate::events::emit_doc_import(&app2, "", "extracting", 0, 0);
-        // EXTRACT (pure `path → text`, no DB/state).
-        let (name, stored) = extract_document_text(&path2)?;
+        // EXTRACT (pure `path → text`, no DB/state). The progress closure translates the extractor's
+        // per-page signal into `EVENT_DOC_IMPORT` "extracting done/total" events (Fix 3: real counts)
+        // and records an OCR-cap truncation so the "done" event can flag a partial import (Fix 2).
+        let ocr_truncated = std::cell::Cell::new(false);
+        let (name, stored) = {
+            let app_p = &app2;
+            let extract_progress = |p: crate::extract::ExtractProgress| match p {
+                crate::extract::ExtractProgress::Page { done, total } => {
+                    crate::events::emit_doc_import(app_p, "", "extracting", done, total);
+                }
+                crate::extract::ExtractProgress::OcrTruncated { .. } => {
+                    ocr_truncated.set(true);
+                }
+            };
+            extract_document_text(&path2, &extract_progress)?
+        };
 
         crate::events::emit_doc_import(&app2, "", "chunking", 0, 0);
         // GATE (re-checked from the cloned handle) + INSERT + CHUNK-ONLY index (FTS durable now).
         let id = insert_extracted_document(&db, &unlocked, &folder2, &name, &stored)?;
 
         // EMBED only if the RAM floor permitted (else defer to the repair tick). Best-effort: a
-        // failure logs (no PII) and leaves the durable chunks/FTS + row in place.
+        // failure logs (no PII) and leaves the durable chunks/FTS + row in place. Per-sub-batch
+        // progress (Fix 3) streams "embedding done/total" as each embed sub-batch completes.
         if ram_permits {
             let embedder = crate::embed::embed_model_present().then(crate::embed::active_embedder);
             crate::events::emit_doc_import(&app2, &id, "embedding", 0, 0);
-            if let Err(e) = index_document_row_kind_routed(&db, &id, embedder.as_deref()) {
+            let id_for_progress = id.clone();
+            let embed_progress = |done: usize, total: usize| {
+                crate::events::emit_doc_import(&app2, &id_for_progress, "embedding", done, total);
+            };
+            if let Err(e) =
+                index_document_row_kind_routed_progress(&db, &id, embedder.as_deref(), &embed_progress)
+            {
                 tracing::warn!(target: "rag", error = %e, document_id = %id, "import: embed failed (content stored)");
             }
         } else {
             tracing::info!(target: "documents", document_id = %id, "import: RAM floor — deferring embed to repair tick");
         }
-        crate::events::emit_doc_import(&app2, &id, "done", 0, 0);
+        // DONE — carry the OCR-cap truncation flag so the FE can surface a partial-import notice.
+        crate::events::emit_doc_import_done(&app2, &id, ocr_truncated.get());
         Ok(id)
     })
     .await
@@ -2912,7 +2934,7 @@ pub(crate) fn import_document_inner(
     folder_id: &str,
 ) -> Result<String, AppError> {
     // EXTRACT (allowlist + `path → text`, pure, no DB/state).
-    let (name, stored) = extract_document_text(path)?;
+    let (name, stored) = extract_document_text(path, &crate::extract::no_progress)?;
     // GATE + INSERT + chunk-only index (the shared seam the async wrapper also uses).
     insert_extracted_document(&state.db, &state.unlocked_folders, folder_id, &name, &stored)
 }
@@ -2923,7 +2945,10 @@ pub(crate) fn import_document_inner(
 /// Tokio runtime inside `run_heavy`. Fails CLOSED with `AppError::InvalidArg` for an unsupported /
 /// extension-less / unreadable / no-extractable-text file. Returns the file-name component as the
 /// display name (never an on-disk path — no PII in the stored name/logs).
-fn extract_document_text(path: &str) -> Result<(String, String), AppError> {
+fn extract_document_text(
+    path: &str,
+    progress: &crate::extract::ProgressFn<'_>,
+) -> Result<(String, String), AppError> {
     // Extension allowlist. Lowercased; an extension-less path is rejected.
     let p = std::path::Path::new(path);
     let ext = p
@@ -2940,9 +2965,10 @@ fn extract_document_text(path: &str) -> Result<(String, String), AppError> {
     };
 
     // EXTRACT to blocks (page/heading preserved), then serialize to the storable text form. A
-    // non-UTF-8 / unreadable / malformed / scanned-PDF / zip-bomb file fails closed inside
-    // `extract_blocks` (the OOXML/XLSX decompression-ratio guard lives there — see extract/ooxml.rs).
-    let blocks = crate::extract::extract_blocks(p, &ext)?;
+    // non-UTF-8 / unreadable / malformed / scanned-PDF / zip-bomb / over-size file fails closed inside
+    // `extract_blocks` (the OOXML/XLSX decompression-ratio guard + the universal extracted-text
+    // ceiling live there — see extract/mod.rs + extract/ooxml.rs). `progress` streams per-page counts.
+    let blocks = crate::extract::extract_blocks(p, &ext, progress)?;
     if blocks.is_empty() || blocks.iter().all(|b| b.text.trim().is_empty()) {
         return Err(AppError::InvalidArg(
             "this document has no extractable text".into(),
@@ -13125,6 +13151,24 @@ pub(crate) fn index_document_row_kind_routed(
     document_id: &str,
     embedder: Option<&dyn crate::embed::Embedder>,
 ) -> Result<(), AppError> {
+    index_document_row_kind_routed_progress(
+        db,
+        document_id,
+        embedder,
+        &crate::storage::db::no_embed_progress,
+    )
+}
+
+/// [`index_document_row_kind_routed`] with a per-sub-batch embed-progress callback (Brain v3 PR-4,
+/// Fix 3): the document-import path streams "Embedding k/M" to the FE as each embed sub-batch lands.
+/// KIND-ROUTED exactly like the no-op variant — a note routes through `index_note_chunks_progress`,
+/// an uploaded document through `index_document_chunks_progress`.
+pub(crate) fn index_document_row_kind_routed_progress(
+    db: &crate::storage::Db,
+    document_id: &str,
+    embedder: Option<&dyn crate::embed::Embedder>,
+    embed_progress: &crate::storage::db::EmbedProgressFn<'_>,
+) -> Result<(), AppError> {
     match db.get_note_row(document_id)? {
         Some(row) => {
             // `kind='note'` — mirror `update_note_doc_inner`'s title fallback + body strip exactly.
@@ -13132,10 +13176,10 @@ pub(crate) fn index_document_row_kind_routed(
             let title = title.trim();
             let title = if title.is_empty() { "Untitled" } else { title };
             let (_yaml, body) = crate::storage::db::split_front_matter(&row.text);
-            db.index_note_chunks(document_id, title, &body, embedder)
+            db.index_note_chunks_progress(document_id, title, &body, embedder, embed_progress)
         }
         // Uploaded document (`kind='document'`) — the raw-text path is correct (no front-matter).
-        None => db.index_document_chunks(document_id, embedder),
+        None => db.index_document_chunks_progress(document_id, embedder, embed_progress),
     }
 }
 

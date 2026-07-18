@@ -13,8 +13,18 @@ use crate::error::{AppError, Result};
 /// (we want readable flow text for embedding/snippets, not a terminal column layout).
 const RENDER_WIDTH: usize = 100;
 
-/// Extract an HTML file into one plain-text block.
+/// Extract an HTML file into one plain-text block. A file-size sanity cap
+/// ([`super::MAX_FLOW_FILE_BYTES`]) is applied BEFORE the read (HTML has no decompression step, so a
+/// multi-gigabyte `.html` would otherwise be slurped whole into RAM before any block-level check).
 pub fn extract_html(path: &Path) -> Result<Vec<ExtractedBlock>> {
+    // FILE-SIZE SANITY CAP (flow format): reject an oversized file before reading it into memory.
+    let meta = std::fs::metadata(path)
+        .map_err(|e| AppError::InvalidArg(format!("could not read HTML: {e}")))?;
+    if meta.len() > super::MAX_FLOW_FILE_BYTES {
+        return Err(AppError::InvalidArg(
+            "this HTML is too large to import — it exceeds the size limit".into(),
+        ));
+    }
     let bytes = std::fs::read(path)
         .map_err(|e| AppError::InvalidArg(format!("could not read HTML: {e}")))?;
     let text = html2text::from_read(bytes.as_slice(), RENDER_WIDTH)
