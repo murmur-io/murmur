@@ -136,7 +136,15 @@ export class RecordComponent implements OnInit {
     const liveConn = c ? c.roleLiveConnection || c.brainBackend : "";
     const enabled = !!c && c.realtimeReactions === true && liveConn !== "off";
     return (
-      enabled ||
+      // D2 (idle redesign, 2026-07-18): `realtimeReactions` surfaces the companion
+      // editor + Ask Brain ONLY when a live meeting exists. At pure idle (no
+      // meeting) this term used to be true on the setting alone, mounting the
+      // embedded companion editor with a null note id — which then spun
+      // "Loading note…" forever. Every OTHER trigger below is already an active
+      // state (recording / listening / processing / enhance), so gating just this
+      // one leaves the idle screen as the launch hero (+ analytics) with no
+      // purposeless, permanently-loading note pane.
+      (enabled && !!this.store.meetingId()) ||
       this.store.isRecording() ||
       this.assistant.listening() ||
       this.assistant.processing() ||

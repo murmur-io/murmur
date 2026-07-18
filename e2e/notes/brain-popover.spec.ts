@@ -2,8 +2,14 @@ import { test, expect } from "@playwright/test";
 import { mockNotes } from "./mock-invoke";
 
 /**
+ * NOTE (2026-07-18 teleport): the floating bubble + Brain popover boxes are
+ * TELEPORTED to `<body>` (appTeleportToBody) so `position: fixed` escapes any
+ * filtered/transformed ancestor. They therefore no longer live INSIDE their
+ * `app-note-selection-toolbar` / `app-note-brain-popover` hosts in the DOM — this
+ * spec locates the boxes by their class (`.sel-bar` / `.brain-pop`) at page level.
+ *
  * The selection Brain-assistant popover (FP3). Selecting body text now floats a
- * FORMATTING BUBBLE (`app-note-selection-toolbar`); the Brain popover opens only
+ * FORMATTING BUBBLE (`.sel-bar`); the Brain popover (`.brain-pop`) opens only
  * when its "Ask Brain" button is pressed — the modal no longer auto-appears.
  * `onBodySelect()` is wired to the textarea's (mouseup)/(keyup)/(select) events
  * and reads `selectionStart/End`. We simulate that by focusing `.body-area`,
@@ -47,12 +53,12 @@ test("selecting body text floats the bubble; Ask Brain → Refine → Accept upd
   // The FORMATTING BUBBLE floats first (not the Brain modal). Its "Ask Brain"
   // button opens the popover. Use dispatchEvent("click") — a plain DOM click that
   // doesn't disturb the live textarea selection (see the Refine note below).
-  const bubble = page.locator("app-note-selection-toolbar");
+  const bubble = page.locator(".sel-bar");
   await expect(bubble).toBeVisible();
-  await expect(page.locator("app-note-brain-popover")).toHaveCount(0);
+  await expect(page.locator(".brain-pop")).toHaveCount(0);
   await bubble.getByRole("button", { name: "Ask Brain" }).dispatchEvent("click");
 
-  const popover = page.locator("app-note-brain-popover");
+  const popover = page.locator(".brain-pop");
   await expect(popover).toBeVisible();
 
   // The ClickUp-style command menu: the "Ask Brain to edit…" input + the 5 quick
@@ -149,11 +155,11 @@ test("Find related: an org-kind citation routes to the read-only /org-item viewe
     el.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
   });
 
-  const bubble = page.locator("app-note-selection-toolbar");
+  const bubble = page.locator(".sel-bar");
   await expect(bubble).toBeVisible();
   await bubble.getByRole("button", { name: "Ask Brain" }).dispatchEvent("click");
 
-  const popover = page.locator("app-note-brain-popover");
+  const popover = page.locator(".brain-pop");
   await expect(popover).toBeVisible();
   await popover.getByRole("button", { name: "Find related" }).dispatchEvent("click");
 
@@ -223,11 +229,11 @@ test("Find related: Insert link drops a [[Title]] wikilink into the body instead
     el.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
   });
 
-  const bubble = page.locator("app-note-selection-toolbar");
+  const bubble = page.locator(".sel-bar");
   await expect(bubble).toBeVisible();
   await bubble.getByRole("button", { name: "Ask Brain" }).dispatchEvent("click");
 
-  const popover = page.locator("app-note-brain-popover");
+  const popover = page.locator(".brain-pop");
   await expect(popover).toBeVisible();
   await popover.getByRole("button", { name: "Find related" }).dispatchEvent("click");
 

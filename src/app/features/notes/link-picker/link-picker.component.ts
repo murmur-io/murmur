@@ -17,6 +17,7 @@ import { IpcService } from "../../../core/ipc.service";
 import type { NoteCitation } from "../../../core/models";
 import { DebounceService } from "../../../services/debounce.service";
 import { RepositionOnScrollDirective } from "../note-brain-popover/reposition-on-scroll.directive";
+import { TeleportToBodyDirective } from "../../../design-system/teleport-to-body.directive";
 
 /** How long to wait after the last keystroke before re-querying the backend. */
 const QUERY_DEBOUNCE_MS = 150;
@@ -70,7 +71,7 @@ const KEYBOARD_LOAD_AHEAD_ROWS = 3;
 @Component({
   selector: "app-link-picker",
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [RepositionOnScrollDirective],
+  imports: [RepositionOnScrollDirective, TeleportToBodyDirective],
   templateUrl: "./link-picker.component.html",
   styleUrl: "./link-picker.component.scss",
 })
