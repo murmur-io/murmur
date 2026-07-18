@@ -41,9 +41,16 @@ pub struct LockedMeetingAudio {
 }
 
 /// Return shape of [`Db::reblank_locked_folders_at_rest`]: the locked meetings' audio to
-/// re-seal, the rollup vault exports to delete, and `(note_id, exported_path)` of every
-/// authored note whose session-re-exported `.md` must be reconciled (audit F2, W5 semantics).
-pub type LockedAtRestCleanup = (Vec<LockedMeetingAudio>, Vec<String>, Vec<(String, String)>);
+/// re-seal, the rollup vault exports to delete, `(note_id, exported_path)` of every authored note
+/// whose session-re-exported `.md` must be reconciled (audit F2, W5 semantics), and (brain-v3 audit
+/// Fix 4) the `(is_meeting, source_id)` of every VISIBLE source whose managed block just had a
+/// crash-leftover sealed-neighbour marker stripped — the caller re-exports each such source's `.md`.
+pub type LockedAtRestCleanup = (
+    Vec<LockedMeetingAudio>,
+    Vec<String>,
+    Vec<(String, String)>,
+    Vec<(bool, String)>,
+);
 
 /// One meeting eligible for storage prune: NOT in a locked folder, with its three audio paths.
 /// Ordered oldest-first by [`Db::prunable_audio_candidates`]. Any column may be `None`.
@@ -157,6 +164,51 @@ fn doc_sealed_at_rest_tx(tx: &rusqlite::Transaction<'_>, document_id: &str) -> R
         |r| Ok(r.get::<_, i64>(0)? != 0),
     )
     .map_err(map_err)
+}
+
+/// TOCTOU seal re-check for a MEETING endpoint, run INSIDE the caller's write transaction — the
+/// meeting-side twin of [`doc_sealed_at_rest_tx`]. A `lock_folder` seal blanks a meeting note's
+/// plaintext `markdown` into `content_blob` (`markdown=''`, `content_blob` kept) — the same
+/// session-independent, DB-side sealed-at-rest invariant [`upsert_live_bullets`] keys on. Brain v3
+/// audit Fix 0: the LINK WRITERS (`index_wikilinks_for_source`, `auto_link_semantic`) resolve their
+/// target set OUTSIDE the write tx (against a possibly-stale `unlocked` snapshot), so a `lock_folder`
+/// committing its `purge_links_tx` BETWEEN that snapshot and the writer's own commit could re-insert
+/// a `links` row naming the now-sealed endpoint. Keying the refusal on this invariant (not the
+/// caller's snapshot) stops a link that reveals a sealed neighbour's existence/title from landing at
+/// rest behind the lock. Returns `true` ⇒ the endpoint is sealed-at-rest and the caller must NOT
+/// write an edge touching it. UNSEAL/session-unlock un-blanks `markdown` before re-deriving, so this
+/// reads `false` there and the re-derive proceeds — the same contract the chunk indexers carry.
+fn meeting_sealed_at_rest_tx(tx: &rusqlite::Transaction<'_>, meeting_id: &str) -> Result<bool> {
+    tx.query_row(
+        "SELECT EXISTS(
+           SELECT 1 FROM notes
+            WHERE meeting_id = ?1
+              AND content_blob IS NOT NULL
+              AND (markdown IS NULL OR markdown = '')
+         )",
+        rusqlite::params![meeting_id],
+        |r| Ok(r.get::<_, i64>(0)? != 0),
+    )
+    .map_err(map_err)
+}
+
+/// Is a link ENDPOINT `(kind, id)` sealed-at-rest RIGHT NOW, inside the caller's write tx? A
+/// `meeting` endpoint reads [`meeting_sealed_at_rest_tx`]; a `note`/`document` endpoint (both live in
+/// the `documents` id space) reads [`doc_sealed_at_rest_tx`]. Brain v3 audit Fix 0 — the one probe
+/// the link writers key their in-tx edge refusal on, so a link naming a sealed neighbour never lands
+/// at rest.
+fn link_endpoint_sealed_at_rest_tx(
+    tx: &rusqlite::Transaction<'_>,
+    kind: crate::links::LinkKind,
+    id: &str,
+) -> Result<bool> {
+    match kind {
+        crate::links::LinkKind::Meeting => meeting_sealed_at_rest_tx(tx, id),
+        // A `note` id IS a `documents` id, so both non-meeting kinds probe the documents row.
+        crate::links::LinkKind::Note | crate::links::LinkKind::Document => {
+            doc_sealed_at_rest_tx(tx, id)
+        }
+    }
 }
 
 /// Embed a batch of augmented chunk texts in small sub-batches instead of ONE call sized to the
@@ -3458,8 +3510,9 @@ impl Db {
         // blanked on resolve and carry no content).
         Self::purge_pending_audit_findings_tx(&tx, &[id.to_string()])?;
         // Brain v3 PR-3: purge every `links` row whose SRC OR DST is this deleted meeting in the same
-        // tx — a link to a gone meeting is a dangling edge (and would name a now-absent neighbour).
-        Self::purge_links_tx(&tx, &[id.to_string()], &[])?;
+        // tx — a link to a gone meeting is a dangling edge (and would name a now-absent neighbour). A
+        // permanent DELETE keeps NO decision row (`preserve_decisions=false`): the endpoint is gone.
+        Self::purge_links_tx(&tx, &[id.to_string()], &[], false)?;
         // Brain v2 L2.1: purge ALL memory rollups in this same tx — a rollup may paraphrase the
         // deleted meeting's (now-gone) facts; the survivors regenerate on the next hourly pass
         // from the remaining visible facts only. The caller deletes the exported `.md`s.
@@ -4154,12 +4207,13 @@ impl Db {
         // id to match, e.g. a stale finding's `see [[superseding note]]`; a seal anywhere
         // invalidates the pass's visibility snapshot). Resolved rows were blanked on resolve.
         Self::purge_all_pending_audit_findings_tx(&tx)?;
-        // Brain v3 PR-3 LINK-ENGINE LOCK-SAFETY: purge every `links` row whose SRC OR DST is a
+        // Brain v3 PR-3 LINK-ENGINE LOCK-SAFETY: purge every DERIVED `links` row whose SRC OR DST is a
         // just-sealed meeting in this SAME seal tx — a link names a neighbour (its title/existence
         // reveals a possibly-sealed item), so it must not survive at rest for a sealed endpoint.
         // Re-derived on unlock (wikilink + semantic pass). Document endpoints of these folders are
-        // covered by the `purge_doc_chunks_for_documents` leg the lock caller runs alongside.
-        Self::purge_links_tx(&tx, meeting_ids, &[])?;
+        // covered by the `purge_doc_chunks_for_documents` leg the lock caller runs alongside. A SEAL
+        // preserves the user's decision rows (`preserve_decisions=true`, Fix 1).
+        Self::purge_links_tx(&tx, meeting_ids, &[], true)?;
         // Brain v2 L2.1 LOCK-SAFETY: memory ROLLUPS are cross-meeting synthesis that may paraphrase
         // the just-sealed facts — purge ALL of them in this SAME seal tx (cheap, re-derivable: the
         // next hourly pass regenerates from the still-VISIBLE facts only). The caller deletes the
@@ -5219,8 +5273,9 @@ impl Db {
         let tx = conn.transaction().map_err(map_err)?;
         Self::purge_doc_chunks_tx(&tx, &[id.to_string()])?;
         // Brain v3 PR-3: purge every `links` row whose SRC OR DST is this deleted document/note in the
-        // same tx — a note id IS a document id, so both kinds are covered by `purge_links_tx`.
-        Self::purge_links_tx(&tx, &[], &[id.to_string()])?;
+        // same tx — a note id IS a document id, so both kinds are covered by `purge_links_tx`. A
+        // permanent DELETE keeps NO decision row (`preserve_decisions=false`).
+        Self::purge_links_tx(&tx, &[], &[id.to_string()], false)?;
         // Vault Audit: a pending finding sourcing or targeting this document/note quotes its
         // content/title — drop it in the same delete tx (mirrors `delete_meeting`'s purge).
         Self::purge_pending_audit_findings_tx(&tx, &[id.to_string()])?;
@@ -5495,10 +5550,11 @@ impl Db {
         let mut conn = self.lock();
         let tx = conn.transaction().map_err(map_err)?;
         Self::purge_doc_chunks_tx(&tx, document_ids)?;
-        // Brain v3 PR-3 LINK-ENGINE LOCK-SAFETY: purge every `links` row whose SRC OR DST is a
+        // Brain v3 PR-3 LINK-ENGINE LOCK-SAFETY: purge every DERIVED `links` row whose SRC OR DST is a
         // just-sealed document/note (a note id IS a document id) in this SAME seal tx — a link names
-        // a neighbour, so it must not survive at rest for a sealed endpoint. Re-derived on unlock.
-        Self::purge_links_tx(&tx, &[], document_ids)?;
+        // a neighbour, so it must not survive at rest for a sealed endpoint. Re-derived on unlock. A
+        // SEAL preserves the user's decision rows (`preserve_decisions=true`, Fix 1).
+        Self::purge_links_tx(&tx, &[], document_ids, true)?;
         // Vault Audit LOCK-SAFETY: the callers are seal-side (`lock_folder`'s document leg, the
         // relock reblank) — purge ALL pending findings in this SAME tx (rollup posture; evidence
         // may cite third-party titles no document id can match). Findings are cheap re-derivable
@@ -8282,8 +8338,9 @@ impl Db {
         // Purge every edge incident on a to-be-deleted document id in the SAME tx so no link row is
         // left dangling to a row that no longer exists. Only the deleted derived-document ids need
         // purging: authored notes + meetings are REPARENTED out of the folder (above / by the command
-        // layer), never deleted here, so their edges stay valid. Same choke-point as the seal purge.
-        Self::purge_links_tx(&tx, &[], &document_ids)?;
+        // layer), never deleted here, so their edges stay valid. Same choke-point as the seal purge. A
+        // permanent DELETE keeps NO decision row (`preserve_decisions=false`).
+        Self::purge_links_tx(&tx, &[], &document_ids, false)?;
         // Explicit (rather than FK-cascade) so the delete is deterministic and trigger-visible. Scoped
         // to non-authored documents — authored notes were reparented out above (and refused if not).
         tx.execute(
@@ -8570,11 +8627,12 @@ impl Db {
             // snapshot). Resolved rows were blanked on resolve and survive.
             Self::purge_all_pending_audit_findings_tx(&tx)?;
 
-            // Brain v3 PR-3 LINK-ENGINE LOCK-SAFETY: purge every `links` row whose SRC OR DST is a
-            // meeting OR document/note in these (re-blanked / sealed) folders in this SAME relock tx —
+            // Brain v3 PR-3 LINK-ENGINE LOCK-SAFETY: purge every DERIVED `links` row whose SRC OR DST is
+            // a meeting OR document/note in these (re-blanked / sealed) folders in this SAME relock tx —
             // a link names a neighbour (its title/existence reveals a possibly-sealed item). Same
-            // purge-on-seal contract as the chunks above; re-derived on unlock.
-            Self::purge_links_tx(&tx, &meeting_ids, &document_ids)?;
+            // purge-on-seal contract as the chunks above; re-derived on unlock. A relock/seal preserves
+            // the user's decision rows (`preserve_decisions=true`, Fix 1).
+            Self::purge_links_tx(&tx, &meeting_ids, &document_ids, true)?;
             // Brain v2 L2.1 LOCK-SAFETY: purge ALL memory rollups in this SAME relock tx — a rollup
             // may paraphrase the just-re-sealed facts. Cheap re-derivable synthesis; regenerates
             // from VISIBLE facts on the next hourly pass. The caller deletes the exported `.md`s.
@@ -8808,15 +8866,55 @@ impl Db {
             [],
         )
         .map_err(map_err)?;
-        // Brain v3 PR-3 LINK-ENGINE LOCK-SAFETY: purge every `links` row whose meeting endpoint is in
-        // a locked folder, OR whose document/note endpoint is in a locked folder, in this same
+        // Brain-v3 audit Fix 4 (startup net): a crash BETWEEN a seal and its marker-strip could leave a
+        // sealed neighbour's `[[Title]]` in a VISIBLE source note's plaintext (DB + `.md`). Repair it
+        // here, BEFORE the links purge deletes the rows that name the affected sources. Resolve the
+        // locked folders' meeting + document id lists, then strip each sealed title from every visible
+        // source's managed block in THIS reconciliation tx. The `changed` sources' `.md` re-export is
+        // done by the caller ([`crate::state`] `reconcile_locked_at_rest`) via `changed_marker_sources`.
+        let locked_meeting_ids: Vec<String> = {
+            let mut stmt = tx.prepare(LOCKED_MEETINGS).map_err(map_err)?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0)).map_err(map_err)?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r.map_err(map_err)?);
+            }
+            out
+        };
+        let locked_document_ids: Vec<String> = {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT id FROM documents WHERE folder_id IN (SELECT id FROM folders WHERE locked = 1)",
+                )
+                .map_err(map_err)?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0)).map_err(map_err)?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r.map_err(map_err)?);
+            }
+            out
+        };
+        let changed_marker_sources = Self::strip_sealed_neighbour_markers_tx(
+            &tx,
+            &locked_meeting_ids,
+            &locked_document_ids,
+        )?;
+        // Brain v3 PR-3 LINK-ENGINE LOCK-SAFETY: purge every DERIVED `links` row whose meeting endpoint
+        // is in a locked folder, OR whose document/note endpoint is in a locked folder, in this same
         // reconciliation transaction — so a crash-while-unlocked (which may have re-derived
         // wikilink/semantic edges against since-sealed items) cannot leave a link naming a sealed
         // neighbour at rest after a restart. Re-derived on the next unlock. A note id IS a document
         // id, so the document leg's `IN ('note','document')` covers both kinds.
+        //
+        // Brain-v3 audit Fix 1: PRESERVE a user's decision rows (`LINK_DECISION_KEEP` — dismissed
+        // tombstones + accepted edges) across this reconcile, mirroring `purge_links_tx`, so a restart
+        // (like a lock→unlock) never resurrects a dismissed suggestion or forgets an accepted edge.
+        // These rows carry ids/kind/edge_type/score only — no titles/plaintext — and stay invisible
+        // via the both-endpoint read gate while an endpoint is sealed.
+        let keep = Self::LINK_DECISION_KEEP;
         tx.execute(
             &format!(
-                "DELETE FROM links WHERE \
+                "DELETE FROM links WHERE ( \
                    ((src_kind = 'meeting' AND src_id IN ({LOCKED_MEETINGS})) \
                     OR (dst_kind = 'meeting' AND dst_id IN ({LOCKED_MEETINGS}))) \
                    OR (src_kind IN ('note','document') AND src_id IN \
@@ -8824,7 +8922,8 @@ impl Db {
                            (SELECT id FROM folders WHERE locked = 1))) \
                    OR (dst_kind IN ('note','document') AND dst_id IN \
                         (SELECT id FROM documents WHERE folder_id IN \
-                           (SELECT id FROM folders WHERE locked = 1)))"
+                           (SELECT id FROM folders WHERE locked = 1)))) \
+                   AND NOT ({keep})"
             ),
             [],
         )
@@ -8896,7 +8995,7 @@ impl Db {
             out
         };
         tx.commit().map_err(map_err)?;
-        Ok((audio, rollup_exports, note_md_exports))
+        Ok((audio, rollup_exports, note_md_exports, changed_marker_sources))
     }
 
     /// Folder ids that are sealed (`locked=1`) — used to re-blank every sealed note on relock-all.
@@ -10249,6 +10348,16 @@ impl Db {
         let now = chrono::Utc::now().timestamp_millis();
         let mut conn = self.lock();
         let tx = conn.transaction().map_err(map_err)?;
+        // Fix 0 (brain-v3 audit) — IN-TX sealed-at-rest SOURCE re-check (TOCTOU): the `targets` above
+        // were resolved OUTSIDE this tx against a possibly-stale `unlocked` snapshot. If a
+        // `lock_folder` committed its seal (running `purge_links_tx`) in the meantime and this
+        // source's own endpoint is now sealed-at-rest, a re-derive would re-insert wikilink rows
+        // behind the lock. Refuse silently (rollback via drop) — the source is sealed; its edges are
+        // re-derived on unlock. Never a new row naming a sealed source.
+        if link_endpoint_sealed_at_rest_tx(&tx, src_kind, src_id)? {
+            tracing::debug!(target: "links", src_kind = src_kind.as_str(), "wikilink index refused: source sealed at rest");
+            return Ok(());
+        }
         // Clean replace: drop this source's OLD wikilink rows first, then insert the fresh set. A
         // removed `[[Title]]` therefore vanishes from the graph on the next save (self-healing).
         tx.execute(
@@ -10257,6 +10366,12 @@ impl Db {
         )
         .map_err(map_err)?;
         for (dst_kind, dst_id) in &targets {
+            // Fix 0 (brain-v3 audit) — IN-TX sealed-at-rest DST re-check (TOCTOU): drop any target
+            // whose endpoint sealed at rest since the OUTSIDE-tx resolve above, so a link never names
+            // a now-sealed neighbour. The endpoint is re-derived on that folder's unlock.
+            if link_endpoint_sealed_at_rest_tx(&tx, *dst_kind, dst_id)? {
+                continue;
+            }
             Self::upsert_link_tx(
                 &tx,
                 src_kind.as_str(),
@@ -10293,6 +10408,160 @@ impl Db {
         )?;
         tx.commit().map_err(map_err)?;
         Ok(())
+    }
+
+    /// Brain-v3 audit Fix 2 — RE-ASSERT the `companion` edges of a JUST-UNSEALED folder that the seal
+    /// purge dropped. A `companion` edge (`note → meeting`, `created_by='user'`) is NOT a preserved
+    /// decision row ([`LINK_DECISION_KEEP`] keeps only dismissed/accepted), and `set_companion_link`
+    /// only fires at the recording-time write site — so ONE lock cycle permanently deletes it (the
+    /// one-time backfill sentinel is spent). This restores both legs in ONE tx on unlock:
+    ///
+    ///   • OUTBOUND — every companion note IN this folder (`documents.kind='note'` with a non-null
+    ///     `meeting_id`) → its meeting; and
+    ///   • INBOUND — every companion note in ANY folder whose `meeting_id` is a meeting IN this folder
+    ///     (a companion note can live in a DIFFERENT folder than its meeting) → that meeting.
+    ///
+    /// Each edge is written ONLY when NEITHER endpoint is sealed-at-rest (the Fix-0 probe) — so a
+    /// companion note that itself lives in a still-sealed folder never has its edge re-asserted (no
+    /// link naming a sealed neighbour). `meeting_ids` is the folder's meetings (resolved by the
+    /// caller's unlock, plaintext restored). Best-effort at the call site; logs ids/counts only.
+    pub fn rederive_companion_links_for_folder(
+        &self,
+        folder_id: &str,
+        meeting_ids: &[String],
+    ) -> Result<usize> {
+        let now = chrono::Utc::now().timestamp_millis();
+        // Gather the (note_id, meeting_id) companion pairs to re-assert: OUTBOUND (notes in this
+        // folder) UNION INBOUND (notes anywhere pointing at this folder's meetings). Resolve OUTSIDE
+        // the guard loop so the SELECT and the guarded upserts share one tx.
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        let mut pairs: Vec<(String, String)> = Vec::new();
+        {
+            // OUTBOUND: companion notes filed in THIS folder.
+            let mut stmt = tx
+                .prepare(
+                    "SELECT id, meeting_id FROM documents
+                       WHERE kind = 'note' AND folder_id = ?1 AND meeting_id IS NOT NULL",
+                )
+                .map_err(map_err)?;
+            let rows = stmt
+                .query_map(rusqlite::params![folder_id], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })
+                .map_err(map_err)?;
+            for r in rows {
+                pairs.push(r.map_err(map_err)?);
+            }
+        }
+        // INBOUND: companion notes ANYWHERE whose meeting is one of this folder's meetings (a
+        // companion note may be filed in a different folder than its meeting). Per-id so the set stays
+        // small and the query needs no dynamic IN-list build.
+        for mid in meeting_ids {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT id FROM documents
+                       WHERE kind = 'note' AND meeting_id = ?1",
+                )
+                .map_err(map_err)?;
+            let rows = stmt
+                .query_map(rusqlite::params![mid], |r| r.get::<_, String>(0))
+                .map_err(map_err)?;
+            for r in rows {
+                pairs.push((r.map_err(map_err)?, mid.clone()));
+            }
+        }
+        // Dedupe (OUTBOUND and INBOUND overlap when the companion note is filed IN this folder).
+        pairs.sort();
+        pairs.dedup();
+        let mut written = 0usize;
+        for (note_id, meeting_id) in &pairs {
+            // Fix-0 discipline: never re-assert an edge naming a sealed-at-rest endpoint. The meeting
+            // is unlocked (plaintext restored), so this normally only guards a companion note that
+            // still lives in another sealed folder.
+            if meeting_sealed_at_rest_tx(&tx, meeting_id)?
+                || doc_sealed_at_rest_tx(&tx, note_id)?
+            {
+                continue;
+            }
+            Self::upsert_link_tx(
+                &tx, "note", note_id, "meeting", meeting_id, "companion", 1.0, "user", "active", now,
+            )?;
+            written += 1;
+        }
+        tx.commit().map_err(map_err)?;
+        tracing::debug!(target: "links", folder = %folder_id, companion_edges = written, "rederive_companion_links_for_folder");
+        Ok(written)
+    }
+
+    /// Brain-v3 audit Fix 3 — RE-DERIVE the INBOUND wikilinks INTO a just-unsealed folder's items. A
+    /// note A (in any OTHER, still-open folder) that carries `[[Project X]]` — whose target note X
+    /// lives in folder F — had its `A → X` wikilink edge PURGED when F was sealed (X was a sealed
+    /// endpoint). `rederive_links_for_folder` only re-indexes F's OWN sources, so without this the
+    /// inbound edge stays gone indefinitely (A may never be edited again). This closes that leg:
+    ///
+    ///   1. For every meeting + note IN folder F (its titles now resolvable — plaintext restored),
+    ///      find every VISIBLE SOURCE whose body carries `[[that title]]` via the SAME gated
+    ///      [`Self::backlinks_for_visible`] scan the "Linked mentions" panel uses (both gates intact),
+    ///      collecting the distinct `(source_kind, source_id)` set.
+    ///   2. RE-RUN [`Self::index_wikilinks_for_source`] on each such source's body — a delete-then-
+    ///      insert that re-resolves ALL its `[[Title]]`s against the current (post-unlock) visibility,
+    ///      so the edge INTO F is re-established. Fix 0's in-tx re-check keeps it from naming any
+    ///      OTHER still-sealed target.
+    ///
+    /// `meeting_ids` are F's meetings; `unlocked` is the post-unlock session set (F included). Returns
+    /// the count of distinct sources re-indexed. Best-effort per source at the call site. IDs/counts
+    /// only in logs.
+    pub fn rederive_inbound_wikilinks_for_folder(
+        &self,
+        folder_id: &str,
+        meeting_ids: &[String],
+        unlocked: &HashSet<String>,
+    ) -> Result<usize> {
+        use crate::storage::models::SourceKind;
+        // 1. Collect the distinct inbound sources across every item in the folder. A source is
+        //    identified as (is_meeting, id) so the two kinds never collide in the id space.
+        let mut sources: std::collections::HashSet<(bool, String)> = std::collections::HashSet::new();
+        // Meeting targets in F.
+        for mid in meeting_ids {
+            for src in self.backlinks_for_visible(SourceKind::Meeting, mid, unlocked)? {
+                sources.insert((src.kind == SourceKind::Meeting, src.id));
+            }
+        }
+        // Note (document kind='note') targets in F.
+        for did in self.document_ids_in_folder(folder_id)? {
+            for src in self.backlinks_for_visible(SourceKind::Note, &did, unlocked)? {
+                sources.insert((src.kind == SourceKind::Meeting, src.id));
+            }
+        }
+        // 2. Re-index each distinct source's body so its `[[Title]]` INTO F resolves + re-inserts.
+        let mut reindexed = 0usize;
+        for (is_meeting, src_id) in &sources {
+            if *is_meeting {
+                // Never re-index a target inside F as its own inbound source (F's own sources are
+                // re-derived by `rederive_links_for_folder`; here we only want OUTSIDE sources — but a
+                // same-folder cross-link is harmless to re-run, just redundant).
+                if let Some(note) = self.get_latest_note_for_meeting(src_id)? {
+                    self.index_wikilinks_for_source(
+                        crate::links::LinkKind::Meeting,
+                        src_id,
+                        &note.markdown,
+                        unlocked,
+                    )?;
+                    reindexed += 1;
+                }
+            } else if let Some(row) = self.get_note_row(src_id)? {
+                self.index_wikilinks_for_source(
+                    crate::links::LinkKind::Note,
+                    src_id,
+                    &row.text,
+                    unlocked,
+                )?;
+                reindexed += 1;
+            }
+        }
+        tracing::debug!(target: "links", folder = %folder_id, inbound_sources = reindexed, "rederive_inbound_wikilinks_for_folder");
+        Ok(reindexed)
     }
 
     /// note↔meeting-links PR-1 — upsert ONE user-initiated DIRECTED `manual` edge (`created_by='user'`,
@@ -10405,22 +10674,520 @@ impl Db {
             .unwrap()
     }
 
-    /// PURGE every link row whose SRC OR DST is a sealed/deleted meeting or document (a note id IS a
-    /// `documents` id, so `document_ids` covers the `note` kind too). Runs INSIDE an existing seal /
-    /// delete tx so a link — which reveals a neighbour's existence + title — never outlives the
-    /// plaintext it was derived from. BOTH endpoint kinds for a meeting id are matched (`src`/`dst`);
-    /// likewise for a document/note id across `document`/`note` kinds. Re-derived on unlock.
-    /// Mirrors the `purge_chunks_tx` / `purge_doc_chunks_tx` choke-point idiom.
+    /// The `links` rows a seal PRESERVES: a user's DECISION about a pair. Brain-v3 audit Fix 1 —
+    /// `purge_links_tx` (and the startup reblank's inline twin) must NOT destroy these on seal, or a
+    /// lock→unlock RESURRECTS a dismissed suggestion (the semantic pass re-proposes it) and forgets an
+    /// accepted edge, contradicting the spec ("a rejected suggestion never reappears").
+    ///
+    /// Two decision classes survive:
+    ///   - `status='dismissed'` — the tombstone that stops a re-suggest (its `upsert_link_tx`
+    ///     DO-UPDATE guard skips dismissed rows), and
+    ///   - `status='active' AND created_by='accepted'` — a user-CONFIRMED semantic link.
+    ///
+    /// A preserved row carries ONLY ids/kind/edge_type/score inside the SQLCipher DB — NO titles, NO
+    /// plaintext — so keeping it leaks nothing at rest; and the read gate ([`links_for_visible`]) still
+    /// hides it (both-endpoint-gated) while an endpoint is sealed, so only the DECISION STATE survives,
+    /// never its visibility. Everything else (wikilink/companion/manual/auto-suggested) is DERIVED and
+    /// re-derivable on unlock, so it is purged.
+    const LINK_DECISION_KEEP: &'static str =
+        "status = 'dismissed' OR (status = 'active' AND created_by = 'accepted')";
+
+    /// Brain-v3 audit Fix 4 — STRIP a just-sealed neighbour's materialized `[[Title]]` from the
+    /// MACHINE-OWNED `murmur:links` block of every VISIBLE note that links to it, INSIDE the seal tx
+    /// (so the DB plaintext is scrubbed atomically with the purge). Compose accept/link wrote
+    /// `[[Neighbour Title]]` into a source note's managed block; when the neighbour's folder later
+    /// seals, the `links` row is purged and every gated read hides the neighbour — but the source
+    /// note's BODY (plaintext in the DB AND its exported vault `.md`) still names the sealed neighbour.
+    /// The seal's own rationale says a sealed item's title+existence is leak-relevant, so the marker
+    /// must go too.
+    ///
+    /// MUST run BEFORE [`purge_links_tx`] in the same tx — the `links` rows being purged are exactly
+    /// what names the affected source→sealed-item pairs. Sealed items' TITLES are still readable here
+    /// (seal blanks BODY content, never `meetings.title` / `documents.title`). Only the MACHINE block
+    /// is touched (via [`crate::enrich::extract_link_hits`] / `apply_link_markers`) — a user-typed
+    /// `[[Title]]` outside the managed block is the user's own content and is NEVER stripped.
+    ///
+    /// A source is scrubbed ONLY when it is itself VISIBLE (not sealed-at-rest) — a source in another
+    /// still-sealed folder has its body blanked already, so there is nothing to leak. Returns the
+    /// `(is_meeting, source_id)` of every source whose plaintext body changed, so the COMMAND layer
+    /// can re-export its vault `.md` (the same DB-in-tx / filesystem-at-command layering as sealed-note
+    /// `.md` deletion). Re-materialized on unlock from the preserved accepted rows (Fix 1) +
+    /// [`Self::rematerialize_accepted_markers_for_folder`]. IDs/counts only in logs.
+    fn strip_sealed_neighbour_markers_tx(
+        tx: &rusqlite::Transaction<'_>,
+        sealed_meeting_ids: &[String],
+        sealed_document_ids: &[String],
+    ) -> Result<Vec<(bool, String)>> {
+        // 1. Gather (sealed_kind, sealed_id) → collect the distinct SOURCE (src_kind, src_id) rows that
+        //    materialize a marker: `wikilink`/`manual`/`companion`/accepted-`semantic` edges pointing
+        //    AT the sealed item. A `companion` edge never materializes a title marker (it's structural),
+        //    but including it is harmless (the strip is a no-op when the block lacks the title).
+        let mut affected: std::collections::HashMap<(bool, String), std::collections::HashSet<String>> =
+            std::collections::HashMap::new();
+        let mut collect = |tx: &rusqlite::Transaction<'_>,
+                           sealed_kinds: &str,
+                           sealed_id: &str|
+         -> Result<()> {
+            // The sealed item's CURRENT title (still readable — seal blanks body, not title). SANITIZE
+            // it: a materialized marker is rendered through `enrich::sanitize` (whitespace-collapse +
+            // comment-delimiter rewrite), so the raw DB title must be sanitized to match the rendered
+            // `[[Title]]` (lock-security finding — a title with a double space would otherwise survive).
+            let title = Self::sealed_item_title_tx(tx, sealed_kinds, sealed_id)?;
+            let Some(title) = title.filter(|t| !t.trim().is_empty()) else {
+                return Ok(());
+            };
+            let title = crate::enrich::sanitize(&title);
+            // The marker OWNER is whichever `note`/`meeting` endpoint is NOT the sealed item. Semantic
+            // edges are CANONICALIZED (the smaller `(kind,id)` is stored as `src`), so the sealed item
+            // can be on EITHER side — scan BOTH directions (dst-leg: owner = `src`; src-leg: owner =
+            // `dst`). A dst-only scan misses a dst-owned marker naming a sealed `src` (e.g. a
+            // `document`-src / `note`-dst accepted edge — `"document" < "note"`), leaking the sealed
+            // title in the visible note's plaintext + `.md` (lock-security finding).
+            let sql = format!(
+                "SELECT src_kind, src_id FROM links
+                   WHERE dst_id = ?1 AND dst_kind IN ({sealed_kinds}) AND src_kind IN ('note','meeting')
+                 UNION
+                 SELECT dst_kind, dst_id FROM links
+                   WHERE src_id = ?1 AND src_kind IN ({sealed_kinds}) AND dst_kind IN ('note','meeting')"
+            );
+            let mut stmt = tx.prepare(&sql).map_err(map_err)?;
+            let rows = stmt
+                .query_map(rusqlite::params![sealed_id], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })
+                .map_err(map_err)?;
+            for r in rows {
+                let (owner_kind, owner_id) = r.map_err(map_err)?;
+                let is_meeting = owner_kind == "meeting";
+                affected
+                    .entry((is_meeting, owner_id))
+                    .or_default()
+                    .insert(title.clone());
+            }
+            Ok(())
+        };
+        for mid in sealed_meeting_ids {
+            collect(tx, "'meeting'", mid)?;
+        }
+        for did in sealed_document_ids {
+            // A note id IS a document id — the marker's dst kind is 'note' (materialized wikilinks
+            // resolve to the `note` kind) or 'document'.
+            collect(tx, "'note','document'", did)?;
+        }
+        // 2. For each affected VISIBLE source, strip EVERY sealed title from its managed block.
+        let mut changed: Vec<(bool, String)> = Vec::new();
+        for ((is_meeting, src_id), titles) in &affected {
+            // Skip a source that is itself sealed-at-rest (its body is already blanked — nothing to
+            // leak, and we must not resurrect plaintext behind its own lock).
+            let sealed = if *is_meeting {
+                meeting_sealed_at_rest_tx(tx, src_id)?
+            } else {
+                doc_sealed_at_rest_tx(tx, src_id)?
+            };
+            if sealed {
+                continue;
+            }
+            let did_change = if *is_meeting {
+                Self::strip_markers_from_meeting_note_tx(tx, src_id, titles)?
+            } else {
+                Self::strip_markers_from_note_doc_tx(tx, src_id, titles)?
+            };
+            if did_change {
+                changed.push((*is_meeting, src_id.clone()));
+            }
+        }
+        Ok(changed)
+    }
+
+    /// The current display TITLE of a to-be-sealed item, read inside the seal tx. `sealed_kinds` is the
+    /// SQL kind-list literal (`'meeting'` or `'note','document'`) that identifies the endpoint's table.
+    /// A meeting → `meetings.title`; a note/document → `documents.title` (fallback `name`). `None` when
+    /// unknown or the title is empty. Titles are NEVER blanked by seal, so this is readable mid-seal.
+    fn sealed_item_title_tx(
+        tx: &rusqlite::Transaction<'_>,
+        sealed_kinds: &str,
+        sealed_id: &str,
+    ) -> Result<Option<String>> {
+        if sealed_kinds == "'meeting'" {
+            tx.query_row(
+                "SELECT NULLIF(TRIM(COALESCE(title, '')), '') FROM meetings WHERE id = ?1",
+                rusqlite::params![sealed_id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map(Option::flatten)
+            .map_err(map_err)
+        } else {
+            tx.query_row(
+                "SELECT COALESCE(NULLIF(TRIM(title), ''), name) FROM documents WHERE id = ?1 AND kind = 'note'",
+                rusqlite::params![sealed_id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map(Option::flatten)
+            .map_err(map_err)
+        }
+    }
+
+    /// Strip every `[[title]]` in `titles` from a MEETING note's (`notes.markdown`, newest provider
+    /// row) managed `murmur:links` block, in-tx. Returns `true` iff the markdown changed. Only the
+    /// machine block is touched (extract → retain → re-apply); user wikilinks elsewhere are untouched.
+    fn strip_markers_from_meeting_note_tx(
+        tx: &rusqlite::Transaction<'_>,
+        meeting_id: &str,
+        titles: &std::collections::HashSet<String>,
+    ) -> Result<bool> {
+        let md: Option<String> = tx
+            .query_row(
+                "SELECT markdown FROM notes WHERE meeting_id = ?1 ORDER BY created_at DESC LIMIT 1",
+                rusqlite::params![meeting_id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(map_err)?;
+        let Some(md) = md.filter(|m| !m.is_empty()) else {
+            return Ok(false);
+        };
+        let Some(stripped) = Self::strip_titles_from_managed_block(&md, titles) else {
+            return Ok(false);
+        };
+        // Write the stripped markdown back into the newest provider row (the one we read).
+        tx.execute(
+            "UPDATE notes SET markdown = ?2
+               WHERE meeting_id = ?1
+                 AND created_at = (SELECT MAX(created_at) FROM notes WHERE meeting_id = ?1)",
+            rusqlite::params![meeting_id, stripped],
+        )
+        .map_err(map_err)?;
+        Ok(true)
+    }
+
+    /// Strip every `[[title]]` in `titles` from a note-doc's (`documents.text`, kind='note') managed
+    /// block, in-tx. Returns `true` iff the text changed. Machine block only.
+    fn strip_markers_from_note_doc_tx(
+        tx: &rusqlite::Transaction<'_>,
+        note_id: &str,
+        titles: &std::collections::HashSet<String>,
+    ) -> Result<bool> {
+        let text: Option<String> = tx
+            .query_row(
+                "SELECT COALESCE(text, '') FROM documents WHERE id = ?1 AND kind = 'note'",
+                rusqlite::params![note_id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(map_err)?;
+        let Some(text) = text.filter(|t| !t.is_empty()) else {
+            return Ok(false);
+        };
+        let Some(stripped) = Self::strip_titles_from_managed_block(&text, titles) else {
+            return Ok(false);
+        };
+        tx.execute(
+            "UPDATE documents SET text = ?2 WHERE id = ?1 AND kind = 'note'",
+            rusqlite::params![note_id, stripped],
+        )
+        .map_err(map_err)?;
+        Ok(true)
+    }
+
+    /// PURE: strip the `[[title]]` hits named by `titles` from the MACHINE-OWNED `murmur:links` block
+    /// of `body`, via [`crate::enrich::extract_link_hits`] + `apply_link_markers` (the exact inverse
+    /// the command-layer `strip_manual_link_marker` uses). Returns `Some(new_body)` iff a hit was
+    /// removed (so the caller only writes on a real change), else `None`. A user-typed `[[Title]]`
+    /// OUTSIDE the managed block is never in `extract_link_hits`'s output, so it is never stripped.
+    fn strip_titles_from_managed_block(
+        body: &str,
+        titles: &std::collections::HashSet<String>,
+    ) -> Option<String> {
+        // A materialized neighbour marker renders `[[Title]]` in EITHER `detail` (the accept/manual
+        // shape: `detail = "[[Title]]"`) OR `url` (the always-on auto related-notes shape:
+        // `detail` = gist, `url = Some("[[Title]]")`). Match BOTH fields — a `detail`-only match keeps
+        // the auto-related marker and leaks the sealed title (adversarial-verifier finding).
+        fn wikilink_inner(s: &str) -> Option<&str> {
+            s.trim()
+                .strip_prefix("[[")
+                .and_then(|x| x.strip_suffix("]]"))
+                .map(str::trim)
+        }
+        let mut hits = crate::enrich::extract_link_hits(body);
+        let before = hits.len();
+        hits.retain(|h| {
+            match wikilink_inner(&h.detail).or_else(|| h.url.as_deref().and_then(wikilink_inner)) {
+                // `titles` holds SANITIZED titles; sanitize the inner too so a whitespace/delimiter
+                // round-trip can't dodge the compare. Drop the hit iff its title is sealed.
+                Some(t) => {
+                    let key = crate::enrich::sanitize(t);
+                    !titles.contains(key.trim())
+                }
+                None => true, // not a wikilink marker → keep (a connector hit).
+            }
+        });
+        if hits.len() == before {
+            return None; // nothing matched → no change.
+        }
+        Some(crate::enrich::apply_link_markers(body, &hits))
+    }
+
+    /// Brain-v3 audit Fix 4 — PUBLIC entry: strip the just-sealed items' `[[Title]]` markers from every
+    /// VISIBLE source note's managed block, in ONE tx, and return the `(is_meeting, source_id)` of each
+    /// source whose plaintext body changed. The COMMAND layer calls this on the seal path (right after
+    /// its seal_note/seal_folder_extras + purge legs) and re-exports each changed source's vault `.md`
+    /// — the DB-in-tx / filesystem-at-command layering that sealed-note `.md` deletion uses. Also run
+    /// (with the locked-folder ids resolved) INSIDE [`Self::reblank_locked_folders_at_rest`], so a
+    /// crash BETWEEN the seal and this strip is repaired on the next launch. `sealed_document_ids`
+    /// covers both `note` and `document` id spaces. Idempotent (a body with no matching marker is a
+    /// no-op). IDs/counts only in logs.
+    pub fn strip_sealed_neighbour_markers(
+        &self,
+        sealed_meeting_ids: &[String],
+        sealed_document_ids: &[String],
+    ) -> Result<Vec<(bool, String)>> {
+        if sealed_meeting_ids.is_empty() && sealed_document_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        let changed =
+            Self::strip_sealed_neighbour_markers_tx(&tx, sealed_meeting_ids, sealed_document_ids)?;
+        tx.commit().map_err(map_err)?;
+        tracing::debug!(target: "links", stripped_sources = changed.len(), "strip_sealed_neighbour_markers");
+        Ok(changed)
+    }
+
+    /// Brain-v3 audit Fix 4 (INVERSE) — on unlock, RE-MATERIALIZE the `[[Title]]` markers that the seal
+    /// stripped ([`Self::strip_sealed_neighbour_markers`]), from the PRESERVED ACCEPTED edges (Fix 1)
+    /// incident on the just-unlocked folder's items. For each accepted `semantic` edge whose one
+    /// endpoint is a now-visible item in this folder, re-add THAT item's `[[title]]` into the OTHER
+    /// endpoint's managed block WHEN the other endpoint is a VISIBLE, locally-owned note/meeting-note.
+    /// Reuses [`crate::enrich::extract_link_hits`] + `apply_link_markers` (merge-preserving), so an
+    /// existing block + its other hits survive. Returns the `(is_meeting, source_id)` of every source
+    /// whose body changed, so the COMMAND layer re-exports its `.md`. Only ACCEPTED edges are walked —
+    /// a wikilink/manual marker re-materializes naturally on the source's own re-index/re-save, but an
+    /// accepted SEMANTIC marker has no body wikilink to re-derive from, so it needs this explicit
+    /// re-add. `meeting_ids` are the folder's meetings; `unlocked` is the post-unlock session set. Skips
+    /// any endpoint that is still sealed-at-rest (Fix-0 discipline). IDs/counts only in logs.
+    pub fn rematerialize_accepted_markers_for_folder(
+        &self,
+        folder_id: &str,
+        meeting_ids: &[String],
+        unlocked: &HashSet<String>,
+    ) -> Result<Vec<(bool, String)>> {
+        // The just-unlocked folder's items, as (is_meeting, id): its meetings + its note-docs.
+        let mut items: Vec<(bool, String)> = meeting_ids.iter().map(|m| (true, m.clone())).collect();
+        for did in self.document_ids_in_folder(folder_id)? {
+            items.push((false, did));
+        }
+        // Collect (owner_kind, owner_id, title_to_readd) work: for each accepted edge incident on an
+        // item, the OWNER is the OTHER endpoint (the source note whose block was stripped), and the
+        // title to re-add is THIS item's current visible title.
+        let mut work: Vec<(crate::links::LinkKind, String, String)> = Vec::new();
+        for (is_meeting, item_id) in &items {
+            let item_kind = if *is_meeting {
+                crate::links::LinkKind::Meeting
+            } else {
+                crate::links::LinkKind::Note
+            };
+            // This item's current gated title (skip if not visible — nothing to re-add).
+            let Some(item_title) =
+                self.link_endpoint_title_visible(item_kind, item_id, unlocked)?
+            else {
+                continue;
+            };
+            // The accepted edges incident on this item (either endpoint), ids/kinds only.
+            let rows: Vec<(String, String, String, String)> = {
+                let conn = self.lock();
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT src_kind, src_id, dst_kind, dst_id FROM links
+                           WHERE edge_type = 'semantic' AND status = 'active' AND created_by = 'accepted'
+                             AND ((src_kind = ?1 AND src_id = ?2) OR (dst_kind = ?1 AND dst_id = ?2))",
+                    )
+                    .map_err(map_err)?;
+                let mapped = stmt
+                    .query_map(rusqlite::params![item_kind.as_str(), item_id], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, String>(3)?,
+                        ))
+                    })
+                    .map_err(map_err)?;
+                let mut out = Vec::new();
+                for r in mapped {
+                    out.push(r.map_err(map_err)?);
+                }
+                out
+            };
+            for (sk, si, dk, di) in rows {
+                // The OWNER is whichever endpoint is NOT this item.
+                let (owner_k, owner_id) = if sk == item_kind.as_str() && si == *item_id {
+                    (dk, di)
+                } else {
+                    (sk, si)
+                };
+                if let Some(owner_kind) = crate::links::LinkKind::parse(&owner_k) {
+                    work.push((owner_kind, owner_id, item_title.clone()));
+                }
+            }
+        }
+        // Apply: re-add each item title into its owner's managed block (visible, owned notes only).
+        let mut changed: Vec<(bool, String)> = Vec::new();
+        for (owner_kind, owner_id, title) in &work {
+            // Skip an owner endpoint still sealed-at-rest (its block is blank — nothing to re-add to).
+            let sealed = match owner_kind {
+                crate::links::LinkKind::Meeting => {
+                    let mut conn = self.lock();
+                    let tx = conn.transaction().map_err(map_err)?;
+                    let s = meeting_sealed_at_rest_tx(&tx, owner_id)?;
+                    tx.commit().map_err(map_err)?;
+                    s
+                }
+                _ => {
+                    let mut conn = self.lock();
+                    let tx = conn.transaction().map_err(map_err)?;
+                    let s = doc_sealed_at_rest_tx(&tx, owner_id)?;
+                    tx.commit().map_err(map_err)?;
+                    s
+                }
+            };
+            if sealed {
+                continue;
+            }
+            let did = self.readd_marker_to_owner(*owner_kind, owner_id, title)?;
+            if let Some(is_meeting) = did {
+                changed.push((is_meeting, owner_id.clone()));
+            }
+        }
+        // Dedupe (a source may own several re-added markers).
+        changed.sort();
+        changed.dedup();
+        tracing::debug!(target: "links", folder = %folder_id, rematerialized = changed.len(), "rematerialize_accepted_markers_for_folder");
+        Ok(changed)
+    }
+
+    /// Re-add ONE `[[title]]` marker into an OWNER note's managed block, in-tx. Returns `Some(is_meeting)`
+    /// iff the body changed (so the caller re-exports), `None` when the owner has no editable body or
+    /// the marker was already present. Merges (never clobbers other hits). The INVERSE of
+    /// [`Self::strip_titles_from_managed_block`].
+    fn readd_marker_to_owner(
+        &self,
+        owner_kind: crate::links::LinkKind,
+        owner_id: &str,
+        title: &str,
+    ) -> Result<Option<bool>> {
+        let new_hit = crate::enrich::ContextHit {
+            source: match owner_kind {
+                crate::links::LinkKind::Meeting => "meeting",
+                _ => "note",
+            }
+            .to_string(),
+            detail: format!("[[{title}]]"),
+            url: None,
+        };
+        match owner_kind {
+            crate::links::LinkKind::Meeting => {
+                let md: Option<String> = {
+                    let conn = self.lock();
+                    conn.query_row(
+                        "SELECT markdown FROM notes WHERE meeting_id = ?1 ORDER BY created_at DESC LIMIT 1",
+                        rusqlite::params![owner_id],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .optional()
+                    .map_err(map_err)?
+                };
+                let Some(md) = md.filter(|m| !m.is_empty()) else {
+                    return Ok(None);
+                };
+                let mut hits = crate::enrich::extract_link_hits(&md);
+                if hits.iter().any(|h| h.detail == new_hit.detail) {
+                    return Ok(None); // already present.
+                }
+                hits.push(new_hit);
+                let merged = crate::enrich::apply_link_markers(&md, &hits);
+                if merged == md {
+                    return Ok(None);
+                }
+                let conn = self.lock();
+                conn.execute(
+                    "UPDATE notes SET markdown = ?2
+                       WHERE meeting_id = ?1
+                         AND created_at = (SELECT MAX(created_at) FROM notes WHERE meeting_id = ?1)",
+                    rusqlite::params![owner_id, merged],
+                )
+                .map_err(map_err)?;
+                Ok(Some(true))
+            }
+            crate::links::LinkKind::Note | crate::links::LinkKind::Document => {
+                let text: Option<String> = {
+                    let conn = self.lock();
+                    conn.query_row(
+                        "SELECT COALESCE(text, '') FROM documents WHERE id = ?1 AND kind = 'note'",
+                        rusqlite::params![owner_id],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .optional()
+                    .map_err(map_err)?
+                };
+                let Some(text) = text.filter(|t| !t.is_empty()) else {
+                    return Ok(None);
+                };
+                let mut hits = crate::enrich::extract_link_hits(&text);
+                if hits.iter().any(|h| h.detail == new_hit.detail) {
+                    return Ok(None);
+                }
+                hits.push(new_hit);
+                let merged = crate::enrich::apply_link_markers(&text, &hits);
+                if merged == text {
+                    return Ok(None);
+                }
+                let conn = self.lock();
+                conn.execute(
+                    "UPDATE documents SET text = ?2 WHERE id = ?1 AND kind = 'note'",
+                    rusqlite::params![owner_id, merged],
+                )
+                .map_err(map_err)?;
+                Ok(Some(false))
+            }
+        }
+    }
+
+    /// PURGE every DERIVED link row whose SRC OR DST is a sealed/deleted meeting or document (a note id
+    /// IS a `documents` id, so `document_ids` covers the `note` kind too), PRESERVING a user's decision
+    /// rows ([`LINK_DECISION_KEEP`] — dismissed tombstones + accepted edges). Runs INSIDE an existing
+    /// seal / delete tx so a derived link — which reveals a neighbour's existence + title — never
+    /// outlives the plaintext it was derived from. BOTH endpoint kinds for a meeting id are matched
+    /// (`src`/`dst`); likewise for a document/note id across `document`/`note` kinds. Re-derived on
+    /// unlock. Mirrors the `purge_chunks_tx` / `purge_doc_chunks_tx` choke-point idiom.
+    ///
+    /// `preserve_decisions`: a SEAL (reversible — the item returns on unlock) passes `true` so a
+    /// user's dismissed/accepted DECISION rows survive ([`LINK_DECISION_KEEP`], Fix 1). A permanent
+    /// DELETE (`delete_meeting`/`delete_document`/the delete-folder derived-doc leg) passes `false` —
+    /// the endpoint is gone for good, so leaving a dangling decision row (that a future id reuse could
+    /// resurface) would be a bug; purge EVERYTHING incident on it.
     fn purge_links_tx(
         tx: &rusqlite::Transaction<'_>,
         meeting_ids: &[String],
         document_ids: &[String],
+        preserve_decisions: bool,
     ) -> Result<()> {
+        // On a permanent delete, keep NOTHING (`NOT (1=0)` ⇒ always delete). On a seal, keep the
+        // decision rows. Building the predicate ONCE keeps the two DELETEs identical modulo scope.
+        let keep = if preserve_decisions {
+            Self::LINK_DECISION_KEEP
+        } else {
+            "1 = 0"
+        };
         for mid in meeting_ids {
             tx.execute(
-                "DELETE FROM links
-                   WHERE (src_kind = 'meeting' AND src_id = ?1)
-                      OR (dst_kind = 'meeting' AND dst_id = ?1)",
+                &format!(
+                    "DELETE FROM links
+                       WHERE ((src_kind = 'meeting' AND src_id = ?1)
+                              OR (dst_kind = 'meeting' AND dst_id = ?1))
+                         AND NOT ({keep})"
+                ),
                 rusqlite::params![mid],
             )
             .map_err(map_err)?;
@@ -10428,9 +11195,12 @@ impl Db {
         for did in document_ids {
             // A note and a document share the `documents` id space — purge BOTH kinds for the id.
             tx.execute(
-                "DELETE FROM links
-                   WHERE (src_kind IN ('note','document') AND src_id = ?1)
-                      OR (dst_kind IN ('note','document') AND dst_id = ?1)",
+                &format!(
+                    "DELETE FROM links
+                       WHERE ((src_kind IN ('note','document') AND src_id = ?1)
+                              OR (dst_kind IN ('note','document') AND dst_id = ?1))
+                         AND NOT ({keep})"
+                ),
                 rusqlite::params![did],
             )
             .map_err(map_err)?;
@@ -10730,10 +11500,28 @@ impl Db {
         let now = chrono::Utc::now().timestamp_millis();
         let mut conn = self.lock();
         let tx = conn.transaction().map_err(map_err)?;
+        // Fix 0 (brain-v3 audit) — IN-TX sealed-at-rest SOURCE re-check (TOCTOU): the kNN + mutuality
+        // pass above ran OUTSIDE this tx against a possibly-stale `unlocked` snapshot. If a
+        // `lock_folder` sealed this source in the meantime, a suggestion re-write would land behind
+        // the lock. Refuse silently (rollback via drop) — re-derived on unlock. (The clear below must
+        // NOT run either, else a concurrent seal + this pass would strip the source's suggestions
+        // that `purge_links_tx` is about to purge anyway — a no-op, but the refusal keeps this pass a
+        // clean no-write.)
+        if link_endpoint_sealed_at_rest_tx(&tx, kind, id)? {
+            tracing::debug!(target: "links", kind = kind.as_str(), "semantic auto-link refused: source sealed at rest");
+            return Ok(0);
+        }
         // Refresh: drop this source's stale suggestions (keeps accepted/dismissed) before re-adding.
         Self::clear_semantic_suggestions_tx(&tx, kind.as_str(), id)?;
         let mut written = 0usize;
         for c in &kept {
+            // Fix 0 (brain-v3 audit) — IN-TX sealed-at-rest NEIGHBOUR re-check (TOCTOU): drop any
+            // candidate whose endpoint sealed at rest since the OUTSIDE-tx kNN, so a suggestion never
+            // names a now-sealed neighbour. `knn_items_visible` already gates on the (stale) snapshot;
+            // this closes the race window. Re-suggested when that folder unlocks.
+            if link_endpoint_sealed_at_rest_tx(&tx, c.kind, &c.id)? {
+                continue;
+            }
             let (src, dst) = crate::links::canonicalize_endpoints(
                 (kind, id.to_string()),
                 (c.kind, c.id.clone()),
@@ -20964,6 +21752,568 @@ mod tests {
         assert_eq!(edges[0].other_title, "Secret Note");
     }
 
+    /// Fix 0 (brain-v3 audit) — LINK-WRITER TOCTOU: a `index_wikilinks_for_source` pass that RESOLVED
+    /// its target while a neighbour was visible must NOT insert an edge if that neighbour SEALED AT
+    /// REST before the write commits. Simulate the race by sealing the target's document
+    /// (`text_blob` set + `text` blanked) BEFORE calling the writer with a stale (empty) unlock set:
+    /// the resolve leg would still find it (targets are resolved via `resolve_wikilink` against the
+    /// snapshot), but the in-tx re-check must drop it. RED before Fix 0: the writer inserted a
+    /// wikilink row naming the sealed neighbour.
+    #[test]
+    fn index_wikilinks_refuses_sealed_at_rest_target() {
+        let db = mem_db();
+        seed_folder(&db, "f-open", "Open");
+        seed_folder(&db, "f-secret", "Secret");
+        seed_note_doc(&db, "open", "f-open", "Open Note", "");
+        seed_note_doc(&db, "secret", "f-secret", "Secret Note", "the secret body");
+        // Resolve the title FIRST while visible (mirrors the outside-tx snapshot), then seal-at-rest.
+        let unlocked = HashSet::new();
+        assert!(
+            db.resolve_wikilink("Secret Note", &unlocked).unwrap().is_some(),
+            "target resolves while visible (the stale snapshot the writer captured)"
+        );
+        // Now the target seals at rest between the resolve and the writer's own commit.
+        db.seal_document("secret", b"ciphertext").unwrap();
+        // The writer runs with the STALE snapshot; the in-tx re-check must drop the sealed target.
+        db.index_wikilinks_for_source(
+            crate::links::LinkKind::Note,
+            "open",
+            "links to [[Secret Note]]",
+            &unlocked,
+        )
+        .unwrap();
+        assert_eq!(
+            link_count(&db, "note", "secret", "wikilink"),
+            0,
+            "a wikilink to a now-sealed-at-rest target must not be inserted (TOCTOU)"
+        );
+    }
+
+    /// Fix 0 (brain-v3 audit) — LINK-WRITER TOCTOU, SOURCE side: a re-derive whose OWN source sealed at
+    /// rest mid-flight must write NOTHING (not even delete-then-insert its own wikilink rows). RED
+    /// before Fix 0: the DELETE-THEN-INSERT ran and re-inserted the source's edges behind the lock.
+    #[test]
+    fn index_wikilinks_refuses_when_source_sealed_at_rest() {
+        let db = mem_db();
+        seed_folder(&db, "f-src", "Src");
+        seed_folder(&db, "f-tgt", "Tgt");
+        seed_note_doc(&db, "src", "f-src", "Src Note", "");
+        seed_note_doc(&db, "tgt", "f-tgt", "Tgt Note", "the target body");
+        // Source is sealed at rest (a lock committed between the caller's snapshot and this write).
+        db.seal_document("src", b"ciphertext").unwrap();
+        let unlocked = HashSet::new();
+        db.index_wikilinks_for_source(
+            crate::links::LinkKind::Note,
+            "src",
+            "links to [[Tgt Note]]",
+            &unlocked,
+        )
+        .unwrap();
+        assert_eq!(
+            link_count(&db, "note", "src", "wikilink"),
+            0,
+            "a sealed-at-rest source writes no wikilink edges"
+        );
+    }
+
+    /// Fix 0 (brain-v3 audit) — LINK-WRITER TOCTOU, SEMANTIC pass: an `auto_link_semantic` whose
+    /// candidate sealed at rest between the (outside-tx) kNN and the upsert must not suggest it. Seal
+    /// one of two content-identical neighbours AFTER indexing but BEFORE the pass, with a stale
+    /// (empty) snapshot. RED before Fix 0: a semantic suggestion naming the sealed neighbour landed.
+    #[test]
+    fn auto_link_semantic_refuses_sealed_at_rest_neighbour() {
+        let db = mem_db();
+        let body = "identical clustering text for the semantic neighbour test";
+        for id in ["a", "b"] {
+            db.insert_meeting(&sample_meeting(id, "2026-06-24T10:00:00Z")).unwrap();
+            note_for(&db, id, "claude_code", body);
+            db.index_meeting_chunks(id, &[], &crate::embed::StubEmbedder).unwrap();
+        }
+        // Neighbour 'b' seals at rest (its note row: content_blob set + markdown blanked) after the
+        // vectors were indexed but before the pass over 'a' runs.
+        db.seal_note("b", "claude_code", b"ciphertext").unwrap();
+        let unlocked = HashSet::new();
+        db.auto_link_semantic(crate::links::LinkKind::Meeting, "a", &unlocked).unwrap();
+        assert_eq!(
+            link_count(&db, "meeting", "b", "semantic"),
+            0,
+            "no semantic suggestion may name a now-sealed-at-rest neighbour (TOCTOU)"
+        );
+    }
+
+    /// Fix 1 (brain-v3 audit) — DECISION rows SURVIVE the seal purge: a `dismissed` tombstone and an
+    /// `accepted` edge must persist across `blank_sealed_notes_in_folders` (the relock purge that runs
+    /// `purge_links_tx`), so a lock→unlock never resurrects a dismissed suggestion or forgets an
+    /// accepted edge. RED before Fix 1: the edge-type-agnostic purge deleted BOTH decision rows, so
+    /// their `status` count dropped to 0 at rest.
+    #[test]
+    fn seal_preserves_dismissed_and_accepted_link_decisions() {
+        let db = mem_db();
+        seed_folder(&db, "f-locked", "Secret");
+        for id in ["a", "b", "c"] {
+            db.insert_meeting(&sample_meeting(id, "2026-06-24T10:00:00Z")).unwrap();
+            note_for(&db, id, "claude_code", "some body text");
+            db.set_note_folder(id, Some("f-locked")).unwrap();
+        }
+        let now = 1_700_000_000_000i64;
+        {
+            let mut conn = db.lock();
+            let tx = conn.transaction().unwrap();
+            // A DISMISSED tombstone a↔b and an ACCEPTED edge a↔c (canonicalized order not required for
+            // the count assertions — we count incident rows on 'a').
+            Db::upsert_link_tx(&tx, "meeting", "a", "meeting", "b", "semantic", 0.9, "auto", "dismissed", now).unwrap();
+            Db::upsert_link_tx(&tx, "meeting", "a", "meeting", "c", "semantic", 0.8, "accepted", "active", now).unwrap();
+            // A DERIVED edge (auto-suggested) a↔b that MUST be purged (control).
+            Db::upsert_link_tx(&tx, "meeting", "b", "meeting", "c", "semantic", 0.7, "auto", "suggested", now).unwrap();
+            tx.commit().unwrap();
+        }
+        // Seal the folder: blank the notes (content_blob present) + run the relock purge.
+        for id in ["a", "b", "c"] {
+            db.seal_note(id, "claude_code", b"ciphertext").unwrap();
+        }
+        let mut folders = HashSet::new();
+        folders.insert("f-locked".to_string());
+        db.blank_sealed_notes_in_folders(&folders).unwrap();
+
+        // The DISMISSED tombstone survives (still incident on 'a', still dismissed).
+        let dismissed: i64 = db
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM links WHERE edge_type='semantic' AND status='dismissed'
+                   AND src_id='a' AND dst_id='b'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(dismissed, 1, "a dismissed tombstone must survive the seal purge");
+        // The ACCEPTED edge survives.
+        let accepted: i64 = db
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM links WHERE status='active' AND created_by='accepted'
+                   AND src_id='a' AND dst_id='c'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(accepted, 1, "an accepted edge must survive the seal purge");
+        // The DERIVED suggested edge b↔c is GONE (purged as normal).
+        let derived: i64 = db
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM links WHERE status='suggested' AND src_id='b' AND dst_id='c'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(derived, 0, "a derived (auto-suggested) edge is still purged on seal");
+    }
+
+    /// Fix 1 (brain-v3 audit) — the preserved dismissed/accepted rows STAY INVISIBLE via the
+    /// both-endpoint read gate while an endpoint is sealed (only the DECISION state survives, never its
+    /// visibility). A sealed meeting 'a' returns no links; the still-open queried side sees no edge to
+    /// the sealed neighbour. This is the load-bearing "preserve rows but don't leak" invariant.
+    #[test]
+    fn preserved_link_decisions_stay_invisible_while_sealed() {
+        let db = mem_db();
+        seed_folder(&db, "f-open", "Open");
+        seed_folder(&db, "f-secret", "Secret");
+        for (id, f) in [("open", "f-open"), ("secret", "f-secret")] {
+            db.insert_meeting(&sample_meeting(id, "2026-06-24T10:00:00Z")).unwrap();
+            note_for(&db, id, "claude_code", "some body text");
+            db.set_note_folder(id, Some(f)).unwrap();
+        }
+        let now = 1_700_000_000_000i64;
+        {
+            let mut conn = db.lock();
+            let tx = conn.transaction().unwrap();
+            // An ACCEPTED edge open↔secret — a preserved decision row.
+            Db::upsert_link_tx(&tx, "meeting", "open", "meeting", "secret", "semantic", 0.9, "accepted", "active", now).unwrap();
+            tx.commit().unwrap();
+        }
+        // Seal the SECRET folder.
+        db.seal_note("secret", "claude_code", b"ciphertext").unwrap();
+        db.set_folder_locked("f-secret", true, None).unwrap();
+
+        let nothing = HashSet::new();
+        // The preserved accepted row is STILL invisible from the open side (neighbour sealed).
+        let edges = db.links_for_visible(crate::links::LinkKind::Meeting, "open", &nothing).unwrap();
+        assert!(
+            edges.iter().all(|e| e.other_id != "secret"),
+            "a preserved accepted row must not surface the sealed neighbour"
+        );
+        // And the sealed queried item reveals no links at all (existence gate).
+        let edges = db.links_for_visible(crate::links::LinkKind::Meeting, "secret", &nothing).unwrap();
+        assert!(edges.is_empty(), "a sealed queried item must not reveal it HAS links");
+    }
+
+    /// Fix 2 (brain-v3 audit) — COMPANION edge RE-DERIVED on unlock. A companion note (in the folder)
+    /// links to its meeting via the `companion` edge; the seal purge drops it (not a preserved decision
+    /// row); `rederive_companion_links_for_folder` restores it. RED before Fix 2: rederive re-ran only
+    /// the wikilink/semantic passes, so the companion edge stayed purged after one lock cycle.
+    #[test]
+    fn rederive_restores_companion_edge_same_folder() {
+        let db = mem_db();
+        seed_folder(&db, "f-locked", "Secret");
+        db.insert_meeting(&sample_meeting("m1", "2026-06-24T10:00:00Z")).unwrap();
+        note_for(&db, "m1", "claude_code", "meeting note body");
+        db.set_note_folder("m1", Some("f-locked")).unwrap();
+        // A companion note (a `documents(kind='note')`) filed in the SAME folder, linked to m1.
+        seed_note_doc(&db, "companion", "f-locked", "Companion", "typed notes");
+        db.set_document_meeting_id("companion", "m1").unwrap();
+        db.set_companion_link("companion", "m1").unwrap();
+        assert_eq!(link_count(&db, "meeting", "m1", "companion"), 1, "companion edge exists pre-seal");
+
+        // Seal the folder: the purge drops the companion edge (it's not dismissed/accepted).
+        db.seal_note("m1", "claude_code", b"ciphertext").unwrap();
+        db.seal_document("companion", b"ciphertext").unwrap();
+        let mut folders = HashSet::new();
+        folders.insert("f-locked".to_string());
+        db.blank_sealed_notes_in_folders(&folders).unwrap();
+        assert_eq!(link_count(&db, "meeting", "m1", "companion"), 0, "companion edge purged on seal");
+
+        // UNLOCK: restore the notes' plaintext (so the endpoints are NOT sealed-at-rest), then rederive.
+        db.restore_note_markdown("m1", "claude_code", "meeting note body").unwrap();
+        db.set_document_text("companion", "typed notes").unwrap();
+        let restored = db
+            .rederive_companion_links_for_folder("f-locked", &["m1".to_string()])
+            .unwrap();
+        assert_eq!(restored, 1, "one companion edge re-asserted");
+        assert_eq!(
+            link_count(&db, "meeting", "m1", "companion"),
+            1,
+            "the companion edge is restored on unlock (present in links)"
+        );
+    }
+
+    /// Fix 2 (brain-v3 audit) — COMPANION edge re-derived when the companion note lives in a DIFFERENT
+    /// (still-open) folder than its meeting: unlocking the MEETING's folder must re-assert the inbound
+    /// leg (note-in-other-folder → meeting-in-this-folder). RED before Fix 2: the inbound leg was never
+    /// scanned, so the edge stayed gone.
+    #[test]
+    fn rederive_restores_companion_edge_cross_folder_inbound() {
+        let db = mem_db();
+        seed_folder(&db, "f-mtg", "Meetings");
+        seed_folder(&db, "f-notes", "Notes");
+        db.insert_meeting(&sample_meeting("m1", "2026-06-24T10:00:00Z")).unwrap();
+        note_for(&db, "m1", "claude_code", "meeting note body");
+        db.set_note_folder("m1", Some("f-mtg")).unwrap();
+        // Companion note in the OTHER (open) folder, linked to m1.
+        seed_note_doc(&db, "companion", "f-notes", "Companion", "typed notes");
+        db.set_document_meeting_id("companion", "m1").unwrap();
+        db.set_companion_link("companion", "m1").unwrap();
+
+        // Seal the MEETING's folder only → its endpoint purge drops the companion edge.
+        db.seal_note("m1", "claude_code", b"ciphertext").unwrap();
+        let mut folders = HashSet::new();
+        folders.insert("f-mtg".to_string());
+        db.blank_sealed_notes_in_folders(&folders).unwrap();
+        assert_eq!(link_count(&db, "meeting", "m1", "companion"), 0, "companion edge purged");
+
+        // Unlock the meeting's folder: restore m1's plaintext, then rederive (companion note in f-notes
+        // was never sealed, so its text is intact).
+        db.restore_note_markdown("m1", "claude_code", "meeting note body").unwrap();
+        let restored = db
+            .rederive_companion_links_for_folder("f-mtg", &["m1".to_string()])
+            .unwrap();
+        assert_eq!(restored, 1, "the inbound companion edge (note in another folder) is re-asserted");
+        assert_eq!(link_count(&db, "meeting", "m1", "companion"), 1, "cross-folder companion edge restored");
+    }
+
+    /// Fix 2 (brain-v3 audit) — the companion re-derive OBEYS Fix 0: it does NOT re-assert an edge to a
+    /// companion note that is ITSELF still sealed-at-rest (in another sealed folder). Guards against
+    /// naming a sealed neighbour during the unlock of a DIFFERENT folder.
+    #[test]
+    fn rederive_companion_skips_sealed_note_endpoint() {
+        let db = mem_db();
+        seed_folder(&db, "f-mtg", "Meetings");
+        seed_folder(&db, "f-secret", "Secret");
+        db.insert_meeting(&sample_meeting("m1", "2026-06-24T10:00:00Z")).unwrap();
+        note_for(&db, "m1", "claude_code", "meeting note body");
+        db.set_note_folder("m1", Some("f-mtg")).unwrap();
+        // Companion note in a STILL-SEALED folder, linked to m1.
+        seed_note_doc(&db, "companion", "f-secret", "Companion", "typed notes");
+        db.set_document_meeting_id("companion", "m1").unwrap();
+        // Seal the companion note at rest (its folder stays locked).
+        db.seal_document("companion", b"ciphertext").unwrap();
+        db.set_folder_locked("f-secret", true, None).unwrap();
+        // Unlock m1's folder: m1 plaintext restored; the companion note is still sealed.
+        let restored = db
+            .rederive_companion_links_for_folder("f-mtg", &["m1".to_string()])
+            .unwrap();
+        assert_eq!(restored, 0, "no companion edge to a still-sealed companion note (Fix-0 discipline)");
+        assert_eq!(link_count(&db, "meeting", "m1", "companion"), 0, "no edge naming the sealed note");
+    }
+
+    /// Fix 3 (brain-v3 audit) — INBOUND wikilink RESTORED on unlock. Note A (open folder) links
+    /// `[[Project X]]` whose target note X lives in folder F. Seal F → the A→X edge is purged (X is a
+    /// sealed endpoint). `rederive_inbound_wikilinks_for_folder` re-indexes A (the outside source) so
+    /// the edge is restored. RED before Fix 3: rederive re-ran only F's OWN sources, so A→X stayed gone
+    /// (A may never be edited again).
+    #[test]
+    fn rederive_restores_inbound_wikilink_from_outside_source() {
+        let db = mem_db();
+        seed_folder(&db, "f-open", "Open");
+        seed_folder(&db, "f-secret", "Secret");
+        // Target note X in the (to-be-sealed) folder.
+        seed_note_doc(&db, "x", "f-secret", "Project X", "the project body");
+        // Source note A in the OPEN folder, body links [[Project X]].
+        seed_note_doc(&db, "a", "f-open", "Note A", "see [[Project X]] for context");
+
+        // Index A while X is visible → the A→X wikilink edge exists.
+        let mut open_all = HashSet::new();
+        open_all.insert("f-open".to_string());
+        open_all.insert("f-secret".to_string());
+        db.index_wikilinks_for_source(
+            crate::links::LinkKind::Note,
+            "a",
+            "see [[Project X]] for context",
+            &open_all,
+        )
+        .unwrap();
+        assert_eq!(link_count(&db, "note", "x", "wikilink"), 1, "A→X edge exists pre-seal");
+
+        // Seal F: blank X + run the relock purge (drops the A→X edge, X being a sealed endpoint).
+        db.seal_document("x", b"ciphertext").unwrap();
+        db.set_folder_locked("f-secret", true, None).unwrap();
+        let mut folders = HashSet::new();
+        folders.insert("f-secret".to_string());
+        db.blank_sealed_notes_in_folders(&folders).unwrap();
+        assert_eq!(link_count(&db, "note", "x", "wikilink"), 0, "A→X edge purged on seal");
+
+        // UNLOCK F: restore X's plaintext + add F to the unlock set, then re-derive the INBOUND leg.
+        db.set_document_text("x", "the project body").unwrap();
+        let mut unlocked = HashSet::new();
+        unlocked.insert("f-open".to_string());
+        unlocked.insert("f-secret".to_string());
+        let reindexed = db
+            .rederive_inbound_wikilinks_for_folder("f-secret", &[], &unlocked)
+            .unwrap();
+        assert!(reindexed >= 1, "the outside source A was re-indexed");
+        assert_eq!(
+            link_count(&db, "note", "x", "wikilink"),
+            1,
+            "the inbound A→X wikilink is restored on unlock"
+        );
+        // And the gated reader on X surfaces A once F is unlocked.
+        let edges = db.links_for_visible(crate::links::LinkKind::Note, "x", &unlocked).unwrap();
+        assert!(
+            edges.iter().any(|e| e.other_id == "a"),
+            "X's link list surfaces the restored inbound source A"
+        );
+    }
+
+    /// Fix 4 (brain-v3 audit) — a later-sealed neighbour's materialized `[[Title]]` is STRIPPED from a
+    /// VISIBLE source note's plaintext on seal, and only from the MACHINE block (a user-typed wikilink
+    /// outside it survives). RED before Fix 4: N's body still named the sealed neighbour after the seal.
+    #[test]
+    fn seal_strips_sealed_neighbour_marker_from_visible_note() {
+        let db = mem_db();
+        seed_folder(&db, "f-open", "Open");
+        seed_folder(&db, "f-secret", "Secret");
+        // Neighbour M in the (to-be-sealed) folder.
+        seed_note_doc(&db, "m", "f-secret", "Neighbour M", "the neighbour body");
+        // Source note N (open): a USER-typed [[Neighbour M]] outside the block + the MACHINE block hit.
+        let machine_block = crate::enrich::apply_link_markers(
+            "user body mentions [[Neighbour M]] inline",
+            &[crate::enrich::ContextHit {
+                source: "note".into(),
+                detail: "[[Neighbour M]]".into(),
+                url: None,
+            }],
+        );
+        seed_note_doc(&db, "n", "f-open", "Note N", &machine_block);
+        // An ACCEPTED edge N↔M so the marker survives (Fix 1) + re-materializes on unlock.
+        let now = 1_700_000_000_000i64;
+        {
+            let mut conn = db.lock();
+            let tx = conn.transaction().unwrap();
+            Db::upsert_link_tx(&tx, "note", "n", "note", "m", "semantic", 0.9, "accepted", "active", now).unwrap();
+            tx.commit().unwrap();
+        }
+
+        // Seal M at rest, then strip the sealed neighbour's marker from visible sources.
+        db.seal_document("m", b"ciphertext").unwrap();
+        let changed = db.strip_sealed_neighbour_markers(&[], &["m".to_string()]).unwrap();
+        assert!(
+            changed.iter().any(|(is_m, id)| !is_m && id == "n"),
+            "N was reported as a changed source"
+        );
+        let n_text: String = db
+            .lock()
+            .query_row("SELECT text FROM documents WHERE id = 'n'", [], |r| r.get(0))
+            .unwrap();
+        // The MACHINE block hit is gone…
+        assert!(
+            !n_text.contains("> - [[Neighbour M]]"),
+            "the managed-block marker naming the sealed neighbour is stripped"
+        );
+        // …but the USER-typed inline wikilink survives (never touch the user's own content).
+        assert!(
+            n_text.contains("user body mentions [[Neighbour M]] inline"),
+            "a user-typed wikilink outside the managed block is NOT stripped"
+        );
+    }
+
+    /// Fix 4 regression (adversarial-verifier): the ALWAYS-ON auto related-notes pass renders the
+    /// neighbour `[[Title]]` in the hit's `url` field (`detail` = a task-free gist), NOT `detail`. The
+    /// original detail-only strip KEPT it → the sealed title leaked in the visible note's plaintext +
+    /// `.md`. The strip must match `[[…]]` in EITHER field.
+    #[test]
+    fn seal_strips_auto_related_url_shape_marker() {
+        let db = mem_db();
+        seed_folder(&db, "f-open", "Open");
+        seed_folder(&db, "f-secret", "Secret");
+        seed_note_doc(&db, "m", "f-secret", "Neighbour M", "the neighbour body");
+        // Auto related-notes shape: `[[Title]]` lives in `url`, `detail` is a gist.
+        let machine_block = crate::enrich::apply_link_markers(
+            "user body",
+            &[crate::enrich::ContextHit {
+                source: "Murmur".into(),
+                detail: "discussed the roadmap".into(),
+                url: Some("[[Neighbour M]]".into()),
+            }],
+        );
+        seed_note_doc(&db, "n", "f-open", "Note N", &machine_block);
+        let now = 1_700_000_000_000i64;
+        {
+            let mut conn = db.lock();
+            let tx = conn.transaction().unwrap();
+            Db::upsert_link_tx(&tx, "note", "n", "note", "m", "semantic", 0.9, "accepted", "active", now)
+                .unwrap();
+            tx.commit().unwrap();
+        }
+        db.seal_document("m", b"ciphertext").unwrap();
+        let changed = db.strip_sealed_neighbour_markers(&[], &["m".to_string()]).unwrap();
+        assert!(changed.iter().any(|(is_m, id)| !is_m && id == "n"), "N reported changed");
+        let n_text: String = db
+            .lock()
+            .query_row("SELECT text FROM documents WHERE id = 'n'", [], |r| r.get(0))
+            .unwrap();
+        assert!(
+            !n_text.contains("[[Neighbour M]]"),
+            "the auto-related url-shape marker naming the sealed neighbour must be stripped; got {n_text:?}"
+        );
+    }
+
+    /// Fix 4 regression (lock-security): semantic edges are CANONICALIZED (smaller `(kind,id)` = `src`),
+    /// so a marker can be written into the DST endpoint naming a sealed SRC. The original dst-only
+    /// collect scan missed it. Here a `document`-src (`"document" < "note"`) is sealed, its title
+    /// materialized into note N (dst) — the collect's src-leg must find N and strip it.
+    #[test]
+    fn seal_strips_marker_naming_a_sealed_src_endpoint() {
+        let db = mem_db();
+        seed_folder(&db, "f-open", "Open");
+        seed_folder(&db, "f-secret", "Secret");
+        seed_note_doc(&db, "d", "f-secret", "Doc D", "doc body");
+        let machine_block = crate::enrich::apply_link_markers(
+            "user body",
+            &[crate::enrich::ContextHit {
+                source: "note".into(),
+                detail: "[[Doc D]]".into(),
+                url: None,
+            }],
+        );
+        seed_note_doc(&db, "n", "f-open", "Note N", &machine_block);
+        let now = 1_700_000_000_000i64;
+        {
+            let mut conn = db.lock();
+            let tx = conn.transaction().unwrap();
+            // Store the edge with the sealed DOCUMENT d as the SRC and the marker-owning note n as the
+            // DST (the canonicalized shape auto_link_semantic produces, since "document" < "note").
+            // upsert_link_tx stores endpoints as-passed, so this exercises the NEW src-leg of the collect
+            // scan: sealing d, the dst-leg (WHERE dst_id='d') misses (d is the src), and ONLY the src-leg
+            // (WHERE src_id='d' … dst_kind IN('note','meeting')) finds n — RED on the old dst-only code.
+            Db::upsert_link_tx(&tx, "document", "d", "note", "n", "semantic", 0.9, "accepted", "active", now)
+                .unwrap();
+            tx.commit().unwrap();
+        }
+        db.seal_document("d", b"ciphertext").unwrap();
+        let changed = db.strip_sealed_neighbour_markers(&[], &["d".to_string()]).unwrap();
+        assert!(
+            changed.iter().any(|(is_m, id)| !is_m && id == "n"),
+            "N (dst, owning the marker) must be found via the src-leg and reported changed; got {changed:?}"
+        );
+        let n_text: String = db
+            .lock()
+            .query_row("SELECT text FROM documents WHERE id = 'n'", [], |r| r.get(0))
+            .unwrap();
+        assert!(
+            !n_text.contains("[[Doc D]]"),
+            "a marker naming the sealed SRC endpoint must be stripped; got {n_text:?}"
+        );
+    }
+
+    /// Fix 4 (brain-v3 audit, INVERSE) — on unlock, the stripped marker is RE-MATERIALIZED from the
+    /// preserved accepted row into the source note's managed block. RED before the inverse: after
+    /// strip+unlock the accepted link had no rendered `[[Title]]` in the source body.
+    #[test]
+    fn unlock_rematerializes_accepted_marker_into_source() {
+        let db = mem_db();
+        seed_folder(&db, "f-open", "Open");
+        seed_folder(&db, "f-secret", "Secret");
+        seed_note_doc(&db, "m", "f-secret", "Neighbour M", "the neighbour body");
+        seed_note_doc(&db, "n", "f-open", "Note N", "just the note body");
+        let now = 1_700_000_000_000i64;
+        {
+            let mut conn = db.lock();
+            let tx = conn.transaction().unwrap();
+            Db::upsert_link_tx(&tx, "note", "n", "note", "m", "semantic", 0.9, "accepted", "active", now).unwrap();
+            tx.commit().unwrap();
+        }
+        // Seal M + strip (N had no marker yet, so strip is a no-op here — the point is the INVERSE).
+        db.seal_document("m", b"ciphertext").unwrap();
+        db.set_folder_locked("f-secret", true, None).unwrap();
+        let _ = db.strip_sealed_neighbour_markers(&[], &["m".to_string()]).unwrap();
+
+        // UNLOCK M's folder: restore M's plaintext, then re-materialize accepted markers for the folder.
+        db.set_document_text("m", "the neighbour body").unwrap();
+        let mut unlocked = HashSet::new();
+        unlocked.insert("f-open".to_string());
+        unlocked.insert("f-secret".to_string());
+        let changed = db
+            .rematerialize_accepted_markers_for_folder("f-secret", &[], &unlocked)
+            .unwrap();
+        assert!(
+            changed.iter().any(|(is_m, id)| !is_m && id == "n"),
+            "N's body was re-materialized"
+        );
+        let n_text: String = db
+            .lock()
+            .query_row("SELECT text FROM documents WHERE id = 'n'", [], |r| r.get(0))
+            .unwrap();
+        assert!(
+            n_text.contains("[[Neighbour M]]"),
+            "the accepted neighbour's [[Title]] is re-materialized into N's managed block on unlock"
+        );
+    }
+
+    /// Fix 4 (brain-v3 audit) — the strip NEVER touches a source that is itself sealed-at-rest (its
+    /// body is already blanked — resurrecting plaintext behind its own lock would be a bug).
+    #[test]
+    fn seal_strip_skips_sealed_at_rest_source() {
+        let db = mem_db();
+        seed_folder(&db, "f-a", "A");
+        seed_folder(&db, "f-b", "B");
+        seed_note_doc(&db, "m", "f-a", "Neighbour M", "m body");
+        // Source N is itself sealed at rest (blank text + blob).
+        seed_note_doc(&db, "n", "f-b", "Note N", "n body");
+        db.seal_document("n", b"ciphertext").unwrap();
+        let now = 1_700_000_000_000i64;
+        {
+            let mut conn = db.lock();
+            let tx = conn.transaction().unwrap();
+            Db::upsert_link_tx(&tx, "note", "n", "note", "m", "wikilink", 1.0, "user", "active", now).unwrap();
+            tx.commit().unwrap();
+        }
+        db.seal_document("m", b"ciphertext").unwrap();
+        let changed = db.strip_sealed_neighbour_markers(&[], &["m".to_string()]).unwrap();
+        assert!(
+            !changed.iter().any(|(_, id)| id == "n"),
+            "a sealed-at-rest source is never re-touched (its body is already blank)"
+        );
+    }
+
     /// DISMISS TOMBSTONES: a dismissed semantic suggestion is never re-suggested by a later auto pass.
     #[test]
     fn dismiss_tombstones_a_semantic_suggestion() {
@@ -24393,7 +25743,7 @@ mod lock_tests {
 
         // Startup reconcile with NO locked folder ⇒ rollups SURVIVE (nothing sealed, no leak).
         seed_rollup(&db);
-        let (_, paths, _) = db.reblank_locked_folders_at_rest().unwrap();
+        let (_, paths, _, _) = db.reblank_locked_folders_at_rest().unwrap();
         assert!(paths.is_empty());
         assert_eq!(
             db.list_memory_rollups().unwrap().len(),
@@ -24403,7 +25753,7 @@ mod lock_tests {
 
         // Startup reconcile WITH a locked folder ⇒ purged.
         db.set_folder_locked("f1", true, None).unwrap();
-        let (_, paths, _) = db.reblank_locked_folders_at_rest().unwrap();
+        let (_, paths, _, _) = db.reblank_locked_folders_at_rest().unwrap();
         assert_eq!(paths.len(), 1);
         assert!(db.list_memory_rollups().unwrap().is_empty());
 
