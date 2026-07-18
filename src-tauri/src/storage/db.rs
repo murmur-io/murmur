@@ -5473,12 +5473,77 @@ impl Db {
         Ok(())
     }
 
+    /// Map one doc-chunk candidate row (the shared 10-column SELECT of the two doc readers) into a
+    /// [`DocChunkHit`] carrying the chunk's hierarchy metadata. `sibling_hits` starts at 0 — it is
+    /// populated by [`Db::fold_doc_candidates`] for the winner of each document's dedup.
+    fn doc_candidate_from_row(row: &Row<'_>) -> rusqlite::Result<DocChunkHit> {
+        Ok(DocChunkHit {
+            document_id: row.get(0)?,
+            name: row.get(1)?,
+            folder_id: row.get(2)?,
+            snippet: row.get(3)?,
+            kind: row.get(4)?,
+            chunk_id: row.get(5)?,
+            parent_id: row.get(6)?,
+            section_path: row.get(7)?,
+            page_no: row.get(8)?,
+            level: row.get(9)?,
+            sibling_hits: 0,
+        })
+    }
+
+    /// Fold a BEST-FIRST pre-dedup doc-chunk candidate stream into the per-document deduped hit
+    /// list. The first candidate seen for a document WINS (exactly the nearest-KNN / best-bm25
+    /// dedup the callers have always had — ranking and snippets stay byte-identical), and later
+    /// candidates only feed the winner's `sibling_hits`: the count of distinct L0 leaves under the
+    /// winning chunk's L1 parent present in the candidate set (winner included). `limit` caps how
+    /// many DOCUMENTS are collected (`None` = all); candidates past the limit still corroborate
+    /// siblings for already-collected winners. Audit Fix 1: this is what makes parent expansion
+    /// hit-aligned and sibling-gated instead of query-independent.
+    fn fold_doc_candidates(
+        candidates: impl Iterator<Item = rusqlite::Result<DocChunkHit>>,
+        limit: Option<usize>,
+    ) -> Result<Vec<DocChunkHit>> {
+        let mut idx_by_doc: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        let mut hits: Vec<DocChunkHit> = Vec::new();
+        for cand in candidates {
+            let cand = cand.map_err(map_err)?;
+            match idx_by_doc.get(&cand.document_id) {
+                None => {
+                    if limit.map_or(true, |l| hits.len() < l) {
+                        // MSRV 1.77: no Option::is_none_or (stable 1.82)
+                        let mut winner = cand;
+                        // The winner counts itself when it is a leaf under a real parent.
+                        winner.sibling_hits =
+                            u32::from(winner.level == 0 && winner.parent_id.is_some());
+                        idx_by_doc.insert(winner.document_id.clone(), hits.len());
+                        hits.push(winner);
+                    }
+                }
+                Some(&i) => {
+                    let w = &mut hits[i];
+                    if cand.level == 0
+                        && w.parent_id.is_some()
+                        && cand.parent_id == w.parent_id
+                        && cand.chunk_id != w.chunk_id
+                    {
+                        w.sibling_hits += 1;
+                    }
+                }
+            }
+        }
+        Ok(hits)
+    }
+
     /// GATED semantic (vector KNN) search over DOCUMENT chunks. Runs a `doc_vec_chunks` KNN for the
     /// top-`k` nearest chunks, then applies EXACTLY the `visibility_clause` predicate (joined
     /// doc_chunks → documents → folders) so a chunk in a sealed-and-not-session-unlocked folder is
     /// EXCLUDED even if a stray chunk survived purge — the same defense-in-depth as
-    /// `search_semantic_visible`. Dedups to one hit per document (best/nearest). Returns the chunk
-    /// snippet + the document name + its folder id (NO meeting — documents are not meetings).
+    /// `search_semantic_visible`. Dedups to one hit per document (best/nearest) while counting the
+    /// winner's `sibling_hits` across the pre-dedup KNN candidates ([`Db::fold_doc_candidates`]).
+    /// Returns the chunk snippet + the document name + its folder id + the winning chunk's
+    /// hierarchy metadata (NO meeting — documents are not meetings).
     pub fn search_doc_chunks_visible(
         &self,
         query_vec: &[f32],
@@ -5497,7 +5562,8 @@ impl Db {
                   WHERE embedding MATCH ?1 AND k = ?2
                   ORDER BY distance
              )
-             SELECT d.id, d.name, d.folder_id, dc.text, d.kind, knn.distance
+             SELECT d.id, d.name, d.folder_id, dc.text, d.kind,
+                    dc.id, dc.parent_id, dc.section_path, dc.page_no, dc.level
                FROM knn
                JOIN doc_chunks dc ON dc.id = knn.chunk_id
                JOIN documents d ON d.id = dc.document_id
@@ -5508,26 +5574,10 @@ impl Db {
         let blob = crate::embed::vec_to_blob(query_vec);
         let mut stmt = conn.prepare(&sql).map_err(map_err)?;
         let rows = stmt
-            .query_map(rusqlite::params![blob, k], |row| {
-                Ok(DocChunkHit {
-                    document_id: row.get(0)?,
-                    name: row.get(1)?,
-                    folder_id: row.get(2)?,
-                    snippet: row.get(3)?,
-                    kind: row.get(4)?,
-                })
-            })
+            .query_map(rusqlite::params![blob, k], Self::doc_candidate_from_row)
             .map_err(map_err)?;
-        let mut seen: HashSet<String> = HashSet::new();
-        let mut hits = Vec::new();
-        for r in rows {
-            let hit = r.map_err(map_err)?;
-            if !seen.insert(hit.document_id.clone()) {
-                continue; // already have a nearer chunk for this document.
-            }
-            hits.push(hit);
-        }
-        Ok(hits)
+        // The k-row KNN CTE already bounds the candidate set; every deduped hit is kept (as before).
+        Self::fold_doc_candidates(rows, None)
     }
 
     /// GATED keyword (FTS5/BM25) search over DOCUMENT chunks — the model-free twin of
@@ -5535,7 +5585,9 @@ impl Db {
     /// install (no e5 model, semantic flag off). Applies EXACTLY the `visibility_clause` predicate
     /// (joined doc_chunks → documents → folders) so a chunk in a sealed-and-not-session-unlocked
     /// folder is EXCLUDED even if a stray chunk survived purge — defense-in-depth on top of the
-    /// trigger-purged FTS index. Dedups to one hit per document (best bm25), capped at `limit`.
+    /// trigger-purged FTS index. Dedups to one hit per document (best bm25), capped at `limit`;
+    /// the scan continues past the cap (bounded at 10×`limit` rows) ONLY to count the winners'
+    /// `sibling_hits` — the returned documents, order, and snippets are unchanged.
     pub fn search_doc_chunks_fts_visible(
         &self,
         query: &str,
@@ -5551,120 +5603,93 @@ impl Db {
         let conn = self.lock();
         let visible = visibility_clause("f", unlocked);
         let sql = format!(
-            "SELECT d.id, d.name, d.folder_id, dc.text, d.kind, bm25(fts_doc_chunks) AS rank
+            "SELECT d.id, d.name, d.folder_id, dc.text, d.kind,
+                    dc.id, dc.parent_id, dc.section_path, dc.page_no, dc.level
                FROM fts_doc_chunks
                JOIN doc_chunks dc ON dc.id = fts_doc_chunks.rowid
                JOIN documents d ON d.id = dc.document_id
                JOIN folders f ON f.id = d.folder_id
               WHERE fts_doc_chunks MATCH ?1 AND {visible}
-              ORDER BY rank ASC, d.id ASC"
+              ORDER BY bm25(fts_doc_chunks) ASC, d.id ASC"
         );
         let mut stmt = conn.prepare(&sql).map_err(map_err)?;
         let rows = stmt
-            .query_map(rusqlite::params![match_expr], |row| {
-                Ok(DocChunkHit {
-                    document_id: row.get(0)?,
-                    name: row.get(1)?,
-                    folder_id: row.get(2)?,
-                    snippet: row.get(3)?,
-                    kind: row.get(4)?,
-                })
-            })
+            .query_map(rusqlite::params![match_expr], Self::doc_candidate_from_row)
             .map_err(map_err)?;
-        let mut seen: HashSet<String> = HashSet::new();
-        let mut hits = Vec::new();
-        for r in rows {
-            let hit = r.map_err(map_err)?;
-            if !seen.insert(hit.document_id.clone()) {
-                continue; // already have a better-ranked chunk for this document.
-            }
-            hits.push(hit);
-            if hits.len() as i64 >= limit {
-                break;
-            }
-        }
-        Ok(hits)
+        // Bound the sibling-count scan so a stop-word-ish query over a large corpus stays cheap;
+        // sibling counts are then a LOWER bound, which can only under-trigger expansion (safe).
+        let scan_cap = (limit as usize).saturating_mul(10).max(64);
+        Self::fold_doc_candidates(rows.take(scan_cap), Some(limit as usize))
     }
 
-    /// Brain v3 PR-2 — GATED parent-document expansion (LlamaIndex parent-document / RAPTOR effect).
-    /// For each of the given `document_ids` (the TOP fused doc hits), return the document's DOMINANT
-    /// L1 section-parent text — the section covering the MOST leaf chunks — so the reasoner reads a
-    /// coherent SECTION instead of an isolated 800-char leaf. Documents with no L1 parents (a flat /
-    /// legacy doc, or one section only) are simply omitted (the caller keeps the original leaf hit).
+    /// Brain v3 audit Fix 1 — HIT-ALIGNED, SIBLING-GATED parent expansion (LlamaIndex auto-merging
+    /// semantics). For each of the given top fused doc `hits`, return the text of the WINNING
+    /// chunk's OWN L1 section-parent (`doc_chunks WHERE id = hit.parent_id`) — but ONLY when the
+    /// retrieval corroborated that section (`sibling_hits >= 2`: at least two distinct L0 leaves of
+    /// the same parent in the pre-dedup candidate set). A single-leaf hit yields no expansion row
+    /// (the caller keeps the leaf snippet), and a FLAT hit (`section_path` `None`) NEVER expands —
+    /// the flat L1 is the doc head, not a real section. The pre-fix dominant-by-leaf-count
+    /// expansion replaced relevant retrieved snippets with an unrelated section's text.
     ///
-    /// GATING (lock-model, load-bearing): the query applies EXACTLY the same `visibility_clause`
-    /// predicate over `doc_chunks → documents → folders` as the doc-search readers — a document in a
-    /// sealed-and-not-session-unlocked folder yields NOTHING here (its `level=1` rows are purged while
-    /// sealed anyway, and the gate is defense-in-depth on top). No raw-SQL bypass; parents are DERIVED
-    /// content, so this is a pure gated READ that never widens what the session can see.
+    /// GATING (lock-model, load-bearing): each parent lookup applies EXACTLY the same
+    /// `visibility_clause` predicate over `doc_chunks → documents → folders` as the doc-search
+    /// readers — a document in a sealed-and-not-session-unlocked folder yields NOTHING here even
+    /// for a STALE pre-seal hit (its `level=1` rows are purged while sealed anyway, and the gate is
+    /// defense-in-depth on top). The parent row is additionally pinned to the hit's own document
+    /// (`p.document_id = hit.document_id`) and to `p.level = 1`, so a stale/foreign `parent_id`
+    /// can never fetch across documents or levels. Parents are DERIVED content — a pure gated READ.
     ///
-    /// Returns `document_id → (name, folder_id, parent_text)`. `parent_text` is the L1 `text` (already
-    /// capped at ingest to ~6000 chars — the reasoner budget stays tight).
+    /// Returns one [`DocChunkHit`] per EXPANDED hit (`snippet` = the L1 parent text, already capped
+    /// at ingest to ~6000 chars); non-expanded hits are simply absent.
     pub fn expand_doc_parents_visible(
         &self,
-        document_ids: &[String],
+        hits: &[DocChunkHit],
         unlocked: &HashSet<String>,
     ) -> Result<Vec<DocChunkHit>> {
-        if document_ids.is_empty() {
+        if hits.is_empty() {
             return Ok(Vec::new());
         }
         let conn = self.lock();
         let visible = visibility_clause("f", unlocked);
-        // For each doc's L1 parents, count how many L0 leaves point at each parent, then pick the
-        // parent with the most leaves (ties broken by lowest parent id, deterministic). One row per
-        // document. `child.parent_id = parent.id` is the hierarchy edge. Gate on the parent's folder.
-        let placeholders = document_ids
-            .iter()
-            .enumerate()
-            .map(|(i, _)| format!("?{}", i + 1))
-            .collect::<Vec<_>>()
-            .join(",");
         let sql = format!(
-            "WITH parent_counts AS (
-                 SELECT p.id AS parent_id,
-                        p.document_id AS document_id,
-                        p.text AS parent_text,
-                        COUNT(c.id) AS leaf_count
-                   FROM doc_chunks p
-                   JOIN documents d ON d.id = p.document_id
-                   JOIN folders f ON f.id = d.folder_id
-                   LEFT JOIN doc_chunks c
-                          ON c.parent_id = p.id AND c.level = 0
-                  WHERE p.level = 1
-                    AND p.document_id IN ({placeholders})
-                    AND {visible}
-                  GROUP BY p.id
-             ),
-             ranked AS (
-                 SELECT parent_counts.*,
-                        ROW_NUMBER() OVER (
-                            PARTITION BY document_id
-                            ORDER BY leaf_count DESC, parent_id ASC
-                        ) AS rn
-                   FROM parent_counts
-             )
-             SELECT d.id, d.name, d.folder_id, r.parent_text, d.kind
-               FROM ranked r
-               JOIN documents d ON d.id = r.document_id
-              WHERE r.rn = 1"
+            "SELECT p.text
+               FROM doc_chunks p
+               JOIN documents d ON d.id = p.document_id
+               JOIN folders f ON f.id = d.folder_id
+              WHERE p.id = ?1 AND p.document_id = ?2 AND p.level = 1 AND {visible}"
         );
-        let params: Vec<&dyn rusqlite::ToSql> =
-            document_ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
         let mut stmt = conn.prepare(&sql).map_err(map_err)?;
-        let rows = stmt
-            .query_map(params.as_slice(), |row| {
-                Ok(DocChunkHit {
-                    document_id: row.get(0)?,
-                    name: row.get(1)?,
-                    folder_id: row.get(2)?,
-                    snippet: row.get(3)?,
-                    kind: row.get(4)?,
-                })
-            })
-            .map_err(map_err)?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r.map_err(map_err)?);
+        let mut out: Vec<DocChunkHit> = Vec::new();
+        for h in hits {
+            if h.sibling_hits < 2 || h.section_path.is_none() {
+                continue; // uncorroborated or flat — the leaf snippet stays.
+            }
+            let Some(parent_id) = h.parent_id else {
+                continue; // an L1/L2/legacy winner has no parent to expand to.
+            };
+            let text: Option<String> = stmt
+                .query_row(rusqlite::params![parent_id, h.document_id], |row| row.get(0))
+                .optional()
+                .map_err(map_err)?;
+            let Some(text) = text else {
+                continue; // gated out (sealed-not-unlocked) or a vanished parent row.
+            };
+            if text.trim().is_empty() {
+                continue;
+            }
+            out.push(DocChunkHit {
+                document_id: h.document_id.clone(),
+                name: h.name.clone(),
+                folder_id: h.folder_id.clone(),
+                snippet: text,
+                kind: h.kind.clone(),
+                chunk_id: parent_id,
+                parent_id: None,
+                section_path: h.section_path.clone(),
+                page_no: h.page_no,
+                level: 1,
+                sibling_hits: h.sibling_hits,
+            });
         }
         Ok(out)
     }
@@ -18937,53 +18962,175 @@ mod tests {
         assert_eq!(vec_count("SELECT COUNT(*) FROM doc_vec_chunks"), 0);
     }
 
-    /// Brain v3 PR-2 — `expand_doc_parents_visible` returns the dominant L1 SECTION-parent text for a
-    /// top doc hit, and is GATED: a sealed-not-unlocked folder's document yields NOTHING (RED if the
-    /// `visibility_clause` were removed), and unlocking restores it.
+    /// Audit Fix 1 test fixture — one document with a DOMINANT "Alpha" section (3 leaves of plain
+    /// filler) and a SMALLER "Beta" section (2 leaves; "pistachio" appears mid-paragraph in both —
+    /// past the first sentence, so the L2 outline never matches it; "zloty" appears in the second
+    /// Beta leaf ONLY). The pre-fix dominant-by-leaf-count expansion always served Alpha.
+    fn seed_two_section_doc(db: &Db, doc_id: &str, folder_id: &str) {
+        let alpha_para = "Alpha filler sentence with plain ordinary words in it. ".repeat(13);
+        let beta_one = format!(
+            "This beta paragraph opens with a plain first sentence. \
+             The pistachio pistachio pistachio budget appears in the middle here. {}",
+            "Beta filler words about the plan. ".repeat(16)
+        );
+        let beta_two = format!(
+            "Another beta paragraph opens plainly as well. \
+             A second pistachio mention and one zloty token live right here. {}",
+            "More beta filler words in this spot. ".repeat(16)
+        );
+        let mk = |text: &str, page: u32, heading: &str| crate::extract::ExtractedBlock {
+            text: text.trim().to_string(),
+            page: Some(page),
+            heading_path: Some(heading.to_string()),
+        };
+        let blocks = vec![
+            mk(&alpha_para, 1, "Alpha"),
+            mk(&alpha_para, 1, "Alpha"),
+            mk(&alpha_para, 2, "Alpha"),
+            mk(&beta_one, 3, "Beta"),
+            mk(&beta_two, 3, "Beta"),
+        ];
+        let stored = crate::extract::blocks_to_stored_text(&blocks);
+        db.insert_document(doc_id, folder_id, "plan.pdf", &stored, "document", 100)
+            .unwrap();
+        db.index_document_chunks(doc_id, Some(&crate::embed::StubEmbedder))
+            .unwrap();
+    }
+
+    /// Audit Fix 1 (RED observed pre-fix: expansion served the dominant Alpha section) — a hit in
+    /// the SMALLER Beta section, corroborated by its sibling leaf, expands to the HIT's OWN L1
+    /// parent: the full Beta section, never Alpha.
+    #[test]
+    fn expand_serves_the_hit_sections_own_parent_when_siblings_corroborate() {
+        let db = mem_db();
+        seed_folder(&db, "f1", "Docs");
+        seed_two_section_doc(&db, "d1", "f1");
+        let nothing = std::collections::HashSet::new();
+        let hits = db
+            .search_doc_chunks_fts_visible("pistachio", 20, &nothing)
+            .unwrap();
+        assert_eq!(hits.len(), 1, "one document → one deduped hit");
+        let h = &hits[0];
+        assert_eq!(h.level, 0, "a Beta LEAF must win the per-document dedup");
+        assert_eq!(h.section_path.as_deref(), Some("Beta"));
+        assert!(h.parent_id.is_some(), "a section leaf carries its L1 parent id");
+        assert!(h.chunk_id > 0);
+        assert_eq!(
+            h.sibling_hits, 2,
+            "both Beta leaves are in the pre-dedup candidate set (winner + 1 sibling)"
+        );
+        let parents = db.expand_doc_parents_visible(&hits, &nothing).unwrap();
+        assert_eq!(parents.len(), 1, "a corroborated section hit expands");
+        let p = &parents[0];
+        assert_eq!(p.level, 1);
+        assert!(
+            p.snippet.contains("This beta paragraph opens")
+                && p.snippet.contains("Another beta paragraph opens"),
+            "expansion serves the FULL Beta section (both leaves), got: {:?}…",
+            p.snippet.chars().take(80).collect::<String>()
+        );
+        assert!(
+            !p.snippet.contains("Alpha filler"),
+            "expansion must NEVER serve the dominant Alpha section for a Beta hit"
+        );
+    }
+
+    /// Audit Fix 1 — a SINGLE uncorroborated leaf hit (`sibling_hits == 1`) keeps its leaf snippet:
+    /// no expansion row. (RED pre-fix: expansion was unconditional and query-independent.)
+    #[test]
+    fn expand_requires_two_corroborating_sibling_leaves() {
+        let db = mem_db();
+        seed_folder(&db, "f1", "Docs");
+        seed_two_section_doc(&db, "d1", "f1");
+        let nothing = std::collections::HashSet::new();
+        let hits = db
+            .search_doc_chunks_fts_visible("zloty", 20, &nothing)
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].level, 0, "the single matching Beta leaf wins");
+        assert_eq!(
+            hits[0].sibling_hits, 1,
+            "only the winner itself matched — no corroborating sibling"
+        );
+        assert!(
+            db.expand_doc_parents_visible(&hits, &nothing).unwrap().is_empty(),
+            "an uncorroborated single-leaf hit must keep its leaf snippet"
+        );
+    }
+
+    /// Audit Fix 1 — a FLAT document (no headings; `section_path` NULL) NEVER expands, even when
+    /// two of its leaves corroborate: its L1 is the doc head, not a real section. (RED pre-fix:
+    /// the old code expanded flat docs to the head, contrary to its own comments.)
+    #[test]
+    fn flat_doc_hit_keeps_its_leaf_no_expansion() {
+        let db = mem_db();
+        seed_folder(&db, "f1", "Docs");
+        let mut text = String::new();
+        for i in 0..6 {
+            let marker = if i == 2 || i == 5 {
+                "The zanzibar clause appears in this very paragraph. "
+            } else {
+                ""
+            };
+            text.push_str(&format!(
+                "Flat paragraph number {i} with plain filler words. {marker}{}\n\n",
+                "More flat filler text in this paragraph. ".repeat(16)
+            ));
+        }
+        db.insert_document("d2", "f1", "notes.md", &text, "document", 100)
+            .unwrap();
+        db.index_document_chunks("d2", Some(&crate::embed::StubEmbedder))
+            .unwrap();
+        let nothing = std::collections::HashSet::new();
+        let hits = db
+            .search_doc_chunks_fts_visible("zanzibar", 20, &nothing)
+            .unwrap();
+        assert_eq!(hits.len(), 1, "a mid-file leaf must be keyword-reachable");
+        assert!(hits[0].section_path.is_none(), "a flat doc's leaf has no section path");
+        assert_eq!(
+            hits[0].sibling_hits, 2,
+            "both matching flat leaves share the flat L1 — corroboration alone must NOT expand"
+        );
+        assert!(
+            db.expand_doc_parents_visible(&hits, &nothing).unwrap().is_empty(),
+            "a flat doc must keep its leaf snippet — never expand to the doc head"
+        );
+    }
+
+    /// Brain v3 — `expand_doc_parents_visible` is GATED: a sealed-not-unlocked folder's document
+    /// yields NOTHING even for a STALE pre-seal hit still carrying a valid `parent_id` (RED if the
+    /// `visibility_clause` were removed), and unlocking restores the expansion.
     #[test]
     fn expand_doc_parents_is_gated_and_returns_section_text() {
         let db = mem_db();
         seed_folder(&db, "f-lock", "Secret");
-        let blocks = vec![
-            crate::extract::ExtractedBlock {
-                text: "First paragraph about the classified launch plan for the product.".into(),
-                page: Some(1),
-                heading_path: Some("Launch".into()),
-            },
-            crate::extract::ExtractedBlock {
-                text: "Second paragraph under the same launch heading with more detail here.".into(),
-                page: Some(1),
-                heading_path: Some("Launch".into()),
-            },
-        ];
-        let stored = crate::extract::blocks_to_stored_text(&blocks);
-        db.insert_document("d1", "f-lock", "plan.pdf", &stored, "document", 100)
-            .unwrap();
-        db.index_document_chunks("d1", Some(&crate::embed::StubEmbedder))
-            .unwrap();
-
-        let ids = vec!["d1".to_string()];
-        // Open folder → the dominant L1 "Launch" section text comes back.
+        seed_two_section_doc(&db, "d1", "f-lock");
         let nothing = std::collections::HashSet::new();
-        let open = db.expand_doc_parents_visible(&ids, &nothing).unwrap();
-        assert_eq!(open.len(), 1, "one document → one dominant parent");
+        // Open folder → the corroborated Beta hit expands to its section text.
+        let hits = db
+            .search_doc_chunks_fts_visible("pistachio", 20, &nothing)
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        let open = db.expand_doc_parents_visible(&hits, &nothing).unwrap();
+        assert_eq!(open.len(), 1, "one corroborated hit → one parent");
         assert!(
-            open[0].snippet.contains("classified launch plan"),
+            open[0].snippet.contains("beta paragraph"),
             "parent text is the SECTION body, got: {:?}",
-            open[0].snippet
+            open[0].snippet.chars().take(80).collect::<String>()
         );
 
-        // Seal → gated OUT with empty unlock set.
+        // Seal → the SAME (now stale) hits are gated OUT with an empty unlock set: the parent
+        // lookup re-applies the visibility gate per hit, so a pre-seal hit cannot fetch anything.
         db.set_folder_locked("f-lock", true, None).unwrap();
         assert!(
-            db.expand_doc_parents_visible(&ids, &nothing).unwrap().is_empty(),
+            db.expand_doc_parents_visible(&hits, &nothing).unwrap().is_empty(),
             "sealed-not-unlocked parent leaked through expand gate"
         );
         // Unlock → restored.
         let mut unlocked = std::collections::HashSet::new();
         unlocked.insert("f-lock".to_string());
         assert_eq!(
-            db.expand_doc_parents_visible(&ids, &unlocked).unwrap().len(),
+            db.expand_doc_parents_visible(&hits, &unlocked).unwrap().len(),
             1,
             "unlock restores the parent"
         );

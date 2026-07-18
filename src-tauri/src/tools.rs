@@ -531,14 +531,15 @@ pub fn execute_tool(
                 .search_doc_chunks_fts_visible(q, 20, unlocked)
                 .unwrap_or_default();
             let mut docs = crate::embed::fuse_doc_hits(knn_docs, fts_docs);
-            // Brain v3 PR-2 — GATED PARENT EXPANSION: for the top-3 fused doc hits, swap the isolated
-            // leaf snippet for the document's dominant L1 SECTION-parent text so the agent reads a
-            // coherent section. `expand_doc_parents_visible` re-applies the visibility gate (a
-            // sealed-not-unlocked doc yields nothing); a flat/legacy doc keeps its leaf snippet.
-            let top_ids: Vec<String> =
-                docs.iter().take(3).map(|h| h.document_id.clone()).collect();
-            if !top_ids.is_empty() {
-                if let Ok(parents) = db.expand_doc_parents_visible(&top_ids, unlocked) {
+            // Brain v3 audit Fix 1 — GATED, HIT-ALIGNED PARENT EXPANSION: a top-3 fused doc hit
+            // whose section was corroborated by a second sibling leaf (auto-merging) swaps its leaf
+            // snippet for the WINNING chunk's own L1 section-parent text, so the agent reads the
+            // coherent section AROUND what was retrieved — never a different (dominant) section.
+            // `expand_doc_parents_visible` re-applies the visibility gate (a sealed-not-unlocked
+            // doc yields nothing); single-leaf hits and flat/legacy docs keep their leaf snippet.
+            if !docs.is_empty() {
+                let top_n = docs.len().min(3);
+                if let Ok(parents) = db.expand_doc_parents_visible(&docs[..top_n], unlocked) {
                     for p in parents {
                         if let Some(h) = docs.iter_mut().find(|h| h.document_id == p.document_id) {
                             if !p.snippet.trim().is_empty() {
