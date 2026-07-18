@@ -1709,6 +1709,24 @@ export class IpcService {
   }
 
   /**
+   * The audio receipt for ONE fact's text against its SOURCE meeting (Brain v3
+   * audit PR-8) — lets the decision-ledger "Source" chip deep-seek the meeting's
+   * audio to the second the fact derives from. Same gate and alignment floor as
+   * `getNoteReceipts`: a sealed-and-not-session-unlocked meeting — or a fact the
+   * transcript doesn't clearly support — resolves `null`, and the caller falls
+   * back to plainly opening the meeting.
+   */
+  getFactReceipt(
+    meetingId: string,
+    factText: string,
+  ): Promise<ClaimAlignment | null> {
+    return invoke<ClaimAlignment | null>("get_fact_receipt", {
+      meetingId,
+      factText,
+    });
+  }
+
+  /**
    * Resolve this meeting's owning folder and run the biometric unlock_folder
    * path (Touch ID). Returns the updated `FolderNode` for the folder, or null
    * when the meeting is at the vault root / in an open folder. After a success,
