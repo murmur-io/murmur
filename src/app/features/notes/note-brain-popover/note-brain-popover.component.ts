@@ -30,6 +30,7 @@ import {
   noteAssistEntry,
 } from "./note-assist-catalog";
 import { RepositionOnScrollDirective } from "./reposition-on-scroll.directive";
+import { TeleportToBodyDirective } from "../../../design-system/teleport-to-body.directive";
 
 /** The live text selection the popover acts on, plus its viewport anchor rect. */
 export interface PopoverSelection {
@@ -112,7 +113,7 @@ const RETRIEVAL_ACTIONS = new Set<NoteAssistAction>([
 @Component({
   selector: "app-note-brain-popover",
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [RepositionOnScrollDirective],
+  imports: [RepositionOnScrollDirective, TeleportToBodyDirective],
   templateUrl: "./note-brain-popover.component.html",
   styleUrl: "./note-brain-popover.component.scss",
 })

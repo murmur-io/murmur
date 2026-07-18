@@ -171,7 +171,9 @@ test("connections panel: × only on manual chips (unlink), + Link chooser links 
   // Open the + Link chooser → the query input + the opaque picker popover appear.
   await panel.getByRole("button", { name: "Link" }).click();
   await expect(panel.getByPlaceholder(/Link a meeting, note/)).toBeVisible();
-  const picker = page.locator("app-link-picker");
+  // The link-picker popover box is TELEPORTED to <body> (appTeleportToBody) —
+  // locate it by class, not by the `app-link-picker` host.
+  const picker = page.locator(".link-pop");
   await expect(picker).toBeVisible();
 
   // The picker offers the candidates (org row is not a valid endpoint; picking a

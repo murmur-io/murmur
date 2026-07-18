@@ -1,16 +1,25 @@
-/* The surface fills its host (the record screen makes it the full-height
-   main view) so the notes flow grows to the bottom. */
+/* The surface fills its host (the record screen makes it the full-height main
+   view) so the note + drawer grow to the bottom. */
 :host {
   display: block;
   height: 100%;
 }
+
+/* OPAQUE hero card (v3, 2026-07-18): overrides the frosted global `.card` so glass
+   stays CHROME, never a content panel wrapping the editor + its overlays (T3/T4).
+   The floating overlays the editor spawns teleport to <body>, so this card no
+   longer needs to be their (broken) containing block. */
 .surface {
   display: flex;
   flex-direction: column;
   gap: var(--space-3);
   height: 100%;
   min-height: 0;
+  background: var(--surface-solid);
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
 }
+
 .surface-head {
   display: flex;
   align-items: center;
@@ -19,29 +28,55 @@
 .head-orb {
   --orb-size: 22px;
 }
-.tabs {
-  flex: none;
-}
 .surface-hint {
-  margin-left: auto;
+  flex: 1 1 auto;
+  min-width: 0;
   color: var(--text-muted);
   font-size: 0.78rem;
-  text-align: right;
 }
 
-/* ── NOTE TAB — the embedded companion-note editor fills the panel body. ── */
+/* Ask-Brain drawer toggle (replaces the retired segmented tabs). Neutral ghost
+   pill; the active/open state reads as a selected chrome control. */
+.ask-toggle {
+  position: relative;
+  flex: none;
+  gap: var(--space-1);
+  height: 30px;
+  padding: 0 var(--space-3);
+  font-size: 0.82rem;
+}
+.ask-toggle.is-active {
+  background: var(--shell-active-bg, var(--surface-hover));
+  color: var(--text-primary);
+}
+.ask-toggle-glyph {
+  color: var(--accent-hover);
+}
+.ask-toggle-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 8px var(--accent-soft);
+}
+
+/* ── Body row: the note document (hero) + optional Ask-Brain drawer ────────── */
+.surface-body {
+  display: flex;
+  flex-direction: row;
+  align-items: stretch;
+  gap: var(--space-3);
+  flex: 1 1 auto;
+  min-height: 0;
+}
+/* The note editor is the always-visible HERO; it SHRINKS when the drawer opens. */
 .note-host {
   display: flex;
   flex-direction: column;
   flex: 1 1 auto;
+  min-width: 0;
   min-height: 0;
   overflow: hidden;
-}
-/* The editor is ALWAYS MOUNTED (one live flush target); it is HIDDEN — not
-   destroyed — while the Ask Brain tab is active. `display: flex` above overrides
-   the UA `[hidden] { display: none }`, so force it explicitly. */
-.note-host[hidden] {
-  display: none;
 }
 .note-host app-note-editor {
   display: block;
@@ -50,8 +85,35 @@
   overflow: auto;
 }
 
-/* ── The scrollable notes flow (oldest → newest) ─────────────────────── */
-/* Reactions rail — the recall + contradiction lanes stacked above the flow. */
+/* The Ask-Brain drawer — a docked side panel (in-flow, not a floating overlay), so
+   it uses a left border + its own scroll. Slides in without a transform-based
+   entry animation (which would trap any position:fixed descendant). */
+.ask-drawer {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  flex: 0 0 clamp(280px, 34%, 380px);
+  min-width: 0;
+  min-height: 0;
+  padding-left: var(--space-3);
+  border-left: 1px solid var(--border-subtle);
+  animation: ask-drawer-in var(--transition-dur) var(--transition-ease, ease) both;
+}
+@keyframes ask-drawer-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .ask-drawer {
+    animation: none;
+  }
+}
+
+/* ── Ambient live reactions — recall + contradiction lanes above the body ──── */
 .reactions-rail {
   display: flex;
   flex-direction: column;
@@ -89,12 +151,14 @@
   padding: 0 var(--space-3);
   font-size: 0.8rem;
 }
+
+/* ── The scrollable Ask-Brain flow (oldest → newest), inside the drawer ────── */
 .flow {
   display: flex;
   flex-direction: column;
   gap: var(--space-2);
   flex: 1 1 auto;
-  min-height: 180px;
+  min-height: 120px;
   overflow-y: auto;
   padding-right: var(--space-1);
 }
@@ -103,20 +167,11 @@
   font-size: 0.875rem;
   line-height: 1.55;
 }
-
-/* inline keycap (head + empty-state hint) */
-.kbd {
-  font-family: var(--font-mono, ui-monospace, monospace);
-  font-size: 0.74rem;
-  padding: 1px 6px;
-  border-radius: var(--radius-sm);
-  background: var(--surface-input);
-  border: 1px solid var(--border-subtle);
-  color: var(--text-secondary);
+.flow app-note-item {
+  display: block;
 }
 
-/* ── Ask-Brain input row: voice mic + a plain single-line question input +
-   Ask button, pinned at the foot of the Ask-Brain tab. ──────────────────── */
+/* ── Ask-Brain input row: voice mic + single-line question input + Ask ─────── */
 .composer {
   display: flex;
   align-items: center;
@@ -205,12 +260,7 @@
   }
 }
 
-/* ── ENHANCE-MY-NOTES: the head hint tints accent as the note shapes the
-   summary (the sweep-over-note-lines animation is retired — the note is now
-   ONE document, not per-jot lines). ─────────────────────────────────────── */
-.flow app-note-item {
-  display: block;
-}
+/* ── ENHANCE-MY-NOTES: the head hint tints accent as the note shapes the summary. ── */
 .surface-hint.is-enhancing,
 .surface-hint.is-settled {
   color: var(--accent);
@@ -222,4 +272,3 @@
     animation: none;
   }
 }
-

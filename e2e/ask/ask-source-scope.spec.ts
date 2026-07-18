@@ -66,13 +66,16 @@ test("Ask page threads the picked source into ask_vault's explicitSources (empty
 
   // Open the picker, pick the one candidate → a chip appears.
   await page.locator("mur-source-picker .sp-trigger").click();
-  await page.locator("mur-source-picker .sp-row").first().click();
+  // The popover (`.sp-pop`/`.sp-scrim`/`.sp-row`) is TELEPORTED to <body>
+  // (appTeleportToBody), so it is NOT under `mur-source-picker` — locate it at
+  // page level. The trigger + selected chips stay in-tree.
+  await page.locator(".sp-row").first().click();
   await expect(page.locator("mur-source-picker .sp-chip-title")).toHaveText([
     "Planning sync",
   ]);
   // Close the popover so the composer regains focus.
-  await page.locator("mur-source-picker .sp-scrim").click();
-  await expect(page.locator("mur-source-picker .sp-pop")).toHaveCount(0);
+  await page.locator(".sp-scrim").click();
+  await expect(page.locator(".sp-pop")).toHaveCount(0);
 
   // Scoped turn: the picked meeting rides ask_vault as explicitSources. Click
   // Send explicitly (deterministic) and wait for the SECOND user row to land.
