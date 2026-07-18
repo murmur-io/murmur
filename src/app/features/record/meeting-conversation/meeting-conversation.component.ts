@@ -14,52 +14,44 @@ import {
 } from "@angular/core";
 import { MeetingConversationStore } from "../../../core/meeting-conversation.store";
 import { NoteEditorComponent } from "../../notes/note-editor/note-editor.component";
-import {
-  MurSegmentedComponent,
-  type SegmentOption,
-} from "../../../design-system/segmented/segmented.component";
 import { AiOrbComponent } from "../ai-orb/ai-orb.component";
 import { NoteItemComponent } from "../note-item/note-item.component";
 import { ProactiveHintCardComponent } from "../proactive-hint-card/proactive-hint-card.component";
 import { WhisperCardComponent } from "../whisper-card/whisper-card.component";
 
-/** The two tabs of the recording panel. */
-type PanelTab = "note" | "ask";
-
 /**
- * The in-meeting panel — a DOCUMENT-FIRST two-tab surface (v2 redesign):
+ * The in-meeting panel — a DOCUMENT-FIRST surface (v3 redesign, 2026-07-18):
  *
- *  - **"Note" (default):** the meeting's ONE companion note rendered as ONE editable
- *    DOCUMENT via the embedded {@link NoteEditorComponent} (`[embedded]="true"`) — the
- *    real create-note experience (`/` blocks, `[[` links, selection toolbar, in-note
- *    Ask-Brain popover, autosave). The HOST eagerly gets-or-creates the companion note
- *    (via {@link MeetingConversationStore.ensureCompanionNote}) so the editor mounts on
- *    a stable id — there are NO per-jot "Saved" badges; the note IS the document.
- *  - **"Ask Brain":** the conversational `@brain` thread (reuses the store's
- *    open/run/resolve/follow-up/tool-trace/citation machinery). A plain single-line
- *    input at the foot opens a thread (everything here is a question — no `@brain`
- *    marker parsing). An answer's "Add to note" appends into the companion note.
+ *  - The meeting's ONE companion note is the always-visible HERO, rendered as ONE
+ *    editable DOCUMENT via the embedded {@link NoteEditorComponent} (`[embedded]`) —
+ *    the real create-note experience (`/` blocks, `[[` links, selection toolbar,
+ *    in-note Ask-Brain popover, autosave). The HOST eagerly gets-or-creates the
+ *    companion note so the editor mounts on a stable id.
+ *  - **Ask Brain** — the conversational `@brain` thread — lives in a RIGHT-SIDE
+ *    DRAWER toggled from the head (the same note+Brain pattern as routed notes,
+ *    replacing the retired Note|Ask segmented tabs). Opening it SHRINKS the
+ *    document column (never covers it).
+ *  - Live brain REACTIONS (recall hints + contradiction whisper cards + the
+ *    shadow-mode calibration prompt) stay AMBIENT above the body so they surface
+ *    even with the drawer closed — never buried behind a toggle.
  *
- * The embedded editor is ALWAYS MOUNTED for the whole recording — the Note tab is
- * HIDDEN (not destroyed) when the user is on Ask Brain, and returning to it calls the
- * editor's `reload()` (not a re-mount) so an Ask-Brain "Add to note" append / a
- * mid-session external edit is reflected. Keeping ONE live editor instance is what
- * makes the flush-before-Stop deterministic: {@link RecorderStore.stop} awaits that
- * single editor's durable save via {@link RecordingFlushService} before finalizing, so
- * a Stop fired inside the autosave debounce window can never lose the user's prose (an
- * earlier destroy/re-mount left an in-flight destroy-flush racing Stop when the user
- * clicked Stop from the Ask Brain tab). The reactions rail (recall hints / whisper
- * cards) lives in the Ask-Brain tab.
+ * The embedded editor is ALWAYS MOUNTED (and now always visible) for the whole
+ * recording — one live editor instance is the flush-at-Stop target:
+ * {@link RecorderStore.stop} awaits its durable save via {@link RecordingFlushService}
+ * before finalizing, so a Stop fired inside the autosave debounce window can never
+ * lose the user's prose. Closing the Ask drawer RELOADS the editor (not a re-mount)
+ * so an Ask-Brain "Add to note" append / a mid-session external edit is reflected.
  *
- * IN-FLOW (not a floating overlay) — the frosted `.card` chrome is correct (trap T3 is
- * handled inside the editor's own `/`/`[[` menus + the Ask-Brain popover).
+ * The card is OPAQUE (`--surface-solid`), not the frosted glass `.card` — glass is
+ * chrome, never a content panel wrapping overlays (T3/T4); the floating overlays the
+ * editor spawns (`/`/`[[` menus, the Ask-Brain popover, the selection toolbar) all
+ * teleport to <body> so their position:fixed anchors to the viewport.
  */
 @Component({
   selector: "app-meeting-conversation",
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [
     AiOrbComponent,
-    MurSegmentedComponent,
     NoteEditorComponent,
     NoteItemComponent,
     ProactiveHintCardComponent,
@@ -75,42 +67,32 @@ export class MeetingConversationComponent implements OnInit {
   private readonly askInput = viewChild<ElementRef<HTMLInputElement>>("askInput");
   /**
    * The ONE always-mounted embedded companion note editor. Used to `reload()` it on
-   * return to the Note tab (in place of the retired re-mount nonce). It stays in the
-   * DOM (hidden while on Ask Brain) so exactly one editor instance is live for the
-   * whole recording — the flush-at-Stop target.
+   * drawer close. Exactly one editor instance is live for the whole recording — the
+   * flush-at-Stop target.
    */
   private readonly noteEditor = viewChild(NoteEditorComponent);
 
-  /**
-   * The active recording's meeting id (null when there's no meeting yet). Pushed
-   * into the store so the companion note + Ask-Brain scope bind to THIS meeting.
-   */
   readonly meetingId = input<string | null>(null);
-
-  /**
-   * The `proactiveHintsEnabled` config flag (the record screen passes its config
-   * snapshot down). False ⇒ the recall card NEVER renders, even if an event
-   * slips through before the backend mute takes effect. Defaults true, matching
-   * the backend default.
-   */
   readonly hintsEnabled = input<boolean>(true);
-
-  /** ENHANCE-MY-NOTES presentation inputs (pure; all state lives in root stores). */
   readonly enhancing = input(false);
   readonly settled = input(false);
   readonly enhanceAware = input(false);
 
-  /** The active tab — the DOCUMENT-FIRST "Note" tab is the default. */
-  protected readonly activeTab = signal<PanelTab>("note");
+  /** Whether the Ask-Brain drawer is open (the note editor is the always-visible hero). */
+  protected readonly drawerOpen = signal(false);
 
-  /** The two-tab segmented control options. */
-  protected readonly tabOptions: readonly SegmentOption[] = [
-    { value: "note", label: "Note" },
-    { value: "ask", label: "Ask Brain" },
-  ];
+  /** A quiet dot on the Ask-Brain toggle when a closed drawer hides an ongoing thread. */
+  protected readonly askUnseen = computed(
+    () => !this.drawerOpen() && this.store.hasNotes(),
+  );
 
-  /** The active tab as the segmented control's two-way value (mirrors {@link activeTab}). */
-  protected readonly tabValue = computed<string>(() => this.activeTab());
+  /** Whether any live reaction is showing (drives the ambient rail's presence). */
+  protected readonly hasReactions = computed(
+    () =>
+      (this.hintsEnabled() && !!this.store.hint()) ||
+      this.store.whisperCards().length > 0 ||
+      this.store.showShadowCalibration(),
+  );
 
   /** During the enhance pass the orb shows its shipped 'processing' choreography. */
   readonly orbStateView = computed(() =>
@@ -129,20 +111,18 @@ export class MeetingConversationComponent implements OnInit {
       this.store.setMeetingId(this.meetingId());
     });
 
-    // EAGERLY get-or-create the companion note whenever a meeting is set, so the
-    // "Note" tab always has a document to mount on (the HOST owns eager creation;
-    // the embedded editor never auto-creates). The effect only reads the input +
-    // calls an async store method (the signal write happens inside the store).
+    // EAGERLY get-or-create the companion note whenever a meeting is set, so the note
+    // hero always has a document to mount on (the HOST owns eager creation; the
+    // embedded editor never auto-creates).
     effect(() => {
       if (this.meetingId()) void this.store.ensureCompanionNote();
     });
 
-    // Auto-scroll the Ask-Brain flow to the newest turn whenever the conversation
-    // changes AND the Ask tab is showing. Tracks the notes signal; schedules the
-    // DOM work via afterNextRender (zoneless-safe; no signal writes → no NG0600).
+    // Auto-scroll the Ask flow to the newest turn whenever the conversation changes
+    // AND the drawer is open. afterNextRender is zoneless-safe (no signal writes).
     effect(() => {
       this.store.notes();
-      if (this.activeTab() === "ask") {
+      if (this.drawerOpen()) {
         afterNextRender(() => this.scrollToBottom(), { injector: this.injector });
       }
     });
@@ -154,23 +134,23 @@ export class MeetingConversationComponent implements OnInit {
     void this.store.init();
   }
 
-  /** Switch tabs. Re-entering "Note" RELOADS the always-mounted editor (no re-mount)
-   *  + refreshes the enhance-honesty content signal; entering "Ask" focuses the
-   *  question input. */
-  protected selectTab(tab: string): void {
-    const next = tab as PanelTab;
-    if (next === this.activeTab()) return;
-    this.activeTab.set(next);
-    if (next === "note") {
-      // The editor stays mounted (hidden) while on Ask Brain, so returning re-reads
-      // its body in place — reflecting an Ask-Brain "Add to note" append / external
-      // edit — rather than destroying + recreating the one live flush target.
-      this.noteEditor()?.reload();
-      this.store.refreshCompanionContentNow();
-    } else {
+  /**
+   * Toggle the Ask-Brain drawer. CLOSING reloads the always-mounted editor in place
+   * (so an Ask-Brain "Add to note" append / external edit is reflected in the hero
+   * document) + refreshes the enhance-honesty content signal — mirroring the retired
+   * return-to-Note-tab semantics without destroying the one live flush target.
+   * OPENING focuses the question input for a fast ask.
+   */
+  protected toggleDrawer(): void {
+    const next = !this.drawerOpen();
+    this.drawerOpen.set(next);
+    if (next) {
       afterNextRender(() => this.askInput()?.nativeElement.focus(), {
         injector: this.injector,
       });
+    } else {
+      this.noteEditor()?.reload();
+      this.store.refreshCompanionContentNow();
     }
   }
 
@@ -185,7 +165,7 @@ export class MeetingConversationComponent implements OnInit {
   }
 
   /**
-   * Submit the Ask-Brain question → open a thread (everything in this tab is a
+   * Submit the Ask-Brain question → open a thread (everything in the drawer is a
    * question — no `@brain` marker parsing). Self-clears; a no-op for blank text.
    */
   protected submitAsk(event: Event): void {
@@ -196,7 +176,6 @@ export class MeetingConversationComponent implements OnInit {
     void this.store.openThread(q).catch(() => {
       /* the store resolves the agent turn with an error in the thread */
     });
-    // Keep the focus in the ask input for a fast back-and-forth.
     afterNextRender(() => this.askInput()?.nativeElement.focus(), {
       injector: this.injector,
     });
