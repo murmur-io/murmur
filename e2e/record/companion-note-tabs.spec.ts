@@ -2,19 +2,18 @@ import { test, expect } from "@playwright/test";
 import { mockTauri } from "../settings-ai/mock-invoke";
 
 /**
- * v2 DOCUMENT-FIRST recording panel — a two-tab surface (Note | Ask Brain).
+ * v3 DOCUMENT-FIRST recording panel — the note is the always-visible HERO, Ask
+ * Brain is a right-side DRAWER (2026-07-18 redesign; replaces the v2 Note|Ask
+ * segmented tabs).
  *
- *  - The "Note" tab (default) mounts the EMBEDDED note editor on the meeting's ONE
- *    companion note (eagerly created via `get_or_create_companion_note`). It is ONE
- *    editable DOCUMENT — no per-jot "Saved to Notes" badges.
- *  - The "Ask Brain" tab hosts the `@brain` conversation. A plain single-line input
- *    opens a thread; the answer renders with the brain identity.
- *  - The tabs switch cleanly (the segmented control drives `activeTab`).
- *
- * These replace the retired v1 specs (`companion-note-card` / `note-save-failure-toast`),
- * which asserted on the removed `mur-markdown-composer` + per-jot "Saved to Notes" card.
+ *  - The embedded note editor mounts on the meeting's ONE companion note (eagerly
+ *    created via `get_or_create_companion_note`) and is ALWAYS VISIBLE — one editable
+ *    DOCUMENT, no per-jot "Saved to Notes" badges.
+ *  - The "Ask Brain" head toggle opens/closes a drawer hosting the `@brain` thread
+ *    BESIDE the editor (shrinks it, never hides it). One live editor instance stays
+ *    mounted for the whole recording (the flush-at-Stop target).
  */
-test.describe("Record — document-first companion-note tabs (v2)", () => {
+test.describe("Record — document-first companion note + Ask Brain drawer (v3)", () => {
   test.beforeEach(async ({ page }) => {
     await mockTauri(page, {
       model_present: () => true,
@@ -22,7 +21,7 @@ test.describe("Record — document-first companion-note tabs (v2)", () => {
         meetingId: "m-rec",
         startedAt: "2026-07-01T09:00:00Z",
       }),
-      // Eager get-or-create for the "Note" tab's embedded editor mount.
+      // Eager get-or-create for the hero editor's mount.
       get_or_create_companion_note: () => ({
         noteId: "n1",
         meetingWikilink: "[[Test Meeting]]",
@@ -67,12 +66,12 @@ test.describe("Record — document-first companion-note tabs (v2)", () => {
     await expect(page.locator("app-meeting-conversation")).toBeVisible();
   }
 
-  test("(a) the Note tab shows an editable document body — no per-jot badges", async ({
+  test("(a) the note document is the always-visible editable hero — no per-jot badges", async ({
     page,
   }) => {
     await startRecording(page);
 
-    // The default tab is "Note": the embedded editor mounts on the companion note.
+    // The embedded editor mounts on the companion note as the visible hero.
     const body = page.locator(
       "app-meeting-conversation app-note-editor .editor-body textarea.body-area",
     );
@@ -89,26 +88,23 @@ test.describe("Record — document-first companion-note tabs (v2)", () => {
     await expect(body).toHaveValue(/ship the three flows/);
   });
 
-  test("(b) switching to Ask Brain shows the conversation and can ask", async ({
+  test("(b) opening the Ask Brain drawer shows the conversation and can ask (editor stays visible)", async ({
     page,
   }) => {
     await startRecording(page);
 
-    // Switch to the Ask Brain tab via the segmented control.
-    await page
-      .locator("app-meeting-conversation mur-segmented")
-      .getByText("Ask Brain", { exact: true })
-      .click();
+    // Open the Ask Brain drawer via the head toggle.
+    await page.locator("app-meeting-conversation .ask-toggle").click();
 
     const ask = page.locator("app-meeting-conversation .ask-input");
     await expect(ask).toBeVisible();
 
-    // The embedded document editor stays MOUNTED for the whole recording (the fix
-    // keeps ONE live editor to flush at Stop) but is HIDDEN while on the Ask tab —
-    // so it must be present-but-not-visible, not removed from the DOM.
+    // The embedded document editor is the always-visible HERO — the drawer docks
+    // BESIDE it (shrinks it), it is NOT hidden. One live editor stays mounted as the
+    // flush-at-Stop target.
     await expect(
       page.locator("app-meeting-conversation app-note-editor"),
-    ).toBeHidden();
+    ).toBeVisible();
 
     // Ask a question → a thread opens and the brain answers.
     await ask.fill("why was the mobile redesign deferred?");
@@ -120,25 +116,34 @@ test.describe("Record — document-first companion-note tabs (v2)", () => {
     ).toBeVisible({ timeout: 10_000 });
   });
 
-  test("(c) tabs switch cleanly back and forth", async ({ page }) => {
+  test("(c) the Ask Brain drawer toggles open and closed cleanly", async ({
+    page,
+  }) => {
     await startRecording(page);
 
-    const seg = page.locator("app-meeting-conversation mur-segmented");
+    const toggle = page.locator("app-meeting-conversation .ask-toggle");
     const body = page.locator(
       "app-meeting-conversation app-note-editor .editor-body textarea.body-area",
     );
 
-    // Note tab (default) → editor mounted.
+    // Default: the editor is the visible hero, drawer closed (no ask input).
     await expect(body).toBeVisible({ timeout: 10_000 });
+    await expect(
+      page.locator("app-meeting-conversation .ask-input"),
+    ).toHaveCount(0);
 
-    // → Ask Brain: editor HIDDEN (stays mounted — one live flush target), ask input shown.
-    await seg.getByText("Ask Brain", { exact: true }).click();
-    await expect(page.locator("app-meeting-conversation .ask-input")).toBeVisible();
-    await expect(page.locator("app-meeting-conversation app-note-editor")).toBeHidden();
+    // Open the drawer → the ask input shows, the editor STAYS visible beside it.
+    await toggle.click();
+    await expect(
+      page.locator("app-meeting-conversation .ask-input"),
+    ).toBeVisible();
+    await expect(body).toBeVisible();
 
-    // → back to Note: the editor re-shows + reloads in place (no re-mount), ask input gone.
-    await seg.getByText("Note", { exact: true }).click();
-    await expect(body).toBeVisible({ timeout: 10_000 });
-    await expect(page.locator("app-meeting-conversation .ask-input")).toHaveCount(0);
+    // Close the drawer → the editor reloads in place (no re-mount), ask input gone.
+    await toggle.click();
+    await expect(
+      page.locator("app-meeting-conversation .ask-input"),
+    ).toHaveCount(0);
+    await expect(body).toBeVisible();
   });
 });
