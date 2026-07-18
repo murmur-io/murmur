@@ -115,6 +115,15 @@ export class AudioPanelComponent {
   readonly pin = output<number>();
   /** Rename a timeline speaker lane. */
   readonly renameSpeaker = output<{ oldLabel: string; newLabel: string }>();
+  /**
+   * The pending receipt seek was APPLIED (carries its `seq`): the shell clears
+   * `seekTarget` on this ack, making consumption ONE-SHOT — without it the
+   * still-set input replays the seek + flash every time the Audio tab is
+   * revisited (this panel is recreated per `@switch` case, so the mount effect
+   * re-fires on a stale target). Repeat clicks on the SAME chip still work: the
+   * note panel bumps `seq` per click, so a fresh target always arrives.
+   */
+  readonly seekConsumed = output<number>();
 
   // --- Audio playback state (driven by the <audio> event bindings) --------
   private readonly audio = viewChild<ElementRef<HTMLAudioElement>>("player");
@@ -305,8 +314,11 @@ export class AudioPanelComponent {
    * on the exact line that proves the claim. Tracks `seq` (bumped by the shell)
    * so re-clicking the SAME receipt re-arms; `flashSeq` re-arms the pure-CSS
    * animation when the SAME segment is receipted twice (a net-zero `flashSegId`
-   * write wouldn't restart it). Legitimate signal-writing effect (T1): it
-   * reacts to an input and drives the player — no async fetch, no stale race.
+   * write wouldn't restart it). Consumption is ONE-SHOT: after applying, the
+   * effect acks via `seekConsumed` so the shell nulls the input — a later
+   * Audio-tab revisit (a fresh panel instance) must not replay the seek/flash.
+   * Legitimate signal-writing effect (T1): it reacts to an input and drives the
+   * player — no async fetch, no stale race.
    */
   private readonly _applyReceiptSeek = effect(() => {
     const target = this.seekTarget();
@@ -318,6 +330,9 @@ export class AudioPanelComponent {
     this.seekTo(target.startS); // (also clears any prior flash)
     this.flashSegId.set(target.segId);
     this.flashSeq.update((n) => n + 1);
+    // Ack consumption (the shell nulls `seekTarget`; the flash/karaoke state
+    // above is panel-local and survives — only the REPLAY trigger is retired).
+    this.seekConsumed.emit(target.seq);
     // Restart the pure-CSS pulse deterministically (a repeat of the SAME segment
     // keeps the `.is-flash` class, so the animation wouldn't retrigger on its own)
     // and bring the flashed fragment into view. One-shot, zoneless-safe: no timer.

@@ -56,12 +56,17 @@ export interface ParsedNote {
  * `segId`/`startS`/`seq` drive the audio panel's flash + seek.
  */
 export interface ReceiptChip {
-  /** Short label of the claim line this receipt proves. */
+  /** Short label of the claim line this receipt likely derives from. */
   claim: string;
   /** "Me" / "Others" / "" — from the segment speaker. */
   speaker: string;
-  /** m:ss timestamp of the segment start. */
+  /** m:ss (h:mm:ss above 60 min) timestamp of the segment start. */
   time: string;
+  /**
+   * The full tooltip: likely-source phrasing + timestamp + speaker + the ASR
+   * confidence TIER ("audio: clear" / "audio: unclear" — never the raw float).
+   */
+  title: string;
   /** The segment start in raw seconds (the player seek target). */
   startS: number;
   /** `Segment.idx` to flash in the transcript. */
@@ -71,6 +76,16 @@ export interface ReceiptChip {
   /** Monotonic id so the parent can re-fire a repeat click on the same chip. */
   seq: number;
 }
+
+/**
+ * ASR-confidence tier bounds for the receipt tooltip: at/above `CLEAR` the audio
+ * was decoded confidently ("audio: clear"), below `UNCLEAR` it was acoustically
+ * shaky ("audio: unclear" — the backend's `LOW_CONFIDENCE_P` operating point),
+ * and the band between renders NOTHING (no over-claiming either way). The raw
+ * float never reaches the UI.
+ */
+const RECEIPT_AUDIO_CLEAR_MIN = 0.8;
+const RECEIPT_AUDIO_UNCLEAR_MAX = 0.55;
 
 /** One grounding citation, split into vault vs web shapes for rendering. */
 export interface ParsedCitation {
@@ -239,9 +254,12 @@ export class NotePanelComponent {
   /**
    * The receipts decorated for display: each aligned claim → a chip labelled with
    * a snippet of the claim line (from the raw markdown at `claimIndex`) + the
-   * speaker + m:ss timestamp of the proving segment. A receipt whose `claimIndex`
-   * is out of range (a stale note vs a just-recomputed alignment) is dropped so a
-   * chip never shows a wrong/blank claim. Pure `computed` (no template method).
+   * speaker + timestamp of the likely-source segment. A receipt whose `claimIndex`
+   * is out of range (a stale note vs a just-recomputed alignment) OR points into
+   * the YAML front-matter (metadata like `attendees:` is never a claim — the
+   * backend skips it too; this is defense-in-depth against a stale/older backend)
+   * is dropped so a chip never shows a wrong/blank/metadata claim. Pure
+   * `computed` (no template method).
    */
   readonly receiptChips = computed<ReceiptChip[]>(() => {
     const raw = this.noteRaw();
@@ -249,17 +267,24 @@ export class NotePanelComponent {
       return [];
     }
     const lines = raw.split("\n");
+    const fmEnd = this.frontmatterEnd(lines);
     const out: ReceiptChip[] = [];
     for (const r of this.receipts()) {
+      if (r.claimIndex < fmEnd) {
+        continue; // front-matter line ⇒ never a chip
+      }
       const line = lines[r.claimIndex];
       const claim = line ? this.claimSnippet(line) : "";
       if (!claim) {
         continue; // out-of-range / non-content line ⇒ no chip
       }
+      const speaker = this.speakerLabel(r.speaker);
+      const time = this.fmtTime(r.startS);
       out.push({
         claim,
-        speaker: this.speakerLabel(r.speaker),
-        time: this.fmtTime(r.startS),
+        speaker,
+        time,
+        title: this.receiptTitle(time, speaker, r.confidence ?? null),
         startS: r.startS,
         segId: r.segmentId,
         claimIndex: r.claimIndex,
@@ -276,6 +301,45 @@ export class NotePanelComponent {
       segId: chip.segId,
       seq: ++this.receiptSeq,
     });
+  }
+
+  /**
+   * The number of leading lines occupied by a YAML front-matter block (`---`
+   * fence on line 0 through the closing `---`), or 0 when there is none. Mirrors
+   * the backend's `frontmatter_end` semantics, including the conservative
+   * unterminated case (an opened-but-never-closed block makes EVERY line
+   * front-matter — never chip a line we cannot prove is body).
+   */
+  private frontmatterEnd(lines: string[]): number {
+    if (lines[0] !== "---") {
+      return 0;
+    }
+    const close = lines.indexOf("---", 1);
+    return close === -1 ? lines.length : close + 1;
+  }
+
+  /**
+   * The chip tooltip: likely-source phrasing (an overlap heuristic, never a
+   * proof) + the ASR confidence rendered as a TIER — "audio: clear" at/above
+   * {@link RECEIPT_AUDIO_CLEAR_MIN}, "audio: unclear" below
+   * {@link RECEIPT_AUDIO_UNCLEAR_MAX}, nothing in the band between or when
+   * whisper computed no confidence. The raw float is never rendered.
+   */
+  private receiptTitle(
+    time: string,
+    speaker: string,
+    confidence: number | null,
+  ): string {
+    let title = `Likely source · ${time}`;
+    if (speaker) {
+      title += ` · ${speaker}`;
+    }
+    if (confidence !== null && confidence >= RECEIPT_AUDIO_CLEAR_MIN) {
+      title += " · audio: clear";
+    } else if (confidence !== null && confidence < RECEIPT_AUDIO_UNCLEAR_MAX) {
+      title += " · audio: unclear";
+    }
+    return title;
   }
 
   /** A short, marker-stripped snippet of a claim line for the chip label. */
@@ -304,11 +368,17 @@ export class NotePanelComponent {
     return "";
   }
 
-  /** Seconds → m:ss for the receipt timestamp. */
+  /** Seconds → m:ss, or h:mm:ss above 60 min (a 2h receipt is never "125:07"). */
   private fmtTime(s: number): string {
     const total = Math.max(0, Math.floor(s || 0));
-    const m = Math.floor(total / 60);
+    const h = Math.floor(total / 3600);
+    const m = Math.floor((total % 3600) / 60);
     const sec = total % 60;
+    if (h > 0) {
+      return `${h}:${m.toString().padStart(2, "0")}:${sec
+        .toString()
+        .padStart(2, "0")}`;
+    }
     return `${m}:${sec.toString().padStart(2, "0")}`;
   }
 
