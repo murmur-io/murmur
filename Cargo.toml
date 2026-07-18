@@ -15,3 +15,20 @@ members = ["src-tauri", "crates/murmur-brain"]
 # Keep the inner loop + `cd src-tauri && cargo ...` (CI / release / `npm run dev`) building ONLY the
 # app crate by default; the brain sidecar is built explicitly (beforeBuildCommand / `-p murmur-brain`).
 default-members = ["src-tauri"]
+
+# Dependencies carry NO debuginfo in dev/test builds. The app test binary statically links a large
+# native/ML tree (candle, whisper-rs, sherpa-onnx, sqlcipher, openssl, tauri) and the default
+# `debug = 2` builds full DWARF for EVERY dependency — which linkers do NOT tree-shake, so it is the
+# bulk of both the multi-hundred-GB `target/` and the ~15-20 GB link-time memory peak of a single
+# `cargo test --lib`. Several of those links at once pinned the macOS memory compressor and froze the
+# whole UI (root-cause writeup: docs/research/2026-07-18-build-ram-freeze.md). Stripping dependency
+# debuginfo cuts ~30-40% of incremental compile time and most of that link RAM. OUR OWN crates keep
+# full debuginfo below, so panic backtraces stay useful. The `release` profile is intentionally
+# untouched (shipped binaries + notarization are unaffected).
+[profile.dev.package."*"]
+debug = false
+
+# Our own workspace crates keep line-level debuginfo (file:line in backtraces) without the full
+# `debug = 2` weight — a light middle ground for the code we actually debug locally.
+[profile.dev]
+debug = "line-tables-only"
