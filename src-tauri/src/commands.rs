@@ -2759,6 +2759,53 @@ pub(crate) fn get_note_receipts_inner(
     Ok(receipts)
 }
 
+/// Brain v3 audit PR-8 (Knowledge Diff completion): the audio receipt for ONE fact's text against
+/// its SOURCE meeting — lets the decision-ledger "Source" chip deep-seek the meeting's audio to the
+/// second the fact derives from, instead of just opening the meeting. Reuses the SAME deterministic
+/// token-overlap alignment as [`get_note_receipts`] (`align_claims_to_segments`, one line in ⇒ at
+/// most one alignment out, `RECEIPT_MIN_OVERLAP` floor): a fact whose text the transcript doesn't
+/// clearly support returns `None` and the FE falls back to plain open-the-meeting — a wrong receipt
+/// is worse than none. Recomputed on demand, no storage, therefore no new seal path.
+///
+/// LOCK-MODEL (audio-adjacent read): the `meeting_is_unlocked` gate is FIRST, exactly like
+/// `get_note_receipts` — a sealed-and-NOT-session-unlocked meeting returns `None`, never a segment
+/// time, speaker, or overlap that would leak WHEN something was said or BY WHOM. No PII in logs
+/// (id + hit flag only — never the fact text).
+#[tauri::command]
+pub fn get_fact_receipt(
+    state: State<'_, AppState>,
+    meeting_id: String,
+    fact_text: String,
+) -> Result<Option<crate::summarize::grounding::ClaimAlignment>, AppError> {
+    get_fact_receipt_inner(state.inner(), &meeting_id, &fact_text)
+}
+
+/// Inner of [`get_fact_receipt`] taking `&AppState` (unit-testable gate). `None` for a
+/// sealed-not-unlocked meeting; `None` when the fact text doesn't clear the alignment floor.
+pub(crate) fn get_fact_receipt_inner(
+    state: &AppState,
+    meeting_id: &str,
+    fact_text: &str,
+) -> Result<Option<crate::summarize::grounding::ClaimAlignment>, AppError> {
+    // GATE FIRST — a locked meeting leaks NOTHING (no segment times, no speakers, no overlaps).
+    if !meeting_is_unlocked(state, meeting_id)? {
+        return Ok(None);
+    }
+    let segments = state.db.get_segments(meeting_id)?;
+    let lines = [fact_text];
+    let receipt = crate::summarize::grounding::align_claims_to_segments(&lines, &segments)
+        .into_iter()
+        .next();
+    tracing::debug!(
+        target: "receipts",
+        meeting = %meeting_id,
+        segments = segments.len(),
+        hit = receipt.is_some(),
+        "computed fact receipt"
+    );
+    Ok(receipt)
+}
+
 /// The extensions document ingestion accepts (Brain v3 PR-2). Text (md/txt) plus the extracted
 /// formats: PDF (macOS PDFKit, scanned-PDF pages fall back to on-device Vision OCR), DOCX/PPTX
 /// (pure-Rust OOXML), XLSX (calamine), HTML, and — Brain v3 OCR — direct image import
@@ -22717,6 +22764,97 @@ mod lifecycle_tests {
             get_note_receipts_inner(&state, "m1").unwrap().len(),
             1,
             "session-unlock restores receipts"
+        );
+    }
+
+    /// FACT-RECEIPT lock-gate (Brain v3 audit PR-8, RED-before-GREEN): a sealed-and-NOT-session-
+    /// unlocked meeting returns `None` — never a segment time, speaker, or overlap that would leak
+    /// WHEN/BY WHOM — even though the segments still exist; session-unlocking the folder restores
+    /// the receipt. Also pins the honesty floor: a fact text the transcript doesn't support earns
+    /// NO receipt even while open (the FE then falls back to plain open-the-meeting). Remove the
+    /// `meeting_is_unlocked` gate in `get_fact_receipt_inner` and this fails (RED).
+    #[test]
+    fn get_fact_receipt_masked_when_sealed_then_restored_on_unlock() {
+        let state = build_state("fact-receipt-sealed");
+        make_open_folder(&state.db, "f-lock", "Secret");
+        state
+            .db
+            .insert_meeting(&Meeting {
+                id: "m1".to_string(),
+                started_at: "2026-06-27T09:00:00Z".to_string(),
+                ended_at: None,
+                title: Some("Secret".to_string()),
+                duration_s: 60,
+                audio_path: None,
+                status: MeetingStatus::Summarized,
+                folder_id: None,
+            })
+            .unwrap();
+        // A meeting's folder anchor is its NOTE row (`notes.folder_id` — see `folder_for_meeting`),
+        // so the fixture needs a note for `set_meeting_folder` to bite.
+        state
+            .db
+            .upsert_note(&NoteRecord {
+                meeting_id: "m1".to_string(),
+                provider_id: "claude_code".to_string(),
+                markdown: "We shipped the login page and the payment flow.".to_string(),
+                created_at: "2026-06-27T09:05:00Z".to_string(),
+                exported_path: None,
+                model_requested: None,
+                model_served: None,
+                gateway_host: None,
+            })
+            .unwrap();
+        state
+            .db
+            .insert_segments(
+                "m1",
+                &[Segment {
+                    idx: 1,
+                    start_s: 3.0,
+                    end_s: 9.0,
+                    text: "we shipped the login page and the payment flow today".to_string(),
+                    speaker: Some("me".to_string()),
+                    confidence: Some(0.9),
+                }],
+            )
+            .unwrap();
+        state.db.set_meeting_folder("m1", Some("f-lock")).unwrap();
+
+        let fact_text = "Atlas shipped login page payment flow";
+        // Precondition: while OPEN, the fact aligns (proves the mask below is the gate, not a
+        // no-alignment computation).
+        let open = get_fact_receipt_inner(&state, "m1", fact_text).unwrap();
+        let open = open.expect("precondition: open folder yields a fact receipt");
+        assert_eq!(open.segment_id, 1, "aligned to the proving segment");
+        assert_eq!(open.start_s, 3.0, "raw-second seek target");
+        // Honesty floor: an unsupported fact earns NO receipt even while open.
+        assert!(
+            get_fact_receipt_inner(&state, "m1", "teleporter prototype launched successfully")
+                .unwrap()
+                .is_none(),
+            "an unsupported fact text must earn no receipt"
+        );
+
+        // Seal the folder (locked, NOT in the session unlock set) ⇒ masked.
+        state
+            .db
+            .set_folder_locked("f-lock", true, Some(&b"wrapped"[..]))
+            .unwrap();
+        assert!(
+            get_fact_receipt_inner(&state, "m1", fact_text).unwrap().is_none(),
+            "sealed-not-unlocked meeting must leak NO fact receipt (no times/speakers)"
+        );
+
+        // Session-unlock the folder ⇒ the receipt returns.
+        state
+            .unlocked_folders
+            .lock()
+            .unwrap()
+            .insert("f-lock".to_string());
+        assert!(
+            get_fact_receipt_inner(&state, "m1", fact_text).unwrap().is_some(),
+            "session-unlock restores the fact receipt"
         );
     }
 
