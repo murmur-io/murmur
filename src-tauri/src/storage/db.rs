@@ -22219,8 +22219,12 @@ mod tests {
         {
             let mut conn = db.lock();
             let tx = conn.transaction().unwrap();
-            // Inserted as (note n, document d) — canonicalize stores src = document/d (smaller), dst = note/n.
-            Db::upsert_link_tx(&tx, "note", "n", "document", "d", "semantic", 0.9, "accepted", "active", now)
+            // Store the edge with the sealed DOCUMENT d as the SRC and the marker-owning note n as the
+            // DST (the canonicalized shape auto_link_semantic produces, since "document" < "note").
+            // upsert_link_tx stores endpoints as-passed, so this exercises the NEW src-leg of the collect
+            // scan: sealing d, the dst-leg (WHERE dst_id='d') misses (d is the src), and ONLY the src-leg
+            // (WHERE src_id='d' … dst_kind IN('note','meeting')) finds n — RED on the old dst-only code.
+            Db::upsert_link_tx(&tx, "document", "d", "note", "n", "semantic", 0.9, "accepted", "active", now)
                 .unwrap();
             tx.commit().unwrap();
         }
