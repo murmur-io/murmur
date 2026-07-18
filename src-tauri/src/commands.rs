@@ -7996,10 +7996,18 @@ pub fn list_links(
 }
 
 /// Brain v3 PR-3 — ACCEPT a suggested (semantic) link: flip it `status='active'`,
-/// `created_by='accepted'`, AND materialize the neighbour's `[[Title]]` into the SOURCE's markdown
-/// via the managed `apply_link_markers` block (the ONLY path that writes a semantic link into a
-/// `.md` — the auto pass never does). GATED: the SOURCE endpoint must be session-visible (else refuse
-/// — never write plaintext behind a lock, and never reveal a locked neighbour). Idempotent.
+/// `created_by='accepted'`, AND materialize the neighbour's `[[Title]]` into whichever endpoint is a
+/// locally-owned, session-visible note (via the managed `apply_link_markers` block — the ONLY path
+/// that writes a semantic link into a `.md`; the auto pass never does).
+///
+/// GATED (PR-5): accept is ONLY for an unconfirmed SUGGESTION (`edge_type='semantic'`,
+/// `status='suggested'`) — anything else (a deterministic wikilink/companion, an already-active
+/// manual/accepted, or a dismissed tombstone) is refused `InvalidArg`. BOTH endpoints must be
+/// session-visible (`link_endpoint_is_unlocked` on each) — if EITHER is sealed-and-not-unlocked the
+/// accept is refused `AppError::Locked` (never activate an edge behind a lock, never reveal a locked
+/// neighbour by materializing a link to it). Idempotent (re-accepting an already-active edge is a
+/// no-op; the DB DO-UPDATE guard never downgrades it). The materialized marker is preserved across a
+/// later neighbour-seal and re-materialized on unlock (brain-v3 audit Fix 1/Fix 4).
 #[tauri::command]
 pub fn accept_link(state: State<'_, AppState>, id: i64) -> Result<(), AppError> {
     accept_link_inner(state.inner(), id)
@@ -8522,6 +8530,41 @@ fn rederive_links_for_folder(
             }
         }
         Err(e) => tracing::warn!(target: "links", error = %e, "unlock link re-derive: document-id list failed"),
+    }
+    // Fix 2 (brain-v3 audit) — COMPANION leg: the note↔meeting `companion` edge is NOT re-derived by
+    // the wikilink/semantic passes above (it comes from `documents.meeting_id`, not the body), is NOT
+    // a preserved decision row, and is set only at the recording-time write site — so one lock cycle
+    // permanently deletes it without this. Re-assert both legs (companion notes IN this folder → their
+    // meetings, AND companion notes ANYWHERE → this folder's meetings, since a companion note can be
+    // filed in a different folder). Best-effort; the DB helper skips any sealed-at-rest endpoint.
+    match state.db.meeting_ids_in_folder(folder_id) {
+        Ok(mids) => {
+            if let Err(e) = state.db.rederive_companion_links_for_folder(folder_id, &mids) {
+                tracing::warn!(target: "links", error = %e, "unlock companion re-derive failed");
+            }
+            // Fix 3 (brain-v3 audit) — INBOUND leg: re-index every OUTSIDE source whose body links
+            // `[[title]]` INTO a just-unsealed item, so a link from a note that may never be edited
+            // again is restored (the seal purged the edge from the sealed side; rederive only touched
+            // F's OWN sources). Best-effort; Fix 0 keeps it from naming any still-sealed target.
+            if let Err(e) =
+                state.db.rederive_inbound_wikilinks_for_folder(folder_id, &mids, unlocked)
+            {
+                tracing::warn!(target: "links", error = %e, "unlock inbound wikilink re-derive failed");
+            }
+            // Fix 4 (brain-v3 audit, INVERSE): re-materialize the `[[Title]]` markers the seal stripped,
+            // from the PRESERVED accepted rows (Fix 1) incident on the just-unlocked items, into the
+            // source notes' managed blocks, then re-export those sources' `.md`. A wikilink/manual
+            // marker re-materializes via the source's own body re-index above; an accepted SEMANTIC
+            // marker has no body wikilink to re-derive from, so this explicit re-add restores it.
+            match state
+                .db
+                .rematerialize_accepted_markers_for_folder(folder_id, &mids, unlocked)
+            {
+                Ok(changed) => reexport_stripped_marker_sources(state, &changed),
+                Err(e) => tracing::warn!(target: "links", error = %e, "unlock accepted-marker re-materialize failed"),
+            }
+        }
+        Err(e) => tracing::warn!(target: "links", error = %e, "unlock companion re-derive: meeting-id list failed"),
     }
 }
 
@@ -14290,6 +14333,20 @@ pub(crate) fn lock_folder_inner(state: &AppState, folder_id: String) -> Result<(
     // lands a locked-then-unlocked folder is simply not semantically searchable (degraded, not
     // leaky).
     let sealed_meeting_ids = state.db.meeting_ids_in_folder(&folder_id)?;
+    let sealed_document_ids = state.db.document_ids_in_folder(&folder_id)?;
+    // Brain-v3 audit Fix 4: BEFORE the link-row purge deletes the edges that name each affected
+    // source→sealed-item pair, strip the just-sealed items' `[[Title]]` markers from every VISIBLE
+    // source note's MACHINE-OWNED managed block (the DB plaintext), and re-export those sources' `.md`
+    // so neither the DB nor the vault file names the now-sealed neighbour. The sealed items' titles are
+    // still readable here (seal blanks body content, never the title). Re-materialized on unlock from
+    // the preserved accepted rows. Runs BEFORE the purges below (which drop the naming edges).
+    match state
+        .db
+        .strip_sealed_neighbour_markers(&sealed_meeting_ids, &sealed_document_ids)
+    {
+        Ok(changed) => reexport_stripped_marker_sources(state, &changed),
+        Err(e) => tracing::warn!(target: "links", error = %e, "sealed-neighbour marker strip failed"),
+    }
     // The purge tx also drops ALL memory rollups (cross-meeting synthesis that may paraphrase the
     // just-sealed facts; regenerated from visible facts on the next hourly pass) and returns their
     // exported vault paths — deleted below alongside the sealed notes' `.md`s.
@@ -14298,7 +14355,6 @@ pub(crate) fn lock_folder_inner(state: &AppState, folder_id: String) -> Result<(
     // Document ingestion LOCK-SAFETY: purge the (now-sealed) documents' plaintext-derived chunks +
     // their invertible vectors too — a doc vector is PII derived from the plaintext, so it must not
     // survive at rest in a locked folder. Re-embeddable on unlock (the text seal is restorable).
-    let sealed_document_ids = state.db.document_ids_in_folder(&folder_id)?;
     state
         .db
         .purge_doc_chunks_for_documents(&sealed_document_ids)?;
@@ -14688,6 +14744,10 @@ pub fn relock_folder(
     }
     let mut one = std::collections::HashSet::new();
     one.insert(folder_id.clone());
+    // Brain-v3 audit Fix 4: strip the just-re-sealed items' `[[Title]]` markers from VISIBLE sources
+    // (in other still-open folders) + re-export their `.md`, BEFORE the relock purge drops the naming
+    // edges.
+    strip_and_reexport_markers_for_folders(state.inner(), &one);
     // The re-blank tx also purges ALL memory rollups (may paraphrase the re-sealed facts) and
     // returns their exported vault paths — the files are removed here (command layer).
     let rollup_exports = state.db.blank_sealed_notes_in_folders(&one)?;
@@ -14752,6 +14812,11 @@ pub(crate) fn relock_all_inner(state: &AppState) -> Result<(), AppError> {
     // (may paraphrase the re-sealed facts) — their exported vault `.md`s are removed here.
     let locked: std::collections::HashSet<String> =
         state.db.locked_folder_ids()?.into_iter().collect();
+    // Brain-v3 audit Fix 4: BEFORE the relock purge drops the naming edges, strip the just-re-sealed
+    // items' `[[Title]]` markers from every VISIBLE source note (a source in a DIFFERENT still-open
+    // folder that was materialized while this folder was session-unlocked) + re-export those sources'
+    // `.md`. Resolve the relocked folders' meeting + document ids first.
+    strip_and_reexport_markers_for_folders(state, &locked);
     let rollup_exports = state.db.blank_sealed_notes_in_folders(&locked)?;
     remove_rollup_export_files(&rollup_exports);
     // Phase 0.5 — re-blank the transcript + timeline + drop the decrypted session WAVs for every
@@ -16255,6 +16320,74 @@ fn reexport_notes_in_folder(state: &AppState, folder_id: &str) {
                 tracing::warn!(target: "notes", note_id = %nid, error = %e, "note re-export: read failed");
             }
         }
+    }
+}
+
+/// Brain-v3 audit Fix 4 — the FILESYSTEM half of the sealed-neighbour marker strip: given the
+/// `(is_meeting, source_id)` sources whose managed block the seal tx just scrubbed in the DB,
+/// re-export each VISIBLE source's vault `.md` so the on-disk file no longer names the sealed
+/// neighbour (the DB-in-tx / filesystem-at-command layering that sealed-note `.md` deletion uses).
+/// A note-doc source re-exports via the gated [`export_note_to_vault`] (reads the now-scrubbed
+/// `documents.text`); a meeting-note source overwrites its recorded `.md` via the guarded overwrite
+/// (reads the now-scrubbed `notes.markdown`). Best-effort per source — a re-export failure logs
+/// (ids/stage only, no PII) and never fails the seal (the DB plaintext is already scrubbed, the
+/// primary leak closed). Called AFTER the seal/purge legs so it writes the final scrubbed body.
+fn reexport_stripped_marker_sources(state: &AppState, sources: &[(bool, String)]) {
+    for (is_meeting, source_id) in sources {
+        if *is_meeting {
+            // Meeting-note source: overwrite its recorded `.md` from the scrubbed newest-provider row.
+            match state.db.get_latest_note_for_meeting(source_id) {
+                Ok(Some(note)) => {
+                    if let Some(path) = note.exported_path.as_deref() {
+                        if let Err(e) = overwrite_exported_note_guarded(
+                            state,
+                            source_id,
+                            &note.provider_id,
+                            path,
+                            &note.markdown,
+                        ) {
+                            tracing::warn!(target: "links", meeting_id = %source_id, error = %e, "marker-strip .md re-export (meeting) failed");
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => tracing::warn!(target: "links", meeting_id = %source_id, error = %e, "marker-strip .md re-export: note read failed"),
+            }
+        } else if let Err(e) = export_note_to_vault(state, source_id) {
+            // Note-doc source: the gate inside is satisfied (a stripped source is VISIBLE by
+            // construction — the strip skips sealed-at-rest sources).
+            tracing::warn!(target: "links", note_id = %source_id, error = %e, "marker-strip .md re-export (note) failed");
+        }
+    }
+}
+
+/// Brain-v3 audit Fix 4 — RELOCK helper: resolve the given folders' meeting + document ids, strip
+/// their `[[Title]]` markers from VISIBLE source notes, and re-export those sources' `.md`. Best-effort
+/// (a resolve/strip failure logs and never fails the relock). Called on relock_folder / relock_all
+/// BEFORE the relock purge drops the naming edges. Distinct from the initial-lock inline call only in
+/// that it spans a SET of folders (the relocked ones).
+fn strip_and_reexport_markers_for_folders(
+    state: &AppState,
+    folder_ids: &std::collections::HashSet<String>,
+) {
+    let mut meeting_ids: Vec<String> = Vec::new();
+    let mut document_ids: Vec<String> = Vec::new();
+    for fid in folder_ids {
+        match state.db.meeting_ids_in_folder(fid) {
+            Ok(mut m) => meeting_ids.append(&mut m),
+            Err(e) => tracing::warn!(target: "links", error = %e, "relock marker strip: meeting-id list failed"),
+        }
+        match state.db.document_ids_in_folder(fid) {
+            Ok(mut d) => document_ids.append(&mut d),
+            Err(e) => tracing::warn!(target: "links", error = %e, "relock marker strip: document-id list failed"),
+        }
+    }
+    match state
+        .db
+        .strip_sealed_neighbour_markers(&meeting_ids, &document_ids)
+    {
+        Ok(changed) => reexport_stripped_marker_sources(state, &changed),
+        Err(e) => tracing::warn!(target: "links", error = %e, "relock sealed-neighbour marker strip failed"),
     }
 }
 
