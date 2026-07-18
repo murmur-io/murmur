@@ -241,13 +241,18 @@ fn tools_spec() -> Value {
         },
         {
             "name": "get_meeting",
-            "description": "Get a meeting's AI note (summary) and full transcript by id (from a search hit labelled 'meeting:...'). The transcript is STRUCTURED by default — one line per segment, '[<start_s>–<end_s>] <Speaker>: <text>' with Me/Others/Unknown speakers and raw-second timestamps; pass transcriptFormat 'plain' for the old flat text. For a very long transcript, page through it with offset + maxChars.",
-            "inputSchema": { "type": "object", "properties": { "meetingId": { "type": "string" }, "transcriptFormat": { "type": "string", "enum": ["structured", "plain"], "description": "Transcript rendering (default 'structured')." }, "offset": { "type": "number", "description": "Chars to skip into the transcript (default 0)." }, "maxChars": { "type": "number", "description": "Max transcript chars to return from offset (default all)." } }, "required": ["meetingId"] }
+            "description": "Get a meeting's AI note (summary) and transcript by id (from a search hit labelled 'meeting:...'). The transcript is STRUCTURED by default — one line per segment, '[<start_s>–<end_s>] <Speaker>: <text>' with Me/Others/Unknown speakers and raw-second timestamps; pass transcriptFormat 'plain' for the old flat text. The transcript is returned as a WINDOW (default first 6000 chars) prefixed with 'TOTAL_CHARS: <N> (showing <start>..<end>)'; page a long transcript by passing offset + maxChars.",
+            "inputSchema": { "type": "object", "properties": { "meetingId": { "type": "string" }, "transcriptFormat": { "type": "string", "enum": ["structured", "plain"], "description": "Transcript rendering (default 'structured')." }, "offset": { "type": "number", "description": "Chars to skip into the transcript (default 0)." }, "maxChars": { "type": "number", "description": "Max transcript chars to return from offset (default: a bounded 6000-char window with the total disclosed)." } }, "required": ["meetingId"] }
         },
         {
             "name": "get_document",
-            "description": "Get the full body of one standalone note or imported/uploaded document by id (from a search hit labelled 'document:...'). Use this — not get_meeting — for ids from the DOCUMENTS section of a search result. For a big document, page through it with offset + maxChars.",
-            "inputSchema": { "type": "object", "properties": { "documentId": { "type": "string" }, "offset": { "type": "number", "description": "Chars to skip into the body (default 0)." }, "maxChars": { "type": "number", "description": "Max body chars to return from offset (default all)." } }, "required": ["documentId"] }
+            "description": "Get the body of one standalone note or imported/uploaded document by id (from a search hit labelled 'document:...'). Use this — not get_meeting — for ids from the DOCUMENTS section of a search result. The body is returned as a WINDOW (default first 6000 chars) prefixed with 'TOTAL_CHARS: <N> (showing <start>..<end>)'; page a big document by passing offset + maxChars.",
+            "inputSchema": { "type": "object", "properties": { "documentId": { "type": "string" }, "offset": { "type": "number", "description": "Chars to skip into the body (default 0)." }, "maxChars": { "type": "number", "description": "Max body chars to return from offset (default: a bounded 6000-char window with the total disclosed)." } }, "required": ["documentId"] }
+        },
+        {
+            "name": "get_document_outline",
+            "description": "Get the STRUCTURAL OUTLINE (heading/section map + page numbers) of one standalone note or imported/uploaded document by id (from a 'document:...' search hit). Use this on a BIG document BEFORE get_document: read the map, then fetch the section you need with get_document's offset + maxChars instead of paging blindly. Returns the section headings in document order; a flat/heading-less document has no outline. Sealed-and-locked documents return no outline.",
+            "inputSchema": { "type": "object", "properties": { "documentId": { "type": "string" } }, "required": ["documentId"] }
         },
         {
             "name": "list_recent_meetings",
@@ -335,6 +340,25 @@ fn mcp_usize_arg(args: &Value, key: &str) -> usize {
         .min(usize::MAX as u64) as usize
 }
 
+/// Brain v3 audit Fix 2 — the MCP `get_meeting`/`get_document` DEFAULT window. UNLIKE the in-app
+/// agentic loop (which caps every tool result at `RESULT_BUDGET` before re-feeding it to the model),
+/// a raw MCP `tools/call` returns the ENTIRE payload to the connected client — so a client that
+/// omits paging on a multi-MB document/transcript would be flooded. When the MCP client passes NO
+/// paging (both `offset` and `maxChars` absent/0) we substitute THIS bounded default `maxChars`, and
+/// the tool returns a DISCLOSED window (`TOTAL_CHARS: <N> …`) so the client can see the full length
+/// and page the rest with explicit `offset`. A client that DOES pass paging is honored verbatim.
+/// DELIBERATE default change (documented): the pre-fix MCP default `(0,0)` returned the whole body.
+const MCP_DEFAULT_WINDOW_CHARS: usize = 6000;
+
+/// Resolve the MCP paging window for a body tool: honor explicit `offset`/`maxChars`, but when the
+/// client passes NEITHER, default `maxChars` to [`MCP_DEFAULT_WINDOW_CHARS`] so a huge payload is
+/// bounded + disclosed instead of flooding the client. Returns `(offset, max_chars)`.
+fn mcp_body_window(args: &Value) -> (usize, usize) {
+    let offset = mcp_usize_arg(args, "offset");
+    let max_chars = mcp_usize_arg(args, "maxChars");
+    (offset, max_chars)
+}
+
 fn dispatch_tool(
     db: &Db,
     name: &str,
@@ -371,9 +395,11 @@ fn dispatch_tool(
                 .filter(|f| *f == "plain")
                 .unwrap_or("structured")
                 .to_string(),
-            // Brain v3 PR-2 — agent paging (absent → 0 → today's behavior).
-            offset: mcp_usize_arg(args, "offset"),
-            max_chars: mcp_usize_arg(args, "maxChars"),
+            // Brain v3 audit Fix 2 — bound + DISCLOSE the default MCP window (no paging args → a
+            // 6000-char disclosed window, not the whole transcript) so a huge transcript can't flood
+            // the client; explicit offset/maxChars are honored verbatim.
+            offset: mcp_body_window(args).0,
+            max_chars: mcp_body_window(args).1,
         },
         "get_document" => ToolCall::GetDocument {
             document_id: args
@@ -381,8 +407,18 @@ fn dispatch_tool(
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string(),
-            offset: mcp_usize_arg(args, "offset"),
-            max_chars: mcp_usize_arg(args, "maxChars"),
+            // Audit Fix 2 — same bounded + disclosed default window as get_meeting.
+            offset: mcp_body_window(args).0,
+            max_chars: mcp_body_window(args).1,
+        },
+        // Brain v3 audit Fix 3(b) — the document OUTLINE (heading map). Gated by
+        // `get_document_outline_if_visible` inside `execute_tool` (a sealed-not-unlocked doc → empty).
+        "get_document_outline" => ToolCall::GetDocumentOutline {
+            document_id: args
+                .get("documentId")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
         },
         "list_recent_meetings" => ToolCall::ListRecentMeetings {
             limit: args
@@ -496,10 +532,10 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_has_ten_tools() {
+    fn tools_list_has_eleven_tools() {
         let r = rpc(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#).unwrap();
         let tools = r["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 10);
+        assert_eq!(tools.len(), 11);
         // The Phase 2b semantic tool is advertised.
         assert!(tools.iter().any(|t| t["name"] == "search_semantic"));
         // The Phase 5a open-commitments rollup tool is advertised.
@@ -522,6 +558,16 @@ mod tests {
         assert!(
             tools.iter().any(|t| t["name"] == "knowledge_diff"),
             "knowledge_diff must be advertised in the MCP tool catalog"
+        );
+        // Brain v3 audit Fix 3(b) — the document-outline tool is advertised (the 11th tool), and its
+        // args must be MIRRORED between the MCP tools list and the agentic tool surface (documentId).
+        let outline = tools
+            .iter()
+            .find(|t| t["name"] == "get_document_outline")
+            .expect("get_document_outline must be advertised in the MCP tool catalog");
+        assert_eq!(
+            outline["inputSchema"]["required"][0], "documentId",
+            "the MCP outline tool must advertise the documentId arg (parity with the tool surface)"
         );
     }
 
@@ -1178,6 +1224,114 @@ mod tests {
         let _ = std::fs::remove_file(&p);
     }
 
+    /// Brain v3 audit Fix 2 — the MCP `get_document` DEFAULT (no paging args) no longer floods the
+    /// client with the whole body: it returns a BOUNDED window (`MCP_DEFAULT_WINDOW_CHARS`) plus a
+    /// `TOTAL_CHARS: …` disclosure so the client can see the true length and page the rest. An
+    /// explicit larger `maxChars` is honored verbatim. RED on the pre-fix `(0,0)`-returns-everything.
+    #[test]
+    fn mcp_get_document_default_window_is_bounded_and_disclosed() {
+        use crate::storage::models::Folder;
+        let (db, p) = temp_db();
+        db.insert_folder(&Folder {
+            id: "f-open".to_string(),
+            name: "Docs".to_string(),
+            path: "Docs".to_string(),
+            parent_id: None,
+            locked: false,
+            created_at: "2026-06-26T00:00:00Z".to_string(),
+        })
+        .unwrap();
+        // A body LARGER than the default window so the flood is measurable.
+        let big = "A".repeat(MCP_DEFAULT_WINDOW_CHARS + 5000);
+        db.insert_document("bigdoc", "f-open", "big.md", &big, "document", 1_700_000_000)
+            .unwrap();
+
+        // Default (no paging) → bounded to MCP_DEFAULT_WINDOW_CHARS + a disclosure header showing
+        // the TRUE total; NOT the whole 11000-char body.
+        let out = dispatch_tool(&db, "get_document", &json!({ "documentId": "bigdoc" }), &HashSet::new())
+            .unwrap();
+        assert!(
+            out.contains(&format!("BODY (TOTAL_CHARS: {} (showing 0..{}))", big.chars().count(), MCP_DEFAULT_WINDOW_CHARS)),
+            "the MCP default must disclose the true total + the bounded window: {}",
+            &out[..out.len().min(120)]
+        );
+        // The returned body is bounded (window + headers/title), NOT the full 11000-char body.
+        assert!(
+            out.len() < big.len(),
+            "the default MCP window must NOT return the whole body (flood): got {} vs body {}",
+            out.len(),
+            big.len()
+        );
+        assert!(
+            !out.contains("[end of content]"),
+            "the bounded default window does NOT reach the end of a body larger than the window: {}",
+            &out[out.len().saturating_sub(60)..]
+        );
+
+        // Explicit larger maxChars is honored (the client CAN ask for more).
+        let full = dispatch_tool(
+            &db,
+            "get_document",
+            &json!({ "documentId": "bigdoc", "offset": 0, "maxChars": big.chars().count() + 10 }),
+            &HashSet::new(),
+        )
+        .unwrap();
+        assert!(full.contains("[end of content]"), "an explicit full window reaches the end: last 60 = {}", &full[full.len().saturating_sub(60)..]);
+        assert!(full.len() > out.len(), "explicit large maxChars returns more than the default window");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Brain v3 audit Fix 3(b) — the MCP `get_document_outline` dispatch is visibility-gated: a
+    /// document in a sealed-and-not-session-unlocked folder returns the "no outline" sentinel (no
+    /// heading leak), and the heading map reappears once the folder is session-unlocked. Proves the
+    /// NEW gated read routes through `execute_tool` → `get_document_outline_if_visible`.
+    #[test]
+    fn mcp_get_document_outline_is_visibility_gated() {
+        use crate::storage::models::Folder;
+        let (db, p) = temp_db();
+        db.insert_folder(&Folder {
+            id: "f-lock".to_string(),
+            name: "Specs".to_string(),
+            path: "Specs".to_string(),
+            parent_id: None,
+            locked: false,
+            created_at: "2026-06-26T00:00:00Z".to_string(),
+        })
+        .unwrap();
+        // A two-section doc → two L1 headings in the outline.
+        let blocks = vec![
+            crate::extract::ExtractedBlock {
+                text: "Confidential design of the vault store.".to_string(),
+                page: Some(1),
+                heading_path: Some("SecretDesign".to_string()),
+            },
+            crate::extract::ExtractedBlock {
+                text: "The keys are wrapped by the master KEK.".to_string(),
+                page: Some(2),
+                heading_path: Some("SecretDesign › Keys".to_string()),
+            },
+        ];
+        let stored = crate::extract::blocks_to_stored_text(&blocks);
+        db.insert_document("od1", "f-lock", "spec.pdf", &stored, "document", 1_700_000_000)
+            .unwrap();
+        db.index_document_chunks("od1", None).unwrap();
+        db.set_folder_locked("f-lock", true, None).unwrap();
+
+        let args = json!({ "documentId": "od1" });
+        // Locked, not unlocked → the "no outline" sentinel; the heading trail must NOT leak.
+        let out = dispatch_tool(&db, "get_document_outline", &args, &HashSet::new()).unwrap();
+        assert!(out.contains("No outline for document od1"), "sealed → sentinel: {out}");
+        assert!(!out.contains("SecretDesign"), "sealed document headings leaked via MCP outline: {out}");
+
+        // Session-unlock → the heading map reappears in document order.
+        let mut unlocked = HashSet::new();
+        unlocked.insert("f-lock".to_string());
+        let out2 = dispatch_tool(&db, "get_document_outline", &args, &unlocked).unwrap();
+        assert!(out2.contains("SecretDesign (p.1)"), "unlocked outline lists section + page: {out2}");
+        assert!(out2.contains("SecretDesign › Keys (p.2)"), "document order preserved: {out2}");
+        let _ = std::fs::remove_file(&p);
+    }
+
     /// Feature D: the MCP `get_meeting` dispatch defaults to the STRUCTURED transcript, and honors an
     /// explicit `transcriptFormat: "plain"` for the legacy flat text.
     #[test]
@@ -1221,13 +1375,21 @@ mod tests {
         )
         .unwrap();
 
-        // Default (no transcriptFormat) → STRUCTURED (speaker label + timestamp token).
+        // Default (no transcriptFormat) → STRUCTURED (speaker label + timestamp token). Audit
+        // Fix 2: the MCP default now bounds+discloses the transcript window, so the section header
+        // carries a `TOTAL_CHARS: …` disclosure (the whole short transcript fits the 6000 window).
         let def = dispatch_tool(&db, "get_meeting", &json!({ "meetingId": "mm" }), &HashSet::new())
             .unwrap();
         assert!(def.contains("Me: opening remarks"), "default must be structured: {def}");
         assert!(def.contains("[5–8]"), "default must carry a timestamp token: {def}");
+        assert!(
+            def.contains("TRANSCRIPT (TOTAL_CHARS:"),
+            "the MCP default now discloses the transcript window total: {def}"
+        );
 
-        // Explicit plain → the legacy flat text (no speaker label, no timestamp).
+        // Explicit plain → the legacy flat text (no speaker label, no timestamp). Audit Fix 2: with
+        // NO paging args the MCP default now applies the bounded+disclosed window, so the short
+        // transcript is fully returned WITH its `TOTAL_CHARS` header + the end-of-content marker.
         let plain = dispatch_tool(
             &db,
             "get_meeting",
@@ -1235,7 +1397,10 @@ mod tests {
             &HashSet::new(),
         )
         .unwrap();
-        assert_eq!(plain, "NOTE:\nn\n\nTRANSCRIPT:\nopening remarks");
+        assert_eq!(
+            plain,
+            "NOTE:\nn\n\nTRANSCRIPT (TOTAL_CHARS: 15 (showing 0..15)):\nopening remarks\n[end of content]"
+        );
         let _ = std::fs::remove_file(&p);
     }
 

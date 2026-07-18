@@ -65,11 +65,14 @@ impl AssistantScope {
     /// and the connector tools are partitioned here; `propose_note` / write tools are governed by the
     /// surface flags, not the tier, so they are allowed through the tier gate and left to those flags.
     fn allows(self, tool: &str) -> bool {
-        const VAULT_READS: [&str; 9] = [
+        const VAULT_READS: [&str; 10] = [
             "search_meetings",
             "search_semantic",
             "get_meeting",
             "get_document",
+            // Brain v3 audit Fix 3(b) — the document OUTLINE (heading/section map, egress-free,
+            // gated exactly like `get_document`). An owned-vault read.
+            "get_document_outline",
             "list_recent_meetings",
             "get_open_commitments",
             "get_entity_dossier",
@@ -152,6 +155,12 @@ pub enum ToolCall {
         /// Max chars of body to return from `offset` (0 = unlimited = today's behavior).
         max_chars: usize,
     },
+    /// Brain v3 audit Fix 3(b) — the STRUCTURAL OUTLINE (heading/section tree + page map) of one
+    /// document, so the agent can plan targeted `get_document(offset, maxChars)` reads instead of
+    /// blind char paging. Deterministic (no LLM). Gated by [`Db::get_document_outline_if_visible`]
+    /// (a sealed-and-not-session-unlocked document → an EMPTY outline, the same masking as
+    /// `get_document`). Carries only the heading map, never the section body text.
+    GetDocumentOutline { document_id: String },
     /// The most recent meetings (already clamped to 1..=100 by the caller/parser).
     ListRecentMeetings { limit: i64 },
     /// Hybrid semantic + FTS search. Gated behind the `semantic_search_enabled` config flag.
@@ -294,6 +303,24 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                     "documentId": { "type": "string", "description": "The document id from a prior search result (a 'document:...' hit)." },
                     "offset": { "type": "integer", "description": "Chars to skip into the body (default 0)." },
                     "maxChars": { "type": "integer", "description": "Max body chars to return from offset (default all)." }
+                },
+                "required": ["documentId"]
+            }),
+            write: false,
+        },
+        ToolSpec {
+            name: "get_document_outline".into(),
+            description: "Get the STRUCTURAL OUTLINE (heading/section map + page numbers) of one \
+                          standalone note or imported/uploaded document by id (from a 'document:...' \
+                          search hit). Use this on a BIG document BEFORE get_document: read the map, \
+                          then fetch the section you need with get_document's offset + maxChars — \
+                          instead of paging blindly. Returns the section headings in document order; \
+                          a flat/heading-less document has no outline."
+                .into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "documentId": { "type": "string", "description": "The document id from a prior search result (a 'document:...' hit)." }
                 },
                 "required": ["documentId"]
             }),
@@ -598,16 +625,24 @@ pub fn execute_tool(
                     } else {
                         format_structured_transcript(&segs)
                     };
-                    // Brain v3 PR-2 — agent PAGING: default (offset 0, max_chars 0) is byte-identical
-                    // to today. A non-default window returns a char-safe slice of the transcript.
-                    let transcript = page_text(&full_transcript, *offset, *max_chars);
+                    // Brain v3 PR-2 — agent PAGING; audit Fix 2 — HONEST disclosure. Default
+                    // (offset 0, max_chars 0) is byte-identical to today (no header). A window
+                    // returns a char-safe slice PLUS a `TOTAL_CHARS: …` header so the agent knows
+                    // it saw a fraction of the transcript and how to page the rest.
+                    let (transcript, disclosure) =
+                        page_text_disclosed(&full_transcript, *offset, *max_chars);
+                    // The window is over the TRANSCRIPT only, so scope the header to that section.
+                    let transcript_section = match &disclosure {
+                        Some(h) => format!("TRANSCRIPT ({h}):\n{transcript}"),
+                        None => format!("TRANSCRIPT:\n{transcript}"),
+                    };
                     match note {
                         Some(n) => Ok(format!(
-                            "{title_line}NOTE:\n{}\n\nTRANSCRIPT:\n{transcript}",
+                            "{title_line}NOTE:\n{}\n\n{transcript_section}",
                             n.markdown
                         )),
                         None if !transcript.is_empty() => {
-                            Ok(format!("{title_line}TRANSCRIPT:\n{transcript}"))
+                            Ok(format!("{title_line}{transcript_section}"))
                         }
                         None => Ok(format!("No data for meeting {mid}.")),
                     }
@@ -636,11 +671,32 @@ pub fn execute_tool(
                         .map(str::trim)
                         .filter(|t| !t.is_empty())
                         .unwrap_or(doc.name.trim());
-                    // Brain v3 PR-2 — agent PAGING: default (0, 0) returns the full body (today's
-                    // behavior); a window returns a char-safe slice so the agent can iterate a big doc.
-                    let body = page_text(&doc.markdown, *offset, *max_chars);
-                    Ok(format!("TITLE: [[{title}]]\nKIND: {}\n\nBODY:\n{}", doc.kind, body))
+                    // Brain v3 PR-2 — agent PAGING; audit Fix 2 — HONEST disclosure. Default (0, 0)
+                    // returns the full body byte-identical to today (no header); a window returns a
+                    // char-safe slice PLUS a `TOTAL_CHARS: …` header so the agent knows it saw a
+                    // fraction of the body and how to page the rest.
+                    let (body, disclosure) = page_text_disclosed(&doc.markdown, *offset, *max_chars);
+                    let body_section = match &disclosure {
+                        Some(h) => format!("BODY ({h}):\n{body}"),
+                        None => format!("BODY:\n{body}"),
+                    };
+                    Ok(format!("TITLE: [[{title}]]\nKIND: {}\n\n{body_section}", doc.kind))
                 }
+            }
+        }
+        ToolCall::GetDocumentOutline { document_id } => {
+            let id = document_id.as_str();
+            // GATE: `get_document_outline_if_visible` applies the SAME `visibility_clause` JOIN as
+            // the doc readers — a document in a sealed-and-not-session-unlocked folder yields an
+            // EMPTY outline, INDISTINGUISHABLE from a never-existed id / a flat legacy doc (never
+            // leaks locked-vs-absent, mirroring `get_document` masking). Bounded at DOC_OUTLINE_CAP.
+            match db.get_document_outline_if_visible(id, unlocked, DOC_OUTLINE_CAP) {
+                Err(e) => Err(AppError::Storage(format!("document outline read failed: {e}"))),
+                Ok(entries) if entries.is_empty() => Ok(format!(
+                    "No outline for document {id} (it may be locked, absent, or have no headings — \
+                     read it with get_document)."
+                )),
+                Ok(entries) => Ok(format_doc_outline(id, &entries)),
             }
         }
         ToolCall::ListRecentMeetings { limit } => {
@@ -897,6 +953,46 @@ pub fn mcp_server_id_from_tool(name: &str) -> Option<&str> {
 
 /// Cap on a dynamic MCP tool's model-facing description.
 pub const MCP_DESCRIPTION_MAX_CHARS: usize = 100;
+
+/// Brain v3 audit Fix 3(b) — max entries in a `get_document_outline` result, so a huge deck
+/// (hundreds of slides) can't blow the tool result / cloud egress. An outline past this cap is
+/// truncated with a `[… more sections]` marker.
+const DOC_OUTLINE_CAP: usize = 200;
+
+/// Brain v3 audit Fix 3(b) — render a document's structural outline (L1 section headings + L2
+/// summary node) into the tool text payload the agent reads, as a MAP for planning targeted section
+/// reads. Deterministic; carries only the heading trail + page, never body text. The caller has
+/// already bounded the entry count at [`DOC_OUTLINE_CAP`]; if it returned exactly the cap we mark
+/// that the list may be truncated.
+fn format_doc_outline(id: &str, entries: &[crate::storage::models::DocOutlineEntry]) -> String {
+    let mut out = format!("OUTLINE for document {id} (page-map — read a section with get_document offset/maxChars):\n");
+    let lines: Vec<String> = entries
+        .iter()
+        .filter(|e| e.level == 1) // L1 section headings are the navigable map; the L2 summary is grounding, not structure.
+        .map(|e| {
+            let section = e
+                .section_path
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("(no heading)");
+            match e.page_no {
+                Some(p) => format!("- {section} (p.{p})"),
+                None => format!("- {section}"),
+            }
+        })
+        .collect();
+    if lines.is_empty() {
+        // Only an L2 summary / flat structure survived the L1 filter — no navigable headings.
+        out.push_str("- (no section headings — this document is flat; read it with get_document)");
+    } else {
+        out.push_str(&lines.join("\n"));
+    }
+    if entries.len() >= DOC_OUTLINE_CAP {
+        out.push_str("\n[… more sections — outline truncated at the cap]");
+    }
+    out
+}
 
 /// SANITIZE a value destined for the model-facing tool catalog: control chars dropped, `<`/`>`
 /// neutralized (no HTML/tag smuggling), whitespace runs collapsed, hard-capped at `max` chars.
@@ -1557,6 +1653,45 @@ fn page_text(text: &str, offset: usize, max_chars: usize) -> String {
     }
 }
 
+/// Brain v3 audit Fix 2 — HONEST windowed paging. Returns the slice of `text` for
+/// `(offset, max_chars)` (same semantics as [`page_text`]) PAIRED WITH an optional disclosure
+/// header the caller prefixes so a windowed read is never mistaken for a whole document:
+///   - DEFAULT `(0, 0)` ⇒ `(full text, None)` — BYTE-IDENTICAL to today (the `execute_tool` tests
+///     pin this: a non-windowed `get_document`/`get_meeting` carries no header).
+///   - a WINDOW ⇒ `(slice, Some("TOTAL_CHARS: <N> (showing <start>..<end>)"))`, and when the window
+///     reaches the end of the content the slice gets the shipped `[end of content]` marker appended
+///     so the agent can tell it has paged to the end (vs. "there is more, call again with a larger
+///     offset"). All counts are CHARS — the unit the `offset`/`maxChars` args use.
+///
+/// Without this the agent pages a big doc by blind char arithmetic and can't tell a short window
+/// from the whole body — the "windowed reads must disclose the total" honesty gap.
+fn page_text_disclosed(text: &str, offset: usize, max_chars: usize) -> (String, Option<String>) {
+    if offset == 0 && max_chars == 0 {
+        return (text.to_string(), None); // byte-identical default — no header.
+    }
+    let total = text.chars().count();
+    if offset >= total {
+        // Past the end: `page_text` yields the end-of-content marker; disclose the total + that
+        // we're at the end so the agent stops paging.
+        return (
+            page_text(text, offset, max_chars),
+            Some(format!("TOTAL_CHARS: {total} (showing {total}..{total})")),
+        );
+    }
+    // Reuse the CHAR-safe slicer so the windowing logic lives in ONE place.
+    let slice = page_text(text, offset, max_chars);
+    let shown = slice.chars().count();
+    let end = offset + shown;
+    let header = format!("TOTAL_CHARS: {total} (showing {offset}..{end})");
+    // Append the end-of-content marker when this window reaches the end of the body.
+    let body = if end >= total {
+        format!("{slice}\n[end of content]")
+    } else {
+        slice
+    };
+    (body, Some(header))
+}
+
 /// Feature D — render a meeting's transcript segments as a STRUCTURED, one-line-per-segment block:
 /// `[<start_s>–<end_s>] <Speaker>: <text>`. RAW SECONDS (never MM:SS) so a 2h+ meeting can never
 /// wrap/clip a minutes field. Speaker maps the cheap 2-way stream attribution
@@ -1609,6 +1744,29 @@ fn format_hits(hits: &[crate::storage::models::SearchHit]) -> String {
 /// document line carries a `[document:{kind}:{id}]` id-type tag (kind = `note` | `document`) so a
 /// model knows to call `get_document` (NOT `get_meeting`) with that id — distinct from the meeting
 /// lines' `[meeting:{id}]` tag. Both inputs are already visibility-gated by the caller.
+/// Brain v3 audit Fix 3(a) — render a doc hit's PROVENANCE LOCATION (heading trail + page/slide) as
+/// a compact ` (§<section> · p.<page>)` suffix, so a search result tells the agent WHICH section/page
+/// a hit is from. Empty when a flat/heading-less, flow-format doc carries neither — the hit line is
+/// then byte-identical to before this fix. The `section_path` is trimmed to a sane length so a deep
+/// heading trail can't blow a result line.
+fn format_hit_location(section_path: Option<&str>, page_no: Option<u32>) -> String {
+    let section = section_path
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            // Cap the heading trail so a pathological deep path stays bounded on the result line.
+            let capped: String = s.chars().take(120).collect();
+            format!("§{capped}")
+        });
+    let page = page_no.map(|p| format!("p.{p}"));
+    match (section, page) {
+        (Some(s), Some(p)) => format!(" ({s} · {p})"),
+        (Some(s), None) => format!(" ({s})"),
+        (None, Some(p)) => format!(" ({p})"),
+        (None, None) => String::new(),
+    }
+}
+
 fn format_hits_and_docs(
     hits: &[crate::storage::models::SearchHit],
     docs: &[crate::storage::models::DocChunkHit],
@@ -1626,9 +1784,15 @@ fn format_hits_and_docs(
             &docs
                 .iter()
                 .map(|d| {
+                    // Brain v3 audit Fix 3(a) — surface WHERE in the document this hit lives so the
+                    // agent can do search → get_document_outline → targeted section read instead of
+                    // blind offset paging. `section_path` (heading trail) and `page_no` (PDF/slide)
+                    // are the persisted hierarchy PR-1 threaded into DocChunkHit; a flat/flow doc
+                    // omits the absent parts. Format: `(§<section> · p.<page>)` after the id tag.
+                    let loc = format_hit_location(d.section_path.as_deref(), d.page_no);
                     format!(
-                        "- [document:{}:{}] {} — {}",
-                        d.kind, d.document_id, d.name, d.snippet
+                        "- [document:{}:{}] {}{} — {}",
+                        d.kind, d.document_id, d.name, loc, d.snippet
                     )
                 })
                 .collect::<Vec<_>>()
@@ -1840,6 +2004,16 @@ impl crate::agent::ToolExecutor for GatedToolExecutor<'_> {
                     document_id: s("documentId"),
                     offset: u("offset"),
                     max_chars: u("maxChars"),
+                },
+                self.db,
+                &unlocked,
+                self.config,
+            ),
+            // Brain v3 audit Fix 3(b) — the document OUTLINE (heading map). Owned-vault read, gated
+            // by `get_document_outline_if_visible` against the re-read `unlocked` set.
+            "get_document_outline" => execute_tool(
+                &ToolCall::GetDocumentOutline {
+                    document_id: s("documentId"),
                 },
                 self.db,
                 &unlocked,
@@ -3972,6 +4146,110 @@ mod tests {
         );
     }
 
+    /// Brain v3 audit Fix 3(a) — a doc-search hit that has hierarchy metadata surfaces its
+    /// `§<section> · p.<page>` LOCATION in the result line; a flat/flow hit with neither is
+    /// byte-identical to before the fix (no location suffix). Uses the pure formatters so the
+    /// assertion binds the exact rendered shape.
+    #[test]
+    fn doc_hit_surfaces_section_path_and_page() {
+        use crate::storage::models::DocChunkHit;
+        // Pure location formatter cases.
+        assert_eq!(
+            format_hit_location(Some("Intro › Goals"), Some(3)),
+            " (§Intro › Goals · p.3)"
+        );
+        assert_eq!(format_hit_location(Some("Appendix"), None), " (§Appendix)");
+        assert_eq!(format_hit_location(None, Some(7)), " (p.7)");
+        assert_eq!(format_hit_location(None, None), "", "flat/flow hit → no suffix");
+        assert_eq!(format_hit_location(Some("   "), None), "", "blank section → no suffix");
+
+        // End-to-end through the doc renderer.
+        let hit = DocChunkHit {
+            document_id: "d1".into(),
+            name: "Spec.pdf".into(),
+            folder_id: "f".into(),
+            snippet: "the retrieved passage".into(),
+            kind: "document".into(),
+            chunk_id: 10,
+            parent_id: Some(2),
+            section_path: Some("Design › API".into()),
+            page_no: Some(4),
+            level: 0,
+            sibling_hits: 2,
+        };
+        let rendered = format_hits_and_docs(&[], std::slice::from_ref(&hit));
+        assert!(
+            rendered.contains("[document:document:d1] Spec.pdf (§Design › API · p.4) — the retrieved passage"),
+            "a hit with hierarchy must render its section + page: {rendered}"
+        );
+        // A flat hit (no section, no page) stays byte-identical to the pre-fix line shape.
+        let flat = DocChunkHit {
+            section_path: None,
+            page_no: None,
+            ..hit
+        };
+        let flat_rendered = format_hits_and_docs(&[], std::slice::from_ref(&flat));
+        assert!(
+            flat_rendered.contains("[document:document:d1] Spec.pdf — the retrieved passage"),
+            "a flat hit carries no location suffix: {flat_rendered}"
+        );
+    }
+
+    /// Brain v3 audit Fix 3(b) — the `get_document_outline` TOOL: a sealed-not-unlocked doc → the
+    /// "no outline" sentinel (no heading leak); unlock → the heading map with pages, in document
+    /// order. Routes through the gated `execute_tool` → `get_document_outline_if_visible`.
+    #[test]
+    fn get_document_outline_tool_is_gated_and_maps_sections() {
+        let db = tmp_db();
+        let cfg = AppConfig::default();
+        seed_folder(&db, "f-lock", "Specs");
+        let blocks = vec![
+            crate::extract::ExtractedBlock {
+                text: "The plan is stored in the vault.".to_string(),
+                page: Some(1),
+                heading_path: Some("Overview".to_string()),
+            },
+            crate::extract::ExtractedBlock {
+                text: "Everything is encrypted at rest.".to_string(),
+                page: Some(2),
+                heading_path: Some("Overview › Security".to_string()),
+            },
+        ];
+        let stored = crate::extract::blocks_to_stored_text(&blocks);
+        db.insert_document("od1", "f-lock", "plan.pdf", &stored, "document", 1_700_000_000)
+            .unwrap();
+        db.index_document_chunks("od1", None).unwrap();
+        db.set_folder_locked("f-lock", true, None).unwrap();
+
+        // Locked → the sentinel; the heading trail must NOT leak.
+        let locked = execute_tool(
+            &ToolCall::GetDocumentOutline { document_id: "od1".into() },
+            &db,
+            &HashSet::new(),
+            &cfg,
+        )
+        .unwrap();
+        assert!(locked.contains("No outline for document od1"), "sealed → sentinel: {locked}");
+        assert!(!locked.contains("Overview"), "sealed headings leaked via the outline tool: {locked}");
+
+        // Session-unlock → the heading map, in order, with pages.
+        let mut unlocked = HashSet::new();
+        unlocked.insert("f-lock".to_string());
+        let out = execute_tool(
+            &ToolCall::GetDocumentOutline { document_id: "od1".into() },
+            &db,
+            &unlocked,
+            &cfg,
+        )
+        .unwrap();
+        assert!(out.contains("OUTLINE for document od1"), "outline header: {out}");
+        assert!(out.contains("- Overview (p.1)"), "first section + page: {out}");
+        assert!(out.contains("- Overview › Security (p.2)"), "document order + page: {out}");
+        let first = out.find("Overview (p.1)").unwrap();
+        let second = out.find("Overview › Security").unwrap();
+        assert!(first < second, "sections render in document order: {out}");
+    }
+
     /// #6 — regression guard: after the `DocChunkHit.kind` addition, a locked-not-unlocked folder's
     /// document stays ABSENT from search (the `visibility_clause` gate still excludes it).
     #[test]
@@ -4036,6 +4314,40 @@ mod tests {
         assert!(windowed.starts_with("zażół"), "no mid-codepoint slice: {windowed}");
     }
 
+    /// Brain v3 audit Fix 2 — `page_text_disclosed` returns the disclosure header for a WINDOW and
+    /// stays byte-identical (no header) for the default, appending the end-of-content marker only
+    /// when the window reaches the end. Counts are CHARS.
+    #[test]
+    fn page_text_disclosed_windows_honestly() {
+        let text = "abcdefghij"; // 10 chars
+        // Default (0,0): byte-identical text, NO disclosure header.
+        let (body, disc) = page_text_disclosed(text, 0, 0);
+        assert_eq!(body, "abcdefghij");
+        assert!(disc.is_none(), "default read carries no disclosure");
+        // A mid window: header discloses total + window, NO end marker (there is more).
+        let (body, disc) = page_text_disclosed(text, 3, 4);
+        assert_eq!(body, "defg", "the slice itself is unchanged");
+        assert_eq!(disc.as_deref(), Some("TOTAL_CHARS: 10 (showing 3..7)"));
+        // A window reaching the end: end-of-content marker + header.
+        let (body, disc) = page_text_disclosed(text, 7, 100);
+        assert_eq!(body, "hij\n[end of content]", "reaching the end appends the marker: {body}");
+        assert_eq!(disc.as_deref(), Some("TOTAL_CHARS: 10 (showing 7..10)"));
+        // Offset past the end: end sentinel + a header pinned at the total.
+        let (body, disc) = page_text_disclosed(text, 20, 5);
+        assert_eq!(body, "[end of content]");
+        assert_eq!(disc.as_deref(), Some("TOTAL_CHARS: 10 (showing 10..10)"));
+        // Offset-only (max 0) window to the end: whole tail + end marker + header.
+        let (body, disc) = page_text_disclosed(text, 3, 0);
+        assert_eq!(body, "defghij\n[end of content]");
+        assert_eq!(disc.as_deref(), Some("TOTAL_CHARS: 10 (showing 3..10)"));
+        // Multibyte: char counts, not bytes.
+        let pl = "zażółć gęślą";
+        let total = pl.chars().count();
+        let (body, disc) = page_text_disclosed(pl, 2, 3);
+        assert_eq!(body.chars().count(), 3, "3 chars, not bytes");
+        assert_eq!(disc.as_deref(), Some(format!("TOTAL_CHARS: {total} (showing 2..5)").as_str()));
+    }
+
     /// Brain v3 PR-2 — `get_document` honors offset/max_chars: default returns the full body; a
     /// window returns a slice; the DEFAULT path is unchanged from before paging.
     #[test]
@@ -4068,7 +4380,38 @@ mod tests {
             &cfg,
         )
         .unwrap();
-        assert!(windowed.contains("BODY:\nABCDE"), "windowed body: {windowed}");
+        assert!(windowed.contains("ABCDE"), "windowed body: {windowed}");
         assert!(!windowed.contains("01234"), "the offset skipped the first 10 chars: {windowed}");
+        // Audit Fix 2 — the WINDOWED read discloses the true total + the exact window so the agent
+        // knows it saw a fraction (20 chars total, showing 10..15), and there IS more to page.
+        assert!(
+            windowed.contains("BODY (TOTAL_CHARS: 20 (showing 10..15)):"),
+            "windowed read must disclose the total + window: {windowed}"
+        );
+        assert!(
+            !windowed.contains("[end of content]"),
+            "this window (10..15 of 20) does NOT reach the end, so no end marker: {windowed}"
+        );
+        // The DEFAULT (0,0) read stays byte-identical: no disclosure header, no end marker.
+        assert!(full.contains("BODY:\n0123456789ABCDEFGHIJ"), "default body byte-identical: {full}");
+        assert!(!full.contains("TOTAL_CHARS"), "default read carries NO disclosure header: {full}");
+
+        // A window that REACHES the end gets the end-of-content marker + the total.
+        let to_end = execute_tool(
+            &ToolCall::GetDocument { document_id: "d-big".into(), offset: 15, max_chars: 100 },
+            &db,
+            &nothing,
+            &cfg,
+        )
+        .unwrap();
+        assert!(to_end.contains("FGHIJ"), "tail slice: {to_end}");
+        assert!(
+            to_end.contains("TOTAL_CHARS: 20 (showing 15..20)"),
+            "the end-window discloses 15..20 of 20: {to_end}"
+        );
+        assert!(
+            to_end.contains("[end of content]"),
+            "a window that reaches the end must carry the end marker: {to_end}"
+        );
     }
 }
