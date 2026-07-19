@@ -1,4 +1,4 @@
-<section class="record">
+<section class="record" [class.is-recording]="store.isRecording()">
   @if (modelPresent() === false) {
     <div class="banner is-accent model-banner" role="alert">
       <span class="banner-icon" aria-hidden="true">↓</span>
@@ -43,7 +43,9 @@
     </div>
   }
 
-  @if (headphonesHint()) {
+  <!-- Headphones hint — a separate banner only when NOT recording; while recording it
+       folds into the single coherent top bar below (no stacked bands). -->
+  @if (headphonesHint() && !store.isRecording()) {
     <div class="banner is-accent" role="note">
       <span class="banner-icon" aria-hidden="true">🎧</span>
       <span>
@@ -53,15 +55,26 @@
     </div>
   }
 
-  <!-- ── While recording: a THIN top line — the single alive heartbeat (the orb) +
-       the timer. Recording is ambient chrome; the centered notepad below is the hero.
-       Controls (mic-mute · captions · Ask · Stop) live in the footer HUD. ────────── -->
+  <!-- ── While recording: ONE coherent top bar — the recording heartbeat (orb + timer)
+       + the headphones hint folded in (not a separate stacked banner) + Pop out. The
+       whole strip above the notepad reads as a single bar. ─────────────────────────── -->
   @if (store.isRecording()) {
-    <div class="rec-topline" role="status">
-      <span class="orb live" aria-hidden="true"></span>
-      <span class="timer">{{ elapsedLabel() }}</span>
-      <span class="rec-topline-label">Recording</span>
-      <span class="rec-topline-spacer"></span>
+    <div class="rec-topbar" role="status">
+      <span class="rt-status">
+        <span class="orb live" aria-hidden="true"></span>
+        <span class="timer">{{ elapsedLabel() }}</span>
+        <span class="rt-label">Recording</span>
+      </span>
+      @if (headphonesHint()) {
+        <span
+          class="rt-hint"
+          title="Capturing system audio — use headphones so the other participants' voices don't echo back into your microphone."
+        >
+          <span class="rt-hint-ico" aria-hidden="true">🎧</span>
+          Use <strong>headphones</strong> so others' voices don't echo into your mic
+        </span>
+      }
+      <span class="rt-spacer"></span>
       <button type="button" class="popout" (click)="popOut()">
         Pop out
         <span class="kbd-inline">⌘⇧R</span>
@@ -224,7 +237,7 @@
             opacity="0.85"
           />
         </svg>
-        <span class="ask-pill-label">Ask</span>
+        <span class="ask-pill-label">Ask Brain</span>
         @if (assistant.hasNotes() && !assistant.askPanelOpen()) {
           <span class="ask-dot" aria-hidden="true"></span>
         }

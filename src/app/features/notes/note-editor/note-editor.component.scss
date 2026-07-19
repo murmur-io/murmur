@@ -688,6 +688,15 @@
 .slash-menu .menu-item.is-active {
   background: var(--surface-hover);
 }
+/* "✦ Ask Brain" — the accented AI entry pinned to the top of the recording slash
+   menu, set apart from the block items by a hairline separator (Notion-style). */
+.slash-menu .menu-item.is-ask {
+  color: var(--accent-hover);
+  font-weight: 550;
+  border-bottom: 1px solid var(--border-subtle);
+  margin-bottom: 4px;
+  padding-bottom: calc(var(--space-2) + 4px);
+}
 
 /* "Full width" toggle item (⋯ menu) — a checkbox-style row: the checkmark
    floats to the trailing edge when the preference is ON. */

@@ -8,6 +8,17 @@
   animation: rise 420ms var(--transition) both;
 }
 
+/* While recording, BOUND the surface to the viewport so the whole thing (top bar →
+   notepad → footer HUD) fits with NO page scroll — the note scrolls INTERNALLY. Mirrors
+   the note-editor's proven fill-the-pane calc (cancel app-main's top padding + tab strip)
+   + a negative bottom margin to cancel app-main's bottom padding so the footer reaches
+   the window bottom. Idle/done keep the min-height above (their stacked cards may scroll). */
+.record.is-recording {
+  height: calc(100vh - 10px - var(--tabs-strip-height, 0px) - var(--space-7));
+  min-height: 0;
+  margin-bottom: calc(-1 * var(--space-8));
+}
+
 /* ── The conversation thread = the full-height main surface ─────────── */
 .conversation {
   display: block;
@@ -115,26 +126,55 @@
   box-shadow: var(--glass-highlight);
   animation: bar-in 320ms var(--ease-spring) both;
 }
-/* ── While recording: a THIN, quiet top line — the single alive heartbeat (the orb)
-   + the timer. Ambient chrome: low contrast, NO card/glow, so the notepad below reads
-   as the hero (Calm-Notepad, 2026-07-19). ── */
-.rec-topline {
+/* ── While recording: ONE coherent top bar — the recording heartbeat (orb + timer) +
+   the headphones hint folded in + Pop out. A quiet glass strip matching the footer HUD,
+   so the top and bottom chrome bracket the notepad symmetrically (2026-07-19). ── */
+.rec-topbar {
   display: flex;
   align-items: center;
   gap: var(--space-3);
   flex: none;
-  padding: var(--space-1) var(--space-2);
-  color: var(--text-secondary);
+  padding: var(--space-2) var(--space-2) var(--space-2) var(--space-3);
+  border-radius: var(--radius-lg);
+  border: 1px solid var(--glass-border);
+  background: rgba(255, 255, 255, 0.04);
+  -webkit-backdrop-filter: blur(var(--glass-blur))
+    saturate(var(--glass-saturate));
+  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+  box-shadow: var(--glass-highlight);
   animation: bar-in 320ms var(--ease-spring) both;
 }
-.rec-topline-label {
+.rt-status {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex: none;
+}
+.rt-label {
   font-size: 0.85rem;
   font-weight: 550;
   color: var(--text-secondary);
   letter-spacing: -0.005em;
 }
-.rec-topline-spacer {
-  flex: 1;
+/* Headphones hint, folded inline — muted, shrinks + truncates before it crowds. */
+.rt-hint {
+  flex: 0 1 auto;
+  min-width: 0;
+  color: var(--text-muted);
+  font-size: 0.82rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.rt-hint strong {
+  color: var(--text-secondary);
+  font-weight: 600;
+}
+.rt-hint-ico {
+  margin-right: var(--space-1);
+}
+.rt-spacer {
+  flex: 1 1 auto;
 }
 .rec-strip.is-idle {
   flex-wrap: wrap;
