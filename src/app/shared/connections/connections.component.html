@@ -100,7 +100,11 @@
     @if (relatedRows().length) {
       <div class="cx-group">
         @for (row of relatedRows(); track row.key) {
-          <span class="cx-chipwrap" [class.is-pending]="row.pending">
+          <span
+            class="cx-chipwrap"
+            [class.has-remove]="row.removable && !!row.edge"
+            [class.is-pending]="row.pending"
+          >
             <a class="cx-chip" [routerLink]="row.route">
               @switch (row.kind) {
                 @case ("meeting") {
@@ -141,7 +145,7 @@
       <div class="cx-group cx-group--suggest">
         <span class="cx-label">Suggested</span>
         @for (row of suggestionRows(); track row.edge.id) {
-          <span class="cx-chipwrap" [class.is-pending]="row.pending">
+          <span class="cx-chipwrap has-remove" [class.is-pending]="row.pending">
             <button
               type="button"
               class="cx-chip cx-chip--suggested"
