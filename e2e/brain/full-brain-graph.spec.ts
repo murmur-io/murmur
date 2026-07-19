@@ -143,32 +143,31 @@ test("full-brain graph: a sealed meeting's title/name never renders; the hidden-
 
 /**
  * PR-9 F6 (CAP DISCLOSURE, the silent-trim class): with more visible nodes than the
- * FE draw cap (MAX_NODES = 140), the disclosure banner must name what is ACTUALLY
- * DRAWN, not the backend's post-per-kind-cap `nodes.length`. The toolbar caption
- * ("N items") and the banner ("Drawing N of M items") must AGREE on the drawn count —
- * the F1 fix (before it, the caption said 300 while 140 somas were painted and the
- * banner claimed the backend total). Feeds 300 visible nodes with `totalVisibleNodes`
- * 300; asserts the drawn caption count === the banner's disclosed drawn count === 140.
+ * FE draw cap (MAX_NODES = 500 since the 2026-07-19 redesign), the disclosure banner
+ * must name what is ACTUALLY DRAWN, not the backend's post-per-kind-cap `nodes.length`.
+ * The toolbar caption ("N items") and the banner ("Drawing N of M items") must AGREE on
+ * the drawn count. Feeds 600 visible nodes with `totalVisibleNodes` 600; asserts the
+ * drawn caption count === the banner's disclosed drawn count === 500.
  */
 test("full-brain graph: the draw-cap disclosure names the DRAWN count, and the caption agrees", async ({
   page,
 }) => {
   await mockTauri(page, {
     get_full_graph: () => {
-      // 300 note nodes (> the 140 draw cap). Give each a distinct degree so the
-      // top-140-by-degree selection is deterministic.
-      const nodes = Array.from({ length: 300 }, (_v, i) => ({
+      // 600 note nodes (> the 500 draw cap). Give each a distinct degree so the
+      // top-500-by-degree selection is deterministic.
+      const nodes = Array.from({ length: 600 }, (_v, i) => ({
         id: `n${String(i).padStart(4, "0")}`,
         kind: "note",
         label: `Note ${i}`,
         date: "2026-07-01T00:00:00Z",
-        degree: 300 - i,
+        degree: 600 - i,
       }));
       return {
         nodes,
         edges: [],
         hasHidden: false,
-        totalVisibleNodes: 300,
+        totalVisibleNodes: 600,
         edgesTruncated: false,
       };
     },
@@ -180,10 +179,74 @@ test("full-brain graph: the draw-cap disclosure names the DRAWN count, and the c
   const graph = page.locator("app-full-brain-graph");
   await expect(graph).toBeVisible();
 
-  // The banner discloses the DRAWN count (140), not the backend total (300).
-  await expect(graph.getByText(/Drawing 140 of 300 items/)).toBeVisible();
+  // The banner discloses the DRAWN count (500), not the backend total (600).
+  await expect(graph.getByText(/Drawing 500 of 600 items/)).toBeVisible();
 
-  // The toolbar caption's item count MUST match what the banner says is drawn (140) —
+  // The toolbar caption's item count MUST match what the banner says is drawn (500) —
   // no more claiming more items than the canvas paints (the F1 fix).
-  await expect(graph.getByText(/140 items ·/)).toBeVisible();
+  await expect(graph.getByText(/500 items ·/)).toBeVisible();
+});
+
+/**
+ * The Layers|Clusters view-mode toggle (2026-07-19 "neural" redesign): the graph
+ * defaults to the LAYERED (neural-band) layout, and switching to Clusters (the
+ * organic per-component layout) is a CLIENT-SIDE re-layout — same nodes, NO
+ * re-fetch — with a clean console (guards the animation-loop + layout swap against
+ * NG0600 / paint regressions).
+ */
+test("full-brain graph: the Layers|Clusters mode toggle re-lays out client-side, clean console", async ({
+  page,
+}) => {
+  const consoleErrors: string[] = [];
+  page.on("console", (msg) => {
+    if (msg.type() === "error") consoleErrors.push(msg.text());
+  });
+  page.on("pageerror", (err) => consoleErrors.push(String(err)));
+
+  await mockTauri(page, {
+    get_full_graph: () => {
+      const w = window as unknown as { __fullGraphCalls?: number };
+      w.__fullGraphCalls = (w.__fullGraphCalls ?? 0) + 1;
+      return {
+        nodes: [
+          { id: "e1", kind: "entity", label: "Alice", date: null, degree: 1 },
+          { id: "m1", kind: "meeting", label: "Standup", date: "2026-07-01", degree: 2 },
+          { id: "n1", kind: "note", label: "Roadmap", date: "2026-07-02", degree: 1 },
+        ],
+        edges: [
+          { src: "e1", dst: "m1", srcKind: "entity", dstKind: "meeting", kind: "mention", score: 1, status: "active" },
+          { src: "m1", dst: "n1", srcKind: "meeting", dstKind: "note", kind: "companion", score: 1, status: "active" },
+        ],
+        hasHidden: false,
+        totalVisibleNodes: 3,
+        edgesTruncated: false,
+      };
+    },
+  });
+
+  await page.goto("/brain");
+  await page.getByRole("button", { name: /Full brain graph/i }).click();
+  const graph = page.locator("app-full-brain-graph");
+  await expect(graph.locator("canvas.fbg-canvas")).toBeVisible();
+
+  // Defaults to Layers (pressed); Clusters is not.
+  await expect(graph.getByRole("button", { name: "Layers" })).toHaveAttribute("aria-pressed", "true");
+  await expect(graph.getByRole("button", { name: "Clusters" })).toHaveAttribute("aria-pressed", "false");
+
+  const callsBefore = await page.evaluate(
+    () => (window as unknown as { __fullGraphCalls?: number }).__fullGraphCalls ?? 0,
+  );
+
+  // Switch to Clusters → client-side re-layout, no re-fetch.
+  await graph.getByRole("button", { name: "Clusters" }).click();
+  await expect(graph.getByRole("button", { name: "Clusters" })).toHaveAttribute("aria-pressed", "true");
+  await expect(graph.getByRole("button", { name: "Layers" })).toHaveAttribute("aria-pressed", "false");
+  const callsAfter = await page.evaluate(
+    () => (window as unknown as { __fullGraphCalls?: number }).__fullGraphCalls ?? 0,
+  );
+  expect(callsAfter).toBe(callsBefore); // NO re-fetch on a mode toggle
+
+  // The caption still reflects the same drawn graph.
+  await expect(graph.getByText(/3 items · 2 links/)).toBeVisible();
+  expect(consoleErrors).toEqual([]);
 });
