@@ -32,12 +32,37 @@ use tauri::Emitter;
 mod pipeline_commands;
 pub use pipeline_commands::*;
 
-/// Keychain account for the Anthropic API key (matches `summarize::ANTHROPIC_KEY_ACCOUNT`).
-const ANTHROPIC_KEY_ACCOUNT: &str = "anthropic_api_key";
+// macOS Reminders (osascript) — no name collision with a crate module.
+mod reminders;
+pub use reminders::*;
+
+// Model / capability / performance probes + NER download — no name collision with a crate module.
+mod model_perf;
+pub use model_perf::*;
+
+// Keychain secret setters/probes. Bound as `secrets_commands` to avoid colliding with the
+// crate-level `secrets` module (`use crate::{pipeline, secrets};` above).
+#[path = "secrets.rs"]
+mod secrets_commands;
+pub use secrets_commands::*;
+
+// MCP server-config commands. Bound as `mcp_commands` (via `#[path]`) to keep it clearly distinct
+// from the crate-level `mcp` module.
+#[path = "mcp.rs"]
+mod mcp_commands;
+pub use mcp_commands::*;
+
+// Egress-consent commands. Bound as `settings_commands` (via `#[path]`) to keep it clearly distinct
+// from the crate-level `settings` module.
+#[path = "settings.rs"]
+mod settings_commands;
+pub use settings_commands::*;
 
 /// Keychain account for the AI Gateway API key (matches `summarize::GATEWAY_KEY_ACCOUNT`).
-/// Strictly separate from `ANTHROPIC_KEY_ACCOUNT` — never a fallback to the Anthropic key (R3).
-const GATEWAY_KEY_ACCOUNT: &str = "gateway_api_key";
+/// Strictly separate from `ANTHROPIC_KEY_ACCOUNT` (defined in `commands/secrets.rs`) — never a
+/// fallback to the Anthropic key (R3). Kept here because the gateway model-listing helpers below
+/// reference it; `commands/secrets.rs` reaches it via `super::GATEWAY_KEY_ACCOUNT`.
+pub(crate) const GATEWAY_KEY_ACCOUNT: &str = "gateway_api_key";
 
 // ── IPC DTOs (camelCase mirrors of PHASE0-PLAN §6) ──
 
@@ -6025,114 +6050,6 @@ pub fn patch_note_tasks(
     })
 }
 
-/// Escape a string for embedding inside an AppleScript `"…"` literal: backslash + double-quote are
-/// escaped, and raw CR/LF are flattened to spaces (an AppleScript string literal cannot span lines).
-/// This is what stops the item text from breaking out of the quoted literal or injecting extra
-/// statements (`"`, `end tell`, …) into the osascript program.
-fn escape_applescript(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace(['\n', '\r'], " ")
-}
-
-/// Parse a strict ISO `YYYY-MM-DD` into `(year, month, day)`; `None` for anything else.
-fn parse_iso_ymd(s: &str) -> Option<(i32, u32, u32)> {
-    let s = s.trim();
-    let b = s.as_bytes();
-    if b.len() != 10 || b[4] != b'-' || b[7] != b'-' {
-        return None;
-    }
-    let y: i32 = s.get(0..4)?.parse().ok()?;
-    let m: u32 = s.get(5..7)?.parse().ok()?;
-    let d: u32 = s.get(8..10)?.parse().ok()?;
-    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
-        return None;
-    }
-    Some((y, m, d))
-}
-
-/// Build the osascript program that creates a Reminder named `name`. When `due_date` is a valid
-/// ISO `YYYY-MM-DD`, attach `remind me date`/`due date` (defaulted to 9am local) so the date
-/// actually lands in Reminders — previously the date was dropped. The name is
-/// `escape_applescript`-escaped so its text can never break out of the string literal. The date is
-/// built by setting `day` to 1 FIRST (so a year/month change can't overflow the current day-of-month),
-/// then year, then month, then the real day.
-pub(crate) fn build_reminder_script(name: &str, due_date: Option<&str>) -> String {
-    let esc = escape_applescript(name);
-    match due_date.and_then(parse_iso_ymd) {
-        Some((y, m, d)) => format!(
-            "set theDate to current date\n\
-             set day of theDate to 1\n\
-             set year of theDate to {y}\n\
-             set month of theDate to {m}\n\
-             set day of theDate to {d}\n\
-             set hours of theDate to 9\n\
-             set minutes of theDate to 0\n\
-             set seconds of theDate to 0\n\
-             tell application \"Reminders\" to make new reminder with properties {{name:\"{esc}\", remind me date:theDate, due date:theDate}}"
-        ),
-        None => format!(
-            "tell application \"Reminders\" to make new reminder with properties {{name:\"{esc}\"}}"
-        ),
-    }
-}
-
-/// Add a macOS Reminder (via osascript) for an action item. A denied Reminders permission
-/// surfaces a clear, actionable error rather than crashing the UI. When the item carries an ISO
-/// due date, it is set as the reminder's due/remind date (best-effort; verify on a real Mac).
-#[tauri::command]
-pub async fn add_reminder(text: String, due_date: Option<String>) -> Result<(), AppError> {
-    let name = text.trim().to_string();
-    if name.is_empty() {
-        return Err(AppError::InvalidArg("empty reminder".into()));
-    }
-    let due = due_date.as_deref().filter(|d| !d.is_empty());
-    let script = build_reminder_script(&name, due);
-    let out = tokio::task::spawn_blocking(move || {
-        std::process::Command::new("osascript")
-            .arg("-e")
-            .arg(&script)
-            .output()
-    })
-    .await
-    .map_err(|e| AppError::Unavailable(format!("reminder task failed: {e}")))?
-    .map_err(|e| AppError::Unavailable(format!("osascript failed: {e}")))?;
-    if out.status.success() {
-        Ok(())
-    } else {
-        Err(AppError::Unavailable(format!(
-            "Could not add to Reminders — grant access in System Settings ▸ Privacy & Security ▸ Reminders. ({})",
-            String::from_utf8_lossy(&out.stderr).trim()
-        )))
-    }
-}
-
-/// SYNCHRONOUS reminder creation for the off-thread voice-action dispatch (Flow B). Mirrors the
-/// `add_reminder` command's osascript path, but blocking (it already runs on a detached task, so it
-/// must not require an async runtime). Returns `Ok(())` on success, a typed `AppError` otherwise —
-/// NEVER panics. NO PII logged by the caller; the reminder text is the user's own dictated note.
-pub(crate) fn add_reminder_blocking(text: &str, due_date: Option<&str>) -> Result<(), AppError> {
-    let name = text.trim();
-    if name.is_empty() {
-        return Err(AppError::InvalidArg("empty reminder".into()));
-    }
-    let due = due_date.filter(|d| !d.is_empty());
-    let script = build_reminder_script(name, due);
-    let out = std::process::Command::new("osascript")
-        .arg("-e")
-        .arg(&script)
-        .output()
-        .map_err(|e| AppError::Unavailable(format!("osascript failed: {e}")))?;
-    if out.status.success() {
-        Ok(())
-    } else {
-        Err(AppError::Unavailable(format!(
-            "Could not add to Reminders — grant access in System Settings ▸ Privacy & Security ▸ Reminders. ({})",
-            String::from_utf8_lossy(&out.stderr).trim()
-        )))
-    }
-}
-
 /// Pin a meeting moment: append a timestamped ^block-ref to the note (DB + vault file) and
 /// return an obsidian:// deep link to the note.
 #[tauri::command]
@@ -10255,101 +10172,9 @@ pub fn dismiss_brief(state: State<'_, AppState>, run_id: String) -> Result<(), A
 }
 
 // ── Brain v2 L5 — MCP server config (list/add/remove + per-server consent + test) ───────────────
-
-/// All configured MCP servers (connection config only).
-#[tauri::command]
-pub fn list_mcp_servers(
-    state: State<'_, AppState>,
-) -> Result<Vec<crate::storage::models::McpServer>, AppError> {
-    state.db.list_mcp_servers()
-}
-
-/// Add one MCP server. `transport` is `"http"` (a JSON-RPC endpoint URL) or `"stdio"` (a LOCAL
-/// PROCESS — `endpoint` must be an ABSOLUTE path).
-///
-/// ⚠️ stdio WARNING (surface this in the FE add-server flow): a stdio MCP server is ARBITRARY
-/// CODE EXECUTION — Murmur launches that binary with your user's permissions every time the brain
-/// queries it. Only add binaries you trust and control; the absolute-path requirement prevents
-/// $PATH hijacking but does NOT make an untrusted binary safe. The server stays fail-closed
-/// (absent from the brain's tools) until `consent_to_mcp_server` is granted.
-#[tauri::command]
-pub fn add_mcp_server(
-    state: State<'_, AppState>,
-    label: String,
-    transport: String,
-    endpoint: String,
-    args: Option<Vec<String>>,
-) -> Result<crate::storage::models::McpServer, AppError> {
-    let label = label.trim().to_string();
-    if label.is_empty() {
-        return Err(AppError::InvalidArg("server label is empty".into()));
-    }
-    let endpoint = endpoint.trim().to_string();
-    match transport.as_str() {
-        "http" => {
-            if !(endpoint.starts_with("http://") || endpoint.starts_with("https://")) {
-                return Err(AppError::InvalidArg(
-                    "an http MCP server needs an http(s):// endpoint URL".into(),
-                ));
-            }
-        }
-        "stdio" => {
-            // ABSOLUTE-PATH-ONLY (defense-in-depth against $PATH hijacking; re-checked at spawn).
-            if !std::path::Path::new(&endpoint).is_absolute() {
-                return Err(AppError::InvalidArg(
-                    "a stdio MCP server command must be an ABSOLUTE path".into(),
-                ));
-            }
-        }
-        _ => {
-            return Err(AppError::InvalidArg(
-                "transport must be \"http\" or \"stdio\"".into(),
-            ))
-        }
-    }
-    let server = crate::storage::models::McpServer {
-        // Hyphen-free id so it embeds cleanly in the `mcp_<id>_query` tool name.
-        id: uuid::Uuid::new_v4().simple().to_string(),
-        label,
-        transport,
-        endpoint,
-        args: args.unwrap_or_default(),
-        enabled: true,
-        consented: false, // fail-closed until the dedicated consent command flips it.
-        created_at: chrono::Utc::now().to_rfc3339(),
-    };
-    state.db.insert_mcp_server(&server)?;
-    Ok(server)
-}
-
-/// Remove one MCP server (its tool disappears from the brain on the next spec build).
-#[tauri::command]
-pub fn remove_mcp_server(state: State<'_, AppState>, server_id: String) -> Result<(), AppError> {
-    state.db.delete_mcp_server(&server_id)
-}
-
-/// Grant the ONE-TIME per-server egress consent for an MCP server. Mirrors
-/// `consent_to_web_search`: the dedicated command is the ONLY writer that can flip consent ON.
-#[tauri::command]
-pub fn consent_to_mcp_server(
-    state: State<'_, AppState>,
-    server_id: String,
-) -> Result<(), AppError> {
-    if state.db.get_mcp_server(&server_id)?.is_none() {
-        return Err(AppError::InvalidArg(format!("no MCP server {server_id}")));
-    }
-    state.db.set_mcp_server_consented(&server_id, true)
-}
-
-/// Revoke an MCP server's egress consent — it drops out of the connector registry and the brain's
-/// tool list on the next build (fail-closed).
-#[tauri::command]
-pub fn revoke_mcp_consent(
-    state: State<'_, AppState>,
-    server_id: String,
-) -> Result<(), AppError> {
-    state.db.set_mcp_server_consented(&server_id, false)
-}
+//
+// The list/add/remove + per-server consent commands were extracted verbatim to `commands/mcp.rs`
+// (a NON-content-gated config domain); `test_mcp_server` (the async connectivity probe) stays here.
 
 /// TEST a configured MCP server: JSON-RPC `initialize` + `tools/list`, returning the discovered
 /// tool COUNT (never the tool metadata — server-supplied descriptions are untrusted input and stay
@@ -10694,121 +10519,6 @@ pub(crate) fn save_config_inner(state: &AppState, config: AppConfigDto) -> Resul
     new_config.save(&state.db)?;
     *cache = new_config;
     Ok(())
-}
-
-/// E10 — grant the one-time cloud-egress consent. This is the ONLY supported way to flip
-/// `cloud_egress_consented` true: it persists the flag AND updates the in-memory config cache, so
-/// the next `make_provider(claude_code|anthropic)` is allowed to build. Idempotent.
-///
-/// The FE calls this from its first-cloud-send confirmation dialog. Until the user confirms, every
-/// cloud summarize/chat returns `AppError::Unavailable("cloud egress not consented …")`, which the
-/// FE detects and surfaces as the consent prompt.
-#[tauri::command]
-pub fn consent_to_cloud_egress(state: State<'_, AppState>) -> Result<(), AppError> {
-    let mut cache = state
-        .config
-        .lock()
-        .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
-    cache.grant_cloud_egress_consent(&state.db)?;
-    Ok(())
-}
-
-/// E10 — REVOKE the cloud-egress consent (the AI-settings privacy strip). Mirror of
-/// [`consent_to_cloud_egress`] and the ONLY supported way to flip `cloud_egress_consented` false:
-/// it persists the flag AND updates the in-memory config cache, so the NEXT
-/// `make_provider(claude_code|anthropic|gateway)` / cloud-reasoner call is refused fail-closed
-/// (`AppError::Unavailable`) — the gate re-reads the live config per call, no restart needed.
-/// Idempotent; a settings save can still neither grant nor revoke (the DTO stays preserve-only).
-#[tauri::command]
-pub fn revoke_cloud_egress(state: State<'_, AppState>) -> Result<(), AppError> {
-    let mut cache = state
-        .config
-        .lock()
-        .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
-    cache.revoke_cloud_egress(&state.db)?;
-    Ok(())
-}
-
-/// brain2 connectors — grant the one-time WEB SEARCH egress consent. The web connector reaches an
-/// EXTERNAL service (a NEW EGRESS CLASS): the redacted query leaves the device. This is the ONLY
-/// supported way to flip `web_search_consented` true; it persists the flag AND updates the in-memory
-/// config cache, so the next `ConnectorRegistry::build` exposes the web tool (provided web search is
-/// also enabled and a key is stored). Idempotent. Until granted, the web connector is absent from the
-/// brain's tool registry and the redacted query never leaves the device.
-#[tauri::command]
-pub fn consent_to_web_search(state: State<'_, AppState>) -> Result<(), AppError> {
-    let mut cache = state
-        .config
-        .lock()
-        .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
-    cache.grant_web_search_consent(&state.db)?;
-    Ok(())
-}
-
-/// One-time Jira egress consent — the ONLY way `jira_consented` flips true. Persists the flag AND
-/// updates the in-memory config cache, so the next `ConnectorRegistry::build` exposes the jira tool
-/// (provided Jira is also enabled + configured + a token is stored). Idempotent.
-#[tauri::command]
-pub fn consent_to_jira(state: State<'_, AppState>) -> Result<(), AppError> {
-    let mut cache = state
-        .config
-        .lock()
-        .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
-    cache.grant_jira_consent(&state.db)?;
-    Ok(())
-}
-
-/// Store/replace the BYO Jira API token in the Keychain (account "jira_api_token"). An empty input
-/// clears it. NEVER logged, NEVER returned to the FE — only `has_*` reports presence.
-#[tauri::command]
-pub fn set_jira_token(key: String) -> Result<(), AppError> {
-    if key.trim().is_empty() {
-        return secrets::delete_secret(crate::connectors::jira::JIRA_TOKEN_ACCOUNT);
-    }
-    secrets::set_secret(crate::connectors::jira::JIRA_TOKEN_ACCOUNT, key.trim())
-}
-
-/// Whether a Jira token is currently stored (UI shows "set"/"not set"; never the value).
-#[tauri::command]
-pub fn has_jira_token() -> Result<bool, AppError> {
-    Ok(
-        secrets::get_secret(crate::connectors::jira::JIRA_TOKEN_ACCOUNT)?
-            .filter(|k| !k.trim().is_empty())
-            .is_some(),
-    )
-}
-
-/// One-time Slack egress consent — the ONLY way `slack_consented` flips true. Persists the flag AND
-/// updates the in-memory config cache, so the next `ConnectorRegistry::build` exposes the slack tool
-/// (provided Slack is also enabled + a token is stored). Idempotent.
-#[tauri::command]
-pub fn consent_to_slack(state: State<'_, AppState>) -> Result<(), AppError> {
-    let mut cache = state
-        .config
-        .lock()
-        .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
-    cache.grant_slack_consent(&state.db)?;
-    Ok(())
-}
-
-/// Store/replace the BYO Slack user token in the Keychain (account "slack_user_token"). An empty
-/// input clears it. NEVER logged, NEVER returned to the FE — only `has_*` reports presence.
-#[tauri::command]
-pub fn set_slack_token(key: String) -> Result<(), AppError> {
-    if key.trim().is_empty() {
-        return secrets::delete_secret(crate::connectors::slack::SLACK_TOKEN_ACCOUNT);
-    }
-    secrets::set_secret(crate::connectors::slack::SLACK_TOKEN_ACCOUNT, key.trim())
-}
-
-/// Whether a Slack token is currently stored (UI shows "set"/"not set"; never the value).
-#[tauri::command]
-pub fn has_slack_token() -> Result<bool, AppError> {
-    Ok(
-        secrets::get_secret(crate::connectors::slack::SLACK_TOKEN_ACCOUNT)?
-            .filter(|k| !k.trim().is_empty())
-            .is_some(),
-    )
 }
 
 fn config_to_dto(c: &AppConfig) -> AppConfigDto {
@@ -11250,52 +10960,6 @@ pub fn output_is_builtin_speakers() -> Result<Option<bool>, AppError> {
     Ok(crate::audio::output::default_output_is_builtin_speakers())
 }
 
-/// Store/replace the Anthropic API key in Keychain (account "anthropic_api_key").
-#[tauri::command]
-pub fn set_anthropic_key(key: String) -> Result<(), AppError> {
-    if key.trim().is_empty() {
-        // Empty input clears the stored key.
-        return secrets::delete_secret(ANTHROPIC_KEY_ACCOUNT);
-    }
-    secrets::set_secret(ANTHROPIC_KEY_ACCOUNT, &key)
-}
-
-/// Whether an Anthropic key is currently stored (UI shows "set"/"not set"; never the value).
-#[tauri::command]
-pub fn has_anthropic_key() -> Result<bool, AppError> {
-    Ok(secrets::get_secret(ANTHROPIC_KEY_ACCOUNT)?.is_some())
-}
-
-/// Store/replace the AI Gateway API key in Keychain (account "gateway_api_key").
-/// An empty/blank key is rejected — call `clear_gateway_key` to remove an existing key.
-/// The key is NEVER logged and NEVER returned to the FE — only `has_gateway_key` reports presence.
-/// Uses a SEPARATE keychain account from the Anthropic key (R3 — no cross-provider fallback).
-#[tauri::command]
-pub fn set_gateway_key(key: String) -> Result<(), AppError> {
-    if key.trim().is_empty() {
-        return Err(AppError::InvalidArg(
-            "gateway API key must not be empty; use clear_gateway_key to remove an existing key"
-                .into(),
-        ));
-    }
-    secrets::set_secret(GATEWAY_KEY_ACCOUNT, key.trim())
-}
-
-/// Whether an AI Gateway key is currently stored (UI shows "set"/"not set"; never the value).
-#[tauri::command]
-pub fn has_gateway_key() -> Result<bool, AppError> {
-    Ok(secrets::get_secret(GATEWAY_KEY_ACCOUNT)?
-        .filter(|k| !k.trim().is_empty())
-        .is_some())
-}
-
-/// Remove the stored AI Gateway API key from the Keychain.
-/// Idempotent — no error if no key is stored. Mirrors `set_anthropic_key("")` semantics.
-#[tauri::command]
-pub fn clear_gateway_key() -> Result<(), AppError> {
-    secrets::delete_secret(GATEWAY_KEY_ACCOUNT)
-}
-
 /// DTO for a single model returned by `list_gateway_models`.
 ///
 /// Shape: `{ "id": "gpt-4o" }` (camelCase). The FE populates the model picker from this.
@@ -11600,27 +11264,6 @@ pub fn get_egress_ledger(
             })
             .collect(),
     })
-}
-
-/// Store/replace the BYO web-search (Brave) API key in the Keychain (account "web_search_api_key").
-/// An empty input clears it. The key is NEVER logged and NEVER returned to the FE — only `has_*`
-/// reports presence. Mirrors `set_anthropic_key`.
-#[tauri::command]
-pub fn set_web_search_api_key(key: String) -> Result<(), AppError> {
-    if key.trim().is_empty() {
-        return secrets::delete_secret(crate::connectors::web::WEB_SEARCH_KEY_ACCOUNT);
-    }
-    secrets::set_secret(crate::connectors::web::WEB_SEARCH_KEY_ACCOUNT, key.trim())
-}
-
-/// Whether a web-search API key is currently stored (UI shows "set"/"not set"; never the value).
-#[tauri::command]
-pub fn has_web_search_key() -> Result<bool, AppError> {
-    Ok(
-        secrets::get_secret(crate::connectors::web::WEB_SEARCH_KEY_ACCOUNT)?
-            .filter(|k| !k.trim().is_empty())
-            .is_some(),
-    )
 }
 
 /// availability() fan-out across all three providers for the Settings UI.
@@ -12209,26 +11852,6 @@ pub fn get_timeline(
     Ok(MeetingTimeline::default())
 }
 
-/// Would generating THIS install's timeline load a residency-bound on-device model? True when the
-/// resolved Notes-role provider is on-device (local GGUF / Ollama / Apple FM) — the residency-bound
-/// engines whose synchronous multi-GB load on a passive Audio-tab open OOM-beachballed the Mac. The
-/// FE uses this to decide: auto-generate for CLOUD (cheap), or hide generation behind an explicit
-/// "Generate timeline" click for on-device (never a surprise heavy load). Cheap: config read only.
-#[tauri::command]
-pub fn timeline_generation_on_device(state: State<'_, AppState>) -> Result<bool, AppError> {
-    let config = {
-        let c = state
-            .config
-            .lock()
-            .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
-        c.clone()
-    };
-    let target = crate::summarize::roles::resolve(crate::summarize::roles::Role::Notes, &config);
-    Ok(crate::summarize::timeline::is_on_device_provider(
-        &target.connection,
-    ))
-}
-
 /// EXPLICIT timeline generation — the HEAVY path split out of `get_timeline`. Runs the Notes-role
 /// provider over the (decimated, for on-device) transcript to derive the speaker/topic map, caches
 /// it, and returns it. For an on-device provider this loads a multi-GB model, so it is only ever
@@ -12374,25 +11997,6 @@ fn masked_detail(meeting: Meeting) -> MeetingDetailDto {
     }
 }
 
-/// Whether a usable Whisper model is present for the chosen size + language (or the
-/// explicit configured path). Lets the UI auto-detect + offer a download when missing.
-#[tauri::command]
-pub fn model_present(state: State<'_, AppState>) -> Result<bool, AppError> {
-    let (configured, size, language) = {
-        let c = state
-            .config
-            .lock()
-            .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
-        (
-            c.whisper_model_path.clone(),
-            c.model_size.clone(),
-            c.language.clone().unwrap_or_default(),
-        )
-    };
-    let p = configured.as_deref().map(std::path::Path::new);
-    Ok(crate::transcribe::resolve_model_path(p, &size, &language)?.is_some())
-}
-
 /// Download the Whisper model matching the chosen size + language (multilingual unless
 /// English is selected) from the whisper.cpp HuggingFace mirror into the app models dir if
 /// missing; returns its path. No-op (returns the existing path) when already present. Emits
@@ -12488,225 +12092,12 @@ pub async fn download_parakeet_models(app: AppHandle) -> Result<(), AppError> {
     Ok(())
 }
 
-/// Whether a usable on-device brain (reasoning GGUF) is present at the resolved path — the
-/// configured custom `brain_model_path`, else the selected `brain_model_id`'s file in the shared
-/// models dir. Lets the UI offer a download. Purely a file-on-disk check (mistralrs is always
-/// compiled; the real brain activates on model presence).
-#[tauri::command]
-pub fn brain_model_present(state: State<'_, AppState>) -> Result<bool, AppError> {
-    let (configured, selected) = {
-        let c = state
-            .config
-            .lock()
-            .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
-        (c.brain_model_path.clone(), c.brain_model_id.clone())
-    };
-    let p = configured.as_deref().map(std::path::Path::new);
-    Ok(crate::reason::resolve_brain_model(p, selected.as_deref())?.is_some())
-}
-
-/// macOS total physical RAM in whole GB via `sysctl -n hw.memsize` (no new FFI/crate). Returns
-/// `None` on any error — the caller then treats every model as fitting rather than HIDING it behind
-/// a failed probe.
-fn total_ram_gb() -> Option<u64> {
-    let out = std::process::Command::new("sysctl")
-        .arg("-n")
-        .arg("hw.memsize")
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let bytes: u64 = String::from_utf8(out.stdout).ok()?.trim().parse().ok()?;
-    Some(bytes / (1024 * 1024 * 1024))
-}
-
-/// The curated on-device brain model registry, each row carrying the picker flags `downloaded`
-/// (file present in the shared models dir), `fits_ram` (min RAM within the machine's total RAM —
-/// `true` when total RAM can't be read), and `selected` (the persisted `brain_model_id`). Feeds the
-/// Phase-H model picker. No content read / no egress — static metadata + on-disk existence only.
-#[tauri::command]
-pub fn list_brain_models(
-    state: State<'_, AppState>,
-) -> Result<Vec<crate::reason::BrainModelDto>, AppError> {
-    let (selected, light, heavy) = {
-        let c = state
-            .config
-            .lock()
-            .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
-        (
-            c.brain_model_id.clone(),
-            c.brain_light_model_id.clone(),
-            c.brain_heavy_model_id.clone(),
-        )
-    };
-    let dir = crate::transcribe::models_dir()?;
-    Ok(crate::reason::brain_model_dtos(
-        &dir,
-        total_ram_gb(),
-        selected.as_deref(),
-        light.as_deref(),
-        heavy.as_deref(),
-    ))
-}
-
-/// The installed-base migration nudge: `Some` when the persisted `brain_model_id` points at a RETIRED
-/// model (e.g. the non-commercial `qwen2.5-3b`), telling the FE to offer the Apache-licensed
-/// replacement. `None` for an active/absent selection. Read-only capability probe (no content, no
-/// egress) — like [`brain_model_present`]. The retired GGUF keeps working until the user switches;
-/// nothing is changed silently.
-#[tauri::command]
-pub fn brain_model_retirement_nudge(
-    state: State<'_, AppState>,
-) -> Result<Option<crate::reason::RetiredModelNudge>, AppError> {
-    let selected = {
-        let c = state
-            .config
-            .lock()
-            .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
-        c.brain_model_id.clone()
-    };
-    let dir = crate::transcribe::models_dir()?;
-    Ok(crate::reason::retired_model_nudge(
-        selected.as_deref(),
-        &dir,
-    ))
-}
-
-/// The DERIVED Murmur Brain posture (spec §2.1) for the Settings display — computed from the live
-/// config (resolved role targets + `brain_live`), NEVER stored. `custom` when the dispatch keys match
-/// no preset, so the label can never lie about egress. Read-only capability probe (no content).
-#[tauri::command]
-pub fn brain_posture(state: State<'_, AppState>) -> Result<crate::settings::Posture, AppError> {
-    let c = state
-        .config
-        .lock()
-        .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
-    Ok(crate::settings::postures::derive_posture(&c))
-}
-
-/// Apply a Murmur Brain posture PRESET (`cloud` / `hybrid` / `fully_local`) and persist it. `custom`
-/// is a derived-only label and is rejected (`InvalidArg`). This is the SINGLE writer of the posture
-/// presets — the raw settings save preserves `brain_live` + the posture role keys (see
-/// `dto_to_config`), so a partial save can never change the posture. The Hybrid preset deliberately
-/// leaves `role_live_*` untouched (the @brain assistant stays intact).
-#[tauri::command]
-pub fn set_brain_posture(state: State<'_, AppState>, posture: String) -> Result<(), AppError> {
-    let p = crate::settings::Posture::from_settable(&posture)
-        .ok_or_else(|| AppError::InvalidArg(format!("not a settable posture: {posture}")))?;
-    let mut c = state
-        .config
-        .lock()
-        .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
-    crate::settings::postures::apply_posture(&mut c, p);
-    c.save(&state.db)?;
-    Ok(())
-}
-
-/// The RESOLVED "what runs where" map for the Settings AI page — one row per AI job with its
-/// resolved engine/model/locality (mirrors `roles::resolve`; display-only, steers nothing).
-/// Read-only config projection: no content, no PII, no keys — NOT a gated content read.
-#[tauri::command]
-pub fn resolved_ai_map(
-    state: State<'_, AppState>,
-) -> Result<Vec<crate::settings::ai_map::AiMapRow>, AppError> {
-    let c = state
-        .config
-        .lock()
-        .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
-    Ok(crate::settings::ai_map::ai_map_rows(&c))
-}
-
-/// Whether the machine has enough RAM to run Realtime Reactions (the light engine) alongside a live
-/// recording — the combined-residency guard (spec §3.3), including a KV estimate + call-overhead. Lets
-/// the Brain Live card warn / gate before enabling. `true` when total RAM can't be read (never block
-/// behind a failed probe). Read-only capability probe.
-#[tauri::command]
-pub fn brain_live_ram_ok() -> Result<bool, AppError> {
-    let light = crate::reason::default_model_for_class(crate::reason::ModelClass::Light);
-    let models: Vec<&crate::reason::BrainModel> = light.into_iter().collect();
-    Ok(crate::reason::residency_fits(
-        &models,
-        total_ram_gb(),
-        crate::reason::CALL_OVERHEAD_GB,
-    ))
-}
-
-/// The Realtime-Reactions SHADOW counter (spec §4.2): how many contradiction cards WOULD have fired
-/// this recording while the sub-toggle is OFF. Lets the FE offer "the brain would have flagged N —
-/// enable?" (user-local calibration, no telemetry). Read-only; resets each `start_recording`.
-#[tauri::command]
-pub fn brain_reactions_shadow_count(state: State<'_, AppState>) -> Result<u64, AppError> {
-    Ok(state
-        .reactions_shadow_count
-        .load(std::sync::atomic::Ordering::Relaxed))
-}
-
-/// Flip the Realtime-Reactions CONTRADICTION-card sub-toggle (spec §4.2). Default OFF (shadow mode);
-/// the FE offers this only once the user's OWN shadow count clears a bar. Dedicated command (not the
-/// raw settings save, which preserves it) so a partial/older save can never silently enable ⚠ cards.
-#[tauri::command]
-pub fn set_brain_contradiction_cards(
-    state: State<'_, AppState>,
-    enabled: bool,
-) -> Result<(), AppError> {
-    let mut c = state
-        .config
-        .lock()
-        .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
-    c.brain_contradiction_cards = enabled;
-    c.save(&state.db)?;
-    Ok(())
-}
-
-/// Persist the user's SELECTED on-device brain model id. Validates `model_id` against the registry
-/// (unknown id ⇒ `AppError::InvalidArg`) and saves it to config; the reasoner dispatch
-/// (`ReasonerCell`) re-resolves per call, so the model takes effect on the next reasoning call
-/// once its GGUF is present — no restart. Does NOT download — the FE calls
-/// `download_brain_model(model_id)` for that.
-#[tauri::command]
-pub fn select_brain_model(state: State<'_, AppState>, model_id: String) -> Result<(), AppError> {
-    select_brain_model_inner(&state, model_id)
-}
-
-/// Testable core of [`select_brain_model`]: validate the id against the registry, persist it.
-fn select_brain_model_inner(state: &AppState, model_id: String) -> Result<(), AppError> {
-    let model = crate::reason::brain_model_by_id(&model_id)
-        .ok_or_else(|| AppError::InvalidArg(format!("unknown brain model id: {model_id}")))?;
-    let mut c = state
-        .config
-        .lock()
-        .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
-    // Keep the legacy single-model id (BrainBackend::Local + custom-path fallback) …
-    c.brain_model_id = Some(model_id.clone());
-    // … AND wire the CLASS handle so the Brain-Live `light()` / Fully-Local `heavy()` handles actually
-    // use what the user just selected. Without this, selecting a light model leaves `light()` pointing
-    // at the registry DEFAULT (a different, un-downloaded GGUF) → it silently resolves to the stub and
-    // Realtime Reactions never fire despite Brain Live being "on".
-    match model.class {
-        crate::reason::ModelClass::Light => c.brain_light_model_id = Some(model_id),
-        crate::reason::ModelClass::Heavy => c.brain_heavy_model_id = Some(model_id),
-    }
-    c.save(&state.db)?;
-    Ok(())
-}
-
 /// Download the on-device brain model identified by `model_id` (from the curated registry) into the
 /// shared models dir if missing; returns its path. No-op (returns the existing path) when already
 /// present. Unknown id ⇒ `AppError::InvalidArg`. INBOUND ONLY — fetches a model file and sends NO
 /// meeting content (no egress). Emits [`crate::events::EVENT_BRAIN_DOWNLOAD`] progress events
 /// (throttled). The downloaded file is NOT loaded here — wiring the brain is a later step.
-/// Resolve a registry `model_id` to its `(download url, on-disk dest)`. Unknown id ⇒
-/// `AppError::InvalidArg` (the rejection [`download_brain_model`] enforces). Testable sync core.
-fn brain_download_target(model_id: &str) -> Result<(&'static str, std::path::PathBuf), AppError> {
-    let model = crate::reason::brain_model_by_id(model_id)
-        .ok_or_else(|| AppError::InvalidArg(format!("unknown brain model id: {model_id}")))?;
-    Ok((
-        model.url,
-        crate::transcribe::models_dir()?.join(model.filename),
-    ))
-}
-
+/// (The registry-lookup core `brain_download_target` lives in `commands/model_perf.rs`.)
 #[tauri::command]
 pub async fn download_brain_model(app: AppHandle, model_id: String) -> Result<String, AppError> {
     let (url, dest) = brain_download_target(&model_id)?;
@@ -12746,111 +12137,6 @@ pub async fn download_brain_model(app: AppHandle, model_id: String) -> Result<St
         },
     );
     Ok(dest.to_string_lossy().to_string())
-}
-
-/// WS2 (EXPERIMENTAL) — availability of the on-device Apple Foundation Models sidecar
-/// (`meetnotes-afm`): is it bundled, and (if so) does its on-device model report available? Lets the
-/// FE offer the "Apple Intelligence (on-device)" brain option ONLY on macOS-26 Apple-Silicon
-/// hardware where the native sidecar is present — never advertise it elsewhere. On every current
-/// (non-macOS-26) build the sidecar is ABSENT, so this returns
-/// `{sidecar_present:false, model_available:None}`.
-///
-/// Opens NO content-read path (a device-capability probe only, like [`brain_model_present`]), so no
-/// `meeting_is_unlocked` / `visibility_clause` gate applies. NEVER panics, NEVER egresses (the probe
-/// is a local `--probe` spawn; a missing/wedged sidecar degrades gracefully).
-#[tauri::command]
-pub fn afm_available(app: AppHandle) -> Result<crate::reason::afm::AfmStatus, AppError> {
-    Ok(crate::reason::afm::probe(Some(&app)))
-}
-
-/// `true` when all three multilingual-e5-small files are present in the shared models dir's embed
-/// sub-dir — i.e. the REAL embedder would load (candle is always compiled; it activates on model
-/// presence). Cheap existence probe; NEVER errors on a missing models dir (treats it as "not present").
-#[tauri::command]
-pub fn embed_model_present() -> Result<bool, AppError> {
-    Ok(crate::embed::embed_model_present())
-}
-
-/// The bundled selectable embedders (multilingual-e5-small default + mmlw-retrieval-e5-small), each with
-/// `downloaded` (files present in its own subdir) and `selected` (mirrors the persisted
-/// `embed_model_id`). Feeds the embedder picker. No content read / no egress — static metadata +
-/// on-disk existence only.
-#[tauri::command]
-pub fn list_embed_models(
-    state: State<'_, AppState>,
-) -> Result<Vec<crate::embed::EmbedModelDto>, AppError> {
-    let selected = {
-        let c = state
-            .config
-            .lock()
-            .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
-        c.embed_model_id.clone()
-    };
-    Ok(crate::embed::embed_model_dtos(selected.as_deref()))
-}
-
-/// Result of [`select_embed_model`]. `reindex_needed` is `true` when the selection actually CHANGED
-/// the resolved model (so its old vectors are stale — a different model's embeddings are not
-/// comparable): the FE should prompt the user to run `reindex_embeddings` (and download the new
-/// model first via `download_embed_model` if `!embed_model_present()`). Counts/flags only — no PII.
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SelectEmbedModelResult {
-    pub selected: String,
-    pub reindex_needed: bool,
-    pub model_present: bool,
-}
-
-/// Persist the user's SELECTED on-device embedding model id. Validates `model_id` against the
-/// registry (unknown ⇒ `AppError::InvalidArg`) and saves it to config; `AppConfig::save` republishes
-/// the process-global selection so `embed::active_embedder`/`embed_model_present`/`download_embed_model`
-/// pick up the new model with NO restart. Switching the model INVALIDATES existing vectors (a
-/// different model's embeddings are not comparable), so `reindex_needed` is `true` when the resolved
-/// model actually changed — the FE then prompts the user to download (if missing) + re-index. All
-/// bundled options are BERT/384 ⇒ NO `vec0` schema migration. Does NOT download and does NOT auto-
-/// reindex (both are explicit user actions).
-#[tauri::command]
-pub fn select_embed_model(
-    state: State<'_, AppState>,
-    model_id: String,
-) -> Result<SelectEmbedModelResult, AppError> {
-    select_embed_model_inner(&state, model_id)
-}
-
-/// Testable core of [`select_embed_model`]: validate the id, compute whether the resolved model
-/// changed, persist it. No `AppHandle`, so it runs headless.
-fn select_embed_model_inner(
-    state: &AppState,
-    model_id: String,
-) -> Result<SelectEmbedModelResult, AppError> {
-    let model = crate::embed::embed_model_by_id(&model_id)
-        .ok_or_else(|| AppError::InvalidArg(format!("unknown embed model id: {model_id}")))?;
-
-    let mut c = state
-        .config
-        .lock()
-        .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
-
-    // The PREVIOUS resolved model id (None/empty/unknown ⇒ the default) — the re-index trigger keys
-    // on a real change of the resolved model, not merely a config-string write.
-    let prev_resolved = c
-        .embed_model_id
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .and_then(crate::embed::embed_model_by_id)
-        .map(|m| m.id)
-        .unwrap_or(crate::embed::DEFAULT_EMBED_MODEL_ID);
-    let reindex_needed = prev_resolved != model.id;
-
-    c.embed_model_id = Some(model.id.to_string());
-    c.save(&state.db)?; // republishes the process-global selection.
-    drop(c);
-
-    Ok(SelectEmbedModelResult {
-        selected: model.id.to_string(),
-        reindex_needed,
-        model_present: crate::embed::embed_model_present(),
-    })
 }
 
 /// Download the multilingual-e5-small model (3 HF files) into the shared models dir, INBOUND-ONLY,
@@ -13386,58 +12672,6 @@ pub(crate) fn backfill_missing_brain_indexes_capped(
         }
     }
     Ok((meetings, docs))
-}
-
-/// True iff the on-device PERSON-name NER model (Phase D) is present on disk. Pure existence probe;
-/// NEVER errors on a missing models dir (treats it as "not present"). When false, the redaction
-/// firewall uses the byte-identical NoopNameRedactor (candle NER is always compiled; it activates on
-/// model presence).
-#[tauri::command]
-pub fn ner_model_present() -> Result<bool, AppError> {
-    Ok(crate::summarize::redact::ner_model_present())
-}
-
-/// Download the multilingual mDeBERTa-v3 NER model (3 HF files) into the shared models dir,
-/// INBOUND-ONLY, emitting [`crate::events::EVENT_NER_DOWNLOAD`] progress (throttled per file). Sends
-/// NO meeting content (no egress). The downloaded model is NOT loaded here — it is picked up lazily by
-/// `summarize::redact::active_name_redactor` on the next cloud summarization (selected on model
-/// presence). Returns the model dir.
-#[tauri::command]
-pub async fn download_ner_model(app: AppHandle) -> Result<String, AppError> {
-    let file_count = crate::summarize::redact::NER_MODEL_FILES.len();
-    // Throttle progress to roughly every 2 MB so the model download doesn't flood the FE.
-    const EMIT_EVERY: u64 = 2 * 1024 * 1024;
-    let mut last_emit: u64 = 0;
-    let mut last_index: usize = usize::MAX;
-    let dir = crate::summarize::redact::download_ner_model(|file_index, downloaded, total| {
-        if file_index != last_index || downloaded - last_emit >= EMIT_EVERY {
-            last_index = file_index;
-            last_emit = downloaded;
-            let _ = app.emit(
-                crate::events::EVENT_NER_DOWNLOAD,
-                crate::events::NerDownloadPayload {
-                    file_index,
-                    file_count,
-                    downloaded,
-                    total,
-                    done: false,
-                },
-            );
-        }
-    })
-    .await?;
-
-    let _ = app.emit(
-        crate::events::EVENT_NER_DOWNLOAD,
-        crate::events::NerDownloadPayload {
-            file_index: file_count,
-            file_count,
-            downloaded: 0,
-            total: None,
-            done: true,
-        },
-    );
-    Ok(dir.to_string_lossy().to_string())
 }
 
 /// Show/hide the floating recorder bar window (also bound to the global ⌘⇧R shortcut).
@@ -37848,103 +37082,6 @@ fn resolve_owned_source(
         }));
     }
     Ok(None)
-}
-
-#[cfg(test)]
-mod reminder_script_tests {
-    use super::{build_reminder_script, escape_applescript, parse_iso_ymd};
-
-    #[test]
-    fn parses_strict_iso_only() {
-        assert_eq!(parse_iso_ymd("2026-07-01"), Some((2026, 7, 1)));
-        assert_eq!(parse_iso_ymd(" 2026-12-31 "), Some((2026, 12, 31)));
-        assert_eq!(parse_iso_ymd("2026-13-01"), None); // month out of range
-        assert_eq!(parse_iso_ymd("2026-07-32"), None); // day out of range
-        assert_eq!(parse_iso_ymd("2026/07/01"), None); // wrong separators
-        assert_eq!(parse_iso_ymd("26-07-01"), None); // not 4-digit year
-        assert_eq!(parse_iso_ymd(""), None);
-    }
-
-    #[test]
-    fn due_date_sets_the_date_properties() {
-        let s = build_reminder_script("Ship the deck", Some("2026-07-01"));
-        // The date is actually attached now (the bug was: only `name` was set).
-        assert!(s.contains("set year of theDate to 2026"));
-        assert!(s.contains("set month of theDate to 7"));
-        assert!(s.contains("set day of theDate to 1"));
-        assert!(s.contains("remind me date:theDate"));
-        assert!(s.contains("due date:theDate"));
-        assert!(s.contains("name:\"Ship the deck\""));
-        // `day` is reset to 1 BEFORE year/month so a month change can't overflow the day.
-        let reset = s.find("set day of theDate to 1").unwrap();
-        let yr = s.find("set year of theDate").unwrap();
-        assert!(
-            reset < yr,
-            "day must be reset to 1 before changing year/month"
-        );
-    }
-
-    #[test]
-    fn no_due_date_is_name_only() {
-        let s = build_reminder_script("Call Bob", None);
-        assert!(s.contains("name:\"Call Bob\""));
-        assert!(!s.contains("due date"));
-        assert!(!s.contains("theDate"));
-    }
-
-    #[test]
-    fn invalid_due_date_falls_back_to_name_only() {
-        let s = build_reminder_script("Task", Some("not-a-date"));
-        assert!(
-            !s.contains("due date"),
-            "an unparseable date must not produce date props"
-        );
-        assert!(s.contains("name:\"Task\""));
-    }
-
-    #[test]
-    fn item_text_cannot_break_out_of_the_applescript_literal() {
-        // A name carrying a quote + a forged statement must stay INSIDE the string literal: the
-        // `"` is escaped to `\"`, so `end tell` / the injected `make` never become real statements.
-        let evil =
-            "pwn\", remind me date:theDate}\nend tell\ntell application \"Finder\" to delete";
-        let esc = escape_applescript(evil);
-        assert!(
-            !esc.contains('\n'),
-            "raw newlines flattened (literals can't span lines)"
-        );
-        // Every `"` in the payload is preceded by a backslash — no bare quote survives to close
-        // the literal early. (Checked by scanning: each `"` byte has a `\` immediately before it.)
-        let bytes = esc.as_bytes();
-        for (i, &b) in bytes.iter().enumerate() {
-            if b == b'"' {
-                assert!(
-                    i > 0 && bytes[i - 1] == b'\\',
-                    "unescaped quote survived at {i}"
-                );
-            }
-        }
-        let s = build_reminder_script(evil, Some("2026-07-01"));
-        // The ONE real `tell` statement (unescaped quotes around Reminders) is intact...
-        assert!(
-            s.contains("tell application \"Reminders\""),
-            "the real Reminders statement must survive"
-        );
-        // ...and the injected Finder `tell` never becomes real code: its quotes are escaped, so it
-        // stays as inert data inside the name literal (no `tell application "Finder"` with REAL quotes).
-        assert!(
-            !s.contains("tell application \"Finder\""),
-            "injected statement must remain escaped data, not executable code"
-        );
-        // The whole program is a single line (newlines in the payload were flattened), so a forged
-        // `end tell` can never start its own statement line.
-        assert!(
-            !s.lines().any(|l| l.trim() == "end tell"),
-            "no standalone injected `end tell` statement line"
-        );
-        // Every embedded double-quote from the payload is backslash-escaped in the program.
-        assert!(s.contains("\\\""), "payload quotes are escaped");
-    }
 }
 
 // ─── Task 1.4 — gateway key command argument validation ────────────────────────────────────────
