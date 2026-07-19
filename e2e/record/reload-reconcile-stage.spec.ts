@@ -39,7 +39,7 @@ test.describe("Record — webview (re)load reconciles the stage with the backend
 
     // WITHOUT clicking Start: the store's init() resync must adopt the
     // backend's in-flight recording.
-    await expect(page.locator(".rec-topline")).toBeVisible({
+    await expect(page.locator(".rec-topbar")).toBeVisible({
       timeout: 10_000,
     });
     await expect(page.locator("button.stop-btn")).toBeVisible();
@@ -81,6 +81,6 @@ test.describe("Record — webview (re)load reconciles the stage with the backend
     });
     await expect(page.getByText(/Transcribing on-device/i)).toHaveCount(0);
     await expect(page.locator("button.stop-btn")).toHaveCount(0);
-    await expect(page.locator(".rec-topline")).toHaveCount(0);
+    await expect(page.locator(".rec-topbar")).toHaveCount(0);
   });
 });

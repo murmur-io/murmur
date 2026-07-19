@@ -594,6 +594,7 @@
                       class="menu-item"
                       role="option"
                       [class.is-active]="i === slashIndex()"
+                      [class.is-ask]="item.id === 'askBrain'"
                       [attr.aria-selected]="i === slashIndex()"
                       (click)="pickSlash(item)"
                     >

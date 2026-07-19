@@ -248,6 +248,20 @@ export class RecordComponent implements OnInit {
   );
 
   /**
+   * BOUND the record surface to the viewport (fixed height → the note scrolls
+   * INTERNALLY, nothing spills past the window) whenever the note is the active
+   * writing surface: while recording AND while a pipeline runs with the companion
+   * note visible. EXCLUDES the "done" review state — that stacks the Brain-reveal /
+   * Re-Truth cards below the note and legitimately needs the page to scroll. Idle
+   * (no note surface) also stays unbounded (its short content just fills the calm
+   * min-height). Fixes the note overflowing off the bottom on smaller screens
+   * (2026-07-19).
+   */
+  readonly boundToViewport = computed(
+    () => this.showAssistant() && this.store.stage() !== "done",
+  );
+
+  /**
    * The processing status line. Prefer the backend's status message — it is
    * already a clean, properly-cased sentence ("Summarizing with Claude Code…",
    * "Writing note to vault…") — and fall back to a Title-cased stage word only
