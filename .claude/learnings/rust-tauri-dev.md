@@ -34,6 +34,30 @@
 - **Test loop = `cargo test --lib` from `src-tauri/`.** NEVER `cargo clippy --all-targets` in the
   loop (openssl/sqlcipher profile thrash → timeout; also blocked by `block-bash.sh`). Full gate =
   `scripts/ci.sh`, run ONCE at the end. Let a slow cold ML build finish; don't bail.
+- **ONE `cargo` process machine-wide, ever — concurrency FREEZES the Mac.** The app test binary
+  statically links the ML tree (candle/whisper/onnx); several concurrent `cargo test --lib` links
+  (multiple agents + your own runs) pin the macOS memory compressor → the whole UI freezes (swap
+  stays 0 — it's compression). Iterate with TARGETED filters (`cargo test --lib links` = full
+  compile + subset run, catches build errors, low RAM), NEVER the full 1900-test suite locally; let
+  CI run the full gate. `CARGO_BUILD_JOBS=2 … -j2`. Root cause + the `[profile.dev.package."*"]
+  debug=false` fix: `docs/research/2026-07-18-build-ram-freeze.md`.
+- **`cargo clippy --lib -- -D warnings` before EVERY push — the cheap CI-parity gate.** Link-free
+  (typecheck only → low RAM, ~10-15s warm). Catches the `dead_code` class that BOTH `cargo test
+  --lib` and `cargo clippy --lib --tests` mask: a `const`/`fn` used ONLY in a `#[cfg(test)]` module
+  is "never used" in the lib-only build CI runs, but the test build sees the test using it and stays
+  green (this ate a CI cycle — PR-2's `MCP_DEFAULT_WINDOW_CHARS`, whose feature was ALSO inert:
+  the dead-code error was the real "you wired it wrong" signal).
+- **Grep the diff for post-1.77 std items BEFORE pushing** (RAM-free): `git diff origin/murmur --
+  src-tauri | grep '^+' | grep -oE 'is_none_or|LazyLock|LazyCell|split_at_checked|take_if|next_multiple_of'`.
+  MSRV 1.77; `ci.sh` clippy `-D warnings` implies `-D clippy::incompatible_msrv` (cargo test does
+  not catch it). `is_none_or`(1.82)→`map_or(true, …)`; lazy statics→the `OnceLock` accessor idiom.
+- **A guard held across a callee that re-takes it = self-deadlock (invisible to green tests).**
+  `accept_link_inner` held the non-reentrant `lifecycle_guard` across `materialize_accepted_link →
+  update_note_inner` (which re-acquires it) → a valid Accept hung forever; every accept TEST hit
+  only refusal paths, none a SUCCESSFUL accept, so cargo test stayed green. When you take
+  `lifecycle_guard`, SCOPE it in a `{ }` block around only the gate+db-write and DROP it before any
+  materialize/note-write callee (the `link_items_inner`/`unlink_items_inner` idiom); and add a test
+  that drives the SUCCESS path, not just the error paths.
 
 ## Run journal
 <!-- Append-only, newest first. -->
