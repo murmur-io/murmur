@@ -2,18 +2,20 @@ import { test, expect } from "@playwright/test";
 import { mockNotes } from "./mock-invoke";
 
 /**
- * VERIFICATION (2026-07-19 IA consolidation) — the merged "Related" panel in the
- * note editor at /notes/n1, driven over mocked Tauri IPC. Asserts the six behaviors
- * the redesign promises:
- *  1. ONE "Related · N" section (no separate "Linked mentions" / "Connections").
+ * VERIFICATION (2026-07-19 IA consolidation + collapse/cross-dedup follow-up) — the
+ * merged "Related" panel in the note editor at /notes/n1, over mocked Tauri IPC:
+ *  1. COLLAPSED BY DEFAULT — a single "Related · N" affordance (Notion-style); the
+ *     chips appear only after expanding. N = related rows + (deduped) suggestions.
  *  2. A neighbour that is BOTH an inbound backlink AND an outbound edge shows ONCE.
- *  3. A body-inline [[wikilink]] neighbour is NOT re-chipped (item 4).
- *  4. A suggestion is an ambient dashed chip: tap promotes (acceptLink), hover ×
+ *  3. A body-inline [[wikilink]] neighbour is NOT re-chipped.
+ *  4. CROSS-DEDUP — a semantic suggestion whose neighbour is ALSO a Related row is
+ *     NOT shown as a suggestion (no item in both "Related" and "Suggested").
+ *  5. A suggestion is an ambient dashed chip: tap promotes (acceptLink), hover ×
  *     dismisses (dismissLink) — no % label, no Accept/Dismiss buttons.
- *  5. The header shows ≤5 top-level controls (Move / Edit-Preview seg / Ask / ⋯).
- *  6. Zero console/page errors.
+ *  6. The header shows ≤5 top-level controls (Move / Edit-Preview seg / Ask / ⋯).
+ *  7. Zero console/page errors.
  */
-test("merged Related panel: dedup, inline-suppress, ambient suggestions, slim header", async ({
+test("Related panel: collapse-by-default, dedup, cross-dedup, ambient suggestions, slim header", async ({
   page,
 }) => {
   const consoleErrors: string[] = [];
@@ -40,8 +42,10 @@ test("merged Related panel: dedup, inline-suppress, ambient suggestions, slim he
     }),
 
     // list_links: a companion edge, a manual link, a wikilink edge whose title is
-    // ALREADY inline (must be suppressed), and a wikilink edge that ALSO appears as
-    // a backlink below (must dedup to ONE chip), plus a semantic SUGGESTION.
+    // ALREADY inline (must be suppressed), a wikilink edge that ALSO appears as a
+    // backlink below (must dedup to ONE chip), a semantic SUGGESTION ("Design doc"),
+    // and a semantic suggestion for "Roadmap" — which is ALSO a manual Related row,
+    // so it must be CROSS-DEDUPED out of the suggestions.
     list_links: () => {
       const w = window as unknown as { __dismissed?: boolean; __accepted?: boolean };
       const rows = [
@@ -110,6 +114,21 @@ test("merged Related panel: dedup, inline-suppress, ambient suggestions, slim he
           createdAt: 5,
           manual: false,
         },
+        {
+          // CROSS-DEDUP FIXTURE: a semantic suggestion for "Roadmap" — but Roadmap is
+          // already a manual Related row (id 2), so this must NOT render as a suggestion.
+          id: 6,
+          direction: "in",
+          otherKind: "note",
+          otherId: "n-roadmap",
+          otherTitle: "Roadmap",
+          edgeType: "semantic",
+          createdBy: "auto",
+          status: "suggested",
+          score: 0.9,
+          createdAt: 6,
+          manual: false,
+        },
       ];
       let out = rows;
       if (w.__dismissed) out = out.filter((r) => r.id !== 5);
@@ -143,10 +162,20 @@ test("merged Related panel: dedup, inline-suppress, ambient suggestions, slim he
   const panel = page.locator("app-connections");
   await expect(panel).toBeVisible();
 
-  // (1) ONE "Related" section header (with a count), no old labels.
-  await expect(panel.locator(".cx-label--head")).toContainText("Related");
+  // (1) COLLAPSED BY DEFAULT — a single "Related · N" toggle; no chips yet.
+  // N = 4 related (Kickoff, Roadmap, Standup[dedup'd], Retro) + 1 suggestion
+  // (Design doc; Roadmap-suggestion cross-deduped away) = 5.
+  const collapsed = panel.locator(".cx-collapsed");
+  await expect(collapsed).toBeVisible();
+  await expect(collapsed).toContainText("Related");
+  await expect(collapsed.locator(".cx-count")).toHaveText("5");
+  await expect(panel.locator(".cx-group")).toHaveCount(0); // chips hidden while collapsed
   await expect(page.getByText("Linked mentions")).toHaveCount(0);
   await expect(page.getByText("Suggested connections")).toHaveCount(0);
+
+  // Expand the section.
+  await collapsed.click();
+  await expect(panel.locator(".cx-group").first()).toBeVisible();
 
   // (2) dedup — "Standup notes" is both an inbound backlink AND an outbound edge;
   // it renders exactly ONCE.
@@ -158,38 +187,42 @@ test("merged Related panel: dedup, inline-suppress, ambient suggestions, slim he
     panel.locator(".cx-chip").filter({ hasText: "Meeting 2026-07-17" }),
   ).toHaveCount(0);
 
+  // (4) CROSS-DEDUP — "Roadmap" is a manual Related row AND a semantic suggestion;
+  // it shows exactly ONCE, and NOT as a suggested chip.
+  await expect(panel.getByText("Roadmap", { exact: true })).toHaveCount(1);
+  await expect(
+    panel.locator(".cx-chip--suggested").filter({ hasText: "Roadmap" }),
+  ).toHaveCount(0);
+
   // The real relationships DO show: companion, manual, dedup'd backlink, mentions-only.
   await expect(panel.getByText("Kickoff", { exact: true })).toBeVisible();
   await expect(panel.getByText("Roadmap", { exact: true })).toBeVisible();
   await expect(panel.getByText("Retro", { exact: true })).toBeVisible();
 
-  // (4a) NO raw confidence % anywhere in the panel (the score chip is gone).
+  // (5a) NO raw confidence % anywhere; NO Accept/Dismiss buttons; the ONE surviving
+  // suggestion is a dashed chip for "Design doc".
   await expect(panel.getByText("86%")).toHaveCount(0);
   await expect(panel.locator(".cx-score")).toHaveCount(0);
-  // NO persistent Accept/Dismiss buttons.
   await expect(panel.getByRole("button", { name: "Accept" })).toHaveCount(0);
   await expect(panel.getByRole("button", { name: "Dismiss", exact: true })).toHaveCount(0);
-  // The suggestion IS a dashed chip.
+  await expect(panel.locator(".cx-chip--suggested")).toHaveCount(1);
   await expect(panel.locator(".cx-chip--suggested")).toContainText("Design doc");
 
-  // (5) slim header — count the top-level controls in `.editor-head` (before any
-  // menu opens): breadcrumb (Move), the Edit/Preview segmented control, Ask Brain,
-  // and the ⋯ trigger. Save-state is silent at rest. That is 4 (≤5).
+  // (6) slim header — breadcrumb (Move), Edit/Preview seg, Ask Brain, ⋯. 4 (≤5).
   const head = page.locator(".editor-head");
-  await expect(head.locator(".crumb-btn").first()).toBeVisible(); // breadcrumb/Move
-  await expect(head.locator(".head-seg")).toHaveCount(1); // Edit/Preview seg
-  await expect(head.locator(".head-chat-btn")).toHaveCount(1); // Ask Brain
-  await expect(head.locator(".head-more .crumb-btn")).toHaveCount(1); // ⋯
-  // Share is NOT a top-level header button anymore.
+  await expect(head.locator(".crumb-btn").first()).toBeVisible();
+  await expect(head.locator(".head-seg")).toHaveCount(1);
+  await expect(head.locator(".head-chat-btn")).toHaveCount(1);
+  await expect(head.locator(".head-more .crumb-btn")).toHaveCount(1);
   await expect(head.getByRole("button", { name: "Share" })).toHaveCount(0);
 
-  // Screenshot the collapsed Related section (dark scheme is the config default).
+  // Screenshot the expanded Related section (dark scheme is the config default).
   await panel.scrollIntoViewIfNeeded();
   await panel.screenshot({
     path: "/private/tmp/claude-501/-Users-jakubgawronski-Projects-meetnotes/d3db29b4-fbd3-49ac-868a-fd86a0c14a1f/scratchpad/related-panel.png",
   });
 
-  // (4b) promote a suggestion by TAPPING its chip body → acceptLink runs, the
+  // (5b) promote the suggestion by TAPPING its chip body → acceptLink runs, the
   // dashed chip becomes a real "Design doc" link and the suggestion group empties.
   await panel.locator(".cx-chip--suggested").click();
   await expect(panel.locator(".cx-chip--suggested")).toHaveCount(0);
