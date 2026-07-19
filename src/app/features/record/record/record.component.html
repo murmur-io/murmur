@@ -143,6 +143,18 @@
     </div>
   }
 
+  <!-- ── Brain reveal + Re-Truth — surfaced ABOVE the note (2026-07-19, user request):
+       once a meeting resolves, show the already-alive brain (people + open commitments)
+       and the facts this note supersedes at the TOP, beside the "Saved ✓ in Murmur"
+       strip — not buried below a full-height note. Gated on stage = done. ─────────── -->
+  @if (store.stage() === "done") {
+    <app-brain-reveal-card [active]="!!store.lastNote()" />
+    <app-re-truth-card
+      [active]="!!store.lastNote()"
+      [meetingId]="store.meetingId()"
+    />
+  }
+
   <!-- ── The notes + @brain threads surface — the full-height main view ── -->
   <!-- The main flow is the user's NOTES (persisted to manual_notes); the one
        composer splits a line by @brain (a plain note vs opening a thread). -->
@@ -285,20 +297,6 @@
         <span>{{ err }}</span>
       </div>
     }
-  }
-
-  <!-- ── Brain reveal — after the first note lands, surface the already-alive
-       shallow brain (people + open commitments) mapped on defaults. In-flow,
-       gated on a resolved note; one-time dismissible. ──────────────────── -->
-  @if (store.stage() === "done") {
-    <app-brain-reveal-card [active]="!!store.lastNote()" />
-    <!-- ── Re-Truth — the vault heals itself: surface the facts this meeting
-         supersedes from earlier notes; one tap appends a reversible
-         [!superseded] callout. In-flow, gated on the resolved note + its id. ── -->
-    <app-re-truth-card
-      [active]="!!store.lastNote()"
-      [meetingId]="store.meetingId()"
-    />
   }
 
   <!-- ── Minimal stats strip — hidden once the conversation thread is the
