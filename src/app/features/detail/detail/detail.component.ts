@@ -24,7 +24,6 @@ import { TabsService } from "../../../core/tabs.service";
 import type {
   AppConfigDto,
   AssistantInteraction,
-  BacklinkSource,
   ClaimAlignment,
   FolderNode,
   GraphPayload,
@@ -300,52 +299,9 @@ export class DetailComponent implements OnInit {
     return raw.map((i, idx) => this.parseInteraction(i, idx));
   });
 
-  // --- Note↔note backlinks ("Linked mentions") ----------------------------
-  /**
-   * The VISIBLE inbound sources (meetings + authored notes) that link/mention
-   * THIS meeting. Fed to the note panel's "Linked mentions" chip row. Empty
-   * while the meeting is locked/masked (the fetch is skipped there — never
-   * surface backlinks behind a lock) and until the first fetch resolves.
-   */
-  readonly backlinks = signal<BacklinkSource[]>([]);
-  /**
-   * Monotonic request token — a late `getBacklinks` reply for a superseded
-   * meeting (openRelated reuses this component) is dropped (stale-result guard,
-   * FE failure mode #4).
-   */
-  private backlinksSeq = 0;
-
-  /**
-   * Load this meeting's backlinks whenever the loaded meeting id changes, and
-   * SKIP the fetch entirely while it is locked/masked (`locked()` derives from
-   * the backend's masked DTO). A legitimate signal-writing effect (T1): async
-   * IPC keyed on inputs with a stale-result guard. A late reply for a meeting
-   * the user has since navigated away from is dropped by the seq check.
-   */
-  private readonly _loadBacklinks = effect(() => {
-    const id = this.detail()?.meeting.id ?? null;
-    const locked = this.locked();
-    const seq = ++this.backlinksSeq;
-    if (!id || locked) {
-      this.backlinks.set([]);
-      return;
-    }
-    void this.fetchBacklinks(id, seq);
-  });
-
-  private async fetchBacklinks(id: string, seq: number): Promise<void> {
-    try {
-      const rows = await this.ipc.getBacklinks("meeting", id);
-      if (seq !== this.backlinksSeq) {
-        return; // superseded by a newer meeting / lock transition
-      }
-      this.backlinks.set(Array.isArray(rows) ? rows : []);
-    } catch {
-      if (seq === this.backlinksSeq) {
-        this.backlinks.set([]);
-      }
-    }
-  }
+  // Note↔note backlinks are now fetched + merged inside the self-loading
+  // `app-connections` "Related" panel (with `kind="meeting"`), so the host no
+  // longer owns a separate backlinks fetch (IA consolidation, 2026-07-19).
 
   // --- Receipts (Brain v3 PR-5): claim → second-of-audio ------------------
   /**
