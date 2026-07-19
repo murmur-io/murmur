@@ -563,26 +563,25 @@
         );
     }
 
-    /// Stage 2 / Lane A happy path: over a FINISHED note in an OPEN folder, `link_related_notes_inner`
-    /// appends a `> [!related]-` block of `[[Title]]` links + TASK-FREE gists, persisted DB-canonical,
-    /// preserving the original body — and is idempotent (the block never stacks).
+    /// Stage 2 / Lane A is now a NO-OP: the machine `murmur:links` block was retired (it went stale +
+    /// rendered as raw junk in the editor; the RELATED panel reads the live `links` table instead). So
+    /// `link_related_notes_inner` over a FINISHED note in an OPEN folder must leave the note body
+    /// EXACTLY as it was — no `> [!related]-` block written. (Was RED before this change: the pass used
+    /// to append the block; now it writes nothing.)
     #[test]
-    fn link_related_notes_writes_related_block_in_open_folder() {
-        let state = build_state("lanea-open");
+    fn link_related_notes_writes_no_body_block() {
+        let state = build_state("lanea-noop");
         make_open_folder(&state.db, "f-open", "Project");
-        // The note we link FROM. Kept lean so the salient query is a subset of the related note's
-        // terms (FTS5 MATCH is implicit-AND — every query term must be present in the related note).
         seed_meeting(&state.db, "this", "Apollo migration.\n", Some("f-open"));
         state
             .db
             .set_meeting_title("this", "Apollo Migration")
             .unwrap();
-        // A related PRIOR note (open folder → visible) whose Summary is the ideal task-free gist and
-        // whose Action items must NEVER enter the link detail.
+        // A related PRIOR note the OLD pass WOULD have retrieved + rendered into the block.
         seed_meeting(
             &state.db,
             "prior",
-            "## Summary\n\nApollo migration groundwork and rollout roadmap.\n\n## Action items\n\n- [ ] SECRET-TASK\n",
+            "## Summary\n\nApollo migration groundwork and rollout roadmap.\n",
             Some("f-open"),
         );
         state
@@ -590,60 +589,34 @@
             .set_meeting_title("prior", "Apollo Kickoff")
             .unwrap();
 
-        link_related_notes_inner(&state, "this").unwrap();
-
-        let md = state
+        let before = state
             .db
             .get_latest_note_for_meeting("this")
             .unwrap()
             .unwrap()
             .markdown;
-        assert!(
-            md.contains("> [!related]- Related notes"),
-            "the Related block was written; got: {md}"
-        );
-        assert!(
-            md.contains("[[Apollo Kickoff]]"),
-            "the [[Title]] link is present; got: {md}"
-        );
-        assert!(
-            md.contains("(via Murmur)"),
-            "loud Murmur attribution; got: {md}"
-        );
-        assert!(
-            md.contains("groundwork and rollout"),
-            "the task-free gist prose is present; got: {md}"
-        );
-        assert!(
-            !md.contains("SECRET-TASK"),
-            "an action item must NEVER enter a link detail; got: {md}"
-        );
-        assert!(
-            md.starts_with("Apollo migration.\n"),
-            "the original note body is preserved verbatim; got: {md}"
-        );
-
-        // Idempotent: re-linking does not stack the block.
         link_related_notes_inner(&state, "this").unwrap();
-        let md2 = state
+        let after = state
             .db
             .get_latest_note_for_meeting("this")
             .unwrap()
             .unwrap()
             .markdown;
-        assert_eq!(
-            md2.matches("<!-- murmur:links -->").count(),
-            1,
-            "the links block never stacks on re-link"
+
+        assert_eq!(after, before, "Lane A is a no-op — the note body is unchanged");
+        assert!(
+            !after.contains("murmur:links"),
+            "no managed links block is written into the note body; got: {after}"
+        );
+        assert!(
+            !after.contains("> [!related]-"),
+            "no Related-notes callout is written; got: {after}"
         );
     }
 
-    /// SEAL-SAFETY (RED-before-GREEN, load-bearing): Lane A must NEVER write the transient `markdown`
-    /// column of a SEALED note — even when the session happens to have its folder unlocked (so the
-    /// `meeting_is_unlocked` read gate passes). Without the `content_blob` guard, Lane A would derive a
-    /// query from the title, retrieve a visible related note, and upsert plaintext links into the
-    /// blanked column — resurrecting content that would be lost on the next relock. The guard makes it
-    /// a no-op: the sealed column stays blank and `content_blob` stays intact.
+    /// SEAL-SAFETY: Lane A is a no-op AND never touches a SEALED note's transient `markdown` column
+    /// even when the session has its folder unlocked (so the `meeting_is_unlocked` read gate passes).
+    /// The sealed column stays blank and `content_blob` stays intact.
     #[test]
     fn link_related_notes_never_touches_a_sealed_note() {
         let state = build_state("lanea-sealsafe");
@@ -667,7 +640,7 @@
             .unwrap();
 
         // Seal the note (content_blob present, markdown blanked), lock the folder, and SESSION-UNLOCK it
-        // so the read gate passes and ONLY the seal-safety guard can stop the write.
+        // so the read gate passes.
         state
             .db
             .seal_note("sealed", "claude_code", &b"ciphertext-blob"[..])
@@ -762,42 +735,42 @@
         );
     }
 
-    /// A NOTE source creates a `manual` row AND materializes `[[Title]]` into the note body; after the
-    /// note's wikilinks are re-indexed, the pair shows as ONE deduped chip in `links_for_visible`.
+    /// A NOTE source creates a `manual` edge and writes NO note body (the `murmur:links` block was
+    /// retired). The link is GRAPH-ONLY: `links_for_visible` shows ONE manual chip, the source body is
+    /// byte-unchanged, and no machine block is injected. (RED before this change: `link_items` used to
+    /// materialize `[[Target Note]]` into the body.)
     #[test]
-    fn link_from_note_materializes_wikilink_and_dedupes() {
+    fn link_from_note_creates_edge_without_body_block() {
         let state = build_state("link-from-note");
         make_open_folder(&state.db, "f-open", "Project");
         seed_note_doc_cmd(&state.db, "src", "f-open", "Source Note", "original body\n");
         seed_note_doc_cmd(&state.db, "dst", "f-open", "Target Note", "target body");
 
+        let before = state.db.get_note_row("src").unwrap().unwrap().text;
         // Link note src → note dst.
         link_items_inner(&state, "note", "src", "note", "dst").unwrap();
 
         // A manual row exists...
         assert_eq!(manual_link_count(&state, "note", "src"), 1, "manual row created");
-        // ...and the source note body gained the [[Target Note]] marker (materialized).
+        // ...and the source note body is UNCHANGED — no [[Target Note]] / links block materialized.
         let body = state.db.get_note_row("src").unwrap().unwrap().text;
+        assert_eq!(body, before, "the note body is byte-unchanged (no materialize); got: {body}");
         assert!(
-            body.contains("[[Target Note]]"),
-            "the [[Title]] was materialized into the note body; got: {body}"
+            !body.contains("murmur:links") && !body.contains("[[Target Note]]"),
+            "no managed links block injected into the source note; got: {body}"
         );
-        assert!(
-            body.starts_with("original body\n"),
-            "the original body is preserved; got: {body}"
-        );
+        // No `wikilink` edge is derived either (the body block that produced it is gone).
+        assert_eq!(link_count_in(&state, "note", "src", "wikilink"), 0, "no derived wikilink edge");
 
-        // The materialize went through `update_note_doc_inner`, which re-indexes wikilinks — so a
-        // `wikilink` edge for the same pair now ALSO exists. The reader must collapse to ONE chip.
-        assert_eq!(link_count_in(&state, "note", "src", "wikilink"), 1, "wikilink edge also present");
+        // The manual edge is the visible chip (removable-manual), from the source side.
         let unlocked = unlocked_snapshot(&state).unwrap();
         let edges = state
             .db
             .links_for_visible(crate::links::LinkKind::Note, "src", &unlocked)
             .unwrap();
         let to_dst: Vec<_> = edges.iter().filter(|e| e.other_id == "dst").collect();
-        assert_eq!(to_dst.len(), 1, "manual + wikilink collapse to ONE chip");
-        assert!(to_dst[0].manual, "the collapsed chip is flagged removable-manual");
+        assert_eq!(to_dst.len(), 1, "exactly one chip for the pair");
+        assert!(to_dst[0].manual, "the chip is flagged removable-manual");
     }
 
     /// Helper mirroring db.rs `link_count` for the command-test module.
@@ -805,38 +778,44 @@
         state.db.link_edge_count(kind, id, edge_type)
     }
 
-    /// UNLINK removes the `manual` row and strips the materialized `[[Title]]` from the source note
-    /// body. The wikilink edge that the materialize produced is NOT deleted by unlink (only the manual
-    /// row is), but the strip removes the `[[Title]]`, so a follow-up re-index would drop the wikilink
-    /// too — here we assert the DIRECT contract: manual row gone + marker stripped.
+    /// UNLINK removes the `manual` row. A fresh link writes NO body marker (block retired), so unlink's
+    /// body is byte-unchanged. The legacy-cleanup strip is still wired for a note that carries a
+    /// PRE-EXISTING `[[Title]]` marker (imported before the block was retired): unlink removes the row
+    /// AND strips that stale marker.
     #[test]
-    fn unlink_removes_row_and_strips_marker() {
+    fn unlink_removes_row_and_strips_legacy_marker() {
         let state = build_state("unlink-strips");
         make_open_folder(&state.db, "f-open", "Project");
-        seed_note_doc_cmd(&state.db, "src", "f-open", "Source Note", "original body\n");
+        // A SOURCE note that already carries a LEGACY managed links block referencing the target (as an
+        // old note would). `apply_link_markers` renders exactly the block the retired path used to.
+        let legacy_hit = crate::enrich::ContextHit {
+            source: "note".to_string(),
+            detail: "[[Target Note]]".to_string(),
+            url: None,
+        };
+        let legacy_body =
+            crate::enrich::apply_link_markers("original body\n", std::slice::from_ref(&legacy_hit));
+        assert!(legacy_body.contains("[[Target Note]]"), "precondition: legacy marker seeded");
+        seed_note_doc_cmd(&state.db, "src", "f-open", "Source Note", &legacy_body);
         seed_note_doc_cmd(&state.db, "dst", "f-open", "Target Note", "target body");
 
         link_items_inner(&state, "note", "src", "note", "dst").unwrap();
         assert_eq!(manual_link_count(&state, "note", "src"), 1, "precondition: manual row exists");
-        assert!(
-            state.db.get_note_row("src").unwrap().unwrap().text.contains("[[Target Note]]"),
-            "precondition: marker materialized"
-        );
 
         // Unlink note src → note dst.
         unlink_items_inner(&state, "note", "src", "note", "dst").unwrap();
 
         // The manual row is gone...
         assert_eq!(manual_link_count(&state, "note", "src"), 0, "manual row deleted");
-        // ...and the [[Target Note]] marker is stripped from the body.
+        // ...and the stale legacy [[Target Note]] marker is stripped from the body (legacy cleanup).
         let body = state.db.get_note_row("src").unwrap().unwrap().text;
         assert!(
-            !body.contains("[[Target Note]]"),
-            "the materialized marker is stripped on unlink; got: {body}"
+            !body.contains("[[Target Note]]") && !body.contains("murmur:links"),
+            "the legacy marker + block are stripped on unlink; got: {body}"
         );
-        assert!(
-            body.starts_with("original body\n"),
-            "the original body is preserved after strip; got: {body}"
+        assert_eq!(
+            body, "original body\n",
+            "the original prose is restored byte-exact after strip; got: {body}"
         );
     }
 
@@ -1100,23 +1079,32 @@
         assert_eq!(status, "suggested", "the suggestion must stay suggested after a refused accept");
     }
 
-    /// Fix 5 + lock-review regression: a VALID accept (semantic suggestion between two owned, visible
-    /// notes) must COMPLETE (not self-deadlock) and flip the row off `suggested`. The pre-fix code held
-    /// the non-reentrant `lifecycle_guard` across `materialize_accepted_link` → `update_note_doc_inner`
-    /// (which re-acquires it) → self-deadlock; every accept test only exercised REFUSAL paths, so cargo
-    /// test stayed green while a user clicking Accept hung the command forever. If this test hangs, the
-    /// guard is being held across materialize again.
+    /// A VALID accept (semantic suggestion between two owned, visible notes) flips the row off
+    /// `suggested` and writes NO note body (the `murmur:links` block was retired — accept is now
+    /// GRAPH-ONLY). RED before this change: accept used to materialize `[[Title]]` into an owned note.
     #[test]
-    fn accept_link_valid_suggestion_materializes_without_deadlock() {
-        let state = build_state("accept-materialize");
+    fn accept_link_activates_edge_without_body_block() {
+        let state = build_state("accept-graph-only");
         make_open_folder(&state.db, "f-open", "Open");
         seed_note_doc_cmd(&state.db, "a", "f-open", "Alpha", "alpha body");
         seed_note_doc_cmd(&state.db, "b", "f-open", "Beta", "beta body");
+        let a_before = state.db.get_note_row("a").unwrap().unwrap().text;
+        let b_before = state.db.get_note_row("b").unwrap().unwrap().text;
         let id = insert_semantic_link(&state, "a", "b", "suggested");
-        // Must RETURN (pre-fix: deadlock) — the guard is released before the materialize loop.
+
         accept_link_inner(&state, id).expect("a valid accept between two open notes must succeed");
+
         let (_sk, _si, _dk, _di, _et, status) = state.db.link_by_id(id).unwrap().unwrap();
         assert_ne!(status, "suggested", "an accepted suggestion must no longer be 'suggested'");
+        // NEITHER note body was touched — no [[Title]] / links block materialized.
+        let a_after = state.db.get_note_row("a").unwrap().unwrap().text;
+        let b_after = state.db.get_note_row("b").unwrap().unwrap().text;
+        assert_eq!(a_after, a_before, "accept writes no body into note a");
+        assert_eq!(b_after, b_before, "accept writes no body into note b");
+        assert!(
+            !a_after.contains("murmur:links") && !b_after.contains("murmur:links"),
+            "no managed links block written by accept"
+        );
     }
 
     /// M3-CLIENT lock gate (spec §7 inv. 1): `share_note_to_link` on a SEALED-and-not-session-unlocked
@@ -5062,6 +5050,172 @@
             Some(&"draft".to_string())
         );
         assert_eq!(list_notes_inner(&state, None).unwrap().len(), 1);
+    }
+
+    /// Part B — `get_note` STRIPS a legacy machine-managed `murmur:links` block from the VISIBLE
+    /// editor DTO, so the editor + Preview show prose-only (the block leaves the DB on the next natural
+    /// save). The strip is FENCE-DELIMITED + SURGICAL: user prose + front-matter are byte-preserved.
+    /// (RED before this change: `get_note` returned the stored text VERBATIM, block included.)
+    #[test]
+    fn get_note_strips_managed_links_block() {
+        let state = build_state("getnote-strip");
+        make_open_folder(&state.db, "f-open", "Project");
+        // Seed a note whose STORED text = real prose + a machine `murmur:links` block (rendered
+        // exactly as the retired path did, so this is a faithful legacy body).
+        let prose = "---\ntags: [a, b]\n---\n# Heading\n\nReal prose the user typed.\n";
+        let hit = crate::enrich::ContextHit {
+            source: "Murmur".to_string(),
+            detail: "We agreed the roadmap.".to_string(),
+            url: Some("[[Prior Note]]".to_string()),
+        };
+        let stored = crate::enrich::apply_link_markers(prose, std::slice::from_ref(&hit));
+        assert!(stored.contains("murmur:links"), "precondition: block seeded into stored text");
+        seed_note_doc_cmd(&state.db, "n1", "f-open", "Note One", &stored);
+
+        let doc = get_note_inner(&state, "n1").unwrap();
+        assert!(!doc.locked, "an open note is not masked");
+        // The machine block is GONE from what the editor sees...
+        assert!(
+            !doc.markdown.contains("murmur:links") && !doc.markdown.contains("[!related]-"),
+            "the managed links block is stripped from the get_note DTO; got: {}",
+            doc.markdown
+        );
+        // ...and the strip is byte-exact — the DTO markdown equals the prose with the block removed.
+        assert_eq!(
+            doc.markdown, prose,
+            "the strip restores the prose byte-for-byte (front-matter + heading + text preserved)"
+        );
+        // Front-matter tags still parse (the block sat in the BODY, not the front-matter).
+        assert_eq!(doc.tags, vec!["a".to_string(), "b".to_string()], "front-matter tags preserved");
+        // The stored DB text is UNCHANGED by a read (cleanup happens on the next save, not the read).
+        assert!(
+            state.db.get_note_row("n1").unwrap().unwrap().text.contains("murmur:links"),
+            "get_note is a READ — it does not rewrite the DB row (natural save-time cleanup)"
+        );
+    }
+
+    /// Part B — a note whose STORED text is ONLY the machine block (no prose) reads back as an
+    /// empty/whitespace body after the strip (never leaks the block as junk content).
+    #[test]
+    fn get_note_strips_block_only_note_to_empty_body() {
+        let state = build_state("getnote-strip-only");
+        make_open_folder(&state.db, "f-open", "Project");
+        let hit = crate::enrich::ContextHit {
+            source: "Murmur".to_string(),
+            detail: "Only a link.".to_string(),
+            url: Some("[[X]]".to_string()),
+        };
+        // A body that is JUST the block (apply_link_markers over an empty note).
+        let stored = crate::enrich::apply_link_markers("", std::slice::from_ref(&hit));
+        assert!(stored.contains("murmur:links"), "precondition: block-only body");
+        seed_note_doc_cmd(&state.db, "only", "f-open", "Only Block", &stored);
+
+        let doc = get_note_inner(&state, "only").unwrap();
+        assert!(
+            doc.markdown.trim().is_empty(),
+            "a block-only note reads back empty/whitespace; got: {:?}",
+            doc.markdown
+        );
+    }
+
+    /// Part B invariant — the MASKED (sealed-not-unlocked) path is UNCHANGED: `get_note` returns the
+    /// masked DTO (empty body) and NO strip is attempted on the sealed text (no content behind a lock,
+    /// no leak). Even when the underlying stored text carries a `murmur:links` block, the mask short-
+    /// circuits BEFORE the strip.
+    #[test]
+    fn get_note_masked_note_unchanged_no_strip() {
+        let state = build_state("getnote-masked");
+        let fid = create_note_folder_inner(&state, "Secret", None).unwrap().id;
+        // Seed a note with a links block, then SEAL its folder.
+        let hit = crate::enrich::ContextHit {
+            source: "Murmur".to_string(),
+            detail: "secret link".to_string(),
+            url: Some("[[Secret]]".to_string()),
+        };
+        let stored = crate::enrich::apply_link_markers("# secret prose\n", std::slice::from_ref(&hit));
+        let id = create_note_inner(&state, Some(&fid), "Sealed note").unwrap();
+        update_note_doc_inner(&state, &id, "Sealed note", &stored).unwrap();
+        lock_folder_inner(&state, fid.clone()).unwrap();
+
+        let masked = get_note_inner(&state, &id).unwrap();
+        assert!(masked.locked, "sealed note reports locked");
+        assert_eq!(masked.title, "🔒 Locked", "sealed note title masked");
+        assert_eq!(masked.markdown, "", "sealed note body never leaks (no strip attempted)");
+        // The masked DTO is the SAME whether or not the sealed text had a block — nothing about the
+        // block escapes the mask.
+        assert!(
+            !masked.markdown.contains("murmur:links") && !masked.markdown.contains("secret"),
+            "no sealed content (block or prose) leaks through the mask"
+        );
+    }
+
+    /// FIX 1 (content-loss) — the read-path strip is HEADER-GATED: a `murmur:links` fence pair a USER
+    /// typed/pasted into their OWN prose (real text between the markers, NO `> [!related]- Related
+    /// notes` header) is NOT a machine block, so `get_note` returns the body BYTE-IDENTICAL and the
+    /// "IMPORTANT user text" between the forged markers SURVIVES. RED before this change: the
+    /// unconditional `apply_link_markers(md, &[])` strip `rfind`s the fence pair and cuts everything
+    /// between — eating the user's text, which the editor's debounced autosave then persists (real
+    /// owned-file data loss). GREEN after: the forged fence has no `[!related]` header → untouched.
+    #[test]
+    fn get_note_does_not_strip_forged_fence_in_prose() {
+        let state = build_state("getnote-forged-fence");
+        make_open_folder(&state.db, "f-open", "Project");
+        // A body where the user LITERALLY typed both markers with important text between them, but the
+        // body is NOT the machine callout (no `> [!related]- Related notes` header line).
+        let prose = "Real line A\n<!-- murmur:links -->\nIMPORTANT user text\n<!-- /murmur:links -->\nReal line B\n";
+        seed_note_doc_cmd(&state.db, "forged", "f-open", "Forged", prose);
+
+        let doc = get_note_inner(&state, "forged").unwrap();
+        assert!(!doc.locked, "an open note is not masked");
+        assert_eq!(
+            doc.markdown, prose,
+            "a forged fence in USER PROSE (no [!related] header) is left byte-identical — no data loss"
+        );
+        // The load-bearing assertion: the user's text between the forged markers is NOT eaten.
+        assert!(
+            doc.markdown.contains("IMPORTANT user text"),
+            "user text between forged markers must survive; got: {}",
+            doc.markdown
+        );
+    }
+
+    /// FIX 1 (scan-all, lock-security re-fail 2026-07-20) — on the DISPLAY path, a REAL machine
+    /// `murmur:links` block FOLLOWED by a bare forged links fence must STILL be stripped (the old
+    /// `rfind`-last anchor gated on the trailing forged pair → the real related-notes block, with its
+    /// stale linked titles, stayed rendered as raw junk in the editor). The forged-fence prose SURVIVES.
+    #[test]
+    fn get_note_strips_real_block_before_a_trailing_forged_fence() {
+        let state = build_state("getnote-scanall");
+        make_open_folder(&state.db, "f-open", "Project");
+        let real = crate::enrich::apply_link_markers(
+            "# Notes\n\nReal prose.\n",
+            &[crate::enrich::ContextHit {
+                source: "note".into(),
+                detail: "[[Old Related Title]]".into(),
+                url: None,
+            }],
+        );
+        // The user pastes a bare forged links fence AFTER the real machine block.
+        let stored = format!(
+            "{real}\n\nmore prose\n<!-- murmur:links -->\nkeepme forged\n<!-- /murmur:links -->\ntail\n"
+        );
+        seed_note_doc_cmd(&state.db, "scanall", "f-open", "ScanAll", &stored);
+
+        let doc = get_note_inner(&state, "scanall").unwrap();
+        assert!(!doc.locked);
+        assert!(
+            !doc.markdown.contains("Old Related Title") && !doc.markdown.contains("[!related]-"),
+            "the REAL related-notes block is stripped despite the trailing forged fence; got: {}",
+            doc.markdown
+        );
+        assert!(
+            doc.markdown.contains("keepme forged")
+                && doc.markdown.contains("Real prose.")
+                && doc.markdown.contains("more prose")
+                && doc.markdown.contains("tail"),
+            "the forged-fence content + all prose survive; got: {}",
+            doc.markdown
+        );
     }
 
     /// WP2 seal round-trip — a note's full markdown (front-matter + Unicode body) survives a real
@@ -12347,20 +12501,19 @@
         assert!(state.db.get_org_item("nope").unwrap().is_none());
     }
 
-    /// REGRESSION (app-hang on Accept): `accept_link_inner` held the non-reentrant `lifecycle_guard`
-    /// across `materialize_accepted_link` → `update_note_doc_inner`, which re-takes the SAME guard →
-    /// a same-thread DEADLOCK whenever the accepted pair has an OWNED note to materialize `[[Title]]`
-    /// into (a NOTE↔NOTE accept — the exact case the user hit). We run the accept on a worker thread
-    /// and BOUND the wait, so the deadlock surfaces as a clean FAILURE instead of wedging the whole
-    /// suite; on the fixed code it completes in milliseconds AND materializes the neighbour link.
+    /// REGRESSION (app-hang on Accept): the old accept held the non-reentrant `lifecycle_guard` across
+    /// a note-body materialize whose `update_note_doc_inner` re-took the SAME guard → a same-thread
+    /// DEADLOCK on a NOTE↔NOTE accept. The materialize (and the whole `murmur:links` body block) is now
+    /// retired, so accept is GRAPH-ONLY and nothing re-enters the guard — but we KEEP the bounded-wait
+    /// regression: accept between two owned notes must COMPLETE (never hang) and write NO note body.
     #[test]
-    fn accept_link_does_not_deadlock_and_materializes_on_owned_notes() {
+    fn accept_link_completes_without_deadlock_graph_only() {
         use std::sync::mpsc;
         let state = std::sync::Arc::new(build_state("accept-no-deadlock"));
         make_open_folder(&state.db, "f1", "Notes");
         seed_note_doc_cmd(&state.db, "n1", "f1", "Note One", "body one\n");
         seed_note_doc_cmd(&state.db, "n2", "f1", "Note Two", "body two\n");
-        // A SUGGESTED semantic edge between two OWNED notes → accept WILL materialize (the hang path).
+        // A SUGGESTED semantic edge between two OWNED notes (the exact case that used to hang).
         let link_id = state
             .db
             .insert_link_for_test("note", "n1", "note", "n2", "semantic", 0.9, "auto", "suggested");
@@ -12370,19 +12523,21 @@
         let handle = std::thread::spawn(move || {
             let _ = tx.send(accept_link_inner(&worker, link_id));
         });
-        // If it re-enters the guard it blocks forever; a bounded recv turns that into a test failure.
+        // If it ever re-enters the guard it blocks forever; a bounded recv turns that into a failure.
         let result = rx.recv_timeout(std::time::Duration::from_secs(10)).expect(
             "accept_link_inner DEADLOCKED — did not finish in 10s (re-entrant lifecycle guard)",
         );
         result.expect("accept_link_inner returned an error");
         handle.join().unwrap();
 
-        // The accept materialized the neighbour's [[Title]] into an owned note (the very path that hung).
+        // The edge is active and NEITHER owned note body was written (graph-only accept).
+        let (_sk, _si, _dk, _di, _et, status) = state.db.link_by_id(link_id).unwrap().unwrap();
+        assert_ne!(status, "suggested", "the accepted edge is active");
         let n1 = state.db.get_note_row("n1").unwrap().unwrap();
         let n2 = state.db.get_note_row("n2").unwrap().unwrap();
         assert!(
-            n1.text.contains("[[") || n2.text.contains("[["),
-            "accept must materialize a [[Title]] wikilink into one of the owned notes"
+            !n1.text.contains("[[") && !n2.text.contains("[["),
+            "accept writes no [[Title]] / links block into either owned note"
         );
     }
 

@@ -204,6 +204,144 @@ fn strip_fenced_block(md: &str, fence_start: &str, fence_end: &str) -> String {
     out
 }
 
+/// The exact header line a REAL machine `murmur:links` block always carries as its first body line
+/// (`apply_link_markers` renders `{fence}\n> [!related]- Related notes\n…`, with NO trailing
+/// timestamp). Used to distinguish a genuine machine block from a fence a user typed (or pasted) into
+/// their own prose.
+const RELATED_CALLOUT_HEADER: &str = "> [!related]- Related notes";
+
+/// The STABLE header PREFIX of a machine `murmur:context` block. Unlike `murmur:links`, the connector
+/// context callout carries a dated suffix (`… (as of {date})`, see [`apply_context_markers`]), so the
+/// gate is a `starts_with` on this timeless prefix — never an exact match on the whole line.
+/// `pub(crate)` so the share-egress scrub reuses it (never a hardcoded string).
+pub(crate) const CONTEXT_CALLOUT_HEADER_PREFIX: &str = "> [!context]- Live context";
+
+/// How the first-body-line header gate matches: `Exact` (`murmur:links`, no dated suffix) or `Prefix`
+/// (`murmur:context` / `murmur:verify`, which append `(as of {date})`).
+enum HeaderMatch<'a> {
+    Exact(&'a str),
+    Prefix(&'a str),
+}
+
+/// HEADER-GATED strip of EVERY managed fenced block of one type. Scans ALL `(fence_start, fence_end)`
+/// pairs LEFT-TO-RIGHT and removes EACH ONE ONLY when its first non-empty body line matches `header`;
+/// a pair whose body is arbitrary user prose (no machine callout header) is copied through
+/// BYTE-IDENTICAL and never eaten. Shared by the read-path links strip AND the share-egress
+/// context/verify strips so all three use ONE gate discipline.
+///
+/// Why SCAN-ALL, not `rfind`-the-last (lock-security re-fail 2026-07-20): a user typing a bare
+/// `<!-- murmur:context -->x<!-- /murmur:context -->` fence in prose AFTER a REAL machine block made
+/// `rfind` anchor on the LAST (forged) pair — the gate failed on its non-header body, the function
+/// returned the note UNCHANGED, and the earlier REAL block (Jira key + workspace URL, or a linked
+/// title) LEAKED through `clean_note_body` into the share/org envelope. Scanning every pair strips the
+/// real one regardless of a trailing decoy. For each STRIPPED pair, the reclaimed leading `\n\n`/`\n`
+/// separator matches the write-path append, so a real block round-trips byte-exact via the append/strip
+/// inverse; a header-LESS pair (and all surrounding prose/front-matter) is preserved verbatim.
+fn strip_managed_block_if_header(
+    md: &str,
+    fence_start: &str,
+    fence_end: &str,
+    header: &HeaderMatch<'_>,
+) -> String {
+    // Fast path: no start fence at all → nothing to consider (avoids an allocation on the common case).
+    if !md.contains(fence_start) {
+        return md.to_string();
+    }
+    let mut out = String::with_capacity(md.len());
+    // `cursor` = index into `md` of the next unemitted byte. We walk forward pair-by-pair.
+    let mut cursor = 0usize;
+    while let Some(rel_start) = md[cursor..].find(fence_start) {
+        let start = cursor + rel_start;
+        // Find this start's matching end fence (the FIRST end after the start — the write-path never
+        // nests these HTML-comment fences, so first-after is the correct pairing).
+        let Some(rel_end) = md[start + fence_start.len()..].find(fence_end) else {
+            // Lone start fence with no following end → NEVER truncate; emit the rest verbatim and stop.
+            out.push_str(&md[cursor..]);
+            return out;
+        };
+        let end = start + fence_start.len() + rel_end + fence_end.len();
+        let body = &md[start + fence_start.len()..end - fence_end.len()];
+        // GATE: the first NON-EMPTY body line must be the machine callout header. A user's forged fence
+        // (whose body is arbitrary prose) fails this → the pair is KEPT (copied through).
+        let is_machine_block = match body.lines().map(str::trim).find(|l| !l.is_empty()) {
+            Some(first_non_empty) => match header {
+                HeaderMatch::Exact(h) => first_non_empty == *h,
+                HeaderMatch::Prefix(p) => first_non_empty.starts_with(p),
+            },
+            None => false, // empty body is never a machine block.
+        };
+        if is_machine_block {
+            // STRIP: emit everything up to this pair MINUS the leading `\n\n`/`\n` separator the
+            // write-path wrote before the fence (byte-exact inverse of the append), then skip the pair.
+            let before = &md[cursor..start];
+            let kept = before
+                .strip_suffix("\n\n")
+                .or_else(|| before.strip_suffix('\n'))
+                .unwrap_or(before);
+            out.push_str(kept);
+            cursor = end;
+        } else {
+            // KEEP: emit everything up to AND INCLUDING this pair verbatim, then continue after it.
+            out.push_str(&md[cursor..end]);
+            cursor = end;
+        }
+    }
+    // Emit any trailing bytes after the last fence pair.
+    out.push_str(&md[cursor..]);
+    out
+}
+
+/// READ-PATH strip (retired `murmur:links` block): remove EVERY managed links fence pair whose fenced
+/// body is genuinely the MACHINE block, i.e. its first non-empty body line is exactly the
+/// [`RELATED_CALLOUT_HEADER`] (`> [!related]- Related notes`) that `apply_link_markers` always emits.
+///
+/// Why this is NOT `apply_link_markers(md, &[])`: that variant unconditionally `rfind`s the fence
+/// pair and cuts everything between — so USER PROSE that happens to contain both `<!-- murmur:links
+/// -->` and `<!-- /murmur:links -->` markers (with real text between them) is silently EATEN, and the
+/// editor's debounced autosave then PERSISTS that loss to the DB (owned-file data loss). This helper
+/// is SURGICAL: a forged/bare fence in prose (no `[!related]` callout header) is left BYTE-IDENTICAL,
+/// and it strips a REAL block even when a forged fence trails it (scan-all, not rfind-last).
+///
+/// SCOPE: this is the READ/DISPLAY strip — `murmur:links` ONLY (the block is fully retired). The
+/// `murmur:context` / `murmur:verify` blocks are in-app FEATURES the user opted into and MUST stay
+/// visible in the editor; they are stripped ONLY on the share-egress path
+/// ([`strip_managed_context_block`] / [`strip_verify_block_for_egress`]), never here.
+pub fn strip_managed_links_block(md: &str) -> String {
+    strip_managed_block_if_header(
+        md,
+        LINKS_FENCE_START,
+        LINKS_FENCE_END,
+        &HeaderMatch::Exact(RELATED_CALLOUT_HEADER),
+    )
+}
+
+/// SHARE-EGRESS strip of the connector `murmur:context` block (Jira/Slack/web live snippets +
+/// workspace URLs). HEADER-GATED on the timeless [`CONTEXT_CALLOUT_HEADER_PREFIX`] (the callout also
+/// carries `(as of {date})`), so a user's forged bare `murmur:context` fence in prose is left
+/// byte-identical. NOT called on the read/display path — the block stays visible in the editor;
+/// this only stops it LEAKING on share. See [`crate::share::envelope::clean_note_body`].
+pub fn strip_managed_context_block(md: &str) -> String {
+    strip_managed_block_if_header(
+        md,
+        FENCE_START,
+        FENCE_END,
+        &HeaderMatch::Prefix(CONTEXT_CALLOUT_HEADER_PREFIX),
+    )
+}
+
+/// SHARE-EGRESS strip of the `murmur:verify` block (Jira issue keys + verdicts + workspace URLs).
+/// A thin re-export delegating to the shared header gate — the fence constants + header prefix live
+/// in [`crate::verify`] (their owner), so this never hardcodes the strings. NOT called on the
+/// read/display path (the block is an in-app Verify feature the user opted into).
+pub fn strip_verify_block_for_egress(md: &str) -> String {
+    strip_managed_block_if_header(
+        md,
+        crate::verify::VERIFY_FENCE_START,
+        crate::verify::VERIFY_FENCE_END,
+        &HeaderMatch::Prefix(crate::verify::VERIFY_CALLOUT_HEADER_PREFIX),
+    )
+}
+
 /// Make a connector-supplied value safe to embed in the callout:
 /// - collapse CR/LF + whitespace runs to single spaces so it can never spawn a second line that
 ///   escapes the block / injects a line-start callout (mirrors `verify::apply_verify_markers`);
@@ -492,5 +630,183 @@ mod tests {
         );
         let twice = apply_link_markers(&out, std::slice::from_ref(&evil));
         assert_eq!(out, twice, "idempotent with the hostile hit");
+    }
+
+    // ── FIX 1: `strip_managed_links_block` — HEADER-GATED read-path strip ──────────────────────────
+
+    /// A REAL machine block (rendered by `apply_link_markers`, so it carries the exact
+    /// `> [!related]- Related notes` header) IS stripped — byte-identical to `apply_link_markers(_, &[])`.
+    #[test]
+    fn strip_managed_links_block_removes_a_real_machine_block() {
+        let md = "---\ntags: [a]\n---\n# Heading\n\nProse.\n";
+        let with_block = apply_link_markers(md, &related_hits());
+        assert!(with_block.contains(LINKS_FENCE_START), "precondition: real block present");
+        let stripped = strip_managed_links_block(&with_block);
+        assert_eq!(stripped, md, "a real machine block strips back to the original note byte-exact");
+        assert_eq!(
+            stripped,
+            apply_link_markers(&with_block, &[]),
+            "on a REAL block the header-gated strip matches the unconditional strip byte-for-byte"
+        );
+    }
+
+    /// The load-bearing FIX-1 guarantee: a `murmur:links` fence pair a USER typed in their OWN prose
+    /// (real text between the markers, NO `> [!related]- Related notes` header) is left BYTE-IDENTICAL
+    /// — the user's text is NEVER eaten. (The old `apply_link_markers(md, &[])` DID eat it.)
+    #[test]
+    fn strip_managed_links_block_leaves_a_forged_fence_in_prose_untouched() {
+        let prose = "Real line A\n<!-- murmur:links -->\nIMPORTANT user text\n<!-- /murmur:links -->\nReal line B\n";
+        assert_eq!(
+            strip_managed_links_block(prose),
+            prose,
+            "a forged fence (no [!related] header) is left byte-identical"
+        );
+        // Contrast: the OLD unconditional strip DID eat the user's text — pin that difference so a
+        // regression back to `apply_link_markers(md, &[])` on the read path is caught here.
+        assert_ne!(
+            apply_link_markers(prose, &[]),
+            prose,
+            "the unconditional strip WOULD have eaten the forged-fence body (this is what FIX 1 avoids)"
+        );
+        assert!(
+            !apply_link_markers(prose, &[]).contains("IMPORTANT user text"),
+            "confirming the unconditional strip ate the user text"
+        );
+    }
+
+    /// A fenced region whose first non-empty body line is SOME OTHER callout (not `[!related]`) is a
+    /// user construct → left untouched (only the genuine Related-notes machine header matches).
+    #[test]
+    fn strip_managed_links_block_ignores_a_different_callout_header() {
+        let prose = "before\n<!-- murmur:links -->\n> [!note]- My own note\n> body\n<!-- /murmur:links -->\nafter\n";
+        assert_eq!(strip_managed_links_block(prose), prose, "a non-[!related] callout is not the machine block");
+    }
+
+    /// A lone/unterminated fence never truncates real content; a note with no fence is unchanged.
+    #[test]
+    fn strip_managed_links_block_no_fence_or_lone_fence_is_noop() {
+        let none = "# Just prose\n\nno fence at all\n";
+        assert_eq!(strip_managed_links_block(none), none);
+        let lone = "text\n<!-- murmur:links -->\n> [!related]- Related notes\n(no end fence, EOF)\n";
+        assert_eq!(strip_managed_links_block(lone), lone, "a lone start fence is never truncated");
+    }
+
+    /// FIX 3 egress helper — `strip_managed_context_block` removes a REAL connector block (the header
+    /// carries a DATED suffix, so the gate is a PREFIX match) but leaves a forged bare `murmur:context`
+    /// fence in user prose byte-identical. Also proves it round-trips a real `apply_context_markers`.
+    #[test]
+    fn strip_managed_context_block_gated_on_the_dated_header_prefix() {
+        // A REAL block (dated header via apply_context_markers) IS stripped, byte-exact to the original.
+        let md = "# N\n\nprose\n";
+        let with_ctx = apply_context_markers(md, &jira_slack(), AS_OF);
+        assert!(with_ctx.contains("[!context]-"), "precondition: real context block present");
+        assert_eq!(
+            strip_managed_context_block(&with_ctx),
+            md,
+            "a real dated context block strips back byte-exact"
+        );
+        // A forged bare fence in prose (no `> [!context]- Live context` header) is UNTOUCHED.
+        let forged = "line A\n<!-- murmur:context -->\nIMPORTANT user text\n<!-- /murmur:context -->\nline B\n";
+        assert_eq!(strip_managed_context_block(forged), forged, "forged context fence left byte-identical");
+        // The LINKS strip must NOT touch a context block (distinct fence).
+        assert_eq!(strip_managed_links_block(&with_ctx), with_ctx, "links strip leaves the context block alone");
+    }
+
+    /// FIX 3 egress helper — `strip_verify_block_for_egress` removes a REAL verify block (dated header
+    /// → prefix gate) and leaves a forged bare `murmur:verify` fence untouched.
+    #[test]
+    fn strip_verify_block_for_egress_gated_on_header_prefix() {
+        let md = "# N\n\nprose\n";
+        let finding = crate::verify::VerifyFinding {
+            line_no: 1,
+            key: "PROJ-789".into(),
+            verdict: crate::verify::Verdict::Confirmed,
+            detail: "PROJ-789 matches".into(),
+            url: "https://acme.atlassian.net/browse/PROJ-789".into(),
+        };
+        let with_verify = crate::verify::apply_verify_callout(md, std::slice::from_ref(&finding), AS_OF);
+        assert!(with_verify.contains("[!verify]-"), "precondition: real verify block present");
+        assert_eq!(
+            strip_verify_block_for_egress(&with_verify),
+            md,
+            "a real dated verify block strips back byte-exact"
+        );
+        let forged = "line A\n<!-- murmur:verify -->\nIMPORTANT user text\n<!-- /murmur:verify -->\nline B\n";
+        assert_eq!(strip_verify_block_for_egress(forged), forged, "forged verify fence left byte-identical");
+    }
+
+    // ── SCAN-ALL (lock-security re-fail 2026-07-20): strip a REAL block even behind a trailing forged
+    //    fence, while keeping the header-LESS forged fence intact. RED on the old `rfind`-last anchor. ─
+
+    /// LINKS — a real machine block FOLLOWED by a bare forged `murmur:links` fence: the real block's
+    /// linked title is STRIPPED (leak closed) and the forged-fence prose SURVIVES. RED on the old
+    /// `rfind`-last code (rfind anchored the trailing forged pair → gate failed → real block kept).
+    #[test]
+    fn strip_managed_links_block_strips_real_block_before_a_trailing_forged_fence() {
+        let real = apply_link_markers(
+            "# Notes\n\nReal prose.\n",
+            &[hit("note", "[[Secret Zwolnienia Q3]]", None)],
+        );
+        assert!(real.contains("Secret Zwolnienia Q3"), "precondition: real block carries the title");
+        // The user then pastes a bare forged fence (no [!related] header) AFTER the real block.
+        let md = format!("{real}\n\nmore prose\n<!-- murmur:links -->\nkeepme forged\n<!-- /murmur:links -->\ntail\n");
+        let out = strip_managed_links_block(&md);
+        assert!(!out.contains("Secret Zwolnienia Q3"), "the REAL block's linked title is stripped: {out}");
+        assert!(!out.contains("> [!related]- Related notes"), "the real machine callout is gone: {out}");
+        // The forged fence + its content + all prose survive byte-intact.
+        assert!(out.contains("keepme forged"), "forged-fence user content survives: {out}");
+        assert!(out.contains("<!-- murmur:links -->\nkeepme forged\n<!-- /murmur:links -->"), "forged fence kept verbatim: {out}");
+        assert!(out.contains("Real prose.") && out.contains("more prose") && out.contains("tail"), "prose preserved: {out}");
+    }
+
+    /// LINKS — multiple REAL blocks of the same type (pathological, reachable via paste): ALL stripped.
+    #[test]
+    fn strip_managed_links_block_strips_every_real_block() {
+        let one = apply_link_markers("# A\n", &[hit("note", "[[Title One]]", None)]);
+        let two = apply_link_markers("# B\n", &[hit("note", "[[Title Two]]", None)]);
+        let md = format!("{one}\n\nmid prose\n\n{two}");
+        let out = strip_managed_links_block(&md);
+        assert!(!out.contains("Title One") && !out.contains("Title Two"), "BOTH real blocks stripped: {out}");
+        assert_eq!(out.matches(LINKS_FENCE_START).count(), 0, "no links fence survives: {out}");
+        assert!(out.contains("mid prose"), "prose between the blocks preserved: {out}");
+    }
+
+    /// CONTEXT — a real dated `murmur:context` block before a trailing forged context fence: the Jira
+    /// key + workspace URL are STRIPPED (leak closed), the forged content SURVIVES. RED on `rfind`-last.
+    #[test]
+    fn strip_managed_context_block_strips_real_block_before_a_trailing_forged_fence() {
+        let real = apply_context_markers(
+            "# Meeting\n\nprose\n",
+            &[hit("Jira", "PROJ-999 · In Progress", Some("https://acme.atlassian.net/browse/PROJ-999"))],
+            AS_OF,
+        );
+        assert!(real.contains("PROJ-999"), "precondition: real context block carries the key");
+        let md = format!("{real}\n\ntext\n<!-- murmur:context -->\nkeepme\n<!-- /murmur:context -->\n");
+        let out = strip_managed_context_block(&md);
+        assert!(!out.contains("PROJ-999"), "the Jira key is stripped: {out}");
+        assert!(!out.contains("atlassian.net"), "the workspace URL is stripped: {out}");
+        assert!(out.contains("keepme") && out.contains("<!-- murmur:context -->\nkeepme\n<!-- /murmur:context -->"), "forged fence kept: {out}");
+        assert!(out.contains("prose") && out.contains("text"), "prose preserved: {out}");
+    }
+
+    /// VERIFY — a real dated `murmur:verify` block before a trailing forged verify fence: the Jira key
+    /// + URL are STRIPPED, the forged content SURVIVES. RED on `rfind`-last.
+    #[test]
+    fn strip_verify_block_for_egress_strips_real_block_before_a_trailing_forged_fence() {
+        let finding = crate::verify::VerifyFinding {
+            line_no: 1,
+            key: "PROJ-777".into(),
+            verdict: crate::verify::Verdict::Confirmed,
+            detail: "PROJ-777 matches".into(),
+            url: "https://acme.atlassian.net/browse/PROJ-777".into(),
+        };
+        let real = crate::verify::apply_verify_callout("# N\n\nprose\n", std::slice::from_ref(&finding), AS_OF);
+        assert!(real.contains("PROJ-777"), "precondition: real verify block carries the key");
+        let md = format!("{real}\n\ntext\n<!-- murmur:verify -->\nkeepme\n<!-- /murmur:verify -->\n");
+        let out = strip_verify_block_for_egress(&md);
+        assert!(!out.contains("PROJ-777"), "the Jira key is stripped: {out}");
+        assert!(!out.contains("atlassian.net"), "the workspace URL is stripped: {out}");
+        assert!(out.contains("keepme") && out.contains("<!-- murmur:verify -->\nkeepme\n<!-- /murmur:verify -->"), "forged fence kept: {out}");
+        assert!(out.contains("prose") && out.contains("text"), "prose preserved: {out}");
     }
 }

@@ -115,11 +115,31 @@ fn flatten_link_inner(inner: &str) -> String {
     }
 }
 
-/// The full "clean text" transform: strip frontmatter, then flatten wikilinks + strip
-/// `obsidian://` refs. This is the single call `share_note_to_link` makes on a note's markdown
-/// before building the [`murmur_protocol::envelope::ShareEnvelope`]. Pure.
+/// The full "clean text" transform: strip frontmatter, DROP every machine-managed block, then flatten
+/// wikilinks + strip `obsidian://` refs. This is the single scrub EVERY share path (link-share AND
+/// every org-share) funnels a note's raw `notes.markdown` / `documents.text` through before building
+/// the [`murmur_protocol::envelope::ShareEnvelope`]. Pure.
+///
+/// EGRESS HYGIENE — no MACHINE-MANAGED block may reach the share/org wire. Three fences carry the
+/// sender's private data and are all HEADER-GATED-stripped here (each removed ONLY when its first
+/// body line is its exact machine callout header, so a forged bare fence in USER prose is NEVER eaten
+/// — the fence constants + header strings come from their owning modules, never hardcoded):
+/// - `murmur:links` (`> [!related]- Related notes`) — the `[[Title]]` of every linked note/meeting;
+///   without the strip `flatten_wikilinks` would turn those markers into readable TITLES that reach
+///   the recipient (e.g. a private "Zwolnienia Q3"). This block is ALSO retired app-wide (A/B).
+/// - `murmur:context` (`> [!context]- Live context`) — LIVE CONNECTOR data (Jira issue/status/URL,
+///   Slack channel+snippet+permalink, web snippets) + the sender's workspace host URLs.
+/// - `murmur:verify` (`> [!verify]- Source check`) — Jira issue keys + verdicts + workspace URLs.
+///
+/// SCOPE: this is the EGRESS-ONLY strip. `murmur:context` / `murmur:verify` are in-app FEATURES the
+/// user opted into (ran Enrich / Verify) and STAY visible in the editor — the read/display path
+/// (`get_note`) strips `murmur:links` only. We only stop context/verify LEAKING on share.
+/// Belt-and-braces: closes the leak for EXISTING enriched/verified notes AND any new one.
 pub fn clean_note_body(markdown: &str) -> String {
     let body = strip_frontmatter(markdown);
+    let body = crate::enrich::strip_managed_links_block(&body);
+    let body = crate::enrich::strip_managed_context_block(&body);
+    let body = crate::enrich::strip_verify_block_for_egress(&body);
     flatten_wikilinks(&body)
 }
 
@@ -299,5 +319,167 @@ mod tests {
             !clean.contains("vault=Work"),
             "the vault name must not leak: {clean:?}"
         );
+    }
+
+    /// FIX 3 (CONTENT LEAK) — every share path funnels a note's RAW markdown through `clean_note_body`
+    /// before building the envelope. A note carrying the machine `> [!related]- Related notes`
+    /// (`murmur:links`) block lists the `[[Title]]` of every note/meeting it links to; the linked
+    /// notes' CONTENT is never shared, but WITHOUT this strip `flatten_wikilinks` would turn those
+    /// markers into plain readable TITLES that reach the recipient (a title-egress leak). The block —
+    /// header, callout, and the linked title — must be entirely GONE from the shared body.
+    /// RED before FIX 3: the block reached the envelope, "Related notes"/"Secret Note"/"(via note)"
+    /// all leaked through.
+    #[test]
+    fn clean_note_body_strips_the_related_notes_block() {
+        let md = "# Meeting\n\nReal prose the user wrote.\n\n\
+                  <!-- murmur:links -->\n\
+                  > [!related]- Related notes\n\
+                  > - [[Secret Note]] (via note)\n\
+                  <!-- /murmur:links -->\n";
+        let clean = clean_note_body(md);
+        assert!(
+            clean.contains("Real prose the user wrote."),
+            "the user's own prose survives the share scrub: {clean:?}"
+        );
+        assert!(
+            !clean.contains("Related notes"),
+            "the machine Related-notes callout must not reach the envelope: {clean:?}"
+        );
+        assert!(
+            !clean.contains("Secret Note"),
+            "a linked note TITLE must not leak to the share recipient: {clean:?}"
+        );
+        assert!(
+            !clean.contains("(via note)"),
+            "the machine block attribution must not leak: {clean:?}"
+        );
+        assert!(
+            !clean.contains("murmur:links") && !clean.contains("[!related]"),
+            "no trace of the managed block reaches the shared body: {clean:?}"
+        );
+    }
+
+    /// FIX 3 (generalized) — the `murmur:context` connector block carries LIVE Jira/Slack/web data +
+    /// the sender's workspace host URLs. It must NOT reach the share envelope. HEADER-GATED on the
+    /// `> [!context]- Live context` prefix (the callout also carries `(as of {date})`). RED before the
+    /// generalization: the block + its Jira key + atlassian host URL leaked through.
+    #[test]
+    fn clean_note_body_strips_context_block() {
+        let md = "# Meeting\n\nReal prose the user wrote.\n\n\
+                  <!-- murmur:context -->\n\
+                  > [!context]- Live context (as of 2026-07-05T14:32:00Z)\n\
+                  > - PROJ-123 · In Progress (via Jira) — https://acme.atlassian.net/browse/PROJ-123\n\
+                  <!-- /murmur:context -->\n";
+        let clean = clean_note_body(md);
+        assert!(
+            clean.contains("Real prose the user wrote."),
+            "the user's own prose survives: {clean:?}"
+        );
+        assert!(!clean.contains("PROJ-123"), "the Jira issue key must not leak: {clean:?}");
+        assert!(
+            !clean.contains("atlassian.net"),
+            "the sender's workspace host URL must not leak: {clean:?}"
+        );
+        assert!(
+            !clean.contains("[!context]") && !clean.contains("murmur:context"),
+            "no trace of the connector-context block reaches the shared body: {clean:?}"
+        );
+    }
+
+    /// FIX 3 (generalized) — the `murmur:verify` block carries Jira issue keys + verdicts + workspace
+    /// URLs. It must NOT reach the share envelope. HEADER-GATED on the `> [!verify]- Source check`
+    /// prefix. RED before the generalization: the block + its Jira key + host URL leaked through.
+    #[test]
+    fn clean_note_body_strips_verify_block() {
+        let md = "# Meeting\n\nReal prose the user wrote.\n\n\
+                  <!-- murmur:verify -->\n\
+                  > [!verify]- Source check (as of 2026-07-05T14:32:00Z)\n\
+                  > - Verified — PROJ-456 matches (via Jira) — https://acme.atlassian.net/browse/PROJ-456\n\
+                  <!-- /murmur:verify -->\n";
+        let clean = clean_note_body(md);
+        assert!(
+            clean.contains("Real prose the user wrote."),
+            "the user's own prose survives: {clean:?}"
+        );
+        assert!(!clean.contains("PROJ-456"), "the Jira issue key must not leak: {clean:?}");
+        assert!(
+            !clean.contains("atlassian.net"),
+            "the sender's workspace host URL must not leak: {clean:?}"
+        );
+        assert!(
+            !clean.contains("[!verify]") && !clean.contains("murmur:verify"),
+            "no trace of the verify block reaches the shared body: {clean:?}"
+        );
+    }
+
+    /// FIX 3 (scan-all, lock-security re-fail 2026-07-20) — a REAL machine block FOLLOWED by a bare
+    /// forged fence of the same type must STILL be stripped: the `rfind`-last anchor leaked the real
+    /// block (Jira key / workspace URL / linked title) because it gated on the trailing forged pair.
+    /// The forged-fence prose must SURVIVE (no content loss). Covered for all three fence types.
+    #[test]
+    fn clean_note_body_strips_real_block_before_a_trailing_forged_fence() {
+        // CONTEXT: real block (PROJ-999 + atlassian host) then a bare forged context fence.
+        let ctx = "# Meeting\n\nprose\n\n\
+                   <!-- murmur:context -->\n\
+                   > [!context]- Live context (as of 2026-07-05T14:32:00Z)\n\
+                   > - PROJ-999 · In Progress (via Jira) — https://acme.atlassian.net/browse/PROJ-999\n\
+                   <!-- /murmur:context -->\n\n\
+                   more\n<!-- murmur:context -->\nkeepme forged\n<!-- /murmur:context -->\ntail\n";
+        let clean = clean_note_body(ctx);
+        assert!(!clean.contains("PROJ-999"), "real Jira key must not leak behind a trailing forged fence: {clean:?}");
+        assert!(!clean.contains("atlassian.net"), "real workspace URL must not leak: {clean:?}");
+        assert!(clean.contains("keepme forged"), "the forged-fence user content survives: {clean:?}");
+        assert!(clean.contains("prose") && clean.contains("more") && clean.contains("tail"), "prose preserved: {clean:?}");
+
+        // VERIFY: real block (PROJ-888) then a forged verify fence.
+        let vfy = "# N\n\nprose\n\n\
+                   <!-- murmur:verify -->\n\
+                   > [!verify]- Source check (as of 2026-07-05T14:32:00Z)\n\
+                   > - Verified — PROJ-888 (via Jira) — https://acme.atlassian.net/browse/PROJ-888\n\
+                   <!-- /murmur:verify -->\n\n\
+                   <!-- murmur:verify -->\nkeepme\n<!-- /murmur:verify -->\n";
+        let cv = clean_note_body(vfy);
+        assert!(!cv.contains("PROJ-888") && !cv.contains("atlassian.net"), "real verify block must not leak: {cv:?}");
+        assert!(cv.contains("keepme"), "forged verify content survives: {cv:?}");
+
+        // LINKS: real block (Secret title) then a forged links fence.
+        let lnk = "# N\n\nprose\n\n\
+                   <!-- murmur:links -->\n\
+                   > [!related]- Related notes\n\
+                   > - [[Secret Zwolnienia Q3]] (via note)\n\
+                   <!-- /murmur:links -->\n\n\
+                   <!-- murmur:links -->\nkeepme\n<!-- /murmur:links -->\n";
+        let cl = clean_note_body(lnk);
+        assert!(!cl.contains("Secret Zwolnienia Q3"), "real linked title must not leak: {cl:?}");
+        assert!(cl.contains("keepme"), "forged links content survives: {cl:?}");
+    }
+
+    /// FIX 3 (generalized) — a note carrying ALL THREE managed blocks has NONE of them reach the
+    /// envelope in one scrub (links + context + verify), while the prose survives.
+    #[test]
+    fn clean_note_body_strips_all_three_managed_blocks_at_once() {
+        let md = "# Notes\n\nKeep this prose.\n\n\
+                  <!-- murmur:context -->\n> [!context]- Live context (as of 2026-01-01T00:00:00Z)\n> - SLACK snippet (via Slack) — https://acme.slack.com/x\n<!-- /murmur:context -->\n\n\
+                  <!-- murmur:verify -->\n> [!verify]- Source check (as of 2026-01-01T00:00:00Z)\n> - Verified — KEY-9 (via Jira)\n<!-- /murmur:verify -->\n\n\
+                  <!-- murmur:links -->\n> [!related]- Related notes\n> - [[Private Note]] (via note)\n<!-- /murmur:links -->\n";
+        let clean = clean_note_body(md);
+        assert!(clean.contains("Keep this prose."), "prose survives: {clean:?}");
+        for leak in ["murmur:context", "murmur:verify", "murmur:links", "[!context]", "[!verify]", "[!related]", "slack.com", "KEY-9", "Private Note"] {
+            assert!(!clean.contains(leak), "{leak:?} must not reach the shared body: {clean:?}");
+        }
+    }
+
+    /// FIX 3 negative — the strip is SURGICAL: a `[[Public Note]]` the user typed INLINE in a sentence
+    /// (outside the machine block) still flattens to its display text `Public Note` and reaches the
+    /// recipient normally. We only drop the managed Related-notes block, never the user's own links.
+    #[test]
+    fn clean_note_body_still_flattens_user_inline_wikilink() {
+        let md = "# Notes\n\nWe should read [[Public Note]] before the call.\n";
+        let clean = clean_note_body(md);
+        assert!(
+            clean.contains("We should read Public Note before the call."),
+            "an inline user wikilink still flattens to its display text: {clean:?}"
+        );
+        assert!(!clean.contains("[["), "the wikilink markers are flattened: {clean:?}");
     }
 }
