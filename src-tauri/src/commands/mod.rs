@@ -91,6 +91,32 @@ pub use analytics_commands::*;
 mod facts_commands;
 pub use facts_commands::*;
 
+// Audio / recording-lifecycle / voice-command / storage / voiceprint commands (a GATED domain —
+// `list_voiceprints` snapshots the live `unlocked` set and `free_up_space` holds the seal lifecycle
+// guard across the prune; the gate + at-rest-seal LOGIC is byte-identical, only relocated). Bound as
+// `audio_commands` (via `#[path]`) to avoid colliding with the crate-level `crate::audio` module
+// imported below (`use crate::audio::Recorder;`).
+#[path = "audio.rs"]
+mod audio_commands;
+pub use audio_commands::*;
+
+// Agentic Ask / in-meeting-chat helper commands (a GATED domain — `list_assistant_threads` /
+// `gated_meeting_thread_turns` fail CLOSED on the live unlock snapshot and route through the
+// `*_visible` readers; the gate LOGIC is byte-identical, only relocated). Bound as `ask_commands`
+// (via `#[path]`) to keep it clearly distinct and avoid any future name shadow.
+#[path = "ask.rs"]
+mod ask_commands;
+pub use ask_commands::*;
+
+// Meetings read / detail / tags / speaker-reconcile commands (a GATED domain — `get_meeting_detail`
+// masks to a sealed DTO, `get_timeline` returns empty, `list_meetings`/`search_meetings`/
+// `brain_overview` route through the backend mask + `unlocked_snapshot`; the gate/mask LOGIC is
+// byte-identical, only relocated). Bound as `meetings_commands` (via `#[path]`) to keep it clearly
+// distinct and avoid any future name shadow.
+#[path = "meetings.rs"]
+mod meetings_commands;
+pub use meetings_commands::*;
+
 /// Keychain account for the AI Gateway API key (matches `summarize::GATEWAY_KEY_ACCOUNT`).
 /// Strictly separate from `ANTHROPIC_KEY_ACCOUNT` (defined in `commands/secrets.rs`) — never a
 /// fallback to the Anthropic key (R3). Kept here because the gateway model-listing helpers below
@@ -105,23 +131,6 @@ pub struct StartResult {
     pub meeting_id: String,
 }
 
-/// Live recording state, so a freshly-loaded webview can resync to a capture that is STILL running
-/// in the (long-lived) Rust process. In `tauri dev` a frontend hot-reload swaps the webview without
-/// restarting the backend, so the FE store resets to `idle` while `AppState.recorder` is still
-/// `Some(..)` — the desync that made the next Start fail with "already recording". This exposes only
-/// the ACTIVELY-recording meeting (which cannot be sealed — it's a fresh in-progress draft), so it
-/// leaks no locked content.
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RecordingStatus {
-    /// True while the backend recorder is actively capturing.
-    pub recording: bool,
-    /// The in-progress meeting id, or `None` when idle.
-    pub meeting_id: Option<String>,
-    /// The in-progress meeting's `started_at` (RFC3339), so the FE anchors its elapsed timer to the
-    /// real start instead of an epoch-sized value. `None` when idle or the row can't be read.
-    pub started_at: Option<String>,
-}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -150,22 +159,6 @@ pub struct ProviderStatus {
     pub reason: Option<String>,
 }
 
-/// One stored voiceprint surfaced to a management view (opt-in voice biometrics). NEVER carries the
-/// raw embedding — only the label + provenance + dimension the FE needs to list/forget. Read ONLY
-/// through the gated `list_voiceprints` command (a sealed meeting's row never reaches here).
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct VoiceprintInfo {
-    pub id: String,
-    pub meeting_id: String,
-    /// The diarized cluster index within its source meeting (the `others-{n}` suffix).
-    pub cluster_index: i64,
-    /// The bound person name once the cluster is enrolled by rename (None until then).
-    pub label: Option<String>,
-    /// Embedding dimensionality (a harmless count; NOT the embedding itself).
-    pub dim: i64,
-    pub created_at: String,
-}
 
 /// A suggested label for a diarized cluster of the current meeting, from cosine re-identification
 /// against the GATED set of labeled prior voiceprints. The FE offers it as a one-tap rename.
@@ -532,46 +525,7 @@ pub struct MeetingDetailDto {
 
 // ── Commands (PHASE0-PLAN §7) ──
 
-/// PHASE 6 — set (or clear) the FOCUS meeting: the meeting the user is currently VIEWING /
-/// anchored to, DISTINCT from the recording pointer (`state.current_meeting`, `Some` only while
-/// recording). The FE calls this with `Some(id)` when it opens a meeting-detail / conversation
-/// view and `None` when it closes, so the brain's Tier-1 "this meeting" scope
-/// ([`crate::transcribe::live::resolve_scope_meeting`]) is deterministic even when nothing is
-/// recording AND when a DIFFERENT meeting is recording — the backend safety-net for any assistant
-/// path that falls back off an explicit FE `meeting_id` (the voice/wake twin). This stores ONLY an
-/// id (never meeting content), so there is no seal/verify-before-destroy or clear-on-relock to do:
-/// a relock re-masks the focused meeting's CONTENT through the existing `meeting_is_visible` gate
-/// (`gated_live_context` fail-closes), and the stale id itself leaks nothing. A blank/whitespace
-/// id is treated as clear (`None`). Fail-safe: a poisoned focus mutex recovers via `into_inner()`
-/// (the pointer carries no invariant) rather than bricking the setter. No PII (opaque id only).
-#[tauri::command]
-pub fn set_focus_meeting(
-    state: State<'_, AppState>,
-    meeting_id: Option<String>,
-) -> Result<(), AppError> {
-    set_focus_meeting_inner(state.inner(), meeting_id);
-    Ok(())
-}
 
-/// Inner of [`set_focus_meeting`] taking `&AppState` so it is headless-testable without a
-/// `tauri::State`. Normalizes a blank/whitespace id to `None` (clear) and fail-safes on a poisoned
-/// focus mutex via `into_inner()` (the pointer carries no invariant, so recovering it is safe and
-/// never bricks the setter). No PII (opaque id only).
-pub(crate) fn set_focus_meeting_inner(state: &AppState, meeting_id: Option<String>) {
-    let normalized = meeting_id
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-    let mut focus = state
-        .focus_meeting
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    *focus = normalized;
-    tracing::debug!(
-        target: "brain",
-        has_focus = focus.is_some(),
-        "focus meeting updated"
-    );
-}
 
 /// Begin mic capture. Inserts a Meeting(Draft→Recording), stores Recorder in state,
 /// sets current_meeting. Returns the new meeting id. Errors if already recording.
@@ -1064,385 +1018,23 @@ fn compute_duration_s(
     }
 }
 
-/// Current mic peak level 0.0..=1.0 for the meter (0.0 when idle). Cheap, polled by UI ~10x/s.
-///
-/// This is ALSO the detection site for the 4h `MAX_RECORDING_SECONDS` hard TIME cap. The live-caption
-/// loop (`transcribe::live`) is only spawned when a whisper model resolves — a user with no model
-/// downloaded gets no live loop, yet the recording (and the cap) still happen — so the live loop is
-/// NOT a reliable place to detect the cap. The FE polls THIS command every 100 ms while recording
-/// (`recorder.store.ts` `level`), unconditionally, for the whole recording — making it the site that
-/// ALWAYS runs. On the RISING edge (cap reached, notice not yet emitted this recording) we emit
-/// [`crate::events::EVENT_RECORDING_CAPPED`] exactly once so the FE can surface the notice and call
-/// `stop_recording` to finalize the meeting (the capped buffer is intact — Stop still yields a note).
-/// Best-effort: a failed emit only warns; the meter read is unaffected.
-#[tauri::command]
-pub fn recording_level(app: AppHandle, state: State<'_, AppState>) -> Result<f32, AppError> {
-    let recorder = state
-        .recorder
-        .lock()
-        .map_err(|_| AppError::Audio("recorder mutex poisoned".into()))?;
-    let Some(r) = recorder.as_ref() else {
-        return Ok(0.0);
-    };
-    let level = r.level();
-    // 4h TIME cap: fire the "maximum recording length reached" notice exactly ONCE per recording,
-    // on the false→true transition. `capped_notified` is the per-recording rising-edge latch,
-    // re-armed at each `start_recording`.
-    if r.cap_reached() {
-        let already = state
-            .capped_notified
-            .load(std::sync::atomic::Ordering::Relaxed);
-        if crate::audio::recorder::should_emit_cap_notice(true, already) {
-            state
-                .capped_notified
-                .store(true, std::sync::atomic::Ordering::Relaxed);
-            // PII rule (§8): log the flag only — never any content.
-            tracing::warn!(
-                target: "audio",
-                "maximum recording length reached — surfacing cap notice to finalize the meeting"
-            );
-            crate::events::emit_recording_capped(&app);
-        }
-    }
-    Ok(level)
-}
 
-/// Report whether the backend is CURRENTLY capturing, plus the in-progress meeting id and its start
-/// time. A freshly-loaded webview calls this ONCE on init to resync: a `tauri dev` frontend hot-reload
-/// (or any webview reload / Cmd-R / webview crash) swaps the FE without restarting the long-lived Rust
-/// process, so `AppState.recorder` can still be `Some(..)` (genuinely recording to disk) while the FE
-/// `RecorderStore` has reset to `idle`. Without this resync the next Start hits `start_recording`'s
-/// `already recording` guard, and the Record screen disagrees with the still-`RECORDING` meeting row.
-/// Read-only + leak-safe: the actively-recording meeting is a fresh in-progress draft that cannot be
-/// sealed, so no `meeting_is_unlocked` gate is needed (it returns no note/transcript/audio content).
-#[tauri::command]
-pub fn recording_status(state: State<'_, AppState>) -> Result<RecordingStatus, AppError> {
-    // The live recorder — NOT the lingering `current_meeting` — is the source of truth for "am I
-    // recording". After a full process restart the recorder is `None` again, so idle is reported even
-    // if a ghost row somehow survived reconcile.
-    let recording = {
-        let recorder = state
-            .recorder
-            .lock()
-            .map_err(|_| AppError::Audio("recorder mutex poisoned".into()))?;
-        recorder.is_some()
-    };
-    let meeting_id = if recording {
-        let current = state
-            .current_meeting
-            .lock()
-            .map_err(|_| AppError::Audio("current_meeting mutex poisoned".into()))?;
-        current.map(|u| u.to_string())
-    } else {
-        None
-    };
-    Ok(recording_status_dto(&state.db, recording, meeting_id))
-}
 
-/// Assemble the [`RecordingStatus`] DTO from the recorder-presence flag + the in-progress meeting id,
-/// resolving the start time from the persisted row. Split out of the command so both branches are
-/// unit-testable WITHOUT a live [`Recorder`] (which needs mic hardware and can't be built headless).
-/// The `started_at` lookup is best-effort: a missing/unreadable row just drops the anchor (the FE
-/// falls back to "now") — it never fails the status read.
-fn recording_status_dto(
-    db: &crate::storage::Db,
-    recording: bool,
-    meeting_id: Option<String>,
-) -> RecordingStatus {
-    if !recording {
-        return RecordingStatus {
-            recording: false,
-            meeting_id: None,
-            started_at: None,
-        };
-    }
-    let started_at = meeting_id
-        .as_deref()
-        .and_then(|id| db.get_meeting(id).ok().flatten())
-        .map(|m| m.started_at);
-    RecordingStatus {
-        recording: true,
-        meeting_id,
-        started_at,
-    }
-}
 
-/// Live-toggle the microphone mute mid-recording (no stream teardown). While muted, the cpal
-/// capture callback writes SILENCE into the mic buffer for those frames — the stream stays
-/// full-length so its wall-clock timeline (and thus "me"/"others" alignment) is preserved, and
-/// no real mic audio is captured (privacy). No-op if not recording.
-#[tauri::command]
-pub fn set_mic_muted(state: State<'_, AppState>, muted: bool) -> Result<(), AppError> {
-    let recorder = state
-        .recorder
-        .lock()
-        .map_err(|_| AppError::Audio("recorder mutex poisoned".into()))?;
-    if let Some(r) = recorder.as_ref() {
-        r.set_muted(muted);
-    }
-    Ok(())
-}
 
-/// Whether the mic is currently muted on the live recorder (false when not recording).
-#[tauri::command]
-pub fn is_mic_muted(state: State<'_, AppState>) -> Result<bool, AppError> {
-    let recorder = state
-        .recorder
-        .lock()
-        .map_err(|_| AppError::Audio("recorder mutex poisoned".into()))?;
-    Ok(recorder.as_ref().map(|r| r.is_muted()).unwrap_or(false))
-}
 
-/// Result of arming a MANUAL voice command (the button trigger).
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct VoiceCommandArmResult {
-    /// True when the live loop is now armed to capture the next utterance as a command.
-    pub listening: bool,
-    /// Short, non-PII reason when `listening` is false (e.g. "not recording").
-    pub reason: Option<String>,
-}
 
-/// ARM the MANUAL voice-command capture: the user clicked "ask the assistant", so the next spoken
-/// utterance is taken as a command — NO wake word, NO word-order requirement. This command does NOT
-/// itself transcribe; it sets [`crate::state::CaptureState`] on `AppState` so the already-running
-/// live-caption loop (`transcribe::live`) collects + dispatches the command over the SAME gated +
-/// consent-gated `handle_voice_action` path as the wake trigger (no new egress class). Opt-in PER
-/// CLICK — independent of the `realtime_reactions` toggle.
-///
-/// The live loop only runs DURING recording, so if no recording is in progress we arm nothing and
-/// return `listening: false` with a clear reason (the FE should enable the button only while
-/// recording). Emits [`crate::events::EVENT_VOICE_COMMAND_LISTENING`] so the FE can show the
-/// "listening…" state; the answer arrives later via `EVENT_VOICE_ACTION_RESULT`.
-#[tauri::command]
-pub fn begin_voice_command(
-    app: AppHandle,
-    state: State<'_, AppState>,
-) -> Result<VoiceCommandArmResult, AppError> {
-    let result = begin_voice_command_inner(state.inner())?;
-    if result.listening {
-        tracing::info!(target: "voice", "manual voice command armed");
-        let _ = app.emit(
-            crate::events::EVENT_VOICE_COMMAND_LISTENING,
-            crate::events::VoiceCommandListeningPayload { active: true },
-        );
-    }
-    Ok(result)
-}
 
-/// Headless core of [`begin_voice_command`]: arm the manual-capture state on `AppState`, returning
-/// whether the live loop is now listening. The live loop only runs DURING recording, so when no
-/// recording is in progress we arm nothing and report `listening: false` with a reason (arming a
-/// capture nothing will ever consume would leave the FE stuck "listening"). No `AppHandle`/IPC here,
-/// so it is unit-testable without Tauri.
-pub(crate) fn begin_voice_command_inner(
-    state: &AppState,
-) -> Result<VoiceCommandArmResult, AppError> {
-    // Latch the recorder's current total-sample offset AT CLICK TIME so the live loop transcribes
-    // only the POST-CLICK utterance (the command the user is about to speak), cleanly isolated from
-    // any prior speech in the rolling buffer. `None` (no recorder) ⇒ not recording ⇒ arm nothing.
-    let start_sample = state
-        .recorder
-        .lock()
-        .map_err(|_| AppError::Audio("recorder mutex poisoned".into()))?
-        .as_ref()
-        .map(|r| r.total_samples());
-    let live_running = state
-        .live_running
-        .load(std::sync::atomic::Ordering::SeqCst);
-    match voice_command_arm_decision(start_sample, live_running) {
-        // A refusal (not recording / no live consumer) — arm NOTHING and return the reason.
-        Err(refusal) => Ok(refusal),
-        // Cleared to arm: latch the fresh capture the live loop consumes.
-        Ok(offset) => {
-            let mut guard = state.voice_command_capture.lock().map_err(|_| {
-                AppError::Other(anyhow::anyhow!("voice-command capture mutex poisoned"))
-            })?;
-            *guard = Some(crate::state::CaptureState::armed_from(offset));
-            Ok(VoiceCommandArmResult {
-                listening: true,
-                reason: None,
-            })
-        }
-    }
-}
 
-/// PURE arm decision for [`begin_voice_command_inner`] (no state, no locks → unit-testable without a
-/// real `Recorder`). `recording_offset` is `Some(total_samples)` while recording, `None` otherwise;
-/// `live_running` is whether the live-caption loop (the ONLY consumer of a voice capture) is running.
-///
-/// Returns `Ok(offset)` when the click may arm, else `Err(refusal)` carrying the FE-facing reason:
-/// - not recording ⇒ "not recording" (arm nothing — the live loop only runs during a recording);
-/// - TP-F1: recording but NO live consumer ⇒ "voice needs the live model" (the fresh-install
-///   heavy-turbo default spawns no live loop, so an armed capture would WEDGE with nothing to
-///   transcribe/dispatch it — refuse cleanly instead of arming a consumer-less generation).
-fn voice_command_arm_decision(
-    recording_offset: Option<usize>,
-    live_running: bool,
-) -> std::result::Result<usize, VoiceCommandArmResult> {
-    let Some(offset) = recording_offset else {
-        return Err(VoiceCommandArmResult {
-            listening: false,
-            reason: Some("not recording".into()),
-        });
-    };
-    if !live_running {
-        return Err(VoiceCommandArmResult {
-            listening: false,
-            reason: Some("voice needs the live model".into()),
-        });
-    }
-    Ok(offset)
-}
 
-/// STOP the MANUAL voice-command capture (CLICK-TO-STOP): the user clicked "stop" / "done", so the
-/// FULL accumulated post-click utterance is the command. This does NOT itself transcribe or dispatch;
-/// it flips the armed [`crate::state::CaptureState`]'s `ended` flag so the already-running live loop
-/// (`transcribe::live`) dispatches the FULL accumulated command over the SAME gated + consent-gated
-/// `handle_voice_action` path on its next tick (no new read/egress class).
-///
-/// The dispatch + the "thinking…" PROCESSING event are emitted by the live loop, so the answer still
-/// arrives via [`crate::events::EVENT_VOICE_ACTION_RESULT`]. On a NOT-armed state (no capture in
-/// progress — the user double-clicked, or it already auto-stopped at the backstop) this is a graceful
-/// no-op (`stopped: false`), never an error.
-#[tauri::command]
-pub fn end_voice_command(state: State<'_, AppState>) -> Result<VoiceCommandEndResult, AppError> {
-    let result = end_voice_command_inner(state.inner())?;
-    if result.stopped {
-        tracing::info!(target: "voice", "manual voice command stopped by user — dispatching");
-    }
-    Ok(result)
-}
 
-/// Result of stopping a MANUAL voice command (the "stop" click).
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct VoiceCommandEndResult {
-    /// True when an armed capture was found and flagged to dispatch; false when nothing was armed
-    /// (graceful no-op — the live loop already cleared it via dispatch or the backstop).
-    pub stopped: bool,
-}
 
-/// Headless core of [`end_voice_command`]: flip the armed capture's `ended` flag so the live loop
-/// dispatches the FULL accumulated utterance on its next tick. A NOT-armed state is a graceful no-op
-/// (`stopped: false`). No `AppHandle`/IPC here, so it is unit-testable without Tauri.
-pub(crate) fn end_voice_command_inner(state: &AppState) -> Result<VoiceCommandEndResult, AppError> {
-    let mut guard = state
-        .voice_command_capture
-        .lock()
-        .map_err(|_| AppError::Other(anyhow::anyhow!("voice-command capture mutex poisoned")))?;
-    match guard.as_mut() {
-        Some(capture) => {
-            capture.ended = true;
-            Ok(VoiceCommandEndResult { stopped: true })
-        }
-        // Nothing armed (already dispatched / backstop-stopped / never started) → graceful no-op.
-        None => Ok(VoiceCommandEndResult { stopped: false }),
-    }
-}
 
-/// Ask the in-meeting assistant a TYPED question (the text composer — the twin of the voice trigger).
-/// Routes the typed command through the SAME gated agentic brain as voice ([`spawn_assistant_turn`] →
-/// `run_assistant_turn`): the model decides which gated tools to call, falling through to the
-/// deterministic floor on no-consent / non-convergence, and the answer arrives via
-/// `EVENT_VOICE_ACTION_RESULT` with the live tool-trace on `EVENT_ASSISTANT_TOOL`. Runs OFF-thread
-/// (the brain can take seconds). The text is the user's OWN words — the SAME egress class as a
-/// dictated voice command (no new egress). Emits the "thinking…" processing affordance immediately.
-/// `thread_id` is OPTIONAL: the FE passes an @brain thread's id to keep the exchange in that
-/// thread; when absent (the voice/wake twin sends none) the backend GENERATES a UUID v4 inside the
-/// turn, so every persisted exchange carries a thread identity going forward.
-/// `meeting_id` (FE camelCase `meetingId`) is the OPTIONAL scope meeting this thread is bound to
-/// (Phase 4): the backend resolves `meeting_id.or(state.current_meeting)`, so an explicit FE id wins
-/// (a past/anchored thread scopes correctly) while a `None` keeps the live-recording pointer. This is
-/// what kills the wrong-meeting bug (idle @brain no longer defaults to a vault-wide arbitrary meeting).
-#[tauri::command]
-pub fn ask_assistant_text(
-    app: AppHandle,
-    text: String,
-    thread_id: Option<String>,
-    meeting_id: Option<String>,
-) -> Result<(), AppError> {
-    let text = text.trim().to_string();
-    if text.is_empty() {
-        return Err(AppError::InvalidArg("empty question".into()));
-    }
-    let _ = app.emit(
-        crate::events::EVENT_VOICE_COMMAND_PROCESSING,
-        crate::events::VoiceCommandProcessingPayload { active: true },
-    );
-    crate::transcribe::live::spawn_assistant_turn(app, text, thread_id, meeting_id);
-    Ok(())
-}
 
-/// One message in the in-meeting CHAT conversation (the dedicated chat panel). `role` is `"user"` or
-/// `"assistant"`; the FE sends the FULL conversation (incl. the new user message as the last item) on
-/// every turn, so the brain gets the prior turns as context (multi-turn memory). NO id/timestamp — the
-/// FE owns the conversation state; the backend is stateless per call.
-#[derive(Debug, Clone, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ChatMsg {
-    pub role: String,
-    pub text: String,
-}
 
-/// Cap on conversation turns fed back as context — bounds tokens (and cloud egress) on a long chat.
-const CHAT_CONTEXT_TURNS: usize = 12;
 
-/// Brain v2 L3 — token-ish CHAR budget on the rendered chat history (~16k tokens). The turn-only
-/// cap ([`CHAT_CONTEXT_TURNS`]) bounds the COUNT but not the SIZE — 12 pasted-document-sized turns
-/// still blow a small model's context — so the char budget trims on top of it, OLDEST-first.
-const CHAT_HISTORY_CHAR_BUDGET: usize = 64_000;
 
-/// Brain v2 L3 — trim `messages` to the newest suffix whose total text is within `budget` chars.
-/// OLDEST-first: walk backward from the newest message accumulating chars and cut where the budget
-/// runs out. The NEWEST message is ALWAYS kept, even if it alone exceeds the budget (dropping the
-/// user's live question is never acceptable — the provider's own limits bound that pathological
-/// case). Pure slice-in/slice-out, so the boundary is unit-testable.
-fn trim_history_to_budget(messages: &[ChatMsg], budget: usize) -> &[ChatMsg] {
-    let mut total = 0usize;
-    let mut start = messages.len();
-    for (i, m) in messages.iter().enumerate().rev() {
-        let cost = m.text.chars().count();
-        // Keep the newest unconditionally; stop BEFORE an older message that would bust the budget.
-        if start < messages.len() && total + cost > budget {
-            break;
-        }
-        total = total.saturating_add(cost);
-        start = i;
-    }
-    &messages[start..]
-}
 
-/// Format the chat `messages` into `(latest, conversation)`: `latest` is the user's newest message
-/// (drives intent-routing + the deterministic floor), `conversation` is the recent history rendered
-/// for the agentic loop's context — capped to the last [`CHAT_CONTEXT_TURNS`] turns AND (L3) to
-/// [`CHAT_HISTORY_CHAR_BUDGET`] chars, oldest-first. Errors when the last message is not a
-/// non-empty user message.
-fn format_chat(messages: &[ChatMsg]) -> Result<(String, String), AppError> {
-    let last = messages
-        .last()
-        .ok_or_else(|| AppError::InvalidArg("empty chat".into()))?;
-    if !last.role.eq_ignore_ascii_case("user") || last.text.trim().is_empty() {
-        return Err(AppError::InvalidArg(
-            "the last chat message must be a non-empty user message".into(),
-        ));
-    }
-    let latest = last.text.trim().to_string();
-    let start = messages.len().saturating_sub(CHAT_CONTEXT_TURNS);
-    let recent = trim_history_to_budget(&messages[start..], CHAT_HISTORY_CHAR_BUDGET);
-    let mut convo =
-        String::from("This is an ongoing chat during a live meeting. Conversation so far:\n");
-    for m in recent {
-        let who = if m.role.eq_ignore_ascii_case("assistant") {
-            "Assistant"
-        } else {
-            "User"
-        };
-        convo.push_str(&format!("{who}: {}\n", m.text.trim()));
-    }
-    convo.push_str("\nAnswer the User's LATEST message, using the conversation above for context.");
-    Ok((latest, convo))
-}
 
 /// Ask the in-meeting assistant a CHAT message — the dedicated multi-turn conversation panel. Unlike
 /// the fire-and-forget voice/card path, this RETURNS the reply (a `VoiceActionResult`) so the chat
@@ -1493,28 +1085,6 @@ pub async fn ask_assistant_chat(
     .map_err(|e| AppError::Other(anyhow::anyhow!("chat task join failed: {e}")))
 }
 
-/// List the PERSISTED @brain thread exchanges for a meeting (only rows carrying a `thread_id`),
-/// oldest first — the durable substrate the FE rebuilds its thread panels from across meeting
-/// switches / restarts. GATED read: it routes through `list_assistant_threads_visible`
-/// (`visibility_clause`-backed), so a sealed-and-not-session-unlocked meeting returns EMPTY —
-/// never an error that leaks existence. On seal the rows are purged anyway
-/// (`purge_assistant_interactions_tx`); the gate is defense-in-depth.
-#[tauri::command]
-pub fn list_assistant_threads(
-    state: State<'_, AppState>,
-    meeting_id: String,
-) -> Result<Vec<crate::storage::models::AssistantThreadRow>, AppError> {
-    // Poisoned lock ⇒ empty unlock set ⇒ fail CLOSED (sealed meetings stay invisible) — the same
-    // posture as the `get_meeting_detail` interactions read.
-    let unlocked = state
-        .unlocked_folders
-        .lock()
-        .map(|g| g.clone())
-        .unwrap_or_default();
-    state
-        .db
-        .list_assistant_threads_visible(&meeting_id, &unlocked)
-}
 
 #[cfg(test)]
 mod chat_format_tests {
@@ -3259,33 +2829,7 @@ pub(crate) fn get_document_inner(state: &AppState, id: &str) -> Result<String, A
     Ok(crate::extract::render_display_text(&text))
 }
 
-/// Headline counts + semantic flags for the Brain page ("what's in my brain"). All counts are over
-/// VISIBLE/unlocked content only (a sealed-not-unlocked folder's items are never counted); carries
-/// NO text. The two flags drive the "vectorize your brain" nudge (semantic off / model absent).
-#[tauri::command]
-pub fn brain_overview(state: State<'_, AppState>) -> Result<BrainOverview, AppError> {
-    brain_overview_inner(state.inner())
-}
 
-/// Inner of [`brain_overview`] taking `&AppState` (unit-testable gate).
-pub(crate) fn brain_overview_inner(state: &AppState) -> Result<BrainOverview, AppError> {
-    let unlocked = unlocked_snapshot(state)?;
-    let (meeting_count, document_count, note_count, indexed_chunk_count) =
-        state.db.brain_counts(&unlocked)?;
-    let semantic_enabled = state
-        .config
-        .lock()
-        .map(|c| c.semantic_search_enabled)
-        .unwrap_or(false);
-    Ok(BrainOverview {
-        meeting_count,
-        document_count,
-        note_count,
-        indexed_chunk_count,
-        semantic_enabled,
-        embed_model_present: crate::embed::embed_model_present(),
-    })
-}
 
 /// Permanently delete a document and cascade-delete its chunks + vectors. GATED: a
 /// sealed-and-NOT-session-unlocked folder is refused (`AppError::Locked`) so the lock state can't be
@@ -5414,15 +4958,6 @@ pub async fn import_memories(state: State<'_, AppState>, text: String) -> Result
     .map_err(|e| AppError::Other(anyhow::anyhow!("import task join failed: {e}")))?
 }
 
-/// The reasoner the memory IMPORT extracts on: the LIGHT engine handle (`ReasonerCell::light`) —
-/// LOCAL-or-stub, NEVER cloud, regardless of Brain Live / role config / consent. The FE copy
-/// promises "extracts the durable facts on-device"; routing the pasted export through
-/// `extraction_reasoner()` (cloud-classified Notes provider under the default `brain_live=false`)
-/// would egress a content class users were told stays local (lock-security W2). Stub ⇒ the import
-/// extracts nothing (0 imported) — degrade, never egress.
-fn import_extraction_reasoner(state: &AppState) -> std::sync::Arc<dyn crate::reason::LocalReasoner> {
-    state.reasoner.light()
-}
 
 /// Inner of [`import_memories`] (unit-testable: Db + reasoner + flag injected).
 pub(crate) fn import_memories_inner(
@@ -5485,17 +5020,6 @@ pub(crate) fn import_memories_inner(
     Ok(adds)
 }
 
-/// Full-text-ish search across meeting titles, transcripts, and notes (Library search).
-#[tauri::command]
-pub fn search_meetings(
-    state: State<'_, AppState>,
-    query: String,
-) -> Result<Vec<SearchHit>, AppError> {
-    // BLK-2b: search only VISIBLE meetings (open/unlocked folders) so a sealed-and-not-unlocked
-    // meeting's title/transcript/note never surfaces in a hit — independent of at-rest blanking.
-    let unlocked = unlocked_snapshot(state.inner())?;
-    state.db.search_visible(&query, 100, &unlocked)
-}
 
 /// Permanently delete a meeting: its audio file, its exported vault note, and all DB rows
 /// (segments, notes, timeline cascade via FK). Irreversible.
@@ -5701,73 +5225,11 @@ pub async fn chat_meeting(
     provider.complete(&system, &user).await
 }
 
-/// Best-effort detection of a running meeting app (Zoom / Teams / Webex) to offer a
-/// "start recording?" nudge. Browser-based Google Meet is NOT detectable this way.
-#[tauri::command]
-pub fn detect_meeting_app() -> Result<Option<String>, AppError> {
-    let listing = match std::process::Command::new("ps")
-        .arg("-axo")
-        .arg("comm=")
-        .output()
-    {
-        Ok(o) => String::from_utf8_lossy(&o.stdout).into_owned(),
-        Err(_) => return Ok(None),
-    };
-    for (needle, name) in [
-        ("zoom.us", "Zoom"),
-        ("Microsoft Teams", "Microsoft Teams"),
-        ("Webex", "Webex"),
-    ] {
-        if listing.contains(needle) {
-            return Ok(Some(name.to_string()));
-        }
-    }
-    Ok(None)
-}
 
-/// Replace a meeting's tags (trimmed, de-duplicated by the DB).
-#[tauri::command]
-pub fn set_meeting_tags(
-    state: State<'_, AppState>,
-    meeting_id: String,
-    tags: Vec<String>,
-) -> Result<(), AppError> {
-    state.db.set_meeting_tags(&meeting_id, &tags)
-}
 
-/// A meeting's tags (sorted).
-#[tauri::command]
-pub fn get_meeting_tags(
-    state: State<'_, AppState>,
-    meeting_id: String,
-) -> Result<Vec<String>, AppError> {
-    state.db.get_meeting_tags(&meeting_id)
-}
 
-/// All distinct tags across meetings (for the Library filter).
-#[tauri::command]
-pub fn list_all_tags(state: State<'_, AppState>) -> Result<Vec<String>, AppError> {
-    state.db.list_all_tags()
-}
 
-/// Meetings carrying a given tag, newest first. Sealed-and-not-session-unlocked meetings are
-/// MASKED at the backend before the DTO crosses IPC, exactly like [`list_meetings`] — the tag
-/// view is the same Library surface, so a sealed title / audio path must not leak through it
-/// (rule: every content read is gated; see `mask_locked_meetings`).
-#[tauri::command]
-pub fn list_meetings_by_tag(
-    state: State<'_, AppState>,
-    tag: String,
-) -> Result<Vec<Meeting>, AppError> {
-    list_meetings_by_tag_inner(state.inner(), &tag)
-}
 
-/// Inner body of [`list_meetings_by_tag`] (unit-testable without a tauri `State`): the DB read
-/// routed through the same backend mask as [`list_meetings`].
-fn list_meetings_by_tag_inner(state: &AppState, tag: &str) -> Result<Vec<Meeting>, AppError> {
-    let meetings = state.db.list_meetings_by_tag(tag)?;
-    mask_locked_meetings(state, meetings)
-}
 
 /// Per-meeting open/done action-item counts across the VISIBLE library, for the saved-views meetings
 /// surface. GATED: routes the LIVE session unlock set through `Db::list_meeting_action_summaries`
@@ -6743,30 +6205,6 @@ fn file_stem_of(path: &str) -> String {
         .to_string()
 }
 
-/// Read the meeting's OWN @brain THREAD TURNS for user-fact extraction (design spec D5), GATED by the
-/// live session unlock snapshot: `list_assistant_interactions_visible` returns the meeting's turns
-/// only when the meeting is VISIBLE (a sealed-not-unlocked meeting returns EMPTY — fail-closed). Only
-/// the USER COMMAND text is included (the high-signal part — an explicit "zapamiętaj, że…"); the
-/// assistant's answer is never fed back into extraction. Best-effort: any read error ⇒ empty string
-/// (extraction degrades to note+notes). Content-free on error.
-fn gated_meeting_thread_turns(state: &AppState, meeting_id: &str) -> String {
-    let unlocked = match unlocked_snapshot(state) {
-        Ok(u) => u,
-        Err(_) => return String::new(),
-    };
-    let turns = match state
-        .db
-        .list_assistant_interactions_visible(meeting_id, &unlocked)
-    {
-        Ok(t) => t,
-        Err(_) => return String::new(),
-    };
-    turns
-        .iter()
-        .map(|i| format!("User: {}", i.command.trim()))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
 
 /// Resolve the people + projects in a meeting note → persist them to the encrypted DB graph
 /// (always) and mirror them as `[[Person]]` / `[[Project]]` vault stubs (only when a vault is
@@ -7605,227 +7043,14 @@ pub async fn ask_vault(
     .await
 }
 
-/// Max agentic rounds for the Ask surface. Not live-latency-bound like the in-meeting cascade tiers
-/// (`TIER1/2/3_MAX_STEPS` in `transcribe::live`, kept small so up-to-three tiers stay live-safe), so
-/// the deliberately vault-wide Ask page gets a little more room to search + read — still bounded.
-const ASK_MAX_STEPS: usize = 6;
 
-/// Cap the incoming Ask history to the last [`CHAT_CONTEXT_TURNS`] turns — the same discipline as
-/// the in-meeting chat panel, closing the unbounded-prompt-growth gap the pre-agentic `ask_vault`
-/// had (it rendered the whole history uncapped).
-fn capped_ask_history(history: &[ChatTurn]) -> &[ChatTurn] {
-    let start = history.len().saturating_sub(CHAT_CONTEXT_TURNS);
-    &history[start..]
-}
 
-/// Run the vault-scoped agentic attempt for [`ask_vault`]. Returns `Some(result)` ONLY when the
-/// loop CONVERGED; `None` on non-convergence or ANY loop error — incl. `Unavailable` (no cloud
-/// consent) — so the caller floors to the pre-agentic path with its original semantics.
-fn ask_vault_agentic_attempt(
-    app: &AppHandle,
-    question: &str,
-    history: &[ChatTurn],
-    thread_id: &str,
-) -> Option<AskVaultResult> {
-    let state = app.state::<AppState>();
-    let config = match state.config.lock() {
-        Ok(c) => c.clone(),
-        Err(_) => return None, // poisoned config ⇒ floor (which will surface its own error)
-    };
-    // Re-resolved per turn (never a startup snapshot): consent/provider/backend changes apply.
-    // ASK role — under the legacy fallback this dispatches exactly like the pre-role `current()`.
-    let reasoner = state
-        .reasoner
-        .current_for(crate::summarize::roles::Role::Ask);
-    // VAULT-SCOPED executor: no live meeting, READ-ONLY, and NO note drafts (the Ask page has no
-    // notes flow / Accept affordance, so `propose_note` is not advertised on this surface). The
-    // AppHandle is present so web_search / calendar_lookup participate under their existing
-    // consent/availability gates. Every read re-checks the LIVE unlocked set per call (C6).
-    let executor = crate::tools::GatedToolExecutor {
-        db: &state.db,
-        unlocked: &state.unlocked_folders,
-        config: &config,
-        meeting_id: "",
-        app: Some(app),
-        allow_writes: false,
-        note_drafts: false,
-        // The Ask page is DELIBERATELY vault-wide (Phase 5 preserves it unchanged) — the FULL
-        // per-surface catalog, NOT a cascade tier: it is not the in-meeting @brain surface the
-        // current-first cascade governs.
-        scope: crate::tools::AssistantScope::Full,
-        // Seal-on-write handles (residual W1): read-only today (`allow_writes: false`), but the
-        // executor carries the live seam so a future write surface can never silently skip it.
-        seal: Some(crate::tools::SealAccess {
-            master_kek: &state.master_kek,
-            lifecycle: &state.lifecycle,
-        }),
-        proposed_note: std::sync::Mutex::new(None),
-    };
-    let sink = crate::transcribe::live::ToolEventSink {
-        app: app.clone(),
-        event: crate::events::EVENT_ASK_TOOL,
-        thread_id: thread_id.to_string(),
-    };
-    // Gated cross-meeting USER MEMORY brief for the agentic persona (parity with the @brain loop):
-    // VISIBLE facts only under the LIVE unlock snapshot, empty when memory is disabled ⇒ the persona
-    // is byte-identical. Rides the loop's existing redaction + consent egress (no new class).
-    let unlocked_now = state
-        .unlocked_folders
-        .lock()
-        .map(|g| g.clone())
-        .unwrap_or_default();
-    let memory_brief = gated_memory_brief_for_injection(&state, &unlocked_now, question);
-    // Brain v2 L3 — JIT retrieval (behind `ask_jit_retrieval`, default OFF): seed the persona with
-    // a compact GATED meeting listing (id | title | date, top-30 — hybrid when semantic search is
-    // on, gated FTS otherwise) + search-then-`get_meeting` instructions, instead of any pre-packed
-    // content. Flag OFF passes "" ⇒ the persona is BYTE-IDENTICAL to the legacy agentic prompt.
-    // Every candidate source is `visibility_clause`-gated, so a sealed-not-unlocked meeting
-    // contributes no line; a listing failure degrades to the legacy prompt (never an error).
-    let jit_listing = if config.ask_jit_retrieval {
-        let query_vec = if config.semantic_search_enabled {
-            crate::embed::active_embedder()
-                .embed_query(std::slice::from_ref(&question.to_string()))
-                .ok()
-                .and_then(|v| v.into_iter().next())
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-        crate::summarize::vault_context::build_meeting_listing_visible(
-            &state.db,
-            question,
-            &query_vec,
-            30,
-            &unlocked_now,
-        )
-        .unwrap_or_default()
-    } else {
-        String::new()
-    };
-    // L3: the ASK preset + the `loop_transcript_compaction` flag (default ON) + the default-off
-    // grammar gate (a no-op on today's cloud-only agentic reasoners).
-    let opts = crate::reason::GenOptions::ask_answer()
-        .with_transcript_compaction(config.loop_transcript_compaction)
-        .with_grammar_constraint(config.brain_heavy_grammar_enabled);
-    let org_available = crate::tools::org_brain_available(&state.db, &config);
-    match ask_vault_loop(
-        &*reasoner,
-        &executor,
-        &state.db,
-        &state.unlocked_folders,
-        question,
-        history,
-        &memory_brief,
-        &jit_listing,
-        org_available,
-        Some(&sink as &dyn crate::agent::DeltaSink),
-        opts,
-    ) {
-        Ok(converged) => converged,
-        Err(e) => {
-            // PII rule: the error only — never the question/history text.
-            tracing::debug!(
-                target: "ask",
-                error = %e,
-                "ask agentic loop unavailable/failed; flooring to corpus completion"
-            );
-            None
-        }
-    }
-}
 
-/// The testable core of the agentic Ask path: drive [`crate::agent::run_agentic_loop`] with the
-/// vault-QA persona over the rendered conversation, then map a converged outcome onto the Ask DTO.
-/// `Ok(None)` = non-convergence (caller floors); `Err` propagates (caller floors) — the loop
-/// contract of `run_informational`, applied to the Ask surface.
-///
-/// `jit_listing` (Brain v2 L3) is the compact gated meeting listing for JIT retrieval — `""` (the
-/// `ask_jit_retrieval`-off path) keeps the persona BYTE-IDENTICAL to the legacy agentic prompt
-/// (`agentic_system_jit`'s empty-listing contract). `opts` carries the caller's per-step
-/// generation bounds (the P0.3 ASK preset + the L3 compaction/grammar flags). `org_available` (A2)
-/// is threaded straight to `agentic_system_jit` — the caller passes the SAME `org_brain_available`
-/// predicate that gates the tool's own advertisement, so the hint and the actual tool availability
-/// can never diverge.
-#[allow(clippy::too_many_arguments)]
-fn ask_vault_loop(
-    reasoner: &dyn crate::reason::LocalReasoner,
-    executor: &dyn crate::agent::ToolExecutor,
-    db: &crate::storage::Db,
-    unlocked: &std::sync::Mutex<std::collections::HashSet<String>>,
-    question: &str,
-    history: &[ChatTurn],
-    memory_brief: &str,
-    jit_listing: &str,
-    org_available: bool,
-    sink: Option<&dyn crate::agent::DeltaSink>,
-    opts: crate::reason::GenOptions,
-) -> Result<Option<AskVaultResult>, AppError> {
-    let system =
-        crate::summarize::vault_chat::agentic_system_jit(memory_brief, jit_listing, org_available);
-    let user = crate::summarize::vault_chat::render_conversation(history, question);
-    let Some(outcome) = crate::agent::run_agentic_loop(
-        reasoner,
-        &system,
-        &user,
-        executor,
-        ASK_MAX_STEPS,
-        sink,
-        opts,
-    )?
-    else {
-        return Ok(None);
-    };
-    // Resolve sources against the LIVE unlocked set (fail-closed on a poisoned lock: no source
-    // chips rather than an ungated resolution).
-    let unlocked_now = unlocked.lock().map(|g| g.clone()).unwrap_or_default();
-    Ok(Some(agent_outcome_to_ask_result(
-        db,
-        &unlocked_now,
-        outcome,
-    )))
-}
 
-/// Map a converged [`crate::agent::AgentOutcome`] onto the Ask DTO. `citations` carries the loop's
-/// gated citation strings verbatim (`[[Title]]` / `(web) …`); `sources` additionally resolves each
-/// `[[Title]]` to its VISIBLE meeting (id + date) so the existing source chips keep working. A
-/// title that doesn't resolve to a visible meeting simply contributes no source — never an error,
-/// never an ungated read (`meeting_by_title_visible` applies the same visibility predicate as
-/// every gated reader).
-fn agent_outcome_to_ask_result(
-    db: &crate::storage::Db,
-    unlocked: &std::collections::HashSet<String>,
-    outcome: crate::agent::AgentOutcome,
-) -> AskVaultResult {
-    let mut sources: Vec<crate::storage::models::VaultSource> = Vec::new();
-    for cite in &outcome.citations {
-        let Some(title) = cite.strip_prefix("[[").and_then(|c| c.strip_suffix("]]")) else {
-            continue; // "(web) …" / "(calendar) …" attributions have no meeting to resolve.
-        };
-        match db.meeting_by_title_visible(title, unlocked) {
-            Ok(Some(m)) if !sources.iter().any(|s| s.meeting_id == m.id) => {
-                sources.push(crate::storage::models::VaultSource {
-                    meeting_id: m.id,
-                    title: m.title.unwrap_or_else(|| title.to_string()),
-                    started_at: m.started_at,
-                    origin: None,
-                });
-            }
-            Ok(_) => {}
-            Err(e) => {
-                tracing::debug!(target: "ask", error = %e, "citation source resolution failed")
-            }
-        }
-    }
-    AskVaultResult {
-        answer: outcome.answer,
-        sources,
-        citations: outcome.citations,
-    }
-}
 
 /// The floor's prompt assembly, split from the provider call so the floor-equivalence test can
 /// prove it byte-identical to the pre-agentic implementation without a live provider.
-enum AskFloorPrompt {
+pub(crate) enum AskFloorPrompt {
     /// Nothing to search — the canned early-return result (identical to the pre-change string).
     Empty(AskVaultResult),
     /// The assembled corpus prompt, ready for ONE provider completion.
@@ -7836,68 +7061,6 @@ enum AskFloorPrompt {
     },
 }
 
-/// Everything the pre-agentic `ask_vault` did BEFORE its provider call, verbatim: gated corpus
-/// assembly (hybrid when semantic search is ON, FTS otherwise — Phase 2b semantics unchanged), the
-/// empty-corpus early return, and the corpus prompt build. The floor-equivalence test binds this
-/// to the original statement sequence.
-#[allow(clippy::too_many_arguments)] // cohesive gated-Ask surface: corpus/consent state + explicit sources.
-fn build_ask_vault_floor_prompt(
-    db: &crate::storage::Db,
-    config: &AppConfig,
-    unlocked: &std::collections::HashSet<String>,
-    question: &str,
-    history: &[ChatTurn],
-    memory_brief: &str,
-    reranker: Option<&dyn crate::rerank::Reranker>,
-    explicit_sources: Option<&[crate::storage::models::SourceRef]>,
-) -> Result<AskFloorPrompt, AppError> {
-    // Budget on the ASK-role provider's RESOLVED connection — the corpus egresses to it. With
-    // role keys absent this is the legacy `provider_id` for EVERY brain_backend (the pre-role
-    // floor always ignored `brain_backend`), so the packed corpus is byte-identical.
-    let ask_conn =
-        crate::summarize::roles::provider_target(crate::summarize::roles::Role::Ask, config)
-            .connection;
-    // note↔meeting-links PR-2 — PINNED corpus: when the caller supplied an explicit source list, the
-    // FTS/vector SEARCH is skipped entirely and the corpus is EXACTLY those sources (+ their capped,
-    // gated link-expansion) — the user controls the context. Same `unlocked` visibility gate as
-    // every search leg (a sealed source/neighbour contributes nothing). `None` ⇒ the exact existing
-    // whole-vault search below, byte-for-byte.
-    let (corpus, sources) = if let Some(sources) = explicit_sources.filter(|s| !s.is_empty()) {
-        crate::summarize::vault_context::build_vault_context_pinned_visible(
-            db, sources, &ask_conn, unlocked,
-        )?
-    } else if config.semantic_search_enabled {
-        let embedder = crate::embed::active_embedder();
-        // QUERY side: use the e5 `query:` prefix (asymmetric with the `passage:` index side).
-        let query_vec = embedder
-            .embed_query(std::slice::from_ref(&question.to_string()))?
-            .into_iter()
-            .next()
-            .unwrap_or_default();
-        crate::summarize::vault_context::build_vault_context_hybrid_visible(
-            db, question, &ask_conn, &query_vec, unlocked, reranker,
-        )?
-    } else {
-        crate::summarize::vault_context::build_vault_context_visible(
-            db, question, &ask_conn, unlocked,
-        )?
-    };
-    if corpus.trim().is_empty() {
-        return Ok(AskFloorPrompt::Empty(AskVaultResult {
-            answer: "No meeting notes to search yet — record and summarize a meeting first."
-                .to_string(),
-            sources: Vec::new(),
-            citations: Vec::new(),
-        }));
-    }
-    let (system, user) =
-        crate::summarize::vault_chat::build(&corpus, history, question, memory_brief);
-    Ok(AskFloorPrompt::Ready {
-        system,
-        user,
-        sources,
-    })
-}
 
 /// THE FLOOR — the pre-agentic Ask-My-Vault implementation: gated corpus pack + ONE provider
 /// completion, with the original error/consent semantics (`make_provider`'s fail-closed consent
@@ -9726,115 +8889,12 @@ fn dto_to_config(d: AppConfigDto, current: &AppConfig) -> AppConfig {
     }
 }
 
-/// List available microphone input devices for the FE picker (name + default flag).
-#[tauri::command]
-pub fn list_input_devices() -> Result<Vec<crate::audio::InputDeviceInfo>, AppError> {
-    Ok(crate::audio::list_input_devices())
-}
 
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct StorageReportDto {
-    pub audio_dir: String,
-    pub used_bytes: u64,
-    pub limit_bytes: Option<u64>,
-    pub playback_bytes: u64,
-    pub masters_bytes: u64,
-    pub sealed_bytes: u64,
-    pub recording_count: u64,
-    pub auto_prune: bool,
-}
 
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PruneSummaryDto {
-    pub freed_bytes: u64,
-    pub pruned_count: u64,
-    pub masters_deleted: u64,
-}
 
-/// Recording-storage usage report: on-disk audio path, byte totals bucketed by category,
-/// recording count, and the current cap + auto-prune flag. Sizes only — no content.
-#[tauri::command]
-pub fn get_storage_report(state: State<'_, AppState>) -> Result<StorageReportDto, AppError> {
-    let (limit_bytes, auto_prune) = {
-        let c = state
-            .config
-            .lock()
-            .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
-        (
-            c.audio_storage_limit_gb
-                .map(|g| g as u64 * crate::storage::usage::BYTES_PER_GB),
-            c.audio_auto_prune,
-        )
-    };
-    let dir = crate::pipeline::audio_dir()?;
-    let u = crate::storage::usage::scan_audio_usage(&dir)?;
-    Ok(StorageReportDto {
-        audio_dir: dir.to_string_lossy().into_owned(),
-        used_bytes: u.used_bytes,
-        limit_bytes,
-        playback_bytes: u.playback_bytes,
-        masters_bytes: u.masters_bytes,
-        sealed_bytes: u.sealed_bytes,
-        recording_count: u.recording_count,
-        auto_prune,
-    })
-}
 
-/// Manual "Free up space": prune oldest recordings to the cap NOW (works even when auto-prune
-/// is off). Requires a cap — with none set it is an inert zero summary (the FE disables the
-/// button). Never touches notes or locked audio.
-#[tauri::command]
-pub fn free_up_space(state: State<'_, AppState>) -> Result<PruneSummaryDto, AppError> {
-    let limit_bytes = {
-        let c = state
-            .config
-            .lock()
-            .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
-        c.audio_storage_limit_gb
-            // `Some(0)` is not a "delete everything" cap → no cap (mirrors `AppConfig::load`).
-            .filter(|g| *g > 0)
-            .map(|g| g as u64 * crate::storage::usage::BYTES_PER_GB)
-    };
-    let Some(limit) = limit_bytes else {
-        return Ok(PruneSummaryDto {
-            freed_bytes: 0,
-            pruned_count: 0,
-            masters_deleted: 0,
-        });
-    };
-    let dir = crate::pipeline::audio_dir()?;
-    // Hold the seal lifecycle guard across the prune so it can never interleave with a folder
-    // seal (`lock_folder`) — the same guard every other multi-step audio-path mutator holds.
-    // Acquired AFTER the config lock is released (single lock order: lifecycle ⊃ db, never
-    // config held while holding lifecycle).
-    let _lifecycle = lifecycle_guard(state.inner());
-    let s = crate::storage::usage::prune_to_limit(&state.db, &dir, limit, None)?;
-    Ok(PruneSummaryDto {
-        freed_bytes: s.freed_bytes,
-        pruned_count: s.pruned_count,
-        masters_deleted: s.masters_deleted,
-    })
-}
 
-/// Reveal the recordings folder in Finder (macOS `open`). No content read.
-#[tauri::command]
-pub fn reveal_audio_dir() -> Result<(), AppError> {
-    let dir = crate::pipeline::audio_dir()?;
-    std::process::Command::new("open")
-        .arg(&dir)
-        .spawn()
-        .map_err(|e| AppError::Storage(format!("reveal audio dir: {e}")))?;
-    Ok(())
-}
 
-/// Whether the CURRENT default audio output is the built-in speakers (echo risk while
-/// capturing system audio). Best-effort introspection — `None` when undeterminable.
-#[tauri::command]
-pub fn output_is_builtin_speakers() -> Result<Option<bool>, AppError> {
-    Ok(crate::audio::output::default_output_is_builtin_speakers())
-}
 
 /// DTO for a single model returned by `list_gateway_models`.
 ///
@@ -10224,14 +9284,6 @@ pub(crate) fn retry_transcription_prep(
     Ok(std::path::PathBuf::from(plaintext))
 }
 
-/// Recent meetings for the Library list (newest first, capped). Sealed-and-not-session-unlocked
-/// meetings are MASKED at the backend before the DTO crosses IPC (see [`mask_locked_meetings`]) —
-/// the Library lock gate is enforced in code here, never trusted to the FE.
-#[tauri::command]
-pub fn list_meetings(state: State<'_, AppState>) -> Result<Vec<Meeting>, AppError> {
-    let meetings = state.db.list_meetings(200)?;
-    mask_locked_meetings(state.inner(), meetings)
-}
 
 /// Backend-mask sealed-not-session-unlocked meetings in a Library list, mirroring [`masked_detail`]:
 /// a meeting whose folder is locked (`folders.locked = 1`) AND NOT in the current session unlock set
@@ -10240,7 +9292,7 @@ pub fn list_meetings(state: State<'_, AppState>) -> Result<Vec<Meeting>, AppErro
 /// its `folder_id` are PRESERVED so the FE still renders the inline lock badge (it keys the badge off
 /// `folder_id` + the folder's exposure). The lock decision routes through the session unlock set +
 /// `locked_folder_ids` (the same source the `*_visible` reads use) — NOT the FE.
-fn mask_locked_meetings(
+pub(crate) fn mask_locked_meetings(
     state: &AppState,
     meetings: Vec<Meeting>,
 ) -> Result<Vec<Meeting>, AppError> {
@@ -10270,113 +9322,8 @@ fn mask_locked_meetings(
         .collect())
 }
 
-/// Rename a speaker across a meeting's cached timeline (e.g. "User 1" → "Sarah"). Persists to
-/// the timelines cache and returns the updated timeline.
-#[tauri::command]
-pub fn rename_speaker(
-    state: State<'_, AppState>,
-    meeting_id: String,
-    old_label: String,
-    new_label: String,
-) -> Result<MeetingTimeline, AppError> {
-    rename_speaker_inner(state.inner(), &meeting_id, &old_label, new_label.trim())
-}
 
-/// Inner of [`rename_speaker`] taking `&AppState` (unit-testable gate + enroll). `new_label` is
-/// already trimmed by the command wrapper.
-pub(crate) fn rename_speaker_inner(
-    state: &AppState,
-    meeting_id: &str,
-    old_label: &str,
-    new_label: &str,
-) -> Result<MeetingTimeline, AppError> {
-    if new_label.is_empty() {
-        return Err(AppError::InvalidArg("new speaker name is empty".into()));
-    }
-    // BLK-2b WRITE-GATE: a sealed-and-not-unlocked meeting's timeline `data` is blanked; refuse to
-    // rename a speaker (would persist a near-empty plaintext timeline over the sealed blob in a
-    // locked folder). Fail closed.
-    if !meeting_is_unlocked(state, meeting_id)? {
-        return Err(AppError::Locked(
-            "this meeting's folder is locked — unlock it to rename a speaker".into(),
-        ));
-    }
-    let json = state
-        .db
-        .get_timeline_data(meeting_id)?
-        .ok_or_else(|| AppError::InvalidArg("no timeline for this meeting yet".into()))?;
-    let mut tl: crate::storage::models::MeetingTimeline = serde_json::from_str(&json)
-        .map_err(|e| AppError::InvalidArg(format!("bad timeline data: {e}")))?;
 
-    // Reconstruct the diarized CLUSTER for the OLD label BEFORE the rename rewrites it away. The FE
-    // passes the DISPLAY label the lane shows ("Speaker 1"), not the raw `others-N` tag, so first try
-    // the raw-tag parse (legacy / a raw-tag timeline), then fall back to segment↔turn overlap against
-    // the still-original turns. A label with no overlapping diarized cluster (the "me" lane, or a
-    // non-diarized meeting with no segments) → None → enroll nothing.
-    let old_cluster = parse_others_cluster(old_label).or_else(|| {
-        reconcile_meeting_speakers(state, meeting_id, Some(&tl.speakers))
-            .cluster_for_label(old_label)
-    });
-
-    for turn in &mut tl.speakers {
-        if turn.speaker == old_label {
-            turn.speaker = new_label.to_string();
-        }
-    }
-    let updated = serde_json::to_string(&tl)
-        .map_err(|e| AppError::Storage(format!("serialize timeline: {e}")))?;
-    // SEAM-F2 (2026-07-11 audit, edit lost): in a session-unlocked LOCKED folder the renamed timeline
-    // must be RE-SEALED under the folder CK at write time — the pre-fix bare `set_timeline_data`
-    // landed plaintext-only against the STALE sealed blob, so relock re-blanked the plaintext and the
-    // next unlock restored the OLD speaker labels (the rename was destroyed). Open/rootless meeting →
-    // the plain write inside the helper. Fail-closed on a missing session KEK.
-    set_timeline_data_reseal_if_locked(state, meeting_id, &updated)?;
-
-    // ENROLL-ON-RENAME (Phase 2, opt-in): if the OLD label resolves to a diarized cluster (either a
-    // raw `others-{n}` tag or, via the reconciliation above, the display label the FE lane showed) and
-    // the meeting produced a voiceprint for that cluster, bind the new person name to it so the next
-    // meeting can re-identify this voice. Best-effort + no-op when: the opt-in is off, the label maps
-    // to no cluster, or no voiceprint exists for that cluster (pre-opt-in recording). The rename itself
-    // already succeeded regardless — a failed/absent enroll never fails the command. The WRITE is
-    // anchored to THIS (already-unlocked) meeting; no other meeting's voiceprint is read/written.
-    if let Some(cluster_index) = old_cluster {
-        let enabled = state
-            .config
-            .lock()
-            .map(|c| c.voiceprint_enabled)
-            .unwrap_or(false);
-        if enabled {
-            match state
-                .db
-                .set_voiceprint_label_for_cluster(meeting_id, cluster_index, new_label)
-            {
-                Ok(n) => {
-                    if n > 0 {
-                        tracing::info!(
-                            target: "transcribe", meeting_id = %meeting_id, cluster_index,
-                            "enrolled a voiceprint on rename"
-                        );
-                    }
-                }
-                Err(e) => tracing::warn!(
-                    target: "transcribe", error = %e,
-                    "voiceprint enroll-on-rename failed (rename unaffected)"
-                ),
-            }
-        }
-    }
-    Ok(tl)
-}
-
-/// Parse a diarized-cluster timeline label `others-{n}` → its cluster index, else None. The plain
-/// `others` label (single remote speaker, no cluster suffix) and any human name return None.
-fn parse_others_cluster(label: &str) -> Option<i64> {
-    label
-        .strip_prefix(crate::audio::merge::SPEAKER_OTHERS)?
-        .strip_prefix('-')?
-        .parse::<i64>()
-        .ok()
-}
 
 // ── VOICEPRINTS (Phase 2): cosine re-identification + enroll + management ───────────────────────
 //
@@ -10386,216 +9333,13 @@ fn parse_others_cluster(label: &str) -> Option<i64> {
 // only against OTHER visible LABELED voiceprints; a sealed prior contributes nothing. The raw
 // embedding never crosses the IPC boundary (the DTOs carry label + provenance + dim only).
 
-/// Suggest a person label for each diarized `others-{n}` cluster of `meeting_id`, by cosine
-/// re-identification against prior LABELED voiceprints. GATED: `meeting_is_unlocked` first (a locked
-/// meeting yields no suggestions), then the candidate set is `list_voiceprints_visible` restricted to
-/// labeled rows from OTHER meetings — a sealed prior is never in it. Only matches `>=`
-/// `VOICEPRINT_MATCH_THRESHOLD` are returned. Empty when the opt-in is off, no voiceprint exists, or
-/// nothing matches. NO PII is logged.
-#[tauri::command]
-pub fn suggest_speaker_labels(
-    state: State<'_, AppState>,
-    meeting_id: String,
-) -> Result<Vec<SpeakerSuggestion>, AppError> {
-    suggest_speaker_labels_inner(state.inner(), &meeting_id)
-}
 
-/// Inner of [`suggest_speaker_labels`] taking `&AppState` (unit-testable gate).
-pub(crate) fn suggest_speaker_labels_inner(
-    state: &AppState,
-    meeting_id: &str,
-) -> Result<Vec<SpeakerSuggestion>, AppError> {
-    use crate::transcribe::diarize::{
-        suggest_voiceprint_labels, ClusterEmbeddingRef, LabeledEmbeddingRef,
-        VOICEPRINT_MATCH_THRESHOLD,
-    };
-    // READ-GATE: a locked meeting surfaces nothing (its own clusters are invisible anyway, but fail
-    // closed explicitly).
-    if !meeting_is_unlocked(state, meeting_id)? {
-        return Ok(Vec::new());
-    }
-    // The whole VISIBLE voiceprint corpus (sealed priors already excluded by the visibility clause).
-    let unlocked = unlocked_snapshot(state)?;
-    let all = state.db.list_voiceprints_visible(&unlocked)?;
 
-    // THIS meeting's clusters (candidates to label) vs OTHER meetings' LABELED prints (the gallery).
-    let mine: Vec<_> = all.iter().filter(|v| v.meeting_id == meeting_id).collect();
-    if mine.is_empty() {
-        return Ok(Vec::new());
-    }
-    let labeled_refs: Vec<LabeledEmbeddingRef<'_>> = all
-        .iter()
-        .filter(|v| v.meeting_id != meeting_id)
-        .filter_map(|v| {
-            v.label
-                .as_deref()
-                .filter(|l| !l.trim().is_empty())
-                .map(|label| LabeledEmbeddingRef {
-                    label,
-                    embedding: &v.embedding,
-                })
-        })
-        .collect();
-    if labeled_refs.is_empty() {
-        return Ok(Vec::new());
-    }
-    let cluster_refs: Vec<ClusterEmbeddingRef<'_>> = mine
-        .iter()
-        // Only suggest for clusters that are NOT already labeled in this meeting.
-        .filter(|v| {
-            v.label
-                .as_deref()
-                .map(|l| l.trim().is_empty())
-                .unwrap_or(true)
-        })
-        .map(|v| ClusterEmbeddingRef {
-            cluster_index: v.cluster_index as i32,
-            embedding: &v.embedding,
-        })
-        .collect();
 
-    let suggestions =
-        suggest_voiceprint_labels(&cluster_refs, &labeled_refs, VOICEPRINT_MATCH_THRESHOLD);
 
-    // RE-KEY by the DISPLAY label the FE lane actually shows: the timeline is LLM-generated, so lane
-    // `speaker` = "Speaker 1"/a real name, NOT the raw `others-N` tag. Reconcile the cluster → that
-    // display label via segment↔turn time-overlap so `suggestionByLabel().get(lane.speaker)` matches
-    // for both multi-cluster and single-cluster 1:1. Best-effort: if the meeting has no timeline / no
-    // segments (legacy, sealed-then-unlocked), reconciliation yields nothing → fall back to the raw
-    // `others-N` tag (harmless — a legacy raw-tag timeline still matches; an LLM one just won't chip).
-    let reconciliation = reconcile_meeting_speakers(state, meeting_id, None);
-    Ok(suggestions
-        .into_iter()
-        .map(|s| {
-            let cluster = s.cluster_index as i64;
-            let speaker = reconciliation
-                .label_for_cluster(cluster)
-                .map(str::to_string)
-                .unwrap_or_else(|| {
-                    format!(
-                        "{}-{}",
-                        crate::audio::merge::SPEAKER_OTHERS,
-                        s.cluster_index
-                    )
-                });
-            SpeakerSuggestion {
-                speaker,
-                suggested_label: s.label,
-                score: s.score,
-            }
-        })
-        .collect())
-}
 
-/// Build the cluster↔display-label reconciliation for THIS meeting from segment↔turn time-overlap.
-/// Best-effort + gated by the caller (both call sites first pass `meeting_is_unlocked`): reads ONLY
-/// this meeting's segments + its stored (or supplied) timeline turns — never another meeting's data,
-/// so an enroll can never reach a sealed/other cluster. A missing timeline or missing segments (a
-/// legacy or sealed-then-unlocked meeting) yields an empty reconciliation → no-suggestion / no-enroll,
-/// never an error, never a fabricated cluster. Pass `turns` when the caller already parsed the
-/// timeline (avoids a redundant DB read); pass `None` to load it from the DB. NO PII is logged.
-fn reconcile_meeting_speakers(
-    state: &AppState,
-    meeting_id: &str,
-    turns: Option<&[crate::storage::models::SpeakerTurn]>,
-) -> crate::transcribe::diarize::SpeakerReconciliation {
-    use crate::transcribe::diarize::{reconcile_speakers, TurnRef};
-    let segments = state.db.get_segments(meeting_id).unwrap_or_default();
-    // Own the turns when we have to load them, so the borrow outlives the ref view below.
-    let loaded: Vec<crate::storage::models::SpeakerTurn> = match turns {
-        Some(_) => Vec::new(),
-        None => match state.db.get_timeline_data(meeting_id) {
-            Ok(Some(json)) => serde_json::from_str::<MeetingTimeline>(&json)
-                .map(|t| t.speakers)
-                .unwrap_or_default(),
-            _ => Vec::new(),
-        },
-    };
-    let turns = turns.unwrap_or(&loaded);
-    let turn_refs: Vec<TurnRef<'_>> = turns
-        .iter()
-        .map(|t| TurnRef {
-            start_s: t.start_s,
-            end_s: t.end_s,
-            label: &t.speaker,
-        })
-        .collect();
-    reconcile_speakers(&segments, &turn_refs)
-}
 
-/// List stored voiceprints for a management view (label + source meeting + cluster + dim), GATED —
-/// a sealed-not-unlocked meeting's voiceprint is EXCLUDED. The raw embedding is NEVER returned.
-#[tauri::command]
-pub fn list_voiceprints(state: State<'_, AppState>) -> Result<Vec<VoiceprintInfo>, AppError> {
-    list_voiceprints_inner(state.inner())
-}
 
-/// Inner of [`list_voiceprints`] taking `&AppState` (unit-testable gate).
-pub(crate) fn list_voiceprints_inner(state: &AppState) -> Result<Vec<VoiceprintInfo>, AppError> {
-    let unlocked = unlocked_snapshot(state)?;
-    let rows = state.db.list_voiceprints_visible(&unlocked)?;
-    Ok(rows
-        .into_iter()
-        .map(|v| VoiceprintInfo {
-            id: v.id,
-            meeting_id: v.meeting_id,
-            cluster_index: v.cluster_index,
-            label: v.label,
-            dim: v.dim,
-            created_at: v.created_at,
-        })
-        .collect())
-}
-
-/// FORGET one stored voiceprint by id (hard delete — a voice biometric the user chose to erase).
-/// Idempotent. Content-free logging (the id only). Not itself a content READ, so no gate is needed
-/// (a delete widens no visibility); the management list it feeds IS gated.
-#[tauri::command]
-pub fn forget_voiceprint(state: State<'_, AppState>, id: String) -> Result<(), AppError> {
-    let removed = state.db.delete_voiceprint(&id)?;
-    tracing::info!(target: "transcribe", voiceprint_id = %id, removed, "voiceprint forgotten");
-    Ok(())
-}
-
-/// CLEAR every stored voiceprint (the "forget all captured voices" affordance). Content-free
-/// logging (a count only).
-#[tauri::command]
-pub fn clear_voiceprints(state: State<'_, AppState>) -> Result<(), AppError> {
-    let n = state.db.clear_voiceprints()?;
-    tracing::info!(target: "transcribe", count = n, "all voiceprints cleared");
-    Ok(())
-}
-
-/// Speaker + topic timeline for a meeting — READ-ONLY (cached-or-empty; NEVER generates).
-///
-/// perf-memory-audit / OOM: a passive Audio-tab open must not have a multi-GB side effect. Reading a
-/// not-yet-cached timeline used to synchronously load the on-device Notes model (Qwen/Bielik) and
-/// compile Metal shaders on first run, which swap-death-beachballed the whole Mac on OPEN. Generation
-/// now lives in the SEPARATE, EXPLICIT `generate_timeline` command (auto-fired by the FE only for
-/// cheap CLOUD providers; hidden behind a user click for on-device — see
-/// `timeline_generation_on_device`).
-#[tauri::command]
-pub fn get_timeline(
-    state: State<'_, AppState>,
-    meeting_id: String,
-) -> Result<MeetingTimeline, AppError> {
-    // Phase 0.5 READ-GATE: a sealed-and-not-unlocked meeting returns an EMPTY timeline (its
-    // `timelines.data` is blanked at rest while sealed, but mask explicitly + skip regeneration so
-    // we never re-derive a timeline from now-blank segments).
-    if !meeting_is_unlocked(state.inner(), &meeting_id)? {
-        return Ok(MeetingTimeline::default());
-    }
-    // Return the CACHED timeline (coverage-repaired on read so a legacy cache — e.g. one ending at
-    // 0:14 for a 0:45 recording — heals) or an EMPTY one when nothing is cached. No provider load.
-    let segments = state.db.get_segments(&meeting_id)?;
-    if let Some(json) = state.db.get_timeline_data(&meeting_id)? {
-        if let Ok(mut t) = serde_json::from_str::<MeetingTimeline>(&json) {
-            crate::summarize::timeline::repair_coverage(&mut t, &segments);
-            return Ok(t);
-        }
-    }
-    Ok(MeetingTimeline::default())
-}
 
 /// EXPLICIT timeline generation — the HEAVY path split out of `get_timeline`. Runs the Notes-role
 /// provider over the (decimated, for on-device) transcript to derive the speaker/topic map, caches
@@ -10649,70 +9393,6 @@ pub async fn generate_timeline(
     Ok(timeline)
 }
 
-/// A meeting + its latest note + transcript segments for the Detail view.
-/// Returns `None` if the meeting id is unknown.
-#[tauri::command]
-pub fn get_meeting_detail(
-    state: State<'_, AppState>,
-    meeting_id: String,
-) -> Result<Option<MeetingDetailDto>, AppError> {
-    let Some(meeting) = state.db.get_meeting(&meeting_id)? else {
-        return Ok(None);
-    };
-
-    // Phase 0.5 READ-GATE: a meeting in a locked-and-NOT-session-unlocked folder returns a MASKED
-    // DTO — `locked: true`, no note, no segments. The plaintext columns are blanked at rest while
-    // sealed (and the audio is encrypted), but we mask explicitly so the FE never shows the empty
-    // shell as if it were real content, and so the title can be masked too.
-    //
-    // `audio_path` is NULLED here too: the FE feeds it straight into `convertFileSrc` (the Tauri
-    // `asset:` protocol, scoped to the audio dir) which serves the file to the webview WITHOUT
-    // touching the `export_audio` command — i.e. the only audio read path that does NOT pass
-    // through `meeting_is_unlocked`. While sealed the on-disk file is the AES-GCM `.enc` (so even a
-    // leaked path serves ciphertext), but we must not depend on that single invariant: nulling the
-    // path here means the gate covers the asset protocol regardless of the on-disk seal state, so a
-    // plaintext WAV that briefly survives in the scoped dir (e.g. recorded into an already-sealed
-    // folder, or a crash window) can never be served to a locked meeting's view.
-    if !meeting_is_unlocked(state.inner(), &meeting_id)? {
-        return Ok(Some(masked_detail(meeting)));
-    }
-
-    let note_row = state.db.get_latest_note_for_meeting(&meeting_id)?;
-    // Phase 5: capture provenance from the note row BEFORE converting to NoteDto (NoteDto is a
-    // subset and doesn't carry model fields). All three are None when the note is absent or when
-    // the provider did not record provenance (pre-Phase-5 notes).
-    let ai_provider = note_row.as_ref().map(|n| n.provider_id.clone());
-    let ai_model = note_row.as_ref().and_then(|n| n.model_requested.clone());
-    let model_served = note_row.as_ref().and_then(|n| n.model_served.clone());
-    let note = note_row.map(|n| NoteDto {
-        meeting_id: n.meeting_id,
-        provider_id: n.provider_id,
-        markdown: n.markdown,
-        exported_path: n.exported_path,
-    });
-    let segments = state.db.get_segments(&meeting_id)?;
-    // GATED read: only past the `meeting_is_unlocked` gate above do we surface the persisted
-    // assistant Q&A. The DB read is ALSO `visibility_clause`-gated (it returns empty for a sealed-
-    // not-unlocked meeting) — defense-in-depth, double-gated exactly like the rest of the DTO.
-    let unlocked = state
-        .unlocked_folders
-        .lock()
-        .map(|g| g.clone())
-        .unwrap_or_default();
-    let assistant_interactions = state
-        .db
-        .list_assistant_interactions_visible(&meeting_id, &unlocked)?;
-    Ok(Some(MeetingDetailDto {
-        meeting,
-        note,
-        segments,
-        assistant_interactions,
-        locked: false,
-        ai_provider,
-        ai_model,
-        model_served,
-    }))
-}
 
 /// Build the MASKED detail DTO for a sealed-and-not-session-unlocked meeting. Pure (no DB / state)
 /// so the read-gate's masking contract is unit-testable. EVERY content channel is closed:
@@ -10721,7 +9401,7 @@ pub fn get_meeting_detail(
 ///   serve path that bypasses the `export_audio` command + `meeting_is_unlocked` gate);
 /// - `note` / `segments` → empty;
 /// - `locked` → true so the FE renders the unlock affordance, not an empty shell.
-fn masked_detail(meeting: Meeting) -> MeetingDetailDto {
+pub(crate) fn masked_detail(meeting: Meeting) -> MeetingDetailDto {
     MeetingDetailDto {
         meeting: Meeting {
             title: Some("🔒 Locked".to_string()),
@@ -10793,13 +9473,6 @@ pub async fn download_model(
     Ok(path.to_string_lossy().to_string())
 }
 
-/// Whether the OPTIONAL parakeet live-ASR engine's four int8 models are all present on disk (in
-/// `<models_dir>/parakeet-tdt-0.6b-v3-int8`). A file-on-disk check only — no content read / no
-/// egress. Feeds the Settings ▸ Transcription engine picker (offer the download when absent).
-#[tauri::command]
-pub fn parakeet_models_present() -> Result<bool, AppError> {
-    Ok(crate::transcribe::model::parakeet_models_present())
-}
 
 /// Download the OPTIONAL parakeet live-ASR engine's four int8 models (~600 MB) from the csukuangfj
 /// sherpa-onnx HF mirror into `<models_dir>/parakeet-tdt-0.6b-v3-int8` if missing (atomic per-file
@@ -14834,53 +13507,7 @@ pub(crate) fn assert_in_vault(
     Ok(resolved)
 }
 
-/// (Re)start the voice-trigger listener if enabled — model present and not recording —
-/// replacing any existing one. Safe to call repeatedly to reconcile after a config change
-/// or once a recording finishes.
-pub fn restart_voice_listener(app: AppHandle) {
-    let state = app.state::<AppState>();
-    if let Some(mut l) = state.voice_listener.lock().ok().and_then(|mut g| g.take()) {
-        l.stop();
-    }
-    let (enabled, language) = match state.config.lock() {
-        Ok(c) => (c.voice_trigger, c.language.clone()),
-        Err(_) => return,
-    };
-    if !enabled {
-        return;
-    }
-    // Don't grab the mic while a real recording is in progress.
-    if state.recorder.lock().map(|g| g.is_some()).unwrap_or(false) {
-        return;
-    }
-    // T1.3 — the standby wake listener decodes a ~2.2 s mic window every few seconds for the
-    // WHOLE time it is armed, so it must run the SMALLEST downloaded model (tiny → base →
-    // small, first present), NEVER the configured model (a medium/large standby decode is a
-    // continuous heat + RAM source). Wake-phrase matching needs rough text only. With none of
-    // the three small sizes downloaded the listener does not start (download `tiny`/`base`/
-    // `small` to enable it) — it never silently escalates to a big model.
-    match crate::transcribe::model::smallest_wake_model(language.as_deref().unwrap_or("")) {
-        Some(model_path) => {
-            let listener =
-                crate::audio::listener::VoiceListener::start(app.clone(), model_path, language);
-            if let Ok(mut g) = state.voice_listener.lock() {
-                *g = Some(listener);
-            }
-        }
-        None => tracing::warn!(
-            target: "voice",
-            "voice trigger enabled but no tiny/base/small whisper model downloaded; listener not started"
-        ),
-    }
-}
 
-/// Stop + drop the voice-trigger listener, releasing the mic. No-op if not running.
-pub fn stop_voice_listener(app: &AppHandle) {
-    let state = app.state::<AppState>();
-    if let Some(mut l) = state.voice_listener.lock().ok().and_then(|mut g| g.take()) {
-        l.stop();
-    }
-}
 
 // ═══════════════════════════════════════════════════════════════════════════════════════════════
 // M3-CLIENT — account (OPAQUE) + zero-knowledge link sharing (mode A). Spec §3/§4.7/§7.
