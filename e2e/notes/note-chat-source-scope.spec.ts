@@ -3,8 +3,9 @@ import { mockNotes } from "./mock-invoke";
 
 /**
  * Source-scoped Brain (Brain v3 PR-4) — smoke over the "Ask about this note"
- * panel mounted below the note body (ROUTED mode). It:
- *   1. renders below the body for an OPEN note,
+ * panel, now hosted in the right-side "Ask Brain" DRAWER (re-homed 2026-07-17
+ * from below the body, ROUTED mode). It:
+ *   1. mounts inside the drawer for an OPEN note once the header toggle opens it,
  *   2. pre-fills its `<mur-source-picker>` with the note itself + its ACTIVE
  *      linked neighbours (via `list_links`), and
  *   3. sends `ask_vault` with a NON-empty `explicitSources` (the picked scope).
@@ -16,7 +17,7 @@ import { mockNotes } from "./mock-invoke";
  * scope is `[{note n1}, {meeting m9}]`; `ask_vault` records the `explicitSources`
  * it was called with on `window` so the test can assert the exact wire shape.
  */
-test("Ask-about-this-note renders below the body, pre-fills note + its links, and sends ask_vault with explicitSources", async ({
+test("Ask-about-this-note opens in the drawer, pre-fills note + its links, and sends ask_vault with explicitSources", async ({
   page,
 }) => {
   const consoleErrors: string[] = [];
@@ -70,9 +71,13 @@ test("Ask-about-this-note renders below the body, pre-fills note + its links, an
   });
 
   await page.goto("/notes/n1");
+  await expect(page.locator(".note-title-input")).toHaveValue("My First Note");
 
-  // The panel is mounted below the body.
-  const chat = page.locator("app-note-chat");
+  // The chat now lives in the right-side drawer — open it via the header toggle.
+  await page.locator(".head-chat-btn").click();
+
+  // The panel is mounted inside the open drawer.
+  const chat = page.locator(".note-chat-drawer app-note-chat");
   await expect(chat).toBeVisible();
   await expect(chat.locator(".chat-title")).toHaveText("Ask about this note");
 

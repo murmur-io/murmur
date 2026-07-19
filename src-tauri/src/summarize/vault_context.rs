@@ -26,7 +26,11 @@ const LINK_CONTEXT_CAP: usize = 8;
 
 /// Char budget for the corpus, by provider. Local quantized models (Ollama) have tiny
 /// default context windows, so cap much tighter; API/Claude models get headroom.
-fn budget_for(provider_id: &str) -> usize {
+///
+/// `pub` so a caller assembling a pinned corpus across MULTIPLE packers (e.g. the Ask floor packing
+/// a pinned org item AND explicit sources) can honor ONE shared budget instead of letting each
+/// packer spend the full budget independently.
+pub fn budget_for(provider_id: &str) -> usize {
     if provider_id == "ollama" {
         4_000
     } else {
@@ -357,6 +361,43 @@ fn pack_notes(
     corpus.push_str(&header);
     corpus.push_str(&chunk);
     Ok(true)
+}
+
+/// Pack ONE PINNED org item (a read-only SHARED org-feed note being VIEWED in the org-item viewer)
+/// into a budget-capped corpus chunk, headed by a `### [[Title]] · shared · id:` citation mirroring
+/// [`pack_notes`]. Used by the Ask floor so "Ask about this shared note" is ALWAYS grounded in the
+/// item — the local Brain's FTS/vector search never retrieves org-feed content (it lives in the
+/// separate `org_chunks`/`org_vec_chunks` partition, queried only by the agentic cloud tool), so
+/// pinning is the ONLY way a local-Brain Ask sees it.
+///
+/// GATE: reads through [`Db::get_org_item`], whose SQL requires `tombstoned = 0 AND
+/// context_enabled = 1` — a tombstoned item, or an item whose origin org has its context DISABLED,
+/// yields `None` and contributes NOTHING (no stale/withdrawn content ever reaches the prompt). Org
+/// items are deliberately org-disclosed content (no folder lock gate applies to them), so
+/// `get_org_item`'s gate is the WHOLE gate here — there is no session-`unlocked` dimension. Returns
+/// the corpus chunk, or an empty string when nothing was packed.
+pub fn pack_pinned_org_item(db: &Db, item_id: &str, provider_id: &str) -> Result<String> {
+    let budget = budget_for(provider_id);
+    // GATE: tombstoned item / disabled-org item ⇒ `None` ⇒ contributes nothing.
+    let Some(item) = db.get_org_item(item_id)? else {
+        return Ok(String::new());
+    };
+    let title = if item.title.trim().is_empty() {
+        "Shared note".to_string()
+    } else {
+        item.title
+    };
+    let header = format!("### [[{title}]] · shared · id:{}\n", item.item_id);
+    // Mirror pack_notes' 200-char floor: don't emit a header with essentially no body.
+    if budget <= header.len() + 200 {
+        return Ok(String::new());
+    }
+    let remaining = budget.saturating_sub(header.len());
+    let body: String = item.markdown.chars().take(remaining).collect();
+    if body.trim().is_empty() {
+        return Ok(String::new());
+    }
+    Ok(format!("{header}{body}"))
 }
 
 /// note↔meeting-links PR-2 — build a PINNED corpus from an EXPLICIT source list plus its capped,

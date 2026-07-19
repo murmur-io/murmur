@@ -137,6 +137,14 @@ const PROPERTY_KIND_OPTIONS: readonly { kind: PropertyKind; label: string }[] = 
 const FULL_WIDTH_KEY = "murmur-note-full-width";
 
 /**
+ * localStorage key for the "Ask Brain" chat drawer open/closed state: "1" = open.
+ * Mirrors {@link FULL_WIDTH_KEY} exactly — a GLOBAL chrome preference (not
+ * per-note), zero-risk to wire, matching the existing chrome prefs. Defaults
+ * CLOSED (the drawer starts collapsed so the writing surface owns the width).
+ */
+const NOTE_CHAT_OPEN_KEY = "murmur-note-chat-open";
+
+/**
  * The full note editor (FP2): a centered document with a borderless title, a
  * collapsible Obsidian-style properties bar (tags + key/value), a source-of-truth
  * `<textarea>` body with a formatting toolbar + markdown keyboard behaviors + a
@@ -300,6 +308,12 @@ export class NoteEditorComponent {
    * `min(1600px, 92%)` on `.note-doc` (note-editor.component.scss).
    */
   readonly fullWidth = signal(this.readStoredFullWidth());
+  /**
+   * "Ask Brain" chat drawer open/closed (routed mode only — the embedded
+   * companion + a locked note never show it). Persisted GLOBALLY under
+   * {@link NOTE_CHAT_OPEN_KEY}, mirroring {@link fullWidth}. Default COLLAPSED.
+   */
+  readonly noteChatOpen = signal(this.readStoredChatOpen());
 
   /** The note-kind folders (for the Move menu + breadcrumb). */
   readonly noteFolders = signal<NoteFolder[]>([]);
@@ -635,6 +649,16 @@ export class NoteEditorComponent {
     const value = this.fullWidth();
     try {
       localStorage.setItem(FULL_WIDTH_KEY, value ? "1" : "0");
+    } catch {
+      // Private-mode / storage-disabled — the preference is not persisted.
+    }
+  });
+
+  /** Persist the "Ask Brain" drawer open state whenever it changes (mirrors {@link _persistFullWidth}). */
+  private readonly _persistChatOpen = effect(() => {
+    const value = this.noteChatOpen();
+    try {
+      localStorage.setItem(NOTE_CHAT_OPEN_KEY, value ? "1" : "0");
     } catch {
       // Private-mode / storage-disabled — the preference is not persisted.
     }
@@ -2002,6 +2026,20 @@ export class NoteEditorComponent {
   private readStoredFullWidth(): boolean {
     try {
       return localStorage.getItem(FULL_WIDTH_KEY) === "1";
+    } catch {
+      return false;
+    }
+  }
+
+  /** Toggle the "Ask Brain" chat drawer (header button). */
+  toggleNoteChat(): void {
+    this.noteChatOpen.update((v) => !v);
+  }
+
+  /** Read the persisted drawer open state; default CLOSED (starts collapsed). */
+  private readStoredChatOpen(): boolean {
+    try {
+      return localStorage.getItem(NOTE_CHAT_OPEN_KEY) === "1";
     } catch {
       return false;
     }
