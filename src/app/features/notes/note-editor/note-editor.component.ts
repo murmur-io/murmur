@@ -27,7 +27,6 @@ import { TabRouteReuseStrategy } from "../../../core/tab-route-reuse.strategy";
 import { TabsService } from "../../../core/tabs.service";
 import type {
   AppConfigDto,
-  BacklinkSource,
   FolderNode,
   NoteCitation,
   NoteDoc,
@@ -37,7 +36,6 @@ import { DebounceService } from "../../../services/debounce.service";
 import { FoldersService } from "../../../services/folders.service";
 import { NotesService } from "../../../services/notes.service";
 import { ToastService } from "../../../services/toast.service";
-import { BacklinksComponent } from "../../../shared/backlinks/backlinks.component";
 import { ConnectionsComponent } from "../../../shared/connections/connections.component";
 import { MarkdownComponent } from "../../../shared/markdown/markdown.component";
 import { LinkPickerComponent } from "../link-picker/link-picker.component";
@@ -165,7 +163,6 @@ const NOTE_CHAT_OPEN_KEY = "murmur-note-chat-open";
   selector: "app-note-editor",
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [
-    BacklinksComponent,
     ConnectionsComponent,
     LinkPickerComponent,
     MarkdownComponent,
@@ -274,21 +271,6 @@ export class NoteEditorComponent {
   readonly note = signal<NoteDoc | null>(null);
   readonly loading = signal(true);
   readonly error = signal<string | null>(null);
-
-  // --- Note↔note backlinks ("Linked mentions") ----------------------------
-  /**
-   * The VISIBLE inbound sources (meetings + notes) that link/mention THIS note.
-   * Rendered under the properties bar. Empty until the first fetch resolves,
-   * while the note is locked/masked (the fetch is skipped — never surface
-   * backlinks behind a lock), and CLEARED in the `onLockTreeChanged` seal
-   * branch so a live seal drops stale chips immediately.
-   */
-  readonly backlinks = signal<BacklinkSource[]>([]);
-  /**
-   * Monotonic request token — a late `getBacklinks` reply for a superseded note
-   * id / lock transition is dropped (stale-result guard, trap #4).
-   */
-  private backlinksSeq = 0;
 
   // --- Editable surfaces (source state) -----------------------------------
   /** The title (borderless input). */
@@ -624,36 +606,30 @@ export class NoteEditorComponent {
   });
 
   /**
-   * Load this note's backlinks whenever the loaded doc (id / lock state)
-   * changes, and SKIP the fetch entirely while it is locked/masked (never
-   * surface backlinks behind a lock — the same discipline as the seal branch's
-   * clear). A legitimate signal-writing effect (T1): async IPC keyed on inputs
-   * with a stale-result guard. A late reply for a superseded note id / lock
-   * transition is dropped by the seq check.
+   * The titles of neighbours the note BODY already links inline via `[[Title]]`
+   * (2026-07-19, IA consolidation item 4). Fed to the merged `app-connections`
+   * "Related" panel so a body `[[Title]]` — which materializes a `wikilink` edge
+   * that would ALSO render as a Related chip — is not triplicated (inline chip +
+   * Related chip). A pure `computed` off `body()` (a signal), reusing the SAME
+   * `[[...]]` extraction the link engine uses (first-`|`-split alias-safe, though
+   * Murmur wikilinks carry no alias today). Empty while there is no body.
    */
-  private readonly _loadBacklinks = effect(() => {
-    const doc = this.note();
-    const seq = ++this.backlinksSeq;
-    if (!doc || doc.locked) {
-      this.backlinks.set([]);
-      return;
+  readonly inlineWikilinkTitles = computed<string[]>(() => {
+    const body = this.body();
+    if (!body.includes("[[")) {
+      return [];
     }
-    void this.fetchBacklinks(doc.id, seq);
+    const titles = new Set<string>();
+    const re = /\[\[([^\]]+)\]\]/g;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(body)) !== null) {
+      const title = m[1].split("|")[0].trim();
+      if (title) {
+        titles.add(title);
+      }
+    }
+    return [...titles];
   });
-
-  private async fetchBacklinks(id: string, seq: number): Promise<void> {
-    try {
-      const rows = await this.ipc.getBacklinks("note", id);
-      if (seq !== this.backlinksSeq) {
-        return; // superseded by a newer note / lock transition
-      }
-      this.backlinks.set(Array.isArray(rows) ? rows : []);
-    } catch {
-      if (seq === this.backlinksSeq) {
-        this.backlinks.set([]);
-      }
-    }
-  }
 
   /**
    * The folder id whose schema the editor should load — null while the note is
@@ -899,10 +875,10 @@ export class NoteEditorComponent {
       this.debounce.cancel(this.saveDebounceKey(doc.id));
       this.pendingSave = null;
       this.dirtyFull = false;
-      // Drop stale backlink chips immediately on a live seal (belt-and-braces
-      // with the `_loadBacklinks` effect's own skip-while-locked, so a detached
-      // tab holds no linked-mention titles behind the lock from this instant).
-      this.backlinks.set([]);
+      // The merged "Related" panel (app-connections) owns its own gated fetch and
+      // skips/clears itself while locked, and re-asks on the folders.tree() change
+      // this same seal drives — so there are no stale relationship chips to blank
+      // here (the old host-owned backlinks list is gone).
       this.hydrate({
         ...doc,
         locked: true,

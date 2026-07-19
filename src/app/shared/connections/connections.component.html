@@ -1,13 +1,19 @@
-<!-- Never surface (or offer to add) connections behind a lock: the whole panel —
-     header + `+ Link` chooser included — is suppressed while `locked`. Otherwise it
-     always renders so a user can add the FIRST connection to an item with none. -->
-@if (!locked()) {
+<!-- Never surface (or offer to add) relationships behind a lock: the whole panel —
+     header + `+ Link` chooser included — is suppressed while `locked`. It is also
+     auto-hidden when there is NOTHING to show (no related rows AND no suggestions)
+     so a fresh note carries near-zero footprint (the collapsed "Related" IA). -->
+@if (!locked() && hasAnything()) {
 <div class="cx">
-  <!-- Header: the "Connections" label + the `+ Link` chooser. The query <input>
-       is BOTH the filter field and the popover's keyboard target; the panel owns
-       query/activeIndex (the picker is presentational) and anchors it here. -->
+  <!-- Header: the "Related · N" count label + the `+ Link` chooser. The query
+       <input> is BOTH the filter field and the popover's keyboard target; the panel
+       owns query/activeIndex (the picker is presentational) and anchors it here. -->
   <div class="cx-head">
-    <span class="cx-label cx-label--head">Connections</span>
+    <span class="cx-label cx-label--head">
+      Related
+      @if (relatedCount() > 0) {
+        <span class="cx-count" aria-hidden="true">{{ relatedCount() }}</span>
+      }
+    </span>
     @if (pickerOpen()) {
       <input
         #pickerAnchor
@@ -38,17 +44,18 @@
     }
   </div>
 
-  <!-- DETERMINISTIC edges (wikilink / companion / manual) — plain link chips,
-       mirroring the "Linked mentions" chip row. A manual (user-created) chip
-       gets a hover × to remove the link. Rows are a precomputed view-model
-       (`deterministicRows()`) so the template binds fields only (no per-row
-       method call per change-detection pass — the zoneless computed-only rule). -->
-  @if (deterministicRows().length) {
+  <!-- MERGED "Related" chips — inbound backlinks + incident deterministic edges,
+       deduped by (kind, id) so a neighbour that is both shows ONCE. A small tag
+       reads the direction/type ("linked" / "mentions" / "companion" / "related");
+       a user-created MANUAL link keeps its hover × to remove. Collapsed to the
+       first `limit` with a "+N more" / "Show less" toggle (the app-backlinks
+       idiom). Rows are a precomputed view-model (fields only in the template). -->
+  @if (visibleRelated().length) {
     <div class="cx-group">
-      @for (row of deterministicRows(); track row.edge.id) {
+      @for (row of visibleRelated(); track row.key) {
         <span class="cx-chipwrap" [class.is-pending]="row.pending">
           <a class="cx-chip" [routerLink]="row.route">
-            @switch (row.edge.otherKind) {
+            @switch (row.kind) {
               @case ("meeting") {
                 <span class="cx-kind cx-kind--meeting" aria-hidden="true">meeting</span>
               }
@@ -59,19 +66,15 @@
                 <span class="cx-kind cx-kind--note" aria-hidden="true">note</span>
               }
             }
-            <span class="cx-title">{{ row.edge.otherTitle }}</span>
-            @if (row.edge.edgeType === "companion") {
-              <span class="cx-edge" aria-hidden="true">companion</span>
-            } @else {
-              <span class="cx-edge" aria-hidden="true">link</span>
-            }
+            <span class="cx-title">{{ row.title }}</span>
+            <span class="cx-edge" aria-hidden="true">{{ row.tag }}</span>
           </a>
-          @if (row.removable) {
+          @if (row.removable && row.edge) {
             <button
               type="button"
               class="cx-remove"
               [disabled]="row.pending"
-              [attr.aria-label]="'Remove link to ' + row.edge.otherTitle"
+              [attr.aria-label]="'Remove link to ' + row.title"
               title="Remove link"
               (click)="unlink(row.edge)"
             >
@@ -80,18 +83,32 @@
           }
         </span>
       }
+      @if (hiddenRelatedCount() > 0 || expanded()) {
+        <button type="button" class="cx-more" (click)="toggleExpanded()">
+          {{ expanded() ? "Show less" : "+" + hiddenRelatedCount() + " more" }}
+        </button>
+      }
     </div>
   }
 
-  <!-- SEMANTIC suggestions — a confidence chip + Accept / Dismiss per row (precomputed
-       `suggestionRows()`; template binds fields only). -->
+  <!-- AMBIENT semantic SUGGESTIONS — "related, not yet linked". A dashed chip whose
+       BODY promotes (tap → acceptLink materializes the [[wikilink]]) and whose hover ×
+       dismisses (dismissLink). No confidence %, no persistent Accept/Dismiss buttons —
+       the chip IS the affordance (precomputed `suggestionRows()`, fields only). -->
   @if (suggestionRows().length) {
-    <div class="cx-group">
-      <span class="cx-label">Suggested connections</span>
+    <div class="cx-group cx-group--suggest">
+      <span class="cx-label">Suggested</span>
       @for (row of suggestionRows(); track row.edge.id) {
-        <div class="cx-row" [class.is-pending]="row.pending">
-          <a class="cx-chip cx-chip--suggested" [routerLink]="row.route">
-            @switch (row.edge.otherKind) {
+        <span class="cx-chipwrap" [class.is-pending]="row.pending">
+          <button
+            type="button"
+            class="cx-chip cx-chip--suggested"
+            [disabled]="row.pending"
+            [attr.aria-label]="'Add link to ' + row.title"
+            title="Add this link"
+            (click)="accept(row.edge)"
+          >
+            @switch (row.kind) {
               @case ("meeting") {
                 <span class="cx-kind cx-kind--meeting" aria-hidden="true">meeting</span>
               }
@@ -102,32 +119,20 @@
                 <span class="cx-kind cx-kind--note" aria-hidden="true">note</span>
               }
             }
-            <span class="cx-title">{{ row.edge.otherTitle }}</span>
-            <span
-              class="cx-score"
-              [class]="'cx-score--' + row.tier"
-              [attr.title]="'Confidence ' + row.scoreLabel"
-            >{{ row.scoreLabel }}</span>
-          </a>
-          <div class="cx-actions">
-            <button
-              type="button"
-              class="cx-btn cx-btn--accept"
-              [disabled]="row.pending"
-              (click)="accept(row.edge)"
-            >
-              Accept
-            </button>
-            <button
-              type="button"
-              class="cx-btn cx-btn--dismiss"
-              [disabled]="row.pending"
-              (click)="dismiss(row.edge)"
-            >
-              Dismiss
-            </button>
-          </div>
-        </div>
+            <span class="cx-title">{{ row.title }}</span>
+            <span class="cx-edge cx-edge--add" aria-hidden="true">+ add</span>
+          </button>
+          <button
+            type="button"
+            class="cx-remove"
+            [disabled]="row.pending"
+            [attr.aria-label]="'Dismiss suggestion ' + row.title"
+            title="Dismiss suggestion"
+            (click)="dismiss(row.edge)"
+          >
+            <span aria-hidden="true">×</span>
+          </button>
+        </span>
       }
     </div>
   }

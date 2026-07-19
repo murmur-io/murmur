@@ -114,19 +114,13 @@
 .head-more {
   position: relative;
 }
-/* Privacy hint for an unfiled (always-open) note — subtle, muted, non-alarming. */
-.unfiled-hint {
+/* Privacy hint for an unfiled (always-open) note — a small 🔒-off glyph folded
+   INTO the breadcrumb (2026-07-19 header slim), tooltip-only, muted + non-alarming. */
+.crumb-unsealed {
   display: inline-flex;
   align-items: center;
   margin-left: var(--space-1);
-  padding: 0 var(--space-2);
-  height: 20px;
-  border-radius: var(--radius-pill);
-  background: var(--surface-input);
   color: var(--text-muted);
-  font-size: 0.7rem;
-  font-weight: 600;
-  letter-spacing: 0.01em;
   cursor: help;
 }
 .crumb-btn {
@@ -191,6 +185,11 @@
   border-radius: 50%;
   background: var(--accent);
 }
+/* The "already shared" dot when the Share item sits in the ⋯ menu — trailing
+   (the global `.menu-item` is already a flex row, so this just pushes it right). */
+.menu-trail-dot {
+  margin-left: auto;
+}
 
 /* Header overlay menus — opaque (T3), positioned under the trigger. */
 .head-menu {
@@ -246,15 +245,8 @@
   align-items: center;
   gap: var(--space-1);
   order: 1;
-  min-width: 70px;
   font-size: 0.78rem;
   color: var(--text-muted);
-}
-.save-state[data-state="saved"] {
-  color: var(--success);
-}
-.save-check {
-  color: var(--success);
 }
 .save-retry {
   border: 0;

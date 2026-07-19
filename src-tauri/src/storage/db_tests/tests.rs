@@ -6140,6 +6140,142 @@
         assert_eq!(edges[0].other_title, "Secret Note");
     }
 
+    /// Seed a meeting M (titled, visible) + its companion note N (`documents.meeting_id = M`, same
+    /// title by construction) both linked to an anchor note A, and return the ids so the four
+    /// companion-collapse tests share one setup. `note_edge_type`/`meeting_edge_type` pick the
+    /// edge_type of the A→N and A→M edges so a test can make either `manual`.
+    fn seed_companion_collapse_case(
+        db: &Db,
+        note_edge_type: &str,
+        meeting_edge_type: &str,
+    ) {
+        seed_folder(db, "f-open", "Open");
+        // Anchor note A we query from.
+        seed_note_doc(db, "anchor", "f-open", "Anchor Note", "");
+        // Meeting M (titled, no notes → visible).
+        let mut m = sample_meeting("m", "2026-06-24T10:00:00Z");
+        m.title = Some("Weekly Sync".to_string());
+        db.insert_meeting(&m).unwrap();
+        // Companion note N: same title as M, structurally tied via documents.meeting_id.
+        seed_note_doc(db, "compnote", "f-open", "Weekly Sync", "");
+        db.set_document_meeting_id("compnote", "m").unwrap();
+        let now = 1_700_000_000_000i64;
+        let mut conn = db.lock();
+        let tx = conn.transaction().unwrap();
+        // A → M (meeting edge) and A → N (companion-note edge).
+        Db::upsert_link_tx(&tx, "note", "anchor", "meeting", "m", meeting_edge_type, 1.0, "user", "active", now).unwrap();
+        Db::upsert_link_tx(&tx, "note", "anchor", "note", "compnote", note_edge_type, 1.0, "user", "active", now).unwrap();
+        tx.commit().unwrap();
+    }
+
+    /// COMPANION COLLAPSE (2026-07-19) — the core case: an anchor linked to a meeting M (auto edge) AND
+    /// to M's companion note N (auto edge, same title by construction) collapses to ONE chip — the
+    /// MEETING survives, the companion-note edge is dropped. RED before the transform: the result
+    /// carried BOTH `(meeting, m)` and `(note, compnote)` (two chips, same title).
+    #[test]
+    fn links_for_visible_collapses_meeting_and_its_companion_note() {
+        let db = mem_db();
+        // Both edges AUTO: companion note edge is `companion`, meeting edge is `wikilink`.
+        seed_companion_collapse_case(&db, "companion", "wikilink");
+        let nothing = HashSet::new();
+        let edges = db
+            .links_for_visible(crate::links::LinkKind::Note, "anchor", &nothing)
+            .unwrap();
+        // Exactly one chip: the MEETING (canonical entity); the companion-note edge is folded away.
+        assert_eq!(edges.len(), 1, "meeting + its companion note collapse to one chip");
+        assert_eq!(edges[0].other_kind, "meeting", "the surviving chip is the meeting");
+        assert_eq!(edges[0].other_id, "m");
+        assert!(
+            !edges.iter().any(|e| e.other_kind == "note" && e.other_id == "compnote"),
+            "the companion-note edge must be dropped, not shown as a second chip"
+        );
+    }
+
+    /// COMPANION COLLAPSE — removability guard: if the anchor→companion-note edge is `manual` (the user
+    /// explicitly linked that note), it must NOT collapse — both M and N survive so the user can still
+    /// see and remove the manual link. Guards invariant 3 (no lost removability / no silent reappear).
+    #[test]
+    fn links_for_visible_keeps_manual_companion_note() {
+        let db = mem_db();
+        // Note edge is MANUAL; meeting edge is auto.
+        seed_companion_collapse_case(&db, "manual", "wikilink");
+        let nothing = HashSet::new();
+        let edges = db
+            .links_for_visible(crate::links::LinkKind::Note, "anchor", &nothing)
+            .unwrap();
+        assert_eq!(edges.len(), 2, "a manual companion-note link is preserved (removable)");
+        assert!(
+            edges.iter().any(|e| e.other_kind == "meeting" && e.other_id == "m"),
+            "meeting chip survives"
+        );
+        let note_chip = edges
+            .iter()
+            .find(|e| e.other_kind == "note" && e.other_id == "compnote")
+            .expect("manual companion-note chip must survive");
+        assert!(note_chip.manual, "the surviving note chip is flagged manual (removable ×)");
+    }
+
+    /// COMPANION COLLAPSE — degrade gracefully: an anchor linked to the companion note N but NOT to its
+    /// meeting M → N survives (there is no meeting neighbour to fold into). Invariant 4.
+    #[test]
+    fn links_for_visible_keeps_companion_note_when_meeting_absent() {
+        let db = mem_db();
+        seed_folder(&db, "f-open", "Open");
+        seed_note_doc(&db, "anchor", "f-open", "Anchor Note", "");
+        let mut m = sample_meeting("m", "2026-06-24T10:00:00Z");
+        m.title = Some("Weekly Sync".to_string());
+        db.insert_meeting(&m).unwrap();
+        seed_note_doc(&db, "compnote", "f-open", "Weekly Sync", "");
+        db.set_document_meeting_id("compnote", "m").unwrap();
+        let now = 1_700_000_000_000i64;
+        {
+            let mut conn = db.lock();
+            let tx = conn.transaction().unwrap();
+            // ONLY the companion-note edge exists on the anchor; the meeting is NOT a neighbour.
+            Db::upsert_link_tx(&tx, "note", "anchor", "note", "compnote", "companion", 1.0, "user", "active", now).unwrap();
+            tx.commit().unwrap();
+        }
+        let nothing = HashSet::new();
+        let edges = db
+            .links_for_visible(crate::links::LinkKind::Note, "anchor", &nothing)
+            .unwrap();
+        assert_eq!(edges.len(), 1, "companion note with no meeting neighbour is kept");
+        assert_eq!(edges[0].other_kind, "note");
+        assert_eq!(edges[0].other_id, "compnote");
+    }
+
+    /// COMPANION COLLAPSE — STRUCTURAL only: two notes that merely SHARE a title (no
+    /// `documents.meeting_id` relationship) must BOTH survive — the collapse keys on the structural
+    /// companion link, never a title-string match. Invariant 4 (never a title collision collapse).
+    #[test]
+    fn links_for_visible_does_not_collapse_unrelated_same_title() {
+        let db = mem_db();
+        seed_folder(&db, "f-open", "Open");
+        seed_note_doc(&db, "anchor", "f-open", "Anchor Note", "");
+        // A meeting AND a standalone note that happen to share a title, but the note is NOT the
+        // meeting's companion (no meeting_id set).
+        let mut m = sample_meeting("m", "2026-06-24T10:00:00Z");
+        m.title = Some("Weekly Sync".to_string());
+        db.insert_meeting(&m).unwrap();
+        seed_note_doc(&db, "othernote", "f-open", "Weekly Sync", "");
+        // deliberately NO set_document_meeting_id — the title match is coincidental.
+        let now = 1_700_000_000_000i64;
+        {
+            let mut conn = db.lock();
+            let tx = conn.transaction().unwrap();
+            Db::upsert_link_tx(&tx, "note", "anchor", "meeting", "m", "wikilink", 1.0, "user", "active", now).unwrap();
+            Db::upsert_link_tx(&tx, "note", "anchor", "note", "othernote", "wikilink", 1.0, "user", "active", now).unwrap();
+            tx.commit().unwrap();
+        }
+        let nothing = HashSet::new();
+        let edges = db
+            .links_for_visible(crate::links::LinkKind::Note, "anchor", &nothing)
+            .unwrap();
+        assert_eq!(edges.len(), 2, "same-title-but-unrelated note and meeting both survive");
+        assert!(edges.iter().any(|e| e.other_kind == "meeting" && e.other_id == "m"));
+        assert!(edges.iter().any(|e| e.other_kind == "note" && e.other_id == "othernote"));
+    }
+
     /// Fix 0 (brain-v3 audit) — LINK-WRITER TOCTOU: a `index_wikilinks_for_source` pass that RESOLVED
     /// its target while a neighbour was visible must NOT insert an edge if that neighbour SEALED AT
     /// REST before the write commits. Simulate the race by sealing the target's document

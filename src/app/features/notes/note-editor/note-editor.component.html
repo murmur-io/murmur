@@ -26,7 +26,10 @@
   <header class="editor-head">
     @if (note(); as doc) {
       @if (!doc.locked) {
-        <!-- Folder breadcrumb + Move menu (opaque overlay, T3). -->
+        <!-- Folder breadcrumb + Move menu (opaque overlay, T3). The "not sealed"
+             privacy hint for an unfiled note is folded INTO the breadcrumb as a
+             small 🔒-off glyph with a tooltip (2026-07-19 header slim), instead of a
+             standalone pill — one fewer top-level control. -->
         <div class="head-crumb">
           <button
             type="button"
@@ -42,18 +45,22 @@
               />
             </svg>
             {{ breadcrumb() }}
+            @if (isUnfiled()) {
+              <span
+                class="crumb-unsealed"
+                aria-label="Not sealed"
+                title="Unfiled notes aren't encrypted. Move this note into a locked folder to seal it."
+              >
+                <svg viewBox="0 0 16 16" width="12" height="12" fill="none" aria-hidden="true">
+                  <rect x="3.5" y="7.5" width="9" height="6" rx="1.4" stroke="currentColor" stroke-width="1.3" />
+                  <path d="M6 7.5V5.2a2 2 0 0 1 3.9-.6" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
+                </svg>
+              </span>
+            }
             <svg viewBox="0 0 16 16" width="11" height="11" fill="none" aria-hidden="true">
               <path d="M4 6l4 4 4-4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" />
             </svg>
           </button>
-          <!-- Privacy hint: an unfiled note lives in the always-open root and is NOT sealed. -->
-          @if (isUnfiled()) {
-            <span
-              class="unfiled-hint"
-              title="Unfiled notes aren't encrypted. Move this note into a locked folder to seal it."
-              >not sealed</span
-            >
-          }
           @if (menu() === "move") {
             <div class="menu head-menu" role="menu" aria-label="Move to folder">
               <p class="menu-group-label">Move to…</p>
@@ -79,14 +86,13 @@
 
         <span class="head-spacer"></span>
 
-        <!-- Autosave indicator. -->
+        <!-- Autosave indicator — shows ONLY for "saving"/"error" now (2026-07-19
+             header slim): the steady "Saved" state is silent (persistence is the
+             expected default; a green tick on every keystroke-pause is noise). -->
         <span class="save-state" [attr.data-state]="saveState()" aria-live="polite">
           @switch (saveState()) {
             @case ("saving") {
               <span class="save-spin" aria-hidden="true"></span> Saving…
-            }
-            @case ("saved") {
-              <span class="save-check" aria-hidden="true">✓</span> Saved
             }
             @case ("error") {
               <button
@@ -154,19 +160,8 @@
           Ask Brain
         </button>
 
-        <button
-          type="button"
-          class="btn btn-ghost head-btn"
-          [class.is-shared]="doc.shared"
-          (click)="share()"
-        >
-          @if (doc.shared) {
-            <span class="share-dot" aria-hidden="true"></span>
-          }
-          Share
-        </button>
-
-        <!-- ⋯ overflow (opaque overlay). -->
+        <!-- ⋯ overflow (opaque overlay). Share + Full width now live here (2026-07-19
+             header slim) so the top row is [breadcrumb/Move] [Edit/Preview] [Ask] [⋯]. -->
         <div class="head-more">
           <button
             type="button"
@@ -202,6 +197,13 @@
                 @if (doc.shared) {
                   <p class="menu-group-label">Shared</p>
                 }
+                <!-- Share moved off the top row into ⋯ (2026-07-19 header slim). -->
+                <button type="button" class="menu-item" role="menuitem" (click)="share()">
+                  Share…
+                  @if (doc.shared) {
+                    <span class="share-dot menu-trail-dot" aria-hidden="true"></span>
+                  }
+                </button>
                 <button type="button" class="menu-item" role="menuitem" (click)="exportNote()">
                   Save to vault &amp; reveal
                 </button>
@@ -533,24 +535,22 @@
           </div>
           }
 
-          <!-- LINKED MENTIONS — inbound note↔note backlinks (meetings + notes
-               that link this note). Under the properties bar, above the body.
-               Only present when non-empty; cleared on a live seal (the effect
-               skips + `onLockTreeChanged` blanks it) so nothing shows behind a lock.
-               HIDDEN when embedded (the recording panel's Ask Brain tab owns
-               meeting↔note relationships; the Note tab is pure writing). -->
-          @if (!embedded() && backlinks().length) {
-            <app-backlinks [sources]="backlinks()" />
-          }
-
-          <!-- CONNECTIONS (Brain v3 PR-3) — deterministic wikilink/companion link
-               chips + semantic suggestions (confidence chip + Accept/Dismiss),
-               self-loaded & gated. Beside "Linked mentions". Hidden when embedded
-               (the recording panel's Ask Brain tab owns relationships). The panel
-               owns its gated fetch, skips it while `locked`, and re-asks on a
-               session lock-tree change. -->
+          <!-- RELATED (IA consolidation, 2026-07-19) — ONE merged, deduped panel of
+               every relationship: inbound backlinks + incident link edges (deduped by
+               neighbour) + ambient semantic suggestions, collapsed behind an "N related"
+               count and auto-hidden when empty. Self-loaded & gated: the panel owns its
+               fetch, skips it while `locked`, and re-asks on a session lock-tree change.
+               `inlineWikilinkTitles` suppresses a Related chip for a neighbour the body
+               already links inline via `[[Title]]` (no triplication). Hidden when embedded
+               (the recording panel's Ask Brain tab owns relationships; the Note tab is
+               pure writing). -->
           @if (!embedded() && note(); as doc) {
-            <app-connections kind="note" [id]="doc.id" [locked]="doc.locked" />
+            <app-connections
+              kind="note"
+              [id]="doc.id"
+              [locked]="doc.locked"
+              [inlineWikilinkTitles]="inlineWikilinkTitles()"
+            />
           }
 
           <!-- Body: preview (cached computed) OR the source-of-truth textarea.
