@@ -13,13 +13,12 @@ use crate::storage::models::{
     Analytics, AssistantInteraction, AssistantThreadRow, BacklinkSource, Commitment,
     CorrectionRecord, DayCount,
     DocChunkHit, DocOutlineEntry, DocumentInfo, DocumentSummary, EntityDetail, EntityKind,
-    EntityNeighbor, Folder,
+    EntityNeighbor,
     FullGraphData, FullGraphEdge, FullGraphEdgeKind, FullGraphNode, FullGraphNodeKind, FullGraphOpts,
     GraphData,
     GraphEdge, GraphEntity, GraphNode, Meeting, MeetingActionSummary, MeetingStatus, NoteCitation,
-    NoteFolder,
     NoteRecord, NoteSummary,
-    OrgChunkHit, PendingShareAccept, PeopleList, PersonCard, PropertyKind, PropertySchemaField,
+    OrgChunkHit, PendingShareAccept, PeopleList, PersonCard, PropertyKind,
     PropertyValue, RecipeRecord, SavedView, SearchHit,
     TypedNoteRow,
     StatusCount,
@@ -1476,98 +1475,13 @@ impl Db {
         Ok(())
     }
 
-    /// Brain v2 L5 — idempotent SCHEDULED-BRIEF schema. `brief_schedules` = the user's structured
-    /// local-time schedules (config data only); `brief_runs` = the propose-accept staging rows.
-    /// Lock posture (documented, audited by the lock-security review): `brief_runs.note_md` is
-    /// synthesized by `crate::brief_runner` from VISIBLE-ONLY content — the runner reads with the
-    /// EMPTY unlock set (the consolidation-job discipline), so sealed content can never enter a
-    /// brief AT synthesis time. But `note_md` IS derived meeting content (a cross-meeting
-    /// synthesis — the memory-rollup class, one layer removed): a folder locked AFTER a brief was
-    /// proposed would leave that paraphrase readable, so every seal path
-    /// (`purge_chunks_for_meetings` / `blank_sealed_notes_in_folders` /
-    /// `reblank_locked_folders_at_rest`) AND `delete_meeting` purges PENDING rows whose
-    /// `meeting_ids` (a JSON id array) intersect the sealed/deleted meetings
-    /// (`purge_pending_brief_runs_tx`). ACCEPTED rows are consumed on accept (`note_md` blanked —
-    /// ids + timestamps only) and survive.
-    fn migrate_briefs(conn: &Connection) -> Result<()> {
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS brief_schedules (
-               id TEXT PRIMARY KEY,
-               label TEXT NOT NULL,
-               day_of_week INTEGER,
-               hour_local INTEGER NOT NULL,
-               minute_local INTEGER NOT NULL,
-               scope_days INTEGER NOT NULL DEFAULT 7,
-               prompt_hint TEXT,
-               enabled INTEGER NOT NULL DEFAULT 1,
-               last_run_at TEXT,
-               created_at TEXT NOT NULL
-             );
-             CREATE TABLE IF NOT EXISTS brief_runs (
-               id TEXT PRIMARY KEY,
-               schedule_id TEXT NOT NULL,
-               status TEXT NOT NULL DEFAULT 'pending',
-               note_md TEXT NOT NULL DEFAULT '',
-               meeting_ids TEXT NOT NULL DEFAULT '[]',
-               proposed_at TEXT NOT NULL,
-               accepted_at TEXT
-             );
-             CREATE INDEX IF NOT EXISTS idx_brief_runs_schedule ON brief_runs(schedule_id);",
-        )
-        .map_err(map_err)
-    }
+    // `migrate_briefs` moved to `storage::brief_store` (God-file split) alongside the
+    // `brief_schedules` / `brief_runs` CRUD it schemas — still called `Self::migrate_briefs(&conn)`
+    // from `migrate()` above, cross-file inherent-impl.
 
-    /// Vault Audit v1 — idempotent audit schema (see `crate::audit`). `audit_findings` stages one
-    /// propose→accept finding per row; `evidence_md`/`accept_action`/BOTH TITLES are DERIVED
-    /// PLAINTEXT that only PENDING rows may hold (resolve blanks all four; every seal path purges
-    /// pending rows whose source or target seals — `purge_pending_audit_findings_tx`, the
-    /// brief-runs purge class). `dedupe_key` is the stable cross-run identity and OUTLIVES
-    /// resolve, so its variable part is HASHED (title-free — `crate::audit::dedupe_disc`): an
-    /// existing PENDING or DISMISSED twin suppresses re-creation (dismissed = don't nag again);
-    /// an ACCEPTED one may recur. Enforced in code (`insert_audit_finding_if_new`), not by a
-    /// UNIQUE constraint — accepted twins must be able to coexist with a recurring pending row.
-    /// `audit_runs` is content-free bookkeeping (id + timestamps + per-kind counts).
-    fn migrate_audit(conn: &Connection) -> Result<()> {
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS audit_findings (
-               id TEXT PRIMARY KEY,
-               kind TEXT NOT NULL,
-               source_kind TEXT NOT NULL,
-               source_id TEXT NOT NULL,
-               source_title TEXT NOT NULL,
-               target_title TEXT,
-               target_id TEXT,
-               evidence_md TEXT NOT NULL,
-               accept_action TEXT NOT NULL DEFAULT '',
-               dedupe_key TEXT NOT NULL,
-               status TEXT NOT NULL DEFAULT 'pending',
-               run_id TEXT NOT NULL,
-               created_at INTEGER NOT NULL,
-               resolved_at INTEGER
-             );
-             CREATE INDEX IF NOT EXISTS idx_audit_findings_status ON audit_findings(status);
-             CREATE INDEX IF NOT EXISTS idx_audit_findings_dedupe ON audit_findings(dedupe_key);
-             CREATE INDEX IF NOT EXISTS idx_audit_findings_source ON audit_findings(source_id);
-             CREATE INDEX IF NOT EXISTS idx_audit_findings_target ON audit_findings(target_id);
-             CREATE TABLE IF NOT EXISTS audit_runs (
-               id TEXT PRIMARY KEY,
-               started_at INTEGER NOT NULL,
-               finished_at INTEGER,
-               counts_json TEXT NOT NULL DEFAULT '{}'
-             );",
-        )
-        .map_err(map_err)?;
-        // `target_kind` ("meeting" | "note") rides with `target_id` so the list layer can re-gate
-        // the TARGET side against the right table (lock review, same branch). Guarded for dev DBs
-        // that created the table before the column existed.
-        Self::add_column_if_missing(conn, "audit_findings", "target_kind", "TEXT")?;
-        // Weekly schedule (Phase 3): `scheduled = 1` marks a run row staged by the WEEKLY runner —
-        // both the claim row inserted BEFORE the pass (crash-safe claim-before-run, the
-        // brief-runner discipline) and nothing else. Due-ness reads MAX(finished_at) over
-        // scheduled rows only, so manual runs never push the weekly cadence. Additive + guarded.
-        Self::add_column_if_missing(conn, "audit_runs", "scheduled", "INTEGER NOT NULL DEFAULT 0")?;
-        Ok(())
-    }
+    // `migrate_audit` moved to `storage::audit_store` (God-file split) alongside the
+    // `audit_findings` / `audit_runs` CRUD it schemas — still called `Self::migrate_audit(&conn)`
+    // from `migrate()` above, cross-file inherent-impl.
 
     // `migrate_mcp_servers` (the idempotent `mcp_servers` config schema) moved to
     // `storage::mcp_store` (God-file split) — still called above as `Self::migrate_mcp_servers`.
@@ -1721,7 +1635,7 @@ impl Db {
     }
 
     /// Add `column` to `table` if it is not already present (idempotent migration guard).
-    fn add_column_if_missing(
+    pub(crate) fn add_column_if_missing(
         conn: &Connection,
         table: &str,
         column: &str,
@@ -1761,47 +1675,8 @@ impl Db {
     }
 
     // ── egress audit log ────────────────────────────────────────────────────
-
-    /// Insert one content-free audit row into `egress_log`. Called by `DbEgressSink::record`.
-    ///
-    /// `ts` is a Unix epoch (seconds) computed by the caller (`SystemTime::now()`). The row
-    /// carries ONLY counts, ids, labels, byte sizes, and token counts — NO content (§8).
-    pub fn insert_egress(
-        &self,
-        ts: i64,
-        e: &crate::summarize::egress_log::EgressEntry,
-    ) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
-            "INSERT INTO egress_log (
-               ts, provider_id, destination, model_requested, model_served, call_kind,
-               prompt_tokens, completion_tokens, total_tokens, cached_tokens,
-               redactions_email, redactions_card, redactions_phone, redactions_name,
-               system_bytes, user_bytes, meeting_id
-             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
-            rusqlite::params![
-                ts,
-                e.provider_id,
-                e.destination,
-                e.model_requested,
-                e.meta.model_served.as_deref(),
-                e.call_kind,
-                e.meta.prompt_tokens.map(|v| v as i64),
-                e.meta.completion_tokens.map(|v| v as i64),
-                e.meta.total_tokens.map(|v| v as i64),
-                e.meta.cached_tokens.map(|v| v as i64),
-                e.redactions.email as i64,
-                e.redactions.card as i64,
-                e.redactions.phone as i64,
-                e.redactions.name as i64,
-                e.system_bytes as i64,
-                e.user_bytes as i64,
-                e.meeting_id.as_deref(),
-            ],
-        )
-        .map_err(map_err)?;
-        Ok(())
-    }
+    // `insert_egress` moved to `storage::egress_store` (God-file split) — still callable as inherent
+    // `db.method()` cross-file. Content-free `egress_log` row (counts/ids/labels/bytes/tokens only).
 
     // ── M3-CLIENT: outbound server-share bookkeeping + share egress ledger (spec §7) ─────────────
 
@@ -1921,39 +1796,9 @@ impl Db {
         Ok(())
     }
 
-    /// Append one CONTENT-FREE share-egress ledger row (§7 inv. 4): host + byte size + a `kind` label
-    /// (`"share_create"` / `"share_revoke"` / `"account_login"` …). NEVER the URL, `L`, a title, or
-    /// any note text. `ts` is a Unix epoch (seconds).
-    pub fn insert_share_egress(
-        &self,
-        ts: i64,
-        host: &str,
-        kind: &str,
-        byte_count: usize,
-    ) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
-            "INSERT INTO share_egress_log (ts, host, kind, byte_count) VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![ts, host, kind, byte_count as i64],
-        )
-        .map_err(map_err)?;
-        Ok(())
-    }
-
-    /// Count content-free egress-ledger rows of a given `kind` (e.g. `org_share_publish` /
-    /// `org_share_revoke`). Content-free (a count, never a body); used by the re-publish tests to
-    /// assert a publish+revoke pair was ledgered on an edit-supersede.
-    pub fn count_share_egress_by_kind(&self, kind: &str) -> Result<u64> {
-        let conn = self.lock();
-        let n: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM share_egress_log WHERE kind = ?1",
-                rusqlite::params![kind],
-                |r| r.get(0),
-            )
-            .map_err(map_err)?;
-        Ok(n as u64)
-    }
+    // `insert_share_egress` / `count_share_egress_by_kind` moved to `storage::egress_store`
+    // (God-file split) alongside the other egress-ledger writers — still callable as inherent
+    // `db.method()` cross-file. Content-free `share_egress_log` rows.
 
     // ── M6 Shared Brain: local org state + the outbound org-share state machine ──────────────────
 
@@ -2828,166 +2673,9 @@ impl Db {
         Ok(())
     }
 
-    /// Aggregate the `egress_log` table over the last `days` calendar days and return a rich
-    /// summary for the "Egress & Usage" Analytics panel.
-    ///
-    /// The time window is `[now_unix - days*86400, now_unix]`. A `days <= 0` value returns ALL
-    /// rows. An empty table (no cloud calls yet) returns all-zero totals and empty vecs — never
-    /// an error.
-    ///
-    /// Read-only: touches `egress_log` only; no content columns. (§6: egress_log has none.)
-    pub fn egress_summary(&self, days: i64) -> Result<EgressLedger> {
-        use std::time::{SystemTime, UNIX_EPOCH};
-
-        let now_unix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-        let since = if days > 0 {
-            now_unix - days * 86_400
-        } else {
-            0
-        };
-
-        let conn = self.lock();
-
-        // ── total calls + total tokens ──────────────────────────────────────
-        // Cast to u64 so an all-time SUM cannot wrap (i64→u64 is safe for non-negative sums).
-        let (total_calls, total_tokens): (u64, u64) = conn
-            .query_row(
-                "SELECT COUNT(*), COALESCE(SUM(total_tokens),0)
-                   FROM egress_log
-                  WHERE ts >= ?1",
-                rusqlite::params![since],
-                |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64)),
-            )
-            .map_err(map_err)?;
-
-        // ── total redactions ────────────────────────────────────────────────
-        let total_redactions: EgressRedactionTotals = conn
-            .query_row(
-                "SELECT COALESCE(SUM(redactions_email),0),
-                        COALESCE(SUM(redactions_card),0),
-                        COALESCE(SUM(redactions_phone),0),
-                        COALESCE(SUM(redactions_name),0)
-                   FROM egress_log
-                  WHERE ts >= ?1",
-                rusqlite::params![since],
-                |r| {
-                    Ok(EgressRedactionTotals {
-                        email: r.get::<_, i64>(0)? as u64,
-                        card: r.get::<_, i64>(1)? as u64,
-                        phone: r.get::<_, i64>(2)? as u64,
-                        name: r.get::<_, i64>(3)? as u64,
-                    })
-                },
-            )
-            .map_err(map_err)?;
-
-        // ── by_model (GROUP BY model label, tokens DESC) ────────────────────
-        let by_model = {
-            let mut stmt = conn
-                .prepare(
-                    // NULLIF guards: an empty string '' in model_served or model_requested
-                    // (the default when no model is sent by claude_code/anthropic) must bucket
-                    // under '(unknown)' rather than producing a blank label in the Settings UI.
-                    "SELECT COALESCE(NULLIF(model_served,''), NULLIF(model_requested,''), '(unknown)') AS model,
-                            COUNT(*) AS calls,
-                            COALESCE(SUM(total_tokens), 0) AS tokens
-                       FROM egress_log
-                      WHERE ts >= ?1
-                      GROUP BY model
-                      ORDER BY tokens DESC",
-                )
-                .map_err(map_err)?;
-            let rows = stmt
-                .query_map(rusqlite::params![since], |r| {
-                    Ok(EgressModelUsage {
-                        model: r.get(0)?,
-                        calls: r.get::<_, i64>(1)? as u64,
-                        tokens: r.get::<_, i64>(2)? as u64,
-                    })
-                })
-                .map_err(map_err)?;
-            let mut out = Vec::new();
-            for row in rows {
-                out.push(row.map_err(map_err)?);
-            }
-            out
-        };
-
-        // ── by_day (GROUP BY UTC date, ascending) ──────────────────────────
-        let by_day = {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT date(ts, 'unixepoch') AS day,
-                            COALESCE(SUM(total_tokens), 0) AS tokens
-                       FROM egress_log
-                      WHERE ts >= ?1
-                      GROUP BY day
-                      ORDER BY day ASC",
-                )
-                .map_err(map_err)?;
-            let rows = stmt
-                .query_map(rusqlite::params![since], |r| {
-                    Ok(EgressDayUsage {
-                        day: r.get(0)?,
-                        tokens: r.get::<_, i64>(1)? as u64,
-                    })
-                })
-                .map_err(map_err)?;
-            let mut out = Vec::new();
-            for row in rows {
-                out.push(row.map_err(map_err)?);
-            }
-            out
-        };
-
-        // ── recent rows (last ≤20, newest first) ───────────────────────────
-        let recent = {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT ts, provider_id, destination, model_served, total_tokens,
-                            redactions_email, redactions_card, redactions_phone, redactions_name
-                       FROM egress_log
-                      WHERE ts >= ?1
-                      ORDER BY ts DESC
-                      LIMIT 20",
-                )
-                .map_err(map_err)?;
-            let rows = stmt
-                .query_map(rusqlite::params![since], |r| {
-                    Ok(EgressRecentRow {
-                        ts: r.get(0)?,
-                        provider_id: r.get(1)?,
-                        destination: r.get(2)?,
-                        model_served: r.get(3)?,
-                        total_tokens: r.get::<_, Option<i64>>(4)?.map(|v| v as u32),
-                        redactions: EgressRedactionTotals {
-                            email: r.get::<_, i64>(5)? as u64,
-                            card: r.get::<_, i64>(6)? as u64,
-                            phone: r.get::<_, i64>(7)? as u64,
-                            name: r.get::<_, i64>(8)? as u64,
-                        },
-                    })
-                })
-                .map_err(map_err)?;
-            let mut out = Vec::new();
-            for row in rows {
-                out.push(row.map_err(map_err)?);
-            }
-            out
-        };
-
-        Ok(EgressLedger {
-            total_calls,
-            total_tokens,
-            by_model,
-            by_day,
-            total_redactions,
-            recent,
-        })
-    }
+    // `egress_summary` moved to `storage::egress_store` (God-file split) alongside the
+    // `egress_log` / `share_egress_log` writers — still callable as inherent `db.method()`
+    // cross-file. Read-only aggregate over `egress_log`; content-free.
 
     // ── correction-log flywheel ──────────────────────────────────────────────
 
@@ -5041,59 +4729,11 @@ impl Db {
         .map_err(map_err)
     }
 
-    /// The owning folder id for a document, or `None` if unknown. The folder-lock gate anchor.
-    pub fn folder_for_document(&self, id: &str) -> Result<Option<String>> {
-        let conn = self.lock();
-        conn.query_row(
-            "SELECT folder_id FROM documents WHERE id = ?1",
-            rusqlite::params![id],
-            |r| r.get::<_, String>(0),
-        )
-        .optional()
-        .map_err(map_err)
-    }
+    // `folder_for_document` moved to `storage::folders_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// Distinct document ids governed by a folder's lock (its `documents` rows). Used to seal/unseal/
-    /// purge each document's text + chunks.
-    pub fn document_ids_in_folder(&self, folder_id: &str) -> Result<Vec<String>> {
-        let conn = self.lock();
-        let mut stmt = conn
-            .prepare("SELECT id FROM documents WHERE folder_id = ?1")
-            .map_err(map_err)?;
-        let rows = stmt
-            .query_map(rusqlite::params![folder_id], |r| r.get::<_, String>(0))
-            .map_err(map_err)?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r.map_err(map_err)?);
-        }
-        Ok(out)
-    }
+    // `document_ids_in_folder` moved to `storage::folders_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// Raw `(text, text_blob)` for every document in a folder — the seal/unseal source-of-truth read
-    /// (mirrors [`Db::raw_manual_notes`]). `text` is "" once sealed; `text_blob` carries the sealed
-    /// copy. Used by the seal (encrypt+verify the plaintext), unseal (decrypt the blob), and reblank
-    /// (re-blank only WHERE the blob exists) paths.
-    pub fn raw_documents_in_folder(&self, folder_id: &str) -> Result<Vec<RawDocument>> {
-        let conn = self.lock();
-        let mut stmt = conn
-            .prepare("SELECT id, COALESCE(text, ''), text_blob FROM documents WHERE folder_id = ?1")
-            .map_err(map_err)?;
-        let rows = stmt
-            .query_map(rusqlite::params![folder_id], |r| {
-                Ok(RawDocument {
-                    id: r.get(0)?,
-                    text: r.get(1)?,
-                    blob: r.get(2)?,
-                })
-            })
-            .map_err(map_err)?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r.map_err(map_err)?);
-        }
-        Ok(out)
-    }
+    // `raw_documents_in_folder` moved to `storage::folders_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
     /// Seal ONE document's text: store the AES-GCM `text_blob`, blank the plaintext `text`. The CALLER
     /// must verify the blob decrypts back byte-identical BEFORE calling this (verify-before-destroy) —
@@ -5349,65 +4989,7 @@ impl Db {
         Ok(())
     }
 
-    /// Reparent a note-folder + rewrite the `path` of it and EVERY descendant (a prefix rewrite, so
-    /// the subtree moves as a unit and `path` stays UNIQUE). Additive UPDATE only. `old_path` /
-    /// `new_path` are the folder's vault-relative paths; `parent_id` is the new parent (NULL for a
-    /// root note-folder). All in one tx.
-    pub fn reparent_note_folder(
-        &self,
-        id: &str,
-        old_path: &str,
-        new_path: &str,
-        parent_id: Option<&str>,
-    ) -> Result<()> {
-        let mut conn = self.lock();
-        let tx = conn.transaction().map_err(map_err)?;
-        // Descendants first: rewrite every `<old_path>/…` prefix to `<new_path>/…`.
-        // NOTES-3 (2026-07-11 audit): SQLite `substr()` counts CHARACTERS, not bytes, so the
-        // suffix offset MUST be the char count of `old_path` (+1 for the following '/'), never the
-        // Rust byte length — a multi-byte prefix (Polish "Sprzedaż") would otherwise slice mid-path
-        // and corrupt every descendant. `char_length(old_path) + 1` picks up at the '/' after the
-        // old prefix, so the leading slash survives into the rewritten path.
-        let like = format!("{}/%", old_path.replace('!', "!!").replace('%', "!%").replace('_', "!_"));
-        tx.execute(
-            "UPDATE folders
-                SET path = ?1 || substr(path, ?2)
-              WHERE kind = 'note' AND path LIKE ?3 ESCAPE '!'",
-            rusqlite::params![new_path, (old_path.chars().count() + 1) as i64, like],
-        )
-        .map_err(map_err)?;
-        // Then the folder itself: its own path + parent link.
-        tx.execute(
-            "UPDATE folders SET path = ?2, parent_id = ?3 WHERE id = ?1 AND kind = 'note'",
-            rusqlite::params![id, new_path, parent_id],
-        )
-        .map_err(map_err)?;
-        // NOTES-2 (2026-07-11 audit): rewrite every affected authored note's `documents.exported_path`
-        // so it reflects the NEW on-disk vault path (the FS `.md` was physically moved by
-        // `reparent_note_folder_paths`). Without this the path stays STALE and a later `lock_folder`
-        // deletes nothing at that stale path — leaving the real plaintext `.md` on disk in a sealed
-        // folder (a sealed-content leak). We replace the OLD path prefix with the NEW one for the moved
-        // folder AND its descendants. `replace()` is byte-safe (substring, not offset) and multi-byte
-        // safe. Scoped to notes whose folder is now under the new path (folders were rewritten above).
-        tx.execute(
-            "UPDATE documents
-                SET exported_path = replace(exported_path, ?1, ?2)
-              WHERE kind = 'note' AND exported_path IS NOT NULL
-                AND instr(exported_path, ?1) > 0
-                AND folder_id IN (
-                    SELECT id FROM folders
-                     WHERE kind = 'note' AND (path = ?2 OR path LIKE ?3 ESCAPE '!')
-                )",
-            rusqlite::params![
-                old_path,
-                new_path,
-                format!("{}/%", new_path.replace('!', "!!").replace('%', "!%").replace('_', "!_")),
-            ],
-        )
-        .map_err(map_err)?;
-        tx.commit().map_err(map_err)?;
-        Ok(())
-    }
+    // `reparent_note_folder` moved to `storage::folders_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
     /// Purge (delete) every `doc_chunks` + `doc_vec_chunks` row for the given documents. The vec0 row
     /// is deleted by its `chunk_id` (== doc_chunks.id) BEFORE the doc_chunks row. Used on lock (seal),
@@ -6457,100 +6039,15 @@ impl Db {
         Ok(())
     }
 
-    /// The vault `.md` paths of every authored NOTE in a folder that has one (`exported_path`
-    /// non-NULL). Captured BEFORE seal so `lock_folder` can delete the on-disk `.md` (mirrors the
-    /// meeting-notes `.md` deletion). No text — just paths (never PII-in-a-log; the caller doesn't
-    /// log these).
-    pub fn note_exported_paths_in_folder(&self, folder_id: &str) -> Result<Vec<String>> {
-        let conn = self.lock();
-        let mut stmt = conn
-            .prepare(
-                "SELECT exported_path FROM documents
-                   WHERE folder_id = ?1 AND kind = 'note' AND exported_path IS NOT NULL",
-            )
-            .map_err(map_err)?;
-        let rows = stmt
-            .query_map(rusqlite::params![folder_id], |r| r.get::<_, String>(0))
-            .map_err(map_err)?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r.map_err(map_err)?);
-        }
-        Ok(out)
-    }
+    // `note_exported_paths_in_folder` moved to `storage::folders_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// `(id, exported_path)` of every authored NOTE in a folder that has an on-disk export
-    /// (2026-07-10 residual W5): the id lets the relock cleanup clear each note's `exported_path`
-    /// INDIVIDUALLY, only after its `.md` was actually deleted (or is already absent) — a failed
-    /// delete keeps the path recorded so the next relock/startup pass retries. No text — ids +
-    /// paths only (the caller never logs the paths; they embed note titles).
-    pub fn note_exported_path_rows_in_folder(
-        &self,
-        folder_id: &str,
-    ) -> Result<Vec<(String, String)>> {
-        let conn = self.lock();
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, exported_path FROM documents
-                   WHERE folder_id = ?1 AND kind = 'note' AND exported_path IS NOT NULL",
-            )
-            .map_err(map_err)?;
-        let rows = stmt
-            .query_map(rusqlite::params![folder_id], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-            })
-            .map_err(map_err)?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r.map_err(map_err)?);
-        }
-        Ok(out)
-    }
+    // `note_exported_path_rows_in_folder` moved to `storage::folders_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// NULL the `exported_path` (+ its path-coupled `exported_hash` baseline) of every authored
-    /// NOTE in a folder (called on seal, after the vault `.md` files are deleted — a sealed note
-    /// has no on-disk export). Both re-set on unlock re-export.
-    pub fn clear_note_exported_paths_in_folder(&self, folder_id: &str) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
-            "UPDATE documents SET exported_path = NULL, exported_hash = NULL
-               WHERE folder_id = ?1 AND kind = 'note'",
-            rusqlite::params![folder_id],
-        )
-        .map_err(map_err)?;
-        Ok(())
-    }
+    // `clear_note_exported_paths_in_folder` moved to `storage::folders_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// Ids of every authored NOTE in a folder (its `documents(kind='note')` rows). Used to re-export
-    /// each note's vault `.md` on unlock/remove-lock. Mirrors [`Db::document_ids_in_folder`] but
-    /// scoped to notes.
-    pub fn note_ids_in_folder(&self, folder_id: &str) -> Result<Vec<String>> {
-        let conn = self.lock();
-        let mut stmt = conn
-            .prepare("SELECT id FROM documents WHERE folder_id = ?1 AND kind = 'note'")
-            .map_err(map_err)?;
-        let rows = stmt
-            .query_map(rusqlite::params![folder_id], |r| r.get::<_, String>(0))
-            .map_err(map_err)?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r.map_err(map_err)?);
-        }
-        Ok(out)
-    }
+    // `note_ids_in_folder` moved to `storage::folders_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// Reassign an authored NOTE to a different note-folder (the gate/seal anchor). The COMMAND
-    /// layer gates both the source and target folder. Idempotent on an unknown id / non-note row.
-    /// Named `_doc` to disambiguate from the MEETING-note [`Db::set_note_folder`].
-    pub fn set_note_doc_folder(&self, id: &str, folder_id: &str) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
-            "UPDATE documents SET folder_id = ?2 WHERE id = ?1 AND kind = 'note'",
-            rusqlite::params![id, folder_id],
-        )
-        .map_err(map_err)?;
-        Ok(())
-    }
+    // `set_note_doc_folder` moved to `storage::folders_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
     /// GATED list of note summaries. `folder_id = Some(fid)` scopes to one note-folder; `None` lists
     /// every VISIBLE note across all note-folders. The `visibility_clause` is applied IN THE QUERY
@@ -6618,50 +6115,9 @@ impl Db {
 
     // ── Feature C — TYPED note front-matter properties (note-folder schemas) ─────────────────────
 
-    /// Read a note-folder's declared property SCHEMA (Feature C). Returns the parsed field list, or
-    /// an EMPTY vec when the folder has no schema row. Content-free metadata: the schema declares
-    /// column names/types, never any note content. NOT lock-gated at this layer — the COMMAND layer
-    /// gates on the folder's session-unlock state (a locked folder's schema is deliberately not
-    /// exposed). A malformed `schema_json` (should never happen — we only ever write it via
-    /// [`Self::set_note_folder_schema`]) degrades to an empty vec rather than erroring the read.
-    pub fn get_note_folder_schema(&self, folder_id: &str) -> Result<Vec<PropertySchemaField>> {
-        let conn = self.lock();
-        let json: Option<String> = conn
-            .query_row(
-                "SELECT schema_json FROM note_folder_schemas WHERE folder_id = ?1",
-                rusqlite::params![folder_id],
-                |r| r.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(map_err)?;
-        match json {
-            None => Ok(Vec::new()),
-            Some(s) => Ok(serde_json::from_str::<Vec<PropertySchemaField>>(&s).unwrap_or_default()),
-        }
-    }
+    // `get_note_folder_schema` moved to `storage::folders_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// UPSERT a note-folder's property schema (Feature C). Serializes `fields` to the `schema_json`
-    /// column, inserting a new row or replacing the existing one via `ON CONFLICT(folder_id)`. The
-    /// COMMAND layer validates the fields (count/key/options) and gates the write on the folder's
-    /// session-unlock state BEFORE calling this — this is the raw persistence.
-    pub fn set_note_folder_schema(
-        &self,
-        folder_id: &str,
-        fields: &[PropertySchemaField],
-    ) -> Result<()> {
-        let schema_json = serde_json::to_string(fields)
-            .map_err(|e| AppError::Storage(format!("schema serialize failed: {e}")))?;
-        let now = chrono::Utc::now().timestamp_millis();
-        let conn = self.lock();
-        conn.execute(
-            "INSERT INTO note_folder_schemas (folder_id, schema_json, updated_at)
-             VALUES (?1, ?2, ?3)
-             ON CONFLICT(folder_id) DO UPDATE SET schema_json = ?2, updated_at = ?3",
-            rusqlite::params![folder_id, schema_json, now],
-        )
-        .map_err(map_err)?;
-        Ok(())
-    }
+    // `set_note_folder_schema` moved to `storage::folders_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
     /// List a note-folder's VISIBLE notes projected through its typed schema (Feature C — the
     /// Table/Board substrate). GATE: the visible rows come from the EXISTING gated
@@ -6737,30 +6193,7 @@ impl Db {
 
     // ── NOTE FOLDERS (`folders` with `kind='note'`) ──────────────────────────────────────────────
 
-    /// Ensure the root note-folder exists (name "Notes", `kind='note'`, path "Notes") and return its
-    /// id. Idempotent: on the SECOND+ call it finds the existing row by its unique `path` and returns
-    /// that id (never a duplicate). Every note anchors on a note-folder (the gate anchor).
-    pub fn ensure_default_note_folder(&self) -> Result<String> {
-        if let Some(f) = self.folder_by_path("Notes")? {
-            return Ok(f.id);
-        }
-        let id = uuid::Uuid::new_v4().to_string();
-        let conn = self.lock();
-        // Guard against a race / a pre-existing "Notes" path created between the check and here:
-        // INSERT OR IGNORE on the UNIQUE path, then read the id back (ours or the winner's).
-        conn.execute(
-            "INSERT OR IGNORE INTO folders (id, name, path, parent_id, locked, wrapped_key, created_at, kind)
-             VALUES (?1, 'Notes', 'Notes', NULL, 0, NULL, ?2, 'note')",
-            rusqlite::params![id, chrono::Utc::now().to_rfc3339()],
-        )
-        .map_err(map_err)?;
-        conn.query_row(
-            "SELECT id FROM folders WHERE path = 'Notes'",
-            [],
-            |r| r.get::<_, String>(0),
-        )
-        .map_err(map_err)
-    }
+    // `ensure_default_note_folder` moved to `storage::folders_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
     /// The ONE reserved, always-open note-folder that backs the "Notes" section root — the home for
     /// UNFILED new notes (2026-07-14). Idempotent; returns the existing `is_root` folder, else picks
@@ -6799,19 +6232,7 @@ impl Db {
         .map_err(map_err)
     }
 
-    /// True when this folder is the reserved always-open note-root (`is_root=1`). Drives the
-    /// `lock_folder` refusal so the root can never be sealed.
-    pub fn folder_is_root(&self, id: &str) -> Result<bool> {
-        let conn = self.lock();
-        conn.query_row(
-            "SELECT COALESCE(is_root, 0) FROM folders WHERE id = ?1",
-            rusqlite::params![id],
-            |r| Ok(r.get::<_, i64>(0)? != 0),
-        )
-        .optional()
-        .map(|o| o.unwrap_or(false))
-        .map_err(map_err)
-    }
+    // `folder_is_root` moved to `storage::folders_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
     /// Flag an existing (unlocked) note-folder as the reserved root. The `AND locked = 0` makes
     /// "is_root ⟹ never sealed" a SQL-enforced invariant even under a concurrent lock race — a locked
@@ -6869,86 +6290,15 @@ impl Db {
         .map_err(map_err)
     }
 
-    /// Insert a note-folder (`kind='note'`). Mirrors [`Db::insert_folder`] but stamps the kind.
-    pub fn insert_note_folder(&self, f: &NoteFolder, created_at: &str) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
-            "INSERT INTO folders (id, name, path, parent_id, locked, wrapped_key, created_at, kind)
-             VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, 'note')",
-            rusqlite::params![
-                f.id,
-                f.name,
-                f.path,
-                f.parent_id,
-                f.locked as i64,
-                created_at,
-            ],
-        )
-        .map_err(map_err)?;
-        Ok(())
-    }
+    // `insert_note_folder` moved to `storage::folders_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// All note-folders (`kind='note'`), creation order. The Notes tree; the Meetings tree
-    /// (`kind != 'note'`) is served by [`Db::list_folders`], which is unchanged.
-    pub fn list_note_folders(&self) -> Result<Vec<NoteFolder>> {
-        let conn = self.lock();
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, name, path, parent_id, locked, kind, COALESCE(is_root, 0)
-                   FROM folders WHERE kind = 'note' ORDER BY created_at, name",
-            )
-            .map_err(map_err)?;
-        let rows = stmt.query_map([], row_to_note_folder).map_err(map_err)?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r.map_err(map_err)?);
-        }
-        Ok(out)
-    }
+    // `list_note_folders` moved to `storage::folders_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// A note-folder by id (`kind='note'` enforced), or `None`. Used to gate note-folder ops so a
-    /// meeting-folder id can't be driven through a note-folder command.
-    pub fn note_folder_by_id(&self, id: &str) -> Result<Option<NoteFolder>> {
-        let conn = self.lock();
-        conn.query_row(
-            "SELECT id, name, path, parent_id, locked, kind, COALESCE(is_root, 0)
-               FROM folders WHERE id = ?1 AND kind = 'note'",
-            rusqlite::params![id],
-            row_to_note_folder,
-        )
-        .optional()
-        .map_err(map_err)
-    }
+    // `note_folder_by_id` moved to `storage::folders_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// Resolve a note-folder by NAME (case-insensitive, over [`Self::list_note_folders`]) OR by exact
-    /// id (Feature C — the `query_database` brain tool's `folder` argument). Name match is tried
-    /// first (the FIRST match wins on a name collision); if no name matches, an exact id is tried.
-    /// `Ok(None)` when neither resolves — the tool turns that into a friendly "no note folder named X".
-    /// Note-folders only (`kind='note'`), so a meeting folder can never be driven through the tool.
-    pub fn note_folder_by_name_or_id(&self, folder: &str) -> Result<Option<NoteFolder>> {
-        let needle = folder.trim();
-        if needle.is_empty() {
-            return Ok(None);
-        }
-        for f in self.list_note_folders()? {
-            if f.name.eq_ignore_ascii_case(needle) {
-                return Ok(Some(f));
-            }
-        }
-        self.note_folder_by_id(needle)
-    }
+    // `note_folder_by_name_or_id` moved to `storage::folders_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// The `kind` of a folder (or `None` if unknown). Lets the command layer reject cross-tree ops.
-    pub fn folder_kind(&self, id: &str) -> Result<Option<String>> {
-        let conn = self.lock();
-        conn.query_row(
-            "SELECT COALESCE(kind, 'meeting') FROM folders WHERE id = ?1",
-            rusqlite::params![id],
-            |r| r.get::<_, String>(0),
-        )
-        .optional()
-        .map_err(map_err)
-    }
+    // `folder_kind` moved to `storage::folders_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
     /// Ids of every VISIBLE document (its folder open or session-unlocked), oldest-first. The
     /// reindex-backfill corpus: a sealed-and-not-unlocked folder's documents are NEVER returned, so
@@ -7602,45 +6952,9 @@ impl Db {
     }
 
     // ── settings k/v table ───────────────────────────────────────────────────
-
-    pub fn get_setting(&self, key: &str) -> Result<Option<String>> {
-        let conn = self.lock();
-        conn.query_row(
-            "SELECT value FROM settings WHERE key = ?1",
-            rusqlite::params![key],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()
-        .map_err(map_err)
-    }
-
-    pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
-            "INSERT INTO settings (key, value) VALUES (?1, ?2)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            rusqlite::params![key, value],
-        )
-        .map_err(map_err)?;
-        Ok(())
-    }
-
-    pub fn all_settings(&self) -> Result<Vec<(String, String)>> {
-        let conn = self.lock();
-        let mut stmt = conn
-            .prepare("SELECT key, value FROM settings ORDER BY key")
-            .map_err(map_err)?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
-            .map_err(map_err)?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r.map_err(map_err)?);
-        }
-        Ok(out)
-    }
+    // `get_setting` / `set_setting` / `all_settings` moved to `storage::settings_store` (God-file
+    // split) — still callable as inherent `db.method()` cross-file. The `settings` schema stays
+    // inline in `Db::migrate()` above (created there with its seeded default rows).
 
     // ── analytics ──────────────────────────────────────────────────────────────
 
@@ -7796,132 +7110,21 @@ impl Db {
 
     // ── folders ──────────────────────────────────────────────────────────────
 
-    /// Insert a folder row. `path` is the vault-relative folder path (UNIQUE).
-    pub fn insert_folder(&self, f: &Folder) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
-            "INSERT INTO folders (id, name, path, parent_id, locked, wrapped_key, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6)",
-            rusqlite::params![
-                f.id,
-                f.name,
-                f.path,
-                f.parent_id,
-                f.locked as i64,
-                f.created_at,
-            ],
-        )
-        .map_err(map_err)?;
-        Ok(())
-    }
+    // `insert_folder` moved to `storage::folders_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// All folders (creation order). The tree is assembled by the caller.
-    pub fn list_folders(&self) -> Result<Vec<Folder>> {
-        let conn = self.lock();
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, name, path, parent_id, locked, created_at
-                   FROM folders ORDER BY created_at, name",
-            )
-            .map_err(map_err)?;
-        let rows = stmt.query_map([], row_to_folder).map_err(map_err)?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r.map_err(map_err)?);
-        }
-        Ok(out)
-    }
+    // `list_folders` moved to `storage::folders_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// Every folder's `kind` (`"meeting"` | `"note"`), keyed by id — so the FE can render ONLY meeting
-    /// folders in the Meetings tree (note folders share the `folders` table and would otherwise leak
-    /// into it). Legacy rows with a NULL kind default to `"meeting"`. (2026-07-14.)
-    pub fn folder_kinds(&self) -> Result<std::collections::HashMap<String, String>> {
-        let conn = self.lock();
-        let mut stmt = conn
-            .prepare("SELECT id, COALESCE(kind, 'meeting') FROM folders")
-            .map_err(map_err)?;
-        let rows = stmt
-            .query_map([], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-            })
-            .map_err(map_err)?;
-        let mut out = std::collections::HashMap::new();
-        for r in rows {
-            let (id, kind) = r.map_err(map_err)?;
-            out.insert(id, kind);
-        }
-        Ok(out)
-    }
+    // `folder_kinds` moved to `storage::folders_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    pub fn folder_by_id(&self, id: &str) -> Result<Option<Folder>> {
-        let conn = self.lock();
-        conn.query_row(
-            "SELECT id, name, path, parent_id, locked, created_at FROM folders WHERE id = ?1",
-            rusqlite::params![id],
-            row_to_folder,
-        )
-        .optional()
-        .map_err(map_err)
-    }
+    // `folder_by_id` moved to `storage::folders_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// Look up a folder by its vault-relative `path` (the `path` column is `NOT NULL UNIQUE`). Used
-    /// by the auto-organize seam to map a classifier-chosen subfolder name back to its folder row —
-    /// so a note auto-filed into a LOCKED folder's on-disk dir is sealed/rejected (it would
-    /// otherwise land plaintext with `folder_id = NULL`, which `lock_folder` + the at-rest reconcile
-    /// both key off `folder_id` and miss).
-    pub fn folder_by_path(&self, path: &str) -> Result<Option<Folder>> {
-        let conn = self.lock();
-        conn.query_row(
-            "SELECT id, name, path, parent_id, locked, created_at FROM folders WHERE path = ?1",
-            rusqlite::params![path],
-            row_to_folder,
-        )
-        .optional()
-        .map_err(map_err)
-    }
+    // `folder_by_path` moved to `storage::folders_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// Set a folder's `locked` flag + its KEK-wrapped content key (`Some` when sealing,
-    /// `None` to clear on permanent remove-lock).
-    pub fn set_folder_locked(
-        &self,
-        id: &str,
-        locked: bool,
-        wrapped_key: Option<&[u8]>,
-    ) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
-            "UPDATE folders SET locked = ?2, wrapped_key = ?3 WHERE id = ?1",
-            rusqlite::params![id, locked as i64, wrapped_key],
-        )
-        .map_err(map_err)?;
-        Ok(())
-    }
+    // `set_folder_locked` moved to `storage::folders_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// The KEK-wrapped content key for a sealed folder (`None` if the column is NULL).
-    pub fn folder_wrapped_key(&self, id: &str) -> Result<Option<Vec<u8>>> {
-        let conn = self.lock();
-        conn.query_row(
-            "SELECT wrapped_key FROM folders WHERE id = ?1",
-            rusqlite::params![id],
-            |r| r.get::<_, Option<Vec<u8>>>(0),
-        )
-        .optional()
-        .map_err(map_err)
-        .map(Option::flatten)
-    }
+    // `folder_wrapped_key` moved to `storage::folders_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// Does ANY sealed folder exist? Drives the master-KEK mint guard: while sealed content exists,
-    /// a missing KEK keychain item must NEVER be silently replaced by a freshly-minted one (the
-    /// fresh KEK cannot unwrap the existing folders' content keys — 2026-07-05 field incident).
-    pub fn any_locked_folder(&self) -> Result<bool> {
-        let conn = self.lock();
-        conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM folders WHERE locked = 1)",
-            [],
-            |r| r.get::<_, bool>(0),
-        )
-        .map_err(map_err)
-    }
+    // `any_locked_folder` moved to `storage::folders_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
     /// DESTRUCTIVE escape hatch for a folder whose master KEK is GENUINELY UNRECOVERABLE (the caller
     /// — `discard_unrecoverable_folder_lock` — has already PROVEN, via the full read-first + candidate
@@ -8115,42 +7318,9 @@ impl Db {
         Ok(enc_paths)
     }
 
-    /// Direct CHILD folders of `parent_id` (one level only — not transitive). Used by
-    /// `rename_folder`/`delete_folder` to walk the subtree so a rename can re-prefix descendant
-    /// paths and a delete can refuse a non-empty tree.
-    pub fn child_folders(&self, parent_id: &str) -> Result<Vec<Folder>> {
-        let conn = self.lock();
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, name, path, parent_id, locked, created_at
-                   FROM folders WHERE parent_id = ?1 ORDER BY created_at, name",
-            )
-            .map_err(map_err)?;
-        let rows = stmt
-            .query_map(rusqlite::params![parent_id], row_to_folder)
-            .map_err(map_err)?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r.map_err(map_err)?);
-        }
-        Ok(out)
-    }
+    // `child_folders` moved to `storage::folders_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// Rename a folder's display `name` AND its vault-relative `path` in one statement. The new
-    /// `path` is composed by the caller (parent path + sanitized name), so this is a pure column
-    /// update — it does NOT touch the on-disk vault dir or any note's `exported_path` (those are the
-    /// caller's responsibility, sequenced so a crash can never lose content). Leaves `locked` /
-    /// `wrapped_key` untouched: a locked-folder rename is metadata-only and never reaches sealed
-    /// content.
-    pub fn rename_folder(&self, id: &str, new_name: &str, new_path: &str) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
-            "UPDATE folders SET name = ?2, path = ?3 WHERE id = ?1",
-            rusqlite::params![id, new_name, new_path],
-        )
-        .map_err(map_err)?;
-        Ok(())
-    }
+    // `rename_folder` moved to `storage::folders_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
     /// Delete a folder ROW by id (the `folders` table only). The caller MUST have already moved /
     /// unsealed its notes elsewhere — this does NOT reassign or delete any note, and a locked folder
@@ -8259,24 +7429,9 @@ impl Db {
         Ok(out)
     }
 
-    /// Assign (or clear) a MEETING's folder. A meeting's folder = its note's folder, so this
-    /// updates `folder_id` on EVERY provider row of the meeting (`WHERE meeting_id = ?1`) — the
-    /// note moves as a unit and the seal/unlock lifecycle (which iterates provider rows) stays
-    /// coherent (no row left in a stale folder). `None` clears the folder (move to vault root).
-    pub fn set_meeting_folder(&self, meeting_id: &str, folder_id: Option<&str>) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
-            "UPDATE notes SET folder_id = ?2 WHERE meeting_id = ?1",
-            rusqlite::params![meeting_id, folder_id],
-        )
-        .map_err(map_err)?;
-        Ok(())
-    }
+    // `set_meeting_folder` moved to `storage::folders_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// Back-compat alias for [`Db::set_meeting_folder`] — a note's folder is the meeting's folder.
-    pub fn set_note_folder(&self, meeting_id: &str, folder_id: Option<&str>) -> Result<()> {
-        self.set_meeting_folder(meeting_id, folder_id)
-    }
+    // `set_note_folder` moved to `storage::folders_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
     /// Notes assigned to a folder (the rows needed to seal/unseal): the meeting, provider,
     /// current markdown, exported path, and any existing sealed blob.
@@ -8867,21 +8022,7 @@ impl Db {
         Ok((audio, rollup_exports, note_md_exports, changed_marker_sources))
     }
 
-    /// Folder ids that are sealed (`locked=1`) — used to re-blank every sealed note on relock-all.
-    pub fn locked_folder_ids(&self) -> Result<Vec<String>> {
-        let conn = self.lock();
-        let mut stmt = conn
-            .prepare("SELECT id FROM folders WHERE locked = 1")
-            .map_err(map_err)?;
-        let rows = stmt
-            .query_map([], |r| r.get::<_, String>(0))
-            .map_err(map_err)?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r.map_err(map_err)?);
-        }
-        Ok(out)
-    }
+    // `locked_folder_ids` moved to `storage::folders_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
     // ── transcript + timeline sealing (Phase 0.5 full per-folder lock) ─────────
     //
@@ -8893,37 +8034,9 @@ impl Db {
     // remove-lock. All keyed off the meeting set of a folder (a meeting's folder = its notes'
     // folder, derived from `notes.folder_id`).
 
-    /// Distinct meeting ids whose notes live in `folder_id` (the meetings governed by the
-    /// folder's lock). Used to seal/unseal each meeting's transcript + timeline.
-    pub fn meeting_ids_in_folder(&self, folder_id: &str) -> Result<Vec<String>> {
-        let conn = self.lock();
-        let mut stmt = conn
-            .prepare("SELECT DISTINCT meeting_id FROM notes WHERE folder_id = ?1")
-            .map_err(map_err)?;
-        let rows = stmt
-            .query_map(rusqlite::params![folder_id], |r| r.get::<_, String>(0))
-            .map_err(map_err)?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r.map_err(map_err)?);
-        }
-        Ok(out)
-    }
+    // `meeting_ids_in_folder` moved to `storage::folders_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// The owning folder id for a meeting (its notes' `folder_id`), or `None` at the vault root.
-    /// Drives the read-gate predicate `meeting_is_unlocked`.
-    pub fn folder_for_meeting(&self, meeting_id: &str) -> Result<Option<String>> {
-        let conn = self.lock();
-        conn.query_row(
-            "SELECT folder_id FROM notes
-              WHERE meeting_id = ?1 AND folder_id IS NOT NULL LIMIT 1",
-            rusqlite::params![meeting_id],
-            |r| r.get::<_, Option<String>>(0),
-        )
-        .optional()
-        .map_err(map_err)
-        .map(Option::flatten)
-    }
+    // `folder_for_meeting` moved to `storage::folders_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
     /// Meetings whose audio may be auto-pruned: every meeting NOT in a locked folder
     /// (a meeting's folder = its `notes.folder_id`), OLDEST FIRST. A locked folder's audio
@@ -11759,168 +10872,11 @@ impl Db {
     }
 
     // ── Brain v2 L5 — scheduled briefs (config + propose-accept staging) ────────────────────────
-
-    /// All brief schedules (config rows — no meeting content).
-    pub fn list_brief_schedules(&self) -> Result<Vec<crate::storage::models::BriefSchedule>> {
-        let conn = self.lock();
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, label, day_of_week, hour_local, minute_local, scope_days, \
-                        prompt_hint, enabled, last_run_at, created_at \
-                   FROM brief_schedules ORDER BY created_at ASC, id ASC",
-            )
-            .map_err(map_err)?;
-        let rows = stmt.query_map([], row_to_brief_schedule).map_err(map_err)?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r.map_err(map_err)?);
-        }
-        Ok(out)
-    }
-
-    /// Insert one brief schedule (caller validates ranges — see `create_brief_schedule`).
-    pub fn insert_brief_schedule(&self, s: &crate::storage::models::BriefSchedule) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
-            "INSERT INTO brief_schedules \
-               (id, label, day_of_week, hour_local, minute_local, scope_days, prompt_hint, \
-                enabled, last_run_at, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            rusqlite::params![
-                s.id,
-                s.label,
-                s.day_of_week,
-                s.hour_local,
-                s.minute_local,
-                s.scope_days,
-                s.prompt_hint,
-                s.enabled as i64,
-                s.last_run_at,
-                s.created_at,
-            ],
-        )
-        .map_err(map_err)?;
-        Ok(())
-    }
-
-    /// Update one brief schedule's editable fields (label / timing / window / hint / enabled).
-    /// `last_run_at` / `created_at` are runner/system-owned and never updated here.
-    pub fn update_brief_schedule(&self, s: &crate::storage::models::BriefSchedule) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
-            "UPDATE brief_schedules SET label = ?2, day_of_week = ?3, hour_local = ?4, \
-                    minute_local = ?5, scope_days = ?6, prompt_hint = ?7, enabled = ?8 \
-              WHERE id = ?1",
-            rusqlite::params![
-                s.id,
-                s.label,
-                s.day_of_week,
-                s.hour_local,
-                s.minute_local,
-                s.scope_days,
-                s.prompt_hint,
-                s.enabled as i64,
-            ],
-        )
-        .map_err(map_err)?;
-        Ok(())
-    }
-
-    /// Delete one brief schedule AND its staged runs (a dangling pending run would render a card
-    /// for a schedule that no longer exists).
-    pub fn delete_brief_schedule(&self, id: &str) -> Result<()> {
-        let conn = self.lock();
-        conn.execute("DELETE FROM brief_runs WHERE schedule_id = ?1", [id])
-            .map_err(map_err)?;
-        conn.execute("DELETE FROM brief_schedules WHERE id = ?1", [id])
-            .map_err(map_err)?;
-        Ok(())
-    }
-
-    /// Stamp the once-per-local-day guard: `last_run_at` = the LOCAL date (`YYYY-MM-DD`).
-    pub fn set_brief_schedule_last_run(&self, id: &str, local_date: &str) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
-            "UPDATE brief_schedules SET last_run_at = ?2 WHERE id = ?1",
-            rusqlite::params![id, local_date],
-        )
-        .map_err(map_err)?;
-        Ok(())
-    }
-
-    /// Insert one proposed brief run (status "pending"). `meeting_ids` serializes to a JSON array
-    /// of opaque ids.
-    pub fn insert_brief_run(&self, r: &crate::storage::models::BriefRun) -> Result<()> {
-        let ids = serde_json::to_string(&r.meeting_ids)
-            .map_err(|e| AppError::Storage(format!("meeting_ids serialize: {e}")))?;
-        let conn = self.lock();
-        conn.execute(
-            "INSERT INTO brief_runs (id, schedule_id, status, note_md, meeting_ids, proposed_at, accepted_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            rusqlite::params![
-                r.id,
-                r.schedule_id,
-                r.status,
-                r.note_md,
-                ids,
-                r.proposed_at,
-                r.accepted_at,
-            ],
-        )
-        .map_err(map_err)?;
-        Ok(())
-    }
-
-    /// The PENDING (not yet accepted/dismissed) brief runs, newest first — the FE's proposal cards.
-    pub fn list_pending_brief_runs(&self) -> Result<Vec<crate::storage::models::BriefRun>> {
-        let conn = self.lock();
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, schedule_id, status, note_md, meeting_ids, proposed_at, accepted_at \
-                   FROM brief_runs WHERE status = 'pending' ORDER BY proposed_at DESC, id DESC",
-            )
-            .map_err(map_err)?;
-        let rows = stmt.query_map([], row_to_brief_run).map_err(map_err)?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r.map_err(map_err)?);
-        }
-        Ok(out)
-    }
-
-    /// One brief run by id.
-    pub fn get_brief_run(&self, id: &str) -> Result<Option<crate::storage::models::BriefRun>> {
-        let conn = self.lock();
-        conn.query_row(
-            "SELECT id, schedule_id, status, note_md, meeting_ids, proposed_at, accepted_at \
-               FROM brief_runs WHERE id = ?1",
-            [id],
-            row_to_brief_run,
-        )
-        .optional()
-        .map_err(map_err)
-    }
-
-    /// Mark a run ACCEPTED and CONSUME its markdown (the exported vault `.md` becomes the copy —
-    /// the staging row keeps only ids + timestamps afterwards).
-    pub fn accept_brief_run(&self, id: &str, accepted_at: &str) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
-            "UPDATE brief_runs SET status = 'accepted', accepted_at = ?2, note_md = '' \
-              WHERE id = ?1",
-            rusqlite::params![id, accepted_at],
-        )
-        .map_err(map_err)?;
-        Ok(())
-    }
-
-    /// Dismiss = DELETE the staged run row (nothing is kept).
-    pub fn delete_brief_run(&self, id: &str) -> Result<()> {
-        let conn = self.lock();
-        conn.execute("DELETE FROM brief_runs WHERE id = ?1", [id])
-            .map_err(map_err)?;
-        Ok(())
-    }
+    // The `brief_schedules` / `brief_runs` CRUD (`list_brief_schedules` / `insert_brief_schedule` /
+    // `update_brief_schedule` / `delete_brief_schedule` / `set_brief_schedule_last_run` /
+    // `insert_brief_run` / `list_pending_brief_runs` / `get_brief_run` / `accept_brief_run` /
+    // `delete_brief_run`) + `row_to_brief_schedule` / `row_to_brief_run` moved to
+    // `storage::brief_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
     // ── Brain v2 L5 — MCP server config rows ────────────────────────────────────────────────────
     // The `mcp_servers` table CRUD (`list_mcp_servers` / `get_mcp_server` / `insert_mcp_server` /
@@ -12102,260 +11058,14 @@ impl Db {
         Ok(n)
     }
 
-    // ── Vault Audit v1 (see `crate::audit`) ─────────────────────────────────────────────────────
-
-    /// Stage one audit finding UNLESS a PENDING or DISMISSED twin (same `dedupe_key`) already
-    /// exists — pending = already surfaced, dismissed = the user said "don't nag again". An
-    /// ACCEPTED twin does NOT suppress (the evidence may legitimately recur later). Returns
-    /// whether a row was inserted.
-    pub fn insert_audit_finding_if_new(
-        &self,
-        f: &crate::audit::NewAuditFinding,
-        run_id: &str,
-        created_at: i64,
-    ) -> Result<bool> {
-        let conn = self.lock();
-        let suppressed: bool = conn
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM audit_findings
-                   WHERE dedupe_key = ?1 AND status IN ('pending', 'dismissed'))",
-                rusqlite::params![f.dedupe_key],
-                |r| r.get(0),
-            )
-            .map_err(map_err)?;
-        if suppressed {
-            return Ok(false);
-        }
-        conn.execute(
-            "INSERT INTO audit_findings
-               (id, kind, source_kind, source_id, source_title, target_title, target_id,
-                target_kind, evidence_md, accept_action, dedupe_key, status, run_id, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'pending', ?12, ?13)",
-            rusqlite::params![
-                uuid::Uuid::new_v4().to_string(),
-                f.kind,
-                f.source_kind,
-                f.source_id,
-                f.source_title,
-                f.target_title,
-                f.target_id,
-                f.target_kind,
-                f.evidence_md,
-                f.accept_action,
-                f.dedupe_key,
-                run_id,
-                created_at,
-            ],
-        )
-        .map_err(map_err)?;
-        Ok(true)
-    }
-
-    /// All findings with `status`, newest first. RAW row read — the COMMAND layer defensively
-    /// re-filters each row's SOURCE visibility against the live session unlock set before
-    /// returning (belt-and-braces on top of purge-on-seal).
-    pub fn list_audit_finding_rows(
-        &self,
-        status: &str,
-    ) -> Result<Vec<crate::audit::AuditFindingRow>> {
-        let conn = self.lock();
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, kind, source_kind, source_id, source_title, target_title, target_id,
-                        target_kind, evidence_md, accept_action, dedupe_key, status, run_id,
-                        created_at, resolved_at
-                   FROM audit_findings WHERE status = ?1
-                  ORDER BY created_at DESC, id ASC",
-            )
-            .map_err(map_err)?;
-        let rows = stmt
-            .query_map(rusqlite::params![status], row_to_audit_finding)
-            .map_err(map_err)?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r.map_err(map_err)?);
-        }
-        Ok(out)
-    }
-
-    /// One finding by id (any status).
-    pub fn get_audit_finding(&self, id: &str) -> Result<Option<crate::audit::AuditFindingRow>> {
-        let conn = self.lock();
-        conn.query_row(
-            "SELECT id, kind, source_kind, source_id, source_title, target_title, target_id,
-                    target_kind, evidence_md, accept_action, dedupe_key, status, run_id,
-                    created_at, resolved_at
-               FROM audit_findings WHERE id = ?1",
-            rusqlite::params![id],
-            row_to_audit_finding,
-        )
-        .optional()
-        .map_err(map_err)
-    }
-
-    /// Flip a finding to `accepted`/`dismissed` and BLANK the derived plaintext — `evidence_md`,
-    /// `accept_action` AND BOTH TITLES — in the SAME statement (the brief-runs consume-on-accept
-    /// posture). Titles are content material too (lock review, 2026-07-16): resolved rows survive
-    /// every purge (pending-only) and the list's source re-gate, so a resolved row keeping a
-    /// later-sealed target's title would serve it forever. Only PENDING rows carry ANY
-    /// title/evidence material at rest; ids/kind/timestamps are all a resolved row keeps.
-    pub fn resolve_audit_finding_row(
-        &self,
-        id: &str,
-        status: &str,
-        resolved_at: i64,
-    ) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
-            "UPDATE audit_findings
-                SET status = ?2, resolved_at = ?3, evidence_md = '', accept_action = '',
-                    source_title = '', target_title = NULL
-              WHERE id = ?1",
-            rusqlite::params![id, status, resolved_at],
-        )
-        .map_err(map_err)?;
-        Ok(())
-    }
-
-    /// Delete every PENDING row a given audit run staged — the end-of-pass seal-epoch
-    /// reconciliation (see `crate::audit::run_audit_pass`): when the epoch is observed advanced
-    /// at pass end, the whole run's staged rows are withdrawn in ONE statement, turning the
-    /// residual insert-vs-seal-purge race into a no-op. Pending-only by construction (a
-    /// just-staged run's rows cannot be resolved yet; the filter is belt-and-braces).
-    pub fn delete_pending_audit_findings_for_run(&self, run_id: &str) -> Result<usize> {
-        let conn = self.lock();
-        let n = conn
-            .execute(
-                "DELETE FROM audit_findings WHERE run_id = ?1 AND status = 'pending'",
-                rusqlite::params![run_id],
-            )
-            .map_err(map_err)?;
-        Ok(n)
-    }
-
-    /// Count of pending findings (the summary/event payload — a count, never content).
-    pub fn count_pending_audit_findings(&self) -> Result<usize> {
-        let conn = self.lock();
-        let n: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM audit_findings WHERE status = 'pending'",
-                [],
-                |r| r.get(0),
-            )
-            .map_err(map_err)?;
-        Ok(n as usize)
-    }
-
-    /// Record one audit run (content-free bookkeeping: id + timestamps + per-kind counts JSON).
-    pub fn insert_audit_run(
-        &self,
-        id: &str,
-        started_at: i64,
-        finished_at: i64,
-        counts_json: &str,
-    ) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
-            "INSERT INTO audit_runs (id, started_at, finished_at, counts_json)
-             VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![id, started_at, finished_at, counts_json],
-        )
-        .map_err(map_err)?;
-        Ok(())
-    }
-
-    /// Weekly runner CLAIM row — inserted BEFORE the scheduled pass runs (the brief runner's
-    /// claim-before-run discipline): once this row exists, `weekly_due` holds for the next 7 days
-    /// even if the pass itself crashes/fails, so a persistently-failing pass can never become an
-    /// hourly storm. Content-free (`scheduled = 1`, empty counts); the pass still records its own
-    /// normal (unscheduled) bookkeeping row on completion.
-    pub fn insert_scheduled_audit_run_claim(&self, id: &str, claimed_at: i64) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
-            "INSERT INTO audit_runs (id, started_at, finished_at, counts_json, scheduled)
-             VALUES (?1, ?2, ?2, '{}', 1)",
-            rusqlite::params![id, claimed_at],
-        )
-        .map_err(map_err)?;
-        Ok(())
-    }
-
-    /// `finished_at` of the newest SCHEDULED audit run (the weekly claim rows) — the due-ness
-    /// anchor. Manual runs (`scheduled = 0`) never count, so running the audit by hand does not
-    /// push the weekly cadence.
-    pub fn last_scheduled_audit_run_finished_at(&self) -> Result<Option<i64>> {
-        let conn = self.lock();
-        conn.query_row(
-            "SELECT MAX(finished_at) FROM audit_runs WHERE scheduled = 1",
-            [],
-            |r| r.get::<_, Option<i64>>(0),
-        )
-        .map_err(map_err)
-    }
-
-    /// Judge-tier DEMOTE: delete ONE pending finding outright (NOT dismiss — a dismissed row's
-    /// `dedupe_key` suppresses re-creation forever; deletion lets a real issue re-stage on the
-    /// next pass). Pending-only by construction: a row the user resolved (or a seal purged)
-    /// between the judge's read and this delete is left alone. Returns whether a row was deleted.
-    pub fn delete_pending_audit_finding(&self, id: &str) -> Result<bool> {
-        let conn = self.lock();
-        let n = conn
-            .execute(
-                "DELETE FROM audit_findings WHERE id = ?1 AND status = 'pending'",
-                rusqlite::params![id],
-            )
-            .map_err(map_err)?;
-        Ok(n > 0)
-    }
-
-    /// Vault Audit DELETE-SAFETY: delete every PENDING `audit_findings` row whose SOURCE or
-    /// TARGET is any of `ids`, within an EXISTING transaction. This precise id-matched purge is
-    /// for the DELETE paths ONLY (`delete_meeting` / `delete_document`) — a delete invalidates
-    /// nothing else, so unrelated findings survive. SEAL paths use
-    /// [`Db::purge_all_pending_audit_findings_tx`] instead (a pending finding may cite
-    /// THIRD-PARTY titles no id can match). RESOLVED rows are left alone (blanked on resolve —
-    /// ids + kind only).
-    pub(crate) fn purge_pending_audit_findings_tx(
-        tx: &rusqlite::Transaction<'_>,
-        ids: &[String],
-    ) -> Result<()> {
-        for id in ids {
-            tx.execute(
-                "DELETE FROM audit_findings
-                  WHERE status = 'pending' AND (source_id = ?1 OR target_id = ?1)",
-                rusqlite::params![id],
-            )
-            .map_err(map_err)?;
-        }
-        Ok(())
-    }
-
-    /// Vault Audit LOCK-SAFETY (adversarial HIGH, 2026-07-16): on ANY lock-surface mutation
-    /// (seal, relock, startup reconcile, discard, move-into-locked), purge ALL pending findings —
-    /// the memory-rollups posture, not the per-id brief-runs one. A pending finding's
-    /// `evidence_md` may cite THIRD-PARTY titles (a stale finding's `see [[superseding note]]`,
-    /// an orphan's suggested `[[titles]]`) carried with `target_id = NULL`, which an id-matched
-    /// purge can never cover — and a seal anywhere invalidates the pass's whole visibility
-    /// snapshot. Findings are cheap re-derivable rows: the next manual run re-stages everything
-    /// still true over the post-seal corpus. RESOLVED rows survive (blanked on resolve).
-    pub(crate) fn purge_all_pending_audit_findings_tx(
-        tx: &rusqlite::Transaction<'_>,
-    ) -> Result<()> {
-        tx.execute("DELETE FROM audit_findings WHERE status = 'pending'", [])
-            .map_err(map_err)?;
-        Ok(())
-    }
-
-    /// Standalone-transaction wrapper of [`Db::purge_all_pending_audit_findings_tx`] for the
-    /// lock-surface call sites with no open transaction of their own (the note move-into-locked
-    /// seal in `move_note_doc_inner`).
-    pub fn purge_all_pending_audit_findings(&self) -> Result<()> {
-        let mut conn = self.lock();
-        let tx = conn.transaction().map_err(map_err)?;
-        Self::purge_all_pending_audit_findings_tx(&tx)?;
-        tx.commit().map_err(map_err)?;
-        Ok(())
-    }
+    // The `audit_findings` / `audit_runs` CRUD (`insert_audit_finding_if_new` /
+    // `list_audit_finding_rows` / `get_audit_finding` / `resolve_audit_finding_row` /
+    // `delete_pending_audit_findings_for_run` / `count_pending_audit_findings` / `insert_audit_run` /
+    // `insert_scheduled_audit_run_claim` / `last_scheduled_audit_run_finished_at` /
+    // `delete_pending_audit_finding` / `purge_pending_audit_findings_tx` /
+    // `purge_all_pending_audit_findings_tx` / `purge_all_pending_audit_findings`) + `row_to_audit_finding`
+    // moved to `storage::audit_store` (God-file split) — still callable as inherent `db.method()`
+    // (and `Self::purge_*_pending_audit_findings_tx(&tx, ..)` from the seal paths) cross-file.
 
     /// GATED: every OPEN fact whose source meeting is VISIBLE — the SAME meeting-visibility
     /// predicate as [`Db::list_facts_visible`] (a NULL `meeting_id` is fail-closed via the INNER
@@ -13000,29 +11710,10 @@ fn row_to_meeting(row: &Row<'_>) -> rusqlite::Result<Result<Meeting>> {
     }))
 }
 
-/// Map a `facts` row (column order matches every facts SELECT) to a [`crate::facts::Fact`].
-/// Map one `audit_findings` row (the full column order of `list_audit_finding_rows` /
-/// `get_audit_finding`) to its DB-shaped struct.
-fn row_to_audit_finding(row: &Row<'_>) -> rusqlite::Result<crate::audit::AuditFindingRow> {
-    Ok(crate::audit::AuditFindingRow {
-        id: row.get(0)?,
-        kind: row.get(1)?,
-        source_kind: row.get(2)?,
-        source_id: row.get(3)?,
-        source_title: row.get(4)?,
-        target_title: row.get(5)?,
-        target_id: row.get(6)?,
-        target_kind: row.get(7)?,
-        evidence_md: row.get(8)?,
-        accept_action: row.get(9)?,
-        dedupe_key: row.get(10)?,
-        status: row.get(11)?,
-        run_id: row.get(12)?,
-        created_at: row.get(13)?,
-        resolved_at: row.get(14)?,
-    })
-}
+// `row_to_audit_finding` moved to `storage::audit_store` (God-file split) alongside the
+// `audit_findings` readers that are its only callers.
 
+/// Map a `facts` row (column order matches every facts SELECT) to a [`crate::facts::Fact`].
 fn row_to_fact(row: &Row<'_>) -> rusqlite::Result<crate::facts::Fact> {
     Ok(crate::facts::Fact {
         id: row.get(0)?,
@@ -13057,40 +11748,8 @@ fn row_to_user_fact(row: &Row<'_>) -> rusqlite::Result<crate::facts::Fact> {
     })
 }
 
-/// Map a `brief_schedules` row (id, label, day_of_week, hour_local, minute_local, scope_days,
-/// prompt_hint, enabled, last_run_at, created_at) to a [`crate::storage::models::BriefSchedule`].
-fn row_to_brief_schedule(
-    row: &Row<'_>,
-) -> rusqlite::Result<crate::storage::models::BriefSchedule> {
-    Ok(crate::storage::models::BriefSchedule {
-        id: row.get(0)?,
-        label: row.get(1)?,
-        day_of_week: row.get(2)?,
-        hour_local: row.get(3)?,
-        minute_local: row.get(4)?,
-        scope_days: row.get(5)?,
-        prompt_hint: row.get(6)?,
-        enabled: row.get::<_, i64>(7)? != 0,
-        last_run_at: row.get(8)?,
-        created_at: row.get(9)?,
-    })
-}
-
-/// Map a `brief_runs` row (id, schedule_id, status, note_md, meeting_ids JSON, proposed_at,
-/// accepted_at) to a [`crate::storage::models::BriefRun`]. A malformed `meeting_ids` JSON degrades
-/// to an empty id list (ids are advisory provenance, never content).
-fn row_to_brief_run(row: &Row<'_>) -> rusqlite::Result<crate::storage::models::BriefRun> {
-    let ids_json: String = row.get(4)?;
-    Ok(crate::storage::models::BriefRun {
-        id: row.get(0)?,
-        schedule_id: row.get(1)?,
-        status: row.get(2)?,
-        note_md: row.get(3)?,
-        meeting_ids: serde_json::from_str(&ids_json).unwrap_or_default(),
-        proposed_at: row.get(5)?,
-        accepted_at: row.get(6)?,
-    })
-}
+// `row_to_brief_schedule` / `row_to_brief_run` moved to `storage::brief_store` (God-file split)
+// alongside the `brief_schedules` / `brief_runs` readers that are their only callers.
 
 // `row_to_mcp_server` moved to `storage::mcp_store` (God-file split) alongside the `mcp_servers`
 // readers that are its only callers.
@@ -13332,33 +11991,9 @@ fn row_to_note(row: &Row<'_>) -> rusqlite::Result<NoteRecord> {
     })
 }
 
-/// Maps `(id, name, path, parent_id, locked, created_at)` → `Folder`.
-fn row_to_folder(row: &Row<'_>) -> rusqlite::Result<Folder> {
-    Ok(Folder {
-        id: row.get(0)?,
-        name: row.get(1)?,
-        path: row.get(2)?,
-        parent_id: row.get(3)?,
-        locked: row.get::<_, i64>(4)? != 0,
-        created_at: row.get(5)?,
-    })
-}
+// `row_to_folder` moved to `storage::folders_store` (God-file split) alongside the folder readers that are its only callers.
 
-/// Column order: `id, name, path, parent_id, locked, kind`.
-fn row_to_note_folder(row: &Row<'_>) -> rusqlite::Result<NoteFolder> {
-    Ok(NoteFolder {
-        id: row.get(0)?,
-        name: row.get(1)?,
-        path: row.get(2)?,
-        parent_id: row.get(3)?,
-        locked: row.get::<_, i64>(4)? != 0,
-        // DB-only view: the session-unlock state is not a column. The `list_note_folders` command
-        // fills this in from the live session set; every other reader gets `false` (safe default).
-        unlocked: false,
-        kind: row.get::<_, Option<String>>(5)?.unwrap_or_else(|| "note".into()),
-        is_root: row.get::<_, i64>(6)? != 0,
-    })
-}
+// `row_to_note_folder` moved to `storage::folders_store` (God-file split) alongside the folder readers that are its only callers.
 
 /// Column order: `id, folder_id, name, title, text, created_at, updated_at, exported_path, sealed`.
 fn row_to_note_row(row: &Row<'_>) -> rusqlite::Result<NoteRow> {
@@ -17182,7 +15817,7 @@ mod tests {
         );
     }
 
-    use crate::storage::models::Folder;
+    use crate::storage::models::{Folder, NoteFolder, PropertySchemaField};
 
     // ── Feature C — typed note front-matter properties ──────────────────────────────────────────
 
