@@ -159,6 +159,13 @@
 .sp-row.is-picked {
   color: var(--accent);
 }
+/* Active-AND-picked row: the accent bg from `.is-active` + the accent TEXT from
+   `.is-picked` (equal specificity, declared later) collided → an accent title on the
+   accent highlight = an invisible label (only the ✓ showed). The active highlight must
+   win: force contrasting text so the picked row stays readable when keyboard-focused. */
+.sp-row.is-active.is-picked {
+  color: var(--text-on-accent);
+}
 .sp-title {
   flex: 1;
   min-width: 0;
