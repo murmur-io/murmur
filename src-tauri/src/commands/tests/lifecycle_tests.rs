@@ -12347,6 +12347,110 @@
         assert!(state.db.get_org_item("nope").unwrap().is_none());
     }
 
+    /// REGRESSION (app-hang on Accept): `accept_link_inner` held the non-reentrant `lifecycle_guard`
+    /// across `materialize_accepted_link` → `update_note_doc_inner`, which re-takes the SAME guard →
+    /// a same-thread DEADLOCK whenever the accepted pair has an OWNED note to materialize `[[Title]]`
+    /// into (a NOTE↔NOTE accept — the exact case the user hit). We run the accept on a worker thread
+    /// and BOUND the wait, so the deadlock surfaces as a clean FAILURE instead of wedging the whole
+    /// suite; on the fixed code it completes in milliseconds AND materializes the neighbour link.
+    #[test]
+    fn accept_link_does_not_deadlock_and_materializes_on_owned_notes() {
+        use std::sync::mpsc;
+        let state = std::sync::Arc::new(build_state("accept-no-deadlock"));
+        make_open_folder(&state.db, "f1", "Notes");
+        seed_note_doc_cmd(&state.db, "n1", "f1", "Note One", "body one\n");
+        seed_note_doc_cmd(&state.db, "n2", "f1", "Note Two", "body two\n");
+        // A SUGGESTED semantic edge between two OWNED notes → accept WILL materialize (the hang path).
+        let link_id = state
+            .db
+            .insert_link_for_test("note", "n1", "note", "n2", "semantic", 0.9, "auto", "suggested");
+
+        let (tx, rx) = mpsc::channel();
+        let worker = state.clone();
+        let handle = std::thread::spawn(move || {
+            let _ = tx.send(accept_link_inner(&worker, link_id));
+        });
+        // If it re-enters the guard it blocks forever; a bounded recv turns that into a test failure.
+        let result = rx.recv_timeout(std::time::Duration::from_secs(10)).expect(
+            "accept_link_inner DEADLOCKED — did not finish in 10s (re-entrant lifecycle guard)",
+        );
+        result.expect("accept_link_inner returned an error");
+        handle.join().unwrap();
+
+        // The accept materialized the neighbour's [[Title]] into an owned note (the very path that hung).
+        let n1 = state.db.get_note_row("n1").unwrap().unwrap();
+        let n2 = state.db.get_note_row("n2").unwrap().unwrap();
+        assert!(
+            n1.text.contains("[[") || n2.text.contains("[["),
+            "accept must materialize a [[Title]] wikilink into one of the owned notes"
+        );
+    }
+
+    /// PINNED ORG GROUNDING (RED-before-GREEN): `pack_pinned_org_item` — the Ask-floor pack that
+    /// grounds "Ask about this shared note" in the org-item viewer — must ground a LIVE item's
+    /// content, and pack NOTHING for a tombstoned item OR an item from a context-DISABLED org. It
+    /// rides the SAME `get_org_item` gate as the read-only viewer, so no withdrawn/stale org content
+    /// can ever reach the Ask prompt. (Without the gate this would leak disabled/tombstoned content
+    /// straight into a cloud egress prompt — the exact class of bug the lock-security review hunts.)
+    #[test]
+    fn pack_pinned_org_item_grounds_live_and_gates_tombstoned_and_disabled() {
+        let state = build_state("pack-pinned-org");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        state
+            .db
+            .upsert_org_item(
+                "it-p",
+                "org-1",
+                1,
+                "anna",
+                "Konga costs",
+                "GPT via the Cloud Gateway is cheap and worthwhile.",
+                "2026-07-10T09:00:00Z",
+                1,
+                1,
+                &[7u8; 32],
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        // LIVE: the item's title + content are packed (with a citation header).
+        let packed =
+            crate::summarize::vault_context::pack_pinned_org_item(&state.db, "it-p", "anthropic")
+                .unwrap();
+        assert!(
+            packed.contains("Konga costs") && packed.contains("Cloud Gateway"),
+            "a live pinned org item must ground its title + content"
+        );
+
+        // DISABLED org ⇒ NOTHING packed (the per-instance toggle withdraws org content from Ask).
+        state.db.set_org_context_enabled("org-1", false).unwrap();
+        assert!(
+            crate::summarize::vault_context::pack_pinned_org_item(&state.db, "it-p", "anthropic")
+                .unwrap()
+                .is_empty(),
+            "a disabled org's item must contribute NOTHING to the Ask context"
+        );
+        state.db.set_org_context_enabled("org-1", true).unwrap();
+
+        // TOMBSTONED ⇒ NOTHING packed (a withdrawn item never grounds an answer).
+        state.db.tombstone_org_item("it-p").unwrap();
+        assert!(
+            crate::summarize::vault_context::pack_pinned_org_item(&state.db, "it-p", "anthropic")
+                .unwrap()
+                .is_empty(),
+            "a tombstoned org item must contribute NOTHING to the Ask context"
+        );
+
+        // Unknown id ⇒ NOTHING.
+        assert!(
+            crate::summarize::vault_context::pack_pinned_org_item(&state.db, "nope", "anthropic")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     /// PER-INSTANCE ORG TOGGLE (RED-before-GREEN): `get_org_item` — the single-item read behind
     /// `/org-item/:id` — must return `None` for a DISABLED org's item, closing the gap a stale
     /// citation/bookmark/browser-history entry could otherwise exploit to read through the toggle

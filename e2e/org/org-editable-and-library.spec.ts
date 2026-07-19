@@ -173,4 +173,65 @@ test.describe("org-editable + library unification (mocked IPC)", () => {
     await expect(page).toHaveURL(/\/notes\/note-42$/, { timeout: 10_000 });
     await expect(page.locator("app-note-editor")).toBeVisible();
   });
+
+  test("ask — the read-only viewer has an Ask Brain toggle that opens the Ask pane (split view)", async ({
+    page,
+  }) => {
+    const consoleErrors: string[] = [];
+    page.on("console", (m) => {
+      if (m.type() === "error") {
+        consoleErrors.push(m.text());
+      }
+    });
+    page.on("pageerror", (e) => consoleErrors.push(String(e)));
+
+    await mockTauri(page, {
+      org_resolve_source: () => null,
+      org_get_item: () => ({
+        itemId: "it-1",
+        authorHint: "kasia",
+        title: "Acme onboarding brief",
+        createdAt: "2026-07-10T09:00:00Z",
+        rev: 3,
+        markdown: "# Acme onboarding brief\n\n- Kickoff Monday\n- Owner: Kasia",
+      }),
+      org_refresh: () => null,
+      org_list_statuses: ORG_STATUSES,
+      list_org_items: ORG_ITEMS,
+    });
+    await page.goto("/org-item/it-1");
+    await expect(page.locator(".oi-title")).toHaveText("Acme onboarding brief", {
+      timeout: 10_000,
+    });
+
+    // Default COLLAPSED: the Ask Brain toggle is present, the pane is not.
+    const toggle = page.getByRole("button", { name: "Ask Brain" });
+    await expect(toggle).toBeVisible();
+    await expect(page.locator(".note-chat-drawer")).toHaveCount(0);
+
+    // OPEN — the Ask pane docks on the RIGHT as a full-height split column with the chat inside.
+    await toggle.click();
+    const pane = page.locator(".note-chat-drawer");
+    await expect(pane).toBeVisible();
+    await expect(
+      pane.getByRole("heading", { name: "Ask about this note" }),
+    ).toBeVisible();
+
+    // Split view: the content column and the Ask pane are ADJACENT + NON-OVERLAPPING (the pane's
+    // left edge sits at the content column's right edge).
+    const layout = await page.evaluate(() => {
+      const d = document
+        .querySelector(".note-chat-drawer")!
+        .getBoundingClientRect();
+      const c = document.querySelector(".oi-col")!.getBoundingClientRect();
+      return { drawerLeft: Math.round(d.left), colRight: Math.round(c.right) };
+    });
+    expect(Math.abs(layout.drawerLeft - layout.colRight)).toBeLessThanOrEqual(1);
+
+    // Close via the pane's × — the pane leaves the DOM.
+    await pane.getByRole("button", { name: "Close Ask Brain" }).click();
+    await expect(page.locator(".note-chat-drawer")).toHaveCount(0);
+
+    expect(consoleErrors).toEqual([]);
+  });
 });

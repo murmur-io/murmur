@@ -421,6 +421,7 @@ pub(crate) fn build_ask_vault_floor_prompt(
     memory_brief: &str,
     reranker: Option<&dyn crate::rerank::Reranker>,
     explicit_sources: Option<&[crate::storage::models::SourceRef]>,
+    pinned_org_item_id: Option<&str>,
 ) -> Result<AskFloorPrompt, AppError> {
     // Budget on the ASK-role provider's RESOLVED connection — the corpus egresses to it. With
     // role keys absent this is the legacy `provider_id` for EVERY brain_backend (the pre-role
@@ -433,10 +434,41 @@ pub(crate) fn build_ask_vault_floor_prompt(
     // gated link-expansion) — the user controls the context. Same `unlocked` visibility gate as
     // every search leg (a sealed source/neighbour contributes nothing). `None` ⇒ the exact existing
     // whole-vault search below, byte-for-byte.
-    let (corpus, sources) = if let Some(sources) = explicit_sources.filter(|s| !s.is_empty()) {
-        crate::summarize::vault_context::build_vault_context_pinned_visible(
-            db, sources, &ask_conn, unlocked,
-        )?
+    let has_pinned_sources = explicit_sources.map(|s| !s.is_empty()).unwrap_or(false);
+    let (corpus, sources) = if has_pinned_sources || pinned_org_item_id.is_some() {
+        // PINNED corpus (deterministic; vault-wide search SKIPPED). Pack the pinned ORG item FIRST
+        // (the shared note being viewed — pinned so it's ALWAYS in context; the local Brain's search
+        // never surfaces org-feed content), then the explicit sources (+ their gated link-expansion).
+        // In current callers the two are mutually exclusive — the org viewer sends only the org id,
+        // the note editor sends only explicit sources — so no double-budget concern arises.
+        let budget = crate::summarize::vault_context::budget_for(&ask_conn);
+        let mut corpus = String::new();
+        if let Some(org_id) = pinned_org_item_id {
+            corpus.push_str(&crate::summarize::vault_context::pack_pinned_org_item(
+                db, org_id, &ask_conn,
+            )?);
+        }
+        let sources = if let Some(srcs) = explicit_sources.filter(|s| !s.is_empty()) {
+            let (src_corpus, src_sources) =
+                crate::summarize::vault_context::build_vault_context_pinned_visible(
+                    db, srcs, &ask_conn, unlocked,
+                )?;
+            if !corpus.is_empty() && !src_corpus.is_empty() {
+                corpus.push_str("\n\n");
+            }
+            // The pinned org item is packed FIRST + is the primary anchor. If a caller supplies BOTH
+            // a pinned org id AND explicit sources (the org viewer's Ask WITH user-added scope), cap
+            // the sources to the REMAINING budget so the combined corpus honors ONE budget, not two —
+            // load-bearing for tiny local (Ollama) context windows. `chars().take` is char-boundary
+            // safe (mirrors pack_notes/pack_pinned_org_item). Org-only or sources-only ⇒ this is a
+            // no-op (remaining == full budget, and the un-pinned side is empty).
+            let remaining = budget.saturating_sub(corpus.len());
+            corpus.extend(src_corpus.chars().take(remaining));
+            src_sources
+        } else {
+            Vec::new()
+        };
+        (corpus, sources)
     } else if config.semantic_search_enabled {
         let embedder = crate::embed::active_embedder();
         // QUERY side: use the e5 `query:` prefix (asymmetric with the `passage:` index side).

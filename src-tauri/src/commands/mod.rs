@@ -3352,6 +3352,11 @@ pub async fn ask_vault(
     history: Vec<ChatTurn>,
     ask_thread_id: Option<String>,
     explicit_sources: Option<Vec<crate::storage::models::SourceRef>>,
+    // The org-item viewer pins the read-only SHARED note being viewed (an org item is not a valid
+    // local `SourceRef`, so it can't ride `explicit_sources`). Present ⇒ the deterministic floor
+    // path is used and the item is packed FIRST, gated by `get_org_item` (tombstoned/disabled-org
+    // ⇒ nothing). FE camelCase `pinnedOrgItemId`. `None`/empty ⇒ byte-identical to before.
+    pinned_org_item_id: Option<String>,
 ) -> Result<AskVaultResult, AppError> {
     if question.trim().is_empty() {
         return Err(AppError::InvalidArg("question is empty".into()));
@@ -3373,9 +3378,9 @@ pub async fn ask_vault(
     // agentic vault-wide search is SKIPPED (the user controls the context, so a scoped Ask never
     // pulls unlisted vault items). `None`/empty ⇒ this whole block is a no-op and the path below is
     // BYTE-IDENTICAL to before.
-    let pinned_sources: Option<Vec<crate::storage::models::SourceRef>> =
-        explicit_sources.filter(|s| !s.is_empty());
-    if let Some(sources) = pinned_sources {
+    let pinned_sources = explicit_sources.filter(|s| !s.is_empty());
+    let pinned_org = pinned_org_item_id.filter(|s| !s.trim().is_empty());
+    if pinned_sources.is_some() || pinned_org.is_some() {
         let unlocked = unlocked_snapshot(state.inner())?;
         let memory_brief = gated_memory_brief_for_injection(state.inner(), &unlocked, &question);
         let reranker = crate::rerank::active_reranker(
@@ -3392,7 +3397,8 @@ pub async fn ask_vault(
             &memory_brief,
             Some(reranker),
             &state.heavy_inference,
-            Some(sources),
+            pinned_sources,
+            pinned_org,
         )
         .await;
     }
@@ -3446,6 +3452,7 @@ pub async fn ask_vault(
         Some(reranker),
         &state.heavy_inference,
         None, // whole-vault path: no explicit sources ⇒ the existing search corpus, unchanged.
+        None, // …and no pinned org item — this is the vault-wide fallthrough.
     )
     .await
 }
@@ -3484,6 +3491,7 @@ async fn ask_vault_floor(
     reranker: Option<Box<dyn crate::rerank::Reranker>>,
     heavy: &std::sync::Arc<tokio::sync::Semaphore>,
     explicit_sources: Option<Vec<crate::storage::models::SourceRef>>,
+    pinned_org_item_id: Option<String>,
 ) -> Result<AskVaultResult, AppError> {
     // `build_ask_vault_floor_prompt` does the LOCAL/on-device work — query embedding (Candle/
     // Metal) + hybrid FTS∪vector retrieval + reranker inference — synchronously. This is exactly
@@ -3510,6 +3518,7 @@ async fn ask_vault_floor(
             &memory_brief_owned,
             reranker.as_deref(),
             explicit_sources.as_deref(),
+            pinned_org_item_id.as_deref(),
         )
     })
     .await

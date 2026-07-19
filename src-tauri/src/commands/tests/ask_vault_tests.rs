@@ -256,7 +256,7 @@
         let (want_system, want_user) =
             crate::summarize::vault_chat::build(&corpus, &history, q, "");
 
-        match build_ask_vault_floor_prompt(&db, &cfg, &unlocked, q, &history, "", None, None)
+        match build_ask_vault_floor_prompt(&db, &cfg, &unlocked, q, &history, "", None, None, None)
             .unwrap()
         {
             AskFloorPrompt::Ready {
@@ -289,7 +289,8 @@
 
         // The empty-vault early return keeps the EXACT pre-change canned answer.
         let empty = tmp_db();
-        match build_ask_vault_floor_prompt(&empty, &cfg, &unlocked, q, &[], "", None, None).unwrap()
+        match build_ask_vault_floor_prompt(&empty, &cfg, &unlocked, q, &[], "", None, None, None)
+            .unwrap()
         {
             AskFloorPrompt::Empty(r) => {
                 assert_eq!(
@@ -333,6 +334,7 @@
             "",
             None,
             &std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+            None,
             None,
         ));
         assert!(
