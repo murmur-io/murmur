@@ -212,6 +212,12 @@ pub fn judge_with_detail(
 pub(crate) const VERIFY_FENCE_START: &str = "<!-- murmur:verify -->";
 pub(crate) const VERIFY_FENCE_END: &str = "<!-- /murmur:verify -->";
 
+/// The STABLE header PREFIX a machine `murmur:verify` block always carries as its first body line
+/// ([`apply_verify_callout`] renders `> [!verify]- Source check (as of {date})`). The dated suffix
+/// varies, so the share-egress gate matches on this timeless prefix (never the whole line).
+/// `pub(crate)` so the enrich share-egress scrub reuses it — never a hardcoded string.
+pub(crate) const VERIFY_CALLOUT_HEADER_PREFIX: &str = "> [!verify]- Source check";
+
 /// Brain v2 L5 — append (or idempotently replace) the consolidated, collapsed `> [!verify]-`
 /// callout carrying the verification findings, dated `as_of` (caller-supplied so the function is
 /// pure). Mirrors `enrich.rs` fence discipline EXACTLY (it reuses the same engine):
