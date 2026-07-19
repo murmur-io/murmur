@@ -150,39 +150,49 @@
   background: var(--surface-hover);
 }
 
-/* Remove (×) on a manual chip — hidden until the wrap is hovered/focused. */
+/* Remove (×) — an in-chip trailing button (design-system removable-chip pattern),
+   tucked INSIDE the pill's right edge over reserved padding so it never floats in the
+   inter-chip gap or overlaps the label, with a comfortable 24px hit target. The wrap
+   is `position: relative`; the × is absolutely placed at its right edge and the chip
+   body reserves room for it via `.has-remove` below. */
 .cx-remove {
+  position: absolute;
+  right: 3px;
+  top: 50%;
+  transform: translateY(-50%);
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 18px;
-  height: 18px;
-  margin-left: calc(-1 * var(--space-1));
+  width: 24px;
+  height: 24px;
   padding: 0;
   background: transparent;
   border: 0;
-  border-radius: var(--radius-pill);
+  border-radius: 50%;
   color: var(--text-muted);
-  font-size: 15px;
+  font-size: 16px;
   line-height: 1;
   cursor: pointer;
-  opacity: 0;
   transition:
-    opacity var(--transition-fast),
     color var(--transition-fast),
     background var(--transition-fast);
-}
-.cx-chipwrap:hover .cx-remove,
-.cx-remove:focus-visible {
-  opacity: 1;
 }
 .cx-remove:hover:not(:disabled) {
   color: var(--danger);
   background: var(--surface-hover);
 }
+.cx-remove:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--accent-ring);
+}
 .cx-remove:disabled {
   cursor: default;
   opacity: 0.4;
+}
+/* Reserve room on the chip's right so the label never runs under the × (30px = the
+   24px button + its right offset + a little breathing space). */
+.cx-chipwrap.has-remove .cx-chip {
+  padding-right: 30px;
 }
 
 /* Neighbour-kind badge. */
