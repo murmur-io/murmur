@@ -39,7 +39,7 @@ test.describe("Record — a failed Ask AI leaves no orphaned mic bubble", () => 
     await page.goto("/record");
 
     await page.locator("button.start-btn").click();
-    await expect(page.locator(".rec-topline")).toBeVisible({
+    await expect(page.locator(".rec-topbar")).toBeVisible({
       timeout: 10_000,
     });
 

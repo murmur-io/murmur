@@ -201,13 +201,16 @@ export class NoteEditorComponent {
 
   /**
    * The slash-menu catalog. On the routed editor this is exactly {@link SLASH_ITEMS}
-   * (byte-for-byte unchanged). When {@link embedded} (the recording surface) it
-   * appends an "Ask Brain" entry so `/` at the start of a line can summon the Brain
-   * without a standing side panel — the Calm-Notepad "summon, don't station" model.
+   * (byte-for-byte unchanged). When {@link embedded} (the recording surface) it puts
+   * an "Ask Brain" entry FIRST (Notion-style AI-at-the-top) so `/` immediately surfaces
+   * the Brain instead of burying it below 12 block items in the scrollable menu — the
+   * Calm-Notepad "summon, don't station" model. The default keyboard highlight still
+   * lands on the first BLOCK (see {@link maybeOpenSlash}) so `/`+Enter keeps inserting a
+   * heading; Ask is the prominent top item you click or arrow up to.
    */
   protected readonly slashItems = computed<readonly SlashItem[]>(() =>
     this.embedded()
-      ? [...SLASH_ITEMS, { id: "askBrain", label: "✦ Ask Brain" }]
+      ? [{ id: "askBrain", label: "✦ Ask Brain" }, ...SLASH_ITEMS]
       : SLASH_ITEMS,
   );
 
@@ -1866,7 +1869,10 @@ export class NoteEditorComponent {
     const lineStart = value.lastIndexOf("\n", pos - 1) + 1;
     const line = value.slice(lineStart, pos);
     if (line === "/") {
-      this.slashIndex.set(0);
+      // When embedded, "Ask Brain" is item 0 — default the keyboard highlight to the
+      // first BLOCK (index 1) so `/`+Enter still inserts a heading; Ask stays the
+      // visible top item (click or ArrowUp). Routed editor is unchanged (index 0).
+      this.slashIndex.set(this.embedded() ? 1 : 0);
       this.slashOpen.set(true);
     } else if (!line.startsWith("/") || line.includes(" ")) {
       this.slashOpen.set(false);
