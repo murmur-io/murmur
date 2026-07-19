@@ -71,6 +71,30 @@
   box-shadow: 0 0 0 2px var(--accent-ring);
 }
 
+/* Collapse toggle — "+N more" / "Show less". A muted, dashed pill that trims a wide
+   source scope down to a compact preview so it never floods the panel (2026-07-19). */
+.sp-chip-more {
+  padding: var(--space-1) var(--space-2);
+  border: 1px dashed var(--border);
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 0.8rem;
+  cursor: pointer;
+  transition:
+    border-color var(--transition-fast),
+    color var(--transition-fast),
+    background var(--transition-fast);
+}
+.sp-chip-more:hover {
+  border-color: var(--border-strong);
+  color: var(--text-primary);
+  background: var(--surface-hover);
+}
+.sp-chip-more:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--accent-ring);
+}
+
 /* --- Trigger -------------------------------------------------------------- */
 .sp-trigger {
   height: 28px;

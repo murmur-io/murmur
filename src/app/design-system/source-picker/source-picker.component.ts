@@ -108,6 +108,35 @@ export class SourcePickerComponent {
     })),
   );
 
+  /** How many selected-source chips to show before collapsing the rest behind
+   * "+N more" — a large Brain scope otherwise floods the panel and pushes the ask
+   * input off-screen (user report, 2026-07-19). */
+  private static readonly CHIP_COLLAPSE_AFTER = 3;
+  /** Chips start COLLAPSED so a wide scope reads as a compact preview, not a wall. */
+  private readonly _chipsExpanded = signal(false);
+  readonly chipsExpanded = this._chipsExpanded.asReadonly();
+  /** The chips actually rendered: the first few when collapsed, all when expanded. */
+  readonly visibleChips = computed(() => {
+    const all = this.selected();
+    return this._chipsExpanded() ||
+      all.length <= SourcePickerComponent.CHIP_COLLAPSE_AFTER
+      ? all
+      : all.slice(0, SourcePickerComponent.CHIP_COLLAPSE_AFTER);
+  });
+  /** How many chips are hidden behind "+N more" (0 when expanded or already short). */
+  readonly hiddenChipCount = computed(
+    () => this.selected().length - this.visibleChips().length,
+  );
+  /** Whether the collapse toggle should appear at all. */
+  readonly canCollapseChips = computed(
+    () => this.selected().length > SourcePickerComponent.CHIP_COLLAPSE_AFTER,
+  );
+
+  /** Expand / collapse the selected-source chips. */
+  toggleChips(): void {
+    this._chipsExpanded.update((v) => !v);
+  }
+
   private readonly triggerEl = viewChild<ElementRef<HTMLButtonElement>>("trigger");
   private readonly popoverEl = viewChild<ElementRef<HTMLDivElement>>("popover");
   private readonly searchEl = viewChild<ElementRef<HTMLInputElement>>("search");
