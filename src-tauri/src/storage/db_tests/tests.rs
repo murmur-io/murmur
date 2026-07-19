@@ -5015,6 +5015,66 @@
         );
     }
 
+    /// CONTACT DIGEST (Brain retrieval fix, 2026-07-19): a phone/email buried in a document's prose is
+    /// NOT retrievable by a natural-language "what's the phone number" query — the query WORDS never
+    /// co-occur with the digits. `chunk_document_hierarchical` emits a synthetic contact-digest chunk
+    /// pairing the fact VALUES with bilingual (PL/EN) bridge words, so those queries now match via FTS.
+    /// RED-before-GREEN: the raw prose carries "+48 786 327 907" but NOT the words "numer telefonu" /
+    /// "phone number", so WITHOUT the digest an FTS query for those words returns nothing. A control
+    /// doc with NO contact fact must never match a contact query (recall-safety).
+    #[test]
+    fn index_document_chunks_contact_digest_makes_phone_retrievable_by_nl_query() {
+        let db = mem_db();
+        seed_folder(&db, "f-open", "CVs");
+        let block = crate::extract::ExtractedBlock {
+            text: "Oskar Orlowski — Staff Frontend Engineer. Warsaw, Poland. +48 786 327 907 \
+                   orlow@wp.pl. Ten years building realtime web platforms in Angular and TypeScript."
+                .to_string(),
+            page: Some(1),
+            heading_path: None,
+        };
+        let stored = crate::extract::blocks_to_stored_text(std::slice::from_ref(&block));
+        assert!(
+            !stored.to_lowercase().contains("numer telefonu")
+                && !stored.to_lowercase().contains("phone number"),
+            "precondition: the raw prose does NOT contain the query words (RED state)"
+        );
+        db.insert_document("d-cv", "f-open", "Oskar_Orlowski_CV.pdf", &stored, "document", 100)
+            .unwrap();
+        // Control: a document with NO contact fact — a contact query must never return it.
+        let ctrl = crate::extract::ExtractedBlock {
+            text: "Notes about the weekly roadmap and platform priorities for the team.".to_string(),
+            page: None,
+            heading_path: None,
+        };
+        let ctrl_stored = crate::extract::blocks_to_stored_text(std::slice::from_ref(&ctrl));
+        db.insert_document("d-other", "f-open", "roadmap.md", &ctrl_stored, "document", 100)
+            .unwrap();
+        db.index_document_chunks("d-cv", None).unwrap();
+        db.index_document_chunks("d-other", None).unwrap();
+
+        let nothing = std::collections::HashSet::new();
+        for q in ["numer telefonu", "phone number", "telefon"] {
+            let hits = db.search_doc_chunks_fts_visible(q, 10, &nothing).unwrap();
+            assert!(
+                hits.iter().any(|h| h.document_id == "d-cv"),
+                "query {q:?} must retrieve the CV via the contact digest: {hits:?}"
+            );
+            assert!(
+                !hits.iter().any(|h| h.document_id == "d-other"),
+                "contact query {q:?} must NOT match the contactless control doc: {hits:?}"
+            );
+        }
+        // The digest also carries the number itself (spaced + bare), so a digit query lands too.
+        let by_number = db
+            .search_doc_chunks_fts_visible("786 327 907", 10, &nothing)
+            .unwrap();
+        assert!(
+            by_number.iter().any(|h| h.document_id == "d-cv"),
+            "the phone number itself must retrieve the CV: {by_number:?}"
+        );
+    }
+
     /// TOCTOU (lock-security finding, PR-1): `index_document_chunks` must REFUSE the entire write —
     /// including its clean-replace PURGE — when the row is sealed at rest RIGHT NOW (a `lock_folder`
     /// committing mid-embed blanks `text` into `text_blob`). The re-check runs BEFORE the purge, so a
