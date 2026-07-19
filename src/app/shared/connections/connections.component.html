@@ -142,6 +142,8 @@
       [anchorRect]="pickerRect()"
       [query]="pickerQuery()"
       [activeIndex]="pickerActiveIndex()"
+      [excludeKind]="kind()"
+      [excludeId]="id()"
       (candidatesChange)="onPickerCandidates($event)"
       (picked)="pickCandidate($event)"
     />
