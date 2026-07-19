@@ -570,7 +570,7 @@
                 <textarea
                   #bodyArea
                   class="body-area"
-                  placeholder="Start writing… Type / for blocks."
+                  [placeholder]="bodyPlaceholder()"
                   aria-label="Note body"
                   autocapitalize="sentences"
                   autocomplete="off"
@@ -588,7 +588,7 @@
               <!-- Slash menu (opaque overlay, T3). -->
               @if (slashOpen()) {
                 <div class="menu slash-menu" role="listbox" aria-label="Insert block">
-                  @for (item of slashItems; track item.id; let i = $index) {
+                  @for (item of slashItems(); track item.id; let i = $index) {
                     <button
                       type="button"
                       class="menu-item"

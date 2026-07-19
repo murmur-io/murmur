@@ -45,12 +45,18 @@
   height: 100%;
 }
 .editor.is-embedded .editor-body {
-  padding: var(--space-4) var(--space-5) var(--space-6);
+  /* Extra top breathing room so the title/first line sits on a calm field, not
+     jammed under the recording chrome (Calm-Notepad, 2026-07-19). */
+  padding: var(--space-6) var(--space-5) var(--space-8);
 }
 .editor.is-embedded .note-doc {
-  /* No centered document column when embedded — fill the panel width (the panel
-     is already a narrow tab, so the routed 920px cap would just leave dead space). */
-  max-width: none;
+  /* Calm-Notepad measure (2026-07-19): a CENTERED writing column, not the
+     full-bleed void. The old `max-width: none` assumed a narrow beside-the-drawer
+     tab; the drawer is gone (Ask is now a summoned panel), so an unmeasured note
+     spanned the whole card and one line read as a gargantuan empty canvas. A
+     bounded, centered ~40rem column turns the surplus into deliberate margin. */
+  max-width: var(--editor-measure);
+  margin: 0 auto;
 }
 
 /* Transparent full-viewport backdrop that closes an open header menu on an

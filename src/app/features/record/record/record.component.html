@@ -53,110 +53,18 @@
     </div>
   }
 
-  <!-- ── Slim recording bar — ambient status, NOT the hero ─────────────── -->
+  <!-- ── While recording: a THIN top line — the single alive heartbeat (the orb) +
+       the timer. Recording is ambient chrome; the centered notepad below is the hero.
+       Controls (mic-mute · captions · Ask · Stop) live in the footer HUD. ────────── -->
   @if (store.isRecording()) {
-    <!-- Recording is now ambient: a compact horizontal bar carrying the orb,
-         timer, level meter, the LIVE caption ticker, mic-mute, Ask, and Stop.
-         The conversation thread below is the hero. -->
-    <div class="rec-strip is-recording" role="status">
+    <div class="rec-topline" role="status">
       <span class="orb live" aria-hidden="true"></span>
       <span class="timer">{{ elapsedLabel() }}</span>
-      <div class="wave" [style.--level]="store.level()" aria-hidden="true">
-        @for (b of bars; track b) {
-          <span class="wbar" [style.--i]="b"></span>
-        }
-      </div>
-
-      <!-- Live caption ticker — rides inline in the strip. -->
-      <p class="cc-line" aria-live="polite">
-        @if (liveCaption(); as cc) {
-          @for (rev of [cc]; track rev) {
-            <span class="cc-text">{{ cc }}</span>
-          }
-        } @else {
-          <span class="cc-idle">Listening…</span>
-        }
-      </p>
-
-      <!-- Honesty hint: live captions are mic-only until Stop (matches the
-           README "Live captions are mic-only until you stop"). The other
-           side's system audio is captured in parallel and folded into the
-           full Me / Others transcript only after you stop. Compact + muted +
-           flex:none so it never crowds the ticker (which absorbs the flex). -->
-      <span
-        class="cc-scope"
-        role="note"
-        title="Live captions show your side (your microphone) during the meeting. The other participants are captured now and added to the full Me / Others transcript after you stop."
-      >
-        <svg
-          class="cc-scope-ico"
-          viewBox="0 0 16 16"
-          width="12"
-          height="12"
-          aria-hidden="true"
-        >
-          <circle
-            cx="8"
-            cy="8"
-            r="6.5"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="1.3"
-          />
-          <path
-            d="M8 7.2v4"
-            stroke="currentColor"
-            stroke-width="1.3"
-            stroke-linecap="round"
-          />
-          <circle cx="8" cy="4.6" r="0.9" fill="currentColor" />
-        </svg>
-        <span class="cc-scope-text">Your side · full transcript after Stop</span>
-      </span>
-
-      <!-- Mic-mute: silences only the local mic; system audio keeps recording.
-           Compact (icon-only) so the strip stays uncrowded. -->
-      <app-mic-mute-toggle [compact]="true" #micToggle />
-      <!-- Ask AI — CLICK-TO-STOP voice toggle. The spoken answer lands in the
-           conversation thread below (the one home for asking mid-meeting). -->
-      <button
-        type="button"
-        class="ask-btn"
-        [class.is-listening]="assistant.listening()"
-        [disabled]="assistant.processing()"
-        (click)="toggleAsk()"
-        [attr.aria-pressed]="assistant.listening()"
-        [attr.aria-label]="
-          assistant.listening()
-            ? 'Stop listening and ask'
-            : 'Ask the AI assistant'
-        "
-      >
-        <svg
-          class="ask-ico"
-          viewBox="0 0 24 24"
-          width="18"
-          height="18"
-          aria-hidden="true"
-        >
-          <path
-            d="M12 3l1.6 4.4L18 9l-4.4 1.6L12 15l-1.6-4.4L6 9l4.4-1.6L12 3z"
-            fill="currentColor"
-          />
-          <path
-            d="M18.5 14l.8 2.2 2.2.8-2.2.8-.8 2.2-.8-2.2-2.2-.8 2.2-.8.8-2.2z"
-            fill="currentColor"
-            opacity="0.85"
-          />
-        </svg>
-      </button>
-      <button
-        type="button"
-        class="stop-btn"
-        (click)="store.stop()"
-        aria-label="Stop recording"
-      >
-        <span class="stop-ico" aria-hidden="true"></span>
+      <span class="rec-topline-label">Recording</span>
+      <span class="rec-topline-spacer"></span>
+      <button type="button" class="popout" (click)="popOut()">
+        Pop out
+        <span class="kbd-inline">⌘⇧R</span>
       </button>
     </div>
   } @else {
@@ -234,6 +142,103 @@
       [settled]="enhanceSettled()"
       [enhanceAware]="enhanceMode()"
     />
+  }
+
+  <!-- ── Ambient footer HUD — the recording controls, receded (Calm-Notepad, 2026-07-19):
+       mic-mute · the LIVE caption ticker (mic-only, honesty-noted) · Ask (summons the
+       panel) · Stop. Only while recording, so the note owns the surface otherwise. ── -->
+  @if (store.isRecording()) {
+    <div class="rec-foot" role="group" aria-label="Recording controls">
+      <!-- Mic-mute: silences only the local mic; system audio keeps recording. -->
+      <app-mic-mute-toggle [compact]="true" #micToggle />
+
+      <!-- Live caption ticker — the mic-only partial. -->
+      <p class="cc-line" aria-live="polite">
+        @if (liveCaption(); as cc) {
+          @for (rev of [cc]; track rev) {
+            <span class="cc-text">{{ cc }}</span>
+          }
+        } @else {
+          <span class="cc-idle">Listening…</span>
+        }
+      </p>
+
+      <!-- Honesty hint: live captions are your side (your mic) only; the other
+           participants are captured now and folded into the full Me / Others
+           transcript after you Stop. -->
+      <span
+        class="cc-scope"
+        role="note"
+        title="Live captions show your side (your microphone) during the meeting. The other participants are captured now and added to the full Me / Others transcript after you stop."
+      >
+        <svg
+          class="cc-scope-ico"
+          viewBox="0 0 16 16"
+          width="12"
+          height="12"
+          aria-hidden="true"
+        >
+          <circle
+            cx="8"
+            cy="8"
+            r="6.5"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.3"
+          />
+          <path
+            d="M8 7.2v4"
+            stroke="currentColor"
+            stroke-width="1.3"
+            stroke-linecap="round"
+          />
+          <circle cx="8" cy="4.6" r="0.9" fill="currentColor" />
+        </svg>
+        <span class="cc-scope-text">Your side · full transcript after Stop</span>
+      </span>
+
+      <!-- Ask — SUMMONS the Brain panel over the notepad (voice + text + presets live
+           in the panel). A quiet dot marks an ongoing thread while the panel is closed. -->
+      <button
+        type="button"
+        class="ask-pill"
+        [class.is-active]="assistant.askPanelOpen()"
+        (click)="assistant.toggleAskPanel()"
+        [attr.aria-pressed]="assistant.askPanelOpen()"
+        aria-label="Ask the Brain about this meeting"
+      >
+        <svg
+          class="ask-ico"
+          viewBox="0 0 24 24"
+          width="16"
+          height="16"
+          aria-hidden="true"
+        >
+          <path
+            d="M12 3l1.6 4.4L18 9l-4.4 1.6L12 15l-1.6-4.4L6 9l4.4-1.6L12 3z"
+            fill="currentColor"
+          />
+          <path
+            d="M18.5 14l.8 2.2 2.2.8-2.2.8-.8 2.2-.8-2.2-2.2-.8 2.2-.8.8-2.2z"
+            fill="currentColor"
+            opacity="0.85"
+          />
+        </svg>
+        <span class="ask-pill-label">Ask</span>
+        @if (assistant.hasNotes() && !assistant.askPanelOpen()) {
+          <span class="ask-dot" aria-hidden="true"></span>
+        }
+      </button>
+
+      <button
+        type="button"
+        class="stop-btn"
+        (click)="store.stop()"
+        aria-label="Stop recording"
+      >
+        <span class="stop-ico" aria-hidden="true"></span>
+      </button>
+    </div>
   }
 
   @if (store.error(); as err) {
@@ -334,4 +339,3 @@
     }
   }
 </section>
-  

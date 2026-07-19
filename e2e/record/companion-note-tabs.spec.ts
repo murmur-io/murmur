@@ -2,18 +2,18 @@ import { test, expect } from "@playwright/test";
 import { mockTauri } from "../settings-ai/mock-invoke";
 
 /**
- * v3 DOCUMENT-FIRST recording panel — the note is the always-visible HERO, Ask
- * Brain is a right-side DRAWER (2026-07-18 redesign; replaces the v2 Note|Ask
- * segmented tabs).
+ * Calm-Notepad recording surface (2026-07-19) — the companion note is the
+ * always-visible, centered HERO; Ask Brain is a SUMMONED opaque panel (footer ✦),
+ * not a beside-the-editor split.
  *
  *  - The embedded note editor mounts on the meeting's ONE companion note (eagerly
  *    created via `get_or_create_companion_note`) and is ALWAYS VISIBLE — one editable
  *    DOCUMENT, no per-jot "Saved to Notes" badges.
- *  - The "Ask Brain" head toggle opens/closes a drawer hosting the `@brain` thread
- *    BESIDE the editor (shrinks it, never hides it). One live editor instance stays
- *    mounted for the whole recording (the flush-at-Stop target).
+ *  - The footer "Ask" pill summons the Ask-Brain panel hosting the `@brain` thread
+ *    (preset chips + text/voice). The editor stays mounted (the flush-at-Stop target)
+ *    and visible beneath the sheet.
  */
-test.describe("Record — document-first companion note + Ask Brain drawer (v3)", () => {
+test.describe("Record — companion note hero + summoned Ask Brain panel", () => {
   test.beforeEach(async ({ page }) => {
     await mockTauri(page, {
       model_present: () => true,
@@ -88,27 +88,26 @@ test.describe("Record — document-first companion note + Ask Brain drawer (v3)"
     await expect(body).toHaveValue(/ship the three flows/);
   });
 
-  test("(b) opening the Ask Brain drawer shows the conversation and can ask (editor stays visible)", async ({
+  test("(b) summoning the Ask Brain panel shows the conversation and can ask (editor stays visible)", async ({
     page,
   }) => {
     await startRecording(page);
 
-    // Open the Ask Brain drawer via the head toggle.
-    await page.locator("app-meeting-conversation .ask-toggle").click();
+    // Summon the Ask Brain panel via the footer ✦ pill.
+    await page.locator("app-record .ask-pill").click();
 
-    const ask = page.locator("app-meeting-conversation .ask-input");
+    const ask = page.locator("app-meeting-conversation .ask-panel .ask-input");
     await expect(ask).toBeVisible();
 
-    // The embedded document editor is the always-visible HERO — the drawer docks
-    // BESIDE it (shrinks it), it is NOT hidden. One live editor stays mounted as the
-    // flush-at-Stop target.
+    // The embedded document editor is the always-visible HERO — the panel floats
+    // OVER the notepad without unmounting it (the flush-at-Stop target).
     await expect(
       page.locator("app-meeting-conversation app-note-editor"),
     ).toBeVisible();
 
     // Ask a question → a thread opens and the brain answers.
     await ask.fill("why was the mobile redesign deferred?");
-    await page.locator("app-meeting-conversation .send-btn").click();
+    await page.locator("app-meeting-conversation .ask-panel .send-btn").click();
 
     await expect(page.locator("app-note-item")).toHaveCount(1);
     await expect(
@@ -116,33 +115,33 @@ test.describe("Record — document-first companion note + Ask Brain drawer (v3)"
     ).toBeVisible({ timeout: 10_000 });
   });
 
-  test("(c) the Ask Brain drawer toggles open and closed cleanly", async ({
+  test("(c) the Ask Brain panel summons and dismisses cleanly", async ({
     page,
   }) => {
     await startRecording(page);
 
-    const toggle = page.locator("app-meeting-conversation .ask-toggle");
+    const pill = page.locator("app-record .ask-pill");
     const body = page.locator(
       "app-meeting-conversation app-note-editor .editor-body textarea.body-area",
     );
 
-    // Default: the editor is the visible hero, drawer closed (no ask input).
+    // Default: the editor is the visible hero, panel closed (no ask panel).
     await expect(body).toBeVisible({ timeout: 10_000 });
     await expect(
-      page.locator("app-meeting-conversation .ask-input"),
+      page.locator("app-meeting-conversation .ask-panel"),
     ).toHaveCount(0);
 
-    // Open the drawer → the ask input shows, the editor STAYS visible beside it.
-    await toggle.click();
+    // Summon the panel → the ask input shows, the editor STAYS visible beneath it.
+    await pill.click();
     await expect(
-      page.locator("app-meeting-conversation .ask-input"),
+      page.locator("app-meeting-conversation .ask-panel .ask-input"),
     ).toBeVisible();
     await expect(body).toBeVisible();
 
-    // Close the drawer → the editor reloads in place (no re-mount), ask input gone.
-    await toggle.click();
+    // Dismiss via the panel close × → the editor reloads in place, panel gone.
+    await page.locator("app-meeting-conversation .ask-panel-close").click();
     await expect(
-      page.locator("app-meeting-conversation .ask-input"),
+      page.locator("app-meeting-conversation .ask-panel"),
     ).toHaveCount(0);
     await expect(body).toBeVisible();
   });

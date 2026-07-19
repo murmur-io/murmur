@@ -10,6 +10,7 @@ import {
   effect,
   inject,
   input,
+  output,
   signal,
   untracked,
   viewChild,
@@ -198,8 +199,29 @@ export class NoteEditorComponent {
   /** Drill-down back navigation ("← Notes"). */
   readonly nav = inject(NavHistoryService);
 
-  /** The slash-menu block catalog. */
-  protected readonly slashItems = SLASH_ITEMS;
+  /**
+   * The slash-menu catalog. On the routed editor this is exactly {@link SLASH_ITEMS}
+   * (byte-for-byte unchanged). When {@link embedded} (the recording surface) it
+   * appends an "Ask Brain" entry so `/` at the start of a line can summon the Brain
+   * without a standing side panel — the Calm-Notepad "summon, don't station" model.
+   */
+  protected readonly slashItems = computed<readonly SlashItem[]>(() =>
+    this.embedded()
+      ? [...SLASH_ITEMS, { id: "askBrain", label: "✦ Ask Brain" }]
+      : SLASH_ITEMS,
+  );
+
+  /**
+   * The body textarea's placeholder — a warm ghost prompt. In the recording
+   * surface ({@link embedded}) it names both note-taking AND the two ways to reach
+   * the Brain, so an empty note reads as an invitation, not a void. The routed
+   * editor keeps its original block-oriented prompt.
+   */
+  protected readonly bodyPlaceholder = computed(() =>
+    this.embedded()
+      ? "Type to take notes — / for blocks, or Ask Brain"
+      : "Start writing… Type / for blocks.",
+  );
 
   /**
    * EMBEDDED mode (additive, 2026-07-17) — when true this editor is HOSTED
@@ -215,6 +237,15 @@ export class NoteEditorComponent {
   readonly embedded = input(false);
   /** The note id to load when {@link embedded}. Ignored on the route. */
   readonly noteIdInput = input<string | null>(null);
+
+  /**
+   * Emitted when the user picks the "Ask Brain" entry from the `/` slash menu
+   * (Calm-Notepad redesign, 2026-07-19). ONLY offered when {@link embedded} (the
+   * recording surface), so the routed `/notes/:id` slash menu is byte-for-byte
+   * unchanged. The recording surface host summons the Ask-Brain panel on this —
+   * the editor itself owns no Ask panel, keeping the note the hero.
+   */
+  readonly askBrain = output<void>();
 
   /**
    * The route `:id`, tracked so a same-route navigation re-fetches even though
@@ -1844,18 +1875,19 @@ export class NoteEditorComponent {
 
   /** Handle ↑/↓/Enter/Esc in the open slash menu. Returns true when consumed. */
   private handleSlashKey(event: KeyboardEvent): boolean {
+    const items = this.slashItems();
     switch (event.key) {
       case "ArrowDown":
         event.preventDefault();
-        this.slashIndex.update((i) => (i + 1) % SLASH_ITEMS.length);
+        this.slashIndex.update((i) => (i + 1) % items.length);
         return true;
       case "ArrowUp":
         event.preventDefault();
-        this.slashIndex.update((i) => (i - 1 + SLASH_ITEMS.length) % SLASH_ITEMS.length);
+        this.slashIndex.update((i) => (i - 1 + items.length) % items.length);
         return true;
       case "Enter":
         event.preventDefault();
-        this.pickSlash(SLASH_ITEMS[this.slashIndex()]);
+        this.pickSlash(items[this.slashIndex()]);
         return true;
       case "Escape":
         event.preventDefault();
@@ -1879,6 +1911,14 @@ export class NoteEditorComponent {
     const pos = el.selectionStart;
     const lineStart = value.lastIndexOf("\n", pos - 1) + 1;
     this.slashOpen.set(false);
+    if (item.id === "askBrain") {
+      // Summon the Ask-Brain panel — remove the bare `/` trigger first so no
+      // stray slash is left in the note, then let the recording host open the
+      // panel. Caret returns to the (now-empty) line start.
+      this.replaceRange(el, lineStart, pos, "", lineStart, lineStart);
+      this.askBrain.emit();
+      return;
+    }
     if (item.id === "linkToNote" || item.snippet === undefined) {
       // Replace the `/` trigger with `[[` (the natural Obsidian trigger text),
       // then open the picker anchored right after it.
