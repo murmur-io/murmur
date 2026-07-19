@@ -176,6 +176,7 @@ pub fn run() {
             commands::save_manual_notes,
             commands::get_manual_notes,
             commands::get_note_receipts,
+            commands::get_fact_receipt,
             commands::append_to_companion_note,
             commands::get_or_create_companion_note,
             commands::delete_companion_note_if_empty,

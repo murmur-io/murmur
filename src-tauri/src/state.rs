@@ -405,13 +405,47 @@ impl AppState {
 /// there is no content key at startup). Best-effort and panic-free: every failure is logged, never
 /// fatal to launch.
 fn reconcile_locked_at_rest(db: &Db) {
-    let (rows, rollup_exports, note_md_exports) = match db.reblank_locked_folders_at_rest() {
-        Ok(a) => a,
-        Err(e) => {
-            tracing::warn!(target: "state", error = %e, "startup reconciliation: re-blank of locked folders failed");
-            return;
+    let (rows, rollup_exports, note_md_exports, stripped_marker_sources) =
+        match db.reblank_locked_folders_at_rest() {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::warn!(target: "state", error = %e, "startup reconciliation: re-blank of locked folders failed");
+                return;
+            }
+        };
+    // Brain-v3 audit Fix 4 (startup net, filesystem half): the reconcile tx scrubbed the crash-leftover
+    // sealed-neighbour markers from the affected VISIBLE sources' DB plaintext (the primary leak). Their
+    // stale vault `.md` still names the sealed neighbour on disk; without `AppState`/the vault path here
+    // we cannot re-render the `.md`, so we DELETE it (removing the on-disk leak) — the note's next save
+    // re-exports it clean from the scrubbed DB text. A note-doc's recorded `exported_path` is cleared
+    // per-row after a successful delete (delete-then-clear, W5 semantics). A meeting-note source's
+    // stale `.md` is reconciled by the note_md/audit paths on the meeting's own folder; count-only log.
+    if !stripped_marker_sources.is_empty() {
+        let mut removed = 0usize;
+        for (is_meeting, source_id) in &stripped_marker_sources {
+            if *is_meeting {
+                continue; // meeting-note `.md` reconciled via its own folder's paths; DB already scrubbed.
+            }
+            if let Ok(Some(row)) = db.get_note_row(source_id) {
+                if let Some(p) = &row.exported_path {
+                    let gone = matches!(
+                        std::fs::remove_file(p),
+                        Ok(()) | Err(_)
+                    ) && !std::path::Path::new(p).exists();
+                    if gone {
+                        let _ = db.set_note_doc_exported_path(source_id, None);
+                        removed += 1;
+                    }
+                }
+            }
         }
-    };
+        tracing::warn!(
+            target: "state",
+            removed,
+            total = stripped_marker_sources.len(),
+            "startup reconciliation: scrubbed crash-leftover sealed-neighbour markers from visible notes"
+        );
+    }
     // Brain v2 L2.1 LOCK-SAFETY (filesystem half): when any folder is locked, the reconcile tx
     // purged EVERY memory-rollup row (a rollup may paraphrase sealed facts) — remove their exported
     // vault `.md`s here. Only ever the recorded exported paths; a missing file is fine. The rollups

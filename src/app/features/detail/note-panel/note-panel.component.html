@@ -292,16 +292,18 @@
           </article>
         }
 
-        <!-- RECEIPTS (Brain v3 PR-5): every claim the transcript proves →
-             a chip that seeks the Audio tab to that second + flashes the
-             segment. Empty (nothing rendered) for a locked meeting (the
-             backend returns no receipts) or a note with no aligned claim. -->
+        <!-- RECEIPTS (Brain v3 PR-5): every claim the transcript likely
+             supports → a chip that seeks the Audio tab to that second +
+             flashes the segment. The alignment is a token-overlap HEURISTIC,
+             so the copy says "likely source", never "proof". Empty (nothing
+             rendered) for a locked meeting (the backend returns no receipts)
+             or a note with no aligned claim. -->
         @if (receiptChips().length) {
           <article class="card receipts" aria-label="Audio receipts">
             <div class="receipts-head">
               <span class="section-label">Receipts</span>
               <span class="count">{{ receiptChips().length }}</span>
-              <span class="receipts-hint">Click to hear the moment this was said</span>
+              <span class="receipts-hint">Jump to the likely source in the audio</span>
             </div>
             <ul class="receipt-list">
               @for (r of receiptChips(); track r.claimIndex) {
@@ -309,7 +311,7 @@
                   <button
                     type="button"
                     class="receipt-chip"
-                    [attr.title]="'Play ' + r.time + (r.speaker ? ' · ' + r.speaker : '')"
+                    [attr.title]="r.title"
                     (click)="onReceipt(r)"
                   >
                     <span class="receipt-play" aria-hidden="true">▸</span>

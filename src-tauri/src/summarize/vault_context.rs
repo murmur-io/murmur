@@ -242,24 +242,20 @@ fn pack_doc_chunks(
     if hits.is_empty() {
         return Ok(());
     }
-    // Brain v3 PR-2 — GATED PARENT EXPANSION: for the top-3 fused doc hits, replace the isolated
-    // leaf snippet with the document's dominant L1 SECTION-parent text (coherent section beats a
+    // Brain v3 audit Fix 1 — GATED, HIT-ALIGNED PARENT EXPANSION: for a top-3 fused doc hit whose
+    // section was CORROBORATED by a second sibling leaf in the same retrieval (auto-merging), swap
+    // the leaf snippet for the WINNING chunk's own L1 section-parent text (coherent section beats a
     // fragment; context-rot lesson keeps it to the top few). `expand_doc_parents_visible` re-applies
-    // the visibility gate, so a sealed-not-unlocked doc contributes nothing. A doc with no L1 parent
-    // (flat/legacy) keeps its original leaf snippet unchanged.
+    // the visibility gate, so a sealed-not-unlocked doc contributes nothing. A single-leaf hit and
+    // a flat/legacy doc keep their original leaf snippet unchanged — expansion may only ever add
+    // the section AROUND what was retrieved, never substitute a different section.
     const EXPAND_TOP_N: usize = 3;
-    let top_ids: Vec<String> = hits
-        .iter()
-        .take(EXPAND_TOP_N)
-        .map(|h| h.document_id.clone())
-        .collect();
-    if !top_ids.is_empty() {
-        let parents = db.expand_doc_parents_visible(&top_ids, unlocked)?;
-        for p in parents {
-            if let Some(h) = hits.iter_mut().find(|h| h.document_id == p.document_id) {
-                if !p.snippet.trim().is_empty() {
-                    h.snippet = p.snippet;
-                }
+    let parents =
+        db.expand_doc_parents_visible(&hits[..hits.len().min(EXPAND_TOP_N)], unlocked)?;
+    for p in parents {
+        if let Some(h) = hits.iter_mut().find(|h| h.document_id == p.document_id) {
+            if !p.snippet.trim().is_empty() {
+                h.snippet = p.snippet;
             }
         }
     }

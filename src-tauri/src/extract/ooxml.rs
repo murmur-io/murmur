@@ -4,15 +4,21 @@
 //! headless (the tests build tiny in-memory .docx/.pptx zips), so unlike the PDFKit path this
 //! verifies on any machine.
 //!
-//! DOCX (`word/document.xml`): stream paragraphs (`w:p`). Inside each paragraph, `w:pStyle` with a
-//! `w:val` of `Heading1`..`Heading9` promotes the paragraph to a heading at that level (updating the
-//! running heading trail); `w:t` runs concatenate into the paragraph text; a table (`w:tbl`) renders
-//! its rows as pipe-delimited (`a | b | c`) text. Each non-heading paragraph → one [`ExtractedBlock`]
-//! carrying the CURRENT heading trail (`page = None`).
+//! DOCX (`word/document.xml`): stream paragraphs (`w:p`). A paragraph whose `w:pStyle` resolves to
+//! a heading — via `word/styles.xml` `w:outlineLvl` (language-agnostic: a Polish `Nagłówek1` or
+//! German `Überschrift1` styleId carries no English prefix) or the `Heading1`..`Heading9` prefix
+//! fallback — updates the running heading trail; `w:t` runs concatenate into the paragraph text
+//! (`w:br`/`w:cr` → newline, `w:tab` → tab); a table (`w:tbl`) renders its rows as pipe-delimited
+//! (`a | b | c`) text, with NESTED tables flattened into the outer cell in reading order. Field
+//! instructions (`w:instrText`) and tracked-changes deletions (`w:delText`) are NOT content and are
+//! suppressed. Each non-heading paragraph → one [`ExtractedBlock`] carrying the CURRENT heading
+//! trail (`page = None`).
 //!
 //! PPTX (`ppt/slides/slideN.xml`, ordered by N): each slide is one page (`page = Some(N)`). `a:t`
 //! runs are the text; the TITLE placeholder (`p:ph` with `type="title"` or `type="ctrTitle"`) becomes
-//! the slide's heading. One block per slide (all its body text joined), heading = the title.
+//! the slide's heading; a slide table (`p:graphicFrame` → `a:tbl`, which lives OUTSIDE any `p:sp`
+//! shape) renders pipe-delimited rows like the DOCX idiom. One block per slide (all its body text
+//! joined), heading = the title.
 //!
 //! Lock model: pure `path → blocks`, no DB/keychain. Failures map to `AppError::InvalidArg`
 //! (fail-closed), never a panic. No PII logged.
@@ -188,12 +194,66 @@ fn attr_local<'a>(
 
 /// Parse a `w:pStyle` / heading style value into a 1..=9 heading level, or `None` if it is not a
 /// `HeadingN` style. Case-insensitive on the "heading" prefix; accepts the common `Heading1` and the
-/// display-name `heading 1` shapes.
+/// display-name `heading 1` shapes. FALLBACK only — a localized Word style (`Nagłówek1`,
+/// `Überschrift1`) has no English prefix and resolves through [`parse_styles_heading_levels`].
 fn heading_level(style_val: &str) -> Option<u8> {
     let v = style_val.trim().to_ascii_lowercase();
     let rest = v.strip_prefix("heading")?.trim_start();
     let n: u8 = rest.parse().ok()?;
     (1..=9).contains(&n).then_some(n)
+}
+
+/// Heading levels resolved from `word/styles.xml`: `w:styleId` → 1..=9.
+type StyleHeadings = std::collections::HashMap<String, u8>;
+
+/// Best-effort parse of `word/styles.xml` into a styleId → heading-level map via `w:outlineLvl`
+/// (0-based outline level 0..=8 → heading level `lvl + 1`; 9 means body text per OOXML). The
+/// outline level is the language-agnostic truth for heading detection, so localized style names
+/// resolve without any per-language table. Fidelity METADATA only: a malformed styles.xml degrades
+/// to whatever parsed cleanly before the error (the document body still extracts; the English
+/// prefix fallback in [`heading_level`] still applies) rather than failing the whole extraction.
+fn parse_styles_heading_levels(xml: &str) -> StyleHeadings {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(false);
+    let decoder = reader.decoder();
+
+    let mut map = StyleHeadings::new();
+    let mut current_style: Option<String> = None;
+    let mut current_level: Option<u8> = None;
+
+    let mut buf = Vec::new();
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e) | Event::Empty(e)) => match local_name(e.name().as_ref()) {
+                b"style" => {
+                    current_style = attr_local(&e, b"styleId", decoder);
+                    current_level = None;
+                }
+                b"outlineLvl" => {
+                    if let Some(v) = attr_local(&e, b"val", decoder) {
+                        if let Ok(lvl) = v.trim().parse::<u8>() {
+                            if lvl <= 8 {
+                                current_level = Some(lvl + 1);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            },
+            Ok(Event::End(e)) => {
+                if local_name(e.name().as_ref()) == b"style" {
+                    if let (Some(id), Some(lvl)) = (current_style.take(), current_level.take()) {
+                        map.insert(id, lvl);
+                    }
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => break, // best-effort metadata — keep what parsed cleanly
+            _ => {}
+        }
+        buf.clear();
+    }
+    map
 }
 
 /// The running heading trail: a stack of (level, label). Pushing a heading of level L pops every
@@ -226,16 +286,75 @@ impl HeadingStack {
 pub fn extract_docx(path: &Path) -> Result<Vec<ExtractedBlock>> {
     let mut zip = open_zip(path)?;
     let mut budget = DecompressBudget::new();
+    // Heading styles first, charged against the SAME decompression budget as the body (one ceiling
+    // per document — styles.xml is not a free side-channel for a bomb). Absent → empty map, and the
+    // English `HeadingN` prefix fallback still applies.
+    let style_headings = read_entry(&mut zip, "word/styles.xml", &mut budget)?
+        .map(|xml| parse_styles_heading_levels(&xml))
+        .unwrap_or_default();
     let Some(xml) = read_entry(&mut zip, "word/document.xml", &mut budget)? else {
         return Err(AppError::InvalidArg(
             "DOCX is missing word/document.xml".into(),
         ));
     };
-    parse_docx_xml(&xml)
+    parse_docx_xml(&xml, &style_headings)
+}
+
+/// Per-open-`w:tbl` accumulation state. Tables NEST (a cell may contain a whole inner table), and a
+/// flat clear-on-`w:tr`/`w:tc` state machine wipes the outer cell's captured text and its earlier
+/// sibling cells the moment an inner table starts — one frame per open table keeps each nesting
+/// level's state isolated so nothing already extracted is destroyed.
+#[derive(Default)]
+struct TableFrame {
+    /// Completed cells of the current row.
+    row_cells: Vec<String>,
+    /// Text accumulating for the currently open cell.
+    cell_text: String,
+    /// Whether a `w:tc` is open in THIS table (routes text into `cell_text`).
+    in_cell: bool,
+}
+
+/// Route one rendered table row to its destination: with no enclosing table it becomes a content
+/// block under the current heading trail; inside an outer table it FLATTENS into that table's open
+/// cell text (newline-separated), so nested-table content survives in reading order.
+fn deposit_docx_row(
+    parent: Option<&mut TableFrame>,
+    blocks: &mut Vec<ExtractedBlock>,
+    headings: &HeadingStack,
+    row: String,
+) {
+    if row.trim().is_empty() {
+        return;
+    }
+    match parent {
+        Some(f) => {
+            if !f.cell_text.is_empty() && !f.cell_text.ends_with('\n') {
+                f.cell_text.push('\n');
+            }
+            f.cell_text.push_str(&row);
+        }
+        None => blocks.push(ExtractedBlock {
+            text: row,
+            page: None,
+            heading_path: headings.path(),
+        }),
+    }
+}
+
+/// Push a literal whitespace char produced by an empty layout element (`w:br`/`w:cr` → newline,
+/// `w:tab` → tab) into whatever sink is accumulating: the open table cell if any, else the
+/// paragraph. Without these, visually separate lines glue into one word.
+fn push_layout_char(tables: &mut [TableFrame], para_text: &mut String, c: char) {
+    match tables.last_mut() {
+        Some(f) if f.in_cell => f.cell_text.push(c),
+        _ => para_text.push(c),
+    }
 }
 
 /// The DOCX body walk, split out for direct unit testing on a raw `document.xml` string.
-fn parse_docx_xml(xml: &str) -> Result<Vec<ExtractedBlock>> {
+/// `style_headings` maps `w:styleId` → heading level (from `word/styles.xml`); the English
+/// `HeadingN` prefix remains as fallback for documents without a styles part.
+fn parse_docx_xml(xml: &str, style_headings: &StyleHeadings) -> Result<Vec<ExtractedBlock>> {
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(false);
     let decoder = reader.decoder();
@@ -243,76 +362,139 @@ fn parse_docx_xml(xml: &str) -> Result<Vec<ExtractedBlock>> {
     let mut blocks: Vec<ExtractedBlock> = Vec::new();
     let mut headings = HeadingStack::default();
 
-    // Per-paragraph accumulator.
+    // Per-paragraph accumulator (top-level paragraphs only — cell text lives in its TableFrame).
     let mut in_paragraph = false;
     let mut para_text = String::new();
     let mut para_heading: Option<u8> = None;
-    // Table-cell pipe accumulation: a `w:tr` collects its cells' text into `row_cells`.
-    let mut row_cells: Vec<String> = Vec::new();
-    let mut cell_open = false;
-    // Whether the next `w:t` char-run belongs to a table cell (routes to the cell) vs a paragraph.
+    // One frame per open `w:tbl`, innermost on top.
+    let mut tables: Vec<TableFrame> = Vec::new();
+    // Whether a char-run is being captured (armed at `w:p`/`w:t` start, disarmed at `w:t` end).
     let mut capture_text = false;
+    // Depth inside content that is NOT document text and must never reach the brain: field
+    // plumbing (`w:instrText`, and its deleted-tracked-changes form `w:delInstrText`) and
+    // tracked-changes DELETED runs (`w:del`, which wraps `w:delText` AND any layout breaks the
+    // author deleted — suppressing the whole `w:del` wrapper, not just its `w:delText`, keeps a
+    // `w:br`/`w:tab`/`w:cr` inside a deleted run from injecting stray whitespace).
+    let mut suppress_depth: u32 = 0;
 
     let mut buf = Vec::new();
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) => match local_name(e.name().as_ref()) {
-                b"tr" => row_cells.clear(),
+                b"tbl" => tables.push(TableFrame::default()),
+                b"tr" => {
+                    if let Some(f) = tables.last_mut() {
+                        f.row_cells.clear();
+                    }
+                }
                 b"tc" => {
-                    cell_open = true;
-                    para_text.clear(); // a cell's paragraphs accumulate into the cell text
+                    if let Some(f) = tables.last_mut() {
+                        f.in_cell = true;
+                        f.cell_text.clear();
+                    }
                 }
                 b"p" => {
-                    if !cell_open {
-                        in_paragraph = true;
-                        para_text.clear();
-                        para_heading = None;
+                    match tables.last_mut() {
+                        // A later paragraph in an open cell: newline-separate it from what the
+                        // cell already holds (earlier paragraphs / a flattened nested table).
+                        Some(f) if f.in_cell => {
+                            if !f.cell_text.is_empty() && !f.cell_text.ends_with('\n') {
+                                f.cell_text.push('\n');
+                            }
+                        }
+                        _ => {
+                            in_paragraph = true;
+                            para_text.clear();
+                            para_heading = None;
+                        }
                     }
                     capture_text = true;
                 }
                 b"t" => capture_text = true,
+                b"instrText" | b"delInstrText" | b"delText" | b"del" => {
+                    suppress_depth = suppress_depth.saturating_add(1)
+                }
+                // Word writes breaks self-closed (see the Empty arm); tolerate the expanded form.
+                b"br" | b"cr" if suppress_depth == 0 => {
+                    push_layout_char(&mut tables, &mut para_text, '\n');
+                }
+                b"tab" if suppress_depth == 0 => {
+                    push_layout_char(&mut tables, &mut para_text, '\t');
+                }
                 _ => {}
             },
-            Ok(Event::Empty(e)) => {
-                // `w:pStyle w:val="HeadingN"` is an empty element — read its heading level.
-                if local_name(e.name().as_ref()) == b"pStyle" {
+            Ok(Event::Empty(e)) => match local_name(e.name().as_ref()) {
+                // `w:pStyle w:val="X"`: resolve through styles.xml outlineLvl first (language-
+                // agnostic), then the English HeadingN prefix fallback.
+                b"pStyle" => {
                     if let Some(v) = attr_local(&e, b"val", decoder) {
-                        if let Some(lvl) = heading_level(&v) {
+                        let lvl = style_headings
+                            .get(v.trim())
+                            .copied()
+                            .or_else(|| heading_level(&v));
+                        if let Some(lvl) = lvl {
                             para_heading = Some(lvl);
                         }
                     }
                 }
-            }
+                b"br" | b"cr" if suppress_depth == 0 => {
+                    push_layout_char(&mut tables, &mut para_text, '\n');
+                }
+                b"tab" if suppress_depth == 0 => {
+                    push_layout_char(&mut tables, &mut para_text, '\t');
+                }
+                _ => {}
+            },
             Ok(Event::Text(t)) => {
-                if capture_text {
+                if capture_text && suppress_depth == 0 {
                     let txt = t
                         .xml_content(XML_1_0)
                         .map_err(|e| AppError::InvalidArg(format!("bad DOCX text: {e}")))?;
-                    para_text.push_str(&txt);
+                    match tables.last_mut() {
+                        Some(f) if f.in_cell => f.cell_text.push_str(&txt),
+                        _ => para_text.push_str(&txt),
+                    }
                 }
             }
             Ok(Event::End(e)) => match local_name(e.name().as_ref()) {
                 b"t" => capture_text = false,
+                b"instrText" | b"delInstrText" | b"delText" | b"del" => {
+                    suppress_depth = suppress_depth.saturating_sub(1)
+                }
                 b"tc" => {
-                    cell_open = false;
-                    row_cells.push(para_text.trim().to_string());
-                    para_text.clear();
+                    if let Some(f) = tables.last_mut() {
+                        f.in_cell = false;
+                        let cell = std::mem::take(&mut f.cell_text);
+                        f.row_cells.push(cell.trim().to_string());
+                    }
                 }
                 b"tr" => {
-                    if !row_cells.is_empty() {
-                        let row = row_cells.join(" | ");
-                        if !row.trim().is_empty() {
-                            blocks.push(ExtractedBlock {
-                                text: row,
-                                page: None,
-                                heading_path: headings.path(),
-                            });
+                    let row = match tables.last_mut() {
+                        Some(f) => {
+                            let cells = std::mem::take(&mut f.row_cells);
+                            cells.join(" | ")
                         }
-                        row_cells.clear();
+                        None => String::new(),
+                    };
+                    let n = tables.len();
+                    let parent = if n >= 2 { tables.get_mut(n - 2) } else { None };
+                    deposit_docx_row(parent, &mut blocks, &headings, row);
+                }
+                b"tbl" => {
+                    // Salvage any leftover state (a malformed table missing its tr/tc closes) —
+                    // text is never dropped on the floor — then dispose the frame.
+                    if let Some(f) = tables.pop() {
+                        let mut cells = f.row_cells;
+                        let tail = f.cell_text.trim();
+                        if !tail.is_empty() {
+                            cells.push(tail.to_string());
+                        }
+                        deposit_docx_row(tables.last_mut(), &mut blocks, &headings, cells.join(" | "));
                     }
                 }
                 b"p" => {
-                    if in_paragraph && !cell_open {
+                    let in_cell = tables.last().map(|f| f.in_cell).unwrap_or(false);
+                    if in_paragraph && !in_cell {
                         let text = para_text.trim().to_string();
                         if let Some(lvl) = para_heading {
                             if !text.is_empty() {
@@ -379,7 +561,8 @@ fn slide_number(name: &str) -> u32 {
     stem.parse().unwrap_or(0)
 }
 
-/// Parse ONE slide's XML into a block: title placeholder → heading; all `a:t` runs → body text.
+/// Parse ONE slide's XML into a block: title placeholder → heading; all `a:t` runs → body text;
+/// slide tables (`p:graphicFrame` → `a:tbl`, OUTSIDE any shape) → pipe-delimited rows.
 /// `None` when the slide has no extractable text at all.
 fn parse_pptx_slide(xml: &str, slide_num: u32) -> Result<Option<ExtractedBlock>> {
     let mut reader = Reader::from_str(xml);
@@ -396,6 +579,15 @@ fn parse_pptx_slide(xml: &str, slide_num: u32) -> Result<Option<ExtractedBlock>>
     let mut shape_is_title = false;
     let mut shape_text = String::new();
     let mut capture_text = false;
+
+    // A DrawingML table (`a:tbl` inside `p:graphicFrame`) lives OUTSIDE any `p:sp`, so the
+    // `in_shape` gate alone drops table-only slides entirely. Its cells (`a:tr`/`a:tc`, text under
+    // the cell's `a:txBody`) render pipe-delimited rows like the DOCX table idiom. DrawingML
+    // tables cannot nest (a cell holds only a text body), so flat state suffices here.
+    let mut in_table = false;
+    let mut table_row_cells: Vec<String> = Vec::new();
+    let mut table_cell_text = String::new();
+    let mut in_table_cell = false;
 
     let mut buf = Vec::new();
     loop {
@@ -416,10 +608,23 @@ fn parse_pptx_slide(xml: &str, slide_num: u32) -> Result<Option<ExtractedBlock>>
                         }
                     }
                 }
+                b"tbl" => in_table = true,
+                b"tr" if in_table => table_row_cells.clear(),
+                b"tc" if in_table => {
+                    in_table_cell = true;
+                    table_cell_text.clear();
+                }
                 b"t" => capture_text = true,
                 // paragraph boundary inside a shape → newline between paragraphs.
                 b"p" if in_shape && !shape_text.is_empty() && !shape_text.ends_with('\n') => {
                     shape_text.push('\n');
+                }
+                // paragraph boundary inside a table cell → same newline separation.
+                b"p" if in_table_cell
+                    && !table_cell_text.is_empty()
+                    && !table_cell_text.ends_with('\n') =>
+                {
+                    table_cell_text.push('\n');
                 }
                 _ => {}
             },
@@ -434,11 +639,15 @@ fn parse_pptx_slide(xml: &str, slide_num: u32) -> Result<Option<ExtractedBlock>>
                 }
             }
             Ok(Event::Text(t)) => {
-                if capture_text && in_shape {
+                if capture_text && (in_shape || in_table_cell) {
                     let txt = t
                         .xml_content(XML_1_0)
                         .map_err(|e| AppError::InvalidArg(format!("bad PPTX text: {e}")))?;
-                    shape_text.push_str(&txt);
+                    if in_table_cell {
+                        table_cell_text.push_str(&txt);
+                    } else {
+                        shape_text.push_str(&txt);
+                    }
                 }
             }
             Ok(Event::End(e)) => match local_name(e.name().as_ref()) {
@@ -454,6 +663,18 @@ fn parse_pptx_slide(xml: &str, slide_num: u32) -> Result<Option<ExtractedBlock>>
                     }
                     in_shape = false;
                 }
+                b"tc" if in_table => {
+                    in_table_cell = false;
+                    let cell = std::mem::take(&mut table_cell_text);
+                    table_row_cells.push(cell.trim().to_string());
+                }
+                b"tr" if in_table => {
+                    let row = std::mem::take(&mut table_row_cells).join(" | ");
+                    if !row.trim().is_empty() {
+                        body_paras.push(row);
+                    }
+                }
+                b"tbl" => in_table = false,
                 _ => {}
             },
             Ok(Event::Eof) => break,
@@ -699,5 +920,278 @@ mod tests {
         let p = build_ooxml("docx", &[("word/document.xml", DOCX_XML)]);
         let blocks = extract_docx(&p).unwrap();
         assert!(!blocks.is_empty(), "a normal DOCX must extract under the production ceiling");
+    }
+
+    // ── OOXML FIDELITY (audit fixes: nested tables, localized headings, whitespace, field junk) ──
+
+    /// A table NESTED inside an outer cell must not destroy the outer cell's already-captured text
+    /// nor its earlier sibling cells, and reading order must hold (the flat clear-on-`w:tr`/`w:tc`
+    /// state machine wiped both).
+    #[test]
+    fn docx_nested_table_preserves_outer_and_sibling_text() {
+        const XML: &str = r#"<?xml version="1.0"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:tbl>
+      <w:tr>
+        <w:tc><w:p><w:r><w:t>FIRST CELL</w:t></w:r></w:p></w:tc>
+        <w:tc>
+          <w:p><w:r><w:t>OUTER TEXT</w:t></w:r></w:p>
+          <w:tbl>
+            <w:tr><w:tc><w:p><w:r><w:t>INNER</w:t></w:r></w:p></w:tc></w:tr>
+          </w:tbl>
+          <w:p><w:r><w:t>AFTER</w:t></w:r></w:p>
+        </w:tc>
+      </w:tr>
+    </w:tbl>
+  </w:body>
+</w:document>"#;
+        let p = build_ooxml("docx", &[("word/document.xml", XML)]);
+        let blocks = extract_docx(&p).unwrap();
+        let all = blocks
+            .iter()
+            .map(|b| b.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            all.contains("FIRST CELL"),
+            "sibling cell before the nested table must survive; got: {all:?}"
+        );
+        assert!(
+            all.contains("OUTER TEXT"),
+            "outer-cell text captured before the nested table must survive; got: {all:?}"
+        );
+        assert!(all.contains("INNER"), "nested-table text must extract; got: {all:?}");
+        assert!(
+            all.contains("AFTER"),
+            "outer-cell text after the nested table must survive; got: {all:?}"
+        );
+        let (a, b, c, d) = (
+            all.find("FIRST CELL").unwrap(),
+            all.find("OUTER TEXT").unwrap(),
+            all.find("INNER").unwrap(),
+            all.find("AFTER").unwrap(),
+        );
+        assert!(a < b && b < c && c < d, "reading order must be preserved; got: {all:?}");
+    }
+
+    /// Localized Word heading styles (a Polish `Nagłówek1`, no English `heading` prefix) resolve
+    /// through `word/styles.xml` `w:outlineLvl` — the language-agnostic OOXML truth.
+    #[test]
+    fn docx_localized_heading_styles_resolve_via_styles_xml_outline_level() {
+        const STYLES: &str = r#"<?xml version="1.0"?>
+<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:style w:type="paragraph" w:styleId="Nagłówek1">
+    <w:name w:val="heading 1"/>
+    <w:pPr><w:outlineLvl w:val="0"/></w:pPr>
+  </w:style>
+  <w:style w:type="paragraph" w:styleId="Nagłówek2">
+    <w:name w:val="heading 2"/>
+    <w:pPr><w:outlineLvl w:val="1"/></w:pPr>
+  </w:style>
+  <w:style w:type="paragraph" w:styleId="Zwykly">
+    <w:name w:val="Normal"/>
+  </w:style>
+</w:styles>"#;
+        const DOC: &str = r#"<?xml version="1.0"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p><w:pPr><w:pStyle w:val="Nagłówek1"/></w:pPr><w:r><w:t>Wprowadzenie</w:t></w:r></w:p>
+    <w:p><w:r><w:t>Pierwszy akapit.</w:t></w:r></w:p>
+    <w:p><w:pPr><w:pStyle w:val="Nagłówek2"/></w:pPr><w:r><w:t>Szczegóły</w:t></w:r></w:p>
+    <w:p><w:pPr><w:pStyle w:val="Zwykly"/></w:pPr><w:r><w:t>Drugi akapit.</w:t></w:r></w:p>
+  </w:body>
+</w:document>"#;
+        let p = build_ooxml(
+            "docx",
+            &[("word/styles.xml", STYLES), ("word/document.xml", DOC)],
+        );
+        let blocks = extract_docx(&p).unwrap();
+        let first = blocks.iter().find(|b| b.text.contains("Pierwszy")).unwrap();
+        assert_eq!(
+            first.heading_path.as_deref(),
+            Some("Wprowadzenie"),
+            "a localized H1 style must set the heading trail"
+        );
+        let second = blocks.iter().find(|b| b.text.contains("Drugi")).unwrap();
+        assert_eq!(
+            second.heading_path.as_deref(),
+            Some("Wprowadzenie › Szczegóły"),
+            "a localized H2 style must nest under the H1"
+        );
+        assert!(
+            !blocks
+                .iter()
+                .any(|b| b.text == "Wprowadzenie" || b.text == "Szczegóły"),
+            "localized heading paragraphs must not leak as content blocks"
+        );
+    }
+
+    /// `w:br`/`w:cr` render a newline and `w:tab` a tab — without them, visually separate lines
+    /// glue into one word.
+    #[test]
+    fn docx_break_tab_cr_render_whitespace() {
+        const XML: &str = r#"<?xml version="1.0"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p><w:r><w:t>line1</w:t><w:br/><w:t>line2</w:t><w:tab/><w:t>col</w:t><w:cr/><w:t>line3</w:t></w:r></w:p>
+  </w:body>
+</w:document>"#;
+        let p = build_ooxml("docx", &[("word/document.xml", XML)]);
+        let blocks = extract_docx(&p).unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(
+            blocks[0].text, "line1\nline2\tcol\nline3",
+            "w:br and w:cr must render a newline, w:tab a tab"
+        );
+    }
+
+    /// Multiple paragraphs in ONE table cell join with a newline instead of gluing together.
+    #[test]
+    fn docx_multi_paragraph_cell_joins_with_newline() {
+        const XML: &str = r#"<?xml version="1.0"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:tbl>
+      <w:tr>
+        <w:tc><w:p><w:r><w:t>para one</w:t></w:r></w:p><w:p><w:r><w:t>para two</w:t></w:r></w:p></w:tc>
+        <w:tc><w:p><w:r><w:t>x</w:t></w:r></w:p></w:tc>
+      </w:tr>
+    </w:tbl>
+  </w:body>
+</w:document>"#;
+        let p = build_ooxml("docx", &[("word/document.xml", XML)]);
+        let blocks = extract_docx(&p).unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(
+            blocks[0].text, "para one\npara two | x",
+            "cell paragraphs must join with a newline, not concatenate"
+        );
+    }
+
+    /// Field-instruction text (`w:instrText` — TOC/PAGEREF plumbing) is NOT document content and
+    /// must not leak into the extraction.
+    #[test]
+    fn docx_field_instruction_text_is_not_extracted() {
+        const XML: &str = r#"<?xml version="1.0"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p>
+      <w:r><w:fldChar w:fldCharType="begin"/></w:r>
+      <w:r><w:instrText> PAGEREF _Toc12345 \h </w:instrText></w:r>
+      <w:r><w:fldChar w:fldCharType="end"/></w:r>
+      <w:r><w:t>Chapter one</w:t></w:r>
+    </w:p>
+  </w:body>
+</w:document>"#;
+        let p = build_ooxml("docx", &[("word/document.xml", XML)]);
+        let blocks = extract_docx(&p).unwrap();
+        let all = blocks
+            .iter()
+            .map(|b| b.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !all.contains("PAGEREF"),
+            "field-instruction junk must be suppressed; got: {all:?}"
+        );
+        assert!(all.contains("Chapter one"), "real run text must survive; got: {all:?}");
+    }
+
+    /// Tracked-changes DELETED text (`w:delText`) must not be resurrected into the brain — the
+    /// author removed it (a privacy surprise if it comes back). The deleted run sits BEFORE the
+    /// first `w:t` — the arm-at-paragraph-start capture window that leaked it.
+    #[test]
+    fn docx_tracked_change_deleted_text_is_not_extracted() {
+        const XML: &str = r#"<?xml version="1.0"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p>
+      <w:del w:id="1"><w:r><w:delText>REDACTED SECRET</w:delText></w:r></w:del>
+      <w:r><w:t>kept after deletion</w:t></w:r>
+    </w:p>
+  </w:body>
+</w:document>"#;
+        let p = build_ooxml("docx", &[("word/document.xml", XML)]);
+        let blocks = extract_docx(&p).unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert!(
+            !blocks[0].text.contains("REDACTED"),
+            "deleted (tracked-changes) text must be suppressed; got: {:?}",
+            blocks[0].text
+        );
+        assert_eq!(blocks[0].text, "kept after deletion");
+    }
+
+    /// Deleted-tracked-changes FIELD-instruction text (`w:delInstrText` — the deleted form of the
+    /// PAGEREF/TOC plumbing) is field junk AND author-removed content; it must never leak. Same
+    /// class as the `w:instrText` / `w:delText` suppression.
+    #[test]
+    fn docx_deleted_field_instruction_text_is_not_extracted() {
+        const XML: &str = r#"<?xml version="1.0"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p><w:r><w:delInstrText>PAGEREF _Toc99</w:delInstrText></w:r><w:r><w:t>REAL</w:t></w:r></w:p>
+  </w:body>
+</w:document>"#;
+        let p = build_ooxml("docx", &[("word/document.xml", XML)]);
+        let blocks = extract_docx(&p).unwrap();
+        assert!(!blocks.iter().any(|b| b.text.contains("PAGEREF")),
+            "deleted field-instruction text (w:delInstrText) must not leak: {blocks:?}");
+    }
+
+    /// A layout break (`w:br`) inside a DELETED run (`w:del`) must emit NOTHING — suppressing only
+    /// `w:delText` left the break to inject a stray newline between the surrounding kept runs.
+    #[test]
+    fn docx_break_inside_suppressed_run_emits_no_whitespace() {
+        const XML: &str = r#"<?xml version="1.0"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p><w:r><w:t>A</w:t></w:r><w:del><w:r><w:br/><w:delText>GONE</w:delText></w:r></w:del><w:r><w:t>B</w:t></w:r></w:p>
+  </w:body>
+</w:document>"#;
+        let p = build_ooxml("docx", &[("word/document.xml", XML)]);
+        let blocks = extract_docx(&p).unwrap();
+        assert_eq!(blocks[0].text, "AB", "a break inside a suppressed run must emit nothing (got {:?})", blocks[0].text);
+    }
+
+    /// A PPTX slide table (`p:graphicFrame` → `a:tbl`) lives OUTSIDE any `p:sp` shape — its cells
+    /// must still extract, as pipe-delimited rows like the DOCX table idiom.
+    #[test]
+    fn pptx_graphic_frame_table_extracts_pipe_rows() {
+        const SLIDE: &str = r#"<?xml version="1.0"?>
+<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+       xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+  <p:cSld><p:spTree>
+    <p:graphicFrame>
+      <a:graphic><a:graphicData>
+        <a:tbl>
+          <a:tr>
+            <a:tc><a:txBody><a:p><a:r><a:t>Milestone</a:t></a:r></a:p></a:txBody></a:tc>
+            <a:tc><a:txBody><a:p><a:r><a:t>Date</a:t></a:r></a:p></a:txBody></a:tc>
+          </a:tr>
+          <a:tr>
+            <a:tc><a:txBody><a:p><a:r><a:t>Beta</a:t></a:r></a:p></a:txBody></a:tc>
+            <a:tc><a:txBody><a:p><a:r><a:t>March</a:t></a:r></a:p></a:txBody></a:tc>
+          </a:tr>
+        </a:tbl>
+      </a:graphicData></a:graphic>
+    </p:graphicFrame>
+  </p:spTree></p:cSld>
+</p:sld>"#;
+        let p = build_ooxml("pptx", &[("ppt/slides/slide1.xml", SLIDE)]);
+        let blocks = extract_pptx(&p).unwrap();
+        assert_eq!(
+            blocks.len(),
+            1,
+            "a table-only slide must still yield a block; got {blocks:?}"
+        );
+        assert!(
+            blocks[0].text.contains("Milestone | Date"),
+            "table rows must render pipe-delimited; got: {:?}",
+            blocks[0].text
+        );
+        assert!(blocks[0].text.contains("Beta | March"));
+        assert_eq!(blocks[0].page, Some(1));
     }
 }

@@ -83,6 +83,11 @@
 </div>
 
 @if (open()) {
+  <!-- Scrim + popover are TELEPORTED to <body> (appTeleportToBody) as one overlay
+       so `position: fixed` anchors to the VIEWPORT, never a filtered/transformed
+       ancestor (the `.card` backdrop-filter / drawer transform containing-block
+       trap that made the picker "look dead"). display:contents → no extra box. -->
+  <div class="sp-overlay" appTeleportToBody>
   <!-- Scrim: a click OUTSIDE the popover closes it. Transparent (only the panel
        carries the opaque overlay — T3). role=button + Enter/Space/Esc satisfy the
        a11y lints (mirrors the quick-search scrim). -->
@@ -168,5 +173,6 @@
         }
       }
     </div>
+  </div>
   </div>
 }

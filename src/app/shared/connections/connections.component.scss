@@ -36,44 +36,6 @@
   flex: 0 1 auto;
 }
 
-/* Suggested-connections group — its rows stack under the opt-in toggle. */
-.cx-group--suggested {
-  margin-top: var(--space-1);
-}
-
-/* Opt-in expander for the semantic suggestions: reads like the `.cx-label` header but is a
-   clickable, full-width toggle (COLLAPSED by default so auto-suggestions never bombard the panel). */
-.cx-suggest-toggle {
-  flex: 0 0 100%;
-  display: inline-flex;
-  align-items: center;
-  gap: var(--space-1);
-  padding: 2px 0;
-  background: none;
-  border: none;
-  cursor: pointer;
-  font-size: 11px;
-  font-weight: 600;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  color: var(--text-muted);
-  transition: color 120ms ease;
-}
-.cx-suggest-toggle:hover {
-  color: var(--text-secondary);
-}
-.cx-suggest-caret {
-  display: inline-block;
-  font-size: 13px;
-  transition: transform 120ms ease;
-}
-.cx-suggest-caret.is-open {
-  transform: rotate(90deg);
-}
-.cx-suggest-label {
-  line-height: 1;
-}
-
 /* `+ Link` chooser trigger — a quiet ghost pill (leans on the token language, not
    a new global primitive since it needs the compact chip metrics). */
 .cx-add {

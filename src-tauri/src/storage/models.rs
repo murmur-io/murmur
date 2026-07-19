@@ -143,14 +143,19 @@ impl FullGraphEdgeKind {
 }
 
 /// One TYPED edge in the full-brain graph. `src`/`dst` are node ids that MUST both be present in
-/// the returned `nodes` (BOTH-endpoint-gated — an edge to a sealed node is never emitted). `status`
-/// is `active` for deterministic edges (co-occurrence/mention/wikilink/companion + accepted
-/// semantic) and `suggested` for un-accepted semantic edges (only present when the opts flag is on).
+/// the returned `nodes` (BOTH-endpoint-gated — an edge to a sealed node is never emitted).
+/// `src_kind`/`dst_kind` carry the ENDPOINT node kinds the backend gated on (PR-9 F4): a links edge
+/// can connect `meeting↔note`, so the endpoint kinds are NOT derivable from `kind` alone, and the FE
+/// must match endpoints by `(kind, id)` — not bare `id` — to be safe against a cross-kind id
+/// collision. `status` is `active` for deterministic edges (co-occurrence/mention/wikilink/companion
+/// + accepted semantic) and `suggested` for un-accepted semantic edges (only when the opts flag is on).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FullGraphEdge {
     pub src: String,
     pub dst: String,
+    pub src_kind: FullGraphNodeKind,
+    pub dst_kind: FullGraphNodeKind,
     pub kind: FullGraphEdgeKind,
     pub score: f64,
     pub status: String,
@@ -170,7 +175,10 @@ pub struct FullGraphOpts {
 /// disclosure the entity graph makes. `has_hidden` is true when ≥1 folder is sealed-and-not-unlocked
 /// (some nodes/edges may be hidden). `total_visible_nodes` is the TRUE count of visible nodes BEFORE
 /// the per-kind render caps trimmed `nodes` — `total_visible_nodes > nodes.len()` means a cap
-/// dropped rows (distinct from `has_hidden`, which only reflects LOCKED folders).
+/// dropped rows (distinct from `has_hidden`, which only reflects LOCKED folders). `edges_truncated`
+/// (PR-9 F2) is true when an EDGE-leg cap (the mention or links LIMIT) trimmed edges, so the FE can
+/// disclose "some links are hidden" — distinct from `total_visible_nodes` (a node-leg cap) and
+/// `has_hidden` (a locked folder).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FullGraphData {
@@ -178,6 +186,7 @@ pub struct FullGraphData {
     pub edges: Vec<FullGraphEdge>,
     pub has_hidden: bool,
     pub total_visible_nodes: i64,
+    pub edges_truncated: bool,
 }
 
 /// A co-occurring neighbor of a selected entity (the neighborhood satellites), with the
@@ -623,6 +632,7 @@ pub struct BrainOverview {
 /// One gated document-chunk retrieval hit (the document analogue of [`SearchHit`], minus the
 /// meeting): the nearest chunk's snippet + the source document name + its (visible) folder id.
 /// Returned by `search_doc_chunks_visible` and folded into the brain/Ask grounding corpus.
+/// Backend-internal: this struct never crosses IPC to the FE (no `models.ts` counterpart).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DocChunkHit {
@@ -635,6 +645,23 @@ pub struct DocChunkHit {
     /// concrete kind (`[document:note:<id>]` vs `[document:document:<id>]`) so a model knows which
     /// `get_*` tool to call. Populated straight off the existing `documents.kind` column.
     pub kind: String,
+    /// Brain v3 audit Fix 1 — the WINNING (post-dedup) chunk's `doc_chunks.id`, so parent expansion
+    /// can align to the chunk that was actually retrieved instead of the document's dominant section.
+    pub chunk_id: i64,
+    /// The winning chunk's L1 section-parent row id (`doc_chunks.parent_id`); `None` for an L1/L2
+    /// winner and for legacy flat rows.
+    pub parent_id: Option<i64>,
+    /// The heading trail the winning chunk sits under; `None` = flat/heading-less content, for
+    /// which parent expansion NEVER fires (the flat L1 is the doc head, not a real section).
+    pub section_path: Option<String>,
+    /// The winning chunk's own 1-based page/slide; `None` for flow formats.
+    pub page_no: Option<u32>,
+    /// The winning chunk's `doc_chunks.level` (0 leaf / 1 section-parent / 2 doc-summary).
+    pub level: i64,
+    /// Distinct L0 leaves under the winning chunk's parent that appeared in the PRE-dedup candidate
+    /// set of the SAME query (the winner itself included). `>= 2` is the auto-merging trigger:
+    /// only a section corroborated by a second sibling hit is expanded to its L1 parent.
+    pub sibling_hits: u32,
 }
 
 /// The full body of ONE standalone note OR imported/uploaded document, by id — the transport DTO
@@ -652,6 +679,22 @@ pub struct DocumentSummary {
     pub title: Option<String>,
     pub markdown: String,
     pub updated_at: Option<i64>,
+}
+
+/// Brain v3 audit Fix 3(b) — ONE entry in a document's structural OUTLINE (the heading/section tree
+/// persisted in `doc_chunks`): a section-parent (L1) or the doc summary (L2). Deterministic, derived
+/// PROVENANCE over already-derived plaintext — carries the section trail + page, NOT the section body
+/// text, so an outline is a cheap MAP the agent reads to plan targeted `get_document(offset,maxChars)`
+/// reads instead of blind char paging. Returned ONLY by [`Db::get_document_outline_if_visible`], which
+/// visibility-gates on the owning folder's lock (a sealed-and-not-session-unlocked document → empty).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocOutlineEntry {
+    /// `doc_chunks.level` — 1 = section-parent (a heading), 2 = doc summary/outline node.
+    pub level: i64,
+    /// The heading trail this node sits under (`"A › B"`); `None` for a flat/heading-less node.
+    pub section_path: Option<String>,
+    /// 1-based page/slide (PDF/PPTX); `None` for flow formats.
+    pub page_no: Option<u32>,
 }
 
 /// Shared Brain v1 — one ORG-partition retrieval hit: the nearest/best chunk's snippet + the

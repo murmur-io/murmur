@@ -542,11 +542,14 @@ export interface ReindexProgress {
 }
 
 /**
- * Brain v3 PR-2 — progress for an in-flight document import (`importDocument`):
+ * Brain v3 PR-2/PR-4 — progress for an in-flight document import (`importDocument`):
  * the extract → chunk → embed pipeline for ONE document. Mirrors the backend
  * `DocImportPayload` (camelCase). Counts + a stage ONLY — NO PII (`documentId`
- * is a random UUID; no filename / text). `done`/`total` are chunk counts within
- * the embedding stage (`0`/`0` for the earlier stages). `stage`:
+ * is a random UUID; no filename / text). `done`/`total` are REAL counts within a
+ * stage: PAGES for `"extracting"` (page k of N — including a scanned-PDF OCR) and
+ * embed SUB-BATCHES for `"embedding"` (batch k of M); `0`/`0` for `"chunking"`.
+ * `truncated` is `true` ONLY on the final `"done"` event when the scanned-PDF OCR
+ * page cap was reached (some scanned pages were skipped — partial content). `stage`:
  * `"extracting"` | `"chunking"` | `"embedding"` | `"done"`.
  */
 export interface DocImportProgress {
@@ -554,6 +557,7 @@ export interface DocImportProgress {
   stage: "extracting" | "chunking" | "embedding" | "done";
   done: number;
   total: number;
+  truncated: boolean;
 }
 
 /**
@@ -1515,14 +1519,19 @@ export type FullGraphEdgeKind =
 
 /**
  * One TYPED edge in the full-brain graph. `src`/`dst` are node ids that BOTH
- * appear in `nodes` (both-endpoint-gated). `status` is `"active"` for
- * deterministic edges (co-occurrence/mention/wikilink/companion + accepted
- * semantic) and `"suggested"` for un-accepted semantic edges (only present when
- * `includeSuggested` was on) — a suggested edge is drawn dashed.
+ * appear in `nodes` (both-endpoint-gated). `srcKind`/`dstKind` carry the ENDPOINT
+ * node kinds the backend gated on (a links edge can connect `meeting↔note`, so the
+ * endpoint kinds are NOT derivable from `kind` alone) — the FE matches endpoints by
+ * `(kind, id)`, not bare `id`, safe against a cross-kind id collision. `status` is
+ * `"active"` for deterministic edges (co-occurrence/mention/wikilink/companion +
+ * accepted semantic) and `"suggested"` for un-accepted semantic edges (only present
+ * when `includeSuggested` was on) — a suggested edge is drawn dashed.
  */
 export interface FullGraphEdge {
   src: string;
   dst: string;
+  srcKind: FullGraphNodeKind;
+  dstKind: FullGraphNodeKind;
   kind: FullGraphEdgeKind;
   score: number;
   status: "active" | "suggested";
@@ -1546,12 +1555,16 @@ export interface FullGraphOpts {
  * `totalVisibleNodes` is the TRUE count of visible nodes BEFORE the per-kind
  * render caps trimmed `nodes` (`totalVisibleNodes > nodes.length` = a cap
  * dropped rows — distinct from `hasHidden`, which only reflects LOCKED folders).
+ * `edgesTruncated` is true when an EDGE-leg cap (the mention or links LIMIT)
+ * trimmed edges, so the FE can disclose "some links are hidden" — distinct from
+ * `totalVisibleNodes` (a node-leg cap) and `hasHidden` (a locked folder).
  */
 export interface FullGraphData {
   nodes: FullGraphNode[];
   edges: FullGraphEdge[];
   hasHidden: boolean;
   totalVisibleNodes: number;
+  edgesTruncated: boolean;
 }
 
 /** A co-occurring neighbor of a selected entity (a neighborhood satellite). */

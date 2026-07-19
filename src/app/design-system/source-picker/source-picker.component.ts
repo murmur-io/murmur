@@ -17,6 +17,7 @@ import { IpcService } from "../../core/ipc.service";
 import type { LinkKind, NoteCitation, SourceRef } from "../../core/models";
 import { DebounceService } from "../../services/debounce.service";
 import { RepositionOnScrollDirective } from "../../features/notes/note-brain-popover/reposition-on-scroll.directive";
+import { TeleportToBodyDirective } from "../teleport-to-body.directive";
 
 /** How long to wait after the last keystroke before re-querying the backend. */
 const QUERY_DEBOUNCE_MS = 150;
@@ -65,7 +66,7 @@ const ALLOWED_KINDS: ReadonlySet<string> = new Set<LinkKind>([
 @Component({
   selector: "mur-source-picker",
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [RepositionOnScrollDirective],
+  imports: [RepositionOnScrollDirective, TeleportToBodyDirective],
   templateUrl: "./source-picker.component.html",
   styleUrl: "./source-picker.component.scss",
 })

@@ -26,6 +26,7 @@ import { FullBrainGraphComponent } from "../full-brain-graph/full-brain-graph.co
 import { BrainMemoryComponent } from "../brain-memory/brain-memory.component";
 import { BrainNoteEditorComponent } from "../brain-note-editor/brain-note-editor.component";
 import { BrainSourceCardComponent } from "../brain-source-card/brain-source-card.component";
+import { DocumentPreviewComponent } from "../document-preview/document-preview.component";
 import { BriefsComponent } from "../../briefs/briefs/briefs.component";
 import { AuditComponent } from "../../audit/audit/audit.component";
 
@@ -82,6 +83,7 @@ interface FolderOption {
     RouterLink,
     BrainEnableCardComponent,
     BrainSourceCardComponent,
+    DocumentPreviewComponent,
     BrainNoteEditorComponent,
     BrainMapComponent,
     FullBrainGraphComponent,
@@ -265,6 +267,15 @@ export class BrainComponent {
   private readonly importProgress = signal<DocImportProgress | null>(null);
 
   /**
+   * Set when the in-flight import's terminal `"done"` event reported `truncated`
+   * (the scanned-PDF OCR page cap skipped pages — partial content). Read in
+   * {@link pickAndImportDocument}'s success branch to show a distinct "partial
+   * import" toast instead of the plain success one. Reset at the start of each
+   * import. Content-free (a boolean) — NO PII.
+   */
+  private readonly importTruncated = signal(false);
+
+  /**
    * A short, human progress line for the importing Documents card, e.g.
    * "Extracting…" or "Embedding 12/40". Null unless an import is running.
    */
@@ -278,7 +289,10 @@ export class BrainComponent {
     }
     switch (p.stage) {
       case "extracting":
-        return "Extracting text…";
+        // Real page counts when known ("page 12/300" during a scanned-PDF OCR).
+        return p.total > 0
+          ? `Extracting ${p.done}/${p.total}`
+          : "Extracting text…";
       case "chunking":
         return "Chunking…";
       case "embedding":
@@ -302,6 +316,14 @@ export class BrainComponent {
 
   // ── note editor modal ──────────────────────────────────────────────────
   readonly noteEditorOpen = signal(false);
+
+  // ── document/note content-preview modal ────────────────────────────────
+  /**
+   * The document/note currently open in the read-only preview modal, or null
+   * when closed. Set from a source card's `openItem`; the modal fetches the
+   * gated text itself (sealed folders mask to "" → it renders LOCKED).
+   */
+  readonly previewDoc = signal<DocumentInfo | null>(null);
 
   // ── connections (graph) ────────────────────────────────────────────────
   readonly graphData = signal<GraphData | null>(null);
@@ -415,7 +437,15 @@ export class BrainComponent {
     // — the `importing` flag already gates a second import.
     let unlisten: UnlistenFn | null = null;
     void this.ipc
-      .onDocImportProgress((p) => this.importProgress.set(p))
+      .onDocImportProgress((p) => {
+        this.importProgress.set(p);
+        // Latch a truncation reported on the terminal "done" event (partial import
+        // — the scanned-PDF OCR page cap skipped pages), read after the import call
+        // resolves to pick the toast copy.
+        if (p.stage === "done" && p.truncated) {
+          this.importTruncated.set(true);
+        }
+      })
       .then((fn) => {
         unlisten = fn;
       });
@@ -560,10 +590,19 @@ export class BrainComponent {
     }
 
     this.importProgress.set(null);
+    this.importTruncated.set(false);
     this.importing.set(true);
     try {
       await this.ipc.importDocument(chosen, folderId);
-      this.toast.success("Document added to the brain.");
+      // A scanned PDF past the OCR page cap imports PARTIALLY — say so, don't
+      // claim a clean success (the pages beyond the cap have no text).
+      if (this.importTruncated()) {
+        this.toast.danger(
+          "Document added, but it had more scanned pages than we can read — some pages were skipped.",
+        );
+      } else {
+        this.toast.success("Document added to the brain.");
+      }
       this.docsExpanded.set(true);
       await this.afterMutation();
     } catch (e) {
@@ -572,6 +611,16 @@ export class BrainComponent {
       this.importing.set(false);
       this.importProgress.set(null);
     }
+  }
+
+  /** Open the read-only content preview for a document/note row. */
+  openPreview(doc: DocumentInfo): void {
+    this.previewDoc.set(doc);
+  }
+
+  /** Close the content preview modal. */
+  closePreview(): void {
+    this.previewDoc.set(null);
   }
 
   openNoteEditor(): void {
@@ -667,6 +716,16 @@ export class BrainComponent {
     // remaining no-text failure.
     if (/no text found/i.test(msg)) {
       return "No readable text found in that file, even after OCR.";
+    }
+    // Decompression-bomb guard ("document too large / possible zip bomb") —
+    // NOT an unsupported file type; say what actually stopped the import.
+    if (/zip bomb|document too large/i.test(msg)) {
+      return "That file expands beyond the safe import limit — it can’t be imported.";
+    }
+    // Extraction succeeded but yielded nothing ("this document has no
+    // extractable text") — the type IS supported, the file is just empty of text.
+    if (/no extractable text/i.test(msg)) {
+      return "No extractable text found in that file.";
     }
     // Encrypted / password-protected PDF.
     if (/password-protected|password|encrypted/i.test(msg)) {

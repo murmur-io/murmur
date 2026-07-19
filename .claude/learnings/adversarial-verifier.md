@@ -29,26 +29,6 @@
   screen-share auto-relock only truly verify on a *signed* build — a green unit test is not proof.
 - **Playwright defaults colorScheme LIGHT** and a mock field typo poisons judge rounds — eyeball the
   PNG yourself before trusting a verdict.
-- **NEVER `git checkout <file>` / `git restore` / `reset --hard` on an UNCOMMITTED tree to undo a
-  RED-revert.** A PR under review is usually uncommitted working changes; a `git checkout db.rs`
-  reverts the ENTIRE PR to trunk, not just your scratch hunk (this happened — a verifier nuked a
-  1300-line uncommitted PR and had to reconstruct it from a captured diff). For a RED-revert: use the
-  **Edit tool** to change the one hunk and Edit it back, or `git stash push -- <file>` → test →
-  `git stash pop`, or copy the file to a scratch path. After ANY revert, prove the tree is restored
-  byte-identical (`git diff --stat` matches the builder's, no stray hunks) before reporting.
-- **A green `cargo test --lib` proves NEITHER no-deadlock NOR no-leak when no test exercises the
-  path.** Two real bugs shipped green this program: (1) `accept_link` self-deadlocked (held a
-  non-reentrant guard across a callee that re-takes it) — every accept test hit only REFUSAL paths,
-  none a SUCCESSFUL accept; (2) the seal-time title-strip leaked because no test hit the auto-related
-  marker shape (title in `url` not `detail`) nor the canonicalized src-direction. HUNT: for a
-  state-machine/guard change, is there a test on the SUCCESS/happy path (not just the error paths)?
-  For a strip/filter/gate, enumerate every SHAPE the data takes (both edge directions, every field a
-  marker can live in, every render/sanitize form) and confirm a test covers each — a test that only
-  covers the shape the builder thought of green-washes the others.
-- **Prove a RED test is actually RED — don't trust its label.** A "src-leg regression" that inserts
-  the row in the OTHER direction (because the writer doesn't canonicalize the way the author assumed)
-  passes on the OLD code too and pins nothing. Neuter the exact fix hunk (via Edit), run the test,
-  confirm it FAILS, restore — a RED test that stays green against the unpatched code captured no bug.
 
 ## Run journal
 <!-- Append-only, newest first. -->

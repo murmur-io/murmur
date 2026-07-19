@@ -1,6 +1,20 @@
+pub(crate) mod ask_store;
+pub(crate) mod audit_store;
+pub(crate) mod brief_store;
 pub mod db;
+pub(crate) mod egress_store;
+pub(crate) mod facts_store;
+pub(crate) mod folders_store;
+pub(crate) mod graph_store;
+pub(crate) mod links;
+pub(crate) mod mcp_store;
+pub(crate) mod meetings_store;
 pub mod migration;
 pub mod models;
+pub(crate) mod notes_store;
+pub(crate) mod org_store;
+pub(crate) mod seal_store;
+pub(crate) mod settings_store;
 pub mod usage;
 
 pub use db::*;

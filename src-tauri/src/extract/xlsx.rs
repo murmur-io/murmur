@@ -46,10 +46,29 @@ pub fn extract_xlsx(path: &Path) -> Result<Vec<ExtractedBlock>> {
     Ok(blocks)
 }
 
-/// Render one cell to text. `calamine::Data` already implements `Display` (empty → ""); this wraps
-/// it and trims surrounding whitespace so a padded numeric cell stays clean.
+/// Render one cell to text. Strings/numbers/bools go through `Data`'s own `Display` (empty → ""),
+/// trimmed so a padded cell stays clean. Date/time cells are special-cased: their `Display` is the
+/// RAW Excel serial float (calamine prints `ExcelDateTime`'s inner value, e.g. `45123`), which is
+/// meaningless to the brain and the user — render the actual date/time via calamine's own epoch
+/// math (`to_ymd_hms_milli`, faithful to both the 1900 and 1904 date systems) instead.
 fn cell_text(cell: &Data) -> String {
-    cell.to_string().trim().to_string()
+    match cell {
+        Data::DateTime(dt) if dt.is_datetime() => {
+            let (y, mo, d, h, mi, s, _ms) = dt.to_ymd_hms_milli();
+            if (h, mi, s) == (0, 0, 0) {
+                format!("{y:04}-{mo:02}-{d:02}")
+            } else {
+                format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}")
+            }
+        }
+        // A duration-formatted cell ([hh]:mm:ss style): the serial is a DAY count → h:mm:ss.
+        Data::DateTime(dt) => {
+            let total = (dt.as_f64() * 86_400.0).round() as i64;
+            let (sign, t) = if total < 0 { ("-", -total) } else { ("", total) };
+            format!("{sign}{}:{:02}:{:02}", t / 3600, (t % 3600) / 60, t % 60)
+        }
+        other => other.to_string().trim().to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -77,6 +96,14 @@ mod tests {
             sheet_data.push_str("</row>");
         }
         sheet_data.push_str("</sheetData></worksheet>");
+        build_xlsx_parts(sheet_name, &sheet_data, None)
+    }
+
+    /// The zip plumbing shared by [`build_xlsx`] and the styles-bearing date fixture: one sheet
+    /// built from raw worksheet XML, plus an optional `xl/styles.xml` part (calamine reads styles
+    /// at that fixed path — no relationship entry needed).
+    fn build_xlsx_parts(sheet_name: &str, sheet_data: &str, styles: Option<&str>) -> std::path::PathBuf {
+        let sheet_data = sheet_data.to_string();
 
         let workbook_xml = format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -101,13 +128,16 @@ mod tests {
   <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
 </Relationships>"#;
 
-        let entries = [
+        let mut entries = vec![
             ("[Content_Types].xml", content_types.to_string()),
             ("_rels/.rels", root_rels.to_string()),
             ("xl/workbook.xml", workbook_xml),
             ("xl/_rels/workbook.xml.rels", workbook_rels.to_string()),
             ("xl/worksheets/sheet1.xml", sheet_data),
         ];
+        if let Some(styles) = styles {
+            entries.push(("xl/styles.xml", styles.to_string()));
+        }
 
         let mut cursor = std::io::Cursor::new(Vec::new());
         {
@@ -157,5 +187,31 @@ mod tests {
         std::fs::write(&p, b"definitely not a workbook").unwrap();
         let err = extract_xlsx(&p).unwrap_err();
         assert!(matches!(err, AppError::InvalidArg(_)), "got {err:?}");
+    }
+
+    /// Date-formatted cells (builtin numFmt 14) must render as DATES, not the raw Excel serial
+    /// float — serial 45123 is 2023-07-16, and 45123.5 adds noon. The raw serial is meaningless to
+    /// the brain (and to the user a search hit of `45123` is not a date).
+    #[test]
+    fn xlsx_date_cells_render_as_dates_not_raw_serials() {
+        let sheet = r#"<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>
+<row r="1">
+  <c r="A1" t="inlineStr"><is><t>Kickoff</t></is></c>
+  <c r="B1" s="1"><v>45123</v></c>
+  <c r="C1" s="1"><v>45123.5</v></c>
+</row>
+</sheetData></worksheet>"#;
+        let styles = r#"<?xml version="1.0" encoding="UTF-8"?>
+<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <cellXfs count="2"><xf numFmtId="0"/><xf numFmtId="14" applyNumberFormat="1"/></cellXfs>
+</styleSheet>"#;
+        let p = build_xlsx_parts("Plan", sheet, Some(styles));
+        let blocks = extract_xlsx(&p).unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(
+            blocks[0].text, "Kickoff | 2023-07-16 | 2023-07-16 12:00:00",
+            "date cells must render as dates, not raw serials"
+        );
     }
 }

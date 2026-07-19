@@ -59,21 +59,74 @@ fn catch_objc<R>(f: impl FnOnce() -> R) -> Option<R> {
     catch(AssertUnwindSafe(f)).ok()
 }
 
-/// Build a configured Accurate/pl+en/language-correcting `VNRecognizeTextRequest`. Inside `catch`
+/// Murmur's PREFERRED OCR languages, in priority order: Polish first, English second (Murmur's two
+/// primary languages — the multilingual whisper ships Polish too). Intersected at runtime with the
+/// system's actually-supported set (see [`choose_ocr_languages`]) so an older Vision that lacks "pl"
+/// on the app's 13.4 floor never fails the whole import — it degrades to the supported subset.
+const PREFERRED_OCR_LANGUAGES: &[&str] = &["pl", "en"];
+
+/// Choose the recognition languages to request, intersecting our [`PREFERRED_OCR_LANGUAGES`] (in
+/// PRIORITY order) with the `supported` set Vision reports at runtime. Pure logic (no FFI) so it is
+/// headless-testable — the FFI wrapper [`supported_recognition_languages`] feeds it the live set.
+///
+/// - Keep every preferred language the system supports, in our priority order (pl before en).
+/// - If NONE of our preferred languages are supported (a very old Vision, or an empty/failed probe),
+///   return EMPTY — the caller then leaves Vision's OWN default language selection in place rather
+///   than forcing an unsupported language (forcing "pl" on a Vision that doesn't support it is the
+///   "no text found" failure this fix closes). Fail-open to the system default, never fail-closed.
+fn choose_ocr_languages(supported: &[String], preferred: &[&str]) -> Vec<String> {
+    preferred
+        .iter()
+        .filter(|p| supported.iter().any(|s| s.eq_ignore_ascii_case(p)))
+        .map(|p| p.to_string())
+        .collect()
+}
+
+/// The languages Vision reports as supported for the request's current configuration
+/// (`supportedRecognitionLanguagesAndReturnError:`). Crash-safe: the ObjC call is inside `catch`; a
+/// caught exception / error / nil yields an EMPTY vec (the caller then keeps Vision's default — see
+/// [`choose_ocr_languages`]). Call AFTER `setRecognitionLevel:` (the supported set is level-dependent).
+fn supported_recognition_languages(req: &VNRecognizeTextRequest) -> Vec<String> {
+    catch_objc(|| {
+        // SAFETY: reads the supported-language collection for the request's current state; wrapped in
+        // `catch`. On an ObjC error (`Err`) or nil, fall through to an empty vec.
+        match unsafe { req.supportedRecognitionLanguagesAndReturnError() } {
+            Ok(arr) => arr.iter().map(|s| s.to_string()).collect(),
+            Err(_) => Vec::new(),
+        }
+    })
+    .unwrap_or_default()
+}
+
+/// Build a configured Accurate/language-correcting `VNRecognizeTextRequest`. Inside `catch`
 /// because the alloc/init + property setters are ObjC that could (in principle) throw. `None` on any
 /// caught exception.
+///
+/// LANGUAGE SELECTION (Brain v3 PR-4, finding: hardcoded "pl"/"en" can fail on an older Vision):
+/// after setting the recognition level, we INTERSECT [`PREFERRED_OCR_LANGUAGES`] with the languages
+/// Vision reports as supported at runtime and request only that subset (in priority order). If the
+/// intersection is empty (a very old Vision without "pl"/"en", or a failed probe) we DON'T force a
+/// language at all — Vision's own default selection stays, so the import still attempts recognition
+/// rather than failing "no text found". This is FFI — it only TRULY verifies on a real Mac; the pure
+/// intersection ([`choose_ocr_languages`]) is unit-tested headless.
 fn make_text_request() -> Option<Retained<VNRecognizeTextRequest>> {
     catch_objc(|| {
         // SAFETY: standard `[[VNRecognizeTextRequest alloc] init]`; the whole closure is inside
         // `catch` so any ObjC exception is contained.
         let req = unsafe { VNRecognizeTextRequest::init(VNRecognizeTextRequest::alloc()) };
         req.setRecognitionLevel(VNRequestTextRecognitionLevel::Accurate);
-        // Polish first, English second — Murmur's two primary languages (multilingual whisper ships
-        // Polish too). Vision falls back gracefully for other scripts.
-        let pl = NSString::from_str("pl");
-        let en = NSString::from_str("en");
-        let langs = NSArray::from_slice(&[&*pl, &*en]);
-        req.setRecognitionLanguages(&langs);
+        // Intersect our preferred languages with what THIS system's Vision actually supports (queried
+        // after the level is set — the supported set is level-dependent). Only set them when the
+        // intersection is non-empty; otherwise leave Vision's default selection (fail-open).
+        let supported = supported_recognition_languages(&req);
+        let chosen = choose_ocr_languages(&supported, PREFERRED_OCR_LANGUAGES);
+        if !chosen.is_empty() {
+            let ns_langs: Vec<Retained<NSString>> =
+                chosen.iter().map(|l| NSString::from_str(l)).collect();
+            let refs: Vec<&NSString> = ns_langs.iter().map(|r| &**r).collect();
+            let langs = NSArray::from_slice(&refs);
+            req.setRecognitionLanguages(&langs);
+        }
         req.setUsesLanguageCorrection(true);
         req
     })
@@ -304,9 +357,10 @@ fn with_rgbx_bitmap(
     .flatten()
 }
 
-/// Pixel dimensions for OCR-rendering a page whose media box is `pw × ph` points: scale up so the
-/// long edge is [`MAX_OCR_LONG_EDGE`] (never scale DOWN below native — a small page stays at least its
-/// point size), clamped so neither edge exceeds the cap. Pure arithmetic (unit-testable without FFI).
+/// Pixel dimensions for OCR-rendering a page whose media box is `pw × ph` points: scale the LONG edge
+/// to exactly [`MAX_OCR_LONG_EDGE`] — a small page is scaled UP (better OCR fidelity for low-DPI type)
+/// and an oversized page is scaled DOWN to the cap (the RAM guard: a bitmap is at most
+/// `MAX_OCR_LONG_EDGE² * 4` bytes). Pure arithmetic (unit-testable without FFI).
 fn ocr_render_pixels(pw: f64, ph: f64) -> (usize, usize) {
     // A degenerate box (either edge non-finite or <= 0) yields zero pixels — the renderer bails with
     // no allocation. Both edges must be positive-finite for a valid page.
@@ -317,11 +371,9 @@ fn ocr_render_pixels(pw: f64, ph: f64) -> (usize, usize) {
     if long_edge <= 0.0 {
         return (0, 0);
     }
-    // Scale so the long edge hits the target, but never below 1x (don't downscale small pages).
-    let scale = (MAX_OCR_LONG_EDGE / long_edge).max(1.0);
-    // Clamp the long edge to the cap regardless (a page already larger than the cap is scaled DOWN to
-    // it — the RAM guard wins over "never downscale").
-    let scale = scale.min(MAX_OCR_LONG_EDGE / long_edge);
+    // Scale the long edge to exactly the target (up for a small page, down for an oversized one — the
+    // cap is a hard RAM ceiling, so downscaling a huge page wins).
+    let scale = MAX_OCR_LONG_EDGE / long_edge;
     let w = (pw * scale).round();
     let h = (ph * scale).round();
     // Final hard ceiling on each edge (defense-in-depth against a non-finite/overflow scale).
@@ -365,6 +417,40 @@ mod tests {
     fn render_pixels_rejects_degenerate_box() {
         assert_eq!(ocr_render_pixels(0.0, 0.0), (0, 0));
         assert_eq!(ocr_render_pixels(-1.0, 100.0), (0, 0));
+    }
+
+    /// Fix 6 regression: a page SMALLER than the cap is scaled UP (not left at native size) — proves
+    /// the removed `.max(1.0)`/`.min(...)` no-op pair never gated upscaling. A 100×100pt page → the
+    /// long edge hits the target (2000px).
+    #[test]
+    fn render_pixels_scales_a_small_page_up_to_the_target() {
+        let (w, h) = ocr_render_pixels(100.0, 100.0);
+        assert_eq!((w, h), (2000, 2000), "a small page is scaled UP to the cap, not left native");
+    }
+
+    /// Fix 5 (pure logic, headless): the chosen OCR languages are our preferred set intersected with
+    /// what the system supports, in PRIORITY order (pl before en).
+    #[test]
+    fn choose_ocr_languages_intersects_in_priority_order() {
+        // Both supported → both requested, pl first.
+        let both = vec!["en".to_string(), "fr".to_string(), "pl".to_string()];
+        assert_eq!(choose_ocr_languages(&both, PREFERRED_OCR_LANGUAGES), vec!["pl", "en"]);
+        // Only English supported (an older Vision without Polish) → request only "en", never force pl.
+        let en_only = vec!["en-US".to_string(), "en".to_string(), "de".to_string()];
+        assert_eq!(choose_ocr_languages(&en_only, PREFERRED_OCR_LANGUAGES), vec!["en"]);
+        // Matching is case-insensitive (Vision may report "EN"/"PL").
+        let upper = vec!["PL".to_string(), "EN".to_string()];
+        assert_eq!(choose_ocr_languages(&upper, PREFERRED_OCR_LANGUAGES), vec!["pl", "en"]);
+    }
+
+    /// Fix 5: when NONE of our preferred languages are supported (or the probe returned nothing), the
+    /// chosen set is EMPTY — the caller then leaves Vision's own default selection (fail-open, so the
+    /// import still attempts OCR instead of forcing an unsupported language and failing "no text").
+    #[test]
+    fn choose_ocr_languages_empty_when_none_supported_falls_open() {
+        let none = vec!["ja".to_string(), "zh-Hans".to_string()];
+        assert!(choose_ocr_languages(&none, PREFERRED_OCR_LANGUAGES).is_empty());
+        assert!(choose_ocr_languages(&[], PREFERRED_OCR_LANGUAGES).is_empty(), "empty probe → empty (system default)");
     }
 
     /// A missing image FILE fails CLOSED (None) — `NSImage::initWithContentsOfFile` returns nil for a

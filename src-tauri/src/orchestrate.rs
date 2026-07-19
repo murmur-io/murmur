@@ -226,6 +226,8 @@ fn tool_label(call: &ToolCall) -> &'static str {
         ToolCall::GetOpenCommitments { .. } => "Open commitments",
         ToolCall::GetMeeting { .. } => "Meeting",
         ToolCall::GetDocument { .. } => "Document",
+        // Brain v3 audit Fix 3(b) — the document outline (structural map; explicit tool).
+        ToolCall::GetDocumentOutline { .. } => "Document outline",
         ToolCall::ListRecentMeetings { .. } => "Recent meetings",
         ToolCall::WebSearch { .. } => "Web search",
         ToolCall::CalendarLookup { .. } => "Calendar",
