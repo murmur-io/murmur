@@ -42,7 +42,11 @@ test("(a) routed /notes/:id still renders header + title + properties (embedded=
   await expect(page.locator(".note-title-input")).toHaveValue("My First Note");
   await expect(page.locator(".props")).toBeVisible();
   await expect(page.getByRole("button", { name: "Preview", exact: true })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Share", exact: true })).toBeVisible();
+  // Share is no longer a top-level header button (2026-07-19 header slim) — it lives
+  // in the ⋯ menu now. Open ⋯ and confirm "Share…" is still reachable there.
+  await expect(page.locator(".editor-head").getByRole("button", { name: "Share" })).toHaveCount(0);
+  await page.getByRole("button", { name: "More actions" }).click();
+  await expect(page.getByRole("menuitem", { name: /Share/ })).toBeVisible();
 
   // Not embedded → the section has no is-embedded class.
   await expect(page.locator("section.editor.is-embedded")).toHaveCount(0);
@@ -142,14 +146,14 @@ test("(b) embedded mount shows ONLY the body + working Ask Brain — no header/t
   await expect(body).toBeVisible();
   await expect(body).toHaveValue(/Some body text to select\./);
 
-  // CHROME IS GONE: no header, no title input, no properties bar, no backlinks,
-  // no Preview/Share toggle, and no Ask-about-this-note panel (source-scoped
-  // Brain PR-4 — the recording companion's Ask Brain tab owns Q&A, so the
-  // embedded Note tab never mounts the note-chat).
+  // CHROME IS GONE: no header, no title input, no properties bar, no relationships
+  // panel (the merged "Related" app-connections is hidden when embedded — the
+  // recording companion's Ask Brain tab owns relationships), no Preview/Share
+  // toggle, and no Ask-about-this-note panel (source-scoped Brain PR-4).
   await expect(embed.locator(".editor-head")).toHaveCount(0);
   await expect(embed.locator(".note-title-input")).toHaveCount(0);
   await expect(embed.locator(".props")).toHaveCount(0);
-  await expect(embed.locator("app-backlinks")).toHaveCount(0);
+  await expect(embed.locator("app-connections")).toHaveCount(0);
   await expect(embed.locator("app-note-chat")).toHaveCount(0);
   await expect(embed.getByRole("button", { name: "Preview", exact: true })).toHaveCount(0);
 

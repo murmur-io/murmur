@@ -229,6 +229,11 @@
   justify-content: flex-start;
 }
 .chat-bubble {
+  /* Sanity-cap the message column so long content (incl. an app-markdown citation
+     pill) can never overflow the pane's right edge (2026-07-19): `min-width: 0`
+     lets the bubble shrink below its content's intrinsic width inside the flex
+     row, and `max-width: 100%` bounds it to the row even at the 82% cap. */
+  min-width: 0;
   max-width: 82%;
   padding: var(--space-3) var(--space-4);
   border: 1px solid var(--glass-border);

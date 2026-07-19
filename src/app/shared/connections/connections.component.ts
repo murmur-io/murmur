@@ -14,71 +14,89 @@ import {
 import { RouterLink } from "@angular/router";
 
 import { IpcService } from "../../core/ipc.service";
-import type { LinkEdge, LinkKind, NoteCitation } from "../../core/models";
+import type {
+  BacklinkSource,
+  LinkEdge,
+  LinkKind,
+  NoteCitation,
+} from "../../core/models";
 import { FoldersService } from "../../services/folders.service";
 import { ToastService } from "../../services/toast.service";
 import { LinkPickerComponent } from "../../features/notes/link-picker/link-picker.component";
 
-/** One rendered semantic-suggestion confidence tier (chip color + label). */
-type ConfidenceTier = "high" | "med" | "low";
+/** The small direction/type tag shown on a Related chip. */
+type RelationTag = "linked" | "mentions" | "companion" | "related";
 
 /**
- * A precomputed DETERMINISTIC-chip view-model row (PR-9 F5). Every per-row value the
- * template used to compute via a method call (`routeFor`/`isRemovable`/`isPending`) is
- * resolved ONCE in a `computed()` here, so the template binds fields only — no method
- * re-runs every change-detection pass (the zoneless computed-only rule).
+ * ONE merged, deduped "Related" row (2026-07-19 IA consolidation). A single
+ * neighbour — whether it arrived as an outbound/incident link edge
+ * (`list_links`), an inbound backlink (`get_backlinks`), or BOTH — renders as
+ * exactly one chip here. The deterministic `edge` (when present) drives the
+ * removable `×`; a backlink-only neighbour has no removable edge. All per-row
+ * values (route / tag / removable / pending) are resolved ONCE in a `computed`
+ * so the template binds fields only (the zoneless computed-only rule).
  */
-interface DeterministicRow {
-  readonly edge: LinkEdge;
+interface RelatedRow {
+  /** Dedup identity — `${otherKind}:${otherId}`. Also the `@for` track key. */
+  readonly key: string;
+  readonly kind: "meeting" | "note" | "document";
+  readonly title: string;
   readonly route: unknown[];
+  /** The small direction/type tag ("linked" / "mentions" / "companion" / "related"). */
+  readonly tag: RelationTag;
+  /** True when this row is a user-created MANUAL link that shows a removable hover `×`. */
   readonly removable: boolean;
+  /** True while an unlink for this row's edge is in flight. */
   readonly pending: boolean;
+  /** The removable MANUAL edge behind this row (present only when `removable`). */
+  readonly edge: LinkEdge | null;
 }
 
 /**
- * A precomputed SEMANTIC-suggestion view-model row (PR-9 F5): the edge plus its
- * confidence `tier`/`label` and `route`/`pending`, all resolved in a `computed()`.
+ * One ambient SEMANTIC-suggestion chip (2026-07-19): "related, not yet linked".
+ * Rendered as a dashed chip — the chip BODY promotes (`acceptLink` materializes
+ * the `[[wikilink]]`), a hover `×` dismisses (`dismissLink`). No raw confidence
+ * `%`, no persistent Accept/Dismiss buttons (the chip IS the affordance).
  */
 interface SuggestionRow {
   readonly edge: LinkEdge;
+  readonly kind: "meeting" | "note" | "document";
+  readonly title: string;
   readonly route: unknown[];
-  readonly tier: ConfidenceTier;
-  readonly scoreLabel: string;
   readonly pending: boolean;
 }
 
 /**
- * Brain v3 PR-3 "Connections" — a self-contained panel of the persisted link
- * edges incident on one item (`list_links(kind, id)`), shown BESIDE the existing
- * "Linked mentions" backlinks chip row in the meeting Note tab and the note
- * editor. It renders two groups:
+ * "Related" (Brain v3 PR-3, IA-consolidated 2026-07-19) — a self-contained,
+ * gated panel of every relationship incident on one item, collapsed by default
+ * behind an "N related" count. It MERGES two backend reads into ONE deduped
+ * chip list:
  *
- *  - DETERMINISTIC edges (`wikilink` / `companion`) as plain link chips that route
- *    to the neighbour (`meeting` → `/meeting/:id`, `note`/`document` → `/notes/:id`),
- *    mirroring the `app-backlinks` chip visual language.
- *  - SEMANTIC suggestions (`status === "suggested"`) as rows carrying a 3-tier
- *    confidence chip (score ≥ 0.88 high / ≥ 0.84 med / ≥ 0.80 low) plus Accept /
- *    Dismiss buttons. Accept flips the edge active (and materializes the
- *    `[[Title]]` server-side); Dismiss tombstones it. Both re-fetch on success.
+ *  - the persisted link edges (`list_links(kind, id)`) — deterministic
+ *    `wikilink`/`companion`/`manual` (+ accepted semantic) chips, AND
+ *  - the inbound backlinks (`get_backlinks(kind, id)`) — the meetings/notes
+ *    that mention this item.
  *
- * SELF-LOADING (unlike the presentational `app-backlinks`, whose host owns the
- * fetch): it takes `kind` + `id` + `locked` inputs and owns the gated fetch, so a
- * host only drops the tag in. The fetch is skipped/cleared while `locked` is true
- * (never surface connections behind a lock) and re-runs on a session lock-tree
- * change (a folder unlock/relock, or screen-share relock-all) so sealed neighbours
- * drop out — or reappear — live, exactly like `graph.component`'s `_refetchOnLock`.
+ * A neighbour that appears in BOTH (an inbound wikilink) renders ONCE, keyed on
+ * `(otherKind, otherId)`, with a small direction/type tag. Semantic SUGGESTIONS
+ * (`status === "suggested"`) render as ambient dashed chips inside the same
+ * section — tap promotes (`acceptLink`), hover `×` dismisses (`dismissLink`),
+ * no `%`, no two-button rows. Manual chips keep their hover-`×` unlink.
  *
- * PR-1 (user-initiated linking) adds two write affordances over the same edges:
- *  - a `+ Link` header control that opens the single-pick {@link LinkPickerComponent}
- *    (the SAME opaque, paginated autocomplete the note editor uses) filtered to
- *    `meeting | note | document`; on pick it calls `link_items(anchor → candidate)`
- *    and re-fetches. This panel OWNS the picker's `query` / `activeIndex` / keyboard
- *    nav (the picker is presentational) via a small header `<input>`.
- *  - a hover `×` on each DETERMINISTIC chip whose edge is `manual === true`
- *    (a user-created link), which calls `unlink_items(anchor → neighbour)` and
- *    re-fetches. Non-manual chips (auto wikilink/companion, semantic) get NO `×`.
- * Both writes are gated by the same pending set as Accept/Dismiss and surface a
- * failure through the {@link ToastService} rather than leaving a stuck spinner.
+ * SELF-LOADING & GATED: it takes `kind` + `id` + `locked` and owns BOTH gated
+ * fetches, skipped/cleared while `locked` is true (never surface relationships
+ * behind a lock) and re-run on a session lock-tree change (a folder
+ * unlock/relock, screen-share relock-all) so sealed neighbours drop out — or
+ * reappear — live, exactly like `graph.component`'s `_refetchOnLock`. A late
+ * reply for a superseded `(kind, id)` / lock transition is dropped (stale
+ * guard). The optional `inlineWikilinkTitles` input suppresses a `wikilink`-edge
+ * chip whose title is ALREADY materialized inline in the note body (no visual
+ * triplication with the inline chip).
+ *
+ * PR-1 (user-initiated linking) keeps two write affordances: the `+ Link`
+ * header chooser (`link_items` via the shared opaque {@link LinkPickerComponent})
+ * and the hover-`×` unlink on a MANUAL chip (`unlink_items`). Both are gated by
+ * the same pending set and surface failures via the {@link ToastService}.
  */
 @Component({
   selector: "app-connections",
@@ -98,19 +116,37 @@ export class ConnectionsComponent {
   /** The anchored item's id; changing it re-loads the panel. */
   readonly id = input.required<string>();
   /**
-   * Whether the anchored item is currently locked/masked. While true the fetch
-   * is skipped and the edges are cleared — connections are never surfaced behind
-   * a lock (belt-and-braces with the backend's own both-endpoint visibility gate).
+   * Whether the anchored item is currently locked/masked. While true both
+   * fetches are skipped and everything is cleared — relationships are never
+   * surfaced behind a lock (belt-and-braces with the backend's own
+   * both-endpoint visibility gate).
    */
   readonly locked = input(false);
+  /**
+   * Titles of neighbours the note BODY already links inline via `[[Title]]`
+   * (2026-07-19, optional item 4). A `wikilink`-edge row whose title is in this
+   * set is suppressed from the Related list so the inline chip in the body isn't
+   * triplicated (inline chip + Related chip). Case-insensitive. Empty by default
+   * ⇒ no suppression (the routed meeting Note tab has no body text to feed).
+   * Only `wikilink` edges are filtered — a manual/companion/backlink neighbour is
+   * a distinct relationship worth showing even if also linked inline.
+   */
+  readonly inlineWikilinkTitles = input<string[]>([]);
 
   /** The visible edges for the current `(kind, id)`; `[]` while locked/loading. */
   readonly edges = signal<LinkEdge[]>([]);
+  /** The visible inbound backlinks for the current `(kind, id)`; `[]` while locked/loading. */
+  readonly backlinksIn = signal<BacklinkSource[]>([]);
   /**
-   * In-flight Accept/Dismiss/Unlink edge ids — disables that row's buttons (and its
-   * `×`) meanwhile. Keyed by `LinkEdge.id` (unlink guards on the manual chip's id).
+   * In-flight Accept/Dismiss/Unlink edge ids — disables that row's `×`/tap
+   * meanwhile. Keyed by `LinkEdge.id`.
    */
   private readonly pending = signal<ReadonlySet<number>>(new Set());
+
+  /** Whether the whole Related section is expanded past the collapsed count. */
+  readonly expanded = signal(false);
+  /** Collapsed count affordance shows the first this-many related chips. */
+  readonly limit = input(6);
 
   /** The single-pick `+ Link` chooser element (the header `<input>`) for anchoring. */
   private readonly pickerAnchor =
@@ -156,76 +192,170 @@ export class ConnectionsComponent {
   }
 
   /**
-   * Monotonic request token — a late `list_links` reply for a superseded
-   * `(kind, id)` or lock transition is dropped (stale-result guard, FE failure
-   * mode #4), the same idiom as `entity-detail`'s `_load` / `detail`'s backlinks.
+   * Monotonic request token — a late `list_links`/`get_backlinks` reply for a
+   * superseded `(kind, id)` or lock transition is dropped (stale-result guard, FE
+   * failure mode #4), the same idiom as `entity-detail`'s `_load`.
    */
   private seq = 0;
 
   /**
-   * The active/link chips — the EXACT complement of {@link suggestions}, so every edge renders in
-   * exactly one partition (no fall-through, no double-render). This is everything that is NOT a
-   * pending semantic suggestion: `wikilink`/`companion`/`manual`, any `manual`-flagged chip (a user's
-   * active link is always removable, never a suggestion — even if its collapsed `edgeType` is still
-   * `semantic`), AND an ACCEPTED semantic edge (`status !== "suggested"`) — the last case closes a
-   * pre-existing gap where an accepted semantic link between two non-owned endpoints
-   * (no `[[Title]]` to materialize, e.g. meeting↔meeting) rendered no chip at all.
+   * DETERMINISTIC edges only — everything that is NOT a pending semantic suggestion:
+   * `wikilink`/`companion`/`manual`, any `manual`-flagged chip, AND an ACCEPTED
+   * semantic edge (`status !== "suggested"`). These become "linked"/"companion"/
+   * "related" Related rows.
    */
-  readonly deterministic = computed(() =>
+  private readonly deterministic = computed(() =>
     this.edges().filter(
       (e) => !(e.edgeType === "semantic" && e.status === "suggested" && !e.manual),
     ),
   );
 
   /**
-   * Semantic suggestions (`status === "suggested"`) → Accept/Dismiss rows. A chip flagged `manual`
-   * is EXCLUDED — a user has already actively linked that pair, so it renders as a removable
-   * deterministic chip above, never as an unconfirmed suggestion (defensive twin of the backend's
-   * `edge_rank` fix that makes a `manual` edge outrank a semantic suggestion in the collapse).
+   * Semantic suggestions (`status === "suggested"`, not `manual`) → ambient
+   * dashed chips. A `manual`-flagged chip is EXCLUDED (a user already actively
+   * linked that pair — it renders as a removable Related chip, never an
+   * unconfirmed suggestion).
    */
-  readonly suggestions = computed(() =>
+  private readonly semanticSuggestions = computed(() =>
     this.edges().filter(
       (e) => e.edgeType === "semantic" && e.status === "suggested" && !e.manual,
     ),
   );
 
   /**
-   * PR-9 F5 — the DETERMINISTIC chips as a precomputed view-model. Depends on
-   * `deterministic()` (edges) AND `pending()` so a re-fetch or an in-flight
-   * Accept/Unlink recomputes the rows; the template binds fields only (no per-row
-   * method call per change-detection pass).
+   * The MERGED, DEDUPED "Related" rows (2026-07-19). Inbound backlinks and
+   * incident deterministic edges are reconciled by `(otherKind, otherId)` so a
+   * neighbour that is BOTH shows ONCE. Priority when both exist: the link EDGE
+   * wins (it carries the removable/typed relationship); a backlink-only neighbour
+   * becomes a "mentions" row. Ordering: deterministic edges first (companion >
+   * manual/wikilink > accepted-semantic, mirroring the old strongest-first
+   * intent), then backlink-only mentions. Depends on `edges()`, `backlinksIn()`,
+   * `pending()`, and `inlineWikilinkTitles()`.
    */
-  readonly deterministicRows = computed<DeterministicRow[]>(() => {
+  readonly relatedRows = computed<RelatedRow[]>(() => {
     const pending = this.pending();
-    return this.deterministic().map((edge) => ({
-      edge,
-      route: this.routeFor(edge),
-      removable: edge.manual === true,
-      pending: pending.has(edge.id),
-    }));
+    const inline = new Set(
+      this.inlineWikilinkTitles().map((t) => t.trim().toLowerCase()),
+    );
+    const seen = new Set<string>();
+    const rows: RelatedRow[] = [];
+
+    // 1) Deterministic edges → typed/removable rows (strongest identity first).
+    for (const edge of this.orderedDeterministic()) {
+      // Suppress a wikilink chip already materialized inline in the body (item 4).
+      if (
+        edge.edgeType === "wikilink" &&
+        !edge.manual &&
+        inline.has(edge.otherTitle.trim().toLowerCase())
+      ) {
+        continue;
+      }
+      const key = `${edge.otherKind}:${edge.otherId}`;
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+      rows.push({
+        key,
+        kind: edge.otherKind,
+        title: edge.otherTitle,
+        route: this.routeForKind(edge.otherKind, edge.otherId),
+        tag: this.tagForEdge(edge),
+        removable: edge.manual === true,
+        pending: pending.has(edge.id),
+        edge: edge.manual === true ? edge : null,
+      });
+    }
+
+    // 2) Inbound backlinks with no matching edge → "mentions" rows.
+    for (const bl of this.backlinksIn()) {
+      const key = `${bl.kind}:${bl.id}`;
+      if (seen.has(key)) {
+        continue; // already shown via an incident edge
+      }
+      seen.add(key);
+      rows.push({
+        key,
+        kind: bl.kind,
+        title: bl.title,
+        route: this.routeForKind(bl.kind, bl.id),
+        tag: "mentions",
+        removable: false,
+        pending: false,
+        edge: null,
+      });
+    }
+
+    return rows;
   });
 
   /**
-   * PR-9 F5 — the SEMANTIC suggestions as a precomputed view-model (tier + label +
-   * route + pending resolved once). Same dependency shape as {@link deterministicRows}.
+   * The deterministic edges in stable display order: `companion` first, then
+   * `manual`/`wikilink` links, then accepted-semantic — a modest strongest-first
+   * ordering so the most explicit relationships lead. A pure sort over the
+   * `deterministic()` set (no side effects).
    */
+  private readonly orderedDeterministic = computed<LinkEdge[]>(() => {
+    const weight = (e: LinkEdge): number => {
+      if (e.edgeType === "companion") {
+        return 0;
+      }
+      if (e.manual || e.edgeType === "manual" || e.edgeType === "wikilink") {
+        return 1;
+      }
+      return 2; // accepted semantic (or anything else)
+    };
+    return [...this.deterministic()].sort((a, b) => weight(a) - weight(b));
+  });
+
+  /** The ambient suggestion chips as a precomputed view-model (strongest-first). */
   readonly suggestionRows = computed<SuggestionRow[]>(() => {
     const pending = this.pending();
-    return this.suggestions().map((edge) => ({
-      edge,
-      route: this.routeFor(edge),
-      tier: this.tier(edge.score),
-      scoreLabel: this.scoreLabel(edge.score),
-      pending: pending.has(edge.id),
-    }));
+    return [...this.semanticSuggestions()]
+      .sort((a, b) => b.score - a.score)
+      .map((edge) => ({
+        edge,
+        kind: edge.otherKind,
+        title: edge.otherTitle,
+        route: this.routeForKind(edge.otherKind, edge.otherId),
+        pending: pending.has(edge.id),
+      }));
   });
 
+  /** The total related count (drives the collapsed "N related" affordance). */
+  readonly relatedCount = computed(() => this.relatedRows().length);
+
+  /** The Related rows to actually render — the first `limit` unless expanded. */
+  readonly visibleRelated = computed<RelatedRow[]>(() =>
+    this.expanded()
+      ? this.relatedRows()
+      : this.relatedRows().slice(0, this.limit()),
+  );
+
+  /** How many related rows are hidden behind the collapsed count. */
+  readonly hiddenRelatedCount = computed(() =>
+    Math.max(0, this.relatedCount() - this.limit()),
+  );
+
   /**
-   * Load the edges whenever `(kind, id)`, `locked`, OR the session lock-tree
-   * changes. Reading `folders.tree()` registers this effect as its dependent so a
-   * later unlock/relock re-asks the backend (sealed neighbours drop out / reappear
-   * live). A legitimate signal-writing effect (T1): async IPC keyed on inputs with
-   * a stale-result guard; the `seq` check drops a reply for a superseded item.
+   * Whether the whole section renders at all: hide entirely when there are zero
+   * related rows AND zero suggestions (the panel is auto-hidden when empty — the
+   * near-zero-footprint "Related" IA). The `+ Link` chooser lives inside the
+   * section header, so hiding when empty means a brand-new item shows no
+   * relationship UI until it has one; that's the intended minimalist default (a
+   * user reaches linking via the note body `[[` / slash menu instead).
+   */
+  readonly hasAnything = computed(
+    () => this.relatedCount() > 0 || this.suggestionRows().length > 0,
+  );
+
+  /**
+   * Load BOTH the edges and the inbound backlinks whenever `(kind, id)`,
+   * `locked`, OR the session lock-tree changes. Reading `folders.tree()`
+   * registers this effect as its dependent so a later unlock/relock re-asks the
+   * backend (sealed neighbours drop out / reappear live). A legitimate
+   * signal-writing effect (T1): async IPC keyed on inputs with a stale-result
+   * guard; the `seq` check drops a reply for a superseded item.
    */
   private readonly _load = effect(() => {
     const kind = this.kind();
@@ -237,39 +367,52 @@ export class ConnectionsComponent {
     const seq = ++this.seq;
     if (locked || !id) {
       this.edges.set([]);
+      this.backlinksIn.set([]);
       return;
     }
     void this.fetch(kind, id, seq);
   });
 
+  /**
+   * Fetch the edges AND the inbound backlinks in parallel, dropping a reply for a
+   * superseded `(kind, id)` / lock transition. `get_backlinks` takes a
+   * `SourceKind` (`meeting | note`), so a `document`-anchored panel (which can't
+   * have note-backlinks) skips the backlink read entirely.
+   */
   private async fetch(kind: LinkKind, id: string, seq: number): Promise<void> {
+    // `get_backlinks` takes a `SourceKind` (`meeting | note`), so a
+    // `document`-anchored panel (which can't have note-backlinks) skips it.
+    const backlinksP: Promise<BacklinkSource[]> =
+      kind === "meeting" || kind === "note"
+        ? this.ipc.getBacklinks(kind, id).catch(() => [] as BacklinkSource[])
+        : Promise.resolve([] as BacklinkSource[]);
     try {
-      const rows = await this.ipc.listLinks(kind, id);
+      const [rows, backlinks] = await Promise.all([
+        this.ipc.listLinks(kind, id),
+        backlinksP,
+      ]);
       if (seq !== this.seq) {
         return; // superseded by a newer item / lock transition
       }
       this.edges.set(Array.isArray(rows) ? rows : []);
+      this.backlinksIn.set(Array.isArray(backlinks) ? backlinks : []);
     } catch {
       if (seq === this.seq) {
         this.edges.set([]);
+        this.backlinksIn.set([]);
       }
     }
   }
 
-  /** The confidence tier for a semantic suggestion's cosine score (F5: row-model input). */
-  private tier(score: number): ConfidenceTier {
-    if (score >= 0.88) {
-      return "high";
+  /** The direction/type tag for a deterministic edge. */
+  private tagForEdge(e: LinkEdge): RelationTag {
+    if (e.edgeType === "companion") {
+      return "companion";
     }
-    if (score >= 0.84) {
-      return "med";
+    if (e.manual || e.edgeType === "manual" || e.edgeType === "wikilink") {
+      return "linked";
     }
-    return "low";
-  }
-
-  /** Whole-number percentage label for a suggestion's confidence chip (F5: row-model input). */
-  private scoreLabel(score: number): string {
-    return `${Math.round(score * 100)}%`;
+    return "related"; // accepted semantic
   }
 
   /** True while an Accept/Dismiss/Unlink for this edge is in flight (guards `mutate`). */
@@ -277,14 +420,20 @@ export class ConnectionsComponent {
     return this.pending().has(id);
   }
 
-  /** The click-through route array for an edge's neighbour, split by kind (F5: row-model input). */
-  private routeFor(e: LinkEdge): unknown[] {
-    return e.otherKind === "meeting"
-      ? ["/meeting", e.otherId]
-      : ["/notes", e.otherId];
+  /** The click-through route array for a neighbour, split by kind. */
+  private routeForKind(
+    kind: "meeting" | "note" | "document",
+    id: string,
+  ): unknown[] {
+    return kind === "meeting" ? ["/meeting", id] : ["/notes", id];
   }
 
-  /** Accept a suggestion → materialize server-side, then re-fetch to reflect it. */
+  /** Toggle the collapsed/expanded Related list ("N more" / "Show less"). */
+  toggleExpanded(): void {
+    this.expanded.update((v) => !v);
+  }
+
+  /** Promote a suggestion → materialize server-side, then re-fetch to reflect it. */
   accept(e: LinkEdge): void {
     void this.mutate(e.id, () => this.ipc.acceptLink(e.id));
   }
@@ -309,10 +458,10 @@ export class ConnectionsComponent {
 
   /**
    * Run an Accept/Dismiss/Unlink mutation guarded by the pending set, then re-fetch
-   * the edges for the CURRENT `(kind, id)` (never a stale closure) so the panel
-   * reflects the server truth. The seq token drops a reply for a since-changed item.
-   * A non-null `errorMsg` surfaces a toast on failure (used by Unlink; Accept/Dismiss
-   * stay silent, matching their prior behavior).
+   * the edges + backlinks for the CURRENT `(kind, id)` (never a stale closure) so the
+   * panel reflects the server truth. The seq token drops a reply for a since-changed
+   * item. A non-null `errorMsg` surfaces a toast on failure (used by Unlink; Accept/
+   * Dismiss stay silent, matching their prior behavior).
    */
   private async mutate(
     id: number,
