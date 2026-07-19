@@ -1,8 +1,47 @@
 <section class="org-item">
-  <button type="button" class="back" (click)="back()">
-    <span class="back-arrow" aria-hidden="true">←</span>
-    <span>Notes</span>
-  </button>
+  <div class="oi-main">
+    <div class="oi-col">
+      <!-- Topbar (aligned header band): back + the Ask Brain toggle. Mirrors the note editor's
+           header so the split's two pane headers line up on one divider. -->
+      <header class="oi-topbar">
+        <button type="button" class="back" (click)="back()">
+          <span class="back-arrow" aria-hidden="true">←</span>
+          <span>Notes</span>
+        </button>
+        @if (item() && !editing()) {
+          <button
+            type="button"
+            class="btn btn-ghost oi-ask-toggle"
+            [class.is-active]="orgChatOpen()"
+            [attr.aria-expanded]="orgChatOpen()"
+            (click)="toggleOrgChat()"
+          >
+            <svg
+              class="oi-ask-glyph"
+              viewBox="0 0 16 16"
+              width="13"
+              height="13"
+              fill="none"
+              aria-hidden="true"
+            >
+              <path
+                d="M8 1.5l1.3 3.2L12.5 6 9.3 7.3 8 10.5 6.7 7.3 3.5 6l3.2-1.3L8 1.5Z"
+                stroke="currentColor"
+                stroke-width="1.2"
+                stroke-linejoin="round"
+              />
+              <path
+                d="M12.5 10.5l.6 1.4 1.4.6-1.4.6-.6 1.4-.6-1.4-1.4-.6 1.4-.6.6-1.4Z"
+                stroke="currentColor"
+                stroke-width="1.1"
+                stroke-linejoin="round"
+              />
+            </svg>
+            Ask Brain
+          </button>
+        }
+      </header>
+      <div class="oi-scroll">
 
   @if (loading()) {
     <div class="oi-state card">
@@ -124,4 +163,28 @@
       </div>
     </article>
   }
+      </div>
+      <!-- /.oi-scroll -->
+    </div>
+    <!-- /.oi-col (content pane) -->
+
+    <!-- Ask Brain pane (right COLUMN) — the read-only viewer's "Ask about this note" chat, grounded
+         in THIS shared org item (pinned server-side via anchorKind="org"). Same split-view chrome as
+         the note editor: a full-height pane with its own header band + one continuous left divider.
+         Hidden while editing-in-place (a focused writing mode). -->
+    @if (orgChatOpen() && !editing() && item(); as it) {
+      <aside class="note-chat-drawer" aria-label="Ask Brain about this note">
+        <app-note-chat
+          class="note-chat"
+          [bare]="true"
+          [showClose]="true"
+          [noteId]="it.itemId"
+          [anchorKind]="'org'"
+          [anchorTitle]="it.title"
+          (closed)="toggleOrgChat()"
+        />
+      </aside>
+    }
+  </div>
+  <!-- /.oi-main -->
 </section>

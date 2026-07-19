@@ -139,6 +139,11 @@ test("connections panel: × only on manual chips (unlink), + Link chooser links 
   // Three chips render; the manual one has a × remove button, the others do not.
   await expect(panel.getByText("Manual Meeting Link")).toBeVisible();
   await expect(panel.getByText("Weekly plan")).toBeVisible();
+  // Semantic suggestions are COLLAPSED by default (opt-in, so they don't bombard the panel) —
+  // reveal them via the compact toggle before asserting the suggestion row is present.
+  const suggestToggle = panel.locator("button.cx-suggest-toggle");
+  await expect(suggestToggle).toBeVisible();
+  await suggestToggle.click();
   await expect(panel.getByText("A suggested note")).toBeVisible();
 
   // Exactly ONE remove (×) button — on the manual chip only.

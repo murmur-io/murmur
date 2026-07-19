@@ -9992,6 +9992,34 @@ impl Db {
             .unwrap()
     }
 
+    /// TEST-ONLY: insert a `status='suggested'` semantic edge and return its id, so a `commands.rs`
+    /// test can drive `accept_link_inner` (the private `upsert_link_tx` is not reachable cross-module).
+    #[cfg(test)]
+    pub(crate) fn seed_suggested_semantic_link(
+        &self,
+        src_kind: &str,
+        src_id: &str,
+        dst_kind: &str,
+        dst_id: &str,
+        score: f64,
+    ) -> Result<i64> {
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        Self::upsert_link_tx(
+            &tx, src_kind, src_id, dst_kind, dst_id, "semantic", score, "auto", "suggested",
+            1_700_000_000_000,
+        )?;
+        let id: i64 = tx
+            .query_row(
+                "SELECT id FROM links WHERE edge_type='semantic' AND status='suggested' LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(map_err)?;
+        tx.commit().map_err(map_err)?;
+        Ok(id)
+    }
+
     /// PURGE every link row whose SRC OR DST is a sealed/deleted meeting or document (a note id IS a
     /// `documents` id, so `document_ids` covers the `note` kind too). Runs INSIDE an existing seal /
     /// delete tx so a link — which reveals a neighbour's existence + title — never outlives the

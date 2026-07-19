@@ -7884,14 +7884,24 @@ pub fn accept_link(state: State<'_, AppState>, id: i64) -> Result<(), AppError> 
 }
 
 pub(crate) fn accept_link_inner(state: &AppState, id: i64) -> Result<(), AppError> {
-    let _lifecycle = lifecycle_guard(state);
-    let Some((src_kind, src_id, dst_kind, dst_id, _et, _status)) = state.db.link_by_id(id)? else {
-        return Err(AppError::InvalidArg(format!("no link {id}")));
+    // SCOPE the lifecycle guard tightly around the row-flip ONLY, then RELEASE it before the
+    // note-body materialize below. That callee (`materialize_accepted_link` → `update_note_inner` /
+    // `update_note_doc_inner`) takes the guard ITSELF and re-checks the folder gate; holding it
+    // across would re-enter the non-reentrant `Mutex<()>` and DEADLOCK — the exact app-hang seen when
+    // accepting a suggestion between two OWNED notes (materialize actually runs). Mirrors
+    // `link_items_inner`'s scoping; lock order `lifecycle ⊃ db`.
+    let (src_kind, src_id, dst_kind, dst_id) = {
+        let _lifecycle = lifecycle_guard(state);
+        let Some((src_kind, src_id, dst_kind, dst_id, _et, _status)) = state.db.link_by_id(id)?
+        else {
+            return Err(AppError::InvalidArg(format!("no link {id}")));
+        };
+        // Flip the row: the graph edge is active even if the .md materialize below is skipped
+        // (e.g. neither endpoint is a locally-owned editable note). The panel reflects the accept.
+        state.db.accept_link(id)?;
+        (src_kind, src_id, dst_kind, dst_id)
     };
     let unlocked = unlocked_snapshot(state)?;
-    // Flip the row first: the graph edge is active even if the .md materialize below is skipped
-    // (e.g. neither endpoint is a locally-owned editable note). The panel reflects the accept.
-    state.db.accept_link(id)?;
     // A semantic edge is undirected — materialize the neighbour's [[Title]] into whichever endpoint
     // is a LOCAL, session-VISIBLE note we own the markdown of. Try src's note first, then dst's.
     // Best-effort: a materialize skip/failure never rolls back the accept.
@@ -8458,6 +8468,11 @@ pub async fn ask_vault(
     history: Vec<ChatTurn>,
     ask_thread_id: Option<String>,
     explicit_sources: Option<Vec<crate::storage::models::SourceRef>>,
+    // The org-item viewer pins the read-only SHARED note being viewed (an org item is not a valid
+    // local `SourceRef`, so it can't ride `explicit_sources`). Present ⇒ the deterministic floor
+    // path is used and the item is packed FIRST, gated by `get_org_item` (tombstoned/disabled-org
+    // ⇒ nothing). FE camelCase `pinnedOrgItemId`. `None`/empty ⇒ byte-identical to before.
+    pinned_org_item_id: Option<String>,
 ) -> Result<AskVaultResult, AppError> {
     if question.trim().is_empty() {
         return Err(AppError::InvalidArg("question is empty".into()));
@@ -8479,9 +8494,9 @@ pub async fn ask_vault(
     // agentic vault-wide search is SKIPPED (the user controls the context, so a scoped Ask never
     // pulls unlisted vault items). `None`/empty ⇒ this whole block is a no-op and the path below is
     // BYTE-IDENTICAL to before.
-    let pinned_sources: Option<Vec<crate::storage::models::SourceRef>> =
-        explicit_sources.filter(|s| !s.is_empty());
-    if let Some(sources) = pinned_sources {
+    let pinned_sources = explicit_sources.filter(|s| !s.is_empty());
+    let pinned_org = pinned_org_item_id.filter(|s| !s.trim().is_empty());
+    if pinned_sources.is_some() || pinned_org.is_some() {
         let unlocked = unlocked_snapshot(state.inner())?;
         let memory_brief = gated_memory_brief_for_injection(state.inner(), &unlocked, &question);
         let reranker = crate::rerank::active_reranker(
@@ -8498,7 +8513,8 @@ pub async fn ask_vault(
             &memory_brief,
             Some(reranker),
             &state.heavy_inference,
-            Some(sources),
+            pinned_sources,
+            pinned_org,
         )
         .await;
     }
@@ -8552,6 +8568,7 @@ pub async fn ask_vault(
         Some(reranker),
         &state.heavy_inference,
         None, // whole-vault path: no explicit sources ⇒ the existing search corpus, unchanged.
+        None, // …and no pinned org item — this is the vault-wide fallthrough.
     )
     .await
 }
@@ -8801,6 +8818,7 @@ fn build_ask_vault_floor_prompt(
     memory_brief: &str,
     reranker: Option<&dyn crate::rerank::Reranker>,
     explicit_sources: Option<&[crate::storage::models::SourceRef]>,
+    pinned_org_item_id: Option<&str>,
 ) -> Result<AskFloorPrompt, AppError> {
     // Budget on the ASK-role provider's RESOLVED connection — the corpus egresses to it. With
     // role keys absent this is the legacy `provider_id` for EVERY brain_backend (the pre-role
@@ -8813,10 +8831,41 @@ fn build_ask_vault_floor_prompt(
     // gated link-expansion) — the user controls the context. Same `unlocked` visibility gate as
     // every search leg (a sealed source/neighbour contributes nothing). `None` ⇒ the exact existing
     // whole-vault search below, byte-for-byte.
-    let (corpus, sources) = if let Some(sources) = explicit_sources.filter(|s| !s.is_empty()) {
-        crate::summarize::vault_context::build_vault_context_pinned_visible(
-            db, sources, &ask_conn, unlocked,
-        )?
+    let has_pinned_sources = explicit_sources.map(|s| !s.is_empty()).unwrap_or(false);
+    let (corpus, sources) = if has_pinned_sources || pinned_org_item_id.is_some() {
+        // PINNED corpus (deterministic; vault-wide search SKIPPED). Pack the pinned ORG item FIRST
+        // (the shared note being viewed — pinned so it's ALWAYS in context; the local Brain's search
+        // never surfaces org-feed content), then the explicit sources (+ their gated link-expansion).
+        // In current callers the two are mutually exclusive — the org viewer sends only the org id,
+        // the note editor sends only explicit sources — so no double-budget concern arises.
+        let budget = crate::summarize::vault_context::budget_for(&ask_conn);
+        let mut corpus = String::new();
+        if let Some(org_id) = pinned_org_item_id {
+            corpus.push_str(&crate::summarize::vault_context::pack_pinned_org_item(
+                db, org_id, &ask_conn,
+            )?);
+        }
+        let sources = if let Some(srcs) = explicit_sources.filter(|s| !s.is_empty()) {
+            let (src_corpus, src_sources) =
+                crate::summarize::vault_context::build_vault_context_pinned_visible(
+                    db, srcs, &ask_conn, unlocked,
+                )?;
+            if !corpus.is_empty() && !src_corpus.is_empty() {
+                corpus.push_str("\n\n");
+            }
+            // The pinned org item is packed FIRST + is the primary anchor. If a caller supplies BOTH
+            // a pinned org id AND explicit sources (the org viewer's Ask WITH user-added scope), cap
+            // the sources to the REMAINING budget so the combined corpus honors ONE budget, not two —
+            // load-bearing for tiny local (Ollama) context windows. `chars().take` is char-boundary
+            // safe (mirrors pack_notes/pack_pinned_org_item). Org-only or sources-only ⇒ this is a
+            // no-op (remaining == full budget, and the un-pinned side is empty).
+            let remaining = budget.saturating_sub(corpus.len());
+            corpus.extend(src_corpus.chars().take(remaining));
+            src_sources
+        } else {
+            Vec::new()
+        };
+        (corpus, sources)
     } else if config.semantic_search_enabled {
         let embedder = crate::embed::active_embedder();
         // QUERY side: use the e5 `query:` prefix (asymmetric with the `passage:` index side).
@@ -8865,6 +8914,7 @@ async fn ask_vault_floor(
     reranker: Option<Box<dyn crate::rerank::Reranker>>,
     heavy: &std::sync::Arc<tokio::sync::Semaphore>,
     explicit_sources: Option<Vec<crate::storage::models::SourceRef>>,
+    pinned_org_item_id: Option<String>,
 ) -> Result<AskVaultResult, AppError> {
     // `build_ask_vault_floor_prompt` does the LOCAL/on-device work — query embedding (Candle/
     // Metal) + hybrid FTS∪vector retrieval + reranker inference — synchronously. This is exactly
@@ -8891,6 +8941,7 @@ async fn ask_vault_floor(
             &memory_brief_owned,
             reranker.as_deref(),
             explicit_sources.as_deref(),
+            pinned_org_item_id.as_deref(),
         )
     })
     .await
@@ -9176,7 +9227,7 @@ mod ask_vault_tests {
         let (want_system, want_user) =
             crate::summarize::vault_chat::build(&corpus, &history, q, "");
 
-        match build_ask_vault_floor_prompt(&db, &cfg, &unlocked, q, &history, "", None, None)
+        match build_ask_vault_floor_prompt(&db, &cfg, &unlocked, q, &history, "", None, None, None)
             .unwrap()
         {
             AskFloorPrompt::Ready {
@@ -9209,7 +9260,8 @@ mod ask_vault_tests {
 
         // The empty-vault early return keeps the EXACT pre-change canned answer.
         let empty = tmp_db();
-        match build_ask_vault_floor_prompt(&empty, &cfg, &unlocked, q, &[], "", None, None).unwrap()
+        match build_ask_vault_floor_prompt(&empty, &cfg, &unlocked, q, &[], "", None, None, None)
+            .unwrap()
         {
             AskFloorPrompt::Empty(r) => {
                 assert_eq!(
@@ -9253,6 +9305,7 @@ mod ask_vault_tests {
             "",
             None,
             &std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+            None,
             None,
         ));
         assert!(
@@ -19859,6 +19912,46 @@ mod lifecycle_tests {
         assert!(
             matches!(err, AppError::Locked(_)),
             "a sealed document endpoint must refuse with Locked; got {err:?}"
+        );
+    }
+
+    /// REGRESSION (app-hang on Accept): `accept_link_inner` held the non-reentrant `lifecycle_guard`
+    /// across `materialize_accepted_link` → `update_note_doc_inner`, which re-takes the SAME guard →
+    /// a same-thread DEADLOCK whenever the accepted pair has an OWNED note to materialize `[[Title]]`
+    /// into (a NOTE↔NOTE accept — the exact case the user hit). We run the accept on a worker thread
+    /// and BOUND the wait, so the deadlock surfaces as a clean FAILURE instead of wedging the whole
+    /// suite; on the fixed code it completes in milliseconds AND materializes the neighbour link.
+    #[test]
+    fn accept_link_does_not_deadlock_and_materializes_on_owned_notes() {
+        use std::sync::mpsc;
+        let state = std::sync::Arc::new(build_state("accept-no-deadlock"));
+        make_open_folder(&state.db, "f1", "Notes");
+        seed_note_doc_cmd(&state.db, "n1", "f1", "Note One", "body one\n");
+        seed_note_doc_cmd(&state.db, "n2", "f1", "Note Two", "body two\n");
+        // A SUGGESTED semantic edge between two OWNED notes → accept WILL materialize (the hang path).
+        let link_id = state
+            .db
+            .seed_suggested_semantic_link("note", "n1", "note", "n2", 0.9)
+            .unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        let worker = state.clone();
+        let handle = std::thread::spawn(move || {
+            let _ = tx.send(accept_link_inner(&worker, link_id));
+        });
+        // If it re-enters the guard it blocks forever; a bounded recv turns that into a test failure.
+        let result = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("accept_link_inner DEADLOCKED — did not finish in 10s (re-entrant lifecycle guard)");
+        result.expect("accept_link_inner returned an error");
+        handle.join().unwrap();
+
+        // The accept materialized the neighbour's [[Title]] into an owned note (the very path that hung).
+        let n1 = state.db.get_note_row("n1").unwrap().unwrap();
+        let n2 = state.db.get_note_row("n2").unwrap().unwrap();
+        assert!(
+            n1.text.contains("[[") || n2.text.contains("[["),
+            "accept must materialize a [[Title]] wikilink into one of the owned notes"
         );
     }
 
@@ -30758,6 +30851,71 @@ mod lifecycle_tests {
         assert!(state.db.get_org_item("it-g").unwrap().is_none());
         // Unknown id → None.
         assert!(state.db.get_org_item("nope").unwrap().is_none());
+    }
+
+    /// PINNED ORG GROUNDING (RED-before-GREEN): `pack_pinned_org_item` — the Ask-floor pack that
+    /// grounds "Ask about this shared note" in the org-item viewer — must ground a LIVE item's
+    /// content, and pack NOTHING for a tombstoned item OR an item from a context-DISABLED org. It
+    /// rides the SAME `get_org_item` gate as the read-only viewer, so no withdrawn/stale org content
+    /// can ever reach the Ask prompt. (Without the gate this would leak disabled/tombstoned content
+    /// straight into a cloud egress prompt — the exact class of bug the lock-security review hunts.)
+    #[test]
+    fn pack_pinned_org_item_grounds_live_and_gates_tombstoned_and_disabled() {
+        let state = build_state("pack-pinned-org");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        state
+            .db
+            .upsert_org_item(
+                "it-p",
+                "org-1",
+                1,
+                "anna",
+                "Konga costs",
+                "GPT via the Cloud Gateway is cheap and worthwhile.",
+                "2026-07-10T09:00:00Z",
+                1,
+                1,
+                &[7u8; 32],
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        // LIVE: the item's title + content are packed (with a citation header).
+        let packed =
+            crate::summarize::vault_context::pack_pinned_org_item(&state.db, "it-p", "anthropic")
+                .unwrap();
+        assert!(
+            packed.contains("Konga costs") && packed.contains("Cloud Gateway"),
+            "a live pinned org item must ground its title + content"
+        );
+
+        // DISABLED org ⇒ NOTHING packed (the per-instance toggle withdraws org content from Ask).
+        state.db.set_org_context_enabled("org-1", false).unwrap();
+        assert!(
+            crate::summarize::vault_context::pack_pinned_org_item(&state.db, "it-p", "anthropic")
+                .unwrap()
+                .is_empty(),
+            "a disabled org's item must contribute NOTHING to the Ask context"
+        );
+        state.db.set_org_context_enabled("org-1", true).unwrap();
+
+        // TOMBSTONED ⇒ NOTHING packed (a withdrawn item never grounds an answer).
+        state.db.tombstone_org_item("it-p").unwrap();
+        assert!(
+            crate::summarize::vault_context::pack_pinned_org_item(&state.db, "it-p", "anthropic")
+                .unwrap()
+                .is_empty(),
+            "a tombstoned org item must contribute NOTHING to the Ask context"
+        );
+
+        // Unknown id ⇒ NOTHING.
+        assert!(
+            crate::summarize::vault_context::pack_pinned_org_item(&state.db, "nope", "anthropic")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// PER-INSTANCE ORG TOGGLE (RED-before-GREEN): `get_org_item` — the single-item read behind

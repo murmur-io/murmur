@@ -1588,12 +1588,16 @@ export class IpcService {
     history: ChatTurn[],
     askThreadId?: string,
     explicitSources?: SourceRef[],
+    pinnedOrgItemId?: string,
   ): Promise<AskVaultResult> {
     return invoke<AskVaultResult>("ask_vault", {
       question,
       history,
       askThreadId,
       ...(explicitSources?.length ? { explicitSources } : {}),
+      // Org-item viewer: pin a read-only SHARED (org-feed) note into the Ask context server-side
+      // (the local Brain never retrieves org content via search, so pinning is what grounds it).
+      ...(pinnedOrgItemId ? { pinnedOrgItemId } : {}),
     });
   }
 

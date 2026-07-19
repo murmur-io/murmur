@@ -81,11 +81,25 @@
     </div>
   }
 
-  <!-- SEMANTIC suggestions — a confidence chip + Accept / Dismiss per row. -->
+  <!-- SEMANTIC suggestions — COLLAPSED by default (opt-in): the auto-suggester can surface many
+       low-signal rows, so they no longer bombard the panel. A compact toggle reveals the confidence
+       chip + Accept / Dismiss rows on demand. -->
   @if (suggestions().length) {
-    <div class="cx-group">
-      <span class="cx-label">Suggested connections</span>
-      @for (e of suggestions(); track e.id) {
+    <div class="cx-group cx-group--suggested">
+      <button
+        type="button"
+        class="cx-suggest-toggle"
+        [attr.aria-expanded]="suggestionsExpanded()"
+        (click)="toggleSuggestions()"
+      >
+        <span class="cx-suggest-caret" [class.is-open]="suggestionsExpanded()" aria-hidden="true">›</span>
+        <span class="cx-suggest-label"
+          >{{ suggestions().length }}
+          {{ suggestions().length === 1 ? "suggested connection" : "suggested connections" }}</span
+        >
+      </button>
+      @if (suggestionsExpanded()) {
+        @for (e of suggestions(); track e.id) {
         <div class="cx-row" [class.is-pending]="isPending(e.id)">
           <a class="cx-chip cx-chip--suggested" [routerLink]="routeFor(e)">
             @switch (e.otherKind) {
@@ -125,6 +139,7 @@
             </button>
           </div>
         </div>
+        }
       }
     </div>
   }

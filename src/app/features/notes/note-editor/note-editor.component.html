@@ -11,7 +11,14 @@
     ></button>
   }
 
-  <!-- ===== Sticky header: breadcrumb+Move · Edit/Preview · Share · ⋯ =====
+  <!-- ===== Body: a full-height SPLIT VIEW — the note COLUMN (its own header + the
+       scrolling document) beside the (optional) Ask Brain drawer COLUMN. ONE
+       continuous vertical divider runs top-to-bottom between them, and the two
+       column headers share ONE horizontal divider — a clean two-pane layout, not a
+       full-width bar that welds the panes together at the top (2026-07-19). ===== -->
+  <div class="editor-main">
+  <div class="editor-col">
+  <!-- ===== Note header: breadcrumb+Move · Edit/Preview · Share · ⋯ =====
        No local "← Notes" back button (2026-07-12): the main sidebar is ALWAYS
        visible now, so it IS the way back — see NavHistoryService.
        HIDDEN when embedded (the host tab owns its own chrome). -->
@@ -114,6 +121,39 @@
           </button>
         </div>
 
+        <!-- Ask Brain — toggles the right-side chat drawer (below). Hidden when
+             locked (like Share). Inline SVG spark glyph (no icon lib, per convention). -->
+        <button
+          type="button"
+          class="btn btn-ghost head-btn head-chat-btn"
+          [class.is-active]="noteChatOpen()"
+          [attr.aria-expanded]="noteChatOpen()"
+          (click)="toggleNoteChat()"
+        >
+          <svg
+            class="head-chat-glyph"
+            viewBox="0 0 16 16"
+            width="13"
+            height="13"
+            fill="none"
+            aria-hidden="true"
+          >
+            <path
+              d="M8 1.5l1.3 3.2L12.5 6 9.3 7.3 8 10.5 6.7 7.3 3.5 6l3.2-1.3L8 1.5Z"
+              stroke="currentColor"
+              stroke-width="1.2"
+              stroke-linejoin="round"
+            />
+            <path
+              d="M12.5 10.5l.6 1.4 1.4.6-1.4.6-.6 1.4-.6-1.4-1.4-.6 1.4-.6.6-1.4Z"
+              stroke="currentColor"
+              stroke-width="1.1"
+              stroke-linejoin="round"
+            />
+          </svg>
+          Ask Brain
+        </button>
+
         <button
           type="button"
           class="btn btn-ghost head-btn"
@@ -199,7 +239,7 @@
   </header>
   }
 
-  <!-- ===== Body ===== -->
+  <!-- ===== Body: the note column's scroll region ===== -->
   <div class="editor-body">
     @if (loading()) {
       <p class="editor-status">Loading note…</p>
@@ -565,22 +605,32 @@
             </div>
           }
 
-          <!-- ASK-ABOUT-THIS-NOTE (Brain v3, source-scoped Brain PR-4) — a
-               grounded Q&A panel below the body, scoped to this note + its
-               active links. ROUTED mode ONLY: hidden when embedded (the
-               recording companion's Note tab is pure writing — its Ask Brain
-               tab owns Q&A) and impossible behind a lock (this `@else` branch
-               is the not-locked, note-loaded state). -->
-          @if (!embedded()) {
-            <app-note-chat
-              class="note-chat"
-              [noteId]="doc.id"
-              [anchorTitle]="doc.title"
-            />
-          }
         </article>
       }
     }
+  </div>
+  </div>
+  <!-- /.editor-col (note pane) -->
+
+  <!-- ===== Ask Brain drawer (right COLUMN) — the "Ask about this note" chat as a
+       full-height PANE beside the note column: its own header band (aligned with the
+       note header) + ONE continuous left divider. The chat owns its header + close ×
+       (bare + showClose). ROUTED mode ONLY (hidden when embedded), never behind a
+       lock, only when the toggle is open. ===== -->
+  @if (!embedded() && noteChatOpen() && note(); as doc) {
+    @if (!doc.locked) {
+      <aside class="note-chat-drawer" aria-label="Ask Brain about this note">
+        <app-note-chat
+          class="note-chat"
+          [bare]="true"
+          [showClose]="true"
+          [noteId]="doc.id"
+          [anchorTitle]="doc.title"
+          (closed)="toggleNoteChat()"
+        />
+      </aside>
+    }
+  }
   </div>
 
   <!-- ===== Selection formatting bubble + Brain popover (FP3) =====

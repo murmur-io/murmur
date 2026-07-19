@@ -87,6 +87,18 @@ export class ConnectionsComponent {
    */
   private readonly pending = signal<ReadonlySet<number>>(new Set());
 
+  /**
+   * Whether the (opt-in) semantic-suggestions list is expanded. COLLAPSED by default so the
+   * content-similarity auto-suggester never bombards the panel — the user opts in per note via the
+   * compact toggle, revealing the Accept/Dismiss rows only on demand.
+   */
+  readonly suggestionsExpanded = signal(false);
+
+  /** Toggle the collapsed/expanded state of the opt-in suggested-connections list. */
+  toggleSuggestions(): void {
+    this.suggestionsExpanded.update((v) => !v);
+  }
+
   /** The single-pick `+ Link` chooser element (the header `<input>`) for anchoring. */
   private readonly pickerAnchor =
     viewChild<ElementRef<HTMLElement>>("pickerAnchor");
