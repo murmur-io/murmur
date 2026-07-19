@@ -9,13 +9,11 @@ import {
   viewChild,
 } from "@angular/core";
 import type {
-  BacklinkSource,
   ClaimAlignment,
   GraphPayload,
 } from "../../../core/models";
 import { MarkdownComponent } from "../../../shared/markdown/markdown.component";
 import { AssistantSourcesComponent } from "../../../shared/assistant-sources/assistant-sources.component";
-import { BacklinksComponent } from "../../../shared/backlinks/backlinks.component";
 import { ConnectionsComponent } from "../../../shared/connections/connections.component";
 import { MoveToMenuComponent } from "../../folders/move-to-menu/move-to-menu.component";
 import { MeetingActionsComponent } from "../meeting-actions/meeting-actions.component";
@@ -123,7 +121,6 @@ export interface AssistantQa {
   imports: [
     MarkdownComponent,
     AssistantSourcesComponent,
-    BacklinksComponent,
     ConnectionsComponent,
     MoveToMenuComponent,
     MeetingActionsComponent,
@@ -145,12 +142,6 @@ export class NotePanelComponent {
   readonly note = input<ParsedNote | null>(null);
   /** The persisted in-meeting assistant Q&A. */
   readonly interactions = input<AssistantQa[]>([]);
-  /**
-   * Note↔note backlinks ("Linked mentions") — the VISIBLE inbound sources
-   * (meetings + notes) that link this meeting. Empty when the meeting is
-   * locked (the shell skips the gated fetch there). Rendered below the note body.
-   */
-  readonly backlinks = input<BacklinkSource[]>([]);
   /**
    * Per-claim audio receipts (Brain v3 PR-5): each note line that aligned to a
    * transcript segment (backend `get_note_receipts`, `meeting_is_unlocked`-gated,

@@ -2163,8 +2163,133 @@ impl Db {
             });
         }
         let edges = Self::collapse_manual_duplicate_edges(edges);
+        // COMPANION COLLAPSE (read-time): fold a meeting + its auto-linked companion note into ONE
+        // chip (prefer the meeting, the canonical entity). Pure in-memory transform over the
+        // already-both-endpoint-gated `edges` — no `links` row is touched; the only DB read it adds
+        // is a metadata-only (id + meeting_id) lookup on note endpoints ALREADY in the visible set.
+        let edges = self.collapse_meeting_companion_note_edges(edges)?;
         tracing::debug!(target: "links", count = edges.len(), "links_for_visible resolved");
         Ok(edges)
+    }
+
+    /// READ-TIME COMPANION COLLAPSE (2026-07-19): when the already-visibility-gated edge set for an
+    /// anchor contains BOTH a `(meeting, m)` neighbour edge AND a `(note, n)` neighbour edge where `n`
+    /// is `m`'s STRUCTURAL companion note (`documents.meeting_id(n) == m`), collapse them to ONE chip
+    /// by DROPPING the companion-note edge and keeping the MEETING (the canonical entity). This closes
+    /// the "same title shows twice — once as a Meeting chip, once as a Note chip" duplicate that arises
+    /// because a companion note is auto-created with the meeting's exact title and both get linked.
+    ///
+    /// Lock model — this is a PURE in-memory transform (INVARIANTS, in order):
+    /// 1. **No stored row is deleted or modified.** It rewrites ONLY the `Vec<LinkEdge>` about to be
+    ///    returned; the `links` rows (and their accept/dismiss/unlink handles) are untouched.
+    /// 2. **Never bypasses the gate.** It ONLY inspects endpoints ALREADY present in `edges` — every
+    ///    one passed BOTH-endpoint gating upstream. The `documents` lookup it adds is METADATA ONLY
+    ///    (`id`, `meeting_id` — neither is content) and is scoped to note-endpoint ids already in the
+    ///    set, so it gates nothing new in and leaks nothing.
+    /// 3. **No silent reappear / no lost removability (the removal footgun).** It collapses ONLY when
+    ///    BOTH the companion-note edge AND its meeting edge are AUTO (`manual == false`, i.e. the
+    ///    `companion`/`wikilink`/`semantic` derivations). If EITHER edge is `manual`, it does NOT
+    ///    collapse and both chips survive — because the user deliberately created that link and MUST be
+    ///    able to see and remove it, and because a collapsed manual note-edge could otherwise vanish
+    ///    invisibly (or, if the surviving meeting were later removed, silently reappear as a lone chip).
+    ///    A clean manual-pair collapse would need to also fold the removability of the dropped edge onto
+    ///    the survivor and re-materialize it on meeting-removal — deferred; the auto-only rule is the
+    ///    safe, correct behavior here.
+    /// 4. **Degrades gracefully.** Companion note present but its meeting NOT a neighbour → keep the
+    ///    note (no meeting to fold into). Meeting present but its companion note NOT a neighbour → keep
+    ///    the meeting (nothing to drop). Two notes that merely SHARE a title but are not tied via
+    ///    `documents.meeting_id` → keep both (the relation is STRUCTURAL via `meeting_id`, never a
+    ///    title-string match). No companion notes in the set → the metadata query is skipped entirely.
+    ///
+    /// Serves BOTH anchor kinds (viewing a note or a meeting) since `links_for_visible` does, and any
+    /// caller (MCP/graph) that reuses it benefits identically. Logs a count only, never titles/ids.
+    fn collapse_meeting_companion_note_edges(
+        &self,
+        edges: Vec<crate::storage::models::LinkEdge>,
+    ) -> Result<Vec<crate::storage::models::LinkEdge>> {
+        // Fast exit: nothing to fold unless the set has BOTH a note edge and a meeting edge.
+        let note_ids: Vec<String> = edges
+            .iter()
+            .filter(|e| e.other_kind == "note")
+            .map(|e| e.other_id.clone())
+            .collect();
+        let has_meeting = edges.iter().any(|e| e.other_kind == "meeting");
+        if note_ids.is_empty() || !has_meeting {
+            return Ok(edges);
+        }
+        // Which of those note endpoints are companion notes, and of which meeting? METADATA ONLY
+        // (id + meeting_id, no content) and scoped to note ids ALREADY in the visible set — this
+        // gates nothing new in. Built as a placeholder IN-list so ids never interpolate into SQL.
+        let placeholders = (1..=note_ids.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let comp_of: std::collections::HashMap<String, String> = {
+            let conn = self.lock();
+            let sql = format!(
+                "SELECT id, meeting_id FROM documents
+                   WHERE kind = 'note' AND meeting_id IS NOT NULL AND id IN ({placeholders})"
+            );
+            let mut stmt = conn.prepare(&sql).map_err(map_err)?;
+            let params = rusqlite::params_from_iter(note_ids.iter());
+            let rows = stmt
+                .query_map(params, |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })
+                .map_err(map_err)?;
+            let mut out = std::collections::HashMap::new();
+            for r in rows {
+                let (nid, mid) = r.map_err(map_err)?;
+                out.insert(nid, mid);
+            }
+            out
+        };
+        if comp_of.is_empty() {
+            return Ok(edges); // no companion notes in the set → nothing to fold.
+        }
+        // The meeting endpoints present in the set, and whether each is on a `manual` edge — a
+        // meeting reached by a manual link must NOT absorb (invariant 3). One meeting could
+        // theoretically appear on both a manual and an auto edge (distinct edge rows); a manual on
+        // EITHER side blocks the collapse for that pair, so mark a meeting manual if ANY of its edges is.
+        let mut meeting_manual: std::collections::HashMap<String, bool> =
+            std::collections::HashMap::new();
+        for e in &edges {
+            if e.other_kind == "meeting" {
+                let entry = meeting_manual.entry(e.other_id.clone()).or_insert(false);
+                *entry = *entry || e.manual;
+            }
+        }
+        let before = edges.len();
+        let kept: Vec<crate::storage::models::LinkEdge> = edges
+            .into_iter()
+            .filter(|e| {
+                // Only a NON-manual companion-note edge whose meeting is a NON-manual neighbour in the
+                // set is dropped; everything else survives untouched.
+                if e.other_kind != "note" || e.manual {
+                    return true; // meetings, documents, manual note-edges → always keep.
+                }
+                let Some(mid) = comp_of.get(&e.other_id) else {
+                    return true; // not a companion note → keep.
+                };
+                match meeting_manual.get(mid) {
+                    // The companion's meeting is a neighbour AND that meeting edge is auto → fold
+                    // (drop the note edge, keep the meeting).
+                    Some(false) => false,
+                    // Meeting is a neighbour but reached MANUALLY → keep both (removability).
+                    Some(true) => true,
+                    // The companion's meeting is NOT a neighbour → keep the note (nothing to fold into).
+                    None => true,
+                }
+            })
+            .collect();
+        if kept.len() != before {
+            tracing::debug!(
+                target: "links",
+                dropped = before - kept.len(),
+                "collapse_meeting_companion_note_edges folded companion note(s) into their meeting"
+            );
+        }
+        Ok(kept)
     }
 
     /// note↔meeting-links PR-1 — DISPLAY DEDUPE (avoid double chips): a note→meeting `manual` link

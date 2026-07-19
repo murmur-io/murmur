@@ -15,12 +15,16 @@
   gap: var(--space-2);
 }
 
-/* One labelled cluster (deterministic chips, or suggestion rows). */
+/* One labelled cluster (the merged Related chips, or the suggestion chips). */
 .cx-group {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
   gap: var(--space-2);
+}
+/* The ambient "Suggested" cluster reads as a quieter tier below the real links. */
+.cx-group--suggest {
+  opacity: 0.92;
 }
 
 .cx-label {
@@ -33,7 +37,24 @@
 }
 /* The header label sits INLINE beside the `+ Link` control, not full-width. */
 .cx-label--head {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
   flex: 0 1 auto;
+}
+
+/* The "Related · N" count badge — a quiet neutral pill, mirroring `.props-count`. */
+.cx-count {
+  min-width: 18px;
+  padding: 0 5px;
+  border-radius: var(--radius-pill);
+  background: var(--surface-hover);
+  color: var(--text-secondary);
+  font-size: 10px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0;
+  text-align: center;
 }
 
 /* `+ Link` chooser trigger — a quiet ghost pill (leans on the token language, not
@@ -194,7 +215,7 @@
   white-space: nowrap;
 }
 
-/* Edge-type hint on the deterministic chip. */
+/* Edge-type / direction tag on a Related chip ("linked"/"mentions"/…). */
 .cx-edge {
   flex: 0 0 auto;
   color: var(--text-muted);
@@ -203,81 +224,49 @@
   letter-spacing: 0.04em;
 }
 
-/* --- Semantic suggestion rows ------------------------------------------ */
-.cx-row {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--space-2);
-  transition: opacity var(--transition-fast);
-}
-.cx-row.is-pending {
-  opacity: 0.55;
-}
-
-.cx-chip--suggested {
-  border-style: dashed;
-}
-
-/* 3-tier confidence chip. */
-.cx-score {
-  flex: 0 0 auto;
-  padding: 1px 6px;
+/* "+N more" / "Show less" — collapses the Related list (the app-backlinks idiom). */
+.cx-more {
+  padding: 6px var(--space-3);
+  background: transparent;
+  border: 1px dashed var(--border-strong);
   border-radius: var(--radius-pill);
-  font-family: var(--font-mono);
-  font-size: 10px;
-  font-weight: 700;
-  font-variant-numeric: tabular-nums;
-  letter-spacing: 0.02em;
-}
-.cx-score--high {
-  background: var(--success-soft);
-  color: var(--success);
-}
-.cx-score--med {
-  background: var(--warning-soft);
-  color: var(--warning);
-}
-.cx-score--low {
-  background: var(--danger-soft);
-  color: var(--danger);
-}
-
-.cx-actions {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--space-1);
-}
-
-.cx-btn {
-  padding: 4px var(--space-3);
-  border-radius: var(--radius-pill);
+  color: var(--accent-hover);
   font-size: 12px;
   font-weight: 600;
   cursor: pointer;
-  transition:
-    background var(--transition-fast),
-    border-color var(--transition-fast),
-    color var(--transition-fast);
+  transition: background var(--transition-fast);
 }
-.cx-btn:disabled {
+.cx-more:hover {
+  background: var(--accent-soft);
+}
+
+/* --- Ambient semantic suggestions ("related, not yet linked") ----------- */
+/* A dashed chip (visually distinct from a real link) — the BODY promotes (tap),
+   a hover × dismisses (reusing the manual-chip `.cx-remove` pattern). No %, no
+   two-button row. Rendered as a <button>, so it needs the chip visual + a reset. */
+.cx-chip--suggested {
+  border-style: dashed;
+  background: transparent;
+  cursor: pointer;
+  font: inherit;
+  font-size: 13px;
+}
+.cx-chip--suggested:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--text-primary);
+  background: var(--accent-soft);
+}
+.cx-chip--suggested:disabled {
   cursor: default;
   opacity: 0.6;
 }
-.cx-btn--accept {
-  background: var(--accent-soft);
-  border: 1px solid var(--accent-ring);
+.cx-chip--suggested:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--accent-ring);
+}
+
+/* The trailing "+ add" affordance on a suggestion chip. */
+.cx-edge--add {
   color: var(--accent-hover);
-}
-.cx-btn--accept:hover:not(:disabled) {
-  background: var(--accent);
-  color: var(--text-on-accent);
-}
-.cx-btn--dismiss {
-  background: transparent;
-  border: 1px solid var(--border-subtle);
-  color: var(--text-muted);
-}
-.cx-btn--dismiss:hover:not(:disabled) {
-  border-color: var(--danger);
-  color: var(--danger);
+  font-weight: 700;
 }
