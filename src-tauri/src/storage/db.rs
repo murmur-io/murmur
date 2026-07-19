@@ -12383,6 +12383,10 @@ impl Db {
         // Visibility is already enforced in WHERE; a trailing LIMIT trims magnitude only — it can
         // never widen what is visible.
         const MAX_GRAPH_EDGES: usize = 600;
+        // PR-9 F3: `weight DESC` alone leaves ties in engine-arbitrary order → the surviving 600-edge
+        // subset could vary between opens, contradicting the graph's "Deterministic" claim. Break ties
+        // on the pair identity (`a.entity_id`, then `b.entity_id`, both already `a < b`-canonicalized
+        // above) so identical data → the identical edge set every call.
         let sql = format!(
             "SELECT a.entity_id, b.entity_id, COUNT(*) AS weight
                FROM entity_mentions a
@@ -12398,7 +12402,7 @@ impl Db {
                       )
                     )
               GROUP BY a.entity_id, b.entity_id
-              ORDER BY weight DESC
+              ORDER BY weight DESC, a.entity_id ASC, b.entity_id ASC
               LIMIT {MAX_GRAPH_EDGES}"
         );
         let mut stmt = conn.prepare(&sql).map_err(map_err)?;
@@ -12687,9 +12691,15 @@ impl Db {
     ///   • wikilink/companion/semantic — `links` rows with `status='active'` (+ `status='suggested'`
     ///     semantic ONLY when `opts.include_suggested`), each endpoint re-checked against the set.
     ///
-    /// Deterministic: nodes ordered by (kind, id ASC), edges by (kind, src, dst, status). Honest caps:
-    /// `total_visible_nodes` is the pre-cap true count so the FE can disclose a silent trim; `has_hidden`
-    /// reflects LOCKED folders (mirrors the entity graph). No PII logged — ids/counts only.
+    /// Every edge carries `src_kind`/`dst_kind` (the endpoint node kinds it was gated on) so the FE
+    /// matches endpoints by `(kind, id)`, safe against a cross-kind id collision (PR-9 F4).
+    ///
+    /// Deterministic: nodes ordered by (kind, id ASC), edges by (kind, src, dst, status); every edge
+    /// leg has a deterministic `ORDER BY` before its cap (co_occurrence by weight then pair id;
+    /// mention by meeting recency; links by score). Honest caps: `total_visible_nodes` is the pre-cap
+    /// true NODE count so the FE can disclose a silent node trim; `edges_truncated` is true when an
+    /// EDGE-leg cap (mention/links LIMIT) trimmed edges; `has_hidden` reflects LOCKED folders (mirrors
+    /// the entity graph). No PII logged — ids/counts only.
     pub fn build_full_graph(
         &self,
         unlocked: &HashSet<String>,
@@ -12770,6 +12780,8 @@ impl Db {
                 edges.push(FullGraphEdge {
                     src: ge.source,
                     dst: ge.target,
+                    src_kind: FullGraphNodeKind::Entity,
+                    dst_kind: FullGraphNodeKind::Entity,
                     kind: FullGraphEdgeKind::CoOccurrence,
                     score: ge.weight as f64,
                     status: "active".to_string(),
@@ -12778,7 +12790,13 @@ impl Db {
         }
         // mention — entity→meeting (gated by the SAME meeting-visible predicate; both endpoints then
         // re-checked against the node set, so a mention into a sealed OR cap-dropped meeting is gone).
-        for (entity_id, meeting_id, weight) in self.entity_meeting_mentions_visible(unlocked)? {
+        // `edges_truncated` accumulates whether ANY edge leg hit its cap, so the FE can disclose it.
+        let (mention_edges, mentions_truncated) = self.entity_meeting_mentions_visible(unlocked)?;
+        let (link_rows, links_truncated) = self.full_graph_links(opts.include_suggested)?;
+        // True when a genuine EDGE-leg cap (the mention or links LIMIT) trimmed rows — distinct from
+        // an edge dropped because its endpoint fell to a NODE cap (that is the node disclosure's job).
+        let edges_truncated = mentions_truncated || links_truncated;
+        for (entity_id, meeting_id, weight) in mention_edges {
             if visible.contains(&(ent, entity_id.clone())) && visible.contains(&(mtg, meeting_id.clone()))
             {
                 bump(&mut degree, ent, &entity_id);
@@ -12786,6 +12804,8 @@ impl Db {
                 edges.push(FullGraphEdge {
                     src: entity_id,
                     dst: meeting_id,
+                    src_kind: FullGraphNodeKind::Entity,
+                    dst_kind: FullGraphNodeKind::Meeting,
                     kind: FullGraphEdgeKind::Mention,
                     score: weight as f64,
                     status: "active".to_string(),
@@ -12795,15 +12815,14 @@ impl Db {
         // links rows — wikilink/companion/semantic. active always; suggested semantic behind the flag.
         // BOTH endpoints re-checked against the visible-node set (the links kind strings map 1:1 onto
         // the node-kind strings: meeting|note|document), so a link to a sealed/absent node is dropped.
-        for (src_kind, src_id, dst_kind, dst_id, edge_type, score, status) in
-            self.full_graph_links(opts.include_suggested)?
-        {
-            let (Some(src_k), Some(dst_k)) = (
-                full_graph_link_kind_str(&src_kind),
-                full_graph_link_kind_str(&dst_kind),
+        for (src_kind, src_id, dst_kind, dst_id, edge_type, score, status) in link_rows {
+            let (Some(src_nk), Some(dst_nk)) = (
+                full_graph_link_node_kind(&src_kind),
+                full_graph_link_node_kind(&dst_kind),
             ) else {
                 continue; // corrupt/unknown kind → skip defensively.
             };
+            let (src_k, dst_k) = (src_nk.as_str(), dst_nk.as_str());
             if !visible.contains(&(src_k, src_id.clone()))
                 || !visible.contains(&(dst_k, dst_id.clone()))
             {
@@ -12817,6 +12836,8 @@ impl Db {
             edges.push(FullGraphEdge {
                 src: src_id,
                 dst: dst_id,
+                src_kind: src_nk,
+                dst_kind: dst_nk,
                 kind,
                 score,
                 status,
@@ -12854,6 +12875,7 @@ impl Db {
             nodes = nodes.len(),
             edges = edges.len(),
             has_hidden,
+            edges_truncated,
             "build_full_graph resolved"
         );
         Ok(FullGraphData {
@@ -12861,6 +12883,7 @@ impl Db {
             edges,
             has_hidden,
             total_visible_nodes,
+            edges_truncated,
         })
     }
 
@@ -12868,7 +12891,9 @@ impl Db {
     /// gated by `visibility_clause` over `documents JOIN folders` (a sealed-and-not-session-unlocked
     /// folder's rows are ABSENT — never masked). `kind='note'` → [`FullGraphNodeKind::Note`], anything
     /// else → [`FullGraphNodeKind::Document`]. `label` = title, else the filesystem `name`. `date` =
-    /// the `updated_at`/`created_at` epoch-ms as a string (a sortable hint for the FE). Per-kind capped
+    /// the `updated_at`/`created_at` timestamp UNIFIED to an RFC3339 ISO string (PR-9 F4 — meetings
+    /// already emit ISO `started_at`; notes/docs previously emitted the raw epoch-ms as a string,
+    /// giving the FE two incompatible date formats on the SAME field). Per-kind capped
     /// (`MAX_FULL_GRAPH_PER_KIND`) ordered newest-first so the most-relevant rows survive on a big
     /// vault; visibility is enforced in WHERE, so the cap trims magnitude only.
     fn full_graph_content_nodes(
@@ -12904,7 +12929,10 @@ impl Db {
                 .map_err(map_err)?;
             for r in rows {
                 let (id, label, ts) = r.map_err(map_err)?;
-                out.push((node_kind, id, label, ts.map(|t| t.to_string())));
+                // Unify to RFC3339 so the FE sees ONE date format across every node kind. epoch-ms →
+                // UTC ISO; an out-of-range/absent timestamp yields None (a bad hint, never a panic).
+                let date = ts.and_then(epoch_ms_to_rfc3339);
+                out.push((node_kind, id, label, date));
             }
         }
         Ok(out)
@@ -12955,14 +12983,23 @@ impl Db {
     /// note)` predicate as `list_meetings_visible`/`graph_edges_visible`). `weight` is always 1 (one
     /// mention row per (entity, meeting) — the PK guarantees it); kept as a field for edge-uniformity.
     /// A mention into a sealed-and-not-session-unlocked meeting yields NO row, so it can never surface
-    /// a hidden meeting. Capped ordered by entity/meeting id for a bounded, deterministic payload.
+    /// a hidden meeting.
+    ///
+    /// PR-9 F2: the previous `ORDER BY em.entity_id ASC` truncated at `MAX_MENTION_EDGES` in
+    /// arbitrary entity-UUID order, so entities LATE in UUID order silently lost ALL their mention
+    /// edges (rendered isolated, degree 0, with no signal). Order by meeting RECENCY first
+    /// (`m.started_at DESC`) so the freshest mentions survive the cap regardless of UUID, with a
+    /// deterministic `(entity_id, meeting_id)` tiebreak so identical data → the identical subset.
+    /// Returns `(rows, truncated)` — `truncated` is true when the cap trimmed rows (there was a
+    /// `MAX_MENTION_EDGES + 1`th visible mention), so the caller can disclose the edge trim.
     fn entity_meeting_mentions_visible(
         &self,
         unlocked: &HashSet<String>,
-    ) -> Result<Vec<(String, String, i64)>> {
+    ) -> Result<(Vec<FullGraphMentionEdge>, bool)> {
         let conn = self.lock();
         let visible = visibility_clause("n", unlocked);
         const MAX_MENTION_EDGES: usize = 2000;
+        // Fetch ONE past the cap so a full page distinguishes "exactly the cap" from "trimmed".
         let sql = format!(
             "SELECT em.entity_id, em.meeting_id
                FROM entity_mentions em
@@ -12975,8 +13012,9 @@ impl Db {
                          WHERE n.meeting_id = m.id AND {visible}
                       )
                     )
-              ORDER BY em.entity_id ASC, em.meeting_id ASC
-              LIMIT {MAX_MENTION_EDGES}"
+              ORDER BY m.started_at DESC, em.entity_id ASC, em.meeting_id ASC
+              LIMIT {}",
+            MAX_MENTION_EDGES + 1
         );
         let mut stmt = conn.prepare(&sql).map_err(map_err)?;
         let rows = stmt
@@ -12988,16 +13026,24 @@ impl Db {
         for r in rows {
             out.push(r.map_err(map_err)?);
         }
-        Ok(out)
+        let truncated = out.len() > MAX_MENTION_EDGES;
+        out.truncate(MAX_MENTION_EDGES);
+        Ok((out, truncated))
     }
 
     /// Raw `links` rows for the full-brain graph, PRE-gating (the caller gates both endpoints against
     /// the visible-node set). `status='active'` always; `status='suggested'` semantic rows ONLY when
     /// `include_suggested`. `dismissed` rows are NEVER returned. Returns
-    /// `(src_kind, src_id, dst_kind, dst_id, edge_type, score, status)` ordered deterministically.
-    /// This reads no content columns — ids/kinds/metadata only — and is gated by the caller, so it is
-    /// leak-free at every call site.
-    fn full_graph_links(&self, include_suggested: bool) -> Result<Vec<FullGraphLinkRow>> {
+    /// `(rows, truncated)` where each row is `(src_kind, src_id, dst_kind, dst_id, edge_type, score,
+    /// status)` ordered deterministically. This reads no content columns — ids/kinds/metadata only —
+    /// and is gated by the caller, so it is leak-free at every call site.
+    ///
+    /// PR-9 F2: `links` is the FASTEST-growing edge leg (every wikilink/companion/semantic suggestion
+    /// is a row) and was read UNBOUNDED — the per-kind node caps existed while the highest-cardinality
+    /// edge table had none. Bound it at `MAX_FULL_GRAPH_LINK_EDGES`, ordered by score DESC (strongest
+    /// links survive) with a deterministic `(edge_type, src_id, dst_id, id)` tiebreak, and report
+    /// `truncated` so the caller can disclose the edge trim (mirrors the mention-edge cap).
+    fn full_graph_links(&self, include_suggested: bool) -> Result<(Vec<FullGraphLinkRow>, bool)> {
         let conn = self.lock();
         // active: any edge_type. suggested: ONLY semantic (wikilink/companion are always active by
         // construction; there is no "suggested wikilink"). dismissed tombstones stay excluded.
@@ -13006,11 +13052,14 @@ impl Db {
         } else {
             "status = 'active'"
         };
+        // Fetch ONE past the cap to distinguish "exactly the cap" from "trimmed".
         let sql = format!(
             "SELECT src_kind, src_id, dst_kind, dst_id, edge_type, score, status
                FROM links
               WHERE {status_pred}
-              ORDER BY edge_type ASC, src_id ASC, dst_id ASC, id ASC"
+              ORDER BY score DESC, edge_type ASC, src_id ASC, dst_id ASC, id ASC
+              LIMIT {}",
+            MAX_FULL_GRAPH_LINK_EDGES + 1
         );
         let mut stmt = conn.prepare(&sql).map_err(map_err)?;
         let rows = stmt
@@ -13030,7 +13079,9 @@ impl Db {
         for r in rows {
             out.push(r.map_err(map_err)?);
         }
-        Ok(out)
+        let truncated = out.len() > MAX_FULL_GRAPH_LINK_EDGES;
+        out.truncate(MAX_FULL_GRAPH_LINK_EDGES);
+        Ok((out, truncated))
     }
 
     /// Build the detail payload for one entity (`get_entity_detail`): the entity, its visible
@@ -14888,6 +14939,11 @@ type FullGraphContentNode = (FullGraphNodeKind, String, String, Option<String>);
 /// [`Db::full_graph_links`]'s return under clippy's type-complexity bar.
 type FullGraphLinkRow = (String, String, String, String, String, f64, String);
 
+/// One entity→meeting MENTION edge for the full-brain graph: `(entity_id, meeting_id, weight)`.
+/// Aliased to keep [`Db::entity_meeting_mentions_visible`]'s `(Vec<_>, truncated)` return under
+/// clippy's type-complexity bar (PR-9 F2 added the `truncated` flag).
+type FullGraphMentionEdge = (String, String, i64);
+
 /// Per-kind render cap for the full-brain graph (`build_full_graph`, DESIGN §PR-4). Meetings, notes,
 /// and documents are each capped independently (entities keep their own 500 cap inside
 /// `list_entities_visible`) so the payload stays bounded on a large vault; visibility is enforced in
@@ -14895,15 +14951,32 @@ type FullGraphLinkRow = (String, String, String, String, String, f64, String);
 /// `MAX_GRAPH_EDGES`/`MAX_VISIBLE_ENTITIES` posture, disclosed via `total_visible_nodes`.
 const MAX_FULL_GRAPH_PER_KIND: usize = 500;
 
-/// Map a persisted `links.src_kind`/`dst_kind` string onto the STABLE full-graph node-kind key
+/// Bound for the `links`-derived edge leg of the full-brain graph (`full_graph_links`, PR-9 F2).
+/// `links` is the fastest-growing edge table (every wikilink/companion/semantic-suggestion is a row)
+/// and was previously read UNBOUNDED while the node legs were each capped — the payload the caps
+/// exist for was unenforced on its highest-cardinality leg. Strongest-score edges survive the cut;
+/// the trim is DISCLOSED via `FullGraphData::edges_truncated`. Comfortably above what a laid-out
+/// ≤140-node scene can render, so it trims magnitude only on a very large vault.
+const MAX_FULL_GRAPH_LINK_EDGES: usize = 4000;
+
+/// Convert an epoch-MILLISECONDS timestamp to an RFC3339 UTC string (PR-9 F4: unify the
+/// full-graph node `date` format — meetings already carry ISO `started_at`; notes/docs store
+/// epoch-ms). `None` for an out-of-range value (never a panic — a bad date hint is dropped, not
+/// fatal). Uses the same `chrono` dependency already in use across storage.
+fn epoch_ms_to_rfc3339(ms: i64) -> Option<String> {
+    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms).map(|dt| dt.to_rfc3339())
+}
+
+/// Map a persisted `links.src_kind`/`dst_kind` string onto the STABLE full-graph node kind
 /// (`meeting`/`note`/`document`). `None` for anything unknown (a corrupt row → its edge is dropped).
-/// Deliberately NOT reusing `LinkKind::parse` → `.as_str()` so the returned `&'static str` is the
-/// canonical node-kind key used in the visible-node set (they happen to coincide, kept explicit).
-fn full_graph_link_kind_str(kind: &str) -> Option<&'static str> {
+/// PR-9 F4: returns the typed [`FullGraphNodeKind`] (not a bare `&str`) so the caller can carry the
+/// endpoint kinds onto `FullGraphEdge` — the FE then matches endpoints by `(kind, id)`, not bare id,
+/// closing a cross-kind id-collision mismatch. Its `.as_str()` remains the visible-node-set key.
+fn full_graph_link_node_kind(kind: &str) -> Option<FullGraphNodeKind> {
     match kind {
-        "meeting" => Some(FullGraphNodeKind::Meeting.as_str()),
-        "note" => Some(FullGraphNodeKind::Note.as_str()),
-        "document" => Some(FullGraphNodeKind::Document.as_str()),
+        "meeting" => Some(FullGraphNodeKind::Meeting),
+        "note" => Some(FullGraphNodeKind::Note),
+        "document" => Some(FullGraphNodeKind::Document),
         _ => None,
     }
 }
@@ -26488,6 +26561,235 @@ mod graph_tests {
         db.set_folder_locked("f", true, None).unwrap();
         let g2 = db.build_full_graph(&empty, FullGraphOpts::default()).unwrap();
         assert!(g2.has_hidden, "a locked folder sets has_hidden");
+    }
+
+    /// PR-9 F3 (co-occurrence determinism): `graph_edges_visible`'s `LIMIT 600` had no tiebreak, so
+    /// the surviving edge subset could vary between opens (contradicting the "Deterministic" claim).
+    /// Two calls on the SAME data must now return the byte-identical edge set (weight DESC, pair ASC).
+    /// RED-before-GREEN: drop the `a.entity_id ASC, b.entity_id ASC` tiebreak and, on a dataset whose
+    /// weights tie at the cap boundary, the two vectors can differ.
+    #[test]
+    fn graph_edges_visible_is_deterministic_across_calls() {
+        let db = file_db("cooc-determinism");
+        seed_folder(&db, "f", "Notes");
+        // Many entities co-occurring in ONE meeting → every pair has weight 1 (a full tie). With no
+        // tiebreak the `LIMIT` picks an engine-arbitrary 600 of the pairs; the tiebreak pins them.
+        seed_note(&db, "m", "# meeting", Some("f"));
+        let mut ids = Vec::new();
+        for i in 0..40 {
+            let e = db
+                .upsert_entity(&format!("Ent {i:02}"), EntityKind::Person)
+                .unwrap();
+            db.add_mention(&e, "m").unwrap();
+            ids.push(e);
+        }
+        let empty: HashSet<String> = HashSet::new();
+        let a = db.graph_edges_visible(&empty).unwrap();
+        let b = db.graph_edges_visible(&empty).unwrap();
+        assert!(!a.is_empty(), "co-occurrence edges exist");
+        let key = |v: &[GraphEdge]| {
+            v.iter()
+                .map(|e| (e.source.clone(), e.target.clone(), e.weight))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            key(&a),
+            key(&b),
+            "two build passes on identical data must return the identical edge set"
+        );
+        // And the order itself is the declared one: weight DESC then (source, target) ASC.
+        let mut sorted = a.clone();
+        sorted.sort_by(|x, y| {
+            y.weight
+                .cmp(&x.weight)
+                .then_with(|| x.source.cmp(&y.source))
+                .then_with(|| x.target.cmp(&y.target))
+        });
+        assert_eq!(
+            key(&a),
+            key(&sorted),
+            "edges are ordered weight DESC, then pair id ASC (deterministic)"
+        );
+    }
+
+    /// PR-9 F2 (mention-edge recency ordering + honest edge-cap): the mention leg truncated at
+    /// `MAX_MENTION_EDGES` in ARBITRARY entity-UUID order, so an entity late in UUID order lost ALL
+    /// its edges with no signal. Now it orders by meeting RECENCY, so a mention in the FRESHEST
+    /// meeting survives the cap regardless of the entity's UUID, and `edges_truncated` discloses the
+    /// trim. RED-before-GREEN: restore `ORDER BY em.entity_id` and the most-recent-meeting mention
+    /// from a high-UUID entity is dropped while a stale one survives; drop the flag and the trim is
+    /// invisible.
+    #[test]
+    fn mention_edges_prefer_recency_and_flag_truncation() {
+        let db = file_db("mention-cap");
+        seed_folder(&db, "f", "Notes");
+        // One OLD meeting carries the cap's worth of mentions (2000), one NEW meeting carries one
+        // extra mention from a fresh entity. Recency-ordering must keep the NEW mention and shed an
+        // OLD one; `edges_truncated` must be true (2001 visible > 2000 cap).
+        db.insert_meeting(&Meeting {
+            id: "m-old".to_string(),
+            started_at: "2020-01-01T00:00:00Z".to_string(),
+            ended_at: None,
+            title: Some("Old".to_string()),
+            duration_s: 60,
+            audio_path: None,
+            status: MeetingStatus::Summarized,
+            folder_id: None,
+        })
+        .unwrap();
+        db.insert_meeting(&Meeting {
+            id: "m-new".to_string(),
+            started_at: "2026-12-31T00:00:00Z".to_string(),
+            ended_at: None,
+            title: Some("New".to_string()),
+            duration_s: 60,
+            audio_path: None,
+            status: MeetingStatus::Summarized,
+            folder_id: None,
+        })
+        .unwrap();
+        // Seed entity rows + mentions with CONTROLLED ids (not random UUIDs) so the recency-vs-UUID
+        // ordering is deterministic: the fresh entity's id "z-fresh" sorts AFTER every "e00000..".
+        // Under the OLD `ORDER BY entity_id ASC LIMIT 2000` the highest-id row (the fresh one) is the
+        // one dropped; under the NEW recency order it survives — that contrast is the F2 fix.
+        let seed_entity = |id: &str, name: &str| {
+            db.lock()
+                .execute(
+                    "INSERT INTO entities (id, name, name_ci, kind, created_at)
+                     VALUES (?1, ?2, ?3, 'person', '2020-01-01T00:00:00Z')",
+                    rusqlite::params![id, name, name.to_lowercase()],
+                )
+                .unwrap();
+        };
+        // 2000 distinct entities mentioned in the OLD meeting, ids "e00000".."e01999" (all < "z-fresh").
+        for i in 0..2000 {
+            let id = format!("e{i:05}");
+            seed_entity(&id, &format!("Old {i:04}"));
+            db.add_mention(&id, "m-old").unwrap();
+        }
+        // ONE fresh entity (highest id) mentioned in the NEW meeting.
+        let fresh = "z-fresh".to_string();
+        seed_entity(&fresh, "Fresh Face");
+        db.add_mention(&fresh, "m-new").unwrap();
+
+        let empty: HashSet<String> = HashSet::new();
+        let (rows, truncated) = db.entity_meeting_mentions_visible(&empty).unwrap();
+        assert_eq!(rows.len(), 2000, "the cap bounds the returned mention edges");
+        assert!(
+            truncated,
+            "2001 visible mentions > the 2000 cap sets edges_truncated"
+        );
+        // The freshest-meeting mention survived the cap (recency-ordered) — the whole point of F2.
+        // Under the old `entity_id ASC` order this highest-id entity would be the one dropped.
+        assert!(
+            rows.iter().any(|(e, m, _)| e == &fresh && m == "m-new"),
+            "a mention in the most-RECENT meeting survives the cap regardless of entity UUID"
+        );
+        // And the truncation surfaces through the full graph payload.
+        let g = db.build_full_graph(&empty, FullGraphOpts::default()).unwrap();
+        assert!(
+            g.edges_truncated,
+            "build_full_graph propagates the mention-leg truncation to the FE"
+        );
+    }
+
+    /// PR-9 F2 (links leg bounded + flagged): `full_graph_links` read the WHOLE `links` table
+    /// unbounded — the fastest-growing edge leg had no cap while the node legs each did. It now caps
+    /// at `MAX_FULL_GRAPH_LINK_EDGES` (score DESC) and reports truncation. RED-before-GREEN: remove
+    /// the LIMIT and the returned count is unbounded (> cap); drop the flag and the trim is silent.
+    #[test]
+    fn full_graph_links_are_bounded_and_flag_truncation() {
+        let db = file_db("links-cap");
+        seed_folder(&db, "f", "Notes");
+        // Seed MAX_FULL_GRAPH_LINK_EDGES + 1 active note↔note wikilinks so the cap must trim exactly
+        // one. (Endpoints need not exist as nodes — `full_graph_links` is PRE-gating, read raw.)
+        let over = MAX_FULL_GRAPH_LINK_EDGES + 1;
+        for i in 0..over {
+            seed_link(
+                &db,
+                ("note", &format!("s{i:05}")),
+                ("note", &format!("d{i:05}")),
+                "wikilink",
+                "active",
+                1.0,
+            );
+        }
+        let (rows, truncated) = db.full_graph_links(false).unwrap();
+        assert_eq!(
+            rows.len(),
+            MAX_FULL_GRAPH_LINK_EDGES,
+            "the links leg is bounded by the cap"
+        );
+        assert!(truncated, "one past the cap sets the truncated flag");
+    }
+
+    /// PR-9 F4 (edges carry endpoint kinds): a `FullGraphEdge` now names its `src_kind`/`dst_kind`
+    /// (the endpoint node kinds the backend gated on) so the FE can match endpoints by `(kind, id)`,
+    /// safe against a cross-kind id collision. A mention edge is entity→meeting; a companion link is
+    /// note→meeting. RED-before-GREEN: without the fields the FE can only match on bare id.
+    #[test]
+    fn full_graph_edges_carry_endpoint_kinds() {
+        let db = file_db("edge-kinds");
+        seed_folder(&db, "f", "Notes");
+        seed_note(&db, "m1", "# meeting", Some("f"));
+        db.insert_note("n1", "f", "n1", "Note One", "body", 1_000)
+            .unwrap();
+        let atlas = db.upsert_entity("Atlas", EntityKind::Project).unwrap();
+        db.add_mention(&atlas, "m1").unwrap();
+        seed_link(&db, ("note", "n1"), ("meeting", "m1"), "companion", "active", 1.0);
+
+        let empty: HashSet<String> = HashSet::new();
+        let g = db.build_full_graph(&empty, FullGraphOpts::default()).unwrap();
+        let mention = g
+            .edges
+            .iter()
+            .find(|e| e.kind == FullGraphEdgeKind::Mention)
+            .expect("mention edge present");
+        assert_eq!(mention.src_kind, FullGraphNodeKind::Entity);
+        assert_eq!(mention.dst_kind, FullGraphNodeKind::Meeting);
+        let companion = g
+            .edges
+            .iter()
+            .find(|e| e.kind == FullGraphEdgeKind::Companion)
+            .expect("companion link present");
+        assert_eq!(companion.src_kind, FullGraphNodeKind::Note);
+        assert_eq!(companion.dst_kind, FullGraphNodeKind::Meeting);
+    }
+
+    /// PR-9 F4 (unified node date): a note/document node's `date` is an RFC3339 ISO string (was the
+    /// raw epoch-ms string), matching the meeting node's ISO `started_at`. RED-before-GREEN: emit
+    /// `ts.to_string()` and the field is a bare integer string, inconsistent with meetings.
+    #[test]
+    fn full_graph_content_node_date_is_iso() {
+        let db = file_db("node-date-iso");
+        seed_folder(&db, "f", "Notes");
+        // created_at is epoch-MS; 1_700_000_000_000 ms = 2023-11-14T22:13:20Z.
+        db.insert_note("n1", "f", "n1", "Note One", "body", 1_700_000_000_000)
+            .unwrap();
+        let empty: HashSet<String> = HashSet::new();
+        let g = db.build_full_graph(&empty, FullGraphOpts::default()).unwrap();
+        let note = g
+            .nodes
+            .iter()
+            .find(|n| n.id == "n1")
+            .expect("note node present");
+        let date = note.date.as_deref().expect("note carries a date");
+        assert!(
+            date.starts_with("2023-11-14T"),
+            "the note date is RFC3339 ISO (got {date:?}), not raw epoch-ms"
+        );
+        // A meeting node keeps its ISO started_at — both kinds now share the format.
+        seed_note(&db, "m1", "# meeting", Some("f"));
+        let g2 = db.build_full_graph(&empty, FullGraphOpts::default()).unwrap();
+        let meeting = g2
+            .nodes
+            .iter()
+            .find(|n| n.id == "m1")
+            .expect("meeting node present");
+        assert!(
+            meeting.date.as_deref().is_some_and(|d| d.contains("T")),
+            "the meeting date is ISO too"
+        );
     }
 
     /// `/people` CRM GATE: a Person mentioned ONLY in a sealed-and-not-session-unlocked meeting is
