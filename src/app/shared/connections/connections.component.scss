@@ -224,20 +224,44 @@
   letter-spacing: 0.04em;
 }
 
-/* "+N more" / "Show less" — collapses the Related list (the app-backlinks idiom). */
-.cx-more {
-  padding: 6px var(--space-3);
+/* Collapsed "Related · N" toggle — a quiet inline row (Notion-style collapse-by-
+   default). Doubles as the expanded-state collapse control (in `.cx-head`). */
+.cx-collapsed {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  align-self: flex-start;
+  padding: 4px var(--space-2) 4px var(--space-1);
   background: transparent;
-  border: 1px dashed var(--border-strong);
-  border-radius: var(--radius-pill);
-  color: var(--accent-hover);
-  font-size: 12px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 11px;
   font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
   cursor: pointer;
-  transition: background var(--transition-fast);
+  transition: color var(--transition-fast), background var(--transition-fast);
 }
-.cx-more:hover {
-  background: var(--accent-soft);
+.cx-collapsed:hover {
+  color: var(--text-primary);
+  background: var(--surface-hover);
+}
+.cx-collapsed:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--accent-ring);
+}
+.cx-collapsed-label {
+  letter-spacing: 0.08em;
+}
+.cx-chev {
+  flex: 0 0 auto;
+  color: var(--text-muted);
+  transition: color var(--transition-fast);
+}
+.cx-collapsed:hover .cx-chev {
+  color: var(--text-secondary);
 }
 
 /* --- Ambient semantic suggestions ("related, not yet linked") ----------- */
