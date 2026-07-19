@@ -11313,6 +11313,51 @@ impl Db {
         Ok(Some(centroid))
     }
 
+    /// CALIBRATION read (brain-v3 PR-10 semantic-link threshold gate): the L2-normalized centroids of a
+    /// sample of VISIBLE, EMBEDDED items (meeting/note/document), for building the NULL cosine
+    /// distribution of RANDOM item pairs (are the shipped `SEMANTIC_LINK_FLOOR`/`_STRONG` above or below
+    /// the noise floor?). Read-only, and GATED exactly like the app: items are enumerated ONLY through
+    /// the same `visibility_clause`-backed predicates `list_meetings_visible` / `full_graph_content_nodes`
+    /// use, so a sealed-and-not-session-unlocked item is never sampled — no new ungated read path. Each
+    /// centroid comes from [`Self::item_centroid`] (an item's OWN stored vectors); items without vectors
+    /// or a degenerate centroid are silently skipped. `max_items` caps the enumeration (newest-first per
+    /// kind); the eval runner then samples pairs from the returned set. Returns `(kind, id, centroid)`.
+    /// NO content text ever leaves this method (ids + numeric vectors only). Test-only: its sole caller
+    /// is the PR-10 semantic-link calibration runner (`eval::calibration`), an `#[ignore]` manual test.
+    #[cfg(test)]
+    pub(crate) fn sampled_visible_item_centroids(
+        &self,
+        max_items: usize,
+        unlocked: &HashSet<String>,
+    ) -> Result<Vec<(crate::links::LinkKind, String, Vec<f32>)>> {
+        // 1. Enumerate visible ids per kind — meetings via the `list_meetings_visible` predicate,
+        //    notes/documents via `full_graph_content_nodes` (both already visibility-gated). We only
+        //    take ids here; the centroid read is a separate stored-vector fetch.
+        let cap = max_items.max(1) as i64;
+        let mut ids: Vec<(crate::links::LinkKind, String)> = Vec::new();
+        for m in self.list_meetings_visible(cap, unlocked)? {
+            ids.push((crate::links::LinkKind::Meeting, m.id));
+        }
+        for (node_kind, id, _label, _ts) in self.full_graph_content_nodes(unlocked)? {
+            let kind = match node_kind {
+                FullGraphNodeKind::Note => crate::links::LinkKind::Note,
+                FullGraphNodeKind::Document => crate::links::LinkKind::Document,
+                // full_graph_content_nodes only emits Note/Document; any other is not a linkable item.
+                _ => continue,
+            };
+            ids.push((kind, id));
+        }
+        // 2. Centroid for each (skip items with no vectors / degenerate centroid). Capped to `max_items`
+        //    total across kinds so the sample size is bounded regardless of vault shape.
+        let mut out: Vec<(crate::links::LinkKind, String, Vec<f32>)> = Vec::new();
+        for (kind, id) in ids.into_iter().take(max_items) {
+            if let Some(centroid) = self.item_centroid(kind, &id)? {
+                out.push((kind, id, centroid));
+            }
+        }
+        Ok(out)
+    }
+
     /// vec0 kNN of `centroid` over BOTH vector tables (`vec_chunks` ∪ `doc_vec_chunks`), rolled
     /// chunk→ITEM keeping the BEST (min) distance, converted to cosine, self dropped. Returns up to
     /// `want_items` DISTINCT NON-SELF items as `(kind, id) → cos`, best-first. GATED by
