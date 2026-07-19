@@ -143,10 +143,8 @@ export class ConnectionsComponent {
    */
   private readonly pending = signal<ReadonlySet<number>>(new Set());
 
-  /** Whether the whole Related section is expanded past the collapsed count. */
+  /** Whether the whole Related section is expanded (Notion-style collapse-by-default). */
   readonly expanded = signal(false);
-  /** Collapsed count affordance shows the first this-many related chips. */
-  readonly limit = input(6);
 
   /** The single-pick `+ Link` chooser element (the header `<input>`) for anchoring. */
   private readonly pickerAnchor =
@@ -308,10 +306,26 @@ export class ConnectionsComponent {
     return [...this.deterministic()].sort((a, b) => weight(a) - weight(b));
   });
 
-  /** The ambient suggestion chips as a precomputed view-model (strongest-first). */
+  /**
+   * The `(kind:id)` keys already present as a Related row — used to drop a semantic
+   * suggestion whose neighbour is ALSO an inbound/outbound relationship. Without
+   * this the SAME note renders in BOTH "Related" and "Suggested" (the exact
+   * duplication the consolidation set out to kill — a suggestion is only ever
+   * "related, not yet linked", never a repeat of something already linked/mentioned).
+   */
+  private readonly relatedKeys = computed(
+    () => new Set(this.relatedRows().map((r) => r.key)),
+  );
+
+  /**
+   * The ambient suggestion chips (strongest-first), EXCLUDING any neighbour already
+   * shown as a Related row (cross-surface dedup).
+   */
   readonly suggestionRows = computed<SuggestionRow[]>(() => {
     const pending = this.pending();
+    const related = this.relatedKeys();
     return [...this.semanticSuggestions()]
+      .filter((e) => !related.has(`${e.otherKind}:${e.otherId}`))
       .sort((a, b) => b.score - a.score)
       .map((edge) => ({
         edge,
@@ -322,19 +336,16 @@ export class ConnectionsComponent {
       }));
   });
 
-  /** The total related count (drives the collapsed "N related" affordance). */
+  /** The Related-row count (the "linked"/"mentions" chips). */
   readonly relatedCount = computed(() => this.relatedRows().length);
 
-  /** The Related rows to actually render — the first `limit` unless expanded. */
-  readonly visibleRelated = computed<RelatedRow[]>(() =>
-    this.expanded()
-      ? this.relatedRows()
-      : this.relatedRows().slice(0, this.limit()),
-  );
-
-  /** How many related rows are hidden behind the collapsed count. */
-  readonly hiddenRelatedCount = computed(() =>
-    Math.max(0, this.relatedCount() - this.limit()),
+  /**
+   * The whole-section count behind the collapsed "Related · N" affordance: Related
+   * rows + (deduped) suggestions. The section is COLLAPSED BY DEFAULT (Notion-style,
+   * near-zero footprint above the note body); `expanded` reveals both groups.
+   */
+  readonly totalCount = computed(
+    () => this.relatedCount() + this.suggestionRows().length,
   );
 
   /**
@@ -428,7 +439,7 @@ export class ConnectionsComponent {
     return kind === "meeting" ? ["/meeting", id] : ["/notes", id];
   }
 
-  /** Toggle the collapsed/expanded Related list ("N more" / "Show less"). */
+  /** Toggle the whole Related section collapsed ↔ expanded. */
   toggleExpanded(): void {
     this.expanded.update((v) => !v);
   }

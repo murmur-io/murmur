@@ -1,147 +1,191 @@
 <!-- Never surface (or offer to add) relationships behind a lock: the whole panel —
-     header + `+ Link` chooser included — is suppressed while `locked`. It is also
-     auto-hidden when there is NOTHING to show (no related rows AND no suggestions)
-     so a fresh note carries near-zero footprint (the collapsed "Related" IA). -->
+     collapsed header + `+ Link` chooser included — is suppressed while `locked`. It is
+     also auto-hidden when there is NOTHING to show (no related rows AND no suggestions)
+     so a fresh note carries zero footprint. COLLAPSED BY DEFAULT (Notion-style): a
+     single "Related · N" affordance under Properties; clicking it reveals the merged
+     Related chips + the ambient Suggested chips. -->
 @if (!locked() && hasAnything()) {
 <div class="cx">
-  <!-- Header: the "Related · N" count label + the `+ Link` chooser. The query
-       <input> is BOTH the filter field and the popover's keyboard target; the panel
-       owns query/activeIndex (the picker is presentational) and anchors it here. -->
-  <div class="cx-head">
-    <span class="cx-label cx-label--head">
-      Related
-      @if (relatedCount() > 0) {
-        <span class="cx-count" aria-hidden="true">{{ relatedCount() }}</span>
-      }
-    </span>
-    @if (pickerOpen()) {
-      <input
-        #pickerAnchor
-        type="text"
-        class="cx-link-input"
-        placeholder="Link a meeting, note, or document…"
-        [value]="pickerQuery()"
-        (input)="onQueryInput($event)"
-        (keydown)="onQueryKey($event)"
-        (blur)="closePicker()"
-        aria-label="Search items to link"
-      />
-    } @else {
-      <button
-        #pickerAnchor
-        type="button"
-        class="cx-add"
-        [disabled]="linking()"
-        (click)="openPicker()"
+  @if (!expanded()) {
+    <!-- COLLAPSED (default) — one quiet "Related · N" line; near-zero footprint. -->
+    <button
+      type="button"
+      class="cx-collapsed"
+      (click)="toggleExpanded()"
+      [attr.aria-expanded]="false"
+      aria-label="Show related items and suggestions"
+    >
+      <svg
+        class="cx-chev"
+        viewBox="0 0 16 16"
+        width="11"
+        height="11"
+        fill="none"
+        aria-hidden="true"
       >
-        @if (linking()) {
-          <span class="cx-add-label">Linking…</span>
-        } @else {
-          <span class="cx-add-plus" aria-hidden="true">+</span>
-          <span class="cx-add-label">Link</span>
-        }
+        <path
+          d="M6 4l4 4-4 4"
+          stroke="currentColor"
+          stroke-width="1.5"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+        />
+      </svg>
+      <span class="cx-collapsed-label">Related</span>
+      <span class="cx-count" aria-hidden="true">{{ totalCount() }}</span>
+    </button>
+  } @else {
+    <!-- EXPANDED — the collapse toggle + `+ Link` chooser, then the two chip groups. -->
+    <div class="cx-head">
+      <button
+        type="button"
+        class="cx-collapsed cx-collapsed--open"
+        (click)="toggleExpanded()"
+        [attr.aria-expanded]="true"
+        aria-label="Hide related items"
+      >
+        <svg
+          class="cx-chev cx-chev--open"
+          viewBox="0 0 16 16"
+          width="11"
+          height="11"
+          fill="none"
+          aria-hidden="true"
+        >
+          <path
+            d="M4 6l4 4 4-4"
+            stroke="currentColor"
+            stroke-width="1.5"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          />
+        </svg>
+        <span class="cx-collapsed-label">Related</span>
+        <span class="cx-count" aria-hidden="true">{{ totalCount() }}</span>
       </button>
-    }
-  </div>
+      @if (pickerOpen()) {
+        <input
+          #pickerAnchor
+          type="text"
+          class="cx-link-input"
+          placeholder="Link a meeting, note, or document…"
+          [value]="pickerQuery()"
+          (input)="onQueryInput($event)"
+          (keydown)="onQueryKey($event)"
+          (blur)="closePicker()"
+          aria-label="Search items to link"
+        />
+      } @else {
+        <button
+          #pickerAnchor
+          type="button"
+          class="cx-add"
+          [disabled]="linking()"
+          (click)="openPicker()"
+        >
+          @if (linking()) {
+            <span class="cx-add-label">Linking…</span>
+          } @else {
+            <span class="cx-add-plus" aria-hidden="true">+</span>
+            <span class="cx-add-label">Link</span>
+          }
+        </button>
+      }
+    </div>
 
-  <!-- MERGED "Related" chips — inbound backlinks + incident deterministic edges,
-       deduped by (kind, id) so a neighbour that is both shows ONCE. A small tag
-       reads the direction/type ("linked" / "mentions" / "companion" / "related");
-       a user-created MANUAL link keeps its hover × to remove. Collapsed to the
-       first `limit` with a "+N more" / "Show less" toggle (the app-backlinks
-       idiom). Rows are a precomputed view-model (fields only in the template). -->
-  @if (visibleRelated().length) {
-    <div class="cx-group">
-      @for (row of visibleRelated(); track row.key) {
-        <span class="cx-chipwrap" [class.is-pending]="row.pending">
-          <a class="cx-chip" [routerLink]="row.route">
-            @switch (row.kind) {
-              @case ("meeting") {
-                <span class="cx-kind cx-kind--meeting" aria-hidden="true">meeting</span>
+    <!-- MERGED "Related" chips — inbound backlinks + incident deterministic edges,
+         deduped by (kind, id) so a neighbour that is both shows ONCE. A small tag
+         reads the direction/type ("linked" / "mentions" / "companion" / "related");
+         a user-created MANUAL link keeps its hover × to remove. -->
+    @if (relatedRows().length) {
+      <div class="cx-group">
+        @for (row of relatedRows(); track row.key) {
+          <span class="cx-chipwrap" [class.is-pending]="row.pending">
+            <a class="cx-chip" [routerLink]="row.route">
+              @switch (row.kind) {
+                @case ("meeting") {
+                  <span class="cx-kind cx-kind--meeting" aria-hidden="true">meeting</span>
+                }
+                @case ("document") {
+                  <span class="cx-kind cx-kind--doc" aria-hidden="true">doc</span>
+                }
+                @default {
+                  <span class="cx-kind cx-kind--note" aria-hidden="true">note</span>
+                }
               }
-              @case ("document") {
-                <span class="cx-kind cx-kind--doc" aria-hidden="true">doc</span>
-              }
-              @default {
-                <span class="cx-kind cx-kind--note" aria-hidden="true">note</span>
-              }
+              <span class="cx-title">{{ row.title }}</span>
+              <span class="cx-edge" aria-hidden="true">{{ row.tag }}</span>
+            </a>
+            @if (row.removable && row.edge) {
+              <button
+                type="button"
+                class="cx-remove"
+                [disabled]="row.pending"
+                [attr.aria-label]="'Remove link to ' + row.title"
+                title="Remove link"
+                (click)="unlink(row.edge)"
+              >
+                <span aria-hidden="true">×</span>
+              </button>
             }
-            <span class="cx-title">{{ row.title }}</span>
-            <span class="cx-edge" aria-hidden="true">{{ row.tag }}</span>
-          </a>
-          @if (row.removable && row.edge) {
+          </span>
+        }
+      </div>
+    }
+
+    <!-- AMBIENT semantic SUGGESTIONS — "related, not yet linked". A dashed chip whose
+         BODY promotes (tap → acceptLink materializes the [[wikilink]]) and whose hover ×
+         dismisses (dismissLink). No confidence %, no persistent Accept/Dismiss buttons —
+         the chip IS the affordance. Cross-deduped against Related (never a repeat). -->
+    @if (suggestionRows().length) {
+      <div class="cx-group cx-group--suggest">
+        <span class="cx-label">Suggested</span>
+        @for (row of suggestionRows(); track row.edge.id) {
+          <span class="cx-chipwrap" [class.is-pending]="row.pending">
+            <button
+              type="button"
+              class="cx-chip cx-chip--suggested"
+              [disabled]="row.pending"
+              [attr.aria-label]="'Add link to ' + row.title"
+              title="Add this link"
+              (click)="accept(row.edge)"
+            >
+              @switch (row.kind) {
+                @case ("meeting") {
+                  <span class="cx-kind cx-kind--meeting" aria-hidden="true">meeting</span>
+                }
+                @case ("document") {
+                  <span class="cx-kind cx-kind--doc" aria-hidden="true">doc</span>
+                }
+                @default {
+                  <span class="cx-kind cx-kind--note" aria-hidden="true">note</span>
+                }
+              }
+              <span class="cx-title">{{ row.title }}</span>
+              <span class="cx-edge cx-edge--add" aria-hidden="true">+ add</span>
+            </button>
             <button
               type="button"
               class="cx-remove"
               [disabled]="row.pending"
-              [attr.aria-label]="'Remove link to ' + row.title"
-              title="Remove link"
-              (click)="unlink(row.edge)"
+              [attr.aria-label]="'Dismiss suggestion ' + row.title"
+              title="Dismiss suggestion"
+              (click)="dismiss(row.edge)"
             >
               <span aria-hidden="true">×</span>
             </button>
-          }
-        </span>
-      }
-      @if (hiddenRelatedCount() > 0 || expanded()) {
-        <button type="button" class="cx-more" (click)="toggleExpanded()">
-          {{ expanded() ? "Show less" : "+" + hiddenRelatedCount() + " more" }}
-        </button>
-      }
-    </div>
-  }
-
-  <!-- AMBIENT semantic SUGGESTIONS — "related, not yet linked". A dashed chip whose
-       BODY promotes (tap → acceptLink materializes the [[wikilink]]) and whose hover ×
-       dismisses (dismissLink). No confidence %, no persistent Accept/Dismiss buttons —
-       the chip IS the affordance (precomputed `suggestionRows()`, fields only). -->
-  @if (suggestionRows().length) {
-    <div class="cx-group cx-group--suggest">
-      <span class="cx-label">Suggested</span>
-      @for (row of suggestionRows(); track row.edge.id) {
-        <span class="cx-chipwrap" [class.is-pending]="row.pending">
-          <button
-            type="button"
-            class="cx-chip cx-chip--suggested"
-            [disabled]="row.pending"
-            [attr.aria-label]="'Add link to ' + row.title"
-            title="Add this link"
-            (click)="accept(row.edge)"
-          >
-            @switch (row.kind) {
-              @case ("meeting") {
-                <span class="cx-kind cx-kind--meeting" aria-hidden="true">meeting</span>
-              }
-              @case ("document") {
-                <span class="cx-kind cx-kind--doc" aria-hidden="true">doc</span>
-              }
-              @default {
-                <span class="cx-kind cx-kind--note" aria-hidden="true">note</span>
-              }
-            }
-            <span class="cx-title">{{ row.title }}</span>
-            <span class="cx-edge cx-edge--add" aria-hidden="true">+ add</span>
-          </button>
-          <button
-            type="button"
-            class="cx-remove"
-            [disabled]="row.pending"
-            [attr.aria-label]="'Dismiss suggestion ' + row.title"
-            title="Dismiss suggestion"
-            (click)="dismiss(row.edge)"
-          >
-            <span aria-hidden="true">×</span>
-          </button>
-        </span>
-      }
-    </div>
+          </span>
+        }
+      </div>
+    }
   }
 </div>
 
   <!-- The single-pick chooser popover (reused note-editor LinkPickerComponent):
        OPAQUE, paginated autocomplete over list_link_candidates. THIS panel owns the
        query / activeIndex (fed as inputs) + keyboard nav; the picker renders + emits
-       the picked candidate. Anchored under the header <input>. -->
+       the picked candidate. Anchored under the header <input> (only reachable while
+       expanded). -->
   @if (pickerOpen()) {
     <app-link-picker
       [anchorRect]="pickerRect()"
