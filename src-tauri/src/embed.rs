@@ -631,10 +631,19 @@ pub fn chunk_note(title: &str, date: &str, markdown: &str) -> Vec<String> {
 /// row (the leaves under them still carry the full text).
 const SECTION_PARENT_CHAR_CAP: usize = 6000;
 
-/// Level tag for a [`HierChunk`]: 0 = leaf, 1 = section-parent, 2 = doc-summary.
+/// Level tag for a [`HierChunk`]: 0 = leaf, 1 = section-parent, 2 = doc-summary, 3 = contact-digest.
 pub const HIER_LEVEL_LEAF: i64 = 0;
 pub const HIER_LEVEL_SECTION: i64 = 1;
 pub const HIER_LEVEL_SUMMARY: i64 = 2;
+/// A synthetic per-document CONTACT DIGEST leaf (embedded + FTS). It carries the discrete contact
+/// FACTS (phone / email — values shown + bare-normalized) plus bilingual bridge words so a
+/// natural-language "what's the phone number / jaki jest numer telefonu" query retrieves the
+/// document via BOTH legs: the FTS leg (the bridge words + digits are literal tokens the query
+/// shares) and the vector leg (the chunk is ABOUT contact info). Exactly ONE per document that
+/// carries a contact fact — never per-leaf — so it can only win contact-type queries and cannot
+/// inflate any term's document frequency across the doc. `parent = None`, so parent-expansion
+/// never swaps it out. See [`detect_contact_digest`].
+pub const HIER_LEVEL_CONTACT: i64 = 3;
 
 /// One node of a document's chunk hierarchy, ready to persist into `doc_chunks` (+ its `doc_vec_chunks`
 /// row when `embed`-worthy). Pure data — the DB layer assigns row ids and resolves `parent` indices to
@@ -692,6 +701,160 @@ fn hier_embed_text(name: &str, section_path: Option<&str>, page_no: Option<u32>,
     } else {
         format!("{header}\n{raw}")
     }
+}
+
+/// Turn an uploaded file NAME into a readable title for the retrieval HEADER anchor: drop a trailing
+/// extension, turn `_`/`-` separators into spaces, collapse whitespace runs.
+/// `"Oskar_Orlowski_CV.pdf"` → `"Oskar Orlowski CV"`. Idempotent on an already-clean title
+/// (`"Weekly Sync"` → `"Weekly Sync"`); internal dots are preserved (`"v1.2 report"`). Used ONLY to
+/// anchor the contextual embed-header (a filename with `_`/`.pdf` is a weak semantic anchor); it does
+/// NOT rewrite the stored display name.
+pub fn clean_document_title(name: &str) -> String {
+    // Strip only the LAST extension segment (never an internal dot like "v1.2").
+    let stem = match name.rsplit_once('.') {
+        // Guard: only treat the tail as an extension when it's short + alphanumeric (a real ext),
+        // so "notes.for.review" (no ext) keeps its last segment.
+        Some((head, ext)) if !ext.is_empty() && ext.len() <= 5 && ext.chars().all(|c| c.is_ascii_alphanumeric()) => head,
+        _ => name,
+    };
+    let spaced: String = stem
+        .chars()
+        .map(|c| if c == '_' || c == '-' { ' ' } else { c })
+        .collect();
+    spaced.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The minimum number of digits a separator/`+`-marked run must carry to count as a phone number
+/// (a Polish mobile is 9; with a country code 11) — filters short years/counts.
+const CONTACT_PHONE_MIN_DIGITS: usize = 7;
+/// The maximum — a longer digit blob is an id / account number, not a phone.
+const CONTACT_PHONE_MAX_DIGITS: usize = 15;
+
+/// Find plausible PHONE numbers in `text`. To avoid matching tax/VAT/invoice ids (solid digit
+/// blocks), a run only counts as a phone when it EITHER starts with `+` OR contains a grouping
+/// separator (space / `-` / `.` / `(`), i.e. it looks dialled, and carries 7–15 digits. Returns
+/// `(shown, bare)` pairs — the trimmed as-found string and the digits-only normalization — deduped
+/// by the bare form.
+fn find_phones(text: &str) -> Vec<(String, String)> {
+    let is_phone_char = |c: char| c.is_ascii_digit() || matches!(c, '+' | ' ' | '-' | '.' | '(' | ')');
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0usize;
+    while i < chars.len() {
+        // A run starts at a `+` or a digit that is NOT glued to a preceding alphanumeric (so
+        // "PL8431621900" / "id42" never start a run mid-token). A space never starts a run.
+        let can_start = (chars[i] == '+' || chars[i].is_ascii_digit())
+            && !(i > 0 && chars[i - 1].is_alphanumeric());
+        if !can_start {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < chars.len() && is_phone_char(chars[i]) {
+            i += 1;
+        }
+        let run: String = chars[start..i].iter().collect();
+        // "glued to a letter" (an id fragment like "12345abc") only when a DIGIT sits DIRECTLY
+        // against the following letter — a trailing separator/space (the run absorbed the space
+        // before the next word, e.g. "907 orlow") is a real boundary, not a glue.
+        let ends_glued = i < chars.len()
+            && chars[i].is_alphabetic()
+            && run.chars().last().is_some_and(|c| c.is_ascii_digit());
+        // Trim edge separators/spaces off the shown value.
+        let shown = run
+            .trim()
+            .trim_end_matches([' ', '.', '-', '(', ')'])
+            .to_string();
+        let has_plus = shown.starts_with('+');
+        let has_sep = shown.contains([' ', '-', '.', '(']);
+        let digits: String = shown.chars().filter(|c| c.is_ascii_digit()).collect();
+        if !ends_glued
+            && (has_plus || has_sep)
+            && (CONTACT_PHONE_MIN_DIGITS..=CONTACT_PHONE_MAX_DIGITS).contains(&digits.len())
+            && seen.insert(digits.clone())
+        {
+            out.push((shown, digits));
+        }
+    }
+    out
+}
+
+/// Find EMAIL addresses in `text` (a `local@domain.tld` shape). Tolerant of the fragmented-PDF case
+/// where the local part is broken by a space (`"oskar .orlow@wp.pl"` → `"orlow@wp.pl"`): the local
+/// part is expanded left only over unbroken address chars. Deduped, lowercased.
+fn find_emails(text: &str) -> Vec<String> {
+    let local_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '%' | '+' | '-');
+    let domain_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '-');
+    let chars: Vec<char> = text.chars().collect();
+    let mut out: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (idx, &c) in chars.iter().enumerate() {
+        if c != '@' {
+            continue;
+        }
+        // Expand left over the local part.
+        let mut l = idx;
+        while l > 0 && local_char(chars[l - 1]) {
+            l -= 1;
+        }
+        // Expand right over the domain.
+        let mut r = idx + 1;
+        while r < chars.len() && domain_char(chars[r]) {
+            r += 1;
+        }
+        if l == idx || r == idx + 1 {
+            continue; // empty local or domain
+        }
+        let domain: String = chars[idx + 1..r].iter().collect();
+        // Require a dot inside the domain, not leading/trailing (a real TLD).
+        let domain = domain.trim_matches('.').to_string();
+        if !domain.contains('.') {
+            continue;
+        }
+        let local_raw: String = chars[l..idx].iter().collect();
+        // Trim leading/trailing punctuation off the local part (the fragmented-PDF ".orlow" →
+        // "orlow"); internal dots stay ("first.last").
+        let local = local_raw.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+        if local.is_empty() {
+            continue;
+        }
+        let email = format!("{}@{}", local, domain).to_ascii_lowercase();
+        if seen.insert(email.clone()) {
+            out.push(email);
+        }
+    }
+    out
+}
+
+/// Build ONE deterministic per-document CONTACT DIGEST from `text` (already reflowed), or `None` when
+/// the document carries no phone/email. The digest interleaves the fact VALUES (shown + bare) with
+/// bilingual (PL + EN) bridge words, so both `"jaki jest numer telefonu"` and `"what's the phone
+/// number"` retrieve it. See [`HIER_LEVEL_CONTACT`].
+fn detect_contact_digest(text: &str) -> Option<String> {
+    let phones = find_phones(text);
+    let emails = find_emails(text);
+    if phones.is_empty() && emails.is_empty() {
+        return None;
+    }
+    let mut parts: Vec<String> = Vec::new();
+    if !phones.is_empty() {
+        let vals: Vec<String> = phones
+            .iter()
+            .map(|(shown, bare)| format!("{shown} {bare}"))
+            .collect();
+        parts.push(format!(
+            "telefon · numer telefonu · phone · phone number · tel: {}",
+            vals.join(" · ")
+        ));
+    }
+    if !emails.is_empty() {
+        parts.push(format!(
+            "email · e-mail · adres e-mail · mail: {}",
+            emails.join(" · ")
+        ));
+    }
+    Some(format!("Kontakt · Contact — {}", parts.join(". ")))
 }
 
 /// Greedily pack whole `lines` into chunks of ≤`target` CHARS (never split mid-line), order
@@ -881,6 +1044,11 @@ impl Section {
 /// followed by the L2 summary chunk(s) at the end. The DB layer inserts in this order so a leaf's
 /// `parent` index precedes it.
 pub fn chunk_document_hierarchical(name: &str, blocks: &[crate::extract::ExtractedBlock]) -> Vec<HierChunk> {
+    // Anchor every contextual header on a READABLE title, not the raw upload filename
+    // ("Oskar_Orlowski_CV.pdf" → "Oskar Orlowski CV") — a `_`-joined name with a `.pdf` tail is a
+    // weak semantic anchor for the vector leg. Header-only: the stored display name is untouched.
+    let title = clean_document_title(name);
+    let name = title.as_str();
     // 1) Coalesce consecutive blocks that share a heading trail into sections (the page_no of the
     //    section is the FIRST block's page).
     let mut sections: Vec<Section> = Vec::new();
@@ -1009,6 +1177,31 @@ pub fn chunk_document_hierarchical(name: &str, blocks: &[crate::extract::Extract
             parent: None,
             embed_text,
             raw: sc,
+            section_path: None,
+            page_no: None,
+            embed: true,
+        });
+    }
+
+    // CONTACT DIGEST (Brain retrieval fix, 2026-07-19): a phone/email buried in a prose leaf is not
+    // retrievable by a natural-language "what's the phone number" query — the query words never
+    // co-occur with the digits (FTS), and the leaf vector is dominated by the surrounding prose
+    // (kNN). Emit ONE synthetic embedded+FTS chunk that pairs the fact VALUES with bilingual bridge
+    // words. Scanned over the already-reflowed blocks (so the CV's "90\n7"→"907" weld is upstream).
+    // `raw` (→ FTS + snippet display) and `embed_text` (→ vector, with the doc-title header) both
+    // carry it; ONE per doc keeps it recall-safe (can only win contact-type queries).
+    let full_text = blocks
+        .iter()
+        .map(|b| b.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if let Some(digest) = detect_contact_digest(&full_text) {
+        let embed_text = hier_embed_text(name, None, None, &digest);
+        out.push(HierChunk {
+            level: HIER_LEVEL_CONTACT,
+            parent: None,
+            embed_text,
+            raw: digest,
             section_path: None,
             page_no: None,
             embed: true,
@@ -1725,10 +1918,11 @@ mod tests {
                 out[parent].level, HIER_LEVEL_SECTION,
                 "a leaf's parent must be its L1 section"
             );
-            // Contextual header: "<name> | <section_path> | p.<N>\n<raw>".
+            // Contextual header: "<clean title> | <section_path> | p.<N>\n<raw>". The header anchors
+            // on the READABLE title (`clean_document_title("Spec.pdf")` → "Spec"), not the raw filename.
             assert!(
-                leaf.embed_text.starts_with("Spec.pdf | "),
-                "embed text must carry the doc name header: {:?}",
+                leaf.embed_text.starts_with("Spec | "),
+                "embed text must carry the clean-title header: {:?}",
                 leaf.embed_text
             );
             assert!(
@@ -1771,6 +1965,78 @@ mod tests {
             "a flat doc still yields an L2 summary"
         );
         assert!(out.iter().all(|c| c.page_no.is_none()), "flow format → page None");
+    }
+
+    /// `clean_document_title`: filename → readable header anchor. Strips the real extension, turns
+    /// `_`/`-` into spaces, collapses runs; idempotent on a clean title; keeps internal dots + a
+    /// long non-extension tail.
+    #[test]
+    fn clean_document_title_makes_a_readable_anchor() {
+        assert_eq!(clean_document_title("Oskar_Orlowski_CV.pdf"), "Oskar Orlowski CV");
+        assert_eq!(clean_document_title("report-final.PDF"), "report final");
+        assert_eq!(clean_document_title("Weekly Sync"), "Weekly Sync"); // idempotent
+        assert_eq!(clean_document_title("notes.for.review"), "notes.for.review"); // "review" not an ext
+        assert_eq!(clean_document_title("v1.2 spec.docx"), "v1.2 spec"); // internal dot kept
+    }
+
+    /// `find_phones`: a `+`-led or separator-grouped 7–15 digit run is a phone (shown + bare); a solid
+    /// digit block (tax/VAT id) or a run glued to letters is NOT — the recall-safety filter.
+    #[test]
+    fn find_phones_detects_dialled_numbers_and_rejects_ids() {
+        let got = find_phones("Warsaw · +48 786 327 907 · oskar@wp.pl");
+        assert_eq!(got, vec![("+48 786 327 907".to_string(), "48786327907".to_string())]);
+        // Tax id: a solid block with no '+'/separator → NOT a phone. "PL8431621900": glued to letters.
+        assert!(
+            find_phones("VAT ID: PL8431621900  Tax ID: 8431621900").is_empty(),
+            "solid id blocks must not be mistaken for phones"
+        );
+        // A bare-'+' invoice phone still counts.
+        assert_eq!(
+            find_phones("Phone +48794003209"),
+            vec![("+48794003209".to_string(), "48794003209".to_string())]
+        );
+    }
+
+    /// `find_emails`: tolerant of the fragmented-PDF space before the local part
+    /// (`"oskar .orlow@wp.pl"` → `"orlow@wp.pl"`), requires a dotted domain, deduped + lowercased.
+    #[test]
+    fn find_emails_handles_fragmented_local_part() {
+        assert_eq!(find_emails("contact: oskar .orlow@wp.pl now"), vec!["orlow@wp.pl".to_string()]);
+        assert_eq!(find_emails("A@B.COM and a@b.com"), vec!["a@b.com".to_string()]); // dedup+lower
+        assert!(find_emails("no address here @ all").is_empty()); // no dotted domain
+    }
+
+    /// `detect_contact_digest` + the chunker: a doc with a phone/email gets EXACTLY ONE
+    /// `HIER_LEVEL_CONTACT` chunk carrying the bilingual bridge words AND the values (both legs); a
+    /// doc with no contact fact gets none.
+    #[test]
+    fn chunk_document_emits_one_contact_digest_with_bridge_words() {
+        let blocks = vec![blk(
+            "Oskar Orlowski — Staff Engineer. Warsaw. +48 786 327 907 orlow@wp.pl. Ten years of \
+             building web platforms.",
+            None,
+            None,
+        )];
+        let out = chunk_document_hierarchical("Oskar_Orlowski_CV.pdf", &blocks);
+        let digests: Vec<&HierChunk> = out.iter().filter(|c| c.level == HIER_LEVEL_CONTACT).collect();
+        assert_eq!(digests.len(), 1, "exactly one contact digest per doc");
+        let d = digests[0];
+        assert!(d.embed, "the digest is embedded (rides the vector leg)");
+        assert!(d.parent.is_none(), "the digest has no parent (never expanded away)");
+        for token in ["numer telefonu", "phone number", "telefon", "786 327 907", "48786327907", "orlow@wp.pl"] {
+            assert!(d.raw.contains(token), "digest raw must carry {token:?}: {:?}", d.raw);
+        }
+        // The embed leg additionally carries the CLEAN-title header anchor.
+        assert!(d.embed_text.contains("Oskar Orlowski CV"), "embed header uses the clean title: {:?}", d.embed_text);
+
+        // A contactless doc → no digest.
+        let plain = vec![blk("Notes about the roadmap and priorities.", None, None)];
+        assert!(
+            chunk_document_hierarchical("roadmap.md", &plain)
+                .iter()
+                .all(|c| c.level != HIER_LEVEL_CONTACT),
+            "no contact fact → no digest chunk"
+        );
     }
 
     /// Empty input → no chunks.
