@@ -115,9 +115,26 @@
   box-shadow: var(--glass-highlight);
   animation: bar-in 320ms var(--ease-spring) both;
 }
-.rec-strip.is-recording {
-  border-color: rgba(255, 122, 92, 0.4);
-  box-shadow: var(--live-glow), var(--glass-highlight);
+/* ── While recording: a THIN, quiet top line — the single alive heartbeat (the orb)
+   + the timer. Ambient chrome: low contrast, NO card/glow, so the notepad below reads
+   as the hero (Calm-Notepad, 2026-07-19). ── */
+.rec-topline {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  flex: none;
+  padding: var(--space-1) var(--space-2);
+  color: var(--text-secondary);
+  animation: bar-in 320ms var(--ease-spring) both;
+}
+.rec-topline-label {
+  font-size: 0.85rem;
+  font-weight: 550;
+  color: var(--text-secondary);
+  letter-spacing: -0.005em;
+}
+.rec-topline-spacer {
+  flex: 1;
 }
 .rec-strip.is-idle {
   flex-wrap: wrap;
@@ -253,38 +270,6 @@
   min-width: 48px;
   flex: none;
 }
-.wave {
-  flex: 0 0 auto;
-  display: flex;
-  align-items: center;
-  gap: 2px;
-  width: 84px;
-  height: 28px;
-  /* Guard: bars can never spill past the fixed box into the caption line. */
-  overflow: hidden;
-}
-.wbar {
-  flex: 1;
-  min-width: 2px;
-  max-width: 5px;
-  height: 100%;
-  border-radius: var(--radius-pill);
-  background: var(--live-gradient);
-  transform: scaleY(0.16);
-  transform-origin: center;
-  animation: wave 1100ms ease-in-out infinite;
-  animation-delay: calc(var(--i) * -78ms);
-}
-@keyframes wave {
-  0%,
-  100% {
-    transform: scaleY(calc(0.14 + var(--level, 0) * 0.55));
-  }
-  50% {
-    transform: scaleY(calc(0.32 + var(--level, 0) * 1.15));
-  }
-}
-
 /* Stop — warm circular button with a rounded square glyph (slim). */
 .stop-btn {
   display: inline-flex;
@@ -321,67 +306,81 @@
   background: var(--text-on-accent);
 }
 
-/* Ask AI — sparkle button beside Stop. Calm accent at idle, pulsing glow
-   while the assistant is listening so it's unmistakable. */
-.ask-btn {
+/* ── Ambient footer HUD — receded recording controls (Calm-Notepad, 2026-07-19).
+   A quiet glass bar pinned below the notepad: mic-mute · caption ticker · Ask · Stop.
+   Chrome that supports the content, never competes with it. ── */
+.rec-foot {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  flex: none;
+  padding: var(--space-2) var(--space-2) var(--space-2) var(--space-3);
+  border-radius: var(--radius-lg);
+  border: 1px solid var(--glass-border);
+  background: rgba(255, 255, 255, 0.04);
+  -webkit-backdrop-filter: blur(var(--glass-blur))
+    saturate(var(--glass-saturate));
+  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+  box-shadow: var(--glass-highlight);
+  animation: bar-in 320ms var(--ease-spring) both;
+}
+
+/* Ask — a labeled pill that SUMMONS the Brain panel (voice + text + presets live
+   in the panel). The single ✦ affordance, per Calm-Notepad. */
+.ask-pill {
+  position: relative;
   display: inline-flex;
   align-items: center;
-  justify-content: center;
-  width: 40px;
-  height: 40px;
-  min-width: 40px;
+  gap: var(--space-1);
   flex: none;
+  height: 34px;
+  padding: 0 var(--space-3);
   border: 1px solid var(--accent-ring);
-  border-radius: 50%;
+  border-radius: var(--radius-pill);
   color: var(--accent-hover);
   background: var(--accent-soft);
+  font-family: inherit;
+  font-size: 0.85rem;
+  font-weight: 550;
   cursor: pointer;
   transition:
     transform var(--transition-fast),
     background var(--transition),
-    box-shadow var(--transition),
     color var(--transition);
 }
-.ask-btn:hover {
+.ask-pill:hover {
   background: var(--accent);
   color: var(--text-on-accent);
-  transform: scale(1.05);
+  transform: translateY(-1px);
 }
-.ask-btn:active {
-  transform: scale(0.96);
+.ask-pill:active {
+  transform: translateY(0);
 }
-.ask-btn:focus-visible {
+.ask-pill:focus-visible {
   outline: none;
   box-shadow: 0 0 0 3px var(--accent-ring);
 }
-.ask-btn.is-listening {
-  background: var(--accent-gradient);
+.ask-pill.is-active {
+  background: var(--accent);
   color: var(--text-on-accent);
   border-color: transparent;
-  animation: ask-pulse 1.5s ease-in-out infinite;
+}
+.ask-pill-label {
+  line-height: 1;
 }
 .ask-ico {
   display: block;
 }
-@keyframes ask-pulse {
-  0%,
-  100% {
-    box-shadow: 0 0 0 0 var(--accent-ring);
-  }
-  50% {
-    box-shadow: 0 0 0 8px rgba(110, 118, 255, 0);
-  }
-}
-
-.ask-btn:disabled {
-  opacity: 0.55;
-  cursor: default;
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .ask-btn.is-listening {
-    animation: none;
-  }
+/* Quiet dot: an ongoing Ask thread while the panel is closed. */
+.ask-dot {
+  position: absolute;
+  top: -2px;
+  right: -2px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 8px var(--accent-soft);
 }
 
 /* Processing — cool, calm, working (inline in the idle strip). */

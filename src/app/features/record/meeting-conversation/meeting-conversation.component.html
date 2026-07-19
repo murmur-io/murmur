@@ -1,8 +1,14 @@
+<!-- Calm-Notepad recording surface (2026-07-19). The meeting's companion note is the
+     always-visible, always-full, CENTERED hero (the embedded editor). Recording state
+     lives in the record screen's thin top line + ambient footer HUD; Ask Brain is a
+     SUMMONED opaque sheet (footer ✦ / `/` slash entry / preset chip), never a standing
+     beside-the-editor split. The card is OPAQUE (`--surface-solid`), not the frosted
+     `.card` — glass is chrome, never a content panel wrapping the editor's overlays. -->
 <div class="card surface" role="group" aria-label="In-meeting note and Ask Brain">
-  <div class="surface-head">
-    <app-ai-orb class="head-orb" [state]="orbStateView()" />
-    <span
-      class="surface-hint"
+  <!-- Quiet enhance-honesty hint — centered above the note, only while it applies. -->
+  @if (enhanceHintVisible()) {
+    <p
+      class="enhance-hint"
       role="status"
       aria-live="polite"
       [class.is-enhancing]="enhancing()"
@@ -12,46 +18,15 @@
         Enhancing your notes…
       } @else if (settled()) {
         ✨ Notes enhanced — your note became the outline.
-      } @else if (enhanceAware() && store.hasPersistedNotes()) {
+      } @else {
         ✨ This note will shape your summary
       }
-    </span>
-
-    <!-- Ask Brain drawer toggle — replaces the retired Note|Ask segmented tabs. The
-         note is the always-visible hero; this opens the @brain thread beside it. -->
-    <button
-      type="button"
-      class="btn btn-ghost ask-toggle"
-      [class.is-active]="drawerOpen()"
-      [attr.aria-expanded]="drawerOpen()"
-      (click)="toggleDrawer()"
-    >
-      <svg
-        class="ask-toggle-glyph"
-        viewBox="0 0 16 16"
-        width="13"
-        height="13"
-        fill="none"
-        aria-hidden="true"
-      >
-        <path
-          d="M8 1.5l1.3 3.2L12.5 6 9.3 7.3 8 10.5 6.7 7.3 3.5 6l3.2-1.3L8 1.5Z"
-          stroke="currentColor"
-          stroke-width="1.2"
-          stroke-linejoin="round"
-        />
-      </svg>
-      Ask Brain
-      @if (askUnseen()) {
-        <span class="ask-toggle-dot" aria-hidden="true"></span>
-      }
-    </button>
-  </div>
+    </p>
+  }
 
   <!-- Ambient live reactions — the recall hint + contradiction whisper cards + the
-       shadow-mode calibration prompt. ABOVE the body so they surface even with the
-       drawer closed (never buried behind the toggle). All PURGED on any lock
-       transition by the store. -->
+       shadow-mode calibration prompt. Stay ABOVE the note so they surface with the Ask
+       panel closed (never buried). All PURGED on any lock transition by the store. -->
   @if (hasReactions()) {
     <div class="reactions-rail">
       @if (hintsEnabled() && store.hint(); as h) {
@@ -91,74 +66,124 @@
     </div>
   }
 
-  <!-- ===== Body row: the note document (HERO) + the optional Ask-Brain drawer.
-       A flex ROW so opening the drawer SHRINKS the document column (the editor
-       stays fully visible, never covered). The embedded editor is ALWAYS MOUNTED
-       (one live flush target). ===== -->
+  <!-- The note document (HERO) — the embedded editor, ALWAYS MOUNTED (one live flush
+       target) and ALWAYS FULL WIDTH of the card; its own `.note-doc` centers the
+       writing column to the calm measure. The `/` slash "Ask Brain" entry emits
+       `askBrain` → summon the panel below. -->
   <div class="surface-body">
     <div class="note-host">
-      <app-note-editor [embedded]="true" [noteIdInput]="store.companionNoteId()" />
+      <app-note-editor
+        [embedded]="true"
+        [noteIdInput]="store.companionNoteId()"
+        (askBrain)="store.openAskPanel()"
+      />
     </div>
-
-    @if (drawerOpen()) {
-      <aside class="ask-drawer" aria-label="Ask Brain about this meeting">
-        <div class="flow" #flow>
-          @if (!store.hasNotes()) {
-            <p class="flow-empty text-muted">
-              Ask the brain about this meeting and everything related — it answers
-              here with sources you can follow. An answer can be added straight into
-              your note.
-            </p>
-          }
-          @for (n of store.notes(); track n.id) {
-            <app-note-item [note]="n" (followed)="scrollToBottom()" />
-          }
-        </div>
-
-        <!-- Ask-Brain input row: voice mic + a plain single-line question input + Ask. -->
-        <form class="composer" (submit)="submitAsk($event)">
-          <button
-            type="button"
-            class="mic-btn"
-            [class.is-listening]="store.listening()"
-            [disabled]="store.processing()"
-            (click)="toggleAsk()"
-            [attr.aria-pressed]="store.listening()"
-            [attr.aria-label]="
-              store.listening() ? 'Stop listening and ask' : 'Ask by voice'
-            "
-            [title]="store.listening() ? 'Stop & ask' : 'Ask by voice'"
-          >
-            <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
-              <path
-                d="M12 3l1.6 4.4L18 9l-4.4 1.6L12 15l-1.6-4.4L6 9l4.4-1.6L12 3z"
-                fill="currentColor"
-              />
-              <path
-                d="M18.5 14l.8 2.2 2.2.8-2.2.8-.8 2.2-.8-2.2-2.2-.8 2.2-.8.8-2.2z"
-                fill="currentColor"
-                opacity="0.85"
-              />
-            </svg>
-          </button>
-          <input
-            #askInput
-            type="text"
-            class="ask-input"
-            placeholder="Ask about this meeting…"
-            aria-label="Ask about this meeting"
-            [value]="askDraft()"
-            (input)="onAskInput($event)"
-          />
-          <button
-            type="submit"
-            class="btn btn-primary send-btn"
-            [disabled]="!canAsk()"
-          >
-            Ask
-          </button>
-        </form>
-      </aside>
-    }
   </div>
+
+  <!-- ===== Summoned Ask-Brain panel — an OPAQUE sheet (T3) that floats over the
+       notepad ON DEMAND without unmounting the always-mounted editor. Preset chips
+       in the empty state replace the lonely "Ask Brain" link. ===== -->
+  @if (store.askPanelOpen()) {
+    <aside class="ask-panel" role="dialog" aria-label="Ask Brain about this meeting">
+      <header class="ask-panel-head">
+        <span class="ask-panel-title">
+          <svg
+            class="ask-panel-glyph"
+            viewBox="0 0 16 16"
+            width="14"
+            height="14"
+            fill="none"
+            aria-hidden="true"
+          >
+            <path
+              d="M8 1.5l1.3 3.2L12.5 6 9.3 7.3 8 10.5 6.7 7.3 3.5 6l3.2-1.3L8 1.5Z"
+              stroke="currentColor"
+              stroke-width="1.2"
+              stroke-linejoin="round"
+            />
+          </svg>
+          Ask Brain
+        </span>
+        <button
+          type="button"
+          class="ask-panel-close"
+          (click)="closeAsk()"
+          aria-label="Close Ask Brain"
+        >
+          <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+            <path
+              d="M4 4l8 8M12 4l-8 8"
+              stroke="currentColor"
+              stroke-width="1.5"
+              stroke-linecap="round"
+            />
+          </svg>
+        </button>
+      </header>
+
+      <div class="flow" #flow>
+        @if (!store.hasNotes()) {
+          <p class="flow-empty text-muted">
+            Ask about this meeting and everything related — the Brain answers here
+            with sources you can follow, and an answer can be added straight into
+            your note.
+          </p>
+          <div class="preset-chips" role="group" aria-label="Suggested questions">
+            @for (p of askPresets; track p) {
+              <button type="button" class="preset-chip" (click)="askPreset(p)">
+                {{ p }}
+              </button>
+            }
+          </div>
+        }
+        @for (n of store.notes(); track n.id) {
+          <app-note-item [note]="n" (followed)="scrollToBottom()" />
+        }
+      </div>
+
+      <!-- Ask-Brain input row: voice mic + a plain single-line question input + Ask. -->
+      <form class="composer" (submit)="submitAsk($event)">
+        <button
+          type="button"
+          class="mic-btn"
+          [class.is-listening]="store.listening()"
+          [disabled]="store.processing()"
+          (click)="toggleAsk()"
+          [attr.aria-pressed]="store.listening()"
+          [attr.aria-label]="
+            store.listening() ? 'Stop listening and ask' : 'Ask by voice'
+          "
+          [title]="store.listening() ? 'Stop & ask' : 'Ask by voice'"
+        >
+          <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+            <path
+              d="M12 3l1.6 4.4L18 9l-4.4 1.6L12 15l-1.6-4.4L6 9l4.4-1.6L12 3z"
+              fill="currentColor"
+            />
+            <path
+              d="M18.5 14l.8 2.2 2.2.8-2.2.8-.8 2.2-.8-2.2-2.2-.8 2.2-.8.8-2.2z"
+              fill="currentColor"
+              opacity="0.85"
+            />
+          </svg>
+        </button>
+        <input
+          #askInput
+          type="text"
+          class="ask-input"
+          placeholder="Ask about this meeting…"
+          aria-label="Ask about this meeting"
+          [value]="askDraft()"
+          (input)="onAskInput($event)"
+        />
+        <button
+          type="submit"
+          class="btn btn-primary send-btn"
+          [disabled]="!canAsk()"
+        >
+          Ask
+        </button>
+      </form>
+    </aside>
+  }
 </div>

@@ -39,15 +39,22 @@ test.describe("Record — a failed Ask AI leaves no orphaned mic bubble", () => 
     await page.goto("/record");
 
     await page.locator("button.start-btn").click();
-    await expect(page.locator(".rec-strip.is-recording")).toBeVisible({
+    await expect(page.locator(".rec-topline")).toBeVisible({
       timeout: 10_000,
     });
 
-    // Click "Ask AI" — begin_voice_command rejects immediately.
-    await page.locator("button.ask-btn").click();
+    // Summon the Ask-Brain panel from the footer, then trigger a voice ask via its
+    // mic — begin_voice_command rejects immediately (Calm-Notepad: voice now lives
+    // inside the summoned panel, not a top-strip Ask button).
+    await page.locator("app-record .ask-pill").click();
+    const mic = page.locator("app-meeting-conversation .ask-panel .mic-btn");
+    await expect(mic).toBeVisible();
+    await mic.click();
 
-    // The orb must NOT get stuck listening/processing.
-    await expect(page.locator("button.ask-btn.is-listening")).toHaveCount(0);
+    // The mic must NOT get stuck listening/processing.
+    await expect(
+      page.locator("app-meeting-conversation .mic-btn.is-listening"),
+    ).toHaveCount(0);
 
     // No orphaned "🎙 …" bubble/thread should remain anywhere in the flow.
     await expect(page.getByText("🎙 …", { exact: true })).toHaveCount(0);

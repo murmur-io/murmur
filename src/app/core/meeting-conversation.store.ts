@@ -304,6 +304,33 @@ export class MeetingConversationStore {
   readonly processing = this._processing.asReadonly();
 
   /**
+   * Whether the SUMMONED Ask-Brain panel is open (Calm-Notepad redesign,
+   * 2026-07-19). Ask is no longer a beside-editor split that halves the note
+   * column — it is an on-demand opaque sheet the user summons from the footer ✦,
+   * the `/` slash "Ask Brain" entry, or a preset chip. Lives in the ROOT store
+   * (not the surface component) so the record screen's footer and the note-editor
+   * slash item can open the SAME panel the surface renders. Defaults closed so the
+   * note is always the full centered hero.
+   */
+  private readonly _askPanelOpen = signal(false);
+  readonly askPanelOpen = this._askPanelOpen.asReadonly();
+
+  /** Summon the Ask-Brain panel (footer ✦ / `/` slash entry / preset chip). */
+  openAskPanel(): void {
+    this._askPanelOpen.set(true);
+  }
+
+  /** Dismiss the Ask-Brain panel (the note stays the always-visible hero). */
+  closeAskPanel(): void {
+    this._askPanelOpen.set(false);
+  }
+
+  /** Toggle the Ask-Brain panel from a single footer affordance. */
+  toggleAskPanel(): void {
+    this._askPanelOpen.update((open) => !open);
+  }
+
+  /**
    * The 4-state orb model collapsed from the existing signals — a PURE
    * `computed` (no signal writes → no NG0600 / trap T1):
    *   processing → "processing" (a voice dispatch is in flight)
@@ -483,6 +510,7 @@ export class MeetingConversationStore {
   clear(): void {
     this._notes.set([]);
     this.voiceTargetNoteId = null;
+    this._askPanelOpen.set(false);
     this.clearRail();
   }
 
