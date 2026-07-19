@@ -1,15 +1,18 @@
-/* The surface fills its host (the record screen makes it the full-height main
-   view) so the note + drawer grow to the bottom. */
+/* Calm-Notepad recording surface (2026-07-19). The surface fills its host (the record
+   screen makes it the full-height main view); the companion note is the centered HERO
+   and Ask Brain is a SUMMONED opaque sheet, never a beside-the-editor split. */
 :host {
   display: block;
   height: 100%;
 }
 
-/* OPAQUE hero card (v3, 2026-07-18): overrides the frosted global `.card` so glass
-   stays CHROME, never a content panel wrapping the editor + its overlays (T3/T4).
-   The floating overlays the editor spawns teleport to <body>, so this card no
-   longer needs to be their (broken) containing block. */
+/* OPAQUE hero card: overrides the frosted global `.card` so glass stays CHROME, never a
+   content panel wrapping the editor + its overlays (T3/T4). `position: relative` anchors
+   the summoned Ask-Brain sheet within the card. The floating overlays the editor spawns
+   (`/`/`[[` menus, selection toolbar) teleport to <body>, so this card doesn't need to be
+   their containing block. */
 .surface {
+  position: relative;
   display: flex;
   flex-direction: column;
   gap: var(--space-3);
@@ -20,56 +23,37 @@
   backdrop-filter: none;
 }
 
-.surface-head {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
-}
-.head-orb {
-  --orb-size: 22px;
-}
-.surface-hint {
-  flex: 1 1 auto;
-  min-width: 0;
-  color: var(--text-muted);
-  font-size: 0.78rem;
-}
-
-/* Ask-Brain drawer toggle (replaces the retired segmented tabs). Neutral ghost
-   pill; the active/open state reads as a selected chrome control. */
-.ask-toggle {
-  position: relative;
+/* Quiet enhance-honesty hint — centered on the note's measure, above the document. It
+   tints accent as the note shapes the summary (enhancing / settled). */
+.enhance-hint {
   flex: none;
-  gap: var(--space-1);
-  height: 30px;
-  padding: 0 var(--space-3);
-  font-size: 0.82rem;
+  width: 100%;
+  max-width: var(--editor-measure);
+  margin: 0 auto;
+  text-align: center;
+  color: var(--text-muted);
+  font-size: 0.8rem;
 }
-.ask-toggle.is-active {
-  background: var(--shell-active-bg, var(--surface-hover));
-  color: var(--text-primary);
+.enhance-hint.is-enhancing,
+.enhance-hint.is-settled {
+  color: var(--accent);
+  animation: rise 200ms var(--transition) both;
 }
-.ask-toggle-glyph {
-  color: var(--accent-hover);
-}
-.ask-toggle-dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: var(--accent);
-  box-shadow: 0 0 8px var(--accent-soft);
+@media (prefers-reduced-motion: reduce) {
+  .enhance-hint.is-enhancing,
+  .enhance-hint.is-settled {
+    animation: none;
+  }
 }
 
-/* ── Body row: the note document (hero) + optional Ask-Brain drawer ────────── */
+/* ── The note document is the full-width HERO; its own `.note-doc` centers the writing
+   column to the calm measure (--editor-measure). The embedded editor is ALWAYS MOUNTED
+   (one live flush target). ── */
 .surface-body {
   display: flex;
-  flex-direction: row;
-  align-items: stretch;
-  gap: var(--space-3);
   flex: 1 1 auto;
   min-height: 0;
 }
-/* The note editor is the always-visible HERO; it SHRINKS when the drawer opens. */
 .note-host {
   display: flex;
   flex-direction: column;
@@ -85,35 +69,7 @@
   overflow: auto;
 }
 
-/* The Ask-Brain drawer — a docked side panel (in-flow, not a floating overlay), so
-   it uses a left border + its own scroll. Slides in without a transform-based
-   entry animation (which would trap any position:fixed descendant). */
-.ask-drawer {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-2);
-  flex: 0 0 clamp(280px, 34%, 380px);
-  min-width: 0;
-  min-height: 0;
-  padding-left: var(--space-3);
-  border-left: 1px solid var(--border-subtle);
-  animation: ask-drawer-in var(--transition-dur) var(--transition-ease, ease) both;
-}
-@keyframes ask-drawer-in {
-  from {
-    opacity: 0;
-  }
-  to {
-    opacity: 1;
-  }
-}
-@media (prefers-reduced-motion: reduce) {
-  .ask-drawer {
-    animation: none;
-  }
-}
-
-/* ── Ambient live reactions — recall + contradiction lanes above the body ──── */
+/* ── Ambient live reactions — recall + contradiction lanes above the body ── */
 .reactions-rail {
   display: flex;
   flex-direction: column;
@@ -152,13 +108,118 @@
   font-size: 0.8rem;
 }
 
-/* ── The scrollable Ask-Brain flow (oldest → newest), inside the drawer ────── */
+/* ===== Summoned Ask-Brain panel — an OPAQUE sheet (T3: --surface-overlay + border-strong
+   + shadow-lg, NEVER the frosted `.card`) floating over the notepad ON DEMAND, without
+   unmounting the always-mounted editor. Opacity-only entry: a transform would trap any
+   position:fixed descendant. ===== */
+.ask-panel {
+  position: absolute;
+  left: var(--space-3);
+  right: var(--space-3);
+  bottom: var(--space-3);
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  max-height: 62%;
+  padding: var(--space-3);
+  background: var(--surface-overlay);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg);
+  animation: ask-panel-in var(--transition-dur) ease both;
+}
+@keyframes ask-panel-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .ask-panel {
+    animation: none;
+  }
+}
+.ask-panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex: none;
+}
+.ask-panel-title {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+.ask-panel-glyph {
+  color: var(--accent-hover);
+}
+.ask-panel-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  flex: none;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition:
+    background var(--transition),
+    color var(--transition);
+}
+.ask-panel-close:hover {
+  background: var(--surface-hover);
+  color: var(--text-primary);
+}
+.ask-panel-close:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+
+/* Preset one-tap Ask starters — the empty-state antidote to the lonely link. */
+.preset-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin-top: var(--space-1);
+}
+.preset-chip {
+  padding: var(--space-1) var(--space-3);
+  border-radius: var(--radius-pill);
+  border: 1px solid var(--border-subtle);
+  background: var(--surface-hover);
+  color: var(--text-primary);
+  font-family: inherit;
+  font-size: 0.82rem;
+  cursor: pointer;
+  transition:
+    border-color var(--transition),
+    background var(--transition);
+}
+.preset-chip:hover {
+  border-color: var(--accent-ring);
+  background: var(--accent-soft);
+}
+.preset-chip:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+
+/* ── The scrollable Ask-Brain flow (oldest → newest), inside the panel ── */
 .flow {
   display: flex;
   flex-direction: column;
   gap: var(--space-2);
   flex: 1 1 auto;
-  min-height: 120px;
+  min-height: 80px;
   overflow-y: auto;
   padding-right: var(--space-1);
 }
@@ -171,7 +232,7 @@
   display: block;
 }
 
-/* ── Ask-Brain input row: voice mic + single-line question input + Ask ─────── */
+/* ── Ask-Brain input row: voice mic + single-line question input + Ask ── */
 .composer {
   display: flex;
   align-items: center;
@@ -256,19 +317,6 @@
 }
 @media (prefers-reduced-motion: reduce) {
   .mic-btn.is-listening {
-    animation: none;
-  }
-}
-
-/* ── ENHANCE-MY-NOTES: the head hint tints accent as the note shapes the summary. ── */
-.surface-hint.is-enhancing,
-.surface-hint.is-settled {
-  color: var(--accent);
-  animation: rise 200ms var(--transition) both;
-}
-@media (prefers-reduced-motion: reduce) {
-  .surface-hint.is-enhancing,
-  .surface-hint.is-settled {
     animation: none;
   }
 }

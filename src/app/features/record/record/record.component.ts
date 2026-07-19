@@ -69,11 +69,6 @@ export class RecordComponent implements OnInit {
   /** Handle for the meeting-app poll — cleared on destroy (no leaked interval). */
   private meetingAppPoll: ReturnType<typeof setInterval> | null = null;
 
-  /** Bars in the live waveform (driven by the real mic level signal). 16 bars fit the fixed
-   * 84px `.wave` box (16×2px min + 15×2px gap ≈ 62px) with room to flex; 28 overflowed the box
-   * and spilled into the caption ("…IIIIDzięki za oglądanie!"). */
-  readonly bars = Array.from({ length: 16 }, (_, i) => i);
-
   /** The in-pill mic-mute toggle — its `muted()` signal drives the stage hint. */
   private readonly micToggle = viewChild(MicMuteToggleComponent);
 
@@ -460,27 +455,6 @@ export class RecordComponent implements OnInit {
   /** Summon the floating always-on-top bar (also bound to ⌘⇧R globally). */
   popOut(): void {
     void this.ipc.toggleBar();
-  }
-
-  /**
-   * CLICK-TO-STOP toggle for the "Ask AI" (✨) button. First click opens the
-   * voice-command listener (no wake phrase); a second click — while listening —
-   * stops it so the FULL utterance is dispatched (→ processing). The backend
-   * streams listening/processing over EVENT_VOICE_COMMAND_LISTENING /
-   * EVENT_VOICE_COMMAND_PROCESSING and the spoken answer lands in a thread on the
-   * notes surface below. Swallow rejections (e.g. brain backend off) — the store
-   * resets its listening/processing/in-flight state on error.
-   */
-  toggleAsk(): void {
-    if (this.assistant.listening()) {
-      void this.assistant.endAsk().catch(() => {
-        /* stop failed — store cleared processing/in-flight */
-      });
-    } else {
-      void this.assistant.askNow().catch(() => {
-        /* listener unavailable — store resets the in-flight/listening state */
-      });
-    }
   }
 
   /**

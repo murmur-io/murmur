@@ -14,7 +14,6 @@ import {
 } from "@angular/core";
 import { MeetingConversationStore } from "../../../core/meeting-conversation.store";
 import { NoteEditorComponent } from "../../notes/note-editor/note-editor.component";
-import { AiOrbComponent } from "../ai-orb/ai-orb.component";
 import { NoteItemComponent } from "../note-item/note-item.component";
 import { ProactiveHintCardComponent } from "../proactive-hint-card/proactive-hint-card.component";
 import { WhisperCardComponent } from "../whisper-card/whisper-card.component";
@@ -51,7 +50,6 @@ import { WhisperCardComponent } from "../whisper-card/whisper-card.component";
   selector: "app-meeting-conversation",
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [
-    AiOrbComponent,
     NoteEditorComponent,
     NoteItemComponent,
     ProactiveHintCardComponent,
@@ -78,13 +76,18 @@ export class MeetingConversationComponent implements OnInit {
   readonly settled = input(false);
   readonly enhanceAware = input(false);
 
-  /** Whether the Ask-Brain drawer is open (the note editor is the always-visible hero). */
-  protected readonly drawerOpen = signal(false);
-
-  /** A quiet dot on the Ask-Brain toggle when a closed drawer hides an ongoing thread. */
-  protected readonly askUnseen = computed(
-    () => !this.drawerOpen() && this.store.hasNotes(),
-  );
+  /**
+   * Preset one-tap Ask-Brain starters shown in the summoned panel's empty state —
+   * the antidote to the "lonely Ask Brain link" (Fireflies/Zoom live-assist).
+   * Biased to what the on-device Brain answers well DURING a meeting (your notes +
+   * prior-meeting retrieval), not a pretend two-speaker live transcript.
+   */
+  protected readonly askPresets: readonly string[] = [
+    "Summarize what I've noted so far",
+    "What did we decide?",
+    "Draft a follow-up message",
+    "Pull related notes on this meeting",
+  ];
 
   /** Whether any live reaction is showing (drives the ambient rail's presence). */
   protected readonly hasReactions = computed(
@@ -94,9 +97,12 @@ export class MeetingConversationComponent implements OnInit {
       this.store.showShadowCalibration(),
   );
 
-  /** During the enhance pass the orb shows its shipped 'processing' choreography. */
-  readonly orbStateView = computed(() =>
-    this.enhancing() ? ("processing" as const) : this.store.orbState(),
+  /** True while the enhance hint should surface (quiet, centered, above the note). */
+  protected readonly enhanceHintVisible = computed(
+    () =>
+      this.enhancing() ||
+      this.settled() ||
+      (this.enhanceAware() && this.store.hasPersistedNotes()),
   );
 
   /** This session's Ask-Brain question draft (signal-backed — zoneless). */
@@ -119,12 +125,34 @@ export class MeetingConversationComponent implements OnInit {
     });
 
     // Auto-scroll the Ask flow to the newest turn whenever the conversation changes
-    // AND the drawer is open. afterNextRender is zoneless-safe (no signal writes).
+    // AND the panel is open. afterNextRender is zoneless-safe (no signal writes).
     effect(() => {
       this.store.notes();
-      if (this.drawerOpen()) {
+      if (this.store.askPanelOpen()) {
         afterNextRender(() => this.scrollToBottom(), { injector: this.injector });
       }
+    });
+
+    // Ask-Brain panel lifecycle (Calm-Notepad, 2026-07-19). The open/closed state
+    // lives in the ROOT store (summoned by the footer ✦ / the `/` slash "Ask Brain"
+    // entry / a preset chip). On OPEN, focus the question input for a fast ask. On
+    // CLOSE, reload the always-mounted editor + refresh the enhance-honesty content
+    // so an Ask-Brain "Add to note" append is reflected in the hero document — the
+    // retired toggleDrawer's close semantics, now driven by the shared signal. The
+    // prev flag is closure-local: on a remount both values start false (the panel is
+    // closed on mount), so no spurious reload/focus fires.
+    let prevPanelOpen = false;
+    effect(() => {
+      const open = this.store.askPanelOpen();
+      if (open && !prevPanelOpen) {
+        afterNextRender(() => this.askInput()?.nativeElement.focus(), {
+          injector: this.injector,
+        });
+      } else if (!open && prevPanelOpen) {
+        this.noteEditor()?.reload();
+        this.store.refreshCompanionContentNow();
+      }
+      prevPanelOpen = open;
     });
   }
 
@@ -134,24 +162,18 @@ export class MeetingConversationComponent implements OnInit {
     void this.store.init();
   }
 
-  /**
-   * Toggle the Ask-Brain drawer. CLOSING reloads the always-mounted editor in place
-   * (so an Ask-Brain "Add to note" append / external edit is reflected in the hero
-   * document) + refreshes the enhance-honesty content signal — mirroring the retired
-   * return-to-Note-tab semantics without destroying the one live flush target.
-   * OPENING focuses the question input for a fast ask.
-   */
-  protected toggleDrawer(): void {
-    const next = !this.drawerOpen();
-    this.drawerOpen.set(next);
-    if (next) {
-      afterNextRender(() => this.askInput()?.nativeElement.focus(), {
-        injector: this.injector,
-      });
-    } else {
-      this.noteEditor()?.reload();
-      this.store.refreshCompanionContentNow();
-    }
+  /** Dismiss the summoned Ask-Brain panel (close × / Esc). The editor reload +
+   * content refresh runs on the closed edge in the panel-lifecycle effect. */
+  protected closeAsk(): void {
+    this.store.closeAskPanel();
+  }
+
+  /** Fire a preset starter → ensure the panel is open, then open a thread. */
+  protected askPreset(question: string): void {
+    this.store.openAskPanel();
+    void this.store.openThread(question).catch(() => {
+      /* the store resolves the agent turn with an error in the thread */
+    });
   }
 
   /** Scroll the Ask-Brain flow to its newest content. */
