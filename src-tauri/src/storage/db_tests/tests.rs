@@ -2344,6 +2344,235 @@
         assert_eq!(visible_total, 2);
     }
 
+    /// DOCUMENTS LEG (2026-07-20 link-documents): `list_link_candidates_visible` now surfaces
+    /// uploaded `kind='document'` rows too — matched by TITLE when present AND by the `name`
+    /// (filename) fallback when a document has no `title` — prefix-filtered case-insensitively.
+    /// RED against the pre-fix two-leg reader (which only ever returned notes + meetings).
+    #[test]
+    fn list_link_candidates_returns_visible_documents_by_title_and_name() {
+        let db = mem_db();
+        seed_folder(&db, "f-open", "Open");
+
+        // A document WITH a title (matched on the title). Documents carry a title only after a
+        // rename/ingest, so set it directly here (the test-only raw-UPDATE pattern this file uses).
+        db.insert_document("d-titled", "f-open", "report-final.pdf", "body", "document", 1_000)
+            .unwrap();
+        db.lock()
+            .execute("UPDATE documents SET title = 'Quarterly Report' WHERE id='d-titled'", [])
+            .unwrap();
+        // A document with NO title — only a filename (matched on the `name` fallback).
+        db.insert_document("d-cv", "f-open", "Oskar_Orlowski_CV.pdf", "body", "document", 2_000)
+            .unwrap();
+
+        let nothing = std::collections::HashSet::new();
+
+        // Prefix "Quart" hits the titled doc; not the CV.
+        let (by_title, _) = db
+            .list_link_candidates_visible("Quart", 10, 0, &nothing)
+            .unwrap();
+        assert_eq!(by_title.len(), 1);
+        assert_eq!(by_title[0].kind, "document");
+        assert_eq!(by_title[0].id, "d-titled");
+        assert_eq!(by_title[0].title, "Quarterly Report");
+
+        // Prefix "Oskar" hits the CV by its filename (COALESCE(title, name) fallback).
+        let (by_name, _) = db
+            .list_link_candidates_visible("Oskar", 10, 0, &nothing)
+            .unwrap();
+        assert_eq!(by_name.len(), 1);
+        assert_eq!(by_name[0].kind, "document");
+        assert_eq!(by_name[0].id, "d-cv");
+        assert_eq!(by_name[0].title, "Oskar_Orlowski_CV.pdf");
+
+        // Case-insensitive (SQLite LIKE is ASCII-case-insensitive), same as the notes/meetings legs.
+        let (ci, _) = db
+            .list_link_candidates_visible("oskar", 10, 0, &nothing)
+            .unwrap();
+        assert_eq!(ci.len(), 1);
+        assert_eq!(ci[0].id, "d-cv");
+    }
+
+    /// GATED (documents): a sealed-and-not-session-unlocked document is ABSENT from candidates AND
+    /// must not inflate `local_total` — session-unlock reverses it. Same discipline as
+    /// `list_link_candidates_hides_sealed_sources` for notes/meetings, now for the documents leg.
+    /// RED against an ungated documents scan.
+    #[test]
+    fn list_link_candidates_hides_sealed_documents() {
+        let db = mem_db();
+        seed_folder(&db, "f-locked", "Secret");
+        db.set_folder_locked("f-locked", true, Some(b"wrapped"))
+            .unwrap();
+
+        // A sealed document titled "Secret Dossier" — plaintext still present, so the gate is the
+        // sole suppressor.
+        db.insert_document("d-secret", "f-locked", "dossier.pdf", "classified", "document", 1_000)
+            .unwrap();
+        db.lock()
+            .execute("UPDATE documents SET title = 'Secret Dossier' WHERE id='d-secret'", [])
+            .unwrap();
+
+        let nothing = std::collections::HashSet::new();
+        let (hidden, hidden_total) = db
+            .list_link_candidates_visible("Secret", 10, 0, &nothing)
+            .unwrap();
+        assert!(
+            hidden.is_empty(),
+            "a sealed-and-not-unlocked document must not be a link candidate"
+        );
+        assert_eq!(
+            hidden_total, 0,
+            "the pagination total must not leak that a sealed document exists"
+        );
+
+        let mut unlocked = std::collections::HashSet::new();
+        unlocked.insert("f-locked".to_string());
+        let (visible, visible_total) = db
+            .list_link_candidates_visible("Secret", 10, 0, &unlocked)
+            .unwrap();
+        assert_eq!(visible.len(), 1, "unlocking reveals the document");
+        assert_eq!(visible[0].id, "d-secret");
+        assert_eq!(visible_total, 1);
+    }
+
+    /// PAGINATION across the notes → meetings → documents seam: `offset` walks the ONE combined
+    /// ordering without duplicating or skipping rows, and the documents leg sits AFTER both notes
+    /// and meetings (so pre-existing notes/meetings page positions are unchanged). RED against the
+    /// pre-fix reader (documents never appeared, and `local_total` omitted the document count).
+    #[test]
+    fn list_link_candidates_paginates_across_the_documents_seam() {
+        let db = mem_db();
+        seed_folder(&db, "f-open", "Open");
+
+        // 2 notes (newest-updated first: n2, n1) + 1 meeting + 1 document.
+        db.insert_note("n1", "f-open", "one", "Note One", "body", 1_000)
+            .unwrap();
+        db.insert_note("n2", "f-open", "two", "Note Two", "body", 2_000)
+            .unwrap();
+        let mut m = sample_meeting("m1", "2026-06-20T10:00:00Z");
+        m.title = Some("Meeting One".to_string());
+        db.insert_meeting(&m).unwrap();
+        note_for(&db, "m1", "claude_code", "note");
+        db.set_note_folder("m1", Some("f-open")).unwrap();
+        db.insert_document("d1", "f-open", "Handbook.pdf", "body", "document", 3_000)
+            .unwrap();
+
+        let nothing = std::collections::HashSet::new();
+        let page = |offset: i64| {
+            db.list_link_candidates_visible("", 2, offset, &nothing)
+                .unwrap()
+        };
+
+        // The combined stable ordering is [Note Two, Note One] ++ [Meeting One] ++ [Handbook.pdf].
+        // Total spans all three legs on every page (it feeds the org-leg offset math downstream).
+        let (p0, total) = page(0);
+        assert_eq!(
+            p0.iter().map(|c| c.title.as_str()).collect::<Vec<_>>(),
+            vec!["Note Two", "Note One"]
+        );
+        assert_eq!(total, 4, "local total = notes + meetings + documents");
+
+        // Page 1 straddles the meetings→documents seam: the meeting, then the document last.
+        let (p1, _) = page(2);
+        assert_eq!(
+            p1.iter()
+                .map(|c| (c.kind.as_str(), c.title.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("meeting", "Meeting One"), ("document", "Handbook.pdf")]
+        );
+
+        // Past the end: an empty page, never an error, and no duplicate of the document.
+        let (p2, _) = page(4);
+        assert!(p2.is_empty());
+
+        // Cross-page dedup + no-gap sanity: the union of all pages is exactly the 4 distinct ids.
+        let mut seen: Vec<String> = Vec::new();
+        for off in [0, 2, 4] {
+            for c in page(off).0 {
+                assert!(!seen.contains(&c.id), "no row appears on two pages");
+                seen.push(c.id);
+            }
+        }
+        let mut ids = seen.clone();
+        ids.sort();
+        assert_eq!(ids, vec!["d1", "m1", "n1", "n2"]);
+    }
+
+    /// DOCUMENT LEG (`resolve_wikilink`): a visible `kind='document'` resolves to
+    /// `WikiTarget{kind:"document"}`; a SEALED document does NOT resolve (falls through to None);
+    /// and a title shared by a note AND a document prefers the NOTE (note-first ordering). RED
+    /// against the pre-fix resolver, which had no document leg (a doc-only title returned None).
+    #[test]
+    fn resolve_wikilink_resolves_visible_document_and_prefers_note_and_hides_sealed() {
+        let db = mem_db();
+        seed_folder(&db, "f-open", "Open");
+        seed_folder(&db, "f-locked", "Secret");
+        db.set_folder_locked("f-locked", true, Some(b"wrapped"))
+            .unwrap();
+
+        // A visible document titled "Roadmap" (a doc-only title, no note/meeting names it).
+        db.insert_document("d-road", "f-open", "roadmap.pdf", "body", "document", 1_000)
+            .unwrap();
+        // A sealed document titled "Dossier" — plaintext present, so the gate is the sole suppressor.
+        db.insert_document("d-seal", "f-locked", "dossier.pdf", "body", "document", 1_000)
+            .unwrap();
+        // A note AND a document sharing the title "Shared" — note-first must win.
+        db.insert_note("n-shared", "f-open", "shared-note", "Shared", "body", 2_000)
+            .unwrap();
+        db.insert_document("d-shared", "f-open", "shared.pdf", "body", "document", 2_000)
+            .unwrap();
+        // Set the document titles directly (the test-only raw-UPDATE pattern this file uses).
+        {
+            let conn = db.lock();
+            conn.execute("UPDATE documents SET title='Roadmap' WHERE id='d-road'", [])
+                .unwrap();
+            conn.execute("UPDATE documents SET title='Dossier' WHERE id='d-seal'", [])
+                .unwrap();
+            conn.execute("UPDATE documents SET title='Shared' WHERE id='d-shared'", [])
+                .unwrap();
+        }
+
+        let nothing = std::collections::HashSet::new();
+
+        // Doc-only title resolves to the document.
+        let road = db
+            .resolve_wikilink("Roadmap", &nothing)
+            .unwrap()
+            .expect("[[Roadmap]] resolves to the document");
+        assert_eq!(road.kind, "document");
+        assert_eq!(road.id, "d-road");
+
+        // Case-insensitive fallback also reaches the document.
+        let road_ci = db
+            .resolve_wikilink("roadmap", &nothing)
+            .unwrap()
+            .expect("[[roadmap]] resolves case-insensitively");
+        assert_eq!(road_ci.kind, "document");
+        assert_eq!(road_ci.id, "d-road");
+
+        // Sealed document does NOT resolve (nothing unlocked).
+        assert!(
+            db.resolve_wikilink("Dossier", &nothing).unwrap().is_none(),
+            "a sealed document must not be resolvable from a wikilink"
+        );
+        // Session-unlock reverses it.
+        let mut unlocked = std::collections::HashSet::new();
+        unlocked.insert("f-locked".to_string());
+        let sealed = db
+            .resolve_wikilink("Dossier", &unlocked)
+            .unwrap()
+            .expect("unlocked document resolves");
+        assert_eq!(sealed.kind, "document");
+        assert_eq!(sealed.id, "d-seal");
+
+        // A title shared by a note AND a document prefers the NOTE (note leg runs first).
+        let shared = db
+            .resolve_wikilink("Shared", &nothing)
+            .unwrap()
+            .expect("[[Shared]] resolves");
+        assert_eq!(shared.kind, "note", "a note+doc title collision prefers the note");
+        assert_eq!(shared.id, "n-shared");
+    }
+
     /// FAIL-CLOSED: a correction row with a NULL `meeting_id` (legacy/unattributed) is never returned
     /// by the gated reader, even with nothing locked.
     #[test]

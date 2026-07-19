@@ -150,6 +150,17 @@
   background: var(--surface-hover);
 }
 
+/* A Related chip rendered as a <button> (a `document` neighbour, which has no
+   route → it opens the preview modal instead of navigating). Same solid chip
+   visual as the routed <a>, plus the button resets `.cx-chip` doesn't need for
+   an anchor (inherit the app font, left-align the label, show the pointer). */
+.cx-chip--open {
+  font: inherit;
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+
 /* Remove (×) — an in-chip trailing button (design-system removable-chip pattern),
    tucked INSIDE the pill's right edge over reserved padding so it never floats in the
    inter-chip gap or overlaps the label, with a comfortable 24px hit target. The wrap

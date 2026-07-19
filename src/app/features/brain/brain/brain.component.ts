@@ -18,6 +18,7 @@ import type {
   FolderNode,
   GraphData,
 } from "../../../core/models";
+import { DocumentPreviewService } from "../../../services/document-preview.service";
 import { FoldersService } from "../../../services/folders.service";
 import { ToastService } from "../../../services/toast.service";
 import { BrainEnableCardComponent } from "../brain-enable-card/brain-enable-card.component";
@@ -26,7 +27,6 @@ import { FullBrainGraphComponent } from "../full-brain-graph/full-brain-graph.co
 import { BrainMemoryComponent } from "../brain-memory/brain-memory.component";
 import { BrainNoteEditorComponent } from "../brain-note-editor/brain-note-editor.component";
 import { BrainSourceCardComponent } from "../brain-source-card/brain-source-card.component";
-import { DocumentPreviewComponent } from "../document-preview/document-preview.component";
 import { BriefsComponent } from "../../briefs/briefs/briefs.component";
 import { AuditComponent } from "../../audit/audit/audit.component";
 
@@ -83,7 +83,6 @@ interface FolderOption {
     RouterLink,
     BrainEnableCardComponent,
     BrainSourceCardComponent,
-    DocumentPreviewComponent,
     BrainNoteEditorComponent,
     BrainMapComponent,
     FullBrainGraphComponent,
@@ -99,6 +98,7 @@ export class BrainComponent {
   private readonly folders = inject(FoldersService);
   private readonly toast = inject(ToastService);
   private readonly destroyRef = inject(DestroyRef);
+  private readonly docPreview = inject(DocumentPreviewService);
 
   // ── "Enable the brain" nudge — shown only when an on-device model is missing ─
   /**
@@ -316,14 +316,6 @@ export class BrainComponent {
 
   // ── note editor modal ──────────────────────────────────────────────────
   readonly noteEditorOpen = signal(false);
-
-  // ── document/note content-preview modal ────────────────────────────────
-  /**
-   * The document/note currently open in the read-only preview modal, or null
-   * when closed. Set from a source card's `openItem`; the modal fetches the
-   * gated text itself (sealed folders mask to "" → it renders LOCKED).
-   */
-  readonly previewDoc = signal<DocumentInfo | null>(null);
 
   // ── connections (graph) ────────────────────────────────────────────────
   readonly graphData = signal<GraphData | null>(null);
@@ -613,14 +605,14 @@ export class BrainComponent {
     }
   }
 
-  /** Open the read-only content preview for a document/note row. */
+  /**
+   * Open the read-only content preview for a document/note row. Delegates to the
+   * app-wide {@link DocumentPreviewService} (hosted ONCE in the app shell) so
+   * there's a single preview host/source of truth across every surface —
+   * `DocumentInfo` is structurally a `DocumentPreviewTarget`.
+   */
   openPreview(doc: DocumentInfo): void {
-    this.previewDoc.set(doc);
-  }
-
-  /** Close the content preview modal. */
-  closePreview(): void {
-    this.previewDoc.set(null);
+    this.docPreview.open(doc);
   }
 
   openNoteEditor(): void {
