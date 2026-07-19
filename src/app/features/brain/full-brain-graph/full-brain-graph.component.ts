@@ -23,6 +23,10 @@ import {
   type FullSceneEdge,
   type FullSceneNode,
 } from "./full-brain-scene.directive";
+import { layoutFullBrain, layoutLayered } from "./full-brain-layout";
+
+/** The two graph shapes: layered "neural" bands, or organic clustered islands. */
+type LayoutMode = "layers" | "clusters";
 
 /** Per-kind node lens chip metadata (label + the token that colors its dot). */
 interface NodeLens {
@@ -37,12 +41,15 @@ interface EdgeLens {
   token: string;
 }
 
-/** Rendered-node hard cap — the strongest-degree top-K keep the draw bounded. */
-const MAX_NODES = 140;
-/** Fixed force-directed iteration count — run ONCE, synchronously, no loop. */
-const ITERATIONS = 260;
-/** Logical world scale (world units); the scene camera fits to the cloud. */
-const WORLD = 1000;
+/**
+ * Rendered-node hard cap — the strongest-degree top-K keep the draw bounded.
+ * Raised 140 → 500 (2026-07-19): the previous cap dropped ~15 of a 155-node vault
+ * ("Drawing 140 of 155"); 500 shows a normal vault IN FULL, and the per-component
+ * layout + tiling in `full-brain-layout.ts` keeps even 500 nodes compact + legible.
+ * Only a pathological vault (the backend returns up to ~2000) now hits the cap,
+ * where the honest "Drawing N of M" disclosure + LOD labels carry it.
+ */
+const MAX_NODES = 500;
 
 /**
  * The FULL-BRAIN GRAPH — `getFullGraph()` rendered as one unified, typed graph:
@@ -131,6 +138,14 @@ export class FullBrainGraphComponent {
   // ── hover hint (a11y / affordance) ───────────────────────────────────────
   readonly hoverId = signal<string | null>(null);
   readonly selectedId = signal<string | null>(null);
+  /** Current zoom as a % of fit (100 = fit-to-view) — the scene reports it. */
+  readonly zoomPct = signal(100);
+  /** Graph shape: layered "neural" bands (default) or organic clustered islands. */
+  readonly layoutMode = signal<LayoutMode>("layers");
+  protected readonly layoutModes: readonly { key: LayoutMode; label: string }[] = [
+    { key: "layers", label: "Layers" },
+    { key: "clusters", label: "Clusters" },
+  ];
 
   // ── honest disclosures (mirror the entity graph) ─────────────────────────
   protected readonly hasHidden = computed(
@@ -224,167 +239,42 @@ export class FullBrainGraphComponent {
   protected readonly drawnEdgeCount = computed(() => this.sceneEdges().length);
 
   /**
-   * The laid-out scene nodes — a PURE derivation of the lens-filtered graph.
-   * Top-{@link MAX_NODES} by in-graph degree (id tiebreak), circular seed keyed
-   * by sort index, a fixed {@link ITERATIONS}-iteration 2-D Fruchterman-Reingold
-   * pass (pairwise repulsion + edge springs + gentle centre pull), then an
-   * overlap-relaxation pass. Deterministic: no `Math.random`, coincident points
-   * get index-hash nudges — same data → identical layout every render.
+   * The laid-out scene nodes — a PURE derivation of the lens-filtered graph via
+   * {@link layoutFullBrain}: top-{@link MAX_NODES} by in-graph degree (id
+   * tiebreak), then per-connected-component Fruchterman-Reingold + degree-0
+   * singleton tiling + shelf-packing so disconnected orphans never scatter to the
+   * corners. Deterministic (no `Math.random`) — same data → identical layout, as
+   * the `computed()` re-run on every lens toggle requires.
    */
   protected readonly sceneNodes = computed<FullSceneNode[]>(() => {
     const all = this.filteredNodes();
     if (all.length === 0) {
       return [];
     }
-    // Deterministic order: highest-degree first, id as a stable tiebreak.
+    // Deterministic order: highest-degree first, id as a stable tiebreak; cap.
     const ordered = [...all].sort(
       (a, b) => b.degree - a.degree || a.id.localeCompare(b.id),
     );
-    const nodes = ordered.slice(0, MAX_NODES);
-    const n = nodes.length;
-    const idIndex = new Map(nodes.map((x, i) => [x.id, i]));
-
-    // Degree → soma radius (7…20 world units), sqrt-scaled.
-    const maxDeg = Math.max(1, ...nodes.map((x) => x.degree));
-    const radii = nodes.map(
-      (x) => 7 + (Math.sqrt(x.degree) / Math.sqrt(maxDeg)) * 13,
+    const capped = ordered.slice(0, MAX_NODES);
+    const layout =
+      this.layoutMode() === "layers" ? layoutLayered : layoutFullBrain;
+    return layout(
+      capped.map((nd) => ({
+        id: nd.id,
+        kind: nd.kind,
+        label: nd.label,
+        degree: nd.degree,
+        date: nd.date,
+      })),
+      // Only edges whose endpoints both survive the cap contribute; the layout
+      // filters internally, so passing all lens-filtered edges is fine.
+      this.filteredEdges().map((e) => ({
+        src: e.src,
+        dst: e.dst,
+        srcKind: e.srcKind,
+        dstKind: e.dstKind,
+      })),
     );
-
-    // SEED: a golden-angle spiral keyed by sort index → identical every render.
-    const golden = Math.PI * (3 - Math.sqrt(5));
-    const seedR = WORLD * 0.42;
-    const xs = new Float64Array(n);
-    const ys = new Float64Array(n);
-    for (let i = 0; i < n; i++) {
-      const rr = seedR * Math.sqrt((i + 0.5) / n);
-      const ang = i * golden;
-      xs[i] = rr * Math.cos(ang);
-      ys[i] = rr * Math.sin(ang);
-    }
-
-    // Only edges whose endpoints both survived the cap participate in springs.
-    const edges = this.filteredEdges().filter(
-      (e) => idIndex.has(e.src) && idIndex.has(e.dst),
-    );
-    const degree = new Map<string, number>();
-    for (const e of edges) {
-      degree.set(e.src, (degree.get(e.src) ?? 0) + 1);
-      degree.set(e.dst, (degree.get(e.dst) ?? 0) + 1);
-    }
-
-    // 2-D Fruchterman-Reingold.
-    const k = Math.sqrt((WORLD * WORLD) / Math.max(1, n)) * 1.1;
-    const k2 = k * k;
-    let temp = WORLD * 0.14;
-    const cool = temp / (ITERATIONS + 1);
-    const dxs = new Float64Array(n);
-    const dys = new Float64Array(n);
-
-    for (let iter = 0; iter < ITERATIONS; iter++) {
-      dxs.fill(0);
-      dys.fill(0);
-      for (let i = 0; i < n; i++) {
-        for (let j = i + 1; j < n; j++) {
-          let dx = xs[i] - xs[j];
-          let dy = ys[i] - ys[j];
-          let d2 = dx * dx + dy * dy;
-          if (d2 < 0.01) {
-            dx = ((i * 31 + j) % 7) - 3 + 0.5;
-            dy = ((i * 17 + j) % 5) - 2 + 0.5;
-            d2 = dx * dx + dy * dy;
-          }
-          const dist = Math.sqrt(d2);
-          const force = k2 / dist;
-          const fx = (dx / dist) * force;
-          const fy = (dy / dist) * force;
-          dxs[i] += fx;
-          dys[i] += fy;
-          dxs[j] -= fx;
-          dys[j] -= fy;
-        }
-      }
-      for (const e of edges) {
-        const i = idIndex.get(e.src) as number;
-        const j = idIndex.get(e.dst) as number;
-        const dx = xs[i] - xs[j];
-        const dy = ys[i] - ys[j];
-        const dist = Math.sqrt(dx * dx + dy * dy) || 0.01;
-        // Attenuate hub springs (÷√min-degree) so high-degree nodes don't crush
-        // their whole neighbourhood into one clump.
-        const hub = Math.sqrt(
-          Math.min(degree.get(e.src) ?? 1, degree.get(e.dst) ?? 1),
-        );
-        const force = ((dist * dist) / k / hub) * 0.9;
-        const fx = (dx / dist) * force;
-        const fy = (dy / dist) * force;
-        dxs[i] -= fx;
-        dys[i] -= fy;
-        dxs[j] += fx;
-        dys[j] += fy;
-      }
-      for (let i = 0; i < n; i++) {
-        const dl = Math.sqrt(dxs[i] * dxs[i] + dys[i] * dys[i]) || 1;
-        const step = Math.min(dl, temp);
-        xs[i] += (dxs[i] / dl) * step;
-        ys[i] += (dys[i] / dl) * step;
-        xs[i] -= xs[i] * 0.006;
-        ys[i] -= ys[i] * 0.006;
-      }
-      temp = Math.max(0, temp - cool);
-    }
-
-    // Recentre on the centroid.
-    let mx = 0;
-    let my = 0;
-    for (let i = 0; i < n; i++) {
-      mx += xs[i];
-      my += ys[i];
-    }
-    mx /= n;
-    my /= n;
-    for (let i = 0; i < n; i++) {
-      xs[i] -= mx;
-      ys[i] -= my;
-    }
-
-    // OVERLAP RELAXATION: push any two somas apart until clear.
-    for (let pass = 0; pass < 30; pass++) {
-      let moved = false;
-      for (let i = 0; i < n; i++) {
-        for (let j = i + 1; j < n; j++) {
-          let dx = xs[i] - xs[j];
-          let dy = ys[i] - ys[j];
-          let dist = Math.sqrt(dx * dx + dy * dy);
-          const need = radii[i] + radii[j] + 16;
-          if (dist >= need) {
-            continue;
-          }
-          if (dist < 0.01) {
-            dx = ((i * 31 + j) % 7) - 3 + 0.5;
-            dy = ((i * 17 + j) % 5) - 2 + 0.5;
-            dist = Math.sqrt(dx * dx + dy * dy);
-          }
-          const push = (need - dist) / 2 / dist;
-          xs[i] += dx * push;
-          ys[i] += dy * push;
-          xs[j] -= dx * push;
-          ys[j] -= dy * push;
-          moved = true;
-        }
-      }
-      if (!moved) {
-        break;
-      }
-    }
-
-    return nodes.map((node, i) => ({
-      id: node.id,
-      kind: node.kind,
-      label: node.label,
-      r: radii[i],
-      x: xs[i],
-      y: ys[i],
-    }));
   });
 
   /**
@@ -402,6 +292,8 @@ export class FullBrainGraphComponent {
           key: `${e.srcKind}:${e.src}::${e.dstKind}:${e.dst}::${e.kind}`,
           src: e.src,
           dst: e.dst,
+          srcKind: e.srcKind,
+          dstKind: e.dstKind,
           kind: e.kind,
           suggested: e.status === "suggested",
         });
@@ -486,6 +378,9 @@ export class FullBrainGraphComponent {
   protected toggleSuggested(): void {
     this.showSuggested.update((v) => !v);
   }
+  protected setLayoutMode(mode: LayoutMode): void {
+    this.layoutMode.set(mode);
+  }
 
   // ── camera toolbar (delegates to the scene directive) ────────────────────
   protected zoomIn(): void {
@@ -494,21 +389,27 @@ export class FullBrainGraphComponent {
   protected zoomOut(): void {
     this.scene()?.zoomBy(0.8);
   }
-  protected resetView(): void {
+  /** "Fit" — re-frame the whole cloud in the viewport. */
+  protected fitView(): void {
     this.scene()?.resetView();
   }
 
-  // ── click-through (route by node kind — reuse existing nav) ──────────────
+  /**
+   * Single click = FOCUS a node (pin selection so its neighbourhood spotlights
+   * and the user can dwell on it), toggling off on a second click or on empty
+   * space. It NEVER navigates — that's {@link onOpen} (double-click). This fixes
+   * the old "a click yanks you to a route so you can never explore" behaviour.
+   */
   protected onPick(id: string | null): void {
-    if (id === null) {
-      this.selectedId.set(null);
-      return;
-    }
+    this.selectedId.update((cur) => (id !== null && cur === id ? null : id));
+  }
+
+  /** Double click = OPEN the node (route by kind — reuse existing nav). */
+  protected onOpen(id: string): void {
     const node = this.graphData()?.nodes.find((n) => n.id === id);
     if (!node) {
       return;
     }
-    this.selectedId.set(id);
     switch (node.kind) {
       case "meeting":
         void this.router.navigate(["/meeting", id]);
