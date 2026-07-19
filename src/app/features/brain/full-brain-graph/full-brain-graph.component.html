@@ -32,6 +32,12 @@
         <span>{{ msg }}</span>
       </div>
     }
+    @if (edgesTruncated()) {
+      <div class="banner is-accent fbg-banner" role="status">
+        <span class="fbg-banner-glyph" aria-hidden="true"></span>
+        <span>Some links are hidden — the graph shows the strongest connections.</span>
+      </div>
+    }
 
     <!-- LENSES — node-type + edge-type toggle chips (filter what's drawn). -->
     <div class="fbg-lenses">

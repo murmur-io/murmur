@@ -23,6 +23,31 @@ import { LinkPickerComponent } from "../../features/notes/link-picker/link-picke
 type ConfidenceTier = "high" | "med" | "low";
 
 /**
+ * A precomputed DETERMINISTIC-chip view-model row (PR-9 F5). Every per-row value the
+ * template used to compute via a method call (`routeFor`/`isRemovable`/`isPending`) is
+ * resolved ONCE in a `computed()` here, so the template binds fields only — no method
+ * re-runs every change-detection pass (the zoneless computed-only rule).
+ */
+interface DeterministicRow {
+  readonly edge: LinkEdge;
+  readonly route: unknown[];
+  readonly removable: boolean;
+  readonly pending: boolean;
+}
+
+/**
+ * A precomputed SEMANTIC-suggestion view-model row (PR-9 F5): the edge plus its
+ * confidence `tier`/`label` and `route`/`pending`, all resolved in a `computed()`.
+ */
+interface SuggestionRow {
+  readonly edge: LinkEdge;
+  readonly route: unknown[];
+  readonly tier: ConfidenceTier;
+  readonly scoreLabel: string;
+  readonly pending: boolean;
+}
+
+/**
  * Brain v3 PR-3 "Connections" — a self-contained panel of the persisted link
  * edges incident on one item (`list_links(kind, id)`), shown BESIDE the existing
  * "Linked mentions" backlinks chip row in the meeting Note tab and the note
@@ -165,6 +190,37 @@ export class ConnectionsComponent {
   );
 
   /**
+   * PR-9 F5 — the DETERMINISTIC chips as a precomputed view-model. Depends on
+   * `deterministic()` (edges) AND `pending()` so a re-fetch or an in-flight
+   * Accept/Unlink recomputes the rows; the template binds fields only (no per-row
+   * method call per change-detection pass).
+   */
+  readonly deterministicRows = computed<DeterministicRow[]>(() => {
+    const pending = this.pending();
+    return this.deterministic().map((edge) => ({
+      edge,
+      route: this.routeFor(edge),
+      removable: edge.manual === true,
+      pending: pending.has(edge.id),
+    }));
+  });
+
+  /**
+   * PR-9 F5 — the SEMANTIC suggestions as a precomputed view-model (tier + label +
+   * route + pending resolved once). Same dependency shape as {@link deterministicRows}.
+   */
+  readonly suggestionRows = computed<SuggestionRow[]>(() => {
+    const pending = this.pending();
+    return this.suggestions().map((edge) => ({
+      edge,
+      route: this.routeFor(edge),
+      tier: this.tier(edge.score),
+      scoreLabel: this.scoreLabel(edge.score),
+      pending: pending.has(edge.id),
+    }));
+  });
+
+  /**
    * Load the edges whenever `(kind, id)`, `locked`, OR the session lock-tree
    * changes. Reading `folders.tree()` registers this effect as its dependent so a
    * later unlock/relock re-asks the backend (sealed neighbours drop out / reappear
@@ -200,8 +256,8 @@ export class ConnectionsComponent {
     }
   }
 
-  /** The confidence tier for a semantic suggestion's cosine score. */
-  tier(score: number): ConfidenceTier {
+  /** The confidence tier for a semantic suggestion's cosine score (F5: row-model input). */
+  private tier(score: number): ConfidenceTier {
     if (score >= 0.88) {
       return "high";
     }
@@ -211,18 +267,18 @@ export class ConnectionsComponent {
     return "low";
   }
 
-  /** Whole-number percentage label for a suggestion's confidence chip. */
-  scoreLabel(score: number): string {
+  /** Whole-number percentage label for a suggestion's confidence chip (F5: row-model input). */
+  private scoreLabel(score: number): string {
     return `${Math.round(score * 100)}%`;
   }
 
-  /** True while an Accept/Dismiss for this edge is in flight (buttons disabled). */
-  isPending(id: number): boolean {
+  /** True while an Accept/Dismiss/Unlink for this edge is in flight (guards `mutate`). */
+  private isPending(id: number): boolean {
     return this.pending().has(id);
   }
 
-  /** The click-through route array for an edge's neighbour, split by kind. */
-  routeFor(e: LinkEdge): unknown[] {
+  /** The click-through route array for an edge's neighbour, split by kind (F5: row-model input). */
+  private routeFor(e: LinkEdge): unknown[] {
     return e.otherKind === "meeting"
       ? ["/meeting", e.otherId]
       : ["/notes", e.otherId];
@@ -236,15 +292,6 @@ export class ConnectionsComponent {
   /** Dismiss a suggestion → tombstone server-side, then re-fetch to drop it. */
   dismiss(e: LinkEdge): void {
     void this.mutate(e.id, () => this.ipc.dismissLink(e.id));
-  }
-
-  /**
-   * PR-1 — whether a deterministic chip is USER-REMOVABLE (shows the hover `×`).
-   * Only manual links (`manual === true`, set by the backend on the deduped
-   * manual+wikilink chip) are removable here; auto wikilink/companion edges are not.
-   */
-  isRemovable(e: LinkEdge): boolean {
-    return e.manual === true;
   }
 
   /**
