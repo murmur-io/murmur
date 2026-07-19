@@ -49,6 +49,15 @@
      (92% of the available pane), not a fixed design value. */
   --editor-max: 920px;
 
+  /* The EMBEDDED note editor's calm-notepad measure (Calm-Notepad recording
+     redesign, 2026-07-19). While recording, the companion note is a centered
+     WRITING column — not a full-bleed document — so a single line reads as a
+     calm notepad, not a gargantuan empty canvas. ~40rem (≈640px) is a
+     comfortable reading measure (~66ch at the body size) with generous
+     symmetric margin. Distinct from --editor-max (920px), which is the routed
+     full-page document width, not the in-meeting notepad. */
+  --editor-measure: 40rem;
+
   /* Per-NESTING-LEVEL indent step for the sidebar's folder trees (2026-07-12
      fix) — ONE shared token so Meetings' recursive `--depth` calc
      (folder-row.component.scss) and Notes' flat single-level list
