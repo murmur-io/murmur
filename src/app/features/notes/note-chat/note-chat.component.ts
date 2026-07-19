@@ -8,6 +8,7 @@ import {
   effect,
   inject,
   input,
+  output,
   signal,
   viewChild,
 } from "@angular/core";
@@ -61,6 +62,32 @@ export class NoteChatComponent {
    */
   readonly anchorTitle = input<string | null>(null);
 
+  /**
+   * The anchor's KIND. "note" (default) grounds via the local note's source scope, prefilled into
+   * the picker. "org" grounds a read-only SHARED (org-feed) note (the org-item viewer): the item is
+   * pinned server-side via `pinnedOrgItemId` — an org item is NOT a valid local {@link SourceRef},
+   * so we do NOT prefill a (wrong) note scope; the picker starts empty and the user may still add
+   * their own notes/meetings as extra scope.
+   */
+  readonly anchorKind = input<"note" | "org">("note");
+
+  /**
+   * BARE mode (docked in the note-editor's right drawer): drop the frosted `.card` frame + aurora
+   * glow and FILL the host height, so the drawer is ONE coherent surface (no card-in-panel double
+   * border) with the composer pinned to the bottom. Defaults false ⇒ the standalone card look.
+   */
+  readonly bare = input(false);
+
+  /**
+   * Show a close (×) affordance in the header band — set by the drawer host so the chat OWNS its
+   * own header (title + close) as a single aligned pane header, rather than a floating corner
+   * button. Pressing it emits {@link close}; the host toggles the drawer shut.
+   */
+  readonly showClose = input(false);
+  /** Emitted when the header × is pressed. The drawer host closes itself. (Not `close` — that
+   *  collides with the native DOM event name and trips `@angular-eslint/no-output-native`.) */
+  readonly closed = output<void>();
+
   /** The running conversation (optimistic user turns + grounded replies). */
   readonly conversation = signal<ChatTurn[]>([]);
   /** True while an {@link IpcService.askVault} call is in flight. */
@@ -89,9 +116,16 @@ export class NoteChatComponent {
    */
   private prefillSeq = 0;
   private readonly _prefill = effect(() => {
+    const kind = this.anchorKind();
     const id = this.noteId();
     const title = this.anchorTitle() ?? undefined;
     const seq = ++this.prefillSeq;
+    if (kind !== "note") {
+      // Org anchor: pinned server-side via `pinnedOrgItemId`; an org item is not a local SourceRef,
+      // so prefilling a note scope for its id would be wrong. Start the picker empty.
+      this.sources.set([]);
+      return;
+    }
     void this.sourceScope.defaultSources("note", id, title).then((defaults) => {
       if (seq === this.prefillSeq) {
         this.sources.set(defaults);
@@ -192,6 +226,9 @@ export class NoteChatComponent {
         priorHistory,
         undefined,
         scope.length ? scope : undefined,
+        // Org anchor: pin the shared note server-side so the answer is always grounded in it
+        // (works for the local Brain too, which otherwise never retrieves org-feed content).
+        this.anchorKind() === "org" ? this.noteId() : undefined,
       );
       this.conversation.update((turns) => [
         ...turns,

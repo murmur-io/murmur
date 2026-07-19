@@ -15,6 +15,7 @@ import { TabsService } from "../../../core/tabs.service";
 import { tabKeyFor } from "../../../core/tab-keys";
 import type { OrgItemDetail } from "../../../core/models";
 import { MarkdownComponent } from "../../../shared/markdown/markdown.component";
+import { NoteChatComponent } from "../../notes/note-chat/note-chat.component";
 import { ToastService } from "../../../services/toast.service";
 
 /**
@@ -38,7 +39,7 @@ import { ToastService } from "../../../services/toast.service";
 @Component({
   selector: "app-org-item-viewer",
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [MarkdownComponent],
+  imports: [MarkdownComponent, NoteChatComponent],
   templateUrl: "./org-item-viewer.component.html",
   styleUrl: "./org-item-viewer.component.scss",
 })
@@ -103,6 +104,17 @@ export class OrgItemViewerComponent {
   readonly markdownDraft = signal("");
   /** True while `orgUpdateOwnItem` (seal → publish → tombstone-old) is in flight. */
   readonly saving = signal(false);
+
+  /**
+   * Ask Brain pane open/closed — the read-only viewer's right-hand "Ask about this note" split. It
+   * grounds in THIS shared org item (pinned server-side via `pinnedOrgItemId`, since org-feed
+   * content is not otherwise reachable by the local Brain's search). Session signal, default
+   * COLLAPSED; the toggle is hidden while editing-in-place (a focused writing mode).
+   */
+  readonly orgChatOpen = signal(false);
+  toggleOrgChat(): void {
+    this.orgChatOpen.update((v) => !v);
+  }
 
   constructor() {
     // Resolve + fetch the org item whenever the route id changes. Async IPC

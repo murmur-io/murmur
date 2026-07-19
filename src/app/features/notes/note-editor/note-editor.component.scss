@@ -5,7 +5,18 @@
 :host {
   display: flex;
   flex-direction: column;
-  min-height: calc(100vh - var(--space-8));
+  /* INTERNAL-SCROLL (2026-07-18): BOUND the editor to the pane so the NOTE BODY scrolls inside
+     `.editor-body` while the chrome (tab strip + the header) and the Ask Brain pane stay put.
+     Height = viewport − the chrome ABOVE this host (main-col margin 10px + tab strip + app-main top
+     padding `--space-7`).
+     REACH THE BOTTOM (2026-07-19, user request "the Brain side element should go all the way to the
+     bottom"): the height NO LONGER subtracts app-main's bottom padding `--space-8`, and a negative
+     `margin-bottom` cancels that padding so the split (and its right pane) reaches the very bottom of
+     the window instead of being cut off ~64px short. Total still nets to 100vh (top chrome + this
+     host), so the PAGE never scrolls — `.editor-body` still owns the note scroll. */
+  height: calc(100vh - 10px - var(--tabs-strip-height, 0px) - var(--space-7));
+  margin-bottom: calc(-1 * var(--space-8));
+  min-height: 0;
 }
 
 .editor {
@@ -26,6 +37,9 @@
 :host:has(.editor.is-embedded) {
   min-height: 0;
   height: 100%;
+  /* Embedded (recording panel): fill the host panel exactly — NO negative bleed (that's a
+     routed-layout affordance for canceling app-main's bottom padding, which doesn't exist here). */
+  margin-bottom: 0;
 }
 .editor.is-embedded {
   height: 100%;
@@ -71,7 +85,10 @@
   align-items: center;
   gap: var(--space-2);
   padding: var(--space-4) var(--space-6) var(--space-3);
-  border-bottom: 1px solid var(--border-subtle);
+  /* A crisp full-width divider (mid-tier `--border`, not the faint `--border-subtle`): this is the
+     seam the toolbar sits above — the note body AND the Ask Brain column both dock under it, so it
+     needs to read as a clean cutoff between the buttons and the content below (2026-07-19). */
+  border-bottom: 1px solid var(--border);
 }
 .head-spacer {
   flex: 1 1 auto;
@@ -143,6 +160,23 @@
   font-size: 0.85rem;
 }
 .head-btn.is-shared {
+  color: var(--accent-hover);
+}
+/* Ask Brain toggle: the glyph adopts the accent, and the active (drawer-open)
+   state reads as a pressed neutral pill with the accent glyph/label. */
+.head-chat-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+.head-chat-glyph {
+  color: var(--accent);
+}
+.head-chat-btn.is-active {
+  background: var(--surface-hover);
+  color: var(--accent-hover);
+}
+.head-chat-btn.is-active .head-chat-glyph {
   color: var(--accent-hover);
 }
 .share-dot {
@@ -239,12 +273,79 @@
   }
 }
 
-/* ===== Body scroll region ===== */
+/* ===== Body: the full-height SPLIT VIEW =====
+   A flex ROW that fills the WHOLE editor. The header now lives INSIDE the note column
+   (`.editor-col`), so this row spans top-to-bottom and the divider between the panes is
+   continuous (no full-width header welding the panes at the top). The note column flexes to
+   fill; the Ask Brain drawer column (when open) takes a fixed width beside it and the note
+   column shrinks to fit — two separate panes, one continuous vertical divider between them. */
+.editor-main {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  align-items: stretch;
+}
+
+/* The note pane: its own header band + the scrolling document, stacked. */
+.editor-col {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ===== Body scroll region (inside the note pane) ===== */
 .editor-body {
   flex: 1 1 auto;
+  min-width: 0;
   min-height: 0;
   overflow-y: auto;
   padding: var(--space-5) var(--space-6) var(--space-8);
+}
+
+/* ===== Ask Brain drawer (right PANE of the split view) =====
+   A full-height second COLUMN beside the note — not a floating overlay, not a bar hanging off the
+   header. It carries its OWN header band (the chat's `.chat-head`, aligned with the note header)
+   and is separated from the note pane by ONE continuous hairline that runs top-to-bottom. */
+.note-chat-drawer {
+  /* Full-height pane (2026-07-19 redesign): `.editor-main` is a stretch flex ROW spanning the whole
+     editor, so this pane runs from the very top to the very bottom — its header band lines up with
+     the note header, and the divider below is one unbroken vertical line (fixing the old "welded at
+     the top, cut at the bottom" look). `.editor-body` owns the note scroll, the chat owns its own,
+     so both panes stay put relative to each other. */
+  flex: none;
+  width: clamp(320px, 30vw, 400px);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  /* ONE continuous hairline divider, full height (it crosses the header band too, so the two panes
+     read as a single split, not a floating box). Same token as the header dividers ⇒ the vertical
+     and horizontal seams match. */
+  border-left: 1px solid var(--border);
+  /* A subtle raised pane tone so the "tool" column reads as distinct from the document without the
+     heavy opaque-modal look — it's in-flow chrome now (not a floating overlay), so T3 doesn't apply
+     and the frosted-raised surface is the right register. */
+  background: var(--surface-raised);
+  animation: note-chat-drawer-in var(--transition);
+}
+@keyframes note-chat-drawer-in {
+  from {
+    opacity: 0;
+    transform: translateX(12px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+/* The chat FILLS the whole drawer as ONE flat surface (bare mode = no card frame); its internal
+   message log owns the scroll, so the composer pins to the bottom with no empty strip below. */
+.note-chat-drawer .note-chat {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
 }
 .editor-status {
   color: var(--text-muted);
@@ -304,11 +405,6 @@
 }
 .note-doc.is-full-width {
   max-width: max(var(--editor-max), min(1600px, 92%));
-}
-/* Ask-about-this-note panel — separated from the body it sits below. */
-.note-chat {
-  display: block;
-  margin-top: var(--space-6);
 }
 .note-title-input {
   width: 100%;
@@ -609,5 +705,8 @@
   }
   .note-doc {
     transition: none;
+  }
+  .note-chat-drawer {
+    animation: none;
   }
 }
