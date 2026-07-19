@@ -2,10 +2,25 @@
   display: flex;
   flex-direction: column;
   gap: var(--space-4);
-  /* Fill the routed viewport so the conversation thread can grow to the
-     bottom (conversation-first). The host is the flex parent. */
-  min-height: calc(100vh - var(--space-8));
+  /* Fill the routed viewport (conversation-first). CORRECT the fill so it never
+     overflows: cancel the chrome ABOVE the surface (main-col margin 10px + tab strip +
+     app-main's top padding --space-7); the old `calc(100vh - --space-8)` ignored all of
+     that and forced the surface ~--space-7 too tall (a permanent bottom overflow, worst
+     on small screens). A negative bottom margin cancels app-main's bottom padding so the
+     footer / last card can reach the window bottom. Mirrors the note-editor :host math. */
+  min-height: calc(100vh - 10px - var(--tabs-strip-height, 0px) - var(--space-7));
+  margin-bottom: calc(-1 * var(--space-8));
   animation: rise 420ms var(--transition) both;
+}
+
+/* When the note is the ACTIVE writing surface (recording / an in-flight pipeline with
+   the companion note visible — see boundToViewport), BOUND the height so the whole thing
+   (top bar → notepad → footer HUD) fits with NO page scroll and the note scrolls
+   INTERNALLY. The "done" review state stays unbounded (min-height above) so its stacked
+   Brain-reveal / Re-Truth cards can scroll. */
+.record.is-bounded {
+  height: calc(100vh - 10px - var(--tabs-strip-height, 0px) - var(--space-7));
+  min-height: 0;
 }
 
 /* ── The conversation thread = the full-height main surface ─────────── */
@@ -115,26 +130,55 @@
   box-shadow: var(--glass-highlight);
   animation: bar-in 320ms var(--ease-spring) both;
 }
-/* ── While recording: a THIN, quiet top line — the single alive heartbeat (the orb)
-   + the timer. Ambient chrome: low contrast, NO card/glow, so the notepad below reads
-   as the hero (Calm-Notepad, 2026-07-19). ── */
-.rec-topline {
+/* ── While recording: ONE coherent top bar — the recording heartbeat (orb + timer) +
+   the headphones hint folded in + Pop out. A quiet glass strip matching the footer HUD,
+   so the top and bottom chrome bracket the notepad symmetrically (2026-07-19). ── */
+.rec-topbar {
   display: flex;
   align-items: center;
   gap: var(--space-3);
   flex: none;
-  padding: var(--space-1) var(--space-2);
-  color: var(--text-secondary);
+  padding: var(--space-2) var(--space-2) var(--space-2) var(--space-3);
+  border-radius: var(--radius-lg);
+  border: 1px solid var(--glass-border);
+  background: rgba(255, 255, 255, 0.04);
+  -webkit-backdrop-filter: blur(var(--glass-blur))
+    saturate(var(--glass-saturate));
+  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+  box-shadow: var(--glass-highlight);
   animation: bar-in 320ms var(--ease-spring) both;
 }
-.rec-topline-label {
+.rt-status {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex: none;
+}
+.rt-label {
   font-size: 0.85rem;
   font-weight: 550;
   color: var(--text-secondary);
   letter-spacing: -0.005em;
 }
-.rec-topline-spacer {
-  flex: 1;
+/* Headphones hint, folded inline — muted, shrinks + truncates before it crowds. */
+.rt-hint {
+  flex: 0 1 auto;
+  min-width: 0;
+  color: var(--text-muted);
+  font-size: 0.82rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.rt-hint strong {
+  color: var(--text-secondary);
+  font-weight: 600;
+}
+.rt-hint-ico {
+  margin-right: var(--space-1);
+}
+.rt-spacer {
+  flex: 1 1 auto;
 }
 .rec-strip.is-idle {
   flex-wrap: wrap;
