@@ -1569,25 +1569,8 @@ impl Db {
         Ok(())
     }
 
-    /// Brain v2 L5 — idempotent MCP-SERVER config schema. One row per user-configured external MCP
-    /// server: transport + endpoint + args + the ENABLED and per-server CONSENTED flags (consent
-    /// default 0 — fail-closed; flipped only by the dedicated consent commands). Connection config
-    /// only — never query text or results.
-    fn migrate_mcp_servers(conn: &Connection) -> Result<()> {
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS mcp_servers (
-               id TEXT PRIMARY KEY,
-               label TEXT NOT NULL,
-               transport TEXT NOT NULL,
-               endpoint TEXT NOT NULL,
-               args TEXT NOT NULL DEFAULT '[]',
-               enabled INTEGER NOT NULL DEFAULT 1,
-               consented INTEGER NOT NULL DEFAULT 0,
-               created_at TEXT NOT NULL
-             );",
-        )
-        .map_err(map_err)
-    }
+    // `migrate_mcp_servers` (the idempotent `mcp_servers` config schema) moved to
+    // `storage::mcp_store` (God-file split) — still called above as `Self::migrate_mcp_servers`.
 
     /// M6 Shared Brain — local org bookkeeping. Two tables, additive + guarded, mirroring the
     /// `outbound_shares` conventions:
@@ -11940,78 +11923,9 @@ impl Db {
     }
 
     // ── Brain v2 L5 — MCP server config rows ────────────────────────────────────────────────────
-
-    /// All configured MCP servers (connection config only — never query text or results).
-    pub fn list_mcp_servers(&self) -> Result<Vec<crate::storage::models::McpServer>> {
-        let conn = self.lock();
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, label, transport, endpoint, args, enabled, consented, created_at \
-                   FROM mcp_servers ORDER BY created_at ASC, id ASC",
-            )
-            .map_err(map_err)?;
-        let rows = stmt.query_map([], row_to_mcp_server).map_err(map_err)?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r.map_err(map_err)?);
-        }
-        Ok(out)
-    }
-
-    /// One MCP server by id.
-    pub fn get_mcp_server(&self, id: &str) -> Result<Option<crate::storage::models::McpServer>> {
-        let conn = self.lock();
-        conn.query_row(
-            "SELECT id, label, transport, endpoint, args, enabled, consented, created_at \
-               FROM mcp_servers WHERE id = ?1",
-            [id],
-            row_to_mcp_server,
-        )
-        .optional()
-        .map_err(map_err)
-    }
-
-    /// Insert one MCP server row (caller validates transport/endpoint — see `add_mcp_server`).
-    pub fn insert_mcp_server(&self, s: &crate::storage::models::McpServer) -> Result<()> {
-        let args = serde_json::to_string(&s.args)
-            .map_err(|e| AppError::Storage(format!("mcp args serialize: {e}")))?;
-        let conn = self.lock();
-        conn.execute(
-            "INSERT INTO mcp_servers (id, label, transport, endpoint, args, enabled, consented, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            rusqlite::params![
-                s.id,
-                s.label,
-                s.transport,
-                s.endpoint,
-                args,
-                s.enabled as i64,
-                s.consented as i64,
-                s.created_at,
-            ],
-        )
-        .map_err(map_err)?;
-        Ok(())
-    }
-
-    /// Remove one MCP server row (revokes its tool exposure on the next registry/spec build).
-    pub fn delete_mcp_server(&self, id: &str) -> Result<()> {
-        let conn = self.lock();
-        conn.execute("DELETE FROM mcp_servers WHERE id = ?1", [id])
-            .map_err(map_err)?;
-        Ok(())
-    }
-
-    /// Flip one MCP server's per-server egress consent (the ONLY writer of `consented`).
-    pub fn set_mcp_server_consented(&self, id: &str, consented: bool) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
-            "UPDATE mcp_servers SET consented = ?2 WHERE id = ?1",
-            rusqlite::params![id, consented as i64],
-        )
-        .map_err(map_err)?;
-        Ok(())
-    }
+    // The `mcp_servers` table CRUD (`list_mcp_servers` / `get_mcp_server` / `insert_mcp_server` /
+    // `delete_mcp_server` / `set_mcp_server_consented`) + `row_to_mcp_server` moved to
+    // `storage::mcp_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
     /// Persist ONE voiceprint (opt-in voice biometric) for a diarized cluster of `meeting_id`.
     /// `embedding` is the L2-normalized CAM++ vector; it is stored as a little-endian f32 BLOB.
@@ -13178,22 +13092,8 @@ fn row_to_brief_run(row: &Row<'_>) -> rusqlite::Result<crate::storage::models::B
     })
 }
 
-/// Map an `mcp_servers` row (id, label, transport, endpoint, args JSON, enabled, consented,
-/// created_at) to a [`crate::storage::models::McpServer`]. Malformed `args` JSON degrades to no
-/// args (fail-quiet on config, never a crash).
-fn row_to_mcp_server(row: &Row<'_>) -> rusqlite::Result<crate::storage::models::McpServer> {
-    let args_json: String = row.get(4)?;
-    Ok(crate::storage::models::McpServer {
-        id: row.get(0)?,
-        label: row.get(1)?,
-        transport: row.get(2)?,
-        endpoint: row.get(3)?,
-        args: serde_json::from_str(&args_json).unwrap_or_default(),
-        enabled: row.get::<_, i64>(5)? != 0,
-        consented: row.get::<_, i64>(6)? != 0,
-        created_at: row.get(7)?,
-    })
-}
+// `row_to_mcp_server` moved to `storage::mcp_store` (God-file split) alongside the `mcp_servers`
+// readers that are its only callers.
 
 /// Map a `supersessions` row (id, superseding_meeting_id, source_meeting_id, entity, predicate,
 /// old_value, new_value, created_at, applied_at, source_pre_image, superseding_pre_image) to a row
