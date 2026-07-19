@@ -14,7 +14,7 @@ use crate::storage::models::{
     CorrectionRecord, DayCount,
     DocChunkHit, DocOutlineEntry, DocumentInfo, DocumentSummary, EntityKind,
     GraphNode, Meeting, MeetingActionSummary, MeetingStatus, NoteCitation,
-    OrgChunkHit, PendingShareAccept, PeopleList, PersonCard, PropertyKind,
+    PendingShareAccept, PeopleList, PersonCard, PropertyKind,
     PropertyValue, RecipeRecord, SavedView, SearchHit,
     StatusCount,
 };
@@ -1799,581 +1799,58 @@ impl Db {
 
     // ── M6 Shared Brain: local org state + the outbound org-share state machine ──────────────────
 
-    /// Upsert the locally-cached membership of an org (create/status). Preserves an existing row's
-    /// local `consented` flag, `last_seq` cursor, AND `context_enabled` toggle (an incoming status
-    /// refresh MUST NOT reset the consent flag, rewind the sync cursor, or silently re-enable an org
-    /// the user disabled on this instance). NO content — membership metadata only.
-    pub fn upsert_org_state(&self, o: &crate::storage::OrgState) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
-            "INSERT INTO org_state (org_id, name, role, joined_at, consented, last_seq, generation, context_enabled)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-             ON CONFLICT(org_id) DO UPDATE SET
-               name = excluded.name,
-               role = excluded.role,
-               generation = excluded.generation",
-            rusqlite::params![
-                o.org_id,
-                o.name,
-                o.role,
-                o.joined_at,
-                o.consented as i64,
-                o.last_seq,
-                o.generation as i64,
-                o.context_enabled as i64
-            ],
-        )
-        .map_err(map_err)?;
-        Ok(())
-    }
+    // `upsert_org_state` moved to `storage::org_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    fn map_org_state(r: &rusqlite::Row<'_>) -> rusqlite::Result<crate::storage::OrgState> {
-        Ok(crate::storage::OrgState {
-            org_id: r.get(0)?,
-            name: r.get(1)?,
-            role: r.get(2)?,
-            joined_at: r.get(3)?,
-            consented: r.get::<_, i64>(4)? != 0,
-            last_seq: r.get(5)?,
-            generation: r.get::<_, i64>(6)? as u32,
-            context_enabled: r.get::<_, i64>(7)? != 0,
-        })
-    }
+    // `map_org_state` moved to `storage::org_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// The locally-cached state of one org (or `None` if not joined locally).
-    pub fn get_org_state(&self, org_id: &str) -> Result<Option<crate::storage::OrgState>> {
-        let conn = self.lock();
-        conn.query_row(
-            "SELECT org_id, name, role, joined_at, consented, last_seq, generation, context_enabled
-               FROM org_state WHERE org_id = ?1",
-            rusqlite::params![org_id],
-            Self::map_org_state,
-        )
-        .optional()
-        .map_err(map_err)
-    }
+    // `get_org_state` moved to `storage::org_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// Every locally-joined org (for the launch sweep + a future multi-org list). Ordered by join time.
-    pub fn list_org_states(&self) -> Result<Vec<crate::storage::OrgState>> {
-        let conn = self.lock();
-        let mut stmt = conn
-            .prepare(
-                "SELECT org_id, name, role, joined_at, consented, last_seq, generation, context_enabled
-                   FROM org_state ORDER BY joined_at ASC",
-            )
-            .map_err(map_err)?;
-        let rows = stmt
-            .query_map([], Self::map_org_state)
-            .map_err(map_err)?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r.map_err(map_err)?);
-        }
-        Ok(out)
-    }
+    // `list_org_states` moved to `storage::org_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// Set the local org-egress consent flag for an org (mirrors the config consent grants: the ONLY
-    /// mutator, so a status refresh can't clear it). Fail-safe ordering is the caller's concern.
-    pub fn set_org_consented(&self, org_id: &str, consented: bool) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
-            "UPDATE org_state SET consented = ?2 WHERE org_id = ?1",
-            rusqlite::params![org_id, consented as i64],
-        )
-        .map_err(map_err)?;
-        Ok(())
-    }
+    // `set_org_consented` moved to `storage::org_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// Set the PER-INSTANCE org context toggle (Settings → Organization): whether a JOINED org
-    /// contributes content on THIS Murmur install — browsing (`list_org_items`) AND brain/assistant
-    /// context (`search_org_chunks_knn`/`_fts`). The ONLY mutator (mirrors `set_org_consented`) — a
-    /// status/feed refresh (`upsert_org_state`) never touches this column. Disabling never deletes the
-    /// local replica; re-enabling is instant with no re-sync.
-    pub fn set_org_context_enabled(&self, org_id: &str, enabled: bool) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
-            "UPDATE org_state SET context_enabled = ?2 WHERE org_id = ?1",
-            rusqlite::params![org_id, enabled as i64],
-        )
-        .map_err(map_err)?;
-        Ok(())
-    }
+    // `set_org_context_enabled` moved to `storage::org_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// Advance the synced feed cursor for an org (monotonic; a caller never rewinds it below the
-    /// stored value). Used by the feed-sync slice; kept here so the schema owner defines the writer.
-    pub fn set_org_last_seq(&self, org_id: &str, last_seq: i64) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
-            "UPDATE org_state SET last_seq = ?2 WHERE org_id = ?1 AND ?2 > last_seq",
-            rusqlite::params![org_id, last_seq],
-        )
-        .map_err(map_err)?;
-        Ok(())
-    }
+    // `set_org_last_seq` moved to `storage::org_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// Update the cached live generation for an org (after a rotation the owner drove, or a status pull).
-    pub fn set_org_generation(&self, org_id: &str, generation: u32) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
-            "UPDATE org_state SET generation = ?2 WHERE org_id = ?1",
-            rusqlite::params![org_id, generation as i64],
-        )
-        .map_err(map_err)?;
-        Ok(())
-    }
+    // `set_org_generation` moved to `storage::org_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// Drop the local org row (on leave / removal). Idempotent; leaves `org_shares` alone (a leave
-    /// doesn't retroactively un-share — the items stay published unless explicitly revoked).
-    pub fn delete_org_state(&self, org_id: &str) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
-            "DELETE FROM org_state WHERE org_id = ?1",
-            rusqlite::params![org_id],
-        )
-        .map_err(map_err)?;
-        Ok(())
-    }
+    // `delete_org_state` moved to `storage::org_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// Insert a fresh outbound org share in the `queued` state (the "Share to Brain" action). The
-    /// caller sets `meeting_id` XOR `document_id`. `content_sha256` is the plaintext-envelope hash.
-    #[allow(clippy::too_many_arguments)]
-    pub fn insert_org_share(
-        &self,
-        id: &str,
-        org_id: &str,
-        meeting_id: Option<&str>,
-        document_id: Option<&str>,
-        kind: &str,
-        title: Option<&str>,
-        rev: u32,
-        generation: u32,
-        content_sha256: &[u8],
-        created_at: &str,
-    ) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
-            "INSERT INTO org_shares
-               (id, org_id, meeting_id, document_id, kind, title, rev, generation,
-                content_sha256, item_id, state, last_error, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, 'queued', NULL, ?10, ?10)",
-            rusqlite::params![
-                id,
-                org_id,
-                meeting_id,
-                document_id,
-                kind,
-                title,
-                rev as i64,
-                generation as i64,
-                content_sha256,
-                created_at
-            ],
-        )
-        .map_err(map_err)?;
-        Ok(())
-    }
+    // `insert_org_share` moved to `storage::org_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// Advance a queued org share to `uploaded`, recording the server-assigned `item_id`. Clears any
-    /// prior error. Idempotent on the share id.
-    pub fn set_org_share_uploaded(
-        &self,
-        id: &str,
-        item_id: &str,
-        updated_at: &str,
-    ) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
-            "UPDATE org_shares SET state = 'uploaded', item_id = ?2, last_error = NULL,
-               updated_at = ?3 WHERE id = ?1",
-            rusqlite::params![id, item_id, updated_at],
-        )
-        .map_err(map_err)?;
-        Ok(())
-    }
+    // `set_org_share_uploaded` moved to `storage::org_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// Mark an org share `failed` with a non-PII error string (for the launch sweep to retry / the FE
-    /// to surface). The error is a fixed message + status, never note content.
-    pub fn set_org_share_failed(&self, id: &str, error: &str, updated_at: &str) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
-            "UPDATE org_shares SET state = 'failed', last_error = ?2, updated_at = ?3 WHERE id = ?1",
-            rusqlite::params![id, error, updated_at],
-        )
-        .map_err(map_err)?;
-        Ok(())
-    }
+    // `set_org_share_failed` moved to `storage::org_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// Set an org share's state directly (e.g. `queued` → retry a `failed`, `uploaded` →
-    /// `revoke_pending`, `revoke_pending` → `revoked`). Idempotent; unknown id is a no-op.
-    pub fn set_org_share_state(&self, id: &str, state: &str, updated_at: &str) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
-            "UPDATE org_shares SET state = ?2, updated_at = ?3 WHERE id = ?1",
-            rusqlite::params![id, state, updated_at],
-        )
-        .map_err(map_err)?;
-        Ok(())
-    }
+    // `set_org_share_state` moved to `storage::org_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    fn map_org_share(r: &rusqlite::Row<'_>) -> rusqlite::Result<crate::storage::OrgShareRow> {
-        Ok(crate::storage::OrgShareRow {
-            id: r.get(0)?,
-            org_id: r.get(1)?,
-            meeting_id: r.get(2)?,
-            document_id: r.get(3)?,
-            kind: r.get(4)?,
-            title: r.get(5)?,
-            rev: r.get::<_, i64>(6)? as u32,
-            generation: r.get::<_, i64>(7)? as u32,
-            content_sha256: r.get(8)?,
-            item_id: r.get(9)?,
-            state: r.get(10)?,
-            last_error: r.get(11)?,
-            created_at: r.get(12)?,
-            updated_at: r.get(13)?,
-        })
-    }
+    // `map_org_share` moved to `storage::org_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    const ORG_SHARE_COLS: &'static str =
-        "id, org_id, meeting_id, document_id, kind, title, rev, generation,
-         content_sha256, item_id, state, last_error, created_at, updated_at";
+    // `get_org_share` moved to `storage::org_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// One org share by its local id.
-    pub fn get_org_share(&self, id: &str) -> Result<Option<crate::storage::OrgShareRow>> {
-        let conn = self.lock();
-        conn.query_row(
-            &format!("SELECT {} FROM org_shares WHERE id = ?1", Self::ORG_SHARE_COLS),
-            rusqlite::params![id],
-            Self::map_org_share,
-        )
-        .optional()
-        .map_err(map_err)
-    }
+    // `org_share_by_item` moved to `storage::org_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// The org share bearing a given server `item_id` (for revoke-by-item + self-share dedup).
-    pub fn org_share_by_item(&self, item_id: &str) -> Result<Option<crate::storage::OrgShareRow>> {
-        let conn = self.lock();
-        conn.query_row(
-            &format!(
-                "SELECT {} FROM org_shares WHERE item_id = ?1",
-                Self::ORG_SHARE_COLS
-            ),
-            rusqlite::params![item_id],
-            Self::map_org_share,
-        )
-        .optional()
-        .map_err(map_err)
-    }
+    // `org_shares_for_source` moved to `storage::org_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// Every LIVE-OR-STUCK-LIVE org share anchored to a given source (`meeting_id` XOR
-    /// `document_id`). Powers the re-publish-on-edit fix: one logical note may be shared into SEVERAL
-    /// orgs, so this returns rows ACROSS ALL of them (never restricted to the first). Returns `uploaded`
-    /// rows AND `failed` rows that still carry a non-null `item_id` — the latter is a row whose MOST
-    /// RECENT republish attempt failed transiently (network blip during OCK acquire / seal / blob
-    /// upload / item publish) but whose PRIOR publish is still genuinely live on the server:
-    /// `set_org_share_failed` deliberately does not clear `item_id` on a republish failure (only the
-    /// SUCCESS path's `reset_org_share_for_retry` does), so such a row represents a live item whose
-    /// latest edit hasn't synced yet — not a dead row. Excluding it here (the pre-fix behavior) made it
-    /// permanently invisible to every caller keyed off this function (the edit-save republish path, the
-    /// re-share-block check, the Library share badge), so it could never self-heal and a manual re-share
-    /// would mint a genuine duplicate item. A `queued`/never-published `failed` row (no `item_id`, no
-    /// live server item to supersede yet — the launch sweep publishes the current plaintext for it) and
-    /// a `revoked`/`revoke_pending` share (intentionally torn down; an edit must not resurrect it) are
-    /// still excluded. Exactly one of `meeting_id`/`document_id` must be `Some`; both-`None` returns an
-    /// empty vec (no source ⇒ nothing to republish).
-    pub fn org_shares_for_source(
-        &self,
-        meeting_id: Option<&str>,
-        document_id: Option<&str>,
-    ) -> Result<Vec<crate::storage::OrgShareRow>> {
-        if meeting_id.is_none() && document_id.is_none() {
-            return Ok(Vec::new());
-        }
-        let conn = self.lock();
-        let mut stmt = conn
-            .prepare(&format!(
-                "SELECT {} FROM org_shares
-                   WHERE (state = 'uploaded' OR (state = 'failed' AND item_id IS NOT NULL))
-                     AND ((?1 IS NOT NULL AND meeting_id = ?1)
-                       OR (?2 IS NOT NULL AND document_id = ?2))
-                   ORDER BY created_at ASC",
-                Self::ORG_SHARE_COLS
-            ))
-            .map_err(map_err)?;
-        let rows = stmt
-            .query_map(rusqlite::params![meeting_id, document_id], Self::map_org_share)
-            .map_err(map_err)?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r.map_err(map_err)?);
-        }
-        Ok(out)
-    }
+    // `uploaded_org_shares_for_source_in_org` moved to `storage::org_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// Every LIVE (`uploaded`) org share of ONE exact source (`meeting_id` XOR `document_id`) in ONE
-    /// org, OLDEST-FIRST (stable tie-break on `id`). The `(org, source)`-scoped twin of
-    /// `org_shares_for_source` (which spans all orgs): powers the share IDEMPOTENCY guard + the
-    /// duplicate collapse — `[0]` is the canonical KEEPER (earliest published, the identity other
-    /// members first saw), `[1..]` are accidental duplicates to tombstone. `state = 'uploaded'` only
-    /// (a queued/failed row has no live server item; a revoked one was intentionally torn down).
-    /// `meeting_id`/`document_id` matched NULL-safe via `IS`; both-None ⇒ empty (no source).
-    pub fn uploaded_org_shares_for_source_in_org(
-        &self,
-        org_id: &str,
-        meeting_id: Option<&str>,
-        document_id: Option<&str>,
-    ) -> Result<Vec<crate::storage::OrgShareRow>> {
-        if meeting_id.is_none() && document_id.is_none() {
-            return Ok(Vec::new());
-        }
-        let conn = self.lock();
-        let mut stmt = conn
-            .prepare(&format!(
-                "SELECT {} FROM org_shares
-                   WHERE org_id = ?1 AND state = 'uploaded'
-                     AND meeting_id IS ?2 AND document_id IS ?3
-                   ORDER BY created_at ASC, id ASC",
-                Self::ORG_SHARE_COLS
-            ))
-            .map_err(map_err)?;
-        let rows = stmt
-            .query_map(
-                rusqlite::params![org_id, meeting_id, document_id],
-                Self::map_org_share,
-            )
-            .map_err(map_err)?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r.map_err(map_err)?);
-        }
-        Ok(out)
-    }
+    // `duplicate_uploaded_org_shares` moved to `storage::org_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// Every DUPLICATE live org share across the whole DB: an `uploaded` row that has an EARLIER
-    /// `uploaded` sibling for the same `(org_id, meeting_id, document_id)` — i.e. the extras to
-    /// tombstone, keeping only the earliest per group. Powers the on-launch dedup sweep that cleans
-    /// duplicates created before the idempotency guard existed (e.g. a double-click on Share). Tie-break
-    /// on `id` so two rows sharing a `created_at` still pick ONE deterministic keeper. NEVER returns a
-    /// keeper (the earliest of its group). `meeting_id`/`document_id` grouped NULL-safe via `IS`.
-    pub fn duplicate_uploaded_org_shares(&self) -> Result<Vec<crate::storage::OrgShareRow>> {
-        let conn = self.lock();
-        let mut stmt = conn
-            .prepare(&format!(
-                "SELECT {} FROM org_shares o
-                   WHERE o.state = 'uploaded'
-                     AND EXISTS (
-                       SELECT 1 FROM org_shares e
-                        WHERE e.state = 'uploaded'
-                          AND e.org_id = o.org_id
-                          AND e.meeting_id IS o.meeting_id
-                          AND e.document_id IS o.document_id
-                          AND (e.created_at < o.created_at
-                            OR (e.created_at = o.created_at AND e.id < o.id)))
-                   ORDER BY o.created_at ASC, o.id ASC",
-                Self::ORG_SHARE_COLS
-            ))
-            .map_err(map_err)?;
-        let rows = stmt.query_map([], Self::map_org_share).map_err(map_err)?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r.map_err(map_err)?);
-        }
-        Ok(out)
-    }
+    // `cancel_pending_org_shares_for_source_in_org` moved to `storage::org_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// Cancel (mark `revoked`) any NOT-yet-uploaded (`queued`/`failed`) org share for a given
-    /// (org, source). Used after a collapse when a live `uploaded` keeper already exists for that
-    /// source: a pending sibling is redundant (the source is already live) and would otherwise linger
-    /// as a stuck "pending" row that the launch sweep re-attempts every start. These rows have NO server
-    /// `item_id`, so cancelling is LOCAL-ONLY (no tombstone). Returns the number of rows cancelled.
-    /// `meeting_id`/`document_id` matched NULL-safe via `IS`; both-None ⇒ 0 (no source).
-    pub fn cancel_pending_org_shares_for_source_in_org(
-        &self,
-        org_id: &str,
-        meeting_id: Option<&str>,
-        document_id: Option<&str>,
-        updated_at: &str,
-    ) -> Result<usize> {
-        if meeting_id.is_none() && document_id.is_none() {
-            return Ok(0);
-        }
-        let conn = self.lock();
-        let n = conn
-            .execute(
-                "UPDATE org_shares SET state = 'revoked', updated_at = ?4
-                   WHERE org_id = ?1 AND state IN ('queued', 'failed')
-                     AND meeting_id IS ?2 AND document_id IS ?3",
-                rusqlite::params![org_id, meeting_id, document_id, updated_at],
-            )
-            .map_err(map_err)?;
-        Ok(n)
-    }
+    // `find_reusable_org_share` moved to `storage::org_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// SB-3 dedup: the EXISTING retriable (`queued`/`failed`) org-share row for a logical share key
-    /// (org + meeting-or-document), if any. `share_to_org_inner` REUSES it on a re-publish instead of
-    /// minting a fresh row every sweep tick — without this, each failed retry inserted a NEW row while
-    /// the old one survived, so a persistently-failing share amplified rows unboundedly and a later
-    /// recovery double-published. Newest-created first (a stable pick if somehow >1 exists). Uploaded/
-    /// revoked/revoke_pending rows are NOT reused (an uploaded share is a distinct published item; a
-    /// revoked one is intentionally torn down). `meeting_id`/`document_id` are matched exactly (both
-    /// NULL-safe via `IS`).
-    pub fn find_reusable_org_share(
-        &self,
-        org_id: &str,
-        meeting_id: Option<&str>,
-        document_id: Option<&str>,
-    ) -> Result<Option<crate::storage::OrgShareRow>> {
-        let conn = self.lock();
-        conn.query_row(
-            &format!(
-                "SELECT {} FROM org_shares
-                   WHERE org_id = ?1
-                     AND meeting_id IS ?2 AND document_id IS ?3
-                     AND state IN ('queued', 'failed')
-                   ORDER BY created_at DESC LIMIT 1",
-                Self::ORG_SHARE_COLS
-            ),
-            rusqlite::params![org_id, meeting_id, document_id],
-            Self::map_org_share,
-        )
-        .optional()
-        .map_err(map_err)
-    }
+    // `reset_org_share_for_retry` moved to `storage::org_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// SB-3 retry re-arm: reset an EXISTING org-share row back to `queued` for a fresh publish attempt,
-    /// refreshing the per-attempt fields (title/content hash/generation/timestamps) and CLEARING any
-    /// item_id + last_error. Used by `share_to_org_inner` when it reuses a `find_reusable_org_share`
-    /// row instead of inserting a new one — so N failed attempts stay ONE row, and a later success
-    /// flips that same row to uploaded (no duplicate). Idempotent on the row id.
-    pub fn reset_org_share_for_retry(
-        &self,
-        id: &str,
-        title: Option<&str>,
-        rev: u32,
-        generation: u32,
-        content_sha256: &[u8],
-        updated_at: &str,
-    ) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
-            "UPDATE org_shares SET state = 'queued', item_id = NULL, last_error = NULL,
-               title = ?2, rev = ?3, generation = ?4, content_sha256 = ?5, updated_at = ?6
-             WHERE id = ?1",
-            rusqlite::params![id, title, rev as i64, generation as i64, content_sha256, updated_at],
-        )
-        .map_err(map_err)?;
-        Ok(())
-    }
+    // `list_org_shares_in_state` moved to `storage::org_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// All org shares in a given `state` (the launch sweep pulls `queued` + `revoke_pending`).
-    pub fn list_org_shares_in_state(
-        &self,
-        state: &str,
-    ) -> Result<Vec<crate::storage::OrgShareRow>> {
-        let conn = self.lock();
-        let mut stmt = conn
-            .prepare(&format!(
-                "SELECT {} FROM org_shares WHERE state = ?1 ORDER BY created_at ASC",
-                Self::ORG_SHARE_COLS
-            ))
-            .map_err(map_err)?;
-        let rows = stmt
-            .query_map(rusqlite::params![state], Self::map_org_share)
-            .map_err(map_err)?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r.map_err(map_err)?);
-        }
-        Ok(out)
-    }
+    // `list_live_org_shares` moved to `storage::org_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// Every LIVE org share across ALL sources/orgs — the un-scoped twin of `org_shares_for_source`,
-    /// for callers that need the whole "is this live" set rather than one source (the Library bulk
-    /// share-badge listing). Same STUCK-REPUBLISH definition of "live" as `org_shares_for_source`:
-    /// `uploaded` rows AND `failed` rows that still carry a non-null `item_id` — a row whose MOST
-    /// RECENT republish attempt failed transiently but whose PRIOR publish is still genuinely live on
-    /// the server (`set_org_share_failed` deliberately never clears `item_id`; only the success path's
-    /// `reset_org_share_for_retry` does). A `queued`/never-published `failed` row (no `item_id`) or a
-    /// `revoked`/`revoke_pending` share is excluded. See `org_shares_for_source` for the full rationale.
-    pub fn list_live_org_shares(&self) -> Result<Vec<crate::storage::OrgShareRow>> {
-        let conn = self.lock();
-        let mut stmt = conn
-            .prepare(&format!(
-                "SELECT {} FROM org_shares
-                   WHERE state = 'uploaded' OR (state = 'failed' AND item_id IS NOT NULL)
-                   ORDER BY created_at ASC",
-                Self::ORG_SHARE_COLS
-            ))
-            .map_err(map_err)?;
-        let rows = stmt.query_map([], Self::map_org_share).map_err(map_err)?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r.map_err(map_err)?);
-        }
-        Ok(out)
-    }
+    // `list_org_shares_for_org` moved to `storage::org_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// Every org share for an org (the FE list). Newest first.
-    pub fn list_org_shares_for_org(
-        &self,
-        org_id: &str,
-    ) -> Result<Vec<crate::storage::OrgShareRow>> {
-        let conn = self.lock();
-        let mut stmt = conn
-            .prepare(&format!(
-                "SELECT {} FROM org_shares WHERE org_id = ?1 ORDER BY created_at DESC",
-                Self::ORG_SHARE_COLS
-            ))
-            .map_err(map_err)?;
-        let rows = stmt
-            .query_map(rusqlite::params![org_id], Self::map_org_share)
-            .map_err(map_err)?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r.map_err(map_err)?);
-        }
-        Ok(out)
-    }
+    // `active_org_shares_for_folder` moved to `storage::org_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// The ACTIVE-OR-STUCK-LIVE (queued/uploaded/revoke_pending, PLUS a `failed` row that still
-    /// carries a non-null `item_id`) org shares anchored to a folder's meetings + notes, for the
-    /// lock×shares warn/revoke dialog. Content-free enough for the dialog (an `(item_id?, title?)`
-    /// pair per share; titles render only to the local owner).
-    ///
-    /// The `failed AND item_id IS NOT NULL` clause mirrors the definition of "live" established by
-    /// `org_shares_for_source`/`list_live_org_shares` (see their doc comments): `set_org_share_failed`
-    /// deliberately never clears `item_id` on a republish failure, so such a row's PRIOR publish is
-    /// still genuinely live on the server even though the row's state says `failed`. Before this fix
-    /// that shape was invisible to the lock×shares dialog and to bulk-revoke
-    /// (`active_org_share_ids_for_folder`), so locking a folder with a stuck failed-republish share
-    /// never warned the user and never tombstoned the still-live server item.
-    pub fn active_org_shares_for_folder(
-        &self,
-        folder_id: &str,
-    ) -> Result<Vec<(Option<String>, Option<String>)>> {
-        let conn = self.lock();
-        let mut stmt = conn
-            .prepare(
-                "SELECT s.item_id, s.title
-                   FROM org_shares s
-                   LEFT JOIN notes n  ON n.meeting_id = s.meeting_id
-                   LEFT JOIN documents d ON d.id = s.document_id
-                  WHERE (s.state IN ('queued','uploaded','revoke_pending')
-                     OR (s.state = 'failed' AND s.item_id IS NOT NULL))
-                    AND (n.folder_id = ?1 OR d.folder_id = ?1)",
-            )
-            .map_err(map_err)?;
-        let rows = stmt
-            .query_map(rusqlite::params![folder_id], |r| {
-                Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?))
-            })
-            .map_err(map_err)?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r.map_err(map_err)?);
-        }
-        Ok(out)
-    }
 
     /// The folder's ACTIVE 1:1 shares (LINK + Murmur↔Murmur USER) as `(share_id, mode)`, joined to
     /// the folder through the shared meeting/document. Powers the lock×shares dialog + bulk-revoke —
@@ -2408,44 +1885,8 @@ impl Db {
         Ok(out)
     }
 
-    /// The folder's ACTIVE-OR-STUCK-LIVE org shares as `(row_id, item_id?, title)` for bulk-revoke:
-    /// an uploaded row (item_id present) is tombstoned server-side; a still-`queued` row (no item_id)
-    /// is cancelled locally so the launch sweep never egresses it; a `failed` row with a non-null
-    /// `item_id` (a republish attempt failed but the PRIOR publish is still live — see
-    /// [`Self::active_org_shares_for_folder`]) is tombstoned server-side same as an uploaded row.
-    /// Same folder join + state set as [`Self::active_org_shares_for_folder`], but carries the local
-    /// row id + item id for revocation.
-    pub fn active_org_share_ids_for_folder(
-        &self,
-        folder_id: &str,
-    ) -> Result<Vec<(String, Option<String>, String)>> {
-        let conn = self.lock();
-        let mut stmt = conn
-            .prepare(
-                "SELECT s.id, s.item_id, s.title
-                   FROM org_shares s
-                   LEFT JOIN notes n     ON n.meeting_id = s.meeting_id
-                   LEFT JOIN documents d ON d.id = s.document_id
-                  WHERE (s.state IN ('queued','uploaded','revoke_pending')
-                     OR (s.state = 'failed' AND s.item_id IS NOT NULL))
-                    AND (n.folder_id = ?1 OR d.folder_id = ?1)",
-            )
-            .map_err(map_err)?;
-        let rows = stmt
-            .query_map(rusqlite::params![folder_id], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, Option<String>>(1)?,
-                    r.get::<_, Option<String>>(2)?.unwrap_or_default(),
-                ))
-            })
-            .map_err(map_err)?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r.map_err(map_err)?);
-        }
-        Ok(out)
-    }
+    // `active_org_share_ids_for_folder` moved to `storage::org_store` (God-file split) — still callable as inherent `db.method()` cross-file.
+
 
     // ── M5-CLIENT: TOFU pins, mode-B outbound bookkeeping, inbound accept idempotency (spec §4.8/§7) ──
 
@@ -3511,7 +2952,7 @@ impl Db {
     /// fine). ALL rollups go, not just the sealed scope's: a rollup is cross-meeting synthesis with
     /// no single source meeting, so precision-purging is impossible — and rollups are cheap
     /// re-derivable synthesis that the next hourly pass regenerates FROM VISIBLE FACTS ONLY.
-    fn purge_memory_rollups_tx(tx: &rusqlite::Transaction<'_>) -> Result<Vec<String>> {
+    pub(crate) fn purge_memory_rollups_tx(tx: &rusqlite::Transaction<'_>) -> Result<Vec<String>> {
         let mut stmt = tx
             .prepare("SELECT exported_path FROM memory_rollups WHERE exported_path IS NOT NULL")
             .map_err(map_err)?;
@@ -3540,7 +2981,7 @@ impl Db {
     /// strings, so the per-id `LIKE '%"<id>"%'` intersection is exact — a UUID (hex + hyphens,
     /// no `%`/`_`/`"`) can never partially match inside another quoted id. Simpler than parsing
     /// the JSON in Rust and it stays a pure per-id statement inside the caller's seal tx.
-    fn purge_pending_brief_runs_tx(
+    pub(crate) fn purge_pending_brief_runs_tx(
         tx: &rusqlite::Transaction<'_>,
         meeting_ids: &[String],
     ) -> Result<()> {
@@ -3562,7 +3003,7 @@ impl Db {
     /// — exactly like `correction_log` / `note_chunks` / `assistant_interactions` — we DELETE rather
     /// than key-seal. Dropped by design + not recoverable (never keyed); the underlying transcript is
     /// still sealed + restorable, and a later re-summarize re-derives facts.
-    fn purge_facts_tx(tx: &rusqlite::Transaction<'_>, meeting_ids: &[String]) -> Result<()> {
+    pub(crate) fn purge_facts_tx(tx: &rusqlite::Transaction<'_>, meeting_ids: &[String]) -> Result<()> {
         for mid in meeting_ids {
             tx.execute(
                 "DELETE FROM facts WHERE meeting_id = ?1",
@@ -3577,7 +3018,7 @@ impl Db {
     /// (superseding OR source) within an EXISTING transaction, so a deleted meeting leaves no dangling
     /// supersession behind. The table carries no foreign key (a row references two meetings), so this
     /// explicit purge — mirroring `purge_facts_tx` — is what keeps `delete_meeting` clean. Idempotent.
-    fn purge_supersessions_tx(
+    pub(crate) fn purge_supersessions_tx(
         tx: &rusqlite::Transaction<'_>,
         meeting_ids: &[String],
     ) -> Result<()> {
@@ -3601,7 +3042,7 @@ impl Db {
     /// and not recoverable (never keyed); the underlying transcript is still sealed + restorable, and a
     /// later re-summarize re-derives user facts. The (derived) memory brief is regenerated on the
     /// next read from the remaining VISIBLE user facts only.
-    fn purge_user_facts_tx(tx: &rusqlite::Transaction<'_>, meeting_ids: &[String]) -> Result<()> {
+    pub(crate) fn purge_user_facts_tx(tx: &rusqlite::Transaction<'_>, meeting_ids: &[String]) -> Result<()> {
         for mid in meeting_ids {
             tx.execute(
                 "DELETE FROM user_facts WHERE meeting_id = ?1",
@@ -3620,7 +3061,7 @@ impl Db {
     /// design and not recoverable from the row (never keyed); the underlying audio is still sealed +
     /// restorable, and a later re-diarize (with the opt-in on) re-derives the voiceprint. This is the
     /// stricter-safe choice: a biometric of a locked speaker must not linger at rest.
-    fn purge_speaker_voiceprints_tx(
+    pub(crate) fn purge_speaker_voiceprints_tx(
         tx: &rusqlite::Transaction<'_>,
         meeting_ids: &[String],
     ) -> Result<()> {
@@ -3637,7 +3078,7 @@ impl Db {
     /// Delete chunk rows for `meeting_ids` within an EXISTING transaction (so the purge lands in the
     /// same atomic unit as the plaintext blanking on lock — no window where a vector outlives the
     /// sealed plaintext it was derived from).
-    fn purge_chunks_tx(tx: &rusqlite::Transaction<'_>, meeting_ids: &[String]) -> Result<()> {
+    pub(crate) fn purge_chunks_tx(tx: &rusqlite::Transaction<'_>, meeting_ids: &[String]) -> Result<()> {
         for mid in meeting_ids {
             // vec0 first (its FK-less rowid mirrors note_chunks.id), then the source rows.
             tx.execute(
@@ -3678,7 +3119,7 @@ impl Db {
     /// keyed) — so we delete rather than seal. Note: this is deliberately NOT folded into
     /// `purge_chunks_tx`, because that helper also runs on the (non-seal) re-index "clean replace"
     /// path where corrections must survive.
-    fn purge_corrections_tx(tx: &rusqlite::Transaction<'_>, meeting_ids: &[String]) -> Result<()> {
+    pub(crate) fn purge_corrections_tx(tx: &rusqlite::Transaction<'_>, meeting_ids: &[String]) -> Result<()> {
         for mid in meeting_ids {
             tx.execute(
                 "DELETE FROM correction_log WHERE meeting_id = ?1",
@@ -4460,43 +3901,12 @@ impl Db {
 
     // `raw_documents_in_folder` moved to `storage::folders_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// Seal ONE document's text: store the AES-GCM `text_blob`, blank the plaintext `text`. The CALLER
-    /// must verify the blob decrypts back byte-identical BEFORE calling this (verify-before-destroy) —
-    /// exactly like [`Db::seal_manual_notes`] / [`Db::seal_note`].
-    pub fn seal_document(&self, id: &str, blob: &[u8]) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
-            "UPDATE documents SET text_blob = ?2, text = '' WHERE id = ?1",
-            rusqlite::params![id, blob],
-        )
-        .map_err(map_err)?;
-        Ok(())
-    }
+    // `seal_document` moved to `storage::seal_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// Restore (or re-blank) a document's plaintext `text` for the session, leaving `text_blob`
-    /// intact. Pass the decrypted plaintext on unlock; pass "" on reblank (relock). Mirrors
-    /// [`Db::set_manual_notes`].
-    pub fn set_document_text(&self, id: &str, text: &str) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
-            "UPDATE documents SET text = ?2 WHERE id = ?1",
-            rusqlite::params![id, text],
-        )
-        .map_err(map_err)?;
-        Ok(())
-    }
+    // `set_document_text` moved to `storage::seal_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// Clear a document's sealed `text_blob` (permanent remove-lock, after the plaintext is restored).
-    /// Mirrors [`Db::clear_manual_notes_blob`].
-    pub fn clear_document_blob(&self, id: &str) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
-            "UPDATE documents SET text_blob = NULL WHERE id = ?1",
-            rusqlite::params![id],
-        )
-        .map_err(map_err)?;
-        Ok(())
-    }
+    // `clear_document_blob` moved to `storage::seal_store` (God-file split) — still callable as inherent `db.method()` cross-file.
+
 
     /// Permanently delete a document (its `doc_chunks` + `doc_vec_chunks` go first in the same tx —
     /// `doc_vec_chunks` is a vec0 virtual table with no FK so the `documents` ON DELETE CASCADE
@@ -4743,7 +4153,7 @@ impl Db {
     /// Delete doc-chunk rows for `document_ids` within an EXISTING transaction (so the purge lands in
     /// the same atomic unit as the plaintext blanking on lock). vec0 first (its FK-less rowid mirrors
     /// doc_chunks.id), then the source rows. Mirrors [`Db::purge_chunks_tx`].
-    fn purge_doc_chunks_tx(tx: &rusqlite::Transaction<'_>, document_ids: &[String]) -> Result<()> {
+    pub(crate) fn purge_doc_chunks_tx(tx: &rusqlite::Transaction<'_>, document_ids: &[String]) -> Result<()> {
         for did in document_ids {
             tx.execute(
                 "DELETE FROM doc_vec_chunks WHERE chunk_id IN
@@ -5037,513 +4447,38 @@ impl Db {
 
     // ── M6 Shared Brain — org feed INGEST + local RETRIEVAL ─────────────────────────────────────
     //
-    // The org partition is a decrypted REPLICA of the org feed, living in the dedicated `org_*`
-    // tables OUTSIDE the folder-lock domain (spec §"Trust model": org items are deliberately
-    // org-disclosed content — no folder seal/gate applies; SQLCipher protects them at rest). All
-    // writes here happen after the caller OPENED the OCK-sealed envelope (`share::org_envelope`),
-    // so the plaintext title/markdown are already the member's to see. NO PII in logs (ids/counts).
+    // `upsert_org_item` moved to `storage::org_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// UPSERT one decrypted org feed item + (re)index its chunks. Idempotent on `item_id`: a re-pull
-    /// of the same seq REPLACES the row and re-chunks (clean replace via `index_org_item_chunks`). A
-    /// bumped `rev` (an update-share) overwrites the markdown + re-indexes. `content_sha256` is the
-    /// PLAINTEXT hash (the self-share dedup key). `embedder` is the member's OWN active embedder —
-    /// `None`/StubEmbedder ⇒ FTS-only (no int8 vectors written; the sync report flags `ftsOnly`).
-    ///
-    /// `author_user_id` (2026-07-15 root-cause fix, replaces the separate `set_org_item_author`
-    /// follow-up call as the ONLY writer of this column): the server-authoritative author id, when
-    /// the caller already knows it at upsert time — feed-ingest passes the feed entry's own
-    /// `author_user_id`; a share-time/republish-time local-replica upsert passes the CURRENT
-    /// session's own server user id (the caller IS the author in both those paths). `None` when the
-    /// caller genuinely doesn't know it (a light re-upsert, or a legacy call site). The
-    /// `ON CONFLICT` clause uses `COALESCE(excluded.author_user_id, org_items.author_user_id)` so a
-    /// `None` re-upsert can NEVER clobber an already-stamped author back to NULL — only a `Some`
-    /// value ever overwrites a previous value (and only with a fresher one, since every caller here
-    /// passes the authoritative id it has). This makes new/republished rows correct from the moment
-    /// they're born, with zero dependency on the `backfill_null_org_item_authors` self-heal (which
-    /// stays in place as a safety net for rows that predate this fix).
-    #[allow(clippy::too_many_arguments)]
-    pub fn upsert_org_item(
-        &self,
-        item_id: &str,
-        org_id: &str,
-        seq: u64,
-        author_hint: &str,
-        title: &str,
-        markdown: &str,
-        created_at: &str,
-        rev: u32,
-        generation: u32,
-        content_sha256: &[u8],
-        source_kind: Option<&str>,
-        author_user_id: Option<&str>,
-        embedder: Option<&dyn Embedder>,
-    ) -> Result<()> {
-        // Chunk + embed OUTSIDE the write lock (embedding is CPU/Metal work). The header carries the
-        // item title as provenance; the date axis is the item's created_at.
-        let chunks = crate::embed::chunk_note(title, created_at, markdown);
-        let vectors = match embedder {
-            Some(e) if !chunks.is_empty() => Some(e.embed_passage(&chunks)?),
-            _ => None, // model absent → FTS-only (int8 vectors come later on a re-embed).
-        };
+    // `tombstone_org_item` moved to `storage::org_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-        let mut conn = self.lock();
-        let tx = conn.transaction().map_err(map_err)?;
-        // Replace the item row (idempotent upsert). CASCADE + the explicit vec purge below clear the
-        // old chunks first so a re-pull never leaves stale chunks/vectors.
-        Self::purge_org_item_chunks_tx(&tx, item_id)?;
-        tx.execute(
-            "INSERT INTO org_items
-               (item_id, org_id, seq, author_hint, title, markdown, created_at, rev, generation,
-                content_sha256, source_kind, author_user_id, tombstoned)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,0)
-             ON CONFLICT(item_id) DO UPDATE SET
-               org_id=excluded.org_id, seq=excluded.seq, author_hint=excluded.author_hint,
-               title=excluded.title, markdown=excluded.markdown, created_at=excluded.created_at,
-               rev=excluded.rev, generation=excluded.generation,
-               content_sha256=excluded.content_sha256, source_kind=excluded.source_kind,
-               author_user_id=COALESCE(excluded.author_user_id, org_items.author_user_id),
-               tombstoned=0",
-            rusqlite::params![
-                item_id,
-                org_id,
-                seq as i64,
-                author_hint,
-                title,
-                markdown,
-                created_at,
-                rev as i64,
-                generation as i64,
-                content_sha256,
-                source_kind,
-                author_user_id,
-            ],
-        )
-        .map_err(map_err)?;
-        {
-            let mut ins_chunk = tx
-                .prepare("INSERT INTO org_chunks (item_id, chunk_idx, text) VALUES (?1, ?2, ?3)")
-                .map_err(map_err)?;
-            // int8 vec0 → the value MUST be wrapped `vec_int8(?)` (the scale-spike partition format).
-            let mut ins_vec = tx
-                .prepare("INSERT INTO org_vec_chunks(chunk_id, embedding) VALUES (?1, vec_int8(?2))")
-                .map_err(map_err)?;
-            for (idx, text) in chunks.iter().enumerate() {
-                ins_chunk
-                    .execute(rusqlite::params![item_id, idx as i64, text])
-                    .map_err(map_err)?;
-                if let Some(vecs) = &vectors {
-                    if let Some(vector) = vecs.get(idx) {
-                        let chunk_id = tx.last_insert_rowid();
-                        let blob = crate::embed::vec_to_int8_blob(vector);
-                        ins_vec
-                            .execute(rusqlite::params![chunk_id, blob])
-                            .map_err(map_err)?;
-                    }
-                }
-            }
-        }
-        tx.commit().map_err(map_err)?;
-        Ok(())
-    }
+    // `purge_org_replica` moved to `storage::org_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// TOMBSTONE an org item: mark the row `tombstoned=1` and DROP its chunks/vectors/FTS so the item
-    /// vanishes from retrieval, while the tombstone row keeps a re-pull idempotent (a later feed entry
-    /// for the same id is a no-op). Idempotent — tombstoning an unknown/already-tombstoned id is fine.
-    pub fn tombstone_org_item(&self, item_id: &str) -> Result<()> {
-        let mut conn = self.lock();
-        let tx = conn.transaction().map_err(map_err)?;
-        Self::purge_org_item_chunks_tx(&tx, item_id)?;
-        tx.execute(
-            "UPDATE org_items SET tombstoned = 1, markdown = '', title = '' WHERE item_id = ?1",
-            rusqlite::params![item_id],
-        )
-        .map_err(map_err)?;
-        tx.commit().map_err(map_err)?;
-        Ok(())
-    }
+    // `purge_org_item_chunks_tx` moved to `storage::org_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// LEAVE-A-ORG CONSENT PURGE: drop the ENTIRE decrypted replica of one org — every `org_items`
-    /// row plus its derived `org_chunks` / `org_vec_chunks` / `fts_org_chunks` tokens — in ONE atomic
-    /// tx. Called by `org_leave` so a departed member keeps NO searchable copy of colleagues' shared
-    /// content (leak/consent invariant): the OCK cache is dropped and `org_state` deleted at the
-    /// command layer, but WITHOUT this the plaintext replica lingered forever and `org_search` could
-    /// still return it. Order: vec0 first (its FK-less rowid mirrors `org_chunks.id`), then
-    /// `org_chunks` (whose DELETE fires the `fts_org_chunks_ad` trigger, purging the keyword tokens),
-    /// then the `org_items` header rows. Idempotent; an unknown org id is a no-op. Content-free log
-    /// (org id + counts, never titles/bodies).
-    pub fn purge_org_replica(&self, org_id: &str) -> Result<()> {
-        let mut conn = self.lock();
-        let tx = conn.transaction().map_err(map_err)?;
-        // vec0 KNN rows for every chunk of every item in this org (the FK-less mirror table).
-        tx.execute(
-            "DELETE FROM org_vec_chunks WHERE chunk_id IN
-               (SELECT oc.id FROM org_chunks oc
-                  JOIN org_items oi ON oi.item_id = oc.item_id
-                 WHERE oi.org_id = ?1)",
-            rusqlite::params![org_id],
-        )
-        .map_err(map_err)?;
-        // Source chunks (their DELETE fires the FTS `_ad` trigger → keyword tokens purged).
-        tx.execute(
-            "DELETE FROM org_chunks WHERE item_id IN
-               (SELECT item_id FROM org_items WHERE org_id = ?1)",
-            rusqlite::params![org_id],
-        )
-        .map_err(map_err)?;
-        // Finally the item headers (the decrypted markdown/title replica).
-        let items = tx
-            .execute(
-                "DELETE FROM org_items WHERE org_id = ?1",
-                rusqlite::params![org_id],
-            )
-            .map_err(map_err)?;
-        tx.commit().map_err(map_err)?;
-        tracing::info!(target: "org", items, "purged org replica on leave");
-        Ok(())
-    }
+    // `org_last_seq_for` moved to `storage::org_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// Delete an org item's `org_chunks` + `org_vec_chunks` rows within an EXISTING tx. vec0 first
-    /// (its FK-less rowid mirrors `org_chunks.id`), then the source rows (whose DELETE fires the FTS
-    /// `_ad` trigger, purging the tokens). Mirrors [`Db::purge_doc_chunks_tx`].
-    fn purge_org_item_chunks_tx(tx: &rusqlite::Transaction<'_>, item_id: &str) -> Result<()> {
-        tx.execute(
-            "DELETE FROM org_vec_chunks WHERE chunk_id IN
-               (SELECT id FROM org_chunks WHERE item_id = ?1)",
-            rusqlite::params![item_id],
-        )
-        .map_err(map_err)?;
-        tx.execute(
-            "DELETE FROM org_chunks WHERE item_id = ?1",
-            rusqlite::params![item_id],
-        )
-        .map_err(map_err)?;
-        Ok(())
-    }
+    // `search_org_chunks_knn` moved to `storage::org_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// The synced feed cursor (`org_state.last_seq`) for an org — the max `seq` ingested so far.
-    /// Returns 0 when the org is unknown/never synced. (Companion to Core's monotonic
-    /// [`Db::set_org_last_seq`].)
-    pub fn org_last_seq_for(&self, org_id: &str) -> Result<u64> {
-        Ok(self
-            .get_org_state(org_id)?
-            .map(|s| s.last_seq.max(0) as u64)
-            .unwrap_or(0))
-    }
+    // `search_org_chunks_fts` moved to `storage::org_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// GATED-FREE (no folder lock applies to org items) semantic KNN over the int8 org partition:
-    /// the top-`k` nearest `org_vec_chunks` for the int8-quantized `query_vec`, joined to their
-    /// (non-tombstoned) items, deduped to one hit per item (nearest). `query_vec` is the member's OWN
-    /// f32 query embedding — it is int8-quantized here so it is comparable to the stored int8 vectors.
-    ///
-    /// PER-INSTANCE ORG TOGGLE: joined to `org_state` and filtered on `context_enabled = 1` — a
-    /// disabled org's chunks are EXCLUDED at the SQL level, never read into Rust at all. This is the
-    /// hard data-level gate (not a UI hide): a caller cannot accidentally surface a disabled org's
-    /// content by forgetting to filter it downstream.
-    pub fn search_org_chunks_knn(&self, query_vec: &[f32], k: i64) -> Result<Vec<OrgChunkHit>> {
-        if query_vec.is_empty() || k <= 0 {
-            return Ok(Vec::new());
-        }
-        let conn = self.lock();
-        // KNN isolated to the vec0 table in a CTE (a vec0 query allows a single MATCH+k); the item
-        // columns + the tombstone/context-enabled filters are joined OUTSIDE it.
-        let sql = "WITH knn(chunk_id, distance) AS (
-                 SELECT chunk_id, distance FROM org_vec_chunks
-                  WHERE embedding MATCH vec_int8(?1) AND k = ?2
-                  ORDER BY distance
-             )
-             SELECT oi.item_id, oi.author_hint, oi.title, oc.text, oi.content_sha256, knn.distance
-               FROM knn
-               JOIN org_chunks oc ON oc.id = knn.chunk_id
-               JOIN org_items oi ON oi.item_id = oc.item_id
-               JOIN org_state os ON os.org_id = oi.org_id
-              WHERE oi.tombstoned = 0 AND os.context_enabled = 1
-              ORDER BY knn.distance ASC, oi.item_id ASC";
-        let blob = crate::embed::vec_to_int8_blob(query_vec);
-        let mut stmt = conn.prepare(sql).map_err(map_err)?;
-        let rows = stmt
-            .query_map(rusqlite::params![blob, k], |row| {
-                Ok(OrgChunkHit {
-                    item_id: row.get(0)?,
-                    author_hint: row.get(1)?,
-                    title: row.get(2)?,
-                    snippet: row.get(3)?,
-                    content_sha256: row.get::<_, Option<Vec<u8>>>(4)?.unwrap_or_default(),
-                })
-            })
-            .map_err(map_err)?;
-        Self::dedup_org_hits_by_item(rows)
-    }
+    // `dedup_org_hits_by_item` moved to `storage::org_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// KEYWORD (FTS5/BM25) leg over the org partition — the model-free twin of
-    /// [`Db::search_org_chunks_knn`], so org text is reachable on a DEFAULT install (no e5 model).
-    /// Same `context_enabled = 1` per-instance org filter as the KNN leg — see its doc.
-    ///
-    /// CRITICAL (scale-spike finding #2): the `LIMIT` is PUSHED DOWN into the SQL (bm25-ordered),
-    /// NOT applied in Rust after reading every match — the unbounded production reader hit an 8.8 s
-    /// p95 tail at 1M chunks. We over-fetch a small multiple of `limit` (so per-item dedup still has
-    /// candidates) then cap in Rust; the SQL ceiling is the real bound.
-    pub fn search_org_chunks_fts(&self, query: &str, limit: i64) -> Result<Vec<OrgChunkHit>> {
-        if limit <= 0 {
-            return Ok(Vec::new());
-        }
-        let Some(match_expr) = fts_match_query(query.trim()) else {
-            return Ok(Vec::new()); // punctuation-only / empty query → no hits, never an FTS error.
-        };
-        let conn = self.lock();
-        // Over-fetch a bounded multiple of `limit` so per-item dedup has candidates, but keep the SQL
-        // LIMIT as the hard bound (spike #2). 8× is generous for a per-item dedup at small `limit`.
-        let sql_cap = limit.saturating_mul(8).clamp(limit, 512);
-        let sql = "SELECT oi.item_id, oi.author_hint, oi.title, oc.text, oi.content_sha256,
-                          bm25(fts_org_chunks) AS rank
-               FROM fts_org_chunks
-               JOIN org_chunks oc ON oc.id = fts_org_chunks.rowid
-               JOIN org_items oi ON oi.item_id = oc.item_id
-               JOIN org_state os ON os.org_id = oi.org_id
-              WHERE fts_org_chunks MATCH ?1 AND oi.tombstoned = 0 AND os.context_enabled = 1
-              ORDER BY rank ASC, oi.item_id ASC
-              LIMIT ?2";
-        let mut stmt = conn.prepare(sql).map_err(map_err)?;
-        let rows = stmt
-            .query_map(rusqlite::params![match_expr, sql_cap], |row| {
-                Ok(OrgChunkHit {
-                    item_id: row.get(0)?,
-                    author_hint: row.get(1)?,
-                    title: row.get(2)?,
-                    snippet: row.get(3)?,
-                    content_sha256: row.get::<_, Option<Vec<u8>>>(4)?.unwrap_or_default(),
-                })
-            })
-            .map_err(map_err)?;
-        let mut hits = Self::dedup_org_hits_by_item(rows)?;
-        hits.truncate(limit as usize);
-        Ok(hits)
-    }
+    // `get_org_item` moved to `storage::org_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// Dedup a stream of org chunk hits to ONE per item (first-seen = best-ranked, since callers
-    /// order by distance/bm25 ascending). Shared by both retrieval legs.
-    fn dedup_org_hits_by_item(
-        rows: impl Iterator<Item = rusqlite::Result<OrgChunkHit>>,
-    ) -> Result<Vec<OrgChunkHit>> {
-        let mut seen: HashSet<String> = HashSet::new();
-        let mut hits = Vec::new();
-        for r in rows {
-            let hit = r.map_err(map_err)?;
-            if !seen.insert(hit.item_id.clone()) {
-                continue;
-            }
-            hits.push(hit);
-        }
-        Ok(hits)
-    }
+    // `set_org_item_author` moved to `storage::org_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// The full decrypted org item (for the read-only FE viewer). `None` for an unknown, TOMBSTONED,
-    /// OR per-instance-DISABLED item's org (a stale citation/bookmark to `/org-item/:id` must not read
-    /// through the toggle — same `context_enabled = 1` gate as `search_org_chunks_knn`/`_fts`). No lock
-    /// gate otherwise — org items are deliberately org-disclosed content.
-    pub fn get_org_item(&self, item_id: &str) -> Result<Option<crate::storage::models::OrgItemDetail>> {
-        let conn = self.lock();
-        conn.query_row(
-            "SELECT oi.item_id, oi.author_hint, oi.title, oi.created_at, oi.rev, oi.markdown
-               FROM org_items oi
-               JOIN org_state os ON os.org_id = oi.org_id
-              WHERE oi.item_id = ?1 AND oi.tombstoned = 0 AND os.context_enabled = 1",
-            rusqlite::params![item_id],
-            |r| {
-                Ok(crate::storage::models::OrgItemDetail {
-                    item_id: r.get(0)?,
-                    author_hint: r.get(1)?,
-                    title: r.get(2)?,
-                    created_at: r.get(3)?,
-                    rev: r.get::<_, i64>(4)? as u32,
-                    markdown: r.get(5)?,
-                    // The DB layer has no session context — the `org_get_item` command computes the real
-                    // value by comparing the stored `author_user_id` with the caller's `server_user_id`.
-                    editable: false,
-                })
-            },
-        )
-        .optional()
-        .map_err(map_err)
-    }
+    // `org_item_ids_with_null_author` moved to `storage::org_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// Stamp an org item's `author_user_id` (the server account id of its author, from the feed). Called
-    /// right after `upsert_org_item` at feed-ingest so a second machine can recognise its OWN items and
-    /// offer edit-in-place. Idempotent; a no-op for an unknown id. (2026-07-14.)
-    pub fn set_org_item_author(&self, item_id: &str, author_user_id: &str) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
-            "UPDATE org_items SET author_user_id = ?2 WHERE item_id = ?1",
-            rusqlite::params![item_id, author_user_id],
-        )
-        .map_err(map_err)?;
-        Ok(())
-    }
+    // `org_item_edit_ctx` moved to `storage::org_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// The item ids of this org's LIVE (non-tombstoned) local replica rows that are still missing
-    /// `author_user_id` — the stale-ingest gap (rows ingested before the column/stamping existed, or
-    /// via the local-replica upsert at share/republish time, whose cursor has already advanced past
-    /// them so a normal cursor-based feed pull never re-visits them). Used by the sync-tick backfill
-    /// (`backfill_null_org_item_authors`) to know whether a full-feed re-pull is worth doing at all —
-    /// an empty result short-circuits the backfill on every ordinary sync once a device has caught up.
-    /// (2026-07-15.)
-    pub fn org_item_ids_with_null_author(&self, org_id: &str) -> Result<Vec<String>> {
-        let conn = self.lock();
-        let mut stmt = conn
-            .prepare(
-                "SELECT item_id FROM org_items
-                   WHERE org_id = ?1 AND tombstoned = 0 AND author_user_id IS NULL",
-            )
-            .map_err(map_err)?;
-        let rows = stmt
-            .query_map(rusqlite::params![org_id], |r| r.get::<_, String>(0))
-            .map_err(map_err)?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r.map_err(map_err)?);
-        }
-        Ok(out)
-    }
+    // `list_org_items` moved to `storage::org_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// The context the `org_update_own_item` egress command needs to re-publish an edited org item the
-    /// caller authored (org id, current rev, original created_at + source_kind, stored author id). `None`
-    /// for an unknown / tombstoned item. (2026-07-14.)
-    pub fn org_item_edit_ctx(
-        &self,
-        item_id: &str,
-    ) -> Result<Option<crate::storage::models::OrgItemEditCtx>> {
-        let conn = self.lock();
-        conn.query_row(
-            "SELECT org_id, rev, created_at, source_kind, author_user_id
-               FROM org_items WHERE item_id = ?1 AND tombstoned = 0",
-            rusqlite::params![item_id],
-            |r| {
-                Ok(crate::storage::models::OrgItemEditCtx {
-                    org_id: r.get(0)?,
-                    rev: r.get::<_, i64>(1)? as u32,
-                    created_at: r.get(2)?,
-                    source_kind: r.get::<_, Option<String>>(3)?,
-                    author_user_id: r.get::<_, Option<String>>(4)?,
-                })
-            },
-        )
-        .optional()
-        .map_err(map_err)
-    }
+    // `count_org_items` moved to `storage::org_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// The browsable LIST of one org's live (non-tombstoned) items — headers only (no `markdown`
-    /// body; that's [`Db::get_org_item`]). Newest-first by feed `seq`. This is what lets a member SEE
-    /// what colleagues shared into the org instead of only search-hitting it. Org items are
-    /// deliberately org-disclosed content (no folder lock gate applies); the COMMAND layer re-checks
-    /// the caller is a local member of `org_id` before calling this.
-    ///
-    /// `kind` is now populated DIRECTLY from the stored `source_kind` column (opened off the item's
-    /// `OrgEnvelope` at ingest — see `upsert_org_item`) for EVERY item, not just ones this device
-    /// published: a v2-envelope item from a colleague now classifies correctly. Stays `None` for a row
-    /// ingested before this column existed, or from a peer still on an old v1-only client (honest
-    /// "unclassified", never guessed). `list_org_items_inner` may still override this with the
-    /// owned-item resolver for the caller's OWN items (correct even when the column is somehow null).
-    pub fn list_org_items(
-        &self,
-        org_id: &str,
-    ) -> Result<Vec<crate::storage::models::OrgItemHeader>> {
-        let conn = self.lock();
-        let mut stmt = conn
-            .prepare(
-                "SELECT item_id, title, author_hint, created_at, seq, source_kind
-                   FROM org_items
-                  WHERE org_id = ?1 AND tombstoned = 0
-                  ORDER BY seq DESC",
-            )
-            .map_err(map_err)?;
-        let rows = stmt
-            .query_map(rusqlite::params![org_id], |r| {
-                Ok(crate::storage::models::OrgItemHeader {
-                    item_id: r.get(0)?,
-                    title: r.get(1)?,
-                    author_hint: r.get(2)?,
-                    created_at: r.get(3)?,
-                    seq: r.get::<_, i64>(4)? as u64,
-                    // Direct from storage now (see doc comment above); `list_org_items_inner` may still
-                    // enrich/override for the caller's own items via the local `org_shares` resolver.
-                    kind: r.get::<_, Option<String>>(5)?,
-                    owned_source: None,
-                })
-            })
-            .map_err(map_err)?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r.map_err(map_err)?);
-        }
-        Ok(out)
-    }
+    // `all_org_shared_content_hashes` moved to `storage::org_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// COUNT of one org's live (non-tombstoned) RECEIVED items — the size of the local org replica
-    /// (what colleagues shared IN). Distinct from the outbound `org_shares` count (what THIS member
-    /// published OUT); the two were conflated so the Settings item count showed the caller's own
-    /// uploads and read "0 items" to a receiver. Content-free.
-    ///
-    /// PER-INSTANCE ORG TOGGLE: joined to `org_state` and filtered on `context_enabled = 1` — same
-    /// gate as `search_org_chunks_knn`/`_fts`/`get_org_item`/`list_org_items_inner`. Without this a
-    /// disabled org's `received_count` stayed stale/inflated (the raw local-replica row count) even
-    /// though every other read of the same table (search, browse) correctly reports it as empty —
-    /// the count and the actual gated content must agree for the same org.
-    pub fn count_org_items(&self, org_id: &str) -> Result<u32> {
-        let conn = self.lock();
-        conn.query_row(
-            "SELECT COUNT(*)
-               FROM org_items oi
-               JOIN org_state os ON os.org_id = oi.org_id
-              WHERE oi.org_id = ?1 AND oi.tombstoned = 0 AND os.context_enabled = 1",
-            rusqlite::params![org_id],
-            |r| r.get::<_, i64>(0),
-        )
-        .map(|n| n as u32)
-        .map_err(map_err)
-    }
+    // `org_items_needing_embed` moved to `storage::org_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// Every non-null `content_sha256` from the local `org_shares` rows (across all orgs the user has
-    /// shared into) — the SELF-SHARE dedup key set. A retrieval hit whose hash is in this set is the
-    /// caller's OWN published item and is relabelled/dropped so a member never sees their own share
-    /// echoed back as an "org" result. Content-free (opaque hashes only).
-    pub fn all_org_shared_content_hashes(&self) -> Result<Vec<Vec<u8>>> {
-        let conn = self.lock();
-        let mut stmt = conn
-            .prepare("SELECT content_sha256 FROM org_shares WHERE content_sha256 IS NOT NULL")
-            .map_err(map_err)?;
-        let rows = stmt
-            .query_map([], |r| r.get::<_, Vec<u8>>(0))
-            .map_err(map_err)?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r.map_err(map_err)?);
-        }
-        Ok(out)
-    }
-
-    /// LIVE org item ids that still LACK any int8 vector (chunks present but no `org_vec_chunks`) —
-    /// the re-embed backlog once a real embedder appears on a member that ingested FTS-only. Bounded
-    /// by `limit`. Empty when every live item is already embedded (or FTS-only with no chunks).
-    pub fn org_items_needing_embed(&self, org_id: &str, limit: i64) -> Result<Vec<String>> {
-        let conn = self.lock();
-        let mut stmt = conn
-            .prepare(
-                "SELECT DISTINCT oc.item_id
-                   FROM org_chunks oc
-                   JOIN org_items oi ON oi.item_id = oc.item_id
-                  WHERE oi.org_id = ?1 AND oi.tombstoned = 0
-                    AND NOT EXISTS (SELECT 1 FROM org_vec_chunks v WHERE v.chunk_id = oc.id)
-                  LIMIT ?2",
-            )
-            .map_err(map_err)?;
-        let rows = stmt
-            .query_map(rusqlite::params![org_id, limit], |r| r.get::<_, String>(0))
-            .map_err(map_err)?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r.map_err(map_err)?);
-        }
-        Ok(out)
-    }
 
     // ── NOTES (authored `documents(kind='note')`) ───────────────────────────────────────────────
 
@@ -5726,21 +4661,8 @@ impl Db {
         Ok(())
     }
 
-    /// FAIL-CLOSED cleanup for a salvage/retry pipeline that raced a mid-run relock: delete this
-    /// meeting's segments that carry PLAINTEXT with NO sealed blob (`text_blob IS NULL`) — the
-    /// unsealed fresh rows the relock's re-blank (guarded on `text_blob IS NOT NULL`) can never
-    /// cover. Rows WITH a blob (the durable sealed copies) are untouched. The deleted rows are
-    /// DERIVED data whose source audio survives sealed at rest (`.enc`), so nothing unrecoverable
-    /// is destroyed — privacy wins over keeping a re-derivable plaintext transcript behind a lock.
-    /// Returns the number of rows removed (ids/counts only in logs, never text).
-    pub fn delete_unsealed_segments(&self, meeting_id: &str) -> Result<usize> {
-        let conn = self.lock();
-        conn.execute(
-            "DELETE FROM segments WHERE meeting_id = ?1 AND text_blob IS NULL",
-            rusqlite::params![meeting_id],
-        )
-        .map_err(map_err)
-    }
+    // `delete_unsealed_segments` moved to `storage::seal_store` (God-file split) — still callable as inherent `db.method()` cross-file.
+
 
     /// All segments for a meeting, ordered by `idx`.
     pub fn get_segments(&self, meeting_id: &str) -> Result<Vec<Segment>> {
@@ -5816,30 +4738,8 @@ impl Db {
         Ok(())
     }
 
-    /// SEAL-ON-WRITE twin of [`Db::set_timeline_data`] for a meeting in a session-unlocked LOCKED
-    /// folder (2026-07-11 audit SEAM-F1/F2): upsert the fresh plaintext (session-visible) AND its
-    /// freshly-encrypted `data_blob` in ONE atomic statement, so relock/at-rest reblank restores THIS
-    /// timeline — never a stale lock-time copy, and a timeline GENERATED while unlocked is sealed from
-    /// birth (never a blob-less plaintext behind a lock). The CALLER must have verified the blob
-    /// decrypts back byte-identical BEFORE calling this (verify-before-destroy) — exactly like
-    /// [`Db::seal_timeline`]. INSERT-or-update (a freshly generated timeline has no row yet).
-    pub fn set_timeline_data_sealed(
-        &self,
-        meeting_id: &str,
-        data: &str,
-        data_blob: &[u8],
-    ) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
-            "INSERT INTO timelines (meeting_id, data, data_blob) VALUES (?1, ?2, ?3)
-             ON CONFLICT(meeting_id) DO UPDATE SET
-               data = excluded.data,
-               data_blob = excluded.data_blob",
-            rusqlite::params![meeting_id, data, data_blob],
-        )
-        .map_err(map_err)?;
-        Ok(())
-    }
+    // `set_timeline_data_sealed` moved to `storage::seal_store` (God-file split) — still callable as inherent `db.method()` cross-file.
+
 
     // ── meeting tags ─────────────────────────────────────────────────────────
 
@@ -6197,197 +5097,8 @@ impl Db {
 
     // `any_locked_folder` moved to `storage::folders_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// DESTRUCTIVE escape hatch for a folder whose master KEK is GENUINELY UNRECOVERABLE (the caller
-    /// — `discard_unrecoverable_folder_lock` — has already PROVEN, via the full read-first + candidate
-    /// recovery ladder, that no key unwraps this folder's content key). Discards ONLY this folder's
-    /// sealed payload and returns the folder to an open, usable state. The encrypted `*_blob`
-    /// ciphertext is unrecoverable anyway (its key is gone), so this destroys nothing that was
-    /// otherwise readable — it just stops the folder being permanently bricked.
-    ///
-    /// In one transaction, scoped to THIS folder's meetings + documents: NULL every sealed blob and
-    /// blank the (already-empty) plaintext columns, purge every derived table that could hold
-    /// sealed-content-derived data (chunks/vectors/facts/user-facts/correction-log/assistant-log/
-    /// voiceprints/live-bullets), then clear the folder's `wrapped_key` and set `locked = 0`. Returns the at-rest
-    /// audio columns of the folder's meetings so the caller can delete the orphaned `.enc` files on
-    /// disk (the DB layer stays pure-SQL). NEVER call this without the caller's non-recoverability
-    /// proof — it is the one path that discards sealed content by design (and now provably only the
-    /// sealed, unrecoverable part — never a readable never-sealed buffer).
-    pub fn discard_folder_seal(&self, folder_id: &str) -> Result<Vec<String>> {
-        // Meetings that belong to THIS folder (folder_id lives on the notes row — the same join the
-        // seal/relock paths use). Documents anchor on the folder row directly.
-        const FOLDER_MEETINGS: &str = "SELECT DISTINCT meeting_id FROM notes WHERE folder_id = ?1";
-        let mut conn = self.lock();
-        let tx = conn.transaction().map_err(map_err)?;
+    // `discard_folder_seal` moved to `storage::seal_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-        // Collect ONLY the SEALED (`.enc`) audio paths to unlink — a never-sealed plaintext WAV is
-        // readable content and is left untouched (file kept, column kept).
-        let mut enc_paths: Vec<String> = Vec::new();
-        {
-            let mut stmt = tx
-                .prepare(&format!(
-                    "SELECT audio_path, mic_master_path, sys_master_path FROM meetings \
-                       WHERE id IN ({FOLDER_MEETINGS})"
-                ))
-                .map_err(map_err)?;
-            let rows = stmt
-                .query_map(rusqlite::params![folder_id], |r| {
-                    Ok((
-                        r.get::<_, Option<String>>(0)?,
-                        r.get::<_, Option<String>>(1)?,
-                        r.get::<_, Option<String>>(2)?,
-                    ))
-                })
-                .map_err(map_err)?;
-            for r in rows {
-                let (a, m, s) = r.map_err(map_err)?;
-                for p in [a, m, s].into_iter().flatten() {
-                    if p.ends_with(".enc") {
-                        enc_paths.push(p);
-                    }
-                }
-            }
-        }
-
-        // Notes: blank plaintext + export path (+ its collision-guard hash baseline, which is
-        // path-coupled) ONLY of rows that WERE sealed (blob present); a never-sealed row (blob
-        // NULL) keeps its readable plaintext. Then drop the unrecoverable blob.
-        tx.execute(
-            "UPDATE notes SET markdown = '', exported_path = NULL, exported_hash = NULL WHERE folder_id = ?1 AND content_blob IS NOT NULL",
-            rusqlite::params![folder_id],
-        )
-        .map_err(map_err)?;
-        tx.execute(
-            "UPDATE notes SET content_blob = NULL WHERE folder_id = ?1",
-            rusqlite::params![folder_id],
-        )
-        .map_err(map_err)?;
-        // Transcript segments + timeline.
-        tx.execute(
-            &format!("UPDATE segments SET text = '' WHERE text_blob IS NOT NULL AND meeting_id IN ({FOLDER_MEETINGS})"),
-            rusqlite::params![folder_id],
-        )
-        .map_err(map_err)?;
-        tx.execute(
-            &format!(
-                "UPDATE segments SET text_blob = NULL WHERE meeting_id IN ({FOLDER_MEETINGS})"
-            ),
-            rusqlite::params![folder_id],
-        )
-        .map_err(map_err)?;
-        tx.execute(
-            &format!("UPDATE timelines SET data = '' WHERE data_blob IS NOT NULL AND meeting_id IN ({FOLDER_MEETINGS})"),
-            rusqlite::params![folder_id],
-        )
-        .map_err(map_err)?;
-        tx.execute(
-            &format!(
-                "UPDATE timelines SET data_blob = NULL WHERE meeting_id IN ({FOLDER_MEETINGS})"
-            ),
-            rusqlite::params![folder_id],
-        )
-        .map_err(map_err)?;
-        // Typed realtime notes.
-        tx.execute(
-            &format!("UPDATE meetings SET manual_notes = '' WHERE manual_notes_blob IS NOT NULL AND id IN ({FOLDER_MEETINGS})"),
-            rusqlite::params![folder_id],
-        )
-        .map_err(map_err)?;
-        tx.execute(
-            &format!(
-                "UPDATE meetings SET manual_notes_blob = NULL WHERE id IN ({FOLDER_MEETINGS})"
-            ),
-            rusqlite::params![folder_id],
-        )
-        .map_err(map_err)?;
-        // At-rest audio: null ONLY the SEALED (`.enc`) columns; a plaintext WAV column is preserved.
-        for col in ["audio_path", "mic_master_path", "sys_master_path"] {
-            tx.execute(
-                &format!("UPDATE meetings SET {col} = NULL WHERE {col} LIKE '%.enc' AND id IN ({FOLDER_MEETINGS})"),
-                rusqlite::params![folder_id],
-            )
-            .map_err(map_err)?;
-        }
-
-        // Derived / invertible tables — purge anything keyed on the folder's meetings (vectors first
-        // by chunk_id, then the source rows), mirroring the seal-time purge in
-        // `reblank_locked_folders_at_rest` but scoped to this one folder. Surviving never-sealed
-        // plaintext re-derives its chunks/vectors on next access.
-        tx.execute(
-            &format!("DELETE FROM vec_chunks WHERE chunk_id IN (SELECT id FROM note_chunks WHERE meeting_id IN ({FOLDER_MEETINGS}))"),
-            rusqlite::params![folder_id],
-        )
-        .map_err(map_err)?;
-        // Brain v2 L1.1 — TOPIC chunks are the same purge class (vec0 rows first, then base rows).
-        tx.execute(
-            &format!("DELETE FROM topic_vec_chunks WHERE chunk_id IN (SELECT id FROM topic_chunks WHERE meeting_id IN ({FOLDER_MEETINGS}))"),
-            rusqlite::params![folder_id],
-        )
-        .map_err(map_err)?;
-        for table in [
-            "note_chunks",
-            "topic_chunks",
-            "correction_log",
-            "assistant_interactions",
-            "facts",
-            "user_facts",
-            "speaker_voiceprints",
-            // Brain v2 L4 (lock-security W3): the live-bullets crash-recovery row is the same
-            // derived-plaintext class — purge it with the rest (contract consistency; a reachable
-            // row at discard time only ever digests never-sealed plaintext, but the "purge every
-            // derived table" contract must not silently exclude one table).
-            "live_bullets",
-        ] {
-            tx.execute(
-                &format!("DELETE FROM {table} WHERE meeting_id IN ({FOLDER_MEETINGS})"),
-                rusqlite::params![folder_id],
-            )
-            .map_err(map_err)?;
-        }
-        // (Deliberate, mirrors `memory_rollups`: PENDING `brief_runs` are NOT purged on discard —
-        // discard returns every source meeting to OPEN plaintext, so a pending brief over now-open
-        // content is not a leak. Every SEAL path purges them: `purge_pending_brief_runs_tx`.)
-
-        // Vault Audit (lock review + adversarial HIGH): pending findings ARE purged on discard,
-        // unlike brief runs — ALL of them (the rollup posture): a TOCTOU-orphaned row (staged in
-        // the pass↔seal race the epoch withdrawal narrows but cannot fully close) may CITE this
-        // folder's titles in its evidence with no matching id, so a scoped purge cannot cover it.
-        // Cheap re-derivable rows; the next pass re-stages anything still true.
-        Self::purge_all_pending_audit_findings_tx(&tx)?;
-
-        // Documents anchored on this folder: drop sealed ciphertext + plaintext + their chunks/vectors.
-        tx.execute(
-            "DELETE FROM doc_vec_chunks WHERE chunk_id IN \
-               (SELECT id FROM doc_chunks WHERE document_id IN \
-                  (SELECT id FROM documents WHERE folder_id = ?1))",
-            rusqlite::params![folder_id],
-        )
-        .map_err(map_err)?;
-        tx.execute(
-            "DELETE FROM doc_chunks WHERE document_id IN (SELECT id FROM documents WHERE folder_id = ?1)",
-            rusqlite::params![folder_id],
-        )
-        .map_err(map_err)?;
-        tx.execute(
-            "UPDATE documents SET text = '' WHERE text_blob IS NOT NULL AND folder_id = ?1",
-            rusqlite::params![folder_id],
-        )
-        .map_err(map_err)?;
-        tx.execute(
-            "UPDATE documents SET text_blob = NULL WHERE folder_id = ?1",
-            rusqlite::params![folder_id],
-        )
-        .map_err(map_err)?;
-
-        // Finally flip the folder OPEN and drop its (now-useless) wrapped content key.
-        tx.execute(
-            "UPDATE folders SET locked = 0, wrapped_key = NULL WHERE id = ?1",
-            rusqlite::params![folder_id],
-        )
-        .map_err(map_err)?;
-
-        tx.commit().map_err(map_err)?;
-        Ok(enc_paths)
-    }
 
     // `child_folders` moved to `storage::folders_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
@@ -6504,594 +5215,21 @@ impl Db {
 
     // `set_note_folder` moved to `storage::folders_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// Notes assigned to a folder (the rows needed to seal/unseal): the meeting, provider,
-    /// current markdown, exported path, and any existing sealed blob.
-    pub fn notes_in_folder(&self, folder_id: &str) -> Result<Vec<SealableNote>> {
-        let conn = self.lock();
-        let mut stmt = conn
-            .prepare(
-                "SELECT meeting_id, provider_id, markdown, exported_path, content_blob
-                   FROM notes WHERE folder_id = ?1",
-            )
-            .map_err(map_err)?;
-        let rows = stmt
-            .query_map(rusqlite::params![folder_id], |r| {
-                Ok(SealableNote {
-                    meeting_id: r.get(0)?,
-                    provider_id: r.get(1)?,
-                    markdown: r.get(2)?,
-                    exported_path: r.get(3)?,
-                    content_blob: r.get(4)?,
-                })
-            })
-            .map_err(map_err)?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r.map_err(map_err)?);
-        }
-        Ok(out)
-    }
+    // `notes_in_folder` moved to `storage::seal_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// Every provider row of ONE meeting's note (markdown, exported path, existing blob), regardless
-    /// of folder — the rows needed to seal a note moved INTO a locked folder (BLK-2). Mirrors
-    /// [`Db::notes_in_folder`] but scoped to a single meeting so a move seals ONLY that note.
-    pub fn sealable_notes_for_meeting(&self, meeting_id: &str) -> Result<Vec<SealableNote>> {
-        let conn = self.lock();
-        let mut stmt = conn
-            .prepare(
-                "SELECT meeting_id, provider_id, markdown, exported_path, content_blob
-                   FROM notes WHERE meeting_id = ?1",
-            )
-            .map_err(map_err)?;
-        let rows = stmt
-            .query_map(rusqlite::params![meeting_id], |r| {
-                Ok(SealableNote {
-                    meeting_id: r.get(0)?,
-                    provider_id: r.get(1)?,
-                    markdown: r.get(2)?,
-                    exported_path: r.get(3)?,
-                    content_blob: r.get(4)?,
-                })
-            })
-            .map_err(map_err)?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r.map_err(map_err)?);
-        }
-        Ok(out)
-    }
+    // `sealable_notes_for_meeting` moved to `storage::seal_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// Seal ONE provider row of a note: store its AES-GCM `content_blob`, blank that row's
-    /// plaintext `markdown`, and clear its `exported_path` (the `.md` leaves the vault).
-    /// Targets `(meeting_id, provider_id)` so distinct per-provider markdown each gets its own
-    /// blob — a meeting re-summarized with multiple providers never collapses to one blob (which
-    /// would destroy every provider's content but the first). The whole meeting is sealed by
-    /// calling this once per provider row.
-    pub fn seal_note(
-        &self,
-        meeting_id: &str,
-        provider_id: &str,
-        content_blob: &[u8],
-    ) -> Result<()> {
-        let conn = self.lock();
-        // Export-collision guard: the baseline `exported_hash` is blanked in the SAME seal
-        // UPDATE that clears `exported_path` — a sealed note has no on-disk export, and a stale
-        // baseline surviving the seal would mis-classify the fresh unlock re-export
-        // (`write_note_to_vault` / `remove_lock` re-stamp both columns fresh).
-        conn.execute(
-            "UPDATE notes SET content_blob = ?3, markdown = '', exported_path = NULL,
-                    exported_hash = NULL
-             WHERE meeting_id = ?1 AND provider_id = ?2",
-            rusqlite::params![meeting_id, provider_id, content_blob],
-        )
-        .map_err(map_err)?;
-        Ok(())
-    }
+    // `seal_note` moved to `storage::seal_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// Restore ONE provider row's plaintext `markdown` (session-unlock or permanent remove-lock).
-    /// Does NOT touch `content_blob` (the caller decides whether to clear it). Per-provider so a
-    /// sibling provider's distinct markdown is never overwritten.
-    pub fn restore_note_markdown(
-        &self,
-        meeting_id: &str,
-        provider_id: &str,
-        markdown: &str,
-    ) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
-            "UPDATE notes SET markdown = ?3 WHERE meeting_id = ?1 AND provider_id = ?2",
-            rusqlite::params![meeting_id, provider_id, markdown],
-        )
-        .map_err(map_err)?;
-        Ok(())
-    }
+    // `restore_note_markdown` moved to `storage::seal_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// Clear a note's sealed `content_blob` for every provider row of the meeting (permanent
-    /// remove-lock, after each row's plaintext is back). Safe to target the whole meeting here:
-    /// the plaintext has already been restored per-row, and we want NO blob left anywhere.
-    pub fn clear_note_content_blob(&self, meeting_id: &str) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
-            "UPDATE notes SET content_blob = NULL WHERE meeting_id = ?1",
-            rusqlite::params![meeting_id],
-        )
-        .map_err(map_err)?;
-        Ok(())
-    }
+    // `clear_note_content_blob` moved to `storage::seal_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// Re-blank the plaintext `markdown` of every note in `folder_ids` that still has a sealed
-    /// `content_blob` (relock / relock-all). Idempotent; leaves the blob intact.
-    ///
-    /// Returns the `exported_path`s of the memory rollups purged in the same transaction
-    /// (`purge_memory_rollups_tx` — a relock re-asserts the sealed shape, so sealed-derived rollup
-    /// synthesis must not linger either); the CALLER deletes those vault `.md` files.
-    pub fn blank_sealed_notes_in_folders(
-        &self,
-        folder_ids: &HashSet<String>,
-    ) -> Result<Vec<String>> {
-        if folder_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        let mut conn = self.lock();
-        let tx = conn.transaction().map_err(map_err)?;
-        let rollup_exports;
-        {
-            let mut stmt = tx
-                .prepare(
-                    "UPDATE notes SET markdown = ''
-                      WHERE folder_id = ?1 AND content_blob IS NOT NULL",
-                )
-                .map_err(map_err)?;
-            for id in folder_ids {
-                stmt.execute(rusqlite::params![id]).map_err(map_err)?;
-            }
-            // Phase 2a LOCK-SAFETY: purge plaintext-derived chunks + their (invertible) vectors for
-            // every meeting in these folders, in the SAME transaction as the plaintext blanking —
-            // so a re-blanked (sealed) folder never leaves a semantic vector at rest. Resolve the
-            // folders' meetings from their note rows (mirrors `meeting_ids_in_folder`).
-            let mut mids = tx
-                .prepare("SELECT DISTINCT meeting_id FROM notes WHERE folder_id = ?1")
-                .map_err(map_err)?;
-            let mut meeting_ids: Vec<String> = Vec::new();
-            for id in folder_ids {
-                let rows = mids
-                    .query_map(rusqlite::params![id], |r| r.get::<_, String>(0))
-                    .map_err(map_err)?;
-                for r in rows {
-                    meeting_ids.push(r.map_err(map_err)?);
-                }
-            }
-            drop(mids);
-            Self::purge_chunks_tx(&tx, &meeting_ids)?;
-            // Document ingestion LOCK-SAFETY: purge the (invertible) doc chunks + vectors of every
-            // document in these (re-blanked / sealed) folders in the SAME transaction — so a relocked
-            // folder never leaves a document's semantic vector at rest. (The document TEXT re-blank is
-            // SEALED-AND-RESTORED content handled by `reblank_folder_extras`, exactly like
-            // `manual_notes` — it must NOT be blanked here, where there is no CK to re-seal.)
-            let mut dids = tx
-                .prepare("SELECT id FROM documents WHERE folder_id = ?1")
-                .map_err(map_err)?;
-            let mut document_ids: Vec<String> = Vec::new();
-            for id in folder_ids {
-                let rows = dids
-                    .query_map(rusqlite::params![id], |r| r.get::<_, String>(0))
-                    .map_err(map_err)?;
-                for r in rows {
-                    document_ids.push(r.map_err(map_err)?);
-                }
-            }
-            drop(dids);
-            Self::purge_doc_chunks_tx(&tx, &document_ids)?;
-            // Phase F0 LOCK-SAFETY: purge the correction-log rows of every meeting in these (now
-            // re-blanked / sealed) folders in the SAME transaction — a sealed meeting contributes
-            // nothing to the flywheel.
-            Self::purge_corrections_tx(&tx, &meeting_ids)?;
-            // 2026-07-10 audit F5: the four derived-content families the LOCK tx
-            // (`purge_chunks_for_meetings`) and the STARTUP reconcile
-            // (`reblank_locked_folders_at_rest`) already purge were MISSING from this RELOCK tx —
-            // rows re-derived DURING a session unlock (facts extraction, user memory, voice Q&A,
-            // re-diarized voiceprints) survived the relock at rest. Same purge-on-seal contract,
-            // same meeting scope, same atomic unit as the plaintext re-blank above.
-            Self::purge_facts_tx(&tx, &meeting_ids)?;
-            Self::purge_user_facts_tx(&tx, &meeting_ids)?;
-            Self::purge_assistant_interactions_tx(&tx, &meeting_ids)?;
-            Self::purge_speaker_voiceprints_tx(&tx, &meeting_ids)?;
-            // Re-Truth LOCK-SAFETY: drop supersession rows referencing any meeting in these
-            // (re-blanked / sealed) folders — an applied row's plaintext note pre-image must not
-            // linger at rest for a sealed folder (same purge-on-seal contract as corrections above).
-            Self::purge_supersessions_tx(&tx, &meeting_ids)?;
-            // Brain v2 L4 LOCK-SAFETY: drop the live-bullets crash-recovery rows of every meeting
-            // in these (re-blanked / sealed) folders in this SAME relock tx — running notes are
-            // plaintext derived from the transcript and must not survive a relock at rest.
-            Self::purge_live_bullets_tx(&tx, &meeting_ids)?;
-            // NOTE: the typed-notes (`manual_notes`) re-blank does NOT live here — it is SEALED-AND-
-            // RESTORED content (not a derived/purgeable artifact like chunks/corrections), so its
-            // plaintext is re-blanked only WHERE the `manual_notes_blob` exists, by
-            // `reblank_folder_extras` (relock) / `reblank_locked_folders_at_rest` (startup). Blanking
-            // it here (unconditionally, with no CK to re-seal) would destroy the only copy of a
-            // typed buffer that had not yet been sealed — the verify-before-destroy violation.
+    // `blank_sealed_notes_in_folders` moved to `storage::seal_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-            // Brain v2 L5 LOCK-SAFETY: purge any PENDING scheduled-brief row referencing a meeting
-            // in these (re-blanked / sealed) folders in this SAME tx — a pending brief's `note_md`
-            // paraphrases the sealed notes (accepted rows were consumed on accept). Same
-            // purge-on-seal contract as the rollups below.
-            Self::purge_pending_brief_runs_tx(&tx, &meeting_ids)?;
-            // Vault Audit LOCK-SAFETY: purge ALL pending findings in this SAME relock tx — the
-            // memory-rollups posture (adversarial HIGH: evidence may cite third-party titles no
-            // meeting/document id can match; a relock invalidates the pass's visibility
-            // snapshot). Resolved rows were blanked on resolve and survive.
-            Self::purge_all_pending_audit_findings_tx(&tx)?;
 
-            // Brain v3 PR-3 LINK-ENGINE LOCK-SAFETY: purge every DERIVED `links` row whose SRC OR DST is
-            // a meeting OR document/note in these (re-blanked / sealed) folders in this SAME relock tx —
-            // a link names a neighbour (its title/existence reveals a possibly-sealed item). Same
-            // purge-on-seal contract as the chunks above; re-derived on unlock. A relock/seal preserves
-            // the user's decision rows (`preserve_decisions=true`, Fix 1).
-            Self::purge_links_tx(&tx, &meeting_ids, &document_ids, true)?;
-            // Brain v2 L2.1 LOCK-SAFETY: purge ALL memory rollups in this SAME relock tx — a rollup
-            // may paraphrase the just-re-sealed facts. Cheap re-derivable synthesis; regenerates
-            // from VISIBLE facts on the next hourly pass. The caller deletes the exported `.md`s.
-            rollup_exports = Self::purge_memory_rollups_tx(&tx)?;
-        }
-        tx.commit().map_err(map_err)?;
-        Ok(rollup_exports)
-    }
+    // `reblank_locked_folders_at_rest` moved to `storage::seal_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// SHOULD-FIX startup reconciliation: re-assert the at-rest sealed shape of EVERY `locked=1`
-    /// folder. In one transaction, re-blank the plaintext `markdown` / segment `text` / timeline
-    /// `data` of any row in a locked folder that still carries its AES-GCM blob (so a crash WHILE a
-    /// folder was session-unlocked — which leaves plaintext in those columns — cannot survive a
-    /// restart). Only rows WITH a blob are blanked (the blob is the recoverable source of truth); a
-    /// blob-less plaintext row is left untouched so we never destroy unsealed content.
-    ///
-    /// Returns the at-rest audio columns of every meeting in a locked folder so the caller can
-    /// re-seal stray plaintext audio (remove a plaintext file whose `.enc` already exists, or
-    /// re-point a dangling column at a surviving `.enc`) on disk — that filesystem step lives in
-    /// `state::reconcile_locked_at_rest` (the DB layer stays pure-SQL). ALL THREE per-stream paths
-    /// are surfaced — the playback WAV (`audio_path`) AND the two hi-res masters
-    /// (`mic_master_path` / `sys_master_path`). A crash-while-unlocked decrypts EVERY stream that
-    /// was sealed, so re-pointing only `audio_path` would leave `{id}.mic.wav` / `{id}.sys.wav`
-    /// plaintext on disk forever (B1) — the masters must be reconciled with the same logic.
-    ///
-    /// The second tuple element is the `exported_path`s of the memory rollups purged in-tx when any
-    /// folder is locked (`purge_memory_rollups_tx`) — the caller deletes those vault `.md` files.
-    ///
-    /// The third tuple element (2026-07-10 audit F2) is `(id, exported_path)` of every authored
-    /// NOTE in a locked folder: a session unlock re-exports each note's vault `.md`
-    /// (`reexport_notes_in_folder`), so a crash-while-unlocked leaves that plaintext `.md` on disk.
-    /// The caller ([`crate::state`] `reconcile_locked_at_rest`) deletes each file and clears that
-    /// note's `exported_path` INDIVIDUALLY, only on a successful delete / already-absent file
-    /// (delete-then-clear, per row — 2026-07-10 residual W5): a FAILED delete keeps the path
-    /// recorded so the next startup retries. Mirrors the clean-relock cleanup in
-    /// `reblank_folder_extras`.
-    pub fn reblank_locked_folders_at_rest(&self) -> Result<LockedAtRestCleanup> {
-        const LOCKED_MEETINGS: &str = "SELECT DISTINCT meeting_id FROM notes \
-             WHERE folder_id IN (SELECT id FROM folders WHERE locked = 1)";
-        let mut conn = self.lock();
-        let tx = conn.transaction().map_err(map_err)?;
-        tx.execute(
-            "UPDATE notes SET markdown = '' \
-               WHERE content_blob IS NOT NULL \
-                 AND folder_id IN (SELECT id FROM folders WHERE locked = 1)",
-            [],
-        )
-        .map_err(map_err)?;
-        tx.execute(
-            &format!("UPDATE segments SET text = '' WHERE text_blob IS NOT NULL AND meeting_id IN ({LOCKED_MEETINGS})"),
-            [],
-        )
-        .map_err(map_err)?;
-        tx.execute(
-            &format!("UPDATE timelines SET data = '' WHERE data_blob IS NOT NULL AND meeting_id IN ({LOCKED_MEETINGS})"),
-            [],
-        )
-        .map_err(map_err)?;
-        // Phase 2a LOCK-SAFETY: purge plaintext-derived chunks + vectors for every meeting in a
-        // locked folder, in this same reconciliation transaction — so a crash-while-unlocked (which
-        // may have re-indexed) cannot leave a semantic vector of sealed content at rest after a
-        // restart. Delete vec0 rows first (by chunk_id), then the source note_chunks rows.
-        tx.execute(
-            &format!(
-                "DELETE FROM vec_chunks WHERE chunk_id IN \
-                   (SELECT id FROM note_chunks WHERE meeting_id IN ({LOCKED_MEETINGS}))"
-            ),
-            [],
-        )
-        .map_err(map_err)?;
-        tx.execute(
-            &format!("DELETE FROM note_chunks WHERE meeting_id IN ({LOCKED_MEETINGS})"),
-            [],
-        )
-        .map_err(map_err)?;
-        // Brain v2 L1.1 LOCK-SAFETY: TOPIC chunks are the same class of plaintext-derived data —
-        // purge them (vec0 rows first, then the base rows whose `_ad` FTS trigger drops the
-        // aug_text tokens) in this same reconciliation transaction.
-        tx.execute(
-            &format!(
-                "DELETE FROM topic_vec_chunks WHERE chunk_id IN \
-                   (SELECT id FROM topic_chunks WHERE meeting_id IN ({LOCKED_MEETINGS}))"
-            ),
-            [],
-        )
-        .map_err(map_err)?;
-        tx.execute(
-            &format!("DELETE FROM topic_chunks WHERE meeting_id IN ({LOCKED_MEETINGS})"),
-            [],
-        )
-        .map_err(map_err)?;
-        // Phase F0 LOCK-SAFETY: purge correction-log rows for every meeting in a locked folder, in
-        // this same reconciliation transaction — so a crash-while-unlocked (which may have logged a
-        // correction) cannot leave sealed-content-derived training data at rest after a restart.
-        tx.execute(
-            &format!("DELETE FROM correction_log WHERE meeting_id IN ({LOCKED_MEETINGS})"),
-            [],
-        )
-        .map_err(map_err)?;
-        // LOCK-SAFETY: purge the voice-assistant Q&A log for every meeting in a locked folder, in
-        // this same reconciliation transaction — so a crash-while-unlocked (which may have persisted
-        // an interaction against a since-sealed meeting) cannot leave the plaintext Q&A at rest after
-        // a restart. Same purge-on-seal contract as the correction-log above.
-        tx.execute(
-            &format!("DELETE FROM assistant_interactions WHERE meeting_id IN ({LOCKED_MEETINGS})"),
-            [],
-        )
-        .map_err(map_err)?;
-        // Brain v2 L4 LOCK-SAFETY: purge the live-bullets crash-recovery rows for every meeting in
-        // a locked folder, in this same reconciliation transaction — so a crash mid-recording into
-        // a since-sealed folder cannot leave the plaintext running notes at rest after a restart.
-        // Same purge-on-seal contract as the assistant-interactions above.
-        tx.execute(
-            &format!("DELETE FROM live_bullets WHERE meeting_id IN ({LOCKED_MEETINGS})"),
-            [],
-        )
-        .map_err(map_err)?;
-        // brain2 R2 LOCK-SAFETY: purge the bitemporal facts for every meeting in a locked folder, in
-        // this same reconciliation transaction — so a crash-while-unlocked (which may have re-derived
-        // facts against a since-sealed meeting) cannot leave plaintext facts at rest after a restart.
-        // Same purge-on-seal contract as the correction-log / assistant-interactions above.
-        tx.execute(
-            &format!("DELETE FROM facts WHERE meeting_id IN ({LOCKED_MEETINGS})"),
-            [],
-        )
-        .map_err(map_err)?;
-        // Phase 3 CROSS-MEETING USER MEMORY LOCK-SAFETY: purge user-scoped facts for every meeting in
-        // a locked folder, in this same reconciliation transaction — so a crash-while-unlocked (which
-        // may have re-derived user memory against a since-sealed meeting) cannot leave plaintext user
-        // facts at rest after a restart. Same purge-on-seal contract as `facts` above.
-        tx.execute(
-            &format!("DELETE FROM user_facts WHERE meeting_id IN ({LOCKED_MEETINGS})"),
-            [],
-        )
-        .map_err(map_err)?;
-        // VOICEPRINT LOCK-SAFETY: purge the (opt-in) voice biometrics captured for every meeting in a
-        // locked folder, in this same reconciliation transaction — so a crash-while-unlocked (which
-        // may have re-diarized against a since-sealed meeting) cannot leave a remote speaker's
-        // voiceprint at rest after a restart. Same purge-on-seal contract as `user_facts` above.
-        tx.execute(
-            &format!("DELETE FROM speaker_voiceprints WHERE meeting_id IN ({LOCKED_MEETINGS})"),
-            [],
-        )
-        .map_err(map_err)?;
-        // Re-Truth LOCK-SAFETY: purge every supersession referencing a locked meeting on EITHER side,
-        // in this same reconciliation transaction — so a crash-while-unlocked (which may have applied a
-        // stamp + stored plaintext note pre-images, or recorded old/new fact-value strings against a
-        // since-sealed meeting) cannot leave those plaintext bytes/strings at rest after a restart.
-        // Same purge-on-seal contract as `facts` / `user_facts` above; the row references two meetings
-        // so it matches on both `source_meeting_id` and `superseding_meeting_id`.
-        tx.execute(
-            &format!(
-                "DELETE FROM supersessions \
-                   WHERE source_meeting_id IN ({LOCKED_MEETINGS}) \
-                      OR superseding_meeting_id IN ({LOCKED_MEETINGS})"
-            ),
-            [],
-        )
-        .map_err(map_err)?;
-        // Brain v2 L5 LOCK-SAFETY: purge every PENDING scheduled-brief row referencing a meeting in
-        // a locked folder, in this same reconciliation transaction — a pending brief's `note_md` is
-        // cross-meeting synthesis of the referenced notes and must not survive a restart while a
-        // source folder is sealed (accepted rows were consumed on accept — ids + timestamps only).
-        // `meeting_ids` is a JSON TEXT array of quote-delimited UUIDs, so the per-id LIKE
-        // intersection is exact (see `purge_pending_brief_runs_tx`).
-        tx.execute(
-            &format!(
-                "DELETE FROM brief_runs WHERE status = 'pending' AND EXISTS (\
-                   SELECT 1 FROM ({LOCKED_MEETINGS}) lm \
-                    WHERE brief_runs.meeting_ids LIKE '%\"' || lm.meeting_id || '\"%')"
-            ),
-            [],
-        )
-        .map_err(map_err)?;
-        // Vault Audit LOCK-SAFETY: purge ALL pending audit findings in this same reconciliation
-        // transaction — the memory-rollups posture (adversarial HIGH: a finding staged while a
-        // since-sealed folder was visible may CITE its titles in evidence with no matching id,
-        // e.g. a stale finding's `see [[superseding note]]`; scoping the purge to the locked
-        // folders' ids cannot cover that). A crash-while-unlocked therefore leaves no finding
-        // plaintext at rest after a restart. GUARDED on any locked folder existing: this
-        // reconcile runs at EVERY launch, and with zero locked folders there is no seal whose
-        // snapshot a finding could violate — a lock-free vault keeps its inbox across restarts.
-        // Resolved rows were blanked on resolve and survive either way.
-        let any_locked: bool = tx
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM folders WHERE locked = 1)",
-                [],
-                |r| r.get(0),
-            )
-            .map_err(map_err)?;
-        if any_locked {
-            Self::purge_all_pending_audit_findings_tx(&tx)?;
-        }
-        // brain2 realtime notes LOCK-SAFETY: re-blank the typed-notes plaintext of every meeting in a
-        // locked folder ONLY WHERE its `manual_notes_blob` exists (the sealed copy is present) — so a
-        // crash-while-unlocked (which restored the plaintext) cannot leave typed plaintext at rest
-        // after a restart, but a buffer that was NEVER sealed (no blob) is left intact (never destroy
-        // the only copy). Mirrors the `text_blob IS NOT NULL` / `data_blob IS NOT NULL` guards above.
-        tx.execute(
-            &format!("UPDATE meetings SET manual_notes = '' WHERE manual_notes_blob IS NOT NULL AND manual_notes != '' AND id IN ({LOCKED_MEETINGS})"),
-            [],
-        )
-        .map_err(map_err)?;
-        // Document ingestion LOCK-SAFETY: re-blank the plaintext `text` of every document in a locked
-        // folder ONLY WHERE its `text_blob` exists (the sealed copy is present) — so a
-        // crash-while-unlocked (which restored the plaintext) cannot leave document plaintext at rest
-        // after a restart, but a document that was NEVER sealed (no blob) is left intact (never
-        // destroy the only copy). Mirrors the `manual_notes_blob IS NOT NULL` guard above.
-        tx.execute(
-            "UPDATE documents SET text = '' WHERE text_blob IS NOT NULL AND text != '' \
-               AND folder_id IN (SELECT id FROM folders WHERE locked = 1)",
-            [],
-        )
-        .map_err(map_err)?;
-        // And purge the (invertible) doc chunks + vectors of every document in a locked folder, in
-        // this same reconciliation transaction — so a crash-while-unlocked (which may have
-        // re-embedded) cannot leave a document's semantic vector of sealed content at rest after a
-        // restart. Delete doc_vec_chunks rows first (by chunk_id), then the source doc_chunks rows.
-        tx.execute(
-            "DELETE FROM doc_vec_chunks WHERE chunk_id IN \
-               (SELECT id FROM doc_chunks WHERE document_id IN \
-                  (SELECT id FROM documents WHERE folder_id IN \
-                     (SELECT id FROM folders WHERE locked = 1)))",
-            [],
-        )
-        .map_err(map_err)?;
-        tx.execute(
-            "DELETE FROM doc_chunks WHERE document_id IN \
-               (SELECT id FROM documents WHERE folder_id IN \
-                  (SELECT id FROM folders WHERE locked = 1))",
-            [],
-        )
-        .map_err(map_err)?;
-        // Brain-v3 audit Fix 4 (startup net): a crash BETWEEN a seal and its marker-strip could leave a
-        // sealed neighbour's `[[Title]]` in a VISIBLE source note's plaintext (DB + `.md`). Repair it
-        // here, BEFORE the links purge deletes the rows that name the affected sources. Resolve the
-        // locked folders' meeting + document id lists, then strip each sealed title from every visible
-        // source's managed block in THIS reconciliation tx. The `changed` sources' `.md` re-export is
-        // done by the caller ([`crate::state`] `reconcile_locked_at_rest`) via `changed_marker_sources`.
-        let locked_meeting_ids: Vec<String> = {
-            let mut stmt = tx.prepare(LOCKED_MEETINGS).map_err(map_err)?;
-            let rows = stmt.query_map([], |r| r.get::<_, String>(0)).map_err(map_err)?;
-            let mut out = Vec::new();
-            for r in rows {
-                out.push(r.map_err(map_err)?);
-            }
-            out
-        };
-        let locked_document_ids: Vec<String> = {
-            let mut stmt = tx
-                .prepare(
-                    "SELECT id FROM documents WHERE folder_id IN (SELECT id FROM folders WHERE locked = 1)",
-                )
-                .map_err(map_err)?;
-            let rows = stmt.query_map([], |r| r.get::<_, String>(0)).map_err(map_err)?;
-            let mut out = Vec::new();
-            for r in rows {
-                out.push(r.map_err(map_err)?);
-            }
-            out
-        };
-        let changed_marker_sources = Self::strip_sealed_neighbour_markers_tx(
-            &tx,
-            &locked_meeting_ids,
-            &locked_document_ids,
-        )?;
-        // Brain v3 PR-3 LINK-ENGINE LOCK-SAFETY: purge every DERIVED `links` row whose meeting endpoint
-        // is in a locked folder, OR whose document/note endpoint is in a locked folder, in this same
-        // reconciliation transaction — so a crash-while-unlocked (which may have re-derived
-        // wikilink/semantic edges against since-sealed items) cannot leave a link naming a sealed
-        // neighbour at rest after a restart. Re-derived on the next unlock. A note id IS a document
-        // id, so the document leg's `IN ('note','document')` covers both kinds.
-        //
-        // Brain-v3 audit Fix 1: PRESERVE a user's decision rows (`LINK_DECISION_KEEP` — dismissed
-        // tombstones + accepted edges) across this reconcile, mirroring `purge_links_tx`, so a restart
-        // (like a lock→unlock) never resurrects a dismissed suggestion or forgets an accepted edge.
-        // These rows carry ids/kind/edge_type/score only — no titles/plaintext — and stay invisible
-        // via the both-endpoint read gate while an endpoint is sealed.
-        let keep = Self::LINK_DECISION_KEEP;
-        tx.execute(
-            &format!(
-                "DELETE FROM links WHERE ( \
-                   ((src_kind = 'meeting' AND src_id IN ({LOCKED_MEETINGS})) \
-                    OR (dst_kind = 'meeting' AND dst_id IN ({LOCKED_MEETINGS}))) \
-                   OR (src_kind IN ('note','document') AND src_id IN \
-                        (SELECT id FROM documents WHERE folder_id IN \
-                           (SELECT id FROM folders WHERE locked = 1))) \
-                   OR (dst_kind IN ('note','document') AND dst_id IN \
-                        (SELECT id FROM documents WHERE folder_id IN \
-                           (SELECT id FROM folders WHERE locked = 1)))) \
-                   AND NOT ({keep})"
-            ),
-            [],
-        )
-        .map_err(map_err)?;
-        // Collect the at-rest audio columns of locked meetings for the caller's filesystem re-seal
-        // pass — the playback WAV AND both hi-res masters (B1). A meeting is surfaced if ANY of the
-        // three columns is set; each path is reconciled independently by the caller.
-        let mut audio = Vec::new();
-        {
-            let mut stmt = tx
-                .prepare(&format!(
-                    "SELECT id, audio_path, mic_master_path, sys_master_path FROM meetings \
-                       WHERE (audio_path IS NOT NULL \
-                              OR mic_master_path IS NOT NULL \
-                              OR sys_master_path IS NOT NULL) \
-                         AND id IN ({LOCKED_MEETINGS})"
-                ))
-                .map_err(map_err)?;
-            let rows = stmt
-                .query_map([], |r| {
-                    Ok(LockedMeetingAudio {
-                        meeting_id: r.get::<_, String>(0)?,
-                        audio_path: r.get::<_, Option<String>>(1)?,
-                        mic_master_path: r.get::<_, Option<String>>(2)?,
-                        sys_master_path: r.get::<_, Option<String>>(3)?,
-                    })
-                })
-                .map_err(map_err)?;
-            for r in rows {
-                audio.push(r.map_err(map_err)?);
-            }
-        }
-        // Brain v2 L2.1 LOCK-SAFETY: when ANY folder is locked, purge ALL memory rollups in this
-        // same reconciliation transaction — a rollup synthesized before the seal (or during a
-        // crashed unlocked session) may paraphrase sealed facts. Skipped when nothing is locked
-        // (no sealed content ⇒ no leak ⇒ rollups survive restarts). The caller deletes the
-        // returned exported vault `.md`s.
-        let any_locked: bool = tx
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM folders WHERE locked = 1)",
-                [],
-                |r| r.get(0),
-            )
-            .map_err(map_err)?;
-        let rollup_exports = if any_locked {
-            Self::purge_memory_rollups_tx(&tx)?
-        } else {
-            Vec::new()
-        };
-        // 2026-07-10 audit F2: surface the authored notes' re-exported vault `.md` (id, path) pairs
-        // for every LOCKED folder (a crash while session-unlocked leaves them plaintext on disk with
-        // the column still set). Ids + paths only — the caller deletes each file then clears THAT
-        // note's column (per-row delete-then-clear, residual W5), never text (no PII here).
-        let note_md_exports = {
-            let mut stmt = tx
-                .prepare(
-                    "SELECT id, exported_path FROM documents \
-                       WHERE kind = 'note' AND exported_path IS NOT NULL \
-                         AND folder_id IN (SELECT id FROM folders WHERE locked = 1)",
-                )
-                .map_err(map_err)?;
-            let rows = stmt
-                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
-                .map_err(map_err)?;
-            let mut out = Vec::new();
-            for r in rows {
-                out.push(r.map_err(map_err)?);
-            }
-            out
-        };
-        tx.commit().map_err(map_err)?;
-        Ok((audio, rollup_exports, note_md_exports, changed_marker_sources))
-    }
 
     // `locked_folder_ids` moved to `storage::folders_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
@@ -7143,119 +5281,22 @@ impl Db {
         Ok(out)
     }
 
-    /// The RAW segment rows of a meeting (idx, plaintext text, sealed `text_blob`), regardless of
-    /// seal state — for the seal/unseal lifecycle (NOT a user-facing read; that is `get_segments`).
-    pub fn raw_segments(&self, meeting_id: &str) -> Result<Vec<RawSegment>> {
-        let conn = self.lock();
-        let mut stmt = conn
-            .prepare(
-                "SELECT idx, text, text_blob FROM segments
-                   WHERE meeting_id = ?1 ORDER BY idx",
-            )
-            .map_err(map_err)?;
-        let rows = stmt
-            .query_map(rusqlite::params![meeting_id], |r| {
-                Ok(RawSegment {
-                    idx: r.get(0)?,
-                    text: r.get(1)?,
-                    text_blob: r.get(2)?,
-                })
-            })
-            .map_err(map_err)?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r.map_err(map_err)?);
-        }
-        Ok(out)
-    }
+    // `raw_segments` moved to `storage::seal_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// Seal ONE segment row: store its AES-GCM `text_blob` and blank the plaintext `text`.
-    /// Verified-before-blank by the caller (mirrors `seal_note`).
-    pub fn seal_segment(&self, meeting_id: &str, idx: i64, text_blob: &[u8]) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
-            "UPDATE segments SET text_blob = ?3, text = '' WHERE meeting_id = ?1 AND idx = ?2",
-            rusqlite::params![meeting_id, idx, text_blob],
-        )
-        .map_err(map_err)?;
-        Ok(())
-    }
+    // `seal_segment` moved to `storage::seal_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// Restore ONE segment row's plaintext `text` (session-unlock / remove-lock). Leaves
-    /// `text_blob` intact (the caller clears it only on permanent remove-lock).
-    pub fn restore_segment_text(&self, meeting_id: &str, idx: i64, text: &str) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
-            "UPDATE segments SET text = ?3 WHERE meeting_id = ?1 AND idx = ?2",
-            rusqlite::params![meeting_id, idx, text],
-        )
-        .map_err(map_err)?;
-        Ok(())
-    }
+    // `restore_segment_text` moved to `storage::seal_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// Clear the sealed `text_blob` for every segment of a meeting (permanent remove-lock, after
-    /// the plaintext is restored).
-    pub fn clear_segment_blobs(&self, meeting_id: &str) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
-            "UPDATE segments SET text_blob = NULL WHERE meeting_id = ?1",
-            rusqlite::params![meeting_id],
-        )
-        .map_err(map_err)?;
-        Ok(())
-    }
+    // `clear_segment_blobs` moved to `storage::seal_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// The RAW timeline row of a meeting (plaintext `data`, sealed `data_blob`), regardless of
-    /// seal state — for the seal/unseal lifecycle. `None` if the meeting has no timeline cached.
-    pub fn raw_timeline(&self, meeting_id: &str) -> Result<Option<RawTimeline>> {
-        let conn = self.lock();
-        conn.query_row(
-            "SELECT data, data_blob FROM timelines WHERE meeting_id = ?1",
-            rusqlite::params![meeting_id],
-            |r| {
-                Ok(RawTimeline {
-                    data: r.get(0)?,
-                    data_blob: r.get(1)?,
-                })
-            },
-        )
-        .optional()
-        .map_err(map_err)
-    }
+    // `raw_timeline` moved to `storage::seal_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// Seal a meeting's timeline: store its AES-GCM `data_blob`, blank the plaintext `data`.
-    pub fn seal_timeline(&self, meeting_id: &str, data_blob: &[u8]) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
-            "UPDATE timelines SET data_blob = ?2, data = '' WHERE meeting_id = ?1",
-            rusqlite::params![meeting_id, data_blob],
-        )
-        .map_err(map_err)?;
-        Ok(())
-    }
+    // `seal_timeline` moved to `storage::seal_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// Restore a meeting's timeline plaintext `data` (session-unlock / remove-lock). Leaves
-    /// `data_blob` intact (cleared only on permanent remove-lock).
-    pub fn restore_timeline_data(&self, meeting_id: &str, data: &str) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
-            "UPDATE timelines SET data = ?2 WHERE meeting_id = ?1",
-            rusqlite::params![meeting_id, data],
-        )
-        .map_err(map_err)?;
-        Ok(())
-    }
+    // `restore_timeline_data` moved to `storage::seal_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// Clear the sealed `data_blob` for a meeting's timeline (permanent remove-lock).
-    pub fn clear_timeline_blob(&self, meeting_id: &str) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
-            "UPDATE timelines SET data_blob = NULL WHERE meeting_id = ?1",
-            rusqlite::params![meeting_id],
-        )
-        .map_err(map_err)?;
-        Ok(())
-    }
+    // `clear_timeline_blob` moved to `storage::seal_store` (God-file split) — still callable as inherent `db.method()` cross-file.
+
 
     // `set_meeting_audio_path` moved to `storage::meetings_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
@@ -7599,7 +5640,7 @@ impl Db {
     /// sealed meeting must surface NOTHING, so — exactly like `correction_log` / `note_chunks` — we
     /// DELETE rather than seal. This is INTENTIONAL: the Q&A log is dropped on seal by design and is
     /// not recoverable (it was never keyed); the underlying transcript is still sealed + restorable.
-    fn purge_assistant_interactions_tx(
+    pub(crate) fn purge_assistant_interactions_tx(
         tx: &rusqlite::Transaction<'_>,
         meeting_ids: &[String],
     ) -> Result<()> {
@@ -7699,7 +5740,7 @@ impl Db {
     /// surface NOTHING, so — exactly like `assistant_interactions` / `facts` / `note_chunks` — we
     /// DELETE rather than key-seal. Dropped by design + not recoverable (never keyed); the
     /// underlying transcript is still sealed + restorable.
-    fn purge_live_bullets_tx(tx: &rusqlite::Transaction<'_>, meeting_ids: &[String]) -> Result<()> {
+    pub(crate) fn purge_live_bullets_tx(tx: &rusqlite::Transaction<'_>, meeting_ids: &[String]) -> Result<()> {
         for mid in meeting_ids {
             tx.execute(
                 "DELETE FROM live_bullets WHERE meeting_id = ?1",
@@ -8715,7 +6756,7 @@ fn escape_like(s: &str) -> String {
 /// empty / punctuation-only input yields `None` (→ caller returns no hits, never errors).
 ///
 /// A double-quote inside a token is itself escaped by doubling it (`"` → `""`), per FTS5 quoting.
-fn fts_match_query(q: &str) -> Option<String> {
+pub(crate) fn fts_match_query(q: &str) -> Option<String> {
     let mut terms: Vec<String> = Vec::new();
     let mut cur = String::new();
     for ch in q.chars() {
