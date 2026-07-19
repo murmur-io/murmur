@@ -4,7 +4,7 @@
 <div class="sp" [class.is-open]="open()">
   @if (selected().length > 0) {
     <ul class="sp-chips" aria-label="Selected sources">
-      @for (c of selected(); track c.kind + c.id) {
+      @for (c of visibleChips(); track c.kind + c.id) {
         <li class="sp-chip pill">
           <span class="sp-chip-badge" aria-hidden="true">
             @switch (c.kind) {
@@ -64,6 +64,18 @@
                 stroke-linecap="round"
               />
             </svg>
+          </button>
+        </li>
+      }
+      @if (canCollapseChips()) {
+        <li>
+          <button
+            type="button"
+            class="sp-chip sp-chip-more pill"
+            [attr.aria-expanded]="chipsExpanded()"
+            (click)="toggleChips()"
+          >
+            {{ chipsExpanded() ? "Show less" : "+" + hiddenChipCount() + " more" }}
           </button>
         </li>
       }
