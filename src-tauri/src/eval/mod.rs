@@ -28,6 +28,7 @@
 //! lock-touching: it adds no seal, no new read path, no new export.
 
 pub mod bakeoff;
+pub mod calibration;
 pub mod corpus;
 pub mod diarization;
 pub mod notes_bakeoff;
