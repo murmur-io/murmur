@@ -14,10 +14,8 @@ use crate::storage::models::{
     CorrectionRecord, DayCount,
     DocChunkHit, DocOutlineEntry, DocumentInfo, DocumentSummary, EntityKind,
     GraphNode, Meeting, MeetingActionSummary, MeetingStatus, NoteCitation,
-    NoteRecord, NoteSummary,
     OrgChunkHit, PendingShareAccept, PeopleList, PersonCard, PropertyKind,
     PropertyValue, RecipeRecord, SavedView, SearchHit,
-    TypedNoteRow,
     StatusCount,
 };
 use crate::transcribe::types::Segment;
@@ -61,7 +59,10 @@ pub struct PrunableAudio {
 impl MeetingStatus {
     /// Stable SCREAMING_SNAKE_CASE string used as the on-disk `status` column value.
     /// Kept in sync with the serde `rename_all = "SCREAMING_SNAKE_CASE"` on the enum.
-    fn as_str(&self) -> &'static str {
+    /// `pub(crate)` (promoted from private, God-file split) so the meeting-row writers now in
+    /// `storage::meetings_store` can format the `status` column cross-file — same widening the
+    /// sibling [`EntityKind::as_str`] already carries.
+    pub(crate) fn as_str(&self) -> &'static str {
         match self {
             MeetingStatus::Draft => "DRAFT",
             MeetingStatus::Recording => "RECORDING",
@@ -2754,160 +2755,21 @@ impl Db {
 
     // ── meetings ────────────────────────────────────────────────────────────
 
-    pub fn insert_meeting(&self, m: &Meeting) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
-            "INSERT INTO meetings
-               (id, started_at, ended_at, title, duration_s, audio_path, status)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            rusqlite::params![
-                m.id,
-                m.started_at,
-                m.ended_at,
-                m.title,
-                m.duration_s,
-                m.audio_path,
-                m.status.as_str(),
-            ],
-        )
-        .map_err(map_err)?;
-        Ok(())
-    }
+    // `insert_meeting` moved to `storage::meetings_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    pub fn update_meeting_status(&self, id: &str, status: MeetingStatus) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
-            "UPDATE meetings SET status = ?2 WHERE id = ?1",
-            rusqlite::params![id, status.as_str()],
-        )
-        .map_err(map_err)?;
-        Ok(())
-    }
+    // `update_meeting_status` moved to `storage::meetings_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// Compare-and-swap a meeting's status: set it to `to` ONLY if it is currently `from`.
-    /// Returns `true` when the transition landed (exactly one row changed), `false` when the row
-    /// was in a different status (or absent) — the loser of a concurrent claim. Used by
-    /// `retry_transcription` as its single-flight claim (`Error → Recording`): two simultaneous
-    /// retries of the same meeting can never both run the pipeline.
-    pub fn transition_meeting_status(
-        &self,
-        id: &str,
-        from: MeetingStatus,
-        to: MeetingStatus,
-    ) -> Result<bool> {
-        let conn = self.lock();
-        let n = conn
-            .execute(
-                "UPDATE meetings SET status = ?3 WHERE id = ?1 AND status = ?2",
-                rusqlite::params![id, from.as_str(), to.as_str()],
-            )
-            .map_err(map_err)?;
-        Ok(n == 1)
-    }
+    // `transition_meeting_status` moved to `storage::meetings_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// Ids of every meeting still stuck in the non-terminal `RECORDING` status — the crash "ghosts"
-    /// startup recovery must resolve (spill salvage / disk salvage / reconcile-to-`ERROR`).
-    /// UUIDs only, no content.
-    pub fn stuck_recording_ids(&self) -> Result<Vec<String>> {
-        let conn = self.lock();
-        let mut stmt = conn
-            .prepare("SELECT id FROM meetings WHERE status = ?1")
-            .map_err(map_err)?;
-        let rows = stmt
-            .query_map(rusqlite::params![MeetingStatus::Recording.as_str()], |r| {
-                r.get::<_, String>(0)
-            })
-            .map_err(map_err)?;
-        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(map_err)
-    }
+    // `stuck_recording_ids` moved to `storage::meetings_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// Crash-recovery reconcile: flip every meeting still stuck in `RECORDING` to the terminal
-    /// `ERROR` state. Returns the number of rows reconciled.
-    ///
-    /// `start_recording` (`commands.rs`) inserts a meeting row in `RECORDING` up-front so a crash /
-    /// SIGKILL mid-capture leaves a recoverable row instead of losing the meeting outright. A process
-    /// that dies before `stop_recording`, though, never transitions that row out of `RECORDING`, so
-    /// it lingers in the library as a "ghost" that still looks live forever. Run this once at launch
-    /// (from `lib.rs` setup, after the DB is open + migrated) to make each ghost HONEST: it becomes a
-    /// plain terminal `ERROR` row (which the library already renders as "Error" — no audio, no note,
-    /// no spinner).
-    ///
-    /// ADDITIVE + non-destructive: no row is deleted and no other column is touched. Full audio
-    /// salvage of an abandoned recording (mic spill) is a SEPARATE, later task. Idempotent — with no
-    /// live recording a second call reconciles 0. Non-`RECORDING` rows (Complete/Error/…) are left
-    /// untouched by the `WHERE status = 'RECORDING'` guard. Logs only meeting UUIDs + a count (no PII).
-    pub fn reconcile_stuck_recordings(&self) -> Result<usize> {
-        self.reconcile_stuck_recordings_except(&[])
-    }
+    // `reconcile_stuck_recordings` moved to `storage::meetings_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// [`Self::reconcile_stuck_recordings`], but SKIPPING every meeting id in `claimed` — the rows the
-    /// STAGE-2 crash-salvage (`audio::spill`) is handling THIS launch. Salvage runs BEFORE reconcile
-    /// in setup and CLAIMS the recoverable ghosts (reconstructing their audio + running the pipeline,
-    /// which sets their final status itself); reconcile must NOT clobber a claimed row to `ERROR` in
-    /// the window before the async salvage worker transitions it. Every OTHER stuck `RECORDING` ghost
-    /// (no spill / not recoverable) is still flipped to the terminal `ERROR` state exactly as before.
-    /// Idempotent + additive (the per-row `AND status = RECORDING` guard). Logs ids + counts, no PII.
-    pub fn reconcile_stuck_recordings_except(&self, claimed: &[String]) -> Result<usize> {
-        // Collect the ghost ids first (UUIDs — not PII) so the reconcile is auditable in the log.
-        // Done BEFORE taking the connection lock (`stuck_recording_ids` locks internally; the Mutex
-        // is not re-entrant).
-        let ids: Vec<String> = self.stuck_recording_ids()?;
-        let conn = self.lock();
-        // Exclude the rows salvage claimed this launch — it owns their final status.
-        let to_reconcile: Vec<&String> = ids.iter().filter(|id| !claimed.contains(id)).collect();
-        if to_reconcile.is_empty() {
-            return Ok(0);
-        }
-        let mut n = 0usize;
-        for id in &to_reconcile {
-            n += conn
-                .execute(
-                    "UPDATE meetings SET status = ?2 WHERE id = ?1 AND status = ?3",
-                    rusqlite::params![
-                        id,
-                        MeetingStatus::Error.as_str(),
-                        MeetingStatus::Recording.as_str()
-                    ],
-                )
-                .map_err(map_err)?;
-        }
-        tracing::info!(
-            target: "startup",
-            reconciled = n,
-            skipped_for_salvage = claimed.len(),
-            ids = ?to_reconcile,
-            "reconciled stuck RECORDING meetings to ERROR (crash recovery)"
-        );
-        Ok(n)
-    }
+    // `reconcile_stuck_recordings_except` moved to `storage::meetings_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    pub fn finalize_meeting(
-        &self,
-        id: &str,
-        ended_at: &str,
-        duration_s: i64,
-        audio_path: &str,
-    ) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
-            "UPDATE meetings
-               SET ended_at = ?2, duration_s = ?3, audio_path = ?4
-             WHERE id = ?1",
-            rusqlite::params![id, ended_at, duration_s, audio_path],
-        )
-        .map_err(map_err)?;
-        Ok(())
-    }
+    // `finalize_meeting` moved to `storage::meetings_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    pub fn set_meeting_title(&self, id: &str, title: &str) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
-            "UPDATE meetings SET title = ?2 WHERE id = ?1",
-            rusqlite::params![id, title],
-        )
-        .map_err(map_err)?;
-        Ok(())
-    }
+    // `set_meeting_title` moved to `storage::meetings_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
     // ── brain2 realtime typed @brain notes (the `meetings.manual_notes` durable buffer) ────────
     //
@@ -2920,101 +2782,17 @@ impl Db {
     // helpers with NO lock gating — the COMMAND layer (`save_manual_notes`/`get_manual_notes`) does
     // the `meeting_is_unlocked` gating; the internal seal/unseal paths drive these directly.
 
-    /// Upsert the meeting's typed-notes plaintext. Used by the FE autosave (write the whole buffer)
-    /// AND by the unseal/remove-lock RESTORE (write the decrypted plaintext back). No-op on an
-    /// unknown meeting.
-    pub fn set_manual_notes(&self, meeting_id: &str, text: &str) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
-            "UPDATE meetings SET manual_notes = ?2 WHERE id = ?1",
-            rusqlite::params![meeting_id, text],
-        )
-        .map_err(map_err)?;
-        Ok(())
-    }
+    // `set_manual_notes` moved to `storage::meetings_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// SEAL-ON-WRITE twin of [`Db::set_manual_notes`] for a meeting in a session-unlocked LOCKED
-    /// folder: persist the fresh plaintext (session-visible) AND its freshly-encrypted
-    /// `manual_notes_blob` in ONE atomic statement, so relock/at-rest reblank restores THIS buffer —
-    /// never a stale lock-time copy. The CALLER must have verified the blob decrypts back
-    /// byte-identical BEFORE calling this (verify-before-destroy) — exactly like
-    /// [`Db::seal_manual_notes`]. 2026-07-10 audit F1.
-    pub fn set_manual_notes_sealed(
-        &self,
-        meeting_id: &str,
-        text: &str,
-        blob: &[u8],
-    ) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
-            "UPDATE meetings SET manual_notes = ?2, manual_notes_blob = ?3 WHERE id = ?1",
-            rusqlite::params![meeting_id, text, blob],
-        )
-        .map_err(map_err)?;
-        Ok(())
-    }
+    // `set_manual_notes_sealed` moved to `storage::meetings_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// The meeting's typed-notes plaintext, or "" when never set / NULL (legacy rows) / unknown id /
-    /// sealed-and-blanked. UNGATED at the DB layer — callers that return this to a surface MUST gate
-    /// first (`meeting_is_unlocked` in commands / `meeting_is_visible` for the live brain). The
-    /// (re)summarize fold reads it raw (it is the producer of the note plaintext, not a leak surface).
-    pub fn get_manual_notes(&self, meeting_id: &str) -> Result<String> {
-        let conn = self.lock();
-        let text: Option<String> = conn
-            .query_row(
-                "SELECT manual_notes FROM meetings WHERE id = ?1",
-                rusqlite::params![meeting_id],
-                |r| r.get::<_, Option<String>>(0),
-            )
-            .optional()
-            .map_err(map_err)?
-            .flatten();
-        Ok(text.unwrap_or_default())
-    }
+    // `get_manual_notes` moved to `storage::meetings_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// The meeting's typed notes in EITHER seal state (plaintext + the AES-GCM blob under the folder
-    /// CK) — the read used by the unseal/reblank lifecycle. `None` only when the meeting row is
-    /// absent. Mirrors [`Db::raw_timeline`].
-    pub fn raw_manual_notes(&self, meeting_id: &str) -> Result<Option<RawManualNotes>> {
-        let conn = self.lock();
-        conn.query_row(
-            "SELECT COALESCE(manual_notes, ''), manual_notes_blob FROM meetings WHERE id = ?1",
-            rusqlite::params![meeting_id],
-            |r| {
-                Ok(RawManualNotes {
-                    text: r.get(0)?,
-                    blob: r.get(1)?,
-                })
-            },
-        )
-        .optional()
-        .map_err(map_err)
-    }
+    // `raw_manual_notes` moved to `storage::meetings_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// Seal a meeting's typed notes: store the AES-GCM `manual_notes_blob`, blank the plaintext
-    /// `manual_notes`. The CALLER must verify the blob decrypts back byte-identical BEFORE calling
-    /// this (verify-before-destroy) — exactly like [`Db::seal_timeline`].
-    pub fn seal_manual_notes(&self, meeting_id: &str, blob: &[u8]) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
-            "UPDATE meetings SET manual_notes_blob = ?2, manual_notes = '' WHERE id = ?1",
-            rusqlite::params![meeting_id, blob],
-        )
-        .map_err(map_err)?;
-        Ok(())
-    }
+    // `seal_manual_notes` moved to `storage::meetings_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// Clear a meeting's sealed `manual_notes_blob` (permanent remove-lock, after the plaintext is
-    /// restored). Mirrors [`Db::clear_timeline_blob`].
-    pub fn clear_manual_notes_blob(&self, meeting_id: &str) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
-            "UPDATE meetings SET manual_notes_blob = NULL WHERE id = ?1",
-            rusqlite::params![meeting_id],
-        )
-        .map_err(map_err)?;
-        Ok(())
-    }
+    // `clear_manual_notes_blob` moved to `storage::meetings_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
     /// Delete a meeting and (via ON DELETE CASCADE) its segments, notes, and timeline.
     /// Audio + vault files are removed by the caller before this.
@@ -3076,60 +2854,11 @@ impl Db {
         Ok(rollup_exports)
     }
 
-    pub fn get_meeting(&self, id: &str) -> Result<Option<Meeting>> {
-        let conn = self.lock();
-        conn.query_row(
-            "SELECT id, started_at, ended_at, title, duration_s, audio_path, status,
-                    (SELECT n.folder_id FROM notes n
-                      WHERE n.meeting_id = meetings.id AND n.folder_id IS NOT NULL LIMIT 1)
-                      AS folder_id
-               FROM meetings WHERE id = ?1",
-            rusqlite::params![id],
-            row_to_meeting,
-        )
-        .optional()
-        .map_err(map_err)?
-        .transpose()
-    }
+    // `get_meeting` moved to `storage::meetings_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    pub fn latest_meeting(&self) -> Result<Option<Meeting>> {
-        let conn = self.lock();
-        conn.query_row(
-            "SELECT id, started_at, ended_at, title, duration_s, audio_path, status,
-                    (SELECT n.folder_id FROM notes n
-                      WHERE n.meeting_id = meetings.id AND n.folder_id IS NOT NULL LIMIT 1)
-                      AS folder_id
-               FROM meetings ORDER BY started_at DESC, id DESC LIMIT 1",
-            [],
-            row_to_meeting,
-        )
-        .optional()
-        .map_err(map_err)?
-        .transpose()
-    }
+    // `latest_meeting` moved to `storage::meetings_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// Recent meetings, newest first (Library list).
-    pub fn list_meetings(&self, limit: i64) -> Result<Vec<Meeting>> {
-        let conn = self.lock();
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, started_at, ended_at, title, duration_s, audio_path, status,
-                        (SELECT n.folder_id FROM notes n
-                          WHERE n.meeting_id = meetings.id AND n.folder_id IS NOT NULL LIMIT 1)
-                          AS folder_id
-                   FROM meetings ORDER BY started_at DESC, id DESC LIMIT ?1",
-            )
-            .map_err(map_err)?;
-        let rows = stmt
-            .query_map(rusqlite::params![limit], row_to_meeting)
-            .map_err(map_err)?;
-        let mut out = Vec::new();
-        for r in rows {
-            // row_to_meeting yields rusqlite::Result<Result<Meeting>>: unwrap both layers.
-            out.push(r.map_err(map_err)??);
-        }
-        Ok(out)
-    }
+    // `list_meetings` moved to `storage::meetings_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
     /// Search meeting titles, transcript segments, and note markdown for `query`. Returns
     /// newest-first hits, each with a short snippet around the match. Case-insensitive.
@@ -5818,222 +5547,27 @@ impl Db {
 
     // ── NOTES (authored `documents(kind='note')`) ───────────────────────────────────────────────
 
-    /// Insert an authored note row (`documents` with `kind='note'`). Separate from
-    /// [`Db::insert_document`] only to persist the authoring columns (`title`/`updated_at`);
-    /// `text_blob`/`exported_path` start NULL. The COMMAND layer gates the folder first.
-    pub fn insert_note(
-        &self,
-        id: &str,
-        folder_id: &str,
-        name: &str,
-        title: &str,
-        text: &str,
-        created_at: i64,
-    ) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
-            "INSERT INTO documents
-               (id, folder_id, name, title, text, kind, text_blob, created_at, updated_at, exported_path)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'note', NULL, ?6, ?6, NULL)",
-            rusqlite::params![id, folder_id, name, title, text, created_at],
-        )
-        .map_err(map_err)?;
-        Ok(())
-    }
+    // `insert_note` moved to `storage::notes_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// BIRTH-SEAL twin of [`Db::insert_note`] for a session-unlocked LOCKED folder (2026-07-10
-    /// residual W3): insert the row WITH its freshly-encrypted `text_blob` in ONE atomic INSERT, so
-    /// there is never a blob-less plaintext row in a locked folder — not even transiently between an
-    /// insert and a follow-up seal (the pre-fix shape, where a failed birth-seal left the plaintext
-    /// row lingering). The CALLER must have verified the blob decrypts back byte-identical BEFORE
-    /// calling this (verify-before-destroy), exactly like [`Db::update_note_row_sealed`].
-    #[allow(clippy::too_many_arguments)]
-    pub fn insert_note_sealed(
-        &self,
-        id: &str,
-        folder_id: &str,
-        name: &str,
-        title: &str,
-        text: &str,
-        text_blob: &[u8],
-        created_at: i64,
-    ) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
-            "INSERT INTO documents
-               (id, folder_id, name, title, text, kind, text_blob, created_at, updated_at, exported_path)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'note', ?6, ?7, ?7, NULL)",
-            rusqlite::params![id, folder_id, name, title, text, text_blob, created_at],
-        )
-        .map_err(map_err)?;
-        Ok(())
-    }
+    // `insert_note_sealed` moved to `storage::notes_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// Read ONE note's raw row (every column the DTO builders need), or `None` if the id is unknown
-    /// OR the row is not `kind='note'`. The COMMAND layer gates the folder before surfacing the text.
-    pub fn get_note_row(&self, id: &str) -> Result<Option<NoteRow>> {
-        let conn = self.lock();
-        conn.query_row(
-            "SELECT id, folder_id, name, title, COALESCE(text, ''), created_at, updated_at,
-                    exported_path, (text_blob IS NOT NULL)
-               FROM documents WHERE id = ?1 AND kind = 'note'",
-            rusqlite::params![id],
-            row_to_note_row,
-        )
-        .optional()
-        .map_err(map_err)
-    }
+    // `get_note_row` moved to `storage::notes_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// Recording-time COMPANION NOTE — set the STRUCTURED `documents.meeting_id` link on a
-    /// standalone note (`kind='note'`). Idempotent on an unknown id / non-note row (0 rows). The
-    /// column is a non-content id (rides the SQLCipher-at-rest layer, never sealed/blanked). Callers
-    /// set this immediately after `create_note_inner` births the companion note.
-    pub fn set_document_meeting_id(&self, id: &str, meeting_id: &str) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
-            "UPDATE documents SET meeting_id = ?2 WHERE id = ?1 AND kind = 'note'",
-            rusqlite::params![id, meeting_id],
-        )
-        .map_err(map_err)?;
-        Ok(())
-    }
+    // `set_document_meeting_id` moved to `storage::notes_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// Recording-time COMPANION NOTE — the note id of the ONE companion note (`kind='note'`) linked
-    /// to `meeting_id`, or `None` when none exists yet (the append command then lazily creates it).
-    /// Structured lookup by the indexed `meeting_id` column — never a fragile title-string match.
-    /// One-note-per-meeting is a model invariant (the append command is the only writer); should a
-    /// duplicate ever exist, the newest-updated row wins (deterministic).
-    pub fn companion_note_for_meeting(&self, meeting_id: &str) -> Result<Option<String>> {
-        let conn = self.lock();
-        conn.query_row(
-            "SELECT id FROM documents
-               WHERE kind = 'note' AND meeting_id = ?1
-               ORDER BY COALESCE(updated_at, created_at) DESC, id ASC
-               LIMIT 1",
-            rusqlite::params![meeting_id],
-            |r| r.get::<_, String>(0),
-        )
-        .optional()
-        .map_err(map_err)
-    }
+    // `companion_note_for_meeting` moved to `storage::notes_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// Update an authored note's `title` + `text` + `updated_at` (write path, OPEN folders only).
-    /// Leaves `text_blob` alone. A write into a session-unlocked LOCKED folder must NOT come here —
-    /// the relock reblank discards the plaintext and restores the stale blob (content loss) — it goes
-    /// through the command layer's `reseal_document_if_locked` → [`Db::update_note_row_sealed`],
-    /// which re-seals the fresh text into `text_blob` in the same write (2026-07-10 audit F1).
-    /// Idempotent on an unknown id / non-note row (0 rows affected).
-    pub fn update_note_row(&self, id: &str, title: &str, text: &str, updated_at: i64) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
-            "UPDATE documents SET title = ?2, text = ?3, updated_at = ?4
-               WHERE id = ?1 AND kind = 'note'",
-            rusqlite::params![id, title, text, updated_at],
-        )
-        .map_err(map_err)?;
-        Ok(())
-    }
+    // `update_note_row` moved to `storage::notes_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// SEAL-ON-WRITE twin of [`Db::update_note_row`] for a session-unlocked LOCKED folder: persist
-    /// the fresh plaintext (session-visible) AND its freshly-encrypted `text_blob` in ONE atomic
-    /// statement, so the at-rest seal always matches the newest text (relock re-blanks the plaintext
-    /// and the next unlock restores THIS write, never a stale lock-time copy). The CALLER must have
-    /// verified the blob decrypts back byte-identical BEFORE calling this (verify-before-destroy) —
-    /// exactly like [`Db::seal_document`]. Idempotent on an unknown id / non-note row.
-    pub fn update_note_row_sealed(
-        &self,
-        id: &str,
-        title: &str,
-        text: &str,
-        text_blob: &[u8],
-        updated_at: i64,
-    ) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
-            "UPDATE documents SET title = ?2, text = ?3, text_blob = ?4, updated_at = ?5
-               WHERE id = ?1 AND kind = 'note'",
-            rusqlite::params![id, title, text, text_blob, updated_at],
-        )
-        .map_err(map_err)?;
-        Ok(())
-    }
+    // `update_note_row_sealed` moved to `storage::notes_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// MOVE-INTO-LOCKED twin of [`Db::update_note_row_sealed`] (2026-07-10 residual W2): reassign an
-    /// authored note to a (session-unlocked, LOCKED) target folder AND write its fresh `text_blob`
-    /// (sealed under the TARGET folder's CK) in ONE atomic UPDATE — never a reassign-then-seal
-    /// two-step, whose failure window left the note sitting in the locked target with a stale
-    /// wrong-CK blob (undecryptable at the target's next unlock). `exported_path` is NULLed in the
-    /// same statement (a note governed by a locked folder has no on-disk export). The CALLER must
-    /// have verified the blob decrypts back byte-identical BEFORE calling this
-    /// (verify-before-destroy). Idempotent on an unknown id / non-note row.
-    pub fn move_note_row_sealed(
-        &self,
-        id: &str,
-        folder_id: &str,
-        title: &str,
-        text: &str,
-        text_blob: &[u8],
-        updated_at: i64,
-    ) -> Result<()> {
-        let conn = self.lock();
-        // `exported_hash` is NULLed with `exported_path` (path-coupled collision-guard baseline —
-        // a note sealed into the locked target has no on-disk export to compare against).
-        conn.execute(
-            "UPDATE documents SET folder_id = ?2, title = ?3, text = ?4, text_blob = ?5,
-                    updated_at = ?6, exported_path = NULL, exported_hash = NULL
-               WHERE id = ?1 AND kind = 'note'",
-            rusqlite::params![id, folder_id, title, text, text_blob, updated_at],
-        )
-        .map_err(map_err)?;
-        Ok(())
-    }
+    // `move_note_row_sealed` moved to `storage::notes_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// Persist (or clear with `None`) an authored NOTE's exported vault `.md` path. Set on
-    /// export/unlock re-export; cleared (NULL) when the folder seals and the vault file is deleted.
-    /// Clearing the path ALSO clears the path-coupled `exported_hash` baseline in the same
-    /// statement (the export-collision guard has no file to compare once the `.md` is gone; the
-    /// next export re-stamps both fresh). Setting a path leaves the hash to the caller's explicit
-    /// stamp (`write_note_to_vault`). Named `_doc` to disambiguate from the MEETING-note
-    /// [`Db::set_note_exported_path`].
-    pub fn set_note_doc_exported_path(&self, id: &str, path: Option<&str>) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
-            "UPDATE documents
-                SET exported_path = ?2,
-                    exported_hash = CASE WHEN ?2 IS NULL THEN NULL ELSE exported_hash END
-              WHERE id = ?1 AND kind = 'note'",
-            rusqlite::params![id, path],
-        )
-        .map_err(map_err)?;
-        Ok(())
-    }
+    // `set_note_doc_exported_path` moved to `storage::notes_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// The export-collision-guard baseline for an AUTHORED note (`documents(kind='note')`): the
-    /// SHA-256 (lowercase hex) of the text Murmur last wrote to its exported vault `.md`. `None`
-    /// for a legacy/never-exported row (grandfathered). Twin of [`Db::get_note_exported_hash`].
-    pub fn get_note_doc_exported_hash(&self, id: &str) -> Result<Option<String>> {
-        let conn = self.lock();
-        conn.query_row(
-            "SELECT exported_hash FROM documents WHERE id = ?1 AND kind = 'note'",
-            rusqlite::params![id],
-            |r| r.get::<_, Option<String>>(0),
-        )
-        .optional()
-        .map_err(map_err)
-        .map(Option::flatten)
-    }
+    // `get_note_doc_exported_hash` moved to `storage::notes_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// Persist (or clear with `None`) an authored NOTE's export-collision-guard baseline —
-    /// refreshed on every vault (re)export. Twin of [`Db::set_note_exported_hash`].
-    pub fn set_note_doc_exported_hash(&self, id: &str, hash: Option<&str>) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
-            "UPDATE documents SET exported_hash = ?2 WHERE id = ?1 AND kind = 'note'",
-            rusqlite::params![id, hash],
-        )
-        .map_err(map_err)?;
-        Ok(())
-    }
+    // `set_note_doc_exported_hash` moved to `storage::notes_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
     // `note_exported_paths_in_folder` moved to `storage::folders_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
@@ -6045,69 +5579,7 @@ impl Db {
 
     // `set_note_doc_folder` moved to `storage::folders_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// GATED list of note summaries. `folder_id = Some(fid)` scopes to one note-folder; `None` lists
-    /// every VISIBLE note across all note-folders. The `visibility_clause` is applied IN THE QUERY
-    /// (never a per-row skip) so a sealed-and-not-session-unlocked note's row is EXCLUDED entirely —
-    /// its title/topic never leaks. Newest-updated first. Snippet/tags are derived from the (visible)
-    /// plaintext markdown; a locked note is simply absent here, so no masking is needed at this layer.
-    pub fn list_notes_visible(
-        &self,
-        folder_id: Option<&str>,
-        unlocked: &HashSet<String>,
-    ) -> Result<Vec<NoteSummary>> {
-        // WP6 — the set of notes with an ACTIVE outbound share (one query; drives `shared`). Computed
-        // BEFORE the main lock (it re-locks internally) so the connection guard is held only once.
-        let shared_set = self.notes_with_active_share()?;
-        let conn = self.lock();
-        let visible = visibility_clause("f", unlocked);
-        let folder_pred = if folder_id.is_some() {
-            " AND d.folder_id = ?1"
-        } else {
-            ""
-        };
-        let sql = format!(
-            "SELECT d.id, d.folder_id, d.name, d.title, COALESCE(d.text, ''),
-                    d.created_at, d.updated_at
-               FROM documents d
-               JOIN folders f ON f.id = d.folder_id
-              WHERE d.kind = 'note' AND {visible}{folder_pred}
-              ORDER BY COALESCE(d.updated_at, d.created_at) DESC, d.id ASC"
-        );
-        let mut stmt = conn.prepare(&sql).map_err(map_err)?;
-        let map_row = |r: &Row<'_>| -> rusqlite::Result<NoteSummary> {
-            let id: String = r.get(0)?;
-            let folder_id: String = r.get(1)?;
-            let name: String = r.get(2)?;
-            let title: Option<String> = r.get(3)?;
-            let text: String = r.get(4)?;
-            let created_at: i64 = r.get(5)?;
-            let updated_at: Option<i64> = r.get(6)?;
-            let (tags, _props) = parse_front_matter(&text);
-            let shared = shared_set.contains(&id);
-            Ok(NoteSummary {
-                id,
-                title: title.filter(|t| !t.is_empty()).unwrap_or(name),
-                folder_id,
-                snippet: note_snippet(&text),
-                tags,
-                updated_at: updated_at.unwrap_or(created_at),
-                created_at,
-                locked: false, // a visible note is unlocked by construction (gated in the query).
-                shared,
-            })
-        };
-        let rows = if let Some(fid) = folder_id {
-            stmt.query_map(rusqlite::params![fid], map_row)
-        } else {
-            stmt.query_map([], map_row)
-        }
-        .map_err(map_err)?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r.map_err(map_err)?);
-        }
-        Ok(out)
-    }
+    // `list_notes_visible` moved to `storage::notes_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
     // ── Feature C — TYPED note front-matter properties (note-folder schemas) ─────────────────────
 
@@ -6115,176 +5587,25 @@ impl Db {
 
     // `set_note_folder_schema` moved to `storage::folders_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// List a note-folder's VISIBLE notes projected through its typed schema (Feature C — the
-    /// Table/Board substrate). GATE: the visible rows come from the EXISTING gated
-    /// [`Self::list_notes_visible`] (`visibility_clause` against `unlocked`), so a sealed-and-not-
-    /// session-unlocked folder yields NO rows here (never a masked row) — a typed row can never carry
-    /// sealed content. Per visible row: re-read its markdown through the SAME visibility gate
-    /// (defense-in-depth — a row that somehow slipped the summary gate is still gated on the text
-    /// read), `parse_front_matter` the raw `Record<String,String>`, and coerce each schema key's raw
-    /// scalar via [`coerce_property_value`] against the folder schema. A `Select` value outside the
-    /// declared `options` is PRESERVED as `Text` (never dropped). The front-matter parsers are
-    /// untouched — typing is a pure read-time overlay.
-    pub fn list_notes_visible_typed(
-        &self,
-        folder_id: &str,
-        unlocked: &HashSet<String>,
-    ) -> Result<Vec<TypedNoteRow>> {
-        // The schema drives which keys are typed + how. Empty schema ⇒ rows carry no `values` (still
-        // their id/title/tags), never an error.
-        let schema = self.get_note_folder_schema(folder_id)?;
-        // GATE 1 — only VISIBLE notes for this folder (sealed-not-unlocked ⇒ absent).
-        let summaries = self.list_notes_visible(Some(folder_id), unlocked)?;
-        let mut out = Vec::with_capacity(summaries.len());
-        for s in summaries {
-            // GATE 2 (defense-in-depth) — re-read the markdown through the SAME visibility gate; a
-            // row that slipped the summary gate resolves to None and is dropped, never read plain.
-            let Some(markdown) = self.note_markdown_if_visible(&s.id, unlocked)? else {
-                continue;
-            };
-            let (tags, raw) = parse_front_matter(&markdown);
-            let mut values: std::collections::BTreeMap<String, PropertyValue> =
-                std::collections::BTreeMap::new();
-            for field in &schema {
-                if let Some(raw_val) = raw.get(&field.key) {
-                    values.insert(
-                        field.key.clone(),
-                        coerce_property_value(raw_val, field.kind, &field.options),
-                    );
-                }
-            }
-            out.push(TypedNoteRow {
-                id: s.id,
-                title: s.title,
-                folder_id: s.folder_id,
-                values,
-                tags,
-                updated_at: s.updated_at,
-            });
-        }
-        Ok(out)
-    }
+    // `list_notes_visible_typed` moved to `storage::notes_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// Read ONE note's raw markdown ONLY when its owning folder is VISIBLE (open or session-unlocked)
-    /// — the gated text read [`Self::list_notes_visible_typed`] uses per row. Applies the SAME
-    /// `visibility_clause` JOIN as [`Self::list_notes_visible`]: a note in a sealed-and-not-unlocked
-    /// folder resolves to `None` (never the stored/blanked text). `kind='note'` enforced.
-    pub fn note_markdown_if_visible(
-        &self,
-        note_id: &str,
-        unlocked: &HashSet<String>,
-    ) -> Result<Option<String>> {
-        let conn = self.lock();
-        let visible = visibility_clause("f", unlocked);
-        let sql = format!(
-            "SELECT COALESCE(d.text, '')
-               FROM documents d
-               JOIN folders f ON f.id = d.folder_id
-              WHERE d.id = ?1 AND d.kind = 'note' AND {visible}"
-        );
-        conn.query_row(&sql, rusqlite::params![note_id], |r| r.get::<_, String>(0))
-            .optional()
-            .map_err(map_err)
-    }
+    // `note_markdown_if_visible` moved to `storage::notes_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
     // ── NOTE FOLDERS (`folders` with `kind='note'`) ──────────────────────────────────────────────
 
     // `ensure_default_note_folder` moved to `storage::folders_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// The ONE reserved, always-open note-folder that backs the "Notes" section root — the home for
-    /// UNFILED new notes (2026-07-14). Idempotent; returns the existing `is_root` folder, else picks
-    /// one: an UNLOCKED legacy path-`"Notes"` is flagged `is_root=1` in place (no note movement — the
-    /// common/fresh case); a LOCKED legacy `"Notes"` can't be repurposed (would expose sealed content)
-    /// nor reuse the UNIQUE "Notes" path, so a SEPARATE always-open root is created at the first free
-    /// "Inbox" path (the locked "Notes" stays an ordinary folder); with no `"Notes"` folder at all
-    /// (fresh install) the root is created at "Notes". Never moves user rows, never touches sealed
-    /// content; the root can never be locked (`lock_folder` refuses `is_root`).
-    pub fn ensure_notes_root(&self) -> Result<String> {
-        if let Some(id) = self.note_root_id()? {
-            return Ok(id);
-        }
-        match self.folder_by_path("Notes")? {
-            Some(f) if !f.locked => {
-                self.set_folder_is_root(&f.id)?;
-                Ok(f.id)
-            }
-            Some(_locked) => {
-                let path = self.first_free_note_root_path()?;
-                self.insert_note_root(&path)
-            }
-            None => self.insert_note_root("Notes"),
-        }
-    }
+    // `ensure_notes_root` moved to `storage::notes_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// The id of the reserved note-root (`is_root=1`), or `None` if it hasn't been created yet.
-    pub fn note_root_id(&self) -> Result<Option<String>> {
-        let conn = self.lock();
-        conn.query_row(
-            "SELECT id FROM folders WHERE is_root = 1 AND COALESCE(kind,'meeting') = 'note' LIMIT 1",
-            [],
-            |r| r.get::<_, String>(0),
-        )
-        .optional()
-        .map_err(map_err)
-    }
+    // `note_root_id` moved to `storage::notes_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
     // `folder_is_root` moved to `storage::folders_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// Flag an existing (unlocked) note-folder as the reserved root. The `AND locked = 0` makes
-    /// "is_root ⟹ never sealed" a SQL-enforced invariant even under a concurrent lock race — a locked
-    /// folder can NEVER become the always-open root (lock-security review, 2026-07-14).
-    fn set_folder_is_root(&self, id: &str) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
-            "UPDATE folders SET is_root = 1 WHERE id = ?1 AND locked = 0",
-            rusqlite::params![id],
-        )
-        .map_err(map_err)?;
-        Ok(())
-    }
+    // `set_folder_is_root` moved to `storage::notes_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// The first free "Inbox"-style path for a separate note-root (when the legacy "Notes" is locked).
-    fn first_free_note_root_path(&self) -> Result<String> {
-        for n in 0..1000 {
-            let path = if n == 0 {
-                "Inbox".to_string()
-            } else {
-                format!("Inbox {}", n + 1)
-            };
-            if self.folder_by_path(&path)?.is_none() {
-                return Ok(path);
-            }
-        }
-        Err(AppError::Storage("could not allocate a notes-root path".into()))
-    }
+    // `first_free_note_root_path` moved to `storage::notes_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// Insert a fresh reserved note-root at `path` (name = `path`, `is_root=1`, unlocked, no parent).
-    /// `INSERT OR IGNORE` on the UNIQUE path guards a race, then reads the id back.
-    fn insert_note_root(&self, path: &str) -> Result<String> {
-        let id = uuid::Uuid::new_v4().to_string();
-        let conn = self.lock();
-        conn.execute(
-            "INSERT OR IGNORE INTO folders (id, name, path, parent_id, locked, wrapped_key, created_at, kind, is_root)
-             VALUES (?1, ?2, ?2, NULL, 0, NULL, ?3, 'note', 1)",
-            rusqlite::params![id, path, chrono::Utc::now().to_rfc3339()],
-        )
-        .map_err(map_err)?;
-        // Ensure is_root=1 even if a same-path row pre-existed (the OR IGNORE kept the old one). The
-        // `AND locked = 0` keeps the "is_root ⟹ never sealed" invariant under a concurrent race where
-        // a LOCKED folder was created at this path between the free-path check and here.
-        conn.execute(
-            "UPDATE folders SET is_root = 1 WHERE path = ?1 AND locked = 0 \
-               AND COALESCE(kind, 'meeting') = 'note'",
-            rusqlite::params![path],
-        )
-        .map_err(map_err)?;
-        conn.query_row(
-            "SELECT id FROM folders WHERE path = ?1",
-            rusqlite::params![path],
-            |r| r.get::<_, String>(0),
-        )
-        .map_err(map_err)
-    }
+    // `insert_note_root` moved to `storage::notes_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
     // `insert_note_folder` moved to `storage::folders_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
@@ -6453,194 +5774,23 @@ impl Db {
 
     // ── notes ───────────────────────────────────────────────────────────────
 
-    pub fn upsert_note(&self, note: &NoteRecord) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
-            "INSERT INTO notes
-               (meeting_id, provider_id, markdown, created_at, exported_path,
-                model_requested, model_served, gateway_host)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-             ON CONFLICT(meeting_id, provider_id) DO UPDATE SET
-               markdown = excluded.markdown,
-               created_at = excluded.created_at,
-               exported_path = excluded.exported_path,
-               model_requested = excluded.model_requested,
-               model_served = excluded.model_served,
-               gateway_host = excluded.gateway_host",
-            rusqlite::params![
-                note.meeting_id,
-                note.provider_id,
-                note.markdown,
-                note.created_at,
-                note.exported_path,
-                note.model_requested,
-                note.model_served,
-                note.gateway_host,
-            ],
-        )
-        .map_err(map_err)?;
-        Ok(())
-    }
+    // `upsert_note` moved to `storage::notes_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// SEAL-ON-WRITE twin of [`Db::upsert_note`] for a meeting whose folder is LOCKED (and
-    /// session-unlocked — the command layer gates first): persist the fresh markdown (session-
-    /// visible) AND its freshly-encrypted `content_blob` AND the governing `folder_id` in ONE atomic
-    /// statement. Setting `folder_id` on insert keeps a NEW provider row governed by the meeting's
-    /// lock (a bare insert would leave it NULL → ungoverned → visible). The CALLER must have verified
-    /// the blob decrypts back byte-identical BEFORE calling this (verify-before-destroy) — exactly
-    /// like [`Db::seal_note`]. 2026-07-10 audit F1.
-    pub fn upsert_note_sealed(
-        &self,
-        note: &NoteRecord,
-        content_blob: &[u8],
-        folder_id: &str,
-    ) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
-            "INSERT INTO notes
-               (meeting_id, provider_id, markdown, created_at, exported_path,
-                model_requested, model_served, gateway_host, content_blob, folder_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-             ON CONFLICT(meeting_id, provider_id) DO UPDATE SET
-               markdown = excluded.markdown,
-               created_at = excluded.created_at,
-               exported_path = excluded.exported_path,
-               model_requested = excluded.model_requested,
-               model_served = excluded.model_served,
-               gateway_host = excluded.gateway_host,
-               content_blob = excluded.content_blob,
-               folder_id = excluded.folder_id",
-            rusqlite::params![
-                note.meeting_id,
-                note.provider_id,
-                note.markdown,
-                note.created_at,
-                note.exported_path,
-                note.model_requested,
-                note.model_served,
-                note.gateway_host,
-                content_blob,
-                folder_id,
-            ],
-        )
-        .map_err(map_err)?;
-        Ok(())
-    }
+    // `upsert_note_sealed` moved to `storage::notes_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    pub fn get_note(&self, meeting_id: &str, provider_id: &str) -> Result<Option<NoteRecord>> {
-        let conn = self.lock();
-        conn.query_row(
-            "SELECT meeting_id, provider_id, markdown, created_at, exported_path,
-                    model_requested, model_served, gateway_host
-               FROM notes WHERE meeting_id = ?1 AND provider_id = ?2",
-            rusqlite::params![meeting_id, provider_id],
-            row_to_note,
-        )
-        .optional()
-        .map_err(map_err)
-    }
+    // `get_note` moved to `storage::notes_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    pub fn latest_note(&self) -> Result<Option<NoteRecord>> {
-        let conn = self.lock();
-        conn.query_row(
-            "SELECT meeting_id, provider_id, markdown, created_at, exported_path,
-                    model_requested, model_served, gateway_host
-               FROM notes ORDER BY created_at DESC LIMIT 1",
-            [],
-            row_to_note,
-        )
-        .optional()
-        .map_err(map_err)
-    }
+    // `latest_note` moved to `storage::notes_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// The most recent VISIBLE note across all meetings (BLK-2b backing for `get_last_note`): a note
-    /// whose folder is open/NULL or session-unlocked. A sealed-and-not-unlocked latest note is
-    /// skipped so the recorder bar never surfaces its blanked (or, defensively, sealed) content.
-    pub fn latest_note_visible(&self, unlocked: &HashSet<String>) -> Result<Option<NoteRecord>> {
-        let conn = self.lock();
-        let visible = visibility_clause("n", unlocked);
-        let sql = format!(
-            "SELECT n.meeting_id, n.provider_id, n.markdown, n.created_at, n.exported_path,
-                    n.model_requested, n.model_served, n.gateway_host
-               FROM notes n
-               LEFT JOIN folders f ON f.id = n.folder_id
-              WHERE {visible}
-              ORDER BY n.created_at DESC LIMIT 1"
-        );
-        conn.query_row(&sql, [], row_to_note)
-            .optional()
-            .map_err(map_err)
-    }
+    // `latest_note_visible` moved to `storage::notes_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// The most recent note for a meeting across providers (Detail view).
-    pub fn get_latest_note_for_meeting(&self, meeting_id: &str) -> Result<Option<NoteRecord>> {
-        let conn = self.lock();
-        conn.query_row(
-            "SELECT meeting_id, provider_id, markdown, created_at, exported_path,
-                    model_requested, model_served, gateway_host
-               FROM notes WHERE meeting_id = ?1 ORDER BY created_at DESC LIMIT 1",
-            rusqlite::params![meeting_id],
-            row_to_note,
-        )
-        .optional()
-        .map_err(map_err)
-    }
+    // `get_latest_note_for_meeting` moved to `storage::notes_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    pub fn set_note_exported_path(
-        &self,
-        meeting_id: &str,
-        provider_id: &str,
-        path: &str,
-    ) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
-            "UPDATE notes SET exported_path = ?3
-             WHERE meeting_id = ?1 AND provider_id = ?2",
-            rusqlite::params![meeting_id, provider_id, path],
-        )
-        .map_err(map_err)?;
-        Ok(())
-    }
+    // `set_note_exported_path` moved to `storage::notes_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// The export-collision-guard baseline for a MEETING note: the SHA-256 (lowercase hex) of the
-    /// markdown Murmur last wrote to this row's exported vault `.md`. `None` for a legacy row
-    /// exported before the guard shipped (grandfathered — no sibling is preserved until the next
-    /// Murmur write stamps a baseline) or when the row is unknown.
-    pub fn get_note_exported_hash(
-        &self,
-        meeting_id: &str,
-        provider_id: &str,
-    ) -> Result<Option<String>> {
-        let conn = self.lock();
-        conn.query_row(
-            "SELECT exported_hash FROM notes WHERE meeting_id = ?1 AND provider_id = ?2",
-            rusqlite::params![meeting_id, provider_id],
-            |r| r.get::<_, Option<String>>(0),
-        )
-        .optional()
-        .map_err(map_err)
-        .map(Option::flatten)
-    }
+    // `get_note_exported_hash` moved to `storage::notes_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// Persist (or clear with `None`) a MEETING note's export-collision-guard baseline. Set after
-    /// EVERY write Murmur makes to the exported `.md` (full overwrites AND appends), computed from
-    /// the exact content written — a stale baseline causes false "external edit" siblings on the
-    /// next overwrite.
-    pub fn set_note_exported_hash(
-        &self,
-        meeting_id: &str,
-        provider_id: &str,
-        hash: Option<&str>,
-    ) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
-            "UPDATE notes SET exported_hash = ?3
-             WHERE meeting_id = ?1 AND provider_id = ?2",
-            rusqlite::params![meeting_id, provider_id, hash],
-        )
-        .map_err(map_err)?;
-        Ok(())
-    }
+    // `set_note_exported_hash` moved to `storage::notes_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
     // ── timelines (AI-derived speaker + topic spans; JSON blob per meeting) ──────
 
@@ -6693,88 +5843,13 @@ impl Db {
 
     // ── meeting tags ─────────────────────────────────────────────────────────
 
-    /// Replace all tags for a meeting with `tags` (trimmed, blanks dropped).
-    pub fn set_meeting_tags(&self, meeting_id: &str, tags: &[String]) -> Result<()> {
-        let mut conn = self.lock();
-        let tx = conn.transaction().map_err(map_err)?;
-        tx.execute(
-            "DELETE FROM meeting_tags WHERE meeting_id = ?1",
-            rusqlite::params![meeting_id],
-        )
-        .map_err(map_err)?;
-        {
-            let mut stmt = tx
-                .prepare("INSERT OR IGNORE INTO meeting_tags (meeting_id, tag) VALUES (?1, ?2)")
-                .map_err(map_err)?;
-            for tag in tags {
-                let t = tag.trim();
-                if !t.is_empty() {
-                    stmt.execute(rusqlite::params![meeting_id, t])
-                        .map_err(map_err)?;
-                }
-            }
-        }
-        tx.commit().map_err(map_err)?;
-        Ok(())
-    }
+    // `set_meeting_tags` moved to `storage::meetings_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// All tags for a meeting, sorted.
-    pub fn get_meeting_tags(&self, meeting_id: &str) -> Result<Vec<String>> {
-        let conn = self.lock();
-        let mut stmt = conn
-            .prepare("SELECT tag FROM meeting_tags WHERE meeting_id = ?1 ORDER BY tag")
-            .map_err(map_err)?;
-        let rows = stmt
-            .query_map(rusqlite::params![meeting_id], |r| r.get::<_, String>(0))
-            .map_err(map_err)?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r.map_err(map_err)?);
-        }
-        Ok(out)
-    }
+    // `get_meeting_tags` moved to `storage::meetings_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// All distinct tags across meetings, sorted (for the filter UI).
-    pub fn list_all_tags(&self) -> Result<Vec<String>> {
-        let conn = self.lock();
-        let mut stmt = conn
-            .prepare("SELECT DISTINCT tag FROM meeting_tags ORDER BY tag")
-            .map_err(map_err)?;
-        let rows = stmt
-            .query_map([], |r| r.get::<_, String>(0))
-            .map_err(map_err)?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r.map_err(map_err)?);
-        }
-        Ok(out)
-    }
+    // `list_all_tags` moved to `storage::meetings_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// Meetings carrying `tag`, newest first.
-    pub fn list_meetings_by_tag(&self, tag: &str) -> Result<Vec<Meeting>> {
-        let conn = self.lock();
-        let mut stmt = conn
-            .prepare(
-                "SELECT m.id, m.started_at, m.ended_at, m.title, m.duration_s, m.audio_path, \
-                        m.status, \
-                        (SELECT nf.folder_id FROM notes nf \
-                          WHERE nf.meeting_id = m.id AND nf.folder_id IS NOT NULL LIMIT 1) \
-                          AS folder_id
-                   FROM meetings m
-                   JOIN meeting_tags t ON t.meeting_id = m.id
-                  WHERE t.tag = ?1
-                  ORDER BY m.started_at DESC, m.id DESC",
-            )
-            .map_err(map_err)?;
-        let rows = stmt
-            .query_map(rusqlite::params![tag], row_to_meeting)
-            .map_err(map_err)?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r.map_err(map_err)??);
-        }
-        Ok(out)
-    }
+    // `list_meetings_by_tag` moved to `storage::meetings_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
     // ── saved recipes ────────────────────────────────────────────────────────
 
@@ -8182,100 +7257,19 @@ impl Db {
         Ok(())
     }
 
-    /// Set (or clear) a meeting's `audio_path` — used by the audio-at-rest encryption lifecycle
-    /// to re-point at the decrypted-for-session copy and back to the plaintext WAV on remove-lock.
-    pub fn set_meeting_audio_path(&self, meeting_id: &str, audio_path: Option<&str>) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
-            "UPDATE meetings SET audio_path = ?2 WHERE id = ?1",
-            rusqlite::params![meeting_id, audio_path],
-        )
-        .map_err(map_err)?;
-        Ok(())
-    }
+    // `set_meeting_audio_path` moved to `storage::meetings_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// Read a meeting's per-stream master paths `(mic_master_path, sys_master_path)`. A TARGETED
-    /// query so the masters never ride on the `Meeting` struct / its DTO — keeping them off
-    /// `Meeting` is what makes a masked-detail leak structurally impossible. NULL when not kept.
-    pub fn get_meeting_master_paths(
-        &self,
-        meeting_id: &str,
-    ) -> Result<(Option<String>, Option<String>)> {
-        let conn = self.lock();
-        conn.query_row(
-            "SELECT mic_master_path, sys_master_path FROM meetings WHERE id = ?1",
-            rusqlite::params![meeting_id],
-            |r| {
-                Ok((
-                    r.get::<_, Option<String>>(0)?,
-                    r.get::<_, Option<String>>(1)?,
-                ))
-            },
-        )
-        .optional()
-        .map_err(map_err)?
-        .ok_or_else(|| AppError::Storage(format!("no meeting with id {meeting_id}")))
-    }
+    // `get_meeting_master_paths` moved to `storage::meetings_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// Set (or clear) a meeting's mic master path (the audio-at-rest seal lifecycle re-points it).
-    pub fn set_meeting_mic_master_path(&self, meeting_id: &str, path: Option<&str>) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
-            "UPDATE meetings SET mic_master_path = ?2 WHERE id = ?1",
-            rusqlite::params![meeting_id, path],
-        )
-        .map_err(map_err)?;
-        Ok(())
-    }
+    // `set_meeting_mic_master_path` moved to `storage::meetings_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// Set (or clear) a meeting's system master path (the audio-at-rest seal lifecycle re-points it).
-    pub fn set_meeting_sys_master_path(&self, meeting_id: &str, path: Option<&str>) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
-            "UPDATE meetings SET sys_master_path = ?2 WHERE id = ?1",
-            rusqlite::params![meeting_id, path],
-        )
-        .map_err(map_err)?;
-        Ok(())
-    }
+    // `set_meeting_sys_master_path` moved to `storage::meetings_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// Race-safe clear of `audio_path`: NULL it ONLY if it still equals `expected` (the plaintext
-    /// path the prune snapshotted). If a concurrent seal re-pointed it to `.enc` in between, the
-    /// `AND audio_path = ?2` fails to match → no-op → the freshly-sealed pointer SURVIVES. Used by
-    /// the storage prune, which snapshots candidates OUTSIDE the seal lifecycle lock (TOCTOU-safe).
-    pub fn clear_meeting_audio_path_if(&self, meeting_id: &str, expected: &str) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
-            "UPDATE meetings SET audio_path = NULL WHERE id = ?1 AND audio_path = ?2",
-            rusqlite::params![meeting_id, expected],
-        )
-        .map_err(map_err)?;
-        Ok(())
-    }
+    // `clear_meeting_audio_path_if` moved to `storage::meetings_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// Race-safe clear of `mic_master_path`: NULL it ONLY if it still equals `expected`. Mirrors
-    /// [`Db::clear_meeting_audio_path_if`] — a concurrent seal that re-pointed it survives.
-    pub fn clear_meeting_mic_master_path_if(&self, meeting_id: &str, expected: &str) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
-            "UPDATE meetings SET mic_master_path = NULL WHERE id = ?1 AND mic_master_path = ?2",
-            rusqlite::params![meeting_id, expected],
-        )
-        .map_err(map_err)?;
-        Ok(())
-    }
+    // `clear_meeting_mic_master_path_if` moved to `storage::meetings_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// Race-safe clear of `sys_master_path`: NULL it ONLY if it still equals `expected`. Mirrors
-    /// [`Db::clear_meeting_audio_path_if`] — a concurrent seal that re-pointed it survives.
-    pub fn clear_meeting_sys_master_path_if(&self, meeting_id: &str, expected: &str) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
-            "UPDATE meetings SET sys_master_path = NULL WHERE id = ?1 AND sys_master_path = ?2",
-            rusqlite::params![meeting_id, expected],
-        )
-        .map_err(map_err)?;
-        Ok(())
-    }
+    // `clear_meeting_sys_master_path_if` moved to `storage::meetings_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
     // ── exposure-aware reads (MCP visibility filter, Stage D) ──────────────────
     //
@@ -8405,112 +7399,11 @@ impl Db {
         Ok(hits)
     }
 
-    /// Recent visible meetings only (MCP `list_recent_meetings`). A meeting is visible if it has
-    /// no note, or any of its notes is visible (open/unlocked folder).
-    pub fn list_meetings_visible(
-        &self,
-        limit: i64,
-        unlocked: &HashSet<String>,
-    ) -> Result<Vec<Meeting>> {
-        let conn = self.lock();
-        let visible = visibility_clause("n", unlocked);
-        // A meeting is hidden only when EVERY note it has is sealed-and-not-unlocked. Expressed
-        // as: no note row exists that is currently sealed-and-hidden for this meeting, unless a
-        // sibling visible note exists. Simpler + correct: keep the meeting if it has zero notes
-        // OR at least one visible note.
-        let sql = format!(
-            "SELECT m.id, m.started_at, m.ended_at, m.title, m.duration_s, m.audio_path, m.status,
-                    (SELECT nf.folder_id FROM notes nf
-                      WHERE nf.meeting_id = m.id AND nf.folder_id IS NOT NULL LIMIT 1)
-                      AS folder_id
-               FROM meetings m
-              WHERE NOT EXISTS (SELECT 1 FROM notes nn WHERE nn.meeting_id = m.id)
-                 OR EXISTS (
-                      SELECT 1 FROM notes n
-                       LEFT JOIN folders f ON f.id = n.folder_id
-                       WHERE n.meeting_id = m.id AND {visible}
-                    )
-              ORDER BY m.started_at DESC, m.id DESC
-              LIMIT ?1"
-        );
-        let mut stmt = conn.prepare(&sql).map_err(map_err)?;
-        let rows = stmt
-            .query_map(rusqlite::params![limit], row_to_meeting)
-            .map_err(map_err)?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r.map_err(map_err)??);
-        }
-        Ok(out)
-    }
+    // `list_meetings_visible` moved to `storage::meetings_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// The most recent VISIBLE meeting titled exactly `title` — the Ask surface's citation→source
-    /// resolution (a `[[Title]]` wikilink back to a meeting id/date chip). Applies the SAME
-    /// visibility predicate as [`Self::list_meetings_visible`], so a sealed-and-not-session-unlocked
-    /// meeting can never resolve — a citation string can't become an existence/date leak. Exact
-    /// (case-sensitive) title match; newest first when titles collide.
-    pub fn meeting_by_title_visible(
-        &self,
-        title: &str,
-        unlocked: &HashSet<String>,
-    ) -> Result<Option<Meeting>> {
-        let conn = self.lock();
-        let visible = visibility_clause("n", unlocked);
-        let sql = format!(
-            "SELECT m.id, m.started_at, m.ended_at, m.title, m.duration_s, m.audio_path, m.status,
-                    (SELECT nf.folder_id FROM notes nf
-                      WHERE nf.meeting_id = m.id AND nf.folder_id IS NOT NULL LIMIT 1)
-                      AS folder_id
-               FROM meetings m
-              WHERE m.title = ?1
-                AND (NOT EXISTS (SELECT 1 FROM notes nn WHERE nn.meeting_id = m.id)
-                     OR EXISTS (
-                          SELECT 1 FROM notes n
-                           LEFT JOIN folders f ON f.id = n.folder_id
-                           WHERE n.meeting_id = m.id AND {visible}
-                        ))
-              ORDER BY m.started_at DESC, m.id DESC
-              LIMIT 1"
-        );
-        conn.query_row(&sql, rusqlite::params![title], row_to_meeting)
-            .optional()
-            .map_err(map_err)?
-            .transpose()
-    }
+    // `meeting_by_title_visible` moved to `storage::meetings_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// CASE-FOLDED twin of [`Self::meeting_by_title_visible`] (brain-v3 audit Fix 6): the same
-    /// gated resolver but comparing `LOWER(m.title) = LOWER(?1)` so `[[project x]]` resolves a
-    /// meeting titled "Project X". Used ONLY as [`Self::resolve_wikilink`]'s meeting-leg fallback
-    /// after the exact match misses. Same visibility predicate — a sealed meeting never resolves.
-    /// (SQLite `LOWER()` folds ASCII only; full Unicode fold is deferred with the note leg's.)
-    pub(crate) fn meeting_by_title_folded_visible(
-        &self,
-        title: &str,
-        unlocked: &HashSet<String>,
-    ) -> Result<Option<Meeting>> {
-        let conn = self.lock();
-        let visible = visibility_clause("n", unlocked);
-        let sql = format!(
-            "SELECT m.id, m.started_at, m.ended_at, m.title, m.duration_s, m.audio_path, m.status,
-                    (SELECT nf.folder_id FROM notes nf
-                      WHERE nf.meeting_id = m.id AND nf.folder_id IS NOT NULL LIMIT 1)
-                      AS folder_id
-               FROM meetings m
-              WHERE LOWER(m.title) = LOWER(?1)
-                AND (NOT EXISTS (SELECT 1 FROM notes nn WHERE nn.meeting_id = m.id)
-                     OR EXISTS (
-                          SELECT 1 FROM notes n
-                           LEFT JOIN folders f ON f.id = n.folder_id
-                           WHERE n.meeting_id = m.id AND {visible}
-                        ))
-              ORDER BY m.started_at DESC, m.id DESC
-              LIMIT 1"
-        );
-        conn.query_row(&sql, rusqlite::params![title], row_to_meeting)
-            .optional()
-            .map_err(map_err)?
-            .transpose()
-    }
+    // `meeting_by_title_folded_visible` moved to `storage::meetings_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
     /// Live keystroke-prefix title match over VISIBLE notes + meetings, for the inline `[[` /
     /// slash-menu link-insertion autocomplete (distinct from [`resolve_wikilink`]'s exact-title
@@ -8657,48 +7550,9 @@ impl Db {
         Ok((out, note_count + meeting_count))
     }
 
-    /// The latest visible note for a meeting (MCP `get_meeting`); `None` if the meeting's note
-    /// is sealed-and-not-session-unlocked.
-    pub fn get_note_if_visible(
-        &self,
-        meeting_id: &str,
-        unlocked: &HashSet<String>,
-    ) -> Result<Option<NoteRecord>> {
-        let conn = self.lock();
-        let visible = visibility_clause("n", unlocked);
-        let sql = format!(
-            "SELECT n.meeting_id, n.provider_id, n.markdown, n.created_at, n.exported_path,
-                    n.model_requested, n.model_served, n.gateway_host
-               FROM notes n
-               LEFT JOIN folders f ON f.id = n.folder_id
-              WHERE n.meeting_id = ?1 AND {visible}
-              ORDER BY n.created_at DESC LIMIT 1"
-        );
-        conn.query_row(&sql, rusqlite::params![meeting_id], row_to_note)
-            .optional()
-            .map_err(map_err)
-    }
+    // `get_note_if_visible` moved to `storage::notes_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-    /// Whether a meeting is visible at all (any note visible, or no notes) — gates the transcript
-    /// in MCP `get_meeting` so a sealed meeting's transcript is not leaked either.
-    pub fn meeting_is_visible(&self, meeting_id: &str, unlocked: &HashSet<String>) -> Result<bool> {
-        let conn = self.lock();
-        let visible = visibility_clause("n", unlocked);
-        let sql = format!(
-            "SELECT EXISTS (SELECT 1 FROM notes nn WHERE nn.meeting_id = ?1) AS has_notes,
-                    EXISTS (
-                      SELECT 1 FROM notes n
-                       LEFT JOIN folders f ON f.id = n.folder_id
-                       WHERE n.meeting_id = ?1 AND {visible}
-                    ) AS has_visible"
-        );
-        let (has_notes, has_visible): (bool, bool) = conn
-            .query_row(&sql, rusqlite::params![meeting_id], |r| {
-                Ok((r.get::<_, i64>(0)? != 0, r.get::<_, i64>(1)? != 0))
-            })
-            .map_err(map_err)?;
-        Ok(!has_notes || has_visible)
-    }
+    // `meeting_is_visible` moved to `storage::meetings_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
     /// Phase E (Flow B, `NoteAside`) — record a spoken aside against a meeting in the additive
     /// `notes_asides` store. PURELY ADDITIVE: it never touches the note `markdown`/`content_blob`,
@@ -9364,20 +8218,7 @@ impl Db {
         Ok(out)
     }
 
-    /// Whether ONE authored note is VISIBLE (open or session-unlocked folder) — the lightweight
-    /// existence twin of [`Db::note_markdown_if_visible`], used by the audit list's defensive
-    /// re-filter. Fail-closed on an unknown id.
-    pub fn note_is_visible(&self, note_id: &str, unlocked: &HashSet<String>) -> Result<bool> {
-        let conn = self.lock();
-        let visible = visibility_clause("f", unlocked);
-        let sql = format!(
-            "SELECT EXISTS(SELECT 1 FROM documents d
-               JOIN folders f ON f.id = d.folder_id
-              WHERE d.id = ?1 AND d.kind = 'note' AND {visible})"
-        );
-        conn.query_row(&sql, rusqlite::params![note_id], |r| r.get(0))
-            .map_err(map_err)
-    }
+    // `note_is_visible` moved to `storage::notes_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 }
 
 /// Collision-proof unique temp path for file-backed tests.
@@ -10061,37 +8902,13 @@ mod search_helper_tests {
     }
 }
 
-fn row_to_note(row: &Row<'_>) -> rusqlite::Result<NoteRecord> {
-    Ok(NoteRecord {
-        meeting_id: row.get(0)?,
-        provider_id: row.get(1)?,
-        markdown: row.get(2)?,
-        created_at: row.get(3)?,
-        exported_path: row.get(4)?,
-        model_requested: row.get(5)?,
-        model_served: row.get(6)?,
-        gateway_host: row.get(7)?,
-    })
-}
+// `row_to_note` moved to `storage::notes_store` (God-file split) alongside the note readers that are its only callers.
 
 // `row_to_folder` moved to `storage::folders_store` (God-file split) alongside the folder readers that are its only callers.
 
 // `row_to_note_folder` moved to `storage::folders_store` (God-file split) alongside the folder readers that are its only callers.
 
-/// Column order: `id, folder_id, name, title, text, created_at, updated_at, exported_path, sealed`.
-fn row_to_note_row(row: &Row<'_>) -> rusqlite::Result<NoteRow> {
-    Ok(NoteRow {
-        id: row.get(0)?,
-        folder_id: row.get(1)?,
-        name: row.get(2)?,
-        title: row.get(3)?,
-        text: row.get(4)?,
-        created_at: row.get(5)?,
-        updated_at: row.get(6)?,
-        exported_path: row.get(7)?,
-        sealed: row.get::<_, i64>(8)? != 0,
-    })
-}
+// `row_to_note_row` moved to `storage::notes_store` (God-file split) alongside the note readers that are its only callers.
 
 #[cfg(test)]
 mod tests {
