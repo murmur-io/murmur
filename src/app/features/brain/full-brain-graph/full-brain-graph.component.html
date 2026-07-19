@@ -39,6 +39,21 @@
       </div>
     }
 
+    <!-- VIEW MODE — layered "neural" bands vs organic clustered islands. -->
+    <div class="fbg-seg" role="group" aria-label="Graph layout">
+      @for (m of layoutModes; track m.key) {
+        <button
+          type="button"
+          class="fbg-seg-btn"
+          [class.is-on]="layoutMode() === m.key"
+          [attr.aria-pressed]="layoutMode() === m.key"
+          (click)="setLayoutMode(m.key)"
+        >
+          {{ m.label }}
+        </button>
+      }
+    </div>
+
     <!-- LENSES — node-type + edge-type toggle chips (filter what's drawn). -->
     <div class="fbg-lenses">
       <div class="fbg-lens-group" role="group" aria-label="Show node types">
@@ -102,7 +117,9 @@
         [sceneEdges]="sceneEdges()"
         [selectedId]="selectedId()"
         (nodePick)="onPick($event)"
+        (nodeOpen)="onOpen($event)"
         (nodeHover)="hoverId.set($event)"
+        (zoom)="zoomPct.set($event)"
       ></canvas>
 
       <div class="fbg-toolbar" role="toolbar" aria-label="Graph controls">
@@ -112,12 +129,13 @@
         <div class="fbg-pill fbg-zoom">
           <button
             type="button"
-            class="fbg-zbtn"
-            aria-label="Zoom in"
-            (click)="zoomIn()"
+            class="fbg-zbtn fbg-zreset"
+            aria-label="Fit graph to view"
+            (click)="fitView()"
           >
-            +
+            Fit
           </button>
+          <span class="fbg-zdiv" aria-hidden="true"></span>
           <button
             type="button"
             class="fbg-zbtn"
@@ -126,13 +144,14 @@
           >
             −
           </button>
+          <span class="fbg-zpct" aria-hidden="true">{{ zoomPct() }}%</span>
           <button
             type="button"
-            class="fbg-zbtn fbg-zreset"
-            aria-label="Reset view"
-            (click)="resetView()"
+            class="fbg-zbtn"
+            aria-label="Zoom in"
+            (click)="zoomIn()"
           >
-            Reset
+            +
           </button>
         </div>
       </div>
@@ -142,7 +161,8 @@
       @if (hoverLabel(); as label) {
         {{ label }}
       } @else {
-        Drag to pan · scroll to zoom · click a node to open it.
+        Drag to pan · scroll to zoom · click to focus a node · double-click to
+        open it.
       }
     </p>
   }
