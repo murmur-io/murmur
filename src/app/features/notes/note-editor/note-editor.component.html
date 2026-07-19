@@ -669,6 +669,8 @@
       [anchorRect]="trigger.rect"
       [query]="linkPickerQuery()"
       [activeIndex]="linkPickerActiveIndex()"
+      [excludeKind]="'note'"
+      [excludeId]="note()?.id ?? null"
       (picked)="pickLinkCandidate($event)"
       (candidatesChange)="onLinkPickerCandidates($event)"
     />

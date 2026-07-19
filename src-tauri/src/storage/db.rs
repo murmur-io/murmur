@@ -4418,13 +4418,14 @@ impl Db {
         let conn = self.lock();
         let visible = visibility_clause("f", unlocked);
         // L1 (section-parent) + L2 (doc summary) rows only — the heading/structure tree, never the
-        // L0 leaf body. Ordered by document position (`chunk_index`) so the outline reads top-down.
+        // L0 leaf body NOR the synthetic L3 contact digest (which is a retrieval aid, not structure).
+        // Ordered by document position (`chunk_index`) so the outline reads top-down.
         let sql = format!(
             "SELECT dc.level, dc.section_path, dc.page_no
                FROM doc_chunks dc
                JOIN documents d ON d.id = dc.document_id
                JOIN folders f ON f.id = d.folder_id
-              WHERE dc.document_id = ?1 AND dc.level >= 1 AND {visible}
+              WHERE dc.document_id = ?1 AND dc.level IN (1, 2) AND {visible}
               ORDER BY dc.chunk_index ASC
               LIMIT ?2"
         );

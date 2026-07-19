@@ -589,7 +589,16 @@ export class ConnectionsComponent {
       return;
     }
     if (!this.isLinkable(candidate)) {
-      this.toast.info("You can only link meetings, notes, and documents.");
+      // Distinguish the two refusals so the toast is honest (the anchor is now excluded from the
+      // candidate list, so the self-case is belt-and-braces — but a stale/edge pick must still read
+      // right, not the generic "wrong type" message it used to show for a self-link).
+      const isSelf =
+        candidate.kind === this.kind() && candidate.id === this.id();
+      this.toast.info(
+        isSelf
+          ? "You can't link an item to itself."
+          : "You can only link meetings, notes, and documents.",
+      );
       return;
     }
     const dstKind = candidate.kind as LinkKind;
