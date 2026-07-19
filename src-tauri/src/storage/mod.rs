@@ -12,6 +12,8 @@ pub(crate) mod meetings_store;
 pub mod migration;
 pub mod models;
 pub(crate) mod notes_store;
+pub(crate) mod org_store;
+pub(crate) mod seal_store;
 pub(crate) mod settings_store;
 pub mod usage;
 
