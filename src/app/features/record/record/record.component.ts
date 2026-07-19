@@ -249,16 +249,16 @@ export class RecordComponent implements OnInit {
 
   /**
    * BOUND the record surface to the viewport (fixed height → the note scrolls
-   * INTERNALLY, nothing spills past the window) whenever the note is the active
-   * writing surface: while recording AND while a pipeline runs with the companion
-   * note visible. EXCLUDES the "done" review state — that stacks the Brain-reveal /
-   * Re-Truth cards below the note and legitimately needs the page to scroll. Idle
-   * (no note surface) also stays unbounded (its short content just fills the calm
-   * min-height). Fixes the note overflowing off the bottom on smaller screens
-   * (2026-07-19).
+   * INTERNALLY, nothing spills past the window) whenever the note surface is shown —
+   * recording, an in-flight pipeline, AND the resolved "done" review (the Brain-reveal
+   * / Re-Truth cards now sit ABOVE the note, so the note is always the flex:1 filler
+   * and everything fits). EXCLUDED only when an error banner is up: it renders below
+   * the note and legitimately needs the page to scroll so it stays visible. Idle (no
+   * note surface) stays unbounded (its short content fills the calm min-height). Fixes
+   * the note overflowing off the bottom on smaller screens (2026-07-19).
    */
   readonly boundToViewport = computed(
-    () => this.showAssistant() && this.store.stage() !== "done",
+    () => this.showAssistant() && !this.store.error(),
   );
 
   /**
