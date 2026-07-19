@@ -136,16 +136,40 @@ export class FullBrainGraphComponent {
   protected readonly hasHidden = computed(
     () => this.graphData()?.hasHidden ?? false,
   );
+
+  /**
+   * PR-9 F2: the backend trimmed an EDGE leg (the mention or links cap). Distinct
+   * from a node trim (`capDisclosure`) and a locked folder (`hasHidden`).
+   */
+  protected readonly edgesTruncated = computed(
+    () => this.graphData()?.edgesTruncated ?? false,
+  );
+
+  /**
+   * PR-9 F1 — the HONEST draw-cap disclosure. The old banner compared the backend's
+   * post-per-kind-cap `nodes.length` (up to 2000) against `totalVisibleNodes` and
+   * ignored BOTH the client-side lens filter AND the {@link MAX_NODES} draw cap — so
+   * it could claim "Showing 500 of 812" while only 140 somas were painted,
+   * reintroducing exactly the silent trim `totalVisibleNodes` exists to expose.
+   *
+   * The disclosure now compares what is ACTUALLY DRAWN ({@link drawnNodeCount},
+   * i.e. `sceneNodes().length`) against the true visible universe
+   * (`totalVisibleNodes`, the backend's uncapped count). Whenever fewer items are
+   * drawn than exist — because the backend per-kind cap trimmed rows, the
+   * {@link MAX_NODES} draw cap kept only the top-degree K, or a lens is hiding
+   * kinds — it says "Drawing N of M items" so the count on screen always matches
+   * the count in the caption.
+   */
   protected readonly isCapped = computed(() => {
-    const d = this.graphData();
-    return !!d && d.totalVisibleNodes > d.nodes.length;
+    const total = this.graphData()?.totalVisibleNodes ?? 0;
+    return this.drawnNodeCount() < total;
   });
   protected readonly capDisclosure = computed<string | null>(() => {
     const d = this.graphData();
     if (!d || !this.isCapped()) {
       return null;
     }
-    return `Showing ${d.nodes.length} of ${d.totalVisibleNodes} items.`;
+    return `Drawing ${this.drawnNodeCount()} of ${d.totalVisibleNodes} items.`;
   });
 
   /** Total nodes the backend returned (before any lens filtering). */
@@ -169,26 +193,35 @@ export class FullBrainGraphComponent {
     return d.nodes.filter((n) => lens[n.kind]);
   });
 
-  /** The edges drawn: both endpoints kind-visible AND the edge kind lens-enabled. */
+  /**
+   * The edges surviving the lens: both endpoints kind-visible AND the edge kind
+   * lens-enabled. PR-9 F4: match each endpoint by `(kind, id)` — not bare `id` —
+   * using the edge's `srcKind`/`dstKind`, so a cross-kind id collision can never
+   * mis-match an edge onto the wrong node.
+   */
   private readonly filteredEdges = computed<FullGraphEdge[]>(() => {
     const d = this.graphData();
     if (!d) {
       return [];
     }
     const eLens = this._edgeLens();
-    const visible = new Set(this.filteredNodes().map((n) => n.id));
+    const visible = new Set(this.filteredNodes().map((n) => `${n.kind}:${n.id}`));
     return d.edges.filter(
-      (e) => eLens[e.kind] && visible.has(e.src) && visible.has(e.dst),
+      (e) =>
+        eLens[e.kind] &&
+        visible.has(`${e.srcKind}:${e.src}`) &&
+        visible.has(`${e.dstKind}:${e.dst}`),
     );
   });
 
-  /** Counts for the header caption ("N items · M links"), post-lens. */
-  protected readonly drawnNodeCount = computed(
-    () => this.filteredNodes().length,
-  );
-  protected readonly drawnEdgeCount = computed(
-    () => this.filteredEdges().length,
-  );
+  /**
+   * Counts for the header caption ("N items · M links"). PR-9 F1: these reflect
+   * what is ACTUALLY DRAWN — `sceneNodes()`/`sceneEdges()`, i.e. AFTER the
+   * {@link MAX_NODES} draw cap — not the pre-cap lens-filtered sets, so the caption
+   * never claims more items/links than the canvas paints.
+   */
+  protected readonly drawnNodeCount = computed(() => this.sceneNodes().length);
+  protected readonly drawnEdgeCount = computed(() => this.sceneEdges().length);
 
   /**
    * The laid-out scene nodes — a PURE derivation of the lens-filtered graph.
@@ -354,14 +387,19 @@ export class FullBrainGraphComponent {
     }));
   });
 
-  /** The scene edges (between surviving nodes), with a stable key + dashed flag. */
+  /**
+   * The scene edges (between the somas that survived the {@link MAX_NODES} draw cap),
+   * with a stable key + dashed flag. PR-9 F4: match each endpoint by `(kind, id)` —
+   * keyed against the drawn nodes' `kind:id` — so a cross-kind id collision can't
+   * paint an edge onto the wrong soma.
+   */
   protected readonly sceneEdges = computed<FullSceneEdge[]>(() => {
-    const ids = new Set(this.sceneNodes().map((p) => p.id));
+    const keys = new Set(this.sceneNodes().map((p) => `${p.kind}:${p.id}`));
     const out: FullSceneEdge[] = [];
     for (const e of this.filteredEdges()) {
-      if (ids.has(e.src) && ids.has(e.dst)) {
+      if (keys.has(`${e.srcKind}:${e.src}`) && keys.has(`${e.dstKind}:${e.dst}`)) {
         out.push({
-          key: `${e.src}::${e.dst}::${e.kind}`,
+          key: `${e.srcKind}:${e.src}::${e.dstKind}:${e.dst}::${e.kind}`,
           src: e.src,
           dst: e.dst,
           kind: e.kind,

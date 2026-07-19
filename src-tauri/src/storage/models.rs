@@ -143,14 +143,19 @@ impl FullGraphEdgeKind {
 }
 
 /// One TYPED edge in the full-brain graph. `src`/`dst` are node ids that MUST both be present in
-/// the returned `nodes` (BOTH-endpoint-gated — an edge to a sealed node is never emitted). `status`
-/// is `active` for deterministic edges (co-occurrence/mention/wikilink/companion + accepted
-/// semantic) and `suggested` for un-accepted semantic edges (only present when the opts flag is on).
+/// the returned `nodes` (BOTH-endpoint-gated — an edge to a sealed node is never emitted).
+/// `src_kind`/`dst_kind` carry the ENDPOINT node kinds the backend gated on (PR-9 F4): a links edge
+/// can connect `meeting↔note`, so the endpoint kinds are NOT derivable from `kind` alone, and the FE
+/// must match endpoints by `(kind, id)` — not bare `id` — to be safe against a cross-kind id
+/// collision. `status` is `active` for deterministic edges (co-occurrence/mention/wikilink/companion
+/// + accepted semantic) and `suggested` for un-accepted semantic edges (only when the opts flag is on).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FullGraphEdge {
     pub src: String,
     pub dst: String,
+    pub src_kind: FullGraphNodeKind,
+    pub dst_kind: FullGraphNodeKind,
     pub kind: FullGraphEdgeKind,
     pub score: f64,
     pub status: String,
@@ -170,7 +175,10 @@ pub struct FullGraphOpts {
 /// disclosure the entity graph makes. `has_hidden` is true when ≥1 folder is sealed-and-not-unlocked
 /// (some nodes/edges may be hidden). `total_visible_nodes` is the TRUE count of visible nodes BEFORE
 /// the per-kind render caps trimmed `nodes` — `total_visible_nodes > nodes.len()` means a cap
-/// dropped rows (distinct from `has_hidden`, which only reflects LOCKED folders).
+/// dropped rows (distinct from `has_hidden`, which only reflects LOCKED folders). `edges_truncated`
+/// (PR-9 F2) is true when an EDGE-leg cap (the mention or links LIMIT) trimmed edges, so the FE can
+/// disclose "some links are hidden" — distinct from `total_visible_nodes` (a node-leg cap) and
+/// `has_hidden` (a locked folder).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FullGraphData {
@@ -178,6 +186,7 @@ pub struct FullGraphData {
     pub edges: Vec<FullGraphEdge>,
     pub has_hidden: bool,
     pub total_visible_nodes: i64,
+    pub edges_truncated: bool,
 }
 
 /// A co-occurring neighbor of a selected entity (the neighborhood satellites), with the
