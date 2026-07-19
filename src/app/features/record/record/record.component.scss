@@ -2,21 +2,25 @@
   display: flex;
   flex-direction: column;
   gap: var(--space-4);
-  /* Fill the routed viewport so the conversation thread can grow to the
-     bottom (conversation-first). The host is the flex parent. */
-  min-height: calc(100vh - var(--space-8));
+  /* Fill the routed viewport (conversation-first). CORRECT the fill so it never
+     overflows: cancel the chrome ABOVE the surface (main-col margin 10px + tab strip +
+     app-main's top padding --space-7); the old `calc(100vh - --space-8)` ignored all of
+     that and forced the surface ~--space-7 too tall (a permanent bottom overflow, worst
+     on small screens). A negative bottom margin cancels app-main's bottom padding so the
+     footer / last card can reach the window bottom. Mirrors the note-editor :host math. */
+  min-height: calc(100vh - 10px - var(--tabs-strip-height, 0px) - var(--space-7));
+  margin-bottom: calc(-1 * var(--space-8));
   animation: rise 420ms var(--transition) both;
 }
 
-/* While recording, BOUND the surface to the viewport so the whole thing (top bar →
-   notepad → footer HUD) fits with NO page scroll — the note scrolls INTERNALLY. Mirrors
-   the note-editor's proven fill-the-pane calc (cancel app-main's top padding + tab strip)
-   + a negative bottom margin to cancel app-main's bottom padding so the footer reaches
-   the window bottom. Idle/done keep the min-height above (their stacked cards may scroll). */
-.record.is-recording {
+/* When the note is the ACTIVE writing surface (recording / an in-flight pipeline with
+   the companion note visible — see boundToViewport), BOUND the height so the whole thing
+   (top bar → notepad → footer HUD) fits with NO page scroll and the note scrolls
+   INTERNALLY. The "done" review state stays unbounded (min-height above) so its stacked
+   Brain-reveal / Re-Truth cards can scroll. */
+.record.is-bounded {
   height: calc(100vh - 10px - var(--tabs-strip-height, 0px) - var(--space-7));
   min-height: 0;
-  margin-bottom: calc(-1 * var(--space-8));
 }
 
 /* ── The conversation thread = the full-height main surface ─────────── */

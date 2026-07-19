@@ -1,4 +1,4 @@
-<section class="record" [class.is-recording]="store.isRecording()">
+<section class="record" [class.is-bounded]="boundToViewport()">
   @if (modelPresent() === false) {
     <div class="banner is-accent model-banner" role="alert">
       <span class="banner-icon" aria-hidden="true">↓</span>

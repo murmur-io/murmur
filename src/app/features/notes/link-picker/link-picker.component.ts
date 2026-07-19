@@ -92,6 +92,14 @@ export class LinkPickerComponent {
   readonly query = input<string>("");
   /** Which row is keyboard-highlighted, owned by the host. */
   readonly activeIndex = input<number>(0);
+  /**
+   * The ANCHOR item this picker links FROM — excluded from its own candidate list so a user can
+   * never pick the item they're already on (`list_link_candidates` is anchor-agnostic and would
+   * otherwise surface the current meeting/note in its own list, where picking it hit the self-link
+   * guard with a misleading toast). `null` (the default) excludes nothing.
+   */
+  readonly excludeKind = input<string | null>(null);
+  readonly excludeId = input<string | null>(null);
 
   /** A candidate was picked (click) — the host inserts `[[title]]` at the trigger position. */
   readonly picked = output<NoteCitation>();
@@ -156,15 +164,28 @@ export class LinkPickerComponent {
     this.destroyRef.onDestroy(() => this.debounce.cancel(DEBOUNCE_KEY));
   }
 
+  /** Drop the anchor item (the thing this picker links FROM) so it can't be picked as its own target. */
+  private withoutAnchor(rows: NoteCitation[]): NoteCitation[] {
+    const k = this.excludeKind();
+    const i = this.excludeId();
+    if (!k || !i) {
+      return rows;
+    }
+    return rows.filter((r) => !(r.kind === k && r.id === i));
+  }
+
   private async fetch(q: string): Promise<void> {
     const seq = ++this.requestSeq;
     this._loading.set(true);
     try {
-      const rows = await this.ipc.listLinkCandidates(q, 0, PAGE_SIZE);
+      const raw = await this.ipc.listLinkCandidates(q, 0, PAGE_SIZE);
       if (seq !== this.requestSeq) {
         return; // superseded by a newer query.
       }
-      this.hasMore = rows.length === PAGE_SIZE;
+      // `hasMore` keys on the RAW page length (the backend paginates the unfiltered list); the
+      // anchor is dropped only from what we display, so a full raw page still means "more to load".
+      this.hasMore = raw.length === PAGE_SIZE;
+      const rows = this.withoutAnchor(raw);
       this.candidates.set(rows);
       this.candidatesChange.emit(rows);
       // The list height changed (fresh page) — re-fit around the caret so a
@@ -195,7 +216,7 @@ export class LinkPickerComponent {
     const seq = this.requestSeq;
     this.loadingMore = true;
     try {
-      const page = await this.ipc.listLinkCandidates(
+      const rawPage = await this.ipc.listLinkCandidates(
         this.query(),
         this.candidates().length,
         PAGE_SIZE,
@@ -203,7 +224,8 @@ export class LinkPickerComponent {
       if (seq !== this.requestSeq) {
         return; // a newer query reset the list while this page was in flight.
       }
-      this.hasMore = page.length === PAGE_SIZE;
+      this.hasMore = rawPage.length === PAGE_SIZE;
+      const page = this.withoutAnchor(rawPage);
       // Dedupe on append: a row that shifted pages mid-scroll (e.g. a title
       // edit reordered recency) must not repeat — the template's
       // `track c.kind + c.id` requires unique keys.
