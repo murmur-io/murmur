@@ -1687,12 +1687,14 @@ async fn summarize_and_export(
         tracing::warn!(target: "graph", error = %e, "graph entity persist failed (note export unaffected)");
     }
 
-    // Stage 2 / Lane A — DEFERRED, best-effort cross-meeting LINKING. Runs AFTER the note reaches
-    // `Exported` so the first `.md` is written promptly; the `[[links]]` + Related block land seconds
-    // later on a DB-canonical re-persist + re-export. Fully LOCAL (ZERO egress) + lock/seal-safe (see
-    // `link_related_notes_inner`), so it is auto-eligible on finalize. It must NEVER fail or delay the
-    // pipeline: a detached worker (the same `std::thread::spawn` + `app.state::<AppState>()` shape the
-    // proactive/reactions workers use), any error swallowed with an IDs-only log (no PII).
+    // Stage 2 / Lane A — DEFERRED cross-meeting LINKING trigger. `link_related_notes_inner` is now a
+    // NO-OP: the machine `murmur:links` Related block it used to append to the note body was retired
+    // (it went stale + rendered as raw junk in the editor; the RELATED panel reads the live `links`
+    // table instead, kept fresh by the deterministic wikilink/semantic index hooks on every save). The
+    // detached-worker call site is kept (a stable no-op) so no wiring churns and a future re-link
+    // surface has a seam. It must NEVER fail or delay the pipeline: a detached worker (the same
+    // `std::thread::spawn` + `app.state::<AppState>()` shape the proactive/reactions workers use), any
+    // error swallowed with an IDs-only log (no PII).
     {
         let app_bg = app.clone();
         let mid = meeting_id.to_string();

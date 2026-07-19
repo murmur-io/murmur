@@ -272,6 +272,19 @@ pub(crate) fn get_note_inner(state: &AppState, id: &str) -> Result<NoteDoc, AppE
         return Ok(masked_note_doc(&row)); // sealed-not-unlocked ⇒ masked, never the stored text.
     }
     let mut doc = note_doc_from_row(&row);
+    // Strip any machine-managed `murmur:links` block (retired — it went stale + rendered as raw junk
+    // in the plain-text editor; the RELATED panel reads the live `links` table instead). The strip is
+    // FENCE-DELIMITED and HEADER-GATED: `strip_managed_links_block` removes the `<!-- murmur:links
+    // -->…<!-- /murmur:links -->` region ONLY when its first body line is the exact machine callout
+    // header `> [!related]- Related notes`, so a fence a USER typed/pasted into their own prose (real
+    // text between the markers, no `[!related]` header) is left BYTE-IDENTICAL — never eaten and then
+    // persisted by the editor's debounced autosave (owned-file data loss). Never touches user prose
+    // or front-matter. Editor + Preview see prose-only, and the FE editor's next save writes back the
+    // stripped body → a real block leaves the DB naturally (no migration, no bulk rewrite). NOTE this
+    // runs ONLY on the VISIBLE/unlocked path; the masked-sealed DTO already returned above with NO
+    // body, so no strip is ever attempted on sealed text. `murmur:context` (the connector-context
+    // block) is a DISTINCT fence and is left untouched — only the link block is stripped.
+    doc.markdown = crate::enrich::strip_managed_links_block(&doc.markdown);
     doc.shared = state.db.note_has_active_share(&row.id)?; // WP6 — active-share flag.
     Ok(doc)
 }

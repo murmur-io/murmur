@@ -3,8 +3,8 @@
 //! body is UNCHANGED, only relocated). This is the link domain: `link_related_notes` (the manual
 //! Stage-2 re-link trigger), `link_meeting_entities` (entity extraction + graph persist),
 //! `list_links`, `accept_link`, `dismiss_link`, `link_items`, `unlink_items`, `resolve_wikilink`,
-//! `list_link_candidates`, plus the link-only helpers (`parse_link_kind`, `materialize_accepted_link`,
-//! `merge_related_hit`, `link_endpoint_is_unlocked`, `strip_manual_link_marker`).
+//! `list_link_candidates`, plus the link-only helpers (`parse_link_kind`,
+//! `link_endpoint_is_unlocked`, `strip_manual_link_marker`).
 //!
 //! LOCK-MODEL (byte-identical to the pre-move form): every READ gates — `list_links` returns edges
 //! only when BOTH endpoints are session-VISIBLE (`Db::links_for_visible`, no existence leak),
@@ -12,12 +12,16 @@
 //! `search_org_brain_hits` (a sealed-not-unlocked target stays "not found"). Every WRITE gates BEFORE
 //! mutating: `accept_link`/`dismiss_link` refuse anything but a `semantic`+`suggested` edge and gate
 //! BOTH endpoints (`link_endpoint_is_unlocked`, fail-closed on a sealed/unknown endpoint —
-//! `AppError::Locked`); `link_items`/`unlink_items` gate both endpoints before the row write. The
-//! `accept_link_inner`/`link_items_inner`/`unlink_items_inner` bodies keep their EXACT scoped-
-//! lifecycle-guard shape (the guard is scoped in a `{ }` block RELEASED before the note-body
-//! materialize, because that callee re-takes the non-reentrant `Mutex<()>` — composing them under one
-//! held guard would self-DEADLOCK; the deadlock fix is preserved verbatim). `link_meeting_entities`
-//! READ-GATES the meeting's note (`meeting_is_unlocked`) before any extraction/egress.
+//! `AppError::Locked`); `link_items`/`unlink_items` gate both endpoints before the row write.
+//! `link_items`/`accept_link` are GRAPH-ONLY (they persist/flip the edge and write NO note body) —
+//! the machine `murmur:links` block that used to mirror links into a note body was removed (it went
+//! stale + rendered as raw junk in the plain-text editor; the live `links` table drives the Related
+//! panel). `unlink_items` still strips any PRE-EXISTING manual `[[Title]]` marker via
+//! `strip_manual_link_marker`, whose `update_note_doc_inner` write re-takes the non-reentrant
+//! `Mutex<()>` — so its lifecycle guard is scoped in a `{ }` block RELEASED before that strip
+//! (composing them under one held guard would self-DEADLOCK; the deadlock discipline is preserved).
+//! `link_meeting_entities` READ-GATES the meeting's note (`meeting_is_unlocked`) before any
+//! extraction/egress.
 //!
 //! The SHARED write-time index hooks (`index_wikilinks_best_effort`, `auto_link_semantic_best_effort`
 //! — called from every note-save funnel), the unlock re-derive (`rederive_links_for_folder` — called
@@ -101,31 +105,30 @@ pub fn list_links(
 }
 
 /// Brain v3 PR-3 — ACCEPT a suggested (semantic) link: flip it `status='active'`,
-/// `created_by='accepted'`, AND materialize the neighbour's `[[Title]]` into whichever endpoint is a
-/// locally-owned, session-visible note (via the managed `apply_link_markers` block — the ONLY path
-/// that writes a semantic link into a `.md`; the auto pass never does).
+/// `created_by='accepted'`. GRAPH-ONLY — the accept writes NO note body. (It used to also
+/// materialize the neighbour's `[[Title]]` into an owned note's managed `murmur:links` block; that
+/// block was removed — it went stale + rendered as raw junk in the plain-text editor. The live
+/// `links` table drives the Related panel, so the flipped edge alone is the surface.)
 ///
 /// GATED (PR-5): accept is ONLY for an unconfirmed SUGGESTION (`edge_type='semantic'`,
 /// `status='suggested'`) — anything else (a deterministic wikilink/companion, an already-active
 /// manual/accepted, or a dismissed tombstone) is refused `InvalidArg`. BOTH endpoints must be
 /// session-visible (`link_endpoint_is_unlocked` on each) — if EITHER is sealed-and-not-unlocked the
 /// accept is refused `AppError::Locked` (never activate an edge behind a lock, never reveal a locked
-/// neighbour by materializing a link to it). Idempotent (re-accepting an already-active edge is a
-/// no-op; the DB DO-UPDATE guard never downgrades it). The materialized marker is preserved across a
-/// later neighbour-seal and re-materialized on unlock (brain-v3 audit Fix 1/Fix 4).
+/// neighbour). Idempotent (re-accepting an already-active edge is a no-op; the DB DO-UPDATE guard
+/// never downgrades it).
 #[tauri::command]
 pub fn accept_link(state: State<'_, AppState>, id: i64) -> Result<(), AppError> {
     accept_link_inner(state.inner(), id)
 }
 
 pub(crate) fn accept_link_inner(state: &AppState, id: i64) -> Result<(), AppError> {
-    // BLK-1 / TOCTOU + non-reentrant guard: SCOPE the lifecycle guard tightly around validate + gate
-    // + row-flip so a concurrent lock/relock cannot land between the endpoint gate and the flip. It is
-    // RELEASED before the note-body materialize below — `materialize_accepted_link` →
-    // `update_note_inner`/`update_note_doc_inner` take the guard THEMSELVES, so composing them under one
-    // held guard re-enters the non-reentrant `Mutex<()>` and self-DEADLOCKS on a valid accept (mirrors
-    // `link_items_inner`/`unlink_items_inner`). Lock order `lifecycle ⊃ db`.
-    let (src_kind, src_id, dst_kind, dst_id) = {
+    // BLK-1 / TOCTOU: SCOPE the lifecycle guard tightly around validate + gate + row-flip so a
+    // concurrent lock/relock cannot land between the endpoint gate and the flip. The accept is
+    // GRAPH-ONLY now (no note-body materialize), so nothing after the guard re-takes the
+    // non-reentrant `Mutex<()>` — but the tight scope is kept (fail-closed + no wider hold than the
+    // check-then-write needs). Lock order `lifecycle ⊃ db`.
+    {
         let _lifecycle = lifecycle_guard(state);
         let Some((src_kind, src_id, dst_kind, dst_id, et, status)) = state.db.link_by_id(id)? else {
             return Err(AppError::InvalidArg(format!("no link {id}")));
@@ -153,117 +156,16 @@ pub(crate) fn accept_link_inner(state: &AppState, id: i64) -> Result<(), AppErro
                 "one of these items is locked — unlock it to accept the link".into(),
             ));
         }
-        // Flip the row first: the graph edge is active even if the .md materialize below is skipped
-        // (e.g. neither endpoint is a locally-owned editable note). The panel reflects the accept.
+        // Flip the row active — that edge is the AUTHORITATIVE link. The accept is GRAPH-ONLY: we do
+        // NOT materialize the neighbour's `[[Title]]` / `murmur:links` block into any note body (that
+        // machine block was removed — it went stale, its wikilinks are excluded from edge-indexing,
+        // and it rendered as raw junk in the plain-text editor). The live `links` table drives the
+        // Related panel, so the flipped edge alone is the surface; any pre-existing block is stripped
+        // on the next `get_note` read (natural save-time cleanup).
         state.db.accept_link(id)?;
-        (src_kind, src_id, dst_kind, dst_id)
-    }; // ── lifecycle guard RELEASED here, before materialize (which re-takes it) ──
-    let unlocked = unlocked_snapshot(state)?;
-    // A semantic edge is undirected — materialize the neighbour's [[Title]] into whichever endpoint
-    // is a LOCAL, session-VISIBLE note we own the markdown of. Try src's note first, then dst's.
-    // Best-effort: a materialize skip/failure never rolls back the accept.
-    let endpoints = [
-        (src_kind.as_str(), src_id.as_str(), dst_kind.as_str(), dst_id.as_str()),
-        (dst_kind.as_str(), dst_id.as_str(), src_kind.as_str(), src_id.as_str()),
-    ];
-    for (owner_k, owner_id, other_k, other_id) in endpoints {
-        let (Some(owner_kind), Some(other_kind)) = (
-            crate::links::LinkKind::parse(owner_k),
-            crate::links::LinkKind::parse(other_k),
-        ) else {
-            continue;
-        };
-        // Resolve the neighbour's current gated title; skip if the neighbour is sealed (no leak).
-        let Some(title) =
-            state.db.link_endpoint_title_visible(other_kind, other_id, &unlocked)?
-        else {
-            continue;
-        };
-        if materialize_accepted_link(state, owner_kind, owner_id, &title)? {
-            break; // wrote (or found already-present) in one owned, visible source — done.
-        }
     }
     tracing::info!(target: "links", link_id = id, "accept_link");
     Ok(())
-}
-
-/// Materialize the accepted neighbour's `[[Title]]` into the OWNER `(kind, id)`'s markdown via the
-/// managed `apply_link_markers` block — but ONLY when the owner is a LOCAL, session-VISIBLE note we
-/// own the markdown of (a meeting AI note, or an authored note). Returns `true` when the owner IS
-/// such a note (whether it wrote or the link was already present), `false` when the owner is not a
-/// writable/visible target (the caller then tries the other endpoint). Merges with the related-notes
-/// hits already rendered in the block so the auto block is preserved.
-fn materialize_accepted_link(
-    state: &AppState,
-    kind: crate::links::LinkKind,
-    id: &str,
-    title: &str,
-) -> Result<bool, AppError> {
-    let hit = crate::enrich::ContextHit {
-        source: match kind {
-            crate::links::LinkKind::Meeting => "meeting",
-            _ => "note",
-        }
-        .to_string(),
-        detail: format!("[[{title}]]"),
-        url: None,
-    };
-    match kind {
-        crate::links::LinkKind::Meeting => {
-            // GATE: the meeting's note must be session-visible to write plaintext.
-            if !meeting_is_unlocked(state, id)? {
-                return Ok(false);
-            }
-            let Some(existing) = state.db.get_latest_note_for_meeting(id)? else {
-                return Ok(false);
-            };
-            // Skip a sealed (blob-present) note (the seal-safety gate `link_related_notes_inner` uses).
-            let sealed = state
-                .db
-                .sealable_notes_for_meeting(id)?
-                .iter()
-                .any(|n| n.content_blob.is_some());
-            if sealed {
-                return Ok(false);
-            }
-            let merged = merge_related_hit(&existing.markdown, hit);
-            if merged != existing.markdown {
-                update_note_inner(state, id, &merged)?;
-            }
-            Ok(true)
-        }
-        crate::links::LinkKind::Note | crate::links::LinkKind::Document => {
-            let Some(row) = state.db.get_note_row(id)? else {
-                return Ok(false); // a raw document has no editable note markdown here.
-            };
-            if !folder_is_unlocked(state, &row.folder_id)? {
-                return Ok(false);
-            }
-            let title_disp = row
-                .title
-                .clone()
-                .filter(|t| !t.is_empty())
-                .unwrap_or_else(|| row.name.clone());
-            let merged = merge_related_hit(&row.text, hit);
-            if merged != row.text {
-                update_note_doc_inner(state, id, &title_disp, &merged)?;
-            }
-            Ok(true)
-        }
-    }
-}
-
-/// Append ONE `[[Title]]` [`ContextHit`] to a note's managed `murmur:links` block WITHOUT dropping
-/// any related-notes hits already rendered there. `apply_link_markers` is a full-block REPLACE, so we
-/// re-collect the existing rendered hits ([`crate::enrich::extract_link_hits`]), add the new one
-/// (deduped by rendered detail), and re-apply — the block stays idempotent and the auto related-notes
-/// entries survive an accept.
-fn merge_related_hit(markdown: &str, new_hit: crate::enrich::ContextHit) -> String {
-    let mut hits = crate::enrich::extract_link_hits(markdown);
-    if !hits.iter().any(|h| h.detail == new_hit.detail) {
-        hits.push(new_hit);
-    }
-    crate::enrich::apply_link_markers(markdown, &hits)
 }
 
 /// Brain v3 PR-3 — DISMISS a suggested link: TOMBSTONE it so no later auto pass re-suggests it. No
@@ -312,8 +214,8 @@ pub(crate) fn dismiss_link_inner(state: &AppState, id: i64) -> Result<(), AppErr
     Ok(())
 }
 
-/// note↔meeting-links PR-1 — is a link ENDPOINT `(kind, id)` session-VISIBLE right now? Mirrors
-/// [`materialize_accepted_link`]'s gate order: a `Meeting` endpoint gates on [`meeting_is_unlocked`];
+/// note↔meeting-links PR-1 — is a link ENDPOINT `(kind, id)` session-VISIBLE right now? Gate order:
+/// a `Meeting` endpoint gates on [`meeting_is_unlocked`];
 /// a `Note`/`Document` endpoint resolves its owning folder via `get_note_row` and gates on
 /// [`folder_is_unlocked`]. An UNKNOWN endpoint (no such note/document) reports `false` — fail-closed,
 /// there is nothing legitimate to link. Used by `link_items`/`unlink_items` to refuse `AppError::Locked`
@@ -343,8 +245,8 @@ fn link_endpoint_is_unlocked(
     }
 }
 
-/// note↔meeting-links PR-1 — USER-INITIATED link: persist ONE directed `manual` edge
-/// `(src → dst)` AND, when the source is an OWNED note, materialize `[[dst Title]]` into its body.
+/// note↔meeting-links PR-1 — USER-INITIATED link: persist ONE directed `manual` edge `(src → dst)`.
+/// GRAPH-ONLY — writes NO note body.
 ///
 /// GATE (BEFORE any write): BOTH endpoints must be session-VISIBLE — a `meeting` via
 /// [`meeting_is_unlocked`], a `note`/`document` via its folder ([`folder_is_unlocked`]). If either is
@@ -352,11 +254,9 @@ fn link_endpoint_is_unlocked(
 /// locked neighbour). Unknown kinds are `AppError::InvalidArg`.
 ///
 /// The `manual` row (`created_by='user'`, `status='active'`, `score=1.0`) is idempotent on the
-/// table's UNIQUE key. For a `note` SOURCE we own the markdown of, we ALSO materialize the neighbour's
-/// gated `[[Title]]` into the managed `murmur:links` block via the SAME [`materialize_accepted_link`]
-/// path the accept command uses — best-effort (a materialize skip never rolls back the row). A
-/// `meeting`/`document` source (no owned editable body) creates the row ONLY. The materialized
-/// wikilink is display-deduped against the manual edge in `links_for_visible`.
+/// table's UNIQUE key. It is the AUTHORITATIVE record of the link; the live `links` table drives the
+/// Related panel. We DO NOT write the neighbour's `[[Title]]` / `murmur:links` block into a note body
+/// — that machine block was removed (it went stale + rendered as raw junk in the plain-text editor).
 #[tauri::command]
 pub fn link_items(
     state: State<'_, AppState>,
@@ -402,26 +302,12 @@ pub(crate) fn link_items_inner(
             .db
             .upsert_manual_link(src.as_str(), src_id, dst.as_str(), dst_id)?;
     }
-    // ── Fork #2: a NOTE source ALSO gets the neighbour's [[Title]] in its body (best-effort). ──
-    // A meeting/document source has no owned editable markdown → row only. `materialize_accepted_link`
-    // re-gates the source folder itself before writing plaintext (never behind a lock).
-    if matches!(src, crate::links::LinkKind::Note) {
-        let unlocked = unlocked_snapshot(state)?;
-        // Resolve the dst's CURRENT gated title (skip if sealed — no leak; the gate above already
-        // proved it visible, so this normally resolves).
-        if let Some(title) = state.db.link_endpoint_title_visible(dst, dst_id, &unlocked)? {
-            // Reuse the EXACT accept-materialize path (managed `murmur:links` block, merge-preserving).
-            if let Err(e) = materialize_accepted_link(state, src, src_id, &title) {
-                // Best-effort: the graph row is authoritative; a markdown-write failure never fails the
-                // link (no PII — ids/error only).
-                tracing::warn!(
-                    target: "links",
-                    error = %e,
-                    "manual link materialize skipped (row persisted)"
-                );
-            }
-        }
-    }
+    // The manual edge is the AUTHORITATIVE record of the link — the live `links` table drives the
+    // Related panel. We DO NOT materialize a `[[Title]]` / `murmur:links` block into the note body:
+    // that machine block existed only to surface links inside Obsidian, but it went stale (its
+    // wikilinks are excluded from edge-indexing) and showed as raw junk in the plain-text editor.
+    // Stop writing it here; the edge is created exactly as before. Existing blocks are stripped on
+    // the next read via `get_note` (natural save-time cleanup). See `commands/notes.rs::get_note_inner`.
     tracing::info!(
         target: "links",
         src_kind = src.as_str(),
@@ -498,12 +384,13 @@ pub(crate) fn unlink_items_inner(
     Ok(())
 }
 
-/// note↔meeting-links PR-1 — remove ONE `[[title]]` [`ContextHit`] from an owned note's managed
-/// `murmur:links` block, re-applying the block with that hit filtered out (the INVERSE of
-/// [`merge_related_hit`]). Reuses [`crate::enrich::extract_link_hits`] +
-/// [`crate::enrich::apply_link_markers`] so the block stays idempotent and any auto related-notes /
-/// accepted-semantic hits that lived alongside it survive. WRITE-GATED via `update_note_doc_inner`
-/// (refuses a sealed folder). A no-op (the note is unchanged) when the block never carried the hit.
+/// note↔meeting-links PR-1 — LEGACY CLEANUP: remove ONE `[[title]]` [`ContextHit`] from an owned
+/// note's PRE-EXISTING managed `murmur:links` block (imported before the block was retired), re-
+/// applying the block with that hit filtered out. Reuses [`crate::enrich::extract_link_hits`] +
+/// [`crate::enrich::apply_link_markers`] so any other hits that lived alongside it survive and the
+/// block strips to nothing once its last hit is removed. WRITE-GATED via `update_note_doc_inner`
+/// (refuses a sealed folder). A no-op (the note is unchanged) when the block never carried the hit —
+/// which is the common case now, since `link_items` no longer WRITES the marker.
 fn strip_manual_link_marker(state: &AppState, note_id: &str, title: &str) -> Result<(), AppError> {
     let Some(row) = state.db.get_note_row(note_id)? else {
         return Ok(()); // no owned note markdown → nothing to strip.
