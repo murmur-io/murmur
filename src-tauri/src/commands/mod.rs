@@ -8,19 +8,29 @@ use crate::events::{StatusPayload, EVENT_STATUS};
 use crate::settings::{AppConfig, BrainBackend};
 use crate::state::AppState;
 use crate::storage::models::{
-    ActionItem, Analytics, AskVaultResult, BrainOverview, BuiltinRecipe, CalendarContext,
+    ActionItem, Analytics, AskVaultResult, BrainOverview, CalendarContext,
     CalendarEvent, CalendarEventFull, ChatTurn, Commitment, DigestResult, DocumentInfo,
     EntityDetail, EntityDossierResult, Folder, FolderNode, FullGraphData, FullGraphOpts, GraphData,
     Meeting,
     MeetingActionSummary, MeetingStatus, MeetingTimeline, NoteAssistRequest, NoteAssistResult,
     NoteCitation, NoteDoc, NoteFolder, NoteRecord, NoteSummary, OrganizeMove, OrganizePlan,
-    PeopleList, PinResult, PropertyKind, PropertySchemaField, RecipeRecord, SavedView, SearchHit,
+    PeopleList, PinResult, PropertyKind, PropertySchemaField, SearchHit,
     TopicThread, TypedNoteRow,
 };
 use crate::summarize::all_providers;
 use crate::transcribe::types::Segment;
 use crate::{pipeline, secrets};
 use tauri::Emitter;
+
+// ── Command submodules (God-file split) ─────────────────────────────────────────────────────────
+// `commands` is being decomposed into per-domain files under `commands/`. Each submodule is
+// glob-re-exported here so EVERY existing path — `generate_handler![commands::save_recipe]` in
+// `lib.rs`, and any `crate::commands::…` caller — resolves UNCHANGED. The file is
+// `commands/pipeline.rs` but bound under the name `pipeline_commands` to avoid colliding with the
+// crate-level `pipeline` module imported above (`use crate::{pipeline, secrets};`).
+#[path = "pipeline.rs"]
+mod pipeline_commands;
+pub use pipeline_commands::*;
 
 /// Keychain account for the Anthropic API key (matches `summarize::ANTHROPIC_KEY_ACCOUNT`).
 const ANTHROPIC_KEY_ACCOUNT: &str = "anthropic_api_key";
@@ -5869,163 +5879,6 @@ pub fn list_meetings_by_tag(
 fn list_meetings_by_tag_inner(state: &AppState, tag: &str) -> Result<Vec<Meeting>, AppError> {
     let meetings = state.db.list_meetings_by_tag(tag)?;
     mask_locked_meetings(state, meetings)
-}
-
-/// Built-in recipe templates (quick chips).
-#[tauri::command]
-pub fn list_builtin_recipes() -> Result<Vec<BuiltinRecipe>, AppError> {
-    Ok(crate::summarize::recipes::BUILTIN_RECIPES
-        .iter()
-        .map(|(id, label, prompt)| BuiltinRecipe {
-            id: id.to_string(),
-            label: label.to_string(),
-            prompt: prompt.to_string(),
-        })
-        .collect())
-}
-
-/// User-saved recipe templates.
-#[tauri::command]
-pub fn list_saved_recipes(state: State<'_, AppState>) -> Result<Vec<RecipeRecord>, AppError> {
-    state.db.list_saved_recipes()
-}
-
-/// Save a recipe template (prompt + title).
-#[tauri::command]
-pub fn save_recipe(
-    state: State<'_, AppState>,
-    title: String,
-    prompt: String,
-) -> Result<RecipeRecord, AppError> {
-    let title = title.trim();
-    let prompt = prompt.trim();
-    if title.is_empty() || prompt.is_empty() {
-        return Err(AppError::InvalidArg(
-            "recipe title and prompt are required".into(),
-        ));
-    }
-    let rec = RecipeRecord {
-        id: uuid::Uuid::new_v4().to_string(),
-        title: title.to_string(),
-        prompt: prompt.to_string(),
-        created_at: chrono::Utc::now().to_rfc3339(),
-    };
-    state.db.insert_recipe(&rec)?;
-    Ok(rec)
-}
-
-/// Delete a saved recipe.
-#[tauri::command]
-pub fn delete_recipe(state: State<'_, AppState>, id: String) -> Result<(), AppError> {
-    state.db.delete_recipe(&id)
-}
-
-// ── Saved views (Feature B — "Saved views over the meetings list") ─────────────────────────────
-//
-// LOCK-SECURITY NOTE: the four saved-view commands below (`list_saved_views` / `upsert_saved_view`
-// / `delete_saved_view` / `reorder_saved_views`) are the ONE legitimate NEW-command case that is
-// NOT content-gated. They persist only a user's VIEW DEFINITION (an opaque FE-owned `config` JSON
-// blob + presentation fields) — single-user, non-shared metadata, exactly like the `saved_recipes`
-// commands. They store/return NO meeting content, so there is nothing sealed to leak. The ACTUAL
-// content aggregation the meetings surface consumes is `list_meeting_action_summaries`, which IS
-// gated (routes through `unlocked_snapshot` → the gated `Db::list_meeting_action_summaries`).
-
-/// The valid saved-view scopes — one per list surface. A scope not in this set is rejected as an
-/// argument error so a typo can't quietly create an un-listable orphan row. `"notes"` was added
-/// 2026-07-14 (Saved Views ported to the Notes surface, mirroring Meetings).
-const SAVED_VIEW_SCOPE_MEETINGS: &str = "meetings";
-const SAVED_VIEW_SCOPE_NOTES: &str = "notes";
-
-/// Whether `scope` names a list surface that supports saved views.
-fn is_valid_saved_view_scope(scope: &str) -> bool {
-    scope == SAVED_VIEW_SCOPE_MEETINGS || scope == SAVED_VIEW_SCOPE_NOTES
-}
-
-/// List the user's saved views for a list surface (`scope` = "meetings"). NOT content-gated: view
-/// metadata only (see the LOCK-SECURITY NOTE above).
-#[tauri::command]
-pub fn list_saved_views(
-    state: State<'_, AppState>,
-    scope: String,
-) -> Result<Vec<SavedView>, AppError> {
-    if !is_valid_saved_view_scope(&scope) {
-        return Err(AppError::InvalidArg(format!(
-            "unsupported saved-view scope: {scope}"
-        )));
-    }
-    state.db.list_saved_views(&scope)
-}
-
-/// Create or update a saved view. On FIRST save (empty `id`) the server generates the id +
-/// `created_at`; `updated_at` is always stamped server-side. Trims + rejects empty name/scope/layout
-/// as an argument error. NOT content-gated: view metadata only (see the LOCK-SECURITY NOTE above).
-#[tauri::command]
-pub fn upsert_saved_view(
-    state: State<'_, AppState>,
-    view: SavedView,
-) -> Result<SavedView, AppError> {
-    let scope = view.scope.trim();
-    let name = view.name.trim();
-    let layout = view.layout.trim();
-    if !is_valid_saved_view_scope(scope) {
-        return Err(AppError::InvalidArg(format!(
-            "unsupported saved-view scope: {scope}"
-        )));
-    }
-    if name.is_empty() || layout.is_empty() {
-        return Err(AppError::InvalidArg(
-            "saved-view name and layout are required".into(),
-        ));
-    }
-    let now = chrono::Utc::now().to_rfc3339();
-    let id = view.id.trim();
-    let (id, created_at) = if id.is_empty() {
-        // First save: server-generate the id + creation timestamp.
-        (uuid::Uuid::new_v4().to_string(), now.clone())
-    } else {
-        // Edit: keep the caller's id; preserve the original created_at if we already have the row.
-        let created_at = state
-            .db
-            .list_saved_views(scope)?
-            .into_iter()
-            .find(|v| v.id == id)
-            .map(|v| v.created_at)
-            .unwrap_or_else(|| now.clone());
-        (id.to_string(), created_at)
-    };
-    let rec = SavedView {
-        id,
-        scope: scope.to_string(),
-        name: name.to_string(),
-        layout: layout.to_string(),
-        config: view.config,
-        sort_order: view.sort_order,
-        created_at,
-        updated_at: now,
-    };
-    state.db.upsert_saved_view(&rec)?;
-    Ok(rec)
-}
-
-/// Delete a saved view by id (idempotent). NOT content-gated: view metadata only.
-#[tauri::command]
-pub fn delete_saved_view(state: State<'_, AppState>, id: String) -> Result<(), AppError> {
-    state.db.delete_saved_view(&id)
-}
-
-/// Persist a user reordering of the saved views in a scope. NOT content-gated: view metadata only.
-#[tauri::command]
-pub fn reorder_saved_views(
-    state: State<'_, AppState>,
-    scope: String,
-    ordered_ids: Vec<String>,
-) -> Result<(), AppError> {
-    if !is_valid_saved_view_scope(&scope) {
-        return Err(AppError::InvalidArg(format!(
-            "unsupported saved-view scope: {scope}"
-        )));
-    }
-    state.db.reorder_saved_views(&scope, &ordered_ids)
 }
 
 /// Per-meeting open/done action-item counts across the VISIBLE library, for the saved-views meetings
@@ -19394,6 +19247,7 @@ mod lock_read_gate_tests {
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
+    use crate::storage::models::SavedView;
     use crate::storage::Db;
     use crate::transcribe::types::Segment;
     use std::collections::HashSet;
