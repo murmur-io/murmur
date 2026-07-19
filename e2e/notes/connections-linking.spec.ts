@@ -136,21 +136,25 @@ test("connections panel: × only on manual chips (unlink), + Link chooser links 
   const panel = page.locator("app-connections");
   await expect(panel).toBeVisible();
 
-  // Three chips render; the manual one has a × remove button, the others do not.
+  // Three chips render in the merged "Related" panel: the manual (removable) link,
+  // the auto companion link, and the semantic suggestion (an ambient dashed chip).
   await expect(panel.getByText("Manual Meeting Link")).toBeVisible();
   await expect(panel.getByText("Weekly plan")).toBeVisible();
   await expect(panel.getByText("A suggested note")).toBeVisible();
 
-  // Exactly ONE remove (×) button — on the manual chip only.
-  const removeButtons = panel.locator("button.cx-remove");
-  await expect(removeButtons).toHaveCount(1);
-  await expect(
-    panel.getByRole("button", { name: "Remove link to Manual Meeting Link" }),
-  ).toBeVisible();
+  // The MANUAL deterministic chip carries a "Remove link to …" × (unlink); the
+  // semantic suggestion carries a "Dismiss suggestion …" × instead (2026-07-19 IA:
+  // suggestions are ambient dashed chips — tap promotes, hover × dismisses — no
+  // persistent Accept/Dismiss buttons). Target by aria-label, not a bare .cx-remove
+  // count (both kinds now use the same hover-× visual).
+  const unlinkBtn = panel.getByRole("button", {
+    name: "Remove link to Manual Meeting Link",
+  });
+  await expect(unlinkBtn).toBeVisible();
 
   // Click the × → unlink_items(anchorKind=note, anchorId=n1, otherKind=meeting,
   // otherId=m-manual) is invoked, then the re-fetch drops the manual chip.
-  await removeButtons.first().click();
+  await unlinkBtn.click();
   await expect(panel.getByText("Manual Meeting Link")).toHaveCount(0);
 
   const afterUnlink = await page.evaluate(
@@ -169,7 +173,9 @@ test("connections panel: × only on manual chips (unlink), + Link chooser links 
   ]);
 
   // Open the + Link chooser → the query input + the opaque picker popover appear.
-  await panel.getByRole("button", { name: "Link" }).click();
+  // `exact` so the substring name doesn't also match a suggestion chip's
+  // "Add link to …" aria-label (2026-07-19 ambient suggestion chips are buttons).
+  await panel.getByRole("button", { name: "Link", exact: true }).click();
   await expect(panel.getByPlaceholder(/Link a meeting, note/)).toBeVisible();
   // The link-picker popover box is TELEPORTED to <body> (appTeleportToBody) —
   // locate it by class, not by the `app-link-picker` host.

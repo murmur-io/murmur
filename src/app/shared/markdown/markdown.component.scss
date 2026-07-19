@@ -139,17 +139,27 @@
   font-weight: 600;
 }
 .md-wikilink {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--space-1);
+  /* Overflow fix (2026-07-19): the citation pill must WRAP/BREAK inside its
+     container (e.g. the fixed-width Ask pane, `clamp(320px,30vw,400px)`) instead
+     of being one unbreakable `nowrap` box wider than the pane that bleeds past
+     its right edge. `inline` (not `inline-flex`) lets a long title flow onto the
+     next line; `white-space: normal` + `overflow-wrap: anywhere` break even an
+     unspaced run; `max-width: 100%` caps it to the pane. The 🔗 glyph stays
+     attached via `::before` (word-break rules keep it with the first word). */
+  display: inline;
   padding: 0.04em 0.5em;
   margin: 0 1px;
+  max-width: 100%;
   background: var(--accent-soft);
   color: var(--accent-hover);
   border-radius: var(--radius-pill);
   font-size: 0.9em;
   font-weight: 500;
-  white-space: nowrap;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  box-decoration-break: clone;
+  -webkit-box-decoration-break: clone;
   cursor: pointer;
   transition:
     background var(--transition-fast),
@@ -164,5 +174,6 @@
 .md-wikilink::before {
   content: "🔗";
   font-size: 0.82em;
+  margin-right: var(--space-1);
 }
-    
+
