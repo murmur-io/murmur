@@ -8,8 +8,10 @@ pub(crate) mod folders_store;
 pub(crate) mod graph_store;
 pub(crate) mod links;
 pub(crate) mod mcp_store;
+pub(crate) mod meetings_store;
 pub mod migration;
 pub mod models;
+pub(crate) mod notes_store;
 pub(crate) mod settings_store;
 pub mod usage;
 
