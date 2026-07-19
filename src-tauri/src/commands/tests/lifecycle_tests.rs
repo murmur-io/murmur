@@ -1,0 +1,15411 @@
+    use super::*;
+    use crate::storage::models::SavedView;
+    use crate::storage::Db;
+    use crate::transcribe::types::Segment;
+    use std::collections::HashSet;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex, Once};
+
+    // A fixed at-rest DB key (NOT the Keychain) — same shape the config tests use.
+    const DB_KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    // A fixed dev master KEK so lock/unlock/remove use a deterministic key WITHOUT the Keychain or a
+    // Touch ID prompt (the `MURMUR_DEV_KEK` debug-only escape hatch in `secrets::keychain`).
+    const DEV_KEK: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+
+    static KEK_ENV: Once = Once::new();
+    fn ensure_dev_kek() {
+        // Set once, before any thread reads it, so the concurrent readers only ever READ env.
+        KEK_ENV.call_once(|| std::env::set_var("MURMUR_DEV_KEK", DEV_KEK));
+    }
+
+    fn tmp_db_path(tag: &str) -> std::path::PathBuf {
+        let p = crate::storage::db::unique_temp_path(&format!("murmur-lifecycle-{tag}"), "sqlite");
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
+    /// Construct an [`AppState`] backed by a real temp SQLCipher DB, no Keychain, no Tauri. The
+    /// recorder/listeners are `None`; the config is the default (no vault → remove-lock skips
+    /// re-export, keeping the test filesystem-quiet).
+    fn build_state(tag: &str) -> AppState {
+        ensure_dev_kek();
+        let db = Arc::new(Db::open_with_key(&tmp_db_path(tag), DB_KEY).unwrap());
+        AppState {
+            recorder: Mutex::new(None),
+            system_recorder: Mutex::new(None),
+            aec_recorder: Mutex::new(None),
+            spill_writer: Mutex::new(None),
+            voice_listener: Mutex::new(None),
+            voice_command_capture: Mutex::new(None),
+            live_running: std::sync::atomic::AtomicBool::new(false),
+            db,
+            config: Arc::new(Mutex::new(AppConfig::default())),
+            reasoner: crate::reason::ReasonerCell::fixed(Arc::new(crate::reason::StubReasoner)),
+            current_meeting: Mutex::new(None),
+            focus_meeting: Mutex::new(None),
+            live_transcript: Mutex::new(String::new()),
+            live_bullets: Mutex::new(String::new()),
+            live_bullets_tracker: Mutex::new(crate::transcribe::bullets::BulletsTracker::default()),
+            capped_notified: std::sync::atomic::AtomicBool::new(false),
+            reactions_shadow_count: std::sync::atomic::AtomicU64::new(0),
+            reactions_emitted: Mutex::new(HashSet::new()),
+            in_flight_turns: Mutex::new(std::collections::HashMap::new()),
+            user_turn_in_progress: std::sync::atomic::AtomicBool::new(false),
+            verify_cache: Mutex::new(std::collections::HashMap::new()),
+            unlocked_folders: Arc::new(Mutex::new(HashSet::new())),
+            master_kek: Mutex::new(None),
+            org_ock_cache: Mutex::new(std::collections::HashMap::new()),
+            account_session: Mutex::new(None),
+            lifecycle: Mutex::new(()),
+            share_refresh_lock: tokio::sync::Mutex::new(()),
+            seal_epoch: std::sync::atomic::AtomicU64::new(0),
+            heavy_inference: Arc::new(tokio::sync::Semaphore::new(1)),
+        }
+    }
+
+    fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(f)
+    }
+
+    /// C2 (lifecycle-helper contract): `stop_all_capture` must clear EVERY capture slot to `None`
+    /// (deterministic `take()`) and be panic-free on an empty state. Combined with the C1 Drop tests
+    /// (which prove a taken recorder finalizes + reaps its helper), this is the exit-hook safety net:
+    /// after it runs, no capture path is left owned by `AppState`. The real SIGTERM of the Swift
+    /// helper only truly verifies on a signed build, so this asserts the DETERMINISTIC slot-clearing —
+    /// the seam the exit hook depends on.
+    #[test]
+    fn stop_all_capture_clears_every_capture_slot() {
+        let state = build_state("stop-all-capture");
+        // Sanity: fresh state has no recorders (a real recording would populate these).
+        assert!(state.recorder.lock().unwrap().is_none());
+        assert!(state.system_recorder.lock().unwrap().is_none());
+        assert!(state.aec_recorder.lock().unwrap().is_none());
+        assert!(state.spill_writer.lock().unwrap().is_none());
+
+        // Must not panic, and must leave every slot None.
+        stop_all_capture(&state);
+
+        assert!(
+            state.recorder.lock().unwrap().is_none(),
+            "mic recorder slot cleared"
+        );
+        assert!(
+            state.system_recorder.lock().unwrap().is_none(),
+            "system-audio recorder slot cleared"
+        );
+        assert!(
+            state.aec_recorder.lock().unwrap().is_none(),
+            "AEC recorder slot cleared"
+        );
+        assert!(
+            state.spill_writer.lock().unwrap().is_none(),
+            "spill writer slot cleared"
+        );
+    }
+
+    /// PHASE-4 lock gate (RED-before-GREEN): `verify_note_sources` + `apply_note_verify_markers` on a
+    /// SEALED-and-not-session-unlocked meeting MUST refuse with `AppError::Locked` BEFORE any note
+    /// read / connector egress — a locked note can neither be verified nor marker-written. Runs with
+    /// NO Jira configured, so once session-unlocked the verify falls through to the fail-closed
+    /// connector gate (`Unavailable`), proving `Locked` was the FIRST gate, not a downstream error.
+    #[test]
+    fn verify_commands_refuse_a_sealed_meeting() {
+        let state = build_state("verify-lockgate");
+        make_open_folder(&state.db, "f-vlock", "Secret");
+        state
+            .db
+            .insert_meeting(&Meeting {
+                id: "m-vlock".to_string(),
+                started_at: "2026-07-05T09:00:00Z".to_string(),
+                ended_at: None,
+                title: Some("Sprint".to_string()),
+                duration_s: 600,
+                audio_path: None,
+                status: MeetingStatus::Summarized,
+                folder_id: Some("f-vlock".to_string()),
+            })
+            .unwrap();
+        state
+            .db
+            .upsert_note(&NoteRecord {
+                meeting_id: "m-vlock".to_string(),
+                provider_id: "claude_code".to_string(),
+                markdown: "# N\n- Ship PROJ-1 by 2026-07-08\n".to_string(),
+                created_at: "2026-07-05T09:10:00Z".to_string(),
+                exported_path: None,
+                model_requested: None,
+                model_served: None,
+                gateway_host: None,
+            })
+            .unwrap();
+        state
+            .db
+            .set_note_folder("m-vlock", Some("f-vlock"))
+            .unwrap();
+        state
+            .db
+            .set_folder_locked("f-vlock", true, Some(&b"wrapped"[..]))
+            .unwrap();
+        // NOT session-unlocked: both commands fail closed with Locked.
+        let e1 = block_on(verify_note_sources_inner(&state, "m-vlock".to_string())).unwrap_err();
+        assert!(
+            matches!(e1, AppError::Locked(_)),
+            "verify must fail Locked, got: {e1:?}"
+        );
+        let finding = crate::verify::VerifyFinding {
+            line_no: 2,
+            key: "PROJ-1".into(),
+            verdict: crate::verify::Verdict::NotFound,
+            detail: "PROJ-1 not found in Jira".into(),
+            url: String::new(),
+        };
+        let e2 = apply_note_verify_markers_inner(&state, "m-vlock".to_string(), vec![finding])
+            .unwrap_err();
+        assert!(
+            matches!(e2, AppError::Locked(_)),
+            "apply must fail Locked, got: {e2:?}"
+        );
+
+        // Session-unlock → the lock gate passes; verify now falls to the fail-closed connector gate
+        // (no Jira configured ⇒ jira_lookup NeedsConsent ⇒ Unavailable), proving Locked was the gate.
+        state
+            .unlocked_folders
+            .lock()
+            .unwrap()
+            .insert("f-vlock".to_string());
+        let e3 = block_on(verify_note_sources_inner(&state, "m-vlock".to_string())).unwrap_err();
+        assert!(
+            matches!(e3, AppError::Unavailable(_)),
+            "past the lock gate, an unconfigured Jira verify fails Unavailable, got: {e3:?}"
+        );
+    }
+
+    /// Brain v2 L5 — the SESSION verify cache: a cached meeting returns its findings WITHOUT a
+    /// second connector egress (RED-able: with the cache check removed, this call falls through
+    /// to `jira_lookup` on an unexposed connector and errors `Unavailable`), and a RELOCK clears
+    /// the cache (the next call is back on the connector path).
+    #[test]
+    fn verify_cache_returns_findings_and_relock_clears_it() {
+        let state = build_state("verify-cache");
+        state
+            .db
+            .insert_meeting(&Meeting {
+                id: "m-vc".to_string(),
+                started_at: "2026-07-10T09:00:00Z".to_string(),
+                ended_at: None,
+                title: Some("Sprint".to_string()),
+                duration_s: 600,
+                audio_path: None,
+                status: MeetingStatus::Summarized,
+                folder_id: None,
+            })
+            .unwrap();
+        state
+            .db
+            .upsert_note(&NoteRecord {
+                meeting_id: "m-vc".to_string(),
+                provider_id: "claude_code".to_string(),
+                markdown: "# N\n- Ship PROJ-1 by 2026-07-08\n".to_string(),
+                created_at: "2026-07-10T09:10:00Z".to_string(),
+                exported_path: None,
+                model_requested: None,
+                model_served: None,
+                gateway_host: None,
+            })
+            .unwrap();
+
+        let finding = crate::verify::VerifyFinding {
+            line_no: 2,
+            key: "PROJ-1".into(),
+            verdict: crate::verify::Verdict::Confirmed,
+            detail: "PROJ-1 · Status: Done".into(),
+            url: String::new(),
+        };
+        state
+            .verify_cache
+            .lock()
+            .unwrap()
+            .insert("m-vc".to_string(), vec![finding.clone()]);
+
+        // Cache HIT: findings return WITHOUT touching the (unexposed) Jira connector.
+        let got = block_on(verify_note_sources_inner(&state, "m-vc".to_string())).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].key, "PROJ-1");
+        assert_eq!(got[0].detail, "PROJ-1 · Status: Done");
+
+        // RELOCK-ALL clears the session cache → the next call is back on the connector path,
+        // which fails closed Unavailable (no Jira exposed) — proving the cache is gone.
+        relock_all_inner(&state).unwrap();
+        assert!(
+            state.verify_cache.lock().unwrap().is_empty(),
+            "relock_all must clear the verify cache"
+        );
+        let e = block_on(verify_note_sources_inner(&state, "m-vc".to_string())).unwrap_err();
+        assert!(
+            matches!(e, AppError::Unavailable(_)),
+            "post-relock the cache is empty ⇒ the connector gate speaks again, got: {e:?}"
+        );
+    }
+
+    /// Lock-security NIT promotion (the adversarial verifier's probe A, 2026-07-10): a SEALED and
+    /// NOT-session-unlocked meeting with a POISONED verify-cache entry must still refuse
+    /// `Err(Locked)` — the gate runs BEFORE the cache is read, so a cache hit can never leak
+    /// findings for a locked meeting. RED-able: hoisting the cache check above the lock gate in
+    /// `verify_note_sources_inner` returns the poisoned findings here instead of `Locked`.
+    #[test]
+    fn verify_cache_is_never_read_for_a_sealed_meeting() {
+        let state = build_state("verify-cache-lockgate");
+        make_open_folder(&state.db, "f-vcl", "Secret");
+        state
+            .db
+            .insert_meeting(&Meeting {
+                id: "m-vcl".to_string(),
+                started_at: "2026-07-10T09:00:00Z".to_string(),
+                ended_at: None,
+                title: Some("Sprint".to_string()),
+                duration_s: 600,
+                audio_path: None,
+                status: MeetingStatus::Summarized,
+                folder_id: Some("f-vcl".to_string()),
+            })
+            .unwrap();
+        state
+            .db
+            .upsert_note(&NoteRecord {
+                meeting_id: "m-vcl".to_string(),
+                provider_id: "claude_code".to_string(),
+                markdown: "# N\n- Ship PROJ-1 by 2026-07-08\n".to_string(),
+                created_at: "2026-07-10T09:10:00Z".to_string(),
+                exported_path: None,
+                model_requested: None,
+                model_served: None,
+                gateway_host: None,
+            })
+            .unwrap();
+        state.db.set_note_folder("m-vcl", Some("f-vcl")).unwrap();
+        state
+            .db
+            .set_folder_locked("f-vcl", true, Some(&b"wrapped"[..]))
+            .unwrap();
+        // Poison the cache as if an earlier (unlocked) session had populated it and a relock's
+        // cache-clear were somehow missed.
+        state.verify_cache.lock().unwrap().insert(
+            "m-vcl".to_string(),
+            vec![crate::verify::VerifyFinding {
+                line_no: 2,
+                key: "PROJ-1".into(),
+                verdict: crate::verify::Verdict::Confirmed,
+                detail: "POISONED — must never surface for a locked meeting".into(),
+                url: String::new(),
+            }],
+        );
+        let e = block_on(verify_note_sources_inner(&state, "m-vcl".to_string())).unwrap_err();
+        assert!(
+            matches!(e, AppError::Locked(_)),
+            "the lock gate must speak BEFORE the cache is consulted, got: {e:?}"
+        );
+        // The poisoned entry is untouched — proof the refusal came from the gate, not from a
+        // cache miss/clear (relock_folder/relock_all own the clearing in real flows).
+        assert!(
+            state.verify_cache.lock().unwrap().contains_key("m-vcl"),
+            "the entry must still be present: the gate refused without reading the cache"
+        );
+    }
+
+    /// Brain v2 L5 — `apply_note_verify_markers` persists the inline markers AND the consolidated
+    /// `> [!verify]-` callout into the CANONICAL DB note markdown, idempotently (re-applying never
+    /// stacks either region), and an empty-findings apply restores the original note byte-exact.
+    #[test]
+    fn apply_verify_markers_persists_callout_idempotently_and_undoes() {
+        let state = build_state("verify-callout-persist");
+        let original = "# N\n- Ship PROJ-1 by 2026-07-08\n- other line\n";
+        state
+            .db
+            .insert_meeting(&Meeting {
+                id: "m-cb".to_string(),
+                started_at: "2026-07-10T09:00:00Z".to_string(),
+                ended_at: None,
+                title: Some("Sprint".to_string()),
+                duration_s: 600,
+                audio_path: None,
+                status: MeetingStatus::Summarized,
+                folder_id: None,
+            })
+            .unwrap();
+        state
+            .db
+            .upsert_note(&NoteRecord {
+                meeting_id: "m-cb".to_string(),
+                provider_id: "claude_code".to_string(),
+                markdown: original.to_string(),
+                created_at: "2026-07-10T09:10:00Z".to_string(),
+                exported_path: None,
+                model_requested: None,
+                model_served: None,
+                gateway_host: None,
+            })
+            .unwrap();
+
+        let finding = crate::verify::VerifyFinding {
+            line_no: 2,
+            key: "PROJ-1".into(),
+            verdict: crate::verify::Verdict::Conflict,
+            detail: "note says 2026-07-08, PROJ-1 due 2026-07-10".into(),
+            url: "https://x/browse/PROJ-1".into(),
+        };
+        let once = apply_note_verify_markers_inner(
+            &state,
+            "m-cb".to_string(),
+            vec![finding.clone()],
+        )
+        .unwrap();
+        assert!(once.markdown.contains("> ⧗ note says"), "inline marker present");
+        assert!(once.markdown.contains("> [!verify]- Source check (as of "));
+        assert!(once.markdown.contains(
+            "> - ⧗ Conflict — note says 2026-07-08, PROJ-1 due 2026-07-10 (via Jira) — https://x/browse/PROJ-1"
+        ));
+        // Persisted CANONICALLY (upsert_note): the DB row carries the callout, so it seals with
+        // the note under a folder lock.
+        let db_md = state
+            .db
+            .get_latest_note_for_meeting("m-cb")
+            .unwrap()
+            .unwrap()
+            .markdown;
+        assert_eq!(db_md, once.markdown);
+
+        // Re-apply: neither region stacks (one inline marker, one fenced callout).
+        let twice =
+            apply_note_verify_markers_inner(&state, "m-cb".to_string(), vec![finding]).unwrap();
+        assert_eq!(twice.markdown.matches("(via Jira)").count(), 2, "1 marker + 1 callout line");
+        assert_eq!(twice.markdown.matches("[!verify]-").count(), 1);
+        assert_eq!(twice.markdown.matches("<!-- murmur:verify -->").count(), 1);
+
+        // Empty findings: markers + callout stripped, the ORIGINAL note restored byte-exact.
+        let undone =
+            apply_note_verify_markers_inner(&state, "m-cb".to_string(), Vec::new()).unwrap();
+        assert_eq!(undone.markdown, original, "byte-exact undo through the command");
+    }
+
+    /// `get_mcp_config` must emit a ready-to-paste Claude Code config: `type: "http"`, the
+    /// localhost url, and — when `mcp_require_token` is ON (the default the server enforces) — an
+    /// `Authorization: Bearer <token>` header with a NON-EMPTY token (fixes the `-32001 unauthorized`
+    /// handshake). When the flag is OFF the server serves unauthenticated, so NO `headers` block is
+    /// emitted (no stale/placeholder header). Runs in a debug/test build, so `get_or_create_mcp_token`
+    /// mints into the dev-secrets file store — no Keychain, no `security` CLI.
+    #[test]
+    fn get_mcp_config_carries_token_when_required_and_omits_it_when_off() {
+        let state = build_state("mcp-config");
+
+        // require_token ON (default) → type/url present + a real bearer token in headers.
+        state.config.lock().unwrap().mcp_require_token = true;
+        let on = get_mcp_config_inner(&state).unwrap();
+        let v_on: serde_json::Value = serde_json::from_str(&on).expect("config is valid JSON");
+        let server = &v_on["mcpServers"]["murmur"];
+        assert_eq!(server["type"], "http", "config must declare type: http");
+        assert_eq!(
+            server["url"],
+            format!("http://127.0.0.1:{}", crate::mcp::MCP_PORT),
+            "config url must be the localhost MCP address"
+        );
+        let auth = server["headers"]["Authorization"]
+            .as_str()
+            .expect("Authorization header present when token required");
+        let bearer = auth
+            .strip_prefix("Bearer ")
+            .expect("Authorization is a Bearer header");
+        assert!(
+            !bearer.is_empty(),
+            "the bearer token must be non-empty (never a placeholder), got: {auth:?}"
+        );
+
+        // require_token OFF → the server is unauthenticated, so NO headers block is emitted.
+        state.config.lock().unwrap().mcp_require_token = false;
+        let off = get_mcp_config_inner(&state).unwrap();
+        let v_off: serde_json::Value = serde_json::from_str(&off).expect("config is valid JSON");
+        let server_off = &v_off["mcpServers"]["murmur"];
+        assert_eq!(server_off["type"], "http");
+        assert!(
+            server_off.get("headers").is_none(),
+            "no Authorization header when the token flag is off, got: {off}"
+        );
+    }
+
+    /// ENRICH lock gate (RED-before-GREEN): both `enrich_note_context` (read/egress) and
+    /// `apply_note_enrichment` (write) MUST refuse a SEALED-and-not-session-unlocked meeting with
+    /// `AppError::Locked` BEFORE any note read / connector egress / write. With NO connectors
+    /// configured, once unlocked the preview returns an empty vec (nothing to add — graceful),
+    /// proving Locked was the FIRST gate.
+    #[test]
+    fn enrich_commands_refuse_a_sealed_meeting() {
+        let state = build_state("enrich-lockgate");
+        make_open_folder(&state.db, "f-elock", "Secret");
+        state
+            .db
+            .insert_meeting(&Meeting {
+                id: "m-elock".to_string(),
+                started_at: "2026-07-05T09:00:00Z".to_string(),
+                ended_at: None,
+                title: Some("Sprint".to_string()),
+                duration_s: 600,
+                audio_path: None,
+                status: MeetingStatus::Summarized,
+                folder_id: Some("f-elock".to_string()),
+            })
+            .unwrap();
+        state
+            .db
+            .upsert_note(&NoteRecord {
+                meeting_id: "m-elock".to_string(),
+                provider_id: "claude_code".to_string(),
+                markdown: "# N\n- Ship PROJ-1 by 2026-07-08\n".to_string(),
+                created_at: "2026-07-05T09:10:00Z".to_string(),
+                exported_path: None,
+                model_requested: None,
+                model_served: None,
+                gateway_host: None,
+            })
+            .unwrap();
+        state
+            .db
+            .set_note_folder("m-elock", Some("f-elock"))
+            .unwrap();
+        state
+            .db
+            .set_folder_locked("f-elock", true, Some(&b"wrapped"[..]))
+            .unwrap();
+
+        // Sealed → both refuse Locked before any egress/write.
+        let e1 = block_on(enrich_note_context_inner(&state, "m-elock".to_string())).unwrap_err();
+        assert!(
+            matches!(e1, AppError::Locked(_)),
+            "preview must fail Locked, got: {e1:?}"
+        );
+        let hit = crate::enrich::ContextHit {
+            source: "Jira".into(),
+            detail: "PROJ-1 · Done".into(),
+            url: None,
+        };
+        let e2 = apply_note_enrichment_inner(&state, "m-elock".to_string(), vec![hit]).unwrap_err();
+        assert!(
+            matches!(e2, AppError::Locked(_)),
+            "apply must fail Locked, got: {e2:?}"
+        );
+
+        // Session-unlock → the lock gate passes; with no connectors the preview is graceful-empty.
+        state
+            .unlocked_folders
+            .lock()
+            .unwrap()
+            .insert("f-elock".to_string());
+        let hits = block_on(enrich_note_context_inner(&state, "m-elock".to_string())).unwrap();
+        assert!(
+            hits.is_empty(),
+            "no connectors configured ⇒ nothing to enrich, got: {hits:?}"
+        );
+    }
+
+    /// The enrich WRITE path persists a reviewed context block into the canonical DB note and
+    /// strips it byte-exact on an empty apply — through the real command tail (upsert + re-export).
+    #[test]
+    fn apply_note_enrichment_writes_then_strips_byte_exact() {
+        let state = build_state("enrich-write");
+        make_open_folder(&state.db, "f-open", "Project");
+        seed_meeting(
+            &state.db,
+            "m1",
+            "# Notes\n- decided to ship\n",
+            Some("f-open"),
+        );
+        let original = state
+            .db
+            .get_latest_note_for_meeting("m1")
+            .unwrap()
+            .unwrap()
+            .markdown;
+
+        let hits = vec![crate::enrich::ContextHit {
+            source: "Jira".into(),
+            detail: "PROJ-1 · In Progress".into(),
+            url: Some("https://x/browse/PROJ-1".into()),
+        }];
+        let dto = apply_note_enrichment_inner(&state, "m1".to_string(), hits).unwrap();
+        assert!(
+            dto.markdown.contains("> [!context]-"),
+            "the context callout was written"
+        );
+        assert!(
+            dto.markdown.contains("PROJ-1 · In Progress (via Jira)"),
+            "loud attribution present"
+        );
+        assert!(
+            dto.markdown.starts_with(&original),
+            "the original note is preserved verbatim"
+        );
+        // The DB note now carries the block.
+        assert!(state
+            .db
+            .get_latest_note_for_meeting("m1")
+            .unwrap()
+            .unwrap()
+            .markdown
+            .contains("[!context]-"));
+
+        // Empty apply strips it byte-exact back to the original.
+        let undone = apply_note_enrichment_inner(&state, "m1".to_string(), vec![]).unwrap();
+        assert_eq!(
+            undone.markdown, original,
+            "empty enrichment strips the block byte-for-byte"
+        );
+    }
+
+    /// Stage 2 / Lane A happy path: over a FINISHED note in an OPEN folder, `link_related_notes_inner`
+    /// appends a `> [!related]-` block of `[[Title]]` links + TASK-FREE gists, persisted DB-canonical,
+    /// preserving the original body — and is idempotent (the block never stacks).
+    #[test]
+    fn link_related_notes_writes_related_block_in_open_folder() {
+        let state = build_state("lanea-open");
+        make_open_folder(&state.db, "f-open", "Project");
+        // The note we link FROM. Kept lean so the salient query is a subset of the related note's
+        // terms (FTS5 MATCH is implicit-AND — every query term must be present in the related note).
+        seed_meeting(&state.db, "this", "Apollo migration.\n", Some("f-open"));
+        state
+            .db
+            .set_meeting_title("this", "Apollo Migration")
+            .unwrap();
+        // A related PRIOR note (open folder → visible) whose Summary is the ideal task-free gist and
+        // whose Action items must NEVER enter the link detail.
+        seed_meeting(
+            &state.db,
+            "prior",
+            "## Summary\n\nApollo migration groundwork and rollout roadmap.\n\n## Action items\n\n- [ ] SECRET-TASK\n",
+            Some("f-open"),
+        );
+        state
+            .db
+            .set_meeting_title("prior", "Apollo Kickoff")
+            .unwrap();
+
+        link_related_notes_inner(&state, "this").unwrap();
+
+        let md = state
+            .db
+            .get_latest_note_for_meeting("this")
+            .unwrap()
+            .unwrap()
+            .markdown;
+        assert!(
+            md.contains("> [!related]- Related notes"),
+            "the Related block was written; got: {md}"
+        );
+        assert!(
+            md.contains("[[Apollo Kickoff]]"),
+            "the [[Title]] link is present; got: {md}"
+        );
+        assert!(
+            md.contains("(via Murmur)"),
+            "loud Murmur attribution; got: {md}"
+        );
+        assert!(
+            md.contains("groundwork and rollout"),
+            "the task-free gist prose is present; got: {md}"
+        );
+        assert!(
+            !md.contains("SECRET-TASK"),
+            "an action item must NEVER enter a link detail; got: {md}"
+        );
+        assert!(
+            md.starts_with("Apollo migration.\n"),
+            "the original note body is preserved verbatim; got: {md}"
+        );
+
+        // Idempotent: re-linking does not stack the block.
+        link_related_notes_inner(&state, "this").unwrap();
+        let md2 = state
+            .db
+            .get_latest_note_for_meeting("this")
+            .unwrap()
+            .unwrap()
+            .markdown;
+        assert_eq!(
+            md2.matches("<!-- murmur:links -->").count(),
+            1,
+            "the links block never stacks on re-link"
+        );
+    }
+
+    /// SEAL-SAFETY (RED-before-GREEN, load-bearing): Lane A must NEVER write the transient `markdown`
+    /// column of a SEALED note — even when the session happens to have its folder unlocked (so the
+    /// `meeting_is_unlocked` read gate passes). Without the `content_blob` guard, Lane A would derive a
+    /// query from the title, retrieve a visible related note, and upsert plaintext links into the
+    /// blanked column — resurrecting content that would be lost on the next relock. The guard makes it
+    /// a no-op: the sealed column stays blank and `content_blob` stays intact.
+    #[test]
+    fn link_related_notes_never_touches_a_sealed_note() {
+        let state = build_state("lanea-sealsafe");
+        make_open_folder(&state.db, "f-lock", "Secret");
+        seed_meeting(&state.db, "sealed", "# Secret body\n", Some("f-lock"));
+        state
+            .db
+            .set_meeting_title("sealed", "Atlas Acquisition Roadmap")
+            .unwrap();
+        // A visible related note in an OPEN folder that the sealed meeting's title WOULD retrieve.
+        make_open_folder(&state.db, "f-open", "Open");
+        seed_meeting(
+            &state.db,
+            "prior",
+            "## Summary\n\nAtlas acquisition roadmap groundwork.\n",
+            Some("f-open"),
+        );
+        state
+            .db
+            .set_meeting_title("prior", "Atlas Kickoff")
+            .unwrap();
+
+        // Seal the note (content_blob present, markdown blanked), lock the folder, and SESSION-UNLOCK it
+        // so the read gate passes and ONLY the seal-safety guard can stop the write.
+        state
+            .db
+            .seal_note("sealed", "claude_code", &b"ciphertext-blob"[..])
+            .unwrap();
+        state
+            .db
+            .set_folder_locked("f-lock", true, Some(&b"wrapped"[..]))
+            .unwrap();
+        state
+            .unlocked_folders
+            .lock()
+            .unwrap()
+            .insert("f-lock".to_string());
+
+        assert!(
+            meeting_is_unlocked(&state, "sealed").unwrap(),
+            "precondition: the sealed meeting is session-unlocked (so meeting_is_unlocked passes)"
+        );
+        link_related_notes_inner(&state, "sealed").unwrap();
+
+        // The sealed note's transient markdown column is untouched (still blank) — no plaintext links.
+        let md = state
+            .db
+            .get_latest_note_for_meeting("sealed")
+            .unwrap()
+            .unwrap()
+            .markdown;
+        assert_eq!(
+            md, "",
+            "a sealed note's transient markdown column must NEVER be written by Lane A"
+        );
+        // The seal (content_blob) is intact.
+        assert!(
+            state
+                .db
+                .sealable_notes_for_meeting("sealed")
+                .unwrap()
+                .iter()
+                .any(|n| n.content_blob.is_some()),
+            "the seal (content_blob) is left intact"
+        );
+    }
+
+    // ── note↔meeting-links PR-1 — MANUAL linking (command layer) ─────────────────────────────────
+
+    /// Seed a standalone note-doc (`kind='note'`) in a folder for the manual-link command tests. The
+    /// folder must already exist in the `folders` table (via `make_open_folder`) so the read gates
+    /// (`get_note_row` → `folder_is_unlocked`) resolve it.
+    fn seed_note_doc_cmd(db: &Db, id: &str, folder_id: &str, title: &str, body: &str) {
+        db.insert_note(id, folder_id, title, title, body, 1_700_000_000_000)
+            .unwrap();
+    }
+
+    /// Count the `manual` rows incident on `(kind, id)` (either endpoint).
+    fn manual_link_count(state: &AppState, kind: &str, id: &str) -> i64 {
+        state.db.link_edge_count(kind, id, "manual")
+    }
+
+    /// A MEETING source creates a `manual` row but writes NO markdown into the meeting's note (a
+    /// meeting has no owned editable body — row only, per fork #2).
+    #[test]
+    fn link_from_meeting_creates_row_but_no_markdown() {
+        let state = build_state("link-from-meeting");
+        make_open_folder(&state.db, "f-open", "Project");
+        seed_meeting(&state.db, "m1", "# Meeting note body\n", Some("f-open"));
+        state.db.set_meeting_title("m1", "Kickoff").unwrap();
+        seed_note_doc_cmd(&state.db, "n1", "f-open", "Design Doc", "the design body");
+
+        let before = state
+            .db
+            .get_latest_note_for_meeting("m1")
+            .unwrap()
+            .unwrap()
+            .markdown;
+
+        // Link meeting m1 → note n1.
+        link_items_inner(&state, "meeting", "m1", "note", "n1").unwrap();
+
+        // A manual row exists...
+        assert_eq!(manual_link_count(&state, "meeting", "m1"), 1, "manual row created");
+        // ...and the meeting's note markdown is UNTOUCHED (no injected [[...]] / links block).
+        let after = state
+            .db
+            .get_latest_note_for_meeting("m1")
+            .unwrap()
+            .unwrap()
+            .markdown;
+        assert_eq!(after, before, "a meeting source writes no markdown");
+        assert!(
+            !after.contains("murmur:links"),
+            "no managed links block injected into a meeting source"
+        );
+    }
+
+    /// A NOTE source creates a `manual` row AND materializes `[[Title]]` into the note body; after the
+    /// note's wikilinks are re-indexed, the pair shows as ONE deduped chip in `links_for_visible`.
+    #[test]
+    fn link_from_note_materializes_wikilink_and_dedupes() {
+        let state = build_state("link-from-note");
+        make_open_folder(&state.db, "f-open", "Project");
+        seed_note_doc_cmd(&state.db, "src", "f-open", "Source Note", "original body\n");
+        seed_note_doc_cmd(&state.db, "dst", "f-open", "Target Note", "target body");
+
+        // Link note src → note dst.
+        link_items_inner(&state, "note", "src", "note", "dst").unwrap();
+
+        // A manual row exists...
+        assert_eq!(manual_link_count(&state, "note", "src"), 1, "manual row created");
+        // ...and the source note body gained the [[Target Note]] marker (materialized).
+        let body = state.db.get_note_row("src").unwrap().unwrap().text;
+        assert!(
+            body.contains("[[Target Note]]"),
+            "the [[Title]] was materialized into the note body; got: {body}"
+        );
+        assert!(
+            body.starts_with("original body\n"),
+            "the original body is preserved; got: {body}"
+        );
+
+        // The materialize went through `update_note_doc_inner`, which re-indexes wikilinks — so a
+        // `wikilink` edge for the same pair now ALSO exists. The reader must collapse to ONE chip.
+        assert_eq!(link_count_in(&state, "note", "src", "wikilink"), 1, "wikilink edge also present");
+        let unlocked = unlocked_snapshot(&state).unwrap();
+        let edges = state
+            .db
+            .links_for_visible(crate::links::LinkKind::Note, "src", &unlocked)
+            .unwrap();
+        let to_dst: Vec<_> = edges.iter().filter(|e| e.other_id == "dst").collect();
+        assert_eq!(to_dst.len(), 1, "manual + wikilink collapse to ONE chip");
+        assert!(to_dst[0].manual, "the collapsed chip is flagged removable-manual");
+    }
+
+    /// Helper mirroring db.rs `link_count` for the command-test module.
+    fn link_count_in(state: &AppState, kind: &str, id: &str, edge_type: &str) -> i64 {
+        state.db.link_edge_count(kind, id, edge_type)
+    }
+
+    /// UNLINK removes the `manual` row and strips the materialized `[[Title]]` from the source note
+    /// body. The wikilink edge that the materialize produced is NOT deleted by unlink (only the manual
+    /// row is), but the strip removes the `[[Title]]`, so a follow-up re-index would drop the wikilink
+    /// too — here we assert the DIRECT contract: manual row gone + marker stripped.
+    #[test]
+    fn unlink_removes_row_and_strips_marker() {
+        let state = build_state("unlink-strips");
+        make_open_folder(&state.db, "f-open", "Project");
+        seed_note_doc_cmd(&state.db, "src", "f-open", "Source Note", "original body\n");
+        seed_note_doc_cmd(&state.db, "dst", "f-open", "Target Note", "target body");
+
+        link_items_inner(&state, "note", "src", "note", "dst").unwrap();
+        assert_eq!(manual_link_count(&state, "note", "src"), 1, "precondition: manual row exists");
+        assert!(
+            state.db.get_note_row("src").unwrap().unwrap().text.contains("[[Target Note]]"),
+            "precondition: marker materialized"
+        );
+
+        // Unlink note src → note dst.
+        unlink_items_inner(&state, "note", "src", "note", "dst").unwrap();
+
+        // The manual row is gone...
+        assert_eq!(manual_link_count(&state, "note", "src"), 0, "manual row deleted");
+        // ...and the [[Target Note]] marker is stripped from the body.
+        let body = state.db.get_note_row("src").unwrap().unwrap().text;
+        assert!(
+            !body.contains("[[Target Note]]"),
+            "the materialized marker is stripped on unlink; got: {body}"
+        );
+        assert!(
+            body.starts_with("original body\n"),
+            "the original body is preserved after strip; got: {body}"
+        );
+    }
+
+    /// A sealed-and-not-session-unlocked endpoint refuses the link with `AppError::Locked` BEFORE any
+    /// write — never link behind a lock, never reveal a locked neighbour.
+    #[test]
+    fn link_items_refuses_sealed_endpoint() {
+        let state = build_state("link-refuses-sealed");
+        // Open source note; sealed destination note (in a locked, NOT-session-unlocked folder).
+        make_open_folder(&state.db, "f-open", "Open");
+        make_open_folder(&state.db, "f-lock", "Secret");
+        seed_note_doc_cmd(&state.db, "src", "f-open", "Source Note", "body");
+        seed_note_doc_cmd(&state.db, "dst", "f-lock", "Secret Note", "secret body");
+        // Seal the destination note + lock its folder (NOT session-unlocked).
+        state.db.seal_document("dst", &b"ciphertext"[..]).unwrap();
+        state
+            .db
+            .set_folder_locked("f-lock", true, Some(&b"wrapped"[..]))
+            .unwrap();
+
+        // Link src → dst must refuse Locked.
+        let err = link_items_inner(&state, "note", "src", "note", "dst").unwrap_err();
+        assert!(
+            matches!(err, AppError::Locked(_)),
+            "a sealed destination endpoint must refuse with Locked; got {err:?}"
+        );
+        // No manual row was written (fail-closed BEFORE the write).
+        assert_eq!(manual_link_count(&state, "note", "src"), 0, "no row written behind the lock");
+        // And the source body was NOT materialized.
+        assert!(
+            !state.db.get_note_row("src").unwrap().unwrap().text.contains("[["),
+            "no marker written when the link is refused"
+        );
+
+        // Symmetric: a SEALED SOURCE also refuses (never mutate a locked note's body).
+        let err2 = link_items_inner(&state, "note", "dst", "note", "src").unwrap_err();
+        assert!(
+            matches!(err2, AppError::Locked(_)),
+            "a sealed source endpoint must refuse with Locked; got {err2:?}"
+        );
+    }
+
+    /// A `document` endpoint (an imported PDF/DOCX, `kind='document'` — NOT a `get_note_row` row) must
+    /// be LINKABLE when visible and REFUSED when sealed. Before the dedicated `Document` gate arm,
+    /// `link_endpoint_is_unlocked` routed documents through `get_note_row` (which filters `kind='note'`)
+    /// → `None` → a spurious `Locked` even for an OPEN document. RED: the "open document links"
+    /// assertion fails on the pre-fix code path; the sealed-document refusal proves the gate still holds.
+    #[test]
+    fn link_items_gates_document_endpoint() {
+        let state = build_state("link-doc-endpoint");
+        make_open_folder(&state.db, "f-open", "Open");
+        make_open_folder(&state.db, "f-lock", "Secret");
+        seed_note_doc_cmd(&state.db, "src", "f-open", "Source Note", "body\n");
+        // An OPEN imported document (linkable) + a SEALED imported document (must refuse).
+        state
+            .db
+            .insert_document("doc-open", "f-open", "Contract.pdf", "extracted text", "document", 0i64)
+            .unwrap();
+        state
+            .db
+            .insert_document("doc-seal", "f-lock", "Secret.pdf", "secret extracted", "document", 0i64)
+            .unwrap();
+        state
+            .db
+            .set_folder_locked("f-lock", true, Some(&b"wrapped"[..]))
+            .unwrap();
+
+        // Linking the OPEN document SUCCEEDS (RED before the Document gate arm — was a spurious Locked).
+        link_items_inner(&state, "note", "src", "document", "doc-open").unwrap();
+        let open = unlocked_snapshot(&state).unwrap();
+        assert_eq!(
+            state
+                .db
+                .links_for_visible(crate::links::LinkKind::Note, "src", &open)
+                .unwrap()
+                .iter()
+                .filter(|e| e.other_id == "doc-open")
+                .count(),
+            1,
+            "an open document must be linkable and visible from the note side"
+        );
+
+        // Linking the SEALED document REFUSES Locked (gate holds through the new arm; no row written).
+        let err = link_items_inner(&state, "note", "src", "document", "doc-seal").unwrap_err();
+        assert!(
+            matches!(err, AppError::Locked(_)),
+            "a sealed document endpoint must refuse with Locked; got {err:?}"
+        );
+    }
+
+    /// A MANUAL link is gated on read from BOTH sides after the fact: sealing EITHER endpoint hides
+    /// the edge in `links_for_visible` from BOTH directions; unsealing restores it. (Command-level
+    /// end-to-end mirror of the db-layer gate test — proves the command-created row rides the gate.)
+    #[test]
+    fn manual_link_created_and_gated_both_endpoints_cmd() {
+        let state = build_state("manual-gate-cmd");
+        make_open_folder(&state.db, "f-open", "Open");
+        make_open_folder(&state.db, "f-lock", "Secret");
+        // A note source (open) and a MEETING destination in the lockable folder.
+        seed_note_doc_cmd(&state.db, "src", "f-open", "Source Note", "body\n");
+        seed_meeting(&state.db, "m-dst", "# Meeting body\n", Some("f-lock"));
+        state.db.set_meeting_title("m-dst", "Secret Meeting").unwrap();
+
+        link_items_inner(&state, "note", "src", "meeting", "m-dst").unwrap();
+
+        // Both open → edge visible from either side.
+        let open = unlocked_snapshot(&state).unwrap();
+        assert_eq!(
+            state.db.links_for_visible(crate::links::LinkKind::Note, "src", &open).unwrap()
+                .iter().filter(|e| e.other_id == "m-dst").count(),
+            1,
+            "edge visible from the note side while both open"
+        );
+        assert_eq!(
+            state.db.links_for_visible(crate::links::LinkKind::Meeting, "m-dst", &open).unwrap()
+                .iter().filter(|e| e.other_id == "src").count(),
+            1,
+            "edge visible from the meeting side while both open"
+        );
+
+        // Seal the MEETING's folder (not session-unlocked) → edge hidden BOTH directions.
+        state
+            .db
+            .set_folder_locked("f-lock", true, Some(&b"wrapped"[..]))
+            .unwrap();
+        let sealed = unlocked_snapshot(&state).unwrap(); // still empty — f-lock not session-unlocked.
+        assert!(
+            state.db.links_for_visible(crate::links::LinkKind::Note, "src", &sealed).unwrap()
+                .iter().all(|e| e.other_id != "m-dst"),
+            "sealed meeting neighbour hidden from the note side"
+        );
+        assert!(
+            state.db.links_for_visible(crate::links::LinkKind::Meeting, "m-dst", &sealed).unwrap()
+                .is_empty(),
+            "a sealed queried meeting never reveals it HAS a manual link"
+        );
+
+        // Session-unlock the meeting's folder → edge restored on both sides.
+        state.unlocked_folders.lock().unwrap().insert("f-lock".to_string());
+        let unlocked = unlocked_snapshot(&state).unwrap();
+        assert_eq!(
+            state.db.links_for_visible(crate::links::LinkKind::Note, "src", &unlocked).unwrap()
+                .iter().filter(|e| e.other_id == "m-dst").count(),
+            1,
+            "edge restored from the note side once the meeting folder is unlocked"
+        );
+    }
+
+    /// Insert a raw semantic edge (`status`) between two note ids and return its row id — so the
+    /// accept/dismiss gate tests have a concrete link to act on without running the real auto pass.
+    fn insert_semantic_link(state: &AppState, src_id: &str, dst_id: &str, status: &str) -> i64 {
+        state
+            .db
+            .insert_link_for_test("note", src_id, "note", dst_id, "semantic", 0.9, "auto", status)
+    }
+
+    /// Insert a raw wikilink edge (deterministic) and return its row id.
+    fn insert_wikilink_link(state: &AppState, src_id: &str, dst_id: &str) -> i64 {
+        state
+            .db
+            .insert_link_for_test("note", src_id, "note", dst_id, "wikilink", 1.0, "user", "active")
+    }
+
+    /// Fix 5 (RED before the accept/dismiss gate): DISMISS on a link whose ENDPOINT is
+    /// sealed-and-not-session-unlocked must REFUSE (`AppError::Locked`) — before, any link id could be
+    /// flipped with no endpoint gate at all.
+    #[test]
+    fn dismiss_link_refuses_sealed_endpoint() {
+        let state = build_state("dismiss-sealed");
+        make_open_folder(&state.db, "f-open", "Open");
+        make_open_folder(&state.db, "f-lock", "Secret");
+        seed_note_doc_cmd(&state.db, "open", "f-open", "Open Note", "body");
+        seed_note_doc_cmd(&state.db, "secret", "f-lock", "Secret Note", "secret");
+        let id = insert_semantic_link(&state, "open", "secret", "suggested");
+        // Seal the secret endpoint's folder (NOT session-unlocked).
+        state.db.seal_document("secret", &b"ct"[..]).unwrap();
+        state.db.set_folder_locked("f-lock", true, Some(&b"wrapped"[..])).unwrap();
+
+        let err = dismiss_link_inner(&state, id).unwrap_err();
+        assert!(
+            matches!(err, AppError::Locked(_)),
+            "dismiss on a sealed-endpoint link must refuse with Locked; got {err:?}"
+        );
+        // The row was NOT tombstoned (fail-closed before the write).
+        let (_sk, _si, _dk, _di, _et, status) = state.db.link_by_id(id).unwrap().unwrap();
+        assert_eq!(status, "suggested", "the suggestion must be untouched after a refused dismiss");
+    }
+
+    /// Fix 5: DISMISS on a DETERMINISTIC (wikilink) edge is refused (InvalidArg) — dismissal is for
+    /// semantic suggestions only; a wikilink would be resurrected on the next save anyway.
+    #[test]
+    fn dismiss_link_refuses_deterministic_wikilink() {
+        let state = build_state("dismiss-wikilink");
+        make_open_folder(&state.db, "f-open", "Open");
+        seed_note_doc_cmd(&state.db, "a", "f-open", "A", "body");
+        seed_note_doc_cmd(&state.db, "b", "f-open", "B", "body");
+        let id = insert_wikilink_link(&state, "a", "b");
+        let err = dismiss_link_inner(&state, id).unwrap_err();
+        assert!(
+            matches!(err, AppError::InvalidArg(_)),
+            "dismiss on a wikilink edge must refuse with InvalidArg; got {err:?}"
+        );
+        // Still active (never tombstoned).
+        let (_sk, _si, _dk, _di, _et, status) = state.db.link_by_id(id).unwrap().unwrap();
+        assert_eq!(status, "active", "a wikilink edge is never dismissed");
+    }
+
+    /// Fix 5: DISMISS on a genuine open suggestion SUCCEEDS (tombstones it) — the gate only blocks the
+    /// sealed/deterministic cases, never a legitimate dismiss.
+    #[test]
+    fn dismiss_link_tombstones_an_open_suggestion() {
+        let state = build_state("dismiss-open");
+        make_open_folder(&state.db, "f-open", "Open");
+        seed_note_doc_cmd(&state.db, "a", "f-open", "A", "body");
+        seed_note_doc_cmd(&state.db, "b", "f-open", "B", "body");
+        let id = insert_semantic_link(&state, "a", "b", "suggested");
+        dismiss_link_inner(&state, id).unwrap();
+        let (_sk, _si, _dk, _di, _et, status) = state.db.link_by_id(id).unwrap().unwrap();
+        assert_eq!(status, "dismissed", "an open suggestion is tombstoned by dismiss");
+    }
+
+    /// Fix 5: ACCEPT validates the id is a real SUGGESTION — accepting a non-existent id is InvalidArg,
+    /// and accepting a deterministic (active wikilink) edge is refused (it is not a suggestion).
+    #[test]
+    fn accept_link_validates_suggestion() {
+        let state = build_state("accept-validates");
+        make_open_folder(&state.db, "f-open", "Open");
+        seed_note_doc_cmd(&state.db, "a", "f-open", "A", "body");
+        seed_note_doc_cmd(&state.db, "b", "f-open", "B", "body");
+        // Unknown id → InvalidArg.
+        let err = accept_link_inner(&state, 999_999).unwrap_err();
+        assert!(matches!(err, AppError::InvalidArg(_)), "unknown id must be InvalidArg; got {err:?}");
+        // A wikilink (active, deterministic) is NOT an acceptable suggestion.
+        let wid = insert_wikilink_link(&state, "a", "b");
+        let err2 = accept_link_inner(&state, wid).unwrap_err();
+        assert!(
+            matches!(err2, AppError::InvalidArg(_)),
+            "accepting a deterministic wikilink edge must be InvalidArg; got {err2:?}"
+        );
+    }
+
+    /// Fix 5: ACCEPT on a suggestion whose ENDPOINT is sealed refuses (`Locked`) before flipping — the
+    /// row stays `suggested`, and no locked neighbour is revealed via materialization.
+    #[test]
+    fn accept_link_refuses_sealed_endpoint() {
+        let state = build_state("accept-sealed");
+        make_open_folder(&state.db, "f-open", "Open");
+        make_open_folder(&state.db, "f-lock", "Secret");
+        seed_note_doc_cmd(&state.db, "open", "f-open", "Open Note", "body");
+        seed_note_doc_cmd(&state.db, "secret", "f-lock", "Secret Note", "secret");
+        let id = insert_semantic_link(&state, "open", "secret", "suggested");
+        state.db.seal_document("secret", &b"ct"[..]).unwrap();
+        state.db.set_folder_locked("f-lock", true, Some(&b"wrapped"[..])).unwrap();
+
+        let err = accept_link_inner(&state, id).unwrap_err();
+        assert!(
+            matches!(err, AppError::Locked(_)),
+            "accept on a sealed-endpoint suggestion must refuse with Locked; got {err:?}"
+        );
+        let (_sk, _si, _dk, _di, _et, status) = state.db.link_by_id(id).unwrap().unwrap();
+        assert_eq!(status, "suggested", "the suggestion must stay suggested after a refused accept");
+    }
+
+    /// Fix 5 + lock-review regression: a VALID accept (semantic suggestion between two owned, visible
+    /// notes) must COMPLETE (not self-deadlock) and flip the row off `suggested`. The pre-fix code held
+    /// the non-reentrant `lifecycle_guard` across `materialize_accepted_link` → `update_note_doc_inner`
+    /// (which re-acquires it) → self-deadlock; every accept test only exercised REFUSAL paths, so cargo
+    /// test stayed green while a user clicking Accept hung the command forever. If this test hangs, the
+    /// guard is being held across materialize again.
+    #[test]
+    fn accept_link_valid_suggestion_materializes_without_deadlock() {
+        let state = build_state("accept-materialize");
+        make_open_folder(&state.db, "f-open", "Open");
+        seed_note_doc_cmd(&state.db, "a", "f-open", "Alpha", "alpha body");
+        seed_note_doc_cmd(&state.db, "b", "f-open", "Beta", "beta body");
+        let id = insert_semantic_link(&state, "a", "b", "suggested");
+        // Must RETURN (pre-fix: deadlock) — the guard is released before the materialize loop.
+        accept_link_inner(&state, id).expect("a valid accept between two open notes must succeed");
+        let (_sk, _si, _dk, _di, _et, status) = state.db.link_by_id(id).unwrap().unwrap();
+        assert_ne!(status, "suggested", "an accepted suggestion must no longer be 'suggested'");
+    }
+
+    /// M3-CLIENT lock gate (spec §7 inv. 1): `share_note_to_link` on a SEALED-and-not-session-unlocked
+    /// meeting MUST refuse with `AppError::Locked` BEFORE any note read / network / consent check — a
+    /// locked note can never be uploaded. This is the RED-before-GREEN regression for the leak class:
+    /// it runs with NO server configured + NO login, so a non-`Locked` return (e.g. it fell through to
+    /// the "not signed in"/"no server" errors) is a gate-order violation and fails the test.
+    #[test]
+    fn share_note_to_link_refuses_a_sealed_meeting() {
+        let state = build_state("share-lockgate");
+        // A locked folder holding a meeting + note.
+        make_open_folder(&state.db, "f-lock", "Secret");
+        state
+            .db
+            .insert_meeting(&Meeting {
+                id: "m-locked".to_string(),
+                started_at: "2026-07-04T09:00:00Z".to_string(),
+                ended_at: None,
+                title: Some("Board strategy".to_string()),
+                duration_s: 600,
+                audio_path: None,
+                status: MeetingStatus::Summarized,
+                folder_id: Some("f-lock".to_string()),
+            })
+            .unwrap();
+        state
+            .db
+            .upsert_note(&NoteRecord {
+                meeting_id: "m-locked".to_string(),
+                provider_id: "claude_code".to_string(),
+                markdown: "---\nattendees:\n  - Alice\n---\n# secret".to_string(),
+                created_at: "2026-07-04T09:10:00Z".to_string(),
+                exported_path: None,
+                model_requested: None,
+                model_served: None,
+                gateway_host: None,
+            })
+            .unwrap();
+        // Associate the note (hence the meeting) with the folder, then seal it. `meeting_is_unlocked`
+        // resolves the folder via `notes.folder_id` (`folder_for_meeting`), so this MUST be set or the
+        // meeting reads as vault-root/open and the gate is a no-op.
+        state
+            .db
+            .set_note_folder("m-locked", Some("f-lock"))
+            .unwrap();
+        state
+            .db
+            .set_folder_locked("f-lock", true, Some(&b"wrapped"[..]))
+            .unwrap();
+        // NOT session-unlocked: `unlocked_folders` stays empty.
+
+        let err = block_on(share_note_to_link_inner(
+            &state,
+            "m-locked".to_string(),
+            None,
+            None,
+            None,
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(err, AppError::Locked(_)),
+            "a sealed meeting must fail closed with Locked, got: {err:?}"
+        );
+
+        // Session-unlock the folder → the gate passes, and the NEXT failure is the fail-closed
+        // consent/login gate (proving the Locked was the gate, not a downstream error).
+        state
+            .unlocked_folders
+            .lock()
+            .unwrap()
+            .insert("f-lock".to_string());
+        let err2 = block_on(share_note_to_link_inner(
+            &state,
+            "m-locked".to_string(),
+            None,
+            None,
+            None,
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(err2, AppError::Unavailable(_)),
+            "past the lock gate, an unconsented/logged-out share fails Unavailable, got: {err2:?}"
+        );
+    }
+
+    // ── KEK candidate-recovery (0.7.4) tests ────────────────────────────────────────────────────
+
+    /// The recovery loop finds the ONE candidate that sealed the folder (AAD-bound), returns its
+    /// bytes + index, and yields None when no candidate (or the wrong folder id) matches.
+    #[test]
+    fn kek_recovery_tries_candidates_and_finds_the_sealing_key() {
+        let kek_old: [u8; 32] = [3u8; 32];
+        let kek_new: [u8; 32] = [9u8; 32];
+        let ck = crate::crypto::random_key().unwrap();
+        let wrapped = crate::crypto::encrypt(&kek_old, &ck, &aad_wrapped_ck("f-rec")).unwrap();
+
+        // Primary (kek_new) failed upstream; candidates hold [wrong, old] → winner at index 1.
+        let candidates = [[7u8; 32], kek_old];
+        let (bytes, winner, idx) =
+            try_unwrap_ck_with_candidates(&candidates, &wrapped, "f-rec", Some(&kek_new))
+                .expect("recovery must find the sealing KEK among the candidates");
+        assert_eq!(
+            bytes.as_slice(),
+            ck.as_slice(),
+            "recovered CK must be the original"
+        );
+        assert_eq!(
+            *winner, kek_old,
+            "the winner is the KEK that sealed the folder"
+        );
+        assert_eq!(idx, 1);
+
+        // No matching candidate → None (the caller surfaces the primary error).
+        assert!(
+            try_unwrap_ck_with_candidates(&[[7u8; 32]], &wrapped, "f-rec", Some(&kek_new))
+                .is_none()
+        );
+        // AAD binding holds: the right KEK under the WRONG folder id must not unwrap.
+        assert!(
+            try_unwrap_ck_with_candidates(&candidates, &wrapped, "f-other", Some(&kek_new))
+                .is_none()
+        );
+        // The already-tried primary is skipped even if listed as a candidate.
+        assert!(
+            try_unwrap_ck_with_candidates(&[kek_new], &wrapped, "f-rec", Some(&kek_new)).is_none()
+        );
+        // With NO already-tried key (the primary release itself failed), all candidates are tried.
+        let (_, winner2, _) = try_unwrap_ck_with_candidates(&candidates, &wrapped, "f-rec", None)
+            .expect("recovery with no primary must still find the sealing KEK");
+        assert_eq!(*winner2, kek_old);
+    }
+
+    /// THE 2026-07-05 lock-security regression: a discard must ABORT (not wipe) when the candidate
+    /// enumeration itself FAILED — a cancelled/failed Touch ID or a transient keychain fault must
+    /// never be read as "no key exists". `discard_proof_complete` is the pure decision seam; here we
+    /// drive it directly (the real enumeration can't fail on the dev keychain path).
+    #[test]
+    fn discard_aborts_when_candidate_enumeration_fails() {
+        let kek = [0x11u8; 32];
+        let ck = crate::crypto::random_key().unwrap();
+        let wrapped = crate::crypto::encrypt(&kek, &ck, &aad_wrapped_ck("f-x")).unwrap();
+
+        // Enumeration FAILED (e.g. cancelled Touch ID) → MUST propagate as Err (abort the discard),
+        // NEVER conclude unrecoverable — even though, with an empty set, `try_unwrap` would say "none".
+        let failed: Result<Zeroizing<Vec<[u8; 32]>>, AppError> =
+            Err(AppError::BiometricFailed("Touch ID was cancelled".into()));
+        assert!(
+            discard_proof_complete(failed, &wrapped, "f-x").is_err(),
+            "a failed enumeration must ABORT the discard, never prove absence"
+        );
+
+        // Enumeration COMPLETED with a candidate that unwraps → recoverable → refuse (Ok(false)).
+        let recoverable: Result<Zeroizing<Vec<[u8; 32]>>, AppError> = Ok(Zeroizing::new(vec![kek]));
+        assert!(
+            !discard_proof_complete(recoverable, &wrapped, "f-x").unwrap(),
+            "a completed enumeration with a matching candidate is RECOVERABLE (refuse)"
+        );
+
+        // Enumeration COMPLETED with only a wrong key → provably unrecoverable → safe (Ok(true)).
+        let unrecoverable: Result<Zeroizing<Vec<[u8; 32]>>, AppError> =
+            Ok(Zeroizing::new(vec![[0x99u8; 32]]));
+        assert!(
+            discard_proof_complete(unrecoverable, &wrapped, "f-x").unwrap(),
+            "a completed enumeration with no matching candidate is provably unrecoverable"
+        );
+
+        // Enumeration COMPLETED empty (keychain genuinely wiped) → provably unrecoverable → safe.
+        let empty: Result<Zeroizing<Vec<[u8; 32]>>, AppError> = Ok(Zeroizing::new(vec![]));
+        assert!(
+            discard_proof_complete(empty, &wrapped, "f-x").unwrap(),
+            "an authoritatively-empty enumeration is provably unrecoverable"
+        );
+    }
+
+    /// `any_locked_folder` (the mint-guard input) flips with seal state.
+    #[test]
+    fn any_locked_folder_reflects_seal_state() {
+        let state = build_state("any-locked");
+        make_open_folder(&state.db, "f-guard", "Guard");
+        assert!(!state.db.any_locked_folder().unwrap());
+        state
+            .db
+            .set_folder_locked("f-guard", true, Some(&b"wrapped"[..]))
+            .unwrap();
+        assert!(state.db.any_locked_folder().unwrap());
+        state.db.set_folder_locked("f-guard", false, None).unwrap();
+        assert!(!state.db.any_locked_folder().unwrap());
+    }
+
+    // ── session-refresh (0.7.3 re-enable) tests ─────────────────────────────────────────────────
+
+    /// Snapshot-and-restore guard for the DEV secret file (`MeetNotes-dev/dev-secrets.json`): the
+    /// refresh path's best-effort Keychain mirror writes REAL dev-store keys in a debug test run, and
+    /// this test must not clobber the developer's live dev-app share session. Restores on drop (also
+    /// on panic).
+    struct DevSecretsSnapshot {
+        path: std::path::PathBuf,
+        original: Option<Vec<u8>>,
+    }
+    impl DevSecretsSnapshot {
+        fn take() -> Self {
+            let path = dirs::data_dir()
+                .expect("data dir")
+                .join(crate::state::app_dir_name())
+                .join("dev-secrets.json");
+            let original = std::fs::read(&path).ok();
+            Self { path, original }
+        }
+    }
+    impl Drop for DevSecretsSnapshot {
+        fn drop(&mut self) {
+            match &self.original {
+                Some(bytes) => {
+                    let _ = std::fs::write(&self.path, bytes);
+                }
+                None => {
+                    let _ = std::fs::remove_file(&self.path);
+                }
+            }
+        }
+    }
+
+    /// RED-before-GREEN for the 0.7.2 "sharing dies after a restart" regression: a session whose
+    /// bearer is PAST its 30-min server-side expiry MUST be proactively redeemed via
+    /// `/v1/auth/refresh` — the defanged `valid_access_token` returned the dead cached bearer, so
+    /// every share op after a restart 401'd until a full password re-login. Drives the REAL refresh
+    /// path against a local one-shot HTTP server (loopback `http` is allowed by the URL guardrails)
+    /// and proves the RAM-FIRST rotation: the fresh pair lands in the in-RAM session.
+    #[test]
+    fn valid_access_token_refreshes_a_stale_bearer() {
+        let _guard = DevSecretsSnapshot::take();
+
+        // One-shot local `/v1/auth/refresh`: read the full request, answer with a rotated pair.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut req = Vec::new();
+            let mut buf = [0u8; 4096];
+            // Read until the JSON body's closing brace has arrived (tiny body, no keep-alive reuse).
+            loop {
+                let n = sock.read(&mut buf).unwrap();
+                req.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&req);
+                if n == 0 || (text.contains("\r\n\r\n") && text.trim_end().ends_with('}')) {
+                    break;
+                }
+            }
+            let body = r#"{"accessToken":"fresh-access","refreshToken":"fresh-refresh","deviceId":"dev-1","accessExpiresAt":"2099-01-01T00:00:00Z"}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            sock.write_all(resp.as_bytes()).unwrap();
+            String::from_utf8_lossy(&req).to_string()
+        });
+
+        let state = build_state("refresh-stale-bearer");
+        state.config.lock().unwrap().share_base_url = format!("http://{addr}");
+        *state.account_session.lock().unwrap() = Some(crate::share::AccountSession {
+            account_id: "acct-1".into(),
+            email: "user@example.com".into(),
+            server_user_id: None,
+            device_id: "dev-1".into(),
+            mk: Zeroizing::new([7u8; 32]),
+            generation: 1,
+            access_token: "stale-access".into(),
+            // Long past expiry ⇒ `access_token_needs_refresh` fires ⇒ the refresh MUST happen.
+            access_expires_at: Some("2020-01-01T00:00:00Z".into()),
+            refresh_token: "r0".into(),
+        });
+
+        let token = block_on(valid_access_token(&state)).unwrap();
+        assert_eq!(
+            token, "fresh-access",
+            "the bearer must be the ROTATED token, not the dead cached one (the 0.7.2 defang bug)"
+        );
+
+        let req = server.join().unwrap();
+        assert!(
+            req.contains("POST /v1/auth/refresh"),
+            "must redeem the refresh token at /v1/auth/refresh, got: {req}"
+        );
+        assert!(req.contains("r0"), "must present the CURRENT refresh token");
+
+        // RAM-first rotation: the fresh pair is live in the session immediately.
+        let g = state.account_session.lock().unwrap();
+        let s = g.as_ref().unwrap();
+        assert_eq!(s.access_token, "fresh-access");
+        assert_eq!(
+            s.refresh_token, "fresh-refresh",
+            "the rotated refresh token must land in the in-RAM session (RAM-first)"
+        );
+        assert_eq!(s.access_expires_at.as_deref(), Some("2099-01-01T00:00:00Z"));
+    }
+
+    /// A TRANSIENT refresh failure (server unreachable) must NOT kill the session: the cached bearer
+    /// comes back (it may still be inside the 120 s skew; a genuinely dead one fails closed at the
+    /// server) and the session — including the biometric restore path's state — stays intact. This is
+    /// the OTHER half of the 0.7.1 (#205) regression, where any refresh hiccup wiped the session.
+    #[test]
+    fn transient_refresh_failure_keeps_the_cached_session() {
+        // A bound-then-dropped port: connecting fails fast (connection refused), no server runs.
+        let dead_addr = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap()
+        };
+
+        let state = build_state("refresh-transient");
+        state.config.lock().unwrap().share_base_url = format!("http://{dead_addr}");
+        *state.account_session.lock().unwrap() = Some(crate::share::AccountSession {
+            account_id: "acct-1".into(),
+            email: "user@example.com".into(),
+            server_user_id: None,
+            device_id: "dev-1".into(),
+            mk: Zeroizing::new([7u8; 32]),
+            generation: 1,
+            access_token: "cached-access".into(),
+            access_expires_at: Some("2020-01-01T00:00:00Z".into()),
+            refresh_token: "r0".into(),
+        });
+
+        let token = block_on(valid_access_token(&state)).unwrap();
+        assert_eq!(
+            token, "cached-access",
+            "a transient refresh failure must fall back to the cached bearer, not error"
+        );
+
+        // The session survives untouched — nothing cleared, refresh token still spendable.
+        let g = state.account_session.lock().unwrap();
+        let s = g
+            .as_ref()
+            .expect("session must NOT be cleared on a transient failure");
+        assert_eq!(s.refresh_token, "r0");
+    }
+
+    /// The pure failure policy: a DEFINITIVE `Auth` refusal propagates (the session is dead and
+    /// `refresh_session` already cleared it — the FE must route to sign-in); every other failure
+    /// domain falls back to the cached bearer.
+    #[test]
+    fn refresh_failure_fallback_policy() {
+        let auth = refresh_failure_fallback(AppError::Auth("refused".into()), "cached".into());
+        assert!(matches!(auth, Err(AppError::Auth(_))));
+        let net =
+            refresh_failure_fallback(AppError::Unavailable("offline".into()), "cached".into());
+        assert_eq!(net.unwrap(), "cached");
+        let storage = refresh_failure_fallback(AppError::Storage("disk".into()), "cached".into());
+        assert_eq!(storage.unwrap(), "cached");
+    }
+
+    // ── M5-CLIENT (mode B) tests ──────────────────────────────────────────────────────────────────
+
+    use crate::e2ee::keys::{derive_identity, generate_master_key, IdentityKeypair};
+    use crate::e2ee::wrap::{pack_wrapped_key, seal_to_recipient, UnpackedGrant};
+    use crate::e2ee::{key_fingerprint, random_key32, seal_content};
+    use murmur_protocol::envelope::ShareEnvelope;
+
+    /// Build a `(sender, recipient)` identity pair from two fixed MKs (deterministic, no network).
+    fn mode_b_pair() -> (IdentityKeypair, [u8; 32], IdentityKeypair, [u8; 32]) {
+        let sender_mk = *generate_master_key().unwrap();
+        let recip_mk = *generate_master_key().unwrap();
+        let sender = derive_identity(&sender_mk, "sender@acct", 1).unwrap();
+        let recipient = derive_identity(&recip_mk, "recipient@acct", 1).unwrap();
+        (sender, sender_mk, recipient, recip_mk)
+    }
+
+    /// Craft the accept-side inputs a real inbox item + blob would carry: a valid grant sealed by
+    /// `sender` to `recipient`, packed into the opaque `wrapped_key`, plus the content cell `C`.
+    fn craft_valid_grant(
+        sender: &IdentityKeypair,
+        recipient: &IdentityKeypair,
+        env: &ShareEnvelope,
+        share_id: &str,
+        rev: u32,
+    ) -> (UnpackedGrant, Vec<u8>, String) {
+        let nk = random_key32().unwrap();
+        let content = seal_content(&nk, env, share_id, rev).unwrap();
+        let sender_fp = key_fingerprint(&sender.pk_enc, &sender.pk_sig);
+        let recipient_fp = key_fingerprint(&recipient.pk_enc, &recipient.pk_sig);
+        let grant = seal_to_recipient(
+            &nk,
+            &content,
+            &recipient.pk_enc,
+            &recipient_fp,
+            sender,
+            &sender_fp,
+            1,
+            share_id,
+            rev,
+        )
+        .unwrap();
+        let blob = pack_wrapped_key(&sender.pk_enc, &sender.pk_sig, &grant).unwrap();
+        let up = crate::e2ee::wrap::unpack_wrapped_key(&blob, &grant.signature).unwrap();
+        (up, content, sender_fp)
+    }
+
+    /// HIGH-BAR: `accept_share` refuses a SEALED (not-session-unlocked) target folder with `Locked`,
+    /// BEFORE any inbox/network/decrypt — RED-before-GREEN for the vault write-gate. Runs with NO
+    /// server + NO login, so a non-`Locked` return would mean the gate wasn't first.
+    #[test]
+    fn accept_share_refuses_a_sealed_target_folder() {
+        let state = build_state("accept-sealed");
+        make_open_folder(&state.db, "f-lock", "Secret");
+        state
+            .db
+            .set_folder_locked("f-lock", true, Some(&b"wrapped"[..]))
+            .unwrap();
+        // NOT session-unlocked.
+        let before = state.db.list_meetings(1000).unwrap().len();
+        let err = block_on(accept_share_inner(
+            &state,
+            "share-xyz".to_string(),
+            Some("f-lock".to_string()),
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(err, AppError::Locked(_)),
+            "sealed target must fail Locked, got {err:?}"
+        );
+        assert_eq!(
+            state.db.list_meetings(1000).unwrap().len(),
+            before,
+            "no meeting written"
+        );
+        assert!(
+            state
+                .db
+                .inbound_share_meeting("share-xyz")
+                .unwrap()
+                .is_none(),
+            "no inbound record"
+        );
+    }
+
+    /// The happy path: a VALID grant → verify + decrypt + ingest writes exactly one `Exported` meeting
+    /// with a `"shared"` note carrying provenance frontmatter (mode-B seal→open round-trip through the
+    /// command's ingest layer).
+    #[test]
+    fn accept_ingest_writes_a_verified_shared_note() {
+        let state = build_state("accept-happy");
+        let target = get_or_create_shared_folder(&state).unwrap();
+        let (sender, _smk, recipient, _rmk) = mode_b_pair();
+        let env = ShareEnvelope::new(
+            "Q3 Strategy",
+            "- ship the thing\n- talk to Alice",
+            "2026-07-04T10:00:00Z",
+        );
+        let (up, content, sender_fp) = craft_valid_grant(&sender, &recipient, &env, "share-1", 1);
+
+        let res = accept_ingest_verified(
+            &state,
+            &target,
+            &recipient,
+            &sender_fp,
+            "sender-uuid",
+            &up,
+            &content,
+            "share-1",
+            1,
+            1,
+        )
+        .unwrap();
+        assert_eq!(res.title, "Q3 Strategy");
+        let note = state
+            .db
+            .get_note(&res.meeting_id, "shared")
+            .unwrap()
+            .unwrap();
+        assert!(
+            note.markdown.contains("ship the thing"),
+            "body ingested: {}",
+            note.markdown
+        );
+        assert!(
+            note.markdown.contains("shared-by: "),
+            "provenance frontmatter present"
+        );
+        assert!(
+            note.markdown.contains("share-id: share-1"),
+            "share-id provenance present"
+        );
+        // Idempotency record written; the meeting is a normal Exported row in the target folder.
+        assert_eq!(
+            state
+                .db
+                .inbound_share_meeting("share-1")
+                .unwrap()
+                .as_deref(),
+            Some(res.meeting_id.as_str())
+        );
+        let m = state.db.get_meeting(&res.meeting_id).unwrap().unwrap();
+        assert!(matches!(m.status, MeetingStatus::Exported));
+        assert!(m.audio_path.is_none(), "shared notes carry no audio");
+    }
+
+    /// The full `accept_share_inner` is idempotent on `share_id`: a second call after a successful
+    /// ingest returns the SAME meeting and writes no duplicate (short-circuits before any network).
+    #[test]
+    fn accept_share_is_idempotent_on_share_id() {
+        let state = build_state("accept-idem");
+        let target = get_or_create_shared_folder(&state).unwrap();
+        let (sender, _s, recipient, _r) = mode_b_pair();
+        let env = ShareEnvelope::new("Dup", "body", "2026-07-04T10:00:00Z");
+        let (up, content, sender_fp) = craft_valid_grant(&sender, &recipient, &env, "share-dup", 1);
+        let first = accept_ingest_verified(
+            &state,
+            &target,
+            &recipient,
+            &sender_fp,
+            "s",
+            &up,
+            &content,
+            "share-dup",
+            1,
+            1,
+        )
+        .unwrap();
+        let count = state.db.list_meetings(1000).unwrap().len();
+        // The command-level idempotency short-circuit returns the existing meeting with no network.
+        let again = block_on(accept_share_inner(&state, "share-dup".to_string(), None)).unwrap();
+        assert_eq!(again.meeting_id, first.meeting_id, "same meeting returned");
+        assert_eq!(
+            state.db.list_meetings(1000).unwrap().len(),
+            count,
+            "no duplicate meeting"
+        );
+    }
+
+    /// §4.8 BINDING through the command layer: an UNSIGNED (zeroed-sig) grant, a TAMPERED content
+    /// cell, and a REPLAY to the wrong recipient are ALL rejected `InvalidArg` and write NOTHING.
+    #[test]
+    fn accept_ingest_rejects_unsigned_tampered_and_replayed_grants() {
+        let state = build_state("accept-reject");
+        let target = get_or_create_shared_folder(&state).unwrap();
+        let (sender, _s, recipient, _r) = mode_b_pair();
+        let env = ShareEnvelope::new("t", "body", "2026-07-04T10:00:00Z");
+
+        // (a) Unsigned: zero the grant signature.
+        let (mut up, content, sender_fp) = craft_valid_grant(&sender, &recipient, &env, "s-a", 1);
+        up.grant.signature = vec![0u8; 64];
+        let e = accept_ingest_verified(
+            &state, &target, &recipient, &sender_fp, "s", &up, &content, "s-a", 1, 1,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(e, AppError::InvalidArg(_)),
+            "unsigned must be rejected"
+        );
+
+        // (b) Tampered content: a different cell than the one the grant's hash binds.
+        let (up, _c, sender_fp) = craft_valid_grant(&sender, &recipient, &env, "s-b", 1);
+        let evil = seal_content(
+            &random_key32().unwrap(),
+            &ShareEnvelope::new("t", "EVIL", "2026-07-04T10:00:00Z"),
+            "s-b",
+            1,
+        )
+        .unwrap();
+        let e = accept_ingest_verified(
+            &state, &target, &recipient, &sender_fp, "s", &up, &evil, "s-b", 1, 1,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(e, AppError::InvalidArg(_)),
+            "tampered cell must be rejected"
+        );
+
+        // (c) Replay to the WRONG recipient (grant addressed to `recipient`, opened by `attacker`).
+        let attacker =
+            derive_identity(&generate_master_key().unwrap(), "attacker@acct", 1).unwrap();
+        let (up, content, sender_fp) = craft_valid_grant(&sender, &recipient, &env, "s-c", 1);
+        let e = accept_ingest_verified(
+            &state, &target, &attacker, &sender_fp, "s", &up, &content, "s-c", 1, 1,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(e, AppError::InvalidArg(_)),
+            "replay to a different recipient must be rejected"
+        );
+
+        // NONE of the three wrote a meeting or an inbound record.
+        assert_eq!(
+            state.db.list_meetings(1000).unwrap().len(),
+            0,
+            "no meeting written for any rejected grant"
+        );
+        for sid in ["s-a", "s-b", "s-c"] {
+            assert!(
+                state.db.inbound_share_meeting(sid).unwrap().is_none(),
+                "no inbound record for {sid}"
+            );
+        }
+    }
+
+    /// TOFU: first contact PINS (on the account_id, not email); the SAME fingerprint proceeds; a
+    /// CHANGED fingerprint for the same contact is a BLOCK (never a silent overwrite).
+    #[test]
+    fn tofu_first_contact_pins_and_a_changed_fingerprint_blocks() {
+        let state = build_state("tofu");
+        let acct = "alice@example.com";
+        // First contact: no pin yet.
+        assert!(matches!(
+            tofu_check(&state.db, acct, "FP-ORIGINAL").unwrap(),
+            TofuState::FirstContact
+        ));
+        state
+            .db
+            .pin_contact(
+                acct,
+                Some("Alice@Example.com"),
+                "FP-ORIGINAL",
+                "2026-07-04T00:00:00Z",
+            )
+            .unwrap();
+        // Same key → Match.
+        assert!(matches!(
+            tofu_check(&state.db, acct, "FP-ORIGINAL").unwrap(),
+            TofuState::Match
+        ));
+        // A different fingerprint for the SAME account → Changed (blocking).
+        assert!(matches!(
+            tofu_check(&state.db, acct, "FP-DIFFERENT").unwrap(),
+            TofuState::Changed
+        ));
+        // The pin persisted the ORIGINAL fingerprint (a Changed check does not overwrite it).
+        assert_eq!(
+            state.db.get_pinned_contact(acct).unwrap().unwrap().1,
+            "FP-ORIGINAL"
+        );
+    }
+
+    /// The mode-B share request carries NO note title or body — only ciphertext + wrapped keys + the
+    /// recipient email. Seal a note with distinctive plaintext, build the exact `POST /v1/shares`
+    /// body, serialize it, and assert the plaintext never appears.
+    #[test]
+    fn share_to_user_request_leaks_no_note_content() {
+        let (sender, _s, recipient, _r) = mode_b_pair();
+        let nk = random_key32().unwrap();
+        let title = "TOPSECRET_TITLE_ZZZ";
+        let body = "TOPSECRET_BODY_QQQ meeting minutes";
+        let env = ShareEnvelope::new(title, body, "2026-07-04T10:00:00Z");
+        let content = seal_content(&nk, &env, "s-leak", 1).unwrap();
+        let sender_fp = key_fingerprint(&sender.pk_enc, &sender.pk_sig);
+        let recipient_fp = key_fingerprint(&recipient.pk_enc, &recipient.pk_sig);
+        let grant = seal_to_recipient(
+            &nk,
+            &content,
+            &recipient.pk_enc,
+            &recipient_fp,
+            &sender,
+            &sender_fp,
+            1,
+            "s-leak",
+            1,
+        )
+        .unwrap();
+        let wrapped = pack_wrapped_key(&sender.pk_enc, &sender.pk_sig, &grant).unwrap();
+        let recipients = vec![murmur_protocol::dto::ShareRecipientInput {
+            email: "bob@example.com".to_string(),
+            wrapped_key: Some(wrapped),
+            key_generation: Some(1),
+            grant_sig: Some(grant.signature),
+        }];
+        let req = assemble_user_share_request("s-leak", 1, content, recipients, None);
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            !json.contains(title),
+            "title must never appear in the request body"
+        );
+        assert!(
+            !json.contains("TOPSECRET_BODY_QQQ"),
+            "note body must never appear in the request body"
+        );
+        assert!(
+            json.contains("bob@example.com"),
+            "the recipient email is present (allowed metadata)"
+        );
+    }
+
+    /// MANUAL voice command: with NO recording in progress, arming reports `listening:false`
+    /// ("not recording") and leaves the capture state empty — the live loop (which only runs while
+    /// recording) would never consume it, so we must not pretend to listen.
+    #[test]
+    fn begin_voice_command_not_recording_does_not_arm() {
+        let state = build_state("voicecmd-notrec");
+        assert!(
+            state.recorder.lock().unwrap().is_none(),
+            "precondition: not recording"
+        );
+
+        let res = begin_voice_command_inner(&state).unwrap();
+        assert!(!res.listening, "must not listen when not recording");
+        assert_eq!(res.reason.as_deref(), Some("not recording"));
+        assert!(
+            state.voice_command_capture.lock().unwrap().is_none(),
+            "no capture must be armed when not recording"
+        );
+    }
+
+    /// TP-F1 (RED-before-GREEN, fresh-install regression): the PURE arm decision. A RECORDING is in
+    /// progress (`Some(offset)`) but NO live loop is running (`live_running=false`) — the fresh-install
+    /// heavy-turbo default arm where `start_recording` sets `live_model=None` and spawns no live loop.
+    /// The decision must REFUSE cleanly ("voice needs the live model"), NOT arm — pre-fix the code saw
+    /// only the present recorder and armed a capture no consumer would ever transcribe, wedging the FE
+    /// in "listening…". This targets the extracted pure helper (a real `Recorder` can't be built
+    /// headless), covering all three arms: not-recording, recording-without-consumer, recording+consumer.
+    #[test]
+    fn voice_command_arm_refuses_without_a_live_consumer() {
+        // Not recording at all → "not recording", regardless of live_running.
+        assert_eq!(
+            voice_command_arm_decision(None, true).unwrap_err().reason.as_deref(),
+            Some("not recording")
+        );
+        assert_eq!(
+            voice_command_arm_decision(None, false).unwrap_err().reason.as_deref(),
+            Some("not recording")
+        );
+        // RECORDING but NO live consumer (the fresh-install wedge) → refuse cleanly, arm nothing.
+        let refusal = voice_command_arm_decision(Some(4800), false).unwrap_err();
+        assert!(!refusal.listening, "must not arm a consumer-less generation");
+        assert_eq!(
+            refusal.reason.as_deref(),
+            Some("voice needs the live model"),
+            "the wedge case must surface a clear reason, not arm"
+        );
+        // RECORDING + a live consumer → cleared to arm at the latched offset.
+        assert_eq!(
+            voice_command_arm_decision(Some(4800), true).unwrap(),
+            4800,
+            "with a live consumer, the click arms at the latched offset"
+        );
+    }
+
+    /// The inner integration for the not-recording path (no recorder ⇒ not recording), still exercising
+    /// `begin_voice_command_inner` end-to-end. The recording-present arms need a real audio device, so
+    /// the recording×consumer matrix is covered by the pure-decision test above.
+    #[test]
+    fn begin_voice_command_inner_not_recording_arms_nothing() {
+        let state = build_state("voicecmd-inner-notrec");
+        let res = begin_voice_command_inner(&state).unwrap();
+        assert!(!res.listening);
+        assert_eq!(res.reason.as_deref(), Some("not recording"));
+        assert!(state.voice_command_capture.lock().unwrap().is_none());
+    }
+
+    /// MANUAL voice command: arming sets a fresh full-budget [`crate::state::CaptureState`] on the
+    /// state (the live loop reads it). We exercise the arming half directly (a live `Recorder` needs
+    /// a real audio device); the decision/dispatch half is unit-tested in `transcribe::live`.
+    #[test]
+    fn begin_voice_command_arms_capture_state() {
+        use crate::state::CaptureState;
+        let state = build_state("voicecmd-arm");
+        // Simulate the arm-while-recording write the inner does once the recorder gate passes.
+        {
+            let mut g = state.voice_command_capture.lock().unwrap();
+            *g = Some(CaptureState::armed());
+        }
+        let armed = *state.voice_command_capture.lock().unwrap();
+        assert_eq!(
+            armed,
+            Some(CaptureState {
+                budget: CaptureState::DEFAULT_BUDGET,
+                start_sample: None,
+                ended: false
+            }),
+            "arming must store a fresh full-budget capture the live loop can consume"
+        );
+    }
+
+    /// CLICK-TO-STOP: `end_voice_command` on an ARMED capture flips `ended` so the live loop
+    /// dispatches the FULL accumulated utterance on its next tick — it does NOT clear the capture
+    /// itself (the live loop owns the terminal clear-on-dispatch).
+    #[test]
+    fn end_voice_command_flags_armed_capture_to_dispatch() {
+        use crate::state::CaptureState;
+        let state = build_state("voicecmd-end-armed");
+        {
+            let mut g = state.voice_command_capture.lock().unwrap();
+            *g = Some(CaptureState::armed_from(1000));
+        }
+
+        let res = end_voice_command_inner(&state).unwrap();
+        assert!(res.stopped, "an armed capture must report stopped:true");
+
+        let after = state
+            .voice_command_capture
+            .lock()
+            .unwrap()
+            .expect("capture still present");
+        assert!(
+            after.ended,
+            "the user's stop must flip `ended` so the live loop dispatches"
+        );
+        assert_eq!(
+            after.start_sample,
+            Some(1000),
+            "the latched offset is preserved"
+        );
+    }
+
+    /// CLICK-TO-STOP: `end_voice_command` on a NOT-armed state (double-click, already auto-stopped at
+    /// the backstop, or never started) is a graceful no-op (`stopped: false`), never an error.
+    #[test]
+    fn end_voice_command_not_armed_is_graceful_noop() {
+        let state = build_state("voicecmd-end-noop");
+        assert!(
+            state.voice_command_capture.lock().unwrap().is_none(),
+            "precondition: not armed"
+        );
+
+        let res = end_voice_command_inner(&state).unwrap();
+        assert!(
+            !res.stopped,
+            "a not-armed end must be a graceful no-op (stopped:false)"
+        );
+        assert!(
+            state.voice_command_capture.lock().unwrap().is_none(),
+            "a no-op end must not fabricate a capture"
+        );
+    }
+
+    fn seed_meeting(db: &Db, mid: &str, markdown: &str, folder_id: Option<&str>) {
+        db.insert_meeting(&Meeting {
+            id: mid.to_string(),
+            started_at: "2026-06-27T09:00:00Z".to_string(),
+            ended_at: None,
+            title: Some("Quarterly strategy".to_string()),
+            duration_s: 600,
+            audio_path: None,
+            status: MeetingStatus::Summarized,
+            folder_id: None, // association lives on notes; set via set_meeting_folder below
+        })
+        .unwrap();
+        db.upsert_note(&NoteRecord {
+            meeting_id: mid.to_string(),
+            provider_id: "claude_code".to_string(),
+            markdown: markdown.to_string(),
+            created_at: "2026-06-27T09:05:00Z".to_string(),
+            exported_path: None,
+            model_requested: None,
+            model_served: None,
+            gateway_host: None,
+        })
+        .unwrap();
+        db.insert_segments(
+            mid,
+            &[
+                Segment {
+                    idx: 0,
+                    start_s: 0.0,
+                    end_s: 2.0,
+                    text: "alpha bravo".to_string(),
+                    speaker: None,
+                    confidence: None,
+                },
+                Segment {
+                    idx: 1,
+                    start_s: 2.0,
+                    end_s: 4.0,
+                    text: "charlie delta".to_string(),
+                    speaker: None,
+                    confidence: None,
+                },
+            ],
+        )
+        .unwrap();
+        db.set_timeline_data(mid, "{\"topics\":[],\"speakers\":[]}")
+            .unwrap();
+        db.set_meeting_folder(mid, folder_id).unwrap();
+    }
+
+    fn make_open_folder(db: &Db, id: &str, path: &str) {
+        db.insert_folder(&Folder {
+            id: id.to_string(),
+            name: path.to_string(),
+            path: path.to_string(),
+            parent_id: None,
+            locked: false,
+            created_at: "2026-06-27T08:00:00Z".to_string(),
+        })
+        .unwrap();
+    }
+
+    /// Seed a meeting with an explicit title + audio path into a folder (association lives on the
+    /// note's `folder_id`, resolved back by `list_meetings`).
+    fn seed_titled_meeting(db: &Db, mid: &str, title: &str, audio: &str, folder_id: &str) {
+        db.insert_meeting(&Meeting {
+            id: mid.to_string(),
+            started_at: "2026-07-04T09:00:00Z".to_string(),
+            ended_at: None,
+            title: Some(title.to_string()),
+            duration_s: 600,
+            audio_path: Some(audio.to_string()),
+            status: MeetingStatus::Summarized,
+            folder_id: None,
+        })
+        .unwrap();
+        db.upsert_note(&NoteRecord {
+            meeting_id: mid.to_string(),
+            provider_id: "claude_code".to_string(),
+            markdown: "# note".to_string(),
+            created_at: "2026-07-04T09:05:00Z".to_string(),
+            exported_path: None,
+            model_requested: None,
+            model_served: None,
+            gateway_host: None,
+        })
+        .unwrap();
+        db.set_meeting_folder(mid, Some(folder_id)).unwrap();
+    }
+
+    // ── Recording-time COMPANION NOTE (2026-07-16) ───────────────────────────────────────────────
+
+    /// PURE: `provisional_meeting_title` yields a stable, human, date/time-based headline.
+    #[test]
+    fn provisional_meeting_title_is_stable_and_human() {
+        let dt = chrono::DateTime::parse_from_rfc3339("2026-07-16T14:05:33-04:00").unwrap();
+        assert_eq!(provisional_meeting_title(&dt), "Meeting 2026-07-16 14:05");
+    }
+
+    /// PURE: `meeting_display_name` uses the title when present, else a safe non-empty fallback
+    /// (so `[[<name>]]` is never `[[]]`).
+    #[test]
+    fn meeting_display_name_falls_back_when_blank() {
+        assert_eq!(meeting_display_name(Some("Q3 Planning")), "Q3 Planning");
+        assert_eq!(meeting_display_name(Some("  Trimmed  ")), "Trimmed");
+        assert_eq!(meeting_display_name(Some("   ")), "Untitled meeting");
+        assert_eq!(meeting_display_name(None), "Untitled meeting");
+    }
+
+    /// PURE: `compose_companion_markdown` inserts/refreshes the managed `meeting:` front-matter key
+    /// IDEMPOTENTLY and APPENDS blocks with a blank-line separator, never blanking prior content.
+    #[test]
+    fn compose_companion_markdown_idempotent_link_and_append() {
+        // First append onto empty content: fresh front-matter + the block as the body.
+        let m1 = compose_companion_markdown("", "Q3 Planning", "First jot.");
+        assert!(m1.contains("meeting: \"[[Q3 Planning]]\""));
+        assert!(m1.contains("First jot."));
+        assert_eq!(m1.matches("meeting:").count(), 1, "exactly one meeting key");
+
+        // Second append: prior body preserved, block appended, still ONE meeting key (no duplicate).
+        let m2 = compose_companion_markdown(&m1, "Q3 Planning", "Second jot.");
+        assert!(m2.contains("First jot."), "prior content is never blanked");
+        assert!(m2.contains("Second jot."));
+        assert_eq!(m2.matches("meeting:").count(), 1, "no duplicate meeting key on re-append");
+
+        // A rename REWRITES the link line to the new name (no duplicate, body intact).
+        let m3 = compose_companion_markdown(&m2, "Q3 Planning (final)", "");
+        assert!(m3.contains("meeting: \"[[Q3 Planning (final)]]\""));
+        assert!(!m3.contains("[[Q3 Planning]]\""), "the stale link is replaced");
+        assert!(m3.contains("First jot.") && m3.contains("Second jot."));
+        assert_eq!(m3.matches("meeting:").count(), 1);
+
+        // A note that ALREADY has OTHER front-matter keys keeps them + gains the meeting key.
+        let with_tags = "---\ntags: [a, b]\n---\n\nBody here.";
+        let m4 = compose_companion_markdown(with_tags, "Sync", "New line.");
+        assert!(m4.contains("tags: [a, b]"), "existing keys preserved");
+        assert!(m4.contains("meeting: \"[[Sync]]\""));
+        assert!(m4.contains("Body here.") && m4.contains("New line."));
+    }
+
+    /// LAZY-CREATE + APPEND (RED→GREEN for the append/lazy-create path): the FIRST append creates ONE
+    /// companion note in the open Notes ROOT, links it by `meeting_id`, stamps the `[[Meeting]]`
+    /// front-matter, and mirrors the block into `manual_notes`. A SECOND append reuses the SAME note
+    /// (one-note-per-meeting) and preserves the first block. RED against no-lazy-create / overwrite.
+    #[test]
+    fn append_to_companion_note_lazy_creates_then_reuses() {
+        let state = build_state("companion-append");
+        // An OPEN, in-progress meeting with a provisional title (as start_recording now sets).
+        state
+            .db
+            .insert_meeting(&Meeting {
+                id: "m-rec".to_string(),
+                started_at: "2026-07-16T10:00:00Z".to_string(),
+                ended_at: None,
+                title: Some("Meeting 2026-07-16 10:00".to_string()),
+                duration_s: 0,
+                audio_path: None,
+                status: MeetingStatus::Recording,
+                folder_id: None,
+            })
+            .unwrap();
+
+        let r1 = append_to_companion_note_inner(&state, "m-rec", "First jotted note.").unwrap();
+        assert_eq!(r1.meeting_wikilink, "[[Meeting 2026-07-16 10:00]]");
+        // Structurally linked + exactly one companion note.
+        assert_eq!(
+            state
+                .db
+                .companion_note_for_meeting("m-rec")
+                .unwrap()
+                .as_deref(),
+            Some(r1.note_id.as_str())
+        );
+        // manual_notes mirrors the block (enhance/summary pipeline still sees it).
+        assert!(state
+            .db
+            .get_manual_notes("m-rec")
+            .unwrap()
+            .contains("First jotted note."));
+
+        // Second append reuses the SAME note and preserves the first block.
+        let r2 = append_to_companion_note_inner(&state, "m-rec", "Second jotted note.").unwrap();
+        assert_eq!(r2.note_id, r1.note_id, "one living companion note per meeting");
+        let row = state.db.get_note_row(&r1.note_id).unwrap().unwrap();
+        assert!(row.text.contains("First jotted note."), "first block preserved");
+        assert!(row.text.contains("Second jotted note."));
+        assert_eq!(row.text.matches("meeting:").count(), 1, "no duplicate front-matter link");
+        // manual_notes appended (never overwritten): both blocks present.
+        let mn = state.db.get_manual_notes("m-rec").unwrap();
+        assert!(mn.contains("First jotted note.") && mn.contains("Second jotted note."));
+    }
+
+    /// GATE (RED→GREEN for the leak class): `append_to_companion_note` on a SEALED-and-not-session-
+    /// unlocked meeting REFUSES with `AppError::Locked` and writes NOTHING; a session-unlock reverses
+    /// it. Mirrors the `save_note` tool's gate. RED against dropping the `meeting_is_unlocked` check.
+    #[test]
+    fn append_to_companion_note_refused_for_sealed_meeting() {
+        let state = build_state("companion-lockgate");
+        make_open_folder(&state.db, "f-lock", "Secret");
+        seed_titled_meeting(&state.db, "m-locked", "Board strategy", "/data/m.wav", "f-lock");
+        state
+            .db
+            .set_folder_locked("f-lock", true, Some(&b"wrapped"[..]))
+            .unwrap();
+        // NOT session-unlocked.
+
+        let err =
+            append_to_companion_note_inner(&state, "m-locked", "secret note").unwrap_err();
+        assert!(
+            matches!(err, AppError::Locked(_)),
+            "a sealed meeting must refuse with Locked, got: {err:?}"
+        );
+        // Nothing written: no companion note exists.
+        assert!(state
+            .db
+            .companion_note_for_meeting("m-locked")
+            .unwrap()
+            .is_none());
+    }
+
+    /// TITLE SYNC (Task 6): renaming a meeting refreshes its companion note's managed title +
+    /// front-matter `[[Meeting]]` link. Best-effort — never fails the rename.
+    #[test]
+    fn companion_note_title_syncs_on_rename() {
+        let state = build_state("companion-titlesync");
+        state
+            .db
+            .insert_meeting(&Meeting {
+                id: "m-sync".to_string(),
+                started_at: "2026-07-16T11:00:00Z".to_string(),
+                ended_at: None,
+                title: Some("Meeting 2026-07-16 11:00".to_string()),
+                duration_s: 0,
+                audio_path: None,
+                status: MeetingStatus::Recording,
+                folder_id: None,
+            })
+            .unwrap();
+        let r = append_to_companion_note_inner(&state, "m-sync", "a jot").unwrap();
+
+        // Rename the meeting → sync updates the note's title + link.
+        state.db.set_meeting_title("m-sync", "Renamed Topic").unwrap();
+        sync_companion_note_title_best_effort(&state, "m-sync");
+
+        let row = state.db.get_note_row(&r.note_id).unwrap().unwrap();
+        assert_eq!(row.title.as_deref(), Some("Renamed Topic"), "managed title synced");
+        assert!(
+            row.text.contains("meeting: \"[[Renamed Topic]]\""),
+            "front-matter link synced to the new title"
+        );
+        assert!(row.text.contains("a jot"), "body content preserved through the sync");
+    }
+
+    /// DOCUMENT-FIRST EAGER-CREATE (v2, Task 1): `get_or_create_companion_note` returns a REAL note id
+    /// and the `[[Meeting]]` wikilink WITHOUT writing any body — the freshly-birthed note carries only
+    /// the managed front-matter link (body empty), is linked by `meeting_id`, and a second call reuses
+    /// the SAME note (idempotent). No `manual_notes` mirror is written by this path.
+    #[test]
+    fn get_or_create_companion_note_eager_creates_empty_and_reuses() {
+        let state = build_state("companion-getorcreate");
+        state
+            .db
+            .insert_meeting(&Meeting {
+                id: "m-doc".to_string(),
+                started_at: "2026-07-17T09:00:00Z".to_string(),
+                ended_at: None,
+                title: Some("Sync 2026-07-17".to_string()),
+                duration_s: 0,
+                audio_path: None,
+                status: MeetingStatus::Recording,
+                folder_id: None,
+            })
+            .unwrap();
+
+        let r1 = get_or_create_companion_note_inner(&state, "m-doc").unwrap();
+        assert_eq!(r1.meeting_wikilink, "[[Sync 2026-07-17]]");
+        // The note exists, is id-linked, and carries the front-matter link but an EMPTY body.
+        assert_eq!(
+            state.db.companion_note_for_meeting("m-doc").unwrap().as_deref(),
+            Some(r1.note_id.as_str())
+        );
+        let row = state.db.get_note_row(&r1.note_id).unwrap().unwrap();
+        assert!(
+            row.text.contains("meeting: \"[[Sync 2026-07-17]]\""),
+            "front-matter link stamped on the eager-created note"
+        );
+        assert!(companion_body_is_empty(&row.text), "no body written by the eager create");
+        // No manual_notes mirror from this path.
+        assert_eq!(state.db.get_manual_notes("m-doc").unwrap(), "");
+
+        // Idempotent: a second call reuses the same note.
+        let r2 = get_or_create_companion_note_inner(&state, "m-doc").unwrap();
+        assert_eq!(r2.note_id, r1.note_id, "one living companion note per meeting");
+    }
+
+    /// EMPTY-COMPANION CLEANUP (v2, Task 2, RED→GREEN): `delete_companion_note_if_empty` deletes an
+    /// auto-created companion note whose BODY is whitespace-only (returns `true`), and KEEPS a companion
+    /// note that has ANY user content (returns `false`). RED against a naive "always delete" or a
+    /// front-matter-blind emptiness check (the managed `meeting:` link would falsely read as content).
+    #[test]
+    fn delete_companion_note_if_empty_deletes_empty_keeps_nonempty() {
+        // Case A: an EAGER-created, never-written companion note (body empty) is deleted.
+        let state = build_state("companion-delete-empty");
+        state
+            .db
+            .insert_meeting(&Meeting {
+                id: "m-empty".to_string(),
+                started_at: "2026-07-17T09:00:00Z".to_string(),
+                ended_at: None,
+                title: Some("Untouched".to_string()),
+                duration_s: 0,
+                audio_path: None,
+                status: MeetingStatus::Recording,
+                folder_id: None,
+            })
+            .unwrap();
+        let r = get_or_create_companion_note_inner(&state, "m-empty").unwrap();
+        assert!(state.db.get_note_row(&r.note_id).unwrap().is_some());
+
+        let deleted = block_on(delete_companion_note_if_empty_inner(&state, "m-empty")).unwrap();
+        assert!(deleted, "a body-empty companion note is deleted");
+        assert!(
+            state.db.companion_note_for_meeting("m-empty").unwrap().is_none(),
+            "the empty companion note is gone"
+        );
+
+        // Case B: a companion note WITH user content is KEPT untouched.
+        let state2 = build_state("companion-delete-nonempty");
+        state2
+            .db
+            .insert_meeting(&Meeting {
+                id: "m-used".to_string(),
+                started_at: "2026-07-17T10:00:00Z".to_string(),
+                ended_at: None,
+                title: Some("Used".to_string()),
+                duration_s: 0,
+                audio_path: None,
+                status: MeetingStatus::Recording,
+                folder_id: None,
+            })
+            .unwrap();
+        let used = append_to_companion_note_inner(&state2, "m-used", "A real jot.").unwrap();
+        let deleted2 = block_on(delete_companion_note_if_empty_inner(&state2, "m-used")).unwrap();
+        assert!(!deleted2, "a companion note with content is NOT deleted");
+        let row = state2.db.get_note_row(&used.note_id).unwrap().unwrap();
+        assert!(row.text.contains("A real jot."), "user content preserved");
+
+        // No companion note at all ⇒ false (nothing to clean up), not an error.
+        let none = block_on(delete_companion_note_if_empty_inner(&state2, "m-never")).unwrap();
+        assert!(!none, "no companion note ⇒ false");
+    }
+
+    /// #2 (0.7 security fast-follow): `list_meetings` MUST mask a sealed-and-NOT-session-unlocked
+    /// meeting at the BACKEND — the real AI title + `.enc` `audio_path` may not cross IPC (the Library
+    /// lock gate is enforced in code, not trusted to the FE). This is the RED-before-GREEN regression:
+    /// on the unpatched command a sealed row still carried "Board strategy" + its `.enc` path. The
+    /// `folder_id` stays (the FE keys the lock badge off it), an OPEN-folder meeting is untouched, and
+    /// a session-unlock reveals the real fields again (masking is reversible, never lossy).
+    #[test]
+    fn list_meetings_masks_a_sealed_meeting_at_the_backend() {
+        let state = build_state("list-mask");
+        let db = &state.db;
+        make_open_folder(db, "f-sealed", "Secret");
+        make_open_folder(db, "f-open", "Standups");
+        seed_titled_meeting(
+            db,
+            "m-sealed",
+            "Board strategy",
+            "/data/m-sealed.wav.enc",
+            "f-sealed",
+        );
+        seed_titled_meeting(db, "m-open", "Open standup", "/data/m-open.wav", "f-open");
+        db.set_folder_locked("f-sealed", true, Some(&b"wrapped"[..]))
+            .unwrap();
+        // NOT session-unlocked: `unlocked_folders` stays empty.
+
+        let masked = mask_locked_meetings(&state, db.list_meetings(200).unwrap()).unwrap();
+        let sealed = masked.iter().find(|m| m.id == "m-sealed").unwrap();
+        assert_eq!(
+            sealed.title.as_deref(),
+            Some("🔒 Locked"),
+            "the real AI title must be masked at the backend for a sealed meeting"
+        );
+        assert_eq!(
+            sealed.audio_path, None,
+            "the .enc audio_path must be nulled so nothing can feed convertFileSrc"
+        );
+        assert_eq!(
+            sealed.folder_id.as_deref(),
+            Some("f-sealed"),
+            "folder_id is preserved so the FE still renders the lock badge"
+        );
+
+        // The open-folder meeting is untouched.
+        let open = masked.iter().find(|m| m.id == "m-open").unwrap();
+        assert_eq!(open.title.as_deref(), Some("Open standup"));
+        assert_eq!(open.audio_path.as_deref(), Some("/data/m-open.wav"));
+
+        // Session-unlock the sealed folder → the real title + audio path come back (reversible).
+        state
+            .unlocked_folders
+            .lock()
+            .unwrap()
+            .insert("f-sealed".to_string());
+        let unmasked = mask_locked_meetings(&state, db.list_meetings(200).unwrap()).unwrap();
+        let now = unmasked.iter().find(|m| m.id == "m-sealed").unwrap();
+        assert_eq!(now.title.as_deref(), Some("Board strategy"));
+        assert_eq!(now.audio_path.as_deref(), Some("/data/m-sealed.wav.enc"));
+    }
+
+    /// DELETE-CASCADE FIX (Bug A) — deleting a meeting that has a LIVE org share must revoke it (never
+    /// leave a dangling `uploaded` row the background org-sync tick would resurrect). No live
+    /// server/session in this unit test, so the tombstone call fails closed — the row is still driven
+    /// to (at least) `revoke_pending` FIRST, and the delete itself fails loud + the local meeting
+    /// SURVIVES (never half-deleted-locally-with-a-dangling-server-copy). RED before the fix: the
+    /// unpatched `delete_meeting` never touched `org_shares`, so the meeting would vanish locally
+    /// while its share stayed `uploaded` (the resurrection bug).
+    #[test]
+    fn delete_meeting_revokes_a_live_org_share() {
+        let state = build_state("meeting-delete-org-revoke");
+        let db = &state.db;
+        make_open_folder(db, "f-open", "Standups");
+        seed_titled_meeting(db, "m1", "Shared standup", "/data/m1.wav", "f-open");
+
+        db.insert_org_share(
+            "share-meeting-1", "org-1", Some("m1"), None, "meeting", Some("Shared standup"), 1, 1,
+            &[5u8; 32], "2026-07-15T00:00:00Z",
+        )
+        .unwrap();
+        db.set_org_share_uploaded("share-meeting-1", "item-meeting-1", "2026-07-15T00:00:00Z")
+            .unwrap();
+
+        let err = block_on(delete_meeting_inner(&state, "m1")).unwrap_err();
+        assert!(
+            matches!(err, AppError::Unavailable(_)),
+            "delete fails loud when the revoke can't reach the server (no session), got {err:?}"
+        );
+        let row = db.get_org_share("share-meeting-1").unwrap().unwrap();
+        assert_ne!(
+            row.state, "uploaded",
+            "a live org share must be moved off `uploaded` before the delete gives up"
+        );
+        assert!(
+            db.get_meeting("m1").unwrap().is_some(),
+            "a failed (revoke-blocked) delete must not have removed the local meeting"
+        );
+    }
+
+    /// Quiet-Glass verifier finding (2026-07-11): `list_meetings_by_tag` returned rows WITHOUT the
+    /// backend mask — a sealed meeting's real AI title + `.enc` audio path crossed IPC whenever the
+    /// Library was filtered by tag (the FE then leaked the title into the delete-confirm
+    /// `aria-label`). RED on the unpatched command (it called `db.list_meetings_by_tag` directly);
+    /// GREEN now that it routes through `list_meetings_by_tag_inner` → `mask_locked_meetings`,
+    /// exactly like `list_meetings`. Reversible on session-unlock, open-folder rows untouched.
+    #[test]
+    fn list_meetings_by_tag_masks_a_sealed_meeting_at_the_backend() {
+        let state = build_state("tag-list-mask");
+        let db = &state.db;
+        make_open_folder(db, "f-sealed", "Secret");
+        make_open_folder(db, "f-open", "Standups");
+        seed_titled_meeting(
+            db,
+            "m-sealed",
+            "Board strategy",
+            "/data/m-sealed.wav.enc",
+            "f-sealed",
+        );
+        seed_titled_meeting(db, "m-open", "Open standup", "/data/m-open.wav", "f-open");
+        db.set_meeting_tags("m-sealed", &["planning".to_string()])
+            .unwrap();
+        db.set_meeting_tags("m-open", &["planning".to_string()])
+            .unwrap();
+        db.set_folder_locked("f-sealed", true, Some(&b"wrapped"[..]))
+            .unwrap();
+        // NOT session-unlocked: `unlocked_folders` stays empty.
+
+        let rows = list_meetings_by_tag_inner(&state, "planning").unwrap();
+        let sealed = rows.iter().find(|m| m.id == "m-sealed").unwrap();
+        assert_eq!(
+            sealed.title.as_deref(),
+            Some("🔒 Locked"),
+            "the tag view must mask a sealed meeting's real title at the backend"
+        );
+        assert_eq!(
+            sealed.audio_path, None,
+            "the .enc audio_path must be nulled on the tag path too (convertFileSrc surface)"
+        );
+        assert_eq!(
+            sealed.folder_id.as_deref(),
+            Some("f-sealed"),
+            "folder_id is preserved so the FE still renders the lock badge"
+        );
+
+        // The open-folder meeting is untouched by the mask.
+        let open = rows.iter().find(|m| m.id == "m-open").unwrap();
+        assert_eq!(open.title.as_deref(), Some("Open standup"));
+        assert_eq!(open.audio_path.as_deref(), Some("/data/m-open.wav"));
+
+        // Session-unlock → the real fields come back (masking is reversible, never lossy).
+        state
+            .unlocked_folders
+            .lock()
+            .unwrap()
+            .insert("f-sealed".to_string());
+        let unmasked = list_meetings_by_tag_inner(&state, "planning").unwrap();
+        let now = unmasked.iter().find(|m| m.id == "m-sealed").unwrap();
+        assert_eq!(now.title.as_deref(), Some("Board strategy"));
+        assert_eq!(now.audio_path.as_deref(), Some("/data/m-sealed.wav.enc"));
+    }
+
+    /// WS6 (Tier 4b) — the NEW structured, egress-free `get_person_dossier` command inherits the
+    /// dossier visibility gate through `get_person_dossier_inner`: with a folder sealed and NOT
+    /// session-unlocked, its meeting + commitment contribute NOTHING to the dossier, and both reappear
+    /// only once the folder id is inserted into the live `unlocked_folders` set. An unknown entity id
+    /// → `AppError::InvalidArg` (unknown vs sealed-only indistinguishable — no existence leak). This
+    /// is the command-seam mirror of `dossier::build_dossier_gates_sealed_and_filters_commitments`.
+    #[test]
+    fn get_person_dossier_gates_sealed() {
+        let state = build_state("person-dossier");
+        let db = &state.db;
+        make_open_folder(db, "f-lock", "Locked");
+        seed_meeting(
+            db,
+            "open1",
+            "## Action items\n- [ ] Anna — draft Atlas spec 2026-07-01\n",
+            None,
+        );
+        seed_meeting(
+            db,
+            "sealedX",
+            "LOCKED Atlas price\n## Action items\n- [ ] Carol — sign 2026-07-09\n",
+            Some("f-lock"),
+        );
+        let atlas = db
+            .upsert_entity("Atlas", crate::storage::models::EntityKind::Project)
+            .unwrap();
+        db.add_mention(&atlas, "open1").unwrap();
+        db.add_mention(&atlas, "sealedX").unwrap();
+        db.set_folder_locked("f-lock", true, Some(&b"wrapped"[..]))
+            .unwrap();
+
+        // Sealed + not session-unlocked: the sealed meeting + its commitment MUST be invisible.
+        let data = get_person_dossier_inner(&state, &atlas).unwrap();
+        assert!(
+            data.meetings.iter().any(|m| m.meeting_id == "open1"),
+            "the visible mentioning meeting must be present"
+        );
+        assert!(
+            data.meetings.iter().all(|m| m.meeting_id != "sealedX"),
+            "sealed-not-unlocked meeting leaked into the dossier (gate violation)"
+        );
+        assert!(
+            data.commitments
+                .iter()
+                .any(|c| c.text.contains("draft Atlas spec")),
+            "the visible commitment must be present"
+        );
+        assert!(
+            data.commitments.iter().all(|c| !c.text.contains("sign")),
+            "sealed-not-unlocked commitment leaked (gate violation)"
+        );
+
+        // Session-unlock the folder → the sealed meeting + its commitment reappear (reversible gate).
+        state
+            .unlocked_folders
+            .lock()
+            .unwrap()
+            .insert("f-lock".to_string());
+        let data2 = get_person_dossier_inner(&state, &atlas).unwrap();
+        assert!(
+            data2.meetings.iter().any(|m| m.meeting_id == "sealedX"),
+            "session-unlock must reveal the sealed meeting"
+        );
+        assert!(
+            data2.commitments.iter().any(|c| c.text.contains("sign")),
+            "session-unlock must reveal the sealed commitment"
+        );
+
+        // Unknown id → InvalidArg (unknown vs sealed-only indistinguishable; no existence leak).
+        match get_person_dossier_inner(&state, "no-such-entity") {
+            Err(AppError::InvalidArg(_)) => {}
+            other => panic!("unknown entity must be InvalidArg, got {other:?}"),
+        }
+    }
+
+    /// WS6 (Tier 4b) DTO contract lock: the serialized `DossierData` the FE receives exposes
+    /// `entity`/`meetings`/`commitments`/`neighbors`/`facts` in camelCase and OMITS `corpus`
+    /// (`#[serde(skip)]`) — so meeting note bodies never cross IPC. Guards both the FE field contract
+    /// and the leak invariant.
+    #[test]
+    fn get_person_dossier_dto_omits_corpus_and_is_camelcase() {
+        let state = build_state("person-dossier-dto");
+        let db = &state.db;
+        seed_meeting(
+            db,
+            "m-open",
+            "## Action items\n- [ ] Anna — draft Atlas spec 2026-07-01\n",
+            None,
+        );
+        let atlas = db
+            .upsert_entity("Atlas", crate::storage::models::EntityKind::Project)
+            .unwrap();
+        db.add_mention(&atlas, "m-open").unwrap();
+
+        let data = get_person_dossier_inner(&state, &atlas).unwrap();
+        let v = serde_json::to_value(&data).unwrap();
+        let obj = v.as_object().expect("dossier serializes to a JSON object");
+        for key in ["entity", "meetings", "commitments", "neighbors", "facts"] {
+            assert!(obj.contains_key(key), "DTO must expose `{key}`");
+        }
+        assert!(
+            !obj.contains_key("corpus"),
+            "corpus must be serde-skipped — note bodies must never cross IPC to the FE"
+        );
+        // Nested camelCase the FE consumes (a commitment carries meetingId/meetingTitle/dueDate).
+        let commit = v["commitments"]
+            .get(0)
+            .expect("the visible commitment must serialize");
+        assert!(
+            commit.get("meetingId").is_some(),
+            "commitment.meetingId must be camelCase"
+        );
+        assert!(
+            commit.get("meeting_id").is_none(),
+            "snake_case commitment.meeting_id must not appear"
+        );
+    }
+
+    /// Add a user-memory fact sourced from `meeting_id` (the gating + purge anchor) for the injection
+    /// tests below.
+    fn add_user_fact(db: &Db, meeting_id: &str, object: &str) {
+        db.apply_user_fact_ops(&[crate::facts::FactOp::Add(crate::facts::NewFact {
+            entity_id: crate::user_memory::USER_SCOPE.to_string(),
+            subject: "You".into(),
+            predicate: "prefer".into(),
+            object: object.into(),
+            valid_from: "2026-06-27T09:00:00Z".into(),
+            recorded_at: "2026-06-27T09:00:00Z".into(),
+            confidence: 1.0,
+            meeting_id: Some(meeting_id.to_string()),
+        })])
+        .unwrap();
+    }
+
+    /// LOCK INVARIANT for the Ask surface's memory injection (RED-before-GREEN, task Phase-1 Ask):
+    /// a user-memory fact whose SOURCE meeting is sealed-and-not-session-unlocked does NOT appear in
+    /// the `ask_vault` system prompt, and an EMPTY memory brief yields a BYTE-IDENTICAL prompt. Before
+    /// the visibility gate on `gated_memory_brief_for_injection` (deleting the
+    /// `list_user_facts_visible` predicate) this FAILS — the sealed fact leaks into the Ask prompt.
+    #[test]
+    fn ask_vault_memory_brief_is_gated_and_empty_is_byte_identical() {
+        let state = build_state("ask-mem-gate");
+        make_open_folder(&state.db, "f1", "Secret");
+        seed_meeting(&state.db, "m1", "We shipped the beta.", None);
+        state.db.set_meeting_folder("m1", Some("f1")).unwrap();
+        add_user_fact(&state.db, "m1", "Polish replies");
+
+        // A grounding corpus + the (byte-identical) EMPTY-brief prompt to compare against.
+        let corpus = "### [[Sync]] · 2026-07-01 · id:m1\nWe shipped the beta.";
+        let (want_empty_system, _) =
+            crate::summarize::vault_chat::build(corpus, &[], "what did we ship?", "");
+
+        // OPEN folder: the fact is VISIBLE → the gated brief carries it → it reaches the Ask prompt.
+        let open = unlocked_snapshot(&state).unwrap();
+        let brief_open = gated_memory_brief_for_injection(&state, &open, "what did we ship?");
+        assert!(
+            brief_open.contains("Polish replies"),
+            "an open-folder user fact must be in the brief"
+        );
+        let (sys_open, _) =
+            crate::summarize::vault_chat::build(corpus, &[], "what did we ship?", &brief_open);
+        assert!(
+            sys_open.contains("Polish replies"),
+            "and reach the Ask system prompt when open"
+        );
+        assert_ne!(
+            sys_open, want_empty_system,
+            "a present brief changes the prompt"
+        );
+
+        // SEAL the folder (session NOT unlocked). Flip the flag only (the real seal purges the fact);
+        // here we prove the READ GATE hides a fact whose row still exists at rest.
+        state
+            .db
+            .set_folder_locked("f1", true, Some(&b"wrapped"[..]))
+            .unwrap();
+        let sealed = unlocked_snapshot(&state).unwrap();
+        let brief_sealed = gated_memory_brief_for_injection(&state, &sealed, "what did we ship?");
+        assert!(
+            brief_sealed.is_empty(),
+            "a sealed-source user fact must NOT be in the injected brief"
+        );
+        let (sys_sealed, _) =
+            crate::summarize::vault_chat::build(corpus, &[], "what did we ship?", &brief_sealed);
+        assert!(
+            !sys_sealed.contains("Polish replies"),
+            "the sealed fact must not reach the Ask prompt"
+        );
+        // Empty brief ⇒ the prompt is BYTE-IDENTICAL to the pre-memory prompt.
+        assert_eq!(
+            sys_sealed, want_empty_system,
+            "empty memory ⇒ byte-identical Ask prompt"
+        );
+
+        // A SESSION UNLOCK re-admits it (reversible gate).
+        state
+            .unlocked_folders
+            .lock()
+            .unwrap()
+            .insert("f1".to_string());
+        let unlocked = unlocked_snapshot(&state).unwrap();
+        assert!(
+            gated_memory_brief_for_injection(&state, &unlocked, "what did we ship?").contains("Polish replies"),
+            "a session unlock must re-admit the user fact to the Ask brief"
+        );
+
+        // FLAG OFF: even the visible fact must NOT be injected when memory is disabled.
+        state.config.lock().unwrap().user_memory_enabled = false;
+        assert!(
+            gated_memory_brief_for_injection(&state, &unlocked, "what did we ship?").is_empty(),
+            "memory disabled must suppress the Ask brief even for a visible fact"
+        );
+        // And get_user_memory reports the explicit disabled marker (empty + disabled:true).
+        let mem = get_user_memory_inner(&state).unwrap();
+        assert!(
+            mem.disabled,
+            "disabled flag ⇒ the audit payload reports disabled"
+        );
+        assert!(
+            mem.facts.is_empty() && mem.brief.is_empty(),
+            "disabled ⇒ nothing surfaced"
+        );
+    }
+
+    /// A deterministic "real" brain for the memory-import path: non-stub id, and `structured`
+    /// returns two fixed user-fact candidates regardless of prompt (the extraction seam is
+    /// exercised; the reconcile + anchoring are the deterministic core under test).
+    struct MockImportBrain;
+    impl crate::reason::LocalReasoner for MockImportBrain {
+        fn id(&self) -> &str {
+            "mock-import"
+        }
+        fn reason(&self, _s: &str, _u: &str) -> Result<String, AppError> {
+            Ok(String::new())
+        }
+        fn structured(
+            &self,
+            _s: &str,
+            _u: &str,
+            _schema: &serde_json::Value,
+        ) -> Result<serde_json::Value, AppError> {
+            Ok(serde_json::json!({
+                "facts": [
+                    { "predicate": "prefers", "object": "Polish replies" },
+                    { "predicate": "works on", "object": "Project Atlas" }
+                ]
+            }))
+        }
+    }
+
+    /// Brain v2 L2.3 (RED-first): `import_memories` — the stub imports 0 and leaves NO synthetic
+    /// meeting behind; a real extraction anchors the Adds to ONE synthetic "Memory Import" meeting
+    /// whose facts are VISIBLE; a re-import of the same text reconciles to NoOps (0 new, and no
+    /// second synthetic meeting); deleting the synthetic meeting UNDOES the whole import. Fails
+    /// before L2.3: the command/inner did not exist.
+    #[test]
+    fn import_memories_dedups_anchors_and_delete_undoes() {
+        let state = build_state("mem-import");
+        let none = HashSet::new();
+        let count_import_meetings = |db: &Db| -> usize {
+            db.list_meetings(100)
+                .unwrap()
+                .iter()
+                .filter(|m| m.id.starts_with("import-"))
+                .count()
+        };
+
+        // Memory disabled ⇒ a loud refusal, nothing persisted.
+        assert!(matches!(
+            import_memories_inner(&state.db, &MockImportBrain, false, "x"),
+            Err(AppError::InvalidArg(_))
+        ));
+        // Empty text ⇒ a loud refusal.
+        assert!(matches!(
+            import_memories_inner(&state.db, &MockImportBrain, true, "   "),
+            Err(AppError::InvalidArg(_))
+        ));
+
+        // STUB (default install): 0 imported, NO synthetic meeting left behind.
+        let n = import_memories_inner(
+            &state.db,
+            &crate::reason::StubReasoner,
+            true,
+            "I like tea",
+        )
+        .unwrap();
+        assert_eq!(n, 0);
+        assert_eq!(count_import_meetings(&state.db), 0, "stub must not create a meeting");
+        assert!(state.db.user_facts_all().unwrap().is_empty());
+
+        // REAL extraction: 2 added, anchored to ONE synthetic meeting, visible via the gated read.
+        let n = import_memories_inner(&state.db, &MockImportBrain, true, "chatgpt export text")
+            .unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(count_import_meetings(&state.db), 1);
+        let visible = state.db.list_user_facts_visible(&none).unwrap();
+        assert_eq!(visible.len(), 2, "imported facts are visible (no-folder meeting)");
+        assert!(visible
+            .iter()
+            .all(|f| f.meeting_id.as_deref().unwrap().starts_with("import-")));
+
+        // RE-IMPORT of the same text: pure dedup — 0 new, and NO second synthetic meeting.
+        let n = import_memories_inner(&state.db, &MockImportBrain, true, "chatgpt export text")
+            .unwrap();
+        assert_eq!(n, 0, "re-import must reconcile to NoOps");
+        assert_eq!(
+            count_import_meetings(&state.db),
+            1,
+            "a no-op import must not create another meeting"
+        );
+
+        // DELETE the synthetic meeting ⇒ the import is undone (facts + their scores gone).
+        let import_id = state
+            .db
+            .list_meetings(100)
+            .unwrap()
+            .into_iter()
+            .find(|m| m.id.starts_with("import-"))
+            .unwrap()
+            .id;
+        state.db.delete_meeting(&import_id).unwrap();
+        assert!(
+            state.db.user_facts_all().unwrap().is_empty(),
+            "deleting the synthetic meeting must undo the import"
+        );
+    }
+
+    /// MEM-1 (RED-before-GREEN): a memory import that SUPERSEDES a pre-existing user fact (anchored to
+    /// ANOTHER meeting) must be FULLY reversible — deleting the synthetic Memory-Import meeting must
+    /// REOPEN the superseded fact, not leave it permanently closed. Pre-fix, `set_meeting_id` stamped
+    /// only the Adds, so `delete_meeting`'s `purge_user_facts_tx` (WHERE meeting_id = import id)
+    /// deleted the import's Add but the pre-existing fact — closed by the reconcile's Invalidate —
+    /// stayed closed forever (a partial undo that silently lost the prior memory). This seeds the prior
+    /// fact under a REAL meeting, imports a colliding value (same subject/predicate, different object),
+    /// asserts the prior fact is now CLOSED + the new one OPEN, then deletes the import and asserts the
+    /// prior fact is REOPEN.
+    #[test]
+    fn import_supersede_is_reversible_delete_reopens_prior_fact() {
+        use crate::facts::{FactOp, NewFact};
+        let state = build_state("mem-import-reopen");
+        let none = HashSet::new();
+
+        // A REAL prior meeting the pre-existing user fact is anchored to (so it is visible + survives
+        // the import; deleting the IMPORT must not touch it beyond reopening).
+        state
+            .db
+            .insert_meeting(&crate::storage::models::Meeting {
+                id: "m-old".to_string(),
+                started_at: "2026-07-01T00:00:00Z".to_string(),
+                ended_at: None,
+                title: Some("Old chat".to_string()),
+                duration_s: 0,
+                audio_path: None,
+                status: crate::storage::models::MeetingStatus::Exported,
+                folder_id: None,
+            })
+            .unwrap();
+        // Pre-existing OPEN user fact keyed (You, "prefers") = "English replies", anchored to m-old.
+        // MockImportBrain emits {"prefers":"Polish replies"} → a same-key/DIFFERENT-object collision.
+        state
+            .db
+            .apply_user_fact_ops(&[FactOp::Add(NewFact {
+                entity_id: crate::user_memory::USER_SCOPE.to_string(),
+                subject: "You".to_string(),
+                predicate: "prefers".to_string(),
+                object: "English replies".to_string(),
+                valid_from: "2026-07-01T00:00:00Z".to_string(),
+                recorded_at: "2026-07-01T00:00:00Z".to_string(),
+                confidence: 1.0,
+                meeting_id: Some("m-old".to_string()),
+            })])
+            .unwrap();
+        let prior_id = state.db.user_facts_all().unwrap()[0].id.clone();
+        assert!(
+            state.db.user_facts_all().unwrap()[0].valid_to.is_none(),
+            "precondition: the prior fact is OPEN"
+        );
+
+        // IMPORT: supersedes "prefers" (English→Polish) and adds "works on".
+        let n = import_memories_inner(&state.db, &MockImportBrain, true, "export").unwrap();
+        assert_eq!(n, 2, "two Adds: the superseding 'prefers' + 'works on'");
+        // The prior fact is now CLOSED (superseded), and the new value is the visible one.
+        let prior_after = state
+            .db
+            .user_facts_all()
+            .unwrap()
+            .into_iter()
+            .find(|f| f.id == prior_id)
+            .unwrap();
+        assert!(
+            prior_after.valid_to.is_some(),
+            "the import superseded (closed) the prior fact"
+        );
+        let visible: Vec<_> = state
+            .db
+            .list_user_facts_visible(&none)
+            .unwrap()
+            .into_iter()
+            .filter(|f| f.predicate == "prefers")
+            .collect();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].object, "Polish replies", "the import's value is current");
+
+        // DELETE the synthetic import ⇒ the reconcile is REVERSED: the prior fact REOPENS, and the
+        // import's own Adds are gone.
+        let import_id = state
+            .db
+            .list_meetings(100)
+            .unwrap()
+            .into_iter()
+            .find(|m| m.id.starts_with("import-"))
+            .unwrap()
+            .id;
+        state.db.delete_meeting(&import_id).unwrap();
+
+        let prior_reopened = state
+            .db
+            .user_facts_all()
+            .unwrap()
+            .into_iter()
+            .find(|f| f.id == prior_id)
+            .expect("the prior fact must still exist (only the import's Adds were deleted)");
+        assert!(
+            prior_reopened.valid_to.is_none(),
+            "deleting the import must REOPEN the superseded prior fact (full undo)"
+        );
+        // And it is once again the visible current value.
+        let visible_after: Vec<_> = state
+            .db
+            .list_user_facts_visible(&none)
+            .unwrap()
+            .into_iter()
+            .filter(|f| f.predicate == "prefers")
+            .collect();
+        assert_eq!(visible_after.len(), 1, "exactly one open 'prefers' fact after undo");
+        assert_eq!(
+            visible_after[0].object, "English replies",
+            "the prior value is current again after undoing the import"
+        );
+    }
+
+    /// FIX 2 (lock-security W2, RED-before-GREEN): the memory-IMPORT extraction reasoner is the
+    /// LIGHT local-or-stub handle — NEVER cloud, even under the exact config where the general
+    /// `extraction_reasoner()` goes cloud (default `brain_live=false` + cloud backend + consent).
+    /// RED on the pre-fix code: `import_memories` resolved `extraction_reasoner()`, whose id is
+    /// `cloud:*` under this config — the pasted third-party memory export would have egressed
+    /// while the FE copy promised on-device.
+    #[test]
+    fn import_extraction_reasoner_is_never_cloud() {
+        let mut state = build_state("import-reasoner");
+        let cloud_cfg = Arc::new(Mutex::new(AppConfig {
+            brain_backend: crate::settings::config::BrainBackend::Cloud,
+            cloud_egress_consented: true,
+            brain_live: false,
+            ..Default::default()
+        }));
+        state.reasoner =
+            crate::reason::ReasonerCell::new(Arc::clone(&cloud_cfg), state.heavy_inference.clone());
+
+        // PRECONDITION (the trap): this config cloud-routes the general extraction seam.
+        assert!(
+            state
+                .reasoner
+                .extraction_reasoner()
+                .id()
+                .starts_with("cloud:"),
+            "precondition: the general extraction seam is cloud under this config"
+        );
+        // The import seam must stay local-or-stub regardless. On a machine WITH the light model
+        // installed this is the local sidecar engine (`sidecar:*`); without it, the stub (⇒ 0 imported).
+        // Both are on-device — the binding invariant is NEVER `cloud:*`.
+        let id = import_extraction_reasoner(&state).id().to_string();
+        assert!(
+            !id.starts_with("cloud:"),
+            "memory import must NEVER extract on a cloud reasoner (got {id})"
+        );
+        assert!(
+            id == "stub" || id.starts_with("sidecar:"),
+            "the import reasoner must be the LIGHT local-or-stub handle (got {id})"
+        );
+    }
+
+    /// FIX 1a (CRITICAL leak, both reviewers — RED-before-GREEN): SEALING purges every
+    /// memory-rollup row inside the seal tx AND deletes its exported vault `.md` at this (command)
+    /// layer — the reproduced leak was a rollup paraphrasing sealed facts persisting indefinitely
+    /// in `memory_rollups.content` + `<vault>/brain/memory/*.md` after `lock_folder`. Also covers
+    /// the relock path (`relock_all_inner`). Rollups are cheap re-derivable synthesis; the next
+    /// hourly pass regenerates them FROM VISIBLE FACTS ONLY.
+    #[test]
+    fn lock_and_relock_purge_memory_rollups_and_their_vault_exports() {
+        let vault = tmp_vault("rollup-seal");
+        let state = build_state_with_vault("rollup-seal", &vault);
+        make_open_folder(&state.db, "f-lock", "Secret");
+        seed_meeting(&state.db, "m1", "# note", Some("f-lock"));
+
+        // A rollup exported to the vault, exactly as the hourly job leaves it.
+        let md = vault.join("brain").join("memory").join("weekly-2026-W28.md");
+        std::fs::create_dir_all(md.parent().unwrap()).unwrap();
+        std::fs::write(&md, "---\nmurmur: memory-rollup\n---\n\nsecret synthesis\n").unwrap();
+        state
+            .db
+            .upsert_memory_rollup("weekly:2026-W28", "secret synthesis", "h1", "2026-07-09T12:00:00Z")
+            .unwrap();
+        state
+            .db
+            .set_memory_rollup_exported("weekly:2026-W28", &md.to_string_lossy())
+            .unwrap();
+
+        lock_folder_inner(&state, "f-lock".to_string()).unwrap();
+
+        assert!(
+            state.db.list_memory_rollups().unwrap().is_empty(),
+            "seal must purge every memory-rollup row"
+        );
+        assert!(!md.exists(), "seal must delete the rollup's exported vault .md");
+
+        // RELOCK path: re-seed (the folder stays locked=1 on disk), then relock_all.
+        std::fs::write(&md, "stale synthesis").unwrap();
+        state
+            .db
+            .upsert_memory_rollup("weekly:2026-W28", "stale synthesis", "h2", "2026-07-09T13:00:00Z")
+            .unwrap();
+        state
+            .db
+            .set_memory_rollup_exported("weekly:2026-W28", &md.to_string_lossy())
+            .unwrap();
+        relock_all_inner(&state).unwrap();
+        assert!(
+            state.db.list_memory_rollups().unwrap().is_empty(),
+            "relock must purge rollup rows too"
+        );
+        assert!(!md.exists(), "relock must delete the exported .md too");
+    }
+
+    // ── VOICEPRINTS (Phase 2): matcher gating + enroll + management ───────────────────────────────
+
+    /// CRITICAL LOCK INVARIANT (RED-before-GREEN): `suggest_speaker_labels` NEVER sources a
+    /// suggestion from a SEALED voiceprint. A labeled prior in a locked-not-unlocked folder must NOT
+    /// match the current meeting's cluster; a session unlock re-admits it. Before the
+    /// `list_voiceprints_visible` gate (an ungated SELECT of labeled priors) this FAILS — the sealed
+    /// person's name leaks as a suggestion.
+    #[test]
+    fn suggest_speaker_labels_never_uses_a_sealed_voiceprint() {
+        let state = build_state("vp-suggest-gate");
+        state.config.lock().unwrap().voiceprint_enabled = true;
+
+        // A LABELED prior voiceprint ("Sarah") living in a folder we will SEAL.
+        make_open_folder(&state.db, "f-secret", "Secret");
+        seed_meeting(&state.db, "prior", "prior note", None);
+        state
+            .db
+            .set_meeting_folder("prior", Some("f-secret"))
+            .unwrap();
+        let sarah = vec![1.0f32, 0.0, 0.0];
+        state
+            .db
+            .insert_voiceprint(
+                "vp-prior",
+                "prior",
+                0,
+                Some("Sarah"),
+                &sarah,
+                "2026-07-01T00:00:00Z",
+            )
+            .unwrap();
+
+        // The CURRENT (open) meeting has a cluster near-identical to Sarah's voiceprint.
+        seed_meeting(&state.db, "cur", "current note", None);
+        let cur_cluster = vec![0.99f32, 0.14, 0.0];
+        state
+            .db
+            .insert_voiceprint(
+                "vp-cur",
+                "cur",
+                1,
+                None,
+                &cur_cluster,
+                "2026-07-02T00:00:00Z",
+            )
+            .unwrap();
+
+        // OPEN prior → the suggestion surfaces (Sarah for others-1).
+        let sugg_open = suggest_speaker_labels_inner(&state, "cur").unwrap();
+        assert_eq!(
+            sugg_open.len(),
+            1,
+            "an open labeled prior yields a suggestion"
+        );
+        assert_eq!(sugg_open[0].speaker, "others-1");
+        assert_eq!(sugg_open[0].suggested_label, "Sarah");
+        assert!(sugg_open[0].score >= 0.9);
+
+        // SEAL the prior's folder (session NOT unlocked): the sealed labeled prior must vanish from
+        // the candidate gallery → NO suggestion. RED here without the gate.
+        state
+            .db
+            .set_folder_locked("f-secret", true, Some(&b"wrapped"[..]))
+            .unwrap();
+        let sugg_sealed = suggest_speaker_labels_inner(&state, "cur").unwrap();
+        assert!(
+            sugg_sealed.is_empty(),
+            "a sealed voiceprint must never source a suggestion (leak)"
+        );
+
+        // A session unlock re-admits it (reversible gate).
+        state
+            .unlocked_folders
+            .lock()
+            .unwrap()
+            .insert("f-secret".to_string());
+        let sugg_unlocked = suggest_speaker_labels_inner(&state, "cur").unwrap();
+        assert_eq!(
+            sugg_unlocked.len(),
+            1,
+            "a session unlock re-admits the labeled prior"
+        );
+        assert_eq!(sugg_unlocked[0].suggested_label, "Sarah");
+    }
+
+    /// A LOCKED current meeting yields no suggestions (fail-closed READ-GATE), even with a strong
+    /// visible labeled prior.
+    #[test]
+    fn suggest_speaker_labels_locked_current_meeting_is_empty() {
+        let state = build_state("vp-suggest-locked-cur");
+        state.config.lock().unwrap().voiceprint_enabled = true;
+
+        seed_meeting(&state.db, "prior", "prior", None);
+        let v = vec![1.0f32, 0.0, 0.0];
+        state
+            .db
+            .insert_voiceprint(
+                "vp-prior",
+                "prior",
+                0,
+                Some("Sarah"),
+                &v,
+                "2026-07-01T00:00:00Z",
+            )
+            .unwrap();
+
+        make_open_folder(&state.db, "f-cur", "Cur");
+        seed_meeting(&state.db, "cur", "cur", None);
+        state.db.set_meeting_folder("cur", Some("f-cur")).unwrap();
+        state
+            .db
+            .insert_voiceprint("vp-cur", "cur", 1, None, &v, "2026-07-02T00:00:00Z")
+            .unwrap();
+        state
+            .db
+            .set_folder_locked("f-cur", true, Some(&b"wrapped"[..]))
+            .unwrap();
+
+        assert!(
+            suggest_speaker_labels_inner(&state, "cur")
+                .unwrap()
+                .is_empty(),
+            "a locked current meeting must surface no suggestions"
+        );
+    }
+
+    /// ENROLL-ON-RENAME: renaming a diarized cluster (`others-1` → "Sarah") binds the label to that
+    /// cluster's voiceprint row (opt-in on). A NON-cluster rename or a plain-`others` label enrolls
+    /// nothing; and with the opt-in OFF nothing is enrolled.
+    #[test]
+    fn rename_speaker_enrolls_the_cluster_voiceprint() {
+        let state = build_state("vp-enroll");
+        state.config.lock().unwrap().voiceprint_enabled = true;
+        seed_meeting(&state.db, "m1", "note", None);
+        let emb = vec![0.6f32, 0.8];
+        state
+            .db
+            .insert_voiceprint("vp1", "m1", 1, None, &emb, "2026-07-01T00:00:00Z")
+            .unwrap();
+
+        // Rename the diarized cluster others-1 → "Sarah": the voiceprint gets labeled.
+        rename_speaker_inner(&state, "m1", "others-1", "Sarah").unwrap();
+        let listed = list_voiceprints_inner(&state).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            listed[0].label.as_deref(),
+            Some("Sarah"),
+            "enroll bound the label"
+        );
+        assert_eq!(listed[0].cluster_index, 1);
+
+        // A rename of a PLAIN non-cluster label enrolls nothing (still one row, label unchanged).
+        rename_speaker_inner(&state, "m1", "me", "Bob").unwrap();
+        assert_eq!(
+            list_voiceprints_inner(&state).unwrap()[0].label.as_deref(),
+            Some("Sarah"),
+            "renaming a non-cluster label does not touch a voiceprint"
+        );
+    }
+
+    /// ENROLL is suppressed when the opt-in is OFF (no silent biometric binding).
+    #[test]
+    fn rename_speaker_does_not_enroll_when_opt_in_off() {
+        let state = build_state("vp-enroll-off");
+        state.config.lock().unwrap().voiceprint_enabled = false;
+        seed_meeting(&state.db, "m1", "note", None);
+        state
+            .db
+            .insert_voiceprint("vp1", "m1", 0, None, &[1.0f32, 0.0], "2026-07-01T00:00:00Z")
+            .unwrap();
+
+        rename_speaker_inner(&state, "m1", "others-0", "Sarah").unwrap();
+        assert!(
+            list_voiceprints_inner(&state).unwrap()[0].label.is_none(),
+            "opt-in OFF ⇒ no enroll"
+        );
+    }
+
+    /// Insert diarization-tagged segments + an LLM-DISPLAY-labeled timeline for a meeting (overwrites
+    /// `seed_meeting`'s placeholder segments/timeline). Each `(start, end, tag)` segment carries the
+    /// RAW diarization tag; each `(start, end, label)` turn carries the LLM DISPLAY label the FE lane
+    /// renders — the two key spaces the reconciler must bridge.
+    fn seed_diarized(db: &Db, mid: &str, segs: &[(f64, f64, &str)], turns: &[(f64, f64, &str)]) {
+        let segments: Vec<Segment> = segs
+            .iter()
+            .enumerate()
+            .map(|(idx, (s, e, tag))| Segment {
+                idx: idx as i64,
+                start_s: *s,
+                end_s: *e,
+                text: "x".to_string(),
+                speaker: Some((*tag).to_string()),
+                confidence: None,
+            })
+            .collect();
+        db.insert_segments(mid, &segments).unwrap();
+        let speakers: String = turns
+            .iter()
+            .map(|(s, e, l)| format!("{{\"speaker\":\"{l}\",\"startS\":{s},\"endS\":{e}}}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        db.set_timeline_data(mid, &format!("{{\"topics\":[],\"speakers\":[{speakers}]}}"))
+            .unwrap();
+    }
+
+    /// CRUX (RED-before-GREEN): the timeline is LLM-generated, so the FE lane's `speaker` is the
+    /// DISPLAY label ("Speaker 2"), NOT the raw `others-N` tag. The suggestion MUST be keyed by that
+    /// display label so `suggestionByLabel().get(lane.speaker)` matches and the "Looks like Anna?"
+    /// chip renders. The OLD tag-keyed code emits `speaker == "others-1"` → the FE lookup misses →
+    /// the chip never renders. This asserts the reconciled display-label key.
+    #[test]
+    fn suggest_speaker_labels_keys_by_llm_display_label() {
+        let state = build_state("vp-suggest-display");
+        state.config.lock().unwrap().voiceprint_enabled = true;
+
+        // A prior LABELED voiceprint ("Anna").
+        seed_meeting(&state.db, "prior", "prior", None);
+        let anna = vec![1.0f32, 0.0, 0.0];
+        state
+            .db
+            .insert_voiceprint(
+                "vp-prior",
+                "prior",
+                0,
+                Some("Anna"),
+                &anna,
+                "2026-07-01T00:00:00Z",
+            )
+            .unwrap();
+
+        // Current meeting: diarized cluster 1 (segments tagged `others-1`), whose timeline lane the
+        // LLM labeled "Speaker 2"; its voiceprint is near-identical to Anna's.
+        seed_meeting(&state.db, "cur", "cur", None);
+        seed_diarized(
+            &state.db,
+            "cur",
+            &[(0.0, 5.0, "others-1")],
+            &[(0.0, 5.0, "Speaker 2")],
+        );
+        let cur = vec![0.99f32, 0.14, 0.0];
+        state
+            .db
+            .insert_voiceprint("vp-cur", "cur", 1, None, &cur, "2026-07-02T00:00:00Z")
+            .unwrap();
+
+        let sugg = suggest_speaker_labels_inner(&state, "cur").unwrap();
+        assert_eq!(sugg.len(), 1, "the prior match surfaces one suggestion");
+        assert_eq!(
+            sugg[0].speaker, "Speaker 2",
+            "suggestion MUST be keyed by the DISPLAY label the FE lane shows (not the raw others-1 tag)"
+        );
+        assert_eq!(sugg[0].suggested_label, "Anna");
+    }
+
+    /// ENROLL via the DISPLAY label: the FE passes the lane label "Speaker 2" (not `others-1`), so
+    /// enroll must reconstruct cluster 1 from segment↔turn overlap. The OLD
+    /// `parse_others_cluster("Speaker 2") = None` code enrolls nothing (RED).
+    #[test]
+    fn rename_speaker_enrolls_via_display_label() {
+        let state = build_state("vp-enroll-display");
+        state.config.lock().unwrap().voiceprint_enabled = true;
+        seed_meeting(&state.db, "m1", "note", None);
+        seed_diarized(
+            &state.db,
+            "m1",
+            &[(0.0, 5.0, "others-1")],
+            &[(0.0, 5.0, "Speaker 2")],
+        );
+        state
+            .db
+            .insert_voiceprint("vp1", "m1", 1, None, &[0.6f32, 0.8], "2026-07-01T00:00:00Z")
+            .unwrap();
+
+        // Rename the DISPLAY-labeled lane "Speaker 2" → "Anna": cluster 1 gets enrolled.
+        let tl = rename_speaker_inner(&state, "m1", "Speaker 2", "Anna").unwrap();
+        assert!(
+            tl.speakers.iter().any(|t| t.speaker == "Anna"),
+            "the display rename still persists in the timeline"
+        );
+        let listed = list_voiceprints_inner(&state).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            listed[0].label.as_deref(),
+            Some("Anna"),
+            "enroll reconstructed cluster 1 from the display label via overlap"
+        );
+        assert_eq!(listed[0].cluster_index, 1);
+    }
+
+    /// Single-cluster 1:1 end-to-end: plain `others` segments ↔ cluster 0, LLM lane "Speaker 1".
+    /// Both suggest (keyed by "Speaker 1") and enroll (reconstruct cluster 0) work — and the 1:1 case
+    /// is inferred from the SEGMENT tag shape, not the {0}-only voiceprint set.
+    #[test]
+    fn suggest_and_enroll_single_cluster_1to1() {
+        let state = build_state("vp-1to1");
+        state.config.lock().unwrap().voiceprint_enabled = true;
+
+        // Prior labeled "Sam".
+        seed_meeting(&state.db, "prior", "prior", None);
+        let sam = vec![0.0f32, 1.0, 0.0];
+        state
+            .db
+            .insert_voiceprint(
+                "vp-prior",
+                "prior",
+                0,
+                Some("Sam"),
+                &sam,
+                "2026-07-01T00:00:00Z",
+            )
+            .unwrap();
+
+        // Current single-cluster meeting: plain `others` segments, LLM lane "Speaker 1", cluster 0.
+        seed_meeting(&state.db, "cur", "cur", None);
+        seed_diarized(
+            &state.db,
+            "cur",
+            &[(0.0, 6.0, "others"), (7.0, 9.0, "others")],
+            &[(0.0, 9.0, "Speaker 1")],
+        );
+        let cur = vec![0.02f32, 0.99, 0.0];
+        state
+            .db
+            .insert_voiceprint("vp-cur", "cur", 0, None, &cur, "2026-07-02T00:00:00Z")
+            .unwrap();
+
+        // Suggest is keyed by the display label.
+        let sugg = suggest_speaker_labels_inner(&state, "cur").unwrap();
+        assert_eq!(sugg.len(), 1);
+        assert_eq!(
+            sugg[0].speaker, "Speaker 1",
+            "1:1 suggestion keyed by the display label"
+        );
+        assert_eq!(sugg[0].suggested_label, "Sam");
+
+        // Enroll via the display label reconstructs cluster 0.
+        rename_speaker_inner(&state, "cur", "Speaker 1", "Sam").unwrap();
+        let cur_row = list_voiceprints_inner(&state)
+            .unwrap()
+            .into_iter()
+            .find(|v| v.meeting_id == "cur")
+            .unwrap();
+        assert_eq!(
+            cur_row.label.as_deref(),
+            Some("Sam"),
+            "1:1 enroll bound cluster 0"
+        );
+        assert_eq!(cur_row.cluster_index, 0);
+    }
+
+    /// Renaming a lane that maps to NO diarized cluster (the "me" lane / a non-diarized display label)
+    /// enrolls NOTHING — no fabricated cluster — while a real diarized lane in the same meeting still
+    /// enrolls. Guards against the reconciler over-reaching.
+    #[test]
+    fn rename_speaker_non_diarized_lane_enrolls_nothing() {
+        let state = build_state("vp-me-lane");
+        state.config.lock().unwrap().voiceprint_enabled = true;
+        seed_meeting(&state.db, "m1", "note", None);
+        // A diarized cluster 0 lane ("Speaker 1") AND a disjoint "me" lane the LLM labeled "Jakub".
+        seed_diarized(
+            &state.db,
+            "m1",
+            &[(0.0, 4.0, "others-0"), (4.0, 8.0, "me")],
+            &[(0.0, 4.0, "Speaker 1"), (4.0, 8.0, "Jakub")],
+        );
+        state
+            .db
+            .insert_voiceprint("vp0", "m1", 0, None, &[1.0f32, 0.0], "2026-07-01T00:00:00Z")
+            .unwrap();
+
+        // Renaming the "me"-mapped lane "Jakub" enrolls nothing (it overlaps only "me"/None segments).
+        rename_speaker_inner(&state, "m1", "Jakub", "Jakub K").unwrap();
+        assert!(
+            list_voiceprints_inner(&state).unwrap()[0].label.is_none(),
+            "a non-diarized (me) lane must never fabricate/enroll a cluster"
+        );
+
+        // The real diarized lane still enrolls (positive control).
+        rename_speaker_inner(&state, "m1", "Speaker 1", "Anna").unwrap();
+        assert_eq!(
+            list_voiceprints_inner(&state).unwrap()[0].label.as_deref(),
+            Some("Anna"),
+            "the diarized lane still enrolls its cluster"
+        );
+    }
+
+    /// list/forget/clear management commands are gated (list) and idempotent (forget/clear).
+    #[test]
+    fn voiceprint_management_list_forget_clear() {
+        let state = build_state("vp-manage");
+        seed_meeting(&state.db, "m1", "note", None);
+        seed_meeting(&state.db, "m2", "note2", None);
+        state
+            .db
+            .insert_voiceprint(
+                "vp1",
+                "m1",
+                0,
+                Some("Sarah"),
+                &[1.0f32, 0.0],
+                "2026-07-01T00:00:00Z",
+            )
+            .unwrap();
+        state
+            .db
+            .insert_voiceprint("vp2", "m2", 0, None, &[0.0f32, 1.0], "2026-07-02T00:00:00Z")
+            .unwrap();
+
+        let listed = list_voiceprints_inner(&state).unwrap();
+        assert_eq!(listed.len(), 2, "both visible voiceprints listed");
+        // The DTO carries no raw embedding — only label + provenance + dim.
+        let sarah = listed.iter().find(|v| v.id == "vp1").unwrap();
+        assert_eq!(sarah.label.as_deref(), Some("Sarah"));
+        assert_eq!(sarah.dim, 2);
+
+        // Forget one.
+        state.db.delete_voiceprint("vp1").unwrap();
+        assert_eq!(list_voiceprints_inner(&state).unwrap().len(), 1);
+        // Clear all.
+        state.db.clear_voiceprints().unwrap();
+        assert!(list_voiceprints_inner(&state).unwrap().is_empty());
+    }
+
+    /// PR-A #3 belt-and-braces: sealing a folder while NO recording is active clears any stale
+    /// live-transcript buffer (post clear-on-Stop it is normally already empty — idempotent
+    /// hygiene so a stale tail can never outlive the folder it belongs to).
+    #[test]
+    fn lock_folder_clears_stale_live_transcript_when_not_recording() {
+        let state = build_state("lock-clears-live");
+        make_open_folder(&state.db, "f-lock", "Secret");
+        seed_meeting(&state.db, "m1", "# note", Some("f-lock"));
+        *state.live_transcript.lock().unwrap() =
+            "stale tail of the just-recorded meeting".to_string();
+        assert!(
+            state.recorder.lock().unwrap().is_none(),
+            "precondition: not recording"
+        );
+
+        lock_folder_inner(&state, "f-lock".to_string()).unwrap();
+
+        assert!(
+            state.live_transcript.lock().unwrap().is_empty(),
+            "lock_folder with no active recording must clear the stale live-transcript buffer"
+        );
+    }
+
+    /// PR-A #3 belt-and-braces: `relock_all` (manual "Lock all" + the screen-share auto-relock via
+    /// `relock_all_inner`) clears the stale buffer too when no recording is active.
+    #[test]
+    fn relock_all_clears_stale_live_transcript_when_not_recording() {
+        let state = build_state("relock-clears-live");
+        *state.live_transcript.lock().unwrap() = "stale tail".to_string();
+        assert!(
+            state.recorder.lock().unwrap().is_none(),
+            "precondition: not recording"
+        );
+
+        relock_all_inner(&state).unwrap();
+
+        assert!(
+            state.live_transcript.lock().unwrap().is_empty(),
+            "relock_all with no active recording must clear the stale live-transcript buffer"
+        );
+    }
+
+    /// PHASE 6: `set_focus_meeting` sets and clears the focus pointer; a blank/whitespace id clears.
+    #[test]
+    fn set_focus_meeting_sets_and_clears_the_pointer() {
+        let state = build_state("focus-set-clear");
+        assert!(
+            state.focus_meeting.lock().unwrap().is_none(),
+            "precondition: no focus set"
+        );
+
+        // Set a focus id.
+        set_focus_meeting_inner(&state, Some("m-focused".to_string()));
+        assert_eq!(
+            state.focus_meeting.lock().unwrap().as_deref(),
+            Some("m-focused"),
+            "focus is set to the viewed meeting"
+        );
+
+        // A whitespace id normalizes to a clear (None), not a blank string.
+        set_focus_meeting_inner(&state, Some("   ".to_string()));
+        assert!(
+            state.focus_meeting.lock().unwrap().is_none(),
+            "a blank/whitespace focus id clears the pointer"
+        );
+
+        // Set again, then explicitly clear with None (meeting-view close).
+        set_focus_meeting_inner(&state, Some(" m-2 ".to_string()));
+        assert_eq!(
+            state.focus_meeting.lock().unwrap().as_deref(),
+            Some("m-2"),
+            "focus is trimmed and set"
+        );
+        set_focus_meeting_inner(&state, None);
+        assert!(
+            state.focus_meeting.lock().unwrap().is_none(),
+            "None clears the focus pointer on view close"
+        );
+    }
+
+    /// PHASE 6 fail-safe: a POISONED focus mutex must not brick the setter — it recovers the guard
+    /// via `into_inner()` (the pointer carries no invariant) and still writes the new value.
+    #[test]
+    fn set_focus_meeting_recovers_from_a_poisoned_mutex() {
+        let state = build_state("focus-poisoned");
+        // Poison the focus mutex.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = state.focus_meeting.lock().unwrap();
+            panic!("poison the focus mutex");
+        }));
+        assert!(
+            state.focus_meeting.is_poisoned(),
+            "precondition: the focus mutex is poisoned"
+        );
+
+        // The setter still works (fail-safe recovery).
+        set_focus_meeting_inner(&state, Some("m-after-poison".to_string()));
+        let g = state
+            .focus_meeting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            g.as_deref(),
+            Some("m-after-poison"),
+            "a poisoned focus mutex fails safe and still sets the pointer"
+        );
+    }
+
+    /// brain2 realtime notes: with the meeting in an OPEN folder (or no folder) the gate is open, so
+    /// `save`/`get` round-trip the buffer.
+    #[test]
+    fn manual_notes_save_get_round_trip_when_unlocked() {
+        let state = build_state("manual-notes-open");
+        seed_meeting(&state.db, "m1", "note", None); // no folder ⇒ always open
+
+        get_manual_notes_inner(&state, "m1")
+            .map(|s| assert_eq!(s, ""))
+            .unwrap();
+        save_manual_notes_inner(&state, "m1", "ship Friday; Anna owns QA").unwrap();
+        assert_eq!(
+            get_manual_notes_inner(&state, "m1").unwrap(),
+            "ship Friday; Anna owns QA",
+            "open-folder buffer round-trips through the gated commands"
+        );
+    }
+
+    /// LOCK-GATE: on a sealed-and-NOT-session-unlocked meeting, `save_manual_notes` is refused with
+    /// `AppError::Locked` (never resurrect typed plaintext behind a lock) and `get_manual_notes`
+    /// returns "" (masked) EVEN THOUGH the column still holds content — never leaking the buffer.
+    /// Unlocking the folder restores both read and write.
+    #[test]
+    fn manual_notes_save_refused_and_get_masked_when_sealed() {
+        let state = build_state("manual-notes-sealed");
+        make_open_folder(&state.db, "f-lock", "Secret");
+        seed_meeting(&state.db, "m1", "note", Some("f-lock"));
+        // The buffer holds content at rest (e.g. typed pre-seal); the gate must mask/refuse it.
+        state
+            .db
+            .set_manual_notes("m1", "secret typed plaintext")
+            .unwrap();
+        // Seal the folder (locked, NOT in the session unlock set).
+        state
+            .db
+            .set_folder_locked("f-lock", true, Some(&b"wrapped"[..]))
+            .unwrap();
+
+        // WRITE is refused with Locked.
+        let err = save_manual_notes_inner(&state, "m1", "new secret").unwrap_err();
+        assert!(
+            matches!(err, AppError::Locked(_)),
+            "sealed write must be AppError::Locked, got {err:?}"
+        );
+        // The refused write left the stored buffer untouched.
+        assert_eq!(
+            state.db.get_manual_notes("m1").unwrap(),
+            "secret typed plaintext",
+            "refused write must not mutate"
+        );
+        // READ is masked to "" despite the column holding content.
+        assert_eq!(
+            get_manual_notes_inner(&state, "m1").unwrap(),
+            "",
+            "sealed-not-unlocked read must mask the buffer, never leak it"
+        );
+
+        // Session-unlock the folder ⇒ the READ works again.
+        state
+            .unlocked_folders
+            .lock()
+            .unwrap()
+            .insert("f-lock".to_string());
+        assert_eq!(
+            get_manual_notes_inner(&state, "m1").unwrap(),
+            "secret typed plaintext"
+        );
+        // 2026-07-10 audit F1 (seal-on-write, fail-closed): a WRITE into a session-unlocked LOCKED
+        // folder must re-seal under the folder CK — this fixture has a garbage wrapped key and NO
+        // session-cached KEK (a shape the production unlock can never produce), so the write is
+        // REFUSED rather than persisted as unsealable plaintext. The happy path (real seal, cached
+        // KEK) is covered by `manual_notes_edit_during_session_unlock_survives_relock`.
+        let err = save_manual_notes_inner(&state, "m1", "edited after unlock").unwrap_err();
+        assert!(
+            matches!(err, AppError::Locked(_)),
+            "a KEK-less write into a locked folder must fail closed, got {err:?}"
+        );
+        assert_eq!(
+            get_manual_notes_inner(&state, "m1").unwrap(),
+            "secret typed plaintext",
+            "the refused write must not have mutated the buffer"
+        );
+    }
+
+    /// RECEIPTS happy path (Brain v3 PR-5): on an OPEN meeting, `get_note_receipts` aligns each
+    /// supported note line to the transcript segment it derives from, carrying that segment's raw-
+    /// second coordinates + speaker + confidence. A paraphrased/unsupported line earns no receipt.
+    #[test]
+    fn get_note_receipts_returns_alignments_when_unlocked() {
+        let state = build_state("receipts-open");
+        // No folder ⇒ always open. Seed a note + two distinctive segments directly.
+        state
+            .db
+            .insert_meeting(&Meeting {
+                id: "m1".to_string(),
+                started_at: "2026-06-27T09:00:00Z".to_string(),
+                ended_at: None,
+                title: Some("Receipts".to_string()),
+                duration_s: 60,
+                audio_path: None,
+                status: MeetingStatus::Summarized,
+                folder_id: None,
+            })
+            .unwrap();
+        state
+            .db
+            .upsert_note(&NoteRecord {
+                meeting_id: "m1".to_string(),
+                provider_id: "claude_code".to_string(),
+                // Line 0 heading, 1 blank, 2 supported claim, 3 blank, 4 unsupported paraphrase.
+                markdown: "## Summary\n\nWe shipped the login page and the payment flow.\n\nThe entirely separate teleporter prototype launched successfully.".to_string(),
+                created_at: "2026-06-27T09:05:00Z".to_string(),
+                exported_path: None,
+                model_requested: None,
+                model_served: None,
+                gateway_host: None,
+            })
+            .unwrap();
+        state
+            .db
+            .insert_segments(
+                "m1",
+                &[
+                    Segment {
+                        idx: 5,
+                        start_s: 11.0,
+                        end_s: 17.5,
+                        text: "we finally shipped the login page and the payment flow this week"
+                            .to_string(),
+                        speaker: Some("me".to_string()),
+                        confidence: Some(0.88),
+                    },
+                    Segment {
+                        idx: 6,
+                        start_s: 40.0,
+                        end_s: 44.0,
+                        text: "and then we grabbed some coffee downstairs".to_string(),
+                        speaker: Some("others".to_string()),
+                        confidence: None,
+                    },
+                ],
+            )
+            .unwrap();
+
+        let receipts = get_note_receipts_inner(&state, "m1").unwrap();
+        assert_eq!(
+            receipts.len(),
+            1,
+            "only the supported claim earns a receipt; got:\n{receipts:?}"
+        );
+        let r = &receipts[0];
+        assert_eq!(r.claim_index, 2, "receipt maps to the supported note line");
+        assert_eq!(r.segment_id, 5, "aligned to the login/payment segment");
+        assert_eq!(r.start_s, 11.0, "raw-second seek target");
+        assert_eq!(r.end_s, 17.5);
+        assert_eq!(r.speaker.as_deref(), Some("me"));
+        assert_eq!(r.confidence, Some(0.88));
+    }
+
+    /// RECEIPTS lock-gate (RED-before-GREEN): a sealed-and-NOT-session-unlocked meeting returns an
+    /// EMPTY receipt list — never a segment time, speaker, or overlap that would leak WHEN/BY WHOM —
+    /// EVEN THOUGH the note + segments still exist. Session-unlocking the folder restores receipts.
+    /// Remove the `meeting_is_unlocked` gate in `get_note_receipts_inner` and this fails (RED).
+    #[test]
+    fn get_note_receipts_masked_when_sealed_then_restored_on_unlock() {
+        let state = build_state("receipts-sealed");
+        make_open_folder(&state.db, "f-lock", "Secret");
+        state
+            .db
+            .insert_meeting(&Meeting {
+                id: "m1".to_string(),
+                started_at: "2026-06-27T09:00:00Z".to_string(),
+                ended_at: None,
+                title: Some("Secret".to_string()),
+                duration_s: 60,
+                audio_path: None,
+                status: MeetingStatus::Summarized,
+                folder_id: None,
+            })
+            .unwrap();
+        state
+            .db
+            .upsert_note(&NoteRecord {
+                meeting_id: "m1".to_string(),
+                provider_id: "claude_code".to_string(),
+                markdown: "We shipped the login page and the payment flow.".to_string(),
+                created_at: "2026-06-27T09:05:00Z".to_string(),
+                exported_path: None,
+                model_requested: None,
+                model_served: None,
+                gateway_host: None,
+            })
+            .unwrap();
+        state
+            .db
+            .insert_segments(
+                "m1",
+                &[Segment {
+                    idx: 1,
+                    start_s: 3.0,
+                    end_s: 9.0,
+                    text: "we shipped the login page and the payment flow today".to_string(),
+                    speaker: Some("me".to_string()),
+                    confidence: Some(0.9),
+                }],
+            )
+            .unwrap();
+        state.db.set_meeting_folder("m1", Some("f-lock")).unwrap();
+
+        // Precondition: while OPEN, the receipt is present (proves the mask below is the gate, not
+        // an empty computation).
+        assert_eq!(
+            get_note_receipts_inner(&state, "m1").unwrap().len(),
+            1,
+            "precondition: open folder yields a receipt"
+        );
+
+        // Seal the folder (locked, NOT in the session unlock set).
+        state
+            .db
+            .set_folder_locked("f-lock", true, Some(&b"wrapped"[..]))
+            .unwrap();
+        assert!(
+            get_note_receipts_inner(&state, "m1").unwrap().is_empty(),
+            "sealed-not-unlocked meeting must leak NO receipts (no times/speakers)"
+        );
+
+        // Session-unlock the folder ⇒ receipts return.
+        state
+            .unlocked_folders
+            .lock()
+            .unwrap()
+            .insert("f-lock".to_string());
+        assert_eq!(
+            get_note_receipts_inner(&state, "m1").unwrap().len(),
+            1,
+            "session-unlock restores receipts"
+        );
+    }
+
+    /// FACT-RECEIPT lock-gate (Brain v3 audit PR-8, RED-before-GREEN): a sealed-and-NOT-session-
+    /// unlocked meeting returns `None` — never a segment time, speaker, or overlap that would leak
+    /// WHEN/BY WHOM — even though the segments still exist; session-unlocking the folder restores
+    /// the receipt. Also pins the honesty floor: a fact text the transcript doesn't support earns
+    /// NO receipt even while open (the FE then falls back to plain open-the-meeting). Remove the
+    /// `meeting_is_unlocked` gate in `get_fact_receipt_inner` and this fails (RED).
+    #[test]
+    fn get_fact_receipt_masked_when_sealed_then_restored_on_unlock() {
+        let state = build_state("fact-receipt-sealed");
+        make_open_folder(&state.db, "f-lock", "Secret");
+        state
+            .db
+            .insert_meeting(&Meeting {
+                id: "m1".to_string(),
+                started_at: "2026-06-27T09:00:00Z".to_string(),
+                ended_at: None,
+                title: Some("Secret".to_string()),
+                duration_s: 60,
+                audio_path: None,
+                status: MeetingStatus::Summarized,
+                folder_id: None,
+            })
+            .unwrap();
+        // A meeting's folder anchor is its NOTE row (`notes.folder_id` — see `folder_for_meeting`),
+        // so the fixture needs a note for `set_meeting_folder` to bite.
+        state
+            .db
+            .upsert_note(&NoteRecord {
+                meeting_id: "m1".to_string(),
+                provider_id: "claude_code".to_string(),
+                markdown: "We shipped the login page and the payment flow.".to_string(),
+                created_at: "2026-06-27T09:05:00Z".to_string(),
+                exported_path: None,
+                model_requested: None,
+                model_served: None,
+                gateway_host: None,
+            })
+            .unwrap();
+        state
+            .db
+            .insert_segments(
+                "m1",
+                &[Segment {
+                    idx: 1,
+                    start_s: 3.0,
+                    end_s: 9.0,
+                    text: "we shipped the login page and the payment flow today".to_string(),
+                    speaker: Some("me".to_string()),
+                    confidence: Some(0.9),
+                }],
+            )
+            .unwrap();
+        state.db.set_meeting_folder("m1", Some("f-lock")).unwrap();
+
+        let fact_text = "Atlas shipped login page payment flow";
+        // Precondition: while OPEN, the fact aligns (proves the mask below is the gate, not a
+        // no-alignment computation).
+        let open = get_fact_receipt_inner(&state, "m1", fact_text).unwrap();
+        let open = open.expect("precondition: open folder yields a fact receipt");
+        assert_eq!(open.segment_id, 1, "aligned to the proving segment");
+        assert_eq!(open.start_s, 3.0, "raw-second seek target");
+        // Honesty floor: an unsupported fact earns NO receipt even while open.
+        assert!(
+            get_fact_receipt_inner(&state, "m1", "teleporter prototype launched successfully")
+                .unwrap()
+                .is_none(),
+            "an unsupported fact text must earn no receipt"
+        );
+
+        // Seal the folder (locked, NOT in the session unlock set) ⇒ masked.
+        state
+            .db
+            .set_folder_locked("f-lock", true, Some(&b"wrapped"[..]))
+            .unwrap();
+        assert!(
+            get_fact_receipt_inner(&state, "m1", fact_text).unwrap().is_none(),
+            "sealed-not-unlocked meeting must leak NO fact receipt (no times/speakers)"
+        );
+
+        // Session-unlock the folder ⇒ the receipt returns.
+        state
+            .unlocked_folders
+            .lock()
+            .unwrap()
+            .insert("f-lock".to_string());
+        assert!(
+            get_fact_receipt_inner(&state, "m1", fact_text).unwrap().is_some(),
+            "session-unlock restores the fact receipt"
+        );
+    }
+
+    /// COUNTEREXAMPLE A (verify-before-destroy): the user's typed notes SURVIVE a real lock→unlock
+    /// cycle — SEALED under the folder CK (plaintext blanked, blob present) on lock, RESTORED
+    /// byte-identical on unlock. Drives the PRODUCTION seal (`lock_folder_inner` →
+    /// `seal_meeting_extras`) and unseal (`unseal_folder_extras`), so the typed notes are never
+    /// ESCAPE-HATCH SAFETY GATE (0.7.5): `discard_unrecoverable_folder_lock` MUST REFUSE a folder
+    /// whose key is still available — discarding a RECOVERABLE folder would be gratuitous data loss.
+    /// This is the RED-before-GREEN guard: delete the safety gate and this test fails (the folder
+    /// gets wiped). Here the folder is sealed under the (dev) master KEK, so the recovery ladder
+    /// finds it → discard must refuse and leave the sealed content intact.
+    #[test]
+    fn discard_refuses_a_recoverable_folder() {
+        let state = build_state("discard-refuses-recoverable");
+        make_open_folder(&state.db, "f-lock", "Secret");
+        seed_meeting(&state.db, "m1", "# recoverable note", Some("f-lock"));
+        lock_folder_inner(&state, "f-lock".to_string()).unwrap();
+        // Sealed: the note carries a content_blob.
+        assert!(
+            state.db.notes_in_folder("f-lock").unwrap()[0]
+                .content_blob
+                .is_some(),
+            "precondition: folder is sealed"
+        );
+
+        let err = block_on(discard_unrecoverable_folder_lock_inner(
+            &state,
+            "f-lock".to_string(),
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(err, AppError::InvalidArg(_)),
+            "a RECOVERABLE folder must be refused (route to normal unlock), got: {err:?}"
+        );
+        // Nothing destroyed: still locked, blob intact.
+        assert!(
+            state.db.folder_by_id("f-lock").unwrap().unwrap().locked,
+            "the folder must STAY locked when discard is refused"
+        );
+        assert!(
+            state.db.notes_in_folder("f-lock").unwrap()[0]
+                .content_blob
+                .is_some(),
+            "the sealed content must be untouched when discard is refused"
+        );
+    }
+
+    /// The escape hatch itself: a folder whose key is GENUINELY unrecoverable (sealed under a foreign
+    /// KEK no candidate holds) is discarded — blobs cleared, folder reopened — so the user is no
+    /// longer permanently bricked out of it.
+    #[test]
+    fn discard_clears_an_unrecoverable_folder() {
+        let state = build_state("discard-clears-unrecoverable");
+        make_open_folder(&state.db, "f-lock", "Secret");
+        seed_meeting(&state.db, "m1", "# lost note", Some("f-lock"));
+        // Seal normally (real content_blob under the dev KEK's CK)…
+        lock_folder_inner(&state, "f-lock".to_string()).unwrap();
+        // …then REPLACE the wrapped key with one wrapped under a FOREIGN KEK the recovery ladder can
+        // never hold — simulating a keychain wipe / Mac migration where the real KEK is gone.
+        let foreign_kek = [0x42u8; 32];
+        let foreign_ck = [0x24u8; 32];
+        let foreign_wrapped =
+            crate::crypto::encrypt(&foreign_kek, &foreign_ck, &aad_wrapped_ck("f-lock")).unwrap();
+        state
+            .db
+            .set_folder_locked("f-lock", true, Some(&foreign_wrapped))
+            .unwrap();
+
+        let node = block_on(discard_unrecoverable_folder_lock_inner(
+            &state,
+            "f-lock".to_string(),
+        ))
+        .expect("an unrecoverable folder must be discardable");
+        assert!(!node.locked, "the folder reopens (locked=false)");
+        // The folder is open on disk and its sealed payload is gone.
+        assert!(
+            !state.db.folder_by_id("f-lock").unwrap().unwrap().locked,
+            "folder flipped open in the DB"
+        );
+        assert!(
+            state.db.folder_wrapped_key("f-lock").unwrap().is_none(),
+            "the (useless) wrapped key is cleared"
+        );
+        let notes = state.db.notes_in_folder("f-lock").unwrap();
+        assert!(
+            notes.iter().all(|n| n.content_blob.is_none()),
+            "the undecryptable sealed blobs are discarded"
+        );
+    }
+
+    /// PRESERVE-NEVER-SEALED (2026-07-05 lock-security finding): discard must destroy only the
+    /// UNRECOVERABLE SEALED payload — a never-sealed buffer (plaintext with a NULL blob, e.g. typed
+    /// during a session-unlock) is the ONLY copy and readable once the folder reopens, so it MUST
+    /// survive. RED-before-GREEN: the prior unconditional `markdown=''` blanked it.
+    #[test]
+    fn discard_preserves_never_sealed_content() {
+        let state = build_state("discard-preserve-never-sealed");
+        make_open_folder(&state.db, "f-lock", "Secret");
+        seed_meeting(&state.db, "m1", "# sealed note", Some("f-lock"));
+        lock_folder_inner(&state, "f-lock".to_string()).unwrap(); // seals m1 (blob set, plaintext '')
+
+        // A buffer added into the folder AFTER the seal (as if typed during a later session-unlock):
+        // its note plaintext is the ONLY copy, content_blob stays NULL (never sealed).
+        seed_meeting(
+            &state.db,
+            "m2",
+            "NEVER SEALED — the only copy",
+            Some("f-lock"),
+        );
+
+        // Make the folder unrecoverable (foreign wrapped key no candidate holds).
+        let foreign_wrapped =
+            crate::crypto::encrypt(&[0x42u8; 32], &[0x24u8; 32], &aad_wrapped_ck("f-lock"))
+                .unwrap();
+        state
+            .db
+            .set_folder_locked("f-lock", true, Some(&foreign_wrapped))
+            .unwrap();
+
+        block_on(discard_unrecoverable_folder_lock_inner(
+            &state,
+            "f-lock".to_string(),
+        ))
+        .unwrap();
+
+        let notes = state.db.notes_in_folder("f-lock").unwrap();
+        let m1 = notes.iter().find(|n| n.meeting_id == "m1").unwrap();
+        let m2 = notes.iter().find(|n| n.meeting_id == "m2").unwrap();
+        assert_eq!(
+            m1.markdown, "",
+            "the SEALED note's plaintext is gone (its key was lost) and its blob dropped"
+        );
+        assert!(m1.content_blob.is_none(), "sealed blob dropped");
+        assert_eq!(
+            m2.markdown, "NEVER SEALED — the only copy",
+            "the NEVER-SEALED note's only readable copy MUST be preserved, not wiped"
+        );
+    }
+
+    /// blanked-and-lost. RED on the prior blank-on-seal code (no blob → nothing to restore).
+    #[test]
+    fn manual_notes_survive_lock_unlock_cycle_sealed_and_restored() {
+        let state = build_state("manual-notes-seal-cycle");
+        make_open_folder(&state.db, "f-lock", "Secret");
+        seed_meeting(&state.db, "m1", "# note", Some("f-lock"));
+        let typed = "zażółć 🔒 DECISION: ship Friday; Anna owns QA sign-off";
+        state.db.set_manual_notes("m1", typed).unwrap();
+
+        // LOCK → production seal: plaintext blanked at rest, manual_notes_blob present.
+        lock_folder_inner(&state, "f-lock".to_string()).unwrap();
+        let sealed = state.db.raw_manual_notes("m1").unwrap().unwrap();
+        assert_eq!(
+            sealed.text, "",
+            "typed notes plaintext blanked while sealed"
+        );
+        assert!(
+            sealed.blob.is_some(),
+            "typed notes sealed under the folder CK (blob present)"
+        );
+
+        // UNLOCK (mirror unlock_folder's internals): KEK → unwrap CK → unseal extras.
+        let kek = secrets::get_or_create_master_kek().unwrap();
+        let wrapped = state.db.folder_wrapped_key("f-lock").unwrap().unwrap();
+        let ck_vec = crate::crypto::decrypt(&kek, &wrapped, &aad_wrapped_ck("f-lock")).unwrap();
+        let ck: [u8; 32] = ck_vec.try_into().expect("CK is 32 bytes");
+        unseal_folder_extras(&state, "f-lock", &ck, None).unwrap();
+
+        assert_eq!(
+            state.db.get_manual_notes("m1").unwrap(),
+            typed,
+            "typed notes restored byte-identical on unlock — sealed-and-restored, never lost"
+        );
+    }
+
+    /// REMOVE-LOCK: permanently removing a folder's lock decrypts the typed notes back to plaintext
+    /// and clears the blob — the typed notes are NEVER lost.
+    #[test]
+    fn manual_notes_survive_remove_lock_permanently() {
+        let state = build_state("manual-notes-remove-lock");
+        make_open_folder(&state.db, "f-lock", "Secret");
+        seed_meeting(&state.db, "m1", "# note", Some("f-lock"));
+        let typed = "permanent: revisit auth next sprint";
+        state.db.set_manual_notes("m1", typed).unwrap();
+
+        lock_folder_inner(&state, "f-lock".to_string()).unwrap();
+        assert_eq!(
+            state.db.raw_manual_notes("m1").unwrap().unwrap().text,
+            "",
+            "blanked while sealed"
+        );
+
+        // Cache the KEK for remove_lock (it reads the gated master KEK), then permanently remove.
+        let kek = secrets::get_or_create_master_kek().unwrap();
+        *state.master_kek.lock().unwrap() = Some(Zeroizing::new(kek));
+        remove_lock_inner(&state, "f-lock".to_string()).unwrap();
+
+        let rn = state.db.raw_manual_notes("m1").unwrap().unwrap();
+        assert_eq!(
+            rn.text, typed,
+            "typed notes permanently restored to plaintext on remove-lock"
+        );
+        assert!(
+            rn.blob.is_none(),
+            "manual_notes_blob cleared on remove-lock"
+        );
+    }
+
+    /// NIT-8 (RED-before-GREEN — link lifecycle): PERMANENTLY removing a folder's lock must
+    /// re-derive the folder's `links` (purged on the original seal), mirroring the session unlock —
+    /// otherwise a permanently-unlocked folder has no links until the next note edit. RED on the
+    /// pre-fix `remove_lock_inner` (restored plaintext + re-indexed chunks/vectors but never called
+    /// `rederive_links_for_folder`), so the wikilink edge stayed empty after remove-lock.
+    #[test]
+    fn remove_lock_rederives_wikilinks() {
+        let state = build_state("remove-lock-rederive-links");
+        // Open target the wikilink points at (a standalone note in an OPEN folder).
+        make_open_folder(&state.db, "f-open", "Open");
+        state
+            .db
+            .insert_note("other", "f-open", "Other Note", "Other Note", "body", 1_700_000_000_000)
+            .unwrap();
+        // Locked folder holds a meeting whose note links to the open target.
+        make_open_folder(&state.db, "f-lock", "Secret");
+        seed_meeting(&state.db, "m1", "see [[Other Note]] for context", Some("f-lock"));
+
+        // Index the wikilink while open (as a real save would), then verify it exists.
+        let nothing = std::collections::HashSet::new();
+        state
+            .db
+            .index_wikilinks_for_source(
+                crate::links::LinkKind::Meeting,
+                "m1",
+                "see [[Other Note]] for context",
+                &nothing,
+            )
+            .unwrap();
+        // Count m1's OUTBOUND wikilink edges through the PUBLIC gated reader (open folder → visible).
+        let wikilink_edges = |db: &crate::storage::Db, unlocked: &HashSet<String>| -> usize {
+            db.links_for_visible(crate::links::LinkKind::Meeting, "m1", unlocked)
+                .unwrap()
+                .into_iter()
+                .filter(|e| e.edge_type == "wikilink")
+                .count()
+        };
+        assert_eq!(wikilink_edges(&state.db, &nothing), 1, "wikilink edge exists before seal");
+
+        // LOCK → the seal's purge_links_tx drops the edge at rest (and the sealed source is masked).
+        lock_folder_inner(&state, "f-lock".to_string()).unwrap();
+        assert_eq!(wikilink_edges(&state.db, &nothing), 0, "wikilink edge purged by the seal");
+
+        // Cache the KEK, then PERMANENTLY remove the lock.
+        let kek = secrets::get_or_create_master_kek().unwrap();
+        *state.master_kek.lock().unwrap() = Some(Zeroizing::new(kek));
+        remove_lock_inner(&state, "f-lock".to_string()).unwrap();
+
+        assert_eq!(
+            wikilink_edges(&state.db, &nothing),
+            1,
+            "wikilink edge is RE-DERIVED after remove-lock (the folder is fully open again)"
+        );
+    }
+
+    // ── document ingestion ──────────────────────────────────────────────────
+
+    /// Write a temp md/txt file with `text`, return its absolute path. Cleaned up by the OS temp dir.
+    fn write_temp_doc(tag: &str, ext: &str, text: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "murmur-doc-{tag}-{}-{}.{ext}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&p, text).unwrap();
+        p
+    }
+
+    /// IMPORT round-trip: an md document uploaded into an OPEN folder is stored (text readable) and
+    /// listed (metadata, no text). A .txt is accepted too. The doc-chunk rows exist (chunked) — and,
+    /// on a no-model CI machine, carry NO vectors (stub vectors are never written).
+    #[test]
+    fn import_document_round_trip_md_and_txt_open_folder() {
+        let state = build_state("doc-import");
+        make_open_folder(&state.db, "f-open", "Project");
+
+        let md = write_temp_doc(
+            "md",
+            "md",
+            "# Spec\n\nThe budget is 100k.\n\nAnna owns delivery.",
+        );
+        let id = import_document_inner(&state, md.to_str().unwrap(), "f-open").unwrap();
+        // Stored + readable through the gated get.
+        assert_eq!(
+            get_document_inner(&state, &id).unwrap(),
+            "# Spec\n\nThe budget is 100k.\n\nAnna owns delivery.",
+            "document text readable in an open folder"
+        );
+        // Listed with metadata only (the DTO has no text field).
+        let listed = list_documents_inner(&state, "f-open").unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, id);
+        assert!(listed[0].name.ends_with(".md"));
+        // CHUNKING is unconditional (keyword/FTS retrieval must work on a default install). Brain v3
+        // PR-2: `import_document_inner` is CHUNK-ONLY by design — it NEVER embeds inline (the async
+        // `import_document` wrapper does the authoritative embed behind the RAM floor + heavy-inference
+        // permit). So the inner leaves ZERO doc_vec_chunks rows regardless of model presence; keyword
+        // FTS is durable immediately. (The no-stub contract still holds trivially — no vectors here.)
+        assert!(
+            state.db.doc_chunk_count(&id).unwrap() >= 1,
+            "the document must be chunked regardless of model presence (always-chunk)"
+        );
+        assert_eq!(
+            state.db.doc_vec_count(&id).unwrap(),
+            0,
+            "the inner is chunk-only (embed deferred to the async wrapper): no vectors here"
+        );
+
+        // A .txt import is also accepted.
+        let txt = write_temp_doc("txt", "txt", "plain text notes about hiring");
+        let id2 = import_document_inner(&state, txt.to_str().unwrap(), "f-open").unwrap();
+        assert_eq!(list_documents_inner(&state, "f-open").unwrap().len(), 2);
+        assert!(!id2.is_empty());
+    }
+
+    /// ALLOWLIST (Brain v3 PR-2): an UNSUPPORTED extension (`.rtf`) and an extension-less path are
+    /// rejected with InvalidArg, and NO row is inserted (the folder stays empty). md/txt/pdf/docx/
+    /// pptx/xlsx/html are the supported set; anything else fails closed at the allowlist.
+    #[test]
+    fn import_document_rejects_unsupported_extension() {
+        let state = build_state("doc-allowlist");
+        make_open_folder(&state.db, "f-open", "Project");
+
+        let rtf = write_temp_doc("rtf", "rtf", "{\\rtf1 unsupported}");
+        let err = import_document_inner(&state, rtf.to_str().unwrap(), "f-open").unwrap_err();
+        assert!(
+            matches!(err, AppError::InvalidArg(_)),
+            "an unsupported extension must be rejected, got {err:?}"
+        );
+
+        // Extension-less path.
+        let noext = {
+            let mut p = std::env::temp_dir();
+            p.push(format!("murmur-doc-noext-{}", std::process::id()));
+            std::fs::write(&p, "x").unwrap();
+            p
+        };
+        let err2 = import_document_inner(&state, noext.to_str().unwrap(), "f-open").unwrap_err();
+        assert!(
+            matches!(err2, AppError::InvalidArg(_)),
+            "extension-less must be rejected"
+        );
+
+        assert!(
+            list_documents_inner(&state, "f-open").unwrap().is_empty(),
+            "no row inserted on reject"
+        );
+    }
+
+    /// WRITE-GATE + LIST/GET MASK: importing into a sealed-and-NOT-session-unlocked folder is refused
+    /// (`AppError::Locked`); a sealed folder's existing documents are masked from `list_documents`
+    /// (empty) and `get_document` ("") even though the row still exists. Unlocking restores both.
+    #[test]
+    fn document_import_refused_and_list_get_masked_when_sealed() {
+        let state = build_state("doc-sealed");
+        make_open_folder(&state.db, "f-lock", "Secret");
+        // Seed a document while open, then seal the folder (locked, NOT in the session set).
+        let md = write_temp_doc("seal", "md", "secret: launch date is the 14th");
+        let existing = import_document_inner(&state, md.to_str().unwrap(), "f-lock").unwrap();
+        state
+            .db
+            .set_folder_locked("f-lock", true, Some(&b"wrapped"[..]))
+            .unwrap();
+
+        // IMPORT is refused with Locked.
+        let md2 = write_temp_doc("seal2", "md", "another secret");
+        let err = import_document_inner(&state, md2.to_str().unwrap(), "f-lock").unwrap_err();
+        assert!(
+            matches!(err, AppError::Locked(_)),
+            "sealed import must be Locked, got {err:?}"
+        );
+        // DELETE is refused with Locked too.
+        let derr = block_on(delete_document_inner(&state, &existing)).unwrap_err();
+        assert!(
+            matches!(derr, AppError::Locked(_)),
+            "sealed delete must be Locked, got {derr:?}"
+        );
+
+        // LIST is masked to empty; GET is masked to "" — even though the row + text column persist.
+        assert!(
+            list_documents_inner(&state, "f-lock").unwrap().is_empty(),
+            "sealed list masked"
+        );
+        assert_eq!(
+            get_document_inner(&state, &existing).unwrap(),
+            "",
+            "sealed get masked"
+        );
+
+        // Session-unlock ⇒ list + get + import work again.
+        state
+            .unlocked_folders
+            .lock()
+            .unwrap()
+            .insert("f-lock".to_string());
+        assert_eq!(
+            list_documents_inner(&state, "f-lock").unwrap().len(),
+            1,
+            "unlocked list visible"
+        );
+        assert_eq!(
+            get_document_inner(&state, &existing).unwrap(),
+            "secret: launch date is the 14th",
+            "unlocked get returns the text"
+        );
+        let md3 = write_temp_doc("seal3", "md", "after unlock");
+        import_document_inner(&state, md3.to_str().unwrap(), "f-lock").unwrap();
+    }
+
+    /// WRITE-GATE (race-safe re-check): the `Arc`-handle seam the async `import_document` runs OFF
+    /// the runtime — `insert_extracted_document` — enforces the SAME gate as the on-`&AppState` path.
+    /// A sealed-and-not-session-unlocked folder is refused with `Locked` (so a relock racing between
+    /// the up-front gate and the off-thread insert can't land plaintext at rest); an unknown folder
+    /// is `InvalidArg`; a session-unlocked folder inserts. This pins the exact predicate the blocking
+    /// closure re-evaluates, independent of the sync `import_document_inner` seam.
+    #[test]
+    fn insert_extracted_document_gate_matches_on_arc_handles() {
+        let state = build_state("doc-arc-gate");
+        make_open_folder(&state.db, "f-arc", "Vault");
+        state
+            .db
+            .set_folder_locked("f-arc", true, Some(&b"wrapped"[..]))
+            .unwrap();
+
+        let db = std::sync::Arc::clone(&state.db);
+        let unlocked = std::sync::Arc::clone(&state.unlocked_folders);
+
+        // Unknown folder → InvalidArg.
+        let e0 = insert_extracted_document(&db, &unlocked, "nope", "x.md", "hi").unwrap_err();
+        assert!(matches!(e0, AppError::InvalidArg(_)), "got {e0:?}");
+
+        // Sealed + NOT in the session set → Locked (never insert plaintext behind the lock).
+        let e1 = insert_extracted_document(&db, &unlocked, "f-arc", "x.md", "secret").unwrap_err();
+        assert!(matches!(e1, AppError::Locked(_)), "sealed insert must be Locked, got {e1:?}");
+        assert!(
+            list_documents_inner(&state, "f-arc").unwrap().is_empty(),
+            "no row inserted while sealed"
+        );
+
+        // Session-unlock → the same seam inserts.
+        unlocked.lock().unwrap().insert("f-arc".to_string());
+        let id = insert_extracted_document(&db, &unlocked, "f-arc", "x.md", "now allowed").unwrap();
+        assert!(!id.is_empty());
+        assert_eq!(
+            get_document_inner(&state, &id).unwrap(),
+            "now allowed",
+            "unlocked insert is readable"
+        );
+
+        // And the up-front async-task gate agrees on every case.
+        assert!(import_document_write_gate(&state, "f-arc").is_ok(), "unlocked passes the up-front gate");
+        assert!(
+            matches!(import_document_write_gate(&state, "nope"), Err(AppError::InvalidArg(_))),
+            "unknown folder fails the up-front gate"
+        );
+    }
+
+    /// IMPORT_TEXT round-trip: typed text is ingested as a kind='note' document — stored + readable,
+    /// listed with kind="note", and chunked WHEN the e5 model is present (0 chunks when absent, the
+    /// no-stub contract). Empty text is refused. Reuses the same gated ingest as `import_document`.
+    #[test]
+    fn import_text_round_trip_as_note() {
+        let state = build_state("text-import");
+        make_open_folder(&state.db, "f-open", "Project");
+
+        let id = import_text_inner(&state, "Decisions", "We ship the beta on Friday.", "f-open")
+            .unwrap();
+        assert_eq!(
+            get_document_inner(&state, &id).unwrap(),
+            "We ship the beta on Friday.",
+            "typed note text readable in an open folder"
+        );
+        let listed = list_documents_inner(&state, "f-open").unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].kind, "note", "import_text stores kind='note'");
+        assert_eq!(listed[0].name, "Decisions");
+        // CHUNKING is unconditional (keyword/FTS retrieval must work on a default install);
+        // only the VECTORS stay model-presence-gated (never write stub vectors — mirrors
+        // `import_document`'s assertions and `should_auto_index`'s no-stub contract).
+        assert!(
+            state.db.doc_chunk_count(&id).unwrap() >= 1,
+            "the note must be chunked regardless of model presence (always-chunk)"
+        );
+        if crate::embed::embed_model_present() {
+            assert!(
+                state.db.doc_vec_count(&id).unwrap() >= 1,
+                "with the e5 model present, the chunks must carry real vectors"
+            );
+        } else {
+            assert_eq!(
+                state.db.doc_vec_count(&id).unwrap(),
+                0,
+                "with no e5 model, NO stub vectors are written (no-stub contract)"
+            );
+        }
+        // Empty / whitespace-only text is refused.
+        assert!(matches!(
+            import_text_inner(&state, "n", "   ", "f-open").unwrap_err(),
+            AppError::InvalidArg(_)
+        ));
+    }
+
+    /// import_text is WRITE-GATED like import_document: a sealed-not-unlocked folder refuses it with
+    /// Locked, and a note in a sealed folder is masked from list/get.
+    #[test]
+    fn import_text_refused_when_folder_sealed() {
+        let state = build_state("text-sealed");
+        make_open_folder(&state.db, "f-lock", "Secret");
+        let note = import_text_inner(&state, "n", "the code is 4291", "f-lock").unwrap();
+        state
+            .db
+            .set_folder_locked("f-lock", true, Some(&b"wrapped"[..]))
+            .unwrap();
+
+        assert!(matches!(
+            import_text_inner(&state, "n2", "another", "f-lock").unwrap_err(),
+            AppError::Locked(_)
+        ));
+        assert!(
+            list_documents_inner(&state, "f-lock").unwrap().is_empty(),
+            "sealed note list masked"
+        );
+        assert_eq!(
+            get_document_inner(&state, &note).unwrap(),
+            "",
+            "sealed note get masked"
+        );
+    }
+
+    /// brain_overview counts ONLY visible content: a note in a SEALED-not-unlocked folder is NOT
+    /// counted; session-unlocking the folder makes it count. Flags reflect config + model presence.
+    #[test]
+    fn brain_overview_counts_only_visible() {
+        let state = build_state("brain-overview");
+        make_open_folder(&state.db, "f-open", "Open");
+        make_open_folder(&state.db, "f-lock", "Locked");
+        import_text_inner(&state, "a", "open note one", "f-open").unwrap();
+        import_document_inner(
+            &state,
+            write_temp_doc("ov", "md", "an open document")
+                .to_str()
+                .unwrap(),
+            "f-open",
+        )
+        .unwrap();
+        let secret = import_text_inner(&state, "s", "secret note", "f-lock").unwrap();
+        assert!(!secret.is_empty());
+        state
+            .db
+            .set_folder_locked("f-lock", true, Some(&b"wrapped"[..]))
+            .unwrap();
+
+        // Sealed folder's note is excluded: 1 note (open) + 1 document (open), NOT 2 notes.
+        let ov = brain_overview_inner(&state).unwrap();
+        assert_eq!(ov.note_count, 1, "sealed folder's note not counted");
+        assert_eq!(ov.document_count, 1, "open document counted");
+        assert_eq!(ov.embed_model_present, crate::embed::embed_model_present());
+
+        // Session-unlock ⇒ the sealed note now counts.
+        state
+            .unlocked_folders
+            .lock()
+            .unwrap()
+            .insert("f-lock".to_string());
+        assert_eq!(
+            brain_overview_inner(&state).unwrap().note_count,
+            2,
+            "unlocked note counted"
+        );
+    }
+
+    /// COUNTEREXAMPLE (verify-before-destroy): an uploaded document's TEXT survives a real lock→unlock
+    /// cycle — SEALED under the folder CK (plaintext blanked, blob present) on lock, RESTORED
+    /// byte-identical on unlock. Drives the PRODUCTION seal (`lock_folder_inner` →
+    /// `seal_folder_extras`) and unseal (`unseal_folder_extras`). The doc chunks are purged on lock.
+    #[test]
+    fn document_text_survives_lock_unlock_cycle_sealed_and_restored() {
+        let state = build_state("doc-seal-cycle");
+        make_open_folder(&state.db, "f-lock", "Secret");
+        let md = write_temp_doc(
+            "cycle",
+            "md",
+            "zażółć 🔒 DECISION: ship Friday; Anna owns QA",
+        );
+        let id = import_document_inner(&state, md.to_str().unwrap(), "f-lock").unwrap();
+        let original = "zażółć 🔒 DECISION: ship Friday; Anna owns QA";
+
+        // LOCK → production seal: text blanked at rest, text_blob present, doc chunks purged.
+        lock_folder_inner(&state, "f-lock".to_string()).unwrap();
+        let sealed = state
+            .db
+            .raw_documents_in_folder("f-lock")
+            .unwrap()
+            .into_iter()
+            .find(|d| d.id == id)
+            .unwrap();
+        assert_eq!(
+            sealed.text, "",
+            "document text plaintext blanked while sealed"
+        );
+        assert!(
+            sealed.blob.is_some(),
+            "document sealed under the folder CK (blob present)"
+        );
+        assert_eq!(
+            state.db.doc_chunk_count(&id).unwrap(),
+            0,
+            "doc chunks purged on lock (re-embeddable on unlock)"
+        );
+
+        // UNLOCK (mirror unlock_folder's internals): KEK → unwrap CK → unseal extras.
+        let kek = secrets::get_or_create_master_kek().unwrap();
+        let wrapped = state.db.folder_wrapped_key("f-lock").unwrap().unwrap();
+        let ck_vec = crate::crypto::decrypt(&kek, &wrapped, &aad_wrapped_ck("f-lock")).unwrap();
+        let ck: [u8; 32] = ck_vec.try_into().expect("CK is 32 bytes");
+        unseal_folder_extras(&state, "f-lock", &ck, None).unwrap();
+
+        let restored = state
+            .db
+            .raw_documents_in_folder("f-lock")
+            .unwrap()
+            .into_iter()
+            .find(|d| d.id == id)
+            .unwrap();
+        assert_eq!(
+            restored.text, original,
+            "document text restored byte-identical on unlock — sealed-and-restored, never lost"
+        );
+    }
+
+    /// REMOVE-LOCK: permanently removing a folder's lock decrypts the document text back to plaintext
+    /// and clears the blob — the document is NEVER lost.
+    #[test]
+    fn document_text_survives_remove_lock_permanently() {
+        let state = build_state("doc-remove-lock");
+        make_open_folder(&state.db, "f-lock", "Secret");
+        let md = write_temp_doc("perm", "md", "permanent: revisit auth next sprint");
+        let id = import_document_inner(&state, md.to_str().unwrap(), "f-lock").unwrap();
+
+        lock_folder_inner(&state, "f-lock".to_string()).unwrap();
+        let sealed = state
+            .db
+            .raw_documents_in_folder("f-lock")
+            .unwrap()
+            .into_iter()
+            .find(|d| d.id == id)
+            .unwrap();
+        assert_eq!(sealed.text, "", "blanked while sealed");
+
+        let kek = secrets::get_or_create_master_kek().unwrap();
+        *state.master_kek.lock().unwrap() = Some(Zeroizing::new(kek));
+        remove_lock_inner(&state, "f-lock".to_string()).unwrap();
+
+        let d = state
+            .db
+            .raw_documents_in_folder("f-lock")
+            .unwrap()
+            .into_iter()
+            .find(|d| d.id == id)
+            .unwrap();
+        assert_eq!(
+            d.text, "permanent: revisit auth next sprint",
+            "permanently restored on remove-lock"
+        );
+        assert!(
+            d.blob.is_none(),
+            "document text_blob cleared on remove-lock"
+        );
+    }
+
+    /// DELETE cascades the document's chunks/vectors away.
+    #[test]
+    fn delete_document_cascades_chunks() {
+        let state = build_state("doc-delete");
+        make_open_folder(&state.db, "f-open", "Project");
+        let md = write_temp_doc("del", "md", "alpha bravo charlie");
+        let id = import_document_inner(&state, md.to_str().unwrap(), "f-open").unwrap();
+        assert_eq!(list_documents_inner(&state, "f-open").unwrap().len(), 1);
+
+        block_on(delete_document_inner(&state, &id)).unwrap();
+        assert!(
+            list_documents_inner(&state, "f-open").unwrap().is_empty(),
+            "document deleted"
+        );
+        assert_eq!(
+            state.db.doc_chunk_count(&id).unwrap(),
+            0,
+            "doc chunks cascade-deleted with the document"
+        );
+    }
+
+    /// DELETE-CASCADE FIX (Bug A) — deleting a document that has a LIVE org share must revoke it
+    /// (never leave a dangling `uploaded` row the background org-sync tick would resurrect). No live
+    /// server/session in this unit test, so the tombstone network call itself fails — the row is
+    /// still driven to `revoke_pending` FIRST (crash-safe: the launch sweep would finish a stuck one),
+    /// exactly mirroring `share_to_org_inner_collapses_existing_duplicates_keeping_the_earliest`'s
+    /// no-session assertion shape. RED before the fix: the unpatched `delete_document_inner` never
+    /// touches `org_shares` at all, so the row would still read `uploaded` after the delete.
+    #[test]
+    fn delete_document_revokes_a_live_org_share() {
+        let state = build_state("doc-delete-org-revoke");
+        make_open_folder(&state.db, "f-open", "Project");
+        let md = write_temp_doc("del-org", "md", "alpha bravo charlie");
+        let id = import_document_inner(&state, md.to_str().unwrap(), "f-open").unwrap();
+
+        state
+            .db
+            .insert_org_share(
+                "share-1", "org-1", None, Some(&id), "document", Some("A Doc"), 1, 1,
+                &[3u8; 32], "2026-07-15T00:00:00Z",
+            )
+            .unwrap();
+        state
+            .db
+            .set_org_share_uploaded("share-1", "item-1", "2026-07-15T00:00:00Z")
+            .unwrap();
+        assert_eq!(
+            state.db.get_org_share("share-1").unwrap().unwrap().state,
+            "uploaded",
+            "sanity: the share starts live"
+        );
+
+        block_on(delete_document_inner(&state, &id)).unwrap_err();
+        // The delete FAILS LOUD here (no live session/server → the tombstone call errors), but the
+        // row must already have moved off `uploaded` — never left dangling as if nothing happened.
+        let row = state.db.get_org_share("share-1").unwrap().unwrap();
+        assert_ne!(
+            row.state, "uploaded",
+            "a live org share must be (at least) marked revoke_pending before the delete gives up, \
+             never left uploaded — that's the resurrection bug"
+        );
+    }
+
+    // ── NOTES feature (WP0–WP3) ──────────────────────────────────────────────────────────────────
+
+    /// WP0 — create_note with a NULL folder lands in the default "Notes" note-folder (created on
+    /// first use), and the note is readable + listed. The folder is `kind='note'`.
+    #[test]
+    fn create_note_null_folder_lands_in_default_note_folder() {
+        let state = build_state("note-default-folder");
+        let id = create_note_inner(&state, None, "My first note").unwrap();
+
+        // The default note-folder exists, is kind='note', and its path is "Notes".
+        let folders = state.db.list_note_folders().unwrap();
+        assert_eq!(folders.len(), 1, "exactly one default note-folder created");
+        assert_eq!(folders[0].name, "Notes");
+        assert_eq!(folders[0].path, "Notes");
+        assert_eq!(folders[0].kind, "note");
+
+        // The note is readable (empty body, our title) and listed under the default folder.
+        let doc = get_note_inner(&state, &id).unwrap();
+        assert!(!doc.locked);
+        assert_eq!(doc.title, "My first note");
+        assert_eq!(doc.markdown, "", "a fresh note has an empty body");
+        assert_eq!(doc.folder_id, folders[0].id);
+
+        let listed = list_notes_inner(&state, None).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].title, "My first note");
+        assert_eq!(listed[0].id, id);
+
+        // create_note is idempotent about the default folder: a SECOND null-folder note reuses it.
+        let id2 = create_note_inner(&state, None, "Second").unwrap();
+        assert_ne!(id, id2);
+        assert_eq!(
+            state.db.list_note_folders().unwrap().len(),
+            1,
+            "the default note-folder is not duplicated"
+        );
+    }
+
+    /// DELETE-CASCADE FIX (Bug A) — deleting a note that has a LIVE org share must revoke it (never
+    /// leave a dangling `uploaded` row the background org-sync tick would resurrect on the SAME
+    /// machine). No live server/session in this unit test, so the tombstone network call itself fails
+    /// closed — the row is still driven to (at least) `revoke_pending` FIRST (crash-safe: the launch
+    /// sweep would finish a stuck one) BEFORE the delete gives up. RED before the fix: the unpatched
+    /// `delete_note_inner` never touches `org_shares` at all, so a live share would still read
+    /// `uploaded` and the local note row would ALSO already be gone (a strictly worse outcome — the
+    /// content deleted locally while its server copy stays live-and-undetectable).
+    #[test]
+    fn delete_note_revokes_a_live_org_share() {
+        let state = build_state("note-delete-org-revoke");
+        let id = create_note_inner(&state, None, "Shared note").unwrap();
+
+        state
+            .db
+            .insert_org_share(
+                "share-note-1", "org-1", None, Some(&id), "note", Some("Shared note"), 1, 1,
+                &[4u8; 32], "2026-07-15T00:00:00Z",
+            )
+            .unwrap();
+        state
+            .db
+            .set_org_share_uploaded("share-note-1", "item-note-1", "2026-07-15T00:00:00Z")
+            .unwrap();
+
+        let err = block_on(delete_note_inner(&state, &id)).unwrap_err();
+        assert!(
+            matches!(err, AppError::Unavailable(_)),
+            "delete fails loud when the revoke can't reach the server (no session), got {err:?}"
+        );
+        let row = state.db.get_org_share("share-note-1").unwrap().unwrap();
+        assert_ne!(
+            row.state, "uploaded",
+            "a live org share must be moved off `uploaded` before the delete gives up — \
+             never left dangling live, that's the resurrection bug"
+        );
+        // The local note row must SURVIVE the failed delete — fail loud means fail WHOLE, not
+        // half-deleted-locally-with-a-dangling-server-copy.
+        assert!(
+            get_note_inner(&state, &id).is_ok(),
+            "a failed (revoke-blocked) delete must not have removed the local note"
+        );
+    }
+
+    /// WP0 — create_note into a SEALED-and-not-session-unlocked note-folder is REFUSED with Locked
+    /// (never resurrect plaintext behind a lock). Session-unlocking the folder allows it — and
+    /// (2026-07-10 audit F1) the note created while unlocked is SEALED FROM BIRTH. The seal is a
+    /// REAL `lock_folder_inner` seal (seal-on-write needs the real wrapped key + the session KEK the
+    /// production unlock caches, not a garbage-blob fixture).
+    #[test]
+    fn create_note_refused_when_target_folder_sealed() {
+        let state = build_state("note-create-sealed");
+        let fid = create_note_folder_inner(&state, "Secret", None).unwrap().id;
+        lock_folder_inner(&state, fid.clone()).unwrap();
+
+        assert!(
+            matches!(
+                create_note_inner(&state, Some(&fid), "n").unwrap_err(),
+                AppError::Locked(_)
+            ),
+            "sealed-not-unlocked target folder refuses a new note"
+        );
+
+        // Session-unlock (KEK cached exactly like the production unlock) ⇒ allowed.
+        let _ck = session_unlock(&state, &fid);
+        let id = create_note_inner(&state, Some(&fid), "n").unwrap();
+        assert!(!id.is_empty());
+        assert!(
+            state.db.get_note_row(&id).unwrap().unwrap().sealed,
+            "a note created in a session-unlocked LOCKED folder is sealed from birth"
+        );
+    }
+
+    /// 2026-07-14 Notes Saved Views (RED-before-GREEN): the `"notes"` scope is now a valid saved-view
+    /// scope (was meetings-only), and the `saved_views.scope` column partitions the roster so a notes
+    /// view never appears in the meetings roster and vice-versa. Before the scope guard was relaxed
+    /// this scope was rejected, so a notes view couldn't be persisted at all — this test is RED
+    /// against that.
+    #[test]
+    fn saved_views_notes_scope_is_valid_and_partitioned_from_meetings() {
+        assert!(is_valid_saved_view_scope("meetings"));
+        assert!(
+            is_valid_saved_view_scope("notes"),
+            "the notes surface must be a valid saved-view scope"
+        );
+        assert!(!is_valid_saved_view_scope("calendar"));
+
+        let state = build_state("saved-views-notes-scope");
+        let notes_view = SavedView {
+            id: "nv1".into(),
+            scope: "notes".into(),
+            name: "By folder".into(),
+            layout: "table".into(),
+            config: "{}".into(),
+            sort_order: 0,
+            created_at: "2026-07-14T00:00:00Z".into(),
+            updated_at: "2026-07-14T00:00:00Z".into(),
+        };
+        let meetings_view = SavedView {
+            id: "mv1".into(),
+            scope: "meetings".into(),
+            name: "Recent".into(),
+            layout: "table".into(),
+            config: "{}".into(),
+            sort_order: 0,
+            created_at: "2026-07-14T00:00:00Z".into(),
+            updated_at: "2026-07-14T00:00:00Z".into(),
+        };
+        state.db.upsert_saved_view(&notes_view).unwrap();
+        state.db.upsert_saved_view(&meetings_view).unwrap();
+
+        let notes = state.db.list_saved_views("notes").unwrap();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].id, "nv1");
+        let meetings = state.db.list_saved_views("meetings").unwrap();
+        assert_eq!(meetings.len(), 1);
+        assert_eq!(
+            meetings[0].id, "mv1",
+            "a notes-scoped view must never leak into the meetings roster"
+        );
+    }
+
+    /// 2026-07-14 folder-leak (RED-before-GREEN): `list_folders` returns EVERY folder — meeting AND
+    /// note — because the lock-reactive FE consumers need the whole set. So `build_folder_tree` MUST
+    /// stamp each node's `kind` (from `folder_kinds()`) so the Meetings sidebar can filter note
+    /// folders out (`kind != "note"`). Before the fix `FolderNode` had no `kind` and note folders
+    /// leaked into the Meetings tree with no way to distinguish them — this test is RED against that.
+    #[test]
+    fn folder_tree_tags_note_folders_so_meetings_can_filter_them_out() {
+        let state = build_state("folder-kind-tree");
+        // A meeting folder — `insert_folder` leaves `kind` NULL, which `folder_kinds()` reads as
+        // "meeting" via COALESCE (the legacy-row default).
+        state
+            .db
+            .insert_folder(&Folder {
+                id: "mf1".into(),
+                name: "Project X".into(),
+                path: "Project X".into(),
+                parent_id: None,
+                locked: false,
+                created_at: "2026-07-14T00:00:00Z".into(),
+            })
+            .unwrap();
+        // A note folder — `create_note_folder_inner` stamps `kind='note'`.
+        let nf = create_note_folder_inner(&state, "Ideas", None).unwrap();
+
+        let folders = state.db.list_folders().unwrap();
+        let unlocked = std::collections::HashSet::new();
+        let counts = state.db.count_notes_per_folder(&unlocked).unwrap();
+        let kinds = state.db.folder_kinds().unwrap();
+        let tree = build_folder_tree(&folders, &counts, &unlocked, &kinds);
+
+        let meeting_node = tree
+            .iter()
+            .find(|n| n.id == "mf1")
+            .expect("meeting folder present in the tree");
+        assert_eq!(meeting_node.kind, "meeting");
+        let note_node = tree
+            .iter()
+            .find(|n| n.id == nf.id)
+            .expect("note folder present in the tree");
+        assert_eq!(
+            note_node.kind, "note",
+            "the note folder must be tagged so the Meetings tree can filter it out"
+        );
+
+        // The Meetings sidebar renders `kind != "note"`: only the meeting folder survives, the note
+        // folder never appears there.
+        let meetings_only: Vec<_> = tree.iter().filter(|n| n.kind != "note").collect();
+        assert!(meetings_only.iter().any(|n| n.id == "mf1"));
+        assert!(
+            !meetings_only.iter().any(|n| n.id == nf.id),
+            "a note folder must NEVER render in the Meetings tree"
+        );
+    }
+
+    /// 2026-07-14 folder-leak mirror (RED-before-GREEN): a MEETING must never be filed under a NOTE
+    /// folder. `ensure_meeting_folder_target` (the `move_note` write-gate) rejects a note-folder id
+    /// with `InvalidArg`, accepts a meeting-folder id, and accepts `None` (the vault root). Before
+    /// this gate `move_note` resolved the target kind-agnostically and would move a meeting's `.md`
+    /// under the Notes namespace — this test is RED against that.
+    #[test]
+    fn move_note_write_gate_rejects_a_note_folder_target() {
+        let state = build_state("move-note-kind-gate");
+        state
+            .db
+            .insert_folder(&Folder {
+                id: "mf1".into(),
+                name: "Meetings".into(),
+                path: "Meetings".into(),
+                parent_id: None,
+                locked: false,
+                created_at: "2026-07-14T00:00:00Z".into(),
+            })
+            .unwrap();
+        let nf = create_note_folder_inner(&state, "Ideas", None).unwrap();
+
+        // A note-folder target is refused with InvalidArg.
+        assert!(
+            matches!(
+                ensure_meeting_folder_target(&state.db, Some(nf.id.as_str())).unwrap_err(),
+                AppError::InvalidArg(_)
+            ),
+            "a meeting must not be movable into a note folder"
+        );
+        // A meeting-folder target and the vault root are allowed.
+        assert!(ensure_meeting_folder_target(&state.db, Some("mf1")).is_ok());
+        assert!(ensure_meeting_folder_target(&state.db, None).is_ok());
+    }
+
+    /// Feature C (RED-before-GREEN): `set_note_folder_schema` on a SEALED-and-not-session-unlocked
+    /// folder MUST be refused with `AppError::Locked` and leave the schema UNCHANGED — an impl that
+    /// forgets the `folder_is_unlocked` gate would let a schema be edited behind a lock (this test is
+    /// RED against that). Session-unlock allows the edit.
+    #[test]
+    fn set_note_folder_schema_refuses_on_locked_folder() {
+        let state = build_state("schema-locked-refuse");
+        let fid = create_note_folder_inner(&state, "Secret", None).unwrap().id;
+        // Seed an initial schema WHILE the folder is open, then lock it.
+        let original = vec![PropertySchemaField {
+            key: "status".into(),
+            kind: PropertyKind::Text,
+            options: vec![],
+        }];
+        set_note_folder_schema_inner(&state, &fid, original.clone()).unwrap();
+        lock_folder_inner(&state, fid.clone()).unwrap();
+
+        // Attempt to overwrite the schema while sealed-not-unlocked → Locked refusal.
+        let attempt = vec![PropertySchemaField {
+            key: "owner".into(),
+            kind: PropertyKind::Text,
+            options: vec![],
+        }];
+        assert!(
+            matches!(
+                set_note_folder_schema_inner(&state, &fid, attempt.clone()).unwrap_err(),
+                AppError::Locked(_)
+            ),
+            "sealed-not-unlocked folder must refuse a schema write"
+        );
+        // The stored schema is UNCHANGED (read it directly — the command read gate returns [] when
+        // locked, so assert against the DB layer to prove the write was rejected, not just masked).
+        assert_eq!(
+            state.db.get_note_folder_schema(&fid).unwrap(),
+            original,
+            "the schema must be untouched after a refused write"
+        );
+
+        // Session-unlock ⇒ the write is allowed and takes effect.
+        let _ck = session_unlock(&state, &fid);
+        set_note_folder_schema_inner(&state, &fid, attempt.clone()).unwrap();
+        assert_eq!(state.db.get_note_folder_schema(&fid).unwrap(), attempt);
+    }
+
+    /// Feature C (RED-before-GREEN): `get_note_folder_schema` is GATED — a sealed-and-not-session-
+    /// unlocked folder returns `Ok(vec![])` (we deliberately do NOT expose a locked folder's schema);
+    /// session-unlock reveals the real schema. RED against an ungated read that would return the
+    /// schema while locked.
+    #[test]
+    fn get_note_folder_schema_gated_on_lock() {
+        let state = build_state("schema-read-gate");
+        let fid = create_note_folder_inner(&state, "Secret", None).unwrap().id;
+        let schema = vec![PropertySchemaField {
+            key: "status".into(),
+            kind: PropertyKind::Select,
+            options: vec!["Open".into(), "Done".into()],
+        }];
+        set_note_folder_schema_inner(&state, &fid, schema.clone()).unwrap();
+        lock_folder_inner(&state, fid.clone()).unwrap();
+
+        // Locked-not-unlocked → empty (schema not exposed), even though a row exists in the DB.
+        assert!(
+            get_note_folder_schema_inner(&state, &fid).unwrap().is_empty(),
+            "sealed-not-unlocked folder's schema must not be exposed"
+        );
+
+        // Session-unlock → the real schema.
+        let _ck = session_unlock(&state, &fid);
+        assert_eq!(get_note_folder_schema_inner(&state, &fid).unwrap(), schema);
+    }
+
+    /// Feature C: `list_notes_typed` returns `[]` for a sealed-and-not-session-unlocked folder (no
+    /// rows, never a masked row) and the real typed rows once session-unlocked.
+    #[test]
+    fn list_notes_typed_gated_on_lock() {
+        let state = build_state("typed-list-gate");
+        let fid = create_note_folder_inner(&state, "Tasks", None).unwrap().id;
+        set_note_folder_schema_inner(
+            &state,
+            &fid,
+            vec![PropertySchemaField {
+                key: "status".into(),
+                kind: PropertyKind::Select,
+                options: vec!["Open".into(), "Done".into()],
+            }],
+        )
+        .unwrap();
+        let id = create_note_inner(&state, Some(&fid), "Task A").unwrap();
+        update_note_doc_inner(&state, &id, "Task A", "---\nstatus: Done\n---\nbody").unwrap();
+        lock_folder_inner(&state, fid.clone()).unwrap();
+
+        // Locked → no rows.
+        assert!(
+            list_notes_typed_inner(&state, &fid).unwrap().is_empty(),
+            "sealed-not-unlocked folder must yield no typed rows"
+        );
+
+        // Session-unlock → the real typed row with the coerced Select value.
+        let _ck = session_unlock(&state, &fid);
+        let rows = list_notes_typed_inner(&state, &fid).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].title, "Task A");
+        assert_eq!(
+            rows[0].values.get("status"),
+            Some(&crate::storage::models::PropertyValue::Select("Done".into()))
+        );
+    }
+
+    /// Feature C: `set_note_folder_schema` validation — reserved `tags` key, duplicate keys,
+    /// empty-option Select, and the field-count cap all refuse with `InvalidArg`.
+    #[test]
+    fn set_note_folder_schema_validation() {
+        let state = build_state("schema-validate");
+        let fid = create_note_folder_inner(&state, "V", None).unwrap().id;
+
+        // Reserved key "tags".
+        assert!(matches!(
+            set_note_folder_schema_inner(
+                &state,
+                &fid,
+                vec![PropertySchemaField {
+                    key: "tags".into(),
+                    kind: PropertyKind::Text,
+                    options: vec![]
+                }]
+            )
+            .unwrap_err(),
+            AppError::InvalidArg(_)
+        ));
+
+        // Duplicate keys (case-insensitive).
+        assert!(matches!(
+            set_note_folder_schema_inner(
+                &state,
+                &fid,
+                vec![
+                    PropertySchemaField { key: "Owner".into(), kind: PropertyKind::Text, options: vec![] },
+                    PropertySchemaField { key: "owner".into(), kind: PropertyKind::Text, options: vec![] },
+                ]
+            )
+            .unwrap_err(),
+            AppError::InvalidArg(_)
+        ));
+
+        // Select with no non-empty option.
+        assert!(matches!(
+            set_note_folder_schema_inner(
+                &state,
+                &fid,
+                vec![PropertySchemaField {
+                    key: "status".into(),
+                    kind: PropertyKind::Select,
+                    options: vec!["  ".into()]
+                }]
+            )
+            .unwrap_err(),
+            AppError::InvalidArg(_)
+        ));
+
+        // A valid schema goes through.
+        set_note_folder_schema_inner(
+            &state,
+            &fid,
+            vec![PropertySchemaField {
+                key: "status".into(),
+                kind: PropertyKind::Select,
+                options: vec!["Open".into()],
+            }],
+        )
+        .unwrap();
+    }
+
+    /// WP0 gate — a note in a SEALED-and-not-session-unlocked folder MUST be MASKED: `get_note`
+    /// returns locked:true, title "🔒 Locked", NO markdown/tags/properties; `list_notes` EXCLUDES it
+    /// entirely (the title/topic never leaks through the list). Session-unlock reveals both.
+    #[test]
+    fn sealed_note_is_masked_in_get_and_absent_in_list() {
+        let state = build_state("note-gate-mask");
+        let fid = create_note_folder_inner(&state, "Secret", None).unwrap().id;
+        let md = "---\ntags: [secret, launch]\nstatus: draft\n---\nThe launch code is 4291.";
+        let id = create_note_inner(&state, Some(&fid), "Launch plan").unwrap();
+        update_note_doc_inner(&state, &id, "Launch plan", md).unwrap();
+
+        // Seal the folder (production seal blanks text → blob).
+        lock_folder_inner(&state, fid.clone()).unwrap();
+
+        // get_note MASKED — no body, no tags, no properties, title hidden.
+        let masked = get_note_inner(&state, &id).unwrap();
+        assert!(masked.locked, "sealed note reports locked");
+        assert_eq!(masked.title, "🔒 Locked", "sealed note title masked");
+        assert_eq!(masked.markdown, "", "sealed note body never leaks");
+        assert!(masked.tags.is_empty(), "sealed note tags never leak");
+        assert!(
+            masked.properties.is_empty(),
+            "sealed note properties never leak"
+        );
+
+        // list_notes EXCLUDES the sealed note (title never leaks through the list).
+        assert!(
+            list_notes_inner(&state, None).unwrap().is_empty(),
+            "sealed note absent from the list (no per-row leak)"
+        );
+        assert!(
+            list_notes_inner(&state, Some(&fid)).unwrap().is_empty(),
+            "sealed note absent from the folder-scoped list too"
+        );
+
+        // Session-unlock: mirror `unlock_folder`'s internals — add to the unlock set AND unseal the
+        // plaintext back (adding to the set alone makes the note VISIBLE but its text is still
+        // blanked until the extras are unsealed).
+        let kek = secrets::get_or_create_master_kek().unwrap();
+        let wrapped = state.db.folder_wrapped_key(&fid).unwrap().unwrap();
+        let ck_vec = crate::crypto::decrypt(&kek, &wrapped, &aad_wrapped_ck(&fid)).unwrap();
+        let ck: [u8; 32] = ck_vec.try_into().expect("CK is 32 bytes");
+        unseal_folder_extras(&state, &fid, &ck, None).unwrap();
+        state.unlocked_folders.lock().unwrap().insert(fid.clone());
+
+        let unlocked = get_note_inner(&state, &id).unwrap();
+        assert!(!unlocked.locked);
+        assert_eq!(unlocked.title, "Launch plan");
+        assert!(unlocked.markdown.contains("launch code"));
+        assert_eq!(unlocked.tags, vec!["secret".to_string(), "launch".to_string()]);
+        assert_eq!(
+            unlocked.properties.get("status"),
+            Some(&"draft".to_string())
+        );
+        assert_eq!(list_notes_inner(&state, None).unwrap().len(), 1);
+    }
+
+    /// WP2 seal round-trip — a note's full markdown (front-matter + Unicode body) survives a real
+    /// production lock→unlock cycle BYTE-IDENTICAL (verify-before-destroy). On lock the plaintext is
+    /// blanked + chunks purged; on unlock it is restored exactly and re-indexed.
+    #[test]
+    fn note_markdown_survives_lock_unlock_byte_identical() {
+        let state = build_state("note-seal-cycle");
+        let fid = create_note_folder_inner(&state, "Vault", None).unwrap().id;
+        let original =
+            "---\ntags: [zażółć, launch]\n---\n# Decyzja 🔒\nAnna owns QA; ship on Friday.";
+        let id = create_note_inner(&state, Some(&fid), "Decyzja").unwrap();
+        update_note_doc_inner(&state, &id, "Decyzja", original).unwrap();
+
+        // LOCK → production seal: text blanked, blob present, doc chunks purged.
+        lock_folder_inner(&state, fid.clone()).unwrap();
+        let sealed = state
+            .db
+            .get_note_row(&id)
+            .unwrap()
+            .expect("row still present");
+        assert_eq!(sealed.text, "", "note plaintext blanked while sealed");
+        assert!(sealed.sealed, "note sealed under the folder CK (blob present)");
+        assert_eq!(
+            state.db.doc_chunk_count(&id).unwrap(),
+            0,
+            "note chunks purged on lock (re-embeddable on unlock)"
+        );
+
+        // UNLOCK (mirror unlock_folder internals): KEK → unwrap CK → unseal extras.
+        let kek = secrets::get_or_create_master_kek().unwrap();
+        let wrapped = state.db.folder_wrapped_key(&fid).unwrap().unwrap();
+        let ck_vec = crate::crypto::decrypt(&kek, &wrapped, &aad_wrapped_ck(&fid)).unwrap();
+        let ck: [u8; 32] = ck_vec.try_into().expect("CK is 32 bytes");
+        unseal_folder_extras(&state, &fid, &ck, None).unwrap();
+
+        let restored = state.db.get_note_row(&id).unwrap().unwrap();
+        assert_eq!(
+            restored.text, original,
+            "note markdown restored byte-identical on unlock — never lost"
+        );
+    }
+
+    /// WP3 — update_note PURGES the old chunks and re-indexes the new BODY (front-matter stripped),
+    /// and bumps updated_at. RED-before-GREEN shape: after the first save the body is chunked; after
+    /// an edit the OLD chunk text is gone and the NEW body is chunked; front-matter never chunked.
+    #[test]
+    fn update_note_reindexes_body_and_bumps_updated_at() {
+        let state = build_state("note-reindex");
+        let fid = create_note_folder_inner(&state, "Work", None).unwrap().id;
+        let id = create_note_inner(&state, Some(&fid), "Draft").unwrap();
+
+        // First save: front-matter + body. The BODY is chunked; the front-matter is NOT. The tag
+        // `frontmatteronlyterm` appears ONLY in the front-matter, never in the body — so if it is
+        // retrievable the front-matter leaked into the index.
+        let v1 = "---\ntags: [frontmatteronlyterm]\n---\nBravo charlie decision.";
+        let d1 = update_note_doc_inner(&state, &id, "Draft", v1).unwrap();
+        assert!(
+            state.db.doc_chunk_count(&id).unwrap() >= 1,
+            "note body chunked on save"
+        );
+        // The chunk text must be the BODY (front-matter tags absent from the index).
+        let unlocked = HashSet::new();
+        let hits = state
+            .db
+            .search_doc_chunks_fts_visible("bravo", 10, &unlocked)
+            .unwrap();
+        assert!(
+            hits.iter().any(|h| h.document_id == id),
+            "body term retrievable"
+        );
+        let tag_hits = state
+            .db
+            .search_doc_chunks_fts_visible("frontmatteronlyterm", 10, &unlocked)
+            .unwrap();
+        assert!(
+            !tag_hits.iter().any(|h| h.document_id == id),
+            "front-matter-only tag is NOT chunked (front-matter stripped before embed)"
+        );
+
+        // Edit: a wholly new body. Old body term gone; new term present. updated_at advances.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let v2 = "---\ntags: [frontmatteronlyterm]\n---\nZulu yankee xray rewrite.";
+        let d2 = update_note_doc_inner(&state, &id, "Draft", v2).unwrap();
+        let old = state
+            .db
+            .search_doc_chunks_fts_visible("bravo", 10, &unlocked)
+            .unwrap();
+        assert!(
+            !old.iter().any(|h| h.document_id == id),
+            "old body chunk purged on re-index"
+        );
+        let new = state
+            .db
+            .search_doc_chunks_fts_visible("yankee", 10, &unlocked)
+            .unwrap();
+        assert!(
+            new.iter().any(|h| h.document_id == id),
+            "new body chunk indexed on re-index"
+        );
+        assert!(
+            d2.updated_at >= d1.updated_at,
+            "updated_at is bumped on edit"
+        );
+    }
+
+    /// PERF two-tier save: `save_note_text` (the cheap frequent-autosave path) PERSISTS the body +
+    /// updated_at but does NOT re-chunk/re-embed (no `doc_chunks`) or re-export — so typing never
+    /// triggers the e5 re-embed. The deferred `update_note_doc` (blur/close/preview) is what indexes.
+    #[test]
+    fn save_note_text_persists_without_reindexing() {
+        let state = build_state("note-save-text");
+        let fid = create_note_folder_inner(&state, "Work", None).unwrap().id;
+        let id = create_note_inner(&state, Some(&fid), "Draft").unwrap();
+
+        // Cheap save: body persisted + retrievable via get_note, updated_at set…
+        let now =
+            save_note_text_inner(&state, &id, "Draft", "Alpha bravo cheap-save body.").unwrap();
+        let doc = get_note_inner(&state, &id).unwrap();
+        assert_eq!(doc.markdown, "Alpha bravo cheap-save body.");
+        assert_eq!(doc.updated_at, now);
+
+        // …but it must NOT index (no doc_chunks) — the re-embed is deferred.
+        assert_eq!(
+            state.db.doc_chunk_count(&id).unwrap(),
+            0,
+            "cheap save must NOT re-index (no doc_chunks) — the e5 re-embed is deferred"
+        );
+        let unlocked = HashSet::new();
+        assert!(
+            state
+                .db
+                .search_doc_chunks_fts_visible("bravo", 10, &unlocked)
+                .unwrap()
+                .is_empty(),
+            "cheap-saved body is not searchable until the deferred full save indexes it"
+        );
+
+        // The deferred full save DOES index it (proves the two-tier design end-to-end).
+        update_note_doc_inner(&state, &id, "Draft", "Alpha bravo cheap-save body.").unwrap();
+        assert!(
+            state.db.doc_chunk_count(&id).unwrap() >= 1,
+            "the deferred full update re-indexes the note"
+        );
+    }
+
+    /// WP1 — export_note writes `<vault>/Notes/<title>.md`, records exported_path, and on LOCK the
+    /// vault `.md` is deleted + exported_path NULLed (a sealed note leaves no plaintext on disk).
+    #[test]
+    fn note_exports_to_vault_and_md_deleted_on_lock() {
+        let vault = tmp_vault("note-export");
+        let state = build_state_with_vault("note-export", &vault);
+        let fid = create_note_folder_inner(&state, "Ideas", None).unwrap().id;
+        let id = create_note_inner(&state, Some(&fid), "Roadmap").unwrap();
+        update_note_doc_inner(&state, &id, "Roadmap", "# Roadmap\nShip Q3.").unwrap();
+
+        // The note's .md exists under <vault>/Notes/Ideas/.
+        let doc = get_note_inner(&state, &id).unwrap();
+        let path = doc.exported_path.expect("note exported to vault");
+        assert!(
+            std::path::Path::new(&path).exists(),
+            "vault .md written on save"
+        );
+        assert!(
+            path.contains("Notes/Ideas"),
+            "note lands under the Notes/<folder> tree: {path}"
+        );
+
+        // LOCK: the .md is deleted and exported_path cleared.
+        lock_folder_inner(&state, fid.clone()).unwrap();
+        assert!(
+            !std::path::Path::new(&path).exists(),
+            "sealed note's vault .md deleted on lock"
+        );
+        assert!(
+            state
+                .db
+                .note_exported_paths_in_folder(&fid)
+                .unwrap()
+                .is_empty(),
+            "exported_path NULLed on lock"
+        );
+    }
+
+    /// WP2 relock-leak regression (RED-before-GREEN): a session-UNLOCK re-exports a note's vault
+    /// `.md` (and re-sets exported_path); a subsequent RELOCK MUST delete that plaintext `.md` again
+    /// and NULL exported_path — else a re-sealed folder leaves a plaintext note on disk. This drives
+    /// `reblank_folder_extras` (the relock path). RED on the pre-fix code (reblank only re-blanked the
+    /// DB text, leaving the .md + exported_path).
+    #[test]
+    fn relock_deletes_reexported_note_md() {
+        let vault = tmp_vault("note-relock-leak");
+        let state = build_state_with_vault("note-relock-leak", &vault);
+        let fid = create_note_folder_inner(&state, "Ideas", None).unwrap().id;
+        let id = create_note_inner(&state, Some(&fid), "Secret roadmap").unwrap();
+        update_note_doc_inner(&state, &id, "Secret roadmap", "# Secret\nInternal launch April.")
+            .unwrap();
+
+        // LOCK: .md deleted, exported_path NULL.
+        lock_folder_inner(&state, fid.clone()).unwrap();
+
+        // UNLOCK (unseal extras + add to unlock set): the note's .md is RE-EXPORTED, exported_path set.
+        let kek = secrets::get_or_create_master_kek().unwrap();
+        let wrapped = state.db.folder_wrapped_key(&fid).unwrap().unwrap();
+        let ck_vec = crate::crypto::decrypt(&kek, &wrapped, &aad_wrapped_ck(&fid)).unwrap();
+        let ck: [u8; 32] = ck_vec.try_into().expect("CK is 32 bytes");
+        unseal_folder_extras(&state, &fid, &ck, None).unwrap();
+        state.unlocked_folders.lock().unwrap().insert(fid.clone());
+
+        let reexported = state
+            .db
+            .get_note_row(&id)
+            .unwrap()
+            .unwrap()
+            .exported_path
+            .expect("note re-exported on unlock");
+        assert!(
+            std::path::Path::new(&reexported).exists(),
+            "vault .md re-materialized on unlock"
+        );
+
+        // RELOCK: drop the session unlock + reblank → the re-exported .md MUST be gone again.
+        state.unlocked_folders.lock().unwrap().remove(&fid);
+        reblank_folder_extras(&state, &fid).unwrap();
+        assert!(
+            !std::path::Path::new(&reexported).exists(),
+            "relock deletes the re-exported plaintext .md (no on-disk leak)"
+        );
+        assert!(
+            state
+                .db
+                .note_exported_paths_in_folder(&fid)
+                .unwrap()
+                .is_empty(),
+            "relock NULLs exported_path again"
+        );
+    }
+
+    /// R1 (lock residual, #231 review) RED-before-GREEN — DELETE-THEN-MOVE: when the OLD vault
+    /// `.md` cannot be deleted, `move_note_doc` MUST be REFUSED with the note row, its
+    /// `exported_path`, and the on-disk entry all unchanged. Pre-fix the move committed the
+    /// UPDATE first (clearing `exported_path`) and removed the file BEST-EFFORT afterwards — a
+    /// failed delete orphaned an on-disk plaintext `.md` with no `exported_path` record pointing
+    /// at it (for a session-unlocked LOCKED source, an untracked plaintext leak the seal can
+    /// never reconcile). An already-absent old file still counts as success.
+    #[test]
+    fn move_refused_when_old_vault_md_cannot_be_deleted() {
+        let state = build_state("move-delete-refuse");
+        let src = create_note_folder_inner(&state, "Src", None).unwrap().id;
+        let dst = create_note_folder_inner(&state, "Dst", None).unwrap().id;
+        let id = create_note_inner(&state, Some(&src), "Plan").unwrap();
+        update_note_doc_inner(&state, &id, "Plan", "body").unwrap();
+
+        // Sabotage: point exported_path at a NON-EMPTY DIRECTORY — `remove_file` fails on it
+        // (and NOT with NotFound, which counts as an already-absent success).
+        let blocker = tmp_vault("move-delete-refuse-blocker");
+        std::fs::write(blocker.join("occupant.txt"), "x").unwrap();
+        let blocker_str = blocker.to_string_lossy().to_string();
+        state
+            .db
+            .set_note_doc_exported_path(&id, Some(&blocker_str))
+            .unwrap();
+
+        let err = move_note_doc_inner(&state, &id, &dst).unwrap_err();
+        assert!(
+            matches!(err, AppError::Export(_)),
+            "a failed old-.md delete refuses the move with a clear export error, got {err:?}"
+        );
+
+        // NOTHING moved: folder, exported_path record, and the on-disk entry are all unchanged.
+        let row = state.db.get_note_row(&id).unwrap().unwrap();
+        assert_eq!(row.folder_id, src, "note stays in the source folder");
+        assert_eq!(
+            row.exported_path.as_deref(),
+            Some(blocker_str.as_str()),
+            "exported_path record kept — no orphaned on-disk plaintext"
+        );
+        assert!(blocker.exists(), "the on-disk path is untouched");
+
+        // An ALREADY-ABSENT old file is success: point at a missing file and the move proceeds.
+        let gone = blocker.join("gone.md").to_string_lossy().to_string();
+        state
+            .db
+            .set_note_doc_exported_path(&id, Some(&gone))
+            .unwrap();
+        move_note_doc_inner(&state, &id, &dst).unwrap();
+        assert_eq!(
+            state.db.get_note_row(&id).unwrap().unwrap().folder_id,
+            dst,
+            "an absent old .md never blocks the move"
+        );
+    }
+
+    /// R2 (residual W5 at the INITIAL seal) RED-before-GREEN — `lock_folder_inner`'s authored-note
+    /// `.md` cleanup must clear each row's `exported_path` ONLY after its file was actually
+    /// deleted (or is already absent): one failing delete keeps EXACTLY that row's path recorded
+    /// (the next relock/startup pass retries the file) while the lock itself still completes.
+    /// Pre-fix the cleanup bulk-cleared the whole folder's `exported_path` regardless of per-file
+    /// delete success, forgetting a leaked plaintext `.md` forever.
+    #[test]
+    fn lock_keeps_exported_path_of_a_note_md_that_failed_to_delete() {
+        let vault = tmp_vault("lock-w5-initial");
+        let state = build_state_with_vault("lock-w5-initial", &vault);
+        let fid = create_note_folder_inner(&state, "Ideas", None).unwrap().id;
+        let a = create_note_inner(&state, Some(&fid), "Alpha").unwrap();
+        update_note_doc_inner(&state, &a, "Alpha", "alpha body").unwrap();
+        let b = create_note_inner(&state, Some(&fid), "Beta").unwrap();
+        update_note_doc_inner(&state, &b, "Beta", "beta body").unwrap();
+
+        let pa = state
+            .db
+            .get_note_row(&a)
+            .unwrap()
+            .unwrap()
+            .exported_path
+            .expect("A exported to the vault");
+        let pb = state
+            .db
+            .get_note_row(&b)
+            .unwrap()
+            .unwrap()
+            .exported_path
+            .expect("B exported to the vault");
+
+        // Sabotage B's export: replace the file with a NON-EMPTY DIRECTORY at the same path, so
+        // the lock-time `remove_file` fails (not NotFound).
+        std::fs::remove_file(&pb).unwrap();
+        std::fs::create_dir(&pb).unwrap();
+        std::fs::write(std::path::Path::new(&pb).join("occupant.txt"), "x").unwrap();
+
+        lock_folder_inner(&state, fid.clone()).unwrap(); // the lock itself still completes
+
+        assert!(
+            !std::path::Path::new(&pa).exists(),
+            "the deletable note's .md is gone after lock"
+        );
+        let rows = state.db.note_exported_path_rows_in_folder(&fid).unwrap();
+        assert_eq!(
+            rows,
+            vec![(b.clone(), pb.clone())],
+            "exactly the failed-delete row keeps its exported_path for the retry pass"
+        );
+    }
+
+    // ── 2026-07-10 lock-audit: SEAL-ON-WRITE (content written while session-unlocked) ─────────────
+
+    /// Session-unlock a just-locked folder the way `unlock_folder` does — KEK → unwrap CK → unseal
+    /// the extras → add to the unlock set → CACHE the KEK (the production unlock always caches it;
+    /// seal-on-write depends on that cache). Returns the CK so a test can re-unseal after a relock.
+    fn session_unlock(state: &AppState, fid: &str) -> [u8; 32] {
+        let kek = secrets::get_or_create_master_kek().unwrap();
+        let wrapped = state.db.folder_wrapped_key(fid).unwrap().unwrap();
+        let ck_vec = crate::crypto::decrypt(&kek, &wrapped, &aad_wrapped_ck(fid)).unwrap();
+        let ck: [u8; 32] = ck_vec.try_into().expect("CK is 32 bytes");
+        unseal_folder_extras(state, fid, &ck, None).unwrap();
+        state
+            .unlocked_folders
+            .lock()
+            .unwrap()
+            .insert(fid.to_string());
+        *state.master_kek.lock().unwrap() = Some(Zeroizing::new(kek));
+        ck
+    }
+
+    /// CRITICAL content-loss (RED-before-GREEN, 2026-07-10 audit F1): an autosave edit made WHILE the
+    /// locked folder is session-unlocked must be RE-SEALED at write time — before the fix the write
+    /// landed plaintext-only against the STALE lock-time blob, so relock blanked the plaintext and the
+    /// next unlock restored the OLD text (the edit was silently destroyed).
+    #[test]
+    fn edits_during_session_unlock_survive_relock_roundtrip() {
+        let state = build_state("seal-on-write-edit");
+        let fid = create_note_folder_inner(&state, "Vault", None).unwrap().id;
+        let id = create_note_inner(&state, Some(&fid), "Plan").unwrap();
+        update_note_doc_inner(&state, &id, "Plan", "T0 original").unwrap();
+        lock_folder_inner(&state, fid.clone()).unwrap();
+
+        let ck = session_unlock(&state, &fid);
+        // The FAST autosave edit while session-unlocked (the fixed write path).
+        save_note_text_inner(&state, &id, "Plan", "T1 edited under session unlock").unwrap();
+
+        // RELOCK (command-layer shape: drop from the unlock set + reblank the extras).
+        state.unlocked_folders.lock().unwrap().remove(&fid);
+        reblank_folder_extras(&state, &fid).unwrap();
+        let at_rest = state.db.get_note_row(&id).unwrap().unwrap();
+        assert_eq!(at_rest.text, "", "plaintext re-blanked at rest after relock");
+        assert!(at_rest.sealed, "seal blob present at rest");
+
+        // UNLOCK again: the EDIT must come back — not the stale lock-time seal.
+        unseal_folder_extras(&state, &fid, &ck, None).unwrap();
+        assert_eq!(
+            state.db.get_note_row(&id).unwrap().unwrap().text,
+            "T1 edited under session unlock",
+            "an edit made while session-unlocked must survive the relock round-trip byte-identical"
+        );
+    }
+
+    /// CRITICAL leak (RED-before-GREEN, 2026-07-10 audit F1): a note CREATED (and written) while the
+    /// locked folder is session-unlocked must be sealed FROM BIRTH. Before the fix it had NO blob, so
+    /// the relock reblank (guarded on `text_blob IS NOT NULL`) left its plaintext at rest behind the
+    /// lock forever.
+    #[test]
+    fn note_created_while_unlocked_is_sealed_at_rest() {
+        let state = build_state("seal-on-create");
+        let fid = create_note_folder_inner(&state, "Vault", None).unwrap().id;
+        lock_folder_inner(&state, fid.clone()).unwrap();
+
+        let ck = session_unlock(&state, &fid);
+        let id = create_note_inner(&state, Some(&fid), "Born locked").unwrap();
+        update_note_doc_inner(&state, &id, "Born locked", "T1 secret body").unwrap();
+        assert!(
+            state.db.get_note_row(&id).unwrap().unwrap().sealed,
+            "a note written into a session-unlocked LOCKED folder carries a fresh seal blob from birth"
+        );
+
+        // RELOCK: NO plaintext at rest (the pre-fix leak), blob present.
+        state.unlocked_folders.lock().unwrap().remove(&fid);
+        reblank_folder_extras(&state, &fid).unwrap();
+        let at_rest = state.db.get_note_row(&id).unwrap().unwrap();
+        assert_eq!(
+            at_rest.text, "",
+            "a note created while session-unlocked must leave NO plaintext at rest after relock"
+        );
+        assert!(at_rest.sealed, "seal blob present at rest");
+
+        // UNLOCK: byte-identical restore.
+        unseal_folder_extras(&state, &fid, &ck, None).unwrap();
+        assert_eq!(
+            state.db.get_note_row(&id).unwrap().unwrap().text,
+            "T1 secret body",
+            "the created-while-unlocked note restores byte-identical"
+        );
+    }
+
+    /// FAIL-CLOSED (RED-before-GREEN, 2026-07-10 audit F1): a write into a session-unlocked LOCKED
+    /// folder with NO cached master KEK (so the folder CK cannot be unwrapped to re-seal) must be
+    /// REFUSED with `AppError::Locked` — never silently persisted as unsealed plaintext.
+    #[test]
+    fn write_refused_when_kek_unavailable() {
+        let state = build_state("seal-on-write-no-kek");
+        let fid = create_note_folder_inner(&state, "Vault", None).unwrap().id;
+        let id = create_note_inner(&state, Some(&fid), "Plan").unwrap();
+        update_note_doc_inner(&state, &id, "Plan", "T0 original").unwrap();
+        lock_folder_inner(&state, fid.clone()).unwrap();
+        let _ck = session_unlock(&state, &fid);
+        // The session cache is gone (e.g. a relock-all zeroized it) but the unlock set still has the
+        // folder — the write must fail closed rather than write unsealable plaintext.
+        *state.master_kek.lock().unwrap() = None;
+
+        let err = save_note_text_inner(&state, &id, "Plan", "T1 must not land").unwrap_err();
+        assert!(
+            matches!(err, AppError::Locked(_)),
+            "a KEK-less write into a locked folder must be AppError::Locked, got {err:?}"
+        );
+        assert_eq!(
+            state.db.get_note_row(&id).unwrap().unwrap().text,
+            "T0 original",
+            "the refused write must not have mutated the note"
+        );
+    }
+
+    /// PINNED behavior: once the folder is relocked (dropped from the unlock set) any note write is
+    /// refused with `AppError::Locked`. The gate+write now sits under the lifecycle guard, so a
+    /// relock cannot interleave between the check and the write (serialization-by-construction).
+    #[test]
+    fn write_after_relock_is_refused() {
+        let state = build_state("write-after-relock");
+        let fid = create_note_folder_inner(&state, "Vault", None).unwrap().id;
+        let id = create_note_inner(&state, Some(&fid), "Plan").unwrap();
+        update_note_doc_inner(&state, &id, "Plan", "T0 original").unwrap();
+        lock_folder_inner(&state, fid.clone()).unwrap();
+        let _ck = session_unlock(&state, &fid);
+
+        // RELOCK: drop the session unlock; the write gate must refuse from here on.
+        state.unlocked_folders.lock().unwrap().remove(&fid);
+        reblank_folder_extras(&state, &fid).unwrap();
+
+        let err = save_note_text_inner(&state, &id, "Plan", "T1 after relock").unwrap_err();
+        assert!(
+            matches!(err, AppError::Locked(_)),
+            "a write after relock must be AppError::Locked, got {err:?}"
+        );
+    }
+
+    /// SEAL-ON-WRITE for the typed in-meeting notes twin (2026-07-10 audit F1): an edit to
+    /// `manual_notes` while the meeting's locked folder is session-unlocked must re-seal the fresh
+    /// buffer — before the fix the stale lock-time blob survived and the next unlock restored the OLD
+    /// buffer (the edit was destroyed).
+    #[test]
+    fn manual_notes_edit_during_session_unlock_survives_relock() {
+        let state = build_state("manual-notes-seal-on-write");
+        make_open_folder(&state.db, "f-lock", "Secret");
+        seed_meeting(&state.db, "m1", "# note", Some("f-lock"));
+        state.db.set_manual_notes("m1", "T0 typed").unwrap();
+        lock_folder_inner(&state, "f-lock".to_string()).unwrap();
+
+        let ck = session_unlock(&state, "f-lock");
+        save_manual_notes_inner(&state, "m1", "T1 edited under session unlock").unwrap();
+
+        // RELOCK, then UNLOCK: the edit must come back, not the stale T0 seal.
+        state.unlocked_folders.lock().unwrap().remove("f-lock");
+        reblank_folder_extras(&state, "f-lock").unwrap();
+        assert_eq!(
+            state.db.raw_manual_notes("m1").unwrap().unwrap().text,
+            "",
+            "typed buffer re-blanked at rest after relock"
+        );
+        unseal_folder_extras(&state, "f-lock", &ck, None).unwrap();
+        assert_eq!(
+            state.db.get_manual_notes("m1").unwrap(),
+            "T1 edited under session unlock",
+            "a typed-notes edit made while session-unlocked must survive the relock round-trip"
+        );
+    }
+
+    /// SEAL-ON-WRITE for the meeting-note upsert (2026-07-10 audit F1): an in-app `update_note` edit
+    /// while the meeting's locked folder is session-unlocked must re-seal the fresh markdown into
+    /// `content_blob` — before the fix the stale lock-time blob survived and the next unlock restored
+    /// the OLD markdown (the edit was destroyed). Bound to the COMMAND path (`update_note_inner`,
+    /// the full command body — residual W6): the command surface is what must stay sealed, not just
+    /// the `upsert_note_reseal_if_locked` helper it delegates to.
+    #[test]
+    fn meeting_note_edit_during_session_unlock_survives_relock() {
+        let state = build_state("meeting-note-seal-on-write");
+        make_open_folder(&state.db, "f-lock", "Secret");
+        seed_meeting(&state.db, "m1", "T0 note", Some("f-lock"));
+        lock_folder_inner(&state, "f-lock".to_string()).unwrap();
+
+        let ck = session_unlock(&state, "f-lock");
+        // Restore the note markdown for the session, exactly like `unlock_folder` does before extras.
+        {
+            let notes = state.db.notes_in_folder("f-lock").unwrap();
+            for n in &notes {
+                let blob = n.content_blob.as_ref().unwrap();
+                let aad = aad_content("f-lock", &n.meeting_id, &n.provider_id, "note");
+                let pt = crate::crypto::decrypt(&ck, blob, &aad).unwrap();
+                state
+                    .db
+                    .restore_note_markdown(&n.meeting_id, &n.provider_id, &String::from_utf8(pt).unwrap())
+                    .unwrap();
+            }
+        }
+
+        // The FULL `update_note` COMMAND body (gate + lifecycle guard + seal-on-write upsert), with
+        // fresh markdown — the session-unlocked gate passes and the write must land sealed. RED ran
+        // this through the raw `db.upsert_note` production used pre-fix.
+        update_note_inner(&state, "m1", "T1 edited under session unlock").unwrap();
+
+        // RELOCK, then decrypt the blob directly: it must carry T1, not the stale T0.
+        state.unlocked_folders.lock().unwrap().remove("f-lock");
+        let mut one = HashSet::new();
+        one.insert("f-lock".to_string());
+        state.db.blank_sealed_notes_in_folders(&one).unwrap();
+        reblank_folder_extras(&state, "f-lock").unwrap();
+
+        let sealed = state
+            .db
+            .notes_in_folder("f-lock")
+            .unwrap()
+            .into_iter()
+            .find(|n| n.meeting_id == "m1")
+            .unwrap();
+        assert_eq!(sealed.markdown, "", "markdown re-blanked at rest");
+        let blob = sealed.content_blob.expect("sealed blob present at rest");
+        let aad = aad_content("f-lock", "m1", &sealed.provider_id, "note");
+        let pt = crate::crypto::decrypt(&ck, &blob, &aad).unwrap();
+        assert_eq!(
+            String::from_utf8(pt).unwrap(),
+            "T1 edited under session unlock",
+            "the sealed blob must carry the FRESH markdown, not the stale lock-time copy"
+        );
+    }
+
+    // ── 2026-07-10 FIX-LOCK residuals (W1/W2/W3/W5/W7) ─────────────────────────────────────────
+
+    /// Build the WRITE-ENABLED agent executor over a test `AppState`, wired with the live seal
+    /// handles exactly like the production construction sites (residual W1).
+    fn agent_executor<'a>(
+        state: &'a AppState,
+        cfg: &'a AppConfig,
+        meeting_id: &'a str,
+    ) -> crate::tools::GatedToolExecutor<'a> {
+        crate::tools::GatedToolExecutor {
+            db: &state.db,
+            unlocked: &state.unlocked_folders,
+            config: cfg,
+            meeting_id,
+            app: None,
+            allow_writes: true,
+            note_drafts: false,
+            scope: crate::tools::AssistantScope::Full,
+            seal: Some(crate::tools::SealAccess {
+                master_kek: &state.master_kek,
+                lifecycle: &state.lifecycle,
+            }),
+            proposed_note: Mutex::new(None),
+        }
+    }
+
+    /// Residual W1 (RED-before-GREEN): the agent's `save_note` append made WHILE the meeting's
+    /// locked folder is session-unlocked must be RE-SEALED at write time — before the fix the
+    /// executor wrote via the plain `set_manual_notes`, so the next relock restored the STALE
+    /// lock-time blob and the agent's append was silently destroyed.
+    #[test]
+    fn agent_save_note_during_session_unlock_survives_relock() {
+        use crate::agent::ToolExecutor;
+        let state = build_state("agent-save-note-seal");
+        make_open_folder(&state.db, "f-lock", "Secret");
+        seed_meeting(&state.db, "m1", "# note", Some("f-lock"));
+        state.db.set_manual_notes("m1", "T0 typed").unwrap();
+        lock_folder_inner(&state, "f-lock".to_string()).unwrap();
+        let ck = session_unlock(&state, "f-lock");
+
+        let cfg = AppConfig::default();
+        let exec = agent_executor(&state, &cfg, "m1");
+        exec.run(
+            "save_note",
+            &serde_json::json!({ "text": "agent appended line" }),
+        )
+        .unwrap();
+
+        // RELOCK, then UNLOCK: the append must come back byte-identical, not the stale T0 seal.
+        state.unlocked_folders.lock().unwrap().remove("f-lock");
+        reblank_folder_extras(&state, "f-lock").unwrap();
+        assert_eq!(
+            state.db.raw_manual_notes("m1").unwrap().unwrap().text,
+            "",
+            "typed buffer re-blanked at rest after relock"
+        );
+        unseal_folder_extras(&state, "f-lock", &ck, None).unwrap();
+        assert_eq!(
+            state.db.get_manual_notes("m1").unwrap(),
+            "T0 typed\nagent appended line",
+            "the agent's save_note append must survive the relock round-trip byte-identical"
+        );
+    }
+
+    /// Residual W1 FAIL-CLOSED (RED-before-GREEN): the agent's `save_note` into a session-unlocked
+    /// LOCKED folder with NO cached master KEK must be REFUSED (`AppError::Locked`) and write
+    /// NOTHING — before the fix the plain write silently persisted unsealable plaintext behind the
+    /// lock.
+    #[test]
+    fn agent_save_note_refused_when_kek_unavailable() {
+        use crate::agent::ToolExecutor;
+        let state = build_state("agent-save-note-no-kek");
+        make_open_folder(&state.db, "f-lock", "Secret");
+        seed_meeting(&state.db, "m1", "# note", Some("f-lock"));
+        state.db.set_manual_notes("m1", "T0 typed").unwrap();
+        lock_folder_inner(&state, "f-lock".to_string()).unwrap();
+        let _ck = session_unlock(&state, "f-lock");
+        // The session cache is gone (e.g. a relock-all zeroized it) but the unlock set still has
+        // the folder — the agent write must fail closed.
+        *state.master_kek.lock().unwrap() = None;
+
+        let cfg = AppConfig::default();
+        let exec = agent_executor(&state, &cfg, "m1");
+        let err = exec
+            .run("save_note", &serde_json::json!({ "text": "must not land" }))
+            .unwrap_err();
+        assert!(
+            matches!(err, AppError::Locked(_)),
+            "a KEK-less agent write into a locked folder must be AppError::Locked, got {err:?}"
+        );
+        assert_eq!(
+            state.db.get_manual_notes("m1").unwrap(),
+            "T0 typed",
+            "the refused agent write must not have mutated the buffer"
+        );
+    }
+
+    /// Residual W2 (RED-before-GREEN): a `move_note_doc` into a session-unlocked LOCKED target whose
+    /// seal FAILS (no cached KEK) must leave the note UNTOUCHED in the SOURCE folder — before the
+    /// fix the folder was reassigned BEFORE the reseal, so the failed move stranded the note in the
+    /// locked target (blob-less / wrong-CK) with its source vault `.md` already deleted.
+    #[test]
+    fn move_note_seal_failure_leaves_note_in_source_folder() {
+        let vault = tmp_vault("move-seal-fail");
+        let state = build_state_with_vault("move-seal-fail", &vault);
+        let src = create_note_folder_inner(&state, "Open", None).unwrap().id;
+        let dst = create_note_folder_inner(&state, "Secret", None).unwrap().id;
+        let id = create_note_inner(&state, Some(&src), "Plan").unwrap();
+        update_note_doc_inner(&state, &id, "Plan", "# secret body").unwrap();
+        let exported = state
+            .db
+            .get_note_row(&id)
+            .unwrap()
+            .unwrap()
+            .exported_path
+            .expect("note exported to the vault");
+
+        lock_folder_inner(&state, dst.clone()).unwrap();
+        // Session-unlocked target, but the KEK cache is gone: the target-CK seal must fail closed.
+        state.unlocked_folders.lock().unwrap().insert(dst.clone());
+        *state.master_kek.lock().unwrap() = None;
+
+        let err = move_note_doc_inner(&state, &id, &dst).unwrap_err();
+        assert!(
+            matches!(err, AppError::Locked(_)),
+            "a KEK-less move into a locked folder must be AppError::Locked, got {err:?}"
+        );
+        let row = state.db.get_note_row(&id).unwrap().unwrap();
+        assert_eq!(
+            row.folder_id, src,
+            "a failed seal must leave the note in the SOURCE folder, never stranded in the locked target"
+        );
+        assert!(!row.sealed, "no stale/wrong-CK blob may be written");
+        assert_eq!(
+            row.exported_path.as_deref(),
+            Some(exported.as_str()),
+            "the source exported_path is untouched on failure"
+        );
+        assert!(
+            std::path::Path::new(&exported).exists(),
+            "the source vault .md is untouched on failure"
+        );
+    }
+
+    /// Residual W3 (RED-before-GREEN): a `create_note` whose BIRTH-SEAL fails (locked folder,
+    /// session-unlocked, no cached KEK) must leave NO row behind — before the fix the plaintext row
+    /// was inserted FIRST, so the failed seal left a blob-less plaintext row lingering in the locked
+    /// folder (the relock reblank rightly refuses to blank a blob-less row).
+    #[test]
+    fn create_note_failed_birth_seal_leaves_no_plaintext_row() {
+        let state = build_state("create-birth-seal-fail");
+        let fid = create_note_folder_inner(&state, "Vault", None).unwrap().id;
+        lock_folder_inner(&state, fid.clone()).unwrap();
+        state.unlocked_folders.lock().unwrap().insert(fid.clone());
+        *state.master_kek.lock().unwrap() = None;
+
+        let err = create_note_inner(&state, Some(&fid), "Born locked").unwrap_err();
+        assert!(
+            matches!(err, AppError::Locked(_)),
+            "a KEK-less create in a locked folder must be AppError::Locked, got {err:?}"
+        );
+        assert!(
+            state.db.note_ids_in_folder(&fid).unwrap().is_empty(),
+            "a failed birth-seal must leave NO plaintext row in the locked folder"
+        );
+    }
+
+    /// Residual W5 (RED-before-GREEN, relock half): when the relock cleanup FAILS to delete a
+    /// re-exported note `.md`, that note's `exported_path` must be KEPT so the next relock/startup
+    /// pass retries — before the fix the bulk clear NULLed every path regardless, forgetting the
+    /// leaked plaintext `.md` forever. A deletable sibling is still cleaned + cleared normally.
+    #[test]
+    fn relock_keeps_exported_path_when_md_delete_fails() {
+        let state = build_state("relock-keep-path");
+        let fid = create_note_folder_inner(&state, "Vault", None).unwrap().id;
+        let keep = create_note_inner(&state, Some(&fid), "Undeletable").unwrap();
+        let gone = create_note_inner(&state, Some(&fid), "Deletable").unwrap();
+        lock_folder_inner(&state, fid.clone()).unwrap();
+
+        // Simulate the crash/permission shape where the recorded path cannot be deleted: a
+        // DIRECTORY at the path makes `remove_file` fail with a non-NotFound error.
+        let dir = std::env::temp_dir().join(format!(
+            "murmur-undeletable-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("deletable.md");
+        std::fs::write(&file, "# re-exported plaintext").unwrap();
+        state
+            .db
+            .set_note_doc_exported_path(&keep, Some(dir.to_str().unwrap()))
+            .unwrap();
+        state
+            .db
+            .set_note_doc_exported_path(&gone, Some(file.to_str().unwrap()))
+            .unwrap();
+
+        reblank_folder_extras(&state, &fid).unwrap();
+
+        let kept_row = state.db.get_note_row(&keep).unwrap().unwrap();
+        assert_eq!(
+            kept_row.exported_path.as_deref(),
+            dir.to_str(),
+            "a FAILED .md delete must keep exported_path recorded for retry"
+        );
+        let gone_row = state.db.get_note_row(&gone).unwrap().unwrap();
+        assert!(
+            gone_row.exported_path.is_none(),
+            "a successful .md delete clears exported_path as before"
+        );
+        assert!(!file.exists(), "the deletable .md is removed");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Residual W7: TURN DISCIPLINE for the note assistant — a second call while a turn for the
+    /// SAME note is in flight is refused (`Unavailable`), and every refused/errored call releases
+    /// its in-flight slot (the RAII guard), so a note can never be permanently wedged.
+    #[test]
+    fn note_assistant_dedups_inflight_turns_and_releases_on_refusal() {
+        let state = build_state("note-assist-dedup");
+        let fid = create_note_folder_inner(&state, "Work", None).unwrap().id;
+        let id = create_note_inner(&state, Some(&fid), "Draft").unwrap();
+        update_note_doc_inner(&state, &id, "Draft", "Some body text.").unwrap();
+
+        // Simulate an in-flight note-assist turn for this note (the same key the command uses).
+        let key = format!("note-assist:{id}");
+        assert!(crate::transcribe::live::try_begin_turn(
+            &state.in_flight_turns,
+            &key
+        ));
+        let req = NoteAssistRequest {
+            note_id: id.clone(),
+            action: "refine".into(),
+            selection: "body text".into(),
+            before: None,
+            after: None,
+            variant: None,
+            instruction: None,
+        };
+        let err = block_on(note_assistant_action_inner(&state, req.clone())).unwrap_err();
+        assert!(
+            matches!(err, AppError::Unavailable(_)),
+            "a duplicate in-flight note-assist turn must be refused Unavailable, got {err:?}"
+        );
+        crate::transcribe::live::end_turn(&state.in_flight_turns, &key);
+
+        // A call refused at the LOCK gate must still release its slot on the way out.
+        lock_folder_inner(&state, fid.clone()).unwrap();
+        let err = block_on(note_assistant_action_inner(&state, req)).unwrap_err();
+        assert!(
+            matches!(err, AppError::Locked(_)),
+            "a locked note is refused at the read gate, got {err:?}"
+        );
+        assert!(
+            state.in_flight_turns.lock().unwrap().is_empty(),
+            "the RAII guard must release the in-flight slot on every exit path"
+        );
+    }
+
+    // ── NOTES phase 2 (WP4 / WP5 / WP6) ──────────────────────────────────────────────────────────
+
+    /// WP4 config gate — a DISABLED assistant action is refused with `Unavailable` BEFORE any read or
+    /// provider egress. This is the FIRST gate; it never touches a provider (so it runs headless).
+    #[test]
+    fn note_assistant_refuses_a_disabled_action() {
+        let state = build_state("note-assist-disabled");
+        let fid = create_note_folder_inner(&state, "Work", None).unwrap().id;
+        let id = create_note_inner(&state, Some(&fid), "Draft").unwrap();
+        update_note_doc_inner(&state, &id, "Draft", "Some body text to refine.").unwrap();
+
+        // Turn Refine OFF in config.
+        {
+            let mut c = state.config.lock().unwrap();
+            c.note_assist_refine = false;
+        }
+        let req = NoteAssistRequest {
+            note_id: id.clone(),
+            action: "refine".into(),
+            selection: "body text".into(),
+            before: None,
+            after: None,
+            variant: None,
+            instruction: None,
+        };
+        let err = block_on(note_assistant_action_inner(&state, req)).unwrap_err();
+        assert!(
+            matches!(err, AppError::Unavailable(_)),
+            "a disabled action is refused Unavailable, not attempted"
+        );
+
+        // An unknown action is InvalidArg (before any egress).
+        let bad = NoteAssistRequest {
+            note_id: id,
+            action: "frobnicate".into(),
+            selection: "x".into(),
+            before: None,
+            after: None,
+            variant: None,
+            instruction: None,
+        };
+        assert!(matches!(
+            block_on(note_assistant_action_inner(&state, bad)).unwrap_err(),
+            AppError::InvalidArg(_)
+        ));
+    }
+
+    /// STAGE 1 (shorten-lengthens fix) — the `shorten` prompt now carries a hard length budget
+    /// ("MUST be shorter") and DROPS the trailing `CONTEXT AFTER` block (which a small next-token
+    /// model reads as an autocomplete gradient and continues, lengthening). The selection comes LAST.
+    /// RED on the old prompt ("more concise while preserving every fact", with `CONTEXT AFTER`).
+    #[test]
+    fn note_assist_shorten_prompt_has_length_budget_and_drops_trailing_context() {
+        let req = NoteAssistRequest {
+            note_id: "n1".into(),
+            action: "shorten".into(),
+            selection: "some long selection".into(),
+            before: Some("the preceding sentence".into()),
+            after: Some("the TRAILINGWORD sentence".into()),
+            variant: None,
+            instruction: None,
+        };
+        let (system, user) = build_note_assist_prompt("shorten", &req, &[], &[], "auto");
+        assert!(
+            system.to_lowercase().contains("shorter"),
+            "shorten prompt must state the result MUST be shorter: {system}"
+        );
+        assert!(
+            !user.contains("CONTEXT AFTER") && !user.contains("TRAILINGWORD"),
+            "shorten prompt must not append the trailing context: {user}"
+        );
+        assert!(
+            user.trim_end().ends_with("some long selection"),
+            "the selection must come LAST so the model edits it, not continues past it: {user}"
+        );
+    }
+
+    /// EDIT actions on an existing selection (refine/grammar/shorten/expand/simplify/tone) must
+    /// ALWAYS reply in the selection's OWN language, never the global `note_language` pin — these
+    /// are surgical edits to text the user already wrote, not new-content generation. Reported live:
+    /// with Settings → Notes language pinned to "pl", clicking Shorten on an ENGLISH passage forced
+    /// a Polish rewrite instead of shortening it in English. RED on the old code, which threaded the
+    /// `note_language` parameter straight into every action's `lang`, including `shorten`.
+    #[test]
+    fn edit_actions_ignore_note_language_pin_and_match_selection() {
+        let req = NoteAssistRequest {
+            note_id: "n1".into(),
+            action: "shorten".into(),
+            selection: "some english selection".into(),
+            before: None,
+            after: None,
+            variant: None,
+            instruction: None,
+        };
+        for action in ["refine", "grammar", "shorten", "expand", "simplify", "tone"] {
+            let (system, _user) = build_note_assist_prompt(action, &req, &[], &[], "pl");
+            assert!(
+                system.contains("the same language as the selected text"),
+                "{action} must always match the selection's own language, ignoring the \
+                 note_language pin ('pl'); got: {system}"
+            );
+            assert!(
+                !system.contains("language code 'pl'"),
+                "{action} must NOT force the pinned note_language onto an edited selection: {system}"
+            );
+        }
+    }
+
+    /// STAGE 1 — the note-edit GenOptions preset caps the on-device decode (a compression edit can't
+    /// run away) and lowers temperature for a faithful edit. RED: `edit_rewrite` did not exist —
+    /// note-assist ran with `GenOptions::default()` (no cap, model-default diversity sampler).
+    #[test]
+    fn gen_options_edit_rewrite_caps_output_and_lowers_temperature() {
+        let o = crate::reason::GenOptions::edit_rewrite(100);
+        assert_eq!(o.max_tokens, Some(100), "the token cap must be set");
+        assert_eq!(
+            o.temperature,
+            Some(0.2),
+            "temperature must be lowered for a faithful edit"
+        );
+    }
+
+    /// STAGE 1 — the runaway-guard cap sizes off the selection: `shorten` can't exceed ~the input
+    /// length (so it physically can't lengthen in tokens), `refine` gets headroom, and a tiny
+    /// selection is floored so it isn't truncated.
+    #[test]
+    fn note_edit_max_tokens_shorten_bounds_input_refine_gets_headroom() {
+        let input_chars = 400; // ~100 tokens
+        let shorten = note_edit_max_tokens("shorten", input_chars);
+        let refine = note_edit_max_tokens("refine", input_chars);
+        assert!(
+            shorten <= 101,
+            "shorten cap must not exceed ~input tokens: {shorten}"
+        );
+        assert!(
+            refine > shorten,
+            "refine must get more headroom than shorten: {refine} vs {shorten}"
+        );
+        assert!(
+            note_edit_max_tokens("shorten", 4) >= 48,
+            "a tiny selection must be floored, not truncated"
+        );
+    }
+
+    /// STAGE 1 — `generate_note_edit` ENFORCES that a `shorten` is actually shorter: if the first
+    /// attempt is not, it retries once and takes the shorter candidate; `refine` (no "shorter"
+    /// invariant) never retries. RED: no retry existed — the first (longer) output shipped verbatim.
+    #[test]
+    fn generate_note_edit_retries_shorten_until_actually_shorter() {
+        struct Scripted(std::sync::Mutex<std::collections::VecDeque<String>>);
+        impl Scripted {
+            fn new(outs: &[&str]) -> Self {
+                Self(std::sync::Mutex::new(
+                    outs.iter().map(|s| s.to_string()).collect(),
+                ))
+            }
+        }
+        #[async_trait::async_trait]
+        impl crate::summarize::provider::SummarizerProvider for Scripted {
+            fn id(&self) -> &str {
+                "scripted"
+            }
+            async fn availability(&self) -> crate::summarize::provider::Availability {
+                crate::summarize::provider::Availability::Available
+            }
+            async fn summarize(
+                &self,
+                _r: &crate::summarize::provider::SummarizeRequest,
+            ) -> crate::error::Result<String> {
+                Ok(String::new())
+            }
+            async fn complete(&self, _s: &str, _u: &str) -> crate::error::Result<String> {
+                Ok(self.0.lock().unwrap().pop_front().unwrap_or_default())
+            }
+        }
+
+        // shorten: attempt 1 is LONGER than the input → one retry → the genuinely shorter result.
+        let p = Scripted::new(&[
+            "this first attempt is clearly much much longer than the tiny input phrase",
+            "short result",
+        ]);
+        let input = "the tiny input";
+        let opts = crate::reason::GenOptions::edit_rewrite(64);
+        let (out, _) = block_on(generate_note_edit(
+            &p,
+            "shorten",
+            "sys",
+            "usr",
+            opts,
+            note_edit_word_count(input),
+        ))
+        .unwrap();
+        assert_eq!(
+            out, "short result",
+            "shorten must retry and take the genuinely shorter result"
+        );
+
+        // refine: one call, even if longer — the second scripted output must NOT be consumed.
+        let p2 = Scripted::new(&["a longer refined version of the passage", "UNUSED"]);
+        let (out2, _) =
+            block_on(generate_note_edit(&p2, "refine", "sys", "usr", opts, 3)).unwrap();
+        assert_eq!(
+            out2, "a longer refined version of the passage",
+            "refine must not retry"
+        );
+    }
+
+    /// WP4 enhance retrieval — `gather_note_enhance_citations` EXCLUDES the current note's own
+    /// document id and contributes ONLY visible sources. Uses the model-less FTS path (default
+    /// install), so it runs headless with no provider call.
+    #[test]
+    fn enhance_retrieval_excludes_current_note_and_gates_visibility() {
+        let state = build_state("note-enhance-retrieval");
+        let fid = create_note_folder_inner(&state, "Work", None).unwrap().id;
+
+        // The note being edited — its own body contains the query term, but it must NOT self-cite.
+        let self_id = create_note_inner(&state, Some(&fid), "Self").unwrap();
+        update_note_doc_inner(&state, &self_id, "Self", "The launchcode discussion is here.")
+            .unwrap();
+        // A DIFFERENT visible note that also mentions the term — this SHOULD be a citation.
+        let other_id = create_note_inner(&state, Some(&fid), "Other").unwrap();
+        update_note_doc_inner(&state, &other_id, "Other", "More on the launchcode topic.").unwrap();
+        // A note in a SEALED-not-unlocked folder mentioning the term — must NOT contribute.
+        let sfid = create_note_folder_inner(&state, "Secret", None).unwrap().id;
+        let sealed_id = create_note_inner(&state, Some(&sfid), "Sealed").unwrap();
+        update_note_doc_inner(&state, &sealed_id, "Sealed", "Secret launchcode plan.").unwrap();
+        lock_folder_inner(&state, sfid.clone()).unwrap();
+
+        let req = NoteAssistRequest {
+            note_id: self_id.clone(),
+            action: "enhance".into(),
+            selection: "launchcode".into(),
+            before: None,
+            after: None,
+            variant: None,
+            instruction: None,
+        };
+        let cfg = AppConfig::default();
+        let cites = gather_note_enhance_citations(&state, &cfg, &req).unwrap();
+        let ids: Vec<&str> = cites.iter().map(|c| c.id.as_str()).collect();
+        assert!(
+            !ids.contains(&self_id.as_str()),
+            "the note being edited is never cited"
+        );
+        assert!(
+            !ids.contains(&sealed_id.as_str()),
+            "a sealed-not-unlocked note never contributes to enhance"
+        );
+        assert!(
+            ids.contains(&other_id.as_str()),
+            "a different VISIBLE note that matches IS cited"
+        );
+    }
+
+    /// A3 (RED-before-GREEN): `gather_note_enhance_citations` gains a THIRD leg — the org shared
+    /// brain, via the same `search_org_brain_hits` seam as `org_brain_search`/MCP `org_search`. A
+    /// colleague's org item that matches the query must surface as a `kind: "org"` citation whose
+    /// `id` is the org item id (routed by the FE to `/org-item/:id`), title/snippet carried straight
+    /// through. Pre-fix, `gather_note_enhance_citations` only queried `search_visible` + doc chunks,
+    /// so an org-only match (zero local rows) was invisible — RED on the org leg simply not existing.
+    #[test]
+    fn enhance_retrieval_includes_org_leg_as_org_kind_citation() {
+        let state = build_state("note-enhance-retrieval-org");
+        state
+            .db
+            .upsert_org_state(&crate::storage::OrgState {
+                org_id: "org-1".to_string(),
+                name: "Acme".to_string(),
+                role: "member".to_string(),
+                joined_at: "2026-07-10T00:00:00Z".to_string(),
+                consented: true,
+                last_seq: 0,
+                generation: 1,
+                context_enabled: true,
+            })
+            .unwrap();
+        state
+            .db
+            .upsert_org_item(
+                "it-launchcode",
+                "org-1",
+                1,
+                "anna",
+                "Anna's launchcode notes",
+                "the launchcode rollout plan",
+                "2026-07-10T09:00:00Z",
+                1,
+                1,
+                &[9u8; 32],
+                None,
+                None,
+                Some(&crate::embed::StubEmbedder),
+            )
+            .unwrap();
+
+        let fid = create_note_folder_inner(&state, "Work", None).unwrap().id;
+        let self_id = create_note_inner(&state, Some(&fid), "Self").unwrap();
+        update_note_doc_inner(&state, &self_id, "Self", "unrelated body").unwrap();
+
+        let req = NoteAssistRequest {
+            note_id: self_id.clone(),
+            action: "enhance".into(),
+            selection: "launchcode".into(),
+            before: None,
+            after: None,
+            variant: None,
+            instruction: None,
+        };
+        let cfg = AppConfig {
+            org_egress_consented: true,
+            semantic_search_enabled: false,
+            ..AppConfig::default()
+        };
+        let cites = gather_note_enhance_citations(&state, &cfg, &req).unwrap();
+        let org_cite = cites
+            .iter()
+            .find(|c| c.kind == "org")
+            .expect("an org-brain match must surface as a kind:\"org\" citation");
+        assert_eq!(org_cite.id, "it-launchcode", "id is the org item id, for /org-item routing");
+        assert_eq!(org_cite.title, "Anna's launchcode notes");
+    }
+
+    /// A3 (RED-before-GREEN, leak guard): a NON-MEMBER (no `org_state` joined) must get ZERO org
+    /// citations even though a colleague's item sits in the local replica — the org leg is gated by
+    /// `org_brain_available` (membership), identical to `search_org_brain`'s own fail-closed gate.
+    #[test]
+    fn enhance_retrieval_org_leg_fails_closed_for_a_non_member() {
+        let state = build_state("note-enhance-retrieval-org-nonmember");
+        // Item is in the replica, but NO org joined for this session.
+        state
+            .db
+            .upsert_org_item(
+                "it-x",
+                "org-1",
+                1,
+                "anna",
+                "Anna's roadmap",
+                "the apollo migration ships friday",
+                "2026-07-10T09:00:00Z",
+                1,
+                1,
+                &[3u8; 32],
+                None,
+                None,
+                Some(&crate::embed::StubEmbedder),
+            )
+            .unwrap();
+
+        let fid = create_note_folder_inner(&state, "Work", None).unwrap().id;
+        let self_id = create_note_inner(&state, Some(&fid), "Self").unwrap();
+        update_note_doc_inner(&state, &self_id, "Self", "unrelated body").unwrap();
+
+        let req = NoteAssistRequest {
+            note_id: self_id.clone(),
+            action: "enhance".into(),
+            selection: "apollo migration".into(),
+            before: None,
+            after: None,
+            variant: None,
+            instruction: None,
+        };
+        let cfg = AppConfig {
+            org_egress_consented: true,
+            semantic_search_enabled: false,
+            ..AppConfig::default()
+        };
+        let cites = gather_note_enhance_citations(&state, &cfg, &req).unwrap();
+        assert!(
+            !cites.iter().any(|c| c.kind == "org"),
+            "a non-member must get no org citations even with a populated replica: {cites:?}"
+        );
+    }
+
+    // ── NOTES full-set assistant (brain-menu) ──────────────────────────────────────────────────────
+
+    /// A scripted fake NOTES provider that records how many `complete_with_meta_opts` calls it
+    /// received — the seam for asserting `find_related` makes ZERO provider calls while an LLM action
+    /// makes exactly one. Returns a canned reply for the (single) call.
+    struct CountingProvider {
+        reply: String,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    impl CountingProvider {
+        fn new(reply: &str) -> std::sync::Arc<Self> {
+            std::sync::Arc::new(Self {
+                reply: reply.to_string(),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+        fn count(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+    #[async_trait::async_trait]
+    impl crate::summarize::provider::SummarizerProvider for CountingProvider {
+        fn id(&self) -> &str {
+            "counting"
+        }
+        async fn availability(&self) -> crate::summarize::provider::Availability {
+            crate::summarize::provider::Availability::Available
+        }
+        async fn summarize(
+            &self,
+            _r: &crate::summarize::provider::SummarizeRequest,
+        ) -> crate::error::Result<String> {
+            Ok(String::new())
+        }
+        async fn complete(&self, _s: &str, _u: &str) -> crate::error::Result<String> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(self.reply.clone())
+        }
+    }
+
+    /// Build a note in an unlocked folder + a DIFFERENT visible note that matches a query term (so
+    /// the gated readers return a citation). Returns (state, note_id).
+    fn brain_menu_fixture(tag: &str) -> (AppState, String) {
+        let state = build_state(tag);
+        let fid = create_note_folder_inner(&state, "Work", None).unwrap().id;
+        let id = create_note_inner(&state, Some(&fid), "Draft").unwrap();
+        update_note_doc_inner(&state, &id, "Draft", "The launchcode plan is here.").unwrap();
+        // A second visible note that also matches — a legitimate grounding source.
+        let other = create_note_inner(&state, Some(&fid), "Other").unwrap();
+        update_note_doc_inner(&state, &other, "Other", "More on the launchcode topic.").unwrap();
+        (state, id)
+    }
+
+    fn brain_menu_req(note_id: &str, action: &str) -> NoteAssistRequest {
+        NoteAssistRequest {
+            note_id: note_id.to_string(),
+            action: action.to_string(),
+            selection: "launchcode".into(),
+            before: None,
+            after: None,
+            variant: None,
+            instruction: None,
+        }
+    }
+
+    /// (a) A DISABLED new action (its id in `note_assist_actions_off`) is refused `Unavailable`
+    /// BEFORE any read/egress — the one opt-out list gates every non-legacy action.
+    #[test]
+    fn brain_menu_disabled_new_action_refuses_unavailable() {
+        let (state, id) = brain_menu_fixture("brain-menu-disabled");
+        {
+            let mut c = state.config.lock().unwrap();
+            c.note_assist_actions_off = vec!["bullets".into()];
+        }
+        let err = block_on(note_assistant_action_impl(
+            &state,
+            brain_menu_req(&id, "bullets"),
+            Some(CountingProvider::new("- x")),
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(err, AppError::Unavailable(_)),
+            "an opted-out new action must refuse Unavailable, got {err:?}"
+        );
+    }
+
+    /// `custom` is the always-on escape hatch — even if every other action were off, `custom` runs.
+    #[test]
+    fn brain_menu_custom_is_always_enabled() {
+        let (state, id) = brain_menu_fixture("brain-menu-custom");
+        {
+            let mut c = state.config.lock().unwrap();
+            c.note_assist_actions_off = vec!["custom".into()]; // even if (wrongly) listed
+        }
+        let mut req = brain_menu_req(&id, "custom");
+        req.instruction = Some("make it a haiku".into());
+        let out = block_on(note_assistant_action_impl(
+            &state,
+            req,
+            Some(CountingProvider::new("a tiny haiku")),
+        ))
+        .unwrap();
+        assert_eq!(out.shape, "replace", "custom is a free-text replace");
+        assert_eq!(out.suggestion, "a tiny haiku");
+    }
+
+    /// (b) A LOCKED note (folder not session-unlocked) is refused `Locked` at the read gate, BEFORE
+    /// any provider call — the provider override proves no egress happened (0 calls).
+    #[test]
+    fn brain_menu_locked_note_refuses_locked_before_egress() {
+        let (state, id) = brain_menu_fixture("brain-menu-locked");
+        let fid = state.db.get_note_row(&id).unwrap().unwrap().folder_id;
+        lock_folder_inner(&state, fid).unwrap();
+        let provider = CountingProvider::new("edited");
+        let err = block_on(note_assistant_action_impl(
+            &state,
+            brain_menu_req(&id, "bullets"),
+            Some(provider.clone()),
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(err, AppError::Locked(_)),
+            "a locked note must refuse Locked, got {err:?}"
+        );
+        assert_eq!(
+            provider.count(),
+            0,
+            "a locked note must never reach the provider"
+        );
+    }
+
+    /// (c) SHAPE mapping — assert `result.shape` for a REPLACE (bullets), an INSERT (action_items),
+    /// an INFO (ask), and an ARTIFACT (spinoff_note) action. The provider override drives each to a
+    /// deterministic reply so the shape is the thing under test.
+    #[test]
+    fn brain_menu_shape_mapping_covers_all_four_shapes() {
+        let (state, id) = brain_menu_fixture("brain-menu-shapes");
+
+        let replace = block_on(note_assistant_action_impl(
+            &state,
+            brain_menu_req(&id, "bullets"),
+            Some(CountingProvider::new("- one\n- two")),
+        ))
+        .unwrap();
+        assert_eq!(replace.shape, "replace", "bullets is a replace");
+        assert!(replace.title.is_none(), "a replace carries no title");
+
+        let insert = block_on(note_assistant_action_impl(
+            &state,
+            brain_menu_req(&id, "action_items"),
+            Some(CountingProvider::new("- [ ] ship it")),
+        ))
+        .unwrap();
+        assert_eq!(insert.shape, "insert", "action_items is an insert");
+
+        let mut ask_req = brain_menu_req(&id, "ask");
+        ask_req.instruction = Some("when is launch?".into());
+        let info = block_on(note_assistant_action_impl(
+            &state,
+            ask_req,
+            Some(CountingProvider::new("Launch is Friday.")),
+        ))
+        .unwrap();
+        assert_eq!(info.shape, "info", "ask is an info answer");
+
+        let artifact = block_on(note_assistant_action_impl(
+            &state,
+            brain_menu_req(&id, "spinoff_note"),
+            Some(CountingProvider::new("# Launch plan\nDetails follow.")),
+        ))
+        .unwrap();
+        assert_eq!(artifact.shape, "artifact", "spinoff_note is an artifact");
+        assert_eq!(
+            artifact.title.as_deref(),
+            Some("Launch plan"),
+            "a spinoff_note derives its title from the drafted body's first heading line"
+        );
+    }
+
+    /// The pure shape/retrieval mapping is also asserted directly (defense-in-depth against a future
+    /// action landing in the wrong bucket).
+    #[test]
+    fn note_assist_shape_and_retrieval_mapping_is_correct() {
+        assert_eq!(note_assist_shape("refine"), "replace");
+        assert_eq!(note_assist_shape("grammar"), "replace");
+        assert_eq!(note_assist_shape("translate"), "replace");
+        assert_eq!(note_assist_shape("link_entities"), "replace");
+        assert_eq!(note_assist_shape("custom"), "replace");
+        assert_eq!(note_assist_shape("keypoints"), "insert");
+        assert_eq!(note_assist_shape("enhance"), "insert");
+        assert_eq!(note_assist_shape("decisions"), "insert");
+        assert_eq!(note_assist_shape("find_related"), "info");
+        assert_eq!(note_assist_shape("fact_check"), "info");
+        assert_eq!(note_assist_shape("ask"), "info");
+        assert_eq!(note_assist_shape("draft_followup"), "artifact");
+        assert_eq!(note_assist_shape("spinoff_note"), "artifact");
+        assert!(matches!(
+            note_assist_retrieval("fact_check"),
+            NoteAssistRetrieval::BrainCitations
+        ));
+        assert!(matches!(
+            note_assist_retrieval("link_entities"),
+            NoteAssistRetrieval::Entities
+        ));
+        assert!(matches!(
+            note_assist_retrieval("bullets"),
+            NoteAssistRetrieval::None
+        ));
+    }
+
+    /// (d) FIND_RELATED makes ZERO provider calls (retrieval-only, no egress) yet returns
+    /// `shape="info"`, `mode="local"`, `redacted=false`, and citations wired from the gated reader.
+    #[test]
+    fn brain_menu_find_related_makes_no_provider_call_and_returns_info() {
+        let (state, id) = brain_menu_fixture("brain-menu-find-related");
+        // A provider override that would PANIC-loudly (via the call counter assert below) if invoked.
+        let provider = CountingProvider::new("SHOULD NEVER BE USED");
+        let out = block_on(note_assistant_action_impl(
+            &state,
+            brain_menu_req(&id, "find_related"),
+            Some(provider.clone()),
+        ))
+        .unwrap();
+        assert_eq!(
+            provider.count(),
+            0,
+            "find_related is retrieval-only — it must NEVER call the provider"
+        );
+        assert_eq!(out.shape, "info", "find_related is an info shape");
+        assert_eq!(out.mode, "local", "find_related never egresses → local");
+        assert!(!out.redacted, "find_related never egresses → not redacted");
+        assert!(
+            !out.citations.is_empty(),
+            "find_related surfaces the gated brain citations"
+        );
+        assert!(
+            out.suggestion.contains("related source"),
+            "find_related returns a one-line answer, got {:?}",
+            out.suggestion
+        );
+    }
+
+    /// (e) An `ask` result carries the ANSWER in `suggestion` with `shape="info"` (the free-text
+    /// question rides `req.instruction`).
+    #[test]
+    fn brain_menu_ask_carries_answer_in_suggestion() {
+        let (state, id) = brain_menu_fixture("brain-menu-ask");
+        let mut req = brain_menu_req(&id, "ask");
+        req.instruction = Some("when does the launch happen?".into());
+        let out = block_on(note_assistant_action_impl(
+            &state,
+            req,
+            Some(CountingProvider::new("The launch happens on Friday.")),
+        ))
+        .unwrap();
+        assert_eq!(out.shape, "info");
+        assert_eq!(
+            out.suggestion, "The launch happens on Friday.",
+            "an ask answer lands in `suggestion`"
+        );
+    }
+
+    /// (f) An UNKNOWN action id → `InvalidArg`, refused before any read/egress.
+    #[test]
+    fn brain_menu_unknown_action_is_invalid_arg() {
+        let (state, id) = brain_menu_fixture("brain-menu-unknown");
+        let err = block_on(note_assistant_action_impl(
+            &state,
+            brain_menu_req(&id, "teleport"),
+            Some(CountingProvider::new("nope")),
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(err, AppError::InvalidArg(_)),
+            "an unknown action id must be InvalidArg, got {err:?}"
+        );
+    }
+
+    /// The `ask` question and `custom` instruction reach the prompt (the `instruction` field is the
+    /// carrier); `tone`/`translate` weave the `variant`.
+    #[test]
+    fn build_note_assist_prompt_weaves_instruction_and_variant() {
+        let mut ask = brain_menu_req("n1", "ask");
+        ask.instruction = Some("UNIQUEQUESTION".into());
+        let (_s, u) = build_note_assist_prompt("ask", &ask, &[], &[], "auto");
+        assert!(
+            u.contains("UNIQUEQUESTION"),
+            "the ask question must reach the user prompt: {u}"
+        );
+
+        let mut tone = brain_menu_req("n1", "tone");
+        tone.variant = Some("Confident".into());
+        let (s, _u) = build_note_assist_prompt("tone", &tone, &[], &[], "auto");
+        assert!(
+            s.contains("Confident"),
+            "the tone variant must reach the system prompt: {s}"
+        );
+
+        let mut tr = brain_menu_req("n1", "translate");
+        tr.variant = Some("Polski".into());
+        let (s2, u2) = build_note_assist_prompt("translate", &tr, &[], &[], "auto");
+        assert!(
+            s2.contains("Polski") && u2.contains("Polski"),
+            "the translate target language must reach both prompts"
+        );
+
+        // link_entities only wraps the PROVIDED names.
+        let le = brain_menu_req("n1", "link_entities");
+        let (s3, u3) =
+            build_note_assist_prompt("link_entities", &le, &[], &["Acme Corp".to_string()], "auto");
+        assert!(
+            u3.contains("Acme Corp"),
+            "link_entities must pass the known names to link: {u3}"
+        );
+        assert!(
+            s3.to_lowercase().contains("wikilink")
+                || s3.contains("[[")
+                || s3.to_lowercase().contains("known entity"),
+            "link_entities must instruct wrapping known names: {s3}"
+        );
+
+        // custom — the free-text instruction MUST reach the prompt and drive a REWRITE of the
+        // selection (shape=replace), NOT be silently dropped into the spinoff_note "new note" draft.
+        // RED→GREEN: on the buggy code `custom` fell through the `_` catch-all to the spinoff arm, so
+        // the instruction never appeared and the prompt was the "new note" one — both asserts failed.
+        let mut custom = brain_menu_req("n1", "custom");
+        custom.instruction = Some("ZZ_CUSTOM_INSTRUCTION".into());
+        let (cs, cu) = build_note_assist_prompt("custom", &custom, &[], &[], "auto");
+        assert!(
+            cs.contains("ZZ_CUSTOM_INSTRUCTION"),
+            "the custom instruction must reach the prompt: {cs}"
+        );
+        assert!(
+            !cs.contains("new standalone note") && !cu.contains("TURN INTO A NEW NOTE"),
+            "custom must NOT be routed to the spinoff_note prompt: {cs} / {cu}"
+        );
+    }
+
+    /// WP5 — plan → apply CREATES the target note-folder and MOVES the note into it (non-destructive).
+    /// Drives `apply_organize_plan_inner` directly with a synthetic plan (planning itself needs a
+    /// provider; applying does not).
+    #[test]
+    fn apply_organize_plan_creates_folder_and_moves_note() {
+        let state = build_state("note-organize-apply");
+        let src = create_note_folder_inner(&state, "Inbox", None).unwrap().id;
+        let id = create_note_inner(&state, Some(&src), "Standup 2026-07-10").unwrap();
+        update_note_doc_inner(&state, &id, "Standup 2026-07-10", "Daily standup notes.").unwrap();
+
+        // A plan routing the note into a NOT-yet-existing "Standups" folder (toFolderId = None).
+        let plan = OrganizePlan {
+            moves: vec![OrganizeMove {
+                note_id: id.clone(),
+                title: "Standup 2026-07-10".into(),
+                from_folder_id: src.clone(),
+                from_folder: "Inbox".into(),
+                to_folder: "Standups".into(),
+                to_folder_id: None,
+                reason: "content-based filing".into(),
+            }],
+        };
+        apply_organize_plan_inner(&state, plan).unwrap();
+
+        // "Standups" note-folder now exists and the note lives in it.
+        let folders = state.db.list_note_folders().unwrap();
+        let standups = folders
+            .iter()
+            .find(|f| f.name == "Standups")
+            .expect("Standups folder created");
+        let moved = state.db.get_note_row(&id).unwrap().unwrap();
+        assert_eq!(moved.folder_id, standups.id, "note moved into the new folder");
+        // The note is still readable (non-destructive).
+        assert!(!get_note_inner(&state, &id).unwrap().markdown.is_empty());
+    }
+
+    /// WP6 — sharing a SEALED-and-not-session-unlocked note is REFUSED with `Locked` BEFORE any
+    /// consent/egress (mirrors `share_note_to_link_refuses_a_sealed_meeting`). The gate is the FIRST
+    /// statement, so no server/session is needed to prove it.
+    #[test]
+    fn share_note_to_link_doc_refuses_a_sealed_note() {
+        let state = build_state("note-share-lockgate");
+        let fid = create_note_folder_inner(&state, "Secret", None).unwrap().id;
+        let id = create_note_inner(&state, Some(&fid), "Board strategy").unwrap();
+        update_note_doc_inner(&state, &id, "Board strategy", "# secret\nDetails.").unwrap();
+        // Seal WITHOUT session-unlock.
+        lock_folder_inner(&state, fid.clone()).unwrap();
+
+        let err = block_on(share_note_to_link_doc_inner(
+            &state,
+            id.clone(),
+            None,
+            None,
+            None,
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(err, AppError::Locked(_)),
+            "sharing a sealed-not-unlocked note is refused Locked (before consent/egress)"
+        );
+    }
+
+    /// WP6 — the `shared` flag on the note DTOs reflects an ACTIVE outbound share, and is cleared on
+    /// revoke. Drives the db bookkeeping directly (no server needed).
+    #[test]
+    fn note_shared_flag_tracks_active_outbound_share() {
+        let state = build_state("note-shared-flag");
+        let fid = create_note_folder_inner(&state, "Work", None).unwrap().id;
+        let id = create_note_inner(&state, Some(&fid), "Roadmap").unwrap();
+        update_note_doc_inner(&state, &id, "Roadmap", "Ship Q3.").unwrap();
+
+        assert!(!get_note_inner(&state, &id).unwrap().shared, "not shared yet");
+
+        // Record an active outbound note share (the bookkeeping half of share_note_to_link_doc).
+        state
+            .db
+            .insert_outbound_note_share("sh-1", &id, "link", 1, "2026-07-10T00:00:00Z")
+            .unwrap();
+        assert!(
+            get_note_inner(&state, &id).unwrap().shared,
+            "shared:true once an active share exists"
+        );
+        assert!(
+            list_notes_inner(&state, Some(&fid))
+                .unwrap()
+                .iter()
+                .find(|n| n.id == id)
+                .unwrap()
+                .shared,
+            "list DTO also reflects shared"
+        );
+
+        // Revoke → shared:false.
+        state.db.set_outbound_share_state("sh-1", "revoked").unwrap();
+        assert!(
+            !get_note_inner(&state, &id).unwrap().shared,
+            "shared:false after revoke"
+        );
+    }
+
+    /// PR B HEADLINE (write-only-memory bug): on a DEFAULT install (no e5 model, semantic flag OFF)
+    /// an ingested brain note/document MUST still be REACHABLE — chunked unconditionally, surfaced
+    /// by the FLAG-OFF Ask corpus builder, and surfaced through the advertised tool seam (which MCP
+    /// and the agentic loop share). RED on the old code: ingest skipped chunking without the model,
+    /// the flag-off corpus packed meetings only, and both search tools ignored documents.
+    #[test]
+    fn model_less_ingest_is_reachable_by_flag_off_ask_and_tools() {
+        let state = build_state("docs-default-reach");
+        make_open_folder(&state.db, "f-open", "Project");
+        let id = import_text_inner(
+            &state,
+            "Preferencje",
+            "Ulubiony kolor użytkownika to fioletowoszary.",
+            "f-open",
+        )
+        .unwrap();
+
+        // 1. ALWAYS-CHUNK: doc_chunks rows exist regardless of model presence (keyword retrieval
+        //    must work on a default install; vectors stay model-gated).
+        assert!(
+            state.db.doc_chunk_count(&id).unwrap() >= 1,
+            "ingest must store doc_chunks rows even without the e5 model"
+        );
+
+        // 2. The FLAG-OFF Ask corpus (the default `ask_vault` path) surfaces the token.
+        let nothing = HashSet::new();
+        let (corpus, _) = crate::summarize::vault_context::build_vault_context_visible(
+            &state.db,
+            "fioletowoszary",
+            "anthropic",
+            &nothing,
+        )
+        .unwrap();
+        assert!(
+            // Assert on a CONTENT word absent from the query — sentinels echo the query itself
+            // ("No meetings match \"fioletowoszary\"."), so a query-token check can self-satisfy.
+            corpus.contains("Ulubiony") && corpus.contains("fioletowoszary"),
+            "flag-off Ask corpus must surface ingested document/note content; got: {corpus:?}"
+        );
+
+        // 3. The tool seam (PIN semantic OFF — this test asserts the flag-OFF keyword-fallback path)
+        //    surfaces the token through BOTH advertised search tools — the same seam MCP and the
+        //    agentic loop dispatch through.
+        let cfg = AppConfig {
+            semantic_search_enabled: false,
+            ..AppConfig::default()
+        };
+        let out = crate::tools::execute_tool(
+            &crate::tools::ToolCall::SearchMeetings {
+                query: "fioletowoszary".into(),
+            },
+            &state.db,
+            &nothing,
+            &cfg,
+        )
+        .unwrap();
+        assert!(
+            out.contains("Ulubiony"),
+            "search_meetings must surface document CONTENT (not just echo the query in an \
+             empty-result sentinel); got: {out:?}"
+        );
+        let out2 = crate::tools::execute_tool(
+            &crate::tools::ToolCall::SearchSemantic {
+                query: "fioletowoszary".into(),
+            },
+            &state.db,
+            &nothing,
+            &cfg,
+        )
+        .unwrap();
+        assert!(
+            out2.contains("Ulubiony"),
+            "search_semantic (flag OFF) must fall back to gated keyword doc search and surface \
+             document CONTENT; got: {out2:?}"
+        );
+    }
+
+    /// TIER 1 default-on graceful degradation: with `semantic_search_enabled = true` but NO e5 model
+    /// (CI / the common fresh-install state), `search_semantic` must DEGRADE to gated keyword doc
+    /// search and still surface document CONTENT — not panic, not go empty. Proves the NEW default is
+    /// safe when the model is absent (which it is until the user downloads e5).
+    #[test]
+    fn semantic_on_without_model_surfaces_keyword_results() {
+        let state = build_state("docs-semantic-on-nomodel");
+        make_open_folder(&state.db, "f-open", "Project");
+        import_text_inner(
+            &state,
+            "Preferencje",
+            "Ulubiony kolor użytkownika to fioletowoszary.",
+            "f-open",
+        )
+        .unwrap();
+        let nothing = HashSet::new();
+        // The NEW default: semantic ON. With no e5 model on disk the hybrid leg degenerates to FTS.
+        let cfg = AppConfig {
+            semantic_search_enabled: true,
+            ..AppConfig::default()
+        };
+        let out = crate::tools::execute_tool(
+            &crate::tools::ToolCall::SearchSemantic {
+                query: "fioletowoszary".into(),
+            },
+            &state.db,
+            &nothing,
+            &cfg,
+        )
+        .unwrap();
+        assert!(
+            out.contains("Ulubiony"),
+            "semantic ON + no model must degrade to gated keyword doc search and surface CONTENT; \
+             got: {out:?}"
+        );
+    }
+
+    /// SEAL/UNSEAL PARITY for the new keyword legs: locking a folder makes its document's unique
+    /// token INVISIBLE through EVERY read leg (the gated FTS helper, the flag-off Ask corpus, both
+    /// search tools), and a session unlock brings it back through the SAME legs — including on a
+    /// model-less install (the unlock re-chunk no longer requires the e5 model).
+    #[test]
+    fn sealed_folder_docs_invisible_through_every_leg_until_unlock() {
+        let state = build_state("docs-seal-legs");
+        make_open_folder(&state.db, "f-lock", "Secret");
+        let id = import_text_inner(
+            &state,
+            "plan",
+            "TAJNYTOKEN kwartalny raport przejęcia",
+            "f-lock",
+        )
+        .unwrap();
+        assert!(
+            state.db.doc_chunk_count(&id).unwrap() >= 1,
+            "precondition: chunked on ingest"
+        );
+
+        lock_folder_inner(&state, "f-lock".to_string()).unwrap();
+
+        let nothing = HashSet::new();
+        let cfg = AppConfig::default();
+        // Leak assertions check "przejęcia" — a CONTENT word absent from the query — because the
+        // empty-result sentinels honestly ECHO the query text ("No meetings or documents match
+        // \"TAJNYTOKEN\"."), which is not a content leak.
+        let assert_leg_visibility = |unlocked: &HashSet<String>, expected: bool, phase: &str| {
+            let fts_hit = state
+                .db
+                .search_doc_chunks_fts_visible("TAJNYTOKEN", 10, unlocked)
+                .unwrap()
+                .iter()
+                .any(|h| h.document_id == id);
+            assert_eq!(fts_hit, expected, "FTS helper leg, {phase}");
+            let (corpus, _) = crate::summarize::vault_context::build_vault_context_visible(
+                &state.db,
+                "TAJNYTOKEN",
+                "anthropic",
+                unlocked,
+            )
+            .unwrap();
+            assert_eq!(
+                corpus.contains("przejęcia"),
+                expected,
+                "Ask corpus leg, {phase}"
+            );
+            for call in [
+                crate::tools::ToolCall::SearchMeetings {
+                    query: "TAJNYTOKEN".into(),
+                },
+                crate::tools::ToolCall::SearchSemantic {
+                    query: "TAJNYTOKEN".into(),
+                },
+            ] {
+                let out = crate::tools::execute_tool(&call, &state.db, unlocked, &cfg).unwrap();
+                assert_eq!(
+                    out.contains("przejęcia"),
+                    expected,
+                    "tool leg {call:?}, {phase}"
+                );
+            }
+        };
+
+        // Sealed-and-not-unlocked: the token leaks through NO leg.
+        assert_leg_visibility(&nothing, false, "sealed");
+
+        // Session-unlock (mirror unlock_folder's internals: KEK → unwrap CK → unseal extras, which
+        // re-chunks model-lessly), then evaluate every leg against the live unlock set.
+        let kek = secrets::get_or_create_master_kek().unwrap();
+        let wrapped = state.db.folder_wrapped_key("f-lock").unwrap().unwrap();
+        let ck_vec = crate::crypto::decrypt(&kek, &wrapped, &aad_wrapped_ck("f-lock")).unwrap();
+        let ck: [u8; 32] = ck_vec.try_into().expect("CK is 32 bytes");
+        unseal_folder_extras(&state, "f-lock", &ck, None).unwrap();
+        assert!(
+            state.db.doc_chunk_count(&id).unwrap() >= 1,
+            "unlock must re-chunk the document even without the e5 model"
+        );
+        let mut unlocked = HashSet::new();
+        unlocked.insert("f-lock".to_string());
+        assert_leg_visibility(&unlocked, true, "session-unlocked");
+    }
+
+    /// Mirror `unlock_folder`'s own note-markdown restore (KEK → unwrap CK → decrypt each sealed
+    /// provider row's `content_blob` back into its plaintext markdown column) — the step
+    /// `unlock_folder` runs BEFORE `unseal_folder_extras`, so the meeting re-index has plaintext to
+    /// chunk. Returns the unwrapped CK for the follow-on `unseal_folder_extras` call.
+    fn restore_notes_and_ck(state: &AppState, folder_id: &str) -> [u8; 32] {
+        let kek = secrets::get_or_create_master_kek().unwrap();
+        let wrapped = state.db.folder_wrapped_key(folder_id).unwrap().unwrap();
+        let ck_vec = crate::crypto::decrypt(&kek, &wrapped, &aad_wrapped_ck(folder_id)).unwrap();
+        let ck: [u8; 32] = ck_vec.try_into().expect("CK is 32 bytes");
+        for n in state.db.notes_in_folder(folder_id).unwrap() {
+            if let Some(blob) = &n.content_blob {
+                let aad = aad_content(folder_id, &n.meeting_id, &n.provider_id, "note");
+                let md =
+                    String::from_utf8(crate::crypto::decrypt(&ck, blob, &aad).unwrap()).unwrap();
+                state
+                    .db
+                    .restore_note_markdown(&n.meeting_id, &n.provider_id, &md)
+                    .unwrap();
+            }
+        }
+        ck
+    }
+
+    /// REGRESSION (the reported bug): locking a folder PURGES its meetings' `note_chunks`/`vec_chunks`
+    /// (`purge_chunks_for_meetings`), but session-unlock (`unseal_folder_extras`) previously re-indexed
+    /// ONLY documents and NEVER the meetings — so semantic / related-meetings stayed DEAD for those
+    /// meetings until a manual full re-index. This asserts the fix on the PRODUCTION unlock path.
+    ///
+    /// RED-before-GREEN (deterministic, machine-independent): the meeting embedder is now injected, so
+    /// the model-PRESENT branch is driven by passing `Some(&StubEmbedder)` (the same stand-in every
+    /// meeting-chunk test uses) into the PRODUCTION `unseal_folder_extras`. On the pre-fix code
+    /// `unseal_folder_extras` had no meeting re-index at all (`index_meeting_chunks`'s only production
+    /// callers were the pipeline + the manual reindex command, grep-confirmed), so `note_chunk_count`
+    /// would stay 0 even with `Some` — RED. The `None` call proves the ABSOLUTE no-stub-vector /
+    /// mirror-the-pipeline invariant: model-absent unlock writes ZERO meeting chunks AND vectors.
+    #[test]
+    fn unlock_reindexes_folder_meetings_and_never_stub_vectors() {
+        let state = build_state("unlock-reindex-meetings");
+        make_open_folder(&state.db, "f-lock", "Secret");
+        seed_meeting(
+            &state.db,
+            "m1",
+            "# Q3 plan\n\nbudget planning and hiring across the org",
+            Some("f-lock"),
+        );
+        // Index while the folder is OPEN (the stub stands in for a present model, as every other
+        // meeting-chunk test does) → chunks + vectors present.
+        state
+            .db
+            .index_meeting_chunks("m1", &[], &crate::embed::StubEmbedder)
+            .unwrap();
+        assert!(
+            state.db.note_chunk_count("m1").unwrap() > 0,
+            "precondition: chunked while open"
+        );
+        assert!(
+            state.db.note_vec_count("m1").unwrap() > 0,
+            "precondition: vectored while open"
+        );
+
+        // LOCK (production seal) → meeting chunks + vectors purged.
+        lock_folder_inner(&state, "f-lock".to_string()).unwrap();
+        assert_eq!(
+            state.db.note_chunk_count("m1").unwrap(),
+            0,
+            "note_chunks purged on lock"
+        );
+        assert_eq!(
+            state.db.note_vec_count("m1").unwrap(),
+            0,
+            "vec_chunks purged on lock"
+        );
+
+        // Restore note markdown exactly as `unlock_folder` does BEFORE `unseal_folder_extras`.
+        let ck = restore_notes_and_ck(&state, "f-lock");
+
+        // MODEL-ABSENT (embedder = None): the PRODUCTION unlock must write NOTHING for meetings — no
+        // chunk-only mode → any write would be a forbidden stub vector. Mirrors the pipeline exactly.
+        unseal_folder_extras(&state, "f-lock", &ck, None).unwrap();
+        assert_eq!(
+            state.db.note_chunk_count("m1").unwrap(),
+            0,
+            "model-absent unlock writes NO meeting note_chunks (mirrors the pipeline/reindex policy)"
+        );
+        assert_eq!(
+            state.db.note_vec_count("m1").unwrap(),
+            0,
+            "ABSOLUTE no-stub-vector: model-absent unlock never writes a meeting vector"
+        );
+
+        // MODEL-PRESENT (embedder = Some): the PRODUCTION unlock re-indexes the folder's meetings.
+        // RED on the pre-fix code (unseal_folder_extras had no meeting re-index → stayed 0).
+        unseal_folder_extras(&state, "f-lock", &ck, Some(&crate::embed::StubEmbedder)).unwrap();
+        assert!(
+            state.db.note_chunk_count("m1").unwrap() > 0,
+            "production unlock re-indexes meeting note_chunks when the e5 model is present (was DEAD before the fix)"
+        );
+        assert!(
+            state.db.note_vec_count("m1").unwrap() > 0,
+            "production unlock re-indexes meeting vec_chunks when the e5 model is present"
+        );
+    }
+
+    /// REMOVE-LOCK analogue: permanently opening a folder (`remove_lock_inner` →
+    /// `unseal_folder_extras_permanent`) restores plaintext + `.md` for every meeting; the folder is
+    /// then permanently OPEN, so there is no privacy rationale to skip re-indexing — meetings must
+    /// re-index exactly like documents. Same deterministic RED-before-GREEN shape as the session-unlock
+    /// test, driving the PRODUCTION `unseal_folder_extras_permanent` with `None` then `Some`.
+    #[test]
+    fn remove_lock_reindexes_folder_meetings_and_never_stub_vectors() {
+        let state = build_state("remove-lock-reindex-meetings");
+        make_open_folder(&state.db, "f-lock", "Secret");
+        seed_meeting(
+            &state.db,
+            "m1",
+            "# Roadmap\n\nrevisit auth and the billing migration next sprint",
+            Some("f-lock"),
+        );
+        state
+            .db
+            .index_meeting_chunks("m1", &[], &crate::embed::StubEmbedder)
+            .unwrap();
+        assert!(
+            state.db.note_chunk_count("m1").unwrap() > 0,
+            "precondition: chunked while open"
+        );
+
+        lock_folder_inner(&state, "f-lock".to_string()).unwrap();
+        assert_eq!(
+            state.db.note_chunk_count("m1").unwrap(),
+            0,
+            "purged on lock"
+        );
+
+        // `remove_lock_inner` restores the note markdown (Step 1) BEFORE `unseal_folder_extras_permanent`.
+        let ck = restore_notes_and_ck(&state, "f-lock");
+
+        // MODEL-ABSENT (None): permanent unseal writes NO meeting chunks/vectors (no stub vectors).
+        unseal_folder_extras_permanent(&state, "f-lock", &ck, None).unwrap();
+        assert_eq!(
+            state.db.note_chunk_count("m1").unwrap(),
+            0,
+            "model-absent remove-lock writes NO meeting note_chunks (mirrors the pipeline policy)"
+        );
+        assert_eq!(
+            state.db.note_vec_count("m1").unwrap(),
+            0,
+            "ABSOLUTE no-stub-vector: model-absent remove-lock never writes a meeting vector"
+        );
+
+        // MODEL-PRESENT (Some): permanent unseal re-indexes the now-open folder's meetings. RED on the
+        // pre-fix code (unseal_folder_extras_permanent had no meeting re-index → stayed 0).
+        unseal_folder_extras_permanent(&state, "f-lock", &ck, Some(&crate::embed::StubEmbedder))
+            .unwrap();
+        assert!(
+            state.db.note_chunk_count("m1").unwrap() > 0,
+            "remove-lock re-indexes meeting note_chunks when the e5 model is present (was DEAD before the fix)"
+        );
+        assert!(
+            state.db.note_vec_count("m1").unwrap() > 0,
+            "remove-lock re-indexes meeting vec_chunks"
+        );
+    }
+
+    /// Brain v3 audit gap #1 (RED-before-GREEN): an in-app note EDIT (`update_note_inner`) upserted
+    /// the markdown + re-exported the vault `.md` but NEVER re-derived the meeting's chunks/vectors —
+    /// deleted text kept surfacing in semantic search (snippets read from `note_chunks` at hit time).
+    /// Deterministic via the injected-embedder seam (`update_note_inner_with`), the exact
+    /// `unseal_folder_extras` precedent: pre-fix the production body had NO re-index at all, so the
+    /// stale text stayed even with `Some(&StubEmbedder)` — RED. Also pins the model-ABSENT branch
+    /// (`None` ⇒ the index is untouched — never a stub vector).
+    #[test]
+    fn update_note_edit_reindexes_meeting_chunks_replacing_stale_text() {
+        let state = build_state("edit-reindex-meeting");
+        make_open_folder(&state.db, "f-edit", "Team");
+        seed_meeting(
+            &state.db,
+            "m1",
+            "# Plan\n\nzebrafish budget line for next quarter",
+            Some("f-edit"),
+        );
+        // Index the ORIGINAL note (the pipeline's job at summarize time).
+        let segments = state.db.get_segments("m1").unwrap();
+        state
+            .db
+            .index_meeting_chunks("m1", &segments, &crate::embed::StubEmbedder)
+            .unwrap();
+        let before = state.db.note_chunk_texts("m1").unwrap().join("\n");
+        assert!(
+            before.contains("zebrafish"),
+            "precondition: the original text is indexed"
+        );
+
+        // MODEL ABSENT (None): the save persists but the index is untouched (no chunk-only mode for
+        // meetings → any write would be a forbidden stub vector; mirrors the unseal/reindex policy).
+        update_note_inner_with(&state, "m1", "# Plan\n\ninterim model-less edit", None).unwrap();
+        let mid_pass = state.db.note_chunk_texts("m1").unwrap().join("\n");
+        assert!(
+            mid_pass.contains("zebrafish"),
+            "model-absent edit leaves the index untouched (never a stub vector)"
+        );
+
+        // MODEL PRESENT (Some): the edit re-derives the chunks — deleted text GONE, fresh text in.
+        update_note_inner_with(
+            &state,
+            "m1",
+            "# Plan\n\naardvark forecast line replaces it",
+            Some(&crate::embed::StubEmbedder),
+        )
+        .unwrap();
+        let after = state.db.note_chunk_texts("m1").unwrap().join("\n");
+        assert!(
+            !after.contains("zebrafish"),
+            "deleted note text must STOP surfacing (RED pre-fix: update_note_inner never re-indexed)"
+        );
+        assert!(
+            after.contains("aardvark"),
+            "the fresh markdown is indexed after the edit"
+        );
+        assert!(
+            state.db.note_vec_count("m1").unwrap() > 0,
+            "vectors refreshed alongside the chunks"
+        );
+    }
+
+    /// Brain v3 audit gap #1, the SEAL GATE leg: an edit made while a LOCKED folder is
+    /// session-unlocked re-seals the markdown (seal-on-write) but must NOT re-chunk the sealed
+    /// folder's plaintext — the edit re-index runs under the EMPTY unlock set, so a sealed folder
+    /// (even session-unlocked, plaintext restored — the worst case) is invisible to it. The
+    /// unlock/relock lifecycle owns those rows.
+    #[test]
+    fn update_note_edit_never_reindexes_sealed_folder_chunks() {
+        let state = build_state("edit-reindex-sealed-gate");
+        make_open_folder(&state.db, "f-lock", "Secret");
+        seed_meeting(&state.db, "m1", "T0 secret note", Some("f-lock"));
+        lock_folder_inner(&state, "f-lock".to_string()).unwrap();
+        assert_eq!(
+            state.db.note_chunk_count("m1").unwrap(),
+            0,
+            "purged on lock"
+        );
+
+        // Session-unlock + restore the note markdown exactly like `unlock_folder` does.
+        let ck = session_unlock(&state, "f-lock");
+        for n in state.db.notes_in_folder("f-lock").unwrap() {
+            if let Some(blob) = &n.content_blob {
+                let aad = aad_content("f-lock", &n.meeting_id, &n.provider_id, "note");
+                let pt = crate::crypto::decrypt(&ck, blob, &aad).unwrap();
+                state
+                    .db
+                    .restore_note_markdown(&n.meeting_id, &n.provider_id, &String::from_utf8(pt).unwrap())
+                    .unwrap();
+            }
+        }
+
+        // Edit while session-unlocked WITH the model "present" (stub injected): the write gate
+        // passes and the fresh markdown is re-sealed — but NO chunk/vector row may appear.
+        update_note_inner_with(
+            &state,
+            "m1",
+            "T1 secret edit under session unlock",
+            Some(&crate::embed::StubEmbedder),
+        )
+        .unwrap();
+        assert_eq!(
+            state.db.note_chunk_count("m1").unwrap(),
+            0,
+            "a sealed folder's edit never lands in note_chunks (empty-unlock-set gate)"
+        );
+        assert_eq!(
+            state.db.note_vec_count("m1").unwrap(),
+            0,
+            "…and never in vec_chunks"
+        );
+    }
+
+    /// Test-only `Embedder` recording the SIZE of every `embed()` call (the db.rs sub-batch test
+    /// precedent) — proves a save path sub-batches its embeds instead of one item-sized call.
+    struct RecordingEmbedder {
+        call_sizes: std::sync::Mutex<Vec<usize>>,
+    }
+
+    impl crate::embed::Embedder for RecordingEmbedder {
+        fn dim(&self) -> usize {
+            crate::embed::EMBED_DIM
+        }
+        fn embed(&self, texts: &[String]) -> crate::error::Result<Vec<Vec<f32>>> {
+            self.call_sizes.lock().unwrap().push(texts.len());
+            Ok(texts
+                .iter()
+                .map(|_| vec![0.0f32; crate::embed::EMBED_DIM])
+                .collect())
+        }
+    }
+
+    /// Test-only `Embedder` that probes, from INSIDE each embed call, whether the GLOBAL
+    /// [`AppState::lifecycle`] mutex is currently held (a same-thread `try_lock` on a held
+    /// `std::sync::Mutex` returns `WouldBlock`). Proves the multi-second embed leg runs with the
+    /// lifecycle guard RELEASED — holding it there delays screen-share auto-relock and every
+    /// lock/unlock op.
+    struct GuardProbeEmbedder<'a> {
+        state: &'a AppState,
+        calls: std::sync::atomic::AtomicUsize,
+        saw_guard_held: std::sync::atomic::AtomicBool,
+    }
+
+    impl crate::embed::Embedder for GuardProbeEmbedder<'_> {
+        fn dim(&self) -> usize {
+            crate::embed::EMBED_DIM
+        }
+        fn embed(&self, texts: &[String]) -> crate::error::Result<Vec<Vec<f32>>> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            match self.state.lifecycle.try_lock() {
+                Ok(free) => drop(free),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    self.saw_guard_held
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                Err(std::sync::TryLockError::Poisoned(p)) => drop(p.into_inner()),
+            }
+            Ok(texts
+                .iter()
+                .map(|_| vec![0.0f32; crate::embed::EMBED_DIM])
+                .collect())
+        }
+    }
+
+    /// Brain v3 perf audit H3 (RED-before-GREEN): the authored-note save (`update_note_doc`)
+    /// embedded a long note's chunks in ONE Candle/Metal call sized to the whole note — the exact
+    /// unbounded-tensor class the 2026-07-13 launch-freeze fix closed for topic/transcript/document
+    /// chunks (`embed_in_sub_batches`); the note indexer was the one remaining miss. Pre-fix the
+    /// recorder saw a single 10-sized call: RED.
+    #[test]
+    fn update_note_doc_embeds_long_note_in_small_sub_batches() {
+        let state = build_state("note-doc-sub-batch");
+        make_open_folder(&state.db, "f-notes", "Notes");
+        // 10 paragraphs of ~690 chars: each fills its own ~800-char chunk → 10 chunks, more than
+        // one 8-sized sub-batch.
+        let body: String = (0..10)
+            .map(|i| format!("paragraph {i} {}", "x".repeat(680)))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        state
+            .db
+            .insert_note("n-long", "f-notes", "long", "Long", &body, 1)
+            .unwrap();
+        let expected = crate::embed::chunk_note("Long", "", &body).len();
+        assert!(
+            expected > 8,
+            "fixture sanity: the body must exceed one sub-batch, got {expected} chunks"
+        );
+
+        let rec = RecordingEmbedder {
+            call_sizes: std::sync::Mutex::new(Vec::new()),
+        };
+        update_note_doc_inner_with(&state, "n-long", "Long", &body, Some(&rec)).unwrap();
+
+        let calls = rec.call_sizes.into_inner().unwrap();
+        assert!(!calls.is_empty(), "the injected embedder must actually be exercised");
+        assert!(
+            calls.iter().all(|&n| n <= 8),
+            "no single embed call on the note-save path may exceed the sub-batch size (8): {calls:?}"
+        );
+        assert_eq!(
+            calls.iter().sum::<usize>(),
+            expected,
+            "every chunk is embedded exactly once across the sub-batches"
+        );
+    }
+
+    /// Brain v3 perf audit fix 2 (RED-before-GREEN): the meeting-note edit held the GLOBAL
+    /// lifecycle mutex across the multi-second Candle/Metal re-embed, delaying screen-share
+    /// auto-relock (`relock_all_inner`) and every lock/unlock op behind a long meeting's re-index.
+    /// The in-tx sealed-at-rest re-check inside the indexers is what makes the embed race-safe
+    /// (`rename_meeting_inner` runs the identical re-index with NO guard), so the guard must be
+    /// RELEASED before the heavy leg. Pre-fix the probe observed the guard held: RED.
+    #[test]
+    fn update_note_edit_releases_lifecycle_guard_before_the_embed_leg() {
+        let state = build_state("edit-guard-release");
+        make_open_folder(&state.db, "f-edit", "Team");
+        seed_meeting(&state.db, "m1", "# Plan\n\noriginal body", Some("f-edit"));
+        let probe = GuardProbeEmbedder {
+            state: &state,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            saw_guard_held: std::sync::atomic::AtomicBool::new(false),
+        };
+        update_note_inner_with(&state, "m1", "# Plan\n\nedited body", Some(&probe)).unwrap();
+        assert!(
+            probe.calls.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "the re-index must actually run (the probe is exercised)"
+        );
+        assert!(
+            !probe.saw_guard_held.load(std::sync::atomic::Ordering::SeqCst),
+            "the lifecycle guard must be RELEASED before the embed leg — holding it delays \
+             auto-relock and every lock/unlock op"
+        );
+    }
+
+    /// The authored-note twin of the guard-release test above: `update_note_doc` held the same
+    /// global lifecycle mutex across its note-body re-embed + link pass. Same race-safety argument
+    /// (the `doc_sealed_at_rest_tx` in-tx re-check refuses a mid-flight seal), same fix: the fast
+    /// leg (gate + seal-on-write + vault export) stays guarded, the heavy leg runs released.
+    #[test]
+    fn update_note_doc_releases_lifecycle_guard_before_the_embed_leg() {
+        let state = build_state("note-doc-guard-release");
+        make_open_folder(&state.db, "f-notes", "Notes");
+        state
+            .db
+            .insert_note("n1", "f-notes", "plan", "Plan", "quarterly plan body", 1)
+            .unwrap();
+        let probe = GuardProbeEmbedder {
+            state: &state,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            saw_guard_held: std::sync::atomic::AtomicBool::new(false),
+        };
+        update_note_doc_inner_with(&state, "n1", "Plan", "quarterly plan body", Some(&probe))
+            .unwrap();
+        assert!(
+            probe.calls.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "the note re-index must actually run (the probe is exercised)"
+        );
+        assert!(
+            !probe.saw_guard_held.load(std::sync::atomic::Ordering::SeqCst),
+            "the lifecycle guard must be RELEASED before the note-body embed leg"
+        );
+    }
+
+    /// Brain v3 audit gap #4 (RED-before-GREEN): a RENAME left the OLD title baked into every
+    /// chunk's header/augmented text/vector until a manual full reindex (`chunk_note` embeds
+    /// `<title> · <date>` into each chunk). Pre-fix `rename_meeting` only set the title + synced the
+    /// companion note — no re-index — so the old title stayed even with `Some(&StubEmbedder)`: RED.
+    #[test]
+    fn rename_meeting_refreshes_stale_chunk_titles() {
+        let state = build_state("rename-reindex");
+        make_open_folder(&state.db, "f-open", "Team");
+        // `seed_meeting` titles the meeting "Quarterly strategy".
+        seed_meeting(&state.db, "m1", "# Plan\n\nbudget details", Some("f-open"));
+        let segments = state.db.get_segments("m1").unwrap();
+        state
+            .db
+            .index_meeting_chunks("m1", &segments, &crate::embed::StubEmbedder)
+            .unwrap();
+        let before = state.db.note_chunk_texts("m1").unwrap().join("\n");
+        assert!(
+            before.contains("Quarterly strategy"),
+            "precondition: chunk headers carry the seeded title"
+        );
+
+        rename_meeting_inner(
+            &state,
+            "m1",
+            "Atlas kickoff renamed",
+            Some(&crate::embed::StubEmbedder),
+        )
+        .unwrap();
+
+        let after = state.db.note_chunk_texts("m1").unwrap().join("\n");
+        assert!(
+            after.contains("Atlas kickoff renamed"),
+            "chunk headers carry the NEW title (RED pre-fix: rename never re-indexed)"
+        );
+        assert!(
+            !after.contains("Quarterly strategy"),
+            "the OLD title is gone from every chunk"
+        );
+    }
+
+    /// Brain v3 flag-consistency (PR-1 finding 3): `reindex_meeting_after_edit` hardcoded `enabled=true`,
+    /// so an edit/rename with `semantic_search_enabled = false` + the model present STILL re-chunked the
+    /// meeting — the ONE meeting-index path ignoring the flag. Now it respects the flag exactly like the
+    /// repair tick + `should_auto_index`. RED-before-GREEN: restore the hardcoded `true` and the OFF-flag
+    /// edit re-derives the chunks (the assertion below that the ORIGINAL text survives untouched fails).
+    #[test]
+    fn edit_and_rename_reindex_respect_semantic_flag_off() {
+        let state = build_state("edit-rename-flag-off");
+        // Flag OFF: vectors are not retrieval-active, so an edit/rename must not re-chunk.
+        state.config.lock().unwrap().semantic_search_enabled = false;
+        make_open_folder(&state.db, "f-open", "Team");
+        seed_meeting(
+            &state.db,
+            "m1",
+            "# Plan\n\nzebrafish budget line for next quarter",
+            Some("f-open"),
+        );
+        let segments = state.db.get_segments("m1").unwrap();
+        state
+            .db
+            .index_meeting_chunks("m1", &segments, &crate::embed::StubEmbedder)
+            .unwrap();
+        let before = state.db.note_chunk_texts("m1").unwrap().join("\n");
+        assert!(before.contains("zebrafish"), "precondition: original indexed");
+
+        // EDIT with the model "present" (stub) but the flag OFF → index left untouched.
+        update_note_inner_with(
+            &state,
+            "m1",
+            "# Plan\n\naardvark forecast replaces it",
+            Some(&crate::embed::StubEmbedder),
+        )
+        .unwrap();
+        let after_edit = state.db.note_chunk_texts("m1").unwrap().join("\n");
+        assert!(
+            after_edit.contains("zebrafish") && !after_edit.contains("aardvark"),
+            "flag OFF: an edit must NOT re-chunk the meeting (RED pre-fix: hardcoded enabled=true)"
+        );
+
+        // RENAME likewise leaves the stale-title chunks untouched while the flag is OFF.
+        rename_meeting_inner(
+            &state,
+            "m1",
+            "Atlas kickoff renamed",
+            Some(&crate::embed::StubEmbedder),
+        )
+        .unwrap();
+        let after_rename = state.db.note_chunk_texts("m1").unwrap().join("\n");
+        assert!(
+            after_rename.contains("Quarterly strategy") && !after_rename.contains("Atlas kickoff renamed"),
+            "flag OFF: a rename must NOT re-chunk the meeting"
+        );
+
+        // Flip the flag ON → an edit re-derives again (proves the guard is the flag, not a no-op).
+        state.config.lock().unwrap().semantic_search_enabled = true;
+        update_note_inner_with(
+            &state,
+            "m1",
+            "# Plan\n\naardvark forecast replaces it",
+            Some(&crate::embed::StubEmbedder),
+        )
+        .unwrap();
+        let after_on = state.db.note_chunk_texts("m1").unwrap().join("\n");
+        assert!(
+            after_on.contains("aardvark") && !after_on.contains("zebrafish"),
+            "flag ON: the edit re-indexes as before"
+        );
+    }
+
+    /// Brain v3 audit gap #3 (RED-before-GREEN): the manual Reindex iterated `visible_document_ids`
+    /// with NO kind filter and chunked raw `documents.text` — for an authored note (`kind='note'`)
+    /// that raw text includes the YAML front-matter the note-save path deliberately strips
+    /// (`index_note_body_chunks` → `split_front_matter`). The fixed path routes `kind='note'` rows
+    /// through the stripping `index_note_chunks`; pre-fix the front-matter token landed in
+    /// `doc_chunks` — RED.
+    #[test]
+    fn reindex_strips_front_matter_from_authored_note_chunks() {
+        let state = build_state("reindex-kind-routing");
+        make_open_folder(&state.db, "f-notes", "Notes");
+        state
+            .db
+            .insert_note(
+                "n-fm",
+                "f-notes",
+                "plan",
+                "Plan",
+                "---\ntags: [zzfrontmattertag]\n---\n\nQuarterly zzbodytoken results paragraph.",
+                1,
+            )
+            .unwrap();
+        let empty: HashSet<String> = HashSet::new();
+        reindex_embeddings_inner(
+            &state.db,
+            &empty,
+            true,
+            &crate::embed::StubEmbedder,
+            |_, _| {},
+        )
+        .unwrap();
+        let chunks = state.db.doc_chunk_texts("n-fm").unwrap().join("\n");
+        assert!(
+            chunks.contains("zzbodytoken"),
+            "the note BODY is chunked by the reindex"
+        );
+        assert!(
+            !chunks.contains("zzfrontmattertag"),
+            "front-matter must NEVER reach an authored note's chunks (RED pre-fix: raw text was chunked)"
+        );
+    }
+
+    /// Brain v3 finding 4 (RED-before-GREEN): INGEST of a `kind='note'` via `import_text` raw-chunked
+    /// `documents.text`, so a pasted note with YAML front-matter got its tags/properties into
+    /// `doc_chunks` at ingest time — contradicting the "ONE routing seam" contract. The fix routes
+    /// ingest through `index_document_row_kind_routed` (front-matter stripped). RED pre-fix: the ingest
+    /// called raw `index_document_chunks` and the front-matter token landed in the chunks.
+    #[test]
+    fn ingest_note_strips_front_matter_from_chunks() {
+        let state = build_state("ingest-note-frontmatter");
+        make_open_folder(&state.db, "f-notes", "Notes");
+        let id = import_text_inner(
+            &state,
+            "pasted plan",
+            "---\ntags: [zzingestfmtag]\n---\n\nQuarterly zzingestbody results paragraph.",
+            "f-notes",
+        )
+        .unwrap();
+        let chunks = state.db.doc_chunk_texts(&id).unwrap().join("\n");
+        assert!(
+            chunks.contains("zzingestbody"),
+            "the pasted note BODY is chunked at ingest"
+        );
+        assert!(
+            !chunks.contains("zzingestfmtag"),
+            "front-matter must NEVER reach an ingested note's chunks (RED pre-fix: raw ingest chunking)"
+        );
+    }
+
+    /// Brain v3 audit gap #2 — the startup REPAIR TICK is complete and IDEMPOTENT:
+    /// - model-ABSENT pass: documents with no chunks get a chunk-only backfill (keyword retrieval
+    ///   works on a default install); meetings untouched (no chunk-only mode → stub vectors).
+    /// - model-PRESENT pass: chunked-but-vectorless docs re-embed, note-carrying meetings with no
+    ///   chunks index (note + transcript + vectors), kind-routing keeps front-matter out.
+    /// - re-run: full coverage ⇒ `(0, 0)` — a no-op.
+    #[test]
+    fn repair_tick_backfills_missing_indexes_idempotently() {
+        let state = build_state("repair-tick-idempotent");
+        make_open_folder(&state.db, "f-open", "Team");
+        seed_meeting(
+            &state.db,
+            "m1",
+            "# Plan\n\nquarterly zzmeetingtoken details",
+            Some("f-open"),
+        );
+        state
+            .db
+            .insert_document("d1", "f-open", "spec.md", "spec zzdoctoken body", "document", 1)
+            .unwrap();
+        state
+            .db
+            .insert_note(
+                "n1",
+                "f-open",
+                "note",
+                "Note",
+                "---\ntags: [zztickfmtag]\n---\n\nnote zznotetoken body",
+                1,
+            )
+            .unwrap();
+        // Fix 3c: a permanently-EMPTY note (zero chunks forever) rides along — it must never be
+        // counted as backfilled work in ANY pass (pre-fix it re-counted on every run, so the
+        // pass-1/2 doc counts read 3 and the tick never became a reported no-op: RED).
+        state
+            .db
+            .insert_note("n-empty", "f-open", "empty", "Empty", "", 1)
+            .unwrap();
+
+        // PASS 1 — MODEL ABSENT.
+        let (meetings, docs) =
+            backfill_missing_brain_indexes(&state.db, true, false, &crate::embed::StubEmbedder)
+                .unwrap();
+        assert_eq!(meetings, 0, "model absent: no meeting indexing (no stub vectors)");
+        assert_eq!(
+            docs, 2,
+            "model absent: both non-empty documents chunk-only backfilled (the empty row is zero-yield, never counted)"
+        );
+        let (d_chunks, d_vecs) = state.db.doc_chunk_vector_counts("d1").unwrap();
+        assert!(d_chunks > 0, "doc chunks present after the chunk-only pass");
+        assert_eq!(d_vecs, 0, "no vectors without the model");
+        assert_eq!(state.db.note_chunk_count("m1").unwrap(), 0);
+
+        // PASS 2 — MODEL PRESENT (the model-arrived-later recovery the audit gap describes).
+        let (meetings, docs) =
+            backfill_missing_brain_indexes(&state.db, true, true, &crate::embed::StubEmbedder)
+                .unwrap();
+        assert_eq!(meetings, 1, "the note-carrying meeting is indexed");
+        assert_eq!(docs, 2, "chunked-but-vectorless docs re-embed once the model arrives");
+        assert!(state.db.doc_chunk_vector_counts("d1").unwrap().1 > 0);
+        assert!(state.db.note_chunk_count("m1").unwrap() > 0);
+        assert!(state.db.note_vec_count("m1").unwrap() > 0);
+        // Kind routing respected (audit gap #3): the authored note's chunks carry no front-matter.
+        let note_chunks = state.db.doc_chunk_texts("n1").unwrap().join("\n");
+        assert!(note_chunks.contains("zznotetoken"));
+        assert!(!note_chunks.contains("zztickfmtag"));
+
+        // PASS 3 — IDEMPOTENT: full coverage ⇒ a re-run touches nothing.
+        let (meetings, docs) =
+            backfill_missing_brain_indexes(&state.db, true, true, &crate::embed::StubEmbedder)
+                .unwrap();
+        assert_eq!((meetings, docs), (0, 0), "re-run is a no-op");
+    }
+
+    /// Brain v3 audit gap #2, the FLAG leg: the tick is an AUTOMATIC index, so its meeting half
+    /// respects `semantic_search_enabled` exactly like the pipeline's `should_auto_index` and the
+    /// topic backfill — flag OFF ⇒ no meeting indexing even with the model present.
+    #[test]
+    fn repair_tick_meeting_half_respects_semantic_flag() {
+        let state = build_state("repair-tick-flag-off");
+        make_open_folder(&state.db, "f-open", "Team");
+        seed_meeting(&state.db, "m1", "# Plan\n\nnotes", Some("f-open"));
+        let (meetings, _docs) =
+            backfill_missing_brain_indexes(&state.db, false, true, &crate::embed::StubEmbedder)
+                .unwrap();
+        assert_eq!(
+            meetings, 0,
+            "flag OFF: an automatic tick never indexes meetings (should_auto_index posture)"
+        );
+        assert_eq!(state.db.note_chunk_count("m1").unwrap(), 0);
+    }
+
+    /// Brain v3 audit gap #2, the LOCK-DISCIPLINE leg (the consolidation invariant): the repair tick
+    /// reads with the EMPTY unlock set, so a SEALED folder's meeting is never touched — even in the
+    /// worst case where the folder is session-unlocked and its note plaintext is restored (a
+    /// live-unlock-set bug would index that plaintext; the empty set must not).
+    #[test]
+    fn repair_tick_never_touches_sealed_folder_even_mid_session_unlock() {
+        let state = build_state("repair-tick-sealed");
+        make_open_folder(&state.db, "f-lock", "Secret");
+        seed_meeting(&state.db, "m1", "# Secret\n\nzzsealedtoken plan", Some("f-lock"));
+        lock_folder_inner(&state, "f-lock".to_string()).unwrap();
+        assert_eq!(
+            state.db.note_chunk_count("m1").unwrap(),
+            0,
+            "purged on lock"
+        );
+
+        // Session-unlock (folder in the LIVE unlock set) + restore the note plaintext.
+        let ck = session_unlock(&state, "f-lock");
+        for n in state.db.notes_in_folder("f-lock").unwrap() {
+            if let Some(blob) = &n.content_blob {
+                let aad = aad_content("f-lock", &n.meeting_id, &n.provider_id, "note");
+                let pt = crate::crypto::decrypt(&ck, blob, &aad).unwrap();
+                state
+                    .db
+                    .restore_note_markdown(&n.meeting_id, &n.provider_id, &String::from_utf8(pt).unwrap())
+                    .unwrap();
+            }
+        }
+
+        let (meetings, docs) =
+            backfill_missing_brain_indexes(&state.db, true, true, &crate::embed::StubEmbedder)
+                .unwrap();
+        assert_eq!(
+            (meetings, docs),
+            (0, 0),
+            "a sealed folder's content is never touched — even while session-unlocked"
+        );
+        assert_eq!(
+            state.db.note_chunk_count("m1").unwrap(),
+            0,
+            "no chunks materialize for the sealed meeting"
+        );
+    }
+
+    /// Brain v3 perf audit fix 3 (RED-before-GREEN): the repair tick had NO per-run cap — a vault
+    /// with hundreds of missing rows re-embedded EVERYTHING on one launch (the class the 2026-07-13
+    /// launch freeze pinned on the topic backfill, whose `TOPIC_BACKFILL_MAX_REEMBED_PER_RUN` this
+    /// mirrors). With the cap forced small, one run performs exactly `cap` REAL index ops and the
+    /// next run RESUMES where it left off (the needs-probe is the cursor — no state carried).
+    /// Pre-fix everything indexed in one pass: RED.
+    #[test]
+    fn repair_tick_caps_real_index_ops_per_run_and_resumes_next_launch() {
+        let state = build_state("repair-tick-cap");
+        make_open_folder(&state.db, "f-open", "Team");
+        for i in 0..4 {
+            state
+                .db
+                .insert_document(
+                    &format!("d{i}"),
+                    "f-open",
+                    &format!("doc{i}.md"),
+                    &format!("doc {i} body paragraph"),
+                    "document",
+                    (i + 1) as i64,
+                )
+                .unwrap();
+        }
+        seed_meeting(&state.db, "m1", "# Plan\n\nbudget line", Some("f-open"));
+
+        // RUN 1 (cap 2): exactly two docs (oldest-first) — no budget left for the meeting half.
+        let (m, d) = backfill_missing_brain_indexes_capped(
+            &state.db,
+            true,
+            true,
+            &crate::embed::StubEmbedder,
+            2,
+        )
+        .unwrap();
+        assert_eq!((m, d), (0, 2), "run 1 spends the whole cap on the first two docs");
+        let covered = (0..4)
+            .filter(|i| {
+                state
+                    .db
+                    .doc_chunk_vector_counts(&format!("d{i}"))
+                    .unwrap()
+                    .0
+                    > 0
+            })
+            .count();
+        assert_eq!(covered, 2, "exactly cap-many docs are indexed in one run");
+        assert_eq!(
+            state.db.note_chunk_count("m1").unwrap(),
+            0,
+            "the meeting half gets no leftover budget in run 1"
+        );
+
+        // RUN 2: resumes with the remaining two docs (the needs-probe skips the covered ones).
+        let (m, d) = backfill_missing_brain_indexes_capped(
+            &state.db,
+            true,
+            true,
+            &crate::embed::StubEmbedder,
+            2,
+        )
+        .unwrap();
+        assert_eq!((m, d), (0, 2), "run 2 continues from where run 1 stopped");
+
+        // RUN 3: docs covered → the leftover budget finally reaches the meeting half.
+        let (m, d) = backfill_missing_brain_indexes_capped(
+            &state.db,
+            true,
+            true,
+            &crate::embed::StubEmbedder,
+            2,
+        )
+        .unwrap();
+        assert_eq!((m, d), (1, 0), "run 3 indexes the meeting with the freed budget");
+        assert!(state.db.note_chunk_count("m1").unwrap() > 0);
+
+        // RUN 4: full coverage ⇒ a no-op (idempotence preserved under the cap).
+        let (m, d) = backfill_missing_brain_indexes_capped(
+            &state.db,
+            true,
+            true,
+            &crate::embed::StubEmbedder,
+            2,
+        )
+        .unwrap();
+        assert_eq!((m, d), (0, 0), "a capped tick still converges to the no-op");
+    }
+
+    /// Fix 3c (RED-before-GREEN): a row that yields NOTHING (an empty-bodied note produces zero
+    /// chunks, forever) must neither consume the per-run cap nor count as backfilled work —
+    /// otherwise a vault with permanently-empty rows re-burns the cap on every launch and the
+    /// tail of REAL missing rows behind them never gets indexed. Pre-fix every attempted row was
+    /// counted: RED.
+    #[test]
+    fn repair_tick_zero_yield_rows_never_consume_the_cap() {
+        let state = build_state("repair-tick-zero-yield");
+        make_open_folder(&state.db, "f-open", "Team");
+        // Oldest row first: an EMPTY note (zero chunks forever), then a real doc behind it.
+        state
+            .db
+            .insert_note("n-empty", "f-open", "empty", "Empty", "", 1)
+            .unwrap();
+        state
+            .db
+            .insert_document("d-real", "f-open", "doc.md", "real doc body paragraph", "document", 2)
+            .unwrap();
+
+        // Cap 1: the empty note is probed first but yields nothing — the ONE budget slot must
+        // still reach the real doc behind it.
+        let (m, d) = backfill_missing_brain_indexes_capped(
+            &state.db,
+            true,
+            true,
+            &crate::embed::StubEmbedder,
+            1,
+        )
+        .unwrap();
+        assert_eq!((m, d), (0, 1), "only the REAL doc counts as backfilled work");
+        assert!(
+            state.db.doc_chunk_vector_counts("d-real").unwrap().0 > 0,
+            "the real doc got the cap slot despite the zero-yield row ahead of it"
+        );
+
+        // Re-run: the empty row is re-probed (still zero-yield) — never counted, so the tick
+        // reports the honest no-op.
+        let (m, d) = backfill_missing_brain_indexes_capped(
+            &state.db,
+            true,
+            true,
+            &crate::embed::StubEmbedder,
+            1,
+        )
+        .unwrap();
+        assert_eq!((m, d), (0, 0), "zero-yield rows are not 'work' — the re-run is a no-op");
+    }
+
+    /// RELOCK re-purges the freshly-rebuilt meeting chunks: a lock → unlock (re-index) → relock cycle
+    /// must leave ZERO meeting chunks/vectors at rest — `relock_folder` → `blank_sealed_notes_in_folders`
+    /// → `purge_chunks_tx` covers the rows the unlock re-index rebuilt, so a re-sealed folder never
+    /// leaves a meeting vector at rest.
+    #[test]
+    fn lock_unlock_relock_leaves_zero_meeting_chunks() {
+        let state = build_state("relock-repurge-meetings");
+        make_open_folder(&state.db, "f-lock", "Secret");
+        seed_meeting(
+            &state.db,
+            "m1",
+            "# Notes\n\nlaunch on the 14th; hire two engineers",
+            Some("f-lock"),
+        );
+        state
+            .db
+            .index_meeting_chunks("m1", &[], &crate::embed::StubEmbedder)
+            .unwrap();
+
+        // Lock → purge.
+        lock_folder_inner(&state, "f-lock".to_string()).unwrap();
+        assert_eq!(
+            state.db.note_chunk_count("m1").unwrap(),
+            0,
+            "purged on lock"
+        );
+
+        // Session-unlock: restore markdown + the PRODUCTION unseal with a present (stub) model, which
+        // rebuilds the meeting chunks — so the relock below has something to re-purge.
+        let ck = restore_notes_and_ck(&state, "f-lock");
+        unseal_folder_extras(&state, "f-lock", &ck, Some(&crate::embed::StubEmbedder)).unwrap();
+        state
+            .unlocked_folders
+            .lock()
+            .unwrap()
+            .insert("f-lock".to_string());
+        assert!(
+            state.db.note_chunk_count("m1").unwrap() > 0,
+            "precondition: meeting re-indexed while session-unlocked"
+        );
+        assert!(
+            state.db.note_vec_count("m1").unwrap() > 0,
+            "precondition: vectors rebuilt"
+        );
+
+        // RELOCK → re-purge. Zero meeting chunks AND zero vectors at rest.
+        relock_all_inner(&state).unwrap();
+        assert_eq!(
+            state.db.note_chunk_count("m1").unwrap(),
+            0,
+            "relock must re-purge the meeting note_chunks the unlock re-index rebuilt"
+        );
+        assert_eq!(
+            state.db.note_vec_count("m1").unwrap(),
+            0,
+            "relock must re-purge the rebuilt meeting vec_chunks (no invertible vector at rest)"
+        );
+    }
+
+    /// REINDEX BACKFILL (PR B): `reindex_embeddings_inner` covers documents. Model ABSENT →
+    /// write-only (chunkless) documents gain chunks + FTS reachability with ZERO vectors, while an
+    /// already-chunked document's existing vectors are NOT purged (no downgrade). Model PRESENT →
+    /// the chunkless document is re-embedded with vectors too.
+    #[test]
+    fn reindex_backfills_documents_regardless_of_model() {
+        let state = build_state("reindex-docs");
+        make_open_folder(&state.db, "f-open", "Project");
+        // A write-only legacy row: document stored, never chunked (the pre-PR-B model-less ingest).
+        state
+            .db
+            .insert_document(
+                "d-legacy",
+                "f-open",
+                "legacy.md",
+                "szmaragdowy raport roczny",
+                "document",
+                100,
+            )
+            .unwrap();
+        // An already-indexed document WITH vectors (stub-deterministic).
+        state
+            .db
+            .insert_document(
+                "d-vec",
+                "f-open",
+                "vec.md",
+                "vectored content here",
+                "document",
+                200,
+            )
+            .unwrap();
+        state
+            .db
+            .index_document_chunks("d-vec", Some(&crate::embed::StubEmbedder))
+            .unwrap();
+        let vec_before = state.db.doc_vec_count("d-vec").unwrap();
+        assert!(vec_before >= 1, "precondition: d-vec has vectors");
+        assert_eq!(
+            state.db.doc_chunk_count("d-legacy").unwrap(),
+            0,
+            "precondition: d-legacy chunkless"
+        );
+
+        // Model ABSENT: chunk/FTS backfill only.
+        let nothing = HashSet::new();
+        let stub = crate::embed::StubEmbedder;
+        let res = reindex_embeddings_inner(&state.db, &nothing, false, &stub, |_, _| {}).unwrap();
+        assert_eq!(res.status, "model_missing", "meeting semantics unchanged");
+        assert!(
+            state.db.doc_chunk_count("d-legacy").unwrap() >= 1,
+            "legacy doc backfilled"
+        );
+        assert_eq!(
+            state.db.doc_vec_count("d-legacy").unwrap(),
+            0,
+            "no stub vectors on backfill"
+        );
+        assert_eq!(
+            state.db.doc_vec_count("d-vec").unwrap(),
+            vec_before,
+            "model-absent reindex must NOT purge an indexed document's vectors"
+        );
+        assert!(
+            state
+                .db
+                .search_doc_chunks_fts_visible("szmaragdowy", 10, &nothing)
+                .unwrap()
+                .iter()
+                .any(|h| h.document_id == "d-legacy"),
+            "backfilled document must be keyword-findable"
+        );
+
+        // Model PRESENT: the full purge-then-reinsert re-embed covers documents.
+        let res2 = reindex_embeddings_inner(&state.db, &nothing, true, &stub, |_, _| {}).unwrap();
+        assert_eq!(res2.status, "indexed");
+        assert!(
+            state.db.doc_vec_count("d-legacy").unwrap() >= 1,
+            "model-present reindex must (re)embed document chunks"
+        );
+    }
+
+    /// BLK-1: hammer the off-thread `relock_all_inner` (the blanker) WHILE `remove_lock_inner` runs
+    /// its restore→clear sequence, across many seal/remove cycles, and assert the IRREVERSIBLE-LOSS
+    /// state — a note with `markdown=''` AND `content_blob=NULL` — NEVER occurs. The coarse
+    /// `AppState::lifecycle` mutex serializes the two so the blank can never land between
+    /// `remove_lock`'s Step 1 (restore plaintext) and Step 2 (clear blob).
+    #[test]
+    fn relock_all_never_destroys_a_note_being_remove_locked() {
+        const MID: &str = "m-blk1";
+        const FOLDER: &str = "f-blk1";
+        const ORIGINAL_MD: &str = "# Board notes\n\n- launch on the 14th\n- hire two engineers";
+
+        let state = Arc::new(build_state("blk1"));
+        make_open_folder(&state.db, FOLDER, "Confidential");
+        seed_meeting(&state.db, MID, ORIGINAL_MD, Some(FOLDER));
+
+        // A background thread that spams the off-thread blanker continuously.
+        let stop = Arc::new(AtomicBool::new(false));
+        let spammer = {
+            let state = Arc::clone(&state);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    // Ignore errors — a busy WAL checkpoint etc. is non-fatal to the invariant.
+                    let _ = relock_all_inner(&state);
+                }
+            })
+        };
+
+        const ITERS: usize = 60;
+        for i in 0..ITERS {
+            // Seal the folder (note markdown → '' + content_blob set), then permanently remove the
+            // lock (restore plaintext, clear blob). The blanker is racing the whole time.
+            lock_folder_inner(&state, FOLDER.to_string()).unwrap();
+            remove_lock_inner(&state, FOLDER.to_string()).unwrap();
+
+            // The load-bearing invariant: no provider row is ever blanked-AND-blob-cleared, and the
+            // restore put the ORIGINAL content back with the blob gone (folder fully open again).
+            for n in state.db.sealable_notes_for_meeting(MID).unwrap() {
+                assert!(
+                    !(n.markdown.is_empty() && n.content_blob.is_none()),
+                    "IRREVERSIBLE DATA LOSS at iter {i}: markdown='' AND content_blob=NULL"
+                );
+                assert_eq!(
+                    n.markdown, ORIGINAL_MD,
+                    "note restored to original at iter {i}"
+                );
+                assert!(
+                    n.content_blob.is_none(),
+                    "content_blob cleared after remove_lock at iter {i}"
+                );
+            }
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        spammer.join().unwrap();
+
+        // Final state: open folder, original content, no residual blob anywhere.
+        assert!(!state.db.folder_by_id(FOLDER).unwrap().unwrap().locked);
+        let note = state.db.get_latest_note_for_meeting(MID).unwrap().unwrap();
+        assert_eq!(note.markdown, ORIGINAL_MD);
+    }
+
+    /// BLK-2 (reject half): moving a note INTO a locked folder that is NOT session-unlocked must be
+    /// REJECTED (`AppError::Locked`) and leave the note untouched — never reassigned, never blanked.
+    #[test]
+    fn move_into_locked_not_unlocked_folder_rejects_and_leaves_note_intact() {
+        const MID: &str = "m-blk2r";
+        const TARGET: &str = "f-blk2r";
+        const MD: &str = "# secret meeting\n\nplaintext that must not move into a locked folder";
+
+        let state = build_state("blk2r");
+        seed_meeting(&state.db, MID, MD, None); // at the vault root (open)
+        make_open_folder(&state.db, TARGET, "Locked-Target-R");
+        lock_folder_inner(&state, TARGET.to_string()).unwrap(); // seal it; NOT session-unlocked
+
+        let res = move_into_locked_folder(&state, MID, TARGET);
+        assert!(
+            matches!(res, Err(AppError::Locked(_))),
+            "must reject with Locked, got {res:?}"
+        );
+
+        // Untouched: still at the root, still plaintext, no blob.
+        assert_eq!(
+            state.db.folder_for_meeting(MID).unwrap(),
+            None,
+            "note was NOT reassigned"
+        );
+        let n = &state.db.sealable_notes_for_meeting(MID).unwrap()[0];
+        assert_eq!(n.markdown, MD, "plaintext preserved");
+        assert!(n.content_blob.is_none(), "never sealed");
+    }
+
+    /// BLK-2 (seal half): moving a note INTO a locked + SESSION-UNLOCKED folder seals it AT REST
+    /// (`content_blob`/`text_blob` set) but keeps it READABLE IN-SESSION — the restored plaintext
+    /// markdown + transcript come back exactly like the folder's other unlocked notes, so it never
+    /// shows blank under the open padlock, and no vault `.md` is left behind.
+    ///
+    /// REGRESSION (RED-before-GREEN): before the fix, `seal_moved_note` blanked the plaintext and
+    /// nothing restored it, so a note moved into a session-unlocked folder came back EMPTY under the
+    /// open padlock (the "private note came back empty" bug the user hit). The OLD assertion
+    /// `markdown.is_empty()` enshrined that bug; this asserts the correct in-session-readable state.
+    #[test]
+    fn move_into_locked_unlocked_folder_seals_the_moved_note() {
+        const MID: &str = "m-blk2s";
+        const TARGET: &str = "f-blk2s";
+        const MD: &str = "# moving in\n\nthis becomes ciphertext at rest";
+
+        let state = build_state("blk2s");
+        seed_meeting(&state.db, MID, MD, None); // at the vault root (open, plaintext)
+        make_open_folder(&state.db, TARGET, "Locked-Target-S");
+        lock_folder_inner(&state, TARGET.to_string()).unwrap(); // seal the (empty) target
+
+        // Make the target SESSION-UNLOCKED: in the unlock set + KEK cached (as a real unlock would).
+        state
+            .unlocked_folders
+            .lock()
+            .unwrap()
+            .insert(TARGET.to_string());
+        let kek = secrets::get_or_create_master_kek().unwrap();
+        *state.master_kek.lock().unwrap() = Some(Zeroizing::new(kek));
+
+        move_into_locked_folder(&state, MID, TARGET).unwrap();
+
+        // Reassigned into the target, sealed AT REST (blob set) but READABLE IN-SESSION (plaintext
+        // restored — the folder is session-unlocked, so it must read like its folder-mates).
+        assert_eq!(
+            state.db.folder_for_meeting(MID).unwrap().as_deref(),
+            Some(TARGET)
+        );
+        let n = &state.db.sealable_notes_for_meeting(MID).unwrap()[0];
+        assert!(
+            n.content_blob.is_some(),
+            "moved note must be sealed at rest (content_blob set)"
+        );
+        assert_eq!(
+            n.markdown, MD,
+            "moved note must stay READABLE in-session (regression: it used to come back empty under the open padlock)"
+        );
+        assert!(
+            n.exported_path.is_none(),
+            "no vault .md for a note in a locked folder"
+        );
+        // The visible read path (what the meeting-detail UI uses) returns the note, NON-empty.
+        let unlocked = state.unlocked_folders.lock().unwrap().clone();
+        let visible = state
+            .db
+            .get_note_if_visible(MID, &unlocked)
+            .unwrap()
+            .expect("note is visible while its folder is session-unlocked");
+        assert_eq!(
+            visible.markdown, MD,
+            "the meeting-detail read must show the moved note's content, not an empty note"
+        );
+        // Transcript: blob kept AT REST, but plaintext RESTORED for the session (not left blank).
+        let restored_transcript: String = state
+            .db
+            .raw_segments(MID)
+            .unwrap()
+            .iter()
+            .map(|s| s.text.clone())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            !restored_transcript.trim().is_empty(),
+            "transcript must be restored for the session (regression: left blank)"
+        );
+        for s in state.db.raw_segments(MID).unwrap() {
+            assert!(s.text_blob.is_some(), "segment text_blob kept at rest");
+        }
+
+        // And it round-trips: a permanent remove-lock restores the original plaintext (no loss).
+        remove_lock_inner(&state, TARGET.to_string()).unwrap();
+        let restored = state.db.get_latest_note_for_meeting(MID).unwrap().unwrap();
+        assert_eq!(
+            restored.markdown, MD,
+            "remove-lock restores the moved note's original content"
+        );
+    }
+
+    /// Auto-organize seam: [`classify_auto_file_target`] maps a classifier-chosen subfolder to the
+    /// right BLK-2 outcome — Open for an unmanaged / open subfolder, RejectToRoot for a locked +
+    /// not-session-unlocked folder (so plaintext never lands in a sealed dir), and SealInto for a
+    /// locked + session-unlocked folder (write then seal, like a manual move).
+    #[test]
+    fn classify_auto_file_target_covers_open_locked_and_unlocked() {
+        let state = build_state("autofile");
+
+        // No subfolder / unmanaged subfolder → Open.
+        assert_eq!(
+            classify_auto_file_target(&state, None).unwrap(),
+            AutoFileTarget::Open
+        );
+        assert_eq!(
+            classify_auto_file_target(&state, Some("Nonexistent")).unwrap(),
+            AutoFileTarget::Open,
+            "a subfolder with no matching folder row writes as usual"
+        );
+
+        // An OPEN folder row → Open.
+        make_open_folder(&state.db, "f-open", "Standups");
+        assert_eq!(
+            classify_auto_file_target(&state, Some("Standups")).unwrap(),
+            AutoFileTarget::Open
+        );
+
+        // A LOCKED, not-session-unlocked folder → RejectToRoot (no CK to seal with).
+        make_open_folder(&state.db, "f-locked", "Confidential");
+        lock_folder_inner(&state, "f-locked".to_string()).unwrap();
+        assert_eq!(
+            classify_auto_file_target(&state, Some("Confidential")).unwrap(),
+            AutoFileTarget::RejectToRoot,
+            "plaintext must not be written into a locked, not-unlocked folder"
+        );
+
+        // Make it SESSION-UNLOCKED (in the set + KEK cached) → SealInto(folder_id).
+        state
+            .unlocked_folders
+            .lock()
+            .unwrap()
+            .insert("f-locked".to_string());
+        let kek = secrets::get_or_create_master_kek().unwrap();
+        *state.master_kek.lock().unwrap() = Some(Zeroizing::new(kek));
+        assert_eq!(
+            classify_auto_file_target(&state, Some("Confidential")).unwrap(),
+            AutoFileTarget::SealInto("f-locked".to_string()),
+            "a session-unlocked locked folder seals the auto-filed note in"
+        );
+    }
+
+    /// Auto-organize seam (seal half): a note auto-filed into a session-unlocked locked folder via
+    /// [`seal_auto_filed_note`] is sealed AT REST (blob set) but stays READABLE IN-SESSION (plaintext
+    /// restored) and reassigned — exactly like a manual move. No plaintext `.md` survives in the
+    /// sealed dir, and it never comes back empty under the open padlock (same regression as the manual
+    /// move: the old `markdown.is_empty()` assertion enshrined the "came back empty" bug).
+    #[test]
+    fn seal_auto_filed_note_seals_into_unlocked_locked_folder() {
+        const MID: &str = "m-autofile";
+        const TARGET: &str = "f-autofile";
+        const MD: &str = "# auto-filed\n\nthis becomes ciphertext at rest";
+
+        let state = build_state("autofile-seal");
+        seed_meeting(&state.db, MID, MD, None);
+        make_open_folder(&state.db, TARGET, "AutoLocked");
+        lock_folder_inner(&state, TARGET.to_string()).unwrap();
+        state
+            .unlocked_folders
+            .lock()
+            .unwrap()
+            .insert(TARGET.to_string());
+        let kek = secrets::get_or_create_master_kek().unwrap();
+        *state.master_kek.lock().unwrap() = Some(Zeroizing::new(kek));
+
+        seal_auto_filed_note(&state, MID, TARGET).unwrap();
+
+        assert_eq!(
+            state.db.folder_for_meeting(MID).unwrap().as_deref(),
+            Some(TARGET)
+        );
+        let n = &state.db.sealable_notes_for_meeting(MID).unwrap()[0];
+        assert!(
+            n.content_blob.is_some(),
+            "auto-filed note sealed at rest (content_blob set)"
+        );
+        assert_eq!(
+            n.markdown, MD,
+            "auto-filed note must stay READABLE in-session (regression: it used to come back empty)"
+        );
+        // Visible read path returns the note, non-empty.
+        let unlocked = state.unlocked_folders.lock().unwrap().clone();
+        assert_eq!(
+            state
+                .db
+                .get_note_if_visible(MID, &unlocked)
+                .unwrap()
+                .expect("auto-filed note visible while its folder is session-unlocked")
+                .markdown,
+            MD
+        );
+    }
+
+    // ── retry_transcription prep gates (salvage-from-disk, 2026-07-16) ──────────────────────────
+
+    /// Every fail-closed gate of `retry_transcription_prep`, in order: locked folder → `Locked`;
+    /// non-Error status → refused; missing audio → refused; happy path claims `Error → Recording`
+    /// exactly once (single-flight).
+    #[test]
+    fn retry_prep_gates_fail_closed_then_claims_single_flight() {
+        let state = build_state("retry-prep");
+
+        // Unknown meeting.
+        assert!(matches!(
+            retry_transcription_prep(&state, "m-none"),
+            Err(AppError::InvalidArg(_))
+        ));
+
+        // LOCKED folder → AppError::Locked (never re-pipeline sealed content).
+        seed_meeting(&state.db, "m-locked", "# sealed", None);
+        make_open_folder(&state.db, "f-retry-locked", "RetryLocked");
+        state
+            .db
+            .set_meeting_folder("m-locked", Some("f-retry-locked"))
+            .unwrap();
+        lock_folder_inner(&state, "f-retry-locked".to_string()).unwrap();
+        assert!(
+            matches!(
+                retry_transcription_prep(&state, "m-locked"),
+                Err(AppError::Locked(_))
+            ),
+            "a sealed-and-not-session-unlocked meeting must refuse with Locked"
+        );
+
+        // Non-Error status refused (seed_meeting leaves the row Summarized).
+        seed_meeting(&state.db, "m-summarized", "# fine", None);
+        assert!(matches!(
+            retry_transcription_prep(&state, "m-summarized"),
+            Err(AppError::InvalidArg(_))
+        ));
+
+        // Error status but NO audio on disk → refused, row untouched.
+        seed_meeting(&state.db, "m-no-audio", "# err", None);
+        state
+            .db
+            .update_meeting_status("m-no-audio", MeetingStatus::Error)
+            .unwrap();
+        assert!(matches!(
+            retry_transcription_prep(&state, "m-no-audio"),
+            Err(AppError::Storage(_))
+        ));
+        assert_eq!(
+            state.db.get_meeting("m-no-audio").unwrap().unwrap().status,
+            MeetingStatus::Error,
+            "a refused prep must not have claimed the row"
+        );
+
+        // Happy path: Error + a real on-disk WAV → claimed (Error → Recording), path resolved.
+        let wav = std::env::temp_dir().join(format!("murmur-retry-prep-{}.wav", std::process::id()));
+        std::fs::write(&wav, b"RIFF-fake").unwrap();
+        seed_meeting(&state.db, "m-retry", "# err", None);
+        state
+            .db
+            .finalize_meeting("m-retry", "2026-07-16T10:00:00Z", 60, &wav.to_string_lossy())
+            .unwrap();
+        state
+            .db
+            .update_meeting_status("m-retry", MeetingStatus::Error)
+            .unwrap();
+        let got = retry_transcription_prep(&state, "m-retry").unwrap();
+        assert_eq!(got, wav);
+        assert_eq!(
+            state.db.get_meeting("m-retry").unwrap().unwrap().status,
+            MeetingStatus::Recording,
+            "the claim flips Error → Recording (crash-safe: next launch's disk salvage re-claims it)"
+        );
+        // Single-flight: the row is no longer Error, so a second prep refuses.
+        assert!(retry_transcription_prep(&state, "m-retry").is_err());
+        let _ = std::fs::remove_file(&wav);
+    }
+
+    /// LOCK MODEL — the mid-run-relock fail-closed purge branch of `finalize_salvage_lock_state`:
+    /// a salvage/retry whose folder got LOCKED (and not session-unlocked) while the pipeline ran
+    /// must not leave fresh plaintext at rest behind the lock. Blob-less segments are purged and
+    /// the plaintext WAV is removed ONLY because its sealed `.enc` twin survives; an OPEN folder
+    /// (or no folder) is a strict no-op.
+    #[test]
+    fn finalize_salvage_lock_state_purges_unsealed_output_behind_a_relock() {
+        let state = build_state("salvage-finalize");
+
+        // No-op case first: an OPEN folder's meeting keeps its plaintext output.
+        seed_meeting(&state.db, "m-open", "# open", None);
+        finalize_salvage_lock_state(&state, "m-open");
+        assert_eq!(
+            state.db.get_segments("m-open").unwrap().len(),
+            2,
+            "an open/rootless meeting's fresh segments are untouched"
+        );
+
+        // Relock-raced case: meeting in a folder that is LOCKED and NOT session-unlocked, with
+        // fresh blob-less segments + a plaintext WAV whose sealed .enc twin exists.
+        let dir = std::env::temp_dir().join(format!("murmur-salvage-finalize-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let wav = dir.join("m-raced.wav");
+        let enc = dir.join("m-raced.wav.enc");
+        std::fs::write(&wav, b"RIFF-fresh-plaintext").unwrap();
+        std::fs::write(&enc, b"AES-GCM-ciphertext").unwrap();
+
+        seed_meeting(&state.db, "m-raced", "# raced", None);
+        state
+            .db
+            .finalize_meeting("m-raced", "2026-07-16T10:00:00Z", 60, &wav.to_string_lossy())
+            .unwrap();
+        state
+            .db
+            .insert_folder(&Folder {
+                id: "f-raced".into(),
+                name: "Raced".into(),
+                path: "Raced".into(),
+                parent_id: None,
+                locked: true, // locked, and deliberately NOT in the session unlock set
+                created_at: "2026-07-16T00:00:00Z".into(),
+            })
+            .unwrap();
+        state
+            .db
+            .set_meeting_folder("m-raced", Some("f-raced"))
+            .unwrap();
+
+        finalize_salvage_lock_state(&state, "m-raced");
+
+        assert!(
+            state.db.raw_segments("m-raced").unwrap().is_empty(),
+            "fresh blob-less plaintext segments are purged fail-closed"
+        );
+        assert!(!wav.exists(), "the plaintext WAV is removed (a sealed copy exists)");
+        assert!(enc.exists(), "the sealed .enc twin is never touched");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// LOCK MODEL (2026-07-16 reviews): a RELOCK purges blob-less plaintext segments ONLY when
+    /// re-derivation is PROVEN — status Error/Recording (the retry gate's accepted states) AND the
+    /// meeting's audio surviving on disk. This is the #352 crash window (pipeline died between
+    /// segment insert and seal); before the fix those rows sat plaintext-at-rest behind the lock.
+    #[test]
+    fn relock_reblank_purges_unsealed_plaintext_segments() {
+        let state = build_state("relock-unsealed-purge");
+        let dir =
+            std::env::temp_dir().join(format!("murmur-relock-purge-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let wav = dir.join("m-crashed.wav");
+        std::fs::write(&wav, b"RIFF-archived-audio").unwrap();
+
+        seed_meeting(&state.db, "m-crashed", "# crashed salvage", None);
+        state
+            .db
+            .finalize_meeting(
+                "m-crashed",
+                "2026-07-16T10:00:00Z",
+                60,
+                &wav.to_string_lossy(),
+            )
+            .unwrap();
+        state
+            .db
+            .update_meeting_status("m-crashed", MeetingStatus::Error)
+            .unwrap();
+        state
+            .db
+            .insert_folder(&Folder {
+                id: "f-crash".into(),
+                name: "Crash".into(),
+                path: "Crash".into(),
+                parent_id: None,
+                locked: true,
+                created_at: "2026-07-16T00:00:00Z".into(),
+            })
+            .unwrap();
+        state
+            .db
+            .set_meeting_folder("m-crashed", Some("f-crash"))
+            .unwrap();
+        assert!(
+            !state.db.raw_segments("m-crashed").unwrap().is_empty(),
+            "precondition: fresh blob-less plaintext segments exist behind the lock"
+        );
+
+        reblank_folder_extras(&state, "f-crash").unwrap();
+
+        assert!(
+            state.db.raw_segments("m-crashed").unwrap().is_empty(),
+            "provably re-derivable blob-less rows (Error status + on-disk audio) are purged"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// LOCK MODEL (2026-07-16 lock-review FAIL on the first #356 cut): the relock purge must
+    /// NEVER destroy the only copy. A COMPLETED (Summarized) meeting whose blob-less plaintext
+    /// landed in a locked folder (kill mid-`move_note`: folder set before the seal) with NO audio
+    /// on disk and NO session KEK is neither retryable nor sealable — the rows must SURVIVE.
+    #[test]
+    fn relock_reblank_never_deletes_the_only_copy_without_proof() {
+        let state = build_state("relock-noloss");
+        seed_meeting(&state.db, "m-only", "# completed meeting", None);
+        state
+            .db
+            .update_meeting_status("m-only", MeetingStatus::Summarized)
+            .unwrap();
+        state
+            .db
+            .insert_folder(&Folder {
+                id: "f-only".into(),
+                name: "Only".into(),
+                path: "Only".into(),
+                parent_id: None,
+                locked: true,
+                created_at: "2026-07-16T00:00:00Z".into(),
+            })
+            .unwrap();
+        state
+            .db
+            .set_meeting_folder("m-only", Some("f-only"))
+            .unwrap();
+
+        reblank_folder_extras(&state, "f-only").unwrap();
+
+        let segs = state.db.raw_segments("m-only").unwrap();
+        assert!(
+            !segs.is_empty() && segs.iter().any(|s| !s.text.is_empty()),
+            "non-rederivable blob-less plaintext is LEFT IN PLACE (a bounded residue beats loss)"
+        );
+    }
+
+    /// Pins the STATUS leg of the delete condition ALONE (adversarial re-review R2): a COMPLETED
+    /// (Summarized) meeting with audio ON DISK still must not be purged — retry refuses non-Error
+    /// status, so deletion would be loss even though the audio survives.
+    #[test]
+    fn relock_reblank_leaves_completed_meeting_even_with_audio_on_disk() {
+        let state = build_state("relock-noloss-status-leg");
+        let dir =
+            std::env::temp_dir().join(format!("murmur-relock-statusleg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let wav = dir.join("m-sum.wav");
+        std::fs::write(&wav, b"RIFF-archived-audio").unwrap();
+
+        seed_meeting(&state.db, "m-sum", "# completed", None);
+        state
+            .db
+            .finalize_meeting("m-sum", "2026-07-16T10:00:00Z", 60, &wav.to_string_lossy())
+            .unwrap();
+        state
+            .db
+            .update_meeting_status("m-sum", MeetingStatus::Summarized)
+            .unwrap();
+        state
+            .db
+            .insert_folder(&Folder {
+                id: "f-sum".into(),
+                name: "Sum".into(),
+                path: "Sum".into(),
+                parent_id: None,
+                locked: true,
+                created_at: "2026-07-16T00:00:00Z".into(),
+            })
+            .unwrap();
+        state.db.set_meeting_folder("m-sum", Some("f-sum")).unwrap();
+
+        reblank_folder_extras(&state, "f-sum").unwrap();
+
+        let segs = state.db.raw_segments("m-sum").unwrap();
+        assert!(
+            !segs.is_empty() && segs.iter().any(|s| !s.text.is_empty()),
+            "a Summarized meeting's blob-less rows survive even with audio on disk (retry refuses non-Error)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Pins the AUDIO leg of the delete condition ALONE (adversarial re-review R3): an Error
+    /// meeting whose archived audio is GONE from disk (pruned/dangling path) must not be purged —
+    /// there is nothing to re-transcribe from, so deletion would be loss.
+    #[test]
+    fn relock_reblank_leaves_error_meeting_whose_audio_is_gone() {
+        let state = build_state("relock-noloss-audio-leg");
+        seed_meeting(&state.db, "m-err", "# failed run", None);
+        state
+            .db
+            .finalize_meeting(
+                "m-err",
+                "2026-07-16T10:00:00Z",
+                60,
+                "/nonexistent/murmur-pruned/m-err.wav",
+            )
+            .unwrap();
+        state
+            .db
+            .update_meeting_status("m-err", MeetingStatus::Error)
+            .unwrap();
+        state
+            .db
+            .insert_folder(&Folder {
+                id: "f-err".into(),
+                name: "Err".into(),
+                path: "Err".into(),
+                parent_id: None,
+                locked: true,
+                created_at: "2026-07-16T00:00:00Z".into(),
+            })
+            .unwrap();
+        state.db.set_meeting_folder("m-err", Some("f-err")).unwrap();
+
+        reblank_folder_extras(&state, "f-err").unwrap();
+
+        let segs = state.db.raw_segments("m-err").unwrap();
+        assert!(
+            !segs.is_empty() && segs.iter().any(|s| !s.text.is_empty()),
+            "an Error meeting's blob-less rows survive when its audio is gone (nothing to re-derive from)"
+        );
+    }
+
+    /// LOCK MODEL (2026-07-16 lock-review fix direction): with the session KEK cached (the
+    /// `relock_folder` path), non-rederivable crash-window plaintext is SEALED in place under the
+    /// folder CK (verify-before-blank) instead of deleted or left plaintext.
+    #[test]
+    fn relock_reblank_seals_non_rederivable_plaintext_when_kek_is_cached() {
+        let state = build_state("relock-sealnet");
+        make_open_folder(&state.db, "f-net", "Net");
+        seed_meeting(&state.db, "m-prior", "# already sealed", Some("f-net"));
+        lock_folder_inner(&state, "f-net".to_string()).unwrap(); // real lock: CK minted + wrapped
+
+        // The mid-move crash shape: a COMPLETED meeting's blob-less plaintext segments appear in
+        // the locked folder (move_note set the folder, died before seal_moved_note).
+        seed_meeting(&state.db, "m-moved", "# moved note", None);
+        state
+            .db
+            .update_meeting_status("m-moved", MeetingStatus::Summarized)
+            .unwrap();
+        state
+            .db
+            .set_meeting_folder("m-moved", Some("f-net"))
+            .unwrap();
+        // Session KEK cached (as after any interactive lock/unlock this session).
+        let kek = secrets::get_or_create_master_kek().unwrap();
+        *state.master_kek.lock().unwrap() = Some(Zeroizing::new(kek));
+
+        reblank_folder_extras(&state, "f-net").unwrap();
+
+        let segs = state.db.raw_segments("m-moved").unwrap();
+        assert!(!segs.is_empty(), "rows survive — sealed, never deleted");
+        assert!(
+            segs.iter().all(|s| s.text_blob.is_some() && s.text.is_empty()),
+            "crash-window rows are sealed in place under the folder CK (blob set, plaintext blanked)"
+        );
+    }
+
+    /// DEFENSE-IN-DEPTH (2026-07-16 review, MEDIUM): the salvage lock finalizer is Drop-armed —
+    /// a panic unwinding out of the pipeline scope still runs it, so the mid-run-relock purge
+    /// cannot be skipped by a crash between the segment insert and the sequential finalizer call.
+    #[test]
+    fn salvage_lock_finalizer_guard_runs_on_a_panic_unwind() {
+        let state = build_state("salvage-guard-panic");
+        seed_meeting(&state.db, "m-panic", "# raced", None);
+        state
+            .db
+            .insert_folder(&Folder {
+                id: "f-panic".into(),
+                name: "Panic".into(),
+                path: "Panic".into(),
+                parent_id: None,
+                locked: true, // locked, NOT session-unlocked → the purge branch
+                created_at: "2026-07-16T00:00:00Z".into(),
+            })
+            .unwrap();
+        state
+            .db
+            .set_meeting_folder("m-panic", Some("f-panic"))
+            .unwrap();
+
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = crate::pipeline::SalvageLockFinalizer {
+                state: &state,
+                meeting_id: "m-panic",
+            };
+            panic!("simulated pipeline death between segment insert and finalizer");
+        }));
+        assert!(unwound.is_err(), "the panic really unwound through the guard scope");
+        assert!(
+            state.db.raw_segments("m-panic").unwrap().is_empty(),
+            "the Drop-armed finalizer purged the unsealed plaintext despite the panic"
+        );
+    }
+
+    /// `finalize_salvage_lock_state` never removes a plaintext WAV WITHOUT a surviving sealed
+    /// `.enc` twin — content preservation beats the purge when no sealed copy exists.
+    #[test]
+    fn finalize_salvage_lock_state_keeps_the_only_audio_copy() {
+        let state = build_state("salvage-finalize-keep");
+        let dir = std::env::temp_dir().join(format!(
+            "murmur-salvage-finalize-keep-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let wav = dir.join("m-only.wav");
+        std::fs::write(&wav, b"RIFF-the-only-copy").unwrap();
+
+        seed_meeting(&state.db, "m-only", "# only", None);
+        state
+            .db
+            .finalize_meeting("m-only", "2026-07-16T10:00:00Z", 60, &wav.to_string_lossy())
+            .unwrap();
+        state
+            .db
+            .insert_folder(&Folder {
+                id: "f-only".into(),
+                name: "Only".into(),
+                path: "Only".into(),
+                parent_id: None,
+                locked: true,
+                created_at: "2026-07-16T00:00:00Z".into(),
+            })
+            .unwrap();
+        state
+            .db
+            .set_meeting_folder("m-only", Some("f-only"))
+            .unwrap();
+
+        finalize_salvage_lock_state(&state, "m-only");
+
+        assert!(
+            wav.exists(),
+            "with no sealed .enc twin the plaintext WAV is the ONLY copy — never deleted"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// BLK-3: an `AppConfigDto` payload that OMITS `mcpRequireToken` deserializes to `true`
+    /// (fail-closed), matching its Stage-E siblings — never silently `false`.
+    #[test]
+    fn dto_omitting_mcp_require_token_defaults_true() {
+        let json = r#"{
+            "providerId":"claude_code",
+            "anthropicModel":"claude-opus-4-8",
+            "ollamaBaseUrl":"http://localhost:11434",
+            "ollamaModel":"llama3.1",
+            "claudeBinary":"claude",
+            "captureSystemAudio":false,
+            "modelSize":"large-v3",
+            "voiceTrigger":false,
+            "onboarded":true,
+            "noteStyle":"standard",
+            "autoOrganize":false,
+            "noteLanguage":"auto"
+        }"#;
+        let dto: AppConfigDto = serde_json::from_str(json).unwrap();
+        assert!(
+            dto.mcp_require_token,
+            "omitted mcpRequireToken must fail closed to true (BLK-3)"
+        );
+        assert!(dto.lock_require_biometric, "Stage-E flags default ON");
+        assert!(dto.relock_on_screenshare, "Stage-E flags default ON");
+        assert!(
+            !dto.cloud_egress_consented,
+            "consent defaults OFF (fail-closed)"
+        );
+        assert!(
+            dto.proactive_hints_enabled,
+            "omitted proactiveHintsEnabled defaults ON (matches AppConfig::default)"
+        );
+        assert!(
+            dto.user_memory_enabled,
+            "omitted userMemoryEnabled defaults ON (matches AppConfig::default)"
+        );
+    }
+
+    /// Proactive brain P1 — the mute toggle round-trips through the settings DTO: `config_to_dto`
+    /// carries it OUT (the FE reads `proactiveHintsEnabled`) and `dto_to_config` takes it IN (the
+    /// FE sets it), so Settings can actually mute the backend scanner.
+    #[test]
+    fn dto_round_trips_proactive_hints_toggle() {
+        // OUT: the DTO reflects the live value.
+        let cfg = AppConfig {
+            proactive_hints_enabled: false,
+            ..Default::default()
+        };
+        assert!(!config_to_dto(&cfg).proactive_hints_enabled);
+
+        // IN: the DTO value lands in the merged config (proven from a differing `current`).
+        let mut dto = config_to_dto(&AppConfig::default());
+        dto.proactive_hints_enabled = false;
+        let current = AppConfig::default(); // ON
+        assert!(
+            !dto_to_config(dto, &current).proactive_hints_enabled,
+            "a settings save must be able to mute the backend scanner"
+        );
+    }
+
+    /// Cross-meeting USER MEMORY — the master gate round-trips through the settings DTO:
+    /// `config_to_dto` carries it OUT (the FE reads `userMemoryEnabled`) and `dto_to_config` takes it
+    /// IN (the FE sets it), so Settings can actually turn memory off in the backend.
+    #[test]
+    fn dto_round_trips_user_memory_toggle() {
+        // OUT: the DTO reflects the live value.
+        let cfg = AppConfig {
+            user_memory_enabled: false,
+            ..Default::default()
+        };
+        assert!(!config_to_dto(&cfg).user_memory_enabled);
+
+        // IN: the DTO value lands in the merged config (proven from a differing `current`).
+        let mut dto = config_to_dto(&AppConfig::default());
+        dto.user_memory_enabled = false;
+        let current = AppConfig::default(); // ON
+        assert!(
+            !dto_to_config(dto, &current).user_memory_enabled,
+            "a settings save must be able to turn cross-meeting memory off"
+        );
+    }
+
+    /// BLK-4: `save_config`'s merge (`dto_to_config`) NEVER lets the DTO set cloud-egress consent —
+    /// an omitting/zeroed save preserves an existing `true`, and a save carrying `true` cannot GRANT
+    /// it. Only `consent_to_cloud_egress` may flip it.
+    #[test]
+    fn save_config_merge_never_clobbers_or_grants_consent() {
+        // (a) preserve an existing grant even when the DTO carries false.
+        let mut dto = config_to_dto(&AppConfig::default());
+        dto.cloud_egress_consented = false;
+        let current = AppConfig {
+            cloud_egress_consented: true,
+            ..AppConfig::default()
+        };
+        assert!(
+            dto_to_config(dto, &current).cloud_egress_consented,
+            "an omitting/false save must NOT clobber an existing consent (BLK-4)"
+        );
+
+        // (b) a save carrying true cannot GRANT consent (default-off stays off).
+        let mut dto2 = config_to_dto(&AppConfig::default());
+        dto2.cloud_egress_consented = true;
+        let current2 = AppConfig::default(); // consent off
+        assert!(
+            !dto_to_config(dto2, &current2).cloud_egress_consented,
+            "a settings save must NEVER grant consent — only the dedicated command may (BLK-4)"
+        );
+    }
+
+    /// Sharing-onboarding gate: `sharing_choice_made` is PRESERVE-ONLY on the settings DTO exactly
+    /// like the consent flags. `config_to_dto` carries the stored value OUT (so the init gateway can
+    /// read it), but `dto_to_config` PRESERVES the live value — a save carrying `false` can't reopen
+    /// an already-made choice, and a save carrying `true` can't set it (only the dedicated
+    /// `mark_sharing_choice_made` command latches it).
+    #[test]
+    fn save_config_merge_never_clobbers_or_sets_sharing_choice_made() {
+        // OUT: config_to_dto reflects the live value.
+        let cfg_made = AppConfig {
+            sharing_choice_made: true,
+            ..AppConfig::default()
+        };
+        assert!(config_to_dto(&cfg_made).sharing_choice_made);
+
+        // (a) an omitting/false save must NOT reopen an already-made choice.
+        let mut dto = config_to_dto(&AppConfig::default());
+        dto.sharing_choice_made = false;
+        let current = AppConfig {
+            sharing_choice_made: true,
+            ..AppConfig::default()
+        };
+        assert!(
+            dto_to_config(dto, &current).sharing_choice_made,
+            "an omitting/false save must NOT clear the first-run sharing latch"
+        );
+
+        // (b) a save carrying true cannot SET the latch (default-off stays off — only the command latches).
+        let mut dto2 = config_to_dto(&AppConfig::default());
+        dto2.sharing_choice_made = true;
+        let current2 = AppConfig::default(); // latch off
+        assert!(
+            !dto_to_config(dto2, &current2).sharing_choice_made,
+            "a settings save must NEVER set the sharing latch — only mark_sharing_choice_made may"
+        );
+    }
+
+    /// brain2 connectors (NEW EGRESS CLASS): `web_search_consented` is PRESERVE-ONLY on the settings
+    /// DTO exactly like `cloud_egress_consented` — an omitting/false save can't clear an existing
+    /// grant, and a save carrying `true` can't grant it. Only `consent_to_web_search` may flip it.
+    #[test]
+    fn save_config_merge_never_clobbers_or_grants_web_search_consent() {
+        // (a) preserve an existing grant even when the DTO carries false.
+        let mut dto = config_to_dto(&AppConfig::default());
+        dto.web_search_consented = false;
+        let current = AppConfig {
+            web_search_consented: true,
+            ..AppConfig::default()
+        };
+        assert!(
+            dto_to_config(dto, &current).web_search_consented,
+            "an omitting/false save must NOT clobber an existing web-search consent"
+        );
+
+        // (b) a save carrying true cannot GRANT consent (default-off stays off).
+        let mut dto2 = config_to_dto(&AppConfig::default());
+        dto2.web_search_consented = true;
+        let current2 = AppConfig::default(); // consent off
+        assert!(
+            !dto_to_config(dto2, &current2).web_search_consented,
+            "a settings save must NEVER grant web-search consent — only the dedicated command may"
+        );
+    }
+
+    /// `web_search_enabled` IS settable from the DTO (unlike the consent flag): config_to_dto carries
+    /// it out, dto_to_config takes it in (proven by starting from a different `current`).
+    #[test]
+    fn dto_takes_web_search_enabled_from_payload() {
+        let dto_on = {
+            let mut d = config_to_dto(&AppConfig::default());
+            d.web_search_enabled = true;
+            d
+        };
+        let current_off = AppConfig::default(); // enabled off
+        assert!(
+            dto_to_config(dto_on, &current_off).web_search_enabled,
+            "web_search_enabled is settable from the DTO"
+        );
+        // And OUT: config_to_dto reflects the live value.
+        let cfg = AppConfig {
+            web_search_enabled: true,
+            ..AppConfig::default()
+        };
+        assert!(config_to_dto(&cfg).web_search_enabled);
+    }
+
+    /// Phase H: the three brain toggles round-trip through the settings DTO. `config_to_dto` carries
+    /// them OUT (so the FE can read them) and `dto_to_config` takes them IN (so the FE can set them),
+    /// for every `BrainBackend` variant + the bool + a known model id.
+    #[test]
+    fn dto_round_trips_brain_backend_realtime_reactions_and_model_id() {
+        for backend in [BrainBackend::Cloud, BrainBackend::Local, BrainBackend::Off] {
+            let cfg = AppConfig {
+                brain_backend: backend,
+                realtime_reactions: true,
+                brain_model_id: Some("bielik-11b-v3".to_string()),
+                ..AppConfig::default()
+            };
+            // OUT: get_config carries the live values to the FE.
+            let dto = config_to_dto(&cfg);
+            assert_eq!(dto.brain_backend, backend);
+            assert!(dto.realtime_reactions);
+            assert_eq!(dto.brain_model_id.as_deref(), Some("bielik-11b-v3"));
+
+            // IN: a settings save sets them from the DTO (start from a DIFFERENT current to prove the
+            // value comes from the DTO, not preservation).
+            let current = AppConfig {
+                brain_backend: BrainBackend::Cloud,
+                realtime_reactions: false,
+                brain_model_id: Some("qwen3-4b-instruct-2507".to_string()),
+                ..AppConfig::default()
+            };
+            let merged = dto_to_config(dto, &current);
+            assert_eq!(merged.brain_backend, backend);
+            assert!(merged.realtime_reactions);
+            assert_eq!(merged.brain_model_id.as_deref(), Some("bielik-11b-v3"));
+        }
+    }
+
+    /// brain2 RAG: `semantic_search_enabled` round-trips BOTH ways through the settings DTO. OUT:
+    /// `config_to_dto` carries the live value so the FE toggle reflects it. IN: `dto_to_config` TAKES
+    /// it from the DTO (settable — unlike `cloud_egress_consented`), proven by starting from a
+    /// different `current` so the merged value can only have come from the DTO.
+    #[test]
+    fn dto_round_trips_semantic_search_enabled_both_ways() {
+        // OUT: true and false both surface on the DTO.
+        let cfg_on = AppConfig {
+            semantic_search_enabled: true,
+            ..AppConfig::default()
+        };
+        assert!(config_to_dto(&cfg_on).semantic_search_enabled);
+        let cfg_off = AppConfig {
+            semantic_search_enabled: false,
+            ..AppConfig::default()
+        };
+        assert!(!config_to_dto(&cfg_off).semantic_search_enabled);
+
+        // IN (set true): DTO=true over current=false ⇒ merged true (the DTO is authoritative).
+        let mut dto_on = config_to_dto(&AppConfig::default());
+        dto_on.semantic_search_enabled = true;
+        let current_off = AppConfig {
+            semantic_search_enabled: false,
+            ..AppConfig::default()
+        };
+        assert!(
+            dto_to_config(dto_on, &current_off).semantic_search_enabled,
+            "semantic_search_enabled MUST be settable from the DTO (turn on)"
+        );
+
+        // IN (clear): DTO=false over current=true ⇒ merged false (settable both directions — NOT
+        // preserve-only like cloud_egress_consented).
+        let mut dto_off = config_to_dto(&AppConfig::default());
+        dto_off.semantic_search_enabled = false;
+        let current_on = AppConfig {
+            semantic_search_enabled: true,
+            ..AppConfig::default()
+        };
+        assert!(
+            !dto_to_config(dto_off, &current_on).semantic_search_enabled,
+            "semantic_search_enabled MUST be settable from the DTO (turn off)"
+        );
+    }
+
+    /// Brain/AI picker: `provider_model` + `provider_effort` round-trip through the settings DTO
+    /// BOTH ways. OUT: `config_to_dto` carries the live values so the FE pickers reflect them. IN:
+    /// `dto_to_config` TAKES them from the DTO (settable — like `anthropic_model`, NOT preserve-only),
+    /// proven by starting from a different `current` so the merged value can only have come from the DTO.
+    #[test]
+    fn dto_round_trips_provider_model_and_effort_both_ways() {
+        // OUT.
+        let cfg = AppConfig {
+            provider_model: "claude-sonnet-4-6".to_string(),
+            provider_effort: "high".to_string(),
+            ..AppConfig::default()
+        };
+        let dto = config_to_dto(&cfg);
+        assert_eq!(dto.provider_model, "claude-sonnet-4-6");
+        assert_eq!(dto.provider_effort, "high");
+
+        // IN (set): DTO values over a DIFFERENT current ⇒ merged values come from the DTO.
+        let mut dto_in = config_to_dto(&AppConfig::default());
+        dto_in.provider_model = "claude-haiku-4-5".to_string();
+        dto_in.provider_effort = "low".to_string();
+        let current = AppConfig {
+            provider_model: "claude-opus-4-8".to_string(),
+            provider_effort: "medium".to_string(),
+            ..AppConfig::default()
+        };
+        let merged = dto_to_config(dto_in, &current);
+        assert_eq!(merged.provider_model, "claude-haiku-4-5");
+        assert_eq!(merged.provider_effort, "low");
+
+        // IN (clear to provider default): DTO="" over current set ⇒ merged "" (settable both ways).
+        let mut dto_clear = config_to_dto(&AppConfig::default());
+        dto_clear.provider_model = String::new();
+        dto_clear.provider_effort = String::new();
+        let current2 = AppConfig {
+            provider_model: "claude-opus-4-8".to_string(),
+            provider_effort: "high".to_string(),
+            ..AppConfig::default()
+        };
+        let merged2 = dto_to_config(dto_clear, &current2);
+        assert_eq!(merged2.provider_model, "");
+        assert_eq!(merged2.provider_effort, "");
+    }
+
+    /// Model roles: the 9 role keys round-trip through the settings DTO BOTH ways (settable, like
+    /// `gateway_model` — NOT preserve-only), and an OLDER FE payload that omits them entirely
+    /// deserializes to `""` (inherit-legacy) — a partial save can never flip a role.
+    #[test]
+    fn dto_round_trips_role_keys_and_omitted_keys_default_empty() {
+        // OUT: config_to_dto carries the live values.
+        let cfg = AppConfig {
+            role_notes_connection: "anthropic".to_string(),
+            role_notes_model: "claude-opus-4-8".to_string(),
+            role_notes_effort: "high".to_string(),
+            role_ask_connection: "ollama".to_string(),
+            role_ask_model: "mistral-small".to_string(),
+            role_live_connection: "off".to_string(),
+            ..AppConfig::default()
+        };
+        let dto = config_to_dto(&cfg);
+        assert_eq!(dto.role_notes_connection, "anthropic");
+        assert_eq!(dto.role_notes_model, "claude-opus-4-8");
+        assert_eq!(dto.role_notes_effort, "high");
+        assert_eq!(dto.role_ask_connection, "ollama");
+        assert_eq!(dto.role_ask_model, "mistral-small");
+        assert_eq!(dto.role_ask_effort, "");
+        assert_eq!(dto.role_live_connection, "off");
+
+        // IN: dto_to_config takes them from the DTO (start from a DIFFERENT current to prove the
+        // value comes from the DTO, not preservation) — including clearing back to "".
+        let current = AppConfig {
+            role_notes_connection: "gateway".to_string(),
+            role_ask_connection: "claude_code".to_string(),
+            role_live_connection: "local".to_string(),
+            role_live_model: "bielik-11b-v3".to_string(),
+            ..AppConfig::default()
+        };
+        let merged = dto_to_config(dto, &current);
+        assert_eq!(merged.role_notes_connection, "anthropic");
+        assert_eq!(merged.role_ask_connection, "ollama");
+        assert_eq!(merged.role_live_connection, "off");
+        assert_eq!(
+            merged.role_live_model, "",
+            "a \"\" role key from the DTO clears the override"
+        );
+
+        // An older FE payload OMITTING the role keys deserializes them to "" (#[serde(default)]).
+        let json = serde_json::to_string(&config_to_dto(&AppConfig::default())).unwrap();
+        let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let obj = v.as_object_mut().unwrap();
+        for k in [
+            "roleNotesConnection",
+            "roleNotesModel",
+            "roleNotesEffort",
+            "roleAskConnection",
+            "roleAskModel",
+            "roleAskEffort",
+            "roleLiveConnection",
+            "roleLiveModel",
+            "roleLiveEffort",
+        ] {
+            assert!(obj.remove(k).is_some(), "DTO must serialize {k}");
+        }
+        let dto_old: AppConfigDto = serde_json::from_value(v).unwrap();
+        assert_eq!(dto_old.role_notes_connection, "");
+        assert_eq!(dto_old.role_ask_connection, "");
+        assert_eq!(dto_old.role_live_connection, "");
+    }
+
+    /// Phase H graceful degradation: a DTO carrying an UNKNOWN `brain_model_id` must NOT be stored —
+    /// the live selection is preserved (no error, no bogus id) — while an unknown/omitted
+    /// `brain_backend` deserializes to the default `Cloud` rather than crashing the save.
+    #[test]
+    fn dto_unknown_brain_model_id_preserved_and_unknown_backend_defaults_cloud() {
+        // (a) unknown model id ⇒ ignored, current selection preserved. The `current` here is the now
+        // RETIRED `qwen2.5-3b`, so this doubles as the installed-base guarantee: a settings save must
+        // not wipe a persisted retired selection (its on-disk GGUF keeps resolving; see reason.rs).
+        let mut dto = config_to_dto(&AppConfig::default());
+        dto.brain_model_id = Some("totally-made-up-model".to_string());
+        let current = AppConfig {
+            brain_model_id: Some("qwen2.5-3b".to_string()),
+            ..AppConfig::default()
+        };
+        assert_eq!(
+            dto_to_config(dto, &current).brain_model_id.as_deref(),
+            Some("qwen2.5-3b"),
+            "an unknown brain_model_id must be ignored, preserving the live selection"
+        );
+
+        // (b) a None model id likewise preserves the current selection (a settings save without a
+        // brain pick must not clear an existing one).
+        let mut dto_none = config_to_dto(&AppConfig::default());
+        dto_none.brain_model_id = None;
+        let current_some = AppConfig {
+            brain_model_id: Some("qwen3-14b".to_string()),
+            ..AppConfig::default()
+        };
+        assert_eq!(
+            dto_to_config(dto_none, &current_some)
+                .brain_model_id
+                .as_deref(),
+            Some("qwen3-14b")
+        );
+
+        // (d) FIX D: a CUSTOM brain_model_path IS settable verbatim (no registry validation — it's a
+        // local file path). It round-trips OUT (config_to_dto) and IN (dto_to_config) unchanged, even
+        // while a bogus brain_model_id is (correctly) ignored on the same save.
+        let cfg_with_path = AppConfig {
+            brain_model_path: Some("/models/custom.gguf".to_string()),
+            ..AppConfig::default()
+        };
+        let dto_path = config_to_dto(&cfg_with_path);
+        assert_eq!(
+            dto_path.brain_model_path.as_deref(),
+            Some("/models/custom.gguf"),
+            "config_to_dto carries the custom path OUT to the FE"
+        );
+        let merged_path = dto_to_config(dto_path, &AppConfig::default());
+        assert_eq!(
+            merged_path.brain_model_path.as_deref(),
+            Some("/models/custom.gguf"),
+            "dto_to_config stores the custom path verbatim (settable, not preserve-only)"
+        );
+
+        // (e) an EMPTY brainModelPath clears the custom path (→ None, fall back to the registry id).
+        let mut dto_empty = config_to_dto(&AppConfig::default());
+        dto_empty.brain_model_path = Some(String::new());
+        let current_path = AppConfig {
+            brain_model_path: Some("/models/old.gguf".to_string()),
+            ..AppConfig::default()
+        };
+        assert_eq!(
+            dto_to_config(dto_empty, &current_path).brain_model_path,
+            None,
+            "an empty brainModelPath clears the custom path"
+        );
+
+        // (f) the FE sends camelCase `brainModelPath`; it must deserialize into the field (and an
+        // omitted value defaults to None). Same minimal-but-valid JSON shape as case (c) below.
+        let json_path = r#"{
+            "providerId":"claude_code","anthropicModel":"claude-opus-4-8",
+            "ollamaBaseUrl":"http://localhost:11434","ollamaModel":"llama3.1","claudeBinary":"claude",
+            "captureSystemAudio":false,"modelSize":"large-v3","voiceTrigger":false,"onboarded":true,
+            "noteStyle":"standard","autoOrganize":false,"noteLanguage":"auto",
+            "brainModelPath":"/m/x.gguf"
+        }"#;
+        let parsed: AppConfigDto = serde_json::from_str(json_path).unwrap();
+        assert_eq!(parsed.brain_model_path.as_deref(), Some("/m/x.gguf"));
+
+        // (c) an unknown/omitted brainBackend token deserializes to the default Cloud (no crash),
+        // then flows through dto_to_config as Cloud.
+        let json = r#"{
+            "providerId":"claude_code","anthropicModel":"claude-opus-4-8",
+            "ollamaBaseUrl":"http://localhost:11434","ollamaModel":"llama3.1","claudeBinary":"claude",
+            "captureSystemAudio":false,"modelSize":"large-v3","voiceTrigger":false,"onboarded":true,
+            "noteStyle":"standard","autoOrganize":false,"noteLanguage":"auto","brainBackend":"bogus"
+        }"#;
+        let dto_bad: AppConfigDto = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            dto_bad.brain_backend,
+            BrainBackend::Cloud,
+            "unknown token → Cloud"
+        );
+        assert!(
+            !dto_bad.realtime_reactions,
+            "omitted realtimeReactions defaults OFF"
+        );
+        assert_eq!(
+            dto_to_config(dto_bad, &AppConfig::default()).brain_backend,
+            BrainBackend::Cloud
+        );
+    }
+
+    // ── brain model registry: select + download-target resolution ───────────────────────────────
+
+    /// `select_brain_model` validates the id against the registry and PERSISTS it; reloading config
+    /// from the DB returns the chosen id. An unknown id is rejected with `InvalidArg` and leaves the
+    /// stored selection untouched.
+    #[test]
+    fn select_brain_model_persists_valid_and_rejects_unknown() {
+        let state = build_state("brain-select");
+
+        select_brain_model_inner(&state, "bielik-11b-v3".to_string()).unwrap();
+        assert_eq!(
+            state.config.lock().unwrap().brain_model_id.as_deref(),
+            Some("bielik-11b-v3")
+        );
+        // Selecting a HEAVY model also wires the class handle so heavy()/Fully-Local uses it.
+        assert_eq!(
+            state.config.lock().unwrap().brain_heavy_model_id.as_deref(),
+            Some("bielik-11b-v3"),
+            "selecting a heavy model must set brain_heavy_model_id (else heavy() ignores the choice)"
+        );
+        // Survives a reload from the settings table.
+        assert_eq!(
+            AppConfig::load(&state.db)
+                .unwrap()
+                .brain_model_id
+                .as_deref(),
+            Some("bielik-11b-v3")
+        );
+
+        // Selecting a LIGHT model wires the light class handle (the Brain-Live path) — the bug this
+        // guards: a light selection that only set brain_model_id left light() on the registry default.
+        select_brain_model_inner(&state, "qwen3-1.7b".to_string()).unwrap();
+        assert_eq!(
+            state.config.lock().unwrap().brain_light_model_id.as_deref(),
+            Some("qwen3-1.7b"),
+            "selecting a light model must set brain_light_model_id (else Realtime Reactions stay stub)"
+        );
+
+        // Unknown id ⇒ InvalidArg, selection unchanged (still the last valid pick, qwen3-1.7b).
+        let err = select_brain_model_inner(&state, "not-a-real-model".to_string()).unwrap_err();
+        assert!(matches!(err, AppError::InvalidArg(_)));
+        assert_eq!(
+            state.config.lock().unwrap().brain_model_id.as_deref(),
+            Some("qwen3-1.7b")
+        );
+    }
+
+    /// `select_embed_model` validates the id, PERSISTS it, and reports `reindex_needed` only when the
+    /// resolved model actually CHANGED (a different model's vectors are stale). Unknown id ⇒
+    /// `InvalidArg` with the selection untouched. Serialized on the embedder-selection global lock;
+    /// restores the default (`None`) at the end so it cannot leak state into parallel tests.
+    #[test]
+    fn select_embed_model_persists_and_flags_reindex() {
+        let _g = crate::embed::EMBED_SELECTION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let state = build_state("embed-select");
+
+        // Selecting the SAME (default) model as the effective one ⇒ no re-index needed.
+        let res = select_embed_model_inner(&state, "multilingual-e5-small".to_string()).unwrap();
+        assert_eq!(res.selected, "multilingual-e5-small");
+        assert!(
+            !res.reindex_needed,
+            "re-selecting the default must not force a re-index"
+        );
+
+        // Switching to mmlw CHANGES the resolved model ⇒ re-index needed; persists + reloads.
+        let res = select_embed_model_inner(&state, "mmlw-retrieval-e5-small".to_string()).unwrap();
+        assert_eq!(res.selected, "mmlw-retrieval-e5-small");
+        assert!(
+            res.reindex_needed,
+            "changing the embed model must flag a re-index"
+        );
+        assert_eq!(
+            state.config.lock().unwrap().embed_model_id.as_deref(),
+            Some("mmlw-retrieval-e5-small")
+        );
+        assert_eq!(
+            AppConfig::load(&state.db)
+                .unwrap()
+                .embed_model_id
+                .as_deref(),
+            Some("mmlw-retrieval-e5-small")
+        );
+
+        // Unknown id ⇒ InvalidArg, selection unchanged.
+        let err = select_embed_model_inner(&state, "not-a-real-embedder".to_string()).unwrap_err();
+        assert!(matches!(err, AppError::InvalidArg(_)));
+        assert_eq!(
+            state.config.lock().unwrap().embed_model_id.as_deref(),
+            Some("mmlw-retrieval-e5-small")
+        );
+
+        // Restore the default so the shared process-global doesn't leak mmlw into other tests.
+        crate::embed::set_selected_embed_model_id(None);
+    }
+
+    /// The download-target resolver rejects an unknown id (the exact guard `download_brain_model`
+    /// enforces before any network I/O) and resolves a known id to its registry URL + a path inside
+    /// the shared models dir.
+    #[test]
+    fn brain_download_target_rejects_unknown_and_resolves_known() {
+        assert!(matches!(
+            brain_download_target("bogus-id"),
+            Err(AppError::InvalidArg(_))
+        ));
+        // A RETIRED id is also rejected by the download target (un-selectable / un-downloadable fresh;
+        // the installed-base file, if present, is only RESOLVED, never re-fetched).
+        assert!(matches!(
+            brain_download_target("qwen2.5-3b"),
+            Err(AppError::InvalidArg(_))
+        ));
+        let (url, dest) = brain_download_target("qwen3-1.7b").unwrap();
+        assert_eq!(
+            url,
+            "https://huggingface.co/bartowski/Qwen_Qwen3-1.7B-GGUF/resolve/main/Qwen_Qwen3-1.7B-Q4_K_M.gguf"
+        );
+        assert!(dest.ends_with("Qwen_Qwen3-1.7B-Q4_K_M.gguf"));
+    }
+
+    // ── rename_folder / delete_folder (folder lifecycle) ────────────────────────────────────────
+
+    /// A fresh, unique temp vault dir for the FS-side rename/delete tests.
+    fn tmp_vault(tag: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "murmur-folderlc-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    /// An [`AppState`] with a REAL temp vault dir configured, so the FS-side of rename/delete (dir
+    /// move/remove + note `.md` move) actually runs (the keyless `build_state` skips it).
+    fn build_state_with_vault(tag: &str, vault: &std::path::Path) -> AppState {
+        let s = build_state(tag);
+        {
+            let mut c = s.config.lock().unwrap();
+            c.vault_path = Some(vault.to_string_lossy().to_string());
+        }
+        s
+    }
+
+    fn make_child_folder(db: &Db, id: &str, name: &str, path: &str, parent_id: &str) {
+        db.insert_folder(&Folder {
+            id: id.to_string(),
+            name: name.to_string(),
+            path: path.to_string(),
+            parent_id: Some(parent_id.to_string()),
+            locked: false,
+            created_at: "2026-06-27T08:30:00Z".to_string(),
+        })
+        .unwrap();
+    }
+
+    /// Renaming an OPEN folder updates `name` + `path`, MOVES the on-disk vault subdir, and re-points
+    /// each note's `exported_path` — content (the `.md` bytes) survives byte-identical.
+    #[test]
+    fn rename_open_folder_moves_dir_and_reprefixes_paths() {
+        let vault = tmp_vault("rename-open");
+        let state = build_state_with_vault("rename-open", &vault);
+
+        // An open folder "Work" with one note whose `.md` lives in <vault>/Work/.
+        make_open_folder(&state.db, "f1", "Work");
+        let work_dir = vault.join("Work");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let md_path = work_dir.join("note.md");
+        std::fs::write(&md_path, "# real content").unwrap();
+        seed_meeting(&state.db, "m1", "# real content", Some("f1"));
+        state
+            .db
+            .set_note_exported_path("m1", "claude_code", &md_path.to_string_lossy())
+            .unwrap();
+
+        let renamed = rename_folder_inner(&state, "f1".into(), "Projects".into()).unwrap();
+        assert_eq!(renamed.name, "Projects");
+        assert_eq!(renamed.path, "Projects");
+
+        // DB row updated.
+        let f = state.db.folder_by_id("f1").unwrap().unwrap();
+        assert_eq!(f.name, "Projects");
+        assert_eq!(f.path, "Projects");
+
+        // On-disk subdir moved (old gone, new present with the SAME bytes).
+        assert!(!work_dir.exists(), "old dir gone after rename");
+        let new_md = vault.join("Projects").join("note.md");
+        assert!(new_md.exists(), "note .md moved into the renamed dir");
+        assert_eq!(std::fs::read_to_string(&new_md).unwrap(), "# real content");
+
+        // exported_path re-pointed under the new dir (compare canonicalized — the stored path is the
+        // canonicalized absolute form, which on macOS is /private/var… vs the test's /var…).
+        let n = state.db.get_latest_note_for_meeting("m1").unwrap().unwrap();
+        let stored = n.exported_path.expect("note still has an exported path");
+        assert_eq!(
+            std::fs::canonicalize(&stored).unwrap(),
+            std::fs::canonicalize(&new_md).unwrap(),
+            "exported_path points at the moved .md"
+        );
+
+        let _ = std::fs::remove_dir_all(&vault);
+    }
+
+    /// Renaming a LOCKED folder is METADATA-ONLY: the row name+path change, but no sealed content is
+    /// touched — `locked` stays true, the `wrapped_key` is unchanged, and the note's `content_blob`
+    /// (the ciphertext) is byte-identical before/after. The blanked plaintext stays blanked.
+    #[test]
+    fn rename_locked_folder_is_metadata_only_and_never_touches_sealed_content() {
+        let vault = tmp_vault("rename-locked");
+        let state = build_state_with_vault("rename-locked", &vault);
+        std::fs::create_dir_all(vault.join("Secret")).unwrap();
+
+        make_open_folder(&state.db, "lf", "Secret");
+        seed_meeting(&state.db, "ms", "# top secret strategy", Some("lf"));
+        lock_folder_inner(&state, "lf".to_string()).unwrap(); // seal it (NOT session-unlocked)
+
+        let wrapped_before = state.db.folder_wrapped_key("lf").unwrap();
+        let blob_before = state.db.sealable_notes_for_meeting("ms").unwrap()[0]
+            .content_blob
+            .clone();
+        assert!(blob_before.is_some(), "sealed note has a content_blob");
+
+        let renamed = rename_folder_inner(&state, "lf".into(), "Vault".into()).unwrap();
+        assert_eq!(renamed.name, "Vault");
+
+        let f = state.db.folder_by_id("lf").unwrap().unwrap();
+        assert!(f.locked, "still sealed after a metadata rename");
+        assert_eq!(f.name, "Vault");
+        assert_eq!(f.path, "Vault");
+        assert_eq!(
+            state.db.folder_wrapped_key("lf").unwrap(),
+            wrapped_before,
+            "the wrapped CK is untouched by a rename"
+        );
+        let after = &state.db.sealable_notes_for_meeting("ms").unwrap()[0];
+        assert_eq!(
+            after.content_blob, blob_before,
+            "ciphertext byte-identical after rename"
+        );
+        assert!(after.markdown.is_empty(), "blanked plaintext stays blanked");
+
+        let _ = std::fs::remove_dir_all(&vault);
+    }
+
+    /// A rename re-prefixes DESCENDANT folder paths too (a child of the renamed folder moves with it).
+    #[test]
+    fn rename_reprefixes_descendant_folder_paths() {
+        let state = build_state("rename-desc"); // no vault → pure DB path rewrite
+        make_open_folder(&state.db, "parent", "Work");
+        make_child_folder(&state.db, "child", "Q3", "Work/Q3", "parent");
+
+        rename_folder_inner(&state, "parent".into(), "Projects".into()).unwrap();
+
+        assert_eq!(
+            state.db.folder_by_id("parent").unwrap().unwrap().path,
+            "Projects"
+        );
+        assert_eq!(
+            state.db.folder_by_id("child").unwrap().unwrap().path,
+            "Projects/Q3",
+            "the child's path moves under the renamed parent"
+        );
+    }
+
+    // ── Export-collision guard ("never clobber external edits") ─────────────
+
+    /// The vault files whose name carries the external-edit preservation marker.
+    fn external_edit_siblings(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.contains("(external edit "))
+            })
+            .collect()
+    }
+
+    /// Simulate a completed export of `md` for the seeded meeting: the on-disk `.md`, the stored
+    /// `exported_path`, and the guard's baseline `exported_hash`.
+    fn seed_exported_note(state: &AppState, mid: &str, path: &std::path::Path, md: &str) {
+        std::fs::write(path, md).unwrap();
+        state
+            .db
+            .set_note_exported_path(mid, "claude_code", &path.to_string_lossy())
+            .unwrap();
+        state
+            .db
+            .set_note_exported_hash(
+                mid,
+                "claude_code",
+                Some(&crate::export::note_content_hash(md)),
+            )
+            .unwrap();
+    }
+
+    /// RED-before-GREEN core of the export-collision guard: an EXTERNAL edit to an exported `.md`
+    /// (the user, or their own vault-side agent) must be preserved as a sibling file when a
+    /// DB-derived full overwrite (`update_note`) lands — never silently destroyed. The canonical
+    /// file then carries the DB content and the stored baseline hash matches it.
+    #[test]
+    fn external_edit_is_preserved_as_sibling_on_overwrite() {
+        let vault = tmp_vault("collision-ext");
+        let state = build_state_with_vault("collision-ext", &vault);
+        seed_meeting(&state.db, "m-ext", "# v1\n", None);
+        let md = vault.join("2026-07-16 0900 - Sync.md");
+        seed_exported_note(&state, "m-ext", &md, "# v1\n");
+
+        // The user's agent rewrites the file in the vault behind Murmur's back.
+        std::fs::write(&md, "# my external edit\n").unwrap();
+
+        update_note_inner(&state, "m-ext", "# v2 from murmur\n").unwrap();
+
+        // Canonical file = the DB-derived content (Murmur stays canonical)…
+        assert_eq!(
+            std::fs::read_to_string(&md).unwrap(),
+            "# v2 from murmur\n",
+            "canonical file carries the DB content"
+        );
+        // …and the external version survives byte-exact as a sibling.
+        let siblings = external_edit_siblings(&vault);
+        assert_eq!(siblings.len(), 1, "exactly one preservation sibling");
+        assert_eq!(
+            std::fs::read_to_string(&siblings[0]).unwrap(),
+            "# my external edit\n",
+            "sibling carries EXACTLY the external bytes"
+        );
+        // The baseline is re-stamped to what Murmur just wrote.
+        assert_eq!(
+            state.db.get_note_exported_hash("m-ext", "claude_code").unwrap(),
+            Some(crate::export::note_content_hash("# v2 from murmur\n")),
+            "stored hash re-baselined to the new canonical content"
+        );
+        let _ = std::fs::remove_dir_all(&vault);
+    }
+
+    /// No external edit (file still matches the stored baseline) ⇒ a full overwrite creates NO
+    /// sibling, and the baseline moves to the new content.
+    #[test]
+    fn no_external_edit_no_sibling() {
+        let vault = tmp_vault("collision-clean");
+        let state = build_state_with_vault("collision-clean", &vault);
+        seed_meeting(&state.db, "m-clean", "# v1\n", None);
+        let md = vault.join("2026-07-16 0900 - Sync.md");
+        seed_exported_note(&state, "m-clean", &md, "# v1\n");
+
+        update_note_inner(&state, "m-clean", "# v2\n").unwrap();
+
+        assert!(
+            external_edit_siblings(&vault).is_empty(),
+            "no sibling when the file was untouched"
+        );
+        assert_eq!(std::fs::read_to_string(&md).unwrap(), "# v2\n");
+        assert_eq!(
+            state.db.get_note_exported_hash("m-clean", "claude_code").unwrap(),
+            Some(crate::export::note_content_hash("# v2\n")),
+            "baseline refreshed after the overwrite"
+        );
+        let _ = std::fs::remove_dir_all(&vault);
+    }
+
+    /// A LEGACY row (exported before the guard shipped → NULL `exported_hash`) is grandfathered:
+    /// the overwrite creates NO sibling even though the file drifted, and the first post-guard
+    /// write stamps the baseline.
+    #[test]
+    fn legacy_null_hash_grandfathered() {
+        let vault = tmp_vault("collision-legacy");
+        let state = build_state_with_vault("collision-legacy", &vault);
+        seed_meeting(&state.db, "m-legacy", "# v1\n", None);
+        let md = vault.join("2026-07-16 0900 - Sync.md");
+        // Legacy export: file + path recorded, but NO baseline hash.
+        std::fs::write(&md, "# drifted legacy content\n").unwrap();
+        state
+            .db
+            .set_note_exported_path("m-legacy", "claude_code", &md.to_string_lossy())
+            .unwrap();
+        assert_eq!(
+            state.db.get_note_exported_hash("m-legacy", "claude_code").unwrap(),
+            None,
+            "legacy row starts with no baseline"
+        );
+
+        update_note_inner(&state, "m-legacy", "# v2\n").unwrap();
+
+        assert!(
+            external_edit_siblings(&vault).is_empty(),
+            "legacy rows are grandfathered — no sibling"
+        );
+        assert_eq!(std::fs::read_to_string(&md).unwrap(), "# v2\n");
+        assert_eq!(
+            state.db.get_note_exported_hash("m-legacy", "claude_code").unwrap(),
+            Some(crate::export::note_content_hash("# v2\n")),
+            "the first post-guard write stamps the baseline"
+        );
+        let _ = std::fs::remove_dir_all(&vault);
+    }
+
+    /// APPEND paths (Re-Truth supersession stamps) read-modify-write the CURRENT file, so they
+    /// respect external edits by construction — they must NOT create a sibling, but they MUST
+    /// refresh the stored baseline to the final written content, or the NEXT full overwrite would
+    /// false-positive an "external edit" sibling out of Murmur's own append.
+    #[test]
+    fn append_paths_refresh_hash() {
+        let vault = tmp_vault("collision-append");
+        let state = build_state_with_vault("collision-append", &vault);
+
+        // SOURCE note (gets the [!superseded] callout) + SUPERSEDING note (gets the backlink),
+        // both at the vault root (open + unlocked).
+        seed_meeting(&state.db, "m-src", "# Kickoff\n", None);
+        let src_md = vault.join("2026-07-01 0900 - Kickoff.md");
+        seed_exported_note(&state, "m-src", &src_md, "# Kickoff\n");
+        seed_meeting(&state.db, "m-sup", "# Review\n", None);
+        let sup_md = vault.join("2026-07-15 0900 - Review.md");
+        seed_exported_note(&state, "m-sup", &sup_md, "# Review\n");
+
+        state
+            .db
+            .record_supersessions(&[crate::storage::models::SupersessionRow {
+                id: "s1".to_string(),
+                superseding_meeting_id: "m-sup".to_string(),
+                source_meeting_id: "m-src".to_string(),
+                entity: "Atlas".to_string(),
+                predicate: "status".to_string(),
+                old_value: "in-progress".to_string(),
+                new_value: "shipped".to_string(),
+                created_at: "2026-07-15T10:00:00Z".to_string(),
+                applied_at: None,
+                source_pre_image: None,
+                superseding_pre_image: None,
+            }])
+            .unwrap();
+
+        let result = apply_supersessions_inner(&state, &["s1".to_string()]).unwrap();
+        assert_eq!(result.applied, 1, "the stamp applied");
+
+        // The append landed on disk, and NO sibling was created (append respects the file).
+        let src_after = std::fs::read_to_string(&src_md).unwrap();
+        assert!(src_after.contains("[!superseded]"), "callout appended");
+        let sup_after = std::fs::read_to_string(&sup_md).unwrap();
+        assert!(sup_after.contains("[!supersedes]"), "backlink appended");
+        assert!(
+            external_edit_siblings(&vault).is_empty(),
+            "append paths never create siblings"
+        );
+        // Baselines re-stamped from the FINAL written content on BOTH sides…
+        assert_eq!(
+            state.db.get_note_exported_hash("m-src", "claude_code").unwrap(),
+            Some(crate::export::note_content_hash(&src_after)),
+            "source baseline matches the on-disk content after the append"
+        );
+        assert_eq!(
+            state.db.get_note_exported_hash("m-sup", "claude_code").unwrap(),
+            Some(crate::export::note_content_hash(&sup_after)),
+            "superseding baseline matches the on-disk content after the append"
+        );
+        // …so a subsequent DB-derived full overwrite sees no phantom external edit.
+        update_note_inner(&state, "m-src", "# Kickoff rewritten\n").unwrap();
+        assert!(
+            external_edit_siblings(&vault).is_empty(),
+            "no false 'external edit' sibling after Murmur's own append"
+        );
+        let _ = std::fs::remove_dir_all(&vault);
+    }
+
+    /// Adversarial regression (RED-before-GREEN) — pre-append external-edit LAUNDERING: when the
+    /// file was externally edited BEFORE a Re-Truth append, the append must NOT re-stamp the
+    /// baseline from the (edit + callout) content it wrote — that would make the next DB-derived
+    /// full overwrite see hash == baseline and silently destroy the external edit with no sibling.
+    /// The stale baseline is kept instead, so the next overwrite preserves the file (external
+    /// edit + appended callout) as a sibling.
+    #[test]
+    fn append_over_external_edit_keeps_stale_baseline_so_overwrite_preserves_sibling() {
+        let vault = tmp_vault("collision-launder");
+        let state = build_state_with_vault("collision-launder", &vault);
+
+        seed_meeting(&state.db, "m-src", "# Kickoff\n", None);
+        let src_md = vault.join("2026-07-01 0900 - Kickoff.md");
+        seed_exported_note(&state, "m-src", &src_md, "# Kickoff\n");
+        // Superseding meeting with NO exported `.md` → only the SOURCE-side append fires.
+        seed_meeting(&state.db, "m-sup2", "# Review\n", None);
+
+        // The user edits the exported file in the vault BEFORE any Re-Truth stamp lands.
+        std::fs::write(&src_md, "# Kickoff\nMY EXTERNAL NOTE\n").unwrap();
+
+        state
+            .db
+            .record_supersessions(&[crate::storage::models::SupersessionRow {
+                id: "s-launder".to_string(),
+                superseding_meeting_id: "m-sup2".to_string(),
+                source_meeting_id: "m-src".to_string(),
+                entity: "Atlas".to_string(),
+                predicate: "status".to_string(),
+                old_value: "in-progress".to_string(),
+                new_value: "shipped".to_string(),
+                created_at: "2026-07-15T10:00:00Z".to_string(),
+                applied_at: None,
+                source_pre_image: None,
+                superseding_pre_image: None,
+            }])
+            .unwrap();
+        let result = apply_supersessions_inner(&state, &["s-launder".to_string()]).unwrap();
+        assert_eq!(result.applied, 1, "the stamp applied");
+
+        // The append itself respects the file: external edit + callout are both on disk, and the
+        // append never creates a sibling.
+        let after_append = std::fs::read_to_string(&src_md).unwrap();
+        assert!(after_append.contains("MY EXTERNAL NOTE"), "edit preserved in place");
+        assert!(after_append.contains("[!superseded]"), "callout appended");
+        assert!(
+            external_edit_siblings(&vault).is_empty(),
+            "the append creates no sibling"
+        );
+        // The baseline must STAY at the pre-edit Murmur write — NOT be laundered to the
+        // (edit + callout) content the append wrote.
+        assert_eq!(
+            state.db.get_note_exported_hash("m-src", "claude_code").unwrap(),
+            Some(crate::export::note_content_hash("# Kickoff\n")),
+            "the baseline is NOT re-stamped over an externally-edited file"
+        );
+
+        // The next DB-derived full overwrite therefore detects the divergence and preserves the
+        // (edit + callout) file as a sibling instead of destroying it.
+        update_note_inner(&state, "m-src", "# Kickoff rewritten\n").unwrap();
+        let siblings = external_edit_siblings(&vault);
+        assert_eq!(siblings.len(), 1, "the external edit survives as a sibling");
+        let preserved = std::fs::read_to_string(&siblings[0]).unwrap();
+        assert!(
+            preserved.contains("MY EXTERNAL NOTE") && preserved.contains("[!superseded]"),
+            "the sibling carries the external edit AND the appended callout: {preserved}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&src_md).unwrap(),
+            "# Kickoff rewritten\n",
+            "canonical file carries the DB content"
+        );
+        let _ = std::fs::remove_dir_all(&vault);
+    }
+
+    // ── Vault Audit — accept/dismiss/list (command layer) ─────────────────────
+
+    /// Stage one pending audit finding directly (the pass is tested in `crate::audit`).
+    #[allow(clippy::too_many_arguments)]
+    fn stage_audit_finding(
+        state: &AppState,
+        kind: &str,
+        source_kind: &str,
+        source_id: &str,
+        target_title: Option<&str>,
+        evidence: &str,
+        accept_action: &str,
+        key: &str,
+    ) -> String {
+        state
+            .db
+            .insert_audit_finding_if_new(
+                &crate::audit::NewAuditFinding {
+                    kind: kind.into(),
+                    source_kind: source_kind.into(),
+                    source_id: source_id.into(),
+                    source_title: "T".into(),
+                    target_title: target_title.map(str::to_string),
+                    target_id: None,
+                    target_kind: None,
+                    evidence_md: evidence.into(),
+                    accept_action: accept_action.into(),
+                    dedupe_key: key.into(),
+                },
+                "r-test",
+                1,
+            )
+            .unwrap();
+        state
+            .db
+            .list_audit_finding_rows("pending")
+            .unwrap()
+            .into_iter()
+            .find(|r| r.dedupe_key == key)
+            .unwrap()
+            .id
+    }
+
+    /// Stage a pending finding CARRYING a target id+kind (the list layer's target re-gate seam).
+    fn stage_audit_finding_with_target(
+        state: &AppState,
+        source_id: &str,
+        target_id: &str,
+        target_kind: &str,
+        key: &str,
+    ) -> String {
+        state
+            .db
+            .insert_audit_finding_if_new(
+                &crate::audit::NewAuditFinding {
+                    kind: "unlinked_mention".into(),
+                    source_kind: "meeting".into(),
+                    source_id: source_id.into(),
+                    source_title: "T".into(),
+                    target_title: Some("Sealed Target Title".into()),
+                    target_id: Some(target_id.into()),
+                    target_kind: Some(target_kind.into()),
+                    evidence_md: "> mentions Sealed Target Title".into(),
+                    accept_action: "Append the suggested [[link]] under ## Audit".into(),
+                    dedupe_key: key.into(),
+                },
+                "r-test",
+                1,
+            )
+            .unwrap();
+        state
+            .db
+            .list_audit_finding_rows("pending")
+            .unwrap()
+            .into_iter()
+            .find(|r| r.dedupe_key == key)
+            .unwrap()
+            .id
+    }
+
+    /// Accept appends the callout under `## Audit`, re-stamps the baseline (clean case), blanks
+    /// the evidence, and a SECOND identical accept is refused while a re-staged twin's accept is
+    /// an idempotent no-op on the file.
+    #[test]
+    fn audit_accept_appends_stamp_blanks_evidence_and_is_idempotent() {
+        let vault = tmp_vault("audit-accept");
+        let state = build_state_with_vault("audit-accept", &vault);
+        seed_meeting(&state.db, "m-a", "# Kickoff\n", None);
+        let md = vault.join("2026-07-01 0900 - Kickoff.md");
+        seed_exported_note(&state, "m-a", &md, "# Kickoff\n");
+
+        let id = stage_audit_finding(
+            &state,
+            "broken_link",
+            "meeting",
+            "m-a",
+            Some("Ghost Note"),
+            "> see [[Ghost Note]]",
+            "Append a [!broken-link] note under ## Audit",
+            "broken_link|m-a|Ghost Note",
+        );
+        let resolved = resolve_audit_finding_inner(&state, &id, "accept").unwrap();
+        assert_eq!(resolved.status, "accepted");
+        assert!(resolved.evidence_md.is_empty(), "accept blanks the evidence");
+        assert!(resolved.accept_action.is_empty());
+
+        let after = std::fs::read_to_string(&md).unwrap();
+        assert!(after.contains("## Audit"), "managed section created: {after}");
+        assert!(after.contains("[!broken-link]"), "callout appended: {after}");
+        assert!(after.contains("`[[Ghost Note]]`"), "target in a code span: {after}");
+        assert_eq!(
+            state.db.get_note_exported_hash("m-a", "claude_code").unwrap(),
+            Some(crate::export::note_content_hash(&after)),
+            "clean-case baseline re-stamped from the appended content"
+        );
+        assert!(external_edit_siblings(&vault).is_empty(), "append creates no sibling");
+
+        // Already handled → refused.
+        assert!(matches!(
+            resolve_audit_finding_inner(&state, &id, "accept"),
+            Err(AppError::InvalidArg(_))
+        ));
+        // An ACCEPTED twin may recur (dedupe allows it); accepting the recurrence is an
+        // idempotent no-op on the file (the callout body is the marker).
+        let id2 = stage_audit_finding(
+            &state,
+            "broken_link",
+            "meeting",
+            "m-a",
+            Some("Ghost Note"),
+            "> see [[Ghost Note]]",
+            "Append a [!broken-link] note under ## Audit",
+            "broken_link|m-a|Ghost Note",
+        );
+        resolve_audit_finding_inner(&state, &id2, "accept").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&md).unwrap(),
+            after,
+            "re-accepting the same finding never double-stamps"
+        );
+        let _ = std::fs::remove_dir_all(&vault);
+    }
+
+    /// The external-edit interplay (mirrors
+    /// `append_over_external_edit_keeps_stale_baseline_so_overwrite_preserves_sibling`): an
+    /// audit accept over an externally-edited file appends in place but must NOT launder the
+    /// baseline — the next DB-derived full overwrite preserves (edit + stamp) as a sibling.
+    #[test]
+    fn audit_accept_over_external_edit_keeps_stale_baseline() {
+        let vault = tmp_vault("audit-launder");
+        let state = build_state_with_vault("audit-launder", &vault);
+        seed_meeting(&state.db, "m-a", "# Kickoff\n", None);
+        let md = vault.join("2026-07-01 0900 - Kickoff.md");
+        seed_exported_note(&state, "m-a", &md, "# Kickoff\n");
+        // The user edits the exported file BEFORE the accept lands.
+        std::fs::write(&md, "# Kickoff\nMY EXTERNAL NOTE\n").unwrap();
+
+        let id = stage_audit_finding(
+            &state,
+            "broken_link",
+            "meeting",
+            "m-a",
+            Some("Ghost Note"),
+            "> see [[Ghost Note]]",
+            "Append a [!broken-link] note under ## Audit",
+            "broken_link|m-a|Ghost Note",
+        );
+        resolve_audit_finding_inner(&state, &id, "accept").unwrap();
+
+        let after = std::fs::read_to_string(&md).unwrap();
+        assert!(after.contains("MY EXTERNAL NOTE"), "edit preserved in place");
+        assert!(after.contains("[!broken-link]"), "stamp appended");
+        assert!(external_edit_siblings(&vault).is_empty(), "the append creates no sibling");
+        assert_eq!(
+            state.db.get_note_exported_hash("m-a", "claude_code").unwrap(),
+            Some(crate::export::note_content_hash("# Kickoff\n")),
+            "baseline NOT laundered over the externally-edited file"
+        );
+        // The next full overwrite preserves (edit + stamp) as a sibling.
+        update_note_inner(&state, "m-a", "# Kickoff rewritten\n").unwrap();
+        let siblings = external_edit_siblings(&vault);
+        assert_eq!(siblings.len(), 1, "external edit + stamp survive as a sibling");
+        let preserved = std::fs::read_to_string(&siblings[0]).unwrap();
+        assert!(preserved.contains("MY EXTERNAL NOTE") && preserved.contains("[!broken-link]"));
+        let _ = std::fs::remove_dir_all(&vault);
+    }
+
+    /// Dismiss blanks the evidence with NO vault write; accepting a finding whose source folder
+    /// sealed between pass and resolve is REFUSED with `Locked` (the row stays pending); the
+    /// list defensively hides a finding whose folder sealed between pass and list.
+    #[test]
+    fn audit_dismiss_locked_accept_and_list_regating() {
+        let vault = tmp_vault("audit-gate");
+        let state = build_state_with_vault("audit-gate", &vault);
+        make_open_folder(&state.db, "f1", "Secret");
+        seed_meeting(&state.db, "m-a", "# Kickoff\n", Some("f1"));
+        let md = vault.join("2026-07-01 0900 - Kickoff.md");
+        seed_exported_note(&state, "m-a", &md, "# Kickoff\n");
+
+        // Dismiss path: no vault write, evidence blanked.
+        let id_dismiss = stage_audit_finding(
+            &state,
+            "orphan",
+            "meeting",
+            "m-a",
+            None,
+            "This note has no wikilinks in or out.",
+            "",
+            "orphan|m-a|",
+        );
+        let before = std::fs::read_to_string(&md).unwrap();
+        let resolved = resolve_audit_finding_inner(&state, &id_dismiss, "dismiss").unwrap();
+        assert_eq!(resolved.status, "dismissed");
+        assert!(resolved.evidence_md.is_empty());
+        assert_eq!(std::fs::read_to_string(&md).unwrap(), before, "dismiss never writes");
+
+        // Accepting a dismiss-only finding is refused.
+        let id_dismiss_only = stage_audit_finding(
+            &state, "orphan", "meeting", "m-a", None, "no links", "", "orphan|m-a|2",
+        );
+        assert!(matches!(
+            resolve_audit_finding_inner(&state, &id_dismiss_only, "accept"),
+            Err(AppError::InvalidArg(_))
+        ));
+
+        // Seal the folder DIRECTLY at the DB layer — simulating the pass→resolve race window
+        // where the disk-truth flipped but this row was staged in between (the command-level
+        // seal would have purged it; the TOCTOU re-gate must hold regardless).
+        let id_locked = stage_audit_finding(
+            &state,
+            "broken_link",
+            "meeting",
+            "m-a",
+            Some("Ghost Note"),
+            "> see [[Ghost Note]]",
+            "Append a [!broken-link] note under ## Audit",
+            "broken_link|m-a|Ghost Note",
+        );
+        state.db.set_folder_locked("f1", true, None).unwrap();
+        assert!(matches!(
+            resolve_audit_finding_inner(&state, &id_locked, "accept"),
+            Err(AppError::Locked(_))
+        ));
+        let row = state.db.get_audit_finding(&id_locked).unwrap().unwrap();
+        assert_eq!(row.status, "pending", "a refused accept leaves the row pending");
+        assert!(!row.evidence_md.is_empty(), "…with its evidence intact");
+
+        // The LIST defensively hides it (source no longer visible), while an open-source
+        // finding still lists.
+        seed_meeting(&state.db, "m-open", "# Open\n", None);
+        stage_audit_finding(
+            &state, "orphan", "meeting", "m-open", None, "no links", "", "orphan|m-open|",
+        );
+        let listed = list_audit_findings_inner(&state, None).unwrap();
+        assert_eq!(listed.len(), 1, "sealed-source finding hidden: {listed:#?}");
+        assert_eq!(listed[0].source_id, "m-open");
+        let _ = std::fs::remove_dir_all(&vault);
+    }
+
+    /// The anti-hallucination re-check: accepting an unlinked-mention whose target no longer
+    /// resolves is refused (never append a dead `[[link]]`); a resolvable target appends the
+    /// suggested-link line under `## Audit`.
+    #[test]
+    fn audit_unlinked_mention_accept_reresolves_target() {
+        let vault = tmp_vault("audit-mention");
+        let state = build_state_with_vault("audit-mention", &vault);
+        seed_meeting(&state.db, "m-src", "# Kickoff\n", None);
+        let md = vault.join("2026-07-01 0900 - Kickoff.md");
+        seed_exported_note(&state, "m-src", &md, "# Kickoff\n");
+
+        // Target that resolves: another visible meeting with that exact title.
+        db_insert_titled_meeting(&state.db, "m-t", "Project Atlas Review");
+        let id_ok = stage_audit_finding(
+            &state,
+            "unlinked_mention",
+            "meeting",
+            "m-src",
+            Some("Project Atlas Review"),
+            "> mentioned Project Atlas Review\n\nSuggested link: [[Project Atlas Review]]",
+            "Append the suggested [[link]] under ## Audit",
+            "unlinked_mention|m-src|Project Atlas Review",
+        );
+        resolve_audit_finding_inner(&state, &id_ok, "accept").unwrap();
+        let after = std::fs::read_to_string(&md).unwrap();
+        assert!(
+            after.contains("- Suggested link: [[Project Atlas Review]]"),
+            "link line appended: {after}"
+        );
+
+        // Target that does NOT resolve anywhere → refused, row stays pending.
+        let id_gone = stage_audit_finding(
+            &state,
+            "unlinked_mention",
+            "meeting",
+            "m-src",
+            Some("Vanished Note Title"),
+            "> mentioned Vanished Note Title\n\nSuggested link: [[Vanished Note Title]]",
+            "Append the suggested [[link]] under ## Audit",
+            "unlinked_mention|m-src|Vanished Note Title",
+        );
+        assert!(matches!(
+            resolve_audit_finding_inner(&state, &id_gone, "accept"),
+            Err(AppError::InvalidArg(_))
+        ));
+        assert_eq!(
+            state.db.get_audit_finding(&id_gone).unwrap().unwrap().status,
+            "pending"
+        );
+        let _ = std::fs::remove_dir_all(&vault);
+    }
+
+    /// LIVE BUG (2026-07-16): accept on a NEVER-exported Brain note (documents kind='note',
+    /// created in-app — no vault `.md`) must succeed by writing through the note's CANONICAL
+    /// store, and — with a vault configured — the re-export MATERIALIZES the `.md` with the
+    /// appended content + a fresh baseline. Today it fails `InvalidArg: no exported vault file`.
+    #[test]
+    fn audit_accept_on_never_exported_note_stamps_canonical_text() {
+        let vault = tmp_vault("audit-noexport");
+        let state = build_state_with_vault("audit-noexport", &vault);
+        make_open_folder(&state.db, "fn1", "Notes");
+        state
+            .db
+            .insert_document("n1", "fn1", "My Brain Note", "# My Brain Note\nbody\n", "note", 1)
+            .unwrap();
+        // A resolvable suggestion target for the orphan accept's anti-hallucination re-check.
+        db_insert_titled_meeting(&state.db, "m-t", "Weekly Planning Sync");
+
+        // Orphan accept (suggestions live in the evidence as [[links]]).
+        let id = stage_audit_finding(
+            &state,
+            "orphan",
+            "note",
+            "n1",
+            None,
+            "This note has no wikilinks in or out.\n\nSuggested connections: [[Weekly Planning Sync]]",
+            "Append suggested [[links]] under ## Audit",
+            "orphan|n1|",
+        );
+        let resolved = resolve_audit_finding_inner(&state, &id, "accept").unwrap();
+        assert_eq!(resolved.status, "accepted");
+        assert!(resolved.evidence_md.is_empty(), "accept blanks the evidence");
+
+        // The CANONICAL text carries the managed section + the resolving link.
+        let row = state.db.get_note_row("n1").unwrap().unwrap();
+        assert!(row.text.contains("## Audit"), "managed section in DB text: {}", row.text);
+        assert!(
+            row.text.contains("- Suggested links: [[Weekly Planning Sync]]"),
+            "suggested link in DB text: {}",
+            row.text
+        );
+        // The vault file MATERIALIZED (export healed the never-exported note).
+        let path = row.exported_path.expect("re-export set exported_path");
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(on_disk, row.text, "the exported file mirrors the canonical text");
+        assert_eq!(
+            state.db.get_note_doc_exported_hash("n1").unwrap(),
+            Some(crate::export::note_content_hash(&row.text)),
+            "fresh baseline stamped by the re-export"
+        );
+        let _ = std::fs::remove_dir_all(&vault);
+    }
+
+    /// Same live bug, unlinked_mention shape: the target re-resolves and the suggested-link line
+    /// lands in the CANONICAL text; a second accept of a re-staged twin is an idempotent no-op
+    /// (the marker lives in the DB text now).
+    #[test]
+    fn audit_unlinked_mention_accept_on_note_is_canonical_and_idempotent() {
+        let vault = tmp_vault("audit-noexport-mention");
+        let state = build_state_with_vault("audit-noexport-mention", &vault);
+        make_open_folder(&state.db, "fn1", "Notes");
+        state
+            .db
+            .insert_document("n1", "fn1", "My Brain Note", "# mentions Weekly Planning Sync\n", "note", 1)
+            .unwrap();
+        db_insert_titled_meeting(&state.db, "m-t", "Weekly Planning Sync");
+
+        let stage = |key: &str| {
+            stage_audit_finding(
+                &state,
+                "unlinked_mention",
+                "note",
+                "n1",
+                Some("Weekly Planning Sync"),
+                "> mentions Weekly Planning Sync\n\nSuggested link: [[Weekly Planning Sync]]",
+                "Append the suggested [[link]] under ## Audit",
+                key,
+            )
+        };
+        let id = stage("unlinked_mention|n1|wps");
+        resolve_audit_finding_inner(&state, &id, "accept").unwrap();
+        let text_after = state.db.get_note_row("n1").unwrap().unwrap().text;
+        assert!(
+            text_after.contains("- Suggested link: [[Weekly Planning Sync]]"),
+            "link line in DB text: {text_after}"
+        );
+
+        // Idempotence: an accepted twin recurs (dedupe allows it); accepting it again changes
+        // NOTHING (the marker is the line already present in the canonical text).
+        let id2 = stage("unlinked_mention|n1|wps");
+        resolve_audit_finding_inner(&state, &id2, "accept").unwrap();
+        assert_eq!(
+            state.db.get_note_row("n1").unwrap().unwrap().text,
+            text_after,
+            "double-accept never double-stamps the canonical text"
+        );
+        let _ = std::fs::remove_dir_all(&vault);
+    }
+
+    /// A sealed-and-not-session-unlocked note refuses accept with `Locked` and the row stays
+    /// pending (unchanged posture — now enforced by the gated canonical read).
+    #[test]
+    fn audit_accept_on_sealed_note_refuses_locked() {
+        let state = build_state("audit-note-sealed");
+        make_open_folder(&state.db, "fn1", "Secret");
+        state
+            .db
+            .insert_document("n1", "fn1", "Sealed Note", "# sealed body\n", "note", 1)
+            .unwrap();
+        let id = stage_audit_finding(
+            &state,
+            "orphan",
+            "note",
+            "n1",
+            None,
+            "Suggested connections: [[Whatever Note]]",
+            "Append suggested [[links]] under ## Audit",
+            "orphan|n1|sealed",
+        );
+        state.db.set_folder_locked("fn1", true, None).unwrap();
+        assert!(matches!(
+            resolve_audit_finding_inner(&state, &id, "accept"),
+            Err(AppError::Locked(_))
+        ));
+        assert_eq!(
+            state.db.get_audit_finding(&id).unwrap().unwrap().status,
+            "pending",
+            "a refused accept leaves the row pending"
+        );
+    }
+
+    /// Guard interplay on an EXPORTED note with an EXTERNAL file edit: the accept stamps the
+    /// CANONICAL text and re-exports; `write_note` NEVER clobbers different bytes, so the
+    /// externally-edited file survives byte-identical (the re-export lands on a fresh sibling
+    /// path) — no external data is ever lost.
+    #[test]
+    fn audit_accept_on_externally_edited_exported_note_never_clobbers() {
+        let vault = tmp_vault("audit-note-extedit");
+        let state = build_state_with_vault("audit-note-extedit", &vault);
+        make_open_folder(&state.db, "fn1", "Notes");
+        state
+            .db
+            .insert_document("n1", "fn1", "My Note", "# My Note\n", "note", 1)
+            .unwrap();
+        db_insert_titled_meeting(&state.db, "m-t", "Weekly Planning Sync");
+        // Simulate a completed export: file + path + baseline.
+        let md = vault.join("My Note.md");
+        std::fs::write(&md, "# My Note\n").unwrap();
+        state
+            .db
+            .set_note_doc_exported_path("n1", Some(&md.to_string_lossy()))
+            .unwrap();
+        state
+            .db
+            .set_note_doc_exported_hash("n1", Some(&crate::export::note_content_hash("# My Note\n")))
+            .unwrap();
+        // The user edits the exported file behind Murmur's back.
+        std::fs::write(&md, "# My Note\nMY EXTERNAL NOTE\n").unwrap();
+
+        let id = stage_audit_finding(
+            &state,
+            "unlinked_mention",
+            "note",
+            "n1",
+            Some("Weekly Planning Sync"),
+            "> mention\n\nSuggested link: [[Weekly Planning Sync]]",
+            "Append the suggested [[link]] under ## Audit",
+            "unlinked_mention|n1|ext",
+        );
+        resolve_audit_finding_inner(&state, &id, "accept").unwrap();
+
+        // Canonical text stamped…
+        let row = state.db.get_note_row("n1").unwrap().unwrap();
+        assert!(row.text.contains("[[Weekly Planning Sync]]"), "stamp in DB text");
+        // …the externally-edited file is UNTOUCHED byte-identical…
+        assert_eq!(
+            std::fs::read_to_string(&md).unwrap(),
+            "# My Note\nMY EXTERNAL NOTE\n",
+            "the external edit is never clobbered"
+        );
+        // …and the re-export landed the stamped content on a fresh path with a fresh baseline.
+        let new_path = row.exported_path.expect("re-export recorded a path");
+        assert_ne!(
+            std::path::Path::new(&new_path).canonicalize().ok(),
+            md.canonicalize().ok(),
+            "the re-export did not reuse the externally-edited file"
+        );
+        assert_eq!(std::fs::read_to_string(&new_path).unwrap(), row.text);
+        assert_eq!(
+            state.db.get_note_doc_exported_hash("n1").unwrap(),
+            Some(crate::export::note_content_hash(&row.text))
+        );
+        let _ = std::fs::remove_dir_all(&vault);
+    }
+
+    /// Minimal titled-meeting seed for wikilink-resolution targets (no note needed beyond one
+    /// row so `list_meetings_visible` keeps it).
+    fn db_insert_titled_meeting(db: &Db, id: &str, title: &str) {
+        db.insert_meeting(&crate::storage::models::Meeting {
+            id: id.to_string(),
+            started_at: "2026-07-02T09:00:00Z".to_string(),
+            ended_at: None,
+            title: Some(title.to_string()),
+            duration_s: 60,
+            audio_path: None,
+            status: crate::storage::models::MeetingStatus::Summarized,
+            folder_id: None,
+        })
+        .unwrap();
+    }
+
+    /// Lock review: accepting a broken_link whose target NOW resolves must refuse (the stamp
+    /// would assert a falsehood) — loss-safe: nothing written, the row stays pending.
+    #[test]
+    fn audit_broken_link_accept_refuses_when_target_now_resolves() {
+        let vault = tmp_vault("audit-resolves-now");
+        let state = build_state_with_vault("audit-resolves-now", &vault);
+        seed_meeting(&state.db, "m-src", "# Kickoff\n", None);
+        let md = vault.join("2026-07-01 0900 - Kickoff.md");
+        seed_exported_note(&state, "m-src", &md, "# Kickoff\n");
+        // The once-missing target EXISTS by accept time (created after the pass staged it).
+        db_insert_titled_meeting(&state.db, "m-t", "Now Existing Note");
+
+        let id = stage_audit_finding(
+            &state,
+            "broken_link",
+            "meeting",
+            "m-src",
+            Some("Now Existing Note"),
+            "> see [[Now Existing Note]]",
+            "Append a [!broken-link] note under ## Audit",
+            "broken_link|m-src|now-existing",
+        );
+        let before = std::fs::read_to_string(&md).unwrap();
+        assert!(matches!(
+            resolve_audit_finding_inner(&state, &id, "accept"),
+            Err(AppError::InvalidArg(_))
+        ));
+        assert_eq!(
+            std::fs::read_to_string(&md).unwrap(),
+            before,
+            "a refused accept writes nothing"
+        );
+        assert_eq!(
+            state.db.get_audit_finding(&id).unwrap().unwrap().status,
+            "pending",
+            "the row stays pending (the user dismisses or re-runs the audit)"
+        );
+        let _ = std::fs::remove_dir_all(&vault);
+    }
+
+    /// Lock review (defense in depth): the list also re-gates the TARGET side — a pending finding
+    /// whose target's folder sealed between pass and list is hidden (its title/evidence reference
+    /// the now-sealed content), while purge-on-seal remains the primary cleaner.
+    #[test]
+    fn audit_list_hides_pending_finding_whose_target_sealed() {
+        let state = build_state("audit-target-gate");
+        make_open_folder(&state.db, "f1", "Secret");
+        seed_meeting(&state.db, "m-t", "# target body\n", Some("f1"));
+        seed_meeting(&state.db, "m-src", "# open body\n", None);
+        stage_audit_finding_with_target(&state, "m-src", "m-t", "meeting", "k-target-gate");
+        stage_audit_finding(
+            &state, "orphan", "meeting", "m-src", None, "no links", "", "k-keep",
+        );
+
+        // Both list while the target folder is open.
+        assert_eq!(list_audit_findings_inner(&state, None).unwrap().len(), 2);
+
+        // Seal the TARGET's folder db-level only (simulating the pass→list race window the
+        // in-tx purge did not see because the row was staged in between).
+        state.db.set_folder_locked("f1", true, None).unwrap();
+        let listed = list_audit_findings_inner(&state, None).unwrap();
+        assert_eq!(listed.len(), 1, "sealed-target finding hidden: {listed:#?}");
+        assert_eq!(listed[0].id, {
+            let rows = state.db.list_audit_finding_rows("pending").unwrap();
+            rows.iter().find(|r| r.dedupe_key == "k-keep").unwrap().id.clone()
+        });
+    }
+
+    /// Stage a pending finding whose target is UNTYPED (`target_id` set, `target_kind` NULL) —
+    /// the shape a pre-`target_kind` DB row (or a bug upstream) would take. Returns the row id.
+    fn stage_untyped_target_finding(state: &AppState, source_id: &str, target_id: &str) -> String {
+        state
+            .db
+            .insert_audit_finding_if_new(
+                &crate::audit::NewAuditFinding {
+                    kind: "unlinked_mention".into(),
+                    source_kind: "meeting".into(),
+                    source_id: source_id.into(),
+                    source_title: "T".into(),
+                    target_title: Some("Sealed Target Title".into()),
+                    target_id: Some(target_id.into()),
+                    target_kind: None,
+                    evidence_md: "> mentions Sealed Target Title".into(),
+                    accept_action: "".into(),
+                    dedupe_key: "k-untyped".into(),
+                },
+                "r-test",
+                1,
+            )
+            .unwrap();
+        state
+            .db
+            .list_audit_finding_rows("pending")
+            .unwrap()
+            .into_iter()
+            .find(|r| r.dedupe_key == "k-untyped")
+            .unwrap()
+            .id
+    }
+
+    /// RED-first (lock-review NIT, 2026-07-16): a pending row carrying `target_id` but NO
+    /// `target_kind` cannot be target-re-gated — the list must FAIL CLOSED (hide it), not skip
+    /// the target check. The old inline `if let (Some, Some)` fell OPEN exactly when the target
+    /// sealed: this row's title/evidence reference the sealed note and would still be served.
+    #[test]
+    fn audit_list_hides_untyped_target_rows_fail_closed() {
+        let state = build_state("audit-untyped-target");
+        make_open_folder(&state.db, "f1", "Secret");
+        seed_meeting(&state.db, "m-t", "# target body\n", Some("f1"));
+        seed_meeting(&state.db, "m-src", "# open body\n", None);
+        // Seal FIRST, then stage (the TOCTOU-orphan shape the re-gate exists for — the seal's
+        // own purge ran before this row existed).
+        state.db.set_folder_locked("f1", true, None).unwrap();
+        stage_untyped_target_finding(&state, "m-src", "m-t");
+
+        let listed = list_audit_findings_inner(&state, None).unwrap();
+        assert!(
+            listed.is_empty(),
+            "an untyped-target row must be hidden (fail closed): {listed:#?}"
+        );
+    }
+
+    // ── Vault Audit Phase 3 — schedule + explain (command layer) ─────────────
+
+    /// `get_audit_schedule` / `set_audit_schedule`: default ON; `lastRunAt`/`nextDueAt` derive
+    /// from the SCHEDULED claim rows only; disable persists durably and clears `nextDueAt`.
+    #[test]
+    fn audit_schedule_get_set_round_trips() {
+        let state = build_state("audit-sched");
+        let s = get_audit_schedule_inner(&state).unwrap();
+        assert!(s.enabled, "weekly audit defaults ON");
+        assert_eq!(s.last_run_at, None);
+        assert_eq!(s.next_due_at, None, "never-ran ⇒ due at the next hourly check");
+
+        // A scheduled claim stamps lastRunAt and derives nextDueAt = last + 7 days.
+        state
+            .db
+            .insert_scheduled_audit_run_claim("c1", 1_700_000_000_000)
+            .unwrap();
+        let s = get_audit_schedule_inner(&state).unwrap();
+        assert_eq!(s.last_run_at, Some(1_700_000_000_000));
+        assert_eq!(
+            s.next_due_at,
+            Some(1_700_000_000_000 + crate::audit::WEEKLY_AUDIT_INTERVAL_MS)
+        );
+
+        // Disable → persists (a fresh load sees it) + nextDueAt clears; re-enable restores.
+        let s = set_audit_schedule_inner(&state, false).unwrap();
+        assert!(!s.enabled);
+        assert_eq!(s.next_due_at, None, "disabled ⇒ no next due time");
+        assert!(
+            !AppConfig::load(&state.db).unwrap().vault_audit_weekly_enabled,
+            "the opt-out persists durably"
+        );
+        let s = set_audit_schedule_inner(&state, true).unwrap();
+        assert!(s.enabled);
+        assert_eq!(
+            s.next_due_at,
+            Some(1_700_000_000_000 + crate::audit::WEEKLY_AUDIT_INTERVAL_MS),
+            "re-enable derives from the surviving claim row"
+        );
+    }
+
+    /// `explain_audit_finding` gate matrix: missing id → InvalidArg; already-resolved →
+    /// InvalidArg; sealed-since source → Locked; untyped target (target_id without target_kind)
+    /// → Locked (fail closed — the same rule the list re-gate enforces).
+    #[test]
+    fn explain_gate_refuses_missing_resolved_locked_and_untyped() {
+        let state = build_state("explain-gate");
+
+        // Missing.
+        assert!(matches!(
+            block_on(explain_audit_finding_inner(&state, "nope")),
+            Err(AppError::InvalidArg(_))
+        ));
+
+        // Already resolved.
+        seed_meeting(&state.db, "m-open", "# open body\n", None);
+        let id = stage_audit_finding(
+            &state, "stale", "meeting", "m-open", None, "> ev", "", "k-exp-resolved",
+        );
+        state
+            .db
+            .resolve_audit_finding_row(&id, "dismissed", 5)
+            .unwrap();
+        assert!(matches!(
+            block_on(explain_audit_finding_inner(&state, &id)),
+            Err(AppError::InvalidArg(_))
+        ));
+
+        // Sealed-since source (staged after the seal — the orphan shape) → Locked.
+        make_open_folder(&state.db, "f-exp", "Secret");
+        seed_meeting(&state.db, "m-sealed", "# sealed body\n", Some("f-exp"));
+        state.db.set_folder_locked("f-exp", true, None).unwrap();
+        let id_locked = stage_audit_finding(
+            &state, "stale", "meeting", "m-sealed", None, "> ev", "", "k-exp-locked",
+        );
+        assert!(matches!(
+            block_on(explain_audit_finding_inner(&state, &id_locked)),
+            Err(AppError::Locked(_))
+        ));
+
+        // Untyped target on a visible source → Locked (fail closed), never explained.
+        let id_untyped = stage_untyped_target_finding(&state, "m-open", "m-sealed");
+        assert!(matches!(
+            block_on(explain_audit_finding_inner(&state, &id_untyped)),
+            Err(AppError::Locked(_))
+        ));
+    }
+
+    /// Egress fail-closed: with the default (unconsented) config the cloud Notes provider refuses
+    /// to BUILD — the explain returns `Unavailable` before any content is assembled — and the
+    /// pending row is untouched (still pending, evidence intact; nothing stored anywhere).
+    #[test]
+    fn explain_fails_closed_without_cloud_consent_and_stores_nothing() {
+        let state = build_state("explain-consent");
+        assert!(!state.config.lock().unwrap().cloud_egress_consented);
+        seed_meeting(&state.db, "m-open", "# open body\n", None);
+        let id = stage_audit_finding(
+            &state, "contradiction", "meeting", "m-open", None, "> a vs b", "", "k-exp-consent",
+        );
+
+        let res = block_on(explain_audit_finding_inner(&state, &id));
+        assert!(
+            matches!(res, Err(AppError::Unavailable(_))),
+            "unconsented cloud provider must fail closed"
+        );
+
+        // Nothing stored / mutated — the row is byte-identical to its staged state.
+        let row = state.db.get_audit_finding(&id).unwrap().unwrap();
+        assert_eq!(row.status, "pending");
+        assert_eq!(row.evidence_md, "> a vs b", "evidence untouched by a refused explain");
+        assert!(row.resolved_at.is_none());
+    }
+
+    /// Phase-0 follow-up (a): every seal path that NULLs `exported_path` blanks the path-coupled
+    /// `exported_hash` in the SAME statement — a stale baseline surviving the seal would
+    /// mis-classify the fresh unlock re-export.
+    #[test]
+    fn seal_paths_blank_exported_hash_with_exported_path() {
+        let state = build_state("seal-hash-blank");
+        make_open_folder(&state.db, "f1", "Secret");
+        seed_meeting(&state.db, "m-a", "# body\n", Some("f1"));
+        state
+            .db
+            .set_note_exported_path("m-a", "claude_code", "/tmp/x.md")
+            .unwrap();
+        state
+            .db
+            .set_note_exported_hash("m-a", "claude_code", Some("abc"))
+            .unwrap();
+        state.db.seal_note("m-a", "claude_code", b"blob").unwrap();
+        assert_eq!(
+            state.db.get_note_exported_hash("m-a", "claude_code").unwrap(),
+            None,
+            "seal_note blanks the baseline with the path"
+        );
+
+        // Documents: clearing the path (the per-row seal cleanup) clears the baseline too.
+        state
+            .db
+            .insert_document("n1", "f1", "note-a", "body", "note", 1)
+            .unwrap();
+        state
+            .db
+            .set_note_doc_exported_path("n1", Some("/tmp/n1.md"))
+            .unwrap();
+        state.db.set_note_doc_exported_hash("n1", Some("def")).unwrap();
+        state.db.set_note_doc_exported_path("n1", None).unwrap();
+        assert_eq!(
+            state.db.get_note_doc_exported_hash("n1").unwrap(),
+            None,
+            "clearing the doc path clears the baseline"
+        );
+        // …and setting a path again does NOT resurrect a hash.
+        state
+            .db
+            .set_note_doc_exported_path("n1", Some("/tmp/n1b.md"))
+            .unwrap();
+        assert_eq!(state.db.get_note_doc_exported_hash("n1").unwrap(), None);
+
+        // The folder-wide seal clear blanks both.
+        state.db.set_note_doc_exported_hash("n1", Some("ghi")).unwrap();
+        state.db.clear_note_exported_paths_in_folder("f1").unwrap();
+        assert_eq!(state.db.get_note_doc_exported_hash("n1").unwrap(), None);
+    }
+
+    /// Deleting an OPEN folder moves its notes to the vault ROOT (folder_id = NULL), survives the
+    /// note bytes (the `.md` moves to the root), deletes the folder row, and removes the empty subdir.
+    #[test]
+    fn delete_open_folder_demotes_notes_to_root_and_removes_dir() {
+        let vault = tmp_vault("del-open");
+        let state = build_state_with_vault("del-open", &vault);
+
+        make_open_folder(&state.db, "f", "Trash-Me");
+        let dir = vault.join("Trash-Me");
+        std::fs::create_dir_all(&dir).unwrap();
+        let md = dir.join("keep.md");
+        std::fs::write(&md, "# must survive").unwrap();
+        seed_meeting(&state.db, "m", "# must survive", Some("f"));
+        state
+            .db
+            .set_note_exported_path("m", "claude_code", &md.to_string_lossy())
+            .unwrap();
+
+        delete_folder_inner(&state, "f".into()).unwrap();
+
+        // Folder row gone.
+        assert!(
+            state.db.folder_by_id("f").unwrap().is_none(),
+            "folder row deleted"
+        );
+        // Note survived, now at the root (folder_id NULL).
+        assert_eq!(
+            state.db.folder_for_meeting("m").unwrap(),
+            None,
+            "note demoted to All notes"
+        );
+        let n = state.db.get_latest_note_for_meeting("m").unwrap().unwrap();
+        assert_eq!(n.markdown, "# must survive", "note content never lost");
+        let root_md = vault.join("keep.md");
+        assert!(root_md.exists(), ".md moved to the vault root");
+        assert_eq!(std::fs::read_to_string(&root_md).unwrap(), "# must survive");
+        assert!(!dir.exists(), "emptied folder dir removed");
+
+        let _ = std::fs::remove_dir_all(&vault);
+    }
+
+    /// SECURITY: deleting a LOCKED folder that is NOT session-unlocked is REFUSED (`AppError::Locked`)
+    /// — the row (with the wrapped key) and the sealed `content_blob` are untouched, so nothing is
+    /// orphaned encrypted-and-unrecoverable.
+    #[test]
+    fn delete_locked_not_unlocked_folder_refuses_and_keeps_sealed_content() {
+        let state = build_state("del-locked");
+        make_open_folder(&state.db, "lf", "Sealed");
+        seed_meeting(&state.db, "m", "# confidential", Some("lf"));
+        lock_folder_inner(&state, "lf".to_string()).unwrap(); // sealed, NOT session-unlocked
+
+        let res = delete_folder_inner(&state, "lf".into());
+        assert!(
+            matches!(res, Err(AppError::Locked(_))),
+            "must refuse with Locked, got {res:?}"
+        );
+
+        // Folder + sealed content intact.
+        assert!(
+            state.db.folder_by_id("lf").unwrap().is_some(),
+            "folder NOT deleted"
+        );
+        assert!(
+            state.db.folder_wrapped_key("lf").unwrap().is_some(),
+            "wrapped key kept"
+        );
+        let n = &state.db.sealable_notes_for_meeting("m").unwrap()[0];
+        assert!(n.content_blob.is_some(), "ciphertext kept (never orphaned)");
+        assert_eq!(
+            state.db.folder_for_meeting("m").unwrap().as_deref(),
+            Some("lf")
+        );
+    }
+
+    /// SECURITY: deleting a LOCKED + SESSION-UNLOCKED folder UNSEALS its notes back to plaintext
+    /// (remove-lock) BEFORE the row is destroyed, then demotes them to the root — so nothing is left
+    /// encrypted-and-orphaned and no note is lost.
+    #[test]
+    fn delete_locked_session_unlocked_folder_unseals_then_demotes_notes() {
+        let vault = tmp_vault("del-unlocked");
+        let state = build_state_with_vault("del-unlocked", &vault);
+        std::fs::create_dir_all(vault.join("Secret")).unwrap();
+
+        make_open_folder(&state.db, "lf", "Secret");
+        seed_meeting(&state.db, "m", "# decrypt me back", Some("lf"));
+        lock_folder_inner(&state, "lf".to_string()).unwrap();
+
+        // Make it SESSION-UNLOCKED: in the unlock set + KEK cached (as a real unlock would leave it).
+        state
+            .unlocked_folders
+            .lock()
+            .unwrap()
+            .insert("lf".to_string());
+        let kek = secrets::get_or_create_master_kek().unwrap();
+        *state.master_kek.lock().unwrap() = Some(Zeroizing::new(kek));
+
+        delete_folder_inner(&state, "lf".into()).unwrap();
+
+        // Folder gone; note unsealed (plaintext restored, blob cleared) and demoted to the root.
+        assert!(
+            state.db.folder_by_id("lf").unwrap().is_none(),
+            "folder row deleted"
+        );
+        assert_eq!(
+            state.db.folder_for_meeting("m").unwrap(),
+            None,
+            "note demoted to All notes"
+        );
+        let n = &state.db.sealable_notes_for_meeting("m").unwrap()[0];
+        assert_eq!(
+            n.markdown, "# decrypt me back",
+            "plaintext restored before delete"
+        );
+        assert!(
+            n.content_blob.is_none(),
+            "no orphaned ciphertext left behind"
+        );
+        // The session set no longer references the deleted folder.
+        assert!(!state.unlocked_folders.lock().unwrap().contains("lf"));
+
+        let _ = std::fs::remove_dir_all(&vault);
+    }
+
+    /// Deleting a folder that still has CHILD folders is refused (`InvalidArg`) — never orphan a
+    /// subtree by dangling a child's parent_id.
+    #[test]
+    fn delete_folder_with_children_refuses() {
+        let state = build_state("del-children");
+        make_open_folder(&state.db, "parent", "Work");
+        make_child_folder(&state.db, "child", "Q3", "Work/Q3", "parent");
+
+        let res = delete_folder_inner(&state, "parent".into());
+        assert!(
+            matches!(res, Err(AppError::InvalidArg(_))),
+            "must refuse, got {res:?}"
+        );
+        assert!(
+            state.db.folder_by_id("parent").unwrap().is_some(),
+            "parent NOT deleted"
+        );
+        assert!(
+            state.db.folder_by_id("child").unwrap().is_some(),
+            "child NOT orphaned"
+        );
+    }
+
+    // ── reindex_embeddings (semantic backfill) ──────────────────────────────────────────────────
+
+    /// True iff `mid` surfaces in the GATED semantic read for `text` under `unlocked` — i.e. it has
+    /// vec0 chunks AND is visible. Uses the stub embedder (this test asserts WHICH meetings are
+    /// indexed, not retrieval QUALITY, so the deterministic stub is sufficient plumbing).
+    fn reindex_semantic_finds(db: &Db, mid: &str, text: &str, unlocked: &HashSet<String>) -> bool {
+        use crate::embed::Embedder;
+        let emb = crate::embed::StubEmbedder;
+        let qv = emb.embed(std::slice::from_ref(&text.to_string())).unwrap();
+        let qvec = qv.into_iter().next().unwrap_or_default();
+        db.search_semantic_visible(&qvec, 50, unlocked)
+            .unwrap()
+            .iter()
+            .any(|h| h.meeting.id == mid)
+    }
+
+    /// GATING: `reindex_embeddings_inner` over a corpus of two OPEN (visible) meetings + one SEALED
+    /// (locked, not-session-unlocked) meeting indexes ONLY the two visible ones. The sealed meeting
+    /// is never returned by `list_meetings_visible`, its plaintext is never chunked/embedded, and its
+    /// chunks STAY purged (the seal already removed them) — RED if the gate were dropped.
+    #[test]
+    fn reindex_indexes_only_visible_meetings_skips_sealed() {
+        let state = build_state("reindex-gate");
+        make_open_folder(&state.db, "f-lock", "Confidential");
+
+        // Two open meetings (no folder ⇒ always visible) + one in a folder we will SEAL.
+        seed_meeting(
+            &state.db,
+            "m-open-1",
+            "Quarterly budget planning and hiring runway.",
+            None,
+        );
+        seed_meeting(
+            &state.db,
+            "m-open-2",
+            "Roadmap review for the next sprint.",
+            None,
+        );
+        seed_meeting(
+            &state.db,
+            "m-sealed",
+            "Secret acquisition numbers and the term sheet.",
+            Some("f-lock"),
+        );
+
+        // Seal the folder (verify-before-destroy seal + chunk purge) — m-sealed is now invisible.
+        lock_folder_inner(&state, "f-lock".to_string()).unwrap();
+
+        let nothing = HashSet::new();
+        let stub = crate::embed::StubEmbedder;
+        // model_present = true so the guard passes (we deliberately use the stub here for plumbing).
+        let res = reindex_embeddings_inner(&state.db, &nothing, true, &stub, |_, _| {}).unwrap();
+        assert_eq!(res.status, "indexed");
+        // Only the two VISIBLE meetings were processed (the sealed one is absent from the corpus).
+        assert_eq!(
+            res.total, 2,
+            "sealed meeting must NOT be in the reindex corpus"
+        );
+        assert_eq!(res.indexed, 2);
+
+        // The two open meetings are now semantically findable; the sealed one is NOT — even under the
+        // same empty unlock set (it has no chunks, and is gated out).
+        assert!(reindex_semantic_finds(
+            &state.db,
+            "m-open-1",
+            "budget planning hiring",
+            &nothing
+        ));
+        assert!(reindex_semantic_finds(
+            &state.db,
+            "m-open-2",
+            "roadmap sprint review",
+            &nothing
+        ));
+        assert!(
+            !reindex_semantic_finds(
+                &state.db,
+                "m-sealed",
+                "secret acquisition term sheet",
+                &nothing
+            ),
+            "a sealed-not-unlocked meeting must never be indexed by reindex (gate violation)"
+        );
+    }
+
+    /// MODEL GUARD: with the real e5 model ABSENT (`model_present = false`), `reindex_embeddings_inner`
+    /// returns `{ status: "model_missing" }` and indexes NOTHING — it must NOT poison the index with
+    /// the deterministic STUB embedder. RED if the guard were dropped (the open meeting would gain
+    /// stub chunks).
+    #[test]
+    fn reindex_model_missing_indexes_nothing() {
+        let state = build_state("reindex-nomodel");
+        seed_meeting(&state.db, "m-open", "Quarterly budget planning.", None);
+
+        let nothing = HashSet::new();
+        let stub = crate::embed::StubEmbedder;
+        // model_present = false → the guard short-circuits BEFORE any indexing.
+        let res = reindex_embeddings_inner(&state.db, &nothing, false, &stub, |_, _| {}).unwrap();
+        assert_eq!(res.status, "model_missing");
+        assert_eq!(res.indexed, 0);
+        assert_eq!(res.total, 0);
+        // No chunks were written — the meeting is NOT semantically findable.
+        assert!(
+            !reindex_semantic_finds(&state.db, "m-open", "budget planning", &nothing),
+            "model_missing guard must index NOTHING (no stub poisoning)"
+        );
+    }
+
+    // ── FIX 6 integration: save_config_inner → validate_gateway_url boundary ─────────────────
+
+    /// Drives the REAL `save_config_inner` (the headless core of `save_config`) to guard the
+    /// integration boundary: a future edit that removes the URL-validation guard from
+    /// `save_config_inner` would break this test, not just the unit-level `validate_gateway_url`
+    /// call-site tests.
+    ///
+    /// Three sub-cases:
+    ///   (a) credential-bearing URL → `InvalidArg`; persisted config IS NOT changed.
+    ///   (b) empty URL → `Ok`; empty round-trips.
+    ///   (c) valid https URL → `Ok`; value persists and is visible in the in-memory cache.
+    #[test]
+    fn save_config_inner_validates_gateway_url_at_the_integration_seam() {
+        let state = build_state("cfg-gw-url-integration");
+
+        // ── (a) credential-bearing URL → rejected before writing to DB ───────────────────────
+        let mut dto_bad = config_to_dto(&AppConfig::default());
+        dto_bad.gateway_base_url = "https://key:@gw.example.com/v1".to_string();
+        let err = save_config_inner(&state, dto_bad)
+            .expect_err("credential URL must be rejected by save_config_inner");
+        assert!(
+            matches!(err, AppError::InvalidArg(_)),
+            "expected InvalidArg for credential URL, got: {err:?}"
+        );
+        // The bad URL must NOT have been written into the in-memory config cache.
+        let cached_url = state.config.lock().unwrap().gateway_base_url.clone();
+        assert_ne!(
+            cached_url, "https://key:@gw.example.com/v1",
+            "credential URL must not reach the config cache (save_config_inner must reject first)"
+        );
+
+        // ── (b) empty URL → Ok (no gateway configured) ───────────────────────────────────────
+        let mut dto_empty = config_to_dto(&AppConfig::default());
+        dto_empty.gateway_base_url = String::new();
+        save_config_inner(&state, dto_empty).expect("empty gateway URL must be accepted");
+        assert_eq!(
+            state.config.lock().unwrap().gateway_base_url,
+            "",
+            "empty gateway URL must persist and round-trip"
+        );
+
+        // ── (c) valid https URL → Ok + persisted in the cache ────────────────────────────────
+        let mut dto_ok = config_to_dto(&AppConfig::default());
+        dto_ok.gateway_base_url = "https://gw.example.com/v1".to_string();
+        save_config_inner(&state, dto_ok).expect("valid https gateway URL must be accepted");
+        assert_eq!(
+            state.config.lock().unwrap().gateway_base_url,
+            "https://gw.example.com/v1",
+            "valid URL must be persisted and visible in the in-memory config cache"
+        );
+    }
+
+    // ─── list_models — static connection catalogs (pure, no network) ─────────────────────────
+
+    /// `claude_code` and `anthropic` both serve the curated CLAUDE_MODELS constant — the single
+    /// source of truth that replaced the FE-hardcoded dropdown list.
+    #[test]
+    fn list_models_claude_connections_return_curated_constant() {
+        for conn in ["claude_code", "anthropic"] {
+            let ids = static_connection_models(conn)
+                .unwrap_or_else(|e| panic!("{conn} must resolve statically: {e:?}"));
+            let want: Vec<String> = crate::summarize::provider::CLAUDE_MODELS
+                .iter()
+                .map(|id| id.to_string())
+                .collect();
+            assert_eq!(ids, want, "{conn} must serve CLAUDE_MODELS verbatim");
+            assert!(
+                ids.contains(&"claude-opus-4-8".to_string()),
+                "curated list must include the default Opus id"
+            );
+        }
+    }
+
+    /// `local` serves exactly the BRAIN_MODELS registry ids, in registry order.
+    #[test]
+    fn list_models_local_matches_brain_registry_ids() {
+        let ids = static_connection_models("local").expect("local must resolve statically");
+        let want: Vec<String> = crate::reason::BRAIN_MODELS
+            .iter()
+            .map(|m| m.id.to_string())
+            .collect();
+        assert_eq!(ids, want, "local must mirror the BRAIN_MODELS registry ids");
+        assert!(!ids.is_empty(), "the brain registry is never empty");
+    }
+
+    /// `off` is a valid connection with no models — empty list, not an error.
+    #[test]
+    fn list_models_off_returns_empty() {
+        let ids = static_connection_models("off").expect("off must resolve statically");
+        assert!(ids.is_empty(), "off runs no models");
+    }
+
+    /// An unknown connection id refuses with `InvalidArg` — never a panic, never an empty Ok.
+    #[test]
+    fn list_models_unknown_connection_refuses() {
+        for conn in ["", "openai", "GATEWAY", "claude"] {
+            let err =
+                static_connection_models(conn).expect_err("unknown connection must be refused");
+            assert!(
+                matches!(err, AppError::InvalidArg(_)),
+                "expected InvalidArg for '{conn}', got: {err:?}"
+            );
+        }
+    }
+
+    // ── recording_status (webview-reload resync) ─────────────────────────────────────────────────
+    // A `tauri dev` FE hot-reload swaps the webview WITHOUT restarting the Rust process, so the store
+    // resets to `idle` while the backend recorder is still `Some(..)`. `recording_status` lets the
+    // freshly-loaded FE resync instead of pressing Start and hitting the "already recording" guard.
+    // `Recorder` needs mic hardware (can't be built headless), so we test the pure DTO builder that
+    // the command delegates to.
+
+    #[test]
+    fn recording_status_reports_idle_when_not_recording() {
+        let state = build_state("recstatus-idle");
+        // Even a lingering meeting row + a set `current_meeting` must NOT read as recording: the live
+        // recorder is the source of truth, and here it is `None`.
+        state
+            .db
+            .insert_meeting(&Meeting {
+                id: "ghost".to_string(),
+                started_at: "2026-07-05T10:00:00Z".to_string(),
+                ended_at: None,
+                title: None,
+                duration_s: 0,
+                audio_path: None,
+                status: MeetingStatus::Recording,
+                folder_id: None,
+            })
+            .unwrap();
+        let st = recording_status_dto(&state.db, false, Some("ghost".to_string()));
+        assert!(!st.recording);
+        assert_eq!(st.meeting_id, None);
+        assert_eq!(st.started_at, None);
+    }
+
+    #[test]
+    fn recording_status_anchors_started_at_from_the_persisted_row() {
+        let state = build_state("recstatus-live");
+        state
+            .db
+            .insert_meeting(&Meeting {
+                id: "live-1".to_string(),
+                started_at: "2026-07-05T11:22:33Z".to_string(),
+                ended_at: None,
+                title: None,
+                duration_s: 0,
+                audio_path: None,
+                status: MeetingStatus::Recording,
+                folder_id: None,
+            })
+            .unwrap();
+        let st = recording_status_dto(&state.db, true, Some("live-1".to_string()));
+        assert!(st.recording);
+        assert_eq!(st.meeting_id.as_deref(), Some("live-1"));
+        // The FE anchors its elapsed timer to THIS, not an epoch-sized value.
+        assert_eq!(st.started_at.as_deref(), Some("2026-07-05T11:22:33Z"));
+    }
+
+    #[test]
+    fn recording_status_degrades_when_the_row_is_missing() {
+        // Recording is true but the row can't be read → still report recording, just drop the anchor
+        // (the FE falls back to "now"); the status read must never fail on a best-effort lookup.
+        let state = build_state("recstatus-norow");
+        let st = recording_status_dto(&state.db, true, Some("no-such-meeting".to_string()));
+        assert!(st.recording);
+        assert_eq!(st.meeting_id.as_deref(), Some("no-such-meeting"));
+        assert_eq!(st.started_at, None);
+    }
+
+    // ── Re-Truth (the vault heals itself): supersession capture + preview gate + apply/undo ──────
+
+    use crate::facts::{Fact, FactOp, NewFact};
+    use crate::storage::models::SupersessionRow;
+
+    fn a_fact(id: &str, subject: &str, predicate: &str, object: &str, meeting: &str) -> Fact {
+        Fact {
+            id: id.to_string(),
+            entity_id: "atlas".to_string(),
+            subject: subject.to_string(),
+            predicate: predicate.to_string(),
+            object: object.to_string(),
+            valid_from: "2026-06-01T00:00:00Z".to_string(),
+            valid_to: None,
+            recorded_at: "2026-06-01T00:00:00Z".to_string(),
+            meeting_id: Some(meeting.to_string()),
+            confidence: 1.0,
+        }
+    }
+
+    fn an_add(subject: &str, predicate: &str, object: &str, meeting: &str) -> FactOp {
+        FactOp::Add(NewFact {
+            entity_id: "atlas".to_string(),
+            subject: subject.to_string(),
+            predicate: predicate.to_string(),
+            object: object.to_string(),
+            valid_from: "2026-06-20T00:00:00Z".to_string(),
+            recorded_at: "2026-06-20T00:00:00Z".to_string(),
+            confidence: 1.0,
+            meeting_id: Some(meeting.to_string()),
+        })
+    }
+
+    /// PURE: an Invalidate closing an M1-sourced fact + the matching Add produces EXACTLY one
+    /// supersession citing M1, with the old/new values. A NoOp/Add-only batch (nothing invalidated)
+    /// produces none; a self-supersession (older fact from the SAME meeting) produces none.
+    #[test]
+    fn build_supersession_rows_captures_cross_note_change_only() {
+        let existing = vec![a_fact("f1", "Atlas", "status", "in-progress", "m1")];
+        let ops = vec![
+            FactOp::Invalidate {
+                id: "f1".to_string(),
+                valid_to: "2026-06-20T00:00:00Z".to_string(),
+            },
+            an_add("Atlas", "status", "shipped", "m2"),
+        ];
+        let rows = build_supersession_rows("m2", &existing, &ops, "2026-06-20T00:00:00Z");
+        assert_eq!(rows.len(), 1, "one cross-note supersession");
+        assert_eq!(rows[0].source_meeting_id, "m1");
+        assert_eq!(rows[0].superseding_meeting_id, "m2");
+        assert_eq!(rows[0].entity, "Atlas");
+        assert_eq!(rows[0].predicate, "status");
+        assert_eq!(rows[0].old_value, "in-progress");
+        assert_eq!(rows[0].new_value, "shipped");
+        assert!(rows[0].applied_at.is_none());
+
+        // A NoOp/Add-only batch invalidates nothing → no supersession.
+        let none = build_supersession_rows(
+            "m2",
+            &existing,
+            &[FactOp::NoOp, an_add("Atlas", "owner", "Anna", "m2")],
+            "2026-06-20T00:00:00Z",
+        );
+        assert!(none.is_empty(), "nothing invalidated → no supersession");
+
+        // A self-supersession (the old fact came from the SAME meeting) is skipped.
+        let self_only = vec![a_fact("f1", "Atlas", "status", "in-progress", "m2")];
+        let self_rows = build_supersession_rows(
+            "m2",
+            &self_only,
+            &[
+                FactOp::Invalidate {
+                    id: "f1".to_string(),
+                    valid_to: "2026-06-20T00:00:00Z".to_string(),
+                },
+                an_add("Atlas", "status", "shipped", "m2"),
+            ],
+            "2026-06-20T00:00:00Z",
+        );
+        assert!(
+            self_rows.is_empty(),
+            "same-meeting refinement is not a cross-note supersession"
+        );
+    }
+
+    /// Seed a summarized meeting in a folder, its note pointing at an on-disk `.md` (or a DB-only path
+    /// when `md_bytes` is `None`). Returns the on-disk path.
+    fn seed_note_on_disk(
+        state: &AppState,
+        vault: &std::path::Path,
+        mid: &str,
+        folder_id: &str,
+        folder_name: &str,
+        filename: &str,
+        md_bytes: Option<&str>,
+    ) -> std::path::PathBuf {
+        seed_meeting(
+            &state.db,
+            mid,
+            md_bytes.unwrap_or("# note"),
+            Some(folder_id),
+        );
+        state.db.set_note_folder(mid, Some(folder_id)).unwrap();
+        let dir = vault.join(folder_name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(filename);
+        if let Some(bytes) = md_bytes {
+            std::fs::write(&path, bytes).unwrap();
+        }
+        state
+            .db
+            .set_note_exported_path(mid, "claude_code", &path.to_string_lossy())
+            .unwrap();
+        path
+    }
+
+    /// GATE: `preview_supersessions` EXCLUDES a supersession whose SOURCE meeting is sealed — and a
+    /// mere SESSION-unlock does not re-open it for stamping (its `.md` was deleted on seal; v1 only
+    /// touches open-on-disk notes).
+    #[test]
+    fn preview_supersessions_excludes_sealed_source() {
+        let vault = tmp_vault("retruth-gate");
+        let state = build_state_with_vault("retruth-gate", &vault);
+        make_open_folder(&state.db, "f-src", "Work");
+        seed_note_on_disk(
+            &state,
+            &vault,
+            "m1",
+            "f-src",
+            "Work",
+            "kickoff.md",
+            Some("# Kickoff\n"),
+        );
+        make_open_folder(&state.db, "f-new", "Reviews");
+        seed_note_on_disk(
+            &state,
+            &vault,
+            "m2",
+            "f-new",
+            "Reviews",
+            "review.md",
+            Some("# Review\n"),
+        );
+        state
+            .db
+            .record_supersessions(&[SupersessionRow {
+                id: "s1".into(),
+                superseding_meeting_id: "m2".into(),
+                source_meeting_id: "m1".into(),
+                entity: "Atlas".into(),
+                predicate: "status".into(),
+                old_value: "in-progress".into(),
+                new_value: "shipped".into(),
+                created_at: "2026-06-20T00:00:00Z".into(),
+                applied_at: None,
+                source_pre_image: None,
+                superseding_pre_image: None,
+            }])
+            .unwrap();
+
+        // Both folders open → surfaced.
+        assert_eq!(preview_supersessions_inner(&state, "m2").unwrap().len(), 1);
+
+        // Seal the SOURCE folder → excluded.
+        state
+            .db
+            .set_folder_locked("f-src", true, Some(&b"wrapped"[..]))
+            .unwrap();
+        assert!(
+            preview_supersessions_inner(&state, "m2")
+                .unwrap()
+                .is_empty(),
+            "a sealed source contributes nothing"
+        );
+
+        // Session-unlock the source folder → STILL excluded (no .md on disk after seal; v1 is
+        // open-on-disk only).
+        state
+            .unlocked_folders
+            .lock()
+            .unwrap()
+            .insert("f-src".to_string());
+        assert!(
+            preview_supersessions_inner(&state, "m2")
+                .unwrap()
+                .is_empty(),
+            "session-unlock does not re-open a sealed source for stamping"
+        );
+    }
+
+    /// APPLY appends the callout to both notes; UNDO restores both BYTE-IDENTICAL (the append-only
+    /// verify-before-destroy analogue). Also asserts APPEND-ONLY (original bytes are an untouched
+    /// prefix) and IDEMPOTENCE (a second apply is a no-op — no double stamp).
+    #[test]
+    fn apply_then_undo_round_trips_notes_byte_identical() {
+        let vault = tmp_vault("retruth-apply");
+        let state = build_state_with_vault("retruth-apply", &vault);
+
+        let src_original = "---\ntitle: Kickoff\n---\n# Kickoff\n\nAtlas is in progress.\n";
+        let sup_original = "---\ntitle: Launch review\n---\n# Launch review\n";
+        make_open_folder(&state.db, "f-src", "Work");
+        let src_md = seed_note_on_disk(
+            &state,
+            &vault,
+            "m1",
+            "f-src",
+            "Work",
+            "2026-06-01 0900 - Kickoff.md",
+            Some(src_original),
+        );
+        make_open_folder(&state.db, "f-new", "Reviews");
+        let sup_md = seed_note_on_disk(
+            &state,
+            &vault,
+            "m2",
+            "f-new",
+            "Reviews",
+            "2026-06-20 1000 - Launch review.md",
+            Some(sup_original),
+        );
+        state
+            .db
+            .record_supersessions(&[SupersessionRow {
+                id: "s1".into(),
+                superseding_meeting_id: "m2".into(),
+                source_meeting_id: "m1".into(),
+                entity: "Atlas".into(),
+                predicate: "status".into(),
+                old_value: "in-progress".into(),
+                new_value: "shipped".into(),
+                created_at: "2026-06-20T00:00:00Z".into(),
+                applied_at: None,
+                source_pre_image: None,
+                superseding_pre_image: None,
+            }])
+            .unwrap();
+
+        // Preview surfaces titles.
+        let preview = preview_supersessions_inner(&state, "m2").unwrap();
+        assert_eq!(preview.len(), 1);
+        assert_eq!(preview[0].source_note_title, "2026-06-01 0900 - Kickoff");
+        assert_eq!(
+            preview[0].superseding_note_title.as_deref(),
+            Some("2026-06-20 1000 - Launch review")
+        );
+
+        let src_before = std::fs::read(&src_md).unwrap();
+        let sup_before = std::fs::read(&sup_md).unwrap();
+
+        // APPLY.
+        let res = apply_supersessions_inner(&state, &["s1".to_string()]).unwrap();
+        assert_eq!(res.applied, 1);
+        assert_eq!(res.skipped_sealed, 0);
+
+        let src_after = std::fs::read_to_string(&src_md).unwrap();
+        assert!(
+            src_after.contains("## Re-Truth updates"),
+            "section: {src_after}"
+        );
+        assert!(
+            src_after.contains(
+                "> **status** — in-progress → shipped · see [[2026-06-20 1000 - Launch review]]"
+            ),
+            "source callout: {src_after}"
+        );
+        assert!(
+            src_after.as_bytes().starts_with(&src_before),
+            "append-only: original bytes are an untouched prefix"
+        );
+        let sup_after = std::fs::read_to_string(&sup_md).unwrap();
+        assert!(
+            sup_after.contains("supersedes in-progress → shipped in [[2026-06-01 0900 - Kickoff]]"),
+            "superseding backlink: {sup_after}"
+        );
+
+        // IDEMPOTENT: a second apply is a no-op (row already applied), no double stamp.
+        let res2 = apply_supersessions_inner(&state, &["s1".to_string()]).unwrap();
+        assert_eq!(res2.applied, 0, "already-applied row is not re-stamped");
+        assert_eq!(
+            std::fs::read_to_string(&src_md)
+                .unwrap()
+                .matches("> **status** — in-progress → shipped")
+                .count(),
+            1,
+            "no duplicate callout body"
+        );
+
+        // UNDO restores BOTH notes byte-identical.
+        undo_supersessions_inner(&state, &["s1".to_string()]).unwrap();
+        assert_eq!(
+            std::fs::read(&src_md).unwrap(),
+            src_before,
+            "source note restored byte-identical"
+        );
+        assert_eq!(
+            std::fs::read(&sup_md).unwrap(),
+            sup_before,
+            "superseding note restored byte-identical"
+        );
+        assert!(
+            state
+                .db
+                .get_supersession("s1")
+                .unwrap()
+                .unwrap()
+                .applied_at
+                .is_none(),
+            "undo returns the row to pending"
+        );
+    }
+
+    /// TOCTOU: a source folder that seals BETWEEN preview and apply is SKIPPED (never stamped) —
+    /// proving the prune↔seal re-gate AND the "never write `.md` into a locked folder" invariant.
+    #[test]
+    fn apply_skips_source_sealed_after_preview() {
+        let vault = tmp_vault("retruth-toctou");
+        let state = build_state_with_vault("retruth-toctou", &vault);
+        let src_original = "# Kickoff\n\nAtlas is in progress.\n";
+        make_open_folder(&state.db, "f-src", "Work");
+        let src_md = seed_note_on_disk(
+            &state,
+            &vault,
+            "m1",
+            "f-src",
+            "Work",
+            "kickoff.md",
+            Some(src_original),
+        );
+        make_open_folder(&state.db, "f-new", "Reviews");
+        seed_note_on_disk(
+            &state,
+            &vault,
+            "m2",
+            "f-new",
+            "Reviews",
+            "review.md",
+            Some("# Review\n"),
+        );
+        state
+            .db
+            .record_supersessions(&[SupersessionRow {
+                id: "s1".into(),
+                superseding_meeting_id: "m2".into(),
+                source_meeting_id: "m1".into(),
+                entity: "Atlas".into(),
+                predicate: "status".into(),
+                old_value: "in-progress".into(),
+                new_value: "shipped".into(),
+                created_at: "2026-06-20T00:00:00Z".into(),
+                applied_at: None,
+                source_pre_image: None,
+                superseding_pre_image: None,
+            }])
+            .unwrap();
+
+        // Preview saw it open — now SEAL the source folder before apply (TOCTOU).
+        assert_eq!(preview_supersessions_inner(&state, "m2").unwrap().len(), 1);
+        state
+            .db
+            .set_folder_locked("f-src", true, Some(&b"wrapped"[..]))
+            .unwrap();
+
+        let res = apply_supersessions_inner(&state, &["s1".to_string()]).unwrap();
+        assert_eq!(res.applied, 0);
+        assert_eq!(
+            res.skipped_sealed, 1,
+            "a source sealed after preview is skipped"
+        );
+        // The `.md` was NOT touched (no callout written into a locked folder).
+        assert_eq!(
+            std::fs::read_to_string(&src_md).unwrap(),
+            src_original,
+            "never write into a locked folder"
+        );
+        // Still pending (not marked applied).
+        assert!(state
+            .db
+            .get_supersession("s1")
+            .unwrap()
+            .unwrap()
+            .applied_at
+            .is_none());
+    }
+
+    /// GATE BOTH SIDES: `preview_supersessions` must EXCLUDE a row whose SUPERSEDING meeting is sealed
+    /// (its `new_value` is derived from that just-sealed note). Uses `set_folder_locked` directly so the
+    /// row SURVIVES at rest — proving the READ GATE on the superseding side, independent of
+    /// purge-on-seal (closing the `lock_folder` flip-before-purge race). RED-before-GREEN: without the
+    /// superseding-side gate the source stays open, so the row (with `new_value`) leaks.
+    #[test]
+    fn preview_supersessions_excludes_sealed_superseding() {
+        let vault = tmp_vault("retruth-supgate");
+        let state = build_state_with_vault("retruth-supgate", &vault);
+        make_open_folder(&state.db, "f-src", "Work");
+        seed_note_on_disk(
+            &state,
+            &vault,
+            "m1",
+            "f-src",
+            "Work",
+            "kickoff.md",
+            Some("# Kickoff\n"),
+        );
+        make_open_folder(&state.db, "f-new", "Reviews");
+        seed_note_on_disk(
+            &state,
+            &vault,
+            "m2",
+            "f-new",
+            "Reviews",
+            "review.md",
+            Some("# Review\n"),
+        );
+        state
+            .db
+            .record_supersessions(&[SupersessionRow {
+                id: "s1".into(),
+                superseding_meeting_id: "m2".into(),
+                source_meeting_id: "m1".into(),
+                entity: "Atlas".into(),
+                predicate: "status".into(),
+                old_value: "in-progress".into(),
+                new_value: "shipped".into(),
+                created_at: "2026-06-20T00:00:00Z".into(),
+                applied_at: None,
+                source_pre_image: None,
+                superseding_pre_image: None,
+            }])
+            .unwrap();
+
+        // Both open → surfaced.
+        assert_eq!(preview_supersessions_inner(&state, "m2").unwrap().len(), 1);
+
+        // Seal the SUPERSEDING folder (row survives — the race window) → excluded (no new_value leak).
+        state
+            .db
+            .set_folder_locked("f-new", true, Some(&b"wrapped"[..]))
+            .unwrap();
+        assert!(
+            preview_supersessions_inner(&state, "m2")
+                .unwrap()
+                .is_empty(),
+            "a sealed superseding meeting must surface no new_value (gate BOTH sides)"
+        );
+    }
+
+    /// RETRY AFTER PARTIAL APPLY must not corrupt undo. Reproduces the crash window the durable-
+    /// before-write ordering produces (pre-image stored + file stamped, but `applied_at` not yet
+    /// committed), then a retry: it must REUSE the stored un-stamped pre-image, NOT re-snapshot the
+    /// stamped file — so a later undo still restores byte-identical. RED-before-GREEN: the old
+    /// order (write → mark-with-fresh-file-read) re-captures the stamped bytes here, so undo can no
+    /// longer remove the stamp.
+    #[test]
+    fn apply_retry_after_partial_does_not_corrupt_undo() {
+        let vault = tmp_vault("retruth-retry");
+        let state = build_state_with_vault("retruth-retry", &vault);
+        let original = "# Kickoff\n\nAtlas is in progress.\n";
+        make_open_folder(&state.db, "f-src", "Work");
+        let src_md = seed_note_on_disk(
+            &state,
+            &vault,
+            "m1",
+            "f-src",
+            "Work",
+            "kickoff.md",
+            Some(original),
+        );
+        // Superseding meeting stays open but WITHOUT a vault file we care about — the backlink is
+        // irrelevant to this source-undo test (no superseding stem link ⇒ simpler assertions).
+        make_open_folder(&state.db, "f-new", "Reviews");
+        seed_meeting(&state.db, "m2", "# Review", Some("f-new"));
+        state.db.set_note_folder("m2", Some("f-new")).unwrap();
+        state
+            .db
+            .record_supersessions(&[SupersessionRow {
+                id: "s1".into(),
+                superseding_meeting_id: "m2".into(),
+                source_meeting_id: "m1".into(),
+                entity: "Atlas".into(),
+                predicate: "status".into(),
+                old_value: "in-progress".into(),
+                new_value: "shipped".into(),
+                created_at: "2026-06-20T00:00:00Z".into(),
+                applied_at: None,
+                source_pre_image: None,
+                superseding_pre_image: None,
+            }])
+            .unwrap();
+
+        // Simulate the intermediate crash state produced by the durable-before-write ordering: the
+        // un-stamped pre-image is already persisted AND the file is already stamped, but `applied_at`
+        // never committed. (This is exactly what a crash between the write and mark-applied leaves.)
+        let un_stamped = std::fs::read(&src_md).unwrap();
+        state
+            .db
+            .store_supersession_pre_images("s1", Some(&un_stamped), None)
+            .unwrap();
+        let stamped = crate::export::obsidian::append_supersession_callout(
+            original,
+            "2026-06-20",
+            "status",
+            "in-progress",
+            "shipped",
+            None,
+        );
+        std::fs::write(&src_md, &stamped).unwrap();
+
+        // RETRY the apply: it MUST reuse the stored (un-stamped) pre-image, never re-snapshot the
+        // stamped file.
+        let res = apply_supersessions_inner(&state, &["s1".to_string()]).unwrap();
+        assert_eq!(res.applied, 1);
+        let after = state.db.get_supersession("s1").unwrap().unwrap();
+        assert_eq!(
+            after.source_pre_image.as_deref(),
+            Some(un_stamped.as_slice()),
+            "retry must NOT re-snapshot the stamped file into the pre-image"
+        );
+        // The file is stamped exactly once (idempotent — retry over an already-stamped file is a no-op).
+        assert_eq!(
+            std::fs::read_to_string(&src_md)
+                .unwrap()
+                .matches("> **status** — in-progress → shipped")
+                .count(),
+            1,
+            "no duplicate stamp on retry"
+        );
+
+        // UNDO restores byte-identical to the ORIGINAL (un-stamped) — the corruption is gone.
+        undo_supersessions_inner(&state, &["s1".to_string()]).unwrap();
+        assert_eq!(
+            std::fs::read(&src_md).unwrap(),
+            un_stamped,
+            "undo removes the stamp — byte-identical to the un-stamped original"
+        );
+    }
+
+    /// MULTI-ROW heal: several supersessions in ONE preview share a note FILE — every row shares the
+    /// superseding meeting's note, and two facts from the same old meeting share a SOURCE note. Apply
+    /// ALL then undo ALL must restore EVERY affected file byte-identical. RED-before-GREEN: the old
+    /// per-row snapshot captured mid-batch (already-stamped) bytes for the 2nd+ row on a shared file,
+    /// and forward-order undo then left N-1 orphan stamps → NOT byte-identical.
+    #[test]
+    fn apply_then_undo_multi_row_shared_note_round_trips_byte_identical() {
+        let vault = tmp_vault("retruth-multi");
+        let state = build_state_with_vault("retruth-multi", &vault);
+        // One open folder holding the superseding note + two old source notes.
+        make_open_folder(&state.db, "f", "Work");
+        let new_md = seed_note_on_disk(
+            &state,
+            &vault,
+            "m-new",
+            "f",
+            "Work",
+            "new.md",
+            Some("# New\n"),
+        );
+        let old1_md = seed_note_on_disk(
+            &state,
+            &vault,
+            "m-old1",
+            "f",
+            "Work",
+            "old1.md",
+            Some("# Old one\n"),
+        );
+        let old2_md = seed_note_on_disk(
+            &state,
+            &vault,
+            "m-old2",
+            "f",
+            "Work",
+            "old2.md",
+            Some("# Old two\n"),
+        );
+
+        // Three rows, ALL superseded by m-new:
+        //   r1, r2 → SOURCE m-old1 (two facts from one old note ⇒ shared SOURCE note)
+        //   r3     → SOURCE m-old2
+        // All three ⇒ shared SUPERSEDING note (new.md gets 3 backlinks).
+        let mk = |id: &str, source: &str, predicate: &str, old: &str, new: &str| SupersessionRow {
+            id: id.into(),
+            superseding_meeting_id: "m-new".into(),
+            source_meeting_id: source.into(),
+            entity: "Atlas".into(),
+            predicate: predicate.into(),
+            old_value: old.into(),
+            new_value: new.into(),
+            created_at: "2026-06-20T00:00:00Z".into(),
+            applied_at: None,
+            source_pre_image: None,
+            superseding_pre_image: None,
+        };
+        state
+            .db
+            .record_supersessions(&[
+                mk("r1", "m-old1", "status", "in-progress", "shipped"),
+                mk("r2", "m-old1", "owner", "Anna", "Bob"),
+                mk("r3", "m-old2", "stage", "alpha", "beta"),
+            ])
+            .unwrap();
+
+        // Pre-heal content of every affected file.
+        let new_pre = std::fs::read(&new_md).unwrap();
+        let old1_pre = std::fs::read(&old1_md).unwrap();
+        let old2_pre = std::fs::read(&old2_md).unwrap();
+
+        // APPLY ALL.
+        let ids: Vec<String> = ["r1", "r2", "r3"].iter().map(|s| s.to_string()).collect();
+        let res = apply_supersessions_inner(&state, &ids).unwrap();
+        assert_eq!(res.applied, 3);
+        assert_eq!(res.skipped_sealed, 0);
+        // The shared superseding note carries all THREE backlinks; each source its own callout(s).
+        assert_eq!(
+            std::fs::read_to_string(&new_md)
+                .unwrap()
+                .matches("> [!supersedes]")
+                .count(),
+            3,
+            "shared superseding note accumulates all backlinks"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&old1_md)
+                .unwrap()
+                .matches("> [!superseded]")
+                .count(),
+            2,
+            "shared source note accumulates both callouts"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&old2_md)
+                .unwrap()
+                .matches("> [!superseded]")
+                .count(),
+            1
+        );
+
+        // UNDO ALL → EVERY affected file byte-identical to its pre-heal content.
+        undo_supersessions_inner(&state, &ids).unwrap();
+        assert_eq!(
+            std::fs::read(&new_md).unwrap(),
+            new_pre,
+            "shared SUPERSEDING note restored byte-identical (no orphan backlinks)"
+        );
+        assert_eq!(
+            std::fs::read(&old1_md).unwrap(),
+            old1_pre,
+            "shared SOURCE note restored byte-identical (no orphan callout)"
+        );
+        assert_eq!(std::fs::read(&old2_md).unwrap(), old2_pre);
+        // Every row back to unapplied.
+        for id in ["r1", "r2", "r3"] {
+            assert!(
+                state
+                    .db
+                    .get_supersession(id)
+                    .unwrap()
+                    .unwrap()
+                    .applied_at
+                    .is_none(),
+                "row {id} returned to pending"
+            );
+        }
+    }
+
+    /// PARTIAL undo of a SUBSET that shares a note file must preserve the still-applied siblings'
+    /// on-disk stamps (no silent DB↔disk desync). `apply [r1,r2,r3]` (r1,r2 → source old1.md; r3 →
+    /// source old2.md; all three → superseding new.md), then `undo [r1]` only: r2/r3 stay applied and
+    /// their stamps must survive on old1.md/new.md while r1's are removed. Then `undo [r2,r3]` →
+    /// every file byte-identical to pristine. RED-before-GREEN: the restore-pristine-once logic wipes
+    /// old1.md/new.md fully pristine with r2/r3 still applied (their callouts vanish).
+    #[test]
+    fn partial_undo_preserves_still_applied_siblings_on_shared_file() {
+        let vault = tmp_vault("retruth-partial");
+        let state = build_state_with_vault("retruth-partial", &vault);
+        make_open_folder(&state.db, "f", "Work");
+        let new_md = seed_note_on_disk(
+            &state,
+            &vault,
+            "m-new",
+            "f",
+            "Work",
+            "new.md",
+            Some("# New\n"),
+        );
+        let old1_md = seed_note_on_disk(
+            &state,
+            &vault,
+            "m-old1",
+            "f",
+            "Work",
+            "old1.md",
+            Some("# Old one\n"),
+        );
+        let old2_md = seed_note_on_disk(
+            &state,
+            &vault,
+            "m-old2",
+            "f",
+            "Work",
+            "old2.md",
+            Some("# Old two\n"),
+        );
+        let mk = |id: &str, source: &str, predicate: &str, old: &str, new: &str| SupersessionRow {
+            id: id.into(),
+            superseding_meeting_id: "m-new".into(),
+            source_meeting_id: source.into(),
+            entity: "Atlas".into(),
+            predicate: predicate.into(),
+            old_value: old.into(),
+            new_value: new.into(),
+            created_at: "2026-06-20T00:00:00Z".into(),
+            applied_at: None,
+            source_pre_image: None,
+            superseding_pre_image: None,
+        };
+        state
+            .db
+            .record_supersessions(&[
+                mk("r1", "m-old1", "status", "in-progress", "shipped"),
+                mk("r2", "m-old1", "owner", "Anna", "Bob"),
+                mk("r3", "m-old2", "stage", "alpha", "beta"),
+            ])
+            .unwrap();
+
+        let new_pre = std::fs::read(&new_md).unwrap();
+        let old1_pre = std::fs::read(&old1_md).unwrap();
+        let old2_pre = std::fs::read(&old2_md).unwrap();
+
+        // APPLY ALL.
+        let all: Vec<String> = ["r1", "r2", "r3"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(apply_supersessions_inner(&state, &all).unwrap().applied, 3);
+        let old2_after_apply = std::fs::read(&old2_md).unwrap();
+
+        // UNDO ONLY r1.
+        undo_supersessions_inner(&state, &["r1".to_string()]).unwrap();
+
+        // r2, r3 stay applied; r1 cleared.
+        assert!(state
+            .db
+            .get_supersession("r1")
+            .unwrap()
+            .unwrap()
+            .applied_at
+            .is_none());
+        assert!(state
+            .db
+            .get_supersession("r2")
+            .unwrap()
+            .unwrap()
+            .applied_at
+            .is_some());
+        assert!(state
+            .db
+            .get_supersession("r3")
+            .unwrap()
+            .unwrap()
+            .applied_at
+            .is_some());
+
+        // old1.md: r2's callout SURVIVES, r1's is GONE.
+        let old1 = std::fs::read_to_string(&old1_md).unwrap();
+        assert!(
+            old1.contains("> **owner** — Anna → Bob"),
+            "r2 (survivor) callout kept: {old1}"
+        );
+        assert!(
+            !old1.contains("> **status** — in-progress → shipped"),
+            "r1 (undone) callout removed: {old1}"
+        );
+        // new.md: r2 + r3 backlinks SURVIVE, r1's is GONE.
+        let new = std::fs::read_to_string(&new_md).unwrap();
+        assert!(
+            new.contains("> **owner** — supersedes Anna → Bob in [[old1]]"),
+            "r2 backlink kept: {new}"
+        );
+        assert!(
+            new.contains("> **stage** — supersedes alpha → beta in [[old2]]"),
+            "r3 backlink kept: {new}"
+        );
+        assert!(
+            !new.contains("> **status** — supersedes in-progress → shipped in [[old1]]"),
+            "r1 backlink removed: {new}"
+        );
+        // old2.md: r3 untouched (never in an undo set).
+        assert_eq!(
+            std::fs::read(&old2_md).unwrap(),
+            old2_after_apply,
+            "r3's source note unchanged"
+        );
+
+        // Now UNDO r2, r3 → every file byte-identical to pristine, all rows unapplied.
+        undo_supersessions_inner(&state, &["r2".to_string(), "r3".to_string()]).unwrap();
+        assert_eq!(
+            std::fs::read(&new_md).unwrap(),
+            new_pre,
+            "superseding note back to pristine"
+        );
+        assert_eq!(
+            std::fs::read(&old1_md).unwrap(),
+            old1_pre,
+            "shared source note back to pristine"
+        );
+        assert_eq!(
+            std::fs::read(&old2_md).unwrap(),
+            old2_pre,
+            "other source note back to pristine"
+        );
+        for id in ["r1", "r2", "r3"] {
+            assert!(
+                state
+                    .db
+                    .get_supersession(id)
+                    .unwrap()
+                    .unwrap()
+                    .applied_at
+                    .is_none(),
+                "row {id} unapplied after full undo"
+            );
+        }
+    }
+
+    // ── M6 Shared Brain (Organizations) command-layer gate/consent/scrub/state-machine tests ──────
+
+    /// Seed a locked folder + a meeting + note in it (the sealed-source fixture for the org read-gate).
+    fn seed_locked_meeting_with_note(state: &AppState, folder: &str, meeting: &str) {
+        make_open_folder(&state.db, folder, "Secret");
+        state
+            .db
+            .insert_meeting(&Meeting {
+                id: meeting.to_string(),
+                started_at: "2026-07-10T09:00:00Z".to_string(),
+                ended_at: None,
+                title: Some("Board strategy".to_string()),
+                duration_s: 600,
+                audio_path: None,
+                status: MeetingStatus::Summarized,
+                folder_id: Some(folder.to_string()),
+            })
+            .unwrap();
+        state
+            .db
+            .upsert_note(&NoteRecord {
+                meeting_id: meeting.to_string(),
+                provider_id: "claude_code".to_string(),
+                markdown: "---\nattendees:\n  - Alice\n---\n# secret\ncall me at 415-555-0100"
+                    .to_string(),
+                created_at: "2026-07-10T09:10:00Z".to_string(),
+                exported_path: None,
+                model_requested: None,
+                model_served: None,
+                gateway_host: None,
+            })
+            .unwrap();
+        state.db.set_note_folder(meeting, Some(folder)).unwrap();
+        state
+            .db
+            .set_folder_locked(folder, true, Some(&b"wrapped"[..]))
+            .unwrap();
+    }
+
+    /// RED-before-GREEN (leak class #2): `share_meeting_to_org` on a SEALED-and-not-session-unlocked
+    /// meeting MUST refuse with `AppError::Locked` BEFORE any read/consent/network — a sealed meeting is
+    /// unshareable. Runs with NO consent + NO login/server, so a non-`Locked` return is a gate-order
+    /// violation. After a session unlock, the NEXT failure is the fail-closed CONSENT gate (Unavailable),
+    /// proving the Locked was the FIRST gate, not a downstream error.
+    #[test]
+    fn share_meeting_to_org_refuses_a_sealed_meeting() {
+        let state = build_state("org-share-lockgate");
+        seed_locked_meeting_with_note(&state, "f-lock", "m-locked");
+        // A real org so the target resolves — the read-gate + consent gate still fire FIRST.
+        seed_org(&state.db, "org-1", "Acme", "owner", 1);
+        // NOT session-unlocked: unlocked_folders stays empty.
+        let err = block_on(share_to_org_inner(
+            &state,
+            "org-1",
+            Some("m-locked".to_string()),
+            None,
+            true,
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(err, AppError::Locked(_)),
+            "a sealed meeting must fail closed with Locked, got: {err:?}"
+        );
+
+        // Session-unlock → the read-gate passes; the NEXT gate (org-egress consent, still false) fails.
+        state
+            .unlocked_folders
+            .lock()
+            .unwrap()
+            .insert("f-lock".to_string());
+        let err2 = block_on(share_to_org_inner(
+            &state,
+            "org-1",
+            Some("m-locked".to_string()),
+            None,
+            true,
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(err2, AppError::Unavailable(_)),
+            "past the lock gate, an unconsented org share fails Unavailable, got: {err2:?}"
+        );
+    }
+
+    /// The note-doc twin: `share_document_to_org` on a SEALED authored note refuses with `Locked`
+    /// first, then (once unlocked) fails the consent gate.
+    #[test]
+    fn share_document_to_org_refuses_a_sealed_note() {
+        let state = build_state("org-share-note-lockgate");
+        state
+            .db
+            .insert_folder(&Folder {
+                id: "f-note".to_string(),
+                name: "Secret".to_string(),
+                path: "Secret".to_string(),
+                parent_id: None,
+                locked: false,
+                created_at: "2026-07-10T08:00:00Z".to_string(),
+            })
+            .unwrap();
+        state
+            .db
+            .insert_note("n1", "f-note", "plan", "Plan", "# internal launch April", 1)
+            .unwrap();
+        state
+            .db
+            .set_folder_locked("f-note", true, Some(&b"wrapped"[..]))
+            .unwrap();
+        seed_org(&state.db, "org-1", "Acme", "owner", 1);
+
+        let err = block_on(share_to_org_inner(
+            &state,
+            "org-1",
+            None,
+            Some("n1".to_string()),
+            true,
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(err, AppError::Locked(_)),
+            "a sealed note must fail closed with Locked, got: {err:?}"
+        );
+
+        state
+            .unlocked_folders
+            .lock()
+            .unwrap()
+            .insert("f-note".to_string());
+        let err2 = block_on(share_to_org_inner(
+            &state,
+            "org-1",
+            None,
+            Some("n1".to_string()),
+            true,
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(err2, AppError::Unavailable(_)),
+            "past the lock gate, an unconsented note org share fails Unavailable, got: {err2:?}"
+        );
+    }
+
+    /// RED-before-GREEN for the "blank shared card" bug: a meeting with NO generated note at all
+    /// (`get_latest_note_for_meeting` returns `None`) already refuses via `InvalidArg("no note for
+    /// meeting …")` — this asserts that pre-existing behavior stays intact and is NOT an empty-envelope
+    /// publish. Unlocked + unfoldered so only `build_org_share_body`'s note lookup is exercised.
+    #[test]
+    fn build_org_share_body_refuses_a_meeting_with_no_note_at_all() {
+        let state = build_state("org-share-no-note");
+        state
+            .db
+            .insert_meeting(&Meeting {
+                id: "m-nonote".to_string(),
+                started_at: "2026-07-15T09:00:00Z".to_string(),
+                ended_at: None,
+                title: Some("Untitled sync".to_string()),
+                duration_s: 300,
+                audio_path: None,
+                status: MeetingStatus::Transcribed,
+                folder_id: None,
+            })
+            .unwrap();
+        let err = build_org_share_body(&state, Some("m-nonote"), None, true).unwrap_err();
+        assert!(
+            matches!(err, AppError::InvalidArg(_)),
+            "a meeting with no generated note must refuse, got: {err:?}"
+        );
+    }
+
+    /// RED-before-GREEN (the CONFIRMED root cause): a meeting whose generated note is
+    /// FRONTMATTER-ONLY cleans down to `""` via `clean_note_body` (see
+    /// `share::envelope::frontmatter_only_document_yields_empty_body`). Pre-fix, `build_org_share_body`
+    /// would happily return that empty string and the caller would go on to seal + publish an envelope
+    /// with full header metadata (title/created_at) but a blank content area — a silent, confusing
+    /// share. Post-fix it MUST refuse loudly instead, with a MEETING-worded message (not "note").
+    #[test]
+    fn build_org_share_body_refuses_a_frontmatter_only_meeting_note() {
+        let state = build_state("org-share-empty-meeting-note");
+        make_open_folder(&state.db, "f-empty", "Empty");
+        state
+            .db
+            .insert_meeting(&Meeting {
+                id: "m-empty".to_string(),
+                started_at: "2026-07-15T09:00:00Z".to_string(),
+                ended_at: None,
+                title: Some("Standup".to_string()),
+                duration_s: 300,
+                audio_path: None,
+                status: MeetingStatus::Summarized,
+                folder_id: Some("f-empty".to_string()),
+            })
+            .unwrap();
+        state
+            .db
+            .upsert_note(&NoteRecord {
+                meeting_id: "m-empty".to_string(),
+                provider_id: "claude_code".to_string(),
+                // Frontmatter-only: `strip_frontmatter` correctly reduces this to "".
+                markdown: "---\nattendees:\n  - Bob\n---\n".to_string(),
+                created_at: "2026-07-15T09:10:00Z".to_string(),
+                exported_path: None,
+                model_requested: None,
+                model_served: None,
+                gateway_host: None,
+            })
+            .unwrap();
+        state.db.set_note_folder("m-empty", Some("f-empty")).unwrap();
+        // Folder is NOT locked, so only the empty-body refusal is under test (not the read-gate).
+
+        let err = build_org_share_body(&state, Some("m-empty"), None, true).unwrap_err();
+        assert!(
+            matches!(err, AppError::InvalidArg(_)),
+            "a frontmatter-only meeting note must refuse rather than publish empty, got: {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("meeting"),
+            "the meeting-share refusal must be worded for a meeting: {msg:?}"
+        );
+
+        // Same fixture through the real command-layer entry point (`preview_org_share_inner`), which
+        // is what the FE calls first — confirms the refusal propagates all the way up, not just at the
+        // private helper.
+        let preview_err =
+            preview_org_share_inner(&state, Some("m-empty".to_string()), None, true).unwrap_err();
+        assert!(matches!(preview_err, AppError::InvalidArg(_)));
+    }
+
+    /// The note (document) twin: an authored note whose text is frontmatter-only must ALSO refuse, with
+    /// a NOTE-worded message (not "meeting") — `build_org_share_body` shares the empty-check for both
+    /// branches, so the wording must stay branch-correct.
+    #[test]
+    fn build_org_share_body_refuses_a_frontmatter_only_note() {
+        let state = build_state("org-share-empty-note");
+        state
+            .db
+            .insert_folder(&Folder {
+                id: "f-note-empty".to_string(),
+                name: "Notes".to_string(),
+                path: "Notes".to_string(),
+                parent_id: None,
+                locked: false,
+                created_at: "2026-07-15T08:00:00Z".to_string(),
+            })
+            .unwrap();
+        state
+            .db
+            .insert_note(
+                "n-empty",
+                "f-note-empty",
+                "empty",
+                "Empty",
+                "---\naliases:\n  - x\n---\n",
+                1,
+            )
+            .unwrap();
+
+        let err = build_org_share_body(&state, None, Some("n-empty"), true).unwrap_err();
+        assert!(
+            matches!(err, AppError::InvalidArg(_)),
+            "a frontmatter-only note must refuse rather than publish empty, got: {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("note") && !msg.contains("meeting"),
+            "the note-share refusal must be worded for a note, not a meeting: {msg:?}"
+        );
+    }
+
+    /// The happy path must be UNCHANGED by the empty-body refusal: a meeting with a real generated note
+    /// (non-empty after clean) still shares successfully — `share_to_org_inner` runs to the (expected,
+    /// pre-existing) consent-gate failure, never the new `InvalidArg`, proving the refusal only fires on
+    /// a genuinely empty body.
+    #[test]
+    fn share_to_org_inner_happy_path_unaffected_by_empty_body_guard() {
+        let state = build_state("org-share-happy-unaffected");
+        seed_locked_meeting_with_note(&state, "f-happy", "m-happy");
+        seed_org(&state.db, "org-1", "Acme", "owner", 1);
+        state
+            .unlocked_folders
+            .lock()
+            .unwrap()
+            .insert("f-happy".to_string());
+        let err = block_on(share_to_org_inner(
+            &state,
+            "org-1",
+            Some("m-happy".to_string()),
+            None,
+            true,
+        ))
+        .unwrap_err();
+        // Past the (now-passing) read-gate AND the (now-passing) empty-body guard, the next real gate is
+        // org-egress consent (no consent granted in this fixture) — NOT InvalidArg.
+        assert!(
+            matches!(err, AppError::Unavailable(_)),
+            "a real, non-empty note must sail past the empty-body guard to the consent gate, got: {err:?}"
+        );
+    }
+
+    /// `preview_org_share` never egresses AND still enforces the read-gate: a sealed meeting refuses.
+    /// Once unlocked, the preview returns the CLEANED + SCRUBBED body (frontmatter gone, the phone
+    /// number masked, the scrub count = 1 phone) — and the preview requires NO login/consent.
+    #[test]
+    fn preview_org_share_gates_then_returns_scrubbed_body_no_egress() {
+        let state = build_state("org-preview");
+        seed_locked_meeting_with_note(&state, "f-prev", "m-prev");
+
+        // Sealed → refuse (the preview is a read, so it is gated too).
+        let err = preview_org_share_inner(
+            &state,
+            Some("m-prev".to_string()),
+            None,
+            true,
+        )
+        .unwrap_err();
+        assert!(matches!(err, AppError::Locked(_)), "sealed preview must refuse");
+
+        // Unlock → preview returns the clean + scrubbed body, no egress, no login needed.
+        state
+            .unlocked_folders
+            .lock()
+            .unwrap()
+            .insert("f-prev".to_string());
+        let prev = preview_org_share_inner(
+            &state,
+            Some("m-prev".to_string()),
+            None,
+            true,
+        )
+        .unwrap();
+        // Frontmatter (attendees) stripped by clean_note_body.
+        assert!(
+            !prev.markdown.contains("attendees") && !prev.markdown.contains("Alice"),
+            "frontmatter must be stripped from the preview: {:?}",
+            prev.markdown
+        );
+        // The phone number was scrubbed (regex firewall), and the count reflects it.
+        assert!(
+            !prev.markdown.contains("415-555-0100"),
+            "the phone number must be scrubbed: {:?}",
+            prev.markdown
+        );
+        assert_eq!(prev.scrubbed.phones, 1, "one phone scrubbed");
+        assert_eq!(prev.scrubbed.emails, 0);
+        assert!(prev.scrub, "scrub flag echoed");
+        assert_eq!(prev.bytes, prev.markdown.len() as u32);
+    }
+
+    /// With `scrub=false` the preview keeps PII verbatim (counts all zero) — the toggle is honored.
+    #[test]
+    fn preview_org_share_without_scrub_keeps_pii() {
+        let state = build_state("org-preview-noscrub");
+        seed_locked_meeting_with_note(&state, "f-ns", "m-ns");
+        state
+            .unlocked_folders
+            .lock()
+            .unwrap()
+            .insert("f-ns".to_string());
+        let prev = preview_org_share_inner(
+            &state,
+            Some("m-ns".to_string()),
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(
+            prev.markdown.contains("415-555-0100"),
+            "unscrubbed preview keeps the phone number"
+        );
+        assert_eq!(prev.scrubbed.phones, 0);
+        assert!(!prev.scrub);
+    }
+
+    /// The org-share state machine transitions (DB layer): queued → uploaded → revoke_pending →
+    /// revoked, plus the queued → failed retry path. Also proves `org_share_by_item` + the state
+    /// filters used by the launch sweep.
+    #[test]
+    fn org_share_state_machine_transitions() {
+        let state = build_state("org-share-sm");
+        let sha = vec![7u8; 32];
+        state
+            .db
+            .insert_org_share(
+                "s1",
+                "org-1",
+                Some("m1"),
+                None,
+                "note",
+                Some("Weekly Sync"),
+                1,
+                1,
+                &sha,
+                "2026-07-10T10:00:00Z",
+            )
+            .unwrap();
+        // Fresh row is queued and appears in the sweep's queued pull.
+        assert_eq!(
+            state.db.list_org_shares_in_state("queued").unwrap().len(),
+            1
+        );
+        // queued → uploaded records the item id.
+        state
+            .db
+            .set_org_share_uploaded("s1", "item-abc", "2026-07-10T10:01:00Z")
+            .unwrap();
+        let row = state.db.org_share_by_item("item-abc").unwrap().unwrap();
+        assert_eq!(row.state, "uploaded");
+        assert_eq!(row.item_id.as_deref(), Some("item-abc"));
+        assert!(state.db.list_org_shares_in_state("queued").unwrap().is_empty());
+        // uploaded → revoke_pending → revoked.
+        state
+            .db
+            .set_org_share_state("s1", "revoke_pending", "2026-07-10T10:02:00Z")
+            .unwrap();
+        assert_eq!(
+            state
+                .db
+                .list_org_shares_in_state("revoke_pending")
+                .unwrap()
+                .len(),
+            1
+        );
+        state
+            .db
+            .set_org_share_state("s1", "revoked", "2026-07-10T10:03:00Z")
+            .unwrap();
+        assert_eq!(state.db.get_org_share("s1").unwrap().unwrap().state, "revoked");
+
+        // A second row can go queued → failed (retry path) with a non-PII error.
+        state
+            .db
+            .insert_org_share(
+                "s2",
+                "org-1",
+                None,
+                Some("n2"),
+                "note",
+                Some("Draft"),
+                1,
+                1,
+                &sha,
+                "2026-07-10T11:00:00Z",
+            )
+            .unwrap();
+        state
+            .db
+            .set_org_share_failed("s2", "upload_failed", "2026-07-10T11:01:00Z")
+            .unwrap();
+        let failed = state.db.list_org_shares_in_state("failed").unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].last_error.as_deref(), Some("upload_failed"));
+    }
+
+    /// SB-3 ROW-AMPLIFICATION FIX (RED-before-GREEN): a share whose upload keeps FAILING must yield
+    /// EXACTLY ONE `org_shares` row (state `failed`) no matter how many sweep retries run, and a later
+    /// SUCCESS must flip that SAME row to `uploaded` with NO duplicate. This models the exact
+    /// row-management decision `share_to_org_inner` now makes — `find_reusable_org_share` →
+    /// `reset_org_share_for_retry` (reuse) instead of `insert_org_share` (mint) — using the real DB
+    /// helpers. Pre-fix `share_to_org_inner` unconditionally minted a fresh row every attempt while the
+    /// prior failed row survived, so N failures produced N rows and a recovery double-published. RED on
+    /// the old decision: `find_reusable_org_share` returned nothing (it didn't exist) → every attempt
+    /// would insert. This drives 3 failed attempts + 1 success and asserts a single row throughout.
+    #[test]
+    fn org_share_retry_reuses_one_row_no_amplification() {
+        let state = build_state("org-share-sb3");
+        let sha = vec![5u8; 32];
+        let org = "org-1";
+        let mid = Some("m-flaky");
+
+        // The share row decision `share_to_org_inner` performs, extracted so it can run without a
+        // server: reuse an existing retriable row, else insert a fresh one; return the row id.
+        let attempt_row_id = |title: &str, ts: &str| -> String {
+            match state
+                .db
+                .find_reusable_org_share(org, mid, None)
+                .unwrap()
+            {
+                Some(existing) => {
+                    state
+                        .db
+                        .reset_org_share_for_retry(&existing.id, Some(title), 1, 1, &sha, ts)
+                        .unwrap();
+                    existing.id
+                }
+                None => {
+                    let id = crate::share::new_share_id();
+                    state
+                        .db
+                        .insert_org_share(&id, org, mid, None, "note", Some(title), 1, 1, &sha, ts)
+                        .unwrap();
+                    id
+                }
+            }
+        };
+        let total_rows = || state.db.list_org_shares_for_org(org).unwrap().len();
+
+        // Attempt 1: insert, then upload FAILS.
+        let id1 = attempt_row_id("Flaky", "2026-07-11T10:00:00Z");
+        state.db.set_org_share_failed(&id1, "upload_failed", "2026-07-11T10:00:01Z").unwrap();
+        assert_eq!(total_rows(), 1, "first failed attempt = one row");
+
+        // Attempts 2 & 3 (sweep retries): REUSE the same row, fail again.
+        for (n, ts) in [(2, "2026-07-11T10:05:00Z"), (3, "2026-07-11T10:10:00Z")] {
+            let idn = attempt_row_id("Flaky", ts);
+            assert_eq!(idn, id1, "retry {n} must reuse the SAME row, not mint a new one");
+            state.db.set_org_share_failed(&idn, "upload_failed", ts).unwrap();
+            assert_eq!(total_rows(), 1, "after retry {n}, still exactly one row (no amplification)");
+        }
+        // Exactly one row, and it is FAILED (not a pile of stale queued/failed rows).
+        let failed = state.db.list_org_shares_in_state("failed").unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].id, id1);
+
+        // Recovery: the next attempt reuses the row again and SUCCEEDS → the SAME row flips to
+        // uploaded, item_id recorded, with NO duplicate published row.
+        let id4 = attempt_row_id("Flaky", "2026-07-11T10:15:00Z");
+        assert_eq!(id4, id1, "recovery reuses the same row");
+        state.db.set_org_share_uploaded(&id4, "server-item-1", "2026-07-11T10:15:01Z").unwrap();
+        assert_eq!(total_rows(), 1, "success must not add a duplicate row");
+        let uploaded = state.db.get_org_share(&id1).unwrap().unwrap();
+        assert_eq!(uploaded.state, "uploaded");
+        assert_eq!(uploaded.item_id.as_deref(), Some("server-item-1"));
+        assert!(state.db.list_org_shares_in_state("failed").unwrap().is_empty());
+
+        // A DIFFERENT logical share (a different meeting) is its OWN row — reuse is per logical key.
+        let other = match state.db.find_reusable_org_share(org, Some("m-other"), None).unwrap() {
+            Some(_) => panic!("no reusable row should exist for a fresh meeting"),
+            None => {
+                let id = crate::share::new_share_id();
+                state
+                    .db
+                    .insert_org_share(&id, org, Some("m-other"), None, "note", Some("O"), 1, 1, &sha, "t")
+                    .unwrap();
+                id
+            }
+        };
+        assert_ne!(other, id1);
+        assert_eq!(total_rows(), 2, "a distinct share key gets its own row");
+    }
+
+    /// CROSS-SLICE AAD FIX (RED-before-GREEN for the round-trip bug): the envelope AAD item nonce is
+    /// `hex(content_sha256)`, which BOTH the publisher (from the envelope it seals) and every consumer
+    /// (from the feed's `content_sha256`) derive identically — so a cross-member open SUCCEEDS. The
+    /// old code sealed under the LOCAL row_id (unknowable to a consumer) → open would have FAILED. This
+    /// test seals as the publisher, then opens as a consumer using ONLY the feed hash (never the local
+    /// row id), proving the two AADs match.
+    #[test]
+    fn org_envelope_aad_nonce_is_content_hash_so_cross_member_open_succeeds() {
+        use crate::share::org_envelope::{
+            open_org_envelope, seal_org_envelope, OrgEnvelope, OrgItemKind, OrgSourceKind,
+        };
+
+        let ock = crate::crypto::random_key().unwrap();
+        let env = OrgEnvelope::new(
+            OrgItemKind::Note,
+            "Roadmap",
+            "the apollo migration ships friday",
+            "anna",
+            "2026-07-10T09:00:00Z",
+            1,
+            OrgSourceKind::Meeting,
+        );
+        let content_sha = env.content_sha256();
+
+        // PUBLISHER seals under hex(content_sha) — NOT the local row id. (The server would assign a
+        // different item_id; we simulate that by using a DISTINCT server id below.)
+        let publisher_nonce = org_item_nonce(&content_sha);
+        let (ciphertext, feed_sha) =
+            seal_org_envelope(&ock, &env, "org-1", &publisher_nonce).unwrap();
+        assert_eq!(feed_sha, content_sha, "the feed carries the PLAINTEXT hash");
+
+        // CONSUMER derives the nonce from ONLY the feed's content_sha256 (it never learns row_id, and
+        // the server item_id 'server-xyz' is deliberately different from any local id).
+        let consumer_nonce = org_item_nonce(&feed_sha);
+        assert_eq!(publisher_nonce, consumer_nonce, "both sides derive the same AAD nonce");
+        let opened = open_org_envelope(&ock, &ciphertext, "org-1", &consumer_nonce).unwrap();
+        assert_eq!(opened, env, "a consumer opens the cell with only the feed hash");
+
+        // Sanity: the SERVER item id would NOT open it (proving the old row_id/item_id approach was
+        // broken — the nonce must be the content hash, not any id).
+        assert!(
+            open_org_envelope(&ock, &ciphertext, "org-1", "server-xyz").is_err(),
+            "opening under the server item_id (the old broken nonce) must fail"
+        );
+    }
+
+    /// `org_item_nonce` is deterministic lowercase-hex of the 32-byte hash (stable across devices).
+    #[test]
+    fn org_item_nonce_is_lowercase_hex() {
+        let n = org_item_nonce(&[0x0a, 0xff, 0x00, 0x10]);
+        assert_eq!(n, "0aff0010");
+    }
+
+    /// `org_get_item` command returns the full decrypted item, and `None` for a tombstoned/unknown id.
+    #[test]
+    fn org_get_item_returns_detail_and_none_for_tombstone() {
+        let state = build_state("org-get-item");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        state
+            .db
+            .upsert_org_item(
+                "it-g",
+                "org-1",
+                1,
+                "anna",
+                "Weekly Sync",
+                "the roadmap for the platform team",
+                "2026-07-10T09:00:00Z",
+                2,
+                1,
+                &[5u8; 32],
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let got = state.db.get_org_item("it-g").unwrap().unwrap();
+        assert_eq!(got.item_id, "it-g");
+        assert_eq!(got.title, "Weekly Sync");
+        assert_eq!(got.author_hint, "anna");
+        assert_eq!(got.rev, 2);
+        assert!(got.markdown.contains("platform team"));
+
+        // Tombstone → the viewer returns None.
+        state.db.tombstone_org_item("it-g").unwrap();
+        assert!(state.db.get_org_item("it-g").unwrap().is_none());
+        // Unknown id → None.
+        assert!(state.db.get_org_item("nope").unwrap().is_none());
+    }
+
+    /// PER-INSTANCE ORG TOGGLE (RED-before-GREEN): `get_org_item` — the single-item read behind
+    /// `/org-item/:id` — must return `None` for a DISABLED org's item, closing the gap a stale
+    /// citation/bookmark/browser-history entry could otherwise exploit to read through the toggle
+    /// (this read has no org-id list-scoping to gate at, unlike `list_org_items_inner`). Re-enabling
+    /// instantly restores it — the item itself was never touched.
+    #[test]
+    fn org_get_item_returns_none_for_a_disabled_orgs_item_and_restores_on_reenable() {
+        let state = build_state("org-get-item-disabled");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        state
+            .db
+            .upsert_org_item(
+                "it-d",
+                "org-1",
+                1,
+                "anna",
+                "Weekly Sync",
+                "the roadmap for the platform team",
+                "2026-07-10T09:00:00Z",
+                1,
+                1,
+                &[6u8; 32],
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(state.db.get_org_item("it-d").unwrap().is_some(), "visible while enabled");
+
+        state.db.set_org_context_enabled("org-1", false).unwrap();
+        assert!(
+            state.db.get_org_item("it-d").unwrap().is_none(),
+            "a disabled org's item must NEVER be readable via a direct/stale link"
+        );
+
+        state.db.set_org_context_enabled("org-1", true).unwrap();
+        assert!(
+            state.db.get_org_item("it-d").unwrap().is_some(),
+            "re-enabling instantly restores it — the item itself was never touched"
+        );
+    }
+
+    /// FIX A (browsable org-items LIST): `db.list_org_items` returns the org's LIVE items as headers
+    /// (newest `seq` first, no markdown body), and DROPS a tombstoned item + scopes to the org. This is
+    /// what lets a member SEE what colleagues shared IN — the root of the "A can't see B's note" bug (org
+    /// content was search-only). RED on a missing list (there was no browse path); GREEN with the list.
+    #[test]
+    fn list_org_items_returns_live_headers_newest_first_scoped_and_untombstoned() {
+        let state = build_state("org-list-items");
+        // Two items in org-1 at seq 1 and 2, plus an item in a DIFFERENT org, plus a tombstoned one.
+        state
+            .db
+            .upsert_org_item("a", "org-1", 1, "anna", "Kickoff", "the kickoff agenda", "2026-07-10T09:00:00Z", 1, 1, &[1u8; 32], None, None, None)
+            .unwrap();
+        state
+            .db
+            .upsert_org_item("b", "org-1", 2, "bob", "Retro", "the sprint retro", "2026-07-11T09:00:00Z", 1, 1, &[2u8; 32], None, None, None)
+            .unwrap();
+        state
+            .db
+            .upsert_org_item("z", "org-2", 9, "zed", "Other org", "not our org", "2026-07-11T09:00:00Z", 1, 1, &[3u8; 32], None, None, None)
+            .unwrap();
+        state
+            .db
+            .upsert_org_item("d", "org-1", 3, "dan", "Dead", "revoked", "2026-07-11T10:00:00Z", 1, 1, &[4u8; 32], None, None, None)
+            .unwrap();
+        state.db.tombstone_org_item("d").unwrap();
+
+        let items = state.db.list_org_items("org-1").unwrap();
+        // Only the two LIVE org-1 items, newest seq first (b before a), no other org, no tombstone.
+        assert_eq!(items.len(), 2, "only live org-1 items: {items:?}");
+        assert_eq!(items[0].item_id, "b", "newest seq first");
+        assert_eq!(items[0].title, "Retro");
+        assert_eq!(items[0].author_hint, "bob");
+        assert_eq!(items[0].seq, 2);
+        assert_eq!(items[1].item_id, "a");
+        assert!(
+            !items.iter().any(|h| h.item_id == "z"),
+            "another org's item never appears"
+        );
+        assert!(
+            !items.iter().any(|h| h.item_id == "d"),
+            "a tombstoned item never appears"
+        );
+    }
+
+    /// F-org-editable: `list_org_items_inner` ENRICHES an item the caller published with an
+    /// `owned_source` ref plus the source's CURRENT title (so the author's own card links to the
+    /// editable original and never shows a stale publish-time snapshot), while an item shared by
+    /// SOMEONE ELSE (no local share) stays a bare read-only replica. RED before the enrichment
+    /// (owned_source always None, title frozen).
+    #[test]
+    fn list_org_items_enriches_owned_items_with_editable_source_and_current_title() {
+        let state = build_state("org-list-owned");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        make_open_folder(&state.db, "f-own", "Team");
+        // The author's local note, retitled to "Jest tytul" AFTER it was shared as "Untitled".
+        state
+            .db
+            .insert_note("n-own", "f-own", "Untitled", "Jest tytul", "# body", 1)
+            .unwrap();
+        // The received replica (frozen at publish time = "Untitled") + the matching OUTBOUND share.
+        state
+            .db
+            .upsert_org_item("item-own", "org-1", 2, "kgm004a", "Untitled", "# body", "2026-07-11T09:00:00Z", 1, 1, &[9u8; 32], None, None, None)
+            .unwrap();
+        state
+            .db
+            .insert_org_share("s-own", "org-1", None, Some("n-own"), "note", Some("Untitled"), 1, 1, &[9u8; 32], "2026-07-11T09:00:00Z")
+            .unwrap();
+        state
+            .db
+            .set_org_share_uploaded("s-own", "item-own", "2026-07-11T09:00:00Z")
+            .unwrap();
+        // Someone ELSE's replica — no local share ⇒ stays read-only, title untouched.
+        state
+            .db
+            .upsert_org_item("item-other", "org-1", 1, "kgm004a+2", "Ich notatka", "body", "2026-07-10T09:00:00Z", 1, 1, &[7u8; 32], None, None, None)
+            .unwrap();
+
+        let items = list_org_items_inner(&state, "org-1").unwrap();
+        let own = items.iter().find(|i| i.item_id == "item-own").unwrap();
+        assert_eq!(
+            own.title, "Jest tytul",
+            "owned item shows the source's CURRENT title, not the stale snapshot"
+        );
+        let owned = own.owned_source.as_ref().expect("owned item carries a source ref");
+        assert_eq!(owned.kind, "document");
+        assert_eq!(owned.id, "n-own");
+
+        let other = items.iter().find(|i| i.item_id == "item-other").unwrap();
+        assert!(other.owned_source.is_none(), "a non-author's item is a read-only replica");
+        assert_eq!(other.title, "Ich notatka", "a non-owned title is left as-is");
+    }
+
+    /// F-org-editable-any-device storage: `set_org_item_author` stamps the author id and
+    /// `org_item_edit_ctx` reads it back (with org/rev/created_at/source_kind). An item that was never
+    /// stamped reports `author_user_id: None` — the fail-closed default the ownership gate relies on.
+    #[test]
+    fn org_item_edit_ctx_round_trips_author_and_meta() {
+        let state = build_state("org-edit-ctx");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        state
+            .db
+            .upsert_org_item("item-x", "org-1", 3, "anna", "T", "# body", "2026-07-11T09:00:00Z", 2, 1, &[9u8; 32], Some("document"), None, None)
+            .unwrap();
+
+        // Un-stamped ⇒ author is None (a member could never pass the ownership gate on it).
+        let ctx0 = state.db.org_item_edit_ctx("item-x").unwrap().unwrap();
+        assert_eq!(ctx0.author_user_id, None);
+        assert_eq!(ctx0.org_id, "org-1");
+        assert_eq!(ctx0.rev, 2);
+        assert_eq!(ctx0.created_at, "2026-07-11T09:00:00Z");
+        assert_eq!(ctx0.source_kind.as_deref(), Some("document"));
+
+        // After stamping, the exact author id reads back.
+        state.db.set_org_item_author("item-x", "author-uuid-123").unwrap();
+        let ctx1 = state.db.org_item_edit_ctx("item-x").unwrap().unwrap();
+        assert_eq!(ctx1.author_user_id.as_deref(), Some("author-uuid-123"));
+
+        // A survivor of ON CONFLICT re-upsert (feed re-pull) keeps the author (not in the SET list).
+        state
+            .db
+            .upsert_org_item("item-x", "org-1", 4, "anna", "T2", "# body2", "2026-07-11T09:00:00Z", 3, 1, &[8u8; 32], Some("document"), None, None)
+            .unwrap();
+        let ctx2 = state.db.org_item_edit_ctx("item-x").unwrap().unwrap();
+        assert_eq!(
+            ctx2.author_user_id.as_deref(),
+            Some("author-uuid-123"),
+            "a re-pull upsert must NOT wipe the stamped author"
+        );
+        assert_eq!(ctx2.rev, 3, "the re-pull DID update rev");
+    }
+
+    /// SECURITY GATE (F-org-editable): `org_update_own_item_inner` refuses to re-publish an item the
+    /// caller did NOT author — it returns `Auth` BEFORE any network egress. Seed a live session whose
+    /// `server_user_id` differs from the item's stamped author; the ownership check (step 0) must reject.
+    #[test]
+    fn org_update_own_item_refuses_a_non_author() {
+        let state = build_state("org-edit-not-author");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        state
+            .db
+            .upsert_org_item("item-theirs", "org-1", 1, "bob", "Bob's note", "# body", "2026-07-11T09:00:00Z", 1, 1, &[7u8; 32], Some("document"), None, None)
+            .unwrap();
+        // Authored by SOMEONE ELSE.
+        state.db.set_org_item_author("item-theirs", "bob-user-id").unwrap();
+        // Consent ON + a live session for a DIFFERENT user — proves the refusal is the OWNERSHIP gate,
+        // not a missing session or consent.
+        state.config.lock().unwrap().org_egress_consented = true;
+        *state.account_session.lock().unwrap() = Some(crate::share::AccountSession {
+            account_id: "me@example.com".into(),
+            email: "me@example.com".into(),
+            server_user_id: Some("me-user-id".into()),
+            device_id: "dev-1".into(),
+            mk: Zeroizing::new([7u8; 32]),
+            generation: 1,
+            access_token: "a".into(),
+            access_expires_at: Some("2099-01-01T00:00:00Z".into()),
+            refresh_token: "r".into(),
+        });
+
+        let err = block_on(org_update_own_item_inner(&state, "item-theirs", "hacked", "# pwned"))
+            .expect_err("a non-author must NOT be able to re-publish someone else's org item");
+        assert!(
+            matches!(err, AppError::Auth(_)),
+            "expected an Auth refusal, got {err:?}"
+        );
+        // The stored item is untouched (no local overwrite of the colleague's copy).
+        let detail = state.db.get_org_item("item-theirs").unwrap().unwrap();
+        assert_eq!(detail.title, "Bob's note");
+    }
+
+    /// FAIL-CLOSED CONSENT (F-org-editable): even the AUTHOR cannot re-publish an edit while org-egress
+    /// consent is OFF — `org_update_own_item_inner` returns `Unavailable` before any network egress.
+    #[test]
+    fn org_update_own_item_is_consent_fail_closed_for_the_author() {
+        let state = build_state("org-edit-consent");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        state
+            .db
+            .upsert_org_item("item-mine", "org-1", 1, "me", "Mine", "# body", "2026-07-11T09:00:00Z", 1, 1, &[9u8; 32], Some("document"), None, None)
+            .unwrap();
+        state.db.set_org_item_author("item-mine", "me-user-id").unwrap();
+        // The caller IS the author, but consent is OFF (the default).
+        assert!(!state.config.lock().unwrap().org_egress_consented);
+        *state.account_session.lock().unwrap() = Some(crate::share::AccountSession {
+            account_id: "me@example.com".into(),
+            email: "me@example.com".into(),
+            server_user_id: Some("me-user-id".into()),
+            device_id: "dev-1".into(),
+            mk: Zeroizing::new([7u8; 32]),
+            generation: 1,
+            access_token: "a".into(),
+            access_expires_at: Some("2099-01-01T00:00:00Z".into()),
+            refresh_token: "r".into(),
+        });
+
+        let err = block_on(org_update_own_item_inner(&state, "item-mine", "edit", "# edit"))
+            .expect_err("no egress while consent is off, even for the author");
+        assert!(
+            matches!(err, AppError::Unavailable(_)),
+            "expected an Unavailable (consent) refusal, got {err:?}"
+        );
+    }
+
+    /// SIBLING-GAP FIX (2026-07-16): `org_update_own_item_inner` is a SEPARATE org-publish path from
+    /// `build_org_share_body` (edit-in-place on an already-shared item, never routing through the
+    /// share/republish seam) — it needs its OWN copy of the "refuse an empty publish" guard, or an
+    /// author could reproduce the identical "blank card" bug (found first via `build_org_share_body`,
+    /// PR #342) by editing their own item's body down to nothing. RED against the pre-fix code (which
+    /// had no emptiness check on this path at all): editing to whitespace-only content would have
+    /// sailed through to `client.org_publish_item(...)` and published a real, live, empty-bodied item.
+    #[test]
+    fn org_update_own_item_refuses_an_empty_edit() {
+        let state = build_state("org-edit-empty");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        state
+            .db
+            .upsert_org_item("item-mine", "org-1", 1, "me", "Mine", "# body", "2026-07-11T09:00:00Z", 1, 1, &[9u8; 32], Some("document"), None, None)
+            .unwrap();
+        state.db.set_org_item_author("item-mine", "me-user-id").unwrap();
+        state.config.lock().unwrap().org_egress_consented = true;
+        *state.account_session.lock().unwrap() = Some(crate::share::AccountSession {
+            account_id: "me@example.com".into(),
+            email: "me@example.com".into(),
+            server_user_id: Some("me-user-id".into()),
+            device_id: "dev-1".into(),
+            mk: Zeroizing::new([7u8; 32]),
+            generation: 1,
+            access_token: "a".into(),
+            access_expires_at: Some("2099-01-01T00:00:00Z".into()),
+            refresh_token: "r".into(),
+        });
+
+        // Whitespace-only body — cleans down to "" the same way a frontmatter-only note does.
+        let err = block_on(org_update_own_item_inner(&state, "item-mine", "Mine", "   \n\n  "))
+            .expect_err("editing an org item's body down to nothing must be refused");
+        assert!(
+            matches!(err, AppError::InvalidArg(_)),
+            "expected InvalidArg for an empty edit, got {err:?}"
+        );
+        // The item's stored body is untouched — no empty republish reached the network/local upsert.
+        let detail = state.db.get_org_item("item-mine").unwrap().unwrap();
+        assert_eq!(detail.markdown, "# body");
+    }
+
+    /// A missing / tombstoned item id is an `InvalidArg`, resolved BEFORE any session or network work.
+    #[test]
+    fn org_update_own_item_rejects_an_unknown_item() {
+        let state = build_state("org-edit-unknown");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        let err = block_on(org_update_own_item_inner(&state, "does-not-exist", "t", "b"))
+            .expect_err("an unknown item id must be rejected");
+        assert!(
+            matches!(err, AppError::InvalidArg(_)),
+            "expected InvalidArg for an unknown item, got {err:?}"
+        );
+    }
+
+    /// `delete_org_item_as_author_inner` — OWNERSHIP GATE (Bug B, root-cause fix 2026-07-15): refuses
+    /// to remove an item the caller did NOT author — `AppError::Auth`, BEFORE any network egress, and
+    /// no local mutation. Mirrors `org_update_own_item_refuses_a_non_author`'s shape exactly, since
+    /// both share the same `org_item_edit_ctx`-based ownership signal.
+    #[test]
+    fn delete_org_item_as_author_refuses_a_non_author() {
+        let state = build_state("org-delete-not-author");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        state
+            .db
+            .upsert_org_item("item-theirs", "org-1", 1, "bob", "Bob's note", "# body", "2026-07-11T09:00:00Z", 1, 1, &[7u8; 32], Some("document"), None, None)
+            .unwrap();
+        state.db.set_org_item_author("item-theirs", "bob-user-id").unwrap();
+        *state.account_session.lock().unwrap() = Some(crate::share::AccountSession {
+            account_id: "me@example.com".into(),
+            email: "me@example.com".into(),
+            server_user_id: Some("me-user-id".into()),
+            device_id: "dev-1".into(),
+            mk: Zeroizing::new([7u8; 32]),
+            generation: 1,
+            access_token: "a".into(),
+            access_expires_at: Some("2099-01-01T00:00:00Z".into()),
+            refresh_token: "r".into(),
+        });
+
+        let err = block_on(delete_org_item_as_author_inner(&state, "item-theirs"))
+            .expect_err("a non-author must NOT be able to remove someone else's org item");
+        // Match the EXACT ownership-gate message, not just the AppError variant — this test's
+        // harness has no reachable server (share_base_url unset), so a coincidental error from a
+        // LATER step (e.g. the tombstone network call) could ALSO surface as an Auth variant,
+        // silently defeating this test if the gate itself were ever removed. Pinning the literal
+        // message proves the refusal came from the ownership check specifically (adversarial
+        // review of PR #340 found the un-tightened version of this assertion still passed with
+        // the ownership gate deleted entirely).
+        assert!(
+            matches!(&err, AppError::Auth(msg) if msg == "you can only remove org notes you authored"),
+            "expected the ownership-gate's exact Auth refusal, got {err:?}"
+        );
+        // Untouched: still live, still Bob's — the ownership gate ran before any tombstone attempt.
+        let detail = state.db.get_org_item("item-theirs").unwrap().unwrap();
+        assert_eq!(detail.title, "Bob's note");
+    }
+
+    /// A missing / already-tombstoned item id is an `InvalidArg`, resolved BEFORE any session/network
+    /// work — same shape as `org_update_own_item_rejects_an_unknown_item`.
+    #[test]
+    fn delete_org_item_as_author_rejects_an_unknown_item() {
+        let state = build_state("org-delete-unknown");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        let err = block_on(delete_org_item_as_author_inner(&state, "does-not-exist"))
+            .expect_err("an unknown item id must be rejected");
+        assert!(
+            matches!(err, AppError::InvalidArg(_)),
+            "expected InvalidArg for an unknown item, got {err:?}"
+        );
+    }
+
+    /// `delete_org_item_as_author_inner` — FULL SUCCESS PATH (RED→GREEN, Bug B): the author's own
+    /// item, with a mock server confirming the tombstone DELETE, is removed from BOTH the server (the
+    /// mock asserts the exact `DELETE /v1/orgs/{org}/items/{item}` request landed) and this device's
+    /// own local `org_items` replica (`get_org_item` returns `None` afterward — `tombstoned` items are
+    /// filtered the same way `tombstone_org_item`'s other caller, the feed's own `FeedAction::
+    /// Tombstone` arm, already proves). RED before this command existed: there was NO way at all for
+    /// an author to remove an org item without a local `org_shares`/`documents` anchor — this test
+    /// pins the new command actually completing that removal end-to-end, not just accepting the call.
+    #[test]
+    fn delete_org_item_as_author_removes_the_authors_own_item() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 8192];
+            let n = sock.read(&mut buf).unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]);
+            // The exact tombstone request: DELETE on this org's item.
+            assert!(
+                req.starts_with("DELETE /v1/orgs/org-1/items/item-mine"),
+                "expected a DELETE tombstone request, got: {}",
+                req.lines().next().unwrap_or("")
+            );
+            let resp = "HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+            let _ = sock.write_all(resp.as_bytes());
+        });
+
+        let state = build_state("org-delete-success");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        state
+            .db
+            .upsert_org_item(
+                "item-mine",
+                "org-1",
+                1,
+                "me",
+                "Mine",
+                "# body",
+                "2026-07-11T09:00:00Z",
+                1,
+                1,
+                &[9u8; 32],
+                Some("document"),
+                Some("me-user-id"),
+                None,
+            )
+            .unwrap();
+        state.config.lock().unwrap().share_base_url = format!("http://{addr}");
+        *state.account_session.lock().unwrap() = Some(crate::share::AccountSession {
+            account_id: "me@example.com".into(),
+            email: "me@example.com".into(),
+            server_user_id: Some("me-user-id".into()),
+            device_id: "dev-1".into(),
+            mk: Zeroizing::new([7u8; 32]),
+            generation: 1,
+            access_token: "a".into(),
+            access_expires_at: Some("2099-01-01T00:00:00Z".into()),
+            refresh_token: "r".into(),
+        });
+
+        block_on(delete_org_item_as_author_inner(&state, "item-mine"))
+            .expect("the author's own item must be removable");
+        server.join().unwrap();
+
+        // Gone from this device's own replica — the same "tombstoned rows are invisible" contract
+        // every other org-item read path relies on.
+        assert!(
+            state.db.get_org_item("item-mine").unwrap().is_none(),
+            "the item must be gone from this device's local replica after a successful removal"
+        );
+    }
+
+    /// Feature B (auto-title): a still-"Untitled" note gets a first-line title (no on-device model in
+    /// tests → the heuristic path), a user-titled note is NEVER overwritten, and an empty body stays
+    /// "Untitled". LOCAL-only; no egress in any branch.
+    #[test]
+    fn suggest_note_title_fills_untitled_and_never_clobbers() {
+        let state = build_state("auto-title");
+        make_open_folder(&state.db, "f", "Team");
+
+        // Untitled + body in an open folder → first non-empty line becomes the title, persisted.
+        state
+            .db
+            .insert_note("n1", "f", "n1", "Untitled", "# Kickoff planning\nmore body", 1)
+            .unwrap();
+        let t = block_on(suggest_note_title_inner(&state, "n1")).unwrap();
+        assert_eq!(t, "Kickoff planning");
+        assert_eq!(
+            state.db.get_note_row("n1").unwrap().unwrap().title.as_deref(),
+            Some("Kickoff planning"),
+            "the title is persisted"
+        );
+
+        // A user-set title is NEVER overwritten.
+        state
+            .db
+            .insert_note("n2", "f", "n2", "My Title", "some body", 1)
+            .unwrap();
+        assert_eq!(
+            block_on(suggest_note_title_inner(&state, "n2")).unwrap(),
+            "My Title"
+        );
+        assert_eq!(
+            state.db.get_note_row("n2").unwrap().unwrap().title.as_deref(),
+            Some("My Title")
+        );
+
+        // Untitled + EMPTY body → stays Untitled (nothing to title).
+        state
+            .db
+            .insert_note("n3", "f", "n3", "Untitled", "   \n  ", 1)
+            .unwrap();
+        assert_eq!(
+            block_on(suggest_note_title_inner(&state, "n3")).unwrap(),
+            "Untitled"
+        );
+        assert_eq!(
+            state.db.get_note_row("n3").unwrap().unwrap().title.as_deref(),
+            Some("Untitled")
+        );
+    }
+
+    /// Feature A (the primary bug fix, RED-before-GREEN): `create_note(None)` when the legacy "Notes"
+    /// folder is LOCKED must STILL succeed — it now anchors to the reserved always-open root, not the
+    /// sealed "Notes" (pre-fix it hit the write-gate and returned `Locked` — the "Couldn't create the
+    /// note" dead-end).
+    #[test]
+    fn create_note_with_a_locked_legacy_notes_still_succeeds_via_the_root() {
+        let state = build_state("create-note-locked-default");
+        let notes_id = state.db.ensure_default_note_folder().unwrap();
+        state
+            .db
+            .set_folder_locked(&notes_id, true, Some(&b"wrapped"[..]))
+            .unwrap();
+
+        let id = create_note_inner(&state, None, "Untitled").unwrap();
+        let row = state.db.get_note_row(&id).unwrap().unwrap();
+        assert_ne!(
+            row.folder_id, notes_id,
+            "a new note must NOT be created into the locked legacy Notes folder"
+        );
+        let root = state.db.note_root_id().unwrap().unwrap();
+        assert_eq!(row.folder_id, root, "it lands in the reserved always-open root");
+        assert!(
+            !state.db.folder_by_id(&root).unwrap().unwrap().locked,
+            "the root is always open"
+        );
+    }
+
+    /// Feature A: the reserved Notes root can NEVER be locked (unfiled notes are deliberately open;
+    /// sealing means filing into a lockable folder). `lock_folder_inner` refuses it.
+    #[test]
+    fn lock_folder_refuses_the_reserved_notes_root() {
+        let state = build_state("lock-refuses-root");
+        let root = state.db.ensure_notes_root().unwrap();
+        let err = lock_folder_inner(&state, root.clone())
+            .expect_err("locking the Notes root must be refused");
+        assert!(
+            matches!(err, AppError::InvalidArg(_)),
+            "expected InvalidArg refusing the root lock, got {err:?}"
+        );
+        assert!(
+            !state.db.folder_by_id(&root).unwrap().unwrap().locked,
+            "the root stays unlocked after a refused lock"
+        );
+    }
+
+    /// Feature A: `ensure_notes_root` repurposes an UNLOCKED legacy "Notes" in place (flag flip), but
+    /// creates a SEPARATE always-open root when the legacy "Notes" is LOCKED — never flagging the
+    /// locked folder as the root (the invariant "is_root ⟹ never sealed"). Idempotent.
+    #[test]
+    fn ensure_notes_root_repurposes_unlocked_but_separates_when_locked() {
+        // Fresh: creates "Notes" as an unlocked root; idempotent.
+        let fresh = build_state("root-fresh");
+        let r = fresh.db.ensure_notes_root().unwrap();
+        assert!(fresh.db.folder_is_root(&r).unwrap());
+        assert!(!fresh.db.folder_by_id(&r).unwrap().unwrap().locked);
+        assert_eq!(fresh.db.ensure_notes_root().unwrap(), r, "idempotent");
+
+        // Unlocked legacy "Notes" → repurposed in place (same id becomes the root).
+        let open = build_state("root-repurpose");
+        let notes = open.db.ensure_default_note_folder().unwrap();
+        assert_eq!(open.db.ensure_notes_root().unwrap(), notes);
+        assert!(open.db.folder_is_root(&notes).unwrap());
+
+        // Locked legacy "Notes" → a SEPARATE open root; the locked folder is never the root.
+        let locked = build_state("root-locked");
+        let notes3 = locked.db.ensure_default_note_folder().unwrap();
+        locked
+            .db
+            .set_folder_locked(&notes3, true, Some(&b"w"[..]))
+            .unwrap();
+        let r3 = locked.db.ensure_notes_root().unwrap();
+        assert_ne!(r3, notes3, "a locked legacy Notes is NOT repurposed");
+        assert!(
+            !locked.db.folder_is_root(&notes3).unwrap(),
+            "the locked Notes is never flagged is_root"
+        );
+        assert!(!locked.db.folder_by_id(&r3).unwrap().unwrap().locked);
+    }
+
+    /// STUCK-REPUBLISH FIX (`resolve_owned_source`): `resolve_owned_source` must mirror
+    /// `org_resolve_source_inner` (fixed in cd21b10) and NOT gate on `state == "uploaded"` — a
+    /// republish that failed transiently leaves the row `state = "failed"` with its OLD,
+    /// still-server-live `item_id` retained (`set_org_share_failed` never clears it). Before this
+    /// fix `resolve_owned_source` returned `None` for such a row, so the author's own stuck card
+    /// showed up as NOT owned in `list_org_items` — `openOrgCard` would then route to the read-only
+    /// viewer instead of the real editable original. A `revoked` row (intentionally torn down) is
+    /// the one state that must still fail to enrich.
+    #[test]
+    fn list_org_items_enriches_a_stuck_failed_owned_item_but_not_a_revoked_one() {
+        let state = build_state("org-list-owned-stuck-failed");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        make_open_folder(&state.db, "f-stuck", "Team");
+        let now = "2026-07-13T00:00:00Z";
+
+        // Published successfully once, then a REPUBLISH attempt failed — item_id retained.
+        state
+            .db
+            .insert_note("n-stuck", "f-stuck", "Untitled", "Fixed Title", "# body", 1)
+            .unwrap();
+        state
+            .db
+            .upsert_org_item("item-stuck", "org-1", 1, "kgm004a", "Untitled", "# body", now, 1, 1, &[9u8; 32], None, None, None)
+            .unwrap();
+        state
+            .db
+            .insert_org_share("s-stuck", "org-1", None, Some("n-stuck"), "note", Some("Untitled"), 1, 1, &[9u8; 32], now)
+            .unwrap();
+        state.db.set_org_share_uploaded("s-stuck", "item-stuck", now).unwrap();
+        state.db.set_org_share_failed("s-stuck", "republish_upload_failed", now).unwrap();
+
+        // A SEPARATE row that was uploaded, then intentionally revoked — must NOT enrich.
+        state
+            .db
+            .insert_note("n-revoked", "f-stuck", "Gone", "Gone Title", "# body", 1)
+            .unwrap();
+        state
+            .db
+            .upsert_org_item("item-revoked", "org-1", 1, "kgm004a", "Gone", "# body", now, 1, 1, &[8u8; 32], None, None, None)
+            .unwrap();
+        state
+            .db
+            .insert_org_share("s-revoked", "org-1", None, Some("n-revoked"), "note", Some("Gone"), 1, 1, &[8u8; 32], now)
+            .unwrap();
+        state.db.set_org_share_uploaded("s-revoked", "item-revoked", now).unwrap();
+        state.db.set_org_share_state("s-revoked", "revoked", now).unwrap();
+
+        let items = list_org_items_inner(&state, "org-1").unwrap();
+
+        let stuck = items.iter().find(|i| i.item_id == "item-stuck").unwrap();
+        assert_eq!(
+            stuck.title, "Fixed Title",
+            "a stuck failed-with-item_id row still shows the source's CURRENT title"
+        );
+        let owned = stuck
+            .owned_source
+            .as_ref()
+            .expect("a stuck failed-with-item_id row still resolves as owned (not a leftover read-only replica)");
+        assert_eq!(owned.kind, "document");
+        assert_eq!(owned.id, "n-stuck");
+
+        let revoked = items.iter().find(|i| i.item_id == "item-revoked").unwrap();
+        assert!(
+            revoked.owned_source.is_none(),
+            "an intentionally revoked share must not enrich as owned"
+        );
+    }
+
+    /// `OrgItemHeader.kind` round-trips for BOTH an owned document-kind share and an owned
+    /// meeting-kind share, and stays `None` for a colleague's item that was upserted with no stored
+    /// `source_kind` (mirrors an item ingested off a v1 envelope / before this column existed — the
+    /// genuinely-unclassified case; a colleague's item ingested off a v2 envelope now DOES classify,
+    /// since `Db::list_org_items` SELECTs the stored `org_items.source_kind` column directly for
+    /// every item). For owned items, `kind` is resolved from `org_shares.document_id` / `meeting_id`
+    /// presence — metadata only, independent of the `owned_source` unlock gate.
+    #[test]
+    fn list_org_items_resolves_kind_for_document_and_meeting_owned_shares_and_none_for_others() {
+        let state = build_state("org-list-kind");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        make_open_folder(&state.db, "f-own", "Team");
+
+        // Owned DOCUMENT (note) share.
+        state
+            .db
+            .insert_note("n-own", "f-own", "Untitled", "A Note", "# body", 1)
+            .unwrap();
+        state
+            .db
+            .upsert_org_item("item-doc", "org-1", 3, "kgm004a", "A Note", "# body", "2026-07-11T09:00:00Z", 1, 1, &[9u8; 32], None, None, None)
+            .unwrap();
+        state
+            .db
+            .insert_org_share("s-doc", "org-1", None, Some("n-own"), "note", Some("A Note"), 1, 1, &[9u8; 32], "2026-07-11T09:00:00Z")
+            .unwrap();
+        state.db.set_org_share_uploaded("s-doc", "item-doc", "2026-07-11T09:00:00Z").unwrap();
+
+        // Owned MEETING share (unlocked meeting: no folder_id).
+        state
+            .db
+            .insert_meeting(&Meeting {
+                id: "m-own".to_string(),
+                started_at: "2026-07-11T09:00:00Z".to_string(),
+                ended_at: None,
+                title: Some("Standup".to_string()),
+                duration_s: 60,
+                audio_path: None,
+                status: MeetingStatus::Exported,
+                folder_id: None,
+            })
+            .unwrap();
+        state
+            .db
+            .upsert_org_item("item-meeting", "org-1", 2, "kgm004a", "Standup", "# body", "2026-07-11T09:00:00Z", 1, 1, &[8u8; 32], None, None, None)
+            .unwrap();
+        state
+            .db
+            .insert_org_share("s-meeting", "org-1", Some("m-own"), None, "meeting", Some("Standup"), 1, 1, &[8u8; 32], "2026-07-11T09:00:00Z")
+            .unwrap();
+        state.db.set_org_share_uploaded("s-meeting", "item-meeting", "2026-07-11T09:00:00Z").unwrap();
+
+        // A colleague's item — no local `org_shares` row.
+        state
+            .db
+            .upsert_org_item("item-other", "org-1", 1, "kgm004a+2", "Ich notatka", "body", "2026-07-10T09:00:00Z", 1, 1, &[7u8; 32], None, None, None)
+            .unwrap();
+
+        let items = list_org_items_inner(&state, "org-1").unwrap();
+        let doc = items.iter().find(|i| i.item_id == "item-doc").unwrap();
+        assert_eq!(doc.kind.as_deref(), Some("document"), "owned note share ⇒ kind=document");
+        let meeting = items.iter().find(|i| i.item_id == "item-meeting").unwrap();
+        assert_eq!(meeting.kind.as_deref(), Some("meeting"), "owned meeting share ⇒ kind=meeting");
+        let other = items.iter().find(|i| i.item_id == "item-other").unwrap();
+        assert!(other.kind.is_none(), "a colleague's item has no locally-knowable kind");
+    }
+
+    /// F-org-editable GATE: an owned item whose source folder is LOCKED (not session-unlocked) is NOT
+    /// enriched — its current title must never leak through the org list, and it falls back to the
+    /// read-only replica (frozen snapshot title). RED before the `folder_is_unlocked` gate.
+    #[test]
+    fn list_org_items_does_not_leak_a_locked_owned_source_title() {
+        let state = build_state("org-list-owned-locked");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        // A LOCKED folder (never added to the session unlocked set).
+        state
+            .db
+            .insert_folder(&Folder {
+                id: "f-lock".to_string(),
+                name: "Vault".to_string(),
+                path: "Vault".to_string(),
+                parent_id: None,
+                locked: true,
+                created_at: "2026-06-27T08:00:00Z".to_string(),
+            })
+            .unwrap();
+        state
+            .db
+            .insert_note("n-lock", "f-lock", "secret", "Secret Title", "# body", 1)
+            .unwrap();
+        state
+            .db
+            .upsert_org_item("item-lock", "org-1", 1, "kgm004a", "Old Snapshot", "# body", "2026-07-11T09:00:00Z", 1, 1, &[5u8; 32], None, None, None)
+            .unwrap();
+        state
+            .db
+            .insert_org_share("s-lock", "org-1", None, Some("n-lock"), "note", Some("Old Snapshot"), 1, 1, &[5u8; 32], "2026-07-11T09:00:00Z")
+            .unwrap();
+        state
+            .db
+            .set_org_share_uploaded("s-lock", "item-lock", "2026-07-11T09:00:00Z")
+            .unwrap();
+
+        let items = list_org_items_inner(&state, "org-1").unwrap();
+        let it = items.iter().find(|i| i.item_id == "item-lock").unwrap();
+        assert!(
+            it.owned_source.is_none(),
+            "a locked owned source is not resolved (no editable link)"
+        );
+        assert_eq!(
+            it.kind.as_deref(),
+            Some("document"),
+            "kind is METADATA (not content) — still resolved even when the owned source is locked"
+        );
+        assert_ne!(
+            it.title, "Secret Title",
+            "a locked source's current title must NOT leak into the org list"
+        );
+        assert_eq!(it.title, "Old Snapshot", "falls back to the frozen replica snapshot");
+    }
+
+    /// FIX A (command gate): `list_org_items_inner` refuses an org the caller isn't a local member of
+    /// (membership-checked via `resolve_org`) — never leaking another org's list — and returns the list
+    /// for a member org.
+    #[test]
+    fn list_org_items_command_refuses_non_member_org() {
+        let state = build_state("org-list-items-gate");
+        seed_org(&state.db, "org-mine", "Mine", "owner", 1);
+        state
+            .db
+            .upsert_org_item("m1", "org-mine", 1, "anna", "Mine A", "body", "2026-07-11T09:00:00Z", 1, 1, &[1u8; 32], None, None, None)
+            .unwrap();
+        // A member org resolves + returns the item.
+        let ok = list_org_items_inner(&state, "org-mine").unwrap();
+        assert_eq!(ok.len(), 1);
+        assert_eq!(ok[0].item_id, "m1");
+        // A non-member org is InvalidArg (never a leak of that org's list).
+        assert!(matches!(
+            list_org_items_inner(&state, "org-not-mine"),
+            Err(AppError::InvalidArg(_))
+        ));
+        // A blank id is refused too.
+        assert!(matches!(
+            list_org_items_inner(&state, "  "),
+            Err(AppError::InvalidArg(_))
+        ));
+    }
+
+    /// PER-INSTANCE ORG TOGGLE (RED-before-GREEN): a DISABLED org's `list_org_items_inner` returns
+    /// EMPTY — not an error (disabling is a deliberate, reversible local setting, not a membership
+    /// problem) — even though the local replica still has live items. Re-enabling instantly restores
+    /// the listing, proving the replica itself is untouched by the toggle.
+    #[test]
+    fn list_org_items_inner_is_empty_for_a_disabled_org_and_restores_on_reenable() {
+        let state = build_state("org-list-items-disabled");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        state
+            .db
+            .upsert_org_item("m1", "org-1", 1, "anna", "Kickoff", "body", "2026-07-11T09:00:00Z", 1, 1, &[1u8; 32], None, None, None)
+            .unwrap();
+
+        assert_eq!(list_org_items_inner(&state, "org-1").unwrap().len(), 1, "visible while enabled");
+
+        state.db.set_org_context_enabled("org-1", false).unwrap();
+        assert_eq!(
+            list_org_items_inner(&state, "org-1").unwrap(),
+            Vec::new(),
+            "a disabled org's item list must be EMPTY, not an error"
+        );
+
+        state.db.set_org_context_enabled("org-1", true).unwrap();
+        assert_eq!(
+            list_org_items_inner(&state, "org-1").unwrap().len(),
+            1,
+            "re-enabling instantly restores the listing — the replica was never touched"
+        );
+    }
+
+    /// `org_set_context_enabled_inner` (RED-before-GREEN): flips the per-instance toggle for a
+    /// MEMBER org, refuses a non-member (never lets a caller toggle an org it isn't in), and an
+    /// incoming `upsert_org_state` status refresh NEVER silently re-enables a locally-disabled org —
+    /// mirrors the existing `consented`/`last_seq` preservation contract.
+    #[test]
+    fn org_set_context_enabled_toggles_gates_non_members_and_survives_a_status_refresh() {
+        let state = build_state("org-set-context-enabled");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+
+        assert!(state.db.get_org_state("org-1").unwrap().unwrap().context_enabled);
+        org_set_context_enabled_inner(&state, "org-1", false).unwrap();
+        assert!(!state.db.get_org_state("org-1").unwrap().unwrap().context_enabled);
+
+        // Refuses a non-member — never toggles an org the caller isn't in.
+        assert!(matches!(
+            org_set_context_enabled_inner(&state, "org-not-mine", true),
+            Err(AppError::InvalidArg(_))
+        ));
+
+        // An incoming status refresh (e.g. `org_refresh`) must NOT silently re-enable the org the
+        // user explicitly disabled — mirrors the consent/cursor preservation contract.
+        state
+            .db
+            .upsert_org_state(&crate::storage::OrgState {
+                org_id: "org-1".to_string(),
+                name: "Acme Corp".to_string(), // the refresh DOES update name/role/generation...
+                role: "member".to_string(),
+                joined_at: "2026-07-10T00:00:00Z".to_string(),
+                consented: true,
+                last_seq: 0,
+                generation: 2,
+                context_enabled: true, // ...but this must be IGNORED, not applied.
+            })
+            .unwrap();
+        let row = state.db.get_org_state("org-1").unwrap().unwrap();
+        assert_eq!(row.name, "Acme Corp", "the refresh still updates name normally");
+        assert!(
+            !row.context_enabled,
+            "a status refresh must NEVER silently re-enable a locally-disabled org"
+        );
+
+        // Re-enable, explicit.
+        org_set_context_enabled_inner(&state, "org-1", true).unwrap();
+        assert!(state.db.get_org_state("org-1").unwrap().unwrap().context_enabled);
+    }
+
+    /// `meeting_org_shares`: an OPEN meeting's active org shares are visible (org id + display
+    /// name), and a SEALED-and-not-session-unlocked meeting's org-share status is MASKED to an empty
+    /// list — exactly like `get_meeting_detail`'s `locked: true` masking. RED on any pre-gate version
+    /// that reads `org_shares_for_source` unconditionally (it would leak the org name for a locked
+    /// meeting even though every OTHER content channel on that meeting is closed).
+    #[test]
+    fn meeting_org_shares_gated_by_meeting_is_unlocked() {
+        let state = build_state("meeting-org-shares-gate");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+
+        // An OPEN meeting, actively shared into org-1.
+        make_open_folder(&state.db, "f-open", "Open");
+        seed_meeting(&state.db, "m-open", "# note", Some("f-open"));
+        state
+            .db
+            .insert_org_share(
+                "s-open", "org-1", Some("m-open"), None, "meeting", Some("Quarterly strategy"),
+                1, 1, &[7u8; 32], "2026-07-11T09:00:00Z",
+            )
+            .unwrap();
+        state
+            .db
+            .set_org_share_uploaded("s-open", "item-open", "2026-07-11T09:00:00Z")
+            .unwrap();
+
+        let open_shares = meeting_org_shares_inner(&state, "m-open").unwrap();
+        assert_eq!(open_shares.len(), 1, "the open meeting's active org share is visible");
+        assert_eq!(open_shares[0].org_id, "org-1");
+        assert_eq!(open_shares[0].org_name, "Acme", "the org's display name resolves");
+
+        // A SEALED, NOT session-unlocked meeting, also actively shared into org-1.
+        state
+            .db
+            .insert_folder(&Folder {
+                id: "f-sealed".to_string(),
+                name: "Sealed".to_string(),
+                path: "Sealed".to_string(),
+                parent_id: None,
+                locked: true,
+                created_at: "2026-06-27T08:00:00Z".to_string(),
+            })
+            .unwrap();
+        seed_meeting(&state.db, "m-sealed", "# note", Some("f-sealed"));
+        state
+            .db
+            .insert_org_share(
+                "s-sealed", "org-1", Some("m-sealed"), None, "meeting", Some("Confidential"),
+                1, 1, &[8u8; 32], "2026-07-11T09:00:00Z",
+            )
+            .unwrap();
+        state
+            .db
+            .set_org_share_uploaded("s-sealed", "item-sealed", "2026-07-11T09:00:00Z")
+            .unwrap();
+
+        let sealed_shares = meeting_org_shares_inner(&state, "m-sealed").unwrap();
+        assert!(
+            sealed_shares.is_empty(),
+            "a sealed-and-not-session-unlocked meeting's org-share status must be masked, not leaked"
+        );
+
+        // Session-unlock the folder — the same meeting's org-share status becomes visible again.
+        state
+            .unlocked_folders
+            .lock()
+            .unwrap()
+            .insert("f-sealed".to_string());
+        let unlocked_shares = meeting_org_shares_inner(&state, "m-sealed").unwrap();
+        assert_eq!(
+            unlocked_shares.len(),
+            1,
+            "a session-unlocked meeting's org-share status is visible again"
+        );
+        assert_eq!(unlocked_shares[0].org_id, "org-1");
+    }
+
+    /// `list_meeting_org_shares`: the BULK Library-row variant of `meeting_org_shares` — one row per
+    /// (meeting, org). An open meeting's active share is listed; a sealed-and-not-session-unlocked
+    /// meeting's row is DROPPED (never leaked in the bulk list either), and a document-anchored share
+    /// (no `meeting_id`) is skipped as not a Library concern.
+    #[test]
+    fn list_meeting_org_shares_drops_locked_meetings() {
+        let state = build_state("list-meeting-org-shares-gate");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+
+        make_open_folder(&state.db, "f-open", "Open");
+        seed_meeting(&state.db, "m-open", "# note", Some("f-open"));
+        state
+            .db
+            .insert_org_share(
+                "s-open", "org-1", Some("m-open"), None, "meeting", Some("Quarterly strategy"),
+                1, 1, &[7u8; 32], "2026-07-11T09:00:00Z",
+            )
+            .unwrap();
+        state.db.set_org_share_uploaded("s-open", "item-open", "2026-07-11T09:00:00Z").unwrap();
+
+        state
+            .db
+            .insert_folder(&Folder {
+                id: "f-sealed".to_string(),
+                name: "Sealed".to_string(),
+                path: "Sealed".to_string(),
+                parent_id: None,
+                locked: true,
+                created_at: "2026-06-27T08:00:00Z".to_string(),
+            })
+            .unwrap();
+        seed_meeting(&state.db, "m-sealed", "# note", Some("f-sealed"));
+        state
+            .db
+            .insert_org_share(
+                "s-sealed", "org-1", Some("m-sealed"), None, "meeting", Some("Confidential"),
+                1, 1, &[8u8; 32], "2026-07-11T09:00:00Z",
+            )
+            .unwrap();
+        state.db.set_org_share_uploaded("s-sealed", "item-sealed", "2026-07-11T09:00:00Z").unwrap();
+
+        // A document-anchored share — not a meeting, must be skipped from the Library-scoped list.
+        state
+            .db
+            .insert_org_share(
+                "s-doc", "org-1", None, Some("n-doc"), "note", Some("A note"),
+                1, 1, &[9u8; 32], "2026-07-11T09:00:00Z",
+            )
+            .unwrap();
+        state.db.set_org_share_uploaded("s-doc", "item-doc", "2026-07-11T09:00:00Z").unwrap();
+
+        let rows = list_meeting_org_shares_inner(&state).unwrap();
+        assert_eq!(rows.len(), 1, "only the OPEN meeting's share is listed");
+        assert_eq!(rows[0].meeting_id, "m-open");
+        assert_eq!(rows[0].org_id, "org-1");
+        assert_eq!(rows[0].org_name, "Acme");
+        assert!(
+            !rows.iter().any(|r| r.meeting_id == "m-sealed"),
+            "a sealed-and-not-session-unlocked meeting's share must not appear in the bulk list"
+        );
+    }
+
+    /// STUCK-REPUBLISH FIX (Library badge/CTA parity): a share row whose MOST RECENT republish
+    /// attempt failed transiently but still carries a live server `item_id` (`set_org_share_failed`
+    /// never clears `item_id`) must still show the Library "shared into org" badge — mirroring the
+    /// same "live" definition `org_shares_for_source` already applies for the note-share-panel CTA
+    /// (`org_shares_for_source_includes_failed_rows_with_a_live_item_id`, storage/db.rs). Before the
+    /// fix, `list_meeting_org_shares_inner` used a hardcoded `state = 'uploaded'` filter that dropped
+    /// this exact reachable row, so the Library badge vanished while the share-panel CTA (reading the
+    /// already-fixed `org_shares_for_source`) still claimed the meeting was shared — a real two-surface
+    /// disagreement. A `failed` row that NEVER published (no `item_id`) must stay excluded (no live
+    /// item to badge).
+    #[test]
+    fn list_meeting_org_shares_includes_failed_rows_with_a_live_item_id() {
+        let state = build_state("list-meeting-org-shares-stuck-republish");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        make_open_folder(&state.db, "f-open", "Open");
+
+        // Meeting m1: published once, then a REPUBLISH attempt failed transiently. item_id stays set
+        // (set_org_share_failed doesn't clear it) — this is a genuinely LIVE share.
+        seed_meeting(&state.db, "m-stuck", "# note", Some("f-open"));
+        state
+            .db
+            .insert_org_share(
+                "s-stuck", "org-1", Some("m-stuck"), None, "meeting", Some("Stuck"),
+                1, 1, &[11u8; 32], "2026-07-12T09:00:00Z",
+            )
+            .unwrap();
+        state.db.set_org_share_uploaded("s-stuck", "item-stuck", "2026-07-12T09:00:00Z").unwrap();
+        state.db.set_org_share_failed("s-stuck", "republish_upload_failed", "2026-07-12T09:05:00Z").unwrap();
+
+        // Meeting m2: failed on the INITIAL publish — never got an item_id. No live item to badge.
+        seed_meeting(&state.db, "m-never-live", "# note", Some("f-open"));
+        state
+            .db
+            .insert_org_share(
+                "s-never-live", "org-1", Some("m-never-live"), None, "meeting", Some("Never live"),
+                1, 1, &[12u8; 32], "2026-07-12T09:00:00Z",
+            )
+            .unwrap();
+        state.db.set_org_share_failed("s-never-live", "publish_failed", "2026-07-12T09:00:00Z").unwrap();
+
+        let rows = list_meeting_org_shares_inner(&state).unwrap();
+        assert!(
+            rows.iter().any(|r| r.meeting_id == "m-stuck"),
+            "a failed-with-item_id (stuck republish) row's badge must still be visible in Library"
+        );
+        assert!(
+            !rows.iter().any(|r| r.meeting_id == "m-never-live"),
+            "a failed row that never published (no item_id) stays excluded — no live item"
+        );
+    }
+
+    /// FIX B (received-items COUNT): `OrgStatus.received_count` reflects the LOCAL replica (what
+    /// colleagues shared IN), DISTINCT from `item_count` (the caller's OWN uploaded outbound shares).
+    /// Seed org_items (received) + an outbound uploaded share and assert the two counts are independent.
+    /// RED on the pre-fix code (only `item_count` existed → a receiving member saw "0 items").
+    #[test]
+    fn org_status_received_count_reflects_replica_distinct_from_outbound() {
+        let state = build_state("org-received-count");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        // TWO received items (from colleagues) in the local replica.
+        state
+            .db
+            .upsert_org_item("r1", "org-1", 1, "anna", "Doc A", "body a", "2026-07-10T09:00:00Z", 1, 1, &[1u8; 32], None, None, None)
+            .unwrap();
+        state
+            .db
+            .upsert_org_item("r2", "org-1", 2, "bob", "Doc B", "body b", "2026-07-11T09:00:00Z", 1, 1, &[2u8; 32], None, None, None)
+            .unwrap();
+        // ONE of the caller's OWN outbound shares, state 'uploaded' (item_count = 1).
+        let now = "2026-07-11T12:00:00Z";
+        state
+            .db
+            .insert_org_share("s1", "org-1", Some("m-own"), None, "meeting", Some("My Share"), 1, 1, &[9u8; 32], now)
+            .unwrap();
+        state.db.set_org_share_uploaded("s1", "srv-item-1", now).unwrap();
+
+        let status = block_on(org_status_for(
+            &state,
+            state.db.get_org_state("org-1").unwrap().unwrap(),
+        ))
+        .unwrap();
+        assert_eq!(status.received_count, 2, "received_count = local replica items");
+        assert_eq!(status.item_count, 1, "item_count = the caller's OWN outbound uploads");
+        // A tombstoned received item drops out of received_count.
+        state.db.tombstone_org_item("r1").unwrap();
+        let status2 = block_on(org_status_for(
+            &state,
+            state.db.get_org_state("org-1").unwrap().unwrap(),
+        ))
+        .unwrap();
+        assert_eq!(status2.received_count, 1, "a tombstoned received item is excluded");
+    }
+
+    /// STUCK-REPUBLISH FIX: `OrgStatus.item_count` also counts a `failed` row that still carries a
+    /// non-null `item_id` (a republish that failed transiently but whose OLD publish is still live on
+    /// the server — `set_org_share_failed` never clears `item_id`). Pre-fix this undercounted "N shared
+    /// by you" for exactly the rows the republish-failure bug got stuck. A `failed` row that never
+    /// published (`item_id` NULL) must still be excluded — no live item to count.
+    #[test]
+    fn org_status_item_count_includes_stuck_failed_rows_with_a_live_item_id() {
+        let state = build_state("org-item-count-stuck");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        let now = "2026-07-12T00:00:00Z";
+
+        // One cleanly-uploaded share.
+        state
+            .db
+            .insert_org_share("s-up", "org-1", None, Some("n-up"), "note", Some("T"), 1, 1, &[1u8; 32], now)
+            .unwrap();
+        state.db.set_org_share_uploaded("s-up", "item-up", now).unwrap();
+
+        // One STUCK share: published once, then a republish attempt failed (item_id retained).
+        state
+            .db
+            .insert_org_share("s-stuck", "org-1", None, Some("n-stuck"), "note", Some("T"), 1, 1, &[2u8; 32], now)
+            .unwrap();
+        state.db.set_org_share_uploaded("s-stuck", "item-stuck", now).unwrap();
+        state.db.set_org_share_failed("s-stuck", "republish_upload_failed", now).unwrap();
+
+        // One NEVER-published failed share (item_id NULL) — must stay excluded.
+        state
+            .db
+            .insert_org_share("s-dead", "org-1", None, Some("n-dead"), "note", Some("T"), 1, 1, &[3u8; 32], now)
+            .unwrap();
+        state.db.set_org_share_failed("s-dead", "publish_failed", now).unwrap();
+
+        let status = block_on(org_status_for(
+            &state,
+            state.db.get_org_state("org-1").unwrap().unwrap(),
+        ))
+        .unwrap();
+        assert_eq!(
+            status.item_count, 2,
+            "item_count includes the uploaded row AND the stuck failed-with-item_id row, \
+             excluding the never-published failed row"
+        );
+    }
+
+    /// `org_state` upsert preserves the LOCAL consent + sync cursor across a status refresh (a refresh
+    /// carrying role/name/generation must NOT reset consent or rewind last_seq), and the consent +
+    /// generation + last_seq setters work as the single mutators.
+    #[test]
+    fn org_state_upsert_preserves_consent_and_cursor() {
+        let state = build_state("org-state");
+        state
+            .db
+            .upsert_org_state(&crate::storage::OrgState {
+                org_id: "org-1".into(),
+                name: "Acme".into(),
+                role: "owner".into(),
+                joined_at: "2026-07-10T09:00:00Z".into(),
+                consented: false,
+                last_seq: 0,
+                generation: 1,
+                context_enabled: true,
+            })
+            .unwrap();
+        // Grant local consent + advance the cursor + bump the generation.
+        state.db.set_org_consented("org-1", true).unwrap();
+        state.db.set_org_last_seq("org-1", 42).unwrap();
+        state.db.set_org_generation("org-1", 2).unwrap();
+
+        // A status refresh (name/role/generation only) MUST NOT reset consent or rewind the cursor.
+        state
+            .db
+            .upsert_org_state(&crate::storage::OrgState {
+                org_id: "org-1".into(),
+                name: "Acme Corp".into(),
+                role: "owner".into(),
+                joined_at: "IGNORED".into(),
+                consented: false, // an incoming refresh's false must NOT clobber the local grant
+                last_seq: 0,      // …nor rewind the cursor
+                generation: 3,
+                context_enabled: true,
+            })
+            .unwrap();
+        let row = state.db.get_org_state("org-1").unwrap().unwrap();
+        assert_eq!(row.name, "Acme Corp", "name refreshed");
+        assert_eq!(row.generation, 3, "generation refreshed");
+        assert!(row.consented, "local consent preserved across refresh");
+        assert_eq!(row.last_seq, 42, "sync cursor not rewound by refresh");
+
+        // last_seq is monotonic: a lower value is ignored.
+        state.db.set_org_last_seq("org-1", 10).unwrap();
+        assert_eq!(state.db.get_org_state("org-1").unwrap().unwrap().last_seq, 42);
+
+        // delete_org_state drops it (leave/removal).
+        state.db.delete_org_state("org-1").unwrap();
+        assert!(state.db.get_org_state("org-1").unwrap().is_none());
+    }
+
+    /// Seed a bare local org row (membership metadata only) for the multi-org tests.
+    fn seed_org(db: &Db, org_id: &str, name: &str, role: &str, generation: u32) {
+        db.upsert_org_state(&crate::storage::OrgState {
+            org_id: org_id.into(),
+            name: name.into(),
+            role: role.into(),
+            joined_at: "2026-07-11T00:00:00Z".into(),
+            consented: false,
+            last_seq: 0,
+            generation,
+            context_enabled: true,
+        })
+        .unwrap();
+    }
+
+    /// Seed a local org row with an explicit `joined_at` so the `.next()` (ORDER BY joined_at ASC)
+    /// ordering is DETERMINISTIC — the targeting tests need the pre-fix first-org to be a fixed org so
+    /// their RED direction (a `.next()` returning the WRONG org) is unambiguous, not flaky.
+    fn seed_org_at(db: &Db, org_id: &str, name: &str, role: &str, joined_at: &str) {
+        db.upsert_org_state(&crate::storage::OrgState {
+            org_id: org_id.into(),
+            name: name.into(),
+            role: role.into(),
+            joined_at: joined_at.into(),
+            consented: false,
+            last_seq: 0,
+            generation: 1,
+            context_enabled: true,
+        })
+        .unwrap();
+    }
+
+    /// IDEMPOTENCY — the double-click / re-click DUPLICATE fix. `share_to_org_inner` for a source that is
+    /// ALREADY live (`uploaded`) in the org returns the EXISTING share WITHOUT publishing a second item:
+    /// no new `org_shares` row, no egress. RED before the guard: unpatched `share_to_org_inner` falls
+    /// straight into `publish_org_body`, which with no live session/consent in a unit test ERRORS instead
+    /// of returning the already-shared item. GREEN: the guard short-circuits BEFORE the publish path.
+    #[test]
+    fn share_to_org_inner_is_idempotent_for_an_already_uploaded_source() {
+        let state = build_state("org-share-idem");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        // The FIRST click already published ONE uploaded share of document n1 into org-1.
+        state
+            .db
+            .insert_org_share(
+                "s1", "org-1", None, Some("n1"), "note", Some("A Note"), 1, 1, &[9u8; 32],
+                "2026-07-11T09:00:00Z",
+            )
+            .unwrap();
+        state
+            .db
+            .set_org_share_uploaded("s1", "item-1", "2026-07-11T09:00:00Z")
+            .unwrap();
+
+        let before = state.db.list_org_shares_for_org("org-1").unwrap().len();
+        // The SECOND share of the same source (the double-click) must NOT publish again.
+        let entry = block_on(share_to_org_inner(
+            &state,
+            "org-1",
+            None,
+            Some("n1".to_string()),
+            false,
+        ))
+        .unwrap();
+        assert_eq!(
+            entry.item_id.as_deref(),
+            Some("item-1"),
+            "returns the EXISTING item, not a fresh publish"
+        );
+        assert_eq!(entry.state, "uploaded");
+        let after = state.db.list_org_shares_for_org("org-1").unwrap();
+        assert_eq!(after.len(), before, "no new org_shares row was inserted (no duplicate)");
+        assert_eq!(
+            after.iter().filter(|r| r.state == "uploaded").count(),
+            1,
+            "still exactly one live share"
+        );
+    }
+
+    /// COLLAPSE — auto-clean of duplicates that already exist. `share_to_org_inner` on a source with
+    /// MULTIPLE live copies in one org returns the EARLIEST (the keeper) and marks the extras for teardown
+    /// (`revoke_pending`). The tombstone network call fails in a unit test (no session) but is
+    /// best-effort: `revoke_org_share_inner` marks the row `revoke_pending` FIRST (the launch sweep
+    /// finishes it), and the swallowed error never breaks the idempotent return.
+    #[test]
+    fn share_to_org_inner_collapses_existing_duplicates_keeping_the_earliest() {
+        let state = build_state("org-share-collapse");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        // Two accidental duplicates of (org-1, n1): earliest = keeper, later = the extra to tombstone.
+        state
+            .db
+            .insert_org_share(
+                "keep", "org-1", None, Some("n1"), "note", Some("A Note"), 1, 1, &[1u8; 32],
+                "2026-07-11T09:00:00Z",
+            )
+            .unwrap();
+        state
+            .db
+            .set_org_share_uploaded("keep", "item-keep", "2026-07-11T09:00:00Z")
+            .unwrap();
+        state
+            .db
+            .insert_org_share(
+                "dup", "org-1", None, Some("n1"), "note", Some("A Note"), 1, 1, &[2u8; 32],
+                "2026-07-11T09:05:00Z",
+            )
+            .unwrap();
+        state
+            .db
+            .set_org_share_uploaded("dup", "item-dup", "2026-07-11T09:05:00Z")
+            .unwrap();
+        // A NOT-yet-uploaded sibling (a stuck pending retry) for the same source — redundant, cancelled.
+        state
+            .db
+            .insert_org_share(
+                "pending", "org-1", None, Some("n1"), "note", Some("A Note"), 1, 1, &[3u8; 32],
+                "2026-07-11T09:06:00Z",
+            )
+            .unwrap();
+
+        let entry = block_on(share_to_org_inner(
+            &state,
+            "org-1",
+            None,
+            Some("n1".to_string()),
+            false,
+        ))
+        .unwrap();
+        assert_eq!(
+            entry.item_id.as_deref(),
+            Some("item-keep"),
+            "the EARLIEST live copy is the keeper"
+        );
+        // Keeper stays uploaded; the duplicate is queued for tombstone. No new row was minted.
+        assert_eq!(
+            state.db.get_org_share("keep").unwrap().unwrap().state,
+            "uploaded",
+            "keeper untouched"
+        );
+        assert_eq!(
+            state.db.get_org_share("dup").unwrap().unwrap().state,
+            "revoke_pending",
+            "the duplicate is marked for tombstone (launch sweep finishes it)"
+        );
+        assert_eq!(
+            state.db.get_org_share("pending").unwrap().unwrap().state,
+            "revoked",
+            "a redundant not-yet-uploaded sibling is cancelled locally (no server item)"
+        );
+    }
+
+    /// MULTI-ORG STATUS (RED→GREEN for the single-org `.next()` bug): `org_list_statuses` must return
+    /// an `OrgStatus` for EVERY locally-joined org — the one I created AND the one I was invited to —
+    /// not just the first. With no server configured (empty base URL) it stays offline: each status
+    /// falls back to the cached row. This FAILS on any `.next()`/first-only status path (it would
+    /// return 1). `org_status` (legacy) still returns exactly the FIRST for old callers.
+    #[test]
+    fn org_list_statuses_returns_all_local_orgs() {
+        let state = build_state("org-list-statuses");
+        // Two orgs: one owned (created), one member (invited). No server → offline per-org fallback.
+        seed_org(&state.db, "org-own", "Acme", "owner", 1);
+        seed_org(&state.db, "org-inv", "Partner Co", "member", 2);
+
+        let statuses = block_on(org_list_statuses_inner(&state)).unwrap();
+        assert_eq!(
+            statuses.len(),
+            2,
+            "every locally-joined org yields a status (RED on a single-org .next())"
+        );
+        let ids: std::collections::HashSet<&str> =
+            statuses.iter().map(|s| s.org_id.as_str()).collect();
+        assert!(ids.contains("org-own"), "the owned org appears");
+        assert!(ids.contains("org-inv"), "the invited org appears");
+
+        // Legacy single-org `org_status` still returns the FIRST (ordered by joined_at) — unchanged
+        // for pre-multi-org FE callers.
+        let first = block_on(org_status_inner(&state)).unwrap();
+        assert!(first.is_some(), "legacy org_status still returns the first");
+    }
+
+    /// MEMBERSHIP RECONCILE (DB core, network-free): `reconcile_org_state_into_db` must ADD an org the
+    /// server now lists (an invite I didn't have locally) and REMOVE an org the server no longer lists
+    /// (I left / was removed). Preserves an existing org's local cursor/consent across the refresh.
+    #[test]
+    fn reconcile_adds_invited_org_and_removes_departed() {
+        let state = build_state("org-reconcile");
+        // Local pre-state: I'm in "org-keep" (with a cursor + consent) and "org-gone" (departed).
+        seed_org(&state.db, "org-keep", "Keep", "member", 1);
+        seed_org(&state.db, "org-gone", "Gone", "member", 1);
+        state.db.set_org_consented("org-keep", true).unwrap();
+        state.db.set_org_last_seq("org-keep", 55).unwrap();
+
+        // Server says: I'm in "org-keep" (name refreshed) + a NEW "org-new" (an invite). "org-gone" is
+        // absent (I left / was removed).
+        let server = vec![
+            crate::share::org_dto::OrgSummary {
+                org_id: "org-keep".into(),
+                name: "Keep Renamed".into(),
+                role: "member".into(),
+                created_at: "2026-07-01T00:00:00Z".into(),
+                current_generation: 3,
+            },
+            crate::share::org_dto::OrgSummary {
+                org_id: "org-new".into(),
+                name: "Newly Invited".into(),
+                role: "member".into(),
+                created_at: "2026-07-11T09:00:00Z".into(),
+                current_generation: 1,
+            },
+        ];
+
+        let outcome = reconcile_org_state_into_db(&state, &server).unwrap();
+        // "org-new" is the only NEW org (needs an OCK fetch); "org-gone" is the only removal.
+        assert_eq!(outcome.new_orgs, vec![("org-new".to_string(), 1u32)]);
+        assert_eq!(outcome.removed, 1);
+
+        let after: std::collections::HashSet<String> = state
+            .db
+            .list_org_states()
+            .unwrap()
+            .into_iter()
+            .map(|o| o.org_id)
+            .collect();
+        assert!(after.contains("org-keep"), "kept org stays");
+        assert!(after.contains("org-new"), "invited org added");
+        assert!(!after.contains("org-gone"), "departed org removed");
+
+        // The kept org's LOCAL cursor + consent survive the reconcile (upsert only refreshed
+        // name/role/generation); its generation was refreshed to the server value.
+        let keep = state.db.get_org_state("org-keep").unwrap().unwrap();
+        assert_eq!(keep.name, "Keep Renamed", "name refreshed from server");
+        assert_eq!(keep.generation, 3, "generation refreshed from server");
+        assert_eq!(keep.last_seq, 55, "local cursor NOT rewound");
+        assert!(keep.consented, "local consent NOT cleared");
+        // The new org lands with the defaults.
+        let new = state.db.get_org_state("org-new").unwrap().unwrap();
+        assert_eq!(new.joined_at, "2026-07-11T09:00:00Z");
+        assert!(!new.consented);
+        assert_eq!(new.last_seq, 0);
+    }
+
+    /// MULTI-ORG SYNC iterates ALL orgs (does NOT `.next()`-short-circuit on the FIRST). Seed TWO
+    /// orgs + a live session, and point the client at an UNREACHABLE loopback URL (no real egress —
+    /// the connection is refused). `org_sync_now_inner` must attempt BOTH orgs' feeds: each per-org
+    /// pull fails (connection refused), and a per-org failure is recorded in `report.errors` WITHOUT
+    /// aborting the others — so we see TWO org-level error entries, proving the loop ran twice. The
+    /// pre-fix single-org path would produce at most ONE. No cursor is ever rewound.
+    #[test]
+    fn org_sync_now_over_two_orgs_iterates_both() {
+        let state = build_state("org-sync-multi");
+        seed_org(&state.db, "org-a", "A", "member", 1);
+        seed_org(&state.db, "org-b", "B", "member", 1);
+        state.db.set_org_last_seq("org-a", 10).unwrap();
+        state.db.set_org_last_seq("org-b", 20).unwrap();
+
+        // A loopback URL with a closed port → connection refused (validate_gateway_url allows http on
+        // loopback). NO real network egress; both org feeds fail the same way.
+        state.config.lock().unwrap().share_base_url = "http://127.0.0.1:9/".to_string();
+        // A live (non-expired) session so `valid_access_token` yields a bearer and the loop runs.
+        *state.account_session.lock().unwrap() = Some(crate::share::AccountSession {
+            account_id: "user@example.com".into(),
+            email: "user@example.com".into(),
+            server_user_id: Some("c534b6d2-02c1-4c2c-a256-3af8592b1567".into()),
+            device_id: "dev-1".into(),
+            mk: Zeroizing::new([7u8; 32]),
+            generation: 1,
+            access_token: "a".into(),
+            access_expires_at: Some("2099-01-01T00:00:00Z".into()),
+            refresh_token: "r".into(),
+        });
+
+        let report = block_on(org_sync_now_inner(&state)).unwrap();
+        // BOTH orgs were attempted → BOTH per-org failures recorded (loop iterated twice, not once).
+        assert_eq!(
+            report.errors.len(),
+            2,
+            "one error per org proves the loop iterated ALL orgs, not just the first"
+        );
+        assert_eq!(report.ingested, 0);
+        assert_eq!(report.tombstoned, 0);
+        // Neither cursor is rewound by a failed sync (monotonic).
+        assert_eq!(state.db.get_org_state("org-a").unwrap().unwrap().last_seq, 10);
+        assert_eq!(state.db.get_org_state("org-b").unwrap().unwrap().last_seq, 20);
+    }
+
+    /// FIX D (per-item sync robustness, RED→GREEN): a TERMINAL-bad item at seq N must NOT stall the
+    /// feed forever — the GOOD item at N+1 still ingests on the SAME sync. Pre-fix EVERY per-item
+    /// failure did `break 'pages`, so one poison cell blocked all newer items indefinitely. We serve a
+    /// synthetic one-page feed: item at seq 5 is a LIVE entry with NO blob (structurally terminal — it
+    /// can never open, detected before any key/network), and item at seq 6 is a TOMBSTONE (a "good"
+    /// action that applies with no key/blob). After the fix: seq 5 is skipped (error recorded, cursor
+    /// advanced), seq 6's tombstone APPLIES (`tombstoned == 1`) and the cursor advances to 6. RED on the
+    /// old break-all code: seq 5 breaks the loop → seq 6 never processed → `tombstoned == 0`, cursor
+    /// unchanged.
+    #[test]
+    fn org_sync_skips_a_terminal_item_and_ingests_the_next() {
+        use std::io::{Read, Write};
+        // One-shot local server answering exactly one `GET /v1/orgs/{id}/items` feed page.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 8192];
+            let _ = sock.read(&mut buf).unwrap();
+            // seq 5: LIVE (tombstoned:false) but blobId:null → TERMINAL missing-blob.
+            // seq 6: TOMBSTONE → applies without a key/blob (the "good" item behind the poison one).
+            let body = r#"{"items":[{"itemId":"poison","seq":5,"authorUserId":"u","rev":1,"generation":1,"createdAt":"2026-07-11T09:00:00Z","tombstoned":false,"blobId":null,"contentSha256":null},{"itemId":"good-tomb","seq":6,"authorUserId":"u","rev":1,"generation":1,"createdAt":"2026-07-11T09:01:00Z","tombstoned":true,"blobId":null,"contentSha256":null}],"nextSeq":6}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = sock.write_all(resp.as_bytes());
+        });
+
+        let state = build_state("org-sync-terminal-skip");
+        seed_org(&state.db, "org-x", "X", "member", 1);
+        state.db.set_org_last_seq("org-x", 4).unwrap(); // cursor starts at 4 (items 5,6 are new)
+        state.config.lock().unwrap().share_base_url = format!("http://{addr}");
+        *state.account_session.lock().unwrap() = Some(crate::share::AccountSession {
+            account_id: "user@example.com".into(),
+            email: "user@example.com".into(),
+            server_user_id: Some("c534b6d2-02c1-4c2c-a256-3af8592b1567".into()),
+            device_id: "dev-1".into(),
+            mk: Zeroizing::new([7u8; 32]),
+            generation: 1,
+            access_token: "a".into(),
+            access_expires_at: Some("2099-01-01T00:00:00Z".into()),
+            refresh_token: "r".into(),
+        });
+
+        let report = block_on(org_sync_one_now_inner(&state, "org-x")).unwrap();
+        server.join().unwrap();
+
+        // Both items were pulled; the terminal one was recorded as an error, the good one APPLIED.
+        assert_eq!(report.pulled, 2, "both feed items were pulled");
+        assert_eq!(
+            report.tombstoned, 1,
+            "the GOOD item behind the poison one ingested (RED on break-all: this was 0)"
+        );
+        assert!(
+            report.errors.iter().any(|e| e.contains("poison") && e.contains("missing blob")),
+            "the terminal item is recorded as an error, not silently dropped: {:?}",
+            report.errors
+        );
+        // The cursor advanced PAST both the skipped terminal item and the applied tombstone.
+        assert_eq!(
+            state.db.get_org_state("org-x").unwrap().unwrap().last_seq,
+            6,
+            "cursor advanced past the terminal item AND the good one (RED on break-all: stayed at 4)"
+        );
+    }
+
+    /// STALE-INGEST AUTHOR BACKFILL (root-cause fix, RED→GREEN): an `org_items` row ingested before
+    /// `author_user_id` existed (or one whose seq is already behind the sync cursor) has NULL
+    /// `author_user_id` forever under the OLD cursor-only pull, because the feed is only ever asked for
+    /// `seq > cursor` — the author's own second machine can never recognise the item as its own, so
+    /// `org_get_item`'s `editable` stays false no matter how many times sync runs. Seed a LIVE local
+    /// `org_items` row with `author_user_id = NULL` at seq 3, and advance the cursor to 5 (simulating an
+    /// already-caught-up device — a plain cursor pull would fetch NOTHING new). The mock server answers
+    /// TWO feed requests: the normal `sinceSeq=5` pull (nothing new) and the backfill's full re-pull
+    /// `sinceSeq=0` (returns the SAME item, now carrying its authorUserId). After `org_sync_one_now_inner`
+    /// runs, the local row's `author_user_id` must be backfilled to the session's own id, and
+    /// `org_get_item`'s `editable` must flip true — proving the mechanism, not just the storage.
+    #[test]
+    fn org_sync_backfills_null_author_for_an_already_ingested_item() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let me_uuid = "c534b6d2-02c1-4c2c-a256-3af8592b1567";
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut sock, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 8192];
+                let n = sock.read(&mut buf).unwrap();
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let body = if req.contains("sinceSeq=0") {
+                    // The backfill's full re-pull: the SAME item, now WITH its real author id.
+                    // `contentSha256` is base64URL-NO-PAD (`murmur_protocol::b64`) — 32 zero bytes.
+                    format!(
+                        r#"{{"items":[{{"itemId":"item-stale","seq":3,"authorUserId":"{me_uuid}","rev":1,"generation":1,"createdAt":"2026-07-11T09:00:00Z","tombstoned":false,"blobId":"b1","contentSha256":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}}],"nextSeq":3}}"#
+                    )
+                } else {
+                    // The normal cursor pull from seq 5: nothing new (device already caught up).
+                    r#"{"items":[],"nextSeq":5}"#.to_string()
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes());
+                let _ = sock.flush();
+                let _ = sock.shutdown(std::net::Shutdown::Write);
+                // Let the client fully drain the response before this socket is dropped (dropping
+                // immediately can race a `connection: close` RST ahead of the client's read).
+                let mut drain = [0u8; 64];
+                loop {
+                    match sock.read(&mut drain) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => continue,
+                    }
+                }
+            }
+        });
+
+        let state = build_state("org-sync-author-backfill");
+        seed_org(&state.db, "org-y", "Y", "member", 1);
+        // A LIVE local replica row ingested BEFORE author stamping existed: author_user_id NULL.
+        state
+            .db
+            .upsert_org_item(
+                "item-stale",
+                "org-y",
+                3,
+                "anna",
+                "Old note",
+                "# body",
+                "2026-07-11T09:00:00Z",
+                1,
+                1,
+                &[9u8; 32],
+                Some("document"),
+                None, // author_user_id: unknown at ingest — this row IS the stale-ingest gap under test.
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            state.db.org_item_edit_ctx("item-stale").unwrap().unwrap().author_user_id,
+            None,
+            "precondition: the stale row starts with no stamped author"
+        );
+        // Cursor already PAST the item's seq — a plain cursor pull will never re-see it.
+        state.db.set_org_last_seq("org-y", 5).unwrap();
+        state.config.lock().unwrap().share_base_url = format!("http://{addr}");
+        *state.account_session.lock().unwrap() = Some(crate::share::AccountSession {
+            account_id: "user@example.com".into(),
+            email: "user@example.com".into(),
+            server_user_id: Some(me_uuid.into()),
+            device_id: "dev-2".into(),
+            mk: Zeroizing::new([7u8; 32]),
+            generation: 1,
+            access_token: "a".into(),
+            access_expires_at: Some("2099-01-01T00:00:00Z".into()),
+            refresh_token: "r".into(),
+        });
+
+        let report = block_on(org_sync_one_now_inner(&state, "org-y")).unwrap();
+        server.join().unwrap();
+
+        assert_eq!(
+            report.authors_backfilled, 1,
+            "the sync tick backfilled exactly the one stale-NULL row: {:?}",
+            report.errors
+        );
+        // The local row now carries the real author id (GREEN — RED on the pre-fix code: this stayed
+        // None forever, since the cursor pull alone never re-visits an already-ingested seq).
+        let ctx = state.db.org_item_edit_ctx("item-stale").unwrap().unwrap();
+        assert_eq!(ctx.author_user_id.as_deref(), Some(me_uuid));
+        // The cursor itself is UNCHANGED by the backfill (it's a read-only side query, not a re-ingest).
+        assert_eq!(state.db.get_org_state("org-y").unwrap().unwrap().last_seq, 5);
+
+        // End-to-end: replays `org_get_item`'s own editable-resolution logic (it takes a Tauri `State`
+        // wrapper the test suite has no constructor for elsewhere, so we drive the same two calls the
+        // command body makes) — the actual user-facing bug was "can't edit my own note from a second
+        // device", so the test must prove `editable` flips true, not just that storage round-trips.
+        let mut detail = state.db.get_org_item("item-stale").unwrap().expect("item still resolves");
+        if let Some(edit_ctx) = state.db.org_item_edit_ctx("item-stale").unwrap() {
+            if let (Some(author), Ok(me)) =
+                (edit_ctx.author_user_id.as_deref(), session_server_user_id(&state))
+            {
+                detail.editable = author == me;
+            }
+        }
+        assert!(
+            detail.editable,
+            "editable must flip true once author_user_id is backfilled to match the caller's session"
+        );
+    }
+
+    /// F1 (MULTI-ORG TARGETING, RED→GREEN for the `.next()` misroute): with TWO local orgs, the org
+    /// commands must resolve the SPECIFIC org the FE passed, never the FIRST. `resolve_org` — the
+    /// shared resolution seam every per-org command now uses — must return the SECOND org's row when
+    /// asked for it (RED on any `.next()`/first-only resolution: it would return org #1's row), refuse
+    /// a blank id, and refuse an org the caller isn't a local member of.
+    #[test]
+    fn resolve_org_targets_the_specified_org_not_the_first() {
+        let state = build_state("org-resolve-target");
+        // `org-first` joined EARLIER → it is the deterministic `.next()` (ORDER BY joined_at ASC) org,
+        // so a pre-fix first-only resolve would return it — making the RED direction unambiguous.
+        seed_org_at(&state.db, "org-first", "First", "owner", "2026-07-01T00:00:00Z");
+        seed_org_at(&state.db, "org-second", "Second", "member", "2026-07-11T00:00:00Z");
+
+        // Ask for the SECOND org explicitly → get the SECOND (not the first-by-.next()).
+        let got = resolve_org(&state, "org-second").unwrap();
+        assert_eq!(
+            got.org_id, "org-second",
+            "resolve targets the specified org, not the first (RED on a .next() resolve)"
+        );
+        assert_eq!(got.role, "member");
+        // And the first, explicitly, still resolves to the first.
+        assert_eq!(resolve_org(&state, "org-first").unwrap().org_id, "org-first");
+
+        // A blank id is an InvalidArg refusal (never a silent first-org pick).
+        assert!(matches!(
+            resolve_org(&state, "  "),
+            Err(AppError::InvalidArg(_))
+        ));
+        // An org we're not a local member of is refused — we never operate on an org the caller isn't in.
+        assert!(matches!(
+            resolve_org(&state, "org-not-mine"),
+            Err(AppError::InvalidArg(_))
+        ));
+    }
+
+    /// FIX C (org SHARE targets the SPECIFIED org, RED→GREEN for the `.next()` MISROUTE): with TWO
+    /// local orgs, `share_to_org_inner` must queue the outbound share under the org the FE PICKED, never
+    /// the FIRST (`.next()`). Seed a session + consent + an open (unlocked) meeting with a note, point
+    /// the client at a CLOSED loopback port (no real egress — the seal/upload fails), and share TARGETING
+    /// the SECOND org. Regardless of the network failure, the QUEUED row is persisted BEFORE any egress —
+    /// under `org-second`. RED on the pre-fix code (it `.next()`-picked `org-first` → the row landed under
+    /// org #1); GREEN after routing through `resolve_org`.
+    #[test]
+    fn share_to_org_queues_under_the_specified_org_not_the_first() {
+        let state = build_state("org-share-target");
+        // `org-first` joined EARLIER → the deterministic `.next()` (ORDER BY joined_at ASC) org a pre-fix
+        // share would have wrongly used. The FE picks `org-second`.
+        seed_org_at(&state.db, "org-first", "First", "owner", "2026-07-01T00:00:00Z");
+        seed_org_at(&state.db, "org-second", "Second", "member", "2026-07-11T00:00:00Z");
+
+        // An OPEN folder + a note so the read-gate + clean/scrub pass (no lock).
+        state
+            .db
+            .insert_folder(&Folder {
+                id: "f-share".to_string(),
+                name: "Team".to_string(),
+                path: "Team".to_string(),
+                parent_id: None,
+                locked: false,
+                created_at: "2026-07-11T00:00:00Z".to_string(),
+            })
+            .unwrap();
+        state
+            .db
+            .insert_note("n-share", "f-share", "plan", "Q3 Plan", "# the Q3 roadmap", 1)
+            .unwrap();
+
+        // Consent granted + a closed loopback port (connection refused; NO real egress).
+        state.config.lock().unwrap().org_egress_consented = true;
+        state.config.lock().unwrap().share_base_url = "http://127.0.0.1:9/".to_string();
+        // A live (non-expired) session so `require_session_mk` yields a bearer and the queue insert runs.
+        *state.account_session.lock().unwrap() = Some(crate::share::AccountSession {
+            account_id: "user@example.com".into(),
+            email: "user@example.com".into(),
+            server_user_id: Some("c534b6d2-02c1-4c2c-a256-3af8592b1567".into()),
+            device_id: "dev-1".into(),
+            mk: Zeroizing::new([7u8; 32]),
+            generation: 1,
+            access_token: "a".into(),
+            access_expires_at: Some("2099-01-01T00:00:00Z".into()),
+            refresh_token: "r".into(),
+        });
+
+        // Share TARGETING the SECOND org. The network egress fails (closed port), but the QUEUED row is
+        // written first — under the resolved target org.
+        let _ = block_on(share_to_org_inner(
+            &state,
+            "org-second",
+            None,
+            Some("n-share".to_string()),
+            true,
+        ));
+
+        // The row MUST be under org-second (the picked org), NOT org-first (the `.next()` org).
+        let second = state.db.list_org_shares_for_org("org-second").unwrap();
+        assert_eq!(
+            second.len(),
+            1,
+            "the outbound share was queued under the PICKED org (org-second)"
+        );
+        assert_eq!(second[0].document_id.as_deref(), Some("n-share"));
+        let first = state.db.list_org_shares_for_org("org-first").unwrap();
+        assert!(
+            first.is_empty(),
+            "no share landed under the FIRST org (RED on a .next() misroute — the row was under org-first)"
+        );
+    }
+
+    // ── RE-PUBLISH-ON-EDIT (the stale-org-copy fix) — end-to-end against a MOCK org server ─────────
+
+    /// What a `MockOrgServer` recorded across a test: the sequence of published item ids (one per
+    /// `POST …/items`) and the set of tombstoned item ids (one per `DELETE …/items/{id}`). Lets a
+    /// republish test assert BOTH the new-item-published AND the old-item-tombstoned sides.
+    #[derive(Default)]
+    struct MockOrgLog {
+        published: Vec<String>,
+        tombstoned: Vec<String>,
+    }
+
+    /// A minimal in-process org server (tiny_http) that answers the THREE routes the org publish/
+    /// republish flow hits — `POST /v1/blobs`, `POST /v1/orgs/{id}/items` (mints a fresh item id +
+    /// monotonic seq), `DELETE /v1/orgs/{id}/items/{id}` — so the full seal→upload→publish→tombstone
+    /// chain runs headless WITHOUT a real backend. The OCK is pre-seeded into `org_ock_cache` so
+    /// `acquire_org_ock` never needs the (unmocked) key-grants endpoint. Shuts down on drop.
+    struct MockOrgServer {
+        base: String,
+        log: Arc<Mutex<MockOrgLog>>,
+        shutdown: Arc<AtomicBool>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl MockOrgServer {
+        fn start() -> Self {
+            let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+            let addr = server.server_addr();
+            let base = format!("http://{}/", addr.to_ip().unwrap());
+            let log = Arc::new(Mutex::new(MockOrgLog::default()));
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let log_t = Arc::clone(&log);
+            let shutdown_t = Arc::clone(&shutdown);
+            let handle = std::thread::spawn(move || {
+                let mut seq: u64 = 0;
+                let mut counter: u64 = 0;
+                loop {
+                    if shutdown_t.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    match server.recv_timeout(std::time::Duration::from_millis(50)) {
+                        Ok(Some(req)) => {
+                            let method = req.method().clone();
+                            let url = req.url().to_string();
+                            let path = url.split('?').next().unwrap_or("").to_string();
+                            // POST /v1/blobs → {"blobId": "..."}
+                            if method == tiny_http::Method::Post && path == "/v1/blobs" {
+                                counter += 1;
+                                let body = format!("{{\"blobId\":\"blob-{counter}\"}}");
+                                let resp = tiny_http::Response::from_string(body).with_header(
+                                    "Content-Type: application/json".parse::<tiny_http::Header>().unwrap(),
+                                );
+                                let _ = req.respond(resp);
+                                continue;
+                            }
+                            // POST /v1/orgs/{id}/items → {"itemId": "...", "seq": N} (fresh id each call)
+                            if method == tiny_http::Method::Post
+                                && path.starts_with("/v1/orgs/")
+                                && path.ends_with("/items")
+                            {
+                                seq += 1;
+                                let item_id = format!("item-{seq}");
+                                log_t.lock().unwrap().published.push(item_id.clone());
+                                let body = format!("{{\"itemId\":\"{item_id}\",\"seq\":{seq}}}");
+                                let resp = tiny_http::Response::from_string(body).with_header(
+                                    "Content-Type: application/json".parse::<tiny_http::Header>().unwrap(),
+                                );
+                                let _ = req.respond(resp);
+                                continue;
+                            }
+                            // DELETE /v1/orgs/{id}/items/{itemId} → 200 (tombstone)
+                            if method == tiny_http::Method::Delete
+                                && path.contains("/items/")
+                                && !path.ends_with("/items")
+                            {
+                                if let Some(item) = path.rsplit('/').next() {
+                                    log_t.lock().unwrap().tombstoned.push(item.to_string());
+                                }
+                                let _ = req.respond(tiny_http::Response::empty(200));
+                                continue;
+                            }
+                            let _ = req.respond(tiny_http::Response::empty(404));
+                        }
+                        Ok(None) => continue,
+                        Err(_) => break,
+                    }
+                }
+            });
+            Self {
+                base,
+                log,
+                shutdown,
+                handle: Some(handle),
+            }
+        }
+    }
+
+    impl Drop for MockOrgServer {
+        fn drop(&mut self) {
+            self.shutdown.store(true, Ordering::SeqCst);
+            if let Some(h) = self.handle.take() {
+                let _ = h.join();
+            }
+        }
+    }
+
+    /// Seed a live (non-expiring) session so `require_session_mk` / `valid_access_token` yield a bearer
+    /// with NO network refresh — the mock server never sees an auth call.
+    fn seed_live_session(state: &AppState) {
+        *state.account_session.lock().unwrap() = Some(crate::share::AccountSession {
+            account_id: "user@example.com".into(),
+            email: "user@example.com".into(),
+            server_user_id: Some("c534b6d2-02c1-4c2c-a256-3af8592b1567".into()),
+            device_id: "dev-1".into(),
+            mk: Zeroizing::new([7u8; 32]),
+            generation: 1,
+            access_token: "a".into(),
+            access_expires_at: Some("2099-01-01T00:00:00Z".into()),
+            refresh_token: "r".into(),
+        });
+    }
+
+    /// Pre-seed the session OCK cache for `(org_id, generation)` so `acquire_org_ock` hits the cache
+    /// and never touches the (unmocked) key-grants endpoint.
+    fn seed_ock(state: &AppState, org_id: &str, generation: u32) {
+        state
+            .org_ock_cache
+            .lock()
+            .unwrap()
+            .insert((org_id.to_string(), generation), Zeroizing::new([9u8; 32]));
+    }
+
+    /// ITEM 1 — the core republish-on-edit assertion. Share a DOC to a mock org (item rev 1, one
+    /// `uploaded` `org_shares` row), then EDIT the note body → the edit re-publishes as a NEW item at
+    /// rev 2, the SAME single org_shares row is repointed (new item_id, rev==2, new content hash), the
+    /// OLD item is tombstoned, and the egress ledger carries a publish+revoke pair. RED on the old code
+    /// (no edit path re-published → org copy frozen at rev 1); GREEN after.
+    #[test]
+    fn republish_bumps_rev_and_tombstones_old_on_edit() {
+        let mock = MockOrgServer::start();
+        let state = build_state("org-republish-edit");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        make_open_folder(&state.db, "f-rp", "Team");
+        state
+            .db
+            .insert_note("n-rp", "f-rp", "plan", "Q3 Plan", "# original body", 1)
+            .unwrap();
+
+        state.config.lock().unwrap().org_egress_consented = true;
+        state.config.lock().unwrap().share_base_url = mock.base.clone();
+        seed_live_session(&state);
+        seed_ock(&state, "org-1", 1);
+
+        // Initial share → item-1, rev 1, one uploaded row.
+        let entry = block_on(share_to_org_inner(
+            &state,
+            "org-1",
+            None,
+            Some("n-rp".to_string()),
+            true,
+        ))
+        .expect("initial share should publish against the mock server");
+        assert_eq!(entry.rev, 1, "first share is rev 1");
+        assert_eq!(entry.item_id.as_deref(), Some("item-1"));
+        let rows = state.db.list_org_shares_for_org("org-1").unwrap();
+        assert_eq!(rows.len(), 1, "one uploaded share row after the initial share");
+        assert_eq!(rows[0].state, "uploaded");
+        assert_eq!(rows[0].item_id.as_deref(), Some("item-1"));
+        let sha_before = rows[0].content_sha256.clone();
+
+        // EDIT the note body through the COMMIT boundary. The async command wrapper is exactly
+        // `update_note_doc_inner(..)?` then `republish_org_shares_for_source(..).await` — replicate
+        // those two steps (a real `tauri::State` can't be constructed in a unit test).
+        update_note_doc_inner(&state, "n-rp", "Q3 Plan", "# EDITED body — the org copy must reflect this")
+            .unwrap();
+        block_on(republish_org_shares_for_source(&state, None, Some("n-rp"))).unwrap();
+
+        // The edit superseded the org item: a NEW item published, rev bumped, SAME row repointed.
+        let after = state.db.list_org_shares_for_org("org-1").unwrap();
+        assert_eq!(
+            after.len(),
+            1,
+            "still ONE org_shares row after republish (no row amplification)"
+        );
+        assert_eq!(after[0].state, "uploaded");
+        assert_eq!(after[0].rev, 2, "rev bumped to 2 on the edit republish");
+        assert_eq!(
+            after[0].item_id.as_deref(),
+            Some("item-2"),
+            "the row was repointed to the NEW server item"
+        );
+        assert_ne!(
+            after[0].content_sha256, sha_before,
+            "content hash changed (the body was edited)"
+        );
+
+        // The mock server saw two publishes and the OLD item tombstoned.
+        let log = mock.log.lock().unwrap();
+        assert_eq!(log.published, vec!["item-1".to_string(), "item-2".to_string()]);
+        assert_eq!(
+            log.tombstoned,
+            vec!["item-1".to_string()],
+            "the OLD item (item-1) was tombstoned so members evict the stale copy"
+        );
+
+        // Egress ledger: two publishes + one revoke (all content-free).
+        assert_eq!(
+            state.db.count_share_egress_by_kind("org_share_publish").unwrap(),
+            2
+        );
+        assert_eq!(
+            state.db.count_share_egress_by_kind("org_share_revoke").unwrap(),
+            1
+        );
+    }
+
+    /// B1 (owner-live-refresh) — the OWNER's OWN first-time share must appear in `list_org_items`
+    /// IMMEDIATELY via the local `org_items` replica, not only after a later feed pull. RED before the
+    /// fix (`publish_org_body` published to the server but never upserted the local row → the shared
+    /// note was invisible in the Notes org view / Settings browse until a manual "Sync now"); GREEN
+    /// after: one owned/editable card resolves right away carrying the note's CURRENT title.
+    #[test]
+    fn initial_share_populates_local_org_items_replica_immediately() {
+        let mock = MockOrgServer::start();
+        let state = build_state("org-initial-share-replica");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        make_open_folder(&state.db, "f-sh", "Team");
+        state
+            .db
+            .insert_note("n-sh", "f-sh", "plan", "Kickoff Plan", "# body to share", 1)
+            .unwrap();
+
+        state.config.lock().unwrap().org_egress_consented = true;
+        state.config.lock().unwrap().share_base_url = mock.base.clone();
+        seed_live_session(&state);
+        seed_ock(&state, "org-1", 1);
+
+        let entry = block_on(share_to_org_inner(
+            &state,
+            "org-1",
+            None,
+            Some("n-sh".to_string()),
+            true,
+        ))
+        .expect("initial share should publish against the mock server");
+        assert_eq!(entry.item_id.as_deref(), Some("item-1"));
+
+        // The local replica must ALREADY hold the item — no feed pull has happened. This is exactly what
+        // makes the shared note show up without a manual "Sync now".
+        let items = list_org_items_inner(&state, "org-1").unwrap();
+        assert_eq!(
+            items.len(),
+            1,
+            "the owner's own share is in the local replica immediately (no pull needed)"
+        );
+        assert_eq!(items[0].item_id, "item-1");
+        // The caller authored it → resolved as an OWNED/editable card with the note's CURRENT title.
+        assert!(
+            items[0].owned_source.is_some(),
+            "the author's own item resolves to an owned/editable source"
+        );
+        assert_eq!(items[0].title, "Kickoff Plan");
+    }
+
+    /// ITEM 1 — a republish MUST NOT tombstone-into-nothing. Lock the note's folder AFTER the share,
+    /// then edit (the write itself is gated, but even the republish read-gate refuses): the org copy is
+    /// left UNTOUCHED — no new publish, NO tombstone. Proves the `Locked` skip protects the org copy.
+    #[test]
+    fn republish_refuses_when_folder_locked() {
+        let mock = MockOrgServer::start();
+        let state = build_state("org-republish-locked");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        make_open_folder(&state.db, "f-lk", "Team");
+        state
+            .db
+            .insert_note("n-lk", "f-lk", "plan", "Plan", "# body", 1)
+            .unwrap();
+        state.config.lock().unwrap().org_egress_consented = true;
+        state.config.lock().unwrap().share_base_url = mock.base.clone();
+        seed_live_session(&state);
+        seed_ock(&state, "org-1", 1);
+
+        block_on(share_to_org_inner(
+            &state,
+            "org-1",
+            None,
+            Some("n-lk".to_string()),
+            true,
+        ))
+        .unwrap();
+
+        // Lock the folder (NOT session-unlocked) → the build_org_share_body read-gate refuses.
+        state
+            .db
+            .set_folder_locked("f-lk", true, Some(&b"wrapped"[..]))
+            .unwrap();
+
+        // Republish directly (an edit would be gated too; here we exercise the republish skip path).
+        block_on(republish_org_shares_for_source(&state, None, Some("n-lk"))).unwrap();
+
+        let rows = state.db.list_org_shares_for_org("org-1").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].rev, 1, "rev NOT bumped — republish skipped a locked source");
+        assert_eq!(
+            rows[0].item_id.as_deref(),
+            Some("item-1"),
+            "org copy left as-is (still item-1)"
+        );
+        let log = mock.log.lock().unwrap();
+        assert_eq!(log.published, vec!["item-1".to_string()], "no new publish");
+        assert!(log.tombstoned.is_empty(), "NEVER tombstone-into-nothing on a locked source");
+    }
+
+    /// ITEM 1 — unchanged content ⇒ NO egress. Re-save the IDENTICAL body → the content hash matches
+    /// the stored row → republish short-circuits: no new item, no tombstone, no egress ledger row.
+    #[test]
+    fn republish_noop_when_content_unchanged() {
+        let mock = MockOrgServer::start();
+        let state = build_state("org-republish-noop");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        make_open_folder(&state.db, "f-nc", "Team");
+        state
+            .db
+            .insert_note("n-nc", "f-nc", "plan", "Plan", "# same body", 1)
+            .unwrap();
+        state.config.lock().unwrap().org_egress_consented = true;
+        state.config.lock().unwrap().share_base_url = mock.base.clone();
+        seed_live_session(&state);
+        seed_ock(&state, "org-1", 1);
+
+        block_on(share_to_org_inner(
+            &state,
+            "org-1",
+            None,
+            Some("n-nc".to_string()),
+            true,
+        ))
+        .unwrap();
+        let publishes_before = state.db.count_share_egress_by_kind("org_share_publish").unwrap();
+
+        // Re-save the SAME body (title unchanged too) → identical envelope hash → no-op republish.
+        update_note_doc_inner(&state, "n-nc", "Plan", "# same body").unwrap();
+        block_on(republish_org_shares_for_source(&state, None, Some("n-nc"))).unwrap();
+
+        let rows = state.db.list_org_shares_for_org("org-1").unwrap();
+        assert_eq!(rows[0].rev, 1, "no rev bump on unchanged content");
+        assert_eq!(rows[0].item_id.as_deref(), Some("item-1"));
+        assert_eq!(
+            state.db.count_share_egress_by_kind("org_share_publish").unwrap(),
+            publishes_before,
+            "unchanged content ⇒ NO new publish egress"
+        );
+        let log = mock.log.lock().unwrap();
+        assert_eq!(log.published, vec!["item-1".to_string()], "no second publish");
+        assert!(log.tombstoned.is_empty(), "no tombstone on a no-op republish");
+    }
+
+    /// ITEM 6 — the MEETING arm: share a MEETING note → edit the meeting note via `update_note` → the
+    /// same supersede (new item rev 2, repointed row, old item tombstoned) fires for the meeting path.
+    #[test]
+    fn republish_meeting_note_bumps_rev_and_tombstones_old() {
+        let mock = MockOrgServer::start();
+        let state = build_state("org-republish-meeting");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        make_open_folder(&state.db, "f-mtg", "Team");
+        state
+            .db
+            .insert_meeting(&Meeting {
+                id: "m-rp".to_string(),
+                started_at: "2026-07-10T09:00:00Z".to_string(),
+                ended_at: None,
+                title: Some("Board strategy".to_string()),
+                duration_s: 600,
+                audio_path: None,
+                status: MeetingStatus::Summarized,
+                folder_id: Some("f-mtg".to_string()),
+            })
+            .unwrap();
+        state
+            .db
+            .upsert_note(&NoteRecord {
+                meeting_id: "m-rp".to_string(),
+                provider_id: "claude_code".to_string(),
+                markdown: "# meeting note original".to_string(),
+                created_at: "2026-07-10T09:10:00Z".to_string(),
+                exported_path: None,
+                model_requested: None,
+                model_served: None,
+                gateway_host: None,
+            })
+            .unwrap();
+        state.db.set_note_folder("m-rp", Some("f-mtg")).unwrap();
+
+        state.config.lock().unwrap().org_egress_consented = true;
+        state.config.lock().unwrap().share_base_url = mock.base.clone();
+        seed_live_session(&state);
+        seed_ock(&state, "org-1", 1);
+
+        block_on(share_to_org_inner(
+            &state,
+            "org-1",
+            Some("m-rp".to_string()),
+            None,
+            true,
+        ))
+        .unwrap();
+
+        // Edit the meeting note through the commit boundary (inner + republish, as the wrapper does).
+        update_note_inner(&state, "m-rp", "# meeting note EDITED").unwrap();
+        block_on(republish_org_shares_for_source(&state, Some("m-rp"), None)).unwrap();
+
+        let rows = state.db.list_org_shares_for_org("org-1").unwrap();
+        assert_eq!(rows.len(), 1, "one repointed row for the meeting share");
+        assert_eq!(rows[0].rev, 2, "meeting republish bumped rev to 2");
+        assert_eq!(rows[0].item_id.as_deref(), Some("item-2"));
+        assert_eq!(rows[0].meeting_id.as_deref(), Some("m-rp"));
+        let log = mock.log.lock().unwrap();
+        assert_eq!(log.published, vec!["item-1".to_string(), "item-2".to_string()]);
+        assert_eq!(log.tombstoned, vec!["item-1".to_string()]);
+    }
+
+    /// STUCK-REPUBLISH FIX (the sweep side): `org_sweep_pending_inner` retries a `failed` row that
+    /// STILL carries an `item_id` (a republish that failed transiently, leaving the OLD publish live)
+    /// via `republish_org_shares_for_source` — which SUPERSEDES (new item, bumped rev, old tombstoned)
+    /// — rather than via `share_to_org_inner`, which would wrongly restart at `rev = 1` and mint a
+    /// DUPLICATE item alongside the still-live stuck one. Sequence: (1) share n-sw successfully
+    /// (item-1, rev 1); (2) evict the cached OCK so the NEXT OCK acquire 404s against the mock server
+    /// (no `/key-grants` route) — forcing a deterministic republish failure that lands the row in
+    /// `state='failed'` WITH `item_id` still `Some("item-1")`, exactly the stuck shape; (3) re-seed the
+    /// OCK (simulating the transient blip clearing) and run the sweep — assert it advances the row via
+    /// a NEW published item (rev 2, superseding item-1) rather than a second, independent rev-1 item.
+    #[test]
+    fn org_sweep_pending_retries_stuck_failed_rows_via_republish_not_fresh_share() {
+        let mock = MockOrgServer::start();
+        let state = build_state("org-sweep-stuck-republish");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        make_open_folder(&state.db, "f-sw", "Team");
+        state
+            .db
+            .insert_note("n-sw", "f-sw", "plan", "Plan", "# original body", 1)
+            .unwrap();
+        state.config.lock().unwrap().org_egress_consented = true;
+        state.config.lock().unwrap().share_base_url = mock.base.clone();
+        seed_live_session(&state);
+        seed_ock(&state, "org-1", 1);
+
+        // (1) Initial share succeeds: item-1, rev 1, one uploaded row.
+        let entry = block_on(share_to_org_inner(
+            &state,
+            "org-1",
+            None,
+            Some("n-sw".to_string()),
+            true,
+        ))
+        .expect("initial share should publish against the mock server");
+        assert_eq!(entry.item_id.as_deref(), Some("item-1"));
+        let row_id = state.db.list_org_shares_for_org("org-1").unwrap()[0].id.clone();
+
+        // Edit the note so the republish has new content to publish.
+        update_note_doc_inner(&state, "n-sw", "Plan", "# EDITED body").unwrap();
+
+        // (2) Evict the OCK cache so the republish's `acquire_org_ock` cache-misses and hits the
+        // (unmocked) key-grants endpoint, which 404s → deterministic republish failure.
+        state.org_ock_cache.lock().unwrap().clear();
+        let republished = block_on(republish_org_shares_for_source(&state, None, Some("n-sw"))).unwrap();
+        assert_eq!(republished, 0, "the forced OCK failure republished nothing this call");
+        let stuck = state.db.get_org_share(&row_id).unwrap().unwrap();
+        assert_eq!(stuck.state, "failed", "the row landed in failed state");
+        assert_eq!(
+            stuck.item_id.as_deref(),
+            Some("item-1"),
+            "the OLD, still-server-live item_id is retained (set_org_share_failed doesn't clear it)"
+        );
+        assert_eq!(stuck.rev, 1, "rev was NOT bumped — the republish attempt failed before publishing");
+
+        // (3) The transient blip clears (OCK re-seeded) — run the sweep.
+        seed_ock(&state, "org-1", 1);
+        let advanced = block_on(org_sweep_pending_inner(&state)).unwrap();
+        assert_eq!(advanced, 1, "the sweep advanced the stuck row");
+
+        let healed = state.db.get_org_share(&row_id).unwrap().unwrap();
+        assert_eq!(healed.state, "uploaded", "the row is live again after the sweep");
+        assert_eq!(healed.rev, 2, "republish bumped rev to 2 — NOT a fresh rev-1 share");
+        assert_eq!(
+            healed.item_id.as_deref(),
+            Some("item-2"),
+            "the row was repointed to a NEW item that SUPERSEDES item-1"
+        );
+        // Still exactly ONE org_shares row for this source — no duplicate row was minted.
+        let all_rows = state.db.list_org_shares_for_org("org-1").unwrap();
+        assert_eq!(all_rows.len(), 1, "no duplicate org_shares row for the source");
+
+        // The mock server saw item-1 published, then item-2 published, then item-1 tombstoned — the
+        // supersede sequence, NOT a second independent rev-1 publish with item-1 left live forever.
+        let log = mock.log.lock().unwrap();
+        assert_eq!(log.published, vec!["item-1".to_string(), "item-2".to_string()]);
+        assert_eq!(
+            log.tombstoned,
+            vec!["item-1".to_string()],
+            "the OLD stuck item was tombstoned once the new one superseded it"
+        );
+    }
+
+    /// Brain v3 ORG PUSH SIZE PRE-CHECK (RED-before-GREEN): the server hard-caps an org item blob
+    /// at `MAX_ORG_ITEM_BLOB_BYTES` (1 MiB) — pre-fix an oversized share egressed the blob, got a
+    /// 413, landed `failed("upload_failed")`, and the launch sweep re-attempted it on EVERY start
+    /// (the poison loop; against this size-blind mock the sweep retry would even "succeed", which
+    /// is the RED shape). Post-fix: the share fails CLIENT-SIDE before any egress with the TERMINAL
+    /// `too_large` reason, and the sweep never requeues it.
+    #[test]
+    fn oversized_org_share_fails_terminal_too_large_and_sweep_never_requeues() {
+        let mock = MockOrgServer::start();
+        let state = build_state("org-share-too-large");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        make_open_folder(&state.db, "f-big", "Team");
+        // Plaintext > the cap ⇒ the sealed ciphertext (≥ plaintext) certainly exceeds it.
+        let big_body = format!(
+            "# Big\n\n{}",
+            "x".repeat(murmur_protocol::caps::MAX_ORG_ITEM_BLOB_BYTES + 64 * 1024)
+        );
+        state
+            .db
+            .insert_note("n-big", "f-big", "big", "Big", &big_body, 1)
+            .unwrap();
+        state.config.lock().unwrap().org_egress_consented = true;
+        state.config.lock().unwrap().share_base_url = mock.base.clone();
+        seed_live_session(&state);
+        seed_ock(&state, "org-1", 1);
+
+        // The share is refused client-side: no blob upload, no publish, terminal reason on the row.
+        let res = block_on(share_to_org_inner(
+            &state,
+            "org-1",
+            None,
+            Some("n-big".to_string()),
+            true,
+        ));
+        assert!(res.is_err(), "an oversized share is refused before any egress");
+        let rows = state.db.list_org_shares_for_org("org-1").unwrap();
+        assert_eq!(rows.len(), 1, "exactly one local row records the refusal");
+        assert_eq!(rows[0].state, "failed");
+        assert_eq!(
+            rows[0].last_error.as_deref(),
+            Some(ORG_SHARE_ERR_TOO_LARGE),
+            "the row carries the TERMINAL too_large reason"
+        );
+        assert!(rows[0].item_id.is_none(), "nothing was published");
+        assert!(
+            mock.log.lock().unwrap().published.is_empty(),
+            "the server never saw a publish"
+        );
+        let updated_at_before_sweep = rows[0].updated_at.clone();
+
+        // The launch sweep must NOT requeue it (RED pre-fix: every failed row was re-attempted).
+        let advanced = block_on(org_sweep_pending_inner(&state)).unwrap();
+        assert_eq!(advanced, 0, "too_large is TERMINAL for the sweep");
+        let row = &state.db.list_org_shares_for_org("org-1").unwrap()[0];
+        assert_eq!(row.state, "failed", "the row is left exactly where it was");
+        assert_eq!(row.last_error.as_deref(), Some(ORG_SHARE_ERR_TOO_LARGE));
+        // Binds the sweep EXCLUSION itself (not just the client-side refusal): a re-ATTEMPT would
+        // re-arm + re-fail the row, rewriting `updated_at` — a skipped row is byte-identical.
+        assert_eq!(
+            row.updated_at, updated_at_before_sweep,
+            "the sweep never even re-attempted the too_large row"
+        );
+        assert!(
+            mock.log.lock().unwrap().published.is_empty(),
+            "the sweep produced no egress for the oversized row"
+        );
+    }
+
+    /// ITEM 2 — `org_resolve_source` maps an uploaded org item back to its LOCAL editable source, and
+    /// returns `None` for an unknown item id (a colleague's item this device never published).
+    #[test]
+    fn org_resolve_source_maps_item_to_local_source() {
+        let mock = MockOrgServer::start();
+        let state = build_state("org-resolve-source");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        make_open_folder(&state.db, "f-rs", "Team");
+        state
+            .db
+            .insert_note("n-rs", "f-rs", "plan", "Plan", "# body", 1)
+            .unwrap();
+        state.config.lock().unwrap().org_egress_consented = true;
+        state.config.lock().unwrap().share_base_url = mock.base.clone();
+        seed_live_session(&state);
+        seed_ock(&state, "org-1", 1);
+
+        let entry = block_on(share_to_org_inner(
+            &state,
+            "org-1",
+            None,
+            Some("n-rs".to_string()),
+            true,
+        ))
+        .unwrap();
+        let item_id = entry.item_id.unwrap();
+
+        let resolved = org_resolve_source_inner(&state, &item_id).unwrap().unwrap();
+        assert_eq!(resolved.kind, "document");
+        assert_eq!(resolved.source_id, "n-rs");
+
+        // An unknown item (not published by THIS device) → None.
+        assert!(org_resolve_source_inner(&state, "item-unknown").unwrap().is_none());
+    }
+
+    /// STUCK-REPUBLISH FIX: `org_resolve_source` still resolves a `failed` row whose LAST republish
+    /// attempt failed but which retained its OLD, still-server-live `item_id` (`set_org_share_failed`
+    /// never clears it — see `org_shares_for_source`'s doc). This is what makes the author's own note
+    /// open in the real editor instead of getting stuck in the read-only Org Brain viewer. A `revoked`
+    /// row (intentionally torn down) is the one state that must still return `None`.
+    #[test]
+    fn org_resolve_source_resolves_stuck_failed_rows_but_not_revoked() {
+        let state = build_state("org-resolve-source-stuck");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        let now = "2026-07-12T00:00:00Z";
+
+        // A row that published successfully once, then a REPUBLISH attempt failed — item_id retained.
+        state
+            .db
+            .insert_org_share("s-stuck", "org-1", None, Some("n-stuck"), "note", Some("T"), 1, 1, &[1u8; 32], now)
+            .unwrap();
+        state.db.set_org_share_uploaded("s-stuck", "item-stuck", now).unwrap();
+        state.db.set_org_share_failed("s-stuck", "republish_upload_failed", now).unwrap();
+
+        let resolved = org_resolve_source_inner(&state, "item-stuck").unwrap();
+        assert_eq!(
+            resolved.map(|r| (r.kind, r.source_id)),
+            Some(("document".to_string(), "n-stuck".to_string())),
+            "a failed-with-item_id row still resolves to its real editable source"
+        );
+
+        // A row that was uploaded, then intentionally revoked — must NOT resolve.
+        state
+            .db
+            .insert_org_share("s-revoked", "org-1", None, Some("n-revoked"), "note", Some("T"), 1, 1, &[2u8; 32], now)
+            .unwrap();
+        state.db.set_org_share_uploaded("s-revoked", "item-revoked", now).unwrap();
+        state.db.set_org_share_state("s-revoked", "revoked", now).unwrap();
+
+        assert!(
+            org_resolve_source_inner(&state, "item-revoked").unwrap().is_none(),
+            "an intentionally revoked share must not resolve back to an editable source"
+        );
+    }
+
+    /// F1 (org_leave targets the SPECIFIED org's local state). `org_leave` deletes the local org row +
+    /// purges the replica for the org the FE picked. It first calls the server (unreachable here), so
+    /// we drive the DB-side purge through the same helper `org_leave` uses (`delete_org_state`) against
+    /// the resolved SECOND org and assert ONLY it is removed — the first org (which a `.next()` would
+    /// have wrongly purged) survives. Proves the leave operates on the specified org id, not the first.
+    #[test]
+    fn org_leave_purges_only_the_specified_org() {
+        let state = build_state("org-leave-target");
+        // `org-keep` joined EARLIER → it is the deterministic `.next()` org a pre-fix leave would have
+        // wrongly purged; the FE asks to leave `org-drop` (the SECOND).
+        seed_org_at(&state.db, "org-keep", "Keep", "owner", "2026-07-01T00:00:00Z");
+        seed_org_at(&state.db, "org-drop", "Drop", "member", "2026-07-11T00:00:00Z");
+
+        // Resolve the SECOND org (the one the FE asked to leave) and apply the same DB purge `org_leave`
+        // does after the server call.
+        let target = resolve_org(&state, "org-drop").unwrap();
+        assert_eq!(target.org_id, "org-drop");
+        state.db.delete_org_state(&target.org_id).unwrap();
+        state.db.purge_org_replica(&target.org_id).unwrap();
+
+        assert!(
+            state.db.get_org_state("org-drop").unwrap().is_none(),
+            "the specified org was removed"
+        );
+        assert!(
+            state.db.get_org_state("org-keep").unwrap().is_some(),
+            "the FIRST org is untouched (a .next()-based leave would have wrongly purged it)"
+        );
+    }
+
+    /// F2 (HARDENING, RED→GREEN): an EMPTY server membership list must NOT wipe all local org replicas.
+    /// `reconcile_org_state_into_db` with an empty target set but a NON-empty local set removes NOTHING
+    /// (a `{"orgs":[]}` from a buggy/hostile/transient server would otherwise purge every local org).
+    /// RED on the pre-fix reconcile (it removed both local orgs = `removed == 2`, both gone); GREEN
+    /// after the empty-server guard (removed == 0, both cached rows kept). A non-empty list omitting a
+    /// SPECIFIC org (the real leave/remove case) still removes it — asserted by
+    /// `reconcile_adds_invited_org_and_removes_departed`.
+    #[test]
+    fn reconcile_empty_server_list_keeps_local_orgs() {
+        let state = build_state("org-reconcile-empty");
+        seed_org(&state.db, "org-a", "A", "owner", 1);
+        seed_org(&state.db, "org-b", "B", "member", 1);
+
+        // Server returns an EMPTY membership list (suspicious while we HAVE local orgs).
+        let server: Vec<crate::share::org_dto::OrgSummary> = Vec::new();
+        let outcome = reconcile_org_state_into_db(&state, &server).unwrap();
+
+        assert_eq!(
+            outcome.removed, 0,
+            "an empty server list removes NOTHING (RED on the pre-fix wipe)"
+        );
+        assert!(outcome.new_orgs.is_empty());
+        // Both local replicas are still present (not purged by an empty/transient server response).
+        assert!(state.db.get_org_state("org-a").unwrap().is_some(), "org-a kept");
+        assert!(state.db.get_org_state("org-b").unwrap().is_some(), "org-b kept");
+    }
+
+    /// REGRESSION (2026-07-11 live 404): org key-grants MUST key on the stable SERVER USER ID (a UUID),
+    /// never the email `account_id`. A login sets `account_id = email` (the mk-wrap AAD depends on it),
+    /// and `LoginFinishResponse` used to omit the user id, so the app sent the EMAIL as the grant
+    /// `user_id` → the server's `parse_org_id` rejected it 404 ("Start a shared brain" failed).
+    /// `session_server_user_id` now returns the UUID from the session, and fails CLOSED with a re-login
+    /// prompt (never the email) when a pre-fix session lacks it.
+    #[test]
+    fn org_identity_uses_server_user_id_not_email() {
+        let state = build_state("org-identity");
+        let uuid = "c534b6d2-02c1-4c2c-a256-3af8592b1567";
+        let set_session = |server_user_id: Option<String>| {
+            *state.account_session.lock().unwrap() = Some(crate::share::AccountSession {
+                account_id: "user@example.com".into(), // the EMAIL — must NEVER be the grant key
+                email: "user@example.com".into(),
+                server_user_id,
+                device_id: "dev-1".into(),
+                mk: Zeroizing::new([7u8; 32]),
+                generation: 1,
+                access_token: "a".into(),
+                access_expires_at: Some("2099-01-01T00:00:00Z".into()),
+                refresh_token: "r".into(),
+            });
+        };
+        // UUID present ⇒ org identity is the UUID, not the email.
+        set_session(Some(uuid.into()));
+        assert_eq!(session_server_user_id(&state).unwrap(), uuid);
+        // Absent (a session persisted before the fix) ⇒ a clear re-login prompt, never the email.
+        set_session(None);
+        assert!(matches!(
+            session_server_user_id(&state),
+            Err(AppError::Unavailable(_))
+        ));
+    }
+
+    /// `active_org_shares_for_folder` returns the folder's ACTIVE (non-revoked/failed) org shares for
+    /// the lock×shares dialog — meeting-anchored AND note-anchored — and excludes revoked ones.
+    #[test]
+    fn active_org_shares_for_folder_lists_active_only() {
+        let state = build_state("org-active-folder");
+        make_open_folder(&state.db, "f1", "Team");
+        // A meeting in f1 with an uploaded org share.
+        state
+            .db
+            .insert_meeting(&Meeting {
+                id: "m1".into(),
+                started_at: "2026-07-10T09:00:00Z".into(),
+                ended_at: None,
+                title: Some("Sync".into()),
+                duration_s: 60,
+                audio_path: None,
+                status: MeetingStatus::Summarized,
+                folder_id: Some("f1".into()),
+            })
+            .unwrap();
+        state
+            .db
+            .upsert_note(&NoteRecord {
+                meeting_id: "m1".into(),
+                provider_id: "claude_code".into(),
+                markdown: "# n".into(),
+                created_at: "2026-07-10T09:05:00Z".into(),
+                exported_path: None,
+                model_requested: None,
+                model_served: None,
+                gateway_host: None,
+            })
+            .unwrap();
+        state.db.set_note_folder("m1", Some("f1")).unwrap();
+        // A note in f1 with a queued org share, plus a REVOKED share that must be excluded.
+        state
+            .db
+            .insert_note("n1", "f1", "doc", "Doc", "# body", 1)
+            .unwrap();
+        let sha = vec![1u8; 32];
+        state
+            .db
+            .insert_org_share("s-m", "org-1", Some("m1"), None, "note", Some("Sync"), 1, 1, &sha, "t")
+            .unwrap();
+        state
+            .db
+            .set_org_share_uploaded("s-m", "item-m", "t")
+            .unwrap();
+        state
+            .db
+            .insert_org_share("s-n", "org-1", None, Some("n1"), "note", Some("Doc"), 1, 1, &sha, "t")
+            .unwrap();
+        state
+            .db
+            .insert_org_share("s-rev", "org-1", Some("m1"), None, "note", Some("Old"), 1, 1, &sha, "t")
+            .unwrap();
+        state
+            .db
+            .set_org_share_state("s-rev", "revoked", "t")
+            .unwrap();
+
+        let active = state.db.active_org_shares_for_folder("f1").unwrap();
+        // The uploaded meeting share + the queued note share = 2 active; the revoked one is excluded.
+        assert_eq!(active.len(), 2, "two active org shares, revoked excluded: {active:?}");
+        assert!(active.iter().any(|(item, _)| item.as_deref() == Some("item-m")));
+        assert!(active.iter().any(|(item, _)| item.is_none())); // the queued note share (no item yet)
+    }
+
+    /// cd21b10 established that a `failed` row with a non-null `item_id` (a republish attempt failed
+    /// transiently but the PRIOR publish is still genuinely live on the server — `set_org_share_failed`
+    /// deliberately never clears `item_id`) counts as LIVE everywhere: `org_shares_for_source`,
+    /// `list_live_org_shares`, `OrgStatus.item_count`, `org_resolve_source_inner`. This proves
+    /// `active_org_shares_for_folder` and `active_org_share_ids_for_folder` (the lock×shares dialog +
+    /// bulk-revoke) also surface that shape — before the fix they used the pre-cd21b10 narrow
+    /// `state IN ('queued','uploaded','revoke_pending')` predicate, so a stuck failed-with-item_id share
+    /// was invisible to the dialog and never revoked when the folder was locked.
+    #[test]
+    fn active_org_shares_for_folder_includes_stuck_failed_republish_with_live_item_id() {
+        let state = build_state("org-active-folder-stuck-failed");
+        make_open_folder(&state.db, "f1", "Team");
+        state
+            .db
+            .insert_note("n1", "f1", "doc", "Doc", "# body", 1)
+            .unwrap();
+        let sha = vec![1u8; 32];
+        // Published once (item-stuck), then a republish-on-edit attempt failed transiently: state
+        // becomes 'failed' but item_id STAYS 'item-stuck' (the prior publish is still live).
+        state
+            .db
+            .insert_org_share("s-stuck", "org-1", None, Some("n1"), "note", Some("Doc"), 1, 1, &sha, "t")
+            .unwrap();
+        state
+            .db
+            .set_org_share_uploaded("s-stuck", "item-stuck", "t")
+            .unwrap();
+        state
+            .db
+            .set_org_share_failed("s-stuck", "republish_upload_failed", "t")
+            .unwrap();
+        // A never-published failed row (no item_id) must stay excluded — no live server item.
+        state
+            .db
+            .insert_note("n2", "f1", "doc", "Doc2", "# body2", 1)
+            .unwrap();
+        state
+            .db
+            .insert_org_share("s-dead", "org-1", None, Some("n2"), "note", Some("Doc2"), 1, 1, &sha, "t")
+            .unwrap();
+        state
+            .db
+            .set_org_share_failed("s-dead", "publish_failed", "t")
+            .unwrap();
+
+        let active = state.db.active_org_shares_for_folder("f1").unwrap();
+        assert_eq!(
+            active.len(),
+            1,
+            "the stuck failed-with-item_id share IS surfaced; the never-published failed row stays excluded: {active:?}"
+        );
+        assert_eq!(active[0].0.as_deref(), Some("item-stuck"));
+
+        // Same fix must apply to the bulk-revoke enumeration (`revoke_shares_for_folder`'s source).
+        let ids = state.db.active_org_share_ids_for_folder("f1").unwrap();
+        assert_eq!(
+            ids.len(),
+            1,
+            "bulk-revoke must also see the stuck failed-with-item_id share: {ids:?}"
+        );
+        assert_eq!(ids[0].0, "s-stuck");
+        assert_eq!(ids[0].1.as_deref(), Some("item-stuck"));
+    }
+
+    /// Closes the pre-existing lock×shares HOLE: before `active_link_user_shares_for_folder`, a folder
+    /// could be sealed with NO warning that its notes were still shared 1:1 (link/user). This proves
+    /// the enumeration that `folder_active_shares` (→ the dialog) reads: it surfaces the folder's
+    /// ACTIVE link + user shares, and excludes revoked shares AND shares in other folders.
+    ///
+    /// The mode-B (Murmur↔Murmur USER) fixture is seeded via the REAL production helper
+    /// (`insert_outbound_user_share`, called from `share_note_to_user_inner`) rather than
+    /// `insert_outbound_share` (which hardcodes `state='active'` and is only ever used for mode-A LINK
+    /// shares) — `insert_outbound_user_share` never writes `'active'`, only `'sent'`/`'awaiting_key'`.
+    /// A prior version of this test seeded its "user"-mode row via `insert_outbound_share`, which gave
+    /// false confidence: it never exercised the state values a genuine mode-B row actually carries, so
+    /// it didn't catch `active_link_user_shares_for_folder`'s `WHERE state = 'active'` excluding every
+    /// real 1:1-person share (100%-reproducible, not an edge case).
+    #[test]
+    fn active_link_user_shares_for_folder_lists_active_1to1_and_excludes_revoked_and_other_folders() {
+        let state = build_state("folder-1to1-shares");
+        make_open_folder(&state.db, "f1", "Team");
+        make_open_folder(&state.db, "f2", "Other");
+        let mk_note = |mid: &str, fid: &str, title: &str| {
+            state
+                .db
+                .insert_meeting(&Meeting {
+                    id: mid.into(),
+                    started_at: "2026-07-10T09:00:00Z".into(),
+                    ended_at: None,
+                    title: Some(title.into()),
+                    duration_s: 60,
+                    audio_path: None,
+                    status: MeetingStatus::Summarized,
+                    folder_id: Some(fid.into()),
+                })
+                .unwrap();
+            state
+                .db
+                .upsert_note(&NoteRecord {
+                    meeting_id: mid.into(),
+                    provider_id: "claude_code".into(),
+                    markdown: "# n".into(),
+                    created_at: "t".into(),
+                    exported_path: None,
+                    model_requested: None,
+                    model_served: None,
+                    gateway_host: None,
+                })
+                .unwrap();
+            state.db.set_note_folder(mid, Some(fid)).unwrap();
+        };
+        mk_note("m1", "f1", "Sync");
+        mk_note("m2", "f2", "Elsewhere");
+        // f1/m1: an active LINK share, a REVOKED link that must be excluded, a mode-B USER share
+        // already 'sent' (registered recipient), and a mode-B USER share still 'awaiting_key'
+        // (unregistered recipient, pending re-wrap) — both are LIVE and must surface.
+        state.db.insert_outbound_share("lnk", "m1", "link", 1, "t").unwrap();
+        state.db.insert_outbound_share("old", "m1", "link", 1, "t").unwrap();
+        state.db.set_outbound_share_state("old", "revoked").unwrap();
+        state
+            .db
+            .insert_outbound_user_share("usr-sent", "m1", 1, "t", "sent", b"nk", "acct-1", "a@x.com", b"hash")
+            .unwrap();
+        state
+            .db
+            .insert_outbound_user_share(
+                "usr-pending",
+                "m1",
+                1,
+                "t",
+                "awaiting_key",
+                b"nk",
+                "acct-2",
+                "b@x.com",
+                b"hash",
+            )
+            .unwrap();
+        // f2/m2: a share in ANOTHER folder must not leak into f1's report.
+        state.db.insert_outbound_share("f2lnk", "m2", "link", 1, "t").unwrap();
+
+        let shares = state.db.active_link_user_shares_for_folder("f1").unwrap();
+        assert_eq!(
+            shares.len(),
+            3,
+            "one active LINK + two live USER shares (sent + awaiting_key) in f1, revoked + other-folder excluded: {shares:?}"
+        );
+        let links = shares.iter().filter(|(_, m)| m == "link").count();
+        let users = shares.iter().filter(|(_, m)| m == "user").count();
+        assert_eq!((links, users), (1, 2), "one link + two user shares (sent + awaiting_key)");
+        assert!(
+            shares.iter().any(|(id, _)| id == "usr-sent"),
+            "a 'sent' mode-B share must surface: {shares:?}"
+        );
+        assert!(
+            shares.iter().any(|(id, _)| id == "usr-pending"),
+            "an 'awaiting_key' mode-B share must surface: {shares:?}"
+        );
+        assert!(
+            shares.iter().all(|(id, _)| id != "old" && id != "f2lnk"),
+            "revoked + other-folder shares excluded"
+        );
+    }
+
+    // ── 2026-07-11 audit remediation: NOTES-1/2/3, SEAM-F1/F2, LOCK-SHARE-INGEST-1, gate ─────────────
+
+    /// NOTES-1 (CRITICAL data loss, RED-before-GREEN): deleting a note-folder must REPARENT its
+    /// authored notes (`documents(kind='note')`) to the default "Notes" folder — never DELETE them.
+    /// Pre-fix `delete_folder_inner` demoted only MEETING notes, then `Db::delete_folder`'s blanket
+    /// `DELETE FROM documents WHERE folder_id` permanently destroyed every authored note (the FE
+    /// promises they MOVE to the default folder). This asserts the row SURVIVES under the default
+    /// folder with its `.md` moved + `exported_path` re-pointed.
+    #[test]
+    fn delete_note_folder_reparents_authored_notes_never_deletes_them() {
+        let vault = tmp_vault("notes1-del");
+        let state = build_state_with_vault("notes1-del", &vault);
+        state.db.ensure_default_note_folder().unwrap();
+        let fid = create_note_folder_inner(&state, "Sprint", None).unwrap().id;
+        let id = create_note_inner(&state, Some(&fid), "Roadmap").unwrap();
+        // Give it a body so it exports a real `.md`.
+        update_note_doc_inner(&state, &id, "Roadmap", "the plan lives here").unwrap();
+        let old_path = state
+            .db
+            .get_note_row(&id)
+            .unwrap()
+            .unwrap()
+            .exported_path
+            .expect("note exported to the vault");
+        assert!(std::path::Path::new(&old_path).exists(), "old .md exists");
+
+        delete_folder_inner(&state, fid.clone()).unwrap();
+
+        // The folder row is gone…
+        assert!(
+            state.db.note_folder_by_id(&fid).unwrap().is_none(),
+            "folder row deleted"
+        );
+        // …but the AUTHORED NOTE ROW SURVIVES (the pre-fix bug DELETED it) under the default folder.
+        let row = state
+            .db
+            .get_note_row(&id)
+            .unwrap()
+            .expect("authored note row MUST still exist after folder delete (never destroyed)");
+        assert_eq!(row.text, "the plan lives here", "note content never lost");
+        let default_id = state.db.ensure_default_note_folder().unwrap();
+        assert_eq!(row.folder_id, default_id, "note reparented to the default folder");
+        // Its `.md` moved into the default folder's vault subdir and `exported_path` re-points to it.
+        let new_path = row.exported_path.expect("exported_path re-pointed to the moved .md");
+        assert!(std::path::Path::new(&new_path).exists(), "moved .md exists at the new path");
+        assert!(new_path.contains("Notes"), "moved under the default Notes subdir: {new_path}");
+        assert!(
+            new_path != old_path,
+            "exported_path was actually re-pointed (not left stale)"
+        );
+
+        let _ = std::fs::remove_dir_all(&vault);
+    }
+
+    /// NOTES-2 (CRITICAL sealed-content leak, RED-before-GREEN): moving a note-folder physically
+    /// `fs::rename`s its vault dir, so `documents.exported_path` MUST be rewritten to the new on-disk
+    /// path — otherwise a later `lock_folder` deletes NOTHING at the stale path and the real plaintext
+    /// `.md` survives on disk in a sealed folder. This asserts the path is rewritten to the moved file
+    /// AND that a subsequent lock leaves NO plaintext `.md` at either the old or new path.
+    #[test]
+    fn move_note_folder_rewrites_exported_path_so_lock_deletes_the_real_md() {
+        let vault = tmp_vault("notes2-move");
+        let state = build_state_with_vault("notes2-move", &vault);
+        state.db.ensure_default_note_folder().unwrap();
+        // Notes/Parent and Notes/Dest; the note lives in Parent, we move Parent under Dest.
+        let parent = create_note_folder_inner(&state, "Parent", None).unwrap().id;
+        let dest = create_note_folder_inner(&state, "Dest", None).unwrap().id;
+        let id = create_note_inner(&state, Some(&parent), "Secret plan").unwrap();
+        update_note_doc_inner(&state, &id, "Secret plan", "top secret body").unwrap();
+        let old_path = state
+            .db
+            .get_note_row(&id)
+            .unwrap()
+            .unwrap()
+            .exported_path
+            .expect("exported to the vault");
+        assert!(std::path::Path::new(&old_path).exists(), "old .md present pre-move");
+
+        // Move Parent under Dest → the on-disk dir moves; exported_path must follow.
+        move_note_folder_inner(&state, &parent, Some(&dest)).unwrap();
+
+        let new_path = state
+            .db
+            .get_note_row(&id)
+            .unwrap()
+            .unwrap()
+            .exported_path
+            .expect("exported_path present after move");
+        assert!(
+            new_path != old_path,
+            "exported_path REWRITTEN to the moved location (pre-fix it stayed stale)"
+        );
+        assert!(
+            new_path.contains("Dest"),
+            "exported_path reflects the new vault path under Dest: {new_path}"
+        );
+        assert!(
+            std::path::Path::new(&new_path).exists(),
+            "the real .md is at the rewritten path"
+        );
+
+        // Now LOCK the moved folder (Parent, now under Dest). It must delete the REAL `.md` — so no
+        // plaintext `.md` survives at EITHER path in the sealed folder.
+        lock_folder_inner(&state, parent.clone()).unwrap();
+        assert!(
+            !std::path::Path::new(&new_path).exists(),
+            "lock deleted the REAL plaintext .md (the leak the stale path caused)"
+        );
+        assert!(
+            !std::path::Path::new(&old_path).exists(),
+            "no plaintext .md left at the old path either"
+        );
+
+        let _ = std::fs::remove_dir_all(&vault);
+    }
+
+    /// NOTES-3 (MAJOR, RED-before-GREEN): the descendant-path rewrite in `Db::reparent_note_folder`
+    /// (triggered by MOVING a note-folder) fed the Rust BYTE length into SQLite `substr()` (which
+    /// counts CHARACTERS), corrupting descendant paths for a multi-byte (Polish) folder name. Move a
+    /// multi-byte parent under a new destination and assert the child path = `<new>/Sprzedaż/Q3` with
+    /// the leading slash intact (no mid-path slice / dropped separator).
+    #[test]
+    fn move_multibyte_note_folder_keeps_descendant_paths_intact() {
+        let state = build_state("notes3-multibyte");
+        state.db.ensure_default_note_folder().unwrap();
+        // "Sprzedaż" has a multi-byte 'ż' → BYTE length (15 for "Notes/Sprzedaż") != CHAR length (14),
+        // so a byte-length `substr()` offset drops the '/' after the prefix and corrupts descendants.
+        let parent = create_note_folder_inner(&state, "Sprzedaż", None).unwrap().id;
+        let child = create_note_folder_inner(&state, "Q3", Some(&parent))
+            .unwrap()
+            .id;
+        let dest = create_note_folder_inner(&state, "Klienci", None).unwrap().id;
+        assert_eq!(
+            state.db.note_folder_by_id(&child).unwrap().unwrap().path,
+            "Notes/Sprzedaż/Q3"
+        );
+
+        // MOVE the multi-byte parent under "Notes/Klienci" → parent becomes "Notes/Klienci/Sprzedaż";
+        // the child MUST follow to "Notes/Klienci/Sprzedaż/Q3" with the leading slash intact.
+        move_note_folder_inner(&state, &parent, Some(&dest)).unwrap();
+
+        let child_path = state.db.note_folder_by_id(&child).unwrap().unwrap().path;
+        assert_eq!(
+            child_path, "Notes/Klienci/Sprzedaż/Q3",
+            "multi-byte parent move must not corrupt the descendant path (byte vs char substr)"
+        );
+    }
+
+    /// SEAM-F1 (MAJOR plaintext-at-rest, RED-before-GREEN): a timeline persisted while a locked folder
+    /// is session-unlocked must be SEALED under the folder CK — the pre-fix bare `set_timeline_data`
+    /// left a plaintext timeline in the sealed row that survived relock at rest. This drives the
+    /// seal-on-write helper `generate_timeline` now uses and asserts the row has an encrypted
+    /// `data_blob` and NO plaintext `data` at rest after relock.
+    #[test]
+    fn timeline_written_while_unlocked_is_sealed_at_rest() {
+        let state = build_state("seam-f1-timeline");
+        make_open_folder(&state.db, "f", "Vault");
+        seed_meeting(&state.db, "m", "# note", Some("f"));
+        lock_folder_inner(&state, "f".to_string()).unwrap();
+        let ck = session_unlock(&state, "f");
+
+        // The write path `generate_timeline` uses after re-gating.
+        let json = "{\"topics\":[{\"title\":\"Budget\"}],\"speakers\":[]}";
+        set_timeline_data_reseal_if_locked(&state, "m", json).unwrap();
+
+        // At the session it is plaintext-visible AND carries a blob.
+        let raw = state.db.raw_timeline("m").unwrap().unwrap();
+        assert_eq!(raw.data, json, "plaintext visible in-session");
+        assert!(raw.data_blob.is_some(), "sealed blob written at write time");
+
+        // RELOCK: plaintext re-blanked, blob kept.
+        state.unlocked_folders.lock().unwrap().remove("f");
+        reblank_folder_extras(&state, "f").unwrap();
+        let at_rest = state.db.raw_timeline("m").unwrap().unwrap();
+        assert_eq!(at_rest.data, "", "NO plaintext timeline at rest after relock");
+        assert!(at_rest.data_blob.is_some(), "encrypted data_blob kept at rest");
+
+        // UNLOCK: byte-identical restore of the generated timeline.
+        unseal_folder_extras(&state, "f", &ck, None).unwrap();
+        assert_eq!(
+            state.db.raw_timeline("m").unwrap().unwrap().data,
+            json,
+            "the sealed timeline restores byte-identical"
+        );
+    }
+
+    /// SEAM-F2 (MAJOR edit lost, RED-before-GREEN): a speaker rename in a session-unlocked locked
+    /// folder plaintext-upserted the renamed timeline over the sealed blob, so relock destroyed the
+    /// rename (reblank restored the OLD sealed labels). This asserts the rename ROUND-TRIPS through
+    /// the sealed blob across a relock→unlock cycle.
+    #[test]
+    fn rename_speaker_in_unlocked_locked_folder_survives_relock() {
+        let state = build_state("seam-f2-rename");
+        make_open_folder(&state.db, "f", "Vault");
+        seed_meeting(&state.db, "m", "# note", Some("f"));
+        // Seed a timeline with a speaker turn we can rename.
+        let tl0 = "{\"topics\":[],\"speakers\":[{\"speaker\":\"others-0\",\"start_s\":0.0,\"end_s\":1.0}]}";
+        state.db.set_timeline_data("m", tl0).unwrap();
+        lock_folder_inner(&state, "f".to_string()).unwrap();
+        let ck = session_unlock(&state, "f");
+
+        rename_speaker_inner(&state, "m", "others-0", "Alice").unwrap();
+
+        // In-session the rename is visible AND sealed.
+        let raw = state.db.raw_timeline("m").unwrap().unwrap();
+        assert!(raw.data.contains("Alice"), "rename visible in-session");
+        assert!(raw.data_blob.is_some(), "renamed timeline sealed at write time");
+
+        // RELOCK then UNLOCK: the rename must persist through the sealed blob.
+        state.unlocked_folders.lock().unwrap().remove("f");
+        reblank_folder_extras(&state, "f").unwrap();
+        assert_eq!(
+            state.db.raw_timeline("m").unwrap().unwrap().data,
+            "",
+            "plaintext re-blanked at rest"
+        );
+        unseal_folder_extras(&state, "f", &ck, None).unwrap();
+        let restored = state.db.raw_timeline("m").unwrap().unwrap().data;
+        assert!(
+            restored.contains("Alice") && !restored.contains("others-0"),
+            "the speaker rename survives the relock round-trip (was destroyed pre-fix): {restored}"
+        );
+    }
+
+    /// LOCK-SHARE-INGEST-1 (MAJOR sealed-content leak, RED-before-GREEN): accepting a share into a
+    /// session-unlocked LOCKED folder wrote a RAW plaintext note row + a plaintext `.md`, both of
+    /// which survived the next relock at rest. This asserts the ingested note is SEALED from birth
+    /// (blob present, no plaintext row at rest after relock) and no plaintext `.md` is written.
+    #[test]
+    fn ingest_shared_note_into_unlocked_locked_folder_seals_at_rest() {
+        let vault = tmp_vault("share-ingest");
+        let state = build_state_with_vault("share-ingest", &vault);
+        make_open_folder(&state.db, "f", "Shared");
+        std::fs::create_dir_all(vault.join("Shared")).unwrap();
+        lock_folder_inner(&state, "f".to_string()).unwrap();
+        let ck = session_unlock(&state, "f");
+        let target = state.db.folder_by_id("f").unwrap().unwrap();
+
+        let env = murmur_protocol::envelope::ShareEnvelope::new(
+            "Confidential deal",
+            "the secret terms",
+            "2026-07-04T10:00:00Z",
+        );
+        let accepted =
+            ingest_shared_note(&state, &target, &env, "SENDERFP", "sender-uuid", "share-lk").unwrap();
+        let mid = accepted.meeting_id;
+
+        // The note row must be SEALED (blob present) — never a raw plaintext note behind the lock.
+        let sealed = &state.db.sealable_notes_for_meeting(&mid).unwrap()[0];
+        assert!(
+            sealed.content_blob.is_some(),
+            "shared note sealed from birth (blob present)"
+        );
+        // No plaintext `.md` was written into the locked folder.
+        let shared_dir = vault.join("Shared");
+        let md_files: Vec<_> = std::fs::read_dir(&shared_dir)
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("md"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            md_files.is_empty(),
+            "no plaintext .md written into the locked target: {md_files:?}"
+        );
+
+        // RELOCK (command-layer shape): blank the sealed meeting-note markdown + reblank the extras.
+        state.unlocked_folders.lock().unwrap().remove("f");
+        let mut one = std::collections::HashSet::new();
+        one.insert("f".to_string());
+        state.db.blank_sealed_notes_in_folders(&one).unwrap();
+        reblank_folder_extras(&state, "f").unwrap();
+        let n = &state.db.sealable_notes_for_meeting(&mid).unwrap()[0];
+        assert_eq!(n.markdown, "", "no plaintext note markdown at rest after relock");
+        assert!(n.content_blob.is_some(), "sealed blob kept at rest");
+
+        // UNLOCK: the shared note comes back with its provenance + body.
+        // (unlock restores note markdown via the folder unlock path; here we assert the blob decrypts.)
+        let aad = aad_content("f", &mid, "shared", "note");
+        let pt = crate::crypto::decrypt(&ck, n.content_blob.as_ref().unwrap(), &aad).unwrap();
+        let restored = String::from_utf8(pt).unwrap();
+        assert!(
+            restored.contains("the secret terms") && restored.contains("share-id: share-lk"),
+            "sealed shared note decrypts to the ingested content + provenance"
+        );
+
+        let _ = std::fs::remove_dir_all(&vault);
+    }
+
+    /// folder_active_shares gate (RED-before-GREEN): the report returned org-share TITLES (plaintext)
+    /// for ANY folder including a sealed-and-not-session-unlocked one. This asserts a locked-not-
+    /// unlocked folder returns an EMPTY report (no title leak).
+    #[test]
+    fn folder_active_shares_masks_a_sealed_not_unlocked_folder() {
+        let state = build_state("active-shares-gate");
+        make_open_folder(&state.db, "f", "Secret");
+        seed_meeting(&state.db, "m", "# note", Some("f"));
+        // Seed an org share carrying a plaintext title anchored to this folder's meeting.
+        state
+            .db
+            .insert_org_share(
+                "os-1",
+                "org-1",
+                Some("m"),
+                None,
+                "note",
+                Some("TOP SECRET acquisition"),
+                1,
+                1,
+                &[0u8; 32],
+                "2026-07-11T00:00:00Z",
+            )
+            .unwrap();
+        // Sanity: while OPEN, the title is surfaced.
+        let open = folder_active_shares_inner(&state, "f").unwrap();
+        assert_eq!(open.org.len(), 1, "open folder surfaces the org share");
+
+        // Lock (NOT session-unlocked) → the report MUST be empty (no title leak).
+        lock_folder_inner(&state, "f".to_string()).unwrap();
+        let masked = folder_active_shares_inner(&state, "f").unwrap();
+        assert_eq!(masked.links, 0);
+        assert_eq!(masked.users, 0);
+        assert!(
+            masked.org.is_empty(),
+            "a sealed-not-unlocked folder leaks NO org share titles: {:?}",
+            masked.org
+        );
+    }
