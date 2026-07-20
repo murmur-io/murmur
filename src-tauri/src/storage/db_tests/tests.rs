@@ -1904,6 +1904,31 @@
         assert!(db.resolve_wikilink("   ", &nothing).unwrap().is_none());
     }
 
+    /// The `+ Link` / `[[` picker must not offer never-named notes: a screen of identical "Untitled"
+    /// rows is useless and a pick can't be a meaningful link target (2026-07-20). RED before the
+    /// `list_link_candidates_visible` sentinel filter (which listed every untitled note). Complements
+    /// #417 (which fixed the backlink fan-out) by covering the candidate-picker surface.
+    #[test]
+    fn link_candidates_exclude_untitled_notes() {
+        let db = mem_db();
+        seed_folder(&db, "f-open", "Open");
+        db.insert_note("n-real", "f-open", "real", "Design Doc", "body", 2_000)
+            .unwrap();
+        db.insert_note("n-unnamed", "f-open", "Untitled", "Untitled", "", 3_000)
+            .unwrap();
+        let nothing = std::collections::HashSet::new();
+        let (rows, _total) = db.list_link_candidates_visible("", 40, 0, &nothing).unwrap();
+        let ids: Vec<&str> = rows.iter().map(|c| c.id.as_str()).collect();
+        assert!(
+            ids.contains(&"n-real"),
+            "a real-titled note is still a candidate; got {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"n-unnamed"),
+            "a never-named 'Untitled' note must NOT be offered as a link candidate; got {ids:?}"
+        );
+    }
+
     /// SELF-LINK AVOIDANCE (2026-07-16 companion note): a companion note (`documents` row with a
     /// non-null `meeting_id`) whose managed title EQUALS its meeting's title must be EXCLUDED from the
     /// note-leg, so `[[Meeting Title]]` resolves to the MEETING (kind='meeting'), never to its own
