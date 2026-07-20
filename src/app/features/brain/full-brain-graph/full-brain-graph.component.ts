@@ -111,6 +111,7 @@ export class FullBrainGraphComponent {
     mention: true,
     wikilink: true,
     companion: true,
+    manual: true,
     semantic: true,
   });
   readonly nodeLens = this._nodeLens.asReadonly();
@@ -135,6 +136,7 @@ export class FullBrainGraphComponent {
     { kind: "mention", label: "Mentions", token: "--text-secondary" },
     { kind: "wikilink", label: "Wikilinks", token: "--accent" },
     { kind: "companion", label: "Companion", token: "--graph-note" },
+    { kind: "manual", label: "Manual", token: "--accent-hover" },
     { kind: "semantic", label: "Semantic", token: "--graph-document" },
   ];
 

@@ -676,7 +676,7 @@ impl Db {
                 });
             }
         }
-        // links rows — wikilink/companion/semantic. active always; suggested semantic behind the flag.
+        // links rows — wikilink/companion/manual/semantic. active always; suggested semantic behind the flag.
         // BOTH endpoints re-checked against the visible-node set (the links kind strings map 1:1 onto
         // the node-kind strings: meeting|note|document), so a link to a sealed/absent node is dropped.
         for (src_kind, src_id, dst_kind, dst_id, edge_type, score, status) in link_rows {
@@ -1027,6 +1027,10 @@ fn full_graph_edge_kind_from_type(edge_type: &str) -> Option<FullGraphEdgeKind> 
         "wikilink" => Some(FullGraphEdgeKind::Wikilink),
         "companion" => Some(FullGraphEdgeKind::Companion),
         "semantic" => Some(FullGraphEdgeKind::Semantic),
+        // A USER-created "Related" link (`upsert_manual_link`). Deterministic + always active — WITHOUT
+        // this arm every manual edge fell to `None` and was dropped, so a manually-linked note/meeting/
+        // document showed "0 connections" in the full-brain graph (2026-07-20 regression).
+        "manual" => Some(FullGraphEdgeKind::Manual),
         _ => None,
     }
 }

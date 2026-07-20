@@ -128,6 +128,11 @@ pub enum FullGraphEdgeKind {
     Wikilink,
     Companion,
     Semantic,
+    /// A USER-created link (`links.edge_type = 'manual'`, written by `upsert_manual_link` for the
+    /// note↔meeting↔document "Related" chip). Deterministic + always `active` — the most intentional
+    /// link there is, so it MUST render in the full-brain graph like wikilink/companion. Omitting it
+    /// from the edge taxonomy is what made a manually-linked document show "0 connections" (2026-07-20).
+    Manual,
 }
 
 impl FullGraphEdgeKind {
@@ -138,6 +143,7 @@ impl FullGraphEdgeKind {
             FullGraphEdgeKind::Wikilink => "wikilink",
             FullGraphEdgeKind::Companion => "companion",
             FullGraphEdgeKind::Semantic => "semantic",
+            FullGraphEdgeKind::Manual => "manual",
         }
     }
 }
