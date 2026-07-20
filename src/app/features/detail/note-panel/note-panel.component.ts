@@ -18,7 +18,6 @@ import { ConnectionsComponent } from "../../../shared/connections/connections.co
 import { MoveToMenuComponent } from "../../folders/move-to-menu/move-to-menu.component";
 import { MeetingActionsComponent } from "../meeting-actions/meeting-actions.component";
 import { MeetingChatComponent } from "../meeting-chat/meeting-chat.component";
-import { MeetingRecipesComponent } from "../meeting-recipes/meeting-recipes.component";
 import { RelatedMeetingsComponent } from "../related-meetings/related-meetings.component";
 import { Stage2PanelComponent } from "../stage2-panel/stage2-panel.component";
 
@@ -107,10 +106,10 @@ export interface AssistantQa {
  * The NOTE tab (default): the note IS the product, so its body comes first —
  * primary Re-summarize verb + a `⋯ More` OPAQUE overflow menu (Manage / Export
  * & save / Hi-res masters / Graph, Delete isolated last), then the rendered
- * analysis, the persisted Q&A, action items, Recipes, Ask-this-meeting chat and
- * Related. Presentational: the shell owns the meeting + all IPC handlers; this
- * panel renders inputs and emits outputs. Hosts the reused sub-components
- * (`meeting-actions` / `-recipes` / `-chat` / `related-meetings`).
+ * analysis, the persisted Q&A, action items, Ask-this-meeting chat and Related.
+ * Presentational: the shell owns the meeting + all IPC handlers; this panel
+ * renders inputs and emits outputs. Hosts the reused sub-components
+ * (`meeting-actions` / `-chat` / `related-meetings`).
  *
  * Lives in its own file so its inline styles get their own per-component
  * `anyComponentStyle` budget — the reason the giant detail component is split.
@@ -125,7 +124,6 @@ export interface AssistantQa {
     MoveToMenuComponent,
     MeetingActionsComponent,
     MeetingChatComponent,
-    MeetingRecipesComponent,
     RelatedMeetingsComponent,
     Stage2PanelComponent,
   ],

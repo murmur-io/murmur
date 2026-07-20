@@ -1,4 +1,17 @@
 <div class="note-panel">
+  <!-- RELATED — the meeting's explicit context belongs at the top of the Note tab.
+       Keep it outside the analysis block so Re-summarize never disables linking.
+       Meeting detail starts expanded and uses the stronger hierarchy; standalone
+       notes keep the shared component's compact, collapsed default. -->
+  <section class="related-primary" aria-label="Related items">
+    <app-connections
+      kind="meeting"
+      [id]="meetingId()"
+      [expandedByDefault]="true"
+      [prominent]="true"
+    />
+  </section>
+
   <!-- ANALYSIS CARD: primary verb + ⋯ More menu, then the note body. -->
   <section class="block print-keep" [class.is-resummarizing]="busy()">
     <div class="block-head">
@@ -356,14 +369,6 @@
     }
   </section>
 
-  <!-- RELATED (IA consolidation, 2026-07-19) — ONE merged, deduped panel of every
-       relationship: inbound backlinks + incident link edges (deduped by neighbour) +
-       ambient semantic suggestions, collapsed behind an "N related" count and
-       auto-hidden when empty. Self-loaded & gated: note-panel only renders for an
-       unlocked meeting (detail's `@else (!locked())`), so `locked` stays the default
-       false; the panel owns its fetch and re-asks on a session lock-tree change. -->
-  <app-connections kind="meeting" [id]="meetingId()" />
-
   <!-- LIVE CONTEXT — enrich this note with fresh detail from connected tools (Jira / Slack / web).
        Sits right after the note summary; egress is on-demand + kept loud. Only rendered for an
        unlocked meeting (note-panel itself is under the detail view's `@else (!locked())`). Bubbles
@@ -407,14 +412,6 @@
 
   <!-- ACTION ITEMS (Reminders + Obsidian Tasks; hidden when none). -->
   <app-meeting-actions [meetingId]="meetingId()" />
-
-  <!-- RECIPES / GENERATE (grounded one-tap generations over text). -->
-  <section class="block">
-    <div class="block-head">
-      <h3 class="section-label">Recipes</h3>
-    </div>
-    <app-meeting-recipes [meetingId]="meetingId()" />
-  </section>
 
   <!-- CHAT WITH THIS MEETING (grounded Q&A over the transcript). -->
   <section class="block">
