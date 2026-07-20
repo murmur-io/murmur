@@ -7057,11 +7057,14 @@
         );
     }
 
-    /// Fix 4 (brain-v3 audit, INVERSE) — on unlock, the stripped marker is RE-MATERIALIZED from the
-    /// preserved accepted row into the source note's managed block. RED before the inverse: after
-    /// strip+unlock the accepted link had no rendered `[[Title]]` in the source body.
+    /// FIX 2 (block-drop) — the machine `> [!related]- Related notes` (`murmur:links`) block is
+    /// RETIRED, so on unlock the accepted marker is NO LONGER RE-MATERIALIZED into the source note's
+    /// body/vault `.md`: `rematerialize_accepted_markers_for_folder` is now a documented NO-OP. The
+    /// accepted link ROW is preserved (surfaces in the live Related panel); only the body-block echo
+    /// is gone. RED before FIX 2 (the OLD assertions, now inverted): the old code reported N changed
+    /// and rewrote `[[Neighbour M]]` into N's body — the exact behavior this change removes.
     #[test]
-    fn unlock_rematerializes_accepted_marker_into_source() {
+    fn unlock_does_not_rematerialize_links_block() {
         let db = mem_db();
         seed_folder(&db, "f-open", "Open");
         seed_folder(&db, "f-secret", "Secret");
@@ -7074,12 +7077,12 @@
             Db::upsert_link_tx(&tx, "note", "n", "note", "m", "semantic", 0.9, "accepted", "active", now).unwrap();
             tx.commit().unwrap();
         }
-        // Seal M + strip (N had no marker yet, so strip is a no-op here — the point is the INVERSE).
+        // Seal M, lock its folder, strip (N had no marker yet — the strip is a no-op).
         db.seal_document("m", b"ciphertext").unwrap();
         db.set_folder_locked("f-secret", true, None).unwrap();
         let _ = db.strip_sealed_neighbour_markers(&[], &["m".to_string()]).unwrap();
 
-        // UNLOCK M's folder: restore M's plaintext, then re-materialize accepted markers for the folder.
+        // UNLOCK M's folder: restore M's plaintext, then invoke the (now no-op) rematerialize leg.
         db.set_document_text("m", "the neighbour body").unwrap();
         let mut unlocked = HashSet::new();
         unlocked.insert("f-open".to_string());
@@ -7088,16 +7091,29 @@
             .rematerialize_accepted_markers_for_folder("f-secret", &[], &unlocked)
             .unwrap();
         assert!(
-            changed.iter().any(|(is_m, id)| !is_m && id == "n"),
-            "N's body was re-materialized"
+            changed.is_empty(),
+            "no source is reported changed — the block re-materialization is retired; got {changed:?}"
         );
         let n_text: String = db
             .lock()
             .query_row("SELECT text FROM documents WHERE id = 'n'", [], |r| r.get(0))
             .unwrap();
+        // The load-bearing FIX-2 guarantee: N's body has NO reborn machine links block afterward.
         assert!(
-            n_text.contains("[[Neighbour M]]"),
-            "the accepted neighbour's [[Title]] is re-materialized into N's managed block on unlock"
+            !n_text.contains("murmur:links")
+                && !n_text.contains("[!related]")
+                && !n_text.contains("[[Neighbour M]]"),
+            "unlock must NOT rematerialize a murmur:links block into the source body; got {n_text:?}"
+        );
+        assert_eq!(
+            n_text, "just the note body",
+            "the source body is byte-identical to before — the retired block is never reborn"
+        );
+        // The accepted link ROW is untouched (still surfaces in the Related panel).
+        let edges = db.links_for_visible(crate::links::LinkKind::Note, "n", &unlocked).unwrap();
+        assert!(
+            edges.iter().any(|e| e.other_id == "m"),
+            "the accepted N↔M edge is preserved — only the body-block echo is retired"
         );
     }
 

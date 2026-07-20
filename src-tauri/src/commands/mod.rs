@@ -1533,114 +1533,23 @@ pub(crate) fn update_note_inner_with(
     })
 }
 
-/// Max cross-meeting links Lane A appends to a note (small + high-precision — a note gains a handful
-/// of related links, not a research dump).
-const MAX_RELATED_LINKS: usize = 4;
-
-/// Stage 2 / Lane A — the DETERMINISTIC, ZERO-EGRESS cross-meeting LINKING pass over a FINISHED note.
+/// Stage 2 / Lane A — the cross-meeting LINKING pass over a FINISHED note. NOW A NO-OP.
 ///
-/// Mirrors [`apply_note_enrichment_inner`] (the shipped Lane B persist seam): gate → retrieve →
-/// render → `upsert_note` (DB-canonical, so the links SEAL with the note) → re-export the vault
-/// `.md`. Retrieval is [`related_context::related_note_links`], which is DOUBLE visibility-gated
-/// (`search_visible` + `get_note_if_visible` on the live unlock set) and self-excluding — a
-/// sealed-not-unlocked related note contributes NO link. Empty hits STRIP any stale links block
-/// (byte-exact undo), so re-running self-heals the link graph. Idempotent + reversible via
-/// `apply_link_markers`.
+/// This pass used to APPEND a machine-managed `> [!related]- Related notes` (`murmur:links`) block
+/// into the note body, mirroring cross-meeting `[[Title]]` links so they surfaced inside Obsidian.
+/// That block was RETIRED: it went stale (its wikilinks are excluded from edge-indexing, so it
+/// diverged from the live RELATED panel), rendered as raw junk in the plain-text editor, and created
+/// a latent clobber risk (an open editor holding a stale body could overwrite it). The RELATED panel
+/// reads the live `links` table (driven by the deterministic `index_wikilinks_best_effort` +
+/// `auto_link_semantic_best_effort` hooks on every note save) and is unaffected — it is the real,
+/// always-fresh surface. So this pass writes NOTHING now.
 ///
-/// EGRESS: NONE. Lane A is fully local — a search over OWNED notes plus a local task-free gist. No
-/// provider, no connector, no consent gate needed (nothing leaves the device).
-///
-/// SEAL-SAFETY (stronger than the read gate, load-bearing): after the `meeting_is_unlocked` read
-/// gate, we ALSO require the note to be genuinely UNSEALED (`content_blob IS NULL` on every provider
-/// row). A note in a locked folder is SEALED: its `markdown` column is transient (blanked on relock,
-/// restored from `content_blob` on unlock) and its durable source of truth is `content_blob`.
-/// Writing links into a sealed note's `markdown` column would either corrupt a just-sealed (blanked)
-/// column (the auto-file-into-locked case, where the column is empty but the folder is session-
-/// unlocked) or be silently dropped on the next relock (the column is discarded, `content_blob` is
-/// canonical). So a sealed meeting is skipped even when the session happens to have it unlocked —
-/// which is exactly what makes "persist DB-canonical so it SEALS with the note" true here.
-pub(crate) fn link_related_notes_inner(state: &AppState, meeting_id: &str) -> Result<(), AppError> {
-    // BLK-1 / TOCTOU: hold the lifecycle guard for the WHOLE check-then-write so a concurrent
-    // `lock_folder`/`move_into_locked_folder`/`relock` cannot seal this meeting BETWEEN the seal-safety
-    // gate below and the `upsert_note`+`overwrite_note` — which would re-materialize a plaintext `.md`
-    // into a now-locked folder's vault dir (the Phase-2 lock-security TOCTOU leak). Every seal path
-    // holds this same guard (`lock_folder_inner`/`move_into_locked_folder`/`relock_all_inner`/
-    // `remove_lock_inner`), and the storage-prune was forced to take it by a prior TOCTOU finding.
-    // Lock order is `lifecycle ⊃ db` (matching `lock_folder_inner`).
-    let _lifecycle = lifecycle_guard(state);
-    // READ GATE: a sealed-not-session-unlocked meeting is silently skipped — never link a locked note.
-    if !meeting_is_unlocked(state, meeting_id)? {
-        return Ok(());
-    }
-    // SEAL-SAFETY GATE: only write the markdown COLUMN of an UNSEALED note (durable canonical). A
-    // sealed note (any provider row has a content_blob) is skipped even if session-unlocked. Read
-    // UNDER the lifecycle guard, so a seal cannot slip in after this check and before the write.
-    let sealed = state
-        .db
-        .sealable_notes_for_meeting(meeting_id)?
-        .iter()
-        .any(|n| n.content_blob.is_some());
-    if sealed {
-        return Ok(());
-    }
-    let Some(existing) = state.db.get_latest_note_for_meeting(meeting_id)? else {
-        return Ok(()); // no note yet → nothing to link.
-    };
-    let title = state
-        .db
-        .get_meeting(meeting_id)?
-        .and_then(|m| m.title)
-        .unwrap_or_default();
-    // Derive the salient query from the CANONICAL prose — strip our OWN links block first so a
-    // re-link never keys the query off a previous run's `[[Title]]` links (stable / self-healing).
-    let base = crate::enrich::apply_link_markers(&existing.markdown, &[]);
-    let query = crate::summarize::related_context::salient_query(
-        (!title.trim().is_empty()).then_some(title.as_str()),
-        &base,
-    );
-    // Snapshot the live unlocked set (the SAME gate the retrieval keys on).
-    let unlocked = {
-        state
-            .unlocked_folders
-            .lock()
-            .map_err(|_| AppError::Storage("unlocked-folders mutex poisoned".into()))?
-            .clone()
-    };
-    let hits = crate::summarize::related_context::related_note_links(
-        &state.db,
-        meeting_id,
-        &query,
-        &unlocked,
-        MAX_RELATED_LINKS,
-    )?;
-    // Empty hits ⇒ `apply_link_markers` strips any stale links block (byte-exact). Non-empty ⇒ replace.
-    // No `as_of`: cross-meeting links are timeless (owned notes), so the block is a pure function of
-    // (note, hits) → the `linked == existing.markdown` short-circuit below skips a rewrite when the
-    // link set is unchanged, so the deferred auto-pass never churns the note / vault `.md`.
-    let linked = crate::enrich::apply_link_markers(&existing.markdown, &hits);
-    // No change (no hits AND no stale block) ⇒ nothing to persist; avoid a needless write + re-export.
-    if linked == existing.markdown {
-        return Ok(());
-    }
-    let created_at = chrono::Utc::now().to_rfc3339();
-    // Seal-on-write seam (audit F1): the sealed case was refused above, but a LOCKED folder whose
-    // note was never sealed (auto-filed while session-unlocked) still re-seals the fresh markdown.
-    upsert_note_reseal_if_locked(
-        state,
-        &NoteRecord {
-            meeting_id: meeting_id.to_string(),
-            provider_id: existing.provider_id.clone(),
-            markdown: linked.clone(),
-            created_at,
-            exported_path: existing.exported_path.clone(),
-            model_requested: existing.model_requested.clone(),
-            model_served: existing.model_served.clone(),
-            gateway_host: existing.gateway_host.clone(),
-        },
-    )?;
-    if let Some(path) = existing.exported_path.as_deref() {
-        overwrite_exported_note_guarded(state, meeting_id, &existing.provider_id, path, &linked)?;
-    }
+/// The command (`link_related_notes`) + the deferred pipeline call site are kept (a stable no-op) so
+/// no caller/registration churns; any pre-existing `murmur:links` block in an existing note is
+/// stripped on the next `get_note` read (natural save-time cleanup — see
+/// `commands/notes.rs::get_note_inner`). NO note body is read or written here, so there is no seal /
+/// TOCTOU / lifecycle-guard surface left to reason about.
+pub(crate) fn link_related_notes_inner(_state: &AppState, _meeting_id: &str) -> Result<(), AppError> {
     Ok(())
 }
 

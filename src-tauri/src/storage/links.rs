@@ -1432,188 +1432,42 @@ impl Db {
     pub fn rematerialize_accepted_markers_for_folder(
         &self,
         folder_id: &str,
-        meeting_ids: &[String],
-        unlocked: &HashSet<String>,
+        _meeting_ids: &[String],
+        _unlocked: &HashSet<String>,
     ) -> Result<Vec<(bool, String)>> {
-        // The just-unlocked folder's items, as (is_meeting, id): its meetings + its note-docs.
-        let mut items: Vec<(bool, String)> = meeting_ids.iter().map(|m| (true, m.clone())).collect();
-        for did in self.document_ids_in_folder(folder_id)? {
-            items.push((false, did));
-        }
-        // Collect (owner_kind, owner_id, title_to_readd) work: for each accepted edge incident on an
-        // item, the OWNER is the OTHER endpoint (the source note whose block was stripped), and the
-        // title to re-add is THIS item's current visible title.
-        let mut work: Vec<(crate::links::LinkKind, String, String)> = Vec::new();
-        for (is_meeting, item_id) in &items {
-            let item_kind = if *is_meeting {
-                crate::links::LinkKind::Meeting
-            } else {
-                crate::links::LinkKind::Note
-            };
-            // This item's current gated title (skip if not visible — nothing to re-add).
-            let Some(item_title) =
-                self.link_endpoint_title_visible(item_kind, item_id, unlocked)?
-            else {
-                continue;
-            };
-            // The accepted edges incident on this item (either endpoint), ids/kinds only.
-            let rows: Vec<(String, String, String, String)> = {
-                let conn = self.lock();
-                let mut stmt = conn
-                    .prepare(
-                        "SELECT src_kind, src_id, dst_kind, dst_id FROM links
-                           WHERE edge_type = 'semantic' AND status = 'active' AND created_by = 'accepted'
-                             AND ((src_kind = ?1 AND src_id = ?2) OR (dst_kind = ?1 AND dst_id = ?2))",
-                    )
-                    .map_err(map_err)?;
-                let mapped = stmt
-                    .query_map(rusqlite::params![item_kind.as_str(), item_id], |r| {
-                        Ok((
-                            r.get::<_, String>(0)?,
-                            r.get::<_, String>(1)?,
-                            r.get::<_, String>(2)?,
-                            r.get::<_, String>(3)?,
-                        ))
-                    })
-                    .map_err(map_err)?;
-                let mut out = Vec::new();
-                for r in mapped {
-                    out.push(r.map_err(map_err)?);
-                }
-                out
-            };
-            for (sk, si, dk, di) in rows {
-                // The OWNER is whichever endpoint is NOT this item.
-                let (owner_k, owner_id) = if sk == item_kind.as_str() && si == *item_id {
-                    (dk, di)
-                } else {
-                    (sk, si)
-                };
-                if let Some(owner_kind) = crate::links::LinkKind::parse(&owner_k) {
-                    work.push((owner_kind, owner_id, item_title.clone()));
-                }
-            }
-        }
-        // Apply: re-add each item title into its owner's managed block (visible, owned notes only).
-        let mut changed: Vec<(bool, String)> = Vec::new();
-        for (owner_kind, owner_id, title) in &work {
-            // Skip an owner endpoint still sealed-at-rest (its block is blank — nothing to re-add to).
-            let sealed = match owner_kind {
-                crate::links::LinkKind::Meeting => {
-                    let mut conn = self.lock();
-                    let tx = conn.transaction().map_err(map_err)?;
-                    let s = meeting_sealed_at_rest_tx(&tx, owner_id)?;
-                    tx.commit().map_err(map_err)?;
-                    s
-                }
-                _ => {
-                    let mut conn = self.lock();
-                    let tx = conn.transaction().map_err(map_err)?;
-                    let s = doc_sealed_at_rest_tx(&tx, owner_id)?;
-                    tx.commit().map_err(map_err)?;
-                    s
-                }
-            };
-            if sealed {
-                continue;
-            }
-            let did = self.readd_marker_to_owner(*owner_kind, owner_id, title)?;
-            if let Some(is_meeting) = did {
-                changed.push((is_meeting, owner_id.clone()));
-            }
-        }
-        // Dedupe (a source may own several re-added markers).
-        changed.sort();
-        changed.dedup();
-        tracing::debug!(target: "links", folder = %folder_id, rematerialized = changed.len(), "rematerialize_accepted_markers_for_folder");
-        Ok(changed)
+        // NO-OP (block-drop, fix/drop-links-block): the machine `> [!related]- Related notes`
+        // (`murmur:links`) block that this used to RE-ADD into a source note's body on unlock was
+        // RETIRED (it went stale + rendered as raw junk in the plain-text editor; the RELATED panel
+        // reads the live `links` table instead). Re-materializing it here reborn the retired block in
+        // BOTH the stored `notes.markdown`/`documents.text` AND the re-exported vault `.md` on every
+        // sealed→unlock of a folder holding an accepted-semantic note — so this rematerialization must
+        // stop with the block itself.
+        //
+        // This ONLY dropped the machine MARKER re-add; it is DISTINCT from — and never on the path of
+        // — the actual content-unseal (note text / transcript / audio decrypt happens in the
+        // `unlock_folder` command BEFORE this best-effort post-unlock link leg runs). The accepted
+        // `semantic` link ROWS are preserved untouched (Brain-v3 Fix 1) and still surface in the
+        // Related panel; only the body-block echo is gone. Returning an empty change set means the
+        // command layer re-exports nothing for markers — correct, since no body changed.
+        let _ = folder_id;
+        Ok(Vec::new())
     }
 
-    /// Re-add ONE `[[title]]` marker into an OWNER note's managed block, in-tx. Returns `Some(is_meeting)`
-    /// iff the body changed (so the caller re-exports), `None` when the owner has no editable body or
-    /// the marker was already present. Merges (never clobbers other hits). The INVERSE of
-    /// [`Self::strip_titles_from_managed_block`].
+    /// NO-OP (block-drop, fix/drop-links-block): this used to RE-ADD one `[[title]]` marker into an
+    /// OWNER note's managed `> [!related]- Related notes` (`murmur:links`) block. That block is
+    /// RETIRED (see [`Self::rematerialize_accepted_markers_for_folder`]), so re-adding a marker would
+    /// resurrect it in the stored body + vault `.md`. Now a no-op returning `None` (no body change →
+    /// caller re-exports nothing). Kept as a guarded stub so no future caller can re-introduce the
+    /// block through this seam; the accepted link ROWS are untouched and still surface in the Related
+    /// panel. Does NOT touch content seal/unseal.
+    #[allow(dead_code)]
     fn readd_marker_to_owner(
         &self,
-        owner_kind: crate::links::LinkKind,
-        owner_id: &str,
-        title: &str,
+        _owner_kind: crate::links::LinkKind,
+        _owner_id: &str,
+        _title: &str,
     ) -> Result<Option<bool>> {
-        let new_hit = crate::enrich::ContextHit {
-            source: match owner_kind {
-                crate::links::LinkKind::Meeting => "meeting",
-                _ => "note",
-            }
-            .to_string(),
-            detail: format!("[[{title}]]"),
-            url: None,
-        };
-        match owner_kind {
-            crate::links::LinkKind::Meeting => {
-                let md: Option<String> = {
-                    let conn = self.lock();
-                    conn.query_row(
-                        "SELECT markdown FROM notes WHERE meeting_id = ?1 ORDER BY created_at DESC LIMIT 1",
-                        rusqlite::params![owner_id],
-                        |r| r.get::<_, String>(0),
-                    )
-                    .optional()
-                    .map_err(map_err)?
-                };
-                let Some(md) = md.filter(|m| !m.is_empty()) else {
-                    return Ok(None);
-                };
-                let mut hits = crate::enrich::extract_link_hits(&md);
-                if hits.iter().any(|h| h.detail == new_hit.detail) {
-                    return Ok(None); // already present.
-                }
-                hits.push(new_hit);
-                let merged = crate::enrich::apply_link_markers(&md, &hits);
-                if merged == md {
-                    return Ok(None);
-                }
-                let conn = self.lock();
-                conn.execute(
-                    "UPDATE notes SET markdown = ?2
-                       WHERE meeting_id = ?1
-                         AND created_at = (SELECT MAX(created_at) FROM notes WHERE meeting_id = ?1)",
-                    rusqlite::params![owner_id, merged],
-                )
-                .map_err(map_err)?;
-                Ok(Some(true))
-            }
-            crate::links::LinkKind::Note | crate::links::LinkKind::Document => {
-                let text: Option<String> = {
-                    let conn = self.lock();
-                    conn.query_row(
-                        "SELECT COALESCE(text, '') FROM documents WHERE id = ?1 AND kind = 'note'",
-                        rusqlite::params![owner_id],
-                        |r| r.get::<_, String>(0),
-                    )
-                    .optional()
-                    .map_err(map_err)?
-                };
-                let Some(text) = text.filter(|t| !t.is_empty()) else {
-                    return Ok(None);
-                };
-                let mut hits = crate::enrich::extract_link_hits(&text);
-                if hits.iter().any(|h| h.detail == new_hit.detail) {
-                    return Ok(None);
-                }
-                hits.push(new_hit);
-                let merged = crate::enrich::apply_link_markers(&text, &hits);
-                if merged == text {
-                    return Ok(None);
-                }
-                let conn = self.lock();
-                conn.execute(
-                    "UPDATE documents SET text = ?2 WHERE id = ?1 AND kind = 'note'",
-                    rusqlite::params![owner_id, merged],
-                )
-                .map_err(map_err)?;
-                Ok(Some(false))
-            }
-        }
+        Ok(None)
     }
 
     /// PURGE every DERIVED link row whose SRC OR DST is a sealed/deleted meeting or document (a note id
