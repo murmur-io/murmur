@@ -29,10 +29,12 @@ import { MurQuickSearchComponent } from "../design-system/quick-search/quick-sea
 import { MurSidebarComponent } from "../design-system/sidebar/sidebar.component";
 import { MurSidebarSectionComponent } from "../design-system/sidebar-section/sidebar-section.component";
 import { MurTabStripComponent } from "../design-system/tab-strip/tab-strip.component";
+import { DocumentPreviewComponent } from "../features/brain/document-preview/document-preview.component";
 import { LockSharesDialogComponent } from "../features/folders/lock-shares-dialog/lock-shares-dialog.component";
 import { MeetingsSidebarTreeComponent } from "../features/folders/meetings-sidebar-tree/meetings-sidebar-tree.component";
 import { NotesSidebarTreeComponent } from "../features/notes/notes-sidebar-tree/notes-sidebar-tree.component";
 import { ChromeService } from "../services/chrome.service";
+import { DocumentPreviewService } from "../services/document-preview.service";
 import { FolderLockFlowService } from "../services/folder-lock-flow.service";
 import { FoldersService } from "../services/folders.service";
 import { NotesService } from "../services/notes.service";
@@ -162,6 +164,7 @@ const INSIGHT_PATHS = NAV_GROUPS.filter((g) => g.collapsible).flatMap((g) =>
     NotesSidebarTreeComponent,
     MurSidebarSectionComponent,
     LockSharesDialogComponent,
+    DocumentPreviewComponent,
   ],
   host: {
     // Scoped to !inDrilldown so the pill-clearance padding never leaks onto
@@ -213,6 +216,15 @@ export class AppShellComponent {
    * `e2e/org/org-surfaces.spec.ts`'s strict-mode-violation failure).
    */
   readonly lockFlow = inject(FolderLockFlowService);
+
+  /**
+   * The app-wide read-only document/note preview modal, hosted ONCE here so it's
+   * reachable from every route (a Related/Suggested chip, a `[[wikilink]]`, a
+   * full-brain-graph node — none of which have a document route). The template
+   * binds its `target` into the SINGLE `<app-document-preview>` host below; every
+   * "open a document" surface calls {@link DocumentPreviewService.open}.
+   */
+  readonly docPreview = inject(DocumentPreviewService);
 
   /**
    * The current URL, updated on every completed navigation. Seeded from

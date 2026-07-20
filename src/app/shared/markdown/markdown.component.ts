@@ -11,6 +11,7 @@ import { marked } from "marked";
 import DOMPurify from "dompurify";
 import { IpcService } from "../../core/ipc.service";
 import { TabsService } from "../../core/tabs.service";
+import { DocumentPreviewService } from "../../services/document-preview.service";
 import { ToastService } from "../../services/toast.service";
 
 /**
@@ -61,6 +62,7 @@ import { ToastService } from "../../services/toast.service";
 export class MarkdownComponent {
   private readonly ipc = inject(IpcService);
   private readonly tabsService = inject(TabsService);
+  private readonly docPreview = inject(DocumentPreviewService);
   private readonly toast = inject(ToastService);
 
   readonly markdown = input<string>("");
@@ -116,10 +118,14 @@ export class MarkdownComponent {
         // note/meeting/org-item is a TRACKED TAB, matching every other open path in
         // the app. "org" (2026-07-15) opens the read-only Shared Brain viewer — never
         // offer to CREATE a note when an org item already matched the title.
+        // "document" (a brain-ingested `documents` row, e.g. a PDF) has NO route —
+        // open the app-wide read-only preview modal (gated `getDocument`), never a tab.
         if (target.kind === "meeting") {
           await this.tabsService.openMeeting(target.id, title);
         } else if (target.kind === "org") {
           await this.tabsService.openOrgItem(target.id, title);
+        } else if (target.kind === "document") {
+          this.docPreview.open({ id: target.id, name: title, kind: "document" });
         } else {
           await this.tabsService.openNote(target.id, title);
         }

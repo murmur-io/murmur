@@ -20,6 +20,7 @@ import type {
   LinkKind,
   NoteCitation,
 } from "../../core/models";
+import { DocumentPreviewService } from "../../services/document-preview.service";
 import { FoldersService } from "../../services/folders.service";
 import { ToastService } from "../../services/toast.service";
 import { LinkPickerComponent } from "../../features/notes/link-picker/link-picker.component";
@@ -40,6 +41,13 @@ interface RelatedRow {
   /** Dedup identity — `${otherKind}:${otherId}`. Also the `@for` track key. */
   readonly key: string;
   readonly kind: "meeting" | "note" | "document";
+  /**
+   * The neighbour's raw id (the edge's `otherId` / the backlink's `id`) — the
+   * key `route` is built from, AND what a `document` chip passes to
+   * {@link DocumentPreviewService.open} (a document has no route, so its chip
+   * opens the read-only preview modal instead of navigating).
+   */
+  readonly id: string;
   readonly title: string;
   readonly route: unknown[];
   /** The small direction/type tag ("linked" / "mentions" / "companion" / "related"). */
@@ -61,6 +69,8 @@ interface RelatedRow {
 interface SuggestionRow {
   readonly edge: LinkEdge;
   readonly kind: "meeting" | "note" | "document";
+  /** The neighbour's raw id (`edge.otherId`) — the key `route` is built from. */
+  readonly id: string;
   readonly title: string;
   readonly route: unknown[];
   readonly pending: boolean;
@@ -109,6 +119,7 @@ export class ConnectionsComponent {
   private readonly ipc = inject(IpcService);
   private readonly folders = inject(FoldersService);
   private readonly toast = inject(ToastService);
+  private readonly docPreview = inject(DocumentPreviewService);
   private readonly injector = inject(Injector);
 
   /** The link-endpoint kind this panel is anchored to. */
@@ -256,6 +267,7 @@ export class ConnectionsComponent {
       rows.push({
         key,
         kind: edge.otherKind,
+        id: edge.otherId,
         title: edge.otherTitle,
         route: this.routeForKind(edge.otherKind, edge.otherId),
         tag: this.tagForEdge(edge),
@@ -275,6 +287,7 @@ export class ConnectionsComponent {
       rows.push({
         key,
         kind: bl.kind,
+        id: bl.id,
         title: bl.title,
         route: this.routeForKind(bl.kind, bl.id),
         tag: "mentions",
@@ -330,6 +343,7 @@ export class ConnectionsComponent {
       .map((edge) => ({
         edge,
         kind: edge.otherKind,
+        id: edge.otherId,
         title: edge.otherTitle,
         route: this.routeForKind(edge.otherKind, edge.otherId),
         pending: pending.has(edge.id),
@@ -431,12 +445,29 @@ export class ConnectionsComponent {
     return this.pending().has(id);
   }
 
-  /** The click-through route array for a neighbour, split by kind. */
+  /**
+   * The click-through route array for a neighbour, split by kind. A `document`
+   * neighbour has NO valid route (`get_note` rejects a document id, so
+   * `["/notes", id]` is a dead end) — its chip opens the read-only preview via
+   * {@link openDocument} instead of a `[routerLink]`, so this route is only ever
+   * consumed for `meeting`/`note` chips. It still returns a value for a document
+   * (kept as the identity for the row) but the template never binds it there.
+   */
   private routeForKind(
     kind: "meeting" | "note" | "document",
     id: string,
   ): unknown[] {
     return kind === "meeting" ? ["/meeting", id] : ["/notes", id];
+  }
+
+  /**
+   * Open a `document` neighbour in the app-wide read-only preview modal (a
+   * document has no route). The gated `getDocument(id)` read is done by the
+   * modal; a sealed folder masks it to "🔒 Locked", so this can't reveal
+   * locked content.
+   */
+  openDocument(id: string, title: string): void {
+    this.docPreview.open({ id, name: title, kind: "document" });
   }
 
   /** Toggle the whole Related section collapsed ↔ expanded. */

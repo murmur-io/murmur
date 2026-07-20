@@ -362,4 +362,14 @@
     (cancelled)="lockFlow.cancel()"
   />
 }
-  
+
+<!-- Read-only document/note content-preview modal — the SINGLE app-wide host
+     (see the `docPreview` field doc). Reachable from every route: a Related /
+     Suggested chip, a `[[wikilink]]`, or a full-brain-graph node opens it via
+     `DocumentPreviewService.open`; the component renders nothing while its
+     `target` is null. Opaque overlay (T3), owned by the component. -->
+<app-document-preview
+  [doc]="docPreview.target()"
+  (dismiss)="docPreview.close()"
+/>
+
