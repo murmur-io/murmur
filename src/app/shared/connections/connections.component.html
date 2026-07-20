@@ -1,12 +1,45 @@
-<!-- Never surface (or offer to add) relationships behind a lock: the whole panel —
-     collapsed header + `+ Link` chooser included — is suppressed while `locked`. It is
-     also auto-hidden when there is NOTHING to show (no related rows AND no suggestions)
-     so a fresh note carries zero footprint. COLLAPSED BY DEFAULT (Notion-style): a
-     single "Related · N" affordance under Properties; clicking it reveals the merged
-     Related chips + the ambient Suggested chips. -->
-@if (!locked() && hasAnything()) {
-<div class="cx">
-  @if (!expanded()) {
+<!-- Never surface (or offer to add) relationships behind a lock: the whole panel is
+     suppressed while `locked`. When UNLOCKED, linking is ALWAYS reachable: with relations
+     the panel is COLLAPSED BY DEFAULT (Notion-style) to a single "Related · N" line under
+     Properties (click reveals the merged Related chips + ambient Suggested chips + `+ Link`);
+     with NONE it degrades to a lone quiet `+ Link` affordance so a fresh note can still get
+     its FIRST connection (the `+ Link` entry must never hide, or you can't add the first). -->
+@if (!locked()) {
+<div class="cx" [class.cx--empty]="!hasAnything()">
+  @if (!hasAnything()) {
+    <!-- EMPTY STATE — no relations yet, but linking is ALWAYS available: a single quiet
+         "+ Link" affordance so a note with no connections can still get its FIRST one.
+         (The whole panel used to auto-hide here, which stranded the only in-panel way to
+         add a link — you most need it when there's nothing yet.) -->
+    @if (pickerOpen()) {
+      <input
+        #pickerAnchor
+        type="text"
+        class="cx-link-input"
+        placeholder="Link a meeting, note, or document…"
+        [value]="pickerQuery()"
+        (input)="onQueryInput($event)"
+        (keydown)="onQueryKey($event)"
+        (blur)="closePicker()"
+        aria-label="Search items to link"
+      />
+    } @else {
+      <button
+        #pickerAnchor
+        type="button"
+        class="cx-add cx-add--empty"
+        [disabled]="linking()"
+        (click)="openPicker()"
+      >
+        @if (linking()) {
+          <span class="cx-add-label">Linking…</span>
+        } @else {
+          <span class="cx-add-plus" aria-hidden="true">+</span>
+          <span class="cx-add-label">Link</span>
+        }
+      </button>
+    }
+  } @else if (!expanded()) {
     <!-- COLLAPSED (default) — one quiet "Related · N" line; near-zero footprint. -->
     <button
       type="button"

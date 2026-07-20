@@ -538,7 +538,7 @@
           <!-- RELATED (IA consolidation, 2026-07-19) — ONE merged, deduped panel of
                every relationship: inbound backlinks + incident link edges (deduped by
                neighbour) + ambient semantic suggestions, collapsed behind an "N related"
-               count and auto-hidden when empty. Self-loaded & gated: the panel owns its
+               count; with no relations it degrades to a lone `+ Link`. Self-loaded & gated: the panel owns its
                fetch, skips it while `locked`, and re-asks on a session lock-tree change.
                `inlineWikilinkTitles` suppresses a Related chip for a neighbour the body
                already links inline via `[[Title]]` (no triplication). Hidden when embedded
