@@ -740,8 +740,11 @@ fn orphan_pass(
                 if j == i || suggestions.len() >= MAX_ORPHAN_SUGGESTIONS {
                     continue;
                 }
-                if other.title.is_empty() || suggestions.contains(&other.title) {
-                    continue;
+                if other.title.is_empty()
+                    || crate::storage::db::is_untitled_title(&other.title)
+                    || suggestions.contains(&other.title)
+                {
+                    continue; // never suggest the shared "Untitled" sentinel as a reconnection.
                 }
                 if find_unlinked_mention_line(&other.body, &doc.title).is_some() {
                     suggestions.push(other.title.clone());
@@ -875,6 +878,13 @@ fn dedupe_disc(text: &str) -> String {
 /// word-bounded, un-linked occurrence outside any ``` code fence. PURE.
 pub(crate) fn find_unlinked_mention_line<'a>(body: &'a str, title: &str) -> Option<&'a str> {
     if title.chars().count() < MIN_MENTION_TITLE_CHARS {
+        return None;
+    }
+    // The never-named "Untitled" sentinel is not a unique title (a vault has many), so it must never
+    // be suggested as a mention/link target. Both the `unlinked_mention_pass` target scan and the
+    // `orphan_pass` reconnection scan route through here, so one guard covers both.
+    // See `crate::storage::db::UNTITLED_TITLE`.
+    if crate::storage::db::is_untitled_title(title) {
         return None;
     }
     let mut in_fence = false;
@@ -1407,6 +1417,33 @@ mod tests {
             .collect();
         assert!(!targets.contains(&"Target Five"), "already-linked title skipped");
         assert!(!targets.contains(&"Target Sixxx"), "code-fenced mention skipped");
+    }
+
+    /// 2026-07-20 — the "Untitled" sentinel must not be a mention TARGET (same title-collision class
+    /// as the phantom-mentions panel that #417 fixed for backlinks): a body naming the bare word
+    /// "Untitled" must NOT suggest a `[[Untitled]]` link to every never-named note. RED before the
+    /// `is_untitled_title` skip in the shared `find_unlinked_mention_line`.
+    #[test]
+    fn unlinked_mention_pass_ignores_untitled_sentinel_target() {
+        let corpus = vec![
+            // A real note whose body names the bare word "Untitled" (word-bounded).
+            doc("note", "src", "Notes Hub", "I saved it into my Untitled draft earlier.\n"),
+            // Two never-named notes sharing the sentinel (empty-body notes are dropped from the
+            // corpus, so give them content).
+            doc("note", "u1", "Untitled", "scratch one\n"),
+            doc("note", "u2", "Untitled", "scratch two\n"),
+        ];
+        let found = unlinked_mention_pass(&corpus);
+        assert!(
+            !found
+                .iter()
+                .any(|f| f.target_title.as_deref() == Some("Untitled")),
+            "must not suggest linking to the shared 'Untitled' sentinel; got {:?}",
+            found
+                .iter()
+                .map(|f| f.target_title.clone())
+                .collect::<Vec<_>>()
+        );
     }
 
     // ── stale (file DB) ──
