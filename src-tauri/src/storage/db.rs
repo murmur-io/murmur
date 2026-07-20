@@ -5488,8 +5488,12 @@ impl Db {
         // Notes leg — the COUNT twin shares the page query's exact WHERE body, so the
         // offset arithmetic below can never drift from what the page query returns.
         let visible_notes = visibility_clause("f", unlocked);
+        // Exclude the never-named "Untitled" sentinel (`UNTITLED_TITLE`): a screen of identical
+        // "Untitled" rows is useless and an unnamed note is not a meaningful link target (2026-07-20).
+        // On `notes_where` so the COUNT twin and the page query stay in lockstep (offset arithmetic).
         let notes_where = format!(
             "d.kind = 'note' AND {visible_notes}
+             AND LOWER(COALESCE(NULLIF(TRIM(d.title), ''), d.name)) != LOWER(:untitled)
              AND (:pat IS NULL OR COALESCE(NULLIF(TRIM(d.title), ''), d.name) LIKE :pat ESCAPE '\\')"
         );
         let note_count: i64 = conn
@@ -5500,7 +5504,7 @@ impl Db {
                        JOIN folders f ON f.id = d.folder_id
                       WHERE {notes_where}"
                 ),
-                rusqlite::named_params! { ":pat": pat },
+                rusqlite::named_params! { ":pat": pat, ":untitled": UNTITLED_TITLE },
                 |r| r.get(0),
             )
             .map_err(map_err)?;
@@ -5516,7 +5520,12 @@ impl Db {
             let mut stmt = conn.prepare(&sql).map_err(map_err)?;
             let rows = stmt
                 .query_map(
-                    rusqlite::named_params! { ":pat": pat, ":limit": limit, ":offset": offset },
+                    rusqlite::named_params! {
+                        ":pat": pat,
+                        ":limit": limit,
+                        ":offset": offset,
+                        ":untitled": UNTITLED_TITLE,
+                    },
                     |r: &Row<'_>| -> rusqlite::Result<(String, String)> {
                         Ok((r.get(0)?, r.get(1)?))
                     },
@@ -6449,6 +6458,24 @@ pub(crate) fn extract_wikilink_titles(text: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// The sentinel display title auto-assigned to a note the user never named. `create_note_inner`
+/// writes the literal `"Untitled"` when the user supplies no title, and the auto-title guard in
+/// `commands::notes` treats `== "Untitled"` as "not yet named". It is NOT a unique identity — a real
+/// vault has MANY notes sharing it — so it must not be surfaced as a linkable identity: the link
+/// candidate picker (`list_link_candidates_visible`) does not OFFER it, and the Vault Audit mention
+/// scan (`find_unlinked_mention_line` / `orphan_pass`) never SUGGESTS `[[Untitled]]`. (The backlink
+/// fan-out itself — an untitled note claiming mentions it never earned — is fixed separately by the
+/// resolve-by-id guard in `backlinks_for_visible` (#417), which keeps `[[Untitled]]` resolving to one
+/// note; this const governs ONLY the picker + audit surfaces #417 does not touch.) Kept as one const
+/// so the write site and these read guards can never drift.
+pub(crate) const UNTITLED_TITLE: &str = "Untitled";
+
+/// True when `title` is the never-named sentinel (see [`UNTITLED_TITLE`]) — trimmed + ASCII-case
+/// -folded. Keeps an unnamed note out of the link-candidate picker and the audit link suggestions.
+pub(crate) fn is_untitled_title(title: &str) -> bool {
+    title.trim().eq_ignore_ascii_case(UNTITLED_TITLE)
 }
 
 /// A comparable newest-first sort key (epoch-millis) for a backlink chip. Both legs emit an RFC3339
