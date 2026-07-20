@@ -73,8 +73,8 @@ zero-knowledge, no plaintext ever touching a server.
 - 🎧 **It hears the whole call.** Your mic *and* the other side's system audio are captured and transcribed
   separately, then merged into a **Me / Others** transcript.
 - 🧩 **One store, three surfaces.** An encrypted SQLite DB is the single source of truth; the app, a
-  read-only **MCP server**, and your Obsidian vault are thin readers — never diverging copies.
-- 📁 **You own the output.** Notes are plain Markdown (and Obsidian-friendly) — no proprietary format, no lock-in.
+  read-only **MCP server**, and your exported Markdown files are thin readers — never diverging copies.
+- 📁 **You own the output.** Notes are plain Markdown — no proprietary format, no lock-in.
 - 🪟 **A Liquid Glass shell (macOS 26).** Floating glass rails that collapse into an Apple TV-style pill bar,
   a **⌘K** spotlight over your whole vault, **⌘N** for a new note, light/dark, and a transparency slider that
   honors macOS "Reduce transparency".
@@ -87,7 +87,7 @@ zero-knowledge, no plaintext ever touching a server.
 
 **Just want to use it?** → [**Download the latest signed & notarized build**](https://github.com/murmur-io/murmur/releases/latest),
 drag `Murmur.app` to Applications, and open it. A first-run wizard walks you through the Whisper model,
-an AI provider, and (optionally) an Obsidian vault.
+an AI provider, and (optionally) a Markdown vault folder to export into.
 
 <p align="center">
   <img src="docs/screenshots/onboarding.png" alt="First-run onboarding wizard" width="720">
@@ -249,10 +249,10 @@ across your whole history, and browse what it knows — all over the same store.
 
 ### 📁 Yours to keep
 
-A nice-to-have, not a lock-in: every note is also exported as plain **Obsidian Markdown** — atomic `.md`
-with YAML front-matter, `[[wikilinks]]`, `obsidian://` deep-links, and a `.canvas` board option. People and
-projects mirror into vault stub notes, so your Obsidian graph builds itself. Don't use Obsidian? The files
-are still just Markdown you own. (The encrypted SQLite DB — not the vault — is the source of truth.)
+A nice-to-have, not a lock-in: every note is also exported as plain **Markdown** — atomic `.md`
+with YAML front-matter, `[[wikilinks]]`, block-level deep-links, and a `.canvas` board option. People and
+projects mirror into vault stub notes, so your graph builds itself in your files too. They're just plain
+Markdown you own, openable in any editor. (The encrypted SQLite DB — not the vault — is the source of truth.)
 
 ---
 
@@ -332,7 +332,7 @@ persists everything to **one SQLCipher-encrypted SQLite database** — the canon
 **brain** (a grounded RAG + agentic reasoning layer powering the in-meeting assistant, Ask, and the Notes
 AI command menu — full model-driven agentic tool-choice with a provider connection incl. local Ollama, a
 grounded retrieval floor on a downloaded on-device model), plus three read surfaces: the app UI, a
-read-only **MCP server**, and your Obsidian vault. Opt in to a free account and a fourth path opens: a
+read-only **MCP server**, and your exported Markdown vault. Opt in to a free account and a fourth path opens: a
 zero-knowledge **sync relay** (`murmur-server`, a separate sibling repo) that lets Shared Brain content —
 and nothing else — flow, always as ciphertext, between your org's devices.
 
@@ -351,7 +351,7 @@ flowchart LR
   brain --> live["💬 In-meeting @brain threads"]
   brain --> ask["🔎 Ask across meetings + notes"]
   db --> mcp["🧩 MCP server · 127.0.0.1:8765"]
-  db --> vault["📁 Obsidian vault (.md · .canvas)"]
+  db --> vault["📁 Your Markdown vault (.md · .canvas)"]
   db -.opt-in, E2EE.-> relay["☁️ murmur-server<br/>ciphertext-only relay"]
   relay -.opt-in, E2EE.-> orgdb[("🗄️ Org members' local replicas")]
 ```
