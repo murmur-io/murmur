@@ -144,9 +144,10 @@ across your whole history, and browse what it knows — all over the same store.
 
 - **One page for your whole brain.** A status header counts your (visible) **meetings**, **documents**,
   and **notes**, shows whether semantic search is on, and links straight to Ask.
-- **Expand it with your own sources.** Drop in Markdown/text **documents**, or paste a quick **note** —
-  each is chunked and (when the on-device embedding model is present) vector-indexed into the same brain,
-  gated by the same per-folder lock.
+- **Expand it with your own sources.** Drop in a **PDF** (scanned pages fall back to on-device Apple
+  Vision OCR), a **Word / PowerPoint / Excel** file, an **HTML** page, Markdown/text, or even a
+  screenshot — or paste a quick **note**. Each is extracted, chunked, and (when the on-device embedding
+  model is present) vector-indexed into the same brain, gated by the same per-folder lock.
 - **See the connections.** A collapsible graph shows how people and projects link across everything.
 
 ### 🔎 Ask across every meeting — and every note
@@ -272,7 +273,7 @@ recording. Same store, same lock model, same brain.
   properties, just like a locked meeting.
 - **AI auto-organize** — the brain proposes a folder/tag reorganization plan, you review it, nothing
   moves until you approve.
-- **A 19-action AI command menu on selected text** — ClickUp-style, grouped into Edit / Structure / From
+- **A 19-action AI command menu on selected text** — grouped into Edit / Structure / From
   your brain / Extract / Create, with a compact 5-action default, tone and translation submenus, and a
   free-text custom instruction. The same command backs all 19 actions, gated on the folder being
   unlocked and routed through the identical provider seam, redaction firewall, and egress ledger as
@@ -541,7 +542,7 @@ axum + Postgres relay, AGPL-3.0).
 
 ## 🗺️ Status
 
-Murmur ships at **v0.9.6** — a signed, notarized macOS app, roughly 20 releases past the record →
+Murmur ships at **v1.0.0** — a signed, notarized macOS app, ~30 releases past the record →
 transcribe → summarize MVP.
 
 **Shipped and in daily use:**
@@ -549,6 +550,15 @@ transcribe → summarize MVP.
   screen with in-meeting `@brain` threads, and the floating recorder bar.
 - The on-device brain (agentic tool-use loop + hybrid FTS/semantic/entity-graph retrieval), the `/brain`
   knowledge hub, Ask-Your-Vault, and the knowledge graph.
+- **Universal document ingest** — drop in a PDF (scanned pages fall back to on-device Apple Vision OCR),
+  a Word / PowerPoint / Excel file, an HTML page, Markdown/text, or an image, and it's extracted,
+  chunked, and vector-indexed into the same brain, gated by the same per-folder lock.
+- **Receipts** — every claim in a generated note that aligns to what was actually said carries a
+  receipt chip that jumps you to the exact transcript segment (audio second, speaker, ASR-confidence)
+  it came from; unsupported lines earn none, and a sealed meeting leaks no timing or speaker.
+- **A self-building link graph** — notes, meetings, *and* imported documents are first-class
+  `[[link]]` targets you pick/link/open from any surface; backlinks resolve by id, and the full-brain
+  graph renders as a living neural map.
 - **Notes** as a full standalone product — editor, note folders with their own lock lifecycle, AI
   auto-organize, and the 19-action AI command menu.
 - **Shared Brain** — free, opt-in, end-to-end-encrypted org sharing of notes and meetings, multi-org
