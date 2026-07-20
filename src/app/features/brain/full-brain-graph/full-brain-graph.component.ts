@@ -17,6 +17,7 @@ import type {
   FullGraphNodeKind,
 } from "../../../core/models";
 import { FoldersService } from "../../../services/folders.service";
+import { DocumentPreviewService } from "../../../services/document-preview.service";
 import { TabsService } from "../../../core/tabs.service";
 import {
   FullBrainSceneDirective,
@@ -69,8 +70,9 @@ const MAX_NODES = 500;
  * - {@link FullBrainSceneDirective} owns every DOM-loop concern (ResizeObserver,
  *   invalidate-on-demand paint, pointer input) per angular-zoneless §5.
  *
- * CLICK-THROUGH: a node click routes by kind — meeting → `/meeting/:id`,
- * note/document → the note editor (`/notes/:id`, both are `documents` rows),
+ * CLICK-THROUGH: a node open routes by kind — meeting → `/meeting/:id`,
+ * note → the note editor (`/notes/:id`), document → the app-wide read-only
+ * preview modal (a `document` row has no route; `DocumentPreviewService`),
  * entity → the `/graph` page with `?entity=<id>` preselected (reuse existing
  * nav). Sizing is handled by the directive's ResizeObserver (no `setTimeout`).
  */
@@ -86,6 +88,7 @@ export class FullBrainGraphComponent {
   private readonly folders = inject(FoldersService);
   private readonly router = inject(Router);
   private readonly tabs = inject(TabsService);
+  private readonly docPreview = inject(DocumentPreviewService);
 
   private readonly scene = viewChild(FullBrainSceneDirective);
 
@@ -415,9 +418,18 @@ export class FullBrainGraphComponent {
         void this.router.navigate(["/meeting", id]);
         break;
       case "note":
-      case "document":
-        // Both are `documents` rows — the note editor renders either.
+        // A `note` documents row IS a routable editor note.
         void this.tabs.openNote(id, node.label || "Note");
+        break;
+      case "document":
+        // A brain-ingested `document` (e.g. a PDF) has NO route — `get_note`
+        // rejects a document id (`["/notes", id]` was a dead end). Open the
+        // app-wide read-only preview modal instead (gated `getDocument(id)`).
+        this.docPreview.open({
+          id,
+          name: node.label || "Document",
+          kind: "document",
+        });
         break;
       case "entity":
         // Reuse the /graph page's entity detail via a preselect deep-link.

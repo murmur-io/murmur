@@ -105,21 +105,34 @@
             [class.has-remove]="row.removable && !!row.edge"
             [class.is-pending]="row.pending"
           >
-            <a class="cx-chip" [routerLink]="row.route">
-              @switch (row.kind) {
-                @case ("meeting") {
-                  <span class="cx-kind cx-kind--meeting" aria-hidden="true">meeting</span>
+            <!-- A `document` neighbour has NO route (`get_note` rejects a doc id) —
+                 its chip is a <button> that opens the read-only preview modal.
+                 `meeting`/`note` chips stay routed <a>s exactly as before. -->
+            @if (row.kind === "document") {
+              <button
+                type="button"
+                class="cx-chip cx-chip--open"
+                [attr.aria-label]="'Open document ' + row.title"
+                (click)="openDocument(row.id, row.title)"
+              >
+                <span class="cx-kind cx-kind--doc" aria-hidden="true">doc</span>
+                <span class="cx-title">{{ row.title }}</span>
+                <span class="cx-edge" aria-hidden="true">{{ row.tag }}</span>
+              </button>
+            } @else {
+              <a class="cx-chip" [routerLink]="row.route">
+                @switch (row.kind) {
+                  @case ("meeting") {
+                    <span class="cx-kind cx-kind--meeting" aria-hidden="true">meeting</span>
+                  }
+                  @default {
+                    <span class="cx-kind cx-kind--note" aria-hidden="true">note</span>
+                  }
                 }
-                @case ("document") {
-                  <span class="cx-kind cx-kind--doc" aria-hidden="true">doc</span>
-                }
-                @default {
-                  <span class="cx-kind cx-kind--note" aria-hidden="true">note</span>
-                }
-              }
-              <span class="cx-title">{{ row.title }}</span>
-              <span class="cx-edge" aria-hidden="true">{{ row.tag }}</span>
-            </a>
+                <span class="cx-title">{{ row.title }}</span>
+                <span class="cx-edge" aria-hidden="true">{{ row.tag }}</span>
+              </a>
+            }
             @if (row.removable && row.edge) {
               <button
                 type="button"

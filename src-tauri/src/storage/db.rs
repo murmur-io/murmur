@@ -5589,7 +5589,65 @@ impl Db {
                 });
             }
         }
-        Ok((out, note_count + meeting_count))
+
+        // Documents leg — LAST in the combined ordering (so existing notes/meetings page
+        // positions are untouched; a doc-free vault reports document_count == 0). Mirrors the
+        // notes leg exactly but for `d.kind = 'document'`, and titles on the SAME
+        // COALESCE(title, name) so a filename (e.g. `Oskar_Orlowski_CV.pdf`, no `title`) is
+        // searchable/displayable. The COUNT twin shares the page query's WHERE body, so a
+        // sealed-and-not-unlocked document neither appears NOR inflates the total.
+        let visible_docs = visibility_clause("f", unlocked);
+        let docs_where = format!(
+            "d.kind = 'document' AND {visible_docs}
+             AND (:pat IS NULL OR COALESCE(NULLIF(TRIM(d.title), ''), d.name) LIKE :pat ESCAPE '\\')"
+        );
+        let document_count: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*)
+                       FROM documents d
+                       JOIN folders f ON f.id = d.folder_id
+                      WHERE {docs_where}"
+                ),
+                rusqlite::named_params! { ":pat": pat },
+                |r| r.get(0),
+            )
+            .map_err(map_err)?;
+        let remaining = limit - out.len() as i64;
+        let doc_offset = (offset - note_count - meeting_count).max(0);
+        if remaining > 0 && doc_offset < document_count {
+            let sql = format!(
+                "SELECT d.id, COALESCE(NULLIF(TRIM(d.title), ''), d.name)
+                   FROM documents d
+                   JOIN folders f ON f.id = d.folder_id
+                  WHERE {docs_where}
+                  ORDER BY COALESCE(d.updated_at, d.created_at) DESC, d.id ASC
+                  LIMIT :limit OFFSET :offset"
+            );
+            let mut stmt = conn.prepare(&sql).map_err(map_err)?;
+            let rows = stmt
+                .query_map(
+                    rusqlite::named_params! {
+                        ":pat": pat,
+                        ":limit": remaining,
+                        ":offset": doc_offset,
+                    },
+                    |r: &Row<'_>| -> rusqlite::Result<(String, String)> {
+                        Ok((r.get(0)?, r.get(1)?))
+                    },
+                )
+                .map_err(map_err)?;
+            for r in rows {
+                let (id, title) = r.map_err(map_err)?;
+                out.push(NoteCitation {
+                    kind: "document".into(),
+                    id,
+                    title,
+                    snippet: String::new(),
+                });
+            }
+        }
+        Ok((out, note_count + meeting_count + document_count))
     }
 
     // `get_note_if_visible` moved to `storage::notes_store` (God-file split) — still callable as inherent `db.method()` cross-file.
