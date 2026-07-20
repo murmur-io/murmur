@@ -1,0 +1,444 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Murmur — Off the Record (vibe prototype)</title>
+<style>
+/* ── Murmur design tokens (copied from src/design-tokens/*.css so this file is
+      self-contained — no @import, no build, no npm). Vibe prototype: fake data. ── */
+:root{
+  --surface-base:#07070b;
+  --surface-raised:rgba(255,255,255,.045);
+  --surface-overlay:#1b1b24;
+  --surface-input:rgba(255,255,255,.035);
+  --surface-solid:#111118;
+  --surface-hover:rgba(255,255,255,.06);
+  --scrim:rgba(0,0,0,.5);
+  --text-primary:#f6f6fa;
+  --text-secondary:#a6a6b6;
+  --text-muted:#6c6c7d;
+  --text-on-accent:#fff;
+  --accent:#6e76ff;
+  --accent-hover:#8a90ff;
+  --accent-active:#5b63f0;
+  --accent-soft:rgba(110,118,255,.16);
+  --accent-ring:rgba(110,118,255,.5);
+  --live:#ff7a5c;
+  --live-hover:#ff8e74;
+  --live-soft:rgba(255,122,92,.16);
+  --live-glow:0 8px 24px rgba(255,122,92,.28);
+  --seal:#c86ff2;                 /* orchid — the "sealed" identity (graph-document hue) */
+  --seal-soft:rgba(200,111,242,.14);
+  --seal-ring:rgba(200,111,242,.42);
+  --border:rgba(255,255,255,.09);
+  --border-strong:rgba(255,255,255,.16);
+  --border-subtle:rgba(255,255,255,.055);
+  --success:#4ade80; --success-soft:rgba(74,222,128,.15);
+  --space-1:4px; --space-2:8px; --space-3:12px; --space-4:16px; --space-5:24px; --space-6:32px; --space-8:56px;
+  --radius-sm:8px; --radius-md:12px; --radius-lg:18px; --radius-xl:26px;
+  --shadow-lg:0 24px 60px rgba(0,0,0,.55);
+  --transition:.18s cubic-bezier(.4,0,.2,1);
+  --font-sans:-apple-system,BlinkMacSystemFont,"SF Pro Text","Hanken Grotesk","Segoe UI",system-ui,sans-serif;
+  --font-mono:"SF Mono",ui-monospace,"JetBrains Mono",Menlo,monospace;
+}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0}
+body{
+  min-height:100vh; background:var(--surface-base); color:var(--text-primary);
+  font-family:var(--font-sans); font-size:15px; line-height:1.55; letter-spacing:-.012em;
+  overflow-x:hidden;
+}
+/* Aurora field, static, hugging the left — mirrors the app's body::before. */
+body::before{content:"";position:fixed;inset:-10%;z-index:-2;
+  background:
+    radial-gradient(80% 60% at 8% 12%, rgba(110,118,255,.16), transparent 60%),
+    radial-gradient(60% 50% at 2% 90%, rgba(200,111,242,.10), transparent 55%),
+    radial-gradient(50% 40% at 90% 8%, rgba(255,122,92,.06), transparent 60%);
+  filter:saturate(120%);}
+body::after{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;opacity:.02;
+  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");}
+
+.wrap{max-width:1080px;margin:0 auto;padding:var(--space-6) var(--space-5) var(--space-8);}
+
+/* ── Top chrome ─────────────────────────────────────────────────────────── */
+.topbar{display:flex;align-items:center;gap:var(--space-4);margin-bottom:var(--space-5);flex-wrap:wrap}
+.brand{display:flex;align-items:center;gap:10px;font-weight:650;letter-spacing:-.02em}
+.brand .dot{width:10px;height:10px;border-radius:50%;background:var(--accent);box-shadow:0 0 14px var(--accent)}
+.meeting-title{font-size:1.05rem;font-weight:600}
+.meeting-sub{color:var(--text-muted);font-size:.82rem}
+.spacer{flex:1}
+.live-pill{display:flex;align-items:center;gap:8px;padding:6px 13px;border-radius:var(--radius-xl);
+  background:var(--live-soft);border:1px solid rgba(255,122,92,.35);color:var(--live-hover);font-weight:600;font-size:.82rem;letter-spacing:.02em}
+.live-pill .rec{width:9px;height:9px;border-radius:50%;background:var(--live);animation:pulse 1.6s infinite}
+@keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.35;transform:scale(.82)}}
+.timer{font-family:var(--font-mono);font-size:.82rem;color:var(--text-secondary);font-variant-numeric:tabular-nums}
+.nobot{display:flex;align-items:center;gap:6px;font-size:.75rem;color:var(--text-muted);padding:5px 11px;border:1px solid var(--border);border-radius:var(--radius-xl);background:var(--surface-raised)}
+.nobot b{color:var(--text-secondary);font-weight:600}
+
+/* ── Layout ─────────────────────────────────────────────────────────────── */
+.grid{display:grid;grid-template-columns:1fr 340px;gap:var(--space-5)}
+@media(max-width:920px){.grid{grid-template-columns:1fr}}
+
+.card{background:var(--surface-raised);border:1px solid var(--border);border-radius:var(--radius-lg);
+  backdrop-filter:blur(30px) saturate(140%);-webkit-backdrop-filter:blur(30px) saturate(140%)}
+.stage{padding:var(--space-5);min-height:520px;display:flex;flex-direction:column;transition:box-shadow .4s,border-color .4s}
+/* When sealed the whole stage takes on the orchid "compartment" cast. */
+.stage.sealed{border-color:var(--seal-ring);box-shadow:0 0 0 1px var(--seal-ring),0 24px 70px rgba(200,111,242,.14),inset 0 0 120px rgba(200,111,242,.05)}
+
+.stage-head{display:flex;align-items:center;gap:12px;margin-bottom:var(--space-4)}
+.mode-badge{display:flex;align-items:center;gap:8px;font-size:.8rem;font-weight:650;letter-spacing:.02em;padding:6px 13px;border-radius:var(--radius-xl);border:1px solid var(--border-strong);color:var(--text-secondary);transition:var(--transition)}
+.mode-badge .g{width:8px;height:8px;border-radius:50%;background:var(--success)}
+.stage.sealed .mode-badge{color:var(--seal);border-color:var(--seal-ring);background:var(--seal-soft)}
+.stage.sealed .mode-badge .g{background:var(--seal);box-shadow:0 0 10px var(--seal)}
+.stage-head .who{color:var(--text-muted);font-size:.78rem}
+
+/* transcript stream */
+.stream{flex:1;overflow:hidden;display:flex;flex-direction:column;gap:12px;padding-right:4px}
+.line{display:flex;gap:12px;align-items:flex-start;animation:rise .45s cubic-bezier(.2,.8,.2,1)}
+@keyframes rise{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
+.spk{flex:0 0 auto;width:64px;text-align:right;font-size:.72rem;font-weight:600;color:var(--text-muted);padding-top:3px;letter-spacing:.01em}
+.line.me .spk{color:var(--accent-hover)}
+.bubble{position:relative;padding:10px 14px;border-radius:14px;font-size:.94rem;max-width:78%;
+  background:var(--surface-hover);border:1px solid var(--border-subtle)}
+.line.me .bubble{background:var(--accent-soft);border-color:rgba(110,118,255,.28)}
+.bubble .t{color:var(--text-primary)}
+/* sealed line inside the stream — visibly a different, locked material */
+.line.sealed .bubble{background:var(--seal-soft);border:1px dashed var(--seal-ring);color:var(--text-primary)}
+.line.sealed .spk{color:var(--seal)}
+.line.sealed .bubble::after{content:"🔒 sealed aside · on-device only";display:block;margin-top:5px;font-size:.68rem;color:var(--seal);opacity:.85;letter-spacing:.02em}
+.line .prov{margin-top:5px;font-size:.68rem;color:var(--text-muted);display:flex;align-items:center;gap:6px;opacity:.75}
+.wf{display:inline-flex;gap:2px;align-items:flex-end;height:11px}
+.wf i{width:2px;background:currentColor;border-radius:1px;opacity:.6}
+
+/* the big control */
+.controls{margin-top:var(--space-4);display:flex;flex-direction:column;gap:12px}
+.record-toggle{display:flex;align-items:center;gap:16px;padding:14px 16px;border-radius:var(--radius-lg);border:1px solid var(--border-strong);background:var(--surface-input);cursor:pointer;transition:var(--transition);user-select:none}
+.record-toggle:hover{background:var(--surface-hover)}
+.record-toggle.on-seal{border-color:var(--seal-ring);background:var(--seal-soft)}
+.mic{position:relative;flex:0 0 auto;width:46px;height:46px;border-radius:50%;display:grid;place-items:center;background:var(--accent-soft);border:1px solid var(--accent-ring);color:var(--accent-hover);font-size:1.2rem;transition:var(--transition)}
+.record-toggle.on-seal .mic{background:var(--seal-soft);border-color:var(--seal-ring);color:var(--seal)}
+.record-toggle.on-seal .mic::before{content:"";position:absolute;inset:-6px;border-radius:50%;border:2px solid var(--seal);opacity:.5;animation:ring 1.4s infinite}
+@keyframes ring{0%{transform:scale(.9);opacity:.6}100%{transform:scale(1.5);opacity:0}}
+.rt-text{flex:1}
+.rt-text .k{font-weight:650;font-size:.98rem}
+.rt-text .s{color:var(--text-muted);font-size:.8rem}
+.record-toggle.on-seal .rt-text .k{color:var(--seal)}
+.switch{flex:0 0 auto;width:52px;height:30px;border-radius:16px;background:var(--surface-hover);border:1px solid var(--border-strong);position:relative;transition:var(--transition)}
+.switch::after{content:"";position:absolute;top:3px;left:3px;width:22px;height:22px;border-radius:50%;background:var(--text-secondary);transition:var(--transition)}
+.record-toggle.on-seal .switch{background:var(--seal);border-color:var(--seal)}
+.record-toggle.on-seal .switch::after{left:25px;background:#fff}
+
+.hint{font-size:.78rem;color:var(--text-muted);text-align:center}
+.hint b{color:var(--text-secondary);font-weight:600}
+.voice-chip{display:inline-flex;align-items:center;gap:7px;margin-left:6px;padding:3px 10px;border-radius:var(--radius-xl);border:1px dashed var(--border-strong);color:var(--text-secondary);cursor:pointer;transition:var(--transition)}
+.voice-chip:hover{border-color:var(--seal-ring);color:var(--seal)}
+.voice-chip .mm{width:7px;height:7px;border-radius:50%;background:var(--seal);animation:pulse 1.4s infinite}
+
+/* ── Right column: where it goes ────────────────────────────────────────── */
+.side{display:flex;flex-direction:column;gap:var(--space-4)}
+.panel{padding:var(--space-4)}
+.panel h3{margin:0 0 4px;font-size:.86rem;letter-spacing:.01em}
+.panel .cap{color:var(--text-muted);font-size:.76rem;margin-bottom:12px}
+
+.dest{display:flex;gap:11px;padding:11px;border-radius:var(--radius-md);border:1px solid var(--border-subtle);background:var(--surface-input);margin-bottom:10px}
+.dest .ic{flex:0 0 auto;width:34px;height:34px;border-radius:9px;display:grid;place-items:center;font-size:1.05rem}
+.dest.public .ic{background:var(--accent-soft);color:var(--accent-hover)}
+.dest.sealed .ic{background:var(--seal-soft);color:var(--seal)}
+.dest .body{flex:1;min-width:0}
+.dest .body .k{font-weight:600;font-size:.85rem}
+.dest .body .s{color:var(--text-muted);font-size:.73rem;margin-top:2px}
+.dest .count{font-family:var(--font-mono);font-weight:650;font-size:1.05rem}
+.dest.public .count{color:var(--accent-hover)}
+.dest.sealed .count{color:var(--seal)}
+
+.aside-list{display:flex;flex-direction:column;gap:8px;margin-top:6px}
+.aside-item{border:1px dashed var(--seal-ring);background:var(--seal-soft);border-radius:var(--radius-sm);padding:9px 11px;font-size:.82rem}
+.aside-item .masked{color:var(--seal);letter-spacing:.06em;font-family:var(--font-mono);font-size:.8rem}
+.aside-item .revealed{color:var(--text-primary)}
+.aside-item .rev-btn{margin-top:7px;display:inline-flex;align-items:center;gap:7px;font-size:.74rem;color:var(--seal);border:1px solid var(--seal-ring);background:transparent;border-radius:var(--radius-xl);padding:4px 11px;cursor:pointer;transition:var(--transition);font-family:var(--font-sans)}
+.aside-item .rev-btn:hover{background:var(--seal-soft)}
+.aside-item .meta{margin-top:6px;font-size:.68rem;color:var(--text-muted)}
+
+.ledger{margin-top:2px;padding:12px 14px;border-radius:var(--radius-md);border:1px solid var(--border);background:linear-gradient(180deg,rgba(74,222,128,.05),transparent)}
+.ledger .big{display:flex;align-items:baseline;gap:8px}
+.ledger .big .n{font-family:var(--font-mono);font-size:1.5rem;font-weight:700;color:var(--success)}
+.ledger .big .u{color:var(--text-secondary);font-size:.82rem}
+.ledger .sub{color:var(--text-muted);font-size:.73rem;margin-top:4px;line-height:1.45}
+.ledger .sub b{color:var(--success)}
+.sig{margin-top:8px;font-family:var(--font-mono);font-size:.66rem;color:var(--text-muted);word-break:break-all;opacity:.7}
+
+/* ── Touch ID overlay ───────────────────────────────────────────────────── */
+.scrim{position:fixed;inset:0;background:var(--scrim);backdrop-filter:blur(6px);display:none;place-items:center;z-index:50}
+.scrim.show{display:grid}
+.touchid{width:340px;background:var(--surface-overlay);border:1px solid var(--border-strong);border-radius:var(--radius-lg);box-shadow:var(--shadow-lg);padding:26px;text-align:center}
+.touchid .fp{width:64px;height:64px;margin:0 auto 14px;border-radius:50%;display:grid;place-items:center;font-size:2rem;background:var(--seal-soft);border:1px solid var(--seal-ring);color:var(--seal);transition:var(--transition)}
+.touchid .fp.ok{background:var(--success-soft);border-color:var(--success);color:var(--success)}
+.touchid h4{margin:0 0 6px;font-size:1rem}
+.touchid p{margin:0;color:var(--text-secondary);font-size:.84rem}
+.touchid .go{margin-top:16px;background:var(--seal);color:#fff;border:none;border-radius:var(--radius-md);padding:9px 18px;font-weight:600;cursor:pointer;font-family:var(--font-sans);font-size:.86rem}
+
+/* footer note */
+.foot{margin-top:var(--space-6);text-align:center;color:var(--text-muted);font-size:.75rem;line-height:1.6}
+.foot b{color:var(--text-secondary);font-weight:600}
+.pill-tag{display:inline-block;padding:2px 9px;border-radius:var(--radius-xl);border:1px solid var(--border);color:var(--text-muted);font-size:.68rem;margin:0 3px}
+
+.cta{display:inline-flex;align-items:center;gap:8px;margin-top:14px;padding:9px 15px;border-radius:var(--radius-md);border:1px solid var(--accent-ring);background:var(--accent-soft);color:var(--accent-hover);font-weight:600;font-size:.82rem;cursor:pointer;transition:var(--transition)}
+.cta:hover{background:var(--accent-soft);border-color:var(--accent)}
+.cta.reset{border-color:var(--border-strong);background:var(--surface-hover);color:var(--text-secondary)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="topbar">
+    <div class="brand"><span class="dot"></span>Murmur</div>
+    <div>
+      <div class="meeting-title">Customer Call — Acme Corp</div>
+      <div class="meeting-sub">Recording · far-side captured with no bot in the call</div>
+    </div>
+    <div class="spacer"></div>
+    <div class="nobot">🛰️ <b>No bot joined.</b> Acme can't see you're recording.</div>
+    <div class="live-pill"><span class="rec"></span>REC <span class="timer" id="timer">04:12</span></div>
+  </div>
+
+  <div class="grid">
+    <!-- LEFT: the live stage -->
+    <div class="card stage" id="stage">
+      <div class="stage-head">
+        <div class="mode-badge" id="badge"><span class="g"></span><span id="badgeText">ON THE RECORD</span></div>
+        <div class="who" id="whoText">→ everything flows to your note &amp; (redacted) to your cloud provider</div>
+      </div>
+
+      <div class="stream" id="stream"></div>
+
+      <div class="controls">
+        <div class="record-toggle" id="toggle">
+          <div class="mic" id="mic">🎙</div>
+          <div class="rt-text">
+            <div class="k" id="toggleK">Go off the record</div>
+            <div class="s" id="toggleS">Seal what you say next into a Touch-ID compartment — it never enters the note, never leaves this Mac.</div>
+          </div>
+          <div class="switch"></div>
+        </div>
+        <div class="hint">
+          Tip: you can also just say it —
+          <span class="voice-chip" id="voiceChip"><span class="mm"></span>“Murmur, off the record”</span>
+          <span id="voiceHintTail"> · your voiceprint confirms it's you</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- RIGHT: where it goes -->
+    <div class="side">
+      <div class="card panel">
+        <h3>Where every word goes</h3>
+        <div class="cap">Two streams, one recording. You decide — live.</div>
+
+        <div class="dest public">
+          <div class="ic">📄</div>
+          <div class="body">
+            <div class="k">The shared note</div>
+            <div class="s">Obsidian vault · [[wikilinks]] · redacted → cloud summary</div>
+          </div>
+          <div class="count" id="publicCount">0</div>
+        </div>
+
+        <div class="dest sealed">
+          <div class="ic">🔒</div>
+          <div class="body">
+            <div class="k">Sealed asides</div>
+            <div class="s">This device only · Touch ID to read · verify-before-destroy</div>
+          </div>
+          <div class="count" id="sealedCount">0</div>
+        </div>
+
+        <div class="aside-list" id="asideList"></div>
+      </div>
+
+      <div class="card panel">
+        <div class="ledger">
+          <div class="big"><span class="n">0</span><span class="u">bytes of your sealed asides ever left this device</span></div>
+          <div class="sub">On-device ASR + on-device seal. Your negotiation floor, your private read of the room, your intel — <b>physically un-cloudable.</b></div>
+          <div class="sig">sig: ed25519·on-device · a1f0…9c4b · sealed 3 spans · 0 egress</div>
+        </div>
+        <div class="cta reset" id="reset">↻ replay the call</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="foot">
+    <b>Only Murmur could ship this.</b> A cloud notetaker's bot streams every word to a server the moment it's said —
+    “off the record” already left the building. Murmur hears the far side with no bot, thinks on-device, and seals under your fingerprint.
+    <br>
+    <span class="pill-tag">the lock</span><span class="pill-tag">voice</span><span class="pill-tag">on-device</span><span class="pill-tag">far-side capture</span><span class="pill-tag">owned files</span>
+    <br><br>
+    <span style="opacity:.6">vibe prototype · fake data · not production — <code>docs/dreams/prototypes/off-the-record/</code></span>
+  </div>
+</div>
+
+<!-- Touch ID modal -->
+<div class="scrim" id="scrim">
+  <div class="touchid">
+    <div class="fp" id="fp">☝︎</div>
+    <h4 id="tiTitle">Touch ID to reveal</h4>
+    <p id="tiBody">This sealed aside decrypts only for you, only on this Mac.</p>
+    <button class="go" id="tiGo">Use fingerprint</button>
+  </div>
+</div>
+
+<script>
+/* ── The scripted Acme call. `seal:true` lines are the ones you'd never want in
+      a shared note or a cloud summary — your negotiation strategy + private intel. ── */
+const SCRIPT = [
+  {spk:"Marcus (Acme)", me:false, t:"Before we go further — what's your best pricing on a 3-year commit?"},
+  {spk:"You",           me:true,  t:"Great question. Let me walk you through how the tiers work."},
+  {spk:"You",           me:true,  seal:true, t:"Floor is 40k. Open at 58 and let them negotiate me down to ~48."},
+  {spk:"You",           me:true,  t:"For a 3-year commitment we'd land at 58k annually, all-in."},
+  {spk:"Marcus (Acme)", me:false, t:"That's over budget. Our board only approved 45."},
+  {spk:"You",           me:true,  seal:true, t:"They tipped their hand — 45 is real money, not a bluff. Push to 47 and stop."},
+  {spk:"You",           me:true,  t:"I hear you. If you can sign this quarter, I can get us to 49."},
+  {spk:"Marcus (Acme)", me:false, t:"Let me take 47 back to the board and see."},
+  {spk:"You",           me:true,  seal:true, t:"Their CTO is leaving in Q3 — Devon mentioned it. Do NOT reference it."},
+  {spk:"You",           me:true,  t:"Sounds good. I'll send the redlined 3-year terms this afternoon."},
+];
+
+const stream   = document.getElementById('stream');
+const stage    = document.getElementById('stage');
+const badge    = document.getElementById('badge');
+const badgeText= document.getElementById('badgeText');
+const whoText  = document.getElementById('whoText');
+const toggle   = document.getElementById('toggle');
+const toggleK  = document.getElementById('toggleK');
+const toggleS  = document.getElementById('toggleS');
+const mic      = document.getElementById('mic');
+const voiceChip= document.getElementById('voiceChip');
+const publicCountEl = document.getElementById('publicCount');
+const sealedCountEl = document.getElementById('sealedCount');
+const asideList = document.getElementById('asideList');
+const timerEl   = document.getElementById('timer');
+
+let sealed = false;          // current mode
+let idx = 0;                 // script cursor
+let publicN = 0, sealedN = 0;
+let running = false;
+let clock = 252;             // 4:12
+let queuedSeal = false;      // the next line will be sealed because user acted
+
+function fmt(s){const m=Math.floor(s/60),ss=String(s%60).padStart(2,'0');return `${m}:${ss}`;}
+
+function tick(){ clock++; timerEl.textContent = fmt(clock); }
+
+function setMode(on){
+  sealed = on;
+  stage.classList.toggle('sealed', on);
+  toggle.classList.toggle('on-seal', on);
+  mic.textContent = on ? '🔒' : '🎙';
+  badgeText.textContent = on ? 'OFF THE RECORD · SEALING' : 'ON THE RECORD';
+  whoText.textContent = on
+    ? '→ these words go only into a Touch-ID compartment on this Mac'
+    : '→ everything flows to your note & (redacted) to your cloud provider';
+  toggleK.textContent = on ? 'Back on the record' : 'Go off the record';
+  toggleS.textContent = on
+    ? 'The mic is still yours — the far side never knew you paused for the note. Tap to resume the shared record.'
+    : 'Seal what you say next into a Touch-ID compartment — it never enters the note, never leaves this Mac.';
+}
+
+function bars(n){ // fake waveform
+  let h='';for(let i=0;i<n;i++){h+=`<i style="height:${3+Math.round(Math.random()*8)}px"></i>`;}
+  return `<span class="wf">${h}</span>`;
+}
+
+function addLine(item){
+  const line = document.createElement('div');
+  const isSealed = item.seal;
+  line.className = 'line' + (item.me?' me':'') + (isSealed?' sealed':'');
+  const prov = isSealed
+    ? ''
+    : `<div class="prov">${bars(7)} ${item.spk} · verified voiceprint · ${fmt(clock)}</div>`;
+  line.innerHTML = `<div class="spk">${item.me?'You':item.spk.split(' ')[0]}</div>
+    <div class="bubble"><span class="t">${item.t}</span>${prov}</div>`;
+  stream.appendChild(line);
+  // keep only the last ~6 lines visible so it feels live
+  while(stream.children.length > 6) stream.removeChild(stream.firstChild);
+
+  if(isSealed){
+    sealedN++; sealedCountEl.textContent = sealedN;
+    addAside(item);
+  }else{
+    publicN++; publicCountEl.textContent = publicN;
+  }
+}
+
+function addAside(item){
+  const el = document.createElement('div');
+  el.className = 'aside-item';
+  el.innerHTML = `<div class="masked">•••••• ••••• •• ••• ••••••••</div>
+    <button class="rev-btn">☝︎ Touch ID to reveal</button>
+    <div class="meta">sealed ${fmt(clock)} · CK wrapped by master KEK · never exported</div>`;
+  const btn = el.querySelector('.rev-btn');
+  const masked = el.querySelector('.masked');
+  btn.addEventListener('click', ()=> askTouchID(()=>{
+    masked.className='revealed';
+    masked.textContent = '“'+item.t+'”';
+    btn.remove();
+  }));
+  asideList.appendChild(el);
+}
+
+/* Auto-advance the scripted call. When a line is flagged seal:true we AUTO-arm
+   the off-record mode one beat early so the demo shows the mode flip in context;
+   the user can also flip it themselves at any time. */
+function step(){
+  if(idx >= SCRIPT.length){ running=false; toggleK.textContent='Call ended — replay?'; return; }
+  const item = SCRIPT[idx++];
+  // Decide mode for THIS line: sealed if the line wants it OR the user armed it.
+  const wantSeal = item.seal || queuedSeal;
+  if(wantSeal !== sealed) setMode(wantSeal);
+  const emit = Object.assign({}, item, {seal: wantSeal});
+  // if user armed seal on a normally-public line, keep going; reset the manual arm
+  queuedSeal = false;
+  addLine(emit);
+  tick();
+  // after a sealed line, drop back on record for the next public beat
+  const nextIsSealed = SCRIPT[idx] && SCRIPT[idx].seal;
+  if(sealed && !nextIsSealed){ setTimeout(()=>{ if(running) setMode(false); }, 900); }
+  const delay = wantSeal ? 2600 : 2100;
+  if(running) setTimeout(step, delay);
+}
+
+/* Touch ID modal */
+const scrim=document.getElementById('scrim'), fp=document.getElementById('fp'),
+      tiGo=document.getElementById('tiGo');
+let tiCb=null;
+function askTouchID(cb){ tiCb=cb; fp.className='fp'; fp.textContent='☝︎'; scrim.classList.add('show'); }
+tiGo.addEventListener('click', ()=>{
+  fp.className='fp ok'; fp.textContent='✓';
+  setTimeout(()=>{ scrim.classList.remove('show'); if(tiCb)tiCb(); tiCb=null; }, 650);
+});
+scrim.addEventListener('click', e=>{ if(e.target===scrim) scrim.classList.remove('show'); });
+
+/* Manual controls */
+toggle.addEventListener('click', ()=>{
+  // arm/disarm the NEXT line's seal, and flip visible mode immediately for feel
+  queuedSeal = !sealed;
+  setMode(queuedSeal);
+});
+voiceChip.addEventListener('click', ()=>{
+  queuedSeal = true; setMode(true);
+  voiceChip.style.borderColor='var(--seal)'; voiceChip.style.color='var(--seal)';
+  setTimeout(()=>{ voiceChip.style.borderColor=''; voiceChip.style.color=''; }, 1200);
+});
+
+function start(){
+  stream.innerHTML=''; asideList.innerHTML='';
+  idx=0; publicN=0; sealedN=0; clock=252; queuedSeal=false;
+  publicCountEl.textContent='0'; sealedCountEl.textContent='0'; timerEl.textContent=fmt(clock);
+  setMode(false); running=true;
+  setTimeout(step, 500);
+}
+document.getElementById('reset').addEventListener('click', start);
+start();
+</script>
+</body>
+</html>
