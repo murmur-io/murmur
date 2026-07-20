@@ -81,7 +81,13 @@ pub(crate) fn create_note_inner(
     }
 
     let title = title.trim();
-    let title = if title.is_empty() { "Untitled" } else { title };
+    // The stored default for a never-named note — coupled to `UNTITLED_TITLE` so the written value and
+    // the picker/audit `is_untitled_title` guards can never drift (see `crate::storage::db`).
+    let title = if title.is_empty() {
+        crate::storage::db::UNTITLED_TITLE
+    } else {
+        title
+    };
     // The `name` is the filesystem-safe slug; `title` is the display title.
     let name = crate::export::sanitize_title(title);
 
