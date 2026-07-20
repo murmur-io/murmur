@@ -9,6 +9,12 @@
   animation: rise 320ms var(--transition) both;
 }
 
+.related-primary {
+  padding: var(--space-4) var(--space-5);
+  background: var(--surface-raised);
+  border-block: 1px solid var(--border-subtle);
+}
+
 .block {
   display: flex;
   flex-direction: column;

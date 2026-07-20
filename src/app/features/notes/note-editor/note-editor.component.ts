@@ -390,6 +390,12 @@ export class NoteEditorComponent {
     viewChild<ElementRef<HTMLInputElement>>("titleInput");
   private readonly bodyArea =
     viewChild<ElementRef<HTMLTextAreaElement>>("bodyArea");
+  /** Live textarea node passed to the teleported link picker for motion filtering. */
+  readonly linkPickerAnchorElement = computed(
+    () => this.bodyArea()?.nativeElement ?? null,
+  );
+  /** Coalesce captured scroll bursts into one post-render caret measurement. */
+  private linkPickerRepositionQueued = false;
   private readonly tagInput =
     viewChild<ElementRef<HTMLInputElement>>("tagInput");
 
@@ -2000,6 +2006,29 @@ export class NoteEditorComponent {
   /** The picker's resolved candidates for the current query (drives keyboard nav). */
   onLinkPickerCandidates(rows: NoteCitation[]): void {
     this.linkPickerCandidates.set(rows);
+  }
+
+  /** Re-measure the live textarea caret after an ancestor/window scroll. */
+  repositionLinkPicker(): void {
+    if (this.linkPickerRepositionQueued) {
+      return;
+    }
+    this.linkPickerRepositionQueued = true;
+    afterNextRender(
+      () => {
+        this.linkPickerRepositionQueued = false;
+        const trigger = this.linkPickerTrigger();
+        const el = this.bodyArea()?.nativeElement;
+        if (!trigger || !el) {
+          return;
+        }
+        const rect = this.selectionRect(el, trigger.start, trigger.start);
+        if (rect) {
+          this.linkPickerTrigger.set({ start: trigger.start, rect });
+        }
+      },
+      { injector: this.injector },
+    );
   }
 
   /**

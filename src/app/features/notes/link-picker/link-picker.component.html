@@ -10,7 +10,8 @@
   class="link-pop"
   appTeleportToBody
   appRepositionOnScroll
-  (reposition)="reposition()"
+  [repositionAnchor]="anchorElement()"
+  (reposition)="requestReposition($event)"
   (scroll)="onScroll()"
   (mousedown)="$event.preventDefault()"
   role="listbox"
