@@ -28,9 +28,10 @@ interface SpeakerChip {
 }
 
 /**
- * One turn: a run of consecutive same-speaker segments folded into a single
- * block (the biggest perceived-quality gap vs Otter/Descript). `startS`/`endS`
- * span the whole run; `segs` keeps the underlying segments for karaoke.
+ * One bounded display turn: consecutive same-speaker segments folded into a
+ * paragraph, split before one monologue can create an unbounded fragment DOM.
+ * `startS`/`endS` span the block; `segs` keeps the underlying segments for
+ * karaoke and click-to-seek.
  */
 interface Turn {
   key: string;
@@ -154,12 +155,14 @@ export class AudioPanelComponent {
   /** Live text filter for the transcript turns (case-insensitive substring). */
   readonly query = signal("");
   /**
-   * Cap on how many turns render at once. A 1h meeting folds to hundreds of turns / thousands of
-   * `<button>` fragments, so materializing them all is tens of MB of DOM + layout. We render the
-   * first `RENDER_CAP` (always extended to include the turn the playhead is inside, so karaoke
-   * auto-scroll never targets an un-rendered row) until the user asks for the whole transcript.
+   * Hard render budgets for the collapsed transcript. `RENDER_CAP` bounds rows; `FRAGMENT_CAP`
+   * bounds the inner seek buttons even when a 1.5h single-speaker recording would otherwise fold
+   * into one giant turn. `TURN_FRAGMENT_CAP` splits only the display paragraph, never the source
+   * segments, so search/seek/karaoke keep their original coordinates and stable ids.
    */
   private readonly RENDER_CAP = 80;
+  private readonly FRAGMENT_CAP = 160;
+  private readonly TURN_FRAGMENT_CAP = 16;
   readonly transcriptExpanded = signal(false);
   /** The scrolling transcript container + one element per rendered turn. */
   private readonly scroller = viewChild<ElementRef<HTMLElement>>("scroller");
@@ -167,8 +170,10 @@ export class AudioPanelComponent {
     viewChildren<ElementRef<HTMLElement>>("turnRow");
 
   /**
-   * Fold consecutive same-speaker segments into turn blocks. A single derived
-   * `computed` over the input segments — the transcript's structural source.
+   * Fold consecutive same-speaker segments into bounded display turns. The prior unbounded fold
+   * had two long-meeting failure modes: a single-speaker recording still rendered every fragment
+   * despite `RENDER_CAP`, and repeated `cur.text += ...` copied a growing monologue string. Chunking
+   * plus one final `join` makes construction linear and gives the renderer a hard fragment budget.
    */
   readonly turns = computed<Turn[]>(() => {
     const segs = this.segments();
@@ -176,10 +181,13 @@ export class AudioPanelComponent {
     let cur: Turn | null = null;
     for (const s of segs) {
       const sp = s.speaker ?? null;
-      if (cur && (cur.speaker ?? null) === sp) {
+      if (
+        cur &&
+        (cur.speaker ?? null) === sp &&
+        cur.segs.length < this.TURN_FRAGMENT_CAP
+      ) {
         cur.segs.push(s);
         cur.endS = s.endS;
-        cur.text += (cur.text ? " " : "") + s.text;
       } else {
         cur = {
           key: `t${s.idx}`,
@@ -187,11 +195,14 @@ export class AudioPanelComponent {
           chip: this.speakerChip(sp),
           startS: s.startS,
           endS: s.endS,
-          text: s.text,
+          text: "",
           segs: [s],
         };
         out.push(cur);
       }
+    }
+    for (const turn of out) {
+      turn.text = turn.segs.map((s) => s.text).join(" ");
     }
     return out;
   });
@@ -217,25 +228,71 @@ export class AudioPanelComponent {
   });
 
   /**
-   * The turns actually rendered — the first `RENDER_CAP`, always extended to include the turn the
-   * playhead is inside (so karaoke auto-scroll never targets an un-rendered row), or ALL turns once
-   * the user expands or when the (possibly filtered) list is already within the cap. This bounds the
-   * DOM node count for a long meeting without breaking the play/seek/highlight surfaces.
+   * The turns actually rendered: a contiguous, hard-bounded window around the active turn. The old
+   * prefix window used `slice(0, activeIdx + 1)`, so seeking near the end of a 1.5h recording grew
+   * the nominal 80-turn cap back to the full transcript. This window grows out from the playhead
+   * while BOTH row and fragment budgets allow; at the start/search fallback it naturally grows
+   * forward. Expanding remains the explicit opt-in to render everything.
    */
   readonly renderedTurns = computed<Turn[]>(() => {
     const all = this.visibleTurns();
-    if (this.transcriptExpanded() || all.length <= this.RENDER_CAP) {
+    if (this.transcriptExpanded()) {
       return all;
     }
-    let cap = this.RENDER_CAP;
+
+    const fragmentCount = all.reduce((sum, turn) => sum + turn.segs.length, 0);
+    if (
+      all.length <= this.RENDER_CAP &&
+      fragmentCount <= this.FRAGMENT_CAP
+    ) {
+      return all;
+    }
+
+    // A receipt names the exact source segment. Prefer it over the first
+    // time-overlapping turn so heavily overlapping dual-stream segments cannot
+    // leave the requested proof outside the bounded window.
+    const flashSeg = this.flashSegId();
+    const flashIdx =
+      flashSeg === null
+        ? -1
+        : all.findIndex((turn) =>
+            turn.segs.some((segment) => segment.idx === flashSeg),
+          );
     const activeKey = this.activeTurnKey();
-    if (activeKey) {
-      const activeIdx = all.findIndex((t) => t.key === activeKey);
-      if (activeIdx >= 0) {
-        cap = Math.max(cap, activeIdx + 1);
+    const activeIdx =
+      flashIdx >= 0
+        ? flashIdx
+        : activeKey
+          ? all.findIndex((turn) => turn.key === activeKey)
+          : -1;
+    let start = activeIdx >= 0 ? activeIdx : 0;
+    let end = Math.min(all.length, start + 1);
+    let renderedFragments = all[start]?.segs.length ?? 0;
+
+    while (end - start < this.RENDER_CAP) {
+      let grew = false;
+      if (start > 0) {
+        const before = all[start - 1].segs.length;
+        if (renderedFragments + before <= this.FRAGMENT_CAP) {
+          start -= 1;
+          renderedFragments += before;
+          grew = true;
+        }
+      }
+      if (end < all.length && end - start < this.RENDER_CAP) {
+        const after = all[end].segs.length;
+        if (renderedFragments + after <= this.FRAGMENT_CAP) {
+          end += 1;
+          renderedFragments += after;
+          grew = true;
+        }
+      }
+      if (!grew) {
+        break;
       }
     }
-    return all.slice(0, cap);
+
+    return all.slice(start, end);
   });
 
   /** How many turns sit behind the "Show all" affordance (0 when the whole transcript is rendered). */
@@ -245,19 +302,20 @@ export class AudioPanelComponent {
 
   /**
    * The set of segment `idx`es whose [startS, endS) currently contains the playhead — the karaoke
-   * highlight targets. A single `computed`, scanned ONCE per `currentTime` tick (O(n)); the template
-   * then does an O(1) `.has(s.idx)` per fragment. Replaces the former `isActiveSegment()` METHOD
-   * binding, which Angular re-ran O(n) per fragment on EVERY change-detection pass (~4×/s during
-   * playback → an ~8k-eval/s storm for a 1h transcript). A Set (not a single key) preserves the
-   * original behavior of highlighting EVERY active fragment when me/others segments overlap in
-   * wall-clock time.
+   * highlight targets. A single `computed`, scanned ONCE per `currentTime` tick over the BOUNDED
+   * render window; the template then does an O(1) `.has(s.idx)` per fragment. Replaces the former
+   * `isActiveSegment()` METHOD binding, which Angular re-ran O(n) per fragment on EVERY
+   * change-detection pass (~4×/s during playback → an ~8k-eval/s storm for a 1h transcript). A Set
+   * (not a single key) preserves highlighting every overlapping fragment that is actually rendered.
    */
   readonly activeSegKeys = computed<Set<number>>(() => {
     const t = this.currentTime();
     const out = new Set<number>();
-    for (const s of this.segments()) {
-      if (t >= s.startS && t < s.endS) {
-        out.add(s.idx);
+    for (const turn of this.renderedTurns()) {
+      for (const s of turn.segs) {
+        if (t >= s.startS && t < s.endS) {
+          out.add(s.idx);
+        }
       }
     }
     return out;
@@ -357,6 +415,38 @@ export class AudioPanelComponent {
     );
   });
 
+  /**
+   * Release the receipt-specific window anchor after its pulse completes. The
+   * regular playhead can then resume moving the bounded window. Reduced-motion
+   * mode has no animation event, intentionally retaining its static proof
+   * highlight until the next user seek clears it.
+   */
+  onReceiptFlashEnd(segId: number): void {
+    if (this.flashSegId() === segId) {
+      this.clearReceiptFlash();
+    }
+  }
+
+  private clearReceiptFlash(): void {
+    this.flashSegId.set(null);
+  }
+
+  /**
+   * Reduced-motion disables the receipt animation, so no `animationend` can
+   * release its window anchor. Release it once playback leaves the exact source
+   * segment; until then the static reduced-motion highlight remains visible.
+   */
+  private clearReceiptFlashOutside(timeS: number): void {
+    const flashSeg = this.flashSegId();
+    if (flashSeg === null) {
+      return;
+    }
+    const target = this.segments().find((segment) => segment.idx === flashSeg);
+    if (!target || timeS < target.startS || timeS >= target.endS) {
+      this.clearReceiptFlash();
+    }
+  }
+
   private get el(): HTMLAudioElement | null {
     return this.audio()?.nativeElement ?? null;
   }
@@ -387,7 +477,7 @@ export class AudioPanelComponent {
   }
 
   /**
-   * Collapse the transcript back to the windowed `RENDER_CAP` — called from
+   * Collapse the transcript back to the bounded row/fragment window — called from
    * `DetailComponent.onTabBackgrounded` when this tab is detached (perf-audit
    * fix 2): a backgrounded tab with "Show all N turns" expanded retains the
    * FULL turn DOM off-screen (measured ~21k nodes + ~4k listeners on a
@@ -412,6 +502,7 @@ export class AudioPanelComponent {
    * window before that.
    */
   stopAndUnload(): void {
+    this.clearReceiptFlash();
     const el = this.el;
     if (!el) {
       return;
@@ -430,6 +521,7 @@ export class AudioPanelComponent {
     if (!el || dur <= 0) {
       return;
     }
+    this.clearReceiptFlash();
     const next = Math.min(dur, Math.max(0, el.currentTime + delta));
     el.currentTime = next;
     this.currentTime.set(next);
@@ -461,11 +553,13 @@ export class AudioPanelComponent {
   onTimeUpdate(): void {
     const el = this.el;
     if (el) {
+      this.clearReceiptFlashOutside(el.currentTime);
       this.currentTime.set(el.currentTime);
     }
   }
 
   onEnded(): void {
+    this.clearReceiptFlash();
     this.playing.set(false);
     this.currentTime.set(this.duration());
   }
@@ -483,6 +577,7 @@ export class AudioPanelComponent {
       1,
       Math.max(0, (event.clientX - rect.left) / rect.width),
     );
+    this.clearReceiptFlash();
     el.currentTime = ratio * dur;
     this.currentTime.set(el.currentTime);
   }
@@ -517,6 +612,7 @@ export class AudioPanelComponent {
         return;
     }
     event.preventDefault();
+    this.clearReceiptFlash();
     el.currentTime = next;
     this.currentTime.set(next);
   }
@@ -530,7 +626,7 @@ export class AudioPanelComponent {
     // Clear any lingering receipt pulse so a user-driven seek never leaves a
     // stray flash on an unrelated segment. The receipt path (`_applyReceiptSeek`)
     // re-arms the flash AFTER this call, so its own pulse survives.
-    this.flashSegId.set(null);
+    this.clearReceiptFlash();
     const el = this.el;
     if (!el) {
       const total = this.timelineTotal();
@@ -553,7 +649,7 @@ export class AudioPanelComponent {
     this.query.set("");
   }
 
-  /** Reveal the full transcript (drops the `RENDER_CAP` window). */
+  /** Reveal the full transcript (explicitly drops both render budgets). */
   showAllTurns(): void {
     this.transcriptExpanded.set(true);
   }

@@ -538,8 +538,9 @@
           <!-- RELATED (IA consolidation, 2026-07-19) — ONE merged, deduped panel of
                every relationship: inbound backlinks + incident link edges (deduped by
                neighbour) + ambient semantic suggestions, collapsed behind an "N related"
-               count and auto-hidden when empty. Self-loaded & gated: the panel owns its
-               fetch, skips it while `locked`, and re-asks on a session lock-tree change.
+               count; with no relations it degrades to a lone `+ Link`. Self-loaded &
+               gated: the panel owns its fetch, skips it while `locked`, and re-asks on
+               a session lock-tree change.
                `inlineWikilinkTitles` suppresses a Related chip for a neighbour the body
                already links inline via `[[Title]]` (no triplication). Hidden when embedded
                (the recording panel's Ask Brain tab owns relationships; the Note tab is
@@ -667,12 +668,14 @@
   @if (linkPickerTrigger(); as trigger) {
     <app-link-picker
       [anchorRect]="trigger.rect"
+      [anchorElement]="linkPickerAnchorElement()"
       [query]="linkPickerQuery()"
       [activeIndex]="linkPickerActiveIndex()"
       [excludeKind]="'note'"
       [excludeId]="note()?.id ?? null"
       (picked)="pickLinkCandidate($event)"
       (candidatesChange)="onLinkPickerCandidates($event)"
+      (repositionRequest)="repositionLinkPicker()"
     />
   }
 

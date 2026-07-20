@@ -8,11 +8,24 @@
   gap: var(--space-3);
 }
 
+.cx--prominent {
+  gap: var(--space-4);
+}
+
 /* Header row: the "Connections" label + the `+ Link` chooser. */
 .cx-head {
   display: flex;
   align-items: center;
   gap: var(--space-2);
+}
+
+.cx-prominent-title {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--text-primary);
+  font-size: 0.875rem;
+  font-weight: 650;
 }
 
 /* One labelled cluster (the merged Related chips, or the suggestion chips). */
@@ -89,6 +102,16 @@
 .cx-add-plus {
   font-size: 14px;
   line-height: 1;
+}
+
+/* Empty state: no relations yet → the panel is just a single quiet, left-aligned `+ Link`
+   affordance so a fresh note can still get its FIRST connection (linking must never be hidden). */
+.cx--empty {
+  gap: 0;
+}
+.cx-add--empty {
+  margin-left: 0;
+  align-self: flex-start;
 }
 
 /* The chooser's filter input (replaces the trigger while open). */
@@ -283,6 +306,23 @@
 }
 .cx-collapsed:hover .cx-chev {
   color: var(--text-secondary);
+}
+
+.cx--prominent .cx-collapsed {
+  padding: var(--space-1);
+  color: var(--text-primary);
+  font-size: 0.875rem;
+  letter-spacing: 0;
+  text-transform: none;
+}
+.cx--prominent .cx-collapsed-label {
+  letter-spacing: 0;
+}
+.cx--prominent .cx-add {
+  border-style: solid;
+  border-color: var(--border-strong);
+  background: var(--surface-input);
+  font-size: 0.8125rem;
 }
 
 /* --- Ambient semantic suggestions ("related, not yet linked") ----------- */
