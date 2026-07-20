@@ -91,6 +91,16 @@
   line-height: 1;
 }
 
+/* Empty state: no relations yet → the panel is just a single quiet, left-aligned `+ Link`
+   affordance so a fresh note can still get its FIRST connection (linking must never be hidden). */
+.cx--empty {
+  gap: 0;
+}
+.cx-add--empty {
+  margin-left: 0;
+  align-self: flex-start;
+}
+
 /* The chooser's filter input (replaces the trigger while open). */
 .cx-link-input {
   flex: 1 1 auto;
