@@ -3,6 +3,7 @@ import {
   Component,
   ElementRef,
   Injector,
+  OnInit,
   afterNextRender,
   computed,
   effect,
@@ -115,7 +116,7 @@ interface SuggestionRow {
   templateUrl: "./connections.component.html",
   styleUrl: "./connections.component.scss",
 })
-export class ConnectionsComponent {
+export class ConnectionsComponent implements OnInit {
   private readonly ipc = inject(IpcService);
   private readonly folders = inject(FoldersService);
   private readonly toast = inject(ToastService);
@@ -143,6 +144,10 @@ export class ConnectionsComponent {
    * a distinct relationship worth showing even if also linked inline.
    */
   readonly inlineWikilinkTitles = input<string[]>([]);
+  /** Start open on surfaces where relationships are primary context (meeting Note tab). */
+  readonly expandedByDefault = input(false);
+  /** Stronger visual hierarchy for a primary Related band; compact notes remain unchanged. */
+  readonly prominent = input(false);
 
   /** The visible edges for the current `(kind, id)`; `[]` while locked/loading. */
   readonly edges = signal<LinkEdge[]>([]);
@@ -160,6 +165,10 @@ export class ConnectionsComponent {
   /** The single-pick `+ Link` chooser element (the header `<input>`) for anchoring. */
   private readonly pickerAnchor =
     viewChild<ElementRef<HTMLElement>>("pickerAnchor");
+  /** Current button/input node passed to the teleported picker for motion filtering. */
+  readonly pickerAnchorElement = computed(
+    () => this.pickerAnchor()?.nativeElement ?? null,
+  );
 
   /** Whether the `+ Link` picker is open. */
   readonly pickerOpen = signal(false);
@@ -181,6 +190,8 @@ export class ConnectionsComponent {
     right: number;
     bottom: number;
   }>({ top: 0, left: 0, right: 0, bottom: 0 });
+  /** Coalesce a burst of captured scroll events into one post-render anchor read. */
+  private pickerRepositionQueued = false;
 
   /**
    * A candidate kind that is NOT a valid `link_items` endpoint (a {@link LinkKind}
@@ -363,16 +374,20 @@ export class ConnectionsComponent {
   );
 
   /**
-   * Whether the whole section renders at all: hide entirely when there are zero
-   * related rows AND zero suggestions (the panel is auto-hidden when empty — the
-   * near-zero-footprint "Related" IA). The `+ Link` chooser lives inside the
-   * section header, so hiding when empty means a brand-new item shows no
-   * relationship UI until it has one; that's the intended minimalist default (a
-   * user reaches linking via the note body `[[` / slash menu instead).
+   * Whether the section has rows to collapse/expand. With no rows the template
+   * keeps only the quiet `+ Link` trigger visible, so a fresh item can create its
+   * first relationship. This computed chooses the layout; it never gates the
+   * unlocked panel itself.
    */
   readonly hasAnything = computed(
     () => this.relatedCount() > 0 || this.suggestionRows().length > 0,
   );
+
+  ngOnInit(): void {
+    if (this.expandedByDefault()) {
+      this.expanded.set(true);
+    }
+  }
 
   /**
    * Load BOTH the edges and the inbound backlinks whenever `(kind, id)`,
@@ -661,8 +676,13 @@ export class ConnectionsComponent {
 
   /** Recompute the popover anchor rect from the header chooser input. */
   repositionPicker(): void {
+    if (this.pickerRepositionQueued) {
+      return;
+    }
+    this.pickerRepositionQueued = true;
     afterNextRender(
       () => {
+        this.pickerRepositionQueued = false;
         const el = this.pickerAnchor()?.nativeElement;
         if (!el) {
           return;

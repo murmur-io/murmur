@@ -62,6 +62,22 @@
 ## Run journal
 <!-- Append-only, newest first. -->
 
+### [2026-07-20 documents as link targets — PR #415] `documents.updated_at` is NULL → recency ORDER BY silently degrades
+- **Pattern:** added a documents leg to `list_link_candidates_visible` mirroring the notes leg,
+  incl. `ORDER BY d.updated_at DESC, d.id ASC`. But `insert_document` only writes `created_at`
+  (columns: `id,folder_id,name,text,kind,text_blob,created_at`) — it NEVER sets `updated_at`, so for
+  every real ingested document `updated_at IS NULL` and the empty-prefix "recency browse" collapsed to
+  the `d.id ASC` (UUID) tiebreaker. The notes leg is fine because `insert_note` sets
+  `updated_at = created_at`. Green tests hid it — each test query returned ≤1 doc, so intra-leg order
+  never mattered.
+- **Caught by:** adversarial-verifier (LOW finding, `.claude/tmp/link-documents-related/adversarial-verify.json`).
+- **Lesson:** documents and notes share the `documents` table but do NOT share column-population
+  invariants — a `document` row can have `NULL` `updated_at`/`title` where a `note` row never does.
+  Any ORDER BY / COALESCE / filter you copy from the notes leg to a documents leg must assume those
+  columns are NULL: order documents by `COALESCE(d.updated_at, d.created_at) DESC`, title by
+  `COALESCE(NULLIF(TRIM(d.title),''), d.name)`. A ≤1-row-per-query test set can't catch an intra-leg
+  ordering bug — seed 2+ same-leg rows with distinct timestamps when the ordering is load-bearing.
+
 ### [2026-07-05 password-links + Touch ID — #195/#196] cross-lang crypto salt + biometric MK cache
 - **Pattern:** (a) Password link-shares never decrypted — the Argon2id salt had NO protocol field, so
   the client's RANDOM salt was lost the instant the share sealed (a green Rust round-trip test hid it).

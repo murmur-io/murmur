@@ -1045,12 +1045,12 @@ export class IpcService {
   }
 
   /**
-   * Ask a grounded question about a meeting's transcript (chat with the meeting).
+   * Ask a grounded question about a meeting transcript and selected sources.
    *
    * `explicitSources` (source-scoped Brain) OPTIONALLY pins the answer to exactly
    * the passed sources + their links (each `{kind, id}`; an extra `title` is
-   * ignored backend-side). Omitting it / `[]` / `null` keeps today's whole-vault
-   * behavior grounded on this meeting; a NON-empty array narrows the scope. Only
+   * ignored backend-side). Omitting it / `[]` / `null` keeps the transcript-only
+   * behavior; a NON-empty array adds those gated sources to the grounding. Only
    * sent when non-empty so existing callers are unaffected.
    */
   chatMeeting(

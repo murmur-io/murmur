@@ -26,10 +26,10 @@ const STARTERS: readonly string[] = [
 
 /**
  * "Chat with this meeting" — a grounded Q&A panel over a single meeting's
- * transcript. It is a presentational sibling of the timeline + analysis cards:
- * the parent owns the meeting; this component owns only the conversation it
- * builds via {@link IpcService.chatMeeting}, which answers strictly from that
- * meeting's transcript.
+ * transcript plus visibility-gated sources the user selects. It is a
+ * presentational sibling of the timeline + analysis cards: the parent owns the
+ * meeting; this component owns only the conversation it builds via
+ * {@link IpcService.chatMeeting}.
  *
  * Lives in its own file so its inline styles get their own per-component
  * `anyComponentStyle` budget (the detail component's styles are near the cap).
@@ -50,7 +50,7 @@ export class MeetingChatComponent {
   private readonly injector = inject(Injector);
   private readonly sourceScope = inject(SourceScopeService);
 
-  /** The meeting whose transcript grounds every answer. */
+  /** The anchor meeting whose transcript supplies the primary grounding. */
   readonly meetingId = input.required<string>();
   /**
    * The meeting's display title — the label of the anchor chip pre-filled into

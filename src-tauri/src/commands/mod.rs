@@ -2483,8 +2483,41 @@ pub(crate) fn rename_meeting_inner(
     Ok(())
 }
 
+/// Pack meeting-chat's additional explicit sources under one fair, provider-specific budget.
+/// The anchor meeting is already represented by the primary transcript, so remove it before
+/// packing; otherwise its large generated note can consume the source budget before a note the
+/// user added. The remaining deduped set enters the visibility-gated budgeted builder ONCE, keeping
+/// one global neighbour dedupe and one global link-expansion cap across the whole scope.
+pub(crate) fn pack_chat_pinned_sources(
+    db: &crate::storage::Db,
+    meeting_id: &str,
+    explicit_sources: &[crate::storage::models::SourceRef],
+    provider_id: &str,
+    unlocked: &std::collections::HashSet<String>,
+) -> Result<String, AppError> {
+    let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    let mut filtered = Vec::new();
+    for source in explicit_sources {
+        if source.kind == crate::links::LinkKind::Meeting && source.id == meeting_id {
+            continue;
+        }
+        let key = (source.kind.as_str().to_string(), source.id.clone());
+        if !seen.insert(key) {
+            continue;
+        }
+        filtered.push(source.clone());
+    }
+    let budget = crate::summarize::vault_context::budget_for(provider_id)
+        .min(crate::summarize::chat::MAX_PINNED_SOURCE_CHARS);
+    let (corpus, _) =
+        crate::summarize::vault_context::build_vault_context_pinned_visible_with_budget(
+            db, &filtered, budget, unlocked,
+        )?;
+    Ok(corpus)
+}
+
 /// Grounded Q&A over a meeting's transcript ("chat with the meeting"). The configured
-/// provider answers strictly from the transcript + the running conversation history.
+/// provider answers strictly from the transcript, explicitly pinned sources, and running history.
 #[tauri::command]
 pub async fn chat_meeting(
     state: State<'_, AppState>,
@@ -2509,7 +2542,7 @@ pub async fn chat_meeting(
             "this meeting has no transcript to chat about yet".into(),
         ));
     }
-    let mut transcript = segments
+    let transcript = segments
         .iter()
         .map(|s| format!("[{:.0}s] {}", s.start_s, s.text.trim()))
         .collect::<Vec<_>>()
@@ -2531,19 +2564,13 @@ pub async fn chat_meeting(
     // primary context, the pinned items add cross-item context. Every leg is `unlocked`-gated (a
     // sealed pinned source/neighbour contributes NOTHING — never a leak). `None`/empty ⇒ byte-
     // identical to the pre-change transcript-only grounding.
+    let mut pinned_sources = String::new();
     if let Some(sources) = explicit_sources.filter(|s| !s.is_empty()) {
         let ask_conn =
             crate::summarize::roles::provider_target(crate::summarize::roles::Role::Ask, &config)
                 .connection;
-        let (pinned, _) = crate::summarize::vault_context::build_vault_context_pinned_visible(
-            &state.db, &sources, &ask_conn, &unlocked,
-        )?;
-        if !pinned.trim().is_empty() {
-            transcript.push_str(
-                "\n\n=== LINKED NOTES & MEETINGS (the user pinned these as additional context) ===\n",
-            );
-            transcript.push_str(&pinned);
-        }
+        pinned_sources =
+            pack_chat_pinned_sources(&state.db, &meeting_id, &sources, &ask_conn, &unlocked)?;
     }
     // ASK role: meeting chat is a Q&A surface. With role keys absent this resolves to the same
     // default provider as before (the legacy chat path always ignored `brain_backend`).
@@ -2553,8 +2580,13 @@ pub async fn chat_meeting(
         &state.heavy_inference,
     )?;
     let memory_brief = gated_memory_brief_for_injection(state.inner(), &unlocked, &question);
-    let (system, user) =
-        crate::summarize::chat::build(&transcript, &history, &question, &memory_brief);
+    let (system, user) = crate::summarize::chat::build_with_sources(
+        &transcript,
+        &pinned_sources,
+        &history,
+        &question,
+        &memory_brief,
+    );
     provider.complete(&system, &user).await
 }
 

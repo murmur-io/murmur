@@ -16,7 +16,10 @@ import {
 import { IpcService } from "../../../core/ipc.service";
 import type { NoteCitation } from "../../../core/models";
 import { DebounceService } from "../../../services/debounce.service";
-import { RepositionOnScrollDirective } from "../note-brain-popover/reposition-on-scroll.directive";
+import {
+  RepositionOnScrollDirective,
+  type RepositionReason,
+} from "../note-brain-popover/reposition-on-scroll.directive";
 import { TeleportToBodyDirective } from "../../../design-system/teleport-to-body.directive";
 
 /** How long to wait after the last keystroke before re-querying the backend. */
@@ -33,6 +36,11 @@ const PAGE_SIZE = 40;
 const SCROLL_LOAD_THRESHOLD_PX = 56;
 /** Keyboard ↑/↓: pull the next page once the active row is within this many rows of the end. */
 const KEYBOARD_LOAD_AHEAD_ROWS = 3;
+/** CSS cap plus the viewport geometry used by the fixed overlay. */
+const POPOVER_MAX_HEIGHT_PX = 320;
+const POPOVER_MIN_BROWSE_HEIGHT_PX = 160;
+const POPOVER_GAP_PX = 4;
+const VIEWPORT_MARGIN_PX = 8;
 
 /**
  * The inline `[[` / slash-menu "Link to note" autocomplete (note-editor Fix 2) —
@@ -88,6 +96,8 @@ export class LinkPickerComponent {
     right: number;
     bottom: number;
   }>();
+  /** Live owner element for filtering ancestor CSS-motion reposition events. */
+  readonly anchorElement = input<HTMLElement | null>(null);
   /** The live filter text, owned by the host (the text typed since the trigger). */
   readonly query = input<string>("");
   /** Which row is keyboard-highlighted, owned by the host. */
@@ -105,6 +115,8 @@ export class LinkPickerComponent {
   readonly picked = output<NoteCitation>();
   /** The resolved candidate list for the CURRENT query — the host's ↑/↓/Enter act on this. */
   readonly candidatesChange = output<NoteCitation[]>();
+  /** Ask the owning surface to re-measure its live input/caret after an outer scroll. */
+  readonly repositionRequest = output<void>();
 
   /** The live candidate rows for the current query. */
   readonly candidates = signal<NoteCitation[]>([]);
@@ -124,6 +136,14 @@ export class LinkPickerComponent {
   private hasMore = false;
   /** Re-entrancy guard: one append fetch at a time. */
   private loadingMore = false;
+  /** One pending paint-time position update at most. */
+  private repositionQueued = false;
+  /** Content/viewport changes require one fresh natural-size measurement. */
+  private needsFullFit = true;
+  /** Cached natural geometry lets scroll-follow avoid synchronous layout reads. */
+  private naturalHeight = 0;
+  private positionedHeight = 0;
+  private positionedWidth = 300;
 
   constructor() {
     // Fetch on every query change (debounced) — a legitimate signal-writing effect
@@ -139,7 +159,7 @@ export class LinkPickerComponent {
     // Re-position whenever the anchor rect changes (a fresh caret position).
     effect(() => {
       this.anchorRect(); // track
-      this.reposition();
+      this.scheduleReposition();
     });
     // Keyboard nav over a paginated list: keep the active row scrolled into
     // view (the host moves `activeIndex` without focus ever entering the
@@ -160,6 +180,12 @@ export class LinkPickerComponent {
         },
         { injector: this.injector },
       );
+    });
+    // The owning trigger may change size when it swaps from a compact button to
+    // the query input. Ask for one post-mount measurement instead of trusting
+    // the button rect captured by the opening click.
+    afterNextRender(() => this.requestReposition(), {
+      injector: this.injector,
     });
     this.destroyRef.onDestroy(() => this.debounce.cancel(DEBOUNCE_KEY));
   }
@@ -190,7 +216,7 @@ export class LinkPickerComponent {
       this.candidatesChange.emit(rows);
       // The list height changed (fresh page) — re-fit around the caret so a
       // flipped-above popover never grows down over the line being typed.
-      this.reposition();
+      this.requestReposition();
     } catch {
       if (seq === this.requestSeq) {
         this.hasMore = false;
@@ -235,7 +261,7 @@ export class LinkPickerComponent {
         const next = [...this.candidates(), ...fresh];
         this.candidates.set(next);
         this.candidatesChange.emit(next);
-        this.reposition();
+        this.requestReposition();
       }
     } catch {
       if (seq === this.requestSeq) {
@@ -265,30 +291,97 @@ export class LinkPickerComponent {
     this.picked.emit(candidate);
   }
 
-  reposition(): void {
+  /**
+   * The directive saw viewport/ancestor movement; only the owner can measure
+   * the live anchor. Scroll/motion can reuse the cached popover geometry;
+   * content and viewport-size changes request one fresh fit.
+   */
+  requestReposition(
+    reason: RepositionReason | "content" = "content",
+  ): void {
+    if (reason === "resize" || reason === "content") {
+      this.needsFullFit = true;
+    }
+    this.repositionRequest.emit();
+  }
+
+  private scheduleReposition(): void {
+    if (this.repositionQueued) {
+      return;
+    }
+    this.repositionQueued = true;
     afterNextRender(
       () => {
+        this.repositionQueued = false;
         const el = this.popoverEl()?.nativeElement;
         if (!el) {
           return;
         }
         const rect = this.anchorRect();
-        const width = el.offsetWidth || 300;
-        const height = el.offsetHeight;
+        if (this.needsFullFit || this.naturalHeight <= 0) {
+          // All layout reads happen before any style write. The previous
+          // maxHeight write -> offsetHeight read forced a synchronous layout on
+          // every captured scroll frame and could blank WKWebView's fixed layer.
+          this.positionedWidth = el.offsetWidth || 300;
+          const borderHeight = el.offsetHeight - el.clientHeight;
+          this.naturalHeight = Math.min(
+            el.scrollHeight + borderHeight,
+            POPOVER_MAX_HEIGHT_PX,
+          );
+          this.needsFullFit = false;
+        }
+
+        const width = this.positionedWidth;
         const vw = window.innerWidth;
         const vh = window.innerHeight;
 
         let left = rect.left;
-        left = Math.max(8, Math.min(left, vw - width - 8));
+        left = Math.max(
+          VIEWPORT_MARGIN_PX,
+          Math.min(left, vw - width - VIEWPORT_MARGIN_PX),
+        );
 
-        // Prefer BELOW the caret; flip above when there isn't room below.
-        let top = rect.bottom + 4;
-        if (top + height > vh - 8) {
-          top = Math.max(8, rect.top - height - 4);
+        // Prefer below whenever it offers a useful scrollport; otherwise use
+        // the roomier side. A fixed 320px list used to flip above and then
+        // clamp to 8px in the default 900x680 window, overlapping its own input
+        // by ~17px. Cached natural height keeps scroll-follow layout-read-free.
+        const roomBelow = Math.max(
+          0,
+          vh -
+            VIEWPORT_MARGIN_PX -
+            rect.bottom -
+            POPOVER_GAP_PX,
+        );
+        const roomAbove = Math.max(
+          0,
+          rect.top - POPOVER_GAP_PX - VIEWPORT_MARGIN_PX,
+        );
+        const placeBelow =
+          roomBelow >=
+            Math.min(this.naturalHeight, POPOVER_MIN_BROWSE_HEIGHT_PX) ||
+          roomBelow >= roomAbove;
+        const available = placeBelow ? roomBelow : roomAbove;
+        const height = Math.floor(
+          Math.min(this.naturalHeight, available),
+        );
+        let top = placeBelow
+          ? rect.bottom + POPOVER_GAP_PX
+          : rect.top - height - POPOVER_GAP_PX;
+        top = Math.max(
+          VIEWPORT_MARGIN_PX,
+          Math.min(top, vh - height - VIEWPORT_MARGIN_PX),
+        );
+
+        if (height !== this.positionedHeight) {
+          this.positionedHeight = height;
+          el.style.maxHeight = `${height}px`;
         }
-
-        el.style.left = `${Math.round(left)}px`;
-        el.style.top = `${Math.round(top)}px`;
+        const transform = `translate3d(${Math.round(left)}px, ${Math.round(top)}px, 0)`;
+        if (el.style.transform !== transform) {
+          // Compositor-only movement while the owning pane scrolls. No top/left
+          // layout mutation, so already-painted candidate rows stay resident.
+          el.style.transform = transform;
+        }
       },
       { injector: this.injector },
     );
