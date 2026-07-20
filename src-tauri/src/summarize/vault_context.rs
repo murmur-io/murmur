@@ -400,10 +400,150 @@ pub fn pack_pinned_org_item(db: &Db, item_id: &str, provider_id: &str) -> Result
     Ok(format!("{header}{body}"))
 }
 
+/// Fairly pack already-gated explicit-source sections into one caller-provided budget. Each
+/// section gets a deterministic share before any earlier source can consume the remainder.
+fn fair_pack_explicit_sections(
+    sections: Vec<(String, Vec<VaultSource>)>,
+    budget: usize,
+) -> (String, Vec<VaultSource>) {
+    const SEPARATOR: &str = "\n\n";
+
+    if sections.is_empty() || budget == 0 {
+        return (String::new(), Vec::new());
+    }
+    let separator_chars = SEPARATOR
+        .chars()
+        .count()
+        .saturating_mul(sections.len().saturating_sub(1))
+        .min(budget);
+    let content_budget = budget.saturating_sub(separator_chars);
+    let per_section = content_budget / sections.len();
+    let mut remainder = content_budget % sections.len();
+    let mut corpus = String::new();
+    let mut sources = Vec::new();
+
+    for (section, section_sources) in sections {
+        let extra = usize::from(remainder > 0);
+        remainder = remainder.saturating_sub(extra);
+        let quota = per_section.saturating_add(extra);
+        if quota == 0 {
+            continue;
+        }
+        let chunk: String = section.chars().take(quota).collect();
+        if chunk.trim().is_empty() {
+            continue;
+        }
+        if !corpus.is_empty() {
+            corpus.push_str(SEPARATOR);
+        }
+        corpus.push_str(&chunk);
+        sources.extend(section_sources);
+    }
+    (corpus, sources)
+}
+
+/// Budgeted core for the pinned Ask corpus. Explicit sources are deduped and packed fairly under
+/// `budget`; then ONE global neighbour pass applies ONE dedupe set and ONE [`LINK_CONTEXT_CAP`].
+/// Callers with a tighter surface cap (meeting chat) use this directly.
+pub(crate) fn build_vault_context_pinned_visible_with_budget(
+    db: &Db,
+    sources: &[SourceRef],
+    budget: usize,
+    unlocked: &HashSet<String>,
+) -> Result<(String, Vec<VaultSource>)> {
+    if budget == 0 || sources.is_empty() {
+        return Ok((String::new(), Vec::new()));
+    }
+
+    // Dedupe explicit identities while preserving picker order.
+    let mut explicit_keys: HashSet<(String, String)> = HashSet::new();
+    let mut explicit_sources: Vec<&SourceRef> = Vec::new();
+    for source in sources {
+        let key = (source.kind.as_str().to_string(), source.id.clone());
+        if explicit_keys.insert(key) {
+            explicit_sources.push(source);
+        }
+    }
+
+    // Build each EXPLICIT source as a content-only section. Each read remains behind the same
+    // visible packer; link expansion deliberately does not happen here.
+    let mut sections: Vec<(String, Vec<VaultSource>)> = Vec::new();
+    for source in &explicit_sources {
+        match source.kind {
+            LinkKind::Meeting => {
+                if let Some(meeting) = db.get_meeting(&source.id)? {
+                    let (section, section_sources) =
+                        pack_meetings(db, vec![meeting], budget, unlocked)?;
+                    if !section.trim().is_empty() {
+                        sections.push((section, section_sources));
+                    }
+                }
+            }
+            LinkKind::Note | LinkKind::Document => {
+                let mut section = String::new();
+                if pack_notes(db, &source.id, budget, &mut section, unlocked)?
+                    && !section.trim().is_empty()
+                {
+                    sections.push((section, Vec::new()));
+                }
+            }
+        }
+    }
+    let (mut corpus, mut vault_sources) = fair_pack_explicit_sections(sections, budget);
+
+    // ONE global link expansion: one explicit set, one neighbour dedupe, one cap across ALL sources.
+    let mut seen_neighbours: HashSet<(String, String)> = HashSet::new();
+    let mut neighbours: Vec<(LinkKind, String)> = Vec::new();
+    'outer: for source in &explicit_sources {
+        let edges = db.links_for_visible(source.kind, &source.id, unlocked)?;
+        for edge in edges {
+            if edge.status != "active" {
+                continue;
+            }
+            let Some(other_kind) = LinkKind::parse(&edge.other_kind) else {
+                continue;
+            };
+            let key = (edge.other_kind, edge.other_id);
+            if explicit_keys.contains(&key) || !seen_neighbours.insert(key.clone()) {
+                continue;
+            }
+            neighbours.push((other_kind, key.1));
+            if neighbours.len() >= LINK_CONTEXT_CAP {
+                break 'outer;
+            }
+        }
+    }
+
+    // Neighbours fill only budget left after every explicit source got its fair share.
+    for (kind, id) in neighbours {
+        let remaining = budget.saturating_sub(corpus.chars().count());
+        if remaining == 0 {
+            break;
+        }
+        match kind {
+            LinkKind::Meeting => {
+                if let Some(meeting) = db.get_meeting(&id)? {
+                    let (chunk, chunk_sources) =
+                        pack_meetings(db, vec![meeting], remaining, unlocked)?;
+                    corpus.push_str(&chunk);
+                    vault_sources.extend(chunk_sources);
+                }
+            }
+            LinkKind::Note | LinkKind::Document => {
+                let mut chunk = String::new();
+                pack_notes(db, &id, remaining, &mut chunk, unlocked)?;
+                corpus.push_str(&chunk);
+            }
+        }
+    }
+    Ok((corpus, vault_sources))
+}
+
 /// note↔meeting-links PR-2 — build a PINNED corpus from an EXPLICIT source list plus its capped,
 /// gated link-expansion. This is the source-scoped Ask path: the corpus is EXACTLY the listed
-/// `sources` (packed FIRST, at full budget) plus up to [`LINK_CONTEXT_CAP`] of their ACTIVE linked
-/// neighbours (packed AFTER, filling remaining budget only) — NEVER a vault-wide search.
+/// `sources` (packed FIRST, fairly under the provider budget) plus up to [`LINK_CONTEXT_CAP`] of
+/// their ACTIVE linked neighbours (packed AFTER, filling remaining budget only) — NEVER a
+/// vault-wide search.
 ///
 /// GATE (E9, load-bearing): every leg reads only through the `*_visible` readers against the live
 /// `unlocked` set. A meeting source packs through [`pack_meetings`] (its `get_note_if_visible`
@@ -421,91 +561,7 @@ pub fn build_vault_context_pinned_visible(
     provider_id: &str,
     unlocked: &HashSet<String>,
 ) -> Result<(String, Vec<VaultSource>)> {
-    let budget = budget_for(provider_id);
-    let mut corpus = String::new();
-    let mut vault_sources: Vec<VaultSource> = Vec::new();
-
-    // The explicit set, for dedupe against the link-expansion below (a neighbour that IS an explicit
-    // source is already packed — never pack it twice).
-    let explicit: HashSet<(&str, &str)> = sources
-        .iter()
-        .map(|s| (s.kind.as_str(), s.id.as_str()))
-        .collect();
-
-    // ── 1) Pack the EXPLICIT sources first (full budget). ──
-    for src in sources {
-        if corpus.len() >= budget {
-            break;
-        }
-        match src.kind {
-            LinkKind::Meeting => {
-                // `pack_meetings` gates via `get_note_if_visible` — a sealed meeting packs nothing +
-                // adds no source. An unknown id yields `None` inside the packer → skipped.
-                if let Some(m) = db.get_meeting(&src.id)? {
-                    let (mut chunk_corpus, chunk_sources) =
-                        pack_meetings(db, vec![m], budget.saturating_sub(corpus.len()), unlocked)?;
-                    corpus.push_str(&chunk_corpus);
-                    chunk_corpus.clear();
-                    vault_sources.extend(chunk_sources);
-                }
-            }
-            LinkKind::Note | LinkKind::Document => {
-                pack_notes(db, &src.id, budget, &mut corpus, unlocked)?;
-            }
-        }
-    }
-
-    // ── 2) Link-aware expansion: gather ACTIVE neighbours of each explicit source, deduped across
-    // sources AND against the explicit set, capped at LINK_CONTEXT_CAP total, then pack AFTER the
-    // explicit sources (remaining budget only). `links_for_visible` is both-endpoint gated, so a
-    // sealed neighbour is never enumerated. ──
-    let mut seen_neighbours: HashSet<(String, String)> = HashSet::new();
-    let mut neighbours: Vec<(LinkKind, String)> = Vec::new();
-    'outer: for src in sources {
-        let edges = db.links_for_visible(src.kind, &src.id, unlocked)?;
-        for edge in edges {
-            // Only ACTIVE edges expand context (skip merely-suggested/dismissed relations).
-            if edge.status != "active" {
-                continue;
-            }
-            let Some(other_kind) = LinkKind::parse(&edge.other_kind) else {
-                continue;
-            };
-            // Never re-pack an explicit source, and dedupe the same neighbour across sources.
-            if explicit.contains(&(other_kind.as_str(), edge.other_id.as_str())) {
-                continue;
-            }
-            let key = (edge.other_kind.clone(), edge.other_id.clone());
-            if !seen_neighbours.insert(key) {
-                continue;
-            }
-            neighbours.push((other_kind, edge.other_id));
-            if neighbours.len() >= LINK_CONTEXT_CAP {
-                break 'outer;
-            }
-        }
-    }
-    for (kind, id) in neighbours {
-        if corpus.len() >= budget {
-            break;
-        }
-        match kind {
-            LinkKind::Meeting => {
-                if let Some(m) = db.get_meeting(&id)? {
-                    let (mut chunk_corpus, chunk_sources) =
-                        pack_meetings(db, vec![m], budget.saturating_sub(corpus.len()), unlocked)?;
-                    corpus.push_str(&chunk_corpus);
-                    chunk_corpus.clear();
-                    vault_sources.extend(chunk_sources);
-                }
-            }
-            LinkKind::Note | LinkKind::Document => {
-                pack_notes(db, &id, budget, &mut corpus, unlocked)?;
-            }
-        }
-    }
-
-    Ok((corpus, vault_sources))
+    build_vault_context_pinned_visible_with_budget(db, sources, budget_for(provider_id), unlocked)
 }
 
 #[cfg(test)]
@@ -748,6 +804,100 @@ mod tests {
         }
     }
 
+    /// Meeting-chat regression: a note the user EXPLICITLY picked must still reach the provider
+    /// prompt when the anchor meeting transcript is longer than the transcript budget. The old
+    /// command appended the pinned corpus after the transcript and then truncated the combined
+    /// string from the front, dropping the picked note in full for every >40k-char meeting.
+    #[test]
+    fn pinned_note_survives_long_meeting_chat_prompt_budget() {
+        let db = temp_db();
+        seed_note(
+            &db,
+            "anchor",
+            "Anchor meeting",
+            &format!("ANCHOR-NOTE {}", "a".repeat(50_000)),
+            None,
+        );
+        seed_folder(&db, "notes-open");
+        seed_doc_note(
+            &db,
+            "note-picked",
+            "notes-open",
+            "Picked plan",
+            "The launch codename is SOURCE-ONLY-ORCHID.",
+        );
+
+        let pinned = crate::commands::pack_chat_pinned_sources(
+            &db,
+            "anchor",
+            &[m_src("anchor"), n_src("note-picked")],
+            "anthropic",
+            &HashSet::new(),
+        )
+        .unwrap();
+        assert!(
+            pinned.contains("SOURCE-ONLY-ORCHID"),
+            "fixture: the gated explicit-source packer must return the picked note"
+        );
+        assert!(
+            !pinned.contains("ANCHOR-NOTE"),
+            "the primary anchor is already represented by the transcript and must not consume the source budget"
+        );
+
+        let transcript = "transcript ".repeat(4_000);
+        let (system, _) = crate::summarize::chat::build_with_sources(
+            &transcript,
+            &pinned,
+            &[],
+            "What is the codename?",
+            "",
+        );
+
+        assert!(
+            system.contains("SOURCE-ONLY-ORCHID"),
+            "an explicitly picked note must never be truncated away by the anchor transcript"
+        );
+    }
+
+    #[test]
+    fn budgeted_pinned_corpus_fairly_keeps_each_deduped_explicit_source() {
+        let db = temp_db();
+        seed_folder(&db, "notes-open");
+        seed_doc_note(
+            &db,
+            "large-a",
+            "notes-open",
+            "Large A",
+            &format!("EXPLICIT-A-FACT {}", "a".repeat(2_000)),
+        );
+        seed_doc_note(
+            &db,
+            "large-b",
+            "notes-open",
+            "Large B",
+            &format!("EXPLICIT-B-FACT {}", "b".repeat(2_000)),
+        );
+
+        let (corpus, _) = build_vault_context_pinned_visible_with_budget(
+            &db,
+            &[n_src("large-a"), n_src("large-a"), n_src("large-b")],
+            500,
+            &HashSet::new(),
+        )
+        .unwrap();
+        assert!(corpus.contains("EXPLICIT-A-FACT"));
+        assert!(
+            corpus.contains("EXPLICIT-B-FACT"),
+            "a large first explicit source must not erase the next one: {corpus}"
+        );
+        assert_eq!(
+            corpus.matches("id:large-a").count(),
+            1,
+            "duplicate explicit identities must pack once"
+        );
+        assert!(corpus.chars().count() <= 500);
+    }
+
     /// The pinned corpus contains EXACTLY the listed sources — a meeting NOT in `sources` never
     /// appears, even though it exists and would match a whole-vault search.
     #[test]
@@ -812,6 +962,18 @@ mod tests {
             "sealed note source leaked into pinned corpus (E9): {corpus}"
         );
         assert!(sources.is_empty(), "no source chip for a sealed source");
+        let chat_corpus = crate::commands::pack_chat_pinned_sources(
+            &db,
+            "open-anchor",
+            &[m_src("m-sealed"), n_src("note-sealed")],
+            "anthropic",
+            &nothing,
+        )
+        .unwrap();
+        assert!(
+            chat_corpus.is_empty(),
+            "meeting-chat's fair source packer must preserve the same fail-closed gate"
+        );
 
         // Session-unlock the folder ⇒ the pinned sources legitimately reappear.
         let mut unlocked = HashSet::new();
@@ -825,6 +987,16 @@ mod tests {
         .unwrap();
         assert!(corpus2.contains("SEALED-BODY"), "unlocked meeting source reappears");
         assert!(corpus2.contains("SEALED-NOTE-BODY"), "unlocked note source reappears");
+        let chat_corpus2 = crate::commands::pack_chat_pinned_sources(
+            &db,
+            "open-anchor",
+            &[m_src("m-sealed"), n_src("note-sealed")],
+            "anthropic",
+            &unlocked,
+        )
+        .unwrap();
+        assert!(chat_corpus2.contains("SEALED-BODY"));
+        assert!(chat_corpus2.contains("SEALED-NOTE-BODY"));
     }
 
     /// Link-aware expansion pulls in an explicit source's ACTIVE linked neighbour's content — and a
@@ -862,6 +1034,70 @@ mod tests {
         assert!(
             !corpus.contains("SEALED-NEIGHBOUR-BODY"),
             "a SEALED linked neighbour must be dropped by the gate (E9): {corpus}"
+        );
+    }
+
+    /// Meeting-chat must invoke ONE global pinned builder, not one builder per explicit source:
+    /// two sources with >8 ACTIVE neighbours each still expand at most LINK_CONTEXT_CAP neighbours
+    /// TOTAL, and a neighbour shared by both sources is packed only once.
+    #[test]
+    fn chat_pinned_sources_share_one_global_link_cap_and_neighbour_dedupe() {
+        let db = temp_db();
+        seed_note(&db, "explicit-a", "Explicit A", "EXPLICIT-A-BODY", None);
+        seed_note(&db, "explicit-b", "Explicit B", "EXPLICIT-B-BODY", None);
+        seed_note(
+            &db,
+            "shared-n",
+            "Shared neighbour",
+            "NEIGHBOUR-SHARED",
+            None,
+        );
+        // Insert the shared edge first for BOTH sources so the pre-fix N-builders path packs it
+        // twice; the corrected single builder's global seen-set must collapse it.
+        db.upsert_manual_link("meeting", "explicit-a", "meeting", "shared-n")
+            .unwrap();
+        db.upsert_manual_link("meeting", "explicit-b", "meeting", "shared-n")
+            .unwrap();
+
+        for owner in ["a", "b"] {
+            for i in 0..10 {
+                let id = format!("{owner}-neighbour-{i}");
+                let marker = format!("NEIGHBOUR-{owner}-{i}");
+                seed_note(&db, &id, &format!("{owner} neighbour {i}"), &marker, None);
+                db.upsert_manual_link("meeting", &format!("explicit-{owner}"), "meeting", &id)
+                    .unwrap();
+            }
+        }
+
+        let corpus = crate::commands::pack_chat_pinned_sources(
+            &db,
+            "primary-anchor",
+            &[m_src("explicit-a"), m_src("explicit-b")],
+            "anthropic",
+            &HashSet::new(),
+        )
+        .unwrap();
+        assert!(corpus.contains("EXPLICIT-A-BODY"));
+        assert!(corpus.contains("EXPLICIT-B-BODY"));
+
+        let mut expanded_unique = 0usize;
+        let mut expanded_occurrences = corpus.matches("NEIGHBOUR-SHARED").count();
+        expanded_unique += usize::from(corpus.contains("NEIGHBOUR-SHARED"));
+        for owner in ["a", "b"] {
+            for i in 0..10 {
+                let marker = format!("NEIGHBOUR-{owner}-{i}");
+                let occurrences = corpus.matches(&marker).count();
+                expanded_unique += usize::from(occurrences > 0);
+                expanded_occurrences += occurrences;
+            }
+        }
+        assert_eq!(
+            expanded_unique, LINK_CONTEXT_CAP,
+            "all explicit sources must share exactly ONE global neighbour cap in this full-budget fixture: {corpus}"
+        );
+        assert_eq!(
+            expanded_occurrences, expanded_unique,
+            "the same neighbour must never be packed twice across explicit sources"
         );
     }
 

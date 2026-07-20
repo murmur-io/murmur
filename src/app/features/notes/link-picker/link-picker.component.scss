@@ -1,6 +1,6 @@
 /* The link-insertion autocomplete floats OVER the editor body → OPAQUE overlay
    (T3): --surface-overlay, --border-strong, --shadow-lg, backdrop-filter:none.
-   Never the frosted .card. Positioned in JS (top/left set from the caret rect). */
+   Never the frosted .card. Positioned in JS with a compositor transform. */
 :host {
   position: fixed;
   inset: 0;
@@ -12,6 +12,8 @@
   position: fixed;
   top: 0;
   left: 0;
+  transform: translate3d(0, 0, 0);
+  will-change: transform;
   /* Teleported to <body> (appTeleportToBody) so `position: fixed` anchors to the
      viewport, never a filtered/transformed ancestor; must beat all app chrome. */
   z-index: var(--z-overlay);
@@ -21,6 +23,7 @@
      visible vault now, so give browsing more viewport than the old top-8. */
   max-height: 320px;
   overflow-y: auto;
+  overscroll-behavior: contain;
   pointer-events: auto;
   display: flex;
   flex-direction: column;

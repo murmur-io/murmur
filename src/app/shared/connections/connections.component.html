@@ -1,72 +1,145 @@
 <!-- Never surface (or offer to add) relationships behind a lock: the whole panel is
      suppressed while `locked`. When UNLOCKED, linking is ALWAYS reachable: with relations
      the panel is COLLAPSED BY DEFAULT (Notion-style) to a single "Related · N" line under
-     Properties (click reveals the merged Related chips + ambient Suggested chips + `+ Link`);
+     Properties while `+ Link` stays independent and visible (clicking Related reveals the
+     merged Related chips + ambient Suggested chips without gating the link command);
      with NONE it degrades to a lone quiet `+ Link` affordance so a fresh note can still get
      its FIRST connection (the `+ Link` entry must never hide, or you can't add the first). -->
 @if (!locked()) {
-<div class="cx" [class.cx--empty]="!hasAnything()">
+<div
+  class="cx"
+  [class.cx--empty]="!hasAnything()"
+  [class.cx--prominent]="prominent()"
+>
   @if (!hasAnything()) {
     <!-- EMPTY STATE — no relations yet, but linking is ALWAYS available: a single quiet
          "+ Link" affordance so a note with no connections can still get its FIRST one.
          (The whole panel used to auto-hide here, which stranded the only in-panel way to
          add a link — you most need it when there's nothing yet.) -->
-    @if (pickerOpen()) {
-      <input
-        #pickerAnchor
-        type="text"
-        class="cx-link-input"
-        placeholder="Link a meeting, note, or document…"
-        [value]="pickerQuery()"
-        (input)="onQueryInput($event)"
-        (keydown)="onQueryKey($event)"
-        (blur)="closePicker()"
-        aria-label="Search items to link"
-      />
-    } @else {
-      <button
-        #pickerAnchor
-        type="button"
-        class="cx-add cx-add--empty"
-        [disabled]="linking()"
-        (click)="openPicker()"
-      >
-        @if (linking()) {
-          <span class="cx-add-label">Linking…</span>
+    @if (prominent()) {
+      <div class="cx-head">
+        <span class="cx-prominent-title">
+          <span>Related</span>
+          <span class="cx-count" aria-hidden="true">0</span>
+        </span>
+        @if (pickerOpen()) {
+          <input
+            #pickerAnchor
+            type="text"
+            class="cx-link-input"
+            placeholder="Link a meeting, note, or document…"
+            [value]="pickerQuery()"
+            (input)="onQueryInput($event)"
+            (keydown)="onQueryKey($event)"
+            (blur)="closePicker()"
+            aria-label="Search items to link"
+          />
         } @else {
-          <span class="cx-add-plus" aria-hidden="true">+</span>
-          <span class="cx-add-label">Link</span>
+          <button
+            #pickerAnchor
+            type="button"
+            class="cx-add"
+            [disabled]="linking()"
+            (click)="openPicker()"
+          >
+            @if (linking()) {
+              <span class="cx-add-label">Linking…</span>
+            } @else {
+              <span class="cx-add-plus" aria-hidden="true">+</span>
+              <span class="cx-add-label">Link</span>
+            }
+          </button>
         }
-      </button>
+      </div>
+    } @else {
+      @if (pickerOpen()) {
+        <input
+          #pickerAnchor
+          type="text"
+          class="cx-link-input"
+          placeholder="Link a meeting, note, or document…"
+          [value]="pickerQuery()"
+          (input)="onQueryInput($event)"
+          (keydown)="onQueryKey($event)"
+          (blur)="closePicker()"
+          aria-label="Search items to link"
+        />
+      } @else {
+        <button
+          #pickerAnchor
+          type="button"
+          class="cx-add cx-add--empty"
+          [disabled]="linking()"
+          (click)="openPicker()"
+        >
+          @if (linking()) {
+            <span class="cx-add-label">Linking…</span>
+          } @else {
+            <span class="cx-add-plus" aria-hidden="true">+</span>
+            <span class="cx-add-label">Link</span>
+          }
+        </button>
+      }
     }
   } @else if (!expanded()) {
-    <!-- COLLAPSED (default) — one quiet "Related · N" line; near-zero footprint. -->
-    <button
-      type="button"
-      class="cx-collapsed"
-      (click)="toggleExpanded()"
-      [attr.aria-expanded]="false"
-      aria-label="Show related items and suggestions"
-    >
-      <svg
-        class="cx-chev"
-        viewBox="0 0 16 16"
-        width="11"
-        height="11"
-        fill="none"
-        aria-hidden="true"
+    <!-- COLLAPSED (default) — disclosure hides only the relationship rows.
+         Manual linking is a separate command and must remain reachable. -->
+    <div class="cx-head">
+      <button
+        type="button"
+        class="cx-collapsed"
+        (click)="toggleExpanded()"
+        [attr.aria-expanded]="false"
+        aria-label="Show related items and suggestions"
       >
-        <path
-          d="M6 4l4 4-4 4"
-          stroke="currentColor"
-          stroke-width="1.5"
-          stroke-linecap="round"
-          stroke-linejoin="round"
+        <svg
+          class="cx-chev"
+          viewBox="0 0 16 16"
+          width="11"
+          height="11"
+          fill="none"
+          aria-hidden="true"
+        >
+          <path
+            d="M6 4l4 4-4 4"
+            stroke="currentColor"
+            stroke-width="1.5"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          />
+        </svg>
+        <span class="cx-collapsed-label">Related</span>
+        <span class="cx-count" aria-hidden="true">{{ totalCount() }}</span>
+      </button>
+      @if (pickerOpen()) {
+        <input
+          #pickerAnchor
+          type="text"
+          class="cx-link-input"
+          placeholder="Link a meeting, note, or document…"
+          [value]="pickerQuery()"
+          (input)="onQueryInput($event)"
+          (keydown)="onQueryKey($event)"
+          (blur)="closePicker()"
+          aria-label="Search items to link"
         />
-      </svg>
-      <span class="cx-collapsed-label">Related</span>
-      <span class="cx-count" aria-hidden="true">{{ totalCount() }}</span>
-    </button>
+      } @else {
+        <button
+          #pickerAnchor
+          type="button"
+          class="cx-add"
+          [disabled]="linking()"
+          (click)="openPicker()"
+        >
+          @if (linking()) {
+            <span class="cx-add-label">Linking…</span>
+          } @else {
+            <span class="cx-add-plus" aria-hidden="true">+</span>
+            <span class="cx-add-label">Link</span>
+          }
+        </button>
+      }
+    </div>
   } @else {
     <!-- EXPANDED — the collapse toggle + `+ Link` chooser, then the two chip groups. -->
     <div class="cx-head">
@@ -239,12 +312,14 @@
   @if (pickerOpen()) {
     <app-link-picker
       [anchorRect]="pickerRect()"
+      [anchorElement]="pickerAnchorElement()"
       [query]="pickerQuery()"
       [activeIndex]="pickerActiveIndex()"
       [excludeKind]="kind()"
       [excludeId]="id()"
       (candidatesChange)="onPickerCandidates($event)"
       (picked)="pickCandidate($event)"
+      (repositionRequest)="repositionPicker()"
     />
   }
 }
