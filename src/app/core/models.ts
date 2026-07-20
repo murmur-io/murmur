@@ -1527,14 +1527,16 @@ export interface FullGraphNode {
 /**
  * The relation a full-brain edge encodes (Rust `FullGraphEdgeKind`, snake_case).
  * `co_occurrence` = entity↔entity; `mention` = entity→meeting; `wikilink` /
- * `companion` / `semantic` = a `links` row. Drives the per-kind edge style + the
- * edge lens.
+ * `companion` / `manual` / `semantic` = a `links` row. `manual` is a USER-created
+ * "Related" link (the most intentional edge — always active). Drives the per-kind
+ * edge style + the edge lens.
  */
 export type FullGraphEdgeKind =
   | "co_occurrence"
   | "mention"
   | "wikilink"
   | "companion"
+  | "manual"
   | "semantic";
 
 /**
