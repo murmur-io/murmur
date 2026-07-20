@@ -497,6 +497,27 @@ impl Db {
             _ => return Ok(Vec::new()),
         };
 
+        // ── TITLE-STRING FAN-OUT GUARD (backlink-id fix): a source's `[[target_title]]` is a backlink
+        // to THIS target ONLY IF `[[target_title]]` actually RESOLVES to it — exactly where clicking
+        // the wikilink navigates. `resolve_wikilink` (the SAME gated resolver the write-time index and
+        // click-navigation use: note-leg-first, most-recent `ORDER BY updated_at DESC`, case-folded
+        // fallback, companion self-link avoidance) collapses a `[[Title]]` to EXACTLY ONE target.
+        // When two items share a title (e.g. the default "Untitled"), the resolver picks ONE — so only
+        // THAT one may claim the body-scan backlinks; the others must not fan-out and steal them.
+        // Compute the mapping once: our (target_kind, target_id) as a `WikiTarget` kind string, and
+        // check the resolved target equals us. An `org` resolution never equals a note/meeting target,
+        // so `title_targets_us` is false there too. The two title-string body-scan legs below run ONLY
+        // when this is true; the id-based INDEX fast path and the structural companion leg are
+        // unconditional (they carry the correct, resolved backlinks regardless).
+        let target_kind_wiki = match target_kind {
+            SourceKind::Meeting => "meeting",
+            SourceKind::Note => "note",
+        };
+        let title_targets_us = matches!(
+            self.resolve_wikilink(&target_title, unlocked)?,
+            Some(ref wt) if wt.kind == target_kind_wiki && wt.id == target_id
+        );
+
         // ── INDEXED FAST PATH: wikilink + companion backlinks straight from `links` (Fix 3). ──
         // Each returned source id is remembered so the body-scan legs below skip it (no double-count,
         // no rescan). A source that fails its own visibility gate is dropped here (source gate).
@@ -542,7 +563,9 @@ impl Db {
             if seen_meetings.contains(&id) {
                 continue; // already emitted this meeting (fast path or an earlier note).
             }
-            if extract_wikilink_titles(&body).contains(&target_title) {
+            // FAN-OUT GUARD: only attribute a title-string `[[target_title]]` when the title actually
+            // resolves to US — otherwise it links a DIFFERENT same-titled item (or nothing), not us.
+            if title_targets_us && extract_wikilink_titles(&body).contains(&target_title) {
                 seen_meetings.insert(id.clone());
                 out.push(BacklinkSource {
                     id,
@@ -585,7 +608,9 @@ impl Db {
             if indexed_note_ids.contains(&id) {
                 continue; // already served from the `links` index (Fix 3) — never rescan/duplicate.
             }
-            if extract_wikilink_titles(&text).contains(&target_title) {
+            // FAN-OUT GUARD (see the meeting leg): a title-string `[[target_title]]` counts as a
+            // backlink to US only when the title resolves to us; else it links a same-titled sibling.
+            if title_targets_us && extract_wikilink_titles(&text).contains(&target_title) {
                 note_hits.push(BacklinkSource {
                     id,
                     kind: SourceKind::Note,
