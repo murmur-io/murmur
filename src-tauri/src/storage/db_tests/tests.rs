@@ -6095,6 +6095,133 @@
         );
     }
 
+    /// backlink-id fix (RED before the fan-out guard): the title-string body-scan legs must NOT
+    /// attribute a source's `[[Untitled]]` to EVERY item titled "Untitled" — only to the ONE that
+    /// `resolve_wikilink("Untitled")` actually navigates to. Two VISIBLE notes A and B are BOTH titled
+    /// "Untitled"; B is `updated_at`-newer so the resolver (`ORDER BY updated_at DESC`) picks B. Source
+    /// S carries `[[Untitled]]` in its body but is NOT in the `links` index (never indexed), forcing
+    /// the body-scan leg. Pre-fix (title-string match): BOTH A and B get S — a bogus fan-out. Post-fix:
+    /// only B (the resolved target) gets S; A gets none.
+    #[test]
+    fn backlinks_body_scan_no_fanout_across_duplicate_titles() {
+        let db = mem_db();
+        seed_folder(&db, "f1", "Notes");
+
+        // A and B BOTH titled "Untitled". B is updated more recently (higher created_at ⇒ higher
+        // updated_at, since insert_note stores created_at as updated_at too) so resolve_wikilink picks
+        // B. Do NOT index either — their bodies are irrelevant here; they are the duplicate TARGETS.
+        db.insert_note("n-a", "f1", "a", "Untitled", "the A body, empty note", 1_000)
+            .unwrap();
+        db.insert_note("n-b", "f1", "b", "Untitled", "the B body, empty note", 2_000)
+            .unwrap();
+
+        // Sanity: the resolver picks B (the newest same-titled note) — this is where a click navigates.
+        let nothing = std::collections::HashSet::new();
+        let resolved = db.resolve_wikilink("Untitled", &nothing).unwrap().unwrap();
+        assert_eq!(
+            (resolved.kind.as_str(), resolved.id.as_str()),
+            ("note", "n-b"),
+            "resolve_wikilink must pick the newest same-titled note (B)"
+        );
+
+        // SOURCE S carries [[Untitled]] but is deliberately NOT indexed → served only by the body scan.
+        db.insert_note("n-s", "f1", "s", "Source", "please see [[Untitled]] for context", 3_000)
+            .unwrap();
+
+        let a_back = db
+            .backlinks_for_visible(SourceKind::Note, "n-a", &nothing)
+            .unwrap();
+        let b_back = db
+            .backlinks_for_visible(SourceKind::Note, "n-b", &nothing)
+            .unwrap();
+        let a_ids: Vec<&str> = a_back.iter().map(|s| s.id.as_str()).collect();
+        let b_ids: Vec<&str> = b_back.iter().map(|s| s.id.as_str()).collect();
+
+        assert!(
+            b_ids.contains(&"n-s"),
+            "the resolved target (B) must get the [[Untitled]] body-scan backlink; got {b_ids:?}"
+        );
+        assert!(
+            !a_ids.contains(&"n-s"),
+            "the NON-resolved same-titled note (A) must NOT fan-out and steal the backlink; got {a_ids:?}"
+        );
+    }
+
+    /// backlink-id fix: a UNIQUELY-titled target still gets its body-scan backlink (no regression) —
+    /// its title resolves to itself, so `title_targets_us` is true and the leg runs. Un-indexed source.
+    #[test]
+    fn backlinks_body_scan_unique_title_still_works() {
+        let db = mem_db();
+        seed_folder(&db, "f1", "Notes");
+
+        // A uniquely-titled target T.
+        db.insert_note("n-t", "f1", "t", "UniqueTitle", "the target body", 1_000)
+            .unwrap();
+        // A source S with [[UniqueTitle]] in its body — NOT indexed, so served only by the body scan.
+        db.insert_note("n-s", "f1", "s", "Source", "refer to [[UniqueTitle]] here", 2_000)
+            .unwrap();
+
+        let nothing = std::collections::HashSet::new();
+        let back = db
+            .backlinks_for_visible(SourceKind::Note, "n-t", &nothing)
+            .unwrap();
+        let ids: Vec<&str> = back.iter().map(|s| s.id.as_str()).collect();
+        assert!(
+            ids.contains(&"n-s"),
+            "a uniquely-titled target must still surface its body-scan backlink; got {ids:?}"
+        );
+    }
+
+    /// backlink-id fix: the id-based INDEX fast path is UNCONDITIONAL — a real indexed wikilink edge to
+    /// A is returned even when `title_targets_us` is false for A (a duplicate-title scenario where the
+    /// title resolves to a DIFFERENT same-titled item, B). The guard only ever removes BOGUS title-
+    /// string fan-out; it never suppresses a legitimate id-keyed edge.
+    #[test]
+    fn backlinks_index_path_unaffected_by_title_guard() {
+        let db = mem_db();
+        seed_folder(&db, "f1", "Notes");
+
+        // A and B BOTH titled "Untitled"; B newer ⇒ resolve_wikilink("Untitled") picks B, so for TARGET
+        // A the guard is FALSE.
+        db.insert_note("n-a", "f1", "a", "Untitled", "A body", 1_000)
+            .unwrap();
+        db.insert_note("n-b", "f1", "b", "Untitled", "B body", 2_000)
+            .unwrap();
+
+        // SOURCE S is INDEXED against A's id directly (a resolved, id-keyed `links` edge), NOT via the
+        // current title. Build the edge by indexing S while A is the resolvable target, then flip so the
+        // title now resolves to B — the id-keyed edge to A must remain.
+        db.insert_note("n-s", "f1", "s", "Source", "see [[A Unique Handle]]", 3_000)
+            .unwrap();
+        // Give A a unique title momentarily so the wikilink resolves to A's id and gets indexed.
+        db.lock()
+            .execute("UPDATE documents SET title='A Unique Handle' WHERE id='n-a'", [])
+            .unwrap();
+        let nothing = std::collections::HashSet::new();
+        db.index_wikilinks_for_source(
+            crate::links::LinkKind::Note,
+            "n-s",
+            "see [[A Unique Handle]]",
+            &nothing,
+        )
+        .unwrap();
+        // Now rename A back to "Untitled" (duplicate with B, B newer) so title resolution points at B.
+        db.lock()
+            .execute("UPDATE documents SET title='Untitled' WHERE id='n-a'", [])
+            .unwrap();
+
+        // For target A: title_targets_us is FALSE (resolve_wikilink("Untitled") → B), yet the id-keyed
+        // index edge S → A must still surface.
+        let a_back = db
+            .backlinks_for_visible(SourceKind::Note, "n-a", &nothing)
+            .unwrap();
+        assert!(
+            a_back.iter().any(|s| s.id == "n-s"),
+            "the id-keyed INDEX edge to A must survive the title guard; got {:?}",
+            a_back.iter().map(|s| s.id.as_str()).collect::<Vec<_>>()
+        );
+    }
+
     /// Fix 6 (RED before case-insensitive wikilink resolution): Obsidian resolves `[[links]]`
     /// case-insensitively — `[[project x]]` must resolve to a note titled "Project X". The old
     /// byte-exact match returned `None`.
