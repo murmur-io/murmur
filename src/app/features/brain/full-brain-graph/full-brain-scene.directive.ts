@@ -668,7 +668,10 @@ export class FullBrainSceneDirective {
       const B = this.proj[b];
       const colA = NODE_COLORS[e.srcKind];
       const colB = NODE_COLORS[e.dstKind];
-      const structural = e.kind === "wikilink" || e.kind === "companion";
+      const structural =
+        e.kind === "wikilink" ||
+        e.kind === "companion" ||
+        e.kind === "manual";
 
       // Focus tier → alpha/width.
       let aBase = 0.5;

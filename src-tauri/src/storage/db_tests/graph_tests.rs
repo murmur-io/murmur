@@ -448,6 +448,44 @@
         assert!((sem.score - 0.9).abs() < 1e-9, "semantic score = cosine");
     }
 
+    /// A USER-created `manual` link (the note↔document "Related" chip, written by `upsert_manual_link`)
+    /// MUST appear as an ACTIVE edge in the full-brain graph and bump both endpoints' degree.
+    /// REGRESSION (2026-07-20): `full_graph_edge_kind_from_type` mapped only wikilink/companion/semantic,
+    /// so every `manual` edge fell to `_ => None` and was `continue`-skipped — a linked document showed
+    /// "0 connections". RED-before-GREEN: drop the `"manual"` arm and this test fails (no edge, degree 0).
+    #[test]
+    fn build_full_graph_includes_manual_link_edge() {
+        let db = file_db("fullgraph-manual");
+        seed_folder(&db, "f", "Notes");
+        db.insert_note("n1", "f", "n1", "Note One", "body", 1_000)
+            .unwrap();
+        db.insert_document("d1", "f", "cv.pdf", "doc body", "document", 1_000)
+            .unwrap();
+        // A user-created manual link note → document (exactly what `upsert_manual_link` writes).
+        seed_link(&db, ("note", "n1"), ("document", "d1"), "manual", "active", 1.0);
+
+        let empty: HashSet<String> = HashSet::new();
+        let g = db.build_full_graph(&empty, FullGraphOpts::default()).unwrap();
+
+        // The manual edge is present, active, and correctly typed at both endpoints.
+        let edge = g
+            .edges
+            .iter()
+            .find(|e| e.src == "n1" && e.dst == "d1")
+            .expect("the manual note→document link must be a graph edge (regression: it was dropped)");
+        assert_eq!(edge.kind, FullGraphEdgeKind::Manual, "typed as a manual edge");
+        assert_eq!(edge.src_kind, FullGraphNodeKind::Note);
+        assert_eq!(edge.dst_kind, FullGraphNodeKind::Document);
+        assert_eq!(edge.status, "active", "a manual link is an active edge");
+        // The document is no longer a 0-connection orphan.
+        let doc = g
+            .nodes
+            .iter()
+            .find(|n| n.id == "d1" && n.kind == FullGraphNodeKind::Document)
+            .expect("document node present");
+        assert_eq!(doc.degree, 1, "the linked document has one connection, not zero");
+    }
+
     /// HONEST CAPS: the per-kind node cap trims `nodes` while `total_visible_nodes` reports the TRUE
     /// pre-cap count, and `has_hidden` reflects LOCKED folders independently. RED-before-GREEN: set
     /// `total_visible_nodes = nodes.len()` and the silent cap-drop is invisible to the FE.
