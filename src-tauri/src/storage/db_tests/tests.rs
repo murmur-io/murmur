@@ -8640,10 +8640,15 @@
     fn analytics_excludes_sealed_not_unlocked_folder() {
         let db = mem_db();
         // Two OPEN meetings (folder_id NULL) + one meeting in a LOCKED, not-session-unlocked folder.
+        // Dates are RELATIVE to now (well inside the analytics 30-day per_day window) so this test is
+        // never calendar-flaky: a hardcoded absolute date ages OUT of the window as real time passes
+        // (the old `open-1` at 2026-06-20 dropped off the chart exactly 30 days later — this is that fix).
+        let day = |n: i64| (chrono::Utc::now() - chrono::Duration::days(n)).to_rfc3339();
+        let (open1_at, open2_at, secret_at) = (day(5), day(4), day(3));
         for (id, at, dur) in [
-            ("open-1", "2026-06-20T10:00:00Z", 600i64),
-            ("open-2", "2026-06-21T10:00:00Z", 900i64),
-            ("secret", "2026-06-22T10:00:00Z", 6000i64),
+            ("open-1", open1_at.as_str(), 600i64),
+            ("open-2", open2_at.as_str(), 900i64),
+            ("secret", secret_at.as_str(), 6000i64),
         ] {
             db.insert_meeting(&crate::storage::Meeting {
                 id: id.into(),
@@ -8704,7 +8709,7 @@
             "per-day activity chart must not include the sealed meeting's day"
         );
         assert!(
-            !a.per_day.iter().any(|d| d.date == "2026-06-22"),
+            !a.per_day.iter().any(|d| d.date == secret_at[..10]),
             "the sealed meeting's day must not appear in the 30-day activity chart at all"
         );
 
