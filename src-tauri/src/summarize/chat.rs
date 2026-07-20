@@ -1,22 +1,40 @@
-//! "Chat with the meeting": grounded Q&A over a single meeting's transcript. The provider
-//! answers strictly from the transcript (passed as the system prompt) plus the running
-//! conversation history.
+//! "Chat with the meeting": grounded Q&A over a single meeting's transcript plus any
+//! visibility-gated sources the user explicitly pinned. The provider receives the grounding
+//! material in the system prompt plus the running conversation history.
 
 use crate::storage::models::ChatTurn;
 
 /// Cap the transcript sent as context so a very long meeting can't blow the prompt budget.
 const MAX_TRANSCRIPT_CHARS: usize = 40_000;
+/// Give explicit sources their OWN bounded budget. They must not sit behind (and get truncated
+/// together with) a long anchor transcript: choosing a source is an explicit user instruction.
+pub(crate) const MAX_PINNED_SOURCE_CHARS: usize = 40_000;
 
-/// Build the (system, user) prompt pair for a meeting chat turn. Pure + testable.
+/// Backward-compatible transcript-only entry point. Keeping this wrapper makes the no-source path
+/// byte-identical and leaves existing callers/tests explicit about when cross-item context exists.
+pub fn build(
+    transcript: &str,
+    history: &[ChatTurn],
+    question: &str,
+    memory_brief: &str,
+) -> (String, String) {
+    build_with_sources(transcript, "", history, question, memory_brief)
+}
+
+/// Build the (system, user) prompt pair for a meeting chat turn with optional user-pinned sources.
+/// Transcript and sources are capped INDEPENDENTLY: a >40k-char meeting can no longer consume the
+/// source budget and erase a note the user explicitly attached.
 ///
 /// `memory_brief` is the gated cross-meeting USER MEMORY brief (durable preferences/commitments
 /// about the user). When non-empty it is injected as a small "WHAT YOU KNOW ABOUT THE USER" block so
 /// the meeting answer honors the user's standing preferences (e.g. "prefers replies in Polish");
 /// EMPTY ⇒ the block is omitted entirely, so the prompt is BYTE-IDENTICAL to the pre-memory prompt
-/// (the caller passes `""` when memory is empty or disabled). The brief is DERIVED from VISIBLE facts
-/// only (gated by the caller) and rides this surface's existing redaction + consent egress.
-pub fn build(
+/// (the caller passes `""` when memory is empty or disabled). `pinned_sources` is likewise assembled
+/// exclusively by the caller's visibility-gated source packer and rides the same existing provider
+/// consent/redaction seam. This function performs no reads and opens no new egress path.
+pub fn build_with_sources(
     transcript: &str,
+    pinned_sources: &str,
     history: &[ChatTurn],
     question: &str,
     memory_brief: &str,
@@ -26,6 +44,15 @@ pub fn build(
         format!("{head}\n[transcript truncated]")
     } else {
         transcript.to_string()
+    };
+    let pinned = if pinned_sources.chars().count() > MAX_PINNED_SOURCE_CHARS {
+        let head: String = pinned_sources
+            .chars()
+            .take(MAX_PINNED_SOURCE_CHARS)
+            .collect();
+        format!("{head}\n[pinned sources truncated]")
+    } else {
+        pinned_sources.to_string()
     };
 
     // Present brief ⇒ a labelled block BEFORE the transcript; empty ⇒ byte-identical to before.
@@ -38,12 +65,25 @@ pub fn build(
         )
     };
 
-    let system = format!(
-        "You are a helpful assistant answering questions about ONE meeting. Base your answers \
+    let system = if pinned.trim().is_empty() {
+        // Keep the original transcript-only prompt byte-for-byte when the picker is empty or every
+        // selected source was gated away.
+        format!(
+            "You are a helpful assistant answering questions about ONE meeting. Base your answers \
 strictly on the transcript below. If the answer is not in the transcript, say you don't know \
 — do not invent facts, decisions, or attributions. Be concise and concrete, and reference \
 what was said (and roughly when) when useful.\n\n{memory}TRANSCRIPT:\n{t}"
-    );
+        )
+    } else {
+        format!(
+            "You are a helpful assistant answering questions about ONE meeting and sources the user \
+explicitly pinned. Base your answers strictly on the grounding material below: the meeting \
+transcript and the user-pinned sources. If the answer is not in either, say you don't know — do \
+not invent facts, decisions, or attributions. Be concise and concrete. When an answer comes from \
+the transcript, reference what was said (and roughly when) when useful; when it comes from a \
+pinned source, name that source.\n\n{memory}MEETING TRANSCRIPT:\n{t}\n\nUSER-PINNED SOURCES:\n{pinned}"
+        )
+    };
 
     let mut user = String::new();
     for turn in history {
@@ -95,6 +135,29 @@ mod tests {
         let long = "x".repeat(MAX_TRANSCRIPT_CHARS + 5_000);
         let (system, _u) = build(&long, &[], "q", "");
         assert!(system.contains("[transcript truncated]"));
+    }
+
+    #[test]
+    fn pinned_sources_have_an_independent_budget_and_explicit_contract() {
+        let long = "x".repeat(MAX_TRANSCRIPT_CHARS + 5_000);
+        let (system, _u) = build_with_sources(
+            &long,
+            "### [[Launch plan]]\nCodename: Orchid",
+            &[],
+            "What is the codename?",
+            "",
+        );
+        assert!(system.contains("[transcript truncated]"));
+        assert!(system.contains("USER-PINNED SOURCES"));
+        assert!(system.contains("Codename: Orchid"));
+        assert!(system.contains("name that source"));
+    }
+
+    #[test]
+    fn blank_pinned_sources_keep_the_legacy_prompt_byte_identical() {
+        let legacy = build("transcript", &[], "question", "memory");
+        let blank = build_with_sources("transcript", "   ", &[], "question", "memory");
+        assert_eq!(blank, legacy);
     }
 
     /// EMPTY memory brief ⇒ byte-identical to the pre-memory prompt (no block); a present brief ⇒

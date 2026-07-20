@@ -399,8 +399,8 @@
   .frag.is-flash {
     animation: none;
   }
-  // Keep the pulse legible without motion: a static highlight that a subsequent
-  // user seek (which clears .is-flash) removes.
+  // Keep the pulse legible without motion: a static highlight until playback
+  // leaves the source segment or a user seek clears it.
   .frag.is-flash {
     background: var(--accent-soft);
     box-shadow: 0 0 0 3px var(--accent-soft);
