@@ -243,6 +243,50 @@ impl Db {
                 id: m.id,
             }));
         }
+        // Document leg — AFTER meetings, BEFORE org. A note that links a document materializes
+        // `[[Doc Title]]` into its body (`link_items`), and the inline `[[` autocomplete now
+        // surfaces documents, so a clicked doc-titled wikilink must resolve. Note-first ordering
+        // above means a title shared by a note AND a doc still prefers the note. VISIBLE documents
+        // only (`visibility_clause` on the folder) — a sealed-not-unlocked document resolves to
+        // None, exactly like the note/meeting legs. Exact first, then the ASCII-case-folded
+        // fallback on an exact miss — the same two-tier pattern the note leg uses.
+        {
+            let conn = self.lock();
+            let visible = visibility_clause("f", unlocked);
+            let doc_sql = |exact: bool| {
+                let title_pred = if exact {
+                    "COALESCE(NULLIF(TRIM(d.title), ''), d.name) = ?1"
+                } else {
+                    "LOWER(COALESCE(NULLIF(TRIM(d.title), ''), d.name)) = LOWER(?1)"
+                };
+                format!(
+                    "SELECT d.id
+                       FROM documents d
+                       JOIN folders f ON f.id = d.folder_id
+                      WHERE d.kind = 'document'
+                        AND {title_pred}
+                        AND {visible}
+                      ORDER BY d.updated_at DESC, d.id ASC
+                      LIMIT 1"
+                )
+            };
+            let doc_id: Option<String> = conn
+                .query_row(&doc_sql(true), rusqlite::params![title], |r| r.get(0))
+                .optional()
+                .map_err(map_err)?
+                .or_else(|| {
+                    conn.query_row(&doc_sql(false), rusqlite::params![title], |r| r.get(0))
+                        .optional()
+                        .ok()
+                        .flatten()
+                });
+            if let Some(id) = doc_id {
+                return Ok(Some(WikiTarget {
+                    kind: "document".to_string(),
+                    id,
+                }));
+            }
+        }
         // Org (Shared Brain) leg — deliberately-disclosed content living OUTSIDE the folder-lock
         // domain, so no `unlocked`/`visibility_clause` gate applies here; instead it is scoped to
         // orgs the caller has actually JOINED and left ENABLED on this install, and excludes

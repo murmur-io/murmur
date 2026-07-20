@@ -13,7 +13,7 @@ import {
   viewChild,
 } from "@angular/core";
 import { IpcService } from "../../../core/ipc.service";
-import type { DocumentInfo } from "../../../core/models";
+import type { DocumentPreviewTarget } from "../../../core/models";
 import { MurSpinnerComponent } from "../../../design-system/spinner/spinner.component";
 
 /**
@@ -56,8 +56,15 @@ export class DocumentPreviewComponent {
   private readonly ipc = inject(IpcService);
   private readonly injector = inject(Injector);
 
-  /** The document to preview; null = the modal is closed (renders nothing). */
-  readonly doc = input<DocumentInfo | null>(null);
+  /**
+   * The document/note to preview; null = the modal is closed (renders nothing).
+   * A {@link DocumentPreviewTarget} — the minimal `{ id, name, kind }` the
+   * component reads — so a document reachable only as a link target (a graph
+   * node / `[[wikilink]]` / Related chip, with no full `DocumentInfo` in hand)
+   * can be previewed too. `DocumentInfo` is structurally assignable, so the
+   * Brain page's existing `DocumentInfo`-typed call site is unaffected.
+   */
+  readonly doc = input<DocumentPreviewTarget | null>(null);
 
   // Named `dismiss` (not `close`): `close` is a native DOM event name, which
   // `@angular-eslint/no-output-native` forbids as an output. Matches the
@@ -130,13 +137,20 @@ export class DocumentPreviewComponent {
   );
 
   constructor() {
-    // Focus the close button once the modal has rendered (afterNextRender,
-    // never setTimeout/rAF). The parent renders this component behind an
-    // `@if (previewDoc())`, so it's created fresh on open → this one-shot fires
-    // exactly when the modal appears. Runs in the field-init injection context;
-    // the explicit injector is belt-and-braces consistent with the tree.
-    afterNextRender(() => this.closeBtn()?.nativeElement.focus(), {
-      injector: this.injector,
+    // Focus the close button when the modal OPENS. This host is now MOUNTED ONCE
+    // in the app shell (globally reachable) with `doc` toggled null↔target — so
+    // the component is NOT recreated per open (it used to live behind a parent
+    // `@if`). An effect keyed on `doc()` therefore fires on every open/target
+    // change; `afterNextRender` (never setTimeout/rAF) focuses the close button
+    // once the modal has painted. On close (`doc` → null) the `@if` has removed
+    // the button, so `closeBtn()` is undefined and the focus no-ops.
+    effect(() => {
+      if (!this.doc()) {
+        return;
+      }
+      afterNextRender(() => this.closeBtn()?.nativeElement.focus(), {
+        injector: this.injector,
+      });
     });
 
     // Fetch the document text whenever a non-null doc is set. Stale-result

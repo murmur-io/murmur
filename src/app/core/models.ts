@@ -1064,6 +1064,23 @@ export interface DocumentInfo {
 }
 
 /**
+ * The MINIMAL descriptor the read-only document preview modal needs to open one
+ * `documents` row (`DocumentPreviewComponent`'s `doc` input + `DocumentPreviewService`'s
+ * `open()` argument): just the `id` (the gated `getDocument(id)` read key), the display
+ * `name`, and the `kind` (drives the header badge — `"note"` is always "Note", a
+ * `"document"` badge is derived from the filename extension). Deliberately a SUBSET of
+ * {@link DocumentInfo} (which stays structurally assignable, so the Brain page's existing
+ * `DocumentInfo`-typed call sites keep compiling), so a document reachable ONLY as a link
+ * target (a graph node, a `[[wikilink]]`, a Related chip — where we have an id + a label
+ * but no full `DocumentInfo`) can still be previewed.
+ */
+export interface DocumentPreviewTarget {
+  id: string;
+  name: string;
+  kind: "document" | "note";
+}
+
+/**
  * brain2 — headline counts + semantic flags for the Brain page ("what's in my
  * brain"). Mirrors the Rust `BrainOverview` (serde camelCase). Every count is
  * over VISIBLE/unlocked content only (a sealed-not-unlocked folder's items are
@@ -1350,7 +1367,8 @@ export interface BacklinkSource {
  *
  * - `direction` — `"out"` (the queried item is this edge's `src`) | `"in"` (it is `dst`).
  * - `otherKind` — the neighbour endpoint kind: `"meeting" | "note" | "document"`
- *   (route `meeting` → `/meeting/:id`, `note`/`document` → `/notes/:id`).
+ *   (`meeting` → `/meeting/:id`, `note` → `/notes/:id`; a `document` has no route —
+ *   its chip opens the read-only preview modal via `DocumentPreviewService`).
  * - `edgeType` — `"wikilink" | "companion" | "semantic" | "manual"`. `wikilink`/
  *   `companion`/`manual` are DETERMINISTIC edges (rendered as plain link chips);
  *   `semantic` is a SUGGESTED edge the user can Accept/Dismiss, with `score` the
@@ -1406,11 +1424,13 @@ export interface SourceRef {
  * click can never reveal or open locked content). `kind` is a raw string (NOT
  * `SourceKind` — mirrors `NoteCitation`'s convention for the same tri-state, since
  * `SourceKind` stays local-only for backlinks): `"org"` carries the org item's id,
- * routed to `TabsService.openOrgItem`, never a local id. Mirrors the Rust `WikiTarget`
- * (serde camelCase).
+ * routed to `TabsService.openOrgItem`, never a local id; `"document"` (a brain-ingested
+ * `documents` row, e.g. a PDF) carries the document id, opened in the read-only
+ * {@link DocumentPreviewTarget} modal (via `DocumentPreviewService`), never a route.
+ * Mirrors the Rust `WikiTarget` (serde camelCase).
  */
 export interface WikiTarget {
-  kind: "meeting" | "note" | "org";
+  kind: "meeting" | "note" | "org" | "document";
   id: string;
 }
 

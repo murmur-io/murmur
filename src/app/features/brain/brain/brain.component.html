@@ -300,9 +300,8 @@
       (dismiss)="closeNoteEditor()"
     />
   }
-
-  @if (previewDoc(); as doc) {
-    <app-document-preview [doc]="doc" (dismiss)="closePreview()" />
-  }
+  <!-- The read-only document/note preview modal is now hosted ONCE at the app
+       shell (see DocumentPreviewService) so it's reachable from every surface;
+       `openPreview` delegates to that service instead of a local modal host. -->
 </section>
   
