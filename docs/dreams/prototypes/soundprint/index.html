@@ -1,0 +1,452 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Murmur — Soundprint (vibe prototype)</title>
+<style>
+/* ── Murmur design tokens (copied so this file is self-contained — no build). ── */
+:root{
+  --surface-base:#07070b;
+  --surface-raised:rgba(255,255,255,.045);
+  --surface-overlay:#1b1b24;
+  --surface-input:rgba(255,255,255,.035);
+  --surface-hover:rgba(255,255,255,.06);
+  --scrim:rgba(0,0,0,.5);
+  --text-primary:#f6f6fa;
+  --text-secondary:#a6a6b6;
+  --text-muted:#6c6c7d;
+  --accent:#6e76ff; --accent-hover:#8a90ff; --accent-soft:rgba(110,118,255,.16); --accent-ring:rgba(110,118,255,.5);
+  --others:#ff9d5c;                 /* warm amber — the far side (graph-meeting hue) */
+  --others-soft:rgba(255,157,92,.16);
+  --laugh:#ffe08a;                  /* bright — laughter bursts */
+  --tension:#ff6b6b;                /* the argument */
+  --calm:#4ce0a0;                   /* agreement / resolution (graph-note mint) */
+  --border:rgba(255,255,255,.09); --border-strong:rgba(255,255,255,.16); --border-subtle:rgba(255,255,255,.055);
+  --space-1:4px; --space-2:8px; --space-3:12px; --space-4:16px; --space-5:24px; --space-6:32px; --space-8:56px;
+  --radius-sm:8px; --radius-md:12px; --radius-lg:18px; --radius-xl:26px;
+  --shadow-lg:0 24px 60px rgba(0,0,0,.55);
+  --transition:.18s cubic-bezier(.4,0,.2,1);
+  --font-sans:-apple-system,BlinkMacSystemFont,"SF Pro Text","Hanken Grotesk","Segoe UI",system-ui,sans-serif;
+  --font-mono:"SF Mono",ui-monospace,"JetBrains Mono",Menlo,monospace;
+}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0}
+body{min-height:100vh;background:var(--surface-base);color:var(--text-primary);
+  font-family:var(--font-sans);font-size:15px;line-height:1.55;letter-spacing:-.012em;overflow-x:hidden}
+body::before{content:"";position:fixed;inset:-10%;z-index:-2;
+  background:
+    radial-gradient(70% 55% at 10% 8%, rgba(110,118,255,.14), transparent 60%),
+    radial-gradient(55% 45% at 92% 96%, rgba(255,157,92,.08), transparent 55%),
+    radial-gradient(50% 40% at 88% 4%, rgba(76,224,160,.05), transparent 60%);
+  filter:saturate(120%)}
+body::after{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;opacity:.02;
+  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");}
+
+.wrap{max-width:1080px;margin:0 auto;padding:var(--space-6) var(--space-5) var(--space-8)}
+
+.topbar{display:flex;align-items:center;gap:var(--space-4);margin-bottom:var(--space-5)}
+.brand{display:flex;align-items:center;gap:10px;font-weight:650;letter-spacing:-.02em}
+.brand .dot{width:10px;height:10px;border-radius:50%;background:var(--accent);box-shadow:0 0 14px var(--accent)}
+.eyebrow{color:var(--text-muted);font-size:.74rem;letter-spacing:.14em;text-transform:uppercase}
+h1{font-size:1.5rem;font-weight:650;margin:2px 0 0;letter-spacing:-.025em}
+.spacer{flex:1}
+.asset{display:flex;align-items:center;gap:8px;font-size:.74rem;color:var(--text-muted);border:1px solid var(--border);border-radius:var(--radius-xl);padding:6px 12px;background:var(--surface-raised)}
+.asset code{font-family:var(--font-mono);color:var(--text-secondary);font-size:.72rem}
+
+.card{background:var(--surface-raised);border:1px solid var(--border);border-radius:var(--radius-lg);
+  backdrop-filter:blur(30px) saturate(140%);-webkit-backdrop-filter:blur(30px) saturate(140%)}
+
+/* ── The soundprint hero ────────────────────────────────────────────────── */
+.hero{padding:var(--space-5) var(--space-5) var(--space-4);margin-bottom:var(--space-4)}
+.hero-head{display:flex;align-items:baseline;gap:12px;margin-bottom:var(--space-3)}
+.hero-head h2{margin:0;font-size:1.02rem}
+.hero-head .sub{color:var(--text-muted);font-size:.8rem}
+.hero-head .len{margin-left:auto;font-family:var(--font-mono);font-size:.78rem;color:var(--text-secondary)}
+
+.print{position:relative;width:100%;height:300px;border-radius:var(--radius-md);overflow:hidden;
+  background:linear-gradient(180deg, rgba(255,255,255,.02), rgba(0,0,0,.18));border:1px solid var(--border-subtle);cursor:crosshair}
+.print svg{display:block;width:100%;height:100%}
+/* playhead */
+.playhead{position:absolute;top:0;bottom:0;width:2px;background:#fff;box-shadow:0 0 12px rgba(255,255,255,.7);left:0;opacity:.9;pointer-events:none;transition:left .05s linear}
+.playhead::after{content:"";position:absolute;top:-3px;left:-4px;width:10px;height:10px;border-radius:50%;background:#fff;box-shadow:0 0 12px rgba(255,255,255,.9)}
+/* hover pick */
+.pick{position:absolute;top:0;bottom:0;width:1px;background:rgba(255,255,255,.35);left:0;opacity:0;pointer-events:none}
+.print:hover .pick{opacity:1}
+
+.axis{display:flex;justify-content:space-between;margin-top:6px;font-family:var(--font-mono);font-size:.68rem;color:var(--text-muted)}
+
+.legend{display:flex;flex-wrap:wrap;gap:14px;margin-top:var(--space-4);padding-top:var(--space-3);border-top:1px solid var(--border-subtle)}
+.legend .li{display:flex;align-items:center;gap:7px;font-size:.76rem;color:var(--text-secondary)}
+.legend .sw{width:22px;height:8px;border-radius:3px}
+.legend .dot{width:9px;height:9px;border-radius:50%}
+
+.controls{display:flex;align-items:center;gap:12px;margin-top:var(--space-4)}
+.play{display:inline-flex;align-items:center;gap:9px;padding:9px 16px;border-radius:var(--radius-md);
+  border:1px solid var(--accent-ring);background:var(--accent-soft);color:var(--accent-hover);font-weight:600;font-size:.85rem;cursor:pointer;transition:var(--transition);font-family:var(--font-sans)}
+.play:hover{background:var(--accent-soft);border-color:var(--accent)}
+.nowlbl{font-size:.8rem;color:var(--text-muted)}
+.nowlbl b{color:var(--text-secondary);font-weight:600}
+
+/* moment readout under the print */
+.readout{margin-top:var(--space-3);min-height:64px;border-radius:var(--radius-md);border:1px dashed var(--border-strong);
+  background:var(--surface-input);padding:12px 15px;display:flex;gap:12px;align-items:flex-start;transition:var(--transition)}
+.readout .stamp{flex:0 0 auto;font-family:var(--font-mono);font-size:.74rem;color:var(--text-muted);padding-top:2px;min-width:52px}
+.readout .who{font-weight:600;font-size:.8rem;margin-bottom:2px}
+.readout .who.me{color:var(--accent-hover)} .readout .who.them{color:var(--others)}
+.readout .q{color:var(--text-primary);font-size:.95rem}
+.readout .tone{margin-top:5px;font-size:.72rem;color:var(--text-muted)}
+.readout.empty{color:var(--text-muted);align-items:center;font-size:.86rem;justify-content:center;border-style:dashed}
+
+/* ── Pause Garden ───────────────────────────────────────────────────────── */
+.grid2{display:grid;grid-template-columns:1fr 320px;gap:var(--space-4)}
+@media(max-width:900px){.grid2{grid-template-columns:1fr}}
+.panel{padding:var(--space-5)}
+.panel h3{margin:0 0 3px;font-size:.95rem}
+.panel .cap{color:var(--text-muted);font-size:.78rem;margin-bottom:var(--space-4)}
+.pauses{display:flex;flex-direction:column;gap:11px}
+.pause{display:flex;gap:13px;align-items:center;padding:12px 14px;border-radius:var(--radius-md);
+  border:1px solid var(--border-subtle);background:var(--surface-input);cursor:pointer;transition:var(--transition)}
+.pause:hover{border-color:var(--border-strong);background:var(--surface-hover);transform:translateY(-1px)}
+.pause .dur{flex:0 0 auto;width:52px;height:52px;border-radius:50%;display:grid;place-items:center;
+  background:radial-gradient(circle at 50% 40%, rgba(255,255,255,.08), transparent 70%);border:1px solid var(--border-strong);
+  font-family:var(--font-mono);font-weight:650;font-size:.9rem;color:var(--text-primary)}
+.pause .txt .k{font-weight:600;font-size:.86rem}
+.pause .txt .s{color:var(--text-muted);font-size:.76rem;margin-top:2px}
+.pause .rip{display:inline-flex;gap:3px;align-items:center;margin-top:5px}
+.pause .rip i{width:3px;border-radius:2px;background:var(--others);opacity:.5}
+
+.right .cap{margin-bottom:var(--space-3)}
+.shape{display:flex;flex-direction:column;gap:12px}
+.shape .row{display:flex;justify-content:space-between;align-items:center;font-size:.82rem}
+.shape .row .k{color:var(--text-secondary)}
+.shape .row .v{font-family:var(--font-mono);color:var(--text-primary)}
+.bar{height:6px;border-radius:3px;background:var(--surface-hover);overflow:hidden;margin-top:3px}
+.bar>i{display:block;height:100%;border-radius:3px}
+.mono-note{margin-top:var(--space-4);padding-top:var(--space-3);border-top:1px solid var(--border-subtle);font-size:.76rem;color:var(--text-muted);line-height:1.5}
+.mono-note b{color:var(--text-secondary);font-weight:600}
+
+.foot{margin-top:var(--space-6);text-align:center;color:var(--text-muted);font-size:.78rem;line-height:1.6}
+.foot .big{color:var(--text-secondary);font-size:.92rem;font-weight:600;display:block;margin-bottom:6px}
+.pill-tag{display:inline-block;padding:2px 9px;border-radius:var(--radius-xl);border:1px solid var(--border);color:var(--text-muted);font-size:.68rem;margin:0 3px}
+.disc{opacity:.55;margin-top:12px;display:block;font-size:.72rem}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="topbar">
+    <div class="brand"><span class="dot"></span>Murmur</div>
+    <div>
+      <div class="eyebrow">Soundprint</div>
+      <h1>Design Review — Mobile Redesign</h1>
+    </div>
+    <div class="spacer"></div>
+    <div class="asset">🎼 rendered into your vault as <code>Design-Review.soundprint.svg</code></div>
+  </div>
+
+  <!-- HERO: the soundprint -->
+  <div class="card hero">
+    <div class="hero-head">
+      <h2>The sound of the room</h2>
+      <span class="sub">not bullet points — the shape of what was actually said</span>
+      <span class="len" id="lenLabel">38:00</span>
+    </div>
+
+    <div class="print" id="print">
+      <svg id="svg" viewBox="0 0 1000 300" preserveAspectRatio="none" aria-hidden="true"></svg>
+      <div class="pick" id="pick"></div>
+      <div class="playhead" id="playhead"></div>
+    </div>
+    <div class="axis"><span>0:00</span><span>9:30</span><span>19:00</span><span>28:30</span><span>38:00</span></div>
+
+    <div class="legend">
+      <div class="li"><span class="sw" style="background:var(--accent)"></span>You</div>
+      <div class="li"><span class="sw" style="background:var(--others)"></span>Others (far-side, no bot)</div>
+      <div class="li"><span class="dot" style="background:var(--laugh);box-shadow:0 0 8px var(--laugh)"></span>laughter</div>
+      <div class="li"><span class="dot" style="background:var(--tension)"></span>the argument (fast, overlapping)</div>
+      <div class="li"><span class="dot" style="background:var(--calm)"></span>agreement</div>
+      <div class="li" style="color:var(--text-muted)">▸ tall = pitch rises · thick = louder · gaps = the pauses</div>
+    </div>
+
+    <div class="controls">
+      <button class="play" id="play">▶ Play the shape</button>
+      <span class="nowlbl">click anywhere on the print to hear that second — <b>the transcript threw the sound away; Murmur kept it</b></span>
+    </div>
+
+    <div class="readout empty" id="readout">Hover the landscape — every ridge and valley is a real second you can step back into.</div>
+  </div>
+
+  <!-- Pause Garden + shape sidebar -->
+  <div class="grid2">
+    <div class="card panel">
+      <h3>The Pause Garden</h3>
+      <div class="cap">The longest, most loaded silences — the moments a transcript renders as nothing.</div>
+      <div class="pauses" id="pauses"></div>
+    </div>
+
+    <div class="card panel right">
+      <h3>Shape of the hour</h3>
+      <div class="cap">Read off the waveform — on-device, from prosody, never the words.</div>
+      <div class="shape">
+        <div>
+          <div class="row"><span class="k">Talk balance</span><span class="v">You 44% · Them 56%</span></div>
+          <div class="bar"><i style="width:44%;background:var(--accent)"></i></div>
+        </div>
+        <div>
+          <div class="row"><span class="k">Warmth</span><span class="v">high</span></div>
+          <div class="bar"><i style="width:72%;background:var(--laugh)"></i></div>
+        </div>
+        <div>
+          <div class="row"><span class="k">Tension</span><span class="v">one spike @ 16:40</span></div>
+          <div class="bar"><i style="width:38%;background:var(--tension)"></i></div>
+        </div>
+        <div>
+          <div class="row"><span class="k">Resolution</span><span class="v">landed @ 26:10</span></div>
+          <div class="bar"><i style="width:80%;background:var(--calm)"></i></div>
+        </div>
+      </div>
+      <div class="mono-note">
+        This glyph is an <b>owned file</b> — a real <code style="font-family:var(--font-mono)">.svg</code> in your Obsidian
+        vault, sitting atop the note like an album cover. A cloud notetaker kept the words and
+        <b>deleted the sound</b>; it literally cannot draw this.
+      </div>
+    </div>
+  </div>
+
+  <div class="foot">
+    <span class="big">Murmur stops showing you words <em>about</em> your meeting and starts showing you its sound &amp; shape.</span>
+    Pitch, laughter, the held breath before a yes, who carried the room — the far side captured with no bot, the prosody
+    read on-device, the glyph rendered into a file you own. None of it survives a transcript.
+    <br><br>
+    <span class="pill-tag">voice-as-sound</span><span class="pill-tag">far-side capture</span><span class="pill-tag">on-device prosody</span><span class="pill-tag">owned files</span>
+    <span class="disc">vibe prototype · fake data · procedural prosody · not production — <code style="font-family:var(--font-mono)">docs/dreams/prototypes/soundprint/</code></span>
+  </div>
+</div>
+
+<script>
+/* ── A scripted "prosody terrain" for a 38-min design review. We hand-author a
+      few BEATS (calm status → pitch-y presentation → the argument → laughter →
+      the loaded pause → resolution → wind-down) and procedurally fill a smooth
+      envelope between them for each thread (You / Others). Fake data; the point
+      is the FEELING of a conversation you can see. ── */
+const DUR = 38*60;               // seconds
+const W = 1000, H = 300, MID = H/2;
+
+// beats: {t(min), meEnergy, themEnergy, mePitch, themPitch, tone}
+// energy 0..1 (loudness→thickness), pitch 0..1 (→height), tone drives event color
+const BEATS = [
+  {t:0,  me:.25, them:.30, mp:.35, tp:.35, tone:'calm'},   // settling in
+  {t:3,  me:.30, them:.28, mp:.40, tp:.35, tone:'calm'},   // status
+  {t:6,  me:.70, them:.22, mp:.62, tp:.30, tone:'neutral'},// you present the mocks
+  {t:11, me:.66, them:.35, mp:.60, tp:.45, tone:'neutral'},
+  {t:14, me:.55, them:.60, mp:.66, tp:.62, tone:'tension'},// scope disagreement building
+  {t:16, me:.80, them:.82, mp:.82, tp:.80, tone:'tension'},// THE ARGUMENT (16:40 spike)
+  {t:18, me:.60, them:.58, mp:.58, tp:.55, tone:'tension'},
+  {t:21, me:.45, them:.40, mp:.44, tp:.40, tone:'neutral'},// cooling
+  {t:22, me:.55, them:.72, mp:.55, tp:.78, tone:'laugh'},  // someone cracks a joke (22:20)
+  {t:24, me:.30, them:.34, mp:.34, tp:.36, tone:'calm'},   // easing
+  {t:25.5,me:.18,them:.16, mp:.26, tp:.24, tone:'pause'},  // the loaded 4.2s pause (~26:00)
+  {t:26.2,me:.40,them:.52, mp:.42, tp:.50, tone:'calm'},   // "…yes. let's do it." resolution
+  {t:30, me:.42, them:.38, mp:.40, tp:.38, tone:'calm'},   // action items
+  {t:34, me:.34, them:.30, mp:.34, tp:.32, tone:'calm'},
+  {t:38, me:.22, them:.20, mp:.28, tp:.26, tone:'calm'},
+];
+// events rendered as glyphs on the print: {t(min), kind}
+const EVENTS = [
+  {t:16.67, kind:'tension'},   // 16:40
+  {t:22.33, kind:'laugh'},     // 22:20
+  {t:26.0,  kind:'pause'},     // the held breath
+  {t:26.17, kind:'calm'},      // the yes
+];
+
+// spoken moments keyed by minute → what you'd hear if you clicked there
+const MOMENTS = [
+  {t:2,   who:'them', mm:'2:10',  q:"Quick status before we dive in — onboarding's at 80%.", tone:'even, unhurried'},
+  {t:8,   who:'me',   mm:'8:05',  q:"Here's the trimmed flow — onboarding, search, note detail. Everything else waits.", tone:'your voice rising, making the case'},
+  {t:16.67,who:'them',mm:'16:40', q:"That's not the scope we agreed. We can't cut the settings redesign.", tone:'fast, overlapping — the sharpest moment of the call'},
+  {t:22.33,who:'me', mm:'22:20', q:"Okay, okay — I'm not trying to gold-plate a login screen.", tone:'laughter breaks the tension'},
+  {t:26.0, who:'them',mm:'26:00', q:"…", tone:'4.2 seconds of silence before she answers'},
+  {t:26.17,who:'them',mm:'26:10', q:"Yes. Let's do it. Ship the three flows.", tone:'quiet, settled — the room lets its breath out'},
+  {t:31,  who:'me',   mm:'31:15', q:"Anya owns onboarding mocks by Friday. I'll circulate the trimmed deck.", tone:'calm, wrapping up'},
+];
+
+const PAUSES = [
+  {dur:'4.2s', k:'before she said “yes”', s:'26:00 · the whole decision hung here', at:26.0},
+  {dur:'2.8s', k:'after the hard question', s:'16:52 · nobody wanted to answer first', at:16.87},
+  {dur:'3.1s', k:'before “I disagree”', s:'14:20 · you could hear him deciding to say it', at:14.33},
+];
+
+const toneColor = t => ({calm:'#4ce0a0',neutral:'#8a90ff',tension:'#ff6b6b',laugh:'#ffe08a',pause:'#6c6c7d'}[t]||'#8a90ff');
+
+// linear-interpolate a beat field across time (in seconds) → smooth value
+function sample(field, tSec){
+  const tm = tSec/60;
+  for(let i=0;i<BEATS.length-1;i++){
+    const a=BEATS[i], b=BEATS[i+1];
+    if(tm>=a.t && tm<=b.t){
+      const f=(tm-a.t)/(b.t-a.t);
+      const e=f*f*(3-2*f); // smoothstep
+      return a[field]+(b[field]-a[field])*e;
+    }
+  }
+  return BEATS[BEATS.length-1][field];
+}
+// small deterministic wobble so the ridges look organic (seeded, no Math.random in path)
+function wobble(x, seed){ return Math.sin(x*0.9+seed)*0.5 + Math.sin(x*2.3+seed*1.7)*0.28 + Math.sin(x*5.1+seed)*0.12; }
+
+function buildPath(field, pitchField, seed, dir){
+  // dir: -1 = up from mid (You, top), +1 = down (Others, bottom)
+  const N=240; const top=[], bot=[];
+  for(let i=0;i<=N;i++){
+    const x=i/N*W;
+    const tSec=i/N*DUR;
+    const energy=sample(field,tSec);
+    const pitch=sample(pitchField,tSec);
+    const w=wobble(i*0.13, seed);
+    const amp=(6 + energy*118 + pitch*36) * (1 + 0.16*w);  // thickness/height
+    const base=MID + dir*8;
+    top.push([x, base]);
+    bot.push([x, base + dir*amp]);
+  }
+  let d='M'+top[0][0]+','+top[0][1];
+  for(let i=1;i<top.length;i++) d+='L'+top[i][0].toFixed(1)+','+top[i][1].toFixed(1);
+  for(let i=bot.length-1;i>=0;i--) d+='L'+bot[i][0].toFixed(1)+','+bot[i][1].toFixed(1);
+  return d+'Z';
+}
+
+function render(){
+  const svg=document.getElementById('svg');
+  const meColor='#6e76ff', themColor='#ff9d5c';
+  let defs=`<defs>
+    <linearGradient id="gme" x1="0" y1="1" x2="0" y2="0">
+      <stop offset="0" stop-color="${meColor}" stop-opacity="0.05"/>
+      <stop offset="1" stop-color="${meColor}" stop-opacity="0.85"/>
+    </linearGradient>
+    <linearGradient id="gthem" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="${themColor}" stop-opacity="0.05"/>
+      <stop offset="1" stop-color="${themColor}" stop-opacity="0.8"/>
+    </linearGradient>
+    <filter id="soft"><feGaussianBlur stdDeviation="0.6"/></filter>
+  </defs>`;
+  const meP  = buildPath('me','mp', 1.3, -1);
+  const themP= buildPath('them','tp', 4.1, +1);
+  // event glyphs
+  let ev='';
+  for(const e of EVENTS){
+    const x=e.t*60/DUR*W;
+    if(e.kind==='laugh'){
+      ev+=`<circle cx="${x.toFixed(1)}" cy="${MID-70}" r="26" fill="${toneColor('laugh')}" opacity="0.16"/>
+           <circle cx="${x.toFixed(1)}" cy="${MID-70}" r="11" fill="${toneColor('laugh')}" opacity="0.5"/>`;
+    }else if(e.kind==='tension'){
+      for(let k=-3;k<=3;k++)
+        ev+=`<line x1="${(x+k*4).toFixed(1)}" y1="30" x2="${(x+k*4).toFixed(1)}" y2="${H-30}" stroke="${toneColor('tension')}" stroke-width="1.4" opacity="${0.10+ (3-Math.abs(k))*0.06}"/>`;
+    }else if(e.kind==='pause'){
+      ev+=`<rect x="${(x-9).toFixed(1)}" y="0" width="18" height="${H}" fill="#000" opacity="0.35"/>
+           <text x="${x.toFixed(1)}" y="${MID+5}" fill="#6c6c7d" font-size="20" text-anchor="middle" font-family="monospace">···</text>`;
+    }else if(e.kind==='calm'){
+      ev+=`<circle cx="${x.toFixed(1)}" cy="${MID+66}" r="8" fill="${toneColor('calm')}" opacity="0.55"/>`;
+    }
+  }
+  // faint baseline
+  const baseLine=`<line x1="0" y1="${MID}" x2="${W}" y2="${MID}" stroke="#ffffff" stroke-opacity="0.06" stroke-width="1"/>`;
+  svg.innerHTML=defs+baseLine+
+    `<path d="${themP}" fill="url(#gthem)" filter="url(#soft)"/>`+
+    `<path d="${meP}" fill="url(#gme)" filter="url(#soft)"/>`+
+    ev;
+}
+
+/* ── interaction ── */
+const print=document.getElementById('print');
+const pick=document.getElementById('pick');
+const playhead=document.getElementById('playhead');
+const readout=document.getElementById('readout');
+
+function nearestMoment(tSec){
+  let best=MOMENTS[0], bd=1e9;
+  for(const m of MOMENTS){ const d=Math.abs(m.t*60-tSec); if(d<bd){bd=d;best=m;} }
+  return best;
+}
+function fmt(tSec){const m=Math.floor(tSec/60),s=Math.floor(tSec%60);return m+':'+String(s).padStart(2,'0');}
+function showMoment(m){
+  readout.className='readout';
+  const cls=m.who==='me'?'me':'them';
+  const label=m.who==='me'?'You':'Anya (Acme)';
+  readout.innerHTML=`<div class="stamp">${m.mm}</div>
+    <div><div class="who ${cls}">${label}</div>
+      <div class="q">${m.q==='…'?'<span style="letter-spacing:.3em;color:var(--text-muted)">— silence —</span>':'“'+m.q+'”'}</div>
+      <div class="tone">🎧 ${m.tone}</div></div>`;
+  speak(m);
+}
+
+// optional real audio: speak the moment (progressive enhancement; silent if unsupported/headless)
+let voices=[];
+function loadVoices(){ try{voices=window.speechSynthesis.getVoices();}catch(_){}}
+try{ loadVoices(); window.speechSynthesis.onvoiceschanged=loadVoices; }catch(_){}
+function speak(m){
+  if(!('speechSynthesis' in window) || m.q==='…') return;
+  try{
+    window.speechSynthesis.cancel();
+    const u=new SpeechSynthesisUtterance(m.q);
+    u.rate=0.98; u.pitch=m.who==='me'?1.0:1.12; u.volume=0.9;
+    const v=voices.find(v=>/en[-_]/i.test(v.lang));
+    if(v)u.voice=v;
+    window.speechSynthesis.speak(u);
+  }catch(_){}
+}
+
+print.addEventListener('mousemove', e=>{
+  const r=print.getBoundingClientRect();
+  const x=Math.max(0,Math.min(r.width, e.clientX-r.left));
+  pick.style.left=x+'px';
+});
+print.addEventListener('click', e=>{
+  const r=print.getBoundingClientRect();
+  const x=(e.clientX-r.left)/r.width;
+  const tSec=x*DUR;
+  playAt(tSec);
+  showMoment(nearestMoment(tSec));
+});
+
+/* playhead animation */
+let playing=false, rafId=null, startWall=0, startT=0;
+function setHead(tSec){ playhead.style.left=(tSec/DUR*100)+'%'; }
+function playAt(tSec){ startT=tSec; startWall=performance.now(); if(!playing) tick(); else {playing=true;} setHead(tSec); }
+function tick(){
+  playing=true;
+  const loop=(now)=>{
+    if(!playing) return;
+    const el=(now-startWall)/1000 * 24;   // 24× speed so 38min plays in ~95s; feels alive
+    let t=startT+el;
+    if(t>=DUR){ t=DUR; playing=false; document.getElementById('play').textContent='▶ Play the shape'; }
+    setHead(t);
+    // surface the moment as the head crosses it
+    const m=MOMENTS.find(mm=>Math.abs(mm.t*60-t)<6);
+    if(m && m!==tick._last){ tick._last=m; showMoment(m); }
+    if(playing) rafId=requestAnimationFrame(loop);
+  };
+  rafId=requestAnimationFrame(loop);
+}
+document.getElementById('play').addEventListener('click', function(){
+  if(playing){ playing=false; this.textContent='▶ Play the shape'; try{window.speechSynthesis.cancel();}catch(_){}}
+  else { this.textContent='❚❚ Pause'; playAt(0); }
+});
+
+/* Pause Garden */
+const pausesEl=document.getElementById('pauses');
+PAUSES.forEach(p=>{
+  const el=document.createElement('div');
+  el.className='pause';
+  let rip=''; for(let i=0;i<9;i++){ const h=4+Math.round(Math.abs(Math.sin(i*1.3))*14); rip+=`<i style="height:${h}px"></i>`; }
+  el.innerHTML=`<div class="dur">${p.dur}</div>
+    <div class="txt"><div class="k">The pause ${p.k}</div><div class="s">${p.s}</div>
+      <div class="rip">${rip}</div></div>`;
+  el.addEventListener('click', ()=>{ playAt(p.at*60); showMoment(nearestMoment(p.at*60)); window.scrollTo({top:0,behavior:'smooth'}); });
+  pausesEl.appendChild(el);
+});
+
+render();
+setHead(0);
+</script>
+</body>
+</html>
