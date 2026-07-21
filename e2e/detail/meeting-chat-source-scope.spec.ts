@@ -50,7 +50,9 @@ test("meeting chat pre-fills this meeting + its links and sends chat_meeting wit
 
   await page.goto("/meeting/m-atlas-roadmap");
 
-  // The meeting chat is on the default Note tab.
+  // "Ask about this meeting" now lives in a summoned right-side drawer (default-
+  // closed); open it via the header ✦ Ask button, then the chat is visible.
+  await page.getByRole("button", { name: /Ask/ }).click();
   const chat = page.locator("app-meeting-chat");
   await expect(chat).toBeVisible({ timeout: 10_000 });
 

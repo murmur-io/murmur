@@ -368,15 +368,25 @@ export class AudioPanelComponent {
   /**
    * Apply a pending note-receipt seek (Brain v3 PR-5): when the shell sets
    * `seekTarget` (and switches to this tab), seek the player to the claim's
-   * second of audio and PULSE the matching transcript segment so the eye lands
-   * on the exact line that proves the claim. Tracks `seq` (bumped by the shell)
-   * so re-clicking the SAME receipt re-arms; `flashSeq` re-arms the pure-CSS
-   * animation when the SAME segment is receipted twice (a net-zero `flashSegId`
-   * write wouldn't restart it). Consumption is ONE-SHOT: after applying, the
-   * effect acks via `seekConsumed` so the shell nulls the input — a later
-   * Audio-tab revisit (a fresh panel instance) must not replay the seek/flash.
-   * Legitimate signal-writing effect (T1): it reacts to an input and drives the
-   * player — no async fetch, no stale race.
+   * second of audio and ARM a PULSE over the matching transcript segment so the
+   * eye lands on the exact line that proves the claim. Tracks `seq` (bumped by
+   * the shell) so re-clicking the SAME receipt re-arms; `flashSeq` re-arms the
+   * pure-CSS animation when the SAME segment is receipted twice (a net-zero
+   * `flashSegId` write wouldn't restart it). Consumption is ONE-SHOT: after
+   * applying, the effect acks via `seekConsumed` so the shell nulls the input —
+   * a later Audio-tab revisit (a fresh panel instance) must not replay the
+   * seek/flash. Legitimate signal-writing effect (T1): it reacts to an input and
+   * drives the player — no async fetch, no stale race.
+   *
+   * This ONLY sets the panel-local flash STATE (`flashSegId`/`flashSeq`) + seeks
+   * — the DOM work (scroll-into-view + deterministic pulse restart) lives in the
+   * separate `_scrollFlashIntoView` effect below, because the transcript
+   * `segments` are now fetched LAZILY (off the Note tab): when a receipt is
+   * clicked from the Note tab, `seekTarget` arrives BEFORE the segments do, so
+   * the flashed `.frag` does not exist yet at this moment. Doing the DOM lookup
+   * here (a one-shot `afterNextRender`) would fire against the still-empty
+   * transcript and never scroll/restart. Splitting it lets the DOM step run when
+   * the fragment actually renders (on segments-arrival).
    */
   private readonly _applyReceiptSeek = effect(() => {
     const target = this.seekTarget();
@@ -391,10 +401,35 @@ export class AudioPanelComponent {
     // Ack consumption (the shell nulls `seekTarget`; the flash/karaoke state
     // above is panel-local and survives — only the REPLAY trigger is retired).
     this.seekConsumed.emit(target.seq);
-    // Restart the pure-CSS pulse deterministically (a repeat of the SAME segment
-    // keeps the `.is-flash` class, so the animation wouldn't retrigger on its own)
-    // and bring the flashed fragment into view. One-shot, zoneless-safe: no timer.
+  });
+
+  /**
+   * Bring the flashed receipt fragment into view + restart its pulse — keyed on
+   * both `flashKey()` (a fresh receipt) AND `renderedTurns()` (the transcript
+   * DOM). With LAZY segments the transcript can render AFTER the flash is armed
+   * (a receipt clicked from the Note tab arrives before its segments), so this
+   * re-runs when the segments finally land and the flashed `.frag` exists —
+   * fixing the "seek/flash must resolve when segments ARRIVE, not only when
+   * seekTarget arrives" case. A no-op while nothing is flashed or the fragment
+   * isn't in the rendered window yet; the `renderedTurns` window itself prefers
+   * the flashed segment (see `flashIdx`) so it enters the bounded view. One-shot
+   * `afterNextRender` per run, zoneless-safe (no timer).
+   */
+  /** The `flashKey` this panel has already scrolled+restarted for (once-per-key guard). */
+  private lastScrolledFlashKey = "";
+  private readonly _scrollFlashIntoView = effect(() => {
+    const flashSeg = this.flashSegId();
     const key = this.flashKey();
+    // Depend on the rendered transcript so a lazy segments-arrival re-runs this.
+    const turns = this.renderedTurns();
+    // Once-per-flash: a receipt is a distinct `flashKey` (flashSeq bumps per
+    // click). Only act while a fresh flash is armed AND we haven't already
+    // resolved it — so ordinary `renderedTurns()` churn during playback (a
+    // moving playhead) never re-scrolls a lingering flash, but a lazy
+    // segments-arrival for a not-yet-resolved key still does.
+    if (flashSeg === null || turns.length === 0 || key === this.lastScrolledFlashKey) {
+      return;
+    }
     afterNextRender(
       () => {
         const box = this.scroller()?.nativeElement;
@@ -402,8 +437,11 @@ export class AudioPanelComponent {
           `.frag[data-flash="${CSS.escape(key)}"]`,
         );
         if (!frag) {
-          return;
+          return; // not rendered yet — a later renderedTurns() change re-runs us
         }
+        // Mark this key resolved only once the fragment truly exists, so we keep
+        // retrying across renders until the lazy segments land.
+        this.lastScrolledFlashKey = key;
         // Force the browser to drop the running animation, then re-apply it on
         // the next frame — the canonical restart with no `@angular/animations`.
         frag.style.animation = "none";

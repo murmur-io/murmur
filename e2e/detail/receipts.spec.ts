@@ -54,35 +54,41 @@ test.describe("Detail — Receipts (claim → second of audio)", () => {
             "---\ntitle: Receipts meeting\nattendees: Anna, Bob\n---\n## Decisions\n\nWe will ship the redaction firewall next sprint.\nThe infra migration wrapped up late in the session.",
           exportedPath: null,
         },
-        segments: [
-          {
-            idx: 0,
-            startS: 0,
-            endS: 30,
-            text: "Intro chatter before the decision.",
-            speaker: "others",
-          },
-          {
-            idx: 1,
-            startS: 120,
-            endS: 150,
-            text: "We will ship the redaction firewall next sprint.",
-            speaker: "me",
-          },
-          {
-            idx: 2,
-            startS: 7527,
-            endS: 7560,
-            text: "The infra migration wrapped up late in the session.",
-            speaker: "others",
-          },
-        ],
+        // The detail DTO now ships EMPTY segments (perf: transcript off the Note tab); the
+        // transcript is fetched LAZILY via `get_meeting_segments` when the Audio tab opens.
+        segments: [],
         assistantInteractions: [],
         locked: false,
         aiProvider: null,
         aiModel: null,
         modelServed: null,
       }),
+      // Lazy transcript segments, arriving AFTER the receipt click switches to the Audio tab —
+      // this exercises the flash-resolves-on-segments-arrival path (the `_scrollFlashIntoView`
+      // effect keyed on renderedTurns), not just the seekTarget-arrival path.
+      get_meeting_segments: () => [
+        {
+          idx: 0,
+          startS: 0,
+          endS: 30,
+          text: "Intro chatter before the decision.",
+          speaker: "others",
+        },
+        {
+          idx: 1,
+          startS: 120,
+          endS: 150,
+          text: "We will ship the redaction firewall next sprint.",
+          speaker: "me",
+        },
+        {
+          idx: 2,
+          startS: 7527,
+          endS: 7560,
+          text: "The infra migration wrapped up late in the session.",
+          speaker: "others",
+        },
+      ],
       // The Audio tab's side reads, with their REAL backend shapes (serde gives
       // `[]`/`false`, never undefined — the base mock's undefined fallback made
       // the timeline's `suggestionByLabel` computed throw "not iterable" during
