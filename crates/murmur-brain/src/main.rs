@@ -253,7 +253,16 @@ fn load_model(
     // after the first few generations, so the 2nd+ call samples from NaN/Inf logits ("za drugim
     // razem"). A RESIDENT child answering MANY requests is PRECISELY that multi-generation scenario,
     // so this line is even more load-bearing here than in-process: every request gets a FRESH KV cache.
-    .with_prefix_cache_n(None);
+    .with_prefix_cache_n(None)
+    // KV FOOTPRINT — clamp the scheduler to a SINGLE concurrent sequence. `GgufModelBuilder` defaults
+    // `max_num_seqs` to 32 (mistralrs 0.8.1 `gguf.rs`), which sizes the scheduler — and the reserved
+    // KV headroom — for 32 sequences this sidecar NEVER runs: generation is strictly one-request-at-a-
+    // time (`generate_blocking` below; the app dispatches single-flight over NDJSON). Pinning it to 1
+    // matches actual usage and removes the 32-slot concurrency reservation. Correct + harmless for BOTH
+    // the light and heavy children (neither serves concurrent requests); it never constrains a lone
+    // request's own prefill/decode. The exact resident-GB win is a Metal/KV-allocator property — MEASURE
+    // it with `footprint` on a signed Mac (`scripts/measure-recording-ram.sh` shows the sidecar plateau).
+    .with_max_num_seqs(1);
 
     // `build()` is async → drive it to completion on a scoped thread so it never trips the
     // nested-runtime panic. It returns `anyhow::Result<Model>`.
