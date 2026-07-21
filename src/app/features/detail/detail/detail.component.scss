@@ -47,6 +47,83 @@
 .head h2 {
   margin: 0;
 }
+/* Header actions cluster (the ✦ Ask summon button), right-aligned by the
+   .head's space-between; never shrinks below its content. */
+.head-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex: none;
+}
+/* Ask summon toggle (ported from note-editor's Ask Brain): the glyph adopts the
+   accent, and the active (drawer-open) state reads as a pressed neutral pill
+   with the accent glyph/label. */
+.head-chat-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  height: 32px;
+  padding: 0 var(--space-3);
+  font-size: 0.85rem;
+}
+.head-chat-glyph {
+  color: var(--accent);
+}
+.head-chat-btn.is-active {
+  background: var(--surface-hover);
+  color: var(--accent-hover);
+}
+.head-chat-btn.is-active .head-chat-glyph {
+  color: var(--accent-hover);
+}
+
+/* ===== Ask drawer (right-docked slideout) =====
+   A FLOATING, OPAQUE right-docked panel (trap T3): the .detail is a normal
+   document-flow scrolling column (not a height-bounded flex viewport like the
+   note editor), so an in-flow side column would force restructuring every tab —
+   this floats instead. OPAQUE (var(--surface-overlay) + backdrop-filter:none),
+   NOT the frosted .card / the Notes in-flow --surface-raised tone, or the tab
+   content bleeds through. Sits at the org-share-sheet overlay tier. `display:flex`
+   so the bare chat fills the full height (its own log scrolls, composer pinned). */
+.ask-drawer {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 100;
+  width: clamp(320px, 30vw, 420px);
+  display: flex;
+  flex-direction: column;
+  background: var(--surface-overlay);
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+  border-left: 1px solid var(--border-strong);
+  box-shadow: var(--shadow-lg);
+  animation: ask-drawer-in var(--transition);
+}
+/* The bare chat fills the whole drawer as ONE flat surface (its log owns the
+   scroll, so the composer pins to the bottom with no empty strip below). */
+.ask-drawer app-meeting-chat {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+@keyframes ask-drawer-in {
+  from {
+    opacity: 0;
+    transform: translateX(16px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .ask-drawer {
+    animation: none;
+  }
+}
 .meta {
   display: flex;
   flex-wrap: wrap;

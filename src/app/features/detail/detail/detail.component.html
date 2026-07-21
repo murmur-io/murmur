@@ -143,6 +143,44 @@
           }
         }
       </div>
+
+      <!-- Ask about this meeting — summons the right-side chat drawer (below).
+           Hidden while locked (nothing to ask a masked meeting). Inline SVG spark
+           glyph (no icon lib, per convention); mirrors note-editor's Ask Brain. -->
+      @if (!locked()) {
+        <div class="head-actions">
+          <button
+            type="button"
+            class="btn btn-ghost head-chat-btn"
+            [class.is-active]="askDrawerOpen()"
+            [attr.aria-expanded]="askDrawerOpen()"
+            (click)="toggleAskDrawer()"
+          >
+            <svg
+              class="head-chat-glyph"
+              viewBox="0 0 16 16"
+              width="13"
+              height="13"
+              fill="none"
+              aria-hidden="true"
+            >
+              <path
+                d="M8 1.5l1.3 3.2L12.5 6 9.3 7.3 8 10.5 6.7 7.3 3.5 6l3.2-1.3L8 1.5Z"
+                stroke="currentColor"
+                stroke-width="1.2"
+                stroke-linejoin="round"
+              />
+              <path
+                d="M12.5 10.5l.6 1.4 1.4.6-1.4.6-.6 1.4-.6-1.4-1.4-.6 1.4-.6.6-1.4Z"
+                stroke="currentColor"
+                stroke-width="1.1"
+                stroke-linejoin="round"
+              />
+            </svg>
+            Ask
+          </button>
+        </div>
+      }
     </header>
 
     <!-- ============================================================= -->
@@ -318,7 +356,7 @@
           <app-audio-panel
             #audioPanel
             [audioSrc]="audioSrc()"
-            [segments]="d.segments"
+            [segments]="segments()"
             [seekTarget]="seekTarget()"
             [timeline]="timeline()"
             [timelineTotal]="timelineTotal()"
@@ -350,6 +388,24 @@
             (changed)="onShareChanged()"
           />
         }
+      }
+
+      <!-- Ask about this meeting — a FLOATING, OPAQUE right-docked drawer (T3:
+           var(--surface-overlay) + backdrop-filter:none, NOT the frosted .card).
+           Hosted here (not per-tab) so the conversation survives tab switches;
+           the `askDrawerOpen() && !locked()` reactive guard tears it down the
+           moment the meeting locks while open. `d.meeting` is the current
+           (unlocked) meeting — safe to pass its title/id. -->
+      @if (askDrawerOpen() && !locked()) {
+        <aside class="ask-drawer" aria-label="Ask about this meeting">
+          <app-meeting-chat
+            [bare]="true"
+            [showClose]="true"
+            [meetingId]="d.meeting.id"
+            [anchorTitle]="d.meeting.title"
+            (closed)="closeAskDrawer()"
+          />
+        </aside>
       }
     }
   } @else if (loading()) {

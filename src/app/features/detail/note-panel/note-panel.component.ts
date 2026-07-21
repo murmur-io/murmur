@@ -17,7 +17,6 @@ import { AssistantSourcesComponent } from "../../../shared/assistant-sources/ass
 import { ConnectionsComponent } from "../../../shared/connections/connections.component";
 import { MoveToMenuComponent } from "../../folders/move-to-menu/move-to-menu.component";
 import { MeetingActionsComponent } from "../meeting-actions/meeting-actions.component";
-import { MeetingChatComponent } from "../meeting-chat/meeting-chat.component";
 import { RelatedMeetingsComponent } from "../related-meetings/related-meetings.component";
 import { Stage2PanelComponent } from "../stage2-panel/stage2-panel.component";
 
@@ -123,7 +122,6 @@ export interface AssistantQa {
     ConnectionsComponent,
     MoveToMenuComponent,
     MeetingActionsComponent,
-    MeetingChatComponent,
     RelatedMeetingsComponent,
     Stage2PanelComponent,
   ],

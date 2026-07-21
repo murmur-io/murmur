@@ -1,21 +1,38 @@
-<div class="chat card">
+<div class="chat" [class.card]="!bare()" [class.is-bare]="bare()">
   <div class="chat-head">
     <div class="chat-head-text">
       <h3 class="chat-title">Ask about this meeting</h3>
-      <span class="chat-sub"
-        >Answers use this transcript and selected sources</span
-      >
+      <!-- The sub-line reads as a second header row; in BARE (drawer) mode it would break the
+           single-row header band's alignment with the meeting header, and the empty state already
+           says the same thing — so it's shown only in the standalone card. -->
+      @if (!bare()) {
+        <span class="chat-sub"
+          >Answers use this transcript and selected sources</span
+        >
+      }
     </div>
-    @if (conversation().length) {
-      <button
-        type="button"
-        class="btn btn-ghost chat-clear"
-        (click)="clear()"
-        [disabled]="pending()"
-      >
-        Clear
-      </button>
-    }
+    <div class="chat-head-actions">
+      @if (conversation().length) {
+        <button
+          type="button"
+          class="btn btn-ghost chat-clear"
+          (click)="clear()"
+          [disabled]="pending()"
+        >
+          Clear
+        </button>
+      }
+      @if (showClose()) {
+        <button
+          type="button"
+          class="chat-close"
+          aria-label="Close Ask"
+          (click)="closed.emit()"
+        >
+          ×
+        </button>
+      }
+    </div>
   </div>
 
   <!-- Message list (also the scroll region) -->
