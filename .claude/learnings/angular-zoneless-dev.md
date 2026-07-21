@@ -83,6 +83,28 @@
   silently end the literal. When a workflow phase agent dies mid-response, expect a half-applied tree.
 - **Status:** journal
 
+### [2026-07-21 PR#423 meeting-detail perf] Making a data source LAZY breaks any one-shot DOM effect keyed on a DIFFERENT trigger
+- **Pattern:** the meeting transcript `segments` moved from an eager DTO field to a LAZY fetch (loaded only
+  when the Audio tab opens). The audio-panel's receipt-seek did its scroll-into-view + pulse-restart in a
+  ONE-SHOT `afterNextRender` fired from `_applyReceiptSeek`, keyed only on `seekTarget()`. With lazy
+  segments, a receipt clicked from the Note tab sets `seekTarget` BEFORE the segments (and thus the `.frag`)
+  exist → the DOM lookup ran against an EMPTY transcript and silently no-opped (no scroll, no pulse). A
+  green `ng build` + the old tests (which baked segments into the detail DTO) hid it entirely.
+- **Fix:** SPLIT the effect. `_applyReceiptSeek` sets only panel-local flash STATE (`flashSegId`/`flashSeq`)
+  + seeks; a NEW `_scrollFlashIntoView` effect keyed on BOTH `flashKey()` AND `renderedTurns()` does the DOM
+  scroll+pulse, so it RE-RUNS when the lazily-fetched segments finally render. A `lastScrolledFlashKey`
+  field makes it once-per-flash (ordinary playback `renderedTurns()` churn never re-scrolls a lingering
+  flash; a segments-arrival for a not-yet-resolved key still does). Verified: deep seek to turn #999 in a
+  lazy 1000-turn transcript resolves.
+- **Caught by:** the FE builder itself (I flagged the watch-item in dispatch); confirmed by the
+  adversarial-verifier driving `receipts.spec.ts` + `transcript-cap.spec.ts` against the real lazy path.
+- **Lesson:** when you make a data source lazy/async, AUDIT every effect that does a one-shot DOM read on a
+  DIFFERENT trigger — it will fire against not-yet-rendered DOM. Re-key the DOM step on the RENDERED list
+  (`renderedTurns()`/the `@for` source) with a once-per-key guard, so it retries across renders until the
+  element exists. Update any test that baked the (now-lazy) data into the eager DTO to the new fetch shape,
+  or it silently masks the regression.
+- **Status:** journal
+
 ### [2026-07-04 PR#181 Murmur Brain] Preset command + reactive form dual-write → the stale form CLOBBERS the preset on next save (CRITICAL)
 - **Pattern:** a "posture" preset was applied via a Tauri command that wrote the `role_*` / `brain_backend`
   DB config keys directly. But the Settings page's reactive form still held the STALE key values from its
