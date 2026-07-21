@@ -56,6 +56,7 @@ import type {
   Meeting,
   MeetingDetail,
   MeetingTimeline,
+  Segment,
   SpeakerSuggestion,
   VoiceprintInfo,
   ModelDownloadProgress,
@@ -1748,6 +1749,18 @@ export class IpcService {
    */
   getTimeline(meetingId: string): Promise<MeetingTimeline> {
     return invoke<MeetingTimeline>("get_timeline", { meetingId });
+  }
+
+  /**
+   * The meeting's transcript segments, fetched LAZILY only when the Audio tab
+   * opens (`get_meeting_detail` now returns an EMPTY `segments` so a plain
+   * Note-tab open never ships the whole transcript). GATED server-side exactly
+   * like every content read: a sealed-and-not-session-unlocked meeting returns
+   * `[]`, never leaking transcript text behind the lock. Mirrors
+   * {@link getTimeline}'s `{ meetingId }` invoke-arg convention.
+   */
+  getMeetingSegments(meetingId: string): Promise<Segment[]> {
+    return invoke<Segment[]>("get_meeting_segments", { meetingId });
   }
 
   /**

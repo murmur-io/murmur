@@ -30,6 +30,7 @@ import type {
   MeetingDetail,
   MeetingOrgShareInfo,
   MeetingTimeline,
+  Segment,
   SpeakerSuggestion,
 } from "../../../core/models";
 import {
@@ -39,6 +40,7 @@ import {
 import { ToastService } from "../../../services/toast.service";
 import { LockBadgeComponent } from "../../folders/lock-badge/lock-badge.component";
 import { AudioPanelComponent } from "../audio-panel/audio-panel.component";
+import { MeetingChatComponent } from "../meeting-chat/meeting-chat.component";
 import {
   DetailTabsComponent,
   type DetailTab,
@@ -69,6 +71,7 @@ interface ActionItem {
     DetailTabsComponent,
     NotePanelComponent,
     AudioPanelComponent,
+    MeetingChatComponent,
     SharePanelComponent,
     VerifyPanelComponent,
   ],
@@ -140,6 +143,16 @@ export class DetailComponent implements OnInit {
     panel?.pausePlayback();
     panel?.collapseTranscript();
   }
+
+  // --- Ask-about-this-meeting slideout drawer -----------------------------
+  /**
+   * True while the right-side "Ask about this meeting" drawer is open. Hosted in
+   * this shell (not `note-panel`) so the conversation survives Note/Audio/Share
+   * tab switches AND the chat's `_prefill` runs once per meeting (not on every
+   * Note-tab open). Default-closed, NOT persisted (a fresh ask each open).
+   */
+  private readonly _askDrawerOpen = signal(false);
+  readonly askDrawerOpen = this._askDrawerOpen.asReadonly();
 
   // --- Move-to-folder popover ---------------------------------------------
   /** True while the folder-picker popover is open. */
@@ -467,6 +480,25 @@ export class DetailComponent implements OnInit {
     return { model: model ?? "", provider: provider ?? "" };
   });
 
+  // --- Lazy transcript segments (perf: off the Note tab) ------------------
+  /**
+   * The meeting's transcript segments — fetched LAZILY only when the Audio tab
+   * first opens (mirrors the lazy-timeline latch below). `get_meeting_detail`
+   * now returns an EMPTY `segments`, so a plain Note-tab open never ships the
+   * whole transcript; the Audio panel reads this signal instead of `d.segments`.
+   */
+  readonly segments = signal<Segment[]>([]);
+  /** True while the (gated) `get_meeting_segments` read is in flight. */
+  readonly segmentsLoading = signal(false);
+  /**
+   * One-shot latch (mirror of `_timelineAttempted`): the meeting id whose
+   * Audio-tab segments read has already been attempted this open, so the
+   * `_segmentsOnAudioTab` effect can never re-enter for the same meeting even
+   * when the backend returns an empty list (a legitimately transcript-less
+   * meeting). Cleared per meeting in `loadMeeting` and on `maskLocally`.
+   */
+  private readonly _segmentsAttempted = signal<string | null>(null);
+
   // --- Interactive timeline (speaker + topic viz) -------------------------
   readonly timeline = signal<MeetingTimeline | null>(null);
   readonly timelineLoading = signal(false);
@@ -516,6 +548,72 @@ export class DetailComponent implements OnInit {
       void this.loadTimeline();
     }
   });
+
+  /**
+   * PERF (transcript off the Note tab): fetch the transcript segments LAZILY —
+   * only when the Audio tab (the only surface that renders them) is first opened
+   * for an unlocked meeting and they aren't already in flight. Same guard shape
+   * as `_timelineOnAudioTab`; the `_segmentsAttempted` latch makes it fire at
+   * most once per meeting-open (an empty backend result sets no other terminal
+   * signal, so without the latch it would loop). Legitimate signal-writing
+   * effect (T1): async IPC keyed on inputs with a stale-result guard in
+   * `loadSegments`. A locked() meeting never fetches (the gate returns []).
+   */
+  private readonly _segmentsOnAudioTab = effect(() => {
+    const d = this.detail();
+    const id = d?.meeting.id ?? null;
+    if (
+      this.activeTab() === "audio" &&
+      d &&
+      id &&
+      !this.locked() &&
+      !this.segmentsLoading() &&
+      // ONE-SHOT LATCH: never re-attempt the read for a meeting id already tried
+      // this open — an empty (transcript-less) result must NOT re-loop.
+      this._segmentsAttempted() !== id
+    ) {
+      void this.loadSegments();
+    }
+  });
+
+  /**
+   * Read the (gated) transcript segments for the current meeting. Sets the
+   * one-shot latch FIRST so the Audio-tab effect can't re-enter, guards against
+   * a concurrent in-flight read, and drops a stale result if the user navigated
+   * to another meeting mid-flight (mirrors `loadTimeline`). A gated/locked read
+   * resolves to `[]`. Never throws to the caller — a failure just leaves the
+   * transcript empty.
+   */
+  async loadSegments(): Promise<void> {
+    const id = this.detail()?.meeting.id;
+    if (!id || this.segmentsLoading()) {
+      return;
+    }
+    // Latch first (mirror of loadTimeline) so the effect never re-fires for this
+    // meeting even if the read resolves to an empty list.
+    this._segmentsAttempted.set(id);
+    this.segmentsLoading.set(true);
+    try {
+      const rows = await this.ipc.getMeetingSegments(id);
+      // STALE-RESULT + LOCK guard: drop this if the user switched meetings
+      // mid-flight (never paint meeting A's transcript into meeting B), OR if the
+      // meeting locked while the read was in flight — a late real-row reply must
+      // never (even transiently) repopulate `segments()` after `maskLocally`
+      // blanked it. It couldn't render (the `@if (locked())` teardown unmounts
+      // the audio panel) and a later unlock re-fetches, but this keeps the signal
+      // from ever holding sealed rows post-lock (lock-model belt-and-braces).
+      if (this.detail()?.meeting.id !== id || this.locked()) {
+        return;
+      }
+      this.segments.set(Array.isArray(rows) ? rows : []);
+    } catch {
+      if (this.detail()?.meeting.id === id) {
+        this.segments.set([]);
+      }
+    } finally {
+      this.segmentsLoading.set(false);
+    }
+  }
 
   /**
    * LOCK-REACTIVE re-mask (required by the tabs plan §6 — a real leak surface
@@ -613,13 +711,22 @@ export class DetailComponent implements OnInit {
       locked: true,
     });
     // Plaintext-bearing side signals the lock gate doesn't unmount fast enough
-    // to excuse: timeline topics/speakers, tags, graph entities, editor draft.
+    // to excuse: transcript segments, timeline topics/speakers, tags, graph
+    // entities, editor draft. The audio binding now reads `segments()`, so a
+    // lock transition MUST drop any fetched transcript (and reset the latch so a
+    // later unlock re-fetches on the next Audio-tab open).
+    this.segments.set([]);
+    this._segmentsAttempted.set(null);
     this.timeline.set(null);
     this.speakerSuggestions.set([]);
     this.tags.set([]);
     this.graph.set(null);
     this.editing.set(false);
     this.draft.set("");
+    // Close the Ask drawer on a lock transition so it doesn't reappear on a
+    // later unlock (the `@if (askDrawerOpen() && !locked())` guard already hides
+    // it while locked; this makes a re-summon deliberate, matching default-closed).
+    this._askDrawerOpen.set(false);
     // Receipts leak WHEN/BY-WHOM: blank them (and any pending seek) synchronously
     // on the mask, matching the note/segments/audio the masked DTO already nulls.
     this.receipts.set([]);
@@ -716,7 +823,7 @@ export class DetailComponent implements OnInit {
     for (const t of tl?.topics ?? []) {
       max = Math.max(max, t.endS);
     }
-    for (const seg of this.detail()?.segments ?? []) {
+    for (const seg of this.segments()) {
       max = Math.max(max, seg.endS);
     }
     return max;
@@ -807,6 +914,10 @@ export class DetailComponent implements OnInit {
     this.timelineNeedsGeneration.set(false);
     // Reset the Audio-tab one-shot latch so the next meeting-open may attempt its timeline read once.
     this._timelineAttempted.set(null);
+    // Same for the lazy transcript segments (drop the previous meeting's rows +
+    // reset its latch so the next Audio-tab open re-fetches for this meeting).
+    this.segments.set([]);
+    this._segmentsAttempted.set(null);
     this.speakerSuggestions.set([]);
     this.tags.set([]);
     this.graph.set(null);
@@ -885,6 +996,35 @@ export class DetailComponent implements OnInit {
         this.tags.set([]);
       }
     }
+  }
+
+  // --- Ask drawer ----------------------------------------------------------
+
+  /**
+   * Toggle the "Ask about this meeting" slideout drawer. On OPEN, focus the
+   * chat composer once it has rendered (zoneless-safe `afterNextRender` with the
+   * injected `injector` — this handler runs outside the field-init context, so
+   * the injector must be passed; no setTimeout). A no-op focus if the textarea
+   * isn't found (e.g. reduced to nothing) — never throws.
+   */
+  toggleAskDrawer(): void {
+    const willOpen = !this._askDrawerOpen();
+    this._askDrawerOpen.set(willOpen);
+    if (willOpen) {
+      afterNextRender(
+        () => {
+          document
+            .querySelector<HTMLTextAreaElement>(".ask-drawer .chat-input")
+            ?.focus();
+        },
+        { injector: this.injector },
+      );
+    }
+  }
+
+  /** Close the Ask drawer (the chat's × / the reactive lock guard). */
+  closeAskDrawer(): void {
+    this._askDrawerOpen.set(false);
   }
 
   // --- Move to folder ------------------------------------------------------

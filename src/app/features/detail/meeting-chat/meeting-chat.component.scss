@@ -28,6 +28,52 @@
   z-index: 1;
 }
 
+/* BARE mode (the Ask drawer host): NO card frame (the drawer IS the surface) and FILL the host
+   height. The chat becomes a full-height PANE — a header BAND, the scrolling log, then the pinned
+   sources + composer. The container drops its OWN padding + gap so each section spans the full pane
+   width, and the log grows to eat the slack so the composer stays pinned to the bottom. */
+.chat.is-bare {
+  flex: 1 1 auto;
+  min-height: 0;
+  padding: 0;
+  gap: 0;
+}
+.chat.is-bare::before {
+  display: none;
+}
+/* Header band — a single control row (title + close), padded like the note-chat drawer's. */
+.chat.is-bare .chat-head {
+  flex: none;
+  box-sizing: border-box;
+  padding: var(--space-4) var(--space-5) var(--space-3);
+  align-items: center;
+  border-bottom: 1px solid var(--border);
+}
+.chat.is-bare .chat-title {
+  font-size: 1.05rem;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+}
+.chat.is-bare .chat-log {
+  flex: 1 1 auto;
+  /* Bare (drawer) mode fills its host — drop the standalone card's 440px log cap. */
+  max-height: none;
+  padding: var(--space-4) var(--space-5) var(--space-2);
+}
+.chat.is-bare .chat-sources {
+  padding: 0 var(--space-5);
+  margin-bottom: 0;
+}
+.chat.is-bare .chat-composer {
+  padding: var(--space-3) var(--space-5) var(--space-4);
+}
+.chat.is-bare .chat-empty {
+  flex: 1 1 auto;
+  /* Fill + CENTER the empty state in the middle band (between the heading and the composer), so
+     there's no dead gap above it — the composer stays pinned to the bottom. */
+  justify-content: center;
+}
+
 /* --- Head --- */
 .chat-head {
   display: flex;
@@ -53,6 +99,36 @@
   height: 32px;
   padding: 0 var(--space-3);
   font-size: 0.8125rem;
+}
+.chat-head-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  flex: none;
+}
+/* Close ✕ — lives IN the header band (the pane owns its own header + close), right-aligned. */
+.chat-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  border: 0;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 1.25rem;
+  line-height: 1;
+  cursor: pointer;
+  transition: background var(--transition-fast), color var(--transition-fast);
+}
+.chat-close:hover {
+  background: var(--surface-hover);
+  color: var(--text-primary);
+}
+.chat-close:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--accent-ring);
 }
 
 /* --- Message log (scroll region) --- */

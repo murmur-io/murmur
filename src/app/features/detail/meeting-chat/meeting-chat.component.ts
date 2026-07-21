@@ -8,6 +8,7 @@ import {
   effect,
   inject,
   input,
+  output,
   signal,
   viewChild,
 } from "@angular/core";
@@ -58,6 +59,26 @@ export class MeetingChatComponent {
    * `kind + id`.
    */
   readonly anchorTitle = input<string | null>(null);
+
+  /**
+   * BARE mode (docked in the detail view's right-side Ask drawer): drop the
+   * frosted `.card` frame + aurora glow and FILL the host height, so the drawer
+   * is ONE coherent surface (no card-in-panel double border) with the composer
+   * pinned to the bottom. Defaults false ⇒ the standalone card look (no other
+   * caller exists, so the default keeps existing behavior byte-identical).
+   */
+  readonly bare = input(false);
+
+  /**
+   * Show a close (×) affordance in the header band — set by the drawer host so
+   * the chat OWNS its own header (title + close) as a single aligned pane header
+   * rather than a floating corner button. Pressing it emits {@link closed}; the
+   * host toggles the drawer shut.
+   */
+  readonly showClose = input(false);
+  /** Emitted when the header × is pressed. The drawer host closes itself. (Not `close` — that
+   *  collides with the native DOM event name and trips `@angular-eslint/no-output-native`.) */
+  readonly closed = output<void>();
 
   /**
    * Source-scoped Brain — the `<mur-source-picker>` selection (this meeting +
