@@ -348,6 +348,7 @@ pub fn run() {
             commands::list_calendar_events,
             commands::calendar_context_for,
             commands::get_meeting_detail,
+            commands::get_meeting_segments,
             commands::get_analytics,
             commands::get_timeline,
             commands::generate_timeline,
