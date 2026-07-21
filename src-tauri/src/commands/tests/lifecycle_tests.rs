@@ -4005,6 +4005,79 @@
         );
     }
 
+    /// PERF lazy-transcript READ-GATE (RED-before-GREEN): `get_meeting_segments` (the lazy Audio-tab
+    /// read that replaces the transcript `get_meeting_detail` used to ship) MUST return an EMPTY Vec
+    /// for a sealed-and-NOT-session-unlocked meeting, and the FULL transcript once the session
+    /// unlocks — byte-identical to `db.get_segments`.
+    ///
+    /// RED-if-gate-removed: `db.get_segments` is a RAW read. On seal the segment TEXT is blanked but
+    /// the ROWS remain (`raw_segments` still has 2), so the ungated call returns a NON-empty Vec of
+    /// 2 blanked-text rows. Removing the `meeting_is_unlocked` gate therefore makes the
+    /// `sealed.is_empty()` assertion FAIL — the gate is doing real work, not shadowing an already-
+    /// empty at-rest read. (Proven inline: we assert `raw_segments` == 2 while `get_meeting_segments`
+    /// == 0.)
+    #[test]
+    fn get_meeting_segments_gated() {
+        let state = build_state("get-meeting-segments-gated");
+        make_open_folder(&state.db, "f-lock", "Secret");
+        // `seed_meeting` seeds 2 plaintext segments ("alpha bravo" / "charlie delta").
+        seed_meeting(&state.db, "m1", "# note", Some("f-lock"));
+
+        // Baseline: the plaintext transcript BEFORE any seal, to compare byte-identically after unlock.
+        let plaintext = state.db.get_segments("m1").unwrap();
+        assert_eq!(plaintext.len(), 2, "precondition: 2 seeded segments");
+        assert_eq!(plaintext[0].text, "alpha bravo");
+
+        // LOCK → production seal: segment TEXT blanked at rest, rows kept (text_blob present).
+        lock_folder_inner(&state, "f-lock".to_string()).unwrap();
+        // NOT session-unlocked: `unlocked_folders` stays empty.
+
+        // The RED anchor: the RAW read still returns 2 rows (text blanked) — an UNGATED lazy read
+        // would leak exactly these, so the gate below must collapse them to [].
+        assert_eq!(
+            state.db.raw_segments("m1").unwrap().len(),
+            2,
+            "sealed rows are kept (text blanked) — proves the gate, not an empty at-rest read, returns []"
+        );
+
+        // GATE: sealed-not-unlocked → empty Vec. RED-if-`meeting_is_unlocked`-gate-removed.
+        let masked = get_meeting_segments_inner(&state, "m1").unwrap();
+        assert!(
+            masked.is_empty(),
+            "sealed-not-unlocked meeting must return NO segments through the lazy read (leak gate)"
+        );
+
+        // SESSION-UNLOCK (mirror unlock_folder's internals — same idiom as the manual-notes test):
+        // KEK → unwrap CK → unseal extras (restores segment text) → add folder to the session set.
+        let kek = secrets::get_or_create_master_kek().unwrap();
+        let wrapped = state.db.folder_wrapped_key("f-lock").unwrap().unwrap();
+        let ck_vec = crate::crypto::decrypt(&kek, &wrapped, &aad_wrapped_ck("f-lock")).unwrap();
+        let ck: [u8; 32] = ck_vec.try_into().expect("CK is 32 bytes");
+        unseal_folder_extras(&state, "f-lock", &ck, None).unwrap();
+        state
+            .unlocked_folders
+            .lock()
+            .unwrap()
+            .insert("f-lock".to_string());
+
+        // GREEN: past the gate the lazy read returns the FULL transcript, field-for-field identical
+        // to the raw `db.get_segments` — the lazy command reads through the SAME db call, so the two
+        // must agree on idx/times/text once unlocked. (`Segment` has no `PartialEq`, so compare the
+        // load-bearing fields explicitly rather than widen a shipped type's derive.)
+        let unlocked = get_meeting_segments_inner(&state, "m1").unwrap();
+        let direct = state.db.get_segments("m1").unwrap();
+        assert_eq!(unlocked.len(), 2, "the full transcript is surfaced once unlocked");
+        assert_eq!(unlocked.len(), direct.len(), "lazy read row count == db.get_segments");
+        for (a, b) in unlocked.iter().zip(direct.iter()) {
+            assert_eq!(a.idx, b.idx, "idx identical to db.get_segments");
+            assert_eq!(a.start_s, b.start_s, "start_s identical");
+            assert_eq!(a.end_s, b.end_s, "end_s identical");
+            assert_eq!(a.text, b.text, "text identical (restored plaintext)");
+        }
+        assert_eq!(unlocked[0].text, "alpha bravo", "segment 0 restored byte-identical");
+        assert_eq!(unlocked[1].text, "charlie delta", "segment 1 restored byte-identical");
+    }
+
     /// REMOVE-LOCK: permanently removing a folder's lock decrypts the typed notes back to plaintext
     /// and clears the blob — the typed notes are NEVER lost.
     #[test]

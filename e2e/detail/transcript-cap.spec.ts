@@ -17,10 +17,32 @@ test.describe("Detail — transcript render cap (P1 virtualization)", () => {
     page,
   }) => {
     await mockTauri(page, {
+      // The detail DTO now ships EMPTY segments (perf: transcript off the Note tab); the transcript
+      // is fetched LAZILY via `get_meeting_segments` when the Audio tab opens. No audio (audioPath
+      // null) keeps the test off the asset protocol; the transcript renders from the lazy segments.
+      get_meeting_detail: () => ({
+        meeting: {
+          id: "m-atlas-roadmap",
+          startedAt: "2026-07-01T09:00:00Z",
+          endedAt: "2026-07-01T09:50:00Z",
+          title: "Long meeting",
+          durationS: 3000,
+          audioPath: null,
+          status: "EXPORTED",
+          folderId: null,
+        },
+        note: null,
+        segments: [],
+        assistantInteractions: [],
+        locked: false,
+        aiProvider: null,
+        aiModel: null,
+        modelServed: null,
+      }),
       // A 100-turn meeting: alternating me/others so every segment is its own turn (turns fold
-      // only CONSECUTIVE same-speaker segments). No audio (audioPath null) keeps the test off the
-      // asset protocol; the transcript renders from segments regardless.
-      get_meeting_detail: () => {
+      // only CONSECUTIVE same-speaker segments). Built self-contained (overrides serialize page-
+      // side and can't close over test-scope variables).
+      get_meeting_segments: () => {
         const segments = [];
         for (let i = 0; i < 100; i++) {
           segments.push({
@@ -31,25 +53,7 @@ test.describe("Detail — transcript render cap (P1 virtualization)", () => {
             speaker: i % 2 === 0 ? "me" : "others",
           });
         }
-        return {
-          meeting: {
-            id: "m-atlas-roadmap",
-            startedAt: "2026-07-01T09:00:00Z",
-            endedAt: "2026-07-01T09:50:00Z",
-            title: "Long meeting",
-            durationS: 3000,
-            audioPath: null,
-            status: "EXPORTED",
-            folderId: null,
-          },
-          note: null,
-          segments,
-          assistantInteractions: [],
-          locked: false,
-          aiProvider: null,
-          aiModel: null,
-          modelServed: null,
-        };
+        return segments;
       },
     });
 
@@ -74,10 +78,30 @@ test.describe("Detail — transcript render cap (P1 virtualization)", () => {
     page,
   }) => {
     await mockTauri(page, {
+      get_meeting_detail: () => ({
+        meeting: {
+          id: "m-atlas-roadmap",
+          startedAt: "2026-07-01T09:00:00Z",
+          endedAt: "2026-07-01T10:30:00Z",
+          title: "Long deep-seek meeting",
+          durationS: 5_000,
+          audioPath: null,
+          status: "EXPORTED",
+          folderId: null,
+        },
+        note: null,
+        segments: [],
+        assistantInteractions: [],
+        locked: false,
+        aiProvider: null,
+        aiModel: null,
+        modelServed: null,
+      }),
       // 1,000 alternating turns approximate a long dual-stream meeting. A receipt deep-link seeks
-      // straight to the final turn before the Audio panel renders. The old prefix window then did
+      // straight to the final turn; the transcript is fetched lazily on Audio-tab open (the seek is
+      // deep-linked, which switches to the Audio tab). The old prefix window then did
       // `slice(0, activeIdx + 1)`, silently expanding the nominal cap to all 1,000 turns.
-      get_meeting_detail: () => {
+      get_meeting_segments: () => {
         const segments = [];
         for (let i = 0; i < 1_000; i++) {
           segments.push({
@@ -88,25 +112,7 @@ test.describe("Detail — transcript render cap (P1 virtualization)", () => {
             speaker: i % 2 === 0 ? "me" : "others",
           });
         }
-        return {
-          meeting: {
-            id: "m-atlas-roadmap",
-            startedAt: "2026-07-01T09:00:00Z",
-            endedAt: "2026-07-01T10:30:00Z",
-            title: "Long deep-seek meeting",
-            durationS: 5_000,
-            audioPath: null,
-            status: "EXPORTED",
-            folderId: null,
-          },
-          note: null,
-          segments,
-          assistantInteractions: [],
-          locked: false,
-          aiProvider: null,
-          aiModel: null,
-          modelServed: null,
-        };
+        return segments;
       },
     });
 
@@ -153,7 +159,26 @@ test.describe("Detail — transcript render cap (P1 virtualization)", () => {
       HTMLMediaElement.prototype.pause = () => undefined;
     });
     await mockTauri(page, {
-      get_meeting_detail: () => {
+      get_meeting_detail: () => ({
+        meeting: {
+          id: "m-atlas-roadmap",
+          startedAt: "2026-07-01T09:00:00Z",
+          endedAt: "2026-07-01T10:30:00Z",
+          title: "Long overlapping meeting",
+          durationS: 6_000,
+          audioPath: "/tmp/overlap.wav",
+          status: "EXPORTED",
+          folderId: null,
+        },
+        note: null,
+        segments: [],
+        assistantInteractions: [],
+        locked: false,
+        aiProvider: null,
+        aiModel: null,
+        modelServed: null,
+      }),
+      get_meeting_segments: () => {
         const segments = [];
         for (let i = 0; i < 1_200; i++) {
           segments.push({
@@ -164,25 +189,7 @@ test.describe("Detail — transcript render cap (P1 virtualization)", () => {
             speaker: i % 2 === 0 ? "me" : "others",
           });
         }
-        return {
-          meeting: {
-            id: "m-atlas-roadmap",
-            startedAt: "2026-07-01T09:00:00Z",
-            endedAt: "2026-07-01T10:30:00Z",
-            title: "Long overlapping meeting",
-            durationS: 6_000,
-            audioPath: "/tmp/overlap.wav",
-            status: "EXPORTED",
-            folderId: null,
-          },
-          note: null,
-          segments,
-          assistantInteractions: [],
-          locked: false,
-          aiProvider: null,
-          aiModel: null,
-          modelServed: null,
-        };
+        return segments;
       },
     });
 
@@ -222,10 +229,29 @@ test.describe("Detail — transcript render cap (P1 virtualization)", () => {
     page,
   }) => {
     await mockTauri(page, {
+      get_meeting_detail: () => ({
+        meeting: {
+          id: "m-atlas-roadmap",
+          startedAt: "2026-07-01T09:00:00Z",
+          endedAt: "2026-07-01T10:30:00Z",
+          title: "Long monologue",
+          durationS: 5_000,
+          audioPath: null,
+          status: "EXPORTED",
+          folderId: null,
+        },
+        note: null,
+        segments: [],
+        assistantInteractions: [],
+        locked: false,
+        aiProvider: null,
+        aiModel: null,
+        modelServed: null,
+      }),
       // A real single-speaker recording is the adversarial shape for turn-only windowing: all
       // consecutive segments fold into one turn, so a cap expressed only in turns still renders
       // every fragment and attaches every click handler.
-      get_meeting_detail: () => {
+      get_meeting_segments: () => {
         const segments = [];
         for (let i = 0; i < 1_000; i++) {
           segments.push({
@@ -236,25 +262,7 @@ test.describe("Detail — transcript render cap (P1 virtualization)", () => {
             speaker: "me",
           });
         }
-        return {
-          meeting: {
-            id: "m-atlas-roadmap",
-            startedAt: "2026-07-01T09:00:00Z",
-            endedAt: "2026-07-01T10:30:00Z",
-            title: "Long monologue",
-            durationS: 5_000,
-            audioPath: null,
-            status: "EXPORTED",
-            folderId: null,
-          },
-          note: null,
-          segments,
-          assistantInteractions: [],
-          locked: false,
-          aiProvider: null,
-          aiModel: null,
-          modelServed: null,
-        };
+        return segments;
       },
     });
 

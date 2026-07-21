@@ -463,8 +463,15 @@ pub fn get_timeline(
     Ok(MeetingTimeline::default())
 }
 
-/// A meeting + its latest note + transcript segments for the Detail view.
+/// A meeting + its latest note for the Detail view.
 /// Returns `None` if the meeting id is unknown.
+///
+/// PERF (Note-tab payload): the DTO's `segments` field is now emitted EMPTY. The FE Note tab never
+/// renders the transcript — only the Audio tab does — yet packing the full `Vec<Segment>` here made
+/// `detail()` carry ~0.5 MB for a 1h meeting (>1 MB for 2h), re-parsed/re-spread on every mutation.
+/// The transcript is now fetched LAZILY by the Audio tab via [`get_meeting_segments`] (same read
+/// gate). The `segments: Vec::new()` shape is byte-identical to the masked/locked DTO
+/// (`super::masked_detail`) that every consumer already tolerates — no new DTO fork.
 #[tauri::command]
 pub fn get_meeting_detail(
     state: State<'_, AppState>,
@@ -504,7 +511,10 @@ pub fn get_meeting_detail(
         markdown: n.markdown,
         exported_path: n.exported_path,
     });
-    let segments = state.db.get_segments(&meeting_id)?;
+    // PERF: the transcript is NO LONGER packed into the detail DTO — the Note tab never renders it,
+    // and it dominated the payload. The Audio tab fetches it lazily via `get_meeting_segments` (same
+    // gate). Emit an empty Vec, keeping the field so the DTO shape is unchanged for every consumer.
+    let segments = Vec::new();
     // GATED read: only past the `meeting_is_unlocked` gate above do we surface the persisted
     // assistant Q&A. The DB read is ALSO `visibility_clause`-gated (it returns empty for a sealed-
     // not-unlocked meeting) — defense-in-depth, double-gated exactly like the rest of the DTO.
@@ -526,4 +536,32 @@ pub fn get_meeting_detail(
         ai_model,
         model_served,
     }))
+}
+
+/// LAZY transcript read for the Audio tab — the segments `get_meeting_detail` no longer ships in its
+/// DTO (see the perf note there). Split into a thin `#[tauri::command]` wrapper over an `_inner` that
+/// takes `&AppState` (the pervasive command-vs-`_inner` shape in this file — `set_focus_meeting`,
+/// `brain_overview`, `rename_speaker`, …) so the read gate is unit-testable without a Tauri `State`.
+#[tauri::command]
+pub fn get_meeting_segments(
+    state: State<'_, AppState>,
+    meeting_id: String,
+) -> Result<Vec<Segment>, AppError> {
+    get_meeting_segments_inner(state.inner(), &meeting_id)
+}
+
+/// Phase 0.5 READ-GATE (mirrors `get_meeting_detail` / `get_timeline`): a sealed-and-NOT-session-
+/// unlocked meeting returns an EMPTY Vec — never the raw rows. `db.get_segments` is a RAW,
+/// non-visibility-gated read (it returns the still-present segment rows with their text BLANKED at
+/// rest while sealed), so this gate is what keeps a locked meeting's transcript from leaking through
+/// the lazy path. Returning `[]` (not `Locked`) matches the `get_timeline` / `masked_detail`
+/// precedent — the Audio tab is unreachable while locked anyway.
+pub(crate) fn get_meeting_segments_inner(
+    state: &AppState,
+    meeting_id: &str,
+) -> Result<Vec<Segment>, AppError> {
+    if !meeting_is_unlocked(state, meeting_id)? {
+        return Ok(Vec::new());
+    }
+    state.db.get_segments(meeting_id)
 }

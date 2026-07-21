@@ -413,13 +413,10 @@
   <!-- ACTION ITEMS (Reminders + Obsidian Tasks; hidden when none). -->
   <app-meeting-actions [meetingId]="meetingId()" />
 
-  <!-- CHAT WITH THIS MEETING (grounded Q&A over the transcript). -->
-  <section class="block">
-    <app-meeting-chat
-      [meetingId]="meetingId()"
-      [anchorTitle]="meetingTitle()"
-    />
-  </section>
+  <!-- "Ask about this meeting" moved OUT of this in-flow Note panel into the
+       detail shell's summoned right-side drawer (2026-07 slideout), so the
+       conversation survives tab switches and `_prefill` runs once per meeting
+       rather than on every Note-tab open. -->
 
   <!-- RELATED BY MEANING (semantic neighbors; silent when empty). -->
   <!-- PERF/OOM (P1): defer until it scrolls into view. Its `_load` effect fires the on-device e5
