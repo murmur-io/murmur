@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "repository": "murmur-io/murmur",
+  "branch": "murmur",
+  "required_status_check": "gate (full ci.sh — release parity)",
+  "require_admin_enforcement": true,
+  "minimum_approvals": 0,
+  "require_conversation_resolution": true,
+  "require_secret_scanning": true,
+  "require_secret_push_protection": true
+}

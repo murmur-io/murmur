@@ -1,0 +1,92 @@
+{
+  "schema_version": 1,
+  "max_repair_rounds": 2,
+  "agent_timeout_seconds": 1800,
+  "check_timeout_seconds": 1800,
+  "max_diff_bytes_for_review": 500000,
+  "commit_identity": {
+    "name": "QueaT",
+    "email": "kgm004a@gmail.com"
+  },
+  "cli": {
+    "codex": {
+      "minimum_version": "0.145.0"
+    },
+    "claude": {
+      "minimum_version": "2.1.206",
+      "recommended_version": "2.1.214"
+    }
+  },
+  "required_reviews": [
+    "spec",
+    "adversarial"
+  ],
+  "risk_reviews": {
+    "lock": "lock-security",
+    "egress": "egress-security",
+    "protocol": "protocol-security"
+  },
+  "risk_required_evidence": {
+    "lock": ["lock-negative", "lock-roundtrip"],
+    "egress": ["egress-policy"],
+    "protocol": ["protocol-client", "protocol-server"],
+    "runtime": ["tauri-boot"],
+    "ui": ["playwright"]
+  },
+  "risk_classification": {
+    "lock": [
+      "src-tauri/src/crypto.rs",
+      "src-tauri/src/secrets/**",
+      "src-tauri/src/biometric.rs",
+      "src-tauri/src/screenshare.rs",
+      "src-tauri/src/storage/**",
+      "src-tauri/src/commands/lock.rs",
+      "src-tauri/src/commands/export.rs",
+      "src-tauri/src/mcp.rs",
+      "src/app/**/lock*",
+      "src/app/**/share*"
+    ],
+    "egress": [
+      "src-tauri/src/summarize/**",
+      "src-tauri/src/connectors/**",
+      "src-tauri/src/share/**",
+      "src-tauri/src/mcp.rs",
+      "src-tauri/src/commands/enrich.rs",
+      "src-tauri/src/commands/org.rs"
+    ],
+    "protocol": [
+      "src-tauri/src/share/**"
+    ],
+    "runtime": [
+      "src-tauri/src/lib.rs",
+      "src-tauri/src/state.rs",
+      "src-tauri/src/audio/**",
+      "src-tauri/src/transcribe/**",
+      "src-tauri/tauri.conf.json",
+      "src-tauri/*.swift",
+      "src-tauri/**/*.swift"
+    ],
+    "ui": [
+      "src/app/**",
+      "e2e/**",
+      "playwright.config.ts"
+    ],
+    "release": [
+      "scripts/macos-sign-notarize.sh",
+      ".agents/skills/release-murmur/**",
+      ".claude/skills/release-murmur/**",
+      "src-tauri/tauri.conf.json"
+    ]
+  },
+  "protected_paths": [
+    "AGENTS.md",
+    "CLAUDE.md",
+    ".agents/harness",
+    ".agents/skills",
+    ".github/workflows",
+    ".codex",
+    ".claude",
+    "scripts/agent-harness",
+    "scripts/agent-config-audit"
+  ]
+}
