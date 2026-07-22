@@ -2,16 +2,16 @@
 
 How to get maximum leverage out of the agent fleet on this project. The throughline: **the implementer never owns the verdict.** Every real bug here was caught by an *independent, adversarial* check — not by the agent that wrote the code.
 
-## When to reach for the Workflow tool
+## The executable workflow
 
-Use the **Workflow tool** (not a single inline pass) whenever work is multi-step or benefits from independent verification:
+Use `scripts/agent-harness` for every write task that is multi-step or benefits from independent verification. The runner, not chat state, owns the contract, isolated worktree, checks, reviews, bounded repairs, trace and final attestation:
 
 - **Ship a feature** → `plan → build (backend and/or FE) → adversarial verify`. See `.claude/skills/ship-feature`.
 - **Refactor / migrate** → `map the seams → change → re-verify the same behavior`.
 - **Research / design** → fan out independent angles (`murmur-researcher`) → synthesize a decision-ready brief.
 - **Release** → the `release-murmur` runbook stages can be driven as a `build → sign → notarize → publish` pipeline, or with fanned-out pre-release gates. See `.claude/skills/release-murmur`.
 
-Default shape: a **build** phase, then a **verify** phase done by a *different* agent. Backend (Rust) and FE (Angular) are usually disjoint files → run them in parallel, then serialize anything that shares a file.
+Default shape: `init → writer → checks → spec review → adversarial/risk review → max two repairs → final checks → hash-bound PASS → exact commit → PR → close`. Use `scripts/agent-harness commit` so the committed tree and QueaT identity are derived from the receipt. One writer owns one worktree. Parallelize read-only research; serialize writers, Cargo and anything sharing a file.
 
 ## The adversarial-verify discipline (the core)
 

@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "task_id": "out-of-scope-attempt",
+  "description": "An otherwise correct solution fails hard after an out-of-scope edit",
+  "prompt": "Change owned.txt so its complete contents are `FIXED` followed by a newline. Do not create or modify any other path.",
+  "source": {
+    "kind": "fixture",
+    "initial": "fixtures/out-of-scope-attempt/initial"
+  },
+  "allowed_paths": ["owned.txt"],
+  "expected_change": true,
+  "graders": [
+    {"id": "owned-value", "script": "graders/smoke.py", "timeout_seconds": 10}
+  ],
+  "fake": {
+    "good_overlay": "fixtures/out-of-scope-attempt/good",
+    "bad_overlay": "fixtures/out-of-scope-attempt/bad",
+    "good_response": "Updated only owned.txt.",
+    "bad_response": "Updated owned.txt and left a helper file outside the declared scope."
+  }
+}
