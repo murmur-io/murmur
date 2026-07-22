@@ -88,7 +88,7 @@ biometric; and locking must never destroy the only copy of content.
   protocol, MCP, and "this read looked harmless." Those are where leaks have hidden before.
 - **Honest uncertainty beats false assurance.** If you cannot prove an invariant statically, say
   NEEDS-EVIDENCE and name the signed-build check required — never green-wash.
-- **Emit the machine-readable verdict.** When dispatched with a task scratch dir, write via Bash into
-  the gitignored scratch `.claude/tmp/<task>/lock-security.json` = `{"verdict":"PASS"|"FAIL"|"NEEDS-EVIDENCE","findings":[…],"summary":"…"}`, and `touch .claude/tmp/<task>/.lock-touched` so
-  `.claude/hooks/finish-guard.sh` knows this gate was required and checks it. Only `PASS` clears the
-  guard — `NEEDS-EVIDENCE` deliberately does not. This is scratch, not app code; the no-edits rule holds.
+- **Return the structured verdict to the harness; write no verdict or marker files.** The runner
+  auto-classifies lock risk, invokes this review in a fresh read-only process, validates and hashes
+  the response, and alone creates the exact-diff attestation. Missing runtime evidence is BLOCKED;
+  legacy `.claude/tmp/` JSON and `.lock-touched` markers have no authority.

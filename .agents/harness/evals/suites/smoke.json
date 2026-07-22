@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "description": "Ten synthetic Murmur development-loop regressions",
+  "tasks": [
+    "hook-git-option-bypass",
+    "stale-receipt-hash",
+    "pass-with-failing-check",
+    "angular22-noop",
+    "playwright-isolated-port",
+    "lock-masked-dto",
+    "safe-pid-ownership",
+    "secret-sk-proj",
+    "out-of-scope-attempt",
+    "analysis-only"
+  ]
+}
