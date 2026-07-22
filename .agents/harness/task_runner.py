@@ -796,6 +796,15 @@ def build_check_environment(
         "GIT_CONFIG_GLOBAL": "/dev/null",
         "GIT_CONFIG_NOSYSTEM": "1",
         "MISTRALRS_METAL_PRECOMPILE": "0",
+        # Local verification must stay subordinate to the app the operator is
+        # actively using.  These caps cover both Cargo's compiler fan-out and
+        # the Rust/ML test process itself; the latter caused the observed
+        # 1,100% CPU incident while a packaged Murmur recording was running.
+        "CARGO_BUILD_JOBS": "2",
+        "RUST_TEST_THREADS": "2",
+        "RAYON_NUM_THREADS": "2",
+        "TOKIO_WORKER_THREADS": "2",
+        "NG_BUILD_MAX_WORKERS": "2",
         "MURMUR_HARNESS": "1",
         "MURMUR_HARNESS_TASK": task_dir.name,
         "MURMUR_HARNESS_INSTRUCTIONS_SHA256": instructions_hash(
@@ -838,6 +847,9 @@ def build_check_seatbelt_profile(
         Path("/private/etc"),
         Path("/private/var/db"),
         Path("/private/var/run"),
+        # xcrun/xcode-select resolves the active Command Line Tools symlink
+        # here before rustc can link a macOS target.
+        Path("/private/var/select"),
         worktree.resolve(),
         common.resolve(),
         task_dir.resolve(),
@@ -904,6 +916,21 @@ def build_check_seatbelt_profile(
         '(allow process-exec)',
         '(allow process-fork)',
         '(allow signal (target same-sandbox))',
+        # canonicalize(3), git and rustc must be able to traverse the parents
+        # of specifically allowed subpaths.  Grant metadata only for those
+        # ancestors; file contents remain governed by the narrow rules below.
+        '(allow file-read-metadata '
+        + " ".join(
+            f'(literal {_seatbelt_literal(path)})'
+            for path in sorted(
+                {
+                    ancestor
+                    for allowed in read_paths | write_paths
+                    for ancestor in (allowed, *allowed.parents)
+                }
+            )
+        )
+        + ')',
         '(allow file-read* ' + " ".join(f'(subpath {_seatbelt_literal(path)})' for path in sorted(read_paths)) + ')',
         '(allow file-write* ' + " ".join(f'(subpath {_seatbelt_literal(path)})' for path in sorted(write_paths)) + ')',
     ]
