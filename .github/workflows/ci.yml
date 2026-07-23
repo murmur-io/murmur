@@ -119,7 +119,7 @@ jobs:
           workspaces: ". -> target"
 
       - name: Install pinned cargo-audit + cargo-deny (prebuilt — skips ci.sh's slow cargo install)
-        uses: taiki-e/install-action@678b06b887cdbf44fa0601e5915f865e17c2241d # v2.44.60
+        uses: taiki-e/install-action@7572810d7dd469b651bb7793945692cf78da5dd7 # v2.85.0
         with:
           # Explicit tool versions are required: an action-SHA-relative `latest`
           # installed cargo-audit 0.21.0, which cannot parse CVSS 4.0 entries in
