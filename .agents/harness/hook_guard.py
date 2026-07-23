@@ -1135,11 +1135,18 @@ def _write_receipt(repo: Path, task_id: str, *, risk: bool = False) -> Tuple[Pat
     evidence = [runner.run_check(top, task_dir, check, "round-01") for check in checks]
     failures = [check for check in evidence if not check["passed"]]
     if failures:
-        details = ", ".join(
-            f"{check['id']} exit={check['exit_code']} timed_out={check['timed_out']} "
-            f"log={check['log_path']}"
-            for check in failures
-        )
+        rendered = []
+        for check in failures:
+            log_path = Path(check["log_path"])
+            try:
+                log_tail = log_path.read_text(encoding="utf-8", errors="replace")[-2000:]
+            except OSError as exc:
+                log_tail = f"<unreadable: {exc}>"
+            rendered.append(
+                f"{check['id']} exit={check['exit_code']} timed_out={check['timed_out']} "
+                f"log_tail={log_tail!r}"
+            )
+        details = ", ".join(rendered)
         raise GuardFailure(f"hook selftest deterministic evidence unexpectedly failed: {details}")
     review_kinds = ["spec", "adversarial"] + (["lock-security"] if risk else [])
     reviews = []
