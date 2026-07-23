@@ -1188,12 +1188,21 @@ def build_check_seatbelt_profile(
         real_home / ".cargo" / "credentials.toml",
     ]
 
-    read_filters = ['(literal "/")']
+    system_temp_roots = {
+        Path(tempfile.gettempdir()),
+        Path(tempfile.gettempdir()).resolve(),
+    }
+    xcrun_cache_filters = [
+        f'(regex #{json.dumps(f"^{re.escape(str(root))}/xcrun_db-[^/]+$")})'
+        for root in sorted(system_temp_roots, key=str)
+    ]
+
+    read_filters = ['(literal "/")', *xcrun_cache_filters]
     for path in sorted(read_paths, key=str):
         literal = _seatbelt_literal(path)
         read_filters.extend((f'(literal {literal})', f'(subpath {literal})'))
     read_scope = '(require-any ' + " ".join(read_filters) + ')'
-    write_filters: List[str] = []
+    write_filters: List[str] = ['(literal "/dev/null")', *xcrun_cache_filters]
     for path in sorted(write_paths, key=str):
         literal = _seatbelt_literal(path)
         write_filters.extend((f'(literal {literal})', f'(subpath {literal})'))
