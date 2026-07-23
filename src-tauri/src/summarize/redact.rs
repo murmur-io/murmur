@@ -1106,6 +1106,22 @@ mod tests {
             .block_on(f)
     }
 
+    struct ModelLifecycleTestGuard {
+        _serial: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for ModelLifecycleTestGuard {
+        fn drop(&mut self) {
+            crate::perf::reset_model_lifecycle_for_test();
+        }
+    }
+
+    fn model_lifecycle_test_guard() -> ModelLifecycleTestGuard {
+        let serial = crate::perf::model_lifecycle_test_guard();
+        crate::perf::reset_model_lifecycle_for_test();
+        ModelLifecycleTestGuard { _serial: serial }
+    }
+
     fn sample_req(transcript: &str) -> SummarizeRequest {
         use crate::summarize::provider::MeetingMeta;
         SummarizeRequest {
@@ -1135,6 +1151,7 @@ mod tests {
 
     #[test]
     fn default_provider_egress_is_byte_identical_for_names() {
+        let _lifecycle = model_lifecycle_test_guard();
         // Through the PRODUCTION constructor (default no-op name layer), a transcript with names
         // and NO regex-PII reaches the inner provider verbatim — proving prod egress is unchanged.
         let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
@@ -1166,6 +1183,7 @@ mod tests {
 
     #[test]
     fn name_seam_round_trips_through_provider() {
+        let _lifecycle = model_lifecycle_test_guard();
         // With a real NameRedactor installed: names are scrubbed BEFORE the provider call and
         // restored in the reply. The EchoProvider returns exactly what it received, so the echoed
         // reply proves both halves of the round-trip.
@@ -1182,6 +1200,7 @@ mod tests {
 
     #[test]
     fn name_seam_scrubs_before_egress() {
+        let _lifecycle = model_lifecycle_test_guard();
         // Prove the SCRUB half independently: capture what the inner provider actually receives.
         let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
 
@@ -1225,6 +1244,7 @@ mod tests {
     /// feed CONTAINS the raw name; what egresses must NOT.
     #[test]
     fn tier0_named_speaker_tag_is_scrubbed_before_egress() {
+        let _lifecycle = model_lifecycle_test_guard();
         use crate::transcribe::types::Segment;
         let segs = vec![
             Segment {
@@ -1331,6 +1351,7 @@ mod tests {
 
     #[test]
     fn default_make_provider_egress_byte_identical_with_active_redactor() {
+        let _lifecycle = model_lifecycle_test_guard();
         // End-to-end through the PRODUCTION seam: `RedactingProvider::with_name_redactor(inner,
         // active_name_redactor())` (what `make_provider` now wires). On a clean machine the active
         // redactor is the no-op, so a names-only transcript reaches the inner provider verbatim —
@@ -1368,6 +1389,7 @@ mod tests {
 
     #[test]
     fn name_seam_consistent_across_complete_prompts() {
+        let _lifecycle = model_lifecycle_test_guard();
         // The same name in both `system` and `user` restores consistently (stable-token contract).
         let prov = RedactingProvider::with_name_redactor(
             Arc::new(EchoProvider),
@@ -1382,6 +1404,7 @@ mod tests {
 
     #[test]
     fn production_ner_admission_blocks_background_but_accepts_exact_recording_token() {
+        let _lifecycle = model_lifecycle_test_guard();
         let mut owner = crate::perf::begin_recording_session().unwrap();
         owner.transition_to_live().unwrap();
         let heavy = Arc::new(tokio::sync::Semaphore::new(1));
@@ -1503,6 +1526,7 @@ mod tests {
     /// - `format!("{:?}", entry)` contains NEITHER the email string NOR the note text.
     #[test]
     fn egress_entry_is_content_free_and_captures_meta_and_counts() {
+        let _lifecycle = model_lifecycle_test_guard();
         let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = Arc::new(CaptureEgressSink(captured.clone()));
         let prov = RedactingProvider::with_name_redactor_and_sink(
@@ -1560,6 +1584,7 @@ mod tests {
     /// `meta.redactions = Some(count)` before returning.
     #[test]
     fn summarize_with_meta_surfaces_redaction_count_to_caller() {
+        let _lifecycle = model_lifecycle_test_guard();
         let prov = RedactingProvider::with_name_redactor(
             Arc::new(EchoMetaProvider),
             Arc::new(NoopNameRedactor),
@@ -1581,6 +1606,7 @@ mod tests {
     /// The default `with_name_redactor` path records to a NoopEgressSink — no panic, no row.
     #[test]
     fn default_constructor_records_to_noop_sink_no_panic() {
+        let _lifecycle = model_lifecycle_test_guard();
         let prov = RedactingProvider::with_name_redactor(
             Arc::new(EchoProvider),
             Arc::new(NoopNameRedactor),
@@ -1611,6 +1637,7 @@ mod tests {
     /// the inner's `complete_json` override is NEVER reached → `complete_json_called` stays false.
     #[test]
     fn complete_json_redacts_forwards_restores_and_records() {
+        let _lifecycle = model_lifecycle_test_guard();
         use std::sync::atomic::{AtomicBool, Ordering};
 
         let captured_user = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
@@ -1786,6 +1813,7 @@ mod tests {
     /// GREEN after fix: the same shared map + name-layer pass applied, email replaced with token.
     #[test]
     fn user_notes_are_redacted_before_egress() {
+        let _lifecycle = model_lifecycle_test_guard();
         let mut req = sample_req("no PII in transcript");
         req.user_notes = Some("ping bob@corp.com about the deck".to_string());
         let inner = std::sync::Arc::new(CapturingInner(std::sync::Mutex::new(None)));
@@ -1826,6 +1854,7 @@ mod tests {
     /// survives as a valid link target.
     #[test]
     fn vault_title_with_regex_pii_is_filtered_before_egress() {
+        let _lifecycle = model_lifecycle_test_guard();
         let mut req = sample_req("no PII in transcript");
         req.vault_titles = vec![
             "Offer - jane@doe.example".to_string(), // email in the title → must be dropped
@@ -1865,6 +1894,7 @@ mod tests {
     /// the design-B filter the flagged title is dropped, so the name is ABSENT; a clean title stays.
     #[test]
     fn vault_title_with_person_name_is_filtered_when_ner_active() {
+        let _lifecycle = model_lifecycle_test_guard();
         let mut req = sample_req("no PII in transcript");
         req.vault_titles = vec![
             "Meeting with Anna Kowalska".to_string(), // person page the NER layer detects → dropped
@@ -1897,6 +1927,7 @@ mod tests {
     /// provider (the no-op detector flags nothing). Confirmed failing before the fix.
     #[test]
     fn person_name_title_is_dropped_when_no_ner_model_present() {
+        let _lifecycle = model_lifecycle_test_guard();
         let mut req = sample_req("no PII in transcript");
         req.vault_titles = vec![
             "Anna Kowalska".to_string(), // person-page stem → MUST be dropped under the no-op NER
@@ -1947,6 +1978,7 @@ mod tests {
     /// meeting-shaped titles survive untouched.
     #[test]
     fn person_name_titles_scrubbed_on_complete_path_when_no_ner() {
+        let _lifecycle = model_lifecycle_test_guard();
         let prov = RedactingProvider::with_name_redactor(
             Arc::new(EchoProvider),
             Arc::new(NoopNameRedactor), // the production no-NER-model shape
@@ -1975,6 +2007,7 @@ mod tests {
     /// prompt text is not additionally rewritten by the drop-only scrub.
     #[test]
     fn complete_path_syntactic_scrub_inactive_when_ner_present() {
+        let _lifecycle = model_lifecycle_test_guard();
         let prov = RedactingProvider::with_name_redactor(
             Arc::new(EchoProvider),
             Arc::new(FixtureNameRedactor), // a real (non-noop) name layer
@@ -2023,6 +2056,7 @@ mod tests {
     /// after the fix they are ABSENT while the non-PII instruction text still passes through.
     #[test]
     fn template_and_title_hint_are_scrubbed_before_egress() {
+        let _lifecycle = model_lifecycle_test_guard();
         let mut req = sample_req("no PII in transcript");
         req.template = "Custom recipe — ping ops@corp.example for context.".to_string();
         req.meta.title_hint = Some("Sync re carl@corp.example".to_string());
@@ -2055,6 +2089,7 @@ mod tests {
     /// exempt (a documented non-PII format flag). That is the guard the allowlist bug needed.
     #[test]
     fn every_string_field_of_summarize_request_is_scrubbed_or_exempt() {
+        let _lifecycle = model_lifecycle_test_guard();
         use crate::summarize::provider::MeetingMeta;
         // Distinct email-shaped sentinels — deterministically caught by the regex layer (no model
         // needed), so this test is stable in the headless loop.
