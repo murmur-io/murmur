@@ -1128,9 +1128,13 @@ def build_check_seatbelt_profile(
         )
         if any(developer_dir == root or root in developer_dir.parents for root in allowed_developer_roots):
             # GitHub's macOS runner selects a versioned Xcode bundle under
-            # /Applications. xcrun and the linker dlopen libraries and SDK
-            # metadata from this directory; keep that access read-only.
-            read_paths.add(developer_dir)
+            # /Applications. xcrun and the linker dlopen both Developer/ SDK
+            # content and Contents/SharedFrameworks; keep that one selected
+            # bundle read-only instead of exposing every installed app.
+            developer_read_root = developer_dir
+            if developer_dir.name == "Developer" and developer_dir.parent.name == "Contents":
+                developer_read_root = developer_dir.parent.parent
+            read_paths.add(developer_read_root)
     for optional in (
         real_home / ".bun" / "bin",
         real_home / ".local" / "bin",
