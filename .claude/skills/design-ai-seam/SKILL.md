@@ -17,7 +17,7 @@ can we build X" → `/research` (`murmur-researcher`, outward). If it's "build t
 end-to-end" → `/ship-feature` (mechanical + verified). You are between them.
 
 **Trust code, not docs.** Every symbol below is current, but grep it before you rely on it —
-`commands.rs`/`db.rs` are >8k lines and line numbers drift. Cite by symbol.
+commands and storage are split across growing domain modules, and line numbers drift. Cite by symbol.
 
 ## 1. Simplest-pattern-first ladder (start here, every time)
 

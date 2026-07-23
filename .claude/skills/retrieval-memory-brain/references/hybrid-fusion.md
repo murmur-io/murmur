@@ -99,7 +99,7 @@ measured fixes all failed** — the gap is the inherent, correct cost of a balan
    cannot reorder the top-5. (See the const-rescale note above.)
 2. **OR-match FTS fallback** (`fts_match_query_any` when strict AND is empty): improved REAL ranking
    (nDCG 0.856→0.881, MRR 0.850→0.887 — the right meeting ranks higher) but **recall stayed 0.90**, and
-   it **regressed the synthetic CI baseline** (nDCG 0.825→0.785). A goal-missing ranking tradeoff that
+   it **regressed the committed synthetic baseline** (nDCG 0.825→0.785). A goal-missing ranking tradeoff that
    degrades the committed baseline → **reverted, not shipped.** (Risk: over-fitting to a
    semantic-favouring 20-query set.)
 3. **Dropping / down-weighting the graph leg** (the earlier "graph co-mention noise costs the gold doc"
@@ -136,5 +136,8 @@ Tuning `score_fuse` weights alone is proven insufficient.
   before treating it as a retrieval bug.
 - **A model/chunk/prefix change is inert until reindex.** Fusion changes are live immediately (pure math);
   index-shape changes need `reindex_embeddings`. Never mix old and new vectors.
-- **The synthetic corpus is the CI merge gate.** `rag-bakeoff-latest.md` (hybrid 0.90) is the committed
-  baseline — a change that regresses it does not ship even if the real vault improves.
+- **The synthetic corpus is a manual pre-merge acceptance baseline, not a wired CI check.**
+  `scripts/ci.sh` explicitly documents that the ignored bakeoff runners need model/data inputs and
+  do not run in CI. Re-run the command from `docs/RAG-BAKEOFF.md`; `rag-bakeoff-latest.md`
+  (hybrid 0.90) is the committed comparison artifact, and a change that regresses it does not ship
+  even if the real vault improves.

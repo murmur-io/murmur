@@ -1,6 +1,6 @@
 ---
 name: tauri-dev
-description: Run and iterate Murmur locally (Tauri 2.11 + Angular 22 zoneless). The exact dev-run recipe — MURMUR_DEV_DEK to avoid keychain re-prompts, source ~/.cargo/env, ng on :1420 + MCP on :8765, the dev biometric degradation, the `cargo test --lib`-not-`clippy --all-targets` inner loop, clean-relaunch (pkill + free ports), and reading the boot/abort log. Use whenever the user wants to start/run/serve Murmur in dev, debug a launch/abort, relaunch cleanly, or run the Rust test loop.
+description: Run and iterate Murmur locally (Tauri 2.11 + Angular 22 zoneless). The exact dev-run recipe — MURMUR_DEV_DEK to avoid keychain re-prompts, source ~/.cargo/env, ng on :1420 + MCP on :8765, dev biometric degradation, the `cargo test --lib`-not-`clippy --all-targets` inner loop, owner-aware clean relaunch, and reading the boot/abort log. Use whenever the user wants to start/run/serve Murmur in dev, debug a launch/abort, relaunch cleanly, or run the Rust test loop.
 ---
 
 # /tauri-dev — run & iterate Murmur in dev
@@ -16,10 +16,14 @@ read-only MCP server on **127.0.0.1:8765**.
 source "$HOME/.cargo/env"
 cd /Users/jakubgawronski/Projects/meetnotes
 MURMUR_DEV_DEK=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
-  scripts/agent-resource-run -- npm run dev 2>&1 | tee /tmp/murmur-dev.log
+  scripts/agent-dev-run -- npm run dev 2>&1 | tee /tmp/murmur-dev.log
 ```
 
 - `source ~/.cargo/env` — puts `cargo` on PATH (the shell here isn't a login cargo shell).
+- `agent-dev-run` supervises the long-lived server without holding the repo-global flock. Its
+  private `cargo`/`rustc` proxies acquire `agent-resource-run` only while an actual Rust tool is
+  running. Never wrap `npm run dev` in `agent-resource-run`; that monopolizes the lane until the
+  server exits and starves checks in every linked worktree.
 - **`MURMUR_DEV_DEK`** (64 hex chars) — the **whole-DB SQLCipher DEK** as a fixed dev value,
   read by `get_or_create_db_dek` in `src-tauri/src/secrets/keychain.rs` (the
   `MURMUR_DEV_DEK` env hatch, ~line 26). **Why it matters:** without it, the DEK lives in

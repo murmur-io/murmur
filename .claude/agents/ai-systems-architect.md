@@ -28,8 +28,9 @@ you walk a decision.
 
 ## Standing context — the seams you reason about (`src-tauri/src/`)
 
-Trust code, not this map — grep the SYMBOL (names below are current; line numbers drift, `commands.rs`
-+ `db.rs` are >8k lines). Distinguish shipped vs stubbed vs additive-not-yet-wired.
+Trust code, not this map — grep the SYMBOL (commands and storage are split across growing domain
+modules under `commands/` and `storage/`; line numbers drift). Distinguish shipped vs stubbed vs
+additive-not-yet-wired.
 
 - **The provider seam** — `summarize/provider.rs`: `trait SummarizerProvider` (`id`, `availability`,
   `summarize`, `complete`, `*_with_meta`, `complete_json{,_with_meta}`, and the CAPABILITY method
@@ -55,7 +56,7 @@ Trust code, not this map — grep the SYMBOL (names below are current; line numb
   marker-preserving `LoopTranscript::compact`, one corrective retry on malformed JSON. `trait
   ToolExecutor` / `trait DeltaSink`; `AgentOutcome`/`AgentStep`; `ESCALATE_SENTINEL`/`is_escalation`.
   It has NO internal floor — `Ok(None)` = non-convergence, the CALLER floors; `Err` (esp.
-  `Unavailable`) propagates. Live callers: `voice_action.rs`, `commands.rs` (ask path),
+  `Unavailable`) propagates. Live callers: `voice_action.rs`, the `commands/` ask path,
   `transcribe/live.rs`.
 - **The gated tool ACI** — `tools.rs`: `enum AssistantScope` (`CurrentMeeting`/`Vault`/`Connectors`/
   `Full`) with `allows(tool)` — the STRUCTURAL tier gate decided in CODE, not prompt-trust; `struct
@@ -158,7 +159,7 @@ The invariants that bind THIS agent (a seam that violates one is a wrong design,
 ## Measurement — where the design must be observed, not asserted
 
 A seam design is a hypothesis until observed. Say plainly what proves it and what only a real build can:
-- **Dev run** for behavior at the seam: `source ~/.cargo/env; MURMUR_DEV_DEK=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef npm run dev` (ng on
+- **Dev run** for behavior at the seam: `source ~/.cargo/env; MURMUR_DEV_DEK=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef scripts/agent-dev-run -- npm run dev` (ng on
   `http://localhost:1420`, MCP on `127.0.0.1:8765`). The `MURMUR_DEV_DEK` hatch avoids keychain
   re-prompts.
 - **Unit truth** at the seam: `cargo test --lib` from `src-tauri/` proves the provider/egress/loop/tool

@@ -1,0 +1,348 @@
+#!/usr/bin/env python3
+"""Supervise a long-lived Murmur dev server without monopolizing the Rust lane.
+
+Only recognized development commands may run here.  The server itself does not
+take the repo-global flock.  Instead, private PATH proxies send each cargo/rustc
+process through agent-resource-run for exactly the lifetime of that process.
+"""
+
+import argparse
+import atexit
+import json
+import math
+import os
+from pathlib import Path
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+
+
+USAGE_EXIT = 64
+SUPERVISOR_EXIT = 125
+NOT_EXECUTABLE_EXIT = 126
+NOT_FOUND_EXIT = 127
+POLL_SECONDS = 0.02
+KILL_REAP_SECONDS = 2.0
+LANE_ACTIVE_ENV = "MURMUR_AGENT_RESOURCE_LANE_ACTIVE"
+PROXY_DIR_ENV = "MURMUR_AGENT_DEV_PROXY_DIR"
+PROXY_TOKEN_ENV = "MURMUR_AGENT_DEV_PROXY_TOKEN"
+REAL_CARGO_ENV = "MURMUR_AGENT_DEV_REAL_CARGO"
+REAL_RUSTC_ENV = "MURMUR_AGENT_DEV_REAL_RUSTC"
+PROXY_CONTEXT_FILE = ".context.json"
+RESERVED_ENV = {
+    LANE_ACTIVE_ENV,
+    PROXY_DIR_ENV,
+    PROXY_TOKEN_ENV,
+    REAL_CARGO_ENV,
+    REAL_RUSTC_ENV,
+}
+DEV_SCRIPTS = {"dev", "start"}
+PASSTHROUGH_FLAGS = {"--open", "--no-open", "--strict-port"}
+PASSTHROUGH_VALUE_FLAGS = {"--host", "--port"}
+HOST_VALUE = re.compile(r"^[A-Za-z0-9_.:\[\]-]+$")
+
+
+def positive_seconds(value):
+    try:
+        parsed = float(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be a number") from error
+    if parsed <= 0 or not math.isfinite(parsed):
+        raise argparse.ArgumentTypeError("must be finite and greater than zero")
+    return parsed
+
+
+def passthrough_is_allowed(tokens):
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token in PASSTHROUGH_FLAGS:
+            index += 1
+            continue
+        if token in PASSTHROUGH_VALUE_FLAGS:
+            if index + 1 >= len(tokens):
+                return False
+            value = tokens[index + 1]
+            index += 2
+        elif token.startswith("--port="):
+            value = token.split("=", 1)[1]
+            token = "--port"
+            index += 1
+        elif token.startswith("--host="):
+            value = token.split("=", 1)[1]
+            token = "--host"
+            index += 1
+        else:
+            return False
+        if token == "--port":
+            if not value.isdigit() or not 1 <= int(value) <= 65535:
+                return False
+        elif not HOST_VALUE.fullmatch(value):
+            return False
+    return True
+
+
+def command_is_allowed(command):
+    if len(command) < 3 or Path(command[0]).name != "npm":
+        return False
+    if command[1] not in {"run", "run-script"} or command[2] not in DEV_SCRIPTS:
+        return False
+    remainder = command[3:]
+    if not remainder:
+        return True
+    return remainder[0] == "--" and passthrough_is_allowed(remainder[1:])
+
+
+def parse_args(argv):
+    parser = argparse.ArgumentParser(
+        description="supervise an allowlisted Murmur dev command with per-tool Rust lanes"
+    )
+    parser.add_argument(
+        "--term-grace-seconds",
+        type=positive_seconds,
+        default=os.environ.get("MURMUR_AGENT_TERM_GRACE_SECONDS", "5"),
+        help="bounded TERM grace before KILL during teardown (default: 5)",
+    )
+    parser.add_argument("--chdir", metavar="PATH", help="run the dev command in PATH")
+    parser.add_argument("command", nargs=argparse.REMAINDER)
+    args = parser.parse_args(argv)
+    if args.command[:1] == ["--"]:
+        args.command = args.command[1:]
+    if not command_is_allowed(args.command):
+        parser.error(
+            "allowed commands are `npm run dev` and `npm run start`; "
+            "passthrough is limited to host/port/open flags"
+        )
+    return args
+
+
+def executable_path(name):
+    found = shutil.which(name)
+    if not found:
+        raise FileNotFoundError(name)
+    path = Path(found).expanduser()
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    path = path.absolute()
+    if not path.is_file() or not os.access(path, os.X_OK):
+        raise PermissionError(str(path))
+    return path
+
+
+def exit_code(returncode):
+    return 128 + abs(returncode) if returncode < 0 else returncode
+
+
+class DevSupervisor:
+    def __init__(self, term_grace_seconds):
+        self.term_grace_seconds = term_grace_seconds
+        self.child = None
+        self.pgid = None
+        self.signal_received = None
+        self.teardown_attempted = False
+
+    def note_signal(self, signum, _frame):
+        if self.signal_received is None:
+            self.signal_received = signum
+
+    def group_exists(self):
+        if self.pgid is None:
+            return False
+        try:
+            os.killpg(self.pgid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+
+    def send_group(self, signum):
+        if self.pgid is None:
+            return
+        try:
+            os.killpg(self.pgid, signum)
+        except ProcessLookupError:
+            pass
+
+    def wait_for_group_exit(self, until):
+        while time.monotonic() < until:
+            if self.child is not None:
+                self.child.poll()
+            if not self.group_exists():
+                return True
+            time.sleep(POLL_SECONDS)
+        return not self.group_exists()
+
+    def teardown(self):
+        if self.pgid is None:
+            return True
+        if not self.group_exists():
+            self.pgid = None
+            return True
+        if not self.teardown_attempted:
+            self.teardown_attempted = True
+            self.send_group(signal.SIGTERM)
+            gone = self.wait_for_group_exit(time.monotonic() + self.term_grace_seconds)
+            if not gone:
+                self.send_group(signal.SIGKILL)
+                gone = self.wait_for_group_exit(time.monotonic() + KILL_REAP_SECONDS)
+            if gone:
+                self.pgid = None
+            return gone
+        return not self.group_exists()
+
+    def run(self, command, cwd, env):
+        try:
+            self.child = subprocess.Popen(
+                command,
+                cwd=str(cwd),
+                env=env,
+                start_new_session=True,
+            )
+        except FileNotFoundError:
+            print("agent-dev-run: command not found: {}".format(command[0]), file=sys.stderr)
+            return NOT_FOUND_EXIT
+        except PermissionError:
+            print(
+                "agent-dev-run: command is not executable: {}".format(command[0]),
+                file=sys.stderr,
+            )
+            return NOT_EXECUTABLE_EXIT
+        self.pgid = self.child.pid
+
+        while True:
+            if self.signal_received is not None:
+                received = self.signal_received
+                if not self.teardown():
+                    print("agent-dev-run: process group survived bounded teardown", file=sys.stderr)
+                    return SUPERVISOR_EXIT
+                return 128 + received
+            returncode = self.child.poll()
+            if returncode is not None:
+                if not self.teardown():
+                    print("agent-dev-run: background process group survived teardown", file=sys.stderr)
+                    return SUPERVISOR_EXIT
+                return exit_code(returncode)
+            time.sleep(POLL_SECONDS)
+
+
+def validate_proxy_context(tool):
+    proxy_dir_raw = os.environ.get(PROXY_DIR_ENV)
+    if not proxy_dir_raw:
+        raise RuntimeError("missing private dev-proxy context")
+
+    proxy_dir = Path(proxy_dir_raw)
+    invoked = Path(sys.argv[0])
+    if not invoked.is_absolute():
+        invoked = Path.cwd() / invoked
+    if invoked.parent.absolute() != proxy_dir.absolute():
+        raise RuntimeError("dev proxy was invoked outside its private directory")
+    try:
+        context = json.loads((proxy_dir / PROXY_CONTEXT_FILE).read_text(encoding="utf-8"))
+        real_raw = context["real_cargo" if tool == "cargo" else "real_rustc"]
+    except (OSError, json.JSONDecodeError, KeyError, TypeError) as error:
+        raise RuntimeError("cannot read private dev-proxy context") from error
+
+    real = Path(real_raw)
+    if not real.is_absolute() or not real.is_file() or not os.access(real, os.X_OK):
+        raise RuntimeError("real {} executable is invalid".format(tool))
+    return real
+
+
+def proxy_main(tool, argv):
+    try:
+        real = validate_proxy_context(tool)
+        real_rustc = validate_proxy_context("rustc")
+    except RuntimeError as error:
+        print("agent-dev-run {} proxy: {}".format(tool, error), file=sys.stderr)
+        return SUPERVISOR_EXIT
+
+    env = os.environ.copy()
+    # A repository child can forge any environment marker it inherits or creates.
+    # Therefore the proxy never treats LANE_ACTIVE_ENV as authority. Every direct
+    # proxy call reacquires the kernel flock. Cargo alone receives the resolved real
+    # rustc path before entering the lane, avoiding only its own non-reentrant
+    # compiler recursion.
+    env.pop(LANE_ACTIVE_ENV, None)
+    if tool == "cargo":
+        # Cargo now owns the lane, so its compiler must not recursively acquire
+        # the same non-reentrant flock. Explicit RUSTC also covers rustup shims.
+        env["RUSTC"] = str(real_rustc)
+    resource_runner = Path(__file__).resolve().parent / "agent-resource-run"
+    if not resource_runner.is_file() or not os.access(resource_runner, os.X_OK):
+        print("agent-dev-run {} proxy: resource runner is unavailable".format(tool), file=sys.stderr)
+        return SUPERVISOR_EXIT
+    os.execve(
+        str(resource_runner),
+        [str(resource_runner), "--", str(real), *argv],
+        env,
+    )
+
+
+def main(argv):
+    invoked_as = Path(sys.argv[0]).name
+    if invoked_as in {"cargo", "rustc"}:
+        return proxy_main(invoked_as, argv)
+
+    args = parse_args(argv)
+    invocation_dir = Path.cwd().resolve()
+    child_dir = (invocation_dir / args.chdir).resolve() if args.chdir else invocation_dir
+    if not child_dir.is_dir():
+        print("agent-dev-run: --chdir is not a directory: {}".format(child_dir), file=sys.stderr)
+        return NOT_FOUND_EXIT
+    inherited_reserved = sorted(name for name in RESERVED_ENV if name in os.environ)
+    if inherited_reserved:
+        print(
+            "agent-dev-run: reserved supervisor environment is already set: {}".format(
+                ", ".join(inherited_reserved)
+            ),
+            file=sys.stderr,
+        )
+        return USAGE_EXIT
+
+    try:
+        real_cargo = executable_path("cargo")
+        real_rustc = executable_path("rustc")
+    except FileNotFoundError as error:
+        print("agent-dev-run: required tool not found: {}".format(error.args[0]), file=sys.stderr)
+        return NOT_FOUND_EXIT
+    except PermissionError as error:
+        print("agent-dev-run: required tool is not executable: {}".format(error), file=sys.stderr)
+        return NOT_EXECUTABLE_EXIT
+
+    supervisor = DevSupervisor(args.term_grace_seconds)
+    atexit.register(supervisor.teardown)
+    for signum in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
+        signal.signal(signum, supervisor.note_signal)
+
+    with tempfile.TemporaryDirectory(prefix="murmur-agent-dev-proxy-") as temp:
+        proxy_dir = Path(temp)
+        context_file = proxy_dir / PROXY_CONTEXT_FILE
+        context_file.write_text(
+            json.dumps(
+                {"real_cargo": str(real_cargo), "real_rustc": str(real_rustc)},
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+        context_file.chmod(0o600)
+        script = Path(__file__).absolute()
+        for tool in ("cargo", "rustc"):
+            (proxy_dir / tool).symlink_to(script)
+
+        env = os.environ.copy()
+        env[PROXY_DIR_ENV] = str(proxy_dir)
+        env["PATH"] = str(proxy_dir) + os.pathsep + env.get("PATH", "")
+        # Tauri honors these variables when resolving the Rust toolchain.
+        # Setting both closes the alternate resolution path around PATH.
+        env["CARGO"] = str(proxy_dir / "cargo")
+        env["RUSTC"] = str(proxy_dir / "rustc")
+        return supervisor.run(args.command, child_dir, env)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

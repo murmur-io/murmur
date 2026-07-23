@@ -1,7 +1,6 @@
 //! Headless end-to-end check of the MeetNotes core pipeline (no mic, no GUI):
-//! transcribe a 16 kHz mono WAV with Whisper, summarize via ClaudeCodeProvider
-//! (falling back to a stub note if the `claude` CLI / API is unavailable), and
-//! export a `.md` into a vault dir. Driven by `scripts/e2e-core.sh`.
+//! transcribe a 16 kHz mono WAV with Whisper, summarize with a deterministic
+//! no-egress stub, and export a `.md` into a vault dir.
 //!
 //! Usage: cargo run --example e2e_core -- <wav_16k_mono> <whisper_model.bin> <vault_dir>
 
@@ -9,10 +8,7 @@ use std::path::Path;
 
 use meetnotes_lib::audio;
 use meetnotes_lib::export;
-use meetnotes_lib::summarize::claude_code::ClaudeCodeProvider;
-use meetnotes_lib::summarize::provider::{
-    Availability, MeetingMeta, SummarizeRequest, SummarizerProvider,
-};
+use meetnotes_lib::summarize::provider::{MeetingMeta, SummarizeRequest};
 use meetnotes_lib::transcribe::Transcriber;
 
 #[tokio::main]
@@ -74,26 +70,9 @@ async fn main() {
         live_bullets: None,
     };
 
-    let provider = ClaudeCodeProvider::new();
-    let note = match provider.availability().await {
-        Availability::Available => {
-            eprintln!("[e2e] claude available — summarizing via ClaudeCodeProvider");
-            match provider.summarize(&req).await {
-                Ok(md) => {
-                    eprintln!("[e2e] provider produced a note ({} bytes)", md.len());
-                    md
-                }
-                Err(e) => {
-                    eprintln!("[e2e] provider error: {e} — falling back to stub note");
-                    stub_note(&req)
-                }
-            }
-        }
-        Availability::Unavailable { reason } => {
-            eprintln!("[e2e] claude unavailable ({reason}) — using stub note");
-            stub_note(&req)
-        }
-    };
+    println!("provider mode: deterministic-stub (no egress)");
+    eprintln!("[e2e] using deterministic local stub (no provider egress)");
+    let note = stub_note(&req);
 
     assert!(
         note.trim_start().starts_with("---"),
@@ -120,7 +99,7 @@ async fn main() {
 
 fn stub_note(req: &SummarizeRequest) -> String {
     format!(
-        "---\ndate: 2026-06-24\ntype: meeting\nattendees: []\ntags: [meeting, e2e]\n---\n# MeetNotes E2E test\n\n## TL;DR\nHeadless E2E: local transcription + Obsidian export verified. The AI provider step was stubbed (claude/API unavailable at run time).\n\n## Transkrypt (oczyszczony)\n{}\n",
+        "---\ndate: 2026-06-24\ntype: meeting\nattendees: []\ntags: [meeting, e2e]\n---\n# MeetNotes E2E test\n\n## TL;DR\nHeadless E2E: local transcription + Obsidian export verified. The AI provider step was an explicit deterministic stub.\n\n## Transkrypt (oczyszczony)\n{}\n",
         req.transcript
     )
 }
