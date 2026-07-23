@@ -49,6 +49,9 @@ use crate::state::AppState;
 /// Event emitted to all windows when screen sharing STARTS (rising edge). The UI listens and toasts
 /// "Screen sharing detected — locked notes were re-secured."
 pub const EVENT_SCREEN_SHARE_STARTED: &str = "murmur://screen-share-started";
+/// Emitted when logical visibility was revoked but physical cleanup could not finish. The main
+/// Murmur window is hidden before this event is sent; the UI must never present this as success.
+pub const EVENT_SCREEN_SHARE_RELOCK_FAILED: &str = "murmur://screen-share-relock-failed";
 
 /// Poll cadence for the share-state check. ~1.5s is responsive enough to re-secure quickly while
 /// being negligible CPU.
@@ -178,19 +181,40 @@ fn captured_on_main(app: &AppHandle) -> bool {
 fn on_capture_started(app: &AppHandle) {
     let state = app.state::<AppState>();
     // relock_all_inner takes &AppState; State derefs to it.
-    if let Err(e) = crate::commands::relock_all_inner(&state) {
-        tracing::error!(
-            target: "screenshare",
-            error = %e,
-            "relock_all_inner failed during screen-share auto-relock"
-        );
-    }
-    // Emit regardless so the UI can surface the privacy event even if there was nothing to relock.
-    if let Err(e) = app.emit(EVENT_SCREEN_SHARE_STARTED, ()) {
+    let secured = match crate::commands::relock_all_inner(&state) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::error!(
+                target: "screenshare",
+                error = %e,
+                "screen-share relock cleanup failed after logical visibility revocation"
+            );
+            // Fail closed on the surface the watcher controls. The vault conflict remains intact
+            // for loss-safe recovery, but Murmur itself disappears from the active capture instead
+            // of rendering gated content or claiming that every physical export was secured.
+            if let Some(window) = app.get_webview_window("main") {
+                if let Err(error) = window.hide() {
+                    tracing::error!(
+                        target: "screenshare",
+                        error = %error,
+                        "failed to hide Murmur after screen-share relock cleanup failure"
+                    );
+                }
+            }
+            false
+        }
+    };
+    let event = if secured {
+        EVENT_SCREEN_SHARE_STARTED
+    } else {
+        EVENT_SCREEN_SHARE_RELOCK_FAILED
+    };
+    if let Err(e) = app.emit(event, ()) {
         tracing::warn!(
             target: "screenshare",
             error = %e,
-            "failed to emit screen-share-started event"
+            secured,
+            "failed to emit screen-share privacy event"
         );
     }
     // The auto-relock purged ALL pending audit findings — ping the FE inbox too (count-only,

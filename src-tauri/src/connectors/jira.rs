@@ -48,7 +48,11 @@ impl JiraConnector {
         if !config.jira_enabled || !config.jira_consented {
             return None;
         }
-        let base_url = config.jira_base_url.trim().trim_end_matches('/').to_string();
+        let base_url = config
+            .jira_base_url
+            .trim()
+            .trim_end_matches('/')
+            .to_string();
         let email = config.jira_email.trim().to_string();
         if base_url.is_empty() || email.is_empty() {
             return None;
@@ -118,7 +122,9 @@ impl JiraConnector {
             .header("Accept", "application/json")
             .send()
             .await
-            .map_err(|e| ConnectorError::Failed(format!("jira issue request: {}", e.without_url())))?;
+            .map_err(|e| {
+                ConnectorError::Failed(format!("jira issue request: {}", e.without_url()))
+            })?;
         if resp.status().as_u16() == 404 {
             return Ok(None);
         }
@@ -266,7 +272,10 @@ mod tests {
         let hits = JiraConnector::parse_results(body, "https://acme.atlassian.net").unwrap();
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].title, "PROJ-123 — Fix login flow");
-        assert_eq!(hits[0].snippet, "Status: In Progress · Assignee: Anna · Due: 2026-07-10");
+        assert_eq!(
+            hits[0].snippet,
+            "Status: In Progress · Assignee: Anna · Due: 2026-07-10"
+        );
         assert_eq!(hits[0].url, "https://acme.atlassian.net/browse/PROJ-123");
         assert_eq!(hits[0].source_label, "Jira");
         assert_eq!(hits[1].snippet, "Status: Done");
@@ -274,8 +283,14 @@ mod tests {
 
     #[test]
     fn jira_parser_tolerates_missing_fields_and_empty() {
-        assert!(JiraConnector::parse_results(r#"{}"#, "https://x").unwrap().is_empty());
-        assert!(JiraConnector::parse_results(r#"{"issues":[]}"#, "https://x").unwrap().is_empty());
+        assert!(JiraConnector::parse_results(r#"{}"#, "https://x")
+            .unwrap()
+            .is_empty());
+        assert!(
+            JiraConnector::parse_results(r#"{"issues":[]}"#, "https://x")
+                .unwrap()
+                .is_empty()
+        );
         // Missing key → skipped; missing fields → title still renders.
         let body = r#"{"issues":[{"key":"","fields":{}},{"key":"A-1","fields":{}}]}"#;
         let hits = JiraConnector::parse_results(body, "https://x").unwrap();
@@ -294,7 +309,9 @@ mod tests {
     #[test]
     fn jira_issue_parser_maps_snapshot() {
         let body = r#"{"key":"PROJ-1","fields":{"summary":"Fix login","status":{"name":"In Progress"},"duedate":"2026-07-10"}}"#;
-        let s = JiraConnector::parse_issue(body, "https://acme.atlassian.net").unwrap().unwrap();
+        let s = JiraConnector::parse_issue(body, "https://acme.atlassian.net")
+            .unwrap()
+            .unwrap();
         assert_eq!(s.key, "PROJ-1");
         assert_eq!(s.status, "In Progress");
         assert_eq!(s.due.as_deref(), Some("2026-07-10"));
@@ -303,7 +320,10 @@ mod tests {
 
     #[test]
     fn jql_escaping_neutralizes_quotes_and_backslashes() {
-        assert_eq!(escape_jql(r#"login "bug" \ test"#), r#"login \"bug\" \\ test"#);
+        assert_eq!(
+            escape_jql(r#"login "bug" \ test"#),
+            r#"login \"bug\" \\ test"#
+        );
     }
 
     #[test]
@@ -312,8 +332,14 @@ mod tests {
         // the disabled cases (enable/consent are checked first).
         let cfg = AppConfig::default();
         assert!(JiraConnector::from_config_if_available(&cfg).is_none());
-        let cfg = AppConfig { jira_enabled: true, ..AppConfig::default() };
-        assert!(JiraConnector::from_config_if_available(&cfg).is_none(), "unconsented");
+        let cfg = AppConfig {
+            jira_enabled: true,
+            ..AppConfig::default()
+        };
+        assert!(
+            JiraConnector::from_config_if_available(&cfg).is_none(),
+            "unconsented"
+        );
         let cfg = AppConfig {
             jira_enabled: true,
             jira_consented: true,
@@ -321,6 +347,9 @@ mod tests {
             jira_email: "a@b.c".into(),
             ..AppConfig::default()
         };
-        assert!(JiraConnector::from_config_if_available(&cfg).is_none(), "no base url");
+        assert!(
+            JiraConnector::from_config_if_available(&cfg).is_none(),
+            "no base url"
+        );
     }
 }

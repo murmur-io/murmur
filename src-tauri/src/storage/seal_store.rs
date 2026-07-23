@@ -34,6 +34,62 @@ use crate::storage::db::{
 };
 
 impl Db {
+    /// Final commit for permanent folder unlock. Every plaintext note/transcript/timeline/manual
+    /// note/document and durable audio file has already been restored while the original sealed
+    /// blobs remain intact. Clearing those recovery blobs and flipping `locked=0` must be ONE
+    /// transaction: a crash before commit stays a normal locked/session-materialized state that
+    /// startup can reblank; a crash after commit is a fully open folder. There is no intermediate
+    /// locked-with-plaintext-and-no-blob state.
+    pub fn commit_folder_permanent_unlock(&self, folder_id: &str) -> Result<()> {
+        const FOLDER_MEETINGS: &str = "SELECT DISTINCT meeting_id FROM notes WHERE folder_id = ?1";
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        tx.execute(
+            "UPDATE notes SET content_blob = NULL WHERE folder_id = ?1",
+            rusqlite::params![folder_id],
+        )
+        .map_err(map_err)?;
+        tx.execute(
+            &format!(
+                "UPDATE segments SET text_blob = NULL WHERE meeting_id IN ({FOLDER_MEETINGS})"
+            ),
+            rusqlite::params![folder_id],
+        )
+        .map_err(map_err)?;
+        tx.execute(
+            &format!(
+                "UPDATE timelines SET data_blob = NULL WHERE meeting_id IN ({FOLDER_MEETINGS})"
+            ),
+            rusqlite::params![folder_id],
+        )
+        .map_err(map_err)?;
+        tx.execute(
+            &format!(
+                "UPDATE meetings SET manual_notes_blob = NULL WHERE id IN ({FOLDER_MEETINGS})"
+            ),
+            rusqlite::params![folder_id],
+        )
+        .map_err(map_err)?;
+        tx.execute(
+            "UPDATE documents SET text_blob = NULL WHERE folder_id = ?1",
+            rusqlite::params![folder_id],
+        )
+        .map_err(map_err)?;
+        tx.execute(
+            "UPDATE note_attachments SET data_blob = NULL WHERE
+               document_id IN (SELECT id FROM documents WHERE folder_id = ?1)
+               OR meeting_id IN (SELECT meeting_id FROM notes WHERE folder_id = ?1)",
+            rusqlite::params![folder_id],
+        )
+        .map_err(map_err)?;
+        tx.execute(
+            "UPDATE folders SET locked = 0, wrapped_key = NULL WHERE id = ?1",
+            rusqlite::params![folder_id],
+        )
+        .map_err(map_err)?;
+        tx.commit().map_err(map_err)
+    }
+
     /// Seal ONE document's text: store the AES-GCM `text_blob`, blank the plaintext `text`. The CALLER
     /// must verify the blob decrypts back byte-identical BEFORE calling this (verify-before-destroy) —
     /// exactly like [`Db::seal_manual_notes`] / [`Db::seal_note`].
@@ -766,11 +822,13 @@ impl Db {
         // sealed neighbour's `[[Title]]` in a VISIBLE source note's plaintext (DB + `.md`). Repair it
         // here, BEFORE the links purge deletes the rows that name the affected sources. Resolve the
         // locked folders' meeting + document id lists, then strip each sealed title from every visible
-        // source's managed block in THIS reconciliation tx. The `changed` sources' `.md` re-export is
-        // done by the caller ([`crate::state`] `reconcile_locked_at_rest`) via `changed_marker_sources`.
+        // source's managed block in THIS reconciliation tx. Exact export path+title cleanup authority
+        // is journaled by the strip helper and drained after this transaction by `crate::state`.
         let locked_meeting_ids: Vec<String> = {
             let mut stmt = tx.prepare(LOCKED_MEETINGS).map_err(map_err)?;
-            let rows = stmt.query_map([], |r| r.get::<_, String>(0)).map_err(map_err)?;
+            let rows = stmt
+                .query_map([], |r| r.get::<_, String>(0))
+                .map_err(map_err)?;
             let mut out = Vec::new();
             for r in rows {
                 out.push(r.map_err(map_err)?);
@@ -783,18 +841,16 @@ impl Db {
                     "SELECT id FROM documents WHERE folder_id IN (SELECT id FROM folders WHERE locked = 1)",
                 )
                 .map_err(map_err)?;
-            let rows = stmt.query_map([], |r| r.get::<_, String>(0)).map_err(map_err)?;
+            let rows = stmt
+                .query_map([], |r| r.get::<_, String>(0))
+                .map_err(map_err)?;
             let mut out = Vec::new();
             for r in rows {
                 out.push(r.map_err(map_err)?);
             }
             out
         };
-        let changed_marker_sources = Self::strip_sealed_neighbour_markers_tx(
-            &tx,
-            &locked_meeting_ids,
-            &locked_document_ids,
-        )?;
+        Self::strip_sealed_neighbour_markers_tx(&tx, &locked_meeting_ids, &locked_document_ids)?;
         // Brain v3 PR-3 LINK-ENGINE LOCK-SAFETY: purge every DERIVED `links` row whose meeting endpoint
         // is in a locked folder, OR whose document/note endpoint is in a locked folder, in this same
         // reconciliation transaction — so a crash-while-unlocked (which may have re-derived
@@ -891,7 +947,7 @@ impl Db {
             out
         };
         tx.commit().map_err(map_err)?;
-        Ok((audio, rollup_exports, note_md_exports, changed_marker_sources))
+        Ok((audio, rollup_exports, note_md_exports))
     }
 
     /// The RAW segment rows of a meeting (idx, plaintext text, sealed `text_blob`), regardless of

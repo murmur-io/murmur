@@ -108,15 +108,23 @@ pub(crate) fn persist_facts_for_meeting(
     title: &str,
     markdown: &str,
     entity_refs: &[(String, String)],
+    recording_model_token: Option<&crate::perf::RecordingSessionToken>,
+    visibility: &MeetingContentSnapshot,
 ) -> Result<(), AppError> {
     if entity_refs.is_empty() {
         return Ok(());
     }
     // 1) Best-effort extraction (panic-free, empty on stub/no model/decode failure). The reasoner
     //    is re-resolved from the LIVE config, so a consent/backend change applies without restart.
+    let reasoner = match recording_model_token {
+        Some(token) => state
+            .reasoner
+            .extraction_reasoner_for_recording(token.clone()),
+        None => state.reasoner.extraction_reasoner(),
+    };
     let candidates = crate::facts::extract_fact_candidates(
         // Brain Live ON ⇒ the LOCAL light engine (facts stop egressing); OFF ⇒ today's Notes reasoner.
-        &*state.reasoner.extraction_reasoner(),
+        reasoner.as_ref(),
         title,
         markdown,
         entity_refs,
@@ -126,6 +134,11 @@ pub(crate) fn persist_facts_for_meeting(
     if candidates.is_empty() {
         return Ok(()); // nothing to reconcile — common in the default (no-model) build.
     }
+    // Inference above intentionally runs without the lifecycle mutex. Rebind the exact meeting
+    // authorization generation and hold it through every derived DB write so relock cannot purge
+    // facts and then be followed by this late reconcile.
+    let _lifecycle = lifecycle_guard(state);
+    require_current_meeting_content_snapshot_under_lifecycle(state, meeting_id, visibility)?;
     // 2) Existing facts for exactly these entities.
     let entity_ids: Vec<String> = entity_refs.iter().map(|(id, _)| id.clone()).collect();
     let existing = state.db.facts_for_entities(&entity_ids)?;
@@ -243,6 +256,8 @@ pub(crate) fn persist_user_facts_for_meeting(
     meeting_id: &str,
     title: &str,
     markdown: &str,
+    recording_model_token: Option<&crate::perf::RecordingSessionToken>,
+    visibility: &MeetingContentSnapshot,
 ) -> Result<(), AppError> {
     // FLAG: when the user has turned cross-meeting memory OFF, skip extraction ENTIRELY — no
     // reasoner call, no candidates, nothing new persisted. (Existing facts stay; the user can
@@ -261,9 +276,15 @@ pub(crate) fn persist_user_facts_for_meeting(
     let thread_turns = gated_meeting_thread_turns(state, meeting_id);
     // 1) Best-effort extraction (panic-free, empty on stub/no model/decode failure). The reasoner is
     //    re-resolved from the LIVE config so a consent/backend change applies without restart.
+    let reasoner = match recording_model_token {
+        Some(token) => state
+            .reasoner
+            .extraction_reasoner_for_recording(token.clone()),
+        None => state.reasoner.extraction_reasoner(),
+    };
     let candidates = crate::user_memory::extract_user_fact_candidates(
         // Brain Live ON ⇒ the LOCAL light engine (user facts stop egressing); OFF ⇒ today's reasoner.
-        &*state.reasoner.extraction_reasoner(),
+        reasoner.as_ref(),
         title,
         markdown,
         &typed_notes,
@@ -272,6 +293,8 @@ pub(crate) fn persist_user_facts_for_meeting(
     if candidates.is_empty() {
         return Ok(()); // nothing to reconcile — common in the default (no-model) build.
     }
+    let _lifecycle = lifecycle_guard(state);
+    require_current_meeting_content_snapshot_under_lifecycle(state, meeting_id, visibility)?;
     // 2) Existing user facts (all of them — the reconcile input).
     let existing = state.db.user_facts_all()?;
     // 3) Deterministic reconcile at the meeting's time (valid-time origin).

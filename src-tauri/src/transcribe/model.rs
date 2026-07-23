@@ -281,12 +281,10 @@ fn first_present_model_in(dir: &Path, sizes: &[&str], language: &str) -> Option<
 /// unrecognizable custom filename classifies NOT-heavy, which preserves the pre-pin behavior
 /// for explicit `whisper_model_path` users.
 pub fn is_live_heavy_model_file(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|n| n.to_str())
-        .is_some_and(|n| {
-            let n = n.to_ascii_lowercase();
-            n.contains("large") || n.contains("medium")
-        })
+    path.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+        let n = n.to_ascii_lowercase();
+        n.contains("large") || n.contains("medium")
+    })
 }
 
 /// Hugging Face mirror of the official whisper.cpp GGML models (ggerganov/whisper.cpp).
@@ -491,7 +489,13 @@ where
     let dest = dir.join(&file);
     // Connect-bounded, total-uncapped: a multi-GB whisper model on a slow link can legitimately
     // outlast any fixed total cap (see the constants above).
-    download_model_streaming(&download_client(None), &model_url(&file), &dest, on_progress).await?;
+    download_model_streaming(
+        &download_client(None),
+        &model_url(&file),
+        &dest,
+        on_progress,
+    )
+    .await?;
     Ok(dest)
 }
 
@@ -775,7 +779,10 @@ mod tests {
             !part.exists(),
             "the partial `.part` must be removed on a mid-stream error (no multi-GB orphan)"
         );
-        assert!(!dest.exists(), "no model file is produced from a failed download");
+        assert!(
+            !dest.exists(),
+            "no model file is produced from a failed download"
+        );
 
         let _ = server.join();
         let _ = std::fs::remove_dir_all(&dir);
@@ -830,7 +837,10 @@ mod tests {
             !dest.with_extension("part").exists(),
             "the stalled `.part` must be reclaimed by the guard"
         );
-        assert!(!dest.exists(), "no model file is produced from a stalled download");
+        assert!(
+            !dest.exists(),
+            "no model file is produced from a stalled download"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -846,7 +856,10 @@ mod tests {
         {
             let _g = PartFileGuard::new(armed.clone());
         }
-        assert!(!armed.exists(), "an armed guard removes the `.part` on drop");
+        assert!(
+            !armed.exists(),
+            "an armed guard removes the `.part` on drop"
+        );
 
         // (b) disarmed guard → drop leaves the file (success path already renamed it away).
         let kept = dir.join("kept.part");
@@ -870,8 +883,7 @@ mod tests {
         // A stale orphan: old mtime (2 h) → must be swept.
         let stale = dir.join("ggml-tiny.bin.part");
         std::fs::write(&stale, b"orphaned-partial").unwrap();
-        let two_hours_ago =
-            std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 3600);
+        let two_hours_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 3600);
         filetime_set(&stale, two_hours_ago);
 
         // A fresh `.part` (possibly a live in-progress download) → must survive.
@@ -885,7 +897,10 @@ mod tests {
         sweep_stale_model_parts(&dir);
 
         assert!(!stale.exists(), "a stale `.part` orphan must be swept");
-        assert!(fresh.exists(), "a fresh `.part` (possibly live) must NOT be raced/removed");
+        assert!(
+            fresh.exists(),
+            "a fresh `.part` (possibly live) must NOT be raced/removed"
+        );
         assert!(real.exists(), "a real model `.bin` must never be touched");
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -972,7 +987,11 @@ mod tests {
         for size in QUANT_MODEL_SIZES {
             let expected = format!("ggml-{size}.bin");
             for lang in ["", "en", "pl"] {
-                assert_eq!(model_filename(size, lang), expected, "size={size} lang={lang}");
+                assert_eq!(
+                    model_filename(size, lang),
+                    expected,
+                    "size={size} lang={lang}"
+                );
             }
         }
         // The concrete rows, spelled out (the mirror's actual file names):
@@ -982,7 +1001,10 @@ mod tests {
             model_filename("large-v3-turbo-q8_0", ""),
             "ggml-large-v3-turbo-q8_0.bin"
         );
-        assert_eq!(model_filename("large-v3-q5_0", "en"), "ggml-large-v3-q5_0.bin");
+        assert_eq!(
+            model_filename("large-v3-q5_0", "en"),
+            "ggml-large-v3-q5_0.bin"
+        );
     }
 
     const GIB: u64 = 1024 * 1024 * 1024;
@@ -993,7 +1015,10 @@ mod tests {
     fn default_model_size_prefers_downloaded_turbo() {
         let files = ["ggml-large-v3-turbo-q8_0.bin", "ggml-small.bin"];
         assert_eq!(default_model_size(&files, None), TURBO_DEFAULT_SIZE);
-        assert_eq!(default_model_size(&files, Some(8 * GIB)), TURBO_DEFAULT_SIZE);
+        assert_eq!(
+            default_model_size(&files, Some(8 * GIB)),
+            TURBO_DEFAULT_SIZE
+        );
         assert_eq!(
             default_model_size(&["ggml-large-v3-turbo-q8_0.bin"], Some(64 * GIB)),
             TURBO_DEFAULT_SIZE
@@ -1006,9 +1031,15 @@ mod tests {
     #[test]
     fn default_model_size_fresh_install_big_ram_gets_turbo() {
         let none: [&str; 0] = [];
-        assert_eq!(default_model_size(&none, Some(16 * GIB)), TURBO_DEFAULT_SIZE);
+        assert_eq!(
+            default_model_size(&none, Some(16 * GIB)),
+            TURBO_DEFAULT_SIZE
+        );
         // The floor is inclusive.
-        assert_eq!(default_model_size(&none, Some(12 * GIB)), TURBO_DEFAULT_SIZE);
+        assert_eq!(
+            default_model_size(&none, Some(12 * GIB)),
+            TURBO_DEFAULT_SIZE
+        );
         // Non-whisper residents of the models dir still count as fresh.
         let sidecars = [
             VAD_MODEL_FILE,
@@ -1016,7 +1047,10 @@ mod tests {
             DIARIZE_EMB_MODEL_FILE,
             "ggml-small.bin.part",
         ];
-        assert_eq!(default_model_size(&sidecars, Some(16 * GIB)), TURBO_DEFAULT_SIZE);
+        assert_eq!(
+            default_model_size(&sidecars, Some(16 * GIB)),
+            TURBO_DEFAULT_SIZE
+        );
     }
 
     /// T2 DEFAULT FLIP branch 3a — low or UNKNOWN RAM stays on `small` (a broken RAM probe must
@@ -1274,7 +1308,8 @@ mod tests {
     /// app-data models dir.
     #[test]
     fn parakeet_present_requires_every_file() {
-        let dir = std::env::temp_dir().join(format!("murmur-parakeet-model-{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("murmur-parakeet-model-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let present = |d: &Path| PARAKEET_FILES.iter().all(|f| d.join(f).is_file());
 

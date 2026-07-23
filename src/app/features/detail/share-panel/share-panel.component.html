@@ -14,9 +14,18 @@
       <p class="empty-title">Sharing isn't set up yet</p>
       <p class="gate-copy">
         Murmur can share this note as an end-to-end encrypted link. It uploads
-        only the <strong>encrypted</strong> note — the decryption key never
+        only the <strong>encrypted</strong> note bundle — the decryption key never
         leaves your Mac.
       </p>
+      @if (attachments().length > 0) {
+        <p class="hint">
+          {{ attachments().length }} referenced
+          {{ attachments().length === 1 ? "image" : "images" }}
+          ({{ formatAttachmentBytes(attachmentBytes()) }}) will be included.
+          Images are included exactly as shown; Murmur does not inspect or
+          remove text visible inside pixels.
+        </p>
+      }
       <ul class="gate-reasons">
         @for (r of gateReasons(); track r.key) {
           <li>{{ r.text }}</li>
@@ -57,6 +66,15 @@
     @if (step() === "configure") {
       <div class="panel-card create" role="group" aria-label="Create a share link">
         <span class="section-label">Create a share link</span>
+        @if (attachments().length > 0) {
+          <p class="hint">
+            Includes {{ attachments().length }} referenced
+            {{ attachments().length === 1 ? "image" : "images" }}
+            ({{ formatAttachmentBytes(attachmentBytes()) }}) in the same E2EE
+            ciphertext bundle. Images are included exactly as shown; Murmur
+            does not inspect or remove text visible inside pixels.
+          </p>
+        }
 
         <!-- PASSWORD (first, focused). -->
         <div class="field">
@@ -163,8 +181,10 @@
           <div class="consent" role="group">
             <p class="consent-copy">
               <span class="consent-mark" aria-hidden="true">ⓘ</span>
-              Uploads the <strong>encrypted</strong> note to your sharing
-              server. The decryption key stays on your Mac.
+              Uploads the <strong>encrypted</strong> note bundle to your sharing
+              server. Referenced images travel inside that E2EE bundle. Images
+              are included exactly as shown; Murmur does not inspect or remove
+              text visible inside pixels. The decryption key stays on your Mac.
             </p>
             <button type="button" class="btn btn-ghost" (click)="grantConsent()" [disabled]="consenting()">
               {{ consenting() ? "…" : "I understand" }}
@@ -387,7 +407,10 @@
             @case ("email") {
               <p class="consent-copy">
                 Share this note directly with another Murmur user. It's
-                end-to-end encrypted to their account key.
+                end-to-end encrypted to their account key. Referenced images
+                travel in the same ciphertext bundle. Images are included
+                exactly as shown; Murmur does not inspect or remove text visible
+                inside pixels.
               </p>
               <div class="person-row">
                 <input
@@ -429,9 +452,11 @@
             }
             @case ("consent") {
               <p class="consent-copy">
-                This uploads the encrypted note to your sharing server. The note
-                is end-to-end encrypted — the server can't read it — but it does
-                leave this Mac.
+                This uploads the encrypted note bundle to your sharing server.
+                The note and referenced images are end-to-end encrypted — the
+                server can't read them — but images are included exactly as
+                shown; Murmur does not inspect or remove text visible inside
+                pixels, and the bundle does leave this Mac.
               </p>
               <div class="person-row">
                 <button type="button" class="btn btn-primary" (click)="confirmPersonConsent()" [disabled]="personBusy()">

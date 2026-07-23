@@ -2,7 +2,7 @@
   "name": "murmur",
   "version": "1.0.1",
   "scripts": {
-    "start": "ng serve --port 1420",
+    "start": "cargo build -p murmur-brain && ng serve --port 1420",
     "build": "ng build",
     "tauri": "tauri",
     "dev": "tauri dev",

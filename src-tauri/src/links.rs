@@ -293,7 +293,11 @@ mod tests {
             cand(LinkKind::Note, "e", 0.885, true),
             cand(LinkKind::Note, "f", 0.881, true),
         ]);
-        assert_eq!(out.len(), SEMANTIC_LINK_CAP, "must cap at SEMANTIC_LINK_CAP");
+        assert_eq!(
+            out.len(),
+            SEMANTIC_LINK_CAP,
+            "must cap at SEMANTIC_LINK_CAP"
+        );
         assert_eq!(out[0].id, "m", "0.95 strongest first");
         assert_eq!(out[1].id, "c", "0.91 next");
         // The two 0.90 ties: "a" before "b" (kind equal → id ASC).

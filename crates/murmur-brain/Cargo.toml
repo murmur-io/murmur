@@ -7,10 +7,10 @@ description = "Murmur on-device GGUF LLM inference, isolated in a killable helpe
 # Never published; the app bundles the built binary as a signed Resources/ helper.
 publish = false
 
-# The compiled binary is named `meetnotes-brain` so the existing inside-out signing glob
-# `Contents/Resources/meetnotes-*` in scripts/macos-sign-notarize.sh covers it for free.
+# The compiled binary is named `murmur-brain` to match the Murmur product and process name.
+# scripts/macos-sign-notarize.sh signs it explicitly alongside the legacy `meetnotes-*` helpers.
 [[bin]]
-name = "meetnotes-brain"
+name = "murmur-brain"
 path = "src/main.rs"
 
 [dependencies]

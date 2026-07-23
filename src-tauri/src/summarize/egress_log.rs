@@ -217,7 +217,10 @@ mod tests {
         assert!(e.meeting_id.is_none());
         // Content-free by construction: only the server id enters, and only as an id.
         let dbg = format!("{e:?}");
-        assert!(!dbg.contains("http"), "no endpoint/server strings in the row: {dbg}");
+        assert!(
+            !dbg.contains("http"),
+            "no endpoint/server strings in the row: {dbg}"
+        );
     }
 
     /// Brain v2 L3 — the escalation ledger row is CONTENT-FREE by construction: `call_kind`

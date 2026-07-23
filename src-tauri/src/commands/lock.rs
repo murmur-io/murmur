@@ -66,7 +66,80 @@ pub(crate) fn lock_folder_inner(state: &AppState, folder_id: String) -> Result<(
         ));
     }
     if folder.locked {
-        return Ok(()); // already sealed — idempotent.
+        // `locked=1` is the durable seal journal, not proof that its non-keyed cleanup tail finished.
+        // Always replay that idempotent tail. Only release the CK when primary plaintext/audio residue
+        // proves the keyed portion itself was interrupted.
+        bump_seal_epoch(state);
+        {
+            let mut unlocked = state
+                .unlocked_folders
+                .lock()
+                .map_err(|_| AppError::Storage("unlocked-folders mutex poisoned".into()))?;
+            unlocked.remove(&folder_id);
+        }
+        if let Ok(mut cache) = state.verify_cache.lock() {
+            cache.clear();
+        }
+        let exported_paths: Vec<String> = state
+            .db
+            .meeting_note_export_rows_in_folder(&folder_id)?
+            .into_iter()
+            .map(|(_, _, path, _)| path)
+            .collect();
+        if locked_folder_requires_authenticated_repair(&state.db, &folder_id)? {
+            let wrapped = state
+                .db
+                .folder_wrapped_key(&folder_id)?
+                .ok_or_else(|| AppError::Storage("locked folder has no wrapped key".into()))?;
+            let candidates = crate::secrets::list_master_kek_candidates_strict(
+                "Finish securing this folder after an interrupted lock",
+            )?;
+            let (ck_bytes, _winning_kek, _winner_index) =
+                try_unwrap_ck_with_candidates(&candidates, &wrapped, &folder_id, None).ok_or_else(
+                    || {
+                        AppError::Auth(
+                            "no keychain key can finish the interrupted folder lock".into(),
+                        )
+                    },
+                )?;
+            let ck: Zeroizing<[u8; 32]> =
+                Zeroizing::new(ck_bytes.as_slice().try_into().map_err(|_| {
+                    AppError::Storage("unwrapped content key has wrong length".into())
+                })?);
+            repair_locked_folder_at_rest(&state.db, &folder_id, &ck)?;
+            if locked_folder_requires_authenticated_repair(&state.db, &folder_id)? {
+                return Err(AppError::Storage(
+                    "interrupted folder lock repair did not reach a sealed at-rest shape".into(),
+                ));
+            }
+        }
+        finish_folder_lock_after_seal(state, &folder_id, &exported_paths)?;
+        clear_stale_live_transcript(state);
+        return Ok(());
+    }
+    // A from-disk salvage may hold this folder's current CK across long ASR/provider awaits so a
+    // session relock can seal the exact result. A FRESH lock would mint a different CK and orphan
+    // that authority. Session relock remains allowed above; only key rotation is refused here.
+    ensure_no_active_salvage_in_folder(state, &folder_id)?;
+    // An earlier stop may have durably archived the recording but failed part-way through the
+    // exact artifact cleanup. Claim and resume every expired ARCHIVED generation in this folder
+    // before the final fail-closed reread below. A transient cleanup failure releases its claim,
+    // so the next Lock attempt can retry in this same process; an active/non-ARCHIVED generation
+    // remains nonterminal and therefore still blocks sealing.
+    for meeting_id in state
+        .db
+        .nonterminal_recording_meetings_in_folder(&folder_id)?
+    {
+        reconcile_released_generation_cleanup(state, &meeting_id)?;
+    }
+    if state
+        .db
+        .folder_has_nonterminal_recording_generation(&folder_id)?
+    {
+        return Err(AppError::Locked(
+            "this folder has a recording still being captured or recovered — wait for it to finish before locking"
+                .into(),
+        ));
     }
     // R7: advance the seal epoch at ENTRY (before any seal work) — see `bump_seal_epoch`.
     bump_seal_epoch(state);
@@ -125,6 +198,74 @@ pub(crate) fn lock_folder_inner(state: &AppState, folder_id: String) -> Result<(
         .iter()
         .filter_map(|n| n.exported_path.clone())
         .collect();
+    let doc_export_rows = state.db.note_exported_path_rows_in_folder(&folder_id)?;
+    ensure_no_external_edit_siblings(
+        exported_paths
+            .iter()
+            .chain(doc_export_rows.iter().map(|(_, path)| path)),
+    )?;
+
+    // Preflight every governed Markdown and image replica before deleting the first one. This keeps
+    // an ordinary multi-file conflict atomic from the user's perspective: a changed sibling aborts
+    // while all other vault files and the folder's open state are still intact.
+    for note in &notes {
+        if let Some(path) = note.exported_path.as_deref() {
+            let expected = state
+                .db
+                .get_note_exported_hash(&note.meeting_id, &note.provider_id)?;
+            verify_note_export_unchanged(
+                path,
+                expected.as_deref(),
+                "verify meeting-note export before folder seal",
+            )?;
+        }
+    }
+    for (document_id, path) in &doc_export_rows {
+        let expected = state.db.get_note_doc_exported_hash(document_id)?;
+        verify_note_export_unchanged(
+            path,
+            expected.as_deref(),
+            "verify authored-note export before folder seal",
+        )?;
+    }
+    let attachment_rows = state.db.attachments_in_folder(&folder_id)?;
+    verify_attachment_exports(
+        &attachment_rows,
+        "could not verify an exported image before locking the folder",
+    )?;
+
+    // Create and verify every attachment seal while the folder is still open. Startup can safely
+    // blank these rows if the process dies after the locked bit is published.
+    seal_attachments_in_folder(state, &folder_id, &ck)?;
+    remove_attachment_exports(
+        &attachment_rows,
+        "could not remove an exported image before locking the folder",
+    )?;
+
+    // Claim and content-verify every Markdown export while the folder is still OPEN. A mismatch or
+    // legacy row aborts before `locked=1`; matching files are atomically quarantined and removed,
+    // with their canonical DB content still intact if a later seal step fails.
+    for note in &notes {
+        if let Some(path) = note.exported_path.as_deref() {
+            let expected = state
+                .db
+                .get_note_exported_hash(&note.meeting_id, &note.provider_id)?;
+            remove_note_export_if_unchanged(
+                path,
+                expected.as_deref(),
+                "remove meeting-note export before folder seal",
+            )?;
+        }
+    }
+    for (document_id, path) in &doc_export_rows {
+        let expected = state.db.get_note_doc_exported_hash(document_id)?;
+        remove_note_export_if_unchanged(
+            path,
+            expected.as_deref(),
+            "remove authored-note export before folder seal",
+        )?;
+        state.db.set_note_doc_exported_path(document_id, None)?;
+    }
 
     // Persist: mark the folder locked (+ wrapped key) and write every sealed blob per provider
     // row (markdown blanked, exported_path cleared). Each write is guarded by the verification
@@ -133,101 +274,81 @@ pub(crate) fn lock_folder_inner(state: &AppState, folder_id: String) -> Result<(
     state
         .db
         .set_folder_locked(&folder_id, true, Some(&wrapped))?;
+    {
+        let mut unlocked = state
+            .unlocked_folders
+            .lock()
+            .map_err(|_| AppError::Storage("unlocked-folders mutex poisoned".into()))?;
+        unlocked.remove(&folder_id);
+    }
     for (meeting_id, provider_id, blob) in &sealed_rows {
         state.db.seal_note(meeting_id, provider_id, blob)?;
     }
 
+    // Blobs above were verified before the locked bit was published. Blank image plaintext now;
+    // a later transcript/audio failure must not leave readable images governed by a locked folder.
+    reblank_attachments_in_folder(state, &folder_id)?;
+
     // Phase 0.5 — seal the TRANSCRIPT + TIMELINE (defense-in-depth in the OPEN db) and the AUDIO
     // WAV at rest, all under the SAME folder CK. Verify-before-destroy inside (no transcript /
     // audio loss). Done after the note seal so a partial-seal crash still leaves recoverable blobs.
-    seal_folder_extras(state, &folder_id, &ck)?;
+    seal_folder_extras(&state.db, &folder_id, &ck)?;
     drop(kek); // explicit: KEK zeroized when this Zeroizing drops here.
     drop(ck); // explicit: CK zeroized after sealing all extras.
 
-    // Phase 2a LOCK-SAFETY: purge plaintext-derived semantic chunks + their (invertible) vectors
-    // for every meeting now sealed in this folder — a vector is PII derived from the plaintext, so
-    // it must not survive at rest in a locked folder. Done AFTER the seal so the index is dropped
-    // only once the recoverable blobs exist. Re-index-on-unlock is a separate later step; until it
-    // lands a locked-then-unlocked folder is simply not semantically searchable (degraded, not
-    // leaky).
-    let sealed_meeting_ids = state.db.meeting_ids_in_folder(&folder_id)?;
-    let sealed_document_ids = state.db.document_ids_in_folder(&folder_id)?;
-    // Brain-v3 audit Fix 4: BEFORE the link-row purge deletes the edges that name each affected
-    // source→sealed-item pair, strip the just-sealed items' `[[Title]]` markers from every VISIBLE
-    // source note's MACHINE-OWNED managed block (the DB plaintext), and re-export those sources' `.md`
-    // so neither the DB nor the vault file names the now-sealed neighbour. The sealed items' titles are
-    // still readable here (seal blanks body content, never the title). Re-materialized on unlock from
-    // the preserved accepted rows. Runs BEFORE the purges below (which drop the naming edges).
-    match state
-        .db
-        .strip_sealed_neighbour_markers(&sealed_meeting_ids, &sealed_document_ids)
-    {
-        Ok(changed) => reexport_stripped_marker_sources(state, &changed),
-        Err(e) => tracing::warn!(target: "links", error = %e, "sealed-neighbour marker strip failed"),
-    }
-    // The purge tx also drops ALL memory rollups (cross-meeting synthesis that may paraphrase the
-    // just-sealed facts; regenerated from visible facts on the next hourly pass) and returns their
-    // exported vault paths — deleted below alongside the sealed notes' `.md`s.
-    let rollup_exports = state.db.purge_chunks_for_meetings(&sealed_meeting_ids)?;
-    remove_rollup_export_files(&rollup_exports);
-    // Document ingestion LOCK-SAFETY: purge the (now-sealed) documents' plaintext-derived chunks +
-    // their invertible vectors too — a doc vector is PII derived from the plaintext, so it must not
-    // survive at rest in a locked folder. Re-embeddable on unlock (the text seal is restorable).
-    state
-        .db
-        .purge_doc_chunks_for_documents(&sealed_document_ids)?;
-
-    // AFTER the column writes, delete the vault `.md` files (a leftover .md is reconcilable;
-    // lost content is not — so this is last).
-    // Export-collision guard: the seal delete deliberately does NOT preserve an external-edit
-    // sibling — privacy wins over preservation. A plaintext sibling of a to-be-sealed note would
-    // be exactly the leak the lock exists to prevent. External edits to a locked note's `.md`
-    // are accepted-loss by design; the DB blob remains the canonical recoverable copy.
-    // Phase-0 follow-up: siblings ALREADY preserved by an earlier overwrite are user-authored
-    // files we never delete — but they are plaintext that survives this seal on disk, so WARN
-    // (counts only) so the exposure is at least visible in the log.
-    let doc_export_rows = state.db.note_exported_path_rows_in_folder(&folder_id)?;
-    warn_external_edit_siblings(
-        "lock",
-        exported_paths
-            .iter()
-            .chain(doc_export_rows.iter().map(|(_, p)| p)),
-    );
-    for p in exported_paths {
-        let _ = std::fs::remove_file(&p);
-    }
-
-    // NOTES: an authored note's markdown is sealed by the (kind-agnostic) document seal leg in
-    // `seal_folder_extras` above — but its vault `.md` (a note-only concern; documents have no
-    // `exported_path`) must be deleted on lock exactly like a meeting note's `.md`, so a sealed
-    // note leaves no plaintext on disk. PER ROW (residual W5, extended to the INITIAL seal by the
-    // R2 hardening, 2026-07-10): each row's `exported_path` is cleared ONLY after its `.md` was
-    // actually deleted (or is already absent) — a FAILED delete keeps that row's path recorded so
-    // the next relock/startup pass retries the file (the pre-fix bulk clear forgot the leaked
-    // `.md` forever). The lock itself still completes (the DB blob is the recoverable copy).
-    // Count-only log — never paths (they embed note titles).
-    for (doc_id, p) in doc_export_rows {
-        let removed = match std::fs::remove_file(&p) {
-            Ok(()) => true,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
-            Err(e) => {
-                tracing::warn!(
-                    target: "lock",
-                    error = %e,
-                    "lock: deleting a note .md failed — keeping exported_path for retry"
-                );
-                false
-            }
-        };
-        if removed {
-            state.db.set_note_doc_exported_path(&doc_id, None)?;
-        }
-    }
+    finish_folder_lock_after_seal(state, &folder_id, &exported_paths)?;
 
     // Belt-and-braces RAM hygiene: with no recording active, drop any stale live-caption buffer at
     // the moment a folder seals (post clear-on-Stop it is normally already empty; idempotent).
     clear_stale_live_transcript(state);
     Ok(())
+}
+
+/// Complete the non-keyed cleanup shared by a fresh seal and an authenticated retry of an
+/// interrupted seal. This begins only after every primary content artifact is recoverably sealed.
+fn finish_folder_lock_after_seal(
+    state: &AppState,
+    folder_id: &str,
+    meeting_export_paths: &[String],
+) -> Result<(), AppError> {
+    // Also covers an authenticated retry after a prior lock attempt published `locked=1` and then
+    // failed before its image cleanup completed. Blanking requires an existing recoverable blob.
+    reblank_attachments_in_folder(state, folder_id)?;
+    let sealed_meeting_ids = state.db.meeting_ids_in_folder(folder_id)?;
+    let sealed_document_ids = state.db.document_ids_in_folder(folder_id)?;
+    state
+        .db
+        .strip_sealed_neighbour_markers(&sealed_meeting_ids, &sealed_document_ids)?;
+    remove_rollup_exports_before_seal_purge(&state.db)?;
+    let rollup_exports = state.db.purge_chunks_for_meetings(&sealed_meeting_ids)?;
+    for path in &rollup_exports {
+        crate::crypto::remove_file_verified_absent(
+            std::path::Path::new(path),
+            "remove memory-rollup export during folder seal",
+        )?;
+    }
+    state
+        .db
+        .purge_doc_chunks_for_documents(&sealed_document_ids)?;
+
+    let doc_export_rows = state.db.note_exported_path_rows_in_folder(folder_id)?;
+    ensure_no_external_edit_siblings(
+        meeting_export_paths
+            .iter()
+            .chain(doc_export_rows.iter().map(|(_, path)| path)),
+    )?;
+    for (document_id, path) in doc_export_rows {
+        let expected = state.db.get_note_doc_exported_hash(&document_id)?;
+        remove_note_export_if_unchanged(
+            &path,
+            expected.as_deref(),
+            "remove authored-note export during folder seal",
+        )?;
+        state.db.set_note_doc_exported_path(&document_id, None)?;
+    }
+    // Drain LAST: an outside-source export error must never prevent this locked folder's own
+    // plaintext exports/derived data from reaching their sealed at-rest shape.
+    drain_lock_marker_export_cleanup(&state.db)
 }
 
 /// SESSION-unlock a sealed folder: KEK → unwrap CK → decrypt each note's `content_blob` back into
@@ -427,8 +548,7 @@ pub async fn unlock_folder(
         // The model-gated meeting embedder (Some only when the REAL e5 model is present → never
         // stub vectors) re-indexes the folder's meetings so semantic / related-meetings recover
         // in-session.
-        let meeting_embedder =
-            crate::embed::embed_model_present().then(crate::embed::active_embedder);
+        let meeting_embedder = crate::embed::active_persistence_embedder_if_available();
         unseal_folder_extras(&state, &folder_id, &ck, meeting_embedder.as_deref())?;
 
         // Cache the KEK for the session (zeroized on relock-all + on drop) + add to the unlock set.
@@ -495,8 +615,19 @@ pub fn relock_folder(
     // BLK-1: serialize with the rest of the lock state machine (it re-blanks the same columns
     // `remove_lock` is mid-restoring).
     let _lifecycle = lifecycle_guard(state.inner());
+    if !folder_is_unlocked(state.inner(), &folder_id)? {
+        return Err(AppError::Locked(
+            "folder visibility changed before relock preparation".into(),
+        ));
+    }
+    // Remove every managed plaintext export before revoking visibility. A user-modified export or
+    // collision sibling fails here while the folder is still open, never after `locked` is visible.
+    prepare_folder_exports_before_relock(state.inner(), &folder_id)?;
     // R7: advance the seal epoch at ENTRY — see `bump_seal_epoch`.
     bump_seal_epoch(state.inner());
+    // Revoke logical visibility FIRST. Screen-share relock must hide the folder from every gated
+    // UI/MCP reader even when a later filesystem cleanup fails. Keep the cached KEK until the
+    // physical reblank succeeds, though, so the same process retains authority to retry safely.
     {
         let mut g = state
             .unlocked_folders
@@ -504,10 +635,6 @@ pub fn relock_folder(
             .map_err(|_| AppError::Storage("unlocked-folders mutex poisoned".into()))?;
         g.remove(&folder_id);
     }
-    // Brain v2 L5 — drop the SESSION verify cache on relock: cached findings paraphrase live
-    // connector values about note lines and must not outlive the session unlock. Cleared WHOLE
-    // (conservative — a per-folder filter would need a meeting→folder walk for no security gain).
-    // A poisoned lock only skips the clear-by-mutex; the cache is RAM-only either way.
     if let Ok(mut cache) = state.verify_cache.lock() {
         cache.clear();
     }
@@ -516,14 +643,18 @@ pub fn relock_folder(
     // Brain-v3 audit Fix 4: strip the just-re-sealed items' `[[Title]]` markers from VISIBLE sources
     // (in other still-open folders) + re-export their `.md`, BEFORE the relock purge drops the naming
     // edges.
-    strip_and_reexport_markers_for_folders(state.inner(), &one);
+    enqueue_marker_cleanup_for_folders(state.inner(), &one)?;
     // The re-blank tx also purges ALL memory rollups (may paraphrase the re-sealed facts) and
     // returns their exported vault paths — the files are removed here (command layer).
+    remove_rollup_exports_before_seal_purge(&state.db)?;
     let rollup_exports = state.db.blank_sealed_notes_in_folders(&one)?;
     remove_rollup_export_files(&rollup_exports);
     // Phase 0.5 — re-blank the transcript + timeline plaintext and drop the decrypted session WAV
     // (the .enc + the *_blob columns stay; the folder is still locked=1 on disk).
     reblank_folder_extras(state.inner(), &folder_id)?;
+    drain_lock_marker_export_cleanup(&state.db)?;
+    // The folder has remained logically hidden throughout. A failure above retains the cached KEK
+    // for a repair retry; success leaves it available for other still-unlocked folders.
     // The relock purged ALL pending audit findings — ping the FE inbox (count-only).
     emit_audit_updated_after_purge(&app, state.inner());
     Ok(())
@@ -549,9 +680,23 @@ pub fn relock_all(app: AppHandle, state: State<'_, AppState>) -> Result<(), AppE
 /// must NOT take it separately — a std `Mutex` is non-reentrant and would self-deadlock).
 pub(crate) fn relock_all_inner(state: &AppState) -> Result<(), AppError> {
     let _lifecycle = lifecycle_guard(state);
+    // Snapshot the session set, then revoke every gated read BEFORE any fallible filesystem work.
+    // This ordering is load-bearing for screen-share: an external edit or unlink failure may retain
+    // recoverable vault bytes, but UI/MCP visibility must already be gone and the failure event must
+    // never claim successful physical cleanup.
+    let session_unlocked: Vec<String> = state
+        .unlocked_folders
+        .lock()
+        .map_err(|_| AppError::Storage("unlocked-folders mutex poisoned".into()))?
+        .iter()
+        .cloned()
+        .collect();
     // R7: advance the seal epoch at ENTRY — see `bump_seal_epoch`.
     bump_seal_epoch(state);
-    // Clear the session set.
+    // Revoke every gated read before touching filesystem state. This is load-bearing for the
+    // screen-share watcher: an unlink/reseal error must never leave plaintext visible in the UI or
+    // MCP while sharing is active. The KEK is deliberately retained until physical cleanup below
+    // succeeds, preserving repair authority without preserving visibility.
     {
         let mut g = state
             .unlocked_folders
@@ -559,23 +704,11 @@ pub(crate) fn relock_all_inner(state: &AppState) -> Result<(), AppError> {
             .map_err(|_| AppError::Storage("unlocked-folders mutex poisoned".into()))?;
         g.clear();
     }
-    // Brain v2 L5 — drop the SESSION verify cache on relock-all (screen-share auto-relock,
-    // window-close, app-exit, manual "Lock all"): cached findings paraphrase note lines and must
-    // not outlive the session unlock. Best-effort on a poisoned lock (RAM-only cache).
     if let Ok(mut cache) = state.verify_cache.lock() {
         cache.clear();
     }
-    // Zeroize the cached KEK copy (C5: use zeroize::Zeroize, not a hand byte-loop the optimizer
-    // could elide — `Zeroize::zeroize` is a guaranteed, non-elidable wipe). Taking the `Zeroizing`
-    // out and dropping it ALSO wipes it; the explicit call makes the intent unmistakable.
-    {
-        let mut g = state
-            .master_kek
-            .lock()
-            .map_err(|_| AppError::Storage("master-kek mutex poisoned".into()))?;
-        if let Some(mut k) = g.take() {
-            k.zeroize();
-        }
+    for folder_id in &session_unlocked {
+        prepare_folder_exports_before_relock(state, folder_id)?;
     }
     // Re-blank every sealed note across all locked folders. The tx also purges ALL memory rollups
     // (may paraphrase the re-sealed facts) — their exported vault `.md`s are removed here.
@@ -585,13 +718,27 @@ pub(crate) fn relock_all_inner(state: &AppState) -> Result<(), AppError> {
     // items' `[[Title]]` markers from every VISIBLE source note (a source in a DIFFERENT still-open
     // folder that was materialized while this folder was session-unlocked) + re-export those sources'
     // `.md`. Resolve the relocked folders' meeting + document ids first.
-    strip_and_reexport_markers_for_folders(state, &locked);
+    enqueue_marker_cleanup_for_folders(state, &locked)?;
+    remove_rollup_exports_before_seal_purge(&state.db)?;
     let rollup_exports = state.db.blank_sealed_notes_in_folders(&locked)?;
     remove_rollup_export_files(&rollup_exports);
     // Phase 0.5 — re-blank the transcript + timeline + drop the decrypted session WAVs for every
     // locked folder too (the .enc + *_blob columns stay).
     for fid in &locked {
         reblank_folder_extras(state, fid)?;
+    }
+    // Zeroize the cached KEK copy only after all seal/reblank work succeeded. If an earlier step
+    // returned an error, visibility is still revoked but the KEK remains available for repair.
+    // `Zeroize::zeroize`
+    // is non-elidable; taking the `Zeroizing` out and dropping it also wipes it.
+    {
+        let mut g = state
+            .master_kek
+            .lock()
+            .map_err(|_| AppError::Storage("master-kek mutex poisoned".into()))?;
+        if let Some(mut k) = g.take() {
+            k.zeroize();
+        }
     }
     // B12: checkpoint + truncate the WAL so the just-re-blanked plaintext does not linger in the
     // sidecar. Best-effort — a busy checkpoint is logged, not fatal to the relock.
@@ -602,7 +749,9 @@ pub(crate) fn relock_all_inner(state: &AppState) -> Result<(), AppError> {
     // relock-all (manual "Lock all", screen-share auto-relock, window-close, app-exit). Never
     // clears mid-recording — the in-flight buffer stays, gated by visibility at injection time.
     clear_stale_live_transcript(state);
-    Ok(())
+    // Last privacy leg: folder-owned plaintext is already reblanked and the cached KEK is gone.
+    // Failure retains the SQLCipher outbox and propagates for a later idempotent retry.
+    drain_lock_marker_export_cleanup(&state.db)
 }
 
 /// PERMANENTLY remove a folder's lock: KEK → unwrap CK → decrypt each note back to plaintext
@@ -627,6 +776,9 @@ pub(crate) fn remove_lock_inner(state: &AppState, folder_id: String) -> Result<(
     if !folder.locked {
         return Ok(()); // already open — idempotent.
     }
+    // Permanent unlock destroys this folder's wrapped-key generation. A salvage finalizer may
+    // still need that exact CK to seal output produced after an immediate session relock.
+    ensure_no_active_salvage_in_folder(state, &folder_id)?;
     // R7: advance the seal epoch at ENTRY — remove-lock rewrites the same lock-surface columns
     // the consolidation pass must not interleave with. See `bump_seal_epoch`.
     bump_seal_epoch(state);
@@ -717,16 +869,19 @@ pub(crate) fn remove_lock_inner(state: &AppState, folder_id: String) -> Result<(
             .restore_note_markdown(&n.meeting_id, &n.provider_id, &markdown)?;
     }
 
-    // Step 2: per meeting, clear the blobs (all rows now hold plaintext) and re-export ONE `.md`
-    // (the latest provider's note — matching how the rest of the app treats "the note" for a
-    // meeting). All provider rows for that meeting share the re-exported path.
+    // Restore verified image bytes but retain every attachment blob until the same final atomic
+    // folder-open commit that clears the other recovery ciphertexts.
+    unseal_attachments_in_folder(state, &folder_id, &ck, false)?;
+
+    // Step 2: per meeting, re-export ONE `.md` (the latest provider's note — matching how the rest
+    // of the app treats "the note" for a meeting). KEEP every sealed blob until the final atomic
+    // folder-open commit; clearing them here used to make a crash irreversibly leave a nominally
+    // locked folder with plaintext and no recovery ciphertext.
     let mut seen = std::collections::HashSet::new();
     for n in &notes {
         if !seen.insert(n.meeting_id.clone()) {
             continue;
         }
-        state.db.clear_note_content_blob(&n.meeting_id)?;
-
         let Some(vault) = vault.as_deref() else {
             continue;
         };
@@ -747,12 +902,27 @@ pub(crate) fn remove_lock_inner(state: &AppState, folder_id: String) -> Result<(
         } else {
             Some(folder.path.as_str())
         };
+        let exported_markdown = match render_markdown_with_attachments_for_export_under_lifecycle_authorized(
+            state,
+            &crate::storage::AttachmentOwner::Meeting {
+                meeting_id: latest.meeting_id.clone(),
+                provider_id: latest.provider_id.clone(),
+            },
+            &latest.markdown,
+            std::path::Path::new(vault),
+        ) {
+            Ok(markdown) => markdown,
+            Err(e) => {
+                tracing::warn!(target: "export", error = %e, "meeting image re-export after unlock failed");
+                continue;
+            }
+        };
         if let Ok(path) = crate::export::write_note(
             std::path::Path::new(vault),
             sub,
             &title,
             &date,
-            &latest.markdown,
+            &exported_markdown,
         ) {
             state.db.set_note_exported_path(
                 &n.meeting_id,
@@ -766,7 +936,7 @@ pub(crate) fn remove_lock_inner(state: &AppState, folder_id: String) -> Result<(
             state.db.set_note_exported_hash(
                 &n.meeting_id,
                 &latest.provider_id,
-                Some(&crate::export::note_content_hash(&latest.markdown)),
+                Some(&crate::export::note_content_hash(&exported_markdown)),
             )?;
         }
     }
@@ -775,17 +945,33 @@ pub(crate) fn remove_lock_inner(state: &AppState, folder_id: String) -> Result<(
     // and the AUDIO WAV (decrypt .enc → file, drop .enc) under the SAME CK. Never lose audio. The
     // model-gated meeting embedder (Some only when the REAL e5 model is present → never stub vectors)
     // re-indexes the now-open folder's meetings so semantic / related-meetings work again.
-    let meeting_embedder = crate::embed::embed_model_present().then(crate::embed::active_embedder);
-    unseal_folder_extras_permanent(state, &folder_id, &ck, meeting_embedder.as_deref())?;
+    let meeting_embedder = crate::embed::active_persistence_embedder_if_available();
+    let sealed_audio_to_retire =
+        unseal_folder_extras_permanent(state, &folder_id, &ck, meeting_embedder.as_deref())?;
 
-    // Flip the folder back to OPEN + drop it from the session set.
-    state.db.set_folder_locked(&folder_id, false, None)?;
+    // ONE SQL transaction flips the folder OPEN and clears every note/segment/timeline/manual/doc
+    // blob. Before this commit, startup can reblank all restored plaintext from those blobs; after
+    // it, the folder is intentionally open. No crash point can observe locked + blobless plaintext.
+    state.db.commit_folder_permanent_unlock(&folder_id)?;
     {
         let mut g = state
             .unlocked_folders
             .lock()
             .map_err(|_| AppError::Storage("unlocked-folders mutex poisoned".into()))?;
         g.remove(&folder_id);
+    }
+
+    // Only now is plaintext the canonical at-rest form. Retiring a redundant ciphertext before
+    // `locked=0` would create a crash window where startup still treats the folder as sealed but
+    // the DB points at a missing `.enc`. Failure here is space residue, never plaintext exposure or
+    // content loss, so the completed permanent unlock remains successful and logs count-only.
+    for sealed_path in sealed_audio_to_retire {
+        if let Err(error) = crate::crypto::remove_file_verified_absent(
+            std::path::Path::new(&sealed_path),
+            "retire encrypted audio after permanent unlock",
+        ) {
+            tracing::warn!(target: "lock", error = %error, "permanent unlock left a redundant encrypted audio file for later cleanup");
+        }
     }
 
     // NIT-8 (link lifecycle): the folder's `links` rows were purged on the ORIGINAL seal
@@ -896,6 +1082,7 @@ pub(crate) async fn discard_unrecoverable_folder_lock_inner(
     let _lifecycle = lifecycle_guard(state);
     // `discard_folder_seal` returns ONLY the SEALED `.enc` audio paths (a never-sealed plaintext WAV
     // is readable content and is preserved, both on disk and in the DB). Best-effort unlink each.
+    discard_attachments_in_folder(state, &folder_id)?;
     let enc_paths = state.db.discard_folder_seal(&folder_id)?;
     let enc_count = enc_paths.len();
     for p in &enc_paths {

@@ -140,7 +140,9 @@ impl SpeakerReconciliation {
     /// turn overlaps that cluster's segments. Drives the suggestion key so `suggestionByLabel().get`
     /// matches the lane.
     pub fn label_for_cluster(&self, cluster_index: i64) -> Option<&str> {
-        self.cluster_to_label.get(&cluster_index).map(String::as_str)
+        self.cluster_to_label
+            .get(&cluster_index)
+            .map(String::as_str)
     }
 
     /// The dominant diarized cluster index under the turns carrying `label` (max total overlap), if
@@ -165,7 +167,10 @@ fn tag_is_numbered_cluster(tag: &str) -> bool {
 /// segments (`has_numbered == false`), NOT from the stored-voiceprint set. `me`, an unknown tag, or a
 /// stray plain `others` inside a multi-cluster meeting → None (never a fabricated cluster).
 fn cluster_index_of_tag(tag: &str, has_numbered: bool) -> Option<i64> {
-    if let Some(rest) = tag.strip_prefix(SPEAKER_OTHERS).and_then(|r| r.strip_prefix('-')) {
+    if let Some(rest) = tag
+        .strip_prefix(SPEAKER_OTHERS)
+        .and_then(|r| r.strip_prefix('-'))
+    {
         rest.parse::<i64>().ok()
     } else if tag == SPEAKER_OTHERS && !has_numbered {
         Some(0)
@@ -181,19 +186,29 @@ fn cluster_index_of_tag(tag: &str, has_numbered: bool) -> Option<i64> {
 /// (label → cluster). PURE (no I/O, no FFI) — the caller passes only this (unlocked) meeting's data.
 pub fn reconcile_speakers(segments: &[Segment], turns: &[TurnRef<'_>]) -> SpeakerReconciliation {
     // Single-cluster 1:1 is inferred from the SEGMENT tags, not the voiceprint set (secondary-bug fix).
-    let has_numbered = segments
-        .iter()
-        .any(|s| s.speaker.as_deref().map(tag_is_numbered_cluster).unwrap_or(false));
+    let has_numbered = segments.iter().any(|s| {
+        s.speaker
+            .as_deref()
+            .map(tag_is_numbered_cluster)
+            .unwrap_or(false)
+    });
 
     // Total overlap seconds per (cluster_index, display_label).
-    let mut overlap: std::collections::HashMap<(i64, String), f64> = std::collections::HashMap::new();
+    let mut overlap: std::collections::HashMap<(i64, String), f64> =
+        std::collections::HashMap::new();
     for seg in segments {
-        let Some(tag) = seg.speaker.as_deref() else { continue };
-        let Some(cluster) = cluster_index_of_tag(tag, has_numbered) else { continue };
+        let Some(tag) = seg.speaker.as_deref() else {
+            continue;
+        };
+        let Some(cluster) = cluster_index_of_tag(tag, has_numbered) else {
+            continue;
+        };
         for turn in turns {
             let ov = (seg.end_s.min(turn.end_s) - seg.start_s.max(turn.start_s)).max(0.0);
             if ov > 0.0 {
-                *overlap.entry((cluster, turn.label.to_string())).or_insert(0.0) += ov;
+                *overlap
+                    .entry((cluster, turn.label.to_string()))
+                    .or_insert(0.0) += ov;
             }
         }
     }
@@ -203,8 +218,10 @@ pub fn reconcile_speakers(segments: &[Segment], turns: &[TurnRef<'_>]) -> Speake
     let mut entries: Vec<((i64, String), f64)> = overlap.into_iter().collect();
     entries.sort_by(|a, b| a.0 .0.cmp(&b.0 .0).then_with(|| a.0 .1.cmp(&b.0 .1)));
 
-    let mut cluster_best: std::collections::HashMap<i64, (f64, String)> = std::collections::HashMap::new();
-    let mut label_best: std::collections::HashMap<String, (f64, i64)> = std::collections::HashMap::new();
+    let mut cluster_best: std::collections::HashMap<i64, (f64, String)> =
+        std::collections::HashMap::new();
+    let mut label_best: std::collections::HashMap<String, (f64, i64)> =
+        std::collections::HashMap::new();
     for ((cluster, label), ov) in entries {
         // cluster → best label (strictly-greater ⇒ first-seen wins a tie = smaller label).
         match cluster_best.get(&cluster) {
@@ -492,7 +509,10 @@ mod tests {
     }
 
     fn tagged(start_s: f64, end_s: f64, tag: &str) -> Segment {
-        Segment { speaker: Some(tag.into()), ..seg(start_s, end_s) }
+        Segment {
+            speaker: Some(tag.into()),
+            ..seg(start_s, end_s)
+        }
     }
 
     #[test]
@@ -505,8 +525,16 @@ mod tests {
             tagged(2.0, 3.0, "me"), // ignored: "me" never maps to a cluster
         ];
         let turns = vec![
-            TurnRef { start_s: 0.0, end_s: 4.5, label: "Speaker 1" },
-            TurnRef { start_s: 4.5, end_s: 9.0, label: "Speaker 2" },
+            TurnRef {
+                start_s: 0.0,
+                end_s: 4.5,
+                label: "Speaker 1",
+            },
+            TurnRef {
+                start_s: 4.5,
+                end_s: 9.0,
+                label: "Speaker 2",
+            },
         ];
         let rec = reconcile_speakers(&segs, &turns);
         // cluster → the display label the FE lane shows.
@@ -523,7 +551,11 @@ mod tests {
     fn reconcile_single_cluster_plain_others_is_cluster_zero() {
         // Single remote speaker → segments stay plain "others" (no suffix) + voiceprint cluster 0.
         let segs = vec![tagged(0.0, 5.0, "others"), tagged(6.0, 9.0, "others")];
-        let turns = vec![TurnRef { start_s: 0.0, end_s: 9.0, label: "Anna" }];
+        let turns = vec![TurnRef {
+            start_s: 0.0,
+            end_s: 9.0,
+            label: "Anna",
+        }];
         let rec = reconcile_speakers(&segs, &turns);
         assert_eq!(rec.label_for_cluster(0), Some("Anna"));
         assert_eq!(rec.cluster_for_label("Anna"), Some(0));
@@ -538,12 +570,24 @@ mod tests {
             tagged(10.0, 12.0, "others"), // stray unattributed → contributes no cluster mapping
         ];
         let turns = vec![
-            TurnRef { start_s: 0.0, end_s: 4.0, label: "Speaker 2" },
-            TurnRef { start_s: 10.0, end_s: 12.0, label: "Mystery" },
+            TurnRef {
+                start_s: 0.0,
+                end_s: 4.0,
+                label: "Speaker 2",
+            },
+            TurnRef {
+                start_s: 10.0,
+                end_s: 12.0,
+                label: "Mystery",
+            },
         ];
         let rec = reconcile_speakers(&segs, &turns);
         assert_eq!(rec.label_for_cluster(1), Some("Speaker 2"));
-        assert_eq!(rec.cluster_for_label("Mystery"), None, "plain others → no cluster 0 here");
+        assert_eq!(
+            rec.cluster_for_label("Mystery"),
+            None,
+            "plain others → no cluster 0 here"
+        );
         assert_eq!(rec.label_for_cluster(0), None);
     }
 
@@ -551,10 +595,18 @@ mod tests {
     fn reconcile_empty_when_no_timeline_or_no_segments() {
         // No timeline turns → empty maps (best-effort degrade, never fabricate).
         let segs = vec![tagged(0.0, 4.0, "others-0")];
-        assert!(reconcile_speakers(&segs, &[]).label_for_cluster(0).is_none());
+        assert!(reconcile_speakers(&segs, &[])
+            .label_for_cluster(0)
+            .is_none());
         // No segments → empty maps.
-        let turns = vec![TurnRef { start_s: 0.0, end_s: 4.0, label: "Speaker 1" }];
-        assert!(reconcile_speakers(&[], &turns).cluster_for_label("Speaker 1").is_none());
+        let turns = vec![TurnRef {
+            start_s: 0.0,
+            end_s: 4.0,
+            label: "Speaker 1",
+        }];
+        assert!(reconcile_speakers(&[], &turns)
+            .cluster_for_label("Speaker 1")
+            .is_none());
     }
 
     #[test]
@@ -562,8 +614,16 @@ mod tests {
         // Cluster-0 segment 0..10 overlaps "Speaker 1" for 3s and "Speaker 2" for 7s → Speaker 2.
         let segs = vec![tagged(0.0, 10.0, "others-0")];
         let turns = vec![
-            TurnRef { start_s: 0.0, end_s: 3.0, label: "Speaker 1" },
-            TurnRef { start_s: 3.0, end_s: 10.0, label: "Speaker 2" },
+            TurnRef {
+                start_s: 0.0,
+                end_s: 3.0,
+                label: "Speaker 1",
+            },
+            TurnRef {
+                start_s: 3.0,
+                end_s: 10.0,
+                label: "Speaker 2",
+            },
         ];
         let rec = reconcile_speakers(&segs, &turns);
         assert_eq!(rec.label_for_cluster(0), Some("Speaker 2"));

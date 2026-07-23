@@ -109,7 +109,7 @@ The seven you must never violate:
    for blocking work off an async runtime, `computed`/`toSignal` on the FE, tokens for any CSS, no PII
    in the new metric. Keep every read gated.
 5. **Re-measure + prove no regression.** Same profiler, same scenario, before vs after. `cargo test --lib`
-   for the Rust change; `npx ng lint` + `npx ng build` for the FE change. **Verify FE perf/render on
+   for the Rust change; `npx ng lint` + lane-wrapped `npx ng build` for the FE change. **Verify FE perf/render on
    WebKit, not Chromium** (T4). Never `cargo clippy --all-targets` in the loop.
 6. **Self-check, don't self-certify.** State the numbers you measured, the scenario, and what you could
    NOT measure here (real thermal throttling, a real 1h-meeting Mac-kill, and any signed-build-only
@@ -134,12 +134,12 @@ The seven you must never violate:
   an un-chunked transcript into a local model + DOM node count of an un-windowed `@for` + a MISSING RAM
   guard on the allocation — tipped over by on-open work. Fix each layer where it lives (see the
   reference).
-- **Loop discipline:** `source ~/.cargo/env; ( cd src-tauri && cargo test --lib )` — never
+- **Loop discipline:** `scripts/agent-resource-run --chdir src-tauri -- cargo test --lib` — never
   `clippy --all-targets`. `scripts/ci.sh` is the final gate, run ONCE.
 
 ## Dev run (when behavior must be observed)
 
-`source ~/.cargo/env; MURMUR_DEV_DEK=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef npm run dev 2>&1 | tee /tmp/murmur-dev.log`
+`MURMUR_DEV_DEK=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef scripts/agent-resource-run -- npm run dev 2>&1 | tee /tmp/murmur-dev.log`
 (tauri dev; ng on http://localhost:1420, MCP on 127.0.0.1:8765). `MURMUR_DEV_DEK` skips the keychain
 re-prompt loop. Stop the dev server before a `tauri build` (it holds the cargo target lock). See
 `/tauri-dev`.

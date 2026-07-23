@@ -580,10 +580,7 @@ impl Db {
         );
         let mut stmt = conn.prepare(&sql).map_err(map_err)?;
         let rows = stmt
-            .query_map(
-                rusqlite::params![match_expr, k as i64],
-                row_to_user_fact,
-            )
+            .query_map(rusqlite::params![match_expr, k as i64], row_to_user_fact)
             .map_err(map_err)?;
         let mut out = Vec::new();
         for r in rows {

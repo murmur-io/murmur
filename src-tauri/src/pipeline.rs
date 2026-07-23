@@ -1,7 +1,16 @@
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
+use std::thread::JoinHandle;
+use std::time::Duration;
 
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 
+use crate::audio::source::{
+    copy_verified_file_no_clobber, resample_source_to_f32le, stream_raw_to_float_wav,
+    verify_existing_file, AtomicAudioPublisher, FinalizedRecording, MonoSource, RawF32LeSource,
+    VerifiedDeletion, VerifiedFile, WavMonoSource,
+};
 use crate::error::{AppError, Result};
 use crate::events::{StatusPayload, EVENT_STATUS};
 use crate::settings::AppConfig;
@@ -20,12 +29,59 @@ pub struct PipelineResult {
     /// export-only, so a missing vault yields `None` here — not an error.
     pub exported_path: Option<PathBuf>,
     pub meeting_id: String,
+    /// A session-unlocked locked-folder auto-file target. The pipeline applies it only after every
+    /// plaintext generation artifact is proof-deleted and the generation is RETIRED.
+    pub(crate) deferred_seal_folder_id: Option<String>,
 }
 
 /// Audio subdir (under the app-data folder) for recorded WAVs. The parent folder name comes from
 /// [`crate::state::app_dir_name`] so dev's recordings live under `MeetNotes-dev`, isolated from the
 /// installed release's `MeetNotes` — the same split as the DB dir.
 const AUDIO_SUBDIR: &str = "audio";
+
+#[cfg(test)]
+thread_local! {
+    static TEST_RECORDING_APP_DIR: std::cell::RefCell<Option<PathBuf>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+#[cfg(test)]
+struct TestRecordingAppDirReset(Option<PathBuf>);
+
+#[cfg(test)]
+impl Drop for TestRecordingAppDirReset {
+    fn drop(&mut self) {
+        let previous = self.0.take();
+        TEST_RECORDING_APP_DIR.with(|slot| {
+            slot.replace(previous);
+        });
+    }
+}
+
+/// Thread-local filesystem seam for command tests. It never exists in production builds and keeps
+/// parallel tests from touching either the release or developer recording directories.
+#[cfg(test)]
+pub(crate) fn with_test_recording_app_dir<T>(root: PathBuf, run: impl FnOnce() -> T) -> T {
+    let previous = TEST_RECORDING_APP_DIR.with(|slot| slot.replace(Some(root)));
+    let _reset = TestRecordingAppDirReset(previous);
+    run()
+}
+
+fn recording_app_dir() -> Result<PathBuf> {
+    #[cfg(test)]
+    if let Some(root) = TEST_RECORDING_APP_DIR.with(|slot| slot.borrow().clone()) {
+        std::fs::create_dir_all(&root)
+            .map_err(|e| AppError::Storage(format!("create test app-data directory: {e}")))?;
+        return Ok(root);
+    }
+    let base = dirs::data_dir()
+        .ok_or_else(|| AppError::Storage("could not resolve app-data directory".into()))?;
+    let dir = base.join(crate::state::app_dir_name());
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| AppError::Storage(format!("create app-data directory: {e}")))?;
+    Ok(dir)
+}
 
 /// Max allowed gap between the AEC ASR feed and the raw mic, in seconds. Beyond this the AEC feed
 /// is rejected (raw mic used for ASR) so the transcript timestamps stay aligned with the played
@@ -140,6 +196,23 @@ impl Drop for TerminalStatusGuard {
         }
         // Reached ONLY on a panic-unwind (or an unexpected early exit) out of the pipeline task.
         let body = std::panic::AssertUnwindSafe(|| {
+            if let Err(error) = self
+                .db
+                .expire_recording_generation_after_owner_loss(&self.meeting_id)
+            {
+                tracing::warn!(target: "audio", error = %error, "terminal guard could not expire the lost recording owner");
+            }
+            if let Some(app) = &self.app {
+                let state = app.state::<AppState>();
+                if let Ok(mut current) = state.current_meeting.lock() {
+                    *current = None;
+                }
+                crate::transcribe::live::clear_live_transcript(&state.live_transcript);
+                crate::transcribe::bullets::clear_ram(
+                    &state.live_bullets,
+                    &state.live_bullets_tracker,
+                );
+            }
             // STATUS-AWARE (2026-07-16): if the row ALREADY reached a terminal status
             // (Summarized/Exported/Error), skip the write AND the emit — a tail panic after
             // "saved" (e.g. in a post-persist best-effort step) must not un-save the meeting by
@@ -155,9 +228,7 @@ impl Drop for TerminalStatusGuard {
                 .map(|m| {
                     matches!(
                         m.status,
-                        MeetingStatus::Summarized
-                            | MeetingStatus::Exported
-                            | MeetingStatus::Error
+                        MeetingStatus::Summarized | MeetingStatus::Exported | MeetingStatus::Error
                     )
                 })
                 .unwrap_or(false);
@@ -262,11 +333,75 @@ async fn with_stage_watchdog<T>(
 
 /// `<app-data>/<app_dir_name()>/audio`, created if absent (`MeetNotes` release, `MeetNotes-dev` dev).
 pub(crate) fn audio_dir() -> Result<PathBuf> {
-    let base = dirs::data_dir()
-        .ok_or_else(|| AppError::Storage("could not resolve app-data directory".into()))?;
-    let dir = base.join(crate::state::app_dir_name()).join(AUDIO_SUBDIR);
+    let dir = recording_app_dir()?.join(AUDIO_SUBDIR);
     std::fs::create_dir_all(&dir)
         .map_err(|e| AppError::Storage(format!("create audio dir: {e}")))?;
+    Ok(dir)
+}
+
+/// Private workspace for nonterminal recording generations. Unlike `audio/`, this directory is
+/// deliberately outside Tauri's asset allowlist: raw mic/system tracks and pipeline staging must
+/// never be addressable through `asset:` while a folder can still be locked.
+pub(crate) fn recording_inflight_dir() -> Result<PathBuf> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+    let app_dir = recording_app_dir()?;
+    let dir = app_dir.join("recording-inflight");
+    match std::fs::symlink_metadata(&dir) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(AppError::Storage(
+                "private recording workspace is not a real directory".into(),
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir(&dir).map_err(|e| {
+                AppError::Storage(format!("create private recording workspace: {e}"))
+            })?;
+        }
+        Err(error) => {
+            return Err(AppError::Storage(format!(
+                "inspect private recording workspace: {error}"
+            )))
+        }
+    }
+    #[cfg(target_os = "macos")]
+    const DIRECTORY_NOFOLLOW: i32 = 0x0000_0100;
+    #[cfg(not(target_os = "macos"))]
+    const DIRECTORY_NOFOLLOW: i32 = 0;
+    let handle = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(DIRECTORY_NOFOLLOW)
+        .open(&dir)
+        .map_err(|e| AppError::Storage(format!("open private recording workspace: {e}")))?;
+    let before = handle
+        .metadata()
+        .map_err(|e| AppError::Storage(format!("stat private recording workspace: {e}")))?;
+    if !before.is_dir() {
+        return Err(AppError::Storage(
+            "private recording workspace lost directory identity".into(),
+        ));
+    }
+    handle
+        .set_permissions(std::fs::Permissions::from_mode(0o700))
+        .map_err(|e| AppError::Storage(format!("secure private recording workspace: {e}")))?;
+    let after = handle
+        .metadata()
+        .map_err(|e| AppError::Storage(format!("restat private recording workspace: {e}")))?;
+    let path_after = std::fs::symlink_metadata(&dir)
+        .map_err(|e| AppError::Storage(format!("reinspect private recording workspace: {e}")))?;
+    if path_after.file_type().is_symlink()
+        || !path_after.is_dir()
+        || before.dev() != after.dev()
+        || before.ino() != after.ino()
+        || after.dev() != path_after.dev()
+        || after.ino() != path_after.ino()
+        || after.permissions().mode() & 0o777 != 0o700
+    {
+        return Err(AppError::Storage(
+            "private recording workspace identity or permissions changed".into(),
+        ));
+    }
     Ok(dir)
 }
 
@@ -290,6 +425,31 @@ pub async fn run_after_stop(
     mic_started_at: std::time::Instant,
     system_started_at: Option<std::time::Instant>,
 ) -> Result<PipelineResult> {
+    // Compatibility-only short-clip seam. Production Stop/retry/salvage use the file-backed
+    // functions above/below; refuse anything that could rebuild recording-sized vectors.
+    const LEGACY_MAX_SECONDS: u64 = 120;
+    let max_mic = (src_rate as u64).saturating_mul(LEGACY_MAX_SECONDS);
+    if src_rate == 0 || samples.len() as u64 > max_mic {
+        return Err(AppError::Audio(
+            "legacy in-memory pipeline accepts at most 120 seconds; use file-backed processing"
+                .into(),
+        ));
+    }
+    for path in [system_wav.as_deref(), aec_mic_wav.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        let reader = hound::WavReader::open(path)
+            .map_err(|e| AppError::Audio(format!("inspect bounded legacy WAV: {e}")))?;
+        let spec = reader.spec();
+        let frames = reader.duration() as u64;
+        if frames > (spec.sample_rate as u64).saturating_mul(LEGACY_MAX_SECONDS) {
+            return Err(AppError::Audio(
+                "legacy in-memory pipeline WAV exceeds 120 seconds; use file-backed processing"
+                    .into(),
+            ));
+        }
+    }
     match run_inner(
         app,
         state,
@@ -316,13 +476,696 @@ pub async fn run_after_stop(
     }
 }
 
+/// File-backed post-Stop pipeline. Every audio read is a bounded window; the only unbounded result
+/// is the transcript segment metadata itself (not raw audio). The canonical archive is fsynced,
+/// reopened and SQLCipher-pointed before either sole-source capture artifact is removed.
+pub(crate) async fn run_file_backed(
+    app: &AppHandle,
+    state: &AppState,
+    meeting_id: &str,
+    recording: FinalizedRecording,
+    duration_s: i64,
+    recording_model_token: Option<crate::perf::RecordingSessionToken>,
+) -> Result<PipelineResult> {
+    let mut generation_guard = PipelineGenerationGuard::arm(&state.db, recording);
+    ensure_pipeline_meeting_unlocked(state, meeting_id)?;
+    match run_file_backed_inner(
+        app,
+        state,
+        meeting_id,
+        generation_guard.recording()?,
+        duration_s,
+        recording_model_token,
+    )
+    .await
+    {
+        Ok(result) => {
+            generation_guard.disarm();
+            Ok(result)
+        }
+        Err(error @ AppError::Locked(_)) => {
+            // A lock-state refusal is not a failed recording and must not invoke the ordinary
+            // failure cleanup/status path. Dropping the armed generation guard releases the affine
+            // lease while preserving every raw/transient/archive artifact for an unlocked retry.
+            Err(error)
+        }
+        Err(error) => {
+            // Once the canonical archive exists, it is the verified retry source. Best-effort
+            // finish exact raw/transient cleanup now (including a transient injected failure) so
+            // Retry/Delete/Lock do not remain blocked behind a dead pipeline owner.
+            let mut retired = false;
+            for _ in 0..3 {
+                let cleanup = (|| -> Result<()> {
+                    let snapshot = state
+                        .db
+                        .get_recording_generation_snapshot(&generation_guard.recording()?.key)?
+                        .ok_or_else(|| {
+                            AppError::Storage("failed pipeline lost its generation row".into())
+                        })?;
+                    if snapshot.state == crate::storage::models::RecordingGenerationState::Retired {
+                        return Ok(());
+                    }
+                    if snapshot.state != crate::storage::models::RecordingGenerationState::Archived
+                    {
+                        return Err(AppError::Storage(
+                            "failed pipeline has no canonical archive yet".into(),
+                        ));
+                    }
+                    let assertion = snapshot.archive.as_ref().ok_or_else(|| {
+                        AppError::Storage("archived generation lost archive proof".into())
+                    })?;
+                    let verified = verify_existing_file(&audio_dir()?.join(assertion.basename()))?;
+                    let archive =
+                        crate::storage::recording_store::VerifiedArchiveArtifact::from_file(
+                            &generation_guard.recording()?.key,
+                            &verified,
+                        )?;
+                    crate::audio::source::cleanup_completed_archived_generation(
+                        &state.db,
+                        &recording_inflight_dir()?,
+                        &snapshot,
+                        &generation_guard.recording()?.lease,
+                        &archive,
+                    )
+                })();
+                if cleanup.is_ok() {
+                    retired = true;
+                    break;
+                }
+            }
+            if retired {
+                generation_guard.disarm();
+            }
+            // Once summarize/export completed, a later exact-cleanup failure is recoverable
+            // cleanup-pending state, not a failed note. Preserve `Summarized` so startup can resume
+            // the remaining proof-bound unlinks and retire the ARCHIVED generation idempotently.
+            let pipeline_result_is_durable = state
+                .db
+                .meeting_postprocess_is_durable(meeting_id)
+                .unwrap_or(false);
+            if !pipeline_result_is_durable {
+                let _ = state
+                    .db
+                    .update_meeting_status(meeting_id, MeetingStatus::Error);
+            }
+            emit_status(app, "error", &error.to_string(), meeting_id);
+            Err(error)
+        }
+    }
+}
+
+fn ensure_pipeline_meeting_unlocked(state: &AppState, meeting_id: &str) -> Result<()> {
+    match crate::commands::meeting_is_unlocked(state, meeting_id) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(AppError::Locked(
+            "recording recovery deferred until its folder is unlocked".into(),
+        )),
+        Err(_) => Err(AppError::Locked(
+            "recording recovery lock state is unreadable; deferred fail-closed".into(),
+        )),
+    }
+}
+
+struct PipelineGenerationGuard<'a> {
+    db: &'a crate::storage::Db,
+    recording: Option<FinalizedRecording>,
+}
+
+impl<'a> PipelineGenerationGuard<'a> {
+    fn arm(db: &'a crate::storage::Db, recording: FinalizedRecording) -> Self {
+        Self {
+            db,
+            recording: Some(recording),
+        }
+    }
+
+    fn recording(&self) -> Result<&FinalizedRecording> {
+        self.recording
+            .as_ref()
+            .ok_or_else(|| AppError::Storage("pipeline generation guard lost ownership".into()))
+    }
+
+    fn disarm(&mut self) {
+        self.recording = None;
+    }
+}
+
+impl Drop for PipelineGenerationGuard<'_> {
+    fn drop(&mut self) {
+        let Some(recording) = self.recording.take() else {
+            return;
+        };
+        if let Err(error) = recording.release_for_recovery(self.db) {
+            tracing::warn!(target: "audio", error = %error, "pipeline exit could not release its generation lease");
+        }
+    }
+}
+
+struct RemoveOnDrop(PathBuf);
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+#[derive(Clone, Copy)]
+enum MasterPointerKind {
+    Mic,
+    System,
+}
+
+/// Persist a managed master pointer and reconcile SQLite's ambiguous-error window. A confirmed
+/// absent/different pointer authorizes exact deletion of only the just-published inode; an
+/// unreadable DB preserves both the managed file and the ARCHIVED generation for recovery.
+fn persist_master_pointer_or_reconcile(
+    db: &crate::storage::Db,
+    meeting_id: &str,
+    kind: MasterPointerKind,
+    path: &Path,
+    proof: &VerifiedFile,
+) -> Result<()> {
+    let path_text = path.to_string_lossy();
+    let attempt = match kind {
+        MasterPointerKind::Mic => {
+            db.set_meeting_mic_master_path(meeting_id, Some(path_text.as_ref()))
+        }
+        MasterPointerKind::System => {
+            db.set_meeting_sys_master_path(meeting_id, Some(path_text.as_ref()))
+        }
+    };
+    let Err(error) = attempt else { return Ok(()) };
+
+    let pointers = db.get_meeting_master_paths(meeting_id).map_err(|_| {
+        AppError::Storage(
+            "master pointer commit was ambiguous; preserving the verified managed file".into(),
+        )
+    })?;
+    let durable = match kind {
+        MasterPointerKind::Mic => pointers.0.as_deref(),
+        MasterPointerKind::System => pointers.1.as_deref(),
+    };
+    if durable == Some(path_text.as_ref()) {
+        return Ok(());
+    }
+
+    let current = verify_existing_file(path)?;
+    if current.device() != proof.device()
+        || current.inode() != proof.inode()
+        || current.byte_len() != proof.byte_len()
+        || current.sha256() != proof.sha256()
+    {
+        return Err(AppError::Storage(
+            "master pointer failed and the managed publication changed; preserving it".into(),
+        ));
+    }
+    VerifiedDeletion::for_file(path, &current)?
+        .remove("remove managed master whose pointer was not durable")?;
+    Err(error)
+}
+
+fn apply_deferred_seal(
+    state: &AppState,
+    meeting_id: &str,
+    mut result: PipelineResult,
+) -> Result<PipelineResult> {
+    if let Some(folder_id) = result.deferred_seal_folder_id.take() {
+        crate::commands::seal_auto_filed_note(state, meeting_id, &folder_id)?;
+    }
+    Ok(result)
+}
+
+struct PipelineLeaseHeartbeat {
+    stop: Option<mpsc::Sender<()>>,
+    thread: Option<JoinHandle<()>>,
+    failed: Arc<AtomicBool>,
+}
+
+impl PipelineLeaseHeartbeat {
+    fn start(
+        db: Arc<crate::storage::Db>,
+        key: crate::storage::models::RecordingGenerationKey,
+        owner: crate::storage::recording_store::RecordingGenerationHeartbeat,
+        lease_ms: i64,
+    ) -> Result<Self> {
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let failed = Arc::new(AtomicBool::new(false));
+        let worker_failed = Arc::clone(&failed);
+        let thread = std::thread::Builder::new()
+            .name("murmur-recording-lease".into())
+            .spawn(move || loop {
+                match stop_rx.recv_timeout(Duration::from_secs(20)) {
+                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                }
+                let renewed = db.get_recording_generation_snapshot(&key).and_then(|row| {
+                    let row = row.ok_or_else(|| {
+                        AppError::Storage("recording generation disappeared during pipeline".into())
+                    })?;
+                    db.heartbeat_recording_generation_lease(&key, &owner, row.state, lease_ms)
+                });
+                if renewed.is_err() {
+                    // An archive CAS can land between the state read and renewal. Retry once from
+                    // canonical state; any second failure is loss of ownership and fails closed.
+                    let retry = db.get_recording_generation_snapshot(&key).and_then(|row| {
+                        let row = row.ok_or_else(|| {
+                            AppError::Storage(
+                                "recording generation disappeared during heartbeat".into(),
+                            )
+                        })?;
+                        db.heartbeat_recording_generation_lease(&key, &owner, row.state, lease_ms)
+                    });
+                    if retry.is_err() {
+                        worker_failed.store(true, Ordering::Release);
+                        break;
+                    }
+                }
+            })
+            .map_err(|e| AppError::Storage(format!("spawn recording lease heartbeat: {e}")))?;
+        Ok(Self {
+            stop: Some(stop_tx),
+            thread: Some(thread),
+            failed,
+        })
+    }
+
+    fn ensure_owned(&self) -> Result<()> {
+        if self.failed.load(Ordering::Acquire) {
+            return Err(AppError::Storage(
+                "recording pipeline lost its durable generation lease".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn stop_and_join(&mut self) -> Result<()> {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(thread) = self.thread.take() {
+            thread
+                .join()
+                .map_err(|_| AppError::Storage("recording lease heartbeat panicked".into()))?;
+        }
+        self.ensure_owned()
+    }
+}
+
+impl Drop for PipelineLeaseHeartbeat {
+    fn drop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn remove_existing_generation_transient(
+    path: &Path,
+    generation_id: &str,
+    expected_suffix: &str,
+) -> Result<()> {
+    if let Some(deletion) = generation_transient_deletion(path, generation_id, expected_suffix)? {
+        deletion.remove("remove stale tracked recording transient")?;
+    }
+    Ok(())
+}
+
+fn generation_transient_deletion(
+    path: &Path,
+    generation_id: &str,
+    expected_suffix: &str,
+) -> Result<Option<VerifiedDeletion>> {
+    let expected = format!("{generation_id}{expected_suffix}");
+    if path.file_name().and_then(|value| value.to_str()) != Some(expected.as_str()) {
+        return Err(AppError::Audio(
+            "refusing cleanup of a noncanonical recording transient".into(),
+        ));
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => {
+            let proof = verify_existing_file(path)?;
+            Ok(Some(VerifiedDeletion::for_file(path, &proof)?))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(AppError::Audio(format!(
+            "inspect tracked recording transient: {error}"
+        ))),
+    }
+}
+
+async fn run_file_backed_inner(
+    app: &AppHandle,
+    state: &AppState,
+    meeting_id: &str,
+    recording: &FinalizedRecording,
+    duration_s: i64,
+    recording_model_token: Option<crate::perf::RecordingSessionToken>,
+) -> Result<PipelineResult> {
+    if recording.key.meeting_id() != meeting_id {
+        return Err(AppError::Audio(
+            "recording generation belongs to another meeting".into(),
+        ));
+    }
+    const PIPELINE_LEASE_MS: i64 = 300_000;
+    let snapshot = state
+        .db
+        .get_recording_generation_snapshot(&recording.key)?
+        .ok_or_else(|| {
+            AppError::Storage("recording generation disappeared before pipeline".into())
+        })?;
+    let generation_state = snapshot.state;
+    if !matches!(
+        generation_state,
+        crate::storage::models::RecordingGenerationState::Finalized
+            | crate::storage::models::RecordingGenerationState::Archived
+    ) {
+        return Err(AppError::Storage(
+            "recording pipeline requires a finalized or archived generation".into(),
+        ));
+    }
+    state.db.renew_recording_generation_lease(
+        &recording.key,
+        &recording.lease,
+        generation_state,
+        PIPELINE_LEASE_MS,
+    )?;
+    let mut pipeline_heartbeat = PipelineLeaseHeartbeat::start(
+        state.db.clone(),
+        recording.key.clone(),
+        recording.lease.heartbeat(),
+        PIPELINE_LEASE_MS,
+    )?;
+    let config = state
+        .config
+        .lock()
+        .map_err(|_| AppError::Config("config mutex poisoned".into()))?
+        .clone();
+    let wav_dir = audio_dir()?;
+    let inflight_dir = recording_inflight_dir()?;
+    let mic_16k_path = inflight_dir.join(format!("{}.mic16.f32", recording.key.generation_id()));
+    remove_existing_generation_transient(
+        &mic_16k_path,
+        recording.key.generation_id(),
+        ".mic16.f32",
+    )?;
+    {
+        let mut mic_native = RawF32LeSource::open(&recording.mic_path, recording.sample_rate)?;
+        let _ = resample_source_to_f32le(&mut mic_native, &mic_16k_path)?;
+    }
+    pipeline_heartbeat.ensure_owned()?;
+    state.db.renew_recording_generation_lease(
+        &recording.key,
+        &recording.lease,
+        generation_state,
+        PIPELINE_LEASE_MS,
+    )?;
+
+    let system_16k_path = recording
+        .system_wav
+        .as_ref()
+        .map(|_| inflight_dir.join(format!("{}.system16.f32", recording.key.generation_id())));
+    if let Some(path) = system_16k_path.as_deref() {
+        remove_existing_generation_transient(path, recording.key.generation_id(), ".system16.f32")?;
+    }
+    if let (Some(system), Some(output)) =
+        (recording.system_wav.as_deref(), system_16k_path.as_deref())
+    {
+        let mut source = WavMonoSource::open(system)?;
+        let _ = resample_source_to_f32le(&mut source, output)?;
+    }
+    pipeline_heartbeat.ensure_owned()?;
+    state.db.renew_recording_generation_lease(
+        &recording.key,
+        &recording.lease,
+        generation_state,
+        PIPELINE_LEASE_MS,
+    )?;
+
+    // Offline AEC is intentionally degraded on this streaming path until its adaptive filter has a
+    // stateful chunk adapter. The setting remains default-off; collecting a multi-hour Vec merely
+    // to honor an opt-in would reintroduce the OOM being fixed.
+    if config.post_aec_enabled {
+        tracing::warn!(
+            target: "audio",
+            meeting_id,
+            "offline AEC skipped for bounded file-backed processing; raw mic retained"
+        );
+    }
+
+    let (mic_delay, system_delay) = audio::align::archive_delays(
+        None,
+        recording.started_at,
+        recording.system_started_at,
+        audio::TARGET_RATE_HZ,
+    );
+    let publisher = AtomicAudioPublisher::new(&inflight_dir, &wav_dir, &recording.key)?;
+    // Revalidate immediately before publishing a plaintext archive outside the private inflight
+    // directory. The generation's nonterminal ownership prevents ordinary lock/move operations,
+    // while this gate also closes session relock and recovery races fail-closed.
+    ensure_pipeline_meeting_unlocked(state, meeting_id)?;
+    let (archive_path, archive_verified) = publisher.publish_mix(
+        &mic_16k_path,
+        system_16k_path.as_deref(),
+        mic_delay as u64,
+        system_delay as u64,
+    )?;
+    pipeline_heartbeat.ensure_owned()?;
+    let archive = crate::storage::recording_store::VerifiedArchiveArtifact::from_file(
+        &recording.key,
+        &archive_verified,
+    )?;
+    state.db.renew_recording_generation_lease(
+        &recording.key,
+        &recording.lease,
+        generation_state,
+        PIPELINE_LEASE_MS,
+    )?;
+    if generation_state == crate::storage::models::RecordingGenerationState::Finalized {
+        state
+            .db
+            .archive_recording_generation(&recording.key, &recording.lease, &archive)?;
+    } else {
+        let assertion = snapshot.archive.as_ref().ok_or_else(|| {
+            AppError::Storage("archived generation lost its archive assertion".into())
+        })?;
+        if assertion.basename() != archive_verified.basename()
+            || assertion.device() != archive_verified.device()
+            || assertion.inode() != archive_verified.inode()
+            || assertion.byte_len() != archive_verified.byte_len()
+            || assertion.sha256() != archive_verified.sha256()
+        {
+            return Err(AppError::Storage(
+                "rebuilt archive does not match the archived ledger assertion".into(),
+            ));
+        }
+    }
+
+    let ended_at = chrono::Utc::now().to_rfc3339();
+    state.db.finalize_meeting(
+        meeting_id,
+        &ended_at,
+        duration_s,
+        archive_path.to_string_lossy().as_ref(),
+    )?;
+
+    // Optional masters remain streaming. Publication is no-clobber + idempotent, with staging in
+    // the private generation directory. A pointer failure is reconciled by reread; only a proven
+    // absent pointer authorizes exact deletion of the just-published managed inode.
+    if config.keep_hires_masters {
+        let mic_master = wav_dir.join(format!("{meeting_id}.mic.wav"));
+        let mic_proof = stream_raw_to_float_wav(
+            &recording.mic_path,
+            recording.sample_rate,
+            &inflight_dir,
+            &mic_master,
+            recording.key.generation_id(),
+        )?;
+        persist_master_pointer_or_reconcile(
+            &state.db,
+            meeting_id,
+            MasterPointerKind::Mic,
+            &mic_master,
+            &mic_proof,
+        )?;
+        if let Some(system) = recording.system_wav.as_deref() {
+            let system_master = wav_dir.join(format!("{meeting_id}.sys.wav"));
+            let system_proof = copy_verified_file_no_clobber(
+                system,
+                &inflight_dir,
+                &system_master,
+                recording.key.generation_id(),
+            )?;
+            persist_master_pointer_or_reconcile(
+                &state.db,
+                meeting_id,
+                MasterPointerKind::System,
+                &system_master,
+                &system_proof,
+            )?;
+        }
+    }
+
+    if recording.capture_fault.is_some() {
+        emit_status(
+            app,
+            "transcribing",
+            "Capture stopped early after an audio-device or storage fault. Transcribing the exact durable prefix…",
+            meeting_id,
+        );
+    }
+
+    emit_status(app, "transcribing", "Transcribing audio…", meeting_id);
+    let model_path = resolve_model_path(&config)?;
+    let language = config.language.clone();
+    let normalize_windows = config.vad_enabled;
+    let mic_path = mic_16k_path.clone();
+    let system_path = system_16k_path.clone();
+    let mic_started_at = recording.started_at;
+    let system_started_at = recording.system_started_at;
+    let vad_path = if config.vad_enabled {
+        crate::transcribe::ensure_vad_model().await.ok()
+    } else {
+        None
+    };
+    let (segments, echo_suppressed) = with_stage_watchdog(
+        asr_watchdog_bound(duration_s),
+        "asr_file_windows",
+        crate::perf::run_heavy_maybe_recording(
+            &state.heavy_inference,
+            recording_model_token.clone(),
+            crate::perf::ResidentModelKind::Whisper,
+            move || {
+                use crate::audio::merge::{merge_streams, StreamInput, SPEAKER_ME, SPEAKER_OTHERS};
+                let transcriber = Transcriber::load(&model_path)?;
+                let mic_segments = transcribe_raw_windows(
+                    &transcriber,
+                    &mic_path,
+                    language.as_deref(),
+                    vad_path.as_deref(),
+                    normalize_windows,
+                )?;
+                let mut streams = vec![StreamInput {
+                    segments: mic_segments,
+                    started_at: mic_started_at,
+                    speaker: SPEAKER_ME,
+                }];
+                if let (Some(path), Some(started_at)) = (system_path, system_started_at) {
+                    let sys_segments = transcribe_raw_windows(
+                        &transcriber,
+                        &path,
+                        language.as_deref(),
+                        vad_path.as_deref(),
+                        normalize_windows,
+                    )?;
+                    // Full-recording sherpa diarization is deliberately skipped beyond one ASR window;
+                    // every far-side segment remains honestly labelled `others`.
+                    streams.push(StreamInput {
+                        segments: sys_segments,
+                        started_at,
+                        speaker: SPEAKER_OTHERS,
+                    });
+                }
+                Ok((merge_streams(streams), 0usize))
+            },
+        ),
+    )
+    .await?;
+
+    // ASR may run for minutes. Session relock during that await must not publish fresh plaintext
+    // segments into SQLCipher under a sealed-and-not-session-unlocked folder.
+    ensure_pipeline_meeting_unlocked(state, meeting_id)?;
+    state.db.replace_segments(meeting_id, &segments)?;
+    state
+        .db
+        .update_meeting_status(meeting_id, MeetingStatus::Transcribed)?;
+    let feed = build_transcript_feed(&segments);
+    if feed.summary_text.trim().is_empty() {
+        return Err(AppError::Transcribe(
+            "No speech detected in the recording — nothing to transcribe.".into(),
+        ));
+    }
+    let now = chrono::Utc::now();
+    let result = summarize_and_export(
+        app,
+        state,
+        meeting_id,
+        &feed,
+        config.language,
+        duration_s,
+        &now.format("%Y-%m-%d").to_string(),
+        &ended_at,
+        recording_model_token,
+    )
+    .await?;
+    pipeline_heartbeat.ensure_owned()?;
+
+    // Stop and join before retirement. Otherwise a final renewal can observe RETIRED and latch a
+    // false ownership loss after the successful cleanup CAS.
+    pipeline_heartbeat.stop_and_join()?;
+
+    // Each exact unlink+directory-fsync advances a durable cleanup bit. A crash at any boundary is
+    // resumed idempotently from ARCHIVED; RETIRED is DB-guarded on the complete required mask.
+    crate::audio::source::cleanup_completed_archived_generation(
+        &state.db,
+        &inflight_dir,
+        &snapshot,
+        &recording.lease,
+        &archive,
+    )?;
+    if let Some(folder_id) = result.deferred_seal_folder_id.as_deref() {
+        // The generation is RETIRED and every private plaintext source is gone before the meeting
+        // becomes logically governed by the locked folder.
+        crate::commands::seal_auto_filed_note(state, meeting_id, folder_id)?;
+    }
+    let _ = echo_suppressed;
+    Ok(result)
+}
+
+fn transcribe_raw_windows(
+    transcriber: &Transcriber,
+    path: &Path,
+    language: Option<&str>,
+    vad_path: Option<&Path>,
+    normalize: bool,
+) -> Result<Vec<crate::transcribe::types::Segment>> {
+    const WINDOW_FRAMES: usize = 120 * audio::TARGET_RATE_HZ as usize;
+    let mut source = RawF32LeSource::open(path, audio::TARGET_RATE_HZ)?;
+    let mut all = Vec::new();
+    let mut offset = 0u64;
+    let mut next_idx = 0i64;
+    let mut vad = vad_path.and_then(|model| crate::transcribe::vad::VadSegmenter::load(model).ok());
+    while offset < source.frames() {
+        let mut window = source.read_frames(offset, WINDOW_FRAMES)?;
+        if window.is_empty() {
+            break;
+        }
+        if normalize {
+            audio::normalize_for_asr(&mut window);
+        }
+        let offset_s = offset as f64 / audio::TARGET_RATE_HZ as f64;
+        let mut segments = transcribe_stream(transcriber, vad.as_mut(), &window, language)?;
+        for segment in &mut segments {
+            segment.idx = next_idx;
+            segment.start_s += offset_s;
+            segment.end_s += offset_s;
+            next_idx += 1;
+        }
+        all.extend(segments);
+        offset += window.len() as u64;
+    }
+    Ok(all)
+}
+
 /// FROM-DISK re-run of the post-Stop pipeline (2026-07-16, salvage-from-disk): re-transcribe a
 /// meeting whose ARCHIVE WAV survived on disk after its original pipeline died (crash / panic /
 /// force-quit between `finalize_meeting` and a terminal status), or whose user asked for a retry
 /// (`retry_transcription`). Reads the archived mix back into memory, then runs the EXACT SAME
-/// [`run_after_stop`] a live Stop takes — so the re-run inherits the heavy-inference gate
-/// (`perf::run_heavy`), the ASR watchdog, seal-aware note persist (`upsert_note_reseal_if_locked`)
-/// and the locked-folder export-skip branches with zero forking.
+/// [`run_after_stop`] a live Stop takes — so the re-run inherits recording-priority admission
+/// (`perf::run_heavy_maybe_recording`), the ASR watchdog, seal-aware note persist
+/// (`upsert_note_reseal_if_locked`) and the locked-folder export-skip branches with zero forking.
 ///
 /// KNOWN, DOCUMENTED DEGRADATION: the archive is the COMBINED mic+system mix, so the re-run is
 /// single-stream — every segment is attributed to `me` (no `others` split, no diarization). A
@@ -334,8 +1177,8 @@ pub async fn run_after_stop(
 /// lock-state finalizer ([`crate::commands::finalize_salvage_lock_state`]) reconciles the fresh
 /// output with the folder's CURRENT lock state: a session-unlocked locked folder gets the fresh
 /// segments/timeline/audio durably re-sealed via the same `SealInto` path auto-file uses; a
-/// mid-run relock gets the unsealed plaintext leftovers purged fail-closed (audio survives as the
-/// sealed `.enc`).
+/// mid-run relock uses an entry-pinned, zeroizing folder key to authenticate and seal the exact
+/// new transcript/audio; it never substitutes later re-transcription for the original rows.
 ///
 /// A PRE-pipeline failure (unreadable/empty WAV) persists `Error` + emits the terminal `error`
 /// stage itself, mirroring `run_after_stop`'s Err arm, so the row never wedges non-terminal.
@@ -345,44 +1188,113 @@ pub async fn run_salvage_from_disk(
     meeting_id: &str,
     wav_path: &Path,
 ) -> Result<PipelineResult> {
-    let prep: Result<(Vec<f32>, u32)> =
-        audio::read_wav_mono(wav_path).and_then(|(samples, rate)| {
-            if samples.is_empty() || rate == 0 {
-                Err(AppError::Audio(
-                    "archived recording audio is empty or unreadable — nothing to re-transcribe"
-                        .into(),
-                ))
-            } else {
-                Ok((samples, rate))
-            }
-        });
-    let (samples, rate) = match prep {
-        Ok(v) => v,
-        Err(e) => {
+    let mut archive = match WavMonoSource::open(wav_path) {
+        Ok(source) if source.frames() > 0 && source.sample_rate() > 0 => source,
+        Ok(_) => {
+            let error = AppError::Audio(
+                "archived recording audio is empty or unreadable — nothing to re-transcribe".into(),
+            );
             let _ = state
                 .db
                 .update_meeting_status(meeting_id, MeetingStatus::Error);
-            emit_status(app, "error", &e.to_string(), meeting_id);
-            return Err(e);
+            emit_status(app, "error", &error.to_string(), meeting_id);
+            return Err(error);
+        }
+        Err(error) => {
+            let _ = state
+                .db
+                .update_meeting_status(meeting_id, MeetingStatus::Error);
+            emit_status(app, "error", &error.to_string(), meeting_id);
+            return Err(error);
         }
     };
-    let duration_s = (samples.len() as f64 / rate as f64).round() as i64;
+    let duration_s = (archive.frames() as f64 / archive.sample_rate() as f64).round() as i64;
     // Reconcile the fresh output with the folder's CURRENT lock state on EVERY exit — Ok, Err, a
     // panic unwinding through the detached task, or this future being dropped mid-await. A plain
     // sequential call after the await left a crash window (2026-07-16 review): a kill between the
     // segment insert and the finalizer skipped the re-seal/purge, stranding fresh plaintext behind
     // a lock (the relock-side sweep in `reblank_folder_extras` is the second, universal net).
     // Best-effort by contract: a finalizer failure is logged inside and never masks the result.
-    let _finalizer = SalvageLockFinalizer { state, meeting_id };
-    // Single stream, anchored to a fresh Instant (the original capture clocks are gone) — the
-    // merge sees one stream, so the anchor only offsets absolute timestamps uniformly.
-    let now = std::time::Instant::now();
-    run_after_stop(
-        app, state, meeting_id, samples, rate, duration_s, None, // no system stream
-        None, // no AEC helper track
-        now, None,
+    // Register before taking the folder/CK snapshot. The permit blocks only operations that would
+    // rotate/orphan that key (fresh lock, permanent unlock, move/delete); session relock remains
+    // free to revoke visibility immediately. Declaration order is intentional: the finalizer below
+    // drops first, then the permit releases key-changing operations.
+    let _salvage_permit = crate::commands::begin_active_salvage(state, meeting_id)?;
+    let seal_context = crate::commands::capture_salvage_seal_context(state, meeting_id)?;
+    let _finalizer = SalvageLockFinalizer {
+        state,
+        meeting_id,
+        seal_context,
+    };
+    let temp =
+        recording_inflight_dir()?.join(format!(".retry-{meeting_id}-{}.f32", uuid::Uuid::new_v4()));
+    let _temp_guard = RemoveOnDrop(temp.clone());
+    let _ = resample_source_to_f32le(&mut archive, &temp)?;
+    emit_status(app, "transcribing", "Transcribing audio…", meeting_id);
+    let config = state
+        .config
+        .lock()
+        .map_err(|_| AppError::Config("config mutex poisoned".into()))?
+        .clone();
+    let model = resolve_model_path(&config)?;
+    let language = config.language.clone();
+    let vad = if config.vad_enabled {
+        crate::transcribe::ensure_vad_model().await.ok()
+    } else {
+        None
+    };
+    let normalize = config.vad_enabled;
+    let segments = with_stage_watchdog(
+        asr_watchdog_bound(duration_s),
+        "asr_archive_windows",
+        crate::perf::run_heavy_maybe_recording(
+            &state.heavy_inference,
+            None,
+            crate::perf::ResidentModelKind::Whisper,
+            move || {
+                let transcriber = Transcriber::load(&model)?;
+                transcribe_raw_windows(
+                    &transcriber,
+                    &temp,
+                    language.as_deref(),
+                    vad.as_deref(),
+                    normalize,
+                )
+            },
+        ),
+    )
+    .await?;
+    state.db.replace_segments(meeting_id, &segments)?;
+    state
+        .db
+        .update_meeting_status(meeting_id, MeetingStatus::Transcribed)?;
+    let feed = build_transcript_feed(&segments);
+    if feed.summary_text.trim().is_empty() {
+        return Err(AppError::Transcribe(
+            "No speech detected in the recording — nothing to transcribe.".into(),
+        ));
+    }
+    let now = chrono::Utc::now();
+    let result = summarize_and_export(
+        app,
+        state,
+        meeting_id,
+        &feed,
+        config.language,
+        duration_s,
+        &now.format("%Y-%m-%d").to_string(),
+        &now.to_rfc3339(),
+        None,
     )
     .await
+    .and_then(|result| apply_deferred_seal(state, meeting_id, result));
+    if let Err(error) = &result {
+        let _ = state
+            .db
+            .update_meeting_status(meeting_id, MeetingStatus::Error);
+        emit_status(app, "error", &error.to_string(), meeting_id);
+    }
+    result
 }
 
 /// Drop-armed wrapper for [`crate::commands::finalize_salvage_lock_state`] — the salvage lock
@@ -393,13 +1305,15 @@ pub async fn run_salvage_from_disk(
 pub(crate) struct SalvageLockFinalizer<'a> {
     pub(crate) state: &'a AppState,
     pub(crate) meeting_id: &'a str,
+    pub(crate) seal_context: Option<crate::commands::SalvageSealContext>,
 }
 
 impl Drop for SalvageLockFinalizer<'_> {
     fn drop(&mut self) {
         let (state, meeting_id) = (self.state, self.meeting_id);
+        let seal_context = self.seal_context.as_ref();
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::commands::finalize_salvage_lock_state(state, meeting_id);
+            crate::commands::finalize_salvage_lock_state(state, meeting_id, seal_context);
         }));
     }
 }
@@ -825,7 +1739,18 @@ async fn run_inner(
     // `with_stage_watchdog` for why the timeout does NOT kill the underlying blocking compute.
     let asr_watchdog = asr_watchdog_bound(duration_s);
     let asr_diarize_started = std::time::Instant::now();
-    let (merged_segments, echo_suppressed, cluster_voiceprints) = with_stage_watchdog(asr_watchdog, "asr_diarize", crate::perf::run_heavy(&state.heavy_inference, move || -> Result<(Vec<crate::transcribe::types::Segment>, usize, Vec<crate::transcribe::diarize::ClusterVoiceprint>)> {
+    let (merged_segments, echo_suppressed, cluster_voiceprints) = with_stage_watchdog(
+        asr_watchdog,
+        "asr_diarize",
+        crate::perf::run_heavy_maybe_recording(
+            &state.heavy_inference,
+            None,
+            crate::perf::ResidentModelKind::Whisper,
+            move || -> Result<(
+                Vec<crate::transcribe::types::Segment>,
+                usize,
+                Vec<crate::transcribe::diarize::ClusterVoiceprint>,
+            )> {
         use crate::audio::merge::{merge_streams, StreamInput, SPEAKER_ME, SPEAKER_OTHERS};
 
         let transcriber = Transcriber::load(&model_path_owned)?;
@@ -921,8 +1846,10 @@ async fn run_inner(
         // Copy, captured by this move closure.
         let (merged, echo_suppressed) =
             crate::audio::merge::suppress_cross_stream_echo(merge_streams(streams), leak.as_ref());
-        Ok((merged, echo_suppressed, cluster_voiceprints))
-    }))
+                Ok((merged, echo_suppressed, cluster_voiceprints))
+            },
+        ),
+    )
     .await?;
     tracing::info!(
         target: "perf",
@@ -1015,8 +1942,10 @@ async fn run_inner(
         duration_s,
         &date_iso,
         &ended_at,
+        None,
     )
-    .await;
+    .await
+    .and_then(|result| apply_deferred_seal(state, meeting_id, result));
     tracing::info!(
         target: "perf",
         stage = "summarize_and_export",
@@ -1148,6 +2077,7 @@ pub(crate) fn build_transcript_feed(
 /// Regression: `summarize_egress_resolution_honors_revoke_landed_after_stop_snapshot`.
 fn resolve_summarize_egress(
     state: &AppState,
+    recording_model_token: Option<crate::perf::RecordingSessionToken>,
 ) -> Result<(
     AppConfig,
     std::sync::Arc<dyn crate::summarize::provider::SummarizerProvider>,
@@ -1159,7 +2089,15 @@ fn resolve_summarize_egress(
             .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
         guard.clone()
     };
-    let provider = provider_for(Role::Notes, &config, &state.heavy_inference)?;
+    let provider = match recording_model_token {
+        Some(token) => crate::summarize::provider_for_recording(
+            Role::Notes,
+            &config,
+            &state.heavy_inference,
+            token,
+        )?,
+        None => provider_for(Role::Notes, &config, &state.heavy_inference)?,
+    };
     Ok((config, provider))
 }
 
@@ -1244,11 +2182,13 @@ async fn summarize_and_export(
     duration_s: i64,
     date_iso: &str,
     when_iso: &str,
+    recording_model_token: Option<crate::perf::RecordingSessionToken>,
 ) -> Result<PipelineResult> {
     // Egress gate FIRST, on the LIVE config: a consent revoke that landed during transcription
     // refuses here (fail-closed), before any status/corpus work. The provider is pure
     // construction (no I/O), and every config read below uses this same fresh snapshot.
-    let (config, provider) = resolve_summarize_egress(state)?;
+    let postprocess_token = recording_model_token.clone();
+    let (config, provider) = resolve_summarize_egress(state, recording_model_token)?;
     let config = &config;
 
     // The NOTES-role provider target — with role keys absent this is EXACTLY the legacy
@@ -1492,9 +2432,27 @@ async fn summarize_and_export(
             .lock()
             .map(|g| g.clone())
             .unwrap_or_default();
-        let embedder = crate::embed::active_embedder();
-        if let Err(e) =
-            index_meeting_if_enabled(&state.db, meeting_id, true, &unlocked, embedder.as_ref())
+        let app_for_index = app.clone();
+        let meeting_for_index = meeting_id.to_string();
+        let index_token = postprocess_token.clone();
+        if let Err(e) = crate::perf::run_blocking_serialized(&state.heavy_inference, move || {
+            let state = app_for_index.state::<AppState>();
+            // Persisted vectors are REAL-only and one immutable model snapshot backs every
+            // sub-batch. A Settings switch or model-init failure must never mix/fall back to
+            // deterministic stub vectors inside this index generation.
+            let embedder = match index_token {
+                Some(token) => crate::embed::active_recording_persistence_embedder(token)?,
+                None => crate::embed::active_persistence_embedder()?,
+            };
+            index_meeting_if_enabled(
+                &state.db,
+                &meeting_for_index,
+                true,
+                &unlocked,
+                embedder.as_ref(),
+            )
+        })
+        .await
         {
             tracing::warn!(target: "rag", error = %e, "semantic index of new note failed (note unaffected)");
         }
@@ -1515,8 +2473,15 @@ async fn summarize_and_export(
         );
         // Best-effort self-assembling graph: the encrypted DB (Sink A) is the canonical store and
         // works without a vault; never fail the saved note on a graph hiccup.
-        if let Err(e) =
-            crate::commands::build_and_persist_entities(app, state, meeting_id, &title, &markdown).await
+        if let Err(e) = crate::commands::build_and_persist_entities(
+            app,
+            state,
+            meeting_id,
+            &title,
+            &markdown,
+            postprocess_token.clone(),
+        )
+        .await
         {
             tracing::warn!(target: "graph", error = %e, "graph entity persist failed (note saved unaffected)");
         }
@@ -1524,6 +2489,7 @@ async fn summarize_and_export(
             note_markdown: markdown,
             exported_path: None,
             meeting_id: meeting_id.to_string(),
+            deferred_seal_folder_id: None,
         });
     };
 
@@ -1544,8 +2510,15 @@ async fn summarize_and_export(
         );
         // Same best-effort graph persist as the no-vault path (Sink B's own gate skips vault stubs
         // for a locked folder; Sink A rows are visibility-gated on read).
-        if let Err(e) =
-            crate::commands::build_and_persist_entities(app, state, meeting_id, &title, &markdown).await
+        if let Err(e) = crate::commands::build_and_persist_entities(
+            app,
+            state,
+            meeting_id,
+            &title,
+            &markdown,
+            postprocess_token.clone(),
+        )
+        .await
         {
             tracing::warn!(target: "graph", error = %e, "graph entity persist failed (note saved unaffected)");
         }
@@ -1553,6 +2526,7 @@ async fn summarize_and_export(
             note_markdown: markdown,
             exported_path: None,
             meeting_id: meeting_id.to_string(),
+            deferred_seal_folder_id: None,
         });
     }
 
@@ -1612,7 +2586,8 @@ async fn summarize_and_export(
             // Auto-organize safety (BLK-2 parity): if the classifier chose a subfolder that maps to
             // a LOCKED folder, plaintext must NEVER land in its sealed on-disk dir — not even
             // transiently. Decide BEFORE writing (and inside the same guarded section as the write).
-            let auto_file = crate::commands::classify_auto_file_target(state, subfolder.as_deref())?;
+            let auto_file =
+                crate::commands::classify_auto_file_target(state, subfolder.as_deref())?;
             let write_subfolder = match &auto_file {
                 // Open / root / unmanaged subfolder → write into the chosen subfolder as usual.
                 crate::commands::AutoFileTarget::Open => subfolder.as_deref(),
@@ -1649,8 +2624,15 @@ async fn summarize_and_export(
             "Saved to Murmur — this folder is locked, so no plaintext note was exported.",
             meeting_id,
         );
-        if let Err(e) =
-            crate::commands::build_and_persist_entities(app, state, meeting_id, &title, &markdown).await
+        if let Err(e) = crate::commands::build_and_persist_entities(
+            app,
+            state,
+            meeting_id,
+            &title,
+            &markdown,
+            postprocess_token.clone(),
+        )
+        .await
         {
             tracing::warn!(target: "graph", error = %e, "graph entity persist failed (note saved unaffected)");
         }
@@ -1658,22 +2640,9 @@ async fn summarize_and_export(
             note_markdown: markdown,
             exported_path: None,
             meeting_id: meeting_id.to_string(),
+            deferred_seal_folder_id: None,
         });
     };
-
-    // Seal the note INTO a session-unlocked locked folder (encrypts the markdown/extras and removes
-    // the plaintext `.md` we just wrote) — the same outcome a manual move would produce. Runs
-    // OUTSIDE the guarded block above: `seal_auto_filed_note` → `move_into_locked_folder` takes the
-    // lifecycle guard itself (holding it here would self-deadlock); the `.md` is already tracked by
-    // `exported_path`, so an interleaving lock's cleanup covers it.
-    if let crate::commands::AutoFileTarget::SealInto(folder_id) = &auto_file {
-        if let Err(e) = crate::commands::seal_auto_filed_note(state, meeting_id, folder_id) {
-            // Rare relock race: the `.md` is on disk but the folder is now locked. Never leave
-            // plaintext in a sealed dir — drop the stray `.md` (the note markdown is still in the DB).
-            let _ = std::fs::remove_file(&exported_path);
-            return Err(e);
-        }
-    }
 
     emit_status(app, "done", "Note exported.", meeting_id);
 
@@ -1681,8 +2650,15 @@ async fn summarize_and_export(
     // + mirror vault stubs for unsealed folders (Sink B). NEVER fail the note on a graph error —
     // a graph-extraction LLM hiccup must not block note export. `add_mention` idempotency makes
     // the `resummarize_existing` path safe (re-extraction refreshes without double-counting).
-    if let Err(e) =
-        crate::commands::build_and_persist_entities(app, state, meeting_id, &title, &markdown).await
+    if let Err(e) = crate::commands::build_and_persist_entities(
+        app,
+        state,
+        meeting_id,
+        &title,
+        &markdown,
+        postprocess_token.clone(),
+    )
+    .await
     {
         tracing::warn!(target: "graph", error = %e, "graph entity persist failed (note export unaffected)");
     }
@@ -1716,6 +2692,11 @@ async fn summarize_and_export(
         note_markdown: markdown,
         exported_path: Some(exported_path),
         meeting_id: meeting_id.to_string(),
+        deferred_seal_folder_id: match auto_file {
+            crate::commands::AutoFileTarget::SealInto(folder_id) => Some(folder_id),
+            crate::commands::AutoFileTarget::Open
+            | crate::commands::AutoFileTarget::RejectToRoot => None,
+        },
     })
 }
 
@@ -1979,10 +2960,11 @@ pub async fn resummarize_existing(
         meeting.duration_s,
         &date_iso,
         &when_iso,
+        None,
     )
     .await
     {
-        Ok(result) => Ok(result),
+        Ok(result) => apply_deferred_seal(state, meeting_id, result),
         Err(e) => {
             let _ = state
                 .db
@@ -2312,7 +3294,7 @@ mod tests {
 
         // FIXED: the summarize step resolves config + provider through the LIVE state → the
         // fail-closed consent gate refuses.
-        match resolve_summarize_egress(&state) {
+        match resolve_summarize_egress(&state, None) {
             Err(AppError::Unavailable(_)) => {}
             Err(other) => panic!("summarize egress must refuse AT the consent gate, got {other:?}"),
             Ok(_) => panic!("summarize egress must refuse AT the consent gate, got Ok"),
@@ -2709,13 +3691,21 @@ mod tests {
     fn asr_watchdog_bound_scales_with_duration() {
         assert_eq!(asr_watchdog_bound(0).as_secs(), 15 * 60);
         assert_eq!(asr_watchdog_bound(-5).as_secs(), 15 * 60);
-        assert_eq!(asr_watchdog_bound(60).as_secs(), 15 * 60, "floor dominates short meetings");
+        assert_eq!(
+            asr_watchdog_bound(60).as_secs(),
+            15 * 60,
+            "floor dominates short meetings"
+        );
         assert_eq!(
             asr_watchdog_bound(20 * 60).as_secs(),
             80 * 60,
             "the reported ~20-min meeting gets 4× its length"
         );
-        assert_eq!(asr_watchdog_bound(i64::MAX).as_secs(), u64::MAX, "saturates, never overflows");
+        assert_eq!(
+            asr_watchdog_bound(i64::MAX).as_secs(),
+            u64::MAX,
+            "saturates, never overflows"
+        );
     }
 
     /// REGRESSION (adversarial find, seal content-leak class): `summarize_and_export` upserts the
@@ -2769,8 +3759,14 @@ mod tests {
             .unwrap();
 
         // The REAL production paired write.
-        persist_note_exported_path(&db, &config, mid, Path::new("/vault/Role export.md"), "# body")
-            .unwrap();
+        persist_note_exported_path(
+            &db,
+            &config,
+            mid,
+            Path::new("/vault/Role export.md"),
+            "# body",
+        )
+        .unwrap();
 
         let note = db
             .get_latest_note_for_meeting(mid)
@@ -2808,8 +3804,14 @@ mod tests {
             &crate::summarize::roles::provider_target(Role::Notes, &legacy_cfg).connection,
         ))
         .unwrap();
-        persist_note_exported_path(&db, &legacy_cfg, mid2, Path::new("/vault/Legacy.md"), "# body")
-            .unwrap();
+        persist_note_exported_path(
+            &db,
+            &legacy_cfg,
+            mid2,
+            Path::new("/vault/Legacy.md"),
+            "# body",
+        )
+        .unwrap();
         let legacy_note = db
             .get_latest_note_for_meeting(mid2)
             .unwrap()
@@ -3066,9 +4068,8 @@ mod tests {
     #[test]
     fn companion_body_is_the_summary_user_notes_else_manual_notes() {
         use crate::storage::models::Meeting;
-        let db =
-            crate::storage::Db::open_with_key(&temp_db_path("companion-usernotes"), TEST_DEK)
-                .unwrap();
+        let db = crate::storage::Db::open_with_key(&temp_db_path("companion-usernotes"), TEST_DEK)
+            .unwrap();
 
         // Meeting A: HAS a companion note → its body (front-matter stripped) is the user notes.
         db.insert_meeting(&Meeting {

@@ -352,8 +352,7 @@ pub fn run_agentic_loop(
                     if let Some(s) = sink {
                         s.tool_done(&name, false, 0);
                     }
-                    transcript
-                        .push_marker(format!("[{name} failed — try another tool or answer]"));
+                    transcript.push_marker(format!("[{name} failed — try another tool or answer]"));
                     steps.push(AgentStep {
                         tool: name,
                         ok: false,
@@ -518,7 +517,9 @@ mod tests {
                 return Ok(serde_json::json!({ "answer": "done" }));
             }
             *n -= 1;
-            Ok(serde_json::json!({ "tool": "search_meetings", "args": { "query": format!("q{}", *n) } }))
+            Ok(
+                serde_json::json!({ "tool": "search_meetings", "args": { "query": format!("q{}", *n) } }),
+            )
         }
     }
 
@@ -592,7 +593,8 @@ mod tests {
             serde_json::json!({ "tool": "search_meetings", "args": { "query": "a" } }),
             serde_json::json!({ "tool": "search_meetings", "args": { "query": "b" } }),
         ]);
-        let out = run_agentic_loop(&r, "sys", "q", &EchoExec, 2, None, GenOptions::default()).unwrap();
+        let out =
+            run_agentic_loop(&r, "sys", "q", &EchoExec, 2, None, GenOptions::default()).unwrap();
         assert!(
             out.is_none(),
             "non-convergence must return Ok(None), not a fabricated answer"
@@ -642,12 +644,18 @@ mod tests {
     #[test]
     fn is_escalation_fires_only_on_the_exact_sentinel() {
         assert!(is_escalation(ESCALATE_SENTINEL));
-        assert!(is_escalation("  __ESCALATE__  "), "trims surrounding whitespace");
+        assert!(
+            is_escalation("  __ESCALATE__  "),
+            "trims surrounding whitespace"
+        );
         assert!(
             !is_escalation("The meeting is about the __ESCALATE__ feature."),
             "a real answer that MENTIONS the token must NOT escalate"
         );
-        assert!(!is_escalation("This is answerable here."), "a real answer never escalates");
+        assert!(
+            !is_escalation("This is answerable here."),
+            "a real answer never escalates"
+        );
         assert!(!is_escalation(""), "an empty answer is not an escalation");
     }
 
@@ -672,23 +680,37 @@ mod tests {
     #[test]
     fn compact_transcript_keeps_head_marker_and_last_two_blocks() {
         let mut t = loop_transcript(5, 100);
-        assert_eq!(t.rendered_len(), t.render().len(), "length math matches rendering");
+        assert_eq!(
+            t.rendered_len(),
+            t.render().len(),
+            "length math matches rendering"
+        );
         t.compact();
         let c = t.render();
         assert!(c.starts_with("User request: what did we decide?"));
-        assert!(c.contains("[3 earlier results omitted]"), "5 blocks - 2 kept = 3 omitted: {c}");
+        assert!(
+            c.contains("[3 earlier results omitted]"),
+            "5 blocks - 2 kept = 3 omitted: {c}"
+        );
         assert!(c.contains("block-3-"), "second-to-last block kept verbatim");
         assert!(c.contains("block-4-"), "last block kept verbatim");
         for dropped in ["block-0-", "block-1-", "block-2-"] {
             assert!(!c.contains(dropped), "{dropped} must be omitted");
         }
-        assert_eq!(t.rendered_len(), c.len(), "length math matches after compaction");
+        assert_eq!(
+            t.rendered_len(),
+            c.len(),
+            "length math matches after compaction"
+        );
 
         // Re-compaction after more blocks FOLDS into the same counter.
         t.push_result("[search_meetings result]\nblock-5-new".to_string());
         t.compact();
         let c2 = t.render();
-        assert!(c2.contains("[4 earlier results omitted]"), "counter folds: {c2}");
+        assert!(
+            c2.contains("[4 earlier results omitted]"),
+            "counter folds: {c2}"
+        );
         assert!(c2.contains("block-5-new"));
 
         // ≤ 2 blocks ⇒ rendering unchanged by compact() (nothing to drop).
@@ -709,9 +731,15 @@ mod tests {
     #[test]
     fn markers_between_evicted_results_survive_compaction() {
         let mut t = LoopTranscript::new("what did we decide?");
-        t.push_result(format!("[search_meetings result]\nres-0-{}", "x".repeat(100)));
+        t.push_result(format!(
+            "[search_meetings result]\nres-0-{}",
+            "x".repeat(100)
+        ));
         t.push_marker("[get_meeting failed — try another tool or answer]".to_string());
-        t.push_result(format!("[search_meetings result]\nres-1-{}", "x".repeat(100)));
+        t.push_result(format!(
+            "[search_meetings result]\nres-1-{}",
+            "x".repeat(100)
+        ));
         t.push_marker(
             "[search_meetings already retrieved — choose a different tool or answer]".to_string(),
         );
@@ -730,20 +758,33 @@ mod tests {
             "the dedup marker must survive compaction: {c}"
         );
         // The keep-window results are verbatim; the two OLD results folded into the counter.
-        assert!(c.contains("res-2-") && c.contains("res-3-"), "newest 2 blocks kept: {c}");
-        assert!(!c.contains("res-0-") && !c.contains("res-1-"), "old results omitted: {c}");
+        assert!(
+            c.contains("res-2-") && c.contains("res-3-"),
+            "newest 2 blocks kept: {c}"
+        );
+        assert!(
+            !c.contains("res-0-") && !c.contains("res-1-"),
+            "old results omitted: {c}"
+        );
         assert!(
             c.contains("[2 earlier results omitted]"),
             "only the 2 evicted RESULTS count as omitted: {c}"
         );
-        assert_eq!(t.rendered_len(), c.len(), "length math matches after marker-aware compaction");
+        assert_eq!(
+            t.rendered_len(),
+            c.len(),
+            "length math matches after marker-aware compaction"
+        );
 
         // Re-compaction is stable: markers keep surviving, the counter never double-counts them.
         t.push_result(format!("[get_meeting result]\nres-4-{}", "x".repeat(100)));
         t.compact();
         let c2 = t.render();
         assert!(c2.contains("[get_meeting failed — try another tool or answer]"));
-        assert!(c2.contains("[3 earlier results omitted]"), "res-2 folds on re-compaction: {c2}");
+        assert!(
+            c2.contains("[3 earlier results omitted]"),
+            "res-2 folds on re-compaction: {c2}"
+        );
     }
 
     /// IN-LOOP: an over-budget transcript is compacted before the next model step (the reasoner
@@ -884,7 +925,9 @@ mod tests {
     #[test]
     fn loop_retries_once_on_malformed_json_then_converges() {
         let r = ScriptReasoner::with(vec![
-            Err(AppError::Summarize("reasoner: no JSON object in reply".into())),
+            Err(AppError::Summarize(
+                "reasoner: no JSON object in reply".into(),
+            )),
             Ok(serde_json::json!({ "answer": "recovered" })),
         ]);
         let out = run_agentic_loop(&r, "sys", "q", &EchoExec, 4, None, GenOptions::default())
@@ -906,8 +949,12 @@ mod tests {
     #[test]
     fn loop_propagates_a_second_malformed_json_failure() {
         let r = ScriptReasoner::with(vec![
-            Err(AppError::Summarize("reasoner: invalid JSON (expected value)".into())),
-            Err(AppError::Summarize("reasoner: no JSON object in reply".into())),
+            Err(AppError::Summarize(
+                "reasoner: invalid JSON (expected value)".into(),
+            )),
+            Err(AppError::Summarize(
+                "reasoner: no JSON object in reply".into(),
+            )),
         ]);
         let res = run_agentic_loop(&r, "sys", "q", &EchoExec, 4, None, GenOptions::default());
         assert!(
@@ -962,7 +1009,10 @@ mod tests {
         // next offset.
         let big = "q".repeat(RESULT_BUDGET + 2500); // 6500 chars
         let out = truncate_with_marker(&big, RESULT_BUDGET);
-        assert!(out.starts_with(&"q".repeat(RESULT_BUDGET)), "keeps the char-safe prefix");
+        assert!(
+            out.starts_with(&"q".repeat(RESULT_BUDGET)),
+            "keeps the char-safe prefix"
+        );
         assert!(
             out.contains(&format!(
                 "[truncated: showing {RESULT_BUDGET} of 6500 chars — call the same tool again with \
@@ -979,9 +1029,15 @@ mod tests {
         // 3000 × '€' (3 bytes each) = 9000 bytes, 3000 chars. Byte-len (9000) exceeds a 4000-byte
         // budget, so it truncates; the DISCLOSED total must be 3000 CHARS, not 9000 bytes.
         let s = "€".repeat(3000);
-        assert!(s.len() > RESULT_BUDGET, "precondition: byte-len exceeds the budget");
+        assert!(
+            s.len() > RESULT_BUDGET,
+            "precondition: byte-len exceeds the budget"
+        );
         let out = truncate_with_marker(&s, RESULT_BUDGET);
-        assert!(out.contains("of 3000 chars"), "total is char count, not byte count: {out}");
+        assert!(
+            out.contains("of 3000 chars"),
+            "total is char count, not byte count: {out}"
+        );
         // The next offset is the number of CHARS shown, and re-slicing the source at that char
         // offset must land exactly where the shown prefix ended (a valid continuation window).
         let shown_chars = out
@@ -991,7 +1047,10 @@ mod tests {
             .and_then(|n| n.parse::<usize>().ok())
             .expect("marker carries a shown-chars count");
         assert!(shown_chars > 0 && shown_chars < 3000);
-        assert!(out.contains(&format!("offset={shown_chars}")), "next offset = chars shown: {out}");
+        assert!(
+            out.contains(&format!("offset={shown_chars}")),
+            "next offset = chars shown: {out}"
+        );
     }
 
     /// The citation accumulator never grows past its cap even when a single tool result is enormous
@@ -1002,7 +1061,11 @@ mod tests {
         let mut buf = String::new();
         let huge = "x".repeat(GATHERED_BUDGET * 3);
         push_bounded(&mut buf, &huge, GATHERED_BUDGET);
-        assert!(buf.len() <= GATHERED_BUDGET + 2, "buffer bounded (+ the \\n\\n joiner): {}", buf.len());
+        assert!(
+            buf.len() <= GATHERED_BUDGET + 2,
+            "buffer bounded (+ the \\n\\n joiner): {}",
+            buf.len()
+        );
         // A second push over an already-full buffer is a no-op.
         let before = buf.len();
         push_bounded(&mut buf, "more", GATHERED_BUDGET);

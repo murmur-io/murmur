@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "task_id": "hook-git-option-bypass",
+  "description": "Guard hooks recognize git commit after git-global options",
+  "prompt": "Fix hooks/guard.py. Its commit detector currently recognizes only `git commit ...`, so `git -c key=value commit`, `git -C path commit`, and long global-option forms bypass the guard. Parse git-global options conservatively, classify commit invocations, and do not classify unrelated commands.",
+  "source": {
+    "kind": "fixture",
+    "initial": "fixtures/hook-git-option-bypass/initial"
+  },
+  "allowed_paths": ["hooks/guard.py"],
+  "expected_change": true,
+  "graders": [
+    {"id": "git-option-cases", "script": "graders/smoke.py", "timeout_seconds": 10}
+  ],
+  "fake": {
+    "good_overlay": "fixtures/hook-git-option-bypass/good",
+    "bad_overlay": "fixtures/hook-git-option-bypass/bad",
+    "good_response": "Updated the guard to skip value-taking and flag-only git-global options before identifying the subcommand.",
+    "bad_response": "Added a special case for git -c."
+  }
+}

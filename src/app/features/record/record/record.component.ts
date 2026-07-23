@@ -466,6 +466,25 @@ export class RecordComponent implements OnInit {
     }
   }
 
+  /**
+   * Start a pointer-activated Stop before focus transfer blurs the companion editor. WebKit may
+   * otherwise cancel the later `click` when a synchronous save-error toast changes the DOM between
+   * pointerdown and pointerup. `RecorderStore.stop()` flips out of recording synchronously, so the
+   * subsequent click path observes `isRecording() === false` and cannot double-submit.
+   */
+  onStopPointerDown(event: PointerEvent): void {
+    if (event.button === 0 && this.store.isRecording()) {
+      void this.store.stop();
+    }
+  }
+
+  /** Keyboard/synthetic activation fallback; pointer activation is handled above. */
+  onStopClick(): void {
+    if (this.store.isRecording()) {
+      void this.store.stop();
+    }
+  }
+
   /** Summon the floating always-on-top bar (also bound to ⌘⇧R globally). */
   popOut(): void {
     void this.ipc.toggleBar();

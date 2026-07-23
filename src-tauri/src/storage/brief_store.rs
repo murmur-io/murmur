@@ -225,9 +225,7 @@ impl Db {
 
 /// Map a `brief_schedules` row (id, label, day_of_week, hour_local, minute_local, scope_days,
 /// prompt_hint, enabled, last_run_at, created_at) to a [`crate::storage::models::BriefSchedule`].
-fn row_to_brief_schedule(
-    row: &Row<'_>,
-) -> rusqlite::Result<crate::storage::models::BriefSchedule> {
+fn row_to_brief_schedule(row: &Row<'_>) -> rusqlite::Result<crate::storage::models::BriefSchedule> {
     Ok(crate::storage::models::BriefSchedule {
         id: row.get(0)?,
         label: row.get(1)?,

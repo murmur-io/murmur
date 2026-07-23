@@ -13,7 +13,10 @@ import { map } from "rxjs";
 import { IpcService } from "../../../core/ipc.service";
 import { TabsService } from "../../../core/tabs.service";
 import { tabKeyFor } from "../../../core/tab-keys";
-import type { OrgItemDetail } from "../../../core/models";
+import type {
+  NoteAttachmentDto,
+  OrgItemDetail,
+} from "../../../core/models";
 import { MarkdownComponent } from "../../../shared/markdown/markdown.component";
 import { NoteChatComponent } from "../../notes/note-chat/note-chat.component";
 import { ToastService } from "../../../services/toast.service";
@@ -68,6 +71,8 @@ export class OrgItemViewerComponent {
   readonly orgName = this._orgName.asReadonly();
   readonly loading = signal(true);
   readonly error = signal<string | null>(null);
+  /** Decrypted attachment DTOs for this received org item; view-only. */
+  readonly attachments = signal<NoteAttachmentDto[]>([]);
 
   /**
    * Whether THIS device has a live sharing-account session — loaded alongside the item so a
@@ -147,6 +152,7 @@ export class OrgItemViewerComponent {
     this.loading.set(true);
     this.error.set(null);
     this._item.set(null);
+    this.attachments.set([]);
     this._orgName.set("");
     // A route change (incl. the post-save redirect to the superseded item) always exits edit mode.
     this.editing.set(false);
@@ -181,6 +187,18 @@ export class OrgItemViewerComponent {
         return; // stale — the route moved on under us
       }
       this._item.set(item);
+      try {
+        const rows = await this.ipc.listNoteAttachments("org", id);
+        if (this.itemId() !== id) {
+          return;
+        }
+        this.attachments.set(Array.isArray(rows) ? rows : []);
+      } catch {
+        if (this.itemId() !== id) {
+          return;
+        }
+        this.attachments.set([]);
+      }
       // Adopt the real title (mirrors note-editor's setTitle) — the caller
       // already passes a best-known title when opening the tab, but this
       // corrects it once the authoritative decrypted detail loads.
@@ -193,6 +211,7 @@ export class OrgItemViewerComponent {
       }
       this.error.set(String(e));
       this._item.set(null);
+      this.attachments.set([]);
     } finally {
       if (this.itemId() === id) {
         this.loading.set(false);

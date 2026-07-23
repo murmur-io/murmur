@@ -1,13 +1,16 @@
-import { Injectable } from "@angular/core";
+import { DestroyRef, Injectable, inject } from "@angular/core";
+
+const STOP_FLUSH_DEADLINE_MS = 2_000;
 
 /**
  * A flush provider — the embedded companion note editor registers one of these
  * while it is mounted during a recording. `flush()` MUST force any pending
- * (debounced) save to the backend NOW and resolve only once that DB write has
- * completed. It must never reject (the recorder finalize path awaits it and a
- * flush failure must not block Stop).
+ * (debounced) save to the backend NOW. The service waits for it only within a
+ * bounded deadline; failure or a wedged provider must never block Stop. The boolean
+ * result is a durability witness: only `true` allows the backend to delete an
+ * apparently-empty companion stub.
  */
-export type FlushProvider = () => Promise<void>;
+export type FlushProvider = () => Promise<boolean>;
 
 /**
  * FLUSH-BEFORE-FINALIZE seam (root-cause fix, 2026-07-17).
@@ -26,14 +29,23 @@ export type FlushProvider = () => Promise<void>;
  * `core/` and MUST NOT import a feature component — that would be an import cycle)
  * DURABLY flush the live companion editor's pending edits BEFORE it calls
  * `stop_recording`. The embedded editor {@link register}s its `flushPendingSave`
- * while mounted; `RecorderStore.stop()` awaits {@link flush} up front. The delete-if-
- * empty predicate is left intact (it is correct) — the flush makes the DB current
- * before emptiness is ever evaluated.
+ * while mounted; `RecorderStore.stop()` awaits {@link flush} up front and passes its
+ * boolean durability witness to Rust. The backend evaluates delete-if-empty only for
+ * an explicit `true`; timeout/failure preserves the row for a possible late save.
  *
  * A root singleton so the ONE live editor instance and the recorder store share it.
  */
 @Injectable({ providedIn: "root" })
 export class RecordingFlushService {
+  private readonly destroyRef = inject(DestroyRef);
+  private readonly timers = new Set<ReturnType<typeof setTimeout>>();
+
+  constructor() {
+    this.destroyRef.onDestroy(() => {
+      for (const timer of this.timers) clearTimeout(timer);
+      this.timers.clear();
+    });
+  }
   /**
    * The currently-registered flush provider (the live embedded companion editor),
    * or null when no such editor is mounted. At most one is registered at a time —
@@ -60,23 +72,40 @@ export class RecordingFlushService {
   }
 
   /**
-   * DURABLY flush the registered companion editor's pending edits and resolve once
-   * the DB write has completed. A no-op (resolves immediately) when no editor is
-   * registered. Never rejects: a flush failure is swallowed here so the recorder's
-   * Stop path can always proceed to `stop_recording` — the editor's own save chain
-   * has already surfaced any real error to the user, and blocking Stop would be worse
-   * than a best-effort flush.
+   * Ask the registered editor to durably flush, but wait at most two seconds. Returns
+   * `true` only when the local webview has a registered provider and it explicitly
+   * confirmed a durable save before the deadline. A fulfilled `false` is still a
+   * failed witness (for example, the editor exhausted its bounded save retry). When
+   * no provider is registered, this also returns `false`: another Murmur webview may
+   * own the editor, so absence here is not a global durability proof.
+   * Never rejects: failure, timeout, or a wedged provider returns `false`, causing
+   * Stop to preserve the companion stub while a late save remains free to land safely.
    */
-  async flush(): Promise<void> {
+  async flush(): Promise<boolean> {
     const provider = this.provider;
     if (!provider) {
-      return;
+      return false;
     }
+    let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      await provider();
+      const deadline = new Promise<boolean>((resolve) => {
+        timer = setTimeout(() => resolve(false), STOP_FLUSH_DEADLINE_MS);
+        this.timers.add(timer);
+      });
+      return await Promise.race([
+        provider().then(
+          (completed) => completed,
+          () => false,
+        ),
+        deadline,
+      ]);
     } catch {
-      // Never block Stop on a flush failure — the editor's save chain owns error
-      // surfacing; this is a best-effort last write before finalize.
+      return false;
+    } finally {
+      if (timer !== undefined) {
+        clearTimeout(timer);
+        this.timers.delete(timer);
+      }
     }
   }
 }

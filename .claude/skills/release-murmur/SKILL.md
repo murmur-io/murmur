@@ -52,7 +52,7 @@ cd /Users/jakubgawronski/Projects/meetnotes
 git rev-parse --abbrev-ref HEAD            # confirm a feature branch, NOT murmur/main
 gh auth status                            # confirm Active account: JakubGawr
 git log -1 --format='%an <%ae>'           # confirm QueaT <kgm004a@gmail.com>
-bash scripts/ci.sh                        # the full gate — must end "✅ CI: all gates green"
+scripts/agent-resource-run -- bash scripts/ci.sh  # must end "✅ CI: all gates green"
 ```
 
 `scripts/ci.sh` runs: swiftc typecheck of the ScreenCaptureKit sidecar → `cargo clippy
@@ -89,14 +89,14 @@ Then **re-pin `Cargo.lock`** (the `murmur` package entry must match, or the buil
 drifts):
 
 ```bash
-( cd src-tauri && cargo update -p murmur --precise "$NEW" )
-grep -A1 '^name = "murmur"' src-tauri/Cargo.lock   # confirm version = "<NEW>"
+scripts/agent-resource-run --chdir src-tauri -- cargo update -p murmur --precise "$NEW"
+grep -A1 '^name = "murmur"' Cargo.lock   # workspace-root lock; confirm version = "<NEW>"
 ```
 
 ## Stage 3 — Commit as QueaT (no Claude trailers)
 
 ```bash
-git add package.json src-tauri/tauri.conf.json src-tauri/Cargo.toml src-tauri/Cargo.lock
+git add package.json src-tauri/tauri.conf.json src-tauri/Cargo.toml Cargo.lock
 git commit -m "chore(release): bump version to $NEW"
 git log -1 --format='%an <%ae>%n%b'   # author QueaT, body has NO Co-Authored-By / Claude
 ```
@@ -136,25 +136,27 @@ rustup target add aarch64-apple-darwin x86_64-apple-darwin
 The running `tauri dev` (from `/tauri-dev`) holds the `target` cargo lock (at the WORKSPACE
 ROOT since the brain-sidecar extraction made this a virtual workspace) — a release build blocks on it.
 
-```bash
-pkill -f 'tauri dev' ; pkill -x Murmur ; pkill -f 'target/debug/Murmur' || true
-```
+Do not use `pkill`, `killall`, or kill a process merely because it is named Murmur; that can
+terminate the installed app or another task. Inspect the exact port/process owners and stop only a
+PID recorded as owned by the current dev task. If ownership cannot be proved, return `BLOCKED` and
+ask the user to quit that process interactively before continuing.
 
 ## Stage 7 — Universal build
 
 The full product IS the default build. The on-device brain (mistralrs) now lives in the
-`crates/murmur-brain` workspace member, compiled to the `meetnotes-brain` helper; the embedder/NER
+`crates/murmur-brain` workspace member, compiled to the `murmur-brain` helper; the embedder/NER
 (candle) are always compiled in the app crate and activate at runtime on model-presence. NO
 `--features` flag. `MISTRALRS_METAL_PRECOMPILE=0` is baked into the WORKSPACE-ROOT `.cargo/config.toml
 [env]` (moved there so the brain member inherits it; CLT-only Mac → defer Metal-shader compile to
 first run); keep it on the command line too as a guard. The `beforeBuildCommand` builds
-`meetnotes-brain` universal (both arches + `lipo`) into `src-tauri/binaries/` before the app compiles.
+`murmur-brain` universal (both arches + `lipo`) into `src-tauri/binaries/` before the app compiles.
 
 ```bash
 source "$HOME/.cargo/env"
-MISTRALRS_METAL_PRECOMPILE=0 npx tauri build --target universal-apple-darwin --bundles app
+MISTRALRS_METAL_PRECOMPILE=0 scripts/agent-resource-run -- \
+  npx tauri build --target universal-apple-darwin --bundles app
 APP="target/universal-apple-darwin/release/bundle/macos/Murmur.app"   # target is at the workspace ROOT now
-lipo -archs "$APP/Contents/Resources/meetnotes-brain"   # NEW: MUST also print x86_64 arm64 (the brain helper)
+lipo -archs "$APP/Contents/Resources/murmur-brain"   # MUST also print x86_64 arm64 (the brain helper)
 lipo -archs "$APP/Contents/MacOS/Murmur"     # MUST print: x86_64 arm64
 ```
 
@@ -165,17 +167,10 @@ lipo -archs "$APP/Contents/MacOS/Murmur"     # MUST print: x86_64 arm64
 > name string to `codesign --sign` fails with **"no identity found."** Resolve the
 > 40-char SHA-1 **hash** and sign with that.
 
-```bash
-HASH=$(security find-identity -v -p codesigning \
-        | grep 'Developer ID Application' | head -1 | awk '{print $2}')
-echo "signing identity: $HASH"   # 40-hex; non-empty or STOP (cert missing)
-
-codesign --force --deep --options runtime --timestamp \
-  --entitlements src-tauri/entitlements.plist --sign "$HASH" "$APP"
-
-codesign --verify --deep --strict --verbose=2 "$APP"
-# expect: flags=0x10000(runtime) ; Authority=Developer ID Application: … (BVF778E5QD)
-```
+The agent shell must never run `security find-identity` or another Keychain CLI. The user supplies
+the already-known 40-hex identity hash as `DEVELOPER_ID` from an interactive terminal. Use
+`scripts/macos-sign-notarize.sh`; it signs every nested helper first and then seals the app without
+`codesign --deep`. Stop if `DEVELOPER_ID` is absent or is not the intended Developer ID identity.
 
 `src-tauri/entitlements.plist` (hardened-runtime) is REQUIRED here — it grants
 `allow-jit` + `allow-unsigned-executable-memory` (WKWebView JS engine),
@@ -213,18 +208,11 @@ spctl -a -vvv -t open --context context:primary-signature "$DMG"
 # expect: source=Notarized Developer ID ; accepted
 ```
 
-> **CALLOUT — `scripts/macos-sign-notarize.sh` automates stages 7→10** (build + sign +
-> DMG + notarize + staple + spctl) and reads `VERSION` from `tauri.conf.json`. **But** it
-> signs by `$DEVELOPER_ID` *name* — prefer the hash. Either edit it to use `$HASH` or run
-> stages 7–10 by hand. Env it expects: `DEVELOPER_ID="Developer ID Application: … (BVF778E5QD)"`
-> plus `NOTARY_PROFILE` (or `APPLE_ID` + `APPLE_PASSWORD` + `APPLE_TEAM_ID`).
-
-> **CALLOUT — signed-but-UN-notarized is still shippable.** If Apple notary creds aren't
-> available, a **Developer-ID-signed** (hardened-runtime) build is enough to distribute —
-> users do **first launch: right-click → Open** once. It is ALSO enough to live-test Touch
-> ID + lock-at-rest + screen-share auto-relock, because those need only a **stable code
-> signature** (each rebuilt *dev* binary has a new ad-hoc signature → re-prompts; a
-> Developer-ID signature is stable). Note the right-click→Open caveat in the release body.
+> **CALLOUT — `scripts/macos-sign-notarize.sh` is the authoritative stages 7→10 path.** It
+> reads the version from `tauri.conf.json`, accepts the user-supplied identity hash in
+> `DEVELOPER_ID`, signs inside-out, notarizes with `NOTARY_PROFILE=murmur`, staples, and checks
+> `spctl`. There is no signed-only fallback: if notarization or stapling is not proven, STOP and
+> do not publish.
 
 ## Stage 11 — Publish the GitHub release
 
@@ -237,15 +225,12 @@ gh release create "v$VER" -R murmur-io/murmur --target murmur --latest \
 gh release upload "v$VER" -R murmur-io/murmur "$DMG" --clobber
 ```
 
-If the DMG is signed but not yet notarized, add to `--notes`:
-`First launch: right-click the app → Open (Developer-ID signed, notarization pending).`
-
 ## Post-release verification
 
 ```bash
 gh release view "v$VER" -R murmur-io/murmur          # asset attached, marked Latest
 git tag --list | tail -3                              # v$VER present
-spctl -a -vvv -t open --context context:primary-signature "$DMG"   # if notarized
+spctl -a -vvv -t open --context context:primary-signature "$DMG"   # MUST say Notarized Developer ID
 ```
 
 ---

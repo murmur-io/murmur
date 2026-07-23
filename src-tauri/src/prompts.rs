@@ -36,7 +36,8 @@ pub const TIER1_SUFFIX: &str = "SCOPE — CURRENT MEETING ONLY: Answer STRICTLY 
 /// NOT reachable at this tier (it is Tier-3/Connectors-class, `tools::AssistantScope::allows`), so the
 /// steering here is to escalate rather than give up — the ACTUAL "also try org" instruction lives in
 /// [`TIER3_SUFFIX`], the tier that can actually call it.
-pub const TIER2_SUFFIX: &str = "SCOPE — YOUR VAULT: Answer from the user's OWN saved meetings and notes, \
+pub const TIER2_SUFFIX: &str =
+    "SCOPE — YOUR VAULT: Answer from the user's OWN saved meetings and notes, \
     using the gated vault search tools to ground your answer. Cite meetings by their [[Title]] \
     wikilink. If — and only if — the answer is NOT in the user's vault (it needs the web, Jira, \
     Slack, the calendar, or your organization's Shared Brain), reply with EXACTLY this JSON and \
@@ -97,7 +98,10 @@ pub const LIVE_BULLETS_SYSTEM: &str = "You maintain RUNNING NOTES for a meeting 
 pub fn live_bullets_user(previous_bullets: &str, delta: &str) -> String {
     let prev = previous_bullets.trim();
     let prev_block = if prev.is_empty() { "(none yet)" } else { prev };
-    format!("NOTES SO FAR:\n{prev_block}\n\nNEW TRANSCRIPT FRAGMENT:\n{}", delta.trim())
+    format!(
+        "NOTES SO FAR:\n{prev_block}\n\nNEW TRANSCRIPT FRAGMENT:\n{}",
+        delta.trim()
+    )
 }
 
 #[cfg(test)]

@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://murmurnotes.io/schemas/development-review-v1.json",
+  "title": "Murmur independent review",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["verdict", "summary", "requirements_covered", "findings"],
+  "properties": {
+    "verdict": { "enum": ["PASS", "FAIL", "BLOCKED"] },
+    "summary": { "type": "string" },
+    "requirements_covered": { "type": "array", "items": { "type": "string" } },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["severity", "file", "evidence", "required_fix"],
+        "properties": {
+          "severity": { "enum": ["BLOCKER", "MAJOR", "MINOR", "INFO"] },
+          "file": { "type": "string" },
+          "evidence": { "type": "string" },
+          "required_fix": { "type": "string" }
+        }
+      }
+    }
+  }
+}

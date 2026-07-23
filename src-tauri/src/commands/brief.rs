@@ -33,6 +33,7 @@ pub async fn generate_digest(
     days: i64,
 ) -> Result<DigestResult, AppError> {
     let days = days.clamp(1, 90);
+    let visibility = capture_content_visibility_snapshot(state.inner());
     let config = {
         state
             .config
@@ -90,11 +91,20 @@ pub async fn generate_digest(
         )));
     }
     let range_label = format!("the last {days} days");
-    let provider = crate::summarize::provider_for(crate::summarize::roles::Role::Notes, &config, &state.heavy_inference)?;
+    let provider = crate::summarize::provider_for(
+        crate::summarize::roles::Role::Notes,
+        &config,
+        &state.heavy_inference,
+    )?;
     let (system, user) =
         crate::summarize::digest::build_digest_prompt(&corpus, &range_label, &config.note_language);
     let markdown = provider.complete(&system, &user).await?;
 
+    // The digest is derived from a multi-folder corpus. Revalidate and keep the lifecycle guard
+    // through vault publication so a relock cannot purge exports and then be followed by this late
+    // plaintext write.
+    let _lifecycle = lifecycle_guard(state.inner());
+    require_current_content_visibility_snapshot_under_lifecycle(state.inner(), visibility)?;
     let exported_path = match config.vault_path.as_deref().filter(|p| !p.is_empty()) {
         Some(vault) => {
             let now = chrono::Utc::now().to_rfc3339();
@@ -170,7 +180,9 @@ pub fn create_brief_schedule(
         hour_local,
         minute_local,
         scope_days: scope_days.unwrap_or(7),
-        prompt_hint: prompt_hint.map(|h| h.trim().to_string()).filter(|h| !h.is_empty()),
+        prompt_hint: prompt_hint
+            .map(|h| h.trim().to_string())
+            .filter(|h| !h.is_empty()),
         enabled: true,
         last_run_at: None,
         created_at: chrono::Utc::now().to_rfc3339(),
@@ -222,7 +234,9 @@ pub fn accept_brief(state: State<'_, AppState>, run_id: String) -> Result<String
         .get_brief_run(&run_id)?
         .ok_or_else(|| AppError::InvalidArg(format!("no brief run {run_id}")))?;
     if run.status != "pending" {
-        return Err(AppError::InvalidArg("this brief was already handled".into()));
+        return Err(AppError::InvalidArg(
+            "this brief was already handled".into(),
+        ));
     }
     if run.note_md.trim().is_empty() {
         return Err(AppError::InvalidArg("this brief has no content".into()));
@@ -254,4 +268,3 @@ pub fn accept_brief(state: State<'_, AppState>, run_id: String) -> Result<String
 pub fn dismiss_brief(state: State<'_, AppState>, run_id: String) -> Result<(), AppError> {
     state.db.delete_brief_run(&run_id)
 }
-

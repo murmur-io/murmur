@@ -355,8 +355,7 @@ fn content_tokens(s: &str) -> HashSet<String> {
 /// them — and their stems (`won`, `can`) are common affirmative words we must not flag.
 const NEGATOR_TOKENS: &[&str] = &[
     // English
-    "not", "no", "never", "none", "cannot",
-    // Polish
+    "not", "no", "never", "none", "cannot", // Polish
     "nie", "nigdy", "żaden", "żadna", "żadne", "bez",
 ];
 
@@ -739,8 +738,14 @@ mod tests {
 
         assert_eq!(out.len(), 1, "exactly one claim line aligns; got:\n{out:?}");
         let a = &out[0];
-        assert_eq!(a.claim_index, 2, "claim_index points at the real claim line");
-        assert_eq!(a.segment_id, 7, "aligned to the LOGIN segment, not migration");
+        assert_eq!(
+            a.claim_index, 2,
+            "claim_index points at the real claim line"
+        );
+        assert_eq!(
+            a.segment_id, 7,
+            "aligned to the LOGIN segment, not migration"
+        );
         assert_eq!(a.start_s, 12.5, "raw-seconds start seek target");
         assert_eq!(a.end_s, 18.0);
         assert_eq!(a.speaker.as_deref(), Some("me"));
@@ -764,10 +769,9 @@ mod tests {
             "we should probably revisit the pricing tiers next quarter",
         )];
         // Shares only "quarter" (1 of 4 distinct content tokens after stopword-strip) → ratio < 0.5.
-        let lines: Vec<&str> =
-            "The acquisition negotiations concluded successfully this quarter."
-                .split('\n')
-                .collect();
+        let lines: Vec<&str> = "The acquisition negotiations concluded successfully this quarter."
+            .split('\n')
+            .collect();
         let out = align_claims_to_segments(&lines, &segments);
         assert!(
             out.is_empty(),
@@ -781,8 +785,22 @@ mod tests {
     fn alignment_is_deterministic_and_ties_pick_earliest() {
         // Both segments overlap the claim on the SAME two tokens (roadmap, budget) — a tie.
         let segments = vec![
-            seg_full(3, 1.0, 4.0, "me", None, "we reviewed the roadmap and the budget"),
-            seg_full(4, 30.0, 34.0, "others", None, "roadmap and budget again later on"),
+            seg_full(
+                3,
+                1.0,
+                4.0,
+                "me",
+                None,
+                "we reviewed the roadmap and the budget",
+            ),
+            seg_full(
+                4,
+                30.0,
+                34.0,
+                "others",
+                None,
+                "roadmap and budget again later on",
+            ),
         ];
         let lines: Vec<&str> = "We reviewed the roadmap and the budget in detail."
             .split('\n')
@@ -812,7 +830,11 @@ mod tests {
         let note = "# Heading with shipped invoice export reporting words\n\n> a blockquote mentioning shipped invoice export dashboard\n\n[[Shipped Invoice Export Reporting Note]]\n\n- ok\n\n```\nshipped invoice export reporting dashboard code\n```\n\nWe shipped the invoice export and the reporting dashboard.";
         let lines: Vec<&str> = note.split('\n').collect();
         let out = align_claims_to_segments(&lines, &segments);
-        assert_eq!(out.len(), 1, "only the real prose claim aligns; got:\n{out:?}");
+        assert_eq!(
+            out.len(),
+            1,
+            "only the real prose claim aligns; got:\n{out:?}"
+        );
         assert_eq!(
             lines[out[0].claim_index].trim(),
             "We shipped the invoice export and the reporting dashboard."

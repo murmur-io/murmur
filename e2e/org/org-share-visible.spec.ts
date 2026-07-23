@@ -171,6 +171,9 @@ test.describe("Org share — browse + picker (mocked IPC)", () => {
         chunkCount: 1,
         scrubbed: { emails: 0, phones: 0, cards: 0 },
         scrub: true,
+        attachmentCount: 0,
+        attachmentBytes: 0,
+        imagePixelsScrubbed: false,
       }),
       share_meeting_to_org: (args: unknown) => {
         (window as unknown as { __shareCalls: unknown[] }).__shareCalls.push(
