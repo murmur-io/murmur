@@ -108,10 +108,13 @@ at launch ("Rust cannot catch foreign exceptions"). See the header doc in
 - If an Objective-C `msg_send!` (objc2) is genuinely unavoidable, GUARD it first with
   `respondsToSelector:` / `class_getInstanceMethod` and have a safe fallback. Never send a
   selector you have not proven the receiver implements on the target OS version.
-- Biometric (`biometric.rs`, objc2 `LAContext`) deliberately GRACEFULLY DEGRADES: FFI failure,
-  no Touch ID hardware, unsigned/CI binary → `Ok(true)` with a warning, never a panic
-  (`biometric.rs:7`/`29`/`46`). Touch ID + lock-at-rest + screen-share only TRULY verify on a
-  signed build — typecheck/`cargo test` is not proof for FFI/permission code.
+- Biometric/user-presence release lives in `secrets/keychain.rs`, using Security.framework
+  `SecAccessControl` + `SecItemCopyMatching` rather than objc2/`LAContext`.
+  `MacKekStore::read_biometric` maps cancellation/auth/UI-context failures to `AppError`
+  and never treats them as authoritative absence. The DEBUG-only `MURMUR_DEV_KEK` hatch bypasses
+  the Keychain for dev unlock/recovery, while strict destructive absence checks fail closed
+  (`dev_kek_candidates`). Touch ID + lock-at-rest + screen-share only TRULY verify on a signed
+  build — typecheck/`cargo test` is not proof for FFI/permission code.
 
 ## 7b. CSP in `tauri.conf.json` — keep `style-src` nonce-FREE or Angular styles vanish in prod
 

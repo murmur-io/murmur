@@ -26,7 +26,7 @@ builder and whether the lock-security review is mandatory:
   settings,onboarding,bar,analytics}`), services (`core/ipc.service.ts`, `folders.service.ts`,
   `toast.service.ts`, `screen-share.service.ts`), `core/models.ts`.
 - **Lock / crypto / visibility-gated** — ANY change to `crypto.rs`, `secrets/keychain.rs`,
-  `biometric.rs`, `screenshare.rs`, `storage/migration.rs`, the unlock/seal/visibility path,
+  `screenshare.rs`, `storage/migration.rs`, the unlock/seal/visibility path,
   or content-read gating ⇒ the **lock-security review is MANDATORY** in stage 4.
 
 ### 2. Create the executable task contract
