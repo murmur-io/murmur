@@ -29,14 +29,17 @@ builder and whether the lock-security review is mandatory:
   `biometric.rs`, `screenshare.rs`, `storage/migration.rs`, the unlock/seal/visibility path,
   or content-read gating ⇒ the **lock-security review is MANDATORY** in stage 4.
 
-### 2. Plan (optionally via the Workflow tooling)
+### 2. Create the executable task contract
 For a multi-part change, write a short plan: the exact files/symbols, the IPC seam (new Tauri
 command name + the `ipc.service.ts` call), data shape (`core/models.ts` ↔ Rust DTO), and the
-verification you'll demand. An orchestrator may drive this with the **Workflow / agent-team
-tooling** (`TaskCreate`/`TaskUpdate`/`Monitor`) — e.g. fan out a backend builder and an FE
-builder in parallel when the seam is agreed up front, then converge on the verifier. Keep the
-plan honest about what a dev run *can't* prove (Touch ID / lock-at-rest / screen-share need a
-signed build — see `/tauri-dev`).
+verification you'll demand. Every mutation task is initialized through `scripts/agent-harness init`:
+give it explicit owned paths, risk flags and deterministic checks. The harness creates the worktree;
+never point a writer at the shared primary checkout. Then run `scripts/agent-harness run <task-id>`.
+Unless the user explicitly chooses otherwise, the checked-in harness policy selects **Claude as
+writer and Codex as reviewer**; do not silently reverse that pair in the orchestration prompt.
+It owns the writer → checks → fresh spec review → fresh adversarial/risk review → bounded repair
+state machine. Keep the contract honest about what a dev run *can't* prove (Touch ID / lock-at-rest /
+screen-share need a signed build — see `/tauri-dev`).
 
 ### 3. Build — to the project conventions (non-negotiable)
 Dispatch the work to the matching builder role (today only `murmur-researcher` exists as a
@@ -104,23 +107,19 @@ signs off does the code/adversarial pass begin.
 
 A verifier finding sends it BACK to stage 3. Do not advance on the author's say-so.
 
-**Record the verdict as evidence (Phase-3 gate).** Each verifier writes a schema'd JSON to
-`.codex/tmp/<task>/` (gitignored scratch) so the Definition-of-Done becomes machine-checkable, not
-prose the committer eyeballs:
-- adversarial-verifier → `adversarial-verify.json` = `{"verdict":"PASS"|"FAIL","findings":[…],"summary":"…"}`
-- lock-security-reviewer (when stage-1 flagged lock/crypto/visibility) → `lock-security.json` (same
-  shape) AND `touch .codex/tmp/<task>/.lock-touched` so the guard knows the lock gate is required.
-- Optional observability: `.codex/lib/trace-span.sh <task> verify adversarial-verify PASS adversarial-verify.json`.
-
-`.codex/hooks/finish-guard.sh` reads these on `git commit` (advisory by default; set
-`MURMUR_FINISH_GUARD=enforce` to hard-block a commit whose gates aren't PASS).
+**The runner records the verdict; reviewers do not write their own PASS files.** The canonical
+attestation lives under the shared Git common directory at
+`.git/agent-harness/tasks/<task>/attestation.json`. It binds the contract/instruction/base/tree/staged
+diff hashes, CLI/model identity, every command exit/log hash and each fresh review. The commit hook
+recomputes the staged diff and automatic risk classification; any edit, missing review or failed
+check invalidates PASS.
 
 ### 5. Gates green
 ```bash
-source "$HOME/.cargo/env"
-( cd src-tauri && cargo test --lib )    # iterate loop
-npx ng lint && npx ng build
-bash scripts/ci.sh                      # full gate before commit (clippy + tests + lint + build + headless E2E)
+scripts/agent-resource-run --chdir src-tauri -- cargo test --lib
+npx ng lint
+scripts/agent-resource-run -- npx ng build
+scripts/agent-resource-run -- bash scripts/ci.sh
 ```
 `scripts/ci.sh` must end `✅ CI: all gates green`. (Reminder: `clippy --all-targets` belongs
 in `ci.sh`, NOT the inner loop — see `/tauri-dev`.)
@@ -134,18 +133,24 @@ lesson" instead of a re-paid one.
 
 ### 6. Commit as QueaT
 ```bash
-git checkout -b feat/<slug>      # never commit on the murmur trunk (block-bash.sh refuses trunk push)
-git add -A && git commit -m "<type>(<scope>): <subject>"
-git log -1 --format='%an <%ae>'  # MUST be QueaT <kgm004a@gmail.com>
+# Commit through the runner — never from the shared checkout.
+scripts/agent-harness status <task-id>
+scripts/agent-harness verify-attestation <task-id>
+scripts/agent-harness commit <task-id> -m "<type>(<scope>): <subject>"
+git -C ../.murmur-agent-tasks/<task-id>/meetnotes log -1 --format='%an <%ae>'
+# MUST be QueaT <kgm004a@gmail.com>
 ```
-**No `Co-Authored-By: Codex` / no Codex trailers.** Conventional-commit style
+Never use `git add -A` in a shared repository. **No `Co-Authored-By: Codex` / no Codex trailers.** Conventional-commit style
 (`feat`/`fix`/`chore(scope)`), matching the existing log.
 
 ### 7. PR to the `murmur` trunk (never direct push)
 ```bash
-git push -u origin feat/<slug>
-gh pr create -R murmur-io/murmur --base murmur --head feat/<slug> \
+git -C ../.murmur-agent-tasks/<task-id>/meetnotes push -u origin agent/<task-id>
+gh pr create -R murmur-io/murmur --base murmur --head agent/<task-id> \
   --title "<type>(<scope>): <subject>" --body "<what + how verified>"
+
+# From the primary checkout after the exact task commit exists (before or after PR merge):
+scripts/agent-harness close <task-id>
 ```
 `gh` active account MUST be `JakubGawr`. Base is `murmur` (the trunk) via PR — direct
 `git push origin murmur` is blocked by the environment guard. If this feature is a release,

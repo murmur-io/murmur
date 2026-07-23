@@ -7,8 +7,8 @@
 # from the environment — nothing is hardcoded.
 #
 # ── Required environment ─────────────────────────────────────────────────────
-#   DEVELOPER_ID   e.g. "Developer ID Application: Jakub Gawronski (TEAMID)"
-#                  (find it: `security find-identity -v -p codesigning`)
+#   DEVELOPER_ID   40-hex identity hash supplied by the user from an interactive terminal.
+#                  The agent shell must never inspect the Keychain with `security`.
 # Notarization auth — EITHER a stored profile:
 #   NOTARY_PROFILE name of a notarytool keychain profile, created once with:
 #     xcrun notarytool store-credentials "$NOTARY_PROFILE" \
@@ -18,7 +18,7 @@
 #   APPLE_PASSWORD  an app-specific password (appleid.apple.com → App-Specific Passwords)
 #   APPLE_TEAM_ID   your 10-char Team ID
 #
-# Usage:  DEVELOPER_ID="Developer ID Application: … (TEAMID)" NOTARY_PROFILE=murmur \
+# Usage:  DEVELOPER_ID="<user-supplied-40-hex-hash>" NOTARY_PROFILE=murmur \
 #           scripts/macos-sign-notarize.sh
 set -euo pipefail
 
@@ -34,7 +34,11 @@ VERSION="$(grep -m1 '"version"' "$ROOT/src-tauri/tauri.conf.json" | sed -E 's/.*
 APP="$ROOT/target/universal-apple-darwin/release/bundle/macos/Murmur.app"
 OUT_DMG="$HOME/Desktop/Murmur-$VERSION.dmg"
 
-: "${DEVELOPER_ID:?set DEVELOPER_ID='Developer ID Application: Your Name (TEAMID)' — see security find-identity -v -p codesigning}"
+: "${DEVELOPER_ID:?set DEVELOPER_ID to the user-supplied 40-hex Developer ID identity hash}"
+if ! printf '%s\n' "$DEVELOPER_ID" | grep -Eq '^[0-9A-Fa-f]{40}$'; then
+  echo "DEVELOPER_ID must be the exact user-supplied 40-hex identity hash" >&2
+  exit 1
+fi
 [ -f "$ENTITLEMENTS" ] || { echo "missing $ENTITLEMENTS" >&2; exit 1; }
 [ -f "$ENTITLEMENTS_APP" ] || { echo "missing $ENTITLEMENTS_APP" >&2; exit 1; }
 [ -f "$PROFILE" ] || { echo "missing provisioning profile $PROFILE" >&2; exit 1; }
@@ -43,7 +47,13 @@ OUT_DMG="$HOME/Desktop/Murmur-$VERSION.dmg"
 # keychain-access-groups entitlement, authorized ONLY by this embedded provisioning profile. A
 # missing/EXPIRED/mismatched profile AMFI-kills launch even though codesign + notarization pass
 # (the 0.7.1 incident). Fail the build NOW rather than ship a bundle that dies on the user's Mac.
-PROFILE_EXP="$(security cms -D -i "$PROFILE" 2>/dev/null | plutil -extract ExpirationDate raw - 2>/dev/null || true)"
+PROFILE_PLIST="$(mktemp -t murmur-profile.XXXXXX)"
+trap 'rm -f "$PROFILE_PLIST"' EXIT
+if ! /usr/bin/openssl smime -verify -inform DER -noverify -in "$PROFILE" -out "$PROFILE_PLIST" >/dev/null 2>&1; then
+  echo "could not decode provisioning profile without Keychain access" >&2
+  exit 1
+fi
+PROFILE_EXP="$(plutil -extract ExpirationDate raw "$PROFILE_PLIST" 2>/dev/null || true)"
 if [ -n "$PROFILE_EXP" ]; then
   # ExpirationDate is ISO-8601 (e.g. 2027-01-01T00:00:00Z). Compare epoch seconds.
   EXP_EPOCH="$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$PROFILE_EXP" +%s 2>/dev/null || echo 0)"
@@ -73,6 +83,20 @@ echo "1) Building universal (.app, arm64 + x86_64)…"
 npx tauri build --target universal-apple-darwin --bundles app
 [ -d "$APP" ] || { echo "universal .app not found at $APP" >&2; exit 1; }
 
+require_universal_macho() {
+  local binary="$1" arches
+  [ -f "$binary" ] || { echo "required universal binary missing: $binary" >&2; exit 1; }
+  arches="$(lipo -archs "$binary")" || { echo "lipo could not inspect: $binary" >&2; exit 1; }
+  case " $arches " in *" arm64 "*) ;; *) echo "arm64 slice missing: $binary ($arches)" >&2; exit 1 ;; esac
+  case " $arches " in *" x86_64 "*) ;; *) echo "x86_64 slice missing: $binary ($arches)" >&2; exit 1 ;; esac
+}
+require_universal_macho "$APP/Contents/MacOS/Murmur"
+for REQUIRED_HELPER in \
+  meetnotes-sysaudio meetnotes-audiocap meetnotes-aeccap meetnotes-calendar murmur-brain; do
+  require_universal_macho "$APP/Contents/Resources/$REQUIRED_HELPER"
+done
+echo "   verified universal slices for app + every bundled helper"
+
 # Embed the Developer-ID provisioning profile that AUTHORIZES keychain-access-groups (the
 # data-protection keychain holding the biometric master KEK + account MK). Without it, that restricted
 # entitlement has no authorization and the kernel AMFI-kills launch even though codesign + notarization
@@ -84,10 +108,10 @@ echo "2) Codesigning INSIDE-OUT (nested helpers first, app last — NO --deep)�
 # --deep mis-signs nested Mach-Os and breaks notarization once a helper is bundled
 # (deprecated since macOS 13; reproduces Tauri #11992). Sign each embedded sidecar FIRST
 # with hardened runtime + timestamp, THEN seal the app bundle last.
-# Glob ALL bundled meetnotes-* sidecars (sysaudio/audiocap/aeccap/calendar/…) so a newly-added
-# helper can never be missed — a hardcoded list that omitted meetnotes-calendar is exactly what made
-# the first 0.5.0 notarization Invalid ("meetnotes-calendar: binary is not signed").
-for HELPER in "$APP/Contents/Resources/"meetnotes-*; do
+# Glob every legacy `meetnotes-*` capture helper and include the product-named `murmur-brain`
+# explicitly. A hardcoded list that omitted meetnotes-calendar is exactly what made the first 0.5.0
+# notarization Invalid ("meetnotes-calendar: binary is not signed").
+for HELPER in "$APP/Contents/Resources/"meetnotes-* "$APP/Contents/Resources/murmur-brain"; do
   if [ -f "$HELPER" ]; then
     echo "   • helper: $(basename "$HELPER")"
     codesign --force --options runtime --timestamp \
@@ -99,7 +123,12 @@ done
 # they carry NO restricted keychain entitlement (they have no profile → would be AMFI-killed).
 codesign --force --options runtime --timestamp \
   --entitlements "$ENTITLEMENTS_APP" --sign "$DEVELOPER_ID" "$APP"
-codesign --verify --deep --strict --verbose=2 "$APP"
+for HELPER in "$APP/Contents/Resources/"meetnotes-* "$APP/Contents/Resources/murmur-brain"; do
+  if [ -f "$HELPER" ]; then
+    codesign --verify --strict --verbose=2 "$HELPER"
+  fi
+done
+codesign --verify --strict --verbose=2 "$APP"
 
 # POST-SIGN ASSERTION: prove the shipped bundle actually carries the keychain-access-groups
 # entitlement AND the embedded profile — the two things whose absence silently AMFI-kills launch

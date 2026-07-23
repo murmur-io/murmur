@@ -160,7 +160,9 @@ pub fn list_assistant_threads(
 /// `extraction_reasoner()` (cloud-classified Notes provider under the default `brain_live=false`)
 /// would egress a content class users were told stays local (lock-security W2). Stub ⇒ the import
 /// extracts nothing (0 imported) — degrade, never egress.
-pub(crate) fn import_extraction_reasoner(state: &AppState) -> std::sync::Arc<dyn crate::reason::LocalReasoner> {
+pub(crate) fn import_extraction_reasoner(
+    state: &AppState,
+) -> std::sync::Arc<dyn crate::reason::LocalReasoner> {
     state.reasoner.light()
 }
 
@@ -231,6 +233,7 @@ pub(crate) fn ask_vault_agentic_attempt(
         config: &config,
         meeting_id: "",
         app: Some(app),
+        recording_token: None,
         allow_writes: false,
         note_drafts: false,
         // The Ask page is DELIBERATELY vault-wide (Phase 5 preserves it unchanged) — the FULL
@@ -267,7 +270,7 @@ pub(crate) fn ask_vault_agentic_attempt(
     // contributes no line; a listing failure degrades to the legacy prompt (never an error).
     let jit_listing = if config.ask_jit_retrieval {
         let query_vec = if config.semantic_search_enabled {
-            crate::embed::active_embedder()
+            crate::embed::active_admitted_embedder()
                 .embed_query(std::slice::from_ref(&question.to_string()))
                 .ok()
                 .and_then(|v| v.into_iter().next())
@@ -470,7 +473,7 @@ pub(crate) fn build_ask_vault_floor_prompt(
         };
         (corpus, sources)
     } else if config.semantic_search_enabled {
-        let embedder = crate::embed::active_embedder();
+        let embedder = crate::embed::active_admitted_embedder();
         // QUERY side: use the e5 `query:` prefix (asymmetric with the `passage:` index side).
         let query_vec = embedder
             .embed_query(std::slice::from_ref(&question.to_string()))?

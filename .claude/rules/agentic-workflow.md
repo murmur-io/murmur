@@ -2,22 +2,38 @@
 
 How to get maximum leverage out of the agent fleet on this project. The throughline: **the implementer never owns the verdict.** Every real bug here was caught by an *independent, adversarial* check — not by the agent that wrote the code.
 
-## When to reach for the Workflow tool
+## The executable workflow
 
-Use the **Workflow tool** (not a single inline pass) whenever work is multi-step or benefits from independent verification:
+Use `scripts/agent-harness` for every write task that is multi-step or benefits from independent verification. The runner, not chat state, owns the contract, isolated worktree, checks, reviews, bounded repairs, trace and final attestation:
 
 - **Ship a feature** → `plan → build (backend and/or FE) → adversarial verify`. See `.claude/skills/ship-feature`.
 - **Refactor / migrate** → `map the seams → change → re-verify the same behavior`.
 - **Research / design** → fan out independent angles (`murmur-researcher`) → synthesize a decision-ready brief.
 - **Release** → the `release-murmur` runbook stages can be driven as a `build → sign → notarize → publish` pipeline, or with fanned-out pre-release gates. See `.claude/skills/release-murmur`.
 
-Default shape: a **build** phase, then a **verify** phase done by a *different* agent. Backend (Rust) and FE (Angular) are usually disjoint files → run them in parallel, then serialize anything that shares a file.
+Default shape: `init → writer → checks → spec review → adversarial/risk review → max two repairs → final checks → hash-bound PASS → exact commit → PR → close`. The default vendor pair is **Claude writer → Codex reviewer**; the only supported reversal is Codex writer → Claude reviewer. Same-vendor production review and the selftest-only `fake` adapter are forbidden. Use `scripts/agent-harness commit` so the committed tree and QueaT identity are derived from the receipt. One writer owns one worktree. Parallelize read-only research; serialize writers, Cargo and anything sharing a file.
+
+## One resource lane for every Rust/full-CI process
+
+Parallel reasoning is useful; overlapping the always-compiled ML tree is not. Every agent-issued
+Cargo/rustc/full-CI command must run through the repo-global supervisor:
+
+```bash
+scripts/agent-resource-run --chdir src-tauri -- cargo test --lib
+scripts/agent-resource-run -- bash scripts/ci.sh
+```
+
+The supervisor locks Git's common directory, so linked worktrees serialize; it caps build/test
+parallelism, owns a fresh process group, and reaps descendants on timeout, signal, or normal exit.
+The executable harness uses that exact same kernel lock for its deterministic checks. Direct
+Cargo (including metadata), Cargo-launching scripts, Tauri dev/build and Angular production builds
+are blocked by the shared hook guard; text searches and lightweight lint remain available.
 
 ## The adversarial-verify discipline (the core)
 
 A change is not done because it compiles. It is done when an independent agent **tried to break it and failed**:
 
-- Run the **real gates**: `cargo test --lib` (never `clippy --all-targets` — it thrashes the openssl/sqlcipher profile and times out), `npx ng lint`, `npx ng build`.
+- Run the **real gates**: `scripts/agent-resource-run --chdir src-tauri -- cargo test --lib` (never bare `clippy --all-targets` — it thrashes the openssl/sqlcipher profile and times out), `npx ng lint`, `scripts/agent-resource-run -- npx ng build`.
 - **Live-reproduce**, don't trust unit tests at the FE↔BE seam: drive the running app at `http://localhost:1420` via Playwright MCP with a mocked `window.__TAURI_INTERNALS__.invoke`; or launch the dev app and watch `/tmp/murmur-dev.log` for a clean boot (no abort).
 - **RED before GREEN.** A bug fix needs a regression that fails on the old code and passes on the new. A test that passes against unpatched code didn't capture the bug.
 - **Hunt the failure modes this project actually ships** (every one slipped past a green build+lint):

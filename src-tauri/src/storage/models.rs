@@ -1505,6 +1505,391 @@ pub struct OrgShareRow {
     pub updated_at: String,
 }
 
+/// Durable lifecycle of one physical recording attempt. Only verified-empty PREPARED attempts may
+/// take the exceptional direct PREPARED -> RETIRED abandonment edge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecordingGenerationState {
+    Prepared,
+    Capturing,
+    Finalized,
+    Archived,
+    Retired,
+}
+
+impl RecordingGenerationState {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Prepared => "PREPARED",
+            Self::Capturing => "CAPTURING",
+            Self::Finalized => "FINALIZED",
+            Self::Archived => "ARCHIVED",
+            Self::Retired => "RETIRED",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> crate::error::Result<Self> {
+        match value {
+            "PREPARED" => Ok(Self::Prepared),
+            "CAPTURING" => Ok(Self::Capturing),
+            "FINALIZED" => Ok(Self::Finalized),
+            "ARCHIVED" => Ok(Self::Archived),
+            "RETIRED" => Ok(Self::Retired),
+            _ => Err(crate::error::AppError::Storage(
+                "invalid recording generation state".into(),
+            )),
+        }
+    }
+}
+
+/// Allowlisted, content-free reason code. OS error strings and paths never enter the ledger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecordingCaptureFault {
+    MicIo,
+    SystemIo,
+    DiskFull,
+    DeviceLost,
+    Interrupted,
+}
+
+impl RecordingCaptureFault {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::MicIo => "MIC_IO",
+            Self::SystemIo => "SYSTEM_IO",
+            Self::DiskFull => "DISK_FULL",
+            Self::DeviceLost => "DEVICE_LOST",
+            Self::Interrupted => "INTERRUPTED",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> crate::error::Result<Self> {
+        match value {
+            "MIC_IO" => Ok(Self::MicIo),
+            "SYSTEM_IO" => Ok(Self::SystemIo),
+            "DISK_FULL" => Ok(Self::DiskFull),
+            "DEVICE_LOST" => Ok(Self::DeviceLost),
+            "INTERRUPTED" => Ok(Self::Interrupted),
+            _ => Err(crate::error::AppError::Storage(
+                "invalid recording capture fault code".into(),
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecordingRetirementReason {
+    Archived,
+    EmptyAbandoned,
+}
+
+impl RecordingRetirementReason {
+    pub(crate) fn parse(value: &str) -> crate::error::Result<Self> {
+        match value {
+            "ARCHIVED" => Ok(Self::Archived),
+            "EMPTY_ABANDONED" => Ok(Self::EmptyAbandoned),
+            _ => Err(crate::error::AppError::Storage(
+                "invalid recording retirement reason".into(),
+            )),
+        }
+    }
+}
+
+fn canonical_uuid(value: &str, label: &str) -> crate::error::Result<String> {
+    let parsed = uuid::Uuid::parse_str(value)
+        .map_err(|_| crate::error::AppError::InvalidArg(format!("invalid {label}")))?;
+    if parsed.is_nil() || parsed.hyphenated().to_string() != value {
+        return Err(crate::error::AppError::InvalidArg(format!(
+            "invalid {label}"
+        )));
+    }
+    Ok(value.to_owned())
+}
+
+fn canonical_uuid_v4(value: &str, label: &str) -> crate::error::Result<String> {
+    let canonical = canonical_uuid(value, label)?;
+    let parsed = uuid::Uuid::parse_str(&canonical)
+        .map_err(|_| crate::error::AppError::InvalidArg(format!("invalid {label}")))?;
+    if parsed.get_version() != Some(uuid::Version::Random) {
+        return Err(crate::error::AppError::InvalidArg(format!(
+            "invalid {label}"
+        )));
+    }
+    Ok(canonical)
+}
+
+fn safe_recording_basename(value: &str) -> crate::error::Result<String> {
+    let safe = !value.is_empty()
+        && value.len() <= 255
+        && value != "."
+        && value != ".."
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+    if !safe {
+        return Err(crate::error::AppError::InvalidArg(
+            "invalid recording artifact basename".into(),
+        ));
+    }
+    Ok(value.to_owned())
+}
+
+fn sha256_hex(value: &str) -> crate::error::Result<String> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    {
+        return Err(crate::error::AppError::InvalidArg(
+            "invalid recording artifact SHA-256".into(),
+        ));
+    }
+    Ok(value.to_owned())
+}
+
+fn checked_identity(device: u64, inode: u64) -> crate::error::Result<()> {
+    if device == 0 || inode == 0 || device > i64::MAX as u64 || inode > i64::MAX as u64 {
+        return Err(crate::error::AppError::InvalidArg(
+            "invalid recording artifact identity".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RecordingGenerationKey {
+    meeting_id: String,
+    generation_id: String,
+}
+
+impl RecordingGenerationKey {
+    pub(crate) fn new(meeting_id: &str, generation_id: &str) -> crate::error::Result<Self> {
+        Ok(Self {
+            meeting_id: canonical_uuid(meeting_id, "meeting UUID")?,
+            generation_id: canonical_uuid_v4(generation_id, "recording generation UUID")?,
+        })
+    }
+
+    pub(crate) fn fresh(meeting_id: &str) -> crate::error::Result<Self> {
+        Self::new(meeting_id, &uuid::Uuid::new_v4().hyphenated().to_string())
+    }
+
+    pub(crate) fn meeting_id(&self) -> &str {
+        &self.meeting_id
+    }
+
+    pub(crate) fn generation_id(&self) -> &str {
+        &self.generation_id
+    }
+}
+
+/// Caller-asserted identity recorded at PREPARED time. This is deliberately not named or treated
+/// as verified evidence; only the private capability types in `recording_store` carry that meaning.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RecordingMicAssertion {
+    basename: String,
+    sample_rate: u32,
+    device: u64,
+    inode: u64,
+}
+
+impl RecordingMicAssertion {
+    pub(crate) fn for_generation(
+        key: &RecordingGenerationKey,
+        sample_rate: u32,
+        device: u64,
+        inode: u64,
+    ) -> crate::error::Result<Self> {
+        checked_identity(device, inode)?;
+        if !(8_000..=384_000).contains(&sample_rate) {
+            return Err(crate::error::AppError::InvalidArg(
+                "invalid recording sample rate".into(),
+            ));
+        }
+        Ok(Self {
+            basename: safe_recording_basename(&format!("{}.mic.f32", key.generation_id()))?,
+            sample_rate,
+            device,
+            inode,
+        })
+    }
+
+    pub(crate) fn basename(&self) -> &str {
+        &self.basename
+    }
+
+    pub(crate) fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    pub(crate) fn device(&self) -> u64 {
+        self.device
+    }
+
+    pub(crate) fn inode(&self) -> u64 {
+        self.inode
+    }
+}
+
+/// Canonical artifact namespace. The role is part of the assertion, so system evidence cannot be
+/// replayed as archive evidence even if every numeric identity field were copied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecordingArtifactRole {
+    System,
+    Archive,
+}
+
+impl RecordingArtifactRole {
+    fn suffix(self) -> &'static str {
+        match self {
+            Self::System => "system.wav",
+            Self::Archive => "archive.wav",
+        }
+    }
+}
+
+/// Stored checkpoint assertion. Creation validates shape only; state transitions accept a separate
+/// private verified-evidence capability, never this freely constructible row shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RecordingCheckpointAssertion {
+    durable_frames: u64,
+    byte_len: u64,
+    sha256_prefix: String,
+}
+
+impl RecordingCheckpointAssertion {
+    pub(crate) fn new(
+        durable_frames: u64,
+        byte_len: u64,
+        sha256_prefix: &str,
+    ) -> crate::error::Result<Self> {
+        if durable_frames > (i64::MAX as u64) / 4 || byte_len > i64::MAX as u64 {
+            return Err(crate::error::AppError::InvalidArg(
+                "recording checkpoint size is too large".into(),
+            ));
+        }
+        let expected_len = durable_frames.checked_mul(4).ok_or_else(|| {
+            crate::error::AppError::InvalidArg("recording checkpoint size overflow".into())
+        })?;
+        let sha256_prefix = sha256_hex(sha256_prefix)?;
+        if byte_len != expected_len
+            || (durable_frames == 0
+                && sha256_prefix
+                    != "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+        {
+            return Err(crate::error::AppError::InvalidArg(
+                "invalid recording checkpoint assertion".into(),
+            ));
+        }
+        Ok(Self {
+            durable_frames,
+            byte_len,
+            sha256_prefix,
+        })
+    }
+
+    pub(crate) fn durable_frames(&self) -> u64 {
+        self.durable_frames
+    }
+
+    pub(crate) fn byte_len(&self) -> u64 {
+        self.byte_len
+    }
+
+    pub(crate) fn sha256_prefix(&self) -> &str {
+        &self.sha256_prefix
+    }
+}
+
+/// Stored system/archive metadata. Shape-valid but explicitly not proof of a filesystem read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RecordingArtifactAssertion {
+    role: RecordingArtifactRole,
+    basename: String,
+    device: u64,
+    inode: u64,
+    byte_len: u64,
+    sha256: String,
+}
+
+impl RecordingArtifactAssertion {
+    pub(crate) fn for_generation(
+        key: &RecordingGenerationKey,
+        role: RecordingArtifactRole,
+        device: u64,
+        inode: u64,
+        byte_len: u64,
+        sha256: &str,
+    ) -> crate::error::Result<Self> {
+        checked_identity(device, inode)?;
+        if byte_len == 0 || byte_len > i64::MAX as u64 {
+            return Err(crate::error::AppError::InvalidArg(
+                "invalid recording artifact length".into(),
+            ));
+        }
+        Ok(Self {
+            role,
+            basename: safe_recording_basename(&format!(
+                "{}.{}",
+                key.generation_id(),
+                role.suffix()
+            ))?,
+            device,
+            inode,
+            byte_len,
+            sha256: sha256_hex(sha256)?,
+        })
+    }
+
+    pub(crate) fn role(&self) -> RecordingArtifactRole {
+        self.role
+    }
+
+    pub(crate) fn basename(&self) -> &str {
+        &self.basename
+    }
+
+    pub(crate) fn device(&self) -> u64 {
+        self.device
+    }
+
+    pub(crate) fn inode(&self) -> u64 {
+        self.inode
+    }
+
+    pub(crate) fn byte_len(&self) -> u64 {
+        self.byte_len
+    }
+
+    pub(crate) fn sha256(&self) -> &str {
+        &self.sha256
+    }
+}
+
+#[allow(dead_code)] // Read by the recording coordinator in the next bounded harness slice.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct RecordingGenerationSnapshot {
+    pub(crate) key: RecordingGenerationKey,
+    pub(crate) state: RecordingGenerationState,
+    pub(crate) lease_expires_at_ms: i64,
+    pub(crate) mic: RecordingMicAssertion,
+    pub(crate) checkpoint: RecordingCheckpointAssertion,
+    pub(crate) system_artifact: Option<RecordingArtifactAssertion>,
+    pub(crate) capture_fault: Option<RecordingCaptureFault>,
+    pub(crate) archive: Option<RecordingArtifactAssertion>,
+    pub(crate) retirement_reason: Option<RecordingRetirementReason>,
+    pub(crate) created_at_ms: i64,
+    pub(crate) updated_at_ms: i64,
+    pub(crate) finalized_at_ms: Option<i64>,
+    pub(crate) archived_at_ms: Option<i64>,
+    pub(crate) retired_at_ms: Option<i64>,
+    /// Signed system-first-frame offset from mic capture start. Persisted independently of the
+    /// system artifact so CAPTURING crash recovery can reconstruct wall-clock stream alignment.
+    pub(crate) system_start_offset_micros: Option<i64>,
+    /// Durable post-note cleanup progress. Bits are owned by the recording pipeline and are
+    /// advanced only after an exact unlink plus parent-directory fsync.
+    pub(crate) cleanup_mask: u8,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -3,11 +3,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, Mutex};
 
 use crate::audio::listener::VoiceListener;
-use crate::audio::system::SystemAudioRecorder;
-use crate::audio::Recorder;
+use crate::audio::source::ActiveRecording;
 use crate::error::{AppError, Result};
 use crate::settings::AppConfig;
 use crate::storage::Db;
+
+static NEXT_MANUAL_CAPTURE_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 /// SQLite database filename inside the app-data folder.
 const DB_FILE: &str = "meetnotes.sqlite";
@@ -52,6 +53,9 @@ pub fn app_dir_name() -> &'static str {
 /// ends gracefully as "nothing_heard".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CaptureState {
+    /// Distinguishes a re-arm from the capture whose one-shot transcription is still in flight.
+    /// Content-free; used only for compare-before-clear so a stale worker cannot erase a new arm.
+    pub generation: u64,
     /// Remaining live ticks of BACKSTOP before we auto-stop a capture the user never explicitly ended
     /// (so it can't listen forever). Decremented EVERY tick. Armed to [`Self::DEFAULT_BUDGET`] by
     /// `begin_voice_command`. The PRIMARY end is the user's `end_voice_command` click; this is just
@@ -62,9 +66,26 @@ pub struct CaptureState {
     /// the click. `None` only in degenerate paths (no recorder / poisoned lock at arm time), in which
     /// case the loop falls back to the rolling-tail window so the capture still functions.
     pub start_sample: Option<usize>,
+    /// Absolute source-frame cap for this command. Production arms it from the recorder's retained
+    /// history budget, so thermal tick stretching or failed ASR can never listen indefinitely.
+    pub max_end_sample: Option<usize>,
     /// Set true by `end_voice_command` (the user's "stop" click). On the next tick the live loop
     /// dispatches the FULL accumulated post-click utterance (or surfaces "nothing_heard" if silent).
     pub ended: bool,
+}
+
+/// One finalized manual voice command whose audio has already been transcribed, but whose
+/// assistant turn has not yet completed. The slot is deliberately single-entry: the UI can arm
+/// only one capture at a time, and [`crate::commands::begin_voice_command`] refuses a new arm while
+/// this owned handoff exists. Keeping the exact recording token alongside the opaque meeting id
+/// lets Stop carry a command across Live -> Draining without ever dispatching it under a stale or
+/// unrelated recording session.
+#[derive(Clone)]
+pub(crate) struct PendingManualCommand {
+    pub meeting_id: String,
+    pub capture_generation: u64,
+    pub command: String,
+    pub recording_token: crate::perf::RecordingSessionToken,
 }
 
 impl CaptureState {
@@ -79,18 +100,24 @@ impl CaptureState {
     /// don't have a recorder; the live loop falls back to the rolling tail when `start_sample` is None.
     pub fn armed() -> Self {
         Self {
+            generation: NEXT_MANUAL_CAPTURE_GENERATION
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             budget: Self::DEFAULT_BUDGET,
             start_sample: None,
+            max_end_sample: None,
             ended: false,
         }
     }
 
     /// A freshly-armed capture that latches the recorder's total-sample `offset` at arm time, so the
     /// live loop transcribes only the POST-CLICK utterance.
-    pub fn armed_from(offset: usize) -> Self {
+    pub fn armed_from(offset: usize, max_end_sample: usize) -> Self {
         Self {
+            generation: NEXT_MANUAL_CAPTURE_GENERATION
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             budget: Self::DEFAULT_BUDGET,
             start_sample: Some(offset),
+            max_end_sample: Some(max_end_sample),
             ended: false,
         }
     }
@@ -100,20 +127,80 @@ impl CaptureState {
 /// `Zeroizing` so it is wiped on drop/replace (see [`AppState::org_ock_cache`]).
 pub type OrgOckCache = std::collections::HashMap<(String, u32), zeroize::Zeroizing<[u8; 32]>>;
 
+#[derive(Clone, Debug)]
+pub struct RecordingStopResult {
+    pub meeting_id: String,
+    pub markdown: String,
+    pub exported_path: Option<String>,
+}
+
+/// Shared result cell for idempotent Stop. Every concurrent caller observes the same detached
+/// operation; no caller can steal/drop ActiveRecording or receive a misleading "not recording".
+pub struct RecordingStopFlight {
+    result: Mutex<Option<std::result::Result<RecordingStopResult, String>>>,
+    notify: tokio::sync::Notify,
+}
+
+impl RecordingStopFlight {
+    pub fn new() -> Self {
+        Self {
+            result: Mutex::new(None),
+            notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    pub fn complete(&self, result: std::result::Result<RecordingStopResult, String>) {
+        let mut slot = self
+            .result
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if slot.is_none() {
+            *slot = Some(result);
+            self.notify.notify_waiters();
+        }
+    }
+
+    pub async fn wait(&self) -> std::result::Result<RecordingStopResult, String> {
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            // `notify_waiters` does not retain a permit for a future waiter. Register this waiter
+            // before checking the result so completion in the check->await window cannot be lost.
+            notified.as_mut().enable();
+            let ready = {
+                self.result
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone()
+            };
+            if let Some(result) = ready {
+                return result;
+            }
+            notified.as_mut().await;
+        }
+    }
+}
+
+impl Default for RecordingStopFlight {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub struct AppState {
-    /// Some while recording.
-    pub recorder: Mutex<Option<Recorder>>,
-    /// Some while recording AND system-audio capture is enabled + available.
-    pub system_recorder: Mutex<Option<SystemAudioRecorder>>,
-    /// Some while recording AND echo-cancellation (VPIO AEC) capture is enabled + available.
-    pub aec_recorder: Mutex<Option<crate::audio::aec::AecRecorder>>,
-    /// Some while recording: the STAGE-2 crash-salvage spill writer, mirroring the RAM mic buffer to
-    /// an on-disk spill so a crash mid-record is recoverable at next launch (see `audio::spill`). Its
-    /// `Drop` deletes the plaintext spill + sidecar, so `stop_recording` just `take()`s it into a
-    /// guard that drops on every exit path (clean Stop ⇒ spill gone; only a crash leaves it behind).
-    pub spill_writer: Mutex<Option<crate::audio::spill::SpillWriter>>,
+    /// The sole owner of every component for one in-flight recording: paused/active cpal stream,
+    /// fixed resident ring, durable mic spool + SQLCipher lease, and optional system helper.
+    pub(crate) recorder: Mutex<Option<ActiveRecording>>,
+    pub recording_stop: Mutex<Option<Arc<RecordingStopFlight>>>,
     /// Some while the voice-trigger listener is running.
     pub voice_listener: Mutex<Option<VoiceListener>>,
+    /// Serializes voice-listener start/stop transitions. Kept separate from `voice_listener` so
+    /// the potentially blocking worker join is never hidden behind the option-slot mutex alone.
+    pub voice_listener_lifecycle: Mutex<()>,
+    /// Set from the first synchronous instruction of `start_recording` until the authoritative
+    /// recorder owner is installed (or Start unwinds). `restart_voice_listener` checks it while
+    /// holding `voice_listener_lifecycle`, closing the listener-start vs recording-start TOCTOU.
+    pub recording_starting: AtomicBool,
     /// MANUAL voice-command capture (the button trigger): `Some` while the user has clicked
     /// "ask the assistant" and the live loop is collecting the next spoken utterance as a command —
     /// NO wake word required. Armed by [`crate::commands::begin_voice_command`], consumed + cleared
@@ -123,9 +210,14 @@ pub struct AppState {
     /// SAME gated `handle_voice_action` path as the wake trigger. Opt-in PER CLICK — independent of
     /// the `realtime_reactions` toggle.
     pub voice_command_capture: Mutex<Option<CaptureState>>,
+    /// Bounded ownership handoff for a finalized manual command. A Live worker leaves the entry in
+    /// place until its lifecycle lease completes; if Draining wins admission, Stop takes the same
+    /// entry after live quiescence and dispatches it with the exact Postprocess token.
+    pub(crate) pending_manual_command: Mutex<Option<PendingManualCommand>>,
     /// TP-F1 — `true` while the LIVE-caption loop (`transcribe::live::run`) is actually running: the
-    /// ONLY consumer of a [`voice_command_capture`](Self::voice_command_capture). Set at the loop's
-    /// entry, cleared on EVERY exit (RAII guard) incl. an early model-load failure. The recorder being
+    /// ONLY consumer of a [`voice_command_capture`](Self::voice_command_capture). Set only after the
+    /// resident live model loads, then cleared on EVERY exit by an RAII guard. A click during load
+    /// or after load failure is refused rather than arming a consumer-less capture. The recorder being
     /// present is NOT sufficient — on the fresh-install heavy-model default (`large-v3-turbo-q8_0`,
     /// pinned `small` absent) `start_recording` sets `live_model = None` and spawns NO live loop, so a
     /// voice command armed against a live-less recording would WEDGE with no consumer/backstop.
@@ -181,6 +273,9 @@ pub struct AppState {
     /// Reset to `false` at each `start_recording`; latched `true` the first tick the cap is reached.
     /// Distinct from the byte/size storage cap — this is the wall-clock TIME cap.
     pub capped_notified: AtomicBool,
+    /// Rising-edge latch for a terminal capture/storage fault. The meter poll emits one typed,
+    /// content-free event so the UI can auto-finalize the exact durable prefix.
+    pub capture_fault_notified: AtomicBool,
     /// Realtime Reactions SHADOW-mode counter (spec §4.2): how many contradiction cards WOULD have
     /// fired this recording while the `brain_contradiction_cards` sub-toggle is OFF. Lets the FE offer
     /// "the brain would have flagged N — enable?" — user-local calibration, no telemetry. Reset to 0
@@ -261,6 +356,13 @@ pub struct AppState {
     /// `Mutex<()>` used purely as a critical-section guard: a poisoned `()` carries no invalid
     /// state, so acquirers recover via `into_inner()` rather than bricking all future lock ops.
     pub lifecycle: Mutex<()>,
+    /// Meetings whose from-disk salvage pipeline is currently in flight. The retry may retain a
+    /// one-shot folder CK across long ASR/provider awaits so a concurrent session relock can still
+    /// seal the exact output. Key-changing/destructive commands consult this set under
+    /// [`Self::lifecycle`] and refuse permanent unlock, fresh lock, move, or delete until the
+    /// salvage guard drops. Session relock remains allowed and revokes visibility immediately.
+    /// Opaque meeting ids only; no content or key material lives here.
+    pub(crate) active_salvages: Mutex<std::collections::HashSet<String>>,
     /// SEAL EPOCH (L2 follow-up, 2026-07-10) — a monotonic counter bumped at the ENTRY of every
     /// lock-surface mutation (`lock_folder` / `relock_folder` / `relock_all` / `remove_lock`, via
     /// `commands::bump_seal_epoch`). The hourly memory-consolidation job snapshots it before
@@ -284,6 +386,29 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// Return the exact Live-session token only when `meeting_id` names the capture currently held
+    /// in the recorder slot. Transitional Starting/Draining/Postprocess phases and mismatched or
+    /// stale meeting ids fail closed instead of borrowing recording priority for unrelated work.
+    pub(crate) fn live_model_token_for_meeting(
+        &self,
+        meeting_id: &str,
+    ) -> Result<Option<crate::perf::RecordingSessionToken>> {
+        let recorder = self
+            .recorder
+            .lock()
+            .map_err(|_| AppError::Unavailable("recorder mutex poisoned".into()))?;
+        match recorder.as_ref() {
+            Some(active) if active.meeting_id == meeting_id => active.live_model_token().map(Some),
+            Some(_) => Err(AppError::Unavailable(
+                "assistant scope does not match the active recording".into(),
+            )),
+            None if crate::perf::recording_has_priority() => Err(AppError::Unavailable(
+                "recording model session is not accepting live work".into(),
+            )),
+            None => Ok(None),
+        }
+    }
+
     /// Open DB at the app-data dir, run migrations, load config. Called once in `lib::run`.
     ///
     /// Returns `Err` (never panics) on any failure so the caller can show a graceful dialog and
@@ -335,23 +460,22 @@ impl AppState {
         let reasoner =
             crate::reason::ReasonerCell::new(Arc::clone(&config), Arc::clone(&heavy_inference));
 
-        // SHOULD-FIX startup reconciliation: re-assert the at-rest sealed shape of every locked
-        // folder. If the app crashed (or was force-quit) WHILE a folder was session-unlocked, the
-        // plaintext markdown/transcript/timeline + a decrypted WAV may still be on disk. Re-blank
-        // those columns (the blobs remain the source of truth) and re-seal any stray plaintext WAV
-        // whose `.enc` already exists, so plaintext never survives a crash into the next session.
-        // Best-effort: a reconciliation error is logged, never fatal to startup.
-        reconcile_locked_at_rest(&db);
+        // Re-assert the at-rest sealed shape before any AppState/window/MCP surface exists. A crash
+        // during an initial seal can leave hidden plaintext without a blob; that shape must be
+        // authenticated and completed with the wrapped CK, never blindly blanked/deleted. Failure is
+        // fatal-to-startup (the outer setup shows the existing graceful dialog and leaves data intact).
+        reconcile_locked_at_rest(&db)?;
 
         tracing::info!(target: "state", "app state initialized");
 
         Ok(Self {
             recorder: Mutex::new(None),
-            system_recorder: Mutex::new(None),
-            aec_recorder: Mutex::new(None),
-            spill_writer: Mutex::new(None),
+            recording_stop: Mutex::new(None),
             voice_listener: Mutex::new(None),
+            voice_listener_lifecycle: Mutex::new(()),
+            recording_starting: AtomicBool::new(false),
             voice_command_capture: Mutex::new(None),
+            pending_manual_command: Mutex::new(None),
             live_running: AtomicBool::new(false),
             db,
             config,
@@ -362,6 +486,7 @@ impl AppState {
             live_bullets: Mutex::new(String::new()),
             live_bullets_tracker: Mutex::new(crate::transcribe::bullets::BulletsTracker::default()),
             capped_notified: AtomicBool::new(false),
+            capture_fault_notified: AtomicBool::new(false),
             reactions_shadow_count: AtomicU64::new(0),
             reactions_emitted: Mutex::new(std::collections::HashSet::new()),
             in_flight_turns: Mutex::new(std::collections::HashMap::new()),
@@ -373,6 +498,7 @@ impl AppState {
             account_session: Mutex::new(None),
             share_refresh_lock: tokio::sync::Mutex::new(()),
             lifecycle: Mutex::new(()),
+            active_salvages: Mutex::new(std::collections::HashSet::new()),
             seal_epoch: AtomicU64::new(0),
             heavy_inference,
         })
@@ -390,153 +516,169 @@ impl AppState {
     }
 }
 
-/// SHOULD-FIX startup reconciliation (filesystem half of [`Db::reblank_locked_folders_at_rest`]).
-/// Re-blanks the locked folders' plaintext columns at the DB level, then re-seals stray plaintext
-/// audio on disk for ALL THREE per-stream files of each locked meeting — the playback WAV
-/// (`audio_path`) AND the two hi-res masters (`mic_master_path` / `sys_master_path`). A
-/// crash-while-unlocked decrypts EVERY sealed stream, so reconciling only the playback copy would
-/// leave `{id}.mic.wav` / `{id}.sys.wav` plaintext on disk forever (B1).
-///
-/// For each path: if it is a PLAINTEXT file (not `.enc`) with a sibling `<file>.enc` present, drop
-/// the plaintext and re-point the column at the `.enc`. This covers both crash shapes — the
-/// plaintext still on disk (drop it) and the plaintext already gone but the column still pointing at
-/// it (`remove_file` no-ops, the dangling column is re-pointed at the surviving `.enc`). We only
-/// re-point when the encrypted twin exists (never destroy the only copy, and never ENCRYPT here —
-/// there is no content key at startup). Best-effort and panic-free: every failure is logged, never
-/// fatal to launch.
-fn reconcile_locked_at_rest(db: &Db) {
-    let (rows, rollup_exports, note_md_exports, stripped_marker_sources) =
-        match db.reblank_locked_folders_at_rest() {
-            Ok(a) => a,
-            Err(e) => {
-                tracing::warn!(target: "state", error = %e, "startup reconciliation: re-blank of locked folders failed");
-                return;
-            }
-        };
-    // Brain-v3 audit Fix 4 (startup net, filesystem half): the reconcile tx scrubbed the crash-leftover
-    // sealed-neighbour markers from the affected VISIBLE sources' DB plaintext (the primary leak). Their
-    // stale vault `.md` still names the sealed neighbour on disk; without `AppState`/the vault path here
-    // we cannot re-render the `.md`, so we DELETE it (removing the on-disk leak) — the note's next save
-    // re-exports it clean from the scrubbed DB text. A note-doc's recorded `exported_path` is cleared
-    // per-row after a successful delete (delete-then-clear, W5 semantics). A meeting-note source's
-    // stale `.md` is reconciled by the note_md/audit paths on the meeting's own folder; count-only log.
-    if !stripped_marker_sources.is_empty() {
-        let mut removed = 0usize;
-        for (is_meeting, source_id) in &stripped_marker_sources {
-            if *is_meeting {
-                continue; // meeting-note `.md` reconciled via its own folder's paths; DB already scrubbed.
-            }
-            if let Ok(Some(row)) = db.get_note_row(source_id) {
-                if let Some(p) = &row.exported_path {
-                    let gone = matches!(
-                        std::fs::remove_file(p),
-                        Ok(()) | Err(_)
-                    ) && !std::path::Path::new(p).exists();
-                    if gone {
-                        let _ = db.set_note_doc_exported_path(source_id, None);
-                        removed += 1;
-                    }
-                }
-            }
-        }
-        tracing::warn!(
-            target: "state",
-            removed,
-            total = stripped_marker_sources.len(),
-            "startup reconciliation: scrubbed crash-leftover sealed-neighbour markers from visible notes"
-        );
+/// Complete or re-assert every locked folder's at-rest shape before any content surface starts.
+/// Residual plaintext from an interrupted initial seal is never deleted on ciphertext existence
+/// alone: the wrapped content key is recovered strictly and the exact plaintext is re-encrypted +
+/// verified first. Fully sealed folders avoid a keychain prompt.
+fn reconcile_locked_at_rest(db: &Db) -> Result<()> {
+    sweep_locked_audio_crypto_stages(db)?;
+    let repair_folders = locked_folders_requiring_authenticated_repair(db)?;
+    if repair_folders.is_empty() {
+        return finalize_locked_at_rest_cleanup(db);
     }
-    // Brain v2 L2.1 LOCK-SAFETY (filesystem half): when any folder is locked, the reconcile tx
-    // purged EVERY memory-rollup row (a rollup may paraphrase sealed facts) — remove their exported
-    // vault `.md`s here. Only ever the recorded exported paths; a missing file is fine. The rollups
-    // regenerate from visible facts on the next hourly pass.
-    for p in &rollup_exports {
-        let _ = std::fs::remove_file(p);
-    }
-    // 2026-07-10 audit F2 (filesystem half): a session unlock re-exports each authored note's vault
-    // `.md`; a crash while unlocked leaves that plaintext on disk. PER ROW (residual W5): delete the
-    // recorded file, and clear THAT note's `exported_path` only when the delete succeeded or the
-    // file is already absent — a FAILED delete keeps the path recorded so the next startup retries
-    // (the pre-fix bulk clear forgot the leaked `.md` forever). Count-only log — never paths (they
-    // embed note titles).
-    if !note_md_exports.is_empty() {
-        let mut cleared: usize = 0;
-        let mut kept: usize = 0;
-        for (doc_id, p) in &note_md_exports {
-            let removed = match std::fs::remove_file(p) {
-                Ok(()) => true,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
-                Err(e) => {
-                    tracing::warn!(
-                        target: "state",
-                        error = %e,
-                        "startup reconciliation: deleting a re-exported note .md failed — keeping exported_path for retry"
-                    );
-                    false
-                }
-            };
-            if removed {
-                match db.set_note_doc_exported_path(doc_id, None) {
-                    Ok(()) => cleared += 1,
-                    Err(e) => tracing::warn!(target: "state", error = %e, "startup reconciliation: clearing a note exported_path failed"),
-                }
-            } else {
-                kept += 1;
-            }
-        }
-        tracing::warn!(
-            target: "state",
-            cleared,
-            kept,
-            "startup reconciliation: reconciled re-exported plaintext note .md files left by a crash while unlocked"
-        );
-    }
-    for row in rows {
-        let crate::storage::LockedMeetingAudio {
-            meeting_id,
-            audio_path,
-            mic_master_path,
-            sys_master_path,
-        } = row;
-        reseal_stray_audio(audio_path.as_deref(), "playback WAV", |enc| {
-            db.set_meeting_audio_path(&meeting_id, Some(enc))
-        });
-        reseal_stray_audio(mic_master_path.as_deref(), "mic master", |enc| {
-            db.set_meeting_mic_master_path(&meeting_id, Some(enc))
-        });
-        reseal_stray_audio(sys_master_path.as_deref(), "sys master", |enc| {
-            db.set_meeting_sys_master_path(&meeting_id, Some(enc))
-        });
-    }
+    let candidates = crate::secrets::list_master_kek_candidates_strict(
+        "Repair locked content after an interrupted session",
+    )?;
+    repair_and_finalize_locked_at_rest(db, &repair_folders, &candidates)
 }
 
-/// Re-seal one at-rest audio column left by a crash-while-unlocked. If `path` is a plaintext file
-/// (not `.enc`) whose sibling `<path>.enc` (the durable encrypted copy) exists, remove the stray
-/// plaintext and call `repoint` to re-point the column at the `.enc`. No-op when the column is
-/// absent, already `.enc`, or has no encrypted twin (never destroy the only copy). `repoint` is the
-/// matching DB setter (`set_meeting_audio_path` / `…_mic_master_path` / `…_sys_master_path`); a
-/// setter error is logged, never fatal. `label` names the stream for the log line only.
-fn reseal_stray_audio(
-    path: Option<&str>,
-    label: &str,
-    repoint: impl FnOnce(&str) -> crate::error::Result<()>,
-) {
-    const ENC_SUFFIX: &str = ".enc";
-    let Some(path) = path else { return };
-    if path.ends_with(ENC_SUFFIX) {
-        return; // already sealed at rest.
+/// Keychain-free entry used by state tests: candidates are injected, while production always enters
+/// through [`reconcile_locked_at_rest`] and strict keychain enumeration.
+#[cfg(test)]
+fn reconcile_locked_at_rest_with_candidates(db: &Db, candidates: &[[u8; 32]]) -> Result<()> {
+    sweep_locked_audio_crypto_stages(db)?;
+    let repair_folders = locked_folders_requiring_authenticated_repair(db)?;
+    repair_and_finalize_locked_at_rest(db, &repair_folders, candidates)
+}
+
+fn locked_folders_requiring_authenticated_repair(db: &Db) -> Result<Vec<String>> {
+    let mut repair = Vec::new();
+    for folder_id in db.locked_folder_ids()? {
+        if crate::commands::locked_folder_requires_authenticated_repair(db, &folder_id)? {
+            repair.push(folder_id);
+        }
     }
-    let enc_path = format!("{path}{ENC_SUFFIX}");
-    // Only re-point when the encrypted twin already exists (the durable copy).
-    if !std::path::Path::new(&enc_path).exists() {
-        return;
+    Ok(repair)
+}
+
+fn repair_and_finalize_locked_at_rest(
+    db: &Db,
+    repair_folders: &[String],
+    candidates: &[[u8; 32]],
+) -> Result<()> {
+    for folder_id in repair_folders {
+        let wrapped = db
+            .folder_wrapped_key(folder_id)?
+            .ok_or_else(|| AppError::Storage("locked folder repair has no wrapped key".into()))?;
+        let (ck_bytes, _winning_kek, _winner_index) =
+            crate::commands::try_unwrap_ck_with_candidates(candidates, &wrapped, folder_id, None)
+                .ok_or_else(|| {
+                AppError::Auth("no keychain key can repair interrupted locked content".into())
+            })?;
+        let ck: zeroize::Zeroizing<[u8; 32]> = zeroize::Zeroizing::new(
+            ck_bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| AppError::Storage("unwrapped content key has wrong length".into()))?,
+        );
+        crate::commands::repair_locked_folder_at_rest(db, folder_id, &ck)?;
+        if crate::commands::locked_folder_requires_authenticated_repair(db, folder_id)? {
+            return Err(AppError::Storage(
+                "locked-folder startup repair did not reach a sealed at-rest shape".into(),
+            ));
+        }
     }
-    let _ = std::fs::remove_file(path); // no-op if the plaintext is already gone (dangling column).
-    if let Err(e) = repoint(&enc_path) {
-        tracing::warn!(target: "state", error = %e, stream = label, "startup reconciliation: re-point of stray plaintext audio to .enc failed");
-    } else {
-        tracing::warn!(target: "state", stream = label, "startup reconciliation: re-sealed a stray plaintext audio file left by a crash while unlocked");
+    finalize_locked_at_rest_cleanup(db)
+}
+
+fn sweep_locked_audio_crypto_stages(db: &Db) -> Result<()> {
+    let mut by_dir: std::collections::HashMap<
+        std::path::PathBuf,
+        std::collections::HashSet<String>,
+    > = std::collections::HashMap::new();
+    for folder_id in db.locked_folder_ids()? {
+        for meeting_id in db.meeting_ids_in_folder(&folder_id)? {
+            let playback = db
+                .get_meeting(&meeting_id)?
+                .and_then(|meeting| meeting.audio_path);
+            let (mic, system) = db.get_meeting_master_paths(&meeting_id)?;
+            for path in [playback, mic, system].into_iter().flatten() {
+                let path = std::path::Path::new(&path);
+                let (Some(parent), Some(name)) = (
+                    path.parent(),
+                    path.file_name().and_then(|name| name.to_str()),
+                ) else {
+                    return Err(AppError::Storage(
+                        "locked audio path cannot be reconciled safely".into(),
+                    ));
+                };
+                let targets = by_dir.entry(parent.to_path_buf()).or_default();
+                targets.insert(name.to_string());
+                if let Some(plain) = name.strip_suffix(".enc") {
+                    targets.insert(plain.to_string());
+                } else {
+                    targets.insert(format!("{name}.enc"));
+                }
+            }
+        }
     }
+    let mut removed = 0usize;
+    for (directory, targets) in by_dir {
+        removed += crate::crypto::sweep_atomic_stages(&directory, &targets)?;
+    }
+    if removed > 0 {
+        tracing::warn!(target: "state", removed, "startup reconciliation removed abandoned audio crypto stages");
+    }
+    Ok(())
+}
+
+fn finalize_locked_at_rest_cleanup(db: &Db) -> Result<()> {
+    crate::commands::remove_rollup_exports_before_seal_purge(db)?;
+    let (audio_rows, rollup_exports, note_md_exports) = db.reblank_locked_folders_at_rest()?;
+    let attachment_exports = db.reblank_locked_attachments_at_rest()?;
+    crate::commands::delete_attachment_exports_with_retry(db, attachment_exports)?;
+    for path in &rollup_exports {
+        crate::crypto::remove_file_verified_absent(
+            std::path::Path::new(path),
+            "remove purged memory-rollup export during startup reconciliation",
+        )?;
+    }
+    for (document_id, path) in &note_md_exports {
+        crate::crypto::remove_file_verified_absent(
+            std::path::Path::new(path),
+            "remove re-exported authored note during startup reconciliation",
+        )?;
+        db.set_note_doc_exported_path(document_id, None)?;
+    }
+    for row in audio_rows {
+        for (path, stream) in [
+            (row.audio_path.as_deref(), "playback"),
+            (row.mic_master_path.as_deref(), "mic"),
+            (row.sys_master_path.as_deref(), "system"),
+        ] {
+            assert_locked_audio_at_rest(path, stream)?;
+        }
+    }
+    // Drain LAST: locked-folder exports/audio/derived rows above must reach a safe at-rest shape
+    // even when an unrelated visible source export is a symlink, hardlink, or concurrently edited.
+    // Failure retains the encrypted outbox and aborts startup before content surfaces appear.
+    crate::commands::drain_lock_marker_export_cleanup(db)
+}
+
+fn assert_locked_audio_at_rest(path: Option<&str>, stream: &str) -> Result<()> {
+    let Some(path) = path else { return Ok(()) };
+    if !path.ends_with(".enc") {
+        return Err(AppError::Storage(format!(
+            "locked {stream} audio still points at plaintext after startup repair"
+        )));
+    }
+    if !crate::crypto::owned_regular_file_exists(
+        std::path::Path::new(path),
+        "assert encrypted audio after startup repair",
+    )? {
+        return Err(AppError::Storage(format!(
+            "locked {stream} audio has no encrypted artifact after startup repair"
+        )));
+    }
+    if crate::crypto::owned_regular_file_exists(
+        std::path::Path::new(path.trim_end_matches(".enc")),
+        "assert plaintext audio absent after startup repair",
+    )? {
+        return Err(AppError::Storage(format!(
+            "locked {stream} audio plaintext survived startup repair"
+        )));
+    }
+    Ok(())
 }
 
 /// Does `path` start with the plaintext-SQLite magic ("SQLite format 3\0")? A SQLCipher-encrypted
@@ -596,6 +738,19 @@ mod tests {
 
     const GOOD_KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     const WRONG_KEY: &str = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+    const TEST_KEK: [u8; 32] = [0x4b; 32];
+    const TEST_CK: [u8; 32] = [0x63; 32];
+
+    fn mark_folder_locked_recoverable(db: &Db, folder_id: &str) {
+        let wrapped = crate::crypto::encrypt(
+            &TEST_KEK,
+            &TEST_CK,
+            &crate::commands::aad_wrapped_ck(folder_id),
+        )
+        .unwrap();
+        db.set_folder_locked(folder_id, true, Some(&wrapped))
+            .unwrap();
+    }
 
     /// The dev/release app-data dir split: a DEBUG build (the test binary always is one) must
     /// resolve to the ISOLATED `MeetNotes-dev` so `npm run dev` can never collide with the
@@ -669,12 +824,15 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        std::fs::write(&md, "# secret plan\ninternal launch April").unwrap();
+        let exported = "# secret plan\ninternal launch April";
+        std::fs::write(&md, exported).unwrap();
         db.set_note_doc_exported_path("n1", Some(md.to_str().unwrap()))
             .unwrap();
-        db.set_folder_locked("f1", true, None).unwrap();
+        db.set_note_doc_exported_hash("n1", Some(&crate::export::note_content_hash(exported)))
+            .unwrap();
+        mark_folder_locked_recoverable(&db, "f1");
 
-        reconcile_locked_at_rest(&db);
+        reconcile_locked_at_rest_with_candidates(&db, &[TEST_KEK]).unwrap();
 
         assert!(
             !md.exists(),
@@ -686,11 +844,49 @@ mod tests {
         );
     }
 
+    #[test]
+    fn reconcile_wrong_candidate_preserves_hidden_plaintext_and_cleanup_authority() {
+        use crate::storage::models::Folder;
+
+        let db = Db::open_with_key(&tmp_path("repair-wrong-kek"), GOOD_KEY).unwrap();
+        db.insert_folder(&Folder {
+            id: "f1".to_string(),
+            name: "Secret".to_string(),
+            path: "Notes/Secret".to_string(),
+            parent_id: None,
+            locked: false,
+            created_at: "2026-07-10T08:00:00Z".to_string(),
+        })
+        .unwrap();
+        db.insert_note("n1", "f1", "secret", "Secret", "secret body", 1)
+            .unwrap();
+        let md = tmp_path("repair-wrong-kek-export").with_extension("md");
+        std::fs::write(&md, "# secret body").unwrap();
+        db.set_note_doc_exported_path("n1", Some(md.to_str().unwrap()))
+            .unwrap();
+        mark_folder_locked_recoverable(&db, "f1");
+
+        assert!(
+            reconcile_locked_at_rest_with_candidates(&db, &[[0x99; 32]]).is_err(),
+            "startup must fail closed when no candidate unwraps the repair CK"
+        );
+        let row = db.get_note_row("n1").unwrap().unwrap();
+        assert_eq!(
+            row.text, "secret body",
+            "canonical plaintext must remain intact"
+        );
+        assert_eq!(row.exported_path.as_deref(), md.to_str());
+        assert!(
+            md.exists(),
+            "no unauthenticated cleanup may remove the export"
+        );
+        let _ = std::fs::remove_file(md);
+    }
+
     /// Residual W5 (RED-before-GREEN, startup half): when the reconcile FAILS to delete a
     /// re-exported note `.md`, that note's `exported_path` must be KEPT so the next startup pass
     /// retries — before the fix the bulk clear NULLed every locked-folder path regardless,
-    /// forgetting the leaked plaintext `.md` forever. A deletable sibling is still cleaned +
-    /// cleared normally.
+    /// forgetting the leaked plaintext `.md` forever. Startup now fails closed before surfaces.
     #[test]
     fn reconcile_keeps_exported_path_when_md_delete_fails() {
         use crate::storage::models::Folder;
@@ -706,11 +902,8 @@ mod tests {
         .unwrap();
         db.insert_note("n-keep", "f1", "undeletable", "Undeletable", "", 1)
             .unwrap();
-        db.insert_note("n-gone", "f1", "deletable", "Deletable", "", 1)
-            .unwrap();
-
-        // A DIRECTORY at the recorded path makes `remove_file` fail with a non-NotFound error —
-        // the undeletable-crash shape; a plain file is the normal deletable shape.
+        // A DIRECTORY at the recorded path makes verified file removal fail with a non-NotFound
+        // error — the undeletable crash shape.
         let dir = std::env::temp_dir().join(format!(
             "murmur-reconcile-undeletable-{}-{}",
             std::process::id(),
@@ -720,15 +913,14 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("deletable.md");
-        std::fs::write(&file, "# re-exported plaintext").unwrap();
         db.set_note_doc_exported_path("n-keep", Some(dir.to_str().unwrap()))
             .unwrap();
-        db.set_note_doc_exported_path("n-gone", Some(file.to_str().unwrap()))
-            .unwrap();
-        db.set_folder_locked("f1", true, None).unwrap();
+        mark_folder_locked_recoverable(&db, "f1");
 
-        reconcile_locked_at_rest(&db);
+        assert!(
+            reconcile_locked_at_rest_with_candidates(&db, &[TEST_KEK]).is_err(),
+            "an undeletable managed plaintext export must abort startup"
+        );
 
         let keep_row = db.get_note_row("n-keep").unwrap().unwrap();
         assert_eq!(
@@ -736,13 +928,6 @@ mod tests {
             dir.to_str(),
             "a FAILED .md delete must keep exported_path recorded for the next startup retry"
         );
-        let gone_row = db.get_note_row("n-gone").unwrap().unwrap();
-        assert!(
-            gone_row.exported_path.is_none(),
-            "a successful .md delete clears exported_path"
-        );
-        assert!(!file.exists(), "the deletable .md is removed");
-
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -827,10 +1012,10 @@ mod tests {
             let c = Connection::open(&p).unwrap();
             c.execute_batch(
                 "PRAGMA journal_mode=WAL;
-                 CREATE TABLE meetings(id TEXT PRIMARY KEY, started_at TEXT, title TEXT);
+                 CREATE TABLE meetings(id TEXT PRIMARY KEY, started_at TEXT, title TEXT, audio_path TEXT);
                  CREATE TABLE segments(meeting_id TEXT, idx INTEGER, text TEXT);
                  CREATE TABLE notes(meeting_id TEXT, markdown TEXT);
-                 INSERT INTO meetings VALUES('m1','2026-07-01','Sync');
+                 INSERT INTO meetings VALUES('m1','2026-07-01','Sync',NULL);
                  PRAGMA user_version=7;",
             )
             .unwrap();
@@ -986,6 +1171,7 @@ mod tests {
         })
         .unwrap();
         db.set_note_folder("m1", Some("f1")).unwrap();
+        mark_folder_locked_recoverable(&db, "f1");
 
         // Sibling files derived from the unique db path so concurrent test runs never collide.
         let base = p.to_string_lossy().to_string();
@@ -996,9 +1182,18 @@ mod tests {
 
         // Crash shape A (mic): plaintext STILL present + sibling .enc present.
         std::fs::write(&mic_plain, b"PLAINTEXT-MIC-MASTER").unwrap();
-        std::fs::write(&mic_enc, b"ENC-MIC").unwrap();
+        std::fs::write(&mic_enc, b"INTERRUPTED-STAGE-WILL-BE-REPLACED").unwrap();
         // Crash shape B (sys): plaintext ALREADY GONE, only the .enc survives, column still dangles.
-        std::fs::write(&sys_enc, b"ENC-SYS").unwrap();
+        let sys_source = format!("{base}.m1.sys.source.wav");
+        std::fs::write(&sys_source, b"SYSTEM-MASTER").unwrap();
+        crate::crypto::encrypt_file(
+            &TEST_CK,
+            std::path::Path::new(&sys_source),
+            std::path::Path::new(&sys_enc),
+            b"murmur:audio:v1|meeting=m1|folder=f1|stream=sys",
+        )
+        .unwrap();
+        std::fs::remove_file(&sys_source).unwrap();
         assert!(
             !std::path::Path::new(&sys_plain).exists(),
             "sys plaintext is gone (crash shape B)"
@@ -1010,7 +1205,7 @@ mod tests {
             .unwrap();
 
         // RECONCILE — the production startup pass.
-        reconcile_locked_at_rest(&db);
+        reconcile_locked_at_rest_with_candidates(&db, &[TEST_KEK]).unwrap();
 
         // mic: stray plaintext dropped; sys: dangling column re-pointed. Both columns now at the .enc.
         assert!(
@@ -1082,14 +1277,32 @@ mod tests {
         })
         .unwrap();
         db.set_note_folder("m1", Some("f1")).unwrap();
+        mark_folder_locked_recoverable(&db, "f1");
+
+        let note_blob = crate::crypto::encrypt(
+            &TEST_CK,
+            b"",
+            &crate::commands::aad_content("f1", "m1", "claude_code", "note"),
+        )
+        .unwrap();
+        db.seal_note("m1", "claude_code", &note_blob).unwrap();
 
         let base = p.to_string_lossy().to_string();
         let mic_enc = format!("{base}.m1.mic.wav.enc");
-        std::fs::write(&mic_enc, b"ENC-MIC").unwrap();
+        let mic_source = format!("{base}.m1.mic.source.wav");
+        std::fs::write(&mic_source, b"MIC-MASTER").unwrap();
+        crate::crypto::encrypt_file(
+            &TEST_CK,
+            std::path::Path::new(&mic_source),
+            std::path::Path::new(&mic_enc),
+            b"murmur:audio:v1|meeting=m1|folder=f1|stream=mic",
+        )
+        .unwrap();
+        std::fs::remove_file(&mic_source).unwrap();
         db.set_meeting_mic_master_path("m1", Some(&mic_enc))
             .unwrap();
 
-        reconcile_locked_at_rest(&db);
+        reconcile_locked_at_rest_with_candidates(&db, &[]).unwrap();
 
         let (mic_after, _sys_after) = db.get_meeting_master_paths("m1").unwrap();
         assert_eq!(
@@ -1104,5 +1317,27 @@ mod tests {
 
         let _ = std::fs::remove_file(&mic_enc);
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[tokio::test]
+    async fn recording_stop_flight_replays_one_terminal_result_to_all_waiters() {
+        let flight = Arc::new(RecordingStopFlight::new());
+        let first = flight.clone();
+        let second = flight.clone();
+        let first_waiter = tokio::spawn(async move { first.wait().await });
+        let second_waiter = tokio::spawn(async move { second.wait().await });
+        flight.complete(Err("durable finalization failed".into()));
+        assert_eq!(
+            first_waiter.await.unwrap().unwrap_err(),
+            "durable finalization failed"
+        );
+        assert_eq!(
+            second_waiter.await.unwrap().unwrap_err(),
+            "durable finalization failed"
+        );
+        assert_eq!(
+            flight.wait().await.unwrap_err(),
+            "durable finalization failed"
+        );
     }
 }

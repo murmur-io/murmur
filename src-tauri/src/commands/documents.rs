@@ -34,8 +34,8 @@ use super::*;
 /// (png/jpg/jpeg/heic/tiff/tif/bmp/gif) via on-device Apple Vision. Dispatch + extraction live in
 /// `crate::extract`; anything else is rejected with `InvalidArg`.
 const DOC_ALLOWED_EXTS: &[&str] = &[
-    "md", "txt", "pdf", "docx", "pptx", "xlsx", "html", "htm", "png", "jpg", "jpeg", "heic", "tiff",
-    "tif", "bmp", "gif",
+    "md", "txt", "pdf", "docx", "pptx", "xlsx", "html", "htm", "png", "jpg", "jpeg", "heic",
+    "tiff", "tif", "bmp", "gif",
 ];
 
 /// Document ingestion — upload a local file INTO a folder so its EXTRACTED text is chunked + embedded
@@ -117,7 +117,7 @@ pub async fn import_document(
         // failure logs (no PII) and leaves the durable chunks/FTS + row in place. Per-sub-batch
         // progress (Fix 3) streams "embedding done/total" as each embed sub-batch completes.
         if ram_permits {
-            let embedder = crate::embed::embed_model_present().then(crate::embed::active_embedder);
+            let embedder = crate::embed::active_persistence_embedder_if_available();
             crate::events::emit_doc_import(&app2, &id, "embedding", 0, 0);
             let id_for_progress = id.clone();
             let embed_progress = |done: usize, total: usize| {
@@ -157,7 +157,13 @@ pub(crate) fn import_document_inner(
     // EXTRACT (allowlist + `path → text`, pure, no DB/state).
     let (name, stored) = extract_document_text(path, &crate::extract::no_progress)?;
     // GATE + INSERT + chunk-only index (the shared seam the async wrapper also uses).
-    insert_extracted_document(&state.db, &state.unlocked_folders, folder_id, &name, &stored)
+    insert_extracted_document(
+        &state.db,
+        &state.unlocked_folders,
+        folder_id,
+        &name,
+        &stored,
+    )
 }
 
 /// EXTRACT a supported document to its storable text form — PURE `path → (display_name, text)`, with
@@ -264,7 +270,10 @@ pub(crate) fn insert_extracted_document(
 /// The WRITE-GATE for an uploaded document evaluated from a borrowed `&AppState` (the up-front,
 /// fail-fast check on the async task before any file work). Same predicate as
 /// [`insert_extracted_document`]'s re-check; delegates to the existing `folder_is_unlocked`.
-pub(crate) fn import_document_write_gate(state: &AppState, folder_id: &str) -> Result<(), AppError> {
+pub(crate) fn import_document_write_gate(
+    state: &AppState,
+    folder_id: &str,
+) -> Result<(), AppError> {
     let folder = state
         .db
         .folder_by_id(folder_id)?
@@ -353,7 +362,7 @@ fn ingest_into_folder(
     // raw `text`, which must NEVER be embedded/indexed (DESIGN §1a — tags/properties pollute the
     // vectors + snippets). Route through the ONE front-matter-stripping seam so the ingest matches
     // every other note-index path.
-    let embedder = crate::embed::embed_model_present().then(crate::embed::active_embedder);
+    let embedder = crate::embed::active_persistence_embedder_if_available();
     if let Err(e) = index_document_row_kind_routed(&state.db, &id, embedder.as_deref()) {
         tracing::warn!(target: "rag", error = %e, "ingest: chunk/embed failed (content stored)");
     }
@@ -401,18 +410,23 @@ pub fn get_document(state: State<'_, AppState>, id: String) -> Result<String, Ap
 
 /// Inner of [`get_document`] taking `&AppState` (unit-testable gate).
 pub(crate) fn get_document_inner(state: &AppState, id: &str) -> Result<String, AppError> {
-    let Some((folder_id, _name, text)) = state.db.get_document(id)? else {
+    // Serialize gate + content read with relock, and resolve only the content-free folder anchor
+    // before authorization. A locked row may retain residual plaintext after interrupted cleanup;
+    // that plaintext must not enter the process merely to discover its governing folder.
+    let _lifecycle = lifecycle_guard(state);
+    let Some(folder_id) = state.db.folder_for_document(id)? else {
         return Ok(String::new()); // unknown id → nothing.
     };
     if !folder_is_unlocked(state, &folder_id)? {
         return Ok(String::new()); // sealed-not-unlocked ⇒ masked, never the stored text.
     }
+    let Some((_folder_id, _name, text)) = state.db.get_document(id)? else {
+        return Ok(String::new());
+    };
     // Brain v3 PR-2: strip the block-structure markers a PR-2 upload stores in `text` — the FE gets
     // clean readable text (a note / md / txt / legacy row has no markers → unchanged).
     Ok(crate::extract::render_display_text(&text))
 }
-
-
 
 /// Permanently delete a document and cascade-delete its chunks + vectors. GATED: a
 /// sealed-and-NOT-session-unlocked folder is refused (`AppError::Locked`) so the lock state can't be
@@ -432,7 +446,7 @@ pub async fn delete_document(
     // Only a `kind='note'` row is ever tab-tracked (a plain ingested `kind='document'` has no tab —
     // see `TabKind` in `tab-keys.ts`), so only fire the delete-fan-out event for that case: emitting
     // it for an id nothing tracks is harmless, but this stays precise about what was actually deleted.
-    let was_note = matches!(state.db.get_note_row(&id), Ok(Some(_)));
+    let was_note = matches!(state.db.note_gate_anchor(&id), Ok(Some(_)));
     delete_document_inner(state.inner(), &id).await?;
     if was_note {
         crate::events::emit_content_deleted(&app, "note", &id);
@@ -458,6 +472,28 @@ pub(crate) async fn delete_document_inner(state: &AppState, id: &str) -> Result<
     // server item back into the local replica after the user asked to delete it. Fails LOUD: a revoke
     // failure (e.g. offline) aborts the delete rather than silently leaving a dangling live share.
     revoke_org_shares_for_source(state, None, Some(id)).await?;
+    // The generic surface can also delete a `kind='note'` document. Re-check the gate under the
+    // lifecycle mutex after the network await and remove every tracked image while its row still
+    // carries retry metadata. Plain imported documents have no attachment owner and skip this leg.
+    let _lifecycle = lifecycle_guard(state);
+    let Some(folder_id) = state.db.folder_for_document(id)? else {
+        return Ok(());
+    };
+    if !folder_is_unlocked(state, &folder_id)? {
+        return Err(AppError::Locked(
+            "this folder is locked — unlock it to delete a document".into(),
+        ));
+    }
+    if state.db.note_gate_anchor(id)?.is_some() {
+        let attachment_owner = crate::storage::AttachmentOwner::Document {
+            document_id: id.to_string(),
+        };
+        let attachments = state.db.list_attachments(&attachment_owner)?;
+        remove_attachment_exports(
+            &attachments,
+            "could not remove an exported image before deleting the note",
+        )?;
+    }
     state.db.delete_document(id)?;
     tracing::info!(target: "documents", document_id = %id, "document deleted");
     Ok(())

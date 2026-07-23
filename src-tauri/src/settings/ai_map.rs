@@ -37,13 +37,15 @@ pub struct AiMapRow {
 /// Display name for an on-device brain model id — registry name, raw id when unknown,
 /// generic label when empty.
 fn brain_display(id: &str) -> String {
-    brain_model_by_id(id).map(|m| m.name.to_string()).unwrap_or_else(|| {
-        if id.is_empty() {
-            "On-device brain".to_string()
-        } else {
-            id.to_string()
-        }
-    })
+    brain_model_by_id(id)
+        .map(|m| m.name.to_string())
+        .unwrap_or_else(|| {
+            if id.is_empty() {
+                "On-device brain".to_string()
+            } else {
+                id.to_string()
+            }
+        })
 }
 
 /// Build one routable role row by mirroring [`roles::resolve`].
@@ -166,7 +168,10 @@ mod tests {
         assert!(notes.routable);
         let reactions = row(&rows, "reactions");
         assert!(reactions.on_device);
-        assert!(!reactions.active, "brain_live defaults off ⇒ reactions row inactive");
+        assert!(
+            !reactions.active,
+            "brain_live defaults off ⇒ reactions row inactive"
+        );
         assert!(!reactions.routable);
         let tr = row(&rows, "transcription");
         assert_eq!(tr.engine, "Whisper");
@@ -189,7 +194,10 @@ mod tests {
         }
         let heavy = crate::reason::brain_model_by_id("qwen3-4b-instruct-2507").unwrap();
         assert_eq!(row(&rows, "notes").engine, heavy.name);
-        assert!(row(&rows, "reactions").active, "Fully local turns brain_live on");
+        assert!(
+            row(&rows, "reactions").active,
+            "Fully local turns brain_live on"
+        );
     }
 
     #[test]
@@ -201,8 +209,14 @@ mod tests {
         let rows = ai_map_rows(&cfg);
         let notes = row(&rows, "notes");
         assert_eq!(notes.engine, "Ollama");
-        assert_eq!(notes.model, cfg.ollama_model, "empty role model must fall back to ollama_model");
-        assert!(notes.on_device, "loopback ollama must not classify as cloud");
+        assert_eq!(
+            notes.model, cfg.ollama_model,
+            "empty role model must fall back to ollama_model"
+        );
+        assert!(
+            notes.on_device,
+            "loopback ollama must not classify as cloud"
+        );
         assert!(!notes.redacted);
     }
 
@@ -218,7 +232,10 @@ mod tests {
         let rows = ai_map_rows(&cfg);
         let ask = row(&rows, "ask");
         assert_eq!(ask.engine, "Anthropic API");
-        assert_eq!(ask.model, cfg.anthropic_model, "empty role model falls back to anthropic_model");
+        assert_eq!(
+            ask.model, cfg.anthropic_model,
+            "empty role model falls back to anthropic_model"
+        );
         assert!(!ask.on_device, "anthropic is cloud ⇒ not on-device");
         assert!(ask.redacted, "cloud egress passes the redaction firewall");
         assert!(ask.active);

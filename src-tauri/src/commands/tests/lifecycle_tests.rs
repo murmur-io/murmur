@@ -32,11 +32,12 @@
         let db = Arc::new(Db::open_with_key(&tmp_db_path(tag), DB_KEY).unwrap());
         AppState {
             recorder: Mutex::new(None),
-            system_recorder: Mutex::new(None),
-            aec_recorder: Mutex::new(None),
-            spill_writer: Mutex::new(None),
+            recording_stop: Mutex::new(None),
             voice_listener: Mutex::new(None),
+            voice_listener_lifecycle: Mutex::new(()),
+            recording_starting: std::sync::atomic::AtomicBool::new(false),
             voice_command_capture: Mutex::new(None),
+            pending_manual_command: Mutex::new(None),
             live_running: std::sync::atomic::AtomicBool::new(false),
             db,
             config: Arc::new(Mutex::new(AppConfig::default())),
@@ -47,6 +48,7 @@
             live_bullets: Mutex::new(String::new()),
             live_bullets_tracker: Mutex::new(crate::transcribe::bullets::BulletsTracker::default()),
             capped_notified: std::sync::atomic::AtomicBool::new(false),
+            capture_fault_notified: std::sync::atomic::AtomicBool::new(false),
             reactions_shadow_count: std::sync::atomic::AtomicU64::new(0),
             reactions_emitted: Mutex::new(HashSet::new()),
             in_flight_turns: Mutex::new(std::collections::HashMap::new()),
@@ -57,6 +59,7 @@
             org_ock_cache: Mutex::new(std::collections::HashMap::new()),
             account_session: Mutex::new(None),
             lifecycle: Mutex::new(()),
+            active_salvages: Mutex::new(HashSet::new()),
             share_refresh_lock: tokio::sync::Mutex::new(()),
             seal_epoch: std::sync::atomic::AtomicU64::new(0),
             heavy_inference: Arc::new(tokio::sync::Semaphore::new(1)),
@@ -82,9 +85,6 @@
         let state = build_state("stop-all-capture");
         // Sanity: fresh state has no recorders (a real recording would populate these).
         assert!(state.recorder.lock().unwrap().is_none());
-        assert!(state.system_recorder.lock().unwrap().is_none());
-        assert!(state.aec_recorder.lock().unwrap().is_none());
-        assert!(state.spill_writer.lock().unwrap().is_none());
 
         // Must not panic, and must leave every slot None.
         stop_all_capture(&state);
@@ -92,18 +92,6 @@
         assert!(
             state.recorder.lock().unwrap().is_none(),
             "mic recorder slot cleared"
-        );
-        assert!(
-            state.system_recorder.lock().unwrap().is_none(),
-            "system-audio recorder slot cleared"
-        );
-        assert!(
-            state.aec_recorder.lock().unwrap().is_none(),
-            "AEC recorder slot cleared"
-        );
-        assert!(
-            state.spill_writer.lock().unwrap().is_none(),
-            "spill writer slot cleared"
         );
     }
 
@@ -163,8 +151,8 @@
             detail: "PROJ-1 not found in Jira".into(),
             url: String::new(),
         };
-        let e2 = apply_note_verify_markers_inner(&state, "m-vlock".to_string(), vec![finding])
-            .unwrap_err();
+        let e2 =
+            apply_note_verify_markers_inner(&state, "m-vlock".to_string(), vec![finding]).unwrap_err();
         assert!(
             matches!(e2, AppError::Locked(_)),
             "apply must fail Locked, got: {e2:?}"
@@ -357,17 +345,16 @@
             detail: "note says 2026-07-08, PROJ-1 due 2026-07-10".into(),
             url: "https://x/browse/PROJ-1".into(),
         };
-        let once = apply_note_verify_markers_inner(
-            &state,
-            "m-cb".to_string(),
-            vec![finding.clone()],
-        )
-        .unwrap();
-        assert!(once.markdown.contains("> ⧗ note says"), "inline marker present");
+        let once =
+            apply_note_verify_markers_inner(&state, "m-cb".to_string(), vec![finding.clone()]).unwrap();
+        assert!(
+            once.markdown.contains("> ⧗ note says"),
+            "inline marker present"
+        );
         assert!(once.markdown.contains("> [!verify]- Source check (as of "));
         assert!(once.markdown.contains(
-            "> - ⧗ Conflict — note says 2026-07-08, PROJ-1 due 2026-07-10 (via Jira) — https://x/browse/PROJ-1"
-        ));
+                "> - ⧗ Conflict — note says 2026-07-08, PROJ-1 due 2026-07-10 (via Jira) — https://x/browse/PROJ-1"
+            ));
         // Persisted CANONICALLY (upsert_note): the DB row carries the callout, so it seals with
         // the note under a folder lock.
         let db_md = state
@@ -379,16 +366,21 @@
         assert_eq!(db_md, once.markdown);
 
         // Re-apply: neither region stacks (one inline marker, one fenced callout).
-        let twice =
-            apply_note_verify_markers_inner(&state, "m-cb".to_string(), vec![finding]).unwrap();
-        assert_eq!(twice.markdown.matches("(via Jira)").count(), 2, "1 marker + 1 callout line");
+        let twice = apply_note_verify_markers_inner(&state, "m-cb".to_string(), vec![finding]).unwrap();
+        assert_eq!(
+            twice.markdown.matches("(via Jira)").count(),
+            2,
+            "1 marker + 1 callout line"
+        );
         assert_eq!(twice.markdown.matches("[!verify]-").count(), 1);
         assert_eq!(twice.markdown.matches("<!-- murmur:verify -->").count(), 1);
 
         // Empty findings: markers + callout stripped, the ORIGINAL note restored byte-exact.
-        let undone =
-            apply_note_verify_markers_inner(&state, "m-cb".to_string(), Vec::new()).unwrap();
-        assert_eq!(undone.markdown, original, "byte-exact undo through the command");
+        let undone = apply_note_verify_markers_inner(&state, "m-cb".to_string(), Vec::new()).unwrap();
+        assert_eq!(
+            undone.markdown, original,
+            "byte-exact undo through the command"
+        );
     }
 
     /// `get_mcp_config` must emit a ready-to-paste Claude Code config: `type: "http"`, the
@@ -603,7 +595,10 @@
             .unwrap()
             .markdown;
 
-        assert_eq!(after, before, "Lane A is a no-op — the note body is unchanged");
+        assert_eq!(
+            after, before,
+            "Lane A is a no-op — the note body is unchanged"
+        );
         assert!(
             !after.contains("murmur:links"),
             "no managed links block is written into the note body; got: {after}"
@@ -720,7 +715,11 @@
         link_items_inner(&state, "meeting", "m1", "note", "n1").unwrap();
 
         // A manual row exists...
-        assert_eq!(manual_link_count(&state, "meeting", "m1"), 1, "manual row created");
+        assert_eq!(
+            manual_link_count(&state, "meeting", "m1"),
+            1,
+            "manual row created"
+        );
         // ...and the meeting's note markdown is UNTOUCHED (no injected [[...]] / links block).
         let after = state
             .db
@@ -751,16 +750,27 @@
         link_items_inner(&state, "note", "src", "note", "dst").unwrap();
 
         // A manual row exists...
-        assert_eq!(manual_link_count(&state, "note", "src"), 1, "manual row created");
+        assert_eq!(
+            manual_link_count(&state, "note", "src"),
+            1,
+            "manual row created"
+        );
         // ...and the source note body is UNCHANGED — no [[Target Note]] / links block materialized.
         let body = state.db.get_note_row("src").unwrap().unwrap().text;
-        assert_eq!(body, before, "the note body is byte-unchanged (no materialize); got: {body}");
+        assert_eq!(
+            body, before,
+            "the note body is byte-unchanged (no materialize); got: {body}"
+        );
         assert!(
             !body.contains("murmur:links") && !body.contains("[[Target Note]]"),
             "no managed links block injected into the source note; got: {body}"
         );
         // No `wikilink` edge is derived either (the body block that produced it is gone).
-        assert_eq!(link_count_in(&state, "note", "src", "wikilink"), 0, "no derived wikilink edge");
+        assert_eq!(
+            link_count_in(&state, "note", "src", "wikilink"),
+            0,
+            "no derived wikilink edge"
+        );
 
         // The manual edge is the visible chip (removable-manual), from the source side.
         let unlocked = unlocked_snapshot(&state).unwrap();
@@ -795,18 +805,29 @@
         };
         let legacy_body =
             crate::enrich::apply_link_markers("original body\n", std::slice::from_ref(&legacy_hit));
-        assert!(legacy_body.contains("[[Target Note]]"), "precondition: legacy marker seeded");
+        assert!(
+            legacy_body.contains("[[Target Note]]"),
+            "precondition: legacy marker seeded"
+        );
         seed_note_doc_cmd(&state.db, "src", "f-open", "Source Note", &legacy_body);
         seed_note_doc_cmd(&state.db, "dst", "f-open", "Target Note", "target body");
 
         link_items_inner(&state, "note", "src", "note", "dst").unwrap();
-        assert_eq!(manual_link_count(&state, "note", "src"), 1, "precondition: manual row exists");
+        assert_eq!(
+            manual_link_count(&state, "note", "src"),
+            1,
+            "precondition: manual row exists"
+        );
 
         // Unlink note src → note dst.
         unlink_items_inner(&state, "note", "src", "note", "dst").unwrap();
 
         // The manual row is gone...
-        assert_eq!(manual_link_count(&state, "note", "src"), 0, "manual row deleted");
+        assert_eq!(
+            manual_link_count(&state, "note", "src"),
+            0,
+            "manual row deleted"
+        );
         // ...and the stale legacy [[Target Note]] marker is stripped from the body (legacy cleanup).
         let body = state.db.get_note_row("src").unwrap().unwrap().text;
         assert!(
@@ -843,10 +864,20 @@
             "a sealed destination endpoint must refuse with Locked; got {err:?}"
         );
         // No manual row was written (fail-closed BEFORE the write).
-        assert_eq!(manual_link_count(&state, "note", "src"), 0, "no row written behind the lock");
+        assert_eq!(
+            manual_link_count(&state, "note", "src"),
+            0,
+            "no row written behind the lock"
+        );
         // And the source body was NOT materialized.
         assert!(
-            !state.db.get_note_row("src").unwrap().unwrap().text.contains("[["),
+            !state
+                .db
+                .get_note_row("src")
+                .unwrap()
+                .unwrap()
+                .text
+                .contains("[["),
             "no marker written when the link is refused"
         );
 
@@ -872,11 +903,25 @@
         // An OPEN imported document (linkable) + a SEALED imported document (must refuse).
         state
             .db
-            .insert_document("doc-open", "f-open", "Contract.pdf", "extracted text", "document", 0i64)
+            .insert_document(
+                "doc-open",
+                "f-open",
+                "Contract.pdf",
+                "extracted text",
+                "document",
+                0i64,
+            )
             .unwrap();
         state
             .db
-            .insert_document("doc-seal", "f-lock", "Secret.pdf", "secret extracted", "document", 0i64)
+            .insert_document(
+                "doc-seal",
+                "f-lock",
+                "Secret.pdf",
+                "secret extracted",
+                "document",
+                0i64,
+            )
             .unwrap();
         state
             .db
@@ -917,21 +962,34 @@
         // A note source (open) and a MEETING destination in the lockable folder.
         seed_note_doc_cmd(&state.db, "src", "f-open", "Source Note", "body\n");
         seed_meeting(&state.db, "m-dst", "# Meeting body\n", Some("f-lock"));
-        state.db.set_meeting_title("m-dst", "Secret Meeting").unwrap();
+        state
+            .db
+            .set_meeting_title("m-dst", "Secret Meeting")
+            .unwrap();
 
         link_items_inner(&state, "note", "src", "meeting", "m-dst").unwrap();
 
         // Both open → edge visible from either side.
         let open = unlocked_snapshot(&state).unwrap();
         assert_eq!(
-            state.db.links_for_visible(crate::links::LinkKind::Note, "src", &open).unwrap()
-                .iter().filter(|e| e.other_id == "m-dst").count(),
+            state
+                .db
+                .links_for_visible(crate::links::LinkKind::Note, "src", &open)
+                .unwrap()
+                .iter()
+                .filter(|e| e.other_id == "m-dst")
+                .count(),
             1,
             "edge visible from the note side while both open"
         );
         assert_eq!(
-            state.db.links_for_visible(crate::links::LinkKind::Meeting, "m-dst", &open).unwrap()
-                .iter().filter(|e| e.other_id == "src").count(),
+            state
+                .db
+                .links_for_visible(crate::links::LinkKind::Meeting, "m-dst", &open)
+                .unwrap()
+                .iter()
+                .filter(|e| e.other_id == "src")
+                .count(),
             1,
             "edge visible from the meeting side while both open"
         );
@@ -943,22 +1001,38 @@
             .unwrap();
         let sealed = unlocked_snapshot(&state).unwrap(); // still empty — f-lock not session-unlocked.
         assert!(
-            state.db.links_for_visible(crate::links::LinkKind::Note, "src", &sealed).unwrap()
-                .iter().all(|e| e.other_id != "m-dst"),
+            state
+                .db
+                .links_for_visible(crate::links::LinkKind::Note, "src", &sealed)
+                .unwrap()
+                .iter()
+                .all(|e| e.other_id != "m-dst"),
             "sealed meeting neighbour hidden from the note side"
         );
         assert!(
-            state.db.links_for_visible(crate::links::LinkKind::Meeting, "m-dst", &sealed).unwrap()
+            state
+                .db
+                .links_for_visible(crate::links::LinkKind::Meeting, "m-dst", &sealed)
+                .unwrap()
                 .is_empty(),
             "a sealed queried meeting never reveals it HAS a manual link"
         );
 
         // Session-unlock the meeting's folder → edge restored on both sides.
-        state.unlocked_folders.lock().unwrap().insert("f-lock".to_string());
+        state
+            .unlocked_folders
+            .lock()
+            .unwrap()
+            .insert("f-lock".to_string());
         let unlocked = unlocked_snapshot(&state).unwrap();
         assert_eq!(
-            state.db.links_for_visible(crate::links::LinkKind::Note, "src", &unlocked).unwrap()
-                .iter().filter(|e| e.other_id == "m-dst").count(),
+            state
+                .db
+                .links_for_visible(crate::links::LinkKind::Note, "src", &unlocked)
+                .unwrap()
+                .iter()
+                .filter(|e| e.other_id == "m-dst")
+                .count(),
             1,
             "edge restored from the note side once the meeting folder is unlocked"
         );
@@ -967,16 +1041,16 @@
     /// Insert a raw semantic edge (`status`) between two note ids and return its row id — so the
     /// accept/dismiss gate tests have a concrete link to act on without running the real auto pass.
     fn insert_semantic_link(state: &AppState, src_id: &str, dst_id: &str, status: &str) -> i64 {
-        state
-            .db
-            .insert_link_for_test("note", src_id, "note", dst_id, "semantic", 0.9, "auto", status)
+        state.db.insert_link_for_test(
+            "note", src_id, "note", dst_id, "semantic", 0.9, "auto", status,
+        )
     }
 
     /// Insert a raw wikilink edge (deterministic) and return its row id.
     fn insert_wikilink_link(state: &AppState, src_id: &str, dst_id: &str) -> i64 {
-        state
-            .db
-            .insert_link_for_test("note", src_id, "note", dst_id, "wikilink", 1.0, "user", "active")
+        state.db.insert_link_for_test(
+            "note", src_id, "note", dst_id, "wikilink", 1.0, "user", "active",
+        )
     }
 
     /// Fix 5 (RED before the accept/dismiss gate): DISMISS on a link whose ENDPOINT is
@@ -992,7 +1066,10 @@
         let id = insert_semantic_link(&state, "open", "secret", "suggested");
         // Seal the secret endpoint's folder (NOT session-unlocked).
         state.db.seal_document("secret", &b"ct"[..]).unwrap();
-        state.db.set_folder_locked("f-lock", true, Some(&b"wrapped"[..])).unwrap();
+        state
+            .db
+            .set_folder_locked("f-lock", true, Some(&b"wrapped"[..]))
+            .unwrap();
 
         let err = dismiss_link_inner(&state, id).unwrap_err();
         assert!(
@@ -1001,7 +1078,10 @@
         );
         // The row was NOT tombstoned (fail-closed before the write).
         let (_sk, _si, _dk, _di, _et, status) = state.db.link_by_id(id).unwrap().unwrap();
-        assert_eq!(status, "suggested", "the suggestion must be untouched after a refused dismiss");
+        assert_eq!(
+            status, "suggested",
+            "the suggestion must be untouched after a refused dismiss"
+        );
     }
 
     /// Fix 5: DISMISS on a DETERMINISTIC (wikilink) edge is refused (InvalidArg) — dismissal is for
@@ -1034,7 +1114,10 @@
         let id = insert_semantic_link(&state, "a", "b", "suggested");
         dismiss_link_inner(&state, id).unwrap();
         let (_sk, _si, _dk, _di, _et, status) = state.db.link_by_id(id).unwrap().unwrap();
-        assert_eq!(status, "dismissed", "an open suggestion is tombstoned by dismiss");
+        assert_eq!(
+            status, "dismissed",
+            "an open suggestion is tombstoned by dismiss"
+        );
     }
 
     /// Fix 5: ACCEPT validates the id is a real SUGGESTION — accepting a non-existent id is InvalidArg,
@@ -1047,7 +1130,10 @@
         seed_note_doc_cmd(&state.db, "b", "f-open", "B", "body");
         // Unknown id → InvalidArg.
         let err = accept_link_inner(&state, 999_999).unwrap_err();
-        assert!(matches!(err, AppError::InvalidArg(_)), "unknown id must be InvalidArg; got {err:?}");
+        assert!(
+            matches!(err, AppError::InvalidArg(_)),
+            "unknown id must be InvalidArg; got {err:?}"
+        );
         // A wikilink (active, deterministic) is NOT an acceptable suggestion.
         let wid = insert_wikilink_link(&state, "a", "b");
         let err2 = accept_link_inner(&state, wid).unwrap_err();
@@ -1068,7 +1154,10 @@
         seed_note_doc_cmd(&state.db, "secret", "f-lock", "Secret Note", "secret");
         let id = insert_semantic_link(&state, "open", "secret", "suggested");
         state.db.seal_document("secret", &b"ct"[..]).unwrap();
-        state.db.set_folder_locked("f-lock", true, Some(&b"wrapped"[..])).unwrap();
+        state
+            .db
+            .set_folder_locked("f-lock", true, Some(&b"wrapped"[..]))
+            .unwrap();
 
         let err = accept_link_inner(&state, id).unwrap_err();
         assert!(
@@ -1076,7 +1165,10 @@
             "accept on a sealed-endpoint suggestion must refuse with Locked; got {err:?}"
         );
         let (_sk, _si, _dk, _di, _et, status) = state.db.link_by_id(id).unwrap().unwrap();
-        assert_eq!(status, "suggested", "the suggestion must stay suggested after a refused accept");
+        assert_eq!(
+            status, "suggested",
+            "the suggestion must stay suggested after a refused accept"
+        );
     }
 
     /// A VALID accept (semantic suggestion between two owned, visible notes) flips the row off
@@ -1095,7 +1187,10 @@
         accept_link_inner(&state, id).expect("a valid accept between two open notes must succeed");
 
         let (_sk, _si, _dk, _di, _et, status) = state.db.link_by_id(id).unwrap().unwrap();
-        assert_ne!(status, "suggested", "an accepted suggestion must no longer be 'suggested'");
+        assert_ne!(
+            status, "suggested",
+            "an accepted suggestion must no longer be 'suggested'"
+        );
         // NEITHER note body was touched — no [[Title]] / links block materialized.
         let a_after = state.db.get_note_row("a").unwrap().unwrap().text;
         let b_after = state.db.get_note_row("b").unwrap().unwrap().text;
@@ -1219,18 +1314,14 @@
 
         // No matching candidate → None (the caller surfaces the primary error).
         assert!(
-            try_unwrap_ck_with_candidates(&[[7u8; 32]], &wrapped, "f-rec", Some(&kek_new))
-                .is_none()
+            try_unwrap_ck_with_candidates(&[[7u8; 32]], &wrapped, "f-rec", Some(&kek_new)).is_none()
         );
         // AAD binding holds: the right KEK under the WRONG folder id must not unwrap.
         assert!(
-            try_unwrap_ck_with_candidates(&candidates, &wrapped, "f-other", Some(&kek_new))
-                .is_none()
+            try_unwrap_ck_with_candidates(&candidates, &wrapped, "f-other", Some(&kek_new)).is_none()
         );
         // The already-tried primary is skipped even if listed as a candidate.
-        assert!(
-            try_unwrap_ck_with_candidates(&[kek_new], &wrapped, "f-rec", Some(&kek_new)).is_none()
-        );
+        assert!(try_unwrap_ck_with_candidates(&[kek_new], &wrapped, "f-rec", Some(&kek_new)).is_none());
         // With NO already-tried key (the primary release itself failed), all candidates are tried.
         let (_, winner2, _) = try_unwrap_ck_with_candidates(&candidates, &wrapped, "f-rec", None)
             .expect("recovery with no primary must still find the sealing KEK");
@@ -1356,9 +1447,9 @@
             }
             let body = r#"{"accessToken":"fresh-access","refreshToken":"fresh-refresh","deviceId":"dev-1","accessExpiresAt":"2099-01-01T00:00:00Z"}"#;
             let resp = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                body.len()
-            );
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
             sock.write_all(resp.as_bytes()).unwrap();
             String::from_utf8_lossy(&req).to_string()
         });
@@ -1449,8 +1540,7 @@
     fn refresh_failure_fallback_policy() {
         let auth = refresh_failure_fallback(AppError::Auth("refused".into()), "cached".into());
         assert!(matches!(auth, Err(AppError::Auth(_))));
-        let net =
-            refresh_failure_fallback(AppError::Unavailable("offline".into()), "cached".into());
+        let net = refresh_failure_fallback(AppError::Unavailable("offline".into()), "cached".into());
         assert_eq!(net.unwrap(), "cached");
         let storage = refresh_failure_fallback(AppError::Storage("disk".into()), "cached".into());
         assert_eq!(storage.unwrap(), "cached");
@@ -1634,6 +1724,44 @@
         );
     }
 
+    /// The idempotency fast path is also a read surface. If the accepted meeting's folder has since
+    /// been sealed, it may return identity metadata but never the retained real title.
+    #[test]
+    fn accept_share_idempotency_masks_title_after_folder_is_locked() {
+        let state = build_state("accept-idem-locked");
+        let target = get_or_create_shared_folder(&state).unwrap();
+        let (sender, _s, recipient, _r) = mode_b_pair();
+        let env = ShareEnvelope::new(
+            "Private acquisition",
+            "confidential body",
+            "2026-07-04T10:00:00Z",
+        );
+        let (up, content, sender_fp) =
+            craft_valid_grant(&sender, &recipient, &env, "share-locked-idem", 1);
+        let first = accept_ingest_verified(
+            &state,
+            &target,
+            &recipient,
+            &sender_fp,
+            "s",
+            &up,
+            &content,
+            "share-locked-idem",
+            1,
+            1,
+        )
+        .unwrap();
+        state
+            .db
+            .set_folder_locked(&target.id, true, Some(&b"wrapped"[..]))
+            .unwrap();
+
+        let again =
+            block_on(accept_share_inner(&state, "share-locked-idem".to_string(), None)).unwrap();
+        assert_eq!(again.meeting_id, first.meeting_id);
+        assert_eq!(again.title, "🔒 Locked");
+    }
+
     /// §4.8 BINDING through the command layer: an UNSIGNED (zeroed-sig) grant, a TAMPERED content
     /// cell, and a REPLAY to the wrong recipient are ALL rejected `InvalidArg` and write NOTHING.
     #[test]
@@ -1674,8 +1802,7 @@
         );
 
         // (c) Replay to the WRONG recipient (grant addressed to `recipient`, opened by `attacker`).
-        let attacker =
-            derive_identity(&generate_master_key().unwrap(), "attacker@acct", 1).unwrap();
+        let attacker = derive_identity(&generate_master_key().unwrap(), "attacker@acct", 1).unwrap();
         let (up, content, sender_fp) = craft_valid_grant(&sender, &recipient, &env, "s-c", 1);
         let e = accept_ingest_verified(
             &state, &target, &attacker, &sender_fp, "s", &up, &content, "s-c", 1, 1,
@@ -1816,16 +1943,25 @@
     fn voice_command_arm_refuses_without_a_live_consumer() {
         // Not recording at all → "not recording", regardless of live_running.
         assert_eq!(
-            voice_command_arm_decision(None, true).unwrap_err().reason.as_deref(),
+            voice_command_arm_decision(None, true)
+                .unwrap_err()
+                .reason
+                .as_deref(),
             Some("not recording")
         );
         assert_eq!(
-            voice_command_arm_decision(None, false).unwrap_err().reason.as_deref(),
+            voice_command_arm_decision(None, false)
+                .unwrap_err()
+                .reason
+                .as_deref(),
             Some("not recording")
         );
         // RECORDING but NO live consumer (the fresh-install wedge) → refuse cleanly, arm nothing.
-        let refusal = voice_command_arm_decision(Some(4800), false).unwrap_err();
-        assert!(!refusal.listening, "must not arm a consumer-less generation");
+        let refusal = voice_command_arm_decision(Some((4800, 52_800)), false).unwrap_err();
+        assert!(
+            !refusal.listening,
+            "must not arm a consumer-less generation"
+        );
         assert_eq!(
             refusal.reason.as_deref(),
             Some("voice needs the live model"),
@@ -1833,8 +1969,8 @@
         );
         // RECORDING + a live consumer → cleared to arm at the latched offset.
         assert_eq!(
-            voice_command_arm_decision(Some(4800), true).unwrap(),
-            4800,
+            voice_command_arm_decision(Some((4800, 52_800)), true).unwrap(),
+            (4800, 52_800),
             "with a live consumer, the click arms at the latched offset"
         );
     }
@@ -1864,15 +2000,12 @@
             *g = Some(CaptureState::armed());
         }
         let armed = *state.voice_command_capture.lock().unwrap();
-        assert_eq!(
-            armed,
-            Some(CaptureState {
-                budget: CaptureState::DEFAULT_BUDGET,
-                start_sample: None,
-                ended: false
-            }),
-            "arming must store a fresh full-budget capture the live loop can consume"
-        );
+        let armed = armed.expect("capture armed");
+        assert_eq!(armed.budget, CaptureState::DEFAULT_BUDGET);
+        assert_eq!(armed.start_sample, None);
+        assert_eq!(armed.max_end_sample, None);
+        assert!(!armed.ended);
+        assert_ne!(armed.generation, 0);
     }
 
     /// CLICK-TO-STOP: `end_voice_command` on an ARMED capture flips `ended` so the live loop
@@ -1884,7 +2017,7 @@
         let state = build_state("voicecmd-end-armed");
         {
             let mut g = state.voice_command_capture.lock().unwrap();
-            *g = Some(CaptureState::armed_from(1000));
+            *g = Some(CaptureState::armed_from(1000, 61_000));
         }
 
         let res = end_voice_command_inner(&state).unwrap();
@@ -1903,6 +2036,30 @@
             after.start_sample,
             Some(1000),
             "the latched offset is preserved"
+        );
+    }
+
+    #[test]
+    fn manual_voice_stop_latch_is_exact_bounded_and_never_widens() {
+        assert_eq!(
+            latch_manual_end_sample(Some(100), Some(6_100), Some(350)),
+            Some(350),
+            "the click position becomes the exact end"
+        );
+        assert_eq!(
+            latch_manual_end_sample(Some(100), Some(6_100), Some(9_000)),
+            Some(6_100),
+            "the click cannot widen the hard 60-second cap"
+        );
+        assert_eq!(
+            latch_manual_end_sample(Some(100), Some(350), Some(500)),
+            Some(350),
+            "a repeated later Stop cannot widen an already latched end"
+        );
+        assert_eq!(
+            latch_manual_end_sample(Some(100), Some(6_100), Some(80)),
+            Some(100),
+            "a stale observation before arm clamps to an empty exact range"
         );
     }
 
@@ -2050,12 +2207,19 @@
         let m2 = compose_companion_markdown(&m1, "Q3 Planning", "Second jot.");
         assert!(m2.contains("First jot."), "prior content is never blanked");
         assert!(m2.contains("Second jot."));
-        assert_eq!(m2.matches("meeting:").count(), 1, "no duplicate meeting key on re-append");
+        assert_eq!(
+            m2.matches("meeting:").count(),
+            1,
+            "no duplicate meeting key on re-append"
+        );
 
         // A rename REWRITES the link line to the new name (no duplicate, body intact).
         let m3 = compose_companion_markdown(&m2, "Q3 Planning (final)", "");
         assert!(m3.contains("meeting: \"[[Q3 Planning (final)]]\""));
-        assert!(!m3.contains("[[Q3 Planning]]\""), "the stale link is replaced");
+        assert!(
+            !m3.contains("[[Q3 Planning]]\""),
+            "the stale link is replaced"
+        );
         assert!(m3.contains("First jot.") && m3.contains("Second jot."));
         assert_eq!(m3.matches("meeting:").count(), 1);
 
@@ -2109,11 +2273,21 @@
 
         // Second append reuses the SAME note and preserves the first block.
         let r2 = append_to_companion_note_inner(&state, "m-rec", "Second jotted note.").unwrap();
-        assert_eq!(r2.note_id, r1.note_id, "one living companion note per meeting");
+        assert_eq!(
+            r2.note_id, r1.note_id,
+            "one living companion note per meeting"
+        );
         let row = state.db.get_note_row(&r1.note_id).unwrap().unwrap();
-        assert!(row.text.contains("First jotted note."), "first block preserved");
+        assert!(
+            row.text.contains("First jotted note."),
+            "first block preserved"
+        );
         assert!(row.text.contains("Second jotted note."));
-        assert_eq!(row.text.matches("meeting:").count(), 1, "no duplicate front-matter link");
+        assert_eq!(
+            row.text.matches("meeting:").count(),
+            1,
+            "no duplicate front-matter link"
+        );
         // manual_notes appended (never overwritten): both blocks present.
         let mn = state.db.get_manual_notes("m-rec").unwrap();
         assert!(mn.contains("First jotted note.") && mn.contains("Second jotted note."));
@@ -2126,15 +2300,20 @@
     fn append_to_companion_note_refused_for_sealed_meeting() {
         let state = build_state("companion-lockgate");
         make_open_folder(&state.db, "f-lock", "Secret");
-        seed_titled_meeting(&state.db, "m-locked", "Board strategy", "/data/m.wav", "f-lock");
+        seed_titled_meeting(
+            &state.db,
+            "m-locked",
+            "Board strategy",
+            "/data/m.wav",
+            "f-lock",
+        );
         state
             .db
             .set_folder_locked("f-lock", true, Some(&b"wrapped"[..]))
             .unwrap();
         // NOT session-unlocked.
 
-        let err =
-            append_to_companion_note_inner(&state, "m-locked", "secret note").unwrap_err();
+        let err = append_to_companion_note_inner(&state, "m-locked", "secret note").unwrap_err();
         assert!(
             matches!(err, AppError::Locked(_)),
             "a sealed meeting must refuse with Locked, got: {err:?}"
@@ -2168,16 +2347,26 @@
         let r = append_to_companion_note_inner(&state, "m-sync", "a jot").unwrap();
 
         // Rename the meeting → sync updates the note's title + link.
-        state.db.set_meeting_title("m-sync", "Renamed Topic").unwrap();
+        state
+            .db
+            .set_meeting_title("m-sync", "Renamed Topic")
+            .unwrap();
         sync_companion_note_title_best_effort(&state, "m-sync");
 
         let row = state.db.get_note_row(&r.note_id).unwrap().unwrap();
-        assert_eq!(row.title.as_deref(), Some("Renamed Topic"), "managed title synced");
+        assert_eq!(
+            row.title.as_deref(),
+            Some("Renamed Topic"),
+            "managed title synced"
+        );
         assert!(
             row.text.contains("meeting: \"[[Renamed Topic]]\""),
             "front-matter link synced to the new title"
         );
-        assert!(row.text.contains("a jot"), "body content preserved through the sync");
+        assert!(
+            row.text.contains("a jot"),
+            "body content preserved through the sync"
+        );
     }
 
     /// DOCUMENT-FIRST EAGER-CREATE (v2, Task 1): `get_or_create_companion_note` returns a REAL note id
@@ -2205,7 +2394,11 @@
         assert_eq!(r1.meeting_wikilink, "[[Sync 2026-07-17]]");
         // The note exists, is id-linked, and carries the front-matter link but an EMPTY body.
         assert_eq!(
-            state.db.companion_note_for_meeting("m-doc").unwrap().as_deref(),
+            state
+                .db
+                .companion_note_for_meeting("m-doc")
+                .unwrap()
+                .as_deref(),
             Some(r1.note_id.as_str())
         );
         let row = state.db.get_note_row(&r1.note_id).unwrap().unwrap();
@@ -2213,13 +2406,19 @@
             row.text.contains("meeting: \"[[Sync 2026-07-17]]\""),
             "front-matter link stamped on the eager-created note"
         );
-        assert!(companion_body_is_empty(&row.text), "no body written by the eager create");
+        assert!(
+            companion_body_is_empty(&row.text),
+            "no body written by the eager create"
+        );
         // No manual_notes mirror from this path.
         assert_eq!(state.db.get_manual_notes("m-doc").unwrap(), "");
 
         // Idempotent: a second call reuses the same note.
         let r2 = get_or_create_companion_note_inner(&state, "m-doc").unwrap();
-        assert_eq!(r2.note_id, r1.note_id, "one living companion note per meeting");
+        assert_eq!(
+            r2.note_id, r1.note_id,
+            "one living companion note per meeting"
+        );
     }
 
     /// EMPTY-COMPANION CLEANUP (v2, Task 2, RED→GREEN): `delete_companion_note_if_empty` deletes an
@@ -2228,6 +2427,10 @@
     /// front-matter-blind emptiness check (the managed `meeting:` link would falsely read as content).
     #[test]
     fn delete_companion_note_if_empty_deletes_empty_keeps_nonempty() {
+        assert!(companion_cleanup_allowed(Some(true)));
+        assert!(!companion_cleanup_allowed(Some(false)));
+        assert!(!companion_cleanup_allowed(None));
+
         // Case A: an EAGER-created, never-written companion note (body empty) is deleted.
         let state = build_state("companion-delete-empty");
         state
@@ -2246,10 +2449,27 @@
         let r = get_or_create_companion_note_inner(&state, "m-empty").unwrap();
         assert!(state.db.get_note_row(&r.note_id).unwrap().is_some());
 
-        let deleted = block_on(delete_companion_note_if_empty_inner(&state, "m-empty")).unwrap();
+        let skipped = block_on(delete_empty_companion_after_confirmed_flush(
+            &state, "m-empty", false,
+        ))
+        .unwrap();
+        assert!(!skipped, "unconfirmed flush skips empty-stub deletion");
+        assert!(
+            state.db.get_note_row(&r.note_id).unwrap().is_some(),
+            "timeout/failure preserves the row for a late save"
+        );
+
+        let deleted = block_on(delete_empty_companion_after_confirmed_flush(
+            &state, "m-empty", true,
+        ))
+        .unwrap();
         assert!(deleted, "a body-empty companion note is deleted");
         assert!(
-            state.db.companion_note_for_meeting("m-empty").unwrap().is_none(),
+            state
+                .db
+                .companion_note_for_meeting("m-empty")
+                .unwrap()
+                .is_none(),
             "the empty companion note is gone"
         );
 
@@ -2352,8 +2572,16 @@
         seed_titled_meeting(db, "m1", "Shared standup", "/data/m1.wav", "f-open");
 
         db.insert_org_share(
-            "share-meeting-1", "org-1", Some("m1"), None, "meeting", Some("Shared standup"), 1, 1,
-            &[5u8; 32], "2026-07-15T00:00:00Z",
+            "share-meeting-1",
+            "org-1",
+            Some("m1"),
+            None,
+            "meeting",
+            Some("Shared standup"),
+            1,
+            1,
+            &[5u8; 32],
+            "2026-07-15T00:00:00Z",
         )
         .unwrap();
         db.set_org_share_uploaded("share-meeting-1", "item-meeting-1", "2026-07-15T00:00:00Z")
@@ -2372,6 +2600,33 @@
         assert!(
             db.get_meeting("m1").unwrap().is_some(),
             "a failed (revoke-blocked) delete must not have removed the local meeting"
+        );
+    }
+
+    /// Direct IPC must not destroy a sealed meeting without a session unlock. This intentionally
+    /// leaves residual plaintext in the row to model a crash between logical lock and cleanup: the
+    /// delete path must consult only the content-free anchor before returning `Locked`.
+    #[test]
+    fn delete_locked_meeting_refuses_before_content_or_network_access() {
+        let state = build_state("meeting-delete-locked");
+        make_open_folder(&state.db, "f-locked", "Secret");
+        seed_titled_meeting(
+            &state.db,
+            "m-locked",
+            "Residual secret title",
+            "/data/residual-secret.wav",
+            "f-locked",
+        );
+        state
+            .db
+            .set_folder_locked("f-locked", true, Some(&b"wrapped"[..]))
+            .unwrap();
+
+        let error = block_on(delete_meeting_inner(&state, "m-locked")).unwrap_err();
+        assert!(matches!(error, AppError::Locked(_)), "got {error:?}");
+        assert!(
+            state.db.get_meeting("m-locked").unwrap().is_some(),
+            "the locked meeting survives the refused delete"
         );
     }
 
@@ -2639,7 +2894,8 @@
             .insert("f1".to_string());
         let unlocked = unlocked_snapshot(&state).unwrap();
         assert!(
-            gated_memory_brief_for_injection(&state, &unlocked, "what did we ship?").contains("Polish replies"),
+            gated_memory_brief_for_injection(&state, &unlocked, "what did we ship?")
+                .contains("Polish replies"),
             "a session unlock must re-admit the user fact to the Ask brief"
         );
 
@@ -2716,31 +2972,34 @@
         ));
 
         // STUB (default install): 0 imported, NO synthetic meeting left behind.
-        let n = import_memories_inner(
-            &state.db,
-            &crate::reason::StubReasoner,
-            true,
-            "I like tea",
-        )
-        .unwrap();
+        let n =
+            import_memories_inner(&state.db, &crate::reason::StubReasoner, true, "I like tea").unwrap();
         assert_eq!(n, 0);
-        assert_eq!(count_import_meetings(&state.db), 0, "stub must not create a meeting");
+        assert_eq!(
+            count_import_meetings(&state.db),
+            0,
+            "stub must not create a meeting"
+        );
         assert!(state.db.user_facts_all().unwrap().is_empty());
 
         // REAL extraction: 2 added, anchored to ONE synthetic meeting, visible via the gated read.
-        let n = import_memories_inner(&state.db, &MockImportBrain, true, "chatgpt export text")
-            .unwrap();
+        let n =
+            import_memories_inner(&state.db, &MockImportBrain, true, "chatgpt export text").unwrap();
         assert_eq!(n, 2);
         assert_eq!(count_import_meetings(&state.db), 1);
         let visible = state.db.list_user_facts_visible(&none).unwrap();
-        assert_eq!(visible.len(), 2, "imported facts are visible (no-folder meeting)");
+        assert_eq!(
+            visible.len(),
+            2,
+            "imported facts are visible (no-folder meeting)"
+        );
         assert!(visible
             .iter()
             .all(|f| f.meeting_id.as_deref().unwrap().starts_with("import-")));
 
         // RE-IMPORT of the same text: pure dedup — 0 new, and NO second synthetic meeting.
-        let n = import_memories_inner(&state.db, &MockImportBrain, true, "chatgpt export text")
-            .unwrap();
+        let n =
+            import_memories_inner(&state.db, &MockImportBrain, true, "chatgpt export text").unwrap();
         assert_eq!(n, 0, "re-import must reconcile to NoOps");
         assert_eq!(
             count_import_meetings(&state.db),
@@ -2838,7 +3097,10 @@
             .filter(|f| f.predicate == "prefers")
             .collect();
         assert_eq!(visible.len(), 1);
-        assert_eq!(visible[0].object, "Polish replies", "the import's value is current");
+        assert_eq!(
+            visible[0].object, "Polish replies",
+            "the import's value is current"
+        );
 
         // DELETE the synthetic import ⇒ the reconcile is REVERSED: the prior fact REOPENS, and the
         // import's own Adds are gone.
@@ -2871,7 +3133,11 @@
             .into_iter()
             .filter(|f| f.predicate == "prefers")
             .collect();
-        assert_eq!(visible_after.len(), 1, "exactly one open 'prefers' fact after undo");
+        assert_eq!(
+            visible_after.len(),
+            1,
+            "exactly one open 'prefers' fact after undo"
+        );
         assert_eq!(
             visible_after[0].object, "English replies",
             "the prior value is current again after undoing the import"
@@ -2933,12 +3199,20 @@
         seed_meeting(&state.db, "m1", "# note", Some("f-lock"));
 
         // A rollup exported to the vault, exactly as the hourly job leaves it.
-        let md = vault.join("brain").join("memory").join("weekly-2026-W28.md");
+        let md = vault
+            .join("brain")
+            .join("memory")
+            .join("weekly-2026-W28.md");
         std::fs::create_dir_all(md.parent().unwrap()).unwrap();
         std::fs::write(&md, "---\nmurmur: memory-rollup\n---\n\nsecret synthesis\n").unwrap();
         state
             .db
-            .upsert_memory_rollup("weekly:2026-W28", "secret synthesis", "h1", "2026-07-09T12:00:00Z")
+            .upsert_memory_rollup(
+                "weekly:2026-W28",
+                "secret synthesis",
+                "h1",
+                "2026-07-09T12:00:00Z",
+            )
             .unwrap();
         state
             .db
@@ -2951,13 +3225,21 @@
             state.db.list_memory_rollups().unwrap().is_empty(),
             "seal must purge every memory-rollup row"
         );
-        assert!(!md.exists(), "seal must delete the rollup's exported vault .md");
+        assert!(
+            !md.exists(),
+            "seal must delete the rollup's exported vault .md"
+        );
 
         // RELOCK path: re-seed (the folder stays locked=1 on disk), then relock_all.
         std::fs::write(&md, "stale synthesis").unwrap();
         state
             .db
-            .upsert_memory_rollup("weekly:2026-W28", "stale synthesis", "h2", "2026-07-09T13:00:00Z")
+            .upsert_memory_rollup(
+                "weekly:2026-W28",
+                "stale synthesis",
+                "h2",
+                "2026-07-09T13:00:00Z",
+            )
             .unwrap();
         state
             .db
@@ -3219,9 +3501,9 @@
         let sugg = suggest_speaker_labels_inner(&state, "cur").unwrap();
         assert_eq!(sugg.len(), 1, "the prior match surfaces one suggestion");
         assert_eq!(
-            sugg[0].speaker, "Speaker 2",
-            "suggestion MUST be keyed by the DISPLAY label the FE lane shows (not the raw others-1 tag)"
-        );
+                sugg[0].speaker, "Speaker 2",
+                "suggestion MUST be keyed by the DISPLAY label the FE lane shows (not the raw others-1 tag)"
+            );
         assert_eq!(sugg[0].suggested_label, "Anna");
     }
 
@@ -3402,8 +3684,7 @@
         let state = build_state("lock-clears-live");
         make_open_folder(&state.db, "f-lock", "Secret");
         seed_meeting(&state.db, "m1", "# note", Some("f-lock"));
-        *state.live_transcript.lock().unwrap() =
-            "stale tail of the just-recorded meeting".to_string();
+        *state.live_transcript.lock().unwrap() = "stale tail of the just-recorded meeting".to_string();
         assert!(
             state.recorder.lock().unwrap().is_none(),
             "precondition: not recording"
@@ -3607,19 +3888,19 @@
             })
             .unwrap();
         state
-            .db
-            .upsert_note(&NoteRecord {
-                meeting_id: "m1".to_string(),
-                provider_id: "claude_code".to_string(),
-                // Line 0 heading, 1 blank, 2 supported claim, 3 blank, 4 unsupported paraphrase.
-                markdown: "## Summary\n\nWe shipped the login page and the payment flow.\n\nThe entirely separate teleporter prototype launched successfully.".to_string(),
-                created_at: "2026-06-27T09:05:00Z".to_string(),
-                exported_path: None,
-                model_requested: None,
-                model_served: None,
-                gateway_host: None,
-            })
-            .unwrap();
+                .db
+                .upsert_note(&NoteRecord {
+                    meeting_id: "m1".to_string(),
+                    provider_id: "claude_code".to_string(),
+                    // Line 0 heading, 1 blank, 2 supported claim, 3 blank, 4 unsupported paraphrase.
+                    markdown: "## Summary\n\nWe shipped the login page and the payment flow.\n\nThe entirely separate teleporter prototype launched successfully.".to_string(),
+                    created_at: "2026-06-27T09:05:00Z".to_string(),
+                    exported_path: None,
+                    model_requested: None,
+                    model_served: None,
+                    gateway_host: None,
+                })
+                .unwrap();
         state
             .db
             .insert_segments(
@@ -3817,7 +4098,9 @@
             .set_folder_locked("f-lock", true, Some(&b"wrapped"[..]))
             .unwrap();
         assert!(
-            get_fact_receipt_inner(&state, "m1", fact_text).unwrap().is_none(),
+            get_fact_receipt_inner(&state, "m1", fact_text)
+                .unwrap()
+                .is_none(),
             "sealed-not-unlocked meeting must leak NO fact receipt (no times/speakers)"
         );
 
@@ -3828,7 +4111,9 @@
             .unwrap()
             .insert("f-lock".to_string());
         assert!(
-            get_fact_receipt_inner(&state, "m1", fact_text).unwrap().is_some(),
+            get_fact_receipt_inner(&state, "m1", fact_text)
+                .unwrap()
+                .is_some(),
             "session-unlock restores the fact receipt"
         );
     }
@@ -3943,8 +4228,7 @@
 
         // Make the folder unrecoverable (foreign wrapped key no candidate holds).
         let foreign_wrapped =
-            crate::crypto::encrypt(&[0x42u8; 32], &[0x24u8; 32], &aad_wrapped_ck("f-lock"))
-                .unwrap();
+            crate::crypto::encrypt(&[0x42u8; 32], &[0x24u8; 32], &aad_wrapped_ck("f-lock")).unwrap();
         state
             .db
             .set_folder_locked("f-lock", true, Some(&foreign_wrapped))
@@ -4035,10 +4319,10 @@
         // The RED anchor: the RAW read still returns 2 rows (text blanked) — an UNGATED lazy read
         // would leak exactly these, so the gate below must collapse them to [].
         assert_eq!(
-            state.db.raw_segments("m1").unwrap().len(),
-            2,
-            "sealed rows are kept (text blanked) — proves the gate, not an empty at-rest read, returns []"
-        );
+                state.db.raw_segments("m1").unwrap().len(),
+                2,
+                "sealed rows are kept (text blanked) — proves the gate, not an empty at-rest read, returns []"
+            );
 
         // GATE: sealed-not-unlocked → empty Vec. RED-if-`meeting_is_unlocked`-gate-removed.
         let masked = get_meeting_segments_inner(&state, "m1").unwrap();
@@ -4066,16 +4350,30 @@
         // load-bearing fields explicitly rather than widen a shipped type's derive.)
         let unlocked = get_meeting_segments_inner(&state, "m1").unwrap();
         let direct = state.db.get_segments("m1").unwrap();
-        assert_eq!(unlocked.len(), 2, "the full transcript is surfaced once unlocked");
-        assert_eq!(unlocked.len(), direct.len(), "lazy read row count == db.get_segments");
+        assert_eq!(
+            unlocked.len(),
+            2,
+            "the full transcript is surfaced once unlocked"
+        );
+        assert_eq!(
+            unlocked.len(),
+            direct.len(),
+            "lazy read row count == db.get_segments"
+        );
         for (a, b) in unlocked.iter().zip(direct.iter()) {
             assert_eq!(a.idx, b.idx, "idx identical to db.get_segments");
             assert_eq!(a.start_s, b.start_s, "start_s identical");
             assert_eq!(a.end_s, b.end_s, "end_s identical");
             assert_eq!(a.text, b.text, "text identical (restored plaintext)");
         }
-        assert_eq!(unlocked[0].text, "alpha bravo", "segment 0 restored byte-identical");
-        assert_eq!(unlocked[1].text, "charlie delta", "segment 1 restored byte-identical");
+        assert_eq!(
+            unlocked[0].text, "alpha bravo",
+            "segment 0 restored byte-identical"
+        );
+        assert_eq!(
+            unlocked[1].text, "charlie delta",
+            "segment 1 restored byte-identical"
+        );
     }
 
     /// REMOVE-LOCK: permanently removing a folder's lock decrypts the typed notes back to plaintext
@@ -4123,11 +4421,23 @@
         make_open_folder(&state.db, "f-open", "Open");
         state
             .db
-            .insert_note("other", "f-open", "Other Note", "Other Note", "body", 1_700_000_000_000)
+            .insert_note(
+                "other",
+                "f-open",
+                "Other Note",
+                "Other Note",
+                "body",
+                1_700_000_000_000,
+            )
             .unwrap();
         // Locked folder holds a meeting whose note links to the open target.
         make_open_folder(&state.db, "f-lock", "Secret");
-        seed_meeting(&state.db, "m1", "see [[Other Note]] for context", Some("f-lock"));
+        seed_meeting(
+            &state.db,
+            "m1",
+            "see [[Other Note]] for context",
+            Some("f-lock"),
+        );
 
         // Index the wikilink while open (as a real save would), then verify it exists.
         let nothing = std::collections::HashSet::new();
@@ -4148,11 +4458,19 @@
                 .filter(|e| e.edge_type == "wikilink")
                 .count()
         };
-        assert_eq!(wikilink_edges(&state.db, &nothing), 1, "wikilink edge exists before seal");
+        assert_eq!(
+            wikilink_edges(&state.db, &nothing),
+            1,
+            "wikilink edge exists before seal"
+        );
 
         // LOCK → the seal's purge_links_tx drops the edge at rest (and the sealed source is masked).
         lock_folder_inner(&state, "f-lock".to_string()).unwrap();
-        assert_eq!(wikilink_edges(&state.db, &nothing), 0, "wikilink edge purged by the seal");
+        assert_eq!(
+            wikilink_edges(&state.db, &nothing),
+            0,
+            "wikilink edge purged by the seal"
+        );
 
         // Cache the KEK, then PERMANENTLY remove the lock.
         let kek = secrets::get_or_create_master_kek().unwrap();
@@ -4348,7 +4666,10 @@
 
         // Sealed + NOT in the session set → Locked (never insert plaintext behind the lock).
         let e1 = insert_extracted_document(&db, &unlocked, "f-arc", "x.md", "secret").unwrap_err();
-        assert!(matches!(e1, AppError::Locked(_)), "sealed insert must be Locked, got {e1:?}");
+        assert!(
+            matches!(e1, AppError::Locked(_)),
+            "sealed insert must be Locked, got {e1:?}"
+        );
         assert!(
             list_documents_inner(&state, "f-arc").unwrap().is_empty(),
             "no row inserted while sealed"
@@ -4365,9 +4686,15 @@
         );
 
         // And the up-front async-task gate agrees on every case.
-        assert!(import_document_write_gate(&state, "f-arc").is_ok(), "unlocked passes the up-front gate");
         assert!(
-            matches!(import_document_write_gate(&state, "nope"), Err(AppError::InvalidArg(_))),
+            import_document_write_gate(&state, "f-arc").is_ok(),
+            "unlocked passes the up-front gate"
+        );
+        assert!(
+            matches!(
+                import_document_write_gate(&state, "nope"),
+                Err(AppError::InvalidArg(_))
+            ),
             "unknown folder fails the up-front gate"
         );
     }
@@ -4380,8 +4707,8 @@
         let state = build_state("text-import");
         make_open_folder(&state.db, "f-open", "Project");
 
-        let id = import_text_inner(&state, "Decisions", "We ship the beta on Friday.", "f-open")
-            .unwrap();
+        let id =
+            import_text_inner(&state, "Decisions", "We ship the beta on Friday.", "f-open").unwrap();
         assert_eq!(
             get_document_inner(&state, &id).unwrap(),
             "We ship the beta on Friday.",
@@ -4398,7 +4725,10 @@
             state.db.doc_chunk_count(&id).unwrap() >= 1,
             "the note must be chunked regardless of model presence (always-chunk)"
         );
-        if crate::embed::embed_model_present() {
+        // Test builds intentionally refuse real Metal embedding unless explicitly opted in, even
+        // on a developer Mac that has the model files installed. Assert against the same real-only
+        // persistence seam used by production rather than raw filesystem presence.
+        if crate::embed::active_persistence_embedder().is_ok() {
             assert!(
                 state.db.doc_vec_count(&id).unwrap() >= 1,
                 "with the e5 model present, the chunks must carry real vectors"
@@ -4623,8 +4953,16 @@
         state
             .db
             .insert_org_share(
-                "share-1", "org-1", None, Some(&id), "document", Some("A Doc"), 1, 1,
-                &[3u8; 32], "2026-07-15T00:00:00Z",
+                "share-1",
+                "org-1",
+                None,
+                Some(&id),
+                "document",
+                Some("A Doc"),
+                1,
+                1,
+                &[3u8; 32],
+                "2026-07-15T00:00:00Z",
             )
             .unwrap();
         state
@@ -4644,7 +4982,7 @@
         assert_ne!(
             row.state, "uploaded",
             "a live org share must be (at least) marked revoke_pending before the delete gives up, \
-             never left uploaded — that's the resurrection bug"
+                 never left uploaded — that's the resurrection bug"
         );
     }
 
@@ -4702,8 +5040,16 @@
         state
             .db
             .insert_org_share(
-                "share-note-1", "org-1", None, Some(&id), "note", Some("Shared note"), 1, 1,
-                &[4u8; 32], "2026-07-15T00:00:00Z",
+                "share-note-1",
+                "org-1",
+                None,
+                Some(&id),
+                "note",
+                Some("Shared note"),
+                1,
+                1,
+                &[4u8; 32],
+                "2026-07-15T00:00:00Z",
             )
             .unwrap();
         state
@@ -4720,7 +5066,7 @@
         assert_ne!(
             row.state, "uploaded",
             "a live org share must be moved off `uploaded` before the delete gives up — \
-             never left dangling live, that's the resurrection bug"
+                 never left dangling live, that's the resurrection bug"
         );
         // The local note row must SURVIVE the failed delete — fail loud means fail WHOLE, not
         // half-deleted-locally-with-a-dangling-server-copy.
@@ -4958,7 +5304,9 @@
 
         // Locked-not-unlocked → empty (schema not exposed), even though a row exists in the DB.
         assert!(
-            get_note_folder_schema_inner(&state, &fid).unwrap().is_empty(),
+            get_note_folder_schema_inner(&state, &fid)
+                .unwrap()
+                .is_empty(),
             "sealed-not-unlocked folder's schema must not be exposed"
         );
 
@@ -5000,7 +5348,9 @@
         assert_eq!(rows[0].title, "Task A");
         assert_eq!(
             rows[0].values.get("status"),
-            Some(&crate::storage::models::PropertyValue::Select("Done".into()))
+            Some(&crate::storage::models::PropertyValue::Select(
+                "Done".into()
+            ))
         );
     }
 
@@ -5032,8 +5382,16 @@
                 &state,
                 &fid,
                 vec![
-                    PropertySchemaField { key: "Owner".into(), kind: PropertyKind::Text, options: vec![] },
-                    PropertySchemaField { key: "owner".into(), kind: PropertyKind::Text, options: vec![] },
+                    PropertySchemaField {
+                        key: "Owner".into(),
+                        kind: PropertyKind::Text,
+                        options: vec![]
+                    },
+                    PropertySchemaField {
+                        key: "owner".into(),
+                        kind: PropertyKind::Text,
+                        options: vec![]
+                    },
                 ]
             )
             .unwrap_err(),
@@ -5117,7 +5475,10 @@
         assert!(!unlocked.locked);
         assert_eq!(unlocked.title, "Launch plan");
         assert!(unlocked.markdown.contains("launch code"));
-        assert_eq!(unlocked.tags, vec!["secret".to_string(), "launch".to_string()]);
+        assert_eq!(
+            unlocked.tags,
+            vec!["secret".to_string(), "launch".to_string()]
+        );
         assert_eq!(
             unlocked.properties.get("status"),
             Some(&"draft".to_string())
@@ -5142,7 +5503,10 @@
             url: Some("[[Prior Note]]".to_string()),
         };
         let stored = crate::enrich::apply_link_markers(prose, std::slice::from_ref(&hit));
-        assert!(stored.contains("murmur:links"), "precondition: block seeded into stored text");
+        assert!(
+            stored.contains("murmur:links"),
+            "precondition: block seeded into stored text"
+        );
         seed_note_doc_cmd(&state.db, "n1", "f-open", "Note One", &stored);
 
         let doc = get_note_inner(&state, "n1").unwrap();
@@ -5159,10 +5523,20 @@
             "the strip restores the prose byte-for-byte (front-matter + heading + text preserved)"
         );
         // Front-matter tags still parse (the block sat in the BODY, not the front-matter).
-        assert_eq!(doc.tags, vec!["a".to_string(), "b".to_string()], "front-matter tags preserved");
+        assert_eq!(
+            doc.tags,
+            vec!["a".to_string(), "b".to_string()],
+            "front-matter tags preserved"
+        );
         // The stored DB text is UNCHANGED by a read (cleanup happens on the next save, not the read).
         assert!(
-            state.db.get_note_row("n1").unwrap().unwrap().text.contains("murmur:links"),
+            state
+                .db
+                .get_note_row("n1")
+                .unwrap()
+                .unwrap()
+                .text
+                .contains("murmur:links"),
             "get_note is a READ — it does not rewrite the DB row (natural save-time cleanup)"
         );
     }
@@ -5180,7 +5554,10 @@
         };
         // A body that is JUST the block (apply_link_markers over an empty note).
         let stored = crate::enrich::apply_link_markers("", std::slice::from_ref(&hit));
-        assert!(stored.contains("murmur:links"), "precondition: block-only body");
+        assert!(
+            stored.contains("murmur:links"),
+            "precondition: block-only body"
+        );
         seed_note_doc_cmd(&state.db, "only", "f-open", "Only Block", &stored);
 
         let doc = get_note_inner(&state, "only").unwrap();
@@ -5213,7 +5590,10 @@
         let masked = get_note_inner(&state, &id).unwrap();
         assert!(masked.locked, "sealed note reports locked");
         assert_eq!(masked.title, "🔒 Locked", "sealed note title masked");
-        assert_eq!(masked.markdown, "", "sealed note body never leaks (no strip attempted)");
+        assert_eq!(
+            masked.markdown, "",
+            "sealed note body never leaks (no strip attempted)"
+        );
         // The masked DTO is the SAME whether or not the sealed text had a block — nothing about the
         // block escapes the mask.
         assert!(
@@ -5270,8 +5650,8 @@
         );
         // The user pastes a bare forged links fence AFTER the real machine block.
         let stored = format!(
-            "{real}\n\nmore prose\n<!-- murmur:links -->\nkeepme forged\n<!-- /murmur:links -->\ntail\n"
-        );
+                "{real}\n\nmore prose\n<!-- murmur:links -->\nkeepme forged\n<!-- /murmur:links -->\ntail\n"
+            );
         seed_note_doc_cmd(&state.db, "scanall", "f-open", "ScanAll", &stored);
 
         let doc = get_note_inner(&state, "scanall").unwrap();
@@ -5298,8 +5678,7 @@
     fn note_markdown_survives_lock_unlock_byte_identical() {
         let state = build_state("note-seal-cycle");
         let fid = create_note_folder_inner(&state, "Vault", None).unwrap().id;
-        let original =
-            "---\ntags: [zażółć, launch]\n---\n# Decyzja 🔒\nAnna owns QA; ship on Friday.";
+        let original = "---\ntags: [zażółć, launch]\n---\n# Decyzja 🔒\nAnna owns QA; ship on Friday.";
         let id = create_note_inner(&state, Some(&fid), "Decyzja").unwrap();
         update_note_doc_inner(&state, &id, "Decyzja", original).unwrap();
 
@@ -5311,7 +5690,10 @@
             .unwrap()
             .expect("row still present");
         assert_eq!(sealed.text, "", "note plaintext blanked while sealed");
-        assert!(sealed.sealed, "note sealed under the folder CK (blob present)");
+        assert!(
+            sealed.sealed,
+            "note sealed under the folder CK (blob present)"
+        );
         assert_eq!(
             state.db.doc_chunk_count(&id).unwrap(),
             0,
@@ -5405,8 +5787,7 @@
         let id = create_note_inner(&state, Some(&fid), "Draft").unwrap();
 
         // Cheap save: body persisted + retrievable via get_note, updated_at set…
-        let now =
-            save_note_text_inner(&state, &id, "Draft", "Alpha bravo cheap-save body.").unwrap();
+        let now = save_note_text_inner(&state, &id, "Draft", "Alpha bravo cheap-save body.").unwrap();
         let doc = get_note_inner(&state, &id).unwrap();
         assert_eq!(doc.markdown, "Alpha bravo cheap-save body.");
         assert_eq!(doc.updated_at, now);
@@ -5484,8 +5865,13 @@
         let state = build_state_with_vault("note-relock-leak", &vault);
         let fid = create_note_folder_inner(&state, "Ideas", None).unwrap().id;
         let id = create_note_inner(&state, Some(&fid), "Secret roadmap").unwrap();
-        update_note_doc_inner(&state, &id, "Secret roadmap", "# Secret\nInternal launch April.")
-            .unwrap();
+        update_note_doc_inner(
+            &state,
+            &id,
+            "Secret roadmap",
+            "# Secret\nInternal launch April.",
+        )
+        .unwrap();
 
         // LOCK: .md deleted, exported_path NULL.
         lock_folder_inner(&state, fid.clone()).unwrap();
@@ -5583,13 +5969,10 @@
     }
 
     /// R2 (residual W5 at the INITIAL seal) RED-before-GREEN — `lock_folder_inner`'s authored-note
-    /// `.md` cleanup must clear each row's `exported_path` ONLY after its file was actually
-    /// deleted (or is already absent): one failing delete keeps EXACTLY that row's path recorded
-    /// (the next relock/startup pass retries the file) while the lock itself still completes.
-    /// Pre-fix the cleanup bulk-cleared the whole folder's `exported_path` regardless of per-file
-    /// delete success, forgetting a leaked plaintext `.md` forever.
+    /// `.md` cleanup preflights the complete governed set BEFORE the first removal. One invalid
+    /// path keeps every file/path intact and aborts before the durable locked bit is published.
     #[test]
-    fn lock_keeps_exported_path_of_a_note_md_that_failed_to_delete() {
+    fn lock_fails_closed_and_keeps_exported_path_of_a_note_md_that_failed_to_delete() {
         let vault = tmp_vault("lock-w5-initial");
         let state = build_state_with_vault("lock-w5-initial", &vault);
         let fid = create_note_folder_inner(&state, "Ideas", None).unwrap().id;
@@ -5619,17 +6002,34 @@
         std::fs::create_dir(&pb).unwrap();
         std::fs::write(std::path::Path::new(&pb).join("occupant.txt"), "x").unwrap();
 
-        lock_folder_inner(&state, fid.clone()).unwrap(); // the lock itself still completes
+        assert!(matches!(
+            lock_folder_inner(&state, fid.clone()).unwrap_err(),
+            AppError::Storage(_)
+        ));
+        assert!(
+            !state.db.folder_by_id(&fid).unwrap().unwrap().locked,
+            "the all-files preflight aborts before locked=1 is published"
+        );
 
         assert!(
-            !std::path::Path::new(&pa).exists(),
-            "the deletable note's .md is gone after lock"
+            std::path::Path::new(&pa).exists(),
+            "the valid sibling is not removed when another export fails preflight"
         );
-        let rows = state.db.note_exported_path_rows_in_folder(&fid).unwrap();
+        let rows: std::collections::HashMap<_, _> = state
+            .db
+            .note_exported_path_rows_in_folder(&fid)
+            .unwrap()
+            .into_iter()
+            .collect();
         assert_eq!(
-            rows,
-            vec![(b.clone(), pb.clone())],
-            "exactly the failed-delete row keeps its exported_path for the retry pass"
+            rows.get(&a).map(String::as_str),
+            Some(pa.as_str()),
+            "the valid row keeps its cleanup authority"
+        );
+        assert_eq!(
+            rows.get(&b).map(String::as_str),
+            Some(pb.as_str()),
+            "the failed row keeps its cleanup authority"
         );
     }
 
@@ -5673,7 +6073,10 @@
         state.unlocked_folders.lock().unwrap().remove(&fid);
         reblank_folder_extras(&state, &fid).unwrap();
         let at_rest = state.db.get_note_row(&id).unwrap().unwrap();
-        assert_eq!(at_rest.text, "", "plaintext re-blanked at rest after relock");
+        assert_eq!(
+            at_rest.text, "",
+            "plaintext re-blanked at rest after relock"
+        );
         assert!(at_rest.sealed, "seal blob present at rest");
 
         // UNLOCK again: the EDIT must come back — not the stale lock-time seal.
@@ -5826,7 +6229,11 @@
                 let pt = crate::crypto::decrypt(&ck, blob, &aad).unwrap();
                 state
                     .db
-                    .restore_note_markdown(&n.meeting_id, &n.provider_id, &String::from_utf8(pt).unwrap())
+                    .restore_note_markdown(
+                        &n.meeting_id,
+                        &n.provider_id,
+                        &String::from_utf8(pt).unwrap(),
+                    )
                     .unwrap();
             }
         }
@@ -5876,6 +6283,7 @@
             config: cfg,
             meeting_id,
             app: None,
+            recording_token: None,
             allow_writes: true,
             note_drafts: false,
             scope: crate::tools::AssistantScope::Full,
@@ -5990,9 +6398,9 @@
         );
         let row = state.db.get_note_row(&id).unwrap().unwrap();
         assert_eq!(
-            row.folder_id, src,
-            "a failed seal must leave the note in the SOURCE folder, never stranded in the locked target"
-        );
+                row.folder_id, src,
+                "a failed seal must leave the note in the SOURCE folder, never stranded in the locked target"
+            );
         assert!(!row.sealed, "no stale/wrong-CK blob may be written");
         assert_eq!(
             row.exported_path.as_deref(),
@@ -6029,15 +6437,14 @@
     }
 
     /// Residual W5 (RED-before-GREEN, relock half): when the relock cleanup FAILS to delete a
-    /// re-exported note `.md`, that note's `exported_path` must be KEPT so the next relock/startup
-    /// pass retries — before the fix the bulk clear NULLed every path regardless, forgetting the
-    /// leaked plaintext `.md` forever. A deletable sibling is still cleaned + cleared normally.
+    /// re-exported note `.md`, relock must FAIL CLOSED and that note's `exported_path` must be KEPT
+    /// so the next relock/startup pass retries — before the fix the bulk clear NULLed every path
+    /// regardless, forgetting the leaked plaintext `.md` forever.
     #[test]
     fn relock_keeps_exported_path_when_md_delete_fails() {
         let state = build_state("relock-keep-path");
         let fid = create_note_folder_inner(&state, "Vault", None).unwrap().id;
         let keep = create_note_inner(&state, Some(&fid), "Undeletable").unwrap();
-        let gone = create_note_inner(&state, Some(&fid), "Deletable").unwrap();
         lock_folder_inner(&state, fid.clone()).unwrap();
 
         // Simulate the crash/permission shape where the recorded path cannot be deleted: a
@@ -6051,18 +6458,20 @@
                 .as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("deletable.md");
-        std::fs::write(&file, "# re-exported plaintext").unwrap();
         state
             .db
             .set_note_doc_exported_path(&keep, Some(dir.to_str().unwrap()))
             .unwrap();
         state
             .db
-            .set_note_doc_exported_path(&gone, Some(file.to_str().unwrap()))
+            .set_note_doc_exported_hash(&keep, Some(&"00".repeat(32)))
             .unwrap();
 
-        reblank_folder_extras(&state, &fid).unwrap();
+        let error = reblank_folder_extras(&state, &fid).unwrap_err();
+        assert!(
+            matches!(error, AppError::Storage(_)),
+            "an ambiguous/non-file export must abort relock fail-closed, got {error:?}"
+        );
 
         let kept_row = state.db.get_note_row(&keep).unwrap().unwrap();
         assert_eq!(
@@ -6070,13 +6479,6 @@
             dir.to_str(),
             "a FAILED .md delete must keep exported_path recorded for retry"
         );
-        let gone_row = state.db.get_note_row(&gone).unwrap().unwrap();
-        assert!(
-            gone_row.exported_path.is_none(),
-            "a successful .md delete clears exported_path as before"
-        );
-        assert!(!file.exists(), "the deletable .md is removed");
-
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -6224,7 +6626,7 @@
             assert!(
                 system.contains("the same language as the selected text"),
                 "{action} must always match the selection's own language, ignoring the \
-                 note_language pin ('pl'); got: {system}"
+                     note_language pin ('pl'); got: {system}"
             );
             assert!(
                 !system.contains("language code 'pl'"),
@@ -6324,8 +6726,7 @@
 
         // refine: one call, even if longer — the second scripted output must NOT be consumed.
         let p2 = Scripted::new(&["a longer refined version of the passage", "UNUSED"]);
-        let (out2, _) =
-            block_on(generate_note_edit(&p2, "refine", "sys", "usr", opts, 3)).unwrap();
+        let (out2, _) = block_on(generate_note_edit(&p2, "refine", "sys", "usr", opts, 3)).unwrap();
         assert_eq!(
             out2, "a longer refined version of the passage",
             "refine must not retry"
@@ -6342,8 +6743,13 @@
 
         // The note being edited — its own body contains the query term, but it must NOT self-cite.
         let self_id = create_note_inner(&state, Some(&fid), "Self").unwrap();
-        update_note_doc_inner(&state, &self_id, "Self", "The launchcode discussion is here.")
-            .unwrap();
+        update_note_doc_inner(
+            &state,
+            &self_id,
+            "Self",
+            "The launchcode discussion is here.",
+        )
+        .unwrap();
         // A DIFFERENT visible note that also mentions the term — this SHOULD be a citation.
         let other_id = create_note_inner(&state, Some(&fid), "Other").unwrap();
         update_note_doc_inner(&state, &other_id, "Other", "More on the launchcode topic.").unwrap();
@@ -6443,7 +6849,10 @@
             .iter()
             .find(|c| c.kind == "org")
             .expect("an org-brain match must surface as a kind:\"org\" citation");
-        assert_eq!(org_cite.id, "it-launchcode", "id is the org item id, for /org-item routing");
+        assert_eq!(
+            org_cite.id, "it-launchcode",
+            "id is the org item id, for /org-item routing"
+        );
         assert_eq!(org_cite.title, "Anna's launchcode notes");
     }
 
@@ -6533,8 +6942,7 @@
             Ok(String::new())
         }
         async fn complete(&self, _s: &str, _u: &str) -> crate::error::Result<String> {
-            self.calls
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(self.reply.clone())
         }
     }
@@ -6807,8 +7215,13 @@
 
         // link_entities only wraps the PROVIDED names.
         let le = brain_menu_req("n1", "link_entities");
-        let (s3, u3) =
-            build_note_assist_prompt("link_entities", &le, &[], &["Acme Corp".to_string()], "auto");
+        let (s3, u3) = build_note_assist_prompt(
+            "link_entities",
+            &le,
+            &[],
+            &["Acme Corp".to_string()],
+            "auto",
+        );
         assert!(
             u3.contains("Acme Corp"),
             "link_entities must pass the known names to link: {u3}"
@@ -6868,7 +7281,10 @@
             .find(|f| f.name == "Standups")
             .expect("Standups folder created");
         let moved = state.db.get_note_row(&id).unwrap().unwrap();
-        assert_eq!(moved.folder_id, standups.id, "note moved into the new folder");
+        assert_eq!(
+            moved.folder_id, standups.id,
+            "note moved into the new folder"
+        );
         // The note is still readable (non-destructive).
         assert!(!get_note_inner(&state, &id).unwrap().markdown.is_empty());
     }
@@ -6908,7 +7324,10 @@
         let id = create_note_inner(&state, Some(&fid), "Roadmap").unwrap();
         update_note_doc_inner(&state, &id, "Roadmap", "Ship Q3.").unwrap();
 
-        assert!(!get_note_inner(&state, &id).unwrap().shared, "not shared yet");
+        assert!(
+            !get_note_inner(&state, &id).unwrap().shared,
+            "not shared yet"
+        );
 
         // Record an active outbound note share (the bookkeeping half of share_note_to_link_doc).
         state
@@ -6930,7 +7349,10 @@
         );
 
         // Revoke → shared:false.
-        state.db.set_outbound_share_state("sh-1", "revoked").unwrap();
+        state
+            .db
+            .set_outbound_share_state("sh-1", "revoked")
+            .unwrap();
         assert!(
             !get_note_inner(&state, &id).unwrap().shared,
             "shared:false after revoke"
@@ -6996,7 +7418,7 @@
         assert!(
             out.contains("Ulubiony"),
             "search_meetings must surface document CONTENT (not just echo the query in an \
-             empty-result sentinel); got: {out:?}"
+                 empty-result sentinel); got: {out:?}"
         );
         let out2 = crate::tools::execute_tool(
             &crate::tools::ToolCall::SearchSemantic {
@@ -7010,7 +7432,7 @@
         assert!(
             out2.contains("Ulubiony"),
             "search_semantic (flag OFF) must fall back to gated keyword doc search and surface \
-             document CONTENT; got: {out2:?}"
+                 document CONTENT; got: {out2:?}"
         );
     }
 
@@ -7047,7 +7469,7 @@
         assert!(
             out.contains("Ulubiony"),
             "semantic ON + no model must degrade to gated keyword doc search and surface CONTENT; \
-             got: {out:?}"
+                 got: {out:?}"
         );
     }
 
@@ -7146,8 +7568,7 @@
         for n in state.db.notes_in_folder(folder_id).unwrap() {
             if let Some(blob) = &n.content_blob {
                 let aad = aad_content(folder_id, &n.meeting_id, &n.provider_id, "note");
-                let md =
-                    String::from_utf8(crate::crypto::decrypt(&ck, blob, &aad).unwrap()).unwrap();
+                let md = String::from_utf8(crate::crypto::decrypt(&ck, blob, &aad).unwrap()).unwrap();
                 state
                     .db
                     .restore_note_markdown(&n.meeting_id, &n.provider_id, &md)
@@ -7228,9 +7649,9 @@
         // RED on the pre-fix code (unseal_folder_extras had no meeting re-index → stayed 0).
         unseal_folder_extras(&state, "f-lock", &ck, Some(&crate::embed::StubEmbedder)).unwrap();
         assert!(
-            state.db.note_chunk_count("m1").unwrap() > 0,
-            "production unlock re-indexes meeting note_chunks when the e5 model is present (was DEAD before the fix)"
-        );
+                state.db.note_chunk_count("m1").unwrap() > 0,
+                "production unlock re-indexes meeting note_chunks when the e5 model is present (was DEAD before the fix)"
+            );
         assert!(
             state.db.note_vec_count("m1").unwrap() > 0,
             "production unlock re-indexes meeting vec_chunks when the e5 model is present"
@@ -7289,9 +7710,9 @@
         unseal_folder_extras_permanent(&state, "f-lock", &ck, Some(&crate::embed::StubEmbedder))
             .unwrap();
         assert!(
-            state.db.note_chunk_count("m1").unwrap() > 0,
-            "remove-lock re-indexes meeting note_chunks when the e5 model is present (was DEAD before the fix)"
-        );
+                state.db.note_chunk_count("m1").unwrap() > 0,
+                "remove-lock re-indexes meeting note_chunks when the e5 model is present (was DEAD before the fix)"
+            );
         assert!(
             state.db.note_vec_count("m1").unwrap() > 0,
             "remove-lock re-indexes meeting vec_chunks"
@@ -7384,7 +7805,11 @@
                 let pt = crate::crypto::decrypt(&ck, blob, &aad).unwrap();
                 state
                     .db
-                    .restore_note_markdown(&n.meeting_id, &n.provider_id, &String::from_utf8(pt).unwrap())
+                    .restore_note_markdown(
+                        &n.meeting_id,
+                        &n.provider_id,
+                        &String::from_utf8(pt).unwrap(),
+                    )
                     .unwrap();
             }
         }
@@ -7445,8 +7870,7 @@
             crate::embed::EMBED_DIM
         }
         fn embed(&self, texts: &[String]) -> crate::error::Result<Vec<Vec<f32>>> {
-            self.calls
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             match self.state.lifecycle.try_lock() {
                 Ok(free) => drop(free),
                 Err(std::sync::TryLockError::WouldBlock) => {
@@ -7493,7 +7917,10 @@
         update_note_doc_inner_with(&state, "n-long", "Long", &body, Some(&rec)).unwrap();
 
         let calls = rec.call_sizes.into_inner().unwrap();
-        assert!(!calls.is_empty(), "the injected embedder must actually be exercised");
+        assert!(
+            !calls.is_empty(),
+            "the injected embedder must actually be exercised"
+        );
         assert!(
             calls.iter().all(|&n| n <= 8),
             "no single embed call on the note-save path may exceed the sub-batch size (8): {calls:?}"
@@ -7527,9 +7954,11 @@
             "the re-index must actually run (the probe is exercised)"
         );
         assert!(
-            !probe.saw_guard_held.load(std::sync::atomic::Ordering::SeqCst),
+            !probe
+                .saw_guard_held
+                .load(std::sync::atomic::Ordering::SeqCst),
             "the lifecycle guard must be RELEASED before the embed leg — holding it delays \
-             auto-relock and every lock/unlock op"
+                 auto-relock and every lock/unlock op"
         );
     }
 
@@ -7550,14 +7979,15 @@
             calls: std::sync::atomic::AtomicUsize::new(0),
             saw_guard_held: std::sync::atomic::AtomicBool::new(false),
         };
-        update_note_doc_inner_with(&state, "n1", "Plan", "quarterly plan body", Some(&probe))
-            .unwrap();
+        update_note_doc_inner_with(&state, "n1", "Plan", "quarterly plan body", Some(&probe)).unwrap();
         assert!(
             probe.calls.load(std::sync::atomic::Ordering::SeqCst) > 0,
             "the note re-index must actually run (the probe is exercised)"
         );
         assert!(
-            !probe.saw_guard_held.load(std::sync::atomic::Ordering::SeqCst),
+            !probe
+                .saw_guard_held
+                .load(std::sync::atomic::Ordering::SeqCst),
             "the lifecycle guard must be RELEASED before the note-body embed leg"
         );
     }
@@ -7625,7 +8055,10 @@
             .index_meeting_chunks("m1", &segments, &crate::embed::StubEmbedder)
             .unwrap();
         let before = state.db.note_chunk_texts("m1").unwrap().join("\n");
-        assert!(before.contains("zebrafish"), "precondition: original indexed");
+        assert!(
+            before.contains("zebrafish"),
+            "precondition: original indexed"
+        );
 
         // EDIT with the model "present" (stub) but the flag OFF → index left untouched.
         update_note_inner_with(
@@ -7651,7 +8084,8 @@
         .unwrap();
         let after_rename = state.db.note_chunk_texts("m1").unwrap().join("\n");
         assert!(
-            after_rename.contains("Quarterly strategy") && !after_rename.contains("Atlas kickoff renamed"),
+            after_rename.contains("Quarterly strategy")
+                && !after_rename.contains("Atlas kickoff renamed"),
             "flag OFF: a rename must NOT re-chunk the meeting"
         );
 
@@ -7757,7 +8191,14 @@
         );
         state
             .db
-            .insert_document("d1", "f-open", "spec.md", "spec zzdoctoken body", "document", 1)
+            .insert_document(
+                "d1",
+                "f-open",
+                "spec.md",
+                "spec zzdoctoken body",
+                "document",
+                1,
+            )
             .unwrap();
         state
             .db
@@ -7782,7 +8223,10 @@
         let (meetings, docs) =
             backfill_missing_brain_indexes(&state.db, true, false, &crate::embed::StubEmbedder)
                 .unwrap();
-        assert_eq!(meetings, 0, "model absent: no meeting indexing (no stub vectors)");
+        assert_eq!(
+            meetings, 0,
+            "model absent: no meeting indexing (no stub vectors)"
+        );
         assert_eq!(
             docs, 2,
             "model absent: both non-empty documents chunk-only backfilled (the empty row is zero-yield, never counted)"
@@ -7794,10 +8238,12 @@
 
         // PASS 2 — MODEL PRESENT (the model-arrived-later recovery the audit gap describes).
         let (meetings, docs) =
-            backfill_missing_brain_indexes(&state.db, true, true, &crate::embed::StubEmbedder)
-                .unwrap();
+            backfill_missing_brain_indexes(&state.db, true, true, &crate::embed::StubEmbedder).unwrap();
         assert_eq!(meetings, 1, "the note-carrying meeting is indexed");
-        assert_eq!(docs, 2, "chunked-but-vectorless docs re-embed once the model arrives");
+        assert_eq!(
+            docs, 2,
+            "chunked-but-vectorless docs re-embed once the model arrives"
+        );
         assert!(state.db.doc_chunk_vector_counts("d1").unwrap().1 > 0);
         assert!(state.db.note_chunk_count("m1").unwrap() > 0);
         assert!(state.db.note_vec_count("m1").unwrap() > 0);
@@ -7808,8 +8254,7 @@
 
         // PASS 3 — IDEMPOTENT: full coverage ⇒ a re-run touches nothing.
         let (meetings, docs) =
-            backfill_missing_brain_indexes(&state.db, true, true, &crate::embed::StubEmbedder)
-                .unwrap();
+            backfill_missing_brain_indexes(&state.db, true, true, &crate::embed::StubEmbedder).unwrap();
         assert_eq!((meetings, docs), (0, 0), "re-run is a no-op");
     }
 
@@ -7839,7 +8284,12 @@
     fn repair_tick_never_touches_sealed_folder_even_mid_session_unlock() {
         let state = build_state("repair-tick-sealed");
         make_open_folder(&state.db, "f-lock", "Secret");
-        seed_meeting(&state.db, "m1", "# Secret\n\nzzsealedtoken plan", Some("f-lock"));
+        seed_meeting(
+            &state.db,
+            "m1",
+            "# Secret\n\nzzsealedtoken plan",
+            Some("f-lock"),
+        );
         lock_folder_inner(&state, "f-lock".to_string()).unwrap();
         assert_eq!(
             state.db.note_chunk_count("m1").unwrap(),
@@ -7855,14 +8305,17 @@
                 let pt = crate::crypto::decrypt(&ck, blob, &aad).unwrap();
                 state
                     .db
-                    .restore_note_markdown(&n.meeting_id, &n.provider_id, &String::from_utf8(pt).unwrap())
+                    .restore_note_markdown(
+                        &n.meeting_id,
+                        &n.provider_id,
+                        &String::from_utf8(pt).unwrap(),
+                    )
                     .unwrap();
             }
         }
 
         let (meetings, docs) =
-            backfill_missing_brain_indexes(&state.db, true, true, &crate::embed::StubEmbedder)
-                .unwrap();
+            backfill_missing_brain_indexes(&state.db, true, true, &crate::embed::StubEmbedder).unwrap();
         assert_eq!(
             (meetings, docs),
             (0, 0),
@@ -7907,9 +8360,14 @@
             true,
             &crate::embed::StubEmbedder,
             2,
+            None,
         )
         .unwrap();
-        assert_eq!((m, d), (0, 2), "run 1 spends the whole cap on the first two docs");
+        assert_eq!(
+            (m, d),
+            (0, 2),
+            "run 1 spends the whole cap on the first two docs"
+        );
         let covered = (0..4)
             .filter(|i| {
                 state
@@ -7934,6 +8392,7 @@
             true,
             &crate::embed::StubEmbedder,
             2,
+            None,
         )
         .unwrap();
         assert_eq!((m, d), (0, 2), "run 2 continues from where run 1 stopped");
@@ -7945,9 +8404,14 @@
             true,
             &crate::embed::StubEmbedder,
             2,
+            None,
         )
         .unwrap();
-        assert_eq!((m, d), (1, 0), "run 3 indexes the meeting with the freed budget");
+        assert_eq!(
+            (m, d),
+            (1, 0),
+            "run 3 indexes the meeting with the freed budget"
+        );
         assert!(state.db.note_chunk_count("m1").unwrap() > 0);
 
         // RUN 4: full coverage ⇒ a no-op (idempotence preserved under the cap).
@@ -7957,6 +8421,7 @@
             true,
             &crate::embed::StubEmbedder,
             2,
+            None,
         )
         .unwrap();
         assert_eq!((m, d), (0, 0), "a capped tick still converges to the no-op");
@@ -7978,7 +8443,14 @@
             .unwrap();
         state
             .db
-            .insert_document("d-real", "f-open", "doc.md", "real doc body paragraph", "document", 2)
+            .insert_document(
+                "d-real",
+                "f-open",
+                "doc.md",
+                "real doc body paragraph",
+                "document",
+                2,
+            )
             .unwrap();
 
         // Cap 1: the empty note is probed first but yields nothing — the ONE budget slot must
@@ -7989,9 +8461,14 @@
             true,
             &crate::embed::StubEmbedder,
             1,
+            None,
         )
         .unwrap();
-        assert_eq!((m, d), (0, 1), "only the REAL doc counts as backfilled work");
+        assert_eq!(
+            (m, d),
+            (0, 1),
+            "only the REAL doc counts as backfilled work"
+        );
         assert!(
             state.db.doc_chunk_vector_counts("d-real").unwrap().0 > 0,
             "the real doc got the cap slot despite the zero-yield row ahead of it"
@@ -8005,9 +8482,14 @@
             true,
             &crate::embed::StubEmbedder,
             1,
+            None,
         )
         .unwrap();
-        assert_eq!((m, d), (0, 0), "zero-yield rows are not 'work' — the re-run is a no-op");
+        assert_eq!(
+            (m, d),
+            (0, 0),
+            "zero-yield rows are not 'work' — the re-run is a no-op"
+        );
     }
 
     /// RELOCK re-purges the freshly-rebuilt meeting chunks: a lock → unlock (re-index) → relock cycle
@@ -8433,9 +8915,354 @@
 
     // ── retry_transcription prep gates (salvage-from-disk, 2026-07-16) ──────────────────────────
 
+    struct ReleasedArchivedGenerationFixture {
+        key: crate::storage::models::RecordingGenerationKey,
+        mic_path: std::path::PathBuf,
+        archive_path: std::path::PathBuf,
+        archive_bytes: Vec<u8>,
+    }
+
+    fn stage_released_archived_generation(
+        state: &AppState,
+        meeting_id: &str,
+        folder_id: Option<&str>,
+    ) -> ReleasedArchivedGenerationFixture {
+        seed_meeting(&state.db, meeting_id, "# cleanup retry", folder_id);
+        let app_dir = crate::pipeline::recording_inflight_dir()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let inflight = crate::pipeline::recording_inflight_dir().unwrap();
+        let archive_dir = crate::pipeline::audio_dir().unwrap();
+        let legacy = app_dir.join(format!("legacy-{meeting_id}.f32"));
+        let mut raw = Vec::new();
+        for sample in [0.25f32, -0.5, 0.75, -1.0] {
+            raw.extend_from_slice(&sample.to_le_bytes());
+        }
+        std::fs::write(&legacy, raw).unwrap();
+        let recording = crate::audio::source::adopt_legacy_raw_recording(
+            &state.db,
+            meeting_id,
+            &legacy,
+            48_000,
+            None,
+            &inflight,
+        )
+        .unwrap();
+        std::fs::remove_file(legacy).unwrap();
+        let key = recording.key.clone();
+        let mic_path = recording.mic_path.clone();
+        let archive_path = archive_dir.join(format!("{}.archive.wav", key.generation_id()));
+        let archive_bytes = b"RIFF-canonical-archive-v1".to_vec();
+        std::fs::write(&archive_path, &archive_bytes).unwrap();
+        let archive_file = crate::audio::source::verify_existing_file(&archive_path).unwrap();
+        let archive = crate::storage::recording_store::VerifiedArchiveArtifact::from_file(
+            &key,
+            &archive_file,
+        )
+        .unwrap();
+        state
+            .db
+            .archive_recording_generation(&key, &recording.lease, &archive)
+            .unwrap();
+        recording.release_for_recovery(&state.db).unwrap();
+        state
+            .db
+            .finalize_meeting(
+                meeting_id,
+                "2026-07-22T12:01:00Z",
+                60,
+                &archive_path.to_string_lossy(),
+            )
+            .unwrap();
+        ReleasedArchivedGenerationFixture {
+            key,
+            mic_path,
+            archive_path,
+            archive_bytes,
+        }
+    }
+
+    fn corrupt_archived_generation(fixture: &ReleasedArchivedGenerationFixture) {
+        std::fs::write(&fixture.archive_path, b"RIFF-corrupted-archive-v1").unwrap();
+    }
+
+    fn restore_archived_generation(fixture: &ReleasedArchivedGenerationFixture) {
+        std::fs::write(&fixture.archive_path, &fixture.archive_bytes).unwrap();
+    }
+
+    #[test]
+    fn retry_reclaims_released_cleanup_after_transient_failure_without_restart() {
+        let app_dir = std::env::temp_dir().join(format!(
+            "murmur-retry-reclaim-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        crate::pipeline::with_test_recording_app_dir(app_dir.clone(), || {
+            let state = build_state("retry-reclaim");
+            let meeting_id = uuid::Uuid::new_v4().hyphenated().to_string();
+            let fixture = stage_released_archived_generation(&state, &meeting_id, None);
+            state
+                .db
+                .update_meeting_status(&meeting_id, MeetingStatus::Error)
+                .unwrap();
+
+            corrupt_archived_generation(&fixture);
+            assert!(retry_transcription_prep(&state, &meeting_id).is_err());
+            assert_eq!(
+                state.db.get_meeting(&meeting_id).unwrap().unwrap().status,
+                MeetingStatus::Error,
+                "failed cleanup must not claim the ordinary retry"
+            );
+            restore_archived_generation(&fixture);
+
+            assert_eq!(
+                retry_transcription_prep(&state, &meeting_id).unwrap(),
+                fixture.archive_path
+            );
+            assert_eq!(
+                state
+                    .db
+                    .get_recording_generation_snapshot(&fixture.key)
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                crate::storage::models::RecordingGenerationState::Retired
+            );
+            assert!(!fixture.mic_path.exists());
+            assert!(fixture.archive_path.exists());
+        });
+        std::fs::remove_dir_all(app_dir).unwrap();
+    }
+
+    #[test]
+    fn delete_reclaims_released_cleanup_after_transient_failure_without_restart() {
+        let app_dir = std::env::temp_dir().join(format!(
+            "murmur-delete-reclaim-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        crate::pipeline::with_test_recording_app_dir(app_dir.clone(), || {
+            let state = build_state("delete-reclaim");
+            let meeting_id = uuid::Uuid::new_v4().hyphenated().to_string();
+            let fixture = stage_released_archived_generation(&state, &meeting_id, None);
+
+            corrupt_archived_generation(&fixture);
+            assert!(block_on(delete_meeting_inner(&state, &meeting_id)).is_err());
+            assert!(state.db.get_meeting(&meeting_id).unwrap().is_some());
+            restore_archived_generation(&fixture);
+
+            block_on(delete_meeting_inner(&state, &meeting_id)).unwrap();
+            assert!(state.db.get_meeting(&meeting_id).unwrap().is_none());
+            assert!(state
+                .db
+                .get_recording_generation_snapshot(&fixture.key)
+                .unwrap()
+                .is_none());
+            assert!(!fixture.mic_path.exists());
+            assert!(!fixture.archive_path.exists());
+        });
+        std::fs::remove_dir_all(app_dir).unwrap();
+    }
+
+    #[test]
+    fn lock_reclaims_released_cleanup_after_transient_failure_without_restart() {
+        let app_dir = std::env::temp_dir().join(format!(
+            "murmur-lock-reclaim-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        crate::pipeline::with_test_recording_app_dir(app_dir.clone(), || {
+            let state = build_state("lock-reclaim");
+            let folder_id = format!("f-{}", uuid::Uuid::new_v4());
+            make_open_folder(&state.db, &folder_id, "CleanupLock");
+            let meeting_id = uuid::Uuid::new_v4().hyphenated().to_string();
+            let fixture =
+                stage_released_archived_generation(&state, &meeting_id, Some(&folder_id));
+
+            corrupt_archived_generation(&fixture);
+            assert!(lock_folder_inner(&state, folder_id.clone()).is_err());
+            assert!(!state.db.folder_by_id(&folder_id).unwrap().unwrap().locked);
+            restore_archived_generation(&fixture);
+
+            lock_folder_inner(&state, folder_id.clone()).unwrap();
+            assert!(state.db.folder_by_id(&folder_id).unwrap().unwrap().locked);
+            assert_eq!(
+                state
+                    .db
+                    .get_recording_generation_snapshot(&fixture.key)
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                crate::storage::models::RecordingGenerationState::Retired
+            );
+            assert!(!fixture.mic_path.exists());
+            assert!(!fixture.archive_path.exists());
+            assert!(std::path::PathBuf::from(format!(
+                "{}.enc",
+                fixture.archive_path.to_string_lossy()
+            ))
+            .exists());
+        });
+        std::fs::remove_dir_all(app_dir).unwrap();
+    }
+
+    #[test]
+    fn folder_lock_refuses_pending_legacy_recording_recovery() {
+        let state = build_state("lock-legacy-recovery");
+        let folder_id = format!("f-{}", uuid::Uuid::new_v4());
+        let meeting_id = uuid::Uuid::new_v4().hyphenated().to_string();
+        make_open_folder(&state.db, &folder_id, "LegacyRecovery");
+        seed_meeting(
+            &state.db,
+            &meeting_id,
+            "# pending legacy recovery",
+            Some(&folder_id),
+        );
+        state
+            .db
+            .update_meeting_status(&meeting_id, MeetingStatus::Error)
+            .unwrap();
+        state
+            .db
+            .mark_legacy_recording_recovery_pending(&meeting_id)
+            .unwrap();
+
+        assert!(matches!(
+            lock_folder_inner(&state, folder_id.clone()),
+            Err(AppError::Locked(_))
+        ));
+        assert!(!state.db.folder_by_id(&folder_id).unwrap().unwrap().locked);
+        assert!(state
+            .db
+            .meeting_has_pending_legacy_recording_recovery(&meeting_id)
+            .unwrap());
+    }
+
+    #[test]
+    fn locked_move_refuses_pending_legacy_recording_recovery() {
+        let state = build_state("move-legacy-recovery");
+        let folder_id = format!("f-{}", uuid::Uuid::new_v4());
+        make_open_folder(&state.db, &folder_id, "LegacyMove");
+        lock_folder_inner(&state, folder_id.clone()).unwrap();
+        session_unlock(&state, &folder_id);
+        let meeting_id = uuid::Uuid::new_v4().hyphenated().to_string();
+        seed_meeting(&state.db, &meeting_id, "# pending legacy recovery", None);
+        state
+            .db
+            .mark_legacy_recording_recovery_pending(&meeting_id)
+            .unwrap();
+
+        assert!(matches!(
+            move_into_locked_folder(&state, &meeting_id, &folder_id),
+            Err(AppError::Locked(_))
+        ));
+        assert_eq!(state.db.folder_for_meeting(&meeting_id).unwrap(), None);
+    }
+
+    #[test]
+    fn retry_and_delete_refuse_pending_legacy_recording_recovery() {
+        let state = build_state("mutate-legacy-recovery");
+        let meeting_id = uuid::Uuid::new_v4().hyphenated().to_string();
+        seed_meeting(&state.db, &meeting_id, "# pending legacy recovery", None);
+        state
+            .db
+            .update_meeting_status(&meeting_id, MeetingStatus::Error)
+            .unwrap();
+        state
+            .db
+            .mark_legacy_recording_recovery_pending(&meeting_id)
+            .unwrap();
+
+        assert!(retry_transcription_prep(&state, &meeting_id).is_err());
+        assert!(block_on(delete_meeting_inner(&state, &meeting_id)).is_err());
+        assert!(state.db.get_meeting(&meeting_id).unwrap().is_some());
+        assert!(state
+            .db
+            .meeting_has_pending_legacy_recording_recovery(&meeting_id)
+            .unwrap());
+    }
+
+    #[test]
+    fn locked_move_retries_cleanup_and_never_assigns_persistent_plaintext_generation() {
+        let app_dir = std::env::temp_dir().join(format!(
+            "murmur-move-reclaim-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        crate::pipeline::with_test_recording_app_dir(app_dir.clone(), || {
+            let state = build_state("move-reclaim");
+            let folder_id = format!("f-{}", uuid::Uuid::new_v4());
+            make_open_folder(&state.db, &folder_id, "MoveLocked");
+            lock_folder_inner(&state, folder_id.clone()).unwrap();
+            session_unlock(&state, &folder_id);
+
+            // An expired ARCHIVED generation whose first cleanup attempt fails must stay at root.
+            // Restoring the exact canonical archive lets the very next Move in this process claim,
+            // clean, retire, and only then assign+seal it into the locked folder.
+            let meeting_id = uuid::Uuid::new_v4().hyphenated().to_string();
+            let fixture = stage_released_archived_generation(&state, &meeting_id, None);
+            corrupt_archived_generation(&fixture);
+            assert!(move_into_locked_folder(&state, &meeting_id, &folder_id).is_err());
+            assert_eq!(state.db.folder_for_meeting(&meeting_id).unwrap(), None);
+            restore_archived_generation(&fixture);
+            move_into_locked_folder(&state, &meeting_id, &folder_id).unwrap();
+            assert_eq!(
+                state.db.folder_for_meeting(&meeting_id).unwrap().as_deref(),
+                Some(folder_id.as_str())
+            );
+            assert_eq!(
+                state
+                    .db
+                    .get_recording_generation_snapshot(&fixture.key)
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                crate::storage::models::RecordingGenerationState::Retired
+            );
+            assert!(!fixture.mic_path.exists());
+
+            // A genuinely live FINALIZED/raw generation is not cleanup-only recovery. It remains
+            // nonterminal, Move refuses before association, and the exact raw file survives.
+            let active_id = uuid::Uuid::new_v4().hyphenated().to_string();
+            seed_meeting(&state.db, &active_id, "# still recovering", None);
+            let inflight = crate::pipeline::recording_inflight_dir().unwrap();
+            let legacy = app_dir.join(format!("legacy-{active_id}.f32"));
+            std::fs::write(&legacy, 0.5f32.to_le_bytes()).unwrap();
+            let active = crate::audio::source::adopt_legacy_raw_recording(
+                &state.db, &active_id, &legacy, 48_000, None, &inflight,
+            )
+            .unwrap();
+            std::fs::remove_file(legacy).unwrap();
+            let raw_path = active.mic_path.clone();
+            assert!(move_into_locked_folder(&state, &active_id, &folder_id).is_err());
+            assert_eq!(state.db.folder_for_meeting(&active_id).unwrap(), None);
+            assert!(raw_path.exists(), "refused Move preserves the exact raw source");
+            active.release_for_recovery(&state.db).unwrap();
+        });
+        std::fs::remove_dir_all(app_dir).unwrap();
+    }
+
     /// Every fail-closed gate of `retry_transcription_prep`, in order: locked folder → `Locked`;
     /// non-Error status → refused; missing audio → refused; happy path claims `Error → Recording`
     /// exactly once (single-flight).
+    #[test]
+    fn retry_prep_refuses_while_recording_priority_is_starting_without_a_recorder_slot() {
+        let _serial = crate::perf::model_lifecycle_test_guard();
+        crate::perf::reset_model_lifecycle_for_test();
+        let state = build_state("retry-prep-starting-priority");
+        let owner = crate::perf::begin_recording_session().unwrap();
+
+        // Starting deliberately precedes capture installation, so the recorder slot is empty.
+        assert!(state.recorder.lock().unwrap().is_none());
+        let result = retry_transcription_prep(&state, "not-reached");
+
+        drop(owner);
+        crate::perf::reset_model_lifecycle_for_test();
+        assert!(matches!(result, Err(AppError::Audio(_))));
+    }
+
     #[test]
     fn retry_prep_gates_fail_closed_then_claims_single_flight() {
         let state = build_state("retry-prep");
@@ -8485,13 +9312,40 @@
             "a refused prep must not have claimed the row"
         );
 
+        // A durable generation recovery owner wins over the ordinary archive Retry path. This
+        // prevents a startup claim and a user click from transcribing/mutating the same meeting in
+        // parallel.
+        let owned_mid = uuid::Uuid::new_v4().to_string();
+        seed_meeting(&state.db, &owned_mid, "# recovery-owned", None);
+        state
+            .db
+            .update_meeting_status(&owned_mid, MeetingStatus::Error)
+            .unwrap();
+        let generation = crate::storage::models::RecordingGenerationKey::fresh(&owned_mid).unwrap();
+        let mic =
+            crate::storage::models::RecordingMicAssertion::for_generation(&generation, 48_000, 7, 11)
+                .unwrap();
+        let _owner = state
+            .db
+            .prepare_recording_generation(&generation, &mic, 120_000)
+            .unwrap();
+        assert!(matches!(
+            retry_transcription_prep(&state, &owned_mid),
+            Err(AppError::Storage(_))
+        ));
+
         // Happy path: Error + a real on-disk WAV → claimed (Error → Recording), path resolved.
         let wav = std::env::temp_dir().join(format!("murmur-retry-prep-{}.wav", std::process::id()));
         std::fs::write(&wav, b"RIFF-fake").unwrap();
         seed_meeting(&state.db, "m-retry", "# err", None);
         state
             .db
-            .finalize_meeting("m-retry", "2026-07-16T10:00:00Z", 60, &wav.to_string_lossy())
+            .finalize_meeting(
+                "m-retry",
+                "2026-07-16T10:00:00Z",
+                60,
+                &wav.to_string_lossy(),
+            )
             .unwrap();
         state
             .db
@@ -8509,38 +9363,39 @@
         let _ = std::fs::remove_file(&wav);
     }
 
-    /// LOCK MODEL — the mid-run-relock fail-closed purge branch of `finalize_salvage_lock_state`:
-    /// a salvage/retry whose folder got LOCKED (and not session-unlocked) while the pipeline ran
-    /// must not leave fresh plaintext at rest behind the lock. Blob-less segments are purged and
-    /// the plaintext WAV is removed ONLY because its sealed `.enc` twin survives; an OPEN folder
-    /// (or no folder) is a strict no-op.
+    /// LOCK MODEL — a salvage/retry pins the folder CK at entry. If screen-share relock lands while
+    /// Whisper is running, the finalizer seals and decrypt-verifies the exact new transcript/audio;
+    /// it never deletes transcript rows merely because old audio exists. An open folder is a no-op.
     #[test]
-    fn finalize_salvage_lock_state_purges_unsealed_output_behind_a_relock() {
+    fn finalize_salvage_lock_state_seals_exact_output_after_a_relock() {
         let state = build_state("salvage-finalize");
 
         // No-op case first: an OPEN folder's meeting keeps its plaintext output.
         seed_meeting(&state.db, "m-open", "# open", None);
-        finalize_salvage_lock_state(&state, "m-open");
+        finalize_salvage_lock_state(&state, "m-open", None);
         assert_eq!(
             state.db.get_segments("m-open").unwrap().len(),
             2,
             "an open/rootless meeting's fresh segments are untouched"
         );
 
-        // Relock-raced case: meeting in a folder that is LOCKED and NOT session-unlocked, with
-        // fresh blob-less segments + a plaintext WAV whose sealed .enc twin exists.
+        // Establish a real locked folder and verified encrypted audio, then session-unlock just
+        // long enough to capture the one-shot salvage CK.
         let dir = std::env::temp_dir().join(format!("murmur-salvage-finalize-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let wav = dir.join("m-raced.wav");
-        let enc = dir.join("m-raced.wav.enc");
         std::fs::write(&wav, b"RIFF-fresh-plaintext").unwrap();
-        std::fs::write(&enc, b"AES-GCM-ciphertext").unwrap();
 
         seed_meeting(&state.db, "m-raced", "# raced", None);
         state
             .db
-            .finalize_meeting("m-raced", "2026-07-16T10:00:00Z", 60, &wav.to_string_lossy())
+            .finalize_meeting(
+                "m-raced",
+                "2026-07-16T10:00:00Z",
+                60,
+                &wav.to_string_lossy(),
+            )
             .unwrap();
         state
             .db
@@ -8549,7 +9404,7 @@
                 name: "Raced".into(),
                 path: "Raced".into(),
                 parent_id: None,
-                locked: true, // locked, and deliberately NOT in the session unlock set
+                locked: false,
                 created_at: "2026-07-16T00:00:00Z".into(),
             })
             .unwrap();
@@ -8557,33 +9412,281 @@
             .db
             .set_meeting_folder("m-raced", Some("f-raced"))
             .unwrap();
+        lock_folder_inner(&state, "f-raced".to_string()).unwrap();
+        let kek = secrets::get_or_create_master_kek().unwrap();
+        *state.master_kek.lock().unwrap() = Some(Zeroizing::new(kek));
+        state
+            .unlocked_folders
+            .lock()
+            .unwrap()
+            .insert("f-raced".to_string());
+        let seal_context = capture_salvage_seal_context(&state, "m-raced")
+            .unwrap()
+            .expect("locked session-unlocked salvage pins its CK");
 
-        finalize_salvage_lock_state(&state, "m-raced");
+        // Fresh pipeline output lands after the relock sweep. Remove the session markers to model
+        // the screen-share race, while the finalizer retains only its scoped Zeroizing CK.
+        state
+            .db
+            .replace_segments(
+                "m-raced",
+                &[Segment {
+                    idx: 0,
+                    start_s: 0.0,
+                    end_s: 1.0,
+                    text: "corrected exact transcript".into(),
+                    speaker: Some("Me".into()),
+                    confidence: Some(0.99),
+                }],
+            )
+            .unwrap();
+        std::fs::write(&wav, b"RIFF-fresh-after-relock").unwrap();
+        state
+            .db
+            .set_meeting_audio_path("m-raced", Some(&wav.to_string_lossy()))
+            .unwrap();
+        state.unlocked_folders.lock().unwrap().clear();
+        *state.master_kek.lock().unwrap() = None;
 
+        finalize_salvage_lock_state(&state, "m-raced", Some(&seal_context));
+
+        let sealed = state.db.raw_segments("m-raced").unwrap();
+        assert_eq!(sealed.len(), 1, "the exact transcript row survives");
         assert!(
-            state.db.raw_segments("m-raced").unwrap().is_empty(),
-            "fresh blob-less plaintext segments are purged fail-closed"
+            sealed[0].text.is_empty() && sealed[0].text_blob.is_some(),
+            "the exact transcript is authenticated and sealed, never re-derived or deleted"
         );
-        assert!(!wav.exists(), "the plaintext WAV is removed (a sealed copy exists)");
-        assert!(enc.exists(), "the sealed .enc twin is never touched");
+        assert!(
+            !wav.exists(),
+            "plaintext audio is removed only after a fresh authenticated seal"
+        );
+        assert!(
+            dir.join("m-raced.wav.enc").exists(),
+            "the finalizer publishes a verified encrypted audio artifact"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// LOCK MODEL (2026-07-16 reviews): a RELOCK purges blob-less plaintext segments ONLY when
-    /// re-derivation is PROVEN — status Error/Recording (the retry gate's accepted states) AND the
-    /// meeting's audio surviving on disk. This is the #352 crash window (pipeline died between
-    /// segment insert and seal); before the fix those rows sat plaintext-at-rest behind the lock.
+    /// LOCK MODEL — a salvage permit blocks only operations that could orphan its captured CK or
+    /// discard/reassign the in-flight output. Session relock is deliberately still allowed so
+    /// screen sharing can revoke every gated reader immediately.
     #[test]
-    fn relock_reblank_purges_unsealed_plaintext_segments() {
+    fn active_salvage_blocks_key_rotation_move_and_delete_but_allows_session_relock() {
+        let state = build_state("salvage-permit");
+        make_open_folder(&state.db, "f-permit", "Permit");
+        seed_meeting(&state.db, "m-permit", "# exact", Some("f-permit"));
+
+        let permit = begin_active_salvage(&state, "m-permit").unwrap();
+        assert!(lock_folder_inner(&state, "f-permit".into()).is_err());
+        assert!(move_note_inner_impl(&state, "m-permit".into(), None).is_err());
+        assert!(block_on(delete_meeting_inner(&state, "m-permit")).is_err());
+        assert!(delete_folder_inner(&state, "f-permit".into()).is_err());
+        drop(permit);
+
+        // Permit release makes a fresh seal possible. Once sealed, a second permit refuses the
+        // permanent unlock (key destruction) while relock-all still revokes session visibility.
+        lock_folder_inner(&state, "f-permit".into()).unwrap();
+        let permit = begin_active_salvage(&state, "m-permit").unwrap();
+        assert!(remove_lock_inner(&state, "f-permit".into()).is_err());
+        state
+            .unlocked_folders
+            .lock()
+            .unwrap()
+            .insert("f-permit".into());
+        relock_all_inner(&state).unwrap();
+        assert!(state.unlocked_folders.lock().unwrap().is_empty());
+        drop(permit);
+    }
+
+    /// LOCK MODEL — the finalizer's pinned CK is generation-bound. Even if storage is corrupted or
+    /// bypasses the permit and swaps the folder's wrapped-key envelope, the stale context performs
+    /// no seal/blank overwrite under an orphaned key.
+    #[test]
+    fn salvage_finalizer_refuses_a_changed_wrapped_key_generation_without_blanking() {
+        let state = build_state("salvage-key-generation");
+        make_open_folder(&state.db, "f-generation", "Generation");
+        seed_meeting(
+            &state.db,
+            "m-generation",
+            "# original note",
+            Some("f-generation"),
+        );
+        lock_folder_inner(&state, "f-generation".into()).unwrap();
+        let kek = secrets::get_or_create_master_kek().unwrap();
+        *state.master_kek.lock().unwrap() = Some(Zeroizing::new(kek));
+        state
+            .unlocked_folders
+            .lock()
+            .unwrap()
+            .insert("f-generation".into());
+        let seal_context = capture_salvage_seal_context(&state, "m-generation")
+            .unwrap()
+            .expect("session-unlocked locked folder captures its key generation");
+        let original_note_blob = state
+            .db
+            .sealable_notes_for_meeting("m-generation")
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+            .content_blob;
+
+        let replacement_ck = crate::crypto::random_key().unwrap();
+        let replacement_wrapped = crate::crypto::encrypt(
+            &kek,
+            &replacement_ck,
+            &aad_wrapped_ck("f-generation"),
+        )
+        .unwrap();
+        state
+            .db
+            .set_folder_locked("f-generation", true, Some(&replacement_wrapped))
+            .unwrap();
+        state
+            .db
+            .replace_segments(
+                "m-generation",
+                &[Segment {
+                    idx: 0,
+                    start_s: 0.0,
+                    end_s: 1.0,
+                    text: "exact fresh transcript".into(),
+                    speaker: Some("Me".into()),
+                    confidence: Some(0.99),
+                }],
+            )
+            .unwrap();
+        state.unlocked_folders.lock().unwrap().clear();
+        *state.master_kek.lock().unwrap() = None;
+
+        finalize_salvage_lock_state(&state, "m-generation", Some(&seal_context));
+
+        let segments = state.db.raw_segments("m-generation").unwrap();
+        assert_eq!(segments[0].text, "exact fresh transcript");
+        assert!(segments[0].text_blob.is_none());
+        assert_eq!(
+            state
+                .db
+                .sealable_notes_for_meeting("m-generation")
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap()
+                .content_blob,
+            original_note_blob,
+            "a stale salvage CK never overwrites the current generation's note blob"
+        );
+    }
+
+    /// A cached pipeline markdown must not cross IPC after the folder is relocked during a long
+    /// await. The final visibility seam fails closed even though the caller still owns the String.
+    #[test]
+    fn post_await_result_gate_refuses_cached_plaintext_after_relock() {
+        let state = build_state("post-await-result-gate");
+        make_open_folder(&state.db, "f-result", "Result");
+        seed_meeting(&state.db, "m-result", "# cached plaintext", Some("f-result"));
+        lock_folder_inner(&state, "f-result".into()).unwrap();
+
+        let cached_markdown = "# cached plaintext".to_string();
+        let error = ensure_post_await_result_visible(&state, "m-result").unwrap_err();
+        assert!(matches!(error, AppError::Locked(_)));
+        assert_eq!(cached_markdown, "# cached plaintext");
+    }
+
+    /// A multi-source synthesis is invalidated by any lock-generation transition, even if the
+    /// caller still owns the assembled corpus/result in RAM.
+    #[test]
+    fn content_visibility_snapshot_refuses_a_late_result_after_epoch_change() {
+        let state = build_state("content-visibility-epoch");
+        let snapshot = capture_content_visibility_snapshot(&state);
+
+        bump_seal_epoch(&state);
+
+        assert!(matches!(
+            require_current_content_visibility_snapshot(&state, snapshot),
+            Err(AppError::Locked(_))
+        ));
+    }
+
+    /// Folder identity is part of a single-meeting authorization snapshot because an ordinary
+    /// OPEN→OPEN move does not bump the global seal epoch.
+    #[test]
+    fn meeting_content_snapshot_refuses_a_late_result_after_folder_move() {
+        let state = build_state("meeting-content-folder");
+        make_open_folder(&state.db, "f-a", "A");
+        make_open_folder(&state.db, "f-b", "B");
+        seed_meeting(&state.db, "m-snapshot", "# body", Some("f-a"));
+        let snapshot = capture_meeting_content_snapshot(&state, "m-snapshot").unwrap();
+
+        state
+            .db
+            .set_meeting_folder("m-snapshot", Some("f-b"))
+            .unwrap();
+
+        assert!(matches!(
+            require_current_meeting_content_snapshot(&state, "m-snapshot", &snapshot),
+            Err(AppError::Locked(_))
+        ));
+    }
+
+    /// Related-meeting embedding/search must not return a result derived from cached source text
+    /// after a relock invalidates the authorization generation while the synchronous work runs.
+    #[test]
+    fn related_meetings_refuses_a_late_result_after_relock_epoch_change() {
+        let state = build_state("related-meetings-epoch");
+        make_open_folder(&state.db, "f-related", "Related");
+        seed_meeting(
+            &state.db,
+            "m-related",
+            "# source plaintext",
+            Some("f-related"),
+        );
+        let snapshot = capture_meeting_content_snapshot(&state, "m-related").unwrap();
+
+        bump_seal_epoch(&state);
+
+        assert!(matches!(
+            finish_related_meetings_result(&state, "m-related", &snapshot, Vec::new()),
+            Err(AppError::Locked(_))
+        ));
+    }
+
+    /// Authored-note async saves bind their returned DTO to the exact folder protection domain.
+    #[test]
+    fn document_content_snapshot_refuses_a_late_result_after_folder_move() {
+        let state = build_state("document-content-folder");
+        make_open_folder(&state.db, "f-a", "A");
+        make_open_folder(&state.db, "f-b", "B");
+        seed_note_doc_cmd(&state.db, "n-snapshot", "f-a", "Plan", "secret body");
+        let snapshot = capture_document_content_snapshot(&state, "n-snapshot").unwrap();
+
+        state.db.set_note_doc_folder("n-snapshot", "f-b").unwrap();
+
+        assert!(matches!(
+            require_current_document_content_snapshot(&state, "n-snapshot", &snapshot),
+            Err(AppError::Locked(_))
+        ));
+    }
+
+    /// LOCK MODEL: even an Error meeting with verified audio keeps its exact transcript semantics.
+    /// Relock seals the blob-less rows under the cached folder CK; it never substitutes a future
+    /// re-transcription for corrected wording, speakers, confidence, or timing.
+    #[test]
+    fn relock_reblank_seals_exact_unsealed_transcript_segments() {
         let state = build_state("relock-unsealed-purge");
-        let dir =
-            std::env::temp_dir().join(format!("murmur-relock-purge-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("murmur-relock-purge-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let wav = dir.join("m-crashed.wav");
         std::fs::write(&wav, b"RIFF-archived-audio").unwrap();
 
-        seed_meeting(&state.db, "m-crashed", "# crashed salvage", None);
+        make_open_folder(&state.db, "f-crash", "Crash");
+        seed_meeting(
+            &state.db,
+            "m-crashed",
+            "# crashed salvage",
+            Some("f-crash"),
+        );
         state
             .db
             .finalize_meeting(
@@ -8597,20 +9700,34 @@
             .db
             .update_meeting_status("m-crashed", MeetingStatus::Error)
             .unwrap();
-        state
+        // Establish a REAL, verify-before-destroy sealed audio source first. The interrupted
+        // pipeline then replaces the sealed transcript with fresh blob-less rows after relock.
+        // Purging is safe only because the source `.enc` was produced and verified by the seal.
+        lock_folder_inner(&state, "f-crash".to_string()).unwrap();
+        let kek = secrets::get_or_create_master_kek().unwrap();
+        *state.master_kek.lock().unwrap() = Some(Zeroizing::new(kek));
+        let sealed_audio = state
             .db
-            .insert_folder(&Folder {
-                id: "f-crash".into(),
-                name: "Crash".into(),
-                path: "Crash".into(),
-                parent_id: None,
-                locked: true,
-                created_at: "2026-07-16T00:00:00Z".into(),
-            })
+            .get_meeting("m-crashed")
+            .unwrap()
+            .unwrap()
+            .audio_path
             .unwrap();
+        assert!(sealed_audio.ends_with(ENC_SUFFIX));
+        assert!(std::path::Path::new(&sealed_audio).exists());
         state
             .db
-            .set_meeting_folder("m-crashed", Some("f-crash"))
+            .replace_segments(
+                "m-crashed",
+                &[Segment {
+                    idx: 0,
+                    start_s: 0.0,
+                    end_s: 1.0,
+                    text: "fresh crash-window plaintext".into(),
+                    speaker: None,
+                    confidence: None,
+                }],
+            )
             .unwrap();
         assert!(
             !state.db.raw_segments("m-crashed").unwrap().is_empty(),
@@ -8619,9 +9736,11 @@
 
         reblank_folder_extras(&state, "f-crash").unwrap();
 
+        let sealed = state.db.raw_segments("m-crashed").unwrap();
+        assert_eq!(sealed.len(), 1, "the exact row survives relock");
         assert!(
-            state.db.raw_segments("m-crashed").unwrap().is_empty(),
-            "provably re-derivable blob-less rows (Error status + on-disk audio) are purged"
+            sealed[0].text.is_empty() && sealed[0].text_blob.is_some(),
+            "the exact row is encrypted and verified rather than deleted as re-derivable"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -8654,7 +9773,11 @@
             .set_meeting_folder("m-only", Some("f-only"))
             .unwrap();
 
-        reblank_folder_extras(&state, "f-only").unwrap();
+        let error = reblank_folder_extras(&state, "f-only").unwrap_err();
+        assert!(
+            matches!(error, AppError::Locked(_)),
+            "without a cached session key relock must surface the unrepaired residue, got {error:?}"
+        );
 
         let segs = state.db.raw_segments("m-only").unwrap();
         assert!(
@@ -8669,8 +9792,7 @@
     #[test]
     fn relock_reblank_leaves_completed_meeting_even_with_audio_on_disk() {
         let state = build_state("relock-noloss-status-leg");
-        let dir =
-            std::env::temp_dir().join(format!("murmur-relock-statusleg-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("murmur-relock-statusleg-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let wav = dir.join("m-sum.wav");
@@ -8698,13 +9820,18 @@
             .unwrap();
         state.db.set_meeting_folder("m-sum", Some("f-sum")).unwrap();
 
-        reblank_folder_extras(&state, "f-sum").unwrap();
+        let error = reblank_folder_extras(&state, "f-sum").unwrap_err();
+        assert!(
+            matches!(error, AppError::Locked(_)),
+            "plaintext audio without a cached key must abort relock, got {error:?}"
+        );
 
         let segs = state.db.raw_segments("m-sum").unwrap();
         assert!(
             !segs.is_empty() && segs.iter().any(|s| !s.text.is_empty()),
             "a Summarized meeting's blob-less rows survive even with audio on disk (retry refuses non-Error)"
         );
+        assert!(wav.exists(), "the only plaintext audio copy must also survive");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -8741,7 +9868,11 @@
             .unwrap();
         state.db.set_meeting_folder("m-err", Some("f-err")).unwrap();
 
-        reblank_folder_extras(&state, "f-err").unwrap();
+        let error = reblank_folder_extras(&state, "f-err").unwrap_err();
+        assert!(
+            matches!(error, AppError::Locked(_)),
+            "without audio or a cached key relock must surface the residue, got {error:?}"
+        );
 
         let segs = state.db.raw_segments("m-err").unwrap();
         assert!(
@@ -8780,7 +9911,8 @@
         let segs = state.db.raw_segments("m-moved").unwrap();
         assert!(!segs.is_empty(), "rows survive — sealed, never deleted");
         assert!(
-            segs.iter().all(|s| s.text_blob.is_some() && s.text.is_empty()),
+            segs.iter()
+                .all(|s| s.text_blob.is_some() && s.text.is_empty()),
             "crash-window rows are sealed in place under the folder CK (blob set, plaintext blanked)"
         );
     }
@@ -8812,13 +9944,17 @@
             let _guard = crate::pipeline::SalvageLockFinalizer {
                 state: &state,
                 meeting_id: "m-panic",
+                seal_context: None,
             };
             panic!("simulated pipeline death between segment insert and finalizer");
         }));
-        assert!(unwound.is_err(), "the panic really unwound through the guard scope");
         assert!(
-            state.db.raw_segments("m-panic").unwrap().is_empty(),
-            "the Drop-armed finalizer purged the unsealed plaintext despite the panic"
+            unwound.is_err(),
+            "the panic really unwound through the guard scope"
+        );
+        assert!(
+            !state.db.raw_segments("m-panic").unwrap().is_empty(),
+            "without an authenticated entry context the Drop guard preserves the exact transcript"
         );
     }
 
@@ -8857,7 +9993,7 @@
             .set_meeting_folder("m-only", Some("f-only"))
             .unwrap();
 
-        finalize_salvage_lock_state(&state, "m-only");
+        finalize_salvage_lock_state(&state, "m-only", None);
 
         assert!(
             wav.exists(),
@@ -9317,23 +10453,23 @@
         // (f) the FE sends camelCase `brainModelPath`; it must deserialize into the field (and an
         // omitted value defaults to None). Same minimal-but-valid JSON shape as case (c) below.
         let json_path = r#"{
-            "providerId":"claude_code","anthropicModel":"claude-opus-4-8",
-            "ollamaBaseUrl":"http://localhost:11434","ollamaModel":"llama3.1","claudeBinary":"claude",
-            "captureSystemAudio":false,"modelSize":"large-v3","voiceTrigger":false,"onboarded":true,
-            "noteStyle":"standard","autoOrganize":false,"noteLanguage":"auto",
-            "brainModelPath":"/m/x.gguf"
-        }"#;
+                "providerId":"claude_code","anthropicModel":"claude-opus-4-8",
+                "ollamaBaseUrl":"http://localhost:11434","ollamaModel":"llama3.1","claudeBinary":"claude",
+                "captureSystemAudio":false,"modelSize":"large-v3","voiceTrigger":false,"onboarded":true,
+                "noteStyle":"standard","autoOrganize":false,"noteLanguage":"auto",
+                "brainModelPath":"/m/x.gguf"
+            }"#;
         let parsed: AppConfigDto = serde_json::from_str(json_path).unwrap();
         assert_eq!(parsed.brain_model_path.as_deref(), Some("/m/x.gguf"));
 
         // (c) an unknown/omitted brainBackend token deserializes to the default Cloud (no crash),
         // then flows through dto_to_config as Cloud.
         let json = r#"{
-            "providerId":"claude_code","anthropicModel":"claude-opus-4-8",
-            "ollamaBaseUrl":"http://localhost:11434","ollamaModel":"llama3.1","claudeBinary":"claude",
-            "captureSystemAudio":false,"modelSize":"large-v3","voiceTrigger":false,"onboarded":true,
-            "noteStyle":"standard","autoOrganize":false,"noteLanguage":"auto","brainBackend":"bogus"
-        }"#;
+                "providerId":"claude_code","anthropicModel":"claude-opus-4-8",
+                "ollamaBaseUrl":"http://localhost:11434","ollamaModel":"llama3.1","claudeBinary":"claude",
+                "captureSystemAudio":false,"modelSize":"large-v3","voiceTrigger":false,"onboarded":true,
+                "noteStyle":"standard","autoOrganize":false,"noteLanguage":"auto","brainBackend":"bogus"
+            }"#;
         let dto_bad: AppConfigDto = serde_json::from_str(json).unwrap();
         assert_eq!(
             dto_bad.brain_backend,
@@ -9464,9 +10600,9 @@
         ));
         let (url, dest) = brain_download_target("qwen3-1.7b").unwrap();
         assert_eq!(
-            url,
-            "https://huggingface.co/bartowski/Qwen_Qwen3-1.7B-GGUF/resolve/main/Qwen_Qwen3-1.7B-Q4_K_M.gguf"
-        );
+                url,
+                "https://huggingface.co/bartowski/Qwen_Qwen3-1.7B-GGUF/resolve/main/Qwen_Qwen3-1.7B-Q4_K_M.gguf"
+            );
         assert!(dest.ends_with("Qwen_Qwen3-1.7B-Q4_K_M.gguf"));
     }
 
@@ -9556,11 +10692,11 @@
         let _ = std::fs::remove_dir_all(&vault);
     }
 
-    /// Renaming a LOCKED folder is METADATA-ONLY: the row name+path change, but no sealed content is
-    /// touched — `locked` stays true, the `wrapped_key` is unchanged, and the note's `content_blob`
-    /// (the ciphertext) is byte-identical before/after. The blanked plaintext stays blanked.
+    /// Renaming a locked folder must first prove every descendant is session-unlocked. The rename
+    /// implementation has to enumerate exported note paths, which are content-bearing metadata;
+    /// direct IPC therefore refuses before reading or mutating them when the folder is sealed.
     #[test]
-    fn rename_locked_folder_is_metadata_only_and_never_touches_sealed_content() {
+    fn rename_locked_folder_refuses_before_reading_sealed_content() {
         let vault = tmp_vault("rename-locked");
         let state = build_state_with_vault("rename-locked", &vault);
         std::fs::create_dir_all(vault.join("Secret")).unwrap();
@@ -9575,13 +10711,13 @@
             .clone();
         assert!(blob_before.is_some(), "sealed note has a content_blob");
 
-        let renamed = rename_folder_inner(&state, "lf".into(), "Vault".into()).unwrap();
-        assert_eq!(renamed.name, "Vault");
+        let error = rename_folder_inner(&state, "lf".into(), "Vault".into()).unwrap_err();
+        assert!(matches!(error, AppError::Locked(_)), "got {error:?}");
 
         let f = state.db.folder_by_id("lf").unwrap().unwrap();
-        assert!(f.locked, "still sealed after a metadata rename");
-        assert_eq!(f.name, "Vault");
-        assert_eq!(f.path, "Vault");
+        assert!(f.locked, "still sealed after the refused rename");
+        assert_eq!(f.name, "Secret");
+        assert_eq!(f.path, "Secret");
         assert_eq!(
             state.db.folder_wrapped_key("lf").unwrap(),
             wrapped_before,
@@ -9590,7 +10726,7 @@
         let after = &state.db.sealable_notes_for_meeting("ms").unwrap()[0];
         assert_eq!(
             after.content_blob, blob_before,
-            "ciphertext byte-identical after rename"
+            "ciphertext byte-identical after the refused rename"
         );
         assert!(after.markdown.is_empty(), "blanked plaintext stays blanked");
 
@@ -9650,6 +10786,72 @@
             .unwrap();
     }
 
+    /// Lock must compare the vault file with Murmur's last-export hash before publishing the locked
+    /// state. A real Obsidian edit is never deleted or silently replaced by the older DB markdown.
+    #[test]
+    fn folder_lock_refuses_and_preserves_an_externally_edited_export() {
+        let vault = tmp_vault("lock-external-edit");
+        let state = build_state_with_vault("lock-external-edit", &vault);
+        make_open_folder(&state.db, "f-ext", "Secret");
+        std::fs::create_dir_all(vault.join("Secret")).unwrap();
+        seed_meeting(&state.db, "m-ext-lock", "# canonical\n", Some("f-ext"));
+        let md = vault.join("Secret").join("Meeting.md");
+        seed_exported_note(&state, "m-ext-lock", &md, "# canonical\n");
+        let external = "# edited in Obsidian\nKEEP THIS\n";
+        std::fs::write(&md, external).unwrap();
+
+        let error = lock_folder_inner(&state, "f-ext".to_string()).unwrap_err();
+        assert!(matches!(error, AppError::Storage(_)), "got {error:?}");
+        assert!(
+            !state.db.folder_by_id("f-ext").unwrap().unwrap().locked,
+            "a conflicting export aborts before locked=1 is published"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&md).unwrap(),
+            external,
+            "the external bytes survive at their canonical vault path"
+        );
+        assert_eq!(
+            state
+                .db
+                .get_latest_note_for_meeting("m-ext-lock")
+                .unwrap()
+                .unwrap()
+                .markdown,
+            "# canonical\n",
+            "the canonical SQLCipher row also remains readable while the lock is refused"
+        );
+
+        let _ = std::fs::remove_dir_all(&vault);
+    }
+
+    /// A collision-guard sibling is deliberately user-owned evidence of an unresolved merge. The
+    /// seal refuses before changing logical visibility and leaves both versions byte-identical.
+    #[test]
+    fn folder_lock_refuses_while_an_external_edit_sibling_exists() {
+        let vault = tmp_vault("lock-external-sibling");
+        let state = build_state_with_vault("lock-external-sibling", &vault);
+        make_open_folder(&state.db, "f-sibling", "Secret");
+        let folder = vault.join("Secret");
+        std::fs::create_dir_all(&folder).unwrap();
+        seed_meeting(&state.db, "m-sibling", "# canonical\n", Some("f-sibling"));
+        let md = folder.join("Meeting.md");
+        seed_exported_note(&state, "m-sibling", &md, "# canonical\n");
+        let sibling = folder.join("Meeting (external edit 2026-07-23).md");
+        std::fs::write(&sibling, "# unresolved external bytes\n").unwrap();
+
+        let error = lock_folder_inner(&state, "f-sibling".to_string()).unwrap_err();
+        assert!(matches!(error, AppError::Locked(_)), "got {error:?}");
+        assert!(!state.db.folder_by_id("f-sibling").unwrap().unwrap().locked);
+        assert_eq!(std::fs::read_to_string(&md).unwrap(), "# canonical\n");
+        assert_eq!(
+            std::fs::read_to_string(&sibling).unwrap(),
+            "# unresolved external bytes\n"
+        );
+
+        let _ = std::fs::remove_dir_all(&vault);
+    }
+
     /// RED-before-GREEN core of the export-collision guard: an EXTERNAL edit to an exported `.md`
     /// (the user, or their own vault-side agent) must be preserved as a sibling file when a
     /// DB-derived full overwrite (`update_note`) lands — never silently destroyed. The canonical
@@ -9683,7 +10885,10 @@
         );
         // The baseline is re-stamped to what Murmur just wrote.
         assert_eq!(
-            state.db.get_note_exported_hash("m-ext", "claude_code").unwrap(),
+            state
+                .db
+                .get_note_exported_hash("m-ext", "claude_code")
+                .unwrap(),
             Some(crate::export::note_content_hash("# v2 from murmur\n")),
             "stored hash re-baselined to the new canonical content"
         );
@@ -9708,7 +10913,10 @@
         );
         assert_eq!(std::fs::read_to_string(&md).unwrap(), "# v2\n");
         assert_eq!(
-            state.db.get_note_exported_hash("m-clean", "claude_code").unwrap(),
+            state
+                .db
+                .get_note_exported_hash("m-clean", "claude_code")
+                .unwrap(),
             Some(crate::export::note_content_hash("# v2\n")),
             "baseline refreshed after the overwrite"
         );
@@ -9731,7 +10939,10 @@
             .set_note_exported_path("m-legacy", "claude_code", &md.to_string_lossy())
             .unwrap();
         assert_eq!(
-            state.db.get_note_exported_hash("m-legacy", "claude_code").unwrap(),
+            state
+                .db
+                .get_note_exported_hash("m-legacy", "claude_code")
+                .unwrap(),
             None,
             "legacy row starts with no baseline"
         );
@@ -9744,7 +10955,10 @@
         );
         assert_eq!(std::fs::read_to_string(&md).unwrap(), "# v2\n");
         assert_eq!(
-            state.db.get_note_exported_hash("m-legacy", "claude_code").unwrap(),
+            state
+                .db
+                .get_note_exported_hash("m-legacy", "claude_code")
+                .unwrap(),
             Some(crate::export::note_content_hash("# v2\n")),
             "the first post-guard write stamps the baseline"
         );
@@ -9800,12 +11014,18 @@
         );
         // Baselines re-stamped from the FINAL written content on BOTH sides…
         assert_eq!(
-            state.db.get_note_exported_hash("m-src", "claude_code").unwrap(),
+            state
+                .db
+                .get_note_exported_hash("m-src", "claude_code")
+                .unwrap(),
             Some(crate::export::note_content_hash(&src_after)),
             "source baseline matches the on-disk content after the append"
         );
         assert_eq!(
-            state.db.get_note_exported_hash("m-sup", "claude_code").unwrap(),
+            state
+                .db
+                .get_note_exported_hash("m-sup", "claude_code")
+                .unwrap(),
             Some(crate::export::note_content_hash(&sup_after)),
             "superseding baseline matches the on-disk content after the append"
         );
@@ -9860,7 +11080,10 @@
         // The append itself respects the file: external edit + callout are both on disk, and the
         // append never creates a sibling.
         let after_append = std::fs::read_to_string(&src_md).unwrap();
-        assert!(after_append.contains("MY EXTERNAL NOTE"), "edit preserved in place");
+        assert!(
+            after_append.contains("MY EXTERNAL NOTE"),
+            "edit preserved in place"
+        );
         assert!(after_append.contains("[!superseded]"), "callout appended");
         assert!(
             external_edit_siblings(&vault).is_empty(),
@@ -9869,7 +11092,10 @@
         // The baseline must STAY at the pre-edit Murmur write — NOT be laundered to the
         // (edit + callout) content the append wrote.
         assert_eq!(
-            state.db.get_note_exported_hash("m-src", "claude_code").unwrap(),
+            state
+                .db
+                .get_note_exported_hash("m-src", "claude_code")
+                .unwrap(),
             Some(crate::export::note_content_hash("# Kickoff\n")),
             "the baseline is NOT re-stamped over an externally-edited file"
         );
@@ -9995,19 +11221,37 @@
         );
         let resolved = resolve_audit_finding_inner(&state, &id, "accept").unwrap();
         assert_eq!(resolved.status, "accepted");
-        assert!(resolved.evidence_md.is_empty(), "accept blanks the evidence");
+        assert!(
+            resolved.evidence_md.is_empty(),
+            "accept blanks the evidence"
+        );
         assert!(resolved.accept_action.is_empty());
 
         let after = std::fs::read_to_string(&md).unwrap();
-        assert!(after.contains("## Audit"), "managed section created: {after}");
-        assert!(after.contains("[!broken-link]"), "callout appended: {after}");
-        assert!(after.contains("`[[Ghost Note]]`"), "target in a code span: {after}");
+        assert!(
+            after.contains("## Audit"),
+            "managed section created: {after}"
+        );
+        assert!(
+            after.contains("[!broken-link]"),
+            "callout appended: {after}"
+        );
+        assert!(
+            after.contains("`[[Ghost Note]]`"),
+            "target in a code span: {after}"
+        );
         assert_eq!(
-            state.db.get_note_exported_hash("m-a", "claude_code").unwrap(),
+            state
+                .db
+                .get_note_exported_hash("m-a", "claude_code")
+                .unwrap(),
             Some(crate::export::note_content_hash(&after)),
             "clean-case baseline re-stamped from the appended content"
         );
-        assert!(external_edit_siblings(&vault).is_empty(), "append creates no sibling");
+        assert!(
+            external_edit_siblings(&vault).is_empty(),
+            "append creates no sibling"
+        );
 
         // Already handled → refused.
         assert!(matches!(
@@ -10062,18 +11306,31 @@
         resolve_audit_finding_inner(&state, &id, "accept").unwrap();
 
         let after = std::fs::read_to_string(&md).unwrap();
-        assert!(after.contains("MY EXTERNAL NOTE"), "edit preserved in place");
+        assert!(
+            after.contains("MY EXTERNAL NOTE"),
+            "edit preserved in place"
+        );
         assert!(after.contains("[!broken-link]"), "stamp appended");
-        assert!(external_edit_siblings(&vault).is_empty(), "the append creates no sibling");
+        assert!(
+            external_edit_siblings(&vault).is_empty(),
+            "the append creates no sibling"
+        );
         assert_eq!(
-            state.db.get_note_exported_hash("m-a", "claude_code").unwrap(),
+            state
+                .db
+                .get_note_exported_hash("m-a", "claude_code")
+                .unwrap(),
             Some(crate::export::note_content_hash("# Kickoff\n")),
             "baseline NOT laundered over the externally-edited file"
         );
         // The next full overwrite preserves (edit + stamp) as a sibling.
         update_note_inner(&state, "m-a", "# Kickoff rewritten\n").unwrap();
         let siblings = external_edit_siblings(&vault);
-        assert_eq!(siblings.len(), 1, "external edit + stamp survive as a sibling");
+        assert_eq!(
+            siblings.len(),
+            1,
+            "external edit + stamp survive as a sibling"
+        );
         let preserved = std::fs::read_to_string(&siblings[0]).unwrap();
         assert!(preserved.contains("MY EXTERNAL NOTE") && preserved.contains("[!broken-link]"));
         let _ = std::fs::remove_dir_all(&vault);
@@ -10106,11 +11363,22 @@
         let resolved = resolve_audit_finding_inner(&state, &id_dismiss, "dismiss").unwrap();
         assert_eq!(resolved.status, "dismissed");
         assert!(resolved.evidence_md.is_empty());
-        assert_eq!(std::fs::read_to_string(&md).unwrap(), before, "dismiss never writes");
+        assert_eq!(
+            std::fs::read_to_string(&md).unwrap(),
+            before,
+            "dismiss never writes"
+        );
 
         // Accepting a dismiss-only finding is refused.
         let id_dismiss_only = stage_audit_finding(
-            &state, "orphan", "meeting", "m-a", None, "no links", "", "orphan|m-a|2",
+            &state,
+            "orphan",
+            "meeting",
+            "m-a",
+            None,
+            "no links",
+            "",
+            "orphan|m-a|2",
         );
         assert!(matches!(
             resolve_audit_finding_inner(&state, &id_dismiss_only, "accept"),
@@ -10136,14 +11404,24 @@
             Err(AppError::Locked(_))
         ));
         let row = state.db.get_audit_finding(&id_locked).unwrap().unwrap();
-        assert_eq!(row.status, "pending", "a refused accept leaves the row pending");
+        assert_eq!(
+            row.status, "pending",
+            "a refused accept leaves the row pending"
+        );
         assert!(!row.evidence_md.is_empty(), "…with its evidence intact");
 
         // The LIST defensively hides it (source no longer visible), while an open-source
         // finding still lists.
         seed_meeting(&state.db, "m-open", "# Open\n", None);
         stage_audit_finding(
-            &state, "orphan", "meeting", "m-open", None, "no links", "", "orphan|m-open|",
+            &state,
+            "orphan",
+            "meeting",
+            "m-open",
+            None,
+            "no links",
+            "",
+            "orphan|m-open|",
         );
         let listed = list_audit_findings_inner(&state, None).unwrap();
         assert_eq!(listed.len(), 1, "sealed-source finding hidden: {listed:#?}");
@@ -10197,7 +11475,12 @@
             Err(AppError::InvalidArg(_))
         ));
         assert_eq!(
-            state.db.get_audit_finding(&id_gone).unwrap().unwrap().status,
+            state
+                .db
+                .get_audit_finding(&id_gone)
+                .unwrap()
+                .unwrap()
+                .status,
             "pending"
         );
         let _ = std::fs::remove_dir_all(&vault);
@@ -10214,7 +11497,14 @@
         make_open_folder(&state.db, "fn1", "Notes");
         state
             .db
-            .insert_document("n1", "fn1", "My Brain Note", "# My Brain Note\nbody\n", "note", 1)
+            .insert_document(
+                "n1",
+                "fn1",
+                "My Brain Note",
+                "# My Brain Note\nbody\n",
+                "note",
+                1,
+            )
             .unwrap();
         // A resolvable suggestion target for the orphan accept's anti-hallucination re-check.
         db_insert_titled_meeting(&state.db, "m-t", "Weekly Planning Sync");
@@ -10232,20 +11522,31 @@
         );
         let resolved = resolve_audit_finding_inner(&state, &id, "accept").unwrap();
         assert_eq!(resolved.status, "accepted");
-        assert!(resolved.evidence_md.is_empty(), "accept blanks the evidence");
+        assert!(
+            resolved.evidence_md.is_empty(),
+            "accept blanks the evidence"
+        );
 
         // The CANONICAL text carries the managed section + the resolving link.
         let row = state.db.get_note_row("n1").unwrap().unwrap();
-        assert!(row.text.contains("## Audit"), "managed section in DB text: {}", row.text);
         assert!(
-            row.text.contains("- Suggested links: [[Weekly Planning Sync]]"),
+            row.text.contains("## Audit"),
+            "managed section in DB text: {}",
+            row.text
+        );
+        assert!(
+            row.text
+                .contains("- Suggested links: [[Weekly Planning Sync]]"),
             "suggested link in DB text: {}",
             row.text
         );
         // The vault file MATERIALIZED (export healed the never-exported note).
         let path = row.exported_path.expect("re-export set exported_path");
         let on_disk = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(on_disk, row.text, "the exported file mirrors the canonical text");
+        assert_eq!(
+            on_disk, row.text,
+            "the exported file mirrors the canonical text"
+        );
         assert_eq!(
             state.db.get_note_doc_exported_hash("n1").unwrap(),
             Some(crate::export::note_content_hash(&row.text)),
@@ -10264,7 +11565,14 @@
         make_open_folder(&state.db, "fn1", "Notes");
         state
             .db
-            .insert_document("n1", "fn1", "My Brain Note", "# mentions Weekly Planning Sync\n", "note", 1)
+            .insert_document(
+                "n1",
+                "fn1",
+                "My Brain Note",
+                "# mentions Weekly Planning Sync\n",
+                "note",
+                1,
+            )
             .unwrap();
         db_insert_titled_meeting(&state.db, "m-t", "Weekly Planning Sync");
 
@@ -10374,7 +11682,10 @@
 
         // Canonical text stamped…
         let row = state.db.get_note_row("n1").unwrap().unwrap();
-        assert!(row.text.contains("[[Weekly Planning Sync]]"), "stamp in DB text");
+        assert!(
+            row.text.contains("[[Weekly Planning Sync]]"),
+            "stamp in DB text"
+        );
         // …the externally-edited file is UNTOUCHED byte-identical…
         assert_eq!(
             std::fs::read_to_string(&md).unwrap(),
@@ -10476,7 +11787,11 @@
         assert_eq!(listed.len(), 1, "sealed-target finding hidden: {listed:#?}");
         assert_eq!(listed[0].id, {
             let rows = state.db.list_audit_finding_rows("pending").unwrap();
-            rows.iter().find(|r| r.dedupe_key == "k-keep").unwrap().id.clone()
+            rows.iter()
+                .find(|r| r.dedupe_key == "k-keep")
+                .unwrap()
+                .id
+                .clone()
         });
     }
 
@@ -10544,7 +11859,10 @@
         let s = get_audit_schedule_inner(&state).unwrap();
         assert!(s.enabled, "weekly audit defaults ON");
         assert_eq!(s.last_run_at, None);
-        assert_eq!(s.next_due_at, None, "never-ran ⇒ due at the next hourly check");
+        assert_eq!(
+            s.next_due_at, None,
+            "never-ran ⇒ due at the next hourly check"
+        );
 
         // A scheduled claim stamps lastRunAt and derives nextDueAt = last + 7 days.
         state
@@ -10563,7 +11881,9 @@
         assert!(!s.enabled);
         assert_eq!(s.next_due_at, None, "disabled ⇒ no next due time");
         assert!(
-            !AppConfig::load(&state.db).unwrap().vault_audit_weekly_enabled,
+            !AppConfig::load(&state.db)
+                .unwrap()
+                .vault_audit_weekly_enabled,
             "the opt-out persists durably"
         );
         let s = set_audit_schedule_inner(&state, true).unwrap();
@@ -10591,7 +11911,14 @@
         // Already resolved.
         seed_meeting(&state.db, "m-open", "# open body\n", None);
         let id = stage_audit_finding(
-            &state, "stale", "meeting", "m-open", None, "> ev", "", "k-exp-resolved",
+            &state,
+            "stale",
+            "meeting",
+            "m-open",
+            None,
+            "> ev",
+            "",
+            "k-exp-resolved",
         );
         state
             .db
@@ -10607,7 +11934,14 @@
         seed_meeting(&state.db, "m-sealed", "# sealed body\n", Some("f-exp"));
         state.db.set_folder_locked("f-exp", true, None).unwrap();
         let id_locked = stage_audit_finding(
-            &state, "stale", "meeting", "m-sealed", None, "> ev", "", "k-exp-locked",
+            &state,
+            "stale",
+            "meeting",
+            "m-sealed",
+            None,
+            "> ev",
+            "",
+            "k-exp-locked",
         );
         assert!(matches!(
             block_on(explain_audit_finding_inner(&state, &id_locked)),
@@ -10631,7 +11965,14 @@
         assert!(!state.config.lock().unwrap().cloud_egress_consented);
         seed_meeting(&state.db, "m-open", "# open body\n", None);
         let id = stage_audit_finding(
-            &state, "contradiction", "meeting", "m-open", None, "> a vs b", "", "k-exp-consent",
+            &state,
+            "contradiction",
+            "meeting",
+            "m-open",
+            None,
+            "> a vs b",
+            "",
+            "k-exp-consent",
         );
 
         let res = block_on(explain_audit_finding_inner(&state, &id));
@@ -10643,7 +11984,10 @@
         // Nothing stored / mutated — the row is byte-identical to its staged state.
         let row = state.db.get_audit_finding(&id).unwrap().unwrap();
         assert_eq!(row.status, "pending");
-        assert_eq!(row.evidence_md, "> a vs b", "evidence untouched by a refused explain");
+        assert_eq!(
+            row.evidence_md, "> a vs b",
+            "evidence untouched by a refused explain"
+        );
         assert!(row.resolved_at.is_none());
     }
 
@@ -10665,7 +12009,10 @@
             .unwrap();
         state.db.seal_note("m-a", "claude_code", b"blob").unwrap();
         assert_eq!(
-            state.db.get_note_exported_hash("m-a", "claude_code").unwrap(),
+            state
+                .db
+                .get_note_exported_hash("m-a", "claude_code")
+                .unwrap(),
             None,
             "seal_note blanks the baseline with the path"
         );
@@ -10679,7 +12026,10 @@
             .db
             .set_note_doc_exported_path("n1", Some("/tmp/n1.md"))
             .unwrap();
-        state.db.set_note_doc_exported_hash("n1", Some("def")).unwrap();
+        state
+            .db
+            .set_note_doc_exported_hash("n1", Some("def"))
+            .unwrap();
         state.db.set_note_doc_exported_path("n1", None).unwrap();
         assert_eq!(
             state.db.get_note_doc_exported_hash("n1").unwrap(),
@@ -10694,7 +12044,10 @@
         assert_eq!(state.db.get_note_doc_exported_hash("n1").unwrap(), None);
 
         // The folder-wide seal clear blanks both.
-        state.db.set_note_doc_exported_hash("n1", Some("ghi")).unwrap();
+        state
+            .db
+            .set_note_doc_exported_hash("n1", Some("ghi"))
+            .unwrap();
         state.db.clear_note_exported_paths_in_folder("f1").unwrap();
         assert_eq!(state.db.get_note_doc_exported_hash("n1").unwrap(), None);
     }
@@ -11049,8 +12402,7 @@
     #[test]
     fn list_models_unknown_connection_refuses() {
         for conn in ["", "openai", "GATEWAY", "claude"] {
-            let err =
-                static_connection_models(conn).expect_err("unknown connection must be refused");
+            let err = static_connection_models(conn).expect_err("unknown connection must be refused");
             assert!(
                 matches!(err, AppError::InvalidArg(_)),
                 "expected InvalidArg for '{conn}', got: {err:?}"
@@ -12150,7 +13502,10 @@
                 gateway_host: None,
             })
             .unwrap();
-        state.db.set_note_folder("m-empty", Some("f-empty")).unwrap();
+        state
+            .db
+            .set_note_folder("m-empty", Some("f-empty"))
+            .unwrap();
         // Folder is NOT locked, so only the empty-body refusal is under test (not the read-gate).
 
         let err = build_org_share_body(&state, Some("m-empty"), None, true).unwrap_err();
@@ -12238,9 +13593,9 @@
         // Past the (now-passing) read-gate AND the (now-passing) empty-body guard, the next real gate is
         // org-egress consent (no consent granted in this fixture) — NOT InvalidArg.
         assert!(
-            matches!(err, AppError::Unavailable(_)),
-            "a real, non-empty note must sail past the empty-body guard to the consent gate, got: {err:?}"
-        );
+                matches!(err, AppError::Unavailable(_)),
+                "a real, non-empty note must sail past the empty-body guard to the consent gate, got: {err:?}"
+            );
     }
 
     /// `preview_org_share` never egresses AND still enforces the read-gate: a sealed meeting refuses.
@@ -12252,14 +13607,11 @@
         seed_locked_meeting_with_note(&state, "f-prev", "m-prev");
 
         // Sealed → refuse (the preview is a read, so it is gated too).
-        let err = preview_org_share_inner(
-            &state,
-            Some("m-prev".to_string()),
-            None,
-            true,
-        )
-        .unwrap_err();
-        assert!(matches!(err, AppError::Locked(_)), "sealed preview must refuse");
+        let err = preview_org_share_inner(&state, Some("m-prev".to_string()), None, true).unwrap_err();
+        assert!(
+            matches!(err, AppError::Locked(_)),
+            "sealed preview must refuse"
+        );
 
         // Unlock → preview returns the clean + scrubbed body, no egress, no login needed.
         state
@@ -12267,13 +13619,7 @@
             .lock()
             .unwrap()
             .insert("f-prev".to_string());
-        let prev = preview_org_share_inner(
-            &state,
-            Some("m-prev".to_string()),
-            None,
-            true,
-        )
-        .unwrap();
+        let prev = preview_org_share_inner(&state, Some("m-prev".to_string()), None, true).unwrap();
         // Frontmatter (attendees) stripped by clean_note_body.
         assert!(
             !prev.markdown.contains("attendees") && !prev.markdown.contains("Alice"),
@@ -12302,13 +13648,7 @@
             .lock()
             .unwrap()
             .insert("f-ns".to_string());
-        let prev = preview_org_share_inner(
-            &state,
-            Some("m-ns".to_string()),
-            None,
-            false,
-        )
-        .unwrap();
+        let prev = preview_org_share_inner(&state, Some("m-ns".to_string()), None, false).unwrap();
         assert!(
             prev.markdown.contains("415-555-0100"),
             "unscrubbed preview keeps the phone number"
@@ -12352,7 +13692,11 @@
         let row = state.db.org_share_by_item("item-abc").unwrap().unwrap();
         assert_eq!(row.state, "uploaded");
         assert_eq!(row.item_id.as_deref(), Some("item-abc"));
-        assert!(state.db.list_org_shares_in_state("queued").unwrap().is_empty());
+        assert!(state
+            .db
+            .list_org_shares_in_state("queued")
+            .unwrap()
+            .is_empty());
         // uploaded → revoke_pending → revoked.
         state
             .db
@@ -12370,7 +13714,10 @@
             .db
             .set_org_share_state("s1", "revoked", "2026-07-10T10:03:00Z")
             .unwrap();
-        assert_eq!(state.db.get_org_share("s1").unwrap().unwrap().state, "revoked");
+        assert_eq!(
+            state.db.get_org_share("s1").unwrap().unwrap().state,
+            "revoked"
+        );
 
         // A second row can go queued → failed (retry path) with a non-PII error.
         state
@@ -12416,11 +13763,7 @@
         // The share row decision `share_to_org_inner` performs, extracted so it can run without a
         // server: reuse an existing retriable row, else insert a fresh one; return the row id.
         let attempt_row_id = |title: &str, ts: &str| -> String {
-            match state
-                .db
-                .find_reusable_org_share(org, mid, None)
-                .unwrap()
-            {
+            match state.db.find_reusable_org_share(org, mid, None).unwrap() {
                 Some(existing) => {
                     state
                         .db
@@ -12442,15 +13785,28 @@
 
         // Attempt 1: insert, then upload FAILS.
         let id1 = attempt_row_id("Flaky", "2026-07-11T10:00:00Z");
-        state.db.set_org_share_failed(&id1, "upload_failed", "2026-07-11T10:00:01Z").unwrap();
+        state
+            .db
+            .set_org_share_failed(&id1, "upload_failed", "2026-07-11T10:00:01Z")
+            .unwrap();
         assert_eq!(total_rows(), 1, "first failed attempt = one row");
 
         // Attempts 2 & 3 (sweep retries): REUSE the same row, fail again.
         for (n, ts) in [(2, "2026-07-11T10:05:00Z"), (3, "2026-07-11T10:10:00Z")] {
             let idn = attempt_row_id("Flaky", ts);
-            assert_eq!(idn, id1, "retry {n} must reuse the SAME row, not mint a new one");
-            state.db.set_org_share_failed(&idn, "upload_failed", ts).unwrap();
-            assert_eq!(total_rows(), 1, "after retry {n}, still exactly one row (no amplification)");
+            assert_eq!(
+                idn, id1,
+                "retry {n} must reuse the SAME row, not mint a new one"
+            );
+            state
+                .db
+                .set_org_share_failed(&idn, "upload_failed", ts)
+                .unwrap();
+            assert_eq!(
+                total_rows(),
+                1,
+                "after retry {n}, still exactly one row (no amplification)"
+            );
         }
         // Exactly one row, and it is FAILED (not a pile of stale queued/failed rows).
         let failed = state.db.list_org_shares_in_state("failed").unwrap();
@@ -12461,21 +13817,43 @@
         // uploaded, item_id recorded, with NO duplicate published row.
         let id4 = attempt_row_id("Flaky", "2026-07-11T10:15:00Z");
         assert_eq!(id4, id1, "recovery reuses the same row");
-        state.db.set_org_share_uploaded(&id4, "server-item-1", "2026-07-11T10:15:01Z").unwrap();
+        state
+            .db
+            .set_org_share_uploaded(&id4, "server-item-1", "2026-07-11T10:15:01Z")
+            .unwrap();
         assert_eq!(total_rows(), 1, "success must not add a duplicate row");
         let uploaded = state.db.get_org_share(&id1).unwrap().unwrap();
         assert_eq!(uploaded.state, "uploaded");
         assert_eq!(uploaded.item_id.as_deref(), Some("server-item-1"));
-        assert!(state.db.list_org_shares_in_state("failed").unwrap().is_empty());
+        assert!(state
+            .db
+            .list_org_shares_in_state("failed")
+            .unwrap()
+            .is_empty());
 
         // A DIFFERENT logical share (a different meeting) is its OWN row — reuse is per logical key.
-        let other = match state.db.find_reusable_org_share(org, Some("m-other"), None).unwrap() {
+        let other = match state
+            .db
+            .find_reusable_org_share(org, Some("m-other"), None)
+            .unwrap()
+        {
             Some(_) => panic!("no reusable row should exist for a fresh meeting"),
             None => {
                 let id = crate::share::new_share_id();
                 state
                     .db
-                    .insert_org_share(&id, org, Some("m-other"), None, "note", Some("O"), 1, 1, &sha, "t")
+                    .insert_org_share(
+                        &id,
+                        org,
+                        Some("m-other"),
+                        None,
+                        "note",
+                        Some("O"),
+                        1,
+                        1,
+                        &sha,
+                        "t",
+                    )
                     .unwrap();
                 id
             }
@@ -12511,16 +13889,21 @@
         // PUBLISHER seals under hex(content_sha) — NOT the local row id. (The server would assign a
         // different item_id; we simulate that by using a DISTINCT server id below.)
         let publisher_nonce = org_item_nonce(&content_sha);
-        let (ciphertext, feed_sha) =
-            seal_org_envelope(&ock, &env, "org-1", &publisher_nonce).unwrap();
+        let (ciphertext, feed_sha) = seal_org_envelope(&ock, &env, "org-1", &publisher_nonce).unwrap();
         assert_eq!(feed_sha, content_sha, "the feed carries the PLAINTEXT hash");
 
         // CONSUMER derives the nonce from ONLY the feed's content_sha256 (it never learns row_id, and
         // the server item_id 'server-xyz' is deliberately different from any local id).
         let consumer_nonce = org_item_nonce(&feed_sha);
-        assert_eq!(publisher_nonce, consumer_nonce, "both sides derive the same AAD nonce");
+        assert_eq!(
+            publisher_nonce, consumer_nonce,
+            "both sides derive the same AAD nonce"
+        );
         let opened = open_org_envelope(&ock, &ciphertext, "org-1", &consumer_nonce).unwrap();
-        assert_eq!(opened, env, "a consumer opens the cell with only the feed hash");
+        assert_eq!(
+            opened, env,
+            "a consumer opens the cell with only the feed hash"
+        );
 
         // Sanity: the SERVER item id would NOT open it (proving the old row_id/item_id approach was
         // broken — the nonce must be the content hash, not any id).
@@ -12587,9 +13970,16 @@
         seed_note_doc_cmd(&state.db, "n1", "f1", "Note One", "body one\n");
         seed_note_doc_cmd(&state.db, "n2", "f1", "Note Two", "body two\n");
         // A SUGGESTED semantic edge between two OWNED notes (the exact case that used to hang).
-        let link_id = state
-            .db
-            .insert_link_for_test("note", "n1", "note", "n2", "semantic", 0.9, "auto", "suggested");
+        let link_id = state.db.insert_link_for_test(
+            "note",
+            "n1",
+            "note",
+            "n2",
+            "semantic",
+            0.9,
+            "auto",
+            "suggested",
+        );
 
         let (tx, rx) = mpsc::channel();
         let worker = state.clone();
@@ -12706,7 +14096,10 @@
                 None,
             )
             .unwrap();
-        assert!(state.db.get_org_item("it-d").unwrap().is_some(), "visible while enabled");
+        assert!(
+            state.db.get_org_item("it-d").unwrap().is_some(),
+            "visible while enabled"
+        );
 
         state.db.set_org_context_enabled("org-1", false).unwrap();
         assert!(
@@ -12731,19 +14124,75 @@
         // Two items in org-1 at seq 1 and 2, plus an item in a DIFFERENT org, plus a tombstoned one.
         state
             .db
-            .upsert_org_item("a", "org-1", 1, "anna", "Kickoff", "the kickoff agenda", "2026-07-10T09:00:00Z", 1, 1, &[1u8; 32], None, None, None)
+            .upsert_org_item(
+                "a",
+                "org-1",
+                1,
+                "anna",
+                "Kickoff",
+                "the kickoff agenda",
+                "2026-07-10T09:00:00Z",
+                1,
+                1,
+                &[1u8; 32],
+                None,
+                None,
+                None,
+            )
             .unwrap();
         state
             .db
-            .upsert_org_item("b", "org-1", 2, "bob", "Retro", "the sprint retro", "2026-07-11T09:00:00Z", 1, 1, &[2u8; 32], None, None, None)
+            .upsert_org_item(
+                "b",
+                "org-1",
+                2,
+                "bob",
+                "Retro",
+                "the sprint retro",
+                "2026-07-11T09:00:00Z",
+                1,
+                1,
+                &[2u8; 32],
+                None,
+                None,
+                None,
+            )
             .unwrap();
         state
             .db
-            .upsert_org_item("z", "org-2", 9, "zed", "Other org", "not our org", "2026-07-11T09:00:00Z", 1, 1, &[3u8; 32], None, None, None)
+            .upsert_org_item(
+                "z",
+                "org-2",
+                9,
+                "zed",
+                "Other org",
+                "not our org",
+                "2026-07-11T09:00:00Z",
+                1,
+                1,
+                &[3u8; 32],
+                None,
+                None,
+                None,
+            )
             .unwrap();
         state
             .db
-            .upsert_org_item("d", "org-1", 3, "dan", "Dead", "revoked", "2026-07-11T10:00:00Z", 1, 1, &[4u8; 32], None, None, None)
+            .upsert_org_item(
+                "d",
+                "org-1",
+                3,
+                "dan",
+                "Dead",
+                "revoked",
+                "2026-07-11T10:00:00Z",
+                1,
+                1,
+                &[4u8; 32],
+                None,
+                None,
+                None,
+            )
             .unwrap();
         state.db.tombstone_org_item("d").unwrap();
 
@@ -12783,11 +14232,36 @@
         // The received replica (frozen at publish time = "Untitled") + the matching OUTBOUND share.
         state
             .db
-            .upsert_org_item("item-own", "org-1", 2, "kgm004a", "Untitled", "# body", "2026-07-11T09:00:00Z", 1, 1, &[9u8; 32], None, None, None)
+            .upsert_org_item(
+                "item-own",
+                "org-1",
+                2,
+                "kgm004a",
+                "Untitled",
+                "# body",
+                "2026-07-11T09:00:00Z",
+                1,
+                1,
+                &[9u8; 32],
+                None,
+                None,
+                None,
+            )
             .unwrap();
         state
             .db
-            .insert_org_share("s-own", "org-1", None, Some("n-own"), "note", Some("Untitled"), 1, 1, &[9u8; 32], "2026-07-11T09:00:00Z")
+            .insert_org_share(
+                "s-own",
+                "org-1",
+                None,
+                Some("n-own"),
+                "note",
+                Some("Untitled"),
+                1,
+                1,
+                &[9u8; 32],
+                "2026-07-11T09:00:00Z",
+            )
             .unwrap();
         state
             .db
@@ -12796,7 +14270,21 @@
         // Someone ELSE's replica — no local share ⇒ stays read-only, title untouched.
         state
             .db
-            .upsert_org_item("item-other", "org-1", 1, "kgm004a+2", "Ich notatka", "body", "2026-07-10T09:00:00Z", 1, 1, &[7u8; 32], None, None, None)
+            .upsert_org_item(
+                "item-other",
+                "org-1",
+                1,
+                "kgm004a+2",
+                "Ich notatka",
+                "body",
+                "2026-07-10T09:00:00Z",
+                1,
+                1,
+                &[7u8; 32],
+                None,
+                None,
+                None,
+            )
             .unwrap();
 
         let items = list_org_items_inner(&state, "org-1").unwrap();
@@ -12805,13 +14293,22 @@
             own.title, "Jest tytul",
             "owned item shows the source's CURRENT title, not the stale snapshot"
         );
-        let owned = own.owned_source.as_ref().expect("owned item carries a source ref");
+        let owned = own
+            .owned_source
+            .as_ref()
+            .expect("owned item carries a source ref");
         assert_eq!(owned.kind, "document");
         assert_eq!(owned.id, "n-own");
 
         let other = items.iter().find(|i| i.item_id == "item-other").unwrap();
-        assert!(other.owned_source.is_none(), "a non-author's item is a read-only replica");
-        assert_eq!(other.title, "Ich notatka", "a non-owned title is left as-is");
+        assert!(
+            other.owned_source.is_none(),
+            "a non-author's item is a read-only replica"
+        );
+        assert_eq!(
+            other.title, "Ich notatka",
+            "a non-owned title is left as-is"
+        );
     }
 
     /// F-org-editable-any-device storage: `set_org_item_author` stamps the author id and
@@ -12823,7 +14320,21 @@
         seed_org(&state.db, "org-1", "Acme", "member", 1);
         state
             .db
-            .upsert_org_item("item-x", "org-1", 3, "anna", "T", "# body", "2026-07-11T09:00:00Z", 2, 1, &[9u8; 32], Some("document"), None, None)
+            .upsert_org_item(
+                "item-x",
+                "org-1",
+                3,
+                "anna",
+                "T",
+                "# body",
+                "2026-07-11T09:00:00Z",
+                2,
+                1,
+                &[9u8; 32],
+                Some("document"),
+                None,
+                None,
+            )
             .unwrap();
 
         // Un-stamped ⇒ author is None (a member could never pass the ownership gate on it).
@@ -12835,14 +14346,31 @@
         assert_eq!(ctx0.source_kind.as_deref(), Some("document"));
 
         // After stamping, the exact author id reads back.
-        state.db.set_org_item_author("item-x", "author-uuid-123").unwrap();
+        state
+            .db
+            .set_org_item_author("item-x", "author-uuid-123")
+            .unwrap();
         let ctx1 = state.db.org_item_edit_ctx("item-x").unwrap().unwrap();
         assert_eq!(ctx1.author_user_id.as_deref(), Some("author-uuid-123"));
 
         // A survivor of ON CONFLICT re-upsert (feed re-pull) keeps the author (not in the SET list).
         state
             .db
-            .upsert_org_item("item-x", "org-1", 4, "anna", "T2", "# body2", "2026-07-11T09:00:00Z", 3, 1, &[8u8; 32], Some("document"), None, None)
+            .upsert_org_item(
+                "item-x",
+                "org-1",
+                4,
+                "anna",
+                "T2",
+                "# body2",
+                "2026-07-11T09:00:00Z",
+                3,
+                1,
+                &[8u8; 32],
+                Some("document"),
+                None,
+                None,
+            )
             .unwrap();
         let ctx2 = state.db.org_item_edit_ctx("item-x").unwrap().unwrap();
         assert_eq!(
@@ -12862,10 +14390,27 @@
         seed_org(&state.db, "org-1", "Acme", "member", 1);
         state
             .db
-            .upsert_org_item("item-theirs", "org-1", 1, "bob", "Bob's note", "# body", "2026-07-11T09:00:00Z", 1, 1, &[7u8; 32], Some("document"), None, None)
+            .upsert_org_item(
+                "item-theirs",
+                "org-1",
+                1,
+                "bob",
+                "Bob's note",
+                "# body",
+                "2026-07-11T09:00:00Z",
+                1,
+                1,
+                &[7u8; 32],
+                Some("document"),
+                None,
+                None,
+            )
             .unwrap();
         // Authored by SOMEONE ELSE.
-        state.db.set_org_item_author("item-theirs", "bob-user-id").unwrap();
+        state
+            .db
+            .set_org_item_author("item-theirs", "bob-user-id")
+            .unwrap();
         // Consent ON + a live session for a DIFFERENT user — proves the refusal is the OWNERSHIP gate,
         // not a missing session or consent.
         state.config.lock().unwrap().org_egress_consented = true;
@@ -12881,8 +14426,13 @@
             refresh_token: "r".into(),
         });
 
-        let err = block_on(org_update_own_item_inner(&state, "item-theirs", "hacked", "# pwned"))
-            .expect_err("a non-author must NOT be able to re-publish someone else's org item");
+        let err = block_on(org_update_own_item_inner(
+            &state,
+            "item-theirs",
+            "hacked",
+            "# pwned",
+        ))
+        .expect_err("a non-author must NOT be able to re-publish someone else's org item");
         assert!(
             matches!(err, AppError::Auth(_)),
             "expected an Auth refusal, got {err:?}"
@@ -12900,9 +14450,26 @@
         seed_org(&state.db, "org-1", "Acme", "member", 1);
         state
             .db
-            .upsert_org_item("item-mine", "org-1", 1, "me", "Mine", "# body", "2026-07-11T09:00:00Z", 1, 1, &[9u8; 32], Some("document"), None, None)
+            .upsert_org_item(
+                "item-mine",
+                "org-1",
+                1,
+                "me",
+                "Mine",
+                "# body",
+                "2026-07-11T09:00:00Z",
+                1,
+                1,
+                &[9u8; 32],
+                Some("document"),
+                None,
+                None,
+            )
             .unwrap();
-        state.db.set_org_item_author("item-mine", "me-user-id").unwrap();
+        state
+            .db
+            .set_org_item_author("item-mine", "me-user-id")
+            .unwrap();
         // The caller IS the author, but consent is OFF (the default).
         assert!(!state.config.lock().unwrap().org_egress_consented);
         *state.account_session.lock().unwrap() = Some(crate::share::AccountSession {
@@ -12917,8 +14484,13 @@
             refresh_token: "r".into(),
         });
 
-        let err = block_on(org_update_own_item_inner(&state, "item-mine", "edit", "# edit"))
-            .expect_err("no egress while consent is off, even for the author");
+        let err = block_on(org_update_own_item_inner(
+            &state,
+            "item-mine",
+            "edit",
+            "# edit",
+        ))
+        .expect_err("no egress while consent is off, even for the author");
         assert!(
             matches!(err, AppError::Unavailable(_)),
             "expected an Unavailable (consent) refusal, got {err:?}"
@@ -12938,9 +14510,26 @@
         seed_org(&state.db, "org-1", "Acme", "member", 1);
         state
             .db
-            .upsert_org_item("item-mine", "org-1", 1, "me", "Mine", "# body", "2026-07-11T09:00:00Z", 1, 1, &[9u8; 32], Some("document"), None, None)
+            .upsert_org_item(
+                "item-mine",
+                "org-1",
+                1,
+                "me",
+                "Mine",
+                "# body",
+                "2026-07-11T09:00:00Z",
+                1,
+                1,
+                &[9u8; 32],
+                Some("document"),
+                None,
+                None,
+            )
             .unwrap();
-        state.db.set_org_item_author("item-mine", "me-user-id").unwrap();
+        state
+            .db
+            .set_org_item_author("item-mine", "me-user-id")
+            .unwrap();
         state.config.lock().unwrap().org_egress_consented = true;
         *state.account_session.lock().unwrap() = Some(crate::share::AccountSession {
             account_id: "me@example.com".into(),
@@ -12955,8 +14544,13 @@
         });
 
         // Whitespace-only body — cleans down to "" the same way a frontmatter-only note does.
-        let err = block_on(org_update_own_item_inner(&state, "item-mine", "Mine", "   \n\n  "))
-            .expect_err("editing an org item's body down to nothing must be refused");
+        let err = block_on(org_update_own_item_inner(
+            &state,
+            "item-mine",
+            "Mine",
+            "   \n\n  ",
+        ))
+        .expect_err("editing an org item's body down to nothing must be refused");
         assert!(
             matches!(err, AppError::InvalidArg(_)),
             "expected InvalidArg for an empty edit, got {err:?}"
@@ -12971,8 +14565,13 @@
     fn org_update_own_item_rejects_an_unknown_item() {
         let state = build_state("org-edit-unknown");
         seed_org(&state.db, "org-1", "Acme", "member", 1);
-        let err = block_on(org_update_own_item_inner(&state, "does-not-exist", "t", "b"))
-            .expect_err("an unknown item id must be rejected");
+        let err = block_on(org_update_own_item_inner(
+            &state,
+            "does-not-exist",
+            "t",
+            "b",
+        ))
+        .expect_err("an unknown item id must be rejected");
         assert!(
             matches!(err, AppError::InvalidArg(_)),
             "expected InvalidArg for an unknown item, got {err:?}"
@@ -12989,9 +14588,26 @@
         seed_org(&state.db, "org-1", "Acme", "member", 1);
         state
             .db
-            .upsert_org_item("item-theirs", "org-1", 1, "bob", "Bob's note", "# body", "2026-07-11T09:00:00Z", 1, 1, &[7u8; 32], Some("document"), None, None)
+            .upsert_org_item(
+                "item-theirs",
+                "org-1",
+                1,
+                "bob",
+                "Bob's note",
+                "# body",
+                "2026-07-11T09:00:00Z",
+                1,
+                1,
+                &[7u8; 32],
+                Some("document"),
+                None,
+                None,
+            )
             .unwrap();
-        state.db.set_org_item_author("item-theirs", "bob-user-id").unwrap();
+        state
+            .db
+            .set_org_item_author("item-theirs", "bob-user-id")
+            .unwrap();
         *state.account_session.lock().unwrap() = Some(crate::share::AccountSession {
             account_id: "me@example.com".into(),
             email: "me@example.com".into(),
@@ -13120,12 +14736,25 @@
         // Untitled + body in an open folder → first non-empty line becomes the title, persisted.
         state
             .db
-            .insert_note("n1", "f", "n1", "Untitled", "# Kickoff planning\nmore body", 1)
+            .insert_note(
+                "n1",
+                "f",
+                "n1",
+                "Untitled",
+                "# Kickoff planning\nmore body",
+                1,
+            )
             .unwrap();
         let t = block_on(suggest_note_title_inner(&state, "n1")).unwrap();
         assert_eq!(t, "Kickoff planning");
         assert_eq!(
-            state.db.get_note_row("n1").unwrap().unwrap().title.as_deref(),
+            state
+                .db
+                .get_note_row("n1")
+                .unwrap()
+                .unwrap()
+                .title
+                .as_deref(),
             Some("Kickoff planning"),
             "the title is persisted"
         );
@@ -13140,7 +14769,13 @@
             "My Title"
         );
         assert_eq!(
-            state.db.get_note_row("n2").unwrap().unwrap().title.as_deref(),
+            state
+                .db
+                .get_note_row("n2")
+                .unwrap()
+                .unwrap()
+                .title
+                .as_deref(),
             Some("My Title")
         );
 
@@ -13154,9 +14789,171 @@
             "Untitled"
         );
         assert_eq!(
-            state.db.get_note_row("n3").unwrap().unwrap().title.as_deref(),
+            state
+                .db
+                .get_note_row("n3")
+                .unwrap()
+                .unwrap()
+                .title
+                .as_deref(),
             Some("Untitled")
         );
+    }
+
+    /// LOCK-GATE regression: a logically locked note can still retain plaintext after an interrupted
+    /// cleanup. No command may read that residual row before authorization. The historical auto-title
+    /// path returned the real stored title before its lock check; the editor/document readers also
+    /// selected the full body before masking it.
+    #[test]
+    fn locked_residual_note_never_leaks_title_or_body_before_the_gate() {
+        let state = build_state("locked-residual-note-gate");
+        make_open_folder(&state.db, "secret-folder", "Secret");
+        state
+            .db
+            .insert_note(
+                "secret-note",
+                "secret-folder",
+                "secret-note",
+                "Launch Bluebird",
+                "acquisition terms and customer names",
+                1,
+            )
+            .unwrap();
+        // Model the crash/interruption window directly: the logical lock is authoritative while the
+        // plaintext columns have not yet been blanked. Commands must fail closed from metadata alone.
+        state
+            .db
+            .set_folder_locked("secret-folder", true, Some(&b"wrapped"[..]))
+            .unwrap();
+
+        assert_eq!(
+            block_on(suggest_note_title_inner(&state, "secret-note")).unwrap(),
+            "Untitled",
+            "auto-title must never return the stored title of a locked note"
+        );
+        let masked = get_note_inner(&state, "secret-note").unwrap();
+        assert!(masked.locked);
+        assert_eq!(masked.title, "🔒 Locked");
+        assert!(masked.markdown.is_empty());
+        assert_eq!(
+            get_document_inner(&state, "secret-note").unwrap(),
+            "",
+            "generic document read must mask the same residual plaintext"
+        );
+    }
+
+    /// Export/relock TOCTOU regression: explicit audio publication must acquire the SAME lifecycle
+    /// mutex as relock before it reads/copies plaintext. Holding that mutex here deterministically
+    /// keeps the destination absent; once released, the export completes byte-identically.
+    #[test]
+    fn explicit_audio_export_waits_for_the_lock_lifecycle_interval() {
+        let state = Arc::new(build_state("audio-export-lifecycle"));
+        make_open_folder(&state.db, "f-export", "Export");
+        let src = crate::storage::db::unique_temp_path("murmur-audio-export-src", "wav");
+        let dest = crate::storage::db::unique_temp_path("murmur-audio-export-dest", "wav");
+        std::fs::write(&src, b"RIFF lifecycle bytes").unwrap();
+        let src_string = src.to_string_lossy().to_string();
+        seed_titled_meeting(
+            &state.db,
+            "m-export",
+            "Export race",
+            &src_string,
+            "f-export",
+        );
+
+        let worker_state = Arc::clone(&state);
+        let worker_dest = dest.clone();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let lifecycle = lifecycle_guard(state.as_ref());
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            export_audio_inner(
+                worker_state.as_ref(),
+                "m-export",
+                &worker_dest.to_string_lossy(),
+            )
+        });
+        started_rx.recv().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(
+            !dest.exists(),
+            "export must remain blocked while relock owns the lifecycle interval"
+        );
+        drop(lifecycle);
+        worker.join().unwrap().unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"RIFF lifecycle bytes");
+
+        let _ = std::fs::remove_file(src);
+        let _ = std::fs::remove_file(dest);
+    }
+
+    /// Canvas publication includes title/timeline plaintext and therefore obeys the same relock
+    /// serialization contract as audio and Markdown export.
+    #[test]
+    fn canvas_export_waits_for_the_lock_lifecycle_interval() {
+        let vault = tmp_vault("canvas-export-lifecycle");
+        let state = Arc::new(build_state_with_vault("canvas-export-lifecycle", &vault));
+        make_open_folder(&state.db, "f-canvas", "Canvas source");
+        seed_meeting(&state.db, "m-canvas", "# canvas note", Some("f-canvas"));
+
+        let worker_state = Arc::clone(&state);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let lifecycle = lifecycle_guard(state.as_ref());
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            export_canvas_inner(worker_state.as_ref(), "m-canvas")
+        });
+        started_rx.recv().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(
+            !vault.join("Canvas").exists(),
+            "Canvas publication must wait while relock owns the lifecycle interval"
+        );
+        drop(lifecycle);
+        let exported = worker.join().unwrap().unwrap();
+        assert!(std::path::Path::new(&exported).exists());
+
+        let _ = std::fs::remove_dir_all(vault);
+    }
+
+    /// Authored-note vault publication uses the same serialization contract as meeting exports.
+    /// This catches accidentally calling the lifecycle-authorized image/Markdown helper without
+    /// actually owning the lifecycle mutex.
+    #[test]
+    fn authored_note_vault_export_waits_for_the_lock_lifecycle_interval() {
+        let vault = tmp_vault("authored-export-lifecycle");
+        let state = Arc::new(build_state_with_vault("authored-export-lifecycle", &vault));
+        make_open_folder(&state.db, "f-note-export", "Notes/Export");
+        state
+            .db
+            .insert_note(
+                "n-export",
+                "f-note-export",
+                "n-export",
+                "Exported note",
+                "private body",
+                1,
+            )
+            .unwrap();
+
+        let worker_state = Arc::clone(&state);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let lifecycle = lifecycle_guard(state.as_ref());
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            export_note_to_vault(worker_state.as_ref(), "n-export")
+        });
+        started_rx.recv().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(
+            !vault.join("Notes/Export").exists(),
+            "vault publication must wait while relock owns the lifecycle interval"
+        );
+        drop(lifecycle);
+        let exported = worker.join().unwrap().unwrap().expect("exported path");
+        assert!(std::fs::read_to_string(exported).unwrap().contains("private body"));
+
+        let _ = std::fs::remove_dir_all(vault);
     }
 
     /// Feature A (the primary bug fix, RED-before-GREEN): `create_note(None)` when the legacy "Notes"
@@ -13179,7 +14976,10 @@
             "a new note must NOT be created into the locked legacy Notes folder"
         );
         let root = state.db.note_root_id().unwrap().unwrap();
-        assert_eq!(row.folder_id, root, "it lands in the reserved always-open root");
+        assert_eq!(
+            row.folder_id, root,
+            "it lands in the reserved always-open root"
+        );
         assert!(
             !state.db.folder_by_id(&root).unwrap().unwrap().locked,
             "the root is always open"
@@ -13260,14 +15060,45 @@
             .unwrap();
         state
             .db
-            .upsert_org_item("item-stuck", "org-1", 1, "kgm004a", "Untitled", "# body", now, 1, 1, &[9u8; 32], None, None, None)
+            .upsert_org_item(
+                "item-stuck",
+                "org-1",
+                1,
+                "kgm004a",
+                "Untitled",
+                "# body",
+                now,
+                1,
+                1,
+                &[9u8; 32],
+                None,
+                None,
+                None,
+            )
             .unwrap();
         state
             .db
-            .insert_org_share("s-stuck", "org-1", None, Some("n-stuck"), "note", Some("Untitled"), 1, 1, &[9u8; 32], now)
+            .insert_org_share(
+                "s-stuck",
+                "org-1",
+                None,
+                Some("n-stuck"),
+                "note",
+                Some("Untitled"),
+                1,
+                1,
+                &[9u8; 32],
+                now,
+            )
             .unwrap();
-        state.db.set_org_share_uploaded("s-stuck", "item-stuck", now).unwrap();
-        state.db.set_org_share_failed("s-stuck", "republish_upload_failed", now).unwrap();
+        state
+            .db
+            .set_org_share_uploaded("s-stuck", "item-stuck", now)
+            .unwrap();
+        state
+            .db
+            .set_org_share_failed("s-stuck", "republish_upload_failed", now)
+            .unwrap();
 
         // A SEPARATE row that was uploaded, then intentionally revoked — must NOT enrich.
         state
@@ -13276,14 +15107,45 @@
             .unwrap();
         state
             .db
-            .upsert_org_item("item-revoked", "org-1", 1, "kgm004a", "Gone", "# body", now, 1, 1, &[8u8; 32], None, None, None)
+            .upsert_org_item(
+                "item-revoked",
+                "org-1",
+                1,
+                "kgm004a",
+                "Gone",
+                "# body",
+                now,
+                1,
+                1,
+                &[8u8; 32],
+                None,
+                None,
+                None,
+            )
             .unwrap();
         state
             .db
-            .insert_org_share("s-revoked", "org-1", None, Some("n-revoked"), "note", Some("Gone"), 1, 1, &[8u8; 32], now)
+            .insert_org_share(
+                "s-revoked",
+                "org-1",
+                None,
+                Some("n-revoked"),
+                "note",
+                Some("Gone"),
+                1,
+                1,
+                &[8u8; 32],
+                now,
+            )
             .unwrap();
-        state.db.set_org_share_uploaded("s-revoked", "item-revoked", now).unwrap();
-        state.db.set_org_share_state("s-revoked", "revoked", now).unwrap();
+        state
+            .db
+            .set_org_share_uploaded("s-revoked", "item-revoked", now)
+            .unwrap();
+        state
+            .db
+            .set_org_share_state("s-revoked", "revoked", now)
+            .unwrap();
 
         let items = list_org_items_inner(&state, "org-1").unwrap();
 
@@ -13293,9 +15155,9 @@
             "a stuck failed-with-item_id row still shows the source's CURRENT title"
         );
         let owned = stuck
-            .owned_source
-            .as_ref()
-            .expect("a stuck failed-with-item_id row still resolves as owned (not a leftover read-only replica)");
+                .owned_source
+                .as_ref()
+                .expect("a stuck failed-with-item_id row still resolves as owned (not a leftover read-only replica)");
         assert_eq!(owned.kind, "document");
         assert_eq!(owned.id, "n-stuck");
 
@@ -13326,13 +15188,41 @@
             .unwrap();
         state
             .db
-            .upsert_org_item("item-doc", "org-1", 3, "kgm004a", "A Note", "# body", "2026-07-11T09:00:00Z", 1, 1, &[9u8; 32], None, None, None)
+            .upsert_org_item(
+                "item-doc",
+                "org-1",
+                3,
+                "kgm004a",
+                "A Note",
+                "# body",
+                "2026-07-11T09:00:00Z",
+                1,
+                1,
+                &[9u8; 32],
+                None,
+                None,
+                None,
+            )
             .unwrap();
         state
             .db
-            .insert_org_share("s-doc", "org-1", None, Some("n-own"), "note", Some("A Note"), 1, 1, &[9u8; 32], "2026-07-11T09:00:00Z")
+            .insert_org_share(
+                "s-doc",
+                "org-1",
+                None,
+                Some("n-own"),
+                "note",
+                Some("A Note"),
+                1,
+                1,
+                &[9u8; 32],
+                "2026-07-11T09:00:00Z",
+            )
             .unwrap();
-        state.db.set_org_share_uploaded("s-doc", "item-doc", "2026-07-11T09:00:00Z").unwrap();
+        state
+            .db
+            .set_org_share_uploaded("s-doc", "item-doc", "2026-07-11T09:00:00Z")
+            .unwrap();
 
         // Owned MEETING share (unlocked meeting: no folder_id).
         state
@@ -13350,27 +15240,80 @@
             .unwrap();
         state
             .db
-            .upsert_org_item("item-meeting", "org-1", 2, "kgm004a", "Standup", "# body", "2026-07-11T09:00:00Z", 1, 1, &[8u8; 32], None, None, None)
+            .upsert_org_item(
+                "item-meeting",
+                "org-1",
+                2,
+                "kgm004a",
+                "Standup",
+                "# body",
+                "2026-07-11T09:00:00Z",
+                1,
+                1,
+                &[8u8; 32],
+                None,
+                None,
+                None,
+            )
             .unwrap();
         state
             .db
-            .insert_org_share("s-meeting", "org-1", Some("m-own"), None, "meeting", Some("Standup"), 1, 1, &[8u8; 32], "2026-07-11T09:00:00Z")
+            .insert_org_share(
+                "s-meeting",
+                "org-1",
+                Some("m-own"),
+                None,
+                "meeting",
+                Some("Standup"),
+                1,
+                1,
+                &[8u8; 32],
+                "2026-07-11T09:00:00Z",
+            )
             .unwrap();
-        state.db.set_org_share_uploaded("s-meeting", "item-meeting", "2026-07-11T09:00:00Z").unwrap();
+        state
+            .db
+            .set_org_share_uploaded("s-meeting", "item-meeting", "2026-07-11T09:00:00Z")
+            .unwrap();
 
         // A colleague's item — no local `org_shares` row.
         state
             .db
-            .upsert_org_item("item-other", "org-1", 1, "kgm004a+2", "Ich notatka", "body", "2026-07-10T09:00:00Z", 1, 1, &[7u8; 32], None, None, None)
+            .upsert_org_item(
+                "item-other",
+                "org-1",
+                1,
+                "kgm004a+2",
+                "Ich notatka",
+                "body",
+                "2026-07-10T09:00:00Z",
+                1,
+                1,
+                &[7u8; 32],
+                None,
+                None,
+                None,
+            )
             .unwrap();
 
         let items = list_org_items_inner(&state, "org-1").unwrap();
         let doc = items.iter().find(|i| i.item_id == "item-doc").unwrap();
-        assert_eq!(doc.kind.as_deref(), Some("document"), "owned note share ⇒ kind=document");
+        assert_eq!(
+            doc.kind.as_deref(),
+            Some("document"),
+            "owned note share ⇒ kind=document"
+        );
         let meeting = items.iter().find(|i| i.item_id == "item-meeting").unwrap();
-        assert_eq!(meeting.kind.as_deref(), Some("meeting"), "owned meeting share ⇒ kind=meeting");
+        assert_eq!(
+            meeting.kind.as_deref(),
+            Some("meeting"),
+            "owned meeting share ⇒ kind=meeting"
+        );
         let other = items.iter().find(|i| i.item_id == "item-other").unwrap();
-        assert!(other.kind.is_none(), "a colleague's item has no locally-knowable kind");
+        assert!(
+            other.kind.is_none(),
+            "a colleague's item has no locally-knowable kind"
+        );
     }
 
     /// F-org-editable GATE: an owned item whose source folder is LOCKED (not session-unlocked) is NOT
@@ -13398,11 +15341,36 @@
             .unwrap();
         state
             .db
-            .upsert_org_item("item-lock", "org-1", 1, "kgm004a", "Old Snapshot", "# body", "2026-07-11T09:00:00Z", 1, 1, &[5u8; 32], None, None, None)
+            .upsert_org_item(
+                "item-lock",
+                "org-1",
+                1,
+                "kgm004a",
+                "Old Snapshot",
+                "# body",
+                "2026-07-11T09:00:00Z",
+                1,
+                1,
+                &[5u8; 32],
+                None,
+                None,
+                None,
+            )
             .unwrap();
         state
             .db
-            .insert_org_share("s-lock", "org-1", None, Some("n-lock"), "note", Some("Old Snapshot"), 1, 1, &[5u8; 32], "2026-07-11T09:00:00Z")
+            .insert_org_share(
+                "s-lock",
+                "org-1",
+                None,
+                Some("n-lock"),
+                "note",
+                Some("Old Snapshot"),
+                1,
+                1,
+                &[5u8; 32],
+                "2026-07-11T09:00:00Z",
+            )
             .unwrap();
         state
             .db
@@ -13424,7 +15392,10 @@
             it.title, "Secret Title",
             "a locked source's current title must NOT leak into the org list"
         );
-        assert_eq!(it.title, "Old Snapshot", "falls back to the frozen replica snapshot");
+        assert_eq!(
+            it.title, "Old Snapshot",
+            "falls back to the frozen replica snapshot"
+        );
     }
 
     /// FIX A (command gate): `list_org_items_inner` refuses an org the caller isn't a local member of
@@ -13436,7 +15407,21 @@
         seed_org(&state.db, "org-mine", "Mine", "owner", 1);
         state
             .db
-            .upsert_org_item("m1", "org-mine", 1, "anna", "Mine A", "body", "2026-07-11T09:00:00Z", 1, 1, &[1u8; 32], None, None, None)
+            .upsert_org_item(
+                "m1",
+                "org-mine",
+                1,
+                "anna",
+                "Mine A",
+                "body",
+                "2026-07-11T09:00:00Z",
+                1,
+                1,
+                &[1u8; 32],
+                None,
+                None,
+                None,
+            )
             .unwrap();
         // A member org resolves + returns the item.
         let ok = list_org_items_inner(&state, "org-mine").unwrap();
@@ -13464,10 +15449,28 @@
         seed_org(&state.db, "org-1", "Acme", "member", 1);
         state
             .db
-            .upsert_org_item("m1", "org-1", 1, "anna", "Kickoff", "body", "2026-07-11T09:00:00Z", 1, 1, &[1u8; 32], None, None, None)
+            .upsert_org_item(
+                "m1",
+                "org-1",
+                1,
+                "anna",
+                "Kickoff",
+                "body",
+                "2026-07-11T09:00:00Z",
+                1,
+                1,
+                &[1u8; 32],
+                None,
+                None,
+                None,
+            )
             .unwrap();
 
-        assert_eq!(list_org_items_inner(&state, "org-1").unwrap().len(), 1, "visible while enabled");
+        assert_eq!(
+            list_org_items_inner(&state, "org-1").unwrap().len(),
+            1,
+            "visible while enabled"
+        );
 
         state.db.set_org_context_enabled("org-1", false).unwrap();
         assert_eq!(
@@ -13493,9 +15496,23 @@
         let state = build_state("org-set-context-enabled");
         seed_org(&state.db, "org-1", "Acme", "member", 1);
 
-        assert!(state.db.get_org_state("org-1").unwrap().unwrap().context_enabled);
+        assert!(
+            state
+                .db
+                .get_org_state("org-1")
+                .unwrap()
+                .unwrap()
+                .context_enabled
+        );
         org_set_context_enabled_inner(&state, "org-1", false).unwrap();
-        assert!(!state.db.get_org_state("org-1").unwrap().unwrap().context_enabled);
+        assert!(
+            !state
+                .db
+                .get_org_state("org-1")
+                .unwrap()
+                .unwrap()
+                .context_enabled
+        );
 
         // Refuses a non-member — never toggles an org the caller isn't in.
         assert!(matches!(
@@ -13519,7 +15536,10 @@
             })
             .unwrap();
         let row = state.db.get_org_state("org-1").unwrap().unwrap();
-        assert_eq!(row.name, "Acme Corp", "the refresh still updates name normally");
+        assert_eq!(
+            row.name, "Acme Corp",
+            "the refresh still updates name normally"
+        );
         assert!(
             !row.context_enabled,
             "a status refresh must NEVER silently re-enable a locally-disabled org"
@@ -13527,7 +15547,14 @@
 
         // Re-enable, explicit.
         org_set_context_enabled_inner(&state, "org-1", true).unwrap();
-        assert!(state.db.get_org_state("org-1").unwrap().unwrap().context_enabled);
+        assert!(
+            state
+                .db
+                .get_org_state("org-1")
+                .unwrap()
+                .unwrap()
+                .context_enabled
+        );
     }
 
     /// `meeting_org_shares`: an OPEN meeting's active org shares are visible (org id + display
@@ -13546,8 +15573,16 @@
         state
             .db
             .insert_org_share(
-                "s-open", "org-1", Some("m-open"), None, "meeting", Some("Quarterly strategy"),
-                1, 1, &[7u8; 32], "2026-07-11T09:00:00Z",
+                "s-open",
+                "org-1",
+                Some("m-open"),
+                None,
+                "meeting",
+                Some("Quarterly strategy"),
+                1,
+                1,
+                &[7u8; 32],
+                "2026-07-11T09:00:00Z",
             )
             .unwrap();
         state
@@ -13556,9 +15591,16 @@
             .unwrap();
 
         let open_shares = meeting_org_shares_inner(&state, "m-open").unwrap();
-        assert_eq!(open_shares.len(), 1, "the open meeting's active org share is visible");
+        assert_eq!(
+            open_shares.len(),
+            1,
+            "the open meeting's active org share is visible"
+        );
         assert_eq!(open_shares[0].org_id, "org-1");
-        assert_eq!(open_shares[0].org_name, "Acme", "the org's display name resolves");
+        assert_eq!(
+            open_shares[0].org_name, "Acme",
+            "the org's display name resolves"
+        );
 
         // A SEALED, NOT session-unlocked meeting, also actively shared into org-1.
         state
@@ -13576,8 +15618,16 @@
         state
             .db
             .insert_org_share(
-                "s-sealed", "org-1", Some("m-sealed"), None, "meeting", Some("Confidential"),
-                1, 1, &[8u8; 32], "2026-07-11T09:00:00Z",
+                "s-sealed",
+                "org-1",
+                Some("m-sealed"),
+                None,
+                "meeting",
+                Some("Confidential"),
+                1,
+                1,
+                &[8u8; 32],
+                "2026-07-11T09:00:00Z",
             )
             .unwrap();
         state
@@ -13620,11 +15670,22 @@
         state
             .db
             .insert_org_share(
-                "s-open", "org-1", Some("m-open"), None, "meeting", Some("Quarterly strategy"),
-                1, 1, &[7u8; 32], "2026-07-11T09:00:00Z",
+                "s-open",
+                "org-1",
+                Some("m-open"),
+                None,
+                "meeting",
+                Some("Quarterly strategy"),
+                1,
+                1,
+                &[7u8; 32],
+                "2026-07-11T09:00:00Z",
             )
             .unwrap();
-        state.db.set_org_share_uploaded("s-open", "item-open", "2026-07-11T09:00:00Z").unwrap();
+        state
+            .db
+            .set_org_share_uploaded("s-open", "item-open", "2026-07-11T09:00:00Z")
+            .unwrap();
 
         state
             .db
@@ -13641,21 +15702,43 @@
         state
             .db
             .insert_org_share(
-                "s-sealed", "org-1", Some("m-sealed"), None, "meeting", Some("Confidential"),
-                1, 1, &[8u8; 32], "2026-07-11T09:00:00Z",
+                "s-sealed",
+                "org-1",
+                Some("m-sealed"),
+                None,
+                "meeting",
+                Some("Confidential"),
+                1,
+                1,
+                &[8u8; 32],
+                "2026-07-11T09:00:00Z",
             )
             .unwrap();
-        state.db.set_org_share_uploaded("s-sealed", "item-sealed", "2026-07-11T09:00:00Z").unwrap();
+        state
+            .db
+            .set_org_share_uploaded("s-sealed", "item-sealed", "2026-07-11T09:00:00Z")
+            .unwrap();
 
         // A document-anchored share — not a meeting, must be skipped from the Library-scoped list.
         state
             .db
             .insert_org_share(
-                "s-doc", "org-1", None, Some("n-doc"), "note", Some("A note"),
-                1, 1, &[9u8; 32], "2026-07-11T09:00:00Z",
+                "s-doc",
+                "org-1",
+                None,
+                Some("n-doc"),
+                "note",
+                Some("A note"),
+                1,
+                1,
+                &[9u8; 32],
+                "2026-07-11T09:00:00Z",
             )
             .unwrap();
-        state.db.set_org_share_uploaded("s-doc", "item-doc", "2026-07-11T09:00:00Z").unwrap();
+        state
+            .db
+            .set_org_share_uploaded("s-doc", "item-doc", "2026-07-11T09:00:00Z")
+            .unwrap();
 
         let rows = list_meeting_org_shares_inner(&state).unwrap();
         assert_eq!(rows.len(), 1, "only the OPEN meeting's share is listed");
@@ -13690,23 +15773,48 @@
         state
             .db
             .insert_org_share(
-                "s-stuck", "org-1", Some("m-stuck"), None, "meeting", Some("Stuck"),
-                1, 1, &[11u8; 32], "2026-07-12T09:00:00Z",
+                "s-stuck",
+                "org-1",
+                Some("m-stuck"),
+                None,
+                "meeting",
+                Some("Stuck"),
+                1,
+                1,
+                &[11u8; 32],
+                "2026-07-12T09:00:00Z",
             )
             .unwrap();
-        state.db.set_org_share_uploaded("s-stuck", "item-stuck", "2026-07-12T09:00:00Z").unwrap();
-        state.db.set_org_share_failed("s-stuck", "republish_upload_failed", "2026-07-12T09:05:00Z").unwrap();
+        state
+            .db
+            .set_org_share_uploaded("s-stuck", "item-stuck", "2026-07-12T09:00:00Z")
+            .unwrap();
+        state
+            .db
+            .set_org_share_failed("s-stuck", "republish_upload_failed", "2026-07-12T09:05:00Z")
+            .unwrap();
 
         // Meeting m2: failed on the INITIAL publish — never got an item_id. No live item to badge.
         seed_meeting(&state.db, "m-never-live", "# note", Some("f-open"));
         state
             .db
             .insert_org_share(
-                "s-never-live", "org-1", Some("m-never-live"), None, "meeting", Some("Never live"),
-                1, 1, &[12u8; 32], "2026-07-12T09:00:00Z",
+                "s-never-live",
+                "org-1",
+                Some("m-never-live"),
+                None,
+                "meeting",
+                Some("Never live"),
+                1,
+                1,
+                &[12u8; 32],
+                "2026-07-12T09:00:00Z",
             )
             .unwrap();
-        state.db.set_org_share_failed("s-never-live", "publish_failed", "2026-07-12T09:00:00Z").unwrap();
+        state
+            .db
+            .set_org_share_failed("s-never-live", "publish_failed", "2026-07-12T09:00:00Z")
+            .unwrap();
 
         let rows = list_meeting_org_shares_inner(&state).unwrap();
         assert!(
@@ -13730,27 +15838,75 @@
         // TWO received items (from colleagues) in the local replica.
         state
             .db
-            .upsert_org_item("r1", "org-1", 1, "anna", "Doc A", "body a", "2026-07-10T09:00:00Z", 1, 1, &[1u8; 32], None, None, None)
+            .upsert_org_item(
+                "r1",
+                "org-1",
+                1,
+                "anna",
+                "Doc A",
+                "body a",
+                "2026-07-10T09:00:00Z",
+                1,
+                1,
+                &[1u8; 32],
+                None,
+                None,
+                None,
+            )
             .unwrap();
         state
             .db
-            .upsert_org_item("r2", "org-1", 2, "bob", "Doc B", "body b", "2026-07-11T09:00:00Z", 1, 1, &[2u8; 32], None, None, None)
+            .upsert_org_item(
+                "r2",
+                "org-1",
+                2,
+                "bob",
+                "Doc B",
+                "body b",
+                "2026-07-11T09:00:00Z",
+                1,
+                1,
+                &[2u8; 32],
+                None,
+                None,
+                None,
+            )
             .unwrap();
         // ONE of the caller's OWN outbound shares, state 'uploaded' (item_count = 1).
         let now = "2026-07-11T12:00:00Z";
         state
             .db
-            .insert_org_share("s1", "org-1", Some("m-own"), None, "meeting", Some("My Share"), 1, 1, &[9u8; 32], now)
+            .insert_org_share(
+                "s1",
+                "org-1",
+                Some("m-own"),
+                None,
+                "meeting",
+                Some("My Share"),
+                1,
+                1,
+                &[9u8; 32],
+                now,
+            )
             .unwrap();
-        state.db.set_org_share_uploaded("s1", "srv-item-1", now).unwrap();
+        state
+            .db
+            .set_org_share_uploaded("s1", "srv-item-1", now)
+            .unwrap();
 
         let status = block_on(org_status_for(
             &state,
             state.db.get_org_state("org-1").unwrap().unwrap(),
         ))
         .unwrap();
-        assert_eq!(status.received_count, 2, "received_count = local replica items");
-        assert_eq!(status.item_count, 1, "item_count = the caller's OWN outbound uploads");
+        assert_eq!(
+            status.received_count, 2,
+            "received_count = local replica items"
+        );
+        assert_eq!(
+            status.item_count, 1,
+            "item_count = the caller's OWN outbound uploads"
+        );
         // A tombstoned received item drops out of received_count.
         state.db.tombstone_org_item("r1").unwrap();
         let status2 = block_on(org_status_for(
@@ -13758,7 +15914,10 @@
             state.db.get_org_state("org-1").unwrap().unwrap(),
         ))
         .unwrap();
-        assert_eq!(status2.received_count, 1, "a tombstoned received item is excluded");
+        assert_eq!(
+            status2.received_count, 1,
+            "a tombstoned received item is excluded"
+        );
     }
 
     /// STUCK-REPUBLISH FIX: `OrgStatus.item_count` also counts a `failed` row that still carries a
@@ -13775,24 +15934,69 @@
         // One cleanly-uploaded share.
         state
             .db
-            .insert_org_share("s-up", "org-1", None, Some("n-up"), "note", Some("T"), 1, 1, &[1u8; 32], now)
+            .insert_org_share(
+                "s-up",
+                "org-1",
+                None,
+                Some("n-up"),
+                "note",
+                Some("T"),
+                1,
+                1,
+                &[1u8; 32],
+                now,
+            )
             .unwrap();
-        state.db.set_org_share_uploaded("s-up", "item-up", now).unwrap();
+        state
+            .db
+            .set_org_share_uploaded("s-up", "item-up", now)
+            .unwrap();
 
         // One STUCK share: published once, then a republish attempt failed (item_id retained).
         state
             .db
-            .insert_org_share("s-stuck", "org-1", None, Some("n-stuck"), "note", Some("T"), 1, 1, &[2u8; 32], now)
+            .insert_org_share(
+                "s-stuck",
+                "org-1",
+                None,
+                Some("n-stuck"),
+                "note",
+                Some("T"),
+                1,
+                1,
+                &[2u8; 32],
+                now,
+            )
             .unwrap();
-        state.db.set_org_share_uploaded("s-stuck", "item-stuck", now).unwrap();
-        state.db.set_org_share_failed("s-stuck", "republish_upload_failed", now).unwrap();
+        state
+            .db
+            .set_org_share_uploaded("s-stuck", "item-stuck", now)
+            .unwrap();
+        state
+            .db
+            .set_org_share_failed("s-stuck", "republish_upload_failed", now)
+            .unwrap();
 
         // One NEVER-published failed share (item_id NULL) — must stay excluded.
         state
             .db
-            .insert_org_share("s-dead", "org-1", None, Some("n-dead"), "note", Some("T"), 1, 1, &[3u8; 32], now)
+            .insert_org_share(
+                "s-dead",
+                "org-1",
+                None,
+                Some("n-dead"),
+                "note",
+                Some("T"),
+                1,
+                1,
+                &[3u8; 32],
+                now,
+            )
             .unwrap();
-        state.db.set_org_share_failed("s-dead", "publish_failed", now).unwrap();
+        state
+            .db
+            .set_org_share_failed("s-dead", "publish_failed", now)
+            .unwrap();
 
         let status = block_on(org_status_for(
             &state,
@@ -13802,7 +16006,7 @@
         assert_eq!(
             status.item_count, 2,
             "item_count includes the uploaded row AND the stuck failed-with-item_id row, \
-             excluding the never-published failed row"
+                 excluding the never-published failed row"
         );
     }
 
@@ -13852,7 +16056,10 @@
 
         // last_seq is monotonic: a lower value is ignored.
         state.db.set_org_last_seq("org-1", 10).unwrap();
-        assert_eq!(state.db.get_org_state("org-1").unwrap().unwrap().last_seq, 42);
+        assert_eq!(
+            state.db.get_org_state("org-1").unwrap().unwrap().last_seq,
+            42
+        );
 
         // delete_org_state drops it (leave/removal).
         state.db.delete_org_state("org-1").unwrap();
@@ -13900,11 +16107,24 @@
     fn share_to_org_inner_is_idempotent_for_an_already_uploaded_source() {
         let state = build_state("org-share-idem");
         seed_org(&state.db, "org-1", "Acme", "member", 1);
+        make_open_folder(&state.db, "f-idem", "Team");
+        state
+            .db
+            .insert_note("n1", "f-idem", "note", "A Note", "# body", 1)
+            .unwrap();
         // The FIRST click already published ONE uploaded share of document n1 into org-1.
         state
             .db
             .insert_org_share(
-                "s1", "org-1", None, Some("n1"), "note", Some("A Note"), 1, 1, &[9u8; 32],
+                "s1",
+                "org-1",
+                None,
+                Some("n1"),
+                "note",
+                Some("A Note"),
+                1,
+                1,
+                &[9u8; 32],
                 "2026-07-11T09:00:00Z",
             )
             .unwrap();
@@ -13930,12 +16150,222 @@
         );
         assert_eq!(entry.state, "uploaded");
         let after = state.db.list_org_shares_for_org("org-1").unwrap();
-        assert_eq!(after.len(), before, "no new org_shares row was inserted (no duplicate)");
+        assert_eq!(
+            after.len(),
+            before,
+            "no new org_shares row was inserted (no duplicate)"
+        );
         assert_eq!(
             after.iter().filter(|r| r.state == "uploaded").count(),
             1,
             "still exactly one live share"
         );
+    }
+
+    /// LOCK REGRESSION: the duplicate/idempotent fast path stores the original plaintext title in
+    /// `org_shares`. Once the source folder is sealed, a second Share click must hit the CURRENT
+    /// source gate before loading/returning that keeper row; otherwise the command leaks `Secret`.
+    #[test]
+    fn share_to_org_duplicate_fast_path_refuses_locked_source_before_returning_title() {
+        let state = build_state("org-share-idem-locked");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        make_open_folder(&state.db, "f-secret", "Secret folder");
+        state
+            .db
+            .insert_note(
+                "n-secret",
+                "f-secret",
+                "secret",
+                "Secret title",
+                "# secret body",
+                1,
+            )
+            .unwrap();
+        state
+            .db
+            .insert_org_share(
+                "s-secret",
+                "org-1",
+                None,
+                Some("n-secret"),
+                "note",
+                Some("Secret title"),
+                1,
+                1,
+                &[9u8; 32],
+                "2026-07-11T09:00:00Z",
+            )
+            .unwrap();
+        state
+            .db
+            .set_org_share_uploaded("s-secret", "item-secret", "2026-07-11T09:00:00Z")
+            .unwrap();
+        state
+            .db
+            .set_folder_locked("f-secret", true, Some(b"wrapped"))
+            .unwrap();
+
+        let err = block_on(share_to_org_inner(
+            &state,
+            "org-1",
+            None,
+            Some("n-secret".to_string()),
+            false,
+        ))
+        .unwrap_err();
+        assert!(matches!(err, AppError::Locked(_)));
+        let row = state.db.get_org_share("s-secret").unwrap().unwrap();
+        assert_eq!(
+            row.state, "uploaded",
+            "the gated refusal is non-destructive"
+        );
+        assert_eq!(row.item_id.as_deref(), Some("item-secret"));
+    }
+
+    /// EGRESS TOCTOU: an OPEN-folder move does not bump `seal_epoch`, so the snapshot must bind the
+    /// source folder id independently and refuse it before upload when that association changes.
+    #[test]
+    fn org_share_snapshot_revalidation_detects_open_folder_move() {
+        let state = build_state("org-share-snapshot-move");
+        make_open_folder(&state.db, "f-a", "A");
+        make_open_folder(&state.db, "f-b", "B");
+        state
+            .db
+            .insert_note("n-move", "f-a", "move", "Move", "# body", 1)
+            .unwrap();
+
+        let snapshot = build_org_share_snapshot(&state, None, Some("n-move"), true).unwrap();
+        state.db.set_note_doc_folder("n-move", "f-b").unwrap();
+
+        assert!(
+            !org_share_snapshot_is_current(&state, None, Some("n-move"), &snapshot.source_version,)
+                .unwrap()
+        );
+    }
+
+    /// EGRESS TOCTOU: every seal/relock/remove-lock bumps the monotonic epoch. Even when the source
+    /// folder id is unchanged, a snapshot read before that lifecycle transition is stale.
+    #[test]
+    fn org_share_snapshot_revalidation_detects_seal_epoch_change() {
+        let state = build_state("org-share-snapshot-seal");
+        make_open_folder(&state.db, "f-seal", "Team");
+        state
+            .db
+            .insert_note("n-seal", "f-seal", "seal", "Seal", "# body", 1)
+            .unwrap();
+
+        let snapshot = build_org_share_snapshot(&state, None, Some("n-seal"), true).unwrap();
+        bump_seal_epoch(&state);
+
+        assert!(
+            !org_share_snapshot_is_current(&state, None, Some("n-seal"), &snapshot.source_version,)
+                .unwrap()
+        );
+    }
+
+    /// INLINE REPUBLISH: there is one atomic `/items` request and no anonymous `/blobs` staging
+    /// request. A source move after the server has received that request cannot retract already-sent
+    /// bytes; the published snapshot is the one authorized at the request boundary.
+    #[test]
+    fn republish_move_during_inline_publish_uses_one_atomic_request() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_ip().unwrap();
+        let state = build_state("org-republish-move-during-upload");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        make_open_folder(&state.db, "f-before", "Before");
+        make_open_folder(&state.db, "f-after", "After");
+        state
+            .db
+            .insert_note(
+                "n-race",
+                "f-before",
+                "race",
+                "Race",
+                "# fresh body",
+                1,
+            )
+            .unwrap();
+        state
+            .db
+            .insert_org_share(
+                "s-race",
+                "org-1",
+                None,
+                Some("n-race"),
+                "note",
+                Some("Race"),
+                1,
+                1,
+                &[1u8; 32], // deliberately differs from the fresh envelope hash
+                "2026-07-11T09:00:00Z",
+            )
+            .unwrap();
+        state
+            .db
+            .set_org_share_uploaded("s-race", "item-old", "2026-07-11T09:00:00Z")
+            .unwrap();
+        state.config.lock().unwrap().org_egress_consented = true;
+        state.config.lock().unwrap().share_base_url = format!("http://{addr}/");
+        seed_live_session(&state);
+        seed_ock(&state, "org-1", 1);
+
+        let db = Arc::clone(&state.db);
+        let mock = std::thread::spawn(move || {
+            let req = server
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap()
+                .expect("republish must issue one inline publish");
+            assert_eq!(req.method(), &tiny_http::Method::Post);
+            assert_eq!(req.url().split('?').next(), Some("/v1/orgs/org-1/items"));
+
+            let mut req = req;
+            let mut body = String::new();
+            req.as_reader().read_to_string(&mut body).unwrap();
+            let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert!(json.get("blobId").is_none());
+            assert!(json.get("contentCell").and_then(|v| v.as_str()).is_some());
+
+            // Land the OPEN→OPEN move after the atomic request has already crossed the egress seam.
+            db.set_note_doc_folder("n-race", "f-after").unwrap();
+            let response = tiny_http::Response::from_string(r#"{"itemId":"item-new","seq":2}"#)
+                .with_header(
+                    "Content-Type: application/json"
+                        .parse::<tiny_http::Header>()
+                        .unwrap(),
+                );
+            req.respond(response).unwrap();
+
+            // A successful supersede has exactly one follow-up: tombstone the old item. There is no
+            // staging request and no second publish.
+            let tombstone = server
+                .recv_timeout(std::time::Duration::from_millis(400))
+                .unwrap()
+                .expect("successful republish tombstones the old item");
+            let tombstone_path = tombstone.url().to_string();
+            assert_eq!(tombstone.method(), &tiny_http::Method::Delete);
+            let _ = tombstone.respond(tiny_http::Response::empty(200));
+            let extra = server
+                .recv_timeout(std::time::Duration::from_millis(200))
+                .unwrap()
+                .map(|req| req.url().to_string());
+            (tombstone_path, extra)
+        });
+
+        let republished = block_on(republish_org_shares_for_source(
+            &state,
+            None,
+            Some("n-race"),
+        ))
+        .unwrap();
+        assert_eq!(republished, 1, "one authorized snapshot was published");
+        let (tombstone_path, extra) = mock.join().unwrap();
+        assert_eq!(tombstone_path, "/v1/orgs/org-1/items/item-old");
+        assert_eq!(extra, None, "no staging or duplicate publish request");
+
+        let row = state.db.get_org_share("s-race").unwrap().unwrap();
+        assert_eq!(row.rev, 2, "the inline publish advanced one revision");
+        assert_eq!(row.item_id.as_deref(), Some("item-new"));
+        assert_eq!(row.state, "uploaded");
     }
 
     /// COLLAPSE — auto-clean of duplicates that already exist. `share_to_org_inner` on a source with
@@ -13947,11 +16377,24 @@
     fn share_to_org_inner_collapses_existing_duplicates_keeping_the_earliest() {
         let state = build_state("org-share-collapse");
         seed_org(&state.db, "org-1", "Acme", "member", 1);
+        make_open_folder(&state.db, "f-collapse", "Team");
+        state
+            .db
+            .insert_note("n1", "f-collapse", "note", "A Note", "# body", 1)
+            .unwrap();
         // Two accidental duplicates of (org-1, n1): earliest = keeper, later = the extra to tombstone.
         state
             .db
             .insert_org_share(
-                "keep", "org-1", None, Some("n1"), "note", Some("A Note"), 1, 1, &[1u8; 32],
+                "keep",
+                "org-1",
+                None,
+                Some("n1"),
+                "note",
+                Some("A Note"),
+                1,
+                1,
+                &[1u8; 32],
                 "2026-07-11T09:00:00Z",
             )
             .unwrap();
@@ -13962,7 +16405,15 @@
         state
             .db
             .insert_org_share(
-                "dup", "org-1", None, Some("n1"), "note", Some("A Note"), 1, 1, &[2u8; 32],
+                "dup",
+                "org-1",
+                None,
+                Some("n1"),
+                "note",
+                Some("A Note"),
+                1,
+                1,
+                &[2u8; 32],
                 "2026-07-11T09:05:00Z",
             )
             .unwrap();
@@ -13974,7 +16425,15 @@
         state
             .db
             .insert_org_share(
-                "pending", "org-1", None, Some("n1"), "note", Some("A Note"), 1, 1, &[3u8; 32],
+                "pending",
+                "org-1",
+                None,
+                Some("n1"),
+                "note",
+                Some("A Note"),
+                1,
+                1,
+                &[3u8; 32],
                 "2026-07-11T09:06:00Z",
             )
             .unwrap();
@@ -14028,8 +16487,7 @@
             2,
             "every locally-joined org yields a status (RED on a single-org .next())"
         );
-        let ids: std::collections::HashSet<&str> =
-            statuses.iter().map(|s| s.org_id.as_str()).collect();
+        let ids: std::collections::HashSet<&str> = statuses.iter().map(|s| s.org_id.as_str()).collect();
         assert!(ids.contains("org-own"), "the owned org appears");
         assert!(ids.contains("org-inv"), "the invited org appears");
 
@@ -14100,12 +16558,10 @@
         assert_eq!(new.last_seq, 0);
     }
 
-    /// MULTI-ORG SYNC iterates ALL orgs (does NOT `.next()`-short-circuit on the FIRST). Seed TWO
-    /// orgs + a live session, and point the client at an UNREACHABLE loopback URL (no real egress —
-    /// the connection is refused). `org_sync_now_inner` must attempt BOTH orgs' feeds: each per-org
-    /// pull fails (connection refused), and a per-org failure is recorded in `report.errors` WITHOUT
-    /// aborting the others — so we see TWO org-level error entries, proving the loop ran twice. The
-    /// pre-fix single-org path would produce at most ONE. No cursor is ever rewound.
+    /// MULTI-ORG SYNC services ALL orgs across bounded round-robin turns. Each invocation owns one
+    /// global feed-page budget, so with TWO orgs two consecutive calls must attempt one org each.
+    /// Point the client at an UNREACHABLE loopback URL (connection refused, no real egress): each
+    /// turn records one error and neither durable cursor is rewound.
     #[test]
     fn org_sync_now_over_two_orgs_iterates_both() {
         let state = build_state("org-sync-multi");
@@ -14130,18 +16586,28 @@
             refresh_token: "r".into(),
         });
 
-        let report = block_on(org_sync_now_inner(&state)).unwrap();
-        // BOTH orgs were attempted → BOTH per-org failures recorded (loop iterated twice, not once).
+        let first = block_on(org_sync_now_inner(&state)).unwrap();
+        let second = block_on(org_sync_now_inner(&state)).unwrap();
+        // One global page budget per call; consecutive round-robin turns cover both orgs regardless
+        // of the process-global cursor's starting parity.
         assert_eq!(
-            report.errors.len(),
+            first.errors.len() + second.errors.len(),
             2,
-            "one error per org proves the loop iterated ALL orgs, not just the first"
+            "two bounded turns must attempt both joined orgs"
         );
-        assert_eq!(report.ingested, 0);
-        assert_eq!(report.tombstoned, 0);
+        assert_eq!(first.errors.len(), 1);
+        assert_eq!(second.errors.len(), 1);
+        assert_eq!(first.ingested + second.ingested, 0);
+        assert_eq!(first.tombstoned + second.tombstoned, 0);
         // Neither cursor is rewound by a failed sync (monotonic).
-        assert_eq!(state.db.get_org_state("org-a").unwrap().unwrap().last_seq, 10);
-        assert_eq!(state.db.get_org_state("org-b").unwrap().unwrap().last_seq, 20);
+        assert_eq!(
+            state.db.get_org_state("org-a").unwrap().unwrap().last_seq,
+            10
+        );
+        assert_eq!(
+            state.db.get_org_state("org-b").unwrap().unwrap().last_seq,
+            20
+        );
     }
 
     /// FIX D (per-item sync robustness, RED→GREEN): a TERMINAL-bad item at seq N must NOT stall the
@@ -14167,9 +16633,9 @@
             // seq 6: TOMBSTONE → applies without a key/blob (the "good" item behind the poison one).
             let body = r#"{"items":[{"itemId":"poison","seq":5,"authorUserId":"u","rev":1,"generation":1,"createdAt":"2026-07-11T09:00:00Z","tombstoned":false,"blobId":null,"contentSha256":null},{"itemId":"good-tomb","seq":6,"authorUserId":"u","rev":1,"generation":1,"createdAt":"2026-07-11T09:01:00Z","tombstoned":true,"blobId":null,"contentSha256":null}],"nextSeq":6}"#;
             let resp = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                body.len()
-            );
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
             let _ = sock.write_all(resp.as_bytes());
         });
 
@@ -14199,7 +16665,10 @@
             "the GOOD item behind the poison one ingested (RED on break-all: this was 0)"
         );
         assert!(
-            report.errors.iter().any(|e| e.contains("poison") && e.contains("missing blob")),
+            report
+                .errors
+                .iter()
+                .any(|e| e.contains("poison") && e.contains("missing blob")),
             "the terminal item is recorded as an error, not silently dropped: {:?}",
             report.errors
         );
@@ -14217,24 +16686,38 @@
     /// `seq > cursor` — the author's own second machine can never recognise the item as its own, so
     /// `org_get_item`'s `editable` stays false no matter how many times sync runs. Seed a LIVE local
     /// `org_items` row with `author_user_id = NULL` at seq 3, and advance the cursor to 5 (simulating an
-    /// already-caught-up device — a plain cursor pull would fetch NOTHING new). The mock server answers
-    /// TWO feed requests: the normal `sinceSeq=5` pull (nothing new) and the backfill's full re-pull
-    /// `sinceSeq=0` (returns the SAME item, now carrying its authorUserId). After `org_sync_one_now_inner`
-    /// runs, the local row's `author_user_id` must be backfilled to the session's own id, and
-    /// `org_get_item`'s `editable` must flip true — proving the mechanism, not just the storage.
+    /// already-caught-up device — a plain cursor pull would fetch NOTHING new). The bounded scheduler
+    /// alternates a normal `sinceSeq=5` turn with a bounded backfill turn starting immediately before
+    /// the stale row (`seq=3` ⇒ `sinceSeq=2`), so drive TWO ticks; the mock returns the SAME item with
+    /// its authorUserId on the backfill turn. The server loop is bounded so a regression fails instead
+    /// of hanging the entire suite on a second blocking `accept()`.
     #[test]
     fn org_sync_backfills_null_author_for_an_already_ingested_item() {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
         let addr = listener.local_addr().unwrap();
         let me_uuid = "c534b6d2-02c1-4c2c-a256-3af8592b1567";
         let server = std::thread::spawn(move || {
-            for _ in 0..2 {
-                let (mut sock, _) = listener.accept().unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut served = 0usize;
+            while served < 2 && std::time::Instant::now() < deadline {
+                let (mut sock, _) = match listener.accept() {
+                    Ok(v) => v,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(e) => panic!("author-backfill mock accept failed: {e}"),
+                };
+                sock.set_nonblocking(false).unwrap();
+                sock.set_read_timeout(Some(std::time::Duration::from_secs(1)))
+                    .unwrap();
+                served += 1;
                 let mut buf = [0u8; 8192];
                 let n = sock.read(&mut buf).unwrap();
                 let req = String::from_utf8_lossy(&buf[..n]);
-                let body = if req.contains("sinceSeq=0") {
+                let body = if req.contains("sinceSeq=2") {
                     // The backfill's full re-pull: the SAME item, now WITH its real author id.
                     // `contentSha256` is base64URL-NO-PAD (`murmur_protocol::b64`) — 32 zero bytes.
                     format!(
@@ -14261,6 +16744,7 @@
                     }
                 }
             }
+            served
         });
 
         let state = build_state("org-sync-author-backfill");
@@ -14285,7 +16769,12 @@
             )
             .unwrap();
         assert_eq!(
-            state.db.org_item_edit_ctx("item-stale").unwrap().unwrap().author_user_id,
+            state
+                .db
+                .org_item_edit_ctx("item-stale")
+                .unwrap()
+                .unwrap()
+                .author_user_id,
             None,
             "precondition: the stale row starts with no stamped author"
         );
@@ -14304,30 +16793,45 @@
             refresh_token: "r".into(),
         });
 
-        let report = block_on(org_sync_one_now_inner(&state, "org-y")).unwrap();
-        server.join().unwrap();
+        let first = block_on(org_sync_one_now_inner(&state, "org-y")).unwrap();
+        let second = block_on(org_sync_one_now_inner(&state, "org-y")).unwrap();
+        let served = server.join().unwrap();
+        assert_eq!(
+            served, 2,
+            "sync must issue cursor + author-backfill requests"
+        );
 
         assert_eq!(
-            report.authors_backfilled, 1,
-            "the sync tick backfilled exactly the one stale-NULL row: {:?}",
-            report.errors
+            first.authors_backfilled + second.authors_backfilled,
+            1,
+            "the two bounded sync turns backfilled exactly one stale-NULL row: first={:?}, second={:?}",
+            first.errors,
+            second.errors,
         );
         // The local row now carries the real author id (GREEN — RED on the pre-fix code: this stayed
         // None forever, since the cursor pull alone never re-visits an already-ingested seq).
         let ctx = state.db.org_item_edit_ctx("item-stale").unwrap().unwrap();
         assert_eq!(ctx.author_user_id.as_deref(), Some(me_uuid));
         // The cursor itself is UNCHANGED by the backfill (it's a read-only side query, not a re-ingest).
-        assert_eq!(state.db.get_org_state("org-y").unwrap().unwrap().last_seq, 5);
+        assert_eq!(
+            state.db.get_org_state("org-y").unwrap().unwrap().last_seq,
+            5
+        );
 
         // End-to-end: replays `org_get_item`'s own editable-resolution logic (it takes a Tauri `State`
         // wrapper the test suite has no constructor for elsewhere, so we drive the same two calls the
         // command body makes) — the actual user-facing bug was "can't edit my own note from a second
         // device", so the test must prove `editable` flips true, not just that storage round-trips.
-        let mut detail = state.db.get_org_item("item-stale").unwrap().expect("item still resolves");
+        let mut detail = state
+            .db
+            .get_org_item("item-stale")
+            .unwrap()
+            .expect("item still resolves");
         if let Some(edit_ctx) = state.db.org_item_edit_ctx("item-stale").unwrap() {
-            if let (Some(author), Ok(me)) =
-                (edit_ctx.author_user_id.as_deref(), session_server_user_id(&state))
-            {
+            if let (Some(author), Ok(me)) = (
+                edit_ctx.author_user_id.as_deref(),
+                session_server_user_id(&state),
+            ) {
                 detail.editable = author == me;
             }
         }
@@ -14347,8 +16851,20 @@
         let state = build_state("org-resolve-target");
         // `org-first` joined EARLIER → it is the deterministic `.next()` (ORDER BY joined_at ASC) org,
         // so a pre-fix first-only resolve would return it — making the RED direction unambiguous.
-        seed_org_at(&state.db, "org-first", "First", "owner", "2026-07-01T00:00:00Z");
-        seed_org_at(&state.db, "org-second", "Second", "member", "2026-07-11T00:00:00Z");
+        seed_org_at(
+            &state.db,
+            "org-first",
+            "First",
+            "owner",
+            "2026-07-01T00:00:00Z",
+        );
+        seed_org_at(
+            &state.db,
+            "org-second",
+            "Second",
+            "member",
+            "2026-07-11T00:00:00Z",
+        );
 
         // Ask for the SECOND org explicitly → get the SECOND (not the first-by-.next()).
         let got = resolve_org(&state, "org-second").unwrap();
@@ -14358,7 +16874,10 @@
         );
         assert_eq!(got.role, "member");
         // And the first, explicitly, still resolves to the first.
-        assert_eq!(resolve_org(&state, "org-first").unwrap().org_id, "org-first");
+        assert_eq!(
+            resolve_org(&state, "org-first").unwrap().org_id,
+            "org-first"
+        );
 
         // A blank id is an InvalidArg refusal (never a silent first-org pick).
         assert!(matches!(
@@ -14384,8 +16903,20 @@
         let state = build_state("org-share-target");
         // `org-first` joined EARLIER → the deterministic `.next()` (ORDER BY joined_at ASC) org a pre-fix
         // share would have wrongly used. The FE picks `org-second`.
-        seed_org_at(&state.db, "org-first", "First", "owner", "2026-07-01T00:00:00Z");
-        seed_org_at(&state.db, "org-second", "Second", "member", "2026-07-11T00:00:00Z");
+        seed_org_at(
+            &state.db,
+            "org-first",
+            "First",
+            "owner",
+            "2026-07-01T00:00:00Z",
+        );
+        seed_org_at(
+            &state.db,
+            "org-second",
+            "Second",
+            "member",
+            "2026-07-11T00:00:00Z",
+        );
 
         // An OPEN folder + a note so the read-gate + clean/scrub pass (no lock).
         state
@@ -14401,7 +16932,14 @@
             .unwrap();
         state
             .db
-            .insert_note("n-share", "f-share", "plan", "Q3 Plan", "# the Q3 roadmap", 1)
+            .insert_note(
+                "n-share",
+                "f-share",
+                "plan",
+                "Q3 Plan",
+                "# the Q3 roadmap",
+                1,
+            )
             .unwrap();
 
         // Consent granted + a closed loopback port (connection refused; NO real egress).
@@ -14440,9 +16978,9 @@
         assert_eq!(second[0].document_id.as_deref(), Some("n-share"));
         let first = state.db.list_org_shares_for_org("org-first").unwrap();
         assert!(
-            first.is_empty(),
-            "no share landed under the FIRST org (RED on a .next() misroute — the row was under org-first)"
-        );
+                first.is_empty(),
+                "no share landed under the FIRST org (RED on a .next() misroute — the row was under org-first)"
+            );
     }
 
     // ── RE-PUBLISH-ON-EDIT (the stale-org-copy fix) — end-to-end against a MOCK org server ─────────
@@ -14456,10 +16994,10 @@
         tombstoned: Vec<String>,
     }
 
-    /// A minimal in-process org server (tiny_http) that answers the THREE routes the org publish/
-    /// republish flow hits — `POST /v1/blobs`, `POST /v1/orgs/{id}/items` (mints a fresh item id +
-    /// monotonic seq), `DELETE /v1/orgs/{id}/items/{id}` — so the full seal→upload→publish→tombstone
-    /// chain runs headless WITHOUT a real backend. The OCK is pre-seeded into `org_ock_cache` so
+    /// A minimal in-process org server (tiny_http) that answers the TWO routes the atomic-inline org
+    /// publish/republish flow hits — `POST /v1/orgs/{id}/items` and
+    /// `DELETE /v1/orgs/{id}/items/{id}` — so seal→publish→tombstone runs headless without a backend.
+    /// The OCK is pre-seeded into `org_ock_cache` so
     /// `acquire_org_ock` never needs the (unmocked) key-grants endpoint. Shuts down on drop.
     struct MockOrgServer {
         base: String,
@@ -14479,7 +17017,6 @@
             let shutdown_t = Arc::clone(&shutdown);
             let handle = std::thread::spawn(move || {
                 let mut seq: u64 = 0;
-                let mut counter: u64 = 0;
                 loop {
                     if shutdown_t.load(Ordering::SeqCst) {
                         break;
@@ -14489,16 +17026,6 @@
                             let method = req.method().clone();
                             let url = req.url().to_string();
                             let path = url.split('?').next().unwrap_or("").to_string();
-                            // POST /v1/blobs → {"blobId": "..."}
-                            if method == tiny_http::Method::Post && path == "/v1/blobs" {
-                                counter += 1;
-                                let body = format!("{{\"blobId\":\"blob-{counter}\"}}");
-                                let resp = tiny_http::Response::from_string(body).with_header(
-                                    "Content-Type: application/json".parse::<tiny_http::Header>().unwrap(),
-                                );
-                                let _ = req.respond(resp);
-                                continue;
-                            }
                             // POST /v1/orgs/{id}/items → {"itemId": "...", "seq": N} (fresh id each call)
                             if method == tiny_http::Method::Post
                                 && path.starts_with("/v1/orgs/")
@@ -14509,7 +17036,9 @@
                                 log_t.lock().unwrap().published.push(item_id.clone());
                                 let body = format!("{{\"itemId\":\"{item_id}\",\"seq\":{seq}}}");
                                 let resp = tiny_http::Response::from_string(body).with_header(
-                                    "Content-Type: application/json".parse::<tiny_http::Header>().unwrap(),
+                                    "Content-Type: application/json"
+                                        .parse::<tiny_http::Header>()
+                                        .unwrap(),
                                 );
                                 let _ = req.respond(resp);
                                 continue;
@@ -14609,7 +17138,11 @@
         assert_eq!(entry.rev, 1, "first share is rev 1");
         assert_eq!(entry.item_id.as_deref(), Some("item-1"));
         let rows = state.db.list_org_shares_for_org("org-1").unwrap();
-        assert_eq!(rows.len(), 1, "one uploaded share row after the initial share");
+        assert_eq!(
+            rows.len(),
+            1,
+            "one uploaded share row after the initial share"
+        );
         assert_eq!(rows[0].state, "uploaded");
         assert_eq!(rows[0].item_id.as_deref(), Some("item-1"));
         let sha_before = rows[0].content_sha256.clone();
@@ -14617,8 +17150,13 @@
         // EDIT the note body through the COMMIT boundary. The async command wrapper is exactly
         // `update_note_doc_inner(..)?` then `republish_org_shares_for_source(..).await` — replicate
         // those two steps (a real `tauri::State` can't be constructed in a unit test).
-        update_note_doc_inner(&state, "n-rp", "Q3 Plan", "# EDITED body — the org copy must reflect this")
-            .unwrap();
+        update_note_doc_inner(
+            &state,
+            "n-rp",
+            "Q3 Plan",
+            "# EDITED body — the org copy must reflect this",
+        )
+        .unwrap();
         block_on(republish_org_shares_for_source(&state, None, Some("n-rp"))).unwrap();
 
         // The edit superseded the org item: a NEW item published, rev bumped, SAME row repointed.
@@ -14642,7 +17180,10 @@
 
         // The mock server saw two publishes and the OLD item tombstoned.
         let log = mock.log.lock().unwrap();
-        assert_eq!(log.published, vec!["item-1".to_string(), "item-2".to_string()]);
+        assert_eq!(
+            log.published,
+            vec!["item-1".to_string(), "item-2".to_string()]
+        );
         assert_eq!(
             log.tombstoned,
             vec!["item-1".to_string()],
@@ -14651,11 +17192,17 @@
 
         // Egress ledger: two publishes + one revoke (all content-free).
         assert_eq!(
-            state.db.count_share_egress_by_kind("org_share_publish").unwrap(),
+            state
+                .db
+                .count_share_egress_by_kind("org_share_publish")
+                .unwrap(),
             2
         );
         assert_eq!(
-            state.db.count_share_egress_by_kind("org_share_revoke").unwrap(),
+            state
+                .db
+                .count_share_egress_by_kind("org_share_revoke")
+                .unwrap(),
             1
         );
     }
@@ -14746,7 +17293,10 @@
 
         let rows = state.db.list_org_shares_for_org("org-1").unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].rev, 1, "rev NOT bumped — republish skipped a locked source");
+        assert_eq!(
+            rows[0].rev, 1,
+            "rev NOT bumped — republish skipped a locked source"
+        );
         assert_eq!(
             rows[0].item_id.as_deref(),
             Some("item-1"),
@@ -14754,7 +17304,10 @@
         );
         let log = mock.log.lock().unwrap();
         assert_eq!(log.published, vec!["item-1".to_string()], "no new publish");
-        assert!(log.tombstoned.is_empty(), "NEVER tombstone-into-nothing on a locked source");
+        assert!(
+            log.tombstoned.is_empty(),
+            "NEVER tombstone-into-nothing on a locked source"
+        );
     }
 
     /// ITEM 1 — unchanged content ⇒ NO egress. Re-save the IDENTICAL body → the content hash matches
@@ -14782,7 +17335,10 @@
             true,
         ))
         .unwrap();
-        let publishes_before = state.db.count_share_egress_by_kind("org_share_publish").unwrap();
+        let publishes_before = state
+            .db
+            .count_share_egress_by_kind("org_share_publish")
+            .unwrap();
 
         // Re-save the SAME body (title unchanged too) → identical envelope hash → no-op republish.
         update_note_doc_inner(&state, "n-nc", "Plan", "# same body").unwrap();
@@ -14792,13 +17348,23 @@
         assert_eq!(rows[0].rev, 1, "no rev bump on unchanged content");
         assert_eq!(rows[0].item_id.as_deref(), Some("item-1"));
         assert_eq!(
-            state.db.count_share_egress_by_kind("org_share_publish").unwrap(),
+            state
+                .db
+                .count_share_egress_by_kind("org_share_publish")
+                .unwrap(),
             publishes_before,
             "unchanged content ⇒ NO new publish egress"
         );
         let log = mock.log.lock().unwrap();
-        assert_eq!(log.published, vec!["item-1".to_string()], "no second publish");
-        assert!(log.tombstoned.is_empty(), "no tombstone on a no-op republish");
+        assert_eq!(
+            log.published,
+            vec!["item-1".to_string()],
+            "no second publish"
+        );
+        assert!(
+            log.tombstoned.is_empty(),
+            "no tombstone on a no-op republish"
+        );
     }
 
     /// ITEM 6 — the MEETING arm: share a MEETING note → edit the meeting note via `update_note` → the
@@ -14861,7 +17427,10 @@
         assert_eq!(rows[0].item_id.as_deref(), Some("item-2"));
         assert_eq!(rows[0].meeting_id.as_deref(), Some("m-rp"));
         let log = mock.log.lock().unwrap();
-        assert_eq!(log.published, vec!["item-1".to_string(), "item-2".to_string()]);
+        assert_eq!(
+            log.published,
+            vec!["item-1".to_string(), "item-2".to_string()]
+        );
         assert_eq!(log.tombstoned, vec!["item-1".to_string()]);
     }
 
@@ -14900,7 +17469,9 @@
         ))
         .expect("initial share should publish against the mock server");
         assert_eq!(entry.item_id.as_deref(), Some("item-1"));
-        let row_id = state.db.list_org_shares_for_org("org-1").unwrap()[0].id.clone();
+        let row_id = state.db.list_org_shares_for_org("org-1").unwrap()[0]
+            .id
+            .clone();
 
         // Edit the note so the republish has new content to publish.
         update_note_doc_inner(&state, "n-sw", "Plan", "# EDITED body").unwrap();
@@ -14908,8 +17479,12 @@
         // (2) Evict the OCK cache so the republish's `acquire_org_ock` cache-misses and hits the
         // (unmocked) key-grants endpoint, which 404s → deterministic republish failure.
         state.org_ock_cache.lock().unwrap().clear();
-        let republished = block_on(republish_org_shares_for_source(&state, None, Some("n-sw"))).unwrap();
-        assert_eq!(republished, 0, "the forced OCK failure republished nothing this call");
+        let republished =
+            block_on(republish_org_shares_for_source(&state, None, Some("n-sw"))).unwrap();
+        assert_eq!(
+            republished, 0,
+            "the forced OCK failure republished nothing this call"
+        );
         let stuck = state.db.get_org_share(&row_id).unwrap().unwrap();
         assert_eq!(stuck.state, "failed", "the row landed in failed state");
         assert_eq!(
@@ -14917,7 +17492,10 @@
             Some("item-1"),
             "the OLD, still-server-live item_id is retained (set_org_share_failed doesn't clear it)"
         );
-        assert_eq!(stuck.rev, 1, "rev was NOT bumped — the republish attempt failed before publishing");
+        assert_eq!(
+            stuck.rev, 1,
+            "rev was NOT bumped — the republish attempt failed before publishing"
+        );
 
         // (3) The transient blip clears (OCK re-seeded) — run the sweep.
         seed_ock(&state, "org-1", 1);
@@ -14925,8 +17503,14 @@
         assert_eq!(advanced, 1, "the sweep advanced the stuck row");
 
         let healed = state.db.get_org_share(&row_id).unwrap().unwrap();
-        assert_eq!(healed.state, "uploaded", "the row is live again after the sweep");
-        assert_eq!(healed.rev, 2, "republish bumped rev to 2 — NOT a fresh rev-1 share");
+        assert_eq!(
+            healed.state, "uploaded",
+            "the row is live again after the sweep"
+        );
+        assert_eq!(
+            healed.rev, 2,
+            "republish bumped rev to 2 — NOT a fresh rev-1 share"
+        );
         assert_eq!(
             healed.item_id.as_deref(),
             Some("item-2"),
@@ -14934,12 +17518,19 @@
         );
         // Still exactly ONE org_shares row for this source — no duplicate row was minted.
         let all_rows = state.db.list_org_shares_for_org("org-1").unwrap();
-        assert_eq!(all_rows.len(), 1, "no duplicate org_shares row for the source");
+        assert_eq!(
+            all_rows.len(),
+            1,
+            "no duplicate org_shares row for the source"
+        );
 
         // The mock server saw item-1 published, then item-2 published, then item-1 tombstoned — the
         // supersede sequence, NOT a second independent rev-1 publish with item-1 left live forever.
         let log = mock.log.lock().unwrap();
-        assert_eq!(log.published, vec!["item-1".to_string(), "item-2".to_string()]);
+        assert_eq!(
+            log.published,
+            vec!["item-1".to_string(), "item-2".to_string()]
+        );
         assert_eq!(
             log.tombstoned,
             vec!["item-1".to_string()],
@@ -14959,14 +17550,14 @@
         let state = build_state("org-share-too-large");
         seed_org(&state.db, "org-1", "Acme", "member", 1);
         make_open_folder(&state.db, "f-big", "Team");
-        // Plaintext > the cap ⇒ the sealed ciphertext (≥ plaintext) certainly exceeds it.
-        let big_body = format!(
-            "# Big\n\n{}",
-            "x".repeat(murmur_protocol::caps::MAX_ORG_ITEM_BLOB_BYTES + 64 * 1024)
-        );
+        // Each individual canonical field stays within the parser's 8 MiB field bound, while title
+        // + markdown + framing exceed the 16 MiB sealed-item cap. This reaches the intended
+        // client-side `too_large` classifier rather than the independent malformed-field refusal.
+        let big_title = "T".repeat(8 * 1024 * 1024);
+        let big_body = "x".repeat(8 * 1024 * 1024);
         state
             .db
-            .insert_note("n-big", "f-big", "big", "Big", &big_body, 1)
+            .insert_note("n-big", "f-big", "big", &big_title, &big_body, 1)
             .unwrap();
         state.config.lock().unwrap().org_egress_consented = true;
         state.config.lock().unwrap().share_base_url = mock.base.clone();
@@ -14981,7 +17572,10 @@
             Some("n-big".to_string()),
             true,
         ));
-        assert!(res.is_err(), "an oversized share is refused before any egress");
+        assert!(
+            res.is_err(),
+            "an oversized share is refused before any egress"
+        );
         let rows = state.db.list_org_shares_for_org("org-1").unwrap();
         assert_eq!(rows.len(), 1, "exactly one local row records the refusal");
         assert_eq!(rows[0].state, "failed");
@@ -15047,7 +17641,9 @@
         assert_eq!(resolved.source_id, "n-rs");
 
         // An unknown item (not published by THIS device) → None.
-        assert!(org_resolve_source_inner(&state, "item-unknown").unwrap().is_none());
+        assert!(org_resolve_source_inner(&state, "item-unknown")
+            .unwrap()
+            .is_none());
     }
 
     /// STUCK-REPUBLISH FIX: `org_resolve_source` still resolves a `failed` row whose LAST republish
@@ -15064,10 +17660,27 @@
         // A row that published successfully once, then a REPUBLISH attempt failed — item_id retained.
         state
             .db
-            .insert_org_share("s-stuck", "org-1", None, Some("n-stuck"), "note", Some("T"), 1, 1, &[1u8; 32], now)
+            .insert_org_share(
+                "s-stuck",
+                "org-1",
+                None,
+                Some("n-stuck"),
+                "note",
+                Some("T"),
+                1,
+                1,
+                &[1u8; 32],
+                now,
+            )
             .unwrap();
-        state.db.set_org_share_uploaded("s-stuck", "item-stuck", now).unwrap();
-        state.db.set_org_share_failed("s-stuck", "republish_upload_failed", now).unwrap();
+        state
+            .db
+            .set_org_share_uploaded("s-stuck", "item-stuck", now)
+            .unwrap();
+        state
+            .db
+            .set_org_share_failed("s-stuck", "republish_upload_failed", now)
+            .unwrap();
 
         let resolved = org_resolve_source_inner(&state, "item-stuck").unwrap();
         assert_eq!(
@@ -15079,13 +17692,32 @@
         // A row that was uploaded, then intentionally revoked — must NOT resolve.
         state
             .db
-            .insert_org_share("s-revoked", "org-1", None, Some("n-revoked"), "note", Some("T"), 1, 1, &[2u8; 32], now)
+            .insert_org_share(
+                "s-revoked",
+                "org-1",
+                None,
+                Some("n-revoked"),
+                "note",
+                Some("T"),
+                1,
+                1,
+                &[2u8; 32],
+                now,
+            )
             .unwrap();
-        state.db.set_org_share_uploaded("s-revoked", "item-revoked", now).unwrap();
-        state.db.set_org_share_state("s-revoked", "revoked", now).unwrap();
+        state
+            .db
+            .set_org_share_uploaded("s-revoked", "item-revoked", now)
+            .unwrap();
+        state
+            .db
+            .set_org_share_state("s-revoked", "revoked", now)
+            .unwrap();
 
         assert!(
-            org_resolve_source_inner(&state, "item-revoked").unwrap().is_none(),
+            org_resolve_source_inner(&state, "item-revoked")
+                .unwrap()
+                .is_none(),
             "an intentionally revoked share must not resolve back to an editable source"
         );
     }
@@ -15100,8 +17732,20 @@
         let state = build_state("org-leave-target");
         // `org-keep` joined EARLIER → it is the deterministic `.next()` org a pre-fix leave would have
         // wrongly purged; the FE asks to leave `org-drop` (the SECOND).
-        seed_org_at(&state.db, "org-keep", "Keep", "owner", "2026-07-01T00:00:00Z");
-        seed_org_at(&state.db, "org-drop", "Drop", "member", "2026-07-11T00:00:00Z");
+        seed_org_at(
+            &state.db,
+            "org-keep",
+            "Keep",
+            "owner",
+            "2026-07-01T00:00:00Z",
+        );
+        seed_org_at(
+            &state.db,
+            "org-drop",
+            "Drop",
+            "member",
+            "2026-07-11T00:00:00Z",
+        );
 
         // Resolve the SECOND org (the one the FE asked to leave) and apply the same DB purge `org_leave`
         // does after the server call.
@@ -15143,8 +17787,14 @@
         );
         assert!(outcome.new_orgs.is_empty());
         // Both local replicas are still present (not purged by an empty/transient server response).
-        assert!(state.db.get_org_state("org-a").unwrap().is_some(), "org-a kept");
-        assert!(state.db.get_org_state("org-b").unwrap().is_some(), "org-b kept");
+        assert!(
+            state.db.get_org_state("org-a").unwrap().is_some(),
+            "org-a kept"
+        );
+        assert!(
+            state.db.get_org_state("org-b").unwrap().is_some(),
+            "org-b kept"
+        );
     }
 
     /// REGRESSION (2026-07-11 live 404): org key-grants MUST key on the stable SERVER USER ID (a UUID),
@@ -15223,7 +17873,18 @@
         let sha = vec![1u8; 32];
         state
             .db
-            .insert_org_share("s-m", "org-1", Some("m1"), None, "note", Some("Sync"), 1, 1, &sha, "t")
+            .insert_org_share(
+                "s-m",
+                "org-1",
+                Some("m1"),
+                None,
+                "note",
+                Some("Sync"),
+                1,
+                1,
+                &sha,
+                "t",
+            )
             .unwrap();
         state
             .db
@@ -15231,11 +17892,33 @@
             .unwrap();
         state
             .db
-            .insert_org_share("s-n", "org-1", None, Some("n1"), "note", Some("Doc"), 1, 1, &sha, "t")
+            .insert_org_share(
+                "s-n",
+                "org-1",
+                None,
+                Some("n1"),
+                "note",
+                Some("Doc"),
+                1,
+                1,
+                &sha,
+                "t",
+            )
             .unwrap();
         state
             .db
-            .insert_org_share("s-rev", "org-1", Some("m1"), None, "note", Some("Old"), 1, 1, &sha, "t")
+            .insert_org_share(
+                "s-rev",
+                "org-1",
+                Some("m1"),
+                None,
+                "note",
+                Some("Old"),
+                1,
+                1,
+                &sha,
+                "t",
+            )
             .unwrap();
         state
             .db
@@ -15244,8 +17927,14 @@
 
         let active = state.db.active_org_shares_for_folder("f1").unwrap();
         // The uploaded meeting share + the queued note share = 2 active; the revoked one is excluded.
-        assert_eq!(active.len(), 2, "two active org shares, revoked excluded: {active:?}");
-        assert!(active.iter().any(|(item, _)| item.as_deref() == Some("item-m")));
+        assert_eq!(
+            active.len(),
+            2,
+            "two active org shares, revoked excluded: {active:?}"
+        );
+        assert!(active
+            .iter()
+            .any(|(item, _)| item.as_deref() == Some("item-m")));
         assert!(active.iter().any(|(item, _)| item.is_none())); // the queued note share (no item yet)
     }
 
@@ -15270,7 +17959,18 @@
         // becomes 'failed' but item_id STAYS 'item-stuck' (the prior publish is still live).
         state
             .db
-            .insert_org_share("s-stuck", "org-1", None, Some("n1"), "note", Some("Doc"), 1, 1, &sha, "t")
+            .insert_org_share(
+                "s-stuck",
+                "org-1",
+                None,
+                Some("n1"),
+                "note",
+                Some("Doc"),
+                1,
+                1,
+                &sha,
+                "t",
+            )
             .unwrap();
         state
             .db
@@ -15287,7 +17987,18 @@
             .unwrap();
         state
             .db
-            .insert_org_share("s-dead", "org-1", None, Some("n2"), "note", Some("Doc2"), 1, 1, &sha, "t")
+            .insert_org_share(
+                "s-dead",
+                "org-1",
+                None,
+                Some("n2"),
+                "note",
+                Some("Doc2"),
+                1,
+                1,
+                &sha,
+                "t",
+            )
             .unwrap();
         state
             .db
@@ -15296,10 +18007,10 @@
 
         let active = state.db.active_org_shares_for_folder("f1").unwrap();
         assert_eq!(
-            active.len(),
-            1,
-            "the stuck failed-with-item_id share IS surfaced; the never-published failed row stays excluded: {active:?}"
-        );
+                active.len(),
+                1,
+                "the stuck failed-with-item_id share IS surfaced; the never-published failed row stays excluded: {active:?}"
+            );
         assert_eq!(active[0].0.as_deref(), Some("item-stuck"));
 
         // Same fix must apply to the bulk-revoke enumeration (`revoke_shares_for_folder`'s source).
@@ -15365,12 +18076,20 @@
         // f1/m1: an active LINK share, a REVOKED link that must be excluded, a mode-B USER share
         // already 'sent' (registered recipient), and a mode-B USER share still 'awaiting_key'
         // (unregistered recipient, pending re-wrap) — both are LIVE and must surface.
-        state.db.insert_outbound_share("lnk", "m1", "link", 1, "t").unwrap();
-        state.db.insert_outbound_share("old", "m1", "link", 1, "t").unwrap();
+        state
+            .db
+            .insert_outbound_share("lnk", "m1", "link", 1, "t")
+            .unwrap();
+        state
+            .db
+            .insert_outbound_share("old", "m1", "link", 1, "t")
+            .unwrap();
         state.db.set_outbound_share_state("old", "revoked").unwrap();
         state
             .db
-            .insert_outbound_user_share("usr-sent", "m1", 1, "t", "sent", b"nk", "acct-1", "a@x.com", b"hash")
+            .insert_outbound_user_share(
+                "usr-sent", "m1", 1, "t", "sent", b"nk", "acct-1", "a@x.com", b"hash",
+            )
             .unwrap();
         state
             .db
@@ -15387,17 +18106,24 @@
             )
             .unwrap();
         // f2/m2: a share in ANOTHER folder must not leak into f1's report.
-        state.db.insert_outbound_share("f2lnk", "m2", "link", 1, "t").unwrap();
+        state
+            .db
+            .insert_outbound_share("f2lnk", "m2", "link", 1, "t")
+            .unwrap();
 
         let shares = state.db.active_link_user_shares_for_folder("f1").unwrap();
         assert_eq!(
-            shares.len(),
-            3,
-            "one active LINK + two live USER shares (sent + awaiting_key) in f1, revoked + other-folder excluded: {shares:?}"
-        );
+                shares.len(),
+                3,
+                "one active LINK + two live USER shares (sent + awaiting_key) in f1, revoked + other-folder excluded: {shares:?}"
+            );
         let links = shares.iter().filter(|(_, m)| m == "link").count();
         let users = shares.iter().filter(|(_, m)| m == "user").count();
-        assert_eq!((links, users), (1, 2), "one link + two user shares (sent + awaiting_key)");
+        assert_eq!(
+            (links, users),
+            (1, 2),
+            "one link + two user shares (sent + awaiting_key)"
+        );
         assert!(
             shares.iter().any(|(id, _)| id == "usr-sent"),
             "a 'sent' mode-B share must surface: {shares:?}"
@@ -15453,11 +18179,22 @@
             .expect("authored note row MUST still exist after folder delete (never destroyed)");
         assert_eq!(row.text, "the plan lives here", "note content never lost");
         let default_id = state.db.ensure_default_note_folder().unwrap();
-        assert_eq!(row.folder_id, default_id, "note reparented to the default folder");
+        assert_eq!(
+            row.folder_id, default_id,
+            "note reparented to the default folder"
+        );
         // Its `.md` moved into the default folder's vault subdir and `exported_path` re-points to it.
-        let new_path = row.exported_path.expect("exported_path re-pointed to the moved .md");
-        assert!(std::path::Path::new(&new_path).exists(), "moved .md exists at the new path");
-        assert!(new_path.contains("Notes"), "moved under the default Notes subdir: {new_path}");
+        let new_path = row
+            .exported_path
+            .expect("exported_path re-pointed to the moved .md");
+        assert!(
+            std::path::Path::new(&new_path).exists(),
+            "moved .md exists at the new path"
+        );
+        assert!(
+            new_path.contains("Notes"),
+            "moved under the default Notes subdir: {new_path}"
+        );
         assert!(
             new_path != old_path,
             "exported_path was actually re-pointed (not left stale)"
@@ -15488,7 +18225,10 @@
             .unwrap()
             .exported_path
             .expect("exported to the vault");
-        assert!(std::path::Path::new(&old_path).exists(), "old .md present pre-move");
+        assert!(
+            std::path::Path::new(&old_path).exists(),
+            "old .md present pre-move"
+        );
 
         // Move Parent under Dest → the on-disk dir moves; exported_path must follow.
         move_note_folder_inner(&state, &parent, Some(&dest)).unwrap();
@@ -15539,11 +18279,15 @@
         state.db.ensure_default_note_folder().unwrap();
         // "Sprzedaż" has a multi-byte 'ż' → BYTE length (15 for "Notes/Sprzedaż") != CHAR length (14),
         // so a byte-length `substr()` offset drops the '/' after the prefix and corrupts descendants.
-        let parent = create_note_folder_inner(&state, "Sprzedaż", None).unwrap().id;
+        let parent = create_note_folder_inner(&state, "Sprzedaż", None)
+            .unwrap()
+            .id;
         let child = create_note_folder_inner(&state, "Q3", Some(&parent))
             .unwrap()
             .id;
-        let dest = create_note_folder_inner(&state, "Klienci", None).unwrap().id;
+        let dest = create_note_folder_inner(&state, "Klienci", None)
+            .unwrap()
+            .id;
         assert_eq!(
             state.db.note_folder_by_id(&child).unwrap().unwrap().path,
             "Notes/Sprzedaż/Q3"
@@ -15586,8 +18330,14 @@
         state.unlocked_folders.lock().unwrap().remove("f");
         reblank_folder_extras(&state, "f").unwrap();
         let at_rest = state.db.raw_timeline("m").unwrap().unwrap();
-        assert_eq!(at_rest.data, "", "NO plaintext timeline at rest after relock");
-        assert!(at_rest.data_blob.is_some(), "encrypted data_blob kept at rest");
+        assert_eq!(
+            at_rest.data, "",
+            "NO plaintext timeline at rest after relock"
+        );
+        assert!(
+            at_rest.data_blob.is_some(),
+            "encrypted data_blob kept at rest"
+        );
 
         // UNLOCK: byte-identical restore of the generated timeline.
         unseal_folder_extras(&state, "f", &ck, None).unwrap();
@@ -15608,7 +18358,8 @@
         make_open_folder(&state.db, "f", "Vault");
         seed_meeting(&state.db, "m", "# note", Some("f"));
         // Seed a timeline with a speaker turn we can rename.
-        let tl0 = "{\"topics\":[],\"speakers\":[{\"speaker\":\"others-0\",\"start_s\":0.0,\"end_s\":1.0}]}";
+        let tl0 =
+            "{\"topics\":[],\"speakers\":[{\"speaker\":\"others-0\",\"start_s\":0.0,\"end_s\":1.0}]}";
         state.db.set_timeline_data("m", tl0).unwrap();
         lock_folder_inner(&state, "f".to_string()).unwrap();
         let ck = session_unlock(&state, "f");
@@ -15618,7 +18369,10 @@
         // In-session the rename is visible AND sealed.
         let raw = state.db.raw_timeline("m").unwrap().unwrap();
         assert!(raw.data.contains("Alice"), "rename visible in-session");
-        assert!(raw.data_blob.is_some(), "renamed timeline sealed at write time");
+        assert!(
+            raw.data_blob.is_some(),
+            "renamed timeline sealed at write time"
+        );
 
         // RELOCK then UNLOCK: the rename must persist through the sealed blob.
         state.unlocked_folders.lock().unwrap().remove("f");
@@ -15686,7 +18440,10 @@
         state.db.blank_sealed_notes_in_folders(&one).unwrap();
         reblank_folder_extras(&state, "f").unwrap();
         let n = &state.db.sealable_notes_for_meeting(&mid).unwrap()[0];
-        assert_eq!(n.markdown, "", "no plaintext note markdown at rest after relock");
+        assert_eq!(
+            n.markdown, "",
+            "no plaintext note markdown at rest after relock"
+        );
         assert!(n.content_blob.is_some(), "sealed blob kept at rest");
 
         // UNLOCK: the shared note comes back with its provenance + body.

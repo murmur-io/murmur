@@ -7,8 +7,8 @@ description: Run and iterate Murmur locally (Tauri 2.11 + Angular 22 zoneless). 
 
 Murmur is a Tauri 2.11 desktop app: a Rust core (crate `murmur`, bin `Murmur`, lib
 `meetnotes_lib`) hosting an Angular 22 **zoneless** webview. `npm run dev` (= `tauri dev`)
-builds the Rust binary, serves Angular on **http://localhost:1420**, and the app boots the
-read-only MCP server on **127.0.0.1:8765**.
+builds the `murmur-brain` sidecar first, then the Rust app binary, serves Angular on
+**http://localhost:1420**, and boots the read-only MCP server on **127.0.0.1:8765**.
 
 ## The dev-run recipe (copy-paste)
 
@@ -16,7 +16,7 @@ read-only MCP server on **127.0.0.1:8765**.
 source "$HOME/.cargo/env"
 cd /Users/jakubgawronski/Projects/meetnotes
 MURMUR_DEV_DEK=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
-  npm run dev 2>&1 | tee /tmp/murmur-dev.log
+  scripts/agent-resource-run -- npm run dev 2>&1 | tee /tmp/murmur-dev.log
 ```
 
 - `source ~/.cargo/env` — puts `cargo` on PATH (the shell here isn't a login cargo shell).
@@ -51,11 +51,10 @@ MURMUR_DEV_DEK=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef 
   CoreGraphics C funcs — it runs in dev but the heuristic is only meaningful with a real
   screen-share session.
 
-## The inner test loop — `cargo test --lib` ONLY
+## The inner test loop — lane-wrapped `cargo test --lib` ONLY
 
 ```bash
-source "$HOME/.cargo/env"
-( cd src-tauri && cargo test --lib )      # ~127 lib tests, fast
+scripts/agent-resource-run --chdir src-tauri -- cargo test --lib
 ```
 
 > **CALLOUT — do NOT run `cargo clippy --all-targets` in the iterate loop.** It rebuilds the
@@ -63,20 +62,17 @@ source "$HOME/.cargo/env"
 > Use `cargo test --lib` while iterating. The full `clippy --all-targets -- -D warnings`
 > belongs only in the release gate (`scripts/ci.sh`), run once before shipping.
 
-Other gates when you need them: `npx ng lint`, `npx ng build`, and the full
-`bash scripts/ci.sh` (clippy + tests + lint + build + headless E2E) before a release.
+Other gates when you need them: `npx ng lint`, lane-wrapped `npx ng build`, and
+`scripts/agent-resource-run -- bash scripts/ci.sh` before a release.
 
-## Clean relaunch (kill stragglers + free ports)
+## Clean relaunch (task-owned processes only)
 
-A crashed or backgrounded run can leave the binary holding `target/` or the MCP port:
-
-```bash
-pkill -x Murmur ; pkill -f 'tauri dev' ; pkill -f 'target/debug/Murmur' || true
-lsof -ti :1420 -ti :8765 | xargs kill -9 2>/dev/null || true   # free the ports
-```
-
-Then re-run the dev recipe above. (Also do this before a release build — a live dev server
-holds the cargo `target` lock; see `/release-murmur` stage 6.)
+Never `pkill Murmur` or kill an arbitrary owner of `:1420`/`:8765`: that may be the installed
+production app or another worktree. A harness runtime check uses `scripts/harness-runtime-smoke`;
+it refuses an occupied port and terminates only the process group it created. For an interactive
+run, record the PID you started, verify its executable/cwd, send TERM to that PID, wait, and use
+KILL only for that same task-owned PID if it does not exit. Unknown ownership is `BLOCKED`, not
+permission to free the port.
 
 ## Reading the boot / abort log
 

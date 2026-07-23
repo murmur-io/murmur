@@ -1,0 +1,80 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://murmurnotes.io/schemas/development-task-v1.json",
+  "title": "Murmur development task contract",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "task_id",
+    "description",
+    "kind",
+    "base_sha",
+    "contract_sha256",
+    "instructions_sha256",
+    "dependency_revisions",
+    "repo_realpath",
+    "git_common_dir",
+    "worktree_path",
+    "branch",
+    "owned_paths",
+    "risk_flags",
+    "writer",
+    "reviewer",
+    "max_repair_rounds",
+    "checks",
+    "final_checks",
+    "expected_change",
+    "created_at"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "task_id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{1,63}$" },
+    "description": { "type": "string", "minLength": 1 },
+    "kind": { "enum": ["bug", "feature", "refactor", "docs", "harness"] },
+    "base_sha": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "contract_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "instructions_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "dependency_revisions": {
+      "type": "object",
+      "additionalProperties": { "type": "string" }
+    },
+    "repo_realpath": { "type": "string", "minLength": 1 },
+    "git_common_dir": { "type": "string", "minLength": 1 },
+    "worktree_path": { "type": "string", "minLength": 1 },
+    "branch": { "type": "string", "minLength": 1 },
+    "owned_paths": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "risk_flags": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "enum": ["lock", "egress", "protocol", "runtime", "ui", "performance", "release"] }
+    },
+    "writer": { "enum": ["codex", "claude", "fake"] },
+    "reviewer": { "enum": ["codex", "claude", "fake"] },
+    "max_repair_rounds": { "type": "integer", "minimum": 0, "maximum": 5 },
+    "checks": { "$ref": "#/$defs/checks" },
+    "final_checks": { "$ref": "#/$defs/checks" },
+    "expected_change": { "type": "boolean" },
+    "created_at": { "type": "string", "format": "date-time" }
+  },
+  "$defs": {
+    "checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "command", "timeout_seconds"],
+        "properties": {
+          "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9._-]*$" },
+          "command": { "type": "string", "minLength": 1 },
+          "timeout_seconds": { "type": "integer", "minimum": 1, "maximum": 7200 }
+        }
+      }
+    }
+  }
+}

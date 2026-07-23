@@ -1,0 +1,78 @@
+# Project-scoped orchestration bounds. The vendor-neutral runner still owns the
+# authoritative timeout/repair budget and selects one of the profiles below.
+[agents]
+max_threads = 4
+max_depth = 1
+job_max_runtime_seconds = 1800
+
+# These profiles are selected explicitly by scripts/agent-harness. They retain
+# read access needed by the local Rust/Node toolchains and the pinned sibling
+# murmur-server checkout, but carve credentials and production Murmur data out
+# of that read boundary. Only the writer's isolated task root is writable.
+[permissions.murmur_harness_writer.filesystem]
+":root" = "read"
+":tmpdir" = "write"
+":slash_tmp" = "write"
+"~/Desktop" = "deny"
+"~/Documents" = "deny"
+"~/Downloads" = "deny"
+"~/Library" = "deny"
+"~/.aws" = "deny"
+"~/.claude" = "deny"
+"~/.codex" = "deny"
+"~/.config" = "deny"
+"~/.cargo/credentials" = "deny"
+"~/.cargo/credentials.toml" = "deny"
+"~/.docker" = "deny"
+"~/.git-credentials" = "deny"
+"~/.gnupg" = "deny"
+"~/.kube" = "deny"
+"~/.netrc" = "deny"
+"~/.npmrc" = "deny"
+"~/.ssh" = "deny"
+
+[permissions.murmur_harness_writer.filesystem.":workspace_roots"]
+"." = "write"
+"**/.env" = "deny"
+"**/.env.*" = "deny"
+"**/*.p12" = "deny"
+"**/*.pem" = "deny"
+"**/id_ed25519" = "deny"
+"**/id_rsa" = "deny"
+
+[permissions.murmur_harness_writer.network]
+enabled = false
+
+[permissions.murmur_harness_reviewer.filesystem]
+":root" = "read"
+":tmpdir" = "write"
+":slash_tmp" = "write"
+"~/Desktop" = "deny"
+"~/Documents" = "deny"
+"~/Downloads" = "deny"
+"~/Library" = "deny"
+"~/.aws" = "deny"
+"~/.claude" = "deny"
+"~/.codex" = "deny"
+"~/.config" = "deny"
+"~/.cargo/credentials" = "deny"
+"~/.cargo/credentials.toml" = "deny"
+"~/.docker" = "deny"
+"~/.git-credentials" = "deny"
+"~/.gnupg" = "deny"
+"~/.kube" = "deny"
+"~/.netrc" = "deny"
+"~/.npmrc" = "deny"
+"~/.ssh" = "deny"
+
+[permissions.murmur_harness_reviewer.filesystem.":workspace_roots"]
+"." = "read"
+"**/.env" = "deny"
+"**/.env.*" = "deny"
+"**/*.p12" = "deny"
+"**/*.pem" = "deny"
+"**/id_ed25519" = "deny"
+"**/id_rsa" = "deny"
+
+[permissions.murmur_harness_reviewer.network]
+enabled = false

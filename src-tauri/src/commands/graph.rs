@@ -43,7 +43,9 @@ pub fn get_full_graph(
     opts: Option<FullGraphOpts>,
 ) -> Result<FullGraphData, AppError> {
     let unlocked = unlocked_snapshot(state.inner())?;
-    state.db.build_full_graph(&unlocked, opts.unwrap_or_default())
+    state
+        .db
+        .build_full_graph(&unlocked, opts.unwrap_or_default())
 }
 
 /// `/people` personal CRM: one card per VISIBLE Person entity, rolled up over the SAME gated

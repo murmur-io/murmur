@@ -158,7 +158,10 @@
             spellcheck="false"
           ></textarea>
         } @else {
-          <app-markdown [markdown]="it.markdown" />
+          <app-markdown
+            [markdown]="it.markdown"
+            [attachments]="attachments()"
+          />
         }
       </div>
     </article>

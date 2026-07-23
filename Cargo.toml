@@ -1,7 +1,7 @@
 # Virtual workspace root (introduced for the brain-sidecar extraction, 2026-07-11).
 #
 # WHY a workspace: the on-device GGUF LLM (mistralrs) was extracted out of the app crate into its
-# OWN member crate (`crates/murmur-brain`) compiled to a killable helper binary `meetnotes-brain`.
+# OWN member crate (`crates/murmur-brain`) compiled to a killable helper binary `murmur-brain`.
 # The app crate (`src-tauri`, package `murmur`) NO LONGER depends on mistralrs — so `cargo test --lib`
 # stops compiling the largest single ML tree, and (the real point) the multi-GB model residency +
 # mistralrs drop-leaks (#723/#865) + uncancellable generation now live in a child process whose RAM
@@ -23,8 +23,8 @@ default-members = ["src-tauri"]
 # `cargo test --lib`. Several of those links at once pinned the macOS memory compressor and froze the
 # whole UI (root-cause writeup: docs/research/2026-07-18-build-ram-freeze.md). Stripping dependency
 # debuginfo cuts ~30-40% of incremental compile time and most of that link RAM. OUR OWN crates keep
-# full debuginfo below, so panic backtraces stay useful. The `release` profile is intentionally
-# untouched (shipped binaries + notarization are unaffected).
+# line-table debuginfo below, so panic backtraces retain file:line locations. Any release-profile
+# tuning belongs in its own `[profile.release]` section and does not change these dev-only settings.
 [profile.dev.package."*"]
 debug = false
 
@@ -32,3 +32,10 @@ debug = false
 # `debug = 2` weight — a light middle ground for the code we actually debug locally.
 [profile.dev]
 debug = "line-tables-only"
+
+# Shipped binaries favor steady-state performance and size. Workspace profiles belong at this
+# virtual root (putting this in src-tauri/Cargo.toml would be ignored by Cargo).
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

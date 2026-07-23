@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "repository": "murmur-io/murmur",
+  "branch": "murmur",
+  "required_status_check": "gate (full ci.sh — release parity)",
+  "required_status_check_app_id": 15368,
+  "require_strict_status_checks": true,
+  "require_admin_enforcement": true,
+  "minimum_approvals": 1,
+  "require_conversation_resolution": true,
+  "require_secret_scanning": true,
+  "require_secret_push_protection": true
+}

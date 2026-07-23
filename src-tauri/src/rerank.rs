@@ -106,7 +106,21 @@ impl Reranker for PromptedReranker {
                 timeout: Some(remaining),
                 ..GenOptions::default()
             };
-            match self.reasoner.structured_with(system, &user, &schema, opts) {
+            let verdict = if self.reasoner.model_admission_managed() {
+                self.reasoner.structured_with(system, &user, &schema, opts)
+            } else if self.reasoner.id() == "afm" || self.reasoner.id().starts_with("sidecar:") {
+                let kind = if self.reasoner.id() == "afm" {
+                    crate::perf::ResidentModelKind::AppleFoundation
+                } else {
+                    crate::perf::ResidentModelKind::BrainGguf
+                };
+                crate::perf::with_model_generation(None, kind, || {
+                    self.reasoner.structured_with(system, &user, &schema, opts)
+                })
+            } else {
+                self.reasoner.structured_with(system, &user, &schema, opts)
+            };
+            match verdict {
                 Ok(v) => {
                     if let Some(rel) = v.get("relevant").and_then(|b| b.as_bool()) {
                         relevance[i] = rel;

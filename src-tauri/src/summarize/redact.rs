@@ -548,6 +548,10 @@ pub struct RedactingProvider {
     model_requested: String,
     /// Sink that receives one content-free audit row per call. `NoopEgressSink` by default.
     sink: Arc<dyn EgressSink>,
+    /// Production-only NER admission seam. Test/fixture constructors leave this `None`; the provider
+    /// factory supplies the shared heavy lane plus an optional exact recording token.
+    ner_heavy: Option<Arc<tokio::sync::Semaphore>>,
+    recording_token: Option<crate::perf::RecordingSessionToken>,
 }
 
 impl RedactingProvider {
@@ -562,6 +566,8 @@ impl RedactingProvider {
             inner,
             names: Arc::new(NoopNameRedactor),
             sink: Arc::new(NoopEgressSink),
+            ner_heavy: None,
+            recording_token: None,
         }
     }
 
@@ -579,6 +585,8 @@ impl RedactingProvider {
             inner,
             names,
             sink: Arc::new(NoopEgressSink),
+            ner_heavy: None,
+            recording_token: None,
         }
     }
 
@@ -604,7 +612,56 @@ impl RedactingProvider {
             provider_id,
             destination,
             model_requested,
+            ner_heavy: None,
+            recording_token: None,
         }
+    }
+
+    /// Production constructor with local NER lifecycle admission. The lease + heavy permit cover
+    /// only regex/NER preparation and are dropped BEFORE the cloud await, so Record never waits on
+    /// network I/O. If Start wins the race, unscoped admission fails and no plaintext egress occurs.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn with_name_redactor_sink_and_model_admission(
+        inner: Arc<dyn SummarizerProvider>,
+        names: Arc<dyn NameRedactor>,
+        sink: Arc<dyn EgressSink>,
+        provider_id: String,
+        destination: String,
+        model_requested: String,
+        heavy: Arc<tokio::sync::Semaphore>,
+        recording_token: Option<crate::perf::RecordingSessionToken>,
+    ) -> Self {
+        Self {
+            inner,
+            names,
+            sink,
+            provider_id,
+            destination,
+            model_requested,
+            ner_heavy: Some(heavy),
+            recording_token,
+        }
+    }
+
+    async fn run_name_redactor<T, F>(&self, f: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&dyn NameRedactor) -> Result<T> + Send + 'static,
+    {
+        if self.names.is_noop() {
+            return f(self.names.as_ref()); // no model, or an explicit fixture constructor.
+        }
+        let Some(heavy) = self.ner_heavy.as_ref() else {
+            return f(self.names.as_ref()); // explicit fixture/back-compat constructor.
+        };
+        let names = Arc::clone(&self.names);
+        crate::perf::run_heavy_with_admission(
+            heavy,
+            self.recording_token.clone(),
+            crate::perf::ResidentModelKind::Ner,
+            move || f(names.as_ref()),
+        )
+        .await
     }
 }
 
@@ -674,23 +731,6 @@ impl SummarizerProvider for RedactingProvider {
             .live_bullets
             .as_ref()
             .map(|c| redact_into(c, &mut map, &mut rev));
-        // Name layer (default no-op → text unchanged, `name_pairs` empty → byte-identical egress).
-        let (red_transcript, mut name_pairs) = self.names.redact_names(&red_transcript);
-        let red_related = red_related.map(|c| {
-            let (c2, more) = self.names.redact_names(&c);
-            name_pairs.extend(more);
-            c2
-        });
-        let red_notes = red_notes.map(|c| {
-            let (c2, more) = self.names.redact_names(&c);
-            name_pairs.extend(more);
-            c2
-        });
-        let red_bullets = red_bullets.map(|c| {
-            let (c2, more) = self.names.redact_names(&c);
-            name_pairs.extend(more);
-            c2
-        });
         // DEFENSE-IN-DEPTH — the note-format `template` rides the prompt as the SYSTEM message
         // (anthropic/gateway/claude_code providers) and `meta.title_hint` rides
         // `render_user_content`; both previously egressed VERBATIM inside `req.clone()`. Scrub them
@@ -729,25 +769,50 @@ impl SummarizerProvider for RedactingProvider {
         // `[[Anna Kowalska]].md` person page would egress verbatim. The conservative SYNTACTIC
         // detector `title_looks_like_person_name` covers that gap — active ONLY under the no-op, so
         // model-present installs keep the unchanged NER behavior.
-        let noop_ner = self.names.is_noop();
-        let red_titles: Vec<String> = req
-            .vault_titles
-            .iter()
-            .filter(|title| {
-                let title = title.as_str();
-                let (regex_scrubbed, _) = redact(title);
-                if regex_scrubbed.as_str() != title {
-                    return false; // an email/card/phone in the title → drop it
-                }
-                if noop_ner && title_looks_like_person_name(title) {
-                    return false; // no NER model → syntactic person-name fallback drops it
-                }
-                let (name_scrubbed, name_hits) = self.names.redact_names(title);
-                // a PERSON detected in the title → drop it (only fires when a NER model is present)
-                name_scrubbed.as_str() == title && name_hits.is_empty()
+        let titles = req.vault_titles.clone();
+        let (red_transcript, red_related, red_notes, red_bullets, name_pairs, red_titles) = self
+            .run_name_redactor(move |names| {
+                let (red_transcript, mut name_pairs) = names.redact_names(&red_transcript);
+                let red_related = red_related.map(|c| {
+                    let (c2, more) = names.redact_names(&c);
+                    name_pairs.extend(more);
+                    c2
+                });
+                let red_notes = red_notes.map(|c| {
+                    let (c2, more) = names.redact_names(&c);
+                    name_pairs.extend(more);
+                    c2
+                });
+                let red_bullets = red_bullets.map(|c| {
+                    let (c2, more) = names.redact_names(&c);
+                    name_pairs.extend(more);
+                    c2
+                });
+                let noop_ner = names.is_noop();
+                let red_titles = titles
+                    .into_iter()
+                    .filter(|title| {
+                        let (regex_scrubbed, _) = redact(title);
+                        if regex_scrubbed.as_str() != title {
+                            return false;
+                        }
+                        if noop_ner && title_looks_like_person_name(title) {
+                            return false;
+                        }
+                        let (name_scrubbed, name_hits) = names.redact_names(title);
+                        name_scrubbed.as_str() == title && name_hits.is_empty()
+                    })
+                    .collect();
+                Ok((
+                    red_transcript,
+                    red_related,
+                    red_notes,
+                    red_bullets,
+                    name_pairs,
+                    red_titles,
+                ))
             })
-            .cloned()
-            .collect();
+            .await?;
 
         // Byte sizes of the REDACTED content (sizes, never the text itself).
         let user_bytes = red_transcript.len()
@@ -762,6 +827,21 @@ impl SummarizerProvider for RedactingProvider {
         r.template = red_template;
         r.meta.title_hint = red_title_hint;
         r.vault_titles = red_titles;
+        if self.recording_token.is_none()
+            && self.ner_heavy.is_some()
+            && !self.names.is_noop()
+            && crate::perf::recording_has_priority()
+        {
+            return Err(AppError::Unavailable(
+                "cloud dispatch deferred because recording started during local redaction".into(),
+            ));
+        }
+        // NER/model work is complete. Never hold a local-model lease across the cloud await. The
+        // affine external-egress lease, however, MUST cover the entire awaited provider dispatch:
+        // either this call wins before Start/Draining and that transition waits, or the transition
+        // wins and no network call starts.
+        let _egress_lease =
+            crate::perf::acquire_external_egress_lease(self.recording_token.as_ref())?;
         let (out, meta) = self.inner.summarize_with_meta(&r).await?;
         // Restore both layers in the reply (disjoint token namespaces; order-independent).
         let out = restore_names(&out, &name_pairs);
@@ -800,14 +880,20 @@ impl SummarizerProvider for RedactingProvider {
         let user_bytes = ruser.len();
         // Name layer on each prompt (default no-op → unchanged). A stable-token NameRedactor maps
         // the same name to the same token across both prompts, so the merged pairs restore cleanly.
-        let (rsys, mut name_pairs) = self.names.redact_names(&rsys);
-        let (ruser, more) = self.names.redact_names(&ruser);
-        name_pairs.extend(more);
+        let noop_ner = self.names.is_noop();
+        let (rsys, ruser, name_pairs) = self
+            .run_name_redactor(move |names| {
+                let (rsys, mut name_pairs) = names.redact_names(&rsys);
+                let (ruser, more) = names.redact_names(&ruser);
+                name_pairs.extend(more);
+                Ok((rsys, ruser, name_pairs))
+            })
+            .await?;
         // R6 (P0.1 follow-up) — with NO NER model the name layer detects nothing, so person-name
         // TITLES (the JIT listing lines / [[wikilinks]] in the prompt) would egress verbatim on
         // this COMPLETE path. Apply the drop-only syntactic title scrub — active ONLY under the
         // no-op layer, exactly like the summarize path's vault-title fallback.
-        let (rsys, ruser) = if self.names.is_noop() {
+        let (rsys, ruser) = if noop_ner {
             (
                 scrub_person_name_titles(&rsys),
                 scrub_person_name_titles(&ruser),
@@ -815,6 +901,19 @@ impl SummarizerProvider for RedactingProvider {
         } else {
             (rsys, ruser)
         };
+        if self.recording_token.is_none()
+            && self.ner_heavy.is_some()
+            && !noop_ner
+            && crate::perf::recording_has_priority()
+        {
+            return Err(AppError::Unavailable(
+                "cloud dispatch deferred because recording started during local redaction".into(),
+            ));
+        }
+        // NER/model work is complete. Never hold a local-model lease across the cloud await; hold
+        // only the affine egress lease across the actual provider future.
+        let _egress_lease =
+            crate::perf::acquire_external_egress_lease(self.recording_token.as_ref())?;
         let (out, meta) = self.inner.complete_with_meta(&rsys, &ruser).await?;
         let out = restore_names(&out, &name_pairs);
         let out = restore(&out, &map);
@@ -860,12 +959,18 @@ impl SummarizerProvider for RedactingProvider {
         let user_bytes = ruser.len();
         // Name layer on each prompt (default no-op → unchanged). A stable-token NameRedactor maps
         // the same name to the same token across both prompts, so the merged pairs restore cleanly.
-        let (rsys, mut name_pairs) = self.names.redact_names(&rsys);
-        let (ruser, more) = self.names.redact_names(&ruser);
-        name_pairs.extend(more);
+        let noop_ner = self.names.is_noop();
+        let (rsys, ruser, name_pairs) = self
+            .run_name_redactor(move |names| {
+                let (rsys, mut name_pairs) = names.redact_names(&rsys);
+                let (ruser, more) = names.redact_names(&ruser);
+                name_pairs.extend(more);
+                Ok((rsys, ruser, name_pairs))
+            })
+            .await?;
         // R6 — same no-NER-only person-name-title scrub as `complete_with_meta` (the structured
         // side-tasks embed the same listing/wikilink title shapes).
-        let (rsys, ruser) = if self.names.is_noop() {
+        let (rsys, ruser) = if noop_ner {
             (
                 scrub_person_name_titles(&rsys),
                 scrub_person_name_titles(&ruser),
@@ -873,8 +978,19 @@ impl SummarizerProvider for RedactingProvider {
         } else {
             (rsys, ruser)
         };
+        if self.recording_token.is_none()
+            && self.ner_heavy.is_some()
+            && !noop_ner
+            && crate::perf::recording_has_priority()
+        {
+            return Err(AppError::Unavailable(
+                "cloud dispatch deferred because recording started during local redaction".into(),
+            ));
+        }
         // Forward to the INNER's own complete_json_with_meta — dispatches to the gateway's native
         // json_schema+meta override, or the trait default for anthropic/claude_code/ollama.
+        let _egress_lease =
+            crate::perf::acquire_external_egress_lease(self.recording_token.as_ref())?;
         let (value, meta) = self
             .inner
             .complete_json_with_meta(&rsys, &ruser, schema)
@@ -990,6 +1106,22 @@ mod tests {
             .block_on(f)
     }
 
+    struct ModelLifecycleTestGuard {
+        _serial: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for ModelLifecycleTestGuard {
+        fn drop(&mut self) {
+            crate::perf::reset_model_lifecycle_for_test();
+        }
+    }
+
+    fn model_lifecycle_test_guard() -> ModelLifecycleTestGuard {
+        let serial = crate::perf::model_lifecycle_test_guard();
+        crate::perf::reset_model_lifecycle_for_test();
+        ModelLifecycleTestGuard { _serial: serial }
+    }
+
     fn sample_req(transcript: &str) -> SummarizeRequest {
         use crate::summarize::provider::MeetingMeta;
         SummarizeRequest {
@@ -1019,6 +1151,7 @@ mod tests {
 
     #[test]
     fn default_provider_egress_is_byte_identical_for_names() {
+        let _lifecycle = model_lifecycle_test_guard();
         // Through the PRODUCTION constructor (default no-op name layer), a transcript with names
         // and NO regex-PII reaches the inner provider verbatim — proving prod egress is unchanged.
         let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
@@ -1050,6 +1183,7 @@ mod tests {
 
     #[test]
     fn name_seam_round_trips_through_provider() {
+        let _lifecycle = model_lifecycle_test_guard();
         // With a real NameRedactor installed: names are scrubbed BEFORE the provider call and
         // restored in the reply. The EchoProvider returns exactly what it received, so the echoed
         // reply proves both halves of the round-trip.
@@ -1066,6 +1200,7 @@ mod tests {
 
     #[test]
     fn name_seam_scrubs_before_egress() {
+        let _lifecycle = model_lifecycle_test_guard();
         // Prove the SCRUB half independently: capture what the inner provider actually receives.
         let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
 
@@ -1109,6 +1244,7 @@ mod tests {
     /// feed CONTAINS the raw name; what egresses must NOT.
     #[test]
     fn tier0_named_speaker_tag_is_scrubbed_before_egress() {
+        let _lifecycle = model_lifecycle_test_guard();
         use crate::transcribe::types::Segment;
         let segs = vec![
             Segment {
@@ -1215,6 +1351,7 @@ mod tests {
 
     #[test]
     fn default_make_provider_egress_byte_identical_with_active_redactor() {
+        let _lifecycle = model_lifecycle_test_guard();
         // End-to-end through the PRODUCTION seam: `RedactingProvider::with_name_redactor(inner,
         // active_name_redactor())` (what `make_provider` now wires). On a clean machine the active
         // redactor is the no-op, so a names-only transcript reaches the inner provider verbatim —
@@ -1252,6 +1389,7 @@ mod tests {
 
     #[test]
     fn name_seam_consistent_across_complete_prompts() {
+        let _lifecycle = model_lifecycle_test_guard();
         // The same name in both `system` and `user` restores consistently (stable-token contract).
         let prov = RedactingProvider::with_name_redactor(
             Arc::new(EchoProvider),
@@ -1262,6 +1400,54 @@ mod tests {
                 .unwrap();
         assert!(!out.contains("NAME_"));
         assert_eq!(out.matches("Anna Kowalska").count(), 2);
+    }
+
+    #[test]
+    fn production_ner_admission_blocks_background_but_accepts_exact_recording_token() {
+        let _lifecycle = model_lifecycle_test_guard();
+        let mut owner = crate::perf::begin_recording_session().unwrap();
+        owner.transition_to_live().unwrap();
+        let heavy = Arc::new(tokio::sync::Semaphore::new(1));
+
+        let background = RedactingProvider::with_name_redactor_sink_and_model_admission(
+            Arc::new(EchoProvider),
+            Arc::new(FixtureNameRedactor),
+            Arc::new(NoopEgressSink),
+            "echo".into(),
+            "test".into(),
+            "m".into(),
+            heavy.clone(),
+            None,
+        );
+        assert!(matches!(
+            block_on(background.complete("s", "Anna Kowalska")),
+            Err(AppError::Unavailable(_))
+        ));
+        assert!(matches!(
+            block_on(background.complete_json_with_meta(
+                "s",
+                "Anna Kowalska",
+                &serde_json::json!({"type": "object"}),
+            )),
+            Err(AppError::Unavailable(_))
+        ));
+
+        let recording = RedactingProvider::with_name_redactor_sink_and_model_admission(
+            Arc::new(EchoProvider),
+            Arc::new(FixtureNameRedactor),
+            Arc::new(NoopEgressSink),
+            "echo".into(),
+            "test".into(),
+            "m".into(),
+            heavy,
+            Some(owner.token()),
+        );
+        let out = block_on(recording.complete("s", "Anna Kowalska")).unwrap();
+        assert!(out.contains("Anna Kowalska"));
+
+        owner.transition_to_draining().unwrap();
+        owner.transition_to_postprocess().unwrap();
+        owner.finish().unwrap();
     }
 
     // ── Phase 2b — egress ledger ─────────────────────────────────────────────
@@ -1340,6 +1526,7 @@ mod tests {
     /// - `format!("{:?}", entry)` contains NEITHER the email string NOR the note text.
     #[test]
     fn egress_entry_is_content_free_and_captures_meta_and_counts() {
+        let _lifecycle = model_lifecycle_test_guard();
         let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = Arc::new(CaptureEgressSink(captured.clone()));
         let prov = RedactingProvider::with_name_redactor_and_sink(
@@ -1397,6 +1584,7 @@ mod tests {
     /// `meta.redactions = Some(count)` before returning.
     #[test]
     fn summarize_with_meta_surfaces_redaction_count_to_caller() {
+        let _lifecycle = model_lifecycle_test_guard();
         let prov = RedactingProvider::with_name_redactor(
             Arc::new(EchoMetaProvider),
             Arc::new(NoopNameRedactor),
@@ -1418,6 +1606,7 @@ mod tests {
     /// The default `with_name_redactor` path records to a NoopEgressSink — no panic, no row.
     #[test]
     fn default_constructor_records_to_noop_sink_no_panic() {
+        let _lifecycle = model_lifecycle_test_guard();
         let prov = RedactingProvider::with_name_redactor(
             Arc::new(EchoProvider),
             Arc::new(NoopNameRedactor),
@@ -1448,6 +1637,7 @@ mod tests {
     /// the inner's `complete_json` override is NEVER reached → `complete_json_called` stays false.
     #[test]
     fn complete_json_redacts_forwards_restores_and_records() {
+        let _lifecycle = model_lifecycle_test_guard();
         use std::sync::atomic::{AtomicBool, Ordering};
 
         let captured_user = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
@@ -1623,6 +1813,7 @@ mod tests {
     /// GREEN after fix: the same shared map + name-layer pass applied, email replaced with token.
     #[test]
     fn user_notes_are_redacted_before_egress() {
+        let _lifecycle = model_lifecycle_test_guard();
         let mut req = sample_req("no PII in transcript");
         req.user_notes = Some("ping bob@corp.com about the deck".to_string());
         let inner = std::sync::Arc::new(CapturingInner(std::sync::Mutex::new(None)));
@@ -1663,6 +1854,7 @@ mod tests {
     /// survives as a valid link target.
     #[test]
     fn vault_title_with_regex_pii_is_filtered_before_egress() {
+        let _lifecycle = model_lifecycle_test_guard();
         let mut req = sample_req("no PII in transcript");
         req.vault_titles = vec![
             "Offer - jane@doe.example".to_string(), // email in the title → must be dropped
@@ -1702,6 +1894,7 @@ mod tests {
     /// the design-B filter the flagged title is dropped, so the name is ABSENT; a clean title stays.
     #[test]
     fn vault_title_with_person_name_is_filtered_when_ner_active() {
+        let _lifecycle = model_lifecycle_test_guard();
         let mut req = sample_req("no PII in transcript");
         req.vault_titles = vec![
             "Meeting with Anna Kowalska".to_string(), // person page the NER layer detects → dropped
@@ -1734,6 +1927,7 @@ mod tests {
     /// provider (the no-op detector flags nothing). Confirmed failing before the fix.
     #[test]
     fn person_name_title_is_dropped_when_no_ner_model_present() {
+        let _lifecycle = model_lifecycle_test_guard();
         let mut req = sample_req("no PII in transcript");
         req.vault_titles = vec![
             "Anna Kowalska".to_string(), // person-page stem → MUST be dropped under the no-op NER
@@ -1784,6 +1978,7 @@ mod tests {
     /// meeting-shaped titles survive untouched.
     #[test]
     fn person_name_titles_scrubbed_on_complete_path_when_no_ner() {
+        let _lifecycle = model_lifecycle_test_guard();
         let prov = RedactingProvider::with_name_redactor(
             Arc::new(EchoProvider),
             Arc::new(NoopNameRedactor), // the production no-NER-model shape
@@ -1812,6 +2007,7 @@ mod tests {
     /// prompt text is not additionally rewritten by the drop-only scrub.
     #[test]
     fn complete_path_syntactic_scrub_inactive_when_ner_present() {
+        let _lifecycle = model_lifecycle_test_guard();
         let prov = RedactingProvider::with_name_redactor(
             Arc::new(EchoProvider),
             Arc::new(FixtureNameRedactor), // a real (non-noop) name layer
@@ -1847,9 +2043,7 @@ mod tests {
         assert!(!title_looks_like_person_name("Anna")); // single word
         assert!(!title_looks_like_person_name("CI CD Pipeline")); // all-caps acronyms
         assert!(!title_looks_like_person_name("Clean retained title")); // lowercase words
-        assert!(!title_looks_like_person_name(
-            "Five Word Long Phrase Here"
-        )); // > 4 words
+        assert!(!title_looks_like_person_name("Five Word Long Phrase Here")); // > 4 words
         assert!(!title_looks_like_person_name("")); // empty
     }
 
@@ -1862,6 +2056,7 @@ mod tests {
     /// after the fix they are ABSENT while the non-PII instruction text still passes through.
     #[test]
     fn template_and_title_hint_are_scrubbed_before_egress() {
+        let _lifecycle = model_lifecycle_test_guard();
         let mut req = sample_req("no PII in transcript");
         req.template = "Custom recipe — ping ops@corp.example for context.".to_string();
         req.meta.title_hint = Some("Sync re carl@corp.example".to_string());
@@ -1894,6 +2089,7 @@ mod tests {
     /// exempt (a documented non-PII format flag). That is the guard the allowlist bug needed.
     #[test]
     fn every_string_field_of_summarize_request_is_scrubbed_or_exempt() {
+        let _lifecycle = model_lifecycle_test_guard();
         use crate::summarize::provider::MeetingMeta;
         // Distinct email-shaped sentinels — deterministically caught by the regex layer (no model
         // needed), so this test is stable in the headless loop.

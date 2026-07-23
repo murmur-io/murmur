@@ -1,0 +1,948 @@
+<!doctype html>
+<html lang="pl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Murmur — jak działa development loop</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #090b10;
+      --panel: rgba(20, 23, 31, 0.82);
+      --panel-strong: #171a22;
+      --line: rgba(255, 255, 255, 0.09);
+      --line-strong: rgba(255, 255, 255, 0.17);
+      --text: #f5f5f7;
+      --muted: #9ca3b3;
+      --violet: #ad8cff;
+      --violet-strong: #8e68ff;
+      --cyan: #61d9ff;
+      --green: #5fe0a0;
+      --red: #ff7474;
+      --amber: #ffc66f;
+      --shadow: 0 24px 80px rgba(0, 0, 0, 0.35);
+      --radius-xl: 28px;
+      --radius-lg: 20px;
+      --radius-md: 14px;
+    }
+
+    * { box-sizing: border-box; }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      overflow-x: hidden;
+      background:
+        radial-gradient(circle at 14% 8%, rgba(142, 104, 255, 0.18), transparent 31rem),
+        radial-gradient(circle at 88% 24%, rgba(97, 217, 255, 0.1), transparent 28rem),
+        var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", sans-serif;
+    }
+
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      opacity: 0.18;
+      background-image:
+        linear-gradient(rgba(255,255,255,.025) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255,255,255,.025) 1px, transparent 1px);
+      background-size: 36px 36px;
+      mask-image: linear-gradient(to bottom, black, transparent 78%);
+    }
+
+    button, textarea { font: inherit; }
+    button { color: inherit; }
+
+    .shell {
+      position: relative;
+      width: min(1240px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 28px 0 64px;
+    }
+
+    .topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 20px;
+      margin-bottom: 54px;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      font-weight: 720;
+      letter-spacing: -0.02em;
+    }
+
+    .brand-mark {
+      display: grid;
+      width: 38px;
+      height: 38px;
+      place-items: center;
+      border: 1px solid rgba(255,255,255,.13);
+      border-radius: 12px;
+      background: linear-gradient(145deg, rgba(173,140,255,.28), rgba(97,217,255,.08));
+      box-shadow: inset 0 1px rgba(255,255,255,.15), 0 10px 26px rgba(89,53,180,.2);
+    }
+
+    .brand-mark svg { width: 22px; height: 22px; }
+    .brand small { display: block; color: var(--muted); font-size: 11px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; }
+
+    .status-row { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
+
+    .status {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      padding: 8px 11px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: rgba(255,255,255,.035);
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 650;
+    }
+
+    .dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; box-shadow: 0 0 13px currentColor; }
+    .status.ok { color: var(--green); }
+    .status.warn { color: var(--amber); }
+
+    .hero {
+      max-width: 850px;
+      margin-bottom: 34px;
+    }
+
+    .eyebrow {
+      margin: 0 0 12px;
+      color: var(--violet);
+      font-size: 13px;
+      font-weight: 750;
+      letter-spacing: .12em;
+      text-transform: uppercase;
+    }
+
+    h1 {
+      max-width: 800px;
+      margin: 0;
+      font-size: clamp(42px, 7vw, 78px);
+      line-height: .98;
+      letter-spacing: -.064em;
+    }
+
+    .gradient-text {
+      color: transparent;
+      background: linear-gradient(105deg, #fff 6%, #c9b8ff 50%, #75dcff 95%);
+      -webkit-background-clip: text;
+      background-clip: text;
+    }
+
+    .hero p:last-child {
+      max-width: 720px;
+      margin: 24px 0 0;
+      color: var(--muted);
+      font-size: 19px;
+      line-height: 1.55;
+      letter-spacing: -.01em;
+    }
+
+    .tabs {
+      display: inline-flex;
+      gap: 4px;
+      margin-bottom: 18px;
+      padding: 4px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: rgba(255,255,255,.03);
+    }
+
+    .tab {
+      padding: 10px 14px;
+      border: 0;
+      border-radius: 10px;
+      background: transparent;
+      color: var(--muted);
+      cursor: pointer;
+      font-size: 13px;
+      font-weight: 700;
+      transition: .2s ease;
+    }
+
+    .tab:hover { color: var(--text); }
+    .tab.active { background: rgba(255,255,255,.09); color: var(--text); box-shadow: inset 0 1px rgba(255,255,255,.1); }
+    .tab-panel { display: none; }
+    .tab-panel.active { display: block; animation: enter .34s ease both; }
+
+    @keyframes enter {
+      from { opacity: 0; transform: translateY(6px); }
+      to { opacity: 1; transform: none; }
+    }
+
+    .card {
+      border: 1px solid var(--line);
+      border-radius: var(--radius-xl);
+      background: linear-gradient(145deg, rgba(24,27,36,.9), rgba(14,16,23,.88));
+      box-shadow: var(--shadow), inset 0 1px rgba(255,255,255,.055);
+      backdrop-filter: blur(20px);
+    }
+
+    .composer {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 300px;
+      gap: 18px;
+      padding: 18px;
+    }
+
+    .prompt-box {
+      min-height: 136px;
+      padding: 18px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius-lg);
+      background: rgba(7,9,13,.58);
+    }
+
+    .prompt-label {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 12px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: .04em;
+      text-transform: uppercase;
+    }
+
+    textarea {
+      width: 100%;
+      min-height: 72px;
+      resize: vertical;
+      border: 0;
+      outline: 0;
+      background: transparent;
+      color: var(--text);
+      font-size: 18px;
+      line-height: 1.48;
+    }
+
+    .options {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      padding: 4px;
+    }
+
+    .option-block {
+      padding: 13px 14px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: rgba(255,255,255,.026);
+    }
+
+    .option-title { margin-bottom: 9px; color: var(--muted); font-size: 11px; font-weight: 750; text-transform: uppercase; letter-spacing: .08em; }
+    .segmented { display: grid; grid-template-columns: 1fr 1fr; gap: 5px; }
+
+    .segment, .scenario {
+      border: 1px solid transparent;
+      border-radius: 10px;
+      background: rgba(255,255,255,.045);
+      color: var(--muted);
+      cursor: pointer;
+      font-size: 12px;
+      font-weight: 720;
+      padding: 9px;
+      transition: .2s ease;
+    }
+
+    .segment:hover, .scenario:hover { color: var(--text); }
+    .segment.active, .scenario.active { border-color: rgba(173,140,255,.38); background: rgba(142,104,255,.18); color: #e7deff; }
+
+    .toggle-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+    .toggle-copy strong { display: block; font-size: 13px; }
+    .toggle-copy span { display: block; margin-top: 3px; color: var(--muted); font-size: 11px; }
+
+    .switch {
+      position: relative;
+      width: 42px;
+      height: 24px;
+      flex: 0 0 auto;
+    }
+    .switch input { opacity: 0; width: 0; height: 0; }
+    .switch span { position: absolute; inset: 0; border-radius: 999px; background: rgba(255,255,255,.12); cursor: pointer; transition: .2s; }
+    .switch span::before { content: ""; position: absolute; width: 18px; height: 18px; left: 3px; top: 3px; border-radius: 50%; background: #c6c8cf; transition: .2s; }
+    .switch input:checked + span { background: var(--violet-strong); }
+    .switch input:checked + span::before { transform: translateX(18px); background: white; }
+
+    .primary {
+      width: 100%;
+      border: 0;
+      border-radius: 13px;
+      padding: 13px 16px;
+      background: linear-gradient(135deg, var(--violet-strong), #6f9bff);
+      box-shadow: 0 11px 28px rgba(115,80,230,.3), inset 0 1px rgba(255,255,255,.24);
+      cursor: pointer;
+      font-weight: 780;
+      transition: .2s ease;
+    }
+    .primary:hover { transform: translateY(-1px); filter: brightness(1.07); }
+
+    .workspace {
+      display: grid;
+      grid-template-columns: minmax(0, 1.55fr) minmax(280px, .65fr);
+      gap: 18px;
+      margin-top: 18px;
+    }
+
+    .flow-card { min-width: 0; padding: 22px; }
+    .side-card { display: flex; flex-direction: column; min-height: 480px; padding: 22px; }
+
+    .card-heading {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 22px;
+    }
+    .card-heading h2 { margin: 0; font-size: 17px; letter-spacing: -.02em; }
+    .counter { color: var(--muted); font: 650 12px ui-monospace, SFMono-Regular, Menlo, monospace; }
+
+    .flow {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(118px, 1fr));
+      gap: 24px 18px;
+      align-items: stretch;
+    }
+
+    .step {
+      position: relative;
+      min-height: 118px;
+      padding: 14px;
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: var(--radius-md);
+      background: rgba(255,255,255,.026);
+      color: var(--muted);
+      transition: .32s cubic-bezier(.2,.8,.2,1);
+    }
+
+    .step:not(:nth-child(5n))::after {
+      content: "→";
+      position: absolute;
+      z-index: 3;
+      right: -15px;
+      top: 45%;
+      color: rgba(255,255,255,.22);
+      font-size: 17px;
+      transform: translateX(100%);
+    }
+
+    .step::before {
+      content: "";
+      position: absolute;
+      inset: 0;
+      opacity: 0;
+      background: radial-gradient(circle at 20% 0%, rgba(173,140,255,.24), transparent 70%);
+      transition: opacity .3s;
+    }
+
+    .step.done { border-color: rgba(95,224,160,.21); color: #d3dae1; background: rgba(95,224,160,.045); }
+    .step.active { border-color: rgba(173,140,255,.56); color: var(--text); transform: translateY(-3px); box-shadow: 0 15px 38px rgba(0,0,0,.34), 0 0 0 1px rgba(173,140,255,.1); }
+    .step.active::before { opacity: 1; }
+    .step.error { border-color: rgba(255,116,116,.48); background: rgba(255,116,116,.08); color: #ffd7d7; animation: shake .35s ease; }
+    .step.skipped { opacity: .38; }
+
+    @keyframes shake { 25% { transform: translateX(-3px); } 75% { transform: translateX(3px); } }
+
+    .step-index { position: relative; display: flex; align-items: center; justify-content: space-between; margin-bottom: 18px; }
+    .step-number { display: grid; width: 28px; height: 28px; place-items: center; border: 1px solid var(--line-strong); border-radius: 9px; background: rgba(255,255,255,.05); font: 720 11px ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .step-state { width: 8px; height: 8px; border-radius: 50%; background: rgba(255,255,255,.15); }
+    .step.done .step-state { background: var(--green); box-shadow: 0 0 12px rgba(95,224,160,.7); }
+    .step.active .step-state { background: var(--violet); box-shadow: 0 0 12px rgba(173,140,255,.8); }
+    .step.error .step-state { background: var(--red); box-shadow: 0 0 12px rgba(255,116,116,.8); }
+    .step h3 { position: relative; margin: 0 0 6px; font-size: 14px; color: inherit; letter-spacing: -.015em; }
+    .step p { position: relative; margin: 0; font-size: 11px; line-height: 1.4; }
+
+    .loop-back {
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      margin-top: 18px;
+      padding: 11px 13px;
+      border: 1px dashed rgba(255,198,111,.27);
+      border-radius: 12px;
+      background: rgba(255,198,111,.04);
+      color: #d9bd8d;
+      font-size: 12px;
+    }
+    .loop-back strong { color: var(--amber); }
+
+    .controls { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 18px; }
+    .control {
+      border: 1px solid var(--line);
+      border-radius: 11px;
+      padding: 10px 13px;
+      background: rgba(255,255,255,.045);
+      color: var(--muted);
+      cursor: pointer;
+      font-size: 12px;
+      font-weight: 700;
+      transition: .2s;
+    }
+    .control:hover:not(:disabled) { border-color: var(--line-strong); color: var(--text); transform: translateY(-1px); }
+    .control:disabled { opacity: .35; cursor: not-allowed; }
+    .control.accent { border-color: rgba(173,140,255,.24); color: #dacfff; background: rgba(142,104,255,.13); }
+
+    .owner {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      align-self: flex-start;
+      padding: 7px 9px;
+      border-radius: 9px;
+      background: rgba(255,255,255,.05);
+      color: var(--cyan);
+      font: 700 11px ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+
+    .explanation { margin: 24px 0 0; }
+    .explanation-label { margin-bottom: 8px; color: var(--muted); font-size: 11px; font-weight: 750; text-transform: uppercase; letter-spacing: .09em; }
+    .explanation h2 { margin: 0 0 10px; font-size: 25px; line-height: 1.12; letter-spacing: -.035em; }
+    .explanation p { margin: 0; color: var(--muted); font-size: 14px; line-height: 1.58; }
+
+    .artifact {
+      margin-top: 18px;
+      padding: 12px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: #0a0c11;
+      color: #c3c9d5;
+      font: 600 11px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+      overflow-wrap: anywhere;
+    }
+
+    .mini-log {
+      margin-top: auto;
+      padding-top: 22px;
+    }
+    .log-line { display: flex; gap: 9px; padding: 7px 0; border-bottom: 1px solid rgba(255,255,255,.045); color: var(--muted); font: 600 10px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .log-line:last-child { border-bottom: 0; }
+    .log-time { color: #636a78; }
+    .log-line.ok { color: var(--green); }
+    .log-line.bad { color: var(--red); }
+
+    .comparison {
+      display: grid;
+      grid-template-columns: 1fr auto 1fr;
+      gap: 18px;
+      align-items: stretch;
+    }
+
+    .compare-card { padding: 28px; }
+    .compare-card.goal { border-color: rgba(97,217,255,.18); }
+    .compare-card.loop { border-color: rgba(173,140,255,.25); }
+    .compare-icon { display: grid; width: 44px; height: 44px; place-items: center; margin-bottom: 28px; border-radius: 14px; font-size: 19px; background: rgba(255,255,255,.055); }
+    .compare-card h2 { margin: 0 0 10px; font-size: 28px; letter-spacing: -.04em; }
+    .compare-card > p { margin: 0 0 24px; color: var(--muted); line-height: 1.55; }
+    .compare-card ul { display: grid; gap: 12px; margin: 0; padding: 0; list-style: none; }
+    .compare-card li { display: flex; gap: 10px; align-items: flex-start; color: #c9ced8; font-size: 14px; line-height: 1.45; }
+    .compare-card li::before { content: "✓"; color: var(--green); font-weight: 800; }
+    .plus { display: grid; place-items: center; color: var(--muted); font-size: 28px; }
+
+    .best-use {
+      margin-top: 18px;
+      padding: 24px 26px;
+      border: 1px solid rgba(95,224,160,.17);
+      border-radius: var(--radius-lg);
+      background: linear-gradient(120deg, rgba(95,224,160,.07), rgba(142,104,255,.06));
+    }
+    .best-use strong { display: block; margin-bottom: 7px; color: var(--green); font-size: 13px; text-transform: uppercase; letter-spacing: .08em; }
+    .best-use code { color: #f3f6fa; font: 650 14px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace; }
+
+    .under-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
+    .under-card { min-height: 230px; padding: 22px; }
+    .under-number { color: var(--violet); font: 800 12px ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .under-card h2 { margin: 30px 0 9px; font-size: 20px; letter-spacing: -.03em; }
+    .under-card p { margin: 0; color: var(--muted); font-size: 13px; line-height: 1.55; }
+    .under-card code { display: block; margin-top: 18px; color: #b9c1d0; font: 600 10px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+
+    .truth {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 12px;
+      margin-top: 18px;
+    }
+    .truth-item { padding: 18px; border: 1px solid var(--line); border-radius: 15px; background: rgba(255,255,255,.025); }
+    .truth-item strong { display: block; margin-bottom: 5px; font-size: 13px; }
+    .truth-item span { color: var(--muted); font-size: 12px; line-height: 1.45; }
+    .truth-item.ok strong { color: var(--green); }
+    .truth-item.warn strong { color: var(--amber); }
+
+    footer { margin-top: 32px; color: #676e7d; font-size: 11px; text-align: center; }
+
+    @media (max-width: 980px) {
+      .composer, .workspace { grid-template-columns: 1fr; }
+      .flow { grid-template-columns: repeat(3, 1fr); }
+      .step:not(:nth-child(5n))::after { display: none; }
+      .comparison { grid-template-columns: 1fr; }
+      .plus { height: 30px; }
+      .under-grid, .truth { grid-template-columns: 1fr 1fr; }
+    }
+
+    @media (max-width: 650px) {
+      .shell { width: min(100% - 20px, 1240px); padding-top: 18px; }
+      .topbar { align-items: flex-start; margin-bottom: 40px; }
+      .status-row { max-width: 150px; }
+      .status.warn { display: none; }
+      .hero p:last-child { font-size: 16px; }
+      .tabs { width: 100%; overflow-x: auto; }
+      .tab { flex: 1 0 auto; }
+      .composer { padding: 10px; }
+      .flow { grid-template-columns: 1fr 1fr; gap: 10px; }
+      .step { min-height: 108px; }
+      .under-grid, .truth { grid-template-columns: 1fr; }
+      .card { border-radius: 22px; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .001ms !important; transition-duration: .001ms !important; }
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none">
+            <path d="M5 16.4V7.6M9.7 19V5M14.3 17V7M19 14.6V9.4" stroke="currentColor" stroke-width="2.1" stroke-linecap="round"/>
+          </svg>
+        </span>
+        <span>Murmur <small>Development loop</small></span>
+      </div>
+      <div class="status-row" aria-label="Aktualny stan">
+        <span class="status ok"><span class="dot"></span>Local PASS</span>
+        <span class="status warn"><span class="dot"></span>Jeszcze bez PR</span>
+      </div>
+    </header>
+
+    <section class="hero">
+      <p class="eyebrow">Bez agentowego voodoo</p>
+      <h1>Ty mówisz <span class="gradient-text">co.</span><br>Loop pilnuje <span class="gradient-text">jak.</span></h1>
+      <p>Wpisujesz zwykłe zadanie. Reszta to kontrolowana taśma produkcyjna: osobny checkout, agent piszący, testy, drugi agent próbujący znaleźć błąd i dopiero wtedy prawdziwy PASS.</p>
+    </section>
+
+    <nav class="tabs" aria-label="Widoki architektury">
+      <button class="tab active" data-tab="demo">Klikalne demo</button>
+      <button class="tab" data-tab="goal">Goal vs loop</button>
+      <button class="tab" data-tab="under">Co jest pod spodem</button>
+    </nav>
+
+    <section class="tab-panel active" id="demo">
+      <div class="card composer">
+        <div class="prompt-box">
+          <div class="prompt-label"><span>Twoja wiadomość</span><span>Nie potrzebujesz specjalnej składni</span></div>
+          <textarea id="taskPrompt" aria-label="Przykładowe zadanie">Napraw utratę załączników po zamknięciu notatki i przygotuj PR.</textarea>
+        </div>
+
+        <div class="options">
+          <div class="option-block">
+            <div class="option-title">Kto pisze kod?</div>
+            <div class="segmented" id="writerPicker">
+              <button class="segment" data-writer="Codex">Codex</button>
+              <button class="segment active" data-writer="Claude">Claude</button>
+            </div>
+          </div>
+
+          <div class="option-block toggle-row">
+            <div class="toggle-copy"><strong>Użyj /goal</strong><span>Opcjonalne dla długiej pracy</span></div>
+            <label class="switch" aria-label="Włącz goal">
+              <input id="goalToggle" type="checkbox" checked>
+              <span></span>
+            </label>
+          </div>
+
+          <div class="option-block">
+            <div class="option-title">Scenariusz demo</div>
+            <div class="segmented" id="scenarioPicker">
+              <button class="scenario" data-scenario="clean">Od razu dobrze</button>
+              <button class="scenario active" data-scenario="repair">Reviewer łapie błąd</button>
+            </div>
+          </div>
+
+          <button class="primary" id="startButton">Uruchom symulację</button>
+        </div>
+      </div>
+
+      <div class="workspace">
+        <section class="card flow-card">
+          <div class="card-heading">
+            <h2>Droga jednego zadania</h2>
+            <span class="counter" id="stepCounter">Gotowy</span>
+          </div>
+
+          <div class="flow" id="flow">
+            <article class="step" data-step="0">
+              <div class="step-index"><span class="step-number">01</span><span class="step-state"></span></div>
+              <h3>Twoje zadanie</h3><p>Zwykła wiadomość, bez DSL-a.</p>
+            </article>
+            <article class="step" data-step="1">
+              <div class="step-index"><span class="step-number">02</span><span class="step-state"></span></div>
+              <h3>Goal</h3><p>Trzyma cel aktywny w rozmowie.</p>
+            </article>
+            <article class="step" data-step="2">
+              <div class="step-index"><span class="step-number">03</span><span class="step-state"></span></div>
+              <h3>Kontrakt</h3><p>Zakres, ryzyka, testy i base SHA.</p>
+            </article>
+            <article class="step" data-step="3">
+              <div class="step-index"><span class="step-number">04</span><span class="step-state"></span></div>
+              <h3>Writer</h3><p>Jeden model implementuje zmianę.</p>
+            </article>
+            <article class="step" data-step="4">
+              <div class="step-index"><span class="step-number">05</span><span class="step-state"></span></div>
+              <h3>Testy</h3><p>Offline, sandbox, bez sekretów.</p>
+            </article>
+            <article class="step" data-step="5">
+              <div class="step-index"><span class="step-number">06</span><span class="step-state"></span></div>
+              <h3>Reviewer</h3><p>Drugi model próbuje to rozbić.</p>
+            </article>
+            <article class="step" data-step="6">
+              <div class="step-index"><span class="step-number">07</span><span class="step-state"></span></div>
+              <h3>Decyzja</h3><p>PASS albo konkretna poprawka.</p>
+            </article>
+            <article class="step" data-step="7">
+              <div class="step-index"><span class="step-number">08</span><span class="step-state"></span></div>
+              <h3>Attestation</h3><p>Dowód przypięty do diffu.</p>
+            </article>
+            <article class="step" data-step="8">
+              <div class="step-index"><span class="step-number">09</span><span class="step-state"></span></div>
+              <h3>Commit + PR</h3><p>Dopiero po prawdziwym PASS.</p>
+            </article>
+          </div>
+
+          <div class="loop-back"><span>↩</span><span>Gdy review znajdzie problem: <strong>wracamy do writera, maksymalnie 2 razy.</strong> Potem kończymy jako FAILED/BLOCKED — bez wiecznej pętli.</span></div>
+
+          <div class="controls">
+            <button class="control accent" id="nextButton" disabled>Następny krok</button>
+            <button class="control" id="autoButton" disabled>Odtwórz automatycznie</button>
+            <button class="control" id="resetButton">Reset</button>
+          </div>
+        </section>
+
+        <aside class="card side-card" aria-live="polite">
+          <span class="owner" id="owner">Czeka na Ciebie</span>
+          <div class="explanation">
+            <div class="explanation-label">Co się teraz dzieje?</div>
+            <h2 id="explanationTitle">Napisz zadanie</h2>
+            <p id="explanationText">Nie wybierasz ręcznie każdego agenta. Normalne „napraw X end-to-end” wystarczy, aby workflow dobrał zakres i uruchomił loop.</p>
+          </div>
+          <div class="artifact" id="artifact">Brak artefaktu — symulacja jeszcze nie wystartowała.</div>
+          <div class="mini-log" id="miniLog">
+            <div class="log-line"><span class="log-time">--:--</span><span>loop czeka na zadanie</span></div>
+          </div>
+        </aside>
+      </div>
+    </section>
+
+    <section class="tab-panel" id="goal">
+      <div class="comparison">
+        <article class="card compare-card goal">
+          <div class="compare-icon">◎</div>
+          <h2>/goal</h2>
+          <p>Pamięć intencji w konkretnej rozmowie. Mówi agentowi, dokąd ma dojść i pozwala pracować długo.</p>
+          <ul>
+            <li>Trzyma cel aktywny między kolejnymi turami</li>
+            <li>Możesz go pauzować, edytować i wznawiać</li>
+            <li>Nie tworzy sam niezależnego review ani dowodu PASS</li>
+          </ul>
+        </article>
+        <div class="plus">+</div>
+        <article class="card compare-card loop">
+          <div class="compare-icon">⟳</div>
+          <h2>Agent harness</h2>
+          <p>Maszyna wykonawcza zapisana w repo. Mówi agentom, jak zbudować, sprawdzić i udowodnić zmianę.</p>
+          <ul>
+            <li>Osobny worktree i twardy zakres plików</li>
+            <li>Writer nie może sam wystawić sobie PASS</li>
+            <li>Stan i dowody przeżyją zmianę chatu albo modelu</li>
+          </ul>
+        </article>
+      </div>
+      <div class="best-use">
+        <strong>Najlepsze użycie razem</strong>
+        <code>/goal Dostarcz feature X jako PR. Wykonaj przez agent-harness i zakończ dopiero na niezależnym PASSED.</code>
+      </div>
+    </section>
+
+    <section class="tab-panel" id="under">
+      <div class="under-grid">
+        <article class="card under-card">
+          <span class="under-number">01 / IZOLACJA</span>
+          <h2>Nie dotyka Twojego brudnego checkoutu</h2>
+          <p>Każdy task dostaje własny branch i worktree. Sibling murmur-server jest przypięty do jednego, konkretnego SHA.</p>
+          <code>../.murmur-agent-tasks/&lt;id&gt;/meetnotes</code>
+        </article>
+        <article class="card under-card">
+          <span class="under-number">02 / SANDBOX</span>
+          <h2>Test nie łazi po komputerze</h2>
+          <p>Stałe środowisko bez tokenów, Cargo offline, prywatny target. Internet wyłączony; UI dostaje tylko loopback.</p>
+          <code>macOS Seatbelt · private HOME · no egress</code>
+        </article>
+        <article class="card under-card">
+          <span class="under-number">03 / REVIEW</span>
+          <h2>Inny model wydaje werdykt</h2>
+          <p>Domyślnie Claude pisze → Codex sprawdza. Ryzykowne zmiany dostają dodatkowy lock/egress/protocol review.</p>
+          <code>fresh session ≠ writer session</code>
+        </article>
+        <article class="card under-card">
+          <span class="under-number">04 / BOUNDS</span>
+          <h2>Pętla ma hamulec</h2>
+          <p>Domyślnie najwyżej dwie rundy napraw. Jeśli nadal jest źle, task kończy się jawnie jako FAILED albo BLOCKED.</p>
+          <code>max_repair_rounds = 2</code>
+        </article>
+        <article class="card under-card">
+          <span class="under-number">05 / DOWÓD</span>
+          <h2>PASS dotyczy jednego diffu</h2>
+          <p>Zmiana po review unieważnia wynik. Hash obejmuje kontrakt, diff, testy, logi, sesje reviewerów i commit receipt.</p>
+          <code>development-attestation-v2</code>
+        </article>
+        <article class="card under-card">
+          <span class="under-number">06 / EVAL</span>
+          <h2>Mierzymy też samych agentów</h2>
+          <p>Ukryte syntetyczne zadania wykrywają false-green, wyjście poza scope, timeouty i obchodzenie guardów.</p>
+          <code>pass@1 · false-green · scope-fail</code>
+        </article>
+      </div>
+
+      <div class="truth">
+        <div class="truth-item ok"><strong>Local harness: PASS</strong><span>Niezależny adversarial verifier nie znalazł otwartych lokalnych findingów.</span></div>
+        <div class="truth-item warn"><strong>Jeszcze nie landed</strong><span>Pliki harnessu i pin serwera muszą trafić do osobnego PR.</span></div>
+        <div class="truth-item warn"><strong>GitHub: 5 braków</strong><span>Required CI, admin enforcement, conversation resolution, secret scanning i push protection.</span></div>
+      </div>
+    </section>
+
+    <footer>Standalone explanation UI · nie jest częścią produkcyjnego interfejsu Murmur</footer>
+  </main>
+
+  <script>
+    const tabs = document.querySelectorAll('.tab');
+    const panels = document.querySelectorAll('.tab-panel');
+    const steps = [...document.querySelectorAll('.step')];
+    const writerButtons = document.querySelectorAll('[data-writer]');
+    const scenarioButtons = document.querySelectorAll('[data-scenario]');
+    const goalToggle = document.getElementById('goalToggle');
+    const taskPrompt = document.getElementById('taskPrompt');
+    const startButton = document.getElementById('startButton');
+    const nextButton = document.getElementById('nextButton');
+    const autoButton = document.getElementById('autoButton');
+    const resetButton = document.getElementById('resetButton');
+    const counter = document.getElementById('stepCounter');
+    const owner = document.getElementById('owner');
+    const title = document.getElementById('explanationTitle');
+    const explanation = document.getElementById('explanationText');
+    const artifact = document.getElementById('artifact');
+    const miniLog = document.getElementById('miniLog');
+
+    let writer = 'Claude';
+    let scenario = 'repair';
+    let sequence = [];
+    let cursor = -1;
+    let timer = null;
+    let repairRound = 0;
+
+    const stageCopy = {
+      0: {
+        owner: 'Ty',
+        title: 'Mówisz tylko, czego chcesz',
+        text: 'Nie rozpisujesz architektury agentów. Zadanie może być tak proste jak „napraw X end-to-end”.',
+        artifact: 'prompt: "{{prompt}}"'
+      },
+      1: {
+        owner: '/goal · opcjonalny',
+        title: 'Cel zostaje przypięty do rozmowy',
+        text: 'Goal pomaga przy długiej pracy, ale nie jest mechanizmem testowania. Gdy go wyłączysz, sam harness nadal działa.',
+        artifact: 'goal: outcome + constraints + verification'
+      },
+      2: {
+        owner: 'agent-harness',
+        title: 'Powstaje twardy kontrakt',
+        text: 'Runner zapisuje dozwolone pliki, ryzyka, testy, bazowy commit i przypiętą wersję murmur-server.',
+        artifact: 'task.json · owned_paths · risk_flags · base_sha'
+      },
+      3: {
+        owner: '{{writer}} · writer',
+        title: 'Jeden agent pisze kod',
+        text: 'Writer pracuje w osobnym worktree. Nie może sam zdecydować, że zadanie jest ukończone.',
+        artifact: '../.murmur-agent-tasks/<id>/meetnotes'
+      },
+      4: {
+        owner: 'deterministyczny runner',
+        title: 'Kod przechodzi prawdziwe testy',
+        text: 'Komendy działają offline w sandboxie, bez Twoich tokenów i bez dostępu do danych Murmur. Wynik i logi są hashowane.',
+        artifact: 'cargo test · ng lint · ng build · Playwright'
+      },
+      5: {
+        owner: '{{reviewer}} · reviewer',
+        title: 'Drugi model szuka dziur',
+        text: 'Reviewer dostaje świeżą sesję i próbuje znaleźć crash, wyciek, utratę danych albo niezgodność ze specyfikacją.',
+        artifact: 'spec-review.json · adversarial-review.json'
+      },
+      6: {
+        owner: 'runner · decyzja',
+        title: 'Reviewer znalazł problem',
+        text: 'To nie jest porażka procesu. Konkretne findingi wracają do writera. Pętla ma maksymalnie dwie rundy napraw.',
+        artifact: 'verdict: FAIL · repair_round: {{round}}/2'
+      },
+      7: {
+        owner: 'runner · jedyny właściciel PASS',
+        title: 'Powstaje niepodrabialny PASS',
+        text: 'Attestation wiąże dokładny diff z testami i niezależnymi review. Każda późniejsza edycja unieważnia wynik.',
+        artifact: 'attestation.json · status: PASSED · sha256: …'
+      },
+      8: {
+        owner: 'Git + GitHub',
+        title: 'Dopiero teraz commit i PR',
+        text: 'Runner commitowałby dokładnie sprawdzony indeks. GitHub CI ponownie uruchamia scripts/ci.sh przed mergem.',
+        artifact: 'agent/<task-id> → Pull Request → scripts/ci.sh'
+      }
+    };
+
+    function interpolate(value) {
+      const reviewer = writer === 'Codex' ? 'Claude' : 'Codex';
+      return value
+        .replaceAll('{{writer}}', writer)
+        .replaceAll('{{reviewer}}', reviewer)
+        .replaceAll('{{round}}', String(Math.max(repairRound, 1)))
+        .replaceAll('{{prompt}}', taskPrompt.value.trim() || 'Napraw X end-to-end');
+    }
+
+    tabs.forEach(tab => tab.addEventListener('click', () => {
+      tabs.forEach(item => item.classList.toggle('active', item === tab));
+      panels.forEach(panel => panel.classList.toggle('active', panel.id === tab.dataset.tab));
+    }));
+
+    writerButtons.forEach(button => button.addEventListener('click', () => {
+      writer = button.dataset.writer;
+      writerButtons.forEach(item => item.classList.toggle('active', item === button));
+      if (cursor >= 0) render();
+    }));
+
+    scenarioButtons.forEach(button => button.addEventListener('click', () => {
+      scenario = button.dataset.scenario;
+      scenarioButtons.forEach(item => item.classList.toggle('active', item === button));
+      reset();
+    }));
+
+    function buildSequence() {
+      const base = goalToggle.checked ? [0, 1, 2, 3, 4, 5] : [0, 2, 3, 4, 5];
+      return scenario === 'repair'
+        ? [...base, 6, 3, 4, 5, 7, 8]
+        : [...base, 7, 8];
+    }
+
+    function now() {
+      return new Intl.DateTimeFormat('pl-PL', { hour: '2-digit', minute: '2-digit', second: '2-digit' }).format(new Date());
+    }
+
+    function addLog(message, kind = '') {
+      const line = document.createElement('div');
+      line.className = `log-line ${kind}`;
+      line.innerHTML = `<span class="log-time">${now()}</span><span>${message}</span>`;
+      miniLog.prepend(line);
+      while (miniLog.children.length > 5) miniLog.lastElementChild.remove();
+    }
+
+    function render() {
+      const current = sequence[cursor];
+      const visited = sequence.slice(0, cursor);
+      steps.forEach(step => {
+        const id = Number(step.dataset.step);
+        step.className = 'step';
+        if (!goalToggle.checked && id === 1) step.classList.add('skipped');
+        if (visited.includes(id)) step.classList.add('done');
+        if (id === current) step.classList.add('active');
+        if (scenario === 'repair' && id === 6 && current === 6) step.classList.add('error');
+      });
+
+      if (current === 6) repairRound = 1;
+      const copy = stageCopy[current];
+      owner.textContent = interpolate(copy.owner);
+      title.textContent = interpolate(copy.title);
+      explanation.textContent = interpolate(copy.text);
+      artifact.textContent = interpolate(copy.artifact);
+      counter.textContent = `Krok ${cursor + 1} / ${sequence.length}`;
+      nextButton.disabled = cursor >= sequence.length - 1;
+      autoButton.disabled = cursor >= sequence.length - 1;
+
+      if (current === 6) addLog('review FAIL → wraca do writera', 'bad');
+      else if (current === 7) addLog('niezależny werdykt PASSED', 'ok');
+      else if (current === 8) addLog('commit receipt gotowy', 'ok');
+      else addLog(`${interpolate(copy.owner)}: krok zakończony`);
+    }
+
+    function start() {
+      stopAuto();
+      sequence = buildSequence();
+      cursor = 0;
+      repairRound = 0;
+      miniLog.innerHTML = '';
+      nextButton.disabled = false;
+      autoButton.disabled = false;
+      render();
+    }
+
+    function next() {
+      if (cursor < 0) return start();
+      if (cursor >= sequence.length - 1) return stopAuto();
+      cursor += 1;
+      render();
+      if (cursor >= sequence.length - 1) stopAuto();
+    }
+
+    function stopAuto() {
+      if (timer) window.clearInterval(timer);
+      timer = null;
+      autoButton.textContent = 'Odtwórz automatycznie';
+    }
+
+    function toggleAuto() {
+      if (timer) return stopAuto();
+      if (cursor < 0) start();
+      autoButton.textContent = 'Pauza';
+      timer = window.setInterval(next, 1150);
+    }
+
+    function reset() {
+      stopAuto();
+      cursor = -1;
+      sequence = [];
+      repairRound = 0;
+      steps.forEach(step => {
+        step.className = 'step';
+        if (!goalToggle.checked && Number(step.dataset.step) === 1) step.classList.add('skipped');
+      });
+      counter.textContent = 'Gotowy';
+      owner.textContent = 'Czeka na Ciebie';
+      title.textContent = 'Napisz zadanie';
+      explanation.textContent = 'Nie wybierasz ręcznie każdego agenta. Normalne „napraw X end-to-end” wystarczy, aby workflow dobrał zakres i uruchomił loop.';
+      artifact.textContent = 'Brak artefaktu — symulacja jeszcze nie wystartowała.';
+      miniLog.innerHTML = '<div class="log-line"><span class="log-time">--:--</span><span>loop czeka na zadanie</span></div>';
+      nextButton.disabled = true;
+      autoButton.disabled = true;
+    }
+
+    startButton.addEventListener('click', start);
+    nextButton.addEventListener('click', next);
+    autoButton.addEventListener('click', toggleAuto);
+    resetButton.addEventListener('click', reset);
+    goalToggle.addEventListener('change', reset);
+
+    reset();
+  </script>
+</body>
+</html>

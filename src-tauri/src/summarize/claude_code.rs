@@ -1,10 +1,10 @@
 use std::path::Path;
 use std::process::Stdio;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-use tokio::io::AsyncWriteExt;
-use tokio::process::Command;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::process::{Child, Command};
 
 use crate::error::AppError;
 use crate::summarize::provider::*;
@@ -13,6 +13,462 @@ use crate::summarize::template;
 /// Hard wall-clock ceiling for a single `claude -p` run. A wedged CLI (network stall, hung
 /// node child) is killed rather than blocking the pipeline forever (F6).
 const CLAUDE_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// Separate bounded budget for SIGKILL + reap and for draining already-closed output pipes. The
+/// execution deadline never turns into a second unbounded wait during cleanup.
+const CLAUDE_REAP_TIMEOUT: Duration = Duration::from_secs(5);
+const CLAUDE_AVAILABILITY_TIMEOUT: Duration = Duration::from_secs(5);
+const CLAUDE_STDOUT_LIMIT_BYTES: usize = 8 * 1024 * 1024;
+const CLAUDE_STDERR_LIMIT_BYTES: usize = 1024 * 1024;
+
+#[cfg(unix)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ClaudeGroupState {
+    Active,
+    Unproven,
+}
+
+#[cfg(unix)]
+fn claude_process_groups() -> &'static Mutex<std::collections::HashMap<i32, ClaudeGroupState>> {
+    static GROUPS: OnceLock<Mutex<std::collections::HashMap<i32, ClaudeGroupState>>> =
+        OnceLock::new();
+    GROUPS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+struct ClaudeProcessGroup {
+    #[cfg(unix)]
+    pgid: i32,
+    proven_dead: bool,
+}
+
+impl ClaudeProcessGroup {
+    fn register(child: &Child) -> Self {
+        #[cfg(unix)]
+        {
+            let pgid = child
+                .id()
+                .and_then(|pid| i32::try_from(pid).ok())
+                .unwrap_or(0);
+            if pgid > 0 {
+                claude_process_groups()
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(pgid, ClaudeGroupState::Active);
+            }
+            Self {
+                pgid,
+                proven_dead: false,
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = child;
+            Self { proven_dead: false }
+        }
+    }
+
+    fn pgid(&self) -> Option<i32> {
+        #[cfg(unix)]
+        {
+            (self.pgid > 0).then_some(self.pgid)
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
+    }
+
+    fn mark_proven_dead(&mut self) {
+        #[cfg(unix)]
+        if self.pgid > 0 {
+            claude_process_groups()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&self.pgid);
+        }
+        self.proven_dead = true;
+    }
+}
+
+impl Drop for ClaudeProcessGroup {
+    fn drop(&mut self) {
+        if self.proven_dead {
+            return;
+        }
+        #[cfg(unix)]
+        if self.pgid > 0 {
+            // If recording cancellation already removed this exact PGID after proving the group
+            // empty, do not resurrect it. Otherwise preserve an unproven marker after cancellation,
+            // panic, or teardown failure so later egress/recording admission fails closed.
+            if let Some(state) = claude_process_groups()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get_mut(&self.pgid)
+            {
+                *state = ClaudeGroupState::Unproven;
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn isolate_process_group(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    command.as_std_mut().process_group(0);
+}
+
+#[cfg(not(unix))]
+fn isolate_process_group(_command: &mut Command) {}
+
+#[cfg(unix)]
+fn signal_process_group(pgid: i32, signal: i32) -> crate::error::Result<()> {
+    extern "C" {
+        fn kill(pid: i32, signal: i32) -> i32;
+    }
+    // SAFETY: `pgid` is the positive PID returned for a child spawned into its own process group.
+    // A negative pid targets that group; no pointer crosses the FFI boundary.
+    if unsafe { kill(-pgid, signal) } == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(3) {
+        Ok(()) // ESRCH: the group is already absent.
+    } else {
+        Err(AppError::Summarize(format!(
+            "failed signaling claude process group: {error}"
+        )))
+    }
+}
+
+#[cfg(unix)]
+fn process_group_is_alive(pgid: i32) -> crate::error::Result<bool> {
+    extern "C" {
+        fn kill(pid: i32, signal: i32) -> i32;
+    }
+    // SAFETY: signal 0 performs only an existence/permission check for the owned process group.
+    if unsafe { kill(-pgid, 0) } == 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(3) => Ok(false), // ESRCH
+        Some(1) => Ok(true),  // EPERM still proves a group exists.
+        _ => Err(AppError::Summarize(format!(
+            "failed checking claude process group: {error}"
+        ))),
+    }
+}
+
+#[cfg(not(unix))]
+fn process_group_is_alive(_pgid: i32) -> crate::error::Result<bool> {
+    Ok(false)
+}
+
+pub(crate) fn has_unproven_process_group() -> bool {
+    #[cfg(unix)]
+    {
+        claude_process_groups()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .any(|state| *state == ClaudeGroupState::Unproven)
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+type PipeReadTask = tokio::task::JoinHandle<std::io::Result<Vec<u8>>>;
+
+fn spawn_pipe_reader<R>(mut pipe: R, limit: usize) -> PipeReadTask
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        let mut chunk = [0_u8; 8192];
+        let mut exceeded = false;
+        loop {
+            let read = pipe.read(&mut chunk).await?;
+            if read == 0 {
+                return if exceeded {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "claude output exceeded bounded limit",
+                    ))
+                } else {
+                    Ok(bytes)
+                };
+            }
+            let remaining = limit.saturating_sub(bytes.len());
+            let retained = read.min(remaining);
+            bytes.extend_from_slice(&chunk[..retained]);
+            if retained < read {
+                exceeded = true;
+            }
+            // Keep draining after the cap so a full pipe cannot prevent process exit/reap.
+        }
+    })
+}
+
+async fn kill_and_prove_group_dead(
+    pgid: Option<i32>,
+    deadline: tokio::time::Instant,
+) -> crate::error::Result<()> {
+    let Some(pgid) = pgid else {
+        return Ok(());
+    };
+    #[cfg(unix)]
+    signal_process_group(pgid, 9)?;
+    loop {
+        if !process_group_is_alive(pgid)? {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(AppError::Summarize(
+                "claude process group remained alive after teardown deadline".into(),
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Recording-priority cancellation for active OR previously unproven Claude CLI groups. The CLI is
+/// cloud-bound and may have a Node descendant holding pipes/network after its direct parent exits;
+/// Start may proceed only after every isolated group is proven absent.
+pub(crate) async fn kill_for_recording(timeout: Duration) -> crate::error::Result<bool> {
+    #[cfg(not(unix))]
+    {
+        let _ = timeout;
+        return Ok(true);
+    }
+    #[cfg(unix)]
+    {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let groups = claude_process_groups()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .keys()
+                .copied()
+                .collect::<Vec<_>>();
+            if groups.is_empty() {
+                return Ok(true);
+            }
+            for pgid in groups {
+                signal_process_group(pgid, 9)?;
+                if !process_group_is_alive(pgid)? {
+                    claude_process_groups()
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .remove(&pgid);
+                }
+            }
+            if claude_process_groups()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty()
+            {
+                return Ok(true);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Ok(false);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+}
+
+async fn kill_and_reap_claude(
+    child: &mut Child,
+    group: &mut ClaudeProcessGroup,
+) -> crate::error::Result<()> {
+    let deadline = tokio::time::Instant::now() + CLAUDE_REAP_TIMEOUT;
+    let pre_kill_error = match child.try_wait() {
+        Ok(Some(_)) => None,
+        Ok(None) => None,
+        // Still attempt kill when status observation itself fails. If teardown also fails, retain
+        // this diagnostic rather than abandoning a potentially live cloud CLI child.
+        Err(error) => Some(error),
+    };
+
+    #[cfg(unix)]
+    if let Some(pgid) = group.pgid() {
+        signal_process_group(pgid, 9)?;
+    }
+    if let Err(kill_error) = child.start_kill() {
+        return match child.try_wait() {
+            Ok(Some(_)) => {
+                kill_and_prove_group_dead(group.pgid(), deadline).await?;
+                group.mark_proven_dead();
+                Ok(())
+            }
+            Ok(None) => Err(AppError::Summarize(match pre_kill_error {
+                Some(precheck) => format!(
+                    "failed checking claude status before teardown: {precheck}; failed to kill claude: {kill_error}"
+                ),
+                None => format!("failed to kill claude after deadline: {kill_error}"),
+            })),
+            Err(wait_error) => Err(AppError::Summarize(format!(
+                "failed to kill claude after deadline: {kill_error}; status check failed: {wait_error}"
+            ))),
+        };
+    }
+
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    match tokio::time::timeout(remaining, child.wait()).await {
+        Ok(Ok(_)) => {
+            kill_and_prove_group_dead(group.pgid(), deadline).await?;
+            group.mark_proven_dead();
+            Ok(())
+        }
+        Ok(Err(error)) => Err(AppError::Summarize(format!(
+            "failed to reap claude after kill: {error}"
+        ))),
+        Err(_) => Err(AppError::Summarize(format!(
+            "claude did not reap within {}s after kill",
+            CLAUDE_REAP_TIMEOUT.as_secs()
+        ))),
+    }
+}
+
+async fn collect_claude_output(
+    mut stdout_task: PipeReadTask,
+    mut stderr_task: PipeReadTask,
+) -> crate::error::Result<(Vec<u8>, Vec<u8>)> {
+    let drains = async { tokio::join!(&mut stdout_task, &mut stderr_task) };
+
+    match tokio::time::timeout(CLAUDE_REAP_TIMEOUT, drains).await {
+        Ok((stdout, stderr)) => {
+            let stdout = stdout
+                .map_err(|error| {
+                    AppError::Summarize(format!("claude stdout reader failed: {error}"))
+                })?
+                .map_err(|error| {
+                    AppError::Summarize(format!("failed reading claude stdout: {error}"))
+                })?;
+            let stderr = stderr
+                .map_err(|error| {
+                    AppError::Summarize(format!("claude stderr reader failed: {error}"))
+                })?
+                .map_err(|error| {
+                    AppError::Summarize(format!("failed reading claude stderr: {error}"))
+                })?;
+            Ok((stdout, stderr))
+        }
+        Err(_) => {
+            stdout_task.abort();
+            stderr_task.abort();
+            Err(AppError::Summarize(
+                "claude output pipes did not close after process exit".into(),
+            ))
+        }
+    }
+}
+
+/// Own one complete CLI transaction: stdin write + EOF + process wait all share the same hard
+/// deadline. Stdout/stderr are drained concurrently so neither pipe can back-pressure the child.
+/// Every error path explicitly kill/reaps before returning; `kill_on_drop` remains the cancellation
+/// belt when the caller itself drops this future.
+async fn run_claude_child(
+    mut child: Child,
+    stdin_content: &[u8],
+) -> crate::error::Result<std::process::Output> {
+    let mut process_group = ClaudeProcessGroup::register(&child);
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            let teardown = kill_and_reap_claude(&mut child, &mut process_group).await;
+            return match teardown {
+                Ok(()) => Err(AppError::Summarize("failed to open claude stdout".into())),
+                Err(error) => Err(AppError::Summarize(format!(
+                    "failed to open claude stdout; teardown failed: {error}"
+                ))),
+            };
+        }
+    };
+    let stderr = match child.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            let teardown = kill_and_reap_claude(&mut child, &mut process_group).await;
+            return match teardown {
+                Ok(()) => Err(AppError::Summarize("failed to open claude stderr".into())),
+                Err(error) => Err(AppError::Summarize(format!(
+                    "failed to open claude stderr; teardown failed: {error}"
+                ))),
+            };
+        }
+    };
+    let stdout_task = spawn_pipe_reader(stdout, CLAUDE_STDOUT_LIMIT_BYTES);
+    let stderr_task = spawn_pipe_reader(stderr, CLAUDE_STDERR_LIMIT_BYTES);
+
+    let execution = tokio::time::timeout(CLAUDE_TIMEOUT, async {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| AppError::Summarize("failed to open claude stdin".into()))?;
+        stdin.write_all(stdin_content).await.map_err(|error| {
+            AppError::Summarize(format!("failed writing to claude stdin: {error}"))
+        })?;
+        stdin.shutdown().await.map_err(|error| {
+            AppError::Summarize(format!("failed closing claude stdin: {error}"))
+        })?;
+        drop(stdin);
+        child
+            .wait()
+            .await
+            .map_err(|error| AppError::Summarize(format!("failed waiting on claude: {error}")))
+    })
+    .await;
+
+    let status = match execution {
+        Ok(Ok(status)) => status,
+        Ok(Err(primary)) => {
+            let teardown = kill_and_reap_claude(&mut child, &mut process_group).await;
+            stdout_task.abort();
+            stderr_task.abort();
+            return match teardown {
+                Ok(()) => Err(primary),
+                Err(error) => Err(AppError::Summarize(format!(
+                    "{primary}; teardown failed: {error}"
+                ))),
+            };
+        }
+        Err(_) => {
+            let teardown = kill_and_reap_claude(&mut child, &mut process_group).await;
+            stdout_task.abort();
+            stderr_task.abort();
+            return match teardown {
+                Ok(()) => Err(AppError::Summarize(format!(
+                    "claude timed out after {}s",
+                    CLAUDE_TIMEOUT.as_secs()
+                ))),
+                Err(error) => Err(AppError::Summarize(format!(
+                    "claude timed out after {}s; teardown failed: {error}",
+                    CLAUDE_TIMEOUT.as_secs()
+                ))),
+            };
+        }
+    };
+
+    // The direct CLI exited, but Node/tooling descendants may still own network connections or
+    // inherited stdout/stderr. Kill the isolated group and prove it empty before releasing output
+    // or the caller's external-egress lease.
+    kill_and_prove_group_dead(
+        process_group.pgid(),
+        tokio::time::Instant::now() + CLAUDE_REAP_TIMEOUT,
+    )
+    .await?;
+    process_group.mark_proven_dead();
+
+    let (stdout, stderr) = collect_claude_output(stdout_task, stderr_task).await?;
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
 
 /// Minimal, non-secret environment a child `claude` (and the `node` it spawns) needs. We start
 /// from an EMPTY environment (`env_clear`) and re-add ONLY these, so `MURMUR_DEV_*`, API keys,
@@ -285,6 +741,17 @@ impl SummarizerProvider for ClaudeCodeProvider {
     /// Probe whether the `claude` binary is reachable by running `claude --version`.
     /// Non-failing: any spawn/exec/validation error is reported as `Unavailable`.
     async fn availability(&self) -> Availability {
+        // The probe is local, but it still spawns the same Node-backed executable. Admit it through
+        // the external-process lane so recording Start cannot observe an empty group registry and
+        // then have `--version` spawn in the final check-to-capture gap.
+        let _process_lease = match crate::perf::acquire_external_egress_lease(None) {
+            Ok(lease) => lease,
+            Err(error) => {
+                return Availability::Unavailable {
+                    reason: error.to_string(),
+                }
+            }
+        };
         let bin = match resolve_binary(&self.binary) {
             Ok(b) => b,
             Err(e) => {
@@ -299,8 +766,49 @@ impl SummarizerProvider for ClaudeCodeProvider {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .kill_on_drop(true);
+        isolate_process_group(&mut cmd);
         harden_env(&mut cmd, self.inherit_env); // F2: env_clear + minimal PATH so no secrets leak to the child.
-        match cmd.status().await {
+        let mut child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                return Availability::Unavailable {
+                    reason: format!("`{bin}` not found ({error})"),
+                }
+            }
+        };
+        let mut process_group = ClaudeProcessGroup::register(&child);
+        let status = match tokio::time::timeout(CLAUDE_AVAILABILITY_TIMEOUT, child.wait()).await {
+            Ok(Ok(status)) => {
+                match kill_and_prove_group_dead(
+                    process_group.pgid(),
+                    tokio::time::Instant::now() + CLAUDE_REAP_TIMEOUT,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        process_group.mark_proven_dead();
+                        Ok(status)
+                    }
+                    Err(error) => Err(format!("`{bin} --version` teardown failed ({error})")),
+                }
+            }
+            Ok(Err(error)) => match kill_and_reap_claude(&mut child, &mut process_group).await {
+                Ok(()) => Err(format!("`{bin} --version` wait failed ({error})")),
+                Err(teardown) => Err(format!(
+                    "`{bin} --version` wait failed ({error}); teardown failed ({teardown})"
+                )),
+            },
+            Err(_) => match kill_and_reap_claude(&mut child, &mut process_group).await {
+                Ok(()) => Err(format!(
+                    "`{bin} --version` timed out after {}s",
+                    CLAUDE_AVAILABILITY_TIMEOUT.as_secs()
+                )),
+                Err(error) => Err(format!(
+                    "`{bin} --version` timed out and teardown failed ({error})"
+                )),
+            },
+        };
+        match status {
             Ok(status) if status.success() => Availability::Available,
             Ok(status) => Availability::Unavailable {
                 reason: format!(
@@ -308,9 +816,7 @@ impl SummarizerProvider for ClaudeCodeProvider {
                     status.code().unwrap_or(-1)
                 ),
             },
-            Err(e) => Availability::Unavailable {
-                reason: format!("`{bin}` not found ({e})"),
-            },
+            Err(reason) => Availability::Unavailable { reason },
         }
     }
 
@@ -330,42 +836,10 @@ impl SummarizerProvider for ClaudeCodeProvider {
 
         let bin = resolve_binary(&self.binary)?;
         let mut cmd = build_claude_command(&bin, &system_prompt, &self.model, self.inherit_env);
-        let mut child = cmd
+        let child = cmd
             .spawn()
             .map_err(|e| AppError::Summarize(format!("failed to spawn `{bin}`: {e}")))?;
-
-        // Write the transcript to stdin, then drop the handle to signal EOF.
-        {
-            let mut stdin = child
-                .stdin
-                .take()
-                .ok_or_else(|| AppError::Summarize("failed to open claude stdin".into()))?;
-            stdin
-                .write_all(stdin_content.as_bytes())
-                .await
-                .map_err(|e| AppError::Summarize(format!("failed writing to claude stdin: {e}")))?;
-            stdin
-                .shutdown()
-                .await
-                .map_err(|e| AppError::Summarize(format!("failed closing claude stdin: {e}")))?;
-        }
-
-        // F6: bound the run. On timeout, kill the child (kill_on_drop also covers this) and fail.
-        let output = match tokio::time::timeout(CLAUDE_TIMEOUT, child.wait_with_output()).await {
-            Ok(Ok(out)) => out,
-            Ok(Err(e)) => {
-                return Err(AppError::Summarize(format!(
-                    "failed waiting on claude: {e}"
-                )))
-            }
-            Err(_elapsed) => {
-                // The future is dropped here → kill_on_drop(true) reaps the process.
-                return Err(AppError::Summarize(format!(
-                    "claude timed out after {}s",
-                    CLAUDE_TIMEOUT.as_secs()
-                )));
-            }
-        };
+        let output = run_claude_child(child, stdin_content.as_bytes()).await?;
 
         if !output.status.success() {
             // F6: never echo claude's stderr at a PII-retaining level (it can carry prompt/transcript
@@ -407,38 +881,10 @@ impl SummarizerProvider for ClaudeCodeProvider {
         // `GatedToolExecutor` parses + executes) — it needs ZERO claude native tools or MCP, so this
         // isolation FIXES the Ask self-loop (no more `mcp__murmur*`) rather than breaking Ask.
         let mut cmd = build_claude_command(&bin, system, &self.model, self.inherit_env);
-        let mut child = cmd
+        let child = cmd
             .spawn()
             .map_err(|e| AppError::Summarize(format!("failed to spawn `{bin}`: {e}")))?;
-        {
-            let mut stdin = child
-                .stdin
-                .take()
-                .ok_or_else(|| AppError::Summarize("failed to open claude stdin".into()))?;
-            stdin
-                .write_all(user.as_bytes())
-                .await
-                .map_err(|e| AppError::Summarize(format!("failed writing to claude stdin: {e}")))?;
-            stdin
-                .shutdown()
-                .await
-                .map_err(|e| AppError::Summarize(format!("failed closing claude stdin: {e}")))?;
-        }
-        // F6: bound the run; on timeout the dropped future + kill_on_drop reaps the child.
-        let output = match tokio::time::timeout(CLAUDE_TIMEOUT, child.wait_with_output()).await {
-            Ok(Ok(out)) => out,
-            Ok(Err(e)) => {
-                return Err(AppError::Summarize(format!(
-                    "failed waiting on claude: {e}"
-                )))
-            }
-            Err(_elapsed) => {
-                return Err(AppError::Summarize(format!(
-                    "claude timed out after {}s",
-                    CLAUDE_TIMEOUT.as_secs()
-                )))
-            }
-        };
+        let output = run_claude_child(child, user.as_bytes()).await?;
         if !output.status.success() {
             // F6: suppress stderr content (may carry prompt/transcript text); code only. Same
             // actionable error + opt-in capture as `summarize`.
@@ -466,7 +912,8 @@ impl SummarizerProvider for ClaudeCodeProvider {
 /// `complete`) — the single testable SEAM for the hermeticity flags (F1). Sets, in order:
 /// `-p`, `--system-prompt <system>`, `--allowedTools ""` (fail-closed tool isolation),
 /// `--strict-mcp-config` (zero ambient MCP servers), the optional `--model <id>`, piped stdio,
-/// `kill_on_drop` (F6), and the hardened env (F2). The caller only writes stdin + reaps the child.
+/// `kill_on_drop` (F6), and the hardened env (F2). [`run_claude_child`] owns stdin + wait + teardown
+/// under one deadline.
 ///
 /// Keeping this in ONE place is what lets a unit test assert (via `get_args()`) that every real spawn
 /// carries `--allowedTools ""` + `--strict-mcp-config` — a drift-proof guard against the egress hole
@@ -489,6 +936,7 @@ fn build_claude_command(bin: &str, system_prompt: &str, model: &str, inherit_env
         .kill_on_drop(true); // F6: a dropped future (cancel/panic/timeout) reaps the child.
                              // Brain/AI model override: add `--model` only when the user picked one.
     cmd.args(model_args(model));
+    isolate_process_group(&mut cmd);
     harden_env(&mut cmd, inherit_env); // F2: env_clear + minimal PATH (or inherit-minus-secrets).
     cmd
 }
@@ -621,7 +1069,10 @@ mod tests {
         // user's ambient MCP servers. RED before those flags were added, GREEN after.
         let cmd = build_claude_command("claude", "SYSTEM PROMPT", "", false);
         let args = args_of(&cmd);
-        assert!(args.contains(&"-p".to_string()), "headless print mode: {args:?}");
+        assert!(
+            args.contains(&"-p".to_string()),
+            "headless print mode: {args:?}"
+        );
         assert!(
             args.contains(&"--strict-mcp-config".to_string()),
             "F1: must pass --strict-mcp-config to load ZERO ambient MCP servers: {args:?}"

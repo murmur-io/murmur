@@ -83,7 +83,7 @@ is `"Untitled"` (or empty) **and** the body is non-empty → generate a title. (
 notkę to się generuje tytuł jak jest Untitled"*.)
 
 ### Model — local only
-Use the on-device brain sidecar (`meetnotes-brain`, mistralrs) with a short prompt ("a 3–6 word title
+Use the on-device brain sidecar (`murmur-brain`, mistralrs) with a short prompt ("a 3–6 word title
 for this note: <body excerpt>"). **Local-only, zero egress.**
 - **Fallback** when the brain model isn't downloaded / the sidecar isn't ready: derive a title from the
   first non-empty line of the body (the `derive_artifact_title`-style heuristic already in the tree).

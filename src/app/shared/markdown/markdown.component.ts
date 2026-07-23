@@ -7,9 +7,10 @@ import {
   inject,
   input,
 } from "@angular/core";
-import { marked } from "marked";
+import { marked, type Tokens } from "marked";
 import DOMPurify from "dompurify";
 import { IpcService } from "../../core/ipc.service";
+import type { NoteAttachmentDto } from "../../core/models";
 import { TabsService } from "../../core/tabs.service";
 import { DocumentPreviewService } from "../../services/document-preview.service";
 import { ToastService } from "../../services/toast.service";
@@ -67,8 +68,12 @@ export class MarkdownComponent {
 
   readonly markdown = input<string>("");
   readonly compact = input(false, { transform: booleanAttribute });
+  /** Gated attachment DTOs for the current content owner. */
+  readonly attachments = input<readonly NoteAttachmentDto[]>([]);
 
-  readonly html = computed(() => this.render(this.markdown() ?? ""));
+  readonly html = computed(() =>
+    this.render(this.markdown() ?? "", this.attachments()),
+  );
 
   /** Click anywhere in the rendered markdown — act only when a `.md-wikilink` chip was hit. */
   onClick(ev: Event): void {
@@ -150,16 +155,46 @@ export class MarkdownComponent {
     }
   }
 
-  private render(src: string): string {
+  private render(
+    src: string,
+    attachments: readonly NoteAttachmentDto[],
+  ): string {
     let text = this.stripFrontMatter(src);
+    // Raw HTML image/picture/source tags never reach the DOM. The only renderable
+    // image route is a gated opaque attachment id below.
+    text = text.replace(
+      /<\s*\/?\s*(?:img|picture|source)\b[^>]*>/gi,
+      '<span class="md-image-blocked">External image blocked for privacy</span>',
+    );
     // [[Wikilink]] / [[Wikilink|alias]] → clickable accent chip (marked passes raw HTML through).
     // The chip's TEXT is the title — no `data-*` attribute (Angular's `[innerHTML]` sanitizer
     // strips those; see the class doc's ROOT-CAUSE FIX note), so `chipTitle()` reads `textContent`.
-    text = text.replace(/\[\[([^\]|]+)(?:\|[^\]]+)?\]\]/g, (_m, t: string) => {
-      const safe = this.escapeHtml(t.trim());
-      return `<span class="md-wikilink" role="link" tabindex="0">${safe}</span>`;
+    // Capture the preceding character so `![[embed]]` is not corrupted on older WKWebView.
+    text = text.replace(
+      /(^|[^!])\[\[([^\]|]+)(?:\|[^\]]+)?\]\]/g,
+      (_m, prefix: string, title: string) => {
+        const safe = this.escapeHtml(title.trim());
+        return `${prefix}<span class="md-wikilink" role="link" tabindex="0">${safe}</span>`;
+      },
+    );
+
+    const byId = new Map(
+      attachments.map((attachment) => [attachment.id.toLowerCase(), attachment]),
+    );
+    const renderer = new marked.Renderer();
+    renderer.image = (token: Tokens.Image): string =>
+      this.renderImage(token, byId);
+    renderer.html = ({ text: html }: Tokens.HTML): string =>
+      /<\s*\/?\s*(?:img|picture|source)\b/i.test(html)
+        ? '<span class="md-image-blocked">External image blocked for privacy</span>'
+        : html;
+
+    const out = marked.parse(text, {
+      async: false,
+      gfm: true,
+      breaks: true,
+      renderer,
     });
-    const out = marked.parse(text, { async: false, gfm: true, breaks: true });
     const raw = typeof out === "string" ? out : src;
     // Sanitize the parsed HTML before it is bound to [innerHTML]. The source is untrusted
     // (LLM output / transcript), so DOMPurify is the authoritative XSS gate — no
@@ -167,8 +202,44 @@ export class MarkdownComponent {
     // (both survive Angular's OWN sanitizer pass too, unlike a custom `data-*` attribute).
     return DOMPurify.sanitize(raw, {
       USE_PROFILES: { html: true },
-      ADD_ATTR: ["role", "tabindex"],
+      ADD_ATTR: ["role", "tabindex", "aria-label", "loading", "decoding"],
     });
+  }
+
+  /** Render only a canonical attachment URI whose DTO/data URL passes every check. */
+  private renderImage(
+    token: Tokens.Image,
+    byId: ReadonlyMap<string, NoteAttachmentDto>,
+  ): string {
+    const match = /^murmur-attachment:\/\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i.exec(
+      token.href,
+    );
+    const alt = token.text.trim() || "Image";
+    if (!match) {
+      return `<span class="md-image-blocked">${this.escapeHtml(alt)} — external image blocked for privacy</span>`;
+    }
+    const attachment = byId.get(match[1].toLowerCase());
+    if (!attachment || !this.isSafeDataUrl(attachment)) {
+      return `<span class="md-image-unavailable" role="status">${this.escapeHtml(alt)} — image unavailable</span>`;
+    }
+    const safeAlt = this.escapeHtml(alt);
+    const caption = (token.title?.trim() || alt).trim();
+    const safeCaption = this.escapeHtml(caption);
+    return `<span class="md-attachment" role="figure" aria-label="${safeCaption}"><img src="${attachment.dataUrl}" alt="${safeAlt}" loading="lazy" decoding="async"><span class="md-attachment-caption">${safeCaption}</span></span>`;
+  }
+
+  /** Data URLs are accepted only for a verified raster MIME matching the DTO. */
+  private isSafeDataUrl(attachment: NoteAttachmentDto): boolean {
+    const mimeType = attachment.mimeType.toLowerCase();
+    if (!["image/png", "image/jpeg", "image/webp"].includes(mimeType)) {
+      return false;
+    }
+    const prefix = `data:${mimeType};base64,`;
+    if (!attachment.dataUrl.startsWith(prefix)) {
+      return false;
+    }
+    const payload = attachment.dataUrl.slice(prefix.length);
+    return payload.length > 0 && /^[a-z0-9+/]+={0,2}$/i.test(payload);
   }
 
   private escapeHtml(s: string): string {

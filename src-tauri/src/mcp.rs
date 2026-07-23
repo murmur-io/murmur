@@ -774,9 +774,10 @@ mod tests {
         let _ = std::fs::remove_file(&p);
     }
 
-    /// Flag ON: `search_semantic` routes through `search_hybrid_visible`, which applies the SAME
-    /// visibility gate as `search_meetings`. A sealed-and-not-unlocked meeting is EXCLUDED from the
-    /// results and reappears once its folder is session-unlocked.
+    /// Flag ON: both the real-model hybrid route and its model-unavailable keyword fallback apply
+    /// the SAME visibility gate as `search_meetings`. Unit tests deliberately take the fallback so
+    /// a developer's installed Metal model is never loaded; the DB-level test exercises the vector
+    /// gate directly. A sealed-and-not-unlocked meeting is excluded and reappears after unlock.
     #[test]
     fn search_semantic_is_visibility_gated_when_enabled() {
         use crate::storage::models::Folder;
@@ -812,9 +813,14 @@ mod tests {
             Some("f-lock"),
         );
 
-        let emb = crate::embed::active_embedder();
-        db.index_meeting_chunks("open", &[], emb.as_ref()).unwrap();
-        db.index_meeting_chunks("sealed", &[], emb.as_ref()).unwrap();
+        // Seed deterministic vector rows directly. Holding an admitted active-model handle across
+        // `dispatch_tool` would also hold the model-selection read barrier while AppConfig::load
+        // republishes that selection, creating a same-thread read→write deadlock. MCP behavior is
+        // what this test owns; real-model loading is covered by the embedder tests / Mac bake-off.
+        let emb = crate::embed::StubEmbedder;
+        db.index_meeting_chunks("open", &[], &emb).unwrap();
+        db.index_meeting_chunks("sealed", &[], &emb)
+            .unwrap();
         // Seal the folder AFTER indexing (a stray vec row now exists for a sealed meeting).
         db.set_folder_locked("f-lock", true, None).unwrap();
 
@@ -822,6 +828,10 @@ mod tests {
 
         // Not unlocked → sealed meeting must NOT appear.
         let out = dispatch_tool(&db, "search_semantic", &args, &HashSet::new()).unwrap();
+        assert!(
+            out.contains("semantic model is not installed"),
+            "unit tests must stay on the bounded model-free fallback: {out}"
+        );
         assert!(out.contains("id:open"), "open meeting must surface");
         assert!(
             !out.contains("id:sealed"),
@@ -980,7 +990,12 @@ mod tests {
         );
 
         // Missing required `folder` arg is an InvalidArg (JSON-RPC -32602), never a silent all-rows.
-        let bad = dispatch_tool(&db, "query_database", &json!({ "filter": "x=y" }), &unlocked);
+        let bad = dispatch_tool(
+            &db,
+            "query_database",
+            &json!({ "filter": "x=y" }),
+            &unlocked,
+        );
         assert!(bad.is_err(), "query_database requires a folder argument");
         let _ = std::fs::remove_file(&p);
     }
@@ -1120,8 +1135,13 @@ mod tests {
             })
         };
         // Seed Atlas.status = in-progress (open) on m_open1.
-        db.apply_fact_ops(&[add("status", "in-progress", "2026-06-01T00:00:00Z", "m_open1")])
-            .unwrap();
+        db.apply_fact_ops(&[add(
+            "status",
+            "in-progress",
+            "2026-06-01T00:00:00Z",
+            "m_open1",
+        )])
+        .unwrap();
         // The reconcile-style change: close in-progress @2026-06-20 (Invalidate the minted row) and
         // open shipped on m_open2 — a real supersession, built exactly like `apply_fact_ops` does.
         let ip_id = db
@@ -1140,8 +1160,13 @@ mod tests {
         ])
         .unwrap();
         // The SEALED-source fact whose object must never leak while the folder is sealed.
-        db.apply_fact_ops(&[add("budget", "SECRET-42M", "2026-06-15T00:00:00Z", "m_sealed")])
-            .unwrap();
+        db.apply_fact_ops(&[add(
+            "budget",
+            "SECRET-42M",
+            "2026-06-15T00:00:00Z",
+            "m_sealed",
+        )])
+        .unwrap();
 
         db.set_folder_locked("f-lock", true, None).unwrap();
 
@@ -1173,9 +1198,27 @@ mod tests {
         );
 
         // Missing required args are InvalidArg (-32602), never a silent all-facts read.
-        assert!(dispatch_tool(&db, "knowledge_diff", &json!({ "from": "x", "to": "y" }), &unlocked).is_err());
-        assert!(dispatch_tool(&db, "knowledge_diff", &json!({ "entity": "Atlas", "to": "y" }), &unlocked).is_err());
-        assert!(dispatch_tool(&db, "knowledge_diff", &json!({ "entity": "Atlas", "from": "x" }), &unlocked).is_err());
+        assert!(dispatch_tool(
+            &db,
+            "knowledge_diff",
+            &json!({ "from": "x", "to": "y" }),
+            &unlocked
+        )
+        .is_err());
+        assert!(dispatch_tool(
+            &db,
+            "knowledge_diff",
+            &json!({ "entity": "Atlas", "to": "y" }),
+            &unlocked
+        )
+        .is_err());
+        assert!(dispatch_tool(
+            &db,
+            "knowledge_diff",
+            &json!({ "entity": "Atlas", "from": "x" }),
+            &unlocked
+        )
+        .is_err());
 
         // Unknown entity → friendly non-leaking message (never an error).
         let none = dispatch_tool(
@@ -1185,7 +1228,10 @@ mod tests {
             &HashSet::new(),
         )
         .unwrap();
-        assert!(none.contains("No visible entity"), "unknown entity → friendly message");
+        assert!(
+            none.contains("No visible entity"),
+            "unknown entity → friendly message"
+        );
 
         let _ = std::fs::remove_file(&p);
     }
@@ -1222,14 +1268,23 @@ mod tests {
         // Locked, not unlocked → masked sentinel, no body/title.
         let out = dispatch_tool(&db, "get_document", &args, &HashSet::new()).unwrap();
         assert_eq!(out, "No data for document note-1.");
-        assert!(!out.contains("classified"), "sealed document body leaked via MCP get_document");
+        assert!(
+            !out.contains("classified"),
+            "sealed document body leaked via MCP get_document"
+        );
 
         // Session-unlock → body reappears.
         let mut unlocked = HashSet::new();
         unlocked.insert("f-lock".to_string());
         let out2 = dispatch_tool(&db, "get_document", &args, &unlocked).unwrap();
-        assert!(out2.contains("the classified body text"), "unlocked body must reappear: {out2}");
-        assert!(out2.contains("TITLE: [[Secret Note]]"), "title must render: {out2}");
+        assert!(
+            out2.contains("the classified body text"),
+            "unlocked body must reappear: {out2}"
+        );
+        assert!(
+            out2.contains("TITLE: [[Secret Note]]"),
+            "title must render: {out2}"
+        );
         let _ = std::fs::remove_file(&p);
     }
 
@@ -1252,15 +1307,31 @@ mod tests {
         .unwrap();
         // A body LARGER than the default window so the flood is measurable.
         let big = "A".repeat(MCP_DEFAULT_WINDOW_CHARS + 5000);
-        db.insert_document("bigdoc", "f-open", "big.md", &big, "document", 1_700_000_000)
-            .unwrap();
+        db.insert_document(
+            "bigdoc",
+            "f-open",
+            "big.md",
+            &big,
+            "document",
+            1_700_000_000,
+        )
+        .unwrap();
 
         // Default (no paging) → bounded to MCP_DEFAULT_WINDOW_CHARS + a disclosure header showing
         // the TRUE total; NOT the whole 11000-char body.
-        let out = dispatch_tool(&db, "get_document", &json!({ "documentId": "bigdoc" }), &HashSet::new())
-            .unwrap();
+        let out = dispatch_tool(
+            &db,
+            "get_document",
+            &json!({ "documentId": "bigdoc" }),
+            &HashSet::new(),
+        )
+        .unwrap();
         assert!(
-            out.contains(&format!("BODY (TOTAL_CHARS: {} (showing 0..{}))", big.chars().count(), MCP_DEFAULT_WINDOW_CHARS)),
+            out.contains(&format!(
+                "BODY (TOTAL_CHARS: {} (showing 0..{}))",
+                big.chars().count(),
+                MCP_DEFAULT_WINDOW_CHARS
+            )),
             "the MCP default must disclose the true total + the bounded window: {}",
             &out[..out.len().min(120)]
         );
@@ -1285,8 +1356,15 @@ mod tests {
             &HashSet::new(),
         )
         .unwrap();
-        assert!(full.contains("[end of content]"), "an explicit full window reaches the end: last 60 = {}", &full[full.len().saturating_sub(60)..]);
-        assert!(full.len() > out.len(), "explicit large maxChars returns more than the default window");
+        assert!(
+            full.contains("[end of content]"),
+            "an explicit full window reaches the end: last 60 = {}",
+            &full[full.len().saturating_sub(60)..]
+        );
+        assert!(
+            full.len() > out.len(),
+            "explicit large maxChars returns more than the default window"
+        );
         let _ = std::fs::remove_file(&p);
     }
 
@@ -1321,23 +1399,42 @@ mod tests {
             },
         ];
         let stored = crate::extract::blocks_to_stored_text(&blocks);
-        db.insert_document("od1", "f-lock", "spec.pdf", &stored, "document", 1_700_000_000)
-            .unwrap();
+        db.insert_document(
+            "od1",
+            "f-lock",
+            "spec.pdf",
+            &stored,
+            "document",
+            1_700_000_000,
+        )
+        .unwrap();
         db.index_document_chunks("od1", None).unwrap();
         db.set_folder_locked("f-lock", true, None).unwrap();
 
         let args = json!({ "documentId": "od1" });
         // Locked, not unlocked → the "no outline" sentinel; the heading trail must NOT leak.
         let out = dispatch_tool(&db, "get_document_outline", &args, &HashSet::new()).unwrap();
-        assert!(out.contains("No outline for document od1"), "sealed → sentinel: {out}");
-        assert!(!out.contains("SecretDesign"), "sealed document headings leaked via MCP outline: {out}");
+        assert!(
+            out.contains("No outline for document od1"),
+            "sealed → sentinel: {out}"
+        );
+        assert!(
+            !out.contains("SecretDesign"),
+            "sealed document headings leaked via MCP outline: {out}"
+        );
 
         // Session-unlock → the heading map reappears in document order.
         let mut unlocked = HashSet::new();
         unlocked.insert("f-lock".to_string());
         let out2 = dispatch_tool(&db, "get_document_outline", &args, &unlocked).unwrap();
-        assert!(out2.contains("SecretDesign (p.1)"), "unlocked outline lists section + page: {out2}");
-        assert!(out2.contains("SecretDesign › Keys (p.2)"), "document order preserved: {out2}");
+        assert!(
+            out2.contains("SecretDesign (p.1)"),
+            "unlocked outline lists section + page: {out2}"
+        );
+        assert!(
+            out2.contains("SecretDesign › Keys (p.2)"),
+            "document order preserved: {out2}"
+        );
         let _ = std::fs::remove_file(&p);
     }
 
@@ -1387,10 +1484,21 @@ mod tests {
         // Default (no transcriptFormat) → STRUCTURED (speaker label + timestamp token). Audit
         // Fix 2: the MCP default now bounds+discloses the transcript window, so the section header
         // carries a `TOTAL_CHARS: …` disclosure (the whole short transcript fits the 6000 window).
-        let def = dispatch_tool(&db, "get_meeting", &json!({ "meetingId": "mm" }), &HashSet::new())
-            .unwrap();
-        assert!(def.contains("Me: opening remarks"), "default must be structured: {def}");
-        assert!(def.contains("[5–8]"), "default must carry a timestamp token: {def}");
+        let def = dispatch_tool(
+            &db,
+            "get_meeting",
+            &json!({ "meetingId": "mm" }),
+            &HashSet::new(),
+        )
+        .unwrap();
+        assert!(
+            def.contains("Me: opening remarks"),
+            "default must be structured: {def}"
+        );
+        assert!(
+            def.contains("[5–8]"),
+            "default must carry a timestamp token: {def}"
+        );
         assert!(
             def.contains("TRANSCRIPT (TOTAL_CHARS:"),
             "the MCP default now discloses the transcript window total: {def}"

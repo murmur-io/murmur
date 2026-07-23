@@ -242,7 +242,10 @@ mod tests {
             confidence: Some(0.9),
         };
         let segments = vec![
-            seg(0, "We decided to migrate the storage layer to SQLCipher next quarter."),
+            seg(
+                0,
+                "We decided to migrate the storage layer to SQLCipher next quarter.",
+            ),
             seg(1, "The budget review is scheduled for Friday afternoon."),
         ];
         // Line 0: near-verbatim of segment 0 (high token overlap → receipt).
@@ -272,7 +275,8 @@ mod tests {
         use crate::extract::ExtractedBlock;
         let blocks = vec![
             ExtractedBlock {
-                text: "The first paragraph of the design section with enough words to chunk.".to_string(),
+                text: "The first paragraph of the design section with enough words to chunk."
+                    .to_string(),
                 page: Some(1),
                 heading_path: Some("Design".to_string()),
             },
@@ -496,7 +500,9 @@ mod tests {
             {
                 continue; // belt-and-braces: never read segments for a non-visible meeting.
             }
-            let segments = db.get_segments(&m.id).expect("segments for visible meeting");
+            let segments = db
+                .get_segments(&m.id)
+                .expect("segments for visible meeting");
             if segments.is_empty() {
                 continue; // no transcript ⇒ receipts are undefined; skip (not counted).
             }
@@ -635,8 +641,8 @@ mod tests {
     fn bench_large_pdf_ingest_from_env() {
         use std::time::Instant;
 
-        let pdf_path = std::env::var("MURMUR_CALIB_PDF")
-            .expect("set MURMUR_CALIB_PDF to a big text PDF path");
+        let pdf_path =
+            std::env::var("MURMUR_CALIB_PDF").expect("set MURMUR_CALIB_PDF to a big text PDF path");
         let real = crate::embed::embed_model_present();
         // The real embedder wants the Metal forward-pass opt-in (same as the bake-off runners).
         std::env::set_var("MURMUR_TEST_REAL_EMBED", "1");

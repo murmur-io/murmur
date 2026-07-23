@@ -1,5 +1,5 @@
 //! Shared NDJSON wire protocol between the app (host, `meetnotes_lib`) and the on-device brain
-//! sidecar (child, `meetnotes-brain`).
+//! sidecar (child, `murmur-brain`).
 //!
 //! ONE source of truth: this file has NO mistralrs / app dependency (only serde + serde_json), and
 //! is compiled into BOTH crates — the child owns it as a normal `mod`, and the host `#[path]`-includes
@@ -45,9 +45,8 @@ pub enum HostMsg {
 pub enum ChildMsg {
     /// Emitted once, after the model has loaded — the readiness handshake answer.
     Ready { model_id: String },
-    /// Liveness beat emitted periodically WHILE a generation is running, so the host can distinguish
-    /// "productively generating a long note" from "wedged" and only kill on true silence rather than
-    /// guillotining a healthy long decode at the wall-clock cap.
+    /// Progress beat emitted periodically WHILE a generation is running. It is telemetry only: the
+    /// host keeps one immutable request deadline and does not extend it when a beat arrives.
     Heartbeat { id: u64 },
     /// Terminal success for request `id` — the whole-string result (the one-shot contract the
     /// `LocalReasoner` trait expects). `text` is either free-form text or a JSON string per the

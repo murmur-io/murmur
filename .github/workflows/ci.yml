@@ -47,6 +47,9 @@ env:
   # build/test). Mirrors scripts/ci.sh; harmless even where full Xcode is present.
   MISTRALRS_METAL_PRECOMPILE: "0"
   CARGO_TERM_COLOR: always
+  # taiki-e/install-action supplies these before ci.sh; keep the gate from
+  # recompiling the same tools while preserving local self-install behavior.
+  MURMUR_CI_TOOLS_PREINSTALLED: "1"
 
 jobs:
   gate:
@@ -73,12 +76,30 @@ jobs:
             echo "::error::secret MURMUR_SERVER_DEPLOY_KEY is missing — register the read-only deploy key on murmur-server and add its private half as this secret (see the comment above this step)"
             exit 1
           fi
-          mkdir -p ~/.ssh
-          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/murmur_server_ci
-          chmod 600 ~/.ssh/murmur_server_ci
-          ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
-          GIT_SSH_COMMAND="ssh -i ~/.ssh/murmur_server_ci -o IdentitiesOnly=yes" \
-            git clone --depth 1 git@github.com:murmur-io/murmur-server.git "${GITHUB_WORKSPACE}/../murmur-server"
+          install -m 700 -d "$HOME/.ssh"
+          KEY_FILE="$HOME/.ssh/murmur_server_ci"
+          KNOWN_HOSTS="$RUNNER_TEMP/github_known_hosts"
+          trap 'rm -f "$KEY_FILE" "$KNOWN_HOSTS"' EXIT
+          printf '%s\n' "$DEPLOY_KEY" > "$KEY_FILE"
+          chmod 600 "$KEY_FILE"
+          # GitHub's published Ed25519 host key. Do not trust live ssh-keyscan
+          # output on the same unauthenticated connection we are protecting.
+          printf '%s\n' \
+            'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' \
+            > "$KNOWN_HOSTS"
+          chmod 600 "$KNOWN_HOSTS"
+          SERVER_REV="$(tr -d '[:space:]' < .murmur-server-revision)"
+          if ! [[ "$SERVER_REV" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::.murmur-server-revision must contain exactly one 40-hex commit"
+            exit 1
+          fi
+          SERVER_DIR="${GITHUB_WORKSPACE}/../murmur-server"
+          git init "$SERVER_DIR"
+          git -C "$SERVER_DIR" remote add origin git@github.com:murmur-io/murmur-server.git
+          GIT_SSH_COMMAND="ssh -i $KEY_FILE -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$KNOWN_HOSTS" \
+            git -C "$SERVER_DIR" fetch --depth 1 origin "$SERVER_REV"
+          git -C "$SERVER_DIR" checkout --detach FETCH_HEAD
+          test "$(git -C "$SERVER_DIR" rev-parse HEAD)" = "$SERVER_REV"
 
       - name: Setup Node (version from .nvmrc — Angular 22 needs >= 24.15)
         uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
@@ -89,15 +110,18 @@ jobs:
       - name: Install pinned Rust toolchain (rust-toolchain.toml → 1.96.0 + clippy/rustfmt)
         run: rustup show
 
-      - name: Cache Rust build (registry + git + src-tauri/target)
+      - name: Cache Rust build (registry + git + workspace target)
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          workspaces: src-tauri
+          workspaces: ". -> target"
 
-      - name: Install cargo-audit + cargo-deny (prebuilt — skips ci.sh's slow cargo install)
+      - name: Install pinned cargo-audit + cargo-deny (prebuilt — skips ci.sh's slow cargo install)
         uses: taiki-e/install-action@678b06b887cdbf44fa0601e5915f865e17c2241d # v2.44.60
         with:
-          tool: cargo-audit,cargo-deny
+          # Explicit tool versions are required: an action-SHA-relative `latest`
+          # installed cargo-audit 0.21.0, which cannot parse CVSS 4.0 entries in
+          # the current RustSec database (for example RUSTSEC-2026-0073).
+          tool: cargo-audit@0.22.2,cargo-deny@0.20.2
 
       - name: Install ffmpeg (audio E2E — aiff to 16 kHz mono WAV)
         run: brew list ffmpeg >/dev/null 2>&1 || brew install ffmpeg
@@ -110,6 +134,15 @@ jobs:
 
       - name: Install JS deps
         run: npm ci
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/Library/Caches/ms-playwright
+          key: playwright-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('package-lock.json') }}
+
+      - name: Install Playwright browser runtimes
+        run: npx playwright install chromium webkit
 
       - name: Run the FULL gate (scripts/ci.sh incl. headless audio E2E)
         # No MURMUR_CI_SKIP_E2E → e2e-core.sh + e2e-mix.sh run. The provider step
