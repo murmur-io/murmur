@@ -2,7 +2,7 @@
 
 Deep material for `/design-ai-seam` step 4. When a task needs "the model decides", REUSE this envelope
 and this ACI — do not roll a new loop or a new ungated tool path. All symbols verified against the
-current tree (`agent.rs`, `tools.rs`, `orchestrate.rs`, `voice_action.rs`, `commands.rs`,
+current tree (`agent.rs`, `tools.rs`, `orchestrate.rs`, `voice_action.rs`, `commands/{mod,ask}.rs`,
 `transcribe/live.rs`).
 
 ---
@@ -53,7 +53,7 @@ decide-or-finish loop. Each turn the model replies with ONLY `{"tool":…,"args"
 
 Designing a new agentic caller means: build a `GatedToolExecutor` with the right scope, call
 `run_agentic_loop`, and OWN the floor for `Ok(None)`/`Err`. Live callers to mirror: `voice_action.rs`,
-`commands.rs` (the ask path), `transcribe/live.rs` (the cascade). `AgentOutcome` carries `answer`,
+`commands/{mod,ask}.rs` (the ask path), `transcribe/live.rs` (the cascade). `AgentOutcome` carries `answer`,
 the ephemeral `steps` trace (tool NAME + ok only — never args/results; not persisted), and `citations`
 (from `voice_action::extract_citations` over gated tool output only).
 

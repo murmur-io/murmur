@@ -65,10 +65,12 @@ many queries have an empty FTS leg — the ceiling on what empty-leg fusion chan
 
 ## Report the HONEST delta — the honesty bar
 
-- **Two corpora, both reported.** The COMMITTED synthetic corpus (`eval/results/rag-bakeoff-latest.md`,
-  `eval/results/rag-bakeoff-baseline-synthetic.md`) is the CI MERGE-GATE baseline — a change that regresses it
-  does NOT ship even if the real vault improves. The real vault (`eval/results/rag-bakeoff-real-vault.md`) is
-  a signal, not a benchmark. A synthetic number is NOT a real-vault number — never present one as the other.
+- **Two corpora, both reported.** CI enforces only the small deterministic FTS metric floor in
+  `src-tauri/src/eval/bakeoff.rs`. The broader COMMITTED synthetic reports
+  (`eval/results/rag-bakeoff-latest.md`, `eval/results/rag-bakeoff-baseline-synthetic.md`) remain a
+  required manual comparison for retrieval changes, but are not an automated merge gate. The real vault
+  (`eval/results/rag-bakeoff-real-vault.md`) is a signal, not a benchmark. A synthetic number is NOT a
+  real-vault number — never present one as the other.
 - **A skewed set proves the skew.** The 2026-07-10 real set was deliberately skewed AWAY from lexical overlap
   (18/20 empty FTS legs), so it makes pure semantic look best (0.95 vs hybrid 0.90). That is BY CONSTRUCTION —
   a balanced set including keyword searches would show hybrid's robustness (synthetic: hybrid 0.90 > semantic
@@ -83,8 +85,8 @@ many queries have an empty FTS leg — the ceiling on what empty-leg fusion chan
 
 ## The committed baselines (as of trunk, 2026-07-10 — re-read the files, they update)
 
-- Synthetic (CI gate): hybrid recall@5 **0.90**, nDCG **0.825**, fts 0.45; hybrid 0.90 > semantic 0.84 on
-  keyword queries.
+- Synthetic (manual full bake-off; CI gates only FTS ≥0.20): hybrid recall@5 **0.90**, nDCG
+  **0.825**, fts 0.45; hybrid 0.90 > semantic 0.84 on keyword queries.
 - Real dev vault (hard 20-query set): semantic 0.95 > hybrid 0.90 = hybrid+rerank 0.90; fts 0.10 — CORRECT
   hybrid behaviour on lexically-mismatched queries, proven un-closable by fusion tuning (three attempts).
 
