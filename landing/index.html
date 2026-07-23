@@ -3,11 +3,11 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Murmur — meeting notes with a brain, on your Mac</title>
-  <meta name="description" content="Murmur records your meetings, transcribes and reasons over them entirely on your Mac, and lets you ask your AI live in the call. Local-first. Privacy is the architecture, not a setting." />
+  <title>Murmur — local-first meeting notes with a brain</title>
+  <meta name="description" content="Murmur records meetings and transcribes them on-device. Run AI locally, or explicitly opt into redacted cloud AI; your meeting archive stays on your Mac." />
   <link rel="icon" href="./assets/icon.svg" />
-  <meta property="og:title" content="Murmur — meeting notes with a brain, on your Mac" />
-  <meta property="og:description" content="On-device meeting notes for macOS. Nothing leaves your Mac. Privacy is the architecture." />
+  <meta property="og:title" content="Murmur — local-first meeting notes with a brain" />
+  <meta property="og:description" content="On-device transcription for macOS. Run AI locally or explicitly opt into redacted cloud AI." />
   <meta property="og:type" content="website" />
   <script>
     // Set the theme before first paint to avoid a flash of the wrong mode.
@@ -482,8 +482,8 @@
           <span class="badge safe"><span class="dot"></span> Local-first · macOS</span>
           <span class="badge">On-device brain</span>
         </div>
-        <h1 class="hero-title">Your meetings get a brain — <span class="grad">and it never leaves your Mac.</span></h1>
-        <p class="hero-sub">Murmur records your calls, transcribes and reasons over them <b>entirely on-device</b>, and lets you ask your AI a question <b>live, mid-meeting</b> — grounded in everything you've ever recorded. No cloud required.</p>
+        <h1 class="hero-title">Your meetings get a brain — <span class="grad">and you control where it runs.</span></h1>
+        <p class="hero-sub">Murmur records your calls and transcribes them <b>on-device</b>. Run AI locally, or explicitly opt into <b>redacted cloud AI</b>; your meeting archive stays on your Mac.</p>
         <div class="hero-actions">
           <a class="btn btn-primary" href="https://github.com/murmur-io/murmur/releases/latest">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12m0 0 4-4m-4 4-4-4M5 21h14"/></svg>
@@ -507,7 +507,7 @@
   <!-- ── Trust strip ─────────────────────────────────────────── -->
   <div class="trust">
     <div class="wrap trust-inner">
-      <div class="trust-item"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg> Everything on-device</div>
+      <div class="trust-item"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg> On-device transcription</div>
       <div class="trust-item"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10Z"/></svg> Touch ID lock at rest</div>
       <div class="trust-item"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/><path d="m3 3 18 18"/></svg> No cloud required</div>
       <div class="trust-item"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg> Plain Markdown you own</div>
@@ -519,8 +519,8 @@
     <div class="wrap">
       <div class="section-head reveal">
         <span class="eyebrow">How it works</span>
-        <h2>Record → understand → ask. All on your Mac.</h2>
-        <p>One local pipeline turns a live call into a searchable, queryable memory — with no round-trip to someone else's server.</p>
+        <h2>Record → understand → ask. Local-first by design.</h2>
+        <p>One local-first pipeline turns a live call into searchable memory. Transcription stays on your Mac; AI can run locally or, with explicit consent, use redacted cloud processing.</p>
       </div>
       <div class="steps">
         <div class="step reveal">
@@ -548,7 +548,7 @@
       <div class="section-head reveal">
         <span class="eyebrow" style="color:var(--safe-text)">Security &amp; Privacy</span>
         <h2>Privacy isn't a setting. It's the architecture.</h2>
-        <p>Most meeting tools ship your audio to someone else's cloud. Murmur is built the other way around: the brain, transcription, and search are designed to run <b>without a network at all</b>.</p>
+        <p>Murmur is designed so transcription, search, and local AI can run <b>without a network at all</b>. If you choose cloud AI, consent and a redaction firewall sit in front of that egress.</p>
       </div>
 
       <div class="privacy-grid">
@@ -594,9 +594,9 @@
             <tbody>
               <tr><td>On-device brain (Bielik / Qwen)</td><td>Fully local</td><td><span class="tag no">No</span></td></tr>
               <tr><td>Ollama</td><td>Fully local</td><td><span class="tag no">No</span></td></tr>
-              <tr><td>Claude Code <span style="color:var(--text-muted);font-weight:400">(default summarizer)</span></td><td>Local CLI → cloud</td><td><span class="tag yes">Redacted only</span></td></tr>
-              <tr><td>Anthropic API <span style="color:var(--text-muted);font-weight:400">(bring your own key)</span></td><td>Direct HTTPS</td><td><span class="tag yes">Redacted only</span></td></tr>
-              <tr><td>AI Gateway <span style="color:var(--text-muted);font-weight:400">(any OpenAI-compatible endpoint — LiteLLM, Kong, Portkey, vLLM…)</span></td><td>Direct HTTPS</td><td><span class="tag yes">Redacted only</span></td></tr>
+              <tr><td>Claude Code <span style="color:var(--text-muted);font-weight:400">(default summarizer)</span></td><td>Local CLI → cloud</td><td><span class="tag yes">Only after consent; redaction firewall applied</span></td></tr>
+              <tr><td>Anthropic API <span style="color:var(--text-muted);font-weight:400">(bring your own key)</span></td><td>Direct HTTPS</td><td><span class="tag yes">Only after consent; redaction firewall applied</span></td></tr>
+              <tr><td>AI Gateway <span style="color:var(--text-muted);font-weight:400">(any OpenAI-compatible endpoint — LiteLLM, Kong, Portkey, vLLM…)</span></td><td>Direct HTTPS</td><td><span class="tag yes">Only after consent; redaction firewall applied</span></td></tr>
             </tbody>
           </table>
         </div>
@@ -637,7 +637,7 @@
           <p>Dual-stream recording captures your mic and the other side's system audio, transcribes each independently on-device, and merges them by wall-clock into a clean Me / Others transcript with live captions as you speak.</p>
           <ul class="flist">
             <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> On-device Whisper, tiny to large-v3 — pick your speed/accuracy tradeoff</li>
-            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Optional speaker diarization &amp; voice activity detection</li>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Two-stream attribution: you and everyone else, plus voice-activity detection</li>
             <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> A floating recorder bar — record from anywhere (⌘⇧R)</li>
           </ul>
         </div>
@@ -685,7 +685,7 @@
           <ul class="flist">
             <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> An encrypted SQLite DB is the single source of truth</li>
             <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> A read-only local MCP server for Claude Desktop / Code</li>
-            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> No proprietary format, ever</li>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Plain Markdown exports you can open in any editor</li>
           </ul>
         </div>
         <div class="shot"><img src="./assets/detail-note.jpg" alt="A structured note — summary, decisions, action items, quotes" loading="lazy" /></div>
@@ -700,7 +700,7 @@
           <ul class="flist">
             <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Nineteen Brain actions, one keystroke away</li>
             <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Grounded in your own meetings &amp; notes, not the model's guesses</li>
-            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Same encrypted store, same Touch ID lock, same Markdown export</li>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Paste screenshots into notes; they stay local and follow the folder lock</li>
           </ul>
         </div>
         <div class="shot"><img src="assets/notes-editor-brain-menu.png" alt="The standalone note editor with a text selection and the Brain command menu open, showing Refine, Shorten, Change tone and more actions" loading="lazy" /></div>
@@ -728,22 +728,22 @@
     <div class="wrap">
       <div class="section-head reveal">
         <span class="eyebrow">Pricing</span>
-        <h2>Free today. Built to grow with you.</h2>
-        <p>Everything Murmur does right now is <b>completely free</b> — no account, no trial, no catch. Pro and Team plans are on the roadmap, and every one keeps the same end-to-end-encrypted, on-device-first design.</p>
+        <h2>Free during early access.</h2>
+        <p>Local recording, transcription, notes, and Markdown exports need no account or payment. Pricing and availability beyond early access will be announced separately.</p>
       </div>
       <div class="plans">
         <!-- Free — the whole app, available now -->
         <div class="plan featured reveal">
           <span class="plan-badge now">Available now</span>
           <h3>Free</h3>
-          <div class="price"><span class="amt">$0</span><span class="per">/ forever</span></div>
-          <p class="tagline">The complete app. Everything runs on your Mac.</p>
+          <div class="price"><span class="amt">$0</span><span class="per">/ early access</span></div>
+          <p class="tagline">Local recording, transcription, notes, and exports.</p>
           <ul>
             <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Unlimited on-device recording &amp; transcription</li>
             <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> In-meeting AI assistant + Ask Your Vault</li>
             <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Semantic search &amp; the auto knowledge graph</li>
             <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Standalone notes with a Brain-assisted editor</li>
-            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Shared Brain — E2EE org sharing, unlimited members</li>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> E2EE sharing (account required)</li>
             <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Expiring, encrypted share links for a note or meeting</li>
             <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Per-folder Touch ID lock &amp; AES-256 encryption</li>
             <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Screen-share auto-relock</li>
@@ -756,8 +756,8 @@
         <div class="plan soon reveal">
           <span class="plan-badge soon">Coming soon</span>
           <h3>Pro</h3>
-          <div class="price"><span class="amt">$3.99</span><span class="per">/ month · planned</span></div>
-          <p class="tagline">Your memory, on every device — still end-to-end encrypted.</p>
+          <div class="price"><span class="amt">Planned</span></div>
+          <p class="tagline">Pricing and availability to be announced.</p>
           <ul>
             <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Everything in Free</li>
             <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> End-to-end encrypted sync across your Macs &amp; iPhone</li>
@@ -774,8 +774,8 @@
         <div class="plan soon reveal">
           <span class="plan-badge soon">Coming soon</span>
           <h3>Team</h3>
-          <div class="price"><span class="amt">Contact</span></div>
-          <p class="tagline">Admin controls for a Shared Brain org — privacy kept intact.</p>
+          <div class="price"><span class="amt">Planned</span></div>
+          <p class="tagline">Pricing and availability to be announced.</p>
           <ul>
             <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Everything in Pro</li>
             <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Member roles &amp; permissions for your Shared Brain org</li>
@@ -786,7 +786,7 @@
           <a class="btn btn-ghost" href="https://github.com/murmur-io/murmur">Talk to us</a>
         </div>
       </div>
-      <p style="text-align:center; color:var(--text-muted); font-size:13.5px; margin-top:26px;">Shared Brain org sharing is free today — see the Free plan. Pricing for Pro and Team is indicative and not final; Murmur stays free while in early access.</p>
+      <p style="text-align:center; color:var(--text-muted); font-size:13.5px; margin-top:26px;">Pricing and availability beyond early access will be announced separately.</p>
     </div>
   </section>
 
@@ -794,8 +794,8 @@
   <section class="cta-final">
     <div class="wrap">
       <div class="cta-card reveal">
-        <h2>Give your meetings a brain — keep it on your Mac.</h2>
-        <p>Free, local-first, and signed &amp; notarized for macOS. Your audio never has to leave the device.</p>
+        <h2>Give your meetings a brain — keep control on your Mac.</h2>
+        <p>Local-first for macOS. Keep AI local, or explicitly opt into redacted cloud AI when you choose.</p>
         <div class="cta-actions">
           <a class="btn btn-primary" href="https://github.com/murmur-io/murmur/releases/latest">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12m0 0 4-4m-4 4-4-4M5 21h14"/></svg>
