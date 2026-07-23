@@ -19,7 +19,7 @@ biometric; and locking must never destroy the only copy of content.
 - `.claude/rules/lock-model.md` (the invariants) and `.claude/rules/rust-tauri.md` (the ruleset).
 - The diff/branch under review (`git diff`, `git log` — read-only).
 - Ground every check in the real tree: `src-tauri/src/commands/`, `storage/`,
-  `storage/migration.rs`, `crypto.rs`, `secrets/keychain.rs`, `mcp.rs`, `biometric.rs`,
+  `storage/migration.rs`, `crypto.rs`, `secrets/keychain.rs`, `mcp.rs`,
   `screenshare.rs`. Cite `file:line` for every finding. Trust code, not docs.
 
 ## The audit checklist (run every item; cite evidence for each)
