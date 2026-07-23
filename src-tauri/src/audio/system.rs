@@ -340,12 +340,16 @@ mod tests {
         assert!(!helper_exit_proves_finalized(false, None));
     }
 
-    /// Whether `pid` still has a process-table entry (any state). None once fully reaped.
-    fn ps_present(pid: u32) -> bool {
-        std::process::Command::new("/bin/ps")
-            .args(["-o", "stat=", "-p", &pid.to_string()])
-            .output()
-            .map(|o| !String::from_utf8_lossy(&o.stdout).trim().is_empty())
+    /// Whether `pid` still has a process-table entry (including a zombie).
+    /// `ps` is setuid on macOS and cannot execute under Seatbelt even under
+    /// `(allow default)`, while signal 0 is the direct non-mutating liveness
+    /// probe used by the production helper lifecycle.
+    fn process_present(pid: u32) -> bool {
+        Command::new("/bin/kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .status()
+            .map(|status| status.success())
             .unwrap_or(false)
     }
 
@@ -381,14 +385,14 @@ mod tests {
     #[test]
     fn drop_without_stop_reaps_the_capture_child() {
         let (rec, pid) = recorder_over_dummy_child();
-        assert!(ps_present(pid), "the dummy child is alive before drop");
+        assert!(process_present(pid), "the dummy child is alive before drop");
 
         drop(rec); // no stop() — exercises the app-quit-mid-recording path.
 
         // Give the SIGTERM + wait() a moment to complete.
         std::thread::sleep(std::time::Duration::from_millis(300));
         assert!(
-            !ps_present(pid),
+            !process_present(pid),
             "dropping without stop() must SIGTERM + reap the child — no orphan, no zombie"
         );
     }

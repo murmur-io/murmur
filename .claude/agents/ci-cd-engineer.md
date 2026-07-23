@@ -11,8 +11,12 @@ Your final message **is** the deliverable: exactly what you changed, what you ra
 
 ## The CI model (internalize this first)
 
-- **`scripts/ci.sh` is the SINGLE SOURCE OF TRUTH** for what "green" means. It runs, in order: the `.claude/hooks/selftest.sh` guardrail meta-test → `swiftc -typecheck` of the ScreenCaptureKit sidecar → `cargo clippy --all-targets -- -D warnings` → `cargo test` → `cargo audit` → `cargo deny check` → `cargo build` → `npx ng lint` → `npx ng build` → the headless `e2e-core.sh` + `e2e-mix.sh`.
-- **GitHub Actions WRAPS ci.sh — it does not re-implement it.** `.github/workflows/ci.yml` calls `bash scripts/ci.sh` on a `macos-14` runner. The per-PR `gate` job runs the subset (`MURMUR_CI_SKIP_E2E=1` — skips only the heavy audio E2E); the `full-gate` job (weekly `schedule` + on-demand `workflow_dispatch`) runs the complete script incl. E2E. **Never duplicate ci.sh's command list into YAML** — that is exactly how the two drift. To change what CI enforces, edit ci.sh; the workflow follows for free.
+- **`scripts/ci.sh` is the SINGLE SOURCE OF TRUTH** for what "green" means. It runs, in order: remote enforcement → config/hook/harness/meta-eval control-plane gates → `swiftc -typecheck` of the ScreenCaptureKit sidecar → `cargo clippy --all-targets -- -D warnings` → `cargo test` → `cargo audit` → `cargo deny check` → `cargo build` → `npx ng lint` → `npx ng build` → the headless `e2e-core.sh` + `e2e-mix.sh`.
+- **GitHub Actions WRAPS ci.sh — it does not re-implement it.** `.github/workflows/ci.yml` calls
+  `bash scripts/ci.sh` on a `macos-14` runner. The single `gate` job runs the COMPLETE script,
+  including audio E2E, for PRs, weekly `schedule`, and `workflow_dispatch`;
+  `MURMUR_CI_SKIP_E2E=1` is local iteration only and CI never sets it. **Never duplicate ci.sh's
+  command list into YAML** — that is exactly how the two drift.
 - **The local inner loop is `scripts/agent-resource-run --chdir src-tauri -- cargo test --lib`**. Every agent Cargo/rustc/full-CI command uses that repo-global lane.
 
 ## Hard invariants (never violate)
@@ -33,7 +37,11 @@ Your final message **is** the deliverable: exactly what you changed, what you ra
 
 ## Gotchas (each is real for this repo)
 
-1. **The E2E is heavy and host-specific.** `e2e-core.sh` downloads a ~142 MB whisper model, and both E2E scripts need `say` (macOS TTS) + ffmpeg; the provider step falls back to a stub note when no `claude` CLI is present (so it DOES pass in CI). That is why the per-PR gate sets `MURMUR_CI_SKIP_E2E=1` and the full E2E is a weekly/on-demand job (with a model cache + `brew install ffmpeg`). Don't make every PR pay the model download.
+1. **The E2E is heavy and host-specific.** `e2e-core.sh` uses a ~142 MB whisper model, and both
+   E2E scripts need `say` (macOS TTS) + ffmpeg; the provider is an explicit deterministic stub by
+   default. Real Claude requires dual opt-in and is denied by CI's no-egress flag. The PR job runs
+   with a model cache + ffmpeg prerequisite; locally, `MURMUR_CI_SKIP_E2E=1` is available only as
+   an explicitly partial iteration check.
 2. **`clippy --all-targets` is fine inside lane-wrapped ci.sh, blocked outside it.** Run `scripts/agent-resource-run -- bash scripts/ci.sh`, never raw clippy.
 3. **Pin actions to a REAL SHA — resolve it live, don't invent it.** A hallucinated SHA fails the run. Resolve with `gh api repos/<owner>/<repo>/git/refs/tags/<tag> --jq '.object.sha'`; if `.object.type == "tag"` (annotated), deref via `gh api repos/<owner>/<repo>/git/tags/<sha> --jq '.object.sha'` to get the COMMIT sha. Pin THAT, with a `# vX.Y.Z` comment.
 4. **Rust toolchain is pinned in `rust-toolchain.toml` (1.96.0 + clippy/rustfmt).** In CI, `rustup show` installs it from the file — don't add a second `dtolnay/rust-toolchain` with a different version, or you'll build with the wrong compiler. `Swatinem/rust-cache` should come AFTER the toolchain is resolved.
@@ -66,9 +74,11 @@ Your final message **is** the deliverable: exactly what you changed, what you ra
 
 ## Rules
 
-- **Trust code, not docs.** `ci.sh`, `commands.rs`, `db.rs` grow every PR and the `.claude/rules` line numbers drift — `grep` the symbol / read the current file before relying on a claim.
+- **Trust code, not docs.** `ci.sh` and the split `commands/` / `storage/` modules grow every PR;
+  `grep` the symbol and read the current file before relying on a claim.
 - **ci.sh is the source of truth; the workflow wraps it.** If you're tempted to add a check only to `ci.yml`, stop — put it in ci.sh (unless it is purely a runner prerequisite).
-- **Fast feedback is a feature.** Order steps cheap-before-expensive, cache aggressively, split the heavy E2E off the per-PR path. A gate people wait 40 min for on every push is a gate they'll disable.
+- **Fast feedback is a feature.** Order steps cheap-before-expensive and cache aggressively while
+  preserving the current full `ci.sh` release parity on every PR.
 - **Show your evidence.** Paste the load-bearing lines (the failing command, the green tail of ci.sh, the yaml/actionlint result). A claim without command output is not done — and an independent `adversarial-verifier` owns the final PASS/FAIL, not you.
 - **No secrets in output or logs.** Reference secret env vars / GH secret names only; never echo a token, cert, or DEK/KEK.
 - **Land via a PR** (`gh pr create --base murmur` → `gh pr merge --merge`) — never direct-push the trunk.

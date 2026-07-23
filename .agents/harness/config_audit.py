@@ -18,6 +18,16 @@ ROOT = Path(__file__).resolve().parents[2]
 HOOK_NAMES = ("block-bash", "secret-scan", "finish-guard")
 WRAPPER_NAMES = (*HOOK_NAMES, "selftest")
 REQUIRED_RULES = ("rust-tauri.md", "angular-zoneless.md", "lock-model.md", "agentic-workflow.md")
+ADVERSARIAL_PROMPT_MARKER = "control-plane-audit: shipped-bug-classes-v1"
+ADVERSARIAL_BUG_MARKERS = (
+    "SEALED_CONTENT_LEAK",
+    "FFI_LAUNCH_ABORT",
+    "ANGULAR_NG0600",
+    "ANGULAR_IMPORT_CYCLE_ɵcmp",
+    "SEAL_ROUND_TRIP_LOSS",
+    "EGRESS_WITHOUT_CONSENT",
+    "PROCESS_OWNERSHIP_KILL",
+)
 REQUIRED_AGENTS = (
     "rust-tauri-dev",
     "angular-zoneless-dev",
@@ -151,6 +161,28 @@ def _json_audit(audit: Audit) -> Dict[str, Any]:
         "hot paths require deterministic performance contracts",
         "performance risk must require .agents/harness/checks/perf-contracts.sh",
     )
+    sherpa = (
+        config.get("shared_artifacts", {}).get("sherpa_onnx", {})
+        if isinstance(config, dict)
+        else {}
+    )
+    sherpa_archives = sherpa.get("archives", {}) if isinstance(sherpa, dict) else {}
+    audit.require(
+        isinstance(sherpa, dict)
+        and sherpa.get("directory") == "target/sherpa-onnx-prebuilt"
+        and isinstance(sherpa_archives, dict)
+        and set(sherpa_archives) == {"arm64", "x86_64"}
+        and all(
+            isinstance(value, dict)
+            and isinstance(value.get("filename"), str)
+            and value["filename"].endswith(".tar.bz2")
+            and isinstance(value.get("sha256"), str)
+            and re.fullmatch(r"[0-9a-f]{64}", value["sha256"])
+            for value in sherpa_archives.values()
+        ),
+        "sherpa-onnx offline archives are versioned and checksum-pinned",
+        "shared_artifacts.sherpa_onnx must pin filename + SHA-256 for arm64 and x86_64",
+    )
     identity = config.get("commit_identity", {}) if isinstance(config, dict) else {}
     audit.require(
         isinstance(identity, dict)
@@ -278,13 +310,50 @@ def _agent_and_rule_manifest(audit: Audit) -> None:
     for path in sorted((ROOT / ".codex" / "agents").glob("*.toml")):
         _basic_toml(path, audit)
 
-    # Adapter prose is allowed to differ.  Surface drift for review, but only
-    # the executable hook manifest below is a hard byte/fingerprint gate.
-    for name in REQUIRED_RULES:
-        left = ROOT / ".codex" / "rules" / name
-        right = ROOT / ".claude" / "rules" / name
-        if left.is_file() and right.is_file() and left.read_bytes() != right.read_bytes():
-            audit.warn(f"rule adapters differ (reviewed drift allowed): {name}")
+    # Binding rules are deliberately vendor-neutral and byte-identical.  Compare
+    # the full manifests too: a new one-sided rule is drift, even if the four
+    # required core files still match.
+    codex_rules = {path.name: path for path in (ROOT / ".codex" / "rules").glob("*.md")}
+    claude_rules = {path.name: path for path in (ROOT / ".claude" / "rules").glob("*.md")}
+    audit.require(
+        set(codex_rules) == set(claude_rules),
+        "binding rule manifests match",
+        "Claude/Codex binding rule manifest drift: "
+        f"Codex-only={sorted(set(codex_rules) - set(claude_rules))}, "
+        f"Claude-only={sorted(set(claude_rules) - set(codex_rules))}",
+    )
+    for name in sorted(set(codex_rules) & set(claude_rules)):
+        left_bytes = codex_rules[name].read_bytes()
+        right_bytes = claude_rules[name].read_bytes()
+        audit.require(
+            left_bytes == right_bytes,
+            f"binding rule parity: {name}",
+            f"Claude/Codex binding rule drift: {name}",
+        )
+        if left_bytes == right_bytes:
+            audit.fingerprints[f"rule:{name}"] = _sha256(left_bytes)
+
+
+def _adversarial_prompt_contract(audit: Audit) -> None:
+    path = ROOT / ".agents" / "harness" / "prompts" / "adversarial-reviewer.md"
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        audit.error(f"cannot read adversarial reviewer prompt: {exc}")
+        return
+    audit.require(
+        ADVERSARIAL_PROMPT_MARKER in text,
+        "adversarial prompt audit marker present",
+        f"adversarial prompt missing audit marker: {ADVERSARIAL_PROMPT_MARKER}",
+    )
+    missing = [marker for marker in ADVERSARIAL_BUG_MARKERS if marker not in text]
+    audit.require(
+        not missing,
+        "adversarial prompt names all seven shipped bug classes",
+        "adversarial prompt missing shipped bug classes: " + ", ".join(missing),
+    )
+    if not missing and ADVERSARIAL_PROMPT_MARKER in text:
+        audit.fingerprints["adversarial-reviewer-prompt"] = _sha256(text.encode("utf-8"))
 
 
 def _toml_table(text: str, name: str) -> Optional[str]:
@@ -538,6 +607,103 @@ def _semantic_lint(audit: Audit) -> None:
         audit.checks.append("critical Angular instruction semantics are current")
 
 
+def _remote_workflow_contract(audit: Audit) -> None:
+    workflow = ROOT / ".github" / "workflows" / "ci.yml"
+    ci_script = ROOT / "scripts" / "ci.sh"
+    try:
+        workflow_text = workflow.read_text(encoding="utf-8")
+        ci_text = ci_script.read_text(encoding="utf-8")
+    except OSError as exc:
+        audit.error(f"cannot read remote-audit workflow contract: {exc}")
+        return
+
+    dedicated_mapping = re.findall(
+        r"(?m)^\s+MURMUR_REMOTE_AUDIT_TOKEN:\s*"
+        r"\$\{\{\s*secrets\.MURMUR_REMOTE_AUDIT_TOKEN\s*\}\}\s*$",
+        workflow_text,
+    )
+    public_mapping = re.findall(
+        r"(?m)^\s+MURMUR_PUBLIC_REMOTE_AUDIT_TOKEN:\s*"
+        r"\$\{\{[^\n]*github\.event_name\s*==\s*'pull_request'[^\n]*github\.token[^\n]*\}\}\s*$",
+        workflow_text,
+    )
+    audit.require(
+        len(dedicated_mapping) == 1,
+        "privileged remote audit receives exactly the dedicated secret",
+        "ci.yml must pass MURMUR_REMOTE_AUDIT_TOKEN directly from its same-named secret",
+    )
+    audit.require(
+        len(public_mapping) == 1,
+        "ordinary GitHub token is scoped to pull-request public audit",
+        "ci.yml must pass github.token only through the pull-request public-audit variable",
+    )
+    privileged_fallback_markers = (
+        "secrets.MURMUR_REMOTE_AUDIT_TOKEN !=",
+        "|| github.token",
+        "GH_TOKEN: ${{",
+    )
+    audit.require(
+        not any(marker in workflow_text for marker in privileged_fallback_markers),
+        "privileged remote audit has no ordinary-token fallback expression",
+        "ci.yml contains a privileged-token fallback or direct GH_TOKEN expression",
+    )
+    required_ci_fragments = (
+        'remote_audit_token="${MURMUR_REMOTE_AUDIT_TOKEN:-}"',
+        "unset MURMUR_REMOTE_AUDIT_TOKEN MURMUR_PUBLIC_REMOTE_AUDIT_TOKEN GH_TOKEN GITHUB_TOKEN",
+        'if [ -z "$remote_audit_token" ]; then',
+        'GH_TOKEN="$remote_audit_token" scripts/agent-remote-audit',
+        'GH_TOKEN="$public_audit_token" scripts/agent-remote-audit --public',
+    )
+    audit.require(
+        all(fragment in ci_text for fragment in required_ci_fragments),
+        "ci.sh selects remote-audit credentials fail-closed before repo checks",
+        "ci.sh must preflight the dedicated token, isolate public/privileged credentials, and drop exports",
+    )
+
+
+def _headless_e2e_no_egress_contract(audit: Audit) -> None:
+    paths = (
+        ROOT / "src-tauri" / "examples" / "e2e_core.rs",
+        ROOT / "scripts" / "e2e-core.sh",
+        ROOT / "scripts" / "e2e-mix.sh",
+        ROOT / "scripts" / "ci.sh",
+        ROOT / ".github" / "workflows" / "ci.yml",
+    )
+    try:
+        documents = {path: path.read_text(encoding="utf-8") for path in paths}
+    except OSError as exc:
+        audit.error(f"cannot read headless E2E no-egress contract: {exc}")
+        return
+
+    rust = documents[paths[0]]
+    core_script = documents[paths[1]]
+    mix_script = documents[paths[2]]
+    workflow = documents[paths[4]]
+    forbidden_cloud_switches = (
+        "ClaudeCodeProvider",
+        "MURMUR_E2E_PROVIDER",
+        "MURMUR_E2E_ALLOW_CLOUD",
+    )
+    audit.require(
+        not any(marker in text for text in documents.values() for marker in forbidden_cloud_switches),
+        "headless E2E has no raw cloud-provider branch or opt-in switch",
+        "headless E2E must remain a deterministic no-egress fake by construction",
+    )
+    audit.require(
+        'let note = stub_note(&req);' in rust
+        and 'provider mode: deterministic-stub (no egress)' in rust,
+        "Rust headless E2E always selects the deterministic stub",
+        "e2e_core.rs must unconditionally use and report the deterministic no-egress stub",
+    )
+    audit.require(
+        "export MURMUR_E2E_NO_EGRESS=1" in core_script
+        and "export MURMUR_E2E_NO_EGRESS=1" in mix_script
+        and re.search(r'(?m)^\s+MURMUR_E2E_NO_EGRESS:\s*"1"\s*$', workflow) is not None,
+        "headless E2E shells and GitHub gate declare no-egress mode",
+        "headless E2E and CI must retain the explicit no-egress environment invariant",
+    )
+
+
 def run_audit() -> Audit:
     audit = Audit()
     documents = _json_audit(audit)
@@ -546,7 +712,10 @@ def run_audit() -> Audit:
     _codex_permission_profiles(audit)
     _eval_adapter_security(audit)
     _hook_parity(documents, audit)
+    _adversarial_prompt_contract(audit)
     _semantic_lint(audit)
+    _remote_workflow_contract(audit)
+    _headless_e2e_no_egress_contract(audit)
     return audit
 
 

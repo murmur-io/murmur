@@ -6,7 +6,7 @@
 - **`AppError` + `Result<T>` only.** Never bare `anyhow::Result`, `Box<dyn Error>`, or
   `unwrap()`/`expect()` in non-test code. A locked-content refusal is `AppError::Locked`, never a
   generic `Storage`/`Other`. `AppError` is `Serialize` — don't hand-build error strings for the FE.
-- **A new command = edit `commands.rs` AND `lib.rs`.** A `#[tauri::command]` missing from
+- **A new command = edit its `commands/<domain>.rs` module AND `lib.rs`.** A `#[tauri::command]` missing from
   `generate_handler![…]` compiles but is silently un-callable — the #1 "IPC undefined" bug.
 - **SQLCipher `PRAGMA key` is the FIRST statement.** Open only through `Db::open` /
   `Db::open_with_key`; never a raw `rusqlite::Connection` to the murmur DB. Never log/embed/FE-pass

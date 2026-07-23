@@ -3,7 +3,7 @@
 Deep reference for `/app-perf-audit`. The binding FE ruleset is `.claude/rules/angular-zoneless.md`
 (imported every session) — this file is the **performance-specific** subset: how a zoneless CD storm
 happens on Murmur, the shipped fixes, and how to measure the fix. Do not duplicate the rule file; this
-extends it with numbers and war stories. Cite by SYMBOL — line numbers in `commands.rs`/`db.rs`/big
+extends it with numbers and war stories. Cite by SYMBOL — line numbers in command/storage modules and big
 components drift; `grep` the name.
 
 ## The model you must hold
