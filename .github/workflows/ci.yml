@@ -50,6 +50,9 @@ env:
   # taiki-e/install-action supplies these before ci.sh; keep the gate from
   # recompiling the same tools while preserving local self-install behavior.
   MURMUR_CI_TOOLS_PREINSTALLED: "1"
+  # Product-provider egress is forbidden in CI. Package/tool/model setup still uses
+  # their pinned upstreams; the runtime E2E itself remains local + deterministic.
+  MURMUR_E2E_NO_EGRESS: "1"
 
 jobs:
   gate:
@@ -130,7 +133,10 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/Library/Application Support/MeetNotes/models
-          key: whisper-ggml-base-en-v1
+          key: whisper-base-en-5359861c739e-a03779c86df3-v1
+
+      - name: Install or verify immutable Whisper model
+        run: bash scripts/ensure-whisper-model.sh
 
       - name: Install JS deps
         run: npm ci
@@ -145,6 +151,16 @@ jobs:
         run: npx playwright install chromium webkit
 
       - name: Run the FULL gate (scripts/ci.sh incl. headless audio E2E)
-        # No MURMUR_CI_SKIP_E2E → e2e-core.sh + e2e-mix.sh run. The provider step
-        # falls back to a stub note when no `claude` CLI is present (as in CI).
+        # Every PR performs a live public audit with only its ordinary GITHUB_TOKEN.
+        # It does NOT claim bypass actors or repository security settings: those are
+        # explicitly MONITOR_ONLY and are verified by trusted schedule/dispatch runs.
+        # The privileged path receives only the dedicated repository-read secret:
+        # there is deliberately no github.token fallback, and ci.sh fails explicitly
+        # when that secret is absent. ci.sh drops both tokens before any later repo
+        # command. No MURMUR_CI_SKIP_E2E: audio E2E uses the stub.
+        env:
+          MURMUR_CI_LIVE_REMOTE_AUDIT: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/murmur' && '1' || '0' }}
+          MURMUR_CI_PUBLIC_REMOTE_AUDIT: ${{ github.event_name == 'pull_request' && '1' || '0' }}
+          MURMUR_REMOTE_AUDIT_TOKEN: ${{ secrets.MURMUR_REMOTE_AUDIT_TOKEN }}
+          MURMUR_PUBLIC_REMOTE_AUDIT_TOKEN: ${{ github.event_name == 'pull_request' && github.token || '' }}
         run: bash scripts/ci.sh

@@ -4141,9 +4141,10 @@
             "precondition: folder is sealed"
         );
 
-        let err = block_on(discard_unrecoverable_folder_lock_inner(
+        let err = block_on(discard_unrecoverable_folder_lock_with_candidates_for_test(
             &state,
             "f-lock".to_string(),
+            Zeroizing::new(vec![[0x11; 32]]),
         ))
         .unwrap_err();
         assert!(
@@ -4160,6 +4161,35 @@
                 .content_blob
                 .is_some(),
             "the sealed content must be untouched when discard is refused"
+        );
+    }
+
+    #[test]
+    fn discard_with_dev_kek_refuses_unproven_keychain_absence() {
+        let state = build_state("discard-dev-kek-fail-closed");
+        make_open_folder(&state.db, "f-lock", "Secret");
+        seed_meeting(&state.db, "m1", "# still recoverable elsewhere", Some("f-lock"));
+        lock_folder_inner(&state, "f-lock".to_string()).unwrap();
+        let foreign_wrapped =
+            crate::crypto::encrypt(&[0x42u8; 32], &[0x24u8; 32], &aad_wrapped_ck("f-lock")).unwrap();
+        state
+            .db
+            .set_folder_locked("f-lock", true, Some(&foreign_wrapped))
+            .unwrap();
+
+        let err = block_on(discard_unrecoverable_folder_lock_inner(
+            &state,
+            "f-lock".to_string(),
+        ))
+        .expect_err("the isolated dev KEK cannot prove older Keychain candidates absent");
+        assert!(matches!(err, AppError::Unavailable(_)));
+        assert!(state.db.folder_by_id("f-lock").unwrap().unwrap().locked);
+        assert!(state.db.folder_wrapped_key("f-lock").unwrap().is_some());
+        assert!(
+            state.db.notes_in_folder("f-lock").unwrap()[0]
+                .content_blob
+                .is_some(),
+            "an incomplete candidate proof must preserve the sealed payload"
         );
     }
 
@@ -4184,9 +4214,10 @@
             .set_folder_locked("f-lock", true, Some(&foreign_wrapped))
             .unwrap();
 
-        let node = block_on(discard_unrecoverable_folder_lock_inner(
+        let node = block_on(discard_unrecoverable_folder_lock_with_candidates_for_test(
             &state,
             "f-lock".to_string(),
+            Zeroizing::new(Vec::new()),
         ))
         .expect("an unrecoverable folder must be discardable");
         assert!(!node.locked, "the folder reopens (locked=false)");
@@ -4234,9 +4265,10 @@
             .set_folder_locked("f-lock", true, Some(&foreign_wrapped))
             .unwrap();
 
-        block_on(discard_unrecoverable_folder_lock_inner(
+        block_on(discard_unrecoverable_folder_lock_with_candidates_for_test(
             &state,
             "f-lock".to_string(),
+            Zeroizing::new(Vec::new()),
         ))
         .unwrap();
 

@@ -14,6 +14,36 @@ cd "$REPO"
 # below fail at link time. Safe to always set (it only changes WHEN shaders compile, not whether).
 export MISTRALRS_METAL_PRECOMPILE=0
 
+# ── Remote merge enforcement is the first, cheapest gate. Local runs exercise the evaluator
+#    deterministically. GitHub Actions lends either the ordinary PR token or the dedicated
+#    privileged monitoring credential only to the matching audit command. Copy then immediately
+#    drop all exported token names before executing repo code. Privileged mode has no fallback:
+#    a missing dedicated credential is an explicit gate failure. PRs attest only merge scope;
+#    admin-only controls are MONITOR_ONLY and checked by trusted schedule/manual runs. ──
+echo "── development agent remote enforcement audit ──"
+remote_audit_token="${MURMUR_REMOTE_AUDIT_TOKEN:-}"
+public_audit_token="${MURMUR_PUBLIC_REMOTE_AUDIT_TOKEN:-}"
+unset MURMUR_REMOTE_AUDIT_TOKEN MURMUR_PUBLIC_REMOTE_AUDIT_TOKEN GH_TOKEN GITHUB_TOKEN
+if [ "${MURMUR_CI_LIVE_REMOTE_AUDIT:-0}" = "1" ]; then
+  if [ -z "$remote_audit_token" ]; then
+    echo "remote audit: MURMUR_REMOTE_AUDIT_TOKEN is required for privileged monitoring" >&2
+    exit 1
+  fi
+  GH_TOKEN="$remote_audit_token" scripts/agent-remote-audit
+elif [ "${MURMUR_CI_PUBLIC_REMOTE_AUDIT:-0}" = "1" ]; then
+  if [ -z "$public_audit_token" ]; then
+    echo "remote audit: ordinary pull-request token is missing" >&2
+    exit 1
+  fi
+  GH_TOKEN="$public_audit_token" scripts/agent-remote-audit --public
+else
+  scripts/agent-remote-audit --selftest
+  echo "  (live GitHub audit skipped — set MURMUR_CI_PUBLIC_REMOTE_AUDIT=1 or use privileged live mode)"
+fi
+remote_audit_token=
+public_audit_token=
+unset GH_TOKEN GITHUB_TOKEN
+
 # ── Development-agent control plane: fail before paying for any product build. The audit checks
 #    both Claude and Codex wiring/config parity; the selftest proves lifecycle, isolation, scope,
 #    stale-attestation rejection and the known hook bypasses with fake agents only. ──
@@ -28,12 +58,6 @@ scripts/agent-harness selftest --ci
 
 echo "── development agent eval harness: deterministic self-test ──"
 scripts/agent-harness eval selftest
-
-echo "── development agent remote-policy evaluator: deterministic self-test ──"
-# This tests the fail-closed policy logic without network/auth. The live GitHub
-# audit is a separate scheduled/operator preflight because harness checks are
-# intentionally network-denied and administration reads need explicit authority.
-scripts/agent-remote-audit --selftest
 
 echo "── swiftc: system-audio sidecar typecheck ──"
 if command -v swiftc >/dev/null 2>&1; then
@@ -86,9 +110,8 @@ echo "── cargo clippy (deny warnings) ──"
 ( cd src-tauri && cargo clippy --all-targets -- -D warnings )
 
 echo "── cargo test ──"
-# NOTE: the RAG eval gate (eval::bakeoff #[ignore] runners + eval/results/ artifact) is MANUAL —
-# it needs the embed model (and, for the real-vault run, a copied DB) so it is NOT run in CI;
-# see docs/RAG-BAKEOFF.md "Synthetic baseline" for the re-run command + merge rule.
+# The normal test set includes the deterministic synthetic FTS floor. Semantic/reranked and
+# note-generation quality remain manual: they require real local models and/or a labeled vault.
 ( cd src-tauri && cargo test --quiet )
 
 echo "── murmur-brain sidecar: clippy + tests ──"
@@ -168,12 +191,13 @@ npx ng build
 #    exercises Chromium + WebKit over synthetic Tauri IPC. Audio E2E is host-specific: it needs
 #    `say` (macOS TTS), ffmpeg, and a
 #    ~142 MB whisper model download (e2e-core.sh) — and cloud PR runners have no signed
-#    provider. `MURMUR_CI_SKIP_E2E=1` skips ONLY these three runtime/E2E steps (everything above still runs),
-#    so the GitHub Actions per-PR `gate` job reuses THIS script as the single source of truth
-#    instead of duplicating the command list. Default (unset) = full local behavior, unchanged.
-#    The full E2E runs locally and in the CI gate on PRs, weekly, and on demand. ──
+#    provider. The E2E provider is a deterministic no-egress stub by construction; the
+#    example contains no cloud-provider branch. `MURMUR_CI_SKIP_E2E=1` is a
+#    local-iteration escape hatch that skips
+#    ONLY these three runtime/E2E steps (everything above still runs). GitHub Actions never sets it:
+#    every PR, scheduled, and manually dispatched run executes this complete release-parity gate. ──
 if [ "${MURMUR_CI_SKIP_E2E:-0}" = "1" ]; then
-  echo "── headless E2E: SKIPPED (MURMUR_CI_SKIP_E2E=1) — run the full gate locally or via the CI full-gate job ──"
+  echo "── headless E2E: SKIPPED for local iteration (MURMUR_CI_SKIP_E2E=1) — GitHub CI always runs the full gate ──"
 else
   echo "── Playwright UI E2E (fresh server, Chromium + WebKit) ──"
   npm run test:e2e -- --workers=1

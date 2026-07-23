@@ -17,6 +17,7 @@ READ_ONLY_SEARCHES = {"grep", "rg"}
 MAX_DEPTH = 12
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RESOURCE_RUN = (REPO_ROOT / "scripts/agent-resource-run").resolve()
+DEV_RUN = (REPO_ROOT / "scripts/agent-dev-run").resolve()
 HEAVY_SCRIPTS = {
     (REPO_ROOT / "scripts/ci.sh").resolve(),
     (REPO_ROOT / "scripts/e2e-core.sh").resolve(),
@@ -40,6 +41,16 @@ NODE_OPTIONS_WITH_VALUE = {
 }
 TEST_GUARDIAN_ENV = "MURMUR_AGENT_SELFTEST_GUARDIAN_RELEASE"
 SAFE_SOURCE_TARGETS = {"$HOME/.cargo/env", "${HOME}/.cargo/env", "~/.cargo/env"}
+DEV_SCRIPTS = {"dev", "start"}
+DEV_PASSTHROUGH_FLAGS = {"--open", "--no-open", "--strict-port"}
+DEV_PASSTHROUGH_VALUE_FLAGS = {"--host", "--port"}
+RESERVED_RESOURCE_ENV = {
+    "MURMUR_AGENT_RESOURCE_LANE_ACTIVE",
+    "MURMUR_AGENT_DEV_PROXY_DIR",
+    "MURMUR_AGENT_DEV_PROXY_TOKEN",
+    "MURMUR_AGENT_DEV_REAL_CARGO",
+    "MURMUR_AGENT_DEV_REAL_RUSTC",
+}
 
 
 def resolved_command_path(token):
@@ -51,6 +62,140 @@ def resolved_command_path(token):
 
 def is_lane_runner(token):
     return resolved_command_path(token) == RESOURCE_RUN
+
+
+def is_dev_runner(token):
+    return resolved_command_path(token) == DEV_RUN
+
+
+def assignment_name(token):
+    if not ASSIGNMENT.match(token):
+        return None
+    return token.split("=", 1)[0]
+
+
+def dev_passthrough_is_allowed(tokens):
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token in DEV_PASSTHROUGH_FLAGS:
+            index += 1
+            continue
+        if token in DEV_PASSTHROUGH_VALUE_FLAGS:
+            if index + 1 >= len(tokens):
+                return False
+            value = tokens[index + 1]
+            index += 2
+        elif token.startswith("--port="):
+            value = token.split("=", 1)[1]
+            token = "--port"
+            index += 1
+        elif token.startswith("--host="):
+            value = token.split("=", 1)[1]
+            token = "--host"
+            index += 1
+        else:
+            return False
+        if token == "--port":
+            if not value.isdigit() or not 1 <= int(value) <= 65535:
+                return False
+        elif not re.fullmatch(r"[A-Za-z0-9_.:\[\]-]+", value):
+            return False
+    return True
+
+
+def dev_command_is_allowed(tokens):
+    if len(tokens) < 3 or basename(tokens[0]) != "npm":
+        return False
+    if tokens[1] not in ("run", "run-script") or tokens[2] not in DEV_SCRIPTS:
+        return False
+    remainder = tokens[3:]
+    if not remainder:
+        return True
+    return remainder[0] == "--" and dev_passthrough_is_allowed(remainder[1:])
+
+
+def runner_command_index(tokens, index, value_options):
+    index += 1
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "--":
+            return index + 1
+        if any(token.startswith(option + "=") for option in value_options):
+            index += 1
+            continue
+        if token in value_options:
+            if index + 1 >= len(tokens):
+                return len(tokens)
+            index += 2
+            continue
+        if token.startswith("-"):
+            return len(tokens)
+        return index
+    return index
+
+
+def dev_runner_invocation_is_allowed(tokens, index):
+    nested = runner_command_index(
+        tokens,
+        index,
+        {"--chdir", "--term-grace-seconds"},
+    )
+    return nested < len(tokens) and dev_command_is_allowed(tokens[nested:])
+
+
+def segment_is_dev(tokens, depth):
+    if not tokens or depth > MAX_DEPTH:
+        return True
+    index = skip_assignments(tokens, 0)
+    if index >= len(tokens):
+        return False
+    executable = basename(tokens[index])
+
+    if is_dev_runner(tokens[index]):
+        return False
+    if is_lane_runner(tokens[index]):
+        nested = runner_command_index(
+            tokens,
+            index,
+            {"--chdir", "--deadline-seconds", "--term-grace-seconds"},
+        )
+        return nested < len(tokens) and segment_is_dev(tokens[nested:], depth + 1)
+    if executable in ("npm", "yarn", "pnpm", "bun"):
+        cursor = first_non_option(tokens, index + 1)
+        if cursor >= len(tokens):
+            return False
+        action = tokens[cursor]
+        if action in ("run", "run-script"):
+            cursor = first_non_option(tokens, cursor + 1)
+            return cursor < len(tokens) and tokens[cursor] in DEV_SCRIPTS
+        return action in DEV_SCRIPTS
+    if executable in ("npx", "pnpx", "bunx"):
+        cursor = first_non_option(tokens, index + 1)
+        return (
+            cursor + 1 < len(tokens)
+            and basename(tokens[cursor]) == "tauri"
+            and tokens[cursor + 1] == "dev"
+        )
+    if executable == "tauri":
+        return index + 1 < len(tokens) and tokens[index + 1] == "dev"
+    if executable in LAUNCHERS:
+        nested = launcher_command_index(tokens, index, executable, depth)
+        return segment_is_dev(tokens[nested:], depth + 1)
+    if executable in SHELLS:
+        cursor = index + 1
+        while cursor < len(tokens):
+            token = tokens[cursor]
+            if token == "--":
+                cursor += 1
+                break
+            if token.startswith("-") and token != "-":
+                if "c" in token[1:] and cursor + 1 < len(tokens):
+                    return command_is_dev(tokens[cursor + 1], depth + 1)
+                cursor += 1
+                continue
+            break
+    return False
 
 
 def is_repo_script(path):
@@ -340,15 +485,29 @@ def segment_is_heavy(tokens, depth):
             path.name in raw for path in HEAVY_SCRIPTS
         )
 
+    if any(assignment_name(token) in RESERVED_RESOURCE_ENV for token in tokens):
+        return True
     index = skip_assignments(tokens, 0)
     if index >= len(tokens):
         return False
     executable = basename(tokens[index])
 
     if is_lane_runner(tokens[index]):
-        return False
+        nested = runner_command_index(
+            tokens,
+            index,
+            {"--chdir", "--deadline-seconds", "--term-grace-seconds"},
+        )
+        # A long-lived server may not own the flock. All other commands are
+        # safe here because the exact canonical lane runner supervises them.
+        return nested < len(tokens) and segment_is_dev(tokens[nested:], depth + 1)
     if executable == "agent-resource-run":
         # A same-named executable outside this repository is not the supervisor.
+        return True
+    if is_dev_runner(tokens[index]):
+        return not dev_runner_invocation_is_allowed(tokens, index)
+    if executable == "agent-dev-run":
+        # A same-named executable outside this repository is not the dev supervisor.
         return True
     if is_dynamic_executable(tokens[index]):
         return True
@@ -434,6 +593,22 @@ def command_is_heavy(command, depth=0):
         if command_is_heavy(substitution_body, depth + 1):
             return True
     return any(segment_is_heavy(segment, depth) for segment in command_segments(tokenize(command)))
+
+
+def command_is_dev(command, depth=0):
+    if depth > MAX_DEPTH:
+        return True
+    return any(segment_is_dev(segment, depth) for segment in command_segments(tokenize(command)))
+
+
+def command_is_dev_in(command, cwd):
+    """Classify long-lived dev commands using the hook payload execution directory."""
+    previous = Path.cwd()
+    try:
+        os.chdir(cwd)
+        return command_is_dev(command)
+    finally:
+        os.chdir(previous)
 
 
 def command_is_heavy_in(command, cwd):
