@@ -62,7 +62,6 @@
     "lock": [
       "src-tauri/src/crypto.rs",
       "src-tauri/src/secrets/**",
-      "src-tauri/src/biometric.rs",
       "src-tauri/src/screenshare.rs",
       "src-tauri/src/storage/**",
       "src-tauri/src/commands/lock.rs",
