@@ -318,10 +318,7 @@ fn build_import_user_prompt(text: &str) -> String {
 /// command resolves the LIGHT local-or-stub reasoner (`import_extraction_reasoner` in commands.rs
 /// — NEVER cloud; the FE copy promises on-device, and a pasted third-party memory export must not
 /// ride the cloud Notes provider). No local model ⇒ nothing extracted ⇒ 0 imported.
-pub fn extract_imported_memories(
-    reasoner: &dyn LocalReasoner,
-    text: &str,
-) -> Vec<FactCandidate> {
+pub fn extract_imported_memories(reasoner: &dyn LocalReasoner, text: &str) -> Vec<FactCandidate> {
     if reasoner.id() == "stub" {
         return Vec::new();
     }
@@ -531,7 +528,10 @@ mod tests {
 
         // Query matching ONE fact → the brief contains ONLY that fact.
         let brief = build_memory_brief(&db, "what is the deadline for Atlas?", &unlocked);
-        assert!(brief.contains("Project Atlas"), "matching fact present: {brief}");
+        assert!(
+            brief.contains("Project Atlas"),
+            "matching fact present: {brief}"
+        );
         assert!(
             !brief.contains("Polish replies"),
             "non-matching fact filtered out: {brief}"

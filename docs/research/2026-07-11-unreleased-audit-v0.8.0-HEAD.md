@@ -170,7 +170,7 @@ Matches verified finding WT-F1 below: the new selection bubble re-floats after A
 
 Touch ID KEK release, real screen-share auto-relock, lock-at-rest on disk, real
 turbo/parakeet decode wall-times + Polish caption quality under flash-attn+VAD, sidecar RAM
-reclaim + 90 s ready bound with a real GGUF, notarized fat `Resources/meetnotes-brain`,
+reclaim + 90 s ready bound with a real GGUF, notarized fat `Resources/murmur-brain`,
 watts via powermetrics, live L4 bullet quality, real MCP servers.
 
 ## Release-blocker shortlist (before any 0.8.x/0.9 cut)

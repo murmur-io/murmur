@@ -24,6 +24,8 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
+import resource_policy
+
 
 SOURCE_ROOT = Path(__file__).resolve().parents[2]
 HARNESS_ROOT = SOURCE_ROOT / ".agents" / "harness"
@@ -276,7 +278,39 @@ def _effective_tokens(tokens: Sequence[str]) -> Tuple[str, ...]:
 def _unsupported_execution_indirection(command: str) -> Optional[str]:
     """Fail closed when the hook cannot see the executable command directly."""
 
-    if "$(" in command or "`" in command or "<(" in command or ">(" in command:
+    single_quoted = False
+    double_quoted = False
+    escaped = False
+    active_shell_indirection = False
+    index = 0
+    while index < len(command):
+        character = command[index]
+        if escaped:
+            escaped = False
+            index += 1
+            continue
+        if character == "\\" and not single_quoted:
+            escaped = True
+            index += 1
+            continue
+        if character == "'" and not double_quoted:
+            single_quoted = not single_quoted
+            index += 1
+            continue
+        if character == '"' and not single_quoted:
+            double_quoted = not double_quoted
+            index += 1
+            continue
+        if not single_quoted and (
+            character == "`"
+            or command.startswith("$(", index)
+            or command.startswith("<(", index)
+            or command.startswith(">(", index)
+        ):
+            active_shell_indirection = True
+            break
+        index += 1
+    if active_shell_indirection:
         return "shell substitution/process indirection is unsupported by the command guard"
     for simple in _simple_commands(command):
         raw = list(simple.tokens)
@@ -284,7 +318,7 @@ def _unsupported_execution_indirection(command: str) -> Optional[str]:
             raw.pop(0)
         if raw and Path(raw[0]).name == "env":
             if any(
-                token in {"-S", "--split-string"} or token.startswith("--split-string=")
+                token == "--split-string" or token.startswith("--split-string=") or token.startswith("-S")
                 for token in raw[1:]
             ):
                 return "env --split-string/-S is unsupported by the command guard"
@@ -453,6 +487,11 @@ def _block_bash(command: str, process_cwd: Path) -> Optional[str]:
             dangerous = {"/", "//", "/*", "~", "~/", "~/*", "$HOME", "${HOME}", "$HOME/", "${HOME}/"}
             if recursive and any(token in dangerous for token in targets):
                 return "recursive deletion of filesystem root or the home directory is forbidden"
+    if resource_policy.command_is_heavy_in(command, process_cwd):
+        return (
+            "unwrapped resource-heavy build/test/dev command; run it through "
+            "scripts/agent-resource-run so Murmur worktrees share one supervised lane"
+        )
     return None
 
 
@@ -620,9 +659,22 @@ def _classify_actual_risks(paths: Sequence[str], config: Mapping[str, Any]) -> L
     return result
 
 
-def _validate_provenance(attestation: Mapping[str, Any], task: Mapping[str, Any]) -> None:
+def _validate_provenance(
+    attestation: Mapping[str, Any],
+    task: Mapping[str, Any],
+    *,
+    allow_test_adapter: bool = False,
+) -> None:
     writer = attestation["writer"]
     reviewer = attestation["reviewer"]
+    writer_vendor = task.get("writer")
+    reviewer_vendor = task.get("reviewer")
+    if allow_test_adapter and writer_vendor == reviewer_vendor == "fake":
+        pass
+    elif writer_vendor not in {"codex", "claude"} or reviewer_vendor not in {"codex", "claude"}:
+        raise GuardFailure("fake or unknown model vendors are forbidden outside harness selftests")
+    elif writer_vendor == reviewer_vendor:
+        raise GuardFailure("writer and reviewer must use different vendors")
     if writer.get("vendor") != task.get("writer"):
         raise GuardFailure("attestation writer does not match the task contract")
     if reviewer.get("vendor") != task.get("reviewer"):
@@ -631,17 +683,23 @@ def _validate_provenance(attestation: Mapping[str, Any], task: Mapping[str, Any]
         raise GuardFailure("writer round does not match attestation rounds")
 
     for label, identity in (("writer", writer), ("reviewer", reviewer)):
-        vendor = identity.get("vendor")
         for field in ("cli_version", "model"):
             value = identity.get(field)
-            if not isinstance(value, str) or (not value and vendor != "fake"):
+            if not isinstance(value, str) or not value:
                 raise GuardFailure(f"{label} provenance field {field} is empty")
     writer_session = writer.get("session_id")
     if not isinstance(writer_session, str) or not writer_session:
         raise GuardFailure("writer provenance session_id is empty")
 
 
-def _validate_attestation(repo: Path, common: Path, task: Dict[str, Any], task_dir: Path) -> None:
+def _validate_attestation(
+    repo: Path,
+    common: Path,
+    task: Dict[str, Any],
+    task_dir: Path,
+    *,
+    allow_test_adapter: bool = False,
+) -> None:
     runner = _task_runner_module()
     try:
         runner.validate_schema(task, runner.load_schema("task"), label="task contract")
@@ -736,7 +794,7 @@ def _validate_attestation(repo: Path, common: Path, task: Dict[str, Any], task_d
         missing = sorted(required_risks - set(attested_risks))
         raise GuardFailure("attestation is missing automatically classified risks: " + ", ".join(missing))
 
-    _validate_provenance(attestation, task)
+    _validate_provenance(attestation, task, allow_test_adapter=allow_test_adapter)
     rounds = attestation.get("rounds")
     if not isinstance(rounds, int) or rounds < 1 or rounds > int(task.get("max_repair_rounds", 0)) + 1:
         raise GuardFailure("attestation rounds exceed the bounded repair loop")
@@ -821,7 +879,7 @@ def _validate_attestation(repo: Path, common: Path, task: Dict[str, Any], task_d
         reviewer_sessions.add(session_id)
         for field in ("vendor", "cli_version", "model"):
             value = reviewer_run.get(field) if isinstance(reviewer_run, dict) else None
-            if not isinstance(value, str) or (not value and reviewer_run.get("vendor") != "fake"):
+            if not isinstance(value, str) or not value:
                 raise GuardFailure(f"review {kind} provenance field {field} is empty")
         if reviewer_run.get("vendor") != task.get("reviewer"):
             raise GuardFailure(f"review {kind} vendor does not match the independent reviewer contract")
@@ -847,12 +905,14 @@ def _validate_attestation(repo: Path, common: Path, task: Dict[str, Any], task_d
     # commit commands. Hooks may add contextual checks, but may never accept a
     # receipt that the canonical verifier rejects.
     try:
-        runner.verify_attestation(task, task_dir)
+        runner.verify_attestation(task, task_dir, allow_test_adapter=allow_test_adapter)
     except Exception as exc:
         raise GuardFailure(str(exc)) from exc
 
 
-def _finish_guard(command: str, process_cwd: Path) -> Optional[str]:
+def _finish_guard(
+    command: str, process_cwd: Path, *, allow_test_adapter: bool = False
+) -> Optional[str]:
     commits = [item for item in _git_invocations(command, process_cwd) if item.subcommand == "commit"]
     if not commits:
         return None
@@ -868,7 +928,13 @@ def _finish_guard(command: str, process_cwd: Path) -> Optional[str]:
             repo = _repo_for_invocation(commits[0])
             _, common, _, _ = _repo_context(repo)
             task, task_dir = _resolve_task(repo, common)
-            _validate_attestation(repo, common, task, task_dir)
+            _validate_attestation(
+                repo,
+                common,
+                task,
+                task_dir,
+                allow_test_adapter=allow_test_adapter,
+            )
             return None
         except GuardFailure as exc:
             reason = str(exc)
@@ -932,7 +998,18 @@ class _Selftest:
         extra_env: Optional[Mapping[str, str]] = None,
         use_default_finish: bool = False,
         payload_workdir: Optional[Path] = None,
+        allow_test_adapter: bool = False,
     ) -> Tuple[str, subprocess.CompletedProcess]:
+        if allow_test_adapter:
+            if action != "finish-guard":
+                raise RuntimeError("the internal test adapter is valid only for finish-guard selftests")
+            reason = _finish_guard(
+                command,
+                payload_workdir or cwd,
+                allow_test_adapter=True,
+            )
+            completed = subprocess.CompletedProcess([], 2 if reason else 0, b"", b"")
+            return ("BLOCK" if reason else "ALLOW"), completed
         wrapper = SOURCE_ROOT / f".{vendor}" / "hooks" / f"{action}.sh"
         env = os.environ.copy()
         env.pop("MURMUR_AGENT_TASK_ID", None)
@@ -972,7 +1049,17 @@ def _init_repo(path: Path) -> None:
     _run(["git", "config", "user.name", "Harness Selftest"], path)
     _run(["git", "config", "user.email", "harness@example.invalid"], path)
     (path / "base.txt").write_text("base\n", encoding="utf-8")
-    _run(["git", "add", "base.txt"], path)
+    cargo_src = path / "src-tauri" / "src"
+    cargo_src.mkdir(parents=True)
+    (path / "src-tauri" / "Cargo.toml").write_text(
+        '[package]\nname="hook-selftest"\nversion="0.0.0"\nedition="2021"\n',
+        encoding="utf-8",
+    )
+    (cargo_src / "lib.rs").write_text(
+        "#[cfg(test)] mod tests { #[test] fn smoke() { assert_eq!(2 + 2, 4); } }\n",
+        encoding="utf-8",
+    )
+    _run(["git", "add", "base.txt", "src-tauri/Cargo.toml", "src-tauri/src/lib.rs"], path)
     _run(["git", "commit", "-q", "-m", "base"], path)
 
 
@@ -996,11 +1083,12 @@ def _write_receipt(repo: Path, task_id: str, *, risk: bool = False) -> Tuple[Pat
     now = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
     checks = [{"id": "unit", "command": "test -f owned.txt", "timeout_seconds": 30}]
     if risk:
-        checks.extend(
-            [
-                {"id": "lock-negative", "command": "test -f owned.txt", "timeout_seconds": 30},
-                {"id": "lock-roundtrip", "command": "test -f owned.txt", "timeout_seconds": 30},
-            ]
+        checks.append(
+            {
+                "id": "rust-lib",
+                "command": runner.canonical_check_commands(runner.load_config())["rust-lib"],
+                "timeout_seconds": 60,
+            }
         )
     task: Dict[str, Any] = {
         "schema_version": 1,
@@ -1092,54 +1180,40 @@ def _linked_worktree_runner_case(test: _Selftest) -> None:
     with tempfile.TemporaryDirectory(prefix="murmur-hook-linked-worktree-") as temp:
         repo = Path(temp) / "repo"
         _init_repo(repo)
-        runner = HARNESS_ROOT / "task_runner.py"
-        init = subprocess.run(
-            [
-                sys.executable,
-                str(runner),
-                "init",
-                "hook-linked-integration",
-                "--kind",
-                "harness",
-                "--agent",
-                "fake",
-                "--reviewer",
-                "fake",
-                "--prompt",
-                "linked worktree hook integration",
-                "--owned",
-                "base.txt",
-                "--check",
-                "unit::test -f base.txt",
-                "--final-check",
-                "final::test -f base.txt",
-                "--no-expected-change",
-            ],
-            cwd=str(repo),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
+        runner = _task_runner_module()
+        init_args = argparse.Namespace(
+            task_id="hook-linked-integration",
+            kind="harness",
+            agent="fake",
+            reviewer="fake",
+            prompt="linked worktree hook integration",
+            owned=["base.txt"],
+            risk=[],
+            check=["unit::test -f base.txt"],
+            final_check=["final::test -f base.txt"],
+            max_repair_rounds=2,
+            base=None,
+            branch=None,
+            expected_change=False,
+            quiet=True,
+            _allow_test_adapter=True,
         )
-        if init.returncode != 0:
-            detail = (init.stderr or init.stdout).decode("utf-8", "replace").strip()
-            test.result("runner linked-worktree init", "FAIL: " + detail, "PASS")
-            return
+        previous_cwd = Path.cwd()
         try:
-            worktree = Path(json.loads(init.stdout.decode("utf-8"))["worktree"]).resolve()
-        except (KeyError, TypeError, json.JSONDecodeError) as exc:
-            test.result("runner linked-worktree manifest", f"FAIL: {exc}", "PASS")
+            os.chdir(repo)
+            runner.cmd_init(init_args)
+            contract, task_dir, _ = runner.load_task_from_current_repo(
+                "hook-linked-integration", repo
+            )
+            worktree = Path(contract["worktree_path"]).resolve()
+            if runner.run_task(contract, task_dir, allow_test_adapter=True) != "PASSED":
+                test.result("runner linked-worktree run", "FAIL", "PASS")
+                return
+        except Exception as exc:
+            test.result("runner linked-worktree init", f"FAIL: {exc}", "PASS")
             return
-        run = subprocess.run(
-            [sys.executable, str(runner), "run", "hook-linked-integration"],
-            cwd=str(repo),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-        )
-        if run.returncode != 0:
-            detail = (run.stderr or run.stdout).decode("utf-8", "replace").strip()
-            test.result("runner linked-worktree run", "FAIL: " + detail, "PASS")
-            return
+        finally:
+            os.chdir(previous_cwd)
         _, common, _, _ = _repo_context(worktree)
         task_dir = common / "agent-harness" / "tasks" / "hook-linked-integration"
         task = _load_json(task_dir / "task.json")
@@ -1150,7 +1224,13 @@ def _linked_worktree_runner_case(test: _Selftest) -> None:
         )
         test.result("runner receipt identifies linked worktree", "PASS" if paths_match else "FAIL", "PASS")
         for vendor in ("codex", "claude"):
-            got, _ = test.invoke(vendor, "finish-guard", "git commit -m integration", worktree)
+            got, _ = test.invoke(
+                vendor,
+                "finish-guard",
+                "git commit -m integration",
+                worktree,
+                allow_test_adapter=True,
+            )
             test.result(f"{vendor}: real runner linked receipt", got, "ALLOW")
             got, _ = test.invoke(
                 vendor,
@@ -1158,6 +1238,7 @@ def _linked_worktree_runner_case(test: _Selftest) -> None:
                 "git commit -m integration",
                 repo,
                 payload_workdir=worktree,
+                allow_test_adapter=True,
             )
             test.result(f"{vendor}: payload workdir selects linked receipt", got, "ALLOW")
 
@@ -1166,8 +1247,91 @@ def _linked_worktree_runner_case(test: _Selftest) -> None:
             test.result("runner review artifact exists", "FAIL", "PASS")
             return
         artifact.write_text('{"tampered":true}\n', encoding="utf-8")
-        got, _ = test.invoke("codex", "finish-guard", "git commit -m integration", worktree)
+        got, _ = test.invoke(
+            "codex",
+            "finish-guard",
+            "git commit -m integration",
+            worktree,
+            allow_test_adapter=True,
+        )
         test.result("codex: tampered runner artifact", got, "BLOCK")
+
+
+def _resource_lane_runner_cases(test: _Selftest) -> None:
+    """Exercise the bounded supervisor without launching any product build."""
+
+    runner = SOURCE_ROOT / "scripts" / "agent-resource-run"
+    test.result(
+        "resource lane runner is executable",
+        "PASS" if runner.is_file() and os.access(runner, os.X_OK) else "FAIL",
+        "PASS",
+    )
+    with tempfile.TemporaryDirectory(prefix="murmur-resource-lane-") as temp:
+        repo = Path(temp) / "repo"
+        repo.mkdir()
+        _run(["git", "init", "-q"], repo)
+
+        completed = subprocess.run(
+            [str(runner), "--deadline-seconds", "3", "--", "sh", "-c", "exit 0"],
+            cwd=str(repo),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        test.result(
+            "resource lane runner executes a light command",
+            "PASS" if completed.returncode == 0 else f"FAIL({completed.returncode})",
+            "PASS",
+        )
+
+        completed = subprocess.run(
+            [
+                str(runner),
+                "--deadline-seconds",
+                "3",
+                "--",
+                "sh",
+                "-c",
+                'test "$CARGO_BUILD_JOBS" = 2 && test "$RUST_TEST_THREADS" = 1 && '
+                'test "$RAYON_NUM_THREADS" = 2 && test "$OMP_NUM_THREADS" = 1 && '
+                'test "$VECLIB_MAXIMUM_THREADS" = 1',
+            ],
+            cwd=str(repo),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        test.result(
+            "resource lane runner injects bounded defaults",
+            "PASS" if completed.returncode == 0 else f"FAIL({completed.returncode})",
+            "PASS",
+        )
+
+        started = dt.datetime.now(dt.timezone.utc)
+        completed = subprocess.run(
+            [
+                str(runner),
+                "--deadline-seconds",
+                "0.20",
+                "--term-grace-seconds",
+                "0.05",
+                "--",
+                "sh",
+                "-c",
+                "sleep 5",
+            ],
+            cwd=str(repo),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=5,
+        )
+        elapsed = (dt.datetime.now(dt.timezone.utc) - started).total_seconds()
+        test.result(
+            "resource lane runner enforces aggregate deadline",
+            "PASS" if completed.returncode == 124 and elapsed < 3 else f"FAIL({completed.returncode})",
+            "PASS",
+        )
 
 
 def _run_selftest() -> int:
@@ -1188,7 +1352,7 @@ def _run_selftest() -> int:
                 ("notary credential store", "xcrun notarytool store-credentials murmur", "BLOCK"),
                 ("notary submit", "xcrun notarytool submit app.dmg --wait", "ALLOW"),
                 ("cargo toolchain clippy", "cargo +stable clippy --all-targets", "BLOCK"),
-                ("cargo test", "cargo test --lib", "ALLOW"),
+                ("cargo test", "cargo test --lib", "BLOCK"),
                 ("codesign deep", "/usr/bin/codesign --deep --sign X app", "BLOCK"),
                 ("codesign helper", "/usr/bin/codesign --options runtime --sign X helper", "ALLOW"),
                 ("root delete", "/bin/rm -rf -- /", "BLOCK"),
@@ -1213,6 +1377,46 @@ def _run_selftest() -> int:
             for action in ("block-bash", "secret-scan", "finish-guard"):
                 for label, command in indirections:
                     test.expect(f"{action} rejects {label}", vendor, action, command, repo, "BLOCK")
+                test.expect(f"{action} permits direct command", vendor, action, "git status --short", repo, "ALLOW")
+                test.expect(
+                    f"{action} permits quoted indirection text",
+                    vendor,
+                    action,
+                    "rg '$(literal only)' .",
+                    repo,
+                    "ALLOW",
+                )
+
+        resource_cases = [
+            ("direct cargo metadata", "cargo metadata --no-deps", "BLOCK"),
+            ("direct Rust test", "cd src-tauri && cargo test --lib", "BLOCK"),
+            ("direct Angular build", "npx ng build", "BLOCK"),
+            ("direct npm dev", "npm run dev", "BLOCK"),
+            ("direct full CI", "bash scripts/ci.sh", "BLOCK"),
+            ("read-only cargo search", "rg 'cargo test --lib' .", "ALLOW"),
+            (
+                "lane-wrapped Rust test",
+                "scripts/agent-resource-run --chdir src-tauri -- cargo test --lib",
+                "ALLOW",
+            ),
+            (
+                "lane-wrapped full CI",
+                "scripts/agent-resource-run -- bash scripts/ci.sh",
+                "ALLOW",
+            ),
+            (
+                "lookalike lane runner",
+                "/tmp/scripts/agent-resource-run -- cargo test --lib",
+                "BLOCK",
+            ),
+            (
+                "test-only guardian env",
+                "MURMUR_AGENT_SELFTEST_GUARDIAN_RELEASE=/tmp/x scripts/agent-resource-run -- true",
+                "BLOCK",
+            ),
+        ]
+        for label, command, want in resource_cases:
+            test.expect(label, vendor, "block-bash", command, SOURCE_ROOT, want)
 
     print("-- staged secret scan (no path exclusions) --")
     for vendor in ("codex", "claude"):
@@ -1259,23 +1463,37 @@ def _run_selftest() -> int:
 
         task_dir, task, attestation = _write_receipt(repo, "fresh")
         got, _ = test.invoke(vendor, "finish-guard", "git commit -m x", repo)
-        test.result(f"{vendor}: fresh receipt", got, "ALLOW")
+        test.result(f"{vendor}: production rejects fake receipt", got, "BLOCK")
+        got, _ = test.invoke(
+            vendor,
+            "finish-guard",
+            "git commit -m x",
+            repo,
+            allow_test_adapter=True,
+        )
+        test.result(f"{vendor}: internal selftest accepts fresh receipt", got, "ALLOW")
 
         (task_dir / "attestation.json").write_text('{"verdict":"PASS"}\n', encoding="utf-8")
-        got, _ = test.invoke(vendor, "finish-guard", "git commit -m x", repo)
+        got, _ = test.invoke(
+            vendor, "finish-guard", "git commit -m x", repo, allow_test_adapter=True
+        )
         test.result(f"{vendor}: minimal receipt", got, "BLOCK")
 
         (task_dir / "attestation.json").write_text(json.dumps(attestation, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         attestation["reviews"][0]["verdict"] = "FAIL"
         (task_dir / "attestation.json").write_text(json.dumps(attestation, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        got, _ = test.invoke(vendor, "finish-guard", "git commit -m x", repo)
+        got, _ = test.invoke(
+            vendor, "finish-guard", "git commit -m x", repo, allow_test_adapter=True
+        )
         test.result(f"{vendor}: failed review", got, "BLOCK")
 
         # Rebuild a fresh receipt, then mutate the staged tree.
         task_dir, task, attestation = _write_receipt(repo, "fresh")
         (repo / "owned.txt").write_text("changed again\n", encoding="utf-8")
         _run(["git", "add", "owned.txt"], repo)
-        got, _ = test.invoke(vendor, "finish-guard", "git commit -m x", repo)
+        got, _ = test.invoke(
+            vendor, "finish-guard", "git commit -m x", repo, allow_test_adapter=True
+        )
         test.result(f"{vendor}: changed staged hash", got, "BLOCK")
 
         # Remove the non-risk task so discovery remains unambiguous, then prove
@@ -1286,19 +1504,26 @@ def _run_selftest() -> int:
         task_dir, task, attestation = _write_receipt(repo, "lock-risk", risk=True)
         attestation["reviews"] = [review for review in attestation["reviews"] if review["kind"] != "lock-security"]
         (task_dir / "attestation.json").write_text(json.dumps(attestation, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        got, _ = test.invoke(vendor, "finish-guard", "git commit -m x", repo)
+        got, _ = test.invoke(
+            vendor, "finish-guard", "git commit -m x", repo, allow_test_adapter=True
+        )
         test.result(f"{vendor}: missing risk review", got, "BLOCK")
 
         task_dir, task, attestation = _write_receipt(repo, "lock-risk")
         attestation["reviews"][0]["reviewer"]["session_id"] = attestation["writer"]["session_id"]
         (task_dir / "attestation.json").write_text(json.dumps(attestation, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        got, _ = test.invoke(vendor, "finish-guard", "git commit -m x", repo)
+        got, _ = test.invoke(
+            vendor, "finish-guard", "git commit -m x", repo, allow_test_adapter=True
+        )
         test.result(f"{vendor}: reviewer reused writer session", got, "BLOCK")
 
         shutil.rmtree(repo.parent)
 
     print("-- real runner / linked-worktree integration --")
     _linked_worktree_runner_case(test)
+
+    print("-- repo-global resource lane --")
+    _resource_lane_runner_cases(test)
 
     if test.failures:
         print("guardrail self-test: FAIL")

@@ -13,6 +13,7 @@ import { IpcService } from "../../../core/ipc.service";
 import type {
   AccountStatus,
   MyShareEntry,
+  NoteAttachmentDto,
   OrgShareEntry,
   OrgSourceShareStatus,
   OrgStatus,
@@ -98,11 +99,26 @@ export class SharePanelComponent {
   /** True when the meeting is sealed-and-not-session-unlocked (never reached — the shell
    *  renders the lock gate instead — but kept fail-closed for safety). */
   readonly locked = input(false);
+  /** Only image attachments referenced by this meeting note's markdown. */
+  readonly attachments = input<readonly NoteAttachmentDto[]>([]);
+  readonly attachmentBytes = computed(() =>
+    this.attachments().reduce((total, attachment) => total + attachment.byteLen, 0),
+  );
 
   /** Emitted after any create/revoke so the shell can refresh a dependent count. */
   readonly changed = output<void>();
   /** Emitted when the gate's CTA is pressed → the shell routes to Settings › Sharing. */
   readonly setupSharing = output<void>();
+
+  formatAttachmentBytes(bytes: number): string {
+    if (bytes < 1024) {
+      return `${bytes} B`;
+    }
+    if (bytes < 1024 * 1024) {
+      return `${(bytes / 1024).toFixed(1)} KB`;
+    }
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  }
 
   // --- Account + gate -------------------------------------------------------
   private readonly accountStatus = signal<AccountStatus | null>(null);

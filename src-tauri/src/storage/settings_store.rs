@@ -12,6 +12,19 @@ use rusqlite::OptionalExtension;
 use crate::error::Result;
 use crate::storage::db::{map_err, Db};
 
+fn delete_all_vector_partitions(tx: &rusqlite::Transaction<'_>) -> Result<()> {
+    // vec0 tables do not participate in the source tables' foreign-key cascades. Delete all four
+    // model-dependent partitions explicitly; no plaintext/chunk row is read or removed.
+    tx.execute("DELETE FROM vec_chunks", []).map_err(map_err)?;
+    tx.execute("DELETE FROM topic_vec_chunks", [])
+        .map_err(map_err)?;
+    tx.execute("DELETE FROM doc_vec_chunks", [])
+        .map_err(map_err)?;
+    tx.execute("DELETE FROM org_vec_chunks", [])
+        .map_err(map_err)?;
+    Ok(())
+}
+
 impl Db {
     // ── settings k/v table ───────────────────────────────────────────────────
 
@@ -34,6 +47,46 @@ impl Db {
             rusqlite::params![key, value],
         )
         .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Persist the selected embedding-model id and, when its resolved model changed, invalidate
+    /// every vector partition in the SAME transaction. Chunks + FTS stay intact, so retrieval
+    /// degrades to keyword-only until the explicit/background reindex repopulates vectors.
+    ///
+    /// Atomicity is load-bearing: saving model B and crashing before deleting model-A vectors
+    /// would make the next launch encode B queries against an incompatible A index. The caller
+    /// owns the process-wide embed-selection write barrier, so no guarded vector writer can land
+    /// output between this invalidation and publication of B.
+    pub fn set_embed_model_selection(
+        &self,
+        model_id: &str,
+        invalidate_vectors: bool,
+    ) -> Result<()> {
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        tx.execute(
+            "INSERT INTO settings (key, value) VALUES ('embed_model_id', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            rusqlite::params![model_id],
+        )
+        .map_err(map_err)?;
+        if invalidate_vectors {
+            delete_all_vector_partitions(&tx)?;
+        }
+        tx.commit().map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Clear every model-dependent vector partition in one transaction while preserving all
+    /// canonical source rows, chunks, FTS indexes, and Org feed cursors. Full reindex calls this
+    /// before writing the first new vector, so an interrupted rebuild is new-model-or-empty rather
+    /// than a silently mixed old/new index.
+    pub fn invalidate_all_vector_embeddings(&self) -> Result<()> {
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        delete_all_vector_partitions(&tx)?;
+        tx.commit().map_err(map_err)?;
         Ok(())
     }
 

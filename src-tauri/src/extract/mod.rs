@@ -108,7 +108,8 @@ fn guard_extracted_text_size_with_ceiling(blocks: &[ExtractedBlock], ceiling: u6
         .fold(0u64, |acc, b| acc.saturating_add(b.text.len() as u64));
     if total > ceiling {
         return Err(AppError::InvalidArg(
-            "this document is too large to import — its extracted text exceeds the size limit".into(),
+            "this document is too large to import — its extracted text exceeds the size limit"
+                .into(),
         ));
     }
     Ok(())
@@ -163,7 +164,11 @@ pub fn no_progress(_p: ExtractProgress) {}
 /// The non-paged formats never call it. The UNIVERSAL extracted-text ceiling
 /// ([`MAX_EXTRACTED_TEXT_BYTES`]) is enforced once here over the assembled blocks, so EVERY format's
 /// accumulated output is memory-bounded (not just the zip containers).
-pub fn extract_blocks(path: &Path, ext: &str, progress: &ProgressFn<'_>) -> Result<Vec<ExtractedBlock>> {
+pub fn extract_blocks(
+    path: &Path,
+    ext: &str,
+    progress: &ProgressFn<'_>,
+) -> Result<Vec<ExtractedBlock>> {
     let blocks = match ext.to_ascii_lowercase().as_str() {
         "md" | "txt" => extract_text(path),
         "docx" => ooxml::extract_docx(path),
@@ -395,9 +400,15 @@ mod tests {
         );
         // Ceiling one below the total → the fold sums past it and fails closed with InvalidArg.
         let err = guard_extracted_text_size_with_ceiling(&blocks, 29).unwrap_err();
-        assert!(matches!(err, AppError::InvalidArg(_)), "over-ceiling fails closed: {err:?}");
+        assert!(
+            matches!(err, AppError::InvalidArg(_)),
+            "over-ceiling fails closed: {err:?}"
+        );
         // Production const is generously large — normal blocks never trip it.
-        assert!(guard_extracted_text_size(&blocks).is_ok(), "the real ceiling passes normal text");
+        assert!(
+            guard_extracted_text_size(&blocks).is_ok(),
+            "the real ceiling passes normal text"
+        );
     }
 
     /// Fix 4: the flow-format file-size sanity cap. A real small file passes the cap and reads back
@@ -419,7 +430,10 @@ mod tests {
     fn single_flow_block_stores_verbatim_and_round_trips() {
         let block = ExtractedBlock::plain("# Spec\n\nThe budget is 100k.");
         let stored = blocks_to_stored_text(std::slice::from_ref(&block));
-        assert_eq!(stored, "# Spec\n\nThe budget is 100k.", "stored verbatim, no markers");
+        assert_eq!(
+            stored, "# Spec\n\nThe budget is 100k.",
+            "stored verbatim, no markers"
+        );
         let back = blocks_from_stored_text(&stored);
         assert_eq!(back, vec![block], "round-trips to one plain block");
     }
@@ -446,7 +460,10 @@ mod tests {
         ];
         let stored = blocks_to_stored_text(&blocks);
         let back = blocks_from_stored_text(&stored);
-        assert_eq!(back, blocks, "page + heading + text all survive the round trip");
+        assert_eq!(
+            back, blocks,
+            "page + heading + text all survive the round trip"
+        );
     }
 
     /// Legacy text WITHOUT any sentinel (a pre-PR-2 row) reconstructs as ONE plain block (backward

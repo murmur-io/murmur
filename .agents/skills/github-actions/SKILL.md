@@ -39,7 +39,7 @@ step with that error, bump BOTH cache actions to current tags (resolve SHAs live
 
 ## Make it fast (or the team routes around it)
 
-- **`Swatinem/rust-cache`** with `workspaces: src-tauri`, AFTER the toolchain is resolved. This is the single biggest win — the always-compiled ML tree (mistralrs/candle) is hundreds of MB cold.
+- **`Swatinem/rust-cache`** with `workspaces: ". -> target"`, AFTER the toolchain is resolved. Cargo's virtual workspace and target directory are at the repository root; `src-tauri` would cache the obsolete path. This is the single biggest win — the always-compiled ML tree (mistralrs/candle) is hundreds of MB cold.
 - **`actions/setup-node` with `cache: npm`** + `npm ci` (not `npm install`) for a reproducible, cached FE install.
 - **Prebuilt cargo tools via `taiki-e/install-action`** (`tool: cargo-audit,cargo-deny`) so `ci.sh` finds them on PATH and skips its slow `cargo install`.
 - **Cache the heavy E2E inputs.** Since the 2026-07-05 release-parity change every PR runs the COMPLETE ci.sh (incl. audio E2E); the cost is tamed with a **whisper-model `actions/cache`** + `brew install ffmpeg` — the 142 MB model downloads once, not per PR. `MURMUR_CI_SKIP_E2E=1` is local-only.
@@ -60,7 +60,7 @@ jobs:
   gate:   # every PR + weekly + on-demand — the COMPLETE ci.sh (release parity)
     runs-on: macos-14
     steps: [ checkout, setup-node(node-version-file: .nvmrc, cache:npm), rustup show,
-             rust-cache(src-tauri), install-action(cargo-audit,cargo-deny),
+             rust-cache(. -> target), install-action(cargo-audit,cargo-deny),
              brew install ffmpeg, cache(whisper model), npm ci,
              run: bash scripts/ci.sh ]
 ```

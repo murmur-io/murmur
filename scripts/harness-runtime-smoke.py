@@ -46,10 +46,18 @@ def common_dir(root: Path) -> Path:
 
 
 def listener(port: int) -> str | None:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.settimeout(0.25)
-        if sock.connect_ex(("127.0.0.1", port)) != 0:
-            return None
+    listening = False
+    for family, host in ((socket.AF_INET, "127.0.0.1"), (socket.AF_INET6, "::1")):
+        try:
+            with socket.socket(family, socket.SOCK_STREAM) as sock:
+                sock.settimeout(0.25)
+                if sock.connect_ex((host, port)) == 0:
+                    listening = True
+                    break
+        except OSError:
+            continue
+    if not listening:
+        return None
     try:
         result = subprocess.run(
             ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN"],
@@ -64,11 +72,14 @@ def listener(port: int) -> str | None:
 
 
 def angular_ready() -> bool:
-    try:
-        with urllib.request.urlopen("http://127.0.0.1:1420", timeout=1) as response:
-            return 200 <= response.status < 500
-    except Exception:
-        return False
+    for url in ("http://127.0.0.1:1420", "http://localhost:1420"):
+        try:
+            with urllib.request.urlopen(url, timeout=1) as response:
+                if 200 <= response.status < 500:
+                    return True
+        except Exception:
+            continue
+    return False
 
 
 def emit(verdict: str, reason: str, log_path: Path | None, started_at: str) -> int:

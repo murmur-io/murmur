@@ -21,6 +21,8 @@ use crate::error::{AppError, Result};
 use crate::storage::db::{map_err, Db, RawDocument};
 use crate::storage::models::{Folder, NoteFolder, PropertySchemaField};
 
+pub(crate) type MeetingNoteExportRow = (String, String, String, Option<String>);
+
 impl Db {
     /// The owning folder id for a document, or `None` if unknown. The folder-lock gate anchor.
     pub fn folder_for_document(&self, id: &str) -> Result<Option<String>> {
@@ -95,7 +97,13 @@ impl Db {
         // Rust byte length — a multi-byte prefix (Polish "Sprzedaż") would otherwise slice mid-path
         // and corrupt every descendant. `char_length(old_path) + 1` picks up at the '/' after the
         // old prefix, so the leading slash survives into the rewritten path.
-        let like = format!("{}/%", old_path.replace('!', "!!").replace('%', "!%").replace('_', "!_"));
+        let like = format!(
+            "{}/%",
+            old_path
+                .replace('!', "!!")
+                .replace('%', "!%")
+                .replace('_', "!_")
+        );
         tx.execute(
             "UPDATE folders
                 SET path = ?1 || substr(path, ?2)
@@ -128,7 +136,13 @@ impl Db {
             rusqlite::params![
                 old_path,
                 new_path,
-                format!("{}/%", new_path.replace('!', "!!").replace('%', "!%").replace('_', "!_")),
+                format!(
+                    "{}/%",
+                    new_path
+                        .replace('!', "!!")
+                        .replace('%', "!%")
+                        .replace('_', "!_")
+                ),
             ],
         )
         .map_err(map_err)?;
@@ -182,6 +196,33 @@ impl Db {
         let mut out = Vec::new();
         for r in rows {
             out.push(r.map_err(map_err)?);
+        }
+        Ok(out)
+    }
+
+    /// Content-free cleanup authority for meeting-note vault exports in one folder. No markdown,
+    /// title, transcript, or audio path is selected, so interrupted-lock repair can locate governed
+    /// files before biometric authorization without pulling residual plaintext into the process.
+    pub fn meeting_note_export_rows_in_folder(
+        &self,
+        folder_id: &str,
+    ) -> Result<Vec<MeetingNoteExportRow>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT meeting_id, provider_id, exported_path, exported_hash
+                   FROM notes
+                  WHERE folder_id = ?1 AND exported_path IS NOT NULL",
+            )
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![folder_id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .map_err(map_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(map_err)?);
         }
         Ok(out)
     }
@@ -293,11 +334,9 @@ impl Db {
             rusqlite::params![id, chrono::Utc::now().to_rfc3339()],
         )
         .map_err(map_err)?;
-        conn.query_row(
-            "SELECT id FROM folders WHERE path = 'Notes'",
-            [],
-            |r| r.get::<_, String>(0),
-        )
+        conn.query_row("SELECT id FROM folders WHERE path = 'Notes'", [], |r| {
+            r.get::<_, String>(0)
+        })
         .map_err(map_err)
     }
 
@@ -441,9 +480,7 @@ impl Db {
             .prepare("SELECT id, COALESCE(kind, 'meeting') FROM folders")
             .map_err(map_err)?;
         let rows = stmt
-            .query_map([], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-            })
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
             .map_err(map_err)?;
         let mut out = std::collections::HashMap::new();
         for r in rows {
@@ -564,14 +601,46 @@ impl Db {
     /// updates `folder_id` on EVERY provider row of the meeting (`WHERE meeting_id = ?1`) — the
     /// note moves as a unit and the seal/unlock lifecycle (which iterates provider rows) stays
     /// coherent (no row left in a stale folder). `None` clears the folder (move to vault root).
+    /// A locked target additionally refuses any nonterminal generation or pending legacy recovery
+    /// marker in the SAME transaction, so no caller can associate unmanaged plaintext audio behind
+    /// a folder lock even if it bypasses the command-side recovery seam.
     pub fn set_meeting_folder(&self, meeting_id: &str, folder_id: Option<&str>) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        let blocked: bool = match folder_id {
+            Some(folder_id) => tx
+                .query_row(
+                    "SELECT EXISTS(
+                         SELECT 1
+                           FROM folders f
+                          WHERE f.id=?2 AND f.locked=1 AND (
+                                EXISTS(
+                                    SELECT 1 FROM recording_generations rg
+                                     WHERE rg.meeting_id=?1 AND rg.state!='RETIRED'
+                                ) OR EXISTS(
+                                    SELECT 1 FROM legacy_recording_recovery lr
+                                     WHERE lr.meeting_id=?1
+                                )
+                          )
+                     )",
+                    rusqlite::params![meeting_id, folder_id],
+                    |row| row.get(0),
+                )
+                .map_err(map_err)?,
+            None => false,
+        };
+        if blocked {
+            return Err(AppError::Locked(
+                "meeting has plaintext recording artifacts that are not governed by the locked folder"
+                    .into(),
+            ));
+        }
+        tx.execute(
             "UPDATE notes SET folder_id = ?2 WHERE meeting_id = ?1",
             rusqlite::params![meeting_id, folder_id],
         )
         .map_err(map_err)?;
-        Ok(())
+        tx.commit().map_err(map_err)
     }
 
     /// Back-compat alias for [`Db::set_meeting_folder`] — a note's folder is the meeting's folder.
@@ -626,7 +695,6 @@ impl Db {
         .map_err(map_err)
         .map(Option::flatten)
     }
-
 }
 
 /// Maps `(id, name, path, parent_id, locked, created_at)` → `Folder`.
@@ -652,7 +720,9 @@ fn row_to_note_folder(row: &Row<'_>) -> rusqlite::Result<NoteFolder> {
         // DB-only view: the session-unlock state is not a column. The `list_note_folders` command
         // fills this in from the live session set; every other reader gets `false` (safe default).
         unlocked: false,
-        kind: row.get::<_, Option<String>>(5)?.unwrap_or_else(|| "note".into()),
+        kind: row
+            .get::<_, Option<String>>(5)?
+            .unwrap_or_else(|| "note".into()),
         is_root: row.get::<_, i64>(6)? != 0,
     })
 }

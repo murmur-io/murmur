@@ -41,7 +41,7 @@ use super::decode_windows;
 use crate::audio;
 use crate::audio::merge::{merge_streams, StreamInput, SPEAKER_ME, SPEAKER_OTHERS};
 use crate::error::Result;
-use crate::transcribe::{Transcriber, TranscribeQuality};
+use crate::transcribe::{TranscribeQuality, Transcriber};
 
 /// Print panics loudly: payload + location (via `info`'s Display) + a FORCED backtrace
 /// (independent of RUST_BACKTRACE). In production this panic is swallowed by tokio; here it

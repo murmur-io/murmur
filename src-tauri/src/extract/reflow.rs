@@ -268,7 +268,10 @@ mod tests {
             "Staff Frontend Engineer",
             "building large-scale realtime web platforms",
         ] {
-            assert!(out.contains(needle), "reflow must recover {needle:?}\n---\n{out}\n---");
+            assert!(
+                out.contains(needle),
+                "reflow must recover {needle:?}\n---\n{out}\n---"
+            );
         }
         assert!(
             !out.contains("Fron\nt"),
@@ -285,7 +288,10 @@ mod tests {
             "the gate must NOT fire on the clean invoice"
         );
         let out = reflow_fragmented_text(INVOICE_CLEAN);
-        assert_eq!(out, INVOICE_CLEAN, "a clean invoice must pass through byte-identical");
+        assert_eq!(
+            out, INVOICE_CLEAN,
+            "a clean invoice must pass through byte-identical"
+        );
         assert!(out.contains("Invoice # INV-9752r79-2026-5"));
         assert!(out.contains("PLN zł49,883.33"));
     }
@@ -297,15 +303,31 @@ mod tests {
     #[test]
     fn weld_counterexamples_have_the_label_then_digit_shape_red_context() {
         // "Age" then "42": prev='e' (letter), next='4' (digit) — the shape the old code welded.
-        assert_eq!(join_kind(Some('e'), Some('4')), Join::Space, "label→digit value must space, not weld");
+        assert_eq!(
+            join_kind(Some('e'), Some('4')),
+            Join::Space,
+            "label→digit value must space, not weld"
+        );
         // "Intro" then "1": prev='o', next='1'.
-        assert_eq!(join_kind(Some('o'), Some('1')), Join::Space, "entry→page-number must space, not weld");
+        assert_eq!(
+            join_kind(Some('o'), Some('1')),
+            Join::Space,
+            "entry→page-number must space, not weld"
+        );
         // "Soup" then "5".
         assert_eq!(join_kind(Some('p'), Some('5')), Join::Space);
         // But a SPLIT NUMBER still welds: "90" then "7" (the CV phone) — prev='0' is a digit.
-        assert_eq!(join_kind(Some('0'), Some('7')), Join::Weld, "a split number must still weld");
+        assert_eq!(
+            join_kind(Some('0'), Some('7')),
+            Join::Weld,
+            "a split number must still weld"
+        );
         // And a genuine mid-word still welds: "Fron" then "t".
-        assert_eq!(join_kind(Some('n'), Some('t')), Join::Weld, "mid-word must still weld");
+        assert_eq!(
+            join_kind(Some('n'), Some('t')),
+            Join::Weld,
+            "mid-word must still weld"
+        );
     }
 
     /// A TOC page must NOT weld its entry titles onto their page numbers. Either the gate no-ops (the
@@ -336,7 +358,10 @@ mod tests {
             "a form label must never weld onto its value\n---\n{out}\n---"
         );
         // The gate also should not fire (2 short lines < floor; and 0 single-alpha lines).
-        assert!(!looks_fragmented(FORM_PAGE), "a form page must not trip the gate");
+        assert!(
+            !looks_fragmented(FORM_PAGE),
+            "a form page must not trip the gate"
+        );
     }
 
     /// NON-VACUOUS join proof: embed the label→value pair inside a document whose gate GENUINELY FIRES
@@ -346,14 +371,23 @@ mod tests {
     #[test]
     fn label_value_not_welded_even_when_gate_fires() {
         let frag = "Fron\nt\nend\nA\nng\nular\nb\nu\ni\nld\nRealt\nime\nAge\n42";
-        assert!(looks_fragmented(frag), "this mixed block must trip the gate (letter-spaced fragments)");
+        assert!(
+            looks_fragmented(frag),
+            "this mixed block must trip the gate (letter-spaced fragments)"
+        );
         let out = reflow_fragmented_text(frag);
-        assert!(out.contains("Frontend"), "mid-word fragments still recover\n---\n{out}\n---");
+        assert!(
+            out.contains("Frontend"),
+            "mid-word fragments still recover\n---\n{out}\n---"
+        );
         assert!(
             !out.contains("Age42"),
             "a label→value digit boundary must NOT weld even inside a firing block\n---\n{out}\n---"
         );
-        assert!(out.contains("Age 42"), "the label→value pair must be space-joined\n---\n{out}\n---");
+        assert!(
+            out.contains("Age 42"),
+            "the label→value pair must be space-joined\n---\n{out}\n---"
+        );
     }
 
     /// A vertical acronym list must not fire the gate (no single-letter lines) nor weld into one token.
@@ -364,7 +398,10 @@ mod tests {
             "a short-word list with no single-letter lines must not trip the gate"
         );
         let out = reflow_fragmented_text(ACRONYM_LIST);
-        assert!(!out.contains("AWSGCP"), "acronyms must stay separate tokens\n---\n{out}\n---");
+        assert!(
+            !out.contains("AWSGCP"),
+            "acronyms must stay separate tokens\n---\n{out}\n---"
+        );
         assert_eq!(out, ACRONYM_LIST, "gate no-op → byte-identical passthrough");
     }
 
@@ -384,7 +421,10 @@ mod tests {
     #[test]
     fn cv_phone_number_split_digits_reweld() {
         let out = reflow_fragmented_text(CV_FRAGMENT);
-        assert!(out.contains("907"), "the split phone number must re-weld to 907\n---\n{out}\n---");
+        assert!(
+            out.contains("907"),
+            "the split phone number must re-weld to 907\n---\n{out}\n---"
+        );
     }
 
     /// Normal prose / markdown is returned UNCHANGED (the gate no-ops). This is the same body the
@@ -392,7 +432,10 @@ mod tests {
     #[test]
     fn normal_prose_is_unchanged() {
         let prose = "# Spec\n\nThe budget is 100k.\n\nAnna owns delivery.";
-        assert!(!looks_fragmented(prose), "normal prose must not trip the gate");
+        assert!(
+            !looks_fragmented(prose),
+            "normal prose must not trip the gate"
+        );
         assert_eq!(reflow_fragmented_text(prose), prose);
     }
 
@@ -427,8 +470,12 @@ mod tests {
     /// blob). A fragmented doc with two paragraphs stays two paragraphs.
     #[test]
     fn paragraph_breaks_are_preserved() {
-        let frag = "Fron\nt\nend one\nA\nng\nular two\n\nRealt\nime three\nplat\nform four\nb\nu\ni\nld";
+        let frag =
+            "Fron\nt\nend one\nA\nng\nular two\n\nRealt\nime three\nplat\nform four\nb\nu\ni\nld";
         let out = reflow_fragmented_text(frag);
-        assert!(out.contains("\n\n"), "a blank-line paragraph break must survive\n{out}");
+        assert!(
+            out.contains("\n\n"),
+            "a blank-line paragraph break must survive\n{out}"
+        );
     }
 }

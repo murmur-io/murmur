@@ -616,6 +616,29 @@
 .body-wrap {
   position: relative;
 }
+.body-insert-bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin-bottom: var(--space-3);
+}
+.image-add-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--text-secondary);
+}
+.image-add-btn svg {
+  flex: none;
+}
+.body-insert-hint {
+  color: var(--text-muted);
+  font-size: 0.75rem;
+}
+.image-file-input {
+  display: none;
+}
 /* The grid mirror: the `::after` pseudo (fed by [data-value]="body()") renders the
    SAME text HIDDEN and sizes the single grid cell; the textarea overlays + fills it.
    Both share identical typography + box so they wrap line-for-line — the textarea

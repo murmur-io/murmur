@@ -6,6 +6,7 @@ import { mockTauri } from "../settings-ai/mock-invoke";
  * with plausible payloads so the whole Notes feature is drivable with no Rust
  * core. The command NAMES + camelCase DTOs match `ipc.service.ts` exactly:
  *   list_note_folders / list_notes / get_note / create_note / update_note_doc /
+ *   add_note_attachment / list_note_attachments / delete_note_attachment /
  *   move_note_doc / delete_note / export_note_doc / note_assistant_action /
  *   plan_organize_notes / apply_organize_plan / create_note_folder /
  *   rename_note_folder / delete_note_folder / move_note_folder / list_my_shares.
@@ -125,6 +126,49 @@ export async function mockNotes(
       locked: false,
       shared: false,
     }),
+    list_note_attachments: (args: {
+      ownerKind: "note" | "meeting" | "org";
+      ownerId: string;
+    }) => {
+      const rows = ((window as any).__noteAttachments ?? []) as any[];
+      return rows.filter(
+        (row) => row.ownerKind === args.ownerKind && row.ownerId === args.ownerId,
+      );
+    },
+    add_note_attachment: (args: {
+      ownerKind: "note" | "meeting" | "org";
+      ownerId: string;
+      mimeType: string;
+      dataBase64: string;
+    }) => ({
+      ...(() => {
+        const standard = args.dataBase64.replace(/-/g, "+").replace(/_/g, "/");
+        const padded = standard.padEnd(Math.ceil(standard.length / 4) * 4, "=");
+        const row = {
+          id: crypto.randomUUID(),
+          ownerKind: args.ownerKind,
+          ownerId: args.ownerId,
+          mimeType: args.mimeType,
+          extension: "webp",
+          byteLen: Math.floor((padded.length * 3) / 4),
+          width: 1,
+          height: 1,
+          sha256: "demo",
+          dataUrl: `data:image/webp;base64,${padded}`,
+        };
+        (window as any).__noteAttachments = [
+          ...((window as any).__noteAttachments ?? []),
+          row,
+        ];
+        return row;
+      })(),
+    }),
+    delete_note_attachment: (args: { attachmentId: string }) => {
+      (window as any).__noteAttachments = (
+        ((window as any).__noteAttachments ?? []) as any[]
+      ).filter((row) => row.id !== args.attachmentId);
+      return null;
+    },
     move_note_doc: () => null,
     delete_note: () => null,
     export_note_doc: () => "/Users/demo/Obsidian/Vault/Notes/My-First-Note.md",

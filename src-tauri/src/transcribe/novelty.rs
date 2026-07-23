@@ -333,7 +333,10 @@ mod tests {
         let mut buf2 = String::new();
         silent_ticks(&mut st2, &buf2, 5);
         buf2.push_str("a tam cokolwiek");
-        assert!(!st2.on_tick(&buf2, &noisy).fire, "1-char names are noise, not a trigger");
+        assert!(
+            !st2.on_tick(&buf2, &noisy).fire,
+            "1-char names are noise, not a trigger"
+        );
     }
 
     #[test]
@@ -346,11 +349,17 @@ mod tests {
         // 13 quiet ticks: still holding.
         silent_ticks(&mut st, &buf, NOVELTY_LULL_TICKS - 1);
         // The 14th quiet tick = the 42 s lull → fire on the pending text.
-        assert!(st.on_tick(&buf, &[]).fire, "the lull must flush pending text");
+        assert!(
+            st.on_tick(&buf, &[]).fire,
+            "the lull must flush pending text"
+        );
         // With NOTHING pending, a lull alone never fires.
         let mut idle = NoveltyState::default();
         for _ in 0..40 {
-            assert!(!idle.on_tick("", &[]).fire, "an empty recording must never fire");
+            assert!(
+                !idle.on_tick("", &[]).fire,
+                "an empty recording must never fire"
+            );
         }
     }
 
@@ -365,10 +374,16 @@ mod tests {
             assert!(!st.on_tick(&buf1, &[]).fire);
         }
         // Tick 5: floor cleared → the pending question fires.
-        assert!(st.on_tick(&buf1, &[]).fire, "the pending trigger fires at the floor");
+        assert!(
+            st.on_tick(&buf1, &[]).fire,
+            "the pending trigger fires at the floor"
+        );
         // Immediately after a fire, a fresh question waits the full floor again.
         let buf2 = format!("{buf1} no dobrze, a termin?");
-        assert!(!st.on_tick(&buf2, &[]).fire, "tick 1 after a fire is inside the floor");
+        assert!(
+            !st.on_tick(&buf2, &[]).fire,
+            "tick 1 after a fire is inside the floor"
+        );
         for _ in 0..3 {
             assert!(!st.on_tick(&buf2, &[]).fire);
         }
@@ -384,8 +399,15 @@ mod tests {
         let _ = t.take_delta(&long);
         let trimmed = format!("{} FRESH tail here", &long[60..].trim_end());
         let delta = t.take_delta(&trimmed);
-        assert_eq!(delta.trim_start(), "FRESH tail here", "only the new tail, got {delta:?}");
-        assert!(!delta.contains("word"), "no already-seen text re-surfaced: {delta:?}");
+        assert_eq!(
+            delta.trim_start(),
+            "FRESH tail here",
+            "only the new tail, got {delta:?}"
+        );
+        assert!(
+            !delta.contains("word"),
+            "no already-seen text re-surfaced: {delta:?}"
+        );
         // Anchor fully gone (buffer replaced) → bounded recent-tail rescan, never a lying slice.
         let mut t2 = TickDelta::default();
         let _ = t2.take_delta("completely original first buffer content");
@@ -408,7 +430,10 @@ mod tests {
             assert_eq!(got, 1, "cache always serves the list (tick {tick})");
         }
         // Tick 1 fetches, tick 61 fetches, tick 121 fetches: exactly 3 across 121 ticks.
-        assert_eq!(fetches, 3, "refresh exactly every {ENTITY_CACHE_REFRESH_TICKS} ticks");
+        assert_eq!(
+            fetches, 3,
+            "refresh exactly every {ENTITY_CACHE_REFRESH_TICKS} ticks"
+        );
     }
 
     // ── Boundary gate ───────────────────────────────────────────────────────────────────────────
@@ -445,7 +470,10 @@ mod tests {
             "a sentence-final '.' is a boundary even while speech continues"
         );
         let mut g2 = BoundaryGate::default();
-        assert!(g2.on_tick(true, true, "czy na pewno zdążymy?"), "'?' ends a sentence");
+        assert!(
+            g2.on_tick(true, true, "czy na pewno zdążymy?"),
+            "'?' ends a sentence"
+        );
         let mut g3 = BoundaryGate::default();
         assert!(g3.on_tick(true, true, "no i tyle…"), "'…' ends a sentence");
     }
@@ -455,7 +483,11 @@ mod tests {
         let mut g = BoundaryGate::default();
         let mut emitted_at = None;
         for tick in 1..=MAX_HOLD_TICKS {
-            if g.on_tick(true, true, "endless run-on sentence that never terminates and") {
+            if g.on_tick(
+                true,
+                true,
+                "endless run-on sentence that never terminates and",
+            ) {
                 emitted_at = Some(tick);
                 break;
             }
@@ -471,9 +503,15 @@ mod tests {
     fn empty_queue_never_emits_and_resets_hold() {
         let mut g = BoundaryGate::default();
         for _ in 0..20 {
-            assert!(!g.on_tick(false, false, "done."), "no pending ⇒ nothing to emit");
+            assert!(
+                !g.on_tick(false, false, "done."),
+                "no pending ⇒ nothing to emit"
+            );
         }
         // A fresh pending batch after a long idle emits on merit, not on stale hold ticks.
-        assert!(g.on_tick(true, false, "sentence over."), "sentence boundary applies");
+        assert!(
+            g.on_tick(true, false, "sentence over."),
+            "sentence boundary applies"
+        );
     }
 }

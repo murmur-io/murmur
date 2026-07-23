@@ -548,6 +548,10 @@ pub struct RedactingProvider {
     model_requested: String,
     /// Sink that receives one content-free audit row per call. `NoopEgressSink` by default.
     sink: Arc<dyn EgressSink>,
+    /// Production-only NER admission seam. Test/fixture constructors leave this `None`; the provider
+    /// factory supplies the shared heavy lane plus an optional exact recording token.
+    ner_heavy: Option<Arc<tokio::sync::Semaphore>>,
+    recording_token: Option<crate::perf::RecordingSessionToken>,
 }
 
 impl RedactingProvider {
@@ -562,6 +566,8 @@ impl RedactingProvider {
             inner,
             names: Arc::new(NoopNameRedactor),
             sink: Arc::new(NoopEgressSink),
+            ner_heavy: None,
+            recording_token: None,
         }
     }
 
@@ -579,6 +585,8 @@ impl RedactingProvider {
             inner,
             names,
             sink: Arc::new(NoopEgressSink),
+            ner_heavy: None,
+            recording_token: None,
         }
     }
 
@@ -604,7 +612,56 @@ impl RedactingProvider {
             provider_id,
             destination,
             model_requested,
+            ner_heavy: None,
+            recording_token: None,
         }
+    }
+
+    /// Production constructor with local NER lifecycle admission. The lease + heavy permit cover
+    /// only regex/NER preparation and are dropped BEFORE the cloud await, so Record never waits on
+    /// network I/O. If Start wins the race, unscoped admission fails and no plaintext egress occurs.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn with_name_redactor_sink_and_model_admission(
+        inner: Arc<dyn SummarizerProvider>,
+        names: Arc<dyn NameRedactor>,
+        sink: Arc<dyn EgressSink>,
+        provider_id: String,
+        destination: String,
+        model_requested: String,
+        heavy: Arc<tokio::sync::Semaphore>,
+        recording_token: Option<crate::perf::RecordingSessionToken>,
+    ) -> Self {
+        Self {
+            inner,
+            names,
+            sink,
+            provider_id,
+            destination,
+            model_requested,
+            ner_heavy: Some(heavy),
+            recording_token,
+        }
+    }
+
+    async fn run_name_redactor<T, F>(&self, f: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&dyn NameRedactor) -> Result<T> + Send + 'static,
+    {
+        if self.names.is_noop() {
+            return f(self.names.as_ref()); // no model, or an explicit fixture constructor.
+        }
+        let Some(heavy) = self.ner_heavy.as_ref() else {
+            return f(self.names.as_ref()); // explicit fixture/back-compat constructor.
+        };
+        let names = Arc::clone(&self.names);
+        crate::perf::run_heavy_with_admission(
+            heavy,
+            self.recording_token.clone(),
+            crate::perf::ResidentModelKind::Ner,
+            move || f(names.as_ref()),
+        )
+        .await
     }
 }
 
@@ -674,23 +731,6 @@ impl SummarizerProvider for RedactingProvider {
             .live_bullets
             .as_ref()
             .map(|c| redact_into(c, &mut map, &mut rev));
-        // Name layer (default no-op → text unchanged, `name_pairs` empty → byte-identical egress).
-        let (red_transcript, mut name_pairs) = self.names.redact_names(&red_transcript);
-        let red_related = red_related.map(|c| {
-            let (c2, more) = self.names.redact_names(&c);
-            name_pairs.extend(more);
-            c2
-        });
-        let red_notes = red_notes.map(|c| {
-            let (c2, more) = self.names.redact_names(&c);
-            name_pairs.extend(more);
-            c2
-        });
-        let red_bullets = red_bullets.map(|c| {
-            let (c2, more) = self.names.redact_names(&c);
-            name_pairs.extend(more);
-            c2
-        });
         // DEFENSE-IN-DEPTH — the note-format `template` rides the prompt as the SYSTEM message
         // (anthropic/gateway/claude_code providers) and `meta.title_hint` rides
         // `render_user_content`; both previously egressed VERBATIM inside `req.clone()`. Scrub them
@@ -729,25 +769,50 @@ impl SummarizerProvider for RedactingProvider {
         // `[[Anna Kowalska]].md` person page would egress verbatim. The conservative SYNTACTIC
         // detector `title_looks_like_person_name` covers that gap — active ONLY under the no-op, so
         // model-present installs keep the unchanged NER behavior.
-        let noop_ner = self.names.is_noop();
-        let red_titles: Vec<String> = req
-            .vault_titles
-            .iter()
-            .filter(|title| {
-                let title = title.as_str();
-                let (regex_scrubbed, _) = redact(title);
-                if regex_scrubbed.as_str() != title {
-                    return false; // an email/card/phone in the title → drop it
-                }
-                if noop_ner && title_looks_like_person_name(title) {
-                    return false; // no NER model → syntactic person-name fallback drops it
-                }
-                let (name_scrubbed, name_hits) = self.names.redact_names(title);
-                // a PERSON detected in the title → drop it (only fires when a NER model is present)
-                name_scrubbed.as_str() == title && name_hits.is_empty()
+        let titles = req.vault_titles.clone();
+        let (red_transcript, red_related, red_notes, red_bullets, name_pairs, red_titles) = self
+            .run_name_redactor(move |names| {
+                let (red_transcript, mut name_pairs) = names.redact_names(&red_transcript);
+                let red_related = red_related.map(|c| {
+                    let (c2, more) = names.redact_names(&c);
+                    name_pairs.extend(more);
+                    c2
+                });
+                let red_notes = red_notes.map(|c| {
+                    let (c2, more) = names.redact_names(&c);
+                    name_pairs.extend(more);
+                    c2
+                });
+                let red_bullets = red_bullets.map(|c| {
+                    let (c2, more) = names.redact_names(&c);
+                    name_pairs.extend(more);
+                    c2
+                });
+                let noop_ner = names.is_noop();
+                let red_titles = titles
+                    .into_iter()
+                    .filter(|title| {
+                        let (regex_scrubbed, _) = redact(title);
+                        if regex_scrubbed.as_str() != title {
+                            return false;
+                        }
+                        if noop_ner && title_looks_like_person_name(title) {
+                            return false;
+                        }
+                        let (name_scrubbed, name_hits) = names.redact_names(title);
+                        name_scrubbed.as_str() == title && name_hits.is_empty()
+                    })
+                    .collect();
+                Ok((
+                    red_transcript,
+                    red_related,
+                    red_notes,
+                    red_bullets,
+                    name_pairs,
+                    red_titles,
+                ))
             })
-            .cloned()
-            .collect();
+            .await?;
 
         // Byte sizes of the REDACTED content (sizes, never the text itself).
         let user_bytes = red_transcript.len()
@@ -762,6 +827,21 @@ impl SummarizerProvider for RedactingProvider {
         r.template = red_template;
         r.meta.title_hint = red_title_hint;
         r.vault_titles = red_titles;
+        if self.recording_token.is_none()
+            && self.ner_heavy.is_some()
+            && !self.names.is_noop()
+            && crate::perf::recording_has_priority()
+        {
+            return Err(AppError::Unavailable(
+                "cloud dispatch deferred because recording started during local redaction".into(),
+            ));
+        }
+        // NER/model work is complete. Never hold a local-model lease across the cloud await. The
+        // affine external-egress lease, however, MUST cover the entire awaited provider dispatch:
+        // either this call wins before Start/Draining and that transition waits, or the transition
+        // wins and no network call starts.
+        let _egress_lease =
+            crate::perf::acquire_external_egress_lease(self.recording_token.as_ref())?;
         let (out, meta) = self.inner.summarize_with_meta(&r).await?;
         // Restore both layers in the reply (disjoint token namespaces; order-independent).
         let out = restore_names(&out, &name_pairs);
@@ -800,14 +880,20 @@ impl SummarizerProvider for RedactingProvider {
         let user_bytes = ruser.len();
         // Name layer on each prompt (default no-op → unchanged). A stable-token NameRedactor maps
         // the same name to the same token across both prompts, so the merged pairs restore cleanly.
-        let (rsys, mut name_pairs) = self.names.redact_names(&rsys);
-        let (ruser, more) = self.names.redact_names(&ruser);
-        name_pairs.extend(more);
+        let noop_ner = self.names.is_noop();
+        let (rsys, ruser, name_pairs) = self
+            .run_name_redactor(move |names| {
+                let (rsys, mut name_pairs) = names.redact_names(&rsys);
+                let (ruser, more) = names.redact_names(&ruser);
+                name_pairs.extend(more);
+                Ok((rsys, ruser, name_pairs))
+            })
+            .await?;
         // R6 (P0.1 follow-up) — with NO NER model the name layer detects nothing, so person-name
         // TITLES (the JIT listing lines / [[wikilinks]] in the prompt) would egress verbatim on
         // this COMPLETE path. Apply the drop-only syntactic title scrub — active ONLY under the
         // no-op layer, exactly like the summarize path's vault-title fallback.
-        let (rsys, ruser) = if self.names.is_noop() {
+        let (rsys, ruser) = if noop_ner {
             (
                 scrub_person_name_titles(&rsys),
                 scrub_person_name_titles(&ruser),
@@ -815,6 +901,19 @@ impl SummarizerProvider for RedactingProvider {
         } else {
             (rsys, ruser)
         };
+        if self.recording_token.is_none()
+            && self.ner_heavy.is_some()
+            && !noop_ner
+            && crate::perf::recording_has_priority()
+        {
+            return Err(AppError::Unavailable(
+                "cloud dispatch deferred because recording started during local redaction".into(),
+            ));
+        }
+        // NER/model work is complete. Never hold a local-model lease across the cloud await; hold
+        // only the affine egress lease across the actual provider future.
+        let _egress_lease =
+            crate::perf::acquire_external_egress_lease(self.recording_token.as_ref())?;
         let (out, meta) = self.inner.complete_with_meta(&rsys, &ruser).await?;
         let out = restore_names(&out, &name_pairs);
         let out = restore(&out, &map);
@@ -860,12 +959,18 @@ impl SummarizerProvider for RedactingProvider {
         let user_bytes = ruser.len();
         // Name layer on each prompt (default no-op → unchanged). A stable-token NameRedactor maps
         // the same name to the same token across both prompts, so the merged pairs restore cleanly.
-        let (rsys, mut name_pairs) = self.names.redact_names(&rsys);
-        let (ruser, more) = self.names.redact_names(&ruser);
-        name_pairs.extend(more);
+        let noop_ner = self.names.is_noop();
+        let (rsys, ruser, name_pairs) = self
+            .run_name_redactor(move |names| {
+                let (rsys, mut name_pairs) = names.redact_names(&rsys);
+                let (ruser, more) = names.redact_names(&ruser);
+                name_pairs.extend(more);
+                Ok((rsys, ruser, name_pairs))
+            })
+            .await?;
         // R6 — same no-NER-only person-name-title scrub as `complete_with_meta` (the structured
         // side-tasks embed the same listing/wikilink title shapes).
-        let (rsys, ruser) = if self.names.is_noop() {
+        let (rsys, ruser) = if noop_ner {
             (
                 scrub_person_name_titles(&rsys),
                 scrub_person_name_titles(&ruser),
@@ -873,8 +978,19 @@ impl SummarizerProvider for RedactingProvider {
         } else {
             (rsys, ruser)
         };
+        if self.recording_token.is_none()
+            && self.ner_heavy.is_some()
+            && !noop_ner
+            && crate::perf::recording_has_priority()
+        {
+            return Err(AppError::Unavailable(
+                "cloud dispatch deferred because recording started during local redaction".into(),
+            ));
+        }
         // Forward to the INNER's own complete_json_with_meta — dispatches to the gateway's native
         // json_schema+meta override, or the trait default for anthropic/claude_code/ollama.
+        let _egress_lease =
+            crate::perf::acquire_external_egress_lease(self.recording_token.as_ref())?;
         let (value, meta) = self
             .inner
             .complete_json_with_meta(&rsys, &ruser, schema)
@@ -1262,6 +1378,53 @@ mod tests {
                 .unwrap();
         assert!(!out.contains("NAME_"));
         assert_eq!(out.matches("Anna Kowalska").count(), 2);
+    }
+
+    #[test]
+    fn production_ner_admission_blocks_background_but_accepts_exact_recording_token() {
+        let mut owner = crate::perf::begin_recording_session().unwrap();
+        owner.transition_to_live().unwrap();
+        let heavy = Arc::new(tokio::sync::Semaphore::new(1));
+
+        let background = RedactingProvider::with_name_redactor_sink_and_model_admission(
+            Arc::new(EchoProvider),
+            Arc::new(FixtureNameRedactor),
+            Arc::new(NoopEgressSink),
+            "echo".into(),
+            "test".into(),
+            "m".into(),
+            heavy.clone(),
+            None,
+        );
+        assert!(matches!(
+            block_on(background.complete("s", "Anna Kowalska")),
+            Err(AppError::Unavailable(_))
+        ));
+        assert!(matches!(
+            block_on(background.complete_json_with_meta(
+                "s",
+                "Anna Kowalska",
+                &serde_json::json!({"type": "object"}),
+            )),
+            Err(AppError::Unavailable(_))
+        ));
+
+        let recording = RedactingProvider::with_name_redactor_sink_and_model_admission(
+            Arc::new(EchoProvider),
+            Arc::new(FixtureNameRedactor),
+            Arc::new(NoopEgressSink),
+            "echo".into(),
+            "test".into(),
+            "m".into(),
+            heavy,
+            Some(owner.token()),
+        );
+        let out = block_on(recording.complete("s", "Anna Kowalska")).unwrap();
+        assert!(out.contains("Anna Kowalska"));
+
+        owner.transition_to_draining().unwrap();
+        owner.transition_to_postprocess().unwrap();
+        owner.finish().unwrap();
     }
 
     // ── Phase 2b — egress ledger ─────────────────────────────────────────────
@@ -1847,9 +2010,7 @@ mod tests {
         assert!(!title_looks_like_person_name("Anna")); // single word
         assert!(!title_looks_like_person_name("CI CD Pipeline")); // all-caps acronyms
         assert!(!title_looks_like_person_name("Clean retained title")); // lowercase words
-        assert!(!title_looks_like_person_name(
-            "Five Word Long Phrase Here"
-        )); // > 4 words
+        assert!(!title_looks_like_person_name("Five Word Long Phrase Here")); // > 4 words
         assert!(!title_looks_like_person_name("")); // empty
     }
 

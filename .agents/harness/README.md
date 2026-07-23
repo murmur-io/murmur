@@ -22,19 +22,21 @@ Create an isolated task:
 ```bash
 scripts/agent-harness init attachment-loss \
   --kind bug \
-  --agent codex \
-  --reviewer claude \
   --prompt "Fix attachment loss after closing a note" \
   --owned src-tauri/src/storage/attachment_store.rs \
   --owned src-tauri/src/commands/attachments.rs \
   --owned src-tauri/src/commands/tests/attachment_tests.rs \
   --risk lock \
-  --check 'rust::(cd src-tauri && cargo test --lib)' \
   --final-check 'ci::MURMUR_CI_SKIP_E2E=1 bash scripts/ci.sh'
 
 scripts/agent-harness run attachment-loss
 scripts/agent-harness status attachment-loss
 ```
+
+The repository invariant is **Claude writer -> Codex reviewer** by default, or the exact reverse
+when `--agent codex` is supplied. Writer and reviewer must be different real vendors. The `fake`
+adapter is not accepted by public `init`, verification, hooks, or commit; it exists only behind the
+in-process deterministic selftest interface.
 
 `init` always starts from a committed `base_sha`; it never copies dirty changes from the primary checkout.
 
@@ -60,7 +62,32 @@ UI checks receive a runner-owned `MURMUR_E2E_PORT` reservation for their full li
 Playwright config propagates that one value to its worker processes and refuses server reuse, so a
 test cannot silently attach to another task's Angular server.
 
-The default loop permits two repair rounds. The default reviewer is the other vendor. A task becomes `PASSED`, `FAILED`, or `BLOCKED`; it never retries forever.
+Every deterministic check also runs under a fail-closed macOS Seatbelt profile. It receives a
+fixed allowlist environment (no ambient tokens/DEKs), can write only the isolated worktree and
+explicit task-private runtime/cache leaves, and has no Internet access. The profile starts from
+macOS's `allow default` capability baseline and then imposes explicit file/network/process/secret
+denials; it is strong file/network containment, not a pure capability allowlist. Contracts, logs,
+reviews, and attestations remain parent-**writable** only; checks may read runner inputs needed for
+reproducibility but cannot create or alter evidence.
+The machine's Cargo registry, advisory database, tool binaries, and Rustup toolchains are exposed
+read-only; offline Cargo writes and build artifacts stay inside that one task.
+Playwright and native runtime probes get loopback TCP only. The profile, environment-key set,
+stdout/stderr and combined log are hash-bound into the attestation. If `sandbox-exec` is absent,
+the task is `BLOCKED`; checks never fall back to an unsandboxed shell.
+
+The default loop permits two repair rounds and has a two-hour task-wide deadline in addition to
+per-process timeouts. Two consecutive repair rounds with the same staged diff and the same
+failing-check/review signature stop as `BLOCKED/no progress`. Any terminal task stays terminal;
+an abandoned nonterminal run lands `BLOCKED/interrupted` instead of silently receiving a fresh
+repair budget. Retrying requires a new contract. A failed or
+blocked run emits a content-free `learning-candidate.json` for explicit human curation; it never
+edits binding learnings automatically.
+
+Risk evidence is runner-owned. Path classification automatically injects byte-exact canonical
+commands from `config.json`; a caller cannot satisfy a lock or egress requirement with a label such
+as `rust-lib::true`. Performance-sensitive paths add `perf-contracts`, which checks bounded audio,
+spill, inference-lane and thermal lifecycle invariants. Noisy wall-clock/RSS/Metal measurements are
+deliberately not PR gates; use the signed-Mac `scripts/measure-recording-ram.sh` protocol for them.
 
 After `PASSED`, commit the exact attested index from the isolated worktree, then close it:
 
@@ -75,12 +102,13 @@ scripts/agent-harness close attachment-loss
 ```
 
 `commit` re-verifies the receipt, requires the QueaT identity, rejects AI co-author trailers, and
-creates one commit from exactly the attested index. `verify-attestation` and the defense-in-depth
+creates one commit from exactly the attested index (an explicit empty commit for a valid
+`--no-expected-change` task). `verify-attestation` and the defense-in-depth
 commit hook fail after any post-review edit. If a manual commit is ever needed, use
 `git -C <printed-worktree> commit ...` so the hook can resolve the task explicitly. `close` is
-deliberately strict: it accepts one clean commit whose parent is the recorded base and whose tree is
-byte-for-byte the attested tree, removes only the two task worktrees, and preserves the branch and
-evidence.
+deliberately strict: only the runner's `COMMITTED` state is accepted; the commit receipt must match
+the exact HEAD, sole parent, tree, message, timestamps, and QueaT author/committer. It then removes
+only the two task worktrees and preserves the branch and evidence.
 
 For a change that claims native boot behavior, add the exclusive runtime evidence before review:
 
@@ -101,6 +129,10 @@ scripts/agent-harness eval report <run-id>
 
 Eval trials use disposable history-free snapshots. Hidden graders remain outside the writer's workspace. A normal trial is single-shot; repair rounds are an explicit, separately reported mode. The report includes pass-at-1, any-pass-at-k, all-pass-at-k, duration, failures, scope violations, and harness/infra errors.
 
+Only deterministic harness/eval selftests belong in blocking PR CI. Live Codex/Claude capability
+trials are manual or scheduled until a pinned task/configuration has a reviewed reference solution
+and repeated near-100% reliability; one stochastic trial must never red-bar a product PR.
+
 ## Enforcement
 
 - Claude/Codex hooks are fast defense-in-depth and call one canonical implementation.
@@ -114,6 +146,11 @@ Audit that boundary without mutating GitHub:
 scripts/agent-remote-audit
 ```
 
-The repository policy is versioned in `remote-policy.json`. A remote FAIL means the development loop is locally functional but merge enforcement is not complete; changing branch protection or secret scanning is an explicit operator action.
+The repository policy is versioned in `remote-policy.json` and requires at least one approval plus
+the app-bound full gate. CI deterministically selftests the policy evaluator, but the live network
+audit stays a separate operator/scheduled preflight because harness checks intentionally have no
+Internet and GitHub administration reads need an explicit read-only credential. A remote FAIL means
+the development loop is locally functional but merge enforcement is not complete; changing branch
+protection, rulesets, or secret scanning is an explicit operator action.
 
 No production vault, MeetingNotes database, Keychain item, live microphone, ScreenCaptureKit session, or real cloud provider belongs in an automated trial. Signed-build-only behavior stays an explicit human/runtime gate.

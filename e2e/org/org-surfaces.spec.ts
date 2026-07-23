@@ -168,6 +168,9 @@ test.describe("Shared Brain v1 — org FE surfaces (mocked IPC)", () => {
         chunkCount: 2,
         scrubbed: { emails: 1, phones: 0, cards: 0 },
         scrub: true,
+        attachmentCount: 0,
+        attachmentBytes: 0,
+        imagePixelsScrubbed: false,
       }),
     });
     // Open a meeting, go to the Share tab.

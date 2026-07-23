@@ -474,7 +474,10 @@ mod tests {
     #[test]
     fn live_bullets_none_or_blank_renders_without_section() {
         let base = render_user_content(&req(None));
-        assert!(!base.contains("Live notes (auto)"), "no section without bullets");
+        assert!(
+            !base.contains("Live notes (auto)"),
+            "no section without bullets"
+        );
         let mut blank = req(None);
         blank.live_bullets = Some("  \n ".to_string());
         assert_eq!(

@@ -228,7 +228,9 @@ pub fn list_master_kek_candidates(reason: &str) -> Result<zeroize::Zeroizing<Vec
 /// AUTHORITATIVELY completed and returned no unwrapping candidate. A cancelled/failed Touch ID or a
 /// transient keychain fault must abort the discard (`Err`), never be mistaken for "the keychain
 /// holds no key" (which would irreversibly wipe a still-recoverable folder).
-pub fn list_master_kek_candidates_strict(reason: &str) -> Result<zeroize::Zeroizing<Vec<[u8; 32]>>> {
+pub fn list_master_kek_candidates_strict(
+    reason: &str,
+) -> Result<zeroize::Zeroizing<Vec<[u8; 32]>>> {
     collect_master_kek_candidates(reason, true)
 }
 
@@ -349,10 +351,11 @@ pub fn read_account_mk_biometric(reason: &str) -> Result<[u8; 32]> {
     {
         let _ = reason;
         match legacy_get_secret(ACCOUNT_SHARE_MK)? {
-            Some(hex) => {
-                hex_to_key32(&hex).ok_or_else(|| AppError::Secrets("cached account MK is malformed".into()))
-            }
-            None => Err(AppError::Unavailable("no cached account key to unlock".into())),
+            Some(hex) => hex_to_key32(&hex)
+                .ok_or_else(|| AppError::Secrets("cached account MK is malformed".into())),
+            None => Err(AppError::Unavailable(
+                "no cached account key to unlock".into(),
+            )),
         }
     }
 }
@@ -406,10 +409,11 @@ fn cache_account_mk_at(path: &std::path::Path, mk: &[u8; 32]) -> Result<()> {
 #[cfg(debug_assertions)]
 fn read_account_mk_at(path: &std::path::Path) -> Result<[u8; 32]> {
     match dev_get_secret_at(path, ACCOUNT_SHARE_MK)? {
-        Some(hex) => {
-            hex_to_key32(&hex).ok_or_else(|| AppError::Secrets("cached account MK is malformed".into()))
-        }
-        None => Err(AppError::Unavailable("no cached account key to unlock".into())),
+        Some(hex) => hex_to_key32(&hex)
+            .ok_or_else(|| AppError::Secrets("cached account MK is malformed".into())),
+        None => Err(AppError::Unavailable(
+            "no cached account key to unlock".into(),
+        )),
     }
 }
 #[cfg(debug_assertions)]

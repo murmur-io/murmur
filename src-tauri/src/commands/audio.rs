@@ -76,6 +76,19 @@ pub fn recording_level(app: AppHandle, state: State<'_, AppState>) -> Result<f32
         return Ok(0.0);
     };
     let level = r.level();
+    if let Some(fault) = r.fault() {
+        if !state
+            .capture_fault_notified
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            crate::events::emit_recording_capture_fault(
+                &app,
+                fault,
+                r.total_samples() as u64,
+                r.source_sample_rate(),
+            );
+        }
+    }
     // 4h TIME cap: fire the "maximum recording length reached" notice exactly ONCE per recording,
     // on the false→true transition. `capped_notified` is the per-recording rising-edge latch,
     // re-armed at each `start_recording`.
@@ -232,24 +245,45 @@ pub(crate) fn begin_voice_command_inner(
     // Latch the recorder's current total-sample offset AT CLICK TIME so the live loop transcribes
     // only the POST-CLICK utterance (the command the user is about to speak), cleanly isolated from
     // any prior speech in the rolling buffer. `None` (no recorder) ⇒ not recording ⇒ arm nothing.
-    let start_sample = state
+    let recorder = state
         .recorder
         .lock()
-        .map_err(|_| AppError::Audio("recorder mutex poisoned".into()))?
+        .map_err(|_| AppError::Audio("recorder mutex poisoned".into()))?;
+    let capture_bounds = recorder
         .as_ref()
-        .map(|r| r.total_samples());
-    let live_running = state
-        .live_running
-        .load(std::sync::atomic::Ordering::SeqCst);
-    match voice_command_arm_decision(start_sample, live_running) {
+        .and_then(|recorder| recorder.manual_capture_bounds());
+    let live_running = state.live_running.load(std::sync::atomic::Ordering::SeqCst);
+    match voice_command_arm_decision(capture_bounds, live_running) {
         // A refusal (not recording / no live consumer) — arm NOTHING and return the reason.
         Err(refusal) => Ok(refusal),
         // Cleared to arm: latch the fresh capture the live loop consumes.
-        Ok(offset) => {
+        Ok((offset, max_end_sample)) => {
+            // Lock order is recorder -> capture -> pending. Holding `recorder` until AFTER the
+            // capture write closes the meeting-Stop race: Stop cannot remove ActiveRecording,
+            // perform its terminal capture latch, and then have this Begin publish a fresh armed
+            // generation that nobody owns.
             let mut guard = state.voice_command_capture.lock().map_err(|_| {
                 AppError::Other(anyhow::anyhow!("voice-command capture mutex poisoned"))
             })?;
-            *guard = Some(crate::state::CaptureState::armed_from(offset));
+            let pending = state.pending_manual_command.lock().map_err(|_| {
+                AppError::Other(anyhow::anyhow!("pending manual-command mutex poisoned"))
+            })?;
+            if guard.is_some() {
+                return Ok(VoiceCommandArmResult {
+                    listening: false,
+                    reason: Some("voice command is already listening".into()),
+                });
+            }
+            if pending.is_some() {
+                return Ok(VoiceCommandArmResult {
+                    listening: false,
+                    reason: Some("previous voice command is still processing".into()),
+                });
+            }
+            *guard = Some(crate::state::CaptureState::armed_from(
+                offset,
+                max_end_sample,
+            ));
             Ok(VoiceCommandArmResult {
                 listening: true,
                 reason: None,
@@ -259,19 +293,19 @@ pub(crate) fn begin_voice_command_inner(
 }
 
 /// PURE arm decision for [`begin_voice_command_inner`] (no state, no locks → unit-testable without a
-/// real `Recorder`). `recording_offset` is `Some(total_samples)` while recording, `None` otherwise;
+/// real `Recorder`). `recording_bounds` carries click offset + absolute cap while recording;
 /// `live_running` is whether the live-caption loop (the ONLY consumer of a voice capture) is running.
 ///
-/// Returns `Ok(offset)` when the click may arm, else `Err(refusal)` carrying the FE-facing reason:
+/// Returns `Ok((offset, max_end))` when the click may arm, else `Err(refusal)` with the reason:
 /// - not recording ⇒ "not recording" (arm nothing — the live loop only runs during a recording);
 /// - TP-F1: recording but NO live consumer ⇒ "voice needs the live model" (the fresh-install
 ///   heavy-turbo default spawns no live loop, so an armed capture would WEDGE with nothing to
 ///   transcribe/dispatch it — refuse cleanly instead of arming a consumer-less generation).
 pub(crate) fn voice_command_arm_decision(
-    recording_offset: Option<usize>,
+    recording_bounds: Option<(usize, usize)>,
     live_running: bool,
-) -> std::result::Result<usize, VoiceCommandArmResult> {
-    let Some(offset) = recording_offset else {
+) -> std::result::Result<(usize, usize), VoiceCommandArmResult> {
+    let Some((offset, max_end_sample)) = recording_bounds else {
         return Err(VoiceCommandArmResult {
             listening: false,
             reason: Some("not recording".into()),
@@ -283,14 +317,17 @@ pub(crate) fn voice_command_arm_decision(
             reason: Some("voice needs the live model".into()),
         });
     }
-    Ok(offset)
+    Ok((offset, max_end_sample))
 }
 
 /// STOP the MANUAL voice-command capture (CLICK-TO-STOP): the user clicked "stop" / "done", so the
 /// FULL accumulated post-click utterance is the command. This does NOT itself transcribe or dispatch;
-/// it flips the armed [`crate::state::CaptureState`]'s `ended` flag so the already-running live loop
-/// (`transcribe::live`) dispatches the FULL accumulated command over the SAME gated + consent-gated
-/// `handle_voice_action` path on its next tick (no new read/egress class).
+/// it latches the recorder's exact source-frame position and flips the armed
+/// [`crate::state::CaptureState`]'s `ended` flag. The already-running live loop
+/// (`transcribe::live`) waits for that exact certified spool prefix, then dispatches the FULL
+/// accumulated command over the SAME gated + consent-gated `handle_voice_action` path (no new
+/// read/egress class). Audio spoken after the click is never included just because the next live
+/// tick is delayed.
 ///
 /// The dispatch + the "thinking…" PROCESSING event are emitted by the live loop, so the answer still
 /// arrives via [`crate::events::EVENT_VOICE_ACTION_RESULT`]. On a NOT-armed state (no capture in
@@ -314,16 +351,47 @@ pub struct VoiceCommandEndResult {
     pub stopped: bool,
 }
 
-/// Headless core of [`end_voice_command`]: flip the armed capture's `ended` flag so the live loop
-/// dispatches the FULL accumulated utterance on its next tick. A NOT-armed state is a graceful no-op
-/// (`stopped: false`). No `AppHandle`/IPC here, so it is unit-testable without Tauri.
+/// Narrow the command's existing hard cap to an observed Stop position. Repeated Stops can only
+/// preserve or shorten the range; a stale/early observation clamps to an empty range at `start`.
+pub(crate) fn latch_manual_end_sample(
+    start_sample: Option<usize>,
+    existing_max: Option<usize>,
+    observed_stop: Option<usize>,
+) -> Option<usize> {
+    let Some(observed_stop) = observed_stop else {
+        return existing_max;
+    };
+    Some(
+        observed_stop
+            .min(existing_max.unwrap_or(observed_stop))
+            .max(start_sample.unwrap_or(0)),
+    )
+}
+
+/// Headless core of [`end_voice_command`]: atomically (with respect to arm's recorder→capture lock
+/// order) latch the exact source-frame Stop position and flag the capture. A NOT-armed state is a
+/// graceful no-op (`stopped: false`). No `AppHandle`/IPC here, so it remains unit-testable without
+/// Tauri or an audio device.
 pub(crate) fn end_voice_command_inner(state: &AppState) -> Result<VoiceCommandEndResult, AppError> {
+    // Keep the same lock order as `begin_voice_command_inner`: recorder, then capture. Holding the
+    // recorder guard through the capture update prevents a concurrent re-arm from receiving an old
+    // command's Stop position.
+    let recorder = state
+        .recorder
+        .lock()
+        .map_err(|_| AppError::Audio("recorder mutex poisoned".into()))?;
+    let observed_stop = recorder.as_ref().map(|recorder| recorder.total_samples());
     let mut guard = state
         .voice_command_capture
         .lock()
         .map_err(|_| AppError::Other(anyhow::anyhow!("voice-command capture mutex poisoned")))?;
     match guard.as_mut() {
         Some(capture) => {
+            capture.max_end_sample = latch_manual_end_sample(
+                capture.start_sample,
+                capture.max_end_sample,
+                observed_stop,
+            );
             capture.ended = true;
             Ok(VoiceCommandEndResult { stopped: true })
         }
@@ -498,9 +566,26 @@ pub fn parakeet_models_present() -> Result<bool, AppError> {
 /// or once a recording finishes.
 pub fn restart_voice_listener(app: AppHandle) {
     let state = app.state::<AppState>();
-    if let Some(mut l) = state.voice_listener.lock().ok().and_then(|mut g| g.take()) {
-        l.stop();
+    let _transition = state
+        .voice_listener_lifecycle
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Ok(mut guard) = state.voice_listener.lock() {
+        if let Some(listener) = guard.as_mut() {
+            match listener.stop_with_timeout(std::time::Duration::from_secs(5)) {
+                Ok(true) => *guard = None,
+                Ok(false) => {
+                    tracing::warn!(target: "voice", "previous voice listener did not stop before restart deadline; keeping it owned and skipping replacement");
+                    return;
+                }
+                Err(error) => {
+                    tracing::warn!(target: "voice", error = %error, "previous voice listener failed during restart; clearing finished owner");
+                    *guard = None;
+                }
+            }
+        }
     }
+    crate::audio::listener::release_wake_transcriber_cache();
     let (enabled, language) = match state.config.lock() {
         Ok(c) => (c.voice_trigger, c.language.clone()),
         Err(_) => return,
@@ -508,8 +593,14 @@ pub fn restart_voice_listener(app: AppHandle) {
     if !enabled {
         return;
     }
-    // Don't grab the mic while a real recording is in progress.
-    if state.recorder.lock().map(|g| g.is_some()).unwrap_or(false) {
+    // Don't grab the mic while real capture is active OR during Start's await-heavy preparation
+    // window before the recorder slot is installed. The transition mutex makes this check atomic
+    // with listener construction/storage relative to `stop_voice_listener` in Start.
+    if state
+        .recording_starting
+        .load(std::sync::atomic::Ordering::Acquire)
+        || state.recorder.lock().map(|g| g.is_some()).unwrap_or(true)
+    {
         return;
     }
     // T1.3 — the standby wake listener decodes a ~2.2 s mic window every few seconds for the
@@ -533,10 +624,38 @@ pub fn restart_voice_listener(app: AppHandle) {
     }
 }
 
-/// Stop + drop the voice-trigger listener, releasing the mic. No-op if not running.
-pub fn stop_voice_listener(app: &AppHandle) {
+/// Stop + drop the voice-trigger listener within a fixed deadline, releasing the mic. A timed-out
+/// worker remains in AppState with its stop flag set; callers must fail before opening real capture
+/// and may retry reaping it later.
+pub fn stop_voice_listener(app: &AppHandle) -> Result<(), AppError> {
     let state = app.state::<AppState>();
-    if let Some(mut l) = state.voice_listener.lock().ok().and_then(|mut g| g.take()) {
-        l.stop();
+    let _transition = state
+        .voice_listener_lifecycle
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut guard = state
+        .voice_listener
+        .lock()
+        .map_err(|_| AppError::Audio("voice-listener mutex poisoned".into()))?;
+    let Some(listener) = guard.as_mut() else {
+        crate::audio::listener::release_wake_transcriber_cache();
+        return Ok(());
+    };
+    match listener.stop_with_timeout(std::time::Duration::from_secs(5)) {
+        Ok(true) => {
+            *guard = None;
+            drop(guard);
+            crate::audio::listener::release_wake_transcriber_cache();
+            Ok(())
+        }
+        Ok(false) => Err(AppError::Unavailable(
+            "voice listener did not stop before the recording-start deadline".into(),
+        )),
+        Err(error) => {
+            *guard = None;
+            drop(guard);
+            crate::audio::listener::release_wake_transcriber_cache();
+            Err(error)
+        }
     }
 }

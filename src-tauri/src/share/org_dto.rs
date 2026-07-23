@@ -139,11 +139,14 @@ pub struct KeyGrantsResponse {
     pub grants: Vec<KeyGrantEntry>,
 }
 
-/// `POST /v1/orgs/{id}/items {blobId, contentSha256, rev, generation}`.
+/// `POST /v1/orgs/{id}/items` — exactly one of legacy `blobId` or atomic inline `contentCell`.
 #[derive(Serialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct PublishItemRequest {
-    pub blob_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blob_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", with = "b64::opt")]
+    pub content_cell: Option<Vec<u8>>,
     /// SHA-256 of the canonical PLAINTEXT envelope — NOT the ciphertext (see
     /// `OrgEnvelope::content_sha256`, `share/org_envelope.rs`). It is the content-free self-share
     /// dedup key AND the per-item AAD nonce source (`org_item_nonce(content_sha256)`): the publisher
@@ -222,7 +225,8 @@ mod tests {
             wrapped_key: vec![0xDE, 0xAD],
             grant_sig: vec![0xBE, 0xEF],
         };
-        let v: serde_json::Value = serde_json::from_str(&serde_json::to_string(&g).unwrap()).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&g).unwrap()).unwrap();
         assert_eq!(v["userId"], "u-1");
         assert_eq!(v["generation"], 2);
         // base64url-unpadded of DE AD / BE EF.
@@ -234,13 +238,16 @@ mod tests {
     #[test]
     fn publish_item_request_wire_shape() {
         let r = PublishItemRequest {
-            blob_id: "b-1".into(),
+            blob_id: None,
+            content_cell: Some(vec![0xAB, 0xCD]),
             content_sha256: vec![1u8; 32],
             rev: 1,
             generation: 3,
         };
-        let v: serde_json::Value = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
-        assert_eq!(v["blobId"], "b-1");
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+        assert!(v.get("blobId").is_none());
+        assert_eq!(v["contentCell"], murmur_protocol::b64::encode(&[0xAB, 0xCD]));
         assert_eq!(v["rev"], 1);
         assert_eq!(v["generation"], 3);
         assert_eq!(v["contentSha256"], murmur_protocol::b64::encode(&[1u8; 32]));
@@ -283,7 +290,8 @@ mod tests {
     /// An older server omitting `currentGeneration` defaults it to 1.
     #[test]
     fn org_response_defaults_generation_to_one() {
-        let json = r#"{"orgId":"o1","name":"Acme","role":"member","createdAt":"2026-07-10T00:00:00Z"}"#;
+        let json =
+            r#"{"orgId":"o1","name":"Acme","role":"member","createdAt":"2026-07-10T00:00:00Z"}"#;
         let r: OrgResponse = serde_json::from_str(json).unwrap();
         assert_eq!(r.current_generation, 1);
     }

@@ -40,7 +40,7 @@ Never let the step *pass silently when it didn't actually run* on the host that 
 
 ## Step 3 — don't slow the INNER loop
 
-The gate is `ci.sh` (run once before shipping / in CI). The inner iterate loop is `(cd src-tauri && cargo test --lib)`. Adding to `ci.sh` is fine even if it's slowish. **Do NOT** wire an expensive check into anything that runs every edit, and **do NOT** add a bare `cargo clippy --all-targets` anywhere an agent would run it directly — `.claude/hooks/block-bash.sh` blocks it (openssl/sqlcipher profile thrash); it belongs inside ci.sh only.
+The gate is `ci.sh`; the agent inner loop is `scripts/agent-resource-run --chdir src-tauri -- cargo test --lib`. Every agent Cargo/rustc/full-CI command uses the wrapper. Adding to `ci.sh` is fine even if it is slowish; do not wire an expensive check into anything that runs every edit.
 
 ## Step 4 — if it's a GUARDRAIL HOOK, prove it with RED-before-GREEN
 
@@ -60,8 +60,8 @@ CI runs the COMPLETE ci.sh on every PR (release parity, 2026-07-05), so placemen
 ```bash
 # 1) The new step FAILS when it should (introduce a temporary violation, confirm red), then remove it.
 # 2) The gate is green with the real tree, via the exact CI command:
-MURMUR_CI_SKIP_E2E=1 bash scripts/ci.sh     # fast local subset (CI itself runs the full gate)
-bash scripts/ci.sh                          # full, if your step is in the E2E path
+MURMUR_CI_SKIP_E2E=1 scripts/agent-resource-run -- bash scripts/ci.sh
+scripts/agent-resource-run -- bash scripts/ci.sh
 # 3) Guardrail added? prove it:
 bash .claude/hooks/selftest.sh              # PASS
 # 4) Touched the workflow? parse it:

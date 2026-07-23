@@ -63,21 +63,19 @@ pub(crate) async fn verify_note_sources_inner(
     state: &AppState,
     meeting_id: String,
 ) -> Result<Vec<crate::verify::VerifyFinding>, AppError> {
-    if !meeting_is_unlocked(state, &meeting_id)? {
-        return Err(AppError::Locked(
-            "this meeting's folder is locked — unlock it to verify the note".into(),
-        ));
-    }
+    let visibility = capture_meeting_content_snapshot(state, &meeting_id)?;
     // Brain v2 L5 — SESSION verify cache, checked AFTER the read gate (the gate is never skipped
     // for a cache hit). A hit re-renders the panel without a second Jira egress; the cache is
     // RAM-only and cleared on relock_folder / relock_all, so it never outlives the session unlock.
-    if let Some(cached) = state
+    let cached = state
         .verify_cache
         .lock()
         .map_err(|_| AppError::Other(anyhow::anyhow!("verify cache lock")))?
         .get(&meeting_id)
-    {
-        return Ok(cached.clone());
+        .cloned();
+    if let Some(cached) = cached {
+        require_current_meeting_content_snapshot(state, &meeting_id, &visibility)?;
+        return Ok(cached);
     }
     let note = state
         .db
@@ -90,6 +88,7 @@ pub(crate) async fn verify_note_sources_inner(
     let stripped = crate::verify::apply_verify_markers(&base, &[]);
     let keys = crate::verify::extract_issue_keys(&stripped);
     if keys.is_empty() {
+        require_current_meeting_content_snapshot(state, &meeting_id, &visibility)?;
         return Ok(Vec::new());
     }
     let config = state
@@ -115,6 +114,8 @@ pub(crate) async fn verify_note_sources_inner(
     }
     // Populate the session cache (RAM-only; cleared on relock). A poisoned lock only skips the
     // cache — the findings still return.
+    let _lifecycle = lifecycle_guard(state);
+    require_current_meeting_content_snapshot_under_lifecycle(state, &meeting_id, &visibility)?;
     if let Ok(mut cache) = state.verify_cache.lock() {
         cache.insert(meeting_id, findings.clone());
     }
@@ -223,12 +224,8 @@ pub(crate) async fn enrich_note_context_inner(
     state: &AppState,
     meeting_id: String,
 ) -> Result<Vec<crate::enrich::ContextHit>, AppError> {
-    // READ-GATE FIRST — a sealed-not-unlocked meeting refuses before ANY connector egress.
-    if !meeting_is_unlocked(state, &meeting_id)? {
-        return Err(AppError::Locked(
-            "this meeting's folder is locked — unlock it to add live context".into(),
-        ));
-    }
+    // READ-GATE FIRST + bind the folder/epoch before ANY connector egress.
+    let visibility = capture_meeting_content_snapshot(state, &meeting_id)?;
     let note = state
         .db
         .get_latest_note_for_meeting(&meeting_id)?
@@ -296,6 +293,7 @@ pub(crate) async fn enrich_note_context_inner(
         }
     }
 
+    require_current_meeting_content_snapshot(state, &meeting_id, &visibility)?;
     Ok(hits)
 }
 
@@ -366,7 +364,13 @@ pub(crate) fn apply_note_enrichment_inner(
         },
     )?;
     if let Some(path) = existing.exported_path.as_deref() {
-        overwrite_exported_note_guarded(state, &meeting_id, &existing.provider_id, path, &enriched)?;
+        overwrite_exported_note_guarded(
+            state,
+            &meeting_id,
+            &existing.provider_id,
+            path,
+            &enriched,
+        )?;
     }
     Ok(NoteDto {
         meeting_id,
@@ -564,15 +568,30 @@ pub(crate) async fn note_assistant_action_impl(
         priority: false,
     };
 
-    // (2) READ-GATE: the note's folder must be unlocked (never egress a sealed note's text).
-    let Some(row) = state.db.get_note_row(&req.note_id)? else {
-        return Err(AppError::InvalidArg(format!("no note {}", req.note_id)));
+    // (2) READ-GATE: resolve only the content-free folder anchor first, then select title/body while
+    // holding the lifecycle mutex. Bind the snapshot to both folder identity and seal epoch because
+    // provider inference below awaits and can span a relock or open-folder move.
+    let (row, note_folder_id, note_seal_epoch) = {
+        let _lifecycle = lifecycle_guard(state);
+        let Some((folder_id, _created_at, _updated_at)) = state.db.note_gate_anchor(&req.note_id)?
+        else {
+            return Err(AppError::InvalidArg(format!("no note {}", req.note_id)));
+        };
+        if !folder_is_unlocked(state, &folder_id)? {
+            return Err(AppError::Locked(
+                "this note is locked — unlock its folder to use the assistant".into(),
+            ));
+        }
+        let row = state
+            .db
+            .get_note_row(&req.note_id)?
+            .ok_or_else(|| AppError::InvalidArg(format!("no note {}", req.note_id)))?;
+        (
+            row,
+            folder_id,
+            state.seal_epoch.load(std::sync::atomic::Ordering::SeqCst),
+        )
     };
-    if !folder_is_unlocked(state, &row.folder_id)? {
-        return Err(AppError::Locked(
-            "this note is locked — unlock its folder to use the assistant".into(),
-        ));
-    }
 
     let shape = note_assist_shape(&action).to_string();
     let retrieval = note_assist_retrieval(&action);
@@ -596,6 +615,12 @@ pub(crate) async fn note_assistant_action_impl(
             redacted = false,
             "note assistant action completed (retrieval-only)"
         );
+        require_current_note_assist_snapshot(
+            state,
+            &req.note_id,
+            &note_folder_id,
+            note_seal_epoch,
+        )?;
         return Ok(NoteAssistResult {
             action,
             suggestion,
@@ -626,8 +651,7 @@ pub(crate) async fn note_assistant_action_impl(
             .store(true, std::sync::atomic::Ordering::Relaxed);
         turn.priority = true;
     }
-    let model_requested =
-        crate::summarize::effective_model_requested(&target, &config);
+    let model_requested = crate::summarize::effective_model_requested(&target, &config);
     let conn_label = crate::summarize::roles::connection_display_name(&target.connection);
     let model_label = if model_requested.trim().is_empty() {
         conn_label.to_string()
@@ -639,9 +663,10 @@ pub(crate) async fn note_assistant_action_impl(
     //     citation readers and `list_entities_visible` push the session unlock set through
     //     `visibility_clause`, so a sealed source never grounds a result.
     let (citations, entity_names) = match retrieval {
-        NoteAssistRetrieval::BrainCitations => {
-            (gather_note_enhance_citations(state, &config, &req)?, Vec::new())
-        }
+        NoteAssistRetrieval::BrainCitations => (
+            gather_note_enhance_citations(state, &config, &req)?,
+            Vec::new(),
+        ),
         NoteAssistRetrieval::Entities => {
             let unlocked = unlocked_snapshot(state)?;
             let names: Vec<String> = state
@@ -660,8 +685,13 @@ pub(crate) async fn note_assistant_action_impl(
     //     per-action token cap + low temperature (`GenOptions::edit_rewrite`) so a compression edit
     //     can't run away and LENGTHEN, and `generate_note_edit` enforces "shorten is actually shorter"
     //     with one stricter retry.
-    let (system, user) =
-        build_note_assist_prompt(&action, &req, &citations, &entity_names, &config.note_language);
+    let (system, user) = build_note_assist_prompt(
+        &action,
+        &req,
+        &citations,
+        &entity_names,
+        &config.note_language,
+    );
     let provider = match provider_override {
         Some(p) => p,
         None => crate::summarize::provider_for(
@@ -675,8 +705,27 @@ pub(crate) async fn note_assistant_action_impl(
         req.selection.chars().count(),
     ));
     let input_words = note_edit_word_count(&req.selection);
-    let (mut suggestion, meta) =
-        generate_note_edit(provider.as_ref(), &action, &system, &user, opts, input_words).await?;
+    require_current_note_assist_snapshot(
+        state,
+        &req.note_id,
+        &note_folder_id,
+        note_seal_epoch,
+    )?;
+    let (mut suggestion, meta) = generate_note_edit(
+        provider.as_ref(),
+        &action,
+        &system,
+        &user,
+        opts,
+        input_words,
+    )
+    .await?;
+    require_current_note_assist_snapshot(
+        state,
+        &req.note_id,
+        &note_folder_id,
+        note_seal_epoch,
+    )?;
     suggestion = suggestion.trim().to_string();
 
     // Artifacts carry a title (email subject / note title). Derive it from the note's own title for
@@ -720,6 +769,29 @@ pub(crate) async fn note_assistant_action_impl(
         shape,
         title,
     })
+}
+
+fn require_current_note_assist_snapshot(
+    state: &AppState,
+    note_id: &str,
+    expected_folder_id: &str,
+    expected_seal_epoch: u64,
+) -> Result<(), AppError> {
+    let _lifecycle = lifecycle_guard(state);
+    if state.seal_epoch.load(std::sync::atomic::Ordering::SeqCst) != expected_seal_epoch {
+        return Err(AppError::Locked(
+            "this note was locked while the assistant was working — unlock it and retry".into(),
+        ));
+    }
+    let Some((folder_id, _created_at, _updated_at)) = state.db.note_gate_anchor(note_id)? else {
+        return Err(AppError::InvalidArg(format!("no note {note_id}")));
+    };
+    if folder_id != expected_folder_id || !folder_is_unlocked(state, &folder_id)? {
+        return Err(AppError::Locked(
+            "this note moved or was locked while the assistant was working — retry".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Derive a non-PII-in-logs artifact title. `draft_followup` reuses the note's own title as an email
@@ -781,11 +853,18 @@ pub(crate) fn gather_note_enhance_citations(
     let mut out: Vec<NoteCitation> = Vec::new();
 
     // Meeting notes/segments (FTS over visible meetings).
-    for hit in state.db.search_visible(&query, MAX_CITATIONS as i64, &unlocked)? {
+    for hit in state
+        .db
+        .search_visible(&query, MAX_CITATIONS as i64, &unlocked)?
+    {
         out.push(NoteCitation {
             kind: "meeting".into(),
             id: hit.meeting.id.clone(),
-            title: hit.meeting.title.clone().unwrap_or_else(|| "Meeting".into()),
+            title: hit
+                .meeting
+                .title
+                .clone()
+                .unwrap_or_else(|| "Meeting".into()),
             snippet: hit.snippet,
         });
         if out.len() >= MAX_CITATIONS {
@@ -796,13 +875,23 @@ pub(crate) fn gather_note_enhance_citations(
     // Other notes/documents (semantic when the e5 model is present, else FTS). EXCLUDE the current
     // note's own document id (never cite the note being edited).
     if out.len() < MAX_CITATIONS {
-        let doc_hits = if config.semantic_search_enabled && crate::embed::embed_model_present() {
-            let embedder = crate::embed::active_embedder();
+        // Resolve one REAL, pinned query embedder instead of checking the model directory and then
+        // constructing a potentially different/stub handle. Besides closing a settings/download
+        // TOCTOU, this keeps keyword retrieval honest in test builds (where real Metal forwards are
+        // deliberately disabled even when this Mac happens to have the model on disk).
+        let semantic_embedder = if config.semantic_search_enabled {
+            crate::embed::active_persistence_embedder().ok()
+        } else {
+            None
+        };
+        let doc_hits = if let Some(embedder) = semantic_embedder {
             let qvecs = embedder.embed_query(std::slice::from_ref(&query))?;
             match qvecs.into_iter().next() {
-                Some(qvec) => state
-                    .db
-                    .search_doc_chunks_visible(&qvec, MAX_CITATIONS as i64, &unlocked)?,
+                Some(qvec) => {
+                    state
+                        .db
+                        .search_doc_chunks_visible(&qvec, MAX_CITATIONS as i64, &unlocked)?
+                }
                 None => Vec::new(),
             }
         } else {
@@ -895,7 +984,9 @@ pub(crate) fn build_note_assist_prompt(
     let preceding = if before.trim().is_empty() {
         String::new()
     } else {
-        format!("Preceding text (READ-ONLY context — do NOT reproduce or continue it):\n{before}\n\n")
+        format!(
+            "Preceding text (READ-ONLY context — do NOT reproduce or continue it):\n{before}\n\n"
+        )
     };
     let sel = req.selection.as_str();
     let variant = req.variant.as_deref().unwrap_or("").trim();
@@ -932,7 +1023,8 @@ pub(crate) fn build_note_assist_prompt(
                  busy right now and there is a lot going on.\nShortened: Move the deadline to \
                  Friday — the team is overloaded."
             );
-            let user = format!("{preceding}PASSAGE TO SHORTEN (rewrite ONLY this, shorter):\n{sel}");
+            let user =
+                format!("{preceding}PASSAGE TO SHORTEN (rewrite ONLY this, shorter):\n{sel}");
             (system, user)
         }
         "expand" => {
@@ -958,13 +1050,19 @@ pub(crate) fn build_note_assist_prompt(
             (system, user)
         }
         "tone" => {
-            let tone = if variant.is_empty() { "professional" } else { variant };
+            let tone = if variant.is_empty() {
+                "professional"
+            } else {
+                variant
+            };
             let system = format!(
                 "You rewrite a passage of the user's own note in a {tone} tone WITHOUT changing its \
                  meaning, facts, or length beyond what the tone requires. Reply in {edit_lang}. \
                  Output ONLY the rewritten passage — no preamble, no quotes, no explanation."
             );
-            let user = format!("{preceding}PASSAGE TO REWRITE in a {tone} tone (rewrite ONLY this):\n{sel}");
+            let user = format!(
+                "{preceding}PASSAGE TO REWRITE in a {tone} tone (rewrite ONLY this):\n{sel}"
+            );
             (system, user)
         }
         "translate" => {
@@ -979,7 +1077,9 @@ pub(crate) fn build_note_assist_prompt(
                  tone, formatting, names, numbers, and any markdown. Do NOT add or omit content. \
                  Output ONLY the translated passage — no preamble, no quotes, no explanation."
             );
-            let user = format!("{preceding}PASSAGE TO TRANSLATE into {target} (translate ONLY this):\n{sel}");
+            let user = format!(
+                "{preceding}PASSAGE TO TRANSLATE into {target} (translate ONLY this):\n{sel}"
+            );
             (system, user)
         }
         "bullets" => {
@@ -989,7 +1089,9 @@ pub(crate) fn build_note_assist_prompt(
                  decision; do NOT add, remove, or invent content. Reply in {lang}. Output ONLY the \
                  markdown list — no preamble, no heading, no explanation."
             );
-            let user = format!("{preceding}PASSAGE TO CONVERT to a bullet list (convert ONLY this):\n{sel}");
+            let user = format!(
+                "{preceding}PASSAGE TO CONVERT to a bullet list (convert ONLY this):\n{sel}"
+            );
             (system, user)
         }
         "table" => {
@@ -999,7 +1101,8 @@ pub(crate) fn build_note_assist_prompt(
                  preserve every fact, number, name, and decision; do NOT add or invent data. Reply \
                  in {lang}. Output ONLY the markdown table — no preamble, no explanation."
             );
-            let user = format!("{preceding}PASSAGE TO CONVERT to a table (convert ONLY this):\n{sel}");
+            let user =
+                format!("{preceding}PASSAGE TO CONVERT to a table (convert ONLY this):\n{sel}");
             (system, user)
         }
         "keypoints" => {
@@ -1010,7 +1113,8 @@ pub(crate) fn build_note_assist_prompt(
                  Reply in {lang}. Output ONLY the bullet digest — no preamble, no heading, no \
                  explanation."
             );
-            let user = format!("{preceding}PASSAGE TO SUMMARIZE (write a short digest of this):\n{sel}");
+            let user =
+                format!("{preceding}PASSAGE TO SUMMARIZE (write a short digest of this):\n{sel}");
             (system, user)
         }
         "enhance" => {
@@ -1129,7 +1233,9 @@ pub(crate) fn build_note_assist_prompt(
                  beyond it, do NOT answer as chat, do NOT continue the surrounding text. Reply in \
                  {lang}. Output ONLY the edited passage — no preamble, no quotes, no explanation."
             );
-            let user = format!("{preceding}PASSAGE TO EDIT (apply the instruction, rewrite ONLY this):\n{sel}");
+            let user = format!(
+                "{preceding}PASSAGE TO EDIT (apply the instruction, rewrite ONLY this):\n{sel}"
+            );
             (system, user)
         }
         // spinoff_note
@@ -1167,8 +1273,8 @@ pub(crate) fn note_edit_max_tokens(action: &str, input_chars: usize) -> usize {
         "shorten" => (1.0_f64, 48usize, 1024usize),
         // Additive / generated output: the answer/draft/list is NEW content — give it room, and a
         // higher floor so a short selection can still yield a full draft or answer.
-        "expand" | "enhance" | "keypoints" | "action_items" | "decisions" | "fact_check" | "ask"
-        | "draft_followup" | "spinoff_note" => (3.0_f64, 256usize, 2048usize),
+        "expand" | "enhance" | "keypoints" | "action_items" | "decisions" | "fact_check"
+        | "ask" | "draft_followup" | "spinoff_note" => (3.0_f64, 256usize, 2048usize),
         // In-place edits can legitimately match or slightly exceed the input length.
         _ => (1.5_f64, 64usize, 1536usize),
     };
@@ -1196,7 +1302,9 @@ pub(crate) async fn generate_note_edit(
             "{system}\n\nThe previous attempt was NOT shorter than the original. Return a STRICTLY \
              shorter version: fewer words than the original, keeping only the essential facts."
         );
-        let (out2, meta2) = provider.complete_with_meta_opts(&strict, user, opts).await?;
+        let (out2, meta2) = provider
+            .complete_with_meta_opts(&strict, user, opts)
+            .await?;
         if note_edit_word_count(&out2) < note_edit_word_count(&out) {
             return Ok((out2, meta2));
         }
@@ -1285,7 +1393,6 @@ pub async fn import_memories(state: State<'_, AppState>, text: String) -> Result
     .map_err(|e| AppError::Other(anyhow::anyhow!("import task join failed: {e}")))?
 }
 
-
 /// Inner of [`import_memories`] (unit-testable: Db + reasoner + flag injected).
 pub(crate) fn import_memories_inner(
     db: &crate::storage::Db,
@@ -1299,7 +1406,9 @@ pub(crate) fn import_memories_inner(
         ));
     }
     if text.trim().is_empty() {
-        return Err(AppError::InvalidArg("nothing to import — paste the memory text".into()));
+        return Err(AppError::InvalidArg(
+            "nothing to import — paste the memory text".into(),
+        ));
     }
     // 1) Best-effort extraction (stub / decode failure ⇒ empty ⇒ 0 imported, nothing persisted).
     let candidates = crate::user_memory::extract_imported_memories(reasoner, text);
@@ -1477,13 +1586,19 @@ pub(crate) fn apply_supersessions_inner(
             continue;
         };
         if let Some(pre) = &row.source_pre_image {
-            if let Some((path, _)) = note_file_for(state, &row.source_meeting_id)? {
-                pristine.entry(path).or_insert_with(|| pre.clone());
+            if source_is_stampable(state, &row.source_meeting_id)? {
+                if let Some((path, _)) = note_file_for(state, &row.source_meeting_id)? {
+                    pristine.entry(path).or_insert_with(|| pre.clone());
+                }
             }
         }
         if let Some(pre) = &row.superseding_pre_image {
-            if let Some((path, _)) = note_file_for(state, &row.superseding_meeting_id)? {
-                pristine.entry(path).or_insert_with(|| pre.clone());
+            let superseding_open = meeting_is_unlocked(state, &row.superseding_meeting_id)?
+                && !folder_locked_on_disk(state, &row.superseding_meeting_id)?;
+            if superseding_open {
+                if let Some((path, _)) = note_file_for(state, &row.superseding_meeting_id)? {
+                    pristine.entry(path).or_insert_with(|| pre.clone());
+                }
             }
         }
     }
@@ -1755,5 +1870,3 @@ fn superseding_link_stem(
     }
     Ok(note_file_for(state, &s.superseding_meeting_id)?.map(|(_, stem)| stem))
 }
-
-

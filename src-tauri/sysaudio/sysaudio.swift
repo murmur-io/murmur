@@ -1,4 +1,4 @@
-// MeetNotes — system-audio capture sidecar (macOS 13+, ScreenCaptureKit).
+// Murmur — system-audio capture sidecar (macOS 13+, ScreenCaptureKit).
 //
 // Captures the system audio output to a WAV file. Spawned by the Rust core
 // (`audio::system::SystemAudioRecorder`); the Rust side stops it with SIGINT/SIGTERM
@@ -6,13 +6,14 @@
 // of the call".
 //
 // Usage:  sysaudio <output.wav> [maxSeconds]
-// Exit:   0 ok · 2 bad args · 3 no Screen-Recording permission / no content · 4 unsupported
+// Exit:   0 finalized · 2 bad args · 3 pre-ready failure · 4 unsupported · 6 parent-loss hard bound
 //
 // ⚠️ RUNTIME-UNVERIFIED in a headless build: capturing real system audio needs an
 // interactive desktop session + the Screen Recording (TCC) permission + live audio.
 // Compilation is verified (swiftc); end-to-end capture must be confirmed on a real Mac.
 
 import AVFoundation
+import Darwin
 import Foundation
 import ScreenCaptureKit
 
@@ -124,63 +125,76 @@ final class Capturer: NSObject, SCStreamOutput, SCStreamDelegate {
 
 let capturer = Capturer(outURL: outURL)
 
-// Clean shutdown on SIGINT/SIGTERM from the parent (Rust) process. `stopping` is written from
-// BOTH the signal/kqueue dispatch queue (`sigQueue`) and the main thread (the ppid re-checks
-// below), so the double-stop guard is NSLock-protected — an unsynchronized check-then-set could
-// let two racing stop requests both pass the guard and tear down twice. Mirrors the exact
-// pattern in audiocap.swift / aeccap.swift.
-var stopping = false
+// Every stop source shares this phase gate. Before `start()` completes, capture objects are only
+// partially initialized and teardown is unsafe, so fail fast with NONZERO status. Once ready, the
+// first request owns clean finalization; later signal/EOF/self-cap races are idempotent no-ops.
+enum CapturePhase { case starting, ready, stopping }
+var capturePhase = CapturePhase.starting
 let stopLock = NSLock()
-func requestStop() {
+func requestStop(_ code: Int32) {
     stopLock.lock()
-    if stopping {
+    switch capturePhase {
+    case .stopping:
         stopLock.unlock()
         return
+    case .starting:
+        capturePhase = .stopping
+        stopLock.unlock()
+        // A callback may already have emitted a tiny partial file, but teardown is not safe until
+        // `start()` returns. `_exit(3)` prevents Rust from adopting it as a finalized success.
+        _exit(3)
+    case .ready:
+        capturePhase = .stopping
+        stopLock.unlock()
+        Task { await capturer.stop(); exit(code) }
     }
-    stopping = true
+}
+func markCaptureReady() {
+    stopLock.lock()
+    if case .starting = capturePhase { capturePhase = .ready }
     stopLock.unlock()
-    Task { await capturer.stop(); exit(0) }
 }
 let sigQueue = DispatchQueue(label: "meetnotes.sig")
 for sig in [SIGINT, SIGTERM] {
     signal(sig, SIG_IGN)
     let src = DispatchSource.makeSignalSource(signal: sig, queue: sigQueue)
-    src.setEventHandler(handler: requestStop)
+    src.setEventHandler { requestStop(0) }
     src.resume()
     // keep the source alive for the process lifetime
     _ = Unmanaged.passRetained(src)
 }
 
-// Parent-liveness watchdog: this helper must never outlive the Murmur process that spawned it.
-// The parent normally SIGTERMs us on Stop/quit — but a SIGKILL'd / crashed / hot-rebuilt parent
-// sends nothing, and the orphan then keeps capturing until the self-cap (a sibling helper once
-// outlived its parent by 7h20m). kqueue-backed EVFILT_PROC/NOTE_EXIT via DispatchSource —
-// event-driven, no polling — routed into the SAME clean-stop path the signals use, so the WAV is
-// flushed + closed before exit.
-let parentPid = getppid()
-// Already reparented to launchd (ppid 1) = the parent died while we were still launching. The
-// Rust core always spawns this helper as a DIRECT child, so ppid 1 can only mean "orphaned before
-// we could even observe the real parent" — watching launchd would wait forever.
-if parentPid == 1 { requestStop() }
-let parentWatch = DispatchSource.makeProcessSource(
-    identifier: parentPid, eventMask: .exit, queue: sigQueue)
-parentWatch.setEventHandler(handler: requestStop)
-parentWatch.resume()
-_ = Unmanaged.passRetained(parentWatch)  // keep alive for the process lifetime
-// Close the registration race: if the parent died BEFORE the source was armed, its NOTE_EXIT
-// already fired unseen and we were reparented (getppid() changed) — stop now instead of waiting
-// on an event that will never come.
-if getppid() != parentPid { requestStop() }
+// Exact parent lifetime capability: Rust owns the only stdin writer. EOF therefore means that
+// exact recorder owner died or dropped its capability; unlike PID/kqueue observation it has no
+// registration race, reparenting ambiguity, or PID-reuse window. Retry interrupted reads; EOF and
+// every other read failure fail closed through the same phase-aware stop gate. Queue stop work on
+// `sigQueue`, and arm an independent hard exit first: if capture finalization wedges after its exact
+// owner disappears, the helper still cannot outlive that owner indefinitely. Exit 6 is deliberately
+// not a finalized-file proof, so Rust preserves recovery metadata but never adopts the partial WAV.
+DispatchQueue(label: "meetnotes.parent-lifetime", qos: .utility).async {
+    var byte: UInt8 = 0
+    while true {
+        let count = withUnsafeMutableBytes(of: &byte) { buffer in
+            Darwin.read(STDIN_FILENO, buffer.baseAddress, buffer.count)
+        }
+        if count > 0 { continue }
+        if count < 0 && errno == EINTR { continue }
+        DispatchQueue.global(qos: .utility).asyncAfter(wallDeadline: .now() + 5) { _exit(6) }
+        sigQueue.async { requestStop(0) }
+        return
+    }
+}
 
 // Self-cap — ALWAYS armed (default 4h; see the `maxSeconds` derivation at the top), and armed
 // INDEPENDENT of capture start so even a wedged SCK setup can't leave the process alive
 // unbounded. `wallDeadline` (not `deadline`): `DispatchTime` PAUSES while the machine sleeps,
 // silently stretching the cap past its wall-clock intent — `DispatchWallTime` does not.
-sigQueue.asyncAfter(wallDeadline: .now() + maxSeconds) { requestStop() }
+sigQueue.asyncAfter(wallDeadline: .now() + maxSeconds) { requestStop(0) }
 
 Task {
     do {
         try await capturer.start()
+        markCaptureReady()
         FileHandle.standardError.write(Data("sysaudio: capturing\n".utf8))
     } catch {
         FileHandle.standardError.write(

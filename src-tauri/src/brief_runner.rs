@@ -85,7 +85,12 @@ pub struct BriefCorpus {
 /// EVERYTHING with the EMPTY unlock set — sealed-and-not-session-unlocked content never enters a
 /// brief (see the module doc). Returns `Ok(None)` when NO visible meeting note falls in the
 /// window (commitments/facts alone don't justify a brief — they derive from the same meetings).
-pub fn build_brief_corpus(db: &Db, scope_days: i64, now_utc: &str, budget: usize) -> Result<Option<BriefCorpus>> {
+pub fn build_brief_corpus(
+    db: &Db,
+    scope_days: i64,
+    now_utc: &str,
+    budget: usize,
+) -> Result<Option<BriefCorpus>> {
     let no_unlocks: HashSet<String> = HashSet::new();
     let cutoff = chrono::DateTime::parse_from_rfc3339(now_utc)
         .map(|now| (now - chrono::Duration::days(scope_days.clamp(1, 90))).to_rfc3339())
@@ -166,7 +171,11 @@ pub fn build_brief_corpus(db: &Db, scope_days: i64, now_utc: &str, budget: usize
 async fn run_one_brief(
     state: &crate::state::AppState,
     schedule: &BriefSchedule,
+    background_epoch: u64,
 ) -> Result<Option<BriefRun>> {
+    if !crate::perf::background_epoch_is_current(background_epoch) {
+        return Ok(None);
+    }
     let config = state
         .config
         .lock()
@@ -185,6 +194,11 @@ async fn run_one_brief(
     let Some(built) = build_brief_corpus(&state.db, schedule.scope_days, &now_utc, budget)? else {
         return Ok(None);
     };
+
+    // Re-check after the gated content read and immediately before provider construction/dispatch.
+    if !crate::perf::background_epoch_is_current(background_epoch) {
+        return Ok(None);
+    }
 
     // Build the provider (consent gate + redaction firewall) BEFORE composing the prompt — an
     // unconsented cloud provider fails closed here and NOTHING egresses.
@@ -207,7 +221,17 @@ async fn run_one_brief(
     {
         user.push_str(&format!("\n\nUSER FOCUS for this brief: {hint}"));
     }
+    // Local GGUF and loopback Ollama providers acquire their own precise generation admission;
+    // cloud providers hold no local-model lease across the network await.
+    if !crate::perf::background_epoch_is_current(background_epoch) {
+        return Ok(None);
+    }
     let markdown = provider.complete(&system, &user).await?;
+    // A Start installed priority after dispatch. Discard the answer; the already-written day claim
+    // intentionally prevents a retry/egress storm.
+    if !crate::perf::background_epoch_is_current(background_epoch) {
+        return Ok(None);
+    }
     if markdown.trim().is_empty() {
         return Ok(None); // an empty synthesis proposes nothing.
     }
@@ -221,7 +245,13 @@ async fn run_one_brief(
         proposed_at: now_utc,
         accepted_at: None,
     };
-    state.db.insert_brief_run(&run)?;
+    if crate::perf::with_current_background_epoch(background_epoch, || {
+        state.db.insert_brief_run(&run)
+    })?
+    .is_none()
+    {
+        return Ok(None);
+    }
     Ok(Some(run))
 }
 
@@ -233,6 +263,9 @@ pub async fn brief_tick(handle: &tauri::AppHandle) {
     let Some(state) = handle.try_state::<crate::state::AppState>() else {
         return; // init failed — nothing to run.
     };
+    if crate::perf::recording_has_priority() {
+        return;
+    }
     let schedules = match state.db.list_brief_schedules() {
         Ok(s) => s,
         Err(e) => {
@@ -246,13 +279,24 @@ pub async fn brief_tick(handle: &tauri::AppHandle) {
     let now_local = chrono::Local::now().naive_local();
     let today = now_local.date().to_string();
     for schedule in schedules.iter().filter(|s| should_fire(s, &now_local)) {
+        let epoch = crate::perf::background_epoch();
+        if !crate::perf::background_epoch_is_current(epoch) {
+            return;
+        }
         // CLAIM the day BEFORE synthesis: max one attempt per schedule per local day, so a
         // persistently-failing provider can never become a once-a-minute egress storm.
-        if let Err(e) = state.db.set_brief_schedule_last_run(&schedule.id, &today) {
-            tracing::warn!(target: "briefs", schedule_id = %schedule.id, error = %e, "brief tick: day-claim failed; skipping");
-            continue;
+        let claim = crate::perf::with_current_background_epoch(epoch, || {
+            state.db.set_brief_schedule_last_run(&schedule.id, &today)
+        });
+        match claim {
+            Ok(Some(())) => {}
+            Ok(None) => return,
+            Err(e) => {
+                tracing::warn!(target: "briefs", schedule_id = %schedule.id, error = %e, "brief tick: day-claim failed; skipping");
+                continue;
+            }
         }
-        match run_one_brief(&state, schedule).await {
+        match run_one_brief(&state, schedule, epoch).await {
             Ok(Some(run)) => {
                 tracing::info!(
                     target: "briefs",
@@ -326,7 +370,10 @@ mod tests {
         // Time not reached yet → holds.
         assert!(!should_fire(&schedule(None, 9, 5, None), &now));
         // Already ran today → holds (max one run per day).
-        assert!(!should_fire(&schedule(None, 9, 0, Some("2026-07-10")), &now));
+        assert!(!should_fire(
+            &schedule(None, 9, 0, Some("2026-07-10")),
+            &now
+        ));
         // Ran YESTERDAY → fires again today.
         assert!(should_fire(&schedule(None, 9, 0, Some("2026-07-09")), &now));
         // Weekly on Friday (4) → fires; on Monday (0) → holds.
@@ -460,10 +507,22 @@ mod tests {
         let out = build_brief_corpus(&db, 7, "2026-07-10T09:00:00+00:00", 80_000)
             .unwrap()
             .expect("the open meeting builds a brief");
-        assert!(!out.corpus.contains("SECRET-ACQUISITION"), "sealed note text must not leak");
-        assert!(!out.corpus.contains("five million"), "sealed commitments must not leak");
-        assert!(!out.corpus.contains("CONFIDENTIAL-NUMBER"), "sealed facts must not leak");
-        assert!(!out.corpus.contains("Meeting m-sealed"), "the sealed TITLE must not leak");
+        assert!(
+            !out.corpus.contains("SECRET-ACQUISITION"),
+            "sealed note text must not leak"
+        );
+        assert!(
+            !out.corpus.contains("five million"),
+            "sealed commitments must not leak"
+        );
+        assert!(
+            !out.corpus.contains("CONFIDENTIAL-NUMBER"),
+            "sealed facts must not leak"
+        );
+        assert!(
+            !out.corpus.contains("Meeting m-sealed"),
+            "the sealed TITLE must not leak"
+        );
         assert_eq!(out.meeting_ids, vec!["m-open".to_string()]);
     }
 
@@ -534,6 +593,9 @@ mod tests {
         db.insert_brief_run(&run3).unwrap();
         db.delete_brief_schedule("s1").unwrap();
         assert!(db.list_brief_schedules().unwrap().is_empty());
-        assert!(db.get_brief_run("r3").unwrap().is_none(), "schedule delete removes its runs");
+        assert!(
+            db.get_brief_run("r3").unwrap().is_none(),
+            "schedule delete removes its runs"
+        );
     }
 }

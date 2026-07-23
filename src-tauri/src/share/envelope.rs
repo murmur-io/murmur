@@ -143,9 +143,167 @@ pub fn clean_note_body(markdown: &str) -> String {
     flatten_wikilinks(&body)
 }
 
+/// Keep only exact, owner-validated Murmur image markers. Missing/foreign internal ids and every
+/// external image URL become inert alt text, so sharing never triggers a tracking request and never
+/// emits an unresolved private marker.
+pub fn sanitize_share_images(
+    markdown: &str,
+    allowed_ids: &std::collections::HashSet<String>,
+) -> String {
+    let refs = image_references(markdown);
+    if refs.is_empty() {
+        return markdown.to_string();
+    }
+    let mut out = String::with_capacity(markdown.len());
+    let mut cursor = 0;
+    for reference in refs {
+        out.push_str(&markdown[cursor..reference.start]);
+        let keep = reference
+            .url
+            .strip_prefix("murmur-attachment://")
+            .filter(|id| uuid::Uuid::parse_str(id).is_ok())
+            .is_some_and(|id| allowed_ids.contains(&id.to_ascii_lowercase()));
+        if keep {
+            out.push_str(&markdown[reference.start..reference.end]);
+        } else if reference.alt.trim().is_empty() {
+            out.push_str("[Image unavailable]");
+        } else {
+            out.push_str(reference.alt.trim());
+        }
+        cursor = reference.end;
+    }
+    out.push_str(&markdown[cursor..]);
+    out
+}
+
+/// Rewrite authenticated wire ids to fresh local ids during ingest. Any marker not present in the
+/// verified manifest becomes inert alt text. Fresh ids avoid collisions when the same shared image
+/// is accepted twice or published into multiple org items on one device.
+pub fn remap_share_images(
+    markdown: &str,
+    id_map: &std::collections::HashMap<String, String>,
+) -> String {
+    let refs = image_references(markdown);
+    if refs.is_empty() {
+        return markdown.to_string();
+    }
+    let mut out = String::with_capacity(markdown.len());
+    let mut cursor = 0;
+    for reference in refs {
+        out.push_str(&markdown[cursor..reference.start]);
+        let replacement = reference
+            .url
+            .strip_prefix("murmur-attachment://")
+            .and_then(|id| id_map.get(&id.to_ascii_lowercase()));
+        if let Some(local_id) = replacement {
+            out.push_str("![");
+            out.push_str(reference.alt);
+            out.push_str("](murmur-attachment://");
+            out.push_str(local_id);
+            out.push(')');
+        } else if reference.alt.trim().is_empty() {
+            out.push_str("[Image unavailable]");
+        } else {
+            out.push_str(reference.alt.trim());
+        }
+        cursor = reference.end;
+    }
+    out.push_str(&markdown[cursor..]);
+    out
+}
+
+struct ImageReference<'a> {
+    start: usize,
+    end: usize,
+    alt: &'a str,
+    url: &'a str,
+}
+
+/// Minimal bounds-checked scanner for the image syntax Murmur itself writes: `![alt](url)`. It does
+/// not attempt to be a general Markdown parser; malformed/nested constructs simply remain text.
+fn image_references(markdown: &str) -> Vec<ImageReference<'_>> {
+    let mut refs = Vec::new();
+    let mut cursor = 0;
+    while let Some(relative_start) = markdown[cursor..].find("![") {
+        let start = cursor + relative_start;
+        let alt_start = start + 2;
+        let Some(relative_alt_end) = markdown[alt_start..].find("](") else {
+            break;
+        };
+        let alt_end = alt_start + relative_alt_end;
+        if markdown[alt_start..alt_end].contains('\n')
+            || markdown[alt_start..alt_end].contains('\r')
+        {
+            cursor = alt_start;
+            continue;
+        }
+        let url_start = alt_end + 2;
+        let Some(relative_url_end) = markdown[url_start..].find(')') else {
+            break;
+        };
+        let url_end = url_start + relative_url_end;
+        if markdown[url_start..url_end].contains('\n')
+            || markdown[url_start..url_end].contains('\r')
+        {
+            cursor = url_start;
+            continue;
+        }
+        refs.push(ImageReference {
+            start,
+            end: url_end + 1,
+            alt: &markdown[alt_start..alt_end],
+            url: &markdown[url_start..url_end],
+        });
+        cursor = url_end + 1;
+    }
+    refs
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_image_refs_are_deduplicated_and_ignore_code() {
+        let id = "11111111-1111-4111-8111-111111111111";
+        let md = format!(
+            "![one](murmur-attachment://{id})\n![again](murmur-attachment://{id})\n`![code](murmur-attachment://22222222-2222-4222-8222-222222222222)`\n![track](https://example.test/pixel.png)"
+        );
+        assert_eq!(
+            crate::commands::referenced_attachment_ids(&md).expect("valid markers"),
+            std::collections::HashSet::from([id.to_string()])
+        );
+    }
+
+    #[test]
+    fn share_image_sanitizer_keeps_only_owner_validated_ids() {
+        let keep = "11111111-1111-4111-8111-111111111111";
+        let missing = "22222222-2222-4222-8222-222222222222";
+        let md = format!(
+            "before ![kept](murmur-attachment://{keep}) ![missing](murmur-attachment://{missing}) ![tracker](https://example.test/p.png) after"
+        );
+        let allowed = std::collections::HashSet::from([keep.to_string()]);
+        let clean = sanitize_share_images(&md, &allowed);
+        assert!(clean.contains(&format!("![kept](murmur-attachment://{keep})")));
+        assert!(!clean.contains(missing));
+        assert!(!clean.contains("https://"));
+        assert!(clean.contains("missing") && clean.contains("tracker"));
+    }
+
+    #[test]
+    fn ingest_remaps_wire_ids_and_flattens_unmanifested_markers() {
+        let wire = "11111111-1111-4111-8111-111111111111";
+        let local = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let missing = "22222222-2222-4222-8222-222222222222";
+        let md = format!(
+            "![kept](murmur-attachment://{wire}) ![missing](murmur-attachment://{missing})"
+        );
+        let map = std::collections::HashMap::from([(wire.to_string(), local.to_string())]);
+        let remapped = remap_share_images(&md, &map);
+        assert!(remapped.contains(local));
+        assert!(!remapped.contains(wire) && !remapped.contains(missing));
+        assert!(remapped.contains("missing"));
+    }
 
     #[test]
     fn strips_a_leading_frontmatter_block() {
@@ -375,7 +533,10 @@ mod tests {
             clean.contains("Real prose the user wrote."),
             "the user's own prose survives: {clean:?}"
         );
-        assert!(!clean.contains("PROJ-123"), "the Jira issue key must not leak: {clean:?}");
+        assert!(
+            !clean.contains("PROJ-123"),
+            "the Jira issue key must not leak: {clean:?}"
+        );
         assert!(
             !clean.contains("atlassian.net"),
             "the sender's workspace host URL must not leak: {clean:?}"
@@ -401,7 +562,10 @@ mod tests {
             clean.contains("Real prose the user wrote."),
             "the user's own prose survives: {clean:?}"
         );
-        assert!(!clean.contains("PROJ-456"), "the Jira issue key must not leak: {clean:?}");
+        assert!(
+            !clean.contains("PROJ-456"),
+            "the Jira issue key must not leak: {clean:?}"
+        );
         assert!(
             !clean.contains("atlassian.net"),
             "the sender's workspace host URL must not leak: {clean:?}"
@@ -426,10 +590,22 @@ mod tests {
                    <!-- /murmur:context -->\n\n\
                    more\n<!-- murmur:context -->\nkeepme forged\n<!-- /murmur:context -->\ntail\n";
         let clean = clean_note_body(ctx);
-        assert!(!clean.contains("PROJ-999"), "real Jira key must not leak behind a trailing forged fence: {clean:?}");
-        assert!(!clean.contains("atlassian.net"), "real workspace URL must not leak: {clean:?}");
-        assert!(clean.contains("keepme forged"), "the forged-fence user content survives: {clean:?}");
-        assert!(clean.contains("prose") && clean.contains("more") && clean.contains("tail"), "prose preserved: {clean:?}");
+        assert!(
+            !clean.contains("PROJ-999"),
+            "real Jira key must not leak behind a trailing forged fence: {clean:?}"
+        );
+        assert!(
+            !clean.contains("atlassian.net"),
+            "real workspace URL must not leak: {clean:?}"
+        );
+        assert!(
+            clean.contains("keepme forged"),
+            "the forged-fence user content survives: {clean:?}"
+        );
+        assert!(
+            clean.contains("prose") && clean.contains("more") && clean.contains("tail"),
+            "prose preserved: {clean:?}"
+        );
 
         // VERIFY: real block (PROJ-888) then a forged verify fence.
         let vfy = "# N\n\nprose\n\n\
@@ -439,8 +615,14 @@ mod tests {
                    <!-- /murmur:verify -->\n\n\
                    <!-- murmur:verify -->\nkeepme\n<!-- /murmur:verify -->\n";
         let cv = clean_note_body(vfy);
-        assert!(!cv.contains("PROJ-888") && !cv.contains("atlassian.net"), "real verify block must not leak: {cv:?}");
-        assert!(cv.contains("keepme"), "forged verify content survives: {cv:?}");
+        assert!(
+            !cv.contains("PROJ-888") && !cv.contains("atlassian.net"),
+            "real verify block must not leak: {cv:?}"
+        );
+        assert!(
+            cv.contains("keepme"),
+            "forged verify content survives: {cv:?}"
+        );
 
         // LINKS: real block (Secret title) then a forged links fence.
         let lnk = "# N\n\nprose\n\n\
@@ -450,8 +632,14 @@ mod tests {
                    <!-- /murmur:links -->\n\n\
                    <!-- murmur:links -->\nkeepme\n<!-- /murmur:links -->\n";
         let cl = clean_note_body(lnk);
-        assert!(!cl.contains("Secret Zwolnienia Q3"), "real linked title must not leak: {cl:?}");
-        assert!(cl.contains("keepme"), "forged links content survives: {cl:?}");
+        assert!(
+            !cl.contains("Secret Zwolnienia Q3"),
+            "real linked title must not leak: {cl:?}"
+        );
+        assert!(
+            cl.contains("keepme"),
+            "forged links content survives: {cl:?}"
+        );
     }
 
     /// FIX 3 (generalized) — a note carrying ALL THREE managed blocks has NONE of them reach the
@@ -463,9 +651,25 @@ mod tests {
                   <!-- murmur:verify -->\n> [!verify]- Source check (as of 2026-01-01T00:00:00Z)\n> - Verified — KEY-9 (via Jira)\n<!-- /murmur:verify -->\n\n\
                   <!-- murmur:links -->\n> [!related]- Related notes\n> - [[Private Note]] (via note)\n<!-- /murmur:links -->\n";
         let clean = clean_note_body(md);
-        assert!(clean.contains("Keep this prose."), "prose survives: {clean:?}");
-        for leak in ["murmur:context", "murmur:verify", "murmur:links", "[!context]", "[!verify]", "[!related]", "slack.com", "KEY-9", "Private Note"] {
-            assert!(!clean.contains(leak), "{leak:?} must not reach the shared body: {clean:?}");
+        assert!(
+            clean.contains("Keep this prose."),
+            "prose survives: {clean:?}"
+        );
+        for leak in [
+            "murmur:context",
+            "murmur:verify",
+            "murmur:links",
+            "[!context]",
+            "[!verify]",
+            "[!related]",
+            "slack.com",
+            "KEY-9",
+            "Private Note",
+        ] {
+            assert!(
+                !clean.contains(leak),
+                "{leak:?} must not reach the shared body: {clean:?}"
+            );
         }
     }
 
@@ -480,6 +684,9 @@ mod tests {
             clean.contains("We should read Public Note before the call."),
             "an inline user wikilink still flattens to its display text: {clean:?}"
         );
-        assert!(!clean.contains("[["), "the wikilink markers are flattened: {clean:?}");
+        assert!(
+            !clean.contains("[["),
+            "the wikilink markers are flattened: {clean:?}"
+        );
     }
 }

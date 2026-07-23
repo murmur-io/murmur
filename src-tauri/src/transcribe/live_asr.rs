@@ -166,7 +166,10 @@ mod tests {
     #[test]
     fn parakeet_selected_only_when_configured_and_present() {
         assert!(should_use_parakeet("parakeet", true));
-        assert!(!should_use_parakeet("parakeet", false), "selected but absent → whisper");
+        assert!(
+            !should_use_parakeet("parakeet", false),
+            "selected but absent → whisper"
+        );
         assert!(!should_use_parakeet("whisper", true));
         assert!(!should_use_parakeet("whisper", false));
         assert!(!should_use_parakeet("", true), "empty → whisper default");
@@ -185,7 +188,8 @@ mod tests {
     /// treated as absent — the load-guard contract).
     #[test]
     fn parakeet_paths_all_present_requires_every_file() {
-        let dir = std::env::temp_dir().join(format!("murmur-parakeet-paths-{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("murmur-parakeet-paths-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let paths = ParakeetModelPaths {
             encoder: dir.join("encoder.int8.onnx"),

@@ -200,8 +200,14 @@ mod tests {
     #[test]
     fn agentic_system_jit_empty_listing_is_byte_identical() {
         for brief in ["", "- You prefer: Polish replies"] {
-            assert_eq!(agentic_system_jit(brief, "", false), agentic_system(brief, false));
-            assert_eq!(agentic_system_jit(brief, "   ", false), agentic_system(brief, false));
+            assert_eq!(
+                agentic_system_jit(brief, "", false),
+                agentic_system(brief, false)
+            );
+            assert_eq!(
+                agentic_system_jit(brief, "   ", false),
+                agentic_system(brief, false)
+            );
         }
         let with = agentic_system_jit("", "- m1 | Standup | 2026-07-01", false);
         assert!(

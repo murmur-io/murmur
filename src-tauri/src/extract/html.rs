@@ -66,10 +66,19 @@ mod tests {
         // VISIBLE text survives and the raw HTML TAGS are gone.
         assert!(text.contains("Spec"), "heading text survives: {text:?}");
         assert!(text.contains("100k"), "inline text survives: {text:?}");
-        assert!(text.contains("budget is"), "paragraph text survives: {text:?}");
-        assert!(text.contains("Anna owns delivery"), "list item survives: {text:?}");
+        assert!(
+            text.contains("budget is"),
+            "paragraph text survives: {text:?}"
+        );
+        assert!(
+            text.contains("Anna owns delivery"),
+            "list item survives: {text:?}"
+        );
         assert!(!text.contains("<b>"), "raw tags must be stripped: {text:?}");
-        assert!(!text.contains("<li>"), "raw tags must be stripped: {text:?}");
+        assert!(
+            !text.contains("<li>"),
+            "raw tags must be stripped: {text:?}"
+        );
         assert_eq!(blocks[0].page, None);
         assert_eq!(blocks[0].heading_path, None);
     }

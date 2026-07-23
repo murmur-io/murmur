@@ -115,6 +115,8 @@ SENSITIVE_HOST_PATHS = (
     "~/.claude",
     "~/.codex",
     "~/.config",
+    "~/.cargo/credentials",
+    "~/.cargo/credentials.toml",
     "~/.docker",
     "~/.git-credentials",
     "~/.gnupg",
