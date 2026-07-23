@@ -1253,7 +1253,7 @@ def command_doctor(args: argparse.Namespace) -> int:
         tasks = all_tasks()
         add("tasks", bool(tasks), "%d valid task(s)" % len(tasks))
         smoke = load_suite("smoke")
-        add("smoke-suite", len(smoke) == 10, "%d task(s), expected 10" % len(smoke))
+        add("smoke-suite", len(smoke) == 11, "%d task(s), expected 11" % len(smoke))
     except HarnessError as exc:
         add("task-config", False, str(exc))
     for cli in ("codex", "claude"):
@@ -1314,7 +1314,7 @@ def command_selftest(args: argparse.Namespace) -> int:
         root = Path(raw)
         try:
             smoke = load_suite("smoke")
-            check("smoke-has-ten-tasks", len(smoke) == 10, "count=%d" % len(smoke))
+            check("smoke-has-eleven-tasks", len(smoke) == 11, "count=%d" % len(smoke))
             good_results = []
             bad_results = []
             for task_id in smoke:

@@ -19,20 +19,43 @@ Your final message **is** the deliverable: a structured `PASS` / `FAIL` verdict 
 
 ## Standing context — what Murmur is and where it breaks
 
-- **Backend:** Rust crate `murmur` (lib `meetnotes_lib`, bin `Murmur`), modules in `src-tauri/src/`. 61 Tauri commands registered in `src-tauri/src/lib.rs` `generate_handler!` (`commands::*`). 128 `#[test]`/`#[tokio::test]` in `src-tauri/src/`. `AppError`+`Result` everywhere.
+- **Backend:** Rust crate `murmur` (lib `meetnotes_lib`, bin `Murmur`), modules in
+  `src-tauri/src/`. Tauri commands live in domain modules under `commands/` and are registered in
+  `src-tauri/src/lib.rs` `generate_handler!`; tests live across `src-tauri/src/**`. Do not pin
+  command/test counts in instructions — enumerate the live registry/tests when a count matters.
 - **Frontend:** Angular 22 **zoneless** (`provideZonelessChangeDetection`), standalone + OnPush + signals. FE↔BE seam is `src/app/core/ipc.service.ts` — one method per command via `invoke()` from `@tauri-apps/api/core`, which at runtime calls `window.__TAURI_INTERNALS__.invoke(cmd, args, options)` (`node_modules/@tauri-apps/api/core.js:202`). `convertFileSrc` → `window.__TAURI_INTERNALS__.convertFileSrc` (core.js:235).
 - **Lock model (the leak surface):** whole-DB SQLCipher (DEK) + per-folder content-key (AES-GCM, KEK released by Touch ID). Sealing a folder encrypts note + transcript segments + timeline + audio WAV at rest and blanks the plaintext. EVERY content read is gated by `meeting_is_unlocked` / the `visibility_clause` / the live `unlocked_folders` set. A **sealed-and-not-session-unlocked meeting must leak NOTHING** through any surface: detail DTO, segments, timeline, audio, graph/entities, MCP.
-- **Dev run for live repro:** `MURMUR_DEV_DEK=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef scripts/agent-resource-run -- npm run dev` → Angular on `http://localhost:1420`, MCP on `127.0.0.1:8765`. The dev server has NO Tauri runtime in the browser, so `window.__TAURI_INTERNALS__` is undefined until you inject a mock (below). Touch ID / lock-at-rest / screen-share only TRULY verify on a signed build — say so honestly; do not claim you verified them in the browser.
+- **Dev run for live repro:** `MURMUR_DEV_DEK=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef scripts/agent-dev-run -- npm run dev` → Angular on `http://localhost:1420`, MCP on `127.0.0.1:8765`. The dev server stays outside the global resource lane; its cargo/rustc descendants acquire it per process. The browser has NO Tauri runtime, so `window.__TAURI_INTERNALS__` is undefined until you inject a mock (below). Touch ID / lock-at-rest / screen-share only TRULY verify on a signed build — say so honestly; do not claim you verified them in the browser.
 
 ## The seven real bugs this project shipped (your hunt list)
 
 These are not hypothetical. Each shipped once; each is a regression you must specifically probe. For any change touching the relevant surface, actively try to re-trigger the matching class.
 
-1. **Content loss on seal.** Sealing blanked plaintext WITHOUT first verifying the ciphertext decrypts back. Root pattern is now `crypto::encrypt_file` (verify-before-destroy, `src-tauri/src/crypto.rs:50-66`) and `seal_note` (`src-tauri/src/commands.rs:~1726-1759`: encrypt each `(meeting,provider)` row, `decrypt`-verify byte-identical, only THEN blank the markdown + delete the vault `.md`). **Probe:** seal → unlock → assert note markdown + transcript segments + timeline + the audio WAV come back byte-identical. Round-trip unit anchor: `crypto.rs` `audio_encrypt_decrypt_round_trips_byte_identical` (~line 125). A seal that can't be unsealed losslessly = data loss = hard FAIL.
-2. **Entity-name leak.** The self-assembling `[[Person]]/[[Project]]` graph drew edges from sealed meetings, leaking attendee/project names through the graph view while content was locked. Gate is the live `unlocked_folders` snapshot pushed through the visibility predicate in `get_graph` / `get_entity_detail` (`commands.rs:~878-910`, `build_graph(&unlocked)` / `build_entity_detail(&entity_id, &unlocked, …)`). **Probe:** seal a meeting whose entities appear nowhere else → assert those entity names are ABSENT from `get_graph` and `get_entity_detail`.
-3. **Audio-path leak via `convertFileSrc`.** The masked detail DTO once still carried `audioPath`; the FE feeds it straight into `convertFileSrc` (`src/app/features/detail/detail.component.ts:1752`, `audioSrc` computed), so the asset protocol (scope `$HOME/Library/Application Support/MeetNotes/audio/**`, `src-tauri/tauri.conf.json`) would serve a plaintext WAV for a locked meeting. Fix: masked DTO NULLs `audio_path` (`commands.rs:~1435-1442`) and `export_audio` fails closed on `!meeting_is_unlocked` (`commands.rs:~475-488`). **Probe:** locked meeting → `get_meeting_detail` returns `audioPath: null`, `export_audio` returns a `Locked` error, and the FE renders no `<audio>` src.
-4. **NG0600 — "writing to signals is not allowed in `computed`/`effect`."** Zoneless Angular aborts the change-detection pass with NG0600 when a signal is written inside a `computed()` or `effect()`. **Probe:** drive the changed component live and read the console — NG0600 (or any NG06xx) in `browser_console_messages` is a FAIL even if the gate build passed.
-5. **Screen-share FFI abort at launch.** `msg_send![screen, isCaptured]` sent an **iOS-only** selector (`NSScreen.isCaptured` does not exist on macOS) → unrecognized-selector `NSException` → "Rust cannot catch foreign exceptions" → process ABORT before the window drew. `src-tauri/src/screenshare.rs` is now pure CoreGraphics C functions (`CGWindowListCopyWindowInfo`, `CFArray*`, `CFDictionaryGetValue`, `CFGetTypeID`), ZERO `msg_send`/selector dispatch. **Probe:** grep new macOS FFI for `msg_send!` — any unguarded `msg_send` (no `respondsToSelector:`/`class_getInstanceMethod`) on this path is a launch-crash risk → FAIL. On a signed build, the app must boot and the share watcher must not abort.
+1. **Content loss on seal.** Sealing blanked plaintext WITHOUT first verifying the ciphertext
+   decrypts back. Ground at `crypto.rs::encrypt_file`, `commands/lock.rs::lock_folder`,
+   `commands/mod.rs::seal_folder_extras`, and `storage/seal_store.rs::Db::seal_note`; grep the
+   symbols rather than trusting a line. **Probe:** seal → unlock → assert note markdown + transcript
+   segments + timeline + every audio artifact come back byte-identical. Regression anchors:
+   `crypto.rs::audio_encrypt_decrypt_round_trips_byte_identical` and
+   `storage/db_tests/lock_tests.rs::seal_transcript_timeline_round_trips_byte_identical`.
+2. **Entity-name leak.** The self-assembling `[[Person]]/[[Project]]` graph drew edges from sealed
+   meetings. Gate is the live `unlocked_folders` snapshot in
+   `commands/graph.rs::{get_graph,get_entity_detail}` and the storage visibility helpers. **Probe:**
+   seal a meeting whose entities appear nowhere else → assert those entity names are ABSENT.
+3. **Audio-path leak via `convertFileSrc`.** The masked detail DTO once still carried `audioPath`;
+   the FE's `audioSrc` computed fed it straight into the asset protocol. Ground at
+   `commands/meetings.rs::get_meeting_detail` (masked `audio_path: None`) and
+   `commands/export.rs::export_audio` (fails closed through `meeting_is_unlocked`). **Probe:** locked
+   meeting → `audioPath: null`, `export_audio` returns `Locked`, and no `<audio>` src renders.
+4. **Angular effect regression (historic NG0600; current stale-result risk).** Signal writes in
+   effects are allowed since Angular 19, so `{ allowSignalWrites: true }` is a deprecated no-op and
+   must not be reintroduced. The live failure to hunt now is an effect-orchestrated IPC fetch whose
+   older response overwrites newer state. **Probe:** drive rapid input changes, require a stale-result
+   guard, and fail on any NG06xx console error.
+5. **Screen-share FFI abort at launch.** `msg_send![screen, isCaptured]` sent an **iOS-only**
+   selector (`NSScreen.isCaptured` does not exist on macOS) → unrecognized-selector `NSException` →
+   process ABORT before the window drew. `src-tauri/src/screenshare.rs` now uses CoreGraphics /
+   CoreFoundation C functions. **Probe:** any new unguarded `msg_send` on this path is a FAIL.
 6. **Folder import-cycle (`ɵcmp` undefined).** A circular import among the `folders` feature files made a component's `ɵcmp` definition read as `undefined` (component referenced before its module initialized) → blank route / runtime TypeError. **Probe:** `ng build` must be clean AND the route must actually render live — a green build does not catch a cycle that only explodes at runtime. Read the console for `Cannot read … ɵcmp` / `undefined is not an object`.
 7. **Opacity bleed.** A locked-state overlay used translucent opacity, so the real plaintext rendered BEHIND it was still readable through the layer (and present in the DOM). **Probe:** for a locked meeting, the plaintext must be ABSENT FROM THE DOM (because the DTO is masked), not merely visually dimmed. Assert the masked DTO carries no `note`/`segments`, and that no plaintext string is present in the page snapshot.
 

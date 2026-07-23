@@ -5,15 +5,15 @@ This is the vendor-neutral control plane around Claude Code and Codex. It is sep
 The runner owns the lifecycle:
 
 ```text
-contract -> isolated worktree -> writer -> deterministic checks
+contract -> isolated worktree -> writer -> deterministic checks -> final checks
          -> fresh spec review -> fresh adversarial review
-         -> risk review(s) -> bounded repair -> final checks
+         -> risk review(s) -> bounded repair (re-runs checks + final checks first)
          -> hash-bound PASS attestation
 ```
 
 The model never decides that the task is complete. `PASS` belongs to the runner and is valid only for the exact contract, base commit, worktree, staged binary diff, checks, and independent reviews recorded in the attestation. Any later edit invalidates it.
 
-`instructions_sha256` is deterministic: sort the active instruction paths (`AGENTS.md`, `CLAUDE.md`, both clients' rules/agent adapters, and the harness config/prompts/schemas), then hash each UTF-8 path, a NUL byte, its raw contents, and another NUL byte. Changing instructions creates a new harness variant and invalidates an older task receipt.
+`instructions_sha256` is deterministic: sort the active instruction paths (`AGENTS.md`, `CLAUDE.md`, both clients' rules/agent adapters, canonical `.codex/learnings`, and the harness config/prompts/schemas), then hash each UTF-8 path, a NUL byte, its raw contents, and another NUL byte. Changing instructions creates a new harness variant and invalidates an older task receipt. Each dispatch receives a bounded, role-relevant extract of canonical `## Recurring patterns`; journal history is not injected.
 
 ## Daily use
 
@@ -69,10 +69,16 @@ macOS's `allow default` capability baseline and then imposes explicit file/netwo
 denials; it is strong file/network containment, not a pure capability allowlist. Contracts, logs,
 reviews, and attestations remain parent-**writable** only; checks may read runner inputs needed for
 reproducibility but cannot create or alter evidence.
-The machine's Cargo registry, advisory database, tool binaries, and Rustup toolchains are exposed
-read-only; offline Cargo writes and build artifacts stay inside that one task.
-Playwright and native runtime probes get loopback TCP only. The profile, environment-key set,
-stdout/stderr and combined log are hash-bound into the attestation. If `sandbox-exec` is absent,
+The machine's Cargo registry, advisory database, tool binaries, Rustup toolchains, and the
+checksum-verified sherpa-onnx prebuilt archive are exposed read-only; offline Cargo writes and
+build artifacts stay inside that one task. Native resolvers may enumerate only the literal ancestor
+directories needed to reach an allowed leaf such as shared `node_modules`; those ancestors do not
+gain subtree read access.
+Playwright, native runtime probes, and Rust test commands get loopback TCP only because the
+existing Rust suite owns ephemeral local HTTP listeners; ordinary build/lint checks remain
+network-denied. The profile, complete sanitized
+environment (keys and values), stdout/stderr and combined log are hash-bound into the attestation.
+If `sandbox-exec` is absent,
 the task is `BLOCKED`; checks never fall back to an unsandboxed shell.
 
 The default loop permits two repair rounds and has a two-hour task-wide deadline in addition to
@@ -81,7 +87,8 @@ failing-check/review signature stop as `BLOCKED/no progress`. Any terminal task 
 an abandoned nonterminal run lands `BLOCKED/interrupted` instead of silently receiving a fresh
 repair budget. Retrying requires a new contract. A failed or
 blocked run emits a content-free `learning-candidate.json` for explicit human curation; it never
-edits binding learnings automatically.
+edits binding learnings automatically. Disposable task caches are pruned immediately after
+`FAILED`/`BLOCKED`, while small sandbox profiles and all logs/evidence remain.
 
 Risk evidence is runner-owned. Path classification automatically injects byte-exact canonical
 commands from `config.json`; a caller cannot satisfy a lock or egress requirement with a label such
@@ -108,7 +115,36 @@ commit hook fail after any post-review edit. If a manual commit is ever needed, 
 `git -C <printed-worktree> commit ...` so the hook can resolve the task explicitly. `close` is
 deliberately strict: only the runner's `COMMITTED` state is accepted; the commit receipt must match
 the exact HEAD, sole parent, tree, message, timestamps, and QueaT author/committer. It then removes
-only the two task worktrees and preserves the branch and evidence.
+only the two task worktrees, stores the exact task tip under `refs/agent-harness/archive/`, removes
+the local task branch, prunes disposable caches, and preserves the evidence.
+
+Changing the executable control-plane itself has one explicit bootstrap because `init` normally
+freezes the auto-loaded instruction fingerprint before the writer runs. For a `--kind harness`
+task only, an operator may copy a prepared patch into the new isolated worktree and run
+`scripts/agent-harness seal-prepared <task-id>` **before any model or check**. The command requires
+an actually changed protected path, stages the exact owned bytes, refuses dependency-pin changes,
+rebinds the instruction fingerprint once, and writes `prepared.json`. From that point the new
+instructions are immutable again and the ordinary writer, checks, fresh cross-vendor reviews,
+attestation, commit, and close lifecycle is mandatory. Feature/product tasks cannot use this path.
+
+Failed or blocked tasks can be cleaned without losing their work:
+
+```bash
+scripts/agent-harness reap attachment-loss
+scripts/agent-harness gc --older-than-hours 168 --dry-run
+scripts/agent-harness gc --older-than-hours 168
+```
+
+`reap` first writes every Git-visible tracked and untracked task byte to a hidden Git archive ref
+(ignored dependency caches remain disposable), then removes
+only the contract-bound client/server worktrees and local task branch. It refuses dirty sibling
+server worktrees. `gc` applies the same operation to old `FAILED`/`BLOCKED`/legacy `CLOSED`
+tasks and to stale abandoned `INITIALIZED`/`RUNNING`/`CHECKING`/`REVIEWING`/`REPAIRING`
+tasks only after the age cutoff and only when no live task-run lock exists. The locked reaper
+revalidates both conditions before converting an abandoned task to `BLOCKED/interrupted`.
+When an older runner already lost/removed a task worktree, `gc` cannot invent a code
+snapshot; it preserves the existing evidence/state and prunes only disposable runtime caches.
+`--dry-run` lists reap and runtime-only targets separately.
 
 For a change that claims native boot behavior, add the exclusive runtime evidence before review:
 
@@ -146,11 +182,31 @@ Audit that boundary without mutating GitHub:
 scripts/agent-remote-audit
 ```
 
-The repository policy is versioned in `remote-policy.json` and requires at least one approval plus
-the app-bound full gate. CI deterministically selftests the policy evaluator, but the live network
-audit stays a separate operator/scheduled preflight because harness checks intentionally have no
-Internet and GitHub administration reads need an explicit read-only credential. A remote FAIL means
-the development loop is locally functional but merge enforcement is not complete; changing branch
-protection, rulesets, or secret scanning is an explicit operator action.
+The repository policy is versioned in `remote-policy.json`. Its merge scope requires an active
+ruleset that actually applies to `murmur`, requires the exact GitHub Actions check
+`gate (full ci.sh — release parity)` with strict-up-to-date checks, resolves every review thread,
+and blocks deletion/non-fast-forward updates. The privileged monitoring scope separately requires
+no bypass actors plus secret scanning and push protection.
+The approval count is deliberately **zero** while Murmur has one operator: requiring the PR author
+to obtain an independent approval would deadlock, not add separation. The no-bypass ruleset plus
+the exact CI status is the honest enforceable boundary.
+
+CI runs a live read-only audit first. Pull requests lend only their ordinary, least-privilege
+GitHub Actions token and may return `PASS_MERGE_SCOPE` only when every merge-scope control passes.
+The three admin-only controls are labeled `MONITOR_ONLY`;
+that verdict explicitly does not attest them for the PR. Trusted schedule/dispatch runs require
+the privileged audit with the repository-scoped `MURMUR_REMOTE_AUDIT_TOKEN`; a missing or
+under-scoped secret fails closed and never falls back to the narrower PR scope. The secret is never
+exposed to pull-request code. A token exists only in the `ci.sh` step and is unset immediately
+after the audit, before any other repository command. Local runs execute the deterministic
+evaluator selftest unless `MURMUR_CI_PUBLIC_REMOTE_AUDIT=1` or privileged
+`MURMUR_CI_LIVE_REMOTE_AUDIT=1` is set. A remote FAIL means the development loop is locally
+functional but the audited enforcement scope is incomplete; this audit never mutates GitHub.
+
+Control-plane tasks declare the harness and hook meta-selftests as hash-bound checks. Their nested
+fake checks inherit the already-applied outer no-network Seatbelt because macOS refuses a second
+`sandbox_apply`. Inherited mode is accepted only for fake/selftest receipts and only after
+`sandbox_check` proves the current process is kernel-sandboxed; a forged host environment marker
+fails closed. Production task checks always record `sandbox_mode: direct`.
 
 No production vault, MeetingNotes database, Keychain item, live microphone, ScreenCaptureKit session, or real cloud provider belongs in an automated trial. Signed-build-only behavior stays an explicit human/runtime gate.

@@ -49,7 +49,8 @@ the invariants below.
   the RAM guard `ram_permits_load(free_bytes, model_disk_bytes)` (**FAILS OPEN** on a broken probe),
   `available_ram_bytes()` (`vm_stat` parse), `model_disk_bytes()`. Transcript-side OOM guard:
   `src-tauri/src/summarize/timeline.rs` (UNIFORM DECIMATION of the on-device transcript — never
-  head-truncation; cloud provider = no cap). `total_ram_gb()` (`sysctl hw.memsize`) in `commands.rs`.
+  head-truncation; cloud provider = no cap). `commands/model_perf.rs::total_ram_gb()` probes
+  `sysctl hw.memsize`.
 - **Thermal (co-owned with model-perf-engineer)** — `src-tauri/src/thermal.rs`: `ThermalGovernor` +
   `ThermalLevel` back-off for the LIVE loop ONLY. Its module header states the invariant verbatim:
   *"The RECORDING and the post-Stop batch pipeline are NEVER touched by this governor — only the
@@ -139,9 +140,10 @@ The seven you must never violate:
 
 ## Dev run (when behavior must be observed)
 
-`MURMUR_DEV_DEK=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef scripts/agent-resource-run -- npm run dev 2>&1 | tee /tmp/murmur-dev.log`
+`MURMUR_DEV_DEK=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef scripts/agent-dev-run -- npm run dev 2>&1 | tee /tmp/murmur-dev.log`
 (tauri dev; ng on http://localhost:1420, MCP on 127.0.0.1:8765). `MURMUR_DEV_DEK` skips the keychain
-re-prompt loop. Stop the dev server before a `tauri build` (it holds the cargo target lock). See
+re-prompt loop. Rust compiler descendants acquire the repo-global lane per process; the server does
+not hold it. Stop the dev server before a `tauri build` because they share Cargo targets. See
 `/tauri-dev`.
 
 ## Output contract (return exactly this structure)

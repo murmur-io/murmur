@@ -16,7 +16,7 @@ FTS5 Ask is **live today**. Run it on your real data and score it.
 ### Setup
 ```bash
 source ~/.cargo/env
-MURMUR_DEV_DEK=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef npm run dev
+MURMUR_DEV_DEK=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef scripts/agent-dev-run -- npm run dev
 ```
 Open **Ask-My-Vault** (the Ask screen). Use your real vault.
 
@@ -152,8 +152,17 @@ To bake them off against each other on your Polish queries:
 
 *mmlw config verified: BERT architecture (`model_type: bert`, loadable by candle's `BertModel`), `hidden_size == 384` (matches `EMBED_DIM`, zero schema change), and the same `"query: "`/`"passage: "` asymmetric prefix convention as e5 (per its HF card).*
 
-### Metric math is unit-tested (no model needed)
-The recall@k / nDCG@k / MRR implementations are pure and covered by deterministic unit tests over synthetic rankings (`cargo test --lib eval::` — runs in the normal loop). The *real* run above is the only part that needs a Mac + the model.
+### Deterministic CI floor vs manual quality signals
+The recall@k / nDCG@k / MRR implementations are pure and covered by deterministic unit tests.
+The normal non-ignored synthetic-corpus test also enforces the committed **FTS floor of 0.20** for
+all three metrics (recall@5, nDCG@5, MRR), using the fixed corpus/date and no model. This catches a
+real lexical-retrieval regression in CI.
+
+Semantic/hybrid/reranker numbers are intentionally not gated by that headless run: its stub vectors
+are not a semantic quality signal. The real-model synthetic runner and labeled real-vault runner
+remain manual Mac measurements. Note-generation quality is a separate manual real-provider
+bake-off; the audio E2E uses a deterministic provider stub by default and does not certify
+generation quality.
 
 ---
 

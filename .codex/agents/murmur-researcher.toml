@@ -35,9 +35,18 @@ The team's hard-won lesson is **"trust code, not docs — the docs were repeated
 - Redaction firewall historically wrapped only `anthropic`; default `claude_code` is a cloud relay → all non-Ollama providers must be treated as cloud.
 - **FIXED — dual-stream preserves diarization.** The pipeline keeps mic + system as SEPARATE streams and wall-clock-merges them (`pipeline.rs`, `audio/merge.rs`); `Segment.speaker` is `Some("me")` (mic) / `Some("others")` (system) (`transcribe/types.rs:5-17`). It is cheap 2-way stream-attribution, NOT voice-fingerprint diarization — every remote participant collapses into one "others" label. Per-speaker splitting of "others" is still open.
 - System-audio capture (ScreenCaptureKit Swift sidecar, `audio/system.rs`) is implemented but only TRULY verifies on a real Mac with Screen-Recording TCC permission + a signed build — typecheck/`cargo test` is not proof.
-- **FIXED — in-app graph has real tables.** `entities` + `entity_mentions` exist in SQLCipher (`storage/db.rs:172`/`180`, indexed) and the graph reads them, gated by `visibility_clause` (`list_entities_visible`, `db.rs:1448`). The graph is now DB-backed, not vault-stub-only.
-- **FIXED — guarded migrations + SQLCipher shipped.** Schema evolves via `Db::migrate()` + `add_column_if_missing` (`db.rs:111`/`212`), idempotent + additive-only; and the one-time plaintext→SQLCipher encrypt-in-place (`storage/migration.rs`) does export → independent verify → `.pre-encrypt.bak` → atomic swap. The whole DB is SQLCipher-encrypted at rest. Still no destructive migrations by rule.
-- **FIXED — default model is `large-v3`** (multilingual, `transcribe/model.rs:34`), and **Polish is wired** (large-v3/-turbo are multilingual-only, so `pl` resolves the full `ggml-large-v3.bin`; `model.rs:182`). Decode quality splits `TranscribeQuality::Fast` (live/greedy) vs `Accurate` (batch beam-5 + temperature fallback + anti-hallucination thresholds, `transcribe/whisper.rs`). Real-world Polish accuracy is still unmeasured.
+- **FIXED — in-app graph has real tables.** `entities` + `entity_mentions` exist in SQLCipher
+  (grep their table declarations); the graph reads them through
+  `storage/graph_store.rs::Db::list_entities_visible` and the shared `visibility_clause`. The graph
+  is DB-backed, not vault-stub-only.
+- **FIXED — guarded migrations + SQLCipher shipped.** Schema evolves via
+  `storage/db.rs::{Db::migrate,Db::add_column_if_missing}`, idempotent + additive-only; the one-time
+  plaintext→SQLCipher encrypt-in-place (`storage/migration.rs`) does export → independent verify →
+  `.pre-encrypt.bak` → atomic swap.
+- **FIXED — model default is RAM/install-aware.** `transcribe/model.rs::default_model_size`
+  selects `large-v3-turbo-q8_0` for qualifying fresh ≥12 GB installs or when already downloaded,
+  otherwise `small`; all larger models remain selectable. Polish resolves multilingual builds.
+  Decode quality splits `TranscribeQuality::Fast` vs `Accurate` in `transcribe/whisper.rs`.
 
 If your topic touches any of these, ground your feasibility in the **current** state of the code, not these notes (they may have been fixed). Read `docs/STATUS.md`, `docs/KILLER-FEATURES.md`, `docs/COMPETITIVE-LANDSCAPE.md`, and `docs/superpowers/specs/` for the latest, then verify load-bearing claims in `src-tauri/src/` and `src/app/`.
 

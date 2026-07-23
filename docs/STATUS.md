@@ -29,7 +29,7 @@
 | Quality | clippy `-D warnings`, `ng lint`, 34 tests | `scripts/ci.sh` |
 
 The headless E2E (`scripts/e2e-core.sh`) drives `say → ffmpeg → Whisper(base.en) →
-ClaudeCodeProvider → Obsidian .md` and asserts a real note with front-matter — the core
+deterministic provider stub → Obsidian .md` and asserts a real note with front-matter — the core
 pipeline is proven end-to-end, minus the parts that need a desktop (below).
 
 ## Remaining for prod-ready (user / runtime gated)
@@ -66,11 +66,9 @@ bash scripts/e2e-core.sh    # just the headless core pipeline
 ```bash
 npx tauri dev               # Angular dev server (:1420) + Tauri window
 ```
-Then in **Settings**: set the Vault folder; set the Whisper model path (download once):
+Then in **Settings**: set the Vault folder; install the checksum-pinned Whisper model once:
 ```bash
-mkdir -p "$HOME/Library/Application Support/MeetNotes/models"
-curl -L -o "$HOME/Library/Application Support/MeetNotes/models/ggml-base.en.bin" \
-  https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin
+scripts/ensure-whisper-model.sh
 ```
 Leave Provider = Claude Code (needs the `claude` CLI in PATH), or set an Anthropic key /
 run Ollama. Then **Record → speak → Stop** and confirm a note appears in the vault.

@@ -9,6 +9,7 @@ clients cannot silently drift.
 from __future__ import annotations
 
 import argparse
+import atexit
 import copy
 import datetime as dt
 import fnmatch
@@ -17,9 +18,12 @@ import json
 import os
 import re
 import shlex
+import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
@@ -487,6 +491,12 @@ def _block_bash(command: str, process_cwd: Path) -> Optional[str]:
             dangerous = {"/", "//", "/*", "~", "~/", "~/*", "$HOME", "${HOME}", "$HOME/", "${HOME}/"}
             if recursive and any(token in dangerous for token in targets):
                 return "recursive deletion of filesystem root or the home directory is forbidden"
+    if resource_policy.command_is_dev_in(command, process_cwd):
+        return (
+            "long-lived dev commands must run through scripts/agent-dev-run; "
+            "the dev supervisor stays outside the global lane while its cargo/rustc "
+            "descendants acquire it per process"
+        )
     if resource_policy.command_is_heavy_in(command, process_cwd):
         return (
             "unwrapped resource-heavy build/test/dev command; run it through "
@@ -1056,7 +1066,8 @@ def _init_repo(path: Path) -> None:
     cargo_src = path / "src-tauri" / "src"
     cargo_src.mkdir(parents=True)
     (path / "src-tauri" / "Cargo.toml").write_text(
-        '[package]\nname="hook-selftest"\nversion="0.0.0"\nedition="2021"\n',
+        '[package]\nname="hook-selftest"\nversion="0.0.0"\nedition="2021"\n\n'
+        "[workspace]\n",
         encoding="utf-8",
     )
     (cargo_src / "lib.rs").write_text(
@@ -1193,7 +1204,16 @@ def _write_receipt(repo: Path, task_id: str, *, risk: bool = False) -> Tuple[Pat
 
 
 def _finish_repo() -> Path:
-    temp = Path(tempfile.mkdtemp(prefix="murmur-hook-finish-"))
+    # Cargo discovers .cargo/config.toml by walking every parent of its cwd.
+    # The outer harness TMPDIR lives below the primary checkout's common .git,
+    # so a nested fixture created there can accidentally discover mutable
+    # primary-worktree configuration. Keep the Rust-backed finish fixture
+    # below this sealed worktree instead; the source diff fingerprint catches
+    # contamination and the caller removes the directory after every case.
+    fixture_parent = SOURCE_ROOT / "target" / "harness-selftest"
+    fixture_parent.mkdir(parents=True, exist_ok=True)
+    temp = Path(tempfile.mkdtemp(prefix="murmur-hook-finish-", dir=fixture_parent))
+    atexit.register(shutil.rmtree, temp, ignore_errors=True)
     repo = temp / "repo"
     _init_repo(repo)
     (repo / "owned.txt").write_text("changed\n", encoding="utf-8")
@@ -1288,9 +1308,15 @@ def _resource_lane_runner_cases(test: _Selftest) -> None:
     """Exercise the bounded supervisor without launching any product build."""
 
     runner = SOURCE_ROOT / "scripts" / "agent-resource-run"
+    dev_runner = SOURCE_ROOT / "scripts" / "agent-dev-run"
     test.result(
         "resource lane runner is executable",
         "PASS" if runner.is_file() and os.access(runner, os.X_OK) else "FAIL",
+        "PASS",
+    )
+    test.result(
+        "dev runner is executable",
+        "PASS" if dev_runner.is_file() and os.access(dev_runner, os.X_OK) else "FAIL",
         "PASS",
     )
     with tempfile.TemporaryDirectory(prefix="murmur-resource-lane-") as temp:
@@ -1359,6 +1385,257 @@ def _resource_lane_runner_cases(test: _Selftest) -> None:
             "PASS" if completed.returncode == 124 and elapsed < 3 else f"FAIL({completed.returncode})",
             "PASS",
         )
+
+        fake_bin = Path(temp) / "fake-bin"
+        fake_bin.mkdir()
+        tool_log = Path(temp) / "tool.log"
+        ready_file = Path(temp) / "dev.ready"
+        child_pid_file = Path(temp) / "dev-child.pid"
+        fake_cargo = fake_bin / "cargo"
+        fake_rustc = fake_bin / "rustc"
+        fake_npm = fake_bin / "npm"
+        fake_cargo.write_text(
+            "#!/bin/sh\n"
+            "set -eu\n"
+            'if test "${MURMUR_AGENT_DEV_TEST_MODE:-}" = compile_hold; then\n'
+            '  printf "%s\\n" "$$" > "$MURMUR_AGENT_DEV_TEST_CHILD_PID"\n'
+            '  : > "$MURMUR_AGENT_DEV_TEST_READY"\n'
+            "  trap 'exit 0' HUP INT TERM\n"
+            "  while :; do sleep 0.05; done\n"
+            "fi\n"
+            'printf "cargo lane=%s rustc=%s\\n" '
+            '"${MURMUR_AGENT_RESOURCE_LANE_ACTIVE:-}" "${RUSTC:-}" '
+            '>> "$MURMUR_AGENT_DEV_TEST_LOG"\n'
+            '"$RUSTC" --dev-proxy-selftest\n',
+            encoding="utf-8",
+        )
+        fake_rustc.write_text(
+            "#!/bin/sh\n"
+            "set -eu\n"
+            'printf "rustc lane=%s\\n" "${MURMUR_AGENT_RESOURCE_LANE_ACTIVE:-}" '
+            '>> "$MURMUR_AGENT_DEV_TEST_LOG"\n',
+            encoding="utf-8",
+        )
+        fake_npm.write_text(
+            "#!/bin/sh\n"
+            "set -eu\n"
+            'case "${MURMUR_AGENT_DEV_TEST_MODE:-proxy}" in\n'
+            '  proxy) "$CARGO" --dev-proxy-selftest; "$RUSTC" --dev-proxy-selftest ;;\n'
+            '  forge_lane) MURMUR_AGENT_RESOURCE_LANE_ACTIVE=1 "$CARGO" --dev-proxy-selftest ;;\n'
+            "  hold)\n"
+            '    printf "%s\\n" "$$" > "$MURMUR_AGENT_DEV_TEST_CHILD_PID"\n'
+            '    : > "$MURMUR_AGENT_DEV_TEST_READY"\n'
+            "    trap 'exit 0' HUP INT TERM\n"
+            "    while :; do sleep 0.05; done\n"
+            "    ;;\n"
+            '  compile_hold) "$CARGO" --dev-proxy-selftest ;;\n'
+            "  *) exit 65 ;;\n"
+            "esac\n",
+            encoding="utf-8",
+        )
+        for executable in (fake_cargo, fake_rustc, fake_npm):
+            executable.chmod(0o755)
+
+        dev_env = os.environ.copy()
+        for reserved in (
+            "MURMUR_AGENT_RESOURCE_LANE_ACTIVE",
+            "MURMUR_AGENT_DEV_PROXY_DIR",
+            "MURMUR_AGENT_DEV_PROXY_TOKEN",
+            "MURMUR_AGENT_DEV_REAL_CARGO",
+            "MURMUR_AGENT_DEV_REAL_RUSTC",
+        ):
+            # The complete CI command may itself be resource-lane wrapped.
+            # These child cases model a fresh operator dev invocation; the
+            # production runner still rejects inherited/forged supervisor state.
+            dev_env.pop(reserved, None)
+        dev_env["PATH"] = str(fake_bin) + os.pathsep + dev_env.get("PATH", "")
+        dev_env["MURMUR_AGENT_DEV_TEST_LOG"] = str(tool_log)
+        completed = subprocess.run(
+            [str(dev_runner), "--", "npm", "run", "dev"],
+            cwd=str(repo),
+            env=dev_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+        tool_output = tool_log.read_text(encoding="utf-8") if tool_log.is_file() else ""
+        proxy_ok = (
+            completed.returncode == 0
+            and "cargo lane=1" in tool_output
+            and f"rustc={fake_rustc}" in tool_output
+            and tool_output.count("rustc lane=1") == 2
+        )
+        test.result(
+            "dev runner proxies cargo and rustc without recursive flock",
+            "PASS" if proxy_ok else f"FAIL({completed.returncode}: {tool_output.strip()})",
+            "PASS",
+        )
+
+        lane_owner_ready = Path(temp) / "lane-owner.ready"
+        owner_env = os.environ.copy()
+        owner_env["MURMUR_AGENT_DEV_TEST_READY"] = str(lane_owner_ready)
+        lane_owner = subprocess.Popen(
+            [
+                str(runner),
+                "--deadline-seconds",
+                "3",
+                "--",
+                "sh",
+                "-c",
+                ': > "$MURMUR_AGENT_DEV_TEST_READY"; sleep 2',
+            ],
+            cwd=str(repo),
+            env=owner_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            ready_until = time.monotonic() + 2
+            while time.monotonic() < ready_until and not lane_owner_ready.exists():
+                if lane_owner.poll() is not None:
+                    break
+                time.sleep(0.02)
+            before_forge = tool_log.read_text(encoding="utf-8") if tool_log.is_file() else ""
+            forge_env = dev_env.copy()
+            forge_env["MURMUR_AGENT_DEV_TEST_MODE"] = "forge_lane"
+            forge_env["MURMUR_AGENT_DEADLINE_SECONDS"] = "0.20"
+            forged = subprocess.run(
+                [str(dev_runner), "--", "npm", "run", "dev"],
+                cwd=str(repo),
+                env=forge_env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+                timeout=3,
+            )
+            after_forge = tool_log.read_text(encoding="utf-8") if tool_log.is_file() else ""
+            test.result(
+                "dev child cannot forge lane marker to bypass held flock",
+                "PASS"
+                if lane_owner_ready.exists()
+                and forged.returncode == 124
+                and after_forge == before_forge
+                else f"FAIL(owner={lane_owner.poll()}, forged={forged.returncode})",
+                "PASS",
+            )
+        finally:
+            if lane_owner.poll() is None:
+                lane_owner.terminate()
+            try:
+                lane_owner.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                lane_owner.kill()
+                lane_owner.wait(timeout=3)
+
+        hold_env = dev_env.copy()
+        hold_env["MURMUR_AGENT_DEV_TEST_MODE"] = "hold"
+        hold_env["MURMUR_AGENT_DEV_TEST_READY"] = str(ready_file)
+        hold_env["MURMUR_AGENT_DEV_TEST_CHILD_PID"] = str(child_pid_file)
+        dev_process = subprocess.Popen(
+            [str(dev_runner), "--term-grace-seconds", "0.20", "--", "npm", "run", "dev"],
+            cwd=str(repo),
+            env=hold_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            ready_until = time.monotonic() + 3
+            while time.monotonic() < ready_until and not ready_file.exists():
+                if dev_process.poll() is not None:
+                    break
+                time.sleep(0.02)
+            lane_probe = subprocess.run(
+                [str(runner), "--deadline-seconds", "0.50", "--", "sh", "-c", "exit 0"],
+                cwd=str(repo),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=3,
+            )
+            test.result(
+                "long-lived dev supervisor does not hold resource lane",
+                "PASS"
+                if ready_file.exists() and lane_probe.returncode == 0
+                else f"FAIL(dev={dev_process.poll()}, lane={lane_probe.returncode})",
+                "PASS",
+            )
+            dev_process.send_signal(signal.SIGTERM)
+            dev_return = dev_process.wait(timeout=4)
+            child_alive = False
+            if child_pid_file.is_file():
+                child_pid = int(child_pid_file.read_text(encoding="utf-8").strip())
+                try:
+                    os.kill(child_pid, 0)
+                    child_alive = True
+                except ProcessLookupError:
+                    pass
+            test.result(
+                "dev runner signal tears down its owned process group",
+                "PASS" if dev_return == 143 and not child_alive else f"FAIL({dev_return})",
+                "PASS",
+            )
+        finally:
+            if dev_process.poll() is None:
+                dev_process.kill()
+                dev_process.wait(timeout=3)
+
+        ready_file.unlink(missing_ok=True)
+        child_pid_file.unlink(missing_ok=True)
+        compile_env = dev_env.copy()
+        compile_env["MURMUR_AGENT_DEV_TEST_MODE"] = "compile_hold"
+        compile_env["MURMUR_AGENT_DEV_TEST_READY"] = str(ready_file)
+        compile_env["MURMUR_AGENT_DEV_TEST_CHILD_PID"] = str(child_pid_file)
+        dev_process = subprocess.Popen(
+            [str(dev_runner), "--term-grace-seconds", "0.20", "--", "npm", "run", "dev"],
+            cwd=str(repo),
+            env=compile_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            ready_until = time.monotonic() + 3
+            while time.monotonic() < ready_until and not ready_file.exists():
+                if dev_process.poll() is not None:
+                    break
+                time.sleep(0.02)
+            dev_process.send_signal(signal.SIGTERM)
+            dev_return = dev_process.wait(timeout=4)
+            lane_probe = subprocess.run(
+                [str(runner), "--deadline-seconds", "0.50", "--", "sh", "-c", "exit 0"],
+                cwd=str(repo),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=3,
+            )
+            child_alive = False
+            if child_pid_file.is_file():
+                child_pid = int(child_pid_file.read_text(encoding="utf-8").strip())
+                try:
+                    os.kill(child_pid, 0)
+                    child_alive = True
+                except ProcessLookupError:
+                    pass
+            test.result(
+                "dev signal reaps an in-flight cargo lane and releases flock",
+                "PASS"
+                if ready_file.exists()
+                and dev_return == 143
+                and lane_probe.returncode == 0
+                and not child_alive
+                else f"FAIL(dev={dev_return}, lane={lane_probe.returncode})",
+                "PASS",
+            )
+        finally:
+            if dev_process.poll() is None:
+                dev_process.kill()
+                dev_process.wait(timeout=3)
 
 
 def _run_selftest() -> int:
@@ -1432,6 +1709,56 @@ def _run_selftest() -> int:
                 "ALLOW",
             ),
             (
+                "lane-wrapped long-lived dev",
+                "scripts/agent-resource-run -- npm run dev",
+                "BLOCK",
+            ),
+            (
+                "lane-wrapped chdir long-lived dev",
+                "scripts/agent-resource-run --chdir /tmp/deck npm run dev -- --port 4173",
+                "BLOCK",
+            ),
+            (
+                "dedicated npm dev",
+                "scripts/agent-dev-run -- npm run dev",
+                "ALLOW",
+            ),
+            (
+                "dedicated npm dev port",
+                "scripts/agent-dev-run -- npm run dev -- --port 4173",
+                "ALLOW",
+            ),
+            (
+                "dedicated npm dev host",
+                "scripts/agent-dev-run -- npm run dev -- --host 127.0.0.1",
+                "ALLOW",
+            ),
+            (
+                "dedicated npm start",
+                "scripts/agent-dev-run -- npm run start",
+                "ALLOW",
+            ),
+            (
+                "dedicated dev config override",
+                "scripts/agent-dev-run -- npm run dev -- --config injected.json",
+                "BLOCK",
+            ),
+            (
+                "dedicated runner arbitrary cargo",
+                "scripts/agent-dev-run -- cargo test --lib",
+                "BLOCK",
+            ),
+            (
+                "dedicated runner npm build",
+                "scripts/agent-dev-run -- npm run build",
+                "BLOCK",
+            ),
+            (
+                "lookalike dev runner",
+                "/tmp/scripts/agent-dev-run -- npm run dev",
+                "BLOCK",
+            ),
+            (
                 "lookalike lane runner",
                 "/tmp/scripts/agent-resource-run -- cargo test --lib",
                 "BLOCK",
@@ -1439,6 +1766,11 @@ def _run_selftest() -> int:
             (
                 "test-only guardian env",
                 "MURMUR_AGENT_SELFTEST_GUARDIAN_RELEASE=/tmp/x scripts/agent-resource-run -- true",
+                "BLOCK",
+            ),
+            (
+                "forged lane-active env",
+                "MURMUR_AGENT_RESOURCE_LANE_ACTIVE=1 scripts/agent-dev-run -- npm run dev",
                 "BLOCK",
             ),
         ]
@@ -1525,8 +1857,6 @@ def _run_selftest() -> int:
 
         # Remove the non-risk task so discovery remains unambiguous, then prove
         # path/risk-required reviews and evidence cannot be omitted.
-        import shutil
-
         shutil.rmtree(task_dir)
         task_dir, task, attestation = _write_receipt(repo, "lock-risk", risk=True)
         attestation["reviews"] = [review for review in attestation["reviews"] if review["kind"] != "lock-security"]

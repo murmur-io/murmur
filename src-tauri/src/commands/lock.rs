@@ -91,7 +91,11 @@ pub(crate) fn lock_folder_inner(state: &AppState, folder_id: String) -> Result<(
                 .db
                 .folder_wrapped_key(&folder_id)?
                 .ok_or_else(|| AppError::Storage("locked folder has no wrapped key".into()))?;
-            let candidates = crate::secrets::list_master_kek_candidates_strict(
+            // This is non-destructive recovery: a partial/failed enumeration
+            // can only leave plaintext in place and return an error. Use the
+            // lenient source so a debug MURMUR_DEV_KEK can finish its own
+            // interrupted seal without touching the release Keychain.
+            let candidates = crate::secrets::list_master_kek_candidates(
                 "Finish securing this folder after an interrupted lock",
             )?;
             let (ck_bytes, _winning_kek, _winner_index) =
@@ -1025,6 +1029,33 @@ pub(crate) async fn discard_unrecoverable_folder_lock_inner(
     state: &AppState,
     folder_id: String,
 ) -> Result<FolderNode, AppError> {
+    discard_unrecoverable_folder_lock_with_enumeration(state, folder_id, None).await
+}
+
+#[cfg(test)]
+pub(crate) async fn discard_unrecoverable_folder_lock_with_candidates_for_test(
+    state: &AppState,
+    folder_id: String,
+    candidates: Zeroizing<Vec<[u8; 32]>>,
+) -> Result<FolderNode, AppError> {
+    discard_unrecoverable_folder_lock_with_enumeration(
+        state,
+        folder_id,
+        Some(Ok(candidates)),
+    )
+    .await
+}
+
+/// Execute the destructive-discard state machine with either the production
+/// strict Keychain enumeration or an explicit test candidate set. The test seam
+/// is needed because `MURMUR_DEV_KEK` deliberately isolates the real Keychain
+/// and therefore cannot authoritatively prove that an older Keychain KEK is
+/// absent. Production never supplies `injected_enumeration`.
+async fn discard_unrecoverable_folder_lock_with_enumeration(
+    state: &AppState,
+    folder_id: String,
+    injected_enumeration: Option<Result<Zeroizing<Vec<[u8; 32]>>, AppError>>,
+) -> Result<FolderNode, AppError> {
     let folder = state
         .db
         .folder_by_id(&folder_id)?
@@ -1065,13 +1096,17 @@ pub(crate) async fn discard_unrecoverable_folder_lock_inner(
     //    successfully-completed enumeration that returns NO unwrapping candidate proves the folder
     //    unrecoverable (2026-07-05 lock-security finding — the previous lenient enumeration could
     //    swallow a cancelled second Touch ID and wrongly wipe a recoverable folder).
-    let enumeration = tokio::task::spawn_blocking(|| {
-        crate::secrets::list_master_kek_candidates_strict(
-            "Confirm this folder's key is unrecoverable",
-        )
-    })
-    .await
-    .map_err(|e| AppError::Auth(format!("kek-enumeration task join failed: {e}")))?;
+    let enumeration = if let Some(enumeration) = injected_enumeration {
+        enumeration
+    } else {
+        tokio::task::spawn_blocking(|| {
+            crate::secrets::list_master_kek_candidates_strict(
+                "Confirm this folder's key is unrecoverable",
+            )
+        })
+        .await
+        .map_err(|e| AppError::Auth(format!("kek-enumeration task join failed: {e}")))?
+    };
     if !discard_proof_complete(enumeration, &wrapped, &folder_id)? {
         return Err(AppError::InvalidArg(recoverable.into()));
     }

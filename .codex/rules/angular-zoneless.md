@@ -1,8 +1,11 @@
 # Angular 22 Zoneless — Murmur `src/app` (binding ruleset)
 
 > The canonical FE ruleset for Murmur's Angular frontend. BINDING: every rule
-> here is enforced. The frontend is **zoneless** (`provideZonelessChangeDetection()`
-> in `src/app/app.config.ts`) — there is no Zone.js, so change detection only runs
+> here is enforced. Murmur runs **Angular `^22.0.5`** on the **`@angular/build`**
+> builder (the Angular CLI needs **Node ≥ 24.15** — on this machine use nvm's
+> v24.18.0). The frontend is **zoneless** (`provideZonelessChangeDetection()`
+> in `src/app/app.config.ts`; `zone.js` is NOT a dependency and `polyfills` is
+> empty — never reintroduce it) — change detection only runs
 > when a **signal** changes, a template event fires, or an explicit
 > `markForCheck`-equivalent happens. Plain mutable fields do not trigger renders.
 > If your view is stale, the cause is almost always state living in a field that
@@ -18,7 +21,9 @@
 
 ## 1. Component shape (HARD)
 
-- **Standalone only.** No `NgModule`. Components are standalone by default in Angular 22; do not add redundant `standalone: true`.
+- **Standalone only.** No `NgModule`. Standalone is the DEFAULT since v19 —
+  do NOT write `standalone: true` (redundant; removed repo-wide in the v22
+  migration) and never `standalone: false`.
 - **`OnPush` always.** `changeDetection: ChangeDetectionStrategy.OnPush`. Under
   zoneless this is effectively mandatory; omitting it does not buy you anything.
 - **Directory per component, split files** (convention CHANGED 2026-07-04 with
@@ -190,6 +195,50 @@ prototype is the reference implementation). The concrete contract:
   event/interval streams into signals as in `recorder.store.ts`). Adding a UI
   kit, icon library, state library, charting lib, etc. is forbidden.
 
+## 8. List views — stale-while-revalidate (HARD)
+
+A **list route** (`/notes`, `/library`, any future "browse everything" view)
+is destroyed and recreated on every navigate-away-and-back (list routes are
+deliberately NOT in `TabRouteReuseStrategy`'s scope — see its doc — because a
+component that's kept alive can't be trusted to refetch on return; see the
+2026-07-12 incident below). Two rules make that reload invisible instead of a
+"reload flash":
+
+- **List-backing state lives in a `providedIn: 'root'` service, never a
+  component-local `signal()`.** A component-local signal is wiped to its
+  initial (usually empty) value on every destroy+recreate — the list has
+  nothing to show until the refetch resolves. A root service instance
+  outlives the component, so the SAME signal (and its last-known rows)
+  survives the remount; the component just re-injects it. Reference
+  implementations: `NotesService` (notes), `MeetingsListStore` (meetings),
+  `OrgBrainService` (the shared "Shared Brains" roster/items BOTH Notes and
+  Library merge in — was duplicated as two component-local copies before the
+  2026-07-12 fix, now the ONE source). A tiny signal-holder service (no
+  load()/CRUD methods of its own — the component keeps owning orchestration,
+  it just reads/writes the service's signals instead of local ones) is a
+  legitimate, minimal shape when the surrounding logic is non-trivial and
+  moving it wholesale would be riskier than worth it — see `MeetingsListStore`.
+- **A template's loading state must NEVER hide already-cached rows.** Gate the
+  "Loading…" branch on `listEmpty() && loading()`, not `loading()` alone —
+  `@if (listEmpty() && loading()) { <spinner> } @else if (listEmpty()) { <empty-state> } @else { <the list> }`.
+  The FIRST-ever visit still shows a spinner (nothing cached yet); every
+  RETURN visit shows the cached rows instantly while the (still real, still
+  unconditional) reload replaces them underneath — the reload itself is
+  UNCHANGED, only what the template does with `loading()` changes.
+
+**2026-07-12 incident:** `NotesHomeComponent`'s notes already persisted
+correctly (root `NotesService`), but its org-derived rows and
+`LibraryComponent`'s ENTIRE meetings list did not (component-local signals),
+and BOTH templates gated their whole list behind `loading()` regardless — so
+returning to either list always flashed empty/spinner even when data was one
+signal-read away. An earlier attempt to fix this by extending
+`TabRouteReuseStrategy` to also cover the list routes was reverted: keeping
+the component instance alive means `ngOnInit` never re-fires on return, so a
+genuinely NEW row (e.g. a meeting recorded while away) would need a bespoke
+"detect reactivation" hook to ever appear — the root-service approach needs
+no such hook, since the normal destroy+recreate cycle still reliably
+refetches every time.
+
 ## Banned → replacement
 
 | Banned | Use instead |
@@ -213,25 +262,34 @@ prototype is the reference implementation). The concrete contract:
 | Hardcoded hex / spacing / radius / shadow | `var(--token)` from `src/styles.css` |
 | New npm package (FE) | ask the user; reuse `@angular/*` / `rxjs` / `@tauri-apps/api` |
 | `NgModule`, NgRx, a new facade/store abstraction | standalone component + `IpcService` + signals |
+| `standalone: true` in a decorator | omit it — standalone is the v19+ default |
+| `{ allowSignalWrites: true }` on `effect()` | delete it — writes are allowed since v19 (deprecated no-op) |
+| `provideExperimentalZonelessChangeDetection` | `provideZonelessChangeDetection` (stable) |
+| `@angular-devkit/build-angular` builders | `@angular/build:application` / `@angular/build:dev-server` |
+| `zone.js` (dependency or polyfill) | nothing — the app is zoneless |
 
 ## CRITICAL Murmur-specific traps
 
-### T1 — stale async results inside a tracked `effect()`
-Signal writes inside effects are allowed since Angular 19. The old
-`allowSignalWrites` option is a deprecated no-op and must not be reintroduced.
-The real trap is an IPC-on-input-change effect whose older response overwrites
-newer state. Use a monotonically increasing request token:
+### T1 — signal writes inside a tracked `effect()` (Angular 22 semantics)
+Signal writes in effects are **allowed by default since v19** — NG0600 is gone
+and the old `allowSignalWrites` flag is a **deprecated no-op** (it still
+typechecks in v22 but does nothing). Never add it (it was removed repo-wide in
+the v22 migration; an AI trained on Angular 18 code will try to reintroduce
+it — refuse):
 
 ```ts
-private readonly _load = effect(
-  () => { const id = this.entityId(); const token = ++this.loadToken; void this.fetch(id, token); },
-);
+private readonly _load = effect(() => {
+  const id = this.entityId();
+  this.loading.set(true);          // fine in v22 — no flag needed
+  void this.fetch(id);
+});
 ```
 
-Live examples: `entity-detail.component.ts:305-315`, `graph.component.ts:512-520`.
-Prefer **deriving with `computed()`** where possible. Effects may orchestrate
-async IPC, but every result must prove it still belongs to the newest request
-before mutating state.
+The DISCIPLINE the flag used to enforce still binds: prefer **deriving with
+`computed()`**; an effect that writes signals is legitimate ONLY when it
+genuinely orchestrates an async IPC fetch (set loading → await → write result,
+with a stale-result guard). Live examples: `entity-detail.component.ts`,
+`graph.component.ts` (grep the `_load` / `_refetchOnLock` effects).
 
 ### T2 — mutually-recursive standalone components need `forwardRef`
 `FolderTreeComponent` ↔ `FolderRowComponent` render each other (a row renders
