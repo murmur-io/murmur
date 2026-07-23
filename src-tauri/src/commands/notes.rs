@@ -111,7 +111,9 @@ pub(crate) fn create_note_inner(
             .db
             .insert_note_sealed(&id, &folder_id, &name, title, "", &blob, now)?;
     } else {
-        state.db.insert_note(&id, &folder_id, &name, title, "", now)?;
+        state
+            .db
+            .insert_note(&id, &folder_id, &name, title, "", now)?;
     }
     // No chunks to index for an empty body — `update_note` re-indexes once the user writes.
     // Brain v3 PR-3 — LINK ENGINE: index the (empty) body's wikilinks so a create with no body
@@ -205,61 +207,101 @@ pub(crate) async fn suggest_note_title_inner(
     state: &AppState,
     note_id: &str,
 ) -> Result<String, AppError> {
-    let Some(row) = state.db.get_note_row(note_id)? else {
-        return Err(AppError::InvalidArg(format!("no note {note_id}")));
+    let background_epoch = crate::perf::background_epoch();
+    // Resolve and gate on content-free metadata under the lifecycle mutex BEFORE loading the full
+    // row. A sealed row may retain plaintext after an interrupted cleanup; reading it merely to find
+    // the folder would already violate the lock boundary. A locked call returns only the public
+    // placeholder, never the stored title.
+    let (folder_id, current, row_updated_at, row_text) = {
+        let _lifecycle = lifecycle_guard(state);
+        let Some((folder_id, _created_at, _updated_at)) = state.db.note_gate_anchor(note_id)? else {
+            return Err(AppError::InvalidArg(format!("no note {note_id}")));
+        };
+        if !folder_is_unlocked(state, &folder_id)? {
+            return Ok(crate::storage::db::UNTITLED_TITLE.to_string());
+        }
+        let Some(row) = state.db.get_note_row(note_id)? else {
+            return Err(AppError::InvalidArg(format!("no note {note_id}")));
+        };
+        // `NoteRow.title` is Option<String> (NULL-able column) — treat a missing title as "".
+        let current = row.title.clone().unwrap_or_default();
+        // Only ever fill in an "Untitled" note — never overwrite a title the user chose.
+        let cur = current.trim();
+        if !cur.is_empty() && cur != "Untitled" {
+            return Ok(current);
+        }
+        // A session-unlocked but logically LOCKED folder is readable for the session, yet auto-title
+        // intentionally does not mutate it (the title-only CAS is open-folder-only by contract).
+        if state
+            .db
+            .folder_by_id(&folder_id)?
+            .map(|folder| folder.locked)
+            .unwrap_or(false)
+        {
+            return Ok(current);
+        }
+        if row.text.trim().is_empty() {
+            return Ok(current);
+        }
+        (folder_id, current, row.updated_at, row.text)
     };
-    // `NoteRow.title` is Option<String> (NULL-able column) — treat a missing title as "".
-    let current = row.title.clone().unwrap_or_default();
-    // Only ever fill in an "Untitled" note — never overwrite a title the user chose.
-    let cur = current.trim();
-    if !cur.is_empty() && cur != "Untitled" {
-        return Ok(current);
-    }
-    // Skip a locked folder: new notes live in the always-open root, so this only skips the rare
-    // deliberately-filed-then-locked case; auto-titling it would need seal-on-write / an unlock.
-    let folder_locked = state
-        .db
-        .folder_by_id(&row.folder_id)?
-        .map(|f| f.locked)
-        .unwrap_or(false);
-    if folder_locked {
-        return Ok(current);
-    }
-    let body = row.text.trim();
-    if body.is_empty() {
+    if !crate::perf::background_epoch_is_current(background_epoch) {
         return Ok(current);
     }
 
     // On-device first (zero egress); first-line heuristic otherwise / on failure.
     let title = match local_title_provider(state) {
         Some(provider) => {
-            let excerpt: String = body.chars().take(1200).collect();
+            let excerpt: String = row_text.chars().take(1200).collect();
             match provider.complete(AUTO_TITLE_SYSTEM, &excerpt).await {
-                Ok(t) => sanitize_title_suggestion(&t).unwrap_or_else(|| first_line_title(body)),
+                Ok(t) => {
+                    sanitize_title_suggestion(&t).unwrap_or_else(|| first_line_title(&row_text))
+                }
                 Err(e) => {
                     tracing::info!(target: "notes", error = %e, "auto-title: on-device failed, using first line");
-                    first_line_title(body)
+                    first_line_title(&row_text)
                 }
             }
         }
-        None => first_line_title(body),
+        None => first_line_title(&row_text),
     };
     if title.trim().is_empty() || title == "Untitled" {
         return Ok(current);
     }
 
-    // Persist — re-read + re-check under the write so a title the user set meanwhile always wins.
-    if let Some(fresh) = state.db.get_note_row(note_id)? {
-        let fresh_title = fresh.title.clone().unwrap_or_default();
-        let ft = fresh_title.trim();
-        if ft.is_empty() || ft == "Untitled" {
-            let now = chrono::Utc::now().timestamp_millis();
-            state.db.update_note_row(note_id, &title, &fresh.text, now)?;
-            return Ok(title);
-        }
-        return Ok(fresh_title); // user titled it in the meantime
+    // One title-only CAS under the recording-priority epoch. The SQL itself rechecks the exact body
+    // revision, folder identity, OPEN lock state, absent seal blob and still-placeholder title.
+    // Never re-write `text`: a concurrent editor save or folder seal therefore always wins, and a
+    // stale background task cannot resurrect plaintext after the lock blanked it.
+    // The model call awaited outside the lifecycle mutex. Reacquire it and revalidate the exact
+    // folder gate before either committing OR returning the derived title; a concurrent relock must
+    // turn the stale result into the harmless placeholder instead of leaking content-derived text.
+    let _lifecycle = lifecycle_guard(state);
+    let Some((current_folder_id, _created_at, _updated_at)) = state.db.note_gate_anchor(note_id)?
+    else {
+        return Err(AppError::InvalidArg(format!("no note {note_id}")));
+    };
+    if current_folder_id != folder_id || !folder_is_unlocked(state, &current_folder_id)? {
+        return Ok(current);
     }
-    Ok(title)
+    let now = chrono::Utc::now().timestamp_millis();
+    let committed = crate::perf::with_current_background_epoch(background_epoch, || {
+        state.db.set_auto_title_if_unchanged_and_open(
+            note_id,
+            &folder_id,
+            row_updated_at,
+            &row_text,
+            &title,
+            now,
+        )
+    })?;
+    if committed == Some(true) {
+        Ok(title)
+    } else {
+        // Do not fresh-read a possibly newly sealed/user-retitled row just to satisfy this
+        // fire-and-forget response. The harmless placeholder observed while open is leak-free.
+        Ok(current)
+    }
 }
 
 /// Read ONE note (editor DTO). GATED: a sealed-and-not-session-unlocked note returns the MASKED DTO
@@ -271,12 +313,27 @@ pub fn get_note(state: State<'_, AppState>, id: String) -> Result<NoteDoc, AppEr
 
 /// Inner of [`get_note`] taking `&AppState` (unit-testable gate).
 pub(crate) fn get_note_inner(state: &AppState, id: &str) -> Result<NoteDoc, AppError> {
+    let _lifecycle = lifecycle_guard(state);
+    get_note_under_lifecycle_authorized(state, id)
+}
+
+/// Read one note while the caller holds the non-reentrant lifecycle mutex. Authorization is
+/// resolved from content-free metadata before any title/body/export-path column is selected.
+fn get_note_under_lifecycle_authorized(state: &AppState, id: &str) -> Result<NoteDoc, AppError> {
+    let Some((folder_id, created_at, updated_at)) = state.db.note_gate_anchor(id)? else {
+        return Err(AppError::InvalidArg(format!("no note {id}")));
+    };
+    if !folder_is_unlocked(state, &folder_id)? {
+        return Ok(masked_note_doc(
+            id,
+            &folder_id,
+            created_at,
+            updated_at,
+        ));
+    }
     let Some(row) = state.db.get_note_row(id)? else {
         return Err(AppError::InvalidArg(format!("no note {id}")));
     };
-    if !folder_is_unlocked(state, &row.folder_id)? {
-        return Ok(masked_note_doc(&row)); // sealed-not-unlocked ⇒ masked, never the stored text.
-    }
     let mut doc = note_doc_from_row(&row);
     // Strip any machine-managed `murmur:links` block (retired — it went stale + rendered as raw junk
     // in the plain-text editor; the RELATED panel reads the live `links` table instead). The strip is
@@ -330,6 +387,7 @@ pub async fn update_note_doc(
     title: String,
     markdown: String,
 ) -> Result<NoteDoc, AppError> {
+    let visibility = capture_document_content_snapshot(state.inner(), &id)?;
     // PERF (brain-v3 audit H3): the inner runs Candle/Metal embedding + the semantic-link pass —
     // route the whole synchronous body through the shared heavy-inference gate on the blocking
     // pool, exactly like the meeting twin `update_note` (PR-1 #362). Re-fetch `AppState` inside
@@ -352,6 +410,7 @@ pub async fn update_note_doc(
     {
         crate::events::emit_org_feed_updated(&app, 1);
     }
+    require_current_document_content_snapshot(state.inner(), &id, &visibility)?;
     Ok(doc)
 }
 
@@ -364,7 +423,7 @@ pub(crate) fn update_note_doc_inner(
     title: &str,
     markdown: &str,
 ) -> Result<NoteDoc, AppError> {
-    let embedder = crate::embed::embed_model_present().then(crate::embed::active_embedder);
+    let embedder = crate::embed::active_persistence_embedder_if_available();
     update_note_doc_inner_with(state, id, title, markdown, embedder.as_deref())
 }
 
@@ -380,32 +439,37 @@ pub(crate) fn update_note_doc_inner_with(
     // BLK-1 / TOCTOU (2026-07-10 audit F4): hold the lifecycle guard across gate+write so a
     // concurrent relock/seal cannot land between the unlock check and the row write.
     let lifecycle = lifecycle_guard(state);
-    let Some(row) = state.db.get_note_row(id)? else {
+    let Some((folder_id, _created_at, _updated_at)) = state.db.note_gate_anchor(id)? else {
         return Err(AppError::InvalidArg(format!("no note {id}")));
     };
-    // WRITE-GATE: refuse editing a sealed-and-not-session-unlocked note (never write plaintext
-    // behind a lock).
-    if !folder_is_unlocked(state, &row.folder_id)? {
+    // WRITE-GATE before the content read: refuse editing a sealed-and-not-session-unlocked note
+    // without ever loading its title/body/export path.
+    if !folder_is_unlocked(state, &folder_id)? {
         return Err(AppError::Locked(
             "this note is locked — unlock its folder to edit it".into(),
         ));
     }
     let title = title.trim();
     let title = if title.is_empty() { "Untitled" } else { title };
+    let attachment_owner = crate::storage::AttachmentOwner::Document {
+        document_id: id.to_string(),
+    };
+    validate_attachment_references_before_save(state, &attachment_owner, markdown)?;
     let now = chrono::Utc::now().timestamp_millis();
     // Seal-on-write (audit F1): a session-unlocked LOCKED folder re-seals the fresh text into
     // `text_blob` in the same write; an open folder takes the plain update. Fail-closed on a
     // missing session KEK.
-    reseal_document_if_locked(state, &row.folder_id, id, title, markdown, now)?;
+    reseal_document_if_locked(state, &folder_id, id, title, markdown, now)?;
+    prune_unreferenced_attachments(state, &attachment_owner, markdown)?;
 
     // Re-export the vault `.md` (best-effort). A sealed folder has no export (gated above), so this
     // only runs for a visible note.
-    if let Err(e) = export_note_to_vault(state, id) {
+    if let Err(e) = export_note_to_vault_under_lifecycle_authorized(state, id) {
         tracing::warn!(target: "notes", error = %e, "note vault re-export failed (text saved)");
     }
     // Read the fresh DTO while still guarded (the row cannot be resealed under us); the heavy leg
     // below never mutates the note row, so the DTO stays accurate.
-    let doc = get_note_inner(state, id)?;
+    let doc = get_note_under_lifecycle_authorized(state, id)?;
 
     // PERF (brain-v3 audit H3, the `update_note_inner_with` twin): release the GLOBAL lifecycle
     // guard BEFORE the heavy leg — the note-body re-embed + semantic-link pass is multi-second
@@ -464,21 +528,26 @@ pub(crate) fn save_note_text_inner(
     // BLK-1 / TOCTOU (2026-07-10 audit F4): hold the lifecycle guard across gate+write so a
     // concurrent relock/seal cannot land between the unlock check and the row write.
     let _lifecycle = lifecycle_guard(state);
-    let Some(row) = state.db.get_note_row(id)? else {
+    let Some((folder_id, _created_at, _updated_at)) = state.db.note_gate_anchor(id)? else {
         return Err(AppError::InvalidArg(format!("no note {id}")));
     };
-    if !folder_is_unlocked(state, &row.folder_id)? {
+    if !folder_is_unlocked(state, &folder_id)? {
         return Err(AppError::Locked(
             "this note is locked — unlock its folder to edit it".into(),
         ));
     }
     let title = title.trim();
     let title = if title.is_empty() { "Untitled" } else { title };
+    let attachment_owner = crate::storage::AttachmentOwner::Document {
+        document_id: id.to_string(),
+    };
+    validate_attachment_references_before_save(state, &attachment_owner, markdown)?;
     let now = chrono::Utc::now().timestamp_millis();
     // Seal-on-write (audit F1): a session-unlocked LOCKED folder re-seals the fresh text into
     // `text_blob` in the same write; an open folder takes the plain update. Fail-closed on a
     // missing session KEK.
-    reseal_document_if_locked(state, &row.folder_id, id, title, markdown, now)?;
+    reseal_document_if_locked(state, &folder_id, id, title, markdown, now)?;
+    prune_unreferenced_attachments(state, &attachment_owner, markdown)?;
     Ok(now)
 }
 
@@ -508,16 +577,19 @@ pub(crate) fn move_note_doc_inner(
     // BLK-1 / TOCTOU (2026-07-10 audit F4): hold the lifecycle guard across the double gate + the
     // reassign/seal writes so a concurrent lock/relock cannot land mid-move.
     let _lifecycle = lifecycle_guard(state);
-    let Some(row) = state.db.get_note_row(id)? else {
+    let Some((source_folder_id, _created_at, _updated_at)) = state.db.note_gate_anchor(id)? else {
         return Err(AppError::InvalidArg(format!("no note {id}")));
     };
-    // Source gate: refuse moving a sealed-not-unlocked note (its plaintext is blanked — we'd move an
-    // empty note and lose the seal anchoring; unlock first).
-    if !folder_is_unlocked(state, &row.folder_id)? {
+    // Source gate before the content read: refuse moving a sealed-not-unlocked note without loading
+    // its blanked/residual plaintext row merely to discover the governing folder.
+    if !folder_is_unlocked(state, &source_folder_id)? {
         return Err(AppError::Locked(
             "this note is locked — unlock its folder to move it".into(),
         ));
     }
+    let Some(row) = state.db.get_note_row(id)? else {
+        return Err(AppError::InvalidArg(format!("no note {id}")));
+    };
     // Target must be a NOTE folder and be unlocked (never land plaintext behind a lock). We do not
     // support sealing-on-move into a locked note-folder in WP0 — refuse (the FE unlocks first).
     if state.db.note_folder_by_id(folder_id)?.is_none() {
@@ -556,27 +628,66 @@ pub(crate) fn move_note_doc_inner(
         .folder_by_id(folder_id)?
         .map(|f| f.locked)
         .unwrap_or(false);
+    let attachment_owner = crate::storage::AttachmentOwner::Document {
+        document_id: id.to_string(),
+    };
+    let attachment_rows = state.db.list_attachments(&attachment_owner)?;
+    let mut attachment_plaintext =
+        std::collections::HashMap::with_capacity(attachment_rows.len());
+    for attachment in &attachment_rows {
+        attachment_plaintext.insert(
+            attachment.id.clone(),
+            plaintext_attachment_data(state, attachment)?,
+        );
+    }
     if target_locked {
         let title = row.title.clone().unwrap_or_else(|| row.name.clone());
         let updated_at = row.updated_at.unwrap_or(row.created_at);
         let blob = sealed_document_blob(state, folder_id, id, &row.text)?;
+        let ck = session_folder_ck(state, folder_id)?;
+        let mut attachment_seals =
+            std::collections::HashMap::with_capacity(attachment_plaintext.len());
+        for (attachment_id, data) in &attachment_plaintext {
+            let aad = attachment_aad(folder_id, &attachment_owner, attachment_id);
+            let attachment_blob = crate::crypto::encrypt(&ck, data, &aad)?;
+            if crate::crypto::decrypt(&ck, &attachment_blob, &aad)? != *data {
+                return Err(AppError::Storage(
+                    "attachment move-seal verification failed".into(),
+                ));
+            }
+            attachment_seals.insert(attachment_id.clone(), attachment_blob);
+        }
         remove_note_export_before_move(row.exported_path.as_deref())?;
-        state
-            .db
-            .move_note_row_sealed(id, folder_id, &title, &row.text, &blob, updated_at)?;
+        remove_attachment_exports_before_move(&attachment_rows)?;
+        state.db.move_note_with_attachments_sealed(
+            id,
+            folder_id,
+            &title,
+            &row.text,
+            &blob,
+            updated_at,
+            &attachment_seals,
+        )?;
+        // The destination is session-unlocked. The atomic move first installs verified target-CK
+        // blobs and blanks plaintext (crash-safe at rest); now rematerialize the already-verified
+        // bytes for this session while retaining those blobs for the next relock.
+        for (attachment_id, data) in &attachment_plaintext {
+            state
+                .db
+                .restore_attachment_data(attachment_id, data, false)?;
+        }
         // Vault Audit LOCK-SAFETY: a move-into-locked is a SEAL — purge ALL pending findings
         // (the rollup posture; this note's title may be cited in third-party evidence no id can
         // match). The other seal paths purge inside their chunk-purge txs; this path has none.
         state.db.purge_all_pending_audit_findings()?;
     } else {
         remove_note_export_before_move(row.exported_path.as_deref())?;
-        state.db.set_note_doc_folder(id, folder_id)?;
-        state.db.set_note_doc_exported_path(id, None)?;
-        if row.sealed {
-            state.db.clear_document_blob(id)?;
-        }
+        remove_attachment_exports_before_move(&attachment_rows)?;
+        state
+            .db
+            .move_note_with_attachments_open(id, folder_id, &attachment_plaintext)?;
     }
-    if let Err(e) = export_note_to_vault(state, id) {
+    if let Err(e) = export_note_to_vault_under_lifecycle_authorized(state, id) {
         tracing::warn!(target: "notes", error = %e, "note re-export after move failed (moved in db)");
     }
     tracing::info!(target: "notes", note_id = %id, folder_id = %folder_id, "note moved");
@@ -625,10 +736,10 @@ pub async fn delete_note(
 /// Inner of [`delete_note`] taking `&AppState` (unit-testable gate). `async` for the org-share revoke
 /// cascade (network round-trip); the gate + DB delete themselves stay synchronous internally.
 pub(crate) async fn delete_note_inner(state: &AppState, id: &str) -> Result<(), AppError> {
-    let Some(row) = state.db.get_note_row(id)? else {
+    let Some((folder_id, _created_at, _updated_at)) = state.db.note_gate_anchor(id)? else {
         return Ok(()); // unknown id → idempotent no-op.
     };
-    if !folder_is_unlocked(state, &row.folder_id)? {
+    if !folder_is_unlocked(state, &folder_id)? {
         return Err(AppError::Locked(
             "this folder is locked — unlock it to delete a note".into(),
         ));
@@ -638,6 +749,28 @@ pub(crate) async fn delete_note_inner(state: &AppState, id: &str) -> Result<(), 
     // server item back into the local replica after the user asked to delete it. Fails LOUD: a revoke
     // failure (e.g. offline) aborts the delete rather than silently leaving a dangling live share.
     revoke_org_shares_for_source(state, None, Some(id)).await?;
+    // The revoke awaited the network. Re-check under the lifecycle mutex before touching plaintext
+    // exports or rows; a concurrent relock may have changed the source gate meanwhile.
+    let _lifecycle = lifecycle_guard(state);
+    let Some((folder_id, _created_at, _updated_at)) = state.db.note_gate_anchor(id)? else {
+        return Ok(());
+    };
+    if !folder_is_unlocked(state, &folder_id)? {
+        return Err(AppError::Locked(
+            "this folder is locked — unlock it to delete a note".into(),
+        ));
+    }
+    let Some(row) = state.db.get_note_row(id)? else {
+        return Ok(());
+    };
+    let attachment_owner = crate::storage::AttachmentOwner::Document {
+        document_id: id.to_string(),
+    };
+    let attachments = state.db.list_attachments(&attachment_owner)?;
+    remove_attachment_exports(
+        &attachments,
+        "could not remove an exported image before deleting the note",
+    )?;
     // Remove the vault file first (best-effort), then cascade-delete the row + its chunks/vectors.
     if let Some(path) = &row.exported_path {
         let _ = std::fs::remove_file(path);
@@ -652,7 +785,9 @@ pub(crate) async fn delete_note_inner(state: &AppState, id: &str) -> Result<(), 
 #[tauri::command]
 pub fn export_note_doc(state: State<'_, AppState>, id: String) -> Result<String, AppError> {
     let path = export_note_to_vault(state.inner(), &id)?;
-    path.ok_or_else(|| AppError::Export("no vault configured — set your Obsidian vault first".into()))
+    path.ok_or_else(|| {
+        AppError::Export("no vault configured — set your Obsidian vault first".into())
+    })
 }
 
 /// List every note-folder (`kind='note'`). Lock state comes through unchanged from `folders.locked`.
@@ -748,7 +883,9 @@ pub(crate) fn set_note_folder_schema_inner(
     for f in &fields {
         let key = f.key.trim();
         if key.is_empty() {
-            return Err(AppError::InvalidArg("property key must not be empty".into()));
+            return Err(AppError::InvalidArg(
+                "property key must not be empty".into(),
+            ));
         }
         if key.len() > NOTE_SCHEMA_MAX_KEY_LEN {
             return Err(AppError::InvalidArg(format!(
@@ -766,9 +903,7 @@ pub(crate) fn set_note_folder_schema_inner(
                 "duplicate property key \"{key}\""
             )));
         }
-        if f.kind == PropertyKind::Select
-            && !f.options.iter().any(|o| !o.trim().is_empty())
-        {
+        if f.kind == PropertyKind::Select && !f.options.iter().any(|o| !o.trim().is_empty()) {
             return Err(AppError::InvalidArg(format!(
                 "select property \"{key}\" needs at least one option"
             )));
@@ -935,7 +1070,9 @@ pub(crate) fn move_note_folder_inner(
     let parent_path = match parent_id {
         Some(pid) => {
             if pid == id {
-                return Err(AppError::InvalidArg("a folder cannot be its own parent".into()));
+                return Err(AppError::InvalidArg(
+                    "a folder cannot be its own parent".into(),
+                ));
             }
             state
                 .db

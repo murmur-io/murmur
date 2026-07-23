@@ -13,14 +13,14 @@ rule file:
 - `.codex/rules/lock-model.md`
 - `.codex/rules/agentic-workflow.md`
 
-*(Orientation: `rust-tauri` = errors/commands/SQLCipher/additive-migrations/verify-before-destroy/gate-every-read/crash-safe-FFI/`cargo test --lib` only; `angular-zoneless` = signals-first/standalone/`@if`-`@for`/IPC→signals/dir-per-component (ts+html+scss)/Liquid-Glass views/design-tokens-only/mur-* design-system/the traps; `lock-model` = gate every read + verify-before-destroy every seal + the `convertFileSrc` leak trap; `agentic-workflow` = Workflow tool + adversarial-verify discipline.)*
+*(Orientation: `rust-tauri` = errors/commands/SQLCipher/additive-migrations/verify-before-destroy/gate-every-read/crash-safe-FFI/`cargo test --lib` only; `angular-zoneless` = signals-first/standalone/`@if`-`@for`/IPC→signals/dir-per-component (ts+html+scss)/Liquid-Glass views/design-tokens-only/mur-* design-system/the traps; `lock-model` = gate every read + verify-before-destroy every seal + the `convertFileSrc` leak trap; `agentic-workflow` = executable harness + adversarial-verify discipline.)*
 
 ## What Murmur is
 
-A **local-first macOS desktop app** that records meetings, transcribes on-device, turns the transcript into a clean note via a pluggable LLM provider, and lives inside the user's **Obsidian vault**. Currently shipped at **0.6.4**.
+A **local-first macOS desktop app** that records meetings, transcribes on-device, turns the transcript into a clean note via a pluggable LLM provider, and lives inside the user's **Obsidian vault**. Treat the manifests and GitHub releases as the version source of truth.
 
-- **Stack:** Tauri 2.11 (Rust crate `murmur`, lib `meetnotes_lib`, bin `Murmur`) + Angular 18 **zoneless** (standalone, signals). IPC = Tauri commands (registered in `src-tauri/src/lib.rs` `generate_handler!`) + events. The FE talks to the backend through `src/app/core/ipc.service.ts` — **there is no NgRx**.
-- **Pipeline:** capture (mic via `cpal` + system audio via a Swift **ScreenCaptureKit** sidecar) → **dual-stream** (transcribed separately, merged by wall-clock → `Me`/`Others`) → **whisper.cpp** (`whisper-rs`, Metal; default model **small**, ~470 MB — `tiny`…`large-v3` selectable) → segments → **SQLite (canonical source of truth, SQLCipher-encrypted)** → `SummarizerProvider` → note markdown → atomic **Obsidian `.md`** export.
+- **Stack:** Tauri 2.11 (Rust crate `murmur`, lib `meetnotes_lib`, bin `Murmur`) + Angular 22 **zoneless** (standalone, signals). IPC = Tauri commands (registered in `src-tauri/src/lib.rs` `generate_handler!`) + events. The FE talks to the backend through `src/app/core/ipc.service.ts` — **there is no NgRx**.
+- **Pipeline:** capture (mic via `cpal` + system audio via a Swift **ScreenCaptureKit** sidecar) → **dual-stream** (transcribed separately, merged by wall-clock → `Me`/`Others`) → **whisper.cpp** (`whisper-rs`, Metal; selectable local model) → segments → **SQLite (canonical source of truth, SQLCipher-encrypted)** → `SummarizerProvider` → note markdown → atomic **Obsidian `.md`** export.
 - **Providers (one trait, swappable):** `claude_code` (default), `anthropic` (BYO key in Keychain), `ollama` (local). Cloud-bound text passes the **redaction firewall**.
 - **Three consumption surfaces over one store:** the app UI, a local read-only **MCP server** (`127.0.0.1:8765`), and the Obsidian vault.
 
@@ -57,7 +57,7 @@ runbook `../murmur-server/DEPLOY.md` (Railway, GraphQL API not CLI) — never ha
 ```bash
 # Dev (the MURMUR_DEV_DEK hatch avoids per-rebuild Keychain re-prompts; see .agents/skills/tauri-dev)
 # No --features needed: the on-device brain/embedder/NER are ALWAYS compiled and activate at runtime
-# on model-presence. `MISTRALRS_METAL_PRECOMPILE=0` is baked into src-tauri/.cargo/config.toml [env]
+# on model-presence. `MISTRALRS_METAL_PRECOMPILE=0` is baked into the workspace `.cargo/config.toml` [env]
 # (this Mac has only the Command Line Tools, not full Xcode → defer Metal-shader compile to first run),
 # so `npm run dev` just works.
 source ~/.cargo/env
@@ -75,7 +75,7 @@ bash scripts/ci.sh                      # full: clippy -D warnings + tests + lin
 
 ## Non-negotiable constraints
 
-1. **Local-first / privacy.** Audio + transcript stay on device. Ollama / `claude_code` = nothing leaves; `anthropic` = only the redacted transcript leaves. New cloud egress must be loud + justified.
+1. **Local-first / privacy.** Audio + transcript stay on device. On-device providers and loopback Ollama are local. `claude_code`, Anthropic, Gateway, remote Ollama, and unknown providers are cloud-classified and must pass explicit consent, redaction where applicable, and the egress ledger. New cloud egress must be loud + justified.
 2. **Obsidian-native, owned files.** Output is plain `.md` (front-matter, `[[wikilinks]]`, `obsidian://` block-refs, `.canvas`). No lock-in.
 3. **SQLite is canonical.** UI / MCP / Obsidian are thin readers/exporters — never three diverging copies of the truth.
 4. **macOS-first.** Touch ID, ScreenCaptureKit, Keychain, notarization — don't assume cross-platform for free. `com.meetnotes.app` **MUST NOT change** (TCC + Keychain ACL continuity).
@@ -97,9 +97,9 @@ Full runbook: **[`.agents/skills/release-murmur`](.agents/skills/release-murmur/
 ### Hard-won release rules — DO NOT repeat the 2026-06-27 mess
 
 1. **NOTARIZATION IS MANDATORY for every published release — never ship signed-only.** Use the existing notarytool keychain profile **`murmur`**: `xcrun notarytool submit <dmg> --keychain-profile murmur --wait` → `xcrun stapler staple <dmg>` → confirm `spctl -a -vvv -t open --context context:primary-signature <dmg>` says *Notarized Developer ID* → `gh release upload v<ver> -R murmur-io/murmur <dmg> --clobber`. A signed-but-un-notarized DMG is Gatekeeper-blocked on macOS 15 (no right-click→Open anymore; only Settings → Privacy & Security → Open Anyway). v0.3.0/0.3.1 shipped un-notarized by mistake and blocked the user — never again.
-2. **Sign INSIDE-OUT, NEVER `--deep` — prefer `scripts/macos-sign-notarize.sh`.** Get the identity by HASH (the cert CN has a Polish `ń` "Gawroński" → name matching fails "no identity found"): `HASH=$(security find-identity -v -p codesigning | grep 'Developer ID Application' | head -1 | awk '{print $2}')`. **`codesign --deep` does NOT sign the bundled audio helpers in `Contents/Resources/` (`meetnotes-sysaudio` / `meetnotes-audiocap` / `meetnotes-aeccap`) → notarization comes back `Invalid` ("binary is not signed / no secure timestamp / no hardened runtime").** Sign each nested helper FIRST (`codesign --force --options runtime --timestamp --entitlements src-tauri/entitlements.plist --sign "$HASH" <helper>`), THEN seal the `.app` **without `--deep`**, THEN sign the DMG. `scripts/macos-sign-notarize.sh` already does exactly this — use it instead of hand-rolling codesign (the 2026-06-27 v0.4.0 notarization first failed because a manual `codesign --deep` skipped the three Resources/ helpers). On the codesign Developer-ID-key keychain prompt click **Always Allow / Allow** — clicking **Deny** gives `errSecInternalComponent` and leaves the bundle half-signed.
+2. **Sign INSIDE-OUT, NEVER `--deep` — prefer `scripts/macos-sign-notarize.sh`.** The Developer-ID identity HASH must be supplied by the user/operator; an agent must not derive it with the `security` CLI. **`codesign --deep` does NOT sign the bundled audio helpers in `Contents/Resources/` (`meetnotes-sysaudio` / `meetnotes-audiocap` / `meetnotes-aeccap`) → notarization comes back `Invalid` ("binary is not signed / no secure timestamp / no hardened runtime").** Sign each nested helper FIRST (`codesign --force --options runtime --timestamp --entitlements src-tauri/entitlements.plist --sign "$HASH" <helper>`), THEN seal the `.app` **without `--deep`**, THEN sign the DMG. On the codesign Developer-ID-key keychain prompt click **Always Allow / Allow** — clicking **Deny** gives `errSecInternalComponent` and leaves the bundle half-signed.
 3. **NEVER run `security` / keychain CLI ops from the agent shell.** It can't surface the macOS auth dialog → the command HANGS → retries queue → many hung processes spamming the user (the 2026-06-27 loop was 11 `security` procs). Any keychain op needing auth (add / unlock / `notarytool store-credentials`) MUST be run by the **user** interactively (`!` in their terminal) or avoided. Even ACL/locked reads hang — never loop them. (Process kills like `pkill security` are fine; they don't touch the keychain.)
-4. **`MURMUR_DEV_DEK` (dev) and the release keychain DEK collide on a shared DB.** The dev hatch encrypts the DB with the env DEK; the release build (no debug hatch) uses a Keychain DEK → on the same DB path the keys differ → the release build can't open a dev-keyed DB → startup fails. When testing a release on a dev machine, expect this; recover by restoring the plaintext `~/Library/Application Support/MeetNotes/meetnotes.sqlite.pre-encrypt.bak` so the release re-encrypts fresh (preserve the encrypted one first). Fresh-install real users are unaffected.
+4. **Dev and release data are intentionally isolated.** Debug/dev resolves through `state::app_dir_name()` to `MeetNotes-dev`; release uses `MeetNotes`. Never copy, restore, delete, or re-key the release database as part of a dev test.
 5. **A locked login keychain also breaks `git`/`gh` push** (the credential helper reads the GitHub token from it). `git push` → "could not read Username for https://github.com" means the keychain is locked, not that auth broke — the user unlocks it (`security unlock-keychain`, run BY THE USER) and you retry.
 6. Merge to `murmur` **via a PR, never a direct push** (guard script: `.codex/hooks/block-bash.sh`); commits/PRs authored **only** by `QueaT <kgm004a@gmail.com>`, **no AI co-author trailers**; `gh` account = `JakubGawr`; `com.meetnotes.app` immutable.
 7. **Startup must never hard-crash on a keychain/DB failure** (v0.3.1 made it a graceful dialog + clean exit, DB untouched) — keep it; never reintroduce an `init().expect()` / `.unwrap()` on the keychain-or-DB-open path.
@@ -107,7 +107,7 @@ Full runbook: **[`.agents/skills/release-murmur`](.agents/skills/release-murmur/
 ## Agents, skills, rules & hooks (this repo's `.codex/`)
 
 - **Rules** (`.codex/rules/`): `rust-tauri`, `angular-zoneless`, `lock-model`, `agentic-workflow` — binding local references; read the relevant one before changing that surface.
-- **Hooks** (`.codex/hooks/`): ported deterministic guardrail scripts — `block-bash.sh` refuses direct trunk pushes, the hang-prone `security`/keychain CLI, `cargo clippy --all-targets`, and `codesign --deep`; `secret-scan.sh` blocks a `git commit` whose staged diff carries key/token/DEK material; `finish-guard.sh` gates the commit on the DoD verdicts (advisory by default); `autoformat.sh` is opt-in (`MURMUR_AUTOFMT=1`). Full reference + the advisory→enforce toggles: **[`.codex/hooks/README.md`](.codex/hooks/README.md)**. `bash .codex/hooks/selftest.sh` proves the scripts still block.
+- **Harness + hooks** (`.agents/harness/`, `scripts/agent-harness`, `.codex/hooks/`): the neutral runner owns isolated worktrees, bounded repair, checks, independent reviews, hash-bound PASS attestations, and the exact `commit`/`close` lifecycle. Hooks are fast defense-in-depth; CI is the remote truth. Run `scripts/agent-harness selftest` and `scripts/agent-config-audit`.
 - **Skills** (`.agents/skills/`): **invoke these PROACTIVELY the moment a task matches — the user should NOT have to type the slash command:**
   - cutting a build / version bump / publishing a release → **`release-murmur`**
   - starting, iterating, or debugging the dev app → **`tauri-dev`**
@@ -120,4 +120,4 @@ Full runbook: **[`.agents/skills/release-murmur`](.agents/skills/release-murmur/
   - recording or curating the lessons loop → **`murmur-learn`**, **`murmur-curate-learnings`**
 - **Agents** (`.codex/agents/*.toml`): `rust-tauri-dev`, `angular-zoneless-dev`, `adversarial-verifier`, `lock-security-reviewer`, `release-engineer`, `ci-cd-engineer` (designs & maintains CI — the local `scripts/ci.sh` gate + the GitHub Actions macOS PR-gate that wraps it; CD/notarized release stays with `release-engineer`), `murmur-researcher` — spawn as custom subagents; the implementer never owns the verdict.
 
-When a task is multi-step (a feature, a refactor, a release), reach for the **Workflow tool** and let an independent **adversarial-verifier** own the verdict.
+When a task mutates the repository, use `scripts/agent-harness`: one isolated writer, deterministic checks, fresh independent reviewers, bounded repair and a hash-bound attestation. The implementer never owns the verdict.

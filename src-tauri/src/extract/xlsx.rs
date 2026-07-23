@@ -64,7 +64,11 @@ fn cell_text(cell: &Data) -> String {
         // A duration-formatted cell ([hh]:mm:ss style): the serial is a DAY count → h:mm:ss.
         Data::DateTime(dt) => {
             let total = (dt.as_f64() * 86_400.0).round() as i64;
-            let (sign, t) = if total < 0 { ("-", -total) } else { ("", total) };
+            let (sign, t) = if total < 0 {
+                ("-", -total)
+            } else {
+                ("", total)
+            };
             format!("{sign}{}:{:02}:{:02}", t / 3600, (t % 3600) / 60, t % 60)
         }
         other => other.to_string().trim().to_string(),
@@ -102,7 +106,11 @@ mod tests {
     /// The zip plumbing shared by [`build_xlsx`] and the styles-bearing date fixture: one sheet
     /// built from raw worksheet XML, plus an optional `xl/styles.xml` part (calamine reads styles
     /// at that fixed path — no relationship entry needed).
-    fn build_xlsx_parts(sheet_name: &str, sheet_data: &str, styles: Option<&str>) -> std::path::PathBuf {
+    fn build_xlsx_parts(
+        sheet_name: &str,
+        sheet_data: &str,
+        styles: Option<&str>,
+    ) -> std::path::PathBuf {
         let sheet_data = sheet_data.to_string();
 
         let workbook_xml = format!(
@@ -142,8 +150,8 @@ mod tests {
         let mut cursor = std::io::Cursor::new(Vec::new());
         {
             let mut zw = zip::ZipWriter::new(&mut cursor);
-            let opts: zip::write::FileOptions<'_, ()> =
-                zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+            let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
             for (name, content) in &entries {
                 zw.start_file(*name, opts).unwrap();
                 zw.write_all(content.as_bytes()).unwrap();

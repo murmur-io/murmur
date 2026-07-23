@@ -7,7 +7,7 @@
     "devUrl": "http://localhost:1420",
     "beforeDevCommand": "npm run start",
     "frontendDist": "../dist/meetnotes/browser",
-    "beforeBuildCommand": "npm run build && cargo build -p murmur-brain --release --target aarch64-apple-darwin && cargo build -p murmur-brain --release --target x86_64-apple-darwin && lipo -create target/aarch64-apple-darwin/release/meetnotes-brain target/x86_64-apple-darwin/release/meetnotes-brain -output src-tauri/binaries/meetnotes-brain"
+    "beforeBuildCommand": "npm run build && cargo build -p murmur-brain --release --target aarch64-apple-darwin && cargo build -p murmur-brain --release --target x86_64-apple-darwin && lipo -create target/aarch64-apple-darwin/release/murmur-brain target/x86_64-apple-darwin/release/murmur-brain -output src-tauri/binaries/murmur-brain"
   },
   "app": {
     "macOSPrivateApi": true,
@@ -59,7 +59,7 @@
       "binaries/meetnotes-audiocap": "meetnotes-audiocap",
       "binaries/meetnotes-aeccap": "meetnotes-aeccap",
       "binaries/meetnotes-calendar": "meetnotes-calendar",
-      "binaries/meetnotes-brain": "meetnotes-brain"
+      "binaries/murmur-brain": "murmur-brain"
     },
     "icon": [
       "icons/32x32.png",

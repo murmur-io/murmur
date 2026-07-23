@@ -1,58 +1,45 @@
-# `.claude/` — Murmur's agent setup
+# `.claude/` — Murmur's Claude Code control surface
 
-The map of this directory, and the decisions behind it. Rationale + the audit that drove this:
-`docs/research/2026-07-02-claude-setup-audit.md`.
+Claude Code is one adapter to the vendor-neutral development harness in
+`.agents/harness/`; it is not a separate source of workflow truth.
 
-Design principle (from the audit): **prose rules are advisory; hooks are deterministic.** Keep the
-war-story rules for *why*, and encode the *already-paid-for incidents* as hooks the agent cannot
-talk itself out of. Start lean — the failure mode of this exercise is a 95-hook cathedral for a
-one-person repo, so anything with false-positive risk ships advisory/opt-in first.
+| Path | Purpose |
+| --- | --- |
+| `../CLAUDE.md` | Autoloaded project charter and rule index |
+| `settings.json` | Project permissions, sandbox policy, and hook wiring |
+| `rules/` | Binding Rust, Angular, lock, and agent-loop rules |
+| `agents/` | Thin specialist role prompts |
+| `skills/` | Claude-facing mirrors of shared executable runbooks |
+| `hooks/` | Claude adapters for the canonical hook guard |
+| `learnings/` | Curated recurring lessons and append-only run journals |
 
-## Layout
+The active development loop is:
 
-| Path | What | Loaded |
-| --- | --- | --- |
-| `../CLAUDE.md` | Project charter + binding rules index + release rules | always (session start) |
-| `rules/*.md` | The 4 always-on rulesets (`rust-tauri`, `angular-zoneless`, `lock-model`, `agentic-workflow`) | always (`@`-imported by CLAUDE.md) |
-| `settings.json` | **Checked-in**: hook wiring + `deny` rules for credential paths + env defaults | always |
-| `settings.local.json` | Personal overrides (gitignored) | always |
-| `hooks/` | Deterministic guardrails — see [`hooks/README.md`](hooks/README.md) | via `settings.json` |
-| `lib/trace-span.sh` | Best-effort JSONL observability span helper | on demand |
-| `skills/*/SKILL.md` | Runbooks: `release-murmur`, `tauri-dev`, `ship-feature`, `research` | on match / on `/name` |
-| `agents/*.md` | Subagent roles (2 builders, 2 verifiers, releaser, researcher) | on dispatch |
-| `commands/*.md` | Operator slash-commands: `/learn`, `/curate-learnings` | on `/name` |
-| `learnings/*.md` | The compounding-lessons loop — see [`learnings/README.md`](learnings/README.md) | injected at dispatch |
-| `traces/` | Optional per-task evidence archive | manual |
-| `tmp/` | Gitignored scratch (gate JSONs, in-flight `trace.jsonl`) | runtime |
+```text
+task contract -> sibling worktree -> writer -> deterministic checks
+              -> fresh spec/adversarial/risk reviews -> bounded repair
+              -> hash-bound attestation -> guarded commit -> required remote CI
+```
 
-## What's active vs dormant vs deferred (be honest about this)
+Run it with `scripts/agent-harness`; task evidence is stored once under the
+shared Git common directory at `.git/agent-harness/tasks/<task-id>/`. Legacy
+`.claude/tmp/` verdicts and trace helpers are historical evidence only and have
+no authority over commits.
 
-**Active guardrails** (enforce today): `block-bash.sh` (trunk push / `security` CLI /
-`clippy --all-targets` / `codesign --deep` / `rm -rf /`), `secret-scan.sh` (staged-diff secret
-gate on commit), the `permissions.deny` credential-path list. These close the incidents that have
-already cost the project. `bash .claude/hooks/selftest.sh` proves they still block (also runs in
-`scripts/ci.sh`).
+The finish guard is fail-closed. It accepts only a runner-created PASS bound to
+the exact staged diff, active instructions, dependency revisions, green checks,
+and independent review sessions. `scripts/agent-config-audit --ci` prevents the
+Claude and Codex adapters from silently drifting.
 
-**Dormant scaffolding** (wired, waiting on the loop that feeds them): `finish-guard.sh` (advisory
-until the ship-feature gates emit `.claude/tmp/<task>/*.json`; flip with `MURMUR_FINISH_GUARD=enforce`),
-`autoformat.sh` (off until `MURMUR_AUTOFMT=1`), the learnings loop + trace archive.
+Quick verification:
 
-**Deliberately deferred** (documented, not built — enable when a real need appears):
+```bash
+scripts/agent-harness doctor
+scripts/agent-harness selftest --ci
+scripts/agent-harness eval selftest
+scripts/agent-config-audit --ci
+```
 
-- **`wip-guard` (WIP=1)** — urc blocks a 2nd active feature branch. Lower value for a solo dev; adds
-  latency to every Bash call. Enable by adding a `PreToolUse(Bash)` hook counting active
-  `.claude/tmp/*/` task dirs if branch-thrashing becomes a real problem.
-- **Stop-hook DoD gate** — block turn-end until `cargo test --lib`/`ng lint` pass, for fully-unattended
-  runs. Deferred to avoid a noisy Stop hook layered on the existing user-global one; revisit for long
-  autonomy sessions.
-- **PostToolUse TS/Angular auto-format** — intentionally NOT added; a blind prettier pass fights the
-  zoneless rules (dir-per-component ts/html/scss, per-component style budget). `npx ng lint` stays the FE formatter.
-- **`.mcp.json` (checked-in MCP servers)** — none needed yet; MCP tools reach the session already.
-- **GitHub Action SAST** (`anthropics/claude-code-security-review`) — cloud-bound + needs an API-key
-  secret; out of step with local-first + solo. One YAML file away if desired.
-
-## Identity interlocks (unchanged, still binding)
-
-Commits/PRs authored ONLY by `QueaT <kgm004a@gmail.com>`, no Claude trailers; `gh` account
-`JakubGawr`; trunk is `murmur` reached via PR only (now enforced by `block-bash.sh`);
-`com.meetnotes.app` immutable.
+Local hooks are defense in depth, not a remote security boundary. Merge safety
+ultimately requires GitHub to make the macOS `CI` check required on `murmur`.
+Inspect that read-only with `scripts/agent-remote-audit`.

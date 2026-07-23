@@ -43,11 +43,13 @@
 //!
 //! Every fallible step returns [`AppError`] — config parse, model load, tokenize, forward, argmax
 //! NEVER panic or `unwrap`. The heavy safetensors+tokenizer load is LAZY (first `redact_names` call)
-//! and cached behind a `Mutex`, so this can back `active_name_redactor` without blocking or aborting
-//! app startup. `Device::new_metal(0)` is tried first with a CPU fallback.
+//! and cached once per canonical model directory behind a process-global shared slot, so this can
+//! back independently-built providers without reloading or blocking app startup.
+//! `Device::new_metal(0)` is tried first with a CPU fallback.
 
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use candle_core::{Device, Tensor};
 use candle_nn::VarBuilder;
@@ -68,8 +70,65 @@ const NER_DTYPE: candle_core::DType = candle_core::DType::F32;
 pub struct DebertaNameRedactor {
     /// Directory holding `model.safetensors` + `tokenizer.json` + `config.json`.
     model_dir: PathBuf,
-    /// Lazily-built, cached engine. `None` until the first `redact_names` call.
-    inner: Mutex<Option<Arc<Loaded>>>,
+    /// Process-global per-model-dir lazy engine slot. `None` until the first `redact_names` call or
+    /// after an explicit recording/residency-boundary eviction.
+    inner: Arc<Mutex<Option<Arc<Loaded>>>>,
+}
+
+type CacheSlot<T> = Mutex<Option<Arc<T>>>;
+type CacheSlots<T> = HashMap<PathBuf, Arc<CacheSlot<T>>>;
+type LoadedSlot = CacheSlot<Loaded>;
+type LoadedSlots = CacheSlots<Loaded>;
+
+fn loaded_slots() -> &'static Mutex<LoadedSlots> {
+    static SLOTS: OnceLock<Mutex<LoadedSlots>> = OnceLock::new();
+    SLOTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Return the ONE process-global lazy cache slot for `model_dir`. Providers built independently for
+/// note generation, Ask, and connectors share the same warm model even across sequential calls and
+/// cannot duplicate it in RAM. Serializing slot creation under the registry mutex closes the
+/// concurrent-first-provider race; [`release_all_caches`] is the explicit residency-boundary eviction.
+fn shared_loaded_slot(model_dir: &Path) -> Arc<LoadedSlot> {
+    let mut slots = loaded_slots()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    slots
+        .entry(model_dir.to_path_buf())
+        .or_insert_with(|| Arc::new(Mutex::new(None)))
+        .clone()
+}
+
+/// Clear every cached value while preserving slot identity for providers that survive the boundary.
+/// Generic so the eviction contract can be unit-tested without constructing a real candle model or
+/// touching Metal.
+fn release_live_slots<T>(slots: &CacheSlots<T>) -> usize {
+    let mut released = 0usize;
+    for slot in slots.values() {
+        if slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .is_some()
+        {
+            released += 1;
+        }
+    }
+    released
+}
+
+/// Release every still-live provider's lazy NER weights at a recording model boundary. Provider
+/// wrappers may outlive one redaction call (auto-organize can reuse them), so clear every shared
+/// model-dir slot in place. The registry retains only empty slot identities after eviction — never a
+/// provider, prompt, or name — so a surviving wrapper cannot split into a second cache generation.
+pub(crate) fn release_all_caches() {
+    let slots = loaded_slots()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let released = release_live_slots(&slots);
+    if released > 0 {
+        tracing::info!(target: "ner", caches = released, "released cached NER model weights");
+    }
 }
 
 /// The loaded engine: the DeBERTa NER weights, its tokenizer (with offsets), the `id` → label map, and
@@ -96,10 +155,18 @@ impl DebertaNameRedactor {
                 )));
             }
         }
-        Ok(Self {
-            model_dir,
-            inner: Mutex::new(None),
-        })
+        // Canonicalization makes syntactic aliases (for example a symlinked models root) share the
+        // same process-global slot. Validation above already proved the directory is readable; retain
+        // the original path only as a graceful fallback if canonicalization itself is unavailable.
+        let model_dir = std::fs::canonicalize(&model_dir).unwrap_or(model_dir);
+        let inner = shared_loaded_slot(&model_dir);
+        Ok(Self { model_dir, inner })
+    }
+
+    #[cfg(test)]
+    fn new_for_cache_test(model_dir: PathBuf) -> Self {
+        let inner = shared_loaded_slot(&model_dir);
+        Self { model_dir, inner }
     }
 
     /// Pick a compute device: Metal first (the Mac fast path), CPU as a graceful fallback. NEVER
@@ -388,6 +455,121 @@ fn id2label_will_log(id2label: &Id2Label) -> usize {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::sync::Barrier;
+
+    fn cache_test_path(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("murmur-ner-cache-{tag}-{}", std::process::id()))
+    }
+
+    #[test]
+    fn providers_for_same_model_dir_share_one_lazy_slot() {
+        let dir = cache_test_path("same-dir");
+        let first = DebertaNameRedactor::new_for_cache_test(dir.clone());
+        let second = DebertaNameRedactor::new_for_cache_test(dir);
+
+        assert!(
+            Arc::ptr_eq(&first.inner, &second.inner),
+            "independently-built providers must share one lazy model slot"
+        );
+    }
+
+    #[test]
+    fn sequential_providers_reuse_the_process_global_slot() {
+        let dir = cache_test_path("sequential");
+        let first_slot = {
+            let first = DebertaNameRedactor::new_for_cache_test(dir.clone());
+            Arc::downgrade(&first.inner)
+        };
+        let retained = first_slot
+            .upgrade()
+            .expect("the process-global registry must retain the warm slot");
+        let second = DebertaNameRedactor::new_for_cache_test(dir);
+
+        assert!(
+            Arc::ptr_eq(&retained, &second.inner),
+            "dropping one provider must not force the next provider to reload NER"
+        );
+    }
+
+    #[test]
+    fn different_model_dirs_keep_distinct_lazy_slots() {
+        let first = DebertaNameRedactor::new_for_cache_test(cache_test_path("model-a"));
+        let second = DebertaNameRedactor::new_for_cache_test(cache_test_path("model-b"));
+
+        assert!(
+            !Arc::ptr_eq(&first.inner, &second.inner),
+            "cache identity must include the model directory"
+        );
+    }
+
+    #[test]
+    fn concurrent_provider_construction_deduplicates_the_lazy_slot() {
+        const PROVIDERS: usize = 8;
+        let dir = cache_test_path("concurrent");
+        let gate = Arc::new(Barrier::new(PROVIDERS));
+        let workers: Vec<_> = (0..PROVIDERS)
+            .map(|_| {
+                let dir = dir.clone();
+                let gate = gate.clone();
+                std::thread::spawn(move || {
+                    gate.wait();
+                    DebertaNameRedactor::new_for_cache_test(dir).inner
+                })
+            })
+            .collect();
+        let slots: Vec<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("cache-test worker must not panic"))
+            .collect();
+
+        assert!(
+            slots
+                .iter()
+                .skip(1)
+                .all(|slot| Arc::ptr_eq(&slots[0], slot)),
+            "concurrent first providers must not allocate duplicate load slots"
+        );
+    }
+
+    #[test]
+    fn boundary_release_evicts_values_but_preserves_slot_identity() {
+        type MarkerSlot = CacheSlot<usize>;
+
+        let first = Arc::new(Mutex::new(Some(Arc::new(7usize))));
+        let second = Arc::new(Mutex::new(Some(Arc::new(9usize))));
+        let first_key = cache_test_path("release-first");
+        let second_key = cache_test_path("release-second");
+        let mut slots: HashMap<PathBuf, Arc<MarkerSlot>> = HashMap::new();
+        slots.insert(first_key.clone(), first.clone());
+        slots.insert(second_key.clone(), second.clone());
+
+        assert_eq!(release_live_slots(&slots), 2);
+        assert!(
+            first
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_none(),
+            "recording boundary must evict the shared cached model"
+        );
+        assert!(
+            second
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_none(),
+            "every model-dir cache must be evicted"
+        );
+        assert!(
+            Arc::ptr_eq(slots.get(&first_key).expect("first slot retained"), &first),
+            "eviction must preserve slot identity for surviving providers"
+        );
+        assert!(
+            Arc::ptr_eq(
+                slots.get(&second_key).expect("second slot retained"),
+                &second
+            ),
+            "eviction must preserve every keyed slot identity"
+        );
+    }
 
     fn id2label() -> Id2Label {
         // A canonical CoNLL-style PER scheme: 0=O, 1=B-PER, 2=I-PER, 3=B-ORG, 4=I-ORG.

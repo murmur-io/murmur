@@ -179,7 +179,11 @@ mod tests {
         for p in [Posture::Cloud, Posture::Hybrid, Posture::FullyLocal] {
             let mut cfg = AppConfig::default();
             apply_posture(&mut cfg, p);
-            assert_eq!(derive_posture(&cfg), p, "apply then derive must round-trip {p:?}");
+            assert_eq!(
+                derive_posture(&cfg),
+                p,
+                "apply then derive must round-trip {p:?}"
+            );
         }
     }
 
@@ -256,7 +260,10 @@ mod tests {
     fn custom_is_not_settable() {
         assert_eq!(Posture::from_settable("cloud"), Some(Posture::Cloud));
         assert_eq!(Posture::from_settable("hybrid"), Some(Posture::Hybrid));
-        assert_eq!(Posture::from_settable("fully_local"), Some(Posture::FullyLocal));
+        assert_eq!(
+            Posture::from_settable("fully_local"),
+            Some(Posture::FullyLocal)
+        );
         assert_eq!(Posture::from_settable("custom"), None);
         assert_eq!(Posture::from_settable("bogus"), None);
     }

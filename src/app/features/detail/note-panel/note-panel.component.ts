@@ -1,8 +1,10 @@
 import {
   ChangeDetectionStrategy,
   Component,
+  DestroyRef,
   ElementRef,
   computed,
+  inject,
   input,
   output,
   signal,
@@ -11,6 +13,7 @@ import {
 import type {
   ClaimAlignment,
   GraphPayload,
+  NoteAttachmentDto,
 } from "../../../core/models";
 import { MarkdownComponent } from "../../../shared/markdown/markdown.component";
 import { AssistantSourcesComponent } from "../../../shared/assistant-sources/assistant-sources.component";
@@ -19,6 +22,15 @@ import { MoveToMenuComponent } from "../../folders/move-to-menu/move-to-menu.com
 import { MeetingActionsComponent } from "../meeting-actions/meeting-actions.component";
 import { RelatedMeetingsComponent } from "../related-meetings/related-meetings.component";
 import { Stage2PanelComponent } from "../stage2-panel/stage2-panel.component";
+import { ToastService } from "../../../services/toast.service";
+import {
+  NoteAttachmentService,
+  MAX_NOTE_ATTACHMENTS,
+  insertMarkdownBlock,
+  replacePendingAttachmentUri,
+  type AttachmentPastePlan,
+  type MarkdownEdit,
+} from "../../../services/note-attachment.service";
 
 /** One checklist entry parsed from a `- [ ]` / `- [x]` action-item line. */
 export interface ActionItemLine {
@@ -129,6 +141,17 @@ export interface AssistantQa {
   styleUrl: "./note-panel.component.scss",
 })
 export class NotePanelComponent {
+  private readonly attachmentService = inject(NoteAttachmentService);
+  private readonly toast = inject(ToastService);
+  private readonly destroyRef = inject(DestroyRef);
+  private destroyed = false;
+
+  constructor() {
+    this.destroyRef.onDestroy(() => {
+      this.destroyed = true;
+    });
+  }
+
   // --- Identity / meeting inputs ------------------------------------------
   readonly meetingId = input.required<string>();
   /** The meeting's title — the anchor-chip label for the Ask-this-meeting picker. */
@@ -150,6 +173,12 @@ export class NotePanelComponent {
    * receipt's `claimIndex` points at. Null when there is no note / it is masked.
    */
   readonly noteRaw = input<string | null>(null);
+  /** Gated image DTOs for this meeting note. */
+  readonly attachments = input<readonly NoteAttachmentDto[]>([]);
+  /** Image-bearing notes use the shared Markdown renderer to preserve exact order. */
+  readonly hasAttachmentRefs = computed(() =>
+    /murmur-attachment:\/\/[0-9a-f-]{36}/i.test(this.noteRaw() ?? ""),
+  );
   /** The vault export path from the note DTO (Saved-to-vault line). */
   readonly exportedPath = input<string | null>(null);
   /** Model provenance for the ghost badge (null → hidden). */
@@ -207,6 +236,8 @@ export class NotePanelComponent {
   readonly cancelEdit = output<void>();
   readonly saveNote = output<void>();
   readonly draftInput = output<string>();
+  readonly attachmentAdded = output<NoteAttachmentDto>();
+  readonly attachmentBusyChange = output<boolean>();
   readonly copyPath = output<void>();
   readonly openRelated = output<string>();
   /**
@@ -219,7 +250,13 @@ export class NotePanelComponent {
   // --- ⋯ More overlay menu (local presentational open/close) --------------
   private readonly moreAnchor =
     viewChild<ElementRef<HTMLElement>>("moreAnchor");
+  private readonly editorArea =
+    viewChild<ElementRef<HTMLTextAreaElement>>("editorArea");
+  private readonly imageFileInput =
+    viewChild<ElementRef<HTMLInputElement>>("imageFileInput");
   readonly menuOpen = signal(false);
+  readonly importingImages = signal(0);
+  private imageInsertion: { start: number; end: number } | null = null;
 
   toggleMenu(): void {
     this.menuOpen.update((v) => !v);
@@ -228,6 +265,197 @@ export class NotePanelComponent {
   /** Close the menu after an item fires (the action itself is an output). */
   pick(): void {
     this.menuOpen.set(false);
+  }
+
+  rememberImageInsertion(): void {
+    const el = this.editorArea()?.nativeElement;
+    if (el) {
+      this.imageInsertion = { start: el.selectionStart, end: el.selectionEnd };
+    }
+  }
+
+  openImagePicker(): void {
+    if (this.saving() || this.importingImages() > 0) {
+      return;
+    }
+    if (!this.imageInsertion) {
+      this.rememberImageInsertion();
+    }
+    this.imageFileInput()?.nativeElement.click();
+  }
+
+  onImageFilesSelected(event: Event): void {
+    const input = event.target as HTMLInputElement;
+    const plan = this.attachmentService.planFromFiles(
+      input.files ?? [],
+      this.availableImageSlots(),
+    );
+    input.value = "";
+    this.notifyAttachmentWarnings(plan);
+    const el = this.editorArea()?.nativeElement;
+    const selection = this.imageInsertion ?? {
+      start: el?.selectionStart ?? this.draft().length,
+      end: el?.selectionEnd ?? this.draft().length,
+    };
+    this.imageInsertion = null;
+    this.startAttachmentImport(plan, selection.start, selection.end);
+  }
+
+  onEditorPaste(event: ClipboardEvent): void {
+    if (!event.clipboardData) {
+      return;
+    }
+    const plan = this.attachmentService.planFromTransfer(
+      event.clipboardData,
+      this.availableImageSlots(),
+    );
+    this.notifyAttachmentWarnings(plan);
+    if (!plan.segments.some((segment) => segment.kind === "image")) {
+      return;
+    }
+    event.preventDefault();
+    const el = event.target as HTMLTextAreaElement;
+    this.startAttachmentImport(plan, el.selectionStart, el.selectionEnd);
+  }
+
+  onEditorDragOver(event: DragEvent): void {
+    if (event.dataTransfer?.types.includes("Files")) {
+      event.preventDefault();
+    }
+  }
+
+  onEditorDrop(event: DragEvent): void {
+    if (!event.dataTransfer) {
+      return;
+    }
+    const plan = this.attachmentService.planFromTransfer(
+      event.dataTransfer,
+      this.availableImageSlots(),
+    );
+    this.notifyAttachmentWarnings(plan);
+    if (!plan.segments.some((segment) => segment.kind === "image")) {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    const el = event.target as HTMLTextAreaElement;
+    this.startAttachmentImport(plan, el.selectionStart, el.selectionEnd);
+  }
+
+  private startAttachmentImport(
+    plan: AttachmentPastePlan,
+    selectionStart: number,
+    selectionEnd: number,
+  ): void {
+    const pending = this.attachmentService.pendingPlan(plan);
+    if (!pending.images.length || !pending.markdown) {
+      return;
+    }
+    this.applyDraftEdit(
+      insertMarkdownBlock(this.draft(), selectionStart, selectionEnd, pending.markdown),
+      true,
+    );
+    this.importingImages.update((count) => count + pending.images.length);
+    this.attachmentBusyChange.emit(true);
+    void this.performAttachmentImport(this.meetingId(), pending.images);
+  }
+
+  private async performAttachmentImport(
+    meetingId: string,
+    pendingImages: ReturnType<NoteAttachmentService["pendingPlan"]>["images"],
+  ): Promise<void> {
+    try {
+      // One decoder/canvas at a time bounds peak RGBA memory.
+      for (const { id, image } of pendingImages) {
+        try {
+          const attachment = await this.attachmentService.importImage(
+            "meeting",
+            meetingId,
+            image,
+          );
+          if (
+            this.destroyed ||
+            this.meetingId() !== meetingId ||
+            !this.editing()
+          ) {
+            void this.attachmentService
+              .deleteAttachment("meeting", meetingId, attachment.id)
+              .catch(() => undefined);
+            continue;
+          }
+          const replaced = this.replacePendingAttachment(
+            id,
+            this.attachmentService.attachmentMarkdown(attachment, image.alt),
+          );
+          if (replaced) {
+            this.attachmentAdded.emit(attachment);
+          } else {
+            void this.attachmentService
+              .deleteAttachment("meeting", meetingId, attachment.id)
+              .catch(() => undefined);
+          }
+        } catch (error) {
+          if (this.meetingId() === meetingId && this.editing()) {
+            this.replacePendingAttachment(id, "");
+            this.toast.danger(String(error));
+          }
+        }
+      }
+    } finally {
+      this.importingImages.update((count) =>
+        Math.max(0, count - pendingImages.length),
+      );
+      if (!this.destroyed && this.importingImages() === 0) {
+        this.attachmentBusyChange.emit(false);
+      }
+    }
+  }
+
+  private replacePendingAttachment(pendingId: string, replacement: string): boolean {
+    const el = this.editorArea()?.nativeElement;
+    const edit = replacePendingAttachmentUri(
+      this.draft(),
+      pendingId,
+      replacement,
+      el?.selectionStart ?? this.draft().length,
+      el?.selectionEnd ?? this.draft().length,
+    );
+    if (!edit) {
+      return false;
+    }
+    this.applyDraftEdit(edit, false);
+    return edit.canonicalSlot;
+  }
+
+  private availableImageSlots(): number {
+    if (this.importingImages() > 0) {
+      return 0;
+    }
+    return Math.max(0, MAX_NOTE_ATTACHMENTS - this.attachments().length);
+  }
+
+  private applyDraftEdit(edit: MarkdownEdit, focus: boolean): void {
+    this.draftInput.emit(edit.value);
+    const el = this.editorArea()?.nativeElement;
+    if (el) {
+      el.value = edit.value;
+      el.setSelectionRange(edit.selectionStart, edit.selectionEnd);
+      if (focus) {
+        el.focus();
+      }
+    }
+  }
+
+  private notifyAttachmentWarnings(plan: AttachmentPastePlan): void {
+    if (plan.skippedExternalImages) {
+      this.toast.info("External images were skipped to protect your privacy.");
+    }
+    if (plan.skippedUnsupportedImages) {
+      this.toast.danger("Some images were skipped. Use PNG, JPEG, or WebP files.");
+    }
+    if (plan.skippedTooManyImages) {
+      this.toast.danger(`A note can contain up to ${MAX_NOTE_ATTACHMENTS} images.`);
+    }
   }
 
   /** Whether the menu should offset the ⋯ trigger when no badge precedes it. */

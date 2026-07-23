@@ -108,7 +108,7 @@ pub fn make_provider(
         model,
         effort: config.provider_effort.clone(),
     };
-    make_provider_resolved(&target, config, heavy)
+    make_provider_resolved(&target, config, heavy, None)
 }
 
 /// Build the `SummarizerProvider` serving `role`, resolved through the role layer
@@ -135,7 +135,25 @@ pub fn provider_for(
             target.connection
         )));
     }
-    make_provider_resolved(&target, config, heavy)
+    make_provider_resolved(&target, config, heavy, None)
+}
+
+/// Recording postprocess provider: identical consent/redaction/ledger seam, with the exact session
+/// token threaded into every on-device model stage (local GGUF, loopback Ollama, and NER).
+pub(crate) fn provider_for_recording(
+    role: roles::Role,
+    config: &AppConfig,
+    heavy: &Arc<tokio::sync::Semaphore>,
+    token: crate::perf::RecordingSessionToken,
+) -> crate::error::Result<Arc<dyn SummarizerProvider>> {
+    let target = roles::provider_target(role, config);
+    if target.builds_no_provider() {
+        return Err(crate::error::AppError::Unavailable(format!(
+            "the {} role targets the on-device reasoner ({}); no summarizer provider is available for it",
+            role.as_str(), target.connection
+        )));
+    }
+    make_provider_resolved(&target, config, heavy, Some(token))
 }
 
 /// The EFFECTIVE model id a resolved target sends: the target's own model, or — when empty —
@@ -165,6 +183,7 @@ fn make_provider_resolved(
     target: &roles::RoleTarget,
     config: &AppConfig,
     heavy: &Arc<tokio::sync::Semaphore>,
+    recording_token: Option<crate::perf::RecordingSessionToken>,
 ) -> crate::error::Result<Arc<dyn SummarizerProvider>> {
     let id = target.connection.as_str();
     // E10 — fail-closed consent gate, now classification-aware: no cloud provider is built (so no
@@ -210,8 +229,14 @@ fn make_provider_resolved(
             } else {
                 target.model.clone()
             };
-            let ollama = Arc::new(OllamaProvider::new(config.ollama_base_url.clone(), model));
-            if !egress_is_cloud(id, config) {
+            let ollama_is_local = !egress_is_cloud(id, config);
+            let ollama = Arc::new(OllamaProvider::with_model_admission(
+                config.ollama_base_url.clone(),
+                model,
+                ollama_is_local,
+                recording_token.clone(),
+            ));
+            if ollama_is_local {
                 return Ok(ollama); // LOCAL ollama: unwrapped, unchanged behavior
             }
             ollama // REMOTE ollama: falls through to the RedactingProvider wrap below
@@ -265,10 +290,15 @@ fn make_provider_resolved(
                     let reasoner: Arc<dyn crate::reason::LocalReasoner> = Arc::new(
                         crate::reason::sidecar::SidecarReasoner::new(path, timeouts)?,
                     );
-                    return Ok(Arc::new(local::LocalSummarizerProvider::new(
-                        reasoner,
-                        heavy.clone(),
-                    )));
+                    let provider = match recording_token.clone() {
+                        Some(token) => local::LocalSummarizerProvider::new_recording(
+                            reasoner,
+                            heavy.clone(),
+                            token,
+                        ),
+                        None => local::LocalSummarizerProvider::new(reasoner, heavy.clone()),
+                    };
+                    return Ok(Arc::new(provider));
                 }
                 None => {
                     return Err(crate::error::AppError::Unavailable(
@@ -298,7 +328,8 @@ fn make_provider_resolved(
     //
     // Phase 2b — wire the process-global egress sink so every cloud call records a content-free
     // audit row. Non-PII destination label + requested model are computed per provider arm here;
-    // the full constructor is `with_name_redactor_and_sink`.
+    // The recording-aware constructor also admits the NER load/inference under the exact session
+    // token, before any cloud dispatch.
     let destination = match id {
         PROVIDER_CLAUDE_CODE => "claude_code (Anthropic CLI)".to_string(),
         PROVIDER_ANTHROPIC => "api.anthropic.com".to_string(),
@@ -316,13 +347,15 @@ fn make_provider_resolved(
     // that is `anthropic_model` (previously recorded as empty even though the request carried it).
     let model_requested = effective_model_requested(target, config);
     Ok(Arc::new(
-        crate::summarize::redact::RedactingProvider::with_name_redactor_and_sink(
+        crate::summarize::redact::RedactingProvider::with_name_redactor_sink_and_model_admission(
             inner,
             crate::summarize::redact::active_name_redactor(),
             crate::summarize::egress_log::active_sink(),
             id.to_string(),
             destination,
             model_requested,
+            heavy.clone(),
+            recording_token,
         ),
     ))
 }
@@ -446,7 +479,11 @@ mod tests {
             cloud_egress_consented: false,
             ..AppConfig::default()
         };
-        let res = make_provider(PROVIDER_OLLAMA, &cfg, &Arc::new(tokio::sync::Semaphore::new(1)));
+        let res = make_provider(
+            PROVIDER_OLLAMA,
+            &cfg,
+            &Arc::new(tokio::sync::Semaphore::new(1)),
+        );
         assert!(
             matches!(res, Err(crate::error::AppError::Unavailable(_))),
             "expected Unavailable for remote ollama without consent"
@@ -461,7 +498,12 @@ mod tests {
             ..AppConfig::default()
         };
         // local ollama must build without consent
-        assert!(make_provider(PROVIDER_OLLAMA, &cfg, &Arc::new(tokio::sync::Semaphore::new(1))).is_ok());
+        assert!(make_provider(
+            PROVIDER_OLLAMA,
+            &cfg,
+            &Arc::new(tokio::sync::Semaphore::new(1))
+        )
+        .is_ok());
     }
 
     fn consented_config() -> AppConfig {
@@ -477,9 +519,19 @@ mod tests {
         // transparent to `id()`, so we assert construction succeeds (with consent granted) and
         // the wrapped provider reports the inner id.
         let cfg = consented_config();
-        let cc = make_provider(PROVIDER_CLAUDE_CODE, &cfg, &Arc::new(tokio::sync::Semaphore::new(1))).unwrap();
+        let cc = make_provider(
+            PROVIDER_CLAUDE_CODE,
+            &cfg,
+            &Arc::new(tokio::sync::Semaphore::new(1)),
+        )
+        .unwrap();
         assert_eq!(cc.id(), PROVIDER_CLAUDE_CODE);
-        let an = make_provider(PROVIDER_ANTHROPIC, &cfg, &Arc::new(tokio::sync::Semaphore::new(1))).unwrap();
+        let an = make_provider(
+            PROVIDER_ANTHROPIC,
+            &cfg,
+            &Arc::new(tokio::sync::Semaphore::new(1)),
+        )
+        .unwrap();
         assert_eq!(an.id(), PROVIDER_ANTHROPIC);
     }
 
@@ -489,7 +541,12 @@ mod tests {
         // A remote ollama_base_url is covered by remote_ollama_requires_consent.
         let cfg = AppConfig::default();
         assert!(!cfg.cloud_egress_consented);
-        let ol = make_provider(PROVIDER_OLLAMA, &cfg, &Arc::new(tokio::sync::Semaphore::new(1))).unwrap();
+        let ol = make_provider(
+            PROVIDER_OLLAMA,
+            &cfg,
+            &Arc::new(tokio::sync::Semaphore::new(1)),
+        )
+        .unwrap();
         assert_eq!(ol.id(), PROVIDER_OLLAMA);
     }
 
@@ -523,7 +580,12 @@ mod tests {
         let mut cfg = AppConfig::load(&db).unwrap();
         cfg.grant_cloud_egress_consent(&db).unwrap();
         assert!(
-            make_provider(PROVIDER_CLAUDE_CODE, &cfg, &Arc::new(tokio::sync::Semaphore::new(1))).is_ok(),
+            make_provider(
+                PROVIDER_CLAUDE_CODE,
+                &cfg,
+                &Arc::new(tokio::sync::Semaphore::new(1))
+            )
+            .is_ok(),
             "granted consent must build the cloud provider"
         );
         cfg.revoke_cloud_egress(&db).unwrap();
@@ -557,9 +619,13 @@ mod tests {
             cloud_egress_consented: false,
             ..AppConfig::default()
         };
-        let err = make_provider(PROVIDER_GATEWAY, &c, &Arc::new(tokio::sync::Semaphore::new(1)))
-            .map(|_| ())
-            .expect_err("expected Err for gateway without consent");
+        let err = make_provider(
+            PROVIDER_GATEWAY,
+            &c,
+            &Arc::new(tokio::sync::Semaphore::new(1)),
+        )
+        .map(|_| ())
+        .expect_err("expected Err for gateway without consent");
         assert!(
             matches!(err, crate::error::AppError::Unavailable(_)),
             "expected Unavailable, got: {err}"
@@ -579,7 +645,12 @@ mod tests {
         };
         // Must build without error — the make_provider consent gate + URL validation passed.
         assert!(
-            make_provider(PROVIDER_GATEWAY, &c, &Arc::new(tokio::sync::Semaphore::new(1))).is_ok(),
+            make_provider(
+                PROVIDER_GATEWAY,
+                &c,
+                &Arc::new(tokio::sync::Semaphore::new(1))
+            )
+            .is_ok(),
             "consented localhost gateway must build successfully"
         );
     }
@@ -592,9 +663,13 @@ mod tests {
             cloud_egress_consented: true,
             ..AppConfig::default()
         };
-        let err = make_provider(PROVIDER_GATEWAY, &c, &Arc::new(tokio::sync::Semaphore::new(1)))
-            .map(|_| ())
-            .expect_err("expected Err for remote http gateway");
+        let err = make_provider(
+            PROVIDER_GATEWAY,
+            &c,
+            &Arc::new(tokio::sync::Semaphore::new(1)),
+        )
+        .map(|_| ())
+        .expect_err("expected Err for remote http gateway");
         assert!(
             matches!(err, crate::error::AppError::InvalidArg(_)),
             "expected InvalidArg for remote http://, got: {err}"
@@ -609,9 +684,13 @@ mod tests {
             cloud_egress_consented: true,
             ..AppConfig::default()
         };
-        let err = make_provider(PROVIDER_GATEWAY, &c, &Arc::new(tokio::sync::Semaphore::new(1)))
-            .map(|_| ())
-            .expect_err("expected Err for empty gateway URL");
+        let err = make_provider(
+            PROVIDER_GATEWAY,
+            &c,
+            &Arc::new(tokio::sync::Semaphore::new(1)),
+        )
+        .map(|_| ())
+        .expect_err("expected Err for empty gateway URL");
         assert!(
             matches!(err, crate::error::AppError::InvalidArg(_)),
             "expected InvalidArg for empty URL, got: {err}"
@@ -679,7 +758,11 @@ mod tests {
             extra(&mut cfg);
             assert!(
                 matches!(
-                    provider_for(roles::Role::Ask, &cfg, &Arc::new(tokio::sync::Semaphore::new(1))),
+                    provider_for(
+                        roles::Role::Ask,
+                        &cfg,
+                        &Arc::new(tokio::sync::Semaphore::new(1))
+                    ),
                     Err(crate::error::AppError::Unavailable(_))
                 ),
                 "explicit Ask→{conn} must be consent-gated"
@@ -688,8 +771,12 @@ mod tests {
             // transparent to id(), which reports the inner connection — the wrap itself is proven
             // by the redact.rs tests, exactly like the legacy factory tests above).
             cfg.cloud_egress_consented = true;
-            let p = provider_for(roles::Role::Ask, &cfg, &Arc::new(tokio::sync::Semaphore::new(1)))
-                .unwrap_or_else(|e| panic!("consented Ask→{conn} must build: {e}"));
+            let p = provider_for(
+                roles::Role::Ask,
+                &cfg,
+                &Arc::new(tokio::sync::Semaphore::new(1)),
+            )
+            .unwrap_or_else(|e| panic!("consented Ask→{conn} must build: {e}"));
             assert_eq!(p.id(), conn);
         }
     }
@@ -704,7 +791,12 @@ mod tests {
             cloud_egress_consented: false,
             ..AppConfig::default()
         };
-        let p = provider_for(roles::Role::Ask, &cfg, &Arc::new(tokio::sync::Semaphore::new(1))).expect("loopback ollama needs no consent");
+        let p = provider_for(
+            roles::Role::Ask,
+            &cfg,
+            &Arc::new(tokio::sync::Semaphore::new(1)),
+        )
+        .expect("loopback ollama needs no consent");
         assert_eq!(p.id(), PROVIDER_OLLAMA);
     }
 
@@ -719,9 +811,13 @@ mod tests {
                 cloud_egress_consented: true,
                 ..AppConfig::default()
             };
-            let err = provider_for(roles::Role::Ask, &cfg, &Arc::new(tokio::sync::Semaphore::new(1)))
-                .map(|_| ())
-                .expect_err("explicit reasoner-only target must not build a provider");
+            let err = provider_for(
+                roles::Role::Ask,
+                &cfg,
+                &Arc::new(tokio::sync::Semaphore::new(1)),
+            )
+            .map(|_| ())
+            .expect_err("explicit reasoner-only target must not build a provider");
             assert!(
                 matches!(err, crate::error::AppError::Unavailable(_)),
                 "expected Unavailable for explicit {conn}, got: {err}"

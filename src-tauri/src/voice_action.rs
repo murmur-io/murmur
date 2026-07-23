@@ -185,6 +185,17 @@ impl VoiceActionResult {
             "I didn't hear a command — click and say it again.",
         )
     }
+
+    /// The command had an exact captured range, but its durable audio could not be certified before
+    /// the bounded deadline. Keep this distinct from silence: claiming "nothing heard" would hide a
+    /// storage/Stop race and encourage the user to repeat a command that was actually spoken.
+    pub fn capture_unavailable() -> Self {
+        VoiceActionResult::new(
+            "unknown",
+            "unavailable",
+            "The recorded command could not be read safely — please try it again.",
+        )
+    }
 }
 
 /// The honest notice surfaced when a RAG floor request found VISIBLE vault matches but NO AI model
@@ -244,6 +255,38 @@ pub fn handle_voice_action(
     recording_in_progress: bool,
     app: Option<&tauri::AppHandle>,
 ) -> VoiceActionResult {
+    handle_voice_action_with_recording_token(
+        intent,
+        reasoner,
+        db,
+        unlocked,
+        config,
+        meeting_id,
+        literal_command,
+        current_meeting_context,
+        recording_in_progress,
+        app,
+        None,
+    )
+}
+
+/// Recording-aware twin used by the live assistant. The exact token reaches both the cloud
+/// reasoner and every external connector dispatch; the public legacy/test surface above remains
+/// explicitly unscoped and therefore fails closed if Start wins concurrently.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn handle_voice_action_with_recording_token(
+    intent: &VoiceIntent,
+    reasoner: &dyn LocalReasoner,
+    db: &Db,
+    unlocked: &HashSet<String>,
+    config: &AppConfig,
+    meeting_id: &str,
+    literal_command: &str,
+    current_meeting_context: &str,
+    recording_in_progress: bool,
+    app: Option<&tauri::AppHandle>,
+    recording_token: Option<&crate::perf::RecordingSessionToken>,
+) -> VoiceActionResult {
     match intent {
         VoiceIntent::Research { topic } => rag_answer(
             "research",
@@ -256,6 +299,7 @@ pub fn handle_voice_action(
             unlocked,
             config,
             app,
+            recording_token,
         ),
         VoiceIntent::Recall { entity } => rag_answer(
             "recall",
@@ -268,6 +312,7 @@ pub fn handle_voice_action(
             unlocked,
             config,
             app,
+            recording_token,
         ),
         VoiceIntent::CreateReminder { text, due } => {
             let text = text.trim();
@@ -303,7 +348,7 @@ pub fn handle_voice_action(
             } else {
                 q
             };
-            match slack_search_blocking(query_for_retrieval, config) {
+            match slack_search_blocking(query_for_retrieval, config, recording_token) {
                 Ok(text) => {
                     let text = text.trim();
                     if text.is_empty() || is_empty_tool_result(text) {
@@ -313,9 +358,7 @@ pub fn handle_voice_action(
                         VoiceActionResult::new("slack_search", "ok", text.to_string())
                     }
                 }
-                Err(e) => {
-                    VoiceActionResult::new("slack_search", "unavailable", non_pii_error(&e))
-                }
+                Err(e) => VoiceActionResult::new("slack_search", "unavailable", non_pii_error(&e)),
             }
         }
         VoiceIntent::Unknown { .. } => VoiceActionResult::new(
@@ -484,11 +527,21 @@ pub(crate) fn is_about_current_meeting(command: &str) -> bool {
     // only ("ta/te/tej rozmow…", "te rozmowe" = tę rozmowę acc) so "te rozmowy" (plural) doesn't hit.
     const THIS_MEETING_PHRASES: &[&str] = &[
         // English "this <meeting-noun>".
-        "this meeting", "this conversation", "this call", "this recording",
+        "this meeting",
+        "this conversation",
+        "this call",
+        "this recording",
         // Polish neuter (spotkanie / nagranie): to/tego/tym <noun>.
-        "to spotkani", "tego spotkani", "tym spotkani", "to nagrani", "tego nagrani", "tym nagrani",
+        "to spotkani",
+        "tego spotkani",
+        "tym spotkani",
+        "to nagrani",
+        "tego nagrani",
+        "tym nagrani",
         // Polish feminine (rozmowa) — SINGULAR only.
-        "ta rozmow", "te rozmowe", "tej rozmow",
+        "ta rozmow",
+        "te rozmowe",
+        "tej rozmow",
     ];
     let has_this_meeting_phrase = THIS_MEETING_PHRASES.iter().any(|p| n.contains(p));
 
@@ -770,6 +823,7 @@ fn rag_answer(
     unlocked: &HashSet<String>,
     config: &AppConfig,
     app: Option<&tauri::AppHandle>,
+    recording_token: Option<&crate::perf::RecordingSessionToken>,
 ) -> VoiceActionResult {
     let topic = topic.trim();
     if topic.is_empty() && literal_command.trim().is_empty() {
@@ -840,7 +894,7 @@ fn rag_answer(
             literal_command.trim().to_string()
         };
         if !web_query.is_empty() {
-            match web_search_blocking(&web_query, config) {
+            match web_search_blocking(&web_query, config, recording_token) {
                 Ok(text) => {
                     let text = text.trim();
                     if !text.is_empty() && !is_empty_tool_result(text) {
@@ -1129,7 +1183,11 @@ fn rag_answer(
     // gated context as the PRIMARY source, then the vault notes as SECONDARY context.
     let original_words = {
         let lit = literal_command.trim();
-        if lit.is_empty() { display_query.as_str() } else { lit }
+        if lit.is_empty() {
+            display_query.as_str()
+        } else {
+            lit
+        }
     };
     let mut user = format!("Request (user's own words): {original_words}");
     if !display_query.is_empty() && display_query != original_words {
@@ -1141,7 +1199,9 @@ fn rag_answer(
         ));
     }
     if !grounding.is_empty() {
-        user.push_str(&format!("\n\nNotes from the vault (secondary context):\n{grounding}"));
+        user.push_str(&format!(
+            "\n\nNotes from the vault (secondary context):\n{grounding}"
+        ));
     }
 
     // EGRESS SEAM: a Cloud reasoner routes through make_provider (consent gate + RedactingProvider).
@@ -1226,7 +1286,11 @@ fn note_aside(
 /// OS thread with its own current-thread runtime, so we never "start a runtime within a runtime" and
 /// the future never crosses a thread boundary (only the `Result<String>` does). The egress/consent/
 /// redaction discipline all lives inside `execute_web_search` → the connector registry.
-fn web_search_blocking(query: &str, config: &AppConfig) -> crate::error::Result<String> {
+fn web_search_blocking(
+    query: &str,
+    config: &AppConfig,
+    recording_token: Option<&crate::perf::RecordingSessionToken>,
+) -> crate::error::Result<String> {
     std::thread::scope(|scope| {
         scope
             .spawn(|| {
@@ -1234,7 +1298,11 @@ fn web_search_blocking(query: &str, config: &AppConfig) -> crate::error::Result<
                     .enable_all()
                     .build()
                     .map_err(|e| AppError::Summarize(format!("web search runtime build: {e}")))?;
-                rt.block_on(crate::tools::execute_web_search(query, config))
+                rt.block_on(crate::tools::execute_web_search(
+                    query,
+                    config,
+                    recording_token,
+                ))
             })
             .join()
             .map_err(|_| AppError::Summarize("web search worker thread panicked".into()))?
@@ -1246,7 +1314,11 @@ fn web_search_blocking(query: &str, config: &AppConfig) -> crate::error::Result<
 /// never "start a runtime within a runtime" and the future never crosses a thread boundary (only the
 /// `Result<String>` does). The egress/consent/redaction discipline all lives inside
 /// `execute_slack_search` → the connector registry (fail-closed when the Slack connector is absent).
-fn slack_search_blocking(query: &str, config: &AppConfig) -> crate::error::Result<String> {
+fn slack_search_blocking(
+    query: &str,
+    config: &AppConfig,
+    recording_token: Option<&crate::perf::RecordingSessionToken>,
+) -> crate::error::Result<String> {
     std::thread::scope(|scope| {
         scope
             .spawn(|| {
@@ -1254,7 +1326,11 @@ fn slack_search_blocking(query: &str, config: &AppConfig) -> crate::error::Resul
                     .enable_all()
                     .build()
                     .map_err(|e| AppError::Summarize(format!("slack search runtime build: {e}")))?;
-                rt.block_on(crate::tools::execute_slack_search(query, config))
+                rt.block_on(crate::tools::execute_slack_search(
+                    query,
+                    config,
+                    recording_token,
+                ))
             })
             .join()
             .map_err(|_| AppError::Summarize("slack search worker thread panicked".into()))?
@@ -1374,10 +1450,7 @@ fn org_citation_from_line(line: &str) -> Option<String> {
     let after_label = line.strip_prefix("- [org")?;
     let close = after_label.find(']')?;
     // `after_label` looks like " · <author>] Title — snippet" — the author sits between " · " and "]".
-    let author = after_label[..close]
-        .trim()
-        .trim_start_matches('·')
-        .trim();
+    let author = after_label[..close].trim().trim_start_matches('·').trim();
     let rest = after_label[close + 1..].trim();
     let title = rest.split(" — ").next().unwrap_or(rest).trim();
     if title.is_empty() {
@@ -1637,6 +1710,7 @@ mod tests {
             config: &cfg,
             meeting_id: "",
             app: None,
+            recording_token: None,
             allow_writes: false,
             note_drafts: true,
             scope: crate::tools::AssistantScope::Full,
@@ -2536,7 +2610,8 @@ mod tests {
         let db = tmp_db();
         seed_visible_and_sealed(&db); // "Atlas Kickoff" note is the VAULT (secondary) grounding.
         let reasoner = CaptureReasoner::new();
-        let current = "Live transcript (so far):\nAlice: let's finalize the CURRENT-Q3-BUDGET today.";
+        let current =
+            "Live transcript (so far):\nAlice: let's finalize the CURRENT-Q3-BUDGET today.";
         let res = handle_voice_action(
             &VoiceIntent::Research {
                 topic: "Atlas".into(),
@@ -2641,7 +2716,7 @@ mod tests {
             &AppConfig::default(),
             "live-mtg",
             "",
-            "", // EMPTY current context — the meeting just started
+            "",   // EMPTY current context — the meeting just started
             true, // recording_in_progress
             None,
         );
@@ -2683,7 +2758,8 @@ mod tests {
         let db = tmp_db();
         seed_visible_and_sealed(&db); // "Atlas Kickoff" = the SECONDARY vault grounding.
         let reasoner = CaptureReasoner::new();
-        let current = "Live transcript (so far):\nAlice: let's finalize the CURRENT-Q3-BUDGET today.";
+        let current =
+            "Live transcript (so far):\nAlice: let's finalize the CURRENT-Q3-BUDGET today.";
         let res = handle_voice_action(
             &VoiceIntent::Research {
                 topic: "Atlas".into(),
@@ -2710,7 +2786,9 @@ mod tests {
         );
         // Current-first ordering is PRESERVED: the current transcript reaches the brain BEFORE the vault.
         let user = reasoner.last_user.lock().unwrap().clone().unwrap();
-        let this_at = user.find("THIS MEETING").expect("THIS MEETING labeled in user input");
+        let this_at = user
+            .find("THIS MEETING")
+            .expect("THIS MEETING labeled in user input");
         let vault_at = user
             .find("Atlas Kickoff")
             .expect("vault note still present as secondary grounding");
@@ -2781,7 +2859,10 @@ mod tests {
             "o czym jest ta rozmowę", // inflected accusative — stem-matches
             "Claudku, o czym jest to spotkanie",
         ] {
-            assert!(is_about_current_meeting(q), "should match PL about-this: {q}");
+            assert!(
+                is_about_current_meeting(q),
+                "should match PL about-this: {q}"
+            );
         }
         // Polish "summarize / streść THIS meeting/recording/conversation" — the summarize rule
         // requires the deictic AND a meeting-noun (a bare "streść to" with no meeting-noun is a
@@ -2791,7 +2872,10 @@ mod tests {
             "podsumuj to nagranie",
             "streść tę rozmowę",
         ] {
-            assert!(is_about_current_meeting(q), "should match PL summarize-this: {q}");
+            assert!(
+                is_about_current_meeting(q),
+                "should match PL summarize-this: {q}"
+            );
         }
         // Polish "what did we (here) decide / discuss".
         for q in [
@@ -2800,7 +2884,10 @@ mod tests {
             "co tu omówiliśmy",
             "co tu zdecydowaliśmy",
         ] {
-            assert!(is_about_current_meeting(q), "should match PL here-verb: {q}");
+            assert!(
+                is_about_current_meeting(q),
+                "should match PL here-verb: {q}"
+            );
         }
         // English.
         for q in [
@@ -2811,7 +2898,10 @@ mod tests {
             "what did we just discuss",
             "what did we decide here",
         ] {
-            assert!(is_about_current_meeting(q), "should match EN about-this: {q}");
+            assert!(
+                is_about_current_meeting(q),
+                "should match EN about-this: {q}"
+            );
         }
     }
 
@@ -2820,32 +2910,32 @@ mod tests {
     #[test]
     fn is_about_current_meeting_ignores_cross_note_and_world_questions() {
         for q in [
-            "co ustaliliśmy z Weroniką",           // cross-meeting (a person), NOT "here"
-            "jaka pogoda",                          // world / web
-            "jaka jest pogoda w Warszawie",         // world / web
-            "moje otwarte zadania",                 // vault, not this-meeting
-            "co wiemy o projekcie Atlas",           // cross-note recall
-            "what's the weather",                   // world / web
-            "who won the game yesterday",           // world / web
-            "what did we decide with Weronika",     // cross-meeting (no deictic)
+            "co ustaliliśmy z Weroniką",    // cross-meeting (a person), NOT "here"
+            "jaka pogoda",                  // world / web
+            "jaka jest pogoda w Warszawie", // world / web
+            "moje otwarte zadania",         // vault, not this-meeting
+            "co wiemy o projekcie Atlas",   // cross-note recall
+            "what's the weather",           // world / web
+            "who won the game yesterday",   // world / web
+            "what did we decide with Weronika", // cross-meeting (no deictic)
             // CROSS-MEETING SUMMARIZE (adversarial 2026-07-09 regression): a summarize verb + a
             // PLURAL/possessive-other meeting noun with NO "this/here" deictic must fan out to the
             // vault, NOT be stolen to the current-meeting isolation.
-            "podsumuj moje spotkania",              // summarize MY meetings (plural, no deictic)
+            "podsumuj moje spotkania", // summarize MY meetings (plural, no deictic)
             "summarize my meetings",
-            "podsumuj wszystkie spotkania",         // summarize ALL meetings
-            "streść wszystkie moje rozmowy",        // summarize ALL my conversations
-            "podsumuj spotkania z Weroniką",        // summarize meetings WITH a person
-            "recap my last call with Bob",          // recap a call WITH a person
+            "podsumuj wszystkie spotkania",  // summarize ALL meetings
+            "streść wszystkie moje rozmowy", // summarize ALL my conversations
+            "podsumuj spotkania z Weroniką", // summarize meetings WITH a person
+            "recap my last call with Bob",   // recap a call WITH a person
             "podsumuj nasze rozmowy z tego tygodnia", // summarize this week's conversations (plural)
             // DEICTIC-NOT-ADJACENT (adversarial 2026-07-09 round 2): "this" modifies a TIME word, not
             // the meeting-noun → cross-meeting/vault, must NOT be stolen to the current-meeting isolation.
-            "summarize this week's meetings",       // "this" → "week's", meetings is plural/cross
+            "summarize this week's meetings", // "this" → "week's", meetings is plural/cross
             "summarize this month's meetings",
             "recap this week's calls",
             "podsumuj to co ustaliliśmy na spotkaniach", // relative "to co" + plural "na spotkaniach"
-            "",                                     // empty
-            "   ",                                  // whitespace
+            "",                                          // empty
+            "   ",                                       // whitespace
         ] {
             assert!(
                 !is_about_current_meeting(q),
@@ -2881,7 +2971,9 @@ mod tests {
             "the current content must be handed to the model: {user}"
         );
         assert!(
-            !user.contains("vault") && !user.contains("web") && !user.to_lowercase().contains("secondary"),
+            !user.contains("vault")
+                && !user.contains("web")
+                && !user.to_lowercase().contains("secondary"),
             "NO vault/web/secondary grounding in the isolated Tier-1 prompt: {user}"
         );
         // NO literal "THIS MEETING" label the weak model would echo as its opening words.
@@ -2941,7 +3033,10 @@ mod tests {
             "viewed+empty ⇒ 'no transcript or notes' honest notice: {}",
             res2.summary
         );
-        assert!(res2.citations.is_empty(), "no citations when there is no content");
+        assert!(
+            res2.citations.is_empty(),
+            "no citations when there is no content"
+        );
     }
 
     /// Tier-1 with a STUB reasoner but PRESENT content ⇒ honest no-model notice + KEEP the current
@@ -2995,7 +3090,8 @@ mod tests {
             sha,
             None,
             None,
-            Some(&crate::embed::StubEmbedder))
+            Some(&crate::embed::StubEmbedder),
+        )
         .unwrap();
     }
 
@@ -3143,7 +3239,8 @@ mod tests {
     /// STILL-enabled org's content must keep working normally. Proves "disabled means truly gone",
     /// not just deprioritized, at the actual consumer surface a real user hits.
     #[test]
-    fn floor_never_folds_a_disabled_orgs_content_into_grounding_while_the_enabled_org_still_works() {
+    fn floor_never_folds_a_disabled_orgs_content_into_grounding_while_the_enabled_org_still_works()
+    {
         let db = tmp_db();
         seed_org(&db); // org-1, enabled by default
         db.upsert_org_state(&crate::storage::OrgState {
@@ -3178,7 +3275,8 @@ mod tests {
             &[32u8; 32],
             None,
             None,
-            Some(&crate::embed::StubEmbedder))
+            Some(&crate::embed::StubEmbedder),
+        )
         .unwrap();
         db.set_org_context_enabled("org-1", false).unwrap();
 

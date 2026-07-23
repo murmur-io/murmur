@@ -58,7 +58,13 @@ pub(crate) fn is_on_device_provider(provider_id: &str) -> bool {
 /// inventing its own.
 fn render_segment_line(s: &Segment) -> String {
     let who = s.speaker.as_deref().unwrap_or("?");
-    format!("[{:.1}-{:.1}] ({}) {}", s.start_s, s.end_s, who, s.text.trim())
+    format!(
+        "[{:.1}-{:.1}] ({}) {}",
+        s.start_s,
+        s.end_s,
+        who,
+        s.text.trim()
+    )
 }
 
 /// Build the timestamped transcript fed to the provider.
@@ -555,7 +561,10 @@ mod tests {
                 inner[..dash].parse::<f64>().ok()
             })
             .collect();
-        assert!(starts.len() >= 2, "expected multiple kept lines, got {starts:?}");
+        assert!(
+            starts.len() >= 2,
+            "expected multiple kept lines, got {starts:?}"
+        );
 
         let first = *starts.first().unwrap();
         let last = *starts.last().unwrap();

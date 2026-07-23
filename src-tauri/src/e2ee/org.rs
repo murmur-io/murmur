@@ -163,17 +163,8 @@ mod tests {
         let member = generate_identity().unwrap();
         let ock = generate_ock().unwrap();
 
-        let grant = wrap_ock_for_member(
-            &ock,
-            ORG,
-            GEN,
-            &member.pk_enc,
-            MEMBER,
-            &owner,
-            OWNER,
-            1,
-        )
-        .unwrap();
+        let grant =
+            wrap_ock_for_member(&ock, ORG, GEN, &member.pk_enc, MEMBER, &owner, OWNER, 1).unwrap();
 
         let opened = open_own_grant(
             &grant.wrapped_key,
@@ -328,7 +319,10 @@ mod tests {
             ORG,
             GEN,
         );
-        assert!(res.is_err(), "a grant signed by an unpinned key must be rejected");
+        assert!(
+            res.is_err(),
+            "a grant signed by an unpinned key must be rejected"
+        );
     }
 
     /// A grant addressed to MEMBER cannot be opened by OTHER (recipient binding).

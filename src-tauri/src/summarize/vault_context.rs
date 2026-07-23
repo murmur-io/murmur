@@ -250,8 +250,7 @@ fn pack_doc_chunks(
     // a flat/legacy doc keep their original leaf snippet unchanged — expansion may only ever add
     // the section AROUND what was retrieved, never substitute a different section.
     const EXPAND_TOP_N: usize = 3;
-    let parents =
-        db.expand_doc_parents_visible(&hits[..hits.len().min(EXPAND_TOP_N)], unlocked)?;
+    let parents = db.expand_doc_parents_visible(&hits[..hits.len().min(EXPAND_TOP_N)], unlocked)?;
     for p in parents {
         if let Some(h) = hits.iter_mut().find(|h| h.document_id == p.document_id) {
             if !p.snippet.trim().is_empty() {
@@ -692,17 +691,32 @@ mod tests {
         let listing = build_meeting_listing_visible(&db, "Secret", &[], 30, &nothing).unwrap();
         assert!(listing.contains("- open"), "open meeting listed: {listing}");
         assert!(listing.contains("Open Meeting"));
-        assert!(listing.contains("2026-06-26"), "date column present: {listing}");
-        assert!(!listing.contains("sealed"), "sealed id must not be listed: {listing}");
-        assert!(!listing.contains("Sealed Secret"), "sealed title must not leak: {listing}");
+        assert!(
+            listing.contains("2026-06-26"),
+            "date column present: {listing}"
+        );
+        assert!(
+            !listing.contains("sealed"),
+            "sealed id must not be listed: {listing}"
+        );
+        assert!(
+            !listing.contains("Sealed Secret"),
+            "sealed title must not leak: {listing}"
+        );
         // Content-free: never note text, even for visible meetings.
-        assert!(!listing.contains("OPEN-SECRET"), "note content must never enter the listing");
+        assert!(
+            !listing.contains("OPEN-SECRET"),
+            "note content must never enter the listing"
+        );
 
         // Session-unlock ⇒ the sealed meeting's line legitimately reappears.
         let mut unlocked = HashSet::new();
         unlocked.insert("f-locked".to_string());
         let listing2 = build_meeting_listing_visible(&db, "Secret", &[], 30, &unlocked).unwrap();
-        assert!(listing2.contains("Sealed Secret"), "unlocked meeting reappears: {listing2}");
+        assert!(
+            listing2.contains("Sealed Secret"),
+            "unlocked meeting reappears: {listing2}"
+        );
 
         // A long title is char-capped so a line stays compact (~80 chars).
         seed_note(
@@ -719,7 +733,11 @@ mod tests {
             .lines()
             .find(|l| l.contains("long |"))
             .expect("the long-title meeting is listed");
-        assert!(line.len() <= 90, "listing line stays compact, got {}: {line}", line.len());
+        assert!(
+            line.len() <= 90,
+            "listing line stays compact, got {}: {line}",
+            line.len()
+        );
     }
 
     /// Phase 2b: the HYBRID corpus builder is gated by the SAME visibility predicate. A sealed-not-
@@ -903,8 +921,20 @@ mod tests {
     #[test]
     fn pinned_corpus_only_includes_listed_sources() {
         let db = temp_db();
-        seed_note(&db, "m-in", "In Meeting", "PINNED-BODY project apollo", None);
-        seed_note(&db, "m-out", "Out Meeting", "UNLISTED-BODY project zeus", None);
+        seed_note(
+            &db,
+            "m-in",
+            "In Meeting",
+            "PINNED-BODY project apollo",
+            None,
+        );
+        seed_note(
+            &db,
+            "m-out",
+            "Out Meeting",
+            "UNLISTED-BODY project zeus",
+            None,
+        );
 
         let nothing = HashSet::new();
         let (corpus, sources) =
@@ -920,7 +950,13 @@ mod tests {
 
         // A note source packs the standalone note body; the unlisted meeting still absent.
         seed_folder(&db, "f-open");
-        seed_doc_note(&db, "note-in", "f-open", "Pinned Note", "NOTE-BODY design decisions");
+        seed_doc_note(
+            &db,
+            "note-in",
+            "f-open",
+            "Pinned Note",
+            "NOTE-BODY design decisions",
+        );
         let (corpus2, _) =
             build_vault_context_pinned_visible(&db, &[n_src("note-in")], "anthropic", &nothing)
                 .unwrap();
@@ -941,7 +977,13 @@ mod tests {
             "SEALED-BODY acquisition price",
             Some("f-locked"),
         );
-        seed_doc_note(&db, "note-sealed", "f-locked", "Sealed Note", "SEALED-NOTE-BODY roadmap");
+        seed_doc_note(
+            &db,
+            "note-sealed",
+            "f-locked",
+            "Sealed Note",
+            "SEALED-NOTE-BODY roadmap",
+        );
         db.set_folder_locked("f-locked", true, None).unwrap();
 
         // Nothing session-unlocked: both a sealed MEETING source and a sealed NOTE source pack nothing.
@@ -985,8 +1027,14 @@ mod tests {
             &unlocked,
         )
         .unwrap();
-        assert!(corpus2.contains("SEALED-BODY"), "unlocked meeting source reappears");
-        assert!(corpus2.contains("SEALED-NOTE-BODY"), "unlocked note source reappears");
+        assert!(
+            corpus2.contains("SEALED-BODY"),
+            "unlocked meeting source reappears"
+        );
+        assert!(
+            corpus2.contains("SEALED-NOTE-BODY"),
+            "unlocked note source reappears"
+        );
         let chat_corpus2 = crate::commands::pack_chat_pinned_sources(
             &db,
             "open-anchor",
@@ -1005,8 +1053,20 @@ mod tests {
     fn pinned_corpus_expands_active_links_gated() {
         let db = temp_db();
         // One explicit meeting, manually linked to (a) an OPEN neighbour meeting and (b) a SEALED one.
-        seed_note(&db, "m-anchor", "Anchor Meeting", "ANCHOR-BODY kickoff", None);
-        seed_note(&db, "m-open-neighbour", "Open Neighbour", "OPEN-NEIGHBOUR-BODY specs", None);
+        seed_note(
+            &db,
+            "m-anchor",
+            "Anchor Meeting",
+            "ANCHOR-BODY kickoff",
+            None,
+        );
+        seed_note(
+            &db,
+            "m-open-neighbour",
+            "Open Neighbour",
+            "OPEN-NEIGHBOUR-BODY specs",
+            None,
+        );
         seed_folder(&db, "f-locked");
         seed_note(
             &db,
@@ -1151,7 +1211,8 @@ mod tests {
 
         // Pinned to A only: A present, B ABSENT — the scoped path is strictly narrower.
         let (pinned, pinned_sources) =
-            build_vault_context_pinned_visible(&db, &[m_src("m-a")], "anthropic", &nothing).unwrap();
+            build_vault_context_pinned_visible(&db, &[m_src("m-a")], "anthropic", &nothing)
+                .unwrap();
         assert!(pinned.contains("WHOLE-A"));
         assert!(
             !pinned.contains("WHOLE-B"),

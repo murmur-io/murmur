@@ -25,6 +25,30 @@ use crate::reason::LocalReasoner;
 use crate::summarize::provider::*;
 use crate::summarize::template;
 
+async fn run_local_reasoner<T, F>(
+    heavy: &Arc<tokio::sync::Semaphore>,
+    recording_token: Option<crate::perf::RecordingSessionToken>,
+    reasoner: Arc<dyn LocalReasoner>,
+    call: F,
+) -> crate::error::Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&dyn LocalReasoner) -> crate::error::Result<T> + Send + 'static,
+{
+    if reasoner.id().starts_with("sidecar:") {
+        crate::perf::run_heavy_maybe_recording(
+            heavy,
+            recording_token,
+            crate::perf::ResidentModelKind::BrainGguf,
+            move || call(reasoner.as_ref()),
+        )
+        .await
+    } else {
+        // Deterministic fixtures/fallbacks own no weights and must not publish a fake resident kind.
+        crate::perf::run_blocking_serialized(heavy, move || call(reasoner.as_ref())).await
+    }
+}
+
 /// A [`SummarizerProvider`] backed by the on-device heavy reasoner.
 pub struct LocalSummarizerProvider {
     reasoner: Arc<dyn LocalReasoner>,
@@ -33,11 +57,28 @@ pub struct LocalSummarizerProvider {
     /// can never run concurrently with an in-progress whisper transcription/diarization/embedding
     /// pass on the same machine.
     heavy: Arc<tokio::sync::Semaphore>,
+    recording_token: Option<crate::perf::RecordingSessionToken>,
 }
 
 impl LocalSummarizerProvider {
     pub fn new(reasoner: Arc<dyn LocalReasoner>, heavy: Arc<tokio::sync::Semaphore>) -> Self {
-        Self { reasoner, heavy }
+        Self {
+            reasoner,
+            heavy,
+            recording_token: None,
+        }
+    }
+
+    pub(crate) fn new_recording(
+        reasoner: Arc<dyn LocalReasoner>,
+        heavy: Arc<tokio::sync::Semaphore>,
+        token: crate::perf::RecordingSessionToken,
+    ) -> Self {
+        Self {
+            reasoner,
+            heavy,
+            recording_token: Some(token),
+        }
     }
 }
 
@@ -61,13 +102,18 @@ impl SummarizerProvider for LocalSummarizerProvider {
         // Routed through the shared heavy-inference gate (perf::run_heavy), not a bare
         // spawn_blocking — a local Notes generation must serialize against any OTHER heavy
         // native-runtime call (whisper ASR, the diarizer, the embedder/NER) running concurrently.
-        let note = crate::perf::run_heavy(&self.heavy, move || {
-            reasoner.reason(
+        let note = run_local_reasoner(
+            &self.heavy,
+            self.recording_token.clone(),
+            reasoner,
+            move |reasoner| {
+                reasoner.reason(
                 "You are a meeting-notes writer. Produce clean Obsidian-ready Markdown; follow the \
                  instructions exactly.",
                 &prompt,
             )
-        })
+            },
+        )
         .await?;
         let note = note.trim_start_matches('\u{feff}').trim();
         if note.is_empty() {
@@ -82,7 +128,13 @@ impl SummarizerProvider for LocalSummarizerProvider {
         let reasoner = Arc::clone(&self.reasoner);
         let system = system.to_string();
         let user = user.to_string();
-        let out = crate::perf::run_heavy(&self.heavy, move || reasoner.reason(&system, &user)).await?;
+        let out = run_local_reasoner(
+            &self.heavy,
+            self.recording_token.clone(),
+            reasoner,
+            move |reasoner| reasoner.reason(&system, &user),
+        )
+        .await?;
         Ok(out.trim().to_string())
     }
 
@@ -99,9 +151,13 @@ impl SummarizerProvider for LocalSummarizerProvider {
         let reasoner = Arc::clone(&self.reasoner);
         let system = system.to_string();
         let user = user.to_string();
-        let out =
-            crate::perf::run_heavy(&self.heavy, move || reasoner.reason_with(&system, &user, opts))
-                .await?;
+        let out = run_local_reasoner(
+            &self.heavy,
+            self.recording_token.clone(),
+            reasoner,
+            move |reasoner| reasoner.reason_with(&system, &user, opts),
+        )
+        .await?;
         Ok((
             out.trim().to_string(),
             crate::summarize::meta::CallMeta::default(),

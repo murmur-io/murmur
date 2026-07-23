@@ -1,30 +1,30 @@
 //! Note storage surface — the authored-note (`documents(kind='note')`) CRUD + the per-provider
-//! `notes`-table records + the note-root (`is_root`) bootstrap, extracted verbatim from
-//! `storage::db` (God-file split, a PURE MOVE — no behavior change). The methods below are an
-//! inherent-impl split of [`crate::storage::db::Db`] across files (Rust allows one type's inherent
-//! `impl` to live in multiple files of the same crate); every method retains its EXACT prior body,
-//! signature, AND gating. The VISIBILITY-GATED note readers (`list_notes_visible`,
+//! `notes`-table records + the note-root (`is_root`) bootstrap, originally extracted from
+//! `storage::db` during the God-file split. The methods below are an inherent-impl split of
+//! [`crate::storage::db::Db`] across files (Rust allows one type's inherent `impl` to live in
+//! multiple files of the same crate). The VISIBILITY-GATED note readers (`list_notes_visible`,
 //! `list_notes_visible_typed`, `note_markdown_if_visible`, `latest_note_visible`,
 //! `get_note_if_visible`, `note_is_visible`) route through `visibility_clause` EXACTLY as on trunk —
 //! a sealed-and-not-session-unlocked note stays invisible/`None`. The SEAL-ON-WRITE twins
 //! (`insert_note_sealed`, `update_note_row_sealed`, `move_note_row_sealed`, `upsert_note_sealed`)
-//! are unchanged: the CALLER still verifies the blob decrypts back byte-identical BEFORE calling
-//! (verify-before-destroy) — this move relocated the low-level writers, not the seal-verify caller
-//! (`lock_folder`/`reseal_document_if_locked` stay in `commands.rs`). Shared db.rs module-level
+//! preserve the CALLER-side verify-before-destroy contract. `upsert_note_sealed` additionally keeps
+//! its folder assignment behind the recording-generation lock backstop in the same transaction.
+//! The seal-verify callers (`lock_folder`/`reseal_document_if_locked`) stay in `commands.rs`.
+//! Shared db.rs module-level
 //! helpers `map_err` / `visibility_clause` / `parse_front_matter` / `note_snippet` /
 //! `coerce_property_value` are `pub(crate)`/`pub`; the `NoteRow` DTO stays in db.rs; the note row
 //! mappers `row_to_note` / `row_to_note_row` (only ever used by these readers) moved along and stay
 //! private to this module. The note-folder/document CRUD (`folder_by_path`, `get_note_folder_schema`,
-//! `notes_with_active_share`) stays in its own module and is reached cross-file via `self.`. Tests
-//! stay in db.rs's `mod tests` (shared harness); the count is conserved.
+//! `notes_with_active_share`) stays in its own module and is reached cross-file via `self.`.
 
 use std::collections::HashSet;
 
-use rusqlite::{OptionalExtension, Row};
+use rusqlite::{OptionalExtension, Row, Transaction};
 
 use crate::error::{AppError, Result};
 use crate::storage::db::{
-    coerce_property_value, map_err, note_snippet, parse_front_matter, visibility_clause, Db, NoteRow,
+    coerce_property_value, map_err, note_snippet, parse_front_matter, visibility_clause, Db,
+    NoteRow,
 };
 use crate::storage::models::{NoteRecord, NoteSummary, PropertyValue, TypedNoteRow};
 
@@ -95,6 +95,21 @@ impl Db {
         .map_err(map_err)
     }
 
+    /// Content-free authorization anchor for one authored note. Commands use this BEFORE reading
+    /// [`NoteRow`] so a locked row's title/body/export path never enters the process merely to find
+    /// its governing folder. Timestamps are safe identity metadata used by the masked editor DTO.
+    pub fn note_gate_anchor(&self, id: &str) -> Result<Option<(String, i64, Option<i64>)>> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT folder_id, created_at, updated_at
+               FROM documents WHERE id = ?1 AND kind = 'note'",
+            rusqlite::params![id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(map_err)
+    }
+
     /// Recording-time COMPANION NOTE — set the STRUCTURED `documents.meeting_id` link on a
     /// standalone note (`kind='note'`). Idempotent on an unknown id / non-note row (0 rows). The
     /// column is a non-content id (rides the SQLCipher-at-rest layer, never sealed/blanked). Callers
@@ -134,7 +149,13 @@ impl Db {
     /// through the command layer's `reseal_document_if_locked` → [`Db::update_note_row_sealed`],
     /// which re-seals the fresh text into `text_blob` in the same write (2026-07-10 audit F1).
     /// Idempotent on an unknown id / non-note row (0 rows affected).
-    pub fn update_note_row(&self, id: &str, title: &str, text: &str, updated_at: i64) -> Result<()> {
+    pub fn update_note_row(
+        &self,
+        id: &str,
+        title: &str,
+        text: &str,
+        updated_at: i64,
+    ) -> Result<()> {
         let conn = self.lock();
         conn.execute(
             "UPDATE documents SET title = ?2, text = ?3, updated_at = ?4
@@ -143,6 +164,49 @@ impl Db {
         )
         .map_err(map_err)?;
         Ok(())
+    }
+
+    /// Background auto-title CAS. It changes ONLY `title` + `updated_at`, and only while the exact
+    /// body revision observed before inference is still in the same OPEN, unsealed folder and its
+    /// title remains blank/`Untitled`. The single SQL statement closes editor-save and folder-seal
+    /// TOCTOU windows; unlike [`Db::update_note_row`], it can never copy a stale plaintext body back
+    /// over a freshly blanked sealed row.
+    pub fn set_auto_title_if_unchanged_and_open(
+        &self,
+        id: &str,
+        expected_folder_id: &str,
+        expected_updated_at: Option<i64>,
+        expected_text: &str,
+        title: &str,
+        updated_at: i64,
+    ) -> Result<bool> {
+        let conn = self.lock();
+        let changed = conn
+            .execute(
+                "UPDATE documents
+                    SET title = ?5, updated_at = ?6
+                  WHERE id = ?1
+                    AND kind = 'note'
+                    AND folder_id = ?2
+                    AND updated_at IS ?3
+                    AND text = ?4
+                    AND text_blob IS NULL
+                    AND COALESCE(TRIM(title), '') IN ('', 'Untitled')
+                    AND EXISTS (
+                        SELECT 1 FROM folders f
+                         WHERE f.id = documents.folder_id AND f.locked = 0
+                    )",
+                rusqlite::params![
+                    id,
+                    expected_folder_id,
+                    expected_updated_at,
+                    expected_text,
+                    title,
+                    updated_at
+                ],
+            )
+            .map_err(map_err)?;
+        Ok(changed == 1)
     }
 
     /// SEAL-ON-WRITE twin of [`Db::update_note_row`] for a session-unlocked LOCKED folder: persist
@@ -444,7 +508,9 @@ impl Db {
                 return Ok(path);
             }
         }
-        Err(AppError::Storage("could not allocate a notes-root path".into()))
+        Err(AppError::Storage(
+            "could not allocate a notes-root path".into(),
+        ))
     }
 
     /// Insert a fresh reserved note-root at `path` (name = `path`, `is_root=1`, unlocked, no parent).
@@ -510,15 +576,25 @@ impl Db {
     /// statement. Setting `folder_id` on insert keeps a NEW provider row governed by the meeting's
     /// lock (a bare insert would leave it NULL → ungoverned → visible). The CALLER must have verified
     /// the blob decrypts back byte-identical BEFORE calling this (verify-before-destroy) — exactly
-    /// like [`Db::seal_note`]. 2026-07-10 audit F1.
+    /// like [`Db::seal_note`]. A new association with a LOCKED folder is refused transactionally
+    /// while the meeting has a non-retired generation or pending legacy recovery: those plaintext
+    /// recording artifacts are not governed by the folder seal. Re-sealing an existing row already
+    /// associated with this folder remains valid. 2026-07-10 audit F1.
     pub fn upsert_note_sealed(
         &self,
         note: &NoteRecord,
         content_blob: &[u8],
         folder_id: &str,
     ) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        guard_locked_folder_assignment_for_recording(
+            &tx,
+            &note.meeting_id,
+            &note.provider_id,
+            folder_id,
+        )?;
+        tx.execute(
             "INSERT INTO notes
                (meeting_id, provider_id, markdown, created_at, exported_path,
                 model_requested, model_served, gateway_host, content_blob, folder_id)
@@ -546,7 +622,7 @@ impl Db {
             ],
         )
         .map_err(map_err)?;
-        Ok(())
+        tx.commit().map_err(map_err)
     }
 
     pub fn get_note(&self, meeting_id: &str, provider_id: &str) -> Result<Option<NoteRecord>> {
@@ -702,6 +778,54 @@ impl Db {
     }
 }
 
+/// Storage-level backstop shared by every sealed-note upsert outcome (INSERT and conflict UPDATE).
+/// The check and the folder-id write must remain in one transaction: a future caller must not be
+/// able to move a meeting with unmanaged recording artifacts behind a folder lock by bypassing
+/// `Db::set_meeting_folder`. The exact existing provider row is exempt only when it is already
+/// governed by this target folder, because that path is a content re-seal rather than an assignment.
+fn guard_locked_folder_assignment_for_recording(
+    tx: &Transaction<'_>,
+    meeting_id: &str,
+    provider_id: &str,
+    folder_id: &str,
+) -> Result<()> {
+    let blocked = tx
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1
+                   FROM folders f
+                  WHERE f.id = ?3
+                    AND f.locked = 1
+                    AND (
+                        EXISTS(
+                            SELECT 1 FROM recording_generations rg
+                             WHERE rg.meeting_id = ?1 AND rg.state != 'RETIRED'
+                        ) OR EXISTS(
+                            SELECT 1 FROM legacy_recording_recovery lr
+                             WHERE lr.meeting_id = ?1
+                        )
+                    )
+                    AND NOT EXISTS(
+                        SELECT 1
+                          FROM notes n
+                         WHERE n.meeting_id = ?1
+                           AND n.provider_id = ?2
+                           AND n.folder_id = ?3
+                    )
+             )",
+            rusqlite::params![meeting_id, provider_id, folder_id],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(map_err)?;
+    if blocked {
+        return Err(AppError::Locked(
+            "meeting has plaintext recording artifacts that are not governed by the locked folder"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 fn row_to_note(row: &Row<'_>) -> rusqlite::Result<NoteRecord> {
     Ok(NoteRecord {
         meeting_id: row.get(0)?,
@@ -728,4 +852,248 @@ fn row_to_note_row(row: &Row<'_>) -> rusqlite::Result<NoteRow> {
         exported_path: row.get(7)?,
         sealed: row.get::<_, i64>(8)? != 0,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::models::{
+        Folder, Meeting, MeetingStatus, RecordingGenerationKey, RecordingMicAssertion,
+    };
+
+    const TEST_DEK: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    fn db() -> Db {
+        Db::open_with_key(std::path::Path::new(":memory:"), TEST_DEK).unwrap()
+    }
+
+    fn seed_meeting(db: &Db) -> String {
+        let id = uuid::Uuid::new_v4().hyphenated().to_string();
+        db.insert_meeting(&Meeting {
+            id: id.clone(),
+            started_at: "2026-07-22T12:00:00Z".into(),
+            ended_at: None,
+            title: None,
+            duration_s: 0,
+            audio_path: None,
+            status: MeetingStatus::Draft,
+            folder_id: None,
+        })
+        .unwrap();
+        id
+    }
+
+    fn seed_locked_folder(db: &Db) -> String {
+        let id = uuid::Uuid::new_v4().hyphenated().to_string();
+        db.insert_folder(&Folder {
+            id: id.clone(),
+            name: "Private".into(),
+            path: id.clone(),
+            parent_id: None,
+            locked: false,
+            created_at: "2026-07-22T12:00:00Z".into(),
+        })
+        .unwrap();
+        db.set_folder_locked(&id, true, Some(b"wrapped-key"))
+            .unwrap();
+        id
+    }
+
+    fn note(meeting_id: &str, markdown: &str) -> NoteRecord {
+        NoteRecord {
+            meeting_id: meeting_id.into(),
+            provider_id: "test".into(),
+            markdown: markdown.into(),
+            created_at: "2026-07-22T12:00:01Z".into(),
+            exported_path: None,
+            model_requested: None,
+            model_served: None,
+            gateway_host: None,
+        }
+    }
+
+    fn seed_active_generation(db: &Db, meeting_id: &str) {
+        let key = RecordingGenerationKey::fresh(meeting_id).unwrap();
+        let mic = RecordingMicAssertion::for_generation(&key, 48_000, 7, 11).unwrap();
+        let _lease = db.prepare_recording_generation(&key, &mic, 60_000).unwrap();
+    }
+
+    fn stored_note_seal(db: &Db, meeting_id: &str) -> (String, Option<Vec<u8>>, Option<String>) {
+        db.lock()
+            .query_row(
+                "SELECT markdown, content_blob, folder_id
+                   FROM notes
+                  WHERE meeting_id = ?1 AND provider_id = 'test'",
+                [meeting_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn auto_title_cas_never_overwrites_new_body_or_crosses_folder_lock() {
+        let db = db();
+        let folder_id = uuid::Uuid::new_v4().hyphenated().to_string();
+        db.insert_folder(&Folder {
+            id: folder_id.clone(),
+            name: "Notes".into(),
+            path: folder_id.clone(),
+            parent_id: None,
+            locked: false,
+            created_at: "2026-07-22T12:00:00Z".into(),
+        })
+        .unwrap();
+
+        db.insert_note("auto-ok", &folder_id, "auto-ok", "Untitled", "old body", 1)
+            .unwrap();
+        let observed = db.get_note_row("auto-ok").unwrap().unwrap();
+        assert!(db
+            .set_auto_title_if_unchanged_and_open(
+                "auto-ok",
+                &folder_id,
+                observed.updated_at,
+                &observed.text,
+                "Generated title",
+                2,
+            )
+            .unwrap());
+        let titled = db.get_note_row("auto-ok").unwrap().unwrap();
+        assert_eq!(titled.title.as_deref(), Some("Generated title"));
+        assert_eq!(titled.text, "old body");
+
+        db.insert_note(
+            "auto-stale",
+            &folder_id,
+            "auto-stale",
+            "Untitled",
+            "observed body",
+            10,
+        )
+        .unwrap();
+        let stale = db.get_note_row("auto-stale").unwrap().unwrap();
+        db.update_note_row("auto-stale", "User title", "new editor body", 11)
+            .unwrap();
+        assert!(!db
+            .set_auto_title_if_unchanged_and_open(
+                "auto-stale",
+                &folder_id,
+                stale.updated_at,
+                &stale.text,
+                "Stale generated title",
+                12,
+            )
+            .unwrap());
+        let current = db.get_note_row("auto-stale").unwrap().unwrap();
+        assert_eq!(current.title.as_deref(), Some("User title"));
+        assert_eq!(current.text, "new editor body");
+
+        db.insert_note(
+            "auto-locked",
+            &folder_id,
+            "auto-locked",
+            "Untitled",
+            "private body",
+            20,
+        )
+        .unwrap();
+        let before_lock = db.get_note_row("auto-locked").unwrap().unwrap();
+        db.set_folder_locked(&folder_id, true, Some(b"wrapped-key"))
+            .unwrap();
+        assert!(!db
+            .set_auto_title_if_unchanged_and_open(
+                "auto-locked",
+                &folder_id,
+                before_lock.updated_at,
+                &before_lock.text,
+                "Must not land",
+                21,
+            )
+            .unwrap());
+        assert_eq!(
+            db.get_note_row("auto-locked")
+                .unwrap()
+                .unwrap()
+                .title
+                .as_deref(),
+            Some("Untitled")
+        );
+    }
+
+    #[test]
+    fn sealed_upsert_rejects_active_recording_reassignment_to_locked_folder() {
+        let db = db();
+        let meeting_id = seed_meeting(&db);
+        let folder_id = seed_locked_folder(&db);
+        db.upsert_note(&note(&meeting_id, "before")).unwrap();
+        seed_active_generation(&db, &meeting_id);
+
+        let result = db.upsert_note_sealed(&note(&meeting_id, "after"), b"after-blob", &folder_id);
+
+        assert!(matches!(result, Err(AppError::Locked(_))));
+        assert_eq!(
+            stored_note_seal(&db, &meeting_id),
+            ("before".into(), None, None),
+            "the rejected assignment must leave the existing note unchanged"
+        );
+    }
+
+    #[test]
+    fn sealed_upsert_rejects_pending_legacy_recovery_reassignment_to_locked_folder() {
+        let db = db();
+        let meeting_id = seed_meeting(&db);
+        let folder_id = seed_locked_folder(&db);
+        db.upsert_note(&note(&meeting_id, "before")).unwrap();
+        db.mark_legacy_recording_recovery_pending(&meeting_id)
+            .unwrap();
+
+        let result = db.upsert_note_sealed(&note(&meeting_id, "after"), b"after-blob", &folder_id);
+
+        assert!(matches!(result, Err(AppError::Locked(_))));
+        assert_eq!(
+            stored_note_seal(&db, &meeting_id),
+            ("before".into(), None, None),
+            "the rejected assignment must leave the existing note unchanged"
+        );
+    }
+
+    #[test]
+    fn sealed_upsert_allows_new_locked_org_ingest_without_recording_generation() {
+        let db = db();
+        let meeting_id = seed_meeting(&db);
+        let folder_id = seed_locked_folder(&db);
+
+        db.upsert_note_sealed(&note(&meeting_id, "shared"), b"shared-blob", &folder_id)
+            .unwrap();
+
+        assert_eq!(
+            stored_note_seal(&db, &meeting_id),
+            (
+                "shared".into(),
+                Some(b"shared-blob".to_vec()),
+                Some(folder_id)
+            )
+        );
+    }
+
+    #[test]
+    fn sealed_upsert_allows_reseal_already_associated_with_locked_folder() {
+        let db = db();
+        let meeting_id = seed_meeting(&db);
+        let folder_id = seed_locked_folder(&db);
+        db.upsert_note_sealed(&note(&meeting_id, "before"), b"before-blob", &folder_id)
+            .unwrap();
+        seed_active_generation(&db, &meeting_id);
+
+        db.upsert_note_sealed(&note(&meeting_id, "after"), b"after-blob", &folder_id)
+            .unwrap();
+
+        assert_eq!(
+            stored_note_seal(&db, &meeting_id),
+            (
+                "after".into(),
+                Some(b"after-blob".to_vec()),
+                Some(folder_id)
+            )
+        );
+    }
 }

@@ -2,21 +2,23 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, State};
 use zeroize::{Zeroize, Zeroizing};
 
+use crate::audio::source::{
+    discard_untracked_empty_mic, ActiveRecording, CaptureSpool, RawF32LeSink, RECORDING_LEASE_MS,
+};
 use crate::audio::Recorder;
 use crate::error::AppError;
 use crate::events::{StatusPayload, EVENT_STATUS};
 use crate::settings::{AppConfig, BrainBackend};
 use crate::state::AppState;
 use crate::storage::models::{
-    ActionItem, Analytics, AskVaultResult, BrainOverview, CalendarContext,
-    CalendarEvent, CalendarEventFull, ChatTurn, Commitment, DigestResult, DocumentInfo,
-    EntityDetail, EntityDossierResult, Folder, FolderNode, FullGraphData, FullGraphOpts, GraphData,
-    Meeting,
+    ActionItem, Analytics, AskVaultResult, BrainOverview, CalendarContext, CalendarEvent,
+    CalendarEventFull, ChatTurn, Commitment, DigestResult, DocumentInfo, EntityDetail,
+    EntityDossierResult, Folder, FolderNode, FullGraphData, FullGraphOpts, GraphData, Meeting,
     MeetingActionSummary, MeetingStatus, MeetingTimeline, NoteAssistRequest, NoteAssistResult,
     NoteCitation, NoteDoc, NoteFolder, NoteRecord, NoteSummary, OrganizeMove, OrganizePlan,
-    PeopleList, PinResult, PropertyKind, PropertySchemaField, SearchHit,
-    TopicThread, TypedNoteRow,
+    PeopleList, PinResult, PropertyKind, PropertySchemaField, SearchHit, TopicThread, TypedNoteRow,
 };
+use crate::storage::Db;
 use crate::summarize::all_providers;
 use crate::transcribe::types::Segment;
 use crate::{pipeline, secrets};
@@ -125,6 +127,11 @@ pub use meetings_commands::*;
 #[path = "notes.rs"]
 mod notes_commands;
 pub use notes_commands::*;
+
+// Canonical note-image attachments: gated binary CRUD + validation and the shared bundle seam.
+#[path = "attachments.rs"]
+mod attachment_commands;
+pub use attachment_commands::*;
 
 // Per-folder LOCK / UNLOCK / RELOCK / REMOVE-LOCK command surface — the verify-before-destroy
 // CALLERS (a LOCK-CRITICAL domain, PURE MOVE — every seal/verify/blank/unseal ORDERING is
@@ -291,7 +298,6 @@ pub struct StartResult {
     pub meeting_id: String,
 }
 
-
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StopResult {
@@ -300,6 +306,166 @@ pub struct StopResult {
     /// Path of the exported Obsidian `.md`, or `None` when no vault is configured (the note
     /// is still saved to the DB — the vault is export-only).
     pub exported_path: Option<String>,
+}
+
+/// Final IPC content gate after a long pipeline await. A result may own a plaintext markdown copy
+/// even though screen-share/manual relock has already blanked the canonical rows and revoked every
+/// reader. Recheck under the short lock lifecycle guard immediately before building the DTO; never
+/// let the cached copy cross Tauri IPC after revocation.
+pub(crate) fn ensure_post_await_result_visible(
+    state: &AppState,
+    meeting_id: &str,
+) -> Result<(), AppError> {
+    let _lifecycle = lifecycle_guard(state);
+    if !meeting_is_unlocked(state, meeting_id)? {
+        return Err(AppError::Locked(
+            "this meeting was relocked before its result could be shown — unlock it to view the note"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Optimistic authorization token for work that derives a result from one or more visible content
+/// rows and then releases the lifecycle mutex across a long `.await` / blocking inference call.
+/// Every lock, relock and remove-lock transition bumps this epoch at entry. A mismatch therefore
+/// means the caller's cached plaintext was observed under an obsolete authorization generation and
+/// must neither be returned nor persisted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ContentVisibilitySnapshot {
+    seal_epoch: u64,
+}
+
+/// Capture the current content-authorization generation under the same lifecycle mutex as every
+/// lock transition. Call this BEFORE assembling a visible multi-source corpus.
+pub(crate) fn capture_content_visibility_snapshot(state: &AppState) -> ContentVisibilitySnapshot {
+    let _lifecycle = lifecycle_guard(state);
+    ContentVisibilitySnapshot {
+        seal_epoch: state.seal_epoch.load(std::sync::atomic::Ordering::SeqCst),
+    }
+}
+
+pub(crate) fn require_current_content_visibility_snapshot_under_lifecycle(
+    state: &AppState,
+    snapshot: ContentVisibilitySnapshot,
+) -> Result<(), AppError> {
+    if state.seal_epoch.load(std::sync::atomic::Ordering::SeqCst) != snapshot.seal_epoch {
+        return Err(AppError::Locked(
+            "content was locked while this operation was running — unlock it and retry".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Revalidate a multi-source result immediately before it crosses IPC. For a derived write, acquire
+/// `lifecycle_guard` and use the `_under_lifecycle` twin so the check and write are one interval.
+pub(crate) fn require_current_content_visibility_snapshot(
+    state: &AppState,
+    snapshot: ContentVisibilitySnapshot,
+) -> Result<(), AppError> {
+    let _lifecycle = lifecycle_guard(state);
+    require_current_content_visibility_snapshot_under_lifecycle(state, snapshot)
+}
+
+/// A single-meeting snapshot additionally binds the folder association. Ordinary moves between
+/// open folders do not bump the global epoch, while moving into a different protection domain must
+/// still invalidate a cached transcript/note/timeline result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MeetingContentSnapshot {
+    folder_id: Option<String>,
+    visibility: ContentVisibilitySnapshot,
+}
+
+pub(crate) fn capture_meeting_content_snapshot(
+    state: &AppState,
+    meeting_id: &str,
+) -> Result<MeetingContentSnapshot, AppError> {
+    let _lifecycle = lifecycle_guard(state);
+    if !meeting_is_unlocked(state, meeting_id)? {
+        return Err(AppError::Locked(
+            "this meeting's folder is locked — unlock it and retry".into(),
+        ));
+    }
+    Ok(MeetingContentSnapshot {
+        folder_id: state.db.folder_for_meeting(meeting_id)?,
+        visibility: ContentVisibilitySnapshot {
+            seal_epoch: state.seal_epoch.load(std::sync::atomic::Ordering::SeqCst),
+        },
+    })
+}
+
+pub(crate) fn require_current_meeting_content_snapshot_under_lifecycle(
+    state: &AppState,
+    meeting_id: &str,
+    snapshot: &MeetingContentSnapshot,
+) -> Result<(), AppError> {
+    require_current_content_visibility_snapshot_under_lifecycle(state, snapshot.visibility)?;
+    if !meeting_is_unlocked(state, meeting_id)?
+        || state.db.folder_for_meeting(meeting_id)? != snapshot.folder_id
+    {
+        return Err(AppError::Locked(
+            "this meeting moved or was locked while the operation was running — unlock it and retry"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn require_current_meeting_content_snapshot(
+    state: &AppState,
+    meeting_id: &str,
+    snapshot: &MeetingContentSnapshot,
+) -> Result<(), AppError> {
+    let _lifecycle = lifecycle_guard(state);
+    require_current_meeting_content_snapshot_under_lifecycle(state, meeting_id, snapshot)
+}
+
+/// Authored-note counterpart of [`MeetingContentSnapshot`]. The content-free gate anchor is read
+/// before any title/body/export path and is rebound after every long await.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DocumentContentSnapshot {
+    folder_id: String,
+    visibility: ContentVisibilitySnapshot,
+}
+
+pub(crate) fn capture_document_content_snapshot(
+    state: &AppState,
+    note_id: &str,
+) -> Result<DocumentContentSnapshot, AppError> {
+    let _lifecycle = lifecycle_guard(state);
+    let Some((folder_id, _created_at, _updated_at)) = state.db.note_gate_anchor(note_id)? else {
+        return Err(AppError::InvalidArg(format!("no note {note_id}")));
+    };
+    if !folder_is_unlocked(state, &folder_id)? {
+        return Err(AppError::Locked(
+            "this note's folder is locked — unlock it and retry".into(),
+        ));
+    }
+    Ok(DocumentContentSnapshot {
+        folder_id,
+        visibility: ContentVisibilitySnapshot {
+            seal_epoch: state.seal_epoch.load(std::sync::atomic::Ordering::SeqCst),
+        },
+    })
+}
+
+pub(crate) fn require_current_document_content_snapshot(
+    state: &AppState,
+    note_id: &str,
+    snapshot: &DocumentContentSnapshot,
+) -> Result<(), AppError> {
+    let _lifecycle = lifecycle_guard(state);
+    require_current_content_visibility_snapshot_under_lifecycle(state, snapshot.visibility)?;
+    let Some((folder_id, _created_at, _updated_at)) = state.db.note_gate_anchor(note_id)? else {
+        return Err(AppError::InvalidArg(format!("no note {note_id}")));
+    };
+    if folder_id != snapshot.folder_id || !folder_is_unlocked(state, &folder_id)? {
+        return Err(AppError::Locked(
+            "this note moved or was locked while the operation was running — unlock it and retry"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -318,7 +484,6 @@ pub struct ProviderStatus {
     pub available: bool,
     pub reason: Option<String>,
 }
-
 
 /// A suggested label for a diarized cluster of the current meeting, from cosine re-identification
 /// against the GATED set of labeled prior voiceprints. The FE offers it as a one-tap rename.
@@ -383,7 +548,7 @@ pub struct AppConfigDto {
     /// silently blanks it. Mirrors Rust `AppConfig::live_asr_engine` / FE `liveAsrEngine`.
     #[serde(default = "default_live_asr_engine")]
     pub live_asr_engine: String,
-    /// Brain-sidecar IDLE-KILL window (s) — after this idle the host kills the `meetnotes-brain`
+    /// Brain-sidecar IDLE-KILL window (s) — after this idle the host kills the `murmur-brain`
     /// child to reclaim its model RAM. Settable. An omitted key deserializes to 300
     /// (`#[serde(default = "…")]`) so an older FE payload never zeroes it. Mirrors Rust
     /// `AppConfig::brain_idle_timeout_secs` / FE `brainIdleTimeoutSecs`.
@@ -685,7 +850,67 @@ pub struct MeetingDetailDto {
 
 // ── Commands (PHASE0-PLAN §7) ──
 
+struct RecordingStartGuard<'a> {
+    db: &'a crate::storage::Db,
+    meeting_id: String,
+    armed: bool,
+}
 
+struct RecordingStartingFlag<'a> {
+    flag: &'a std::sync::atomic::AtomicBool,
+    armed: bool,
+}
+
+struct PendingManualStopGuard {
+    app: AppHandle,
+    meeting_id: String,
+    armed: bool,
+}
+
+impl PendingManualStopGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PendingManualStopGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            crate::transcribe::live::fail_pending_manual_for_meeting(&self.app, &self.meeting_id);
+        }
+    }
+}
+
+impl RecordingStartingFlag<'_> {
+    fn disarm(&mut self) {
+        self.flag.store(false, std::sync::atomic::Ordering::Release);
+        self.armed = false;
+    }
+}
+
+impl Drop for RecordingStartingFlag<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.flag.store(false, std::sync::atomic::Ordering::Release);
+        }
+    }
+}
+
+impl RecordingStartGuard<'_> {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RecordingStartGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self
+                .db
+                .update_meeting_status(&self.meeting_id, MeetingStatus::Error);
+        }
+    }
+}
 
 /// Begin mic capture. Inserts a Meeting(Draft→Recording), stores Recorder in state,
 /// sets current_meeting. Returns the new meeting id. Errors if already recording.
@@ -699,44 +924,142 @@ pub async fn start_recording(
         let recorder = state
             .recorder
             .lock()
-            .map_err(|_| AppError::Audio("recorder mutex poisoned".into()))?;
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if recorder.is_some() {
             return Err(AppError::Audio("already recording".into()));
         }
     }
 
-    // Re-sweep orphaned capture helpers BEFORE spawning this recording's own (same decision logic
-    // as the once-at-launch reaper): an orphan that appeared while THIS app kept running (another
-    // instance crashed / was SIGKILL'd mid-recording) would otherwise capture alongside the new
-    // recording until its 4h self-cap. Safe by construction — a helper owned by any LIVE Murmur
-    // process (including the one this call is about to spawn for) is always spared. Best-effort,
-    // never fails the recording. Hardening 2026-07-16: the sweep shells out to /bin/ps (×2) plus
-    // a per-candidate `kill -0`, so it runs on a BLOCKING worker instead of stalling this async
-    // runtime thread — but it is still AWAITED: the sweep MUST complete before this recording's
-    // own helpers spawn (ordering guarantee unchanged).
-    if let Err(e) =
-        tauri::async_runtime::spawn_blocking(crate::audio::aec::reap_orphaned_capture_helpers)
-            .await
+    if state
+        .recording_starting
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        )
+        .is_err()
     {
-        tracing::warn!(target: "audio", error = %e, "orphan-helper sweep join failed; recording continues");
+        return Err(AppError::Audio(
+            "recording start already in progress".into(),
+        ));
     }
+    let mut recording_starting = RecordingStartingFlag {
+        flag: &state.recording_starting,
+        armed: true,
+    };
 
-    // Fresh recording ⇒ re-arm the 4h-cap rising-edge notice (see `recording_level`). If a previous
-    // recording hit the cap and set this, the next recording must be able to fire the notice again.
-    state
-        .capped_notified
-        .store(false, std::sync::atomic::Ordering::Relaxed);
-    // Fresh recording ⇒ reset the Realtime-Reactions shadow counter (per-recording calibration) and
-    // the per-recording whisper-card dedup set (each recording surfaces a contradiction at most once).
-    state
-        .reactions_shadow_count
-        .store(0, std::sync::atomic::Ordering::Relaxed);
-    if let Ok(mut e) = state.reactions_emitted.lock() {
-        e.clear();
+    // Install recording priority before listener/helper/DB/capture side effects. The owner stays
+    // local through every fallible preparation step, so any early return drops it to Aborted.
+    let mut model_session = crate::perf::begin_recording_session()?;
+    {
+        let app2 = app.clone();
+        tokio::task::spawn_blocking(move || stop_voice_listener(&app2))
+            .await
+            .map_err(|e| AppError::Audio(format!("voice-listener stop worker panicked: {e}")))??;
     }
-    // Brain v2 L4: fresh recording ⇒ fresh running bullets (RAM buffer + delta tracker) — a stale
-    // previous meeting's bullets must never seed the new meeting's substrate or prompt inject.
-    crate::transcribe::bullets::clear_ram(&state.live_bullets, &state.live_bullets_tracker);
+    // Starting atomically closes new unscoped model/egress admission, but a generation admitted
+    // immediately before it may not have spawned its helper PID yet. One kill followed by one long
+    // wait has a check-to-spawn hole: the helper can appear after that kill and burn CPU/RAM for the
+    // whole 30 s. Repeatedly signal the out-of-process Brain, then wait only a short exact-session
+    // slice, under one shared deadline. Quiescence is authoritative; once true, Starting prevents a
+    // late unscoped spawn. Cloud egress simply drains through these slices.
+    let quiescence_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let remaining = quiescence_deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(AppError::Unavailable(
+                "local AI did not quiesce in time to start recording safely".into(),
+            ));
+        }
+        if !crate::reason::sidecar::kill_for_recording_async(
+            remaining.min(std::time::Duration::from_secs(2)),
+        )
+        .await?
+        {
+            return Err(AppError::Unavailable(
+                "on-device Brain could not be proven stopped; recording was not started".into(),
+            ));
+        }
+        let remaining = quiescence_deadline.saturating_duration_since(std::time::Instant::now());
+        if !crate::summarize::claude_code::kill_for_recording(
+            remaining.min(std::time::Duration::from_secs(2)),
+        )
+        .await?
+        {
+            return Err(AppError::Unavailable(
+                "Claude Code could not be proven stopped; recording was not started".into(),
+            ));
+        }
+        let remaining = quiescence_deadline.saturating_duration_since(std::time::Instant::now());
+        if model_session
+            .wait_for_quiescence_async(remaining.min(std::time::Duration::from_millis(50)))
+            .await?
+        {
+            break;
+        }
+    }
+    let afm_reaped = tokio::task::spawn_blocking(|| {
+        crate::reason::afm::reap_unreaped_for_recording(std::time::Duration::from_secs(2))
+    })
+    .await
+    .map_err(|error| {
+        AppError::Other(anyhow::anyhow!(
+            "Apple Foundation Models reap worker panicked: {error}"
+        ))
+    })??;
+    if !afm_reaped {
+        return Err(AppError::Unavailable(
+            "Apple Foundation Models worker could not be proven stopped; recording was not started"
+                .into(),
+        ));
+    }
+    state.reasoner.release_local_cache();
+    crate::embed::release_real_embedder_cache();
+    crate::summarize::ner_deberta::release_all_caches();
+    if !crate::reason::sidecar::kill_for_recording_async(std::time::Duration::from_secs(2)).await? {
+        return Err(AppError::Unavailable(
+            "on-device Brain did not exit in time; recording was not started".into(),
+        ));
+    }
+    let ollama_config = state
+        .config
+        .lock()
+        .map_err(|_| AppError::Unavailable("configuration mutex poisoned".into()))?
+        .clone();
+    let unloaded =
+        crate::summarize::ollama::unload_local_models_for_recording(&ollama_config).await;
+    if unloaded > 0 {
+        tracing::info!(target: "ollama", models = unloaded, "released loopback Ollama models before recording");
+    }
+    if crate::perf::resident_model_quarantine_key(crate::perf::ResidentModelKind::Ollama).is_some()
+    {
+        return Err(AppError::Unavailable(
+            "a previous Ollama generation could not be proven stopped; recording is blocked until a verified unload or app restart"
+                .into(),
+        ));
+    }
+    // A non-cancellable generation may have populated an idle cache while Start waited.
+    state.reasoner.release_local_cache();
+    crate::embed::release_real_embedder_cache();
+    crate::summarize::ner_deberta::release_all_caches();
+    // Re-scan helpers BEFORE spawning this recording's own: a survivor from a crashed/SIGKILL'd
+    // instance must never capture alongside a new session. Cross-process `kill(pid)` is not safe
+    // against PID reuse on Darwin, so this boundary is deliberately detection-only: a live Murmur
+    // child is never touched but still defers this Start, while any orphan/ambiguous target FAILS
+    // CLOSED before the meeting row or capture artifacts are created. Current Swift helpers watch
+    // an exact parent-owned stdin pipe and retain a 4 h wall cap; Brain watches its own protocol
+    // pipe and exits even during a stuck generation. The scan stays on a blocking worker so
+    // process-table probes do not stall Tokio.
+    tauri::async_runtime::spawn_blocking(|| {
+        crate::audio::aec::detect_surviving_capture_helpers(None)
+    })
+    .await
+    .map_err(|error| {
+        AppError::Audio(format!(
+            "surviving-helper detection worker panicked: {error}"
+        ))
+    })??;
 
     let meeting_uuid = uuid::Uuid::new_v4();
     let meeting_id = meeting_uuid.to_string();
@@ -750,6 +1073,43 @@ pub async fn start_recording(
     // generated note's front-matter) UPGRADES it, and the companion-note title-sync then refreshes
     // the note's managed title + link. Local time (matches how the user experiences "when").
     let provisional_title = provisional_meeting_title(&chrono::Local::now());
+
+    let _recording_lifecycle = state
+        .lifecycle
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    // The optimistic check above intentionally happens before the listener-stop await, but it is
+    // same lifecycle exclusion used by install/delete, before creating the meeting row or any
+    // artifact. This check and the final slot install are one synchronous critical section.
+    {
+        let recorder = state
+            .recorder
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if recorder.is_some() {
+            return Err(AppError::Audio("already recording".into()));
+        }
+    }
+    *state
+        .recording_stop
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    // Only the authoritative Start winner may reset per-recording observer state. A concurrent
+    // loser must not clear the active meeting's fault latch, cards or live bullets.
+    state
+        .capped_notified
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    state
+        .capture_fault_notified
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    state
+        .reactions_shadow_count
+        .store(0, std::sync::atomic::Ordering::Relaxed);
+    if let Ok(mut emitted) = state.reactions_emitted.lock() {
+        emitted.clear();
+    }
+    crate::transcribe::bullets::clear_ram(&state.live_bullets, &state.live_bullets_tracker);
 
     // Persist the meeting in RECORDING state up-front so a crash mid-capture leaves a row behind
     // rather than losing the meeting silently. If this process dies before `stop_recording`, that
@@ -767,87 +1127,141 @@ pub async fn start_recording(
         status: MeetingStatus::Recording,
         folder_id: None,
     })?;
+    let mut start_guard = RecordingStartGuard {
+        db: &state.db,
+        meeting_id: meeting_id.clone(),
+        armed: true,
+    };
 
-    // Free the mic from the voice listener (if any) before opening it for the recording.
-    {
-        let app2 = app.clone();
-        let _ = tokio::task::spawn_blocking(move || stop_voice_listener(&app2)).await;
-    }
-
-    // Start mic capture on the configured input device (falls back to default if unset/gone).
+    // PREPARE the mic stream while still paused. No frame may become capturable until a create-new
+    // stable-handle artifact, SQLCipher generation row and sole checkpoint writer all exist.
     let input_device = state
         .config
         .lock()
         .ok()
         .and_then(|c| c.input_device.clone());
-    let recorder = Recorder::start(input_device)?;
-    // STAGE 2 crash-salvage: grab a read-only handle onto the live buffer + the device rate BEFORE the
-    // recorder is moved into state — the spill writer mirrors this handle (never the RT callback).
-    let sample_reader = recorder.sample_reader();
-    let src_rate = recorder.source_sample_rate();
+    let mut prepared = Recorder::prepare(input_device)?;
+    let src_rate = prepared.source_sample_rate();
+    let generation = crate::storage::models::RecordingGenerationKey::fresh(&meeting_id)?;
+    // Resolve every fallible directory component before activation. Once `activate` succeeds the
+    // remaining path contains no `?` until the sole ActiveRecording owner is installed.
+    let recording_inflight_dir = pipeline::recording_inflight_dir()?;
+    let raw_path = recording_inflight_dir.join(format!("{}.mic.f32", generation.generation_id()));
+    let sink = RawF32LeSink::create(raw_path)?;
+    let mic = crate::storage::models::RecordingMicAssertion::for_generation(
+        &generation,
+        src_rate,
+        sink.device(),
+        sink.inode(),
+    )?;
+    let lease = match state
+        .db
+        .prepare_recording_generation(&generation, &mic, RECORDING_LEASE_MS)
     {
-        let mut slot = state
-            .recorder
-            .lock()
-            .map_err(|_| AppError::Audio("recorder mutex poisoned".into()))?;
-        *slot = Some(recorder);
-    }
-    {
-        let mut current = state
-            .current_meeting
-            .lock()
-            .map_err(|_| AppError::Audio("current_meeting mutex poisoned".into()))?;
-        *current = Some(meeting_uuid);
-    }
+        Ok(lease) => lease,
+        Err(error) => {
+            // A transaction/commit failure can be ambiguous. Unlink only after proving that no
+            // generation row exists; otherwise preserve the verified inode for reconciliation.
+            match state.db.get_recording_generation_snapshot(&generation) {
+                Ok(None) => discard_untracked_empty_mic(sink)?,
+                Ok(Some(_)) | Err(_) => tracing::warn!(
+                    target: "audio",
+                    "recording PREPARE failed ambiguously; preserving the empty artifact for recovery"
+                ),
+            }
+            return Err(error);
+        }
+    };
+    let generation_heartbeat = lease.heartbeat();
+    let sample_reader = prepared.sample_reader();
+    let checkpoint_writer = prepared.take_checkpoint_writer()?;
+    let spool = CaptureSpool::start(
+        state.db.clone(),
+        generation.clone(),
+        lease,
+        mic.clone(),
+        sample_reader,
+        checkpoint_writer,
+        sink,
+    )?;
+    let recorder = prepared.activate()?;
 
     // Optionally capture system audio (the other side of the call) alongside the mic.
     // Best-effort: if it can't start, we log and record mic-only — never fail recording.
     // `sys_scratch_for_spill` remembers the far-side scratch path so the crash-salvage sidecar can
     // pair the "others" track at next launch (only set when the system recorder actually started).
-    let mut sys_scratch_for_spill: Option<std::path::PathBuf> = None;
-    {
+    let mut system = {
         let enabled = state
             .config
             .lock()
             .map(|c| c.capture_system_audio)
             .unwrap_or(false);
         if enabled && crate::audio::system::is_available(&app) {
-            let sys_wav = std::env::temp_dir().join(format!("meetnotes-sys-{meeting_id}.wav"));
-            match crate::audio::system::SystemAudioRecorder::start(&app, sys_wav.clone()) {
-                Ok(rec) => {
-                    sys_scratch_for_spill = Some(sys_wav);
-                    if let Ok(mut slot) = state.system_recorder.lock() {
-                        *slot = Some(rec);
-                    }
+            let sys_wav =
+                recording_inflight_dir.join(format!("{}.system.wav", generation.generation_id()));
+            match crate::audio::system::SystemAudioRecorder::start(&app, sys_wav) {
+                Ok(rec) => Some(rec),
+                Err(e) => {
+                    tracing::warn!(
+                        target: "audio", error = %e,
+                        "system-audio capture unavailable; recording mic only"
+                    );
+                    None
                 }
-                Err(e) => tracing::warn!(
-                    target: "audio", error = %e,
-                    "system-audio capture unavailable; recording mic only"
-                ),
             }
+        } else {
+            None
+        }
+    };
+    if let Some(system_recorder) = system.as_ref() {
+        let offset_micros =
+            signed_instant_offset_micros(recorder.started_at(), system_recorder.started_at());
+        if let Err(error) = state.db.set_recording_system_start_offset(
+            &generation,
+            &generation_heartbeat,
+            offset_micros,
+        ) {
+            let outcome = system
+                .take()
+                .ok_or_else(|| AppError::Audio("system recorder ownership was lost".into()))?
+                .stop();
+            crate::audio::source::discard_unaligned_system_stop(&outcome)?;
+            tracing::warn!(target: "audio", error = %error, "system capture alignment was not durable; continuing mic-only");
         }
     }
 
-    // STAGE 2 crash-salvage: mirror the growing RAM mic buffer to an on-disk spill (+ a sidecar naming
-    // the rate + the paired far-side scratch) so a crash / SIGKILL mid-record is recoverable at next
-    // launch (see `audio::spill`). Its own NON-RT writer thread; best-effort — a spill start failure
-    // NEVER fails the recording (the RAM buffer stays the sole primary source until Stop).
-    match crate::audio::spill::SpillWriter::start(
-        &meeting_id,
-        sample_reader,
-        src_rate,
-        sys_scratch_for_spill,
-    ) {
-        Ok(w) => {
-            if let Ok(mut slot) = state.spill_writer.lock() {
-                *slot = Some(w);
-            }
-        }
-        Err(e) => tracing::warn!(
-            target: "audio", error = %e,
-            "crash-salvage spill unavailable; recording on the RAM buffer only"
-        ),
+    // Capture, spool, ledger and system alignment are now prepared. Open Live admission only at
+    // this point, then move the affine owner into the same ActiveRecording value as capture.
+    model_session.transition_to_live()?;
+    let recording_model_token = model_session.token();
+    let active_recording = ActiveRecording::new(
+        meeting_id.clone(),
+        recorder,
+        spool,
+        generation,
+        mic,
+        system,
+        model_session,
+    );
+    // The live thread keeps a generation-bound file handle even after Stop atomically removes the
+    // sole ActiveRecording owner from AppState. That lets an already-ended manual command wait for
+    // the spool's certified prefix instead of turning a Stop race into a fake "nothing heard".
+    let manual_clip_source = active_recording.manual_clip_source();
+
+    {
+        let mut slot = state
+            .recorder
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut current = state
+            .current_meeting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *slot = Some(active_recording);
+        *current = Some(meeting_uuid);
     }
+    recording_starting.disarm();
+    start_guard.disarm();
 
     // NOTE: the live VPIO echo-cancel helper (aeccap) is intentionally NEVER spawned anymore.
     // It is superseded by the OFFLINE AEC pass (`post_aec_enabled`, default OFF — opt-in in
@@ -887,9 +1301,8 @@ pub async fn start_recording(
         // target machines): prefer the largest downloaded live-SAFE model (small → base →
         // tiny); a live-safe CONFIGURED model still works as before; but a medium/large-class
         // configured model is NEVER handed to the live tick — captions are skipped for THIS
-        // recording and the pinned size is downloaded in the background (single-flight,
-        // best-effort) so the next recording — and the wake listener, which reconciles via
-        // `restart_voice_listener` when this recording stops — has it.
+        // recording. Missing live models are downloaded explicitly from Settings while idle;
+        // recording lifecycle code never launches a ~487 MB background transfer beside capture.
         let live_model = match crate::transcribe::model::live_pin_size(
             &cfg.live_model_pin,
             cfg.brain_live,
@@ -921,9 +1334,8 @@ pub async fn start_recording(
                             tracing::warn!(
                                 target: "live",
                                 pin = %size,
-                                "pinned live model absent and only medium/large models downloaded; live captions off for this recording; downloading the pinned model in the background"
+                                "pinned live model absent and only medium/large models downloaded; live captions off for this recording; download a live-safe model from Settings while idle"
                             );
-                            spawn_live_pin_download(size, lang.to_string());
                             None
                         }
                         None => None,
@@ -933,7 +1345,14 @@ pub async fn start_recording(
             None => configured(),
         };
         if let Some(model_path) = live_model {
-            crate::transcribe::live::spawn(app.clone(), model_path, cfg.language.clone());
+            crate::transcribe::live::spawn(
+                app.clone(),
+                meeting_id.clone(),
+                model_path,
+                cfg.language.clone(),
+                recording_model_token,
+                manual_clip_source,
+            );
         }
     }
 
@@ -945,180 +1364,571 @@ pub async fn start_recording(
             meeting_id: Some(meeting_id.clone()),
         },
     );
+    spawn_recording_terminal_watchdog(app.clone(), meeting_id.clone());
 
     Ok(StartResult { meeting_id })
 }
 
-/// Best-effort BACKGROUND download of the pinned LIVE model (T2 default-flip follow-up): a
-/// fresh turbo-default install has no live-safe whisper model on disk, so the first record
-/// start fetches the pinned size (~487 MB `small`) off the recording path. Single-flight (an
-/// `AtomicBool` latch — consecutive record starts while a download is in flight must not race
-/// two writers onto the same `.part` file); failure is logged and re-armed (next record start
-/// retries). Deliberately does NOT spawn the live loop when the download lands mid-meeting:
-/// a belated `live::spawn` could race a NEXT recording's own live loop and clear its
-/// `live_transcript`. The model serves the next recording + the wake listener instead.
-fn spawn_live_pin_download(size: String, language: String) {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
-    if IN_FLIGHT
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
-        return;
+fn signed_instant_offset_micros(
+    mic_started_at: std::time::Instant,
+    system_started_at: std::time::Instant,
+) -> i64 {
+    if system_started_at >= mic_started_at {
+        i64::try_from(system_started_at.duration_since(mic_started_at).as_micros())
+            .unwrap_or(i64::MAX)
+    } else {
+        -i64::try_from(mic_started_at.duration_since(system_started_at).as_micros())
+            .unwrap_or(i64::MAX)
     }
-    tauri::async_runtime::spawn(async move {
-        match crate::transcribe::model::ensure_model(None, &size, &language, |_, _| {}).await {
-            Ok(_) => {
-                tracing::info!(target: "live", pin = %size, "pinned live model downloaded; live captions available from the next recording")
-            }
-            Err(e) => {
-                tracing::warn!(target: "live", pin = %size, error = %e, "pinned live model download failed; will retry on a later record start")
-            }
-        }
-        IN_FLIGHT.store(false, Ordering::SeqCst);
-    });
 }
 
-/// Stop capture, then run the full pipeline (pipeline::run_after_stop). Returns the
-/// exported note path + markdown. Emits status events throughout. Errors if not recording.
+/// Stop capture, then run the full pipeline (pipeline::run_after_stop). Returns the exported note
+/// path + markdown. `companion_flush_completed` is an optional FE durability witness: only explicit
+/// `Some(true)` permits deletion of an empty companion stub; missing/false preserves it. Emits
+/// status events throughout. Errors if not recording.
 #[tauri::command]
 pub async fn stop_recording(
     app: AppHandle,
     state: State<'_, AppState>,
+    companion_flush_completed: Option<bool>,
 ) -> Result<StopResult, AppError> {
-    // Take the recorder out of state (errors if not recording).
-    let recorder = {
-        let mut slot = state
+    let flight =
+        launch_recording_stop_flight(&app, state.inner(), companion_flush_completed, None)?;
+    let result = flight.wait().await.map_err(AppError::Audio)?;
+    ensure_post_await_result_visible(state.inner(), &result.meeting_id)?;
+    Ok(StopResult {
+        meeting_id: result.meeting_id,
+        markdown: result.markdown,
+        exported_path: result.exported_path,
+    })
+}
+
+/// Start (or join) the one detached Stop owner. Backend terminal-capture detection uses the same
+/// seam as the command, so finalization never depends on a live webview or its 100 ms level poll.
+fn launch_recording_stop_flight(
+    app: &AppHandle,
+    state: &AppState,
+    companion_flush_completed: Option<bool>,
+    expected_meeting_id: Option<&str>,
+) -> Result<std::sync::Arc<crate::state::RecordingStopFlight>, AppError> {
+    let (flight, launch) = {
+        // Keep the recorder identity stable through single-flight lookup/creation. An old backend
+        // watcher must never observe meeting A, lose the lock, then create a Stop owner for a
+        // newly-installed meeting B.
+        let recorder = state
             .recorder
             .lock()
-            .map_err(|_| AppError::Audio("recorder mutex poisoned".into()))?;
-        slot.take()
-            .ok_or_else(|| AppError::Audio("not recording".into()))?
-    };
-
-    // STAGE 2 crash-salvage: take the spill writer into a guard whose `Drop` stops the writer thread
-    // and DELETES the plaintext spill + sidecar on EVERY exit path of the pipeline (success,
-    // `?`-error, panic-unwind) — mirroring `pipeline::ScratchWav`. It is MOVED INTO the detached
-    // pipeline task below (2026-07-16) and dropped there right after `run_after_stop` returns, so
-    // its drop timing relative to the pipeline is unchanged (it survives until the archive WAV is
-    // written) — but it is now immune to THIS command future being dropped mid-await (webview
-    // teardown): the spill lives exactly as long as the pipeline that is consuming the audio.
-    // ONLY a process crash (the task never finishes) leaves it behind for next-launch salvage.
-    // A POISONED `spill_writer` mutex (`.lock().ok()` ⇒ None) merely DEFERS this clean-stop cleanup:
-    // the spill lingers to next launch, where `claim_inflight` sees the row is no longer RECORDING and
-    // DiscardOrphans it — benign (no leak, no content loss), so tolerating the poison here is correct.
-    let spill_guard = state.spill_writer.lock().ok().and_then(|mut s| s.take());
-
-    // The recording is definitively over — clear the accumulated live-caption buffer NOW so a
-    // stale tail can never be injected into assistant prompts after Stop (nor keep egressing once
-    // the just-recorded folder is sealed). The authoritative transcript is produced below.
-    crate::transcribe::live::clear_live_transcript(&state.live_transcript);
-    // Brain v2 L4: clear the running-bullets RAM the same way. The crash-recovery `live_bullets`
-    // DB row deliberately SURVIVES this clear — the note pipeline below reads it as the
-    // "Live notes (auto)" Stage-1 input and consumes (clears) it after the note persists.
-    crate::transcribe::bullets::clear_ram(&state.live_bullets, &state.live_bullets_tracker);
-
-    let meeting_uuid = {
-        let mut current = state
-            .current_meeting
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut slot = state
+            .recording_stop
             .lock()
-            .map_err(|_| AppError::Audio("current_meeting mutex poisoned".into()))?;
-        current
-            .take()
-            .ok_or_else(|| AppError::Audio("no current meeting".into()))?
-    };
-    let meeting_id = meeting_uuid.to_string();
-
-    // DOCUMENT-FIRST cleanup (v2 companion note): the "Note" tab EAGERLY creates a companion note to
-    // mount the editor on. If the user never wrote into it, remove it now so an unused recording
-    // leaves no clutter. BEST-EFFORT — a delete failure NEVER fails Stop (and only ever deletes a
-    // body-empty companion note, so no user content is at risk). Runs BEFORE the pipeline reads the
-    // companion body for the summary, so an empty companion correctly falls back to `manual_notes`.
-    if let Err(e) = delete_companion_note_if_empty_inner(state.inner(), &meeting_id).await {
-        tracing::warn!(target: "notes", meeting_id = %meeting_id, error = %e, "empty-companion cleanup skipped (Stop unaffected)");
-    }
-
-    // Capture the mic stream's host start instant BEFORE consuming the recorder — it anchors the
-    // mic ("me") segments onto the absolute timeline in the wall-clock merge (pipeline.rs).
-    let mic_started_at = recorder.started_at();
-    let (samples, src_rate) = recorder.stop()?;
-
-    // Stop the system-audio sidecar (if any) and collect its WAV + host start instant. The
-    // sidecar's start instant anchors the system ("others") segments; the two streams run on
-    // INDEPENDENT clocks, so we merge by wall-clock, not sample count (see audio::merge).
-    let (system_wav, system_started_at) = {
-        let rec = state
-            .system_recorder
-            .lock()
-            .ok()
-            .and_then(|mut slot| slot.take());
-        match rec {
-            Some(r) => {
-                let started = r.started_at();
-                (r.stop().unwrap_or(None), Some(started))
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let (Some(expected), Some(active)) = (expected_meeting_id, recorder.as_ref()) {
+            if active.meeting_id != expected {
+                return Err(AppError::Audio(
+                    "recording Stop request belongs to a stale meeting".into(),
+                ));
             }
-            None => (None, None),
+        }
+        match slot.as_ref() {
+            Some(existing) => (existing.clone(), None),
+            None => {
+                let active_meeting_id = recorder
+                    .as_ref()
+                    .map(|active| active.meeting_id.clone())
+                    .ok_or_else(|| AppError::Audio("not recording".into()))?;
+                if expected_meeting_id.is_some_and(|expected| expected != active_meeting_id) {
+                    return Err(AppError::Audio(
+                        "recording Stop request belongs to a stale meeting".into(),
+                    ));
+                }
+                let created = std::sync::Arc::new(crate::state::RecordingStopFlight::new());
+                *slot = Some(created.clone());
+                (created, Some(active_meeting_id))
+            }
         }
     };
+    if let Some(expected_owner_meeting_id) = launch {
+        let owner_app = app.clone();
+        let monitor_app = app.clone();
+        let completion = flight.clone();
+        // Only the invocation that creates the single-flight owner may authorize cleanup. Missing
+        // (older webview/direct/concurrent/automatic caller) and explicit false both preserve the
+        // stub, so a late companion save can never race a backend delete.
+        let delete_empty_companion = companion_cleanup_allowed(companion_flush_completed);
+        // The monitor awaits a nested task so an owner panic is converted into a completed shared
+        // error instead of leaving every concurrent Stop waiter asleep forever.
+        tauri::async_runtime::spawn(async move {
+            let owner = tauri::async_runtime::spawn(stop_recording_owner(
+                owner_app,
+                delete_empty_companion,
+                expected_owner_meeting_id,
+            ));
+            let outcome = match owner.await {
+                Ok(Ok(result)) => Ok(crate::state::RecordingStopResult {
+                    meeting_id: result.meeting_id,
+                    markdown: result.markdown,
+                    exported_path: result.exported_path,
+                }),
+                Ok(Err(error)) => Err(error.to_string()),
+                Err(error) => Err(format!("recording Stop task crashed: {error}")),
+            };
+            let failed = outcome.is_err();
+            completion.complete(outcome);
+            if failed {
+                let state = monitor_app.state::<AppState>();
+                let mut slot = state
+                    .recording_stop
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if slot
+                    .as_ref()
+                    .is_some_and(|current| std::sync::Arc::ptr_eq(current, &completion))
+                {
+                    *slot = None;
+                }
+            }
+        });
+    }
+    Ok(flight)
+}
 
-    // Stop the AEC mic helper (if any) and collect its WAV — used as the ASR mic feed; None falls
-    // back to the raw cpal mic.
-    let aec_mic_wav = {
-        let rec = state
-            .aec_recorder
-            .lock()
-            .ok()
-            .and_then(|mut slot| slot.take());
-        match rec {
-            Some(r) => r.stop().unwrap_or(None),
-            None => None,
+enum RecordingTerminalTrigger {
+    CaptureFault {
+        fault: crate::audio::recorder::CaptureFault,
+        retained_frames: u64,
+        sample_rate: u32,
+    },
+    Capped,
+}
+
+/// Observe the backend recorder itself, not the renderer. A webview reload/crash, a missed event,
+/// or a hidden window must not leave a self-stopped recorder and its affine spool/model owner stuck
+/// in `AppState`. The meeting id fences this watcher from a later recording.
+fn spawn_recording_terminal_watchdog(app: AppHandle, meeting_id: String) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let trigger = {
+                let state = app.state::<AppState>();
+                let slot = state
+                    .recorder
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let Some(active) = slot.as_ref() else {
+                    return;
+                };
+                if active.meeting_id != meeting_id {
+                    return;
+                }
+                if let Some(fault) = active.fault() {
+                    Some(RecordingTerminalTrigger::CaptureFault {
+                        fault,
+                        retained_frames: active.total_samples() as u64,
+                        sample_rate: active.source_sample_rate(),
+                    })
+                } else if active.cap_reached() {
+                    Some(RecordingTerminalTrigger::Capped)
+                } else {
+                    None
+                }
+            };
+            let Some(trigger) = trigger else {
+                continue;
+            };
+
+            let state = app.state::<AppState>();
+            match trigger {
+                RecordingTerminalTrigger::CaptureFault {
+                    fault,
+                    retained_frames,
+                    sample_rate,
+                } => {
+                    if !state
+                        .capture_fault_notified
+                        .swap(true, std::sync::atomic::Ordering::AcqRel)
+                    {
+                        crate::events::emit_recording_capture_fault(
+                            &app,
+                            fault,
+                            retained_frames,
+                            sample_rate,
+                        );
+                    }
+                }
+                RecordingTerminalTrigger::Capped => {
+                    if !state
+                        .capped_notified
+                        .swap(true, std::sync::atomic::Ordering::AcqRel)
+                    {
+                        crate::events::emit_recording_capped(&app);
+                    }
+                }
+            }
+            let _ = launch_recording_stop_flight(&app, state.inner(), None, Some(&meeting_id));
+            return;
         }
-    };
+    });
+}
 
-    // Duration from the persisted started_at, falling back to a sample-count estimate.
-    let duration_s = compute_duration_s(&state, &meeting_id, samples.len(), src_rate);
+fn companion_cleanup_allowed(companion_flush_completed: Option<bool>) -> bool {
+    companion_flush_completed == Some(true)
+}
 
-    // DETACHED, panic-mapped pipeline execution (2026-07-16). The verified production wedge:
-    // `run_after_stop` was awaited INLINE in this command future, and Tauri never settles the JS
-    // invoke Promise for a command future that PANICS (tokio swallows the panic at the task
-    // boundary) or is DROPPED mid-await — the FE stayed on "Transcribing…" forever with the
-    // meeting row stuck at RECORDING and no terminal event. Running the pipeline in a REAL
-    // spawned task fixes both halves:
-    //   • a pipeline PANIC surfaces here as a `JoinError` → mapped to an `AppError` so the
-    //     invoke Promise REJECTS (FE catch → "error"), and the in-task `TerminalStatusGuard`
-    //     has already persisted `Error` + emitted the terminal `error` event during the unwind;
-    //   • if THIS command future is dropped (webview teardown/reload), the detached task keeps
-    //     running to completion and still performs its own status writes + event emits — the
-    //     (re)loaded FE recovers via the event path even without the Promise.
+async fn delete_empty_companion_after_confirmed_flush(
+    state: &AppState,
+    meeting_id: &str,
+    companion_flush_completed: bool,
+) -> Result<bool, AppError> {
+    if !companion_flush_completed {
+        return Ok(false);
+    }
+    delete_companion_note_if_empty_inner(state, meeting_id).await
+}
+
+async fn stop_recording_owner(
+    app: AppHandle,
+    delete_empty_companion: bool,
+    expected_meeting_id: String,
+) -> Result<StopResult, AppError> {
+    // DETACHED, panic-mapped Stop + pipeline execution. Ownership moves into a real task BEFORE
+    // this command awaits anything, so webview cancellation cannot drop the sole capture/spool
+    // handles. The blocking cpal stop, spool drain/fsync and thread joins run on the blocking pool,
+    // never on a Tokio command worker.
     let task_app = app.clone();
-    let task_meeting_id = meeting_id.clone();
-    let pipeline_task = tauri::async_runtime::spawn(async move {
-        // Owns the crash-salvage spill for exactly the pipeline's lifetime — see the comment at
-        // the `take()` above. Dropped (spill deleted) when this scope exits: success, error, or
-        // panic-unwind — never before the pipeline has finished with the audio.
-        let _spill_guard = spill_guard;
+    let stop_task = tauri::async_runtime::spawn(async move {
+        let guarded_meeting_id = {
+            let state = task_app.state::<AppState>();
+            let slot = state
+                .recorder
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let active_meeting_id = slot
+                .as_ref()
+                .map(|active| active.meeting_id.clone())
+                .ok_or_else(|| AppError::Audio("not recording".into()))?;
+            if active_meeting_id != expected_meeting_id {
+                return Err(AppError::Audio(
+                    "recording Stop owner belongs to a stale meeting".into(),
+                ));
+            }
+            active_meeting_id
+        };
+        // Armed before the affine ActiveRecording owner is taken. Any panic/error in finalization,
+        // companion cleanup, or the later pipeline now clears current_meeting and reaches Error.
         let state = task_app.state::<AppState>();
-        // Armed NOW; disarmed on BOTH normal arms below. Fires ONLY on a panic-unwind (or an
-        // unexpected early exit) — `run_after_stop`'s Err arm already persists `Error` + emits
-        // the `error` stage itself, so there is no double-emit.
         let terminal_guard = pipeline::TerminalStatusGuard::arm(
             Some(task_app.clone()),
             state.db.clone(),
-            &task_meeting_id,
+            &guarded_meeting_id,
         );
-        let result = pipeline::run_after_stop(
+        let mut pending_manual_guard = PendingManualStopGuard {
+            app: task_app.clone(),
+            meeting_id: guarded_meeting_id.clone(),
+            armed: true,
+        };
+        let finish_app = task_app.clone();
+        let mut finish_task = tauri::async_runtime::spawn_blocking(move || {
+            let state = finish_app.state::<AppState>();
+            let _recording_lifecycle = state
+                .lifecycle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut active = {
+                let mut slot = state
+                    .recorder
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                // Same lock order as begin/end_voice_command: recorder -> capture. Latch every
+                // still-armed command at this recording's exact terminal frame before removing the
+                // ActiveRecording. The stable ManualClipSource held by the live thread can then
+                // finish from the durable spool even though the recorder slot is already empty.
+                let observed_stop = slot.as_ref().map(|active| active.total_samples());
+                let mut capture = state
+                    .voice_command_capture
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(capture) = capture.as_mut() {
+                    capture.max_end_sample = latch_manual_end_sample(
+                        capture.start_sample,
+                        capture.max_end_sample,
+                        observed_stop,
+                    );
+                    capture.ended = true;
+                }
+                drop(capture);
+                slot.as_mut()
+                    .ok_or_else(|| AppError::Audio("not recording".into()))?
+                    .transition_model_to_draining()?;
+                slot.take()
+                    .ok_or_else(|| AppError::Audio("not recording".into()))?
+            };
+            let meeting_id = active.meeting_id.clone();
+            let mut finish_failures = 0u8;
+            let (finalized, model_session) = loop {
+                match active.try_finish(&state.db) {
+                    Ok(Some(finalized)) => break finalized,
+                    Ok(None) => {
+                        std::thread::sleep(std::time::Duration::from_millis(25));
+                    }
+                    Err(error) => {
+                        finish_failures = finish_failures.saturating_add(1);
+                        if finish_failures < 3 {
+                            std::thread::sleep(std::time::Duration::from_millis(50));
+                            continue;
+                        }
+                        if let Err(release_error) = active.release_for_recovery(&state.db) {
+                            tracing::warn!(target: "audio", error = %release_error, "failed Stop could not expire its ledger lease; startup recovery will wait for natural expiry");
+                        }
+                        let _ = state
+                            .db
+                            .update_meeting_status(&meeting_id, MeetingStatus::Error);
+                        if let Ok(mut current) = state.current_meeting.lock() {
+                            *current = None;
+                        }
+                        crate::transcribe::live::clear_live_transcript(&state.live_transcript);
+                        crate::transcribe::bullets::clear_ram(
+                            &state.live_bullets,
+                            &state.live_bullets_tracker,
+                        );
+                        return Err(error);
+                    }
+                }
+            };
+            if let Ok(mut current) = state.current_meeting.lock() {
+                *current = None;
+            }
+            let duration_s = compute_duration_s(
+                &state,
+                &meeting_id,
+                finalized.frames as usize,
+                finalized.sample_rate,
+            );
+            Ok((meeting_id, finalized, duration_s, model_session))
+        });
+
+        let finish = match tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            &mut finish_task,
+        )
+        .await
+        {
+            Ok(joined) => joined.map_err(|error| {
+                AppError::Other(anyhow::anyhow!(
+                    "recording finalization task failed: {error}"
+                ))
+            })??,
+            Err(_) => {
+                // `spawn_blocking` cannot be safely aborted. Move its still-owned JoinHandle into
+                // a continuation so ActiveRecording, native threads, spool lease and Draining model
+                // owner remain alive until proven settled. Only then release the generation and
+                // drop model admission; a permanently wedged producer therefore fails closed.
+                let recovery_app = task_app.clone();
+                let recovery_meeting_id = guarded_meeting_id.clone();
+                tauri::async_runtime::spawn(async move {
+                    // The outer guard must be disarmed while the blocking owner is still alive, so
+                    // transfer terminal responsibility to this continuation. A late JoinError or
+                    // panic in its cleanup then still expires recovery ownership, clears the live
+                    // pointers and persists Error instead of leaving a forever-Recording ghost.
+                    let late_terminal_guard = pipeline::TerminalStatusGuard::arm(
+                        Some(recovery_app.clone()),
+                        recovery_app.state::<AppState>().db.clone(),
+                        &recovery_meeting_id,
+                    );
+                    let terminal_cleanup_completed = match finish_task.await {
+                        Ok(Ok((meeting_id, finalized, _duration_s, model_session))) => {
+                            let cleanup_app = recovery_app.clone();
+                            let cleanup = tauri::async_runtime::spawn_blocking(
+                                move || -> Result<(), AppError> {
+                                    let state = cleanup_app.state::<AppState>();
+                                    let _lifecycle = state
+                                        .lifecycle
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                    // These two writes are the durable hand-off from the timed-out Stop
+                                    // owner to startup recovery. Do not disarm TerminalStatusGuard unless
+                                    // BOTH succeeded: a merely non-panicking cleanup is not proof that
+                                    // the generation was released or the meeting left Recording.
+                                    finalized.release_for_recovery(&state.db)?;
+                                    state
+                                        .db
+                                        .update_meeting_status(&meeting_id, MeetingStatus::Error)?;
+                                    if let Ok(mut current) = state.current_meeting.lock() {
+                                        if current.as_ref().map(uuid::Uuid::to_string).as_deref()
+                                            == Some(meeting_id.as_str())
+                                        {
+                                            *current = None;
+                                        }
+                                    }
+                                    crate::transcribe::live::clear_live_transcript(
+                                        &state.live_transcript,
+                                    );
+                                    crate::transcribe::bullets::clear_ram(
+                                        &state.live_bullets,
+                                        &state.live_bullets_tracker,
+                                    );
+                                    drop(model_session);
+                                    Ok(())
+                                },
+                            )
+                            .await;
+                            match cleanup {
+                                Ok(Ok(())) => true,
+                                Ok(Err(error)) => {
+                                    tracing::error!(target: "audio", error = %error, "late Stop recovery could not persist its terminal hand-off");
+                                    false
+                                }
+                                Err(error) => {
+                                    tracing::error!(target: "audio", error = %error, "late Stop recovery worker panicked");
+                                    false
+                                }
+                            }
+                        }
+                        Ok(Err(error)) => {
+                            tracing::warn!(target: "audio", error = %error, "timed-out Stop finished with preserved recovery state");
+                            false
+                        }
+                        Err(error) => {
+                            tracing::error!(target: "audio", error = %error, "timed-out Stop worker panicked");
+                            false
+                        }
+                    };
+                    crate::transcribe::live::fail_pending_manual_for_meeting(
+                        &recovery_app,
+                        &recovery_meeting_id,
+                    );
+                    if terminal_cleanup_completed {
+                        late_terminal_guard.disarm();
+                    }
+                });
+                // The guard must not mutate/expire a generation still owned by the continuation.
+                terminal_guard.disarm();
+                pending_manual_guard.disarm();
+                return Err(AppError::Audio(
+                    "recording Stop exceeded 20 seconds; capture recovery is continuing safely in the background"
+                        .into(),
+                ));
+            }
+        };
+
+        let (meeting_id, finalized, duration_s, mut model_session) = finish;
+        let state = task_app.state::<AppState>();
+
+        // The recorder slot is gone, so the live loop is terminating and Draining admits no new
+        // work. Wait for its exact-token model/egress leases, then reclaim idle caches/sidecar
+        // before opening Postprocess for batch Whisper and note generation.
+        let live_quiescent = model_session
+            .wait_for_quiescence_async(std::time::Duration::from_secs(30))
+            .await?;
+        if !live_quiescent {
+            if let Err(error) = finalized.release_for_recovery(&state.db) {
+                tracing::warn!(target: "audio", error = %error, "live-drain failure could not release finalized generation; recovery will wait for lease expiry");
+            }
+            return Err(AppError::Unavailable(
+                "live local AI did not drain in time; postprocess was not started".into(),
+            ));
+        }
+        state.reasoner.release_local_cache();
+        crate::embed::release_real_embedder_cache();
+        crate::summarize::ner_deberta::release_all_caches();
+        if !crate::reason::sidecar::kill_for_recording_async(std::time::Duration::from_secs(2))
+            .await?
+        {
+            if let Err(error) = finalized.release_for_recovery(&state.db) {
+                tracing::warn!(target: "audio", error = %error, "sidecar-drain failure could not release finalized generation; recovery will wait for lease expiry");
+            }
+            return Err(AppError::Unavailable(
+                "on-device Brain did not exit in time; postprocess was not started".into(),
+            ));
+        }
+        model_session.transition_to_postprocess()?;
+        let recording_model_token = model_session.token().validated_for_postprocess()?;
+
+        // A manual command whose exact audio range became durable while Stop was draining remains
+        // in a single owned AppState slot. Dispatch it now under this recording's exact
+        // Postprocess token and await completion before the batch pipeline can claim the one model
+        // lane. PROCESSING is emitted by the handoff only after its worker was actually accepted.
+        crate::transcribe::live::dispatch_pending_manual_after_stop(
+            &task_app,
+            &meeting_id,
+            recording_model_token.clone(),
+        )
+        .await;
+        pending_manual_guard.disarm();
+        // Keep the visibility-gated live context until the cross-Stop manual command has consumed
+        // it. The final batch transcript is not in SQLite yet, so clearing these buffers before the
+        // owned handoff would make a valid "what did they say?" command answer from an empty note.
+        crate::transcribe::live::clear_live_transcript(&state.live_transcript);
+        crate::transcribe::bullets::clear_ram(&state.live_bullets, &state.live_bullets_tracker);
+
+        // Delete an empty stub only with the FE's explicit durable-flush witness. A missing/false
+        // witness means a save may still be in flight after the bounded FE deadline, so preserve
+        // the row; the late write can then land safely (at worst an unused empty stub remains).
+        if !delete_empty_companion {
+            tracing::info!(target: "notes", meeting_id = %meeting_id, "empty-companion cleanup skipped because durable flush was not confirmed");
+        }
+        if let Err(error) = delete_empty_companion_after_confirmed_flush(
+            &state,
+            &meeting_id,
+            delete_empty_companion,
+        )
+        .await
+        {
+            tracing::warn!(target: "notes", meeting_id = %meeting_id, error = %error, "empty-companion cleanup skipped (Stop unaffected)");
+        }
+
+        // DETACHED, panic-mapped pipeline execution (2026-07-16). The verified production wedge:
+        // `run_after_stop` was awaited INLINE in this command future, and Tauri never settles the JS
+        // invoke Promise for a command future that PANICS (tokio swallows the panic at the task
+        // boundary) or is DROPPED mid-await — the FE stayed on "Transcribing…" forever with the
+        // meeting row stuck at RECORDING and no terminal event. Running the pipeline in a REAL
+        // spawned task fixes both halves:
+        //   • a pipeline PANIC surfaces here as a `JoinError` → mapped to an `AppError` so the
+        //     invoke Promise REJECTS (FE catch → "error"), and the in-task `TerminalStatusGuard`
+        //     has already persisted `Error` + emitted the terminal `error` event during the unwind;
+        //   • if THIS command future is dropped (webview teardown/reload), the detached task keeps
+        //     running to completion and still performs its own status writes + event emits — the
+        //     (re)loaded FE recovers via the event path even without the Promise.
+        let task_meeting_id = meeting_id.clone();
+        let result = pipeline::run_file_backed(
             &task_app,
             &state,
             &task_meeting_id,
-            samples,
-            src_rate,
+            finalized,
             duration_s,
-            system_wav,
-            aec_mic_wav,
-            mic_started_at,
-            system_started_at,
+            Some(recording_model_token),
         )
         .await;
+        let lifecycle_result = match model_session
+            .wait_for_quiescence_async(std::time::Duration::from_secs(30))
+            .await
+        {
+            Ok(true) => {
+                state.reasoner.release_local_cache();
+                crate::embed::release_real_embedder_cache();
+                crate::summarize::ner_deberta::release_all_caches();
+                match crate::reason::sidecar::kill_for_recording_async(
+                    std::time::Duration::from_secs(2),
+                )
+                .await
+                {
+                    Ok(true) => model_session.finish(),
+                    Ok(false) => Err(AppError::Unavailable(
+                        "postprocess Brain did not exit in time".into(),
+                    )),
+                    Err(error) => Err(error),
+                }
+            }
+            Ok(false) => Err(AppError::Unavailable(
+                "postprocess local AI did not drain in time".into(),
+            )),
+            Err(error) => Err(error),
+        };
+        let result = match (result, lifecycle_result) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Ok(_), Err(error)) => Err(error),
+            (Err(error), _) => Err(error),
+        };
         terminal_guard.disarm();
         // Resume voice listening if it's still enabled (the mic is free again). Inside the task
         // (Ok arm only, preserving the pre-change `?` semantics) so it still runs when the outer
@@ -1126,17 +1936,16 @@ pub async fn stop_recording(
         if result.is_ok() {
             restart_voice_listener(task_app.clone());
         }
-        result
+        let result = result?;
+        Ok(StopResult {
+            meeting_id: result.meeting_id,
+            markdown: result.note_markdown,
+            exported_path: result
+                .exported_path
+                .map(|path| path.to_string_lossy().to_string()),
+        })
     });
-    let result = await_pipeline_task(pipeline_task).await?;
-
-    Ok(StopResult {
-        meeting_id: result.meeting_id,
-        markdown: result.note_markdown,
-        exported_path: result
-            .exported_path
-            .map(|p| p.to_string_lossy().to_string()),
-    })
+    await_pipeline_task(stop_task).await
 }
 
 /// Await the detached pipeline task, mapping a join failure (= the pipeline task PANICKED; it is
@@ -1178,24 +1987,6 @@ fn compute_duration_s(
     }
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 /// Ask the in-meeting assistant a CHAT message — the dedicated multi-turn conversation panel. Unlike
 /// the fire-and-forget voice/card path, this RETURNS the reply (a `VoiceActionResult`) so the chat
 /// panel can resolve the in-flight assistant bubble; the live tool-trace streams via `EVENT_CHAT_TOOL`.
@@ -1222,6 +2013,10 @@ pub async fn ask_assistant_chat(
 ) -> Result<crate::voice_action::VoiceActionResult, AppError> {
     let (latest, conversation) = format_chat(&messages)?;
     let thread_id = crate::transcribe::live::ensure_thread_id(thread_id);
+    let visibility = {
+        let state = app.state::<AppState>();
+        capture_content_visibility_snapshot(&state)
+    };
     // note↔meeting-links PR-2 — SOURCE-SCOPED augmentation (PARTIAL, the SHOULD leg). The @brain
     // assistant loop (`run_assistant_query`) is a deep current-first cascade whose tool executor +
     // deterministic floor legs would need wide surgery to fully candidate-constrain; PR-2 threads
@@ -1229,9 +2024,10 @@ pub async fn ask_assistant_chat(
     // corpus injected into its conversation context. `None`/empty ⇒ byte-identical to before. The
     // remaining full candidate-constraint of the floor/tool legs is a documented follow-up.
     let explicit_sources = explicit_sources.filter(|s| !s.is_empty());
-    tokio::task::spawn_blocking(move || {
+    let app_for_task = app.clone();
+    let result = tokio::task::spawn_blocking(move || {
         crate::transcribe::live::run_assistant_query(
-            &app,
+            &app_for_task,
             &latest,
             &conversation,
             crate::events::EVENT_CHAT_TOOL,
@@ -1239,12 +2035,15 @@ pub async fn ask_assistant_chat(
             anchor_text.as_deref(),
             meeting_id.as_deref(),
             explicit_sources.as_deref(),
+            None, // run_assistant_query re-fetches the exact active-meeting token from AppState.
         )
     })
     .await
-    .map_err(|e| AppError::Other(anyhow::anyhow!("chat task join failed: {e}")))
+    .map_err(|e| AppError::Other(anyhow::anyhow!("chat task join failed: {e}")))?;
+    let state = app.state::<AppState>();
+    require_current_content_visibility_snapshot(&state, visibility)?;
+    Ok(result)
 }
-
 
 #[cfg(test)]
 #[path = "tests/chat_format_tests.rs"]
@@ -1278,6 +2077,7 @@ pub async fn update_note(
     meeting_id: String,
     markdown: String,
 ) -> Result<NoteDto, AppError> {
+    let visibility = capture_meeting_content_snapshot(state.inner(), &meeting_id)?;
     // PERF (PR-1 finding 2): `update_note_inner` does the durable seal-on-write upsert + vault
     // re-write AND (Brain v3 gap #1) re-derives the meeting's chunks/vectors via Candle/Metal — a
     // multi-second stall on a long meeting / cold e5 if run INLINE on this async command's Tokio
@@ -1303,6 +2103,7 @@ pub async fn update_note(
     {
         crate::events::emit_org_feed_updated(&app, 1);
     }
+    require_current_meeting_content_snapshot(state.inner(), &meeting_id, &visibility)?;
     Ok(dto)
 }
 
@@ -1321,14 +2122,29 @@ pub(crate) fn overwrite_exported_note_guarded(
     path: &str,
     markdown: &str,
 ) -> Result<(), AppError> {
+    let exported_markdown = if markdown.contains("murmur-attachment://") {
+        let vault = vault_path(state)
+            .ok_or_else(|| AppError::Export("no vault configured for image export".into()))?;
+        render_markdown_with_attachments_for_export_under_lifecycle_authorized(
+            state,
+            &crate::storage::AttachmentOwner::Meeting {
+                meeting_id: meeting_id.to_string(),
+                provider_id: provider_id.to_string(),
+            },
+            markdown,
+            std::path::Path::new(&vault),
+        )?
+    } else {
+        markdown.to_string()
+    };
     let expected = state.db.get_note_exported_hash(meeting_id, provider_id)?;
     let path = std::path::Path::new(path);
     let sibling = crate::export::preserve_external_edit_if_any(path, expected.as_deref())?;
-    crate::export::overwrite_note(path, markdown)?;
+    crate::export::overwrite_note(path, &exported_markdown)?;
     state.db.set_note_exported_hash(
         meeting_id,
         provider_id,
-        Some(&crate::export::note_content_hash(markdown)),
+        Some(&crate::export::note_content_hash(&exported_markdown)),
     )?;
     if sibling.is_some() {
         tracing::info!(
@@ -1453,7 +2269,7 @@ pub(crate) fn update_note_inner(
     meeting_id: &str,
     markdown: &str,
 ) -> Result<NoteDto, AppError> {
-    let embedder = crate::embed::embed_model_present().then(crate::embed::active_embedder);
+    let embedder = crate::embed::active_persistence_embedder_if_available();
     update_note_inner_with(state, meeting_id, markdown, embedder.as_deref())
 }
 
@@ -1549,7 +2365,10 @@ pub(crate) fn update_note_inner_with(
 /// stripped on the next `get_note` read (natural save-time cleanup — see
 /// `commands/notes.rs::get_note_inner`). NO note body is read or written here, so there is no seal /
 /// TOCTOU / lifecycle-guard surface left to reason about.
-pub(crate) fn link_related_notes_inner(_state: &AppState, _meeting_id: &str) -> Result<(), AppError> {
+pub(crate) fn link_related_notes_inner(
+    _state: &AppState,
+    _meeting_id: &str,
+) -> Result<(), AppError> {
     Ok(())
 }
 
@@ -1749,7 +2568,7 @@ pub(crate) fn get_or_create_companion_note_inner(
             }
             // Stamp the front-matter `meeting: "[[…]]"` link on the fresh (empty) note so the
             // document-first editor mounts on a note that already carries the link (no body added).
-            if let Some(row) = state.db.get_note_row(&id)? {
+            if let Some(row) = visible_authored_note_row_snapshot(state, &id)? {
                 let new_markdown = compose_companion_markdown(&row.text, &meeting_name, "");
                 update_note_doc_inner(state, &id, &meeting_name, &new_markdown)?;
             }
@@ -1762,6 +2581,23 @@ pub(crate) fn get_or_create_companion_note_inner(
         note_id,
         meeting_wikilink,
     })
+}
+
+/// Snapshot a visible authored-note row for cross-domain companion helpers. The lifecycle mutex and
+/// content-free anchor ensure title/body/export-path columns are never selected before the folder
+/// gate. Callers that later write re-enter the canonical note update path, which revalidates again.
+fn visible_authored_note_row_snapshot(
+    state: &AppState,
+    note_id: &str,
+) -> Result<Option<crate::storage::db::NoteRow>, AppError> {
+    let _lifecycle = lifecycle_guard(state);
+    let Some((folder_id, _created_at, _updated_at)) = state.db.note_gate_anchor(note_id)? else {
+        return Ok(None);
+    };
+    if !folder_is_unlocked(state, &folder_id)? {
+        return Ok(None);
+    }
+    state.db.get_note_row(note_id)
 }
 
 /// `append_to_companion_note(meeting_id, markdown)` — turn an in-recording jot (or an accepted
@@ -1811,7 +2647,7 @@ pub(crate) fn append_to_companion_note_inner(
     // block appended), and save through the standalone-note update path (re-index + guarded
     // re-export). Read the CURRENT text via the row (the note is in the open root, so no mask). The
     // managed title stays the meeting name — never blank it, never a user-facing title edit.
-    let Some(row) = state.db.get_note_row(&note_id)? else {
+    let Some(row) = visible_authored_note_row_snapshot(state, &note_id)? else {
         return Err(AppError::InvalidArg(format!("no note {note_id}")));
     };
     let new_markdown = compose_companion_markdown(&row.text, &meeting_name, block);
@@ -1878,15 +2714,60 @@ pub(crate) async fn delete_companion_note_if_empty_inner(
     let Some(note_id) = state.db.companion_note_for_meeting(meeting_id)? else {
         return Ok(false); // no companion note was ever created.
     };
-    let Some(row) = state.db.get_note_row(&note_id)? else {
+    let Some(row) = visible_authored_note_row_snapshot(state, &note_id)? else {
         return Ok(false); // race: note vanished → nothing to do.
     };
     // NO-LOSS: only ever delete a note whose BODY is whitespace-only. Any user content ⇒ KEEP it.
     if !companion_body_is_empty(&row.text) {
         return Ok(false);
     }
-    delete_note_inner(state, &note_id).await?;
-    tracing::info!(target: "notes", note_id = %note_id, meeting_id = %meeting_id, "empty companion note deleted");
+    // The revoke can await the network. Re-read under lifecycle afterwards so a concurrent edit
+    // cannot turn this stale empty snapshot into destructive authority.
+    revoke_org_shares_for_source(state, None, Some(&note_id)).await?;
+    delete_companion_after_revoke_if_still_empty(state, meeting_id, &note_id)
+}
+
+fn delete_companion_after_revoke_if_still_empty(
+    state: &AppState,
+    meeting_id: &str,
+    expected_note_id: &str,
+) -> Result<bool, AppError> {
+    let _lifecycle = lifecycle_guard(state);
+    if !meeting_is_unlocked(state, meeting_id)? {
+        return Err(AppError::Locked(
+            "this meeting is locked — unlock it before cleaning up its note".into(),
+        ));
+    }
+    if state.db.companion_note_for_meeting(meeting_id)?.as_deref() != Some(expected_note_id) {
+        return Ok(false);
+    }
+    let Some((folder_id, _created_at, _updated_at)) =
+        state.db.note_gate_anchor(expected_note_id)?
+    else {
+        return Ok(false);
+    };
+    if !folder_is_unlocked(state, &folder_id)? {
+        return Ok(false);
+    }
+    let Some(row) = state.db.get_note_row(expected_note_id)? else {
+        return Ok(false);
+    };
+    if !companion_body_is_empty(&row.text) {
+        return Ok(false);
+    }
+    let owner = crate::storage::AttachmentOwner::Document {
+        document_id: expected_note_id.to_string(),
+    };
+    let attachments = state.db.list_attachments(&owner)?;
+    remove_attachment_exports(
+        &attachments,
+        "could not remove an exported image before deleting the empty companion note",
+    )?;
+    if let Some(path) = &row.exported_path {
+        let _ = std::fs::remove_file(path);
+    }
+    state.db.delete_document(expected_note_id)?;
+    tracing::info!(target: "notes", note_id = %expected_note_id, meeting_id = %meeting_id, "empty companion note deleted");
     Ok(true)
 }
 
@@ -1895,14 +2776,28 @@ pub(crate) async fn delete_companion_note_if_empty_inner(
 /// failure NEVER fails the rename (the meeting title is already persisted). No-op when the meeting
 /// has no companion note. Skips when the companion note's folder is sealed-not-unlocked (never write
 /// plaintext behind a lock — the sync re-applies on the next unlock+append).
+#[cfg(test)]
 pub(crate) fn sync_companion_note_title_best_effort(state: &AppState, meeting_id: &str) {
-    if let Err(e) = sync_companion_note_title(state, meeting_id) {
+    let embedder = crate::embed::active_persistence_embedder_if_available();
+    sync_companion_note_title_best_effort_with(state, meeting_id, embedder.as_deref());
+}
+
+fn sync_companion_note_title_best_effort_with(
+    state: &AppState,
+    meeting_id: &str,
+    embedder: Option<&dyn crate::embed::Embedder>,
+) {
+    if let Err(e) = sync_companion_note_title(state, meeting_id, embedder) {
         // ids only — never the title text.
         tracing::warn!(target: "notes", meeting_id = %meeting_id, error = %e, "companion note title sync failed (meeting title unaffected)");
     }
 }
 
-fn sync_companion_note_title(state: &AppState, meeting_id: &str) -> Result<(), AppError> {
+fn sync_companion_note_title(
+    state: &AppState,
+    meeting_id: &str,
+    embedder: Option<&dyn crate::embed::Embedder>,
+) -> Result<(), AppError> {
     let Some(note_id) = state.db.companion_note_for_meeting(meeting_id)? else {
         return Ok(()); // no companion note — nothing to sync.
     };
@@ -1910,14 +2805,9 @@ fn sync_companion_note_title(state: &AppState, meeting_id: &str) -> Result<(), A
         return Ok(());
     };
     let meeting_name = meeting_display_name(meeting.title.as_deref());
-    let Some(row) = state.db.get_note_row(&note_id)? else {
+    let Some(row) = visible_authored_note_row_snapshot(state, &note_id)? else {
         return Ok(());
     };
-    // Skip a sealed-not-unlocked companion note (its plaintext is blanked; unlocking + a later
-    // append re-applies the correct title/link). `update_note_doc_inner` would refuse anyway.
-    if !folder_is_unlocked(state, &row.folder_id)? {
-        return Ok(());
-    }
     // Nothing to do if the title AND the front-matter link already match (idempotent).
     let (yaml, _body) = crate::storage::db::split_front_matter(&row.text);
     let link_ok = yaml.lines().any(|l| {
@@ -1941,7 +2831,7 @@ fn sync_companion_note_title(state: &AppState, meeting_id: &str) -> Result<(), A
     // Re-write the managed title + refresh the `meeting:` front-matter line; body is UNCHANGED
     // (empty block append). Routes through the guarded update path (re-index + re-export).
     let new_markdown = compose_companion_markdown(&row.text, &meeting_name, "");
-    update_note_doc_inner(state, &note_id, &meeting_name, &new_markdown)?;
+    update_note_doc_inner_with(state, &note_id, &meeting_name, &new_markdown, embedder)?;
     tracing::info!(target: "notes", note_id = %note_id, meeting_id = %meeting_id, "companion note title/link synced");
     Ok(())
 }
@@ -2109,16 +2999,21 @@ fn note_doc_from_row(row: &crate::storage::db::NoteRow) -> NoteDoc {
 
 /// The MASKED (sealed-not-unlocked) editor DTO: identity + timestamps only, NO body/title/tags —
 /// the topic never leaks. Mirrors the masked meeting-detail DTO.
-fn masked_note_doc(row: &crate::storage::db::NoteRow) -> NoteDoc {
+fn masked_note_doc(
+    id: &str,
+    folder_id: &str,
+    created_at: i64,
+    updated_at: Option<i64>,
+) -> NoteDoc {
     NoteDoc {
-        id: row.id.clone(),
+        id: id.to_string(),
         title: "🔒 Locked".into(),
-        folder_id: row.folder_id.clone(),
+        folder_id: folder_id.to_string(),
         markdown: String::new(),
         tags: Vec::new(),
         properties: std::collections::BTreeMap::new(),
-        updated_at: row.updated_at.unwrap_or(row.created_at),
-        created_at: row.created_at,
+        updated_at: updated_at.unwrap_or(created_at),
+        created_at,
         exported_path: None,
         locked: true,
         shared: false,
@@ -2131,14 +3026,28 @@ fn masked_note_doc(row: &crate::storage::db::NoteRow) -> NoteDoc {
 /// vault is configured (a no-op, not an error, so the create/update save path never fails on it).
 /// Idempotent + atomic + collision-suffixed via `export::write_note`.
 fn export_note_to_vault(state: &AppState, id: &str) -> Result<Option<String>, AppError> {
+    let _lifecycle = lifecycle_guard(state);
+    export_note_to_vault_under_lifecycle_authorized(state, id)
+}
+
+/// Vault export for a caller that already owns the non-reentrant lifecycle mutex. The content-free
+/// anchor and gate precede the full row read, and the caller keeps relock serialized through image
+/// plus Markdown publication.
+fn export_note_to_vault_under_lifecycle_authorized(
+    state: &AppState,
+    id: &str,
+) -> Result<Option<String>, AppError> {
+    let Some((folder_id, _created_at, _updated_at)) = state.db.note_gate_anchor(id)? else {
+        return Ok(None); // unknown/non-note id.
+    };
+    // GATE before any title/body/export-path read. The unseal path uses `write_note_to_vault`
+    // directly because its authorization is the CK it just decrypted with.
+    if !folder_is_unlocked(state, &folder_id)? {
+        return Ok(None);
+    }
     let Some(row) = state.db.get_note_row(id)? else {
         return Ok(None); // unknown id.
     };
-    // GATE: never materialize a sealed-not-unlocked note's plaintext on disk. (The unseal path uses
-    // `write_note_to_vault` directly — its authorization is the CK it just decrypted with.)
-    if !folder_is_unlocked(state, &row.folder_id)? {
-        return Ok(None);
-    }
     write_note_to_vault(state, &row)
 }
 
@@ -2178,22 +3087,33 @@ fn write_note_to_vault(
     let created_iso = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(row.created_at)
         .unwrap_or_else(chrono::Utc::now)
         .to_rfc3339();
+    let exported_markdown = render_markdown_with_attachments_for_export_under_lifecycle_authorized(
+        state,
+        &crate::storage::AttachmentOwner::Document {
+            document_id: row.id.clone(),
+        },
+        &row.text,
+        vault_root,
+    )?;
     let path = crate::export::write_note(
         vault_root,
         Some(&subfolder),
         &title,
         &created_iso,
-        &row.text,
+        &exported_markdown,
     )?;
     let path_str = path.to_string_lossy().to_string();
-    state.db.set_note_doc_exported_path(&row.id, Some(&path_str))?;
+    state
+        .db
+        .set_note_doc_exported_path(&row.id, Some(&path_str))?;
     // Export-collision guard: stamp the baseline from the text this export wrote. `write_note`
     // never overwrites different content (it collision-suffixes), so the file at `path` is
     // byte-equal to `row.text` in every branch — including the unlock/remove-lock re-export,
     // where any pre-lock baseline is stale and must be re-stamped fresh.
-    state
-        .db
-        .set_note_doc_exported_hash(&row.id, Some(&crate::export::note_content_hash(&row.text)))?;
+    state.db.set_note_doc_exported_hash(
+        &row.id,
+        Some(&crate::export::note_content_hash(&exported_markdown)),
+    )?;
     Ok(Some(path_str))
 }
 
@@ -2211,9 +3131,7 @@ fn index_note_body_chunks(
     embedder: Option<&dyn crate::embed::Embedder>,
 ) -> Result<(), AppError> {
     let (_yaml, body) = crate::storage::db::split_front_matter(markdown);
-    state
-        .db
-        .index_note_chunks(id, title, &body, embedder)
+    state.db.index_note_chunks(id, title, &body, embedder)
 }
 
 // ── NOTES — auto-organize (WP5) ──────────────────────────────────────────────────────────────────
@@ -2231,6 +3149,7 @@ pub async fn plan_organize_notes(
     state: State<'_, AppState>,
     folder_id: Option<String>,
 ) -> Result<OrganizePlan, AppError> {
+    let visibility = capture_content_visibility_snapshot(state.inner());
     let config = {
         state
             .config
@@ -2258,7 +3177,11 @@ pub async fn plan_organize_notes(
         .map(|f| (f.id.clone(), f.name.clone()))
         .collect();
 
-    let provider = crate::summarize::provider_for(crate::summarize::roles::Role::Notes, &config, &state.heavy_inference)?;
+    let provider = crate::summarize::provider_for(
+        crate::summarize::roles::Role::Notes,
+        &config,
+        &state.heavy_inference,
+    )?;
 
     let mut moves = Vec::new();
     for n in &notes {
@@ -2271,6 +3194,7 @@ pub async fn plan_organize_notes(
             &existing_names,
         )
         .await;
+        require_current_content_visibility_snapshot(state.inner(), visibility)?;
         let Some(to_folder) = target else {
             continue; // model declined / unusable → leave this note where it is.
         };
@@ -2293,6 +3217,7 @@ pub async fn plan_organize_notes(
             reason: "content-based filing".to_string(),
         });
     }
+    require_current_content_visibility_snapshot(state.inner(), visibility)?;
     Ok(OrganizePlan { moves })
 }
 
@@ -2375,12 +3300,58 @@ pub async fn delete_meeting(
 
 /// Inner of [`delete_meeting`] taking `&AppState` (unit-testable). `async` for the org-share revoke
 /// cascade (network round-trip); the file/DB cascade itself stays synchronous internally.
-pub(crate) async fn delete_meeting_inner(state: &AppState, meeting_id: &str) -> Result<(), AppError> {
+pub(crate) async fn delete_meeting_inner(
+    state: &AppState,
+    meeting_id: &str,
+) -> Result<(), AppError> {
+    // Gate before the network revoke without selecting title/audio/note content. The await below can
+    // span a relock, so this is only the early refusal; destructive authority is reacquired below.
+    {
+        let _lifecycle = lifecycle_guard(state);
+        ensure_no_active_salvage_for_meeting(state, meeting_id)?;
+        if state.db.get_meeting_gate_anchor(meeting_id)?.is_none() {
+            return Ok(());
+        }
+        if !meeting_is_unlocked(state, meeting_id)? {
+            return Err(AppError::Locked(
+                "this meeting is locked — unlock it before deleting it".into(),
+            ));
+        }
+    }
     // REVOKE-BEFORE-DELETE (Bug A root cause): tear down every LIVE org share of this exact meeting
     // BEFORE the local rows disappear, so the background org-sync tick can never re-pull a still-live
     // server item back into the local replica after the user asked to delete it. Fails LOUD: a revoke
     // failure (e.g. offline) aborts the delete rather than silently leaving a dangling live share.
     revoke_org_shares_for_source(state, Some(meeting_id), None).await?;
+
+    // Serialize against Start/Stop/seal. The content-free generation preflight MUST happen before
+    // the first unlink; Db::delete_meeting repeats it transactionally before row deletion.
+    let _lifecycle = lifecycle_guard(state);
+    ensure_no_active_salvage_for_meeting(state, meeting_id)?;
+    if state.db.get_meeting_gate_anchor(meeting_id)?.is_none() {
+        return Ok(());
+    }
+    if !meeting_is_unlocked(state, meeting_id)? {
+        return Err(AppError::Locked(
+            "this meeting was locked while revoking its shares — unlock it and retry deletion"
+                .into(),
+        ));
+    }
+    reconcile_released_generation_cleanup(state, meeting_id)?;
+    if state
+        .db
+        .meeting_has_recording_recovery_ownership(meeting_id)?
+    {
+        return Err(AppError::Audio(
+            "cannot delete a meeting while recording recovery owns its artifacts".into(),
+        ));
+    }
+
+    let attachment_rows = state.db.attachments_for_meeting(meeting_id)?;
+    remove_attachment_exports(
+        &attachment_rows,
+        "could not remove an exported image before deleting the meeting",
+    )?;
 
     // Capture + remove on-disk files before the rows disappear (best-effort).
     // C4: the playback audio may exist as BOTH the plaintext WAV *and* its sealed `.enc` at once —
@@ -2420,6 +3391,21 @@ pub(crate) fn remove_rollup_export_files(paths: &[String]) {
     }
 }
 
+/// Lock-critical variant: remove every recorded rollup export BEFORE the transaction purges the
+/// rows that carry those paths. This ordering makes an unlink failure retryable and closes the
+/// crash window where DB-first purge permanently forgot a plaintext vault file.
+pub(crate) fn remove_rollup_exports_before_seal_purge(db: &Db) -> Result<(), AppError> {
+    for rollup in db.list_memory_rollups()? {
+        if let Some(path) = rollup.exported_path.as_deref() {
+            crate::crypto::remove_file_verified_absent(
+                std::path::Path::new(path),
+                "remove memory-rollup export before sealed-content purge",
+            )?;
+        }
+    }
+    Ok(())
+}
+
 /// C4 — remove ALL on-disk forms of one at-rest audio path (best-effort). A path recorded in the DB
 /// may be the plaintext WAV OR its sealed `.enc`, and during a session-unlock BOTH coexist (the
 /// unseal decrypts the `.enc` to a playable WAV but keeps the `.enc`). So deleting a meeting must
@@ -2452,7 +3438,7 @@ pub async fn rename_meeting(
     let heavy_inference = state.heavy_inference.clone();
     crate::perf::run_heavy(&heavy_inference, move || -> Result<(), AppError> {
         let state = app.state::<AppState>();
-        let embedder = crate::embed::embed_model_present().then(crate::embed::active_embedder);
+        let embedder = crate::embed::active_persistence_embedder_if_available();
         rename_meeting_inner(&state, &meeting_id, &title, embedder.as_deref())
     })
     .await
@@ -2476,7 +3462,7 @@ pub(crate) fn rename_meeting_inner(
     state.db.set_meeting_title(meeting_id, title)?;
     // Keep the companion note's managed title + front-matter `[[Meeting]]` link in sync with the new
     // title. Best-effort — a sync failure NEVER fails the rename (the title is already persisted).
-    sync_companion_note_title_best_effort(state, meeting_id);
+    sync_companion_note_title_best_effort_with(state, meeting_id, embedder);
     // Brain v3 (audit gap #4): refresh chunk headers/vectors so they carry the NEW title.
     // Best-effort + sealed-folder gate inside (empty unlock set); never fails the rename.
     reindex_meeting_after_edit(state, meeting_id, embedder);
@@ -2529,13 +3515,7 @@ pub async fn chat_meeting(
     if question.trim().is_empty() {
         return Err(AppError::InvalidArg("question is empty".into()));
     }
-    // D4 READ-GATE: a sealed-and-not-unlocked meeting's transcript is blanked; refuse to chat over
-    // it (it would otherwise answer from an empty transcript or leak via the provider). Fail closed.
-    if !meeting_is_unlocked(state.inner(), &meeting_id)? {
-        return Err(AppError::Locked(
-            "this meeting's folder is locked — unlock it to chat about this meeting".into(),
-        ));
-    }
+    let visibility = capture_meeting_content_snapshot(state.inner(), &meeting_id)?;
     let segments = state.db.get_segments(&meeting_id)?;
     if segments.is_empty() {
         return Err(AppError::InvalidArg(
@@ -2587,14 +3567,10 @@ pub async fn chat_meeting(
         &question,
         &memory_brief,
     );
-    provider.complete(&system, &user).await
+    let answer = provider.complete(&system, &user).await?;
+    require_current_meeting_content_snapshot(state.inner(), &meeting_id, &visibility)?;
+    Ok(answer)
 }
-
-
-
-
-
-
 
 /// Per-meeting open/done action-item counts across the VISIBLE library, for the saved-views meetings
 /// surface. GATED: routes the LIVE session unlock set through `Db::list_meeting_action_summaries`
@@ -2618,13 +3594,7 @@ pub async fn run_recipe(
     if prompt.trim().is_empty() {
         return Err(AppError::InvalidArg("recipe prompt is empty".into()));
     }
-    // BLK-2b READ-GATE: a sealed-and-not-unlocked meeting's transcript is blanked; refuse to run a
-    // recipe over it (would feed a cloud provider blank/garbage and depend on at-rest blanking).
-    if !meeting_is_unlocked(state.inner(), &meeting_id)? {
-        return Err(AppError::Locked(
-            "this meeting's folder is locked — unlock it to run a recipe".into(),
-        ));
-    }
+    let visibility = capture_meeting_content_snapshot(state.inner(), &meeting_id)?;
     let segments = state.db.get_segments(&meeting_id)?;
     if segments.is_empty() {
         return Err(AppError::InvalidArg(
@@ -2644,10 +3614,16 @@ pub async fn run_recipe(
             .map_err(|_| AppError::Config("config mutex poisoned".into()))?
             .clone()
     };
-    let provider = crate::summarize::provider_for(crate::summarize::roles::Role::Notes, &config, &state.heavy_inference)?;
+    let provider = crate::summarize::provider_for(
+        crate::summarize::roles::Role::Notes,
+        &config,
+        &state.heavy_inference,
+    )?;
     let (system, user) =
         crate::summarize::recipes::build_recipe_prompt(&transcript, &prompt, &config.note_language);
-    provider.complete(&system, &user).await
+    let artifact = provider.complete(&system, &user).await?;
+    require_current_meeting_content_snapshot(state.inner(), &meeting_id, &visibility)?;
+    Ok(artifact)
 }
 
 /// Parse a meeting note's "## Action items" checklist into structured items.
@@ -2777,18 +3753,25 @@ pub fn pin_moment(
 ///
 /// Returns the extracted `GraphPayload`. The caller decides whether extraction failures are fatal
 /// (the `link_meeting_entities` command surfaces them; the pipeline hook swallows them).
-pub async fn build_and_persist_entities(
+pub(crate) async fn build_and_persist_entities(
     app: &AppHandle,
     state: &AppState,
     meeting_id: &str,
     title: &str,
     markdown: &str,
+    recording_model_token: Option<crate::perf::RecordingSessionToken>,
 ) -> Result<crate::summarize::graph::GraphPayload, AppError> {
+    let visibility = capture_meeting_content_snapshot(state, meeting_id)?;
     // COMPANION NOTE title sync (2026-07-16): every pipeline finish path calls this AFTER the
     // meeting's final title is persisted (auto-title-on-close via `set_meeting_title`), so this is
     // the one funnel to refresh a companion note's managed title + `[[Meeting]]` front-matter link
     // to the final title. Best-effort — never fails the graph/note (which already succeeded).
-    sync_companion_note_title_best_effort(state, meeting_id);
+    // Keep this async orchestration model-free. In recording Postprocess an unscoped embedder is
+    // correctly refused by the session token; outside recording it would run synchronous Metal on
+    // the async worker and could select a second model after the pipeline's meeting index. The
+    // `None` path still clean-replaces companion chunks + FTS and PURGES stale vectors; the bounded
+    // repair tick fills real vectors later.
+    sync_companion_note_title_best_effort_with(state, meeting_id, None);
     let config = {
         state
             .config
@@ -2796,7 +3779,19 @@ pub async fn build_and_persist_entities(
             .map_err(|_| AppError::Config("config mutex poisoned".into()))?
             .clone()
     };
-    let provider = crate::summarize::provider_for(crate::summarize::roles::Role::Notes, &config, &state.heavy_inference)?;
+    let provider = match recording_model_token.clone() {
+        Some(token) => crate::summarize::provider_for_recording(
+            crate::summarize::roles::Role::Notes,
+            &config,
+            &state.heavy_inference,
+            token,
+        )?,
+        None => crate::summarize::provider_for(
+            crate::summarize::roles::Role::Notes,
+            &config,
+            &state.heavy_inference,
+        )?,
+    };
     let entities_started = std::time::Instant::now();
     let payload =
         crate::summarize::graph::extract_entities(provider.as_ref(), title, markdown).await?;
@@ -2810,6 +3805,8 @@ pub async fn build_and_persist_entities(
     // Sink A — ALWAYS persist to the encrypted DB (the graph's source of truth). Collect the
     // resolved (entity_id, name) pairs so the bitemporal-facts pass below can extract + reconcile
     // facts ABOUT these very entities.
+    let lifecycle = lifecycle_guard(state);
+    require_current_meeting_content_snapshot_under_lifecycle(state, meeting_id, &visibility)?;
     let mut entity_refs: Vec<(String, String)> = Vec::new();
     for p in &payload.people {
         let id = state
@@ -2825,6 +3822,7 @@ pub async fn build_and_persist_entities(
         state.db.add_mention(&id, meeting_id)?;
         entity_refs.push((id, pr.clone()));
     }
+    drop(lifecycle);
 
     // brain2 R2 — BITEMPORAL FACTS + Phase 3 CROSS-MEETING USER MEMORY. Both are BEST-EFFORT +
     // NEVER fail the note: extract entity·predicate·object / user-preference candidates via the
@@ -2843,6 +3841,8 @@ pub async fn build_and_persist_entities(
     let title_owned = title.to_string();
     let markdown_owned = markdown.to_string();
     let entity_refs_owned = entity_refs.clone();
+    let facts_model_token = recording_model_token;
+    let facts_visibility = visibility.clone();
     let facts_started = std::time::Instant::now();
     if let Err(e) = crate::perf::run_heavy(&state.heavy_inference, move || -> Result<(), AppError> {
         let state = app_for_facts.state::<AppState>();
@@ -2853,13 +3853,22 @@ pub async fn build_and_persist_entities(
             &title_owned,
             &markdown_owned,
             &entity_refs_owned,
+            facts_model_token.as_ref(),
+            &facts_visibility,
         ) {
             tracing::warn!(target: "facts", error = %e, "fact reconcile failed (note unaffected)");
         }
         tracing::info!(target: "perf", stage = "persist_facts", elapsed_ms = t0.elapsed().as_millis() as u64, "pipeline stage complete");
         let t1 = std::time::Instant::now();
         if let Err(e) =
-            persist_user_facts_for_meeting(&state, &meeting_id_owned, &title_owned, &markdown_owned)
+            persist_user_facts_for_meeting(
+                &state,
+                &meeting_id_owned,
+                &title_owned,
+                &markdown_owned,
+                facts_model_token.as_ref(),
+                &facts_visibility,
+            )
         {
             tracing::warn!(target: "user_memory", error = %e, "user-fact reconcile failed (note unaffected)");
         }
@@ -2877,6 +3886,8 @@ pub async fn build_and_persist_entities(
         "pipeline stage complete"
     );
 
+    let _lifecycle = lifecycle_guard(state);
+    require_current_meeting_content_snapshot_under_lifecycle(state, meeting_id, &visibility)?;
     // Sink B — vault [[ ]] stubs, ONLY when a vault is configured AND the meeting's folder is
     // NOT sealed on disk. Disk-truth `locked` (not session `unlocked`): a session-unlock must
     // never re-write encrypted-content stubs back to plaintext on disk.
@@ -2970,9 +3981,7 @@ fn note_file_for(state: &AppState, meeting_id: &str) -> Result<Option<(String, S
 /// discipline; see the `crate::audit` module doc) on a blocking worker, then ping the FE inbox.
 /// Zero egress, zero LLM.
 #[tauri::command]
-pub async fn run_vault_audit(
-    app: AppHandle,
-) -> Result<crate::audit::AuditRunSummary, AppError> {
+pub async fn run_vault_audit(app: AppHandle) -> Result<crate::audit::AuditRunSummary, AppError> {
     let handle = app.clone();
     let mut summary = tokio::task::spawn_blocking(move || {
         let state = handle.state::<AppState>();
@@ -3025,6 +4034,7 @@ pub(crate) async fn explain_audit_finding_inner(
     state: &AppState,
     id: &str,
 ) -> Result<crate::audit::AuditExplanation, AppError> {
+    let visibility = capture_content_visibility_snapshot(state);
     let row = state
         .db
         .get_audit_finding(id)?
@@ -3062,7 +4072,9 @@ pub(crate) async fn explain_audit_finding_inner(
             .db
             .get_note_if_visible(&row.source_id, &unlocked)?
             .map(|n| n.markdown),
-        _ => state.db.note_markdown_if_visible(&row.source_id, &unlocked)?,
+        _ => state
+            .db
+            .note_markdown_if_visible(&row.source_id, &unlocked)?,
     }
     .ok_or_else(|| {
         AppError::Locked("this finding's source is locked — unlock it to explain".into())
@@ -3080,6 +4092,14 @@ pub(crate) async fn explain_audit_finding_inner(
         chars = explanation_md.len(),
         "audit finding explained"
     );
+    let _lifecycle = lifecycle_guard(state);
+    require_current_content_visibility_snapshot_under_lifecycle(state, visibility)?;
+    let unlocked = unlocked_snapshot(state)?;
+    if !audit_row_visible(state, &row, &unlocked)? {
+        return Err(AppError::Locked(
+            "this finding's source was locked while the explanation was generated".into(),
+        ));
+    }
     // RETURN-ONLY — nothing stored.
     Ok(crate::audit::AuditExplanation {
         finding_id: row.id,
@@ -3191,14 +4211,18 @@ pub(crate) fn rederive_links_for_folder(
                 }
                 if crate::embed::embed_model_present() {
                     if let Err(e) =
-                        state.db.auto_link_semantic(crate::links::LinkKind::Meeting, &mid, unlocked)
+                        state
+                            .db
+                            .auto_link_semantic(crate::links::LinkKind::Meeting, &mid, unlocked)
                     {
                         tracing::warn!(target: "links", error = %e, "unlock semantic re-derive (meeting) failed");
                     }
                 }
             }
         }
-        Err(e) => tracing::warn!(target: "links", error = %e, "unlock link re-derive: meeting-id list failed"),
+        Err(e) => {
+            tracing::warn!(target: "links", error = %e, "unlock link re-derive: meeting-id list failed")
+        }
     }
     // Documents/notes in the folder → re-index authored notes' wikilinks + semantic neighbours (a raw
     // document has no wikilinks but still gets a semantic pass over its chunks).
@@ -3217,14 +4241,18 @@ pub(crate) fn rederive_links_for_folder(
                 }
                 if crate::embed::embed_model_present() {
                     if let Err(e) =
-                        state.db.auto_link_semantic(crate::links::LinkKind::Note, &did, unlocked)
+                        state
+                            .db
+                            .auto_link_semantic(crate::links::LinkKind::Note, &did, unlocked)
                     {
                         tracing::warn!(target: "links", error = %e, "unlock semantic re-derive (doc) failed");
                     }
                 }
             }
         }
-        Err(e) => tracing::warn!(target: "links", error = %e, "unlock link re-derive: document-id list failed"),
+        Err(e) => {
+            tracing::warn!(target: "links", error = %e, "unlock link re-derive: document-id list failed")
+        }
     }
     // Fix 2 (brain-v3 audit) — COMPANION leg: the note↔meeting `companion` edge is NOT re-derived by
     // the wikilink/semantic passes above (it comes from `documents.meeting_id`, not the body), is NOT
@@ -3234,15 +4262,19 @@ pub(crate) fn rederive_links_for_folder(
     // filed in a different folder). Best-effort; the DB helper skips any sealed-at-rest endpoint.
     match state.db.meeting_ids_in_folder(folder_id) {
         Ok(mids) => {
-            if let Err(e) = state.db.rederive_companion_links_for_folder(folder_id, &mids) {
+            if let Err(e) = state
+                .db
+                .rederive_companion_links_for_folder(folder_id, &mids)
+            {
                 tracing::warn!(target: "links", error = %e, "unlock companion re-derive failed");
             }
             // Fix 3 (brain-v3 audit) — INBOUND leg: re-index every OUTSIDE source whose body links
             // `[[title]]` INTO a just-unsealed item, so a link from a note that may never be edited
             // again is restored (the seal purged the edge from the sealed side; rederive only touched
             // F's OWN sources). Best-effort; Fix 0 keeps it from naming any still-sealed target.
-            if let Err(e) =
-                state.db.rederive_inbound_wikilinks_for_folder(folder_id, &mids, unlocked)
+            if let Err(e) = state
+                .db
+                .rederive_inbound_wikilinks_for_folder(folder_id, &mids, unlocked)
             {
                 tracing::warn!(target: "links", error = %e, "unlock inbound wikilink re-derive failed");
             }
@@ -3256,10 +4288,14 @@ pub(crate) fn rederive_links_for_folder(
                 .rematerialize_accepted_markers_for_folder(folder_id, &mids, unlocked)
             {
                 Ok(changed) => reexport_stripped_marker_sources(state, &changed),
-                Err(e) => tracing::warn!(target: "links", error = %e, "unlock accepted-marker re-materialize failed"),
+                Err(e) => {
+                    tracing::warn!(target: "links", error = %e, "unlock accepted-marker re-materialize failed")
+                }
             }
         }
-        Err(e) => tracing::warn!(target: "links", error = %e, "unlock companion re-derive: meeting-id list failed"),
+        Err(e) => {
+            tracing::warn!(target: "links", error = %e, "unlock companion re-derive: meeting-id list failed")
+        }
     }
 }
 
@@ -3302,6 +4338,7 @@ pub async fn ask_vault(
     if question.trim().is_empty() {
         return Err(AppError::InvalidArg("question is empty".into()));
     }
+    let visibility = capture_content_visibility_snapshot(state.inner());
     let config = {
         state
             .config
@@ -3329,7 +4366,7 @@ pub async fn ask_vault(
                 .reasoner
                 .current_for(crate::summarize::roles::Role::Ask),
         );
-        return ask_vault_floor(
+        let result = ask_vault_floor(
             &state.db,
             &config,
             &unlocked,
@@ -3341,7 +4378,9 @@ pub async fn ask_vault(
             pinned_sources,
             pinned_org,
         )
-        .await;
+        .await?;
+        require_current_content_visibility_snapshot(state.inner(), visibility)?;
+        return Ok(result);
     }
 
     // Agentic path — CLOUD-connection roles only (the same rule as the in-meeting brain:
@@ -3363,6 +4402,7 @@ pub async fn ask_vault(
         .await
         .map_err(|e| AppError::Other(anyhow::anyhow!("ask task join failed: {e}")))?;
         if let Some(result) = attempt {
+            require_current_content_visibility_snapshot(state.inner(), visibility)?;
             return Ok(result);
         }
     }
@@ -3383,7 +4423,7 @@ pub async fn ask_vault(
             .reasoner
             .current_for(crate::summarize::roles::Role::Ask),
     );
-    ask_vault_floor(
+    let result = ask_vault_floor(
         &state.db,
         &config,
         &unlocked,
@@ -3395,13 +4435,10 @@ pub async fn ask_vault(
         None, // whole-vault path: no explicit sources ⇒ the existing search corpus, unchanged.
         None, // …and no pinned org item — this is the vault-wide fallthrough.
     )
-    .await
+    .await?;
+    require_current_content_visibility_snapshot(state.inner(), visibility)?;
+    Ok(result)
 }
-
-
-
-
-
 
 /// The floor's prompt assembly, split from the provider call so the floor-equivalence test can
 /// prove it byte-identical to the pre-agentic implementation without a live provider.
@@ -3415,7 +4452,6 @@ pub(crate) enum AskFloorPrompt {
         sources: Vec<crate::storage::models::VaultSource>,
     },
 }
-
 
 /// THE FLOOR — the pre-agentic Ask-My-Vault implementation: gated corpus pack + ONE provider
 /// completion, with the original error/consent semantics (`make_provider`'s fail-closed consent
@@ -3509,6 +4545,7 @@ pub async fn entity_dossier(
     state: State<'_, AppState>,
     entity: String,
 ) -> Result<EntityDossierResult, AppError> {
+    let visibility = capture_content_visibility_snapshot(state.inner());
     let config = {
         state
             .config
@@ -3527,8 +4564,13 @@ pub async fn entity_dossier(
     // Build the provider (firewall + consent gate) BEFORE synthesizing — the factory refuses a
     // cloud provider until the user has consented to egress. NOTES role (the dossier is a
     // written synthesis); the corpus budget keys on the same resolved connection.
-    let provider = crate::summarize::provider_for(crate::summarize::roles::Role::Notes, &config, &state.heavy_inference)?;
+    let provider = crate::summarize::provider_for(
+        crate::summarize::roles::Role::Notes,
+        &config,
+        &state.heavy_inference,
+    )?;
     let markdown = provider.complete(&system, &user).await?;
+    require_current_content_visibility_snapshot(state.inner(), visibility)?;
     Ok(EntityDossierResult {
         markdown,
         has_org_context,
@@ -3732,10 +4774,10 @@ pub(crate) fn save_config_inner(state: &AppState, config: AppConfigDto) -> Resul
         crate::summarize::gateway::validate_gateway_url(&config.share_base_url)?;
     }
 
-    // Merge against the CURRENT config under the config lock so the security-sensitive flags that
-    // save_config must NOT be able to flip from the DTO (BLK-4: cloud_egress_consented) are read
-    // from the live value, not the incoming payload. Holding the guard across the merge+save+swap
-    // makes it atomic w.r.t. a concurrent `consent_to_cloud_egress`.
+    // Generic Settings cannot change `embed_model_id`: `dto_to_config` preserves it from this
+    // mutex-protected cache, while the dedicated selector takes the model-selection write barrier
+    // before taking the same mutex. Do not make an unrelated Settings save wait behind a minutes-
+    // long reindex persistence handle.
     let mut cache = state
         .config
         .lock()
@@ -4075,13 +5117,6 @@ fn dto_to_config(d: AppConfigDto, current: &AppConfig) -> AppConfig {
     }
 }
 
-
-
-
-
-
-
-
 /// Re-run summarize+export for an existing meeting with the configured provider, reusing
 /// the meeting's stored transcript segments (Detail "re-summarize"/"re-export" seed —
 /// wired in P0, UI optional).
@@ -4125,6 +5160,7 @@ pub async fn resummarize(
     {
         crate::events::emit_org_feed_updated(&app, 1);
     }
+    ensure_post_await_result_visible(state.inner(), &result.meeting_id)?;
     Ok(StopResult {
         meeting_id: result.meeting_id,
         markdown: result.note_markdown,
@@ -4177,6 +5213,8 @@ pub async fn retry_transcription(
     });
     let result = await_pipeline_task(pipeline_task).await?;
 
+    ensure_post_await_result_visible(state.inner(), &result.meeting_id)?;
+
     Ok(StopResult {
         meeting_id: result.meeting_id,
         markdown: result.note_markdown,
@@ -4193,7 +5231,14 @@ pub(crate) fn retry_transcription_prep(
     state: &AppState,
     meeting_id: &str,
 ) -> Result<std::path::PathBuf, AppError> {
-    // No retry while a recording is in progress (mirror of `start_recording`'s own check).
+    // No retry while any recording lifecycle owns priority. Checking only the recorder slot misses
+    // Starting (priority installed before capture) and Draining/Postprocess (slot already taken),
+    // which would let recovery ASR race capture preparation or the live Stop pipeline.
+    if crate::perf::recording_has_priority() {
+        return Err(AppError::Audio(
+            "a recording is in progress — stop it before retrying transcription".into(),
+        ));
+    }
     {
         let recorder = state
             .recorder
@@ -4205,10 +5250,23 @@ pub(crate) fn retry_transcription_prep(
             ));
         }
     }
+    // Serialize the released-generation claim/cleanup/final reread with Stop, Delete and Lock.
+    // The guard is intentionally acquired only after dropping the recorder mutex above.
+    let _lifecycle = lifecycle_guard(state);
     // Lock gate: never re-pipeline (or decrypt) a sealed-and-not-session-unlocked meeting.
     if !meeting_is_unlocked(state, meeting_id)? {
         return Err(AppError::Locked(
             "this meeting's folder is locked — unlock it to retry transcription".into(),
+        ));
+    }
+    reconcile_released_generation_cleanup(state, meeting_id)?;
+    if state
+        .db
+        .meeting_has_recording_recovery_ownership(meeting_id)?
+    {
+        return Err(AppError::Storage(
+            "this recording already has an active recovery owner — wait for recovery to finish"
+                .into(),
         ));
     }
     let meeting = state
@@ -4220,11 +5278,14 @@ pub(crate) fn retry_transcription_prep(
             "retry transcription is only available for a failed recording".into(),
         ));
     }
-    let path = meeting.audio_path.filter(|p| !p.trim().is_empty()).ok_or_else(|| {
-        AppError::Storage(
-            "this recording has no archived audio on disk — nothing to re-transcribe".into(),
-        )
-    })?;
+    let path = meeting
+        .audio_path
+        .filter(|p| !p.trim().is_empty())
+        .ok_or_else(|| {
+            AppError::Storage(
+                "this recording has no archived audio on disk — nothing to re-transcribe".into(),
+            )
+        })?;
     // Resolve a PLAINTEXT playable WAV. A `.enc`-only state past the gate (e.g. an unfiled row
     // pointing at a sealed file) still refuses — this path never decrypts.
     let plaintext = path.trim_end_matches(ENC_SUFFIX).to_string();
@@ -4254,6 +5315,26 @@ pub(crate) fn retry_transcription_prep(
     Ok(std::path::PathBuf::from(plaintext))
 }
 
+/// Retry one expired ARCHIVED cleanup in the current process, then let the caller reread the
+/// nonterminal predicate. A filesystem/DB failure is returned honestly, but the helper releases
+/// its claim so the next command attempt can retry without a restart.
+pub(crate) fn reconcile_released_generation_cleanup(
+    state: &AppState,
+    meeting_id: &str,
+) -> Result<(), AppError> {
+    if !state
+        .db
+        .meeting_has_nonterminal_recording_generation(meeting_id)?
+    {
+        return Ok(());
+    }
+    crate::audio::source::resume_released_generation_cleanup_for_meeting(
+        &state.db,
+        &pipeline::recording_inflight_dir()?,
+        &pipeline::audio_dir()?,
+        meeting_id,
+    )
+}
 
 /// Backend-mask sealed-not-session-unlocked meetings in a Library list, mirroring [`masked_detail`]:
 /// a meeting whose folder is locked (`folders.locked = 1`) AND NOT in the current session unlock set
@@ -4292,9 +5373,6 @@ pub(crate) fn mask_locked_meetings(
         .collect())
 }
 
-
-
-
 // ── VOICEPRINTS (Phase 2): cosine re-identification + enroll + management ───────────────────────
 //
 // GATE DISCIPLINE (lock-model): every read here goes through `list_voiceprints_visible`, so a
@@ -4302,14 +5380,6 @@ pub(crate) fn mask_locked_meetings(
 // match candidate, and never a suggestion source. The suggester compares THIS meeting's clusters
 // only against OTHER visible LABELED voiceprints; a sealed prior contributes nothing. The raw
 // embedding never crosses the IPC boundary (the DTOs carry label + provenance + dim only).
-
-
-
-
-
-
-
-
 
 /// EXPLICIT timeline generation — the HEAVY path split out of `get_timeline`. Runs the Notes-role
 /// provider over the (decimated, for on-device) transcript to derive the speaker/topic map, caches
@@ -4326,6 +5396,7 @@ pub async fn generate_timeline(
     if !meeting_is_unlocked(state.inner(), &meeting_id)? {
         return Ok(MeetingTimeline::default());
     }
+    let visibility = capture_meeting_content_snapshot(state.inner(), &meeting_id)?;
     let segments = state.db.get_segments(&meeting_id)?;
     if segments.is_empty() {
         return Ok(MeetingTimeline::default());
@@ -4342,7 +5413,11 @@ pub async fn generate_timeline(
             .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
         c.clone()
     };
-    let provider = crate::summarize::provider_for(crate::summarize::roles::Role::Notes, &config, &state.heavy_inference)?;
+    let provider = crate::summarize::provider_for(
+        crate::summarize::roles::Role::Notes,
+        &config,
+        &state.heavy_inference,
+    )?;
     let timeline =
         crate::summarize::timeline::generate(provider.as_ref(), &segments, duration_s).await?;
     // SEAM-F1 (2026-07-11 audit, plaintext-at-rest): the provider `.await` above can span a relock,
@@ -4354,15 +5429,21 @@ pub async fn generate_timeline(
     // timeline is discarded (the FE re-generates after the next unlock).
     if let Ok(json) = serde_json::to_string(&timeline) {
         let _lifecycle = lifecycle_guard(state.inner());
-        if !meeting_is_unlocked(state.inner(), &meeting_id)? {
-            return Ok(timeline); // relocked mid-generation → persist nothing plaintext behind the lock.
+        if require_current_meeting_content_snapshot_under_lifecycle(
+            state.inner(),
+            &meeting_id,
+            &visibility,
+        )
+        .is_err()
+        {
+            return Ok(MeetingTimeline::default());
         }
         // Fail-closed on a missing session KEK for a locked folder (never write unsealed plaintext).
         set_timeline_data_reseal_if_locked(state.inner(), &meeting_id, &json)?;
     }
+    require_current_meeting_content_snapshot(state.inner(), &meeting_id, &visibility)?;
     Ok(timeline)
 }
-
 
 /// Build the MASKED detail DTO for a sealed-and-not-session-unlocked meeting. Pure (no DB / state)
 /// so the read-gate's masking contract is unit-testable. EVERY content channel is closed:
@@ -4432,11 +5513,26 @@ pub async fn related_meetings(
     if !meeting_is_unlocked(state.inner(), &meeting_id)? {
         return Ok(Vec::new());
     }
+    let visibility = capture_meeting_content_snapshot(state.inner(), &meeting_id)?;
     let unlocked = unlocked_snapshot(state.inner())?;
-    let emb = crate::embed::active_embedder();
-    state
+    let emb = crate::embed::active_admitted_embedder();
+    let hits = state
         .db
-        .related_meetings_visible(&meeting_id, emb.as_ref(), 5, &unlocked)
+        .related_meetings_visible(&meeting_id, emb.as_ref(), 5, &unlocked)?;
+    finish_related_meetings_result(state.inner(), &meeting_id, &visibility, hits)
+}
+
+/// Bind a derived related-meetings result to the exact source-meeting authorization generation.
+/// Embedding and KNN search are synchronous but can still run long enough for a manual or
+/// screen-share relock to revoke the source while its chunk plaintext remains cached in RAM.
+pub(crate) fn finish_related_meetings_result(
+    state: &AppState,
+    meeting_id: &str,
+    visibility: &MeetingContentSnapshot,
+    hits: Vec<SearchHit>,
+) -> Result<Vec<SearchHit>, AppError> {
+    require_current_meeting_content_snapshot(state, meeting_id, visibility)?;
+    Ok(hits)
 }
 
 /// Pure, AppHandle-free core of [`reindex_embeddings`] so the model-missing guard + the
@@ -4460,6 +5556,14 @@ pub(crate) fn reindex_embeddings_inner<F: FnMut(usize, usize)>(
     embedder: &dyn crate::embed::Embedder,
     mut on_progress: F,
 ) -> Result<ReindexResult, AppError> {
+    if model_present {
+        // Establish one clean generation before the first REAL vector is written. Chunks/FTS and
+        // canonical content remain intact; interruption can therefore leave B-or-missing rows but
+        // never an A/B mixture queried in one vector space. The caller's persistence handle pins B
+        // and owns the selection read guard through this whole function.
+        db.invalidate_all_vector_embeddings()?;
+    }
+
     // DOCUMENT backfill first — doc_chunks + the FTS index are model-INDEPENDENT (keyword retrieval
     // must work on a default install), so this runs even when the e5 model is absent. Visible
     // documents only (`visible_document_ids` applies `visibility_clause`; a sealed folder's docs
@@ -4468,7 +5572,8 @@ pub(crate) fn reindex_embeddings_inner<F: FnMut(usize, usize)>(
     // never a purge-then-reinsert of an already-chunked document, which would DESTROY its existing
     // real vectors without replacing them. The shared leg is kind-ROUTED (Brain v3 audit gap #3):
     // authored notes re-chunk through the front-matter-stripping path, never raw `documents.text`.
-    let docs_indexed = backfill_document_chunks(db, unlocked, model_present, embedder, true, None)?;
+    let docs_indexed =
+        backfill_document_chunks(db, unlocked, model_present, embedder, true, None, None)?;
     if docs_indexed > 0 {
         tracing::info!(target: "rag", docs_indexed, "reindex: document chunks backfilled");
     }
@@ -4524,7 +5629,12 @@ pub(crate) fn reindex_embeddings_inner<F: FnMut(usize, usize)>(
         on_progress(indexed, total);
     }
 
-    tracing::info!(target: "rag", indexed, total, "reindex_embeddings complete");
+    // Org replicas live outside the folder-lock domain by design (org-disclosed, SQLCipher at
+    // rest). Rebuild that fourth vector partition under the SAME pinned REAL handle; its helper
+    // keyset-reads one item at a time and never changes feed cursors or canonical chunks/FTS.
+    let org_indexed = org_commands::reindex_org_embeddings(db, embedder)?;
+
+    tracing::info!(target: "rag", indexed, total, org_indexed, "reindex_embeddings complete");
     Ok(ReindexResult {
         status: "indexed".to_string(),
         indexed,
@@ -4579,6 +5689,24 @@ pub(crate) fn index_document_row_kind_routed_progress(
     }
 }
 
+fn index_document_row_kind_routed_background(
+    db: &crate::storage::Db,
+    document_id: &str,
+    embedder: Option<&dyn crate::embed::Embedder>,
+    epoch: u64,
+) -> Result<bool, AppError> {
+    match db.get_note_row(document_id)? {
+        Some(row) => {
+            let title = row.title.as_deref().unwrap_or(&row.name);
+            let title = title.trim();
+            let title = if title.is_empty() { "Untitled" } else { title };
+            let (_yaml, body) = crate::storage::db::split_front_matter(&row.text);
+            db.index_note_chunks_background(document_id, title, &body, embedder, epoch)
+        }
+        None => db.index_document_chunks_background(document_id, embedder, epoch),
+    }
+}
+
 /// The DOCUMENT backfill leg shared by [`reindex_embeddings_inner`] (`force_reembed = true`: the
 /// user-triggered full pass — model present ⇒ purge-then-reinsert re-embed of EVERY visible doc)
 /// and the startup repair tick [`backfill_missing_brain_indexes`] (`force_reembed = false`:
@@ -4603,6 +5731,7 @@ fn backfill_document_chunks(
     embedder: &dyn crate::embed::Embedder,
     force_reembed: bool,
     mut repair_budget: Option<&mut usize>,
+    background_epoch: Option<u64>,
 ) -> Result<usize, AppError> {
     let doc_embedder = model_present.then_some(embedder);
     let mut docs_indexed = 0usize;
@@ -4641,8 +5770,13 @@ fn backfill_document_chunks(
         if !should_index {
             continue;
         }
-        match index_document_row_kind_routed(db, &did, doc_embedder) {
-            Ok(()) => match repair_budget.as_deref_mut() {
+        let indexed = match background_epoch {
+            Some(epoch) => index_document_row_kind_routed_background(db, &did, doc_embedder, epoch),
+            None => index_document_row_kind_routed(db, &did, doc_embedder).map(|_| true),
+        };
+        match indexed {
+            Ok(false) => return Ok(docs_indexed),
+            Ok(true) => match repair_budget.as_deref_mut() {
                 Some(budget) => {
                     // Fix 3c — spend the budget ONLY on a row whose index pass actually produced
                     // rows: re-run the needs-probe and treat "still missing" as zero-yield.
@@ -4694,6 +5828,7 @@ fn backfill_document_chunks(
 /// ZERO-YIELD row (one whose index pass produces no chunks/vectors — e.g. an empty-bodied note)
 /// is never counted as work and never spends the cap, otherwise permanently-empty rows would
 /// re-burn the cap on every launch and starve the real tail.
+#[cfg(test)]
 pub(crate) fn backfill_missing_brain_indexes(
     db: &crate::storage::Db,
     semantic_enabled: bool,
@@ -4706,6 +5841,24 @@ pub(crate) fn backfill_missing_brain_indexes(
         model_present,
         embedder,
         REPAIR_TICK_MAX_INDEX_PER_RUN,
+        None,
+    )
+}
+
+pub(crate) fn backfill_missing_brain_indexes_background(
+    db: &crate::storage::Db,
+    semantic_enabled: bool,
+    model_present: bool,
+    embedder: &dyn crate::embed::Embedder,
+    epoch: u64,
+) -> Result<(usize, usize), AppError> {
+    backfill_missing_brain_indexes_capped(
+        db,
+        semantic_enabled,
+        model_present,
+        embedder,
+        REPAIR_TICK_MAX_INDEX_PER_RUN,
+        Some(epoch),
     )
 }
 
@@ -4725,6 +5878,7 @@ pub(crate) fn backfill_missing_brain_indexes_capped(
     model_present: bool,
     embedder: &dyn crate::embed::Embedder,
     max_real_index_ops: usize,
+    background_epoch: Option<u64>,
 ) -> Result<(usize, usize), AppError> {
     let empty = std::collections::HashSet::new();
     // ONE budget across both halves — a launch tick is one resource envelope, however the missing
@@ -4739,6 +5893,7 @@ pub(crate) fn backfill_missing_brain_indexes_capped(
         embedder,
         false,
         Some(&mut remaining),
+        background_epoch,
     )?;
 
     // MEETING half — flag + model gated (see the gating matrix above).
@@ -4777,35 +5932,55 @@ pub(crate) fn backfill_missing_brain_indexes_capped(
             }
             match db.get_segments(&m.id) {
                 Ok(segments) => {
-                    if let Err(e) = db.index_meeting_chunks(&m.id, &segments, embedder) {
-                        tracing::warn!(target: "rag", error = %e, "repair tick: indexing one meeting failed (skipped)");
-                    } else {
-                        // Fix 3c — count + spend the cap ONLY when the pass actually produced
-                        // rows. A zero-yield meeting (empty note body AND no segments → no
-                        // chunks) stays "missing" forever; counting it would re-burn the cap on
-                        // every launch. Zero-yield ⇒ the segments were empty, so the topic
-                        // indexer (segment-derived) is skipped as the no-op it would be.
-                        match db.meeting_chunk_vector_counts(&m.id) {
-                            Ok((chunks, vectors)) if chunks > 0 && vectors > 0 => {
-                                meetings += 1;
-                                remaining -= 1;
-                                // Topic chunks follow the note/transcript index (the reindex
-                                // idiom) — under the SAME empty unlock set (sealed context
-                                // never persists).
-                                if let Err(e) = db.index_meeting_topic_chunks(
-                                    &m.id, &segments, embedder, &empty,
-                                ) {
-                                    tracing::warn!(target: "rag", error = %e, "repair tick: topic indexing failed (skipped)");
+                    let indexed = match background_epoch {
+                        Some(epoch) => {
+                            db.index_meeting_chunks_background(&m.id, &segments, embedder, epoch)
+                        }
+                        None => db
+                            .index_meeting_chunks(&m.id, &segments, embedder)
+                            .map(|_| true),
+                    };
+                    match indexed {
+                        Err(e) => {
+                            tracing::warn!(target: "rag", error = %e, "repair tick: indexing one meeting failed (skipped)");
+                        }
+                        Ok(false) => return Ok((meetings, docs)),
+                        Ok(true) => {
+                            // Fix 3c — count + spend the cap ONLY when the pass actually produced
+                            // rows. A zero-yield meeting (empty note body AND no segments → no
+                            // chunks) stays "missing" forever; counting it would re-burn the cap on
+                            // every launch. Zero-yield ⇒ the segments were empty, so the topic
+                            // indexer (segment-derived) is skipped as the no-op it would be.
+                            match db.meeting_chunk_vector_counts(&m.id) {
+                                Ok((chunks, vectors)) if chunks > 0 && vectors > 0 => {
+                                    meetings += 1;
+                                    remaining -= 1;
+                                    // Topic chunks follow the note/transcript index (the reindex
+                                    // idiom) — under the SAME empty unlock set (sealed context
+                                    // never persists).
+                                    let topic_indexed = match background_epoch {
+                                        Some(epoch) => db
+                                            .index_meeting_topic_chunks_background(
+                                                &m.id, &segments, embedder, &empty, epoch,
+                                            )
+                                            .map(|_| ()),
+                                        None => db.index_meeting_topic_chunks(
+                                            &m.id, &segments, embedder, &empty,
+                                        ),
+                                    };
+                                    if let Err(e) = topic_indexed {
+                                        tracing::warn!(target: "rag", error = %e, "repair tick: topic indexing failed (skipped)");
+                                    }
+                                    // Pacing between REAL index ops (the topic backfill's posture) —
+                                    // idempotent no-ops stay unpaced.
+                                    std::thread::sleep(std::time::Duration::from_millis(
+                                        REPAIR_TICK_PACING_MS,
+                                    ));
                                 }
-                                // Pacing between REAL index ops (the topic backfill's posture) —
-                                // idempotent no-ops stay unpaced.
-                                std::thread::sleep(std::time::Duration::from_millis(
-                                    REPAIR_TICK_PACING_MS,
-                                ));
-                            }
-                            Ok(_) => {} // zero-yield: not work, no cap spend, no pacing.
-                            Err(e) => {
-                                tracing::warn!(target: "rag", error = %e, "repair tick: yield probe failed (skipped)");
+                                Ok(_) => {} // zero-yield: not work, no cap spend, no pacing.
+                                Err(e) => {
+                                    tracing::warn!(target: "rag", error = %e, "repair tick: yield probe failed (skipped)");
+                                }
                             }
                         }
                     }
@@ -4883,17 +6058,26 @@ fn move_note_command_body(
     meeting_id: String,
     folder_id: Option<String>,
 ) -> Result<(), AppError> {
-    move_note_inner_impl(&state, meeting_id, folder_id)?;
+    move_note_inner_impl(state.inner(), meeting_id, folder_id)?;
     emit_audit_updated_after_purge(app, state.inner());
     Ok(())
 }
 
 fn move_note_inner_impl(
-    state: &State<'_, AppState>,
+    state: &AppState,
     meeting_id: String,
     folder_id: Option<String>,
 ) -> Result<(), AppError> {
+    let _lifecycle = lifecycle_guard(state);
+    // The salvage finalizer is folder/CK-bound. Reassignment while it is awaiting ASR/provider
+    // work would either apply that key to the wrong folder or leave fresh plaintext ungoverned.
+    ensure_no_active_salvage_for_meeting(state, &meeting_id)?;
     // Resolve current + target folder lock state.
+    if !meeting_is_unlocked(state, &meeting_id)? {
+        return Err(AppError::Locked(
+            "the source folder is locked — unlock it before moving the note".into(),
+        ));
+    }
     let note = state.db.get_latest_note_for_meeting(&meeting_id)?;
 
     // A MEETING may only be filed under a MEETING folder — never a note folder
@@ -4916,10 +6100,10 @@ fn move_note_inner_impl(
 
     // ── Target is a LOCKED folder: seal-or-reject (BLK-2) ───────────────────────────────────────
     if target_locked {
-        let fid = folder_id
-            .as_deref()
-            .expect("locked target implies Some(folder_id)");
-        return move_into_locked_folder(state.inner(), &meeting_id, fid);
+        let fid = folder_id.as_deref().ok_or_else(|| {
+            AppError::Storage("locked meeting-folder target lost its folder id".into())
+        })?;
+        return move_into_locked_folder_under_lifecycle(state, &meeting_id, fid);
     }
 
     // ── Target is OPEN / root: existing reassign + best-effort FS move ──────────────────────────
@@ -4928,12 +6112,22 @@ fn move_note_inner_impl(
     // "no movable file" and skip the FS move entirely.
     let exported = note.as_ref().and_then(|n| n.exported_path.clone());
 
-    // Reassign in the DB first (the source-of-truth association). Targets EVERY provider row of
-    // the meeting (WHERE meeting_id = ?1) so the meeting's folder is consistent across providers
-    // and the seal/unlock lifecycle (which iterates provider rows) stays coherent.
-    state
-        .db
-        .set_meeting_folder(&meeting_id, folder_id.as_deref())?;
+    // Recover every attachment under the SOURCE gate before clearing a source-folder seal. Folder
+    // reassignment + plaintext restore + blob clear then commit atomically, so a crash cannot leave
+    // a stale source-CK blob attached to the open target.
+    let attachment_rows = state.db.attachments_for_meeting(&meeting_id)?;
+    let mut attachment_plaintext = std::collections::HashMap::with_capacity(attachment_rows.len());
+    for attachment in &attachment_rows {
+        attachment_plaintext.insert(
+            attachment.id.clone(),
+            plaintext_attachment_data(state, attachment)?,
+        );
+    }
+    state.db.move_meeting_with_attachments_open(
+        &meeting_id,
+        folder_id.as_deref(),
+        &attachment_plaintext,
+    )?;
 
     // Best-effort FS move only when a plaintext .md exists (target is open here).
     if let Some(src_path) = exported {
@@ -4942,13 +6136,7 @@ fn move_note_inner_impl(
                 Some(fid) => state.db.folder_by_id(fid)?.map(|f| f.path),
                 None => None,
             };
-            move_note_file(
-                state,
-                &meeting_id,
-                &src_path,
-                &vault,
-                target_rel.as_deref(),
-            )?;
+            move_note_file(state, &meeting_id, &src_path, &vault, target_rel.as_deref())?;
         }
     }
     Ok(())
@@ -4964,6 +6152,19 @@ fn move_into_locked_folder(
     folder_id: &str,
 ) -> Result<(), AppError> {
     let _lifecycle = lifecycle_guard(state);
+    move_into_locked_folder_under_lifecycle(state, meeting_id, folder_id)
+}
+
+fn move_into_locked_folder_under_lifecycle(
+    state: &AppState,
+    meeting_id: &str,
+    folder_id: &str,
+) -> Result<(), AppError> {
+    if !meeting_is_unlocked(state, meeting_id)? {
+        return Err(AppError::Locked(
+            "the source folder is locked — unlock it before moving the note".into(),
+        ));
+    }
 
     // Must be session-unlocked — otherwise we have no CK to seal the moved note with.
     let session_unlocked = state
@@ -4974,6 +6175,22 @@ fn move_into_locked_folder(
     if !session_unlocked {
         return Err(AppError::Locked(
             "the destination folder is locked — unlock it first, then move the note".into(),
+        ));
+    }
+
+    // A locked-folder association is also the boundary that declares every meeting-owned audio
+    // artifact governed by this folder's CK. Resume an expired ARCHIVED cleanup first, then reread
+    // fail-closed BEFORE assigning even one provider row. Active/FINALIZED/persistently ambiguous
+    // plaintext therefore stays in its original open/root location; a transient cleanup failure
+    // releases its targeted claim so the next same-process Move/auto-file attempt can retry.
+    reconcile_released_generation_cleanup(state, meeting_id)?;
+    if state
+        .db
+        .meeting_has_recording_recovery_ownership(meeting_id)?
+    {
+        return Err(AppError::Locked(
+            "this meeting still has plaintext recording artifacts — finish recording recovery before moving it into a locked folder"
+                .into(),
         ));
     }
 
@@ -5009,9 +6226,30 @@ fn move_into_locked_folder(
             .map_err(|_| AppError::Storage("unwrapped content key has wrong length".into()))?,
     );
 
-    // Reassign EVERY provider row of the meeting into the locked folder (the source-of-truth
-    // association), THEN seal that one meeting's note + extras under the folder CK.
-    state.db.set_meeting_folder(meeting_id, Some(folder_id))?;
+    // Prepare and verify every attachment seal under the TARGET CK before mutating ownership. Then
+    // remove tracked plaintext exports before the transaction clears their retry metadata.
+    let attachment_rows = state.db.attachments_for_meeting(meeting_id)?;
+    let mut attachment_seals = std::collections::HashMap::with_capacity(attachment_rows.len());
+    for attachment in &attachment_rows {
+        let data = plaintext_attachment_data(state, attachment)?;
+        let aad = attachment_aad(folder_id, &attachment.owner, &attachment.id);
+        let blob = crate::crypto::encrypt(&ck, &data, &aad)?;
+        if crate::crypto::decrypt(&ck, &blob, &aad)? != data {
+            return Err(AppError::Storage(
+                "attachment move-seal verification failed".into(),
+            ));
+        }
+        attachment_seals.insert(attachment.id.clone(), blob);
+    }
+    remove_attachment_exports_before_move(&attachment_rows)?;
+
+    // Reassign every provider row and install the verified image seals in the same transaction.
+    bump_seal_epoch(state);
+    state.db.move_meeting_with_attachments_sealed(
+        meeting_id,
+        folder_id,
+        &attachment_seals,
+    )?;
     seal_moved_note(state, folder_id, meeting_id, &ck)?;
 
     // The destination folder is SESSION-UNLOCKED (checked above), so the moved note MUST be READABLE
@@ -5037,10 +6275,11 @@ fn move_into_locked_folder(
             .restore_note_markdown(meeting_id, &n.provider_id, &markdown)?;
     }
     unseal_meeting_extras(state, folder_id, meeting_id, &ck)?;
+    unseal_attachments_for_meeting(state, folder_id, meeting_id, &ck)?;
     // Re-index this one meeting so semantic search / related-meetings recover in-session (its note
     // markdown was just restored above). Model-gated (never a stub vector); best-effort — a re-index
     // hiccup must not fail (or half-undo) the completed move.
-    let meeting_embedder = crate::embed::embed_model_present().then(crate::embed::active_embedder);
+    let meeting_embedder = crate::embed::active_persistence_embedder_if_available();
     reindex_meetings_after_unseal(
         state,
         &[meeting_id.to_string()],
@@ -5110,6 +6349,73 @@ pub fn seal_auto_filed_note(
     move_into_locked_folder(state, meeting_id, folder_id)
 }
 
+/// A narrowly-scoped, zeroizing folder key captured when a disk-salvage run starts while its
+/// locked folder is session-unlocked. If screen-share/manual relock lands while Whisper is still
+/// running, the global KEK is correctly zeroized, but this one-shot context lets the Drop finalizer
+/// authenticate and seal the exact newly-produced transcript instead of deleting it or treating
+/// audio re-transcription as an equivalent copy.
+pub(crate) struct SalvageSealContext {
+    folder_id: String,
+    ck: Zeroizing<[u8; 32]>,
+    /// Exact encrypted CK envelope observed with `ck`. Session relock leaves it unchanged; a
+    /// permanent unlock/fresh lock rotates it. Equality is a defense-in-depth generation check
+    /// immediately before any destructive seal write.
+    wrapped_key: Vec<u8>,
+}
+
+/// Capture the exact folder CK before a long salvage run crosses any await. The lifecycle guard
+/// makes the folder association, visibility gate and KEK unwrap one coherent snapshot. Open-folder
+/// salvage needs no context; a locked folder that raced closed aborts before producing new output.
+pub(crate) fn capture_salvage_seal_context(
+    state: &AppState,
+    meeting_id: &str,
+) -> Result<Option<SalvageSealContext>, AppError> {
+    let _lifecycle = lifecycle_guard(state);
+    let Some(folder_id) = state.db.folder_for_meeting(meeting_id)? else {
+        return Ok(None);
+    };
+    let Some(folder) = state.db.folder_by_id(&folder_id)? else {
+        return Ok(None);
+    };
+    if !folder.locked {
+        return Ok(None);
+    }
+    if !state
+        .unlocked_folders
+        .lock()
+        .map_err(|_| AppError::Storage("unlocked-folders mutex poisoned".into()))?
+        .contains(&folder_id)
+    {
+        return Err(AppError::Locked(
+            "the meeting folder relocked before transcription could start".into(),
+        ));
+    }
+    let kek = state
+        .master_kek
+        .lock()
+        .map_err(|_| AppError::Storage("master-kek mutex poisoned".into()))?
+        .clone()
+        .ok_or_else(|| AppError::Locked("the unlocked folder has no cached session key".into()))?;
+    let wrapped = state
+        .db
+        .folder_wrapped_key(&folder_id)?
+        .ok_or_else(|| AppError::Storage("locked folder has no wrapped key".into()))?;
+    let ck_bytes = Zeroizing::new(crate::crypto::decrypt(
+        &kek,
+        &wrapped,
+        &aad_wrapped_ck(&folder_id),
+    )?);
+    let ck: [u8; 32] = ck_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| AppError::Storage("unwrapped content key has wrong length".into()))?;
+    Ok(Some(SalvageSealContext {
+        folder_id,
+        ck: Zeroizing::new(ck),
+        wrapped_key: wrapped,
+    }))
+}
+
 /// LOCK-STATE FINALIZER for a from-disk pipeline re-run (`pipeline::run_salvage_from_disk` —
 /// `retry_transcription` + startup disk salvage). The re-run inserts fresh plaintext
 /// segments/audio exactly like a live Stop; for a meeting whose folder is LOCKED that fresh
@@ -5125,16 +6431,18 @@ pub fn seal_auto_filed_note(
 ///   [`seal_auto_filed_note`] — the SAME verify-before-blank path a manual move / auto-file
 ///   takes, which also restores the session plaintext afterward. Content is never lost.
 /// - **Locked + NOT unlocked** (a relock/screen-share auto-relock landed MID-RUN — the entry gate
-///   had passed): fail CLOSED. The relock's re-blank only covers rows with sealed blobs, so the
-///   fresh unsealed rows would otherwise sit plaintext-at-rest behind the lock forever. Purge the
-///   blob-less segments ([`Db::delete_unsealed_segments`] — derived data; the audio survives) and
-///   remove the plaintext WAV ONLY when its sealed `.enc` twin exists (never destroy the only
-///   copy). The row is already terminal `Error` (the note persist fail-closed with
-///   `AppError::Locked` inside the pipeline) and recoverable: unlock → retry.
+///   had passed): use the entry-pinned, zeroizing CK to seal and decrypt-verify the exact fresh
+///   transcript/timeline/audio. Audio is never treated as an equivalent transcript copy. If the
+///   pinned context is unavailable or the seal fails, retain every byte behind the logical gate;
+///   bounded SQLCipher-only residue is preferable to irreversible loss.
 ///
 /// Best-effort by contract: every failure is logged (ids/counts only) and swallowed — the
 /// finalizer must never mask the pipeline's own result.
-pub(crate) fn finalize_salvage_lock_state(state: &AppState, meeting_id: &str) {
+pub(crate) fn finalize_salvage_lock_state(
+    state: &AppState,
+    meeting_id: &str,
+    seal_context: Option<&SalvageSealContext>,
+) {
     let locked_folder = match state
         .db
         .folder_for_meeting(meeting_id)
@@ -5166,29 +6474,43 @@ pub(crate) fn finalize_salvage_lock_state(state: &AppState, meeting_id: &str) {
         }
         return;
     }
-    // Mid-run relock: purge the unsealed plaintext leftovers, fail closed.
-    match state.db.delete_unsealed_segments(meeting_id) {
-        Ok(n) if n > 0 => {
-            tracing::warn!(target: "lock", meeting_id = %meeting_id, purged = n, "salvage raced a relock — purged unsealed plaintext segments (audio stays sealed at rest; unlock + retry to re-transcribe)");
-        }
-        Ok(_) => {}
-        Err(e) => {
-            tracing::warn!(target: "lock", meeting_id = %meeting_id, error = %e, "salvage lock finalizer: unsealed-segment purge failed");
-        }
+    let Some(context) = seal_context.filter(|ctx| ctx.folder_id == folder.id) else {
+        tracing::error!(target: "lock", meeting_id = %meeting_id, "salvage raced a relock without its entry seal context; exact output retained behind the logical gate for recovery");
+        return;
+    };
+    // Serialize with every lock transition, then revalidate the association before applying the
+    // captured CK. Never seal under a key captured for a folder the meeting has since left.
+    let _lifecycle = lifecycle_guard(state);
+    let still_same_locked_folder = state
+        .db
+        .folder_for_meeting(meeting_id)
+        .ok()
+        .flatten()
+        .is_some_and(|fid| fid == context.folder_id)
+        && state
+            .db
+            .folder_by_id(&context.folder_id)
+            .ok()
+            .flatten()
+            .is_some_and(|f| f.locked);
+    if !still_same_locked_folder {
+        tracing::error!(target: "lock", meeting_id = %meeting_id, "salvage folder changed before exact-output seal; output retained for recovery");
+        return;
     }
-    // Remove the freshly-written plaintext WAV ONLY when the sealed `.enc` twin exists — the
-    // audio content must never be destroyed without a surviving sealed copy.
-    if let Ok(Some(m)) = state.db.get_meeting(meeting_id) {
-        if let Some(path) = m.audio_path.as_deref().filter(|p| !p.ends_with(ENC_SUFFIX)) {
-            let enc = format!("{path}{ENC_SUFFIX}");
-            let sealed_copy_exists = std::path::Path::new(&enc).exists();
-            if sealed_copy_exists
-                && std::path::Path::new(path).exists()
-                && std::fs::remove_file(path).is_ok()
-            {
-                tracing::warn!(target: "lock", meeting_id = %meeting_id, "salvage raced a relock — removed the plaintext session WAV (sealed .enc retained)");
-            }
-        }
+    let same_key_generation = state
+        .db
+        .folder_wrapped_key(&context.folder_id)
+        .ok()
+        .flatten()
+        .is_some_and(|wrapped| wrapped == context.wrapped_key);
+    if !same_key_generation {
+        tracing::error!(target: "lock", meeting_id = %meeting_id, "salvage folder key generation changed before exact-output seal; output retained without destructive writes");
+        return;
+    }
+    if let Err(e) = seal_moved_note(state, &context.folder_id, meeting_id, &context.ck) {
+        tracing::error!(target: "lock", meeting_id = %meeting_id, error = %e, "salvage exact-output seal after relock failed; output retained for recovery");
+    } else {
+        tracing::warn!(target: "lock", meeting_id = %meeting_id, "salvage raced a relock — exact output authenticated and sealed with the entry-pinned folder key");
     }
 }
 
@@ -5204,10 +6526,18 @@ fn seal_moved_note(
     let notes = state.db.sealable_notes_for_meeting(meeting_id)?;
     // Encrypt + VERIFY every provider row BEFORE any blank, so a failure leaves intact plaintext.
     let mut sealed_rows: Vec<(String, Vec<u8>)> = Vec::new();
-    let mut exported_paths: Vec<String> = Vec::new();
+    let mut exported_paths: Vec<(String, String)> = Vec::new();
     for n in &notes {
+        if let Some(path) = n.exported_path.clone() {
+            exported_paths.push((n.provider_id.clone(), path));
+        }
         // Skip a row already sealed (blob present + markdown blanked) — idempotent.
-        if n.content_blob.is_some() && n.markdown.is_empty() {
+        if let Some(blob) = n.content_blob.as_deref().filter(|_| n.markdown.is_empty()) {
+            crate::crypto::decrypt(
+                ck,
+                blob,
+                &aad_content(folder_id, meeting_id, &n.provider_id, "note"),
+            )?;
             continue;
         }
         let aad = aad_content(folder_id, meeting_id, &n.provider_id, "note");
@@ -5218,29 +6548,32 @@ fn seal_moved_note(
             ));
         }
         sealed_rows.push((n.provider_id.clone(), blob));
-        if let Some(p) = n.exported_path.clone() {
-            exported_paths.push(p);
-        }
+    }
+    ensure_no_external_edit_siblings(exported_paths.iter().map(|(_, path)| path))?;
+    for (provider_id, path) in &exported_paths {
+        let expected = state
+            .db
+            .get_note_exported_hash(meeting_id, provider_id)?;
+        remove_note_export_if_unchanged(
+            path,
+            expected.as_deref(),
+            "remove meeting-note export before sealing a moved note",
+        )?;
     }
     for (provider_id, blob) in &sealed_rows {
         state.db.seal_note(meeting_id, provider_id, blob)?;
     }
     // Seal the moved meeting's transcript + timeline + audio under the SAME CK.
-    seal_meeting_extras(state, folder_id, meeting_id, ck)?;
-    // AFTER the column writes, remove the vault `.md` files (a leftover .md is reconcilable; lost
-    // content is not — so this is last).
-    // Export-collision guard: NO external-edit sibling on a seal delete — privacy wins over
-    // preservation (a plaintext sibling of a to-be-sealed note would be a leak; see the same
-    // decision in `lock_folder_inner`).
-    for p in exported_paths {
-        let _ = std::fs::remove_file(&p);
-    }
+    seal_meeting_extras(&state.db, folder_id, meeting_id, ck)?;
+    // Meeting-note exports were removed immediately before their row seal, while exported_path was
+    // still durable cleanup authority. A retry can therefore never forget a failed plaintext unlink.
     // The note's chunks/vectors are plaintext-derived and a dense embedding is invertible, so they
     // must NOT survive at rest for a meeting now sealed into a locked folder — same invariant the
     // lock_folder / relock / startup-reconcile paths enforce. Covers both the manual move-into-locked
     // and the auto-file callers. (Re-indexed on unlock once indexing ships.) The same tx purges ALL
     // memory rollups (cross-meeting synthesis that may paraphrase the just-sealed facts) — remove
     // their exported vault `.md`s here, like the note `.md`s above.
+    remove_rollup_exports_before_seal_purge(&state.db)?;
     let rollup_exports = state
         .db
         .purge_chunks_for_meetings(&[meeting_id.to_string()])?;
@@ -5251,7 +6584,7 @@ fn seal_moved_note(
 /// Move the exported `.md` to the target folder's vault subdir, preserving content. Re-points
 /// the note's `exported_path`. Copy-then-remove so a failure never loses bytes.
 fn move_note_file(
-    state: &State<'_, AppState>,
+    state: &AppState,
     meeting_id: &str,
     src_path: &str,
     vault: &str,
@@ -5324,6 +6657,89 @@ pub(crate) fn lifecycle_guard(state: &AppState) -> std::sync::MutexGuard<'_, ()>
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// RAII ownership for one from-disk salvage. The set entry is installed while holding the lock
+/// lifecycle guard, so a key-changing folder operation can never slip between the salvage's
+/// registration and its folder/CK snapshot. Drop removes only the opaque meeting id; the
+/// [`SalvageLockFinalizer`] is declared after this permit and therefore runs first.
+pub(crate) struct ActiveSalvagePermit<'a> {
+    state: &'a AppState,
+    meeting_id: String,
+}
+
+pub(crate) fn begin_active_salvage<'a>(
+    state: &'a AppState,
+    meeting_id: &str,
+) -> Result<ActiveSalvagePermit<'a>, AppError> {
+    let _lifecycle = lifecycle_guard(state);
+    let mut active = state
+        .active_salvages
+        .lock()
+        .map_err(|_| AppError::Storage("active-salvages mutex poisoned".into()))?;
+    if !active.insert(meeting_id.to_string()) {
+        return Err(AppError::Audio(
+            "this meeting already has an active transcription recovery".into(),
+        ));
+    }
+    Ok(ActiveSalvagePermit {
+        state,
+        meeting_id: meeting_id.to_string(),
+    })
+}
+
+impl Drop for ActiveSalvagePermit<'_> {
+    fn drop(&mut self) {
+        let mut active = self
+            .state
+            .active_salvages
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        active.remove(&self.meeting_id);
+    }
+}
+
+/// Called only from a short [`lifecycle_guard`] critical section. Resolve folder membership from
+/// the canonical DB at the time of the mutation rather than caching it in the permit: an internal
+/// auto-file may legitimately assign the meeting while salvage is running.
+pub(crate) fn ensure_no_active_salvage_in_folder(
+    state: &AppState,
+    folder_id: &str,
+) -> Result<(), AppError> {
+    let active: Vec<String> = state
+        .active_salvages
+        .lock()
+        .map_err(|_| AppError::Storage("active-salvages mutex poisoned".into()))?
+        .iter()
+        .cloned()
+        .collect();
+    for meeting_id in active {
+        if state.db.folder_for_meeting(&meeting_id)?.as_deref() == Some(folder_id) {
+            return Err(AppError::Locked(
+                "this folder has a transcription recovery in progress — wait for it to finish"
+                    .into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn ensure_no_active_salvage_for_meeting(
+    state: &AppState,
+    meeting_id: &str,
+) -> Result<(), AppError> {
+    if state
+        .active_salvages
+        .lock()
+        .map_err(|_| AppError::Storage("active-salvages mutex poisoned".into()))?
+        .contains(meeting_id)
+    {
+        return Err(AppError::Locked(
+            "this meeting has a transcription recovery in progress — wait for it to finish"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 /// R7 (2026-07-10) — bump the SEAL EPOCH ([`AppState::seal_epoch`]): the monotonic counter every
 /// lock-surface mutation advances at ENTRY (before any blank/purge), so the hourly memory
 /// consolidation job can detect a seal/relock/remove-lock that interleaved with its pass and
@@ -5338,12 +6754,14 @@ pub(crate) fn bump_seal_epoch(state: &AppState) {
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 }
 
-/// Phase-0 lock-review follow-up: count `<stem> (external edit …).md` siblings sitting next to
-/// the given exported `.md` paths and WARN (counts only — paths embed note titles). The seal /
-/// relock paths delete ONLY the canonical exports; an external-edit sibling is USER-AUTHORED
-/// content the collision guard preserved, so it is deliberately NEVER deleted — but it is
-/// plaintext that survives the seal on disk, and that exposure must at least be visible.
-pub(crate) fn warn_external_edit_siblings<'a>(stage: &str, paths: impl Iterator<Item = &'a String>) {
+/// Refuse a seal while a collision-guard `<stem> (external edit …).md` sibling exists next to a
+/// governed export. Murmur cannot silently delete user-authored bytes, but publishing `locked=1`
+/// while leaving that known plaintext beside the sealed note is also unsafe. The folder therefore
+/// stays open until the user explicitly reconciles the sibling. Paths/titles never enter the error
+/// or logs.
+pub(crate) fn ensure_no_external_edit_siblings<'a>(
+    paths: impl Iterator<Item = &'a String>,
+) -> Result<(), AppError> {
     let mut siblings = 0usize;
     for p in paths {
         let path = std::path::Path::new(p);
@@ -5364,13 +6782,141 @@ pub(crate) fn warn_external_edit_siblings<'a>(stage: &str, paths: impl Iterator<
         }
     }
     if siblings > 0 {
-        tracing::warn!(
-            target: "lock",
-            stage,
-            siblings,
-            "external-edit sibling .md files remain next to sealed notes' exports — left in place (user-authored, never deleted by the seal), but they are plaintext outside the seal"
-        );
+        return Err(AppError::Locked(format!(
+            "cannot lock this folder while {siblings} preserved external-edit note file(s) remain; reconcile them in the vault first"
+        )));
     }
+    Ok(())
+}
+
+fn decode_sha256_hex(value: &str) -> Result<[u8; 32], AppError> {
+    if value.len() != 64 {
+        return Err(AppError::Storage(
+            "managed note export has an invalid integrity baseline".into(),
+        ));
+    }
+    let mut out = [0u8; 32];
+    for (index, byte) in out.iter_mut().enumerate() {
+        let start = index * 2;
+        *byte = u8::from_str_radix(&value[start..start + 2], 16).map_err(|_| {
+            AppError::Storage("managed note export has an invalid integrity baseline".into())
+        })?;
+    }
+    Ok(out)
+}
+
+/// Preflight one governed Markdown export against its last Murmur-authored digest.
+pub(crate) fn verify_note_export_unchanged(
+    path: &str,
+    expected_hash: Option<&str>,
+    operation: &str,
+) -> Result<(), AppError> {
+    if !std::path::Path::new(path).exists() {
+        return Ok(());
+    }
+    let expected = expected_hash.ok_or_else(|| {
+        AppError::Locked(
+            "cannot lock a legacy vault export without an integrity baseline; re-export the note first"
+                .into(),
+        )
+    })?;
+    let digest = decode_sha256_hex(expected)?;
+    crate::crypto::verify_file_content(std::path::Path::new(path), None, &digest, operation)
+}
+
+/// Atomically quarantine, integrity-check and remove a governed Markdown export. A missing
+/// baseline is fail-closed: legacy rows must be re-exported while open before they can be sealed,
+/// otherwise Murmur cannot distinguish its own bytes from an external edit.
+pub(crate) fn remove_note_export_if_unchanged(
+    path: &str,
+    expected_hash: Option<&str>,
+    operation: &str,
+) -> Result<(), AppError> {
+    verify_note_export_unchanged(path, expected_hash, operation)?;
+    if !std::path::Path::new(path).exists() {
+        return Ok(());
+    }
+    let expected = expected_hash.ok_or_else(|| {
+        AppError::Locked(
+            "cannot lock a legacy vault export without an integrity baseline; re-export the note first"
+                .into(),
+        )
+    })?;
+    let digest = decode_sha256_hex(expected)?;
+    crate::crypto::remove_file_verified_content(
+        std::path::Path::new(path),
+        None,
+        &digest,
+        operation,
+    )
+}
+
+/// Remove every known plaintext vault replica of a folder selected from a lifecycle-consistent
+/// session-unlocked snapshot. The caller owns the visibility ordering: single-folder manual relock
+/// preflights while open, while emergency relock-all revokes gated reads first. Canonical bytes stay
+/// in SQLCipher/sealed blobs, so a conflict is always recoverable.
+pub(crate) fn prepare_folder_exports_before_relock(
+    state: &AppState,
+    folder_id: &str,
+) -> Result<(), AppError> {
+    let meeting_rows = state.db.meeting_note_export_rows_in_folder(folder_id)?;
+    let note_rows = state.db.note_exported_path_rows_in_folder(folder_id)?;
+    ensure_no_external_edit_siblings(
+        meeting_rows
+            .iter()
+            .map(|(_, _, path, _)| path)
+            .chain(note_rows.iter().map(|(_, path)| path)),
+    )?;
+    for (_, _, path, expected) in &meeting_rows {
+        verify_note_export_unchanged(
+            path,
+            expected.as_deref(),
+            "verify meeting-note export before relock",
+        )?;
+    }
+    for (note_id, path) in &note_rows {
+        let expected = state.db.get_note_doc_exported_hash(note_id)?;
+        verify_note_export_unchanged(
+            path,
+            expected.as_deref(),
+            "verify authored-note export before relock",
+        )?;
+    }
+    let attachments = state.db.attachments_in_folder(folder_id)?;
+    verify_attachment_exports(
+        &attachments,
+        "could not verify an exported image before relock",
+    )?;
+
+    for (_, _, path, expected) in &meeting_rows {
+        remove_note_export_if_unchanged(
+            path,
+            expected.as_deref(),
+            "remove meeting-note export before relock",
+        )?;
+    }
+    for (note_id, path) in &note_rows {
+        let expected = state.db.get_note_doc_exported_hash(note_id)?;
+        remove_note_export_if_unchanged(
+            path,
+            expected.as_deref(),
+            "remove authored-note export before relock",
+        )?;
+    }
+    for (note_id, _) in note_rows {
+        state.db.set_note_doc_exported_path(&note_id, None)?;
+    }
+
+    remove_attachment_exports(
+        &attachments,
+        "could not remove an exported image before relock",
+    )?;
+    for attachment in attachments {
+        if attachment.exported_path.is_some() {
+            state.db.set_attachment_exported_path(&attachment.id, None)?;
+        }
+    }
+    Ok(())
 }
 
 /// Lock-surface RAM hygiene: clear the live-transcript buffer ONLY when no recording is active —
@@ -5390,51 +6936,20 @@ pub(crate) fn clear_stale_live_transcript(state: &AppState) {
 /// C1/C2 — best-effort in-process teardown of EVERY capture path on a true app exit
 /// (`RunEvent::ExitRequested`, via the `lib::relock_and_zeroize_on_lifecycle` hook). Without this,
 /// quitting mid-recording never runs any `stop()`, so the Swift capture helpers (system-audio /
-/// AEC) reparent to launchd and keep writing their temp WAVs until their 4h self-cap — the
-/// next-launch reaper (`aec::reap_orphaned_capture_helpers`) becomes the ONLY thing that reclaims
-/// them. Calling this on a clean exit finalizes + reaps them in-process, so the reaper is the true
-/// safety net rather than the primary path.
+/// AEC) would have to rely on their exact parent-owned stdin lifetime pipe and 4 h wall cap. A clean
+/// exit finalizes + reaps the retained current-process children immediately. The next-launch
+/// helper scan is detection-only and blocks overlap; it never guesses across PID generations.
 ///
-/// For each slot: `take()` it OUT of `AppState` under its own lock (deterministic — no `Drop`
-/// ordering ambiguity), then let the value's teardown run:
-///   - `system_recorder` / `aec_recorder`: `.stop()` SIGTERMs the helper so it flushes its WAV, then
-///     reaps it (their `Drop` would do the same, but the explicit `stop()` matches the clean-Stop
-///     path and consumes the value so the `Drop` no-ops).
-///   - `recorder` / `spill_writer`: just `take()` — their existing `Drop` handles teardown (the
-///     spill guard deletes the plaintext spill; the recorder stops its cpal stream) and runs
-///     deterministically at end of scope.
+/// The single `ActiveRecording` value is taken OUT of `AppState`; its component drops stop cpal,
+/// terminate the system helper and close the durable spool. There are no split slots that can be
+/// partially cleared or accidentally paired with another generation.
 ///
 /// Panic-free: a POISONED slot mutex is skipped (`.lock().ok()`), a `stop()` error is ignored — this
 /// is a last-chance exit hook with no `Result` to surface. Never touches the DB / lock model. NOTE:
 /// call this ONLY on the true exit path, never on a mere window-hide (the app keeps recording in the
 /// tray then — see `lib::relock_and_zeroize_on_lifecycle`).
 pub(crate) fn stop_all_capture(state: &AppState) {
-    // System-audio sidecar: SIGTERM-flush + reap.
-    if let Some(rec) = state
-        .system_recorder
-        .lock()
-        .ok()
-        .and_then(|mut slot| slot.take())
-    {
-        let _ = rec.stop();
-    }
-    // AEC (VPIO) helper: SIGTERM-flush + reap.
-    if let Some(rec) = state
-        .aec_recorder
-        .lock()
-        .ok()
-        .and_then(|mut slot| slot.take())
-    {
-        let _ = rec.stop();
-    }
-    // The cpal mic recorder: `Drop` stops its stream — `take()` makes that deterministic here.
-    let _mic = state.recorder.lock().ok().and_then(|mut slot| slot.take());
-    // The crash-salvage spill writer: `Drop` stops the thread + deletes the plaintext spill.
-    let _spill = state
-        .spill_writer
-        .lock()
-        .ok()
-        .and_then(|mut slot| slot.take());
+    let _active = state.recorder.lock().ok().and_then(|mut slot| slot.take());
 }
 
 // ── Phase 0.5 full per-folder lock: transcript + timeline + audio seal helpers ──
@@ -5512,7 +7027,12 @@ pub(crate) fn try_unwrap_ck_with_candidates(
 /// AAD for a content blob (note / transcript segment / timeline). Bound to
 /// `folder_id | meeting_id | provider_id | record_type | schema_version`. `provider_id` is the note
 /// provider for note rows, or a fixed sentinel for transcript/timeline rows (which have no provider).
-pub(crate) fn aad_content(folder_id: &str, meeting_id: &str, provider_id: &str, record_type: &str) -> Vec<u8> {
+pub(crate) fn aad_content(
+    folder_id: &str,
+    meeting_id: &str,
+    provider_id: &str,
+    record_type: &str,
+) -> Vec<u8> {
     format!(
         "murmur:content:v{AAD_SCHEMA_VERSION}|folder={folder_id}|meeting={meeting_id}|provider={provider_id}|type={record_type}"
     )
@@ -5614,7 +7134,12 @@ fn seal_audio_at_rest(
     aad: &[u8],
 ) -> Result<Option<String>, AppError> {
     let Some(path) = path else { return Ok(None) };
-    if path.ends_with(ENC_SUFFIX) || !std::path::Path::new(&path).exists() {
+    if path.ends_with(ENC_SUFFIX)
+        || !crate::crypto::owned_regular_file_exists(
+            std::path::Path::new(&path),
+            "inspect plaintext audio before seal",
+        )?
+    {
         return Ok(None);
     }
     let enc_path = format!("{path}{ENC_SUFFIX}");
@@ -5624,7 +7149,10 @@ fn seal_audio_at_rest(
         std::path::Path::new(&enc_path),
         aad,
     )?;
-    let _ = std::fs::remove_file(&path);
+    crate::crypto::remove_file_verified_absent(
+        std::path::Path::new(&path),
+        "remove plaintext audio after verified seal",
+    )?;
     Ok(Some(enc_path))
 }
 
@@ -5652,61 +7180,138 @@ fn session_unseal_audio(
     Ok(Some(plain))
 }
 
-/// RE-BLANK (relock): drop the decrypted session copy + re-point at the durable `.enc`. Returns
-/// the `.enc` path to persist (`None` if already sealed or the `.enc` is missing). No crypto → no AAD.
-fn reblank_audio(path: Option<String>) -> Result<Option<String>, AppError> {
+/// RE-BLANK (relock): re-seal any surviving plaintext under the retained session CK, then remove it
+/// and re-point at the newly verified `.enc`. Re-encrypting instead of trusting mere `.enc`
+/// existence prevents a corrupt/tampered ciphertext from becoming the only copy.
+fn reblank_audio(
+    ck: Option<&[u8; 32]>,
+    path: Option<String>,
+    aad: &[u8],
+) -> Result<Option<String>, AppError> {
     let Some(path) = path else { return Ok(None) };
     if path.ends_with(ENC_SUFFIX) {
+        // Crash window: decrypt publish succeeded but the DB setter did not. The row still points
+        // at `.enc`, while its canonical plaintext sibling exists. Reblank must remove that sibling
+        // too; treating the `.enc` pointer as an unconditional no-op strands plaintext forever.
+        if !crate::crypto::owned_regular_file_exists(
+            std::path::Path::new(&path),
+            "verify encrypted audio during relock",
+        )? {
+            return Err(AppError::Storage(
+                "sealed audio pointer has no encrypted artifact".into(),
+            ));
+        }
+        let plain = path.trim_end_matches(ENC_SUFFIX).to_string();
+        if crate::crypto::owned_regular_file_exists(
+            std::path::Path::new(&plain),
+            "inspect crash-window plaintext audio during relock",
+        )? {
+            let ck = ck.ok_or_else(|| {
+                AppError::Locked(
+                    "relock found crash-window plaintext audio without a session key".into(),
+                )
+            })?;
+            return seal_audio_at_rest(ck, Some(plain), aad);
+        }
         return Ok(None);
     }
+
+    let plain_exists = crate::crypto::owned_regular_file_exists(
+        std::path::Path::new(&path),
+        "inspect plaintext audio during relock",
+    )?;
     let enc_path = format!("{path}{ENC_SUFFIX}");
-    if !std::path::Path::new(&enc_path).exists() {
-        return Ok(None);
+    if plain_exists {
+        let ck = ck.ok_or_else(|| {
+            AppError::Locked("relock found plaintext audio without a session key".into())
+        })?;
+        // Always regenerate+verify the sealed twin from this exact plaintext before deletion. An
+        // older `.enc` may be corrupt; existence alone is not a loss-safety proof.
+        return seal_audio_at_rest(ck, Some(path), aad);
     }
-    let _ = std::fs::remove_file(&path);
-    Ok(Some(enc_path))
+    if crate::crypto::owned_regular_file_exists(
+        std::path::Path::new(&enc_path),
+        "verify encrypted audio for dangling relock pointer",
+    )? {
+        return Ok(Some(enc_path));
+    }
+    Ok(None) // dangling DB pointer, but neither plaintext nor ciphertext exists.
 }
 
-/// PERMANENT-unseal (remove-lock): decrypt `<file>.enc` → `<file>`, then remove the `.enc`.
-/// Returns the plaintext path to persist (`None` if not sealed). Never loses audio. `aads` is the
-/// role→role-less decrypt ladder (see [`audio_decrypt_ladder`]) so a pre-role master still decrypts.
+/// PERMANENT-unseal preparation: durably decrypt `<file>.enc` → `<file>` but KEEP the `.enc` until
+/// the caller has persisted the plaintext pointer and atomically flipped the folder open. This
+/// ordering makes every crash recoverable: while the folder is still locked startup removes the
+/// plaintext session copy; after the folder is open an orphan `.enc` is only redundant ciphertext.
+/// Returns the plaintext path to persist (`None` if not sealed). `aads` is the role→role-less
+/// decrypt ladder (see [`audio_decrypt_ladder`]) so a pre-role master still decrypts.
+struct PermanentUnsealedAudio {
+    plaintext_path: String,
+    sealed_path: String,
+}
+
 fn permanent_unseal_audio(
     ck: &[u8; 32],
-    enc_path: Option<String>,
+    stored_path: Option<String>,
     aads: &[&[u8]],
-) -> Result<Option<String>, AppError> {
-    let Some(enc_path) = enc_path else {
+) -> Result<Option<PermanentUnsealedAudio>, AppError> {
+    let Some(stored_path) = stored_path else {
         return Ok(None);
     };
-    if !enc_path.ends_with(ENC_SUFFIX) {
+    let (plain, sealed) = if stored_path.ends_with(ENC_SUFFIX) {
+        (
+            stored_path.trim_end_matches(ENC_SUFFIX).to_string(),
+            stored_path,
+        )
+    } else {
+        (stored_path.clone(), format!("{stored_path}{ENC_SUFFIX}"))
+    };
+    let sealed_path = std::path::Path::new(&sealed);
+    if !crate::crypto::owned_regular_file_exists(
+        sealed_path,
+        "inspect retained encrypted audio during permanent unlock",
+    )? {
         return Ok(None);
     }
-    let plain = enc_path.trim_end_matches(ENC_SUFFIX).to_string();
-    crate::crypto::decrypt_file_multi(
-        ck,
-        std::path::Path::new(&enc_path),
-        std::path::Path::new(&plain),
-        aads,
-    )?;
-    let _ = std::fs::remove_file(&enc_path);
-    Ok(Some(plain))
+    let plain_path = std::path::Path::new(&plain);
+    if crate::crypto::owned_regular_file_exists(
+        plain_path,
+        "inspect plaintext audio during permanent unlock",
+    )? {
+        crate::crypto::verify_encrypted_file_matches_plaintext_multi(
+            ck,
+            sealed_path,
+            plain_path,
+            aads,
+        )?;
+    } else {
+        crate::crypto::decrypt_file_multi(ck, sealed_path, plain_path, aads)?;
+    }
+    Ok(Some(PermanentUnsealedAudio {
+        plaintext_path: plain,
+        sealed_path: sealed,
+    }))
 }
 
 /// SEAL every governed meeting's transcript + timeline under `ck`, then the audio WAV. Mirrors
 /// `lock_folder`'s note seal: each blob is verified-decryptable BEFORE the plaintext is blanked /
 /// the plaintext WAV is removed — content (transcript / audio) is never lost.
-pub(crate) fn seal_folder_extras(state: &AppState, folder_id: &str, ck: &[u8; 32]) -> Result<(), AppError> {
-    let meeting_ids = state.db.meeting_ids_in_folder(folder_id)?;
+pub(crate) fn seal_folder_extras(db: &Db, folder_id: &str, ck: &[u8; 32]) -> Result<(), AppError> {
+    let meeting_ids = db.meeting_ids_in_folder(folder_id)?;
     for mid in &meeting_ids {
-        seal_meeting_extras(state, folder_id, mid, ck)?;
+        seal_meeting_extras(db, folder_id, mid, ck)?;
     }
     // Document ingestion: SEAL every uploaded document's text (USER-AUTHORED PRIMARY content,
     // SEALED-AND-RESTORED like the note markdown / typed notes — never lost). Encrypt the plaintext
     // under the folder CK, VERIFY it decrypts back byte-identical (verify-before-destroy), THEN blank
     // the plaintext. Done per FOLDER (documents anchor on the folder, not a meeting). An empty text ⇒
     // nothing to seal (blob stays NULL); an already-sealed document (blank text) is skipped.
-    for d in state.db.raw_documents_in_folder(folder_id)? {
+    for d in db.raw_documents_in_folder(folder_id)? {
         if d.text.is_empty() {
+            if let Some(blob) = &d.blob {
+                // Idempotent repair must authenticate already-sealed rows too. Merely observing a
+                // non-NULL blob is not proof that the only surviving copy is decryptable.
+                crate::crypto::decrypt(ck, blob, &aad_document(folder_id, &d.id))?;
+            }
             continue;
         }
         let aad = aad_document(folder_id, &d.id);
@@ -5716,27 +7321,238 @@ pub(crate) fn seal_folder_extras(state: &AppState, folder_id: &str, ck: &[u8; 32
                 "document seal verification failed (blob mismatch)".into(),
             ));
         }
-        state.db.seal_document(&d.id, &blob)?;
+        db.seal_document(&d.id, &blob)?;
     }
     Ok(())
+}
+
+/// Authenticated startup completion for a folder whose durable `locked=1 + wrapped_key` marker
+/// may have been published before every governed artifact finished sealing. This is deliberately
+/// idempotent: surviving plaintext is freshly sealed under the recovered CK, existing ciphertext
+/// is AEAD-verified, and no plaintext pathname is removed before a byte-valid replacement exists.
+pub(crate) fn repair_locked_folder_at_rest(
+    db: &Db,
+    folder_id: &str,
+    ck: &[u8; 32],
+) -> Result<(), AppError> {
+    // Meeting-note exports must be removed while their recorded path still exists. `seal_note`
+    // clears that cleanup authority, so delete/prove absent first on both initial seal and repair.
+    for note in db.notes_in_folder(folder_id)? {
+        let aad = aad_content(folder_id, &note.meeting_id, &note.provider_id, "note");
+        let blob = if note.markdown.is_empty() {
+            match note.content_blob {
+                Some(blob) => {
+                    crate::crypto::decrypt(ck, &blob, &aad)?;
+                    blob
+                }
+                None => crate::crypto::encrypt(ck, b"", &aad)?,
+            }
+        } else {
+            let blob = crate::crypto::encrypt(ck, note.markdown.as_bytes(), &aad)?;
+            if crate::crypto::decrypt(ck, &blob, &aad)? != note.markdown.as_bytes() {
+                return Err(AppError::Storage(
+                    "startup note-seal verification failed".into(),
+                ));
+            }
+            blob
+        };
+        if let Some(path) = note.exported_path.as_deref() {
+            let expected = db.get_note_exported_hash(&note.meeting_id, &note.provider_id)?;
+            remove_note_export_if_unchanged(
+                path,
+                expected.as_deref(),
+                "remove meeting-note export during startup seal repair",
+            )?;
+        }
+        db.seal_note(&note.meeting_id, &note.provider_id, &blob)?;
+    }
+
+    // Covers every transcript/timeline/manual-note/document row and every plaintext-pointing audio
+    // column. Rows already sealed are skipped; crash-window plaintext is re-encrypted from source.
+    seal_folder_extras(db, folder_id, ck)?;
+
+    // Authored-note exports are a separate filesystem copy of `documents(kind='note').text`.
+    // Delete/prove absent while each row still carries its cleanup path, then clear that one path.
+    // A failure leaves the path durable and aborts startup before any content surface is exposed.
+    for (document_id, path) in db.note_exported_path_rows_in_folder(folder_id)? {
+        let expected = db.get_note_doc_exported_hash(&document_id)?;
+        remove_note_export_if_unchanged(
+            &path,
+            expected.as_deref(),
+            "remove authored-note export during startup seal repair",
+        )?;
+        db.set_note_doc_exported_path(&document_id, None)?;
+    }
+
+    for meeting_id in db.meeting_ids_in_folder(folder_id)? {
+        let playback = db.get_meeting(&meeting_id)?.and_then(|m| m.audio_path);
+        let (playback_role, playback_legacy) =
+            audio_decrypt_ladder(&meeting_id, folder_id, StreamRole::Playback);
+        if let Some(path) = repair_locked_audio_at_rest(
+            ck,
+            playback,
+            &playback_role,
+            &[&playback_role, &playback_legacy],
+        )? {
+            db.set_meeting_audio_path(&meeting_id, Some(&path))?;
+        }
+
+        let (mic, system) = db.get_meeting_master_paths(&meeting_id)?;
+        let (mic_role, mic_legacy) = audio_decrypt_ladder(&meeting_id, folder_id, StreamRole::Mic);
+        if let Some(path) =
+            repair_locked_audio_at_rest(ck, mic, &mic_role, &[&mic_role, &mic_legacy])?
+        {
+            db.set_meeting_mic_master_path(&meeting_id, Some(&path))?;
+        }
+        let (system_role, system_legacy) =
+            audio_decrypt_ladder(&meeting_id, folder_id, StreamRole::Sys);
+        if let Some(path) =
+            repair_locked_audio_at_rest(ck, system, &system_role, &[&system_role, &system_legacy])?
+        {
+            db.set_meeting_sys_master_path(&meeting_id, Some(&path))?;
+        }
+    }
+    Ok(())
+}
+
+/// Non-destructive predicate for the incomplete-seal/crash-unlock shapes that require the folder CK
+/// before startup may re-blank or remove anything. It deliberately does not decrypt here, so a fully
+/// sealed folder does not prompt for Touch ID on every launch; once any residue is found the repair
+/// authenticates/reseals the whole folder before cleanup.
+pub(crate) fn locked_folder_requires_authenticated_repair(
+    db: &Db,
+    folder_id: &str,
+) -> Result<bool, AppError> {
+    for note in db.notes_in_folder(folder_id)? {
+        if !note.markdown.is_empty() || note.content_blob.is_none() || note.exported_path.is_some()
+        {
+            return Ok(true);
+        }
+    }
+    if !db.note_exported_path_rows_in_folder(folder_id)?.is_empty() {
+        return Ok(true);
+    }
+    for document in db.raw_documents_in_folder(folder_id)? {
+        // An empty blob-less document/note is a valid empty source; only surviving plaintext is a
+        // repair marker here. Meeting-note rows above always carry a sealed blob, including empties.
+        if !document.text.is_empty() {
+            return Ok(true);
+        }
+    }
+    for meeting_id in db.meeting_ids_in_folder(folder_id)? {
+        if db
+            .raw_segments(&meeting_id)?
+            .iter()
+            .any(|segment| !segment.text.is_empty() || segment.text_blob.is_none())
+        {
+            return Ok(true);
+        }
+        if db
+            .raw_timeline(&meeting_id)?
+            .is_some_and(|timeline| !timeline.data.is_empty() || timeline.data_blob.is_none())
+        {
+            return Ok(true);
+        }
+        if db
+            .raw_manual_notes(&meeting_id)?
+            .is_some_and(|notes| !notes.text.is_empty())
+        {
+            return Ok(true);
+        }
+
+        let playback = db
+            .get_meeting(&meeting_id)?
+            .and_then(|meeting| meeting.audio_path);
+        let (mic, system) = db.get_meeting_master_paths(&meeting_id)?;
+        for path in [playback, mic, system].into_iter().flatten() {
+            if locked_audio_path_requires_repair(&path)? {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn locked_audio_path_requires_repair(path: &str) -> Result<bool, AppError> {
+    if !path.ends_with(ENC_SUFFIX) {
+        return Ok(true);
+    }
+    let encrypted = std::path::Path::new(path);
+    if !crate::crypto::owned_regular_file_exists(
+        encrypted,
+        "inspect locked encrypted audio before startup repair",
+    )? {
+        return Ok(true);
+    }
+    let plain = std::path::Path::new(path.trim_end_matches(ENC_SUFFIX));
+    crate::crypto::owned_regular_file_exists(
+        plain,
+        "inspect locked plaintext audio sibling before startup repair",
+    )
+}
+
+fn repair_locked_audio_at_rest(
+    ck: &[u8; 32],
+    recorded_path: Option<String>,
+    fresh_aad: &[u8],
+    decrypt_aads: &[&[u8]],
+) -> Result<Option<String>, AppError> {
+    let Some(recorded_path) = recorded_path else {
+        return Ok(None);
+    };
+    let (plain, encrypted) = if let Some(plain) = recorded_path.strip_suffix(ENC_SUFFIX) {
+        (plain.to_string(), recorded_path)
+    } else {
+        (
+            recorded_path.clone(),
+            format!("{recorded_path}{ENC_SUFFIX}"),
+        )
+    };
+    let plain_exists = crate::crypto::owned_regular_file_exists(
+        std::path::Path::new(&plain),
+        "inspect locked plaintext audio during startup repair",
+    )?;
+    if plain_exists {
+        crate::crypto::encrypt_file(
+            ck,
+            std::path::Path::new(&plain),
+            std::path::Path::new(&encrypted),
+            fresh_aad,
+        )?;
+        crate::crypto::remove_file_verified_absent(
+            std::path::Path::new(&plain),
+            "remove plaintext audio after authenticated startup repair",
+        )?;
+        return Ok(Some(encrypted));
+    }
+    if !crate::crypto::owned_regular_file_exists(
+        std::path::Path::new(&encrypted),
+        "inspect encrypted audio during startup repair",
+    )? {
+        return Err(AppError::Storage(
+            "locked audio has neither its plaintext nor encrypted artifact".into(),
+        ));
+    }
+    crate::crypto::verify_encrypted_file_multi(ck, std::path::Path::new(&encrypted), decrypt_aads)?;
+    Ok(Some(encrypted))
 }
 
 /// Seal ONE meeting's transcript + timeline + audio WAV under the folder CK (the per-meeting body of
 /// [`seal_folder_extras`]). Reused by [`move_note`] to seal a note moved INTO a session-unlocked
 /// locked folder (BLK-2) without touching the folder's other meetings. Verify-before-destroy
 /// throughout (no transcript / audio loss); idempotent on already-sealed rows.
-fn seal_meeting_extras(
-    state: &AppState,
-    folder_id: &str,
-    mid: &str,
-    ck: &[u8; 32],
-) -> Result<(), AppError> {
+fn seal_meeting_extras(db: &Db, folder_id: &str, mid: &str, ck: &[u8; 32]) -> Result<(), AppError> {
     // Transcript: encrypt each segment's plaintext text, verify, then seal (blank text).
-    let segs = state.db.raw_segments(mid)?;
+    let segs = db.raw_segments(mid)?;
     let mut sealed_segs: Vec<(i64, Vec<u8>)> = Vec::new();
     for s in &segs {
         // Skip rows already sealed (text_blob present, text blank) — idempotent.
         if s.text_blob.is_some() && s.text.is_empty() {
+            crate::crypto::decrypt(
+                ck,
+                s.text_blob.as_deref().expect("checked above"),
+                &aad_content(folder_id, mid, AAD_NO_PROVIDER, "segment"),
+            )?;
             continue;
         }
         let aad = aad_content(folder_id, mid, AAD_NO_PROVIDER, "segment");
@@ -5749,12 +7565,18 @@ fn seal_meeting_extras(
         sealed_segs.push((s.idx, blob));
     }
     for (idx, blob) in &sealed_segs {
-        state.db.seal_segment(mid, *idx, blob)?;
+        db.seal_segment(mid, *idx, blob)?;
     }
 
     // Timeline: encrypt the cached JSON (if any), verify, then seal (blank data).
-    if let Some(tl) = state.db.raw_timeline(mid)? {
-        if !(tl.data_blob.is_some() && tl.data.is_empty()) {
+    if let Some(tl) = db.raw_timeline(mid)? {
+        if tl.data_blob.is_some() && tl.data.is_empty() {
+            crate::crypto::decrypt(
+                ck,
+                tl.data_blob.as_deref().expect("checked above"),
+                &aad_content(folder_id, mid, AAD_NO_PROVIDER, "timeline"),
+            )?;
+        } else {
             let aad = aad_content(folder_id, mid, AAD_NO_PROVIDER, "timeline");
             let blob = crate::crypto::encrypt(ck, tl.data.as_bytes(), &aad)?;
             if crate::crypto::decrypt(ck, &blob, &aad)? != tl.data.as_bytes() {
@@ -5762,7 +7584,7 @@ fn seal_meeting_extras(
                     "timeline seal verification failed (blob mismatch)".into(),
                 ));
             }
-            state.db.seal_timeline(mid, &blob)?;
+            db.seal_timeline(mid, &blob)?;
         }
     }
 
@@ -5773,21 +7595,21 @@ fn seal_meeting_extras(
     // (B7/B8 + stream-role hardening). The timeline was already sealed just above — do NOT re-seal it.
     if let Some(enc) = seal_audio_at_rest(
         ck,
-        state.db.get_meeting(mid)?.and_then(|m| m.audio_path),
+        db.get_meeting(mid)?.and_then(|m| m.audio_path),
         &aad_audio_role(mid, folder_id, StreamRole::Playback),
     )? {
-        state.db.set_meeting_audio_path(mid, Some(&enc))?;
+        db.set_meeting_audio_path(mid, Some(&enc))?;
     }
-    let (mic, sys) = state.db.get_meeting_master_paths(mid)?;
+    let (mic, sys) = db.get_meeting_master_paths(mid)?;
     if let Some(enc) =
         seal_audio_at_rest(ck, mic, &aad_audio_role(mid, folder_id, StreamRole::Mic))?
     {
-        state.db.set_meeting_mic_master_path(mid, Some(&enc))?;
+        db.set_meeting_mic_master_path(mid, Some(&enc))?;
     }
     if let Some(enc) =
         seal_audio_at_rest(ck, sys, &aad_audio_role(mid, folder_id, StreamRole::Sys))?
     {
-        state.db.set_meeting_sys_master_path(mid, Some(&enc))?;
+        db.set_meeting_sys_master_path(mid, Some(&enc))?;
     }
 
     // brain2 realtime notes: SEAL the user's typed in-meeting notes (USER-AUTHORED PRIMARY content)
@@ -5795,7 +7617,7 @@ fn seal_meeting_extras(
     // byte-identical (verify-before-destroy), then blank the plaintext. NEVER blanked without the
     // sealed copy, and reversed by the matching unseal (session-unlock / remove-lock). An empty
     // buffer ⇒ nothing to seal (blob stays NULL); an already-sealed buffer (blank text) is skipped.
-    if let Some(rn) = state.db.raw_manual_notes(mid)? {
+    if let Some(rn) = db.raw_manual_notes(mid)? {
         if !rn.text.is_empty() {
             let aad = aad_content(folder_id, mid, AAD_NO_PROVIDER, "manual_notes");
             let blob = crate::crypto::encrypt(ck, rn.text.as_bytes(), &aad)?;
@@ -5804,7 +7626,13 @@ fn seal_meeting_extras(
                     "manual-notes seal verification failed (blob mismatch)".into(),
                 ));
             }
-            state.db.seal_manual_notes(mid, &blob)?;
+            db.seal_manual_notes(mid, &blob)?;
+        } else if let Some(blob) = &rn.blob {
+            crate::crypto::decrypt(
+                ck,
+                blob,
+                &aad_content(folder_id, mid, AAD_NO_PROVIDER, "manual_notes"),
+            )?;
         }
     }
     Ok(())
@@ -5985,13 +7813,13 @@ pub(crate) fn unseal_folder_extras(
     // v3 audit gap #3): an authored note re-chunks through the front-matter-stripping path.
     // Best-effort: a failure logs (no PII) and does NOT fail the unlock — the text is restored.
     if !restored_doc_ids.is_empty() {
-        let embedder = crate::embed::embed_model_present().then(crate::embed::active_embedder);
         for did in &restored_doc_ids {
-            if let Err(e) = index_document_row_kind_routed(&state.db, did, embedder.as_deref()) {
+            if let Err(e) = index_document_row_kind_routed(&state.db, did, meeting_embedder) {
                 tracing::warn!(target: "rag", error = %e, "document re-index on unlock failed (text restored)");
             }
         }
     }
+    unseal_attachments_in_folder(state, folder_id, ck, false)?;
     // MEETINGS: re-index the folder's meetings into note_chunks + vec_chunks so semantic /
     // related-meetings recover in-session (their note markdown was restored by `unlock_folder`
     // BEFORE this call). The caller supplies the model-gated `meeting_embedder` — never a stub
@@ -6036,6 +7864,116 @@ fn reexport_notes_in_folder(state: &AppState, folder_id: &str) {
     }
 }
 
+/// Drain the SQLCipher-backed lock-marker export outbox. Each exact vault path is scrubbed in place
+/// (machine-owned block only), byte-verified and directory-synced before its rows are acknowledged.
+/// External edits and user wikilinks outside the managed block survive; no collision sibling is
+/// created because such a sibling would itself retain the sealed title. Path/title never enter logs.
+pub(crate) fn drain_lock_marker_export_cleanup(db: &Db) -> Result<(), AppError> {
+    let pending = db.pending_lock_marker_export_cleanup()?;
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let vault_path = db
+        .get_setting("vault_path")?
+        .filter(|path| !path.is_empty())
+        .ok_or_else(|| {
+            AppError::Storage(
+                "marker-export cleanup is pending but no configured vault root is available".into(),
+            )
+        })?;
+    let vault = crate::export::MarkerCleanupVault::open(std::path::Path::new(&vault_path))?;
+    let mut by_path: std::collections::BTreeMap<
+        String,
+        Vec<crate::storage::links::LockMarkerExportCleanup>,
+    > = std::collections::BTreeMap::new();
+    for row in pending {
+        by_path
+            .entry(row.exported_path.clone())
+            .or_default()
+            .push(row);
+    }
+
+    let mut drained = 0usize;
+    for (path, rows) in by_path {
+        let note_path = std::path::Path::new(&path);
+        let titles: std::collections::HashSet<String> =
+            rows.iter().map(|row| row.sealed_title.clone()).collect();
+        let transform = |body: &str| {
+            Db::strip_titles_from_managed_block(body, &titles).unwrap_or_else(|| body.to_string())
+        };
+        let mut final_body = None;
+        let mut reconciled = false;
+        // At most one recovery and one fresh publish are normally required. The third pass is a
+        // bounded allowance for a crash-state rollback that preserved a concurrent vault edit.
+        for _ in 0..3 {
+            let publish = db.reserve_lock_marker_export_publish(&path)?;
+            let note = vault.note(note_path, &publish.stage_name)?;
+            if note.recover_marker_publish(
+                db,
+                &publish,
+                crate::export::MAX_MARKER_CLEANUP_NOTE_BYTES,
+                &transform,
+            )? {
+                continue;
+            }
+            let Some(snapshot) =
+                note.read_owned_snapshot(crate::export::MAX_MARKER_CLEANUP_NOTE_BYTES)?
+            else {
+                note.sync_absent(crate::export::MAX_MARKER_CLEANUP_NOTE_BYTES, &transform)?;
+                db.clear_lock_marker_export_publish(&publish)?;
+                reconciled = true;
+                break;
+            };
+
+            let scrubbed = transform(snapshot.text());
+            // Rewrite even when already scrubbed. That replay case is a crash after publish but
+            // before outbox acknowledgement; another durable atomic publish proves the file safe.
+            note.overwrite_owned_snapshot(db, &publish, snapshot, &scrubbed, &transform)?;
+            final_body = Some(scrubbed);
+            reconciled = true;
+            break;
+        }
+        if !reconciled {
+            return Err(AppError::Storage(
+                "marker-export cleanup exceeded bounded crash recovery attempts".into(),
+            ));
+        }
+        if let Some(scrubbed) = final_body {
+            let hash = crate::export::note_content_hash(&scrubbed);
+            for owner_rows in marker_cleanup_owner_groups(&rows) {
+                db.ack_lock_marker_export_cleanup(&owner_rows, Some(&scrubbed), Some(&hash))?;
+            }
+        } else {
+            for owner_rows in marker_cleanup_owner_groups(&rows) {
+                db.ack_lock_marker_export_cleanup(&owner_rows, None, None)?;
+            }
+        }
+        drained += rows.len();
+    }
+    tracing::info!(target: "links", drained, "drained durable lock-marker export cleanup rows");
+    Ok(())
+}
+
+fn marker_cleanup_owner_groups(
+    rows: &[crate::storage::links::LockMarkerExportCleanup],
+) -> Vec<Vec<crate::storage::links::LockMarkerExportCleanup>> {
+    let mut groups: std::collections::BTreeMap<
+        (String, String, String),
+        Vec<crate::storage::links::LockMarkerExportCleanup>,
+    > = std::collections::BTreeMap::new();
+    for row in rows {
+        groups
+            .entry((
+                row.source_kind.clone(),
+                row.source_id.clone(),
+                row.provider_id.clone(),
+            ))
+            .or_default()
+            .push(row.clone());
+    }
+    groups.into_values().collect()
+}
+
 /// Brain-v3 audit Fix 4 — the FILESYSTEM half of the sealed-neighbour marker strip: given the
 /// `(is_meeting, source_id)` sources whose managed block the seal tx just scrubbed in the DB,
 /// re-export each VISIBLE source's vault `.md` so the on-disk file no longer names the sealed
@@ -6064,9 +8002,13 @@ pub(crate) fn reexport_stripped_marker_sources(state: &AppState, sources: &[(boo
                     }
                 }
                 Ok(None) => {}
-                Err(e) => tracing::warn!(target: "links", meeting_id = %source_id, error = %e, "marker-strip .md re-export: note read failed"),
+                Err(e) => {
+                    tracing::warn!(target: "links", meeting_id = %source_id, error = %e, "marker-strip .md re-export: note read failed")
+                }
             }
-        } else if let Err(e) = export_note_to_vault(state, source_id) {
+        } else if let Err(e) =
+            export_note_to_vault_under_lifecycle_authorized(state, source_id)
+        {
             // Note-doc source: the gate inside is satisfied (a stripped source is VISIBLE by
             // construction — the strip skips sealed-at-rest sources).
             tracing::warn!(target: "links", note_id = %source_id, error = %e, "marker-strip .md re-export (note) failed");
@@ -6075,33 +8017,23 @@ pub(crate) fn reexport_stripped_marker_sources(state: &AppState, sources: &[(boo
 }
 
 /// Brain-v3 audit Fix 4 — RELOCK helper: resolve the given folders' meeting + document ids, strip
-/// their `[[Title]]` markers from VISIBLE source notes, and re-export those sources' `.md`. Best-effort
-/// (a resolve/strip failure logs and never fails the relock). Called on relock_folder / relock_all
-/// BEFORE the relock purge drops the naming edges. Distinct from the initial-lock inline call only in
-/// that it spans a SET of folders (the relocked ones).
-pub(crate) fn strip_and_reexport_markers_for_folders(
+/// their `[[Title]]` markers from VISIBLE source notes and journal the exact vault paths in the same
+/// transaction. The caller finishes the folder-owned purge/reblank first and drains the journal as
+/// its last privacy leg. Called BEFORE the link purge drops the naming edges.
+pub(crate) fn enqueue_marker_cleanup_for_folders(
     state: &AppState,
     folder_ids: &std::collections::HashSet<String>,
-) {
+) -> Result<(), AppError> {
     let mut meeting_ids: Vec<String> = Vec::new();
     let mut document_ids: Vec<String> = Vec::new();
     for fid in folder_ids {
-        match state.db.meeting_ids_in_folder(fid) {
-            Ok(mut m) => meeting_ids.append(&mut m),
-            Err(e) => tracing::warn!(target: "links", error = %e, "relock marker strip: meeting-id list failed"),
-        }
-        match state.db.document_ids_in_folder(fid) {
-            Ok(mut d) => document_ids.append(&mut d),
-            Err(e) => tracing::warn!(target: "links", error = %e, "relock marker strip: document-id list failed"),
-        }
+        meeting_ids.append(&mut state.db.meeting_ids_in_folder(fid)?);
+        document_ids.append(&mut state.db.document_ids_in_folder(fid)?);
     }
-    match state
+    state
         .db
-        .strip_sealed_neighbour_markers(&meeting_ids, &document_ids)
-    {
-        Ok(changed) => reexport_stripped_marker_sources(state, &changed),
-        Err(e) => tracing::warn!(target: "links", error = %e, "relock sealed-neighbour marker strip failed"),
-    }
+        .strip_sealed_neighbour_markers(&meeting_ids, &document_ids)?;
+    Ok(())
 }
 
 /// RE-BLANK (relock): re-blank the plaintext transcript + timeline of every governed meeting and
@@ -6110,9 +8042,9 @@ pub(crate) fn strip_and_reexport_markers_for_folders(
 pub(crate) fn reblank_folder_extras(state: &AppState, folder_id: &str) -> Result<(), AppError> {
     // SEAL-NET KEY (2026-07-16 lock review of #356): resolve the folder CK from the SESSION-CACHED
     // KEK only — never a keychain/biometric prompt (this runs on relock / app-close / screen-share).
-    // `relock_all_inner` zeroizes the KEK BEFORE its sweep by design (screen-share posture), so the
-    // net is live on the `relock_folder` path and absent on relock-all — there, non-rederivable
-    // rows are left in place and warned about instead (a bounded residue beats destroying content).
+    // Both relock paths retain the KEK until every filesystem reblank succeeds, then zeroize it as
+    // the final session-state commit. A failed reblank therefore remains retryable and never claims
+    // a locked state while a known plaintext audio path survives.
     let seal_ck: Option<Zeroizing<[u8; 32]>> = (|| {
         let kek = state.master_kek.lock().ok()?.clone()?;
         let wrapped = state.db.folder_wrapped_key(folder_id).ok().flatten()?;
@@ -6140,63 +8072,43 @@ pub(crate) fn reblank_folder_extras(state: &AppState, folder_id: &str) -> Result
                 state.db.set_manual_notes(&mid, "")?;
             }
         }
-        if let Some(enc) = reblank_audio(state.db.get_meeting(&mid)?.and_then(|m| m.audio_path))? {
+        let playback_aad = aad_audio_role(&mid, folder_id, StreamRole::Playback);
+        if let Some(enc) = reblank_audio(
+            seal_ck.as_deref(),
+            state.db.get_meeting(&mid)?.and_then(|m| m.audio_path),
+            &playback_aad,
+        )? {
             state.db.set_meeting_audio_path(&mid, Some(&enc))?;
         }
         let (mic, sys) = state.db.get_meeting_master_paths(&mid)?;
-        if let Some(enc) = reblank_audio(mic)? {
+        let mic_aad = aad_audio_role(&mid, folder_id, StreamRole::Mic);
+        if let Some(enc) = reblank_audio(seal_ck.as_deref(), mic, &mic_aad)? {
             state.db.set_meeting_mic_master_path(&mid, Some(&enc))?;
         }
-        if let Some(enc) = reblank_audio(sys)? {
+        let sys_aad = aad_audio_role(&mid, folder_id, StreamRole::Sys);
+        if let Some(enc) = reblank_audio(seal_ck.as_deref(), sys, &sys_aad)? {
             state.db.set_meeting_sys_master_path(&mid, Some(&enc))?;
         }
         // FAIL-CLOSED sweep (2026-07-16 reviews: #352 adversarial MEDIUM, then the #356 lock-review
         // FAIL that scoped it): segment rows carrying PLAINTEXT with NO sealed blob — a
         // pipeline/move killed before its seal step — are invisible to the blob-guarded re-blanks
-        // above. Decided per meeting, on PROOF, never on the comment's say-so:
-        //   1. provably RE-DERIVABLE (status Error/Recording — exactly the states the retry gate
-        //      accepts — AND this meeting's audio survives on disk, plaintext or `.enc`): DELETE.
-        //      Unlock + retry re-transcribes; nothing unrecoverable is destroyed.
-        //   2. otherwise, with the folder CK resolvable from the session KEK: SEAL them in place
-        //      (verify-before-blank via `seal_meeting_extras`, which also covers the same crash's
-        //      unsealed timeline/manual-notes/audio) — e.g. a kill mid-`move_note` leaves a
-        //      COMPLETED meeting's transcript unsealed; deleting it would destroy the only copy.
-        //   3. neither: LEAVE + WARN. A bounded plaintext residue behind the SQLCipher layer is
-        //      strictly better than loss — content is NEVER deleted without a provable copy.
+        // above. A transcript is user-authored/corrected canonical content: audio re-transcription
+        // is NOT a byte-identical recovery copy. Therefore the only safe action is to seal and
+        // decrypt-verify these exact rows under the folder CK. Without a cached session key, retain
+        // them behind the logical gate and return an error for an authenticated repair retry.
         let has_unsealed = state
             .db
             .raw_segments(&mid)?
             .iter()
             .any(|s| s.text_blob.is_none());
         if has_unsealed {
-            let rederivable = state.db.get_meeting(&mid)?.is_some_and(|m| {
-                matches!(
-                    m.status,
-                    MeetingStatus::Recording | MeetingStatus::Error
-                ) && m.audio_path.as_deref().is_some_and(|p| {
-                    let plain = p.strip_suffix(ENC_SUFFIX).unwrap_or(p);
-                    std::path::Path::new(plain).exists()
-                        || std::path::Path::new(&format!("{plain}{ENC_SUFFIX}")).exists()
-                })
-            });
-            if rederivable {
-                let purged = state.db.delete_unsealed_segments(&mid)?;
-                if purged > 0 {
-                    tracing::warn!(target: "lock", meeting_id = %mid, purged, "relock purged unsealed plaintext segments left by an interrupted pipeline (audio survives on disk; unlock + retry to re-transcribe)");
-                }
-            } else if let Some(ck) = seal_ck.as_ref() {
-                // Best-effort by design: a seal failure must not abort the relock (that would
-                // leave MORE plaintext) — the rows stay, warned about, recoverable via unlock.
-                match seal_meeting_extras(state, folder_id, &mid, ck) {
-                    Ok(()) => {
-                        tracing::warn!(target: "lock", meeting_id = %mid, "relock sealed crash-window plaintext (interrupted move/seal) in place under the folder CK");
-                    }
-                    Err(e) => {
-                        tracing::warn!(target: "lock", meeting_id = %mid, error = %e, "relock could not seal crash-window plaintext segments — left in place (never deleted without a provable copy)");
-                    }
-                }
+            if let Some(ck) = seal_ck.as_ref() {
+                seal_meeting_extras(&state.db, folder_id, &mid, ck)?;
+                tracing::warn!(target: "lock", meeting_id = %mid, "relock authenticated and sealed exact crash-window transcript rows in place under the folder CK");
             } else {
-                tracing::warn!(target: "lock", meeting_id = %mid, "relock found unsealed plaintext segments that are not provably re-derivable and no session KEK is cached — left in place (unlock the folder to seal or retry)");
+                return Err(AppError::Locked(
+                    "relock found an exact transcript without a cached session key; content retained for authenticated repair".into(),
+                ));
             }
         }
     }
@@ -6221,34 +8133,28 @@ pub(crate) fn reblank_folder_extras(state: &AppState, folder_id: &str) -> Result
     // the path is cleared ONLY after its `.md` was actually deleted (or is already absent) — a
     // FAILED delete keeps the path recorded so the next relock/startup pass retries (the pre-fix
     // bulk clear forgot the leaked `.md` forever). Count-only log — never paths (note titles).
-    // Phase-0 follow-up: warn (counts only) when external-edit siblings sit next to these
-    // exports — the relock deletes only the canonical `.md`s, never a preserved sibling.
+    // Export files were integrity-checked and removed before logical visibility was revoked by the
+    // relock entrypoint. A startup-repair caller can still arrive with legacy retry metadata, so
+    // keep this idempotent second pass fail-closed too.
     let relock_doc_rows = state.db.note_exported_path_rows_in_folder(folder_id)?;
-    warn_external_edit_siblings("relock", relock_doc_rows.iter().map(|(_, p)| p));
+    ensure_no_external_edit_siblings(relock_doc_rows.iter().map(|(_, p)| p))?;
     for (doc_id, p) in relock_doc_rows {
-        let removed = match std::fs::remove_file(&p) {
-            Ok(()) => true,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
-            Err(e) => {
-                tracing::warn!(
-                    target: "lock",
-                    error = %e,
-                    "relock: deleting a re-exported note .md failed — keeping exported_path for retry"
-                );
-                false
-            }
-        };
-        if removed {
-            state.db.set_note_doc_exported_path(&doc_id, None)?;
-        }
+        let expected = state.db.get_note_doc_exported_hash(&doc_id)?;
+        remove_note_export_if_unchanged(
+            &p,
+            expected.as_deref(),
+            "remove re-exported note during relock",
+        )?;
+        state.db.set_note_doc_exported_path(&doc_id, None)?;
     }
+    reblank_attachments_in_folder(state, folder_id)?;
     Ok(())
 }
 
-/// PERMANENT remove-lock: decrypt every governed meeting's transcript + timeline back to plaintext,
-/// clear the `*_blob` columns, and permanently restore the plaintext WAV (decrypt .enc → file,
-/// remove the .enc). NEVER lose audio — the plaintext is written + the file decrypts before the
-/// `.enc` is removed.
+/// PERMANENT remove-lock preparation: decrypt every governed meeting's transcript + timeline back
+/// to plaintext and durably restore the plaintext WAV while RETAINING all `*_blob` columns. The
+/// caller atomically clears those blobs together with `locked=0`, then retires returned redundant
+/// `.enc` paths. This ordering makes every crash recoverable.
 /// `meeting_embedder`: the caller-resolved, model-gated embedder for the MEETING re-index (see
 /// [`unseal_folder_extras`] for why it is injected rather than resolved internally).
 pub(crate) fn unseal_folder_extras_permanent(
@@ -6256,10 +8162,15 @@ pub(crate) fn unseal_folder_extras_permanent(
     folder_id: &str,
     ck: &[u8; 32],
     meeting_embedder: Option<&dyn crate::embed::Embedder>,
-) -> Result<(), AppError> {
+) -> Result<Vec<String>, AppError> {
+    // Retire these ciphertexts only AFTER `remove_lock_inner` commits `locked=0`. Keeping them
+    // through the whole restore closes the crash window where the DB still says locked but neither
+    // its `.enc` pointer nor startup reconciliation can reconstruct the already-published WAV.
+    let mut sealed_audio_to_retire = Vec::new();
     for mid in state.db.meeting_ids_in_folder(folder_id)? {
         // Transcript: restore each segment from its blob (or keep the in-memory text if the folder
-        // was session-unlocked and the blob is absent), then clear all blobs for the meeting.
+        // was session-unlocked and the blob is absent). The final folder-open transaction clears
+        // every blob only after all plaintext/audio restoration has succeeded.
         for s in state.db.raw_segments(&mid)? {
             if let Some(blob) = &s.text_blob {
                 let aad = aad_content(folder_id, &mid, AAD_NO_PROVIDER, "segment");
@@ -6270,8 +8181,6 @@ pub(crate) fn unseal_folder_extras_permanent(
                 state.db.restore_segment_text(&mid, s.idx, &text)?;
             }
         }
-        state.db.clear_segment_blobs(&mid)?;
-
         if let Some(tl) = state.db.raw_timeline(&mid)? {
             if let Some(blob) = &tl.data_blob {
                 let aad = aad_content(folder_id, &mid, AAD_NO_PROVIDER, "timeline");
@@ -6282,11 +8191,9 @@ pub(crate) fn unseal_folder_extras_permanent(
                 state.db.restore_timeline_data(&mid, &data)?;
             }
         }
-        state.db.clear_timeline_blob(&mid)?;
-
         // Typed notes: permanently restore the plaintext from the blob (or keep the in-memory
-        // plaintext if the folder was session-unlocked and the blob is absent), then clear the blob.
-        // NEVER lose the typed notes — the plaintext is back before the blob is dropped.
+        // plaintext if the folder was session-unlocked and the blob is absent). Keep the blob until
+        // the final atomic folder-open commit.
         if let Some(rn) = state.db.raw_manual_notes(&mid)? {
             if let Some(blob) = &rn.blob {
                 let aad = aad_content(folder_id, &mid, AAD_NO_PROVIDER, "manual_notes");
@@ -6297,27 +8204,33 @@ pub(crate) fn unseal_folder_extras_permanent(
                 state.db.set_manual_notes(&mid, &text)?;
             }
         }
-        state.db.clear_manual_notes_blob(&mid)?;
-
         // Audio at rest: permanently restore the playback WAV + both masters from their .enc, each
-        // decrypted through the role→role-less AAD ladder (a pre-role master still decrypts); the
-        // .enc is dropped only after the plaintext is back.
+        // decrypted through the role→role-less AAD ladder (a pre-role master still decrypts). The
+        // `.enc` remains until the caller has committed this folder permanently open.
+        let playback_enc = state.db.get_meeting(&mid)?.and_then(|m| m.audio_path);
         let (pb_role, pb_less) = audio_decrypt_ladder(&mid, folder_id, StreamRole::Playback);
-        if let Some(plain) = permanent_unseal_audio(
-            ck,
-            state.db.get_meeting(&mid)?.and_then(|m| m.audio_path),
-            &[&pb_role, &pb_less],
-        )? {
-            state.db.set_meeting_audio_path(&mid, Some(&plain))?;
+        if let Some(restored) =
+            permanent_unseal_audio(ck, playback_enc.clone(), &[&pb_role, &pb_less])?
+        {
+            state
+                .db
+                .set_meeting_audio_path(&mid, Some(&restored.plaintext_path))?;
+            sealed_audio_to_retire.push(restored.sealed_path);
         }
         let (mic, sys) = state.db.get_meeting_master_paths(&mid)?;
         let (mic_role, mic_less) = audio_decrypt_ladder(&mid, folder_id, StreamRole::Mic);
-        if let Some(plain) = permanent_unseal_audio(ck, mic, &[&mic_role, &mic_less])? {
-            state.db.set_meeting_mic_master_path(&mid, Some(&plain))?;
+        if let Some(restored) = permanent_unseal_audio(ck, mic.clone(), &[&mic_role, &mic_less])? {
+            state
+                .db
+                .set_meeting_mic_master_path(&mid, Some(&restored.plaintext_path))?;
+            sealed_audio_to_retire.push(restored.sealed_path);
         }
         let (sys_role, sys_less) = audio_decrypt_ladder(&mid, folder_id, StreamRole::Sys);
-        if let Some(plain) = permanent_unseal_audio(ck, sys, &[&sys_role, &sys_less])? {
-            state.db.set_meeting_sys_master_path(&mid, Some(&plain))?;
+        if let Some(restored) = permanent_unseal_audio(ck, sys.clone(), &[&sys_role, &sys_less])? {
+            state
+                .db
+                .set_meeting_sys_master_path(&mid, Some(&restored.plaintext_path))?;
+            sealed_audio_to_retire.push(restored.sealed_path);
         }
     }
     // Document ingestion: PERMANENTLY restore each document's plaintext from its blob (or keep the
@@ -6334,16 +8247,14 @@ pub(crate) fn unseal_folder_extras_permanent(
                 .map_err(|_| AppError::Storage("decrypted document is not valid UTF-8".into()))?;
             state.db.set_document_text(&d.id, &text)?;
         }
-        state.db.clear_document_blob(&d.id)?;
         restored_doc_ids.push(d.id.clone());
     }
     if !restored_doc_ids.is_empty() {
         // Chunks + FTS come back unconditionally (keyword retrieval works model-less); vectors only
         // when the REAL e5 model is present (never stub vectors). KIND-ROUTED (Brain v3 audit gap
         // #3): an authored note re-chunks through the front-matter-stripping path.
-        let embedder = crate::embed::embed_model_present().then(crate::embed::active_embedder);
         for did in &restored_doc_ids {
-            if let Err(e) = index_document_row_kind_routed(&state.db, did, embedder.as_deref()) {
+            if let Err(e) = index_document_row_kind_routed(&state.db, did, meeting_embedder) {
                 tracing::warn!(target: "rag", error = %e, "document re-index on remove-lock failed (text restored)");
             }
         }
@@ -6358,7 +8269,7 @@ pub(crate) fn unseal_folder_extras_permanent(
     // NOTES: the folder is permanently open — re-export each authored note's vault `.md` (deleted on
     // lock) so the note lives on disk again. Best-effort (the plaintext text was restored above).
     reexport_notes_in_folder(state, folder_id);
-    Ok(())
+    Ok(sealed_audio_to_retire)
 }
 
 /// READ-GATE predicate (the user's actual complaint): a meeting is unlocked iff its folder is open
@@ -6368,7 +8279,9 @@ pub(crate) fn unseal_folder_extras_permanent(
 /// Snapshot the live session unlock set (the same source `list_folders` / the graph reads use).
 /// Passed to the `*_visible` DB reads (BLK-2b) so a sealed-and-not-unlocked meeting contributes
 /// nothing to digests, search, last-note, topic threads, etc. — independent of at-rest blanking.
-pub(crate) fn unlocked_snapshot(state: &AppState) -> Result<std::collections::HashSet<String>, AppError> {
+pub(crate) fn unlocked_snapshot(
+    state: &AppState,
+) -> Result<std::collections::HashSet<String>, AppError> {
     Ok(state
         .unlocked_folders
         .lock()
@@ -6533,24 +8446,30 @@ pub(crate) fn upsert_note_reseal_if_locked(
     state: &AppState,
     note: &NoteRecord,
 ) -> Result<(), AppError> {
+    let attachment_owner = crate::storage::AttachmentOwner::Meeting {
+        meeting_id: note.meeting_id.clone(),
+        provider_id: note.provider_id.clone(),
+    };
+    validate_attachment_references_before_save(state, &attachment_owner, &note.markdown)?;
     let locked_folder = match state.db.folder_for_meeting(&note.meeting_id)? {
         Some(fid) => state.db.folder_by_id(&fid)?.filter(|f| f.locked),
         None => None,
     };
-    let Some(folder) = locked_folder else {
-        return state.db.upsert_note(note);
-    };
-    let ck = session_folder_ck(state, &folder.id)?;
-    let aad = aad_content(&folder.id, &note.meeting_id, &note.provider_id, "note");
-    let blob = crate::crypto::encrypt(&ck, note.markdown.as_bytes(), &aad)?;
-    if crate::crypto::decrypt(&ck, &blob, &aad)? != note.markdown.as_bytes() {
-        return Err(AppError::Storage(
-            "note seal-on-write verification failed (blob mismatch)".into(),
-        ));
+    if let Some(folder) = locked_folder {
+        let ck = session_folder_ck(state, &folder.id)?;
+        let aad = aad_content(&folder.id, &note.meeting_id, &note.provider_id, "note");
+        let blob = crate::crypto::encrypt(&ck, note.markdown.as_bytes(), &aad)?;
+        if crate::crypto::decrypt(&ck, &blob, &aad)? != note.markdown.as_bytes() {
+            return Err(AppError::Storage(
+                "note seal-on-write verification failed (blob mismatch)".into(),
+            ));
+        }
+        state.db.upsert_note_sealed(note, &blob, &folder.id)?;
+        tracing::debug!(target: "lock", meeting_id = %note.meeting_id, "seal-on-write: meeting note re-sealed under the folder CK");
+    } else {
+        state.db.upsert_note(note)?;
     }
-    state.db.upsert_note_sealed(note, &blob, &folder.id)?;
-    tracing::debug!(target: "lock", meeting_id = %note.meeting_id, "seal-on-write: meeting note re-sealed under the folder CK");
-    Ok(())
+    prune_unreferenced_attachments(state, &attachment_owner, &note.markdown)
 }
 
 /// Persist the meeting's typed-notes buffer, RE-SEALING the fresh text into `manual_notes_blob`
@@ -6715,8 +8634,6 @@ pub(crate) fn assert_in_vault(
     Ok(resolved)
 }
 
-
-
 // ═══════════════════════════════════════════════════════════════════════════════════════════════
 // M3-CLIENT — account (OPAQUE) + zero-knowledge link sharing (mode A). Spec §3/§4.7/§7.
 //
@@ -6754,7 +8671,6 @@ pub struct AccountStatus {
     /// NO Touch ID prompt is presented to compute this (existence probe only).
     pub biometric_unlock_available: bool,
 }
-
 
 /// Read the configured sharing-server base URL from the live config (empty ⇒ unset).
 pub(crate) fn share_base_url(state: &AppState) -> Result<String, AppError> {
@@ -7012,8 +8928,6 @@ pub fn account_status(state: State<'_, AppState>) -> Result<AccountStatus, AppEr
         biometric_unlock_available,
     })
 }
-
-
 
 /// `mark_sharing_choice_made` — persist that the user has RESOLVED the first-run sharing decision
 /// (either "use Murmur locally" OR they went through the account door), so the init gateway
@@ -7347,13 +9261,6 @@ pub async fn unlock_sharing_with_biometric(
     account_status(state)
 }
 
-
-
-
-
-
-
-
 // ═══════════════════════════════════════════════════════════════════════════════════════════════
 // M5-CLIENT — Murmur↔Murmur (mode B). Spec §4.8 / §6 / §7. THE HIGHEST LOCK BAR: `accept_share`
 // WRITES into the user's Obsidian vault, so it is gated + verified before a single byte lands.
@@ -7371,10 +9278,6 @@ pub async fn unlock_sharing_with_biometric(
 //     gen-mismatch) BEFORE any write — on failure it writes NOTHING; IDEMPOTENT on `share_id`.
 // ═══════════════════════════════════════════════════════════════════════════════════════════════
 
-
-
-
-
 /// The TOFU state of a contact's current key vs the local pin.
 pub(crate) enum TofuState {
     /// Never pinned — first contact (pin it, show safety words).
@@ -7384,7 +9287,6 @@ pub(crate) enum TofuState {
     /// The pin DIFFERS — a key change; BLOCK until re-verified (spec §4.8).
     Changed,
 }
-
 
 /// Compare a contact's current `fingerprint` to the local pin WITHOUT mutating anything.
 pub(crate) fn tofu_check(
@@ -7440,23 +9342,6 @@ pub(crate) fn session_server_user_id(state: &AppState) -> Result<String, AppErro
     })
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 #[cfg(test)]
 #[path = "tests/lock_read_gate_tests.rs"]
 mod lock_read_gate_tests;
@@ -7466,6 +9351,9 @@ mod lock_read_gate_tests;
 #[path = "tests/lifecycle_tests.rs"]
 mod lifecycle_tests;
 
+#[cfg(test)]
+#[path = "tests/attachment_tests.rs"]
+mod attachment_tests;
 
 // ─── Task 1.4 — gateway key command argument validation ────────────────────────────────────────
 #[cfg(test)]

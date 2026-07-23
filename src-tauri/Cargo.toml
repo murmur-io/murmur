@@ -57,7 +57,7 @@ async-trait = "0.1"
 rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl"] }
 # ── Local reasoning brain — EXTRACTED to the sibling member crate `crates/murmur-brain` ──
 # mistralrs (in-process GGUF inference, Metal) NO LONGER links into this app crate: it was extracted
-# into `crates/murmur-brain`, compiled to a killable helper binary `meetnotes-brain`. The app drives
+# into `crates/murmur-brain`, compiled to a killable helper binary `murmur-brain`. The app drives
 # it through `reason::sidecar::SidecarReasoner` over the NDJSON protocol in `crates/murmur-brain/src/
 # brain_ipc.rs` — so `cargo test --lib` stops compiling the largest single ML tree, and killing the
 # child reclaims ALL model RAM to the OS (idle-unload / per-request timeout / app-quit). Model

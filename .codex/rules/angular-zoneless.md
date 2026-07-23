@@ -1,7 +1,7 @@
-# Angular 18 Zoneless — Murmur `src/app` (binding ruleset)
+# Angular 22 Zoneless — Murmur `src/app` (binding ruleset)
 
 > The canonical FE ruleset for Murmur's Angular frontend. BINDING: every rule
-> here is enforced. The frontend is **zoneless** (`provideExperimentalZonelessChangeDetection()`
+> here is enforced. The frontend is **zoneless** (`provideZonelessChangeDetection()`
 > in `src/app/app.config.ts`) — there is no Zone.js, so change detection only runs
 > when a **signal** changes, a template event fires, or an explicit
 > `markForCheck`-equivalent happens. Plain mutable fields do not trigger renders.
@@ -18,7 +18,7 @@
 
 ## 1. Component shape (HARD)
 
-- **Standalone only.** No `NgModule`. `standalone: true` on every `@Component`.
+- **Standalone only.** No `NgModule`. Components are standalone by default in Angular 22; do not add redundant `standalone: true`.
 - **`OnPush` always.** `changeDetection: ChangeDetectionStrategy.OnPush`. Under
   zoneless this is effectively mandatory; omitting it does not buy you anything.
 - **Directory per component, split files** (convention CHANGED 2026-07-04 with
@@ -216,24 +216,22 @@ prototype is the reference implementation). The concrete contract:
 
 ## CRITICAL Murmur-specific traps
 
-### T1 — NG0600: signal write inside a tracked `effect()`
-Angular 18 throws **NG0600 ("Writing to signals is not allowed in a `computed`
-or an `effect` by default")** when an `effect()` writes a signal it could also
-read. The two real cases are IPC-on-input-change effects that set
-`loading`/`error` synchronously before `await`. Pass the flag:
+### T1 — stale async results inside a tracked `effect()`
+Signal writes inside effects are allowed since Angular 19. The old
+`allowSignalWrites` option is a deprecated no-op and must not be reintroduced.
+The real trap is an IPC-on-input-change effect whose older response overwrites
+newer state. Use a monotonically increasing request token:
 
 ```ts
 private readonly _load = effect(
-  () => { const id = this.entityId(); this.loading.set(true); void this.fetch(id); },
-  { allowSignalWrites: true },   // REQUIRED in Angular 18
+  () => { const id = this.entityId(); const token = ++this.loadToken; void this.fetch(id, token); },
 );
 ```
 
 Live examples: `entity-detail.component.ts:305-315`, `graph.component.ts:512-520`.
-Prefer **deriving with `computed()`** where possible; only reach for
-`allowSignalWrites` when the effect genuinely orchestrates an async IPC fetch.
-(Note: Murmur is pinned to Angular `^18.2.0` where this option exists; do not
-assume v19 semantics.)
+Prefer **deriving with `computed()`** where possible. Effects may orchestrate
+async IPC, but every result must prove it still belongs to the newest request
+before mutating state.
 
 ### T2 — mutually-recursive standalone components need `forwardRef`
 `FolderTreeComponent` ↔ `FolderRowComponent` render each other (a row renders

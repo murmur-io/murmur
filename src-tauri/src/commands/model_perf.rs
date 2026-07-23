@@ -333,11 +333,12 @@ pub struct SelectEmbedModelResult {
 }
 
 /// Persist the user's SELECTED on-device embedding model id. Validates `model_id` against the
-/// registry (unknown ⇒ `AppError::InvalidArg`) and saves it to config; `AppConfig::save` republishes
-/// the process-global selection so `embed::active_embedder`/`embed_model_present`/`download_embed_model`
-/// pick up the new model with NO restart. Switching the model INVALIDATES existing vectors (a
-/// different model's embeddings are not comparable), so `reindex_needed` is `true` when the resolved
-/// model actually changed — the FE then prompts the user to download (if missing) + re-index. All
+/// registry (unknown ⇒ `AppError::InvalidArg`) and saves it to config; the selection update seam
+/// republishes the process-global resolver so `embed::active_embedder`/`embed_model_present`/
+/// `download_embed_model` pick up the new model with NO restart. Switching the model INVALIDATES
+/// existing vectors (a different model's embeddings are not comparable), so `reindex_needed` is
+/// `true` when the resolved model actually changed — the FE then prompts the user to download (if
+/// missing) + re-index. All
 /// bundled options are BERT/384 ⇒ NO `vec0` schema migration. Does NOT download and does NOT auto-
 /// reindex (both are explicit user actions).
 #[tauri::command]
@@ -357,25 +358,35 @@ pub(crate) fn select_embed_model_inner(
     let model = crate::embed::embed_model_by_id(&model_id)
         .ok_or_else(|| AppError::InvalidArg(format!("unknown embed model id: {model_id}")))?;
 
-    let mut c = state
-        .config
-        .lock()
-        .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
+    let reindex_needed = crate::embed::with_embed_selection_update(|| {
+        let mut c = state
+            .config
+            .lock()
+            .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
 
-    // The PREVIOUS resolved model id (None/empty/unknown ⇒ the default) — the re-index trigger keys
-    // on a real change of the resolved model, not merely a config-string write.
-    let prev_resolved = c
-        .embed_model_id
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .and_then(crate::embed::embed_model_by_id)
-        .map(|m| m.id)
-        .unwrap_or(crate::embed::DEFAULT_EMBED_MODEL_ID);
-    let reindex_needed = prev_resolved != model.id;
+        // The PREVIOUS resolved model id (None/empty/unknown ⇒ the default) — the re-index trigger
+        // keys on a real resolved-model change, not merely a config-string write.
+        let prev_resolved = c
+            .embed_model_id
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .and_then(crate::embed::embed_model_by_id)
+            .map(|m| m.id)
+            .unwrap_or(crate::embed::DEFAULT_EMBED_MODEL_ID);
+        let reindex_needed = prev_resolved != model.id;
 
-    c.embed_model_id = Some(model.id.to_string());
-    c.save(&state.db)?; // republishes the process-global selection.
-    drop(c);
+        // Persist a candidate first. Mutating the live cache before a fallible DB transaction would
+        // leave cache=B while the process resolver remains A. A real model switch atomically purges
+        // all old-model vector partitions with the setting write; chunks/FTS remain available.
+        let mut candidate = c.clone();
+        candidate.embed_model_id = Some(model.id.to_string());
+        state
+            .db
+            .set_embed_model_selection(model.id, reindex_needed)?;
+        let selected_id = candidate.embed_model_id.clone();
+        *c = candidate;
+        Ok((reindex_needed, selected_id))
+    })?;
 
     Ok(SelectEmbedModelResult {
         selected: model.id.to_string(),

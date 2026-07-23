@@ -31,21 +31,20 @@ Murmur's "CI" is two layers of the SAME gate:
 ## Run it
 
 ```bash
-source "$HOME/.cargo/env"
 cd /Users/jakubgawronski/Projects/meetnotes
 
 # Full gate (what a release must pass; incl. the heavy E2E + model download):
-bash scripts/ci.sh
+scripts/agent-resource-run -- bash scripts/ci.sh
 
 # The PR-gate subset (exactly what the GitHub `gate` job runs — no E2E):
-MURMUR_CI_SKIP_E2E=1 bash scripts/ci.sh
+MURMUR_CI_SKIP_E2E=1 scripts/agent-resource-run -- bash scripts/ci.sh
 ```
 
-> The **inner iterate loop is NOT ci.sh** — it's `(cd src-tauri && cargo test --lib)` (fast, ~lib tests). Run the full `ci.sh` once before shipping / to reproduce CI, not on every edit.
+> The inner loop is `scripts/agent-resource-run --chdir src-tauri -- cargo test --lib`. Every agent Cargo/rustc/full-CI command uses this lane.
 
 ## Reproduce a red CI run locally (the #1 job)
 
-1. **Use the SAME command CI used.** CI gate red? → full `bash scripts/ci.sh` (that is what every PR runs since the release-parity change). For a fast local subset while iterating: `MURMUR_CI_SKIP_E2E=1 bash scripts/ci.sh`. Matching the command rules out "works on my machine" drift.
+1. **Use the same script through the local resource lane.** Full: `scripts/agent-resource-run -- bash scripts/ci.sh`; subset: `MURMUR_CI_SKIP_E2E=1 scripts/agent-resource-run -- bash scripts/ci.sh`.
 2. **Read the failing step, not the summary.** ci.sh prints a `── <step> ──` banner before each; the first non-zero exit stops it (`set -euo pipefail`). Find the last banner — that's the culprit.
 3. **Pull the cloud log** when it's CI-only:
    ```bash
@@ -57,7 +56,7 @@ MURMUR_CI_SKIP_E2E=1 bash scripts/ci.sh
 ## Gotchas (repo-specific — each is real)
 
 - **Cold builds are slow, on purpose.** The mistralrs/candle/tokenizers ML tree is ALWAYS compiled (feature gates removed) → the first CI build (or after a deps bump / cache miss) pulls hundreds of MB. `Swatinem/rust-cache` keeps the incremental loop fast. Don't "fix" a slow cold build by ripping out the ML deps.
-- **`cargo clippy --all-targets` is BLOCKED as a bare command** by `.codex/hooks/block-bash.sh` (it thrashes the openssl/sqlcipher profile and times out in the iterate loop). It runs fine INSIDE `ci.sh` (allowed as `bash scripts/ci.sh`). To reproduce just clippy, run the whole `ci.sh` — don't call the raw clippy line.
+- **All agent Cargo/rustc/full-CI work is blocked bare.** Run the inner test or the whole gate through `scripts/agent-resource-run`; this includes `cargo metadata` and Tauri dev/build.
 - **The E2E is heavy + host-specific.** `e2e-core.sh` downloads `ggml-base.en.bin` (~142 MB) and needs `say` + ffmpeg; the provider step falls back to a **stub note** when no `claude` CLI is present (so it passes in CI). In CI the model is `actions/cache`d and ffmpeg brew-installed, so the per-PR full gate stays affordable; locally, skip it while iterating with `MURMUR_CI_SKIP_E2E=1`.
 - **macOS-only steps.** `swiftc`/ScreenCaptureKit, whisper Metal, `say`, the universal build — a Linux runner would silently skip them. CI must stay on `macos-14`.
 - **`cargo audit`/`cargo deny` self-install** (via `cargo install`) if absent — slow. In CI they're pre-installed prebuilt (`taiki-e/install-action`); locally, the first run compiles them once.

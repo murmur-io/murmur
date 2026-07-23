@@ -6,6 +6,8 @@ import { ToastService } from "./toast.service";
 
 /** Backend event fired the instant a screen share begins (privacy panic signal). */
 export const EVENT_SCREEN_SHARE_STARTED = "murmur://screen-share-started";
+export const EVENT_SCREEN_SHARE_RELOCK_FAILED =
+  "murmur://screen-share-relock-failed";
 
 /**
  * Privacy guard: when the OS begins a screen share, the backend has ALREADY
@@ -24,15 +26,15 @@ export class ScreenShareService {
   private readonly conversation = inject(MeetingConversationStore);
   private readonly destroyRef = inject(DestroyRef);
 
-  /** Live event-listener handle (null when not yet initialised / torn down). */
-  private unlisten: UnlistenFn | null = null;
+  /** Live event-listener handles (empty when not yet initialised / torn down). */
+  private unlisten: UnlistenFn[] = [];
   /** Guards against overlapping init() calls before the listen() resolves. */
   private initializing = false;
 
   constructor() {
     this.destroyRef.onDestroy(() => {
-      this.unlisten?.();
-      this.unlisten = null;
+      for (const unlisten of this.unlisten) unlisten();
+      this.unlisten = [];
     });
   }
 
@@ -42,14 +44,23 @@ export class ScreenShareService {
    * live (or being registered) does nothing.
    */
   async init(): Promise<void> {
-    if (this.unlisten || this.initializing) {
+    if (this.unlisten.length > 0 || this.initializing) {
       return;
     }
     this.initializing = true;
     try {
-      this.unlisten = await listen(EVENT_SCREEN_SHARE_STARTED, () => {
+      const success = await listen(EVENT_SCREEN_SHARE_STARTED, () => {
         void this.onScreenShareStarted();
       });
+      try {
+        const failure = await listen(EVENT_SCREEN_SHARE_RELOCK_FAILED, () => {
+          void this.onScreenShareRelockFailed();
+        });
+        this.unlisten = [success, failure];
+      } catch (error) {
+        success();
+        throw error;
+      }
     } finally {
       this.initializing = false;
     }
@@ -68,5 +79,19 @@ export class ScreenShareService {
     this.conversation.clearHint();
     await this.folders.load();
     this.toast.info("Locked your private folders — screen sharing started");
+  }
+
+  /**
+   * Physical cleanup hit a loss-safety conflict after the backend had already revoked every gated
+   * read and hidden Murmur's main window. Keep the UI cache empty and report an explicit alarm —
+   * never reuse the normal success copy for a partially secured vault.
+   */
+  private async onScreenShareRelockFailed(): Promise<void> {
+    this.conversation.clearHint();
+    await this.folders.load();
+    this.toast.danger(
+      "Could not secure every vault export — Murmur was hidden. Stop screen sharing and resolve the edited file.",
+      0,
+    );
   }
 }

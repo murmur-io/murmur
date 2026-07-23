@@ -210,7 +210,10 @@ pub(crate) fn access_token_needs_refresh(
         return true; // unknown expiry ⇒ refresh now (covers pre-feature sessions + omitted fields).
     };
     match chrono::DateTime::parse_from_rfc3339(raw) {
-        Ok(exp) => now + chrono::Duration::seconds(ACCESS_REFRESH_SKEW_SECS) >= exp.with_timezone(&chrono::Utc),
+        Ok(exp) => {
+            now + chrono::Duration::seconds(ACCESS_REFRESH_SKEW_SECS)
+                >= exp.with_timezone(&chrono::Utc)
+        }
         Err(_) => true, // malformed ⇒ refresh (never trust an unparseable expiry).
     }
 }
@@ -308,11 +311,20 @@ mod tests {
         // Malformed expiry ⇒ refresh (never trust an unparseable value).
         assert!(access_token_needs_refresh(Some("not-a-timestamp"), now));
         // Already expired ⇒ refresh.
-        assert!(access_token_needs_refresh(Some("2026-07-05T11:45:00Z"), now));
+        assert!(access_token_needs_refresh(
+            Some("2026-07-05T11:45:00Z"),
+            now
+        ));
         // Within the skew window (< ACCESS_REFRESH_SKEW_SECS to expiry) ⇒ refresh proactively.
-        assert!(access_token_needs_refresh(Some("2026-07-05T12:01:00Z"), now));
+        assert!(access_token_needs_refresh(
+            Some("2026-07-05T12:01:00Z"),
+            now
+        ));
         // Comfortably in the future (a fresh 30-min token) ⇒ do NOT refresh.
-        assert!(!access_token_needs_refresh(Some("2026-07-05T12:29:00Z"), now));
+        assert!(!access_token_needs_refresh(
+            Some("2026-07-05T12:29:00Z"),
+            now
+        ));
         // A non-UTC offset that still resolves comfortably ahead ⇒ no refresh (offset handled).
         assert!(!access_token_needs_refresh(
             Some("2026-07-05T14:29:00+02:00"),

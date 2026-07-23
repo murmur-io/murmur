@@ -10,13 +10,10 @@ use std::collections::HashSet;
 
 use crate::embed::Embedder;
 use crate::storage::models::{
-    Analytics, BacklinkSource, Commitment,
-    CorrectionRecord, DayCount,
-    DocChunkHit, DocOutlineEntry, DocumentInfo, DocumentSummary, EntityKind,
-    GraphNode, Meeting, MeetingActionSummary, MeetingStatus, NoteCitation,
-    PendingShareAccept, PeopleList, PersonCard, PropertyKind,
-    PropertyValue, RecipeRecord, SavedView, SearchHit,
-    StatusCount,
+    Analytics, BacklinkSource, Commitment, CorrectionRecord, DayCount, DocChunkHit,
+    DocOutlineEntry, DocumentInfo, DocumentSummary, EntityKind, GraphNode, Meeting,
+    MeetingActionSummary, MeetingStatus, NoteCitation, PendingShareAccept, PeopleList, PersonCard,
+    PropertyKind, PropertyValue, RecipeRecord, SavedView, SearchHit, StatusCount,
 };
 use crate::transcribe::types::Segment;
 
@@ -35,15 +32,9 @@ pub struct LockedMeetingAudio {
 
 /// Return shape of [`Db::reblank_locked_folders_at_rest`]: the locked meetings' audio to
 /// re-seal, the rollup vault exports to delete, `(note_id, exported_path)` of every authored note
-/// whose session-re-exported `.md` must be reconciled (audit F2, W5 semantics), and (brain-v3 audit
-/// Fix 4) the `(is_meeting, source_id)` of every VISIBLE source whose managed block just had a
-/// crash-leftover sealed-neighbour marker stripped — the caller re-exports each such source's `.md`.
-pub type LockedAtRestCleanup = (
-    Vec<LockedMeetingAudio>,
-    Vec<String>,
-    Vec<(String, String)>,
-    Vec<(bool, String)>,
-);
+/// whose session-re-exported `.md` must be reconciled (audit F2, W5 semantics). Sealed-neighbour
+/// export cleanup is carried by the independent SQLCipher outbox, not a volatile return value.
+pub type LockedAtRestCleanup = (Vec<LockedMeetingAudio>, Vec<String>, Vec<(String, String)>);
 
 /// One meeting eligible for storage prune: NOT in a locked folder, with its three audio paths.
 /// Ordered oldest-first by [`Db::prunable_audio_candidates`]. Any column may be `None`.
@@ -737,6 +728,10 @@ impl Db {
         // Vault Audit v1 — deterministic vault-health findings + run bookkeeping (see
         // `crate::audit`). Additive + guarded so migrate() stays idempotent.
         Self::migrate_audit(&conn)?;
+        // Recording durability v2 — content-free, SQLCipher-protected ownership/lease and artifact
+        // proof ledger. Capture bytes stay in stable-handle files; this table stores only identity,
+        // length, digest and forward-only lifecycle state.
+        Self::migrate_recording_generations(&conn)?;
         // M6 Shared Brain — the local org state + the outbound org-share state machine (mirrors
         // `outbound_shares`). NOT the org_items/chunks ingest tables (a later slice owns those).
         // Additive + guarded so migrate() stays idempotent.
@@ -989,6 +984,11 @@ impl Db {
             )
             .map_err(map_err)?;
         }
+
+        // Note image attachments — canonical bytes live inside SQLCipher. Folder-locked owners
+        // additionally use the per-folder `data_blob` seal managed by the lock lifecycle.
+        // Runs after documents + org_items exist so every FK target is available.
+        Self::migrate_attachments(&conn)?;
 
         // Brain v3 PR-3 — the LINK ENGINE table (wikilink/companion/semantic edges between
         // meetings/notes/documents) + its one-time companion backfill. Additive + guarded so
@@ -1531,7 +1531,12 @@ impl Db {
         // Per-instance org toggle: which JOINED orgs actually contribute content on THIS install
         // (Settings → Organization). Default enabled (1) so every existing membership stays active
         // pre-upgrade. Guarded/additive per the migration rule.
-        Self::add_column_if_missing(conn, "org_state", "context_enabled", "INTEGER NOT NULL DEFAULT 1")
+        Self::add_column_if_missing(
+            conn,
+            "org_state",
+            "context_enabled",
+            "INTEGER NOT NULL DEFAULT 1",
+        )
     }
 
     /// M6 Shared Brain (sync/ingest slice) — the local DECRYPTED REPLICA of the org feed + its
@@ -1851,7 +1856,6 @@ impl Db {
 
     // `active_org_shares_for_folder` moved to `storage::org_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-
     /// The folder's ACTIVE 1:1 shares (LINK + Murmur↔Murmur USER) as `(share_id, mode)`, joined to
     /// the folder through the shared meeting/document. Powers the lock×shares dialog + bulk-revoke —
     /// closing the pre-existing hole where `lock_folder` never surfaced live 1:1 shares. Mirrors
@@ -1861,7 +1865,10 @@ impl Db {
     /// (recipient already registered) or `'awaiting_key'` (pending, later flipped to `'sent'` by
     /// `share_rewrap_pending`) — so all three live states must match or every real mode-B row is
     /// silently excluded. `'revoked'` (terminal, [`Self::set_outbound_share_state`]) stays excluded.
-    pub fn active_link_user_shares_for_folder(&self, folder_id: &str) -> Result<Vec<(String, String)>> {
+    pub fn active_link_user_shares_for_folder(
+        &self,
+        folder_id: &str,
+    ) -> Result<Vec<(String, String)>> {
         let conn = self.lock();
         let mut stmt = conn
             .prepare(
@@ -1886,7 +1893,6 @@ impl Db {
     }
 
     // `active_org_share_ids_for_folder` moved to `storage::org_store` (God-file split) — still callable as inherent `db.method()` cross-file.
-
 
     // ── M5-CLIENT: TOFU pins, mode-B outbound bookkeeping, inbound accept idempotency (spec §4.8/§7) ──
 
@@ -2236,7 +2242,8 @@ impl Db {
     // `clear_manual_notes_blob` moved to `storage::meetings_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
     /// Delete a meeting and (via ON DELETE CASCADE) its segments, notes, and timeline.
-    /// Audio + vault files are removed by the caller before this.
+    /// The caller must preflight nonterminal recording generations before unlinking any file; the
+    /// transaction repeats that guard and purges terminal ledger rows before the meeting row.
     ///
     /// Returns the `exported_path`s of the memory rollups purged in the same transaction (a rollup
     /// may paraphrase the deleted meeting's facts — see `purge_memory_rollups_tx`); the CALLER
@@ -2244,6 +2251,7 @@ impl Db {
     pub fn delete_meeting(&self, id: &str) -> Result<Vec<String>> {
         let mut conn = self.lock();
         let tx = conn.transaction().map_err(map_err)?;
+        Self::refuse_nonterminal_recording_generation_tx(&tx, id)?;
         // Drop derived chunks/vectors FIRST, in the same tx. `vec_chunks` is a vec0 virtual table
         // with no foreign key, so the `meetings` ON DELETE CASCADE reaches `note_chunks` but NOT
         // `vec_chunks` — without this the deleted meeting's (invertible) embeddings would persist
@@ -2289,6 +2297,7 @@ impl Db {
         // deleted meeting's (now-gone) facts; the survivors regenerate on the next hourly pass
         // from the remaining visible facts only. The caller deletes the exported `.md`s.
         let rollup_exports = Self::purge_memory_rollups_tx(&tx)?;
+        Self::purge_retired_recording_generations_tx(&tx, id)?;
         tx.execute("DELETE FROM meetings WHERE id = ?1", rusqlite::params![id])
             .map_err(map_err)?;
         tx.commit().map_err(map_err)?;
@@ -2397,11 +2406,33 @@ impl Db {
         segments: &[Segment],
         embedder: &dyn Embedder,
     ) -> Result<()> {
+        self.index_meeting_chunks_at_background_epoch(meeting_id, segments, embedder, None)
+            .map(|_| ())
+    }
+
+    pub(crate) fn index_meeting_chunks_background(
+        &self,
+        meeting_id: &str,
+        segments: &[Segment],
+        embedder: &dyn Embedder,
+        epoch: u64,
+    ) -> Result<bool> {
+        self.index_meeting_chunks_at_background_epoch(meeting_id, segments, embedder, Some(epoch))
+            .map(|committed| committed.is_some())
+    }
+
+    fn index_meeting_chunks_at_background_epoch(
+        &self,
+        meeting_id: &str,
+        segments: &[Segment],
+        embedder: &dyn Embedder,
+        background_epoch: Option<u64>,
+    ) -> Result<Option<()>> {
         // Resolve title + date (plaintext = visible metadata). Note markdown is optional — a meeting
         // may have transcript segments but no note yet (or vice versa); each class indexes on its own.
         let meeting = self.get_meeting(meeting_id)?;
         let Some(meeting) = meeting else {
-            return Ok(()); // unknown meeting — nothing to index.
+            return Ok(Some(())); // unknown meeting — nothing to index.
         };
         let title = meeting
             .title
@@ -2456,85 +2487,91 @@ impl Db {
         // Always purge this meeting's prior rows first (clean replace of BOTH classes), then insert the
         // fresh set in ONE transaction.
         let this_meeting = [meeting_id.to_string()];
-        let mut conn = self.lock();
-        let tx = conn.transaction().map_err(map_err)?;
-        // TOCTOU re-check INSIDE the write tx (mirrors `index_meeting_topic_chunks_reporting`): the
-        // gated/visible read above ran BEFORE the slow embed, and any caller `unlocked` snapshot can be
-        // stale by now. A `lock_folder` committing mid-embed blanks the note plaintext (`markdown=''`,
-        // `content_blob` kept) — that DB-side sealed-at-rest invariant is session-independent, so key the
-        // re-check on it: if the meeting is sealed at rest RIGHT NOW, inserting its derived plaintext
-        // chunks/vectors would leave sealed content at rest until the next relock/startup reconcile.
-        // Refuse (rollback via drop) — a benign no-op for every best-effort caller. UNSEAL/session-unlock
-        // paths un-blank `markdown` before re-indexing, so `sealed_at_rest` is false there and the write
-        // proceeds (defense-in-depth beyond the purge-on-seal, not a new refusal for legitimate work).
-        let sealed_at_rest: bool = tx
-            .query_row(
-                "SELECT EXISTS(
+        let commit = || -> Result<()> {
+            let mut conn = self.lock();
+            let tx = conn.transaction().map_err(map_err)?;
+            // TOCTOU re-check INSIDE the write tx (mirrors `index_meeting_topic_chunks_reporting`): the
+            // gated/visible read above ran BEFORE the slow embed, and any caller `unlocked` snapshot can be
+            // stale by now. A `lock_folder` committing mid-embed blanks the note plaintext (`markdown=''`,
+            // `content_blob` kept) — that DB-side sealed-at-rest invariant is session-independent, so key the
+            // re-check on it: if the meeting is sealed at rest RIGHT NOW, inserting its derived plaintext
+            // chunks/vectors would leave sealed content at rest until the next relock/startup reconcile.
+            // Refuse (rollback via drop) — a benign no-op for every best-effort caller. UNSEAL/session-unlock
+            // paths un-blank `markdown` before re-indexing, so `sealed_at_rest` is false there and the write
+            // proceeds (defense-in-depth beyond the purge-on-seal, not a new refusal for legitimate work).
+            let sealed_at_rest: bool = tx
+                .query_row(
+                    "SELECT EXISTS(
                    SELECT 1 FROM notes
                     WHERE meeting_id = ?1
                       AND content_blob IS NOT NULL
                       AND (markdown IS NULL OR markdown = '')
                  )",
-                rusqlite::params![meeting_id],
-                |r| Ok(r.get::<_, i64>(0)? != 0),
-            )
-            .map_err(map_err)?;
-        if sealed_at_rest {
-            return Ok(()); // sealed-at-rest mid-flight: never persist its plaintext chunks.
-        }
-        Self::purge_chunks_tx(&tx, &this_meeting)?;
-        {
-            let mut ins_chunk = tx
+                    rusqlite::params![meeting_id],
+                    |r| Ok(r.get::<_, i64>(0)? != 0),
+                )
+                .map_err(map_err)?;
+            if sealed_at_rest {
+                return Ok(()); // sealed-at-rest mid-flight: never persist its plaintext chunks.
+            }
+            Self::purge_chunks_tx(&tx, &this_meeting)?;
+            {
+                let mut ins_chunk = tx
                 .prepare(
                     "INSERT INTO note_chunks
                        (meeting_id, provider_id, chunk_idx, source_type, text, aug_text, content_hash)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 )
                 .map_err(map_err)?;
-            let mut ins_vec = tx
-                .prepare("INSERT INTO vec_chunks(chunk_id, embedding) VALUES (?1, ?2)")
-                .map_err(map_err)?;
-            // `chunk_idx` is a per-class ordinal; the two classes are distinguished by `source_type`.
-            let classes = [
-                ("voice", &note_chunks, &note_aug, &note_vectors),
-                (
-                    "transcript",
-                    &transcript_chunks,
-                    &transcript_aug,
-                    &transcript_vectors,
-                ),
-            ];
-            for (source_type, chunks, augs, vectors) in classes {
-                for (idx, ((text, aug_text), vector)) in chunks
-                    .iter()
-                    .zip(augs.iter())
-                    .zip(vectors.iter())
-                    .enumerate()
-                {
-                    // The hash covers the AUGMENTED text (the embedded bytes) so a facts/attendee
-                    // change re-embeds on the next re-index.
-                    let content_hash = format!("{:016x}", chunk_hash(aug_text));
-                    ins_chunk
-                        .execute(rusqlite::params![
-                            meeting_id,
-                            provider_id,
-                            idx as i64,
-                            source_type,
-                            text,
-                            aug_text,
-                            content_hash
-                        ])
-                        .map_err(map_err)?;
-                    let chunk_id = tx.last_insert_rowid();
-                    let blob = crate::embed::vec_to_blob(vector);
-                    ins_vec
-                        .execute(rusqlite::params![chunk_id, blob])
-                        .map_err(map_err)?;
+                let mut ins_vec = tx
+                    .prepare("INSERT INTO vec_chunks(chunk_id, embedding) VALUES (?1, ?2)")
+                    .map_err(map_err)?;
+                // `chunk_idx` is a per-class ordinal; the two classes are distinguished by `source_type`.
+                let classes = [
+                    ("voice", &note_chunks, &note_aug, &note_vectors),
+                    (
+                        "transcript",
+                        &transcript_chunks,
+                        &transcript_aug,
+                        &transcript_vectors,
+                    ),
+                ];
+                for (source_type, chunks, augs, vectors) in classes {
+                    for (idx, ((text, aug_text), vector)) in chunks
+                        .iter()
+                        .zip(augs.iter())
+                        .zip(vectors.iter())
+                        .enumerate()
+                    {
+                        // The hash covers the AUGMENTED text (the embedded bytes) so a facts/attendee
+                        // change re-embeds on the next re-index.
+                        let content_hash = format!("{:016x}", chunk_hash(aug_text));
+                        ins_chunk
+                            .execute(rusqlite::params![
+                                meeting_id,
+                                provider_id,
+                                idx as i64,
+                                source_type,
+                                text,
+                                aug_text,
+                                content_hash
+                            ])
+                            .map_err(map_err)?;
+                        let chunk_id = tx.last_insert_rowid();
+                        let blob = crate::embed::vec_to_blob(vector);
+                        ins_vec
+                            .execute(rusqlite::params![chunk_id, blob])
+                            .map_err(map_err)?;
+                    }
                 }
             }
+            tx.commit().map_err(map_err)?;
+            Ok(())
+        };
+        match background_epoch {
+            Some(epoch) => crate::perf::with_current_background_epoch(epoch, commit),
+            None => commit().map(Some),
         }
-        tx.commit().map_err(map_err)?;
-        Ok(())
     }
 
     /// Brain v2 L1.2 — the gated AUGMENTATION-HEADER inputs for one meeting, batched (ONE read per
@@ -2656,8 +2693,25 @@ impl Db {
         embedder: &dyn Embedder,
         unlocked: &HashSet<String>,
     ) -> Result<()> {
-        self.index_meeting_topic_chunks_reporting(meeting_id, segments, embedder, unlocked)
+        self.index_meeting_topic_chunks_reporting(meeting_id, segments, embedder, unlocked, None)
             .map(|_wrote| ())
+    }
+
+    pub(crate) fn index_meeting_topic_chunks_background(
+        &self,
+        meeting_id: &str,
+        segments: &[Segment],
+        embedder: &dyn Embedder,
+        unlocked: &HashSet<String>,
+        epoch: u64,
+    ) -> Result<bool> {
+        self.index_meeting_topic_chunks_reporting(
+            meeting_id,
+            segments,
+            embedder,
+            unlocked,
+            Some(epoch),
+        )
     }
 
     /// Same as [`Self::index_meeting_topic_chunks`] but reports whether it actually (re)wrote
@@ -2670,6 +2724,7 @@ impl Db {
         segments: &[Segment],
         embedder: &dyn Embedder,
         unlocked: &HashSet<String>,
+        background_epoch: Option<u64>,
     ) -> Result<bool> {
         if !self.meeting_is_visible(meeting_id, unlocked)? {
             return Ok(false); // sealed-not-unlocked: never index its plaintext.
@@ -2731,84 +2786,91 @@ impl Db {
         let vectors = embed_in_sub_batches(embedder, &augs)?;
 
         // PURGE-then-INSERT this meeting's topic rows in ONE transaction (clean replace).
-        let mut conn = self.lock();
-        let tx = conn.transaction().map_err(map_err)?;
-        // TOCTOU re-check INSIDE the write tx: the visibility gate above ran BEFORE the slow
-        // embed, and the caller's `unlocked` snapshot can be stale by now. A `lock_folder`
-        // committing mid-embed blanks the note plaintext (`markdown=''`, `content_blob` kept) —
-        // that DB-side sealed-at-rest invariant is session-independent, so key the re-check on
-        // it instead of the snapshot: if the meeting is sealed at rest RIGHT NOW, writing its
-        // derived plaintext topic rows would leave sealed content on disk until the next
-        // relock/startup reconcile. Refuse (rollback via drop) instead.
-        let sealed_at_rest: bool = tx
-            .query_row(
-                "SELECT EXISTS(
+        let commit = || -> Result<bool> {
+            let mut conn = self.lock();
+            let tx = conn.transaction().map_err(map_err)?;
+            // TOCTOU re-check INSIDE the write tx: the visibility gate above ran BEFORE the slow
+            // embed, and the caller's `unlocked` snapshot can be stale by now. A `lock_folder`
+            // committing mid-embed blanks the note plaintext (`markdown=''`, `content_blob` kept) —
+            // that DB-side sealed-at-rest invariant is session-independent, so key the re-check on
+            // it instead of the snapshot: if the meeting is sealed at rest RIGHT NOW, writing its
+            // derived plaintext topic rows would leave sealed content on disk until the next
+            // relock/startup reconcile. Refuse (rollback via drop) instead.
+            let sealed_at_rest: bool = tx
+                .query_row(
+                    "SELECT EXISTS(
                    SELECT 1 FROM notes
                     WHERE meeting_id = ?1
                       AND content_blob IS NOT NULL
                       AND (markdown IS NULL OR markdown = '')
                  )",
-                rusqlite::params![meeting_id],
-                |r| Ok(r.get::<_, i64>(0)? != 0),
-            )
-            .map_err(map_err)?;
-        if sealed_at_rest {
-            return Ok(false);
-        }
-        tx.execute(
-            "DELETE FROM topic_vec_chunks WHERE chunk_id IN
-               (SELECT id FROM topic_chunks WHERE meeting_id = ?1)",
-            rusqlite::params![meeting_id],
-        )
-        .map_err(map_err)?;
-        tx.execute(
-            "DELETE FROM topic_chunks WHERE meeting_id = ?1",
-            rusqlite::params![meeting_id],
-        )
-        .map_err(map_err)?;
-        {
-            let mut ins_chunk = tx
-                .prepare(
-                    "INSERT INTO topic_chunks
-                       (meeting_id, seg_index, start_s, end_s, text, aug_text, content_hash)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    rusqlite::params![meeting_id],
+                    |r| Ok(r.get::<_, i64>(0)? != 0),
                 )
                 .map_err(map_err)?;
-            let mut ins_vec = tx
-                .prepare("INSERT INTO topic_vec_chunks(chunk_id, embedding) VALUES (?1, ?2)")
-                .map_err(map_err)?;
-            for (idx, ((topic, aug_text), vector)) in topics
-                .iter()
-                .zip(augs.iter())
-                .zip(vectors.iter())
-                .enumerate()
-            {
-                ins_chunk
-                    .execute(rusqlite::params![
-                        meeting_id,
-                        idx as i64,
-                        topic.start_s,
-                        topic.end_s,
-                        topic.text,
-                        aug_text,
-                        hashes[idx]
-                    ])
-                    .map_err(map_err)?;
-                let chunk_id = tx.last_insert_rowid();
-                let blob = crate::embed::vec_to_blob(vector);
-                ins_vec
-                    .execute(rusqlite::params![chunk_id, blob])
-                    .map_err(map_err)?;
+            if sealed_at_rest {
+                return Ok(false);
             }
+            tx.execute(
+                "DELETE FROM topic_vec_chunks WHERE chunk_id IN
+               (SELECT id FROM topic_chunks WHERE meeting_id = ?1)",
+                rusqlite::params![meeting_id],
+            )
+            .map_err(map_err)?;
+            tx.execute(
+                "DELETE FROM topic_chunks WHERE meeting_id = ?1",
+                rusqlite::params![meeting_id],
+            )
+            .map_err(map_err)?;
+            {
+                let mut ins_chunk = tx
+                    .prepare(
+                        "INSERT INTO topic_chunks
+                       (meeting_id, seg_index, start_s, end_s, text, aug_text, content_hash)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    )
+                    .map_err(map_err)?;
+                let mut ins_vec = tx
+                    .prepare("INSERT INTO topic_vec_chunks(chunk_id, embedding) VALUES (?1, ?2)")
+                    .map_err(map_err)?;
+                for (idx, ((topic, aug_text), vector)) in topics
+                    .iter()
+                    .zip(augs.iter())
+                    .zip(vectors.iter())
+                    .enumerate()
+                {
+                    ins_chunk
+                        .execute(rusqlite::params![
+                            meeting_id,
+                            idx as i64,
+                            topic.start_s,
+                            topic.end_s,
+                            topic.text,
+                            aug_text,
+                            hashes[idx]
+                        ])
+                        .map_err(map_err)?;
+                    let chunk_id = tx.last_insert_rowid();
+                    let blob = crate::embed::vec_to_blob(vector);
+                    ins_vec
+                        .execute(rusqlite::params![chunk_id, blob])
+                        .map_err(map_err)?;
+                }
+            }
+            tx.commit().map_err(map_err)?;
+            tracing::debug!(
+                target: "rag",
+                meeting_id,
+                topics = topics.len(),
+                "topic chunks indexed"
+            );
+            Ok(true)
+        };
+        match background_epoch {
+            Some(epoch) => crate::perf::with_current_background_epoch(epoch, commit)
+                .map(|committed| committed.unwrap_or(false)),
+            None => commit(),
         }
-        tx.commit().map_err(map_err)?;
-        tracing::debug!(
-            target: "rag",
-            meeting_id,
-            topics = topics.len(),
-            "topic chunks indexed"
-        );
-        Ok(true)
     }
 
     /// Brain v2 L1.1 — STARTUP BACKFILL: index topic chunks for every VISIBLE meeting that has
@@ -2826,6 +2888,22 @@ impl Db {
     /// launch-freeze incident). The idempotency probe means the cap just defers the remainder to
     /// the NEXT launch — no cursor needed, each run picks up wherever the hash still differs.
     pub fn backfill_topic_chunks_idempotent(&self, embedder: &dyn Embedder) -> Result<usize> {
+        self.backfill_topic_chunks_idempotent_at_epoch(embedder, None)
+    }
+
+    pub(crate) fn backfill_topic_chunks_idempotent_background(
+        &self,
+        embedder: &dyn Embedder,
+        epoch: u64,
+    ) -> Result<usize> {
+        self.backfill_topic_chunks_idempotent_at_epoch(embedder, Some(epoch))
+    }
+
+    fn backfill_topic_chunks_idempotent_at_epoch(
+        &self,
+        embedder: &dyn Embedder,
+        background_epoch: Option<u64>,
+    ) -> Result<usize> {
         const TOPIC_BACKFILL_BATCH: usize = 20;
         const TOPIC_BACKFILL_MAX_REEMBED_PER_RUN: usize = 50;
         let unlocked: HashSet<String> = HashSet::new();
@@ -2844,7 +2922,13 @@ impl Db {
                 if segments.is_empty() {
                     continue;
                 }
-                match self.index_meeting_topic_chunks_reporting(&m.id, &segments, embedder, &unlocked) {
+                match self.index_meeting_topic_chunks_reporting(
+                    &m.id,
+                    &segments,
+                    embedder,
+                    &unlocked,
+                    background_epoch,
+                ) {
                     Ok(wrote) => {
                         indexed += 1;
                         if wrote {
@@ -2964,7 +3048,8 @@ impl Db {
             paths.push(r.map_err(map_err)?);
         }
         drop(stmt);
-        tx.execute("DELETE FROM memory_rollups", []).map_err(map_err)?;
+        tx.execute("DELETE FROM memory_rollups", [])
+            .map_err(map_err)?;
         Ok(paths)
     }
 
@@ -3003,7 +3088,10 @@ impl Db {
     /// — exactly like `correction_log` / `note_chunks` / `assistant_interactions` — we DELETE rather
     /// than key-seal. Dropped by design + not recoverable (never keyed); the underlying transcript is
     /// still sealed + restorable, and a later re-summarize re-derives facts.
-    pub(crate) fn purge_facts_tx(tx: &rusqlite::Transaction<'_>, meeting_ids: &[String]) -> Result<()> {
+    pub(crate) fn purge_facts_tx(
+        tx: &rusqlite::Transaction<'_>,
+        meeting_ids: &[String],
+    ) -> Result<()> {
         for mid in meeting_ids {
             tx.execute(
                 "DELETE FROM facts WHERE meeting_id = ?1",
@@ -3042,7 +3130,10 @@ impl Db {
     /// and not recoverable (never keyed); the underlying transcript is still sealed + restorable, and a
     /// later re-summarize re-derives user facts. The (derived) memory brief is regenerated on the
     /// next read from the remaining VISIBLE user facts only.
-    pub(crate) fn purge_user_facts_tx(tx: &rusqlite::Transaction<'_>, meeting_ids: &[String]) -> Result<()> {
+    pub(crate) fn purge_user_facts_tx(
+        tx: &rusqlite::Transaction<'_>,
+        meeting_ids: &[String],
+    ) -> Result<()> {
         for mid in meeting_ids {
             tx.execute(
                 "DELETE FROM user_facts WHERE meeting_id = ?1",
@@ -3078,7 +3169,10 @@ impl Db {
     /// Delete chunk rows for `meeting_ids` within an EXISTING transaction (so the purge lands in the
     /// same atomic unit as the plaintext blanking on lock — no window where a vector outlives the
     /// sealed plaintext it was derived from).
-    pub(crate) fn purge_chunks_tx(tx: &rusqlite::Transaction<'_>, meeting_ids: &[String]) -> Result<()> {
+    pub(crate) fn purge_chunks_tx(
+        tx: &rusqlite::Transaction<'_>,
+        meeting_ids: &[String],
+    ) -> Result<()> {
         for mid in meeting_ids {
             // vec0 first (its FK-less rowid mirrors note_chunks.id), then the source rows.
             tx.execute(
@@ -3119,7 +3213,10 @@ impl Db {
     /// keyed) — so we delete rather than seal. Note: this is deliberately NOT folded into
     /// `purge_chunks_tx`, because that helper also runs on the (non-seal) re-index "clean replace"
     /// path where corrections must survive.
-    pub(crate) fn purge_corrections_tx(tx: &rusqlite::Transaction<'_>, meeting_ids: &[String]) -> Result<()> {
+    pub(crate) fn purge_corrections_tx(
+        tx: &rusqlite::Transaction<'_>,
+        meeting_ids: &[String],
+    ) -> Result<()> {
         for mid in meeting_ids {
             tx.execute(
                 "DELETE FROM correction_log WHERE meeting_id = ?1",
@@ -3907,7 +4004,6 @@ impl Db {
 
     // `clear_document_blob` moved to `storage::seal_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-
     /// Permanently delete a document (its `doc_chunks` + `doc_vec_chunks` go first in the same tx —
     /// `doc_vec_chunks` is a vec0 virtual table with no FK so the `documents` ON DELETE CASCADE
     /// reaches `doc_chunks` but NOT `doc_vec_chunks`; deleting them explicitly avoids orphan vectors,
@@ -3954,8 +4050,34 @@ impl Db {
         embedder: Option<&dyn Embedder>,
         embed_progress: &EmbedProgressFn<'_>,
     ) -> Result<()> {
+        self.index_document_chunks_progress_at_epoch(document_id, embedder, embed_progress, None)
+            .map(|_| ())
+    }
+
+    pub(crate) fn index_document_chunks_background(
+        &self,
+        document_id: &str,
+        embedder: Option<&dyn Embedder>,
+        epoch: u64,
+    ) -> Result<bool> {
+        self.index_document_chunks_progress_at_epoch(
+            document_id,
+            embedder,
+            &no_embed_progress,
+            Some(epoch),
+        )
+        .map(|committed| committed.is_some())
+    }
+
+    fn index_document_chunks_progress_at_epoch(
+        &self,
+        document_id: &str,
+        embedder: Option<&dyn Embedder>,
+        embed_progress: &EmbedProgressFn<'_>,
+        background_epoch: Option<u64>,
+    ) -> Result<Option<()>> {
         let Some((_folder_id, name, text)) = self.get_document(document_id)? else {
-            return Ok(()); // unknown document — nothing to index.
+            return Ok(Some(())); // unknown document — nothing to index.
         };
         // Brain v3 PR-2 — HIERARCHICAL chunking. Reconstruct the extracted BLOCKS (page/heading) from
         // the stored text (lossless for a PR-2 upload; a legacy/flat row reconstructs as one block →
@@ -4005,53 +4127,59 @@ impl Db {
         }
 
         let this_doc = [document_id.to_string()];
-        let mut conn = self.lock();
-        let tx = conn.transaction().map_err(map_err)?;
-        if doc_sealed_at_rest_tx(&tx, document_id)? {
-            return Ok(()); // sealed-at-rest mid-flight: never persist its plaintext chunks.
-        }
-        Self::purge_doc_chunks_tx(&tx, &this_doc)?;
-        {
-            let mut ins_chunk = tx
-                .prepare(
-                    "INSERT INTO doc_chunks
+        let commit = || -> Result<()> {
+            let mut conn = self.lock();
+            let tx = conn.transaction().map_err(map_err)?;
+            if doc_sealed_at_rest_tx(&tx, document_id)? {
+                return Ok(()); // sealed-at-rest mid-flight: never persist its plaintext chunks.
+            }
+            Self::purge_doc_chunks_tx(&tx, &this_doc)?;
+            {
+                let mut ins_chunk = tx
+                    .prepare(
+                        "INSERT INTO doc_chunks
                        (document_id, chunk_index, text, level, parent_id, section_path, page_no)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                )
-                .map_err(map_err)?;
-            let mut ins_vec = tx
-                .prepare("INSERT INTO doc_vec_chunks(chunk_id, embedding) VALUES (?1, ?2)")
-                .map_err(map_err)?;
-            // HierChunk-index → the inserted row id, so a leaf can point `parent_id` at its L1 row.
-            // The chunker emits every parent BEFORE its children, so the parent id is always known.
-            let mut row_id_by_hier: Vec<i64> = vec![0; hier.len()];
-            for (idx, c) in hier.iter().enumerate() {
-                let parent_row: Option<i64> = c.parent.map(|pi| row_id_by_hier[pi]);
-                ins_chunk
-                    .execute(rusqlite::params![
-                        document_id,
-                        idx as i64,
-                        c.raw,
-                        c.level,
-                        parent_row,
-                        c.section_path,
-                        c.page_no,
-                    ])
+                    )
                     .map_err(map_err)?;
-                let chunk_id = tx.last_insert_rowid();
-                row_id_by_hier[idx] = chunk_id;
-                // Vector ONLY for embed-worthy chunks that were actually embedded (L0+L2, model
-                // present). L1 parents NEVER get a vec0 row — the vector count stays flat.
-                if let Some(vector) = vec_by_hier.get(&idx) {
-                    let blob = crate::embed::vec_to_blob(vector);
-                    ins_vec
-                        .execute(rusqlite::params![chunk_id, blob])
+                let mut ins_vec = tx
+                    .prepare("INSERT INTO doc_vec_chunks(chunk_id, embedding) VALUES (?1, ?2)")
+                    .map_err(map_err)?;
+                // HierChunk-index → the inserted row id, so a leaf can point `parent_id` at its L1 row.
+                // The chunker emits every parent BEFORE its children, so the parent id is always known.
+                let mut row_id_by_hier: Vec<i64> = vec![0; hier.len()];
+                for (idx, c) in hier.iter().enumerate() {
+                    let parent_row: Option<i64> = c.parent.map(|pi| row_id_by_hier[pi]);
+                    ins_chunk
+                        .execute(rusqlite::params![
+                            document_id,
+                            idx as i64,
+                            c.raw,
+                            c.level,
+                            parent_row,
+                            c.section_path,
+                            c.page_no,
+                        ])
                         .map_err(map_err)?;
+                    let chunk_id = tx.last_insert_rowid();
+                    row_id_by_hier[idx] = chunk_id;
+                    // Vector ONLY for embed-worthy chunks that were actually embedded (L0+L2, model
+                    // present). L1 parents NEVER get a vec0 row — the vector count stays flat.
+                    if let Some(vector) = vec_by_hier.get(&idx) {
+                        let blob = crate::embed::vec_to_blob(vector);
+                        ins_vec
+                            .execute(rusqlite::params![chunk_id, blob])
+                            .map_err(map_err)?;
+                    }
                 }
             }
+            tx.commit().map_err(map_err)?;
+            Ok(())
+        };
+        match background_epoch {
+            Some(epoch) => crate::perf::with_current_background_epoch(epoch, commit),
+            None => commit().map(Some),
         }
-        tx.commit().map_err(map_err)?;
-        Ok(())
     }
 
     /// (Re)index an authored NOTE's BODY into `doc_chunks` (+ FTS triggers) and `doc_vec_chunks`
@@ -4081,6 +4209,45 @@ impl Db {
         embedder: Option<&dyn Embedder>,
         embed_progress: &EmbedProgressFn<'_>,
     ) -> Result<()> {
+        self.index_note_chunks_progress_at_epoch(
+            note_id,
+            title,
+            body,
+            embedder,
+            embed_progress,
+            None,
+        )
+        .map(|_| ())
+    }
+
+    pub(crate) fn index_note_chunks_background(
+        &self,
+        note_id: &str,
+        title: &str,
+        body: &str,
+        embedder: Option<&dyn Embedder>,
+        epoch: u64,
+    ) -> Result<bool> {
+        self.index_note_chunks_progress_at_epoch(
+            note_id,
+            title,
+            body,
+            embedder,
+            &no_embed_progress,
+            Some(epoch),
+        )
+        .map(|committed| committed.is_some())
+    }
+
+    fn index_note_chunks_progress_at_epoch(
+        &self,
+        note_id: &str,
+        title: &str,
+        body: &str,
+        embedder: Option<&dyn Embedder>,
+        embed_progress: &EmbedProgressFn<'_>,
+        background_epoch: Option<u64>,
+    ) -> Result<Option<()>> {
         let chunks = crate::embed::chunk_note(title, "", body);
         // Sub-batch to bound the per-call Metal tensor for a long note (mirror
         // index_meeting_chunks/index_document_chunks — this indexer was the one remaining
@@ -4092,36 +4259,42 @@ impl Db {
             _ => Vec::new(), // model absent → chunk-only (FTS still covers it); vectors come later.
         };
         let this_doc = [note_id.to_string()];
-        let mut conn = self.lock();
-        let tx = conn.transaction().map_err(map_err)?;
-        if doc_sealed_at_rest_tx(&tx, note_id)? {
-            return Ok(()); // sealed-at-rest mid-flight: never persist its plaintext chunks.
-        }
-        Self::purge_doc_chunks_tx(&tx, &this_doc)?;
-        {
-            let mut ins_chunk = tx
+        let commit = || -> Result<()> {
+            let mut conn = self.lock();
+            let tx = conn.transaction().map_err(map_err)?;
+            if doc_sealed_at_rest_tx(&tx, note_id)? {
+                return Ok(()); // sealed-at-rest mid-flight: never persist its plaintext chunks.
+            }
+            Self::purge_doc_chunks_tx(&tx, &this_doc)?;
+            {
+                let mut ins_chunk = tx
                 .prepare(
                     "INSERT INTO doc_chunks (document_id, chunk_index, text) VALUES (?1, ?2, ?3)",
                 )
                 .map_err(map_err)?;
-            let mut ins_vec = tx
-                .prepare("INSERT INTO doc_vec_chunks(chunk_id, embedding) VALUES (?1, ?2)")
-                .map_err(map_err)?;
-            for (idx, text) in chunks.iter().enumerate() {
-                ins_chunk
-                    .execute(rusqlite::params![note_id, idx as i64, text])
+                let mut ins_vec = tx
+                    .prepare("INSERT INTO doc_vec_chunks(chunk_id, embedding) VALUES (?1, ?2)")
                     .map_err(map_err)?;
-                if let Some(vector) = vectors.get(idx) {
-                    let chunk_id = tx.last_insert_rowid();
-                    let blob = crate::embed::vec_to_blob(vector);
-                    ins_vec
-                        .execute(rusqlite::params![chunk_id, blob])
+                for (idx, text) in chunks.iter().enumerate() {
+                    ins_chunk
+                        .execute(rusqlite::params![note_id, idx as i64, text])
                         .map_err(map_err)?;
+                    if let Some(vector) = vectors.get(idx) {
+                        let chunk_id = tx.last_insert_rowid();
+                        let blob = crate::embed::vec_to_blob(vector);
+                        ins_vec
+                            .execute(rusqlite::params![chunk_id, blob])
+                            .map_err(map_err)?;
+                    }
                 }
             }
+            tx.commit().map_err(map_err)?;
+            Ok(())
+        };
+        match background_epoch {
+            Some(epoch) => crate::perf::with_current_background_epoch(epoch, commit),
+            None => commit().map(Some),
         }
-        tx.commit().map_err(map_err)?;
-        Ok(())
     }
 
     // `reparent_note_folder` moved to `storage::folders_store` (God-file split) — still callable as inherent `db.method()` cross-file.
@@ -4153,7 +4326,10 @@ impl Db {
     /// Delete doc-chunk rows for `document_ids` within an EXISTING transaction (so the purge lands in
     /// the same atomic unit as the plaintext blanking on lock). vec0 first (its FK-less rowid mirrors
     /// doc_chunks.id), then the source rows. Mirrors [`Db::purge_chunks_tx`].
-    pub(crate) fn purge_doc_chunks_tx(tx: &rusqlite::Transaction<'_>, document_ids: &[String]) -> Result<()> {
+    pub(crate) fn purge_doc_chunks_tx(
+        tx: &rusqlite::Transaction<'_>,
+        document_ids: &[String],
+    ) -> Result<()> {
         for did in document_ids {
             tx.execute(
                 "DELETE FROM doc_vec_chunks WHERE chunk_id IN
@@ -4365,7 +4541,9 @@ impl Db {
                 continue; // an L1/L2/legacy winner has no parent to expand to.
             };
             let text: Option<String> = stmt
-                .query_row(rusqlite::params![parent_id, h.document_id], |row| row.get(0))
+                .query_row(rusqlite::params![parent_id, h.document_id], |row| {
+                    row.get(0)
+                })
                 .optional()
                 .map_err(map_err)?;
             let Some(text) = text else {
@@ -4479,7 +4657,6 @@ impl Db {
     // `all_org_shared_content_hashes` moved to `storage::org_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
     // `org_items_needing_embed` moved to `storage::org_store` (God-file split) — still callable as inherent `db.method()` cross-file.
-
 
     // ── NOTES (authored `documents(kind='note')`) ───────────────────────────────────────────────
 
@@ -4664,7 +4841,6 @@ impl Db {
 
     // `delete_unsealed_segments` moved to `storage::seal_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-
     /// All segments for a meeting, ordered by `idx`.
     pub fn get_segments(&self, meeting_id: &str) -> Result<Vec<Segment>> {
         let conn = self.lock();
@@ -4740,7 +4916,6 @@ impl Db {
     }
 
     // `set_timeline_data_sealed` moved to `storage::seal_store` (God-file split) — still callable as inherent `db.method()` cross-file.
-
 
     // ── meeting tags ─────────────────────────────────────────────────────────
 
@@ -5100,7 +5275,6 @@ impl Db {
 
     // `discard_folder_seal` moved to `storage::seal_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-
     // `child_folders` moved to `storage::folders_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
     // `rename_folder` moved to `storage::folders_store` (God-file split) — still callable as inherent `db.method()` cross-file.
@@ -5228,9 +5402,7 @@ impl Db {
 
     // `blank_sealed_notes_in_folders` moved to `storage::seal_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
-
     // `reblank_locked_folders_at_rest` moved to `storage::seal_store` (God-file split) — still callable as inherent `db.method()` cross-file.
-
 
     // `locked_folder_ids` moved to `storage::folders_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
@@ -5297,7 +5469,6 @@ impl Db {
     // `restore_timeline_data` moved to `storage::seal_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
     // `clear_timeline_blob` moved to `storage::seal_store` (God-file split) — still callable as inherent `db.method()` cross-file.
-
 
     // `set_meeting_audio_path` moved to `storage::meetings_store` (God-file split) — still callable as inherent `db.method()` cross-file.
 
@@ -5808,7 +5979,10 @@ impl Db {
     /// surface NOTHING, so — exactly like `assistant_interactions` / `facts` / `note_chunks` — we
     /// DELETE rather than key-seal. Dropped by design + not recoverable (never keyed); the
     /// underlying transcript is still sealed + restorable.
-    pub(crate) fn purge_live_bullets_tx(tx: &rusqlite::Transaction<'_>, meeting_ids: &[String]) -> Result<()> {
+    pub(crate) fn purge_live_bullets_tx(
+        tx: &rusqlite::Transaction<'_>,
+        meeting_ids: &[String],
+    ) -> Result<()> {
         for mid in meeting_ids {
             tx.execute(
                 "DELETE FROM live_bullets WHERE meeting_id = ?1",
@@ -5871,8 +6045,6 @@ impl Db {
         );
         Ok(out)
     }
-
-
 
     /// GATED `/people` personal-CRM rollup: one [`PersonCard`] per VISIBLE Person entity, built
     /// ENTIRELY from the existing gated graph/facts/commitment readers — NO new or ungated query.
@@ -5954,13 +6126,13 @@ impl Db {
                 (None, None) => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
             },
         );
-        let total_visible_people = self.count_entities_visible(unlocked, Some(EntityKind::Person))?;
+        let total_visible_people =
+            self.count_entities_visible(unlocked, Some(EntityKind::Person))?;
         Ok(PeopleList {
             people: out,
             total_visible_people,
         })
     }
-
 
     // ── Brain v2 L2.1 — memory consolidation store (see `crate::memory`) ─────────────────────────
     //
@@ -6492,8 +6664,18 @@ pub(crate) fn backlink_sort_key(b: &BacklinkSource) -> i64 {
 /// into a [`crate::storage::models::LinkEdge`]: `(id, src_kind, src_id, dst_kind, dst_id, edge_type,
 /// created_by, status, score, created_at)`. Aliased so the reader's row `Vec` stays under clippy's
 /// type-complexity bar.
-pub(crate) type LinkRowRaw =
-    (i64, String, String, String, String, String, String, String, f64, i64);
+pub(crate) type LinkRowRaw = (
+    i64,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    f64,
+    i64,
+);
 
 /// Per-kind render cap for the full-brain graph (`build_full_graph`, DESIGN §PR-4). Meetings, notes,
 /// and documents are each capped independently (entities keep their own 500 cap inside
@@ -6625,7 +6807,10 @@ pub(crate) fn parse_front_matter(
 
 /// Push a cleaned, non-empty tag (unquoted, `#`-stripped, trimmed) — de-duplicated.
 fn push_tag(tags: &mut Vec<String>, raw: &str) {
-    let t = unquote(raw.trim()).trim_start_matches('#').trim().to_string();
+    let t = unquote(raw.trim())
+        .trim_start_matches('#')
+        .trim()
+        .to_string();
     if !t.is_empty() && !tags.contains(&t) {
         tags.push(t);
     }
@@ -6667,10 +6852,7 @@ pub fn coerce_property_value(raw: &str, kind: PropertyKind, options: &[String]) 
         }
         PropertyKind::Select => {
             // A Select value not in the declared options is PRESERVED as Text (never dropped).
-            match options
-                .iter()
-                .find(|o| o.eq_ignore_ascii_case(v))
-            {
+            match options.iter().find(|o| o.eq_ignore_ascii_case(v)) {
                 Some(canonical) => PropertyValue::Select(canonical.clone()),
                 None => PropertyValue::Text(v.to_string()),
             }
@@ -6684,10 +6866,7 @@ pub fn coerce_property_value(raw: &str, kind: PropertyKind, options: &[String]) 
 /// free text never coerces to Date.
 fn is_iso_ish_date(s: &str) -> bool {
     // Split off any time/zone suffix at the first 'T' or space; validate the date head only.
-    let head = s
-        .split_once(['T', ' '])
-        .map(|(d, _)| d)
-        .unwrap_or(s);
+    let head = s.split_once(['T', ' ']).map(|(d, _)| d).unwrap_or(s);
     let parts: Vec<&str> = head.split('-').collect();
     if parts.len() != 3 {
         return false;
@@ -6815,14 +6994,11 @@ pub(crate) fn row_to_meeting(row: &Row<'_>) -> rusqlite::Result<Result<Meeting>>
 // `row_to_audit_finding` moved to `storage::audit_store` (God-file split) alongside the
 // `audit_findings` readers that are its only callers.
 
-
-
 // `row_to_brief_schedule` / `row_to_brief_run` moved to `storage::brief_store` (God-file split)
 // alongside the `brief_schedules` / `brief_runs` readers that are their only callers.
 
 // `row_to_mcp_server` moved to `storage::mcp_store` (God-file split) alongside the `mcp_servers`
 // readers that are its only callers.
-
 
 /// Escape LIKE wildcards so user input is matched literally (paired with `ESCAPE '\'`).
 fn escape_like(s: &str) -> String {
