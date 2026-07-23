@@ -115,10 +115,13 @@ jobs:
         with:
           workspaces: ". -> target"
 
-      - name: Install cargo-audit + cargo-deny (prebuilt — skips ci.sh's slow cargo install)
+      - name: Install pinned cargo-audit + cargo-deny (prebuilt — skips ci.sh's slow cargo install)
         uses: taiki-e/install-action@678b06b887cdbf44fa0601e5915f865e17c2241d # v2.44.60
         with:
-          tool: cargo-audit,cargo-deny
+          # Explicit tool versions are required: an action-SHA-relative `latest`
+          # installed cargo-audit 0.21.0, which cannot parse CVSS 4.0 entries in
+          # the current RustSec database (for example RUSTSEC-2026-0073).
+          tool: cargo-audit@0.22.2,cargo-deny@0.20.2
 
       - name: Install ffmpeg (audio E2E — aiff to 16 kHz mono WAV)
         run: brew list ffmpeg >/dev/null 2>&1 || brew install ffmpeg
