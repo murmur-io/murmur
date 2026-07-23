@@ -7,10 +7,11 @@ repo** so a lesson learned once is never re-paid.
 
 One file per agent (`<agent-name>.md`), each with two tiers:
 
-### `## Recurring patterns` — curated, injected into every dispatch
-Short binding imperatives ("NEVER write a signal in an `effect()` without `allowSignalWrites`").
-Keep it **≤ ~20 bullets** — this section is prepended to the agent's dispatch prompt as
-*"Previous lessons (binding — do NOT repeat these)"*, so it spends prompt budget every run. A
+### `## Recurring patterns` — compatibility mirror, not executable input
+Short binding imperatives ("Guard async effect results with a newest-request token").
+The executable harness reads canonical `.codex/learnings/`, not this vendor journal. Keep useful
+entries here for native Claude workflows, but never claim they were injected unless the dispatch
+explicitly included them. A
 pattern earns a place here only after it has bitten (or been confirmed) at least twice.
 
 ### `## Run journal` — append-only, newest first
@@ -29,8 +30,9 @@ promoted). `success-pattern` entries capture what a *clean* run did right, not j
 
 ## The loop
 
-1. **Read** — before dispatching an agent, a workflow/skill prepends that agent's
-   `## Recurring patterns` to the prompt (see `.claude/skills/ship-feature`).
+1. **Read** — mutation tasks use the harness, whose `task_runner.py::learning_prompt` prepends
+   role-relevant sections from canonical `.codex/learnings/` and binds that tree in the instruction
+   hash. A direct read-only Claude dispatch must include a relevant section explicitly.
 2. **Work** — the agent implements; the adversarial-verifier / lock-security-reviewer gate it.
 3. **Extract** — after the gates settle, append a `## Run journal` entry (via `/learn`, or an
    extractor pass) citing the artifact that revealed it.

@@ -123,7 +123,7 @@ Key properties, and why they generalize:
   allocation) copies this: measure best-effort, refuse only on an affirmative over-budget reading,
   fail open on any probe failure.
 - **No new crate.** `available_ram_bytes()` parses `vm_stat` (free + inactive + speculative + purgeable
-  page classes × page size); `total_ram_gb()` in `commands.rs` shells `sysctl -n hw.memsize`. Both use
+  page classes × page size); `total_ram_gb()` in `commands/model_perf.rs` shells `sysctl -n hw.memsize`. Both use
   `std::process::Command`, NOT a `sysinfo`-style crate — stay on that pattern (no-new-deps).
 - **Guards the NEXT load, not eviction.** Because the cache never evicts, the check is purely "is there
   headroom for the next model on top of what's already resident."

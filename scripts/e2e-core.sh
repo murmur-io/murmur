@@ -1,25 +1,21 @@
 #!/usr/bin/env bash
 # Headless end-to-end check of the MeetNotes core pipeline (no mic, no GUI):
 #   say (TTS) -> ffmpeg (16 kHz mono WAV) -> Whisper transcription
-#   -> ClaudeCodeProvider summary (or stub fallback) -> Obsidian .md export.
-# Proves transcription + export work for real on this machine. The provider step
-# uses the local `claude` CLI when available; otherwise it falls back to a stub note.
+#   -> deterministic no-egress stub summary -> Obsidian .md export.
+# Proves transcription + export work for real on this machine. This runner has
+# no cloud-provider branch by construction.
 set -euo pipefail
 # shellcheck disable=SC1091
 source "$HOME/.cargo/env" 2>/dev/null || true
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 
-MODELS_DIR="$HOME/Library/Application Support/MeetNotes/models"
+MODELS_DIR="${MURMUR_WHISPER_MODELS_DIR:-$HOME/Library/Application Support/MeetNotes/models}"
 MODEL="$MODELS_DIR/ggml-base.en.bin"
-mkdir -p "$MODELS_DIR"
-if [ ! -f "$MODEL" ]; then
-  echo "[e2e] downloading ggml-base.en.bin (~142 MB)..."
-  curl -fsSL -o "$MODEL.part" \
-    "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin"
-  mv "$MODEL.part" "$MODEL"
-fi
+bash "$REPO/scripts/ensure-whisper-model.sh"
 echo "[e2e] model: $MODEL ($(du -h "$MODEL" | cut -f1))"
+
+export MURMUR_E2E_NO_EGRESS=1
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
@@ -57,6 +53,11 @@ if printf '%s' "$OUT" | grep -qiE 'budget|friday|deck|beta'; then
   echo "PASS  transcript contains an expected keyword (whisper works)"
 else
   echo "FAIL  transcript missing expected keywords"; fail=1
+fi
+if printf '%s' "$OUT" | grep -q "provider mode: deterministic-stub (no egress)"; then
+  echo "PASS  provider mode is deterministic and no-egress"
+else
+  echo "FAIL  deterministic no-egress provider mode was not reported"; fail=1
 fi
 
 if [ "$fail" = "0" ]; then

@@ -37,12 +37,13 @@ it for the depth (and the measured numbers) behind the invariants below.
   no-model/cloud floor); `PromptedReranker` (POINTWISE `{"relevant": bool}` per candidate over the
   resident on-device reasoner, deadline-bounded `RERANK_TIMEOUT_MS=3000`, `RERANK_TOP_K=10`);
   `active_reranker` (stub for `"stub"`/`"cloud:*"` reasoners — the seam is on-device-only, NEVER cloud).
-- `storage/db.rs` — the gated readers + the schema. `search_hybrid_visible` (fuses `search_visible_impl`
+- `storage/` — the schema plus split gated readers. `storage/db.rs::search_hybrid_visible` fuses `search_visible_impl`
   FTS + `search_semantic_visible` KNN + the entity-graph leg via `entities_matching_query` +
   `meetings_mentioning_entities_visible`; scores from `fts_meeting_scores` + `knn_meeting_distances`).
   `index_meeting_chunks` / `index_note_chunks` / `index_document_chunks` (write `vec_chunks` /
   `topic_vec_chunks` / `doc_vec_chunks` `vec0` KNN tables + the `fts_*` external-content FTS5 mirrors).
-  `visibility_clause` + the `*_visible` family (`search_visible`, `list_meetings_visible`,
+  `storage/db.rs::visibility_clause` + the `*_visible` family across the domain stores
+  (`search_visible`, `list_meetings_visible`,
   `get_note_if_visible`, `meeting_is_visible`, `list_entities_visible`, `list_facts_visible`,
   `list_user_facts_visible`, `search_user_facts_visible`). `search_visible_in_range` for temporal.
 - `facts.rs` — the BITEMPORAL fact store. `Fact` (`valid_from`/`valid_to`), `reconcile_facts` (pure:
@@ -140,11 +141,12 @@ without a fresh measurement:
   the CORRECT cost of a balanced hybrid, NOT a fixable bug. Three measured fixes all failed: (a)
   query-adaptive empty-leg redistribution = 0.0 change (18/20 queries have an empty FTS leg, so it only
   rescales the surviving legs by a constant — cannot reorder); (b) OR-match FTS improved real ranking
-  but regressed the synthetic CI baseline → reverted; (c) **dropping/down-weighting the graph leg = 0.0
+  but regressed the committed synthetic baseline → reverted; (c) **dropping/down-weighting the graph leg = 0.0
   change on both sets — the "graph co-mention noise" hypothesis was measured WRONG.**
 - **On keyword (synthetic) queries: hybrid 0.90 > semantic 0.84.** Hybrid earns its keep by being
   robust across BOTH query types. Over-trusting the semantic leg to close the paraphrase gap would HURT
-  keyword recall. The synthetic corpus is the committed CI merge-gate baseline.
+  keyword recall. The synthetic corpus is the committed manual pre-merge baseline; CI enforces only
+  the deterministic FTS floor, not semantic/hybrid quality.
 - **The prompted 1.7B reranker adds no measured value** — 10 candidates exhaust the 3 s deadline →
   identity order. Keep the trait seam; a real WIN needs a cross-encoder (bge-reranker-v2-m3, no
   generation) or ColBERT late-interaction, not N sequential pointwise LLM calls.

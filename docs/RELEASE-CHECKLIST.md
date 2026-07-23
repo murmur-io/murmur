@@ -17,10 +17,8 @@ is ~5 minutes on your Mac.
 
 ## 1. First run + microphone  → closes: real mic capture + GUI
 ```bash
-# one-time: download the default Whisper model
-mkdir -p "$HOME/Library/Application Support/MeetNotes/models"
-curl -L -o "$HOME/Library/Application Support/MeetNotes/models/ggml-base.en.bin" \
-  https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin
+# one-time: install or verify the immutable, checksum-pinned default Whisper model
+scripts/ensure-whisper-model.sh
 npx tauri dev
 ```
 In the window → **Settings**: set the Vault folder (model is auto-found). Then
