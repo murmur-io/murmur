@@ -25,9 +25,9 @@ tested code plus an honest self-check — never a claim of done you cannot back 
   `seal_store.rs` (`seal_note`/`seal_timeline`) and the `*_visible` readers; `migration.rs`
   is plaintext→SQLCipher encrypt-in-place + verify.
 - `crypto.rs` — AES-256-GCM `encrypt`/`decrypt` + `encrypt_file`/`decrypt_file`
-  (verify-before-destroy). `secrets/keychain.rs` — DEK/KEK/MCP-token (service `com.meetnotes.app`,
-  dev hatches `MURMUR_DEV_DEK`/`MURMUR_DEV_KEK`). `biometric.rs` — Touch ID, degrades to `Ok(true)`.
-  `screenshare.rs` — crash-safe CoreGraphics auto-relock.
+  (verify-before-destroy). `secrets/keychain.rs` — DEK/KEK/MCP-token, Security.framework
+  user-presence-gated KEK/MK reads (service `com.meetnotes.app`), and debug hatches
+  `MURMUR_DEV_DEK`/`MURMUR_DEV_KEK`. `screenshare.rs` — crash-safe CoreGraphics auto-relock.
 - `audio/` — `recorder.rs` (cpal mic + mute `AtomicBool`), `system.rs` (ScreenCaptureKit Swift
   sidecar), `mixer.rs`, `merge.rs` (wall-clock dual-stream merge), `wav.rs`, `listener.rs`.
 - `transcribe/` — `whisper.rs` (whisper-rs 0.16 Metal; `TranscribeQuality::Fast`/`Accurate`),

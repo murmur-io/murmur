@@ -16,8 +16,9 @@
 2. **Per-folder content-key (CK), wrapped by the master KEK.** A folder lock adds a SECOND layer:
    an AES-256-GCM content key (CK) that encrypts the actual note/transcript/timeline/audio of the
    folder's meetings. The CK is wrapped by the master KEK (`state.master_kek`,
-   `secrets/keychain.rs::get_or_create_master_kek`), and the KEK is released only by a Touch ID prompt
-   (`biometric.rs`) in a signed build. SQLCipher protects the file; CK/KEK protects sealed
+   `secrets/keychain.rs::master_kek_with_policy`), and the KEK is released by a
+   Security.framework user-presence-gated Keychain read
+   (`secrets/keychain.rs::MacKekStore::read_biometric`) in a signed build. SQLCipher protects the file; CK/KEK protects sealed
    content even while the DB is open.
 
 A locked folder's content must be unreadable even with the DB open and even to the app's own
@@ -87,9 +88,11 @@ asset/`convertFileSrc` serve path that skips the gate.
   continuity for every existing user. Never change it.
 - `MURMUR_DEV_DEK` and `MURMUR_DEV_KEK` (`secrets/keychain.rs`) are DEBUG-ONLY
   escape hatches (fixed 64-hex keys) that avoid per-rebuilt-binary keychain re-prompts in dev.
-  They MUST NOT be reachable in release builds and MUST NOT be logged. Touch ID + lock-at-rest +
-  screen-share auto-relock only TRULY verify on a signed build (stable signature) — a dev/unsigned
-  build degrades biometrics to `Ok(true)` (`biometric.rs:7`).
+  They MUST NOT be reachable in release builds and MUST NOT be logged. `MURMUR_DEV_KEK`
+  bypasses the Keychain entirely for non-destructive dev unlock/recovery; strict destructive
+  absence checks fail closed while the hatch is active
+  (`secrets/keychain.rs::dev_kek_candidates`). Touch ID + lock-at-rest + screen-share
+  auto-relock only TRULY verify on a signed build with a stable signature.
 
 ## No PII in logs (lock paths included)
 

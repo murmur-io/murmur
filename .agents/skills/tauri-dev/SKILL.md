@@ -1,6 +1,6 @@
 ---
 name: tauri-dev
-description: Run and iterate Murmur locally (Tauri 2.11 + Angular 22 zoneless). The exact dev-run recipe — MURMUR_DEV_DEK to avoid keychain re-prompts, source ~/.cargo/env, ng on :1420 + MCP on :8765, dev biometric degradation, the `cargo test --lib`-not-`clippy --all-targets` inner loop, owner-aware clean relaunch, and reading the boot/abort log. Use whenever the user wants to start/run/serve Murmur in dev, debug a launch/abort, relaunch cleanly, or run the Rust test loop.
+description: Run and iterate Murmur locally (Tauri 2.11 + Angular 22 zoneless). The exact dev-run recipe — MURMUR_DEV_DEK/MURMUR_DEV_KEK to avoid keychain prompts, source ~/.cargo/env, ng on :1420 + MCP on :8765, the `cargo test --lib`-not-`clippy --all-targets` inner loop, owner-aware clean relaunch, and reading the boot/abort log. Use whenever the user wants to start/run/serve Murmur in dev, debug a launch/abort, relaunch cleanly, or run the Rust test loop.
 ---
 
 # /tauri-dev — run & iterate Murmur in dev
@@ -44,13 +44,15 @@ MURMUR_DEV_DEK=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef 
 - **8765** — Murmur's MCP server (`src-tauri/src/mcp.rs`, `127.0.0.1:8765`, read-only,
   visibility-gated). If a stale process holds it, the app's MCP bind fails — free it (below).
 
-## Dev-mode degradations (so you don't chase ghosts)
+## Dev-mode security boundary (so you don't chase ghosts)
 
-- **Touch ID / biometric degrades to `Ok(true)`** in dev/unsigned builds
-  (`src-tauri/src/biometric.rs`, objc2 `LAContext`). So `unlock_folder` / `unlock_meeting`
-  "succeed" without a real fingerprint. **Lock-at-rest, Touch ID, and screen-share
-  auto-relock only TRULY verify on a Developer-ID-signed build** (stable signature) — see
-  `/release-murmur`. Don't conclude "lock works" from a dev run alone.
+- **`MURMUR_DEV_KEK` bypasses the Keychain**, not a separate biometric function.
+  The production gate is the Security.framework user-presence-protected KEK read in
+  `src-tauri/src/secrets/keychain.rs`; debug builds use the fixed KEK hatch when supplied.
+  Strict destructive absence checks still fail closed while the hatch isolates the Keychain.
+  **Lock-at-rest, Touch ID, and screen-share auto-relock only TRULY verify on a
+  Developer-ID-signed build** (stable signature) — see `/release-murmur`. Don't conclude
+  "lock works" from a dev run alone.
 - **Screen-share auto-relock** (`src-tauri/src/screenshare.rs`) is best-effort and uses pure
   CoreGraphics C funcs — it runs in dev but the heuristic is only meaningful with a real
   screen-share session.
@@ -89,9 +91,10 @@ What to look for:
 - **`unrecognized selector … NSException` → instant abort at launch.** Hard-won lesson:
   Rust cannot catch foreign (ObjC) exceptions, so a bad `msg_send` aborts the process.
   Cause seen before: calling an iOS-only selector (`NSScreen.isCaptured`) on macOS. The fix
-  pattern lives in `screenshare.rs`/`biometric.rs` — prefer CoreGraphics/CoreFoundation C
-  funcs; if `msg_send` is unavoidable, guard with `respondsToSelector:` /
-  `class_getInstanceMethod` before sending.
+  pattern lives in `screenshare.rs` — prefer CoreGraphics/CoreFoundation C funcs; if
+  `msg_send` is unavoidable, guard with `respondsToSelector:` /
+  `class_getInstanceMethod` before sending. Biometric/user-presence access is a separate
+  Security.framework Keychain path in `secrets/keychain.rs`.
 - **SQLCipher / `PRAGMA key` errors** → the DEK is wrong. Confirm `MURMUR_DEV_DEK` is set
   (64 hex) and matches the DEK the DB was first created with; a mismatched key fails to
   decrypt (`storage/db.rs` `open_with_key` sets `PRAGMA key` FIRST).
