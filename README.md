@@ -433,8 +433,8 @@ to run **without a network**, and every network path Murmur *does* have is opt-i
   ciphertext, wrapped keys, and metadata. Leaving an org purges its entire local replica from your Mac.
 
 > ⚠️ **Honest caveat:** Touch ID, lock-at-rest, and screen-share auto-relock only *truly* verify on a
-> **Developer-ID-signed build** (the published releases). An unsigned local dev build degrades biometrics to
-> a permissive stub — handy for development, not a security guarantee.
+> **Developer-ID-signed build** (the published releases). Development can bypass the Keychain with
+> the debug-only `MURMUR_DEV_KEK` hatch; that path is convenient for iteration, not a security guarantee.
 
 ---
 
