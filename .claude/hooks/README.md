@@ -8,7 +8,7 @@ hook payload and exit contract; policy must not be reimplemented in an adapter.
 
 | Adapter | Trigger | Enforced behavior |
 | --- | --- | --- |
-| `block-bash.sh` | Bash | Parses compound commands and common wrappers; blocks protected-branch pushes, agent-shell Keychain operations, inner-loop `cargo clippy --all-targets`, `codesign --deep`, and recursive deletion of root/home. Quoted search text is not treated as a command. |
+| `block-bash.sh` | Bash | Parses compound commands and common wrappers; blocks protected-branch pushes, agent-shell Keychain operations, inner-loop `cargo clippy --all-targets`, `codesign --deep`, recursive deletion of root/home, and unsupported executable indirection (`env -S`, `eval`, `source`, `exec`, `xargs`, `find -exec`, active shell substitutions). Quoted search text is not treated as a command. |
 | `secret-scan.sh` | `git commit` | Scans every staged added line, including lockfiles and hook sources, for private keys, provider tokens, and DEK/KEK material. |
 | `finish-guard.sh` | `git commit` | Fails closed unless the current linked worktree has a matching harness task and a schema-valid PASS attestation bound to the exact contract, instructions, dependencies, staged binary diff, checks, fresh reviewer sessions, and required risk reviews. |
 | `autoformat.sh` | edits | Optional single-file Rust formatting when `MURMUR_AUTOFMT=1`. |

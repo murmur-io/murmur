@@ -43,6 +43,20 @@ export interface RecordingCappedPayload {
   limitSeconds: number;
 }
 
+/** Content-free terminal capture fault; the retained prefix remains finalizable. */
+export interface RecordingCaptureFaultPayload {
+  code:
+    | "STREAM_ERROR"
+    | "CAPTURE_THREAD_FAILED"
+    | "RESIDENT_CAPACITY_EXHAUSTED"
+    | "BUFFER_LOCK_CONTENDED"
+    | "INVALID_INTERLEAVED_INPUT"
+    | "FRAME_COUNTER_OVERFLOW"
+    | "CHECKPOINT_AUTHORITY_LOST";
+  retainedFrames: number;
+  sampleRate: number;
+}
+
 /**
  * GitHub-release update check (`check_for_update`). Mirrors the Rust `UpdateInfo`
  * (serde camelCase). `updateAvailable` is the sole "should we nudge" flag;
@@ -127,7 +141,7 @@ export interface AppConfigDto {
   liveAsrEngine: string;
   /**
    * Brain-sidecar IDLE-KILL window in seconds (mirrors Rust `brain_idle_timeout_secs`, default
-   * 300): after this long with no on-device brain request, the host kills the `meetnotes-brain`
+   * 300): after this long with no on-device brain request, the host kills the `murmur-brain`
    * child to reclaim ALL its model RAM to the OS.
    */
   brainIdleTimeoutSecs: number;
@@ -2128,6 +2142,27 @@ export interface NoteDoc {
   shared: boolean;
 }
 
+/** Owner namespace used by the gated note-attachment commands. */
+export type NoteAttachmentOwnerKind = "note" | "meeting" | "org";
+
+/**
+ * One locally-stored image attachment. The DTO deliberately contains no original
+ * filename, filesystem path, or capture timestamp: renderers get only an opaque id,
+ * verified image metadata, and a browser-safe data URL returned by the gated backend.
+ */
+export interface NoteAttachmentDto {
+  id: string;
+  ownerKind: NoteAttachmentOwnerKind;
+  ownerId: string;
+  mimeType: string;
+  extension: string;
+  byteLen: number;
+  width: number;
+  height: number;
+  sha256: string;
+  dataUrl: string;
+}
+
 /**
  * The full selection-assistant action set (mirrors the Rust `NoteAssistAction`).
  * Grouped EDIT / STRUCTURE / FROM YOUR BRAIN / EXTRACT / CREATE (see the shared
@@ -2470,6 +2505,12 @@ export interface OrgSharePreview {
   scrubbed: OrgScrubCounts;
   /** Whether the regex PII scrub is ON for this preview (drives the toggle). */
   scrub: boolean;
+  /** Number of referenced images included in the same encrypted share bundle. */
+  attachmentCount: number;
+  /** Total encoded image bytes included in that bundle. */
+  attachmentBytes: number;
+  /** Always false today: regex text redaction cannot inspect image pixels. */
+  imagePixelsScrubbed: boolean;
 }
 
 /** Per-kind PII scrub counts for the preview sheet. Zero for every kind when scrub is off. */

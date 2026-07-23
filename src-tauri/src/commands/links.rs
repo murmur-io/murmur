@@ -75,7 +75,7 @@ pub async fn link_meeting_entities(
         .title
         .clone()
         .unwrap_or_else(|| "Meeting".to_string());
-    build_and_persist_entities(&app, &state, &meeting_id, &title, &note.markdown).await
+    build_and_persist_entities(&app, &state, &meeting_id, &title, &note.markdown, None).await
 }
 
 /// Parse an IPC link-endpoint kind string into [`crate::links::LinkKind`], or a clean `InvalidArg`.
@@ -130,7 +130,8 @@ pub(crate) fn accept_link_inner(state: &AppState, id: i64) -> Result<(), AppErro
     // check-then-write needs). Lock order `lifecycle ⊃ db`.
     {
         let _lifecycle = lifecycle_guard(state);
-        let Some((src_kind, src_id, dst_kind, dst_id, et, status)) = state.db.link_by_id(id)? else {
+        let Some((src_kind, src_id, dst_kind, dst_id, et, status)) = state.db.link_by_id(id)?
+        else {
             return Err(AppError::InvalidArg(format!("no link {id}")));
         };
         // ── Fix 5 (brain-v3 audit): accept is ONLY for an unconfirmed SUGGESTION. Refuse anything else
@@ -147,7 +148,9 @@ pub(crate) fn accept_link_inner(state: &AppState, id: i64) -> Result<(), AppErro
             crate::links::LinkKind::parse(&src_kind),
             crate::links::LinkKind::parse(&dst_kind),
         ) else {
-            return Err(AppError::InvalidArg(format!("link {id} has a corrupt endpoint kind")));
+            return Err(AppError::InvalidArg(format!(
+                "link {id} has a corrupt endpoint kind"
+            )));
         };
         if !link_endpoint_is_unlocked(state, sk, &src_id)?
             || !link_endpoint_is_unlocked(state, dk, &dst_id)?
@@ -200,7 +203,9 @@ pub(crate) fn dismiss_link_inner(state: &AppState, id: i64) -> Result<(), AppErr
         crate::links::LinkKind::parse(&src_kind),
         crate::links::LinkKind::parse(&dst_kind),
     ) else {
-        return Err(AppError::InvalidArg(format!("link {id} has a corrupt endpoint kind")));
+        return Err(AppError::InvalidArg(format!(
+            "link {id} has a corrupt endpoint kind"
+        )));
     };
     if !link_endpoint_is_unlocked(state, sk, &src_id)?
         || !link_endpoint_is_unlocked(state, dk, &dst_id)?
@@ -228,8 +233,10 @@ fn link_endpoint_is_unlocked(
 ) -> Result<bool, AppError> {
     match kind {
         crate::links::LinkKind::Meeting => meeting_is_unlocked(state, id),
-        crate::links::LinkKind::Note => match state.db.get_note_row(id)? {
-            Some(row) => folder_is_unlocked(state, &row.folder_id),
+        crate::links::LinkKind::Note => match state.db.note_gate_anchor(id)? {
+            Some((folder_id, _created_at, _updated_at)) => {
+                folder_is_unlocked(state, &folder_id)
+            }
             None => Ok(false), // unknown note → nothing to surface. Fail-closed.
         },
         crate::links::LinkKind::Document => {
@@ -365,7 +372,10 @@ pub(crate) fn unlink_items_inner(
     // ── A NOTE source: strip the matching [[Title]] from its managed block (best-effort). ──
     if matches!(src, crate::links::LinkKind::Note) {
         let unlocked = unlocked_snapshot(state)?;
-        if let Some(title) = state.db.link_endpoint_title_visible(dst, dst_id, &unlocked)? {
+        if let Some(title) = state
+            .db
+            .link_endpoint_title_visible(dst, dst_id, &unlocked)?
+        {
             if let Err(e) = strip_manual_link_marker(state, src_id, &title) {
                 tracing::warn!(
                     target: "links",
@@ -392,8 +402,20 @@ pub(crate) fn unlink_items_inner(
 /// (refuses a sealed folder). A no-op (the note is unchanged) when the block never carried the hit —
 /// which is the common case now, since `link_items` no longer WRITES the marker.
 fn strip_manual_link_marker(state: &AppState, note_id: &str, title: &str) -> Result<(), AppError> {
-    let Some(row) = state.db.get_note_row(note_id)? else {
-        return Ok(()); // no owned note markdown → nothing to strip.
+    let row = {
+        let _lifecycle = lifecycle_guard(state);
+        let Some((folder_id, _created_at, _updated_at)) = state.db.note_gate_anchor(note_id)? else {
+            return Ok(());
+        };
+        if !folder_is_unlocked(state, &folder_id)? {
+            return Err(AppError::Locked(
+                "this note is locked — unlock it before removing its link marker".into(),
+            ));
+        }
+        let Some(row) = state.db.get_note_row(note_id)? else {
+            return Ok(());
+        };
+        row
     };
     let marker = format!("[[{title}]]");
     let mut hits = crate::enrich::extract_link_hits(&row.text);
@@ -458,10 +480,9 @@ pub fn list_link_candidates(
     let limit = limit.map_or(DEFAULT_PAGE, i64::from).clamp(1, MAX_PAGE);
     let offset = i64::from(offset.unwrap_or(0));
     let unlocked = unlocked_snapshot(state.inner())?;
-    let (mut out, local_total) =
-        state
-            .db
-            .list_link_candidates_visible(&prefix, limit, offset, &unlocked)?;
+    let (mut out, local_total) = state
+        .db
+        .list_link_candidates_visible(&prefix, limit, offset, &unlocked)?;
     if (out.len() as i64) < limit {
         let config = {
             state

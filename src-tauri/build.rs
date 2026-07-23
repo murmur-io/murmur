@@ -52,8 +52,8 @@ fn main() {
         "26.0",
         &["FoundationModels"],
     );
-    // Brain sidecar (`crates/murmur-brain` → `meetnotes-brain`): STAGE-IF-EXISTS the pre-built
-    // binary into `binaries/meetnotes-brain` + emit `BRAIN_BIN` for the dev fallback. We DO NOT
+    // Brain sidecar (`crates/murmur-brain` → `murmur-brain`): STAGE-IF-EXISTS the pre-built
+    // binary into `binaries/murmur-brain` + emit `BRAIN_BIN` for the dev fallback. We DO NOT
     // shell `cargo build -p murmur-brain` here (nested-cargo-in-build.rs = re-entrancy / target-lock
     // hazard): release builds the child via `tauri.conf.json` `beforeBuildCommand`, and this just
     // copies it. If it is ABSENT (e.g. during `cargo test --lib`, which never builds the child) this
@@ -62,15 +62,15 @@ fn main() {
     tauri_build::build();
 }
 
-/// STAGE the `meetnotes-brain` child binary into the stable in-crate `binaries/meetnotes-brain`
+/// STAGE the `murmur-brain` child binary into the stable in-crate `binaries/murmur-brain`
 /// path (the `bundle.resources` mount point), by profile:
 ///
 /// - RELEASE bundle: the REAL UNIVERSAL binary is staged by `tauri.conf.json`'s `beforeBuildCommand`
 ///   (two per-arch `cargo build -p murmur-brain --release --target …` + a `lipo -create … -output
-///   src-tauri/binaries/meetnotes-brain`), which runs ONCE *before* `tauri build` compiles the app —
-///   i.e. before THIS build.rs runs. So on a real release build `binaries/meetnotes-brain` already
+///   src-tauri/binaries/murmur-brain`), which runs ONCE *before* `tauri build` compiles the app —
+///   i.e. before THIS build.rs runs. So on a real release build `binaries/murmur-brain` already
 ///   exists as the correct universal Mach-O when we get here, and we MUST NOT touch it. Overwriting
-///   it with a stale HOST-ARCH-only `target/release/meetnotes-brain` (from a prior dev child build) or
+///   it with a stale HOST-ARCH-only `target/release/murmur-brain` (from a prior dev child build) or
 ///   with an empty placeholder is exactly BLOCKER-8: the universal DMG would ship a dead brain.
 /// - DEV (`cargo build` / `npm run dev`, host-arch): stage the host-arch `target/{debug,release}`
 ///   child IF present, and emit `cargo:rustc-env=BRAIN_BIN=<built>` so the dev fallback in
@@ -82,11 +82,11 @@ fn main() {
 ///   The placeholder is a TEST/DEV-ONLY sentinel; a real bundle ALWAYS gets the real universal binary
 ///   from the `beforeBuildCommand`-before-build.rs ordering above.
 ///
-/// INVARIANT (BLOCKER-8): NEVER overwrite an already-present REAL `binaries/meetnotes-brain` with a
+/// INVARIANT (BLOCKER-8): NEVER overwrite an already-present REAL `binaries/murmur-brain` with a
 /// placeholder or a smaller/host-arch binary. Best-effort otherwise: a missing binary in a dev/test
 /// build is a silent no-op so `cargo test --lib` is NEVER blocked.
 fn stage_brain_sidecar() {
-    const BIN: &str = "meetnotes-brain";
+    const BIN: &str = "murmur-brain";
     println!("cargo:rerun-if-changed=build.rs");
 
     let bundled = Path::new("binaries").join(BIN);
@@ -97,7 +97,9 @@ fn stage_brain_sidecar() {
     // (host-arch dev build ~200+ MB, or the universal release binary) is far from empty. Treat any
     // non-empty `binaries/…` as already-staged and DO NOT clobber it (the release universal binary
     // staged by `beforeBuildCommand` lands here BEFORE build.rs runs — see the fn doc).
-    let already_real = std::fs::metadata(&bundled).map(|m| m.len() > 0).unwrap_or(false);
+    let already_real = std::fs::metadata(&bundled)
+        .map(|m| m.len() > 0)
+        .unwrap_or(false);
 
     // Resolve the workspace target dir. `OUT_DIR` is `<target>/<profile>/build/murmur-*/out`;
     // climb to `<target>` then probe the profile subdirs. Honor `CARGO_TARGET_DIR` if set.
@@ -120,7 +122,7 @@ fn stage_brain_sidecar() {
     // a normal `cargo build -p murmur-brain` dev build (a target-triple build writes under
     // `target/<triple>/…`, which the release path stages via `beforeBuildCommand`, not here).
     // Require a NON-EMPTY file: a half-written / interrupted child build can leave a 0-byte
-    // `target/<profile>/meetnotes-brain`. A bare `is_file()` would treat that empty stub as a real
+    // `target/<profile>/murmur-brain`. A bare `is_file()` would treat that empty stub as a real
     // child, then `fs::copy` it into `binaries/…` on EVERY build (since `already_real` — which also
     // gates on `len() > 0` — never flips true for a 0-byte copy), re-arming the dev watcher into an
     // infinite rebuild loop, and would emit a `BRAIN_BIN` pointing at an unspawnable empty binary.
@@ -131,7 +133,11 @@ fn stage_brain_sidecar() {
             td.join("debug").join(BIN),
         ]
         .into_iter()
-        .find(|p| std::fs::metadata(p).map(|m| m.is_file() && m.len() > 0).unwrap_or(false))
+        .find(|p| {
+            std::fs::metadata(p)
+                .map(|m| m.is_file() && m.len() > 0)
+                .unwrap_or(false)
+        })
     });
 
     match built {
@@ -174,8 +180,9 @@ fn stage_brain_sidecar() {
 ///      `tauri.conf.json` `bundle.resources`, then resolved at RUNTIME. This is the ONLY path
 ///      that works in a shipped, notarized build.
 ///
-/// Best-effort: missing `swiftc`/SDK → `cargo:warning` (capture degrades); a missing x86_64 slice
-/// → fall back to a host-arch-only binary. It never fails `cargo build`.
+/// Dev is best-effort: missing `swiftc`/SDK or x86_64 falls back to a host slice. Release is strict:
+/// every present/bundled helper source must freshly compile as arm64+x86_64 or the build aborts;
+/// a stale staged helper must never make a nominally universal DMG pass.
 fn build_swift_helper(
     src_rel: &str,
     bin: &str,
@@ -193,11 +200,20 @@ fn build_swift_helper(
         return;
     };
     let out_bin = Path::new(&out_dir).join(bin);
+    let is_release = std::env::var("PROFILE").as_deref() == Ok("release");
 
-    if !compile_universal(src, &out_dir, &out_bin, deploy_target, frameworks)
+    if is_release {
+        if !compile_universal(src, &out_dir, &out_bin, deploy_target, frameworks)
+            || !is_universal_macho(&out_bin)
+        {
+            panic!(
+                "release helper {bin} was not freshly built as universal arm64+x86_64; refusing stale/single-arch bundle"
+            );
+        }
+    } else if !compile_universal(src, &out_dir, &out_bin, deploy_target, frameworks)
         && !compile_single(src, &out_bin, deploy_target, frameworks)
     {
-        return; // warnings already emitted; this helper is unavailable
+        return; // warnings already emitted; this helper is unavailable in dev
     }
 
     // Dev fallback path.
@@ -210,17 +226,39 @@ fn build_swift_helper(
     // helper actually executes via the `OUT_DIR` env fallback above; this staged copy only
     // satisfies the resource check.
     let bundled = Path::new("binaries").join(bin);
-    let is_release = std::env::var("PROFILE").as_deref() == Ok("release");
     if is_release || !bundled.exists() {
         if let Some(parent) = bundled.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
         if let Err(e) = std::fs::copy(&out_bin, &bundled) {
-            println!(
-                "cargo:warning=could not stage {bin} for bundling ({e}); a release bundle may lack it"
-            );
+            if is_release {
+                panic!("could not stage universal release helper {bin}: {e}");
+            }
+            println!("cargo:warning=could not stage {bin} for dev bundling ({e})");
+        }
+        if is_release && !is_universal_macho(&bundled) {
+            panic!("staged release helper {bin} is not universal arm64+x86_64");
         }
     }
+}
+
+fn is_universal_macho(path: &Path) -> bool {
+    let Ok(output) = Command::new("lipo").arg("-archs").arg(path).output() else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let Ok(arches) = String::from_utf8(output.stdout) else {
+        return false;
+    };
+    let mut has_arm64 = false;
+    let mut has_x86_64 = false;
+    for arch in arches.split_whitespace() {
+        has_arm64 |= arch == "arm64";
+        has_x86_64 |= arch == "x86_64";
+    }
+    has_arm64 && has_x86_64
 }
 
 fn framework_args(frameworks: &[&str]) -> Vec<String> {

@@ -221,7 +221,13 @@ mod tests {
     fn from_config_fail_closed_when_disabled_or_unconsented() {
         let cfg = AppConfig::default();
         assert!(SlackConnector::from_config_if_available(&cfg).is_none());
-        let cfg = AppConfig { slack_enabled: true, ..AppConfig::default() };
-        assert!(SlackConnector::from_config_if_available(&cfg).is_none(), "unconsented");
+        let cfg = AppConfig {
+            slack_enabled: true,
+            ..AppConfig::default()
+        };
+        assert!(
+            SlackConnector::from_config_if_available(&cfg).is_none(),
+            "unconsented"
+        );
     }
 }

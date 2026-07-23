@@ -27,7 +27,7 @@
 //! off (see LOCKSEC in the spec). Logs carry `target: "reason"` + stages/errors only, never content.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -56,6 +56,96 @@ const ENV_OVERRIDE: &str = "MURMUR_AFM_SIDECAR";
 /// calendar lookup (10s), so this is generous; a wedged child is hard-killed at the deadline so it
 /// can never block the reasoner call.
 const SIDECAR_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// A SIGKILL should reap promptly, but the host must never replace one unbounded `wait()` with
+/// another. Teardown gets its own small deadline and every kill/reap error is surfaced.
+const SIDECAR_REAP_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// AFM replies are one JSON envelope. Keep enough room for a generously sized generated note while
+/// preventing a broken or hostile sidecar from turning stdout into an unbounded host allocation.
+/// The reader continues draining after this limit so the child can still exit and be reaped.
+const SIDECAR_OUTPUT_LIMIT_BYTES: usize = 1024 * 1024;
+const AFM_QUARANTINE_KEY: &str = "afm-unreaped-child";
+
+/// A failed kill/reap must not drop the last Child handle and then release model admission while
+/// the AFM process may still own RAM/CPU. Retain every unproven child here; model admission checks
+/// this owner, and recording Start explicitly retries bounded death proof after closing new work.
+fn unreaped_children() -> &'static Mutex<Vec<std::process::Child>> {
+    static CHILDREN: OnceLock<Mutex<Vec<std::process::Child>>> = OnceLock::new();
+    CHILDREN.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+pub(crate) fn has_unreaped_child() -> bool {
+    !unreaped_children()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .is_empty()
+}
+
+fn retain_unreaped_child(child: std::process::Child, failure: impl std::fmt::Display) -> AppError {
+    let pid = child.id();
+    unreaped_children()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(child);
+    // Generation calls arrive here while their AppleFoundation lease is still held, so poison the
+    // shared residency lane before that lease drops. A direct test/probe without admission may not
+    // satisfy the precondition; the retained-child gate above remains fail-closed regardless.
+    if let Err(error) = crate::perf::quarantine_resident_model(
+        crate::perf::ResidentModelKind::AppleFoundation,
+        AFM_QUARANTINE_KEY.to_string(),
+    ) {
+        tracing::warn!(target: "reason", error = %error, pid, "AFM child retained without coordinator quarantine; global child gate remains active");
+    }
+    AppError::Unavailable(format!(
+        "afm sidecar teardown is unproven ({failure}); local AI and recording stay blocked until pid {pid} is reaped"
+    ))
+}
+
+/// Retry kill/reap for every retained AFM child under one shared deadline. Called only after Start
+/// installed priority and drained pre-admitted generations, so clearing an exact quarantine cannot
+/// race a fresh AFM spawn.
+pub(crate) fn reap_unreaped_for_recording(timeout: Duration) -> Result<bool> {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut children = unreaped_children()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let index = 0usize;
+    while index < children.len() {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Ok(false);
+        }
+        match kill_and_reap_bounded(&mut children[index], remaining) {
+            Ok(()) => {
+                let mut child = children.swap_remove(index);
+                if let Err(error) = child.wait() {
+                    children.push(child);
+                    tracing::warn!(
+                        target: "reason",
+                        error = %error,
+                        "retained AFM child could not confirm cached reap status"
+                    );
+                    return Ok(false);
+                }
+            }
+            Err(error) => {
+                tracing::warn!(target: "reason", error = %error, "retained AFM child still lacks death proof");
+                return Ok(false);
+            }
+        }
+    }
+    drop(children);
+    if crate::perf::resident_model_quarantine_key(crate::perf::ResidentModelKind::AppleFoundation)
+        .is_some()
+    {
+        crate::perf::clear_resident_model_quarantine(
+            crate::perf::ResidentModelKind::AppleFoundation,
+            AFM_QUARANTINE_KEY,
+        )?;
+    }
+    Ok(true)
+}
 
 /// TEST-ONLY process-wide lock serializing tests that require [`ENV_OVERRIDE`] to be UNSET (the
 /// `reason.rs` dispatch tests, which `remove_var` it defensively against an externally-exported
@@ -255,28 +345,154 @@ fn hardened_command(bin: &Path) -> std::process::Command {
     cmd
 }
 
-/// Poll a spawned child to exit under a hard [`SIDECAR_TIMEOUT`] wall-clock cap, hard-killing a
-/// wedged child at the deadline so it can never block the caller. `Ok(())` once the child has exited
-/// (any status); `Err` on timeout or a wait error. NEVER panics.
-fn wait_bounded(child: &mut std::process::Child) -> Result<()> {
+/// Kill a live child and reap it within `timeout`. A race where the child exits just before `kill`
+/// is treated as success only after `try_wait` proves the exit. No error is discarded.
+fn kill_and_reap_bounded(child: &mut std::process::Child, timeout: Duration) -> Result<()> {
+    let pre_kill_error = match child.try_wait() {
+        Ok(Some(_)) => return Ok(()),
+        Ok(None) => None,
+        // A failed status probe must not prevent the best-effort kill. Preserve it in any teardown
+        // error below instead of turning an observation failure into an orphaned live child.
+        Err(error) => Some(error),
+    };
+
+    if let Err(kill_error) = child.kill() {
+        return match child.try_wait() {
+            Ok(Some(_)) => Ok(()),
+            Ok(None) => Err(AppError::Summarize(match pre_kill_error {
+                Some(precheck) => format!(
+                    "afm: pre-kill status check failed: {precheck}; sidecar kill failed: {kill_error}"
+                ),
+                None => format!("afm: sidecar kill failed: {kill_error}"),
+            })),
+            Err(wait_error) => Err(AppError::Summarize(format!(
+                "afm: sidecar kill failed: {kill_error}; status check failed: {wait_error}"
+            ))),
+        };
+    }
+
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                return Err(AppError::Summarize(
+                    "afm: killed sidecar did not reap before deadline".to_string(),
+                ))
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Err(error) => {
+                return Err(AppError::Summarize(format!(
+                    "afm: sidecar reap failed: {error}"
+                )))
+            }
+        }
+    }
+}
+
+/// Drain a child's stdout concurrently with its runtime. The byte buffer is capped, but excess
+/// output is discarded until EOF so a full pipe can never block the child before [`wait_bounded`]
+/// observes its exit. Completion is reported over a capacity-one channel; callers collect it only
+/// after exit/kill has been proven and always under [`SIDECAR_REAP_TIMEOUT`].
+fn spawn_bounded_stdout_reader(
+    mut stdout: std::process::ChildStdout,
+    thread_name: &str,
+) -> std::result::Result<std::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>, std::io::Error> {
+    use std::io::Read;
+
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name(thread_name.to_string())
+        .spawn(move || {
+            let mut output = Vec::new();
+            let mut chunk = [0_u8; 8192];
+            let mut exceeded_limit = false;
+            let result = loop {
+                match stdout.read(&mut chunk) {
+                    Ok(0) => {
+                        if exceeded_limit {
+                            break Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "afm sidecar output exceeded bounded limit",
+                            ));
+                        }
+                        break Ok(output);
+                    }
+                    Ok(read) => {
+                        let remaining = SIDECAR_OUTPUT_LIMIT_BYTES.saturating_sub(output.len());
+                        let retained = read.min(remaining);
+                        output.extend_from_slice(&chunk[..retained]);
+                        if retained < read {
+                            exceeded_limit = true;
+                        }
+                    }
+                    Err(error) => break Err(error),
+                }
+            };
+            let _ = tx.send(result);
+        })?;
+    Ok(rx)
+}
+
+/// Receive a worker result before one shared teardown deadline. Using a shared deadline prevents
+/// two sequential channel collections from each consuming the full reap timeout.
+fn recv_before_deadline<T>(
+    rx: &std::sync::mpsc::Receiver<T>,
+    deadline: std::time::Instant,
+) -> std::result::Result<T, std::sync::mpsc::RecvTimeoutError> {
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    rx.recv_timeout(remaining)
+}
+
+fn worker_completion_summary(
+    result: &std::result::Result<std::io::Result<()>, std::sync::mpsc::RecvTimeoutError>,
+) -> String {
+    match result {
+        Ok(Ok(())) => "completed".to_string(),
+        Ok(Err(error)) => format!("failed: {error}"),
+        Err(error) => format!("not finished: {error}"),
+    }
+}
+
+fn output_completion_summary(
+    result: &std::result::Result<std::io::Result<Vec<u8>>, std::sync::mpsc::RecvTimeoutError>,
+) -> String {
+    match result {
+        Ok(Ok(_)) => "completed".to_string(),
+        Ok(Err(error)) => format!("failed: {error}"),
+        Err(error) => format!("not finished: {error}"),
+    }
+}
+
+/// Poll a spawned child to exit under a hard [`SIDECAR_TIMEOUT`] wall-clock cap, hard-killing and
+/// bounded-reaping a wedged child at the deadline. Returns the proven exit status; `Err` on timeout
+/// or any wait/kill/reap failure. NEVER panics.
+fn wait_bounded(child: &mut std::process::Child) -> Result<std::process::ExitStatus> {
     let deadline = std::time::Instant::now() + SIDECAR_TIMEOUT;
     loop {
         match child.try_wait() {
-            Ok(Some(_status)) => return Ok(()),
+            Ok(Some(status)) => return Ok(status),
             Ok(None) => {
                 if std::time::Instant::now() >= deadline {
                     tracing::warn!(target: "reason", "afm sidecar timed out; killing");
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    if let Err(teardown) = kill_and_reap_bounded(child, SIDECAR_REAP_TIMEOUT) {
+                        return Err(AppError::Summarize(format!(
+                            "afm: sidecar timed out; teardown failed: {teardown}"
+                        )));
+                    }
                     return Err(AppError::Summarize("afm: sidecar timed out".to_string()));
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
             Err(e) => {
-                let _ = child.kill();
-                return Err(AppError::Summarize(format!(
-                    "afm: sidecar wait failed: {e}"
-                )));
+                return match kill_and_reap_bounded(child, SIDECAR_REAP_TIMEOUT) {
+                    Ok(()) => Err(AppError::Summarize(format!(
+                        "afm: sidecar wait failed: {e}"
+                    ))),
+                    Err(teardown) => Err(AppError::Summarize(format!(
+                        "afm: sidecar wait failed: {e}; teardown failed: {teardown}"
+                    ))),
+                };
             }
         }
     }
@@ -284,10 +500,11 @@ fn wait_bounded(child: &mut std::process::Child) -> Result<()> {
 
 /// Spawn the sidecar, stream `request` to its STDIN, bound its runtime, and return its STDOUT.
 ///
-/// DEADLOCK AVOIDANCE: the request is written on a SCOPED writer thread that drops stdin (EOF) when
-/// done, WHILE the main thread runs the bounded try_wait loop — so neither side blocks on a full OS
-/// pipe buffer. Every failure (spawn / timeout / non-zero exit / read) is an `Err` (which floors the
-/// reasoner). NO transcript ever touches disk — stdin pipe only. NEVER panics.
+/// DEADLOCK AVOIDANCE: owned reader/writer threads concurrently drain stdout and write/drop stdin
+/// while the main thread runs the bounded wait. Both report over capacity-one channels and are
+/// collected only after proven exit/kill, under one small deadline. Every failure (spawn / write /
+/// timeout / kill / reap / exit / read) is an `Err` (which floors the reasoner). NO transcript ever
+/// touches disk. NEVER panics.
 fn run_afm(bin: &Path, request: &str) -> Result<String> {
     use std::io::Write;
     use std::process::Stdio;
@@ -300,29 +517,134 @@ fn run_afm(bin: &Path, request: &str) -> Result<String> {
     let mut child = cmd
         .spawn()
         .map_err(|e| AppError::Summarize(format!("afm: spawn failed: {e}")))?;
-    let stdin = child.stdin.take();
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            let teardown = kill_and_reap_bounded(&mut child, SIDECAR_REAP_TIMEOUT);
+            return match teardown {
+                Ok(()) => Err(AppError::Summarize(
+                    "afm: stdout pipe unavailable".to_string(),
+                )),
+                Err(error) => Err(retain_unreaped_child(
+                    child,
+                    format!("stdout pipe unavailable; teardown failed: {error}"),
+                )),
+            };
+        }
+    };
+    let output_rx = match spawn_bounded_stdout_reader(stdout, "murmur-afm-stdout") {
+        Ok(rx) => rx,
+        Err(spawn_error) => {
+            let teardown = kill_and_reap_bounded(&mut child, SIDECAR_REAP_TIMEOUT);
+            return match teardown {
+                Ok(()) => Err(AppError::Summarize(format!(
+                    "afm: stdout reader spawn failed: {spawn_error}"
+                ))),
+                Err(error) => Err(retain_unreaped_child(
+                    child,
+                    format!("stdout reader spawn failed: {spawn_error}; teardown failed: {error}"),
+                )),
+            };
+        }
+    };
+    let mut stdin = match child.stdin.take() {
+        Some(stdin) => stdin,
+        None => {
+            let teardown = kill_and_reap_bounded(&mut child, SIDECAR_REAP_TIMEOUT);
+            let collection_deadline = std::time::Instant::now() + SIDECAR_REAP_TIMEOUT;
+            let output_result = recv_before_deadline(&output_rx, collection_deadline);
+            let output_summary = output_completion_summary(&output_result);
+            return match teardown {
+                Ok(()) => Err(AppError::Summarize(format!(
+                    "afm: stdin pipe unavailable; stdout completion: {output_summary}"
+                ))),
+                Err(error) => Err(retain_unreaped_child(
+                    child,
+                    format!(
+                        "stdin pipe unavailable; teardown failed: {error}; stdout completion: {output_summary}"
+                    ),
+                )),
+            };
+        }
+    };
+    let request = request.as_bytes().to_vec();
+    let (write_tx, write_rx) = std::sync::mpsc::sync_channel(1);
+    if let Err(spawn_error) = std::thread::Builder::new()
+        .name("murmur-afm-stdin".into())
+        .spawn(move || {
+            let result = stdin.write_all(&request);
+            // `stdin` drops here, signalling EOF even when the write failed.
+            let _ = write_tx.send(result);
+        })
+    {
+        let teardown = kill_and_reap_bounded(&mut child, SIDECAR_REAP_TIMEOUT);
+        let collection_deadline = std::time::Instant::now() + SIDECAR_REAP_TIMEOUT;
+        let output_result = recv_before_deadline(&output_rx, collection_deadline);
+        let output_summary = output_completion_summary(&output_result);
+        return match teardown {
+            Ok(()) => Err(AppError::Summarize(format!(
+                "afm: stdin writer spawn failed: {spawn_error}; stdout completion: {output_summary}"
+            ))),
+            Err(error) => Err(retain_unreaped_child(
+                child,
+                format!(
+                    "stdin writer spawn failed: {spawn_error}; teardown failed: {error}; stdout completion: {output_summary}"
+                ),
+            )),
+        };
+    }
 
-    std::thread::scope(|scope| -> Result<String> {
-        // Writer thread: stream the request, then drop stdin (EOF). A BrokenPipe (child already
-        // exited / didn't read stdin) is ignored — the bounded wait below owns the outcome.
-        if let Some(mut stdin) = stdin {
-            scope.spawn(move || {
-                let _ = stdin.write_all(request.as_bytes());
-                // `stdin` dropped here → the child's stdin read sees EOF.
-            });
+    let wait_result = wait_bounded(&mut child);
+    let collection_deadline = std::time::Instant::now() + SIDECAR_REAP_TIMEOUT;
+    let write_result = recv_before_deadline(&write_rx, collection_deadline);
+    let output_result = recv_before_deadline(&output_rx, collection_deadline);
+    let status = match wait_result {
+        Ok(status) => status,
+        Err(wait_error) => {
+            let failure = format!(
+                "{wait_error}; stdin completion: {}; stdout completion: {}",
+                worker_completion_summary(&write_result),
+                output_completion_summary(&output_result)
+            );
+            return match child.try_wait() {
+                Ok(Some(_)) => Err(AppError::Summarize(failure)),
+                Ok(None) | Err(_) => Err(retain_unreaped_child(child, failure)),
+            };
         }
-        wait_bounded(&mut child)?;
-        let out = child
-            .wait_with_output()
-            .map_err(|e| AppError::Summarize(format!("afm: read output failed: {e}")))?;
-        if !out.status.success() {
+    };
+    match write_result {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
             return Err(AppError::Summarize(format!(
-                "afm: sidecar exited with {}",
-                out.status
-            )));
+                "afm: stdin write failed: {error}"
+            )))
         }
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-    })
+        Err(error) => {
+            return Err(AppError::Summarize(format!(
+                "afm: stdin writer did not finish after child exit: {error}"
+            )))
+        }
+    }
+    let output = match output_result {
+        Ok(Ok(output)) => output,
+        Ok(Err(error)) => {
+            return Err(AppError::Summarize(format!(
+                "afm: stdout read failed: {error}"
+            )))
+        }
+        Err(error) => {
+            return Err(AppError::Summarize(format!(
+                "afm: stdout reader did not finish after child exit: {error}"
+            )))
+        }
+    };
+    if !status.success() {
+        return Err(AppError::Summarize(format!(
+            "afm: sidecar exited with {}",
+            status
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output).into_owned())
 }
 
 /// Spawn the sidecar with a single `--probe` arg (a fast availability check, NOT a generation) and
@@ -339,11 +661,73 @@ fn run_probe(bin: &Path) -> Result<String> {
     let mut child = cmd
         .spawn()
         .map_err(|e| AppError::Summarize(format!("afm: probe spawn failed: {e}")))?;
-    wait_bounded(&mut child)?;
-    let out = child
-        .wait_with_output()
-        .map_err(|e| AppError::Summarize(format!("afm: probe read failed: {e}")))?;
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            let teardown = kill_and_reap_bounded(&mut child, SIDECAR_REAP_TIMEOUT);
+            return match teardown {
+                Ok(()) => Err(AppError::Summarize(
+                    "afm: probe stdout pipe unavailable".to_string(),
+                )),
+                Err(error) => Err(retain_unreaped_child(
+                    child,
+                    format!("probe stdout pipe unavailable; teardown failed: {error}"),
+                )),
+            };
+        }
+    };
+    let output_rx = match spawn_bounded_stdout_reader(stdout, "murmur-afm-probe-stdout") {
+        Ok(rx) => rx,
+        Err(spawn_error) => {
+            let teardown = kill_and_reap_bounded(&mut child, SIDECAR_REAP_TIMEOUT);
+            return match teardown {
+                Ok(()) => Err(AppError::Summarize(format!(
+                    "afm: probe stdout reader spawn failed: {spawn_error}"
+                ))),
+                Err(error) => Err(retain_unreaped_child(
+                    child,
+                    format!(
+                        "probe stdout reader spawn failed: {spawn_error}; teardown failed: {error}"
+                    ),
+                )),
+            };
+        }
+    };
+    let wait_result = wait_bounded(&mut child);
+    let collection_deadline = std::time::Instant::now() + SIDECAR_REAP_TIMEOUT;
+    let output_result = recv_before_deadline(&output_rx, collection_deadline);
+    let status = match wait_result {
+        Ok(status) => status,
+        Err(wait_error) => {
+            let failure = format!(
+                "{wait_error}; probe stdout completion: {}",
+                output_completion_summary(&output_result)
+            );
+            return match child.try_wait() {
+                Ok(Some(_)) => Err(AppError::Summarize(failure)),
+                Ok(None) | Err(_) => Err(retain_unreaped_child(child, failure)),
+            };
+        }
+    };
+    let output = match output_result {
+        Ok(Ok(output)) => output,
+        Ok(Err(error)) => {
+            return Err(AppError::Summarize(format!(
+                "afm: probe stdout read failed: {error}"
+            )))
+        }
+        Err(error) => {
+            return Err(AppError::Summarize(format!(
+                "afm: probe stdout reader did not finish after child exit: {error}"
+            )))
+        }
+    };
+    if !status.success() {
+        return Err(AppError::Summarize(format!(
+            "afm: probe sidecar exited with {status}"
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output).into_owned())
 }
 
 /// Availability probe for the FE (`afm_available`). GRACEFUL on every path:
@@ -354,20 +738,39 @@ fn run_probe(bin: &Path) -> Result<String> {
 ///
 /// NEVER panics, NEVER egresses (a local availability check only).
 pub fn probe(app: Option<&AppHandle>) -> AfmStatus {
-    probe_at(sidecar_path(app))
+    let Some(bin) = sidecar_path(app) else {
+        return absent_probe_status();
+    };
+    // Treat the capability probe as a real AFM process lifetime. Even if today's Swift `--probe`
+    // is cheap, it is not allowed to spawn beside capture or another resident model on assumption.
+    let result = crate::perf::with_model_generation(
+        None,
+        crate::perf::ResidentModelKind::AppleFoundation,
+        || run_probe(&bin).and_then(|out| parse_probe_output(&out)),
+    );
+    probe_status_from_result(result)
 }
 
 /// Core of [`probe`] over an already-resolved sidecar path (R8): env-free, so tests drive the
 /// probe against a fixture (or `None`) without touching `MURMUR_AFM_SIDECAR`.
+#[cfg(test)]
 fn probe_at(bin: Option<PathBuf>) -> AfmStatus {
     let Some(bin) = bin else {
-        return AfmStatus {
-            sidecar_present: false,
-            model_available: None,
-            reason: "sidecar not bundled (needs a macOS 26 build)".to_string(),
-        };
+        return absent_probe_status();
     };
-    match run_probe(&bin).and_then(|out| parse_probe_output(&out)) {
+    probe_status_from_result(run_probe(&bin).and_then(|out| parse_probe_output(&out)))
+}
+
+fn absent_probe_status() -> AfmStatus {
+    AfmStatus {
+        sidecar_present: false,
+        model_available: None,
+        reason: "sidecar not bundled (needs a macOS 26 build)".to_string(),
+    }
+}
+
+fn probe_status_from_result(result: Result<(bool, String)>) -> AfmStatus {
+    match result {
         Ok((available, reason)) => AfmStatus {
             sidecar_present: true,
             model_available: Some(available),
@@ -583,6 +986,11 @@ mod tests {
     /// full spawn + stdin-write + stdout-parse path can be exercised WITHOUT a real macOS-26 sidecar.
     #[cfg(unix)]
     fn write_fixture(tag: &str, envelope: &str) -> PathBuf {
+        write_script_fixture(tag, &format!("cat >/dev/null\nprintf '%s' '{envelope}'\n"))
+    }
+
+    #[cfg(unix)]
+    fn write_script_fixture(tag: &str, body: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let mut p = std::env::temp_dir();
         p.push(format!(
@@ -593,9 +1001,7 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        // Drain stdin (so the parent's write never SIGPIPEs / blocks), then print the canned reply.
-        // Single-quote the envelope for the shell; our envelopes contain no single quotes.
-        let script = format!("#!/bin/sh\ncat >/dev/null\nprintf '%s' '{envelope}'\n");
+        let script = format!("#!/bin/sh\n{body}");
         std::fs::write(&p, script).unwrap();
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
         p
@@ -630,6 +1036,40 @@ mod tests {
         let v = r.structured("sys", "user", &schema).unwrap();
         assert_eq!(v["n"], serde_json::json!(2));
         assert_eq!(v["ok"], serde_json::json!(true));
+
+        let _ = std::fs::remove_file(&fixture);
+    }
+
+    /// Regression: output larger than a typical OS pipe must be drained while the process is still
+    /// alive. This fixture writes first and reads stdin second, the exact ordering that deadlocked
+    /// the old wait-before-read implementation.
+    #[cfg(unix)]
+    #[test]
+    fn stdout_larger_than_pipe_is_drained_concurrently() {
+        let fixture =
+            write_script_fixture("large-stdout", "head -c 131072 /dev/zero\ncat >/dev/null\n");
+
+        let output = run_afm(&fixture, r#"{"mode":"reason"}"#).unwrap();
+        assert_eq!(output.len(), 131072);
+
+        let _ = std::fs::remove_file(&fixture);
+    }
+
+    /// A broken sidecar may produce arbitrary output forever. We still drain through EOF so it can
+    /// exit, but never retain more than the one-envelope cap in host RAM.
+    #[cfg(unix)]
+    #[test]
+    fn stdout_over_limit_is_rejected_after_bounded_drain() {
+        let fixture = write_script_fixture(
+            "oversized-stdout",
+            &format!(
+                "head -c {} /dev/zero\ncat >/dev/null\n",
+                SIDECAR_OUTPUT_LIMIT_BYTES + 1
+            ),
+        );
+
+        let error = run_afm(&fixture, r#"{"mode":"reason"}"#).unwrap_err();
+        assert!(format!("{error}").contains("output exceeded bounded limit"));
 
         let _ = std::fs::remove_file(&fixture);
     }

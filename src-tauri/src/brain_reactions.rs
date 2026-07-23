@@ -58,7 +58,11 @@ pub struct WhisperCard {
 /// `(entity, subject, predicate)`) into a Contradiction card citing the OLD fact. `NoOp` (same value)
 /// and `Add` (new topic) produce NOTHING — a paraphrase or a fresh fact is never a contradiction. The
 /// ops are NOT applied (dry-run): a live recording mutates no facts.
-pub fn cards_from_reconcile(existing: &[Fact], candidates: &[FactCandidate], at: &str) -> Vec<WhisperCard> {
+pub fn cards_from_reconcile(
+    existing: &[Fact],
+    candidates: &[FactCandidate],
+    at: &str,
+) -> Vec<WhisperCard> {
     let ops = reconcile_facts(existing, candidates, at);
     let mut cards = Vec::new();
     for op in &ops {
@@ -135,7 +139,13 @@ fn extract_fact_candidates_capped(
 ) -> Vec<FactCandidate> {
     // The title is unused for a live window; pass a short marker. The cap rides GenOptions through the
     // extractor's structured_with call (see facts.rs).
-    extract_fact_candidates(reasoner, "live", window, entities, GenOptions::light_extraction())
+    extract_fact_candidates(
+        reasoner,
+        "live",
+        window,
+        entities,
+        GenOptions::light_extraction(),
+    )
 }
 
 /// Chars of the live-transcript TAIL fed to one reactions scan — a bounded recent window (the far
@@ -334,7 +344,13 @@ mod tests {
     fn planted_contradiction_yields_one_card_citing_the_old_fact() {
         // RED-before-GREEN: existing "firm", far side now says "flexible" ⇒ exactly one Contradiction
         // card citing the OLD value + its source meeting.
-        let existing = vec![fact("f1", "Project Atlas", "deadline", "May 30 firm", "m-kickoff")];
+        let existing = vec![fact(
+            "f1",
+            "Project Atlas",
+            "deadline",
+            "May 30 firm",
+            "m-kickoff",
+        )];
         let cands = vec![cand("Project Atlas", "deadline", "flexible")];
         let cards = cards_from_reconcile(&existing, &cands, "2026-07-04T00:00:00Z");
         assert_eq!(cards.len(), 1);
@@ -347,7 +363,13 @@ mod tests {
     #[test]
     fn same_value_paraphrase_yields_no_card() {
         // NoOp: the far side restates the SAME value ⇒ no contradiction (false-positive guard).
-        let existing = vec![fact("f1", "Project Atlas", "deadline", "May 30 firm", "m-kickoff")];
+        let existing = vec![fact(
+            "f1",
+            "Project Atlas",
+            "deadline",
+            "May 30 firm",
+            "m-kickoff",
+        )];
         let cands = vec![cand("Project Atlas", "deadline", "May 30 firm")];
         assert!(cards_from_reconcile(&existing, &cands, "2026-07-04T00:00:00Z").is_empty());
     }
@@ -355,14 +377,26 @@ mod tests {
     #[test]
     fn brand_new_fact_yields_no_card() {
         // Add: a topic with no prior fact ⇒ nothing to contradict.
-        let existing = vec![fact("f1", "Project Atlas", "deadline", "May 30 firm", "m-kickoff")];
+        let existing = vec![fact(
+            "f1",
+            "Project Atlas",
+            "deadline",
+            "May 30 firm",
+            "m-kickoff",
+        )];
         let cands = vec![cand("Project Atlas", "owner", "Marcus")];
         assert!(cards_from_reconcile(&existing, &cands, "2026-07-04T00:00:00Z").is_empty());
     }
 
     #[test]
     fn no_candidates_no_cards() {
-        let existing = vec![fact("f1", "Project Atlas", "deadline", "May 30 firm", "m-kickoff")];
+        let existing = vec![fact(
+            "f1",
+            "Project Atlas",
+            "deadline",
+            "May 30 firm",
+            "m-kickoff",
+        )];
         assert!(cards_from_reconcile(&existing, &[], "2026-07-04T00:00:00Z").is_empty());
     }
 
@@ -391,7 +425,11 @@ mod tests {
         let w = reaction_window("- [deal]: pricing agreed", &live);
         assert!(w.starts_with("- [deal]: pricing agreed\n"));
         let verbatim = w.split_once('\n').unwrap().1;
-        assert_eq!(verbatim.chars().count(), 300, "verbatim tail bounded at 300");
+        assert_eq!(
+            verbatim.chars().count(),
+            300,
+            "verbatim tail bounded at 300"
+        );
     }
 
     /// Brain v2 L4 — the entity filter over the SHARED tick-thread cache: whole-window
@@ -403,7 +441,8 @@ mod tests {
             ("e2".to_string(), "Kraken".to_string()),
             ("e3".to_string(), "  ".to_string()),
         ];
-        let hits = filter_window_entities(&entities, "wracamy do tematu atlas w przyszłym tygodniu");
+        let hits =
+            filter_window_entities(&entities, "wracamy do tematu atlas w przyszłym tygodniu");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].0, "e1");
         assert!(filter_window_entities(&entities, "nic o nich").is_empty());

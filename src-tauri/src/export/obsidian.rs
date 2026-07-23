@@ -1,9 +1,940 @@
 use std::ffi::OsStr;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+
+#[cfg(target_os = "macos")]
+use std::ffi::CString;
+#[cfg(target_os = "macos")]
+use std::os::fd::{AsRawFd, FromRawFd};
+#[cfg(target_os = "macos")]
+use std::os::unix::ffi::OsStrExt;
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::{AppError, Result};
+#[cfg(target_os = "macos")]
+use crate::storage::db::Db;
+#[cfg(target_os = "macos")]
+use crate::storage::links::LockMarkerExportPublish;
+
+#[cfg(target_os = "macos")]
+const NOTE_O_RDONLY: i32 = 0;
+#[cfg(target_os = "macos")]
+const NOTE_O_RDWR: i32 = 0x0000_0002;
+#[cfg(target_os = "macos")]
+const NOTE_O_CREAT: i32 = 0x0000_0200;
+#[cfg(target_os = "macos")]
+const NOTE_O_EXCL: i32 = 0x0000_0800;
+#[cfg(target_os = "macos")]
+const NOTE_O_NOFOLLOW: i32 = 0x0000_0100;
+#[cfg(target_os = "macos")]
+const NOTE_O_DIRECTORY: i32 = 0x0010_0000;
+#[cfg(target_os = "macos")]
+const NOTE_O_CLOEXEC: i32 = 0x0100_0000;
+#[cfg(target_os = "macos")]
+const NOTE_RENAME_SWAP: u32 = 0x0000_0002;
+
+#[cfg(target_os = "macos")]
+extern "C" {
+    fn openat(directory: i32, path: *const std::ffi::c_char, flags: i32, ...) -> i32;
+    fn renameatx_np(
+        from_directory: i32,
+        from: *const std::ffi::c_char,
+        to_directory: i32,
+        to: *const std::ffi::c_char,
+        flags: u32,
+    ) -> i32;
+    fn unlinkat(directory: i32, path: *const std::ffi::c_char, flags: i32) -> i32;
+}
+
+fn marker_cleanup_error(message: impl std::fmt::Display) -> AppError {
+    AppError::Export(format!("marker-cleanup export: {message}"))
+}
+
+pub(crate) const MAX_MARKER_CLEANUP_NOTE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// A configured vault root held open as a directory capability. Marker cleanup never resolves an
+/// outbox pathname from the process cwd and never follows a symlink in the configured root or any
+/// vault-relative ancestor.
+pub(crate) struct MarkerCleanupVault {
+    configured: PathBuf,
+    #[cfg(target_os = "macos")]
+    root: File,
+}
+
+/// One exact parent-directory capability plus a single-component note name. Every subsequent open,
+/// exchange, unlink and directory sync is relative to this stable descriptor, so swapping an
+/// ancestor pathname cannot redirect a lock cleanup outside the vault.
+pub(crate) struct MarkerCleanupNote {
+    #[cfg(target_os = "macos")]
+    parent: File,
+    #[cfg(target_os = "macos")]
+    name: CString,
+    #[cfg(target_os = "macos")]
+    stage_name: CString,
+}
+
+/// Exact single-link vault-file snapshot used by the lock marker cleanup outbox. Keeping identity
+/// and bytes together prevents a path swap or concurrent external edit from being silently
+/// overwritten between the privacy scrub's read and atomic publish.
+pub(crate) struct OwnedNoteSnapshot {
+    text: String,
+    device: u64,
+    inode: u64,
+    byte_len: u64,
+    mode: u32,
+    #[cfg(target_os = "macos")]
+    file: File,
+}
+
+impl OwnedNoteSnapshot {
+    pub(crate) fn text(&self) -> &str {
+        &self.text
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl MarkerCleanupVault {
+    pub(crate) fn open(path: &Path) -> Result<Self> {
+        if !absolute_normal_path(path) {
+            return Err(marker_cleanup_error(
+                "configured vault root must be an absolute path without dot components",
+            ));
+        }
+        let root = open_absolute_directory_nofollow(path)?;
+        if !root
+            .metadata()
+            .map_err(|error| marker_cleanup_error(format!("stat vault root failed: {error}")))?
+            .is_dir()
+        {
+            return Err(marker_cleanup_error(
+                "configured vault root is not a directory",
+            ));
+        }
+        Ok(Self {
+            configured: path.to_path_buf(),
+            root,
+        })
+    }
+
+    pub(crate) fn note(&self, exported_path: &Path, stage_name: &str) -> Result<MarkerCleanupNote> {
+        if !absolute_normal_path(exported_path) {
+            return Err(marker_cleanup_error(
+                "outbox path must be absolute and contain no dot components",
+            ));
+        }
+        let relative = exported_path.strip_prefix(&self.configured).map_err(|_| {
+            marker_cleanup_error("outbox path is outside the configured vault root")
+        })?;
+        if relative.as_os_str().is_empty()
+            || relative
+                .components()
+                .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        {
+            return Err(marker_cleanup_error("outbox path is not a vault file"));
+        }
+        let name = CString::new(
+            relative
+                .file_name()
+                .ok_or_else(|| marker_cleanup_error("outbox path has no file name"))?
+                .as_bytes(),
+        )
+        .map_err(|_| marker_cleanup_error("outbox file name contains NUL"))?;
+        let token = stage_name
+            .strip_prefix(".murmur-marker-cleanup-")
+            .and_then(|name| name.strip_suffix(".pending"))
+            .ok_or_else(|| marker_cleanup_error("invalid authenticated staging name"))?;
+        if token.len() != 32
+            || !token.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || uuid::Uuid::parse_str(token).is_err()
+        {
+            return Err(marker_cleanup_error("invalid authenticated staging token"));
+        }
+        let stage_name = CString::new(stage_name)
+            .map_err(|_| marker_cleanup_error("authenticated staging name contains NUL"))?;
+        let parent_relative = relative
+            .parent()
+            .ok_or_else(|| marker_cleanup_error("outbox path has no parent"))?;
+        let mut parent = self
+            .root
+            .try_clone()
+            .map_err(|error| marker_cleanup_error(format!("clone vault root failed: {error}")))?;
+        for component in parent_relative.components() {
+            let std::path::Component::Normal(component) = component else {
+                return Err(marker_cleanup_error(
+                    "outbox parent is not a normal vault path",
+                ));
+            };
+            let component = CString::new(component.as_bytes())
+                .map_err(|_| marker_cleanup_error("outbox parent contains NUL"))?;
+            parent = openat_file(
+                parent.as_raw_fd(),
+                &component,
+                NOTE_O_RDONLY | NOTE_O_DIRECTORY | NOTE_O_CLOEXEC | NOTE_O_NOFOLLOW,
+                0,
+            )
+            .map_err(|error| {
+                marker_cleanup_error(format!("open anchored outbox parent failed: {error}"))
+            })?;
+        }
+        if !parent
+            .metadata()
+            .map_err(|error| marker_cleanup_error(format!("stat outbox parent failed: {error}")))?
+            .is_dir()
+        {
+            return Err(marker_cleanup_error(
+                "anchored outbox parent is not a directory",
+            ));
+        }
+        Ok(MarkerCleanupNote {
+            parent,
+            name,
+            stage_name,
+        })
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+impl MarkerCleanupVault {
+    pub(crate) fn open(path: &Path) -> Result<Self> {
+        let _ = path;
+        Err(marker_cleanup_error(
+            "anchored marker cleanup requires macOS file APIs",
+        ))
+    }
+
+    pub(crate) fn note(&self, exported_path: &Path, stage_name: &str) -> Result<MarkerCleanupNote> {
+        let _ = (&self.configured, exported_path, stage_name);
+        Err(marker_cleanup_error(
+            "anchored marker cleanup requires macOS file APIs",
+        ))
+    }
+}
+
+fn absolute_normal_path(path: &Path) -> bool {
+    let mut saw_root = false;
+    for component in path.components() {
+        match component {
+            std::path::Component::RootDir if !saw_root => saw_root = true,
+            std::path::Component::Normal(_) if saw_root => {}
+            _ => return false,
+        }
+    }
+    saw_root
+}
+
+#[cfg(target_os = "macos")]
+fn openat_file(directory: i32, name: &CString, flags: i32, mode: i32) -> std::io::Result<File> {
+    // SAFETY: `name` is NUL-terminated, `directory` is a live directory descriptor, and every
+    // successful returned descriptor is transferred exactly once into `File`.
+    let descriptor = unsafe { openat(directory, name.as_ptr(), flags, mode) };
+    if descriptor < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        // SAFETY: `openat` returned a new owned descriptor above.
+        Ok(unsafe { File::from_raw_fd(descriptor) })
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn open_absolute_directory_nofollow(path: &Path) -> Result<File> {
+    let mut directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(NOTE_O_DIRECTORY | NOTE_O_CLOEXEC | NOTE_O_NOFOLLOW)
+        .open(Path::new("/"))
+        .map_err(|error| marker_cleanup_error(format!("open filesystem root failed: {error}")))?;
+    for component in path.components() {
+        match component {
+            std::path::Component::RootDir => {}
+            std::path::Component::Normal(component) => {
+                let component = CString::new(component.as_bytes())
+                    .map_err(|_| marker_cleanup_error("vault root contains NUL"))?;
+                directory = openat_file(
+                    directory.as_raw_fd(),
+                    &component,
+                    NOTE_O_RDONLY | NOTE_O_DIRECTORY | NOTE_O_CLOEXEC | NOTE_O_NOFOLLOW,
+                    0,
+                )
+                .map_err(|error| {
+                    marker_cleanup_error(format!("open vault root component failed: {error}"))
+                })?;
+            }
+            _ => {
+                return Err(marker_cleanup_error(
+                    "vault root contains a non-normal component",
+                ))
+            }
+        }
+    }
+    Ok(directory)
+}
+
+#[cfg(target_os = "macos")]
+impl MarkerCleanupNote {
+    fn open_named(&self, name: &CString, flags: i32, mode: i32) -> std::io::Result<File> {
+        openat_file(self.parent.as_raw_fd(), name, flags, mode)
+    }
+
+    fn open_target(&self) -> std::io::Result<File> {
+        self.open_named(
+            &self.name,
+            NOTE_O_RDONLY | NOTE_O_CLOEXEC | NOTE_O_NOFOLLOW,
+            0,
+        )
+    }
+
+    fn exchange(&self, first: &CString, second: &CString) -> std::io::Result<()> {
+        // SAFETY: both names are single/relative NUL-terminated paths beneath the same live parent
+        // descriptor. Darwin performs the swap atomically and refuses symlink traversal/escape.
+        let result = unsafe {
+            renameatx_np(
+                self.parent.as_raw_fd(),
+                first.as_ptr(),
+                self.parent.as_raw_fd(),
+                second.as_ptr(),
+                NOTE_RENAME_SWAP,
+            )
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+
+    fn unlink_anchored(&self, name: &CString) -> std::io::Result<()> {
+        // SAFETY: `name` is one NUL-terminated component beneath the stable parent descriptor. The
+        // caller first opens it with O_NOFOLLOW and verifies/scrubs the exact inode; unlinkat never
+        // follows the final symlink even if a hostile replacement is attempted.
+        let result = unsafe { unlinkat(self.parent.as_raw_fd(), name.as_ptr(), 0) };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+
+    fn stable_bytes(
+        file: &mut File,
+        max_bytes: u64,
+        require_unique_link: bool,
+    ) -> Result<(Vec<u8>, std::fs::Metadata)> {
+        let before = file
+            .metadata()
+            .map_err(|error| marker_cleanup_error(format!("stat note failed: {error}")))?;
+        if !before.is_file()
+            || before.nlink() == 0
+            || (require_unique_link && before.nlink() != 1)
+            || before.len() > max_bytes
+        {
+            return Err(marker_cleanup_error(
+                "note is not an owned bounded regular file with the required link count",
+            ));
+        }
+        let read_once = |file: &mut File| -> Result<Vec<u8>> {
+            file.seek(SeekFrom::Start(0))
+                .map_err(|error| marker_cleanup_error(format!("seek note failed: {error}")))?;
+            let capacity = usize::try_from(before.len())
+                .map_err(|_| marker_cleanup_error("note is too large to address"))?;
+            let mut bytes = Vec::with_capacity(capacity);
+            Read::take(file, max_bytes.saturating_add(1))
+                .read_to_end(&mut bytes)
+                .map_err(|error| marker_cleanup_error(format!("read note failed: {error}")))?;
+            Ok(bytes)
+        };
+        let first = read_once(file)?;
+        let second = read_once(file)?;
+        let after = file
+            .metadata()
+            .map_err(|error| marker_cleanup_error(format!("restat note failed: {error}")))?;
+        if first != second
+            || first.len() as u64 != before.len()
+            || after.dev() != before.dev()
+            || after.ino() != before.ino()
+            || after.len() != before.len()
+            || after.nlink() != before.nlink()
+        {
+            return Err(marker_cleanup_error("note changed while reading"));
+        }
+        Ok((first, before))
+    }
+
+    fn read_named_snapshot(
+        &self,
+        name: &CString,
+        max_bytes: u64,
+        require_unique_link: bool,
+    ) -> Result<Option<OwnedNoteSnapshot>> {
+        let mut file =
+            match self.open_named(name, NOTE_O_RDWR | NOTE_O_CLOEXEC | NOTE_O_NOFOLLOW, 0) {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => {
+                    return Err(marker_cleanup_error(format!("open note failed: {error}")))
+                }
+            };
+        let (bytes, opened) = Self::stable_bytes(&mut file, max_bytes, require_unique_link)?;
+        let named = self
+            .open_named(name, NOTE_O_RDWR | NOTE_O_CLOEXEC | NOTE_O_NOFOLLOW, 0)
+            .and_then(|named| named.metadata())
+            .map_err(|error| marker_cleanup_error(format!("reopen note failed: {error}")))?;
+        if named.dev() != opened.dev()
+            || named.ino() != opened.ino()
+            || named.len() != opened.len()
+            || named.nlink() != opened.nlink()
+            || (require_unique_link && named.nlink() != 1)
+        {
+            return Err(marker_cleanup_error("note identity changed while reading"));
+        }
+        let text = String::from_utf8(bytes)
+            .map_err(|_| marker_cleanup_error("note is not valid UTF-8"))?;
+        Ok(Some(OwnedNoteSnapshot {
+            text,
+            device: opened.dev(),
+            inode: opened.ino(),
+            byte_len: opened.len(),
+            mode: opened.permissions().mode() & 0o777,
+            file,
+        }))
+    }
+
+    /// Read an exact outbox export through the anchored parent capability. Missing is idempotent;
+    /// symlinks, hardlinks, oversized files, and changing bytes fail closed.
+    pub(crate) fn read_owned_snapshot(&self, max_bytes: u64) -> Result<Option<OwnedNoteSnapshot>> {
+        self.read_named_snapshot(&self.name, max_bytes, true)
+    }
+
+    fn identity(metadata: &std::fs::Metadata, device: u64, inode: u64) -> bool {
+        metadata.dev() == device && metadata.ino() == inode
+    }
+
+    fn authenticated_identities(
+        publish: &LockMarkerExportPublish,
+    ) -> Result<(u64, u64, &str, u64, u64)> {
+        match (
+            publish.source_device,
+            publish.source_inode,
+            publish.source_hash.as_deref(),
+            publish.stage_device,
+            publish.stage_inode,
+        ) {
+            (
+                Some(source_device),
+                Some(source_inode),
+                Some(source_hash),
+                Some(stage_device),
+                Some(stage_inode),
+            ) => Ok((
+                source_device,
+                source_inode,
+                source_hash,
+                stage_device,
+                stage_inode,
+            )),
+            _ => Err(marker_cleanup_error(
+                "marker publish has incomplete authenticated inode provenance",
+            )),
+        }
+    }
+
+    /// Scrub and unlink only the DB-authenticated stage inode. Darwin 13.4 has no
+    /// identity-conditional unlink primitive, so the final reopen is intentionally adjacent to
+    /// `unlinkat` and the name is an unpredictable UUID held in SQLCipher. A malicious process with
+    /// the same uid can still replace a directory entry between those two syscalls; that same-uid
+    /// namespace mutation is outside Murmur's lock boundary. The retained descriptor ensures any
+    /// hardlinks to the authenticated inode are scrubbed before the name is removed.
+    fn remove_authenticated_stage(
+        &self,
+        mut file: File,
+        device: u64,
+        inode: u64,
+        safe: &str,
+    ) -> Result<()> {
+        let metadata = file.metadata().map_err(|error| {
+            marker_cleanup_error(format!("stat authenticated stage failed: {error}"))
+        })?;
+        if !Self::identity(&metadata, device, inode) {
+            return Err(marker_cleanup_error(
+                "authenticated stage descriptor identity mismatch",
+            ));
+        }
+        scrub_retained_inode(&mut file, safe)?;
+        let named = self
+            .open_named(
+                &self.stage_name,
+                NOTE_O_RDONLY | NOTE_O_CLOEXEC | NOTE_O_NOFOLLOW,
+                0,
+            )
+            .and_then(|named| named.metadata())
+            .map_err(|error| {
+                marker_cleanup_error(format!("reopen authenticated stage failed: {error}"))
+            })?;
+        if !Self::identity(&named, device, inode) {
+            return Err(marker_cleanup_error(
+                "authenticated stage identity changed immediately before unlink",
+            ));
+        }
+        drop(file);
+        self.unlink_anchored(&self.stage_name).map_err(|error| {
+            marker_cleanup_error(format!("unlink authenticated stage failed: {error}"))
+        })?;
+        self.parent
+            .sync_all()
+            .map_err(|error| marker_cleanup_error(format!("sync stage removal failed: {error}")))?;
+        match self.open_named(
+            &self.stage_name,
+            NOTE_O_RDONLY | NOTE_O_CLOEXEC | NOTE_O_NOFOLLOW,
+            0,
+        ) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Ok(_) => Err(marker_cleanup_error(
+                "authenticated stage reappeared after unlink",
+            )),
+            Err(error) => Err(marker_cleanup_error(format!(
+                "verify authenticated stage absence failed: {error}"
+            ))),
+        }
+    }
+
+    /// Reconcile a SQLCipher-authenticated crash state. Identity, not the pathname or persisted
+    /// phase alone, distinguishes pre-swap from post-swap. A changed displaced source is atomically
+    /// swapped back and directory-synced before the harmless staged copy is removed, preserving the
+    /// concurrent edit at the canonical path for the next attempt.
+    pub(crate) fn recover_marker_publish<F>(
+        &self,
+        db: &Db,
+        publish: &LockMarkerExportPublish,
+        max_bytes: u64,
+        transform: &F,
+    ) -> Result<bool>
+    where
+        F: Fn(&str) -> String + ?Sized,
+    {
+        let stage_file = match self.open_named(
+            &self.stage_name,
+            NOTE_O_RDWR | NOTE_O_CLOEXEC | NOTE_O_NOFOLLOW,
+            0,
+        ) {
+            Ok(file) => Some(file),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(marker_cleanup_error(format!(
+                    "open authenticated stage failed: {error}"
+                )))
+            }
+        };
+        if publish.state == "reserved" {
+            return match stage_file {
+                None => Ok(false),
+                Some(_) => Err(marker_cleanup_error(
+                    "unbound authenticated stage already exists; refusing to adopt it",
+                )),
+            };
+        }
+        let (source_device, source_inode, source_hash, stage_device, stage_inode) =
+            Self::authenticated_identities(publish)?;
+        let mut stage_file = stage_file.ok_or_else(|| {
+            marker_cleanup_error("authenticated marker stage disappeared during recovery")
+        })?;
+        let stage_metadata = stage_file.metadata().map_err(|error| {
+            marker_cleanup_error(format!("stat recovery stage failed: {error}"))
+        })?;
+        let target_metadata = self
+            .open_target()
+            .and_then(|file| file.metadata())
+            .map_err(|error| {
+                marker_cleanup_error(format!("stat recovery target failed: {error}"))
+            })?;
+
+        let pre_swap = Self::identity(&target_metadata, source_device, source_inode)
+            && Self::identity(&stage_metadata, stage_device, stage_inode);
+        let post_swap = Self::identity(&target_metadata, stage_device, stage_inode)
+            && Self::identity(&stage_metadata, source_device, source_inode);
+        if pre_swap {
+            self.remove_authenticated_stage(stage_file, stage_device, stage_inode, "")?;
+            db.clear_lock_marker_export_publish(publish)?;
+            return Ok(true);
+        }
+        if !post_swap {
+            return Err(marker_cleanup_error(
+                "marker publish inode layout is ambiguous; refusing recovery",
+            ));
+        }
+
+        // Persist the exchanged namespace before modifying either exchanged inode. Without this
+        // barrier, power loss could restore the old namespace after its inode had been truncated.
+        self.parent.sync_all().map_err(|error| {
+            marker_cleanup_error(format!("sync recovered swap failed: {error}"))
+        })?;
+        let (displaced_bytes, displaced_metadata) =
+            Self::stable_bytes(&mut stage_file, max_bytes, false)?;
+        if !Self::identity(&displaced_metadata, source_device, source_inode) {
+            return Err(marker_cleanup_error(
+                "displaced recovery source identity changed",
+            ));
+        }
+        if sha256_hex(&displaced_bytes) != source_hash {
+            self.exchange(&self.stage_name, &self.name)
+                .map_err(|error| {
+                    marker_cleanup_error(format!("rollback concurrent edit failed: {error}"))
+                })?;
+            self.parent.sync_all().map_err(|error| {
+                marker_cleanup_error(format!("sync concurrent-edit rollback failed: {error}"))
+            })?;
+            let staged = self
+                .open_named(
+                    &self.stage_name,
+                    NOTE_O_RDWR | NOTE_O_CLOEXEC | NOTE_O_NOFOLLOW,
+                    0,
+                )
+                .map_err(|error| {
+                    marker_cleanup_error(format!("open rolled-back stage failed: {error}"))
+                })?;
+            self.remove_authenticated_stage(staged, stage_device, stage_inode, "")?;
+            db.clear_lock_marker_export_publish(publish)?;
+            return Ok(true);
+        }
+        let displaced_text = String::from_utf8(displaced_bytes)
+            .map_err(|_| marker_cleanup_error("authenticated source is no longer valid UTF-8"))?;
+        let safe = transform(&displaced_text);
+        self.remove_authenticated_stage(stage_file, source_device, source_inode, &safe)?;
+        db.clear_lock_marker_export_publish(publish)?;
+        Ok(true)
+    }
+
+    /// Atomically exchange a verified scrubbed stage with the exact snapshotted note. The displaced
+    /// inode is byte-checked, scrubbed through its stable handle (therefore scrubbing any raced
+    /// hardlink too), then unlinked and directory-synced before the SQLCipher journal may be acked.
+    pub(crate) fn overwrite_owned_snapshot<F>(
+        &self,
+        db: &Db,
+        publish: &LockMarkerExportPublish,
+        expected: OwnedNoteSnapshot,
+        markdown: &str,
+        transform: &F,
+    ) -> Result<()>
+    where
+        F: Fn(&str) -> String + ?Sized,
+    {
+        self.overwrite_owned_snapshot_with_hook(db, publish, expected, markdown, transform, || {
+            Ok(())
+        })
+    }
+
+    fn overwrite_owned_snapshot_with_hook<F, H>(
+        &self,
+        db: &Db,
+        publish: &LockMarkerExportPublish,
+        mut expected: OwnedNoteSnapshot,
+        markdown: &str,
+        transform: &F,
+        before_exchange: H,
+    ) -> Result<()>
+    where
+        F: Fn(&str) -> String + ?Sized,
+        H: FnOnce() -> Result<()>,
+    {
+        let max_recheck = MAX_MARKER_CLEANUP_NOTE_BYTES;
+        if expected.byte_len > max_recheck || markdown.len() as u64 > max_recheck {
+            return Err(marker_cleanup_error(
+                "note exceeds the bounded marker-cleanup limit",
+            ));
+        }
+        if publish.state != "reserved" {
+            return Err(marker_cleanup_error(
+                "new marker publish did not start from a reserved journal row",
+            ));
+        }
+        let current = self
+            .read_owned_snapshot(max_recheck)?
+            .ok_or_else(|| marker_cleanup_error("note disappeared before publish"))?;
+        if current.device != expected.device
+            || current.inode != expected.inode
+            || current.byte_len != expected.byte_len
+            || current.text != expected.text
+        {
+            return Err(marker_cleanup_error("note changed before staging"));
+        }
+        drop(current);
+
+        let mut stage_file = self
+            .open_named(
+                &self.stage_name,
+                NOTE_O_RDWR | NOTE_O_CREAT | NOTE_O_EXCL | NOTE_O_CLOEXEC | NOTE_O_NOFOLLOW,
+                0o600,
+            )
+            .map_err(|error| {
+                marker_cleanup_error(format!("create authenticated stage failed: {error}"))
+            })?;
+        let empty_stage = stage_file
+            .metadata()
+            .map_err(|error| marker_cleanup_error(format!("stat empty stage failed: {error}")))?;
+        if !empty_stage.is_file() || empty_stage.nlink() != 1 || empty_stage.len() != 0 {
+            return Err(marker_cleanup_error(
+                "new stage is not a private empty regular file",
+            ));
+        }
+        self.parent.sync_all().map_err(|error| {
+            marker_cleanup_error(format!("sync authenticated stage creation failed: {error}"))
+        })?;
+        let source_hash = sha256_hex(expected.text.as_bytes());
+        db.bind_lock_marker_export_publish(
+            publish,
+            expected.device,
+            expected.inode,
+            &source_hash,
+            empty_stage.dev(),
+            empty_stage.ino(),
+        )?;
+        let mut active = publish.clone();
+        active.source_device = Some(expected.device);
+        active.source_inode = Some(expected.inode);
+        active.source_hash = Some(source_hash);
+        active.stage_device = Some(empty_stage.dev());
+        active.stage_inode = Some(empty_stage.ino());
+        active.state = "created".to_string();
+        let stage_result = (|| -> Result<std::fs::Metadata> {
+            stage_file
+                .set_permissions(std::fs::Permissions::from_mode(expected.mode))
+                .map_err(|error| marker_cleanup_error(format!("set stage mode failed: {error}")))?;
+            stage_file
+                .write_all(markdown.as_bytes())
+                .and_then(|()| stage_file.sync_all())
+                .map_err(|error| marker_cleanup_error(format!("write stage failed: {error}")))?;
+            let staged = stage_file
+                .metadata()
+                .map_err(|error| marker_cleanup_error(format!("stat stage failed: {error}")))?;
+            if !staged.is_file()
+                || staged.nlink() != 1
+                || staged.len() != markdown.len() as u64
+                || staged.permissions().mode() & 0o777 != expected.mode
+            {
+                return Err(marker_cleanup_error(
+                    "stage failed private identity verification",
+                ));
+            }
+            Ok(staged)
+        })();
+        let staged = match stage_result {
+            Ok(staged) => staged,
+            Err(error) => {
+                return Err(error);
+            }
+        };
+        db.advance_lock_marker_export_publish(&active, "created", "prepared")?;
+        active.state = "prepared".to_string();
+
+        if let Err(error) = before_exchange() {
+            self.remove_authenticated_stage(stage_file, staged.dev(), staged.ino(), "")?;
+            db.clear_lock_marker_export_publish(&active)?;
+            return Err(error);
+        }
+        if let Err(exchange_error) = self.exchange(&self.stage_name, &self.name) {
+            return Err(marker_cleanup_error(format!(
+                "atomic note exchange failed: {exchange_error}; authenticated stage retained for recovery"
+            )));
+        }
+        self.parent.sync_all().map_err(|error| {
+            marker_cleanup_error(format!("sync atomic note exchange failed: {error}"))
+        })?;
+        db.advance_lock_marker_export_publish(&active, "prepared", "swapped")?;
+        active.state = "swapped".to_string();
+
+        let validation = (|| -> Result<(OwnedNoteSnapshot, String)> {
+            let published = self
+                .read_owned_snapshot(markdown.len() as u64)?
+                .ok_or_else(|| marker_cleanup_error("published note is missing"))?;
+            if published.device != staged.dev()
+                || published.inode != staged.ino()
+                || published.text != markdown
+            {
+                return Err(marker_cleanup_error(
+                    "published note failed identity or byte verification",
+                ));
+            }
+            drop(published);
+
+            let displaced = self
+                .read_named_snapshot(&self.stage_name, expected.byte_len, false)?
+                .ok_or_else(|| marker_cleanup_error("displaced note is missing"))?;
+            let metadata = displaced.file.metadata().map_err(|error| {
+                marker_cleanup_error(format!("stat displaced note failed: {error}"))
+            })?;
+            if metadata.dev() != expected.device
+                || metadata.ino() != expected.inode
+                || displaced.text != expected.text
+            {
+                return Err(marker_cleanup_error(
+                    "displaced note changed before atomic exchange",
+                ));
+            }
+            let retained = expected.file.metadata().map_err(|error| {
+                marker_cleanup_error(format!("restat retained note failed: {error}"))
+            })?;
+            if retained.dev() != metadata.dev()
+                || retained.ino() != metadata.ino()
+                || retained.len() != metadata.len()
+            {
+                return Err(marker_cleanup_error(
+                    "retained note identity changed during exchange",
+                ));
+            }
+            let safe_displaced = transform(&displaced.text);
+            Ok((displaced, safe_displaced))
+        })();
+
+        let (displaced, safe_displaced) = match validation {
+            Ok(displaced) => displaced,
+            Err(validation_error) => {
+                if let Err(rollback_error) = self.exchange(&self.stage_name, &self.name) {
+                    // Catastrophic filesystem ambiguity: scrub the retained old inode before
+                    // returning, so even a hidden displaced name/hardlink cannot retain the title.
+                    let scrub = scrub_retained_inode(&mut expected.file, markdown);
+                    return Err(marker_cleanup_error(format!(
+                        "{validation_error}; rollback failed: {}; retained-inode scrub: {}",
+                        rollback_error,
+                        scrub
+                            .map(|()| "verified".to_string())
+                            .unwrap_or_else(|error| error.to_string())
+                    )));
+                }
+                self.parent.sync_all().map_err(|error| {
+                    marker_cleanup_error(format!("sync validation rollback failed: {error}"))
+                })?;
+                drop(expected);
+                self.remove_authenticated_stage(stage_file, staged.dev(), staged.ino(), "")?;
+                db.clear_lock_marker_export_publish(&active)?;
+                return Err(validation_error);
+            }
+        };
+
+        // Scrub the exact displaced inode through its retained descriptor before unlink. If a
+        // hardlink appeared after the initial nlink=1 snapshot, the one verified write below
+        // removes the sealed title from every name of that inode.
+        drop(displaced);
+        drop(stage_file);
+        let source_device = expected.device;
+        let source_inode = expected.inode;
+        self.remove_authenticated_stage(
+            expected.file,
+            source_device,
+            source_inode,
+            &safe_displaced,
+        )?;
+        let published = self
+            .read_owned_snapshot(markdown.len() as u64)?
+            .ok_or_else(|| marker_cleanup_error("note missing after durable publish"))?;
+        if published.device != staged.dev()
+            || published.inode != staged.ino()
+            || published.text != markdown
+        {
+            return Err(marker_cleanup_error(
+                "durable published note failed final verification",
+            ));
+        }
+        db.clear_lock_marker_export_publish(&active)?;
+        Ok(())
+    }
+
+    /// Make an already-absent exact note a durable outbox terminal state before SQL acknowledgement.
+    pub(crate) fn sync_absent<F>(&self, max_bytes: u64, transform: &F) -> Result<()>
+    where
+        F: Fn(&str) -> String + ?Sized,
+    {
+        let _ = (max_bytes, transform);
+        match self.open_target() {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => return Err(marker_cleanup_error("note appeared while proving absence")),
+            Err(error) => {
+                return Err(marker_cleanup_error(format!(
+                    "inspect absent note failed: {error}"
+                )))
+            }
+        }
+        self.parent.sync_all().map_err(|error| {
+            marker_cleanup_error(format!("sync absent-note parent failed: {error}"))
+        })?;
+        match self.open_target() {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Ok(_) => Err(marker_cleanup_error("note appeared after absence sync")),
+            Err(error) => Err(marker_cleanup_error(format!(
+                "reinspect absent note failed: {error}"
+            ))),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn scrub_retained_inode(file: &mut File, markdown: &str) -> Result<()> {
+    file.set_len(0)
+        .and_then(|()| file.seek(SeekFrom::Start(0)).map(|_| ()))
+        .and_then(|()| file.write_all(markdown.as_bytes()))
+        .and_then(|()| file.sync_all())
+        .map_err(|error| marker_cleanup_error(format!("scrub retained inode failed: {error}")))?;
+    let (bytes, _) = MarkerCleanupNote::stable_bytes(file, markdown.len() as u64, false)?;
+    if bytes == markdown.as_bytes() {
+        Ok(())
+    } else {
+        Err(marker_cleanup_error(
+            "retained inode failed scrubbed byte verification",
+        ))
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+impl MarkerCleanupNote {
+    pub(crate) fn read_owned_snapshot(&self, max_bytes: u64) -> Result<Option<OwnedNoteSnapshot>> {
+        let _ = max_bytes;
+        Err(marker_cleanup_error(
+            "anchored marker cleanup requires macOS file APIs",
+        ))
+    }
+
+    pub(crate) fn overwrite_owned_snapshot<F>(
+        &self,
+        db: &crate::storage::db::Db,
+        publish: &crate::storage::links::LockMarkerExportPublish,
+        expected: OwnedNoteSnapshot,
+        markdown: &str,
+        transform: &F,
+    ) -> Result<()>
+    where
+        F: Fn(&str) -> String + ?Sized,
+    {
+        let _ = (db, publish, expected, markdown, transform);
+        Err(marker_cleanup_error(
+            "anchored marker cleanup requires macOS file APIs",
+        ))
+    }
+
+    pub(crate) fn recover_marker_publish<F>(
+        &self,
+        db: &crate::storage::db::Db,
+        publish: &crate::storage::links::LockMarkerExportPublish,
+        max_bytes: u64,
+        transform: &F,
+    ) -> Result<bool>
+    where
+        F: Fn(&str) -> String + ?Sized,
+    {
+        let _ = (db, publish, max_bytes, transform);
+        Err(marker_cleanup_error(
+            "anchored marker cleanup requires macOS file APIs",
+        ))
+    }
+
+    pub(crate) fn sync_absent<F>(&self, max_bytes: u64, transform: &F) -> Result<()>
+    where
+        F: Fn(&str) -> String + ?Sized,
+    {
+        let _ = (max_bytes, transform);
+        Err(marker_cleanup_error(
+            "anchored marker cleanup requires macOS file APIs",
+        ))
+    }
+}
 
 // ── Filename derivation ─────────────────────────────────────────────────────
 
@@ -142,7 +1073,11 @@ pub fn write_note(
     // Atomic write: write to a hidden temp dotfile in the SAME directory (so the
     // rename is a same-filesystem atomic operation), fsync, then rename over the
     // final path. The temp name is unique to avoid clobbering a concurrent write.
-    let tmp_name = format!(".{}.{}.murmur.tmp", sanitize_for_tmp(&stem), std::process::id());
+    let tmp_name = format!(
+        ".{}.{}.murmur.tmp",
+        sanitize_for_tmp(&stem),
+        std::process::id()
+    );
     let tmp_path = target_dir.join(tmp_name);
 
     write_and_sync(&tmp_path, markdown).inspect_err(|_| {
@@ -664,7 +1599,8 @@ pub fn append_supersedes_callout(
     new_value: &str,
     source_stem: &str,
 ) -> String {
-    let body = format!("> **{predicate}** — supersedes {old_value} → {new_value} in [[{source_stem}]]");
+    let body =
+        format!("> **{predicate}** — supersedes {old_value} → {new_value} in [[{source_stem}]]");
     let block = format!("> [!supersedes] {date}\n{body}\n");
     append_under_section(markdown, &body, &block)
 }
@@ -1005,6 +1941,256 @@ mod tests {
         dir
     }
 
+    #[cfg(target_os = "macos")]
+    fn marker_test_note(
+        label: &str,
+        body: &str,
+    ) -> (
+        PathBuf,
+        MarkerCleanupVault,
+        MarkerCleanupNote,
+        Db,
+        LockMarkerExportPublish,
+    ) {
+        let raw = tmp_dir(label);
+        let vault_path = raw.canonicalize().unwrap();
+        let path = vault_path.join("note.md");
+        std::fs::write(&path, body).unwrap();
+        let db = Db::open_with_key(
+            &vault_path.join("journal.db"),
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        )
+        .unwrap();
+        let publish = db
+            .reserve_lock_marker_export_publish(path.to_str().unwrap())
+            .unwrap();
+        let vault = MarkerCleanupVault::open(&vault_path).unwrap();
+        let note = vault.note(&path, &publish.stage_name).unwrap();
+        (path, vault, note, db, publish)
+    }
+
+    /// A same-length external edit in the old check→rename window is found on the displaced inode;
+    /// the swap rolls back, the user's edit remains at the canonical path, and the safe stage goes.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn marker_cleanup_atomic_swap_rolls_back_same_length_external_edit() {
+        let original = "prefix [[Secret]] external-A";
+        let edited = "prefix [[Secret]] external-B";
+        assert_eq!(original.len(), edited.len());
+        let transform = |body: &str| body.replace("[[Secret]]", "");
+        let (path, _vault, note, db, publish) = marker_test_note("marker-edit-race", original);
+        let snapshot = note.read_owned_snapshot(1024).unwrap().unwrap();
+        let safe = transform(snapshot.text());
+
+        let result = note.overwrite_owned_snapshot_with_hook(
+            &db,
+            &publish,
+            snapshot,
+            &safe,
+            &transform,
+            || {
+                std::fs::write(&path, edited)
+                    .map_err(|error| marker_cleanup_error(format!("test edit failed: {error}")))
+            },
+        );
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), edited);
+        assert!(!std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .any(|entry| entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".murmur-marker-cleanup-")));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// If a hardlink appears after the nlink=1 snapshot, the exact displaced inode is scrubbed
+    /// before its staging name is unlinked. Both the canonical note and the raced link are safe.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn marker_cleanup_atomic_swap_scrubs_raced_hardlink_inode() {
+        let original = "prefix [[Secret]] external text";
+        let transform = |body: &str| body.replace("[[Secret]]", "");
+        let (path, _vault, note, db, publish) = marker_test_note("marker-hardlink-race", original);
+        let hardlink = path.parent().unwrap().join("raced-hardlink.md");
+        let snapshot = note.read_owned_snapshot(1024).unwrap().unwrap();
+        let safe = transform(snapshot.text());
+
+        note.overwrite_owned_snapshot_with_hook(&db, &publish, snapshot, &safe, &transform, || {
+            std::fs::hard_link(&path, &hardlink)
+                .map_err(|error| marker_cleanup_error(format!("test hardlink failed: {error}")))
+        })
+        .unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), safe);
+        assert_eq!(std::fs::read_to_string(&hardlink).unwrap(), safe);
+        assert!(!std::fs::read_to_string(&hardlink)
+            .unwrap()
+            .contains("[[Secret]]"));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// A vault actor that guesses or observes a reserved name cannot make Murmur adopt a
+    /// pre-existing hardlink as its stage. Recovery refuses an unbound inode before any write and
+    /// the linked file remains byte-identical.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn marker_cleanup_refuses_precreated_stage_hardlink_without_corruption() {
+        let original = "prefix [[Secret]] external text";
+        let transform = |body: &str| body.replace("[[Secret]]", "");
+        let (path, _vault, note, db, publish) =
+            marker_test_note("marker-precreated-stage", original);
+        let unrelated = path.parent().unwrap().join("unrelated.md");
+        std::fs::write(&unrelated, "unrelated bytes").unwrap();
+        let stage_path = path.parent().unwrap().join(&publish.stage_name);
+        std::fs::hard_link(&unrelated, &stage_path).unwrap();
+        let result = note.recover_marker_publish(&db, &publish, 1024, &transform);
+
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read_to_string(&unrelated).unwrap(),
+            "unrelated bytes"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// Crash-state replay: after the atomic swap the authenticated stage can still contain the old
+    /// title-bearing inode. A fresh capability scrubs/removes it before publishing and acking again.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn marker_cleanup_recovers_post_swap_displaced_stage() {
+        let original = "prefix [[Secret]] external text";
+        let transform = |body: &str| body.replace("[[Secret]]", "");
+        let (path, vault, note, db, publish) = marker_test_note("marker-swap-replay", original);
+        let safe = transform(original);
+        let source = note.read_owned_snapshot(1024).unwrap().unwrap();
+        let mut stage = note
+            .open_named(
+                &note.stage_name,
+                NOTE_O_RDWR | NOTE_O_CREAT | NOTE_O_EXCL | NOTE_O_CLOEXEC | NOTE_O_NOFOLLOW,
+                0o600,
+            )
+            .unwrap();
+        let staged_empty = stage.metadata().unwrap();
+        db.bind_lock_marker_export_publish(
+            &publish,
+            source.device,
+            source.inode,
+            &sha256_hex(original.as_bytes()),
+            staged_empty.dev(),
+            staged_empty.ino(),
+        )
+        .unwrap();
+        stage.write_all(safe.as_bytes()).unwrap();
+        stage.sync_all().unwrap();
+        db.advance_lock_marker_export_publish(&publish, "created", "prepared")
+            .unwrap();
+        note.exchange(&note.stage_name, &note.name).unwrap();
+        note.parent.sync_all().unwrap();
+        db.advance_lock_marker_export_publish(&publish, "prepared", "swapped")
+            .unwrap();
+        drop(stage);
+        drop(source);
+        drop(note);
+        drop(vault);
+
+        let vault = MarkerCleanupVault::open(path.parent().unwrap()).unwrap();
+        let publish = db
+            .reserve_lock_marker_export_publish(path.to_str().unwrap())
+            .unwrap();
+        let note = vault.note(&path, &publish.stage_name).unwrap();
+        assert!(note
+            .recover_marker_publish(&db, &publish, 1024, &transform)
+            .unwrap());
+        let publish = db
+            .reserve_lock_marker_export_publish(path.to_str().unwrap())
+            .unwrap();
+        let note = vault.note(&path, &publish.stage_name).unwrap();
+        let snapshot = note.read_owned_snapshot(1024).unwrap().unwrap();
+        note.overwrite_owned_snapshot(&db, &publish, snapshot, &safe, &transform)
+            .unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), safe);
+        assert!(!std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .any(|entry| entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".murmur-marker-cleanup-")));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// If an editor writes through its retained source descriptor after the swap and Murmur then
+    /// crashes, recovery detects the source-hash mismatch, swaps the edited inode back, fsyncs the
+    /// rollback, and removes only the authenticated harmless stage.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn marker_cleanup_crash_recovery_preserves_post_swap_concurrent_edit() {
+        let original = "prefix [[Secret]] external-A";
+        let edited = "prefix [[Secret]] external-B";
+        assert_eq!(original.len(), edited.len());
+        let transform = |body: &str| body.replace("[[Secret]]", "");
+        let (path, vault, note, db, publish) =
+            marker_test_note("marker-crash-concurrent-edit", original);
+        let safe = transform(original);
+        let source = note.read_owned_snapshot(1024).unwrap().unwrap();
+        let mut stage = note
+            .open_named(
+                &note.stage_name,
+                NOTE_O_RDWR | NOTE_O_CREAT | NOTE_O_EXCL | NOTE_O_CLOEXEC | NOTE_O_NOFOLLOW,
+                0o600,
+            )
+            .unwrap();
+        let staged_empty = stage.metadata().unwrap();
+        db.bind_lock_marker_export_publish(
+            &publish,
+            source.device,
+            source.inode,
+            &sha256_hex(original.as_bytes()),
+            staged_empty.dev(),
+            staged_empty.ino(),
+        )
+        .unwrap();
+        stage.write_all(safe.as_bytes()).unwrap();
+        stage.sync_all().unwrap();
+        db.advance_lock_marker_export_publish(&publish, "created", "prepared")
+            .unwrap();
+        note.exchange(&note.stage_name, &note.name).unwrap();
+        note.parent.sync_all().unwrap();
+        db.advance_lock_marker_export_publish(&publish, "prepared", "swapped")
+            .unwrap();
+
+        let mut retained_source = source.file;
+        retained_source.set_len(0).unwrap();
+        retained_source.seek(SeekFrom::Start(0)).unwrap();
+        retained_source.write_all(edited.as_bytes()).unwrap();
+        retained_source.sync_all().unwrap();
+        drop(retained_source);
+        drop(stage);
+        drop(note);
+        drop(vault);
+
+        let vault = MarkerCleanupVault::open(path.parent().unwrap()).unwrap();
+        let recovered = db
+            .reserve_lock_marker_export_publish(path.to_str().unwrap())
+            .unwrap();
+        let note = vault.note(&path, &recovered.stage_name).unwrap();
+        assert!(note
+            .recover_marker_publish(&db, &recovered, 1024, &transform)
+            .unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), edited);
+        assert!(!path.parent().unwrap().join(&recovered.stage_name).exists());
+        let fresh = db
+            .reserve_lock_marker_export_publish(path.to_str().unwrap())
+            .unwrap();
+        assert_ne!(fresh.stage_name, recovered.stage_name);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
     #[test]
     fn date_prefix_date_only() {
         assert_eq!(date_prefix("2026-06-24").unwrap(), "2026-06-24 0000");
@@ -1108,9 +2294,12 @@ mod tests {
 
     /// R2 helper: does the dir still contain any `.tmp` dotfile?
     fn dir_has_tmp(dir: &Path) -> bool {
-        std::fs::read_dir(dir)
-            .unwrap()
-            .any(|e| e.unwrap().file_name().to_str().is_some_and(|n| n.ends_with(".tmp")))
+        std::fs::read_dir(dir).unwrap().any(|e| {
+            e.unwrap()
+                .file_name()
+                .to_str()
+                .is_some_and(|n| n.ends_with(".tmp"))
+        })
     }
 
     /// R2 `export_tmp_pid` shape parser: matches BOTH `write_note` and `overwrite_note` temp shapes,
@@ -1118,10 +2307,13 @@ mod tests {
     #[test]
     fn export_tmp_pid_recognizes_our_shapes_only() {
         // Our MARKED shapes parse:
-        assert_eq!(export_tmp_pid(".2026-06-24 1430 - Sync.99999.murmur.tmp"), Some(99999));
+        assert_eq!(
+            export_tmp_pid(".2026-06-24 1430 - Sync.99999.murmur.tmp"),
+            Some(99999)
+        );
         assert_eq!(export_tmp_pid(".edit.12345.murmur.tmp"), Some(12345));
         assert_eq!(export_tmp_pid(".a.b.c.777.murmur.tmp"), Some(777)); // stem with dots
-        // Not our shape — REJECTED (the `.murmur.tmp` marker makes the sweep Murmur-only):
+                                                                        // Not our shape — REJECTED (the `.murmur.tmp` marker makes the sweep Murmur-only):
         assert_eq!(export_tmp_pid(".2026-06-24 1430 - Sync.99999.tmp"), None); // no marker (old/foreign)
         assert_eq!(export_tmp_pid(".foo.12345.tmp"), None); // a FOREIGN third-party temp — must NOT match
         assert_eq!(export_tmp_pid("Sync.md"), None); // a real note
@@ -1164,8 +2356,14 @@ mod tests {
 
         sweep_stale_export_tmp(&dir);
 
-        assert!(!orphan_write.exists(), "dead-pid write_note temp orphan must be swept");
-        assert!(!orphan_edit.exists(), "dead-pid overwrite_note temp orphan must be swept");
+        assert!(
+            !orphan_write.exists(),
+            "dead-pid write_note temp orphan must be swept"
+        );
+        assert!(
+            !orphan_edit.exists(),
+            "dead-pid overwrite_note temp orphan must be swept"
+        );
         assert!(
             dir.join("2026-06-24 1430 - Sync.md").exists(),
             "a real exported .md must never be touched"
@@ -1201,7 +2399,10 @@ mod tests {
         let future = std::time::SystemTime::now() + std::time::Duration::from_secs(2 * 3600);
         let removed = sweep_export_tmp_dir(&dir, future);
 
-        assert_eq!(removed, 1, "a stale (> 1 h) temp is reclaimed even with a live pid");
+        assert_eq!(
+            removed, 1,
+            "a stale (> 1 h) temp is reclaimed even with a live pid"
+        );
         assert!(!recycled.exists(), "the stale recycled-pid temp is removed");
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1576,7 +2777,10 @@ mod tests {
         let path = dir.join("Sync.md");
         std::fs::write(&path, "murmur content").unwrap();
         let h = note_content_hash("murmur content");
-        assert_eq!(preserve_external_edit_if_any(&path, Some(&h)).unwrap(), None);
+        assert_eq!(
+            preserve_external_edit_if_any(&path, Some(&h)).unwrap(),
+            None
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1596,7 +2800,10 @@ mod tests {
         let dir = tmp_dir("preserve-missing");
         let path = dir.join("Gone.md");
         let h = note_content_hash("whatever");
-        assert_eq!(preserve_external_edit_if_any(&path, Some(&h)).unwrap(), None);
+        assert_eq!(
+            preserve_external_edit_if_any(&path, Some(&h)).unwrap(),
+            None
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1662,11 +2869,19 @@ mod tests {
             "shipped",
             Some("2026-07-04 1000 - Launch review"),
         );
-        assert!(out.starts_with(md), "append-only: input is a prefix of output");
-        assert!(out.contains("## Re-Truth updates"), "section created: {out}");
+        assert!(
+            out.starts_with(md),
+            "append-only: input is a prefix of output"
+        );
+        assert!(
+            out.contains("## Re-Truth updates"),
+            "section created: {out}"
+        );
         assert!(out.contains("> [!superseded] 2026-07-05"), "callout: {out}");
         assert!(
-            out.contains("> **status** — in-progress → shipped · see [[2026-07-04 1000 - Launch review]]"),
+            out.contains(
+                "> **status** — in-progress → shipped · see [[2026-07-04 1000 - Launch review]]"
+            ),
             "body + wikilink: {out}"
         );
     }
@@ -1707,7 +2922,10 @@ mod tests {
     #[test]
     fn supersession_callout_omits_link_when_no_stem() {
         let out = append_supersession_callout("# T\n", "2026-07-05", "status", "a", "b", None);
-        assert!(out.contains("> **status** — a → b\n"), "body without link: {out}");
+        assert!(
+            out.contains("> **status** — a → b\n"),
+            "body without link: {out}"
+        );
         assert!(!out.contains("see [["), "no dangling wikilink: {out}");
     }
 
@@ -1715,7 +2933,14 @@ mod tests {
     #[test]
     fn supersedes_backlink_appends_and_references_source() {
         let md = "# Launch review\n";
-        let out = append_supersedes_callout(md, "2026-07-05", "status", "in-progress", "shipped", "Kickoff");
+        let out = append_supersedes_callout(
+            md,
+            "2026-07-05",
+            "status",
+            "in-progress",
+            "shipped",
+            "Kickoff",
+        );
         assert!(out.starts_with(md), "append-only");
         assert!(out.contains("> [!supersedes] 2026-07-05"), "callout: {out}");
         assert!(

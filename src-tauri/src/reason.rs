@@ -36,7 +36,7 @@ use crate::summarize::roles::{self, Role};
 
 /// The REAL on-device reasoner — the HOST half of the brain-sidecar extraction. mistralrs no longer
 /// links into the app crate; instead [`sidecar::SidecarReasoner`] drives the killable
-/// `meetnotes-brain` child over the NDJSON protocol, and killing the child reclaims ALL model RAM to
+/// `murmur-brain` child over the NDJSON protocol, and killing the child reclaims ALL model RAM to
 /// the OS. Selected at runtime by [`local_reasoner`] when a GGUF resolves on disk, else the
 /// dependency-free stub.
 pub mod sidecar;
@@ -431,7 +431,9 @@ fn sha256_hex_sync(path: &Path) -> Result<String> {
         .output()
         .map_err(|e| AppError::Summarize(format!("shasum spawn failed: {e}")))?;
     if !out.status.success() {
-        return Err(AppError::Summarize("shasum returned a non-zero status".into()));
+        return Err(AppError::Summarize(
+            "shasum returned a non-zero status".into(),
+        ));
     }
     // Output shape: "<hex>  <path>\n" — the hash is the first whitespace-delimited token.
     String::from_utf8_lossy(&out.stdout)
@@ -475,7 +477,10 @@ where
 
     let part = dest.with_extension("part");
     // Resume from a surviving partial, if any.
-    let mut existing: u64 = tokio::fs::metadata(&part).await.map(|m| m.len()).unwrap_or(0);
+    let mut existing: u64 = tokio::fs::metadata(&part)
+        .await
+        .map(|m| m.len())
+        .unwrap_or(0);
 
     let client = reqwest::Client::new();
     let mut req = client.get(url);
@@ -672,6 +677,20 @@ impl ReasonerCell {
         }
     }
 
+    /// Drop the host-side cached local reasoner after the recording coordinator has proved that
+    /// no model generation is in flight. The killable child itself is reclaimed separately.
+    pub(crate) fn release_local_cache(&self) {
+        let evicted = self
+            .local
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .is_some();
+        if evicted {
+            tracing::info!(target: "reason", "released cached local reasoner for recording");
+        }
+    }
+
     /// TEST-ONLY: pin `current()` to a fixed reasoner instance (the old `Box<StubReasoner>` test
     /// shape). Production dispatch always goes through [`new`] + live config resolution. `fixed()`
     /// always short-circuits [`current_for`](Self::current_for) to the pinned reasoner and never
@@ -698,6 +717,25 @@ impl ReasonerCell {
     /// the EXACT legacy `brain_backend` mapping for every role (byte-identical dispatch); with a
     /// role's connection key set, that role dispatches its own target.
     pub fn current_for(&self, role: Role) -> Arc<dyn LocalReasoner> {
+        self.current_for_with_token(role, None)
+    }
+
+    /// Exact-session dispatch for an explicitly recording-owned inference segment. The token is
+    /// retained by both the admitted local-model decorator and the redacted cloud provider; the
+    /// stub remains model-free.
+    pub(crate) fn current_for_recording(
+        &self,
+        role: Role,
+        token: crate::perf::RecordingSessionToken,
+    ) -> Arc<dyn LocalReasoner> {
+        self.current_for_with_token(role, Some(token))
+    }
+
+    fn current_for_with_token(
+        &self,
+        role: Role,
+        recording_token: Option<crate::perf::RecordingSessionToken>,
+    ) -> Arc<dyn LocalReasoner> {
         #[cfg(test)]
         if let Some(f) = &self.fixed {
             return Arc::clone(f);
@@ -714,19 +752,20 @@ impl ReasonerCell {
         let target = roles::reasoner_target(role, &cfg);
         match target.connection.as_str() {
             roles::CONN_OFF => Arc::new(StubReasoner),
-            roles::CONN_LOCAL => self.local_cached(&cfg, &target),
+            roles::CONN_LOCAL => admit_reasoner(self.local_cached(&cfg, &target), recording_token),
             // WS2 anti-egress ORDERING (load-bearing): the on-device AFM arm MUST come BEFORE the
             // catch-all cloud arm below. The `_` sends anything non-off/non-local/non-apple to the
             // cloud (egress); without this explicit arm an `apple` target would silently
             // cloud-dispatch. AfmReasoner holds only a PathBuf, so build per call like CloudReasoner
             // (no cache slot); a missing sidecar falls back to the stub inside `afm_reasoner_arc`.
-            roles::CONN_AFM => afm::afm_reasoner_arc(&cfg),
+            roles::CONN_AFM => admit_reasoner(afm::afm_reasoner_arc(&cfg), recording_token),
             // Cheap per call: the provider (+ consent gate) is built lazily inside, from a fresh
             // config read, so this instance can never pin a stale provider/consent state.
-            _ => Arc::new(CloudReasoner::for_role(
+            _ => Arc::new(CloudReasoner::for_role_with_token(
                 Arc::clone(&self.config),
                 role,
                 Arc::clone(&self.heavy),
+                recording_token,
             )),
         }
     }
@@ -739,19 +778,23 @@ impl ReasonerCell {
     /// apply unchanged. (Adversarial review, code-truth #1/#3 + product #1: the v0.1 "else the
     /// role-resolved reasoner" order would have silently egressed facts on a missing model.)
     pub fn light(&self) -> Arc<dyn LocalReasoner> {
-        self.class_or_stub(ModelClass::Light)
+        self.class_or_stub(ModelClass::Light, None)
     }
 
     /// The HEAVY-engine handle (local Notes/Ask + post-call analysis). Same LOCAL-or-stub,
     /// NEVER-cloud contract as [`light`](Self::light).
     pub fn heavy(&self) -> Arc<dyn LocalReasoner> {
-        self.class_or_stub(ModelClass::Heavy)
+        self.class_or_stub(ModelClass::Heavy, None)
     }
 
     /// Resolve a class engine LOCAL-or-stub — never cloud, never the single class-agnostic custom path
     /// override (`brain_model_path`), so the light and heavy handles can't collide on one custom file.
     /// A poisoned config mutex still yields the stub (fail-closed, no egress).
-    fn class_or_stub(&self, class: ModelClass) -> Arc<dyn LocalReasoner> {
+    fn class_or_stub(
+        &self,
+        class: ModelClass,
+        recording_token: Option<crate::perf::RecordingSessionToken>,
+    ) -> Arc<dyn LocalReasoner> {
         let (model_id, timeouts) = match self.config.lock() {
             Ok(c) => (class_model_id(&c, class), sidecar_timeouts(&c)),
             Err(p) => {
@@ -760,7 +803,10 @@ impl ReasonerCell {
             }
         };
         match resolve_brain_model(None, model_id.as_deref()) {
-            Ok(Some(_)) => Arc::from(local_reasoner_resolved(None, model_id.as_deref(), timeouts)),
+            Ok(Some(_)) => admit_reasoner(
+                Arc::from(local_reasoner_resolved(None, model_id.as_deref(), timeouts)),
+                recording_token,
+            ),
             _ => Arc::new(StubReasoner),
         }
     }
@@ -770,15 +816,27 @@ impl ReasonerCell {
     /// stops egressing (the enablement card's "facts go fully local" promise; spec §3.4). When OFF it
     /// is the role-resolved Notes reasoner EXACTLY as today (cloud by default). Rechecked per call.
     pub fn extraction_reasoner(&self) -> Arc<dyn LocalReasoner> {
-        let brain_live = self
-            .config
-            .lock()
-            .map(|c| c.brain_live)
-            .unwrap_or(false);
+        self.extraction_reasoner_with_token(None)
+    }
+
+    /// Exact-session extraction dispatch used by recording postprocess. Both the Brain-Live light
+    /// route and the role-resolved Notes route carry the same recording identity into local work.
+    pub(crate) fn extraction_reasoner_for_recording(
+        &self,
+        token: crate::perf::RecordingSessionToken,
+    ) -> Arc<dyn LocalReasoner> {
+        self.extraction_reasoner_with_token(Some(token))
+    }
+
+    fn extraction_reasoner_with_token(
+        &self,
+        recording_token: Option<crate::perf::RecordingSessionToken>,
+    ) -> Arc<dyn LocalReasoner> {
+        let brain_live = self.config.lock().map(|c| c.brain_live).unwrap_or(false);
         if brain_live {
-            self.light()
+            self.class_or_stub(ModelClass::Light, recording_token)
         } else {
-            self.current_for(Role::Notes)
+            self.current_for_with_token(Role::Notes, recording_token)
         }
     }
 
@@ -1016,6 +1074,12 @@ pub trait LocalReasoner: Send + Sync {
     /// Stable id of the backing model ("stub" until the real model lands).
     fn id(&self) -> &str;
 
+    /// Internal lifecycle marker: `true` only for the decorator that already leases each concrete
+    /// on-device inference call. Defaults false for all providers and test fakes.
+    fn model_admission_managed(&self) -> bool {
+        false
+    }
+
     /// Free-form reasoning: run `system` + `user` and return the model's text.
     fn reason(&self, system: &str, user: &str) -> Result<String>;
 
@@ -1048,6 +1112,76 @@ pub trait LocalReasoner: Send + Sync {
     ) -> Result<Value> {
         self.structured(system, user, json_schema)
     }
+}
+
+/// Decorates only real on-device AFM/GGUF reasoners. Each trait call owns residency for exactly the
+/// model dispatch; callers remain free to do DB reads, tool/network work and persistence between
+/// agent-loop inference segments without pinning the model lane.
+struct ModelAdmittedReasoner {
+    inner: Arc<dyn LocalReasoner>,
+    recording_token: Option<crate::perf::RecordingSessionToken>,
+}
+
+impl ModelAdmittedReasoner {
+    fn run<T>(&self, f: impl FnOnce(&dyn LocalReasoner) -> Result<T>) -> Result<T> {
+        let kind = if self.inner.id() == "afm" {
+            crate::perf::ResidentModelKind::AppleFoundation
+        } else {
+            crate::perf::ResidentModelKind::BrainGguf
+        };
+        crate::perf::with_model_generation(self.recording_token.as_ref(), kind, || {
+            f(self.inner.as_ref())
+        })
+    }
+}
+
+impl LocalReasoner for ModelAdmittedReasoner {
+    fn id(&self) -> &str {
+        self.inner.id()
+    }
+
+    fn model_admission_managed(&self) -> bool {
+        true
+    }
+
+    fn reason(&self, system: &str, user: &str) -> Result<String> {
+        self.run(|reasoner| reasoner.reason(system, user))
+    }
+
+    fn reason_with(&self, system: &str, user: &str, opts: GenOptions) -> Result<String> {
+        self.run(|reasoner| reasoner.reason_with(system, user, opts))
+    }
+
+    fn structured(&self, system: &str, user: &str, schema: &Value) -> Result<Value> {
+        self.run(|reasoner| reasoner.structured(system, user, schema))
+    }
+
+    fn structured_with(
+        &self,
+        system: &str,
+        user: &str,
+        schema: &Value,
+        opts: GenOptions,
+    ) -> Result<Value> {
+        self.run(|reasoner| reasoner.structured_with(system, user, schema, opts))
+    }
+}
+
+fn is_admission_managed_reasoner(reasoner: &dyn LocalReasoner) -> bool {
+    reasoner.id() == "afm" || reasoner.id().starts_with("sidecar:")
+}
+
+fn admit_reasoner(
+    reasoner: Arc<dyn LocalReasoner>,
+    recording_token: Option<crate::perf::RecordingSessionToken>,
+) -> Arc<dyn LocalReasoner> {
+    if !is_admission_managed_reasoner(reasoner.as_ref()) {
+        return reasoner;
+    }
+    Arc::new(ModelAdmittedReasoner {
+        inner: reasoner,
+        recording_token,
+    })
 }
 
 /// Extract the first BALANCED top-level JSON object `{...}` from `text`.
@@ -1156,7 +1290,7 @@ impl LocalReasoner for StubReasoner {
 ///
 /// ## PRIVACY INVARIANT (load-bearing — audited by the lock-security reviewer)
 /// `CloudReasoner` opens NO new egress class. Every call routes through
-/// [`crate::summarize::make_provider`], so it inherits — byte-for-byte — the summary's egress
+/// the standard `summarize` provider factories, so it inherits — byte-for-byte — the summary's egress
 /// posture:
 /// - the **fail-closed `cloud_egress_consented` gate** (`make_provider` returns
 ///   `AppError::Unavailable` for a cloud provider until the user has consented once);
@@ -1187,10 +1321,14 @@ pub struct CloudReasoner {
     /// resolves (in particular a `local`-connection role, which reaches `LocalSummarizerProvider`)
     /// — see `crate::perf::run_heavy`'s doc comment.
     heavy: Arc<tokio::sync::Semaphore>,
+    /// Exact recording identity for a Live/Postprocess-owned cloud turn. It is forwarded into the
+    /// standard provider factory so NER admission and the cloud await's affine egress lease belong
+    /// to the same session; ordinary calls keep `None` and are deferred once Start owns priority.
+    recording_token: Option<crate::perf::RecordingSessionToken>,
     /// TEST-ONLY injected provider. When `Some`, `build_provider` returns it instead of calling
     /// the factory, so the wiring/parse can be exercised with a mock — NO real Claude/network.
-    /// `None` in every production path (the only constructors reachable in release are [`new`] /
-    /// [`for_role`](Self::for_role)).
+    /// `None` in every production path (including the exact-session constructor used by
+    /// [`ReasonerCell::current_for_recording`]).
     provider_override: Option<Arc<dyn SummarizerProvider>>,
 }
 
@@ -1204,7 +1342,20 @@ impl CloudReasoner {
 
     /// Build the cloud brain serving `role`. The id names the connection the role RESOLVES to
     /// (`cloud:<connection>`) — under the legacy fallback that is `provider_id`, unchanged.
-    pub fn for_role(config: Arc<Mutex<AppConfig>>, role: Role, heavy: Arc<tokio::sync::Semaphore>) -> Self {
+    pub fn for_role(
+        config: Arc<Mutex<AppConfig>>,
+        role: Role,
+        heavy: Arc<tokio::sync::Semaphore>,
+    ) -> Self {
+        Self::for_role_with_token(config, role, heavy, None)
+    }
+
+    fn for_role_with_token(
+        config: Arc<Mutex<AppConfig>>,
+        role: Role,
+        heavy: Arc<tokio::sync::Semaphore>,
+        recording_token: Option<crate::perf::RecordingSessionToken>,
+    ) -> Self {
         let connection = config
             .lock()
             .map(|c| roles::provider_target(role, &c).connection)
@@ -1214,6 +1365,7 @@ impl CloudReasoner {
             config,
             role,
             heavy,
+            recording_token,
             provider_override: None,
         }
     }
@@ -1230,16 +1382,18 @@ impl CloudReasoner {
             config: Arc::new(Mutex::new(config)),
             role: Role::Notes,
             heavy: Arc::new(tokio::sync::Semaphore::new(1)),
+            recording_token: None,
             provider_override: Some(provider),
         }
     }
 
     /// Resolve the provider for this call. THE egress seam: in production this is ALWAYS
-    /// `provider_for(self.role, …)` (role resolution → the same consent gate + RedactingProvider
-    /// as every factory build) over a FRESH read of the shared config — never a construction-time
-    /// snapshot — so a consent grant unblocks, and a consent REVOCATION refuses, on the very next
-    /// call (fail-closed both directions, no restart). A poisoned config mutex makes the consent
-    /// state unknowable, so it refuses too. A test override short-circuits only under `#[cfg(test)]`.
+    /// `provider_for(self.role, …)` or its exact-session `provider_for_recording` twin (role
+    /// resolution → the same consent gate + RedactingProvider as every factory build) over a FRESH
+    /// read of the shared config — never a construction-time snapshot — so a consent grant
+    /// unblocks, and a consent REVOCATION refuses, on the very next call (fail-closed both
+    /// directions, no restart). A poisoned config mutex makes the consent state unknowable, so it
+    /// refuses too. A test override short-circuits only under `#[cfg(test)]`.
     fn build_provider(&self) -> Result<Arc<dyn SummarizerProvider>> {
         if let Some(p) = &self.provider_override {
             return Ok(p.clone());
@@ -1249,7 +1403,12 @@ impl CloudReasoner {
             .lock()
             .map_err(|_| AppError::Config("config mutex poisoned".into()))?
             .clone();
-        crate::summarize::provider_for(self.role, &cfg, &self.heavy)
+        match self.recording_token.clone() {
+            Some(token) => {
+                crate::summarize::provider_for_recording(self.role, &cfg, &self.heavy, token)
+            }
+            None => crate::summarize::provider_for(self.role, &cfg, &self.heavy),
+        }
     }
 }
 
@@ -1310,6 +1469,29 @@ impl LocalReasoner for CloudReasoner {
 mod tests {
     use super::*;
 
+    #[test]
+    fn cloud_role_recording_dispatch_retains_the_exact_session_token() {
+        let _serial = crate::perf::model_lifecycle_test_guard();
+        crate::perf::reset_model_lifecycle_for_test();
+        let mut owner = crate::perf::begin_recording_session().unwrap();
+        owner.transition_to_live().unwrap();
+        let token = owner.token();
+        let reasoner = CloudReasoner::for_role_with_token(
+            shared(AppConfig::default()),
+            Role::Live,
+            Arc::new(tokio::sync::Semaphore::new(1)),
+            Some(token.clone()),
+        );
+        assert!(reasoner
+            .recording_token
+            .as_ref()
+            .is_some_and(|retained| retained.same_session_as(&token)));
+        owner.transition_to_draining().unwrap();
+        owner.transition_to_postprocess().unwrap();
+        owner.finish().unwrap();
+        crate::perf::reset_model_lifecycle_for_test();
+    }
+
     /// Brain v2 P0.3 — the answer presets carry the intended hard caps + the 30 s live-path
     /// wall-clock timeout and never enable thinking; the DEFAULT options carry NO timeout (note-gen
     /// / the FullyLocal floor legitimately run past 30 s — the pre-P0 unbounded behavior); the
@@ -1337,7 +1519,9 @@ mod tests {
 
         // The default trait method delegates to `reason` — the stub answers identically with or
         // without options, proving implementors without a sampler are untouched.
-        let with = StubReasoner.reason_with("s", "u", GenOptions::live_answer()).unwrap();
+        let with = StubReasoner
+            .reason_with("s", "u", GenOptions::live_answer())
+            .unwrap();
         let without = StubReasoner.reason("s", "u").unwrap();
         assert_eq!(with, without);
     }
@@ -1407,7 +1591,9 @@ mod tests {
         let bad = parse_first_json::<P>("{\"a\":\"not-a-number\"}").unwrap_err();
         assert!(is_malformed_json_error(&bad), "{bad:?}");
         // Other classes never match.
-        assert!(!is_malformed_json_error(&AppError::Unavailable("no consent".into())));
+        assert!(!is_malformed_json_error(&AppError::Unavailable(
+            "no consent".into()
+        )));
         assert!(!is_malformed_json_error(&AppError::Storage("boom".into())));
         assert!(!is_malformed_json_error(&AppError::Summarize(
             "some other summarize failure".into()
@@ -1547,7 +1733,9 @@ mod tests {
             std::fs::write(&dest, b"GGUF").unwrap();
         }
         assert_eq!(
-            resolve_brain_model(None, Some("qwen3-1.7b")).unwrap().as_deref(),
+            resolve_brain_model(None, Some("qwen3-1.7b"))
+                .unwrap()
+                .as_deref(),
             Some(dest.as_path())
         );
         if !pre_existing {
@@ -1638,7 +1826,9 @@ mod tests {
             std::fs::write(&dest, b"GGUF").unwrap();
         }
         assert_eq!(
-            resolve_brain_model(None, Some("qwen2.5-3b")).unwrap().as_deref(),
+            resolve_brain_model(None, Some("qwen2.5-3b"))
+                .unwrap()
+                .as_deref(),
             Some(dest.as_path())
         );
         // The nudge fires and reports the file present.
@@ -1673,7 +1863,10 @@ mod tests {
         assert!(BRAIN_MODELS.iter().any(|m| m.class == ModelClass::Light));
         assert!(BRAIN_MODELS.iter().any(|m| m.class == ModelClass::Heavy));
         // The recommended defaults are present and correctly classed.
-        assert_eq!(brain_model_by_id("qwen3-1.7b").unwrap().class, ModelClass::Light);
+        assert_eq!(
+            brain_model_by_id("qwen3-1.7b").unwrap().class,
+            ModelClass::Light
+        );
         assert_eq!(
             brain_model_by_id("qwen3-4b-instruct-2507").unwrap().class,
             ModelClass::Heavy
@@ -1703,7 +1896,10 @@ mod tests {
             brain_model_id: None,
             ..Default::default()
         };
-        assert_eq!(active_reasoner(&cfg, &Arc::new(tokio::sync::Semaphore::new(1))).id(), "stub");
+        assert_eq!(
+            active_reasoner(&cfg, &Arc::new(tokio::sync::Semaphore::new(1))).id(),
+            "stub"
+        );
     }
 
     // ---- CloudReasoner (the cloud brain) ----------------------------------------------------
@@ -1754,7 +1950,10 @@ mod tests {
             provider_id: "claude_code".to_string(),
             ..Default::default()
         };
-        assert_eq!(CloudReasoner::new(shared(cfg), Arc::new(tokio::sync::Semaphore::new(1))).id(), "cloud:claude_code");
+        assert_eq!(
+            CloudReasoner::new(shared(cfg), Arc::new(tokio::sync::Semaphore::new(1))).id(),
+            "cloud:claude_code"
+        );
     }
 
     #[test]
@@ -2022,7 +2221,8 @@ mod tests {
                 brain_model_id: None,
                 ..Default::default()
             });
-            let cell = ReasonerCell::new(Arc::clone(&cfg), Arc::new(tokio::sync::Semaphore::new(1)));
+            let cell =
+                ReasonerCell::new(Arc::clone(&cfg), Arc::new(tokio::sync::Semaphore::new(1)));
             let legacy = cell.current().id().to_string();
             for role in [Role::Notes, Role::Ask, Role::Live] {
                 assert_eq!(
@@ -2073,7 +2273,11 @@ mod tests {
             role_ask_connection: "anthropic".to_string(),
             ..Default::default()
         };
-        let r = CloudReasoner::for_role(shared(cfg), Role::Ask, Arc::new(tokio::sync::Semaphore::new(1)));
+        let r = CloudReasoner::for_role(
+            shared(cfg),
+            Role::Ask,
+            Arc::new(tokio::sync::Semaphore::new(1)),
+        );
         assert_eq!(r.id(), "cloud:anthropic");
     }
 
@@ -2089,7 +2293,11 @@ mod tests {
             cloud_egress_consented: false,
             ..Default::default()
         });
-        let r = CloudReasoner::for_role(Arc::clone(&cfg), Role::Live, Arc::new(tokio::sync::Semaphore::new(1)));
+        let r = CloudReasoner::for_role(
+            Arc::clone(&cfg),
+            Role::Live,
+            Arc::new(tokio::sync::Semaphore::new(1)),
+        );
         match r.reason("s", "u") {
             Err(AppError::Unavailable(_)) => {}
             other => panic!("role-keyed cloud call must be consent-gated, got {other:?}"),
@@ -2125,7 +2333,10 @@ mod tests {
             provider_id: "claude_code".to_string(),
             ..Default::default()
         };
-        assert_eq!(active_reasoner(&cfg, &Arc::new(tokio::sync::Semaphore::new(1))).id(), "cloud:claude_code");
+        assert_eq!(
+            active_reasoner(&cfg, &Arc::new(tokio::sync::Semaphore::new(1))).id(),
+            "cloud:claude_code"
+        );
     }
 
     #[test]
@@ -2134,7 +2345,10 @@ mod tests {
             brain_backend: BrainBackend::Off,
             ..Default::default()
         };
-        assert_eq!(active_reasoner(&cfg, &Arc::new(tokio::sync::Semaphore::new(1))).id(), "stub");
+        assert_eq!(
+            active_reasoner(&cfg, &Arc::new(tokio::sync::Semaphore::new(1))).id(),
+            "stub"
+        );
     }
 
     #[test]
@@ -2152,13 +2366,21 @@ mod tests {
             brain_model_id: None,
             ..Default::default()
         };
-        assert_eq!(active_reasoner(&cfg, &Arc::new(tokio::sync::Semaphore::new(1))).id(), "stub");
+        assert_eq!(
+            active_reasoner(&cfg, &Arc::new(tokio::sync::Semaphore::new(1))).id(),
+            "stub"
+        );
     }
 
     /// Default config (the user's choice) selects the Cloud brain.
     #[test]
     fn active_reasoner_default_is_cloud() {
-        let id = active_reasoner(&AppConfig::default(), &Arc::new(tokio::sync::Semaphore::new(1))).id().to_string();
+        let id = active_reasoner(
+            &AppConfig::default(),
+            &Arc::new(tokio::sync::Semaphore::new(1)),
+        )
+        .id()
+        .to_string();
         assert!(
             id.starts_with("cloud:"),
             "default brain must be cloud, got {id}"
@@ -2181,7 +2403,10 @@ mod tests {
             brain_backend: BrainBackend::AppleFoundation,
             ..Default::default()
         };
-        assert_eq!(active_reasoner(&cfg, &Arc::new(tokio::sync::Semaphore::new(1))).id(), "stub");
+        assert_eq!(
+            active_reasoner(&cfg, &Arc::new(tokio::sync::Semaphore::new(1))).id(),
+            "stub"
+        );
     }
 
     /// ANTI-EGRESS ORDERING regression (the load-bearing `CONN_AFM`-before-`_` arm): a mid-session
@@ -2265,7 +2490,10 @@ mod tests {
             ..Default::default()
         });
         assert!(
-            ReasonerCell::new(off, Arc::new(tokio::sync::Semaphore::new(1))).extraction_reasoner().id().starts_with("cloud:"),
+            ReasonerCell::new(off, Arc::new(tokio::sync::Semaphore::new(1)))
+                .extraction_reasoner()
+                .id()
+                .starts_with("cloud:"),
             "Brain Live OFF keeps the legacy cloud Notes extraction"
         );
         // ON ⇒ the local light engine (local-or-stub), never cloud — even with cloud consent.
@@ -2275,7 +2503,10 @@ mod tests {
             cloud_egress_consented: true,
             ..Default::default()
         });
-        let id = ReasonerCell::new(on, Arc::new(tokio::sync::Semaphore::new(1))).extraction_reasoner().id().to_string();
+        let id = ReasonerCell::new(on, Arc::new(tokio::sync::Semaphore::new(1)))
+            .extraction_reasoner()
+            .id()
+            .to_string();
         assert!(
             !id.starts_with("cloud:"),
             "Brain Live ON must route fact extraction LOCAL, never cloud (got {id})"

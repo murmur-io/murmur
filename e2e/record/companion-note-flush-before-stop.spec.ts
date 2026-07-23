@@ -17,9 +17,9 @@ import { mockTauri } from "../settings-ai/mock-invoke";
  * text..."]` — Stop reached the backend BEFORE the text persisted.
  *
  * THE FIX: `RecorderStore.stop()` awaits the live companion editor's durable flush
- * (RecordingFlushService → NoteEditorComponent.flushPendingSave → the full save chain)
+ * (RecordingFlushService → NoteEditorComponent.flushPendingSave → the cheap text-save chain)
  * BEFORE `stop_recording`. This test proves the ORDER is now inverted: the companion
- * save (`update_note_doc`, carrying the typed text) reaches the backend BEFORE
+ * save (`save_note_text`, carrying the typed text) reaches the backend BEFORE
  * `stop_recording`.
  *
  * RED-before-GREEN: on the pre-fix code (no flush await, editor re-mounted per tab) the
@@ -27,7 +27,7 @@ import { mockTauri } from "../settings-ai/mock-invoke";
  * the immediate `stop_recording` — so the assertion `updateIdx < stopIdx` FAILS. With
  * the fix it PASSES. (Verified RED first by running this spec against the working tree
  * with the `await this.flushService.flush()` line removed from `stop()` — the recorded
- * order was `[..., "stop_recording", "update_note_doc"]`, `updateIdx > stopIdx`.)
+ * order was `[..., "stop_recording", "save_note_text"]`, `updateIdx > stopIdx`.)
  */
 test.describe("Record — companion note is flushed BEFORE stop_recording", () => {
   test.beforeEach(async ({ page }) => {
@@ -58,8 +58,8 @@ test.describe("Record — companion note is flushed BEFORE stop_recording", () =
         shared: false,
       }),
       get_backlinks: () => [],
-      // The FULL save the flush runs (updateNoteDoc → update_note_doc): echo a doc so
-      // the editor's post-save `note.update` is happy.
+      // A full boundary save remains mocked, but Stop itself must use only the cheap
+      // `save_note_text` path so re-index/export cannot delay capture finalization.
       update_note_doc: (args: any) => ({
         id: "n1",
         title: args.title,
@@ -97,6 +97,11 @@ test.describe("Record — companion note is flushed BEFORE stop_recording", () =
         if (cmd === "update_note_doc" || cmd === "save_note_text") {
           const md = (args as { markdown?: string } | undefined)?.markdown ?? "";
           rec.push(`${cmd}:${md}`);
+        } else if (cmd === "stop_recording") {
+          const completed = (
+            args as { companionFlushCompleted?: boolean } | undefined
+          )?.companionFlushCompleted;
+          rec.push(`${cmd}:${String(completed)}`);
         } else {
           rec.push(cmd);
         }
@@ -128,8 +133,8 @@ test.describe("Record — companion note is flushed BEFORE stop_recording", () =
       .poll(async () =>
         page.evaluate(() => {
           const inv = (window as unknown as { __invokes: string[] }).__invokes;
-          const hasWrite = inv.some((c) => c.startsWith("update_note_doc:"));
-          const hasStop = inv.includes("stop_recording");
+          const hasWrite = inv.some((c) => c.startsWith("save_note_text:"));
+          const hasStop = inv.some((c) => c.startsWith("stop_recording:"));
           return hasWrite && hasStop;
         }),
       )
@@ -141,12 +146,15 @@ test.describe("Record — companion note is flushed BEFORE stop_recording", () =
 
     // The companion save carrying the TYPED text must precede stop_recording.
     const writeIdx = order.findIndex(
-      (c) => c.startsWith("update_note_doc:") && c.includes("critical decision"),
+      (c) => c.startsWith("save_note_text:") && c.includes("critical decision"),
     );
-    const stopIdx = order.indexOf("stop_recording");
+    const stopIdx = order.indexOf("stop_recording:true");
 
     expect(writeIdx, "companion save (with typed text) must be recorded").toBeGreaterThanOrEqual(0);
-    expect(stopIdx, "stop_recording must be recorded").toBeGreaterThanOrEqual(0);
+    expect(
+      stopIdx,
+      "stop_recording must carry the completed-flush cleanup witness",
+    ).toBeGreaterThanOrEqual(0);
     expect(
       writeIdx,
       `companion save must reach the backend BEFORE stop_recording (order: ${JSON.stringify(order)})`,

@@ -1,6 +1,8 @@
 {
   "schema_version": 1,
+  "default_writer": "claude",
   "max_repair_rounds": 2,
+  "task_timeout_seconds": 7200,
   "agent_timeout_seconds": 1800,
   "check_timeout_seconds": 1800,
   "max_diff_bytes_for_review": 500000,
@@ -27,11 +29,19 @@
     "protocol": "protocol-security"
   },
   "risk_required_evidence": {
-    "lock": ["lock-negative", "lock-roundtrip"],
-    "egress": ["egress-policy"],
-    "protocol": ["protocol-client", "protocol-server"],
+    "lock": ["rust-lib"],
+    "egress": ["rust-lib"],
+    "protocol": ["rust-lib", "protocol-server"],
     "runtime": ["tauri-boot"],
-    "ui": ["playwright"]
+    "ui": ["playwright"],
+    "performance": ["perf-contracts"]
+  },
+  "canonical_checks": {
+    "rust-lib": "(cd src-tauri && CARGO_BUILD_JOBS=2 cargo test --lib -- --test-threads=1)",
+    "protocol-server": "(cd ../murmur-server && CARGO_BUILD_JOBS=2 cargo test -p murmur-protocol -- --test-threads=1)",
+    "tauri-boot": "scripts/harness-runtime-smoke",
+    "playwright": "npm run test:e2e -- --workers=1",
+    "perf-contracts": "bash .agents/harness/checks/perf-contracts.sh"
   },
   "risk_classification": {
     "lock": [
@@ -42,9 +52,11 @@
       "src-tauri/src/storage/**",
       "src-tauri/src/commands/lock.rs",
       "src-tauri/src/commands/export.rs",
+      "src-tauri/src/commands/attachments.rs",
       "src-tauri/src/mcp.rs",
       "src/app/**/lock*",
-      "src/app/**/share*"
+      "src/app/**/share*",
+      "src/app/**/attachment*"
     ],
     "egress": [
       "src-tauri/src/summarize/**",
@@ -62,6 +74,8 @@
       "src-tauri/src/state.rs",
       "src-tauri/src/audio/**",
       "src-tauri/src/transcribe/**",
+      "src-tauri/src/pipeline.rs",
+      "src-tauri/src/commands/audio.rs",
       "src-tauri/tauri.conf.json",
       "src-tauri/*.swift",
       "src-tauri/**/*.swift"
@@ -70,6 +84,18 @@
       "src/app/**",
       "e2e/**",
       "playwright.config.ts"
+    ],
+    "performance": [
+      "src-tauri/src/audio/**",
+      "src-tauri/src/transcribe/**",
+      "src-tauri/src/embed/**",
+      "src-tauri/src/reason/sidecar.rs",
+      "src-tauri/src/perf.rs",
+      "src-tauri/src/thermal.rs",
+      "src-tauri/src/pipeline.rs",
+      "crates/murmur-brain/**",
+      "scripts/measure-recording-ram.sh",
+      "scripts/measure-live-power.sh"
     ],
     "release": [
       "scripts/macos-sign-notarize.sh",
@@ -87,6 +113,9 @@
     ".codex",
     ".claude",
     "scripts/agent-harness",
-    "scripts/agent-config-audit"
+    "scripts/agent-config-audit",
+    "scripts/agent-remote-audit",
+    "scripts/agent-remote-audit.py",
+    "scripts/ci.sh"
   ]
 }

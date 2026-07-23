@@ -185,6 +185,7 @@ pub(crate) fn rename_folder_inner(
         .db
         .folder_by_id(&folder_id)?
         .ok_or_else(|| AppError::InvalidArg(format!("no folder {folder_id}")))?;
+    ensure_folder_subtree_unlocked(state, &folder_id)?;
     let old_path = folder.path.clone();
 
     // Recompose this folder's path from its PARENT's path + the new sanitized name.
@@ -255,6 +256,21 @@ pub(crate) fn rename_folder_inner(
         path: new_path,
         ..folder
     })
+}
+
+/// A parent-directory rename moves the complete vault subtree and rewrites descendant export paths,
+/// so every folder in that subtree must be session-visible before any content-bearing path row is
+/// read. Metadata-only locked renames are refused; unlock first.
+fn ensure_folder_subtree_unlocked(state: &AppState, folder_id: &str) -> Result<(), AppError> {
+    if !folder_is_unlocked(state, folder_id)? {
+        return Err(AppError::Locked(
+            "unlock this folder before renaming it".into(),
+        ));
+    }
+    for child in state.db.child_folders(folder_id)? {
+        ensure_folder_subtree_unlocked(state, &child.id)?;
+    }
+    Ok(())
 }
 
 /// Recursively re-prefix the vault-relative `path` of every DESCENDANT folder of `folder_id` to sit
@@ -383,6 +399,7 @@ pub(crate) fn delete_folder_inner(state: &AppState, folder_id: String) -> Result
     // Serialize the reassign + row delete + FS cleanup under the lifecycle guard so it can't race a
     // concurrent lock/move on the same folder.
     let _lifecycle = lifecycle_guard(state);
+    ensure_no_active_salvage_in_folder(state, &folder_id)?;
 
     // Move every note in this folder to the vault root (folder_id = NULL). The notes' plaintext `.md`
     // files already live in this folder's vault subdir; we re-point each meeting's exported_path to
@@ -482,10 +499,7 @@ fn move_note_file_to_root(
 /// delete the root "Notes" folder). Best-effort FS move: a note's bytes live in the DB (canonical),
 /// so a failed `.md` move never loses content — but a missing target keeps the reparent (the row moves
 /// regardless). No PII in logs (ids only).
-fn reparent_authored_notes_to_default(
-    state: &AppState,
-    folder_id: &str,
-) -> Result<(), AppError> {
+fn reparent_authored_notes_to_default(state: &AppState, folder_id: &str) -> Result<(), AppError> {
     let note_ids = state.db.note_ids_in_folder(folder_id)?;
     if note_ids.is_empty() {
         return Ok(());
@@ -495,7 +509,8 @@ fn reparent_authored_notes_to_default(
         // Deleting the default note-folder while it still holds authored notes: reparenting to
         // itself is a no-op and the row-delete would then destroy them. Fail closed.
         return Err(AppError::InvalidArg(
-            "cannot delete the default \"Notes\" folder while it holds notes — move them first".into(),
+            "cannot delete the default \"Notes\" folder while it holds notes — move them first"
+                .into(),
         ));
     }
     let default_folder = state

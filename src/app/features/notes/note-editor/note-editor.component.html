@@ -122,6 +122,7 @@
             class="seg-btn"
             [class.is-active]="preview()"
             (click)="setPreview(true)"
+            [disabled]="importingImages() > 0"
           >
             Preview
           </button>
@@ -198,13 +199,25 @@
                   <p class="menu-group-label">Shared</p>
                 }
                 <!-- Share moved off the top row into ⋯ (2026-07-19 header slim). -->
-                <button type="button" class="menu-item" role="menuitem" (click)="share()">
+                <button
+                  type="button"
+                  class="menu-item"
+                  role="menuitem"
+                  (click)="share()"
+                  [disabled]="importingImages() > 0"
+                >
                   Share…
                   @if (doc.shared) {
                     <span class="share-dot menu-trail-dot" aria-hidden="true"></span>
                   }
                 </button>
-                <button type="button" class="menu-item" role="menuitem" (click)="exportNote()">
+                <button
+                  type="button"
+                  class="menu-item"
+                  role="menuitem"
+                  (click)="exportNote()"
+                  [disabled]="importingImages() > 0"
+                >
                   Save to vault &amp; reveal
                 </button>
               </div>
@@ -561,10 +574,41 @@
                is hidden there), so the editable body always shows. -->
           @if (previewActive()) {
             <div class="note-preview">
-              <app-markdown [markdown]="previewMarkdown()" />
+              <app-markdown
+                [markdown]="previewMarkdown()"
+                [attachments]="attachments()"
+              />
             </div>
           } @else {
             <div class="body-wrap">
+              <div class="body-insert-bar">
+                <button
+                  type="button"
+                  class="btn btn-ghost image-add-btn"
+                  (pointerdown)="rememberImageInsertion()"
+                  (click)="openImagePicker()"
+                  [disabled]="importingImages() > 0"
+                  aria-label="Add image at cursor"
+                >
+                  <svg viewBox="0 0 16 16" width="14" height="14" fill="none" aria-hidden="true">
+                    <rect x="2" y="2.5" width="12" height="11" rx="2" stroke="currentColor" stroke-width="1.2" />
+                    <circle cx="5.25" cy="5.75" r="1" fill="currentColor" />
+                    <path d="m3.75 11 2.7-2.7 1.9 1.85 1.45-1.4L12.4 11" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" />
+                  </svg>
+                  {{ importingImages() > 0 ? "Adding image…" : "Add image" }}
+                </button>
+                <span class="body-insert-hint">Paste a screenshot with ⌘V or drop it here</span>
+              </div>
+              <input
+                #imageFileInput
+                class="image-file-input"
+                type="file"
+                accept="image/png,image/jpeg,image/webp"
+                multiple
+                tabindex="-1"
+                aria-hidden="true"
+                (change)="onImageFilesSelected($event)"
+              />
               <!-- CSS auto-grow: the grid mirror (`::after` fed by data-value) sizes the
                    row to the content, the textarea fills it — no per-keystroke JS reflow. -->
               <div class="body-grow" [attr.data-value]="body()">
@@ -579,6 +623,9 @@
                   [value]="body()"
                   (input)="onBodyInput($event)"
                   (keydown)="onBodyKeydown($event)"
+                  (paste)="onBodyPaste($event)"
+                  (dragover)="onBodyDragOver($event)"
+                  (drop)="onBodyDrop($event)"
                   (mouseup)="onBodySelect()"
                   (keyup)="onBodySelect()"
                   (select)="onBodySelect()"
@@ -686,6 +733,7 @@
       @if (!doc.locked) {
         <app-note-share-panel
           [noteId]="doc.id"
+          [attachments]="referencedAttachments()"
           (closed)="closeShare()"
           (changed)="onShareChanged()"
           (setupSharing)="goToSharingSettings()"

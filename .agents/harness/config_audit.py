@@ -116,6 +116,41 @@ def _json_audit(audit: Audit) -> Dict[str, Any]:
         "harness config schema_version=1",
         "harness config must be an object with schema_version=1",
     )
+    audit.require(
+        isinstance(config, dict) and config.get("default_writer") == "claude",
+        "harness defaults to Claude writer",
+        "harness default_writer must be claude (Codex is the automatic reviewer)",
+    )
+    audit.require(
+        isinstance(config, dict)
+        and isinstance(config.get("task_timeout_seconds"), int)
+        and 1 <= config["task_timeout_seconds"] <= 86_400,
+        "harness has a bounded task-wide wall deadline",
+        "harness task_timeout_seconds must be between 1 and 86400",
+    )
+    canonical = config.get("canonical_checks", {}) if isinstance(config, dict) else {}
+    risk_evidence = config.get("risk_required_evidence", {}) if isinstance(config, dict) else {}
+    required_check_ids = {
+        check_id
+        for values in risk_evidence.values()
+        if isinstance(values, list)
+        for check_id in values
+        if isinstance(check_id, str)
+    } if isinstance(risk_evidence, dict) else set()
+    audit.require(
+        isinstance(canonical, dict)
+        and required_check_ids
+        and required_check_ids.issubset(set(canonical)),
+        "every risk evidence id has a canonical command",
+        "risk evidence ids must resolve to runner-owned canonical_checks",
+    )
+    performance_profiles = risk_evidence.get("performance", []) if isinstance(risk_evidence, dict) else []
+    audit.require(
+        "perf-contracts" in performance_profiles
+        and (ROOT / ".agents" / "harness" / "checks" / "perf-contracts.sh").is_file(),
+        "hot paths require deterministic performance contracts",
+        "performance risk must require .agents/harness/checks/perf-contracts.sh",
+    )
     identity = config.get("commit_identity", {}) if isinstance(config, dict) else {}
     audit.require(
         isinstance(identity, dict)
@@ -141,6 +176,7 @@ def _bash_syntax(audit: Audit) -> None:
     launcher = ROOT / "scripts" / "agent-config-audit"
     if launcher.is_file():
         paths.append(launcher)
+    paths.extend(sorted((ROOT / ".agents" / "harness" / "checks").glob("*.sh")))
     for path in paths:
         completed = subprocess.run(
             ["bash", "-n", str(path)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False

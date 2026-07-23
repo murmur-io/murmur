@@ -85,7 +85,10 @@ impl BulletsTracker {
         if count <= MAX_BULLETS_DELTA_CHARS {
             delta
         } else {
-            delta.chars().skip(count - MAX_BULLETS_DELTA_CHARS).collect()
+            delta
+                .chars()
+                .skip(count - MAX_BULLETS_DELTA_CHARS)
+                .collect()
         }
     }
 }
@@ -171,10 +174,7 @@ pub fn append_bullets(existing: &str, new_lines: &str) -> String {
 /// Clear the RAM bullets buffer + reset the delta tracker (recording start / Stop / the
 /// lock-surface idle hygiene). Best-effort: a poisoned lock is ignored — the buffer is re-cleared
 /// at the next recording start anyway. Logs a COUNT only (no bullet text — PII rule).
-pub fn clear_ram(
-    bullets: &std::sync::Mutex<String>,
-    tracker: &std::sync::Mutex<BulletsTracker>,
-) {
+pub fn clear_ram(bullets: &std::sync::Mutex<String>, tracker: &std::sync::Mutex<BulletsTracker>) {
     if let Ok(mut b) = bullets.lock() {
         if !b.is_empty() {
             tracing::debug!(target: "bullets", chars = b.chars().count(), "cleared live-bullets buffer");
@@ -188,24 +188,34 @@ pub fn clear_ram(
 
 /// ONE bullets tick, wired to the running app — runs on the reactions WORKER thread (behind
 /// `reactions_busy`, BEFORE `detect_reactions`), never the live tick thread. Flag- and
-/// stub-gated: `live_bullets_enabled` OFF or no local light model ⇒ a no-op (legacy behavior).
+/// stub-gated: `brain_live` OFF, `live_bullets_enabled` OFF, or no local light model ⇒ a no-op.
 /// The body lives in [`bullets_tick_with`] — the reasoner-injected seam headless tests drive.
 pub fn bullets_tick(app: &tauri::AppHandle) {
     use tauri::Manager;
     let st = app.state::<crate::state::AppState>();
-    let enabled = st
+    let (brain_live, live_bullets_enabled) = st
         .config
         .lock()
-        .map(|c| c.live_bullets_enabled)
-        .unwrap_or(false);
-    if !enabled {
+        .map(|c| (c.brain_live, c.live_bullets_enabled))
+        .unwrap_or((false, false));
+    let Some(reasoner) =
+        resolve_live_bullets_reasoner(brain_live, live_bullets_enabled, || st.reasoner.light())
+    else {
         return;
-    }
-    let reasoner = st.reasoner.light();
+    };
     if reasoner.id() == "stub" {
         return; // no light model ⇒ feature degraded (never a cloud call).
     }
     bullets_tick_with(&st, &*reasoner);
+}
+
+/// Resolve lazily: merely asking for the light handle may initialize the local Brain.
+fn resolve_live_bullets_reasoner<T>(
+    brain_live: bool,
+    live_bullets_enabled: bool,
+    resolve: impl FnOnce() -> T,
+) -> Option<T> {
+    (brain_live && live_bullets_enabled).then(resolve)
 }
 
 /// The tick body with the light reasoner injected (production enters via [`bullets_tick`]; tests
@@ -321,6 +331,24 @@ mod tests {
                               testy QA przed piątkowym wydaniem";
 
     #[test]
+    fn live_bullets_are_a_brain_live_subtoggle() {
+        for (brain_live, enabled, expected) in [
+            (false, false, 0),
+            (false, true, 0),
+            (true, false, 0),
+            (true, true, 1),
+        ] {
+            let calls = std::cell::Cell::new(0);
+            let resolved = resolve_live_bullets_reasoner(brain_live, enabled, || {
+                calls.set(calls.get() + 1);
+                "light"
+            });
+            assert_eq!(calls.get(), expected);
+            assert_eq!(resolved.is_some(), expected == 1);
+        }
+    }
+
+    #[test]
     fn stub_reasoner_yields_none() {
         // The canonical stub guard: no local model ⇒ no bullets, never a cloud call.
         let out = update_bullets(&crate::reason::StubReasoner, "", LONG_DELTA);
@@ -361,7 +389,11 @@ mod tests {
             "Sure, here are the notes:\n- [budżet]: 10k zatwierdzone\n- [QA]: Anna przejmuje testy\n- [termin]: wydanie w piątek\n- [extra]: czwarta linia\nhope this helps",
         );
         let new = update_bullets(&r, "- [start]: kickoff", LONG_DELTA).expect("bullets parsed");
-        assert_eq!(new.lines().count(), MAX_NEW_BULLETS, "capped at {MAX_NEW_BULLETS}");
+        assert_eq!(
+            new.lines().count(),
+            MAX_NEW_BULLETS,
+            "capped at {MAX_NEW_BULLETS}"
+        );
         assert!(new.starts_with("- [budżet]:"));
         assert!(!new.contains("czwarta linia"), "the 4th bullet is dropped");
         assert!(!new.contains("Sure"), "prose stripped");
@@ -391,8 +423,14 @@ mod tests {
             "cap enforced, got {}",
             merged.chars().count()
         );
-        assert!(merged.ends_with("- [new]: the freshest bullet"), "newest survives");
-        assert!(merged.starts_with("- "), "front-trim lands on a line boundary");
+        assert!(
+            merged.ends_with("- [new]: the freshest bullet"),
+            "newest survives"
+        );
+        assert!(
+            merged.starts_with("- "),
+            "front-trim lands on a line boundary"
+        );
     }
 
     // ── bullets_tick_with: the stale-worker guard (adversarial CRITICAL, 2026-07-10) ────────────
@@ -534,7 +572,11 @@ mod tests {
         // Front-trim (as the live buffer's 16k cap does) + genuinely-new tail.
         let trimmed = format!("{} FRESH tail here", &long[60..].trim_end());
         let delta = t.take_delta(&trimmed);
-        assert_eq!(delta.trim_start(), "FRESH tail here", "anchor relocation, got {delta:?}");
+        assert_eq!(
+            delta.trim_start(),
+            "FRESH tail here",
+            "anchor relocation, got {delta:?}"
+        );
         assert!(!delta.contains("word"), "no re-fed old text: {delta:?}");
     }
 }

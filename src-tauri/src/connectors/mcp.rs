@@ -149,12 +149,21 @@ mod tests {
     #[test]
     fn from_row_fail_closed_unless_enabled_and_consented() {
         assert!(McpConnector::from_row_if_available(&row(false, false)).is_none());
-        assert!(McpConnector::from_row_if_available(&row(true, false)).is_none(), "unconsented");
-        assert!(McpConnector::from_row_if_available(&row(false, true)).is_none(), "disabled");
+        assert!(
+            McpConnector::from_row_if_available(&row(true, false)).is_none(),
+            "unconsented"
+        );
+        assert!(
+            McpConnector::from_row_if_available(&row(false, true)).is_none(),
+            "disabled"
+        );
         let c = McpConnector::from_row_if_available(&row(true, true)).expect("armed row builds");
         assert_eq!(c.id(), "mcp_abc123");
         assert_eq!(c.egress_class(), EgressClass::External);
-        assert_eq!(c.egress_attribution(), ("mcp_query", "MCP server (connector)"));
+        assert_eq!(
+            c.egress_attribution(),
+            ("mcp_query", "MCP server (connector)")
+        );
     }
 
     /// A stdio row with a relative path is refused even when enabled + consented (code execution
@@ -170,18 +179,31 @@ mod tests {
     #[test]
     fn pick_primary_tool_prefers_search_like_names() {
         let tools = vec![
-            McpToolInfo { name: "fetch_page".into(), description: String::new() },
-            McpToolInfo { name: "docs_search".into(), description: String::new() },
+            McpToolInfo {
+                name: "fetch_page".into(),
+                description: String::new(),
+            },
+            McpToolInfo {
+                name: "docs_search".into(),
+                description: String::new(),
+            },
         ];
         assert_eq!(pick_primary_tool(&tools).unwrap().name, "docs_search");
-        let tools = vec![
-            McpToolInfo { name: "run_query".into(), description: String::new() },
-        ];
+        let tools = vec![McpToolInfo {
+            name: "run_query".into(),
+            description: String::new(),
+        }];
         assert_eq!(pick_primary_tool(&tools).unwrap().name, "run_query");
         // No search/query-shaped tool → the first one.
         let tools = vec![
-            McpToolInfo { name: "alpha".into(), description: String::new() },
-            McpToolInfo { name: "beta".into(), description: String::new() },
+            McpToolInfo {
+                name: "alpha".into(),
+                description: String::new(),
+            },
+            McpToolInfo {
+                name: "beta".into(),
+                description: String::new(),
+            },
         ];
         assert_eq!(pick_primary_tool(&tools).unwrap().name, "alpha");
         assert!(pick_primary_tool(&[]).is_none());

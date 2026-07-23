@@ -6,6 +6,7 @@ pub mod merge;
 pub mod mixer;
 pub mod output;
 pub mod recorder;
+pub mod source;
 pub mod spill;
 pub mod system;
 pub mod tap;

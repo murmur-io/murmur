@@ -105,9 +105,6 @@ pub fn consent_to_mcp_server(
 /// Revoke an MCP server's egress consent — it drops out of the connector registry and the brain's
 /// tool list on the next build (fail-closed).
 #[tauri::command]
-pub fn revoke_mcp_consent(
-    state: State<'_, AppState>,
-    server_id: String,
-) -> Result<(), AppError> {
+pub fn revoke_mcp_consent(state: State<'_, AppState>, server_id: String) -> Result<(), AppError> {
     state.db.set_mcp_server_consented(&server_id, false)
 }

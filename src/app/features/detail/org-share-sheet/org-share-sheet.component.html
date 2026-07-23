@@ -84,6 +84,14 @@
         </div>
       } @else if (preview(); as p) {
         <pre class="preview-md" aria-label="Outgoing markdown">{{ p.markdown }}</pre>
+        @if (p.attachmentCount > 0) {
+          <p class="scrub-counts is-warn">
+            {{ p.attachmentCount }} referenced
+            {{ p.attachmentCount === 1 ? "image" : "images" }}
+            ({{ formatBytes(p.attachmentBytes) }}) leave in the same E2EE ciphertext
+            bundle. Redaction applies to text, not image pixels.
+          </p>
+        }
       }
     </div>
 
@@ -123,7 +131,8 @@
         }
       }
       <p class="scrub-note hint">
-        Person names are kept. Transcripts and audio are never shared.
+        Person names are kept. Transcripts and audio are never shared. Referenced
+        images are encrypted with the note, but their pixels are not text-redacted.
       </p>
     </div>
 

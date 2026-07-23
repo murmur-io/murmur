@@ -173,7 +173,10 @@ pub fn list_meetings_by_tag(
 
 /// Inner body of [`list_meetings_by_tag`] (unit-testable without a tauri `State`): the DB read
 /// routed through the same backend mask as [`list_meetings`].
-pub(crate) fn list_meetings_by_tag_inner(state: &AppState, tag: &str) -> Result<Vec<Meeting>, AppError> {
+pub(crate) fn list_meetings_by_tag_inner(
+    state: &AppState,
+    tag: &str,
+) -> Result<Vec<Meeting>, AppError> {
     let meetings = state.db.list_meetings_by_tag(tag)?;
     mask_locked_meetings(state, meetings)
 }
@@ -477,7 +480,8 @@ pub fn get_meeting_detail(
     state: State<'_, AppState>,
     meeting_id: String,
 ) -> Result<Option<MeetingDetailDto>, AppError> {
-    let Some(meeting) = state.db.get_meeting(&meeting_id)? else {
+    let _lifecycle = lifecycle_guard(state.inner());
+    let Some(anchor) = state.db.get_meeting_gate_anchor(&meeting_id)? else {
         return Ok(None);
     };
 
@@ -495,8 +499,12 @@ pub fn get_meeting_detail(
     // plaintext WAV that briefly survives in the scoped dir (e.g. recorded into an already-sealed
     // folder, or a crash window) can never be served to a locked meeting's view.
     if !meeting_is_unlocked(state.inner(), &meeting_id)? {
-        return Ok(Some(masked_detail(meeting)));
+        return Ok(Some(masked_detail(anchor)));
     }
+
+    let Some(meeting) = state.db.get_meeting(&meeting_id)? else {
+        return Ok(None);
+    };
 
     let note_row = state.db.get_latest_note_for_meeting(&meeting_id)?;
     // Phase 5: capture provenance from the note row BEFORE converting to NoteDto (NoteDto is a

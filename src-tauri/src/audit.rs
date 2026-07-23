@@ -206,6 +206,16 @@ pub fn run_audit_pass(
     now_ms: i64,
     seal_epoch: &AtomicU64,
 ) -> Result<AuditRunSummary> {
+    run_audit_pass_at_background_epoch(db, vault_dir, now_ms, seal_epoch, None)
+}
+
+fn run_audit_pass_at_background_epoch(
+    db: &Db,
+    vault_dir: Option<&Path>,
+    now_ms: i64,
+    seal_epoch: &AtomicU64,
+    background_epoch: Option<u64>,
+) -> Result<AuditRunSummary> {
     // Snapshot BEFORE any read — every finding insert below re-checks against this (the
     // consolidation-pass TOCTOU discipline, see the module doc).
     let epoch_at_start = seal_epoch.load(Ordering::SeqCst);
@@ -258,7 +268,16 @@ pub fn run_audit_pass(
             );
             break;
         }
-        if db.insert_audit_finding_if_new(f, &run_id, now_ms)? {
+        let inserted = match background_epoch {
+            Some(epoch) => crate::perf::with_current_background_epoch(epoch, || {
+                db.insert_audit_finding_if_new(f, &run_id, now_ms)
+            })?,
+            None => Some(db.insert_audit_finding_if_new(f, &run_id, now_ms)?),
+        };
+        let Some(inserted) = inserted else {
+            break;
+        };
+        if inserted {
             findings_new += 1;
             *counts.entry(f.kind.clone()).or_default() += 1;
         }
@@ -273,7 +292,14 @@ pub fn run_audit_pass(
     // an aborted pass.
     let counts_json = serde_json::to_string(&counts)
         .map_err(|e| crate::error::AppError::Storage(format!("counts serialize failed: {e}")))?;
-    db.insert_audit_run(&run_id, now_ms, now_ms, &counts_json)?;
+    match background_epoch {
+        Some(epoch) => {
+            let _ = crate::perf::with_current_background_epoch(epoch, || {
+                db.insert_audit_run(&run_id, now_ms, now_ms, &counts_json)
+            })?;
+        }
+        None => db.insert_audit_run(&run_id, now_ms, now_ms, &counts_json)?,
+    }
     let findings_total_pending = db.count_pending_audit_findings()?;
     tracing::info!(
         target: "audit",
@@ -359,6 +385,10 @@ pub async fn audit_weekly_tick(handle: &tauri::AppHandle) {
     let Some(state) = handle.try_state::<crate::state::AppState>() else {
         return; // init failed — nothing to audit.
     };
+    let background_epoch = crate::perf::background_epoch();
+    if !crate::perf::background_epoch_is_current(background_epoch) {
+        return;
+    }
     let enabled = state
         .config
         .lock()
@@ -387,9 +417,15 @@ pub async fn audit_weekly_tick(handle: &tauri::AppHandle) {
     }
     // CLAIM the week before running — a pass that crashes below cannot storm.
     let claim_id = uuid::Uuid::new_v4().to_string();
-    if let Err(e) = state.db.insert_scheduled_audit_run_claim(&claim_id, now_ms) {
-        tracing::warn!(target: "audit", error = %e, "weekly tick: claim insert failed; skipping");
-        return;
+    match crate::perf::with_current_background_epoch(background_epoch, || {
+        state.db.insert_scheduled_audit_run_claim(&claim_id, now_ms)
+    }) {
+        Ok(Some(())) => {}
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!(target: "audit", error = %e, "weekly tick: claim insert failed; skipping");
+            return;
+        }
     }
     // The deterministic pass on a blocking worker (the manual command's exact shape).
     let tick_handle = handle.clone();
@@ -401,11 +437,12 @@ pub async fn audit_weekly_tick(handle: &tauri::AppHandle) {
             .ok()
             .and_then(|c| c.vault_path.clone())
             .filter(|p| !p.is_empty());
-        run_audit_pass(
+        run_audit_pass_at_background_epoch(
             &state.db,
             vault.as_deref().map(Path::new),
             chrono::Utc::now().timestamp_millis(),
             &state.seal_epoch,
+            Some(background_epoch),
         )
     })
     .await;
@@ -420,7 +457,15 @@ pub async fn audit_weekly_tick(handle: &tauri::AppHandle) {
             return;
         }
     };
-    let stats = judge_run_findings(state.inner(), &summary.run_id).await;
+    // Deterministic DB/string work never pretends to be model residency: Record is free to start
+    // while it runs. If that happened, stop here. Individual inserts were already atomic against
+    // Start; do not perform a compensating DB write after recording has priority. Any rows committed
+    // before Start remain ordinary pending findings and can be judged by a later explicit pass.
+    if !crate::perf::background_epoch_is_current(background_epoch) {
+        return;
+    }
+    let stats =
+        judge_run_findings_at_epoch(state.inner(), &summary.run_id, Some(background_epoch)).await;
     let pending = state.db.count_pending_audit_findings().unwrap_or(0);
     crate::events::emit_audit_updated(handle, pending as u32);
     tracing::info!(
@@ -471,11 +516,22 @@ pub struct JudgeStats {
 /// `dedupe_key` suppression would permanently silence a real issue; a deleted finding re-stages
 /// on the next pass if the evidence recurs. A row resolved/purged since the read is left alone
 /// (`delete_pending_audit_finding` is pending-only). Logs counts only.
+#[cfg(test)]
 pub(crate) fn judge_findings_sync(
     db: &Db,
     reasoner: &dyn crate::reason::LocalReasoner,
     rows: &[AuditFindingRow],
     budget_ms: u64,
+) -> JudgeStats {
+    judge_findings_sync_guarded(db, reasoner, rows, budget_ms, None)
+}
+
+fn judge_findings_sync_guarded(
+    db: &Db,
+    reasoner: &dyn crate::reason::LocalReasoner,
+    rows: &[AuditFindingRow],
+    budget_ms: u64,
+    background_epoch: Option<u64>,
 ) -> JudgeStats {
     use std::time::{Duration, Instant};
     let deadline = Instant::now() + Duration::from_millis(budget_ms);
@@ -496,7 +552,10 @@ pub(crate) fn judge_findings_sync(
         if now >= deadline {
             break; // out of budget — the rest are kept (degrade toward keeping everything).
         }
-        let user = format!("Finding kind: {}\n\nEvidence:\n{}", row.kind, row.evidence_md);
+        let user = format!(
+            "Finding kind: {}\n\nEvidence:\n{}",
+            row.kind, row.evidence_md
+        );
         let opts = crate::reason::GenOptions {
             max_tokens: Some(JUDGE_MAX_TOKENS),
             temperature: Some(0.0),
@@ -506,16 +565,27 @@ pub(crate) fn judge_findings_sync(
         };
         match reasoner.structured_with(system, &user, &schema, opts) {
             Ok(v) => {
+                if background_epoch
+                    .is_some_and(|epoch| !crate::perf::background_epoch_is_current(epoch))
+                {
+                    return JudgeStats::default();
+                }
                 let Some(keep) = v.get("keep").and_then(|b| b.as_bool()) else {
                     continue; // malformed shape ⇒ keep (uncounted).
                 };
                 stats.judged += 1;
                 if !keep {
-                    match db.delete_pending_audit_finding(&row.id) {
-                        Ok(true) => stats.demoted += 1,
-                        Ok(false) => {} // resolved/purged since the read — left alone.
+                    let deleted = match background_epoch {
+                        Some(epoch) => crate::perf::with_current_background_epoch(epoch, || {
+                            db.delete_pending_audit_finding(&row.id)
+                        }),
+                        None => db.delete_pending_audit_finding(&row.id).map(Some),
+                    };
+                    match deleted {
+                        Ok(Some(true)) => stats.demoted += 1,
+                        Ok(Some(false)) | Ok(None) => {}
                         Err(e) => {
-                            tracing::warn!(target: "audit", error = %e, "judge demote delete failed; keeping");
+                            tracing::warn!(target: "audit", error = %e, "judge demote delete failed; keeping")
                         }
                     }
                 }
@@ -542,6 +612,17 @@ pub(crate) fn judge_findings_sync(
 /// takes the ONE global heavy-inference permit for the whole stage. Degrades to keep-everything
 /// on any failure — this function never errors.
 pub async fn judge_run_findings(state: &crate::state::AppState, run_id: &str) -> JudgeStats {
+    judge_run_findings_at_epoch(state, run_id, None).await
+}
+
+async fn judge_run_findings_at_epoch(
+    state: &crate::state::AppState,
+    run_id: &str,
+    background_epoch: Option<u64>,
+) -> JudgeStats {
+    if background_epoch.is_some_and(|epoch| !crate::perf::background_epoch_is_current(epoch)) {
+        return JudgeStats::default();
+    }
     let reasoner = state.reasoner.light();
     if reasoner.id() == "stub" {
         tracing::debug!(target: "audit", "no local light model; skipping the audit judge stage");
@@ -561,8 +642,14 @@ pub async fn judge_run_findings(state: &crate::state::AppState, run_id: &str) ->
         return JudgeStats::default();
     }
     let db = state.db.clone();
-    match crate::perf::run_heavy(&state.heavy_inference, move || {
-        Ok(judge_findings_sync(&db, reasoner.as_ref(), &rows, JUDGE_STAGE_BUDGET_MS))
+    match crate::perf::run_blocking_serialized(&state.heavy_inference, move || {
+        Ok(judge_findings_sync_guarded(
+            &db,
+            reasoner.as_ref(),
+            &rows,
+            JUDGE_STAGE_BUDGET_MS,
+            background_epoch,
+        ))
     })
     .await
     {
@@ -584,7 +671,10 @@ pub(crate) const EXPLAIN_SNIPPET_CHARS: usize = 4_000;
 /// caller's ALREADY-GATED, already-capped excerpt of the source note (current session unlock
 /// set); everything else comes off the pending row itself (pending rows hold the derived
 /// plaintext by design).
-pub(crate) fn build_explain_prompt(row: &AuditFindingRow, source_snippet: &str) -> (String, String) {
+pub(crate) fn build_explain_prompt(
+    row: &AuditFindingRow,
+    source_snippet: &str,
+) -> (String, String) {
     let system = "You are Murmur's vault-health assistant. Explain ONE automated audit finding \
                   to the user: what was detected, why it matters for their notes, and what \
                   accepting the suggested action would do. Reply in concise markdown (a short \
@@ -600,7 +690,10 @@ pub(crate) fn build_explain_prompt(row: &AuditFindingRow, source_snippet: &str) 
     }
     user.push_str(&format!("\nEvidence:\n{}\n", row.evidence_md));
     if !row.accept_action.is_empty() {
-        user.push_str(&format!("\nSuggested action on accept: {}\n", row.accept_action));
+        user.push_str(&format!(
+            "\nSuggested action on accept: {}\n",
+            row.accept_action
+        ));
     }
     if !source_snippet.trim().is_empty() {
         user.push_str(&format!(
@@ -828,8 +921,9 @@ fn orphan_pass(
 fn unlinked_mention_pass(corpus: &[CorpusDoc]) -> Vec<NewAuditFinding> {
     let mut out = Vec::new();
     for src in corpus {
-        let existing: HashSet<String> =
-            crate::storage::db::extract_wikilink_titles(&src.body).into_iter().collect();
+        let existing: HashSet<String> = crate::storage::db::extract_wikilink_titles(&src.body)
+            .into_iter()
+            .collect();
         let mut per_source = 0usize;
         for target in corpus {
             if per_source >= MAX_MENTIONS_PER_NOTE {
@@ -1064,7 +1158,11 @@ fn contradiction_pass(db: &Db, corpus: &[CorpusDoc]) -> Result<Vec<NewAuditFindi
         }
         // Deterministic order: oldest valid_from first, then id.
         let mut facts = facts.clone();
-        facts.sort_by(|a, b| a.valid_from.cmp(&b.valid_from).then_with(|| a.id.cmp(&b.id)));
+        facts.sort_by(|a, b| {
+            a.valid_from
+                .cmp(&b.valid_from)
+                .then_with(|| a.id.cmp(&b.id))
+        });
         for i in 0..facts.len() {
             for j in (i + 1)..facts.len() {
                 let (a, b) = (facts[i], facts[j]);
@@ -1289,8 +1387,10 @@ mod tests {
     #[test]
     fn mention_matcher_negatives_and_positive() {
         // Positive: word-bounded, plain prose.
-        assert!(find_unlinked_mention_line("We synced on Project Atlas today", "Project Atlas")
-            .is_some());
+        assert!(
+            find_unlinked_mention_line("We synced on Project Atlas today", "Project Atlas")
+                .is_some()
+        );
         // Too short a title (< 6 chars).
         assert!(find_unlinked_mention_line("Quick Sync today", "Sync").is_none());
         // Already linked — inside [[..]].
@@ -1366,7 +1466,12 @@ mod tests {
             // c: no links either way → ORPHAN; "Gamma Note" is mentioned (unlinked) by d.
             doc("note", "c", "Gamma Note", "isolated content\n"),
             // d mentions c's title without linking it.
-            doc("note", "d", "Delta Note", "talked about Gamma Note today [[Alpha Note]]\n"),
+            doc(
+                "note",
+                "d",
+                "Delta Note",
+                "talked about Gamma Note today [[Alpha Note]]\n",
+            ),
         ];
         let found = orphan_pass(&corpus, &HashMap::new());
         assert_eq!(found.len(), 1, "only the zero-degree note is an orphan");
@@ -1376,15 +1481,26 @@ mod tests {
             "the mentioning note is suggested: {}",
             found[0].evidence_md
         );
-        assert!(!found[0].accept_action.is_empty(), "suggestions ⇒ acceptable");
+        assert!(
+            !found[0].accept_action.is_empty(),
+            "suggestions ⇒ acceptable"
+        );
     }
 
     #[test]
     fn orphan_without_suggestions_is_dismiss_only() {
-        let corpus = vec![doc("note", "solo", "Lonely Note", "nothing links anywhere\n")];
+        let corpus = vec![doc(
+            "note",
+            "solo",
+            "Lonely Note",
+            "nothing links anywhere\n",
+        )];
         let found = orphan_pass(&corpus, &HashMap::new());
         assert_eq!(found.len(), 1);
-        assert!(found[0].accept_action.is_empty(), "no suggestions ⇒ dismiss-only");
+        assert!(
+            found[0].accept_action.is_empty(),
+            "no suggestions ⇒ dismiss-only"
+        );
     }
 
     // ── unlinked mentions (pure) ──
@@ -1415,8 +1531,14 @@ mod tests {
             .iter()
             .map(|f| f.target_title.as_deref().unwrap())
             .collect();
-        assert!(!targets.contains(&"Target Five"), "already-linked title skipped");
-        assert!(!targets.contains(&"Target Sixxx"), "code-fenced mention skipped");
+        assert!(
+            !targets.contains(&"Target Five"),
+            "already-linked title skipped"
+        );
+        assert!(
+            !targets.contains(&"Target Sixxx"),
+            "code-fenced mention skipped"
+        );
     }
 
     /// 2026-07-20 — the "Untitled" sentinel must not be a mention TARGET (same title-collision class
@@ -1427,7 +1549,12 @@ mod tests {
     fn unlinked_mention_pass_ignores_untitled_sentinel_target() {
         let corpus = vec![
             // A real note whose body names the bare word "Untitled" (word-bounded).
-            doc("note", "src", "Notes Hub", "I saved it into my Untitled draft earlier.\n"),
+            doc(
+                "note",
+                "src",
+                "Notes Hub",
+                "I saved it into my Untitled draft earlier.\n",
+            ),
             // Two never-named notes sharing the sentinel (empty-body notes are dropped from the
             // corpus, so give them content).
             doc("note", "u1", "Untitled", "scratch one\n"),
@@ -1456,12 +1583,60 @@ mod tests {
         let e = db.upsert_entity("Atlas", EntityKind::Project).unwrap();
 
         // 4 facts from m-old; 2 then superseded from m-new → ratio 0.5, total ≥ 3 → flagged.
-        add_fact(&db, &e, "Atlas", "status", "in-progress", "2026-07-01T09:00:00Z", "m-old");
-        add_fact(&db, &e, "Atlas", "owner", "Anna", "2026-07-01T09:00:00Z", "m-old");
-        add_fact(&db, &e, "Atlas", "deadline", "Q3", "2026-07-01T09:00:00Z", "m-old");
-        add_fact(&db, &e, "Atlas", "budget", "small", "2026-07-01T09:00:00Z", "m-old");
-        supersede_fact(&db, &e, "Atlas", "status", "shipped", "2026-07-05T09:00:00Z", "m-new");
-        supersede_fact(&db, &e, "Atlas", "owner", "Bob", "2026-07-05T09:00:00Z", "m-new");
+        add_fact(
+            &db,
+            &e,
+            "Atlas",
+            "status",
+            "in-progress",
+            "2026-07-01T09:00:00Z",
+            "m-old",
+        );
+        add_fact(
+            &db,
+            &e,
+            "Atlas",
+            "owner",
+            "Anna",
+            "2026-07-01T09:00:00Z",
+            "m-old",
+        );
+        add_fact(
+            &db,
+            &e,
+            "Atlas",
+            "deadline",
+            "Q3",
+            "2026-07-01T09:00:00Z",
+            "m-old",
+        );
+        add_fact(
+            &db,
+            &e,
+            "Atlas",
+            "budget",
+            "small",
+            "2026-07-01T09:00:00Z",
+            "m-old",
+        );
+        supersede_fact(
+            &db,
+            &e,
+            "Atlas",
+            "status",
+            "shipped",
+            "2026-07-05T09:00:00Z",
+            "m-new",
+        );
+        supersede_fact(
+            &db,
+            &e,
+            "Atlas",
+            "owner",
+            "Bob",
+            "2026-07-05T09:00:00Z",
+            "m-new",
+        );
 
         let corpus = build_corpus(&db).unwrap();
         let found = stale_pass(&db, &corpus).unwrap();
@@ -1486,24 +1661,75 @@ mod tests {
         seed_meeting_note(&db, "m2", "Later", "# L\n", None);
         let e = db.upsert_entity("Beta", EntityKind::Project).unwrap();
         // Only 2 facts (below the ≥3 floor) even though both get superseded.
-        add_fact(&db, &e, "Beta", "status", "alpha", "2026-07-01T09:00:00Z", "m1");
-        add_fact(&db, &e, "Beta", "owner", "Kim", "2026-07-01T09:00:00Z", "m1");
-        supersede_fact(&db, &e, "Beta", "status", "beta", "2026-07-05T09:00:00Z", "m2");
-        supersede_fact(&db, &e, "Beta", "owner", "Lee", "2026-07-05T09:00:00Z", "m2");
+        add_fact(
+            &db,
+            &e,
+            "Beta",
+            "status",
+            "alpha",
+            "2026-07-01T09:00:00Z",
+            "m1",
+        );
+        add_fact(
+            &db,
+            &e,
+            "Beta",
+            "owner",
+            "Kim",
+            "2026-07-01T09:00:00Z",
+            "m1",
+        );
+        supersede_fact(
+            &db,
+            &e,
+            "Beta",
+            "status",
+            "beta",
+            "2026-07-05T09:00:00Z",
+            "m2",
+        );
+        supersede_fact(
+            &db,
+            &e,
+            "Beta",
+            "owner",
+            "Lee",
+            "2026-07-05T09:00:00Z",
+            "m2",
+        );
         let corpus = build_corpus(&db).unwrap();
-        assert!(stale_pass(&db, &corpus).unwrap().is_empty(), "below the fact floor");
+        assert!(
+            stale_pass(&db, &corpus).unwrap().is_empty(),
+            "below the fact floor"
+        );
 
         // 4 facts, only 1 closed → ratio below 0.5 → not stale.
         let db2 = file_db("stale-ratio");
         seed_meeting_note(&db2, "m1", "Big", "# B\n", None);
         seed_meeting_note(&db2, "m2", "Later", "# L\n", None);
         let e2 = db2.upsert_entity("Gamma", EntityKind::Project).unwrap();
-        for (p, o) in [("status", "x"), ("owner", "y"), ("deadline", "z"), ("budget", "w")] {
+        for (p, o) in [
+            ("status", "x"),
+            ("owner", "y"),
+            ("deadline", "z"),
+            ("budget", "w"),
+        ] {
             add_fact(&db2, &e2, "Gamma", p, o, "2026-07-01T09:00:00Z", "m1");
         }
-        supersede_fact(&db2, &e2, "Gamma", "status", "x2", "2026-07-05T09:00:00Z", "m2");
+        supersede_fact(
+            &db2,
+            &e2,
+            "Gamma",
+            "status",
+            "x2",
+            "2026-07-05T09:00:00Z",
+            "m2",
+        );
         let corpus2 = build_corpus(&db2).unwrap();
-        assert!(stale_pass(&db2, &corpus2).unwrap().is_empty(), "ratio below half");
+        assert!(
+            stale_pass(&db2, &corpus2).unwrap().is_empty(),
+            "ratio below half"
+        );
     }
 
     // ── contradiction (file DB) ──
@@ -1516,19 +1742,74 @@ mod tests {
         let e = db.upsert_entity("Atlas", EntityKind::Project).unwrap();
 
         // Two OPEN facts, same key, different object, different source → candidate.
-        add_fact(&db, &e, "Atlas", "status", "shipped", "2026-07-01T09:00:00Z", "m-a");
-        add_fact(&db, &e, "Atlas", "Status", "cancelled", "2026-07-02T09:00:00Z", "m-b");
+        add_fact(
+            &db,
+            &e,
+            "Atlas",
+            "status",
+            "shipped",
+            "2026-07-01T09:00:00Z",
+            "m-a",
+        );
+        add_fact(
+            &db,
+            &e,
+            "Atlas",
+            "Status",
+            "cancelled",
+            "2026-07-02T09:00:00Z",
+            "m-b",
+        );
         // A CLOSED pair on another predicate — excluded (only open-open collide).
-        add_fact(&db, &e, "Atlas", "owner", "Anna", "2026-07-01T09:00:00Z", "m-a");
-        supersede_fact(&db, &e, "Atlas", "owner", "Bob", "2026-07-02T09:00:00Z", "m-b");
+        add_fact(
+            &db,
+            &e,
+            "Atlas",
+            "owner",
+            "Anna",
+            "2026-07-01T09:00:00Z",
+            "m-a",
+        );
+        supersede_fact(
+            &db,
+            &e,
+            "Atlas",
+            "owner",
+            "Bob",
+            "2026-07-02T09:00:00Z",
+            "m-b",
+        );
         // A same-source open duplicate on a third predicate — excluded (same meeting).
-        add_fact(&db, &e, "Atlas", "budget", "small", "2026-07-01T09:00:00Z", "m-a");
-        add_fact(&db, &e, "Atlas", "budget", "large", "2026-07-01T10:00:00Z", "m-a");
+        add_fact(
+            &db,
+            &e,
+            "Atlas",
+            "budget",
+            "small",
+            "2026-07-01T09:00:00Z",
+            "m-a",
+        );
+        add_fact(
+            &db,
+            &e,
+            "Atlas",
+            "budget",
+            "large",
+            "2026-07-01T10:00:00Z",
+            "m-a",
+        );
 
         let corpus = build_corpus(&db).unwrap();
         let found = contradiction_pass(&db, &corpus).unwrap();
-        assert_eq!(found.len(), 1, "exactly the open-open cross-source pair: {found:#?}");
-        assert_eq!(found[0].source_id, "m-a", "source = the OLDER fact's meeting");
+        assert_eq!(
+            found.len(),
+            1,
+            "exactly the open-open cross-source pair: {found:#?}"
+        );
+        assert_eq!(
+            found[0].source_id, "m-a",
+            "source = the OLDER fact's meeting"
+        );
         assert_eq!(found[0].target_id.as_deref(), Some("m-b"));
         assert!(found[0].evidence_md.contains("shipped"));
         assert!(found[0].evidence_md.contains("cancelled"));
@@ -1555,7 +1836,10 @@ mod tests {
         }])
         .unwrap();
         let found = contradiction_pass(&db, &corpus).unwrap();
-        assert!(found.is_empty(), "a pair pending Re-Truth review is not re-surfaced");
+        assert!(
+            found.is_empty(),
+            "a pair pending Re-Truth review is not re-surfaced"
+        );
     }
 
     // ── the lock gate: sealed content contributes NOTHING ──
@@ -1574,7 +1858,15 @@ mod tests {
             Some("f-lock"),
         );
         let e = db.upsert_entity("SecretCo", EntityKind::Project).unwrap();
-        add_fact(&db, &e, "SecretCo", "price", "5M", "2026-07-01T09:00:00Z", "m-sealed");
+        add_fact(
+            &db,
+            &e,
+            "SecretCo",
+            "price",
+            "5M",
+            "2026-07-01T09:00:00Z",
+            "m-sealed",
+        );
         // An open meeting (its own broken link keeps the pass productive). The sealed TITLE
         // deliberately exists ONLY on the sealed side — a visible body is always quotable, so
         // the leak assertion below is about the sealed side surfacing, not visible prose.
@@ -1587,9 +1879,11 @@ mod tests {
         );
         db.set_folder_locked("f-lock", true, None).unwrap();
 
-        let summary =
-            run_audit_pass(&db, None, 1_700_000_000_000, &quiet_epoch()).unwrap();
-        assert!(summary.findings_new > 0, "the open note still yields findings");
+        let summary = run_audit_pass(&db, None, 1_700_000_000_000, &quiet_epoch()).unwrap();
+        assert!(
+            summary.findings_new > 0,
+            "the open note still yields findings"
+        );
         let rows = db.list_audit_finding_rows("pending").unwrap();
         for r in &rows {
             assert_ne!(r.source_id, "m-sealed", "no finding sources sealed content");
@@ -1612,7 +1906,8 @@ mod tests {
         }
         // The sealed body's mention of the open title produced nothing sourced at the sealed note.
         assert!(
-            rows.iter().all(|r| r.kind != "unlinked_mention" || r.source_id == "m-open"),
+            rows.iter()
+                .all(|r| r.kind != "unlinked_mention" || r.source_id == "m-open"),
             "mentions only ever source from visible bodies"
         );
     }
@@ -1625,22 +1920,38 @@ mod tests {
         seed_meeting_note(&db, "m1", "Kickoff", "see [[Ghost Note]]\n", None);
 
         let first = run_audit_pass(&db, None, 1_700_000_000_000, &quiet_epoch()).unwrap();
-        assert_eq!(first.findings_new, 1, "the broken link staged once: {first:?}");
+        assert_eq!(
+            first.findings_new, 1,
+            "the broken link staged once: {first:?}"
+        );
         let second = run_audit_pass(&db, None, 1_700_000_000_001, &quiet_epoch()).unwrap();
-        assert_eq!(second.findings_new, 0, "a PENDING twin suppresses re-creation");
+        assert_eq!(
+            second.findings_new, 0,
+            "a PENDING twin suppresses re-creation"
+        );
         assert_eq!(second.findings_total_pending, 1);
 
         // DISMISS → still suppressed (don't nag again).
         let row = &db.list_audit_finding_rows("pending").unwrap()[0];
-        db.resolve_audit_finding_row(&row.id, "dismissed", 1_700_000_000_002).unwrap();
+        db.resolve_audit_finding_row(&row.id, "dismissed", 1_700_000_000_002)
+            .unwrap();
         let third = run_audit_pass(&db, None, 1_700_000_000_003, &quiet_epoch()).unwrap();
-        assert_eq!(third.findings_new, 0, "a DISMISSED twin suppresses re-creation");
+        assert_eq!(
+            third.findings_new, 0,
+            "a DISMISSED twin suppresses re-creation"
+        );
 
         // ACCEPT (simulated status flip) → the evidence persisting means it MAY recur.
-        let row_id = db.list_audit_finding_rows("dismissed").unwrap()[0].id.clone();
-        db.resolve_audit_finding_row(&row_id, "accepted", 1_700_000_000_004).unwrap();
+        let row_id = db.list_audit_finding_rows("dismissed").unwrap()[0]
+            .id
+            .clone();
+        db.resolve_audit_finding_row(&row_id, "accepted", 1_700_000_000_004)
+            .unwrap();
         let fourth = run_audit_pass(&db, None, 1_700_000_000_005, &quiet_epoch()).unwrap();
-        assert_eq!(fourth.findings_new, 1, "an ACCEPTED twin does NOT suppress recurrence");
+        assert_eq!(
+            fourth.findings_new, 1,
+            "an ACCEPTED twin does NOT suppress recurrence"
+        );
     }
 
     // ── purge-on-seal / purge-on-delete (RED→GREEN both directions) ──
@@ -1687,7 +1998,8 @@ mod tests {
             .unwrap()
             .id
             .clone();
-        db.resolve_audit_finding_row(&accepted_id, "accepted", 2).unwrap();
+        db.resolve_audit_finding_row(&accepted_id, "accepted", 2)
+            .unwrap();
 
         // The SEAL tx (lock_folder's purge leg) drops EVERY pending row.
         db.set_folder_locked("f1", true, None).unwrap();
@@ -1714,11 +2026,51 @@ mod tests {
         seed_meeting_note(&db, "m-old", "Planning", "# Plan\n", None);
         seed_meeting_note(&db, "m-new", "Review", "# Review\n", Some("f-r"));
         let e = db.upsert_entity("Atlas", EntityKind::Project).unwrap();
-        add_fact(&db, &e, "Atlas", "status", "in-progress", "2026-07-01T09:00:00Z", "m-old");
-        add_fact(&db, &e, "Atlas", "owner", "Anna", "2026-07-01T09:00:00Z", "m-old");
-        add_fact(&db, &e, "Atlas", "deadline", "Q3", "2026-07-01T09:00:00Z", "m-old");
-        supersede_fact(&db, &e, "Atlas", "status", "shipped", "2026-07-05T09:00:00Z", "m-new");
-        supersede_fact(&db, &e, "Atlas", "owner", "Bob", "2026-07-05T09:00:00Z", "m-new");
+        add_fact(
+            &db,
+            &e,
+            "Atlas",
+            "status",
+            "in-progress",
+            "2026-07-01T09:00:00Z",
+            "m-old",
+        );
+        add_fact(
+            &db,
+            &e,
+            "Atlas",
+            "owner",
+            "Anna",
+            "2026-07-01T09:00:00Z",
+            "m-old",
+        );
+        add_fact(
+            &db,
+            &e,
+            "Atlas",
+            "deadline",
+            "Q3",
+            "2026-07-01T09:00:00Z",
+            "m-old",
+        );
+        supersede_fact(
+            &db,
+            &e,
+            "Atlas",
+            "status",
+            "shipped",
+            "2026-07-05T09:00:00Z",
+            "m-new",
+        );
+        supersede_fact(
+            &db,
+            &e,
+            "Atlas",
+            "owner",
+            "Bob",
+            "2026-07-05T09:00:00Z",
+            "m-new",
+        );
 
         // Stage the REAL stale finding: source = the open m-old, evidence cites [[Review]],
         // target_id None — exactly the shape an id-matched purge can never reach.
@@ -1730,12 +2082,19 @@ mod tests {
             "precondition: the evidence cites the third-party title: {}",
             stale[0].evidence_md
         );
-        assert!(stale[0].target_id.is_none(), "precondition: no id for the citation");
-        assert!(db.insert_audit_finding_if_new(&stale[0], "run-3p", 1).unwrap());
+        assert!(
+            stale[0].target_id.is_none(),
+            "precondition: no id for the citation"
+        );
+        assert!(db
+            .insert_audit_finding_if_new(&stale[0], "run-3p", 1)
+            .unwrap());
 
         // Seal REVIEW's folder (the lock_folder purge leg for ITS meeting only).
         db.set_folder_locked("f-r", true, None).unwrap();
-        let _ = db.purge_chunks_for_meetings(&["m-new".to_string()]).unwrap();
+        let _ = db
+            .purge_chunks_for_meetings(&["m-new".to_string()])
+            .unwrap();
 
         let pending = db.list_audit_finding_rows("pending").unwrap();
         assert!(
@@ -1759,7 +2118,8 @@ mod tests {
         let db = file_db("purge-relock");
         make_folder(&db, "f1", "Secret");
         seed_meeting_note(&db, "m1", "Sealed", "# S\n", Some("f1"));
-        db.insert_document("d1", "f1", "note-a", "body", "note", 1).unwrap();
+        db.insert_document("d1", "f1", "note-a", "body", "note", 1)
+            .unwrap();
         stage_finding(&db, "m1", None, "k-meeting");
         stage_finding(&db, "d1", None, "k-doc");
         stage_finding(&db, "m-else", Some("d1"), "k-doc-target");
@@ -1780,7 +2140,8 @@ mod tests {
         let db = file_db("purge-startup");
         make_folder(&db, "f1", "Secret");
         seed_meeting_note(&db, "m1", "Sealed", "# S\n", Some("f1"));
-        db.insert_document("d1", "f1", "note-a", "body", "note", 1).unwrap();
+        db.insert_document("d1", "f1", "note-a", "body", "note", 1)
+            .unwrap();
         db.set_folder_locked("f1", true, None).unwrap();
         stage_finding(&db, "m1", None, "k-meeting");
         stage_finding(&db, "d1", None, "k-doc");
@@ -1800,7 +2161,8 @@ mod tests {
         let db = file_db("purge-delete");
         seed_meeting_note(&db, "m1", "Doomed", "# D\n", None);
         make_folder(&db, "fn1", "Notes");
-        db.insert_document("d1", "fn1", "note-a", "body", "note", 1).unwrap();
+        db.insert_document("d1", "fn1", "note-a", "body", "note", 1)
+            .unwrap();
         stage_finding(&db, "m1", None, "k-m");
         stage_finding(&db, "m-x", Some("m1"), "k-m-target");
         stage_finding(&db, "d1", None, "k-d");
@@ -1810,7 +2172,11 @@ mod tests {
         db.delete_document("d1").unwrap();
 
         let pending = db.list_audit_finding_rows("pending").unwrap();
-        assert_eq!(pending.len(), 1, "delete purges by source AND target: {pending:#?}");
+        assert_eq!(
+            pending.len(),
+            1,
+            "delete purges by source AND target: {pending:#?}"
+        );
         assert_eq!(pending[0].dedupe_key, "k-keep");
     }
 
@@ -1855,8 +2221,14 @@ mod tests {
         let row = db.get_audit_finding(&id).unwrap().unwrap();
         assert_eq!(row.status, "dismissed");
         assert_eq!(row.resolved_at, Some(5));
-        assert!(row.evidence_md.is_empty(), "dismiss blanks the derived plaintext");
-        assert!(row.accept_action.is_empty(), "dismiss blanks the accept action");
+        assert!(
+            row.evidence_md.is_empty(),
+            "dismiss blanks the derived plaintext"
+        );
+        assert!(
+            row.accept_action.is_empty(),
+            "dismiss blanks the accept action"
+        );
 
         db.insert_audit_finding_if_new(
             &NewAuditFinding {
@@ -1886,7 +2258,10 @@ mod tests {
         db.resolve_audit_finding_row(&id2, "accepted", 6).unwrap();
         let row2 = db.get_audit_finding(&id2).unwrap().unwrap();
         assert_eq!(row2.status, "accepted");
-        assert!(row2.evidence_md.is_empty(), "accept blanks the derived plaintext too");
+        assert!(
+            row2.evidence_md.is_empty(),
+            "accept blanks the derived plaintext too"
+        );
         assert!(row2.accept_action.is_empty());
     }
 
@@ -1955,8 +2330,14 @@ mod tests {
             .clone();
         db.resolve_audit_finding_row(&id2, "accepted", 6).unwrap();
         let row2 = db.get_audit_finding(&id2).unwrap().unwrap();
-        assert!(row2.source_title.is_empty(), "accept blanks the source title");
-        assert!(row2.target_title.is_none(), "accept blanks the target title");
+        assert!(
+            row2.source_title.is_empty(),
+            "accept blanks the source title"
+        );
+        assert!(
+            row2.target_title.is_none(),
+            "accept blanks the target title"
+        );
     }
 
     /// Lock review: `dedupe_key` outlives resolve (dismissed suppression), so it must carry ZERO
@@ -1975,13 +2356,17 @@ mod tests {
         assert_eq!(broken.len(), 2);
         for f in &broken {
             assert!(
-                !f.dedupe_key.contains("SECRET") && !f.dedupe_key.contains("Ghost")
+                !f.dedupe_key.contains("SECRET")
+                    && !f.dedupe_key.contains("Ghost")
                     && !f.dedupe_key.contains("Missing"),
                 "broken_link key carries title material: {}",
                 f.dedupe_key
             );
         }
-        assert_ne!(broken[0].dedupe_key, broken[1].dedupe_key, "distinct per target");
+        assert_ne!(
+            broken[0].dedupe_key, broken[1].dedupe_key,
+            "distinct per target"
+        );
         // Deterministic: a second pass over the same corpus regenerates identical keys (this is
         // what keeps dismissed suppression working).
         let again = broken_link_pass(&corpus, &mut |_| Ok(false)).unwrap();
@@ -2007,7 +2392,8 @@ mod tests {
         let db = file_db("purge-discard");
         make_folder(&db, "f1", "Secret");
         seed_meeting_note(&db, "m1", "Sealed", "# S\n", Some("f1"));
-        db.insert_document("d1", "f1", "note-a", "body", "note", 1).unwrap();
+        db.insert_document("d1", "f1", "note-a", "body", "note", 1)
+            .unwrap();
         db.set_folder_locked("f1", true, None).unwrap();
         stage_finding(&db, "m1", None, "k-m");
         stage_finding(&db, "d1", None, "k-d");
@@ -2061,7 +2447,11 @@ mod tests {
         assert_eq!(n, 0, "an interleaved run reports zero staged");
         assert!(c.is_empty());
         let pending = db.list_audit_finding_rows("pending").unwrap();
-        assert_eq!(pending.len(), 1, "only the other run's row survives: {pending:#?}");
+        assert_eq!(
+            pending.len(),
+            1,
+            "only the other run's row survives: {pending:#?}"
+        );
         assert_eq!(pending[0].dedupe_key, "k-other-run");
     }
 
@@ -2075,13 +2465,25 @@ mod tests {
         assert!(weekly_due(now, None, true));
         // Disabled → never due, even never-ran.
         assert!(!weekly_due(now, None, false));
-        assert!(!weekly_due(now, Some(now - WEEKLY_AUDIT_INTERVAL_MS - 1), false));
+        assert!(!weekly_due(
+            now,
+            Some(now - WEEKLY_AUDIT_INTERVAL_MS - 1),
+            false
+        ));
         // Ran 6 days ago → holds.
-        assert!(!weekly_due(now, Some(now - WEEKLY_AUDIT_INTERVAL_MS + 1), true));
+        assert!(!weekly_due(
+            now,
+            Some(now - WEEKLY_AUDIT_INTERVAL_MS + 1),
+            true
+        ));
         // EXACTLY a week ago → fires (>= — a late hourly tick still catches up).
         assert!(weekly_due(now, Some(now - WEEKLY_AUDIT_INTERVAL_MS), true));
         // Over a week ago → fires.
-        assert!(weekly_due(now, Some(now - WEEKLY_AUDIT_INTERVAL_MS - 3_600_000), true));
+        assert!(weekly_due(
+            now,
+            Some(now - WEEKLY_AUDIT_INTERVAL_MS - 3_600_000),
+            true
+        ));
         // Clock skew (a claim stamped in the future) → holds, never a storm.
         assert!(!weekly_due(now, Some(now + 60_000), true));
     }
@@ -2116,7 +2518,8 @@ mod tests {
 
         // The NEWEST claim wins.
         let t1 = t0 + WEEKLY_AUDIT_INTERVAL_MS;
-        db.insert_scheduled_audit_run_claim("r-claim-2", t1).unwrap();
+        db.insert_scheduled_audit_run_claim("r-claim-2", t1)
+            .unwrap();
         assert_eq!(db.last_scheduled_audit_run_finished_at().unwrap(), Some(t1));
     }
 
@@ -2132,7 +2535,12 @@ mod tests {
     }
     impl VerdictReasoner {
         fn keeping(verdicts: Vec<Option<bool>>) -> Self {
-            Self { verdicts, calls: std::sync::atomic::AtomicUsize::new(0), fail: false, delay_ms: 0 }
+            Self {
+                verdicts,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                fail: false,
+                delay_ms: 0,
+            }
         }
     }
     impl crate::reason::LocalReasoner for VerdictReasoner {
@@ -2159,6 +2567,30 @@ mod tests {
                 Some(keep) => Ok(serde_json::json!({ "keep": keep })),
                 None => Ok(serde_json::json!({ "not_the_schema": 1 })),
             }
+        }
+    }
+
+    /// Simulates the monotonic priority-epoch change made by a recording start racing with an
+    /// already-dispatched local judge call. The coordinator tests separately bind that epoch bump
+    /// to `begin_recording_session`.
+    struct RecordingStartsDuringVerdict;
+    impl crate::reason::LocalReasoner for RecordingStartsDuringVerdict {
+        fn id(&self) -> &str {
+            "judge-recording-race"
+        }
+
+        fn reason(&self, _s: &str, _u: &str) -> Result<String> {
+            Ok(String::new())
+        }
+
+        fn structured(
+            &self,
+            _s: &str,
+            _u: &str,
+            _schema: &serde_json::Value,
+        ) -> Result<serde_json::Value> {
+            crate::perf::invalidate_background_epoch_for_test();
+            Ok(serde_json::json!({ "keep": false }))
         }
     }
 
@@ -2204,7 +2636,10 @@ mod tests {
             JUDGE_STAGE_BUDGET_MS,
         );
         assert_eq!((stats.judged, stats.demoted), (2, 1));
-        assert!(db.get_audit_finding(&kept.id).unwrap().is_some(), "keep=true survives");
+        assert!(
+            db.get_audit_finding(&kept.id).unwrap().is_some(),
+            "keep=true survives"
+        );
         assert!(
             db.get_audit_finding(&demoted.id).unwrap().is_none(),
             "keep=false is DELETED (not dismissed)"
@@ -2266,9 +2701,38 @@ mod tests {
 
         // The STUB reasoner's reply carries no `keep` key either → the same keep-everything path
         // (the orchestrator additionally skips the stage entirely on id() == "stub").
-        let stats = judge_findings_sync(&db, &crate::reason::StubReasoner, &rows, JUDGE_STAGE_BUDGET_MS);
+        let stats = judge_findings_sync(
+            &db,
+            &crate::reason::StubReasoner,
+            &rows,
+            JUDGE_STAGE_BUDGET_MS,
+        );
         assert_eq!((stats.judged, stats.demoted), (0, 0));
         assert_eq!(db.list_audit_finding_rows("pending").unwrap().len(), 2);
+    }
+
+    /// A verdict returned after recording priority starts is discarded wholesale. In particular,
+    /// `keep=false` must not delete the pending finding even when the recording owner has already
+    /// gone away by the time the caller checks the epoch.
+    #[test]
+    fn judge_discards_post_dispatch_output_after_recording_start() {
+        let db = file_db("judge-recording-epoch");
+        let row = stage_judged_finding(&db, "k-recording-race", "stale");
+        let epoch = crate::perf::background_epoch();
+
+        let stats = judge_findings_sync_guarded(
+            &db,
+            &RecordingStartsDuringVerdict,
+            std::slice::from_ref(&row),
+            JUDGE_STAGE_BUDGET_MS,
+            Some(epoch),
+        );
+
+        assert_eq!((stats.judged, stats.demoted), (0, 0));
+        assert!(
+            db.get_audit_finding(&row.id).unwrap().is_some(),
+            "stale post-dispatch output cannot delete a finding"
+        );
     }
 
     /// A slow first call blows the stage deadline: later findings are NEVER judged (kept), and
@@ -2289,7 +2753,10 @@ mod tests {
             delay_ms: 60,
         };
         let stats = judge_findings_sync(&db, &slow, &[r1.clone(), r2.clone()], 30);
-        assert!(stats.judged <= 1, "at most the first row is judged: {stats:?}");
+        assert!(
+            stats.judged <= 1,
+            "at most the first row is judged: {stats:?}"
+        );
         assert!(
             db.get_audit_finding(&r2.id).unwrap().is_some(),
             "a past-deadline row is kept"
@@ -2299,7 +2766,12 @@ mod tests {
         let r3 = stage_judged_finding(&db, "k-resolved", "stale");
         db.resolve_audit_finding_row(&r3.id, "accepted", 5).unwrap();
         let demote = VerdictReasoner::keeping(vec![Some(false)]);
-        let stats = judge_findings_sync(&db, &demote, std::slice::from_ref(&r3), JUDGE_STAGE_BUDGET_MS);
+        let stats = judge_findings_sync(
+            &db,
+            &demote,
+            std::slice::from_ref(&r3),
+            JUDGE_STAGE_BUDGET_MS,
+        );
         assert_eq!(stats.demoted, 0, "a resolved row is never deleted");
         assert_eq!(
             db.get_audit_finding(&r3.id).unwrap().unwrap().status,
@@ -2330,7 +2802,10 @@ mod tests {
             resolved_at: None,
         };
         let (system, user) = build_explain_prompt(&row, "the gated excerpt");
-        assert!(system.contains("do not invent"), "grounding instruction present");
+        assert!(
+            system.contains("do not invent"),
+            "grounding instruction present"
+        );
         assert!(user.contains("contradiction"));
         assert!(user.contains("Meeting A") && user.contains("Meeting B"));
         assert!(user.contains("shipped") && user.contains("cancelled"));

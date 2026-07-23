@@ -291,7 +291,6 @@ pub async fn download_model(
     Ok(path.to_string_lossy().to_string())
 }
 
-
 /// Download the OPTIONAL parakeet live-ASR engine's four int8 models (~600 MB) from the csukuangfj
 /// sherpa-onnx HF mirror into `<models_dir>/parakeet-tdt-0.6b-v3-int8` if missing (atomic per-file
 /// `.part` → rename; a file already present is skipped). Emits the SAME
@@ -467,11 +466,20 @@ pub async fn reindex_embeddings(
     let db = state.db.clone();
     let heavy_inference = state.heavy_inference.clone();
     crate::perf::run_heavy(&heavy_inference, move || {
+        let model_present = crate::embed::embed_model_present();
+        // The absent-model branch only performs model-independent document chunk/FTS work. The
+        // present branch persists vectors, so it must pin one REAL model and fail rather than ever
+        // falling back to StubEmbedder between reindex sub-batches.
+        let embedder: Box<dyn crate::embed::Embedder> = if model_present {
+            crate::embed::active_persistence_embedder()?
+        } else {
+            Box::new(crate::embed::StubEmbedder)
+        };
         reindex_embeddings_inner(
             &db,
             &unlocked,
-            crate::embed::embed_model_present(),
-            crate::embed::active_embedder().as_ref(),
+            model_present,
+            embedder.as_ref(),
             |done, total| {
                 let _ = app.emit(
                     crate::events::EVENT_REINDEX,
@@ -482,4 +490,3 @@ pub async fn reindex_embeddings(
     })
     .await
 }
-

@@ -60,7 +60,15 @@ pub fn classify_query(query: &str) -> QueryClass {
     // the shadow-router parity data (adversarial finding 2026-07-10). "online" was dropped — as a
     // standalone word it describes owned content ("trendy sprzedaży online") as often as the web.
     const EXTERNAL: &[&str] = &[
-        "web", "google", "news", "weather", "pogoda", "jira", "slack", "internet", "wyszukaj w",
+        "web",
+        "google",
+        "news",
+        "weather",
+        "pogoda",
+        "jira",
+        "slack",
+        "internet",
+        "wyszukaj w",
         "search the",
     ];
     const SYNTHESIS: &[&str] = &[
@@ -354,14 +362,35 @@ mod tests {
     /// External > Synthesis > Recall, and the Unknown default.
     #[test]
     fn classify_query_keywords_and_precedence() {
-        assert_eq!(classify_query("what did we decide on pricing?"), QueryClass::Recall);
-        assert_eq!(classify_query("co ustaliliśmy z Weroniką?"), QueryClass::Recall);
+        assert_eq!(
+            classify_query("what did we decide on pricing?"),
+            QueryClass::Recall
+        );
+        assert_eq!(
+            classify_query("co ustaliliśmy z Weroniką?"),
+            QueryClass::Recall
+        );
         assert_eq!(classify_query("kiedy był deadline?"), QueryClass::Recall);
-        assert_eq!(classify_query("summarize the last three syncs"), QueryClass::Synthesis);
-        assert_eq!(classify_query("podsumuj to spotkanie"), QueryClass::Synthesis);
-        assert_eq!(classify_query("porównaj oba podejścia"), QueryClass::Synthesis);
-        assert_eq!(classify_query("jaka jest pogoda w Krakowie"), QueryClass::External);
-        assert_eq!(classify_query("check Jira for the login bug"), QueryClass::External);
+        assert_eq!(
+            classify_query("summarize the last three syncs"),
+            QueryClass::Synthesis
+        );
+        assert_eq!(
+            classify_query("podsumuj to spotkanie"),
+            QueryClass::Synthesis
+        );
+        assert_eq!(
+            classify_query("porównaj oba podejścia"),
+            QueryClass::Synthesis
+        );
+        assert_eq!(
+            classify_query("jaka jest pogoda w Krakowie"),
+            QueryClass::External
+        );
+        assert_eq!(
+            classify_query("check Jira for the login bug"),
+            QueryClass::External
+        );
         // Precedence: an external keyword wins even when a synthesis keyword is present.
         assert_eq!(
             classify_query("summarize the news about the acquisition"),
@@ -395,7 +424,10 @@ mod tests {
             "standalone 'online' is too ambiguous to mean External"
         );
         // The genuine whole-word External hits keep firing.
-        assert_eq!(classify_query("search the web for it"), QueryClass::External);
+        assert_eq!(
+            classify_query("search the web for it"),
+            QueryClass::External
+        );
         assert_eq!(
             classify_query("summarize the news about the acquisition"),
             QueryClass::External

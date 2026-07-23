@@ -29,6 +29,13 @@ test("source-picker teleports on-anchor and stays dismissable (scrim + Escape), 
   });
   await page.goto("/notes/n1");
 
+  // The note chat is intentionally collapsed by default; open the real drawer before testing its
+  // picker. The old fixture implicitly relied on a persisted localStorage preference and failed in
+  // a clean browser context on both engines.
+  const askBrain = page.locator("app-note-editor .head-chat-btn");
+  await expect(askBrain).toBeVisible();
+  await askBrain.click();
+
   const picker = page.locator("app-note-chat mur-source-picker");
   await expect(picker).toBeVisible();
   const trigger = picker.locator(".sp-trigger");
@@ -48,12 +55,23 @@ test("source-picker teleports on-anchor and stays dismissable (scrim + Escape), 
       .querySelector("app-note-chat .sp-trigger")!
       .getBoundingClientRect();
     const p = document.querySelector(".sp-pop")!.getBoundingClientRect();
-    return { dLeft: Math.abs(p.left - t.left), below: p.top >= t.top };
+    const expectedLeft = Math.max(
+      8,
+      Math.min(t.left, window.innerWidth - p.width - 8),
+    );
+    let expectedTop = t.bottom + 4;
+    if (expectedTop + p.height > window.innerHeight - 8) {
+      expectedTop = Math.max(8, t.top - p.height - 4);
+    }
+    return {
+      dLeft: Math.abs(p.left - expectedLeft),
+      dTop: Math.abs(p.top - expectedTop),
+    };
   });
-  // On-anchor: aligned to the trigger's left and below it — NOT shoved hundreds of
-  // px away by the card's box (the containing-block bug the teleport fixes).
-  expect(geo.dLeft).toBeLessThan(60);
-  expect(geo.below).toBe(true);
+  // On-anchor: aligned to the trigger or the component's intentional viewport-edge clamps (which
+  // may flip the panel above in the compact test window), not to the old transformed card box.
+  expect(geo.dLeft).toBeLessThan(2);
+  expect(geo.dTop).toBeLessThan(2);
 
   // --- Dismiss #1: outside click (the full-viewport scrim) → gone, no orphan.
   await page.mouse.click(4, 4);

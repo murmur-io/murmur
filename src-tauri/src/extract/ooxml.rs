@@ -163,7 +163,8 @@ fn read_capped<R: Read>(reader: R, budget: &mut DecompressBudget) -> Result<Stri
         ));
     }
     budget.remaining -= read;
-    String::from_utf8(buf).map_err(|e| AppError::InvalidArg(format!("could not decode OOXML entry: {e}")))
+    String::from_utf8(buf)
+        .map_err(|e| AppError::InvalidArg(format!("could not decode OOXML entry: {e}")))
 }
 
 /// The local name of an element (strip the `w:` / `a:` / `p:` namespace prefix).
@@ -489,7 +490,12 @@ fn parse_docx_xml(xml: &str, style_headings: &StyleHeadings) -> Result<Vec<Extra
                         if !tail.is_empty() {
                             cells.push(tail.to_string());
                         }
-                        deposit_docx_row(tables.last_mut(), &mut blocks, &headings, cells.join(" | "));
+                        deposit_docx_row(
+                            tables.last_mut(),
+                            &mut blocks,
+                            &headings,
+                            cells.join(" | "),
+                        );
                     }
                 }
                 b"p" => {
@@ -706,8 +712,8 @@ mod tests {
         let mut cursor = std::io::Cursor::new(Vec::new());
         {
             let mut zw = zip::ZipWriter::new(&mut cursor);
-            let opts: zip::write::FileOptions<'_, ()> =
-                zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+            let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
             for (name, content) in entries {
                 zw.start_file(*name, opts).unwrap();
                 zw.write_all(content.as_bytes()).unwrap();
@@ -753,14 +759,20 @@ mod tests {
 
         // Body paragraphs: budget (under Design), Anna (under Design › Storage), + 2 table rows.
         let budget = blocks.iter().find(|b| b.text.contains("budget")).unwrap();
-        assert_eq!(budget.text, "The budget is 100k.", "w:t runs must concatenate");
+        assert_eq!(
+            budget.text, "The budget is 100k.",
+            "w:t runs must concatenate"
+        );
         assert_eq!(budget.heading_path.as_deref(), Some("Design"));
 
         let anna = blocks.iter().find(|b| b.text.contains("Anna")).unwrap();
         assert_eq!(anna.heading_path.as_deref(), Some("Design › Storage"));
 
         let header_row = blocks.iter().find(|b| b.text.contains("Owner")).unwrap();
-        assert_eq!(header_row.text, "Name | Owner", "table row → pipe-delimited");
+        assert_eq!(
+            header_row.text, "Name | Owner",
+            "table row → pipe-delimited"
+        );
         assert_eq!(header_row.heading_path.as_deref(), Some("Design › Storage"));
         assert!(
             blocks.iter().any(|b| b.text == "API | Bob"),
@@ -768,7 +780,9 @@ mod tests {
         );
         // Headings themselves are NOT emitted as content blocks.
         assert!(
-            !blocks.iter().any(|b| b.text == "Design" || b.text == "Storage"),
+            !blocks
+                .iter()
+                .any(|b| b.text == "Design" || b.text == "Storage"),
             "heading text must not become a content block"
         );
         // Every block has page None (DOCX is a flow format).
@@ -891,10 +905,7 @@ mod tests {
     fn guard_zip_rejects_bomb_across_entries() {
         // Two entries of 3 KiB each = 6 KiB total, against a 4 KiB ceiling → tripped.
         let big = "Z".repeat(3072);
-        let p = build_ooxml(
-            "xlsx",
-            &[("xl/a.xml", &big), ("xl/b.xml", &big)],
-        );
+        let p = build_ooxml("xlsx", &[("xl/a.xml", &big), ("xl/b.xml", &big)]);
         let err = guard_zip_with_ceiling(&p, 4096).unwrap_err();
         assert!(
             matches!(&err, AppError::InvalidArg(m) if m.contains("zip bomb")),
@@ -919,7 +930,10 @@ mod tests {
     fn production_ceiling_leaves_normal_docx_unaffected() {
         let p = build_ooxml("docx", &[("word/document.xml", DOCX_XML)]);
         let blocks = extract_docx(&p).unwrap();
-        assert!(!blocks.is_empty(), "a normal DOCX must extract under the production ceiling");
+        assert!(
+            !blocks.is_empty(),
+            "a normal DOCX must extract under the production ceiling"
+        );
     }
 
     // ── OOXML FIDELITY (audit fixes: nested tables, localized headings, whitespace, field junk) ──
@@ -961,7 +975,10 @@ mod tests {
             all.contains("OUTER TEXT"),
             "outer-cell text captured before the nested table must survive; got: {all:?}"
         );
-        assert!(all.contains("INNER"), "nested-table text must extract; got: {all:?}");
+        assert!(
+            all.contains("INNER"),
+            "nested-table text must extract; got: {all:?}"
+        );
         assert!(
             all.contains("AFTER"),
             "outer-cell text after the nested table must survive; got: {all:?}"
@@ -972,7 +989,10 @@ mod tests {
             all.find("INNER").unwrap(),
             all.find("AFTER").unwrap(),
         );
-        assert!(a < b && b < c && c < d, "reading order must be preserved; got: {all:?}");
+        assert!(
+            a < b && b < c && c < d,
+            "reading order must be preserved; got: {all:?}"
+        );
     }
 
     /// Localized Word heading styles (a Polish `Nagłówek1`, no English `heading` prefix) resolve
@@ -1095,7 +1115,10 @@ mod tests {
             !all.contains("PAGEREF"),
             "field-instruction junk must be suppressed; got: {all:?}"
         );
-        assert!(all.contains("Chapter one"), "real run text must survive; got: {all:?}");
+        assert!(
+            all.contains("Chapter one"),
+            "real run text must survive; got: {all:?}"
+        );
     }
 
     /// Tracked-changes DELETED text (`w:delText`) must not be resurrected into the brain — the
@@ -1136,8 +1159,10 @@ mod tests {
 </w:document>"#;
         let p = build_ooxml("docx", &[("word/document.xml", XML)]);
         let blocks = extract_docx(&p).unwrap();
-        assert!(!blocks.iter().any(|b| b.text.contains("PAGEREF")),
-            "deleted field-instruction text (w:delInstrText) must not leak: {blocks:?}");
+        assert!(
+            !blocks.iter().any(|b| b.text.contains("PAGEREF")),
+            "deleted field-instruction text (w:delInstrText) must not leak: {blocks:?}"
+        );
     }
 
     /// A layout break (`w:br`) inside a DELETED run (`w:del`) must emit NOTHING — suppressing only
@@ -1152,7 +1177,11 @@ mod tests {
 </w:document>"#;
         let p = build_ooxml("docx", &[("word/document.xml", XML)]);
         let blocks = extract_docx(&p).unwrap();
-        assert_eq!(blocks[0].text, "AB", "a break inside a suppressed run must emit nothing (got {:?})", blocks[0].text);
+        assert_eq!(
+            blocks[0].text, "AB",
+            "a break inside a suppressed run must emit nothing (got {:?})",
+            blocks[0].text
+        );
     }
 
     /// A PPTX slide table (`p:graphicFrame` → `a:tbl`) lives OUTSIDE any `p:sp` shape — its cells

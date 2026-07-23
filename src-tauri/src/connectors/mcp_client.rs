@@ -102,7 +102,10 @@ impl McpClient {
     /// JSON-RPC `tools/call` — run one tool, returning its concatenated text content.
     pub async fn call_tool(&self, name: &str, arguments: Value) -> Result<String, ConnectorError> {
         let result = self
-            .rpc("tools/call", json!({ "name": name, "arguments": arguments }))
+            .rpc(
+                "tools/call",
+                json!({ "name": name, "arguments": arguments }),
+            )
             .await?;
         Ok(parse_tool_result_text(&result))
     }
@@ -111,9 +114,7 @@ impl McpClient {
     async fn rpc(&self, method: &str, params: Value) -> Result<Value, ConnectorError> {
         match &self.transport {
             McpTransport::Http { endpoint } => http_rpc(endpoint, method, params).await,
-            McpTransport::Stdio { command, args } => {
-                stdio_rpc(command, args, method, params).await
-            }
+            McpTransport::Stdio { command, args } => stdio_rpc(command, args, method, params).await,
         }
     }
 }
@@ -351,7 +352,9 @@ async fn read_response(
             .ok_or_else(|| ConnectorError::Failed("mcp stdio closed before responding".into()))?;
         read_bytes = read_bytes.saturating_add(line.len());
         if read_bytes > STDIO_MAX_OUTPUT {
-            return Err(ConnectorError::Failed("mcp stdio output over budget".into()));
+            return Err(ConnectorError::Failed(
+                "mcp stdio output over budget".into(),
+            ));
         }
         let Ok(msg) = serde_json::from_str::<Value>(&line) else {
             continue; // non-JSON noise on stdout — skip.

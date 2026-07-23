@@ -341,7 +341,9 @@ mod tests {
     #[test]
     fn page_needs_ocr_decides_per_page() {
         // A real text-layer page (≥ 16 chars) does NOT need OCR.
-        assert!(!page_needs_ocr("This page has a real, extractable text layer."));
+        assert!(!page_needs_ocr(
+            "This page has a real, extractable text layer."
+        ));
         // An empty page (a scanned/image page with no text layer) needs OCR.
         assert!(page_needs_ocr(""));
         assert!(page_needs_ocr("   \n  "));
@@ -350,8 +352,8 @@ mod tests {
         // Exactly at the threshold (16 chars) counts as a text layer (no OCR).
         assert!(!page_needs_ocr("abcdefghijklmnop")); // 16 chars
         assert!(page_needs_ocr("abcdefghijklmno")); // 15 chars → OCR
-        // Character count, not byte count: a short Polish heading is judged by glyphs. "zażółć gęślą"
-        // is 12 chars (< 16) → OCR, even though its UTF-8 byte length is larger.
+                                                    // Character count, not byte count: a short Polish heading is judged by glyphs. "zażółć gęślą"
+                                                    // is 12 chars (< 16) → OCR, even though its UTF-8 byte length is larger.
         assert!(page_needs_ocr("zażółć gęślą"));
     }
 
@@ -363,6 +365,9 @@ mod tests {
     fn max_ocr_pages_is_bounded() {
         // Pinned to the documented value: generous (a full scanned book) yet finite (bounds the
         // worst-case OCR work + heavy-permit hold). A change here is a deliberate policy change.
-        assert_eq!(MAX_OCR_PAGES, 300, "the OCR page cap is the documented bound");
+        assert_eq!(
+            MAX_OCR_PAGES, 300,
+            "the OCR page cap is the documented bound"
+        );
     }
 }
