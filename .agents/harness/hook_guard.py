@@ -1049,6 +1049,10 @@ def _init_repo(path: Path) -> None:
     _run(["git", "config", "user.name", "Harness Selftest"], path)
     _run(["git", "config", "user.email", "harness@example.invalid"], path)
     (path / "base.txt").write_text("base\n", encoding="utf-8")
+    toolchain = SOURCE_ROOT / "rust-toolchain.toml"
+    if not toolchain.is_file():
+        raise GuardFailure("hook selftest requires the repository Rust toolchain pin")
+    (path / "rust-toolchain.toml").write_bytes(toolchain.read_bytes())
     cargo_src = path / "src-tauri" / "src"
     cargo_src.mkdir(parents=True)
     (path / "src-tauri" / "Cargo.toml").write_text(
@@ -1059,7 +1063,17 @@ def _init_repo(path: Path) -> None:
         "#[cfg(test)] mod tests { #[test] fn smoke() { assert_eq!(2 + 2, 4); } }\n",
         encoding="utf-8",
     )
-    _run(["git", "add", "base.txt", "src-tauri/Cargo.toml", "src-tauri/src/lib.rs"], path)
+    _run(
+        [
+            "git",
+            "add",
+            "base.txt",
+            "rust-toolchain.toml",
+            "src-tauri/Cargo.toml",
+            "src-tauri/src/lib.rs",
+        ],
+        path,
+    )
     _run(["git", "commit", "-q", "-m", "base"], path)
 
 
@@ -1119,8 +1133,14 @@ def _write_receipt(repo: Path, task_id: str, *, risk: bool = False) -> Tuple[Pat
     diff = runner.staged_diff(top)
     diff_hash = _sha256(diff)
     evidence = [runner.run_check(top, task_dir, check, "round-01") for check in checks]
-    if any(not check["passed"] for check in evidence):
-        raise GuardFailure("hook selftest deterministic evidence unexpectedly failed")
+    failures = [check for check in evidence if not check["passed"]]
+    if failures:
+        details = ", ".join(
+            f"{check['id']} exit={check['exit_code']} timed_out={check['timed_out']} "
+            f"log={check['log_path']}"
+            for check in failures
+        )
+        raise GuardFailure(f"hook selftest deterministic evidence unexpectedly failed: {details}")
     review_kinds = ["spec", "adversarial"] + (["lock-security"] if risk else [])
     reviews = []
     writer_run = runner.invoke_model(
