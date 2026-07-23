@@ -423,6 +423,31 @@
   gap: var(--space-3);
   padding: var(--space-4);
 }
+.editor-insert-bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+.editor-image-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--text-secondary);
+}
+.editor-image-btn svg {
+  flex: none;
+}
+.editor-image-hint {
+  color: var(--text-muted);
+  font-size: 0.75rem;
+}
+.editor-image-input {
+  display: none;
+}
+.meeting-markdown-note {
+  overflow: hidden;
+}
 .editor-area {
   width: 100%;
   min-height: 360px;

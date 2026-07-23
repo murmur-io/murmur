@@ -176,7 +176,7 @@ pub struct AppConfig {
     #[serde(default = "default_live_asr_engine")]
     pub live_asr_engine: String,
     /// Brain-sidecar host-authoritative IDLE-KILL window (seconds): after this long with no
-    /// on-device brain request AND nothing in flight, the host kills the `meetnotes-brain` child to
+    /// on-device brain request AND nothing in flight, the host kills the `murmur-brain` child to
     /// reclaim ALL its model RAM to the OS. Default 300. `#[serde(default = "…")]` ⇒ a config
     /// persisted before this field existed loads as 300 (byte-identical to the built-in default).
     #[serde(default = "default_brain_idle_timeout_secs")]
@@ -1196,7 +1196,11 @@ impl AppConfig {
         )?;
         db.set_setting(
             K_NOTE_ASSIST_REFINE,
-            if self.note_assist_refine { "true" } else { "false" },
+            if self.note_assist_refine {
+                "true"
+            } else {
+                "false"
+            },
         )?;
         db.set_setting(
             K_NOTE_ASSIST_SHORTEN,
@@ -1289,8 +1293,6 @@ impl AppConfig {
             K_EMBED_MODEL_ID,
             self.embed_model_id.as_deref().unwrap_or(""),
         )?;
-        // Keep the process-global embedder selection in sync with the persisted value on every save.
-        crate::embed::set_selected_embed_model_id(self.embed_model_id.clone());
         db.set_setting(
             K_BRAIN_MODEL_PATH,
             self.brain_model_path.as_deref().unwrap_or(""),
@@ -1319,7 +1321,11 @@ impl AppConfig {
         )?;
         db.set_setting(
             K_BRAIN_CONTRADICTION_CARDS,
-            if self.brain_contradiction_cards { "true" } else { "false" },
+            if self.brain_contradiction_cards {
+                "true"
+            } else {
+                "false"
+            },
         )?;
         db.set_setting(
             K_WEB_SEARCH_ENABLED,
@@ -1403,7 +1409,11 @@ impl AppConfig {
         )?;
         db.set_setting(
             K_ASK_JIT_RETRIEVAL,
-            if self.ask_jit_retrieval { "true" } else { "false" },
+            if self.ask_jit_retrieval {
+                "true"
+            } else {
+                "false"
+            },
         )?;
         db.set_setting(
             K_LOOP_TRANSCRIPT_COMPACTION,
@@ -1439,7 +1449,11 @@ impl AppConfig {
         )?;
         db.set_setting(
             K_AUDIO_AUTO_PRUNE,
-            if self.audio_auto_prune { "true" } else { "false" },
+            if self.audio_auto_prune {
+                "true"
+            } else {
+                "false"
+            },
         )?;
         Ok(())
     }
@@ -2043,7 +2057,10 @@ mod tests {
         let db = temp_db();
         // Fresh DB ⇒ no actions opted out (missing key keeps the Default's empty Vec).
         assert!(
-            AppConfig::load(&db).unwrap().note_assist_actions_off.is_empty(),
+            AppConfig::load(&db)
+                .unwrap()
+                .note_assist_actions_off
+                .is_empty(),
             "the opt-out list defaults empty (all actions enabled)"
         );
 
@@ -2099,11 +2116,17 @@ mod tests {
             "cloudEgressConsented":false
         }"#;
         let omitted: AppConfig = serde_json::from_str(json).unwrap();
-        assert!(omitted.vault_audit_weekly_enabled, "serde default must be true");
+        assert!(
+            omitted.vault_audit_weekly_enabled,
+            "serde default must be true"
+        );
 
         let mut cfg = AppConfig::load(&db).unwrap();
         cfg.set_vault_audit_weekly(&db, false).unwrap();
-        assert!(!cfg.vault_audit_weekly_enabled, "mutator flips the in-memory flag");
+        assert!(
+            !cfg.vault_audit_weekly_enabled,
+            "mutator flips the in-memory flag"
+        );
         assert!(
             !AppConfig::load(&db).unwrap().vault_audit_weekly_enabled,
             "the opt-out persists across reload"
@@ -2307,7 +2330,10 @@ mod tests {
         );
         // A later plain save must PRESERVE the granted consent — a plain `save` writes the flag
         // verbatim, so this proves the durable record is not clobbered by a save that carries false.
-        let cfg2 = AppConfig { jira_consented: false, ..AppConfig::load(&db).unwrap() };
+        let cfg2 = AppConfig {
+            jira_consented: false,
+            ..AppConfig::load(&db).unwrap()
+        };
         cfg2.save(&db).unwrap();
         assert!(
             AppConfig::load(&db).unwrap().jira_consented,
@@ -2349,7 +2375,10 @@ mod tests {
         );
         // A later plain save must PRESERVE the granted consent — a plain `save` never writes the flag,
         // so this proves the durable record is not clobbered by a save that carries false.
-        let cfg2 = AppConfig { slack_consented: false, ..AppConfig::load(&db).unwrap() };
+        let cfg2 = AppConfig {
+            slack_consented: false,
+            ..AppConfig::load(&db).unwrap()
+        };
         cfg2.save(&db).unwrap();
         assert!(
             AppConfig::load(&db).unwrap().slack_consented,
@@ -2683,7 +2712,11 @@ mod tests {
     fn audio_storage_settings_round_trip() {
         let p = crate::storage::db::unique_temp_path("murmur-cfg-storage", "sqlite");
         let _ = std::fs::remove_file(&p);
-        let db = Db::open_with_key(&p, "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef").unwrap();
+        let db = Db::open_with_key(
+            &p,
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        )
+        .unwrap();
 
         // Defaults: no cap, auto-prune OFF (fail-safe).
         let def = AppConfig::default();

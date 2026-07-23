@@ -16,6 +16,7 @@ pub mod events;
 pub mod export;
 pub mod extract;
 pub mod facts;
+mod instance_lock;
 pub mod links;
 pub mod mcp;
 pub mod memory;
@@ -69,6 +70,24 @@ pub fn run() {
     // strictly before any ggml-Metal device can be initialized. SAFETY: single-threaded at
     // startup, before any thread that could read the env. (Mirror guard in `Transcriber::load`.)
     std::env::set_var("GGML_METAL_NO_RESIDENCY", "1");
+
+    // Acquire global process ownership BEFORE touching even the shared log, encrypted library, or
+    // recovery ledger. Lease expiry alone cannot prove a mic-only recorder died: a stalled spool
+    // thread may miss renewal while CoreAudio remains live, and a second startup would otherwise
+    // truncate that generation to its last checkpoint. The local guard lives through Tauri's
+    // blocking `.run()` and the exit cleanup; close/OOM/SIGKILL releases it in the kernel.
+    let _instance_guard = match instance_lock::acquire() {
+        Ok(instance_lock::AcquireResult::Acquired(guard)) => guard,
+        Ok(instance_lock::AcquireResult::AlreadyRunning) => {
+            instance_lock::show_startup_refusal(instance_lock::StartupRefusal::AlreadyRunning);
+            return;
+        }
+        Err(error) => {
+            eprintln!("Murmur startup guard failed: {error}");
+            instance_lock::show_startup_refusal(instance_lock::StartupRefusal::GuardUnavailable);
+            return;
+        }
+    };
 
     let log_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
@@ -398,6 +417,9 @@ pub fn run() {
             commands::move_note_doc,
             commands::delete_note,
             commands::export_note_doc,
+            commands::add_note_attachment,
+            commands::list_note_attachments,
+            commands::delete_note_attachment,
             commands::list_note_folders,
             commands::create_note_folder,
             commands::rename_note_folder,
@@ -441,6 +463,22 @@ pub fn run() {
             };
             app.manage(state);
 
+            // PRE-WINDOW legacy-recovery guard. Historical paired crash artifacts are plaintext and
+            // cannot be honestly presented as protected by an already-locked folder. Publish their
+            // SQLCipher markers and read folder lock state synchronously, before egress setup,
+            // windows/tray/MCP, helper detection, or recovery claims. A locked owner takes the same
+            // graceful fatal-dialog path as DB init failure; DB and files remain untouched.
+            let mut legacy_recovery_preflight = {
+                let state = app.state::<AppState>();
+                match crate::audio::spill::startup_legacy_recovery_preflight(&state.db) {
+                    Ok(protection) => protection,
+                    Err(error) => {
+                        show_fatal_init_dialog(app.handle().clone(), &error);
+                        return Ok(());
+                    }
+                }
+            };
+
             // Phase 2b — wire the content-free egress ledger. Done here, once, after a successful
             // AppState::init() so the DB is guaranteed open. Every subsequent cloud provider call
             // (routed through RedactingProvider) writes ONE content-free row to egress_log.
@@ -452,73 +490,160 @@ pub fn run() {
             }
 
             // Crash-recovery (STAGE 2 spill salvage + STAGE 3 disk salvage + STAGE 1 reconcile) +
-            // orphan reap. A session that died mid-record (crash / SIGKILL / `tauri dev` hot-rebuild)
-            // never ran `stop_recording`, so the meeting row `start_recording` inserted up-front sits
+            // surviving-helper detection. A session that died mid-record (crash / SIGKILL /
+            // `tauri dev` hot-rebuild) never ran `stop_recording`, so the meeting row
+            // `start_recording` inserted up-front sits
             // as a `RECORDING` "ghost" AND its mic audio (RAM-only) + far-side scratch would be lost.
             // ORDER IS LOAD-BEARING:
-            //   1) CLAIM spill salvage: find inflight mic spills of crashed recordings + MOVE the
-            //      paired far-side scratch out of $TMPDIR (before the reaper below deletes it). Runs
-            //      FIRST so the reaper can't eat a recoverable far-side track.
-            //   1b) CLAIM disk salvage (2026-07-16): among the ghosts the spill did NOT claim (spill
+            //   1) DETECT surviving helpers BEFORE moving or reading any recovery audio content.
+            //      The scanner never signals cross-launch PIDs; any live/orphan/ambiguous helper defers ALL
+            //      salvage and disables the age sweep, because it may still be writing the same
+            //      inode and model/audio recovery must not overlap another process.
+            //   2) CLAIM spill salvage: find inflight mic spills of crashed recordings. A paired
+            //      far-side scratch is preserved with an exclusive copy-on-write clone outside
+            //      $TMPDIR only after the clean scan proves no helper can still be writing it; this
+            //      compatibility path is not loaded into the recovery pipeline.
+            //   2b) CLAIM disk salvage (2026-07-16): among the ghosts the spill did NOT claim (spill
             //      wins — it has both streams), any whose ARCHIVE WAV survived on disk (the pipeline
             //      died AFTER finalize_meeting) is re-run from disk instead of being flipped to
             //      ERROR with intact, never-re-transcribed audio. Sealed audio / a locked folder is
             //      NEVER decrypted here — those rows fall through to reconcile (terminal ERROR, audio
             //      untouched) and stay recoverable via `retry_transcription` after an unlock.
-            //   2) RECONCILE the remaining ghosts to terminal `ERROR` — SKIPPING every claimed row
+            //   3) RECONCILE the remaining ghosts to terminal `ERROR` — SKIPPING every claimed row
             //      (salvage sets their final status itself), so a claimed row isn't clobbered.
-            //   3) REAP orphaned capture helpers + sweep stale scratch (post-claim, so only truly-
-            //      abandoned files remain).
-            //   4) SPAWN the async salvage worker: reconstruct each claimed recording + run it through
-            //      the EXISTING post-Stop pipeline → a real transcript+note. After the reap so the
-            //      paired helper is already down. Best-effort; never deletes un-salvaged audio.
-            //   (3+4 run inside ONE detached task below — sequenced, off the setup thread.)
-            let (salvage_jobs, disk_salvage_jobs) = {
-                let state = app.state::<AppState>();
-                let (jobs, mut claimed) = crate::audio::spill::claim_inflight(&state.db);
-                let (disk_jobs, disk_claimed) =
-                    crate::audio::spill::claim_disk_salvage(&state.db, &claimed);
-                claimed.extend(disk_claimed);
-                if let Err(e) = state.db.reconcile_stuck_recordings_except(&claimed) {
-                    tracing::warn!(target: "startup", error = %e, "could not reconcile stuck recordings");
-                }
-                (jobs, disk_jobs)
-            };
-
-            // Reap any capture helper ORPHANED by a previous session that died without a clean Stop
-            // (crash / force-quit / a `tauri dev` hot-rebuild SIGKILLing the app mid-record). Such a
-            // helper keeps capturing to a temp WAV for up to its 4h self-cap — GBs of dead-session
-            // audio the file-age sweep can't catch (its mtime stays fresh). The reap runs FIRST so
-            // the kill releases the file, THEN stale scratch is reclaimed. A helper whose parent is
-            // launchd, dead, or not a Murmur process is reaped; one owned by a LIVE Murmur process
-            // (a genuinely concurrent instance) is spared — see `helper_verdict`. (Salvage above
-            // already moved any RECOVERABLE far-side scratch out of the reaper's reach.)
+            //   4) SWEEP stale scratch only after both the clean helper scan and exact claims.
+            //   5) SPAWN the async salvage worker: reconstruct each claimed recording + run it through
+            //      the EXISTING post-Stop pipeline → a real transcript+note. Best-effort; never
+            //      deletes un-salvaged audio.
+            //   (1-5 run inside ONE detached task below — sequenced, off the setup thread.)
+            // Detect any helper ORPHANED by a previous session that died without a clean Stop.
+            // Cross-process PID signaling cannot be bound atomically to a process generation on
+            // Darwin, so startup never guesses: any orphan/ambiguous helper preserves all scratch;
+            // the next Start repeats the scan and fails closed. New audio helpers watch the exact
+            // parent-owned stdin pipe and retain a 4 h wall cap; Brain independently watches its
+            // parent-owned stdin pipe and exits even during a stuck generation. A helper owned by
+            // a LIVE Murmur process (a genuinely concurrent instance) is never touched and defers
+            // recovery/capture until that owner exits.
             //
-            // Hardening 2026-07-16: steps 3+4 moved OFF the setup thread — the reap shells out to
-            // /bin/ps (×2) plus a per-candidate `kill -0`, which blocked launch. The LOAD-BEARING
-            // order (see the block comment above: reap[3] completes BEFORE the salvage worker[4]
-            // spawns, so a crashed session's paired helper is already down) is preserved INSIDE
-            // one detached task: the blocking reap+sweep is AWAITED to completion, then the
-            // salvage worker spawns. Steps 1+2 (claim + reconcile) already ran synchronously
-            // above, so the claim still beats the reaper to any recoverable far-side scratch.
-            // Racing an early user-initiated `start_recording` is safe by construction — the reap
-            // spares every helper owned by a live Murmur process, and `start_recording` runs its
-            // own awaited sweep anyway.
+            // Steps 1-5 stay OFF the setup thread because process-table/filesystem probes and
+            // recovery are blocking. The scan+sweep is awaited before salvage starts, and an early
+            // `start_recording` has its own awaited fail-closed scan under the recording-priority
+            // boundary.
             {
+                let recovery_owner = match crate::perf::begin_startup_recovery() {
+                    Ok(owner) => owner,
+                    Err(error) => {
+                        show_fatal_init_dialog(app.handle().clone(), &error);
+                        return Ok(());
+                    }
+                };
                 let app_handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
-                    let joined = tauri::async_runtime::spawn_blocking(|| {
-                        crate::audio::aec::reap_orphaned_capture_helpers();
-                        crate::audio::aec::sweep_stale_scratch();
+                    // This affine owner is deliberately retained across BOTH detection/claim and the
+                    // actual salvage-thread join. Start fails fast while it exists, so recovery ASR,
+                    // RAM and global status events can never overlap a fresh recording.
+                    let recovery_owner = recovery_owner;
+                    let worker_app = app_handle.clone();
+                    let recovered = tauri::async_runtime::spawn_blocking(move || {
+                        let state = worker_app.state::<AppState>();
+                        let _lifecycle = state
+                            .lifecycle
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if let Err(error) = crate::audio::aec::detect_surviving_capture_helpers(Some(
+                            &mut legacy_recovery_preflight.scratch_protection,
+                        )) {
+                            // A helper may still have the exact scratch inode open. Do not rename,
+                            // read, reconcile, or enqueue any source while that writer/model is
+                            // alive; leave every durable marker/artifact for a later clean launch.
+                            legacy_recovery_preflight
+                                .scratch_protection
+                                .preserve_all();
+                            tracing::error!(target: "startup", error = %error, "helper active or scan ambiguous; deferring all recording recovery and preserving scratch");
+                            return Ok((Vec::new(), Vec::new(), Vec::new()));
+                        }
+                        let recovery_dirs = crate::pipeline::recording_inflight_dir()
+                            .and_then(|inflight| {
+                                crate::pipeline::audio_dir().map(|archive| (inflight, archive))
+                            });
+                        let (ledger_jobs, mut claimed) = match recovery_dirs {
+                            Ok((inflight, archive)) => {
+                                crate::audio::source::claim_stale_recording_generations(
+                                    &state.db,
+                                    &inflight,
+                                    &archive,
+                                )
+                            }
+                            Err(error) => {
+                                tracing::warn!(target: "startup", error = %error, "recording ledger recovery directory unavailable");
+                                (Vec::new(), Vec::new())
+                            }
+                        };
+                        let (salvage_jobs, spill_claimed) = crate::audio::spill::claim_inflight(
+                            &state.db,
+                            &mut legacy_recovery_preflight,
+                        )?;
+                        claimed.extend(spill_claimed);
+                        let (disk_salvage_jobs, disk_claimed) =
+                            crate::audio::spill::claim_disk_salvage(&state.db, &claimed);
+                        claimed.extend(disk_claimed);
+                        if let Err(error) = state.db.reconcile_stuck_recordings_except(&claimed) {
+                            tracing::warn!(target: "startup", error = %error, "could not reconcile stuck recordings");
+                        }
+                        crate::audio::aec::sweep_stale_scratch(
+                            &legacy_recovery_preflight.scratch_protection,
+                        );
+                        Ok::<_, crate::error::AppError>((
+                            ledger_jobs,
+                            salvage_jobs,
+                            disk_salvage_jobs,
+                        ))
                     })
                     .await;
-                    if let Err(e) = joined {
-                        tracing::warn!(target: "startup", error = %e, "orphan-helper reap join failed; salvage continues");
+                    let salvage_thread = match recovered {
+                        Ok(Ok((ledger_jobs, salvage_jobs, disk_salvage_jobs))) => {
+                            // After the clean fail-closed helper scan, process exact ledger prefixes
+                            // first, then legacy spill and archived-WAV recovery. The returned owner
+                            // is joined below before recording admission is reopened.
+                            crate::audio::spill::spawn_salvage(
+                                app_handle.clone(),
+                                ledger_jobs,
+                                salvage_jobs,
+                                disk_salvage_jobs,
+                            )
+                        }
+                        Ok(Err(error)) => {
+                            // A post-preflight identity/inventory failure is a startup boundary,
+                            // not a best-effort recovery miss. Continuing would expose the UI and
+                            // run the stale-temp sweep without authenticated ownership of every
+                            // historical source. Preserve all artifacts and fail closed.
+                            // Keep recording admission closed until the fatal-dialog worker exits
+                            // the process; returning normally would drop this owner and reopen the
+                            // global Start path while the modal is still visible.
+                            std::mem::forget(recovery_owner);
+                            show_fatal_init_dialog(app_handle.clone(), &error);
+                            return;
+                        }
+                        Err(error) => {
+                            tracing::warn!(target: "startup", error = %error, "recording recovery worker join failed; artifacts preserved");
+                            None
+                        }
+                    };
+                    if let Some(salvage_thread) = salvage_thread {
+                        match tauri::async_runtime::spawn_blocking(move || salvage_thread.join())
+                            .await
+                        {
+                            Ok(Ok(())) => {}
+                            Ok(Err(_)) => tracing::warn!(target: "startup", "recording salvage worker panicked; artifacts preserved"),
+                            Err(error) => tracing::warn!(target: "startup", error = %error, "recording salvage join task failed; artifacts preserved"),
+                        }
                     }
-                    // STAGE 2 + 3 salvage worker (async, detached): now that the reaper has downed
-                    // any orphan helper, reconstruct + pipeline each claimed crashed recording —
-                    // spill jobs first, then the from-disk re-runs. No-op when nothing crashed.
-                    crate::audio::spill::spawn_salvage(app_handle, salvage_jobs, disk_salvage_jobs);
+
+                    drop(recovery_owner);
+                    // The standby listener also owns Whisper RAM; start it only after recovery has
+                    // relinquished priority. Its own lifecycle gate suppresses a race with a user
+                    // who starts recording immediately at this boundary.
+                    commands::restart_voice_listener(app_handle);
                 });
             }
             // R1: reclaim any STALE `*.part` model-download residue (a crash / force-quit / aborted
@@ -543,7 +668,6 @@ pub fn run() {
             if let Err(e) = app.global_shortcut().register(SUMMON_SHORTCUT) {
                 tracing::warn!(target: "shortcut", error = %e, "could not register global shortcut");
             }
-            commands::restart_voice_listener(app.handle().clone());
             setup_tray(app.handle())?;
             // Localhost MCP server (read-only meeting tools for Claude Desktop/Code; no egress).
             // Share the session unlock set so sealed-and-not-unlocked notes stay invisible.
@@ -580,6 +704,10 @@ pub fn run() {
                     .map(|c| c.semantic_search_enabled)
                     .unwrap_or(false);
                 tauri::async_runtime::spawn_blocking(move || {
+                    let background_epoch = crate::perf::background_epoch();
+                    if !crate::perf::background_epoch_is_current(background_epoch) {
+                        return;
+                    }
                     // 2026-07-13 launch-freeze incident: on a RAM-starved machine, defer the whole
                     // backfill (incl. the lazy Candle/Metal embedder load) rather than starting it
                     // at launch — it is content-hash idempotent, so a later, healthier launch just
@@ -595,12 +723,28 @@ pub fn run() {
                     // under the EMPTY unlock set (sealed content is never touched, even
                     // mid-session-unlock). Counts only — no PII.
                     let model_present = crate::embed::embed_model_present();
-                    let embedder = crate::embed::active_embedder();
-                    match crate::commands::backfill_missing_brain_indexes(
+                    let embedder: Box<dyn crate::embed::Embedder> = if model_present {
+                        match crate::embed::background_persistence_embedder(background_epoch) {
+                            Ok(embedder) => embedder,
+                            Err(error) => {
+                                // Presence changed or construction became impossible after the
+                                // probe. Defer the idempotent repair instead of writing stub or a
+                                // second model's vectors into the same index generation.
+                                tracing::warn!(target: "rag", error = %error, "brain index repair tick deferred: embed model unavailable");
+                                return;
+                            }
+                        }
+                    } else {
+                        // Model-absent work is strictly document chunk/FTS repair; this epoch-aware
+                        // stub cannot persist vectors because `model_present == false` gates them.
+                        crate::embed::background_embedder(background_epoch)
+                    };
+                    match crate::commands::backfill_missing_brain_indexes_background(
                         &db,
                         semantic_enabled,
                         model_present,
                         embedder.as_ref(),
+                        background_epoch,
                     ) {
                         Ok((meetings, docs)) if meetings + docs > 0 => {
                             tracing::info!(
@@ -615,11 +759,36 @@ pub fn run() {
                             tracing::warn!(target: "rag", error = %e, "brain index repair tick failed");
                         }
                     }
+                    if model_present {
+                        // Heal a partial/interrupted Org rebuild under the SAME pinned REAL model
+                        // and epoch. Bounded to four items at startup; canonical replica rows,
+                        // chunks/FTS and feed cursors are untouched.
+                        match crate::commands::repair_missing_org_embeddings(
+                            &db,
+                            embedder.as_ref(),
+                            4,
+                            Some(background_epoch),
+                        ) {
+                            Ok(indexed) if indexed > 0 => {
+                                tracing::info!(target: "rag", indexed, "org vector repair tick backfilled missing vectors");
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                tracing::warn!(target: "rag", error = %e, "org vector repair tick deferred");
+                            }
+                        }
+                    }
                     if !semantic_enabled || !model_present {
                         return;
                     }
+                    if !crate::perf::background_epoch_is_current(background_epoch) {
+                        return;
+                    }
                     let started = std::time::Instant::now();
-                    match db.backfill_topic_chunks_idempotent(embedder.as_ref()) {
+                    match db.backfill_topic_chunks_idempotent_background(
+                        embedder.as_ref(),
+                        background_epoch,
+                    ) {
                         Ok(indexed) if indexed > 0 => {
                             tracing::info!(
                                 target: "rag",
@@ -747,8 +916,8 @@ pub fn run() {
             if let tauri::RunEvent::ExitRequested { .. } = event {
                 // True exit — relock + stop_all_capture (C2) run FIRST inside the hook, THEN kill the
                 // brain sidecar so its multi-GB model RAM is reclaimed on quit (bounded reap — never
-                // hangs app-exit; a slow-dying child reparents to launchd and the startup reaper
-                // SIGTERMs it next launch).
+                // hangs app-exit). The child also owns an exact stdin-lifetime watcher, so losing
+                // the host pipe terminates it without relying on a recycled PID at next launch.
                 relock_and_zeroize_on_lifecycle(handle, LIFECYCLE_CTX_APP_EXIT);
                 crate::reason::sidecar::kill_on_quit();
             }
@@ -795,11 +964,11 @@ const LIFECYCLE_CTX_WINDOW_CLOSE: &str = "window-close";
 ///   if AppState was never managed (the graceful-init failure path returns early without it).
 ///
 /// C2: on the TRUE exit path (`ctx == "app-exit"`) we ALSO stop every capture path in-process
-/// (`stop_all_capture`) FIRST, so quitting mid-recording finalizes + reaps the Swift capture helpers
-/// instead of orphaning them to launchd until their 4h self-cap (the next-launch reaper then becomes
-/// the safety net, not the primary path). We deliberately do NOT stop capture on `ctx ==
-/// "window-close"`: closing the window only HIDES it and the app keeps recording in the tray — killing
-/// capture there would silently drop an active tray recording.
+/// (`stop_all_capture`) FIRST, so quitting mid-recording finalizes + reaps the Swift capture helpers.
+/// Each helper also watches an exact parent-owned stdin pipe and self-terminates if the host dies;
+/// next-launch discovery is detection-only and never signals a PID. We deliberately do NOT stop
+/// capture on `ctx == "window-close"`: closing the window only HIDES it and the app keeps recording
+/// in the tray — killing capture there would silently drop an active tray recording.
 fn relock_and_zeroize_on_lifecycle(handle: &tauri::AppHandle, ctx: &str) {
     use crate::state::AppState;
     let Some(state) = handle.try_state::<AppState>() else {
@@ -821,15 +990,15 @@ fn relock_and_zeroize_on_lifecycle(handle: &tauri::AppHandle, ctx: &str) {
     }
 }
 
-/// Startup-failure handler: AppState::init() returned Err. Show a clear, non-technical native
-/// dialog explaining that the encrypted library couldn't be opened, then exit cleanly with code 1
-/// — NEVER a Rust panic/abort (the v0.3.0 hard-crash). The two failure modes are distinguished in
+/// Startup-failure handler: show a clear, non-technical native dialog, then exit cleanly with code
+/// 1 — NEVER a Rust panic/abort (the v0.3.0 hard-crash). The failure modes are distinguished in
 /// both the message and the log:
 ///   (a) [`AppError::KeychainDenied`] — macOS refused keychain access (user clicked "Deny", or the
 ///       keychain is locked).
-///   (b) anything else (storage / migration) — the DB couldn't be opened: the key doesn't match
+///   (b) [`AppError::Locked`] — unfinished legacy recovery belongs to an already-locked folder.
+///   (c) anything else (storage / migration) — the DB couldn't be opened: the key doesn't match
 ///       the data (e.g. restored from another Mac) or the file is damaged.
-/// This NEVER touches the database or its backups — it is a read-only, fail-safe exit path.
+/// This fail-safe path never mutates user content or deletes database/files.
 fn show_fatal_init_dialog(handle: tauri::AppHandle, err: &crate::error::AppError) {
     use crate::error::AppError;
     use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
@@ -844,6 +1013,16 @@ fn show_fatal_init_dialog(handle: tauri::AppHandle, err: &crate::error::AppError
              contact support.",
             "keychain access denied or unavailable",
         ),
+        AppError::Locked(_) => (
+            "Murmur found unfinished legacy recording recovery files that cannot be safely opened \
+             by this build. Those historical files are preserved, but Murmur cannot treat them as \
+             sealed or recover them until their folder ownership is authenticated.\n\nYour notes, \
+             content, and audio files have NOT been changed or deleted. Murmur may have recorded a \
+             recovery marker. For authenticated recovery, reopen Murmur v1.0.1 (or the dedicated \
+             recovery build), use Touch ID to unlock the affected folder, then relaunch this Murmur \
+             build.",
+            "unfinished legacy recording recovery is locked or ambiguous",
+        ),
         _ => (
             "Murmur couldn't unlock its encrypted database. This can happen if the database key \
              doesn't match the data on this Mac (for example after restoring from a backup or \
@@ -854,7 +1033,7 @@ fn show_fatal_init_dialog(handle: tauri::AppHandle, err: &crate::error::AppError
     };
 
     // Technical detail goes to the log only (Display carries no PII / no secret material).
-    tracing::error!(target: "state", error = %err, reason = log_reason, "startup aborted: AppState::init failed");
+    tracing::error!(target: "state", error = %err, reason = log_reason, "startup aborted safely");
 
     // Hide the config-created main window so its webview can't flash a broken state behind the
     // dialog (its commands would have no managed AppState).
@@ -1033,14 +1212,20 @@ mod tests {
         // 600 two-byte chars ('ł') — a byte-indexed truncation at 400 would split a char.
         let long = "ł".repeat(600);
         let out = sanitize_panic_message(&long, None);
-        assert!(out.ends_with("…[truncated]"), "a capped payload is marked: {out}");
+        assert!(
+            out.ends_with("…[truncated]"),
+            "a capped payload is marked: {out}"
+        );
         let kept = out.trim_end_matches("…[truncated]");
         assert_eq!(
             kept.chars().count(),
             PANIC_MESSAGE_MAX_CHARS,
             "exactly the cap survives"
         );
-        assert!(kept.chars().all(|c| c == 'ł'), "no mangled chars at the cut");
+        assert!(
+            kept.chars().all(|c| c == 'ł'),
+            "no mangled chars at the cut"
+        );
     }
 
     /// A short, home-free payload passes through byte-identical (the common case — our own panic
@@ -1056,6 +1241,54 @@ mod tests {
             sanitize_panic_message(pathy, Some("/")),
             pathy,
             "a one-char home must not be substituted into every separator"
+        );
+    }
+
+    /// A legacy capture helper can keep writing the same inode after a rename. The helper scan must
+    /// therefore precede every crash-recovery claim, not merely the broad stale-file sweep.
+    #[test]
+    fn startup_helper_scan_precedes_every_recovery_claim() {
+        let source = include_str!("lib.rs");
+        let worker = source
+            .find("let recovered = tauri::async_runtime::spawn_blocking")
+            .expect("startup recovery worker exists");
+        let worker_source = &source[worker..];
+        let scan = worker_source
+            .find("detect_surviving_capture_helpers")
+            .expect("helper scan exists in recovery worker");
+        let ledger_claim = worker_source
+            .find("claim_stale_recording_generations")
+            .expect("ledger recovery claim exists");
+        let legacy_claim = worker_source
+            .find("crate::audio::spill::claim_inflight")
+            .expect("legacy recovery claim exists");
+        assert!(scan < ledger_claim && scan < legacy_claim);
+    }
+
+    /// A second process must be rejected before it can truncate the shared log, open/migrate the
+    /// SQLCipher library, or reach either recovery claimant. This source-order pin complements the
+    /// kernel-lock unit test without launching a second GUI process in the library test suite.
+    #[test]
+    fn instance_lock_precedes_every_shared_startup_surface() {
+        let source = include_str!("lib.rs");
+        let acquire = source
+            .find("instance_lock::acquire()")
+            .expect("process-wide instance lock exists");
+        let log_truncate = source
+            .find("std::fs::write(&path, b\"\")")
+            .expect("per-launch log truncate exists");
+        let state_init = source.find("AppState::init()").expect("state init exists");
+        let ledger_claim = source
+            .find("claim_stale_recording_generations")
+            .expect("ledger recovery claim exists");
+        let legacy_claim = source
+            .find("crate::audio::spill::claim_inflight")
+            .expect("legacy recovery claim exists");
+        assert!(
+            acquire < log_truncate
+                && acquire < state_init
+                && acquire < ledger_claim
+                && acquire < legacy_claim
         );
     }
 }

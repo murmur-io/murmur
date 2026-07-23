@@ -201,12 +201,7 @@ impl Db {
     /// never a stale lock-time copy. The CALLER must have verified the blob decrypts back
     /// byte-identical BEFORE calling this (verify-before-destroy) — exactly like
     /// [`Db::seal_manual_notes`]. 2026-07-10 audit F1.
-    pub fn set_manual_notes_sealed(
-        &self,
-        meeting_id: &str,
-        text: &str,
-        blob: &[u8],
-    ) -> Result<()> {
+    pub fn set_manual_notes_sealed(&self, meeting_id: &str, text: &str, blob: &[u8]) -> Result<()> {
         let conn = self.lock();
         conn.execute(
             "UPDATE meetings SET manual_notes = ?2, manual_notes_blob = ?3 WHERE id = ?1",
@@ -282,6 +277,25 @@ impl Db {
         let conn = self.lock();
         conn.query_row(
             "SELECT id, started_at, ended_at, title, duration_s, audio_path, status,
+                    (SELECT n.folder_id FROM notes n
+                      WHERE n.meeting_id = meetings.id AND n.folder_id IS NOT NULL LIMIT 1)
+                      AS folder_id
+               FROM meetings WHERE id = ?1",
+            rusqlite::params![id],
+            row_to_meeting,
+        )
+        .optional()
+        .map_err(map_err)?
+        .transpose()
+    }
+
+    /// Content-free meeting projection for command authorization and masked DTOs. Deliberately
+    /// omits the real title and audio path, while retaining non-content lifecycle metadata needed
+    /// to distinguish an unknown id and render the locked shell.
+    pub fn get_meeting_gate_anchor(&self, id: &str) -> Result<Option<Meeting>> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT id, started_at, ended_at, NULL, duration_s, NULL, status,
                     (SELECT n.folder_id FROM notes n
                       WHERE n.meeting_id = meetings.id AND n.folder_id IS NOT NULL LIMIT 1)
                       AS folder_id

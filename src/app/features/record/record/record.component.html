@@ -258,7 +258,8 @@
       <button
         type="button"
         class="stop-btn"
-        (click)="store.stop()"
+        (pointerdown)="onStopPointerDown($event)"
+        (click)="onStopClick()"
         aria-label="Stop recording"
       >
         <span class="stop-ico" aria-hidden="true"></span>

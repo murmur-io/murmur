@@ -40,9 +40,7 @@ pub fn extract_image(path: &Path) -> Result<Vec<ExtractedBlock>> {
             page: Some(1),
             heading_path: None,
         }]),
-        _ => Err(AppError::InvalidArg(
-            "no text found in this image".into(),
-        )),
+        _ => Err(AppError::InvalidArg("no text found in this image".into())),
     }
 }
 

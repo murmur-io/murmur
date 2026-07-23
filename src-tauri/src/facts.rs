@@ -876,7 +876,13 @@ mod tests {
     #[test]
     fn snapshot_excludes_facts_not_yet_valid() {
         let facts = vec![dated_fact(
-            "f1", "Atlas", "status", "shipped", "2026-06-20T00:00:00Z", None, "m1",
+            "f1",
+            "Atlas",
+            "status",
+            "shipped",
+            "2026-06-20T00:00:00Z",
+            None,
+            "m1",
         )];
         // Before it became true.
         let open = snapshot_as_of(&facts, "2026-06-10T00:00:00Z");
@@ -942,7 +948,13 @@ mod tests {
     #[test]
     fn snapshot_tolerates_unparseable_timestamp_without_panic() {
         let facts = vec![dated_fact(
-            "junk", "Atlas", "status", "shipped", "not-a-timestamp", None, "m1",
+            "junk",
+            "Atlas",
+            "status",
+            "shipped",
+            "not-a-timestamp",
+            None,
+            "m1",
         )];
         // Must return deterministically (no panic) for a well-formed `at`.
         let _ = snapshot_as_of(&facts, "2026-06-20T00:00:00Z");
@@ -952,7 +964,13 @@ mod tests {
     #[test]
     fn snapshot_includes_open_fact_forever_after() {
         let facts = vec![dated_fact(
-            "f1", "Atlas", "status", "shipped", "2026-06-01T00:00:00Z", None, "m1",
+            "f1",
+            "Atlas",
+            "status",
+            "shipped",
+            "2026-06-01T00:00:00Z",
+            None,
+            "m1",
         )];
         assert_eq!(
             ids(&snapshot_as_of(&facts, "2030-01-01T00:00:00Z")),
@@ -1064,11 +1082,23 @@ mod tests {
     #[test]
     fn diff_ignores_unchanged_key() {
         let a_facts = [dated_fact(
-            "a1", "Atlas", "status", "shipped", "2026-06-01T00:00:00Z", None, "m1",
+            "a1",
+            "Atlas",
+            "status",
+            "shipped",
+            "2026-06-01T00:00:00Z",
+            None,
+            "m1",
         )];
         // Casing-only difference in the OBJECT is not a change (norm equal).
         let b_facts = [dated_fact(
-            "b1", "Atlas", "status", "Shipped", "2026-06-20T00:00:00Z", None, "m2",
+            "b1",
+            "Atlas",
+            "status",
+            "Shipped",
+            "2026-06-20T00:00:00Z",
+            None,
+            "m2",
         )];
         let diff = diff_snapshots(
             &a_facts.iter().collect::<Vec<_>>(),
@@ -1188,7 +1218,15 @@ mod tests {
                 Some(offset_form),
                 "m1",
             ),
-            dated_fact("s_new", "Atlas", "status", "shipped", offset_form, None, "m2"),
+            dated_fact(
+                "s_new",
+                "Atlas",
+                "status",
+                "shipped",
+                offset_form,
+                None,
+                "m2",
+            ),
             // owner: Anna → Piotr at 00:30Z — BETWEEN the status instants, so the correct
             // cross-key order is [owner @00:30Z, status @01:00Z]; the lexical order inverts it.
             dated_fact(
@@ -1354,8 +1392,14 @@ mod tests {
         .unwrap();
         // The payload echoes the NORMALIZED (swapped) window, the way normalize_instant already
         // echoes canonical forms...
-        assert_eq!(kd.from, "2026-06-10T00:00:00Z", "from must echo the EARLIER bound");
-        assert_eq!(kd.to, "2026-06-25T00:00:00Z", "to must echo the LATER bound");
+        assert_eq!(
+            kd.from, "2026-06-10T00:00:00Z",
+            "from must echo the EARLIER bound"
+        );
+        assert_eq!(
+            kd.to, "2026-06-25T00:00:00Z",
+            "to must echo the LATER bound"
+        );
         // ...and the semantics are the ordered window's: status CHANGED in-progress → shipped.
         assert_eq!(kd.diff.changed.len(), 1);
         assert_eq!(

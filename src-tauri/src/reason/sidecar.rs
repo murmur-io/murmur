@@ -1,5 +1,5 @@
 //! HOST side of the on-device brain sidecar — the [`LocalReasoner`] that drives the killable
-//! `meetnotes-brain` child process over the NDJSON protocol in `brain_ipc.rs`.
+//! `murmur-brain` child process over the NDJSON protocol in `brain_ipc.rs`.
 //!
 //! ## Why a child process (the whole point)
 //! mistralrs holds a multi-GB model resident, has documented drop-leaks (#723/#865) so the old
@@ -18,15 +18,16 @@
 //! ## The three lifecycle BLOCKERS this design solves
 //! 1. **PERSISTENT child** (NOT afm's per-call `wait_with_output`): the `ChildStdin` + a persistent
 //!    reader thread over `ChildStdout` live in [`SidecarState`] across requests; the child stays alive
-//!    between calls and is `wait()`ed only after an explicit `kill()`.
+//!    between calls and is reaped with bounded `try_wait()` polling after an explicit `kill()`.
 //! 2. **PIPE-DEADLOCK avoidance**: note-gen writes the WHOLE transcript (can exceed the 64 KB pipe
-//!    buffer) and the response can too. The request is pushed on a dedicated scoped WRITER thread while
-//!    a PERSISTENT reader thread drains `ChildMsg` lines into an mpsc channel the dispatcher
-//!    `recv_timeout`s on — so neither side ever blocks on a full pipe, and the deadline is honored
-//!    WITHOUT the dispatcher ever blocking in a raw pipe read.
+//!    buffer) and the response can too. Child stdin is non-blocking and the dispatcher pumps partial
+//!    writes while a PERSISTENT reader thread drains `ChildMsg` lines into an mpsc channel. There is
+//!    no writer thread to join, so timeout/kill/reap stays authoritative even when the child stops
+//!    reading halfway through a request.
 //! 3. **Per-request timeout = KILL+RESPAWN** (replaces the old leaked-worker-on-timeout): on the
-//!    deadline the child is `kill()+wait()`ed — TRUE cancellation + full RAM reclaim — and the next
-//!    call respawns. The persistent reader thread ends when the killed child's pipe closes (there is
+//!    deadline the child is killed and reaped with bounded `try_wait()` polling — TRUE cancellation
+//!    + full RAM reclaim — and the next call respawns. The persistent reader thread ends when the
+//!    killed child's pipe closes (there is
 //!    only ever ONE reader thread per child, reaped by the pipe EOF — never an accumulating leak).
 //!
 //! ## Privacy / hardening (audited by the lock-security reviewer)
@@ -41,11 +42,11 @@
 //! on kill, and the real child's model load only run on a Mac with a GGUF present — a green
 //! `cargo test --lib` proves the lifecycle plumbing, NOT that on-device inference works.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, ErrorKind as IoErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -63,7 +64,7 @@ use brain_ipc::{ChildMsg, ErrorKind, GenOptsWire, HostMsg};
 
 /// Filename of the child binary — inside `Contents/Resources` of a shipped `.app` and staged at
 /// `binaries/` for dev (build.rs emits `BRAIN_BIN`).
-const SIDECAR_NAME: &str = "meetnotes-brain";
+const SIDECAR_NAME: &str = "murmur-brain";
 
 /// Default host-authoritative idle window (s): after this long with no request AND nothing in
 /// flight, the host kills the child to reclaim its model RAM. Overridable per-instance from config.
@@ -84,11 +85,59 @@ const DEFAULT_HARD_CAP_SECS: u64 = 180;
 /// returns the degrade error IMMEDIATELY (no 90s-ready + respawn storm on a broken sidecar).
 const BACKOFF_SECS: u64 = 30;
 
-/// Bounded wait (s) for a killed child to reap during app-exit — a killed child reparents to launchd
-/// and the startup reaper (`aec::reap_orphaned_capture_helpers`) cleans it, so we never block quit.
+/// Bounded wait (s) for a killed child to reap during app-exit. We retain the `Child` until this
+/// attempt finishes; if the whole app is then force-killed, the helper's parent-death watchdog
+/// exits even during a stuck generation and the next recording admission detects any survivor
+/// fail-closed.
 const QUIT_REAP_SECS: u64 = 2;
 
-/// DEV/TEST-ONLY runtime override: an absolute path to a `meetnotes-brain`-compatible executable
+/// Poll slice while a non-blocking request write is waiting for pipe capacity. Replies are checked
+/// between slices, so a child producing output while its stdin pipe is full cannot deadlock us.
+const PIPE_POLL_SLICE: Duration = Duration::from_millis(10);
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn make_stdin_nonblocking(stdin: &ChildStdin) -> Result<()> {
+    use std::os::fd::AsRawFd;
+
+    const F_GETFL: i32 = 3;
+    const F_SETFL: i32 = 4;
+    #[cfg(target_os = "macos")]
+    const O_NONBLOCK: i32 = 0x0004;
+    #[cfg(target_os = "linux")]
+    const O_NONBLOCK: i32 = 0x0800;
+
+    extern "C" {
+        fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+    }
+
+    let fd = stdin.as_raw_fd();
+    // SAFETY: `fd` is owned by the live `ChildStdin`; `fcntl` is a C function that reports failure
+    // with `-1`/errno and cannot raise an Objective-C exception.
+    let flags = unsafe { fcntl(fd, F_GETFL) };
+    if flags == -1 {
+        return Err(AppError::Unavailable(format!(
+            "brain sidecar stdin flags unavailable: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    // SAFETY: same live descriptor; this only adds O_NONBLOCK and preserves every existing flag.
+    if unsafe { fcntl(fd, F_SETFL, flags | O_NONBLOCK) } == -1 {
+        return Err(AppError::Unavailable(format!(
+            "brain sidecar stdin could not be made non-blocking: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn make_stdin_nonblocking(_stdin: &ChildStdin) -> Result<()> {
+    Err(AppError::Unavailable(
+        "brain sidecar non-blocking stdin is unsupported on this platform".into(),
+    ))
+}
+
+/// DEV/TEST-ONLY runtime override: an absolute path to a `murmur-brain`-compatible executable
 /// (e.g. a fixture shell script speaking the NDJSON protocol). Checked FIRST in [`resolve_bin`], but
 /// ONLY under `test`/`debug_assertions` — a signed RELEASE never reads it (mirrors the
 /// `MURMUR_DEV_DEK`/`MURMUR_AFM_SIDECAR` precedent), so a release can't be pointed at a
@@ -125,8 +174,7 @@ fn ram_permits_load(free_bytes: Option<u64>, model_disk_bytes: u64) -> bool {
     let Some(free) = free_bytes else {
         return true; // probe failed → fail OPEN (never break a working machine on a broken probe).
     };
-    let needed =
-        model_disk_bytes.saturating_mul(MODEL_RAM_HEADROOM_NUM) / MODEL_RAM_HEADROOM_DEN;
+    let needed = model_disk_bytes.saturating_mul(MODEL_RAM_HEADROOM_NUM) / MODEL_RAM_HEADROOM_DEN;
     free >= needed
 }
 
@@ -239,6 +287,9 @@ fn current_timeouts() -> SidecarTimeouts {
 struct SidecarState {
     /// The resident child, `None` when not yet spawned / after a kill+clear.
     child: Option<Child>,
+    /// Unique host ownership proof for `child`. Kept until `try_wait` actually reaps it, so the PID
+    /// cannot be reused while a cancellation handle still targets it.
+    child_identity: Option<Arc<ChildIdentity>>,
     /// The child's stdin (we push `HostMsg::Generate` lines here).
     stdin: Option<ChildStdin>,
     /// The receiving end of the PERSISTENT reader thread's channel — every `ChildMsg` the child emits
@@ -266,6 +317,7 @@ impl SidecarState {
     fn empty() -> Self {
         Self {
             child: None,
+            child_identity: None,
             stdin: None,
             rx: None,
             model_path: PathBuf::new(),
@@ -279,20 +331,194 @@ impl SidecarState {
         self.child.is_some() && self.stdin.is_some() && self.rx.is_some()
     }
 
-    /// KILL the resident child (if any) and WAIT to reap it, then clear all handles. SIGKILL is fine —
-    /// the child has nothing to flush (its output is throwaway NDJSON, no file). EVERY kill is paired
-    /// with a `wait()` so we never leave a zombie. Also used when the child self-exited (EOF): the
-    /// `wait()` reaps the already-dead process before we clear. Dropping `stdin` + `rx` closes the
-    /// child's stdin (read-end EOF) and lets the persistent reader thread END on its own stdout EOF —
-    /// there is only ever ONE reader thread per child, so nothing accumulates.
-    fn kill_and_clear(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            let _ = child.wait(); // reap — no zombie.
+    /// KILL the resident child (if any), poll `try_wait()` within `timeout`, then clear all handles.
+    /// SIGKILL is fine — the child has nothing to flush (its output is throwaway NDJSON, no file).
+    /// A timed-out child remains owned in this state so its PID cannot be reused behind our back and
+    /// a second child cannot spawn. Dropping `stdin` + `rx` after a confirmed reap closes the child's
+    /// stdin and lets the persistent reader thread end on stdout EOF.
+    fn kill_and_clear_bounded(&mut self, timeout: Duration) -> bool {
+        if let Some(child) = self.child.as_mut() {
+            let Some(identity) = self.child_identity.as_ref() else {
+                return false;
+            };
+            if !kill_and_reap_child_bounded(child, identity, timeout) {
+                return false;
+            }
+        }
+        self.child = None;
+        if let Some(identity) = self.child_identity.take() {
+            clear_active_sidecar(&identity);
         }
         self.stdin = None;
         self.rx = None; // dropping the receiver lets the reader thread's send fail → it ends.
+        true
     }
+}
+
+#[derive(Debug)]
+struct ChildIdentity;
+
+struct ActiveKillHandle {
+    pid: u32,
+    owner: Weak<ChildIdentity>,
+}
+
+fn active_kill_handle() -> &'static Mutex<Option<ActiveKillHandle>> {
+    static HANDLE: OnceLock<Mutex<Option<ActiveKillHandle>>> = OnceLock::new();
+    HANDLE.get_or_init(|| Mutex::new(None))
+}
+
+struct SpawnPidGuard {
+    identity: Arc<ChildIdentity>,
+    armed: bool,
+}
+
+impl SpawnPidGuard {
+    fn install(pid: u32) -> Self {
+        let identity = Arc::new(ChildIdentity);
+        let mut handle = active_kill_handle()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *handle = Some(ActiveKillHandle {
+            pid,
+            owner: Arc::downgrade(&identity),
+        });
+        drop(handle);
+        Self {
+            identity,
+            armed: true,
+        }
+    }
+
+    fn disarm(mut self) -> Arc<ChildIdentity> {
+        self.armed = false;
+        Arc::clone(&self.identity)
+    }
+}
+
+impl Drop for SpawnPidGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            clear_active_sidecar(&self.identity);
+        }
+    }
+}
+
+fn clear_active_sidecar(identity: &Arc<ChildIdentity>) {
+    let mut handle = active_kill_handle()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let same_owner = handle
+        .as_ref()
+        .and_then(|h| h.owner.upgrade())
+        .is_some_and(|owner| Arc::ptr_eq(&owner, identity));
+    if same_owner {
+        *handle = None;
+    }
+}
+
+fn signal_active_sidecar() -> Result<bool> {
+    signal_active_sidecar_with(signal_process_immediately)
+}
+
+#[cfg(unix)]
+fn signal_process_immediately(pid: u32) -> Result<bool> {
+    const SIGKILL: i32 = 9;
+    extern "C" {
+        fn kill(pid: i32, signal: i32) -> i32;
+    }
+    let pid = i32::try_from(pid)
+        .map_err(|_| AppError::Unavailable("brain sidecar pid is out of range".into()))?;
+    // SAFETY: numeric PID ownership is held by `signal_active_sidecar_with` across this call. POSIX
+    // kill is non-blocking and reports failure through errno; no pointer crosses the FFI boundary.
+    if unsafe { kill(pid, SIGKILL) } == 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    // ESRCH means there is no process left to signal. The Child handle is still retained and the
+    // bounded try_wait path below remains responsible for the authoritative reap proof.
+    if error.raw_os_error() == Some(3) {
+        Ok(true)
+    } else {
+        Err(AppError::Unavailable(format!(
+            "brain sidecar kill failed: {error}"
+        )))
+    }
+}
+
+#[cfg(not(unix))]
+fn signal_process_immediately(pid: u32) -> Result<bool> {
+    Command::new("kill")
+        .arg(pid.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .map_err(|error| AppError::Unavailable(format!("brain sidecar kill failed: {error}")))
+}
+
+fn signal_active_sidecar_with(signal: impl FnOnce(u32) -> Result<bool>) -> Result<bool> {
+    // Hold the handle mutex through `/bin/kill`: the dispatch path cannot clear/reap this identity
+    // between validation and signal. Every Child::try_wait/reap takes THIS SAME authority, so the
+    // OS cannot recycle the numeric PID while the signal sink is using it.
+    let mut handle = active_kill_handle()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(active) = handle.as_ref() else {
+        return Ok(false);
+    };
+    if active.owner.upgrade().is_none() {
+        *handle = None;
+        return Ok(false);
+    }
+    signal(active.pid)
+}
+
+fn with_active_child_authority<T>(
+    identity: &Arc<ChildIdentity>,
+    action: impl FnOnce(&mut Option<ActiveKillHandle>) -> T,
+) -> Option<T> {
+    let mut handle = active_kill_handle()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let same_owner = handle
+        .as_ref()
+        .and_then(|active| active.owner.upgrade())
+        .is_some_and(|owner| Arc::ptr_eq(&owner, identity));
+    same_owner.then(|| action(&mut handle))
+}
+
+/// Kill/reap under the SAME exclusive identity authority used by numeric-PID signaling. A PID is
+/// reusable only after `try_wait` returns `Some`; the handle is cleared while this mutex is still
+/// held, so no signaler can validate the old identity and then hit a recycled process.
+fn kill_and_reap_child_bounded(
+    child: &mut Child,
+    identity: &Arc<ChildIdentity>,
+    timeout: Duration,
+) -> bool {
+    with_active_child_authority(identity, |handle| {
+        let _ = child.kill();
+        let deadline = Instant::now() + timeout;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => {
+                    *handle = None;
+                    return true;
+                }
+                Ok(None) if Instant::now() >= deadline => return false,
+                Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+                Err(_) => return false,
+            }
+        }
+    })
+    .unwrap_or(false)
+}
+
+fn retain_unreaped_child(state: &mut SidecarState, child: Child, identity: Arc<ChildIdentity>) {
+    state.child = Some(child);
+    state.child_identity = Some(identity);
+    state.stdin = None;
+    state.rx = None;
 }
 
 /// The single process-global dispatch mutex. `OnceLock<Mutex<..>>` mirrors `model_cache()`'s shape.
@@ -301,11 +527,56 @@ fn sidecar() -> &'static Mutex<SidecarState> {
     STATE.get_or_init(|| Mutex::new(SidecarState::empty()))
 }
 
+/// Cancel and reap the resident Brain before capture starts. Dispatch deliberately holds its mutex
+/// for the whole request, so cancellation first validates a dedicated weak ownership handle and
+/// SIGKILLs its content-free PID through `/bin/kill` WITHOUT that mutex. Holding the handle lock
+/// across validation+signal prevents a reap/PID-reuse race. The dispatch reader wakes on EOF;
+/// this function then takes the lock only to prove the child is gone and clear idle handles.
+/// Returns `Ok(false)` on a bounded reap timeout; the caller refuses Start rather than record beside
+/// a still-resident multi-GB child.
+pub(crate) fn kill_for_recording(timeout: Duration) -> Result<bool> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        // Re-read inside the loop: Start can race a dispatch that already owns the mutex but has not
+        // reached `Command::spawn` yet. As soon as that PID appears, cancel it without waiting for
+        // the dispatch mutex.
+        let _ = signal_active_sidecar()?;
+        match sidecar().try_lock() {
+            Ok(mut state) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                let had_child = state.child.is_some();
+                let reaped = state.kill_and_clear_bounded(remaining);
+                if reaped && had_child {
+                    tracing::info!(target: "reason", "reclaimed brain sidecar before recording");
+                }
+                return Ok(reaped);
+            }
+            Err(std::sync::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                let mut state = poisoned.into_inner();
+                return Ok(state
+                    .kill_and_clear_bounded(deadline.saturating_duration_since(Instant::now())));
+            }
+        }
+    }
+}
+
+/// Async-safe wrapper for commands/tasks. PID polling and bounded reap stay entirely on Tokio's
+/// blocking pool; callers never sleep an async runtime worker.
+pub(crate) async fn kill_for_recording_async(timeout: Duration) -> Result<bool> {
+    tokio::task::spawn_blocking(move || kill_for_recording(timeout))
+        .await
+        .map_err(|e| AppError::Other(anyhow::anyhow!("brain sidecar reap worker panicked: {e}")))?
+}
+
 // ---------------------------------------------------------------------------------------------------
 // Binary resolution + hardened spawn (mirrors afm.rs).
 // ---------------------------------------------------------------------------------------------------
 
-/// Resolve the `meetnotes-brain` child binary, or `None`. Order (each filtered by `.exists()`):
+/// Resolve the `murmur-brain` child binary, or `None`. Order (each filtered by `.exists()`):
 /// 1. `MURMUR_BRAIN_SIDECAR` runtime override (dev/test — the fake-child fixture path);
 /// 2. `<current_exe dir>/../Resources/<name>` — the shipped `.app` layout;
 /// 3. the compile-time `BRAIN_BIN` (`build.rs`) DEV fallback (the staged `binaries/<name>`).
@@ -412,7 +683,11 @@ fn spawn_reader_thread(stdout: ChildStdout, tx: mpsc::Sender<ReaderEvent>) {
 /// installed into `state` and `last_used` reset. On ANY failure (no binary / spawn error /
 /// ready-timeout / child error line / EOF) the child is killed+reaped, `failed_until` is set
 /// (backoff), and an `Err` is returned so the caller degrades. NEVER panics, NEVER blocks forever.
-fn spawn_and_wait_ready(state: &mut SidecarState, model_path: &Path, ready_secs: u64) -> Result<()> {
+fn spawn_and_wait_ready(
+    state: &mut SidecarState,
+    model_path: &Path,
+    ready_secs: u64,
+) -> Result<()> {
     let bin = resolve_bin()
         .ok_or_else(|| AppError::Unavailable("on-device brain sidecar binary not found".into()))?;
 
@@ -431,14 +706,24 @@ fn spawn_and_wait_ready(state: &mut SidecarState, model_path: &Path, ready_secs:
     let mut child = cmd
         .spawn()
         .map_err(|e| AppError::Unavailable(format!("brain sidecar spawn failed: {e}")))?;
+    let pid_guard = SpawnPidGuard::install(child.id());
 
     let stdin = child.stdin.take();
     let stdout = child.stdout.take();
     let (Some(stdin), Some(stdout)) = (stdin, stdout) else {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(AppError::Unavailable("brain sidecar pipes unavailable".into()));
+        if !kill_and_reap_child_bounded(&mut child, &pid_guard.identity, Duration::from_secs(2)) {
+            retain_unreaped_child(state, child, pid_guard.disarm());
+        }
+        return Err(AppError::Unavailable(
+            "brain sidecar pipes unavailable".into(),
+        ));
     };
+    if let Err(error) = make_stdin_nonblocking(&stdin) {
+        if !kill_and_reap_child_bounded(&mut child, &pid_guard.identity, Duration::from_secs(2)) {
+            retain_unreaped_child(state, child, pid_guard.disarm());
+        }
+        return Err(error);
+    }
 
     let (tx, rx) = mpsc::channel::<ReaderEvent>();
     spawn_reader_thread(stdout, tx);
@@ -450,8 +735,10 @@ fn spawn_and_wait_ready(state: &mut SidecarState, model_path: &Path, ready_secs:
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            let _ = child.kill();
-            let _ = child.wait();
+            if !kill_and_reap_child_bounded(&mut child, &pid_guard.identity, Duration::from_secs(2))
+            {
+                retain_unreaped_child(state, child, pid_guard.disarm());
+            }
             state.failed_until = Some(Instant::now() + Duration::from_secs(BACKOFF_SECS));
             tracing::warn!(target: "reason", ready_s = ready_secs, "brain sidecar ready-handshake timed out");
             return Err(AppError::Unavailable(
@@ -461,6 +748,7 @@ fn spawn_and_wait_ready(state: &mut SidecarState, model_path: &Path, ready_secs:
         match rx.recv_timeout(remaining) {
             Ok(ReaderEvent::Msg(ChildMsg::Ready { .. })) => {
                 state.child = Some(child);
+                state.child_identity = Some(pid_guard.disarm());
                 state.stdin = Some(stdin);
                 state.rx = Some(rx);
                 state.model_path = model_path.to_path_buf();
@@ -471,8 +759,13 @@ fn spawn_and_wait_ready(state: &mut SidecarState, model_path: &Path, ready_secs:
             }
             // The child reported a load error (bad path / OOM refusal). Map it, kill+reap, back off.
             Ok(ReaderEvent::Msg(ChildMsg::Error { kind, message, .. })) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                if !kill_and_reap_child_bounded(
+                    &mut child,
+                    &pid_guard.identity,
+                    Duration::from_secs(2),
+                ) {
+                    retain_unreaped_child(state, child, pid_guard.disarm());
+                }
                 state.failed_until = Some(Instant::now() + Duration::from_secs(BACKOFF_SECS));
                 tracing::warn!(target: "reason", kind = ?kind, "brain sidecar reported an error before ready");
                 return Err(map_error_kind(kind, message));
@@ -481,7 +774,13 @@ fn spawn_and_wait_ready(state: &mut SidecarState, model_path: &Path, ready_secs:
             Ok(ReaderEvent::Msg(_)) => continue,
             // EOF: the child exited before Ready (crash / non-zero exit). Reap, back off, degrade.
             Ok(ReaderEvent::Eof) => {
-                let _ = child.wait();
+                if !kill_and_reap_child_bounded(
+                    &mut child,
+                    &pid_guard.identity,
+                    Duration::from_secs(2),
+                ) {
+                    retain_unreaped_child(state, child, pid_guard.disarm());
+                }
                 state.failed_until = Some(Instant::now() + Duration::from_secs(BACKOFF_SECS));
                 return Err(AppError::Unavailable(
                     "brain sidecar failed to become ready".into(),
@@ -489,8 +788,13 @@ fn spawn_and_wait_ready(state: &mut SidecarState, model_path: &Path, ready_secs:
             }
             // Deadline elapsed with no message — kill+reap, back off, degrade.
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                if !kill_and_reap_child_bounded(
+                    &mut child,
+                    &pid_guard.identity,
+                    Duration::from_secs(2),
+                ) {
+                    retain_unreaped_child(state, child, pid_guard.disarm());
+                }
                 state.failed_until = Some(Instant::now() + Duration::from_secs(BACKOFF_SECS));
                 tracing::warn!(target: "reason", ready_s = ready_secs, "brain sidecar ready-handshake timed out");
                 return Err(AppError::Unavailable(
@@ -499,8 +803,13 @@ fn spawn_and_wait_ready(state: &mut SidecarState, model_path: &Path, ready_secs:
             }
             // The reader thread hung up (spawn failed / it ended) — treat as a failed spawn.
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                if !kill_and_reap_child_bounded(
+                    &mut child,
+                    &pid_guard.identity,
+                    Duration::from_secs(2),
+                ) {
+                    retain_unreaped_child(state, child, pid_guard.disarm());
+                }
                 state.failed_until = Some(Instant::now() + Duration::from_secs(BACKOFF_SECS));
                 return Err(AppError::Unavailable(
                     "brain sidecar failed to become ready".into(),
@@ -537,6 +846,7 @@ fn to_wire(opts: &GenOptions) -> GenOptsWire {
 enum Outcome {
     Done(String),
     ChildError(ErrorKind, String),
+    WriteError(String),
     Eof,
     Timeout,
 }
@@ -546,13 +856,13 @@ enum Outcome {
 /// the WHOLE-string result. On ANY failure returns a mapped `AppError` so the caller degrades.
 ///
 /// PIPE-DEADLOCK AVOIDANCE: the `HostMsg::Generate` line (which can carry a >64 KB transcript) is
-/// pushed on a dedicated scoped WRITER thread while the PERSISTENT reader thread drains `ChildMsg`
-/// lines into the channel THIS thread `recv_timeout`s on — so neither side ever blocks on a full OS
-/// pipe buffer, and the dispatcher never blocks in a raw pipe read (the deadline is always honored).
+/// written in non-blocking chunks while the PERSISTENT reader thread drains `ChildMsg` lines into
+/// the channel this thread polls between writes. The dispatcher owns stdin throughout; no scoped
+/// writer can trap it in `join()` before timeout/kill/reap.
 ///
 /// TIMEOUT = KILL+RESPAWN: the deadline is `opts.timeout` (or the `hard_cap_secs` when `None`). On the
-/// deadline the child is `kill()+wait()`ed (TRUE cancellation + full RAM reclaim) and the exact
-/// message `"on-device brain generation timed out"` returned (KEPT verbatim so existing callers/tests
+/// deadline the child is killed and reaped with bounded `try_wait()` polling (TRUE cancellation +
+/// full RAM reclaim) and the exact message `"on-device brain generation timed out"` returned (KEPT verbatim so existing callers/tests
 /// are unchanged). The next call respawns.
 fn dispatch(
     model_path: &Path,
@@ -582,13 +892,21 @@ fn dispatch(
         && Instant::now().duration_since(state.last_used) > Duration::from_secs(t.idle_secs)
     {
         tracing::info!(target: "reason", idle_s = t.idle_secs, "idle-killing brain sidecar to reclaim RAM");
-        state.kill_and_clear();
+        if !state.kill_and_clear_bounded(Duration::from_secs(2)) {
+            return Err(AppError::Unavailable(
+                "on-device brain sidecar is still terminating".into(),
+            ));
+        }
     }
 
     // Model changed under us (user selected a different GGUF) ⇒ kill the old resident child.
     if state.is_live() && state.model_path != model_path {
         tracing::info!(target: "reason", "brain model changed; respawning sidecar");
-        state.kill_and_clear();
+        if !state.kill_and_clear_bounded(Duration::from_secs(2)) {
+            return Err(AppError::Unavailable(
+                "on-device brain sidecar is still terminating".into(),
+            ));
+        }
     }
 
     // Spawn lazily on first use / after any kill. The RAM pre-check refuses-to-Cloud BEFORE paying a
@@ -598,6 +916,11 @@ fn dispatch(
     // the whole system is under pressure") than "does this job's footprint fit the free/inactive
     // arithmetic". Refuses only on CRITICAL kernel pressure; fails open on a broken probe either way.
     if !state.is_live() {
+        if state.child.is_some() && !state.kill_and_clear_bounded(Duration::from_millis(100)) {
+            return Err(AppError::Unavailable(
+                "on-device brain sidecar is still terminating".into(),
+            ));
+        }
         if let Some(bytes) = model_disk_bytes(model_path) {
             if !crate::perf::heavy_op_permitted(ram_permits_load(available_ram_bytes(), bytes)) {
                 let gb = bytes as f64 / 1_073_741_824.0;
@@ -628,12 +951,14 @@ fn dispatch(
         opts: to_wire(&opts),
         json_schema: json_schema.cloned(),
     };
-    let line = match serde_json::to_string(&req) {
+    let mut line = match serde_json::to_string(&req) {
         Ok(l) => l,
         Err(e) => return Err(AppError::Summarize(format!("brain request serialize: {e}"))),
     };
+    line.push('\n');
 
-    // Take stdin OUT for the scoped writer to own; the reader channel stays in `state`.
+    // Take stdin OUT so this dispatch exclusively owns the non-blocking request pump; the reader
+    // channel stays in `state`.
     let mut stdin = match state.stdin.take() {
         Some(s) => s,
         None => return Err(AppError::Summarize("brain sidecar stdin missing".into())),
@@ -647,58 +972,81 @@ fn dispatch(
     };
 
     let deadline = Instant::now() + budget;
+    let bytes = line.as_bytes();
+    let mut written = 0usize;
 
-    // WRITER on a scoped thread: push the (possibly huge) request line + newline, then flush. A
-    // BrokenPipe (child already died) is ignored — the reader/deadline below owns the outcome.
-    // Meanwhile THIS thread reads replies from the channel, so a >64 KB request never deadlocks
-    // against a >64 KB response.
-    let (outcome, recovered_stdin) = std::thread::scope(|scope| {
-        let writer = scope.spawn(move || {
-            let _ = stdin.write_all(line.as_bytes());
-            let _ = stdin.write_all(b"\n");
-            let _ = stdin.flush();
-            stdin // hand it back so the caller can keep the resident pipe
-        });
+    // Pump request bytes and replies under ONE deadline. When the pipe is full, wait only a short
+    // slice for a reply before retrying the write. A terminal reply received before the request was
+    // fully consumed is a protocol failure: accepting its text would silently build a note/reply
+    // from a truncated prompt. The child is torn down below because unread request bytes would also
+    // corrupt the next generation.
+    let outcome = loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break Outcome::Timeout;
+        }
 
-        // Read replies for THIS id until Done / Error / EOF / deadline.
-        let outcome = loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                break Outcome::Timeout;
+        let mut write_blocked = false;
+        if written < bytes.len() {
+            match stdin.write(&bytes[written..]) {
+                Ok(0) => break Outcome::WriteError("stdin pipe closed".into()),
+                Ok(count) => written = written.saturating_add(count),
+                Err(error) if error.kind() == IoErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == IoErrorKind::WouldBlock => write_blocked = true,
+                Err(error) => break Outcome::WriteError(error.to_string()),
             }
-            match rx.recv_timeout(remaining) {
-                Ok(ReaderEvent::Msg(ChildMsg::Done { id: rid, text })) if rid == id => {
-                    break Outcome::Done(text);
-                }
-                Ok(ReaderEvent::Msg(ChildMsg::Error {
-                    id: rid,
-                    kind,
-                    message,
-                })) if rid == id => {
-                    break Outcome::ChildError(kind, message);
-                }
-                // A heartbeat for OUR id: liveness. The `deadline` is the hard ceiling (the caller's
-                // budget / hard cap), so a productive child that keeps beating simply continues until
-                // it Dones — we do not extend PAST the ceiling (a wedged child that somehow beats can't
-                // outlast the cap). Non-matching lines are stray late replies from a prior request.
-                Ok(ReaderEvent::Msg(_)) => continue,
-                Ok(ReaderEvent::Eof) => break Outcome::Eof,
-                Err(mpsc::RecvTimeoutError::Timeout) => break Outcome::Timeout,
-                // The reader thread ended (child gone) — treat as EOF.
-                Err(mpsc::RecvTimeoutError::Disconnected) => break Outcome::Eof,
+        }
+
+        let event = if written == bytes.len() {
+            rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        } else if write_blocked {
+            rx.recv_timeout(PIPE_POLL_SLICE.min(deadline.saturating_duration_since(Instant::now())))
+        } else {
+            match rx.try_recv() {
+                Ok(event) => Ok(event),
+                Err(mpsc::TryRecvError::Empty) => continue,
+                Err(mpsc::TryRecvError::Disconnected) => Err(mpsc::RecvTimeoutError::Disconnected),
             }
         };
 
-        // Join the writer to recover stdin. It NEVER blocks indefinitely: either it finished the
-        // write, or the child died and its stdin read-end closed (BrokenPipe → the write returns).
-        let recovered = writer.join().ok();
-        (outcome, recovered)
-    });
+        match event {
+            Ok(ReaderEvent::Msg(ChildMsg::Done { id: rid, text })) if rid == id => {
+                break Outcome::Done(text);
+            }
+            Ok(ReaderEvent::Msg(ChildMsg::Error {
+                id: rid,
+                kind,
+                message,
+            })) if rid == id => break Outcome::ChildError(kind, message),
+            // Heartbeats and stray replies never extend the caller's hard deadline.
+            Ok(ReaderEvent::Msg(_)) => continue,
+            Ok(ReaderEvent::Eof) => break Outcome::Eof,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if Instant::now() >= deadline {
+                    break Outcome::Timeout;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break Outcome::Eof,
+        }
+    };
+    let request_complete = written == bytes.len();
 
     // Resolve the outcome, re-installing the resident pipes ONLY when the child is still healthy.
     match outcome {
         Outcome::Done(text) => {
-            state.stdin = recovered_stdin;
+            if !request_complete {
+                tracing::warn!(target: "reason", "brain sidecar replied before consuming its request; terminating protocol stream");
+                if !state.kill_and_clear_bounded(Duration::from_secs(2)) {
+                    return Err(AppError::Unavailable(
+                        "on-device brain returned before the full request and could not be proven stopped"
+                            .into(),
+                    ));
+                }
+                return Err(AppError::Summarize(
+                    "on-device brain returned before the full request was delivered".into(),
+                ));
+            }
+            state.stdin = Some(stdin);
             state.last_used = Instant::now();
             state.failed_until = None;
             if json_schema.is_some() {
@@ -709,22 +1057,31 @@ fn dispatch(
             Ok(text)
         }
         Outcome::ChildError(kind, message) => {
-            // A generation error, but the child is still alive — keep it resident, degrade this call.
-            state.stdin = recovered_stdin;
+            // A generation error after a complete request leaves the child reusable. An early error
+            // tears it down because unread bytes would desynchronise the next NDJSON request.
+            if request_complete {
+                state.stdin = Some(stdin);
+            } else {
+                let _ = state.kill_and_clear_bounded(Duration::from_secs(2));
+            }
             state.last_used = Instant::now();
             Err(map_error_kind(kind, message))
         }
+        Outcome::WriteError(error) => {
+            let _ = state.kill_and_clear_bounded(Duration::from_secs(2));
+            Err(AppError::Summarize(format!(
+                "brain sidecar request write failed: {error}"
+            )))
+        }
         Outcome::Eof => {
             // The child died mid-request. Reap the process, clear, degrade.
-            state.stdin = recovered_stdin; // put it back so kill_and_clear's Drop closes it cleanly
-            state.kill_and_clear();
+            let _ = state.kill_and_clear_bounded(Duration::from_secs(2));
             Err(AppError::Summarize("brain sidecar exited".into()))
         }
         Outcome::Timeout => {
             // TRUE cancellation: KILL+WAIT reclaims ALL model RAM and stops the wedged decode. The
             // next call respawns. KEEP this exact message (existing callers/tests match it).
-            state.stdin = recovered_stdin;
-            state.kill_and_clear();
+            let _ = state.kill_and_clear_bounded(Duration::from_secs(2));
             tracing::warn!(target: "reason", budget_s = budget.as_secs(), "brain sidecar generation timed out; killed + will respawn");
             Err(AppError::Unavailable(
                 "on-device brain generation timed out".into(),
@@ -737,7 +1094,7 @@ fn dispatch(
 // The public reasoner + app-exit hook.
 // ---------------------------------------------------------------------------------------------------
 
-/// A [`LocalReasoner`] that drives the on-device brain through the killable `meetnotes-brain` child.
+/// A [`LocalReasoner`] that drives the on-device brain through the killable `murmur-brain` child.
 /// Holds only the resolved GGUF path + an id (the child + RAM live in the process-global
 /// [`sidecar`]), so it is CHEAP to build per resolution — mirroring how the old `MistralReasoner` held
 /// only paths. All the lifecycle (spawn / idle-kill / timeout-kill / respawn) is process-global.
@@ -816,31 +1173,17 @@ impl LocalReasoner for SidecarReasoner {
 }
 
 /// App-exit hook (wired from `lib.rs` `RunEvent::ExitRequested`): KILL the resident child + a BOUNDED
-/// reap so app-exit is never blocked. A killed child reparents to launchd and the startup reaper
-/// (`aec::reap_orphaned_capture_helpers`) SIGTERMs it next launch, so a slow reap here is safe to
-/// abandon. Best-effort + panic-free.
+/// reap so app-exit is never blocked. A force-killed parent cannot safely signal a later PID by
+/// observation alone; the child's own parent-death watchdog exits from inside the exact process,
+/// even during a stuck generation, and the next recording admission refuses to overlap any
+/// detected survivor. Best-effort + panic-free.
 pub fn kill_on_quit() {
     let Ok(mut state) = sidecar().lock() else {
         return; // poisoned — the OS reaps the child on process teardown anyway.
     };
-    if let Some(mut child) = state.child.take() {
-        let _ = child.kill();
-        // BOUNDED try_wait loop — never block quit indefinitely.
-        let deadline = Instant::now() + Duration::from_secs(QUIT_REAP_SECS);
-        loop {
-            match child.try_wait() {
-                Ok(Some(_)) => break, // reaped
-                Ok(None) if Instant::now() >= deadline => {
-                    tracing::warn!(target: "reason", "brain sidecar did not reap within the quit budget; leaving to the startup reaper");
-                    break;
-                }
-                Ok(None) => std::thread::sleep(Duration::from_millis(20)),
-                Err(_) => break,
-            }
-        }
+    if !state.kill_and_clear_bounded(Duration::from_secs(QUIT_REAP_SECS)) {
+        tracing::warn!(target: "reason", "brain sidecar did not reap within the quit budget; retaining child ownership until process exit");
     }
-    state.stdin = None;
-    state.rx = None;
 }
 
 #[cfg(test)]
@@ -896,6 +1239,11 @@ mod tests {
         }
     }
 
+    #[test]
+    fn production_sidecar_name_is_murmur_brain() {
+        assert_eq!(SIDECAR_NAME, "murmur-brain");
+    }
+
     /// The wire mapping: every child ErrorKind lands on a degrade-able AppError variant.
     #[test]
     fn error_kind_maps_to_degradeable_apperror() {
@@ -923,16 +1271,98 @@ mod tests {
     /// process-global child, so each must start clean and hold a test-serialization lock).
     fn reset_state() {
         if let Ok(mut s) = sidecar().lock() {
-            s.kill_and_clear();
+            let _ = s.kill_and_clear_bounded(Duration::from_secs(2));
             s.failed_until = None;
             s.model_path = PathBuf::new();
             s.last_used = Instant::now();
         }
     }
 
+    fn active_owned_pid() -> Option<u32> {
+        active_kill_handle()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .filter(|handle| handle.owner.upgrade().is_some())
+            .map(|handle| handle.pid)
+    }
+
     /// Serialize the fake-child tests: they share the ONE process-global resident child + the
     /// `MURMUR_BRAIN_SIDECAR` override, so they must not run concurrently.
     static SIDECAR_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn sidecar_test_guards() -> (
+        std::sync::MutexGuard<'static, ()>,
+        std::sync::MutexGuard<'static, ()>,
+    ) {
+        let sidecar = SIDECAR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let residency = crate::perf::model_lifecycle_test_guard();
+        (sidecar, residency)
+    }
+
+    /// RED-before-GREEN for the PID-reuse race: once a signaler has validated an identity and
+    /// entered the injected signal sink, the reap authority must remain blocked. Therefore the OS
+    /// cannot recycle that PID before the signal returns. The old split-lock design allowed
+    /// `Child::try_wait` to reap between validation and `/bin/kill`.
+    #[test]
+    fn validated_pid_cannot_be_reaped_until_signal_sink_returns() {
+        let (_g, _residency) = sidecar_test_guards();
+        reset_state();
+        let identity = Arc::new(ChildIdentity);
+        *active_kill_handle()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(ActiveKillHandle {
+            pid: 42_424,
+            owner: Arc::downgrade(&identity),
+        });
+
+        let (signal_entered_tx, signal_entered_rx) = std::sync::mpsc::channel();
+        let (release_signal_tx, release_signal_rx) = std::sync::mpsc::channel();
+        let signaler = std::thread::spawn(move || {
+            signal_active_sidecar_with(|pid| {
+                assert_eq!(pid, 42_424);
+                signal_entered_tx.send(()).unwrap();
+                release_signal_rx.recv().unwrap();
+                Ok(true)
+            })
+            .unwrap()
+        });
+        signal_entered_rx.recv().unwrap();
+
+        let identity_for_reap = Arc::clone(&identity);
+        let (reap_at_lock_tx, reap_at_lock_rx) = std::sync::mpsc::channel();
+        let (blocked_result_tx, blocked_result_rx) = std::sync::mpsc::channel();
+        let (reap_entered_tx, reap_entered_rx) = std::sync::mpsc::channel();
+        let reaper = std::thread::spawn(move || {
+            // Prove this thread was scheduled and reached the exact authority mutex boundary;
+            // `try_lock` gives a deterministic blocked result instead of a timeout-based guess.
+            reap_at_lock_tx.send(()).unwrap();
+            let blocked = matches!(
+                active_kill_handle().try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            );
+            blocked_result_tx.send(blocked).unwrap();
+            with_active_child_authority(&identity_for_reap, |handle| {
+                reap_entered_tx.send(()).unwrap();
+                *handle = None;
+            })
+        });
+        reap_at_lock_rx.recv().unwrap();
+        assert!(
+            blocked_result_rx.recv().unwrap(),
+            "reaper reached the authority mutex but it was not held by the validated signal sink"
+        );
+
+        release_signal_tx.send(()).unwrap();
+        assert!(signaler.join().unwrap());
+        reap_entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("reap authority must resume after the signal sink returns");
+        assert!(reaper.join().unwrap().is_some());
+        assert!(active_owned_pid().is_none());
+    }
 
     /// Write an executable fake-child shell script to a temp path and point `MURMUR_BRAIN_SIDECAR`
     /// at it. `body` is the script AFTER the shebang. Returns the path (cleaned up by the caller).
@@ -986,7 +1416,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn generate_round_trips_ready_then_done() {
-        let _g = SIDECAR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_g, _residency) = sidecar_test_guards();
         reset_state();
         // Emit Ready, then for every stdin line parse its "id" and echo Done with that id.
         let script = write_fake_child("done", ECHO_DONE_BODY);
@@ -1003,7 +1433,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn ready_timeout_degrades_and_kills() {
-        let _g = SIDECAR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_g, _residency) = sidecar_test_guards();
         reset_state();
         let script = write_fake_child("noready", "sleep 30\n");
         let model = dummy_model();
@@ -1033,7 +1463,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn per_request_timeout_kills_then_respawns() {
-        let _g = SIDECAR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_g, _residency) = sidecar_test_guards();
         reset_state();
         let marker = marker_path("timeout");
         let _ = std::fs::remove_file(&marker);
@@ -1089,13 +1519,46 @@ done
         cleanup(&script, &model);
     }
 
+    /// Recording priority cancels an in-flight killable generation immediately instead of waiting
+    /// for its ordinary request timeout / the generic native drain budget.
+    #[cfg(unix)]
+    #[test]
+    fn recording_start_kills_and_reaps_an_inflight_sidecar_promptly() {
+        let (_g, _residency) = sidecar_test_guards();
+        reset_state();
+        let script = write_fake_child(
+            "recording-cancel",
+            "printf '{\"type\":\"ready\",\"model_id\":\"fake\"}\\n'\nwhile IFS= read -r _line; do\n  exec sleep 30\ndone\n",
+        );
+        let model = dummy_model();
+        let reasoner = SidecarReasoner::new(model.clone(), SidecarTimeouts::default()).unwrap();
+        let generation = std::thread::spawn(move || reasoner.reason("s", "u"));
+
+        let pid_deadline = Instant::now() + Duration::from_secs(2);
+        while active_owned_pid().is_none() && Instant::now() < pid_deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(active_owned_pid().is_some());
+
+        let started = Instant::now();
+        assert!(kill_for_recording(Duration::from_secs(2)).unwrap());
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "recording cancellation must not wait for the 30s fake generation"
+        );
+        assert!(generation.join().unwrap().is_err());
+        assert!(active_owned_pid().is_none());
+
+        cleanup(&script, &model);
+    }
+
     /// EOF / CRASH mid-request → REAP → RESPAWN: a fake child that goes Ready then EXITS on the first
     /// request (EOF mid-request) surfaces `Summarize("brain sidecar exited")`, reaps the process
     /// (no zombie, slot cleared), and a 2nd call respawns + succeeds.
     #[cfg(unix)]
     #[test]
     fn eof_mid_request_reaps_then_respawns() {
-        let _g = SIDECAR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_g, _residency) = sidecar_test_guards();
         reset_state();
         let marker = marker_path("eof");
         let _ = std::fs::remove_file(&marker);
@@ -1145,7 +1608,7 @@ done
     #[cfg(unix)]
     #[test]
     fn idle_kill_reclaims_then_next_call_respawns() {
-        let _g = SIDECAR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_g, _residency) = sidecar_test_guards();
         reset_state();
         let script = write_fake_child("idle", ECHO_DONE_BODY);
         let model = dummy_model();
@@ -1171,8 +1634,9 @@ done
         cleanup(&script, &model);
     }
 
-    /// PIPE-DEADLOCK PROOF (the BLOCKER test): a >128 KB PROMPT AND a >128 KB RESPONSE must NOT
-    /// deadlock — and this test is RED-if-the-writer-thread-is-collapsed onto the dispatch thread.
+    /// PIPE-DEADLOCK + TRUNCATION PROOF: an early >128 KB response while a >128 KB prompt remains
+    /// only partly delivered must terminate promptly as an ERROR, never be accepted as if the child
+    /// had reasoned over the full prompt. This test is also RED if stdin becomes blocking again.
     ///
     /// The bind: the fake child reads only a SMALL PREFIX of stdin (`head -c 4096`, enough to parse the
     /// early `"id":N`) and then emits a >128 KB `Done` WITHOUT draining the rest of the (>150 KB)
@@ -1183,22 +1647,19 @@ done
     ///   - the response (>128 KB) far exceeds the ~64 KB stdout pipe buffer, and the child fills it —
     ///     so a host that is blocked writing (not reading stdout) can never drain it.
     ///
-    /// A hypothetical single-threaded host that WROTE-then-READ would therefore DEADLOCK here (writer
-    /// blocked on a full stdin pipe, child blocked on a full stdout pipe, neither draining the other).
-    /// The shipped design — a scoped WRITER thread doing the blocking write while THIS (dispatch) thread
-    /// drains the persistent-reader channel — completes. If the writer were collapsed onto the dispatch
-    /// thread, this test would hang (and the 6 s hard-cap below turns the hang into a FAILED assertion,
-    /// not an infinite test).
+    /// A blocking write-then-read host would DEADLOCK here. The shipped design pumps a non-blocking
+    /// stdin while the reader thread drains stdout, rejects the incomplete-prompt result, and kills
+    /// the now-desynchronised child. The 6 s cap turns a regression into a bounded failure.
     #[cfg(unix)]
     #[test]
-    fn huge_prompt_and_huge_response_do_not_deadlock() {
-        let _g = SIDECAR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    fn early_huge_response_to_partial_huge_prompt_is_bounded_error() {
+        let (_g, _residency) = sidecar_test_guards();
         reset_state();
         let big_len = 200_000usize; // > 128 KB, > the 64 KB pipe buffer
-        // Read ONLY a 4 KB prefix of stdin (the `"id":N` sits near the front of the request line), then
-        // emit the huge Done WITHOUT reading the remaining ~146 KB — leaving the stdin pipe full so a
-        // write-then-read host would wedge. No `while`/`read` loop: draining the rest of stdin would
-        // UNBIND the test.
+                                    // Read ONLY a 4 KB prefix of stdin (the `"id":N` sits near the front of the request line), then
+                                    // emit the huge Done WITHOUT reading the remaining ~146 KB — leaving the stdin pipe full so a
+                                    // write-then-read host would wedge. No `while`/`read` loop: draining the rest of stdin would
+                                    // UNBIND the test.
         let body = format!(
             r#"printf '{{"type":"ready","model_id":"fake"}}\n'
 PREFIX=$(head -c 4096)
@@ -1215,7 +1676,7 @@ sleep 20
         let script = write_fake_child("huge", &body);
         let model = dummy_model();
 
-        // A >128 KB PROMPT: the host writes this whole thing on the scoped writer thread.
+        // A >128 KB PROMPT: the host pumps this through non-blocking stdin.
         let huge_user = "u".repeat(150_000);
         // A hard 6 s per-request cap so a REGRESSION (writer collapsed → deadlock) surfaces as a
         // Timeout-mapped `Unavailable`, i.e. a FAILED assertion below, rather than an infinite hang.
@@ -1224,15 +1685,55 @@ sleep 20
             ..GenOptions::default()
         };
         let r = SidecarReasoner::new(model.clone(), SidecarTimeouts::default()).unwrap();
+        let started = Instant::now();
+        let result = r.reason_with("system", &huge_user, opts);
+        assert!(
+            result.is_err(),
+            "an answer to a partial prompt must be rejected"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "partial-write protocol failure must stay bounded"
+        );
+        assert!(
+            !sidecar().lock().unwrap().is_live(),
+            "the desynchronised child must be reaped"
+        );
+        cleanup(&script, &model);
+    }
+
+    /// Full-drain twin: both directions exceed ordinary pipe capacity, but the child consumes the
+    /// complete NDJSON request before replying. Concurrent pumping must return the whole response.
+    #[cfg(unix)]
+    #[test]
+    fn fully_drained_huge_prompt_and_response_succeed() {
+        let (_g, _residency) = sidecar_test_guards();
+        reset_state();
+        let big_len = 200_000usize;
+        let body = format!(
+            r#"printf '{{"type":"ready","model_id":"fake"}}\n'
+BIG=$(awk 'BEGIN{{s="";for(i=0;i<{n};i++)s=s "x";print s}}')
+while IFS= read -r line; do
+  ID=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  [ -z "$ID" ] && ID=1
+  printf '{{"type":"done","id":%s,"text":"%s"}}\n' "$ID" "$BIG"
+done
+"#,
+            n = big_len
+        );
+        let script = write_fake_child("huge-full-drain", &body);
+        let model = dummy_model();
+        let huge_user = "u".repeat(150_000);
+        let opts = GenOptions {
+            timeout: Some(Duration::from_secs(6)),
+            ..GenOptions::default()
+        };
+        let r = SidecarReasoner::new(model.clone(), SidecarTimeouts::default()).unwrap();
         let got = r
             .reason_with("system", &huge_user, opts)
-            .expect("a >128 KB request + >128 KB response must complete on the writer-thread design");
-        assert!(
-            got.len() >= big_len,
-            "the >128 KB response must come back whole (got {} bytes)",
-            got.len()
-        );
-        assert!(got.bytes().all(|b| b == b'x'), "response body intact");
+            .expect("fully drained >pipe-cap request/response must succeed");
+        assert_eq!(got.len(), big_len);
+        assert!(got.bytes().all(|byte| byte == b'x'));
         cleanup(&script, &model);
     }
 

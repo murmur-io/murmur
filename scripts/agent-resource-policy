@@ -1,0 +1,15 @@
+#!/usr/bin/env python3
+"""Thin CLI adapter for the canonical harness resource policy."""
+
+from pathlib import Path
+import sys
+
+
+HARNESS = Path(__file__).resolve().parents[1] / ".agents" / "harness"
+sys.path.insert(0, str(HARNESS))
+
+from resource_policy import main  # noqa: E402
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

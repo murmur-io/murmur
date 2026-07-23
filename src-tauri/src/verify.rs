@@ -248,7 +248,13 @@ pub fn apply_verify_callout(note_md: &str, findings: &[VerifyFinding], as_of: &s
             }
         })
         .collect();
-    crate::enrich::apply_fenced_block(note_md, VERIFY_FENCE_START, VERIFY_FENCE_END, &callout, &body)
+    crate::enrich::apply_fenced_block(
+        note_md,
+        VERIFY_FENCE_START,
+        VERIFY_FENCE_END,
+        &callout,
+        &body,
+    )
 }
 
 /// Append one non-destructive marker blockquote after each finding's line. IDEMPOTENT: all
@@ -308,7 +314,10 @@ mod tests {
         let md = "---\ntitle: x\n---\n# Notes\n- Ship PROJ-123 by Friday\n- PROJ-123 again\n- also ABC-9\n";
         let keys = extract_issue_keys(md);
         // 1-based line numbers COUNT the frontmatter lines: PROJ-123 sits on line 5, ABC-9 on 7.
-        assert_eq!(keys, vec![(5, "PROJ-123".to_string()), (7, "ABC-9".to_string())]);
+        assert_eq!(
+            keys,
+            vec![(5, "PROJ-123".to_string()), (7, "ABC-9".to_string())]
+        );
         // Cap at 10 unique keys.
         let many: String = (1..=15).map(|i| format!("- K{i}A-{i}\n")).collect();
         assert_eq!(extract_issue_keys(&many).len(), 10);
@@ -383,7 +392,10 @@ mod tests {
         let once = apply_verify_markers(md, std::slice::from_ref(&f));
         // Every marker-originated line is strippable: re-applying with no findings removes ALL of it.
         let cleaned = apply_verify_markers(&once, &[]);
-        assert_eq!(cleaned, md, "a multiline detail must not leave residue after strip");
+        assert_eq!(
+            cleaned, md,
+            "a multiline detail must not leave residue after strip"
+        );
         // And idempotency holds.
         let twice = apply_verify_markers(&once, &[f]);
         assert_eq!(once, twice);
@@ -398,7 +410,10 @@ mod tests {
         let s = snap("PROJ-1", "In Progress", Some("2026-07-10"));
         let (v, d) = judge_with_detail("- Ship PROJ-1 soon", "PROJ-1", Some(&s));
         assert!(matches!(v, Verdict::Confirmed));
-        assert_eq!(d, "✓ Confirmed — PROJ-1 · Status: In Progress · due 2026-07-10");
+        assert_eq!(
+            d,
+            "✓ Confirmed — PROJ-1 · Status: In Progress · due 2026-07-10"
+        );
 
         let (v, d) = judge_with_detail("- Ship PROJ-1", "PROJ-1", None);
         assert!(matches!(v, Verdict::NotFound));
@@ -406,7 +421,10 @@ mod tests {
 
         let (v, d) = judge_with_detail("- Ship PROJ-1 by 2026-07-08", "PROJ-1", Some(&s));
         assert!(matches!(v, Verdict::Conflict));
-        assert_eq!(d, "⧗ Conflict — note says 2026-07-08, PROJ-1 due 2026-07-10");
+        assert_eq!(
+            d,
+            "⧗ Conflict — note says 2026-07-08, PROJ-1 due 2026-07-10"
+        );
     }
 
     fn finding(verdict: Verdict, detail: &str, url: &str) -> VerifyFinding {
@@ -430,7 +448,10 @@ mod tests {
             "https://x/browse/PROJ-1",
         )];
         let once = apply_verify_callout(md, &fs, "2026-07-10T12:00:00Z");
-        assert!(once.starts_with(md), "original note preserved byte-for-byte");
+        assert!(
+            once.starts_with(md),
+            "original note preserved byte-for-byte"
+        );
         assert!(once.contains("> [!verify]- Source check (as of 2026-07-10T12:00:00Z)"));
         assert!(once.contains(
             "> - ⧗ Conflict — note says 2026-07-08, PROJ-1 due 2026-07-10 (via Jira) — https://x/browse/PROJ-1"
@@ -469,10 +490,20 @@ mod tests {
             "https://x/<!-- /murmur:verify -->",
         );
         let out = apply_verify_callout("# N\n- keep me\n", std::slice::from_ref(&evil), "now");
-        assert_eq!(out.matches(VERIFY_FENCE_START).count(), 1, "no forged start fence");
-        assert_eq!(out.matches(VERIFY_FENCE_END).count(), 1, "no forged end fence");
         assert_eq!(
-            out.lines().filter(|l| l.trim_start().starts_with("> [!danger")).count(),
+            out.matches(VERIFY_FENCE_START).count(),
+            1,
+            "no forged start fence"
+        );
+        assert_eq!(
+            out.matches(VERIFY_FENCE_END).count(),
+            1,
+            "no forged end fence"
+        );
+        assert_eq!(
+            out.lines()
+                .filter(|l| l.trim_start().starts_with("> [!danger"))
+                .count(),
             0,
             "an injected callout never reaches a line-start position"
         );
@@ -491,7 +522,11 @@ mod tests {
     #[test]
     fn verify_callout_coexists_with_inline_markers_and_context_block() {
         let md = "# N\n- Ship PROJ-1 by 2026-07-08\n";
-        let f = finding(Verdict::Conflict, "note says 2026-07-08, PROJ-1 due 2026-07-10", "");
+        let f = finding(
+            Verdict::Conflict,
+            "note says 2026-07-08, PROJ-1 due 2026-07-10",
+            "",
+        );
         let marked = apply_verify_markers(md, std::slice::from_ref(&f));
         let both = apply_verify_callout(&marked, std::slice::from_ref(&f), "2026-07-10T12:00:00Z");
         assert!(both.contains("> ⧗ note says"), "inline marker present");

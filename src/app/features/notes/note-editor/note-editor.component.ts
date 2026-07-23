@@ -28,6 +28,7 @@ import { TabsService } from "../../../core/tabs.service";
 import type {
   AppConfigDto,
   FolderNode,
+  NoteAttachmentDto,
   NoteCitation,
   NoteDoc,
   NoteFolder,
@@ -36,6 +37,15 @@ import { DebounceService } from "../../../services/debounce.service";
 import { FoldersService } from "../../../services/folders.service";
 import { NotesService } from "../../../services/notes.service";
 import { ToastService } from "../../../services/toast.service";
+import {
+  NoteAttachmentService,
+  MAX_NOTE_ATTACHMENTS,
+  insertMarkdownBlock,
+  referencedNoteAttachments,
+  replacePendingAttachmentUri,
+  type AttachmentPastePlan,
+  type MarkdownEdit,
+} from "../../../services/note-attachment.service";
 import { ConnectionsComponent } from "../../../shared/connections/connections.component";
 import { MarkdownComponent } from "../../../shared/markdown/markdown.component";
 import { LinkPickerComponent } from "../link-picker/link-picker.component";
@@ -106,6 +116,7 @@ const SLASH_ITEMS: readonly SlashItem[] = [
   },
   { id: "divider", label: "Divider", snippet: "---\n$" },
   { id: "callout", label: "Callout", snippet: "> [!note]\n> $" },
+  { id: "image", label: "Image" },
   // No `snippet` — opens the inline link-picker popover (Obsidian-style `[[` autocomplete)
   // instead of inserting static markdown. Reuses the SAME picker as the raw `[[` keystroke
   // trigger (one shared component/service, per the parity requirement).
@@ -182,6 +193,7 @@ export class NoteEditorComponent {
   private readonly folders = inject(FoldersService);
   private readonly debounce = inject(DebounceService);
   private readonly toast = inject(ToastService);
+  private readonly attachmentService = inject(NoteAttachmentService);
   private readonly route = inject(ActivatedRoute);
   private readonly router = inject(Router);
   private readonly tabsService = inject(TabsService);
@@ -277,6 +289,14 @@ export class NoteEditorComponent {
   readonly title = signal("");
   /** The BODY markdown (front-matter stripped — the textarea's value). */
   readonly body = signal("");
+  /** Gated image DTOs for the active, unlocked note. Cleared synchronously on lock. */
+  readonly attachments = signal<NoteAttachmentDto[]>([]);
+  /** Only images referenced by the current body are disclosed in share UI. */
+  readonly referencedAttachments = computed(() =>
+    referencedNoteAttachments(this.body(), this.attachments()),
+  );
+  /** Number of local canvas/import jobs still replacing stable pending markers. */
+  readonly importingImages = signal(0);
   /** Front-matter tags. */
   readonly tags = signal<string[]>([]);
   /** Front-matter properties (key → value), excluding tags. */
@@ -390,6 +410,8 @@ export class NoteEditorComponent {
     viewChild<ElementRef<HTMLInputElement>>("titleInput");
   private readonly bodyArea =
     viewChild<ElementRef<HTMLTextAreaElement>>("bodyArea");
+  private readonly imageFileInput =
+    viewChild<ElementRef<HTMLInputElement>>("imageFileInput");
   /** Live textarea node passed to the teleported link picker for motion filtering. */
   readonly linkPickerAnchorElement = computed(
     () => this.bodyArea()?.nativeElement ?? null,
@@ -413,6 +435,10 @@ export class NoteEditorComponent {
    * e5 re-embed never fires per keystroke-pause. Cleared after a successful full save.
    */
   private dirtyFull = false;
+  /** Selection preserved before the hidden file picker takes focus. */
+  private imageInsertion: { start: number; end: number } | null = null;
+  /** In-flight imports joined by every save/finalize boundary. */
+  private readonly attachmentTasks = new Set<Promise<void>>();
 
   // --- Single-writer save queue --------------------------------------------
   /**
@@ -422,7 +448,7 @@ export class NoteEditorComponent {
    * boundary full save could be concurrently in flight with different payloads,
    * and a stale older write could land after a newer one.
    */
-  private saveChain: Promise<void> = Promise.resolve();
+  private saveChain: Promise<boolean> = Promise.resolve(false);
   /**
    * The single coalesced pending save (latest-wins): while a save is in flight,
    * new requests only escalate/refresh this slot — they never stack. `"full"`
@@ -431,6 +457,14 @@ export class NoteEditorComponent {
    * always wins.
    */
   private pendingSave: "text" | "full" | null = null;
+  /** Monotonic local edit generation used to join an already-current save at Stop. */
+  private editRevision = 0;
+  /** Revision snapshotted by the save currently executing on {@link saveChain}. */
+  private savingRevision: number | null = null;
+  /** Most recent revision whose backend persistence attempt fully settled. */
+  private settledRevision = -1;
+  /** Durability result paired with {@link settledRevision}. */
+  private settledRevisionSaved = false;
 
   /**
    * Whether the PREVIEW pane is showing. EMBEDDED mode force-hides the
@@ -768,19 +802,40 @@ export class NoteEditorComponent {
    * backend's delete-if-empty predicate is evaluated (else the user's prose is lost).
    *
    * Reuses the EXISTING save machinery — no second writer: it cancels the autosave
-   * debounce and joins the SAME single-writer chain via {@link flushFull} (the boundary
-   * full save: persist + re-index + export), then awaits that chain settling. Latest
-   * signal state wins (the payload is snapshotted when the queued save runs), so the
-   * character typed a millisecond before Stop is included. A no-op (resolves at once)
+   * debounce and joins the SAME single-writer chain with a CHEAP text-only write. A
+   * not-yet-started full save is deliberately downgraded for this deadline-sensitive
+   * boundary; `dirtyFull` remains set, so indexing + vault export still run at the next
+   * natural note boundary instead of delaying recording Stop. Latest signal state wins
+   * (the payload is snapshotted when the queued save runs), so the character typed a
+   * millisecond before Stop is included. A no-op (resolves at once)
    * while hydrating, when there is no loaded doc, or when the note is locked — the
-   * chain never rejects (both save paths handle their own errors).
+   * chain never rejects (both save paths handle their own errors). The boolean
+   * resolves `true` only when this request reached a confirmed backend write;
+   * `false` keeps normal fire-and-forget autosave error handling intact while
+   * allowing the recording flush witness to fail closed.
    */
-  async flushPendingSave(): Promise<void> {
+  async flushPendingSave(): Promise<boolean> {
     const doc = this.note();
     if (this.hydrating || !doc || doc.locked) {
-      return;
+      return false;
     }
-    await this.flushFull();
+    await this.waitForAttachmentTasks();
+    this.debounce.cancel(this.saveDebounceKey(doc.id));
+    // Clicking Stop first blurs the textarea. `onBlur()` may therefore have already started the
+    // exact save this durability boundary needs. Joining that same generation avoids a duplicate
+    // write/retry pair (and avoids spending the two-second Stop budget twice). If a newer edit
+    // arrived while an older save was in flight, the revisions differ and we enqueue the latest
+    // payload behind it as usual.
+    if (this.pendingSave === null && this.savingRevision === this.editRevision) {
+      return this.saveChain;
+    }
+    // The same revision may have settled between typing and Stop (including an autosave failure).
+    // Reuse that exact result: success is already durable, while retrying an unchanged failed
+    // payload only doubles storage pressure and cannot strengthen the fail-closed witness.
+    if (this.pendingSave === null && this.settledRevision === this.editRevision) {
+      return this.settledRevisionSaved;
+    }
+    return this.queueSave("text", true);
   }
 
   /**
@@ -792,6 +847,7 @@ export class NoteEditorComponent {
    * happened, not a race between the two.
    */
   private async runNoteBoundaryWork(): Promise<void> {
+    await this.waitForAttachmentTasks();
     if (this.dirtyFull) {
       await this.flushFull();
     }
@@ -826,7 +882,11 @@ export class NoteEditorComponent {
     void this.ipc
       .suggestNoteTitle(id)
       .then((title) => {
-        if (title && title.toLowerCase() !== "untitled") {
+        if (
+          this.saveResponseStillApplies(id) &&
+          title &&
+          title.toLowerCase() !== "untitled"
+        ) {
           this.tabsService.setTitle(tabKeyFor("note", id), title);
         }
       })
@@ -881,6 +941,7 @@ export class NoteEditorComponent {
       this.debounce.cancel(this.saveDebounceKey(doc.id));
       this.pendingSave = null;
       this.dirtyFull = false;
+      this.attachments.set([]);
       // The merged "Related" panel (app-connections) owns its own gated fetch and
       // skips/clears itself while locked, and re-asks on the folders.tree() change
       // this same seal drives — so there are no stale relationship chips to blank
@@ -985,16 +1046,37 @@ export class NoteEditorComponent {
   private async fetchNote(id: string, seq: number): Promise<void> {
     this.loading.set(true);
     this.error.set(null);
+    // A previous tab/note's image bytes must never survive across an owner load.
+    this.attachments.set([]);
     try {
       const doc = await this.ipc.getNote(id);
       if (seq !== this.requestSeq) {
         return;
       }
+      let attachments: NoteAttachmentDto[] = [];
+      if (!doc.locked) {
+        try {
+          const rows = await this.ipc.listNoteAttachments("note", id);
+          if (seq !== this.requestSeq) {
+            return;
+          }
+          attachments = Array.isArray(rows) ? rows : [];
+        } catch {
+          // The note remains editable when only its optional image load fails.
+          this.toast.danger("Couldn’t load this note’s images.");
+        }
+      }
+      // The attachment read may have raced a root lock effect.
+      if (seq !== this.requestSeq) {
+        return;
+      }
+      this.attachments.set(attachments);
       this.hydrate(doc);
     } catch (e) {
       if (seq === this.requestSeq) {
         this.error.set(this.friendlyLoadError(e));
         this.note.set(null);
+        this.attachments.set([]);
       }
     } finally {
       if (seq === this.requestSeq) {
@@ -1024,6 +1106,10 @@ export class NoteEditorComponent {
   /** Apply a loaded/reconciled doc into the edit signals (no autosave feedback). */
   private hydrate(doc: NoteDoc): void {
     this.hydrating = true;
+    // Never let a settled write for a previously loaded owner serve as this document's witness.
+    this.editRevision += 1;
+    this.settledRevision = -1;
+    this.settledRevisionSaved = false;
     this.note.set(doc);
     this.title.set(doc.title === "🔒 Locked" ? "" : doc.title);
     // The DTO carries parsed tags/properties, but the source-of-truth body is
@@ -1076,6 +1162,238 @@ export class NoteEditorComponent {
     this.scheduleSave();
   }
 
+  /** Preserve the exact caret before the explicit image button opens a picker. */
+  rememberImageInsertion(): void {
+    const el = this.bodyArea()?.nativeElement;
+    if (!el) {
+      return;
+    }
+    this.imageInsertion = {
+      start: el.selectionStart,
+      end: el.selectionEnd,
+    };
+  }
+
+  /** Open the hidden local-only raster picker without webview filesystem paths. */
+  openImagePicker(): void {
+    const doc = this.note();
+    if (!doc || doc.locked || this.importingImages() > 0) {
+      return;
+    }
+    if (!this.imageInsertion) {
+      this.rememberImageInsertion();
+    }
+    this.imageFileInput()?.nativeElement.click();
+  }
+
+  /** Import explicit picker files at the caret captured before focus moved. */
+  onImageFilesSelected(event: Event): void {
+    const input = event.target as HTMLInputElement;
+    const plan = this.attachmentService.planFromFiles(
+      input.files ?? [],
+      this.availableImageSlots(),
+    );
+    input.value = "";
+    this.notifyAttachmentWarnings(plan);
+    if (!plan.segments.some((segment) => segment.kind === "image")) {
+      this.imageInsertion = null;
+      return;
+    }
+    const el = this.bodyArea()?.nativeElement;
+    const selection = this.imageInsertion ?? {
+      start: el?.selectionStart ?? this.body().length,
+      end: el?.selectionEnd ?? this.body().length,
+    };
+    this.imageInsertion = null;
+    this.startAttachmentImport(plan, selection.start, selection.end);
+  }
+
+  /** Cmd-V: intercept only when the clipboard contains an actual safe image blob. */
+  onBodyPaste(event: ClipboardEvent): void {
+    const data = event.clipboardData;
+    const el = event.target as HTMLTextAreaElement;
+    if (!data) {
+      return;
+    }
+    const plan = this.attachmentService.planFromTransfer(
+      data,
+      this.availableImageSlots(),
+    );
+    this.notifyAttachmentWarnings(plan);
+    if (!plan.segments.some((segment) => segment.kind === "image")) {
+      // Plain text keeps the browser's native paste behavior and undo semantics.
+      return;
+    }
+    event.preventDefault();
+    this.startAttachmentImport(plan, el.selectionStart, el.selectionEnd);
+  }
+
+  /** Allow a local image file drop; remote URL-only drops remain inert. */
+  onBodyDragOver(event: DragEvent): void {
+    if (event.dataTransfer?.types.includes("Files")) {
+      event.preventDefault();
+    }
+  }
+
+  onBodyDrop(event: DragEvent): void {
+    const data = event.dataTransfer;
+    const el = event.target as HTMLTextAreaElement;
+    if (!data) {
+      return;
+    }
+    const plan = this.attachmentService.planFromTransfer(
+      data,
+      this.availableImageSlots(),
+    );
+    this.notifyAttachmentWarnings(plan);
+    if (!plan.segments.some((segment) => segment.kind === "image")) {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    this.startAttachmentImport(plan, el.selectionStart, el.selectionEnd);
+  }
+
+  /** Insert stable markers first, then replace each by identity as imports finish. */
+  private startAttachmentImport(
+    plan: AttachmentPastePlan,
+    selectionStart: number,
+    selectionEnd: number,
+  ): void {
+    const doc = this.note();
+    if (!doc || doc.locked) {
+      return;
+    }
+    const pending = this.attachmentService.pendingPlan(plan);
+    if (!pending.images.length || !pending.markdown) {
+      return;
+    }
+    const edit = insertMarkdownBlock(
+      this.body(),
+      selectionStart,
+      selectionEnd,
+      pending.markdown,
+    );
+    this.applyBodyEdit(edit, true);
+    this.dirtyFull = true;
+    this.saveState.set("saving");
+    this.importingImages.update((count) => count + pending.images.length);
+
+    const task = this.performAttachmentImport(doc.id, pending.images);
+    this.attachmentTasks.add(task);
+    void task.finally(() => this.attachmentTasks.delete(task));
+  }
+
+  private async performAttachmentImport(
+    noteId: string,
+    pendingImages: ReturnType<NoteAttachmentService["pendingPlan"]>["images"],
+  ): Promise<void> {
+    try {
+      // Sequential decode/encode bounds peak RGBA + canvas memory.
+      for (const { id, image } of pendingImages) {
+        try {
+          const attachment = await this.attachmentService.importImage(
+            "note",
+            noteId,
+            image,
+          );
+          const current = this.note();
+          if (!current || current.id !== noteId || current.locked) {
+            void this.attachmentService
+              .deleteAttachment("note", noteId, attachment.id)
+              .catch(() => undefined);
+            continue;
+          }
+          const replaced = this.replacePendingAttachment(
+            id,
+            this.attachmentService.attachmentMarkdown(attachment, image.alt),
+          );
+          if (replaced) {
+            this.attachments.update((rows) =>
+              rows.some((row) => row.id === attachment.id)
+                ? rows
+                : [...rows, attachment],
+            );
+          } else {
+            void this.attachmentService
+              .deleteAttachment("note", noteId, attachment.id)
+              .catch(() => undefined);
+          }
+        } catch (error) {
+          if (this.note()?.id === noteId && !this.note()?.locked) {
+            this.replacePendingAttachment(id, "");
+            this.toast.danger(String(error));
+          }
+        }
+      }
+    } finally {
+      this.importingImages.update((count) =>
+        Math.max(0, count - pendingImages.length),
+      );
+      if (this.note()?.id === noteId && !this.note()?.locked) {
+        this.scheduleSave();
+      }
+    }
+  }
+
+  /** Replace one unique marker while preserving a caret in concurrently typed text. */
+  private replacePendingAttachment(pendingId: string, replacement: string): boolean {
+    const el = this.bodyArea()?.nativeElement;
+    const edit = replacePendingAttachmentUri(
+      this.body(),
+      pendingId,
+      replacement,
+      el?.selectionStart ?? this.body().length,
+      el?.selectionEnd ?? this.body().length,
+    );
+    if (!edit) {
+      return false;
+    }
+    this.applyBodyEdit(edit, false);
+    return edit.canonicalSlot;
+  }
+
+  private availableImageSlots(): number {
+    if (this.importingImages() > 0) {
+      return 0;
+    }
+    return Math.max(0, MAX_NOTE_ATTACHMENTS - this.attachments().length);
+  }
+
+  private applyBodyEdit(edit: MarkdownEdit, focus: boolean): void {
+    this.body.set(edit.value);
+    const el = this.bodyArea()?.nativeElement;
+    if (el) {
+      el.value = edit.value;
+      el.setSelectionRange(edit.selectionStart, edit.selectionEnd);
+      if (focus) {
+        el.focus();
+      }
+    }
+    this.autoGrow();
+  }
+
+  private notifyAttachmentWarnings(plan: AttachmentPastePlan): void {
+    if (plan.skippedExternalImages) {
+      this.toast.push(
+        "External images were skipped to protect your privacy.",
+        "info",
+      );
+    }
+    if (plan.skippedUnsupportedImages) {
+      this.toast.danger("Some images were skipped. Use PNG, JPEG, or WebP files.");
+    }
+    if (plan.skippedTooManyImages) {
+      this.toast.danger(`A note can contain up to ${MAX_NOTE_ATTACHMENTS} images.`);
+    }
+  }
+
+  private async waitForAttachmentTasks(): Promise<void> {
+    while (this.attachmentTasks.size > 0) {
+      await Promise.allSettled([...this.attachmentTasks]);
+    }
+  }
+
   /**
    * The textarea auto-grows via CSS (the `.body-grow` grid mirror sizes the row to
    * the content) — so there is NO per-keystroke JS layout reflow (the old
@@ -1099,8 +1417,13 @@ export class NoteEditorComponent {
     if (this.hydrating || !doc || doc.locked) {
       return;
     }
+    this.editRevision += 1;
     this.dirtyFull = true;
     this.saveState.set("saving");
+    // Pending URIs are transient UI state and must never cross IPC.
+    if (this.importingImages() > 0 || this.body().includes("murmur-pending://")) {
+      return;
+    }
     this.debounce.schedule(
       this.saveDebounceKey(doc.id),
       () => void this.queueSave("text"),
@@ -1114,31 +1437,69 @@ export class NoteEditorComponent {
    * latest-payload-wins, since the payload is read from the signals when the
    * save runs. If a save is IN FLIGHT, the queued one starts only after it
    * settles, so writes reach the backend in order. Returns a promise that
-   * resolves once this request's save has landed (the chain never rejects —
-   * both save paths handle their own errors via `saveState`/toast).
+   * resolves once this request's save attempt has settled. `true` means the
+   * backend confirmed persistence; `false` means skipped/failed, while the
+   * chain remains fulfilled so debounced fire-and-forget callers never create
+   * unhandled rejections and later saves are not wedged.
    */
-  private queueSave(kind: "text" | "full"): Promise<void> {
+  private queueSave(
+    kind: "text" | "full",
+    replacePending = false,
+  ): Promise<boolean> {
+    // Blur and Stop can ask for the same cheap write while that exact edit generation is already
+    // executing. Join it before appending to the chain; a newer generation still queues normally,
+    // and a `full` boundary is never deduped because it also owes re-index/export work.
+    if (
+      kind === "text" &&
+      this.pendingSave === null &&
+      this.savingRevision === this.editRevision
+    ) {
+      return this.saveChain;
+    }
     const alreadyQueued = this.pendingSave !== null;
-    this.pendingSave =
-      this.pendingSave === "full" || kind === "full" ? "full" : "text";
+    this.pendingSave = replacePending
+      ? kind
+      : this.pendingSave === "full" || kind === "full"
+        ? "full"
+        : "text";
     if (!alreadyQueued) {
       this.saveChain = this.saveChain
         .then(() => this.runPendingSave())
-        // Defensive: a rejected link would wedge the chain forever; both save
-        // paths already catch, so this only guards the truly unexpected.
-        .catch(() => undefined);
+        // Defensive: an unexpected rejected link must neither wedge future
+        // autosaves nor become a false-positive durability witness.
+        .catch(() => false);
     }
     return this.saveChain;
   }
 
   /** Execute (and clear) the coalesced pending save. Runs on the chain only. */
-  private async runPendingSave(): Promise<void> {
+  private async runPendingSave(): Promise<boolean> {
+    await this.waitForAttachmentTasks();
     const kind = this.pendingSave;
     this.pendingSave = null;
-    if (kind === "full") {
-      await this.saveFull();
-    } else if (kind === "text") {
-      await this.saveText();
+    if (this.body().includes("murmur-pending://")) {
+      this.saveState.set("error");
+      this.saveErrorMessage.set(
+        "An image is still being resolved. Remove its pending marker or try again.",
+      );
+      return false;
+    }
+    const revision = this.editRevision;
+    this.savingRevision = revision;
+    try {
+      let saved = false;
+      if (kind === "full") {
+        saved = await this.saveFull();
+      } else if (kind === "text") {
+        saved = await this.saveText();
+      }
+      this.settledRevision = revision;
+      this.settledRevisionSaved = saved;
+      return saved;
+    } finally {
+      if (this.savingRevision === revision) {
+        this.savingRevision = null;
+      }
     }
   }
 
@@ -1227,7 +1588,12 @@ export class NoteEditorComponent {
     e: unknown,
     retryAttempt: () => Promise<T>,
     onRetrySuccess: (result: T) => void,
-  ): Promise<void> {
+  ): Promise<boolean> {
+    // A lock transition or navigation may have replaced the editor state while the failed IPC
+    // was in flight. Never let its retry/error UI mutate the new or synchronously masked owner.
+    if (!this.saveResponseStillApplies(noteId)) {
+      return false;
+    }
     const message = String(e);
     if (message.includes("no note ")) {
       // Stale-tab-after-delete: this note id no longer exists server-side —
@@ -1235,29 +1601,48 @@ export class NoteEditorComponent {
       this.saveState.set("error");
       this.saveErrorMessage.set("This note no longer exists.");
       this.toast.danger("This note no longer exists — it may have been deleted elsewhere.");
-      return;
+      return false;
     }
     if (message.includes("Locked")) {
       this.saveState.set("error");
       this.saveErrorMessage.set(message);
       this.toast.danger("This note is locked — unlock its folder to edit.");
-      return;
+      return false;
     }
     if (!this.isUnretryableSaveError(message)) {
       try {
         const result = await this.retryOnce(noteId, retryAttempt);
+        if (!this.saveResponseStillApplies(noteId)) {
+          // The retry did persist, but its response belongs to an authorization/navigation state
+          // that has since been revoked. Treat durability as success without touching current UI.
+          return true;
+        }
         onRetrySuccess(result);
         this.saveState.set("saved");
         this.saveErrorMessage.set(null);
-        return;
+        return true;
       } catch (retryError) {
+        if (!this.saveResponseStillApplies(noteId)) {
+          return false;
+        }
         this.saveState.set("error");
         this.saveErrorMessage.set(String(retryError));
-        return;
+        return false;
       }
     }
     this.saveState.set("error");
     this.saveErrorMessage.set(message);
+    return false;
+  }
+
+  /**
+   * A save response is UI-authoritative only while this exact note is still the visible,
+   * unlocked owner. `onLockTreeChanged` masks synchronously, but an already-running Promise can
+   * settle later; accepting it would flip `locked` back to false and restore a plaintext tab title.
+   */
+  private saveResponseStillApplies(noteId: string): boolean {
+    const current = this.note();
+    return current?.id === noteId && !current.locked;
   }
 
   /**
@@ -1266,15 +1651,18 @@ export class NoteEditorComponent {
    * canonical, so nothing is lost; the brain index catches up on the next full save.
    * Runs ONLY via {@link runPendingSave} on the single-writer chain.
    */
-  private async saveText(): Promise<void> {
+  private async saveText(): Promise<boolean> {
     const doc = this.note();
-    if (!doc || doc.locked) {
-      return;
+    if (!doc || doc.locked || this.importingImages() > 0) {
+      return false;
     }
     const { title, markdown } = this.currentPayload();
     this.saveState.set("saving");
     try {
       const updatedAt = await this.ipc.saveNoteText(doc.id, title, markdown);
+      if (!this.saveResponseStillApplies(doc.id)) {
+        return true;
+      }
       this.note.update((cur) => (cur ? { ...cur, updatedAt } : cur));
       this.saveState.set("saved");
       this.saveErrorMessage.set(null);
@@ -1286,8 +1674,9 @@ export class NoteEditorComponent {
       // OPTIMISTICALLY from every keystroke in `onTitleInput` now, so this call
       // is a reconciling no-op in the common case.
       this.tabsService.setTitle(tabKeyFor("note", doc.id), title || "Untitled");
+      return true;
     } catch (e) {
-      await this.handleSaveFailure(
+      return this.handleSaveFailure(
         doc.id,
         e,
         () => this.ipc.saveNoteText(doc.id, title, markdown),
@@ -1306,7 +1695,7 @@ export class NoteEditorComponent {
    * navigation, so leaving is instant and the backend catches up. Joins the same
    * single-writer chain as the cheap saves, superseding any pending cheap save.
    */
-  private flushFull(): Promise<void> {
+  private flushFull(): Promise<boolean> {
     const doc = this.note();
     if (doc) {
       this.debounce.cancel(this.saveDebounceKey(doc.id));
@@ -1318,15 +1707,18 @@ export class NoteEditorComponent {
    * The full-save body — persist + re-index + export, clearing `dirtyFull` on
    * success. Runs ONLY via {@link runPendingSave} on the single-writer chain.
    */
-  private async saveFull(): Promise<void> {
+  private async saveFull(): Promise<boolean> {
     const doc = this.note();
-    if (!doc || doc.locked) {
-      return;
+    if (!doc || doc.locked || this.importingImages() > 0) {
+      return false;
     }
     const { title, markdown } = this.currentPayload();
     this.saveState.set("saving");
     try {
       const fresh = await this.ipc.updateNoteDoc(doc.id, title, markdown);
+      if (!this.saveResponseStillApplies(doc.id)) {
+        return true;
+      }
       this.dirtyFull = false;
       this.note.update((cur) =>
         cur
@@ -1343,8 +1735,9 @@ export class NoteEditorComponent {
       this.saveErrorMessage.set(null);
       // Live tab-title sync (bug fix, 2026-07-12) — see the twin call in {@link saveText}.
       this.tabsService.setTitle(tabKeyFor("note", doc.id), title || "Untitled");
+      return true;
     } catch (e) {
-      await this.handleSaveFailure(
+      return this.handleSaveFailure(
         doc.id,
         e,
         () => this.ipc.updateNoteDoc(doc.id, title, markdown),
@@ -1558,20 +1951,23 @@ export class NoteEditorComponent {
 
   // ── Edit / Preview ───────────────────────────────────────────────────────
 
-  setPreview(on: boolean): void {
-    this.preview.set(on);
-    if (on) {
-      // No textarea to select in Preview — drop the floating bubble / Brain popover
-      // and the link picker (its trigger position lives in the textarea).
-      this.clearSelection();
-      this.closeLinkPicker();
+  async setPreview(on: boolean): Promise<void> {
+    if (!on) {
+      this.preview.set(false);
+      return;
     }
-    // Switching to Preview is a natural "I'm reviewing" pause: run the deferred FULL
-    // save (re-index + vault export) once if there are unindexed edits, so the note
-    // becomes brain-searchable + vault-synced without waiting for editor close.
-    if (on && this.dirtyFull) {
-      void this.flushFull();
+    await this.waitForAttachmentTasks();
+    if (this.dirtyFull && !(await this.flushFull())) {
+      return;
     }
+    if (this.saveState() === "error" || this.note()?.locked) {
+      return;
+    }
+    this.preview.set(true);
+    // No textarea to select in Preview — drop the floating bubble / Brain popover
+    // and the link picker (its trigger position lives in the textarea).
+    this.clearSelection();
+    this.closeLinkPicker();
   }
 
   // ── Formatting toolbar ─────────────────────────────────────────────────
@@ -1907,6 +2303,14 @@ export class NoteEditorComponent {
       this.askBrain.emit();
       return;
     }
+    if (item.id === "image") {
+      // Remove the `/` trigger, preserve that exact block position, then let
+      // the hidden picker take focus. Async work targets a stable marker.
+      this.replaceRange(el, lineStart, pos, "", lineStart, lineStart);
+      this.imageInsertion = { start: lineStart, end: lineStart };
+      this.openImagePicker();
+      return;
+    }
     if (item.id === "linkToNote" || item.snippet === undefined) {
       // Replace the `/` trigger with `[[` (the natural Obsidian trigger text),
       // then open the picker anchored right after it.
@@ -2106,6 +2510,9 @@ export class NoteEditorComponent {
     this.closeMenus();
     try {
       await this.notes.move(doc.id, folderId);
+      if (!this.saveResponseStillApplies(doc.id)) {
+        return;
+      }
       this.note.update((cur) => (cur ? { ...cur, folderId } : cur));
       const name = this.noteFolders().find((f) => f.id === folderId)?.name ?? "folder";
       this.toast.success(`Moved to ${name}`);
@@ -2124,9 +2531,14 @@ export class NoteEditorComponent {
     // Persist the latest text first (cheap) so the exported file is current —
     // awaited through the single-writer chain so it lands after any in-flight save.
     this.debounce.cancel(this.saveDebounceKey(doc.id));
-    await this.queueSave("text");
+    if (!(await this.queueSave("text")) || this.note()?.locked) {
+      return;
+    }
     try {
       const path = await this.ipc.exportNoteDoc(doc.id);
+      if (!this.saveResponseStillApplies(doc.id)) {
+        return;
+      }
       this.note.update((cur) => (cur ? { ...cur, exportedPath: path } : cur));
       this.toast.success("Saved to your vault");
     } catch (e) {
@@ -2140,7 +2552,7 @@ export class NoteEditorComponent {
    * backend refuses `Locked`); the button is disabled while locked, and this
    * flushes any pending edit so the shared body is current.
    */
-  share(): void {
+  async share(): Promise<void> {
     this.closeMenus();
     const doc = this.note();
     if (!doc || doc.locked) {
@@ -2149,7 +2561,9 @@ export class NoteEditorComponent {
     // Persist the latest text (cheap, via the single-writer chain) so the
     // shared body is current.
     this.debounce.cancel(this.saveDebounceKey(doc.id));
-    void this.queueSave("text");
+    if (!(await this.queueSave("text")) || this.note()?.locked) {
+      return;
+    }
     this.shareOpen.set(true);
   }
 
@@ -2226,8 +2640,15 @@ export class NoteEditorComponent {
     this.unlocking.set(true);
     try {
       await this.folders.unlock(doc.folderId);
+      const seq = ++this.requestSeq;
       const fresh = await this.ipc.getNote(doc.id);
-      this.hydrate(fresh);
+      if (
+        seq === this.requestSeq &&
+        this.note()?.id === doc.id &&
+        !fresh.locked
+      ) {
+        this.hydrate(fresh);
+      }
     } catch (e) {
       this.toast.danger(`Couldn’t unlock — ${String(e)}`);
     } finally {

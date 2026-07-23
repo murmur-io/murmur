@@ -223,7 +223,9 @@ pub(crate) fn resolve_audit_finding_inner(
         .get_audit_finding(id)?
         .ok_or_else(|| AppError::InvalidArg(format!("no audit finding {id}")))?;
     if row.status != "pending" {
-        return Err(AppError::InvalidArg("this finding was already handled".into()));
+        return Err(AppError::InvalidArg(
+            "this finding was already handled".into(),
+        ));
     }
     let status = match action {
         "dismiss" => "dismissed",
@@ -289,7 +291,9 @@ fn apply_audit_accept(
         "broken_link" => {
             let target = row.target_title.as_deref().unwrap_or("").trim().to_string();
             if target.is_empty() {
-                return Err(AppError::InvalidArg("this finding has no link target".into()));
+                return Err(AppError::InvalidArg(
+                    "this finding has no link target".into(),
+                ));
             }
             // LIVE re-resolve (lock review): the target may have been created since the pass —
             // the stamp would then assert a falsehood. REFUSE, loss-safe: nothing is written and
@@ -358,11 +362,14 @@ fn apply_audit_accept(
         "unlinked_mention" => {
             let target = row.target_title.as_deref().unwrap_or("").trim().to_string();
             if target.is_empty() {
-                return Err(AppError::InvalidArg("this finding has no link target".into()));
+                return Err(AppError::InvalidArg(
+                    "this finding has no link target".into(),
+                ));
             }
             if !audit_link_target_ok(state, &target)? {
                 return Err(AppError::InvalidArg(
-                    "the suggested link target no longer exists — dismiss this finding instead".into(),
+                    "the suggested link target no longer exists — dismiss this finding instead"
+                        .into(),
                 ));
             }
             let line = format!("- Suggested link: [[{target}]]");
@@ -430,21 +437,27 @@ fn stamp_audit_note_source(
     note_id: &str,
     stamp: impl Fn(&str) -> String,
 ) -> Result<(), AppError> {
-    let unlocked = unlocked_snapshot(state)?;
-    let Some(markdown) = state.db.note_markdown_if_visible(note_id, &unlocked)? else {
-        return Err(AppError::Locked(
-            "this note's folder is locked — unlock it to apply the audit action".into(),
-        ));
+    let (markdown, title) = {
+        let _lifecycle = lifecycle_guard(state);
+        let Some((folder_id, _created_at, _updated_at)) = state.db.note_gate_anchor(note_id)? else {
+            return Err(AppError::InvalidArg(format!("no note {note_id}")));
+        };
+        if !folder_is_unlocked(state, &folder_id)? {
+            return Err(AppError::Locked(
+                "this note's folder is locked — unlock it to apply the audit action".into(),
+            ));
+        }
+        let row = state
+            .db
+            .get_note_row(note_id)?
+            .ok_or_else(|| AppError::InvalidArg(format!("no note {note_id}")))?;
+        let title = note_display_title(&row);
+        (row.text, title)
     };
     let written = stamp(&markdown);
     if written == markdown {
         return Ok(()); // already stamped — idempotent no-op.
     }
-    let row = state
-        .db
-        .get_note_row(note_id)?
-        .ok_or_else(|| AppError::InvalidArg(format!("no note {note_id}")))?;
-    let title = note_display_title(&row);
     update_note_doc_inner(state, note_id, &title, &written)?;
     Ok(())
 }
@@ -496,12 +509,12 @@ fn audit_link_target_ok(state: &AppState, title: &str) -> Result<bool, AppError>
     match state.db.resolve_wikilink(title, &unlocked)? {
         Some(t) if t.kind == "meeting" => Ok(!folder_locked_on_disk(state, &t.id)?),
         Some(t) if t.kind == "note" => {
-            let Some(row) = state.db.get_note_row(&t.id)? else {
+            let Some((folder_id, _created_at, _updated_at)) = state.db.note_gate_anchor(&t.id)? else {
                 return Ok(false);
             };
             Ok(state
                 .db
-                .folder_by_id(&row.folder_id)?
+                .folder_by_id(&folder_id)?
                 .map(|f| !f.locked)
                 .unwrap_or(false))
         }

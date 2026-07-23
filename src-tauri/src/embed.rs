@@ -15,7 +15,7 @@
 //! - [`rrf_fuse`] (Reciprocal Rank Fusion for hybrid FTS ∪ vector ranking);
 //! - [`vec_to_blob`] (f32 → little-endian blob for binding to a `vec0 float[N]` column).
 
-use crate::error::Result;
+use crate::error::{AppError, Result};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -271,16 +271,57 @@ pub fn default_embed_model() -> &'static EmbedModel {
 /// `active_embedder`/`embed_model_present`/`embed_model_dir`/`download_embed_model` resolve the
 /// user's configured model WITHOUT threading `&AppConfig` through every call site. `None` (never set,
 /// or set to `None`) means "use the default" → byte-identical to the historical behavior. Written
-/// once by `AppConfig::load` at startup and again by `AppConfig::save` when the selection changes;
-/// read on every embedder construction. A poisoned lock degrades to the default (never panics).
+/// once by `AppConfig::load` at startup and through the serialized selection-update seam when the
+/// user changes models; read on every embedder construction. A poisoned lock degrades to the
+/// default (never panics).
 static SELECTED_EMBED_MODEL_ID: RwLock<Option<String>> = RwLock::new(None);
 
-/// Set the process-global selected embedder id (called by `AppConfig::load`/`save`). `None` clears
-/// back to the default. NEVER panics — a poisoned lock is silently ignored (the default stands).
+/// Index-wide model-selection barrier. Every REAL persistence handle owns a read guard for its
+/// complete logical operation (embedding plus DB commit), and every admitted query owns one through
+/// its retrieval call; publishing a different selected model takes the write guard. This prevents
+/// an A-pinned writer from committing after Settings advertised B and an in-flight A query from
+/// searching a rebuilding B index. Historical partitions are invalidated atomically with a real
+/// selection change by `Db::set_embed_model_selection`; this gate protects the in-flight side.
+static EMBED_PERSISTENCE_SELECTION_GATE: RwLock<()> = RwLock::new(());
+
+/// Set the process-global selected embedder id (startup/tests). `None` clears back to the default.
+/// Runtime settings changes use [`with_embed_selection_update`] so DB publication is serialized
+/// with persistence writers. NEVER panics — a poisoned lock is recovered.
 pub fn set_selected_embed_model_id(id: Option<String>) {
-    if let Ok(mut g) = SELECTED_EMBED_MODEL_ID.write() {
-        *g = id.filter(|s| !s.is_empty());
+    let _selection_barrier = EMBED_PERSISTENCE_SELECTION_GATE
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    publish_selected_embed_model_id(id);
+}
+
+/// Serialize the dedicated model-selection transaction and global publication with vector writers
+/// and admitted queries. The closure runs only after prior guarded operations finish and returns
+/// the exact id it saved; publication happens before the write barrier drops.
+pub(crate) fn with_embed_selection_update<T>(
+    update: impl FnOnce() -> Result<(T, Option<String>)>,
+) -> Result<T> {
+    let _selection_barrier = EMBED_PERSISTENCE_SELECTION_GATE
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (output, id) = update()?;
+    publish_selected_embed_model_id(id);
+    Ok(output)
+}
+
+/// Publish while the caller owns [`EMBED_PERSISTENCE_SELECTION_GATE`] exclusively.
+fn publish_selected_embed_model_id(id: Option<String>) {
+    let next = id.filter(|s| !s.is_empty());
+    let mut selected = SELECTED_EMBED_MODEL_ID
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if *selected == next {
+        return;
     }
+    *selected = next;
+    drop(selected);
+    // No persistence reader can be active here, so the old selection's shared cache is safe to
+    // evict before a new operation observes the newly-published id.
+    release_real_embedder_cache();
 }
 
 /// Resolve the currently-selected [`EmbedModel`]: the process-global id if it names a known model,
@@ -423,6 +464,221 @@ impl Embedder for SharedEmbedder {
     }
 }
 
+/// Per-forward admission wrapper. The selected model + directory are snapshotted ONCE when the
+/// operation obtains this handle, then reused for every sub-batch. Only the actual e5 call owns
+/// model residency; DB reads, result fusion and persistence remain outside the lease.
+///
+/// Pinning is load-bearing for persisted vectors: Settings may switch the selected model while a
+/// long reindex is running. Re-resolving before every sub-batch could then mix incompatible vector
+/// spaces in one `vec_chunks` generation. A pinned REAL snapshot also fails loud if construction
+/// fails — it never degrades mid-operation to [`StubEmbedder`].
+struct AdmittedEmbedder {
+    recording_token: Option<crate::perf::RecordingSessionToken>,
+    snapshot: ActiveEmbedderSnapshot,
+    // Ownership-only: blocks selected-model publication until this operation has finished. REAL
+    // persistence handles retain it through DB commit; query handles retain it through retrieval,
+    // so an A query can never race publication/rebuild of a B index. Background model-absent
+    // chunk-only handles carry None.
+    _selection_guard: Option<std::sync::RwLockReadGuard<'static, ()>>,
+    // Once the first batch constructs the lazy engine, retain that exact Arc for this whole
+    // operation. A concurrent Settings switch may evict the process cache, but cannot make a
+    // multi-batch reindex reload or swap its pinned model half-way through.
+    real: std::sync::Mutex<Option<Arc<candle_bert::CandleBertEmbedder>>>,
+}
+
+impl AdmittedEmbedder {
+    fn new(
+        recording_token: Option<crate::perf::RecordingSessionToken>,
+        snapshot: ActiveEmbedderSnapshot,
+        selection_guard: Option<std::sync::RwLockReadGuard<'static, ()>>,
+    ) -> Self {
+        if matches!(&snapshot, ActiveEmbedderSnapshot::Stub(_)) {
+            // Preserve the model-deletion/switch memory contract without doing it on every stub
+            // forward (which could evict a different operation between its sub-batches).
+            release_real_embedder_cache();
+        }
+        Self {
+            recording_token,
+            snapshot,
+            _selection_guard: selection_guard,
+            real: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn pinned_real(
+        &self,
+        dir: &std::path::Path,
+        model: &'static EmbedModel,
+    ) -> Result<Arc<candle_bert::CandleBertEmbedder>> {
+        if let Ok(guard) = self.real.lock() {
+            if let Some(embedder) = guard.as_ref() {
+                return Ok(embedder.clone());
+            }
+        }
+
+        // Construct outside the per-handle lock. The process cache has its own double-check, so a
+        // rare racing first call may build one extra UNLOADED handle but never duplicate weights.
+        let built = cached_real_embedder(dir.to_path_buf(), model)?;
+        match self.real.lock() {
+            Ok(mut guard) => {
+                if let Some(embedder) = guard.as_ref() {
+                    Ok(embedder.clone())
+                } else {
+                    *guard = Some(built.clone());
+                    Ok(built)
+                }
+            }
+            Err(_) => {
+                tracing::warn!(target: "embed", model_id = %model.id, "operation embed cache lock poisoned; using pinned batch handle");
+                Ok(built)
+            }
+        }
+    }
+
+    fn run<T>(&self, f: impl FnOnce(&dyn Embedder) -> Result<T>) -> Result<T> {
+        match &self.snapshot {
+            ActiveEmbedderSnapshot::Stub(_model) => {
+                // This OPERATION was resolved as model-free. Never re-probe model presence here:
+                // an absent->present flip takes effect on the next handle, not half-way through
+                // this one. In particular, never evict a different operation's pinned real cache.
+                f(&StubEmbedder)
+            }
+            ActiveEmbedderSnapshot::Real { dir, model } => crate::perf::with_model_generation(
+                self.recording_token.as_ref(),
+                crate::perf::ResidentModelKind::Embedder,
+                || {
+                    // Construction errors propagate. Persisting a deterministic stub vector under
+                    // a real-model decision would silently poison the semantic index.
+                    let embedder = SharedEmbedder(self.pinned_real(dir, model)?);
+                    f(&embedder)
+                },
+            ),
+        }
+    }
+}
+
+impl Embedder for AdmittedEmbedder {
+    fn dim(&self) -> usize {
+        EMBED_DIM
+    }
+
+    fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        self.run(|embedder| embedder.embed(texts))
+    }
+
+    fn embed_passage(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        self.run(|embedder| embedder.embed_passage(texts))
+    }
+
+    fn embed_query(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        self.run(|embedder| embedder.embed_query(texts))
+    }
+}
+
+/// Active embedder with unscoped admission around each real e5 forward. User/background callers
+/// during capture receive `Unavailable` before weights load or inference starts.
+pub(crate) fn active_admitted_embedder() -> Box<dyn Embedder> {
+    let selection_guard = EMBED_PERSISTENCE_SELECTION_GATE
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    Box::new(AdmittedEmbedder::new(
+        None,
+        active_embedder_snapshot(),
+        Some(selection_guard),
+    ))
+}
+
+/// Real-only handle for any operation that persists vectors. A missing or incomplete selected
+/// model is an honest error; callers must never write [`StubEmbedder`] output to `vec_chunks`.
+pub(crate) fn active_persistence_embedder() -> Result<Box<dyn Embedder>> {
+    let (snapshot, selection_guard) = persistence_embedder_snapshot()?;
+    Ok(Box::new(AdmittedEmbedder::new(
+        None,
+        snapshot,
+        Some(selection_guard),
+    )))
+}
+
+/// Optional real-only persistence handle for best-effort chunk/index paths: `None` means the
+/// selected model is not completely installed, so callers may still perform their model-free
+/// chunk/FTS work. Unlike `embed_model_present().then(active_embedder)`, the presence decision,
+/// pinned snapshot and selection barrier are one atomic operation.
+pub(crate) fn active_persistence_embedder_if_available() -> Option<Box<dyn Embedder>> {
+    active_persistence_embedder().ok()
+}
+
+/// Recording-session counterpart of [`active_persistence_embedder`].
+pub(crate) fn active_recording_persistence_embedder(
+    token: crate::perf::RecordingSessionToken,
+) -> Result<Box<dyn Embedder>> {
+    let (snapshot, selection_guard) = persistence_embedder_snapshot()?;
+    Ok(Box::new(AdmittedEmbedder::new(
+        Some(token),
+        snapshot,
+        Some(selection_guard),
+    )))
+}
+
+/// Startup/background indexing adapter: deterministic chunk/database work holds no model lease;
+/// each actual e5 batch atomically acquires admission, resolves the lazy embedder, runs the native
+/// forward pass, and rejects output made stale by a recording start.
+struct BackgroundEmbedder {
+    epoch: u64,
+    admitted: AdmittedEmbedder,
+}
+
+impl BackgroundEmbedder {
+    fn run<T>(&self, f: impl FnOnce(&dyn Embedder) -> Result<T>) -> Result<T> {
+        if !crate::perf::background_epoch_is_current(self.epoch) {
+            return Err(AppError::Unavailable(
+                "background embedding deferred for recording".into(),
+            ));
+        }
+        let output = f(&self.admitted)?;
+        if !crate::perf::background_epoch_is_current(self.epoch) {
+            return Err(AppError::Unavailable(
+                "background embedding output became stale during recording start".into(),
+            ));
+        }
+        Ok(output)
+    }
+}
+
+impl Embedder for BackgroundEmbedder {
+    fn dim(&self) -> usize {
+        EMBED_DIM
+    }
+
+    fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        self.run(|embedder| embedder.embed(texts))
+    }
+
+    fn embed_passage(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        self.run(|embedder| embedder.embed_passage(texts))
+    }
+
+    fn embed_query(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        self.run(|embedder| embedder.embed_query(texts))
+    }
+}
+
+pub(crate) fn background_embedder(epoch: u64) -> Box<dyn Embedder> {
+    Box::new(BackgroundEmbedder {
+        epoch,
+        admitted: AdmittedEmbedder::new(None, active_embedder_snapshot(), None),
+    })
+}
+
+/// Background-epoch + real-only adapter for jobs that persist vectors. The model snapshot is
+/// pinned for the whole job, while each forward still proves the epoch before and after execution.
+pub(crate) fn background_persistence_embedder(epoch: u64) -> Result<Box<dyn Embedder>> {
+    let (snapshot, selection_guard) = persistence_embedder_snapshot()?;
+    Ok(Box::new(BackgroundEmbedder {
+        epoch,
+        admitted: AdmittedEmbedder::new(None, snapshot, Some(selection_guard)),
+    }))
+}
+
 /// The single active embedding backend used by BOTH the index path (chunking a note on creation)
 /// and the query path (Ask-My-Vault / MCP `search_semantic`). Returning a boxed trait object keeps
 /// the model a swappable seam.
@@ -431,19 +687,21 @@ impl Embedder for SharedEmbedder {
 /// - the e5 model dir is present at [`embed_model_dir`] ([`embed_model_present`]) → the real
 ///   [`candle_bert::CandleBertEmbedder`] (lazy: the model loads on first `embed`, not here, so this
 ///   never blocks startup and never panics);
-/// - otherwise (no model, or a construction error) → the dependency-free [`StubEmbedder`]. The app
-///   works either way; semantic, WHEN enabled, just uses real vectors once the model is present.
-///   Selection keys ONLY on model presence — the candle backend is always compiled (no cargo feature).
+/// - with no complete model directory → the dependency-free [`StubEmbedder`];
+/// - if a directory was complete at handle creation but construction later fails → an honest
+///   error (never an in-operation model swap). Persistence callers use the stricter real-only
+///   constructors above, so stub vectors can never reach `vec_chunks`.
 ///
-/// NEVER panics and NEVER blocks. Target model = multilingual-e5-small (384-dim), so the real model's
+/// NEVER panics. Target model = multilingual-e5-small (384-dim), so the real model's
 /// width EQUALS [`EMBED_DIM`] — ZERO `vec_chunks` schema migration. (A future model whose dimension
 /// differs would be a `vec_chunks float[N]` SCHEMA change — an additive migration to a new-width vec0
 /// table plus a full re-index, NOT a code one-liner; a mismatched-width insert fails loud, never
 /// silently.) Still cheap to call per operation (the stub is zero-sized; the real backend is an
 /// `Arc` clone of the ONE process-wide cached instance — see [`REAL_EMBEDDER_CACHE`] — so repeated
 /// calls share the same lazily-loaded engine instead of re-loading weights per instance). Model
-/// presence + selection are RE-CHECKED on every call, so a model download or a Settings model
-/// switch takes effect on the next embed with no restart. NEVER invoked when
+/// presence + selection are RE-CHECKED for every new HANDLE, then pinned across that handle's
+/// sub-batches; a download or Settings switch therefore takes effect on the next operation without
+/// mixing vector spaces inside the current one. NEVER invoked when
 /// `semantic_search_enabled` is off (the gate short-circuits before this is called) — building the
 /// real embedder does NOT flip that flag.
 ///
@@ -456,11 +714,52 @@ impl Embedder for SharedEmbedder {
 /// explicitly opted in via `MURMUR_TEST_REAL_EMBED=1` — only the manual, `#[ignore]`d bake-off tests
 /// (`eval::bakeoff`) set that var, since they are the one legitimate case that wants the real model.
 pub fn active_embedder() -> Box<dyn Embedder> {
+    active_admitted_embedder()
+}
+
+#[derive(Clone)]
+enum ActiveEmbedderSnapshot {
+    Stub(&'static EmbedModel),
+    Real {
+        dir: PathBuf,
+        model: &'static EmbedModel,
+    },
+}
+
+fn active_embedder_snapshot() -> ActiveEmbedderSnapshot {
     #[cfg(test)]
     if std::env::var_os("MURMUR_TEST_REAL_EMBED").is_none() {
-        return Box::new(StubEmbedder);
+        return ActiveEmbedderSnapshot::Stub(default_embed_model());
     }
-    active_embedder_impl(embed_model_present(), selected_embed_model())
+    let model = selected_embed_model();
+    let Ok(base) = crate::transcribe::models_dir() else {
+        return ActiveEmbedderSnapshot::Stub(model);
+    };
+    let dir = base.join(model.subdir);
+    if EMBED_MODEL_FILES
+        .iter()
+        .all(|file| dir.join(file).is_file())
+    {
+        ActiveEmbedderSnapshot::Real { dir, model }
+    } else {
+        ActiveEmbedderSnapshot::Stub(model)
+    }
+}
+
+fn persistence_embedder_snapshot() -> Result<(
+    ActiveEmbedderSnapshot,
+    std::sync::RwLockReadGuard<'static, ()>,
+)> {
+    let selection_guard = EMBED_PERSISTENCE_SELECTION_GATE
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match active_embedder_snapshot() {
+        real @ ActiveEmbedderSnapshot::Real { .. } => Ok((real, selection_guard)),
+        ActiveEmbedderSnapshot::Stub(model) => Err(AppError::Unavailable(format!(
+            "selected embed model '{}' is not fully installed; vector persistence deferred",
+            model.id
+        ))),
+    }
 }
 
 /// Testable core of [`active_embedder`]'s presence-keyed selection (split out so the
@@ -471,20 +770,28 @@ pub fn active_embedder() -> Box<dyn Embedder> {
 /// mid-session, or switched to a not-yet-downloaded model), the process-wide cache entry is
 /// RELEASED before serving the stub — previously the evicted-only-on-dir-change cache kept the
 /// once-loaded instance (~470 MB of e5 weights) pinned until restart.
+#[cfg(test)]
 fn active_embedder_impl(model_present: bool, model: &'static EmbedModel) -> Box<dyn Embedder> {
     if model_present {
-        let built = embed_model_dir().and_then(|dir| cached_real_embedder(dir, model));
-        match built {
-            Ok(e) => return Box::new(SharedEmbedder(e)),
-            Err(e) => {
-                tracing::warn!(target: "embed", model_id = %model.id, error = %e, "local embed init failed; using stub embedder");
-            }
+        if let Ok(base) = crate::transcribe::models_dir() {
+            return active_embedder_impl_at(base.join(model.subdir), model);
         }
-    } else {
-        release_real_embedder_cache();
-        tracing::info!(target: "embed", model_id = %model.id, "no local embed model present; using stub embedder");
     }
+    release_real_embedder_cache();
+    tracing::info!(target: "embed", model_id = %model.id, "no local embed model present; using stub embedder");
     Box::new(StubEmbedder)
+}
+
+#[cfg(test)]
+fn active_embedder_impl_at(dir: PathBuf, model: &'static EmbedModel) -> Box<dyn Embedder> {
+    match cached_real_embedder(dir, model) {
+        Ok(embedder) => Box::new(SharedEmbedder(embedder)),
+        Err(error) => {
+            release_real_embedder_cache();
+            tracing::warn!(target: "embed", model_id = %model.id, error = %error, "local embed init failed; using stub embedder");
+            Box::new(StubEmbedder)
+        }
+    }
 }
 
 /// Drop the process-wide cached real-embedder entry so a deleted/deselected model actually
@@ -492,14 +799,14 @@ fn active_embedder_impl(model_present: bool, model: &'static EmbedModel) -> Box<
 /// Poison-safe (the cache holds no invariant worth failing over — recover the guard and clear)
 /// and panic-free; a no-op when nothing is cached. An in-flight forward pass holding its own
 /// `Arc` clone finishes safely — the weights free when the LAST clone drops.
-fn release_real_embedder_cache() {
+pub(crate) fn release_real_embedder_cache() {
     let evicted = REAL_EMBEDDER_CACHE
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .take()
         .is_some();
     if evicted {
-        tracing::info!(target: "embed", "released cached embed model (model no longer present)");
+        tracing::info!(target: "embed", "released cached embed model");
     }
 }
 
@@ -694,7 +1001,12 @@ fn hier_header(name: &str, section_path: Option<&str>, page_no: Option<u32>) -> 
 /// the doc name/section in every FTS row would inflate those terms' document frequency and distort
 /// bm25 ranking doc-wide, and changing it now would require a full FTS reindex. A leaf with no
 /// header context embeds the raw text unchanged.
-fn hier_embed_text(name: &str, section_path: Option<&str>, page_no: Option<u32>, raw: &str) -> String {
+fn hier_embed_text(
+    name: &str,
+    section_path: Option<&str>,
+    page_no: Option<u32>,
+    raw: &str,
+) -> String {
     let header = hier_header(name, section_path, page_no);
     if header.is_empty() {
         raw.to_string()
@@ -714,7 +1026,13 @@ pub fn clean_document_title(name: &str) -> String {
     let stem = match name.rsplit_once('.') {
         // Guard: only treat the tail as an extension when it's short + alphanumeric (a real ext),
         // so "notes.for.review" (no ext) keeps its last segment.
-        Some((head, ext)) if !ext.is_empty() && ext.len() <= 5 && ext.chars().all(|c| c.is_ascii_alphanumeric()) => head,
+        Some((head, ext))
+            if !ext.is_empty()
+                && ext.len() <= 5
+                && ext.chars().all(|c| c.is_ascii_alphanumeric()) =>
+        {
+            head
+        }
         _ => name,
     };
     let spaced: String = stem
@@ -736,7 +1054,8 @@ const CONTACT_PHONE_MAX_DIGITS: usize = 15;
 /// `(shown, bare)` pairs — the trimmed as-found string and the digits-only normalization — deduped
 /// by the bare form.
 fn find_phones(text: &str) -> Vec<(String, String)> {
-    let is_phone_char = |c: char| c.is_ascii_digit() || matches!(c, '+' | ' ' | '-' | '.' | '(' | ')');
+    let is_phone_char =
+        |c: char| c.is_ascii_digit() || matches!(c, '+' | ' ' | '-' | '.' | '(' | ')');
     let mut out: Vec<(String, String)> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let chars: Vec<char> = text.chars().collect();
@@ -784,7 +1103,8 @@ fn find_phones(text: &str) -> Vec<(String, String)> {
 /// where the local part is broken by a space (`"oskar .orlow@wp.pl"` → `"orlow@wp.pl"`): the local
 /// part is expanded left only over unbroken address chars. Deduped, lowercased.
 fn find_emails(text: &str) -> Vec<String> {
-    let local_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '%' | '+' | '-');
+    let local_char =
+        |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '%' | '+' | '-');
     let domain_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '-');
     let chars: Vec<char> = text.chars().collect();
     let mut out: Vec<String> = Vec::new();
@@ -1004,7 +1324,10 @@ fn first_sentence(text: &str) -> String {
     let mut end = text.len();
     for (i, &b) in bytes.iter().enumerate() {
         if (b == b'.' || b == b'!' || b == b'?')
-            && bytes.get(i + 1).map(|c| c.is_ascii_whitespace()).unwrap_or(true)
+            && bytes
+                .get(i + 1)
+                .map(|c| c.is_ascii_whitespace())
+                .unwrap_or(true)
         {
             end = i + 1;
             break;
@@ -1012,7 +1335,12 @@ fn first_sentence(text: &str) -> String {
     }
     // `end` is a byte index at an ASCII sentence terminator (or the full byte len) — always a char
     // boundary, so `&text[..end]` is safe. Then char-cap so a run-on line can't dominate the outline.
-    text[..end].chars().take(CAP).collect::<String>().trim().to_string()
+    text[..end]
+        .chars()
+        .take(CAP)
+        .collect::<String>()
+        .trim()
+        .to_string()
 }
 
 /// A running heading section being assembled by [`chunk_document_hierarchical`].
@@ -1043,7 +1371,10 @@ impl Section {
 /// Produced order: for each section — its L1 parent, then its L0 leaves (parent = that L1's index) —
 /// followed by the L2 summary chunk(s) at the end. The DB layer inserts in this order so a leaf's
 /// `parent` index precedes it.
-pub fn chunk_document_hierarchical(name: &str, blocks: &[crate::extract::ExtractedBlock]) -> Vec<HierChunk> {
+pub fn chunk_document_hierarchical(
+    name: &str,
+    blocks: &[crate::extract::ExtractedBlock],
+) -> Vec<HierChunk> {
     // Anchor every contextual header on a READABLE title, not the raw upload filename
     // ("Oskar_Orlowski_CV.pdf" → "Oskar Orlowski CV") — a `_`-joined name with a `.pdf` tail is a
     // weak semantic anchor for the vector leg. Header-only: the stored display name is untouched.
@@ -1161,7 +1492,11 @@ pub fn chunk_document_hierarchical(name: &str, blocks: &[crate::extract::Extract
             &lines_at(&|p| {
                 let prefix = p.map(|p| p.chars().count() + 4).unwrap_or(0);
                 let cap = per_line.saturating_sub(prefix);
-                if cap < 8 { 0 } else { cap }
+                if cap < 8 {
+                    0
+                } else {
+                    cap
+                }
             }),
             CHUNK_CHAR_TARGET,
         );
@@ -1890,17 +2225,39 @@ mod tests {
     #[test]
     fn hierarchical_chunker_builds_the_three_levels_with_headers_and_parents() {
         let blocks = vec![
-            blk("The budget is 100k for the quarter.", Some(1), Some("Design")),
-            blk("Anna owns delivery of the API.", Some(1), Some("Design › Storage")),
-            blk("Closing thoughts on the roadmap.", Some(2), Some("Design › Storage")),
+            blk(
+                "The budget is 100k for the quarter.",
+                Some(1),
+                Some("Design"),
+            ),
+            blk(
+                "Anna owns delivery of the API.",
+                Some(1),
+                Some("Design › Storage"),
+            ),
+            blk(
+                "Closing thoughts on the roadmap.",
+                Some(2),
+                Some("Design › Storage"),
+            ),
         ];
         let out = chunk_document_hierarchical("Spec.pdf", &blocks);
-        assert_eq!(out, chunk_document_hierarchical("Spec.pdf", &blocks), "deterministic");
+        assert_eq!(
+            out,
+            chunk_document_hierarchical("Spec.pdf", &blocks),
+            "deterministic"
+        );
 
         // Two sections (Design, Design › Storage) → 2 L1 parents; the last two blocks coalesce.
-        let l1: Vec<&HierChunk> = out.iter().filter(|c| c.level == HIER_LEVEL_SECTION).collect();
+        let l1: Vec<&HierChunk> = out
+            .iter()
+            .filter(|c| c.level == HIER_LEVEL_SECTION)
+            .collect();
         assert_eq!(l1.len(), 2, "one L1 per heading section");
-        assert!(l1.iter().all(|c| !c.embed), "L1 parents are NEVER embedded (FTS-only)");
+        assert!(
+            l1.iter().all(|c| !c.embed),
+            "L1 parents are NEVER embedded (FTS-only)"
+        );
         assert_eq!(l1[0].section_path.as_deref(), Some("Design"));
         assert_eq!(l1[1].section_path.as_deref(), Some("Design › Storage"));
 
@@ -1926,7 +2283,8 @@ mod tests {
                 leaf.embed_text
             );
             assert!(
-                leaf.embed_text.contains(&format!("p.{}", leaf.page_no.unwrap())),
+                leaf.embed_text
+                    .contains(&format!("p.{}", leaf.page_no.unwrap())),
                 "embed text must carry the page: {:?}",
                 leaf.embed_text
             );
@@ -1937,7 +2295,10 @@ mod tests {
         }
 
         // Exactly one L2 summary here (small doc), embedded, no parent.
-        let l2: Vec<&HierChunk> = out.iter().filter(|c| c.level == HIER_LEVEL_SUMMARY).collect();
+        let l2: Vec<&HierChunk> = out
+            .iter()
+            .filter(|c| c.level == HIER_LEVEL_SUMMARY)
+            .collect();
         assert!(!l2.is_empty() && l2.len() <= 3, "1..=3 summary chunks");
         assert!(l2.iter().all(|c| c.embed && c.parent.is_none()));
         // The outline references the headings.
@@ -1964,7 +2325,10 @@ mod tests {
             out.iter().any(|c| c.level == HIER_LEVEL_SUMMARY),
             "a flat doc still yields an L2 summary"
         );
-        assert!(out.iter().all(|c| c.page_no.is_none()), "flow format → page None");
+        assert!(
+            out.iter().all(|c| c.page_no.is_none()),
+            "flow format → page None"
+        );
     }
 
     /// `clean_document_title`: filename → readable header anchor. Strips the real extension, turns
@@ -1972,7 +2336,10 @@ mod tests {
     /// long non-extension tail.
     #[test]
     fn clean_document_title_makes_a_readable_anchor() {
-        assert_eq!(clean_document_title("Oskar_Orlowski_CV.pdf"), "Oskar Orlowski CV");
+        assert_eq!(
+            clean_document_title("Oskar_Orlowski_CV.pdf"),
+            "Oskar Orlowski CV"
+        );
         assert_eq!(clean_document_title("report-final.PDF"), "report final");
         assert_eq!(clean_document_title("Weekly Sync"), "Weekly Sync"); // idempotent
         assert_eq!(clean_document_title("notes.for.review"), "notes.for.review"); // "review" not an ext
@@ -1984,7 +2351,10 @@ mod tests {
     #[test]
     fn find_phones_detects_dialled_numbers_and_rejects_ids() {
         let got = find_phones("Warsaw · +48 786 327 907 · oskar@wp.pl");
-        assert_eq!(got, vec![("+48 786 327 907".to_string(), "48786327907".to_string())]);
+        assert_eq!(
+            got,
+            vec![("+48 786 327 907".to_string(), "48786327907".to_string())]
+        );
         // Tax id: a solid block with no '+'/separator → NOT a phone. "PL8431621900": glued to letters.
         assert!(
             find_phones("VAT ID: PL8431621900  Tax ID: 8431621900").is_empty(),
@@ -2001,8 +2371,14 @@ mod tests {
     /// (`"oskar .orlow@wp.pl"` → `"orlow@wp.pl"`), requires a dotted domain, deduped + lowercased.
     #[test]
     fn find_emails_handles_fragmented_local_part() {
-        assert_eq!(find_emails("contact: oskar .orlow@wp.pl now"), vec!["orlow@wp.pl".to_string()]);
-        assert_eq!(find_emails("A@B.COM and a@b.com"), vec!["a@b.com".to_string()]); // dedup+lower
+        assert_eq!(
+            find_emails("contact: oskar .orlow@wp.pl now"),
+            vec!["orlow@wp.pl".to_string()]
+        );
+        assert_eq!(
+            find_emails("A@B.COM and a@b.com"),
+            vec!["a@b.com".to_string()]
+        ); // dedup+lower
         assert!(find_emails("no address here @ all").is_empty()); // no dotted domain
     }
 
@@ -2018,16 +2394,37 @@ mod tests {
             None,
         )];
         let out = chunk_document_hierarchical("Oskar_Orlowski_CV.pdf", &blocks);
-        let digests: Vec<&HierChunk> = out.iter().filter(|c| c.level == HIER_LEVEL_CONTACT).collect();
+        let digests: Vec<&HierChunk> = out
+            .iter()
+            .filter(|c| c.level == HIER_LEVEL_CONTACT)
+            .collect();
         assert_eq!(digests.len(), 1, "exactly one contact digest per doc");
         let d = digests[0];
         assert!(d.embed, "the digest is embedded (rides the vector leg)");
-        assert!(d.parent.is_none(), "the digest has no parent (never expanded away)");
-        for token in ["numer telefonu", "phone number", "telefon", "786 327 907", "48786327907", "orlow@wp.pl"] {
-            assert!(d.raw.contains(token), "digest raw must carry {token:?}: {:?}", d.raw);
+        assert!(
+            d.parent.is_none(),
+            "the digest has no parent (never expanded away)"
+        );
+        for token in [
+            "numer telefonu",
+            "phone number",
+            "telefon",
+            "786 327 907",
+            "48786327907",
+            "orlow@wp.pl",
+        ] {
+            assert!(
+                d.raw.contains(token),
+                "digest raw must carry {token:?}: {:?}",
+                d.raw
+            );
         }
         // The embed leg additionally carries the CLEAN-title header anchor.
-        assert!(d.embed_text.contains("Oskar Orlowski CV"), "embed header uses the clean title: {:?}", d.embed_text);
+        assert!(
+            d.embed_text.contains("Oskar Orlowski CV"),
+            "embed header uses the clean title: {:?}",
+            d.embed_text
+        );
 
         // A contactless doc → no digest.
         let plain = vec![blk("Notes about the roadmap and priorities.", None, None)];
@@ -2054,23 +2451,33 @@ mod tests {
         let line = "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima.";
         let para = std::iter::repeat_n(line, 54).collect::<Vec<_>>().join("\n"); // ~4000 chars, no blank lines
         let out = chunk_document_hierarchical("big.pdf", &[blk(&para, Some(1), None)]);
-        let leaves: Vec<&HierChunk> =
-            out.iter().filter(|c| c.level == HIER_LEVEL_LEAF).collect();
+        let leaves: Vec<&HierChunk> = out.iter().filter(|c| c.level == HIER_LEVEL_LEAF).collect();
         assert!(
             leaves.len() > 1,
             "a 4000-char paragraph must hard-split, got {} leaf/leaves of sizes {:?}",
             leaves.len(),
-            leaves.iter().map(|l| l.raw.chars().count()).collect::<Vec<_>>()
+            leaves
+                .iter()
+                .map(|l| l.raw.chars().count())
+                .collect::<Vec<_>>()
         );
         assert!(
-            leaves.iter().all(|l| l.raw.chars().count() <= CHUNK_CHAR_TARGET),
+            leaves
+                .iter()
+                .all(|l| l.raw.chars().count() <= CHUNK_CHAR_TARGET),
             "every leaf must be within CHUNK_CHAR_TARGET chars, got sizes {:?}",
-            leaves.iter().map(|l| l.raw.chars().count()).collect::<Vec<_>>()
+            leaves
+                .iter()
+                .map(|l| l.raw.chars().count())
+                .collect::<Vec<_>>()
         );
         // The page TAIL must survive into some leaf (the whole point of the split): the last
         // line's text appears in the LAST leaf, not only inside one oversized blob.
         assert!(
-            leaves.last().map(|l| l.raw.contains("kilo lima.")).unwrap_or(false),
+            leaves
+                .last()
+                .map(|l| l.raw.contains("kilo lima."))
+                .unwrap_or(false),
             "the paragraph tail must land in the last leaf"
         );
     }
@@ -2084,18 +2491,26 @@ mod tests {
         let sent = "The plan covers hiring and the budget for the second quarter of the year. ";
         let para = sent.repeat(27);
         let out = chunk_document_hierarchical("run-on.txt", &[blk(para.trim(), None, None)]);
-        let leaves: Vec<&HierChunk> =
-            out.iter().filter(|c| c.level == HIER_LEVEL_LEAF).collect();
-        assert!(leaves.len() > 1, "sentence fallback must split a run-on paragraph");
-        assert!(leaves.iter().all(|l| l.raw.chars().count() <= CHUNK_CHAR_TARGET));
+        let leaves: Vec<&HierChunk> = out.iter().filter(|c| c.level == HIER_LEVEL_LEAF).collect();
+        assert!(
+            leaves.len() > 1,
+            "sentence fallback must split a run-on paragraph"
+        );
+        assert!(leaves
+            .iter()
+            .all(|l| l.raw.chars().count() <= CHUNK_CHAR_TARGET));
 
         // 1200 unbroken multi-byte chars: last-resort char windows, split points char-safe.
         let solid: String = "ąćęłńóśźż".chars().cycle().take(1200).collect();
         let out = chunk_document_hierarchical("solid.txt", &[blk(&solid, None, None)]);
-        let leaves: Vec<&HierChunk> =
-            out.iter().filter(|c| c.level == HIER_LEVEL_LEAF).collect();
-        assert!(leaves.len() > 1, "char-window fallback must split an unbroken run");
-        assert!(leaves.iter().all(|l| l.raw.chars().count() <= CHUNK_CHAR_TARGET));
+        let leaves: Vec<&HierChunk> = out.iter().filter(|c| c.level == HIER_LEVEL_LEAF).collect();
+        assert!(
+            leaves.len() > 1,
+            "char-window fallback must split an unbroken run"
+        );
+        assert!(leaves
+            .iter()
+            .all(|l| l.raw.chars().count() <= CHUNK_CHAR_TARGET));
     }
 
     /// Audit Fix 3 — leaf packing counts CHARS, not bytes: two 350-char Polish paragraphs
@@ -2106,8 +2521,7 @@ mod tests {
         let p2: String = "ół".chars().cycle().take(350).collect();
         let body = format!("{p1}\n\n{p2}");
         let out = chunk_document_hierarchical("pl.txt", &[blk(&body, None, None)]);
-        let leaves: Vec<&HierChunk> =
-            out.iter().filter(|c| c.level == HIER_LEVEL_LEAF).collect();
+        let leaves: Vec<&HierChunk> = out.iter().filter(|c| c.level == HIER_LEVEL_LEAF).collect();
         assert_eq!(
             leaves.len(),
             1,
@@ -2147,7 +2561,8 @@ mod tests {
             l2.iter().map(|c| c.raw.chars().count()).collect::<Vec<_>>()
         );
         assert!(
-            l2.iter().all(|c| c.raw.chars().count() <= CHUNK_CHAR_TARGET),
+            l2.iter()
+                .all(|c| c.raw.chars().count() <= CHUNK_CHAR_TARGET),
             "every L2 chunk must be ≤CHUNK_CHAR_TARGET chars, got {:?}",
             l2.iter().map(|c| c.raw.chars().count()).collect::<Vec<_>>()
         );
@@ -2167,7 +2582,8 @@ mod tests {
             l2.iter().map(|c| c.raw.chars().count()).collect::<Vec<_>>()
         );
         assert!(
-            l2.iter().all(|c| c.raw.chars().count() <= CHUNK_CHAR_TARGET),
+            l2.iter()
+                .all(|c| c.raw.chars().count() <= CHUNK_CHAR_TARGET),
             "every L2 chunk must be ≤CHUNK_CHAR_TARGET chars, got {:?}",
             l2.iter().map(|c| c.raw.chars().count()).collect::<Vec<_>>()
         );
@@ -2188,9 +2604,12 @@ mod tests {
             blk(p2.trim_end(), Some(2), Some("Long Section")),
         ];
         let out = chunk_document_hierarchical("paged.pdf", &blocks);
-        let leaves: Vec<&HierChunk> =
-            out.iter().filter(|c| c.level == HIER_LEVEL_LEAF).collect();
-        assert_eq!(leaves.len(), 2, "two ~720-char paragraphs cannot merge into one leaf");
+        let leaves: Vec<&HierChunk> = out.iter().filter(|c| c.level == HIER_LEVEL_LEAF).collect();
+        assert_eq!(
+            leaves.len(),
+            2,
+            "two ~720-char paragraphs cannot merge into one leaf"
+        );
         let leaf2 = leaves
             .iter()
             .find(|l| l.raw.starts_with("omega"))
@@ -2643,7 +3062,10 @@ mod tests {
         assert_eq!(ids, vec!["a", "b", "c"]);
         // Query-adaptive redistribution: the two empty legs' mass moves onto the ONLY present
         // leg, so it carries the full weight 1.0 — hybrid == that leg (its best normalizes to 1.0).
-        assert!((fused[0].1 - 1.0).abs() < 1e-9, "single present leg ⇒ weight 1.0: {fused:?}");
+        assert!(
+            (fused[0].1 - 1.0).abs() < 1e-9,
+            "single present leg ⇒ weight 1.0: {fused:?}"
+        );
     }
 
     #[test]
@@ -2707,10 +3129,17 @@ mod tests {
                 return Vec::new();
             }
             let min = leg.iter().map(|(_, s)| *s).fold(f64::INFINITY, f64::min);
-            let max = leg.iter().map(|(_, s)| *s).fold(f64::NEG_INFINITY, f64::max);
+            let max = leg
+                .iter()
+                .map(|(_, s)| *s)
+                .fold(f64::NEG_INFINITY, f64::max);
             leg.iter()
                 .map(|(id, s)| {
-                    let norm = if max > min { (s - min) / (max - min) } else { 1.0 };
+                    let norm = if max > min {
+                        (s - min) / (max - min)
+                    } else {
+                        1.0
+                    };
                     (id.clone(), norm)
                 })
                 .collect()
@@ -2759,7 +3188,10 @@ mod tests {
         assert_eq!(got.len(), want.len());
         for ((gi, gs), (wi, ws)) in got.iter().zip(want.iter()) {
             assert_eq!(gi, wi, "order diverged: {got:?} vs {want:?}");
-            assert!((gs - ws).abs() < 1e-12, "score diverged at {gi}: {gs} vs {ws}");
+            assert!(
+                (gs - ws).abs() < 1e-12,
+                "score diverged at {gi}: {gs} vs {ws}"
+            );
         }
     }
 
@@ -2822,7 +3254,10 @@ mod tests {
         let ids: Vec<&str> = fused.iter().map(|(id, _)| id.as_str()).collect();
         // Smaller distance ⇒ higher sim ⇒ higher fused: near > mid > far.
         assert_eq!(ids, vec!["near", "mid", "far"], "{fused:?}");
-        assert!((fused[0].1 - 1.0).abs() < 1e-9, "single leg best ⇒ 1.0: {fused:?}");
+        assert!(
+            (fused[0].1 - 1.0).abs() < 1e-9,
+            "single leg best ⇒ 1.0: {fused:?}"
+        );
     }
 
     // (4) ALL EMPTY ⇒ empty (unchanged).
@@ -2846,10 +3281,8 @@ mod tests {
         let dek = std::env::var("MURMUR_BAKEOFF_DEK").expect("MURMUR_BAKEOFF_DEK");
         let set_path = std::env::var("MURMUR_BAKEOFF_SET").expect("MURMUR_BAKEOFF_SET");
         let db = crate::storage::Db::open_with_key(std::path::Path::new(&db_path), &dek).unwrap();
-        let set = crate::eval::LabeledSet::from_json(
-            &std::fs::read_to_string(&set_path).unwrap(),
-        )
-        .unwrap();
+        let set = crate::eval::LabeledSet::from_json(&std::fs::read_to_string(&set_path).unwrap())
+            .unwrap();
         let today = chrono::Utc::now().date_naive();
         let empties: HashSet<String> = HashSet::new();
         let mut empty = 0usize;
@@ -3172,7 +3605,11 @@ mod tests {
 
         // The next embedder resolution sees model_present == false → stub AND a cleared cache.
         let e = active_embedder_impl(false, default_embed_model());
-        assert_eq!(e.dim(), EMBED_DIM, "the stub is served when the model is absent");
+        assert_eq!(
+            e.dim(),
+            EMBED_DIM,
+            "the stub is served when the model is absent"
+        );
         assert!(
             REAL_EMBEDDER_CACHE
                 .read()

@@ -222,7 +222,13 @@ mod tests {
     use crate::storage::Db;
     const GOOD_KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
-    fn seed_meeting(db: &Db, dir: &std::path::Path, id: &str, at: &str, locked_folder: Option<&str>) {
+    fn seed_meeting(
+        db: &Db,
+        dir: &std::path::Path,
+        id: &str,
+        at: &str,
+        locked_folder: Option<&str>,
+    ) {
         // playback 1000B, masters 500B each → 2000B of audio per meeting.
         let wav = dir.join(format!("{id}.wav"));
         let mic = dir.join(format!("{id}.mic.wav"));
@@ -277,11 +283,17 @@ mod tests {
         assert_eq!(s.pruned_count, 0);
         assert_eq!(s.freed_bytes, 1000);
         assert!(!d.join("old.mic.wav").exists() && !d.join("old.sys.wav").exists());
-        assert!(d.join("old.wav").exists(), "playback kept — masters were enough");
+        assert!(
+            d.join("old.wav").exists(),
+            "playback kept — masters were enough"
+        );
         assert!(d.join("new.mic.wav").exists(), "newest untouched");
         // Context preserved: the note still reads back.
         assert_eq!(
-            db.get_latest_note_for_meeting("old").unwrap().unwrap().markdown,
+            db.get_latest_note_for_meeting("old")
+                .unwrap()
+                .unwrap()
+                .markdown,
             "kept"
         );
         let _ = std::fs::remove_dir_all(&d);
@@ -308,9 +320,15 @@ mod tests {
 
         // Cap 0 → prune must free everything it CAN — but the locked meeting is exempt.
         let s = prune_to_limit(&db, &d, 0, None).unwrap();
-        assert!(d.join("locked.wav").exists(), "locked audio must NEVER be deleted");
+        assert!(
+            d.join("locked.wav").exists(),
+            "locked audio must NEVER be deleted"
+        );
         assert!(d.join("locked.mic.wav").exists());
-        assert!(!d.join("open.wav").exists(), "the open meeting's audio was pruned");
+        assert!(
+            !d.join("open.wav").exists(),
+            "the open meeting's audio was pruned"
+        );
         assert!(s.pruned_count >= 1);
         let _ = std::fs::remove_dir_all(&d);
         let _ = std::fs::remove_file(&p);
@@ -324,7 +342,9 @@ mod tests {
         let db = Db::open_with_key(&p, GOOD_KEY).unwrap();
         seed_meeting(&db, &d, "m", "2026-01-01T00:00:00Z", None);
         assert_eq!(
-            maybe_prune(&db, &d, Some(2), false, None).unwrap().freed_bytes,
+            maybe_prune(&db, &d, Some(2), false, None)
+                .unwrap()
+                .freed_bytes,
             0,
             "auto off → no-op"
         );

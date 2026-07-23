@@ -28,10 +28,602 @@
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
 
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
+
 use crate::error::{AppError, Result};
 
 const NONCE_LEN: usize = 12;
 const TAG_LEN: usize = 16;
+
+// Darwin's O_NOFOLLOW. Murmur is macOS-first; other Unix test targets retain the pre/post-open
+// identity checks and omit the platform-specific flag rather than guessing another ABI value.
+#[cfg(target_os = "macos")]
+const NOFOLLOW_FLAG: i32 = 0x0000_0100;
+#[cfg(not(target_os = "macos"))]
+const NOFOLLOW_FLAG: i32 = 0;
+
+const ATOMIC_STAGE_MARKER: &str = ".murmur-crypto-";
+
+fn storage_error(operation: &str, error: impl std::fmt::Display) -> AppError {
+    AppError::Storage(format!("{operation}: {error}"))
+}
+
+/// Open and read one app-owned regular file without following a final-component symlink. The
+/// identity/length checks make a concurrent pathname substitution fail closed. Audio artifacts
+/// must have one name: otherwise sealing one pathname could leave another plaintext hard link.
+fn read_owned_file(path: &Path, operation: &str) -> Result<Vec<u8>> {
+    let path_before = std::fs::symlink_metadata(path).map_err(|e| storage_error(operation, e))?;
+    if path_before.file_type().is_symlink() || !path_before.is_file() || path_before.nlink() != 1 {
+        return Err(AppError::Storage(format!(
+            "{operation}: audio artifact is not an owned single-link regular file"
+        )));
+    }
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(NOFOLLOW_FLAG)
+        .open(path)
+        .map_err(|e| storage_error(operation, e))?;
+    let opened = file.metadata().map_err(|e| storage_error(operation, e))?;
+    if opened.dev() != path_before.dev()
+        || opened.ino() != path_before.ino()
+        || opened.len() != path_before.len()
+        || opened.nlink() != 1
+    {
+        return Err(AppError::Storage(format!(
+            "{operation}: audio artifact identity changed while opening"
+        )));
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(opened.len()).map_err(|_| {
+        AppError::Storage(format!(
+            "{operation}: audio artifact is too large to address"
+        ))
+    })?);
+    file.read_to_end(&mut bytes)
+        .map_err(|e| storage_error(operation, e))?;
+    let after = file.metadata().map_err(|e| storage_error(operation, e))?;
+    let path_after = std::fs::symlink_metadata(path).map_err(|e| storage_error(operation, e))?;
+    if after.dev() != opened.dev()
+        || after.ino() != opened.ino()
+        || after.len() != opened.len()
+        || after.nlink() != 1
+        || path_after.file_type().is_symlink()
+        || path_after.dev() != opened.dev()
+        || path_after.ino() != opened.ino()
+        || path_after.len() != opened.len()
+        || bytes.len() as u64 != opened.len()
+    {
+        return Err(AppError::Storage(format!(
+            "{operation}: audio artifact changed while reading"
+        )));
+    }
+    Ok(bytes)
+}
+
+fn sync_parent(path: &Path, operation: &str) -> Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        AppError::Storage(format!("{operation}: destination has no parent directory"))
+    })?;
+    File::open(parent)
+        .and_then(|dir| dir.sync_all())
+        .map_err(|e| storage_error(operation, e))
+}
+
+struct AtomicStage {
+    path: PathBuf,
+    file: File,
+    device: u64,
+    inode: u64,
+    published: bool,
+}
+
+impl Drop for AtomicStage {
+    fn drop(&mut self) {
+        if !self.published {
+            // A failed decrypt must not strand plaintext in a `.part` until the next launch. Keep
+            // a stable handle, truncate+sync it first (works even if parent permissions prevent
+            // unlink), then remove only when the path still names this exact inode.
+            let _ = self.file.set_len(0);
+            let _ = self.file.sync_all();
+            if let Ok(named) = std::fs::symlink_metadata(&self.path) {
+                if !named.file_type().is_symlink()
+                    && named.is_file()
+                    && named.dev() == self.device
+                    && named.ino() == self.inode
+                    && named.nlink() == 1
+                {
+                    let _ = std::fs::remove_file(&self.path);
+                    let _ = sync_parent(&self.path, "sync failed audio crypto staging cleanup");
+                }
+            }
+        }
+    }
+}
+
+impl AtomicStage {
+    /// Erase and unlink the exact inode retained by this guard after it has been renamed to the
+    /// published path. Every durability/identity failure is collected so the caller can return a
+    /// composite error instead of silently relying on [`Drop`].
+    fn cleanup_failed_publish(&mut self, operation: &str) -> Result<()> {
+        let mut failures = Vec::new();
+
+        if let Err(error) = self.file.set_len(0) {
+            failures.push(format!("truncate exact published inode failed: {error}"));
+        }
+        if let Err(error) = self.file.sync_all() {
+            failures.push(format!("sync truncated published inode failed: {error}"));
+        }
+
+        match self.file.metadata() {
+            Ok(metadata)
+                if metadata.dev() == self.device
+                    && metadata.ino() == self.inode
+                    && metadata.len() == 0 => {}
+            Ok(_) => failures.push(
+                "exact published inode did not verify as the retained zero-length inode".into(),
+            ),
+            Err(error) => {
+                failures.push(format!("verify truncated published inode failed: {error}"))
+            }
+        }
+
+        match std::fs::symlink_metadata(&self.path) {
+            Ok(named)
+                if !named.file_type().is_symlink()
+                    && named.is_file()
+                    && named.dev() == self.device
+                    && named.ino() == self.inode
+                    && named.nlink() == 1 => {
+                if let Err(error) = std::fs::remove_file(&self.path) {
+                    failures.push(format!("unlink exact published inode failed: {error}"));
+                }
+            }
+            Ok(_) => failures.push(
+                "published pathname no longer names the retained single-link inode; refusing to unlink"
+                    .into(),
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => failures.push(format!(
+                "inspect published pathname before unlink failed: {error}"
+            )),
+        }
+
+        match self.file.metadata() {
+            Ok(metadata)
+                if metadata.dev() == self.device
+                    && metadata.ino() == self.inode
+                    && metadata.len() == 0
+                    && metadata.nlink() == 0 => {}
+            Ok(_) => failures
+                .push("exact published inode was not proven zero-length and fully unlinked".into()),
+            Err(error) => failures.push(format!(
+                "verify exact published inode after unlink failed: {error}"
+            )),
+        }
+
+        match std::fs::symlink_metadata(&self.path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                failures.push(format!("verify published pathname absence failed: {error}"))
+            }
+            Ok(_) => failures.push("published pathname remains readable after cleanup".into()),
+        }
+        if let Err(error) = sync_parent(
+            &self.path,
+            "sync failed audio crypto published-file cleanup",
+        ) {
+            failures.push(error.to_string());
+        }
+        match std::fs::symlink_metadata(&self.path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => failures.push(format!(
+                "re-verify published pathname absence after parent sync failed: {error}"
+            )),
+            Ok(_) => failures
+                .push("published pathname became readable again during durable cleanup".into()),
+        }
+
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(AppError::Storage(format!(
+                "{operation}: failed published-file cleanup could not be proven: {}",
+                failures.join("; ")
+            )))
+        }
+    }
+}
+
+/// Same-directory, private, crash-durable publish. The final path is reopened without following a
+/// symlink and compared byte-for-byte before success. A crash before rename leaves only an
+/// unmistakable `.part` file; startup removes those untracked stages before exposing the library.
+fn durable_atomic_write(dest: &Path, bytes: &[u8], operation: &str) -> Result<()> {
+    let parent = dest.parent().ok_or_else(|| {
+        AppError::Storage(format!("{operation}: destination has no parent directory"))
+    })?;
+    let target_name = dest
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| AppError::Storage(format!("{operation}: invalid destination name")))?;
+
+    let mut stage = None;
+    for _ in 0..8 {
+        let candidate = parent.join(format!(
+            ".{target_name}{ATOMIC_STAGE_MARKER}{}.part",
+            uuid::Uuid::new_v4()
+        ));
+        match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(NOFOLLOW_FLAG)
+            .open(&candidate)
+        {
+            Ok(file) => {
+                stage = Some((candidate, file));
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(storage_error(operation, error)),
+        }
+    }
+    let (stage_path, mut stage_file) = stage.ok_or_else(|| {
+        AppError::Storage(format!(
+            "{operation}: could not allocate a unique staging file"
+        ))
+    })?;
+    let created_meta = stage_file
+        .metadata()
+        .map_err(|e| storage_error(operation, e))?;
+    let mut cleanup = AtomicStage {
+        path: stage_path.clone(),
+        file: stage_file
+            .try_clone()
+            .map_err(|e| storage_error(operation, e))?,
+        device: created_meta.dev(),
+        inode: created_meta.ino(),
+        published: false,
+    };
+
+    stage_file
+        .set_permissions(std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| storage_error(operation, e))?;
+    stage_file
+        .write_all(bytes)
+        .and_then(|()| stage_file.sync_all())
+        .map_err(|e| storage_error(operation, e))?;
+    let staged_meta = stage_file
+        .metadata()
+        .map_err(|e| storage_error(operation, e))?;
+    if staged_meta.nlink() != 1
+        || staged_meta.len() != bytes.len() as u64
+        || staged_meta.permissions().mode() & 0o777 != 0o600
+    {
+        return Err(AppError::Storage(format!(
+            "{operation}: staged file failed private identity verification"
+        )));
+    }
+    drop(stage_file);
+    if read_owned_file(&stage_path, operation)? != bytes {
+        return Err(AppError::Storage(format!(
+            "{operation}: staged file failed byte-for-byte verification"
+        )));
+    }
+
+    std::fs::rename(&stage_path, dest).map_err(|e| storage_error(operation, e))?;
+    // The cleanup capability follows the exact inode through rename. Keep it armed until the
+    // published pathname has passed final readback AND the directory entry is durable; a failure
+    // in either step must truncate/remove a decrypted plaintext destination while its `.enc`
+    // source still exists.
+    cleanup.path = dest.to_path_buf();
+
+    let publish_result = (|| -> Result<()> {
+        let final_meta =
+            std::fs::symlink_metadata(dest).map_err(|e| storage_error(operation, e))?;
+        if final_meta.file_type().is_symlink()
+            || final_meta.dev() != staged_meta.dev()
+            || final_meta.ino() != staged_meta.ino()
+            || final_meta.nlink() != 1
+            || final_meta.permissions().mode() & 0o777 != 0o600
+            || read_owned_file(dest, operation)? != bytes
+        {
+            return Err(AppError::Storage(format!(
+                "{operation}: published file failed durable identity verification"
+            )));
+        }
+        sync_parent(dest, operation)
+    })();
+
+    match publish_result {
+        Ok(()) => {
+            cleanup.published = true;
+            Ok(())
+        }
+        Err(publish_error) => {
+            let cleanup_result = cleanup.cleanup_failed_publish(operation);
+            // Cleanup above was explicit and its result is preserved below. Do not let Drop perform
+            // a second best-effort attempt whose suppressed failures could obscure that result.
+            cleanup.published = true;
+            match cleanup_result {
+                Ok(()) => Err(publish_error),
+                Err(cleanup_error) => Err(AppError::Storage(format!(
+                    "{operation}: post-rename failure ({publish_error}); cleanup failure ({cleanup_error})"
+                ))),
+            }
+        }
+    }
+}
+
+/// Remove a sensitive file and prove the pathname is absent before the caller changes any DB
+/// pointer or reports a seal as complete. NotFound is idempotent success; every other outcome is a
+/// hard error. A successful unlink is parent-directory-synced before returning.
+pub(crate) fn remove_file_verified_absent(path: &Path, operation: &str) -> Result<()> {
+    let before = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(storage_error(operation, error)),
+    };
+    if before.file_type().is_symlink() || !before.is_file() || before.nlink() != 1 {
+        return Err(AppError::Storage(format!(
+            "{operation}: sensitive artifact is not an owned single-link regular file"
+        )));
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(NOFOLLOW_FLAG)
+        .open(path)
+        .map_err(|e| storage_error(operation, e))?;
+    let opened = file.metadata().map_err(|e| storage_error(operation, e))?;
+    if opened.dev() != before.dev() || opened.ino() != before.ino() || opened.nlink() != 1 {
+        return Err(AppError::Storage(format!(
+            "{operation}: sensitive artifact identity changed while opening"
+        )));
+    }
+    let named = std::fs::symlink_metadata(path).map_err(|e| storage_error(operation, e))?;
+    if named.file_type().is_symlink()
+        || named.dev() != opened.dev()
+        || named.ino() != opened.ino()
+        || named.nlink() != 1
+    {
+        return Err(AppError::Storage(format!(
+            "{operation}: sensitive pathname no longer names the opened inode"
+        )));
+    }
+    std::fs::remove_file(path).map_err(|e| storage_error(operation, e))?;
+    let after = file.metadata().map_err(|e| storage_error(operation, e))?;
+    if after.dev() != opened.dev() || after.ino() != opened.ino() || after.nlink() != 0 {
+        return Err(AppError::Storage(format!(
+            "{operation}: exact sensitive inode did not lose its final name"
+        )));
+    }
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => sync_parent(path, operation),
+        Err(error) => Err(storage_error(operation, error)),
+        Ok(_) => Err(AppError::Storage(format!(
+            "{operation}: sensitive pathname was recreated during unlink"
+        ))),
+    }
+}
+
+/// Validate a managed plaintext export against Murmur's canonical digest without changing the
+/// filesystem. Missing files are idempotent success; a symlink, hard link, identity race, length
+/// mismatch, or byte mismatch fails closed. Destructive multi-file operations use this as a full
+/// preflight before they remove the first member of a governed export set.
+pub(crate) fn verify_file_content(
+    path: &Path,
+    expected_len: Option<u64>,
+    expected_sha256: &[u8; 32],
+    operation: &str,
+) -> Result<()> {
+    use sha2::{Digest, Sha256};
+
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(storage_error(operation, error)),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.nlink() != 1 {
+        return Err(AppError::Storage(format!(
+            "{operation}: managed export is not an owned single-link regular file"
+        )));
+    }
+    if expected_len.is_some_and(|expected| expected != metadata.len()) {
+        return Err(AppError::Storage(format!(
+            "{operation}: managed export was changed outside Murmur; preserving it"
+        )));
+    }
+    let bytes = read_owned_file(path, operation)?;
+    if Sha256::digest(&bytes).as_slice() != expected_sha256 {
+        return Err(AppError::Storage(format!(
+            "{operation}: managed export was changed outside Murmur; preserving it"
+        )));
+    }
+    Ok(())
+}
+
+/// Remove one managed plaintext export only when the exact named inode still has the canonical
+/// length + SHA-256 recorded by Murmur. The pathname is first atomically moved to a private sibling,
+/// then the displaced inode is opened without following symlinks and verified. A mismatch is moved
+/// back (or left at the private sibling when another writer already recreated the original name) and
+/// returns an error, so callers can abort a seal before publishing the locked state without losing an
+/// external edit. A matching quarantine is removed through [`remove_file_verified_absent`].
+pub(crate) fn remove_file_verified_content(
+    path: &Path,
+    expected_len: Option<u64>,
+    expected_sha256: &[u8; 32],
+    operation: &str,
+) -> Result<()> {
+    use sha2::{Digest, Sha256};
+
+    let before = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(storage_error(operation, error)),
+    };
+    if before.file_type().is_symlink() || !before.is_file() || before.nlink() != 1 {
+        return Err(AppError::Storage(format!(
+            "{operation}: managed export is not an owned single-link regular file"
+        )));
+    }
+    if expected_len.is_some_and(|expected| expected != before.len()) {
+        return Err(AppError::Storage(format!(
+            "{operation}: managed export was changed outside Murmur; preserving it"
+        )));
+    }
+
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| AppError::Storage(format!("{operation}: export name is not valid UTF-8")))?;
+    let quarantine = path.with_file_name(format!(
+        ".{file_name}.murmur-remove-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::rename(path, &quarantine).map_err(|error| storage_error(operation, error))?;
+
+    let restore = |reason: &str| -> Result<()> {
+        match std::fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::rename(&quarantine, path)
+                    .map_err(|error| storage_error(operation, error))?;
+                sync_parent(path, operation)?;
+            }
+            Err(error) => return Err(storage_error(operation, error)),
+            Ok(_) => {
+                // Another writer recreated the canonical name. Keep the displaced bytes at the
+                // private sibling rather than overwrite either version; the caller remains open.
+                sync_parent(&quarantine, operation)?;
+            }
+        }
+        Err(AppError::Storage(format!("{operation}: {reason}")))
+    };
+
+    let opened = match OpenOptions::new()
+        .read(true)
+        .custom_flags(NOFOLLOW_FLAG)
+        .open(&quarantine)
+    {
+        Ok(file) => file,
+        Err(error) => return restore(&format!("quarantined export could not be opened: {error}")),
+    };
+    let metadata = match opened.metadata() {
+        Ok(metadata) => metadata,
+        Err(error) => return restore(&format!("quarantined export could not be inspected: {error}")),
+    };
+    if metadata.dev() != before.dev()
+        || metadata.ino() != before.ino()
+        || metadata.nlink() != 1
+        || expected_len.is_some_and(|expected| expected != metadata.len())
+    {
+        return restore("managed export identity changed during quarantine");
+    }
+    let mut bytes = Vec::with_capacity(metadata.len().min(64 * 1024 * 1024) as usize);
+    let mut reader = opened;
+    if let Err(error) = reader.read_to_end(&mut bytes) {
+        return restore(&format!("quarantined export could not be read: {error}"));
+    }
+    if Sha256::digest(&bytes).as_slice() != expected_sha256 {
+        return restore("managed export was changed outside Murmur; preserving it");
+    }
+
+    remove_file_verified_absent(&quarantine, operation)?;
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(storage_error(operation, error)),
+        Ok(_) => Err(AppError::Storage(format!(
+            "{operation}: managed export was recreated during removal; preserving the new file"
+        ))),
+    }
+}
+
+/// Prove a named artifact is a stable, app-owned regular file without reading its potentially huge
+/// contents. Used when a relock only needs to establish that its already-verified `.enc` twin still
+/// exists before deleting the session plaintext.
+pub(crate) fn owned_regular_file_exists(path: &Path, operation: &str) -> Result<bool> {
+    let named = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(storage_error(operation, error)),
+    };
+    if named.file_type().is_symlink() || !named.is_file() || named.nlink() != 1 {
+        return Err(AppError::Storage(format!(
+            "{operation}: artifact is not an owned single-link regular file"
+        )));
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(NOFOLLOW_FLAG)
+        .open(path)
+        .map_err(|e| storage_error(operation, e))?;
+    let opened = file.metadata().map_err(|e| storage_error(operation, e))?;
+    if opened.dev() != named.dev()
+        || opened.ino() != named.ino()
+        || opened.len() != named.len()
+        || opened.nlink() != 1
+    {
+        return Err(AppError::Storage(format!(
+            "{operation}: artifact identity changed while opening"
+        )));
+    }
+    Ok(true)
+}
+
+/// Remove untracked atomic stages left by a crash. The name is deliberately narrow and every
+/// removal is verified; callers invoke this only after the process-wide instance lock is held.
+pub(crate) fn sweep_atomic_stages(
+    dir: &Path,
+    expected_targets: &std::collections::HashSet<String>,
+) -> Result<usize> {
+    let mut removed = 0usize;
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => {
+            return Err(storage_error(
+                "inspect audio crypto staging directory",
+                error,
+            ))
+        }
+    };
+    for entry in entries {
+        let entry = entry.map_err(|e| storage_error("inspect audio crypto staging entry", e))?;
+        let name = match entry.file_name().to_str() {
+            Some(name) => name.to_owned(),
+            None => continue,
+        };
+        let Some(body) = name.strip_prefix('.') else {
+            continue;
+        };
+        let Some((target, stage_suffix)) = body.rsplit_once(ATOMIC_STAGE_MARKER) else {
+            continue;
+        };
+        let Some(stage_id) = stage_suffix.strip_suffix(".part") else {
+            continue;
+        };
+        if target.is_empty() || uuid::Uuid::parse_str(stage_id).is_err() {
+            continue;
+        }
+        if !expected_targets.contains(target) {
+            return Err(AppError::Storage(
+                "audio crypto staging artifact has no matching locked-audio target".into(),
+            ));
+        }
+        let path = entry.path();
+        let metadata = std::fs::symlink_metadata(&path)
+            .map_err(|e| storage_error("inspect audio crypto staging artifact", e))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.nlink() != 1 {
+            return Err(AppError::Storage(
+                "audio crypto staging artifact has an ambiguous identity".into(),
+            ));
+        }
+        remove_file_verified_absent(&path, "remove abandoned audio crypto staging artifact")?;
+        removed += 1;
+    }
+    Ok(removed)
+}
 
 /// Which AAD form successfully decrypted a blob — so callers can lazily RE-BIND legacy (pre-AAD)
 /// blobs to their real context on the next write (see module docs, B7/B8 backward-compat).
@@ -118,25 +710,25 @@ pub fn random_key() -> Result<[u8; 32]> {
 /// plaintext WAV (separate file at `meetings.audio_path`, NOT in the SQLCipher DB) is encrypted at
 /// rest for locked folders. `aad` should be the audio context (`meeting_id|folder_id`); `&[]` for
 /// the legacy unbound form.
-pub fn encrypt_file(
-    key: &[u8; 32],
-    src: &std::path::Path,
-    dest: &std::path::Path,
-    aad: &[u8],
-) -> Result<()> {
-    let plaintext = std::fs::read(src)
-        .map_err(|e| AppError::Storage(format!("read audio for encrypt: {e}")))?;
+pub fn encrypt_file(key: &[u8; 32], src: &Path, dest: &Path, aad: &[u8]) -> Result<()> {
+    let plaintext = read_owned_file(src, "read audio for encrypt")?;
     let blob = encrypt(key, &plaintext, aad)?;
-    // Verify the blob decrypts back byte-identical (under the SAME aad) BEFORE we ever write it (and
-    // before the caller destroys the plaintext). A tampered/short blob fails closed here.
+    // Verify once before I/O, durably publish through a private same-directory staging file, then
+    // REOPEN the final pathname and decrypt what is actually on disk before callers may destroy the
+    // plaintext. An in-memory-only check is not verify-before-destroy.
     let check = decrypt(key, &blob, aad)?;
     if check != plaintext {
         return Err(AppError::Storage(
             "audio seal verification failed (decrypted blob mismatch)".into(),
         ));
     }
-    std::fs::write(dest, &blob)
-        .map_err(|e| AppError::Storage(format!("write encrypted audio: {e}")))?;
+    durable_atomic_write(dest, &blob, "write encrypted audio")?;
+    let stored = read_owned_file(dest, "verify stored encrypted audio")?;
+    if decrypt(key, &stored, aad)? != plaintext {
+        return Err(AppError::Storage(
+            "stored audio seal verification failed (decrypted file mismatch)".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -144,18 +736,10 @@ pub fn encrypt_file(
 /// expecting context `aad` (legacy empty-AAD fallback applies, see [`decrypt_with_aad`]), into the
 /// plaintext WAV at `dest`. Used to materialize a playable WAV for the session on unlock, and to
 /// permanently restore the plaintext on remove-lock.
-pub fn decrypt_file(
-    key: &[u8; 32],
-    src: &std::path::Path,
-    dest: &std::path::Path,
-    aad: &[u8],
-) -> Result<()> {
-    let blob =
-        std::fs::read(src).map_err(|e| AppError::Storage(format!("read encrypted audio: {e}")))?;
+pub fn decrypt_file(key: &[u8; 32], src: &Path, dest: &Path, aad: &[u8]) -> Result<()> {
+    let blob = read_owned_file(src, "read encrypted audio")?;
     let plaintext = decrypt(key, &blob, aad)?;
-    std::fs::write(dest, &plaintext)
-        .map_err(|e| AppError::Storage(format!("write decrypted audio: {e}")))?;
-    Ok(())
+    durable_atomic_write(dest, &plaintext, "write decrypted audio")
 }
 
 /// Decrypt an encrypted-WAV file at `src` trying a LADDER of candidate AADs in priority order,
@@ -170,23 +754,66 @@ pub fn decrypt_file(
 /// as a lower rung makes the migration lossless; the file re-binds to the role form on its next seal.
 /// A swapped file (mic ciphertext presented as sys) matches NEITHER rung and fails closed. Fails
 /// closed (`AppError::Locked`) only if NO candidate (and no empty fallback) matches.
-pub fn decrypt_file_multi(
-    key: &[u8; 32],
-    src: &std::path::Path,
-    dest: &std::path::Path,
-    aads: &[&[u8]],
-) -> Result<()> {
-    let blob =
-        std::fs::read(src).map_err(|e| AppError::Storage(format!("read encrypted audio: {e}")))?;
+pub fn decrypt_file_multi(key: &[u8; 32], src: &Path, dest: &Path, aads: &[&[u8]]) -> Result<()> {
+    let blob = read_owned_file(src, "read encrypted audio")?;
     for aad in aads {
         if let Ok(pt) = decrypt(key, &blob, aad) {
-            std::fs::write(dest, &pt)
-                .map_err(|e| AppError::Storage(format!("write decrypted audio: {e}")))?;
+            durable_atomic_write(dest, &pt, "write decrypted audio")?;
             return Ok(());
         }
     }
     Err(AppError::Locked(
         "audio decryption failed (wrong key, tampered data, or wrong storage context)".into(),
+    ))
+}
+
+/// Authenticate an encrypted audio file against the ordered AAD ladder without materializing a
+/// plaintext pathname. Used by startup repair before a dangling DB pointer may be repointed at the
+/// ciphertext-only survivor. A wrong key, truncated/tampered file, or swapped stream fails closed.
+pub(crate) fn verify_encrypted_file_multi(
+    key: &[u8; 32],
+    src: &Path,
+    aads: &[&[u8]],
+) -> Result<()> {
+    let blob = read_owned_file(src, "verify encrypted audio")?;
+    for aad in aads {
+        if let Ok(plaintext) = decrypt(key, &blob, aad) {
+            let _plaintext = zeroize::Zeroizing::new(plaintext);
+            return Ok(());
+        }
+    }
+    Err(AppError::Locked(
+        "audio verification failed (wrong key, tampered data, or wrong storage context)".into(),
+    ))
+}
+
+/// Authenticate a retained ciphertext and prove that an already-materialized plaintext sibling is
+/// byte-identical before permanent unlock is allowed to retire the ciphertext. This is the
+/// session-unlock shape: the DB points at plaintext while the `.enc` remains the rollback copy.
+pub(crate) fn verify_encrypted_file_matches_plaintext_multi(
+    key: &[u8; 32],
+    encrypted: &Path,
+    plaintext: &Path,
+    aads: &[&[u8]],
+) -> Result<()> {
+    let blob = read_owned_file(encrypted, "verify retained encrypted audio")?;
+    let expected = zeroize::Zeroizing::new(read_owned_file(
+        plaintext,
+        "verify permanent-unlock plaintext audio",
+    )?);
+    for aad in aads {
+        if let Ok(candidate) = decrypt(key, &blob, aad) {
+            let candidate = zeroize::Zeroizing::new(candidate);
+            if candidate.as_slice() == expected.as_slice() {
+                return Ok(());
+            }
+            return Err(AppError::Locked(
+                "permanent-unlock plaintext does not match its retained ciphertext".into(),
+            ));
+        }
+    }
+    Err(AppError::Locked(
+        "audio verification failed (wrong key, tampered data, or wrong storage context)".into(),
     ))
 }
 
@@ -314,6 +941,52 @@ mod tests {
                 .as_nanos()
         ));
         p
+    }
+
+    #[test]
+    fn verified_content_removal_deletes_only_the_recorded_bytes() {
+        use sha2::{Digest, Sha256};
+
+        let path = temp_path("verified-remove.md");
+        let bytes = b"# Murmur-authored export\n";
+        std::fs::write(&path, bytes).unwrap();
+        let hash: [u8; 32] = Sha256::digest(bytes).into();
+
+        remove_file_verified_content(
+            &path,
+            Some(bytes.len() as u64),
+            &hash,
+            "test verified export removal",
+        )
+        .unwrap();
+
+        assert!(!path.exists(), "an unchanged managed export is removed");
+    }
+
+    #[test]
+    fn verified_content_removal_restores_an_external_edit() {
+        use sha2::{Digest, Sha256};
+
+        let path = temp_path("verified-preserve.md");
+        let authored = b"# Murmur-authored export\n";
+        let external = b"# User edit in Obsidian\n";
+        std::fs::write(&path, external).unwrap();
+        let hash: [u8; 32] = Sha256::digest(authored).into();
+
+        let error = remove_file_verified_content(
+            &path,
+            None,
+            &hash,
+            "test preserve external edit",
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, AppError::Storage(_)));
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            external,
+            "a mismatching file is restored byte-identical at the canonical path"
+        );
     }
 
     #[test]

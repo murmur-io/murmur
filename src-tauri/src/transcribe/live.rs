@@ -3,7 +3,7 @@
 //! that window with Whisper, and emits a [`crate::events::EVENT_LIVE_CAPTION`] event.
 //!
 //! Design guarantees (so this can never destabilise the core record/transcribe flow):
-//! - It only *reads* a clone of the recent samples (`Recorder::snapshot_tail`); it never
+//! - It only *reads* a cloneable [`crate::audio::recorder::SampleReader`]; it never
 //!   drains or mutates the capture buffer.
 //! - It self-terminates as soon as the recorder is gone (recording stopped/taken).
 //! - Every error (model load, resample, transcribe) is logged and skipped — the recording
@@ -101,30 +101,47 @@ impl WakeDedup {
     }
 }
 
-/// FLOOR on how many trailing seconds of the 16 kHz window the VAD gate scans for speech per
-/// tick (the historical fixed delta at the 3 s nominal tick). The ACTUAL span is
-/// [`vad_scan_span_secs`]: everything that arrived since the LAST VAD scan — the thermal
-/// governor stretches the tick to 6 s/9 s, and suspended/deferred/short-tail ticks skip the
-/// scan entirely, so a fixed 3 s would leave the rest of the new audio permanently unscanned
-/// (a short utterance there would scroll out of the window undecoded — a lost caption/wake).
+/// FLOOR on how many trailing seconds the VAD gate scans per tick. Absolute source-frame cursors,
+/// rather than wall time, account for thermal/deferred ticks and slow model work without gaps.
 const VAD_DELTA_SECS: usize = 3;
 
-/// Extra seconds added on top of the measured since-last-scan span, covering loop-body time
-/// (decode latency, resample) between the wall-clock measurement and the audio snapshot.
+/// Overlap on top of the exact unseen source-frame count. It tolerates an in-flight callback and
+/// gives VAD context at the boundary; continuity is still proven from absolute snapshot bounds.
 const VAD_SCAN_HEADROOM_SECS: usize = 2;
 
-/// Seconds of the freshest window audio the VAD gate scans THIS tick: the wall-clock span
-/// since the last scan (however the tick was stretched or how many ticks were skipped) plus
-/// [`VAD_SCAN_HEADROOM_SECS`], floored at [`VAD_DELTA_SECS`] and clamped to the rolling
-/// window itself. Guarantees the fail-open contract (speech ⇒ decode) holds under
-/// thermally-stretched ticks: no new audio is ever left un-scanned between scans.
-fn vad_scan_span_secs(secs_since_last_scan: f64) -> usize {
-    // `as usize` is a SATURATING float cast (NaN → 0, negative → 0, +∞ → usize::MAX), so every
-    // degenerate input lands safely between the floor and the window clamp below.
-    let elapsed = secs_since_last_scan.ceil() as usize;
-    elapsed
-        .saturating_add(VAD_SCAN_HEADROOM_SECS)
-        .clamp(VAD_DELTA_SECS, WINDOW_SECS)
+/// Native-rate frames to inspect this tick. The first scan covers the entire rolling window so
+/// speech captured while Whisper/VAD loaded is not skipped. Later scans cover every frame after
+/// the last committed absolute cursor plus bounded overlap.
+fn vad_scan_frame_count(
+    last_vad_end_frame: Option<usize>,
+    captured_end_frame: usize,
+    source_rate: u32,
+) -> usize {
+    let rate = source_rate as usize;
+    if rate == 0 {
+        return 0;
+    }
+    let full_window = WINDOW_SECS.saturating_mul(rate);
+    let Some(last_end) = last_vad_end_frame else {
+        return full_window;
+    };
+    let unseen = captured_end_frame.saturating_sub(last_end);
+    unseen
+        .saturating_add(VAD_SCAN_HEADROOM_SECS.saturating_mul(rate))
+        .clamp(VAD_DELTA_SECS.saturating_mul(rate), full_window)
+}
+
+/// A delta snapshot may advance the cursor only when it overlaps the prior committed end. A trim
+/// that moved its start beyond the cursor is a detected gap and must fail open to full ASR.
+fn vad_snapshot_covers_cursor(
+    last_vad_end_frame: Option<usize>,
+    snapshot_start_frame: usize,
+    snapshot_end_frame: usize,
+) -> bool {
+    match last_vad_end_frame {
+        None => true,
+        Some(cursor) => snapshot_start_frame <= cursor && cursor <= snapshot_end_frame,
+    }
 }
 
 /// How many extra ticks the gate keeps decoding after the LAST speech-positive tick. Bridges
@@ -148,7 +165,7 @@ const VAD_HANGOVER_TICKS: u8 = 2;
 ///   (those flows consume every tick's transcript directly).
 ///
 /// Pure + stateful (hangover), no I/O — headless-testable ([`live_vad_gate_decision_matrix`]).
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Copy, Default)]
 struct LiveVadGate {
     /// Remaining no-speech ticks that still decode after the last speech-positive tick.
     hangover: u8,
@@ -210,20 +227,49 @@ fn normalize_command(cmd: &str) -> String {
 
 /// Spawn the live-caption loop for the current recording. Returns immediately; the loop
 /// runs on its own OS thread and ends on its own when recording stops.
-pub fn spawn(app: AppHandle, model_path: PathBuf, lang: Option<String>) {
+pub(crate) fn spawn(
+    app: AppHandle,
+    meeting_id: String,
+    model_path: PathBuf,
+    lang: Option<String>,
+    model_token: crate::perf::RecordingSessionToken,
+    manual_clip_source: crate::audio::source::ManualClipSource,
+) {
     let _ = std::thread::Builder::new()
         .name("murmur-live-captions".into())
-        .spawn(move || run(app, model_path, lang));
+        .spawn(move || {
+            run(
+                app,
+                meeting_id,
+                model_path,
+                lang,
+                model_token,
+                manual_clip_source,
+            )
+        });
 }
 
-fn run(app: AppHandle, model_path: PathBuf, lang: Option<String>) {
+/// Wake/manual capture still consumes Whisper directly, so Parakeet cannot be selected without
+/// creating a second resident ASR runtime. Keep the resolution pure and explicit until those paths
+/// move behind the `LiveAsr` trait too.
+fn effective_live_asr_engine(_requested: &str) -> &'static str {
+    crate::transcribe::live_asr::ENGINE_WHISPER
+}
+
+fn run(
+    app: AppHandle,
+    meeting_id: String,
+    model_path: PathBuf,
+    lang: Option<String>,
+    model_token: crate::perf::RecordingSessionToken,
+    manual_clip_source: crate::audio::source::ManualClipSource,
+) {
     // T1.5 — QoS: the caption tick is background inference; tag this thread UTILITY so macOS
     // schedules it onto efficiency cores under contention. Best-effort C call, never fatal.
     crate::thermal::set_utility_qos();
-    // TP-F1 — advertise the live-loop as RUNNING while this thread lives (the only consumer of a
-    // manual voice-command capture). Set here at entry and cleared on EVERY exit (incl. the early
-    // model-load-failure returns below and a panic) via the RAII guard, so `begin_voice_command_inner`
-    // knows a consumer exists. Registered BEFORE `Transcriber::load` so a load failure still clears it.
+    // TP-F1 — advertise the live-loop as RUNNING only after its resident Whisper model loaded.
+    // Begin must refuse during model load: arming earlier could leave a capture with no consumer if
+    // load failed. The guard clears the flag on every later exit, including panic.
     struct LiveRunningGuard(AppHandle);
     impl Drop for LiveRunningGuard {
         fn drop(&mut self) {
@@ -233,10 +279,6 @@ fn run(app: AppHandle, model_path: PathBuf, lang: Option<String>) {
                 .store(false, std::sync::atomic::Ordering::SeqCst);
         }
     }
-    app.state::<AppState>()
-        .live_running
-        .store(true, std::sync::atomic::Ordering::SeqCst);
-    let _live_running_guard = LiveRunningGuard(app.clone());
     // Fresh transcript per recording: clear any leftover from a previous meeting so the in-meeting
     // assistant can never answer about a stale recording.
     if let Ok(mut lt) = app.state::<AppState>().live_transcript.lock() {
@@ -249,6 +291,19 @@ fn run(app: AppHandle, model_path: PathBuf, lang: Option<String>) {
         let state = app.state::<AppState>();
         crate::transcribe::bullets::clear_ram(&state.live_bullets, &state.live_bullets_tracker);
     }
+    // This lease represents the resident Whisper model, not merely one forward pass.
+    // Holding it until the thread exits prevents a Brain sidecar/e5 generation from becoming a
+    // second resident model between ticks, and makes Stop wait for the Transcriber to actually drop.
+    let _live_model_residency = match crate::perf::acquire_recording_model_generation(
+        &model_token,
+        crate::perf::ResidentModelKind::Whisper,
+    ) {
+        Ok(lease) => lease,
+        Err(e) => {
+            tracing::debug!(target: "live", error = %e, "live model load deferred by recording lifecycle");
+            return;
+        }
+    };
     let transcriber = match Transcriber::load(&model_path) {
         Ok(t) => t,
         Err(e) => {
@@ -256,23 +311,27 @@ fn run(app: AppHandle, model_path: PathBuf, lang: Option<String>) {
             return;
         }
     };
-    // OPTIONAL parakeet live-ASR seam: whisper is ALWAYS loaded above (it is the batch-quality Fast
-    // engine, the wake/manual-capture engine, AND the fall-back). The `asr` box drives ONLY the main
-    // caption decode; `build_live_asr` returns a parakeet CPU recognizer when the config selects it
-    // AND its models are present + RAM permits, else it re-shares the whisper transcriber (no
-    // double-load). `Arc` so the same whisper model backs both the seam's fall-back and the direct
-    // `&Transcriber` handle the wake/manual-capture paths keep (they need whisper's short-clip
-    // language forcing — `transcribe_since` at line ~1765, `step_manual_capture` below).
-    let engine = app
+    app.state::<AppState>()
+        .live_running
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let _live_running_guard = LiveRunningGuard(app.clone());
+    // Wake/manual capture still requires this Whisper handle. Loading Parakeet as the caption engine
+    // here would therefore make TWO resident ASR runtimes under one lifecycle lease. Until those
+    // optional paths are engine-agnostic, resolve every configured engine to Whisper for the whole
+    // recording — one model, one resident lease, no hidden co-residency.
+    let requested_engine = app
         .state::<AppState>()
         .config
         .lock()
         .map(|c| c.live_asr_engine.clone())
         .unwrap_or_else(|_| crate::transcribe::live_asr::ENGINE_WHISPER.to_string());
+    let engine = effective_live_asr_engine(&requested_engine);
+    if requested_engine != engine {
+        tracing::info!(target: "live", requested = %requested_engine, "live ASR uses Whisper to preserve single-model residency");
+    }
     let transcriber = std::sync::Arc::new(transcriber);
-    let asr = crate::transcribe::live_asr::build_live_asr(&engine, transcriber.clone());
-    // The caption telemetry label follows the ACTUAL live engine (whisper / parakeet), not the
-    // configured whisper size — a parakeet tick must report `parakeet`, not the batch model size.
+    let asr = crate::transcribe::live_asr::build_live_asr(engine, transcriber.clone());
+    // The caption telemetry label follows the ACTUAL live engine, not the configured whisper size.
     let asr_label = asr.engine_label();
 
     // T1.4 — the Silero VAD tick gate (config `live_vad_gate`, default ON): load the tiny
@@ -312,11 +371,11 @@ fn run(app: AppHandle, model_path: PathBuf, lang: Option<String>) {
         None
     };
     let mut vad_gate = LiveVadGate::default();
-    // Wall-clock cursor for the VAD scan span (see `vad_scan_span_secs`): advanced whenever a
-    // tick's fresh audio is either VAD-scanned or unconditionally decoded (bypass / no VAD).
-    // Ticks that skip both (thermal suspend, turn-defer, short tail, resample failure) leave
-    // it in place so the NEXT scan covers their accumulated audio too.
-    let mut last_vad_scan = std::time::Instant::now();
+    // Absolute native-rate end of the last successfully VAD-scanned or fully decoded snapshot.
+    // `None` deliberately forces the FIRST post-model-load scan over the whole available 14 s.
+    // Skipped/failed ticks never advance it, and every later delta must overlap it before a silent
+    // verdict may suppress ASR.
+    let mut last_vad_end_frame: Option<usize> = None;
 
     // T1.5 — thermal governor (tick-stretch + reactions pause + caption suspend under load) and
     // the one-tick user-turn decode defer. Recording + the post-Stop batch are NEVER touched.
@@ -355,8 +414,13 @@ fn run(app: AppHandle, model_path: PathBuf, lang: Option<String>) {
 
     loop {
         // T1.5 — the sleep is thermal-governed: 3 s nominal (the historical TICK), stretching to
-        // 6 s / 9 s as the Mac heats up. One guarded FFI read per tick; degrade-to-Nominal.
-        std::thread::sleep(governor.effective_tick());
+        // 6 s / 9 s as the Mac heats up. Wait on the recording-session Condvar instead of sleeping:
+        // Live timeout means run the tick, while Draining/abort wakes immediately so Stop never waits
+        // for the resident Whisper lease until the end of a thermal interval.
+        if !model_token.wait_for_live_tick(governor.effective_tick()) {
+            break;
+        }
+        // One guarded FFI read per completed tick; degrade-to-Nominal.
         governor.observe(crate::thermal::read_thermal_level());
         // Age out an expired wake-suppression window once per tick (before this tick's wake check).
         wake_dedup.tick();
@@ -415,6 +479,9 @@ fn run(app: AppHandle, model_path: PathBuf, lang: Option<String>) {
         // (checked BEFORE the busy-flag swap so a paused tick can't wedge the flag).
         if novelty_tick.fire
             && !governor.reactions_paused()
+            // Deliberate priority policy: the resident live Whisper owns the ONE model lane.
+            // Reactions/bullets degrade for this tick instead of spawning a doomed Brain worker.
+            && crate::perf::recording_model_lane_is_free(&model_token)
             && !reactions_busy.swap(true, std::sync::atomic::Ordering::AcqRel)
         {
             let app2 = app.clone();
@@ -463,56 +530,88 @@ fn run(app: AppHandle, model_path: PathBuf, lang: Option<String>) {
         while let Ok(item) = surface_rx.try_recv() {
             pending.push(item);
         }
-        if boundary.on_tick(!pending.is_empty(), novelty_tick.new_chars > 0, &last_caption) {
+        if boundary.on_tick(
+            !pending.is_empty(),
+            novelty_tick.new_chars > 0,
+            &last_caption,
+        ) {
             for item in pending.drain(..) {
                 emit_surface(&app, item);
             }
         }
 
-        // Snapshot the recent tail; stop as soon as the recording is gone.
-        let snapshot = {
+        // Manual capture has its own absolute source-frame cap and is finalized independently of
+        // the ordinary caption decode. This runs BEFORE every early `continue` below, so thermal
+        // suspension, a short live tail, VAD, resample failure or live-ASR failure can never wedge
+        // the FE in "listening". While still armed it performs no extra ASR; the exact post-click
+        // range is transcribed once, only after the user stops or the hard source-frame cap lands.
+        let manual_decision = step_manual_capture(
+            &app,
+            transcriber.as_ref(),
+            lang.as_deref(),
+            &manual_clip_source,
+        );
+        if let Some(decision) = manual_decision {
+            let awaiting_generation = match &decision {
+                ManualCaptureDecision::AwaitingDurable { generation } => Some(*generation),
+                _ => None,
+            };
+            let terminal = !matches!(
+                &decision,
+                ManualCaptureDecision::KeepListening
+                    | ManualCaptureDecision::AwaitingDurable { .. }
+            );
+            apply_manual_capture_decision(&app, &meeting_id, &model_token, decision);
+            if terminal {
+                continue;
+            }
+            if let Some(generation) = awaiting_generation {
+                // The exact range is owned by the stable spool handle. Do not consult the recorder
+                // slot (Stop may already have taken it), and do not impose a second arbitrary
+                // timeout: `spool_finished` is the producer's terminal proof. Retry at a small,
+                // bounded polling cadence until the prefix becomes durable or the spool exits.
+                tracing::trace!(target: "voice", generation, "manual command waiting for certified spool prefix");
+                std::thread::sleep(std::time::Duration::from_millis(25));
+                continue;
+            }
+        }
+
+        // Check recorder liveness without cloning audio. The optional caption throttles below must
+        // run BEFORE the 14 s native-rate snapshot: at 384 kHz that snapshot is a 21.5 MiB atomic
+        // copy (and may retry if a durable trim crosses it), which is pure waste on a tick we have
+        // already decided not to decode. This cheap probe preserves prompt self-termination while
+        // letting thermal/defer skips avoid the copy entirely.
+        let recorder_status = {
             let state = app.state::<AppState>();
             let guard = match state.recorder.lock() {
                 Ok(g) => g,
                 Err(_) => break,
             };
-            match guard.as_ref() {
-                Some(r) => {
-                    let rate = r.source_sample_rate();
-                    Some((r.snapshot_tail(WINDOW_SECS * rate as usize), rate))
-                }
-                None => None,
-            }
+            guard.as_ref().map(|recorder| {
+                (
+                    recorder.sample_reader(),
+                    recorder.total_samples(),
+                    recorder.source_sample_rate(),
+                )
+            })
         };
-        let Some((tail, rate)) = snapshot else {
+        let Some((sample_reader, captured_frames, source_rate)) = recorder_status else {
             break; // recorder taken → recording stopped
         };
-        if rate == 0 || tail.len() < rate as usize {
-            continue; // <1s captured so far — nothing worth transcribing yet
+        if source_rate == 0 || captured_frames < source_rate as usize {
+            continue; // preserve the historical <1 s warm-up without cloning the short tail
         }
 
-        // BYPASS (computed BEFORE the thermal suspend below): while a manual voice-capture is
-        // armed or a wake-suppression window is active, EVERY tick must decode — those flows
-        // consume the per-tick transcript directly (`step_manual_capture` accumulates it and
-        // owns the user's stop click + the backstop budget; a just-fired wake is mid-flow).
-        let bypass = {
-            let state = app.state::<AppState>();
-            let manual_armed = state
-                .voice_command_capture
-                .lock()
-                .map(|g| g.is_some())
-                .unwrap_or(false);
-            manual_armed || wake_dedup.is_suppressing()
-        };
+        // A just-fired wake is mid-flow and bypasses the optional caption throttles. Manual
+        // capture no longer belongs here: its bounded one-shot finalizer ran above and needs no
+        // repeated 14 s caption decode while the user is still speaking.
+        let bypass = wake_dedup.is_suppressing();
 
         // T1.5 — CRITICAL thermal: suspend the caption decode entirely (the recording and the
         // post-Stop batch pipeline are untouched; the loop keeps ticking so recorder-gone
-        // still ends it). Checked AFTER the snapshot so self-termination is never delayed,
-        // BEFORE the resample so the skip costs ~nothing — but NEVER while a bypass flow is
-        // live: an armed click-to-stop capture must keep accumulating and stay stoppable
-        // (`step_manual_capture` is behind the decode), or the FE wedges in "listening" until
-        // thermal recovers. One in-flight utterance's worth of decodes is an acceptable
-        // thermal cost; freezing a user-armed flow is not.
+        // still ends it). Checked after the cheap recorder-presence probe but BEFORE the expensive
+        // native-rate snapshot. Manual capture already progressed above; only the wake-suppression
+        // flow bypasses this optional caption throttle.
         if governor.captions_suspended() && !bypass {
             tracing::debug!(target: "live", "critical thermal state; caption decode suspended this tick");
             continue;
@@ -548,42 +647,123 @@ fn run(app: AppHandle, model_path: PathBuf, lang: Option<String>) {
             }
         }
 
-        let samples_16k = match crate::audio::resample_to_16k(&tail, rate) {
+        // TWO-PHASE VAD TICK GATE (T1.4): first copy + resample only the exact unseen native-rate
+        // span plus bounded overlap. The SampleReader was cloned under the recorder mutex above,
+        // but every O(window) atomic copy happens OUTSIDE it so Stop is never blocked by a 14 s
+        // snapshot. Absolute bounds prove continuity; contention or a trim gap fails open to full
+        // ASR and never masquerades as silence.
+        let mut completed_vad_scan_end = None;
+        let speech: Option<bool> = match vad.as_mut() {
+            Some(v) if !bypass => {
+                let frames = vad_scan_frame_count(
+                    last_vad_end_frame,
+                    sample_reader.total_samples(),
+                    source_rate,
+                );
+                match sample_reader.snapshot_tail(frames) {
+                    Err(e) => {
+                        // Exhausted trim-race retries are NOT silence. Preserve the cursor and fail
+                        // open to the full snapshot below.
+                        tracing::debug!(target: "live", error = %e, "live VAD tail snapshot contended; decoding");
+                        None
+                    }
+                    Ok(snapshot) if snapshot.samples.is_empty() => {
+                        // Defensive only (the liveness probe saw >=1 s). Empty input cannot prove
+                        // silence, so preserve the cursor and decode.
+                        None
+                    }
+                    Ok(snapshot)
+                        if !vad_snapshot_covers_cursor(
+                            last_vad_end_frame,
+                            snapshot.start_frame,
+                            snapshot.end_frame,
+                        ) =>
+                    {
+                        tracing::debug!(
+                            target: "live",
+                            cursor = ?last_vad_end_frame,
+                            snapshot_start = snapshot.start_frame,
+                            snapshot_end = snapshot.end_frame,
+                            "live VAD cursor gap detected; decoding"
+                        );
+                        None
+                    }
+                    Ok(snapshot) => {
+                        let vad_samples_16k = match crate::audio::resample_to_16k(
+                            &snapshot.samples,
+                            source_rate,
+                        ) {
+                            Ok(samples) => samples,
+                            Err(e) => {
+                                // Preserve the prior cursor on failure: the next tick re-scans
+                                // everything since the last successful VAD input.
+                                tracing::debug!(target: "live", error = %e, "live VAD-span resample failed");
+                                continue;
+                            }
+                        };
+                        match v.speech_regions(&vad_samples_16k) {
+                            Ok(regions) => {
+                                completed_vad_scan_end = Some(snapshot.end_frame);
+                                Some(!regions.is_empty())
+                            }
+                            Err(e) => {
+                                tracing::debug!(target: "live", error = %e, "live VAD tick failed; decoding");
+                                None
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {
+                // Bypass or no VAD loaded: decode unconditionally. The absolute cursor advances
+                // only after the full snapshot resamples successfully below.
+                None
+            }
+        };
+        // Stage the hangover transition. If the admitted full-window resample fails, the old path
+        // never reached VAD and therefore changed neither cursor nor hangover; committing only after
+        // a successful full input preserves that retry behavior. A VAD-rejected silent tick needs no
+        // full input, so its completed scan + hangover transition commit immediately.
+        let mut next_vad_gate = vad_gate;
+        if !next_vad_gate.should_decode(speech, bypass) {
+            vad_gate = next_vad_gate;
+            if let Some(scanned_end) = completed_vad_scan_end {
+                last_vad_end_frame = Some(scanned_end);
+            }
+            continue;
+        }
+
+        // Gate admitted a caption decode. Check the affine recording phase before materializing the
+        // full tail; Stop transitions it out of Live before waiting for this worker to quiesce.
+        if model_token.validated_for_live_work().is_err() {
+            break;
+        }
+        let snapshot = match sample_reader
+            .snapshot_tail(WINDOW_SECS.saturating_mul(source_rate as usize))
+        {
+            Ok(snapshot) => snapshot,
+            Err(e) => {
+                tracing::debug!(target: "live", error = %e, "live full-tail snapshot contended");
+                continue; // preserve VAD cursor/hangover and retry next tick
+            }
+        };
+        if source_rate == 0 || snapshot.samples.len() < source_rate as usize {
+            continue; // <1s captured so far — nothing worth transcribing yet
+        }
+        let samples_16k = match crate::audio::resample_to_16k(&snapshot.samples, source_rate) {
             Ok(s) => s,
             Err(e) => {
                 tracing::debug!(target: "live", error = %e, "live resample tick failed");
                 continue;
             }
         };
+        vad_gate = next_vad_gate;
+        last_vad_end_frame = Some(snapshot.end_frame);
 
-        // VAD TICK GATE (T1.4): CPU-only Silero over EVERYTHING that arrived since the last
-        // scan (`vad_scan_span_secs` — the governed tick stretches to 6-9 s and skipped ticks
-        // accumulate, so a fixed 3 s delta would leave audio permanently unscanned). Silence
-        // with the hangover spent ⇒ skip the whisper decode; a VAD error fails OPEN (decode).
-        // Everything downstream consumes decoded TEXT — silence produces none — so a skipped
-        // tick changes no consumer's behavior, only the GPU burn.
-        let speech: Option<bool> = match vad.as_mut() {
-            Some(v) if !bypass => {
-                let span = vad_scan_span_secs(last_vad_scan.elapsed().as_secs_f64());
-                last_vad_scan = std::time::Instant::now();
-                let delta_start = samples_16k.len().saturating_sub(span * 16_000);
-                match v.speech_regions(&samples_16k[delta_start..]) {
-                    Ok(regions) => Some(!regions.is_empty()),
-                    Err(e) => {
-                        tracing::debug!(target: "live", error = %e, "live VAD tick failed; decoding");
-                        None
-                    }
-                }
-            }
-            _ => {
-                // Bypass or no VAD loaded: this tick decodes unconditionally (fail-open), so
-                // its fresh audio is consumed by the decode — advance the scan cursor too.
-                last_vad_scan = std::time::Instant::now();
-                None
-            }
-        };
-        if !vad_gate.should_decode(speech, bypass) {
-            continue;
+        // Stop can arrive during the O(window) resample. Recheck immediately before native ASR so
+        // no stale Whisper decode delays the draining barrier.
+        if model_token.validated_for_live_work().is_err() {
+            break;
         }
 
         // LIVE captions use the Fast profile via the `LiveAsr` seam — whisper's greedy/best_of:1
@@ -621,51 +801,6 @@ fn run(app: AppHandle, model_path: PathBuf, lang: Option<String>) {
                 // the in-meeting assistant can answer questions about the recording IN PROGRESS.
                 // Deduped (overlapping tails) + size-bounded inside `accumulate_live_caption`.
                 accumulate_live_caption(app.state::<AppState>().inner(), &text);
-
-                // MANUAL voice-command capture (the button trigger) — CLICK-TO-STOP, checked EVERY
-                // tick, independent of the wake path and independent of `realtime_reactions`. When the
-                // user has clicked "ask the assistant" the growing post-click window IS the command:
-                // no wake word, no word-order requirement. We ACCUMULATE it tick by tick and keep
-                // listening until the user clicks "stop" (`end_voice_command` → dispatch the FULL
-                // utterance) — only a generous backstop cap forces an end so it can't listen forever.
-                // Best-effort + panic-free: a poisoned lock or empty tail simply leaves the capture
-                // armed; the dispatch runs off-thread exactly like the wake path.
-                if let Some(decision) =
-                    step_manual_capture(&app, transcriber.as_ref(), lang.as_deref(), &text)
-                {
-                    match decision {
-                        ManualCaptureDecision::Dispatch { command } => {
-                            // Capture ENDED (user stop click OR the backstop cap) with a real
-                            // utterance → stop "listening", show "thinking…", then resolve (keyword →
-                            // brain → fallback) + dispatch the FULL accumulated command OFF the tick.
-                            // PROCESSING is cleared by EVENT_VOICE_ACTION_RESULT when the answer lands.
-                            let _ = app.emit(
-                                crate::events::EVENT_VOICE_COMMAND_LISTENING,
-                                crate::events::VoiceCommandListeningPayload { active: false },
-                            );
-                            let _ = app.emit(
-                                crate::events::EVENT_VOICE_COMMAND_PROCESSING,
-                                crate::events::VoiceCommandProcessingPayload { active: true },
-                            );
-                            // No FE thread here (spoken turn) → the turn generates its own id.
-                            // No FE meeting_id (voice twin) → scope falls back to the live recording.
-                            spawn_assistant_turn(app.clone(), command, None, None);
-                        }
-                        ManualCaptureDecision::NothingHeard => {
-                            // Budget expired with nothing heard → graceful, NOT a confusing
-                            // "didn't catch an action". Clear the listening affordance + surface it.
-                            let _ = app.emit(
-                                crate::events::EVENT_VOICE_COMMAND_LISTENING,
-                                crate::events::VoiceCommandListeningPayload { active: false },
-                            );
-                            let _ = app.emit(
-                                crate::events::EVENT_VOICE_ACTION_RESULT,
-                                crate::voice_action::VoiceActionResult::nothing_heard(),
-                            );
-                        }
-                        ManualCaptureDecision::KeepListening => {}
-                    }
-                }
 
                 if !text.is_empty() {
                     // Brain v2 L4: remember the latest caption for the NEXT tick's boundary check
@@ -721,7 +856,13 @@ fn run(app: AppHandle, model_path: PathBuf, lang: Option<String>) {
                         if dispatch {
                             // No FE thread here (wake-word turn) → the turn generates its own id.
                             // No FE meeting_id (wake twin) → scope falls back to the live recording.
-                            spawn_assistant_turn(app.clone(), payload.command.clone(), None, None);
+                            spawn_assistant_turn_with_token(
+                                app.clone(),
+                                payload.command.clone(),
+                                None,
+                                None,
+                                Some(model_token.clone()),
+                            );
                         }
                         let _ = app.emit(crate::events::EVENT_WAKE_DETECTED, payload);
                     }
@@ -845,6 +986,42 @@ pub fn spawn_assistant_turn(
     thread_id: Option<String>,
     meeting_id: Option<String>,
 ) {
+    spawn_assistant_turn_with_token(app, command, thread_id, meeting_id, None);
+}
+
+fn spawn_assistant_turn_with_token(
+    app: AppHandle,
+    command: String,
+    thread_id: Option<String>,
+    meeting_id: Option<String>,
+    recording_token: Option<crate::perf::RecordingSessionToken>,
+) {
+    // Avoid allocating a known-doomed worker: live Whisper deliberately owns residency for the
+    // whole recording. An on-device Brain turn can run only if final ActiveRecording integration
+    // supplied the exact token AND the lane is actually free.
+    if crate::perf::recording_has_priority() {
+        let local_live = app
+            .state::<AppState>()
+            .config
+            .lock()
+            .map(|config| {
+                matches!(
+                    crate::summarize::roles::resolve(crate::summarize::roles::Role::Live, &config,)
+                        .connection
+                        .as_str(),
+                    crate::summarize::roles::CONN_LOCAL | crate::summarize::roles::CONN_AFM
+                )
+            })
+            .unwrap_or(true);
+        if local_live
+            && !recording_token
+                .as_ref()
+                .is_some_and(crate::perf::recording_model_lane_is_free)
+        {
+            tracing::debug!(target: "voice", "local live Brain worker not spawned while Whisper owns residency");
+            return;
+        }
+    }
     // Scope key = the FE-sent meeting id (matching how the turn scopes itself); the voice/wake twin
     // sends none → the shared "" key. Opaque id only — no PII.
     let key = meeting_id
@@ -876,7 +1053,7 @@ pub fn spawn_assistant_turn(
                 .state::<AppState>()
                 .user_turn_in_progress
                 .store(true, std::sync::atomic::Ordering::Relaxed);
-            run_assistant_turn(&app, command, thread_id, meeting_id)
+            run_assistant_turn(&app, command, thread_id, meeting_id, recording_token)
         });
 }
 
@@ -949,6 +1126,7 @@ fn run_assistant_turn(
     command: String,
     thread_id: Option<String>,
     meeting_id: Option<String>,
+    recording_token: Option<crate::perf::RecordingSessionToken>,
 ) {
     let thread_id = ensure_thread_id(thread_id);
     let result = run_assistant_query(
@@ -960,6 +1138,7 @@ fn run_assistant_turn(
         None,
         meeting_id.as_deref(),
         None, // the voice/wake/card twin has no FE source picker → whole-vault, unchanged.
+        recording_token,
     );
     let _ = app.emit(crate::events::EVENT_VOICE_ACTION_RESULT, result);
 }
@@ -994,7 +1173,7 @@ fn run_assistant_turn(
 /// The RESOLVED id is used for the executor scope, `gated_live_context`, AND the persisted
 /// thread binding — so a thread durably answers about its OWN meeting.
 #[allow(clippy::too_many_arguments)] // cohesive @brain entry: fe pointers + thread/anchor + pinned sources.
-pub fn run_assistant_query(
+pub(crate) fn run_assistant_query(
     app: &AppHandle,
     command: &str,
     loop_user: &str,
@@ -1003,6 +1182,7 @@ pub fn run_assistant_query(
     anchor_text: Option<&str>,
     fe_meeting_id: Option<&str>,
     explicit_sources: Option<&[crate::storage::models::SourceRef]>,
+    recording_token: Option<crate::perf::RecordingSessionToken>,
 ) -> crate::voice_action::VoiceActionResult {
     let state = app.state::<AppState>();
     let config = match state.config.lock() {
@@ -1013,6 +1193,84 @@ pub fn run_assistant_query(
                 .with_thread_id(thread_id)
         }
     };
+    // Resolve the scope before any content read. A recording turn borrows priority only through the
+    // exact `ActiveRecording` stored in AppState; a supplied wake token is merely corroborating
+    // evidence and a mismatched/stale token fails closed.
+    let focus_meeting = state.focus_meeting.lock().ok().and_then(|f| f.clone());
+    let current_meeting = state
+        .current_meeting
+        .lock()
+        .ok()
+        .and_then(|m| m.map(|id| id.to_string()));
+    let meeting_id = resolve_scope_meeting(
+        fe_meeting_id,
+        focus_meeting.as_deref(),
+        current_meeting.as_deref(),
+    );
+    // Bind every gated source read and the eventual cached answer/persistence to one lock
+    // generation. The turn may block in a provider/tool loop for minutes; a relock during that
+    // interval must discard the answer and must not recreate a purged interaction row.
+    let visibility = crate::commands::capture_content_visibility_snapshot(state.inner());
+    // After Stop removes ActiveRecording, the ordinary recorder-bound token lookup must fail
+    // closed. The one exception is the bounded manual-command handoff: its AppState slot proves
+    // this exact meeting + session still owns the plaintext command, and the coordinator proves
+    // the supplied token is now Postprocess. No other caller can borrow this exception merely by
+    // passing an id/token pair.
+    let postprocess_manual_token = recording_token.as_ref().and_then(|supplied| {
+        let validated = supplied.validated_for_postprocess().ok()?;
+        let owned = state
+            .pending_manual_command
+            .lock()
+            .map(|slot| {
+                slot.as_ref().is_some_and(|pending| {
+                    pending.meeting_id == meeting_id
+                        && pending.recording_token.same_session_as(&validated)
+                })
+            })
+            .unwrap_or(false);
+        owned.then_some(validated)
+    });
+    let recording_token = match state.live_model_token_for_meeting(&meeting_id) {
+        Ok(Some(active)) => match recording_token {
+            Some(supplied) if !supplied.same_session_as(&active) => {
+                return crate::voice_action::VoiceActionResult::nothing_heard()
+                    .with_command(command)
+                    .with_thread_id(thread_id)
+            }
+            _ => Some(active),
+        },
+        Ok(None) if recording_token.is_none() => None,
+        Ok(None) | Err(_) => match postprocess_manual_token {
+            Some(token) => Some(token),
+            None => {
+                return crate::voice_action::VoiceActionResult::nothing_heard()
+                    .with_command(command)
+                    .with_thread_id(thread_id)
+            }
+        },
+    };
+
+    // A local on-device live turn is the ONE explicitly user-initiated Brain exception during
+    // recording. It still carries the exact session identity; each concrete inference segment is
+    // admitted independently so DB reads, tools and persistence never hold residency. If live
+    // Whisper owns the lane, degrade before resolving the reasoner or reading content — never load
+    // a second Metal/GGUF model beside it.
+    let live_target =
+        crate::summarize::roles::resolve(crate::summarize::roles::Role::Live, &config);
+    let local_model_turn = matches!(
+        live_target.connection.as_str(),
+        crate::summarize::roles::CONN_LOCAL | crate::summarize::roles::CONN_AFM
+    );
+    if local_model_turn
+        && crate::perf::recording_has_priority()
+        && !recording_token
+            .as_ref()
+            .is_some_and(crate::perf::recording_model_lane_is_free)
+    {
+        return crate::voice_action::VoiceActionResult::nothing_heard()
+            .with_command(command)
+            .with_thread_id(thread_id);
+    }
     // C6: re-snapshot the LIVE unlocked set for THIS turn (never trust a snapshot taken before it).
     let unlocked = match state.unlocked_folders.lock() {
         Ok(u) => u.clone(),
@@ -1048,36 +1306,19 @@ pub fn run_assistant_query(
         None => loop_user.to_string(),
     };
     let loop_user: &str = &augmented_user;
-    // Phase 6 precedence (generalizes Phase 4): FE-sent `fe_meeting_id` (a bound thread) WINS over
-    // the FOCUS pointer (the meeting the user is viewing — the backend safety-net for any fallback
-    // path, e.g. the voice/wake twin), which WINS over the recording pointer (`current_meeting`,
-    // Some only while recording). Resolved ONCE here and used for the executor scope,
-    // `gated_live_context`, AND the persisted thread binding. A poisoned focus mutex fails safe (as
-    // if unset) — the resolver just falls through to the recording pointer.
-    let focus_meeting = state
-        .focus_meeting
-        .lock()
-        .ok()
-        .and_then(|f| f.clone());
-    let current_meeting = state
-        .current_meeting
-        .lock()
-        .ok()
-        .and_then(|m| m.map(|id| id.to_string()));
-    let meeting_id = resolve_scope_meeting(
-        fe_meeting_id,
-        focus_meeting.as_deref(),
-        current_meeting.as_deref(),
-    );
-
     // Resolve an intent for the FLOOR only (its read fan-out + surfaced kind) — it NO LONGER routes
     // writes. The agentic loop (with writes) is the single executive path; the agent DECIDES.
     // The reasoner is re-resolved for THIS turn (never a startup snapshot), so a consent /
     // provider / backend change since the last turn is already in effect. LIVE role — the whole
     // in-meeting assistant (wake/voice turns AND typed @brain threads funnel through this core).
-    let reasoner = state
-        .reasoner
-        .current_for(crate::summarize::roles::Role::Live);
+    let reasoner = match recording_token.clone() {
+        Some(token) => state
+            .reasoner
+            .current_for_recording(crate::summarize::roles::Role::Live, token),
+        None => state
+            .reasoner
+            .current_for(crate::summarize::roles::Role::Live),
+    };
     let intent = resolve_command_intent(&*reasoner, command);
     let result = run_informational(
         app,
@@ -1090,6 +1331,7 @@ pub fn run_assistant_query(
         &intent,
         tool_event,
         thread_id,
+        recording_token,
     )
     .with_command(command)
     .with_thread_id(thread_id);
@@ -1103,6 +1345,17 @@ pub fn run_assistant_query(
         thread_id,
         "assistant query dispatched"
     );
+    let _lifecycle = crate::commands::lifecycle_guard(state.inner());
+    if crate::commands::require_current_content_visibility_snapshot_under_lifecycle(
+        state.inner(),
+        visibility,
+    )
+    .is_err()
+    {
+        return crate::voice_action::VoiceActionResult::nothing_heard()
+            .with_command(command)
+            .with_thread_id(thread_id);
+    }
     persist_interaction(
         state.inner(),
         &meeting_id,
@@ -1137,6 +1390,7 @@ fn run_informational(
     intent: &crate::audio::wake::VoiceIntent,
     tool_event: &'static str,
     thread_id: &str,
+    recording_token: Option<crate::perf::RecordingSessionToken>,
 ) -> crate::voice_action::VoiceActionResult {
     // The agentic loop runs only on CLOUD-connection targets — local-GGUF multi-step tool-call
     // reliability is unproven (Q4 + the Bielik 32K-overflow lesson), so the local + stub targets
@@ -1146,12 +1400,16 @@ fn run_informational(
     // (the consent gate itself re-checks fresh config on every provider call inside).
     // The eligibility gate keys on the LIVE role's resolved target: with role keys absent,
     // `!is_reasoner_only()` is EXACTLY the legacy `brain_backend == Cloud` predicate.
-    let reasoner = state
-        .reasoner
-        .current_for(crate::summarize::roles::Role::Live);
-    let live_is_reasoner_only =
-        crate::summarize::roles::resolve(crate::summarize::roles::Role::Live, config)
-            .is_reasoner_only();
+    let live_target = crate::summarize::roles::resolve(crate::summarize::roles::Role::Live, config);
+    let reasoner = match recording_token.clone() {
+        Some(token) => state
+            .reasoner
+            .current_for_recording(crate::summarize::roles::Role::Live, token),
+        None => state
+            .reasoner
+            .current_for(crate::summarize::roles::Role::Live),
+    };
+    let live_is_reasoner_only = live_target.is_reasoner_only();
     // Brain v2 L3 — SHADOW ROUTER (observation only, NOT dispatch): log the route the explicit
     // `crate::router` decision table WOULD take next to what the legacy gate below actually
     // chooses, so router↔legacy parity can be validated on real usage BEFORE any cutover.
@@ -1194,8 +1452,18 @@ fn run_informational(
         // it and steps up. This is "deterministic escalation, model-driven retrieval": which tools are
         // reachable is code-enforced, retrieval within a tier stays model-driven.
         if let Some(result) = run_cascade(
-            app, state, config, unlocked, meeting_id, command, loop_user, intent, tool_event,
-            thread_id, &*reasoner,
+            app,
+            state,
+            config,
+            unlocked,
+            meeting_id,
+            command,
+            loop_user,
+            intent,
+            tool_event,
+            thread_id,
+            &*reasoner,
+            recording_token.clone(),
         ) {
             return result;
         }
@@ -1259,7 +1527,7 @@ fn run_informational(
     let live = compose_live_inject(&live, &bullets);
     let current_meeting_context = floor_current_context(&live, &typed_notes);
     let floor_intent = floor_intent_for(intent, command);
-    crate::voice_action::handle_voice_action(
+    crate::voice_action::handle_voice_action_with_recording_token(
         &floor_intent,
         &*reasoner,
         &state.db,
@@ -1270,6 +1538,7 @@ fn run_informational(
         &current_meeting_context,
         recording_in_progress,
         Some(app),
+        recording_token.as_ref(),
     )
 }
 
@@ -1419,6 +1688,7 @@ fn run_cascade(
     tool_event: &'static str,
     thread_id: &str,
     reasoner: &dyn crate::reason::LocalReasoner,
+    recording_token: Option<crate::perf::RecordingSessionToken>,
 ) -> Option<crate::voice_action::VoiceActionResult> {
     // Shared per-turn injected context (gated). Tier 1 leans on the live buffer + typed notes for the
     // CURRENT meeting (read through `gated_live_context`, fail-closed on the LIVE unlocked set); the
@@ -1473,8 +1743,7 @@ fn run_cascade(
     // (a local→local escalation sends nothing off-device and is NOT egress).
     let live_target = crate::summarize::roles::resolve(crate::summarize::roles::Role::Live, config);
 
-    for (tier_idx, (scope, suffix, max_steps, badge, may_escalate)) in
-        tiers.into_iter().enumerate()
+    for (tier_idx, (scope, suffix, max_steps, badge, may_escalate)) in tiers.into_iter().enumerate()
     {
         let executor = crate::tools::GatedToolExecutor {
             db: &state.db,
@@ -1484,6 +1753,7 @@ fn run_cascade(
             config,
             meeting_id,
             app: Some(app),
+            recording_token: recording_token.clone(),
             // PROPOSE-then-ACCEPT model (Rev 2): the in-meeting agent is READ-ONLY at every tier — it
             // GENERATES content (incl. note drafts) but NEVER auto-writes; the user commits via "Add to
             // notes". The dispatch still routes EVERY request through the loop (no hardcoded classifier).
@@ -1556,8 +1826,10 @@ fn run_cascade(
                 let extra = tier_extra_citations(&state.db, meeting_id, badge, unlocked);
                 let proposed = executor.proposed_note.lock().ok().and_then(|g| g.clone());
                 return Some(
-                    crate::voice_action::VoiceActionResult::from_agent(intent, outcome, badge, extra)
-                        .with_proposed_note(proposed),
+                    crate::voice_action::VoiceActionResult::from_agent(
+                        intent, outcome, badge, extra,
+                    )
+                    .with_proposed_note(proposed),
                 );
             }
             // Non-convergence at a tier is NOT escalation — try the next tier if there is one, else
@@ -1742,104 +2014,445 @@ enum ManualCaptureDecision {
     /// accumulated post-click utterance is a real (non-empty, meaningful) command → resolve +
     /// dispatch it (keyword fast-path, else brain interpret, else keyword fallback) and clear the
     /// capture. Carries the FULL accumulated utterance, not a per-tick fragment.
-    Dispatch { command: String },
+    Dispatch { generation: u64, command: String },
     /// Still listening (the user has not stopped and the backstop cap is not yet reached) → keep the
     /// capture armed, ACCUMULATING the growing post-click window, and wait for the next tick / the
     /// user's stop click. Does NOT dispatch on hearing speech (CLICK-TO-STOP).
     KeepListening,
+    /// The capture has an exact terminal range, but the durable spool has not certified every frame
+    /// yet. The generation stays armed and the live thread retries without consulting AppState's
+    /// recorder slot, which Stop may already have removed.
+    AwaitingDurable { generation: u64 },
     /// The capture ended (user stop OR backstop) with NOTHING meaningful heard (the user never spoke,
     /// or only silence/filler) → clear the capture and surface a graceful "nothing_heard". NEVER
     /// dispatches an empty command.
     NothingHeard,
+    /// The exact range could not become durable because the spool terminated before certifying it.
+    /// Surface an honest unavailable result; never misreport this as silence.
+    Unavailable,
 }
 
-/// Advance the MANUAL voice-command capture by one live tick. Snapshots ONLY the audio captured
-/// SINCE the click (`Recorder::snapshot_from(start_sample)`) — the POST-CLICK utterance — and
-/// transcribes it in isolation, so the command is exactly what the user said after clicking, not the
-/// rolling 14s tail. Falls back to the rolling-tail `caption` text only when no offset was latched
-/// (degenerate arm path). Returns `None` when no manual capture is armed (the common case).
-///
-/// When a capture IS armed it decrements the backstop budget in place and returns the
-/// [`ManualCaptureDecision`], CLEARING the capture state on dispatch / nothing-heard (so exactly one
-/// outcome fires per capture). CLICK-TO-STOP: it returns `Dispatch` only when the user has ended the
-/// capture (`ended`) or the backstop cap was reached — never merely on hearing speech.
-/// Best-effort + panic-free: a poisoned lock is treated as "no capture" (`None`).
-///
-/// The transcription of the GROWING post-click window + the dispatch/emit are the caller's job (off
-/// the tick); the backstop arithmetic + the no-empty guard are the pure [`decide_manual_capture`].
+fn apply_manual_capture_decision(
+    app: &AppHandle,
+    meeting_id: &str,
+    model_token: &crate::perf::RecordingSessionToken,
+    decision: ManualCaptureDecision,
+) {
+    match decision {
+        ManualCaptureDecision::Dispatch {
+            generation,
+            command,
+        } => {
+            let _ = app.emit(
+                crate::events::EVENT_VOICE_COMMAND_LISTENING,
+                crate::events::VoiceCommandListeningPayload { active: false },
+            );
+            let pending = crate::state::PendingManualCommand {
+                meeting_id: meeting_id.to_string(),
+                capture_generation: generation,
+                command,
+                recording_token: model_token.clone(),
+            };
+            let state = app.state::<AppState>();
+            // Atomically move ownership from the capture slot to the pending slot. Begin uses the
+            // same capture -> pending order (under recorder), so it can observe neither a gap nor
+            // overwrite the just-finalized generation between transcription and publication.
+            let published = match state.voice_command_capture.lock() {
+                Ok(mut capture) => match state.pending_manual_command.lock() {
+                    Ok(mut slot)
+                        if capture
+                            .as_ref()
+                            .is_some_and(|current| current.generation == generation)
+                            && slot.is_none() =>
+                    {
+                        *slot = Some(pending.clone());
+                        *capture = None;
+                        true
+                    }
+                    _ => false,
+                },
+                Err(_) => false,
+            };
+            if !published {
+                tracing::warn!(target: "voice", "manual command handoff slot was occupied; preserving the existing owned command");
+                if let Ok(mut capture) = state.voice_command_capture.lock() {
+                    if capture
+                        .as_ref()
+                        .is_some_and(|current| current.generation == generation)
+                    {
+                        *capture = None;
+                    }
+                }
+                let _ = app.emit(
+                    crate::events::EVENT_VOICE_ACTION_RESULT,
+                    crate::voice_action::VoiceActionResult::capture_unavailable(),
+                );
+                return;
+            }
+            // Local Live work intentionally waits for Stop because resident Whisper owns the model
+            // lane. Cloud-capable work may be accepted now. In either case the slot remains owned
+            // until the accepted worker completes, so Draining can never silently drop it.
+            if let Err(error) = try_spawn_pending_manual_turn(app, pending, model_token.clone()) {
+                tracing::debug!(target: "voice", error = %error, "manual command retained for postprocess dispatch");
+            }
+        }
+        ManualCaptureDecision::NothingHeard => {
+            let _ = app.emit(
+                crate::events::EVENT_VOICE_COMMAND_LISTENING,
+                crate::events::VoiceCommandListeningPayload { active: false },
+            );
+            let _ = app.emit(
+                crate::events::EVENT_VOICE_ACTION_RESULT,
+                crate::voice_action::VoiceActionResult::nothing_heard(),
+            );
+        }
+        ManualCaptureDecision::Unavailable => {
+            let _ = app.emit(
+                crate::events::EVENT_VOICE_COMMAND_LISTENING,
+                crate::events::VoiceCommandListeningPayload { active: false },
+            );
+            let _ = app.emit(
+                crate::events::EVENT_VOICE_ACTION_RESULT,
+                crate::voice_action::VoiceActionResult::capture_unavailable(),
+            );
+        }
+        ManualCaptureDecision::KeepListening | ManualCaptureDecision::AwaitingDurable { .. } => {}
+    }
+}
+
+/// Admit one finalized manual command as an owned assistant worker. The coordinator lease is
+/// acquired synchronously before the thread exists, atomically with Live/Draining/Postprocess
+/// transitions. Therefore either the worker is included in Stop's quiescence wait, or admission
+/// fails and the bounded pending slot remains for Stop to dispatch in Postprocess.
+fn try_spawn_pending_manual_turn(
+    app: &AppHandle,
+    pending: crate::state::PendingManualCommand,
+    token: crate::perf::RecordingSessionToken,
+) -> crate::error::Result<Option<tokio::sync::oneshot::Receiver<()>>> {
+    if !pending.recording_token.same_session_as(&token) {
+        return Err(crate::error::AppError::Unavailable(
+            "manual command belongs to a stale recording session".into(),
+        ));
+    }
+
+    let local_live = app
+        .state::<AppState>()
+        .config
+        .lock()
+        .map(|config| {
+            matches!(
+                crate::summarize::roles::resolve(crate::summarize::roles::Role::Live, &config,)
+                    .connection
+                    .as_str(),
+                crate::summarize::roles::CONN_LOCAL | crate::summarize::roles::CONN_AFM
+            )
+        })
+        .unwrap_or(true);
+    if local_live && !crate::perf::recording_model_lane_is_free(&token) {
+        return Ok(None);
+    }
+
+    // This lifecycle lease deliberately covers prompt preparation as well as the eventual local
+    // model / connector-specific lease. Draining must see ownership before it can race this worker.
+    let lifecycle_lease = crate::perf::acquire_recording_work_lease(&token)?;
+    let key = pending.meeting_id.clone();
+    if !try_begin_turn(&app.state::<AppState>().in_flight_turns, &key) {
+        return Ok(None);
+    }
+    let guard = TurnGuard {
+        app: app.clone(),
+        key,
+    };
+    let worker_app = app.clone();
+    let worker_pending = pending.clone();
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    let (start_tx, start_rx) = std::sync::mpsc::sync_channel(0);
+    let spawned = std::thread::Builder::new()
+        .name("murmur-manual-assistant-turn".into())
+        .spawn(move || {
+            let _lifecycle_lease = lifecycle_lease;
+            let _guard = guard;
+            if start_rx.recv().is_err() {
+                let _ = done_tx.send(());
+                return;
+            }
+            _guard
+                .app
+                .state::<AppState>()
+                .user_turn_in_progress
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            run_assistant_turn(
+                &worker_app,
+                worker_pending.command.clone(),
+                None,
+                Some(worker_pending.meeting_id.clone()),
+                Some(token),
+            );
+            if let Ok(mut slot) = worker_app.state::<AppState>().pending_manual_command.lock() {
+                if slot.as_ref().is_some_and(|current| {
+                    current.capture_generation == worker_pending.capture_generation
+                        && current.meeting_id == worker_pending.meeting_id
+                        && current
+                            .recording_token
+                            .same_session_as(&worker_pending.recording_token)
+                }) {
+                    *slot = None;
+                }
+            }
+            let _ = done_tx.send(());
+        });
+    if spawned.is_err() {
+        // The failed spawn drops the closure, which drops both guards and the completion sender.
+        // The command itself remains in AppState for Postprocess ownership.
+        return Ok(None);
+    }
+    let _ = app.emit(
+        crate::events::EVENT_VOICE_COMMAND_PROCESSING,
+        crate::events::VoiceCommandProcessingPayload { active: true },
+    );
+    let _ = start_tx.send(());
+    Ok(Some(done_rx))
+}
+
+/// Stop-side half of the manual-command ownership protocol. Call only after Live quiescence and
+/// `transition_to_postprocess`: it validates both opaque meeting identity and recording-session
+/// identity, starts the worker under the exact Postprocess token, and awaits that owned worker so
+/// the batch pipeline cannot steal the single model lane first.
+pub(crate) async fn dispatch_pending_manual_after_stop(
+    app: &AppHandle,
+    meeting_id: &str,
+    postprocess_token: crate::perf::RecordingSessionToken,
+) {
+    let pending = app
+        .state::<AppState>()
+        .pending_manual_command
+        .lock()
+        .ok()
+        .and_then(|slot| slot.clone());
+    let Some(pending) = pending else {
+        // Live is already proven quiescent at this call site. Any capture still present therefore
+        // lost its only consumer before it could publish a pending command (model-load failure,
+        // panic, or an early live-loop exit). Resolve it honestly before Stop disarms its RAII
+        // cleanup; otherwise the stale single-entry capture would block every future Begin.
+        if app
+            .state::<AppState>()
+            .voice_command_capture
+            .lock()
+            .map(|capture| capture.is_some())
+            .unwrap_or(true)
+        {
+            fail_pending_manual_for_meeting(app, meeting_id);
+        }
+        return;
+    };
+    let identity_matches = pending_matches_stop(&pending, meeting_id, &postprocess_token);
+    if !identity_matches {
+        tracing::warn!(target: "voice", "stale manual command handoff rejected at Stop");
+        clear_pending_manual_command(app, &pending);
+        let _ = app.emit(
+            crate::events::EVENT_VOICE_ACTION_RESULT,
+            crate::voice_action::VoiceActionResult::capture_unavailable(),
+        );
+        return;
+    }
+    match try_spawn_pending_manual_turn(app, pending.clone(), postprocess_token) {
+        Ok(Some(done)) => {
+            if done.await.is_err() || pending_is_owned(app, &pending) {
+                clear_pending_manual_command(app, &pending);
+                let _ = app.emit(
+                    crate::events::EVENT_VOICE_ACTION_RESULT,
+                    crate::voice_action::VoiceActionResult::capture_unavailable(),
+                );
+            }
+        }
+        Ok(None) | Err(_) => {
+            clear_pending_manual_command(app, &pending);
+            let _ = app.emit(
+                crate::events::EVENT_VOICE_ACTION_RESULT,
+                crate::voice_action::VoiceActionResult::capture_unavailable(),
+            );
+        }
+    }
+}
+
+/// Resolve an owned command honestly when Stop itself cannot reach Postprocess. This is called by
+/// a Stop RAII guard on every error/panic path, preventing an old session token from occupying the
+/// bounded slot forever and blocking the next recording's Begin.
+pub(crate) fn fail_pending_manual_for_meeting(app: &AppHandle, meeting_id: &str) {
+    // Clear an ended-but-not-yet-published capture first. The live step compare-before-publishes,
+    // so a concurrent transcription that finishes after this failure observes the missing
+    // generation and cannot resurrect a stale command into the slot.
+    let cleared_capture = app
+        .state::<AppState>()
+        .voice_command_capture
+        .lock()
+        .map(|mut capture| capture.take().is_some())
+        .unwrap_or(false);
+    let pending = app
+        .state::<AppState>()
+        .pending_manual_command
+        .lock()
+        .ok()
+        .and_then(|slot| slot.clone());
+    let pending = pending.filter(|pending| pending.meeting_id == meeting_id);
+    if let Some(pending) = pending.as_ref() {
+        clear_pending_manual_command(app, pending);
+    }
+    if cleared_capture || pending.is_some() {
+        let _ = app.emit(
+            crate::events::EVENT_VOICE_COMMAND_LISTENING,
+            crate::events::VoiceCommandListeningPayload { active: false },
+        );
+        let _ = app.emit(
+            crate::events::EVENT_VOICE_ACTION_RESULT,
+            crate::voice_action::VoiceActionResult::capture_unavailable(),
+        );
+    }
+}
+
+fn pending_matches_stop(
+    pending: &crate::state::PendingManualCommand,
+    meeting_id: &str,
+    postprocess_token: &crate::perf::RecordingSessionToken,
+) -> bool {
+    pending.meeting_id == meeting_id && pending.recording_token.same_session_as(postprocess_token)
+}
+
+fn clear_pending_manual_command(app: &AppHandle, pending: &crate::state::PendingManualCommand) {
+    if let Ok(mut slot) = app.state::<AppState>().pending_manual_command.lock() {
+        if slot.as_ref().is_some_and(|current| {
+            current.capture_generation == pending.capture_generation
+                && current.meeting_id == pending.meeting_id
+                && current
+                    .recording_token
+                    .same_session_as(&pending.recording_token)
+        }) {
+            *slot = None;
+        }
+    }
+}
+
+fn pending_is_owned(app: &AppHandle, pending: &crate::state::PendingManualCommand) -> bool {
+    app.state::<AppState>()
+        .pending_manual_command
+        .lock()
+        .map(|slot| {
+            slot.as_ref().is_some_and(|current| {
+                current.capture_generation == pending.capture_generation
+                    && current.meeting_id == pending.meeting_id
+                    && current
+                        .recording_token
+                        .same_session_as(&pending.recording_token)
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// Advance the MANUAL voice-command capture independently of ordinary captions. While it remains
+/// inside its absolute source-frame budget this is a cheap state check and returns
+/// `KeepListening`; it does not repeatedly transcribe a growing native-rate Vec. On user Stop or
+/// the hard cap, it copies the exact clamped post-click range, resamples it once, transcribes once,
+/// and compare-before-clears only the same capture generation.
 fn step_manual_capture(
     app: &AppHandle,
     transcriber: &Transcriber,
     lang: Option<&str>,
-    caption: &str,
+    clip_source: &crate::audio::source::ManualClipSource,
 ) -> Option<ManualCaptureDecision> {
     let state = app.state::<AppState>();
-    // Read the armed capture (and release the lock before any transcription work).
     let current = { (*state.voice_command_capture.lock().ok()?)? };
 
-    // FORCE the command-clip language. A ~3s clip is far too short for Whisper to reliably
-    // auto-detect — it routinely mis-detects a short Polish command as Russian/Slovak, which then
-    // mangles the transcript. Resolve the forced language from `config.language` (the user's
-    // setting), which is the SAME language the meeting transcription uses this session. When it is
-    // unset/auto we keep `None` (whisper auto-detects) — the user can fix that in Settings ▸ Language.
+    let captured_end = {
+        let recorder = state.recorder.lock().ok()?;
+        recorder.as_ref().map(|recorder| recorder.total_samples())
+    };
+    let source_cap_reached = match (captured_end, current.max_end_sample) {
+        (Some(end), Some(max_end)) => end >= max_end,
+        (None, _) => true,
+        _ => false,
+    };
+    if !current.ended && !source_cap_reached {
+        return Some(ManualCaptureDecision::KeepListening);
+    }
+
     let clip_lang = resolve_clip_lang(lang, &state);
     let clip_lang_ref = clip_lang.as_deref();
-
-    // Transcribe ONLY the post-click window when an offset was latched; otherwise fall back to the
-    // rolling-tail caption the live loop already produced (degenerate arm path with no recorder).
-    let command = match current.start_sample {
-        Some(offset) => {
-            transcribe_since(app, transcriber, clip_lang_ref, offset).unwrap_or_default()
+    let command = match (
+        current.start_sample,
+        captured_end.or(current.max_end_sample),
+    ) {
+        (Some(start), Some(captured_end)) => {
+            let end = current
+                .max_end_sample
+                .unwrap_or(captured_end)
+                .min(captured_end);
+            match clip_source.read_16k(start, end) {
+                Ok(crate::audio::source::ManualClipRead::Pending) => {
+                    return Some(ManualCaptureDecision::AwaitingDurable {
+                        generation: current.generation,
+                    })
+                }
+                Ok(crate::audio::source::ManualClipRead::Ready(samples)) => {
+                    transcribe_manual_samples(transcriber, clip_lang_ref, &samples)
+                }
+                Err(error) => {
+                    tracing::warn!(target: "voice", error = %error, "durable manual clip could not be read");
+                    let mut guard = state.voice_command_capture.lock().ok()?;
+                    if guard.as_ref().map(|capture| capture.generation) != Some(current.generation)
+                    {
+                        return None;
+                    }
+                    *guard = None;
+                    return Some(ManualCaptureDecision::Unavailable);
+                }
+            }
         }
-        None => caption.trim().to_string(),
+        _ => String::new(),
     };
 
-    let (decision, next) = decide_manual_capture(current, &command);
-    // Re-acquire to store the next state (clear on terminal outcomes, decrement on keep-listening).
-    *state.voice_command_capture.lock().ok()? = next;
+    let terminal = crate::state::CaptureState {
+        ended: true,
+        ..current
+    };
+    let (decision, next) = decide_manual_capture(terminal, &command);
+    let mut guard = state.voice_command_capture.lock().ok()?;
+    if guard.as_ref().map(|capture| capture.generation) != Some(current.generation) {
+        // A fresh arm replaced this one while the bounded final transcription was running. Keep
+        // the new generation and suppress every stale event/dispatch from the old result.
+        return None;
+    }
+    if matches!(&decision, ManualCaptureDecision::Dispatch { .. }) {
+        // Publication into `pending_manual_command` is the ownership transfer. Keep the terminal
+        // capture visible until apply performs capture -> pending atomically, so Begin cannot arm a
+        // new generation in the gap between transcription and handoff.
+        *guard = Some(current);
+    } else {
+        *guard = next;
+    }
     Some(decision)
 }
 
-/// Transcribe the growing window of audio captured SINCE `offset` (the click) into a single trimmed
-/// command string. Reads `Recorder::snapshot_from` (read-only, never drains), resamples to 16k, and
-/// runs the Fast profile — exactly like the caption tick, but on the ISOLATED post-click window.
-/// Returns `None` when the recorder is gone or there is < ~0.4s of audio yet (too little to bother).
-fn transcribe_since(
-    app: &AppHandle,
+/// Transcribe the already-clamped, streamed-to-16k durable clip once.
+fn transcribe_manual_samples(
     transcriber: &Transcriber,
     lang: Option<&str>,
-    offset: usize,
-) -> Option<String> {
-    let (window, rate) = {
-        let state = app.state::<AppState>();
-        let guard = state.recorder.lock().ok()?;
-        let r = guard.as_ref()?;
-        (r.snapshot_from(offset), r.source_sample_rate())
-    };
-    // Need a little audio before transcribing — < ~0.4s is just the click latency / silence.
-    if rate == 0 || window.len() < (rate as usize) * 2 / 5 {
-        return Some(String::new());
+    samples_16k: &[f32],
+) -> String {
+    if samples_16k.len() < 16_000 * 2 / 5 {
+        return String::new();
     }
-    let samples_16k = match crate::audio::resample_to_16k(&window, rate) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::debug!(target: "live", error = %e, "manual-capture resample failed");
-            return Some(String::new());
-        }
-    };
-    match transcriber.transcribe(&samples_16k, lang) {
-        Ok(t) => Some(
-            t.segments
-                .iter()
-                .map(|s| s.text.trim())
-                .collect::<Vec<_>>()
-                .join(" ")
-                .trim()
-                .to_string(),
-        ),
+    match transcriber.transcribe(samples_16k, lang) {
+        Ok(t) => t
+            .segments
+            .iter()
+            .map(|s| s.text.trim())
+            .collect::<Vec<_>>()
+            .join(" ")
+            .trim()
+            .to_string(),
         Err(e) => {
             tracing::debug!(target: "live", error = %e, "manual-capture transcribe failed");
-            Some(String::new())
+            String::new()
         }
     }
 }
@@ -1964,6 +2577,7 @@ fn decide_manual_capture(
         if !command.is_empty() && is_meaningful_command(command) {
             (
                 ManualCaptureDecision::Dispatch {
+                    generation: capture.generation,
                     command: command.to_string(),
                 },
                 None,
@@ -2349,6 +2963,72 @@ fn assistant_system_prompt(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Performance-order regression: cheap skips precede even the bounded VAD copy, and the VAD
+    /// verdict precedes the full native-rate rolling-window clone. At the supported 384 kHz ceiling
+    /// the full clone is 21.5 MiB per attempt, so moving it above the verdict restores the bug.
+    #[test]
+    fn thermal_and_turn_defer_precede_live_tail_snapshot() {
+        let source = include_str!("live.rs");
+        let run_start = source.find("\nfn run(").expect("live run function");
+        let run_end = source[run_start..]
+            .find("\n/// One queued live surface")
+            .map(|offset| run_start + offset)
+            .expect("end of live run function");
+        let run = &source[run_start..run_end];
+        let reader_clone = run
+            .find("recorder.sample_reader()")
+            .expect("reader cloned under short recorder lock");
+        let vad_snapshot = run
+            .find("match sample_reader.snapshot_tail(frames)")
+            .expect("bounded native-rate VAD snapshot");
+        let vad_gate = run
+            .find("if !next_vad_gate.should_decode(speech, bypass)")
+            .expect("VAD decode decision");
+        let full_snapshot = run
+            .find("let snapshot = match sample_reader")
+            .expect("full native-rate live snapshot");
+        let thermal = run
+            .find("if governor.captions_suspended() && !bypass")
+            .expect("thermal caption gate");
+        let turn_defer = run
+            .find("if turn_defer.should_skip(user_turn, live_local)")
+            .expect("user-turn defer gate");
+
+        assert!(
+            thermal < vad_snapshot,
+            "thermal skip must avoid every tail clone"
+        );
+        assert!(
+            turn_defer < vad_snapshot,
+            "user-turn defer must avoid every tail clone"
+        );
+        assert!(
+            reader_clone < vad_snapshot && vad_snapshot < vad_gate && vad_gate < full_snapshot,
+            "full 14 s snapshot must remain behind the bounded VAD verdict"
+        );
+        let final_phase_check = run[full_snapshot..]
+            .find("if model_token.validated_for_live_work().is_err()")
+            .map(|offset| full_snapshot + offset)
+            .expect("post-snapshot live-phase check");
+        let asr = run
+            .find("asr.transcribe_live(&samples_16k")
+            .expect("native live ASR call");
+        assert!(
+            full_snapshot < final_phase_check && final_phase_check < asr,
+            "Stop must invalidate the session before stale native ASR can start"
+        );
+    }
+
+    #[test]
+    fn every_live_asr_setting_resolves_to_exactly_one_whisper_runtime() {
+        for requested in ["whisper", "parakeet", "unknown", ""] {
+            assert_eq!(
+                effective_live_asr_engine(requested),
+                crate::transcribe::live_asr::ENGINE_WHISPER
+            );
+        }
+    }
     use crate::audio::wake::VoiceIntent;
 
     // ── T1.4: the Silero VAD tick gate (pure decision matrix, stub-VAD) ──────────────────────────
@@ -2362,8 +3042,14 @@ mod tests {
         let mut g = LiveVadGate::default();
         assert!(g.should_decode(Some(true), false), "speech decodes");
         // Two silent ticks ride the hangover, the THIRD is skipped.
-        assert!(g.should_decode(Some(false), false), "hangover tick 1 decodes");
-        assert!(g.should_decode(Some(false), false), "hangover tick 2 decodes");
+        assert!(
+            g.should_decode(Some(false), false),
+            "hangover tick 1 decodes"
+        );
+        assert!(
+            g.should_decode(Some(false), false),
+            "hangover tick 2 decodes"
+        );
         assert!(
             !g.should_decode(Some(false), false),
             "silence with hangover spent SKIPS the decode"
@@ -2373,7 +3059,10 @@ mod tests {
             "continued silence keeps skipping"
         );
         // Speech returns ⇒ decode + hangover re-armed.
-        assert!(g.should_decode(Some(true), false), "speech resumes decoding");
+        assert!(
+            g.should_decode(Some(true), false),
+            "speech resumes decoding"
+        );
         assert!(g.should_decode(Some(false), false), "hangover re-armed");
 
         // A FRESH gate (hangover 0) skips pure silence immediately…
@@ -2383,7 +3072,10 @@ mod tests {
             "a silent recording start is not decoded"
         );
         // …but BYPASS always decodes, without touching the hangover state…
-        assert!(fresh.should_decode(Some(false), true), "bypass always decodes");
+        assert!(
+            fresh.should_decode(Some(false), true),
+            "bypass always decodes"
+        );
         assert!(
             !fresh.should_decode(Some(false), false),
             "bypass did not arm a hangover"
@@ -2395,28 +3087,49 @@ mod tests {
         );
     }
 
-    /// T1.4/T1.5 fix-round — the VAD scan span tracks the wall clock since the last scan, so a
-    /// thermally-stretched tick (6 s Fair / 9 s Serious) or a run of skipped ticks (thermal
-    /// suspend, turn-defer, short tail) can never leave fresh audio permanently unscanned: a
-    /// wake phrase or short caption in that region is still caught by the next scan.
+    /// The first scan covers the entire post-load window. Later scans use exact unseen source
+    /// frames plus overlap, independent of decode latency or thermal tick stretching.
     #[test]
-    fn vad_scan_span_scales_to_stretched_and_skipped_ticks() {
-        // Nominal 3 s tick: span = 3 s elapsed + 2 s headroom = 5 s (≥ the old fixed 3 s).
-        assert_eq!(vad_scan_span_secs(3.0), 5);
-        // Governed ticks: Fair 6 s → 8 s, Serious 9 s → 11 s — the whole stretched delta is
-        // scanned (the MAJOR finding: a fixed 3 s missed 3-6 s of each stretched tick).
-        assert_eq!(vad_scan_span_secs(6.0), 8);
-        assert_eq!(vad_scan_span_secs(9.0), 11);
-        // Sub-second loop-body drift still ceils up and keeps the headroom.
-        assert_eq!(vad_scan_span_secs(3.4), 6);
-        // Accumulated skipped ticks (thermal suspend / defer) clamp to the rolling window —
-        // the scan can never index past the audio that actually exists.
-        assert_eq!(vad_scan_span_secs(60.0), WINDOW_SECS);
-        // Degenerate inputs floor at the historical minimum, never underflow.
-        assert_eq!(vad_scan_span_secs(0.0), VAD_DELTA_SECS);
-        assert_eq!(vad_scan_span_secs(-1.0), VAD_DELTA_SECS);
-        assert_eq!(vad_scan_span_secs(f64::NAN), VAD_DELTA_SECS);
-        assert_eq!(vad_scan_span_secs(f64::INFINITY), WINDOW_SECS);
+    fn vad_scan_frames_cover_first_backlog_and_every_unseen_frame() {
+        let rate = 48_000;
+        let full = WINDOW_SECS * rate as usize;
+        assert_eq!(
+            vad_scan_frame_count(None, 30 * rate as usize, rate),
+            full,
+            "first post-model-load scan must inspect the whole resident window"
+        );
+        assert_eq!(
+            vad_scan_frame_count(Some(10 * rate as usize), 13 * rate as usize, rate),
+            5 * rate as usize,
+            "3 s unseen plus 2 s overlap"
+        );
+        assert_eq!(
+            vad_scan_frame_count(Some(10 * rate as usize), 19 * rate as usize, rate),
+            11 * rate as usize,
+            "a thermally stretched 9 s delta remains fully covered"
+        );
+        assert_eq!(
+            vad_scan_frame_count(Some(0), 60 * rate as usize, rate),
+            full,
+            "a long skip is bounded by the resident rolling window"
+        );
+        assert_eq!(vad_scan_frame_count(Some(10), 10, 0), 0);
+    }
+
+    #[test]
+    fn vad_cursor_requires_absolute_overlap_before_silence_can_skip_asr() {
+        assert!(vad_snapshot_covers_cursor(None, 500, 900));
+        assert!(vad_snapshot_covers_cursor(Some(700), 500, 900));
+        assert!(vad_snapshot_covers_cursor(Some(500), 500, 900));
+        assert!(vad_snapshot_covers_cursor(Some(900), 500, 900));
+        assert!(
+            !vad_snapshot_covers_cursor(Some(499), 500, 900),
+            "a trimmed-away gap must fail open"
+        );
+        assert!(
+            !vad_snapshot_covers_cursor(Some(901), 500, 900),
+            "a regressed source must not advance the cursor"
+        );
     }
 
     /// The wake-suppression window doubles as a VAD-gate bypass signal: active right after a
@@ -2443,7 +3156,10 @@ mod tests {
             model_size_label(Path::new("/m/ggml-large-v3-turbo-q8_0.bin")),
             "large-v3-turbo-q8_0"
         );
-        assert_eq!(model_size_label(Path::new("/m/ggml-small.en.bin")), "small.en");
+        assert_eq!(
+            model_size_label(Path::new("/m/ggml-small.en.bin")),
+            "small.en"
+        );
         // A user-supplied arbitrary file name is NEVER echoed into logs.
         assert_eq!(
             model_size_label(Path::new("/Users/kim/my-meeting-model.bin")),
@@ -2688,8 +3404,10 @@ mod tests {
 
     fn armed(budget: u32) -> CaptureState {
         CaptureState {
+            generation: 1,
             budget,
             start_sample: Some(0),
+            max_end_sample: Some(60),
             ended: false,
         }
     }
@@ -2697,8 +3415,10 @@ mod tests {
     /// An armed capture the user has CLICKED STOP on (`end_voice_command` flipped `ended`).
     fn ended(budget: u32) -> CaptureState {
         CaptureState {
+            generation: 1,
             budget,
             start_sample: Some(0),
+            max_end_sample: Some(60),
             ended: true,
         }
     }
@@ -2717,8 +3437,10 @@ mod tests {
         assert_eq!(
             next,
             Some(CaptureState {
+                generation: 1,
                 budget: 19,
                 start_sample: Some(0),
+                max_end_sample: Some(60),
                 ended: false
             }),
             "a listening tick decrements the backstop and keeps the latched offset + ended flag"
@@ -2735,11 +3457,51 @@ mod tests {
         assert_eq!(
             decision,
             ManualCaptureDecision::Dispatch {
+                generation: 1,
                 command: "Więc tak, zrób web research o konkurencji".into()
             },
             "the user's stop click must dispatch the FULL accumulated (trimmed) utterance"
         );
         assert!(next.is_none(), "capture must be cleared after a dispatch");
+    }
+
+    #[test]
+    fn manual_stop_pending_handoff_survives_draining_and_matches_postprocess_session() {
+        // Headless lifecycle regression for the cross-Stop half of the flow. The file-backed
+        // Pending -> durable transition itself is exercised by
+        // `audio::source::manual_clip_handle_survives_owner_drop_and_transitions_pending_to_ready`;
+        // here we prove the resulting real command is owned across recorder removal/Draining and
+        // is accepted only by the same meeting + exact Postprocess session (never NothingHeard).
+        let _serial = crate::perf::model_lifecycle_test_guard();
+        crate::perf::reset_model_lifecycle_for_test();
+        let mut owner = crate::perf::begin_recording_session().unwrap();
+        owner.transition_to_live().unwrap();
+        let live_token = owner.token().validated_for_live_work().unwrap();
+        let (decision, next) =
+            decide_manual_capture(ended(15), "zrób research o wydajności nagrywania");
+        let ManualCaptureDecision::Dispatch {
+            generation,
+            command,
+        } = decision
+        else {
+            panic!("durable exact command became NothingHeard instead of a pending dispatch");
+        };
+        assert!(next.is_none());
+        let pending = crate::state::PendingManualCommand {
+            meeting_id: "meeting-a".into(),
+            capture_generation: generation,
+            command: command.clone(),
+            recording_token: live_token,
+        };
+
+        owner.transition_to_draining().unwrap();
+        owner.transition_to_postprocess().unwrap();
+        let post_token = owner.token().validated_for_postprocess().unwrap();
+        assert!(pending_matches_stop(&pending, "meeting-a", &post_token));
+        assert!(!pending_matches_stop(&pending, "meeting-b", &post_token));
+        assert_eq!(pending.command, command);
+        owner.finish().unwrap();
+        crate::perf::reset_model_lifecycle_for_test();
     }
 
     #[test]
@@ -2751,6 +3513,7 @@ mod tests {
         assert_eq!(
             decision,
             ManualCaptureDecision::Dispatch {
+                generation: 1,
                 command: "zrób research o konkurencji".into()
             },
             "reaching the backstop cap with a real utterance must dispatch it (backstop)"
@@ -2792,8 +3555,10 @@ mod tests {
         assert_eq!(
             next,
             Some(CaptureState {
+                generation: 1,
                 budget: 2,
                 start_sample: Some(0),
+                max_end_sample: Some(60),
                 ended: false
             }),
             "a silent tick must decrement the backstop and keep the SAME latched offset + flag"
@@ -3000,6 +3765,7 @@ mod tests {
         assert_eq!(
             d,
             ManualCaptureDecision::Dispatch {
+                generation: 1,
                 command: "zrób research o pogodzie".into()
             },
             "an ended real command must dispatch"
@@ -3194,7 +3960,9 @@ mod tests {
         // Both present: labeled bullets + verbatim tail, each bounded at its 2k budget.
         let long_live = "w ".repeat(3_000); // 6k chars
         let composed = compose_live_inject(&long_live, "- [deal]: pricing agreed");
-        assert!(composed.starts_with("RUNNING NOTES (auto-generated from this meeting so far):\n- [deal]: pricing agreed"));
+        assert!(composed.starts_with(
+            "RUNNING NOTES (auto-generated from this meeting so far):\n- [deal]: pricing agreed"
+        ));
         let verbatim = composed
             .split("MOST RECENT TRANSCRIPT (verbatim):\n")
             .nth(1)
@@ -3469,7 +4237,10 @@ mod tests {
         // Blank/whitespace at ANY level is ABSENT. A blank FE id falls to focus/recording; a blank
         // FE id + blank focus + blank recording yields "" (no scope — the fail-closed default,
         // which gated_live_context treats as not-visible).
-        assert_eq!(resolve_scope_meeting(Some("  "), None, Some("m-rec")), "m-rec");
+        assert_eq!(
+            resolve_scope_meeting(Some("  "), None, Some("m-rec")),
+            "m-rec"
+        );
         assert_eq!(resolve_scope_meeting(Some(""), None, None), "");
         assert_eq!(resolve_scope_meeting(None, None, Some("   ")), "");
         assert_eq!(resolve_scope_meeting(Some(" m-x "), None, None), "m-x");
@@ -3514,11 +4285,17 @@ mod tests {
     #[test]
     fn resolve_scope_meeting_blank_focus_falls_through() {
         // A blank/whitespace focus is ABSENT and falls through to the recording pointer.
-        assert_eq!(resolve_scope_meeting(None, Some("   "), Some("m-rec")), "m-rec");
+        assert_eq!(
+            resolve_scope_meeting(None, Some("   "), Some("m-rec")),
+            "m-rec"
+        );
         // A blank focus + no recording yields "".
         assert_eq!(resolve_scope_meeting(None, Some("  "), None), "");
         // A blank FE id + a real focus uses the focus.
-        assert_eq!(resolve_scope_meeting(Some(" "), Some("m-focus"), Some("m-rec")), "m-focus");
+        assert_eq!(
+            resolve_scope_meeting(Some(" "), Some("m-focus"), Some("m-rec")),
+            "m-focus"
+        );
     }
 
     #[test]
@@ -3539,7 +4316,8 @@ mod tests {
             folder_id: None,
         })
         .unwrap();
-        db.set_manual_notes("m-past", "cut the Q3 travel line").unwrap();
+        db.set_manual_notes("m-past", "cut the Q3 travel line")
+            .unwrap();
 
         // Idle: no recording pointer, no focus. The FE binds the thread to m-past.
         let scope = resolve_scope_meeting(Some("m-past"), None, None);
@@ -3735,8 +4513,12 @@ mod tests {
         );
         assert!(base.contains("in-meeting assistant"));
         // With a transcript ⇒ it is embedded + the brain is told to use it for the current meeting.
-        let with =
-            assistant_system_prompt("we shipped the beta and assigned the deck to Anna", "", "", false);
+        let with = assistant_system_prompt(
+            "we shipped the beta and assigned the deck to Anna",
+            "",
+            "",
+            false,
+        );
         assert!(
             with.contains("LIVE TRANSCRIPT"),
             "names the transcript section: {with}"
@@ -3808,7 +4590,12 @@ mod tests {
         );
 
         // Present typed notes ⇒ embedded under the labeled section, alongside the transcript.
-        let with = assistant_system_prompt(tx, "DECISION: ship Friday. Anna owns QA sign-off.", "", false);
+        let with = assistant_system_prompt(
+            tx,
+            "DECISION: ship Friday. Anna owns QA sign-off.",
+            "",
+            false,
+        );
         assert!(
             with.contains("TYPED NOTES"),
             "names the typed-notes section: {with}"
@@ -3823,7 +4610,8 @@ mod tests {
         );
 
         // Typed notes inject even with NO transcript (the user can type before any caption lands).
-        let notes_only = assistant_system_prompt("", "remember: budget cap is the blocker", "", false);
+        let notes_only =
+            assistant_system_prompt("", "remember: budget cap is the blocker", "", false);
         assert!(
             notes_only.contains("TYPED NOTES"),
             "typed notes inject without a transcript"
@@ -4010,7 +4798,9 @@ mod tests {
             citations: vec!["[[Other Meeting]]".to_string()],
         };
         let res = crate::voice_action::VoiceActionResult::from_agent(
-            &VoiceIntent::Research { topic: "ship".into() },
+            &VoiceIntent::Research {
+                topic: "ship".into(),
+            },
             outcome,
             crate::voice_action::AnsweredFrom::CurrentMeeting,
             vec!["[[This Meeting]]".to_string()],
@@ -4022,7 +4812,10 @@ mod tests {
         );
         assert_eq!(
             res.citations,
-            vec!["[[This Meeting]]".to_string(), "[[Other Meeting]]".to_string()],
+            vec![
+                "[[This Meeting]]".to_string(),
+                "[[Other Meeting]]".to_string()
+            ],
             "Tier 1's own [[Title]] is prepended ahead of the loop's gated citations"
         );
     }
@@ -4063,7 +4856,8 @@ mod tests {
         );
 
         // SEAL the folder + nothing unlocked → invisible → NO title citation (fail-closed).
-        db.set_folder_locked("f1", true, Some(&b"wrapped"[..])).unwrap();
+        db.set_folder_locked("f1", true, Some(&b"wrapped"[..]))
+            .unwrap();
         let sealed = std::collections::HashSet::new();
         assert!(
             !db.meeting_is_visible("m1", &sealed).unwrap(),
@@ -4187,8 +4981,11 @@ mod tests {
             folder_id: None,
         })
         .unwrap();
-        db.insert_segments("m-sealed", &[seg(0, 0.0, "SECRET acquisition price is 40M.")])
-            .unwrap();
+        db.insert_segments(
+            "m-sealed",
+            &[seg(0, 0.0, "SECRET acquisition price is 40M.")],
+        )
+        .unwrap();
         db.upsert_note(&crate::storage::NoteRecord {
             meeting_id: "m-sealed".to_string(),
             provider_id: "claude_code".to_string(),
@@ -4203,11 +5000,12 @@ mod tests {
         db.set_meeting_folder("m-sealed", Some("f1")).unwrap();
         db.set_note_folder("m-sealed", Some("f1")).unwrap();
         // Seal the folder → sealed-not-session-unlocked.
-        db.set_folder_locked("f1", true, Some(&b"wrapped"[..])).unwrap();
+        db.set_folder_locked("f1", true, Some(&b"wrapped"[..]))
+            .unwrap();
 
         let live = std::sync::Mutex::new(String::new());
         let sealed = std::collections::HashSet::new(); // folder NOT in the session unlock set
-        // Self-check: the meeting is invisible to the sealed session.
+                                                       // Self-check: the meeting is invisible to the sealed session.
         assert!(!db.meeting_is_visible("m-sealed", &sealed).unwrap());
 
         let ctx = tier1_current_content(&db, &live, "m-sealed", &sealed);
@@ -4282,6 +5080,9 @@ mod tests {
         assert_eq!(e.model_requested, "");
         assert_eq!(e.system_bytes, 0);
         assert_eq!(e.user_bytes, 0);
-        assert!(e.meeting_id.is_none(), "content-free: no meeting id, no query text");
+        assert!(
+            e.meeting_id.is_none(),
+            "content-free: no meeting id, no query text"
+        );
     }
 }

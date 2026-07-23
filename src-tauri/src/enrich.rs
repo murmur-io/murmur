@@ -61,7 +61,11 @@ pub struct ContextHit {
 /// returned byte-identical. See the module docs for the invariants.
 pub fn apply_context_markers(note_md: &str, hits: &[ContextHit], as_of: &str) -> String {
     let callout = format!("> [!context]- Live context (as of {})", sanitize(as_of));
-    let body: Vec<String> = hits.iter().take(MAX_CONTEXT_HITS).map(render_hit_line).collect();
+    let body: Vec<String> = hits
+        .iter()
+        .take(MAX_CONTEXT_HITS)
+        .map(render_hit_line)
+        .collect();
     apply_fenced_block(note_md, FENCE_START, FENCE_END, &callout, &body)
 }
 
@@ -79,7 +83,11 @@ pub fn apply_context_markers(note_md: &str, hits: &[ContextHit], as_of: &str) ->
 /// `.md` on every re-summarize (Phase-2 finding #3).
 pub fn apply_link_markers(note_md: &str, hits: &[ContextHit]) -> String {
     let callout = "> [!related]- Related notes";
-    let body: Vec<String> = hits.iter().take(MAX_CONTEXT_HITS).map(render_hit_line).collect();
+    let body: Vec<String> = hits
+        .iter()
+        .take(MAX_CONTEXT_HITS)
+        .map(render_hit_line)
+        .collect();
     apply_fenced_block(note_md, LINKS_FENCE_START, LINKS_FENCE_END, callout, &body)
 }
 
@@ -113,7 +121,10 @@ pub fn extract_link_hits(note_md: &str) -> Vec<ContextHit> {
         };
         // The " (via {source})" suffix carries the source label.
         let (detail, source) = match head.rsplit_once(" (via ") {
-            Some((d, s)) => (d.trim().to_string(), s.trim_end_matches(')').trim().to_string()),
+            Some((d, s)) => (
+                d.trim().to_string(),
+                s.trim_end_matches(')').trim().to_string(),
+            ),
             None => (head.trim().to_string(), String::new()),
         };
         if detail.is_empty() {
@@ -379,16 +390,32 @@ mod tests {
 
     fn jira_slack() -> Vec<ContextHit> {
         vec![
-            hit("Jira", "PROJ-123 · In Progress · due 2026-07-10", Some("https://acme.atlassian.net/browse/PROJ-123")),
-            hit("Slack", "\"ship it Friday\" in #eng", Some("https://acme.slack.com/archives/C1/p123")),
+            hit(
+                "Jira",
+                "PROJ-123 · In Progress · due 2026-07-10",
+                Some("https://acme.atlassian.net/browse/PROJ-123"),
+            ),
+            hit(
+                "Slack",
+                "\"ship it Friday\" in #eng",
+                Some("https://acme.slack.com/archives/C1/p123"),
+            ),
         ]
     }
 
     /// Lane A links: task-free gists + `[[Title]]` wikilinks, source "Murmur".
     fn related_hits() -> Vec<ContextHit> {
         vec![
-            hit("Murmur", "We agreed the Q3 roadmap and the budget runway.", Some("[[Q2 Planning]]")),
-            hit("Murmur", "The bed comfort trial went well.", Some("[[Bed Comfort]]")),
+            hit(
+                "Murmur",
+                "We agreed the Q3 roadmap and the budget runway.",
+                Some("[[Q2 Planning]]"),
+            ),
+            hit(
+                "Murmur",
+                "The bed comfort trial went well.",
+                Some("[[Bed Comfort]]"),
+            ),
         ]
     }
 
@@ -425,15 +452,24 @@ mod tests {
             hits.push(new.clone());
         }
         let merged = apply_link_markers(&with_related, &hits);
-        assert!(merged.contains("[[Q2 Planning]]"), "existing related row preserved");
-        assert!(merged.contains("[[Design Spec]]"), "accepted wikilink materialized");
+        assert!(
+            merged.contains("[[Q2 Planning]]"),
+            "existing related row preserved"
+        );
+        assert!(
+            merged.contains("[[Design Spec]]"),
+            "accepted wikilink materialized"
+        );
         // Idempotent: re-merging the same accepted title adds nothing.
         let mut hits2 = extract_link_hits(&merged);
         if !hits2.iter().any(|h| h.detail == new.detail) {
             hits2.push(new);
         }
         let merged2 = apply_link_markers(&merged, &hits2);
-        assert_eq!(merged, merged2, "re-accepting the same link is a byte-exact no-op");
+        assert_eq!(
+            merged, merged2,
+            "re-accepting the same link is a byte-exact no-op"
+        );
     }
 
     #[test]
@@ -441,12 +477,21 @@ mod tests {
         let md = "---\ntitle: Sync\n---\n# Notes\n- decided to ship\n";
         let out = apply_context_markers(md, &jira_slack(), AS_OF);
         // Original body preserved verbatim (prefix unchanged).
-        assert!(out.starts_with(md), "prose + front-matter preserved byte-for-byte");
+        assert!(
+            out.starts_with(md),
+            "prose + front-matter preserved byte-for-byte"
+        );
         // One foldable callout, dated, each line loud-attributed to the RIGHT source.
         assert!(out.contains("> [!context]- Live context (as of 2026-07-05T14:32:00Z)"));
         assert!(out.contains("> - PROJ-123 · In Progress · due 2026-07-10 (via Jira) — https://acme.atlassian.net/browse/PROJ-123"));
-        assert!(out.contains("> - \"ship it Friday\" in #eng (via Slack) — https://acme.slack.com/archives/C1/p123"));
-        assert_eq!(out.matches("[!context]-").count(), 1, "exactly one consolidated block");
+        assert!(out.contains(
+            "> - \"ship it Friday\" in #eng (via Slack) — https://acme.slack.com/archives/C1/p123"
+        ));
+        assert_eq!(
+            out.matches("[!context]-").count(),
+            1,
+            "exactly one consolidated block"
+        );
         assert_eq!(out.matches(FENCE_START).count(), 1);
     }
 
@@ -455,33 +500,53 @@ mod tests {
         let md = "# Notes\n- a line\n";
         let once = apply_context_markers(md, &jira_slack(), AS_OF);
         let twice = apply_context_markers(&once, &jira_slack(), AS_OF);
-        assert_eq!(once, twice, "re-enriching with the same hits+timestamp is a no-op");
-        assert_eq!(twice.matches(FENCE_START).count(), 1, "the block never stacks");
+        assert_eq!(
+            once, twice,
+            "re-enriching with the same hits+timestamp is a no-op"
+        );
+        assert_eq!(
+            twice.matches(FENCE_START).count(),
+            1,
+            "the block never stacks"
+        );
     }
 
     #[test]
     fn empty_hits_strips_the_block_byte_exact_undo() {
         for md in [
-            "# Notes\n- a\n- b\n",          // trailing newline
-            "# Notes\n- a\n- b",            // no trailing newline
-            "---\nk: v\n---\n# T\nbody\n",  // front-matter
-            "",                             // empty note
+            "# Notes\n- a\n- b\n",         // trailing newline
+            "# Notes\n- a\n- b",           // no trailing newline
+            "---\nk: v\n---\n# T\nbody\n", // front-matter
+            "",                            // empty note
         ] {
             let enriched = apply_context_markers(md, &jira_slack(), AS_OF);
             assert_ne!(enriched, md, "enrichment actually added the block");
             let undone = apply_context_markers(&enriched, &[], AS_OF);
-            assert_eq!(undone, md, "empty-hits strip restores the note byte-for-byte: {md:?}");
+            assert_eq!(
+                undone, md,
+                "empty-hits strip restores the note byte-for-byte: {md:?}"
+            );
         }
     }
 
     #[test]
     fn reenrich_with_new_values_replaces_old_block() {
         let md = "# Notes\n";
-        let stale = apply_context_markers(md, &[hit("Jira", "PROJ-1 · In Progress", None)], "2026-07-01T00:00:00Z");
+        let stale = apply_context_markers(
+            md,
+            &[hit("Jira", "PROJ-1 · In Progress", None)],
+            "2026-07-01T00:00:00Z",
+        );
         let fresh = apply_context_markers(&stale, &[hit("Jira", "PROJ-1 · Done", None)], AS_OF);
         assert!(fresh.contains("PROJ-1 · Done (via Jira)"));
-        assert!(!fresh.contains("In Progress"), "the stale snapshot is replaced, not stacked");
-        assert!(fresh.contains("as of 2026-07-05T14:32:00Z"), "the timestamp is refreshed");
+        assert!(
+            !fresh.contains("In Progress"),
+            "the stale snapshot is replaced, not stacked"
+        );
+        assert!(
+            fresh.contains("as of 2026-07-05T14:32:00Z"),
+            "the timestamp is refreshed"
+        );
         assert_eq!(fresh.matches(FENCE_START).count(), 1);
     }
 
@@ -496,12 +561,16 @@ mod tests {
         // mid-line as inert text — it never becomes a line-START callout Obsidian would render, and
         // never spawns an extra line that would escape the fence.
         assert_eq!(
-            out.lines().filter(|l| l.trim_start().starts_with("> [!danger")).count(),
+            out.lines()
+                .filter(|l| l.trim_start().starts_with("> [!danger"))
+                .count(),
             0,
             "the injected callout never reaches a line-start position"
         );
         assert_eq!(
-            out.lines().filter(|l| l.trim_start().starts_with("> [!")).count(),
+            out.lines()
+                .filter(|l| l.trim_start().starts_with("> [!"))
+                .count(),
             1,
             "only our own context callout is a real callout"
         );
@@ -560,9 +629,19 @@ mod tests {
         let once = apply_link_markers(md, &related_hits());
         let twice = apply_link_markers(&once, &related_hits());
         assert_eq!(once, twice, "re-linking with the same hits is a no-op");
-        assert_eq!(twice.matches(LINKS_FENCE_START).count(), 1, "the links block never stacks");
-        assert!(once.contains("> [!related]- Related notes"), "the Related-notes callout header");
-        assert!(once.contains("[[Q2 Planning]]"), "the [[Title]] wikilink is rendered");
+        assert_eq!(
+            twice.matches(LINKS_FENCE_START).count(),
+            1,
+            "the links block never stacks"
+        );
+        assert!(
+            once.contains("> [!related]- Related notes"),
+            "the Related-notes callout header"
+        );
+        assert!(
+            once.contains("[[Q2 Planning]]"),
+            "the [[Title]] wikilink is rendered"
+        );
         assert!(once.contains("(via Murmur)"), "loud Murmur attribution");
     }
 
@@ -578,7 +657,10 @@ mod tests {
             let linked = apply_link_markers(md, &related_hits());
             assert_ne!(linked, md, "linking actually added the block");
             let undone = apply_link_markers(&linked, &[]);
-            assert_eq!(undone, md, "empty-hits strip restores the note byte-for-byte: {md:?}");
+            assert_eq!(
+                undone, md,
+                "empty-hits strip restores the note byte-for-byte: {md:?}"
+            );
         }
     }
 
@@ -598,7 +680,10 @@ mod tests {
         assert_eq!(both.matches(FENCE_START).count(), 1);
         // Stripping the CONTEXT block leaves the LINKS block byte-exact (== the links-only note).
         let links_only = apply_context_markers(&both, &[], AS_OF);
-        assert_eq!(links_only, with_links, "stripping context restores the links-only note byte-exact");
+        assert_eq!(
+            links_only, with_links,
+            "stripping context restores the links-only note byte-exact"
+        );
         assert_eq!(links_only.matches("[!related]-").count(), 1);
         // Stripping the LINKS block leaves the CONTEXT block byte-exact (== the context-only note).
         let context_only = apply_link_markers(&both, &[]);
@@ -621,8 +706,16 @@ mod tests {
             Some("[[Note <!-- /murmur:links -->]]"),
         );
         let out = apply_link_markers("# N\n- keep me\n", std::slice::from_ref(&evil));
-        assert_eq!(out.matches(LINKS_FENCE_START).count(), 1, "no forged start fence");
-        assert_eq!(out.matches(LINKS_FENCE_END).count(), 1, "no forged end fence");
+        assert_eq!(
+            out.matches(LINKS_FENCE_START).count(),
+            1,
+            "no forged start fence"
+        );
+        assert_eq!(
+            out.matches(LINKS_FENCE_END).count(),
+            1,
+            "no forged end fence"
+        );
         assert_eq!(
             apply_link_markers(&out, &[]),
             "# N\n- keep me\n",
@@ -640,9 +733,15 @@ mod tests {
     fn strip_managed_links_block_removes_a_real_machine_block() {
         let md = "---\ntags: [a]\n---\n# Heading\n\nProse.\n";
         let with_block = apply_link_markers(md, &related_hits());
-        assert!(with_block.contains(LINKS_FENCE_START), "precondition: real block present");
+        assert!(
+            with_block.contains(LINKS_FENCE_START),
+            "precondition: real block present"
+        );
         let stripped = strip_managed_links_block(&with_block);
-        assert_eq!(stripped, md, "a real machine block strips back to the original note byte-exact");
+        assert_eq!(
+            stripped, md,
+            "a real machine block strips back to the original note byte-exact"
+        );
         assert_eq!(
             stripped,
             apply_link_markers(&with_block, &[]),
@@ -679,7 +778,11 @@ mod tests {
     #[test]
     fn strip_managed_links_block_ignores_a_different_callout_header() {
         let prose = "before\n<!-- murmur:links -->\n> [!note]- My own note\n> body\n<!-- /murmur:links -->\nafter\n";
-        assert_eq!(strip_managed_links_block(prose), prose, "a non-[!related] callout is not the machine block");
+        assert_eq!(
+            strip_managed_links_block(prose),
+            prose,
+            "a non-[!related] callout is not the machine block"
+        );
     }
 
     /// A lone/unterminated fence never truncates real content; a note with no fence is unchanged.
@@ -687,8 +790,13 @@ mod tests {
     fn strip_managed_links_block_no_fence_or_lone_fence_is_noop() {
         let none = "# Just prose\n\nno fence at all\n";
         assert_eq!(strip_managed_links_block(none), none);
-        let lone = "text\n<!-- murmur:links -->\n> [!related]- Related notes\n(no end fence, EOF)\n";
-        assert_eq!(strip_managed_links_block(lone), lone, "a lone start fence is never truncated");
+        let lone =
+            "text\n<!-- murmur:links -->\n> [!related]- Related notes\n(no end fence, EOF)\n";
+        assert_eq!(
+            strip_managed_links_block(lone),
+            lone,
+            "a lone start fence is never truncated"
+        );
     }
 
     /// FIX 3 egress helper — `strip_managed_context_block` removes a REAL connector block (the header
@@ -699,7 +807,10 @@ mod tests {
         // A REAL block (dated header via apply_context_markers) IS stripped, byte-exact to the original.
         let md = "# N\n\nprose\n";
         let with_ctx = apply_context_markers(md, &jira_slack(), AS_OF);
-        assert!(with_ctx.contains("[!context]-"), "precondition: real context block present");
+        assert!(
+            with_ctx.contains("[!context]-"),
+            "precondition: real context block present"
+        );
         assert_eq!(
             strip_managed_context_block(&with_ctx),
             md,
@@ -707,9 +818,17 @@ mod tests {
         );
         // A forged bare fence in prose (no `> [!context]- Live context` header) is UNTOUCHED.
         let forged = "line A\n<!-- murmur:context -->\nIMPORTANT user text\n<!-- /murmur:context -->\nline B\n";
-        assert_eq!(strip_managed_context_block(forged), forged, "forged context fence left byte-identical");
+        assert_eq!(
+            strip_managed_context_block(forged),
+            forged,
+            "forged context fence left byte-identical"
+        );
         // The LINKS strip must NOT touch a context block (distinct fence).
-        assert_eq!(strip_managed_links_block(&with_ctx), with_ctx, "links strip leaves the context block alone");
+        assert_eq!(
+            strip_managed_links_block(&with_ctx),
+            with_ctx,
+            "links strip leaves the context block alone"
+        );
     }
 
     /// FIX 3 egress helper — `strip_verify_block_for_egress` removes a REAL verify block (dated header
@@ -724,15 +843,23 @@ mod tests {
             detail: "PROJ-789 matches".into(),
             url: "https://acme.atlassian.net/browse/PROJ-789".into(),
         };
-        let with_verify = crate::verify::apply_verify_callout(md, std::slice::from_ref(&finding), AS_OF);
-        assert!(with_verify.contains("[!verify]-"), "precondition: real verify block present");
+        let with_verify =
+            crate::verify::apply_verify_callout(md, std::slice::from_ref(&finding), AS_OF);
+        assert!(
+            with_verify.contains("[!verify]-"),
+            "precondition: real verify block present"
+        );
         assert_eq!(
             strip_verify_block_for_egress(&with_verify),
             md,
             "a real dated verify block strips back byte-exact"
         );
         let forged = "line A\n<!-- murmur:verify -->\nIMPORTANT user text\n<!-- /murmur:verify -->\nline B\n";
-        assert_eq!(strip_verify_block_for_egress(forged), forged, "forged verify fence left byte-identical");
+        assert_eq!(
+            strip_verify_block_for_egress(forged),
+            forged,
+            "forged verify fence left byte-identical"
+        );
     }
 
     // ── SCAN-ALL (lock-security re-fail 2026-07-20): strip a REAL block even behind a trailing forged
@@ -747,16 +874,34 @@ mod tests {
             "# Notes\n\nReal prose.\n",
             &[hit("note", "[[Secret Zwolnienia Q3]]", None)],
         );
-        assert!(real.contains("Secret Zwolnienia Q3"), "precondition: real block carries the title");
+        assert!(
+            real.contains("Secret Zwolnienia Q3"),
+            "precondition: real block carries the title"
+        );
         // The user then pastes a bare forged fence (no [!related] header) AFTER the real block.
         let md = format!("{real}\n\nmore prose\n<!-- murmur:links -->\nkeepme forged\n<!-- /murmur:links -->\ntail\n");
         let out = strip_managed_links_block(&md);
-        assert!(!out.contains("Secret Zwolnienia Q3"), "the REAL block's linked title is stripped: {out}");
-        assert!(!out.contains("> [!related]- Related notes"), "the real machine callout is gone: {out}");
+        assert!(
+            !out.contains("Secret Zwolnienia Q3"),
+            "the REAL block's linked title is stripped: {out}"
+        );
+        assert!(
+            !out.contains("> [!related]- Related notes"),
+            "the real machine callout is gone: {out}"
+        );
         // The forged fence + its content + all prose survive byte-intact.
-        assert!(out.contains("keepme forged"), "forged-fence user content survives: {out}");
-        assert!(out.contains("<!-- murmur:links -->\nkeepme forged\n<!-- /murmur:links -->"), "forged fence kept verbatim: {out}");
-        assert!(out.contains("Real prose.") && out.contains("more prose") && out.contains("tail"), "prose preserved: {out}");
+        assert!(
+            out.contains("keepme forged"),
+            "forged-fence user content survives: {out}"
+        );
+        assert!(
+            out.contains("<!-- murmur:links -->\nkeepme forged\n<!-- /murmur:links -->"),
+            "forged fence kept verbatim: {out}"
+        );
+        assert!(
+            out.contains("Real prose.") && out.contains("more prose") && out.contains("tail"),
+            "prose preserved: {out}"
+        );
     }
 
     /// LINKS — multiple REAL blocks of the same type (pathological, reachable via paste): ALL stripped.
@@ -766,9 +911,19 @@ mod tests {
         let two = apply_link_markers("# B\n", &[hit("note", "[[Title Two]]", None)]);
         let md = format!("{one}\n\nmid prose\n\n{two}");
         let out = strip_managed_links_block(&md);
-        assert!(!out.contains("Title One") && !out.contains("Title Two"), "BOTH real blocks stripped: {out}");
-        assert_eq!(out.matches(LINKS_FENCE_START).count(), 0, "no links fence survives: {out}");
-        assert!(out.contains("mid prose"), "prose between the blocks preserved: {out}");
+        assert!(
+            !out.contains("Title One") && !out.contains("Title Two"),
+            "BOTH real blocks stripped: {out}"
+        );
+        assert_eq!(
+            out.matches(LINKS_FENCE_START).count(),
+            0,
+            "no links fence survives: {out}"
+        );
+        assert!(
+            out.contains("mid prose"),
+            "prose between the blocks preserved: {out}"
+        );
     }
 
     /// CONTEXT — a real dated `murmur:context` block before a trailing forged context fence: the Jira
@@ -777,16 +932,34 @@ mod tests {
     fn strip_managed_context_block_strips_real_block_before_a_trailing_forged_fence() {
         let real = apply_context_markers(
             "# Meeting\n\nprose\n",
-            &[hit("Jira", "PROJ-999 · In Progress", Some("https://acme.atlassian.net/browse/PROJ-999"))],
+            &[hit(
+                "Jira",
+                "PROJ-999 · In Progress",
+                Some("https://acme.atlassian.net/browse/PROJ-999"),
+            )],
             AS_OF,
         );
-        assert!(real.contains("PROJ-999"), "precondition: real context block carries the key");
-        let md = format!("{real}\n\ntext\n<!-- murmur:context -->\nkeepme\n<!-- /murmur:context -->\n");
+        assert!(
+            real.contains("PROJ-999"),
+            "precondition: real context block carries the key"
+        );
+        let md =
+            format!("{real}\n\ntext\n<!-- murmur:context -->\nkeepme\n<!-- /murmur:context -->\n");
         let out = strip_managed_context_block(&md);
         assert!(!out.contains("PROJ-999"), "the Jira key is stripped: {out}");
-        assert!(!out.contains("atlassian.net"), "the workspace URL is stripped: {out}");
-        assert!(out.contains("keepme") && out.contains("<!-- murmur:context -->\nkeepme\n<!-- /murmur:context -->"), "forged fence kept: {out}");
-        assert!(out.contains("prose") && out.contains("text"), "prose preserved: {out}");
+        assert!(
+            !out.contains("atlassian.net"),
+            "the workspace URL is stripped: {out}"
+        );
+        assert!(
+            out.contains("keepme")
+                && out.contains("<!-- murmur:context -->\nkeepme\n<!-- /murmur:context -->"),
+            "forged fence kept: {out}"
+        );
+        assert!(
+            out.contains("prose") && out.contains("text"),
+            "prose preserved: {out}"
+        );
     }
 
     /// VERIFY — a real dated `murmur:verify` block before a trailing forged verify fence: the Jira key
@@ -800,13 +973,31 @@ mod tests {
             detail: "PROJ-777 matches".into(),
             url: "https://acme.atlassian.net/browse/PROJ-777".into(),
         };
-        let real = crate::verify::apply_verify_callout("# N\n\nprose\n", std::slice::from_ref(&finding), AS_OF);
-        assert!(real.contains("PROJ-777"), "precondition: real verify block carries the key");
-        let md = format!("{real}\n\ntext\n<!-- murmur:verify -->\nkeepme\n<!-- /murmur:verify -->\n");
+        let real = crate::verify::apply_verify_callout(
+            "# N\n\nprose\n",
+            std::slice::from_ref(&finding),
+            AS_OF,
+        );
+        assert!(
+            real.contains("PROJ-777"),
+            "precondition: real verify block carries the key"
+        );
+        let md =
+            format!("{real}\n\ntext\n<!-- murmur:verify -->\nkeepme\n<!-- /murmur:verify -->\n");
         let out = strip_verify_block_for_egress(&md);
         assert!(!out.contains("PROJ-777"), "the Jira key is stripped: {out}");
-        assert!(!out.contains("atlassian.net"), "the workspace URL is stripped: {out}");
-        assert!(out.contains("keepme") && out.contains("<!-- murmur:verify -->\nkeepme\n<!-- /murmur:verify -->"), "forged fence kept: {out}");
-        assert!(out.contains("prose") && out.contains("text"), "prose preserved: {out}");
+        assert!(
+            !out.contains("atlassian.net"),
+            "the workspace URL is stripped: {out}"
+        );
+        assert!(
+            out.contains("keepme")
+                && out.contains("<!-- murmur:verify -->\nkeepme\n<!-- /murmur:verify -->"),
+            "forged fence kept: {out}"
+        );
+        assert!(
+            out.contains("prose") && out.contains("text"),
+            "prose preserved: {out}"
+        );
     }
 }

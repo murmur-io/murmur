@@ -1,9 +1,9 @@
 # Dev-watcher ignore list (gitignore syntax) — read by `tauri dev`'s file watcher.
 #
-# `binaries/` holds GENERATED sidecar artifacts (Swift helpers + the meetnotes-brain
+# `binaries/` holds GENERATED sidecar artifacts (Swift helpers + the murmur-brain
 # child), staged into place by build.rs on every `cargo build`. They live inside the
 # watched `src-tauri/` tree, so without this ignore, build.rs re-staging one of them
-# (e.g. copying meetnotes-brain from target/) updates its mtime → the watcher fires
+# (e.g. copying murmur-brain from target/) updates its mtime → the watcher fires
 # "Rebuilding application…" → build.rs re-stages it again → an INFINITE rebuild loop
 # that never boots the app. None of these are hand-edited source; they must not drive
 # an app rebuild. (Release `tauri build` ignores this file — it only affects dev.)

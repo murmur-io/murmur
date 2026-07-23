@@ -122,6 +122,14 @@ impl From<ConnectorError> for crate::error::AppError {
 /// A connector's search result type — `Vec<ConnectorHit>` or a typed [`ConnectorError`].
 pub type ConnectorResult = std::result::Result<Vec<ConnectorHit>, ConnectorError>;
 
+fn external_connector_may_run(
+    egress_class: EgressClass,
+    recording_has_priority: bool,
+    has_exact_recording_token: bool,
+) -> bool {
+    egress_class != EgressClass::External || !recording_has_priority || has_exact_recording_token
+}
+
 /// The connector seam. Each impl DECLARES its [`EgressClass`] and runs a single async `search`.
 ///
 /// CONTRACT (load-bearing): an `External` connector MUST NOT egress anything until it has confirmed
@@ -177,6 +185,9 @@ pub struct ConnectorRegistry {
     /// search ATTEMPT so the Analytics "receipt of what left your Mac" covers connector egress too.
     /// `NoopEgressSink` before startup wiring / in tests that do not install a sink.
     sink: Arc<dyn EgressSink>,
+    /// Present only for a caller explicitly owned by the active recording session. Ordinary
+    /// registries fail closed before external egress while capture has priority.
+    recording_token: Option<crate::perf::RecordingSessionToken>,
 }
 
 impl ConnectorRegistry {
@@ -206,7 +217,25 @@ impl ConnectorRegistry {
             connectors,
             names: active_name_redactor(),
             sink: active_sink(),
+            recording_token: None,
         }
+    }
+
+    /// Attach exact recording identity. Final integration sources this from `ActiveRecording`;
+    /// never synthesize or recover it from a process-global slot.
+    #[allow(dead_code)] // consumed when the affine owner/token moves into ActiveRecording.
+    pub(crate) fn with_recording_token(
+        mut self,
+        token: crate::perf::RecordingSessionToken,
+    ) -> crate::error::Result<Self> {
+        self.recording_token = Some(token.validated_for_live_work()?);
+        Ok(self)
+    }
+
+    fn has_valid_live_recording_token(&self) -> bool {
+        self.recording_token
+            .as_ref()
+            .is_some_and(|token| token.validated_for_live_work().is_ok())
     }
 
     /// Brain v2 L5 — [`Self::build`] EXTENDED with the user's configured MCP servers (the caller
@@ -263,9 +292,52 @@ impl ConnectorRegistry {
             // Not exposed → fail closed. NOTHING egresses, so nothing is recorded.
             return Err(ConnectorError::NeedsConsent);
         };
+        if !external_connector_may_run(
+            connector.egress_class(),
+            crate::perf::recording_has_priority(),
+            self.has_valid_live_recording_token(),
+        ) {
+            return Err(ConnectorError::Failed(
+                "external connector deferred during recording".into(),
+            ));
+        }
         // FULL firewall scrub (regex + NER names), mirroring the provider path. `counts` are the
         // content-free redaction tallies for the ledger; `redacted` is what actually egresses.
-        let (redacted, counts) = redact_connector_query(query, self.names.as_ref());
+        let (redacted, counts) = if self.names.is_noop() {
+            redact_connector_query(query, self.names.as_ref())
+        } else {
+            let names = Arc::clone(&self.names);
+            let query = query.to_string();
+            let recording_token = self.recording_token.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::perf::with_model_generation(
+                    recording_token.as_ref(),
+                    crate::perf::ResidentModelKind::Ner,
+                    || Ok(redact_connector_query(&query, names.as_ref())),
+                )
+            })
+            .await
+            .map_err(|_| ConnectorError::Failed("connector redaction worker failed".into()))?
+            .map_err(|_| ConnectorError::Failed("connector redaction deferred".into()))?
+        };
+
+        // AUTHORITATIVE check-to-egress boundary, deliberately AFTER redaction/preparation. The
+        // coordinator changes Live -> Draining under the same mutex used here: either this lease
+        // wins first and Stop waits for the whole connector future, or Draining wins and no ledger
+        // row/network call occurs. The early check above is only a cheap preflight.
+        let _egress_lease = if connector.egress_class() == EgressClass::External {
+            Some(
+                crate::perf::acquire_external_egress_lease(self.recording_token.as_ref()).map_err(
+                    |_| {
+                        ConnectorError::Failed(
+                            "external connector deferred during recording drain".into(),
+                        )
+                    },
+                )?,
+            )
+        } else {
+            None
+        };
 
         // Record ONE content-free ledger row for this external egress ATTEMPT, BEFORE the network
         // call, so even a failing request is audited as attempted egress. `user_bytes` is the SIZE
@@ -313,6 +385,28 @@ impl ConnectorRegistry {
             // Not exposed → fail closed. NOTHING egresses, so nothing is recorded.
             return Err(ConnectorError::NeedsConsent);
         };
+        if !external_connector_may_run(
+            connector.egress_class(),
+            crate::perf::recording_has_priority(),
+            self.has_valid_live_recording_token(),
+        ) {
+            return Err(ConnectorError::Failed(
+                "external connector deferred during recording".into(),
+            ));
+        }
+        let _egress_lease = if connector.egress_class() == EgressClass::External {
+            Some(
+                crate::perf::acquire_external_egress_lease(self.recording_token.as_ref()).map_err(
+                    |_| {
+                        ConnectorError::Failed(
+                            "external connector deferred during recording drain".into(),
+                        )
+                    },
+                )?,
+            )
+        } else {
+            None
+        };
         // Record ONE content-free ledger row for this external egress ATTEMPT, BEFORE the network
         // call. A lookup is a DISTINCT call_kind from a search — attribute it truthfully as such.
         if connector.egress_class() == EgressClass::External {
@@ -340,7 +434,12 @@ impl ConnectorRegistry {
         names: Arc<dyn NameRedactor>,
         sink: Arc<dyn EgressSink>,
     ) -> Self {
-        Self { connectors, names, sink }
+        Self {
+            connectors,
+            names,
+            sink,
+            recording_token: None,
+        }
     }
 }
 
@@ -373,6 +472,65 @@ mod tests {
                 (text.to_string(), Vec::new())
             }
         }
+    }
+
+    #[test]
+    fn recording_priority_defers_external_connector_without_exact_owner() {
+        assert!(!external_connector_may_run(
+            EgressClass::External,
+            true,
+            false
+        ));
+        assert!(external_connector_may_run(
+            EgressClass::External,
+            true,
+            true
+        ));
+        assert!(external_connector_may_run(
+            EgressClass::External,
+            false,
+            false
+        ));
+        assert!(external_connector_may_run(EgressClass::Local, true, false));
+    }
+
+    #[test]
+    fn stale_recording_token_cannot_authorize_connector_egress_in_a_later_session() {
+        struct ResetLifecycle;
+        impl Drop for ResetLifecycle {
+            fn drop(&mut self) {
+                crate::perf::reset_model_lifecycle_for_test();
+            }
+        }
+        let _serial = crate::perf::model_lifecycle_test_guard();
+        crate::perf::reset_model_lifecycle_for_test();
+        let _reset = ResetLifecycle;
+
+        let mut first = crate::perf::begin_recording_session().unwrap();
+        first.transition_to_live().unwrap();
+        let stale = first.token();
+        let cap = std::sync::Arc::new(CaptureConnector {
+            last_query: std::sync::Mutex::new(None),
+        });
+        let registry = ConnectorRegistry::with_parts(
+            vec![Box::new(CaptureConnectorRef(cap.clone()))],
+            std::sync::Arc::new(NoopNameRedactor),
+            std::sync::Arc::new(NoopEgressSink),
+        )
+        .with_recording_token(stale)
+        .unwrap();
+        first.transition_to_draining().unwrap();
+        first.transition_to_postprocess().unwrap();
+        first.finish().unwrap();
+
+        let mut second = crate::perf::begin_recording_session().unwrap();
+        second.transition_to_live().unwrap();
+        let result = block_on(registry.search("capture", "must not leave"));
+        assert!(matches!(result, Err(ConnectorError::Failed(_))));
+        assert!(cap.last_query.lock().unwrap().is_none());
+        second.transition_to_draining().unwrap();
+        second.transition_to_postprocess().unwrap();
+        second.finish().unwrap();
     }
 
     /// A fake connector that CAPTURES the query it was handed, so a test can prove the framework
@@ -420,7 +578,8 @@ mod tests {
             std::sync::Arc::new(NoopNameRedactor),
             std::sync::Arc::new(NoopEgressSink),
         );
-        let hits = block_on(registry.search("capture", "email bob@acme.com about weather")).unwrap();
+        let hits =
+            block_on(registry.search("capture", "email bob@acme.com about weather")).unwrap();
         assert_eq!(hits.len(), 1);
         let seen = cap.last_query.lock().unwrap().clone().unwrap();
         assert!(
@@ -451,6 +610,153 @@ mod tests {
         async fn search(&self, redacted_query: &str) -> ConnectorResult {
             self.0.search(redacted_query).await
         }
+    }
+
+    struct BarrierNameRedactor {
+        entered: std::sync::mpsc::Sender<()>,
+        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl NameRedactor for BarrierNameRedactor {
+        fn redact_names(&self, text: &str) -> (String, Vec<(String, String)>) {
+            let _ = self.entered.send(());
+            let _ = self
+                .release
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .recv();
+            (text.to_string(), Vec::new())
+        }
+    }
+
+    struct AwaitConnectorState {
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    struct AwaitConnector(std::sync::Arc<AwaitConnectorState>);
+
+    #[async_trait::async_trait]
+    impl Connector for AwaitConnector {
+        fn id(&self) -> &str {
+            "await"
+        }
+
+        fn egress_class(&self) -> EgressClass {
+            EgressClass::External
+        }
+
+        async fn search(&self, _redacted_query: &str) -> ConnectorResult {
+            self.0
+                .calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.0.entered.notify_one();
+            self.0.release.notified().await;
+            Ok(Vec::new())
+        }
+    }
+
+    #[test]
+    fn draining_that_wins_after_redaction_prevents_ledger_and_connector_egress() {
+        struct ResetLifecycle;
+        impl Drop for ResetLifecycle {
+            fn drop(&mut self) {
+                crate::perf::reset_model_lifecycle_for_test();
+            }
+        }
+        let _serial = crate::perf::model_lifecycle_test_guard();
+        crate::perf::reset_model_lifecycle_for_test();
+        let _reset = ResetLifecycle;
+        let mut owner = crate::perf::begin_recording_session().unwrap();
+        owner.transition_to_live().unwrap();
+        let token = owner.token();
+        let (redaction_entered_tx, redaction_entered_rx) = std::sync::mpsc::channel();
+        let (release_redaction_tx, release_redaction_rx) = std::sync::mpsc::channel();
+        let connector = std::sync::Arc::new(CaptureConnector {
+            last_query: std::sync::Mutex::new(None),
+        });
+        let ledger = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let registry = ConnectorRegistry::with_parts(
+            vec![Box::new(CaptureConnectorRef(connector.clone()))],
+            std::sync::Arc::new(BarrierNameRedactor {
+                entered: redaction_entered_tx,
+                release: std::sync::Mutex::new(release_redaction_rx),
+            }),
+            std::sync::Arc::new(CaptureEgressSink(ledger.clone())),
+        )
+        .with_recording_token(token)
+        .unwrap();
+
+        block_on(async {
+            let search =
+                tokio::spawn(
+                    async move { registry.search("capture", "prepared before drain").await },
+                );
+            tokio::task::spawn_blocking(move || redaction_entered_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            owner.transition_to_draining().unwrap();
+            release_redaction_tx.send(()).unwrap();
+            assert!(matches!(
+                search.await.unwrap(),
+                Err(ConnectorError::Failed(_))
+            ));
+            assert!(owner
+                .wait_for_quiescence_async(std::time::Duration::from_secs(1))
+                .await
+                .unwrap());
+        });
+        assert!(connector.last_query.lock().unwrap().is_none());
+        assert!(ledger.lock().unwrap().is_empty());
+        owner.transition_to_postprocess().unwrap();
+        owner.finish().unwrap();
+    }
+
+    #[test]
+    fn connector_egress_that_wins_before_draining_is_awaited_by_stop() {
+        struct ResetLifecycle;
+        impl Drop for ResetLifecycle {
+            fn drop(&mut self) {
+                crate::perf::reset_model_lifecycle_for_test();
+            }
+        }
+        let _serial = crate::perf::model_lifecycle_test_guard();
+        crate::perf::reset_model_lifecycle_for_test();
+        let _reset = ResetLifecycle;
+        let mut owner = crate::perf::begin_recording_session().unwrap();
+        owner.transition_to_live().unwrap();
+        let token = owner.token();
+        let connector = std::sync::Arc::new(AwaitConnectorState {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let registry = ConnectorRegistry::with_parts(
+            vec![Box::new(AwaitConnector(connector.clone()))],
+            std::sync::Arc::new(NoopNameRedactor),
+            std::sync::Arc::new(NoopEgressSink),
+        )
+        .with_recording_token(token)
+        .unwrap();
+
+        block_on(async {
+            let entered = connector.entered.notified();
+            let search = tokio::spawn(async move { registry.search("await", "query").await });
+            entered.await;
+            owner.transition_to_draining().unwrap();
+            assert!(owner.transition_to_postprocess().is_err());
+            connector.release.notify_one();
+            search.await.unwrap().unwrap();
+            assert!(owner
+                .wait_for_quiescence_async(std::time::Duration::from_secs(1))
+                .await
+                .unwrap());
+        });
+        assert_eq!(connector.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        owner.transition_to_postprocess().unwrap();
+        owner.finish().unwrap();
     }
 
     #[test]
@@ -525,7 +831,10 @@ mod tests {
         );
         let res = block_on(registry.jira_lookup("PROJ-1"));
         assert!(matches!(res, Err(ConnectorError::NeedsConsent)));
-        assert!(captured.lock().unwrap().is_empty(), "no egress ⇒ no ledger row");
+        assert!(
+            captured.lock().unwrap().is_empty(),
+            "no egress ⇒ no ledger row"
+        );
     }
 
     #[test]
@@ -573,8 +882,9 @@ mod tests {
             std::sync::Arc::new(FixtureNameRedactor), // the "NER model installed" stand-in
             std::sync::Arc::new(NoopEgressSink),
         );
-        let hits = block_on(registry.search("capture", "what did Anna Kowalska decide about weather"))
-            .unwrap();
+        let hits =
+            block_on(registry.search("capture", "what did Anna Kowalska decide about weather"))
+                .unwrap();
         assert_eq!(hits.len(), 1);
         let seen = cap.last_query.lock().unwrap().clone().unwrap();
         assert!(
@@ -611,7 +921,11 @@ mod tests {
         block_on(registry.search("capture", query)).unwrap();
 
         let rows = recorded.lock().unwrap();
-        assert_eq!(rows.len(), 1, "exactly one content-free ledger row per connector search");
+        assert_eq!(
+            rows.len(),
+            1,
+            "exactly one content-free ledger row per connector search"
+        );
         let row = &rows[0];
 
         // Shape: connector-attributed via the GENERIC FALLBACK (the fake "capture" connector does
@@ -621,17 +935,32 @@ mod tests {
         assert_eq!(row.destination, "external connector");
         assert_eq!(row.model_requested, "");
         assert_eq!(row.system_bytes, 0);
-        assert!(row.user_bytes > 0, "the scrubbed-query byte SIZE is recorded");
+        assert!(
+            row.user_bytes > 0,
+            "the scrubbed-query byte SIZE is recorded"
+        );
         assert_eq!(row.redactions.email, 1, "one email scrubbed");
-        assert_eq!(row.redactions.name, 1, "one person name scrubbed by the NER layer");
+        assert_eq!(
+            row.redactions.name, 1,
+            "one person name scrubbed by the NER layer"
+        );
         assert_eq!(row.redactions.card, 0);
         assert_eq!(row.redactions.phone, 0);
 
         // CONTENT-FREE INVARIANT: no query text / no PII in ANY field (full Debug output).
         let debug = format!("{:?}", row);
-        assert!(!debug.contains("bob@acme.com"), "email must NOT appear in ledger row: {debug}");
-        assert!(!debug.contains("Anna Kowalska"), "name must NOT appear in ledger row: {debug}");
-        assert!(!debug.contains("weather"), "query terms must NOT appear in ledger row: {debug}");
+        assert!(
+            !debug.contains("bob@acme.com"),
+            "email must NOT appear in ledger row: {debug}"
+        );
+        assert!(
+            !debug.contains("Anna Kowalska"),
+            "name must NOT appear in ledger row: {debug}"
+        );
+        assert!(
+            !debug.contains("weather"),
+            "query terms must NOT appear in ledger row: {debug}"
+        );
     }
 
     /// (b, cont.) The ledger row is recorded even when the external call FAILS — a failed HTTP call
@@ -659,14 +988,24 @@ mod tests {
             std::sync::Arc::new(CaptureEgressSink(recorded.clone())),
         );
         let res = block_on(registry.search("capture", "email bob@acme.com weather"));
-        assert!(matches!(res, Err(ConnectorError::Failed(_))), "the failure surfaces");
+        assert!(
+            matches!(res, Err(ConnectorError::Failed(_))),
+            "the failure surfaces"
+        );
         let rows = recorded.lock().unwrap();
-        assert_eq!(rows.len(), 1, "a failed attempt is still audited as attempted egress");
+        assert_eq!(
+            rows.len(),
+            1,
+            "a failed attempt is still audited as attempted egress"
+        );
         // "capture" declares no override → generic fallback attribution.
         assert_eq!(rows[0].call_kind, "connector_search");
         assert_eq!(rows[0].redactions.email, 1);
         let debug = format!("{:?}", rows[0]);
-        assert!(!debug.contains("bob@acme.com"), "email must NOT appear in ledger row: {debug}");
+        assert!(
+            !debug.contains("bob@acme.com"),
+            "email must NOT appear in ledger row: {debug}"
+        );
     }
 
     /// (c) PER-CONNECTOR ATTRIBUTION — RED-before-GREEN: a `"jira"`-id connector must record its OWN

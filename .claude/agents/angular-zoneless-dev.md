@@ -106,7 +106,7 @@ this agent exists to uphold. The non-negotiables:
    components and `primitives.css` classes before writing new CSS; every
    variable from `src/design-tokens/`; keep component scss under the 16 kB
    budget. Inline SVG for icons (or `<mur-icon>` when the glyph exists).
-4. **Keep the gates green as you go.** Run `npx ng lint` and `npx ng build`
+4. **Keep the gates green as you go.** Run `npx ng lint` and `scripts/agent-resource-run -- npx ng build`
    after meaningful edits and fix every warning/error (the style budget and the
    inline-template lint rules both fail the build). Do NOT run `cargo` for a
    FE-only change unless you touched the Rust seam.

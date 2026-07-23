@@ -15,6 +15,7 @@
 
 use crate::crypto;
 use crate::error::{AppError, Result};
+use murmur_protocol::envelope::ShareAttachment;
 use sha2::{Digest, Sha256};
 
 /// The AAD domain prefix binding a sealed org item to `{org_id, item_nonce}`. Domain-separated from
@@ -24,18 +25,14 @@ const ORG_ITEM_AAD_V1: &str = "murmur-org/v1|org-item";
 /// The envelope wire version. Bump only for a breaking canonical-format change (readers reject an
 /// unknown version fail-closed).
 ///
-/// v1 → v2 history: v2 APPENDS one `source_kind` tag byte after `created_at` (no other field moved).
-/// `from_canonical_bytes` accepts BOTH v1 (already-published envelopes sitting in real org feeds —
-/// parsed exactly as before, `source_kind: None`) and v2 (new envelopes, always constructed via
-/// `OrgEnvelope::new`) — an already-published v1 envelope MUST stay parseable forever; only an
-/// unrecognized version (anything but 1 or 2) fails closed. `to_canonical_bytes` also branches on
-/// `self.version` so re-serializing a PARSED v1 envelope reproduces byte-identical v1 bytes (never
-/// silently upgrades the wire form — that would shift `content_sha256` for existing dedup rows).
-pub const ORG_ENVELOPE_VERSION: u16 = 2;
+/// v1 → v2 appends `source_kind`; v2 → v3 appends a canonical attachment manifest. Readers retain
+/// byte-identical parsing/re-serialization of already-published v1 and v2 envelopes.
+pub const ORG_ENVELOPE_VERSION: u16 = 3;
 
 /// The PREVIOUS wire version, still accepted on read for backward compatibility with envelopes
 /// already published to org feeds before this device upgraded. See `ORG_ENVELOPE_VERSION` doc.
 const ORG_ENVELOPE_VERSION_V1: u16 = 1;
+const ORG_ENVELOPE_VERSION_V2: u16 = 2;
 
 /// The kind of authored content an org item carries. Serialized as a single tag byte in the canonical
 /// form (stable across versions).
@@ -124,14 +121,15 @@ pub struct OrgEnvelope {
     /// envelope THIS device constructs (`new()` always stamps v2 + a required source kind); `None`
     /// ONLY for an envelope PARSED from already-published v1 wire bytes, which carry no such signal.
     pub source_kind: Option<OrgSourceKind>,
+    /// Image bytes authenticated inside the OCK-sealed v3 envelope. Empty for parsed v1/v2 data.
+    pub attachments: Vec<ShareAttachment>,
 }
 
 impl OrgEnvelope {
-    /// Build a NEW envelope — always stamped the CURRENT wire version (`ORG_ENVELOPE_VERSION`, v2) with
-    /// a REQUIRED `source_kind`: every envelope this device constructs always knows its own source type,
-    /// so `source_kind: None` is reserved for envelopes parsed off old v1 wire data, never one built
-    /// here. Callers pass the ALREADY-CLEANED + scrubbed markdown (the seal layer does no sanitization —
-    /// that is the command's job, upstream, so the leak-safety transform is a single well-tested seam).
+    /// Build a text-only envelope in the v2 wire shape. v3 is selected only by
+    /// [`Self::with_attachments`] when real image bytes exist, preserving mixed-version org sync for
+    /// older clients that can still consume every text-only item. `source_kind: None` remains reserved
+    /// for parsed v1 wire data. Callers pass already-cleaned + scrubbed markdown.
     pub fn new(
         kind: OrgItemKind,
         title: impl Into<String>,
@@ -142,7 +140,7 @@ impl OrgEnvelope {
         source_kind: OrgSourceKind,
     ) -> Self {
         Self {
-            version: ORG_ENVELOPE_VERSION,
+            version: ORG_ENVELOPE_VERSION_V2,
             kind,
             title: title.into(),
             markdown: markdown.into(),
@@ -150,7 +148,21 @@ impl OrgEnvelope {
             created_at: created_at.into(),
             source_rev,
             source_kind: Some(source_kind),
+            attachments: Vec::new(),
         }
+    }
+
+    /// Attach a deterministic manifest and upgrade to v3 only when it is non-empty. Calling this with
+    /// an empty vector deliberately preserves v2 compatibility for text-only publish/republish paths.
+    pub fn with_attachments(mut self, mut attachments: Vec<ShareAttachment>) -> Self {
+        if attachments.is_empty() {
+            self.attachments.clear();
+            return self;
+        }
+        attachments.sort_by(|a, b| a.id.cmp(&b.id));
+        self.version = ORG_ENVELOPE_VERSION;
+        self.attachments = attachments;
+        self
     }
 
     /// Serialize to the CANONICAL byte form. v1 layout: `version(u16 LE) | kind_tag(u8) |
@@ -169,7 +181,12 @@ impl OrgEnvelope {
                 + self.markdown.len()
                 + self.author_hint.len()
                 + self.created_at.len()
-                + 1,
+                + 1
+                + self
+                    .attachments
+                    .iter()
+                    .map(|a| 28 + a.id.len() + a.mime_type.len() + a.sha256.len() + a.data.len())
+                    .sum::<usize>(),
         );
         out.extend_from_slice(&self.version.to_le_bytes());
         out.push(self.kind.tag());
@@ -183,12 +200,23 @@ impl OrgEnvelope {
             out.extend_from_slice(&(field.len() as u32).to_le_bytes());
             out.extend_from_slice(field.as_bytes());
         }
-        if self.version >= ORG_ENVELOPE_VERSION {
-            // v2 (or later, should the format ever grow again): append the source-kind tag. `new()`
+        if self.version >= ORG_ENVELOPE_VERSION_V2 {
+            // v2 and later append the source-kind tag. `new()`
             // guarantees `Some` here; a `None` on a v2-stamped value is an internal invariant violation
             // (should never happen — nothing constructs one), so fail closed rather than write garbage.
             let tag = self.source_kind.map(OrgSourceKind::tag).unwrap_or(0);
             out.push(tag);
+        }
+        if self.version >= ORG_ENVELOPE_VERSION {
+            out.extend_from_slice(&(self.attachments.len() as u32).to_le_bytes());
+            for attachment in &self.attachments {
+                push_bytes(&mut out, attachment.id.as_bytes());
+                push_bytes(&mut out, attachment.mime_type.as_bytes());
+                out.extend_from_slice(&attachment.width.to_le_bytes());
+                out.extend_from_slice(&attachment.height.to_le_bytes());
+                push_bytes(&mut out, &attachment.sha256);
+                push_bytes(&mut out, &attachment.data);
+            }
         }
         out
     }
@@ -203,7 +231,10 @@ impl OrgEnvelope {
     pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self> {
         let mut cur = Cursor { b: bytes, i: 0 };
         let version = cur.take_u16()?;
-        if version != ORG_ENVELOPE_VERSION_V1 && version != ORG_ENVELOPE_VERSION {
+        if version != ORG_ENVELOPE_VERSION_V1
+            && version != ORG_ENVELOPE_VERSION_V2
+            && version != ORG_ENVELOPE_VERSION
+        {
             return Err(AppError::InvalidArg(format!(
                 "unsupported org envelope version {version}"
             )));
@@ -214,10 +245,45 @@ impl OrgEnvelope {
         let markdown = cur.take_str()?;
         let author_hint = cur.take_str()?;
         let created_at = cur.take_str()?;
-        let source_kind = if version == ORG_ENVELOPE_VERSION {
+        let source_kind = if version >= ORG_ENVELOPE_VERSION_V2 {
             Some(OrgSourceKind::from_tag(cur.take_u8()?)?)
         } else {
             None
+        };
+        let attachments = if version >= ORG_ENVELOPE_VERSION {
+            let count = cur.take_u32()? as usize;
+            if count > murmur_protocol::caps::MAX_NOTE_ATTACHMENTS {
+                return Err(AppError::InvalidArg(
+                    "too many org envelope attachments".into(),
+                ));
+            }
+            let mut attachments = Vec::with_capacity(count);
+            let mut prior_id: Option<String> = None;
+            for _ in 0..count {
+                let id = cur.take_str()?;
+                if prior_id.as_ref().is_some_and(|prior| prior >= &id) {
+                    return Err(AppError::InvalidArg(
+                        "org envelope attachment ids are not canonical".into(),
+                    ));
+                }
+                let mime_type = cur.take_str()?;
+                let width = cur.take_u32()?;
+                let height = cur.take_u32()?;
+                let sha256 = cur.take_vec()?;
+                let data = cur.take_vec()?;
+                prior_id = Some(id.clone());
+                attachments.push(ShareAttachment {
+                    id,
+                    mime_type,
+                    width,
+                    height,
+                    sha256,
+                    data,
+                });
+            }
+            attachments
+        } else {
+            Vec::new()
         };
         if cur.i != bytes.len() {
             return Err(AppError::InvalidArg(
@@ -233,6 +299,7 @@ impl OrgEnvelope {
             created_at,
             source_rev,
             source_kind,
+            attachments,
         })
     }
 
@@ -241,6 +308,11 @@ impl OrgEnvelope {
     pub fn content_sha256(&self) -> Vec<u8> {
         Sha256::digest(self.to_canonical_bytes()).to_vec()
     }
+}
+
+fn push_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
+    out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    out.extend_from_slice(bytes);
 }
 
 /// The AAD domain string binding a sealed item to its org + a per-item nonce (spec: `org-item` +
@@ -336,6 +408,15 @@ impl Cursor<'_> {
         String::from_utf8(s.to_vec())
             .map_err(|_| AppError::InvalidArg("org envelope field is not valid UTF-8".into()))
     }
+    fn take_vec(&mut self) -> Result<Vec<u8>> {
+        let len = self.take_u32()? as usize;
+        if len > murmur_protocol::caps::MAX_NOTE_BUNDLE_BYTES {
+            return Err(AppError::InvalidArg(
+                "org envelope byte field too large".into(),
+            ));
+        }
+        Ok(self.take(len)?.to_vec())
+    }
 }
 
 #[cfg(test)]
@@ -357,7 +438,13 @@ mod tests {
     /// Hand-build a byte buffer in the OLD v1 wire layout (no trailing `source_kind` byte) — the exact
     /// shape of an envelope already published to a real org feed before this device shipped v2. Mirrors
     /// the manual byte-construction style of `malformed_canonical_bytes_fail_closed_no_panic`.
-    fn v1_bytes(title: &str, markdown: &str, author_hint: &str, created_at: &str, source_rev: u32) -> Vec<u8> {
+    fn v1_bytes(
+        title: &str,
+        markdown: &str,
+        author_hint: &str,
+        created_at: &str,
+        source_rev: u32,
+    ) -> Vec<u8> {
         let mut out = ORG_ENVELOPE_VERSION_V1.to_le_bytes().to_vec();
         out.push(OrgItemKind::Note.tag());
         out.extend_from_slice(&source_rev.to_le_bytes());
@@ -365,6 +452,20 @@ mod tests {
             out.extend_from_slice(&(field.len() as u32).to_le_bytes());
             out.extend_from_slice(field.as_bytes());
         }
+        out
+    }
+
+    fn v2_bytes(
+        title: &str,
+        markdown: &str,
+        author_hint: &str,
+        created_at: &str,
+        source_rev: u32,
+        source_kind: OrgSourceKind,
+    ) -> Vec<u8> {
+        let mut out = v1_bytes(title, markdown, author_hint, created_at, source_rev);
+        out[0..2].copy_from_slice(&ORG_ENVELOPE_VERSION_V2.to_le_bytes());
+        out.push(source_kind.tag());
         out
     }
 
@@ -413,10 +514,26 @@ mod tests {
         );
     }
 
-    /// A v2 envelope (freshly constructed via `new()`, always required to carry a `source_kind`) round
-    /// trips both source kinds through the canonical byte form.
     #[test]
-    fn v2_canonical_round_trips_both_source_kinds() {
+    fn v2_wire_bytes_still_parse_and_reserialize_byte_identical() {
+        let old = v2_bytes(
+            "Doc",
+            "body",
+            "anna",
+            "2026-07-11T09:00:00Z",
+            7,
+            OrgSourceKind::Document,
+        );
+        let parsed = OrgEnvelope::from_canonical_bytes(&old).unwrap();
+        assert_eq!(parsed.version, ORG_ENVELOPE_VERSION_V2);
+        assert_eq!(parsed.source_kind, Some(OrgSourceKind::Document));
+        assert!(parsed.attachments.is_empty());
+        assert_eq!(parsed.to_canonical_bytes(), old);
+    }
+
+    /// A fresh text-only v2 envelope carries `source_kind` and round-trips both source kinds.
+    #[test]
+    fn text_only_v2_canonical_round_trips_both_source_kinds() {
         for sk in [OrgSourceKind::Meeting, OrgSourceKind::Document] {
             let e = OrgEnvelope::new(
                 OrgItemKind::Note,
@@ -427,7 +544,7 @@ mod tests {
                 1,
                 sk,
             );
-            assert_eq!(e.version, ORG_ENVELOPE_VERSION);
+            assert_eq!(e.version, ORG_ENVELOPE_VERSION_V2);
             let bytes = e.to_canonical_bytes();
             let back = OrgEnvelope::from_canonical_bytes(&bytes).unwrap();
             assert_eq!(back, e);
@@ -435,6 +552,37 @@ mod tests {
             // Stable re-serialization for v2 too.
             assert_eq!(back.to_canonical_bytes(), bytes);
         }
+    }
+
+    #[test]
+    fn empty_attachment_builder_keeps_text_only_v2_compatible() {
+        let e = env().with_attachments(Vec::new());
+        assert_eq!(e.version, ORG_ENVELOPE_VERSION_V2);
+        assert!(e.attachments.is_empty());
+        let back = OrgEnvelope::from_canonical_bytes(&e.to_canonical_bytes()).unwrap();
+        assert_eq!(back, e);
+    }
+
+    #[test]
+    fn v3_attachment_manifest_is_sorted_and_round_trips() {
+        let attachment = |id: &str, byte: u8| ShareAttachment {
+            id: id.into(),
+            mime_type: "image/webp".into(),
+            width: 640,
+            height: 480,
+            sha256: vec![byte; 32],
+            data: vec![byte; 16],
+        };
+        let e = env().with_attachments(vec![
+            attachment("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", 2),
+            attachment("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", 1),
+        ]);
+        assert_eq!(e.version, ORG_ENVELOPE_VERSION);
+        assert_eq!(e.attachments[0].id, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+        let bytes = e.to_canonical_bytes();
+        let back = OrgEnvelope::from_canonical_bytes(&bytes).unwrap();
+        assert_eq!(back, e);
+        assert_eq!(back.to_canonical_bytes(), bytes);
     }
 
     #[test]
@@ -513,14 +661,14 @@ mod tests {
         // boundary) must fail closed, not silently parse as v1.
         let v2_missing_tag = v1_bytes("t", "m", "a", "c", 1); // v1-shaped bytes...
         let mut v2_claimed = v2_missing_tag.clone();
-        v2_claimed[0] = ORG_ENVELOPE_VERSION.to_le_bytes()[0]; // ...but claims version 2
-        v2_claimed[1] = ORG_ENVELOPE_VERSION.to_le_bytes()[1];
+        v2_claimed[0] = ORG_ENVELOPE_VERSION_V2.to_le_bytes()[0]; // ...but claims version 2
+        v2_claimed[1] = ORG_ENVELOPE_VERSION_V2.to_le_bytes()[1];
         assert!(OrgEnvelope::from_canonical_bytes(&v2_claimed).is_err());
 
         // A v2 buffer with an unknown source_kind tag byte fails closed.
         let mut v2_bad_tag = v1_bytes("t", "m", "a", "c", 1);
-        v2_bad_tag[0] = ORG_ENVELOPE_VERSION.to_le_bytes()[0];
-        v2_bad_tag[1] = ORG_ENVELOPE_VERSION.to_le_bytes()[1];
+        v2_bad_tag[0] = ORG_ENVELOPE_VERSION_V2.to_le_bytes()[0];
+        v2_bad_tag[1] = ORG_ENVELOPE_VERSION_V2.to_le_bytes()[1];
         v2_bad_tag.push(0); // 0 is not a valid OrgSourceKind tag
         assert!(OrgEnvelope::from_canonical_bytes(&v2_bad_tag).is_err());
     }
@@ -552,10 +700,10 @@ mod tests {
         assert_eq!(OrgSourceKind::Meeting.as_str(), "meeting");
     }
 
-    /// The seal/open AEAD layer round-trips a v2 envelope end to end (models
-    /// `seal_open_round_trips_and_verifies_before_egress` for the new source_kind field).
+    /// The seal/open AEAD layer round-trips a text-only v2 envelope end to end (models
+    /// `seal_open_round_trips_and_verifies_before_egress` for the source-kind field).
     #[test]
-    fn seal_open_round_trips_v2_envelope_with_source_kind() {
+    fn seal_open_round_trips_text_only_v2_envelope_with_source_kind() {
         let ock = crypto::random_key().unwrap();
         let e = OrgEnvelope::new(
             OrgItemKind::Note,

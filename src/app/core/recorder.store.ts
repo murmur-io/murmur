@@ -117,6 +117,7 @@ export class RecorderStore {
   private unlistenEcho: UnlistenFn | null = null;
   private unlistenStoragePruned: UnlistenFn | null = null;
   private unlistenCapped: UnlistenFn | null = null;
+  private unlistenCaptureFault: UnlistenFn | null = null;
 
   async init(): Promise<void> {
     if (this.unlisten) return;
@@ -152,13 +153,25 @@ export class RecorderStore {
     // the meeting still produces a note (the capped buffer is intact). IDEMPOTENT: only dispatch stop()
     // while we're still in the "recording" stage — a second cap event or a user Stop already in flight
     // has moved the stage past "recording", so this becomes a no-op (no double stop_recording).
+    // Automatic Stop passes `false`: it has no user-awaited editor flush witness, so Rust preserves
+    // the companion row for any late save.
     this.unlistenCapped = await this.ipc.onRecordingCapped((p) => {
       const hours = Math.round(p.limitSeconds / 3600);
       this.toast.info(
         `Maximum recording length (${hours} h) reached — recording stopped; generating your note…`,
       );
       if (this._stage() === "recording") {
-        void this.stop();
+        void this.stop(false);
+      }
+    });
+    // Device/storage/authority faults self-stop capture but retain the exact fsynced prefix. Treat
+    // them like the 4h cap: surface one content-free notice and idempotently finalize immediately.
+    this.unlistenCaptureFault = await this.ipc.onRecordingCaptureFault(() => {
+      this.toast.info(
+        "Audio capture stopped after a device or storage problem — preserving what was recorded and generating your note…",
+      );
+      if (this._stage() === "recording") {
+        void this.stop(false);
       }
     });
     await this.reconcileStage();
@@ -241,7 +254,7 @@ export class RecorderStore {
     }
   }
 
-  async stop(): Promise<void> {
+  async stop(flushCompanion = true): Promise<void> {
     // OPTIMISTIC flip BEFORE the await: `stopRecording` runs the WHOLE pipeline inline (transcribe
     // the entire recording + generate the note), which for a long meeting takes minutes. Without
     // this, `_stage` stays "recording" for that whole time — the Stop button keeps rendering
@@ -261,8 +274,13 @@ export class RecorderStore {
       // editor's durable flush FIRST so the DB carries the user's text before the
       // delete-if-empty predicate ever runs. A no-op when no companion editor is
       // mounted (e.g. Stop from the floating bar window); never rejects.
-      await this.flushService.flush();
-      const res = await this.ipc.stopRecording();
+      // Only an explicitly completed manual flush authorizes empty-stub deletion.
+      // Automatic cap/capture-fault Stop passes `false` without waiting and therefore
+      // preserves the stub; a late editor save can never race a backend delete.
+      const companionFlushCompleted = flushCompanion
+        ? await this.flushService.flush()
+        : false;
+      const res = await this.ipc.stopRecording(companionFlushCompleted);
       // Optimistic preview from the StopResult; then reconcile with the
       // persisted note so the pane shows the canonical provider id / path.
       this._lastNote.set({

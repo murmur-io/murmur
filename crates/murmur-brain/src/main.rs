@@ -1,11 +1,12 @@
-//! `meetnotes-brain` — Murmur's on-device GGUF LLM inference, isolated in a killable helper process.
+//! `murmur-brain` — Murmur's on-device GGUF LLM inference, isolated in a killable helper process.
 //!
 //! WHY this exists: mistralrs holds a multi-GB model resident, has documented drop-leaks (#723/#865)
 //! so the in-process code could never evict, and its generation is not cancellable. Running it in a
 //! child process turns all three into non-problems: the host reclaims ALL of this process's RAM by
 //! simply killing it (idle-unload / per-request timeout / app-quit), and a hung generation is
 //! cancelled by SIGKILL. This binary loads ONE model, answers NDJSON generation requests over
-//! stdin/stdout, and self-exits after an idle window.
+//! stdin/stdout, self-exits after an idle window, and independently exits when its spawning Murmur
+//! parent dies — including while synchronous generation is stuck.
 //!
 //! PROTOCOL: see `brain_ipc.rs`. stdout carries ONLY NDJSON [`brain_ipc::ChildMsg`] lines; ALL
 //! diagnostics go to stderr (stdout purity is load-bearing — a stray log line would corrupt the
@@ -59,9 +60,200 @@ const MODEL_RAM_GUARD_MIN_DISK_BYTES: u64 = 1_500_000_000; // ~1.5 GB
 /// (Lifted verbatim from `reason/mistral.rs`.)
 const GRAMMAR_SCHEMA_MAX_BYTES: usize = 512;
 
-/// Heartbeat cadence while a generation is running — the host's timeout is a liveness check, not a
-/// blind wall-clock guillotine on a healthy long note-gen.
+/// Heartbeat cadence while a generation is running. Beats are progress telemetry only: the host
+/// enforces one immutable per-request wall-clock deadline and never extends it on a heartbeat.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct KEvent {
+    ident: usize,
+    filter: i16,
+    flags: u16,
+    fflags: u32,
+    data: isize,
+    udata: *mut std::ffi::c_void,
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct TimeSpec {
+    tv_sec: i64,
+    tv_nsec: i64,
+}
+
+#[cfg(target_os = "macos")]
+const EVFILT_READ: i16 = -1;
+#[cfg(target_os = "macos")]
+const EV_ADD: u16 = 0x0001;
+#[cfg(target_os = "macos")]
+const EV_ENABLE: u16 = 0x0004;
+#[cfg(target_os = "macos")]
+const EV_CLEAR: u16 = 0x0020;
+#[cfg(target_os = "macos")]
+const EV_EOF: u16 = 0x8000;
+#[cfg(target_os = "macos")]
+const EV_ERROR: u16 = 0x4000;
+
+#[cfg(target_os = "macos")]
+fn stdin_watchdog_event_requires_exit(flags: u16) -> bool {
+    flags & (EV_EOF | EV_ERROR) != 0
+}
+
+#[cfg(target_os = "macos")]
+fn wait_for_parent_pipe_close(fd: i32, timeout_ms: i32) -> std::io::Result<bool> {
+    use std::os::fd::FromRawFd;
+
+    extern "C" {
+        fn kqueue() -> i32;
+        fn kevent(
+            kq: i32,
+            changelist: *const KEvent,
+            nchanges: i32,
+            eventlist: *mut KEvent,
+            nevents: i32,
+            timeout: *const TimeSpec,
+        ) -> i32;
+    }
+
+    // kqueue's EVFILT_READ reports EV_EOF independently of unread bytes. poll(2) cannot provide
+    // that guarantee on macOS: a closed pipe with buffered NDJSON can remain merely readable until
+    // somebody consumes it, which is exactly what this watchdog must never do.
+    // SAFETY: kqueue(2) has no arguments and returns a fresh owned descriptor on success.
+    let queue_fd = unsafe { kqueue() };
+    if queue_fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `queue_fd` is freshly owned and wrapped exactly once so every return path closes it.
+    let _queue = unsafe { std::fs::File::from_raw_fd(queue_fd) };
+
+    let change = KEvent {
+        ident: fd as usize,
+        filter: EVFILT_READ,
+        flags: EV_ADD | EV_ENABLE | EV_CLEAR,
+        fflags: 0,
+        data: 0,
+        udata: std::ptr::null_mut(),
+    };
+    let deadline =
+        (timeout_ms >= 0).then(|| Instant::now() + Duration::from_millis(timeout_ms as u64));
+    let mut register = true;
+
+    loop {
+        let remaining = deadline.map(|limit| limit.saturating_duration_since(Instant::now()));
+        let timeout = remaining.map(|duration| TimeSpec {
+            tv_sec: duration.as_secs() as i64,
+            tv_nsec: i64::from(duration.subsec_nanos()),
+        });
+        let timeout_ptr = timeout
+            .as_ref()
+            .map_or(std::ptr::null(), |value| value as *const TimeSpec);
+        let mut event = KEvent {
+            ident: 0,
+            filter: 0,
+            flags: 0,
+            fflags: 0,
+            data: 0,
+            udata: std::ptr::null_mut(),
+        };
+        // SAFETY: both optional changelist storage and event storage remain valid for the call;
+        // kevent only observes `fd` and never consumes bytes from it. EV_CLEAR prevents buffered
+        // protocol data from causing a busy loop while still delivering the later EV_EOF edge.
+        let count = unsafe {
+            kevent(
+                queue_fd,
+                if register { &change } else { std::ptr::null() },
+                i32::from(register),
+                &mut event,
+                1,
+                timeout_ptr,
+            )
+        };
+        if count > 0 {
+            register = false;
+            if event.flags & EV_ERROR != 0 {
+                return Err(std::io::Error::from_raw_os_error(event.data as i32));
+            }
+            if stdin_watchdog_event_requires_exit(event.flags) {
+                return Ok(true);
+            }
+            if deadline.is_some_and(|limit| Instant::now() >= limit) {
+                return Ok(false);
+            }
+            continue;
+        }
+        if count == 0 {
+            return Ok(false);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(error);
+    }
+}
+
+/// Install the child-owned parent-lifetime guard BEFORE loading the model. The host owns the sole
+/// write end of this child's stdin pipe for exactly the sidecar lifetime. Watching fd 0 with
+/// kqueue/EVFILT_READ never consumes or competes with the NDJSON reader, while EV_EOF is delivered
+/// even when protocol bytes remain buffered. Closing/crashing the host therefore revokes this exact
+/// capability without any pid lookup or reuse race. The dedicated waiter `_exit`s even if mistralrs
+/// is wedged.
+#[cfg(target_os = "macos")]
+fn spawn_parent_watchdog() -> std::io::Result<()> {
+    use std::os::fd::FromRawFd;
+    use std::os::unix::fs::FileTypeExt;
+
+    extern "C" {
+        fn _exit(status: i32) -> !;
+    }
+
+    // `Command::stdin(Stdio::piped())` supplies a FIFO. Accept only that shipped transport: a
+    // terminal, regular file, or arbitrary socket does not by itself prove one connected Murmur
+    // owner's lifetime and could strand the model after the parent dies.
+    // SAFETY: fd 0 belongs to the process. ManuallyDrop borrows it for metadata without closing it;
+    // the blocking NDJSON reader and watchdog continue sharing the same open file description.
+    let stdin = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(0) });
+    let stdin_type = stdin.metadata()?.file_type();
+    if !stdin_type.is_fifo() {
+        return Err(std::io::Error::other(
+            "brain stdin is not the parent-owned pipe",
+        ));
+    }
+
+    // Fail closed before runtime/model allocation if stdin is already invalid or disconnected.
+    if wait_for_parent_pipe_close(0, 0)? {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "brain parent stdin pipe is already closed",
+        ));
+    }
+
+    let waiter = std::thread::Builder::new()
+        .name("brain-parent-watchdog".into())
+        .spawn(move || {
+            let status = match wait_for_parent_pipe_close(0, -1) {
+                Ok(true) => 0,
+                Ok(false) | Err(_) => 1,
+            };
+            // `_exit`, not unwinding/destructors: inference may be wedged while holding arbitrary
+            // model/runtime locks. The OS reclaims the entire address space.
+            // SAFETY: deliberately terminates only THIS helper process.
+            unsafe { _exit(status) }
+        })?;
+
+    // Dropping the JoinHandle detaches the process-lifetime watchdog. HUP state is persistent, so a
+    // parent close between spawn and the first `poll` is observed immediately; there is no arm race.
+    drop(waiter);
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn spawn_parent_watchdog() -> std::io::Result<()> {
+    Err(std::io::Error::other(
+        "brain parent-pipe watchdog is unsupported on this platform",
+    ))
+}
 
 // ---------------------------------------------------------------------------------------------------
 // RAM self-check helpers — PURE, lifted verbatim from `reason/mistral.rs` (P0.3 refuse-don't-OOM).
@@ -401,6 +593,18 @@ fn main() {
     let args = parse_args();
     let out = Out::new();
 
+    // Install this BEFORE the runtime/model load: a parent crash during a slow Metal/model startup
+    // must not strand the multi-GB helper any more than a crash during generation may.
+    if let Err(error) = spawn_parent_watchdog() {
+        tracing::error!(target: "brain", %error, "parent watchdog unavailable");
+        out.emit(&ChildMsg::Error {
+            id: 0,
+            kind: ErrorKind::Unavailable,
+            message: "brain parent watchdog unavailable".into(),
+        });
+        std::process::exit(1);
+    }
+
     // The child owns ONE process-wide multi-thread runtime driving every mistralrs async op (load +
     // generations). The stdin loop below stays BLOCKING; async lives entirely under `block_on`.
     let rt = match tokio::runtime::Builder::new_multi_thread()
@@ -445,7 +649,8 @@ fn main() {
     tracing::info!(target: "brain", "model loaded; ready");
     out.emit(&ChildMsg::Ready { model_id });
 
-    // Idle self-exit belt (orphan safety) + heartbeat driver both watch shared atomics.
+    // Idle self-exit belt (resident-RAM hygiene) + heartbeat driver both watch shared atomics. The
+    // independent parent watchdog above owns orphan safety even while generation is in flight.
     // - `last_activity_ms`: monotonic-ish activity timestamp, reset on every received request.
     // - `in_generation`: true WHILE a generation runs — guards BOTH the idle-exit (never exit
     //   mid-generation) and the heartbeat thread (only beat while generating).
@@ -519,8 +724,8 @@ fn main() {
 }
 
 /// Spawn the heartbeat thread: while `in_generation`, emit `ChildMsg::Heartbeat{id}` every
-/// ~`HEARTBEAT_INTERVAL` so the host treats its timeout as a liveness check, not a wall-clock
-/// guillotine on a healthy long note-gen.
+/// ~`HEARTBEAT_INTERVAL` as progress telemetry. The host deliberately does not extend the request's
+/// immutable hard deadline when it receives one.
 fn spawn_heartbeat(out: Out, in_generation: Arc<AtomicBool>, current_id: Arc<AtomicU64>) {
     std::thread::Builder::new()
         .name("brain-heartbeat".into())
@@ -534,9 +739,10 @@ fn spawn_heartbeat(out: Out, in_generation: Arc<AtomicBool>, current_id: Arc<Ato
         .ok(); // a heartbeat-thread spawn failure is non-fatal (the host still has its own timeout).
 }
 
-/// Spawn the idle self-exit watchdog (orphan-safety belt; the host is the authoritative killer). After
-/// `max_idle_seconds` with no activity AND no generation in flight, `exit(0)`. The timer is reset by the
-/// main loop on every received line; this thread only READS it. It MUST NOT exit while `in_generation`.
+/// Spawn the idle self-exit watchdog (resident-RAM hygiene; the host is the authoritative killer).
+/// After `max_idle_seconds` with no activity AND no generation in flight, `exit(0)`. The timer is
+/// reset by the main loop on every received line; this thread only READS it. It MUST NOT exit while
+/// `in_generation`; parent-pipe HUP independently handles an orphan during generation.
 fn spawn_idle_watchdog(
     max_idle_seconds: u64,
     start: Instant,
@@ -564,7 +770,7 @@ fn spawn_idle_watchdog(
                     tracing::info!(
                         target: "brain",
                         idle_s = max_idle_seconds,
-                        "idle self-exit (orphan-safety belt)"
+                        "idle self-exit (resident-RAM hygiene belt)"
                     );
                     std::process::exit(0);
                 }
@@ -578,6 +784,57 @@ mod tests {
     use super::*;
 
     const GB: u64 = 1_073_741_824;
+
+    #[test]
+    fn parent_pipe_watchdog_exits_only_on_terminal_kqueue_events() {
+        assert!(stdin_watchdog_event_requires_exit(EV_EOF));
+        assert!(stdin_watchdog_event_requires_exit(EV_ERROR));
+        assert!(stdin_watchdog_event_requires_exit(EV_EOF | EV_ERROR));
+        assert!(!stdin_watchdog_event_requires_exit(0));
+        assert!(!stdin_watchdog_event_requires_exit(EV_CLEAR));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn parent_pipe_watch_ignores_protocol_bytes_then_observes_writer_close() {
+        use std::fs::File;
+        use std::io::Write;
+        use std::os::fd::{AsRawFd, FromRawFd};
+
+        extern "C" {
+            fn pipe(fds: *mut i32) -> i32;
+        }
+
+        // Match the shipped `Command::stdin(Stdio::piped())` transport exactly. A UnixStream is a
+        // subtly wrong fixture on macOS: when unread bytes remain, a socket peer close may surface
+        // as readable EOF rather than POLLHUP, while an anonymous pipe reports the terminal event
+        // independently of POLLIN as the watchdog relies on.
+        let mut fds = [-1_i32; 2];
+        // SAFETY: `fds` is valid writable storage for both descriptors returned by pipe(2).
+        assert_eq!(
+            unsafe { pipe(fds.as_mut_ptr()) },
+            0,
+            "create watchdog fixture pipe"
+        );
+        // SAFETY: pipe(2) returned two fresh owned descriptors; each is wrapped exactly once.
+        let reader = unsafe { File::from_raw_fd(fds[0]) };
+        let mut sole_writer = unsafe { File::from_raw_fd(fds[1]) };
+
+        sole_writer
+            .write_all(b"protocol bytes stay reader-owned\n")
+            .expect("write protocol fixture");
+        assert!(
+            !wait_for_parent_pipe_close(reader.as_raw_fd(), 0).expect("probe open parent pipe"),
+            "unread protocol data must not wake the events=0 watchdog"
+        );
+
+        drop(sole_writer);
+        assert!(
+            wait_for_parent_pipe_close(reader.as_raw_fd(), 1_000)
+                .expect("wait for parent-pipe close"),
+            "closing the sole writer must surface HUP without consuming protocol bytes"
+        );
+    }
 
     /// The pure RAM decision: a healthy machine permits a big model; a pressured one refuses it.
     #[test]

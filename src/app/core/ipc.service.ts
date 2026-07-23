@@ -62,6 +62,8 @@ import type {
   ModelDownloadProgress,
   NerDownloadProgress,
   NoteDto,
+  NoteAttachmentDto,
+  NoteAttachmentOwnerKind,
   NoteSummary,
   NoteDoc,
   NoteFolder,
@@ -95,6 +97,7 @@ import type {
   StatusPayload,
   EchoSuppressedPayload,
   RecordingCappedPayload,
+  RecordingCaptureFaultPayload,
   RecordingStatus,
   StopResult,
   TopicThread,
@@ -158,6 +161,8 @@ export const EVENT_NER_DOWNLOAD = "murmur://ner-download";
 export const EVENT_STORAGE_PRUNED = "murmur://storage-pruned";
 // Recording hit the 4h hard TIME cap and self-stopped (distinct from the byte-based prune).
 export const EVENT_RECORDING_CAPPED = "murmur://recording-capped";
+export const EVENT_RECORDING_CAPTURE_FAULT =
+  "murmur://recording-capture-fault";
 // Brain v2 L5 — a scheduled brief was STAGED (propose-accept; run id + label + size only).
 export const EVENT_BRIEF_PROPOSED = "murmur://brief-proposed";
 // Vault Audit — the audit state changed (a run finished / findings purged by a seal or delete).
@@ -198,8 +203,8 @@ export class IpcService {
     return invoke<StartResult>("start_recording");
   }
 
-  stopRecording(): Promise<StopResult> {
-    return invoke<StopResult>("stop_recording");
+  stopRecording(companionFlushCompleted?: boolean): Promise<StopResult> {
+    return invoke<StopResult>("stop_recording", { companionFlushCompleted });
   }
 
   recordingLevel(): Promise<number> {
@@ -2301,6 +2306,47 @@ export class IpcService {
     return invoke<number>("save_note_text", { id, title, markdown });
   }
 
+  /** Store one locally-normalized WebP attachment under a gated content owner. */
+  addNoteAttachment(
+    ownerKind: NoteAttachmentOwnerKind,
+    ownerId: string,
+    fileName: string,
+    mimeType: string,
+    dataBase64: string,
+  ): Promise<NoteAttachmentDto> {
+    return invoke<NoteAttachmentDto>("add_note_attachment", {
+      ownerKind,
+      ownerId,
+      fileName,
+      mimeType,
+      dataBase64,
+    });
+  }
+
+  /** List image attachments for one unlocked/readable owner. */
+  listNoteAttachments(
+    ownerKind: NoteAttachmentOwnerKind,
+    ownerId: string,
+  ): Promise<NoteAttachmentDto[]> {
+    return invoke<NoteAttachmentDto[]>("list_note_attachments", {
+      ownerKind,
+      ownerId,
+    });
+  }
+
+  /** Delete one attachment after its markdown reference has been removed. */
+  deleteNoteAttachment(
+    ownerKind: NoteAttachmentOwnerKind,
+    ownerId: string,
+    attachmentId: string,
+  ): Promise<void> {
+    return invoke<void>("delete_note_attachment", {
+      ownerKind,
+      ownerId,
+      attachmentId,
+    });
+  }
+
   /**
    * List notes in `folderId` (null ⇒ all VISIBLE notes across note-folders). GATED
    * IN THE QUERY: a sealed-and-not-session-unlocked note is masked (title
@@ -2525,6 +2571,16 @@ export class IpcService {
   ): Promise<UnlistenFn> {
     return listen<RecordingCappedPayload>(EVENT_RECORDING_CAPPED, (e) =>
       cb(e.payload),
+    );
+  }
+
+  /** A terminal capture fault occurred; the exact durable prefix can still be finalized. */
+  onRecordingCaptureFault(
+    cb: (p: RecordingCaptureFaultPayload) => void,
+  ): Promise<UnlistenFn> {
+    return listen<RecordingCaptureFaultPayload>(
+      EVENT_RECORDING_CAPTURE_FAULT,
+      (event) => cb(event.payload),
     );
   }
 

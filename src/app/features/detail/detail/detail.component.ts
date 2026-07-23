@@ -30,6 +30,7 @@ import type {
   MeetingDetail,
   MeetingOrgShareInfo,
   MeetingTimeline,
+  NoteAttachmentDto,
   Segment,
   SpeakerSuggestion,
 } from "../../../core/models";
@@ -38,6 +39,7 @@ import {
   type FolderExposure,
 } from "../../../services/folders.service";
 import { ToastService } from "../../../services/toast.service";
+import { referencedNoteAttachments } from "../../../services/note-attachment.service";
 import { LockBadgeComponent } from "../../folders/lock-badge/lock-badge.component";
 import { AudioPanelComponent } from "../audio-panel/audio-panel.component";
 import { MeetingChatComponent } from "../meeting-chat/meeting-chat.component";
@@ -208,6 +210,12 @@ export class DetailComponent implements OnInit {
   readonly saveError = signal("");
   /** Drives the brief "Saved" confirmation badge after a successful write. */
   readonly justSaved = signal(false);
+  /** Gated image DTOs for this meeting note; synchronously cleared on relock. */
+  readonly attachments = signal<NoteAttachmentDto[]>([]);
+  readonly meetingAttachmentBusy = signal(false);
+  private attachmentSeq = 0;
+  /** Exact attachment set present when the current edit session began. */
+  private editAttachmentSnapshot: NoteAttachmentDto[] = [];
 
   /** Tracked so we can cancel the pending "Saved" reset on destroy (no leaks). */
   private savedResetTimer: ReturnType<typeof setTimeout> | null = null;
@@ -301,6 +309,63 @@ export class DetailComponent implements OnInit {
     const md = this.detail()?.note?.markdown;
     return md ? this.parseNote(md) : null;
   });
+  /** Images actually referenced by the current canonical meeting-note markdown. */
+  readonly referencedAttachments = computed(() =>
+    referencedNoteAttachments(
+      this.detail()?.note?.markdown ?? "",
+      this.attachments(),
+    ),
+  );
+
+  /** Load attachment bytes only for an unlocked meeting with a note. */
+  private readonly _loadAttachments = effect(() => {
+    const id = this.detail()?.meeting.id ?? null;
+    const locked = this.locked();
+    const hasNote = this.detail()?.note !== null;
+    const seq = ++this.attachmentSeq;
+    if (!id || locked || !hasNote) {
+      this.attachments.set([]);
+      return;
+    }
+    void this.fetchAttachments(id, seq);
+  });
+
+  private async fetchAttachments(id: string, seq: number): Promise<void> {
+    try {
+      const rows = await this.ipc.listNoteAttachments("meeting", id);
+      if (seq !== this.attachmentSeq || this.locked()) {
+        return;
+      }
+      this.attachments.set(Array.isArray(rows) ? rows : []);
+    } catch {
+      if (seq === this.attachmentSeq) {
+        this.attachments.set([]);
+      }
+    }
+  }
+
+  onMeetingAttachmentAdded(attachment: NoteAttachmentDto): void {
+    if (
+      this.locked() ||
+      attachment.ownerKind !== "meeting" ||
+      attachment.ownerId !== this.detail()?.meeting.id
+    ) {
+      return;
+    }
+    this.attachments.update((rows) =>
+      rows.some((row) => row.id === attachment.id)
+        ? rows
+        : [...rows, attachment],
+    );
+  }
+
+  onDetailTabChange(tab: DetailTab): void {
+    if (this.meetingAttachmentBusy()) {
+      this.toast.info("Finish adding the image before switching tabs.");
+      return;
+    }
+    this.activeTab.set(tab);
+  }
 
   /**
    * The persisted in-meeting assistant Q&A for this meeting, citations parsed
@@ -723,6 +788,8 @@ export class DetailComponent implements OnInit {
     this.graph.set(null);
     this.editing.set(false);
     this.draft.set("");
+    this.attachments.set([]);
+    this.meetingAttachmentBusy.set(false);
     // Close the Ask drawer on a lock transition so it doesn't reappear on a
     // later unlock (the `@if (askDrawerOpen() && !locked())` guard already hides
     // it while locked; this makes a re-summon deliberate, matching default-closed).
@@ -922,6 +989,8 @@ export class DetailComponent implements OnInit {
     this.tags.set([]);
     this.graph.set(null);
     this.graphError.set("");
+    this.attachments.set([]);
+    this.meetingAttachmentBusy.set(false);
     this.editing.set(false);
     this.renaming.set(false);
     this.moveOpen.set(false);
@@ -1230,8 +1299,9 @@ export class DetailComponent implements OnInit {
   private async deriveTimeline(id: string): Promise<void> {
     try {
       const tl = await this.ipc.generateTimeline(id);
-      if (this.detail()?.meeting.id !== id) {
-        return; // stale — the user moved on
+      const current = this.detail();
+      if (current?.meeting.id !== id || current.locked) {
+        return; // stale — the user moved on or screen-share/manual relock revoked the view
       }
       // TERMINAL-STATE guard (#234): a falsy/empty generate_timeline result must NOT leave
       // `timeline==null && !error && !needsGeneration` — that combination re-fired the Audio-tab
@@ -1476,6 +1546,7 @@ export class DetailComponent implements OnInit {
   /** Enter edit mode, seeding the draft with the note's current raw markdown. */
   startEdit(): void {
     this.draft.set(this.detail()?.note?.markdown ?? "");
+    this.editAttachmentSnapshot = [...this.attachments()];
     this.saveError.set("");
     this.editing.set(true);
   }
@@ -1485,10 +1556,53 @@ export class DetailComponent implements OnInit {
     this.draft.set((event.target as HTMLTextAreaElement).value);
   }
 
-  /** Discard the working copy and leave edit mode unchanged. */
-  cancelEdit(): void {
-    this.editing.set(false);
+  /** Discard the working copy and delete images imported only for this edit. */
+  async cancelEdit(): Promise<void> {
+    const meetingId = this.detail()?.meeting.id;
+    if (!meetingId || this.saving() || this.meetingAttachmentBusy()) {
+      return;
+    }
+    const originalIds = new Set(this.editAttachmentSnapshot.map((row) => row.id));
+    const added = this.attachments().filter((row) => !originalIds.has(row.id));
+    this.saving.set(true);
     this.saveError.set("");
+    try {
+      const results = await Promise.allSettled(
+        added.map((row) =>
+          this.ipc.deleteNoteAttachment("meeting", meetingId, row.id),
+        ),
+      );
+      const failed = added.filter((_, index) => results[index].status === "rejected");
+      if (failed.length > 0) {
+        const failedIds = new Set(failed.map((row) => row.id));
+        const removed = added.filter((row) => !failedIds.has(row.id));
+        let reconciledDraft = this.draft();
+        for (const row of removed) {
+          reconciledDraft = this.removeAttachmentMarker(reconciledDraft, row.id);
+        }
+        this.draft.set(reconciledDraft);
+        this.attachments.set([...this.editAttachmentSnapshot, ...failed]);
+        this.saveError.set(
+          `Couldn’t discard ${failed.length} added image${failed.length === 1 ? "" : "s"}. Retry Cancel.`,
+        );
+        return;
+      }
+      this.attachments.set([...this.editAttachmentSnapshot]);
+      this.draft.set(this.detail()?.note?.markdown ?? "");
+      this.editing.set(false);
+    } catch (e) {
+      this.saveError.set("Couldn’t discard added images: " + String(e));
+    } finally {
+      this.saving.set(false);
+    }
+  }
+
+  private removeAttachmentMarker(markdown: string, attachmentId: string): string {
+    const marker = new RegExp(
+      `!\\[[^\\]\\r\\n]*\\]\\(murmur-attachment:\\/\\/${attachmentId}\\)`,
+      "gi",
+    );
+    return markdown.replace(marker, "").replace(/\n{3,}/g, "\n\n");
   }
 
   /**
@@ -1500,7 +1614,11 @@ export class DetailComponent implements OnInit {
    */
   async saveNote(): Promise<void> {
     const meetingId = this.detail()?.meeting.id;
-    if (!meetingId) {
+    if (
+      !meetingId ||
+      this.meetingAttachmentBusy() ||
+      this.draft().includes("murmur-pending://")
+    ) {
       return;
     }
     this.saving.set(true);
@@ -1508,9 +1626,22 @@ export class DetailComponent implements OnInit {
     try {
       const updated = await this.ipc.updateNote(meetingId, this.draft());
       const current = this.detail();
-      if (current) {
-        this.detail.set({ ...current, note: updated });
+      if (!current || current.meeting.id !== meetingId || current.locked) {
+        return; // a late IPC response must never repopulate content after relock/navigation
       }
+      this.detail.set({ ...current, note: updated });
+      const referenced = new Set(
+        Array.from(
+          updated.markdown.matchAll(
+            /murmur-attachment:\/\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/gi,
+          ),
+          (match) => match[1].toLowerCase(),
+        ),
+      );
+      this.attachments.update((rows) =>
+        rows.filter((row) => referenced.has(row.id.toLowerCase())),
+      );
+      this.editAttachmentSnapshot = [...this.attachments()];
       this.editing.set(false);
       this.flashSaved();
     } catch (e) {

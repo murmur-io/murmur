@@ -1,0 +1,391 @@
+#!/usr/bin/env python3
+"""Run one agent-owned command inside Murmur's repo-global resource lane.
+
+The lane is a kernel flock stored in git's common directory, so linked worktrees
+serialize with one another and a killed supervisor cannot leave a stale lock.
+The command runs in a fresh process group that this supervisor alone owns.
+"""
+
+import argparse
+import atexit
+import errno
+import fcntl
+import json
+import math
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import time
+
+
+TIMEOUT_EXIT = 124
+SUPERVISOR_EXIT = 125
+NOT_EXECUTABLE_EXIT = 126
+NOT_FOUND_EXIT = 127
+POLL_SECONDS = 0.02
+KILL_REAP_SECONDS = 2.0
+
+
+def positive_seconds(value):
+    try:
+        parsed = float(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be a number") from error
+    if parsed <= 0 or not math.isfinite(parsed):
+        raise argparse.ArgumentTypeError("must be finite and greater than zero")
+    return parsed
+
+
+def parse_args(argv):
+    parser = argparse.ArgumentParser(
+        description="serialize and supervise resource-heavy Murmur agent commands"
+    )
+    parser.add_argument(
+        "--deadline-seconds",
+        type=positive_seconds,
+        default=os.environ.get("MURMUR_AGENT_DEADLINE_SECONDS", "7200"),
+        help="one aggregate deadline for lane wait plus command runtime (default: 7200)",
+    )
+    parser.add_argument(
+        "--term-grace-seconds",
+        type=positive_seconds,
+        default=os.environ.get("MURMUR_AGENT_TERM_GRACE_SECONDS", "5"),
+        help="bounded TERM grace before KILL during teardown (default: 5)",
+    )
+    parser.add_argument(
+        "--chdir",
+        metavar="PATH",
+        help="run the child in PATH after resolving the repo-global lane",
+    )
+    parser.add_argument("command", nargs=argparse.REMAINDER)
+    args = parser.parse_args(argv)
+    if args.command[:1] == ["--"]:
+        args.command = args.command[1:]
+    if not args.command:
+        parser.error("a command is required after --")
+    return args
+
+
+def git_common_dir(start_dir):
+    result = subprocess.run(
+        ["git", "rev-parse", "--git-common-dir"],
+        cwd=str(start_dir),
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        raise RuntimeError("current directory is not inside a git worktree")
+    common = Path(result.stdout.strip()).expanduser()
+    if not common.is_absolute():
+        common = start_dir / common
+    return common.resolve()
+
+
+def lane_file_path(start_dir):
+    return git_common_dir(start_dir) / "murmur-agent-resource-lane.lock"
+
+
+def exit_code(returncode):
+    if returncode < 0:
+        return 128 + abs(returncode)
+    return returncode
+
+
+class ProcessGroupSupervisor:
+    def __init__(self, term_grace_seconds, selftest_guardian_release=None):
+        self.term_grace_seconds = term_grace_seconds
+        self.child = None
+        self.pgid = None
+        self.signal_received = None
+        self.teardown_attempted = False
+        self.selftest_guardian_release = selftest_guardian_release
+        self.selftest_guardian_pending = False
+
+    def note_signal(self, signum, _frame):
+        if self.signal_received is None:
+            self.signal_received = signum
+
+    def group_exists(self):
+        if self.pgid is None:
+            return False
+        try:
+            os.killpg(self.pgid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+
+    def send_group(self, signum):
+        if self.pgid is None:
+            return
+        try:
+            os.killpg(self.pgid, signum)
+        except ProcessLookupError:
+            pass
+
+    def reap_leader(self):
+        if self.child is not None:
+            self.child.poll()
+
+    def wait_for_group_exit(self, until):
+        while time.monotonic() < until:
+            self.reap_leader()
+            if not self.group_exists():
+                return True
+            time.sleep(POLL_SECONDS)
+        self.reap_leader()
+        return not self.group_exists()
+
+    def teardown(self):
+        if self.teardown_attempted or self.pgid is None:
+            if self.selftest_guardian_pending:
+                return False
+            return not self.group_exists()
+
+        self.teardown_attempted = True
+
+        self.send_group(signal.SIGTERM)
+        term_until = time.monotonic() + self.term_grace_seconds
+        gone = self.wait_for_group_exit(term_until)
+        if not gone:
+            self.send_group(signal.SIGKILL)
+            gone = self.wait_for_group_exit(time.monotonic() + KILL_REAP_SECONDS)
+
+        self.reap_leader()
+        if gone and self.selftest_guardian_release is not None:
+            # Test-only seam: report one synthetic post-KILL survivor so the
+            # guardian flock handoff can be exercised with an ordinary killable
+            # process. The hook denies this env name in agent-issued commands.
+            self.selftest_guardian_pending = True
+            return False
+        if gone:
+            self.pgid = None
+        return gone
+
+    def emergency_cleanup(self):
+        if self.pgid is not None:
+            return self.teardown()
+        return True
+
+    def run(self, command, cwd, env, absolute_deadline):
+        if self.signal_received is not None:
+            return 128 + self.signal_received
+        if time.monotonic() >= absolute_deadline:
+            return TIMEOUT_EXIT
+        try:
+            self.child = subprocess.Popen(
+                command,
+                cwd=str(cwd),
+                env=env,
+                start_new_session=True,
+            )
+        except FileNotFoundError:
+            print("agent-resource-run: command not found: {}".format(command[0]), file=sys.stderr)
+            return NOT_FOUND_EXIT
+        except PermissionError:
+            print("agent-resource-run: command is not executable: {}".format(command[0]), file=sys.stderr)
+            return NOT_EXECUTABLE_EXIT
+
+        self.pgid = self.child.pid
+        while True:
+            if self.signal_received is not None:
+                signum = self.signal_received
+                if not self.teardown():
+                    print("agent-resource-run: process group survived bounded teardown", file=sys.stderr)
+                    return SUPERVISOR_EXIT
+                return 128 + signum
+
+            returncode = self.child.poll()
+            if returncode is not None:
+                # A shell can exit 0 while a background grandchild remains. EXIT is
+                # therefore also a teardown path, not permission to orphan the group.
+                if not self.teardown():
+                    print("agent-resource-run: background process group survived teardown", file=sys.stderr)
+                    return SUPERVISOR_EXIT
+                return exit_code(returncode)
+
+            remaining = absolute_deadline - time.monotonic()
+            if remaining <= 0:
+                print("agent-resource-run: aggregate deadline exceeded", file=sys.stderr)
+                if not self.teardown():
+                    print("agent-resource-run: process group survived bounded teardown", file=sys.stderr)
+                    return SUPERVISOR_EXIT
+                return TIMEOUT_EXIT
+            time.sleep(min(POLL_SECONDS, remaining))
+
+
+def acquire_lane(lane_handle, lane_path, supervisor, absolute_deadline):
+    while True:
+        if supervisor.signal_received is not None:
+            return False
+        try:
+            fcntl.flock(lane_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            lane_handle.seek(0)
+            lane_handle.truncate()
+            json.dump(
+                {
+                    "pid": os.getpid(),
+                    "cwd": str(Path.cwd()),
+                    "acquired_epoch": int(time.time()),
+                },
+                lane_handle,
+                sort_keys=True,
+            )
+            lane_handle.write("\n")
+            lane_handle.flush()
+            os.fsync(lane_handle.fileno())
+            return True
+        except OSError as error:
+            if error.errno not in (errno.EACCES, errno.EAGAIN):
+                raise
+
+        remaining = absolute_deadline - time.monotonic()
+        if remaining <= 0:
+            owner = ""
+            try:
+                lane_handle.seek(0)
+                owner = lane_handle.read().strip()
+            except OSError:
+                pass
+            suffix = " (owner: {})".format(owner) if owner else ""
+            print(
+                "agent-resource-run: aggregate deadline exceeded waiting for lane {}{}".format(
+                    lane_path, suffix
+                ),
+                file=sys.stderr,
+            )
+            return False
+        time.sleep(min(POLL_SECONDS, remaining))
+
+
+def survivor_lock_guard(supervisor, lane_fd):
+    """Keep the flock held out-of-band until a post-KILL group finally disappears."""
+    try:
+        guardian_pid = os.fork()
+    except OSError as error:
+        # Fork failure must not fail open. Keep this supervisor and its lane alive,
+        # retrying only the exact owned process group until it is actually gone.
+        print(
+            "agent-resource-run: could not fork survivor lock guard ({}); holding lane".format(
+                error
+            ),
+            file=sys.stderr,
+        )
+        while supervisor.group_exists():
+            supervisor.send_group(signal.SIGKILL)
+            time.sleep(0.25)
+        return 0
+
+    if guardian_pid != 0:
+        return guardian_pid
+
+    try:
+        os.setsid()
+    except OSError:
+        pass
+    for signum in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
+        signal.signal(signum, signal.SIG_IGN)
+
+    # Do not keep the invoking tool's stdout/stderr pipes open after its bounded
+    # supervisor returns. Preserve only the inherited locked file description.
+    devnull = os.open(os.devnull, os.O_RDWR)
+    for target in (0, 1, 2):
+        os.dup2(devnull, target)
+    if devnull != lane_fd and devnull > 2:
+        os.close(devnull)
+    try:
+        open_max = int(os.sysconf("SC_OPEN_MAX"))
+    except (OSError, ValueError):
+        open_max = 1024
+    os.closerange(3, lane_fd)
+    os.closerange(lane_fd + 1, open_max)
+
+    if supervisor.selftest_guardian_release is not None:
+        while not supervisor.selftest_guardian_release.exists():
+            time.sleep(POLL_SECONDS)
+    while supervisor.group_exists():
+        supervisor.send_group(signal.SIGKILL)
+        time.sleep(0.25)
+    os.close(lane_fd)
+    os._exit(0)
+
+
+def main(argv):
+    started = time.monotonic()
+    args = parse_args(argv)
+    absolute_deadline = started + args.deadline_seconds
+    invocation_dir = Path.cwd().resolve()
+    child_dir = (invocation_dir / args.chdir).resolve() if args.chdir else invocation_dir
+    if not child_dir.is_dir():
+        print("agent-resource-run: --chdir is not a directory: {}".format(child_dir), file=sys.stderr)
+        return NOT_FOUND_EXIT
+
+    try:
+        lane_path = lane_file_path(invocation_dir)
+    except RuntimeError as error:
+        print("agent-resource-run: {}".format(error), file=sys.stderr)
+        return SUPERVISOR_EXIT
+    lane_path.parent.mkdir(parents=True, exist_ok=True)
+
+    selftest_release = os.environ.get("MURMUR_AGENT_SELFTEST_GUARDIAN_RELEASE")
+    selftest_release_path = Path(selftest_release).resolve() if selftest_release else None
+    supervisor = ProcessGroupSupervisor(args.term_grace_seconds, selftest_release_path)
+    atexit.register(supervisor.emergency_cleanup)
+    signal.signal(signal.SIGINT, supervisor.note_signal)
+    signal.signal(signal.SIGTERM, supervisor.note_signal)
+
+    env = os.environ.copy()
+    env.pop("MURMUR_AGENT_SELFTEST_GUARDIAN_RELEASE", None)
+    env.setdefault("CARGO_BUILD_JOBS", "2")
+    env.setdefault("RUST_TEST_THREADS", "1")
+    env.setdefault("RAYON_NUM_THREADS", "2")
+    env.setdefault("OMP_NUM_THREADS", "1")
+    env.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+
+    try:
+        with lane_path.open("a+", encoding="utf-8") as lane_handle:
+            if not acquire_lane(lane_handle, lane_path, supervisor, absolute_deadline):
+                if supervisor.signal_received is not None:
+                    return 128 + supervisor.signal_received
+                return TIMEOUT_EXIT
+            try:
+                return supervisor.run(args.command, child_dir, env, absolute_deadline)
+            finally:
+                cleaned = supervisor.emergency_cleanup()
+                if cleaned:
+                    fcntl.flock(lane_handle.fileno(), fcntl.LOCK_UN)
+                else:
+                    guardian_pid = survivor_lock_guard(supervisor, lane_handle.fileno())
+                    if guardian_pid:
+                        lane_handle.seek(0)
+                        lane_handle.truncate()
+                        json.dump(
+                            {
+                                "guardian_pid": guardian_pid,
+                                "survivor_pgid": supervisor.pgid,
+                                "handoff_epoch": int(time.time()),
+                            },
+                            lane_handle,
+                            sort_keys=True,
+                        )
+                        lane_handle.write("\n")
+                        lane_handle.flush()
+                        os.fsync(lane_handle.fileno())
+                        print(
+                            "agent-resource-run: survivor group {} still owns the lane via guardian {}".format(
+                                supervisor.pgid, guardian_pid
+                            ),
+                            file=sys.stderr,
+                        )
+    except OSError as error:
+        print("agent-resource-run: supervisor error: {}".format(error), file=sys.stderr)
+        return SUPERVISOR_EXIT
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

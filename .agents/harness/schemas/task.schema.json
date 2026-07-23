@@ -52,7 +52,7 @@
     "risk_flags": {
       "type": "array",
       "uniqueItems": true,
-      "items": { "enum": ["lock", "egress", "protocol", "runtime", "ui", "release"] }
+      "items": { "enum": ["lock", "egress", "protocol", "runtime", "ui", "performance", "release"] }
     },
     "writer": { "enum": ["codex", "claude", "fake"] },
     "reviewer": { "enum": ["codex", "claude", "fake"] },

@@ -637,7 +637,8 @@ impl Db {
         // co_occurrence — entity↔entity (already visibility-gated; re-check both endpoints against the
         // capped node set so an edge to a >500-cap-dropped entity is also dropped).
         for ge in self.graph_edges_visible(unlocked)? {
-            if visible.contains(&(ent, ge.source.clone())) && visible.contains(&(ent, ge.target.clone()))
+            if visible.contains(&(ent, ge.source.clone()))
+                && visible.contains(&(ent, ge.target.clone()))
             {
                 bump(&mut degree, ent, &ge.source);
                 bump(&mut degree, ent, &ge.target);
@@ -661,7 +662,8 @@ impl Db {
         // an edge dropped because its endpoint fell to a NODE cap (that is the node disclosure's job).
         let edges_truncated = mentions_truncated || links_truncated;
         for (entity_id, meeting_id, weight) in mention_edges {
-            if visible.contains(&(ent, entity_id.clone())) && visible.contains(&(mtg, meeting_id.clone()))
+            if visible.contains(&(ent, entity_id.clone()))
+                && visible.contains(&(mtg, meeting_id.clone()))
             {
                 bump(&mut degree, ent, &entity_id);
                 bump(&mut degree, mtg, &meeting_id);

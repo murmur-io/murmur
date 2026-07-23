@@ -28,6 +28,30 @@ use crate::error::Result;
 use crate::storage::db::{fts_match_query, map_err, Db};
 use crate::storage::models::OrgChunkHit;
 
+/// Chunk/vector material for one org item, prepared before entering the short feed-commit
+/// transaction. Keeping model inference on this side of the transaction is load-bearing: recording
+/// admission may invalidate the work, while a committed feed action and its cursor must remain one
+/// indivisible SQLite mutation.
+pub(crate) struct PreparedOrgItemIndex {
+    chunks: Vec<String>,
+    vector_blobs: Option<Vec<Vec<u8>>>,
+}
+
+/// One live org item's existing chunk rows, loaded for a model-switch reindex. The keyset iterator
+/// returns exactly one item at a time so a large local replica never becomes one plaintext RAM
+/// buffer. Ordered chunk ids plus the canonical item version/hash form the optimistic concurrency
+/// token for the vector-only commit (SQLite rowids may be reused after a clean replace, so ids alone
+/// are insufficient).
+pub(crate) struct OrgItemVectorBatch {
+    pub(crate) item_id: String,
+    pub(crate) chunk_ids: Vec<i64>,
+    pub(crate) texts: Vec<String>,
+    seq: u64,
+    rev: u32,
+    generation: u32,
+    content_sha256: Option<Vec<u8>>,
+}
+
 impl Db {
     /// Upsert the locally-cached membership of an org (create/status). Preserves an existing row's
     /// local `consented` flag, `last_seq` cursor, AND `context_enabled` toggle (an incoming status
@@ -92,9 +116,7 @@ impl Db {
                    FROM org_state ORDER BY joined_at ASC",
             )
             .map_err(map_err)?;
-        let rows = stmt
-            .query_map([], Self::map_org_state)
-            .map_err(map_err)?;
+        let rows = stmt.query_map([], Self::map_org_state).map_err(map_err)?;
         let mut out = Vec::new();
         for r in rows {
             out.push(r.map_err(map_err)?);
@@ -152,15 +174,26 @@ impl Db {
         Ok(())
     }
 
-    /// Drop the local org row (on leave / removal). Idempotent; leaves `org_shares` alone (a leave
-    /// doesn't retroactively un-share — the items stay published unless explicitly revoked).
+    /// Atomically withdraw local membership AND purge its decrypted replica. Idempotent; leaves
+    /// `org_shares` alone (a leave doesn't retroactively un-share — the items stay published unless
+    /// explicitly revoked).
+    ///
+    /// The single transaction is load-bearing: deleting `org_state` first and crashing (or racing an
+    /// in-flight feed commit) before a later replica purge leaves plaintext rows orphaned. Feed commits
+    /// claim their sequence against this same membership row inside their own transaction, so SQLite's
+    /// serialized writer order yields only two safe outcomes: commit-before-leave is purged here;
+    /// leave-before-commit makes the feed claim fail before any plaintext insert.
     pub fn delete_org_state(&self, org_id: &str) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        let items = Self::purge_org_replica_tx(&tx, org_id)?;
+        tx.execute(
             "DELETE FROM org_state WHERE org_id = ?1",
             rusqlite::params![org_id],
         )
         .map_err(map_err)?;
+        tx.commit().map_err(map_err)?;
+        tracing::info!(target: "org", items, "atomically removed org membership and decrypted replica");
         Ok(())
     }
 
@@ -205,12 +238,7 @@ impl Db {
 
     /// Advance a queued org share to `uploaded`, recording the server-assigned `item_id`. Clears any
     /// prior error. Idempotent on the share id.
-    pub fn set_org_share_uploaded(
-        &self,
-        id: &str,
-        item_id: &str,
-        updated_at: &str,
-    ) -> Result<()> {
+    pub fn set_org_share_uploaded(&self, id: &str, item_id: &str, updated_at: &str) -> Result<()> {
         let conn = self.lock();
         conn.execute(
             "UPDATE org_shares SET state = 'uploaded', item_id = ?2, last_error = NULL,
@@ -272,7 +300,10 @@ impl Db {
     pub fn get_org_share(&self, id: &str) -> Result<Option<crate::storage::OrgShareRow>> {
         let conn = self.lock();
         conn.query_row(
-            &format!("SELECT {} FROM org_shares WHERE id = ?1", Self::ORG_SHARE_COLS),
+            &format!(
+                "SELECT {} FROM org_shares WHERE id = ?1",
+                Self::ORG_SHARE_COLS
+            ),
             rusqlite::params![id],
             Self::map_org_share,
         )
@@ -331,7 +362,10 @@ impl Db {
             ))
             .map_err(map_err)?;
         let rows = stmt
-            .query_map(rusqlite::params![meeting_id, document_id], Self::map_org_share)
+            .query_map(
+                rusqlite::params![meeting_id, document_id],
+                Self::map_org_share,
+            )
             .map_err(map_err)?;
         let mut out = Vec::new();
         for r in rows {
@@ -489,7 +523,14 @@ impl Db {
             "UPDATE org_shares SET state = 'queued', item_id = NULL, last_error = NULL,
                title = ?2, rev = ?3, generation = ?4, content_sha256 = ?5, updated_at = ?6
              WHERE id = ?1",
-            rusqlite::params![id, title, rev as i64, generation as i64, content_sha256, updated_at],
+            rusqlite::params![
+                id,
+                title,
+                rev as i64,
+                generation as i64,
+                content_sha256,
+                updated_at
+            ],
         )
         .map_err(map_err)?;
         Ok(())
@@ -595,7 +636,10 @@ impl Db {
             .map_err(map_err)?;
         let rows = stmt
             .query_map(rusqlite::params![folder_id], |r| {
-                Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?))
+                Ok((
+                    r.get::<_, Option<String>>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                ))
             })
             .map_err(map_err)?;
         let mut out = Vec::new();
@@ -685,19 +729,247 @@ impl Db {
         author_user_id: Option<&str>,
         embedder: Option<&dyn Embedder>,
     ) -> Result<()> {
-        // Chunk + embed OUTSIDE the write lock (embedding is CPU/Metal work). The header carries the
-        // item title as provenance; the date axis is the item's created_at.
-        let chunks = crate::embed::chunk_note(title, created_at, markdown);
-        let vectors = match embedder {
-            Some(e) if !chunks.is_empty() => Some(e.embed_passage(&chunks)?),
-            _ => None, // model absent → FTS-only (int8 vectors come later on a re-embed).
-        };
+        let prepared = Self::prepare_org_item_index(title, created_at, markdown, embedder)?;
 
         let mut conn = self.lock();
         let tx = conn.transaction().map_err(map_err)?;
+        Self::upsert_org_item_prepared_tx(
+            &tx,
+            item_id,
+            org_id,
+            seq,
+            author_hint,
+            title,
+            markdown,
+            created_at,
+            rev,
+            generation,
+            content_sha256,
+            source_kind,
+            author_user_id,
+            &prepared,
+        )?;
+        tx.commit().map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Prepare one org item's chunks and optional vectors without holding a SQLite write lock or a
+    /// background-commit lease. A scheduled feed sync resolves one pinned persistence embedder for
+    /// its whole bounded page and calls this for each live item before any action is committed.
+    pub(crate) fn prepare_org_item_index(
+        title: &str,
+        created_at: &str,
+        markdown: &str,
+        embedder: Option<&dyn Embedder>,
+    ) -> Result<PreparedOrgItemIndex> {
+        let chunks = crate::embed::chunk_note(title, created_at, markdown);
+        let vector_blobs = match embedder {
+            Some(e) if !chunks.is_empty() => Some(Self::prepare_org_vector_blobs(&chunks, e)?),
+            _ => None, // model absent → FTS-only (int8 vectors come later on a re-embed).
+        };
+        Ok(PreparedOrgItemIndex {
+            chunks,
+            vector_blobs,
+        })
+    }
+
+    /// Embed + quantize outside the SQLite transaction / background commit lease. The vec0 write
+    /// seam receives ready-to-insert int8 blobs, keeping its critical section to compare/delete/insert.
+    pub(crate) fn prepare_org_vector_blobs(
+        texts: &[String],
+        embedder: &dyn Embedder,
+    ) -> Result<Vec<Vec<u8>>> {
+        let vectors = embedder.embed_passage(texts)?;
+        if vectors.len() != texts.len() {
+            return Err(crate::error::AppError::Storage(format!(
+                "org embedder returned {} vectors for {} chunks",
+                vectors.len(),
+                texts.len()
+            )));
+        }
+        Ok(vectors
+            .iter()
+            .map(|vector| crate::embed::vec_to_int8_blob(vector))
+            .collect())
+    }
+
+    /// Apply the author's immediate local replica refresh without destroying a feed-synced real
+    /// vector index for the same immutable server item. The prepared FTS-only index is installed
+    /// only when the item is absent/older. An identical or newer live row keeps its chunks/vectors
+    /// byte-for-byte; only a known author id may be filled in. A tombstone is never resurrected.
+    ///
+    /// `superseded_item_id` is tombstoned in this SAME transaction for republish, so readers cannot
+    /// observe the new local card without the old local card being evicted (or vice versa).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn commit_local_org_replica(
+        &self,
+        item_id: &str,
+        org_id: &str,
+        seq: u64,
+        author_hint: &str,
+        title: &str,
+        markdown: &str,
+        created_at: &str,
+        rev: u32,
+        generation: u32,
+        content_sha256: &[u8],
+        source_kind: Option<&str>,
+        author_user_id: Option<&str>,
+        prepared: &PreparedOrgItemIndex,
+        superseded_item_id: Option<&str>,
+    ) -> Result<()> {
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        if !Self::org_membership_exists_tx(&tx, org_id)? {
+            // The server publish may have raced a local leave/removal. The remote item remains the
+            // server's concern, but withdrawn membership must never be followed by a plaintext local
+            // replica resurrection.
+            return Ok(());
+        }
+        let existing = tx
+            .query_row(
+                "SELECT seq, content_sha256, tombstoned FROM org_items WHERE item_id = ?1",
+                rusqlite::params![item_id],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?.max(0) as u64,
+                        r.get::<_, Option<Vec<u8>>>(1)?,
+                        r.get::<_, i64>(2)? != 0,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(map_err)?;
+
+        let replace = match existing {
+            None => true,
+            Some((_stored_seq, _stored_sha, true)) => false,
+            Some((stored_seq, _, false)) if stored_seq > seq => false,
+            Some((stored_seq, stored_sha, false)) if stored_seq == seq => {
+                if stored_sha.as_deref() != Some(content_sha256) {
+                    return Err(crate::error::AppError::Storage(
+                        "conflicting org replica payload at the same feed sequence".into(),
+                    ));
+                }
+                false
+            }
+            Some(_) => true,
+        };
+
+        if replace {
+            Self::upsert_org_item_prepared_tx(
+                &tx,
+                item_id,
+                org_id,
+                seq,
+                author_hint,
+                title,
+                markdown,
+                created_at,
+                rev,
+                generation,
+                content_sha256,
+                source_kind,
+                author_user_id,
+                prepared,
+            )?;
+        } else if let Some(author_user_id) = author_user_id {
+            tx.execute(
+                "UPDATE org_items
+                    SET author_user_id = COALESCE(author_user_id, ?2)
+                  WHERE item_id = ?1 AND tombstoned = 0",
+                rusqlite::params![item_id, author_user_id],
+            )
+            .map_err(map_err)?;
+        }
+
+        if let Some(old_item_id) = superseded_item_id.filter(|old| *old != item_id) {
+            Self::tombstone_org_item_tx(&tx, old_item_id)?;
+        }
+        tx.commit().map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Commit one already-prepared live feed item and advance the org cursor to this action's exact
+    /// sequence in ONE transaction. There is deliberately no fetched-page cursor parameter: a crash
+    /// after this method can replay later page entries, but can never skip them.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn commit_org_feed_item(
+        &self,
+        item_id: &str,
+        org_id: &str,
+        seq: u64,
+        author_hint: &str,
+        title: &str,
+        markdown: &str,
+        created_at: &str,
+        rev: u32,
+        generation: u32,
+        content_sha256: &[u8],
+        source_kind: Option<&str>,
+        author_user_id: Option<&str>,
+        prepared: &PreparedOrgItemIndex,
+    ) -> Result<bool> {
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        if !Self::claim_org_feed_seq_tx(&tx, org_id, seq)? {
+            return Ok(false);
+        }
+        // Tombstones are permanent for an append-only item id. Even a malformed/malicious later live
+        // event may advance the org cursor, but it must never restore plaintext for a withdrawn item.
+        let already_tombstoned = tx
+            .query_row(
+                "SELECT tombstoned FROM org_items WHERE item_id = ?1",
+                rusqlite::params![item_id],
+                |r| Ok(r.get::<_, i64>(0)? != 0),
+            )
+            .optional()
+            .map_err(map_err)?
+            .unwrap_or(false);
+        if already_tombstoned {
+            tx.commit().map_err(map_err)?;
+            return Ok(false);
+        }
+        Self::upsert_org_item_prepared_tx(
+            &tx,
+            item_id,
+            org_id,
+            seq,
+            author_hint,
+            title,
+            markdown,
+            created_at,
+            rev,
+            generation,
+            content_sha256,
+            source_kind,
+            author_user_id,
+            prepared,
+        )?;
+        tx.commit().map_err(map_err)?;
+        Ok(true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn upsert_org_item_prepared_tx(
+        tx: &rusqlite::Transaction<'_>,
+        item_id: &str,
+        org_id: &str,
+        seq: u64,
+        author_hint: &str,
+        title: &str,
+        markdown: &str,
+        created_at: &str,
+        rev: u32,
+        generation: u32,
+        content_sha256: &[u8],
+        source_kind: Option<&str>,
+        author_user_id: Option<&str>,
+        prepared: &PreparedOrgItemIndex,
+    ) -> Result<()> {
         // Replace the item row (idempotent upsert). CASCADE + the explicit vec purge below clear the
         // old chunks first so a re-pull never leaves stale chunks/vectors.
-        Self::purge_org_item_chunks_tx(&tx, item_id)?;
+        Self::purge_org_item_chunks_tx(tx, item_id)?;
         tx.execute(
             "INSERT INTO org_items
                (item_id, org_id, seq, author_hint, title, markdown, created_at, rev, generation,
@@ -732,16 +1004,17 @@ impl Db {
                 .map_err(map_err)?;
             // int8 vec0 → the value MUST be wrapped `vec_int8(?)` (the scale-spike partition format).
             let mut ins_vec = tx
-                .prepare("INSERT INTO org_vec_chunks(chunk_id, embedding) VALUES (?1, vec_int8(?2))")
+                .prepare(
+                    "INSERT INTO org_vec_chunks(chunk_id, embedding) VALUES (?1, vec_int8(?2))",
+                )
                 .map_err(map_err)?;
-            for (idx, text) in chunks.iter().enumerate() {
+            for (idx, text) in prepared.chunks.iter().enumerate() {
                 ins_chunk
                     .execute(rusqlite::params![item_id, idx as i64, text])
                     .map_err(map_err)?;
-                if let Some(vecs) = &vectors {
-                    if let Some(vector) = vecs.get(idx) {
+                if let Some(blobs) = &prepared.vector_blobs {
+                    if let Some(blob) = blobs.get(idx) {
                         let chunk_id = tx.last_insert_rowid();
-                        let blob = crate::embed::vec_to_int8_blob(vector);
                         ins_vec
                             .execute(rusqlite::params![chunk_id, blob])
                             .map_err(map_err)?;
@@ -749,7 +1022,6 @@ impl Db {
                 }
             }
         }
-        tx.commit().map_err(map_err)?;
         Ok(())
     }
 
@@ -759,28 +1031,96 @@ impl Db {
     pub fn tombstone_org_item(&self, item_id: &str) -> Result<()> {
         let mut conn = self.lock();
         let tx = conn.transaction().map_err(map_err)?;
-        Self::purge_org_item_chunks_tx(&tx, item_id)?;
+        Self::tombstone_org_item_tx(&tx, item_id)?;
+        tx.commit().map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Commit one tombstone and its exact feed sequence atomically. Later page entries remain
+    /// replayable if the process stops immediately after this transaction.
+    pub(crate) fn commit_org_feed_tombstone(
+        &self,
+        org_id: &str,
+        item_id: &str,
+        seq: u64,
+    ) -> Result<bool> {
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        if !Self::claim_org_feed_seq_tx(&tx, org_id, seq)? {
+            return Ok(false);
+        }
+        Self::tombstone_org_item_tx(&tx, item_id)?;
+        tx.commit().map_err(map_err)?;
+        Ok(true)
+    }
+
+    /// Advance past one terminal, permanently un-ingestable feed entry. This is intentionally a
+    /// single-action transaction and accepts only that entry's sequence, never `feed.next_seq`.
+    pub(crate) fn commit_org_feed_terminal_skip(&self, org_id: &str, seq: u64) -> Result<bool> {
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        if !Self::claim_org_feed_seq_tx(&tx, org_id, seq)? {
+            return Ok(false);
+        }
+        tx.commit().map_err(map_err)?;
+        Ok(true)
+    }
+
+    fn tombstone_org_item_tx(tx: &rusqlite::Transaction<'_>, item_id: &str) -> Result<()> {
+        Self::purge_org_item_chunks_tx(tx, item_id)?;
         tx.execute(
             "UPDATE org_items SET tombstoned = 1, markdown = '', title = '' WHERE item_id = ?1",
             rusqlite::params![item_id],
         )
         .map_err(map_err)?;
-        tx.commit().map_err(map_err)?;
         Ok(())
+    }
+
+    /// Atomically require live membership and claim a strictly newer action sequence. A zero-row
+    /// update means either membership was withdrawn or a concurrent sync already committed this/newer
+    /// work; callers must perform no item mutation in either case.
+    fn claim_org_feed_seq_tx(
+        tx: &rusqlite::Transaction<'_>,
+        org_id: &str,
+        seq: u64,
+    ) -> Result<bool> {
+        let changed = tx
+            .execute(
+                "UPDATE org_state SET last_seq = ?2 WHERE org_id = ?1 AND ?2 > last_seq",
+                rusqlite::params![org_id, seq as i64],
+            )
+            .map_err(map_err)?;
+        Ok(changed == 1)
+    }
+
+    fn org_membership_exists_tx(tx: &rusqlite::Transaction<'_>, org_id: &str) -> Result<bool> {
+        tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM org_state WHERE org_id = ?1)",
+            rusqlite::params![org_id],
+            |r| r.get::<_, bool>(0),
+        )
+        .map_err(map_err)
     }
 
     /// LEAVE-A-ORG CONSENT PURGE: drop the ENTIRE decrypted replica of one org — every `org_items`
     /// row plus its derived `org_chunks` / `org_vec_chunks` / `fts_org_chunks` tokens — in ONE atomic
     /// tx. Called by `org_leave` so a departed member keeps NO searchable copy of colleagues' shared
-    /// content (leak/consent invariant): the OCK cache is dropped and `org_state` deleted at the
-    /// command layer, but WITHOUT this the plaintext replica lingered forever and `org_search` could
-    /// still return it. Order: vec0 first (its FK-less rowid mirrors `org_chunks.id`), then
+    /// content (leak/consent invariant). [`Db::delete_org_state`] invokes the transaction helper so
+    /// membership removal and this purge commit atomically; this public standalone form remains useful
+    /// for idempotent repair. Order: vec0 first (its FK-less rowid mirrors `org_chunks.id`), then
     /// `org_chunks` (whose DELETE fires the `fts_org_chunks_ad` trigger, purging the keyword tokens),
     /// then the `org_items` header rows. Idempotent; an unknown org id is a no-op. Content-free log
     /// (org id + counts, never titles/bodies).
     pub fn purge_org_replica(&self, org_id: &str) -> Result<()> {
         let mut conn = self.lock();
         let tx = conn.transaction().map_err(map_err)?;
+        let items = Self::purge_org_replica_tx(&tx, org_id)?;
+        tx.commit().map_err(map_err)?;
+        tracing::info!(target: "org", items, "purged org replica on leave");
+        Ok(())
+    }
+
+    fn purge_org_replica_tx(tx: &rusqlite::Transaction<'_>, org_id: &str) -> Result<usize> {
         // vec0 KNN rows for every chunk of every item in this org (the FK-less mirror table).
         tx.execute(
             "DELETE FROM org_vec_chunks WHERE chunk_id IN
@@ -804,9 +1144,7 @@ impl Db {
                 rusqlite::params![org_id],
             )
             .map_err(map_err)?;
-        tx.commit().map_err(map_err)?;
-        tracing::info!(target: "org", items, "purged org replica on leave");
-        Ok(())
+        Ok(items)
     }
 
     /// Delete an org item's `org_chunks` + `org_vec_chunks` rows within an EXISTING tx. vec0 first
@@ -825,6 +1163,337 @@ impl Db {
         )
         .map_err(map_err)?;
         Ok(())
+    }
+
+    /// Remove every persisted org embedding while retaining the decrypted item rows, plaintext
+    /// chunks and their FTS trigger-backed index. A model-space switch calls this before rebuilding,
+    /// so the partition is always either empty or contains vectors from the newly pinned model —
+    /// never a query-invalid mixture of old and new spaces.
+    pub(crate) fn purge_all_org_vectors(&self) -> Result<usize> {
+        let conn = self.lock();
+        conn.execute("DELETE FROM org_vec_chunks", [])
+            .map_err(map_err)
+    }
+
+    /// Keyset-read exactly one LIVE org item's existing chunks for vector-only reindex. The item row,
+    /// feed cursor, metadata, chunk ids/text and FTS rows are not mutated. Callers advance with the
+    /// returned `item_id`, so the full replica is never materialized as one plaintext vector in RAM.
+    pub(crate) fn next_org_item_vector_batch(
+        &self,
+        after_item_id: Option<&str>,
+    ) -> Result<Option<OrgItemVectorBatch>> {
+        let conn = self.lock();
+        let item = conn
+            .query_row(
+                "SELECT oi.item_id, oi.seq, oi.rev, oi.generation, oi.content_sha256
+                   FROM org_items oi
+                   JOIN org_state os ON os.org_id = oi.org_id
+                  WHERE oi.tombstoned = 0
+                    AND (?1 IS NULL OR oi.item_id > ?1)
+                    AND EXISTS (SELECT 1 FROM org_chunks oc WHERE oc.item_id = oi.item_id)
+                  ORDER BY oi.item_id ASC
+                  LIMIT 1",
+                rusqlite::params![after_item_id],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1)?.max(0) as u64,
+                        r.get::<_, i64>(2)?.max(0) as u32,
+                        r.get::<_, i64>(3)?.max(0) as u32,
+                        r.get::<_, Option<Vec<u8>>>(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(map_err)?;
+        let Some((item_id, seq, rev, generation, content_sha256)) = item else {
+            return Ok(None);
+        };
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, text FROM org_chunks
+                  WHERE item_id = ?1
+                  ORDER BY chunk_idx ASC, id ASC",
+            )
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![item_id], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            })
+            .map_err(map_err)?;
+        let mut chunk_ids = Vec::new();
+        let mut texts = Vec::new();
+        for row in rows {
+            let (chunk_id, text) = row.map_err(map_err)?;
+            chunk_ids.push(chunk_id);
+            texts.push(text);
+        }
+        Ok(Some(OrgItemVectorBatch {
+            item_id,
+            chunk_ids,
+            texts,
+            seq,
+            rev,
+            generation,
+            content_sha256,
+        }))
+    }
+
+    /// Keyset-read one live item with at least one chunk missing its vector. This is the bounded,
+    /// global repair cursor used after a partial model-switch reindex or a period of FTS-only ingest;
+    /// it never purges already-valid vectors and never batches plaintext across items.
+    pub(crate) fn next_missing_org_item_vector_batch(
+        &self,
+        after_item_id: Option<&str>,
+    ) -> Result<Option<OrgItemVectorBatch>> {
+        let conn = self.lock();
+        let item = conn
+            .query_row(
+                "SELECT oi.item_id, oi.seq, oi.rev, oi.generation, oi.content_sha256
+                   FROM org_items oi
+                   JOIN org_state os ON os.org_id = oi.org_id
+                  WHERE oi.tombstoned = 0
+                    AND (?1 IS NULL OR oi.item_id > ?1)
+                    AND EXISTS (
+                        SELECT 1 FROM org_chunks oc
+                         WHERE oc.item_id = oi.item_id
+                           AND NOT EXISTS (
+                               SELECT 1 FROM org_vec_chunks ov WHERE ov.chunk_id = oc.id
+                           )
+                    )
+                  ORDER BY oi.item_id ASC
+                  LIMIT 1",
+                rusqlite::params![after_item_id],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1)?.max(0) as u64,
+                        r.get::<_, i64>(2)?.max(0) as u32,
+                        r.get::<_, i64>(3)?.max(0) as u32,
+                        r.get::<_, Option<Vec<u8>>>(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(map_err)?;
+        let Some((item_id, seq, rev, generation, content_sha256)) = item else {
+            return Ok(None);
+        };
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, text FROM org_chunks
+                  WHERE item_id = ?1
+                  ORDER BY chunk_idx ASC, id ASC",
+            )
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![item_id], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            })
+            .map_err(map_err)?;
+        let mut chunk_ids = Vec::new();
+        let mut texts = Vec::new();
+        for row in rows {
+            let (chunk_id, text) = row.map_err(map_err)?;
+            chunk_ids.push(chunk_id);
+            texts.push(text);
+        }
+        Ok(Some(OrgItemVectorBatch {
+            item_id,
+            chunk_ids,
+            texts,
+            seq,
+            rev,
+            generation,
+            content_sha256,
+        }))
+    }
+
+    /// Read one named live item for the bounded missing-vector repair performed by org sync. This is
+    /// the point lookup twin of the full-reindex keyset reader and likewise materializes plaintext for
+    /// only one item at a time.
+    pub(crate) fn org_item_vector_batch(
+        &self,
+        item_id: &str,
+    ) -> Result<Option<OrgItemVectorBatch>> {
+        let conn = self.lock();
+        let item = conn
+            .query_row(
+                "SELECT oi.seq, oi.rev, oi.generation, oi.content_sha256
+                   FROM org_items oi
+                   JOIN org_state os ON os.org_id = oi.org_id
+                  WHERE oi.item_id = ?1 AND oi.tombstoned = 0",
+                rusqlite::params![item_id],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?.max(0) as u64,
+                        r.get::<_, i64>(1)?.max(0) as u32,
+                        r.get::<_, i64>(2)?.max(0) as u32,
+                        r.get::<_, Option<Vec<u8>>>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(map_err)?;
+        let Some((seq, rev, generation, content_sha256)) = item else {
+            return Ok(None);
+        };
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, text FROM org_chunks
+                  WHERE item_id = ?1
+                  ORDER BY chunk_idx ASC, id ASC",
+            )
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![item_id], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            })
+            .map_err(map_err)?;
+        let mut chunk_ids = Vec::new();
+        let mut texts = Vec::new();
+        for row in rows {
+            let (chunk_id, text) = row.map_err(map_err)?;
+            chunk_ids.push(chunk_id);
+            texts.push(text);
+        }
+        if chunk_ids.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(OrgItemVectorBatch {
+            item_id: item_id.to_string(),
+            chunk_ids,
+            texts,
+            seq,
+            rev,
+            generation,
+            content_sha256,
+        }))
+    }
+
+    /// Replace only one item's org-vector rows if its canonical version/hash and ordered chunk ids
+    /// are unchanged since the keyset read. Embedding happens before this method; the transaction is
+    /// therefore a short compare + vec0 replace and never holds SQLite or an epoch commit lease
+    /// across model inference. The hash/version check is required because SQLite may reuse rowids;
+    /// legacy NULL-hash rows fall back to comparing ordered ids + full texts.
+    pub(crate) fn commit_org_item_vectors_if_unchanged(
+        &self,
+        batch: &OrgItemVectorBatch,
+        vector_blobs: &[Vec<u8>],
+    ) -> Result<bool> {
+        if vector_blobs.len() != batch.chunk_ids.len() {
+            return Err(crate::error::AppError::Storage(format!(
+                "org reindex produced {} vectors for {} chunks",
+                vector_blobs.len(),
+                batch.chunk_ids.len()
+            )));
+        }
+
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        let current_item = tx
+            .query_row(
+                "SELECT seq, rev, generation, content_sha256
+                   FROM org_items WHERE item_id = ?1 AND tombstoned = 0",
+                rusqlite::params![batch.item_id],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?.max(0) as u64,
+                        r.get::<_, i64>(1)?.max(0) as u32,
+                        r.get::<_, i64>(2)?.max(0) as u32,
+                        r.get::<_, Option<Vec<u8>>>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(map_err)?;
+        let item_unchanged = match current_item {
+            Some((seq, rev, generation, content_sha256)) => {
+                seq == batch.seq
+                    && rev == batch.rev
+                    && generation == batch.generation
+                    && content_sha256.as_deref() == batch.content_sha256.as_deref()
+            }
+            None => false,
+        };
+        if !item_unchanged {
+            return Ok(false);
+        }
+
+        let chunks_unchanged = if batch.content_sha256.is_some() {
+            // Normal protocol rows carry a canonical content hash. Version/hash + ordered ids is a
+            // compact token and avoids re-reading a potentially 16 MiB item under the epoch lease.
+            let mut stmt = tx
+                .prepare(
+                    "SELECT id FROM org_chunks
+                      WHERE item_id = ?1
+                      ORDER BY chunk_idx ASC, id ASC",
+                )
+                .map_err(map_err)?;
+            let rows = stmt
+                .query_map(rusqlite::params![batch.item_id], |r| r.get::<_, i64>(0))
+                .map_err(map_err)?;
+            let mut ids = Vec::new();
+            for row in rows {
+                ids.push(row.map_err(map_err)?);
+            }
+            ids.as_slice() == batch.chunk_ids.as_slice()
+        } else {
+            // Legacy rows may have NULL hashes. `None == None` is not a content token, and SQLite may
+            // reuse deleted rowids, so only this rare path compares ordered ids + texts in full.
+            let mut stmt = tx
+                .prepare(
+                    "SELECT id, text FROM org_chunks
+                      WHERE item_id = ?1
+                      ORDER BY chunk_idx ASC, id ASC",
+                )
+                .map_err(map_err)?;
+            let rows = stmt
+                .query_map(rusqlite::params![batch.item_id], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+                })
+                .map_err(map_err)?;
+            let mut chunks = Vec::new();
+            for row in rows {
+                chunks.push(row.map_err(map_err)?);
+            }
+            chunks.len() == batch.chunk_ids.len()
+                && chunks
+                    .iter()
+                    .zip(batch.chunk_ids.iter().zip(&batch.texts))
+                    .all(
+                        |((current_id, current_text), (expected_id, expected_text))| {
+                            current_id == expected_id && current_text == expected_text
+                        },
+                    )
+        };
+        if !chunks_unchanged {
+            return Ok(false);
+        }
+
+        tx.execute(
+            "DELETE FROM org_vec_chunks WHERE chunk_id IN
+               (SELECT id FROM org_chunks WHERE item_id = ?1)",
+            rusqlite::params![batch.item_id],
+        )
+        .map_err(map_err)?;
+        {
+            let mut insert = tx
+                .prepare(
+                    "INSERT INTO org_vec_chunks(chunk_id, embedding) VALUES (?1, vec_int8(?2))",
+                )
+                .map_err(map_err)?;
+            for (chunk_id, blob) in batch.chunk_ids.iter().zip(vector_blobs) {
+                insert
+                    .execute(rusqlite::params![chunk_id, blob])
+                    .map_err(map_err)?;
+            }
+        }
+        tx.commit().map_err(map_err)?;
+        Ok(true)
     }
 
     /// The synced feed cursor (`org_state.last_seq`) for an org — the max `seq` ingested so far.
@@ -947,7 +1616,10 @@ impl Db {
     /// OR per-instance-DISABLED item's org (a stale citation/bookmark to `/org-item/:id` must not read
     /// through the toggle — same `context_enabled = 1` gate as `search_org_chunks_knn`/`_fts`). No lock
     /// gate otherwise — org items are deliberately org-disclosed content.
-    pub fn get_org_item(&self, item_id: &str) -> Result<Option<crate::storage::models::OrgItemDetail>> {
+    pub fn get_org_item(
+        &self,
+        item_id: &str,
+    ) -> Result<Option<crate::storage::models::OrgItemDetail>> {
         let conn = self.lock();
         conn.query_row(
             "SELECT oi.item_id, oi.author_hint, oi.title, oi.created_at, oi.rev, oi.markdown
@@ -989,10 +1661,9 @@ impl Db {
     /// The item ids of this org's LIVE (non-tombstoned) local replica rows that are still missing
     /// `author_user_id` — the stale-ingest gap (rows ingested before the column/stamping existed, or
     /// via the local-replica upsert at share/republish time, whose cursor has already advanced past
-    /// them so a normal cursor-based feed pull never re-visits them). Used by the sync-tick backfill
-    /// (`backfill_null_org_item_authors`) to know whether a full-feed re-pull is worth doing at all —
-    /// an empty result short-circuits the backfill on every ordinary sync once a device has caught up.
-    /// (2026-07-15.)
+    /// them so a normal cursor-based feed pull never re-visits them). Retained for callers that need
+    /// the complete id set; scheduled sync uses the bounded seq-aware helper below and never re-pulls
+    /// the full feed. (2026-07-15.)
     pub fn org_item_ids_with_null_author(&self, org_id: &str) -> Result<Vec<String>> {
         let conn = self.lock();
         let mut stmt = conn
@@ -1007,6 +1678,35 @@ impl Db {
         let mut out = Vec::new();
         for r in rows {
             out.push(r.map_err(map_err)?);
+        }
+        Ok(out)
+    }
+
+    /// Oldest live items whose author still needs the one-page feed repair, paired with their stored
+    /// feed sequence. Starting the side-query immediately before the smallest sequence makes bounded
+    /// progress without a second persistent cursor or a full-history replay on every tick.
+    pub(crate) fn org_items_with_null_author_seq(
+        &self,
+        org_id: &str,
+        limit: i64,
+    ) -> Result<Vec<(String, u64)>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT item_id, seq FROM org_items
+                   WHERE org_id = ?1 AND tombstoned = 0 AND author_user_id IS NULL
+                  ORDER BY seq ASC, item_id ASC
+                  LIMIT ?2",
+            )
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map(rusqlite::params![org_id, limit.max(0)], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?.max(0) as u64))
+            })
+            .map_err(map_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(map_err)?);
         }
         Ok(out)
     }
@@ -1137,6 +1837,7 @@ impl Db {
                 "SELECT DISTINCT oc.item_id
                    FROM org_chunks oc
                    JOIN org_items oi ON oi.item_id = oc.item_id
+                   JOIN org_state os ON os.org_id = oi.org_id
                   WHERE oi.org_id = ?1 AND oi.tombstoned = 0
                     AND NOT EXISTS (SELECT 1 FROM org_vec_chunks v WHERE v.chunk_id = oc.id)
                   LIMIT ?2",

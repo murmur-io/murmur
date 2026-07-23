@@ -15,12 +15,49 @@ use std::collections::HashSet;
 
 use rusqlite::{Connection, OptionalExtension};
 
-use crate::error::Result;
+use crate::error::{AppError, Result};
 use crate::storage::db::{
     backlink_sort_key, doc_sealed_at_rest_tx, extract_wikilink_titles, map_err, visibility_clause,
     Db, LinkRowRaw,
 };
 use crate::storage::models::{BacklinkSource, SourceKind, WikiTarget};
+
+fn parse_marker_identity(value: Option<String>, field: &str) -> Result<Option<u64>> {
+    value
+        .map(|raw| {
+            raw.parse::<u64>().map_err(|_| {
+                AppError::Storage(format!("invalid marker-export publish {field} identity"))
+            })
+        })
+        .transpose()
+}
+
+/// One durable SQLCipher outbox row authorizing removal of a sealed neighbour title from the
+/// exact vault export that Murmur previously wrote. The title/path never leave the encrypted DB
+/// except inside the local filesystem reconciler and are never logged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LockMarkerExportCleanup {
+    pub(crate) source_kind: String,
+    pub(crate) source_id: String,
+    pub(crate) provider_id: String,
+    pub(crate) exported_path: String,
+    pub(crate) sealed_title: String,
+}
+
+/// SQLCipher-backed provenance for the one temporary inode used to publish a marker scrub.
+/// Device/inode values are stored as decimal TEXT in SQLite so Darwin's unsigned 64-bit values
+/// round-trip without truncation through SQLite's signed INTEGER type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LockMarkerExportPublish {
+    pub(crate) exported_path: String,
+    pub(crate) stage_name: String,
+    pub(crate) source_device: Option<u64>,
+    pub(crate) source_inode: Option<u64>,
+    pub(crate) source_hash: Option<String>,
+    pub(crate) stage_device: Option<u64>,
+    pub(crate) stage_inode: Option<u64>,
+    pub(crate) state: String,
+}
 
 /// TOCTOU seal re-check for a MEETING endpoint, run INSIDE the caller's write transaction — the
 /// meeting-side twin of [`doc_sealed_at_rest_tx`]. A `lock_folder` seal blanks a meeting note's
@@ -101,7 +138,25 @@ impl Db {
                UNIQUE (src_kind, src_id, dst_kind, dst_id, edge_type)
              );
              CREATE INDEX IF NOT EXISTS idx_links_src ON links(src_kind, src_id);
-             CREATE INDEX IF NOT EXISTS idx_links_dst ON links(dst_kind, dst_id);",
+             CREATE INDEX IF NOT EXISTS idx_links_dst ON links(dst_kind, dst_id);
+             CREATE TABLE IF NOT EXISTS lock_marker_export_cleanup (
+               source_kind TEXT NOT NULL CHECK(source_kind IN ('meeting','note')),
+               source_id TEXT NOT NULL,
+               provider_id TEXT NOT NULL DEFAULT '',
+               exported_path TEXT NOT NULL,
+               sealed_title TEXT NOT NULL,
+               PRIMARY KEY (source_kind, source_id, provider_id, exported_path, sealed_title)
+             );
+             CREATE TABLE IF NOT EXISTS lock_marker_export_publish (
+               exported_path TEXT PRIMARY KEY,
+               stage_name TEXT NOT NULL UNIQUE,
+               source_device TEXT,
+               source_inode TEXT,
+               source_hash TEXT,
+               stage_device TEXT,
+               stage_inode TEXT,
+               state TEXT NOT NULL CHECK(state IN ('reserved','created','prepared','swapped'))
+             );",
         )
         .map_err(map_err)?;
 
@@ -209,7 +264,11 @@ impl Db {
             let visible = visibility_clause("f", unlocked);
             // Exact first, then the case-folded fallback (only if exact missed).
             let note_id: Option<String> = conn
-                .query_row(&folded_note_sql(true, &visible), rusqlite::params![title], |r| r.get(0))
+                .query_row(
+                    &folded_note_sql(true, &visible),
+                    rusqlite::params![title],
+                    |r| r.get(0),
+                )
                 .optional()
                 .map_err(map_err)?
                 .or_else(|| {
@@ -391,7 +450,8 @@ impl Db {
                 }
                 "note" => {
                     // SOURCE GATE: the note's folder must be visible; title/updated_at via a gated read.
-                    let Some((title, ts)) = self.backlink_note_meta_visible(&src_id, unlocked)? else {
+                    let Some((title, ts)) = self.backlink_note_meta_visible(&src_id, unlocked)?
+                    else {
                         continue;
                     };
                     if note_ids.insert(src_id.clone()) {
@@ -891,7 +951,16 @@ impl Db {
         let mut conn = self.lock();
         let tx = conn.transaction().map_err(map_err)?;
         Self::upsert_link_tx(
-            &tx, "note", note_id, "meeting", meeting_id, "companion", 1.0, "user", "active", now,
+            &tx,
+            "note",
+            note_id,
+            "meeting",
+            meeting_id,
+            "companion",
+            1.0,
+            "user",
+            "active",
+            now,
         )?;
         tx.commit().map_err(map_err)?;
         Ok(())
@@ -966,13 +1035,20 @@ impl Db {
             // Fix-0 discipline: never re-assert an edge naming a sealed-at-rest endpoint. The meeting
             // is unlocked (plaintext restored), so this normally only guards a companion note that
             // still lives in another sealed folder.
-            if meeting_sealed_at_rest_tx(&tx, meeting_id)?
-                || doc_sealed_at_rest_tx(&tx, note_id)?
-            {
+            if meeting_sealed_at_rest_tx(&tx, meeting_id)? || doc_sealed_at_rest_tx(&tx, note_id)? {
                 continue;
             }
             Self::upsert_link_tx(
-                &tx, "note", note_id, "meeting", meeting_id, "companion", 1.0, "user", "active", now,
+                &tx,
+                "note",
+                note_id,
+                "meeting",
+                meeting_id,
+                "companion",
+                1.0,
+                "user",
+                "active",
+                now,
             )?;
             written += 1;
         }
@@ -1008,7 +1084,8 @@ impl Db {
         use crate::storage::models::SourceKind;
         // 1. Collect the distinct inbound sources across every item in the folder. A source is
         //    identified as (is_meeting, id) so the two kinds never collide in the id space.
-        let mut sources: std::collections::HashSet<(bool, String)> = std::collections::HashSet::new();
+        let mut sources: std::collections::HashSet<(bool, String)> =
+            std::collections::HashSet::new();
         // Meeting targets in F.
         for mid in meeting_ids {
             for src in self.backlinks_for_visible(SourceKind::Meeting, mid, unlocked)? {
@@ -1131,7 +1208,15 @@ impl Db {
         let mut conn = self.lock();
         let tx = conn.transaction().unwrap();
         Self::upsert_link_tx(
-            &tx, src_kind, src_id, dst_kind, dst_id, edge_type, score, created_by, status,
+            &tx,
+            src_kind,
+            src_id,
+            dst_kind,
+            dst_id,
+            edge_type,
+            score,
+            created_by,
+            status,
             1_700_000_000_000,
         )
         .unwrap();
@@ -1179,6 +1264,30 @@ impl Db {
     pub(crate) const LINK_DECISION_KEEP: &'static str =
         "status = 'dismissed' OR (status = 'active' AND created_by = 'accepted')";
 
+    fn enqueue_marker_export_cleanup_tx(
+        tx: &rusqlite::Transaction<'_>,
+        is_meeting: bool,
+        source_id: &str,
+        provider_id: &str,
+        exported_path: &str,
+        sealed_title: &str,
+    ) -> Result<()> {
+        tx.execute(
+            "INSERT OR IGNORE INTO lock_marker_export_cleanup(
+               source_kind, source_id, provider_id, exported_path, sealed_title
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                if is_meeting { "meeting" } else { "note" },
+                source_id,
+                provider_id,
+                exported_path,
+                sealed_title,
+            ],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
     /// Brain-v3 audit Fix 4 — STRIP a just-sealed neighbour's materialized `[[Title]]` from the
     /// MACHINE-OWNED `murmur:links` block of every VISIBLE note that links to it, INSIDE the seal tx
     /// (so the DB plaintext is scrubbed atomically with the purge). Compose accept/link wrote
@@ -1209,8 +1318,10 @@ impl Db {
         //    materialize a marker: `wikilink`/`manual`/`companion`/accepted-`semantic` edges pointing
         //    AT the sealed item. A `companion` edge never materializes a title marker (it's structural),
         //    but including it is harmless (the strip is a no-op when the block lacks the title).
-        let mut affected: std::collections::HashMap<(bool, String), std::collections::HashSet<String>> =
-            std::collections::HashMap::new();
+        let mut affected: std::collections::HashMap<
+            (bool, String),
+            std::collections::HashSet<String>,
+        > = std::collections::HashMap::new();
         let mut collect = |tx: &rusqlite::Transaction<'_>,
                            sealed_kinds: &str,
                            sealed_id: &str|
@@ -1275,9 +1386,9 @@ impl Db {
                 continue;
             }
             let did_change = if *is_meeting {
-                Self::strip_markers_from_meeting_note_tx(tx, src_id, titles)?
+                Self::strip_and_journal_meeting_markers_tx(tx, src_id, titles)?
             } else {
-                Self::strip_markers_from_note_doc_tx(tx, src_id, titles)?
+                Self::strip_and_journal_note_markers_tx(tx, src_id, titles)?
             };
             if did_change {
                 changed.push((*is_meeting, src_id.clone()));
@@ -1316,57 +1427,91 @@ impl Db {
         }
     }
 
-    /// Strip every `[[title]]` in `titles` from a MEETING note's (`notes.markdown`, newest provider
-    /// row) managed `murmur:links` block, in-tx. Returns `true` iff the markdown changed. Only the
-    /// machine block is touched (extract → retain → re-apply); user wikilinks elsewhere are untouched.
-    fn strip_markers_from_meeting_note_tx(
+    /// Strip and journal EVERY provider row/export for a meeting source. Provider rows are distinct
+    /// canonical notes and may share a timestamp; updating `created_at = MAX(...)` would collapse
+    /// their different markdown, while selecting only one export would leave older vault files
+    /// leaking the sealed title.
+    fn strip_and_journal_meeting_markers_tx(
         tx: &rusqlite::Transaction<'_>,
         meeting_id: &str,
         titles: &std::collections::HashSet<String>,
     ) -> Result<bool> {
-        let md: Option<String> = tx
-            .query_row(
-                "SELECT markdown FROM notes WHERE meeting_id = ?1 ORDER BY created_at DESC LIMIT 1",
-                rusqlite::params![meeting_id],
-                |r| r.get::<_, String>(0),
+        let provider_rows: Vec<(String, String, Option<String>)> = {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT provider_id, COALESCE(markdown, ''), exported_path
+                       FROM notes WHERE meeting_id = ?1
+                      ORDER BY created_at DESC, provider_id ASC",
+                )
+                .map_err(map_err)?;
+            let rows = stmt
+                .query_map(rusqlite::params![meeting_id], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                    ))
+                })
+                .map_err(map_err)?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.map_err(map_err)?);
+            }
+            out
+        };
+        let mut changed = false;
+        for (provider_id, markdown, exported_path) in provider_rows {
+            // Enqueue even when this DB row is already scrubbed: that is the replay path after a
+            // previous strip commit crashed before the exact provider export was rewritten.
+            if let Some(path) = exported_path.filter(|path| !path.is_empty()) {
+                for title in titles {
+                    Self::enqueue_marker_export_cleanup_tx(
+                        tx,
+                        true,
+                        meeting_id,
+                        &provider_id,
+                        &path,
+                        title,
+                    )?;
+                }
+            }
+            let Some(stripped) = Self::strip_titles_from_managed_block(&markdown, titles) else {
+                continue;
+            };
+            tx.execute(
+                "UPDATE notes SET markdown = ?3 WHERE meeting_id = ?1 AND provider_id = ?2",
+                rusqlite::params![meeting_id, provider_id, stripped],
             )
-            .optional()
             .map_err(map_err)?;
-        let Some(md) = md.filter(|m| !m.is_empty()) else {
-            return Ok(false);
-        };
-        let Some(stripped) = Self::strip_titles_from_managed_block(&md, titles) else {
-            return Ok(false);
-        };
-        // Write the stripped markdown back into the newest provider row (the one we read).
-        tx.execute(
-            "UPDATE notes SET markdown = ?2
-               WHERE meeting_id = ?1
-                 AND created_at = (SELECT MAX(created_at) FROM notes WHERE meeting_id = ?1)",
-            rusqlite::params![meeting_id, stripped],
-        )
-        .map_err(map_err)?;
-        Ok(true)
+            changed = true;
+        }
+        Ok(changed)
     }
 
-    /// Strip every `[[title]]` in `titles` from a note-doc's (`documents.text`, kind='note') managed
-    /// block, in-tx. Returns `true` iff the text changed. Machine block only.
-    fn strip_markers_from_note_doc_tx(
+    /// Authored-note twin: enqueue its exact export even when the DB body is already scrubbed, then
+    /// mutate only the machine-owned block in the same transaction.
+    fn strip_and_journal_note_markers_tx(
         tx: &rusqlite::Transaction<'_>,
         note_id: &str,
         titles: &std::collections::HashSet<String>,
     ) -> Result<bool> {
-        let text: Option<String> = tx
+        let row: Option<(String, Option<String>)> = tx
             .query_row(
-                "SELECT COALESCE(text, '') FROM documents WHERE id = ?1 AND kind = 'note'",
+                "SELECT COALESCE(text, ''), exported_path
+                   FROM documents WHERE id = ?1 AND kind = 'note'",
                 rusqlite::params![note_id],
-                |r| r.get::<_, String>(0),
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
             )
             .optional()
             .map_err(map_err)?;
-        let Some(text) = text.filter(|t| !t.is_empty()) else {
+        let Some((text, exported_path)) = row else {
             return Ok(false);
         };
+        if let Some(path) = exported_path.filter(|path| !path.is_empty()) {
+            for title in titles {
+                Self::enqueue_marker_export_cleanup_tx(tx, false, note_id, "", &path, title)?;
+            }
+        }
         let Some(stripped) = Self::strip_titles_from_managed_block(&text, titles) else {
             return Ok(false);
         };
@@ -1383,7 +1528,7 @@ impl Db {
     /// the command-layer `strip_manual_link_marker` uses). Returns `Some(new_body)` iff a hit was
     /// removed (so the caller only writes on a real change), else `None`. A user-typed `[[Title]]`
     /// OUTSIDE the managed block is never in `extract_link_hits`'s output, so it is never stripped.
-    fn strip_titles_from_managed_block(
+    pub(crate) fn strip_titles_from_managed_block(
         body: &str,
         titles: &std::collections::HashSet<String>,
     ) -> Option<String> {
@@ -1440,6 +1585,264 @@ impl Db {
         tx.commit().map_err(map_err)?;
         tracing::debug!(target: "links", stripped_sources = changed.len(), "strip_sealed_neighbour_markers");
         Ok(changed)
+    }
+
+    /// Snapshot the durable marker-export outbox. Rows remain until the exact file has been
+    /// durably scrubbed (or proved absent) and [`Self::ack_lock_marker_export_cleanup`] commits.
+    pub(crate) fn pending_lock_marker_export_cleanup(
+        &self,
+    ) -> Result<Vec<LockMarkerExportCleanup>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT source_kind, source_id, provider_id, exported_path, sealed_title
+                   FROM lock_marker_export_cleanup
+                  ORDER BY exported_path, source_kind, source_id, provider_id, sealed_title",
+            )
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(LockMarkerExportCleanup {
+                    source_kind: r.get(0)?,
+                    source_id: r.get(1)?,
+                    provider_id: r.get(2)?,
+                    exported_path: r.get(3)?,
+                    sealed_title: r.get(4)?,
+                })
+            })
+            .map_err(map_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(map_err)?);
+        }
+        Ok(out)
+    }
+
+    /// Return the existing authenticated stage reservation for `exported_path`, or durably reserve
+    /// a fresh unpredictable name before any vault file is created. A pre-existing file under that
+    /// name is never adopted: until [`Self::bind_lock_marker_export_publish`] records its inode the
+    /// reconciler fails closed.
+    pub(crate) fn reserve_lock_marker_export_publish(
+        &self,
+        exported_path: &str,
+    ) -> Result<LockMarkerExportPublish> {
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        let existing = tx
+            .query_row(
+                "SELECT exported_path, stage_name, source_device, source_inode, source_hash,
+                        stage_device, stage_inode, state
+                   FROM lock_marker_export_publish WHERE exported_path = ?1",
+                rusqlite::params![exported_path],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, String>(7)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(map_err)?;
+        let raw = if let Some(existing) = existing {
+            existing
+        } else {
+            let stage_name = format!(
+                ".murmur-marker-cleanup-{}.pending",
+                uuid::Uuid::new_v4().simple()
+            );
+            tx.execute(
+                "INSERT INTO lock_marker_export_publish(exported_path, stage_name, state)
+                 VALUES (?1, ?2, 'reserved')",
+                rusqlite::params![exported_path, stage_name],
+            )
+            .map_err(map_err)?;
+            (
+                exported_path.to_string(),
+                stage_name,
+                None,
+                None,
+                None,
+                None,
+                None,
+                "reserved".to_string(),
+            )
+        };
+        tx.commit().map_err(map_err)?;
+        Ok(LockMarkerExportPublish {
+            exported_path: raw.0,
+            stage_name: raw.1,
+            source_device: parse_marker_identity(raw.2, "source device")?,
+            source_inode: parse_marker_identity(raw.3, "source inode")?,
+            source_hash: raw.4,
+            stage_device: parse_marker_identity(raw.5, "stage device")?,
+            stage_inode: parse_marker_identity(raw.6, "stage inode")?,
+            state: raw.7,
+        })
+    }
+
+    /// Bind the freshly-created empty stage to the exact source and stage inodes before writing
+    /// bytes. This closes the old deterministic-name adoption bug: recovery accepts only these
+    /// SQLCipher-authenticated identities.
+    pub(crate) fn bind_lock_marker_export_publish(
+        &self,
+        publish: &LockMarkerExportPublish,
+        source_device: u64,
+        source_inode: u64,
+        source_hash: &str,
+        stage_device: u64,
+        stage_inode: u64,
+    ) -> Result<()> {
+        let changed = self
+            .lock()
+            .execute(
+                "UPDATE lock_marker_export_publish
+                    SET source_device = ?3, source_inode = ?4, source_hash = ?5,
+                        stage_device = ?6, stage_inode = ?7, state = 'created'
+                  WHERE exported_path = ?1 AND stage_name = ?2 AND state = 'reserved'
+                    AND source_device IS NULL AND source_inode IS NULL
+                    AND stage_device IS NULL AND stage_inode IS NULL",
+                rusqlite::params![
+                    publish.exported_path,
+                    publish.stage_name,
+                    source_device.to_string(),
+                    source_inode.to_string(),
+                    source_hash,
+                    stage_device.to_string(),
+                    stage_inode.to_string(),
+                ],
+            )
+            .map_err(map_err)?;
+        if changed != 1 {
+            return Err(AppError::Storage(
+                "marker-export publish reservation changed before identity bind".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn advance_lock_marker_export_publish(
+        &self,
+        publish: &LockMarkerExportPublish,
+        from: &str,
+        to: &str,
+    ) -> Result<()> {
+        let valid = matches!(
+            (from, to),
+            ("created", "prepared") | ("prepared", "swapped")
+        );
+        if !valid {
+            return Err(AppError::Storage(
+                "invalid marker-export publish state transition".into(),
+            ));
+        }
+        let changed = self
+            .lock()
+            .execute(
+                "UPDATE lock_marker_export_publish SET state = ?4
+                  WHERE exported_path = ?1 AND stage_name = ?2 AND state = ?3",
+                rusqlite::params![publish.exported_path, publish.stage_name, from, to],
+            )
+            .map_err(map_err)?;
+        if changed != 1 {
+            return Err(AppError::Storage(
+                "marker-export publish state changed unexpectedly".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn clear_lock_marker_export_publish(
+        &self,
+        publish: &LockMarkerExportPublish,
+    ) -> Result<()> {
+        self.lock()
+            .execute(
+                "DELETE FROM lock_marker_export_publish
+                  WHERE exported_path = ?1 AND stage_name = ?2",
+                rusqlite::params![publish.exported_path, publish.stage_name],
+            )
+            .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Acknowledge one exact-path group only after the filesystem write is durable. The optional
+    /// hash is stamped in the SAME SQLCipher transaction as the row deletion, and is supplied only
+    /// when the resulting file equals the canonical DB body byte-for-byte.
+    pub(crate) fn ack_lock_marker_export_cleanup(
+        &self,
+        rows: &[LockMarkerExportCleanup],
+        final_body: Option<&str>,
+        canonical_hash: Option<&str>,
+    ) -> Result<()> {
+        let Some(first) = rows.first() else {
+            return Ok(());
+        };
+        if rows.iter().any(|row| {
+            row.source_kind != first.source_kind
+                || row.source_id != first.source_id
+                || row.provider_id != first.provider_id
+                || row.exported_path != first.exported_path
+        }) {
+            return Err(AppError::Storage(
+                "ambiguous marker-export cleanup path ownership".into(),
+            ));
+        }
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        if let (Some(body), Some(hash)) = (final_body, canonical_hash) {
+            match first.source_kind.as_str() {
+                "meeting" => {
+                    tx.execute(
+                        "UPDATE notes SET exported_hash = ?4
+                           WHERE meeting_id = ?1 AND provider_id = ?2 AND exported_path = ?3
+                             AND markdown = ?5",
+                        rusqlite::params![
+                            first.source_id,
+                            first.provider_id,
+                            first.exported_path,
+                            hash,
+                            body,
+                        ],
+                    )
+                    .map_err(map_err)?;
+                }
+                "note" => {
+                    tx.execute(
+                        "UPDATE documents SET exported_hash = ?3
+                           WHERE id = ?1 AND kind = 'note' AND exported_path = ?2 AND text = ?4",
+                        rusqlite::params![first.source_id, first.exported_path, hash, body],
+                    )
+                    .map_err(map_err)?;
+                }
+                _ => {
+                    return Err(AppError::Storage(
+                        "invalid marker-export cleanup source kind".into(),
+                    ));
+                }
+            }
+        }
+        for row in rows {
+            tx.execute(
+                "DELETE FROM lock_marker_export_cleanup
+                  WHERE source_kind = ?1 AND source_id = ?2 AND provider_id = ?3
+                    AND exported_path = ?4 AND sealed_title = ?5",
+                rusqlite::params![
+                    row.source_kind,
+                    row.source_id,
+                    row.provider_id,
+                    row.exported_path,
+                    row.sealed_title,
+                ],
+            )
+            .map_err(map_err)?;
+        }
+        tx.commit().map_err(map_err)
     }
 
     /// Brain-v3 audit Fix 4 (INVERSE) — on unlock, RE-MATERIALIZE the `[[Title]]` markers that the seal
@@ -1740,12 +2143,14 @@ impl Db {
         // (→ doc_vec_chunks). The other table's exclusion clause is a no-op (empty set) for that kind.
         let (self_note_pred, self_doc_pred) = match self_kind {
             crate::links::LinkKind::Meeting => (
-                "AND kn.chunk_id NOT IN (SELECT id FROM note_chunks WHERE meeting_id = ?3)".to_string(),
+                "AND kn.chunk_id NOT IN (SELECT id FROM note_chunks WHERE meeting_id = ?3)"
+                    .to_string(),
                 String::new(),
             ),
             crate::links::LinkKind::Note | crate::links::LinkKind::Document => (
                 String::new(),
-                "AND kd.chunk_id NOT IN (SELECT id FROM doc_chunks WHERE document_id = ?3)".to_string(),
+                "AND kd.chunk_id NOT IN (SELECT id FROM doc_chunks WHERE document_id = ?3)"
+                    .to_string(),
             ),
         };
         // Each vec0 table gets its own single-MATCH CTE (vec0 allows one MATCH+k per query); the
@@ -2013,7 +2418,10 @@ impl Db {
         unlocked: &HashSet<String>,
     ) -> Result<Vec<crate::storage::models::LinkEdge>> {
         // ── GATE 1: the queried item must itself be visible. ──
-        if self.link_endpoint_title_visible(kind, id, unlocked)?.is_none() {
+        if self
+            .link_endpoint_title_visible(kind, id, unlocked)?
+            .is_none()
+        {
             return Ok(Vec::new());
         }
         // Read every incident, non-dismissed edge (either endpoint). Direction tells the FE which

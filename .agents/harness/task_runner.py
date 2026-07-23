@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import copy
 import datetime as dt
+import fcntl
 import fnmatch
 import hashlib
 import json
@@ -37,7 +38,9 @@ CONFIG_PATH = HARNESS_ROOT / "config.json"
 TASK_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{1,63}$")
 SHA1_RE = re.compile(r"^[0-9a-f]{40}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
-TERMINAL_STATES = {"PASSED", "FAILED", "BLOCKED", "CLOSED"}
+TERMINAL_STATES = {"PASSED", "FAILED", "BLOCKED", "COMMITTED", "CLOSED"}
+REAL_MODEL_VENDORS = {"codex", "claude"}
+MANAGED_CLEANUP_SIGNALS = frozenset((signal.SIGINT, signal.SIGTERM, signal.SIGHUP))
 
 
 class HarnessError(RuntimeError):
@@ -46,6 +49,18 @@ class HarnessError(RuntimeError):
     def __init__(self, message: str, exit_code: int = 2) -> None:
         super().__init__(message)
         self.exit_code = exit_code
+
+
+class HarnessCancellation(BaseException):
+    """Catchable SIGTERM/SIGHUP so managed child groups are drained first."""
+
+    def __init__(self, signum: int) -> None:
+        super().__init__(signum)
+        self.signum = signum
+
+
+def _raise_harness_cancellation(signum: int, _frame: Any) -> None:
+    raise HarnessCancellation(signum)
 
 
 def utc_now() -> str:
@@ -190,6 +205,47 @@ def load_config() -> Dict[str, Any]:
     if not isinstance(config, dict) or config.get("schema_version") != 1:
         raise HarnessError(f"unsupported harness config: {CONFIG_PATH}")
     return config
+
+
+def resolve_task_vendors(
+    requested_writer: Optional[str],
+    requested_reviewer: Optional[str],
+    config: Mapping[str, Any],
+    *,
+    allow_test_adapter: bool = False,
+) -> Tuple[str, str]:
+    """Resolve the writer first, then default the reviewer to the other vendor."""
+
+    writer = requested_writer or config.get("default_writer")
+    if writer == "fake" and allow_test_adapter:
+        reviewer = requested_reviewer or "fake"
+        if reviewer != "fake":
+            raise HarnessError("the internal fake writer must use the internal fake reviewer")
+        return "fake", "fake"
+    if writer not in REAL_MODEL_VENDORS:
+        raise HarnessError("harness config default_writer must be codex or claude")
+    reviewer = requested_reviewer or {
+        "codex": "claude",
+        "claude": "codex",
+    }[writer]
+    if reviewer not in REAL_MODEL_VENDORS:
+        raise HarnessError("reviewer must be codex or claude; fake is selftest-only")
+    if reviewer == writer:
+        raise HarnessError("writer and reviewer must use different vendors")
+    return writer, reviewer
+
+
+def validate_vendor_separation(
+    contract: Mapping[str, Any], *, allow_test_adapter: bool = False
+) -> None:
+    writer = contract.get("writer")
+    reviewer = contract.get("reviewer")
+    if allow_test_adapter and writer == reviewer == "fake":
+        return
+    if writer not in REAL_MODEL_VENDORS or reviewer not in REAL_MODEL_VENDORS:
+        raise HarnessError("production tasks may use only codex and claude model vendors")
+    if writer == reviewer:
+        raise HarnessError("writer and reviewer must use different vendors")
 
 
 def load_schema(name: str) -> Dict[str, Any]:
@@ -390,7 +446,7 @@ def classify_risks(
     for risk, patterns in classification.items():
         if any(_owned_matches_pattern(path, pattern) for path in owned_paths for pattern in patterns):
             risks.add(risk)
-    order = ["lock", "egress", "protocol", "runtime", "ui", "release"]
+    order = ["lock", "egress", "protocol", "runtime", "ui", "performance", "release"]
     unknown = risks - set(order)
     if unknown:
         raise HarnessError(f"unknown risk flags: {', '.join(sorted(unknown))}")
@@ -405,6 +461,66 @@ def required_risk_evidence(risk_flags: Sequence[str], config: Mapping[str, Any])
             if check_id not in result:
                 result.append(check_id)
     return result
+
+
+def canonical_check_commands(config: Mapping[str, Any]) -> Dict[str, str]:
+    raw = config.get("canonical_checks", {})
+    if not isinstance(raw, dict):
+        raise HarnessError("harness config canonical_checks must be an object")
+    result: Dict[str, str] = {}
+    for check_id, command in raw.items():
+        if not isinstance(check_id, str) or not re.fullmatch(r"[a-z0-9][a-z0-9._-]*", check_id):
+            raise HarnessError("harness config contains an invalid canonical check id")
+        if not isinstance(command, str) or not command.strip():
+            raise HarnessError(f"canonical check {check_id} has an empty command")
+        result[check_id] = command
+    return result
+
+
+def validate_canonical_checks(
+    checks: Sequence[Mapping[str, Any]], risk_flags: Sequence[str], config: Mapping[str, Any]
+) -> None:
+    """Bind risk evidence to runner-owned commands, never caller-controlled labels."""
+
+    canonical = canonical_check_commands(config)
+    by_id = {check.get("id"): check for check in checks}
+    for check_id, check in by_id.items():
+        if check_id in canonical and check.get("command") != canonical[check_id]:
+            raise HarnessError(
+                f"canonical check {check_id} command differs from the runner-owned profile"
+            )
+    for check_id in required_risk_evidence(risk_flags, config):
+        expected = canonical.get(check_id)
+        if expected is None:
+            raise HarnessError(f"risk evidence {check_id} has no canonical command profile")
+        check = by_id.get(check_id)
+        if check is None:
+            raise HarnessError(f"required canonical risk check is missing: {check_id}")
+        if check.get("command") != expected:
+            raise HarnessError(f"required risk check {check_id} is not canonical")
+
+
+def add_missing_canonical_risk_checks(
+    checks: List[Dict[str, Any]],
+    risk_flags: Sequence[str],
+    timeout_seconds: int,
+    config: Mapping[str, Any],
+) -> None:
+    canonical = canonical_check_commands(config)
+    existing = {check["id"]: check for check in checks}
+    for check_id in required_risk_evidence(risk_flags, config):
+        expected = canonical.get(check_id)
+        if expected is None:
+            raise HarnessError(f"risk evidence {check_id} has no canonical command profile")
+        current = existing.get(check_id)
+        if current is None:
+            current = {"id": check_id, "command": expected, "timeout_seconds": timeout_seconds}
+            checks.append(current)
+            existing[check_id] = current
+        elif current.get("command") != expected:
+            raise HarnessError(
+                f"check {check_id} is runner-owned; expected exact command: {expected}"
+            )
 
 
 def instruction_paths(repo_root: Path) -> List[Tuple[str, Path]]:
@@ -440,6 +556,9 @@ def instruction_paths(repo_root: Path) -> List[Tuple[str, Path]]:
             harness_files.append(candidate)
     harness_files.extend(sorted(path for path in PROMPTS_DIR.rglob("*") if path.is_file()))
     harness_files.extend(sorted(path for path in SCHEMAS_DIR.rglob("*") if path.is_file()))
+    checks_dir = HARNESS_ROOT / "checks"
+    if checks_dir.is_dir():
+        harness_files.extend(sorted(path for path in checks_dir.rglob("*") if path.is_file()))
     for name in ("agent-harness", "agent-config-audit"):
         wrapper = source_repo / "scripts" / name
         if wrapper.is_file():
@@ -632,6 +751,37 @@ def workspace_fingerprint(worktree: Path) -> str:
     return digest.hexdigest()
 
 
+# A model can accidentally copy the renderer's truncation banner into a source file when it
+# transfers a large tool result instead of the underlying bytes.  That failure mode is especially
+# destructive: the banner is valid plain text while the omitted middle of the file is silently
+# lost.  Reject the exact renderer marker at the trusted scope boundary before checks/review can
+# green-wash the resulting partial file.
+TOOL_OUTPUT_CONTAMINATION_MARKERS = (
+    b"Warning: truncated output (original token count:",
+)
+
+
+def tool_output_contaminated_paths(worktree: Path, paths: Sequence[str]) -> List[str]:
+    contaminated: List[str] = []
+    overlap = max(len(marker) for marker in TOOL_OUTPUT_CONTAMINATION_MARKERS) - 1
+    for relative in paths:
+        path = worktree / relative
+        if not path.is_file():
+            continue
+        tail = b""
+        try:
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    window = tail + chunk
+                    if any(marker in window for marker in TOOL_OUTPUT_CONTAMINATION_MARKERS):
+                        contaminated.append(relative)
+                        break
+                    tail = window[-overlap:] if overlap else b""
+        except OSError as exc:
+            raise HarnessError(f"could not inspect changed file {relative}: {exc}") from exc
+    return sorted(set(contaminated))
+
+
 def stage_owned_paths(worktree: Path, contract: Mapping[str, Any]) -> Tuple[List[str], bytes]:
     if git(worktree, "rev-parse", "HEAD") != contract["base_sha"]:
         raise HarnessError("writer changed HEAD or created a commit; tasks must leave HEAD at base_sha")
@@ -644,6 +794,12 @@ def stage_owned_paths(worktree: Path, contract: Mapping[str, Any]) -> Tuple[List
         raise HarnessError(
             "present changed paths must be single-link regular files and may not traverse symlinks: "
             + ", ".join(unsafe_nodes)
+        )
+    contaminated = tool_output_contaminated_paths(worktree, paths)
+    if contaminated:
+        raise HarnessError(
+            "renderer-truncated tool output was copied into changed files: "
+            + ", ".join(contaminated)
         )
 
     # Reset only the isolated worktree index, preserve every working-tree byte,
@@ -659,38 +815,102 @@ def stage_owned_paths(worktree: Path, contract: Mapping[str, Any]) -> Tuple[List
     return paths, diff
 
 
-def _terminate_process(process: subprocess.Popen) -> None:
-    try:
-        os.killpg(process.pid, signal.SIGTERM)
-    except (ProcessLookupError, PermissionError):
-        process.terminate()
-    try:
-        process.wait(timeout=3)
-        return
-    except subprocess.TimeoutExpired:
-        pass
-    try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError):
-        process.kill()
-    process.wait()
+def _owned_process_group_id(process: subprocess.Popen) -> int:
+    """Return the exact detached group owned by one managed ``Popen``.
+
+    Every caller creates the process with ``start_new_session=True``, so the
+    child's pid is also its process-group id. Refuse broad/caller groups before
+    signalling: a cleanup bug must never reach the operator's shell or app.
+    """
+
+    pgid = int(process.pid)
+    if pgid <= 1 or pgid == os.getpgrp():
+        raise HarnessError(f"refusing to signal unsafe managed process group {pgid}")
+    return pgid
 
 
-def command_uses_cargo(command: str) -> bool:
-    if re.search(r"(?:^|[\s;&|()])(?:[^\s;&|()]*/)?cargo(?:[\s;&|()]|$)", command):
+def _process_group_alive(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # A group which still exists but became unsignalable is not safely
+        # cleaned up. Keep treating it as alive so the caller fails closed.
         return True
-    # These checked-in entrypoints invoke Cargo internally. They must share the
-    # same lock even though the literal command line does not contain `cargo`.
-    return any(
-        marker in command
-        for marker in (
-            "scripts/ci.sh",
-            "scripts/harness-runtime-smoke",
-            "npm run dev",
-            "npx tauri",
-            "npm run tauri",
-        )
-    )
+    return True
+
+
+def _wait_for_group_exit(process: subprocess.Popen, pgid: int, timeout_seconds: float) -> bool:
+    deadline = time.monotonic() + timeout_seconds
+    while _process_group_alive(pgid) and time.monotonic() < deadline:
+        process.poll()  # reap the leader without assuming its exit ended the group
+        time.sleep(0.05)
+    process.poll()
+    return not _process_group_alive(pgid)
+
+
+def _terminate_process(process: subprocess.Popen) -> None:
+    """Boundedly terminate the complete owned group, including grandchildren.
+
+    Cancellation is deferred across the full TERM -> KILL -> reap sequence. Without
+    this mask, a second signal (or a first signal after a nominal leader exit) can
+    interrupt the cleanup's own grace period and strand a TERM-ignoring descendant.
+    Pending signals are delivered as soon as the previous mask is restored, after
+    the owned group is gone.
+    """
+
+    previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, MANAGED_CLEANUP_SIGNALS)
+    try:
+        pgid = _owned_process_group_id(process)
+        if _process_group_alive(pgid):
+            try:
+                os.killpg(pgid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        if not _wait_for_group_exit(process, pgid, 3.0):
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            if not _wait_for_group_exit(process, pgid, 3.0):
+                raise HarnessError(f"managed process group {pgid} survived SIGKILL")
+        try:
+            process.wait(timeout=0.5)
+        except subprocess.TimeoutExpired as exc:
+            raise HarnessError(f"managed process leader {process.pid} could not be reaped") from exc
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+
+
+def _wait_managed_process(
+    process: subprocess.Popen,
+    timeout_seconds: float,
+    *,
+    stdin_bytes: Optional[bytes] = None,
+) -> bool:
+    """Wait for one managed group; return whether its wall timeout fired.
+
+    Cleanup runs for timeouts, Python cancellation, ordinary exceptions, and
+    a nominally successful leader which left a background descendant behind.
+    """
+
+    timed_out = False
+    try:
+        if stdin_bytes is not None:
+            process.communicate(input=stdin_bytes, timeout=timeout_seconds)
+        else:
+            process.wait(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        _terminate_process(process)
+    except BaseException:
+        _terminate_process(process)
+        raise
+    finally:
+        if _process_group_alive(_owned_process_group_id(process)):
+            _terminate_process(process)
+    return timed_out
 
 
 def command_uses_playwright(command: str) -> bool:
@@ -702,6 +922,30 @@ def command_uses_playwright(command: str) -> bool:
             "playwright",
             "test:e2e",
             "scripts/ci.sh",
+        )
+    )
+
+
+def command_uses_cargo_lane(command: str) -> bool:
+    """Identify direct and wrapped checks which can compile the heavy Rust/ML tree."""
+
+    normalized = command.lower()
+    if re.search(
+        r"(?<![a-z0-9_.-])(?:cargo(?:-[a-z0-9_-]+)?|rustc)(?![a-z0-9_.-])",
+        normalized,
+    ):
+        return True
+    return any(
+        marker in normalized
+        for marker in (
+            "scripts/ci.sh",
+            ".agents/harness/checks/perf-contracts.sh",
+            "scripts/harness-runtime-smoke",
+            "npm run dev",
+            "npm run tauri",
+            "npx tauri",
+            "scripts/e2e-core.sh",
+            "scripts/e2e-mix.sh",
         )
     )
 
@@ -756,24 +1000,51 @@ def _check_runtime_paths(task_dir: Path) -> Dict[str, Path]:
         "npm_cache": root / "npm-cache",
         "clang_cache": root / "clang-cache",
         "profiles": root / "profiles",
+        "cargo_home": root / "cargo-home",
+        "cargo_target": root / "cargo-target",
     }
     for path in paths.values():
         path.mkdir(parents=True, exist_ok=True)
     return paths
 
 
+def _prepare_private_cargo_home(runtime: Mapping[str, Path], real_home: Path) -> None:
+    """Expose immutable dependency inputs through a task-private Cargo home."""
+
+    cargo_home = runtime["cargo_home"]
+    shared_home = (real_home / ".cargo").resolve()
+    for name in ("registry", "git", "advisory-db"):
+        target = shared_home / name
+        link = cargo_home / name
+        if not target.exists():
+            if os.path.lexists(link):
+                raise HarnessError(f"private Cargo cache link has no source: {link}")
+            continue
+        expected = target.resolve(strict=True)
+        if os.path.lexists(link):
+            if not link.is_symlink():
+                raise HarnessError(f"private Cargo cache entry is not a runner-owned symlink: {link}")
+            try:
+                actual = link.resolve(strict=True)
+            except (FileNotFoundError, OSError) as exc:
+                raise HarnessError(f"private Cargo cache link is invalid: {link}") from exc
+            if actual != expected:
+                raise HarnessError(f"private Cargo cache link changed: {link}")
+            continue
+        link.symlink_to(expected, target_is_directory=True)
+
+
 def build_check_environment(
     worktree: Path,
     task_dir: Path,
     *,
-    cargo_target: Path,
     playwright_port: Optional[int],
 ) -> Tuple[Dict[str, str], Dict[str, Path]]:
     """Build a fixed allowlist environment for untrusted check commands."""
 
     runtime = _check_runtime_paths(task_dir)
     real_home = _real_user_home()
-    cargo_home = (real_home / ".cargo").resolve()
+    _prepare_private_cargo_home(runtime, real_home)
     rustup_home = (real_home / ".rustup").resolve()
     environment = {
         "PATH": _safe_tool_path(real_home),
@@ -790,21 +1061,16 @@ def build_check_environment(
         "NPM_CONFIG_CACHE": str(runtime["npm_cache"]),
         "npm_config_cache": str(runtime["npm_cache"]),
         "CLANG_MODULE_CACHE_PATH": str(runtime["clang_cache"]),
-        "CARGO_HOME": str(cargo_home),
+        "CARGO_HOME": str(runtime["cargo_home"].resolve()),
         "RUSTUP_HOME": str(rustup_home),
-        "CARGO_TARGET_DIR": str(cargo_target.resolve()),
+        "CARGO_TARGET_DIR": str(runtime["cargo_target"].resolve()),
+        "CARGO_BUILD_JOBS": "2",
+        "CARGO_NET_OFFLINE": "true",
+        "CARGO_TERM_COLOR": "never",
+        "RUST_TEST_THREADS": "1",
         "GIT_CONFIG_GLOBAL": "/dev/null",
         "GIT_CONFIG_NOSYSTEM": "1",
         "MISTRALRS_METAL_PRECOMPILE": "0",
-        # Local verification must stay subordinate to the app the operator is
-        # actively using.  These caps cover both Cargo's compiler fan-out and
-        # the Rust/ML test process itself; the latter caused the observed
-        # 1,100% CPU incident while a packaged Murmur recording was running.
-        "CARGO_BUILD_JOBS": "2",
-        "RUST_TEST_THREADS": "2",
-        "RAYON_NUM_THREADS": "2",
-        "TOKIO_WORKER_THREADS": "2",
-        "NG_BUILD_MAX_WORKERS": "2",
         "MURMUR_HARNESS": "1",
         "MURMUR_HARNESS_TASK": task_dir.name,
         "MURMUR_HARNESS_INSTRUCTIONS_SHA256": instructions_hash(
@@ -826,7 +1092,6 @@ def build_check_seatbelt_profile(
     worktree: Path,
     task_dir: Path,
     *,
-    cargo_target: Path,
     runtime: Mapping[str, Path],
     network_mode: str,
 ) -> str:
@@ -840,6 +1105,7 @@ def build_check_seatbelt_profile(
         Path("/System"),
         Path("/usr"),
         Path("/bin"),
+        Path("/dev"),
         Path("/sbin"),
         Path("/Library"),
         Path("/opt/homebrew"),
@@ -847,13 +1113,9 @@ def build_check_seatbelt_profile(
         Path("/private/etc"),
         Path("/private/var/db"),
         Path("/private/var/run"),
-        # xcrun/xcode-select resolves the active Command Line Tools symlink
-        # here before rustc can link a macOS target.
-        Path("/private/var/select"),
         worktree.resolve(),
         common.resolve(),
         task_dir.resolve(),
-        cargo_target.resolve(),
         (real_home / ".cargo").resolve(),
         (real_home / ".rustup").resolve(),
     }
@@ -871,20 +1133,21 @@ def build_check_seatbelt_profile(
         except (FileNotFoundError, OSError) as exc:
             raise HarnessError("shared node_modules link became invalid before a check") from exc
 
-    write_paths = {
-        worktree.resolve(),
-        task_dir.resolve(),
-        cargo_target.resolve(),
-        runtime["root"].resolve(),
-        (task_dir.parent.parent / "runtime").resolve(),
-        (real_home / ".cargo" / "registry").resolve(),
-        (real_home / ".cargo" / "git").resolve(),
-    }
-    cargo_cache_files = [
-        real_home / ".cargo" / ".package-cache",
-        real_home / ".cargo" / ".package-cache-mutate",
-        real_home / ".cargo" / ".global-cache",
-    ]
+    # The check process never needs direct access to contracts, logs, reviews,
+    # or attestations. Those files are written by the parent runner through
+    # already-open handles. Keep mutable child state in explicit private leaves
+    # so test code cannot pre-create evidence-path symlinks for a later phase.
+    write_paths = {worktree.resolve()}
+    for key in (
+        "home",
+        "tmp",
+        "xdg_cache",
+        "npm_cache",
+        "clang_cache",
+        "cargo_home",
+        "cargo_target",
+    ):
+        write_paths.add(runtime[key].resolve())
 
     sensitive_paths = [
         real_home / "Desktop",
@@ -909,33 +1172,39 @@ def build_check_seatbelt_profile(
         real_home / ".cargo" / "credentials.toml",
     ]
 
+    read_filters = ['(literal "/")']
+    for path in sorted(read_paths, key=str):
+        literal = _seatbelt_literal(path)
+        read_filters.extend((f'(literal {literal})', f'(subpath {literal})'))
+    read_scope = '(require-any ' + " ".join(read_filters) + ')'
+    write_filters: List[str] = []
+    for path in sorted(write_paths, key=str):
+        literal = _seatbelt_literal(path)
+        write_filters.extend((f'(literal {literal})', f'(subpath {literal})'))
+    write_scope = '(require-any ' + " ".join(write_filters) + ')'
     lines = [
         '(version 1)',
-        '(deny default)',
-        '(import "system.sb")',
-        '(allow process-exec)',
-        '(allow process-fork)',
-        '(allow signal (target same-sandbox))',
-        # canonicalize(3), git and rustc must be able to traverse the parents
-        # of specifically allowed subpaths.  Grant metadata only for those
-        # ancestors; file contents remain governed by the narrow rules below.
-        '(allow file-read-metadata '
-        + " ".join(
-            f'(literal {_seatbelt_literal(path)})'
-            for path in sorted(
-                {
-                    ancestor
-                    for allowed in read_paths | write_paths
-                    for ancestor in (allowed, *allowed.parents)
-                }
-            )
-        )
-        + ')',
-        '(allow file-read* ' + " ".join(f'(subpath {_seatbelt_literal(path)})' for path in sorted(read_paths)) + ')',
-        '(allow file-write* ' + " ".join(f'(subpath {_seatbelt_literal(path)})' for path in sorted(write_paths)) + ')',
+        # Browsers and the macOS compiler stack need a wide set of non-file
+        # Mach/IOKit/shared-memory operations. Start from platform defaults,
+        # then constrain content reads, every write, signals, credentials and
+        # network with negative capability filters.
+        '(allow default)',
+        f'(deny file-read-data (require-not {read_scope}))',
+        f'(deny file-write* (require-not {write_scope}))',
+        '(deny signal (require-not (target same-sandbox)))',
+        '(deny appleevent-send)',
+        '(deny mach-lookup (global-name "com.apple.securityd"))',
+        '(deny mach-lookup (global-name "com.apple.securityd.xpc"))',
+        '(deny mach-lookup (global-name "com.apple.securityd.system"))',
+        '(deny mach-lookup (global-name "com.apple.security.agent"))',
+        '(deny mach-lookup (global-name "com.apple.SecurityServer"))',
+        '(deny mach-lookup (global-name "com.apple.authd"))',
+        '(deny mach-lookup (global-name "com.apple.akd"))',
+        '(deny mach-lookup (global-name "com.apple.secd"))',
     ]
-    for cache_file in cargo_cache_files:
-        lines.append(f'(allow file-write* (literal {_seatbelt_literal(cache_file)}))')
+    for path in ((real_home / ".cargo").resolve(), (real_home / ".rustup").resolve()):
+        literal = _seatbelt_literal(path)
+        lines.append(f'(deny file-write* (literal {literal}) (subpath {literal}))')
     for path in sensitive_paths:
         literal = _seatbelt_literal(path)
         lines.append(f'(deny file-read* (literal {literal}) (subpath {literal}))')
@@ -943,11 +1212,13 @@ def build_check_seatbelt_profile(
     if network_mode == "loopback":
         lines.extend(
             [
-                '(allow network-bind (local ip "localhost:*"))',
-                '(allow network-inbound (local ip "localhost:*"))',
-                '(allow network-outbound (remote ip "localhost:*"))',
+                '(deny network-bind (require-not (local ip "localhost:*")))',
+                '(deny network-inbound (require-not (local ip "localhost:*")))',
+                '(deny network-outbound (require-not (remote ip "localhost:*")))',
             ]
         )
+    else:
+        lines.append('(deny network*)')
     return "\n".join(lines) + "\n"
 
 
@@ -968,55 +1239,6 @@ def _pid_is_alive(pid: int) -> bool:
         return False
 
 
-def acquire_cargo_lock(task_dir: Path, timeout_seconds: int) -> Optional[Path]:
-    """Serialize Cargo across worktrees, recovering only provably dead owners."""
-
-    lock = task_dir.parent.parent / "cargo-lock"
-    deadline = time.monotonic() + timeout_seconds
-    while True:
-        try:
-            lock.mkdir()
-            atomic_write_json(
-                lock / "owner.json",
-                {"pid": os.getpid(), "task_id": task_dir.name, "acquired_at": utc_now()},
-            )
-            return lock
-        except FileExistsError:
-            owner_path = lock / "owner.json"
-            try:
-                owner = load_json(owner_path)
-                owner_pid = int(owner["pid"])
-            except (HarnessError, KeyError, TypeError, ValueError):
-                owner_pid = 0
-            # Missing/corrupt metadata is not enough evidence to delete a lock.
-            if owner_pid > 0 and not _pid_is_alive(owner_pid):
-                try:
-                    owner_path.unlink()
-                    lock.rmdir()
-                    continue
-                except (FileNotFoundError, OSError):
-                    pass
-            if time.monotonic() >= deadline:
-                raise HarnessError(
-                    f"timed out waiting for machine-wide Cargo lock {lock}; owner pid={owner_pid or 'unknown'}"
-                )
-            time.sleep(0.25)
-
-
-def release_cargo_lock(lock: Optional[Path]) -> None:
-    if lock is None:
-        return
-    owner_path = lock / "owner.json"
-    try:
-        owner = load_json(owner_path)
-        if int(owner.get("pid", -1)) != os.getpid():
-            raise HarnessError(f"refusing to release Cargo lock owned by another process: {lock}")
-        owner_path.unlink()
-        lock.rmdir()
-    except FileNotFoundError:
-        pass
-
-
 def _release_owned_directory_lock(lock: Optional[Path]) -> None:
     if lock is None:
         return
@@ -1031,7 +1253,61 @@ def _release_owned_directory_lock(lock: Optional[Path]) -> None:
         pass
 
 
-def acquire_playwright_port(task_dir: Path, timeout_seconds: int) -> Tuple[Path, int]:
+def acquire_cargo_lane(task_dir: Path, timeout_seconds: float) -> Any:
+    """Acquire the one cross-task Rust build lane.
+
+    This is a kernel advisory lock, not a PID-file lock: normal exit, cancellation,
+    crash and SIGKILL all release it automatically when the descriptor closes. The
+    small JSON payload is diagnostic only and never used to infer ownership.
+    """
+
+    # Share the exact kernel lane used by scripts/agent-resource-run. The task
+    # store is <git-common>/agent-harness/tasks/<id>, so three parents resolve
+    # the linked-worktree common Git directory. Separate lock files here would
+    # let a harness Cargo check overlap an operator/agent build in another WT.
+    git_common_dir = task_dir.parent.parent.parent
+    lock_path = git_common_dir / "murmur-agent-resource-lane.lock"
+    lock_handle = lock_path.open("a+", encoding="utf-8")
+    deadline = time.monotonic() + timeout_seconds
+    try:
+        while True:
+            try:
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise HarnessError("timed out waiting for the shared Cargo build lane")
+                time.sleep(0.1)
+        lock_handle.seek(0)
+        lock_handle.truncate()
+        json.dump(
+            {
+                "pid": os.getpid(),
+                "task_id": task_dir.name,
+                "acquired_at": utc_now(),
+            },
+            lock_handle,
+            sort_keys=True,
+        )
+        lock_handle.write("\n")
+        lock_handle.flush()
+        return lock_handle
+    except BaseException:
+        lock_handle.close()
+        raise
+
+
+def release_cargo_lane(lock_handle: Optional[Any]) -> None:
+    if lock_handle is None:
+        return
+    # Close only this runner's descriptor. An explicit LOCK_UN would release the shared open-file
+    # description even if an inherited managed descendant somehow survived cleanup. Plain close
+    # keeps the lane held by any such survivor and releases it automatically once the last holder
+    # exits.
+    lock_handle.close()
+
+
+def acquire_playwright_port(task_dir: Path, timeout_seconds: float) -> Tuple[Path, int]:
     """Reserve a task-private loopback port across concurrent harness runs."""
 
     locks_root = task_dir.parent.parent / "playwright-ports"
@@ -1096,24 +1372,28 @@ def run_logged_process(
     log_path.parent.mkdir(parents=True, exist_ok=True)
     started = time.monotonic()
     timed_out = False
+    process: Optional[subprocess.Popen] = None
     with log_path.open("wb") as log_handle:
-        process = subprocess.Popen(
-            list(argv),
-            cwd=str(cwd),
-            env=dict(env) if env else None,
-            stdin=subprocess.PIPE if stdin_bytes is not None else subprocess.DEVNULL,
-            stdout=log_handle,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
         try:
-            if stdin_bytes is not None:
-                process.communicate(input=stdin_bytes, timeout=timeout_seconds)
-            else:
-                process.wait(timeout=timeout_seconds)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            _terminate_process(process)
+            process = subprocess.Popen(
+                list(argv),
+                cwd=str(cwd),
+                env=dict(env) if env else None,
+                stdin=subprocess.PIPE if stdin_bytes is not None else subprocess.DEVNULL,
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+            timed_out = _wait_managed_process(
+                process,
+                timeout_seconds,
+                stdin_bytes=stdin_bytes,
+            )
+        finally:
+            if process is not None and _process_group_alive(_owned_process_group_id(process)):
+                _terminate_process(process)
+    if process is None:
+        raise HarnessError("managed process did not start")
     duration_ms = int((time.monotonic() - started) * 1000)
     return {
         "exit_code": process.returncode,
@@ -1129,43 +1409,44 @@ def run_check(worktree: Path, task_dir: Path, check: Mapping[str, Any], phase: s
     log_path = task_dir / "logs" / f"{safe_phase}-{check['id']}.log"
     stdout_path = task_dir / "logs" / f"{safe_phase}-{check['id']}.stdout.log"
     stderr_path = task_dir / "logs" / f"{safe_phase}-{check['id']}.stderr.log"
-    primary, _ = repo_context(worktree)
-    uses_shared_cargo_cache = command_uses_cargo(str(check["command"]))
     uses_playwright = command_uses_playwright(str(check["command"]))
     needs_loopback = command_needs_loopback(str(check["command"]))
-    cargo_target = ((primary if uses_shared_cargo_cache else worktree) / "target").resolve()
     started = time.monotonic()
     started_at = utc_now()
+    deadline = started + float(check["timeout_seconds"])
     timed_out = False
-    cargo_lock: Optional[Path] = None
+    cargo_lane: Optional[Any] = None
     playwright_lock: Optional[Path] = None
     playwright_port: Optional[int] = None
     process: Optional[subprocess.Popen] = None
     try:
-        if uses_shared_cargo_cache:
-            cargo_lock = acquire_cargo_lock(task_dir, int(check["timeout_seconds"]))
+        if command_uses_cargo_lane(str(check["command"])):
+            remaining_for_cargo = deadline - time.monotonic()
+            if remaining_for_cargo <= 0:
+                raise HarnessError(f"check {check['id']} exhausted its deadline before the Cargo lane")
+            cargo_lane = acquire_cargo_lane(task_dir, remaining_for_cargo)
         if uses_playwright:
-            elapsed = time.monotonic() - started
-            remaining_for_port = max(1, int(check["timeout_seconds"] - elapsed))
+            remaining_for_port = deadline - time.monotonic()
+            if remaining_for_port <= 0:
+                raise HarnessError(f"check {check['id']} exhausted its deadline before a UI port")
             playwright_lock, playwright_port = acquire_playwright_port(task_dir, remaining_for_port)
         environment, runtime = build_check_environment(
             worktree,
             task_dir,
-            cargo_target=cargo_target,
             playwright_port=playwright_port,
         )
         network_mode = "loopback" if needs_loopback else "none"
         profile = build_check_seatbelt_profile(
             worktree,
             task_dir,
-            cargo_target=cargo_target,
             runtime=runtime,
             network_mode=network_mode,
         )
         profile_path = runtime["profiles"] / f"{safe_phase}-{check['id']}.sb"
         atomic_write_bytes(profile_path, profile.encode("utf-8"))
-        elapsed = time.monotonic() - started
-        remaining = max(1, int(check["timeout_seconds"] - elapsed))
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise HarnessError(f"check {check['id']} exhausted its deadline before process start")
         stdout_path.parent.mkdir(parents=True, exist_ok=True)
         with stdout_path.open("wb") as stdout_handle, stderr_path.open("wb") as stderr_handle:
             process = subprocess.Popen(
@@ -1176,17 +1457,18 @@ def run_check(worktree: Path, task_dir: Path, check: Mapping[str, Any], phase: s
                 stdout=stdout_handle,
                 stderr=stderr_handle,
                 start_new_session=True,
+                pass_fds=(cargo_lane.fileno(),) if cargo_lane is not None else (),
             )
-            try:
-                process.wait(timeout=remaining)
-            except subprocess.TimeoutExpired:
-                timed_out = True
-                _terminate_process(process)
+            timed_out = _wait_managed_process(process, remaining)
     finally:
         try:
-            _release_owned_directory_lock(playwright_lock)
+            if process is not None and _process_group_alive(_owned_process_group_id(process)):
+                _terminate_process(process)
         finally:
-            release_cargo_lock(cargo_lock)
+            try:
+                _release_owned_directory_lock(playwright_lock)
+            finally:
+                release_cargo_lane(cargo_lane)
     if process is None:
         raise HarnessError(f"check {check['id']} did not start")
     duration_ms = int((time.monotonic() - started) * 1000)
@@ -1564,6 +1846,9 @@ def invoke_model(
 
     validate_schema(document, schema, label=f"{label} result")
     metadata = extract_model_metadata(log_path, vendor, invocation_id)
+    resolved_session = f"fake-{invocation_id}" if vendor == "fake" else metadata["session_id"]
+    resolved_model = "fake" if vendor == "fake" else metadata["model"]
+    resolved_cli_version = "fake" if vendor == "fake" else (command_version(vendor) or "unknown")
     invocation_created_at = utc_now()
     atomic_write_json(
         invocation_path,
@@ -1577,6 +1862,9 @@ def invoke_model(
             "budget_usd": budget,
             "removed_env_names": removed_env_names,
             "instructions_sha256": instructions_sha256,
+            "session_id": resolved_session,
+            "model": resolved_model,
+            "cli_version": resolved_cli_version,
             "created_at": invocation_created_at,
         },
     )
@@ -1588,7 +1876,7 @@ def invoke_model(
             "label": label,
             "role": role,
             "vendor": vendor,
-            "session_id": f"fake-{invocation_id}" if vendor == "fake" else metadata["session_id"],
+            "session_id": resolved_session,
             "exit_code": process_result["exit_code"],
             "timed_out": process_result["timed_out"],
             "duration_ms": process_result["duration_ms"],
@@ -1597,14 +1885,16 @@ def invoke_model(
     )
     return {
         "vendor": vendor,
-        "cli_version": "fake" if vendor == "fake" else (command_version(vendor) or "unknown"),
-        "model": "fake" if vendor == "fake" else metadata["model"],
-        "session_id": f"fake-{invocation_id}" if vendor == "fake" else metadata["session_id"],
+        "cli_version": resolved_cli_version,
+        "model": resolved_model,
+        "session_id": resolved_session,
         "role": role,
         "label": label,
         "result": document,
         "result_path": str(result_path),
+        "artifact_sha256": sha256_file(result_path),
         "invocation_path": str(invocation_path),
+        "invocation_sha256": sha256_file(invocation_path),
         "created_at": invocation_created_at,
         **process_result,
     }
@@ -1778,9 +2068,9 @@ def create_attestation(
             "round": rounds,
             "label": latest_writer["label"],
             "result_path": latest_writer["result_path"],
-            "artifact_sha256": sha256_file(Path(latest_writer["result_path"])),
+            "artifact_sha256": latest_writer["artifact_sha256"],
             "invocation_path": latest_writer["invocation_path"],
-            "invocation_sha256": sha256_file(Path(latest_writer["invocation_path"])),
+            "invocation_sha256": latest_writer["invocation_sha256"],
             "log_path": latest_writer["log"],
             "log_sha256": latest_writer["log_sha256"],
             "created_at": latest_writer["created_at"],
@@ -1809,9 +2099,9 @@ def _review_evidence(model_run: Mapping[str, Any]) -> Dict[str, Any]:
         "session_id": model_run["session_id"],
         "result": model_run["result"],
         "result_path": model_run["result_path"],
-        "artifact_sha256": sha256_file(Path(model_run["result_path"])),
+        "artifact_sha256": model_run["artifact_sha256"],
         "invocation_path": model_run["invocation_path"],
-        "invocation_sha256": sha256_file(Path(model_run["invocation_path"])),
+        "invocation_sha256": model_run["invocation_sha256"],
         "log": model_run["log"],
         "log_sha256": model_run["log_sha256"],
         "duration_ms": model_run["duration_ms"],
@@ -1819,8 +2109,75 @@ def _review_evidence(model_run: Mapping[str, Any]) -> Dict[str, Any]:
     }
 
 
-def run_task(contract: Dict[str, Any], task_dir: Path) -> str:
+def bounded_timeout(deadline: float, configured_seconds: int) -> int:
+    """Return a per-process timeout that cannot outlive the task-wide deadline."""
+
+    remaining = int(deadline - time.monotonic())
+    if remaining < 1:
+        raise HarnessError("task-wide wall-clock deadline exceeded")
+    return max(1, min(int(configured_seconds), remaining))
+
+
+def repair_failure_signature(
+    phase: str, staged_diff_bytes: bytes, failures: Sequence[Mapping[str, Any]]
+) -> str:
+    """Fingerprint observable round-boundary state without model reasoning or prose."""
+
+    normalized: List[Dict[str, Any]] = []
+    for failure in failures:
+        normalized.append(
+            {
+                "id": failure.get("id") or failure.get("kind") or failure.get("name"),
+                "verdict": failure.get("verdict"),
+                "exit_code": failure.get("exit_code"),
+                "timed_out": bool(failure.get("timed_out", False)),
+            }
+        )
+    payload = {
+        "phase": phase,
+        "staged_diff_sha256": sha256_bytes(staged_diff_bytes),
+        "failures": sorted(normalized, key=lambda item: canonical_json(item)),
+    }
+    return sha256_bytes(canonical_json(payload))
+
+
+def write_learning_candidate(
+    contract: Mapping[str, Any], task_dir: Path, *, progress_signature: Optional[str]
+) -> None:
+    """Emit non-binding, content-free failure evidence for later human curation."""
+
+    state_path = task_dir / "state.json"
+    if not state_path.is_file():
+        return
+    state = load_json(state_path)
+    if state.get("status") not in {"FAILED", "BLOCKED"}:
+        return
+    candidate = {
+        "schema_version": 1,
+        "task_id": contract["task_id"],
+        "contract_sha256": contract["contract_sha256"],
+        "status": state.get("status"),
+        "phase": state.get("phase"),
+        "round": state.get("round"),
+        "risk_flags": list(contract.get("risk_flags", [])),
+        "state_sha256": sha256_file(state_path),
+        "progress_signature": progress_signature,
+        "created_at": utc_now(),
+        "disposition": "candidate-only; curate manually with murmur-learn",
+    }
+    atomic_write_json(task_dir / "learning-candidate.json", candidate)
+
+
+def run_task(
+    contract: Dict[str, Any], task_dir: Path, *, allow_test_adapter: bool = False
+) -> str:
     config = load_config()
+    validate_vendor_separation(contract, allow_test_adapter=allow_test_adapter)
+    validate_canonical_checks(
+        [*contract.get("checks", []), *contract.get("final_checks", [])],
+        contract.get("risk_flags", []),
+        config,
+    )
     worktree = Path(contract["worktree_path"])
     if not worktree.is_dir():
         raise HarnessError(f"task worktree is missing: {worktree}")
@@ -1829,19 +2186,37 @@ def run_task(contract: Dict[str, Any], task_dir: Path) -> str:
     assert_provenance(contract, task_dir)
 
     state_path = task_dir / "state.json"
+    prior_status: Optional[str] = None
     if state_path.exists():
         prior = load_json(state_path)
-        if prior.get("status") == "PASSED":
-            raise HarnessError("task already PASSED; verify its attestation instead of rerunning")
+        prior_status = prior.get("status")
+        if prior_status in TERMINAL_STATES:
+            raise HarnessError(
+                f"task is already terminal ({prior_status}); create a lineage-bound new task to retry"
+            )
 
+    task_timeout_seconds = int(config.get("task_timeout_seconds", 7200))
+    if task_timeout_seconds < 1:
+        raise HarnessError("task_timeout_seconds must be positive")
     lock = acquire_run_lock(task_dir)
     all_checks: List[Dict[str, Any]] = []
     final_reviews: List[Dict[str, Any]] = []
     writer_runs: List[Dict[str, Any]] = []
     feedback: List[Dict[str, Any]] = []
+    previous_failure_signature: Optional[str] = None
+    latest_failure_signature: Optional[str] = None
     max_repairs = int(contract["max_repair_rounds"])
     max_writer_rounds = 1 + max_repairs
+    task_deadline = time.monotonic() + task_timeout_seconds
     try:
+        if prior_status != "INITIALIZED":
+            set_state(
+                task_dir,
+                "BLOCKED",
+                phase="interrupted",
+                reason="a prior run ended without a terminal receipt; create a lineage-bound new task",
+            )
+            return "BLOCKED"
         set_state(task_dir, "RUNNING", round=0, phase="writer")
         for round_number in range(1, max_writer_rounds + 1):
             set_state(task_dir, "RUNNING", round=round_number, phase="writer")
@@ -1853,7 +2228,7 @@ def run_task(contract: Dict[str, Any], task_dir: Path) -> str:
                 worktree=worktree,
                 task_dir=task_dir,
                 label=f"round-{round_number:02d}-writer",
-                timeout_seconds=int(config["agent_timeout_seconds"]),
+                timeout_seconds=bounded_timeout(task_deadline, int(config["agent_timeout_seconds"])),
                 instructions_sha256=contract["instructions_sha256"],
             )
             writer_runs.append(writer)
@@ -1877,7 +2252,15 @@ def run_task(contract: Dict[str, Any], task_dir: Path) -> str:
                 return "BLOCKED"
 
             set_state(task_dir, "CHECKING", round=round_number, phase="checks")
-            round_checks = [run_check(worktree, task_dir, check, f"round-{round_number:02d}") for check in contract["checks"]]
+            round_checks = []
+            for check in contract["checks"]:
+                bounded_check = dict(check)
+                bounded_check["timeout_seconds"] = bounded_timeout(
+                    task_deadline, int(check["timeout_seconds"])
+                )
+                round_checks.append(
+                    run_check(worktree, task_dir, bounded_check, f"round-{round_number:02d}")
+                )
             assert_provenance(contract, task_dir)
             all_checks.extend(round_checks)
             failed_checks = [check for check in round_checks if not check["passed"]]
@@ -1909,7 +2292,19 @@ def run_task(contract: Dict[str, Any], task_dir: Path) -> str:
                 diff = after_check_diff
 
             if failed_checks:
+                latest_failure_signature = repair_failure_signature("checks", diff, failed_checks)
                 feedback = [{"source": "deterministic-checks", "failures": failed_checks}]
+                if latest_failure_signature == previous_failure_signature:
+                    set_state(
+                        task_dir,
+                        "BLOCKED",
+                        round=round_number,
+                        phase="stall",
+                        reason="no progress: identical failing-check state repeated",
+                        progress_signature=latest_failure_signature,
+                    )
+                    return "BLOCKED"
+                previous_failure_signature = latest_failure_signature
                 if round_number < max_writer_rounds:
                     set_state(task_dir, "REPAIRING", round=round_number, phase="checks", reason="required check failed")
                     continue
@@ -1931,7 +2326,7 @@ def run_task(contract: Dict[str, Any], task_dir: Path) -> str:
                     worktree=worktree,
                     task_dir=task_dir,
                     label=f"round-{round_number:02d}-{review_name}",
-                    timeout_seconds=int(config["agent_timeout_seconds"]),
+                    timeout_seconds=bounded_timeout(task_deadline, int(config["agent_timeout_seconds"])),
                     instructions_sha256=contract["instructions_sha256"],
                 )
                 evidence = _review_evidence(model_review)
@@ -1960,6 +2355,18 @@ def run_task(contract: Dict[str, Any], task_dir: Path) -> str:
                 return "BLOCKED"
             if review_failed:
                 final_reviews = reviews_this_round
+                latest_failure_signature = repair_failure_signature(
+                    "reviews",
+                    diff,
+                    [
+                        {
+                            "id": review["kind"],
+                            "verdict": review["result"]["verdict"],
+                        }
+                        for review in reviews_this_round
+                        if review["result"]["verdict"] != "PASS"
+                    ],
+                )
                 feedback = [
                     {
                         "source": review["name"],
@@ -1969,6 +2376,17 @@ def run_task(contract: Dict[str, Any], task_dir: Path) -> str:
                     for review in reviews_this_round
                     if review["result"]["verdict"] != "PASS"
                 ]
+                if latest_failure_signature == previous_failure_signature:
+                    set_state(
+                        task_dir,
+                        "BLOCKED",
+                        round=round_number,
+                        phase="stall",
+                        reason="no progress: identical review-failure state repeated",
+                        progress_signature=latest_failure_signature,
+                    )
+                    return "BLOCKED"
+                previous_failure_signature = latest_failure_signature
                 if round_number < max_writer_rounds:
                     set_state(task_dir, "REPAIRING", round=round_number, phase="reviews", reason="review returned FAIL")
                     continue
@@ -1978,7 +2396,13 @@ def run_task(contract: Dict[str, Any], task_dir: Path) -> str:
             final_reviews = reviews_this_round
             reviewed_diff = diff
             set_state(task_dir, "CHECKING", round=round_number, phase="final-checks")
-            final_checks = [run_check(worktree, task_dir, check, "final") for check in contract["final_checks"]]
+            final_checks = []
+            for check in contract["final_checks"]:
+                bounded_check = dict(check)
+                bounded_check["timeout_seconds"] = bounded_timeout(
+                    task_deadline, int(check["timeout_seconds"])
+                )
+                final_checks.append(run_check(worktree, task_dir, bounded_check, "final"))
             assert_provenance(contract, task_dir)
             all_checks.extend(final_checks)
             if any(not check["passed"] for check in final_checks):
@@ -2025,6 +2449,11 @@ def run_task(contract: Dict[str, Any], task_dir: Path) -> str:
             set_state(task_dir, "BLOCKED", round=current.get("round", 0), phase="harness", reason=str(exc))
         raise
     finally:
+        write_learning_candidate(
+            contract,
+            task_dir,
+            progress_signature=latest_failure_signature,
+        )
         release_run_lock(lock)
 
 
@@ -2064,6 +2493,8 @@ def verify_model_invocation(
     role: str,
     label: str,
     session_id: str,
+    model: str,
+    cli_version: str,
     invocation_path_raw: Any,
     invocation_sha256: Any,
     expected_path: Path,
@@ -2078,6 +2509,9 @@ def verify_model_invocation(
         ("role", role),
         ("label", label),
         ("instructions_sha256", instructions_sha256),
+        ("session_id", session_id),
+        ("model", model),
+        ("cli_version", cli_version),
     ):
         if invocation.get(key) != expected:
             raise HarnessError(f"{label} invocation {key} is not bound to the attested run")
@@ -2100,15 +2534,23 @@ def verify_model_invocation(
     return parse_timestamp(invocation.get("created_at"), f"{label}.invocation.created_at")
 
 
-def verify_attestation(contract: Mapping[str, Any], task_dir: Path) -> Dict[str, Any]:
+def verify_attestation(
+    contract: Mapping[str, Any], task_dir: Path, *, allow_test_adapter: bool = False
+) -> Dict[str, Any]:
     """Canonical fail-closed verifier used by verify, guard, and commit."""
 
     validate_schema(dict(contract), load_schema("task"), label="task contract")
+    validate_vendor_separation(contract, allow_test_adapter=allow_test_adapter)
     attestation_path = task_dir / "attestation.json"
     attestation = load_json(attestation_path)
     validate_schema(attestation, load_schema("attestation"), label="attestation")
     worktree = Path(contract["worktree_path"])
     config = load_config()
+    validate_canonical_checks(
+        [*contract.get("checks", []), *contract.get("final_checks", [])],
+        contract.get("risk_flags", []),
+        config,
+    )
     failures: List[str] = []
 
     def require(condition: bool, message: str) -> None:
@@ -2171,6 +2613,12 @@ def verify_attestation(contract: Mapping[str, Any], task_dir: Path) -> Dict[str,
             require(not violations, f"out-of-scope paths now changed: {', '.join(violations)}")
             unsafe_nodes = unsafe_changed_nodes(worktree, current_paths)
             require(not unsafe_nodes, f"unsafe changed nodes exist: {', '.join(unsafe_nodes)}")
+            contaminated = tool_output_contaminated_paths(worktree, current_paths)
+            require(
+                not contaminated,
+                "renderer-truncated tool output exists in changed files: "
+                + ", ".join(contaminated),
+            )
             require(bool(current_diff) == bool(contract["expected_change"]), "staged change presence differs from task contract")
             require(
                 not git_bytes(worktree, "diff", "--binary", "--no-ext-diff", "--").strip(),
@@ -2223,6 +2671,8 @@ def verify_attestation(contract: Mapping[str, Any], task_dir: Path) -> Dict[str,
                 role="writer",
                 label=writer_label,
                 session_id=writer_session,
+                model=writer.get("model"),
+                cli_version=writer.get("cli_version"),
                 invocation_path_raw=writer.get("invocation_path"),
                 invocation_sha256=writer.get("invocation_sha256"),
                 expected_path=writer_invocation_expected,
@@ -2232,6 +2682,10 @@ def verify_attestation(contract: Mapping[str, Any], task_dir: Path) -> Dict[str,
             require(writer_time == invocation_time, "writer timestamp differs from invocation metadata")
             writer_log = evidence_file(task_dir, writer.get("log_path"), writer_log_expected, "writer log")
             require(sha256_file(writer_log) == writer.get("log_sha256"), "writer log changed")
+            if writer_vendor != "fake":
+                log_metadata = extract_model_metadata(writer_log, writer_vendor, writer_session)
+                require(log_metadata["session_id"] == writer_session, "writer session differs from the model log")
+                require(log_metadata["model"] == writer.get("model"), "writer model differs from the model log")
             require(task_created <= writer_time <= receipt_created, "writer timestamp is outside the task lifetime")
         except HarnessError as exc:
             failures.append(str(exc))
@@ -2279,14 +2733,11 @@ def verify_attestation(contract: Mapping[str, Any], task_dir: Path) -> Dict[str,
             combined = b"=== stdout ===\n" + stdout_path.read_bytes() + b"\n=== stderr ===\n" + stderr_path.read_bytes()
             require(log_path.read_bytes() == combined, f"check {check_id} combined log is not canonical")
             require(sha256_file(profile_path) == check.get("sandbox_profile_sha256"), f"check {check_id} sandbox profile changed")
-            uses_cargo = command_uses_cargo(declared["command"])
-            cargo_target = (((Path(contract["repo_realpath"]) if uses_cargo else worktree) / "target").resolve())
             expected_network = "loopback" if command_needs_loopback(declared["command"]) else "none"
             require(check.get("network_mode") == expected_network, f"check {check_id} network policy changed")
             env, runtime = build_check_environment(
                 worktree,
                 task_dir,
-                cargo_target=cargo_target,
                 playwright_port=42000 if command_uses_playwright(declared["command"]) else None,
             )
             require(
@@ -2296,7 +2747,6 @@ def verify_attestation(contract: Mapping[str, Any], task_dir: Path) -> Dict[str,
             expected_profile_text = build_check_seatbelt_profile(
                 worktree,
                 task_dir,
-                cargo_target=cargo_target,
                 runtime=runtime,
                 network_mode=expected_network,
             )
@@ -2350,6 +2800,8 @@ def verify_attestation(contract: Mapping[str, Any], task_dir: Path) -> Dict[str,
                     role="reviewer",
                     label=label,
                     session_id=session,
+                    model=reviewer.get("model"),
+                    cli_version=reviewer.get("cli_version"),
                     invocation_path_raw=review.get("invocation_path"),
                     invocation_sha256=review.get("invocation_sha256"),
                     expected_path=invocation_expected,
@@ -2357,6 +2809,10 @@ def verify_attestation(contract: Mapping[str, Any], task_dir: Path) -> Dict[str,
                 )
                 log_path = evidence_file(task_dir, review.get("log_path"), log_expected, f"review {kind} log")
                 require(sha256_file(log_path) == review.get("log_sha256"), f"review {kind} log changed")
+                if vendor != "fake":
+                    log_metadata = extract_model_metadata(log_path, vendor, session)
+                    require(log_metadata["session_id"] == session, f"review {kind} session differs from the model log")
+                    require(log_metadata["model"] == reviewer.get("model"), f"review {kind} model differs from the model log")
                 review_time = parse_timestamp(review.get("created_at"), f"review[{kind}].created_at")
                 require(task_created <= invocation_time <= review_time <= receipt_created, f"review {kind} timestamp is outside task lifetime")
                 require(writer_time <= review_time, f"review {kind} predates the final writer")
@@ -2420,28 +2876,17 @@ def cmd_init(args: argparse.Namespace) -> int:
     if task_root.exists():
         raise HarnessError(f"task worktree root already exists: {task_root}")
 
-    writer = args.agent
-    reviewer = args.reviewer or ({"codex": "claude", "claude": "codex", "fake": "fake"}[writer])
+    writer, reviewer = resolve_task_vendors(
+        args.agent,
+        args.reviewer,
+        config,
+        allow_test_adapter=bool(getattr(args, "_allow_test_adapter", False)),
+    )
     timeout = int(config.get("check_timeout_seconds", 1800))
     checks = [parse_check(raw, timeout) for raw in args.check]
     final_checks = [parse_check(raw, timeout) for raw in args.final_check]
     risks = classify_risks(owned, args.risk, config)
-    check_ids = {check["id"] for check in checks}
-    if "ui" in risks and "playwright" not in check_ids:
-        checks.append(parse_check("playwright::npm run test:e2e -- --workers=1", timeout))
-        check_ids.add("playwright")
-    if "runtime" in risks and "tauri-boot" not in check_ids:
-        runtime_smoke = primary / "scripts" / "harness-runtime-smoke"
-        if runtime_smoke.is_file():
-            checks.append(parse_check("tauri-boot::scripts/harness-runtime-smoke", timeout))
-            check_ids.add("tauri-boot")
-    missing_evidence = [check_id for check_id in required_risk_evidence(risks, config) if check_id not in check_ids]
-    if missing_evidence:
-        raise HarnessError(
-            "risk classification requires explicit deterministic evidence checks: "
-            + ", ".join(missing_evidence)
-            + ". Add each with --check 'id::command'."
-        )
+    add_missing_canonical_risk_checks(checks, risks, timeout, config)
     if not checks:
         raise HarnessError(
             "every task requires at least one deterministic pre-review check; "
@@ -2451,6 +2896,7 @@ def cmd_init(args: argparse.Namespace) -> int:
     duplicates = sorted({check_id for check_id in all_check_ids if all_check_ids.count(check_id) > 1})
     if duplicates:
         raise HarnessError(f"check ids must be unique across checks and final-checks: {', '.join(duplicates)}")
+    validate_canonical_checks([*checks, *final_checks], risks, config)
     created_at = utc_now()
     contract: Dict[str, Any] = {
         "schema_version": 1,
@@ -2564,7 +3010,11 @@ def cmd_init(args: argparse.Namespace) -> int:
 
 def cmd_run(args: argparse.Namespace) -> int:
     contract, task_dir, _ = load_task_from_current_repo(args.task_id, Path.cwd())
-    result = run_task(contract, task_dir)
+    result = run_task(
+        contract,
+        task_dir,
+        allow_test_adapter=bool(getattr(args, "_allow_test_adapter", False)),
+    )
     state = load_json(task_dir / "state.json")
     print(json.dumps(state, indent=2, sort_keys=True))
     return 0 if result == "PASSED" else 1
@@ -2590,7 +3040,11 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 def cmd_verify(args: argparse.Namespace) -> int:
     contract, task_dir, _ = load_task_from_current_repo(args.task_id, Path.cwd())
-    attestation = verify_attestation(contract, task_dir)
+    attestation = verify_attestation(
+        contract,
+        task_dir,
+        allow_test_adapter=bool(getattr(args, "_allow_test_adapter", False)),
+    )
     print(
         json.dumps(
             {
@@ -2632,7 +3086,11 @@ def cmd_guard_commit(args: argparse.Namespace) -> int:
         validate_schema(contract, load_schema("task"), label="task contract")
         if contract_hash(contract) != contract.get("contract_sha256"):
             raise HarnessError("task contract hash mismatch")
-    verify_attestation(contract, task_dir)
+    verify_attestation(
+        contract,
+        task_dir,
+        allow_test_adapter=bool(getattr(args, "_allow_test_adapter", False)),
+    )
     if not getattr(args, "quiet", False):
         print(f"agent-harness: commit gate PASS for {contract['task_id']}")
     return 0
@@ -2718,7 +3176,11 @@ def cmd_commit(args: argparse.Namespace) -> int:
     state = load_json(task_dir / "state.json")
     if state.get("status") != "PASSED":
         raise HarnessError(f"only a PASSED task can be committed; current status is {state.get('status')}")
-    attestation = verify_attestation(contract, task_dir)
+    attestation = verify_attestation(
+        contract,
+        task_dir,
+        allow_test_adapter=bool(getattr(args, "_allow_test_adapter", False)),
+    )
     worktree = Path(contract["worktree_path"])
     if Path(git(worktree, "rev-parse", "--show-toplevel")).resolve() != worktree.resolve():
         raise HarnessError("recorded task worktree does not match its Git root")
@@ -2995,11 +3457,48 @@ def _selftest_init_args(task_id: str, prompt: str, expected_change: bool) -> arg
         branch=None,
         expected_change=expected_change,
         quiet=True,
+        _allow_test_adapter=True,
     )
 
 
 def cmd_selftest(_args: argparse.Namespace) -> int:
     failures: List[str] = []
+    config = load_config()
+    default_cli_args = build_parser().parse_args(
+        ["init", "selftest-default-vendors", "--prompt", "verify defaults", "--owned", "owned.txt"]
+    )
+    if resolve_task_vendors(default_cli_args.agent, default_cli_args.reviewer, config) != (
+        "claude",
+        "codex",
+    ):
+        failures.append("default task vendors are not Claude writer -> Codex reviewer")
+    if resolve_task_vendors("codex", None, config) != ("codex", "claude"):
+        failures.append("explicit writer override did not select the opposite reviewer")
+    for writer, reviewer, label in (
+        ("fake", "fake", "public fake adapter"),
+        ("codex", "codex", "same-vendor Codex review"),
+        ("claude", "claude", "same-vendor Claude review"),
+    ):
+        try:
+            resolve_task_vendors(writer, reviewer, config)
+            failures.append(f"{label} was accepted")
+        except HarnessError:
+            pass
+    if resolve_task_vendors("fake", "fake", config, allow_test_adapter=True) != (
+        "fake",
+        "fake",
+    ):
+        failures.append("internal fake adapter was unavailable to the deterministic selftest")
+    audio_risks = classify_risks(["src-tauri/src/audio/spill.rs"], [], config)
+    if "runtime" not in audio_risks or "performance" not in audio_risks:
+        failures.append("audio hot paths are not automatically classified as runtime + performance")
+    attachment_risks = classify_risks(
+        ["src-tauri/src/commands/attachments.rs", "src/app/features/detail/attachment-view.ts"],
+        [],
+        config,
+    )
+    if "lock" not in attachment_risks:
+        failures.append("attachment read surfaces are not automatically classified as lock-sensitive")
     claude_schema = schema_for_model_cli(load_schema("review"), "claude")
     if "$schema" in claude_schema or "$id" in claude_schema:
         failures.append("Claude CLI schema retained unsupported draft metadata")
@@ -3037,7 +3536,14 @@ def cmd_selftest(_args: argparse.Namespace) -> int:
         cargo_dir.mkdir()
         (cargo_dir / "Cargo.toml").write_text(
             '[package]\nname="selftest-app"\nversion="0.0.0"\nedition="2021"\n'
-            '[dependencies]\nmurmur-protocol={path="../../murmur-server/crates/murmur-protocol"}\n',
+            '[dependencies]\nmurmur-protocol={path="../../murmur-server/crates/murmur-protocol"}\n'
+            'serde="=1.0.228"\n',
+            encoding="utf-8",
+        )
+        cargo_src = cargo_dir / "src"
+        cargo_src.mkdir()
+        (cargo_src / "lib.rs").write_text(
+            "#[cfg(test)] mod tests { #[test] fn sandbox_smoke() { assert_eq!(2 + 2, 4); } }\n",
             encoding="utf-8",
         )
         run_capture(
@@ -3050,6 +3556,7 @@ def cmd_selftest(_args: argparse.Namespace) -> int:
                 ".gitignore",
                 ".murmur-server-revision",
                 "src-tauri/Cargo.toml",
+                "src-tauri/src/lib.rs",
             ],
             repo,
         )
@@ -3086,35 +3593,90 @@ def cmd_selftest(_args: argparse.Namespace) -> int:
             previous_zdotdir = os.environ.get("ZDOTDIR")
             os.environ["ZDOTDIR"] = str(poisoned_zdotdir)
             try:
-                if run_task(contract, task_dir) != "PASSED":
-                    failures.append("passing fake task did not reach PASSED")
+                if run_task(contract, task_dir, allow_test_adapter=True) != "PASSED":
+                    failed_log = task_dir / "logs" / "round-03-deterministic.log"
+                    if not failed_log.is_file():
+                        candidates = sorted((task_dir / "logs").glob("round-*-deterministic.log"))
+                        failed_log = candidates[-1] if candidates else failed_log
+                    log_detail = (
+                        failed_log.read_text(encoding="utf-8", errors="replace")[-2000:]
+                        if failed_log.is_file()
+                        else "no check log"
+                    )
+                    failures.append(
+                        "passing fake task did not reach PASSED: "
+                        + str(load_json(task_dir / "state.json").get("reason", "unknown"))
+                        + ": "
+                        + log_detail
+                    )
             finally:
                 if previous_zdotdir is None:
                     os.environ.pop("ZDOTDIR", None)
                 else:
                     os.environ["ZDOTDIR"] = previous_zdotdir
-            verify_attestation(contract, task_dir)
+            verify_attestation(contract, task_dir, allow_test_adapter=True)
             original_attestation = load_json(task_dir / "attestation.json")
             reused_session_attestation = copy.deepcopy(original_attestation)
             for review in reused_session_attestation["reviews"]:
                 review["reviewer"]["session_id"] = reused_session_attestation["writer"]["session_id"]
             atomic_write_json(task_dir / "attestation.json", reused_session_attestation)
             try:
-                verify_attestation(contract, task_dir)
+                verify_attestation(contract, task_dir, allow_test_adapter=True)
                 failures.append("canonical verifier accepted reviewer sessions reused from the writer")
             except HarnessError:
                 pass
             finally:
                 atomic_write_json(task_dir / "attestation.json", original_attestation)
+
+            # Deterministic TCB mutation campaign: every security-relevant
+            # single-field change must turn an accepted receipt into DENY.
+            mutations: List[Tuple[str, Tuple[Any, ...], Any]] = [
+                ("task id", ("task_id",), "another-task"),
+                ("contract hash", ("contract_sha256",), "0" * 64),
+                ("tree hash", ("tree_sha",), "0" * 40),
+                ("diff hash", ("staged_diff_sha256",), "0" * 64),
+                ("writer round", ("writer", "round"), original_attestation["rounds"] + 1),
+                ("writer artifact", ("writer", "artifact_sha256"), "0" * 64),
+                ("writer invocation", ("writer", "invocation_sha256"), "0" * 64),
+                ("writer log", ("writer", "log_sha256"), "0" * 64),
+                ("check command", ("checks", 0, "command"), "true"),
+                ("check stdout", ("checks", 0, "stdout_sha256"), "0" * 64),
+                ("check sandbox", ("checks", 0, "sandbox_profile_sha256"), "0" * 64),
+                ("review diff", ("reviews", 0, "staged_diff_sha256"), "0" * 64),
+                ("review artifact", ("reviews", 0, "artifact_sha256"), "0" * 64),
+                ("review log", ("reviews", 0, "log_sha256"), "0" * 64),
+                ("future timestamp", ("created_at",), "2999-01-01T00:00:00Z"),
+            ]
+            for label, path, value in mutations:
+                mutated = copy.deepcopy(original_attestation)
+                cursor: Any = mutated
+                for segment in path[:-1]:
+                    cursor = cursor[segment]
+                cursor[path[-1]] = value
+                atomic_write_json(task_dir / "attestation.json", mutated)
+                try:
+                    verify_attestation(contract, task_dir, allow_test_adapter=True)
+                    failures.append(f"canonical verifier accepted TCB mutation: {label}")
+                except HarnessError:
+                    pass
+            atomic_write_json(task_dir / "attestation.json", original_attestation)
+
+            try:
+                verify_attestation(contract, task_dir)
+                failures.append("production verifier accepted a legacy fake receipt")
+            except HarnessError:
+                pass
             previous_cwd = Path.cwd()
             try:
                 os.chdir(worktree)
-                cmd_guard_commit(argparse.Namespace(task_id=None, quiet=True))
+                cmd_guard_commit(
+                    argparse.Namespace(task_id=None, quiet=True, _allow_test_adapter=True)
+                )
             finally:
                 os.chdir(previous_cwd)
             (worktree / "owned.txt").write_text("base\nchanged\nstale\n", encoding="utf-8")
             try:
-                verify_attestation(contract, task_dir)
+                verify_attestation(contract, task_dir, allow_test_adapter=True)
                 failures.append("post-attestation edit was not rejected")
             except HarnessError:
                 pass
@@ -3144,8 +3706,97 @@ def cmd_selftest(_args: argparse.Namespace) -> int:
             scope_contract, scope_dir, _ = load_task_from_current_repo("selftest-scope", repo)
             scope_worktree = Path(scope_contract["worktree_path"])
             (scope_worktree / "other.txt").write_text("out of scope\n", encoding="utf-8")
-            if run_task(scope_contract, scope_dir) != "FAILED":
+            if run_task(scope_contract, scope_dir, allow_test_adapter=True) != "FAILED":
                 failures.append("out-of-scope edit was not rejected")
+
+            contamination_args = _selftest_init_args(
+                "selftest-truncated-tool-output",
+                "reject renderer-truncated tool output copied into source",
+                True,
+            )
+            cmd_init(contamination_args)
+            contamination_contract, contamination_dir, _ = load_task_from_current_repo(
+                "selftest-truncated-tool-output", repo
+            )
+            contamination_worktree = Path(contamination_contract["worktree_path"])
+            (contamination_worktree / "owned.txt").write_text(
+                "base\nWarning: truncated output (original token count: 90092)\n"
+                "Total output lines: 7012\n",
+                encoding="utf-8",
+            )
+            if (
+                run_task(
+                    contamination_contract,
+                    contamination_dir,
+                    allow_test_adapter=True,
+                )
+                != "FAILED"
+            ):
+                failures.append("renderer-truncated tool output contamination was not rejected")
+            else:
+                contamination_state = load_json(contamination_dir / "state.json")
+                if (
+                    contamination_state.get("phase") != "scope"
+                    or "renderer-truncated tool output"
+                    not in contamination_state.get("reason", "")
+                ):
+                    failures.append(
+                        "renderer-truncated tool output failed outside the trusted scope boundary"
+                    )
+
+            stall_args = _selftest_init_args(
+                "selftest-stall", "stop an identical failing-check loop", False
+            )
+            stall_args.check = ["stuck::false"]
+            stall_args.final_check = []
+            cmd_init(stall_args)
+            stall_contract, stall_dir, _ = load_task_from_current_repo("selftest-stall", repo)
+            if run_task(stall_contract, stall_dir, allow_test_adapter=True) != "BLOCKED":
+                failures.append("identical failing checks did not trigger the no-progress circuit breaker")
+            stall_state = load_json(stall_dir / "state.json")
+            if stall_state.get("phase") != "stall" or stall_state.get("round") != 2:
+                failures.append("no-progress circuit breaker did not stop on the second identical round")
+            if not (stall_dir / "learning-candidate.json").is_file():
+                failures.append("terminal failed task did not emit a learning candidate")
+            try:
+                run_task(stall_contract, stall_dir, allow_test_adapter=True)
+                failures.append("terminal task received a fresh repair budget on rerun")
+            except HarnessError as exc:
+                if "already terminal" not in str(exc):
+                    failures.append("terminal rerun failed for an unexpected reason")
+
+            interrupted_args = _selftest_init_args(
+                "selftest-interrupted", "do not reset an abandoned run budget", False
+            )
+            cmd_init(interrupted_args)
+            interrupted_contract, interrupted_dir, _ = load_task_from_current_repo(
+                "selftest-interrupted", repo
+            )
+            set_state(interrupted_dir, "RUNNING", round=1, phase="writer")
+            if run_task(
+                interrupted_contract, interrupted_dir, allow_test_adapter=True
+            ) != "BLOCKED":
+                failures.append("an abandoned nonterminal run received a fresh repair budget")
+            if load_json(interrupted_dir / "state.json").get("phase") != "interrupted":
+                failures.append("abandoned run did not land in the explicit interrupted state")
+
+            missing_state_args = _selftest_init_args(
+                "selftest-missing-state", "do not treat deleted run state as fresh", False
+            )
+            cmd_init(missing_state_args)
+            missing_state_contract, missing_state_dir, _ = load_task_from_current_repo(
+                "selftest-missing-state", repo
+            )
+            (missing_state_dir / "state.json").unlink()
+            if run_task(
+                missing_state_contract, missing_state_dir, allow_test_adapter=True
+            ) != "BLOCKED":
+                failures.append("a task with deleted state received a fresh execution budget")
+            missing_state = load_json(missing_state_dir / "state.json")
+            if missing_state.get("phase") != "interrupted":
+                failures.append("deleted task state did not fail closed as interrupted")
+            if not (missing_state_dir / "learning-candidate.json").is_file():
+                failures.append("deleted task state did not emit a learning candidate")
 
             args = _selftest_init_args("selftest-repair", "exercise one bounded repair", True)
             cmd_init(args)
@@ -3154,15 +3805,22 @@ def cmd_selftest(_args: argparse.Namespace) -> int:
             (repair_worktree / "owned.txt").write_text("base\nrepair target\n", encoding="utf-8")
             os.environ["MURMUR_HARNESS_FAKE_ROUND_01_SPEC_VERDICT"] = "FAIL"
             try:
-                if run_task(repair_contract, repair_dir) != "PASSED":
+                if run_task(repair_contract, repair_dir, allow_test_adapter=True) != "PASSED":
                     failures.append("repair task did not recover from first-round review failure")
             finally:
                 os.environ.pop("MURMUR_HARNESS_FAKE_ROUND_01_SPEC_VERDICT", None)
             repair_state = load_json(repair_dir / "state.json")
             if repair_state.get("round") != 2:
                 failures.append("repair task did not record exactly two writer rounds")
-            verify_attestation(repair_contract, repair_dir)
-            cmd_commit(argparse.Namespace(task_id="selftest-repair", message="test: selftest repair task", quiet=True))
+            verify_attestation(repair_contract, repair_dir, allow_test_adapter=True)
+            cmd_commit(
+                argparse.Namespace(
+                    task_id="selftest-repair",
+                    message="test: selftest repair task",
+                    quiet=True,
+                    _allow_test_adapter=True,
+                )
+            )
             if load_json(repair_dir / "state.json").get("status") != "COMMITTED":
                 failures.append("runner commit did not record COMMITTED state")
             original_commit_receipt = load_json(repair_dir / "commit.json")
@@ -3186,15 +3844,25 @@ def cmd_selftest(_args: argparse.Namespace) -> int:
             ).returncode != 0:
                 failures.append("close removed the preserved task branch")
 
-            # Prove dead-owner recovery without weakening the live-owner rule.
-            cargo_lock = repair_dir.parent.parent / "cargo-lock"
-            cargo_lock.mkdir()
-            stale_pid = 900000
-            while _pid_is_alive(stale_pid):
-                stale_pid += 1
-            atomic_write_json(cargo_lock / "owner.json", {"pid": stale_pid, "task_id": "dead"})
-            recovered = acquire_cargo_lock(repair_dir, 1)
-            release_cargo_lock(recovered)
+            no_change_args = _selftest_init_args("selftest-no-change-lifecycle", "attest an analysis task", False)
+            cmd_init(no_change_args)
+            no_change_contract, no_change_dir, _ = load_task_from_current_repo(
+                "selftest-no-change-lifecycle", repo
+            )
+            no_change_worktree = Path(no_change_contract["worktree_path"])
+            if run_task(no_change_contract, no_change_dir, allow_test_adapter=True) != "PASSED":
+                failures.append("no-change task did not reach PASSED")
+            cmd_commit(
+                argparse.Namespace(
+                    task_id="selftest-no-change-lifecycle",
+                    message="test: attest no-change task",
+                    quiet=True,
+                    _allow_test_adapter=True,
+                )
+            )
+            cmd_close(argparse.Namespace(task_id="selftest-no-change-lifecycle", quiet=True))
+            if no_change_worktree.exists() or load_json(no_change_dir / "state.json").get("status") != "CLOSED":
+                failures.append("no-change task did not complete the committed close lifecycle")
 
             # Playwright workers reload playwright.config.ts in fresh PIDs, so
             # the runner must assign and hold a stable task-private port.
@@ -3204,8 +3872,8 @@ def cmd_selftest(_args: argparse.Namespace) -> int:
                 "sys.exit(0 if 42000 <= port < 62000 else 1)"
             )
             port_check = run_check(
-                repo,
-                repair_dir,
+                scope_worktree,
+                scope_dir,
                 {
                     "id": "playwright-port",
                     "command": f"{json.dumps(sys.executable)} -c {json.dumps(port_probe)} playwright",
@@ -3215,16 +3883,132 @@ def cmd_selftest(_args: argparse.Namespace) -> int:
             )
             if not port_check["passed"]:
                 failures.append("Playwright check did not receive a task-private port")
-            locks_root = repair_dir.parent.parent / "playwright-ports"
+            locks_root = scope_dir.parent.parent / "playwright-ports"
             if any(locks_root.glob("*.lock")):
                 failures.append("Playwright port lock was not released after the check")
+
+            cargo_lane_commands = (
+                "cargo test --lib",
+                "cargo; true",
+                "(cargo)",
+                "cargo|tee build.log",
+                "cargo-nextest run",
+                "rustc --test probe.rs",
+                "\"cargo\" test --lib",
+                "'cargo' test --lib",
+                "cargo>/tmp/build.log",
+                "\"rustc\" --version",
+                "python3 -c \"import subprocess; subprocess.run(['cargo','test'])\"",
+                "bash scripts/ci.sh",
+                "bash .agents/harness/checks/perf-contracts.sh",
+                "scripts/harness-runtime-smoke",
+                "npm run dev",
+                "scripts/e2e-core.sh",
+            )
+            for command in cargo_lane_commands:
+                if not command_uses_cargo_lane(command):
+                    failures.append(f"Cargo lane classifier missed: {command}")
+            canonical_lane_checks = canonical_check_commands(config)
+            for check_id in ("rust-lib", "protocol-server", "perf-contracts", "tauri-boot"):
+                command = canonical_lane_checks.get(check_id, "")
+                if not command or not command_uses_cargo_lane(command):
+                    failures.append(f"Cargo lane classifier missed canonical check: {check_id}")
+            if command_uses_cargo_lane("npm run test:e2e -- --workers=1"):
+                failures.append("Cargo lane classifier serialized a frontend-only Playwright check")
+            for command in ("scargo test", "cargoes", "test -f Cargo.toml", "docs/cargo.md"):
+                if command_uses_cargo_lane(command):
+                    failures.append(f"Cargo lane classifier produced a false positive: {command}")
+
+            capped_environment, _ = build_check_environment(
+                scope_worktree,
+                scope_dir,
+                playwright_port=None,
+            )
+            if capped_environment.get("CARGO_BUILD_JOBS") != "2":
+                failures.append("deterministic check environment did not cap Cargo build jobs")
+            if capped_environment.get("RUST_TEST_THREADS") != "1":
+                failures.append("deterministic check environment did not cap Rust test threads")
+
+            # The kernel Cargo lock must remain held by the managed check after a hard-killed
+            # runner. This harmless Python command is classified via its shell comment; it never
+            # invokes Cargo, but inherits the exact lock descriptor through the sandbox process.
+            lane_runtime = _check_runtime_paths(scope_dir)
+            lane_ready = lane_runtime["tmp"] / "lane-inheritance-ready"
+            lane_ready.unlink(missing_ok=True)
+            lane_probe = (
+                "import os,pathlib,time; "
+                f"pathlib.Path({str(lane_ready)!r}).write_text(str(os.getpgrp())); "
+                "time.sleep(30)"
+            )
+            lane_driver_code = (
+                "import pathlib; from task_runner import run_check; "
+                f"run_check(pathlib.Path({str(scope_worktree)!r}), "
+                f"pathlib.Path({str(scope_dir)!r}), "
+                f"{{'id':'lane-inheritance','command':{(sys.executable + ' -c ' + json.dumps(lane_probe) + ' # cargo')!r},'timeout_seconds':30}}, "
+                "'selftest')"
+            )
+            lane_driver_env = dict(os.environ)
+            lane_driver_env["PYTHONPATH"] = str(HARNESS_ROOT)
+            lane_driver = subprocess.Popen(
+                [sys.executable, "-c", lane_driver_code],
+                cwd=str(repo),
+                env=lane_driver_env,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            lane_check_pgid = 0
+            try:
+                lane_ready_deadline = time.monotonic() + 5.0
+                while not lane_ready.exists() and time.monotonic() < lane_ready_deadline:
+                    time.sleep(0.05)
+                if not lane_ready.exists():
+                    failures.append("Cargo lane inheritance selftest did not arm its managed check")
+                else:
+                    lane_check_pgid = int(lane_ready.read_text(encoding="utf-8"))
+                    os.kill(lane_driver.pid, signal.SIGKILL)
+                    lane_driver.wait(timeout=3)
+                    if not _process_group_alive(lane_check_pgid):
+                        failures.append("Cargo lane inheritance probe exited with its killed runner")
+                    acquired_while_child_alive = None
+                    try:
+                        acquired_while_child_alive = acquire_cargo_lane(scope_dir, 0.4)
+                        failures.append("hard-killed runner released Cargo lane while its check survived")
+                    except HarnessError as exc:
+                        if "timed out waiting" not in str(exc):
+                            failures.append(f"Cargo lane contention returned an unclear error: {exc}")
+                    finally:
+                        release_cargo_lane(acquired_while_child_alive)
+            finally:
+                if lane_driver.poll() is None:
+                    os.kill(lane_driver.pid, signal.SIGKILL)
+                    lane_driver.wait(timeout=3)
+                if lane_check_pgid > 1 and lane_check_pgid != os.getpgrp():
+                    try:
+                        os.killpg(lane_check_pgid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    lane_exit_deadline = time.monotonic() + 2.0
+                    while _process_group_alive(lane_check_pgid) and time.monotonic() < lane_exit_deadline:
+                        time.sleep(0.05)
+                try:
+                    lane_after_cleanup = acquire_cargo_lane(scope_dir, 1.0)
+                except HarnessError as exc:
+                    failures.append(f"Cargo lane did not recover after managed check exit: {exc}")
+                else:
+                    release_cargo_lane(lane_after_cleanup)
+
+            # The harness selftest stays control-plane-only. The real Rust sandbox/gate runs once
+            # through the repository's canonical `rust-lib` check instead of recompiling the heavy
+            # always-on ML tree during every harness iteration.
 
             os.environ["MURMUR_CHECK_SECRET_TOKEN"] = "must-not-cross-check-boundary"
             try:
                 secret_probe = "import os,sys; sys.exit(1 if 'MURMUR_CHECK_SECRET_TOKEN' in os.environ else 0)"
                 secret_check = run_check(
-                    repo,
-                    repair_dir,
+                    scope_worktree,
+                    scope_dir,
                     {
                         "id": "ambient-secret",
                         "command": f"{json.dumps(sys.executable)} -c {json.dumps(secret_probe)}",
@@ -3241,8 +4025,8 @@ def cmd_selftest(_args: argparse.Namespace) -> int:
             outside_probe.write_text("unchanged\n", encoding="utf-8")
             outside_write = f"from pathlib import Path; Path({str(outside_probe)!r}).write_text('mutated')"
             write_check = run_check(
-                repo,
-                repair_dir,
+                scope_worktree,
+                scope_dir,
                 {
                     "id": "outside-write",
                     "command": f"{json.dumps(sys.executable)} -c {json.dumps(outside_write)}",
@@ -3252,10 +4036,56 @@ def cmd_selftest(_args: argparse.Namespace) -> int:
             )
             if write_check["passed"] or outside_probe.read_text(encoding="utf-8") != "unchanged\n":
                 failures.append("check sandbox allowed a write outside task-owned paths")
+
+            # This exact subtree was writable before task-private Cargo isolation.
+            # Keeping the fixture there proves the old profile RED and the new one GREEN.
+            shared_cargo_probe = (
+                _real_user_home() / ".cargo" / "registry" / ".murmur-harness-write-probe"
+            )
+            if os.path.lexists(shared_cargo_probe):
+                failures.append(f"refusing to overwrite pre-existing Cargo probe path: {shared_cargo_probe}")
+            else:
+                cargo_write = (
+                    "from pathlib import Path; "
+                    f"Path({str(shared_cargo_probe)!r}).write_text('mutated')"
+                )
+                cargo_write_check = run_check(
+                    scope_worktree,
+                    scope_dir,
+                    {
+                        "id": "shared-cargo-write",
+                        "command": f"{json.dumps(sys.executable)} -c {json.dumps(cargo_write)}",
+                        "timeout_seconds": 5,
+                    },
+                    "selftest",
+                )
+                if cargo_write_check["passed"] or os.path.lexists(shared_cargo_probe):
+                    failures.append("check sandbox allowed mutation of the shared Cargo cache")
+
+            evidence_probe = scope_dir / "logs" / ".future-phase-write-probe"
+            if os.path.lexists(evidence_probe):
+                failures.append(f"refusing to overwrite pre-existing evidence probe: {evidence_probe}")
+            else:
+                evidence_write = (
+                    "from pathlib import Path; "
+                    f"Path({str(evidence_probe)!r}).write_text('mutated')"
+                )
+                evidence_write_check = run_check(
+                    scope_worktree,
+                    scope_dir,
+                    {
+                        "id": "task-evidence-write",
+                        "command": f"{json.dumps(sys.executable)} -c {json.dumps(evidence_write)}",
+                        "timeout_seconds": 5,
+                    },
+                    "selftest",
+                )
+                if evidence_write_check["passed"] or os.path.lexists(evidence_probe):
+                    failures.append("check sandbox allowed direct mutation of runner evidence")
             outside_read = f"from pathlib import Path; Path({str(outside_probe)!r}).read_text()"
             read_check = run_check(
-                repo,
-                repair_dir,
+                scope_worktree,
+                scope_dir,
                 {
                     "id": "outside-read",
                     "command": f"{json.dumps(sys.executable)} -c {json.dumps(outside_read)}",
@@ -3271,8 +4101,8 @@ def cmd_selftest(_args: argparse.Namespace) -> int:
                 "sys.exit(0 if s.connect_ex(('1.1.1.1',443)) == 0 else 1)"
             )
             outbound_check = run_check(
-                repo,
-                repair_dir,
+                scope_worktree,
+                scope_dir,
                 {
                     "id": "outbound-network",
                     "command": f"{json.dumps(sys.executable)} -c {json.dumps(outbound_probe)}",
@@ -3287,8 +4117,8 @@ def cmd_selftest(_args: argparse.Namespace) -> int:
                 "c=socket.socket(); c.connect(s.getsockname()); conn,_=s.accept(); conn.close(); c.close(); s.close()"
             )
             loopback_check = run_check(
-                repo,
-                repair_dir,
+                scope_worktree,
+                scope_dir,
                 {
                     "id": "loopback-network",
                     "command": f"{json.dumps(sys.executable)} -c {json.dumps(loopback_probe)} playwright",
@@ -3299,6 +4129,30 @@ def cmd_selftest(_args: argparse.Namespace) -> int:
             if not loopback_check["passed"]:
                 failures.append("loopback-only sandbox blocked a local runtime check")
 
+            outside_process = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(30)"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            try:
+                signal_check = run_check(
+                    scope_worktree,
+                    scope_dir,
+                    {
+                        "id": "outside-signal",
+                        "command": f"/bin/kill -TERM {outside_process.pid}",
+                        "timeout_seconds": 5,
+                    },
+                    "selftest",
+                )
+                if signal_check["passed"] or outside_process.poll() is not None:
+                    failures.append("check sandbox signalled a process outside its own sandbox")
+            finally:
+                if outside_process.poll() is None:
+                    _terminate_process(outside_process)
+
             timeout_result = run_logged_process(
                 [sys.executable, "-c", "import time; time.sleep(5)"],
                 cwd=repo,
@@ -3307,6 +4161,202 @@ def cmd_selftest(_args: argparse.Namespace) -> int:
             )
             if not timeout_result["timed_out"] or timeout_result["exit_code"] == 0:
                 failures.append("wall timeout did not terminate the synthetic process group")
+
+            # RED regression: the group leader exits on TERM while its child ignores TERM. The
+            # old cleanup returned as soon as the leader was reaped and orphaned the child under
+            # pid 1 — exactly how an interrupted Cargo check left rustc consuming GBs of RAM.
+            stubborn_pid_path = Path(temp_name) / "stubborn-grandchild.pid"
+            stubborn_child = (
+                "import signal,time; "
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                "time.sleep(30)"
+            )
+            stubborn_parent = (
+                "import pathlib,subprocess,sys,time; "
+                f"child=subprocess.Popen([sys.executable,'-c',{stubborn_child!r}]); "
+                f"pathlib.Path({str(stubborn_pid_path)!r}).write_text(str(child.pid)); "
+                "time.sleep(30)"
+            )
+            stubborn_result = run_logged_process(
+                [sys.executable, "-c", stubborn_parent],
+                cwd=repo,
+                timeout_seconds=0.75,
+                log_path=Path(temp_name) / "stubborn-grandchild.log",
+            )
+            stubborn_pid = int(stubborn_pid_path.read_text(encoding="utf-8"))
+            stubborn_deadline = time.monotonic() + 2.0
+            while _pid_is_alive(stubborn_pid) and time.monotonic() < stubborn_deadline:
+                time.sleep(0.05)
+            if not stubborn_result["timed_out"] or _pid_is_alive(stubborn_pid):
+                failures.append("managed timeout orphaned a TERM-ignoring grandchild")
+                try:
+                    os.kill(stubborn_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+            # Ctrl-C reaches the harness driver, not its start_new_session child. Prove that the
+            # resulting KeyboardInterrupt still drains the complete managed group.
+            cancel_leader_path = Path(temp_name) / "cancel-leader.pid"
+            cancel_grandchild_path = Path(temp_name) / "cancel-grandchild.pid"
+            cancel_grandchild = (
+                "import os,pathlib,signal,time; "
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                f"pathlib.Path({str(cancel_grandchild_path)!r}).write_text(str(os.getpid())); "
+                "time.sleep(30)"
+            )
+            cancel_managed = (
+                "import os,pathlib,subprocess,sys,time; "
+                f"pathlib.Path({str(cancel_leader_path)!r}).write_text(str(os.getpid())); "
+                f"subprocess.Popen([sys.executable,'-c',{cancel_grandchild!r}]); "
+                "time.sleep(30)"
+            )
+            cancel_driver = (
+                "import pathlib,sys; "
+                "from task_runner import run_logged_process; "
+                f"run_logged_process([sys.executable,'-c',{cancel_managed!r}], "
+                f"cwd=pathlib.Path({str(repo)!r}), timeout_seconds=30, "
+                f"log_path=pathlib.Path({str(Path(temp_name) / 'cancel-driver.log')!r}))"
+            )
+            cancel_env = dict(os.environ)
+            cancel_env["PYTHONPATH"] = str(HARNESS_ROOT)
+            cancel_process = subprocess.Popen(
+                [sys.executable, "-c", cancel_driver],
+                cwd=str(repo),
+                env=cancel_env,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            cancel_leader_pid = 0
+            cancel_grandchild_pid = 0
+            try:
+                ready_deadline = time.monotonic() + 3.0
+                while (
+                    (not cancel_leader_path.exists() or not cancel_grandchild_path.exists())
+                    and time.monotonic() < ready_deadline
+                ):
+                    time.sleep(0.05)
+                if not cancel_leader_path.exists() or not cancel_grandchild_path.exists():
+                    failures.append("managed SIGINT selftest did not arm its child group")
+                else:
+                    cancel_leader_pid = int(cancel_leader_path.read_text(encoding="utf-8"))
+                    cancel_grandchild_pid = int(cancel_grandchild_path.read_text(encoding="utf-8"))
+                    os.kill(cancel_process.pid, signal.SIGINT)
+                    cancel_process.wait(timeout=5)
+                    cancel_deadline = time.monotonic() + 2.0
+                    while (
+                        (_pid_is_alive(cancel_leader_pid) or _pid_is_alive(cancel_grandchild_pid))
+                        and time.monotonic() < cancel_deadline
+                    ):
+                        time.sleep(0.05)
+                    if cancel_process.returncode == 0:
+                        failures.append("managed SIGINT driver exited successfully instead of cancelling")
+                    if _pid_is_alive(cancel_leader_pid) or _pid_is_alive(cancel_grandchild_pid):
+                        failures.append("managed SIGINT orphaned its child process group")
+            finally:
+                if cancel_process.poll() is None:
+                    _terminate_process(cancel_process)
+                if cancel_leader_pid > 1 and cancel_leader_pid != os.getpgrp():
+                    try:
+                        os.killpg(cancel_leader_pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
+            # A cancellation can also arrive AFTER the managed leader exits, while the driver is
+            # already escalating a TERM-ignoring descendant. That cleanup window must be
+            # interruption-resistant for both terminal SIGINT and the runner's handled SIGTERM.
+            for cleanup_signum, expected_exit in (
+                (signal.SIGINT, 130),
+                (signal.SIGTERM, 143),
+            ):
+                signal_label = signal.Signals(cleanup_signum).name.lower()
+                cleanup_leader_path = Path(temp_name) / f"cleanup-{signal_label}-leader.pid"
+                cleanup_grandchild_path = Path(temp_name) / f"cleanup-{signal_label}-grandchild.pid"
+                cleanup_grandchild = (
+                    "import os,pathlib,signal,time; "
+                    "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                    f"pathlib.Path({str(cleanup_grandchild_path)!r}).write_text(str(os.getpid())); "
+                    "time.sleep(30)"
+                )
+                cleanup_leader = (
+                    "import os,pathlib,subprocess,sys,time; "
+                    f"pathlib.Path({str(cleanup_leader_path)!r}).write_text(str(os.getpid())); "
+                    f"subprocess.Popen([sys.executable,'-c',{cleanup_grandchild!r}]); "
+                    "time.sleep(0.25)"
+                )
+                cleanup_driver = (
+                    "import pathlib,signal,sys; "
+                    "from task_runner import HarnessCancellation,_raise_harness_cancellation,run_logged_process; "
+                    "signal.signal(signal.SIGTERM,_raise_harness_cancellation); "
+                    "signal.signal(signal.SIGHUP,_raise_harness_cancellation); "
+                    "\ntry:\n "
+                    f" run_logged_process([sys.executable,'-c',{cleanup_leader!r}], "
+                    f"cwd=pathlib.Path({str(repo)!r}), timeout_seconds=30, "
+                    f"log_path=pathlib.Path({str(Path(temp_name) / f'cleanup-{signal_label}.log')!r}))"
+                    "\nexcept KeyboardInterrupt:\n sys.exit(130)"
+                    "\nexcept HarnessCancellation as exc:\n sys.exit(128 + exc.signum)"
+                )
+                cleanup_driver_process = subprocess.Popen(
+                    [sys.executable, "-c", cleanup_driver],
+                    cwd=str(repo),
+                    env=cancel_env,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+                cleanup_leader_pid = 0
+                cleanup_grandchild_pid = 0
+                try:
+                    ready_deadline = time.monotonic() + 3.0
+                    while (
+                        (not cleanup_leader_path.exists() or not cleanup_grandchild_path.exists())
+                        and time.monotonic() < ready_deadline
+                    ):
+                        time.sleep(0.05)
+                    if not cleanup_leader_path.exists() or not cleanup_grandchild_path.exists():
+                        failures.append(f"managed {signal_label} cleanup-race selftest did not arm")
+                        continue
+                    cleanup_leader_pid = int(cleanup_leader_path.read_text(encoding="utf-8"))
+                    cleanup_grandchild_pid = int(cleanup_grandchild_path.read_text(encoding="utf-8"))
+                    leader_exit_deadline = time.monotonic() + 3.0
+                    while _pid_is_alive(cleanup_leader_pid) and time.monotonic() < leader_exit_deadline:
+                        time.sleep(0.02)
+                    if _pid_is_alive(cleanup_leader_pid):
+                        failures.append(
+                            f"managed {signal_label} cleanup-race leader did not exit before signalling"
+                        )
+                    else:
+                        # The leader has exited, while the ignored TERM keeps the driver's
+                        # three-second grace active. Interrupt exactly inside that cleanup interval.
+                        time.sleep(0.15)
+                        if cleanup_driver_process.poll() is None:
+                            os.kill(cleanup_driver_process.pid, cleanup_signum)
+                        cleanup_driver_process.wait(timeout=8)
+                        cleanup_deadline = time.monotonic() + 2.0
+                        while (
+                            _pid_is_alive(cleanup_grandchild_pid)
+                            and time.monotonic() < cleanup_deadline
+                        ):
+                            time.sleep(0.05)
+                        if cleanup_driver_process.returncode != expected_exit:
+                            failures.append(
+                                f"managed {signal_label} cleanup-race driver exited "
+                                f"{cleanup_driver_process.returncode}, expected {expected_exit}"
+                            )
+                        if _pid_is_alive(cleanup_grandchild_pid):
+                            failures.append(
+                                f"managed {signal_label} interrupted cleanup orphaned a grandchild"
+                            )
+                finally:
+                    if cleanup_driver_process.poll() is None:
+                        _terminate_process(cleanup_driver_process)
+                    if cleanup_leader_pid > 1 and cleanup_leader_pid != os.getpgrp():
+                        try:
+                            os.killpg(cleanup_leader_pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
             os.environ["MURMUR_SELFTEST_SECRET_TOKEN"] = "must-not-cross-model-boundary"
             try:
                 clean_env, removed_names = sanitized_model_environment("0" * 64, "codex")
@@ -3319,16 +4369,28 @@ def cmd_selftest(_args: argparse.Namespace) -> int:
             finally:
                 os.environ.pop("MURMUR_SELFTEST_SECRET_TOKEN", None)
 
-            risk_args = _selftest_init_args("selftest-risk", "require lock evidence", True)
+            forged_risk_args = _selftest_init_args(
+                "selftest-risk-forged", "reject caller-controlled risk evidence", True
+            )
+            forged_risk_args.owned = ["src-tauri/src/crypto.rs"]
+            forged_risk_args.check = ["rust-lib::true"]
+            forged_risk_args.final_check = []
+            try:
+                cmd_init(forged_risk_args)
+                failures.append("lock-risk init accepted rust-lib::true as security evidence")
+            except HarnessError as exc:
+                if "runner-owned" not in str(exc):
+                    failures.append("forged risk evidence returned an unclear error")
+
+            risk_args = _selftest_init_args("selftest-risk", "bind lock evidence", True)
             risk_args.owned = ["src-tauri/src/crypto.rs"]
             risk_args.check = []
             risk_args.final_check = []
-            try:
-                cmd_init(risk_args)
-                failures.append("lock-risk init accepted missing deterministic evidence")
-            except HarnessError as exc:
-                if "lock-negative" not in str(exc) or "lock-roundtrip" not in str(exc):
-                    failures.append("lock-risk init returned an unclear missing-evidence error")
+            cmd_init(risk_args)
+            risk_contract, _, _ = load_task_from_current_repo("selftest-risk", repo)
+            risk_checks = {check["id"]: check["command"] for check in risk_contract["checks"]}
+            if risk_checks.get("rust-lib") != canonical_check_commands(config).get("rust-lib"):
+                failures.append("lock-risk init did not inject the exact canonical Rust security gate")
 
             no_check_args = _selftest_init_args("selftest-no-check", "reject zero-check receipts", False)
             no_check_args.check = []
@@ -3354,7 +4416,7 @@ def cmd_selftest(_args: argparse.Namespace) -> int:
             symlink_contract, symlink_dir, _ = load_task_from_current_repo("selftest-symlink", repo)
             symlink_worktree = Path(symlink_contract["worktree_path"])
             os.symlink(str((repo / "AGENTS.md").resolve()), str(symlink_worktree / "owned-link"))
-            if run_task(symlink_contract, symlink_dir) != "FAILED":
+            if run_task(symlink_contract, symlink_dir, allow_test_adapter=True) != "FAILED":
                 failures.append("changed external symlink was not rejected as a scope violation")
 
             hardlink_args = _selftest_init_args("selftest-hardlink", "reject hardlink scope escape", True)
@@ -3366,7 +4428,7 @@ def cmd_selftest(_args: argparse.Namespace) -> int:
             outside_hardlink = Path(temp_name) / "outside-hardlink.txt"
             outside_hardlink.write_text("must remain outside\n", encoding="utf-8")
             os.link(outside_hardlink, hardlink_worktree / "owned-hardlink")
-            if run_task(hardlink_contract, hardlink_dir) != "FAILED":
+            if run_task(hardlink_contract, hardlink_dir, allow_test_adapter=True) != "FAILED":
                 failures.append("changed external hardlink was not rejected as a scope violation")
             if outside_hardlink.read_text(encoding="utf-8") != "must remain outside\n":
                 failures.append("hardlink scope probe mutated the outside inode")
@@ -3417,11 +4479,20 @@ def build_parser() -> argparse.ArgumentParser:
     init_parser = subparsers.add_parser("init", help="create a task contract and isolated worktree")
     init_parser.add_argument("task_id")
     init_parser.add_argument("--kind", choices=["bug", "feature", "refactor", "docs", "harness"], default="feature")
-    init_parser.add_argument("--agent", choices=["codex", "claude", "fake"], default="codex")
-    init_parser.add_argument("--reviewer", choices=["codex", "claude", "fake"])
+    init_parser.add_argument(
+        "--agent",
+        choices=["codex", "claude"],
+        help="writer vendor (default: config.json default_writer)",
+    )
+    init_parser.add_argument("--reviewer", choices=["codex", "claude"])
     init_parser.add_argument("--prompt", required=True)
     init_parser.add_argument("--owned", action="append", required=True, metavar="PATH")
-    init_parser.add_argument("--risk", action="append", default=[], choices=["lock", "egress", "protocol", "runtime", "ui", "release"])
+    init_parser.add_argument(
+        "--risk",
+        action="append",
+        default=[],
+        choices=["lock", "egress", "protocol", "runtime", "ui", "performance", "release"],
+    )
     init_parser.add_argument("--check", action="append", default=[], metavar="ID::COMMAND")
     init_parser.add_argument("--final-check", action="append", default=[], metavar="ID::COMMAND")
     init_parser.add_argument("--max-repair-rounds", type=int, default=2, choices=range(0, 6))
@@ -3481,8 +4552,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
 
 if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, _raise_harness_cancellation)
+    signal.signal(signal.SIGHUP, _raise_harness_cancellation)
     try:
         raise SystemExit(main())
     except HarnessError as exc:
         print(f"agent-harness: {exc}", file=sys.stderr)
         raise SystemExit(exc.exit_code)
+    except KeyboardInterrupt:
+        print("agent-harness: cancelled by SIGINT", file=sys.stderr)
+        raise SystemExit(130)
+    except HarnessCancellation as exc:
+        signal_name = signal.Signals(exc.signum).name
+        print(f"agent-harness: cancelled by {signal_name}", file=sys.stderr)
+        raise SystemExit(128 + exc.signum)

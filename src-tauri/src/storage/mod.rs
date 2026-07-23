@@ -1,4 +1,5 @@
 pub(crate) mod ask_store;
+pub mod attachment_store;
 pub(crate) mod audit_store;
 pub(crate) mod brief_store;
 pub mod db;
@@ -13,9 +14,11 @@ pub mod migration;
 pub mod models;
 pub(crate) mod notes_store;
 pub(crate) mod org_store;
+pub(crate) mod recording_store;
 pub(crate) mod seal_store;
 pub(crate) mod settings_store;
 pub mod usage;
 
 pub use db::*;
+pub use attachment_store::*;
 pub use models::*;

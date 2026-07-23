@@ -66,7 +66,12 @@ impl Db {
         // both the claim row inserted BEFORE the pass (crash-safe claim-before-run, the
         // brief-runner discipline) and nothing else. Due-ness reads MAX(finished_at) over
         // scheduled rows only, so manual runs never push the weekly cadence. Additive + guarded.
-        Self::add_column_if_missing(conn, "audit_runs", "scheduled", "INTEGER NOT NULL DEFAULT 0")?;
+        Self::add_column_if_missing(
+            conn,
+            "audit_runs",
+            "scheduled",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
         Ok(())
     }
 

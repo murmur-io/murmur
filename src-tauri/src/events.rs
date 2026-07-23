@@ -374,6 +374,47 @@ pub fn emit_recording_capped(app: &AppHandle) {
     }
 }
 
+/// Emitted exactly once when realtime capture terminates on a device/storage/authority fault.
+/// The payload contains only an allowlisted code and counts; the UI uses it as the auto-Stop seam
+/// that finalizes the exact durable prefix instead of leaving a red-but-still-owned session.
+pub const EVENT_RECORDING_CAPTURE_FAULT: &str = "murmur://recording-capture-fault";
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordingCaptureFaultPayload {
+    pub code: &'static str,
+    pub retained_frames: u64,
+    pub sample_rate: u32,
+}
+
+pub fn emit_recording_capture_fault(
+    app: &AppHandle,
+    fault: crate::audio::recorder::CaptureFault,
+    retained_frames: u64,
+    sample_rate: u32,
+) {
+    use crate::audio::recorder::CaptureFault;
+    let code = match fault {
+        CaptureFault::StreamError => "STREAM_ERROR",
+        CaptureFault::CaptureThreadFailed => "CAPTURE_THREAD_FAILED",
+        CaptureFault::ResidentCapacityExhausted => "RESIDENT_CAPACITY_EXHAUSTED",
+        CaptureFault::BufferLockContended => "BUFFER_LOCK_CONTENDED",
+        CaptureFault::InvalidInterleavedInput => "INVALID_INTERLEAVED_INPUT",
+        CaptureFault::FrameCounterOverflow => "FRAME_COUNTER_OVERFLOW",
+        CaptureFault::CheckpointAuthorityLost => "CHECKPOINT_AUTHORITY_LOST",
+    };
+    if let Err(error) = app.emit(
+        EVENT_RECORDING_CAPTURE_FAULT,
+        RecordingCaptureFaultPayload {
+            code,
+            retained_frames,
+            sample_rate,
+        },
+    ) {
+        tracing::warn!(target: "audio", error = %error, "failed to emit capture-fault notice");
+    }
+}
+
 /// Emitted after a background org-feed sync tick INGESTED or TOMBSTONED ≥1 item — i.e. the local
 /// org (Shared Brain) replica actually changed this tick. Lets an open FE view (the Notes org
 /// picker, the Settings shared-brain list) refresh WITHOUT polling. Counts only, NO PII (no item
@@ -394,7 +435,10 @@ pub struct OrgFeedUpdatedPayload {
 /// (≥1 ingest/tombstone). Swallows the emit failure with a `tracing::warn!` so a failed emit can
 /// NEVER break the background sync loop. NO PII (a count only).
 pub fn emit_org_feed_updated(app: &AppHandle, orgs_changed: u32) {
-    if let Err(e) = app.emit(EVENT_ORG_FEED_UPDATED, OrgFeedUpdatedPayload { orgs_changed }) {
+    if let Err(e) = app.emit(
+        EVENT_ORG_FEED_UPDATED,
+        OrgFeedUpdatedPayload { orgs_changed },
+    ) {
         tracing::warn!(
             target: "org",
             error = %e,

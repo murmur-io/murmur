@@ -235,9 +235,7 @@ fn cgimage_from_file(path: &Path) -> Option<Retained<CGImage>> {
         // SAFETY: a NULL `proposed_dest_rect` (allowed — means "natural size"), no reference context,
         // no hints; the whole closure is inside `catch`, so any ObjC exception is contained. Returns
         // `nil` (→ None) if the image has no CGImage representation.
-        unsafe {
-            ns_image.CGImageForProposedRect_context_hints(std::ptr::null_mut(), None, None)
-        }
+        unsafe { ns_image.CGImageForProposedRect_context_hints(std::ptr::null_mut(), None, None) }
     })
     .flatten()
 }
@@ -264,7 +262,11 @@ fn upscale_cgimage_for_ocr(src: &CGImage) -> Option<CFRetained<CGImage>> {
 /// an immutable `CGImage`. Shared bitmap-render primitive: the scanned-PDF page path and the image
 /// up-scale path both funnel their draw through this (white bg → high-quality interpolation → snapshot)
 /// via [`with_rgbx_bitmap`]. `None` on any allocation failure / caught exception.
-fn render_cgimage_into_rgbx(src: &CGImage, px_w: usize, px_h: usize) -> Option<CFRetained<CGImage>> {
+fn render_cgimage_into_rgbx(
+    src: &CGImage,
+    px_w: usize,
+    px_h: usize,
+) -> Option<CFRetained<CGImage>> {
     with_rgbx_bitmap(px_w, px_h, |ctx| {
         let full = CGRect::new(
             CGPoint::new(0.0, 0.0),
@@ -399,7 +401,10 @@ mod tests {
         let (w, h) = ocr_render_pixels(612.0, 792.0);
         assert_eq!(h, 2000, "long edge scales to the target");
         // width scaled by the same factor (612 * 2000/792 ≈ 1545), within the cap.
-        assert!((1540..=1550).contains(&w), "short edge scaled proportionally, got {w}");
+        assert!(
+            (1540..=1550).contains(&w),
+            "short edge scaled proportionally, got {w}"
+        );
         assert!(w <= MAX_OCR_LONG_EDGE as usize && h <= MAX_OCR_LONG_EDGE as usize);
     }
 
@@ -409,7 +414,10 @@ mod tests {
         let (w, h) = ocr_render_pixels(10000.0, 5000.0);
         assert_eq!(w, 2000, "oversized long edge is clamped to the cap");
         assert!(h <= 2000);
-        assert!(w * h * 4 <= (MAX_OCR_LONG_EDGE as usize).pow(2) * 4, "bitmap RAM is bounded");
+        assert!(
+            w * h * 4 <= (MAX_OCR_LONG_EDGE as usize).pow(2) * 4,
+            "bitmap RAM is bounded"
+        );
     }
 
     /// A degenerate (zero / negative) box yields zero pixels (the renderer bails, no allocation).
@@ -425,7 +433,11 @@ mod tests {
     #[test]
     fn render_pixels_scales_a_small_page_up_to_the_target() {
         let (w, h) = ocr_render_pixels(100.0, 100.0);
-        assert_eq!((w, h), (2000, 2000), "a small page is scaled UP to the cap, not left native");
+        assert_eq!(
+            (w, h),
+            (2000, 2000),
+            "a small page is scaled UP to the cap, not left native"
+        );
     }
 
     /// Fix 5 (pure logic, headless): the chosen OCR languages are our preferred set intersected with
@@ -434,13 +446,22 @@ mod tests {
     fn choose_ocr_languages_intersects_in_priority_order() {
         // Both supported → both requested, pl first.
         let both = vec!["en".to_string(), "fr".to_string(), "pl".to_string()];
-        assert_eq!(choose_ocr_languages(&both, PREFERRED_OCR_LANGUAGES), vec!["pl", "en"]);
+        assert_eq!(
+            choose_ocr_languages(&both, PREFERRED_OCR_LANGUAGES),
+            vec!["pl", "en"]
+        );
         // Only English supported (an older Vision without Polish) → request only "en", never force pl.
         let en_only = vec!["en-US".to_string(), "en".to_string(), "de".to_string()];
-        assert_eq!(choose_ocr_languages(&en_only, PREFERRED_OCR_LANGUAGES), vec!["en"]);
+        assert_eq!(
+            choose_ocr_languages(&en_only, PREFERRED_OCR_LANGUAGES),
+            vec!["en"]
+        );
         // Matching is case-insensitive (Vision may report "EN"/"PL").
         let upper = vec!["PL".to_string(), "EN".to_string()];
-        assert_eq!(choose_ocr_languages(&upper, PREFERRED_OCR_LANGUAGES), vec!["pl", "en"]);
+        assert_eq!(
+            choose_ocr_languages(&upper, PREFERRED_OCR_LANGUAGES),
+            vec!["pl", "en"]
+        );
     }
 
     /// Fix 5: when NONE of our preferred languages are supported (or the probe returned nothing), the
@@ -450,7 +471,10 @@ mod tests {
     fn choose_ocr_languages_empty_when_none_supported_falls_open() {
         let none = vec!["ja".to_string(), "zh-Hans".to_string()];
         assert!(choose_ocr_languages(&none, PREFERRED_OCR_LANGUAGES).is_empty());
-        assert!(choose_ocr_languages(&[], PREFERRED_OCR_LANGUAGES).is_empty(), "empty probe → empty (system default)");
+        assert!(
+            choose_ocr_languages(&[], PREFERRED_OCR_LANGUAGES).is_empty(),
+            "empty probe → empty (system default)"
+        );
     }
 
     /// A missing image FILE fails CLOSED (None) — `NSImage::initWithContentsOfFile` returns nil for a
@@ -473,8 +497,11 @@ mod tests {
             std::process::id(),
             uuid::Uuid::new_v4()
         ));
-        std::fs::write(&p, b"this is definitely not an image file, just plain ascii bytes")
-            .expect("write tmp garbage file");
+        std::fs::write(
+            &p,
+            b"this is definitely not an image file, just plain ascii bytes",
+        )
+        .expect("write tmp garbage file");
         // The ONLY assertion we can make headless is "it returns (no panic/abort)". The value is
         // None on a real Mac (undecodable) but we accept any return — the point is no FFI abort.
         let _ = ocr_image_file(&p);

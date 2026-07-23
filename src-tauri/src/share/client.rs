@@ -69,10 +69,12 @@ impl ShareClient {
     fn status_err(ctx: &str, status: StatusCode) -> AppError {
         match status {
             StatusCode::UNAUTHORIZED => AppError::Auth(format!("{ctx}: not authenticated")),
-            StatusCode::TOO_MANY_REQUESTS => {
-                AppError::InvalidArg(format!("{ctx}: too many attempts — wait a bit and try again"))
+            StatusCode::TOO_MANY_REQUESTS => AppError::InvalidArg(format!(
+                "{ctx}: too many attempts — wait a bit and try again"
+            )),
+            s if s.is_client_error() => {
+                AppError::InvalidArg(format!("{ctx}: rejected ({})", s.as_u16()))
             }
-            s if s.is_client_error() => AppError::InvalidArg(format!("{ctx}: rejected ({})", s.as_u16())),
             s => AppError::Unavailable(format!("{ctx}: server returned {}", s.as_u16())),
         }
     }
@@ -469,10 +471,7 @@ impl ShareClient {
     /// `GET /v1/orgs` (bearer) — EVERY org the caller actively belongs to (owned OR invited-and-active).
     /// This is the membership-discovery pull: without it an org you were INVITED to (never one you
     /// CREATED) is invisible locally and its feed never syncs. Content-free (ids/roles/timestamps).
-    pub async fn org_list(
-        &self,
-        access_token: &str,
-    ) -> Result<Vec<super::org_dto::OrgSummary>> {
+    pub async fn org_list(&self, access_token: &str) -> Result<Vec<super::org_dto::OrgSummary>> {
         let resp: super::org_dto::OrgListResponse =
             self.get_json("/v1/orgs", access_token, "org-list").await?;
         Ok(resp.orgs)
@@ -610,30 +609,6 @@ impl ShareClient {
             "org-get-key-grants",
         )
         .await
-    }
-
-    /// `POST /v1/blobs` (bearer) — upload raw ciphertext (`application/octet-stream`). Returns
-    /// `{blobId}`. Used to stage an org-item envelope before `publish_item`.
-    pub async fn put_blob(&self, access_token: &str, ciphertext: Vec<u8>) -> Result<String> {
-        let url = self.url("/v1/blobs")?;
-        let resp = self
-            .http
-            .post(url)
-            .bearer_auth(access_token)
-            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
-            .body(ciphertext)
-            .send()
-            .await
-            .map_err(|_| AppError::Unavailable("put-blob: could not reach the server".into()))?;
-        let status = resp.status();
-        if !status.is_success() {
-            return Err(Self::status_err("put-blob", status));
-        }
-        let created: super::org_dto::BlobCreatedResponse = resp
-            .json()
-            .await
-            .map_err(|_| AppError::Unavailable("put-blob: malformed server response".into()))?;
-        Ok(created.blob_id)
     }
 
     /// `POST /v1/orgs/{id}/items` (member-gated) — publish a staged ciphertext blob as an org item.

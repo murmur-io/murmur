@@ -13,6 +13,7 @@ import { IpcService } from "../../../core/ipc.service";
 import type {
   AccountStatus,
   MyShareEntry,
+  NoteAttachmentDto,
   OrgSourceShareStatus,
   OrgStatus,
 } from "../../../core/models";
@@ -77,6 +78,11 @@ export class NoteSharePanelComponent {
 
   /** THIS note's document id — the shares filter key. */
   readonly noteId = input.required<string>();
+  /** Only attachment DTOs referenced by the current note markdown. */
+  readonly attachments = input<readonly NoteAttachmentDto[]>([]);
+  readonly attachmentBytes = computed(() =>
+    this.attachments().reduce((total, attachment) => total + attachment.byteLen, 0),
+  );
 
   /** Close the modal (backdrop / Close / Esc). */
   readonly closed = output<void>();
@@ -84,6 +90,16 @@ export class NoteSharePanelComponent {
   readonly changed = output<void>();
   /** Press the gate CTA → the editor routes to Settings › Sharing. */
   readonly setupSharing = output<void>();
+
+  formatAttachmentBytes(bytes: number): string {
+    if (bytes < 1024) {
+      return `${bytes} B`;
+    }
+    if (bytes < 1024 * 1024) {
+      return `${(bytes / 1024).toFixed(1)} KB`;
+    }
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  }
 
   // --- Account + gate -------------------------------------------------------
   private readonly accountStatus = signal<AccountStatus | null>(null);

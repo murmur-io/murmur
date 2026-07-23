@@ -27,22 +27,33 @@ pub fn export_audio(
     meeting_id: String,
     dest_path: String,
 ) -> Result<(), AppError> {
+    export_audio_inner(state.inner(), &meeting_id, &dest_path)
+}
+
+pub(crate) fn export_audio_inner(
+    state: &AppState,
+    meeting_id: &str,
+    dest_path: &str,
+) -> Result<(), AppError> {
+    // User-selected plaintext publication is synchronous. Serialize the complete gate → source
+    // read → copy interval with relock so cleanup cannot finish and then be followed by stale output.
+    let _lifecycle = lifecycle_guard(state);
     // Phase 0.5 READ-GATE: refuse to export the audio of a sealed-and-not-unlocked meeting. Its
     // WAV is AES-GCM-encrypted at rest (audio_path → <file>.enc) and there is no plaintext on disk
     // to copy until the folder is session-unlocked; fail closed with a Locked error.
-    if !meeting_is_unlocked(state.inner(), &meeting_id)? {
+    if !meeting_is_unlocked(state, meeting_id)? {
         return Err(AppError::Locked(
             "this meeting's folder is locked — unlock it to export the audio".into(),
         ));
     }
     let meeting = state
         .db
-        .get_meeting(&meeting_id)?
+        .get_meeting(meeting_id)?
         .ok_or_else(|| AppError::InvalidArg(format!("no meeting with id {meeting_id}")))?;
     let src = meeting
         .audio_path
         .ok_or_else(|| AppError::InvalidArg("this meeting has no audio file".into()))?;
-    std::fs::copy(&src, &dest_path)
+    std::fs::copy(&src, dest_path)
         .map_err(|e| AppError::Storage(format!("copy audio failed: {e}")))?;
     Ok(())
 }
@@ -57,12 +68,13 @@ enum MasterStream {
 /// sealed-and-not-unlocked meeting (the master is `.enc` at rest, no plaintext to copy) and never
 /// hands a path to the FE — the masters are reachable ONLY through these gated commands.
 fn export_master(
-    state: State<'_, AppState>,
+    state: &AppState,
     meeting_id: &str,
     dest_path: &str,
     which: MasterStream,
 ) -> Result<(), AppError> {
-    if !meeting_is_unlocked(state.inner(), meeting_id)? {
+    let _lifecycle = lifecycle_guard(state);
+    if !meeting_is_unlocked(state, meeting_id)? {
         return Err(AppError::Locked(
             "this meeting's folder is locked — unlock it to export the master".into(),
         ));
@@ -85,7 +97,7 @@ pub fn export_mic_master(
     meeting_id: String,
     dest_path: String,
 ) -> Result<(), AppError> {
-    export_master(state, &meeting_id, &dest_path, MasterStream::Mic)
+    export_master(state.inner(), &meeting_id, &dest_path, MasterStream::Mic)
 }
 
 /// Export a meeting's SYSTEM master archive (faithful 48 kHz float32 WAV) to a chosen path.
@@ -95,7 +107,7 @@ pub fn export_sys_master(
     meeting_id: String,
     dest_path: String,
 ) -> Result<(), AppError> {
-    export_master(state, &meeting_id, &dest_path, MasterStream::Sys)
+    export_master(state.inner(), &meeting_id, &dest_path, MasterStream::Sys)
 }
 
 /// Write a meeting's note markdown to a user-chosen path (FE picks it via a save dialog).
@@ -105,6 +117,11 @@ pub fn export_note(
     meeting_id: String,
     dest_path: String,
 ) -> Result<(), AppError> {
+    // Serialize the complete gate -> plaintext read -> image publication -> Markdown publication
+    // interval with lock/relock. This is synchronous I/O (no await), so holding the coarse lifecycle
+    // guard is both safe and necessary: otherwise relock can finish cleanup after the one-time gate
+    // and a stale exporter can recreate plaintext on disk while the folder is sealed.
+    let _lifecycle = lifecycle_guard(state.inner());
     // D4 READ-GATE: refuse to export a sealed-and-not-unlocked meeting's note (its plaintext
     // markdown is blanked while sealed — exporting would write an empty/garbage file). Fail closed.
     if !meeting_is_unlocked(state.inner(), &meeting_id)? {
@@ -116,8 +133,20 @@ pub fn export_note(
         .db
         .get_latest_note_for_meeting(&meeting_id)?
         .ok_or_else(|| AppError::InvalidArg(format!("no note for meeting {meeting_id}")))?;
-    std::fs::write(&dest_path, note.markdown.as_bytes())
-        .map_err(|e| AppError::Storage(format!("write note failed: {e}")))?;
+    let dest = std::path::Path::new(&dest_path);
+    let root = dest
+        .parent()
+        .ok_or_else(|| AppError::Export("export destination has no parent directory".into()))?;
+    let exported = render_markdown_with_attachments_for_user_export_under_lifecycle_authorized(
+        state.inner(),
+        &crate::storage::AttachmentOwner::Meeting {
+            meeting_id: meeting_id.clone(),
+            provider_id: note.provider_id.clone(),
+        },
+        &note.markdown,
+        root,
+    )?;
+    crate::export::overwrite_note(dest, &exported)?;
     Ok(())
 }
 
@@ -125,25 +154,35 @@ pub fn export_note(
 /// Requires the timeline (open the meeting once). Returns the written path.
 #[tauri::command]
 pub fn export_canvas(state: State<'_, AppState>, meeting_id: String) -> Result<String, AppError> {
+    export_canvas_inner(state.inner(), &meeting_id)
+}
+
+pub(crate) fn export_canvas_inner(
+    state: &AppState,
+    meeting_id: &str,
+) -> Result<String, AppError> {
+    // Keep the content read and final Canvas publication in one lifecycle interval. Otherwise a
+    // relock can blank/delete managed plaintext and the stale exporter can recreate it afterwards.
+    let _lifecycle = lifecycle_guard(state);
     // D4 READ-GATE: a sealed-and-not-unlocked meeting's timeline is blanked; refuse to build a
     // canvas from it. Fail closed.
-    if !meeting_is_unlocked(state.inner(), &meeting_id)? {
+    if !meeting_is_unlocked(state, meeting_id)? {
         return Err(AppError::Locked(
             "this meeting's folder is locked — unlock it to export the canvas".into(),
         ));
     }
     let meeting = state
         .db
-        .get_meeting(&meeting_id)?
+        .get_meeting(meeting_id)?
         .ok_or_else(|| AppError::InvalidArg(format!("no meeting with id {meeting_id}")))?;
-    let json = state.db.get_timeline_data(&meeting_id)?.ok_or_else(|| {
+    let json = state.db.get_timeline_data(meeting_id)?.ok_or_else(|| {
         AppError::InvalidArg("open the meeting once to generate its timeline first".into())
     })?;
     let mut tl: MeetingTimeline = serde_json::from_str(&json)
         .map_err(|e| AppError::InvalidArg(format!("bad timeline data: {e}")))?;
     // Same coverage-repair the Detail view applies (heal a legacy cache that ends short of the
     // recording) so the exported canvas spans the meeting instead of the provider's early cluster.
-    let segments = state.db.get_segments(&meeting_id)?;
+    let segments = state.db.get_segments(meeting_id)?;
     crate::summarize::timeline::repair_coverage(&mut tl, &segments);
     let title = meeting.title.unwrap_or_else(|| "Meeting".to_string());
     let topics: Vec<(String, f64, f64)> = tl
