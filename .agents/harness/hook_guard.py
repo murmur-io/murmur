@@ -44,6 +44,10 @@ class GuardFailure(RuntimeError):
     """A deterministic reason the attempted operation must be refused."""
 
 
+class NoTaskForWorktree(GuardFailure):
+    """Raised when no harness task claims the current worktree (normal mode)."""
+
+
 @dataclass(frozen=True)
 class SimpleCommand:
     tokens: Tuple[str, ...]
@@ -330,7 +334,14 @@ def _unsupported_execution_indirection(command: str) -> Optional[str]:
         if not effective:
             continue
         executable = effective[0] if effective[0] == "." else Path(effective[0]).name
-        if executable in {"eval", "source", ".", "exec", "xargs"}:
+        if executable in {"source", "."}:
+            # `source`/`.` of a known-safe env file (e.g. ~/.cargo/env) is a
+            # standard setup step, not executable indirection. All other targets
+            # stay blocked.
+            target = effective[1] if len(effective) > 1 else ""
+            if target not in resource_policy.SAFE_SOURCE_TARGETS:
+                return f"execution indirection via {executable!r} is unsupported by the command guard"
+        elif executable in {"eval", "exec", "xargs"}:
             return f"execution indirection via {executable!r} is unsupported by the command guard"
         if executable == "find" and any(
             token in {"-exec", "-execdir", "-ok", "-okdir"} or token.startswith("-exec")
@@ -491,13 +502,15 @@ def _block_bash(command: str, process_cwd: Path) -> Optional[str]:
             dangerous = {"/", "//", "/*", "~", "~/", "~/*", "$HOME", "${HOME}", "$HOME/", "${HOME}/"}
             if recursive and any(token in dangerous for token in targets):
                 return "recursive deletion of filesystem root or the home directory is forbidden"
-    if resource_policy.command_is_dev_in(command, process_cwd):
-        return (
-            "long-lived dev commands must run through scripts/agent-dev-run; "
-            "the dev supervisor stays outside the global lane while its cargo/rustc "
-            "descendants acquire it per process"
-        )
-    if resource_policy.command_is_heavy_in(command, process_cwd):
+    dev = resource_policy.command_is_dev_in(command, process_cwd)
+    heavy = resource_policy.command_is_heavy_in(command, process_cwd)
+    if (dev or heavy) and _worktree_has_active_task(process_cwd):
+        if dev:
+            return (
+                "long-lived dev commands must run through scripts/agent-dev-run; "
+                "the dev supervisor stays outside the global lane while its cargo/rustc "
+                "descendants acquire it per process"
+            )
         return (
             "unwrapped resource-heavy build/test/dev command; run it through "
             "scripts/agent-resource-run so Murmur worktrees share one supervised lane"
@@ -622,7 +635,30 @@ def _resolve_task(repo: Path, common: Path) -> Tuple[Dict[str, Any], Path]:
             if _manifest_worktree(document) == repo.resolve():
                 return document, task_dir
             raise GuardFailure("legacy current-task pointer belongs to a different worktree")
-    raise GuardFailure("no task manifest matches this worktree; use scripts/agent-harness init/run")
+    raise NoTaskForWorktree(
+        "no task manifest matches this worktree; use scripts/agent-harness init/run"
+    )
+
+
+def _worktree_has_active_task(process_cwd: Path) -> bool:
+    """True when a harness task claims this worktree (harness mode)."""
+    try:
+        top = _git_text(process_cwd, "rev-parse", "--show-toplevel", check=False)
+        if not top:
+            return False
+        repo = Path(top).resolve()
+        _, common, _, _ = _repo_context(repo)
+        _resolve_task(repo, common)
+        return True
+    except NoTaskForWorktree:
+        return False
+    except GuardFailure:
+        # Tasks exist but are ambiguous/malformed → fail safe: treat as harness
+        # mode so the lane stays enforced.
+        return True
+    except Exception:
+        # Not a resolvable git worktree → normal mode.
+        return False
 
 
 def _parse_time(raw: Any, label: str) -> dt.datetime:
@@ -946,6 +982,8 @@ def _finish_guard(
                 allow_test_adapter=allow_test_adapter,
             )
             return None
+        except NoTaskForWorktree:
+            return None  # normal mode: no active harness task → allow the commit
         except GuardFailure as exc:
             reason = str(exc)
     if mode == "advisory":
@@ -1656,7 +1694,7 @@ def _run_selftest() -> int:
                 ("notary credential store", "xcrun notarytool store-credentials murmur", "BLOCK"),
                 ("notary submit", "xcrun notarytool submit app.dmg --wait", "ALLOW"),
                 ("cargo toolchain clippy", "cargo +stable clippy --all-targets", "BLOCK"),
-                ("cargo test", "cargo test --lib", "BLOCK"),
+                ("cargo test", "cargo test --lib", "ALLOW"),
                 ("codesign deep", "/usr/bin/codesign --deep --sign X app", "BLOCK"),
                 ("codesign helper", "/usr/bin/codesign --options runtime --sign X helper", "ALLOW"),
                 ("root delete", "/bin/rm -rf -- /", "BLOCK"),
@@ -1664,6 +1702,9 @@ def _run_selftest() -> int:
                 ("PR creation", "gh pr create --base murmur --title x", "ALLOW"),
                 ("quoted push search", "rg 'git push origin murmur' .", "ALLOW"),
                 ("quoted security search", "rg 'security find-identity' .", "ALLOW"),
+                ("source cargo env", "source ~/.cargo/env", "ALLOW"),
+                ("dot source cargo env", ". $HOME/.cargo/env", "ALLOW"),
+                ("source arbitrary script", "source ./guard-bypass.sh", "BLOCK"),
             ]
             for label, command, want in cases:
                 test.expect(label, vendor, "block-bash", command, repo, want)
@@ -1692,12 +1733,23 @@ def _run_selftest() -> int:
                 )
 
         resource_cases = [
-            ("direct cargo metadata", "cargo metadata --no-deps", "BLOCK"),
-            ("direct Rust test", "cd src-tauri && cargo test --lib", "BLOCK"),
-            ("direct Angular build", "npx ng build", "BLOCK"),
-            ("direct npm dev", "npm run dev", "BLOCK"),
-            ("direct full CI", "bash scripts/ci.sh", "BLOCK"),
+            ("direct cargo metadata", "cargo metadata --no-deps", "ALLOW"),
+            ("direct Rust test", "cd src-tauri && cargo test --lib", "ALLOW"),
+            ("direct Angular build", "npx ng build", "ALLOW"),
+            ("direct npm dev", "npm run dev", "ALLOW"),
+            ("direct full CI", "bash scripts/ci.sh", "ALLOW"),
             ("read-only cargo search", "rg 'cargo test --lib' .", "ALLOW"),
+            (
+                "gh PR body mentions cargo",
+                "gh pr create --base murmur --title x --body 'Fixes the cargo build path'",
+                "ALLOW",
+            ),
+            (
+                "gh PR body with backticks",
+                "gh pr create --title x --body 'run `cargo test --lib` first'",
+                "ALLOW",
+            ),
+            ("gh then cargo still heavy", "gh pr view 1 && cargo build", "ALLOW"),
             (
                 "lane-wrapped Rust test",
                 "scripts/agent-resource-run --chdir src-tauri -- cargo test --lib",
@@ -1711,12 +1763,12 @@ def _run_selftest() -> int:
             (
                 "lane-wrapped long-lived dev",
                 "scripts/agent-resource-run -- npm run dev",
-                "BLOCK",
+                "ALLOW",
             ),
             (
                 "lane-wrapped chdir long-lived dev",
                 "scripts/agent-resource-run --chdir /tmp/deck npm run dev -- --port 4173",
-                "BLOCK",
+                "ALLOW",
             ),
             (
                 "dedicated npm dev",
@@ -1741,41 +1793,119 @@ def _run_selftest() -> int:
             (
                 "dedicated dev config override",
                 "scripts/agent-dev-run -- npm run dev -- --config injected.json",
-                "BLOCK",
+                "ALLOW",
             ),
             (
                 "dedicated runner arbitrary cargo",
                 "scripts/agent-dev-run -- cargo test --lib",
-                "BLOCK",
+                "ALLOW",
             ),
             (
                 "dedicated runner npm build",
                 "scripts/agent-dev-run -- npm run build",
-                "BLOCK",
+                "ALLOW",
             ),
             (
                 "lookalike dev runner",
                 "/tmp/scripts/agent-dev-run -- npm run dev",
-                "BLOCK",
+                "ALLOW",
             ),
             (
                 "lookalike lane runner",
                 "/tmp/scripts/agent-resource-run -- cargo test --lib",
-                "BLOCK",
+                "ALLOW",
             ),
             (
                 "test-only guardian env",
                 "MURMUR_AGENT_SELFTEST_GUARDIAN_RELEASE=/tmp/x scripts/agent-resource-run -- true",
-                "BLOCK",
+                "ALLOW",
             ),
             (
                 "forged lane-active env",
                 "MURMUR_AGENT_RESOURCE_LANE_ACTIVE=1 scripts/agent-dev-run -- npm run dev",
-                "BLOCK",
+                "ALLOW",
             ),
         ]
         for label, command, want in resource_cases:
             test.expect(label, vendor, "block-bash", command, SOURCE_ROOT, want)
+
+        for label, cmd, want in [
+            ("gh live $() substitution is heavy", 'gh pr create --title x --body "$(cargo build --release)"', "HEAVY"),
+            ("gh single-quoted backticks are light", "gh pr create --title x --body 'run `cargo test` first'", "LIGHT"),
+            ("gh plain cargo word is light", 'gh pr create --title x --body "fixes the cargo build"', "LIGHT"),
+        ]:
+            got = "HEAVY" if resource_policy.command_is_heavy(cmd) else "LIGHT"
+            test.result(label, got, want)
+
+        # Finding 2 fix: mode-independent anti-bypass classifier coverage.
+        # These are the misuse/lookalike patterns whose block-bash result
+        # correctly flipped BLOCK -> ALLOW in the no-task fixture above (the
+        # resource-lane gate now only fires when a harness task claims the
+        # worktree). Their classification in resource_policy.py did NOT
+        # change and is still correct, but block-bash no longer exercises it
+        # in no-task mode, so it lost its only regression guard. Pin the
+        # classifier directly, independent of task/mode, using the exact
+        # execution directory (SOURCE_ROOT) the hook payload would carry --
+        # command_is_heavy_in/command_is_dev_in resolve lookalike-runner
+        # paths relative to that cwd, so the real repo root is required for
+        # the "outside the repo" impostor checks to behave as intended.
+        # Verified non-vacuous: a clearly-safe command ("git status --short")
+        # classifies heavy=False, dev=False against the same cwd.
+        anti_bypass_heavy = [
+            ("plain unwrapped cargo test", "cargo test --lib"),
+            (
+                "dev-runner allowlist violation: injected config flag",
+                "scripts/agent-dev-run -- npm run dev -- --config injected.json",
+            ),
+            (
+                "dev-runner allowlist violation: arbitrary cargo",
+                "scripts/agent-dev-run -- cargo test --lib",
+            ),
+            (
+                "dev-runner allowlist violation: npm build",
+                "scripts/agent-dev-run -- npm run build",
+            ),
+            (
+                "impostor dev runner outside the repo",
+                "/tmp/scripts/agent-dev-run -- npm run dev",
+            ),
+            (
+                "impostor lane runner outside the repo",
+                "/tmp/scripts/agent-resource-run -- cargo test --lib",
+            ),
+            (
+                "forged selftest-guardian-release env",
+                "MURMUR_AGENT_SELFTEST_GUARDIAN_RELEASE=/tmp/x scripts/agent-resource-run -- true",
+            ),
+            (
+                "forged resource-lane-active env",
+                "MURMUR_AGENT_RESOURCE_LANE_ACTIVE=1 scripts/agent-dev-run -- npm run dev",
+            ),
+        ]
+        for label, cmd in anti_bypass_heavy:
+            got = "HEAVY" if resource_policy.command_is_heavy_in(cmd, SOURCE_ROOT) else "LIGHT"
+            test.result(f"anti-bypass classifier: {label}", got, "HEAVY")
+
+        # The lane runner (agent-resource-run) is only meant to wrap bounded
+        # one-off commands; wrapping a long-lived dev server in it (instead
+        # of agent-dev-run) is itself a lane-starvation misuse pattern -- and
+        # it is the one case here where command_is_dev_in is the function
+        # that actually reproduces the original BLOCK (command_is_heavy_in
+        # is also true for these, but the dev-axis classification is the one
+        # this pattern specifically hinges on).
+        anti_bypass_dev = [
+            (
+                "lane runner misused for a long-lived dev server",
+                "scripts/agent-resource-run -- npm run dev",
+            ),
+            (
+                "lane runner misused for a chdir'd long-lived dev server",
+                "scripts/agent-resource-run --chdir /tmp/deck npm run dev -- --port 4173",
+            ),
+        ]
+        for label, cmd in anti_bypass_dev:
+            got = "DEV" if resource_policy.command_is_dev_in(cmd, SOURCE_ROOT) else "NOT-DEV"
+            test.result(f"anti-bypass classifier: {label}", got, "DEV")
 
     print("-- staged secret scan (no path exclusions) --")
     for vendor in ("codex", "claude"):
@@ -1804,7 +1934,7 @@ def _run_selftest() -> int:
             repo,
             use_default_finish=True,
         )
-        test.result(f"{vendor}: default-enforce missing manifest", got, "BLOCK")
+        test.result(f"{vendor}: default-enforce missing manifest", got, "ALLOW")
 
         # Malformed manifest is found by explicit task id and must fail closed.
         _, common, _, _ = _repo_context(repo)
@@ -1837,6 +1967,44 @@ def _run_selftest() -> int:
             vendor, "finish-guard", "git commit -m x", repo, allow_test_adapter=True
         )
         test.result(f"{vendor}: minimal receipt", got, "BLOCK")
+
+        # With a task claiming the worktree, the resource lane is enforced again.
+        # This MUST be pinned through CLEAN single-task resolution, not the
+        # ambiguous fail-safe: reusing `repo` here would leave TWO manifests
+        # ("fresh" above + a new one) claiming the same worktree_path, so
+        # _resolve_task raises GuardFailure("multiple task manifests claim
+        # this worktree") and _worktree_has_active_task returns True via its
+        # `except GuardFailure` fail-safe branch -- never exercising the real
+        # "exactly one task resolves" happy path the gate depends on. Use a
+        # DEDICATED _finish_repo() fixture instead: it starts with no task
+        # manifest of its own, so writing exactly one receipt on it resolves
+        # unambiguously (see _resolve_task: `len(matches) == 1` returns
+        # directly, only `len(matches) > 1` raises the ambiguous GuardFailure).
+        lane_repo = _finish_repo()
+        got, _ = test.invoke(vendor, "block-bash", "cargo test --lib", lane_repo)
+        test.result(f"{vendor}: no-task heavy allowed (clean fixture mirror)", got, "ALLOW")
+
+        _write_receipt(lane_repo, "lane")
+        # Exactly one manifest (this "lane" task) now claims lane_repo's
+        # worktree, so _resolve_task's `matches` list has length 1 and
+        # returns that single match directly -- _worktree_has_active_task
+        # returns True via the real "task found" path, not the
+        # ambiguous-manifests fail-safe. This is the happy path pinned.
+        got, _ = test.invoke(vendor, "block-bash", "cargo test --lib", lane_repo)
+        test.result(f"{vendor}: task-present unwrapped heavy blocked (clean single-task)", got, "BLOCK")
+        # Absolute path: lane_repo is a separate git init unrelated to
+        # SOURCE_ROOT, so a *relative* "scripts/agent-resource-run" would not
+        # resolve to the canonical runner from this cwd and would misclassify
+        # as an untrusted lookalike (see resource_policy.is_lane_runner).
+        lane_runner = SOURCE_ROOT / "scripts" / "agent-resource-run"
+        got, _ = test.invoke(
+            vendor,
+            "block-bash",
+            f"{lane_runner} --chdir src-tauri -- cargo test --lib",
+            lane_repo,
+        )
+        test.result(f"{vendor}: task-present lane-wrapped allowed", got, "ALLOW")
+        shutil.rmtree(lane_repo.parent)
 
         (task_dir / "attestation.json").write_text(json.dumps(attestation, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         attestation["reviews"][0]["verdict"] = "FAIL"
