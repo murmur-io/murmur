@@ -1,0 +1,85 @@
+<!-- Generated 2026-07-25 via a 7-agent re-verification Workflow (2 adversarial/coherence verifiers on the real code + 2 web researchers on same-vendor-vs-cross-vendor judge bias -> delta synthesis -> adversarial critique -> reconciled brief). Follows docs/research/2026-07-24-agent-harness-vs-best-practices.md. -->
+# Re-verification: harness writer/reviewer same-vendor relaxation (PR #442, 30f05eb)
+
+## What changed (merged to trunk `murmur` as PR #442 / 30f05eb)
+The harness now allows ANY writer/reviewer vendor pair including same-vendor; the shipped default flipped from `claude->codex` to **`claude->claude`**. Removed: the `writer.vendor != reviewer.vendor` requirement at its three enforcement layers (`resolve_task_vendors`, `validate_vendor_separation`->`validate_model_vendors`, `hook_guard._validate_provenance`). Added: `config.json` `default_reviewer` + `config_audit` validation. Rationale (design doc): run the harness entirely on Claude, removing the hard Codex dependency that was release friction. Cross-vendor retained as opt-in, "preferred for lock/crypto/egress" (prose).
+
+## Independently re-verified by the orchestrator (not just the subagents)
+- Merged to trunk: `murmur` == `origin/murmur` == `30f05eb` ("Merge pull request #442 from murmur-io/feat/harness-vendor-pairing").
+- Enforcement removed at exactly 3 layers; **session-independence intact** (`hook_guard.py:919` `if session_id == writer_session: raise`; each reviewer session non-empty, distinct from writer + other reviewers).
+- Fake-forbidden-in-production intact at 3 layers; `allow_test_adapter` untouched (fake short-circuits before the removed check).
+- Change is coherent across all 12 files; repo-wide sweep found NO stale "must use different vendors / same-vendor forbidden" claims; CLAUDE.md never asserted the vendor rule.
+- The 2 genuinely-novel items (recompute-don't-trust dev attestation; byte-exact runner-owned risk evidence) untouched.
+
+---
+
+All citations grounded against the merged tree (PR #442, `30f05eb`). Writing the reconciled brief.
+
+---
+
+# Re-verification brief — harness writer/reviewer same-vendor relaxation (PR #442, `30f05eb`)
+
+## 1. Does the change hold up?
+
+Yes. The change is coherent, complete, and correctly scoped: it removes **exactly one** guarantee — `writer.vendor != reviewer.vendor` — at the three layers that enforced it (`task_runner.py:resolve_task_vendors` def@231, `validate_model_vendors` [renamed from `validate_vendor_separation`], `hook_guard.py:_validate_provenance`), and touches nothing else. Two independent verify passes (an adversarial-audit and a rationale/eval-coherence pass) each ran the real gates against the merged tree, did RED-before-GREEN on the actual functions, and returned PASS. Every independence property that actually prevents self-certification survives and fails closed. The only defects found in the change itself are cosmetic (one stale doc phrase) plus two "honest-bar" gaps that are known, non-blocking, and flagged in the design doc's own TODO list. There is **no self-certification hole**: same-vendor review still sees only the staged diff + task, never the writer's session or context, and the runner still owns the verdict.
+
+Independently confirmed (I re-checked the load-bearing citations directly):
+
+- **Only writer≠reviewer was deleted.** Session independence untouched: separate `invoke_model` calls for writer vs reviewer, Claude spawned with `--no-session-persistence`, per-call `uuid4` invocation-id, and the guard/verifier both `raise` if `reviewer.session_id == writer_session` or if the attested session doesn't match the real model log.
+- **Fake/selftest adapter still forbidden in production** at all three layers; `allow_test_adapter` is unchanged by the diff (fake short-circuits *before* the removed check, so the interaction the task probed is genuinely nil).
+- **The two genuinely-novel items survive on-branch:** `verify_attestation` still re-runs `classify_risks` (`task_runner.py:3273`) and requires the task's `risk_flags` ⊇ inferred; `required_risk_evidence` gating intact. The recompute-don't-trust dev attestation and byte-exact runner-owned risk evidence are both untouched.
+- **Gates green:** `config_audit.py --ci` → PASS (137 checks); `hook_guard selftest` → PASS (234 assertions, incl. "same-vendor accepted", "public fake rejected", "reviewer reused writer session: BLOCK"); `task_runner selftest` → PASS (sandbox-disabled; the only failure was `sandbox_apply: Operation not permitted`, environmental, unrelated to vendor logic). No Rust/Angular code touched.
+- **`eval_runner.py` has zero `reviewer` references** (confirmed `grep -c` = 0) — real, and the basis for gap #4 below.
+- **README.md:130 still reads "fresh cross-vendor reviews"** (confirmed) — stale, cosmetic.
+- **Design docs live at `docs/superpowers/plans/` + `docs/superpowers/specs/`** (not `docs/research/` as the task pointed) — files exist and are internally consistent.
+
+## 2. What it does to the assessment (the delta)
+
+**Independence property — the load-bearing distinction.** The research says a fresh same-family session fixes a *different* failure mode than cross-vendor does, and only one of the two survives:
+
+- **Retained (Mechanism A — self-attribution / context-anchoring):** a fresh, authorship-blind reviewer receives the diff as third-party code, moving out of the ~64.5% self-blind-spot regime into the ~82.5% correcting-others regime. I note the verify passes checked the precondition the synthesis asserted but didn't verify — `adversarial-reviewer.md` casts the diff as "the writer's claims" from a fresh read-only third party with **no** "you wrote this" cue — so the keystone claim actually holds. This is the large, cheap chunk of independence, and it survives fully.
+- **Forfeited (Mechanism B — shared-training-prior self-preference):** measured *cold*, without any shared session (Panickssery et al., NeurIPS 2024; self-preference ∝ self-recognition), so a fresh session cannot recover it. Harmful Self-Preference is highest for strong models on confidently-wrong outputs — which is precisely Murmur's shipped incident class (sealed-content leaks, verify-before-destroy ordering, egress-gate omissions, FFI aborts), concentrated on lock/crypto/egress/protocol. The existing specialist reviews (lock-security/egress-security/protocol-security) do **not** compensate: they now all dispatch through the single `contract["reviewer"]` vendor, so they add prompt-diversity, not the model-diversity that was removed.
+
+**Score vs the prior 7.5/10.** Reconciling synthesis (7.5→7.6) and critique (as-shipped 7.5→7.5, uptick contingent on the fix): the honest read is **essentially flat as shipped**. The realized floor (~6.5) does get a real pull upward — this directly attacks the prior assessment's loudest complaint, "the apparatus is only valuable if it gets used," by removing a hard second-vendor runtime dependency (separate auth, rate limits, outages, version-pin) from the common path. But that friction win is **asserted, not measured**, while the diversity loss is **concrete and lands on this repo's entire incident history** — so I decline to book it as a clean +0.1. Call it **7.5, effectively unchanged**, with the genuine upside (→ ~8.0) **conditional on the risk-based auto-escalate** in §4. The invocation-time ceiling (~8.5) is intact as a *capability* (cross-vendor retained as opt-in), but the *shipped default* no longer reaches it on high-risk paths.
+
+**exceeds_frontier #1 — survives, one notch weaker in the default.** It was already downgraded by the prior critique from "ahead of what anyone ships" to "at-par with the published cross-family-judging frontier." This change slides the **default** to same-vendor = at-par-with-*shipped*-frontier, no longer ahead in the default; cross-vendor survives as opt-in, preserving the ceiling capability. One correction to the synthesis's phrasing: "exactly what OpenAI and Anthropic ship" **overstates the OpenAI half** — OpenAI's Codex reviewer is a *differently-trained* skill on the same model (deliberately separated to detect self-gaming); Murmur's claude→claude reviewer is the *identical checkpoint* with only a review prompt. So the default is at-par with **Anthropic's** parallel-Claude practice, slightly **behind** OpenAI's differently-trained reviewer.
+
+**The 2 novel items — untouched**, verified on-branch (§1). The frontier-exceeding core of the harness is fully intact; only the already-downgraded cross-vendor bullet slips from code-enforced-default to opt-in.
+
+## 3. Is it a good change?
+
+**Verdict: good change, ship it — but the score's upside is conditional on §4.** As shipped it is net-neutral-with-real-friction-upside; with the auto-escalate it is strictly better than both the pre-change and as-shipped states.
+
+**The case for.** It is surgical and honest — one guarantee removed, cleanly, with the design doc candidly naming the diversity cost and *why* it matters. For a solo operator the availability/friction win is real: a hard second-vendor dependency (Codex auth, rate limits, outages, `minimum_version` pin, a second account) is removed from the common path, raising the probability the harness runs at all. The Mechanism-A chunk of independence — the large, cheap one — is fully retained, and the deterministic gates carry the objective-bug load family-independently.
+
+**The case against (the de-correlation loss).** Two points sharpen the "flat, not +0.1" read:
+
+1. **The residual is highest-severity on exactly Murmur's paths.** Leaving cross-vendor as forgettable *prose* on lock/crypto/egress/protocol **inverts the risk posture**: the highest-stakes changes become the ones most likely to silently lose model-diversity — while every *other* form of extra rigor on those exact paths is already code-enforced (`risk_reviews` auto-injection at `config.json:28-30`, `required_risk_evidence` at `:33-35`). Collapsing all reviews to one vendor also degrades the harness's "multiple independent reviews" defence-in-depth from N de-correlated draws to N **correlated** draws from one error distribution, with no k-of-n to compensate.
+2. **The repo's own same-day research argues the opposite reflex.** `docs/research/2026-07-24-harness-fast-lanes.md` says an unavailable *independent* reviewer should yield AWAITING_REVIEW/BLOCKED — "never a fake same-vendor PASS" — framing a hard independent-reviewer gate as a **safety feature, not friction**, and locates the real friction in *serial reviews + release ceremony*, whose fixes are "parallelize reviews" and "a release-version profile" — **neither is dropping cross-vendor.** So part of the friction win is borrowed from a friction attributable elsewhere and achievable without weakening independence at all.
+
+The cost/availability lens still lands in favour of shipping: for the low-risk majority, a same-vendor fresh session is at-par-with-frontier and the objective bugs are caught deterministically. The de-correlation loss is only load-bearing on the high-risk minority — which is exactly what §4 fixes for ~10 lines.
+
+## 4. The one thing worth adding
+
+**P1 — Auto-escalate to cross-vendor on `risk_flags ∈ {lock, egress, protocol}` (turn "prefer cross-vendor" prose into policy-as-code). Effort: ~5–15 lines, no schema change.**
+
+The trigger and machinery already exist and already fire: `classify_risks(owned, args.risk, config)` runs in `cmd_init` at `task_runner.py:3562`, immediately after `resolve_task_vendors` at `:3553`; the risk globs are concrete (`config.json:62+` — `crypto.rs`, `secrets/**`, `storage/**`, `commands/lock.rs`, `commands/export.rs`, `mcp.rs`, `connectors/**`, `share/**`). Note that the task's fourth flag **`crypto` is already subsumed under `lock`** (`crypto.rs`/`secrets/**` sit in the lock glob), so the escalation set is `{lock, egress, protocol}`.
+
+Recommended shape:
+- In `cmd_init`, **after** `risks = classify_risks(...)` (`:3562`) and before the contract is built: if `set(risks) & {"lock","egress","protocol"}` **and** `reviewer == writer`, flip `reviewer` to the opposite vendor (the opposite-vendor map already exists inside `resolve_task_vendors`). The scalar `contract["reviewer"]` and `hook_guard`'s `review.reviewer.vendor == task.reviewer` check still hold unchanged.
+- Gate it behind a **loud** `allow_same_vendor_high_risk` opt-out that **errors clearly if Codex is absent** — so an operator with genuinely no second vendor is *told*, not silently downgraded.
+- **Right layer:** this belongs in `cmd_init` (runtime, per-task), **not** `config_audit.py` — the auditor validates static `config.json`, which carries no per-task `risk_flags`. What `config_audit` *can* cheaply do (and is now the natural place for it, since this change already extended it to validate both defaults at `config.json:3-4`) is **surface that both defaults are same-vendor**, so a same-vendor posture is a deliberate audited choice rather than silent.
+
+Honest nuance (from the critique, worth carrying): pure cross-vendor escalation **re-introduces a Codex dependency on high-risk tasks**, partly re-colliding with the "run entirely on Claude" rationale. The design doc parks a Codex-free alternative — per-role Claude model tiering (writer=sonnet / reviewer=opus). Treat that as a **cheaper first rung / availability fallback**, not a substitute: intra-family tiering shares training lineage → high mutual self-recognition → recovers **little** family-level self-preference. So: escalate to opposite-vendor on `{lock,egress,protocol}` for the real fix; fall back to model-tiering only when the operator has no second vendor and has opted out loudly.
+
+**P2 — Close the eval blind-spot on same-vs-cross catch-rate. Effort: moderate; infra ~90% present.**
+
+Nothing measures the false-negative cost. `eval_runner.py` invokes exactly one agent per trial and grades deterministically — there is **no reviewer in the loop** (0 refs), so same-vendor-vs-cross-vendor catch-rate is structurally outside what the evals model, and the change's selftests only prove vendor *resolution/provenance* (that same-vendor is *accepted*), never that a Claude reviewer *catches* what a Codex reviewer would. Add a **"review-mode" eval** reusing the existing `bad`/`good` fixture overlays (`evals/fixtures/{lock-masked-dto,seal-verify-before-destroy,…}/bad` already plant defects; the read-only-review assertion already exists at `task_runner.py:~2972`): present the `bad` overlay as the diff-under-review, grade "returned FAIL and named the defect" = catch, feed `good` as an over-block control, and run the matrix `reviewer ∈ {claude, codex}` to report the catch-rate delta. This converts "accepted on faith" into a measured number **and** finally covers shipped bug-classes #3–#7 (FFI abort, unguarded IPC stale-result, import-cycle `ɵcmp`, opacity bleed, prod-only CSP break), which the suite lacks today regardless of this change. Not a merge-blocker; the single highest-leverage follow-up to validate the new default.
+
+**P2 — One live claude→claude end-to-end run.** The new default path (two genuinely distinct live Claude sessions completing a real task, read-only reviewer, distinct non-empty `session_id`s, PASS) has never been exercised — the design doc §5 flags it as a post-merge TODO. Cheap, one-time; retires the doc's own open TODO before the default is relied on for real work.
+
+**P3 — Doc copy.** Fix `README.md:130` "fresh cross-vendor reviews" → "fresh reviews", and align the "genuine adversarial review, not self-grading" copy to the design doc's own candor: **procedurally** independent (fresh, authorship-blind, no writer context) but **not epistemically diverse** — a same-family reviewer shares the writer's family-level blind spots. Documentation-only; no enforcement impact.
+
+## 5. Bottom line
+
+Good change — ship the relaxation. It is a surgical, honest removal of exactly one guarantee (`writer.vendor != reviewer.vendor`) that keeps every property which actually prevents self-certification — fresh distinct log-verified reviewer session, runner-owned verdict, hash-bound attestation, fake-forbidden — all verified live and fail-closed, and leaves the two genuinely-novel frontier-exceeding items untouched. The blended score is **effectively flat (≈7.5)** as shipped: the solo-operator availability win is real but unmeasured, while the forfeited diversity is concrete and lands on Murmur's highest-severity paths and its entire shipped incident history. The one thing to add is the risk-based auto-escalate — flip the reviewer to the opposite vendor whenever `classify_risks` yields `{lock,egress,protocol}`, behind a loud opt-out (~10 lines in `cmd_init`, machinery already present), plus the review-mode eval to stop flying blind on same-vs-cross catch-rate. With that, the change is strictly better than both the pre-change (always cross-vendor, high friction) and the as-shipped (same-vendor default, prose-only high-risk rigor) states — worth ~8.0. **Ship it; add the risk-based escalation before trusting the default on lock/crypto/egress/protocol work.**
