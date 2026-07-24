@@ -12,24 +12,26 @@ tested code plus an honest self-check — never a claim of done you cannot back 
 
 ## Standing context — the modules you own (`src-tauri/src/`)
 
-- `lib.rs` — Tauri app builder; `generate_handler![ … ]` (`lib.rs:51`) is the ONE command
+- `lib.rs` — Tauri app builder; `generate_handler![ … ]` is the ONE command
   registry. `main.rs` is the thin entry.
-- `commands.rs` — every `#[tauri::command]`; the lock surface (`lock_folder` 1731,
-  `unlock_folder` 1793, `unlock_meeting` 2055, `relock_folder` 1890, `relock_all` 1910,
-  `remove_lock` 1950), the `meeting_is_unlocked` gate (2249), `export_audio` (470).
+- `commands/` — domain modules for every `#[tauri::command]`; the lock surface is in
+  `commands/lock.rs::{lock_folder,unlock_folder,unlock_meeting,relock_folder,relock_all,remove_lock}`,
+  audio export in `commands/export.rs::export_audio`, and the shared gate in
+  `commands/mod.rs::meeting_is_unlocked`.
 - `state.rs` — `AppState { db, unlocked_folders, master_kek }`. `error.rs` — `AppError` +
   `Result<T>` (the only error type). `events.rs` — typed FE events.
-- `storage/` — `db.rs` (SQLCipher `Db::open_with_key`, schema `migrate()`+`add_column_if_missing`,
-  `seal_note`/`seal_timeline`, `visibility_clause` + `*_visible` reads), `migration.rs`
-  (plaintext→SQLCipher encrypt-in-place + verify), `models.rs`, `mod.rs`.
+- `storage/` — `db.rs` (SQLCipher `Db::open_with_key`, schema
+  `migrate()`+`add_column_if_missing`, `visibility_clause`) plus domain stores such as
+  `seal_store.rs` (`seal_note`/`seal_timeline`) and the `*_visible` readers; `migration.rs`
+  is plaintext→SQLCipher encrypt-in-place + verify.
 - `crypto.rs` — AES-256-GCM `encrypt`/`decrypt` + `encrypt_file`/`decrypt_file`
-  (verify-before-destroy). `secrets/keychain.rs` — DEK/KEK/MCP-token (service `com.meetnotes.app`,
-  dev hatches `MURMUR_DEV_DEK`/`MURMUR_DEV_KEK`). `biometric.rs` — Touch ID, degrades to `Ok(true)`.
-  `screenshare.rs` — crash-safe CoreGraphics auto-relock.
+  (verify-before-destroy). `secrets/keychain.rs` — DEK/KEK/MCP-token, Security.framework
+  user-presence-gated KEK/MK reads (service `com.meetnotes.app`), and debug hatches
+  `MURMUR_DEV_DEK`/`MURMUR_DEV_KEK`. `screenshare.rs` — crash-safe CoreGraphics auto-relock.
 - `audio/` — `recorder.rs` (cpal mic + mute `AtomicBool`), `system.rs` (ScreenCaptureKit Swift
   sidecar), `mixer.rs`, `merge.rs` (wall-clock dual-stream merge), `wav.rs`, `listener.rs`.
 - `transcribe/` — `whisper.rs` (whisper-rs 0.16 Metal; `TranscribeQuality::Fast`/`Accurate`),
-  `model.rs` (default `large-v3`, multilingual incl. Polish), `live.rs`, `types.rs`
+  `model.rs` (selectable local models, multilingual incl. Polish), `live.rs`, `types.rs`
   (`Segment.speaker` = `me`/`others`).
 - `pipeline.rs` — dual-stream → 2-pass transcribe → merge. `mcp.rs` — `127.0.0.1:8765` read-only,
   visibility-gated. `summarize/` — `SummarizerProvider` trait (claude_code default, anthropic
@@ -45,8 +47,9 @@ The five you must never violate:
 
 1. **`AppError` + `Result<T>` everywhere.** No `unwrap`/`expect`/`anyhow::Result` in non-test code.
    Locked-content refusals are `AppError::Locked`.
-2. **Register commands in `lib.rs`.** A new `#[tauri::command]` is edited into `commands.rs` AND
-   `generate_handler!` in the SAME change, or it is silently un-callable.
+2. **Register commands in `lib.rs`.** A new `#[tauri::command]` is added to its
+   `commands/<domain>.rs` module AND `generate_handler!` in the SAME change, or it is silently
+   un-callable.
 3. **Gate every content read.** Note/segments/timeline/audio go through `meeting_is_unlocked`;
    db/MCP/graph reads go through `visibility_clause`. No new ungated read or export path. Never
    hand the FE an on-disk audio path for a locked meeting (the `convertFileSrc`/`asset:` trap).
@@ -78,10 +81,11 @@ The five you must never violate:
 
 ## Dev run (when behavior must be observed)
 
-`MURMUR_DEV_DEK=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef scripts/agent-resource-run -- npm run dev`
+`MURMUR_DEV_DEK=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef scripts/agent-dev-run -- npm run dev`
 (tauri dev; ng on http://localhost:1420, MCP on 127.0.0.1:8765). `MURMUR_DEV_DEK` avoids
-per-rebuilt-binary keychain re-prompts. Stop the dev server before any `tauri build` (it holds the
-cargo target lock).
+per-rebuilt-binary keychain re-prompts. The dev supervisor stays outside the repo-global lane;
+its cargo/rustc descendants take that lane per process. Stop the dev server before any
+`tauri build` (it still shares Cargo targets).
 
 ## Output contract
 

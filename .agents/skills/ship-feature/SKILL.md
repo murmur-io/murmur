@@ -18,15 +18,15 @@ verifier, not the author, decides "done."
 ### 1. Scope
 Restate the change in one sentence. Classify which layer(s) it touches — this picks the
 builder and whether the lock-security review is mandatory:
-- **Backend** — `src-tauri/src/`: commands (`commands.rs`, registered in the
+- **Backend** — `src-tauri/src/`: commands (`commands/mod.rs` plus domain modules, registered in the
   `generate_handler!` in `lib.rs`), state (`state.rs`: `AppState` = db / unlocked_folders /
-  master_kek), storage (`storage/{db.rs,migration.rs,models.rs}`), crypto (`crypto.rs`),
+  master_kek), storage (`storage/{db.rs,*_store.rs,migration.rs,models.rs}`), crypto (`crypto.rs`),
   secrets (`secrets/keychain.rs`), audio/transcribe/summarize/mcp/pipeline.
 - **Frontend** — `src/app/`: features (`features/{record,detail,library,folders,ask,graph,
   settings,onboarding,bar,analytics}`), services (`core/ipc.service.ts`, `folders.service.ts`,
   `toast.service.ts`, `screen-share.service.ts`), `core/models.ts`.
 - **Lock / crypto / visibility-gated** — ANY change to `crypto.rs`, `secrets/keychain.rs`,
-  `biometric.rs`, `screenshare.rs`, `storage/migration.rs`, the unlock/seal/visibility path,
+  `screenshare.rs`, `storage/migration.rs`, the unlock/seal/visibility path,
   or content-read gating ⇒ the **lock-security review is MANDATORY** in stage 4.
 
 ### 2. Create the executable task contract
@@ -47,10 +47,11 @@ standing agent; the builder/verifier roles below are dispatched as task subagent
 the conventions explicitly). Iterate with `/tauri-dev` (`MURMUR_DEV_DEK` recipe,
 `cargo test --lib` loop).
 
-**Inject prior lessons first.** Before dispatching a role, prepend that agent's curated
-`## Recurring patterns` from `.codex/learnings/<agent>.md` to its prompt as *"Previous lessons
-(binding — do NOT repeat these)"*. This is the compounding-lessons loop
-(`.codex/learnings/README.md`) — cheap, and it stops the fleet re-paying a bug it already caught.
+**Prior lessons are executable input.** The harness deterministically selects and prepends the
+role-relevant curated `## Recurring patterns` from canonical `.codex/learnings/`, bounds the
+injected bytes, and includes the full canonical learnings tree in `instructions_sha256`. Do not
+manually duplicate that block in a harness task. For a read-only subagent dispatched outside the
+harness, prepend the relevant curated section explicitly.
 
 **Rust / Tauri rules:**
 - `AppError` + `Result` everywhere (`error.rs`); new commands registered in the

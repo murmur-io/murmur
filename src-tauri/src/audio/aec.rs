@@ -894,15 +894,6 @@ mod tests {
         std::fs::remove_dir_all(sandbox).expect("remove scratch path fixtures");
     }
 
-    /// Whether `pid` still has a process-table entry (any state). None once fully reaped.
-    fn ps_present(pid: u32) -> bool {
-        std::process::Command::new("/bin/ps")
-            .args(["-o", "stat=", "-p", &pid.to_string()])
-            .output()
-            .map(|o| !String::from_utf8_lossy(&o.stdout).trim().is_empty())
-            .unwrap_or(false)
-    }
-
     /// C1 (RED-before-GREEN): an `AecRecorder` DROPPED without a clean `stop()` (app-quit
     /// mid-recording) must boundedly TERM→SIGKILL→REAP its VPIO helper child. Parent-pipe EOF alone
     /// bounds the helper but cannot reap it from the still-live host. Proof: after drop the pid has
@@ -924,13 +915,16 @@ mod tests {
             wav_path: PathBuf::from("/nonexistent/dummy.wav"),
             started_at: Instant::now(),
         };
-        assert!(ps_present(pid), "the dummy child is alive before drop");
+        assert!(
+            pid_alive(pid as i32),
+            "the dummy child is alive before drop"
+        );
 
         drop(rec); // no stop() — the app-quit-mid-recording path.
 
         std::thread::sleep(std::time::Duration::from_millis(300));
         assert!(
-            !ps_present(pid),
+            !pid_alive(pid as i32),
             "dropping without stop() must boundedly reap the AEC helper — no orphan, no zombie"
         );
     }

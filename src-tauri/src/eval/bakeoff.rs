@@ -442,11 +442,11 @@ mod tests {
         write_artifact_if_requested(&markdown);
     }
 
-    /// HEADLESS wiring proof (runs in the normal loop): seed the synthetic corpus with the stub
-    /// embedder, run the full bake-off over the committed fixture, and assert the FTS leg — the
-    /// only leg that is REAL without a model — actually retrieves (the entity-anchored queries
-    /// carry exact names, so BM25 must land hits). Deterministic: fixed corpus, fixed set, stub
-    /// vectors. Semantic numbers are NOT asserted (stub ≠ quality signal).
+    /// HEADLESS deterministic retrieval gate (runs in the normal loop): seed the synthetic corpus
+    /// with the stub embedder and enforce the committed FTS baseline for all three metrics. FTS is
+    /// the only genuine quality signal without a model. Semantic/hybrid remain intentionally
+    /// un-gated here (stub vectors are not semantic); generation quality has its separate manual
+    /// real-provider bake-off.
     #[test]
     fn synthetic_corpus_bakeoff_wires_headless() {
         let db = throwaway_db("synthetic-headless");
@@ -463,10 +463,21 @@ mod tests {
             .iter()
             .find(|m| m.mode == RetrievalMode::Fts)
             .expect("fts row present");
+        const COMMITTED_FTS_FLOOR: f64 = 0.20;
         assert!(
-            fts.recall_at_k > 0.0,
-            "FTS must retrieve at least the entity-anchored queries over the seeded corpus, got {}",
+            fts.recall_at_k >= COMMITTED_FTS_FLOOR,
+            "FTS recall@5 regressed below committed floor {COMMITTED_FTS_FLOOR}: {}",
             fts.recall_at_k
+        );
+        assert!(
+            fts.ndcg_at_k >= COMMITTED_FTS_FLOOR,
+            "FTS nDCG@5 regressed below committed floor {COMMITTED_FTS_FLOOR}: {}",
+            fts.ndcg_at_k
+        );
+        assert!(
+            fts.mrr >= COMMITTED_FTS_FLOOR,
+            "FTS MRR regressed below committed floor {COMMITTED_FTS_FLOOR}: {}",
+            fts.mrr
         );
         // The markdown renders over the real report without panicking and carries all three rows.
         let ctx = crate::eval::ReportContext {

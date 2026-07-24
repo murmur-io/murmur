@@ -227,11 +227,27 @@ pub fn list_master_kek_candidates(reason: &str) -> Result<zeroize::Zeroizing<Vec
 /// requires this — it may conclude a folder is unrecoverable ONLY from an enumeration that
 /// AUTHORITATIVELY completed and returned no unwrapping candidate. A cancelled/failed Touch ID or a
 /// transient keychain fault must abort the discard (`Err`), never be mistaken for "the keychain
-/// holds no key" (which would irreversibly wipe a still-recoverable folder).
+/// holds no key" (which would irreversibly wipe a still-recoverable folder). A debug
+/// `MURMUR_DEV_KEK` also returns `Err`: its isolated one-key universe cannot prove that an older
+/// MeetNotes-dev folder was not sealed under a Keychain KEK before the hatch was enabled.
 pub fn list_master_kek_candidates_strict(
     reason: &str,
 ) -> Result<zeroize::Zeroizing<Vec<[u8; 32]>>> {
     collect_master_kek_candidates(reason, true)
+}
+
+#[cfg(debug_assertions)]
+fn dev_kek_candidates(
+    raw: Option<&str>,
+    strict: bool,
+) -> Option<Result<zeroize::Zeroizing<Vec<[u8; 32]>>>> {
+    let key = hex_to_key32(raw?)?;
+    if strict {
+        return Some(Err(AppError::Unavailable(
+            "cannot prove a folder key absent while MURMUR_DEV_KEK isolates the Keychain".into(),
+        )));
+    }
+    Some(Ok(zeroize::Zeroizing::new(vec![key])))
 }
 
 /// Shared enumeration for both candidate-list variants. `strict` decides whether a failure to
@@ -245,10 +261,20 @@ fn collect_master_kek_candidates(
 
     // Dev hatch first (mirrors the resolution order).
     #[cfg(debug_assertions)]
-    if let Ok(dev) = std::env::var("MURMUR_DEV_KEK") {
-        if let Some(k) = hex_to_key32(&dev) {
-            out.push(k);
-        }
+    if let Some(dev_result) =
+        dev_kek_candidates(std::env::var("MURMUR_DEV_KEK").ok().as_deref(), strict)
+    {
+        // The debug hatch is an explicit isolated key universe. Touching
+        // biometric/plain login-Keychain generations as well would make
+        // cargo tests and tauri-dev depend on (and potentially prompt for)
+        // release credentials despite the fixed dev key. It also defeats
+        // the harness's hard Security-framework denial. A destructive
+        // absence proof is different: an older MeetNotes-dev folder may
+        // have been sealed before the hatch was set, using a Keychain KEK.
+        // Since we intentionally skip that store, strict enumeration must
+        // fail closed rather than call this one-key set authoritative.
+        // Release builds do not compile this branch.
+        return dev_result;
     }
 
     #[cfg(target_os = "macos")]
@@ -1747,6 +1773,31 @@ mod tests {
         assert_eq!(hex_to_key32("tooshort"), None);
         assert_eq!(hex_to_key32(&"z".repeat(64)), None);
         assert_eq!(hex_to_key32(&"a".repeat(63)), None);
+    }
+
+    #[test]
+    fn valid_dev_kek_is_isolated_but_never_authoritative_for_discard() {
+        const DEV_KEK: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+
+        let candidates = dev_kek_candidates(Some(DEV_KEK), false)
+            .expect("valid dev KEK is selected")
+            .unwrap();
+        assert_eq!(
+            candidates.as_slice(),
+            &[[0x11; 32]],
+            "a valid debug KEK must not be mixed with release-Keychain generations"
+        );
+        assert!(
+            matches!(
+                dev_kek_candidates(Some(DEV_KEK), true),
+                Some(Err(AppError::Unavailable(_)))
+            ),
+            "an isolated dev candidate cannot prove that an older Keychain KEK is absent"
+        );
+        assert!(
+            dev_kek_candidates(Some("not-a-key"), false).is_none(),
+            "a malformed hatch must fall through to the normal Keychain source"
+        );
     }
 
     #[test]

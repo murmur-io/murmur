@@ -8,7 +8,8 @@ description: The MAP of Murmur's shipped retrieval + agent-memory stack by file:
 The knowledge map for Murmur's retrieval + agent-memory stack (the "brain"). This file is the
 LEAN index: what exists, where, and the invariants you cannot break. The deep, code-grounded
 material lives in `references/*.md` — load the one you need. **Trust code, not this map:** grep the
-symbol in the current tree before you rely on it (`commands.rs`/`db.rs` are >8k lines and drift).
+symbol in the current tree before you rely on it (commands and storage are split across growing
+domain modules, and line anchors drift).
 
 **Pairs with the `memory-retrieval-architect` agent** — dispatch it (or follow this skill yourself).
 Because every change here touches `visibility_clause`, `lock-security-reviewer` is a required second

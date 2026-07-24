@@ -9,8 +9,13 @@ set -euo pipefail
 source "$HOME/.cargo/env" 2>/dev/null || true
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 
-MODEL="$HOME/Library/Application Support/MeetNotes/models/ggml-base.en.bin"
-[ -f "$MODEL" ] || { echo "model missing: $MODEL — run scripts/e2e-core.sh first"; exit 1; }
+MODELS_DIR="${MURMUR_WHISPER_MODELS_DIR:-$HOME/Library/Application Support/MeetNotes/models}"
+MODEL="$MODELS_DIR/ggml-base.en.bin"
+bash "$REPO/scripts/ensure-whisper-model.sh"
+
+# Mixing validates the local audio/transcription path with the example's
+# deterministic no-egress summarizer stub.
+export MURMUR_E2E_NO_EGRESS=1
 
 WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
 MIC="$WORK/mic.wav"; SYS="$WORK/sys.wav"; VAULT="$WORK/vault"; mkdir -p "$VAULT"
