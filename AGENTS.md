@@ -137,6 +137,7 @@ direct-push-to-`murmur` protection are always on. Reach for rigor deliberately:
 - **Choose the writer/reviewer pair** with `--agent`/`--reviewer` (both `codex|claude`).
   All four pairs are allowed, including same-vendor; the shipped default is
   `claude→claude`. The reviewer is always a fresh, independent session with no
-  writer context — same-vendor is still a real adversarial review, not
-  self-grading. Prefer a cross-vendor pair when model-family diversity matters
-  (lock/crypto/egress).
+  writer context — same-vendor is a procedurally independent adversarial review,
+  not self-grading, though not model-family-diverse. `lock`/`egress`/`protocol`
+  tasks auto-escalate the reviewer to the opposite vendor (opt out with
+  `--allow-same-vendor-high-risk`).
