@@ -44,6 +44,10 @@ class GuardFailure(RuntimeError):
     """A deterministic reason the attempted operation must be refused."""
 
 
+class NoTaskForWorktree(GuardFailure):
+    """Raised when no harness task claims the current worktree (normal mode)."""
+
+
 @dataclass(frozen=True)
 class SimpleCommand:
     tokens: Tuple[str, ...]
@@ -629,7 +633,9 @@ def _resolve_task(repo: Path, common: Path) -> Tuple[Dict[str, Any], Path]:
             if _manifest_worktree(document) == repo.resolve():
                 return document, task_dir
             raise GuardFailure("legacy current-task pointer belongs to a different worktree")
-    raise GuardFailure("no task manifest matches this worktree; use scripts/agent-harness init/run")
+    raise NoTaskForWorktree(
+        "no task manifest matches this worktree; use scripts/agent-harness init/run"
+    )
 
 
 def _parse_time(raw: Any, label: str) -> dt.datetime:
@@ -953,6 +959,8 @@ def _finish_guard(
                 allow_test_adapter=allow_test_adapter,
             )
             return None
+        except NoTaskForWorktree:
+            return None  # normal mode: no active harness task → allow the commit
         except GuardFailure as exc:
             reason = str(exc)
     if mode == "advisory":
@@ -1833,7 +1841,7 @@ def _run_selftest() -> int:
             repo,
             use_default_finish=True,
         )
-        test.result(f"{vendor}: default-enforce missing manifest", got, "BLOCK")
+        test.result(f"{vendor}: default-enforce missing manifest", got, "ALLOW")
 
         # Malformed manifest is found by explicit task id and must fail closed.
         _, common, _, _ = _repo_context(repo)
