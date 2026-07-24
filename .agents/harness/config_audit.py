@@ -127,9 +127,14 @@ def _json_audit(audit: Audit) -> Dict[str, Any]:
         "harness config must be an object with schema_version=1",
     )
     audit.require(
-        isinstance(config, dict) and config.get("default_writer") == "claude",
-        "harness defaults to Claude writer",
-        "harness default_writer must be claude (Codex is the automatic reviewer)",
+        isinstance(config, dict) and config.get("default_writer") in ("codex", "claude"),
+        "harness default_writer is a real model vendor",
+        "harness default_writer must be codex or claude",
+    )
+    audit.require(
+        isinstance(config, dict) and config.get("default_reviewer") in ("codex", "claude"),
+        "harness default_reviewer is a real model vendor",
+        "harness default_reviewer must be codex or claude",
     )
     audit.require(
         isinstance(config, dict)
