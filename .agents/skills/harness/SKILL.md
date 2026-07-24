@@ -35,7 +35,8 @@ full attestation and the resource lane is required for heavy commands. Your main
 #    --prompt and --owned are required, --owned may repeat for multiple paths)
 scripts/agent-harness init <task-id> --kind <bug|feature|refactor|docs|harness> \
   --prompt "<what>" --owned <path> [--owned <path> ...] \
-  [--risk <lock|egress|protocol|runtime|ui|performance|release>]
+  [--risk <lock|egress|protocol|runtime|ui|performance|release>] \
+  [--agent <codex|claude>] [--reviewer <codex|claude>]
 
 # 2. Drive writer → checks → independent reviews → PASS attestation
 scripts/agent-harness run <task-id>
@@ -49,9 +50,19 @@ gh pr merge --merge
 scripts/agent-harness close <task-id>
 ```
 
-The default vendor pair is Claude writer → Codex reviewer (the only supported
-reversal is Codex writer → Claude reviewer). The implementer never owns the
-verdict.
+## Choosing the writer/reviewer pair
+
+- `--agent` sets the writer vendor (default: `config.json` `default_writer`).
+- `--reviewer` sets the reviewer vendor (default: `config.json` `default_reviewer`).
+- All four pairs are allowed: `claude→codex`, `codex→claude`, `claude→claude`,
+  `codex→codex`. **The shipped default is `claude→claude`** — the harness runs
+  entirely on Claude, no Codex dependency.
+- Whatever the pair, the reviewer is ALWAYS a fresh, independent session with no
+  writer context — so same-vendor is still a real adversarial review, not
+  self-grading, and the implementer never owns the verdict.
+- **Trade-off:** same-vendor loses cross-model-family diversity (Codex and Claude
+  catch different failure modes). Prefer a cross-vendor pair when that diversity
+  matters most (e.g. lock/crypto/egress changes).
 
 ## Verify the harness itself
 
