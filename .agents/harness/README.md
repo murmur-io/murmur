@@ -33,8 +33,11 @@ scripts/agent-harness run attachment-loss
 scripts/agent-harness status attachment-loss
 ```
 
-The repository invariant is **Claude writer -> Codex reviewer** by default, or the exact reverse
-when `--agent codex` is supplied. Writer and reviewer must be different real vendors. The `fake`
+The writer/reviewer pair is configurable per task via `--agent` (writer) and `--reviewer`
+(reviewer); both default to `config.json` `default_writer` / `default_reviewer` (shipped:
+`claude` / `claude`). Any pair of real vendors is allowed, including same-vendor
+(`claude/claude`, `codex/codex`) — the reviewer is always a fresh, independent session with no
+writer context, so same-vendor is still a genuine adversarial review. The `fake`
 adapter is not accepted by public `init`, verification, hooks, or commit; it exists only behind the
 in-process deterministic selftest interface.
 
