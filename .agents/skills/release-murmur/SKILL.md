@@ -125,6 +125,41 @@ git checkout murmur && git pull origin murmur             # local trunk now has 
 > "Developer ID Application" cert in the login keychain and (for stage 10) Apple notary
 > credentials. If running headless, STOP here and hand the user stages 5–11 verbatim.
 
+## Sandbox & human-pause recipe (do not rely on memory recall)
+
+Release steps that touch the keychain, codesign, notarytool, or `gh`/`git push`
+**must run unsandboxed** and **must not** be wrapped in `agent-resource-run`
+(the harness is opt-in; on the release machine you are in normal mode).
+
+- **Sandbox:** the release machine keeps a per-machine, git-ignored
+  `.claude/settings.local.json` override. Never commit sandbox-disabling to the
+  repo — it would weaken the sandbox for the whole team.
+- **Heavy commands run directly** in normal mode (no `agent-resource-run`
+  wrapping required). `finish-guard` is asleep, so the version-bump commit goes
+  through directly; merge to `murmur` still requires a **PR** (never a direct
+  push), and `gh` PR bodies are no longer misclassified as heavy.
+
+Irreducible human pause points (macOS auth dialogs the agent shell cannot answer):
+
+1. **P1 — unlock the login keychain** (once, up front): needed for `git`/`gh`
+   push and for Developer-ID key + notary-profile access. Run
+   `security unlock-keychain` **yourself** — the agent must never run `security`.
+2. **P2 — supply the Developer-ID hash** as `DEVELOPER_ID` (40 hex chars) to
+   `scripts/macos-sign-notarize.sh`. Pre-supply it so it does not stall the run.
+3. **P3 — approve the Developer-ID codesign key dialog** once ("Always Allow");
+   this collapses the per-helper + app + DMG prompts into one interaction.
+
+One-time-only (not per release): `xcrun notarytool store-credentials murmur`,
+run interactively by you.
+
+Everything else — CI gate, version bump, universal build, DMG, `notarytool
+submit --wait`, staple, `spctl`, `gh release create/upload` — is headless.
+
+## Enable repo auto-merge
+
+`gh pr merge --merge --auto` requires auto-merge enabled on the repo (Settings →
+General → "Allow auto-merge"). Enable it once to stop hand-waiting on CI.
+
 ## Stage 5 — Add the universal Rust targets (once per machine)
 
 ```bash
