@@ -1,6 +1,7 @@
 {
   "schema_version": 1,
   "default_writer": "claude",
+  "default_reviewer": "claude",
   "max_repair_rounds": 2,
   "task_timeout_seconds": 7200,
   "agent_timeout_seconds": 1800,

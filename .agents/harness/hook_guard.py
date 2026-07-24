@@ -719,8 +719,6 @@ def _validate_provenance(
         pass
     elif writer_vendor not in {"codex", "claude"} or reviewer_vendor not in {"codex", "claude"}:
         raise GuardFailure("fake or unknown model vendors are forbidden outside harness selftests")
-    elif writer_vendor == reviewer_vendor:
-        raise GuardFailure("writer and reviewer must use different vendors")
     if writer.get("vendor") != task.get("writer"):
         raise GuardFailure("attestation writer does not match the task contract")
     if reviewer.get("vendor") != task.get("reviewer"):
@@ -2043,6 +2041,30 @@ def _run_selftest() -> int:
         test.result(f"{vendor}: reviewer reused writer session", got, "BLOCK")
 
         shutil.rmtree(repo.parent)
+
+    print("-- provenance vendor rule (same-vendor allowed; public fake rejected) --")
+    same_vendor_attestation = {
+        "writer": {"vendor": "claude", "round": 1, "cli_version": "x", "model": "m", "session_id": "sess-w"},
+        "reviewer": {"vendor": "claude", "cli_version": "x", "model": "m", "session_id": "sess-r"},
+        "rounds": 1,
+    }
+    same_vendor_task = {"writer": "claude", "reviewer": "claude"}
+    try:
+        _validate_provenance(same_vendor_attestation, same_vendor_task)
+        test.result("same-vendor provenance accepted", "ACCEPT", "ACCEPT")
+    except GuardFailure as exc:
+        test.result("same-vendor provenance accepted", f"BLOCK:{exc}", "ACCEPT")
+    fake_attestation = {
+        "writer": {"vendor": "fake", "round": 1, "cli_version": "x", "model": "m", "session_id": "sess-w"},
+        "reviewer": {"vendor": "fake", "cli_version": "x", "model": "m", "session_id": "sess-r"},
+        "rounds": 1,
+    }
+    fake_task = {"writer": "fake", "reviewer": "fake"}
+    try:
+        _validate_provenance(fake_attestation, fake_task)
+        test.result("public fake provenance rejected", "ACCEPT", "BLOCK")
+    except GuardFailure:
+        test.result("public fake provenance rejected", "BLOCK", "BLOCK")
 
     print("-- real runner / linked-worktree integration --")
     _linked_worktree_runner_case(test)
