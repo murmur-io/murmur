@@ -1837,6 +1837,76 @@ def _run_selftest() -> int:
             got = "HEAVY" if resource_policy.command_is_heavy(cmd) else "LIGHT"
             test.result(label, got, want)
 
+        # Finding 2 fix: mode-independent anti-bypass classifier coverage.
+        # These are the misuse/lookalike patterns whose block-bash result
+        # correctly flipped BLOCK -> ALLOW in the no-task fixture above (the
+        # resource-lane gate now only fires when a harness task claims the
+        # worktree). Their classification in resource_policy.py did NOT
+        # change and is still correct, but block-bash no longer exercises it
+        # in no-task mode, so it lost its only regression guard. Pin the
+        # classifier directly, independent of task/mode, using the exact
+        # execution directory (SOURCE_ROOT) the hook payload would carry --
+        # command_is_heavy_in/command_is_dev_in resolve lookalike-runner
+        # paths relative to that cwd, so the real repo root is required for
+        # the "outside the repo" impostor checks to behave as intended.
+        # Verified non-vacuous: a clearly-safe command ("git status --short")
+        # classifies heavy=False, dev=False against the same cwd.
+        anti_bypass_heavy = [
+            ("plain unwrapped cargo test", "cargo test --lib"),
+            (
+                "dev-runner allowlist violation: injected config flag",
+                "scripts/agent-dev-run -- npm run dev -- --config injected.json",
+            ),
+            (
+                "dev-runner allowlist violation: arbitrary cargo",
+                "scripts/agent-dev-run -- cargo test --lib",
+            ),
+            (
+                "dev-runner allowlist violation: npm build",
+                "scripts/agent-dev-run -- npm run build",
+            ),
+            (
+                "impostor dev runner outside the repo",
+                "/tmp/scripts/agent-dev-run -- npm run dev",
+            ),
+            (
+                "impostor lane runner outside the repo",
+                "/tmp/scripts/agent-resource-run -- cargo test --lib",
+            ),
+            (
+                "forged selftest-guardian-release env",
+                "MURMUR_AGENT_SELFTEST_GUARDIAN_RELEASE=/tmp/x scripts/agent-resource-run -- true",
+            ),
+            (
+                "forged resource-lane-active env",
+                "MURMUR_AGENT_RESOURCE_LANE_ACTIVE=1 scripts/agent-dev-run -- npm run dev",
+            ),
+        ]
+        for label, cmd in anti_bypass_heavy:
+            got = "HEAVY" if resource_policy.command_is_heavy_in(cmd, SOURCE_ROOT) else "LIGHT"
+            test.result(f"anti-bypass classifier: {label}", got, "HEAVY")
+
+        # The lane runner (agent-resource-run) is only meant to wrap bounded
+        # one-off commands; wrapping a long-lived dev server in it (instead
+        # of agent-dev-run) is itself a lane-starvation misuse pattern -- and
+        # it is the one case here where command_is_dev_in is the function
+        # that actually reproduces the original BLOCK (command_is_heavy_in
+        # is also true for these, but the dev-axis classification is the one
+        # this pattern specifically hinges on).
+        anti_bypass_dev = [
+            (
+                "lane runner misused for a long-lived dev server",
+                "scripts/agent-resource-run -- npm run dev",
+            ),
+            (
+                "lane runner misused for a chdir'd long-lived dev server",
+                "scripts/agent-resource-run --chdir /tmp/deck npm run dev -- --port 4173",
+            ),
+        ]
+        for label, cmd in anti_bypass_dev:
+            got = "DEV" if resource_policy.command_is_dev_in(cmd, SOURCE_ROOT) else "NOT-DEV"
+            test.result(f"anti-bypass classifier: {label}", got, "DEV")
+
     print("-- staged secret scan (no path exclusions) --")
     for vendor in ("codex", "claude"):
         _secret_case(test, vendor, "plain.txt", "token=" + "sk" + "-ant-" + "A" * 28, "BLOCK")
@@ -1899,12 +1969,30 @@ def _run_selftest() -> int:
         test.result(f"{vendor}: minimal receipt", got, "BLOCK")
 
         # With a task claiming the worktree, the resource lane is enforced again.
-        # Use a distinct task id + local variable names so this scratch task does
-        # not clobber the "fresh" task_dir/attestation this loop keeps mutating.
-        lane_task_dir, _lane_task, _lane_attestation = _write_receipt(repo, "lane")
-        got, _ = test.invoke(vendor, "block-bash", "cargo test --lib", repo)
-        test.result(f"{vendor}: task-present unwrapped heavy blocked", got, "BLOCK")
-        # Absolute path: the fixture repo is a separate git init unrelated to
+        # This MUST be pinned through CLEAN single-task resolution, not the
+        # ambiguous fail-safe: reusing `repo` here would leave TWO manifests
+        # ("fresh" above + a new one) claiming the same worktree_path, so
+        # _resolve_task raises GuardFailure("multiple task manifests claim
+        # this worktree") and _worktree_has_active_task returns True via its
+        # `except GuardFailure` fail-safe branch -- never exercising the real
+        # "exactly one task resolves" happy path the gate depends on. Use a
+        # DEDICATED _finish_repo() fixture instead: it starts with no task
+        # manifest of its own, so writing exactly one receipt on it resolves
+        # unambiguously (see _resolve_task: `len(matches) == 1` returns
+        # directly, only `len(matches) > 1` raises the ambiguous GuardFailure).
+        lane_repo = _finish_repo()
+        got, _ = test.invoke(vendor, "block-bash", "cargo test --lib", lane_repo)
+        test.result(f"{vendor}: no-task heavy allowed (clean fixture mirror)", got, "ALLOW")
+
+        _write_receipt(lane_repo, "lane")
+        # Exactly one manifest (this "lane" task) now claims lane_repo's
+        # worktree, so _resolve_task's `matches` list has length 1 and
+        # returns that single match directly -- _worktree_has_active_task
+        # returns True via the real "task found" path, not the
+        # ambiguous-manifests fail-safe. This is the happy path pinned.
+        got, _ = test.invoke(vendor, "block-bash", "cargo test --lib", lane_repo)
+        test.result(f"{vendor}: task-present unwrapped heavy blocked (clean single-task)", got, "BLOCK")
+        # Absolute path: lane_repo is a separate git init unrelated to
         # SOURCE_ROOT, so a *relative* "scripts/agent-resource-run" would not
         # resolve to the canonical runner from this cwd and would misclassify
         # as an untrusted lookalike (see resource_policy.is_lane_runner).
@@ -1913,10 +2001,10 @@ def _run_selftest() -> int:
             vendor,
             "block-bash",
             f"{lane_runner} --chdir src-tauri -- cargo test --lib",
-            repo,
+            lane_repo,
         )
         test.result(f"{vendor}: task-present lane-wrapped allowed", got, "ALLOW")
-        shutil.rmtree(lane_task_dir)
+        shutil.rmtree(lane_repo.parent)
 
         (task_dir / "attestation.json").write_text(json.dumps(attestation, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         attestation["reviews"][0]["verdict"] = "FAIL"
