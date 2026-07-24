@@ -259,7 +259,6 @@
     .nav-cta { display: flex; align-items: center; gap: 12px; }
     @media (max-width: 860px) { .nav-links .link { display: none; } }
     @media (max-width: 460px) {
-      #ghStar { display: none; }
       .nav-inner { height: 56px; padding: 0 8px 0 14px; }
     }
 
@@ -278,6 +277,10 @@
     }
     .badge .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); }
     .badge.safe .dot { background: var(--safe-text); }
+    .badge.badge-link { cursor: pointer; transition: background .15s ease, border-color .15s ease, color .15s ease; }
+    .badge.badge-link:hover { background: var(--surface-hover); border-color: var(--border); color: var(--text-primary); }
+    .badge.badge-link svg { width: 14px; height: 14px; flex: none; }
+    .badge .star-count { padding-left: 7px; margin-left: 0; border-left: 1px solid var(--border); }
 
     h1.hero-title {
       font-size: clamp(38px, 6.5vw, 72px);
@@ -446,6 +449,7 @@
         <a class="link" href="#privacy">Privacy</a>
         <a class="link" href="#features">Features</a>
         <a class="link" href="#pricing">Pricing</a>
+        <a class="link" href="./docs.html">Docs</a>
         <a class="link" href="https://github.com/murmur-io/murmur">GitHub</a>
       </nav>
       <div class="nav-cta">
@@ -460,11 +464,6 @@
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg>
           </button>
         </div>
-        <a class="btn btn-ghost btn-sm" id="ghStar" href="https://github.com/murmur-io/murmur" aria-label="Star Murmur on GitHub">
-          <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 2C6.48 2 2 6.58 2 12.25c0 4.53 2.87 8.37 6.84 9.73.5.1.68-.22.68-.49 0-.24-.01-.87-.01-1.71-2.78.62-3.37-1.37-3.37-1.37-.45-1.18-1.11-1.5-1.11-1.5-.91-.64.07-.62.07-.62 1 .07 1.53 1.06 1.53 1.06.9 1.56 2.36 1.11 2.94.85.09-.66.35-1.11.63-1.37-2.22-.26-4.56-1.14-4.56-5.06 0-1.12.39-2.03 1.03-2.75-.1-.26-.45-1.3.1-2.71 0 0 .84-.28 2.75 1.05a9.35 9.35 0 0 1 5 0c1.91-1.33 2.75-1.05 2.75-1.05.55 1.41.2 2.45.1 2.71.64.72 1.03 1.63 1.03 2.75 0 3.93-2.34 4.79-4.57 5.05.36.32.68.94.68 1.9 0 1.37-.01 2.48-.01 2.82 0 .27.18.6.69.49A10.04 10.04 0 0 0 22 12.25C22 6.58 17.52 2 12 2Z"/></svg>
-          <span>Star</span>
-          <span class="star-count" id="starCount" hidden aria-label="GitHub stars"></span>
-        </a>
         <a class="btn btn-primary btn-sm" href="https://github.com/murmur-io/murmur/releases/latest">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12m0 0 4-4m-4 4-4-4M5 21h14"/></svg>
           <span>Download</span>
@@ -481,6 +480,11 @@
         <div class="badge-row">
           <span class="badge safe"><span class="dot"></span> Local-first · macOS</span>
           <span class="badge">On-device brain</span>
+          <a class="badge badge-link" id="ghStar" href="https://github.com/murmur-io/murmur" aria-label="Star Murmur on GitHub">
+            <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 2C6.48 2 2 6.58 2 12.25c0 4.53 2.87 8.37 6.84 9.73.5.1.68-.22.68-.49 0-.24-.01-.87-.01-1.71-2.78.62-3.37-1.37-3.37-1.37-.45-1.18-1.11-1.5-1.11-1.5-.91-.64.07-.62.07-.62 1 .07 1.53 1.06 1.53 1.06.9 1.56 2.36 1.11 2.94.85.09-.66.35-1.11.63-1.37-2.22-.26-4.56-1.14-4.56-5.06 0-1.12.39-2.03 1.03-2.75-.1-.26-.45-1.3.1-2.71 0 0 .84-.28 2.75 1.05a9.35 9.35 0 0 1 5 0c1.91-1.33 2.75-1.05 2.75-1.05.55 1.41.2 2.45.1 2.71.64.72 1.03 1.63 1.03 2.75 0 3.93-2.34 4.79-4.57 5.05.36.32.68.94.68 1.9 0 1.37-.01 2.48-.01 2.82 0 .27.18.6.69.49A10.04 10.04 0 0 0 22 12.25C22 6.58 17.52 2 12 2Z"/></svg>
+            <span>Star on GitHub</span>
+            <span class="star-count" id="starCount" hidden aria-label="GitHub stars"></span>
+          </a>
         </div>
         <h1 class="hero-title">Your meetings get a brain — <span class="grad">and you control where it runs.</span></h1>
         <p class="hero-sub">Murmur records your calls and transcribes them <b>on-device</b>. Run AI locally, or explicitly opt into <b>redacted cloud AI</b>; your meeting archive stays on your Mac.</p>
@@ -823,6 +827,7 @@
           <a href="#privacy">Privacy</a>
           <a href="#features">Features</a>
           <a href="#pricing">Pricing</a>
+          <a href="./docs.html">Docs</a>
           <a href="https://github.com/murmur-io/murmur">GitHub</a>
           <a href="https://github.com/murmur-io/murmur/releases/latest">Download</a>
         </nav>

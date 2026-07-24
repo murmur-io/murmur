@@ -1,0 +1,1122 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Docs — Murmur</title>
+  <meta name="description" content="Murmur documentation — how recording, the on-device brain, notes, the knowledge graph and the lock model actually work." />
+  <link rel="icon" href="./assets/icon.svg" />
+  <script>
+    (function () {
+      var t = "system";
+      try { t = localStorage.getItem("murmur-theme") || "system"; } catch (e) {}
+      document.documentElement.setAttribute("data-theme", t);
+    })();
+  </script>
+  <style>
+    /* ─────────────────────────────────────────────────────────────
+       Same Quiet Glass tokens as index.html, kept in sync manually
+       for this PoC (src/design-tokens/*.css mirrors these too).
+       --maxw is wider here than the marketing page — a 3-column
+       docs layout (nav / content / on-this-page) needs the room.
+       ───────────────────────────────────────────────────────────── */
+    :root {
+      --surface-base: #07070b;
+      --surface-raised: rgba(255, 255, 255, 0.045);
+      --surface-solid: #111118;
+      --surface-hover: rgba(255, 255, 255, 0.06);
+
+      --text-primary: #f6f6fa;
+      --text-secondary: #a6a6b6;
+      --text-muted: #6c6c7d;
+
+      --accent: #6e76ff;
+      --accent-hover: #8a90ff;
+      --accent-text: #8a90ff;
+      --accent-soft: rgba(110, 118, 255, 0.16);
+      --accent-ring: rgba(110, 118, 255, 0.5);
+
+      --live-text: #ff7a5c;
+      --safe-text: #4ade80;
+      --safe-soft: rgba(74, 222, 128, 0.14);
+      --warn-text: #f5b14c;
+      --warn-soft: rgba(245, 177, 76, 0.14);
+
+      --border: rgba(255, 255, 255, 0.09);
+      --border-subtle: rgba(255, 255, 255, 0.055);
+
+      --radius-sm: 9px;
+      --radius-md: 13px;
+      --radius-lg: 18px;
+      --radius-xl: 24px;
+      --radius-pill: 999px;
+
+      --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
+      --shadow-md: 0 12px 32px rgba(0, 0, 0, 0.35);
+      --shadow-lg: 0 22px 56px rgba(0, 0, 0, 0.48);
+
+      --font: -apple-system, "SF Pro Display", "SF Pro Text", system-ui, "Segoe UI", Roboto, sans-serif;
+      --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace;
+
+      --maxw: 1320px;
+      color-scheme: dark;
+
+      --glass-bg: linear-gradient(160deg, rgba(255,255,255,.075) 0%, rgba(255,255,255,.035) 55%, rgba(255,255,255,.055) 100%);
+      --glass-border: rgba(255, 255, 255, 0.11);
+      --glass-gleam: inset 0 1px 0 rgba(255, 255, 255, 0.18);
+      --glass-blur: 36px;
+      --glass-saturate: 135%;
+
+      --aurora-field:
+        radial-gradient(40% 46% at 4% 8%, rgba(110, 118, 255, 0.15), transparent 58%),
+        radial-gradient(38% 42% at 3% 94%, rgba(157, 123, 255, 0.10), transparent 60%);
+    }
+
+    :root[data-theme="light"] {
+      color-scheme: light;
+      --surface-base: #f3f3f8;
+      --surface-raised: rgba(255, 255, 255, 0.72);
+      --surface-solid: #ffffff;
+      --surface-hover: rgba(18, 18, 40, 0.05);
+      --text-primary: #17171f;
+      --text-secondary: #55555f;
+      --text-muted: #86868f;
+      --accent-hover: #5b63f0;
+      --accent-text: #4e56e4;
+      --accent-soft: rgba(110, 118, 255, 0.13);
+      --live-text: #d9532e;
+      --safe-text: #1f9d4d;
+      --safe-soft: rgba(31, 157, 77, 0.13);
+      --warn-text: #b9791f;
+      --warn-soft: rgba(185, 121, 31, 0.12);
+      --border: rgba(18, 18, 40, 0.12);
+      --border-subtle: rgba(18, 18, 40, 0.07);
+      --shadow-sm: 0 1px 2px rgba(18, 18, 40, 0.10);
+      --shadow-md: 0 12px 30px rgba(18, 18, 40, 0.10);
+      --shadow-lg: 0 22px 55px rgba(18, 18, 40, 0.13);
+      --glass-bg: linear-gradient(160deg, rgba(255,255,255,.46) 0%, rgba(255,255,255,.36) 55%, rgba(255,255,255,.40) 100%);
+      --glass-border: rgba(255, 255, 255, 0.65);
+      --glass-gleam: inset 0 1px 0 rgba(255, 255, 255, 0.95);
+      --aurora-field:
+        radial-gradient(48% 42% at 8% 10%, rgba(110, 118, 255, 0.24), transparent 60%),
+        radial-gradient(36% 32% at 26% 0%, rgba(74, 196, 240, 0.16), transparent 62%),
+        radial-gradient(42% 40% at 4% 90%, rgba(157, 123, 255, 0.16), transparent 62%);
+    }
+    @media (prefers-color-scheme: light) {
+      :root[data-theme="system"], :root:not([data-theme]) {
+        color-scheme: light;
+        --surface-base: #f3f3f8;
+        --surface-raised: rgba(255, 255, 255, 0.72);
+        --surface-solid: #ffffff;
+        --surface-hover: rgba(18, 18, 40, 0.05);
+        --text-primary: #17171f;
+        --text-secondary: #55555f;
+        --text-muted: #86868f;
+        --accent-hover: #5b63f0;
+        --accent-text: #4e56e4;
+        --accent-soft: rgba(110, 118, 255, 0.13);
+        --live-text: #d9532e;
+        --safe-text: #1f9d4d;
+        --safe-soft: rgba(31, 157, 77, 0.13);
+        --warn-text: #b9791f;
+        --warn-soft: rgba(185, 121, 31, 0.12);
+        --border: rgba(18, 18, 40, 0.12);
+        --border-subtle: rgba(18, 18, 40, 0.07);
+        --shadow-sm: 0 1px 2px rgba(18, 18, 40, 0.10);
+        --shadow-md: 0 12px 30px rgba(18, 18, 40, 0.10);
+        --shadow-lg: 0 22px 55px rgba(18, 18, 40, 0.13);
+        --glass-bg: linear-gradient(160deg, rgba(255,255,255,.46) 0%, rgba(255,255,255,.36) 55%, rgba(255,255,255,.40) 100%);
+        --glass-border: rgba(255, 255, 255, 0.65);
+        --glass-gleam: inset 0 1px 0 rgba(255, 255, 255, 0.95);
+        --aurora-field:
+          radial-gradient(48% 42% at 8% 10%, rgba(110, 118, 255, 0.24), transparent 60%),
+          radial-gradient(36% 32% at 26% 0%, rgba(74, 196, 240, 0.16), transparent 62%),
+          radial-gradient(42% 40% at 4% 90%, rgba(157, 123, 255, 0.16), transparent 62%);
+      }
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+
+    body {
+      margin: 0;
+      font-family: var(--font);
+      color: var(--text-primary);
+      background: var(--surface-base);
+      line-height: 1.6;
+      -webkit-font-smoothing: antialiased;
+      overflow-x: hidden;
+      transition: background-color .25s ease, color .25s ease;
+    }
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      background: var(--aurora-field);
+      pointer-events: none;
+      z-index: 0;
+    }
+    a { color: inherit; text-decoration: none; }
+    .wrap { width: 100%; max-width: var(--maxw); margin: 0 auto; padding: 0 24px; position: relative; z-index: 1; }
+    h1, h2, h3, h4 { margin: 0; text-wrap: balance; letter-spacing: -0.02em; font-weight: 600; }
+    p { margin: 0; }
+
+    .eyebrow {
+      font-size: 12px; font-weight: 600; letter-spacing: 0.14em; text-transform: uppercase;
+      color: var(--text-muted); font-family: var(--font-mono);
+    }
+
+    /* ── Buttons (shared with index.html) ───────────────────── */
+    .btn {
+      display: inline-flex; align-items: center; justify-content: center; gap: 9px;
+      font: inherit; font-weight: 600; font-size: 15px;
+      min-height: 44px; padding: 10px 20px; border-radius: var(--radius-pill);
+      border: 1px solid transparent; cursor: pointer;
+      transition: background .18s ease, border-color .18s ease, color .18s ease;
+      white-space: nowrap;
+    }
+    .btn svg { width: 18px; height: 18px; }
+    .btn-primary { background: var(--accent); color: #fff; box-shadow: var(--shadow-sm); }
+    .btn-primary:hover { background: var(--accent-hover); }
+    .btn-ghost { background: transparent; color: var(--text-primary); border-color: var(--border); }
+    .btn-ghost:hover { background: var(--surface-hover); }
+    .btn-sm { min-height: 38px; padding: 7px 16px; font-size: 14px; }
+
+    /* ── Theme switch ────────────────────────────────────────── */
+    .theme-switch { display: inline-flex; align-items: center; gap: 2px; padding: 3px; border-radius: var(--radius-pill); background: transparent; border: 1px solid var(--border); }
+    .theme-switch button { display: grid; place-items: center; width: 30px; height: 30px; padding: 0; border: 0; background: transparent; color: var(--text-muted); border-radius: var(--radius-pill); cursor: pointer; transition: background .15s ease, color .15s ease; }
+    .theme-switch button svg { width: 16px; height: 16px; }
+    .theme-switch button:hover { color: var(--text-secondary); }
+    .theme-switch button.active { background: var(--surface-hover); color: var(--accent-text); }
+    @media (max-width: 480px) { .theme-switch { display: none; } }
+
+    /* ── Nav ─────────────────────────────────────────────────── */
+    header.nav { position: sticky; top: 12px; z-index: 40; }
+    .nav-inner {
+      display: flex; align-items: center; justify-content: space-between; height: 60px; padding: 0 18px;
+      border-radius: var(--radius-pill); background: var(--glass-bg);
+      -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+      backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+      border: 1px solid var(--glass-border); box-shadow: var(--shadow-md), var(--glass-gleam);
+    }
+    @media (prefers-reduced-transparency: reduce) {
+      .nav-inner { background: var(--surface-solid); -webkit-backdrop-filter: none; backdrop-filter: none; }
+    }
+    .brand { display: flex; align-items: center; gap: 11px; font-weight: 600; font-size: 18px; letter-spacing: -0.03em; }
+    .brand img { width: 30px; height: 30px; border-radius: 8px; }
+    .nav-links { display: flex; align-items: center; gap: 28px; }
+    .nav-links a.link { color: var(--text-secondary); font-size: 15px; font-weight: 500; padding: 10px 0; transition: color .15s; }
+    .nav-links a.link:hover { color: var(--text-primary); }
+    .nav-links a.link.active { color: var(--accent-text); }
+    .nav-cta { display: flex; align-items: center; gap: 12px; }
+    @media (max-width: 860px) { .nav-links .link { display: none; } }
+
+    /* ── Docs shell: left nav / content / right "on this page" ── */
+    .docs-shell { padding: 32px 0 96px; }
+    .docs-grid { display: grid; grid-template-columns: 240px minmax(0, 1fr) 220px; gap: 40px; align-items: start; }
+    @media (max-width: 1180px) { .docs-grid { grid-template-columns: 240px minmax(0, 1fr); } }
+    @media (max-width: 900px) { .docs-grid { grid-template-columns: 1fr; } }
+
+    .docs-toggle { display: none; }
+    @media (max-width: 900px) {
+      .docs-toggle {
+        display: flex; align-items: center; gap: 8px; width: 100%; margin-bottom: 18px;
+        background: var(--surface-raised); border: 1px solid var(--border); border-radius: var(--radius-md);
+        padding: 12px 16px; color: var(--text-primary); font: inherit; font-weight: 600; font-size: 14.5px; cursor: pointer;
+      }
+      .docs-toggle svg { width: 16px; height: 16px; color: var(--text-muted); }
+    }
+
+    /* ── Left sidebar: main docs nav (persists across every page) ── */
+    .docs-side {
+      position: sticky; top: 88px;
+      max-height: calc(100vh - 110px);
+      overflow-y: auto;
+      padding-right: 6px;
+    }
+    @media (max-width: 900px) {
+      .docs-side { display: none; position: static; max-height: none; }
+      .docs-side.open { display: block; margin-bottom: 8px; }
+    }
+    .docs-search { position: relative; margin-bottom: 22px; }
+    .docs-search svg { position: absolute; left: 13px; top: 50%; transform: translateY(-50%); width: 15px; height: 15px; color: var(--text-muted); pointer-events: none; }
+    .docs-search input {
+      width: 100%; font: inherit; font-size: 14px; color: var(--text-primary);
+      background: var(--surface-raised); border: 1px solid var(--border); border-radius: var(--radius-pill);
+      padding: 10px 14px 10px 36px; outline: none; transition: border-color .15s ease;
+    }
+    .docs-search input::placeholder { color: var(--text-muted); }
+    .docs-search input:focus { border-color: var(--accent-ring); }
+    .docs-group + .docs-group { margin-top: 24px; }
+    .docs-group-title { font-size: 11.5px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-muted); margin-bottom: 10px; padding: 0 12px; }
+    .docs-nav-link {
+      display: flex; align-items: flex-start; gap: 9px; font-size: 14.5px; line-height: 1.35; color: var(--text-secondary); font-weight: 500;
+      padding: 8px 12px; border-radius: var(--radius-sm); transition: background .13s ease, color .13s ease; cursor: pointer;
+    }
+    .docs-nav-link:hover { background: var(--surface-hover); color: var(--text-primary); }
+    .docs-nav-link.active { background: var(--accent-soft); color: var(--accent-text); font-weight: 600; }
+    .docs-nav-link .dot { width: 5px; height: 5px; margin-top: 7px; border-radius: 50%; background: currentColor; opacity: .55; flex: none; }
+    .doc-empty { display: none; color: var(--text-muted); font-size: 14px; padding: 8px 12px; }
+    .doc-empty.show { display: block; }
+
+    /* ── Right sidebar: "On this page" for the CURRENT doc only ── */
+    .docs-toc {
+      position: sticky; top: 88px;
+      max-height: calc(100vh - 110px);
+      overflow-y: auto;
+    }
+    @media (max-width: 1180px) { .docs-toc { display: none; } }
+    .docs-toc-title { font-size: 11.5px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-muted); margin-bottom: 12px; padding-left: 13px; }
+    .toc-link {
+      display: block; font-size: 13.5px; color: var(--text-secondary); padding: 7px 13px;
+      border-left: 2px solid var(--border-subtle); transition: color .13s ease, border-color .13s ease;
+      cursor: pointer;
+    }
+    .toc-link:hover { color: var(--text-primary); }
+    .toc-link.active { color: var(--accent-text); border-left-color: var(--accent); font-weight: 600; }
+    .toc-link.lvl-3 { padding-left: 25px; font-size: 13px; }
+    .docs-toc-empty { font-size: 13px; color: var(--text-muted); padding-left: 13px; }
+
+    /* ── "Pro" badge — sidebar links + the page's own title row ── */
+    .pro-badge {
+      display: inline-flex; align-items: center; flex: none;
+      font-family: var(--font-mono); font-size: 10px; font-weight: 700; letter-spacing: 0.05em; text-transform: uppercase;
+      padding: 2px 7px; border-radius: var(--radius-pill);
+      background: var(--accent-soft); color: var(--accent-text); border: 1px solid var(--accent-ring);
+    }
+    .docs-nav-link .pro-badge { margin-left: auto; }
+    .doc-body h2 .pro-badge, .doc-body h3 .pro-badge { margin-left: 9px; vertical-align: middle; }
+    .doc-title-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; }
+
+    /* ── Doc content ─────────────────────────────────────────── */
+    .docs-content { min-width: 0; max-width: 760px; }
+    .doc-panel { display: none; }
+    .doc-panel.active { display: block; }
+    .doc-panel .eyebrow { display: block; margin-bottom: 10px; }
+    .doc-panel h1 { font-size: clamp(24px, 3.2vw, 32px); line-height: 1.14; margin-bottom: 14px; }
+    .doc-title-row h1 { margin-bottom: 0; }
+    .doc-panel .lede { color: var(--text-secondary); font-size: 16.5px; margin-bottom: 28px; }
+    .doc-body { display: flex; flex-direction: column; gap: 20px; }
+    .doc-body h2 { font-size: 19px; margin-top: 8px; scroll-margin-top: 100px; }
+    .doc-body h3 { font-size: 16px; color: var(--text-primary); scroll-margin-top: 100px; }
+    .doc-body p { color: var(--text-secondary); font-size: 15.5px; }
+    .doc-body p code, .doc-body li code { font-family: var(--font-mono); font-size: 13px; background: var(--surface-hover); border: 1px solid var(--border-subtle); border-radius: 5px; padding: 2px 6px; color: var(--text-primary); }
+    .doc-body ul, .doc-body ol { margin: 0; padding-left: 22px; display: flex; flex-direction: column; gap: 9px; color: var(--text-secondary); font-size: 15px; }
+    .doc-body ol { list-style: decimal; }
+    .doc-body li::marker { color: var(--text-muted); }
+    .doc-body li b, .doc-body p b { color: var(--text-primary); font-weight: 600; }
+
+    .doc-card {
+      border: 1px solid var(--border); border-radius: var(--radius-lg); padding: 20px 22px; background: var(--surface-raised);
+    }
+    .doc-card h3 { margin-bottom: 8px; font-size: 15.5px; }
+    .doc-card p { font-size: 14.5px; }
+
+    .callout {
+      display: flex; gap: 12px; border-radius: var(--radius-md); padding: 16px 18px;
+      border: 1px solid var(--border); background: var(--surface-raised); font-size: 14.5px; color: var(--text-secondary);
+    }
+    .callout svg { width: 18px; height: 18px; flex: none; margin-top: 1px; }
+    .callout.tip { border-color: var(--accent-ring); }
+    .callout.tip svg { color: var(--accent-text); }
+    .callout.security { border-color: color-mix(in srgb, var(--safe-text) 40%, var(--border)); }
+    .callout.security svg { color: var(--safe-text); }
+    .callout.roadmap { border-color: color-mix(in srgb, var(--warn-text) 40%, var(--border)); }
+    .callout.roadmap svg { color: var(--warn-text); }
+    .callout b { color: var(--text-primary); }
+
+    pre.code-block {
+      margin: 0; overflow-x: auto; border-radius: var(--radius-md); border: 1px solid var(--border);
+      background: var(--surface-solid); padding: 18px 20px; font-family: var(--font-mono); font-size: 13px;
+      line-height: 1.65; color: var(--text-secondary);
+    }
+    pre.code-block .k { color: var(--accent-text); }
+    pre.code-block .s { color: var(--safe-text); }
+    pre.code-block .c { color: var(--text-muted); }
+    .code-label { font-family: var(--font-mono); font-size: 11.5px; letter-spacing: .06em; text-transform: uppercase; color: var(--text-muted); margin-bottom: 8px; }
+
+    .doc-table { border: 1px solid var(--border); border-radius: var(--radius-lg); overflow: hidden; }
+    .doc-table .scroll { overflow-x: auto; }
+    .doc-table table { width: 100%; border-collapse: collapse; min-width: 480px; }
+    .doc-table thead th { text-align: left; font-size: 11.5px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--text-muted); font-weight: 700; padding: 13px 18px; border-bottom: 1px solid var(--border); }
+    .doc-table tbody td { padding: 13px 18px; border-top: 1px solid var(--border-subtle); font-size: 14px; color: var(--text-secondary); }
+    .doc-table tbody tr:first-child td { border-top: 0; }
+    .doc-table tbody td:first-child { color: var(--text-primary); font-weight: 600; font-family: var(--font-mono); font-size: 13px; }
+
+    /* ── Tier list — wraps naturally, never needs horizontal scroll ── */
+    .tier-list { border: 1px solid var(--border); border-radius: var(--radius-lg); padding: 4px 20px; }
+    .tier-row { padding: 16px 0; border-top: 1px solid var(--border-subtle); }
+    .tier-row:first-child { border-top: 0; }
+    .tier-name { font-family: var(--font-mono); font-size: 12.5px; font-weight: 700; color: var(--text-primary); letter-spacing: 0.03em; margin-bottom: 9px; }
+    .tier-note { color: var(--text-secondary); font-size: 14.5px; }
+    .tier-tools { display: flex; flex-wrap: wrap; gap: 6px; }
+    .tier-tools .tool-pill { font-family: var(--font-mono); font-size: 12px; background: var(--surface-hover); border: 1px solid var(--border-subtle); border-radius: 6px; padding: 3px 8px; color: var(--text-primary); white-space: nowrap; }
+    .tier-tools .tool-plus { align-self: center; color: var(--text-muted); font-size: 12.5px; margin-right: 2px; }
+
+    .doc-pager { display: flex; justify-content: space-between; gap: 16px; margin-top: 40px; padding-top: 24px; border-top: 1px solid var(--border-subtle); }
+    .doc-pager a {
+      display: flex; flex-direction: column; gap: 4px; max-width: 46%;
+      border: 1px solid var(--border); border-radius: var(--radius-md); padding: 12px 16px;
+      transition: background .15s ease, border-color .15s ease;
+    }
+    .doc-pager a:hover { background: var(--surface-hover); border-color: var(--accent-ring); }
+    .doc-pager a.next { margin-left: auto; text-align: right; }
+    .doc-pager .pager-label { font-size: 11.5px; color: var(--text-muted); font-family: var(--font-mono); text-transform: uppercase; letter-spacing: .06em; }
+    .doc-pager .pager-title { font-size: 14.5px; font-weight: 600; color: var(--text-primary); }
+
+    /* ── Footer ──────────────────────────────────────────────── */
+    footer { border-top: 1px solid var(--border-subtle); padding: 44px 0 56px; }
+    .foot-inner { display: flex; justify-content: space-between; align-items: center; gap: 24px; flex-wrap: wrap; }
+    .foot-brand { display: flex; align-items: center; gap: 10px; font-weight: 600; letter-spacing: -0.02em; }
+    .foot-brand img { width: 26px; height: 26px; border-radius: 7px; }
+    .foot-links { display: flex; gap: 24px; flex-wrap: wrap; }
+    .foot-links a { color: var(--text-secondary); font-size: 14.5px; padding: 8px 0; transition: color .15s; }
+    .foot-links a:hover { color: var(--text-primary); }
+    .foot-legal { color: var(--text-muted); font-size: 13px; margin-top: 24px; text-align: center; }
+
+    @media (pointer: coarse) {
+      .btn, .btn-sm { min-height: 44px; }
+      .theme-switch { padding: 2px; }
+      .theme-switch button { width: 44px; height: 44px; }
+      .docs-nav-link { padding: 11px 12px; }
+      .toc-link { padding: 10px 13px; }
+    }
+
+    :focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 6px; }
+  </style>
+</head>
+<body>
+
+  <!-- ── Nav ─────────────────────────────────────────────────── -->
+  <header class="nav">
+    <div class="wrap nav-inner">
+      <a class="brand" href="./index.html">
+        <img src="./assets/icon.svg" alt="Murmur" />
+        <span>Murmur</span>
+      </a>
+      <nav class="nav-links">
+        <a class="link" href="./index.html#product">Product</a>
+        <a class="link" href="./index.html#privacy">Privacy</a>
+        <a class="link" href="./index.html#features">Features</a>
+        <a class="link" href="./index.html#pricing">Pricing</a>
+        <a class="link active" href="./docs.html">Docs</a>
+        <a class="link" href="https://github.com/murmur-io/murmur">GitHub</a>
+      </nav>
+      <div class="nav-cta">
+        <div class="theme-switch" role="group" aria-label="Color theme">
+          <button type="button" data-theme-set="light" title="Light" aria-label="Light theme">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+          </button>
+          <button type="button" data-theme-set="dark" title="Dark" aria-label="Dark theme">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>
+          </button>
+          <button type="button" data-theme-set="system" title="System" aria-label="Match system theme">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg>
+          </button>
+        </div>
+        <a class="btn btn-primary btn-sm" href="https://github.com/murmur-io/murmur/releases/latest">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12m0 0 4-4m-4 4-4-4M5 21h14"/></svg>
+          <span>Download</span>
+        </a>
+      </div>
+    </div>
+  </header>
+
+  <!-- ── Docs shell: left nav / content / on-this-page ──────────
+       Nuxt-docs-style layout: ONE persistent left sidebar for the
+       whole docs site, a center content column, and a right rail
+       scoped to whatever page is currently open. ─────────────── -->
+  <section class="docs-shell">
+    <div class="wrap docs-grid">
+
+      <button type="button" class="docs-toggle" id="docsToggle" aria-expanded="false" aria-controls="docsSide">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
+        <span>Contents</span>
+      </button>
+
+      <!-- ── Left sidebar: the whole docs tree, same on every page ── -->
+      <nav class="docs-side" id="docsSide" aria-label="Documentation contents">
+        <div class="docs-search">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+          <input type="text" id="docsSearch" placeholder="Search docs…" aria-label="Search documentation" autocomplete="off" />
+        </div>
+        <div class="docs-group">
+          <div class="docs-group-title">Getting started</div>
+          <a class="docs-nav-link active" data-doc="welcome"><span class="dot"></span>Welcome to Murmur</a>
+          <a class="docs-nav-link" data-doc="first-recording"><span class="dot"></span>Your first recording</a>
+        </div>
+        <div class="docs-group">
+          <div class="docs-group-title">Core capabilities</div>
+          <a class="docs-nav-link" data-doc="capture"><span class="dot"></span>Capture &amp; transcription</a>
+          <a class="docs-nav-link" data-doc="brain"><span class="dot"></span>The on-device brain</a>
+          <a class="docs-nav-link" data-doc="brain-capabilities"><span class="dot"></span>What the Brain can do</a>
+          <a class="docs-nav-link" data-doc="receipts"><span class="dot"></span>Receipts</a>
+          <a class="docs-nav-link" data-doc="notes-graph"><span class="dot"></span>Notes, graph &amp; MCP</a>
+          <a class="docs-nav-link" data-doc="notes-editor"><span class="dot"></span>Standalone notes &amp; the Brain menu</a>
+        </div>
+        <div class="docs-group">
+          <div class="docs-group-title">Collaboration</div>
+          <a class="docs-nav-link" data-doc="shared-brain"><span class="dot"></span>Shared Brain</a>
+        </div>
+        <div class="docs-group">
+          <div class="docs-group-title">Integrations</div>
+          <a class="docs-nav-link" data-doc="providers"><span class="dot"></span>AI providers</a>
+          <a class="docs-nav-link" data-doc="integrations-apps"><span class="dot"></span>Obsidian, MCP, Reminders &amp; file ingestion</a>
+        </div>
+        <div class="docs-group">
+          <div class="docs-group-title">Configuration</div>
+          <a class="docs-nav-link" data-doc="settings"><span class="dot"></span>Settings &amp; configuration</a>
+          <a class="docs-nav-link" data-doc="shortcuts"><span class="dot"></span>Keyboard shortcuts</a>
+        </div>
+        <div class="docs-group">
+          <div class="docs-group-title">Privacy &amp; security</div>
+          <a class="docs-nav-link" data-doc="data-flow"><span class="dot"></span>What never leaves your Mac</a>
+          <a class="docs-nav-link" data-doc="lock-model"><span class="dot"></span>The lock model</a>
+          <a class="docs-nav-link" data-doc="redaction-firewall"><span class="dot"></span>Redaction firewall &amp; cloud egress</a>
+        </div>
+        <p class="doc-empty" id="docsEmpty">No pages match your search.</p>
+      </nav>
+
+      <!-- ── Center: the current doc's content ─────────────────── -->
+      <div class="docs-content">
+
+        <article class="doc-panel active" id="doc-welcome" data-keywords="welcome overview intro getting started local-first obsidian">
+          <span class="eyebrow">Getting started</span>
+          <h1>Welcome to Murmur</h1>
+          <p class="lede">Murmur records your meetings, transcribes and reasons over them entirely on your Mac, and turns each one into a clean note you own — as plain Markdown, inside your own Obsidian vault.</p>
+          <div class="doc-body">
+            <p>Three ideas run through everything in these docs:</p>
+            <ul>
+              <li><b>Local-first.</b> Recording, transcription and the reasoning brain are designed to work with no network at all. Cloud providers are opt-in, clearly labelled, and pass through a redaction firewall.</li>
+              <li><b>One source of truth.</b> An encrypted SQLite database is canonical. The app UI, a local read-only MCP server, and your exported Markdown files are three thin readers over the same store — never three diverging copies.</li>
+              <li><b>Yours to keep.</b> Every note is also plain <code>.md</code> with YAML front-matter and <code>[[wikilinks]]</code>. No proprietary format, ever.</li>
+            </ul>
+            <div class="callout tip">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2Z"/><path d="M9 21h6"/></svg>
+              <p>This is a proof-of-concept documentation template — a few sections, a handful of pages — so we can agree on the shape before writing the full set.</p>
+            </div>
+          </div>
+          <div class="doc-pager">
+            <span></span>
+            <a class="next" data-doc-link="first-recording"><span class="pager-label">Next</span><span class="pager-title">Your first recording →</span></a>
+          </div>
+        </article>
+
+        <article class="doc-panel" id="doc-first-recording" data-keywords="first recording quick start floating bar shortcut record">
+          <span class="eyebrow">Getting started</span>
+          <h1>Your first recording</h1>
+          <p class="lede">From launch to a finished note in under a minute.</p>
+          <div class="doc-body">
+            <ol>
+              <li>Install Murmur and open it — a floating recorder bar appears, reachable from anywhere with <code>⌘⇧R</code>.</li>
+              <li>Join or start a call, then press <b>Record</b>. Murmur captures your mic and the other side's system audio as two separate streams.</li>
+              <li>Talk normally. Live captions appear as you speak, merged into a <b>Me / Others</b> transcript by wall-clock.</li>
+              <li>Press <b>Stop</b>. On-device Whisper finishes transcribing, and the on-device brain writes a structured note — summary, decisions, action items, quotes.</li>
+              <li>Find it later in the app, in your Obsidian vault as a plain <code>.md</code> file, or ask about it through the local MCP server.</li>
+            </ol>
+            <div class="doc-card">
+              <h3>No setup required for the basics</h3>
+              <p>The bundled on-device model and local Whisper work out of the box — no account, no API key, no cloud provider to configure.</p>
+            </div>
+          </div>
+          <div class="doc-pager">
+            <a class="prev" data-doc-link="welcome"><span class="pager-label">Back</span><span class="pager-title">← Welcome to Murmur</span></a>
+            <a class="next" data-doc-link="capture"><span class="pager-label">Next</span><span class="pager-title">Capture &amp; transcription →</span></a>
+          </div>
+        </article>
+
+        <article class="doc-panel" id="doc-capture" data-keywords="capture transcription dual stream whisper diarization mic system audio">
+          <span class="eyebrow">Core capabilities</span>
+          <h1>Capture &amp; transcription</h1>
+          <p class="lede">Murmur hears both sides of the call, transcribes each independently, and merges them into one clean transcript.</p>
+          <div class="doc-body">
+            <h2 id="dual-stream-capture">Dual-stream capture</h2>
+            <p>Your microphone and the other side's system audio (via a ScreenCaptureKit sidecar) are recorded as two separate streams, then transcribed independently before being merged by wall-clock into a single <b>Me / Others</b> timeline. This avoids the echo and cross-talk problems of single-stream capture.</p>
+            <h2 id="on-device-whisper">On-device Whisper</h2>
+            <p>Transcription runs fully on-device via <code>whisper.cpp</code> with Metal acceleration. Pick a model from <code>tiny</code> to <code>large-v3</code> depending on your speed/accuracy tradeoff, with optional speaker diarization and voice-activity detection.</p>
+            <ul>
+              <li>Live captions while you talk, not just after the call ends</li>
+              <li>A floating recorder bar you can trigger from any app</li>
+              <li>Segments land straight in the encrypted SQLite store as the single source of truth</li>
+            </ul>
+          </div>
+          <div class="doc-pager">
+            <a class="prev" data-doc-link="first-recording"><span class="pager-label">Back</span><span class="pager-title">← Your first recording</span></a>
+            <a class="next" data-doc-link="brain"><span class="pager-label">Next</span><span class="pager-title">The on-device brain →</span></a>
+          </div>
+        </article>
+
+        <article class="doc-panel" id="doc-brain" data-keywords="brain ask wake phrase citations grounded reasoning bielik qwen ollama claude">
+          <span class="eyebrow">Core capabilities</span>
+          <h1>The on-device brain</h1>
+          <p class="lede">A reasoning model runs locally over a semantic index of everything you've recorded — answering questions live, mid-meeting, with sources.</p>
+          <div class="doc-body">
+            <p>Say a wake phrase (or tap once) during a live call and Murmur answers out of your own meeting memory — grounded in retrieved transcript, not a guess — while the recording keeps rolling. The same brain also powers <b>Ask Your Vault</b>: a Q&amp;A surface over months of past meetings and notes, every claim linked back to its source.</p>
+            <h2 id="pluggable-providers">Pluggable providers</h2>
+            <p>The reasoning layer is one trait behind a swappable provider seam:</p>
+            <ul>
+              <li><b>On-device</b> (Bielik-11B, Qwen via Metal) — fully local, the default</li>
+              <li><b>Ollama</b> — fully local, your own models</li>
+              <li><b>Claude Code / Anthropic / any OpenAI-compatible gateway</b> — cloud-bound text passes a redaction firewall first</li>
+            </ul>
+            <div class="callout security">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10Z"/><path d="m9 12 2 2 4-4"/></svg>
+              <p>Cloud egress is <b>opt-in and fail-closed</b>: nothing leaves the Mac until you explicitly enable a cloud provider, and even then only redacted text goes out.</p>
+            </div>
+          </div>
+          <div class="doc-pager">
+            <a class="prev" data-doc-link="capture"><span class="pager-label">Back</span><span class="pager-title">← Capture &amp; transcription</span></a>
+            <a class="next" data-doc-link="brain-capabilities"><span class="pager-label">Next</span><span class="pager-title">What the Brain can do →</span></a>
+          </div>
+        </article>
+
+        <article class="doc-panel" id="doc-brain-capabilities" data-keywords="brain capabilities recipes meeting recipes tools tiers escalation connectors web search calendar jira slack gated tool registry save note reminder propose note action ask">
+          <span class="eyebrow">Core capabilities</span>
+          <h1>What the Brain can do</h1>
+          <p class="lede">Three different surfaces — Meeting Recipes, the Brain menu, and Ask — all run through one gated tool registry underneath. Here's exactly what it can reach, and what it can't.</p>
+          <div class="doc-body">
+            <h2 id="meeting-recipes">Meeting Recipes — one-click artifacts</h2>
+            <p>On any meeting, a row of quick chips turns the transcript into a specific, ready-to-use artifact — strictly grounded in that one meeting, never invented:</p>
+            <ul>
+              <li><b>Follow-up email</b> — context, decisions, and a per-attendee action list, uncertain items flagged</li>
+              <li><b>Decision log</b> — only the decisions made, who owns each one, and the rationale if stated</li>
+              <li><b>Work ticket</b> — the top action item as a title, description, and acceptance criteria</li>
+              <li><b>1:1 recap</b> — wins, blockers, feedback, and next steps</li>
+              <li><b>Standup notes</b> — per-person Done / Doing / Blockers</li>
+              <li><b>Sales recap</b> — pain points, objections, buying signals, and a deal-risk note</li>
+              <li><b>Interview notes</b> — strengths, concerns, and a hire / no-hire lean grounded only in what was said</li>
+            </ul>
+            <h2 id="the-brain-menu-recap">The Brain menu — 19 actions on any selection</h2>
+            <p>Select text anywhere in the note editor and run one of nineteen actions, grouped as <b>Edit</b> (Refine, Fix grammar, Shorten, Expand, Simplify, Change tone, Translate), <b>Structure</b> (Bullet points, Table, Key points), <b>From your brain</b> (Enhance context, Find related, Link entities, Fact-check, Ask about this), <b>Extract</b> (Action items, Decisions), and <b>Create</b> (Draft follow-up, Spin-off note) — full details on the <a href="javascript:void(0)" data-doc-link="notes-editor" style="color:var(--accent-text); font-weight:600;">Standalone notes &amp; the Brain menu</a> page.</p>
+            <h2 id="ask-tiered-tools">Ask — a tiered, gated tool-use loop</h2>
+            <p>Behind the wake phrase and Ask Your Vault sits one agentic loop: the model decides which tools to call, grounds its answer in what they return, and falls back to a deterministic, no-tools answer if it can't converge. Which tools it's even allowed to reach is enforced by code, not by trusting the prompt — a tier can't be talked into reaching a higher one:</p>
+            <div class="tier-list">
+              <div class="tier-row">
+                <div class="tier-name">1 · Current meeting</div>
+                <p class="tier-note">No tools at all — answers only from the live meeting, prompt-injected directly.</p>
+              </div>
+              <div class="tier-row">
+                <div class="tier-name">2 · Vault</div>
+                <div class="tier-tools">
+                  <span class="tool-pill">search_meetings</span>
+                  <span class="tool-pill">search_semantic</span>
+                  <span class="tool-pill">get_meeting</span>
+                  <span class="tool-pill">get_document</span>
+                  <span class="tool-pill">get_document_outline</span>
+                  <span class="tool-pill">list_recent_meetings</span>
+                  <span class="tool-pill">get_open_commitments</span>
+                  <span class="tool-pill">get_entity_dossier</span>
+                  <span class="tool-pill">knowledge_diff</span>
+                  <span class="tool-pill">query_database</span>
+                </div>
+              </div>
+              <div class="tier-row">
+                <div class="tier-name">3 · Connectors</div>
+                <div class="tier-tools">
+                  <span class="tool-plus">All Tier 2, plus</span>
+                  <span class="tool-pill">web_search</span>
+                  <span class="tool-pill">calendar_lookup</span>
+                  <span class="tool-pill">jira_search</span>
+                  <span class="tool-pill">slack_search</span>
+                  <span class="tool-pill">org_brain_search</span>
+                </div>
+              </div>
+              <div class="tier-row">
+                <div class="tier-name">Full</div>
+                <p class="tier-note">The complete catalog above, for the deliberately vault-wide surfaces (the Ask page, MCP).</p>
+              </div>
+            </div>
+            <p>Two write tools exist alongside the reads: <code>propose_note</code> only drafts a suggestion for you to accept — it writes nothing until you do — while <code>save_note</code> and <code>create_reminder</code> (straight into Apple Reminders) write for real, and only when the surface that invoked the loop explicitly allows writes.</p>
+            <div class="callout tip">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2Z"/><path d="M9 21h6"/></svg>
+              <p>The tier boundary is an <b>allowlist in code</b>, not prompt instructions — a model that mis-judges scope still has no way to call a higher tier's tools this turn.</p>
+            </div>
+            <h2 id="connectors">Connectors — reaching outside the vault</h2>
+            <p>Web search, calendar, Jira, and Slack are live connectors the brain can call on demand, turned into cited answers exactly like a vault hit. Web search (Brave), Jira, and Slack are <b>off by default</b> and reachable only once you've both enabled and explicitly consented to each — the outgoing query is scrubbed by the same redaction firewall as any other cloud-bound text. Your <b>local macOS Calendar</b> is different: it's read entirely on-device via EventKit, so it needs the Calendar permission but no cloud consent — nothing about it ever leaves the Mac. Every connector hit, local or external, carries a visible source label (e.g. "web · Brave", "calendar") so you always know exactly where an answer came from.</p>
+          </div>
+          <div class="doc-pager">
+            <a class="prev" data-doc-link="brain"><span class="pager-label">Back</span><span class="pager-title">← The on-device brain</span></a>
+            <a class="next" data-doc-link="receipts"><span class="pager-label">Next</span><span class="pager-title">Receipts →</span></a>
+          </div>
+        </article>
+
+        <article class="doc-panel" id="doc-receipts" data-keywords="receipts claims citations confidence speaker timestamp verified grounded trust">
+          <span class="eyebrow">Core capabilities</span>
+          <h1>Receipts</h1>
+          <p class="lede">Murmur's notes don't ask you to trust them. Every line that's grounded in what was actually said carries a receipt back to the tape.</p>
+          <div class="doc-body">
+            <h2 id="what-counts-as-a-receipt">What counts as a receipt</h2>
+            <p>When the brain writes a note or answers a question, each claim it can trace back to a specific transcript segment gets a small receipt chip. Click it and Murmur jumps straight to that second of audio — no searching through the recording to check whether it's accurate.</p>
+            <h2 id="reading-confidence">Reading confidence</h2>
+            <p>Every receipt carries the speaker (<code>Me</code> / <code>Others</code>) and the ASR confidence for that segment, so you can see at a glance how solid the source is. Paraphrased or unsupported lines simply carry no receipt — that absence is itself the signal that a claim wasn't directly grounded.</p>
+            <div class="callout security">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10Z"/><path d="m9 12 2 2 4-4"/></svg>
+              <p>Receipts respect the <a href="javascript:void(0)" data-doc-link="lock-model" style="color:var(--accent-text); font-weight:600;">lock model</a> like everything else: a sealed, locked meeting leaks no timing or speaker information through its receipts, ever.</p>
+            </div>
+          </div>
+          <div class="doc-pager">
+            <a class="prev" data-doc-link="brain-capabilities"><span class="pager-label">Back</span><span class="pager-title">← What the Brain can do</span></a>
+            <a class="next" data-doc-link="notes-graph"><span class="pager-label">Next</span><span class="pager-title">Notes, graph &amp; MCP →</span></a>
+          </div>
+        </article>
+
+        <article class="doc-panel" id="doc-notes-graph" data-keywords="notes graph mcp server markdown entities knowledge graph claude desktop config json">
+          <span class="eyebrow">Core capabilities</span>
+          <h1>Notes, graph &amp; MCP</h1>
+          <p class="lede">Every call becomes a structured note. People and projects are extracted automatically into a knowledge graph — and everything is reachable from outside the app too.</p>
+          <div class="doc-body">
+            <h2 id="structured-notes-graph">Structured notes &amp; the auto graph</h2>
+            <p>Notes carry a summary, decisions, action items and quotes, exported as atomic Markdown with front-matter and <code>[[wikilinks]]</code>. Entities mentioned across meetings are extracted into a graph automatically, so you can open a person or project and see every related meeting — entity dossiers, related meetings, and weekly digests included.</p>
+            <h2 id="local-mcp-server">A local, read-only MCP server</h2>
+            <p>Murmur exposes an MCP server on <code>127.0.0.1:8765</code> so Claude Desktop or Claude Code can query your notes directly — read-only, and it respects the lock model: a sealed, locked meeting is invisible to it too. Setup, the config snippet, and every other integration point live on the <a href="javascript:void(0)" data-doc-link="integrations-apps" style="color:var(--accent-text); font-weight:600;">Obsidian, MCP, Reminders &amp; file ingestion</a> page.</p>
+          </div>
+          <div class="doc-pager">
+            <a class="prev" data-doc-link="receipts"><span class="pager-label">Back</span><span class="pager-title">← Receipts</span></a>
+            <a class="next" data-doc-link="notes-editor"><span class="pager-label">Next</span><span class="pager-title">Standalone notes &amp; the Brain menu →</span></a>
+          </div>
+        </article>
+
+        <article class="doc-panel" id="doc-notes-editor" data-keywords="notes editor brain menu refine shorten tone translate fact-check folders tags properties markdown pro recipes automations roadmap">
+          <span class="eyebrow">Core capabilities</span>
+          <h1>Standalone notes &amp; the Brain menu</h1>
+          <p class="lede">Not just meeting notes — a full Markdown editor for anything you write, backed by the same brain and the same encrypted store.</p>
+          <div class="doc-body">
+            <h2 id="a-full-editor">A full editor, not just meeting notes</h2>
+            <p>Murmur's note editor works with folders, tags and properties like the meeting notes it generates — but you can open a blank note and write anything. It's the same encrypted SQLite store, the same per-folder Touch ID lock, and the same Markdown export underneath.</p>
+            <h2 id="the-brain-menu">The Brain command menu</h2>
+            <p>Select any passage and a command menu appears with nineteen actions one keystroke away — <b>Refine</b>, <b>Shorten</b>, <b>Change tone</b>, <b>Translate</b>, <b>Fact-check</b>, or just type what you want done. Every action is grounded in your own meetings and notes, not the model's guesses.</p>
+            <ul>
+              <li>Nineteen Brain actions, one keystroke away</li>
+              <li>Grounded in your own meetings &amp; notes via the same retrieval as Ask Your Vault</li>
+              <li>Same encrypted store, same Touch ID lock, same Markdown export</li>
+            </ul>
+            <h2 id="custom-recipes">Custom recipes &amp; automations<span class="pro-badge">Pro</span></h2>
+            <p>Build automations on top of your notes and action items — your own recipes for what should happen once a meeting ends, instead of doing it by hand every time.</p>
+            <div class="callout roadmap">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 8v4l3 3"/><circle cx="12" cy="12" r="9"/></svg>
+              <p>On the <b>roadmap</b>, not available yet — everything else on this page is already shipped and free.</p>
+            </div>
+          </div>
+          <div class="doc-pager">
+            <a class="prev" data-doc-link="notes-graph"><span class="pager-label">Back</span><span class="pager-title">← Notes, graph &amp; MCP</span></a>
+            <a class="next" data-doc-link="shared-brain"><span class="pager-label">Next</span><span class="pager-title">Shared Brain →</span></a>
+          </div>
+        </article>
+
+        <article class="doc-panel" id="doc-shared-brain" data-keywords="shared brain org organization e2ee sync team collaboration ciphertext wrapped keys public keys pro backup iphone multi-device roadmap">
+          <span class="eyebrow">Collaboration</span>
+          <h1>Shared Brain</h1>
+          <p class="lede">Work as a team on notes and meeting summaries, still end-to-end encrypted — the server never sees plaintext.</p>
+          <div class="doc-body">
+            <h2 id="publish-and-sync">Publish and stay in sync</h2>
+            <p>Publish a note or meeting summary into your org's Shared Brain and it stays in sync for every member as you edit it. Everything is sealed on your Mac <b>before</b> it ever leaves the device — the relay only ever stores ciphertext, wrapped keys, and public keys, never your content.</p>
+            <h2 id="verify-before-publish">Verify-before-publish</h2>
+            <p>Publishing follows the same discipline as locking a folder: content is AES-256-GCM sealed under an org content key and verified decryptable before it's ever sent. You can belong to more than one org, each with its own independent encrypted feed.</p>
+            <div class="callout tip">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2Z"/><path d="M9 21h6"/></svg>
+              <p>Shared Brain is an <b>opt-in</b> tier — Murmur is fully usable with no account at all, and org sharing is free today.</p>
+            </div>
+            <h2 id="sync-and-backup">Sync &amp; cloud backup<span class="pro-badge">Pro</span></h2>
+            <p>Pro extends the same end-to-end-encrypted design to your own devices: notes and meetings kept in sync across your Macs and iPhone, plus a zero-knowledge encrypted backup of your vault you can restore from if you lose a device — without giving up the local-first design the Free plan already has.</p>
+            <div class="callout roadmap">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 8v4l3 3"/><circle cx="12" cy="12" r="9"/></svg>
+              <p>On the <b>roadmap</b>, not shipped yet — pricing is indicative and not final. See the <a href="./index.html#pricing" style="color:var(--accent-text); font-weight:600;">pricing section</a> for the current plans.</p>
+            </div>
+          </div>
+          <div class="doc-pager">
+            <a class="prev" data-doc-link="notes-editor"><span class="pager-label">Back</span><span class="pager-title">← Standalone notes &amp; the Brain menu</span></a>
+            <a class="next" data-doc-link="providers"><span class="pager-label">Next</span><span class="pager-title">AI providers →</span></a>
+          </div>
+        </article>
+
+        <article class="doc-panel" id="doc-providers" data-keywords="providers integrations ai bielik qwen ollama claude code anthropic api key gateway litellm kong portkey vllm openai-compatible pro managed brain low latency roadmap">
+          <span class="eyebrow">Integrations</span>
+          <h1>AI providers</h1>
+          <p class="lede">The reasoning layer behind the in-meeting brain, Ask Your Vault, and note-writing is one trait behind a swappable provider seam — pick what runs where.</p>
+          <div class="doc-body">
+            <h2 id="on-device-default">On-device (the default)</h2>
+            <p>Bielik-11B or Qwen, running locally via Metal. No account, no API key, no network call — this is what Murmur uses out of the box for the brain, Ask, and note-writing.</p>
+            <h2 id="ollama-integration">Ollama</h2>
+            <p>Point Murmur at your own local Ollama models. Still fully local — no meeting text ever leaves the Mac with this provider either.</p>
+            <h2 id="cloud-providers-opt-in">Cloud providers (opt-in)</h2>
+            <div class="doc-table">
+              <div class="scroll">
+                <table>
+                  <thead><tr><th>Provider</th><th>Setup</th><th>Notes</th></tr></thead>
+                  <tbody>
+                    <tr><td>Claude Code</td><td>Local CLI, no key to paste</td><td>The default cloud summarizer, if you opt in</td></tr>
+                    <tr><td>Anthropic API</td><td>Bring your own key, stored in Keychain</td><td>Direct HTTPS to Anthropic</td></tr>
+                    <tr><td>AI Gateway</td><td>Any OpenAI-compatible endpoint</td><td>LiteLLM, Kong, Portkey, vLLM, or your own</td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+            <p>Every cloud provider is opt-in and every request it sends passes through the redaction firewall first — see <a href="javascript:void(0)" data-doc-link="redaction-firewall" style="color:var(--accent-text); font-weight:600;">Redaction firewall &amp; cloud egress</a> for exactly what that means.</p>
+            <h2 id="managed-brain">Managed brain<span class="pro-badge">Pro</span></h2>
+            <p>An optional low-latency, cloud-hosted brain you can opt into when you want faster responses than the on-device model gives you. It's still opt-in and still passes through the same redaction firewall as any other cloud provider — nothing changes about consent or what gets scrubbed first.</p>
+            <div class="callout roadmap">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 8v4l3 3"/><circle cx="12" cy="12" r="9"/></svg>
+              <p>On the <b>roadmap</b>, not available yet. Murmur stays fully usable and free while it ships.</p>
+            </div>
+          </div>
+          <div class="doc-pager">
+            <a class="prev" data-doc-link="shared-brain"><span class="pager-label">Back</span><span class="pager-title">← Shared Brain</span></a>
+            <a class="next" data-doc-link="integrations-apps"><span class="pager-label">Next</span><span class="pager-title">Obsidian, MCP, Reminders &amp; file ingestion →</span></a>
+          </div>
+        </article>
+
+        <article class="doc-panel" id="doc-integrations-apps" data-keywords="obsidian mcp claude desktop code apple reminders pdf office word web pages images ingestion vault wikilinks canvas">
+          <span class="eyebrow">Integrations</span>
+          <h1>Obsidian, MCP, Reminders &amp; file ingestion</h1>
+          <p class="lede">Murmur plugs into the tools you already use instead of asking you to live inside a new one.</p>
+          <div class="doc-body">
+            <h2 id="your-obsidian-vault">Your Obsidian vault</h2>
+            <p>Every note is exported as atomic Markdown straight into your vault — YAML front-matter, <code>[[wikilinks]]</code>, <code>obsidian://</code> block-refs, and an optional canvas board. They're plain files you own, editable in Obsidian or anything else that reads Markdown.</p>
+            <h2 id="mcp-setup">A local, read-only MCP server</h2>
+            <p>Murmur exposes an MCP server on <code>127.0.0.1:8765</code> so Claude Desktop or Claude Code can query your notes directly. It's read-only, and it respects the lock model exactly like the app — a sealed, locked meeting is invisible to it too.</p>
+            <div class="code-label">claude_desktop_config.json</div>
+            <pre class="code-block"><span class="c">// Point Claude Desktop at your local Murmur MCP server</span>
+{
+  <span class="k">"mcpServers"</span>: {
+    <span class="k">"murmur"</span>: {
+      <span class="k">"url"</span>: <span class="s">"http://127.0.0.1:8765"</span>
+    }
+  }
+}</pre>
+            <h2 id="apple-reminders">Apple Reminders</h2>
+            <p>Action items extracted from a meeting note can push straight into Apple Reminders, so follow-ups don't have to live only inside Murmur.</p>
+            <h2 id="feed-it-more">Feed it more than meetings</h2>
+            <p>Drop in PDFs, Office documents, web pages, and images — they're chunked into the same on-device brain and become searchable alongside your meetings, in the same encrypted store.</p>
+          </div>
+          <div class="doc-pager">
+            <a class="prev" data-doc-link="providers"><span class="pager-label">Back</span><span class="pager-title">← AI providers</span></a>
+            <a class="next" data-doc-link="settings"><span class="pager-label">Next</span><span class="pager-title">Settings &amp; configuration →</span></a>
+          </div>
+        </article>
+
+        <article class="doc-panel" id="doc-settings" data-keywords="settings configuration appearance theme accent sidebar liquid glass audio transcription diarization voice trigger wake phrase connectors privacy memory facts obsidian storage notes subfolders sharing organizations">
+          <span class="eyebrow">Configuration</span>
+          <h1>Settings &amp; configuration</h1>
+          <p class="lede">Every group below is a real Settings section in the app today, not a hypothetical — grouped the same way you'd find them there.</p>
+          <div class="doc-body">
+            <h2 id="appearance">Appearance</h2>
+            <p>Theme (Light / Dark / System — the same switch this docs site uses), an accent color, sidebar options, and a Liquid Glass transparency slider for the app's frosted chrome.</p>
+            <h2 id="audio-and-transcription">Audio &amp; transcription</h2>
+            <p>Toggles for capturing system audio, smart speech detection, keeping high-fidelity audio masters, splitting "Others" into individual speakers, recognising speakers across meetings, and removing speaker echo from recordings — plus the transcription model picker, the live-caption engine, on-device brain lifecycle settings, and the <b>voice trigger</b> toggle behind the in-meeting wake phrase.</p>
+            <h2 id="ai-and-connectors">AI &amp; connectors</h2>
+            <p>Pick a provider and configure connectors from here — see <a href="javascript:void(0)" data-doc-link="providers" style="color:var(--accent-text); font-weight:600;">AI providers</a> for the provider list and <a href="javascript:void(0)" data-doc-link="brain-capabilities" style="color:var(--accent-text); font-weight:600;">What the Brain can do</a> for what each connector unlocks. A separate "Remember facts about you" toggle controls whether the brain builds a persistent memory of you across sessions.</p>
+            <h2 id="obsidian-storage-notes">Obsidian, storage &amp; notes</h2>
+            <p>Your Obsidian vault path, an auto-delete policy for old recordings (plus a manual "Free up space now"), and a toggle to organize notes into thematic subfolders automatically.</p>
+            <h2 id="sharing-and-organizations">Sharing &amp; organizations</h2>
+            <p>Your sharing account and incoming shares, and the organizations you belong to for <a href="javascript:void(0)" data-doc-link="shared-brain" style="color:var(--accent-text); font-weight:600;">Shared Brain</a>.</p>
+          </div>
+          <div class="doc-pager">
+            <a class="prev" data-doc-link="integrations-apps"><span class="pager-label">Back</span><span class="pager-title">← Obsidian, MCP, Reminders &amp; file ingestion</span></a>
+            <a class="next" data-doc-link="shortcuts"><span class="pager-label">Next</span><span class="pager-title">Keyboard shortcuts →</span></a>
+          </div>
+        </article>
+
+        <article class="doc-panel" id="doc-shortcuts" data-keywords="keyboard shortcuts global shortcut floating bar bold italic heading slash menu ask brain escape">
+          <span class="eyebrow">Configuration</span>
+          <h1>Keyboard shortcuts</h1>
+          <p class="lede">A short, real list — Murmur keeps global shortcuts to exactly one, on purpose.</p>
+          <div class="doc-body">
+            <h2 id="global">Global</h2>
+            <p><code>⌘⇧R</code> toggles the floating recorder bar from anywhere on the Mac — the only global shortcut the app registers.</p>
+            <h2 id="in-the-note-editor">In the note editor</h2>
+            <ul>
+              <li><code>⌘B</code> / <code>⌘I</code> — bold / italic</li>
+              <li><code>⌘1</code> / <code>⌘2</code> / <code>⌘3</code> — heading levels 1 / 2 / 3</li>
+              <li><code>/</code> at the start of a line — opens the slash command menu, including an "Ask Brain" entry</li>
+              <li><code>Esc</code> — closes the slash menu or an open link picker</li>
+            </ul>
+            <h2 id="selecting-text">Selecting text</h2>
+            <p>No shortcut needed here by design: select any passage and the <a href="javascript:void(0)" data-doc-link="notes-editor" style="color:var(--accent-text); font-weight:600;">Brain menu</a> bubble appears on its own, ready for one of its nineteen actions.</p>
+          </div>
+          <div class="doc-pager">
+            <a class="prev" data-doc-link="settings"><span class="pager-label">Back</span><span class="pager-title">← Settings &amp; configuration</span></a>
+            <a class="next" data-doc-link="data-flow"><span class="pager-label">Next</span><span class="pager-title">What never leaves your Mac →</span></a>
+          </div>
+        </article>
+
+        <article class="doc-panel" id="doc-data-flow" data-keywords="privacy data flow local-first what leaves stays on device signed notarized consent">
+          <span class="eyebrow">Privacy &amp; security</span>
+          <h1>What never leaves your Mac</h1>
+          <p class="lede">A plain-language breakdown of what stays local by default, and the one thing that can leave — only if you opt in.</p>
+          <div class="doc-body">
+            <h2 id="stays-on-your-mac">Stays on your Mac, always</h2>
+            <ul>
+              <li>The raw audio of every recording</li>
+              <li>The full transcript, merged Me / Others</li>
+              <li>The semantic search index and embeddings behind Ask Your Vault</li>
+              <li>The auto-extracted entity graph (people, projects)</li>
+              <li>Every encryption key — the SQLCipher DEK and every folder's content key</li>
+            </ul>
+            <h2 id="only-with-opt-in">Only leaves if you opt in</h2>
+            <p>The single exception is meeting text sent to a cloud provider you've explicitly enabled — and even then, only <b>after</b> the redaction firewall scrubs emails, phone numbers, and card-like numbers. See <a href="javascript:void(0)" data-doc-link="redaction-firewall" style="color:var(--accent-text); font-weight:600;">Redaction firewall &amp; cloud egress</a> for the full provider-by-provider breakdown and <a href="javascript:void(0)" data-doc-link="providers" style="color:var(--accent-text); font-weight:600;">AI providers</a> for how to configure one.</p>
+            <div class="callout security">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10Z"/><path d="m9 12 2 2 4-4"/></svg>
+              <p>The app itself is <b>signed &amp; notarized</b> for macOS — Gatekeeper verifies it before it ever runs, the same bar every trusted Mac app has to clear.</p>
+            </div>
+          </div>
+          <div class="doc-pager">
+            <a class="prev" data-doc-link="shortcuts"><span class="pager-label">Back</span><span class="pager-title">← Keyboard shortcuts</span></a>
+            <a class="next" data-doc-link="lock-model"><span class="pager-label">Next</span><span class="pager-title">The lock model →</span></a>
+          </div>
+        </article>
+
+        <article class="doc-panel" id="doc-lock-model" data-keywords="lock model security encryption sqlcipher aes touch id seal verify before destroy folder screen share">
+          <span class="eyebrow">Privacy &amp; security</span>
+          <h1>The lock model</h1>
+          <p class="lede">A per-folder lock is a second, independent encryption layer on top of the whole-database encryption — and every read path respects it.</p>
+          <div class="doc-body">
+            <h2 id="two-layers">Two layers, not one</h2>
+            <p>The entire SQLite database is SQLCipher-encrypted at rest. On top of that, locking a folder wraps its notes, transcripts, timelines and audio in a per-folder AES-256-GCM content key, itself wrapped by a master key released only by <b>Touch ID</b>.</p>
+            <h2 id="verify-before-destroy">Verify-before-destroy</h2>
+            <p>Sealing never trusts the ciphertext blind: Murmur decrypts what it just wrote and checks it's byte-identical <b>before</b> it ever blanks the plaintext. A crash mid-seal can never destroy the only copy of your content.</p>
+            <div class="doc-table">
+              <div class="scroll">
+                <table>
+                  <thead><tr><th>Read path</th><th>Sealed &amp; not unlocked</th></tr></thead>
+                  <tbody>
+                    <tr><td>App detail view</td><td>Masked — <span style="font-family:var(--font-mono)">🔒 Locked</span>, no note/segments</td></tr>
+                    <tr><td>Search &amp; the graph</td><td>Invisible — excluded from results entirely</td></tr>
+                    <tr><td>MCP server</td><td>Invisible — same visibility gate as the app</td></tr>
+                    <tr><td>Audio playback</td><td>No path handed to the player while sealed</td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+            <h2 id="screen-share-aware">Screen-share aware</h2>
+            <p>A watcher can auto-relock sealed folders and wipe the cached key the moment screen sharing is detected — so a shared screen can't spill private notes. Unlocking is session-scoped and reversible: a Touch ID prompt unwraps the content key for that session only; relocking (manual, or automatic) blanks the decrypted copies again without touching the sealed data underneath.</p>
+          </div>
+          <div class="doc-pager">
+            <a class="prev" data-doc-link="data-flow"><span class="pager-label">Back</span><span class="pager-title">← What never leaves your Mac</span></a>
+            <a class="next" data-doc-link="redaction-firewall"><span class="pager-label">Next</span><span class="pager-title">Redaction firewall &amp; cloud egress →</span></a>
+          </div>
+        </article>
+
+        <article class="doc-panel" id="doc-redaction-firewall" data-keywords="redaction firewall egress consent cloud providers anthropic ollama gateway ledger fail-closed">
+          <span class="eyebrow">Privacy &amp; security</span>
+          <h1>Redaction firewall &amp; cloud egress</h1>
+          <p class="lede">If you ever opt into a cloud provider, sensitive text is scrubbed first — and egress is fail-closed behind a one-time consent.</p>
+          <div class="doc-body">
+            <h2 id="whats-scrubbed">What's scrubbed before it leaves</h2>
+            <p>Emails, phone numbers, and card-like numbers are redacted from meeting text before it's ever sent to a cloud summarizer. Nothing crosses the network until you've explicitly consented to that specific provider — the default is fully on-device.</p>
+            <h2 id="providers-and-egress">Providers &amp; what actually leaves your Mac</h2>
+            <div class="doc-table">
+              <div class="scroll">
+                <table>
+                  <thead><tr><th>Brain / provider</th><th>Where it runs</th><th>Does meeting text leave your Mac?</th></tr></thead>
+                  <tbody>
+                    <tr><td>On-device brain (Bielik / Qwen)</td><td>Fully local</td><td>No</td></tr>
+                    <tr><td>Ollama</td><td>Fully local</td><td>No</td></tr>
+                    <tr><td>Claude Code (default summarizer)</td><td>Local CLI → cloud</td><td>Redacted only</td></tr>
+                    <tr><td>Anthropic API (bring your own key)</td><td>Direct HTTPS</td><td>Redacted only</td></tr>
+                    <tr><td>AI Gateway (OpenAI-compatible endpoint)</td><td>Direct HTTPS</td><td>Redacted only</td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+            <p>Every egress decision is logged so you can see, in plain language, exactly what left the Mac and when — a running ledger, not a one-time toggle you forget about.</p>
+          </div>
+          <div class="doc-pager">
+            <a class="prev" data-doc-link="lock-model"><span class="pager-label">Back</span><span class="pager-title">← The lock model</span></a>
+            <span></span>
+          </div>
+        </article>
+
+      </div>
+
+      <!-- ── Right sidebar: "On this page" — scoped to the CURRENT doc only ── -->
+      <aside class="docs-toc" id="docsToc" aria-label="On this page">
+        <div class="docs-toc-title">On this page</div>
+        <nav id="tocList"></nav>
+      </aside>
+
+    </div>
+  </section>
+
+  <!-- ── Footer ──────────────────────────────────────────────── -->
+  <footer>
+    <div class="wrap">
+      <div class="foot-inner">
+        <a class="foot-brand" href="./index.html">
+          <img src="./assets/icon.svg" alt="Murmur" />
+          <span>Murmur</span>
+        </a>
+        <nav class="foot-links">
+          <a href="./index.html#product">Product</a>
+          <a href="./index.html#privacy">Privacy</a>
+          <a href="./index.html#features">Features</a>
+          <a href="./docs.html">Docs</a>
+          <a href="https://github.com/murmur-io/murmur">GitHub</a>
+        </nav>
+      </div>
+      <p class="foot-legal">🍎 macOS-first · 🧠 on-device brain · 🔒 local-first · built with Tauri + Angular + Rust</p>
+    </div>
+  </footer>
+
+  <script>
+    // Theme switch — shared "murmur-theme" key with index.html.
+    (function () {
+      var KEY = "murmur-theme";
+      var root = document.documentElement;
+      var sw = document.querySelector(".theme-switch");
+      function apply(mode) {
+        root.setAttribute("data-theme", mode);
+        if (!sw) return;
+        var btns = sw.querySelectorAll("button");
+        for (var i = 0; i < btns.length; i++) {
+          var on = btns[i].getAttribute("data-theme-set") === mode;
+          btns[i].classList.toggle("active", on);
+          btns[i].setAttribute("aria-pressed", on ? "true" : "false");
+        }
+      }
+      var saved = "system";
+      try { saved = localStorage.getItem(KEY) || "system"; } catch (e) {}
+      apply(saved);
+      if (sw) {
+        sw.addEventListener("click", function (e) {
+          var btn = e.target.closest ? e.target.closest("button[data-theme-set]") : null;
+          if (!btn) return;
+          var mode = btn.getAttribute("data-theme-set");
+          apply(mode);
+          try { localStorage.setItem(KEY, mode); } catch (e2) {}
+        });
+      }
+    })();
+
+    // Docs navigation: LEFT sidebar picks the page; RIGHT "on this page"
+    // rail is regenerated per page from that page's own h2/h3 headings,
+    // with a scrollspy highlighting whichever section is in view.
+    (function () {
+      var side = document.getElementById("docsSide");
+      var panels = Array.prototype.slice.call(document.querySelectorAll(".doc-panel"));
+      var navLinks = Array.prototype.slice.call(document.querySelectorAll(".docs-nav-link"));
+      var tocNav = document.getElementById("tocList");
+      var tocAside = document.getElementById("docsToc");
+      var tocObserver = null;
+
+      function slugify(text) {
+        return text.toLowerCase().trim().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "");
+      }
+
+      function buildToc(panel) {
+        if (tocObserver) { tocObserver.disconnect(); tocObserver = null; }
+        tocNav.innerHTML = "";
+        if (!panel) return;
+        var heads = Array.prototype.slice.call(panel.querySelectorAll("h2, h3"));
+        if (!heads.length) {
+          var empty = document.createElement("p");
+          empty.className = "docs-toc-empty";
+          empty.textContent = "No sections on this page.";
+          tocNav.appendChild(empty);
+          if (tocAside) tocAside.style.display = "";
+          return;
+        }
+        if (tocAside) tocAside.style.display = "";
+        var entries = [];
+        heads.forEach(function (h) {
+          if (!h.id) h.id = slugify(h.textContent);
+          var a = document.createElement("a");
+          a.className = "toc-link" + (h.tagName === "H3" ? " lvl-3" : "");
+          a.textContent = h.textContent;
+          a.href = "javascript:void(0)";
+          a.addEventListener("click", function () {
+            h.scrollIntoView({ behavior: "smooth", block: "start" });
+          });
+          tocNav.appendChild(a);
+          entries.push({ heading: h, link: a });
+        });
+        tocObserver = new IntersectionObserver(function (ioEntries) {
+          ioEntries.forEach(function (e) {
+            if (!e.isIntersecting) return;
+            var match = entries.filter(function (x) { return x.heading === e.target; })[0];
+            if (!match) return;
+            entries.forEach(function (x) { x.link.classList.remove("active"); });
+            match.link.classList.add("active");
+          });
+        }, { rootMargin: "-15% 0px -70% 0px", threshold: 0 });
+        heads.forEach(function (h) { tocObserver.observe(h); });
+      }
+
+      function showDoc(id, opts) {
+        opts = opts || {};
+        var target = null;
+        panels.forEach(function (p) {
+          var on = p.id === "doc-" + id;
+          p.classList.toggle("active", on);
+          if (on) target = p;
+        });
+        if (!target) return;
+        navLinks.forEach(function (l) {
+          l.classList.toggle("active", l.getAttribute("data-doc") === id);
+        });
+        buildToc(target);
+        if (!opts.skipHash) {
+          history.replaceState(null, "", "#" + id);
+        }
+        if (!opts.skipScroll) {
+          window.scrollTo({ top: 0, behavior: "auto" });
+        }
+        // On mobile, picking a page closes the sidebar drawer.
+        if (window.innerWidth <= 900 && side) {
+          side.classList.remove("open");
+          var toggle = document.getElementById("docsToggle");
+          if (toggle) toggle.setAttribute("aria-expanded", "false");
+        }
+      }
+
+      navLinks.forEach(function (l) {
+        l.addEventListener("click", function () { showDoc(l.getAttribute("data-doc")); });
+      });
+      Array.prototype.slice.call(document.querySelectorAll("[data-doc-link]")).forEach(function (l) {
+        l.addEventListener("click", function () { showDoc(l.getAttribute("data-doc-link")); });
+      });
+
+      var initial = (location.hash || "").replace("#", "");
+      if (initial && document.getElementById("doc-" + initial)) {
+        showDoc(initial, { skipScroll: true });
+      } else {
+        var active = panels.filter(function (p) { return p.classList.contains("active"); })[0];
+        buildToc(active);
+      }
+
+      // Mobile "Contents" drawer toggle.
+      var toggle = document.getElementById("docsToggle");
+      if (toggle && side) {
+        toggle.addEventListener("click", function () {
+          var open = side.classList.toggle("open");
+          toggle.setAttribute("aria-expanded", open ? "true" : "false");
+        });
+      }
+
+      // Client-side filter over sidebar entries + their keywords.
+      var search = document.getElementById("docsSearch");
+      var empty = document.getElementById("docsEmpty");
+      if (search) {
+        search.addEventListener("input", function () {
+          var q = search.value.trim().toLowerCase();
+          var anyVisible = false;
+          navLinks.forEach(function (l) {
+            var id = l.getAttribute("data-doc");
+            var panel = document.getElementById("doc-" + id);
+            var haystack = (l.textContent + " " + (panel ? panel.getAttribute("data-keywords") || "" : "")).toLowerCase();
+            var match = !q || haystack.indexOf(q) !== -1;
+            l.style.display = match ? "" : "none";
+            if (match) anyVisible = true;
+          });
+          Array.prototype.slice.call(document.querySelectorAll(".docs-group")).forEach(function (g) {
+            var links = g.querySelectorAll(".docs-nav-link");
+            var visible = Array.prototype.some.call(links, function (l) { return l.style.display !== "none"; });
+            g.style.display = visible ? "" : "none";
+          });
+          if (empty) empty.classList.toggle("show", !anyVisible);
+        });
+      }
+    })();
+  </script>
+</body>
+</html>
