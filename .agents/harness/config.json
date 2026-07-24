@@ -43,11 +43,25 @@
     "playwright": "npm run test:e2e -- --workers=1",
     "perf-contracts": "bash .agents/harness/checks/perf-contracts.sh"
   },
+  "shared_artifacts": {
+    "sherpa_onnx": {
+      "directory": "target/sherpa-onnx-prebuilt",
+      "archives": {
+        "arm64": {
+          "filename": "sherpa-onnx-v1.13.4-osx-arm64-static-lib.tar.bz2",
+          "sha256": "57801db2bbb786a5d343f515a38ff210b401842338bdc804fa075312d1cd2404"
+        },
+        "x86_64": {
+          "filename": "sherpa-onnx-v1.13.4-osx-x64-static-lib.tar.bz2",
+          "sha256": "2bda2c10b31a1cfc45d9f9e14bd4983743ec3779d309e42d99a6c8fa1689043f"
+        }
+      }
+    }
+  },
   "risk_classification": {
     "lock": [
       "src-tauri/src/crypto.rs",
       "src-tauri/src/secrets/**",
-      "src-tauri/src/biometric.rs",
       "src-tauri/src/screenshare.rs",
       "src-tauri/src/storage/**",
       "src-tauri/src/commands/lock.rs",

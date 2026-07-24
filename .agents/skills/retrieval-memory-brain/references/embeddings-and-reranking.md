@@ -51,7 +51,8 @@ the no-model floor so the app + tests run without a download. **But stub vectors
 collapses to near-FTS on the stub. Any recall diagnosis MUST first confirm `embed_model_present()` — a "the
 brain isn't finding things" report is very often just the un-downloaded model.
 
-`reindex_embeddings` (`commands.rs`, async command; core `reindex_embeddings_inner`) snapshots the LIVE
+`reindex_embeddings` (`commands/models.rs`, async command; core
+`commands/mod.rs::reindex_embeddings_inner`) snapshots the LIVE
 session unlock set and re-indexes only VISIBLE meetings + documents (`index_meeting_chunks` /
 `index_note_chunks` / `index_document_chunks`). With the model absent it skips (status `model_missing`) —
 it does NOT index with the stub (stub vectors would be worse than none). A model swap ⇒ the user re-runs it.

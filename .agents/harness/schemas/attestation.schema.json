@@ -98,7 +98,7 @@
       "required": [
         "id", "command", "phase", "exit_code", "duration_ms", "log_sha256",
         "stdout_sha256", "stderr_sha256", "log_path", "sandbox_profile_path",
-        "sandbox_profile_sha256", "environment_keys_sha256", "network_mode",
+        "sandbox_profile_sha256", "sandbox_mode", "environment_keys_sha256", "environment_sha256", "playwright_port", "network_mode",
         "started_at", "created_at"
       ],
       "properties": {
@@ -113,7 +113,15 @@
         "log_path": { "type": "string", "minLength": 1 },
         "sandbox_profile_path": { "type": "string", "minLength": 1 },
         "sandbox_profile_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "sandbox_mode": { "enum": ["direct", "inherited"] },
         "environment_keys_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "environment_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "playwright_port": {
+          "oneOf": [
+            { "type": "integer", "minimum": 42000, "maximum": 61999 },
+            { "type": "null" }
+          ]
+        },
         "network_mode": { "enum": ["none", "loopback"] },
         "started_at": { "type": "string", "format": "date-time" },
         "created_at": { "type": "string", "format": "date-time" }

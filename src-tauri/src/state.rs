@@ -526,14 +526,18 @@ fn reconcile_locked_at_rest(db: &Db) -> Result<()> {
     if repair_folders.is_empty() {
         return finalize_locked_at_rest_cleanup(db);
     }
-    let candidates = crate::secrets::list_master_kek_candidates_strict(
+    // Repair never destroys the only copy: a missing/partial candidate set
+    // leaves residue intact and aborts below. The lenient source also lets a
+    // debug MURMUR_DEV_KEK finish its isolated interrupted seal without
+    // touching the release Keychain.
+    let candidates = crate::secrets::list_master_kek_candidates(
         "Repair locked content after an interrupted session",
     )?;
     repair_and_finalize_locked_at_rest(db, &repair_folders, &candidates)
 }
 
 /// Keychain-free entry used by state tests: candidates are injected, while production always enters
-/// through [`reconcile_locked_at_rest`] and strict keychain enumeration.
+/// through [`reconcile_locked_at_rest`] and read-only recovery enumeration.
 #[cfg(test)]
 fn reconcile_locked_at_rest_with_candidates(db: &Db, candidates: &[[u8; 32]]) -> Result<()> {
     sweep_locked_audio_crypto_stages(db)?;

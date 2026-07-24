@@ -18,42 +18,42 @@ biometric; and locking must never destroy the only copy of content.
 
 - `.claude/rules/lock-model.md` (the invariants) and `.claude/rules/rust-tauri.md` (the ruleset).
 - The diff/branch under review (`git diff`, `git log` — read-only).
-- Ground every check in the real tree: `src-tauri/src/commands.rs`, `storage/db.rs`,
-  `storage/migration.rs`, `crypto.rs`, `secrets/keychain.rs`, `mcp.rs`, `biometric.rs`,
+- Ground every check in the real tree: `src-tauri/src/commands/`, `storage/`,
+  `storage/migration.rs`, `crypto.rs`, `secrets/keychain.rs`, `mcp.rs`,
   `screenshare.rs`. Cite `file:line` for every finding. Trust code, not docs.
 
 ## The audit checklist (run every item; cite evidence for each)
 
 1. **Every content read gated.** Does each path returning note/segments/timeline/audio check
-   `meeting_is_unlocked` (`commands.rs:2249`) or route db/MCP/graph reads through
-   `visibility_clause` (`db.rs:1269`: `search_visible`/`list_meetings_visible`/
+   `commands/mod.rs::meeting_is_unlocked` or route db/MCP/graph reads through
+   `storage/db.rs::visibility_clause` (`search_visible`/`list_meetings_visible`/
    `get_note_if_visible`/`meeting_is_visible`/`list_entities_visible`)? Grep the diff for any NEW
    query/command/export touching these tables and confirm it is gated. An ungated read = LEAK.
 2. **The asset-path trap.** Does the masked locked DTO still set `audio_path: None`
-   (`commands.rs:1431`/`1468`)? Any NEW code handing the FE an on-disk path (for `convertFileSrc`/
+   (`commands/meetings.rs::get_meeting_detail`)? Any NEW code handing the FE an on-disk path (for `convertFileSrc`/
    `asset:`) for a possibly-locked meeting bypasses the gate = LEAK.
-3. **Verify-before-destroy on every seal.** For each seal/at-rest-encrypt path (`seal_note`
-   `db.rs:1000`, `seal_timeline` `db.rs:1204`, audio `encrypt_file` `crypto.rs:50`,
-   `seal_folder_extras` `commands.rs:2087`): is the ciphertext proven decryptable BEFORE the
+3. **Verify-before-destroy on every seal.** For each seal/at-rest-encrypt path
+   (`storage/seal_store.rs::{Db::seal_note,Db::seal_timeline}`,
+   `crypto.rs::encrypt_file`, `commands/mod.rs::seal_folder_extras`): is the ciphertext proven decryptable BEFORE the
    plaintext column is blanked / vault `.md` deleted / WAV removed? Encrypt-then-blank with no
    verify = potential LOSS.
 4. **Nothing plaintext left while sealed.** After `lock_folder`/`relock_*`, are ALL of {note
    markdown column, segment `text_blob` plaintext, timeline `data_blob` plaintext, audio `.enc`
    vs plaintext WAV, vault `.md`} blanked/removed? A surviving plaintext copy (incl. a crash
-   window, or recording into an already-sealed folder) = LEAK. Check `relock_all_inner`
-   (`commands.rs:1915`) and screen-share auto-relock (`screenshare.rs`).
-5. **Reversibility / no loss.** Can `unlock_folder` (`commands.rs:1793`) / `remove_lock`
-   (`commands.rs:1950`) decrypt every sealed artifact back? Any seal without a matching unseal,
+   window, or recording into an already-sealed folder) = LEAK. Check
+   `commands/lock.rs::relock_all_inner` and screen-share auto-relock (`screenshare.rs`).
+5. **Reversibility / no loss.** Can `commands/lock.rs::{unlock_folder,remove_lock}` decrypt every
+   sealed artifact back? Any seal without a matching unseal,
    or a key path where CK/KEK can't recover the content = LOSS.
 6. **Crypto soundness.** AES-256-GCM via `crypto.rs`; CK wrapped by master KEK; DEK/KEK from
    keychain (`secrets/keychain.rs`), never embedded/logged/sent to FE. SQLCipher opened via
    `Db::open_with_key` (`PRAGMA key` first). No home-rolled crypto, no key reuse across domains.
-7. **Migrations safe.** Schema changes additive + guarded (`add_column_if_missing`, `db.rs:212`);
+7. **Migrations safe.** Schema changes additive + guarded (`storage/db.rs::add_column_if_missing`);
    no DROP/destructive SQL; `migrate()` stays idempotent. The plaintext→SQLCipher path
    (`migration.rs`) keeps verify-then-atomic-swap with the `.pre-encrypt.bak`.
 8. **No PII in logs.** Grep the diff for `tracing`/`println`/`eprintln`/`dbg!` carrying note text,
    transcript, titles, names, paths-with-content, or key/token material. Any = FAIL.
-9. **Dev hatches contained.** `MURMUR_DEV_DEK`/`MURMUR_DEV_KEK` (`keychain.rs:26`/`51`) remain
+9. **Dev hatches contained.** `MURMUR_DEV_DEK`/`MURMUR_DEV_KEK` (`secrets/keychain.rs`) remain
    debug-only, never logged, never reachable in release. App id `com.meetnotes.app` unchanged.
 
 ## Verdict format (return exactly this)

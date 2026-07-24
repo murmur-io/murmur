@@ -18,9 +18,9 @@ Give Murmur a dedicated **CI/CD agent** that designs and maintains CI, plus **be
 
 - **macOS-only build steps:** `swiftc`/ScreenCaptureKit sidecar typecheck, whisper.cpp Metal, `say`/ffmpeg E2E, universal build → CI must run on `macos-14` (Apple Silicon), never Linux.
 - **Heavy always-compiled ML tree** (mistralrs/candle/tokenizers — feature gates removed) → cold builds pull hundreds of MB; aggressive caching is essential. `MISTRALRS_METAL_PRECOMPILE=0` defers Metal-shader compile.
-- **`scripts/ci.sh` order:** hooks selftest → swiftc → `clippy --all-targets -D warnings` → `cargo test` → `cargo audit` → `cargo deny` → `cargo build` → `ng lint` → `ng build` → `e2e-core.sh` + `e2e-mix.sh`.
-- **Guardrails (`.claude/hooks/block-bash.sh`)** the agent must respect: no direct trunk push, no `security`/keychain CLI, no bare `cargo clippy --all-targets` (it's fine inside `bash scripts/ci.sh`), no `codesign --deep`.
-- **E2E is heavy + host-specific:** downloads a ~142 MB whisper model, needs `say`+ffmpeg, provider falls back to a stub note when no `claude` CLI (so it passes in CI).
+- **`scripts/ci.sh` order:** remote-enforcement audit → config/hook/harness/meta-eval selftests → swiftc → `clippy --all-targets -D warnings` → Rust tests (client + brain) → `cargo audit` → `cargo deny` → Rust builds → `ng lint` → `ng build` → `e2e-core.sh` + `e2e-mix.sh`.
+- **Guardrails (canonical `.agents/harness/hook_guard.py`, adapted byte-identically by Claude/Codex)** the agent must respect: no direct trunk push, no `security`/keychain CLI, no bare resource-heavy Cargo/build commands outside the shared lane, no `codesign --deep`.
+- **E2E is heavy + host-specific:** installs a checksum-pinned ~142 MB Whisper model, needs `say`+ffmpeg, and uses an explicit deterministic stub provider by default. A real Claude call requires both the provider selection and the cloud-egress opt-in; CLI presence alone can never trigger egress.
 - **Rust pinned to 1.96.0** (`rust-toolchain.toml`, clippy+rustfmt).
 - **What CI cannot prove:** real mic, live ScreenCaptureKit, Touch ID, lock-at-rest, screen-share auto-relock, notarization — need a signed build on a real Mac.
 
@@ -29,8 +29,8 @@ Give Murmur a dedicated **CI/CD agent** that designs and maintains CI, plus **be
 | Artifact | Path | Purpose |
 | --- | --- | --- |
 | Agent | `.claude/agents/ci-cd-engineer.md` | Owns CI design/maintenance; hard invariants; output contract; CD → release-engineer. |
-| Workflow | `.github/workflows/ci.yml` | macOS PR-gate wrapping `ci.sh`. `gate` job (per-PR, `MURMUR_CI_SKIP_E2E=1`) + `full-gate` job (weekly `schedule` + on-demand `workflow_dispatch`, full incl. E2E). SHA-pinned actions, least-priv perms, concurrency cancel, rust/npm/model caching. |
-| Gate toggle | `scripts/ci.sh` | Added guarded `MURMUR_CI_SKIP_E2E=1` (additive, default off → local behavior unchanged) so the per-PR job reuses ci.sh instead of duplicating its command list. |
+| Workflow | `.github/workflows/ci.yml` | One exact required status, `gate (full ci.sh — release parity)`, for PRs, weekly schedule and manual dispatch. Every run includes E2E. PRs lend only the ordinary least-privilege Actions token and attest merge scope only; bypass actors and security settings are explicitly monitor-only and require the privileged trusted default-branch audit. SHA-pinned actions, least-privilege permissions, concurrency cancel, and Rust/npm/model caching. |
+| Gate toggle | `scripts/ci.sh` | `MURMUR_CI_SKIP_E2E=1` remains a local iteration convenience only. GitHub Actions never sets it, so the required PR gate stays at release parity. |
 | Skill | `.claude/skills/ci-maintenance/SKILL.md` | Runbook: every gate step, reproduce-red-locally, all gotchas. |
 | Skill | `.claude/skills/add-ci-gate/SKILL.md` | Discipline for adding a check (ci.sh source of truth, order, tool-absent-safe, selftest RED-before-GREEN, workflow parity). |
 | Skill | `.claude/skills/github-actions/SKILL.md` | Workflow best-practices tuned to Murmur + SHA-pin recipe + the CD release blueprint (design-only). |
@@ -42,6 +42,6 @@ Give Murmur a dedicated **CI/CD agent** that designs and maintains CI, plus **be
 
 ## Deferred (honest gaps)
 
-- **E2E-in-CI as a per-PR gate** — left as the weekly/on-demand `full-gate` job; making it per-PR needs a provider-auth strategy + accepted model-download cost.
+- **Privileged remote-audit credential** — trusted schedule/manual runs require a repository-scoped `MURMUR_REMOTE_AUDIT_TOKEN`. If it is missing or under-scoped, that monitoring run fails closed; PR `PASS_MERGE_SCOPE` deliberately makes no claim about the three admin-only controls.
+- **Semantic/generation product quality** — CI gates the deterministic synthetic FTS floor; real-model semantic/rerank and answer-faithfulness bake-offs remain explicit manual evaluations.
 - **Cloud CD (auto-notarized release)** — a documented blueprint only; requires the user to explicitly move Developer-ID signing into cloud CI (collides with the keychain-is-interactive rule).
-- **First real cloud run** — the workflow is committed but a live GitHub Actions run has not yet been triggered/observed; first PR into `murmur` (or a manual `workflow_dispatch`) is the real proof.
