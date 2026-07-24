@@ -235,7 +235,12 @@ def resolve_task_vendors(
     *,
     allow_test_adapter: bool = False,
 ) -> Tuple[str, str]:
-    """Resolve the writer first, then default the reviewer to the other vendor."""
+    """Resolve the writer, then the reviewer.
+
+    Reviewer precedence: requested_reviewer -> config.default_reviewer ->
+    opposite vendor.  Any pair is allowed, including same-vendor (e.g.
+    claude/claude); reviewer session independence is enforced elsewhere.
+    """
 
     writer = requested_writer or config.get("default_writer")
     if writer == "fake" and allow_test_adapter:
@@ -245,18 +250,17 @@ def resolve_task_vendors(
         return "fake", "fake"
     if writer not in REAL_MODEL_VENDORS:
         raise HarnessError("harness config default_writer must be codex or claude")
-    reviewer = requested_reviewer or {
-        "codex": "claude",
-        "claude": "codex",
-    }[writer]
+    reviewer = (
+        requested_reviewer
+        or config.get("default_reviewer")
+        or {"codex": "claude", "claude": "codex"}[writer]
+    )
     if reviewer not in REAL_MODEL_VENDORS:
         raise HarnessError("reviewer must be codex or claude; fake is selftest-only")
-    if reviewer == writer:
-        raise HarnessError("writer and reviewer must use different vendors")
     return writer, reviewer
 
 
-def validate_vendor_separation(
+def validate_model_vendors(
     contract: Mapping[str, Any], *, allow_test_adapter: bool = False
 ) -> None:
     writer = contract.get("writer")
@@ -265,8 +269,6 @@ def validate_vendor_separation(
         return
     if writer not in REAL_MODEL_VENDORS or reviewer not in REAL_MODEL_VENDORS:
         raise HarnessError("production tasks may use only codex and claude model vendors")
-    if writer == reviewer:
-        raise HarnessError("writer and reviewer must use different vendors")
 
 
 def load_schema(name: str) -> Dict[str, Any]:
@@ -2743,7 +2745,7 @@ def run_task(
     contract: Dict[str, Any], task_dir: Path, *, allow_test_adapter: bool = False
 ) -> str:
     config = load_config()
-    validate_vendor_separation(contract, allow_test_adapter=allow_test_adapter)
+    validate_model_vendors(contract, allow_test_adapter=allow_test_adapter)
     validate_canonical_checks(
         [*contract.get("checks", []), *contract.get("final_checks", [])],
         contract.get("risk_flags", []),
@@ -3174,7 +3176,7 @@ def verify_attestation(
     """Canonical fail-closed verifier used by verify, guard, and commit."""
 
     validate_schema(dict(contract), load_schema("task"), label="task contract")
-    validate_vendor_separation(contract, allow_test_adapter=allow_test_adapter)
+    validate_model_vendors(contract, allow_test_adapter=allow_test_adapter)
     attestation_path = task_dir / "attestation.json"
     attestation = load_json(attestation_path)
     validate_schema(attestation, load_schema("attestation"), label="attestation")
@@ -4604,21 +4606,24 @@ def cmd_selftest(_args: argparse.Namespace) -> int:
     )
     if resolve_task_vendors(default_cli_args.agent, default_cli_args.reviewer, config) != (
         "claude",
-        "codex",
+        "claude",
     ):
-        failures.append("default task vendors are not Claude writer -> Codex reviewer")
+        failures.append("default task vendors are not Claude writer -> Claude reviewer")
     if resolve_task_vendors("codex", None, config) != ("codex", "claude"):
-        failures.append("explicit writer override did not select the opposite reviewer")
+        failures.append("writer override did not fall back to the configured default_reviewer")
+    # Same-vendor pairs are now allowed (session independence is enforced elsewhere).
     for writer, reviewer, label in (
-        ("fake", "fake", "public fake adapter"),
         ("codex", "codex", "same-vendor Codex review"),
         ("claude", "claude", "same-vendor Claude review"),
     ):
-        try:
-            resolve_task_vendors(writer, reviewer, config)
-            failures.append(f"{label} was accepted")
-        except HarnessError:
-            pass
+        if resolve_task_vendors(writer, reviewer, config) != (writer, reviewer):
+            failures.append(f"{label} was not accepted")
+    # The public (non-selftest) fake adapter is still rejected.
+    try:
+        resolve_task_vendors("fake", "fake", config)
+        failures.append("public fake adapter was accepted")
+    except HarnessError:
+        pass
     if resolve_task_vendors("fake", "fake", config, allow_test_adapter=True) != (
         "fake",
         "fake",
