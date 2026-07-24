@@ -1798,6 +1798,14 @@ def _run_selftest() -> int:
         for label, command, want in resource_cases:
             test.expect(label, vendor, "block-bash", command, SOURCE_ROOT, want)
 
+        for label, cmd, want in [
+            ("gh live $() substitution is heavy", 'gh pr create --title x --body "$(cargo build --release)"', "HEAVY"),
+            ("gh single-quoted backticks are light", "gh pr create --title x --body 'run `cargo test` first'", "LIGHT"),
+            ("gh plain cargo word is light", 'gh pr create --title x --body "fixes the cargo build"', "LIGHT"),
+        ]:
+            got = "HEAVY" if resource_policy.command_is_heavy(cmd) else "LIGHT"
+            test.result(label, got, want)
+
     print("-- staged secret scan (no path exclusions) --")
     for vendor in ("codex", "claude"):
         _secret_case(test, vendor, "plain.txt", "token=" + "sk" + "-ant-" + "A" * 28, "BLOCK")
