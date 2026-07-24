@@ -1709,6 +1709,17 @@ def _run_selftest() -> int:
             ("direct full CI", "bash scripts/ci.sh", "BLOCK"),
             ("read-only cargo search", "rg 'cargo test --lib' .", "ALLOW"),
             (
+                "gh PR body mentions cargo",
+                "gh pr create --base murmur --title x --body 'Fixes the cargo build path'",
+                "ALLOW",
+            ),
+            (
+                "gh PR body with backticks",
+                "gh pr create --title x --body 'run `cargo test --lib` first'",
+                "ALLOW",
+            ),
+            ("gh then cargo still heavy", "gh pr view 1 && cargo build", "BLOCK"),
+            (
                 "lane-wrapped Rust test",
                 "scripts/agent-resource-run --chdir src-tauri -- cargo test --lib",
                 "ALLOW",
