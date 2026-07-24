@@ -2,6 +2,17 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
+    // macOS final-link fix (Apple clang 21+): whisper's bundled ggml-metal
+    // (`ggml-metal-device.m`) uses ObjC `@available`, which clang lowers to a call to
+    // `__isPlatformVersionAtLeast`. That symbol lives in clang's compiler-rt
+    // (`libclang_rt.osx.a`). rustc drives the final app link with `-nodefaultlibs`, so the
+    // runtime is NOT auto-added and the binary fails with
+    // "Undefined symbols: ___isPlatformVersionAtLeast". Link the archive explicitly, resolved
+    // from the ACTIVE clang so it tracks CLT/Xcode updates. Only the whisper-linking app crate
+    // needs it (the sibling brain crate uses mistralrs/candle, not whisper.cpp Metal).
+    #[cfg(target_os = "macos")]
+    link_clang_rt_osx();
+
     // ScreenCaptureKit sidecar (macOS 13+) — the system-audio FALLBACK path.
     build_swift_helper(
         "sysaudio/sysaudio.swift",
@@ -60,6 +71,34 @@ fn main() {
     // is a HARMLESS no-op — the resource entry is likewise release-only (see tauri.conf.json).
     stage_brain_sidecar();
     tauri_build::build();
+}
+
+/// Link Apple clang's compiler-rt archive (`libclang_rt.osx.a`) into the final app link so the
+/// `__isPlatformVersionAtLeast` symbol emitted by whisper's ObjC `@available` checks resolves.
+/// The path is resolved from the active clang (`--print-file-name`) so a CLT/Xcode version bump
+/// is followed automatically. Applies only to the app crate's final link (`cargo:rustc-link-arg`),
+/// so no dependency is recompiled. Best-effort: if the archive cannot be resolved, warn rather than
+/// fail (a link error would still surface loudly, and non-macOS builds skip this entirely).
+#[cfg(target_os = "macos")]
+fn link_clang_rt_osx() {
+    let cc = std::env::var("CC").unwrap_or_else(|_| "clang".to_string());
+    if let Ok(output) = Command::new(&cc)
+        .arg("--print-file-name=libclang_rt.osx.a")
+        .output()
+    {
+        if output.status.success() {
+            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let resolved = Path::new(&path);
+            if resolved.is_absolute() && resolved.exists() {
+                println!("cargo:rustc-link-arg={path}");
+                return;
+            }
+        }
+    }
+    println!(
+        "cargo:warning=could not resolve libclang_rt.osx.a via {cc}; the app link may fail on \
+         __isPlatformVersionAtLeast (whisper ggml-metal @available)"
+    );
 }
 
 /// STAGE the `murmur-brain` child binary into the stable in-crate `binaries/murmur-brain`
