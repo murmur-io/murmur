@@ -61,8 +61,11 @@ scripts/agent-harness close <task-id>
   writer context — so same-vendor is still a real adversarial review, not
   self-grading, and the implementer never owns the verdict.
 - **Trade-off:** same-vendor loses cross-model-family diversity (Codex and Claude
-  catch different failure modes). Prefer a cross-vendor pair when that diversity
-  matters most (e.g. lock/crypto/egress changes).
+  catch different failure modes) — a fresh same-family session recovers the
+  writer's self-attribution blind spot but not its family-level blind spots.
+  So **`lock`/`egress`/`protocol` tasks auto-escalate a same-vendor reviewer to
+  the opposite vendor** (pass `--allow-same-vendor-high-risk` to keep same-vendor
+  there, printed with a loud warning). Other paths stay same-vendor by default.
 
 ## Verify the harness itself
 
