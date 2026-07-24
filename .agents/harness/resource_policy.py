@@ -14,6 +14,8 @@ ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*$", re.DOTALL)
 SHELLS = {"bash", "dash", "ksh", "sh", "zsh"}
 LAUNCHERS = {"command", "env", "exec", "nice", "nohup", "sudo", "time"}
 READ_ONLY_SEARCHES = {"grep", "rg"}
+ALWAYS_ALLOWED_TOOLS = {"gh"}
+SAFE_NONBUILD_TOOLS = READ_ONLY_SEARCHES | ALWAYS_ALLOWED_TOOLS
 MAX_DEPTH = 12
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RESOURCE_RUN = (REPO_ROOT / "scripts/agent-resource-run").resolve()
@@ -577,11 +579,34 @@ def substitution_bodies(command):
         cursor = index
 
 
+def _segment_leading_tool(tokens):
+    """Best-effort basename of the executable a segment launches, or None."""
+    if not tokens:
+        return None
+    if tokens[0] == "__MURMUR_UNPARSEABLE__":
+        raw = tokens[1].lstrip()
+        match = re.match(r"(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*([^\s;|&]+)", raw)
+        return basename(match.group(1)) if match else None
+    index = skip_assignments(tokens, 0)
+    if index >= len(tokens):
+        return None
+    return basename(tokens[index])
+
+
 def command_is_heavy(command, depth=0):
     if depth > MAX_DEPTH:
         return True
     if TEST_GUARDIAN_ENV in command:
         return True
+    # A command whose every segment leads with a safe non-build tool (gh, grep,
+    # rg) cannot launch heavy work. Skip the substitution scan whose only job is
+    # to catch build commands hidden in backticks/$() — those are exactly what a
+    # gh PR/issue body legitimately contains as free-form text.
+    segments = list(command_segments(tokenize(command)))
+    if segments and all(
+        _segment_leading_tool(segment) in SAFE_NONBUILD_TOOLS for segment in segments
+    ):
+        return False
     for backtick_body in re.findall(r"`([^`]*)`", command, flags=re.DOTALL):
         if command_is_heavy(backtick_body, depth + 1):
             return True
