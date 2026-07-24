@@ -134,3 +134,9 @@ direct-push-to-`murmur` protection are always on. Reach for rigor deliberately:
 - Guard behavior is identical across vendors (same `hook_guard.py`): a commit in
   a worktree with **no** active task is allowed; a worktree **with** a task
   enforces the full hash-bound attestation.
+- **Choose the writer/reviewer pair** with `--agent`/`--reviewer` (both `codex|claude`).
+  All four pairs are allowed, including same-vendor; the shipped default is
+  `claude→claude`. The reviewer is always a fresh, independent session with no
+  writer context — same-vendor is still a real adversarial review, not
+  self-grading. Prefer a cross-vendor pair when model-family diversity matters
+  (lock/crypto/egress).
