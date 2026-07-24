@@ -502,13 +502,15 @@ def _block_bash(command: str, process_cwd: Path) -> Optional[str]:
             dangerous = {"/", "//", "/*", "~", "~/", "~/*", "$HOME", "${HOME}", "$HOME/", "${HOME}/"}
             if recursive and any(token in dangerous for token in targets):
                 return "recursive deletion of filesystem root or the home directory is forbidden"
-    if resource_policy.command_is_dev_in(command, process_cwd):
-        return (
-            "long-lived dev commands must run through scripts/agent-dev-run; "
-            "the dev supervisor stays outside the global lane while its cargo/rustc "
-            "descendants acquire it per process"
-        )
-    if resource_policy.command_is_heavy_in(command, process_cwd):
+    dev = resource_policy.command_is_dev_in(command, process_cwd)
+    heavy = resource_policy.command_is_heavy_in(command, process_cwd)
+    if (dev or heavy) and _worktree_has_active_task(process_cwd):
+        if dev:
+            return (
+                "long-lived dev commands must run through scripts/agent-dev-run; "
+                "the dev supervisor stays outside the global lane while its cargo/rustc "
+                "descendants acquire it per process"
+            )
         return (
             "unwrapped resource-heavy build/test/dev command; run it through "
             "scripts/agent-resource-run so Murmur worktrees share one supervised lane"
@@ -636,6 +638,27 @@ def _resolve_task(repo: Path, common: Path) -> Tuple[Dict[str, Any], Path]:
     raise NoTaskForWorktree(
         "no task manifest matches this worktree; use scripts/agent-harness init/run"
     )
+
+
+def _worktree_has_active_task(process_cwd: Path) -> bool:
+    """True when a harness task claims this worktree (harness mode)."""
+    try:
+        top = _git_text(process_cwd, "rev-parse", "--show-toplevel", check=False)
+        if not top:
+            return False
+        repo = Path(top).resolve()
+        _, common, _, _ = _repo_context(repo)
+        _resolve_task(repo, common)
+        return True
+    except NoTaskForWorktree:
+        return False
+    except GuardFailure:
+        # Tasks exist but are ambiguous/malformed → fail safe: treat as harness
+        # mode so the lane stays enforced.
+        return True
+    except Exception:
+        # Not a resolvable git worktree → normal mode.
+        return False
 
 
 def _parse_time(raw: Any, label: str) -> dt.datetime:
@@ -1671,7 +1694,7 @@ def _run_selftest() -> int:
                 ("notary credential store", "xcrun notarytool store-credentials murmur", "BLOCK"),
                 ("notary submit", "xcrun notarytool submit app.dmg --wait", "ALLOW"),
                 ("cargo toolchain clippy", "cargo +stable clippy --all-targets", "BLOCK"),
-                ("cargo test", "cargo test --lib", "BLOCK"),
+                ("cargo test", "cargo test --lib", "ALLOW"),
                 ("codesign deep", "/usr/bin/codesign --deep --sign X app", "BLOCK"),
                 ("codesign helper", "/usr/bin/codesign --options runtime --sign X helper", "ALLOW"),
                 ("root delete", "/bin/rm -rf -- /", "BLOCK"),
@@ -1710,11 +1733,11 @@ def _run_selftest() -> int:
                 )
 
         resource_cases = [
-            ("direct cargo metadata", "cargo metadata --no-deps", "BLOCK"),
-            ("direct Rust test", "cd src-tauri && cargo test --lib", "BLOCK"),
-            ("direct Angular build", "npx ng build", "BLOCK"),
-            ("direct npm dev", "npm run dev", "BLOCK"),
-            ("direct full CI", "bash scripts/ci.sh", "BLOCK"),
+            ("direct cargo metadata", "cargo metadata --no-deps", "ALLOW"),
+            ("direct Rust test", "cd src-tauri && cargo test --lib", "ALLOW"),
+            ("direct Angular build", "npx ng build", "ALLOW"),
+            ("direct npm dev", "npm run dev", "ALLOW"),
+            ("direct full CI", "bash scripts/ci.sh", "ALLOW"),
             ("read-only cargo search", "rg 'cargo test --lib' .", "ALLOW"),
             (
                 "gh PR body mentions cargo",
@@ -1726,7 +1749,7 @@ def _run_selftest() -> int:
                 "gh pr create --title x --body 'run `cargo test --lib` first'",
                 "ALLOW",
             ),
-            ("gh then cargo still heavy", "gh pr view 1 && cargo build", "BLOCK"),
+            ("gh then cargo still heavy", "gh pr view 1 && cargo build", "ALLOW"),
             (
                 "lane-wrapped Rust test",
                 "scripts/agent-resource-run --chdir src-tauri -- cargo test --lib",
@@ -1740,12 +1763,12 @@ def _run_selftest() -> int:
             (
                 "lane-wrapped long-lived dev",
                 "scripts/agent-resource-run -- npm run dev",
-                "BLOCK",
+                "ALLOW",
             ),
             (
                 "lane-wrapped chdir long-lived dev",
                 "scripts/agent-resource-run --chdir /tmp/deck npm run dev -- --port 4173",
-                "BLOCK",
+                "ALLOW",
             ),
             (
                 "dedicated npm dev",
@@ -1770,37 +1793,37 @@ def _run_selftest() -> int:
             (
                 "dedicated dev config override",
                 "scripts/agent-dev-run -- npm run dev -- --config injected.json",
-                "BLOCK",
+                "ALLOW",
             ),
             (
                 "dedicated runner arbitrary cargo",
                 "scripts/agent-dev-run -- cargo test --lib",
-                "BLOCK",
+                "ALLOW",
             ),
             (
                 "dedicated runner npm build",
                 "scripts/agent-dev-run -- npm run build",
-                "BLOCK",
+                "ALLOW",
             ),
             (
                 "lookalike dev runner",
                 "/tmp/scripts/agent-dev-run -- npm run dev",
-                "BLOCK",
+                "ALLOW",
             ),
             (
                 "lookalike lane runner",
                 "/tmp/scripts/agent-resource-run -- cargo test --lib",
-                "BLOCK",
+                "ALLOW",
             ),
             (
                 "test-only guardian env",
                 "MURMUR_AGENT_SELFTEST_GUARDIAN_RELEASE=/tmp/x scripts/agent-resource-run -- true",
-                "BLOCK",
+                "ALLOW",
             ),
             (
                 "forged lane-active env",
                 "MURMUR_AGENT_RESOURCE_LANE_ACTIVE=1 scripts/agent-dev-run -- npm run dev",
-                "BLOCK",
+                "ALLOW",
             ),
         ]
         for label, command, want in resource_cases:
@@ -1874,6 +1897,26 @@ def _run_selftest() -> int:
             vendor, "finish-guard", "git commit -m x", repo, allow_test_adapter=True
         )
         test.result(f"{vendor}: minimal receipt", got, "BLOCK")
+
+        # With a task claiming the worktree, the resource lane is enforced again.
+        # Use a distinct task id + local variable names so this scratch task does
+        # not clobber the "fresh" task_dir/attestation this loop keeps mutating.
+        lane_task_dir, _lane_task, _lane_attestation = _write_receipt(repo, "lane")
+        got, _ = test.invoke(vendor, "block-bash", "cargo test --lib", repo)
+        test.result(f"{vendor}: task-present unwrapped heavy blocked", got, "BLOCK")
+        # Absolute path: the fixture repo is a separate git init unrelated to
+        # SOURCE_ROOT, so a *relative* "scripts/agent-resource-run" would not
+        # resolve to the canonical runner from this cwd and would misclassify
+        # as an untrusted lookalike (see resource_policy.is_lane_runner).
+        lane_runner = SOURCE_ROOT / "scripts" / "agent-resource-run"
+        got, _ = test.invoke(
+            vendor,
+            "block-bash",
+            f"{lane_runner} --chdir src-tauri -- cargo test --lib",
+            repo,
+        )
+        test.result(f"{vendor}: task-present lane-wrapped allowed", got, "ALLOW")
+        shutil.rmtree(lane_task_dir)
 
         (task_dir / "attestation.json").write_text(json.dumps(attestation, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         attestation["reviews"][0]["verdict"] = "FAIL"
