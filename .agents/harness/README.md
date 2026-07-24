@@ -37,7 +37,9 @@ The writer/reviewer pair is configurable per task via `--agent` (writer) and `--
 (reviewer); both default to `config.json` `default_writer` / `default_reviewer` (shipped:
 `claude` / `claude`). Any pair of real vendors is allowed, including same-vendor
 (`claude/claude`, `codex/codex`) — the reviewer is always a fresh, independent session with no
-writer context, so same-vendor is still a genuine adversarial review. The `fake`
+writer context, so same-vendor is a procedurally independent adversarial review (though not
+model-family-diverse). High-risk paths (`lock`/`egress`/`protocol`) auto-escalate a same-vendor
+reviewer to the opposite vendor unless you pass `--allow-same-vendor-high-risk`. The `fake`
 adapter is not accepted by public `init`, verification, hooks, or commit; it exists only behind the
 in-process deterministic selftest interface.
 
@@ -127,7 +129,7 @@ task only, an operator may copy a prepared patch into the new isolated worktree 
 `scripts/agent-harness seal-prepared <task-id>` **before any model or check**. The command requires
 an actually changed protected path, stages the exact owned bytes, refuses dependency-pin changes,
 rebinds the instruction fingerprint once, and writes `prepared.json`. From that point the new
-instructions are immutable again and the ordinary writer, checks, fresh cross-vendor reviews,
+instructions are immutable again and the ordinary writer, checks, fresh independent reviews,
 attestation, commit, and close lifecycle is mandatory. Feature/product tasks cannot use this path.
 
 Failed or blocked tasks can be cleaned without losing their work:

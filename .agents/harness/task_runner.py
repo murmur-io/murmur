@@ -45,6 +45,15 @@ TERMINAL_STATES = {"PASSED", "FAILED", "BLOCKED", "COMMITTED", "CLOSED", "REAPED
 REAPABLE_STATES = {"FAILED", "BLOCKED", "CLOSED"}
 ABANDONABLE_STATES = {"INITIALIZED", "RUNNING", "CHECKING", "REVIEWING", "REPAIRING"}
 REAL_MODEL_VENDORS = {"codex", "claude"}
+# Risk flags where a same-vendor reviewer is most dangerous: a fresh same-family
+# session recovers the writer's self-attribution blind spot but NOT its cold,
+# family-level shared-training-prior blind spots, which are highest-severity on
+# exactly these paths (Murmur's entire shipped incident class: sealed-content
+# leaks, verify-before-destroy ordering, egress-gate omissions, protocol format).
+# The runner escalates a same-vendor reviewer to the opposite vendor here unless
+# the operator explicitly, loudly opts out — turning the docs' "prefer a
+# cross-vendor pair for lock/crypto/egress" advice into policy-as-code.
+HIGH_RISK_CROSS_VENDOR_FLAGS = ("lock", "egress", "protocol")
 MANAGED_CLEANUP_SIGNALS = frozenset((signal.SIGINT, signal.SIGTERM, signal.SIGHUP))
 MAX_LEARNINGS_CHARS = 16_000
 OUTER_SANDBOX_ENV = "MURMUR_HARNESS_OUTER_SANDBOX"
@@ -258,6 +267,34 @@ def resolve_task_vendors(
     if reviewer not in REAL_MODEL_VENDORS:
         raise HarnessError("reviewer must be codex or claude; fake is selftest-only")
     return writer, reviewer
+
+
+def escalate_reviewer_for_risk(
+    writer: str,
+    reviewer: str,
+    risks: Sequence[str],
+    *,
+    allow_same_vendor_high_risk: bool = False,
+) -> Tuple[str, bool]:
+    """Escalate a same-vendor reviewer to the opposite vendor on high-severity
+    risk paths (lock/egress/protocol).
+
+    A fresh same-family reviewer recovers the writer's self-attribution blind
+    spot but not its cold, family-level self-preference; that residual is
+    highest-severity on exactly the ``HIGH_RISK_CROSS_VENDOR_FLAGS`` paths. This
+    is policy-as-code for the docs' "prefer a cross-vendor pair when model-family
+    diversity matters (lock/crypto/egress)". Escalation fires only for a real
+    same-vendor pair on a high-risk task and is waivable with an explicit,
+    recorded opt-out. Returns ``(reviewer, escalated)``.
+    """
+
+    if writer not in REAL_MODEL_VENDORS or reviewer != writer:
+        return reviewer, False
+    if not (set(risks) & set(HIGH_RISK_CROSS_VENDOR_FLAGS)):
+        return reviewer, False
+    if allow_same_vendor_high_risk:
+        return reviewer, False
+    return {"codex": "claude", "claude": "codex"}[writer], True
 
 
 def validate_model_vendors(
@@ -3560,6 +3597,27 @@ def cmd_init(args: argparse.Namespace) -> int:
     checks = [parse_check(raw, timeout) for raw in args.check]
     final_checks = [parse_check(raw, timeout) for raw in args.final_check]
     risks = classify_risks(owned, args.risk, config)
+    reviewer, reviewer_escalated = escalate_reviewer_for_risk(
+        writer,
+        reviewer,
+        risks,
+        allow_same_vendor_high_risk=bool(getattr(args, "allow_same_vendor_high_risk", False)),
+    )
+    high_risk_flags = sorted(set(risks) & set(HIGH_RISK_CROSS_VENDOR_FLAGS))
+    if reviewer_escalated:
+        print(
+            f"[harness] high-risk flags {high_risk_flags} -> escalated reviewer to "
+            f"cross-vendor '{reviewer}' (writer '{writer}'); pass "
+            f"--allow-same-vendor-high-risk to keep same-vendor review.",
+            file=sys.stderr,
+        )
+    elif high_risk_flags and reviewer == writer and writer in REAL_MODEL_VENDORS:
+        print(
+            f"[harness] WARNING: high-risk flags {high_risk_flags} will be reviewed by the "
+            f"SAME vendor '{reviewer}' (explicit --allow-same-vendor-high-risk); the writer's "
+            f"model-family blind spots are NOT independently covered.",
+            file=sys.stderr,
+        )
     add_missing_canonical_risk_checks(checks, risks, timeout, config)
     if not checks:
         raise HarnessError(
@@ -4629,6 +4687,23 @@ def cmd_selftest(_args: argparse.Namespace) -> int:
         "fake",
     ):
         failures.append("internal fake adapter was unavailable to the deterministic selftest")
+    # High-risk paths (lock/egress/protocol) auto-escalate a same-vendor reviewer to
+    # cross-vendor — policy-as-code for the docs' "prefer cross-vendor there" advice.
+    if getattr(default_cli_args, "allow_same_vendor_high_risk", "MISSING") is not False:
+        failures.append("init parser is missing the --allow-same-vendor-high-risk opt-out flag")
+    for w, high_risk in (("claude", "lock"), ("codex", "egress"), ("claude", "protocol")):
+        opp = {"codex": "claude", "claude": "codex"}[w]
+        if escalate_reviewer_for_risk(w, w, [high_risk]) != (opp, True):
+            failures.append(f"high-risk {high_risk} task did not escalate same-vendor reviewer to cross-vendor")
+    if escalate_reviewer_for_risk("claude", "claude", ["ui", "performance"]) != ("claude", False):
+        failures.append("low-risk same-vendor reviewer was needlessly escalated")
+    if escalate_reviewer_for_risk("claude", "codex", ["lock"]) != ("codex", False):
+        failures.append("an already cross-vendor high-risk pair was altered")
+    if escalate_reviewer_for_risk("claude", "claude", ["lock"], allow_same_vendor_high_risk=True) != (
+        "claude",
+        False,
+    ):
+        failures.append("explicit same-vendor high-risk opt-out was not honored")
     audio_risks = classify_risks(["src-tauri/src/audio/spill.rs"], [], config)
     if "runtime" not in audio_risks or "performance" not in audio_risks:
         failures.append("audio hot paths are not automatically classified as runtime + performance")
@@ -6177,6 +6252,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="writer vendor (default: config.json default_writer)",
     )
     init_parser.add_argument("--reviewer", choices=["codex", "claude"])
+    init_parser.add_argument(
+        "--allow-same-vendor-high-risk",
+        action="store_true",
+        help="keep a same-vendor reviewer even on lock/egress/protocol risk "
+        "(default: auto-escalate the reviewer to the opposite vendor)",
+    )
     init_parser.add_argument("--prompt", required=True)
     init_parser.add_argument("--owned", action="append", required=True, metavar="PATH")
     init_parser.add_argument(
