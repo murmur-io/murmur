@@ -330,7 +330,14 @@ def _unsupported_execution_indirection(command: str) -> Optional[str]:
         if not effective:
             continue
         executable = effective[0] if effective[0] == "." else Path(effective[0]).name
-        if executable in {"eval", "source", ".", "exec", "xargs"}:
+        if executable in {"source", "."}:
+            # `source`/`.` of a known-safe env file (e.g. ~/.cargo/env) is a
+            # standard setup step, not executable indirection. All other targets
+            # stay blocked.
+            target = effective[1] if len(effective) > 1 else ""
+            if target not in resource_policy.SAFE_SOURCE_TARGETS:
+                return f"execution indirection via {executable!r} is unsupported by the command guard"
+        elif executable in {"eval", "exec", "xargs"}:
             return f"execution indirection via {executable!r} is unsupported by the command guard"
         if executable == "find" and any(
             token in {"-exec", "-execdir", "-ok", "-okdir"} or token.startswith("-exec")
@@ -1664,6 +1671,9 @@ def _run_selftest() -> int:
                 ("PR creation", "gh pr create --base murmur --title x", "ALLOW"),
                 ("quoted push search", "rg 'git push origin murmur' .", "ALLOW"),
                 ("quoted security search", "rg 'security find-identity' .", "ALLOW"),
+                ("source cargo env", "source ~/.cargo/env", "ALLOW"),
+                ("dot source cargo env", ". $HOME/.cargo/env", "ALLOW"),
+                ("source arbitrary script", "source ./guard-bypass.sh", "BLOCK"),
             ]
             for label, command, want in cases:
                 test.expect(label, vendor, "block-bash", command, repo, want)
