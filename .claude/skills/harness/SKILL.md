@@ -31,19 +31,22 @@ full attestation and the resource lane is required for heavy commands. Your main
 ## Run it
 
 ```bash
-# 1. Create the contract + isolated worktree
-scripts/agent-harness init --kind <feature|refactor|docs|harness> --title "<what>"
+# 1. Create the contract + isolated worktree (task_id is positional;
+#    --prompt and --owned are required, --owned may repeat for multiple paths)
+scripts/agent-harness init <task-id> --kind <bug|feature|refactor|docs|harness> \
+  --prompt "<what>" --owned <path> [--owned <path> ...] \
+  [--risk <lock|egress|protocol|runtime|ui|performance|release>]
 
 # 2. Drive writer → checks → independent reviews → PASS attestation
-scripts/agent-harness run
+scripts/agent-harness run <task-id>
 
 # 3. Commit from the attested index (QueaT identity, no AI trailers) and open a PR
-scripts/agent-harness commit
+scripts/agent-harness commit <task-id> -m "<type>(<scope>): <subject>"
 gh pr create -R murmur-io/murmur --base murmur
 gh pr merge --merge
 
 # 4. Close the task
-scripts/agent-harness close
+scripts/agent-harness close <task-id>
 ```
 
 The default vendor pair is Claude writer → Codex reviewer (the only supported

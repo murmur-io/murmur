@@ -128,7 +128,7 @@ The harness is **opt-in**. Normal commits run freely; only `secret-scan` and
 direct-push-to-`murmur` protection are always on. Reach for rigor deliberately:
 
 - **Codex has no skills mechanism** — invoke the harness directly:
-  `scripts/agent-harness init … && scripts/agent-harness run && scripts/agent-harness commit`.
+  `scripts/agent-harness init <task-id> --prompt "…" --owned <path> && scripts/agent-harness run <task-id> && scripts/agent-harness commit <task-id> -m "…"`.
 - Use it for lock/crypto/egress/protocol changes or anything you want a fresh
   adversarial reviewer to verify. Skip it for docs/chores/low-risk edits.
 - Guard behavior is identical across vendors (same `hook_guard.py`): a commit in
