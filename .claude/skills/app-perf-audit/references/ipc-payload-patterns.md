@@ -75,7 +75,7 @@ a sealed-and-not-session-unlocked meeting **must carry no on-disk audio path**. 
 `meeting.audioPath` straight into Tauri's `convertFileSrc` (the `asset:` protocol, scoped to the audio
 dir) WITHOUT going through any backend command or the `meeting_is_unlocked` gate — it is the one audio
 read path that bypasses the gate. The masked DTO sets `audio_path: None` on purpose
-(`src-tauri/src/commands.rs`, the masked-detail path; grep `audio_path: None`), and the FE's
+(`src-tauri/src/commands/mod.rs`, the masked-detail path; grep `audio_path: None`), and the FE's
 `src/app/features/detail/detail/detail.component.ts` `audioSrc` computed honors it:
 
 ```ts

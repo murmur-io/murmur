@@ -45,6 +45,18 @@ def common_dir(root: Path) -> Path:
     return Path(value).resolve()
 
 
+def runtime_dir(root: Path) -> Path:
+    """Keep harness-owned boot artifacts inside the check's writable runtime."""
+
+    harness_runtime = os.environ.get("MURMUR_HARNESS_RUNTIME_DIR")
+    if harness_runtime:
+        path = Path(harness_runtime)
+        if not path.is_absolute():
+            raise ValueError("MURMUR_HARNESS_RUNTIME_DIR must be absolute")
+        return path.resolve()
+    return common_dir(root) / "agent-harness" / "runtime"
+
+
 def listener(port: int) -> str | None:
     listening = False
     for family, host in ((socket.AF_INET, "127.0.0.1"), (socket.AF_INET6, "::1")):
@@ -99,10 +111,19 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Safely prove that the real Tauri dev app boots")
     parser.add_argument("--timeout", type=int, default=240)
     parser.add_argument("--settle-seconds", type=int, default=10)
+    parser.add_argument("--runtime-write-probe", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     started_at = utc_now()
 
     root = repo_root()
+    runtime_root = runtime_dir(root)
+    runtime_root.mkdir(parents=True, exist_ok=True)
+    run_id = f"boot-{int(time.time())}-{os.getpid()}"
+    log_path = runtime_root / f"{run_id}.log"
+    if args.runtime_write_probe:
+        log_path.write_text("task-private runtime write probe\n", encoding="utf-8")
+        return emit("PASS", "task-private runtime log is writable", log_path, started_at)
+
     for port in (1420, 8765):
         owner = listener(port)
         if owner:
@@ -112,11 +133,6 @@ def main() -> int:
                 None,
                 started_at,
             )
-
-    runtime_root = common_dir(root) / "agent-harness" / "runtime"
-    runtime_root.mkdir(parents=True, exist_ok=True)
-    run_id = f"boot-{int(time.time())}-{os.getpid()}"
-    log_path = runtime_root / f"{run_id}.log"
 
     original_home = Path.home()
     temp_root = Path(tempfile.mkdtemp(prefix=f"murmur-{run_id}-"))

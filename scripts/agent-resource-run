@@ -26,6 +26,7 @@ NOT_EXECUTABLE_EXIT = 126
 NOT_FOUND_EXIT = 127
 POLL_SECONDS = 0.02
 KILL_REAP_SECONDS = 2.0
+LANE_ACTIVE_ENV = "MURMUR_AGENT_RESOURCE_LANE_ACTIVE"
 
 
 def positive_seconds(value):
@@ -341,6 +342,11 @@ def main(argv):
 
     env = os.environ.copy()
     env.pop("MURMUR_AGENT_SELFTEST_GUARDIAN_RELEASE", None)
+    # This marker is minted only after this supervisor owns the kernel flock.
+    # The dev-tool proxy uses it to avoid recursively taking the same
+    # non-reentrant lane when Cargo launches rustc.
+    env.pop(LANE_ACTIVE_ENV, None)
+    env[LANE_ACTIVE_ENV] = "1"
     env.setdefault("CARGO_BUILD_JOBS", "2")
     env.setdefault("RUST_TEST_THREADS", "1")
     env.setdefault("RAYON_NUM_THREADS", "2")

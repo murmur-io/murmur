@@ -230,25 +230,21 @@ mod tests {
     /// zombie for the process lifetime. The pre-fix `try_wait` error arm did `child.kill()` WITHOUT
     /// `child.wait()`.
     ///
-    /// The test proves BOTH sides against the kernel via `ps -o stat`:
-    ///   (a) the OLD behavior — a bare `kill()` with no reap — leaves the pid in state `Z` (zombie),
-    ///   (b) the FIX — `kill_and_reap` — leaves NO `ps` entry (the pid is fully reaped).
+    /// The test proves BOTH sides against the kernel via signal 0:
+    ///   (a) the OLD behavior — a bare `kill()` with no reap — leaves a process-table entry,
+    ///   (b) the FIX — `kill_and_reap` — leaves no process-table entry.
     /// So this is genuinely RED on the old code shape and GREEN on the new one.
     #[test]
     fn kill_and_reap_leaves_no_zombie_unlike_bare_kill() {
         use std::process::{Command, Stdio};
 
-        fn ps_stat(pid: u32) -> Option<String> {
-            let out = Command::new("/bin/ps")
-                .args(["-o", "stat=", "-p", &pid.to_string()])
-                .output()
-                .ok()?;
-            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if s.is_empty() {
-                None
-            } else {
-                Some(s)
-            }
+        fn process_present(pid: u32) -> bool {
+            Command::new("/bin/kill")
+                .arg("-0")
+                .arg(pid.to_string())
+                .status()
+                .map(|status| status.success())
+                .unwrap_or(false)
         }
 
         fn spawn_dummy() -> std::process::Child {
@@ -261,28 +257,26 @@ mod tests {
                 .expect("spawn a dummy long-lived child")
         }
 
-        // (a) OLD behavior: kill WITHOUT reap → the child becomes a zombie (`Z`).
+        // (a) OLD behavior: kill WITHOUT reap → the child remains as an unreaped zombie.
         let mut zombie = spawn_dummy();
         let zpid = zombie.id();
         let _ = zombie.kill();
         std::thread::sleep(Duration::from_millis(200));
-        assert_eq!(
-            ps_stat(zpid).as_deref().map(|s| s.starts_with('Z')),
-            Some(true),
-            "the pre-fix bare kill (no wait) strands a `<defunct>` zombie"
+        assert!(
+            process_present(zpid),
+            "the pre-fix bare kill (no wait) leaves an unreaped process-table entry"
         );
         // Clean the fixture zombie up so the test leaves no residue.
         let _ = zombie.wait();
 
-        // (b) THE FIX: kill AND reap → no `ps` entry at all (fully reaped, no zombie).
+        // (b) THE FIX: kill AND reap → no process-table entry (fully reaped, no zombie).
         let mut reaped = spawn_dummy();
         let rpid = reaped.id();
         kill_and_reap(&mut reaped);
         std::thread::sleep(Duration::from_millis(200));
-        assert_eq!(
-            ps_stat(rpid),
-            None,
-            "kill_and_reap must fully reap the child — no zombie, no `ps` entry"
+        assert!(
+            !process_present(rpid),
+            "kill_and_reap must fully reap the child — no process-table entry"
         );
     }
 }

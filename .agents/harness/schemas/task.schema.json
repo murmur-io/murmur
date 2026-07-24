@@ -35,6 +35,7 @@
     "base_sha": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
     "contract_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
     "instructions_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "prepared_input_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
     "dependency_revisions": {
       "type": "object",
       "additionalProperties": { "type": "string" }

@@ -24,7 +24,7 @@ A **local-first macOS desktop app** that records meetings, transcribes on-device
 
 ### Module map (verify against the tree — trust code, not docs)
 
-**Rust** (`src-tauri/src/`): `commands.rs` (Tauri commands), `lib.rs` (handler registry + setup), `state.rs` (`AppState`), `error.rs` (`AppError`/`Result`), `events.rs`; `storage/` (`db.rs`, `migration.rs` = SQLCipher whole-DB encrypt-in-place, `models.rs`); `crypto.rs` (AES-256-GCM + `encrypt_file`/`decrypt_file`, verify-before-destroy); `secrets/keychain.rs` (keyring, service `com.meetnotes.app`, `MURMUR_DEV_DEK`/`MURMUR_DEV_KEK` debug hatches); `biometric.rs` (Touch ID); `screenshare.rs` (best-effort auto-relock, crash-safe `CGWindowList`); `audio/` (`recorder`, `system`, `mixer`, `merge`, `wav`, `listener`); `transcribe/` (`whisper`, `model`, `live`, `types`); `pipeline.rs`; `mcp.rs`; `summarize/`; `settings/config.rs`; `export/`.
+**Rust** (`src-tauri/src/`): `commands/` (`mod.rs` plus domain modules; Tauri commands), `lib.rs` (handler registry + setup), `state.rs` (`AppState`), `error.rs` (`AppError`/`Result`), `events.rs`; `storage/` (`db.rs` plus domain `*_store.rs`, `migration.rs` = SQLCipher whole-DB encrypt-in-place, `models.rs`); `crypto.rs` (AES-256-GCM + `encrypt_file`/`decrypt_file`, verify-before-destroy); `secrets/keychain.rs` (keyring + Security.framework user-presence-gated KEK/MK reads, service `com.meetnotes.app`, `MURMUR_DEV_DEK`/`MURMUR_DEV_KEK` debug hatches); `screenshare.rs` (best-effort auto-relock, crash-safe `CGWindowList`); `audio/` (`recorder`, `system`, `mixer`, `merge`, `wav`, `listener`); `transcribe/` (`whisper`, `model`, `live`, `types`); `reason.rs` + `reason/` (`sidecar.rs`, `afm.rs`) with the killable helper crate at `crates/murmur-brain/`; `pipeline.rs`; `mcp.rs`; `summarize/`; `settings/config.rs`; `export/`.
 
 **Angular** (`src/app/features/`): `analytics`, `ask`, `bar`, `detail`, `folders`, `graph`, `library`, `onboarding`, `record`, `settings`. Services: `core/ipc.service.ts`, `services/{folders,toast,screen-share}.service.ts`, `core/models.ts`.
 
@@ -57,9 +57,9 @@ threat matrix §1.1, the one-way two-domain rule §9). Deploy / redeploy / logs 
 # No --features needed: the on-device brain/embedder/NER are ALWAYS compiled and activate at runtime
 # on model-presence. `MISTRALRS_METAL_PRECOMPILE=0` is baked into the workspace `.cargo/config.toml` [env]
 # (this Mac has only the Command Line Tools, not full Xcode → defer Metal-shader compile to first run),
-# so `npm run dev` just works.
+# so the supervised dev command just works without monopolizing the shared Cargo lane.
 source ~/.cargo/env
-MURMUR_DEV_DEK=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef npm run dev
+MURMUR_DEV_DEK=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef scripts/agent-dev-run -- npm run dev
 #   → ng on http://localhost:1420, MCP on 127.0.0.1:8765
 
 # Quality gates
