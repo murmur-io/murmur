@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Build + package MeetNotes. What this does HEADLESS (all verified to work):
-#   1. release .app build, 2. ad-hoc codesign + verify (proves the bundle is well-formed
-#   and signable), 3. a functional .dmg via hdiutil.
-# What still needs a real Mac / paid Apple Developer ID (see printout): Developer-ID
-# signing + notarization, and Tauri's *styled* .dmg layout (bundle_dmg.sh uses Finder).
+# DEPRECATED — smoke test only, NOT the release path.
+# This targets the stale bundle name (MeetNotes.app); the real universal release
+# is Murmur.app at the workspace-root target/, driven by the `release-murmur`
+# skill + scripts/macos-sign-notarize.sh. Use this file only to prove the bundle
+# builds, ad-hoc-signs, and packages into a functional .dmg on a headless box.
 set -euo pipefail
 # shellcheck disable=SC1091
 source "$HOME/.cargo/env" 2>/dev/null || true

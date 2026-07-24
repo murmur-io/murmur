@@ -14,6 +14,8 @@ ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*$", re.DOTALL)
 SHELLS = {"bash", "dash", "ksh", "sh", "zsh"}
 LAUNCHERS = {"command", "env", "exec", "nice", "nohup", "sudo", "time"}
 READ_ONLY_SEARCHES = {"grep", "rg"}
+ALWAYS_ALLOWED_TOOLS = {"gh"}
+SAFE_NONBUILD_TOOLS = READ_ONLY_SEARCHES | ALWAYS_ALLOWED_TOOLS
 MAX_DEPTH = 12
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RESOURCE_RUN = (REPO_ROOT / "scripts/agent-resource-run").resolve()
@@ -577,11 +579,80 @@ def substitution_bodies(command):
         cursor = index
 
 
+def _segment_leading_tool(tokens):
+    """Best-effort basename of the executable a segment launches, or None."""
+    if not tokens:
+        return None
+    if tokens[0] == "__MURMUR_UNPARSEABLE__":
+        raw = tokens[1].lstrip()
+        match = re.match(r"(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*([^\s;|&]+)", raw)
+        return basename(match.group(1)) if match else None
+    index = skip_assignments(tokens, 0)
+    if index >= len(tokens):
+        return None
+    return basename(tokens[index])
+
+
+def _has_live_substitution(command):
+    """True if $()/backtick/<()/>() appears outside single-quoted spans.
+
+    Single-quoted text is inert (the shell never expands it); a substitution in
+    double-quoted or unquoted context IS executed, so such a command can launch
+    heavy work regardless of its leading executable.
+    """
+    single = False
+    double = False
+    escaped = False
+    index = 0
+    while index < len(command):
+        character = command[index]
+        if escaped:
+            escaped = False
+            index += 1
+            continue
+        if character == "\\" and not single:
+            escaped = True
+            index += 1
+            continue
+        if character == "'" and not double:
+            single = not single
+            index += 1
+            continue
+        if character == '"' and not single:
+            double = not double
+            index += 1
+            continue
+        if not single and (
+            character == "`"
+            or command.startswith("$(", index)
+            or command.startswith("<(", index)
+            or command.startswith(">(", index)
+        ):
+            return True
+        index += 1
+    return False
+
+
 def command_is_heavy(command, depth=0):
     if depth > MAX_DEPTH:
         return True
     if TEST_GUARDIAN_ENV in command:
         return True
+    # A command whose every segment leads with a safe non-build tool (gh, grep,
+    # rg) cannot launch heavy work. Skip the substitution scan whose only job is
+    # to catch build commands hidden in backticks/$() — those are exactly what a
+    # gh PR/issue body legitimately contains as free-form text. This exemption
+    # only applies when there is no LIVE substitution: single-quoted `$(...)`/
+    # backtick text is inert, but the same syntax in double-quoted or unquoted
+    # context is executed by the shell BEFORE gh ever runs, so it must fall
+    # through to the normal heavy scan below.
+    segments = list(command_segments(tokenize(command)))
+    if (
+        segments
+        and all(_segment_leading_tool(segment) in SAFE_NONBUILD_TOOLS for segment in segments)
+        and not _has_live_substitution(command)
+    ):
+        return False
     for backtick_body in re.findall(r"`([^`]*)`", command, flags=re.DOTALL):
         if command_is_heavy(backtick_body, depth + 1):
             return True
