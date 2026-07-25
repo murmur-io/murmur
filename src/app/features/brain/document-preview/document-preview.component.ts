@@ -13,7 +13,7 @@ import {
   viewChild,
 } from "@angular/core";
 import { IpcService } from "../../../core/ipc.service";
-import type { DocumentPreviewTarget } from "../../../core/models";
+import type { DocumentPreviewTarget, NoteRecipe } from "../../../core/models";
 import { MurSpinnerComponent } from "../../../design-system/spinner/spinner.component";
 
 /**
@@ -71,12 +71,26 @@ export class DocumentPreviewComponent {
   // BrainNoteEditorComponent modal's `dismiss` convention.
   readonly dismiss = output<void>();
 
+  /**
+   * Emits the NEW note id after "Make a note from this" succeeds (the smart-note
+   * engine). Optional to bind — a parent that ignores it still works; a parent
+   * that binds it can navigate to / open the generated note.
+   */
+  readonly noteCreated = output<string>();
+
   /** The fetched clean text ("" when sealed-masked or genuinely empty). */
   protected readonly content = signal<string>("");
   /** True while `getDocument` is in flight. */
   protected readonly loading = signal(false);
   /** A read failure (e.g. transient IPC error) — distinct from locked/empty. */
   protected readonly error = signal<string | null>(null);
+
+  /** True while `generateNoteFromDocument` is in flight (the "Make a note" action). */
+  protected readonly generating = signal(false);
+  /** A generation failure message (locked / no-consent / no-text), or null. */
+  protected readonly genError = signal<string | null>(null);
+  /** True once a note was successfully generated from this document. */
+  protected readonly genCreated = signal(false);
 
   private readonly closeBtn =
     viewChild<ElementRef<HTMLButtonElement>>("closeBtn");
@@ -136,6 +150,23 @@ export class DocumentPreviewComponent {
     () => !this.loading() && !this.error() && this.content().length === 0,
   );
 
+  /**
+   * Show the "Make a note from this" entry point only for a SOURCE document
+   * (`kind: "document"` — never an existing note) whose content actually loaded
+   * (not while loading / errored / locked-masked). A locked doc has no readable
+   * text and the backend would refuse generation anyway.
+   */
+  protected readonly canMakeNote = computed<boolean>(() => {
+    const d = this.doc();
+    return (
+      !!d &&
+      d.kind !== "note" &&
+      !this.loading() &&
+      !this.error() &&
+      !this.masked()
+    );
+  });
+
   constructor() {
     // Focus the close button when the modal OPENS. This host is now MOUNTED ONCE
     // in the app shell (globally reachable) with `doc` toggled null↔target — so
@@ -160,6 +191,11 @@ export class DocumentPreviewComponent {
     // effect genuinely orchestrates an async IPC fetch, the sanctioned case.
     effect(() => {
       const d = this.doc();
+      // Reset the "Make a note" state on every open / target change so a prior
+      // success or error never bleeds into a different document.
+      this.generating.set(false);
+      this.genError.set(null);
+      this.genCreated.set(false);
       if (!d) {
         this.content.set("");
         this.loading.set(false);
@@ -172,6 +208,53 @@ export class DocumentPreviewComponent {
       this.content.set("");
       void this.fetch(id);
     });
+  }
+
+  /**
+   * Generate a formatted note from THIS document via the smart-note engine, then
+   * emit its new id. Stale-guarded on the doc id (the user may close/switch mid-
+   * flight). A locked / no-consent / no-text failure surfaces inline; the source
+   * document is never modified.
+   */
+  protected async makeNote(recipe: NoteRecipe): Promise<void> {
+    const d = this.doc();
+    if (!d || this.generating()) {
+      return;
+    }
+    const id = d.id;
+    this.generating.set(true);
+    this.genError.set(null);
+    try {
+      const noteId = await this.ipc.generateNoteFromDocument(id, recipe);
+      if (this.doc()?.id !== id) {
+        return; // the user moved on — drop the late result.
+      }
+      this.genCreated.set(true);
+      this.noteCreated.emit(noteId);
+    } catch (e) {
+      if (this.doc()?.id !== id) {
+        return;
+      }
+      this.genError.set(this.friendlyGenError(String(e)));
+    } finally {
+      if (this.doc()?.id === id) {
+        this.generating.set(false);
+      }
+    }
+  }
+
+  /** Map a raw backend error string to a short, friendly message. */
+  private friendlyGenError(raw: string): string {
+    if (/locked/i.test(raw)) {
+      return "This document is in a locked folder — unlock it first.";
+    }
+    if (/consent|egress|Unavailable/i.test(raw)) {
+      return "Turn on your note provider (Settings) to make a note.";
+    }
+    if (/no extractable text|InvalidArg/i.test(raw)) {
+      return "This document has no text to turn into a note.";
+    }
+    return "Couldn’t make a note from this document. Please try again.";
   }
 
   /** Await the gated read; drop the response if the open doc changed since. */
