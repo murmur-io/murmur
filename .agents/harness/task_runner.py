@@ -489,13 +489,42 @@ def unsafe_changed_nodes(worktree: Path, paths: Sequence[str]) -> List[str]:
     return unsafe
 
 
+def _glob_pattern_to_regex(pattern: str) -> str:
+    """Translate a repo path glob into an anchored, path-aware regex.
+
+    gitignore-style `**` spans path separators (zero or more whole segments); a
+    single `*`/`?` never crosses `/`. This replaces a former static-prefix
+    fallback that collapsed e.g. ``src-tauri/**/*.swift`` to the bare directory
+    ``src-tauri`` and then matched EVERY file under it (the bug that spuriously
+    flagged a pure ``commands/attachments.rs`` change as ``runtime`` and pulled
+    in the env-fragile tauri-boot gate).
+    """
+
+    out: List[str] = ["^"]
+    index = 0
+    length = len(pattern)
+    while index < length:
+        if pattern.startswith("**/", index):
+            out.append("(?:[^/]+/)*")
+            index += 3
+        elif pattern.startswith("**", index):
+            out.append(".*")
+            index += 2
+        elif pattern[index] == "*":
+            out.append("[^/]*")
+            index += 1
+        elif pattern[index] == "?":
+            out.append("[^/]")
+            index += 1
+        else:
+            out.append(re.escape(pattern[index]))
+            index += 1
+    out.append("$")
+    return "".join(out)
+
+
 def _owned_matches_pattern(owned: str, pattern: str) -> bool:
-    if fnmatch.fnmatchcase(owned, pattern):
-        return True
-    wildcard_positions = [index for index in (pattern.find("*"), pattern.find("?"), pattern.find("[")) if index >= 0]
-    static = pattern[: min(wildcard_positions)] if wildcard_positions else pattern
-    static = static.rstrip("/")
-    return bool(static) and path_overlaps(owned, static)
+    return re.match(_glob_pattern_to_regex(pattern), owned) is not None
 
 
 def classify_risks(
@@ -1739,6 +1768,56 @@ def run_logged_process(
     }
 
 
+# A check's stdout is WRITER-CONTROLLED (the writer authors the code a check runs), so it
+# can never be authoritative over the outcome — the harness derives PASS/FAIL from the exit
+# code alone. The single exception is an ENVIRONMENTAL block: a stray dev server owning an
+# exclusive port must read as "cannot evaluate here", not as a red test, and must not burn
+# repair rounds. That signal is trustworthy ONLY from a runner-owned probe whose command is
+# a canonical, scope-verified runner script (stage_owned_paths rejects any non-owned change
+# before checks run) that decides on foreign port ownership BEFORE executing writer code.
+# So it is bound to a specific canonical check id AND a dedicated exit code — never stdout.
+ENVIRONMENT_PROBE_CHECK_IDS = frozenset({"tauri-boot"})
+ENVIRONMENT_BLOCKED_EXIT_CODE = 3
+
+
+def _check_outcome(check_id: str, exit_code: int, timed_out: bool) -> Tuple[bool, str]:
+    """Derive ``(passed, outcome)`` from a check's exit code only. Returns outcome
+    ``BLOCKED`` (not ``passed``, but not a code FAIL either) only for a runner-owned
+    environment probe that exits with the dedicated blocked code."""
+
+    if timed_out:
+        return (False, "FAIL")
+    if exit_code == 0:
+        return (True, "PASS")
+    if check_id in ENVIRONMENT_PROBE_CHECK_IDS and exit_code == ENVIRONMENT_BLOCKED_EXIT_CODE:
+        return (False, "BLOCKED")
+    return (False, "FAIL")
+
+
+def _probe_blocked_reason(stdout_path: Path) -> Optional[str]:
+    """Best-effort human reason from an env-probe's JSON stdout — informational ONLY.
+
+    The BLOCKED decision is made by :func:`_check_outcome` from the exit code; this merely
+    surfaces the probe's own message and never influences the verdict.
+    """
+
+    last = None
+    try:
+        with stdout_path.open("r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                stripped = line.strip()
+                if stripped:
+                    last = stripped
+        if last is None:
+            return None
+        obj = json.loads(last)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if isinstance(obj, dict) and isinstance(obj.get("reason"), str):
+        return obj["reason"].strip() or None
+    return None
+
+
 def run_check(worktree: Path, task_dir: Path, check: Mapping[str, Any], phase: str) -> Dict[str, Any]:
     safe_phase = re.sub(r"[^a-z0-9._-]+", "-", phase.lower())
     log_path = task_dir / "logs" / f"{safe_phase}-{check['id']}.log"
@@ -1842,13 +1921,20 @@ def run_check(worktree: Path, task_dir: Path, check: Mapping[str, Any], phase: s
         "started_at": started_at,
         "created_at": utc_now(),
     }
+    # Outcome is derived from the EXIT CODE only (stdout is writer-controlled). A runner-owned
+    # environment probe may report BLOCKED via its dedicated exit code — "cannot evaluate in
+    # this environment", not a red test — so a stray dev server owning a port does not read as
+    # a code FAIL or burn repair rounds. See _check_outcome for the security rationale.
+    passed, outcome = _check_outcome(check["id"], result["exit_code"], result["timed_out"])
+    blocked_reason = _probe_blocked_reason(stdout_path) if outcome == "BLOCKED" else None
     evidence = {
         "id": check["id"],
         "command": check["command"],
         "phase": phase,
         **result,
-        "passed": result["exit_code"] == 0 and not result["timed_out"],
-        "outcome": "PASS" if result["exit_code"] == 0 and not result["timed_out"] else "FAIL",
+        "passed": passed,
+        "outcome": outcome,
+        "blocked_reason": blocked_reason,
     }
     append_jsonl(
         task_dir / "events.jsonl",
@@ -1862,6 +1948,7 @@ def run_check(worktree: Path, task_dir: Path, check: Mapping[str, Any], phase: s
             "duration_ms": evidence["duration_ms"],
             "passed": evidence["passed"],
             "outcome": evidence["outcome"],
+            "blocked_reason": evidence["blocked_reason"],
             "log_path": evidence["log_path"],
             "network_mode": evidence["network_mode"],
             "sandbox_mode": evidence["sandbox_mode"],
@@ -1939,6 +2026,59 @@ def _extract_claude_result(log_path: Path) -> Any:
     if candidate is None:
         raise HarnessError(f"Claude returned no structured result; inspect {log_path}")
     return candidate
+
+
+# A WRITER's final structured report (status/summary/tests_run/remaining_risks) is
+# METADATA only: the harness re-derives the diff itself (stage_owned_paths) and the
+# verdict rests on deterministic checks + fresh independent reviews, none of which trust
+# the self-report. So a purely cosmetic model output-formatting failure must NOT forfeit
+# a complete, staged, checks-green deliverable. These subtypes are recoverable — a stub
+# is synthesized and the loop proceeds to checks+reviews on the produced tree. REVIEWER
+# output is load-bearing and is NEVER stubbed (a malformed reviewer verdict still raises).
+_RECOVERABLE_WRITER_REPORT_SUBTYPES = {"error_max_structured_output_retries"}
+
+
+def _claude_terminal_subtype(log_path: Path) -> Optional[str]:
+    """The `subtype` of the last Claude-CLI `{"type":"result"}` event, or None."""
+
+    subtype: Optional[str] = None
+    try:
+        with log_path.open("r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if (
+                    isinstance(event, dict)
+                    and event.get("type") == "result"
+                    and isinstance(event.get("subtype"), str)
+                ):
+                    subtype = event["subtype"]
+    except OSError:
+        return None
+    return subtype
+
+
+def _degraded_writer_document(vendor: str, subtype: str) -> Dict[str, Any]:
+    """A schema-valid writer stub used when the writer's self-report was unparseable."""
+
+    return {
+        "status": "completed",
+        "summary": (
+            f"<recovered> the {vendor} writer's final structured report was malformed "
+            f"({subtype}); the staged diff is intact. This self-report is metadata only — "
+            "the verdict rests on the harness's deterministic checks and independent reviews."
+        ),
+        "tests_run": [],
+        "remaining_risks": [
+            "writer self-report was not machine-readable; the verdict relies on "
+            "deterministic checks and the independent reviews, not this report",
+        ],
+    }
 
 
 def extract_model_metadata(log_path: Path, vendor: str, fallback_session: str) -> Dict[str, str]:
@@ -2191,8 +2331,27 @@ def invoke_model(
             env=environment,
         )
         if process_result["exit_code"] != 0 or process_result["timed_out"]:
-            raise HarnessError(f"Claude {label} failed; inspect {log_path}")
-        document = _extract_claude_result(log_path)
+            subtype = None if process_result["timed_out"] else _claude_terminal_subtype(log_path)
+            if role == "writer" and subtype in _RECOVERABLE_WRITER_REPORT_SUBTYPES:
+                # The writer produced its edits but could not emit a well-formed final
+                # report. Proceed on the STAGED tree — checks + independent reviews own
+                # the verdict — instead of forfeiting a complete, compiling deliverable.
+                document = _degraded_writer_document(vendor, subtype)
+                append_jsonl(
+                    task_dir / "events.jsonl",
+                    {
+                        "at": utc_now(),
+                        "event": "writer-report-degraded",
+                        "label": label,
+                        "vendor": vendor,
+                        "subtype": subtype,
+                        "reason": "writer structured-output retries exhausted; proceeding on the staged tree",
+                    },
+                )
+            else:
+                raise HarnessError(f"Claude {label} failed; inspect {log_path}")
+        else:
+            document = _extract_claude_result(log_path)
         atomic_write_json(result_path, document)
     else:
         raise HarnessError(f"unsupported model adapter: {vendor}")
@@ -2877,6 +3036,23 @@ def run_task(
                 )
             assert_provenance(contract, task_dir)
             all_checks.extend(round_checks)
+            blocked_checks = [c for c in round_checks if c.get("outcome") == "BLOCKED"]
+            if blocked_checks:
+                reasons = "; ".join(
+                    f"{c['id']}: {c.get('blocked_reason') or 'environment unavailable'}"
+                    for c in blocked_checks
+                )
+                set_state(
+                    task_dir,
+                    "BLOCKED",
+                    round=round_number,
+                    phase="checks",
+                    reason=(
+                        "a required check could not run in this environment; "
+                        f"re-run in a clean environment: {reasons}"
+                    ),
+                )
+                return "BLOCKED"
             failed_checks = [check for check in round_checks if not check["passed"]]
             successful_ids = {check["id"] for check in round_checks if check["passed"]}
             missing_risk_evidence = [
@@ -2937,6 +3113,23 @@ def run_task(
                 )
             assert_provenance(contract, task_dir)
             all_checks.extend(final_checks)
+            blocked_final = [c for c in final_checks if c.get("outcome") == "BLOCKED"]
+            if blocked_final:
+                reasons = "; ".join(
+                    f"{c['id']}: {c.get('blocked_reason') or 'environment unavailable'}"
+                    for c in blocked_final
+                )
+                set_state(
+                    task_dir,
+                    "BLOCKED",
+                    round=round_number,
+                    phase="final-checks",
+                    reason=(
+                        "a required final check could not run in this environment; "
+                        f"re-run in a clean environment: {reasons}"
+                    ),
+                )
+                return "BLOCKED"
             if any(not check["passed"] for check in final_checks):
                 set_state(
                     task_dir,
@@ -4714,6 +4907,61 @@ def cmd_selftest(_args: argparse.Namespace) -> int:
     )
     if "lock" not in attachment_risks:
         failures.append("attachment read surfaces are not automatically classified as lock-sensitive")
+    # Regression (glob-prefix-collapse): a pure backend commands/attachments.rs change is
+    # lock, NEVER runtime. The former static-prefix fallback collapsed `src-tauri/**/*.swift`
+    # to the bare directory `src-tauri` and matched every backend file, spuriously attaching
+    # the env-fragile tauri-boot gate. RED on the old matcher, GREEN on the path-aware one.
+    backend_only_risks = classify_risks(["src-tauri/src/commands/attachments.rs"], [], config)
+    if "runtime" in backend_only_risks:
+        failures.append("a pure commands/attachments.rs change was spuriously classified as runtime")
+    if "lock" not in backend_only_risks:
+        failures.append("commands/attachments.rs lost its lock classification")
+    # The path-aware matcher still classifies the intended runtime targets (top-level and nested swift).
+    if "runtime" not in classify_risks(["src-tauri/audiocap.swift"], [], config):
+        failures.append("a top-level src-tauri/*.swift file is no longer classified as runtime")
+    if "runtime" not in classify_risks(["src-tauri/deep/nested/helper.swift"], [], config):
+        failures.append("a nested src-tauri/**/*.swift file is no longer classified as runtime")
+    # The FE attachment service (real name note-attachment.service.ts) stays lock + ui and
+    # leaks no unrelated flag — the `*attachment*` pattern catches the note- prefix.
+    fe_attachment_risks = classify_risks(["src/app/services/note-attachment.service.ts"], [], config)
+    if "lock" not in fe_attachment_risks or "ui" not in fe_attachment_risks:
+        failures.append("the FE note-attachment service is not classified lock + ui")
+    if any(flag in fe_attachment_risks for flag in ("runtime", "egress", "protocol", "performance", "release")):
+        failures.append("the FE note-attachment service leaked an unrelated risk flag")
+    # Fix: a runner-owned environment probe signals BLOCKED via a DEDICATED EXIT CODE (never
+    # stdout, which is writer-controlled) and only for its canonical check id — so a stray dev
+    # server owning a port reads as "cannot evaluate here", not a code FAIL, while a forged
+    # non-probe check can never escape a FAIL (the infra-blocked case below proves the latter).
+    if _check_outcome("tauri-boot", ENVIRONMENT_BLOCKED_EXIT_CODE, False) != (False, "BLOCKED"):
+        failures.append("the runner-owned env probe blocked exit code was not read as BLOCKED")
+    if _check_outcome("rust-lib", ENVIRONMENT_BLOCKED_EXIT_CODE, False) != (False, "FAIL"):
+        failures.append("a non-probe check exiting the blocked code was wrongly read as BLOCKED")
+    if _check_outcome("tauri-boot", 1, False) != (False, "FAIL"):
+        failures.append("a genuine env-probe boot failure was not read as a FAIL")
+    if _check_outcome("tauri-boot", 0, False) != (True, "PASS"):
+        failures.append("a passing env probe was not read as PASS")
+    if _check_outcome("tauri-boot", ENVIRONMENT_BLOCKED_EXIT_CODE, True) != (False, "FAIL"):
+        failures.append("a timed-out env probe was not read as a FAIL")
+    # Fix: an unparseable writer SELF-REPORT yields a schema-valid completed stub so the loop
+    # proceeds to checks + independent reviews on the staged tree. Recovery is writer-only.
+    degraded_stub = _degraded_writer_document("claude", "error_max_structured_output_retries")
+    try:
+        validate_schema(degraded_stub, load_schema("model-result"), label="degraded writer stub")
+    except HarnessError:
+        failures.append("the degraded writer stub is not schema-valid")
+    if degraded_stub.get("status") != "completed":
+        failures.append("the degraded writer stub must carry a completed status")
+    if "error_max_structured_output_retries" not in _RECOVERABLE_WRITER_REPORT_SUBTYPES:
+        failures.append("the recoverable writer-report subtype set regressed")
+    with tempfile.TemporaryDirectory(prefix="murmur-harness-subtype-") as stmp:
+        spath = Path(stmp) / "claude.jsonl"
+        spath.write_text(
+            '{"type":"assistant","message":{}}\n'
+            '{"type":"result","subtype":"error_max_structured_output_retries","is_error":true}\n',
+            encoding="utf-8",
+        )
+        if _claude_terminal_subtype(spath) != "error_max_structured_output_retries":
+            failures.append("the Claude terminal result subtype was not extracted")
     claude_schema = schema_for_model_cli(load_schema("review"), "claude")
     if "$schema" in claude_schema or "$id" in claude_schema:
         failures.append("Claude CLI schema retained unsupported draft metadata")
