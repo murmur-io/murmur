@@ -12245,7 +12245,7 @@
         let emb = crate::embed::StubEmbedder;
         let qv = emb.embed(std::slice::from_ref(&text.to_string())).unwrap();
         let qvec = qv.into_iter().next().unwrap_or_default();
-        db.search_semantic_visible(&qvec, 50, unlocked)
+        db.search_semantic_visible(&qvec, 50, 0.0, unlocked)
             .unwrap()
             .iter()
             .any(|h| h.meeting.id == mid)

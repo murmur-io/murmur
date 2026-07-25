@@ -91,6 +91,17 @@ pub const SCORE_FUSE_W_KNN: f64 = 0.4;
 /// Weight of the entity-graph leg in [`score_fuse`].
 pub const SCORE_FUSE_W_GRAPH: f64 = 0.2;
 
+/// Minimum cosine (over L2-normalized e5 vectors) for a vector-KNN candidate to survive into a
+/// SEARCH result. Below it, the k-nearest neighbour is noise on a tiny/irrelevant corpus (S1 QA).
+/// PROVISIONAL value derived from the already-calibrated persistent auto-link floor
+/// (links::SEMANTIC_LINK_FLOOR = 0.80): search is ephemeral + user-initiated, so it sits just
+/// BELOW the link floor to protect recall. Finalize on a real vault via eval::calibration +
+/// eval::bakeoff (see PR body) — the mechanism is opt-in so tuning is a one-line const change.
+pub const KNN_SEARCH_COSINE_FLOOR: f32 = 0.78;
+
+/// Org-partition int8 KNN floor (own distribution — the int8 /127 rescale is approximate).
+pub const ORG_KNN_SEARCH_COSINE_FLOOR: f32 = 0.78;
+
 /// The swappable embedding backend. Pure + synchronous: `embed` maps a batch of texts to a batch
 /// of `dim()`-length vectors. The real model implements this over multilingual-e5-small; tests +
 /// the no-model floor use [`StubEmbedder`].

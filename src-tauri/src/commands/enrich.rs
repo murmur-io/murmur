@@ -890,7 +890,7 @@ pub(crate) fn gather_note_enhance_citations(
                 Some(qvec) => {
                     state
                         .db
-                        .search_doc_chunks_visible(&qvec, MAX_CITATIONS as i64, &unlocked)?
+                        .search_doc_chunks_visible(&qvec, MAX_CITATIONS as i64, 0.0, &unlocked)?
                 }
                 None => Vec::new(),
             }
