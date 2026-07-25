@@ -468,6 +468,10 @@ pub fn execute_tool(
     match call {
         ToolCall::SearchMeetings { query } => {
             let q = query.as_str();
+            // R1 (consistency) — an empty/whitespace query matches NOTHING, never everything.
+            if q.trim().is_empty() {
+                return Ok(format!("No meetings or documents match \"{q}\"."));
+            }
             // Brain v2 L1.5 — time-aware expansion: a temporal phrase in the query ("last week",
             // "zeszłego tygodnia") becomes a `started_at` window on the meeting leg. The query
             // text itself is NOT stripped (BM25 tolerates the extra tokens). Query-time `now` is
@@ -491,6 +495,14 @@ pub fn execute_tool(
         }
         ToolCall::SearchSemantic { query } => {
             let q = query.as_str();
+            // R1 — an EMPTY/whitespace query must match NOTHING, never everything: with a real
+            // embedder present, embedding "" makes the KNN legs return the k-nearest = ALL rows.
+            // Short-circuit BEFORE any embedder/model branch (mirrors `search_org_brain_hits`'
+            // `if q.is_empty()` guard) so the guard holds regardless of model presence — no vec /
+            // doc_vec table is ever touched. More conservative only; never widens visibility.
+            if q.trim().is_empty() {
+                return Ok(format!("No meetings or documents match \"{q}\"."));
+            }
             // Brain v2 L1.5 — the same time-aware window as `search_meetings` (all legs of the
             // hybrid query apply it).
             let date_filter =
@@ -626,6 +638,15 @@ pub fn execute_tool(
                     } else {
                         format_structured_transcript(&segs)
                     };
+                    // B1 — decide "no data" on the RAW content BEFORE windowing. A note-less
+                    // meeting whose transcript is empty (INCLUDING a nonexistent id, which
+                    // `meeting_is_visible` treats as visible) is genuinely "No data" — never a
+                    // fake windowed `[end of content]` payload (the default MCP window is 6000,
+                    // never (0,0), so `page_text_disclosed` on "" yields a NON-empty end-marker).
+                    // Mirrors how `get_document` returns "No data for document {id}." on a None row.
+                    if note.is_none() && full_transcript.is_empty() {
+                        return Ok(format!("No data for meeting {mid}."));
+                    }
                     // Brain v3 PR-2 — agent PAGING; audit Fix 2 — HONEST disclosure. Default
                     // (offset 0, max_chars 0) is byte-identical to today (no header). A window
                     // returns a char-safe slice PLUS a `TOTAL_CHARS: …` header so the agent knows
@@ -637,15 +658,16 @@ pub fn execute_tool(
                         Some(h) => format!("TRANSCRIPT ({h}):\n{transcript}"),
                         None => format!("TRANSCRIPT:\n{transcript}"),
                     };
+                    // E1 — the NOTE is a whole-note prefix, NOT part of the transcript window, so
+                    // emit it ONLY on the first window (`offset == 0`). Paging a long transcript
+                    // (`offset > 0`) must never re-ship the full note on every page. The
+                    // `offset == 0` output stays byte-identical to before.
                     match note {
-                        Some(n) => Ok(format!(
+                        Some(n) if *offset == 0 => Ok(format!(
                             "{title_line}NOTE:\n{}\n\n{transcript_section}",
                             n.markdown
                         )),
-                        None if !transcript.is_empty() => {
-                            Ok(format!("{title_line}{transcript_section}"))
-                        }
-                        None => Ok(format!("No data for meeting {mid}.")),
+                        _ => Ok(format!("{title_line}{transcript_section}")),
                     }
                 }
             }
@@ -4782,6 +4804,138 @@ mod tests {
         assert!(
             to_end.contains("[end of content]"),
             "a window that reaches the end must carry the end marker: {to_end}"
+        );
+    }
+
+    /// B1 (RED-before-GREEN) — `get_meeting` on a NONEXISTENT id must return the "No data" sentinel,
+    /// NOT a fake empty-transcript payload. `meeting_is_visible` returns Ok(true) for an absent id
+    /// (has_notes=false ⇒ `!has_notes` = visible), and the MCP default window (6000, not (0,0)) makes
+    /// `page_text_disclosed("")` yield a NON-empty `[end of content]` marker — so pre-fix this arm
+    /// shipped `TRANSCRIPT (TOTAL_CHARS: 0 (showing 0..0)):\n[end of content]`. RED on the old code.
+    #[test]
+    fn get_meeting_nonexistent_returns_no_data_not_fake_transcript() {
+        let db = tmp_db();
+        let cfg = AppConfig::default();
+        // No seed: the id never existed. Exercise the MCP dispatch DEFAULT window (offset 0, 6000).
+        let out = execute_tool(
+            &ToolCall::GetMeeting {
+                meeting_id: "does-not-exist".into(),
+                transcript_format: "structured".into(),
+                offset: 0,
+                max_chars: 6000,
+            },
+            &db,
+            &HashSet::new(),
+            &cfg,
+        )
+        .unwrap();
+        assert!(
+            out.starts_with("No data for meeting"),
+            "a nonexistent meeting must be the No-data sentinel, not a fake transcript: {out}"
+        );
+        assert!(
+            !out.contains("TRANSCRIPT") && !out.contains("[end of content]"),
+            "no fake empty-transcript payload may leak for an absent meeting: {out}"
+        );
+    }
+
+    /// E1 (RED-before-GREEN) — `get_meeting` emits the NOTE section only on the FIRST window
+    /// (`offset == 0`); paging a long transcript (`offset > 0`) must NOT re-ship the whole note on
+    /// every page. Pre-fix the NOTE was prepended UNCONDITIONALLY at every offset. RED on the old code.
+    #[test]
+    fn get_meeting_note_only_on_first_window() {
+        let db = tmp_db();
+        let cfg = AppConfig::default();
+        const NOTE_BODY: &str = "SECRET_NOTE_BODY_UNIQUE_MARKER";
+        seed_meeting(&db, "m-page", "Standup", NOTE_BODY, None);
+        // A transcript long enough that a small window at offset>0 stays inside it.
+        db.insert_segments(
+            "m-page",
+            &[
+                Segment {
+                    idx: 0,
+                    start_s: 1.0,
+                    end_s: 2.0,
+                    text: "alpha bravo charlie delta echo foxtrot golf".into(),
+                    speaker: Some("me".into()),
+                    confidence: None,
+                },
+                Segment {
+                    idx: 1,
+                    start_s: 2.0,
+                    end_s: 3.0,
+                    text: "hotel india juliet kilo lima mike november".into(),
+                    speaker: Some("others".into()),
+                    confidence: None,
+                },
+            ],
+        )
+        .unwrap();
+
+        // offset 0 → the NOTE is present (first window carries the whole-note prefix).
+        let first = execute_tool(
+            &ToolCall::GetMeeting {
+                meeting_id: "m-page".into(),
+                transcript_format: "structured".into(),
+                offset: 0,
+                max_chars: 20,
+            },
+            &db,
+            &HashSet::new(),
+            &cfg,
+        )
+        .unwrap();
+        assert!(
+            first.contains(NOTE_BODY) && first.contains("NOTE:"),
+            "the first window (offset 0) must carry the note: {first}"
+        );
+
+        // offset > 0 (past the note's length) → the note body must NOT be re-shipped, but the
+        // transcript section IS still present.
+        let paged = execute_tool(
+            &ToolCall::GetMeeting {
+                meeting_id: "m-page".into(),
+                transcript_format: "structured".into(),
+                offset: 10,
+                max_chars: 20,
+            },
+            &db,
+            &HashSet::new(),
+            &cfg,
+        )
+        .unwrap();
+        assert!(
+            !paged.contains(NOTE_BODY) && !paged.contains("NOTE:"),
+            "a paged window (offset>0) must NOT re-ship the note: {paged}"
+        );
+        assert!(
+            paged.contains("TRANSCRIPT"),
+            "the paged window must still carry the transcript section: {paged}"
+        );
+    }
+
+    /// R1 (RED-before-GREEN) — `search_semantic` with an EMPTY query returns the friendly empty
+    /// sentinel and lists NO hit, short-circuiting BEFORE any embedder/model branch (so it holds
+    /// regardless of model presence). Pre-fix, embedding "" made the KNN legs return every row.
+    #[test]
+    fn search_semantic_empty_query_matches_nothing() {
+        let db = tmp_db();
+        let cfg = AppConfig::default(); // semantic default ON — the guard must precede the model branch.
+        seed_meeting(&db, "m-hit", "Zephyr Kickoff", "zephyr launch planning", None);
+        let out = execute_tool(
+            &ToolCall::SearchSemantic { query: "".into() },
+            &db,
+            &HashSet::new(),
+            &cfg,
+        )
+        .unwrap();
+        assert_eq!(
+            out, "No meetings or documents match \"\".",
+            "an empty query must match nothing: {out}"
+        );
+        assert!(
+            !out.contains("Zephyr"),
+            "an empty query must not surface any seeded meeting: {out}"
         );
     }
 }
