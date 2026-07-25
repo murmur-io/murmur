@@ -113,17 +113,26 @@ pub(crate) fn prepare_incoming_attachment_bundle(
             attachment.sha256.as_slice().try_into().map_err(|_| {
                 AppError::InvalidArg("shared image hash has the wrong length".into())
             })?;
-        if attachment.mime_type != "image/webp" {
-            return Err(AppError::InvalidArg(
-                "shared images must be normalized WebP".into(),
-            ));
-        }
+        // Derive the canonical extension from the container. WebKit clients cannot canvas-encode
+        // WebP and now share metadata-free PNGs (see attachments::add_note_attachment_inner), so both
+        // are accepted here; the authoritative check — magic bytes, dims, sha, and the
+        // container-matched metadata rejector — runs in validate_incoming_attachment_bundle below,
+        // before any DB write.
+        let extension = match attachment.mime_type.as_str() {
+            "image/webp" => "webp",
+            "image/png" => "png",
+            _ => {
+                return Err(AppError::InvalidArg(
+                    "shared images must be normalized WebP or PNG".into(),
+                ))
+            }
+        };
         let local_id = uuid::Uuid::new_v4().to_string();
         id_map.insert(wire_id, local_id.clone());
         incoming.push(crate::storage::IncomingAttachment {
             id: local_id,
             mime_type: attachment.mime_type.clone(),
-            extension: "webp".to_string(),
+            extension: extension.to_string(),
             width: attachment.width,
             height: attachment.height,
             sha256,
