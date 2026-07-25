@@ -122,12 +122,21 @@ pub(crate) fn persist_facts_for_meeting(
             .extraction_reasoner_for_recording(token.clone()),
         None => state.reasoner.extraction_reasoner(),
     };
+    // Pin the extractor's OUTPUT language to the note-language config knob (default "auto") so a
+    // Polish-dominant note can't emit the same fact in two languages. Fail-safe like
+    // `user_memory_enabled`: a poisoned config mutex falls back to "auto".
+    let note_language = state
+        .config
+        .lock()
+        .map(|c| c.note_language.clone())
+        .unwrap_or_else(|_| "auto".to_string());
     let candidates = crate::facts::extract_fact_candidates(
         // Brain Live ON ⇒ the LOCAL light engine (facts stop egressing); OFF ⇒ today's Notes reasoner.
         reasoner.as_ref(),
         title,
         markdown,
         entity_refs,
+        &note_language,
         // Post-call extraction over the full note: no tight cap (the realtime path uses a capped preset).
         crate::reason::GenOptions::default(),
     );
@@ -282,6 +291,13 @@ pub(crate) fn persist_user_facts_for_meeting(
             .extraction_reasoner_for_recording(token.clone()),
         None => state.reasoner.extraction_reasoner(),
     };
+    // Pin the extractor's output language (default "auto") — same fail-safe as `user_memory_enabled`
+    // — so a Polish-dominant note can't duplicate a "me" fact as a PL+EN twin.
+    let note_language = state
+        .config
+        .lock()
+        .map(|c| c.note_language.clone())
+        .unwrap_or_else(|_| "auto".to_string());
     let candidates = crate::user_memory::extract_user_fact_candidates(
         // Brain Live ON ⇒ the LOCAL light engine (user facts stop egressing); OFF ⇒ today's reasoner.
         reasoner.as_ref(),
@@ -289,6 +305,7 @@ pub(crate) fn persist_user_facts_for_meeting(
         markdown,
         &typed_notes,
         &thread_turns,
+        &note_language,
     );
     if candidates.is_empty() {
         return Ok(()); // nothing to reconcile — common in the default (no-model) build.
