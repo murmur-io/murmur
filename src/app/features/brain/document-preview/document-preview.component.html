@@ -62,6 +62,44 @@
       } @else {
         <pre class="dp-body" tabindex="0">{{ content() }}</pre>
       }
+
+      <!-- SMART-NOTE ENGINE — "Make a note from this" (source documents only, once
+           the content has loaded and is not locked-masked). -->
+      @if (canMakeNote()) {
+        <footer class="dp-makenote">
+          @if (genCreated()) {
+            <span class="dp-makenote-done" role="status">
+              <span aria-hidden="true">✓</span> Note created — find it in your notes.
+            </span>
+          } @else if (generating()) {
+            <span class="dp-makenote-busy" role="status" aria-live="polite">
+              <mur-spinner [size]="16" />
+              <span>Making a note…</span>
+            </span>
+          } @else {
+            <span class="dp-makenote-label">Make a note from this:</span>
+            <span class="dp-makenote-actions">
+              <button
+                type="button"
+                class="btn btn-primary"
+                (click)="makeNote('synthesis')"
+              >
+                Summary note
+              </button>
+              <button
+                type="button"
+                class="btn btn-ghost"
+                (click)="makeNote('structure-mirror')"
+              >
+                Structured note
+              </button>
+            </span>
+          }
+          @if (genError(); as ge) {
+            <span class="dp-makenote-error" role="alert">{{ ge }}</span>
+          }
+        </footer>
+      }
     </div>
   </div>
 }

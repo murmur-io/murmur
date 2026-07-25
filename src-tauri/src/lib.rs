@@ -204,6 +204,7 @@ pub fn run() {
             commands::brain_overview,
             commands::list_documents,
             commands::get_document,
+            commands::generate_note_from_document,
             commands::delete_document,
             commands::get_user_memory,
             commands::forget_user_fact,
