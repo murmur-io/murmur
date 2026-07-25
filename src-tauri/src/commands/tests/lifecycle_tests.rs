@@ -2703,16 +2703,19 @@
         let state = build_state("person-dossier");
         let db = &state.db;
         make_open_folder(db, "f-lock", "Locked");
+        // B4: the commitment filter is OWNER-ONLY, so this GATING test's fixture commitments must be
+        // OWNED BY Atlas (the entity under test) to surface at all — the test exercises the visibility
+        // gate (sealed source hidden → revealed on unlock), not the mention-vs-owner predicate.
         seed_meeting(
             db,
             "open1",
-            "## Action items\n- [ ] Anna — draft Atlas spec 2026-07-01\n",
+            "## Action items\n- [ ] Atlas — draft Atlas spec 2026-07-01\n",
             None,
         );
         seed_meeting(
             db,
             "sealedX",
-            "LOCKED Atlas price\n## Action items\n- [ ] Carol — sign 2026-07-09\n",
+            "LOCKED Atlas price\n## Action items\n- [ ] Atlas — sign the deal 2026-07-09\n",
             Some("f-lock"),
         );
         let atlas = db
@@ -2775,10 +2778,12 @@
     fn get_person_dossier_dto_omits_corpus_and_is_camelcase() {
         let state = build_state("person-dossier-dto");
         let db = &state.db;
+        // B4 owner-only: the fixture commitment must be OWNED BY Atlas to appear (and thus serialize)
+        // — this test locks the DTO camelCase/omit-corpus contract, not the mention-vs-owner filter.
         seed_meeting(
             db,
             "m-open",
-            "## Action items\n- [ ] Anna — draft Atlas spec 2026-07-01\n",
+            "## Action items\n- [ ] Atlas — draft Atlas spec 2026-07-01\n",
             None,
         );
         let atlas = db

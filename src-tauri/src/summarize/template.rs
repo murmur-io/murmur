@@ -246,27 +246,38 @@ Formatting rules:
     )
 }
 
+/// Map a `note_language` config code to a human-readable language NAME, single-sourcing the
+/// code→name table used by every prompt that pins an output language. `"pl"` → `Some("Polish")`;
+/// `"auto"` / `""` (whitespace-trimmed, case-insensitive) → `None` (no pin — match the source);
+/// an unknown code passes through as `Some(code)` so a valid but untabled ISO code still names a
+/// concrete target rather than silently falling back to "auto".
+pub fn language_name(note_language: &str) -> Option<String> {
+    let lang = note_language.trim();
+    if lang.is_empty() || lang.eq_ignore_ascii_case("auto") {
+        return None;
+    }
+    let name = match lang {
+        "en" => "English",
+        "pl" => "Polish",
+        "de" => "German",
+        "es" => "Spanish",
+        "fr" => "French",
+        "it" => "Italian",
+        "pt" => "Portuguese",
+        "uk" => "Ukrainian",
+        "nl" => "Dutch",
+        other => other,
+    };
+    Some(name.to_string())
+}
+
 /// An explicit output-language directive appended to the summary system prompt so the WHOLE
 /// note (section headings AND content) comes out in one consistent language. The YAML
 /// front-matter KEYS stay English so Obsidian keeps parsing them.
 pub fn language_directive(note_language: &str) -> String {
-    let lang = note_language.trim();
-    let target = if lang.is_empty() || lang.eq_ignore_ascii_case("auto") {
-        "the SAME language as the meeting transcript below (match the speakers)".to_string()
-    } else {
-        let name = match lang {
-            "en" => "English",
-            "pl" => "Polish",
-            "de" => "German",
-            "es" => "Spanish",
-            "fr" => "French",
-            "it" => "Italian",
-            "pt" => "Portuguese",
-            "uk" => "Ukrainian",
-            "nl" => "Dutch",
-            other => other,
-        };
-        name.to_string()
+    let target = match language_name(note_language) {
+        None => "the SAME language as the meeting transcript below (match the speakers)".to_string(),
+        Some(name) => name,
     };
     format!(
         "OUTPUT LANGUAGE: Write the section headings AND the body content in {target}. \
