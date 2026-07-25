@@ -242,6 +242,30 @@ one-off remarks, or anything not clearly about the USER. Precision over recall �
 worse than a missing one. Empty array if none.\n\
 Output ONLY the JSON.";
 
+/// [`EXTRACT_SYSTEM`] + a LANGUAGE directive pinning the extractor's OUTPUT language, the sibling of
+/// [`crate::facts::extract_system_prompt`]: without it a Polish-dominant note makes the 1.7B reasoner
+/// emit the SAME "me" fact twice (a Polish `rola:` AND an English `role:` twin — two reconcile keys
+/// dedup can't merge). PURE + headless-testable. A pinned `note_language` (`"pl"` → "Polish", via
+/// [`crate::summarize::template::language_name`]) forces every predicate/object into that ONE
+/// language; `"auto"`/`""` pins to "the same language as the note", still ONE consistent language.
+/// Both variants forbid a two-language twin. (The subject is always the English sentinel
+/// [`USER_SUBJECT`] "You" — never emitted by the model — so there is no entity name to protect here.)
+fn user_extract_system_prompt(note_language: &str) -> String {
+    match crate::summarize::template::language_name(note_language) {
+        Some(name) => format!(
+            "{EXTRACT_SYSTEM}\n\
+LANGUAGE: Write EVERY predicate and object in {name}. Use ONE language for all facts. \
+NEVER output the same fact twice in two languages (never emit both a {name} and an English version \
+of one attribute)."
+        ),
+        None => format!(
+            "{EXTRACT_SYSTEM}\n\
+LANGUAGE: Write predicates and objects in the SAME language as the NOTE below; use ONE consistent \
+language for all facts; never emit the same fact in two languages."
+        ),
+    }
+}
+
 /// The stable subject stored on every user fact (the memory is about "you"). A single constant
 /// subject keeps the reconcile key `(USER_SCOPE, subject, predicate)` effectively
 /// `(predicate)`-keyed — so a later note that changes the user's answer to the SAME predicate
@@ -290,6 +314,7 @@ pub fn extract_user_fact_candidates(
     note_markdown: &str,
     typed_notes: &str,
     thread_turns: &str,
+    note_language: &str,
 ) -> Vec<FactCandidate> {
     // No real brain (the default build / no model) → no extraction. The deterministic reconcile +
     // synthesis are still exercised on whatever candidates a real brain would produce.
@@ -315,7 +340,8 @@ pub fn extract_user_fact_candidates(
         "required": ["facts"]
     });
 
-    let value = match reasoner.structured(EXTRACT_SYSTEM, &user, &schema) {
+    let value = match reasoner.structured(&user_extract_system_prompt(note_language), &user, &schema)
+    {
         Ok(v) => v,
         Err(e) => {
             tracing::debug!(target: "user_memory", error = %e, "user-fact extraction failed; no candidates (best-effort)");
@@ -749,6 +775,36 @@ mod tests {
     fn extract_imported_memories_stub_is_empty() {
         let out = extract_imported_memories(&crate::reason::StubReasoner, "remember: I like tea");
         assert!(out.is_empty());
+    }
+
+    /// LEVER A sibling (RED-before-GREEN) — the USER-memory extractor system prompt is
+    /// LANGUAGE-PINNED, the twin of `crate::facts::extract_system_prompt`: without it a Polish note
+    /// duplicated a "me" fact as a PL+EN twin in the dossier/brief. A pinned code names the language
+    /// and forbids a two-language twin; `"auto"` pins to the note's own language, one consistent
+    /// language. RED before `user_extract_system_prompt` existed.
+    #[test]
+    fn user_extract_system_prompt_pins_output_language() {
+        let pl = user_extract_system_prompt("pl");
+        assert!(pl.contains("Polish"), "a pinned code names the language: {pl}");
+        assert!(
+            pl.contains("ONE language for all facts"),
+            "one-language instruction present: {pl}"
+        );
+        assert!(
+            pl.contains("NEVER output the same fact twice in two languages"),
+            "no-duplicate-language instruction present: {pl}"
+        );
+
+        let auto = user_extract_system_prompt("auto");
+        assert!(
+            auto.contains("SAME language as the NOTE"),
+            "auto pins to the note's language: {auto}"
+        );
+        assert!(
+            auto.contains("ONE consistent language"),
+            "auto still forces one consistent language: {auto}"
+        );
+        assert!(user_extract_system_prompt("").contains("SAME language as the NOTE"));
     }
 
     /// candidates_from_raw scopes every candidate to the user + drops empty pairs.
