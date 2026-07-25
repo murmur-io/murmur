@@ -119,7 +119,7 @@ pub fn build_vault_context_hybrid_visible(
     // Brain v2 L1.5 — temporal window (all hybrid legs apply it; query-time `now` anchor).
     let date_filter =
         crate::summarize::temporal::extract_date_filter(query, chrono::Utc::now().date_naive());
-    let mut hits = db.search_hybrid_visible(query, query_vec, 40, unlocked, date_filter)?;
+    let mut hits = db.search_hybrid_visible(query, query_vec, 40, 0.0, unlocked, date_filter)?;
 
     // Brain v2 L1.4 — the RERANKER seam (Ask-only): reorder the TOP-K fused candidates before
     // packing. The reranker sees ONLY already-gated hits (id + title/snippet — content the caller
@@ -194,7 +194,7 @@ pub fn build_meeting_listing_visible(
             .map(|h| h.meeting)
             .collect()
     } else {
-        db.search_hybrid_visible(query, query_vec, limit, unlocked, date_filter)?
+        db.search_hybrid_visible(query, query_vec, limit, 0.0, unlocked, date_filter)?
             .into_iter()
             .map(|h| h.meeting)
             .collect()
@@ -235,7 +235,7 @@ fn pack_doc_chunks(
     let knn = if query_vec.is_empty() {
         Vec::new()
     } else {
-        db.search_doc_chunks_visible(query_vec, 20, unlocked)?
+        db.search_doc_chunks_visible(query_vec, 20, 0.0, unlocked)?
     };
     let fts = db.search_doc_chunks_fts_visible(query, 20, unlocked)?;
     let mut hits = crate::embed::fuse_doc_hits(knn, fts);
