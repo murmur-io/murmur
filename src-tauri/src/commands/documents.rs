@@ -498,3 +498,638 @@ pub(crate) async fn delete_document_inner(state: &AppState, id: &str) -> Result<
     tracing::info!(target: "documents", document_id = %id, "document deleted");
     Ok(())
 }
+
+// ── SMART-NOTE ENGINE (2026-07-25) — turn an ingested document/photo into a readable Obsidian note ──
+//
+// We already extract flat text on-device (`extract::extract_blocks` → `documents.text`), but ingest
+// only ever produced RETRIEVAL text, never a readable note. `generate_note_from_document` takes the
+// EXISTING extracted text of a `documents` row and produces a NEW `kind='note'` documents row → `.md`
+// through the provider seam, in TWO selectable recipe shapes (see `summarize::recipes::NoteRecipe`):
+// SYNTHESIS (`provider.complete()` over one fixed anti-slop template) and STRUCTURE-MIRROR
+// (`provider.complete_json()` into a generic opaque-string schema + a DETERMINISTIC Rust renderer).
+//
+// LOCK-MODEL: the source doc's folder is BOTH the read source and the write target, so ONE gate
+// (`folder_is_unlocked`, refuse `AppError::Locked`) covers both — exactly `import_document`'s posture.
+// The note is birthed seal-aware (SEAL-THEN-INSERT for a session-unlocked LOCKED folder, mirroring
+// `create_note_inner`), then written through the authored-note funnel `update_note_doc_inner`
+// (seal-on-write + gated `.md` export + chunk/wikilink re-index). Any embedded source image is
+// re-materialized under the NEW note's owner through the existing E2EE bundle seam
+// (`materialize_attachment_bundle`, seal-on-birth + verify) — the source's bytes are only READ; its
+// AAD is never weakened. The current/last meeting link is gated (a sealed-latest meeting contributes
+// neither its title nor an edge). §10: no money/arithmetic — the structure schema is opaque strings.
+//
+// EGRESS: the note text goes out through the SAME `provider_for(Role::Notes, …)` factory as every
+// other note — the consent gate + `RedactingProvider` firewall + egress ledger all live inside it,
+// so ONLY REDACTED TEXT egresses. No image bytes are ever sent (there is no multimodal path here).
+
+/// The assembled, ready-to-persist smart note — the output of [`prepare_smart_note`] (the async
+/// egress phase) and the input to [`persist_generated_note`] (the sync, off-thread write phase).
+#[derive(Debug)]
+pub(crate) struct PreparedNote {
+    /// The source document's folder (also the new note's folder — one gate covers read + write).
+    pub folder_id: String,
+    /// The note's display title (drives the `.md` filename + the front-matter `title:`).
+    pub title: String,
+    /// The complete note markdown: `---` front-matter FIRST, then the H1 + recipe body + (when a
+    /// visible last meeting exists) a `[[Title]]` wikilink footer. NO image markers yet — those are
+    /// appended in [`persist_generated_note`] once the attachments are materialized under the new id.
+    pub markdown: String,
+    /// The SOURCE document id (its image attachments, if any, are re-embedded into the note).
+    pub source_document_id: String,
+    /// The VISIBLE current/last meeting id to link the note to, or `None` (no meeting, or the latest
+    /// meeting is sealed-not-unlocked — then neither its title nor an edge surfaces).
+    pub meeting_id: Option<String>,
+}
+
+/// Filesystem/display TITLE for a smart note: the source file's stem (never a full path — no PII in
+/// logs), capped, falling back to a generic label. Deterministic + pure.
+fn smart_note_title(source_name: &str) -> String {
+    let stem = std::path::Path::new(source_name)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("Smart note");
+    stem.chars().take(120).collect()
+}
+
+/// Drop a leading YAML front-matter block a synthesis model may have emitted despite the prompt (the
+/// command prepends its OWN deterministic front-matter — two blocks would be invalid). A body with no
+/// leading `---` is returned trimmed but otherwise unchanged.
+fn strip_leading_front_matter(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.starts_with("---") {
+        let (_yaml, body) = crate::storage::db::split_front_matter(trimmed);
+        let body = body.trim();
+        if !body.is_empty() {
+            return body.to_string();
+        }
+    }
+    trimmed.to_string()
+}
+
+/// Provider dispatch for one recipe → the note BODY markdown (no front-matter). SYNTHESIS runs
+/// `complete()` over the anti-slop template; STRUCTURE-MIRROR runs `complete_json()` into the generic
+/// opaque-string schema, then the DETERMINISTIC Rust renderer. This is the ONLY egress on the path.
+async fn build_smart_note_body(
+    provider: &dyn crate::summarize::provider::SummarizerProvider,
+    recipe: crate::summarize::recipes::NoteRecipe,
+    source_name: &str,
+    text: &str,
+    note_language: &str,
+) -> Result<String, AppError> {
+    use crate::summarize::recipes::{self, NoteRecipe};
+    match recipe {
+        NoteRecipe::Synthesis => {
+            let (system, user) = recipes::build_synthesis_prompt(source_name, text, note_language);
+            let raw = provider.complete(&system, &user).await?;
+            let body = strip_leading_front_matter(&raw);
+            if body.trim().is_empty() {
+                return Err(AppError::Summarize(
+                    "the note model returned an empty synthesis".into(),
+                ));
+            }
+            Ok(body)
+        }
+        NoteRecipe::StructureMirror => {
+            let (system, user) = recipes::build_structure_prompt(source_name, text, note_language);
+            let schema = recipes::structure_mirror_schema();
+            let value = provider.complete_json(&system, &user, &schema).await?;
+            let doc: recipes::StructuredDoc = serde_json::from_value(value).map_err(|e| {
+                AppError::Summarize(format!(
+                    "structure-mirror: invalid JSON shape from provider: {e}"
+                ))
+            })?;
+            Ok(recipes::render_structure_markdown(&doc))
+        }
+    }
+}
+
+/// The async EGRESS phase: gate the source folder, read + clean the extracted text, run the recipe
+/// through the provider, and assemble the complete `---`-first note markdown (front-matter + H1 +
+/// body + a GATED last-meeting wikilink footer). Returns a [`PreparedNote`] for the sync write phase.
+/// Refuses a sealed-not-unlocked folder (`AppError::Locked`) and an empty/unknown source
+/// (`AppError::InvalidArg`) BEFORE any provider call.
+pub(crate) async fn prepare_smart_note(
+    state: &AppState,
+    provider: &dyn crate::summarize::provider::SummarizerProvider,
+    document_id: &str,
+    recipe: crate::summarize::recipes::NoteRecipe,
+    note_language: &str,
+) -> Result<PreparedNote, AppError> {
+    // Read the source row (raw stored text) + resolve its folder.
+    let (folder_id, source_name, stored_text) = state
+        .db
+        .get_document(document_id)?
+        .ok_or_else(|| AppError::InvalidArg(format!("no document {document_id}")))?;
+    // GATE (read + write, one folder): refuse a sealed-and-NOT-session-unlocked folder — the same
+    // posture as `import_document`'s write-gate. A blanked (sealed) source has no text to read either.
+    if !folder_is_unlocked(state, &folder_id)? {
+        return Err(AppError::Locked(
+            "this folder is locked — unlock it to make a note from this document".into(),
+        ));
+    }
+    // Clean display text (strips the PR-2 block-structure markers; md/txt/note rows pass through).
+    let display_text = crate::extract::render_display_text(&stored_text);
+    if display_text.trim().is_empty() {
+        return Err(AppError::InvalidArg(
+            "this document has no extractable text to turn into a note".into(),
+        ));
+    }
+
+    // The current/last meeting — GATED: a sealed-not-unlocked latest meeting contributes neither its
+    // title (leak) nor a link. `meeting_is_unlocked` treats a folderless/open meeting as visible.
+    let last_meeting = state.db.latest_meeting()?;
+    let visible_meeting = match &last_meeting {
+        Some(m) if meeting_is_unlocked(state, &m.id)? => Some(m.clone()),
+        _ => None,
+    };
+
+    // The ONLY egress — redaction firewall applied inside the provider wrapper.
+    let body = build_smart_note_body(provider, recipe, &source_name, &display_text, note_language).await?;
+
+    let title = smart_note_title(&source_name);
+    let date_iso = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let front =
+        crate::summarize::template::smart_note_front_matter(&title, &date_iso, &source_name, recipe.as_str());
+    // `---` front-matter FIRST (the load-bearing Obsidian invariant), then the H1 + body.
+    let mut markdown = format!("{front}\n# {title}\n\n{body}\n");
+    if let Some(meeting_title) = visible_meeting
+        .as_ref()
+        .and_then(|m| m.title.as_deref())
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    {
+        // A `[[wikilink]]` back to the meeting (indexed rename-proof on save); the manual edge is
+        // created in the persist phase. Only ever a VISIBLE meeting's title reaches here.
+        markdown.push_str(&format!("\n---\n\nGenerated from meeting [[{meeting_title}]].\n"));
+    }
+
+    Ok(PreparedNote {
+        folder_id,
+        title,
+        markdown,
+        source_document_id: document_id.to_string(),
+        meeting_id: visible_meeting.map(|m| m.id),
+    })
+}
+
+/// Best-effort: re-embed the SOURCE document's image attachments into the NEW note. Reads the source
+/// bytes READ-ONLY (never mutates/deletes them) and creates a fresh sealed copy under the NEW note's
+/// owner through the existing E2EE bundle seam ([`materialize_attachment_bundle`] — seal-on-birth +
+/// verify), so nothing about the source's AAD is weakened. Only normalized WebP/PNG images (the only
+/// shapes the seam accepts) are carried; the returned markdown gains a canonical
+/// `![](murmur-attachment://<new-id>)` marker per embedded image. No source attachments ⇒ the
+/// markdown is returned unchanged.
+fn embed_source_attachments(
+    state: &AppState,
+    source_document_id: &str,
+    new_note_id: &str,
+    markdown: &str,
+) -> Result<String, AppError> {
+    let src_owner = crate::storage::AttachmentOwner::Document {
+        document_id: source_document_id.to_string(),
+    };
+    let rows = state.db.list_attachments(&src_owner)?;
+    if rows.is_empty() {
+        return Ok(markdown.to_string());
+    }
+    let mut incoming: Vec<crate::storage::IncomingAttachment> = Vec::new();
+    let mut markers = String::new();
+    for row in rows.iter().take(crate::storage::MAX_ATTACHMENTS_PER_OWNER) {
+        // `materialize_attachment_bundle` only accepts a normalized WebP/PNG image; skip anything else.
+        if !matches!(
+            (row.mime_type.as_str(), row.extension.as_str()),
+            ("image/webp", "webp") | ("image/png", "png")
+        ) {
+            continue;
+        }
+        let data = plaintext_attachment_data(state, row)?;
+        let new_att_id = uuid::Uuid::new_v4().to_string();
+        // The canonical marker form parsed by `commands::attachments::parse_attachment_markers`
+        // (`murmur-attachment://<UUIDv4>`) — kept in sync with that module's `ATTACHMENT_URI_PREFIX`.
+        markers.push_str(&format!("\n\n![](murmur-attachment://{new_att_id})"));
+        incoming.push(crate::storage::IncomingAttachment {
+            id: new_att_id,
+            mime_type: row.mime_type.clone(),
+            extension: row.extension.clone(),
+            width: row.width,
+            height: row.height,
+            sha256: row.sha256,
+            data,
+        });
+    }
+    if incoming.is_empty() {
+        return Ok(markdown.to_string());
+    }
+    let new_owner = crate::storage::AttachmentOwner::Document {
+        document_id: new_note_id.to_string(),
+    };
+    materialize_attachment_bundle(state, &new_owner, &incoming)?;
+    Ok(format!("{markdown}{markers}"))
+}
+
+/// The sync WRITE phase (run off the runtime thread behind the heavy permit): birth a seal-aware
+/// `kind='note'` documents row in the source's folder, best-effort re-embed the source's images under
+/// the new note, write the body through the authored-note funnel `update_note_doc_inner` (seal-on-
+/// write + gated `.md` export + chunk/wikilink re-index), and (best-effort, gated) link the note to
+/// the current/last meeting. Returns the new note id. Refuses a sealed-not-unlocked folder.
+pub(crate) fn persist_generated_note(
+    state: &AppState,
+    prepared: &PreparedNote,
+) -> Result<String, AppError> {
+    let id = uuid::Uuid::new_v4().to_string();
+    let now = chrono::Utc::now().timestamp_millis();
+    let name = crate::export::sanitize_title(&prepared.title);
+    // BIRTH — seal-aware empty note in the source's folder (mirrors `create_note_inner`'s F1/W3
+    // SEAL-THEN-INSERT birth-seal: a session-unlocked LOCKED folder gets a verified `text_blob` from
+    // birth so there is never a blob-less plaintext row behind the lock; an open folder plain-inserts).
+    {
+        let _lifecycle = lifecycle_guard(state);
+        // Re-check the gate under the lifecycle guard: a relock racing between `prepare_smart_note`
+        // and here must refuse, never land plaintext at rest behind a lock.
+        if !folder_is_unlocked(state, &prepared.folder_id)? {
+            return Err(AppError::Locked(
+                "this folder is locked — unlock it to add a note".into(),
+            ));
+        }
+        let locked = state
+            .db
+            .folder_by_id(&prepared.folder_id)?
+            .map(|f| f.locked)
+            .unwrap_or(false);
+        if locked {
+            let blob = sealed_document_blob(state, &prepared.folder_id, &id, "")?;
+            state
+                .db
+                .insert_note_sealed(&id, &prepared.folder_id, &name, &prepared.title, "", &blob, now)?;
+        } else {
+            state
+                .db
+                .insert_note(&id, &prepared.folder_id, &name, &prepared.title, "", now)?;
+        }
+        index_wikilinks_best_effort(state, crate::links::LinkKind::Note, &id, "");
+    }
+
+    // ATTACHMENTS (best-effort — a failure keeps the text note, never loses the untouched source).
+    let final_markdown = match embed_source_attachments(state, &prepared.source_document_id, &id, &prepared.markdown) {
+        Ok(md) => md,
+        Err(e) => {
+            tracing::warn!(target: "documents", error = %e, "smart-note: attachment embed skipped (text kept)");
+            prepared.markdown.clone()
+        }
+    };
+
+    // WRITE the body through the authored-note funnel (seal-on-write + gated `.md` export + chunk +
+    // wikilink re-index). Re-gates the folder itself — fail-closed on a mid-flight relock.
+    update_note_doc_inner(state, &id, &prepared.title, &final_markdown)?;
+
+    // LINK note → current/last meeting (best-effort, gated). A locked/absent meeting silently skips.
+    if let Some(meeting_id) = prepared.meeting_id.as_deref() {
+        if let Err(e) = link_items_inner(state, "note", &id, "meeting", meeting_id) {
+            tracing::warn!(target: "documents", error = %e, "smart-note: meeting link skipped");
+        }
+    }
+
+    tracing::info!(
+        target: "documents",
+        note_id = %id,
+        folder_id = %prepared.folder_id,
+        source_document_id = %prepared.source_document_id,
+        "smart note generated from document"
+    );
+    Ok(id)
+}
+
+/// Turn an already-ingested `documents` row into a formatted Obsidian note (`kind='note'` row → `.md`)
+/// through the provider seam, in one of two selectable recipe shapes: `"synthesis"` (flagship
+/// free-form) or `"structure-mirror"` (deterministic form/table transpile). Returns the NEW note id.
+///
+/// LOCK: refuses a sealed-not-unlocked folder (`AppError::Locked`). EGRESS: only redacted text leaves
+/// the device (the redaction firewall lives inside `provider_for`); no image bytes are ever sent.
+#[tauri::command]
+pub async fn generate_note_from_document(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    document_id: String,
+    recipe: String,
+) -> Result<String, AppError> {
+    let recipe = crate::summarize::recipes::NoteRecipe::parse(&recipe).ok_or_else(|| {
+        AppError::InvalidArg(format!(
+            "unknown note recipe {recipe:?} (expected \"synthesis\" or \"structure-mirror\")"
+        ))
+    })?;
+    let config = {
+        state
+            .config
+            .lock()
+            .map_err(|_| AppError::Config("config mutex poisoned".into()))?
+            .clone()
+    };
+    // The provider factory owns the consent gate + redaction firewall + egress ledger.
+    let provider = crate::summarize::provider_for(
+        crate::summarize::roles::Role::Notes,
+        &config,
+        &state.heavy_inference,
+    )?;
+
+    // EGRESS phase (async, on the runtime task) — gate + read + provider + assemble.
+    let prepared =
+        prepare_smart_note(state.inner(), provider.as_ref(), &document_id, recipe, &config.note_language)
+            .await?;
+
+    // WRITE phase off the runtime thread behind the heavy permit (birth-seal + attachment re-seal +
+    // note re-embed are Candle/Metal + crypto work — mirror `update_note_doc`'s H3 offload). A bare
+    // `&AppState` cannot cross into a `'static` closure, so re-fetch it from the `AppHandle` inside.
+    let heavy = state.heavy_inference.clone();
+    let app_for_persist = app.clone();
+    let new_id = crate::perf::run_heavy(&heavy, move || {
+        let state = app_for_persist.state::<AppState>();
+        persist_generated_note(&state, &prepared)
+    })
+    .await?;
+    Ok(new_id)
+}
+
+#[cfg(test)]
+mod smart_note_tests {
+    use super::*;
+    use crate::settings::AppConfig;
+    use crate::storage::models::{Folder, Meeting, MeetingStatus};
+    use crate::storage::Db;
+    use crate::summarize::provider::{Availability, SummarizeRequest, SummarizerProvider};
+    use crate::summarize::recipes::NoteRecipe;
+    use std::collections::HashSet;
+    use std::sync::{Arc, Mutex};
+
+    const DB_KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    fn tmp_db_path(tag: &str) -> std::path::PathBuf {
+        let p = crate::storage::db::unique_temp_path(&format!("murmur-smartnote-{tag}"), "sqlite");
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
+    /// A minimal [`AppState`] backed by a real temp SQLCipher DB (no Keychain, no Tauri, no vault) —
+    /// the same shape `commands/tests` uses. Enough to exercise the gate + note write end-to-end.
+    fn build_state(tag: &str) -> AppState {
+        let db = Arc::new(Db::open_with_key(&tmp_db_path(tag), DB_KEY).unwrap());
+        AppState {
+            recorder: Mutex::new(None),
+            recording_stop: Mutex::new(None),
+            voice_listener: Mutex::new(None),
+            voice_listener_lifecycle: Mutex::new(()),
+            recording_starting: std::sync::atomic::AtomicBool::new(false),
+            voice_command_capture: Mutex::new(None),
+            pending_manual_command: Mutex::new(None),
+            live_running: std::sync::atomic::AtomicBool::new(false),
+            db,
+            config: Arc::new(Mutex::new(AppConfig::default())),
+            reasoner: crate::reason::ReasonerCell::fixed(Arc::new(crate::reason::StubReasoner)),
+            current_meeting: Mutex::new(None),
+            focus_meeting: Mutex::new(None),
+            live_transcript: Mutex::new(String::new()),
+            live_bullets: Mutex::new(String::new()),
+            live_bullets_tracker: Mutex::new(crate::transcribe::bullets::BulletsTracker::default()),
+            capped_notified: std::sync::atomic::AtomicBool::new(false),
+            capture_fault_notified: std::sync::atomic::AtomicBool::new(false),
+            reactions_shadow_count: std::sync::atomic::AtomicU64::new(0),
+            reactions_emitted: Mutex::new(HashSet::new()),
+            in_flight_turns: Mutex::new(std::collections::HashMap::new()),
+            user_turn_in_progress: std::sync::atomic::AtomicBool::new(false),
+            verify_cache: Mutex::new(std::collections::HashMap::new()),
+            unlocked_folders: Arc::new(Mutex::new(HashSet::new())),
+            master_kek: Mutex::new(None),
+            org_ock_cache: Mutex::new(std::collections::HashMap::new()),
+            account_session: Mutex::new(None),
+            lifecycle: Mutex::new(()),
+            active_salvages: Mutex::new(HashSet::new()),
+            share_refresh_lock: tokio::sync::Mutex::new(()),
+            seal_epoch: std::sync::atomic::AtomicU64::new(0),
+            heavy_inference: Arc::new(tokio::sync::Semaphore::new(1)),
+        }
+    }
+
+    fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(f)
+    }
+
+    fn seed_folder(db: &Db, id: &str, locked: bool) {
+        db.insert_folder(&Folder {
+            id: id.to_string(),
+            name: id.to_string(),
+            path: id.to_string(),
+            parent_id: None,
+            locked: false,
+            created_at: "2026-07-25T00:00:00Z".to_string(),
+        })
+        .unwrap();
+        if locked {
+            db.set_folder_locked(id, true, None).unwrap();
+        }
+    }
+
+    fn seed_document(db: &Db, id: &str, folder_id: &str, name: &str, text: &str) {
+        db.insert_document(id, folder_id, name, text, "document", 1_700_000_000_000)
+            .unwrap();
+    }
+
+    /// A stub provider: `complete` returns a fixed SYNTHESIS body; `complete_json_with_meta` returns a
+    /// fixed STRUCTURE-MIRROR payload. No egress, no model — the note plumbing is what's under test.
+    struct StubProvider;
+
+    #[async_trait::async_trait]
+    impl SummarizerProvider for StubProvider {
+        fn id(&self) -> &str {
+            "stub"
+        }
+        async fn availability(&self) -> Availability {
+            Availability::Available
+        }
+        async fn summarize(&self, _req: &SummarizeRequest) -> Result<String, AppError> {
+            Ok(String::new())
+        }
+        async fn complete(&self, _system: &str, _user: &str) -> Result<String, AppError> {
+            Ok("## Summary\nA fixed synthesis body.\n\n## Outline\n- point one\n\n## Action items\n- None"
+                .to_string())
+        }
+        async fn complete_json_with_meta(
+            &self,
+            _system: &str,
+            _user: &str,
+            _schema: &serde_json::Value,
+        ) -> Result<(serde_json::Value, crate::summarize::meta::CallMeta), AppError> {
+            Ok((
+                serde_json::json!({
+                    "fields": [{"key": "Invoice #", "value": "1042"}],
+                    "tables": [{"title": "Line items", "rows": [["Item", "Amount"], ["Widget", "$30.00"]]}],
+                    "sections": []
+                }),
+                crate::summarize::meta::CallMeta::default(),
+            ))
+        }
+    }
+
+    /// SYNTHESIS: a fixed extracted-text fixture becomes a valid, FRONT-MATTER-FIRST `.md` note whose
+    /// body carries the section skeleton, persisted as a `kind='note'` row.
+    #[test]
+    fn synthesis_produces_a_front_matter_first_note() {
+        let state = build_state("synth");
+        seed_folder(&state.db, "f-open", false);
+        seed_document(
+            &state.db,
+            "doc1",
+            "f-open",
+            "whiteboard.png",
+            "Q3 goals: ship v2. Anna owns QA by 2026-08-01.",
+        );
+
+        let prepared = block_on(prepare_smart_note(
+            &state,
+            &StubProvider,
+            "doc1",
+            NoteRecipe::Synthesis,
+            "auto",
+        ))
+        .expect("prepare must succeed for an open folder");
+        assert!(
+            prepared.markdown.starts_with("---\n"),
+            "note must be front-matter-first: {}",
+            prepared.markdown
+        );
+        assert!(prepared.markdown.contains("recipe: synthesis"));
+        assert!(prepared.markdown.contains("## Summary"));
+        assert!(prepared.markdown.contains("## Action items"));
+
+        let id = persist_generated_note(&state, &prepared).expect("persist must succeed");
+        let row = state.db.get_note_row(&id).unwrap().expect("note row exists");
+        assert!(
+            row.text.starts_with("---\n"),
+            "persisted note text must be front-matter-first: {}",
+            row.text
+        );
+        assert!(row.text.contains("## Summary"));
+        // It is a real `kind='note'` row, gate-anchored and folder-anchored to the source folder.
+        let anchor = state.db.note_gate_anchor(&id).unwrap().expect("gate anchor");
+        assert_eq!(anchor.0, "f-open");
+    }
+
+    /// STRUCTURE-MIRROR: the same path renders the opaque-string payload DETERMINISTICALLY into a
+    /// front-matter-first `.md` — a valid table + fields, amounts copied verbatim, NEVER summed (§10).
+    #[test]
+    fn structure_mirror_produces_a_deterministic_front_matter_first_note() {
+        let state = build_state("struct");
+        seed_folder(&state.db, "f-open", false);
+        seed_document(&state.db, "doc1", "f-open", "invoice.pdf", "Invoice 1042. Widget $30.00.");
+
+        let prepared = block_on(prepare_smart_note(
+            &state,
+            &StubProvider,
+            "doc1",
+            NoteRecipe::StructureMirror,
+            "auto",
+        ))
+        .expect("prepare must succeed");
+        assert!(prepared.markdown.starts_with("---\n"), "{}", prepared.markdown);
+        assert!(prepared.markdown.contains("recipe: structure-mirror"));
+        assert!(prepared.markdown.contains("## Details"));
+        assert!(prepared.markdown.contains("| Item | Amount |"));
+        assert!(prepared.markdown.contains("$30.00"));
+        assert!(
+            !prepared.markdown.contains("$60.00"),
+            "structure-mirror must never sum amounts (§10): {}",
+            prepared.markdown
+        );
+
+        let id = persist_generated_note(&state, &prepared).unwrap();
+        let row = state.db.get_note_row(&id).unwrap().expect("note row exists");
+        assert!(row.text.starts_with("---\n"));
+        assert!(row.text.contains("## Details"));
+    }
+
+    /// A visible last meeting is linked (a `[[Title]]` wikilink footer + a manual note→meeting edge).
+    #[test]
+    fn links_the_note_to_the_visible_last_meeting() {
+        let state = build_state("link");
+        seed_folder(&state.db, "f-open", false);
+        seed_document(&state.db, "doc1", "f-open", "notes.txt", "Some plan for the launch.");
+        state
+            .db
+            .insert_meeting(&Meeting {
+                id: "m1".to_string(),
+                started_at: "2026-07-24T09:00:00Z".to_string(),
+                ended_at: None,
+                title: Some("Launch Sync".to_string()),
+                duration_s: 60,
+                audio_path: None,
+                status: MeetingStatus::Summarized,
+                folder_id: None,
+            })
+            .unwrap();
+
+        let prepared = block_on(prepare_smart_note(
+            &state,
+            &StubProvider,
+            "doc1",
+            NoteRecipe::Synthesis,
+            "auto",
+        ))
+        .unwrap();
+        assert_eq!(prepared.meeting_id.as_deref(), Some("m1"));
+        assert!(prepared.markdown.contains("[[Launch Sync]]"));
+
+        let id = persist_generated_note(&state, &prepared).unwrap();
+        let unlocked = HashSet::new();
+        let links = state
+            .db
+            .links_for_visible(crate::links::LinkKind::Note, &id, &unlocked)
+            .unwrap();
+        assert!(
+            links
+                .iter()
+                .any(|e| e.other_kind == "meeting" && e.other_id == "m1"),
+            "the note must carry a link to the last meeting"
+        );
+    }
+
+    /// A sealed-and-NOT-session-unlocked source folder is REFUSED (`AppError::Locked`) BEFORE any
+    /// provider call — never read a sealed doc, never land a note behind the lock. RED before the gate.
+    #[test]
+    fn sealed_folder_is_refused() {
+        let state = build_state("sealed");
+        seed_folder(&state.db, "f-lock", true); // locked, NOT session-unlocked
+        seed_document(&state.db, "doc1", "f-lock", "secret.pdf", "confidential text");
+
+        let err = block_on(prepare_smart_note(
+            &state,
+            &StubProvider,
+            "doc1",
+            NoteRecipe::Synthesis,
+            "auto",
+        ))
+        .expect_err("a sealed folder must be refused");
+        assert!(
+            matches!(err, AppError::Locked(_)),
+            "expected AppError::Locked, got {err:?}"
+        );
+    }
+
+    /// An unknown document id is a clean `InvalidArg` (never a panic / empty note).
+    #[test]
+    fn unknown_document_is_invalid_arg() {
+        let state = build_state("unknown");
+        let err = block_on(prepare_smart_note(
+            &state,
+            &StubProvider,
+            "nope",
+            NoteRecipe::Synthesis,
+            "auto",
+        ))
+        .expect_err("unknown id must error");
+        assert!(matches!(err, AppError::InvalidArg(_)), "got {err:?}");
+    }
+}

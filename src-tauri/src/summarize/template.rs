@@ -312,6 +312,43 @@ pub fn render_user_content(req: &SummarizeRequest) -> String {
     out
 }
 
+// ── SMART-NOTE ENGINE — deterministic front-matter for a generated document note ─────────────────
+
+/// YAML-quote an opaque string value so a `:` / `"` / `#` / newline in a title or source name can
+/// never break the front-matter block. Wraps in double quotes and escapes `\` and `"`; newlines
+/// collapse to spaces (a front-matter scalar is single-line).
+fn yaml_quote(s: &str) -> String {
+    let flat = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let escaped = flat.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{escaped}\"")
+}
+
+/// Build the deterministic YAML front-matter block for a smart note generated from a document — the
+/// first line is exactly `---` (the load-bearing Obsidian invariant the whole app depends on), and
+/// the closing `---` is the last line. The `title`/`source` values are opaque strings, YAML-quoted;
+/// `date` is an ISO `YYYY-MM-DD`; `recipe` is the [`crate::summarize::recipes::NoteRecipe`] token.
+/// Deterministic + pure — no clock, no DB.
+pub fn smart_note_front_matter(
+    title: &str,
+    date_iso: &str,
+    source_name: &str,
+    recipe: &str,
+) -> String {
+    format!(
+        "---\n\
+title: {title}\n\
+date: {date}\n\
+tags: [note, smart-note]\n\
+source: {source}\n\
+recipe: {recipe}\n\
+---\n",
+        title = yaml_quote(title),
+        date = date_iso,
+        source = yaml_quote(source_name),
+        recipe = recipe,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -504,6 +541,27 @@ mod tests {
             s.contains("the transcript below is authoritative"),
             "transcript stays authoritative: {s}"
         );
+    }
+
+    /// SMART-NOTE front-matter is `---`-first, `---`-closed, YAML-safe (a `:` in the title/source
+    /// can't break parsing), and stamps the deterministic keys. The load-bearing invariant: the very
+    /// first line is exactly `---`.
+    #[test]
+    fn smart_note_front_matter_is_dashes_first_and_yaml_safe() {
+        let fm = smart_note_front_matter(
+            "Q3: Planning \"board\"",
+            "2026-07-25",
+            "whiteboard.png",
+            "synthesis",
+        );
+        assert!(fm.starts_with("---\n"), "front-matter must start with ---: {fm}");
+        assert!(fm.trim_end().ends_with("---"), "front-matter must close with ---: {fm}");
+        // The colon + quotes in the title are quoted+escaped, never bare.
+        assert!(fm.contains("title: \"Q3: Planning \\\"board\\\"\""), "{fm}");
+        assert!(fm.contains("date: 2026-07-25"));
+        assert!(fm.contains("tags: [note, smart-note]"));
+        assert!(fm.contains("source: \"whiteboard.png\""));
+        assert!(fm.contains("recipe: synthesis"));
     }
 
     /// TIER 0: the speaker-attribution directive is appended ONLY when `labeled`, and the

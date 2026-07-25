@@ -47,6 +47,7 @@ import type {
   DossierData,
   EntityDetail,
   EntityKnowledgeDiff,
+  NoteRecipe,
   Folder,
   FolderNode,
   FullGraphData,
@@ -1561,6 +1562,27 @@ export class IpcService {
    */
   getDocument(id: string): Promise<string> {
     return invoke<string>("get_document", { id });
+  }
+
+  /**
+   * SMART-NOTE ENGINE — turn an already-ingested document/photo (`documentId`) into a
+   * formatted Obsidian note through the provider seam, in one of two recipe shapes
+   * ({@link NoteRecipe}: `"synthesis"` for whiteboards/screenshots, `"structure-mirror"`
+   * for forms/tables). Resolves with the NEW `kind='note'` document id (open it via the
+   * usual note surfaces). Only REDACTED TEXT egresses (the redaction firewall lives in the
+   * backend provider factory); no image bytes are ever sent. Rejects with `AppError::Locked`
+   * when the document's folder is sealed-and-NOT-session-unlocked, `AppError::Unavailable`
+   * when cloud egress isn't consented, and `AppError::InvalidArg` for an unknown id / a
+   * document with no extractable text — surface each as a friendly message.
+   */
+  generateNoteFromDocument(
+    documentId: string,
+    recipe: NoteRecipe,
+  ): Promise<string> {
+    return invoke<string>("generate_note_from_document", {
+      documentId,
+      recipe,
+    });
   }
 
   /**

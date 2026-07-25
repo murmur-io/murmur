@@ -1095,6 +1095,16 @@ export interface DocumentPreviewTarget {
 }
 
 /**
+ * The two selectable SMART-NOTE recipe shapes for `IpcService.generateNoteFromDocument`
+ * (mirrors the Rust `summarize::recipes::NoteRecipe` tokens):
+ * - `"synthesis"` — the flagship free-form path for a whiteboard photo / screenshot / slide
+ *   deck with no inherent schema (summary → outline → action items).
+ * - `"structure-mirror"` — for forms/tables: a deterministic transpile of the document's
+ *   structure into markdown, every value an opaque string (never summed — §10).
+ */
+export type NoteRecipe = "synthesis" | "structure-mirror";
+
+/**
  * brain2 — headline counts + semantic flags for the Brain page ("what's in my
  * brain"). Mirrors the Rust `BrainOverview` (serde camelCase). Every count is
  * over VISIBLE/unlocked content only (a sealed-not-unlocked folder's items are
