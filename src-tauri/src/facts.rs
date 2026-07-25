@@ -103,9 +103,13 @@ pub(crate) fn norm(s: &str) -> String {
 /// `(entity_id, norm(subject), norm(predicate))` and `valid_to IS NULL`:
 ///   * **no match** → [`FactOp::Add`] (valid_from = recorded_at = `at`, open),
 ///   * **match, SAME object** → [`FactOp::NoOp`],
-///   * **match, DIFFERENT object** → [`FactOp::Invalidate`] the old (valid_to = `at`) **and**
-///     [`FactOp::Add`] the new (valid_from = `at`, open) — the old fact STAYS, closed, so history
-///     is preserved.
+///   * **match, DIFFERENT object, and the open fact's `valid_from` STRICTLY precedes `at`** →
+///     [`FactOp::Invalidate`] the old (valid_to = `at`) **and** [`FactOp::Add`] the new
+///     (valid_from = `at`, open) — the old fact STAYS, closed, so history is preserved,
+///   * **match, DIFFERENT object, but the open fact's `valid_from` is NOT before `at`** (same-instant
+///     re-processing of one meeting — e.g. a PL→EN translation of the same fact on the meeting's
+///     stable `started_at`, or an out-of-order earlier candidate) → [`FactOp::NoOp`]: superseding
+///     here would mint a zero/negative-duration closed row = false bitemporal history.
 ///
 /// Determinism + within-batch safety: a working view of the currently-open object per key is
 /// threaded through the candidate loop, starting from `existing` and updated as ops are emitted, so
@@ -114,15 +118,22 @@ pub(crate) fn norm(s: &str) -> String {
 /// junk). Closed (`valid_to.is_some()`) existing facts are ignored — only open facts are matchable.
 pub fn reconcile_facts(existing: &[Fact], candidates: &[FactCandidate], at: &str) -> Vec<FactOp> {
     use std::collections::HashMap;
-    // key -> (id-of-open-row-if-from-existing, normalized current object). `None` id means the open
-    // fact was created earlier IN THIS BATCH (no row id yet) and so cannot be Invalidated.
-    let mut open: HashMap<(String, String, String), (Option<String>, String)> = HashMap::new();
+    // key -> (id-of-open-row-if-from-existing, normalized current object, its valid_from). `None` id
+    // means the open fact was created earlier IN THIS BATCH (no row id yet) and so cannot be
+    // Invalidated. The valid_from is carried so the DIFFERENT-object arm can refuse a supersession
+    // that would not STRICTLY post-date the open fact (a zero/negative-duration closed row = false
+    // history — e.g. a PL→EN self-flip on the SAME meeting instant).
+    let mut open: HashMap<(String, String, String), (Option<String>, String, String)> =
+        HashMap::new();
     for f in existing {
         if f.valid_to.is_some() {
             continue; // only OPEN facts are matchable.
         }
         let key = (f.entity_id.clone(), norm(&f.subject), norm(&f.predicate));
-        open.insert(key, (Some(f.id.clone()), norm(&f.object)));
+        open.insert(
+            key,
+            (Some(f.id.clone()), norm(&f.object), f.valid_from.clone()),
+        );
     }
 
     // Dedup candidates within THIS batch by key, LAST mention wins: a single note must not assert
@@ -165,15 +176,24 @@ pub fn reconcile_facts(existing: &[Fact], candidates: &[FactCandidate], at: &str
         };
         match open.get(key).cloned() {
             None => ops.push(FactOp::Add(mk_new())),
-            Some((_, prev_obj)) if prev_obj == nobj => ops.push(FactOp::NoOp),
-            Some((maybe_id, _)) => {
-                if let Some(id) = maybe_id {
-                    ops.push(FactOp::Invalidate {
-                        id,
-                        valid_to: at.to_string(),
-                    });
+            Some((_, prev_obj, _)) if prev_obj == nobj => ops.push(FactOp::NoOp),
+            Some((maybe_id, _, existing_vf)) => {
+                // A fact can only be superseded by a LATER one. If the open fact's valid_from is not
+                // STRICTLY before `at` (same-instant re-processing of ONE meeting → a PL→EN self-flip
+                // on the meeting's stable started_at, or an out-of-order earlier candidate), an
+                // Invalidate+Add would mint a zero/negative-duration closed row = false bitemporal
+                // history. Keep the already-open fact (NoOp). Forward-only: stored rows untouched.
+                if cmp_instant(&existing_vf, at) == std::cmp::Ordering::Less {
+                    if let Some(id) = maybe_id {
+                        ops.push(FactOp::Invalidate {
+                            id,
+                            valid_to: at.to_string(),
+                        });
+                    }
+                    ops.push(FactOp::Add(mk_new()));
+                } else {
+                    ops.push(FactOp::NoOp);
                 }
-                ops.push(FactOp::Add(mk_new()));
             }
         }
     }
@@ -518,6 +538,32 @@ note, as entity·predicate·object triples. Output STRICT JSON ONLY (no prose, n
 - Only durable state worth tracking across meetings — not one-off remarks. Empty array if none.\n\
 Output ONLY the JSON.";
 
+/// [`EXTRACT_SYSTEM`] + a LANGUAGE directive that pins the extractor's OUTPUT language so a
+/// Polish-dominant note can never emit the SAME fact twice (a Polish `rola:` AND an English `role:`
+/// twin — two different reconcile keys that dedup can't merge). PURE + headless-testable.
+///
+/// A pinned `note_language` (e.g. `"pl"` → "Polish", via [`crate::summarize::template::language_name`])
+/// forces every predicate/object into that ONE language; `"auto"`/`""` instead pins to "the same
+/// language as the note", still ONE consistent language. Both variants forbid a two-language twin and
+/// PROTECT the entity name (kept verbatim so the case-insensitive entity match in
+/// [`candidates_from_triples`] still resolves).
+fn extract_system_prompt(note_language: &str) -> String {
+    match crate::summarize::template::language_name(note_language) {
+        Some(name) => format!(
+            "{EXTRACT_SYSTEM}\n\
+LANGUAGE: Write EVERY predicate and object in {name}. Use ONE language for all facts. \
+NEVER output the same fact twice in two languages (never emit both a {name} and an English version \
+of one attribute). Keep the ENTITY name EXACTLY as listed — do not translate it."
+        ),
+        None => format!(
+            "{EXTRACT_SYSTEM}\n\
+LANGUAGE: Write predicates and objects in the SAME language as the NOTE below; use ONE consistent \
+language for all facts; never emit the same fact in two languages. Keep the ENTITY name EXACTLY as \
+listed — do not translate it."
+        ),
+    }
+}
+
 /// Maximum note chars fed to the extractor (bounds the prompt / leak surface, like graph.rs).
 const EXTRACT_EXCERPT_CHARS: usize = 8000;
 
@@ -531,6 +577,7 @@ pub fn extract_fact_candidates(
     title: &str,
     note_markdown: &str,
     entities: &[(String, String)],
+    note_language: &str,
     opts: GenOptions,
 ) -> Vec<FactCandidate> {
     if entities.is_empty() {
@@ -567,7 +614,8 @@ pub fn extract_fact_candidates(
         "required": ["facts"]
     });
 
-    let value = match reasoner.structured_with(EXTRACT_SYSTEM, &user, &schema, opts) {
+    let value = match reasoner.structured_with(&extract_system_prompt(note_language), &user, &schema, opts)
+    {
         Ok(v) => v,
         Err(e) => {
             tracing::debug!(target: "facts", error = %e, "fact extraction failed; no candidates (best-effort)");
@@ -717,6 +765,94 @@ mod tests {
                 .any(|o| matches!(o, FactOp::Add(nf) if nf.object == "in-progress")),
             "the superseded object must not be re-added"
         );
+    }
+
+    /// LEVER A (RED-before-GREEN) — the extractor system prompt is LANGUAGE-PINNED. A pinned code
+    /// (`"pl"`) names the concrete language AND forbids a two-language twin; `"auto"` pins to the
+    /// note's own language, still one consistent language. This is the only lever that can stop the
+    /// within-note PL+EN twin ("rola:"/"role:"), since a language-insensitive reconcile key is
+    /// infeasible without translation/embeddings. RED before `extract_system_prompt` existed.
+    #[test]
+    fn extract_system_prompt_pins_output_language() {
+        let pl = extract_system_prompt("pl");
+        assert!(pl.contains("Polish"), "a pinned code names the language: {pl}");
+        assert!(
+            pl.contains("ONE language for all facts"),
+            "one-language instruction present: {pl}"
+        );
+        assert!(
+            pl.contains("NEVER output the same fact twice in two languages"),
+            "no-duplicate-language instruction present: {pl}"
+        );
+        // The entity name must be protected so candidates_from_triples still resolves it.
+        assert!(
+            pl.contains("Keep the ENTITY name EXACTLY"),
+            "entity-name protection present: {pl}"
+        );
+
+        let auto = extract_system_prompt("auto");
+        assert!(
+            auto.contains("SAME language as the NOTE"),
+            "auto pins to the note's language: {auto}"
+        );
+        assert!(
+            auto.contains("ONE consistent language"),
+            "auto still forces one consistent language: {auto}"
+        );
+        // Empty string behaves like "auto" (no pin).
+        assert!(extract_system_prompt("").contains("SAME language as the NOTE"));
+    }
+
+    /// LEVER B (RED-before-GREEN, core of symptom 2) — same-day SELF-supersession guard. An OPEN
+    /// existing fact whose `valid_from` EQUALS `at` (the meeting's stable started_at, re-extracted on
+    /// multiple funnels) reconciled against a DIFFERENT-language object at the SAME `at` must NOT
+    /// close the open row: an Invalidate+Add there mints `valid_from == valid_to == at`, a
+    /// zero-duration closed fact = false bitemporal history (the observed "deadline: was '…'
+    /// (2026-07-22 -> 2026-07-22)" WHAT-CHANGED row). The guard keeps the open fact (NoOp). RED on
+    /// the pre-guard code (it emitted Invalidate + Add).
+    #[test]
+    fn reconcile_does_not_self_supersede_at_the_same_instant() {
+        let at = "2026-07-22T09:00:00Z";
+        let existing = vec![dated_fact(
+            "f1",
+            "Klaudia",
+            "deadline",
+            "skończyć projekt w tym tygodniu",
+            at,
+            None,
+            "m1",
+        )];
+        let ops = reconcile_facts(
+            &existing,
+            &[cand("atlas", "Klaudia", "deadline", "finish project this week")],
+            at,
+        );
+        assert_eq!(
+            ops,
+            vec![FactOp::NoOp],
+            "a same-instant object flip must not mint a zero-duration closed row"
+        );
+    }
+
+    /// LEVER B — the guard must ALSO block a supersession whose open fact's valid_from is AFTER `at`
+    /// (an out-of-order earlier candidate) — that would be a NEGATIVE-duration closed row.
+    #[test]
+    fn reconcile_does_not_supersede_when_open_fact_postdates_at() {
+        let existing = vec![dated_fact(
+            "f1",
+            "Klaudia",
+            "deadline",
+            "later value",
+            "2026-07-25T00:00:00Z", // AFTER `at`
+            None,
+            "m1",
+        )];
+        let ops = reconcile_facts(
+            &existing,
+            &[cand("atlas", "Klaudia", "deadline", "earlier value")],
+            "2026-07-22T09:00:00Z",
+        );
+        assert_eq!(ops, vec![FactOp::NoOp], "a negative-duration close is refused");
     }
 
     /// WITHIN-BATCH dedup (RED-before-GREEN for the data-quality fix): a single note that asserts two
