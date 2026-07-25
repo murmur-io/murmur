@@ -51,8 +51,9 @@ pub struct DossierData {
     pub entity: GraphEntity,
     /// Visible meetings mentioning this entity (newest first), as `[[Title]]` citation chips.
     pub meetings: Vec<VaultSource>,
-    /// Open commitments tied to this entity: an OPEN item from one of the entity's visible
-    /// mentioning meetings, OR an OPEN item whose owner matches the entity name.
+    /// Open commitments OWNED BY this entity: an OPEN item whose owner name-matches the entity
+    /// (case-insensitive). B4 fix — owner-only, so a co-participant's commitment from a shared
+    /// mentioning meeting is never falsely attributed here.
     pub commitments: Vec<Commitment>,
     /// Top co-occurring neighbour entities (shared visible meetings).
     pub neighbors: Vec<EntityNeighbor>,
@@ -136,21 +137,22 @@ pub fn build_dossier_data(
     // here: a sealed-not-unlocked meeting's facts (its source meeting) never surface.
     let facts = db.list_facts_visible(entity_id, unlocked)?;
 
-    // The visible meetings that mention this entity, as an id set for the commitment filter.
-    let mention_ids: HashSet<&str> = meetings.iter().map(|m| m.meeting_id.as_str()).collect();
     let name_lc = entity.name.trim().to_lowercase();
     // `list_open_commitments` is itself double-gated (list_meetings_visible + get_note_if_visible),
-    // so every candidate already comes from a visible meeting. Keep an item iff it belongs to one
-    // of this entity's mentioning meetings OR is owned by this entity (name match, case-insensitive).
+    // so every candidate already comes from a visible meeting. Keep an item iff it is OWNED BY this
+    // entity (name match, case-insensitive). B4 fix (2026-07-25): the former "belongs to one of this
+    // entity's mentioning meetings OR owned" predicate FALSELY attributed a co-participant's
+    // commitment to the entity merely because it shared a mentioning meeting (e.g. "Jakub — fix your
+    // branch" surfacing under Klaudia). Owner-only never widens what is shown; the visibility gate is
+    // unchanged. This predicate MUST stay identical to `Db::list_people`'s `open_commitment_count`.
     let commitments: Vec<Commitment> = db
         .list_open_commitments(unlocked, None)?
         .into_iter()
         .filter(|c| {
-            mention_ids.contains(c.meeting_id.as_str())
-                || c.owner
-                    .as_deref()
-                    .map(|o| o.trim().to_lowercase() == name_lc)
-                    .unwrap_or(false)
+            c.owner
+                .as_deref()
+                .map(|o| o.trim().to_lowercase() == name_lc)
+                .unwrap_or(false)
         })
         .collect();
 
@@ -389,14 +391,17 @@ mod tests {
 
     /// build_dossier_data assembles the entity's VISIBLE mentioning meetings (with [[Title]] cites
     /// in the corpus), its open commitments, and its neighbours — and EXCLUDES a sealed-not-unlocked
-    /// mentioning meeting, which reappears once the folder is session-unlocked. The owner/entity
-    /// commitment filter works.
+    /// mentioning meeting, which reappears once the folder is session-unlocked. B4 fix: the
+    /// commitment filter is OWNER-ONLY — an item owned by a co-participant (Anna) in one of the
+    /// entity's mentioning meetings is NOT attributed to the entity (Atlas); only an item Atlas OWNS
+    /// surfaces.
     #[test]
     fn build_dossier_gates_sealed_and_filters_commitments() {
         let db = temp_db();
         // Atlas (the dossier subject) + Anna co-occur in an OPEN meeting; Atlas is also mentioned
         // in a SEALED meeting. A commitment owned by "Atlas" lives in a third (open) meeting that
-        // does NOT mention Atlas as an entity — caught only by the owner filter.
+        // does NOT mention Atlas as an entity — caught only by the owner filter. Anna's item in
+        // open1 shares Atlas's mentioning meeting but is OWNED BY Anna → excluded under owner-only.
         seed_meeting(
             &db,
             "open1",
@@ -405,11 +410,13 @@ mod tests {
             None,
         );
         seed_folder(&db, "f-lock");
+        // The sealed meeting holds a commitment OWNED BY Atlas — gated out while sealed, and it
+        // must reappear (owner match) once the folder is session-unlocked.
         seed_meeting(
             &db,
             "sealedX",
             "Secret Atlas Review",
-            "LOCKED Atlas acquisition price\n## Action items\n- [ ] Carol — sign 2026-07-09\n",
+            "LOCKED Atlas acquisition price\n## Action items\n- [ ] Atlas — sign the deal 2026-07-09\n",
             Some("f-lock"),
         );
         seed_meeting(
@@ -451,17 +458,22 @@ mod tests {
             "sealed note body leaked into the dossier corpus (gate violation)"
         );
 
-        // Commitment filter: 'draft Atlas spec' is in a mentioning meeting (open1);
-        // 'own the rollout' is owner==Atlas (owner filter). Carol's sealed item is excluded.
-        assert!(data
-            .commitments
-            .iter()
-            .any(|c| c.text.contains("draft Atlas spec")));
+        // Commitment filter (OWNER-ONLY, B4): 'own the rollout' is owner==Atlas → included.
+        // 'draft Atlas spec' is owned by Anna (a co-participant) though it lives in Atlas's
+        // mentioning meeting → EXCLUDED (mention-only no longer attributes). The sealed 'sign the
+        // deal' item (owner==Atlas) is gated out while sealed, and reappears on unlock (below).
         assert!(
             data.commitments
                 .iter()
                 .any(|c| c.text.contains("own the rollout")),
             "owner==entity-name commitment must be included"
+        );
+        assert!(
+            data.commitments
+                .iter()
+                .all(|c| !c.text.contains("draft Atlas spec")),
+            "a co-participant's (Anna's) commitment from a shared mentioning meeting must NOT be \
+             attributed to Atlas (owner-only, B4)"
         );
         assert!(
             data.commitments.iter().all(|c| !c.text.contains("sign")),
@@ -486,7 +498,65 @@ mod tests {
             data2.corpus.contains("LOCKED Atlas acquisition"),
             "unlocked content must reappear"
         );
-        assert!(data2.commitments.iter().any(|c| c.text.contains("sign")));
+        // The sealed meeting's Atlas-OWNED commitment reappears on unlock (owner match survives).
+        assert!(
+            data2.commitments.iter().any(|c| c.text.contains("sign the deal")),
+            "the unlocked Atlas-owned commitment must reappear"
+        );
+    }
+
+    /// B4 (2026-07-25) RED-before-GREEN: the dossier's OPEN COMMITMENTS must attribute an item ONLY
+    /// to its OWNER, never to a co-participant merely because the item shares one of the entity's
+    /// mentioning meetings. Live QA repro: `get_entity_dossier("Klaudia")` listed "Jakub — fix your
+    /// branch…" under Klaudia merely because the meeting mentions Klaudia. This test FAILS on the
+    /// old `mention_ids.contains(...) || owner==name` predicate and PASSES on owner-only.
+    #[test]
+    fn dossier_open_commitments_are_owner_only_not_mention_attributed() {
+        let db = temp_db();
+        // ONE meeting mentions Klaudia; its open commitment is OWNED BY Jakub. Klaudia also owns a
+        // commitment of her own in a second mentioning meeting.
+        seed_meeting(
+            &db,
+            "m-standup",
+            "Standup",
+            "## Action items\n- [ ] Jakub — fix your branch 2026-07-30\n",
+            None,
+        );
+        seed_meeting(
+            &db,
+            "m-review",
+            "Review",
+            "## Action items\n- [ ] Klaudia — send the design doc 2026-07-31\n",
+            None,
+        );
+        let klaudia = db
+            .upsert_entity("Klaudia", crate::storage::models::EntityKind::Person)
+            .unwrap();
+        // Klaudia is MENTIONED in BOTH meetings (co-participant in the standup).
+        db.add_mention(&klaudia, "m-standup").unwrap();
+        db.add_mention(&klaudia, "m-review").unwrap();
+
+        let nothing = HashSet::new();
+        let data = build_dossier_data(&db, &klaudia, &nothing).unwrap().unwrap();
+
+        assert!(
+            data.commitments
+                .iter()
+                .all(|c| !c.text.contains("fix your branch")),
+            "Jakub's commitment must NOT be attributed to Klaudia just because it shares her \
+             mentioning meeting (B4 mis-attribution)"
+        );
+        assert!(
+            data.commitments
+                .iter()
+                .any(|c| c.text.contains("send the design doc")),
+            "Klaudia's own (owner-matched) commitment must still appear"
+        );
+
+        // Belt-and-suspenders: the rendered OPEN COMMITMENTS section leaks neither the foreign item.
+        let rendered = render_structured(&data);
+        assert!(!rendered.contains("fix your branch"));
+        assert!(rendered.contains("send the design doc"));
     }
 
     /// brain2 R2 — the dossier surfaces the entity's CURRENT FACTS (open) + WHAT CHANGED (closed),
