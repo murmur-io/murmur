@@ -103,13 +103,15 @@ pub fn detect_reactions(
     unlocked: &HashSet<String>,
     entities: &[(String, String)],
     window: &str,
+    note_language: &str,
     at: &str,
 ) -> Vec<WhisperCard> {
     if entities.is_empty() || window.trim().is_empty() {
         return Vec::new();
     }
-    // Stage 1 — light LLM extraction of the window into candidates (capped decode).
-    let candidates = extract_fact_candidates_capped(reasoner, window, entities);
+    // Stage 1 — light LLM extraction of the window into candidates (capped decode). The extractor is
+    // language-pinned like the persisted path (facts.rs) so a Polish window can't emit a PL+EN twin.
+    let candidates = extract_fact_candidates_capped(reasoner, window, entities, note_language);
     if candidates.is_empty() {
         return Vec::new();
     }
@@ -136,6 +138,7 @@ fn extract_fact_candidates_capped(
     reasoner: &dyn LocalReasoner,
     window: &str,
     entities: &[(String, String)],
+    note_language: &str,
 ) -> Vec<FactCandidate> {
     // The title is unused for a live window; pass a short marker. The cap rides GenOptions through the
     // extractor's structured_with call (see facts.rs).
@@ -144,6 +147,7 @@ fn extract_fact_candidates_capped(
         "live",
         window,
         entities,
+        note_language,
         GenOptions::light_extraction(),
     )
 }
@@ -218,8 +222,12 @@ pub fn reactions_scan(
         tracing::debug!(target: "reactions", "user turn in flight; deferring scan");
         return empty;
     }
-    let (brain_live, emit) = match st.config.lock() {
-        Ok(c) => (c.brain_live, c.brain_contradiction_cards),
+    let (brain_live, emit, note_language) = match st.config.lock() {
+        Ok(c) => (
+            c.brain_live,
+            c.brain_contradiction_cards,
+            c.note_language.clone(),
+        ),
         Err(_) => return empty,
     };
     if !brain_live {
@@ -255,7 +263,15 @@ pub fn reactions_scan(
         };
     }
     let entities = filter_window_entities(entities, &window);
-    let cards = detect_reactions(&*reasoner, &st.db, &unlocked, &entities, &window, now);
+    let cards = detect_reactions(
+        &*reasoner,
+        &st.db,
+        &unlocked,
+        &entities,
+        &window,
+        &note_language,
+        now,
+    );
     // SESSION dedup (deep-review): a contradiction surfaces at most ONCE per recording — else the same
     // card re-emits every ~21 s scan and (in shadow mode) re-inflates the calibration count. Keyed on
     // (entity | predicate | old-value); `HashSet::insert` returns true only for a NOT-yet-seen key.
