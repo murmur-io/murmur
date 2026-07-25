@@ -137,6 +137,46 @@
   color: var(--text-secondary);
 }
 
+/* "Make a note from this" footer — a compact action row under the content well. */
+.dp-makenote {
+  flex: none;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2) var(--space-3);
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--border-subtle);
+}
+
+.dp-makenote-label {
+  color: var(--text-secondary);
+  font-size: 0.8125rem;
+}
+
+.dp-makenote-actions {
+  display: flex;
+  gap: var(--space-2);
+}
+
+.dp-makenote-busy,
+.dp-makenote-done {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--text-secondary);
+  font-size: 0.8125rem;
+}
+
+.dp-makenote-done {
+  color: var(--accent);
+}
+
+.dp-makenote-error {
+  flex-basis: 100%;
+  color: var(--live);
+  font-size: 0.8125rem;
+}
+
 @keyframes dp-fade {
   from {
     opacity: 0;
