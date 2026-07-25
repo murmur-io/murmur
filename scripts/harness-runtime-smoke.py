@@ -104,7 +104,14 @@ def emit(verdict: str, reason: str, log_path: Path | None, started_at: str) -> i
         "log_path": str(log_path) if log_path else None,
     }
     print(json.dumps(payload, sort_keys=True))
-    return 0 if verdict == "PASS" else 2
+    # Dedicated exit codes so the harness distinguishes an ENVIRONMENTAL block (a stray dev
+    # server owning an exclusive port — not this change's fault) from a genuine boot FAILURE.
+    # The harness honors code 3 as BLOCKED only for this runner-owned canonical probe.
+    if verdict == "PASS":
+        return 0
+    if verdict == "BLOCKED":
+        return 3
+    return 1
 
 
 def main() -> int:
