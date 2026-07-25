@@ -10782,3 +10782,56 @@ fn clear_meeting_audio_path_if_only_nulls_a_matching_path() {
     db.clear_meeting_audio_path_if("M", "/d/M.wav").unwrap();
     assert_eq!(db.get_meeting("M").unwrap().unwrap().audio_path, None);
 }
+
+/// note_templates round-trip: insert → list returns the row with its `sections` (ordered) and
+/// `extra_frontmatter_keys` intact through the JSON TEXT columns; REPLACE by id overwrites; delete
+/// removes. CONTENT-FREE metadata (mirrors saved_recipes) — no visibility gate.
+#[test]
+fn note_templates_round_trip() {
+    use crate::storage::models::{NoteTemplate, NoteTemplateSection};
+    let db = mem_db();
+    assert!(db.list_note_templates().unwrap().is_empty());
+
+    let t = NoteTemplate {
+        id: "tpl-1".to_string(),
+        name: "Client call".to_string(),
+        tone: "Warm, outcome-first".to_string(),
+        sections: vec![
+            NoteTemplateSection {
+                heading: "Outcome".to_string(),
+                instruction: "What we agreed.".to_string(),
+            },
+            NoteTemplateSection {
+                heading: "Next steps".to_string(),
+                instruction: "Owner — action.".to_string(),
+            },
+        ],
+        extra_frontmatter_keys: vec!["client".to_string(), "project".to_string()],
+        created_at: "2026-07-25T00:00:00Z".to_string(),
+    };
+    db.insert_note_template(&t).unwrap();
+
+    let got = db.list_note_templates().unwrap();
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].name, "Client call");
+    assert_eq!(got[0].sections.len(), 2);
+    assert_eq!(got[0].sections[0].heading, "Outcome");
+    assert_eq!(got[0].sections[1].heading, "Next steps");
+    assert_eq!(
+        got[0].extra_frontmatter_keys,
+        vec!["client".to_string(), "project".to_string()]
+    );
+
+    // REPLACE by id (INSERT OR REPLACE): same id, new content.
+    let mut t2 = t.clone();
+    t2.name = "Renamed".to_string();
+    t2.sections.truncate(1);
+    db.insert_note_template(&t2).unwrap();
+    let got = db.list_note_templates().unwrap();
+    assert_eq!(got.len(), 1, "replace, not append");
+    assert_eq!(got[0].name, "Renamed");
+    assert_eq!(got[0].sections.len(), 1);
+
+    db.delete_note_template("tpl-1").unwrap();
+    assert!(db.list_note_templates().unwrap().is_empty());
+}
