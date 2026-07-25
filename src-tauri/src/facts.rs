@@ -118,13 +118,17 @@ pub(crate) fn norm(s: &str) -> String {
 /// junk). Closed (`valid_to.is_some()`) existing facts are ignored — only open facts are matchable.
 pub fn reconcile_facts(existing: &[Fact], candidates: &[FactCandidate], at: &str) -> Vec<FactOp> {
     use std::collections::HashMap;
+    // (entity_id, norm(subject), norm(predicate)) — the identity key used throughout reconciliation.
+    type FactKey = (String, String, String);
+    // (open-row id if from an existing row, normalized object, valid_from) — an open fact's working
+    // state; factored into a `type` so the `open` map stays under clippy::type_complexity.
+    type OpenFactState = (Option<String>, String, String);
     // key -> (id-of-open-row-if-from-existing, normalized current object, its valid_from). `None` id
     // means the open fact was created earlier IN THIS BATCH (no row id yet) and so cannot be
     // Invalidated. The valid_from is carried so the DIFFERENT-object arm can refuse a supersession
     // that would not STRICTLY post-date the open fact (a zero/negative-duration closed row = false
     // history — e.g. a PL→EN self-flip on the SAME meeting instant).
-    let mut open: HashMap<(String, String, String), (Option<String>, String, String)> =
-        HashMap::new();
+    let mut open: HashMap<FactKey, OpenFactState> = HashMap::new();
     for f in existing {
         if f.valid_to.is_some() {
             continue; // only OPEN facts are matchable.
@@ -140,8 +144,8 @@ pub fn reconcile_facts(existing: &[Fact], candidates: &[FactCandidate], at: &str
     // two conflicting "current" values for the same (entity, subject, predicate) — without this, two
     // same-key candidates each emitted an Add and produced two simultaneously-open ("current") facts.
     // First-seen key order is preserved so the op output stays deterministic.
-    let mut last_by_key: HashMap<(String, String, String), &FactCandidate> = HashMap::new();
-    let mut order: Vec<(String, String, String)> = Vec::new();
+    let mut last_by_key: HashMap<FactKey, &FactCandidate> = HashMap::new();
+    let mut order: Vec<FactKey> = Vec::new();
     for c in candidates {
         let entity_id = c.entity_id.trim();
         let subject = c.subject.trim();
