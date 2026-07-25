@@ -193,12 +193,18 @@ pub(crate) fn add_note_attachment_inner(
     gate_attachment_owner(state, &owner)?;
     let data = decode_base64(data_base64)?;
     let image = validate_image(mime_type, &data)?;
-    if image.mime_type != "image/webp" {
-        return Err(AppError::InvalidArg(
-            "new images must be locally normalized to metadata-free WebP".into(),
-        ));
+    // WebKit's <canvas> cannot ENCODE WebP (`toBlob("image/webp")` silently yields PNG), so the FE
+    // falls back to a metadata-free PNG. Accept both, running the metadata rejector that matches the
+    // container. JPEG and any other source container are never produced by the local normalizer.
+    match image.mime_type {
+        "image/webp" => reject_webp_metadata(&data)?,
+        "image/png" => reject_png_metadata(&data)?,
+        _ => {
+            return Err(AppError::InvalidArg(
+                "new images must be locally normalized to metadata-free WebP or PNG".into(),
+            ))
+        }
     }
-    reject_webp_metadata(&data)?;
     let id = uuid::Uuid::new_v4().to_string();
     let hash: [u8; 32] = Sha256::digest(&data).into();
     let created_at = chrono::Utc::now().timestamp_millis();
@@ -352,9 +358,14 @@ pub fn validate_incoming_attachment_bundle(
     let mut seen = HashSet::new();
     let mut total = 0usize;
     for item in incoming {
-        if item.mime_type != "image/webp" || item.extension != "webp" {
+        // A shared note may carry either a normalized WebP or the metadata-free PNG fallback that
+        // WebKit clients now produce; both must materialize on the recipient.
+        if !matches!(
+            (item.mime_type.as_str(), item.extension.as_str()),
+            ("image/webp", "webp") | ("image/png", "png")
+        ) {
             return Err(AppError::InvalidArg(
-                "attachments must be normalized WebP images".into(),
+                "attachments must be normalized WebP or PNG images".into(),
             ));
         }
         let parsed = uuid::Uuid::parse_str(&item.id)
@@ -368,7 +379,15 @@ pub fn validate_incoming_attachment_bundle(
             ));
         }
         let image = validate_image(&item.mime_type, &item.data)?;
-        reject_webp_metadata(&item.data)?;
+        match image.mime_type {
+            "image/webp" => reject_webp_metadata(&item.data)?,
+            "image/png" => reject_png_metadata(&item.data)?,
+            _ => {
+                return Err(AppError::InvalidArg(
+                    "attachments must be normalized WebP or PNG images".into(),
+                ))
+            }
+        }
         if image.extension != item.extension
             || image.width != item.width
             || image.height != item.height
@@ -1446,6 +1465,72 @@ fn reject_webp_metadata(data: &[u8]) -> Result<(), AppError> {
     Ok(())
 }
 
+/// Enforce that a PNG the FE claims is metadata-free actually is. Walk the chunk stream with checked
+/// arithmetic, require the canonical `IHDR`-first / `IEND`-last framing, reject any trailing bytes,
+/// and fail closed if any privacy-bearing ancillary chunk is present. `sRGB` (WebKit's own encoder
+/// emits it) and other rendering-intent chunks are benign and allowed. No PII is placed in errors.
+fn reject_png_metadata(data: &[u8]) -> Result<(), AppError> {
+    const SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+    if data.len() < SIGNATURE.len() || &data[..SIGNATURE.len()] != SIGNATURE {
+        return Err(AppError::InvalidArg("malformed PNG".into()));
+    }
+    let mut offset = SIGNATURE.len();
+    let mut first = true;
+    let mut saw_iend = false;
+    while offset < data.len() {
+        if offset + 8 > data.len() {
+            return Err(AppError::InvalidArg("malformed PNG chunks".into()));
+        }
+        let len = u32::from_be_bytes([
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
+        ]) as usize;
+        let tag = &data[offset + 4..offset + 8];
+        if first {
+            if tag != b"IHDR" {
+                return Err(AppError::InvalidArg("PNG must begin with IHDR".into()));
+            }
+            first = false;
+        }
+        // eXIf/tEXt/zTXt/iTXt carry arbitrary embedded text, iCCP an ICC profile, tIME a timestamp —
+        // all can re-introduce the private metadata the local normalizer exists to strip.
+        if matches!(
+            tag,
+            b"eXIf" | b"tEXt" | b"zTXt" | b"iTXt" | b"iCCP" | b"tIME"
+        ) {
+            return Err(AppError::InvalidArg(
+                "PNG metadata chunks are not allowed".into(),
+            ));
+        }
+        let is_iend = tag == b"IEND";
+        // Advance past length(4) + type(4) + data(len) + crc(4).
+        let advance = len
+            .checked_add(12)
+            .ok_or_else(|| AppError::InvalidArg("malformed PNG chunks".into()))?;
+        offset = offset
+            .checked_add(advance)
+            .ok_or_else(|| AppError::InvalidArg("malformed PNG chunks".into()))?;
+        if offset > data.len() {
+            return Err(AppError::InvalidArg("malformed PNG chunks".into()));
+        }
+        if is_iend {
+            saw_iend = true;
+            break;
+        }
+    }
+    if !saw_iend {
+        return Err(AppError::InvalidArg("PNG is missing its IEND chunk".into()));
+    }
+    if offset != data.len() {
+        return Err(AppError::InvalidArg(
+            "trailing bytes after PNG IEND".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn decode_base64(input: &str) -> Result<Vec<u8>, AppError> {
     if input.len() > MAX_BASE64_INPUT {
         return Err(AppError::InvalidArg(
@@ -1553,6 +1638,92 @@ mod tests {
         b.extend_from_slice(&height.to_be_bytes());
         b.extend_from_slice(&[8, 6, 0, 0, 0, 0, 0, 0, 0]);
         b
+    }
+
+    fn png_crc32(bytes: &[u8]) -> u32 {
+        let mut crc = 0xFFFF_FFFFu32;
+        for &byte in bytes {
+            crc ^= u32::from(byte);
+            for _ in 0..8 {
+                crc = if crc & 1 != 0 {
+                    (crc >> 1) ^ 0xEDB8_8320
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        crc ^ 0xFFFF_FFFF
+    }
+
+    fn png_chunk(kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(12 + data.len());
+        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        out.extend_from_slice(kind);
+        out.extend_from_slice(data);
+        let mut crc_input = Vec::with_capacity(4 + data.len());
+        crc_input.extend_from_slice(kind);
+        crc_input.extend_from_slice(data);
+        out.extend_from_slice(&png_crc32(&crc_input).to_be_bytes());
+        out
+    }
+
+    /// A canvas-style PNG (`IHDR sRGB IDAT IEND`) with an optional extra ancillary chunk inserted
+    /// after `sRGB`, mirroring what WebKit's own encoder emits.
+    fn png_document(extra: Option<(&[u8; 4], &[u8])>) -> Vec<u8> {
+        let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(&8u32.to_be_bytes());
+        ihdr.extend_from_slice(&8u32.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
+        out.extend_from_slice(&png_chunk(b"IHDR", &ihdr));
+        out.extend_from_slice(&png_chunk(b"sRGB", &[0]));
+        if let Some((kind, data)) = extra {
+            out.extend_from_slice(&png_chunk(kind, data));
+        }
+        out.extend_from_slice(&png_chunk(b"IDAT", &[0x78, 0x9c, 0x63, 0x00, 0x01]));
+        out.extend_from_slice(&png_chunk(b"IEND", &[]));
+        out
+    }
+
+    #[test]
+    fn reject_png_metadata_allows_clean_srgb_png() {
+        assert!(reject_png_metadata(&png_document(None)).is_ok());
+        // A bare `IHDR IDAT IEND` PNG (no rendering-intent chunk) is equally clean.
+        let mut bare = b"\x89PNG\r\n\x1a\n".to_vec();
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(&2u32.to_be_bytes());
+        ihdr.extend_from_slice(&2u32.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
+        bare.extend_from_slice(&png_chunk(b"IHDR", &ihdr));
+        bare.extend_from_slice(&png_chunk(b"IDAT", &[0x78, 0x9c, 0x63, 0x00, 0x01]));
+        bare.extend_from_slice(&png_chunk(b"IEND", &[]));
+        assert!(reject_png_metadata(&bare).is_ok());
+    }
+
+    #[test]
+    fn reject_png_metadata_rejects_privacy_bearing_chunks() {
+        for kind in [b"eXIf", b"tEXt", b"zTXt", b"iTXt", b"iCCP", b"tIME"] {
+            let bytes = png_document(Some((kind, b"payload")));
+            assert!(
+                matches!(reject_png_metadata(&bytes), Err(AppError::InvalidArg(_))),
+                "chunk {:?} must be rejected",
+                std::str::from_utf8(kind).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn reject_png_metadata_rejects_bad_framing_and_trailing_bytes() {
+        assert!(reject_png_metadata(b"not a png at all").is_err());
+        // Trailing bytes after IEND are refused.
+        let mut trailing = png_document(None);
+        trailing.extend_from_slice(b"junk");
+        assert!(reject_png_metadata(&trailing).is_err());
+        // A declared length that overruns the buffer is refused via checked arithmetic.
+        let mut overrun = b"\x89PNG\r\n\x1a\n".to_vec();
+        overrun.extend_from_slice(&0xffff_ffffu32.to_be_bytes());
+        overrun.extend_from_slice(b"IHDR");
+        assert!(reject_png_metadata(&overrun).is_err());
     }
 
     #[test]

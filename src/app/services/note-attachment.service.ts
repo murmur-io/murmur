@@ -19,6 +19,74 @@ const INPUT_IMAGE_TYPES = new Set([
 ]);
 const ATTACHMENT_REF_RE =
   /murmur-attachment:\/\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/gi;
+const PNG_SIGNATURE = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a] as const;
+// Ancillary chunks that can carry embedded text / profiles / timestamps — the private metadata the
+// local normalizer exists to strip. WebKit's own `canvas.toBlob("image/png")` emits `eXIf`, so it
+// MUST be dropped before upload; `sRGB` (and other rendering-intent chunks) are benign and kept.
+const PNG_METADATA_CHUNKS = new Set(["eXIf", "tEXt", "zTXt", "iTXt", "iCCP", "tIME"]);
+
+/**
+ * Remove privacy-bearing ancillary chunks from a PNG byte stream, preserving chunk order and every
+ * structural/rendering chunk verbatim (each PNG chunk carries its own CRC, so dropping an ancillary
+ * chunk needs no re-CRC). If the input is not a well-formed PNG it is returned unchanged and the
+ * backend validator fails closed. Exported for direct unit testing.
+ */
+export function stripPngMetadata(
+  bytes: Uint8Array<ArrayBuffer>,
+): Uint8Array<ArrayBuffer> {
+  // Signature (8) + at least one 12-byte chunk header/footer must be present.
+  if (bytes.length < PNG_SIGNATURE.length + 12) {
+    return bytes;
+  }
+  for (let i = 0; i < PNG_SIGNATURE.length; i += 1) {
+    if (bytes[i] !== PNG_SIGNATURE[i]) {
+      return bytes;
+    }
+  }
+  const kept: Uint8Array<ArrayBuffer>[] = [bytes.subarray(0, PNG_SIGNATURE.length)];
+  let offset: number = PNG_SIGNATURE.length;
+  let sawIend = false;
+  while (offset + 8 <= bytes.length) {
+    const length =
+      ((bytes[offset] << 24) >>> 0) +
+      (bytes[offset + 1] << 16) +
+      (bytes[offset + 2] << 8) +
+      bytes[offset + 3];
+    const type = String.fromCharCode(
+      bytes[offset + 4],
+      bytes[offset + 5],
+      bytes[offset + 6],
+      bytes[offset + 7],
+    );
+    const end = offset + 12 + length;
+    if (end > bytes.length) {
+      // Malformed length overruns the buffer — leave the bytes untouched; the backend rejects them.
+      return bytes;
+    }
+    if (!PNG_METADATA_CHUNKS.has(type)) {
+      kept.push(bytes.subarray(offset, end));
+    }
+    offset = end;
+    if (type === "IEND") {
+      sawIend = true;
+      break;
+    }
+  }
+  if (!sawIend) {
+    return bytes;
+  }
+  let total = 0;
+  for (const part of kept) {
+    total += part.length;
+  }
+  const out = new Uint8Array(total);
+  let cursor = 0;
+  for (const part of kept) {
+    out.set(part, cursor);
+    cursor += part.length;
+  }
+  return out;
+}
 
 interface ImageDimensions {
   width: number;
@@ -284,9 +352,10 @@ export function referencedNoteAttachments(
 
 /**
  * Local-only image preparation and attachment IPC. Every accepted input is
- * decoded into a canvas and encoded as a NEW WebP before it crosses IPC. This
- * strips source metadata and guarantees the backend never receives the original
- * PNG/JPEG container. No remote URL is fetched by this service.
+ * decoded into a canvas and re-encoded before it crosses IPC — as WebP where the
+ * engine can encode it, otherwise as a metadata-free PNG (WebKit's <canvas>
+ * cannot encode WebP). Either way the backend never receives the original
+ * container or its metadata. No remote URL is fetched by this service.
  */
 @Injectable({ providedIn: "root" })
 export class NoteAttachmentService {
@@ -369,19 +438,23 @@ export class NoteAttachmentService {
     return { markdown: chunks.join("\n\n"), images };
   }
 
-  /** Decode → scale → WebP encode locally, then persist through the typed IPC seam. */
+  /** Decode → scale → WebP-or-PNG encode locally, then persist through the typed IPC seam. */
   async importImage(
     ownerKind: NoteAttachmentOwnerKind,
     ownerId: string,
     image: LocalImageCandidate,
   ): Promise<NoteAttachmentDto> {
-    const normalized = await this.normalizeToWebp(image.blob);
+    const normalized = await this.normalizeForUpload(image.blob);
     const dataBase64 = await this.base64Url(normalized.blob);
+    // The declared MIME must match the bytes (the backend re-detects and rejects a mismatch), and
+    // the neutral filename keeps person/project names out of Markdown/shareable metadata.
+    const fileName =
+      normalized.mime === "image/png" ? "note-image.png" : "note-image.webp";
     return this.ipc.addNoteAttachment(
       ownerKind,
       ownerId,
-      "note-image.webp",
-      "image/webp",
+      fileName,
+      normalized.mime,
       dataBase64,
     );
   }
@@ -598,9 +671,9 @@ export class NoteAttachmentService {
     }
   }
 
-  private async normalizeToWebp(
+  private async normalizeForUpload(
     sourceBlob: Blob,
-  ): Promise<{ blob: Blob; width: number; height: number }> {
+  ): Promise<{ blob: Blob; mime: "image/webp" | "image/png"; width: number; height: number }> {
     const mimeType = sourceBlob.type.toLowerCase();
     if (!INPUT_IMAGE_TYPES.has(mimeType)) {
       throw new Error("Choose a PNG, JPEG, or WebP image.");
@@ -640,6 +713,7 @@ export class NoteAttachmentService {
       let width = Math.max(1, Math.round(decoded.width * initialScale));
       let height = Math.max(1, Math.round(decoded.height * initialScale));
       const qualities = [0.86, 0.74, 0.62, 0.5, 0.4];
+      let producedAnyBlob = false;
 
       for (let resizeAttempt = 0; resizeAttempt < 7; resizeAttempt += 1) {
         const canvas = document.createElement("canvas");
@@ -650,12 +724,42 @@ export class NoteAttachmentService {
           throw new Error("Image processing is unavailable in this window.");
         }
         context.drawImage(decoded.source, 0, 0, width, height);
+
+        // Prefer WebP when the engine can genuinely encode it (Chromium today, WebKit later).
+        // WebKit's `toBlob("image/webp")` silently returns a PNG-typed blob, so gate on the actual
+        // returned type — never trust the requested MIME.
         for (const quality of qualities) {
-          const output = await this.canvasWebp(canvas, quality);
+          const output = await this.encodeCanvas(canvas, "image/webp", quality);
+          if (!output) {
+            break;
+          }
+          producedAnyBlob = true;
+          if (output.type.toLowerCase() !== "image/webp") {
+            // This engine cannot encode WebP (WebKit yields a PNG-typed blob). Lowering the quality
+            // will not change that, so stop probing WebP and take the PNG fallback below.
+            break;
+          }
           if (output.size <= MAX_OUTPUT_BYTES) {
-            return { blob: output, width, height };
+            return { blob: output, mime: "image/webp", width, height };
           }
         }
+
+        // WebP unavailable → fall back to a metadata-free PNG (lossless, alpha-safe). Strip the
+        // metadata chunks WebKit's own encoder emits so the backend's reject_png_metadata accepts it.
+        const png = await this.encodeCanvas(canvas, "image/png");
+        if (png) {
+          producedAnyBlob = true;
+          const stripped = stripPngMetadata(new Uint8Array(await png.arrayBuffer()));
+          if (stripped.length <= MAX_OUTPUT_BYTES) {
+            return {
+              blob: new Blob([stripped], { type: "image/png" }),
+              mime: "image/png",
+              width,
+              height,
+            };
+          }
+        }
+
         // One shared scale preserves panoramas/portraits; each axis bottoms at
         // one pixel instead of independently clamping and distorting the image.
         const nextWidth = Math.max(1, Math.floor(width * 0.78));
@@ -665,6 +769,11 @@ export class NoteAttachmentService {
         }
         width = nextWidth;
         height = nextHeight;
+      }
+      if (!producedAnyBlob) {
+        throw new Error(
+          "This browser can’t encode images for upload. Update macOS and try again.",
+        );
       }
       throw new Error("That image is too detailed to fit the 3 MB note-image limit.");
     } finally {
@@ -721,16 +830,15 @@ export class NoteAttachmentService {
     });
   }
 
-  private async canvasWebp(canvas: HTMLCanvasElement, quality: number): Promise<Blob> {
-    const blob = await new Promise<Blob | null>((resolve) => {
-      canvas.toBlob(resolve, "image/webp", quality);
+  /** Encode a canvas to a blob of the requested type, resolving null when the engine cannot. */
+  private encodeCanvas(
+    canvas: HTMLCanvasElement,
+    type: "image/webp" | "image/png",
+    quality?: number,
+  ): Promise<Blob | null> {
+    return new Promise<Blob | null>((resolve) => {
+      canvas.toBlob((blob) => resolve(blob), type, quality);
     });
-    if (!blob || blob.type.toLowerCase() !== "image/webp") {
-      throw new Error(
-        "This WebView cannot safely encode WebP images. Update macOS and try again.",
-      );
-    }
-    return blob;
   }
 
   private async base64Url(blob: Blob): Promise<string> {

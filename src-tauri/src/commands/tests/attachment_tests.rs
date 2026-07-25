@@ -87,6 +87,51 @@ fn webp(width: u32, height: u32) -> Vec<u8> {
     bytes
 }
 
+fn png_crc32(bytes: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &byte in bytes {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    crc ^ 0xFFFF_FFFF
+}
+
+fn png_chunk(kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(12 + data.len());
+    out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    out.extend_from_slice(kind);
+    out.extend_from_slice(data);
+    let mut crc_input = Vec::with_capacity(4 + data.len());
+    crc_input.extend_from_slice(kind);
+    crc_input.extend_from_slice(data);
+    out.extend_from_slice(&png_crc32(&crc_input).to_be_bytes());
+    out
+}
+
+/// A canvas-style PNG (`IHDR sRGB IDAT IEND`), optionally carrying one extra ancillary chunk after
+/// `sRGB` — exactly the shape WebKit's `canvas.toBlob("image/png")` produces (it emits `eXIf`).
+fn png_image(width: u32, height: u32, extra: Option<(&[u8; 4], &[u8])>) -> Vec<u8> {
+    let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
+    let mut ihdr = Vec::new();
+    ihdr.extend_from_slice(&width.to_be_bytes());
+    ihdr.extend_from_slice(&height.to_be_bytes());
+    ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
+    out.extend_from_slice(&png_chunk(b"IHDR", &ihdr));
+    out.extend_from_slice(&png_chunk(b"sRGB", &[0]));
+    if let Some((kind, data)) = extra {
+        out.extend_from_slice(&png_chunk(kind, data));
+    }
+    out.extend_from_slice(&png_chunk(b"IDAT", &[0x78, 0x9c, 0x63, 0x00, 0x01]));
+    out.extend_from_slice(&png_chunk(b"IEND", &[]));
+    out
+}
+
 fn base64url(data: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let mut out = String::new();
@@ -129,6 +174,31 @@ fn add_webp(state: &AppState, owner_kind: &str, owner_id: &str, bytes: &[u8]) ->
         &base64url(bytes),
     )
     .expect("add normalized WebP")
+}
+
+fn add_png(state: &AppState, owner_kind: &str, owner_id: &str, bytes: &[u8]) -> AttachmentDto {
+    add_note_attachment_inner(
+        state,
+        owner_kind,
+        owner_id,
+        "clipboard.png",
+        "image/png",
+        &base64url(bytes),
+    )
+    .expect("add normalized PNG")
+}
+
+fn incoming_png(bytes: &[u8], width: u32, height: u32) -> crate::storage::IncomingAttachment {
+    use sha2::{Digest, Sha256};
+    crate::storage::IncomingAttachment {
+        id: uuid::Uuid::new_v4().to_string(),
+        mime_type: "image/png".into(),
+        extension: "png".into(),
+        width,
+        height,
+        sha256: Sha256::digest(bytes).into(),
+        data: bytes.to_vec(),
+    }
 }
 
 fn meeting_folder(db: &Db, id: &str) {
@@ -902,4 +972,142 @@ fn org_feed_attachment_bundle_remaps_and_authoritatively_replaces_local_replica(
         .list_attachments(&owner)
         .expect("empty org images")
         .is_empty());
+}
+
+#[test]
+fn add_note_attachment_accepts_metadata_free_png_and_rejects_exif() {
+    let state = build_state("png-upload", None);
+    let folder = create_note_folder_inner(&state, "PNG", None).expect("folder");
+    let note_id = create_note_inner(&state, Some(&folder.id), "PNG").expect("note");
+
+    // The WebKit fallback path: a clean, metadata-free PNG must round-trip through the gated add.
+    let clean = png_image(48, 32, None);
+    let dto = add_png(&state, "note", &note_id, &clean);
+    assert_eq!(dto.mime_type, "image/png");
+    assert_eq!(dto.extension, "png");
+    assert_eq!((dto.width, dto.height), (48, 32));
+
+    // WebP still works alongside the new PNG path.
+    add_webp(&state, "note", &note_id, &webp(40, 30));
+
+    // A PNG that still carries an eXIf chunk (the exact chunk WebKit emits before the FE strips it)
+    // is rejected: the strip is enforced by the backend, not merely assumed.
+    let with_exif = png_image(48, 32, Some((b"eXIf", b"\x00\x01\x02")));
+    assert!(matches!(
+        add_note_attachment_inner(
+            &state,
+            "note",
+            &note_id,
+            "clipboard.png",
+            "image/png",
+            &base64url(&with_exif),
+        ),
+        Err(AppError::InvalidArg(_))
+    ));
+}
+
+#[test]
+fn locked_folder_png_attachment_seals_and_round_trips_byte_identical() {
+    let vault = temp_vault("png-seal");
+    let state = build_state("png-seal", Some(&vault));
+    let folder = create_note_folder_inner(&state, "Private PNG", None).expect("folder");
+    let note_id = create_note_inner(&state, Some(&folder.id), "Screens").expect("note");
+    let bytes = png_image(64, 40, None);
+    add_png(&state, "note", &note_id, &bytes);
+    let owner = AttachmentOwner::Document {
+        document_id: note_id.clone(),
+    };
+
+    lock_folder_inner(&state, folder.id.clone()).expect("lock folder");
+    let sealed = &state.db.list_attachments(&owner).expect("sealed row")[0];
+    assert!(sealed.data.is_empty(), "plaintext blanked after verified seal");
+    assert!(sealed.data_blob.is_some(), "recoverable seal retained");
+
+    let ck = cache_kek_and_folder_ck(&state, &folder.id);
+    unseal_attachments_in_folder(&state, &folder.id, &ck, false).expect("session restore");
+    assert_eq!(
+        state.db.list_attachments(&owner).expect("restored row")[0].data,
+        bytes,
+        "PNG seal decrypts byte-identical to the original plaintext"
+    );
+    let _ = std::fs::remove_dir_all(vault);
+}
+
+#[test]
+fn share_ingest_accepts_clean_png_and_rejects_metadata_png() {
+    let clean = incoming_png(&png_image(96, 64, None), 96, 64);
+    validate_incoming_attachment_bundle(std::slice::from_ref(&clean))
+        .expect("a clean PNG share bundle materializes on the recipient");
+
+    let with_exif = incoming_png(&png_image(96, 64, Some((b"eXIf", b"payload"))), 96, 64);
+    assert!(matches!(
+        validate_incoming_attachment_bundle(std::slice::from_ref(&with_exif)),
+        Err(AppError::InvalidArg(_))
+    ));
+
+    // A WebP bundle still validates unchanged.
+    let webp_bytes = webp(96, 64);
+    let webp_item = crate::storage::IncomingAttachment {
+        id: uuid::Uuid::new_v4().to_string(),
+        mime_type: "image/webp".into(),
+        extension: "webp".into(),
+        width: 96,
+        height: 64,
+        sha256: {
+            use sha2::{Digest, Sha256};
+            Sha256::digest(&webp_bytes).into()
+        },
+        data: webp_bytes,
+    };
+    validate_incoming_attachment_bundle(std::slice::from_ref(&webp_item))
+        .expect("WebP share bundle still validates");
+}
+
+/// RED→GREEN for the org / Murmur↔Murmur E2EE share-ingest ENTRYPOINT (not the inner validator the
+/// other test exercises). WebKit clients now share metadata-free PNGs; `prepare_incoming_attachment_bundle`
+/// used to hard-reject non-WebP and hardcode `extension: "webp"`, so accepting a shared note that
+/// carried a PNG image failed (`ingest_shared_note` → `?`). This asserts the real entrypoint now
+/// remaps + validates a clean PNG bundle end-to-end, deriving the correct extension.
+#[test]
+fn org_share_ingest_entrypoint_accepts_clean_png_bundle() {
+    use sha2::{Digest, Sha256};
+
+    let wire_id = uuid::Uuid::new_v4().to_string();
+    let bytes = png_image(96, 64, None);
+    let markdown = format!("before ![shot](murmur-attachment://{wire_id}) after");
+    let wire = murmur_protocol::envelope::ShareAttachment {
+        id: wire_id.clone(),
+        mime_type: "image/png".into(),
+        width: 96,
+        height: 64,
+        sha256: Sha256::digest(&bytes).to_vec(),
+        data: bytes.clone(),
+    };
+    let (local_markdown, incoming) =
+        crate::commands::org_commands::prepare_incoming_attachment_bundle(&markdown, &[wire])
+            .expect("a PNG share bundle must materialize through the real ingest entrypoint");
+    assert_eq!(incoming.len(), 1);
+    assert_eq!(incoming[0].mime_type, "image/png");
+    assert_eq!(incoming[0].extension, "png");
+    assert_eq!(incoming[0].data, bytes);
+    assert_ne!(incoming[0].id, wire_id);
+    assert!(local_markdown.contains(&incoming[0].id));
+
+    // A PNG that still carries an eXIf chunk is rejected by the entrypoint (metadata rejector runs
+    // inside prepare's validate_incoming_attachment_bundle), not merely by the inner validator.
+    let exif_id = uuid::Uuid::new_v4().to_string();
+    let exif_bytes = png_image(96, 64, Some((b"eXIf", b"payload")));
+    let exif_md = format!("![x](murmur-attachment://{exif_id})");
+    let exif_wire = murmur_protocol::envelope::ShareAttachment {
+        id: exif_id,
+        mime_type: "image/png".into(),
+        width: 96,
+        height: 64,
+        sha256: Sha256::digest(&exif_bytes).to_vec(),
+        data: exif_bytes,
+    };
+    assert!(matches!(
+        crate::commands::org_commands::prepare_incoming_attachment_bundle(&exif_md, &[exif_wire]),
+        Err(AppError::InvalidArg(_))
+    ));
 }
