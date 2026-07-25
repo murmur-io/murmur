@@ -253,25 +253,42 @@ def validate_proxy_context(tool):
     return real
 
 
+def laned_child_env(base_env, proxy_dir, real_cargo, real_rustc):
+    """Environment for the REAL tool a proxy execs under the resource lane.
+
+    This top-level proxy call enters the kernel flock via agent-resource-run; from that
+    point the ENTIRE build subtree must resolve the REAL toolchain directly and NEVER
+    re-enter a proxy. A build.rs / proc-macro / tauri CLI that spawns `cargo`/`rustc` by
+    BARE NAME would otherwise hit the proxy again and deadlock on the non-reentrant flock
+    this very call already holds. So remove the private proxy dir from the child PATH and
+    pin CARGO+RUSTC to the resolved real tools — the outer lane already covers the subtree.
+    The forgeable LANE_ACTIVE marker is never trusted as authority and is dropped.
+    """
+
+    env = dict(base_env)
+    env.pop(LANE_ACTIVE_ENV, None)
+    if proxy_dir:
+        proxy_abs = Path(proxy_dir).absolute()
+        env["PATH"] = os.pathsep.join(
+            entry
+            for entry in env.get("PATH", "").split(os.pathsep)
+            if entry and Path(entry).absolute() != proxy_abs
+        )
+    env["CARGO"] = str(real_cargo)
+    env["RUSTC"] = str(real_rustc)
+    return env
+
+
 def proxy_main(tool, argv):
     try:
         real = validate_proxy_context(tool)
+        real_cargo = validate_proxy_context("cargo")
         real_rustc = validate_proxy_context("rustc")
     except RuntimeError as error:
         print("agent-dev-run {} proxy: {}".format(tool, error), file=sys.stderr)
         return SUPERVISOR_EXIT
 
-    env = os.environ.copy()
-    # A repository child can forge any environment marker it inherits or creates.
-    # Therefore the proxy never treats LANE_ACTIVE_ENV as authority. Every direct
-    # proxy call reacquires the kernel flock. Cargo alone receives the resolved real
-    # rustc path before entering the lane, avoiding only its own non-reentrant
-    # compiler recursion.
-    env.pop(LANE_ACTIVE_ENV, None)
-    if tool == "cargo":
-        # Cargo now owns the lane, so its compiler must not recursively acquire
-        # the same non-reentrant flock. Explicit RUSTC also covers rustup shims.
-        env["RUSTC"] = str(real_rustc)
+    env = laned_child_env(os.environ, os.environ.get(PROXY_DIR_ENV), real_cargo, real_rustc)
     resource_runner = Path(__file__).resolve().parent / "agent-resource-run"
     if not resource_runner.is_file() or not os.access(resource_runner, os.X_OK):
         print("agent-dev-run {} proxy: resource runner is unavailable".format(tool), file=sys.stderr)
@@ -283,10 +300,43 @@ def proxy_main(tool, argv):
     )
 
 
+def selftest():
+    """Regress the proxy re-entry deadlock fix: a laned build's child subtree must resolve
+    the REAL toolchain (proxy stripped from PATH, CARGO+RUSTC pinned), so a bare `cargo`/
+    `rustc` from a build.rs never re-enters the proxy and self-deadlocks on the flock."""
+
+    failures = []
+    proxy_dir = "/private/tmp/murmur-dev-proxy-selftest"
+    base = {
+        "PATH": os.pathsep.join([proxy_dir, "/usr/bin", "/bin"]),
+        LANE_ACTIVE_ENV: "1",
+        "KEEP": "value",
+    }
+    env = laned_child_env(base, proxy_dir, "/real/cargo", "/real/rustc")
+    if proxy_dir in env.get("PATH", "").split(os.pathsep):
+        failures.append("proxy dir was not stripped from the laned child PATH")
+    if "/usr/bin" not in env.get("PATH", "").split(os.pathsep):
+        failures.append("laned child PATH lost its real toolchain entries")
+    if env.get("CARGO") != "/real/cargo" or env.get("RUSTC") != "/real/rustc":
+        failures.append("laned child CARGO/RUSTC were not pinned to the real tools")
+    if LANE_ACTIVE_ENV in env:
+        failures.append("the forgeable lane marker was not dropped from the child env")
+    if env.get("KEEP") != "value":
+        failures.append("laned child env dropped an unrelated inherited variable")
+    for message in failures:
+        print("agent-dev-run selftest FAIL: {}".format(message), file=sys.stderr)
+    if failures:
+        return 1
+    print("agent-dev-run selftest: OK")
+    return 0
+
+
 def main(argv):
     invoked_as = Path(sys.argv[0]).name
     if invoked_as in {"cargo", "rustc"}:
         return proxy_main(invoked_as, argv)
+    if argv[:1] == ["selftest"]:
+        return selftest()
 
     args = parse_args(argv)
     invocation_dir = Path.cwd().resolve()
