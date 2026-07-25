@@ -1004,43 +1004,69 @@ fn list_people_excludes_sealed_person_and_counts_visible_only() {
 
 /// The People card's `open_commitment_count` badge MUST agree with the count backing the same
 /// person's dossier "who owes what" section one click away
-/// (`summarize::dossier::build_dossier_data`), which counts an open item as this person's iff
-/// it's from one of their mentioning meetings OR owner-name-matches — NOT owner-name-match
-/// alone. RED-before-GREEN: a narrower owner-only bucket undercounts a person mentioned in a
-/// meeting with an open, unowned action item, so the card badge (0) disagrees with the dossier
-/// (1) for the exact same person.
+/// (`summarize::dossier::build_dossier_data`). B4 fix (2026-07-25): the shared predicate is now
+/// OWNER-ONLY — an open item is this person's iff its owner name-matches. This asserts, via BOTH
+/// `list_people`'s badge AND `build_dossier_data`'s commitments, that badge == dossier count for
+/// two cases: (a) a person who OWNS an open commitment → 1 in both (they AGREE); (b) a person
+/// merely MENTIONED in a meeting whose open commitment is owned by SOMEONE ELSE → 0 in both (they
+/// AGREE). The badge==dossier invariant is the point; only the predicate (now owner-only) changed.
 #[test]
-fn list_people_open_commitment_count_matches_dossier_mention_or_owner_filter() {
+fn list_people_open_commitment_count_matches_dossier_owner_filter() {
     let db = file_db("people-dossier-parity");
+    // ONE meeting mentions BOTH people; its single open commitment is OWNED BY Priya. Sam is a
+    // co-participant (mentioned) but owns nothing — under owner-only, Sam's item from this shared
+    // meeting must NOT be attributed to Sam.
     seed_note(
         &db,
         "m1",
-        "## Action items\n- [ ] Follow up on pricing 2026-08-01\n",
+        "## Action items\n- [ ] Priya — ship the pricing page 2026-08-01\n",
         None,
     );
     let priya = db.upsert_entity("Priya", EntityKind::Person).unwrap();
+    let sam = db.upsert_entity("Sam", EntityKind::Person).unwrap();
     db.add_mention(&priya, "m1").unwrap();
+    db.add_mention(&sam, "m1").unwrap();
 
     let empty: HashSet<String> = HashSet::new();
     let cards = db.list_people(&empty).unwrap().people;
+
+    // (a) Priya OWNS the commitment → badge 1, dossier 1, they agree.
     let priya_card = cards
         .iter()
         .find(|p| p.id == priya)
         .expect("Priya is visible via her mention");
     assert_eq!(
         priya_card.open_commitment_count, 1,
-        "the card badge must count the open, unowned action item from Priya's mentioned \
-             meeting, same as the dossier's 'who owes what' section"
+        "the card badge must count the open commitment OWNED BY Priya"
     );
-
-    let dossier = crate::summarize::dossier::build_dossier_data(&db, &priya, &empty)
+    let priya_dossier = crate::summarize::dossier::build_dossier_data(&db, &priya, &empty)
         .unwrap()
         .expect("Priya has a visible dossier");
     assert_eq!(
-        dossier.commitments.len() as i64,
+        priya_dossier.commitments.len() as i64,
         priya_card.open_commitment_count,
         "the People card badge and the dossier 'who owes what' count must never disagree \
-             for the same person"
+             for the owning person"
+    );
+
+    // (b) Sam is only MENTIONED; the commitment is owned by someone else → badge 0, dossier 0.
+    let sam_card = cards
+        .iter()
+        .find(|p| p.id == sam)
+        .expect("Sam is visible via his mention");
+    assert_eq!(
+        sam_card.open_commitment_count, 0,
+        "a co-participant's commitment from a shared mentioning meeting must NOT be attributed \
+             to Sam — owner-only"
+    );
+    let sam_dossier = crate::summarize::dossier::build_dossier_data(&db, &sam, &empty)
+        .unwrap()
+        .expect("Sam has a visible dossier");
+    assert_eq!(
+        sam_dossier.commitments.len() as i64,
+        sam_card.open_commitment_count,
+        "the People card badge and the dossier 'who owes what' count must never disagree \
+             for the merely-mentioned person"
     );
 }
 
