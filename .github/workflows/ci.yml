@@ -2,14 +2,20 @@ name: CI
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Murmur PR gate. `scripts/ci.sh` is the SINGLE SOURCE OF TRUTH for what "green"
-# means; this workflow only WRAPS it on a macOS runner (swiftc / whisper.cpp Metal /
+# means; this workflow only WRAPS it on macOS runners (swiftc / whisper.cpp Metal /
 # ScreenCaptureKit are macOS-only, so Linux runners cannot mirror the gate).
 #
 # RELEASE PARITY (2026-07-05): every PR runs the COMPLETE ci.sh — the exact gate
 # the release preflight (/release-murmur) requires — including the headless audio
-# E2E. The whisper model (~142 MB) is cached between runs and ffmpeg is a one-line
-# brew install, so parity costs little after the first run. `MURMUR_CI_SKIP_E2E=1`
-# remains a LOCAL iteration convenience only — CI never sets it.
+# E2E. As of 2026-07-25 the gate is split into TWO PARALLEL macOS lanes so wall-
+# clock is max(lanes), not the sum:
+#   • rust  — `bash scripts/ci.sh rust`  (control plane, swiftc, clippy/test/build,
+#             supply-chain, audio E2E via cargo-run examples). No Node.
+#   • web   — `bash scripts/ci.sh web`   (ng lint + ng build + Playwright UI E2E).
+#             No Rust / murmur-server.
+# The `gate (full ci.sh — release parity)` aggregation job below is the REQUIRED
+# status check: it fails unless BOTH lanes pass. `ci.sh` with no arg still runs
+# `full` (= rust ∪ web), so `bash scripts/ci.sh` locally is unchanged.
 #
 # Node comes from `.nvmrc` (24.18.0) — Angular 22's CLI refuses Node < 24.15, so
 # the version is pinned in ONE place shared by CI and local nvm users.
@@ -55,12 +61,13 @@ env:
   MURMUR_E2E_NO_EGRESS: "1"
 
 jobs:
-  gate:
-    name: gate (full ci.sh — release parity)
+  # ── Rust lane: control plane + clippy/test/build + supply-chain + audio E2E. ──
+  rust:
+    name: rust lane (ci.sh rust)
     # macOS is MANDATORY: swiftc ScreenCaptureKit sidecar typecheck + whisper.cpp Metal.
     # macos-14 = Apple Silicon, matching the dev Mac's arch and the release target.
     runs-on: macos-14
-    timeout-minutes: 120
+    timeout-minutes: 90
     steps:
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -104,12 +111,6 @@ jobs:
           git -C "$SERVER_DIR" checkout --detach FETCH_HEAD
           test "$(git -C "$SERVER_DIR" rev-parse HEAD)" = "$SERVER_REV"
 
-      - name: Setup Node (version from .nvmrc — Angular 22 needs >= 24.15)
-        uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
-        with:
-          node-version-file: .nvmrc
-          cache: npm
-
       - name: Install pinned Rust toolchain (rust-toolchain.toml → 1.96.0 + clippy/rustfmt)
         run: rustup show
 
@@ -118,13 +119,16 @@ jobs:
         with:
           workspaces: ". -> target"
 
-      - name: Install pinned cargo-audit + cargo-deny (prebuilt — skips ci.sh's slow cargo install)
-        uses: taiki-e/install-action@678b06b887cdbf44fa0601e5915f865e17c2241d # v2.44.60
+      - name: Install pinned cargo-audit + cargo-deny + cargo-nextest (prebuilt — skips ci.sh's slow cargo install)
+        uses: taiki-e/install-action@3d7d7cd5ac7f994c1892ae0c06165095b9139094 # v2.85.1
         with:
           # Explicit tool versions are required: an action-SHA-relative `latest`
           # installed cargo-audit 0.21.0, which cannot parse CVSS 4.0 entries in
           # the current RustSec database (for example RUSTSEC-2026-0073).
-          tool: cargo-audit@0.22.2,cargo-deny@0.20.2
+          # Keep the action SHA fresh: a pin older than the tool versions has no
+          # prebuilt manifest entry and SILENTLY source-compiles (~5 min). If the
+          # tool-install step ever exceeds ~30s, bump this action SHA.
+          tool: cargo-audit@0.22.2,cargo-deny@0.20.2,cargo-nextest@0.9.98
 
       - name: Install ffmpeg (audio E2E — aiff to 16 kHz mono WAV)
         run: brew list ffmpeg >/dev/null 2>&1 || brew install ffmpeg
@@ -138,19 +142,7 @@ jobs:
       - name: Install or verify immutable Whisper model
         run: bash scripts/ensure-whisper-model.sh
 
-      - name: Install JS deps
-        run: npm ci
-
-      - name: Cache Playwright browsers
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ~/Library/Caches/ms-playwright
-          key: playwright-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('package-lock.json') }}
-
-      - name: Install Playwright browser runtimes
-        run: npx playwright install chromium webkit
-
-      - name: Run the FULL gate (scripts/ci.sh incl. headless audio E2E)
+      - name: Run the Rust lane (scripts/ci.sh rust)
         # Every PR performs a live public audit with only its ordinary GITHUB_TOKEN.
         # It does NOT claim bypass actors or repository security settings: those are
         # explicitly MONITOR_ONLY and are verified by trusted schedule/dispatch runs.
@@ -163,4 +155,55 @@ jobs:
           MURMUR_CI_PUBLIC_REMOTE_AUDIT: ${{ github.event_name == 'pull_request' && '1' || '0' }}
           MURMUR_REMOTE_AUDIT_TOKEN: ${{ secrets.MURMUR_REMOTE_AUDIT_TOKEN }}
           MURMUR_PUBLIC_REMOTE_AUDIT_TOKEN: ${{ github.event_name == 'pull_request' && github.token || '' }}
-        run: bash scripts/ci.sh
+        run: bash scripts/ci.sh rust
+
+  # ── Web lane: ng lint + ng build + Playwright UI E2E. Node only — no Rust. ──
+  web:
+    name: web lane (ci.sh web)
+    # macos-14 to mirror the release/dev WebKit + Chromium behavior of the shipped app.
+    runs-on: macos-14
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Setup Node (version from .nvmrc — Angular 22 needs >= 24.15)
+        uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install JS deps
+        run: npm ci
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/Library/Caches/ms-playwright
+          key: playwright-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('package-lock.json') }}
+
+      - name: Install Playwright browser runtimes
+        run: npx playwright install chromium webkit
+
+      - name: Run the Web lane (scripts/ci.sh web)
+        run: bash scripts/ci.sh web
+
+  # ── Aggregation: the SINGLE required status check. Its name is the branch-
+  #    ruleset's required context, so keep it EXACTLY "gate (full ci.sh — release
+  #    parity)". Runs on Linux (trivial) to avoid a third 10x-billed macOS job. ──
+  gate:
+    name: gate (full ci.sh — release parity)
+    needs: [rust, web]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require both lanes green
+        run: |
+          echo "rust lane: ${{ needs.rust.result }}"
+          echo "web  lane: ${{ needs.web.result }}"
+          if [ "${{ needs.rust.result }}" != "success" ] || [ "${{ needs.web.result }}" != "success" ]; then
+            echo "::error::a ci.sh lane failed — the full gate is RED"
+            exit 1
+          fi
+          echo "✅ both lanes green — full ci.sh gate satisfied"
