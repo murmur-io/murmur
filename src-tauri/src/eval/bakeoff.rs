@@ -78,7 +78,8 @@ fn semantic_ranked(
         return Ok(Vec::new());
     }
     // KNN returns one hit per meeting (nearest chunk) already deduped by `search_semantic_visible`.
-    let hits = db.search_semantic_visible(&query_vec, (k.max(1) * 4) as i64, unlocked)?;
+    // No S1 floor in the bake-off (0.0) — the committed baseline must stay byte-identical.
+    let hits = db.search_semantic_visible(&query_vec, (k.max(1) * 4) as i64, 0.0, unlocked)?;
     Ok(hits.into_iter().map(|h| h.meeting.id).collect())
 }
 
@@ -102,6 +103,7 @@ fn hybrid_hits(
         query,
         &query_vec,
         (k.max(1) * 4) as i64,
+        0.0, // no S1 floor in the bake-off — the committed baseline must stay byte-identical.
         unlocked,
         date_filter,
     )
