@@ -216,11 +216,7 @@ test("Related panel: collapse-by-default, dedup, cross-dedup, ambient suggestion
   await expect(head.locator(".head-more .crumb-btn")).toHaveCount(1);
   await expect(head.getByRole("button", { name: "Share" })).toHaveCount(0);
 
-  // Screenshot the expanded Related section (dark scheme is the config default).
   await panel.scrollIntoViewIfNeeded();
-  await panel.screenshot({
-    path: "/private/tmp/claude-501/-Users-jakubgawronski-Projects-meetnotes/d3db29b4-fbd3-49ac-868a-fd86a0c14a1f/scratchpad/related-panel.png",
-  });
 
   // (5b) promote the suggestion by TAPPING its chip body → acceptLink runs, the
   // dashed chip becomes a real "Design doc" link and the suggestion group empties.

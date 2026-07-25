@@ -68,9 +68,5 @@ test("a long Ask citation wraps INSIDE the drawer pane (no horizontal overflow)"
   // font-size-tall row; a wrapped one is clearly taller).
   expect(rects.chipHeight).toBeGreaterThan(rects.lineHeight * 1.5);
 
-  await drawer.screenshot({
-    path: "/private/tmp/claude-501/-Users-jakubgawronski-Projects-meetnotes/d3db29b4-fbd3-49ac-868a-fd86a0c14a1f/scratchpad/ask-citation.png",
-  });
-
   expect(consoleErrors).toEqual([]);
 });
