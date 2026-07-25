@@ -156,20 +156,59 @@ pub const RELEVANT_BRIEF_FACTS: usize = 8;
 /// nothing. [`MEMORY_BRIEF_MAX_CHARS`] applies unchanged on both paths. Best-effort like the
 /// existing brief call sites: a DB read error degrades to an empty brief, never a failure. The
 /// CALLER still owns the `user_memory_enabled` flag check (this fn only assembles).
+///
+/// SALIENCE RANKING (memory-salience-retrieval): both paths order by the persisted salience
+/// [`crate::memory::composite_score`] (recency·importance·relevance, the SAME score the hourly
+/// consolidation job writes into `memory_scores` and exports to the weekly rollup) BEFORE
+/// [`synthesize_brief`], so the most salient facts are surfaced first (and win the
+/// [`MAX_BRIEF_FACTS`] / [`RELEVANT_BRIEF_FACTS`] budget). On the empty-query / fallback path the
+/// visible facts are re-ordered by composite descending; on the FTS-hit path the hits are kept
+/// (still exactly the gated, BM25-selected set) but STABLE-sorted by composite descending, so
+/// salience surfaces first while BM25 order is preserved among equally-salient hits. VISIBILITY IS
+/// UNCHANGED: every fact still arrives through `search_user_facts_visible` / `list_user_facts_visible`
+/// (the `unlocked` set); `memory_scores` is only consulted to REORDER that already-gated set — a
+/// sealed-not-unlocked meeting's facts never appear here (and its score rows cascade-delete on seal).
 pub fn build_memory_brief(
     db: &crate::storage::Db,
     query: &str,
     unlocked: &std::collections::HashSet<String>,
 ) -> String {
     if !query.trim().is_empty() {
-        if let Ok(hits) = db.search_user_facts_visible(query, RELEVANT_BRIEF_FACTS, unlocked) {
+        if let Ok(mut hits) = db.search_user_facts_visible(query, RELEVANT_BRIEF_FACTS, unlocked) {
             if !hits.is_empty() {
+                sort_by_salience(db, &mut hits);
                 return synthesize_brief(&hits);
             }
         }
     }
-    let facts = db.list_user_facts_visible(unlocked).unwrap_or_default();
+    let mut facts = db.list_user_facts_visible(unlocked).unwrap_or_default();
+    sort_by_salience(db, &mut facts);
     synthesize_brief(&facts)
+}
+
+/// STABLE-sort `facts` in place by persisted salience (`memory_scores.composite`, the
+/// [`crate::memory::composite_score`] the consolidation job writes) DESCENDING — most salient first.
+/// Best-effort + non-gating: it only REORDERS an already-visibility-filtered slice, never adds or
+/// drops a fact, so it cannot leak a sealed fact. A DB read error or an unscored fact degrades
+/// gracefully — on error the caller's order is left untouched; an unscored fact (no `memory_scores`
+/// row yet — freshly extracted, not yet hit by the hourly pass) defaults to `0.0` and, because
+/// `composite_score` is always `>= 0`, sinks below any scored fact while the STABLE sort keeps the
+/// caller's relative order among equally-scored facts (BM25 on the FTS path, newest-first on the list
+/// path). No content, no PII — `memory_scores` rows are fact ids + floats only.
+fn sort_by_salience(db: &crate::storage::Db, facts: &mut [Fact]) {
+    let Ok(scores) = db.list_memory_scores() else {
+        return; // best-effort: keep the caller's order on any read error.
+    };
+    let salience: std::collections::HashMap<&str, f64> = scores
+        .iter()
+        .map(|s| (s.fact_id.as_str(), s.composite))
+        .collect();
+    facts.sort_by(|a, b| {
+        let sa = salience.get(a.id.as_str()).copied().unwrap_or(0.0);
+        let sb = salience.get(b.id.as_str()).copied().unwrap_or(0.0);
+        // Descending by composite; NaN-safe (a junk float never panics the sort).
+        sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+    });
 }
 
 /// The shape the reasoner must emit. Best-effort: parse failures degrade to no facts.
@@ -546,6 +585,85 @@ mod tests {
         let brief_nohit = build_memory_brief(&db, "qqqzzz nonexistent", &unlocked);
         assert!(brief_nohit.contains("Project Atlas"));
         assert!(brief_nohit.contains("Polish replies"));
+    }
+
+    /// memory-salience-retrieval (RED-first): the injected facts are ordered by the persisted
+    /// salience (`memory_scores.composite`, `memory::composite_score`) — a HIGHER-salience fact is
+    /// injected AHEAD of a LOWER-salience one even though the natural list order (newest
+    /// `valid_from` first) would place the lower-salience fact first. RED before this change:
+    /// `build_memory_brief` never consulted `memory_scores`, so the brief followed `valid_from DESC`
+    /// and the newer-but-less-salient fact came first.
+    #[test]
+    fn build_memory_brief_orders_by_salience() {
+        use crate::facts::{FactOp, NewFact};
+        use crate::storage::models::{Meeting, MeetingStatus};
+        use crate::storage::Db;
+
+        let path = crate::storage::db::unique_temp_path("murmur-brief-salience", "sqlite");
+        let db = Db::open_with_key(
+            &path,
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        )
+        .unwrap();
+        db.insert_meeting(&Meeting {
+            id: "m1".to_string(),
+            started_at: "2026-07-01T09:00:00Z".to_string(),
+            ended_at: None,
+            title: Some("Sync".to_string()),
+            duration_s: 60,
+            audio_path: None,
+            status: MeetingStatus::Summarized,
+            folder_id: None,
+        })
+        .unwrap();
+        let add = |predicate: &str, object: &str, valid_from: &str| {
+            FactOp::Add(NewFact {
+                entity_id: USER_SCOPE.to_string(),
+                subject: "You".to_string(),
+                predicate: predicate.to_string(),
+                object: object.to_string(),
+                valid_from: valid_from.to_string(),
+                recorded_at: valid_from.to_string(),
+                confidence: 1.0,
+                meeting_id: Some("m1".to_string()),
+            })
+        };
+        // "Polish replies" is the NEWER fact → natural list order (valid_from DESC) puts it FIRST.
+        // "Project Atlas" is older → naturally second. Salience must flip this.
+        db.apply_user_fact_ops(&[
+            add("works on", "Project Atlas", "2026-07-01T09:00:00Z"),
+            add("prefer", "Polish replies", "2026-07-02T09:00:00Z"),
+        ])
+        .unwrap();
+        let unlocked = std::collections::HashSet::new();
+
+        // Sanity: before scoring, the newer fact leads (proves the RED baseline order).
+        let baseline = build_memory_brief(&db, "", &unlocked);
+        assert!(
+            baseline.find("Polish replies").unwrap() < baseline.find("Project Atlas").unwrap(),
+            "natural (unscored) order is newest-first: {baseline}"
+        );
+
+        // Score the OLDER fact (Atlas) as MORE salient than the newer one (Polish).
+        let facts = db.list_user_facts_visible(&unlocked).unwrap();
+        let atlas = facts.iter().find(|f| f.object == "Project Atlas").unwrap();
+        let polish = facts.iter().find(|f| f.object == "Polish replies").unwrap();
+        db.upsert_memory_score(&atlas.id, "user", 1.0, 10.0, 0.0, 0.9, "2026-07-03T00:00:00Z")
+            .unwrap();
+        db.upsert_memory_score(&polish.id, "user", 0.1, 1.0, 0.0, 0.1, "2026-07-03T00:00:00Z")
+            .unwrap();
+
+        // GREEN: the higher-salience Atlas fact is now injected AHEAD of the newer-but-less-salient
+        // Polish fact — salience overrides recency ordering.
+        let brief = build_memory_brief(&db, "", &unlocked);
+        assert!(
+            brief.contains("Project Atlas") && brief.contains("Polish replies"),
+            "both facts still injected: {brief}"
+        );
+        assert!(
+            brief.find("Project Atlas").unwrap() < brief.find("Polish replies").unwrap(),
+            "higher-salience fact must be injected first: {brief}"
+        );
     }
 
     /// FIX 3 RED (adversarial finding 2, reproduced): a query sharing ONLY STOPWORDS with an
