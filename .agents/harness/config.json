@@ -71,7 +71,7 @@
       "src-tauri/src/mcp.rs",
       "src/app/**/lock*",
       "src/app/**/share*",
-      "src/app/**/attachment*"
+      "src/app/**/*attachment*"
     ],
     "egress": [
       "src-tauri/src/summarize/**",
