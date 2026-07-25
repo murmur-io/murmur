@@ -470,6 +470,21 @@ fn dispatch_tool(
             if to.trim().is_empty() {
                 return Err((-32602, "missing required argument: to".to_string()));
             }
+            // B2 — this is UNTRUSTED MCP client input, so validate at the dispatch boundary that
+            // BOTH `from` and `to` parse as RFC3339. `facts.rs::normalize_instant` returns an
+            // unparseable string UNCHANGED and `cmp_instant` then compares it lexically, so a
+            // garbage `from` sorts AFTER a real `to`, SWAPS the range, and yields a confident but
+            // wrong "0 changes" with NO error. Reject the bad timestamp here (naming the offending
+            // arg) rather than silently returning an empty window. `build_knowledge_diff`'s lenient
+            // pass-through is left intact for the other in-app callers that rely on it.
+            for (arg, value) in [("from", from), ("to", to)] {
+                if chrono::DateTime::parse_from_rfc3339(value).is_err() {
+                    return Err((
+                        -32602,
+                        format!("invalid ISO-8601 timestamp for '{arg}': {value}"),
+                    ));
+                }
+            }
             ToolCall::KnowledgeDiff {
                 entity: entity.to_string(),
                 from: from.to_string(),
@@ -1220,17 +1235,59 @@ mod tests {
         )
         .is_err());
 
-        // Unknown entity → friendly non-leaking message (never an error).
+        // Unknown entity → friendly non-leaking message (never an error). Uses VALID RFC3339
+        // bounds so it reaches the entity-resolution path (B2 rejects malformed timestamps at the
+        // dispatch boundary before the entity is ever resolved).
         let none = dispatch_tool(
             &db,
             "knowledge_diff",
-            &json!({ "entity": "Nonexistent", "from": "x", "to": "y" }),
+            &json!({ "entity": "Nonexistent", "from": "2026-06-10T00:00:00Z", "to": "2026-06-25T00:00:00Z" }),
             &HashSet::new(),
         )
         .unwrap();
         assert!(
             none.contains("No visible entity"),
             "unknown entity → friendly message"
+        );
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// B2 (RED-before-GREEN) — the MCP `knowledge_diff` dispatch validates that BOTH `from` and `to`
+    /// parse as RFC3339. An unparseable `from` used to pass through (`normalize_instant` returns it
+    /// UNCHANGED, `cmp_instant` compares lexically), SWAP the range, and yield a confident but wrong
+    /// "0 changes" with NO error. Now it is a -32602 that names the offending argument; a well-formed
+    /// pair proceeds past validation. RED on the pre-fix code (which returned Ok with an empty window).
+    #[test]
+    fn mcp_knowledge_diff_rejects_unparseable_timestamp() {
+        let (db, p) = temp_db();
+
+        // A garbage `from` (valid `to`) → -32602 naming `from`, never a silent "0 changes".
+        let err = dispatch_tool(
+            &db,
+            "knowledge_diff",
+            &json!({ "entity": "Atlas", "from": "not-a-date", "to": "2026-06-25T00:00:00Z" }),
+            &HashSet::new(),
+        )
+        .unwrap_err();
+        assert_eq!(err.0, -32602, "malformed timestamp must be InvalidArg: {err:?}");
+        assert!(
+            err.1.contains("from"),
+            "the error must name the offending argument (from): {}",
+            err.1
+        );
+
+        // Well-formed RFC3339 bounds do NOT error at the validation step — dispatch proceeds to
+        // `execute_tool` (an unknown entity there is a friendly Ok message, not a validation error).
+        let ok = dispatch_tool(
+            &db,
+            "knowledge_diff",
+            &json!({ "entity": "Atlas", "from": "2026-06-10T00:00:00Z", "to": "2026-06-25T00:00:00Z" }),
+            &HashSet::new(),
+        );
+        assert!(
+            ok.is_ok(),
+            "valid RFC3339 bounds must pass the dispatch validation: {ok:?}"
         );
 
         let _ = std::fs::remove_file(&p);
