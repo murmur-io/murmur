@@ -333,6 +333,9 @@ pub fn run() {
             commands::list_saved_recipes,
             commands::save_recipe,
             commands::delete_recipe,
+            commands::list_note_templates,
+            commands::save_note_template,
+            commands::delete_note_template,
             commands::list_saved_views,
             commands::upsert_saved_view,
             commands::delete_saved_view,
@@ -488,6 +491,22 @@ pub fn run() {
                 crate::summarize::egress_log::set_egress_sink(std::sync::Arc::new(
                     crate::summarize::egress_log::DbEgressSink::new(state.db.clone()),
                 ));
+            }
+
+            // Load the user's saved NOTE TEMPLATES into the renderer registry so a note-style
+            // selection of a saved template resolves at Stop-time (`summarize::template::
+            // build_template` sees only the style STRING, not the DB). Best-effort: a read failure
+            // just leaves the registry empty (built-in styles still work) — never crash boot.
+            {
+                let state = app.state::<AppState>();
+                match state.db.list_note_templates() {
+                    Ok(templates) => crate::summarize::template::set_saved_templates(templates),
+                    Err(e) => tracing::warn!(
+                        target: "note_templates",
+                        error = %e,
+                        "failed to load saved note templates at startup"
+                    ),
+                }
             }
 
             // Crash-recovery (STAGE 2 spill salvage + STAGE 3 disk salvage + STAGE 1 reconcile) +
