@@ -57,14 +57,15 @@ pub async fn generate_digest(
     // the device. `list_meetings_visible` + `get_note_if_visible` push the session unlock set
     // through the same predicate as MCP — correctness no longer depends on at-rest blanking.
     let unlocked = unlocked_snapshot(state.inner())?;
-    let mut corpus = String::new();
-    let mut count = 0usize;
+    // Collect the VISIBLE + SUMMARIZED meetings inside the window (newest-first), keeping the
+    // visibility gate EXACTLY as-is: `list_meetings_visible` + `get_note_if_visible` push the
+    // session unlock set through the same `visibility_clause` predicate MCP uses. Assembling the
+    // corpus (the whole-note-or-skip budgeting + the omitted-count marker) is factored into the
+    // pure `assemble_digest_corpus` so it is unit-testable without a live provider.
+    let mut entries: Vec<DigestEntry> = Vec::new();
     for m in state.db.list_meetings_visible(300, &unlocked)? {
         if m.started_at.as_str() < cutoff.as_str() {
             continue;
-        }
-        if corpus.len() >= budget {
-            break;
         }
         let Some(note) = state.db.get_note_if_visible(&m.id, &unlocked)? else {
             continue;
@@ -76,20 +77,26 @@ pub async fn generate_digest(
             .next()
             .unwrap_or("")
             .to_string();
-        let header = format!("\n\n### [[{title}]] · {date}\n");
-        let remaining = budget.saturating_sub(corpus.len() + header.len());
-        if remaining < 200 {
-            break;
-        }
-        corpus.push_str(&header);
-        corpus.push_str(&note.markdown.chars().take(remaining).collect::<String>());
-        count += 1;
+        entries.push(DigestEntry {
+            title,
+            date,
+            markdown: note.markdown,
+        });
     }
-    if count == 0 {
+    let assembled = assemble_digest_corpus(&entries, budget);
+    if assembled.included == 0 {
         return Err(AppError::InvalidArg(format!(
             "no summarized meetings in the last {days} days"
         )));
     }
+    // Non-PII: counts only (no titles/content) — records whether any meetings were dropped for budget.
+    tracing::info!(
+        target: "digest",
+        included = assembled.included,
+        omitted = assembled.omitted,
+        "assembled weekly-digest corpus"
+    );
+    let corpus = assembled.corpus;
     let range_label = format!("the last {days} days");
     let provider = crate::summarize::provider_for(
         crate::summarize::roles::Role::Notes,
@@ -124,6 +131,64 @@ pub async fn generate_digest(
         markdown,
         exported_path,
     })
+}
+
+/// One VISIBLE + SUMMARIZED meeting in the digest window (already gated by
+/// `list_meetings_visible` / `get_note_if_visible` at the call site).
+struct DigestEntry {
+    title: String,
+    date: String,
+    markdown: String,
+}
+
+/// The assembled digest corpus plus how many notes were included vs omitted for budget.
+struct AssembledDigest {
+    corpus: String,
+    included: usize,
+    omitted: usize,
+}
+
+/// Assemble the digest corpus from newest-first entries.
+///
+/// Two invariants (the 2026-07-25 silent-drop + mid-note-truncation fix):
+///   1. A note is included WHOLE or skipped ENTIRELY — never truncated mid-content. (The old
+///      `note.markdown.chars().take(remaining)` cut the boundary note in the middle of a line.)
+///   2. When one or more visible-and-summarized meetings in the window are dropped for budget,
+///      an explicit human-readable marker with the correct omitted COUNT is appended so nothing
+///      is silently lost. (The old loop `break`-ed past budget with no marker.)
+///
+/// The newest note is always admitted (so a non-empty window never yields an empty digest); once a
+/// whole note would exceed the budget the rest of the (older) window is omitted and counted.
+fn assemble_digest_corpus(entries: &[DigestEntry], budget: usize) -> AssembledDigest {
+    let mut corpus = String::new();
+    let mut included = 0usize;
+    let mut omitted = 0usize;
+    let mut budget_reached = false;
+    for entry in entries {
+        let header = format!("\n\n### [[{}]] · {}\n", entry.title, entry.date);
+        let would_be = corpus.len() + header.len() + entry.markdown.len();
+        // Always admit the first (newest) note; after that, a whole note that would push the
+        // corpus over budget is omitted — and so is every older note behind it.
+        if budget_reached || (included > 0 && would_be > budget) {
+            budget_reached = true;
+            omitted += 1;
+            continue;
+        }
+        corpus.push_str(&header);
+        corpus.push_str(&entry.markdown);
+        included += 1;
+    }
+    if omitted > 0 {
+        let noun = if omitted == 1 { "meeting" } else { "meetings" };
+        corpus.push_str(&format!(
+            "\n\n_({omitted} earlier {noun} omitted — over the digest size budget)_\n"
+        ));
+    }
+    AssembledDigest {
+        corpus,
+        included,
+        omitted,
+    }
 }
 
 // ── Brain v2 L5 — scheduled briefs (schedule CRUD + propose-accept runs) ─────────────────────────
@@ -267,4 +332,135 @@ pub fn accept_brief(state: State<'_, AppState>, run_id: String) -> Result<String
 #[tauri::command]
 pub fn dismiss_brief(state: State<'_, AppState>, run_id: String) -> Result<(), AppError> {
     state.db.delete_brief_run(&run_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{assemble_digest_corpus, DigestEntry};
+
+    /// A multi-line note ending in a stable terminal sentinel, so a mid-content truncation is
+    /// detectable (the sentinel would be missing).
+    fn note_body(n: usize) -> String {
+        let mut s = String::new();
+        for line in 0..20 {
+            s.push_str(&format!(
+                "meeting {n} line {line} lorem ipsum dolor sit amet consectetur\n"
+            ));
+        }
+        s.push_str(&format!("[END-OF-NOTE-{n}]"));
+        s
+    }
+
+    /// RED-before-GREEN regression for the 2026-07-25 silent-drop + mid-note-truncation bug:
+    /// seed > budget chars of visible summarized notes across the window and assert (i) the
+    /// omitted-count marker is present with the correct count, and (ii) every INCLUDED note body
+    /// is byte-complete (never cut mid-content).
+    ///
+    /// Against the OLD code this fails twice: the boundary note was truncated via
+    /// `.chars().take(remaining)` (sentinel missing) and the loop `break`-ed with NO marker.
+    #[test]
+    fn digest_never_truncates_and_marks_omitted() {
+        let budget = 4_000usize;
+        let entries: Vec<DigestEntry> = (0..10)
+            .map(|n| DigestEntry {
+                title: format!("Title {n}"),
+                date: "2026-07-20".to_string(),
+                markdown: note_body(n),
+            })
+            .collect();
+        // Sanity: the corpus of all notes is well over budget so omission MUST happen.
+        assert!(
+            entries.iter().map(|e| e.markdown.len()).sum::<usize>() > budget,
+            "test setup must exceed the budget"
+        );
+
+        let assembled = assemble_digest_corpus(&entries, budget);
+
+        // (i) some meetings were omitted, and every window meeting is accounted for.
+        assert!(
+            assembled.omitted > 0,
+            "expected some meetings omitted over budget"
+        );
+        assert!(
+            assembled.included > 0,
+            "the newest note is always admitted so the digest is never empty"
+        );
+        assert_eq!(
+            assembled.included + assembled.omitted,
+            entries.len(),
+            "every visible+summarized meeting is either included or counted as omitted"
+        );
+
+        // ...and the explicit human-readable marker carries the CORRECT omitted count.
+        let noun = if assembled.omitted == 1 {
+            "meeting"
+        } else {
+            "meetings"
+        };
+        let expected_marker = format!(
+            "_({} earlier {noun} omitted — over the digest size budget)_",
+            assembled.omitted
+        );
+        assert!(
+            assembled.corpus.contains(&expected_marker),
+            "digest corpus must carry an explicit omitted-count marker; got tail: {:?}",
+            &assembled.corpus[assembled.corpus.len().saturating_sub(160)..]
+        );
+
+        // (ii) every INCLUDED note is byte-complete — never cut mid-content. For each note whose
+        // header appears, its FULL body (including the terminal sentinel) must be present verbatim.
+        for n in 0..10 {
+            let header = format!("### [[Title {n}]]");
+            if assembled.corpus.contains(&header) {
+                let body = note_body(n);
+                assert!(
+                    assembled.corpus.contains(&body),
+                    "note {n} was included but is truncated mid-content (body not byte-complete)"
+                );
+                assert!(
+                    assembled.corpus.contains(&format!("[END-OF-NOTE-{n}]")),
+                    "note {n} was included but its terminal sentinel is missing (mid-content cut)"
+                );
+            }
+        }
+    }
+
+    /// The marker uses the singular noun when exactly one meeting is omitted.
+    #[test]
+    fn omitted_marker_is_singular_for_one() {
+        // Two notes each ~900 chars; budget admits only the first, omitting exactly one.
+        let entries: Vec<DigestEntry> = (0..2)
+            .map(|n| DigestEntry {
+                title: format!("Title {n}"),
+                date: "2026-07-20".to_string(),
+                markdown: note_body(n),
+            })
+            .collect();
+        let one_note = entries[0].markdown.len();
+        let assembled = assemble_digest_corpus(&entries, one_note + 40);
+        assert_eq!(assembled.included, 1);
+        assert_eq!(assembled.omitted, 1);
+        assert!(
+            assembled
+                .corpus
+                .contains("_(1 earlier meeting omitted — over the digest size budget)_"),
+            "singular-noun marker missing; tail: {:?}",
+            &assembled.corpus[assembled.corpus.len().saturating_sub(120)..]
+        );
+    }
+
+    /// No omission → no marker at all (don't cry wolf).
+    #[test]
+    fn no_marker_when_nothing_omitted() {
+        let entries = vec![DigestEntry {
+            title: "Only".to_string(),
+            date: "2026-07-20".to_string(),
+            markdown: "short body\n[END-OF-NOTE-0]".to_string(),
+        }];
+        let assembled = assemble_digest_corpus(&entries, 80_000);
+        assert_eq!(assembled.included, 1);
+        assert_eq!(assembled.omitted, 0);
+        assert!(!assembled.corpus.contains("omitted"));
+        assert!(assembled.corpus.contains("[END-OF-NOTE-0]"));
+    }
 }
