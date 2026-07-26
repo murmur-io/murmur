@@ -381,6 +381,29 @@ impl Db {
         Ok(())
     }
 
+    /// Drop every image replica belonging to ONE org item, inside an EXISTING transaction. Called by
+    /// the single org eviction primitive (`org_store::Db::evict_org_item`) so a withdrawn colleague's
+    /// pictures never outlive the withdrawn text.
+    ///
+    /// WHY THIS EXISTS AT ALL: `note_attachments.org_item_id` carries
+    /// `REFERENCES org_items(item_id) ON DELETE CASCADE`, which only fires on a row DELETE — and an
+    /// org eviction is an UPDATE (`tombstoned = 1`), because the header row must survive as a
+    /// tombstone to keep an append-only re-pull idempotent. So the CASCADE never fired and the
+    /// plaintext image BLOBs leaked past the revoke. Org attachments are never exported to the vault
+    /// (`exported_path` is only ever written by the note/meeting export paths), so there is no
+    /// on-disk file to reap here — the BLOB rows are the whole replica.
+    pub(crate) fn purge_org_item_attachments_tx(
+        tx: &rusqlite::Transaction<'_>,
+        item_id: &str,
+    ) -> Result<()> {
+        tx.execute(
+            "DELETE FROM note_attachments WHERE org_item_id=?1",
+            rusqlite::params![item_id],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
     pub fn list_attachments(&self, owner: &AttachmentOwner) -> Result<Vec<AttachmentRecord>> {
         let conn = self.lock();
         let (sql, p1, p2): (&str, &str, Option<&str>) = match owner {
