@@ -2331,6 +2331,34 @@ async fn summarize_and_export(
         markdown
     };
 
+    // T4b — MURMUR ASSEMBLES THE FRONT-MATTER (it is no longer the model's guess).
+    //
+    // Everything above produced the model's note; from here the note Murmur persists/exports is
+    // `markdown` = a DETERMINISTIC, sanitized, YAML-escaped `---` block PREPENDED to that model
+    // body, while `classification` holds the PRE-assembly output for the two CLASSIFICATION-only
+    // consumers (`resolve_subfolder`, the graph-extraction step). They are the cloud-bound ones and
+    // they do not need the resolved values, so they take the `ClassificationInput` TYPE — handing
+    // either one the assembled note is a compile error, not a review catch. The vars are resolved
+    // AFTER the provider call by construction (the generation prompt is already sent).
+    //
+    // `classification_title` is the MODEL-derived title (the exact value `derive_title` produced
+    // before assembly) — it is what the vault filename, the classifier and the graph step all see,
+    // so the assembly changes neither the filename nor any downstream key.
+    let classification_title = derive_title(&markdown, date_iso);
+    let vars = resolve_template_vars(
+        state,
+        meeting_id,
+        &classification_title,
+        date_iso,
+        duration_s,
+        request.meta.language.as_deref(),
+        &markdown,
+    );
+    // Resolve the saved template ONCE here (the registry read the renderer would otherwise do
+    // internally), so every renderer below stays pure and explicitly parameterized.
+    let note_template = template::saved_template(&config.note_style);
+    let (markdown, classification) = assemble_and_split(note_template.as_ref(), &vars, markdown);
+
     state
         .db
         .update_meeting_status(meeting_id, MeetingStatus::Summarized)?;
@@ -2486,7 +2514,8 @@ async fn summarize_and_export(
     // terminal `Summarized` state — NOT `Error`. Recording without a vault is fully supported.
     let Some(vault_path) = config.vault_path.as_deref().filter(|p| !p.is_empty()) else {
         // Title the meeting so the library/detail view shows it (same title we'd derive on export).
-        let title = finalize_note_without_vault(&state.db, meeting_id, &markdown, date_iso)?;
+        let title =
+            finalize_note_without_vault(&state.db, meeting_id, classification.as_str(), date_iso)?;
         emit_status(
             app,
             "saved",
@@ -2495,12 +2524,13 @@ async fn summarize_and_export(
         );
         // Best-effort self-assembling graph: the encrypted DB (Sink A) is the canonical store and
         // works without a vault; never fail the saved note on a graph hiccup.
-        if let Err(e) = crate::commands::build_and_persist_entities(
+        // T4b: classification-only ⇒ the PRE-assembly model output (no resolved deterministic vars).
+        if let Err(e) = persist_entities_for_classification(
             app,
             state,
             meeting_id,
             &title,
-            &markdown,
+            &classification,
             postprocess_token.clone(),
         )
         .await
@@ -2523,7 +2553,8 @@ async fn summarize_and_export(
     // exactly like the no-vault path (title + `Summarized`, `exported_path: None`). The
     // `meeting_locked` decision was read under the SAME lifecycle guard as the persist (W4).
     if meeting_locked {
-        let title = finalize_note_without_vault(&state.db, meeting_id, &markdown, date_iso)?;
+        let title =
+            finalize_note_without_vault(&state.db, meeting_id, classification.as_str(), date_iso)?;
         emit_status(
             app,
             "saved",
@@ -2532,12 +2563,13 @@ async fn summarize_and_export(
         );
         // Same best-effort graph persist as the no-vault path (Sink B's own gate skips vault stubs
         // for a locked folder; Sink A rows are visibility-gated on read).
-        if let Err(e) = crate::commands::build_and_persist_entities(
+        // T4b: classification-only ⇒ the PRE-assembly model output (no resolved deterministic vars).
+        if let Err(e) = persist_entities_for_classification(
             app,
             state,
             meeting_id,
             &title,
-            &markdown,
+            &classification,
             postprocess_token.clone(),
         )
         .await
@@ -2554,9 +2586,18 @@ async fn summarize_and_export(
 
     emit_status(app, "exporting", "Writing note to vault…", meeting_id);
 
-    let title = derive_title(&markdown, date_iso);
-    let subfolder =
-        resolve_subfolder(config, provider.as_ref(), vault_path, &title, &markdown).await;
+    // T4b: the model-derived title computed BEFORE assembly — byte-identical to the legacy
+    // `derive_title(&markdown, …)` value, so the vault filename and every downstream key are
+    // unchanged, and the classifier below is handed the PRE-assembly note.
+    let title = classification_title;
+    let subfolder = resolve_subfolder(
+        config,
+        provider.as_ref(),
+        vault_path,
+        &title,
+        &classification,
+    )
+    .await;
     // Phase 5 — inject model-provenance keys into the YAML frontmatter before the vault write.
     // The note markdown already has the `---` / `---` block generated by the LLM; we append
     // `ai-provider:` and `ai-model:` to it. Pure + idempotent: if the keys are already present
@@ -2639,19 +2680,21 @@ async fn summarize_and_export(
         // The meeting's folder was locked during the `resolve_subfolder` await: NO plaintext `.md`
         // is written (the note is already durably sealed in the DB by that lock). Finish exactly
         // like the meeting-locked path above.
-        let title = finalize_note_without_vault(&state.db, meeting_id, &markdown, date_iso)?;
+        let title =
+            finalize_note_without_vault(&state.db, meeting_id, classification.as_str(), date_iso)?;
         emit_status(
             app,
             "saved",
             "Saved to Murmur — this folder is locked, so no plaintext note was exported.",
             meeting_id,
         );
-        if let Err(e) = crate::commands::build_and_persist_entities(
+        // T4b: classification-only ⇒ the PRE-assembly model output (no resolved deterministic vars).
+        if let Err(e) = persist_entities_for_classification(
             app,
             state,
             meeting_id,
             &title,
-            &markdown,
+            &classification,
             postprocess_token.clone(),
         )
         .await
@@ -2672,12 +2715,13 @@ async fn summarize_and_export(
     // + mirror vault stubs for unsealed folders (Sink B). NEVER fail the note on a graph error —
     // a graph-extraction LLM hiccup must not block note export. `add_mention` idempotency makes
     // the `resummarize_existing` path safe (re-extraction refreshes without double-counting).
-    if let Err(e) = crate::commands::build_and_persist_entities(
+    // T4b: classification-only ⇒ the PRE-assembly model output (no resolved deterministic vars).
+    if let Err(e) = persist_entities_for_classification(
         app,
         state,
         meeting_id,
         &title,
-        &markdown,
+        &classification,
         postprocess_token.clone(),
     )
     .await
@@ -2911,18 +2955,23 @@ pub(crate) fn build_grounding_context(
 /// Pick the vault subfolder for a note: AI thematic filing (nested under the configured
 /// subfolder, if any) when `auto_organize` is on; otherwise just the configured subfolder.
 /// Classification failures degrade gracefully to the configured subfolder.
+///
+/// T4b: takes a [`ClassificationInput`], not a `&str`. `classify_subfolder` may reach a CLOUD
+/// provider, so the type is what guarantees it sees the PRE-assembly model output rather than the
+/// note Murmur assembled from resolved deterministic variables.
 async fn resolve_subfolder(
     config: &AppConfig,
     provider: &dyn crate::summarize::provider::SummarizerProvider,
     vault_path: &str,
     title: &str,
-    markdown: &str,
+    input: &ClassificationInput,
 ) -> Option<String> {
     if !config.auto_organize {
         return config.vault_subfolder.clone();
     }
     let existing = export::list_subfolders(Path::new(vault_path)).unwrap_or_default();
-    match crate::summarize::organize::classify_subfolder(provider, title, markdown, &existing).await
+    match crate::summarize::organize::classify_subfolder(provider, title, input.as_str(), &existing)
+        .await
     {
         Some(folder) => match config.vault_subfolder.as_deref().filter(|s| !s.is_empty()) {
             Some(base) => Some(format!("{base}/{folder}")),
@@ -3036,6 +3085,213 @@ fn derive_title(markdown: &str, date_iso: &str) -> String {
         }
     }
     format!("Meeting {date_iso}")
+}
+
+/// T4b — resolve the DETERMINISTIC `{{}}` template variables for ONE meeting.
+///
+/// GATE: the entity leg reads through `Db::list_entities_for_meeting_visible`, i.e. the SAME
+/// `visibility_clause` predicate as every other graph read — a sealed-and-not-session-unlocked
+/// meeting resolves an EMPTY list, so a locked folder's entity names can never surface in a note
+/// header. Thin wrapper: this fn owns ONLY the gated read; every rule about what becomes a variable
+/// lives in the pure [`resolve_vars_from_note`], which is where the tests bind it.
+///
+/// EGRESS: called AFTER the provider call, and its result is handed ONLY to the persistence/export
+/// half of [`note_split::assemble_and_split`] — never to a `ClassificationInput` consumer.
+/// `meeting_id` is deliberately NOT a variable (no note value, highest linkability cost).
+fn resolve_template_vars(
+    state: &AppState,
+    meeting_id: &str,
+    title: &str,
+    date_iso: &str,
+    duration_s: i64,
+    language: Option<&str>,
+    model_markdown: &str,
+) -> template::ResolvedVars {
+    let unlocked = state
+        .unlocked_folders
+        .lock()
+        .map(|g| g.clone())
+        .unwrap_or_default();
+    // The gated graph read. It is EMPTY on a meeting's FIRST summarize — `entity_mentions` rows are
+    // written by the graph step, which by design runs AFTER assembly (see `resolve_vars_from_note`,
+    // which is why `{{entities}}` does not depend on it alone).
+    let gated_entities = state
+        .db
+        .list_entities_for_meeting_visible(meeting_id, &unlocked)
+        .unwrap_or_default();
+    resolve_vars_from_note(
+        gated_entities,
+        title,
+        date_iso,
+        duration_s,
+        language,
+        model_markdown,
+    )
+}
+
+/// The PURE half of [`resolve_template_vars`] — every rule about what a `{{}}` variable resolves to,
+/// with the one gated DB read hoisted out as `gated_entities` so the whole thing is unit-testable.
+///
+/// Sources, and why each is the honest one:
+/// * `participants` — the MODEL's own `participants:` front-matter list, re-read with
+///   `front_matter_list` and re-rendered safely. It is the only source that heard the room. The
+///   gated ENTITY list is deliberately NOT merged in here: it is a mixed-kind list (people,
+///   organizations, projects — see the `kind = 'person'` ORDER BY, not filter, in
+///   `list_entities_for_meeting_visible`), so folding it into `participants` would file `ACME Corp`
+///   as an attendee.
+/// * `entities` — `gated_entities` UNION the `[[wikilink]]` targets in the note's own body. The
+///   union is load-bearing, not belt-and-braces: `entity_mentions` for this meeting are written by
+///   the graph step, which runs AFTER the note is assembled, so on a meeting's FIRST summarize —
+///   the primary path — `gated_entities` is EMPTY and the wikilinks are the only thing that exists
+///   at assembly time. On a re-summarize both legs are populated and the gated names come first.
+///   Wikilinks add no read path: they are already text in the note being assembled.
+/// * `tags` — the model's list, with `meeting` guaranteed present (the note-format contract).
+/// * `action_items` — the note body's own `- [ ]` items, via the shared parser.
+/// * `title` / `date_iso` / `duration_minutes` / `language` — this meeting's own row.
+///
+/// Every leg degrades to empty rather than failing: a note is never failed by a variable that would
+/// not resolve.
+fn resolve_vars_from_note(
+    gated_entities: Vec<String>,
+    title: &str,
+    date_iso: &str,
+    duration_s: i64,
+    language: Option<&str>,
+    model_markdown: &str,
+) -> template::ResolvedVars {
+    let (model_yaml, model_body) = crate::storage::db::split_front_matter(model_markdown);
+
+    let participants = template::front_matter_list(&model_yaml, "participants");
+
+    let mut entities = gated_entities;
+    for link in wikilink_targets(&model_body) {
+        if !entities.iter().any(|e| e.eq_ignore_ascii_case(&link)) {
+            entities.push(link);
+        }
+    }
+
+    // Tags keep the note-format contract ("a YAML list including at least [meeting]").
+    let mut tags = template::front_matter_list(&model_yaml, "tags");
+    if !tags.iter().any(|t| t.eq_ignore_ascii_case("meeting")) {
+        tags.insert(0, "meeting".to_string());
+    }
+
+    let action_items = crate::summarize::action_items::parse_action_items(&model_body)
+        .into_iter()
+        .map(|i| i.text)
+        .collect();
+
+    template::ResolvedVars {
+        title: title.to_string(),
+        date_iso: date_iso.to_string(),
+        duration_minutes: (duration_s as f64 / 60.0).round() as i64,
+        participants,
+        action_items,
+        entities,
+        tags,
+        language: language.map(str::to_string),
+    }
+}
+
+/// The `[[Target]]` / `[[Target|alias]]` / `[[Target#heading]]` link TARGETS in a note body, in
+/// first-appearance order, de-duplicated case-insensitively. Hand-rolled (no new crate), bounded by
+/// the caller's list cap downstream. An unterminated `[[` yields nothing.
+fn wikilink_targets(body: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut rest = body;
+    while let Some(open) = rest.find("[[") {
+        rest = &rest[open + 2..];
+        let Some(close) = rest.find("]]") else { break };
+        let raw = &rest[..close];
+        rest = &rest[close + 2..];
+        // A link never spans lines; anything that does is not a wikilink.
+        if raw.contains('\n') {
+            continue;
+        }
+        // `[[Target|alias]]` / `[[Target#heading]]` — everything after the first `|` or `#` is
+        // presentation, not the target.
+        let target = raw
+            .split(['|', '#'])
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if !target.is_empty() && !out.iter().any(|e| e.eq_ignore_ascii_case(&target)) {
+            out.push(target);
+        }
+    }
+    out
+}
+
+/// T4b — the EGRESS TYPE BOUNDARY between the note Murmur assembles and the note a CLASSIFICATION
+/// step is allowed to see. The invariant is enforced by the TYPE SYSTEM, not by a convention:
+/// [`ClassificationInput`]'s field is private to this module and [`assemble_and_split`] is its only
+/// constructor, so a consumer typed on `&ClassificationInput` structurally CANNOT be handed the
+/// assembled note. Re-wiring a call site back to the assembled `markdown` is a COMPILE ERROR, which
+/// is exactly the RED the previous string-typed split could not produce.
+mod note_split {
+    use super::template;
+    use crate::storage::models::NoteTemplate;
+
+    /// The PRE-ASSEMBLY model output — byte-identical to what the provider returned, and the ONLY
+    /// note text a classification-only consumer may receive.
+    ///
+    /// Consumers: `resolve_subfolder` (thematic vault filing) and
+    /// [`super::persist_entities_for_classification`] (graph extraction). Both may reach a CLOUD
+    /// provider, and neither needs Murmur's resolved deterministic values — so no resolved variable
+    /// can ride them off-device.
+    pub(super) struct ClassificationInput(String);
+
+    impl ClassificationInput {
+        pub(super) fn as_str(&self) -> &str {
+            &self.0
+        }
+    }
+
+    /// Split the model's output into `(assembled_note, classification_input)`.
+    ///
+    /// * `.0` — Murmur's deterministic, sanitized, YAML-escaped `---` block prepended to the model's
+    ///   body. This is what is persisted, sealed and exported.
+    /// * `.1` — the same model output, TYPED so it can only flow to a classification consumer.
+    ///
+    /// `template_row` is the caller's already-resolved saved template (`None` for a built-in style),
+    /// passed explicitly rather than looked up here — that keeps this pure and keeps its tests off
+    /// the process-global template registry.
+    pub(super) fn assemble_and_split(
+        template_row: Option<&NoteTemplate>,
+        vars: &template::ResolvedVars,
+        model_markdown: String,
+    ) -> (String, ClassificationInput) {
+        let assembled = template::assemble_note_with_template(template_row, vars, &model_markdown);
+        (assembled, ClassificationInput(model_markdown))
+    }
+}
+
+use note_split::{assemble_and_split, ClassificationInput};
+
+/// The SOLE pipeline call path into the graph-extraction step, typed on [`ClassificationInput`] so
+/// the assembled note (with Murmur's resolved deterministic values) can never be handed to it.
+///
+/// Every `summarize_and_export` finish path goes through here; nothing else in this module may call
+/// [`crate::commands::build_and_persist_entities`] directly (pinned by
+/// `graph_extraction_has_exactly_one_typed_call_site`).
+async fn persist_entities_for_classification(
+    app: &AppHandle,
+    state: &AppState,
+    meeting_id: &str,
+    title: &str,
+    input: &ClassificationInput,
+    recording_model_token: Option<crate::perf::RecordingSessionToken>,
+) -> Result<crate::summarize::graph::GraphPayload> {
+    crate::commands::build_and_persist_entities(
+        app,
+        state,
+        meeting_id,
+        title,
+        input.as_str(),
+        recording_model_token,
+    )
+    .await
 }
 
 /// Whether the post-note AUTO semantic index should run: requires BOTH the master flag AND the real
@@ -3348,6 +3604,249 @@ mod tests {
         );
         assert!(!should_auto_index(false, true), "flag off → never index");
         assert!(!should_auto_index(false, false));
+    }
+
+    // ── T4b — Murmur-assembled front-matter: the EGRESS split ────────────────────────────────────
+
+    fn t4b_vars() -> template::ResolvedVars {
+        template::ResolvedVars {
+            title: "Q3 planning".to_string(),
+            date_iso: "2026-07-26".to_string(),
+            duration_minutes: 30,
+            // The three hostile transcript-derived shapes the escaping exists for.
+            participants: vec![
+                "---\nadmin: true".to_string(),
+                "<% tp.system.prompt() %>".to_string(),
+                "Ann: the CFO".to_string(),
+            ],
+            action_items: vec!["Bob — ship it".to_string()],
+            // A GATED-DB-derived value that appears NOWHERE in the model's own output: if it shows
+            // up in the classification input, a `visibility_clause`-gated name just gained a new
+            // cloud egress path.
+            entities: vec!["ACME Corp".to_string()],
+            tags: vec!["meeting".to_string()],
+            language: Some("en".to_string()),
+        }
+    }
+
+    /// A saved template that binds the GATED-DB `{{entities}}` variable into a front-matter key, so
+    /// the assembled note provably carries a value that exists ONLY in the gated store. Passed
+    /// EXPLICITLY (never through `template::set_saved_templates`) so this test never mutates the
+    /// process-global registry — under a parallel `cargo test` (which `scripts/ci.sh` falls back to
+    /// when cargo-nextest is absent) a registry-mutating test races every other one in the binary.
+    fn t4b_template() -> crate::storage::models::NoteTemplate {
+        crate::storage::models::NoteTemplate {
+            id: "tpl-t4b-egress".to_string(),
+            name: "t4b".to_string(),
+            tone: String::new(),
+            sections: vec![crate::storage::models::NoteTemplateSection {
+                heading: "Outcome".to_string(),
+                instruction: "One line.".to_string(),
+            }],
+            extra_frontmatter_keys: vec!["client: {{entities}}".to_string()],
+            created_at: "2026-07-26T00:00:00Z".to_string(),
+        }
+    }
+
+    /// The EGRESS invariant, bound to the SPLIT: the resolved deterministic variables land in the
+    /// note Murmur persists/exports, and the `ClassificationInput` the two cloud-bound consumers
+    /// take is the byte-identical PRE-assembly model output.
+    ///
+    /// HONESTY NOTE on what this test does and does not prove. Asserting
+    /// `classification.as_str() == model` only pins THIS function's behavior — it cannot, on its
+    /// own, prove that the pipeline's four hand-off sites actually pass it. What binds those is the
+    /// TYPE: `resolve_subfolder` and `persist_entities_for_classification` take
+    /// `&ClassificationInput`, whose field is private to `mod note_split` and whose only constructor
+    /// is `assemble_and_split`. Passing the assembled `markdown` (a `String`) at any of those call
+    /// sites does not compile. `graph_extraction_has_exactly_one_typed_call_site` closes the one
+    /// remaining hole — a NEW direct call to the untyped command.
+    #[test]
+    fn resolved_vars_never_reach_the_classification_input() {
+        let t = t4b_template();
+        let vars = t4b_vars();
+        let model = "---\ntitle: model guess\n---\n\n# Q3 planning\n\n- [ ] Bob — ship it\n";
+        let (assembled, classification) = assemble_and_split(Some(&t), &vars, model.to_string());
+
+        // The gated-DB entity IS in the note Murmur persists…
+        assert!(
+            assembled.contains("client: [\"ACME Corp\"]"),
+            "the gated `{{{{entities}}}}` binding must render into the note: {assembled}"
+        );
+
+        // (1) The classification input is the model's output, UNCHANGED — byte-identical.
+        assert_eq!(
+            classification.as_str(),
+            model,
+            "classifiers must see the pre-assembly model output verbatim"
+        );
+
+        // (2) …and therefore carries NONE of the resolved deterministic values.
+        for leaked in [
+            "ACME Corp",    // gated-DB entity
+            "admin: true",  // sanitized participant
+            "tp.system",    // sanitized participant
+            "Ann: the CFO", // sanitized participant
+            "duration_minutes: 30",
+        ] {
+            assert!(
+                !classification.as_str().contains(leaked),
+                "`{leaked}` must never reach the cloud-bound classification input:\n{}",
+                classification.as_str()
+            );
+        }
+
+        // (3) The PERSISTED/EXPORTED note DOES carry them, assembled and escaped.
+        assert!(assembled.starts_with("---\n"), "{assembled}");
+        assert_eq!(
+            assembled.lines().filter(|l| l.trim() == "---").count(),
+            2,
+            "exactly one front-matter block: {assembled}"
+        );
+        assert!(assembled.contains("title: \"Q3 planning\""), "{assembled}");
+        assert!(assembled.contains("date: 2026-07-26"), "{assembled}");
+        assert!(assembled.contains("duration_minutes: 30"), "{assembled}");
+        assert!(assembled.contains("\"admin: true\""), "{assembled}");
+        assert!(assembled.contains("\"Ann: the CFO\""), "{assembled}");
+        assert!(!assembled.contains("<%"), "{assembled}");
+        assert!(!assembled.contains("model guess"), "{assembled}");
+        assert!(
+            assembled.contains("# Q3 planning"),
+            "body preserved: {assembled}"
+        );
+
+        // (4) The title every downstream key uses is unchanged by the assembly.
+        assert_eq!(
+            derive_title(&assembled, "2026-01-01"),
+            "Q3 planning",
+            "the assembled note must derive the SAME title the classifier was given"
+        );
+    }
+
+    /// The one hole the TYPE cannot close: someone adding a NEW call to the untyped
+    /// `crate::commands::build_and_persist_entities` (which takes `&str`) instead of going through
+    /// the `&ClassificationInput`-typed `persist_entities_for_classification`. Exactly ONE such call
+    /// may exist in this module — the one inside that wrapper.
+    ///
+    /// RED by construction: add a second call (e.g. re-wire one finish path to pass `&markdown`
+    /// directly) and the count becomes 2. The needle is assembled with `concat!` so this
+    /// assertion's own source text is not itself an occurrence.
+    #[test]
+    fn graph_extraction_has_exactly_one_typed_call_site() {
+        let src = include_str!("pipeline.rs");
+        let needle = concat!("build_and_persist_entities", "(");
+        assert_eq!(
+            src.matches(needle).count(),
+            1,
+            "graph extraction must be reached ONLY through \
+             persist_entities_for_classification(&ClassificationInput); found {} direct calls",
+            src.matches(needle).count()
+        );
+        // …and that one call must hand it the TYPED input, never a raw note string. `concat!` again,
+        // so this line is not itself the occurrence it is looking for.
+        let typed_arg = concat!("input.as_str", "(),");
+        assert!(
+            src.contains(typed_arg),
+            "the wrapper must pass ClassificationInput::as_str()"
+        );
+    }
+
+    /// FIRST-RUN pin for `{{entities}}` (the MAJOR the previous round shipped): `entity_mentions`
+    /// rows are written by the graph step, which runs AFTER assembly — so on a meeting's first
+    /// summarize the gated read returns NOTHING. With `gated_entities` empty the variable must
+    /// still resolve to something real: the note's own `[[wikilink]]` targets.
+    ///
+    /// Also pins that the mixed-kind gated entity list is NOT folded into `participants` (it would
+    /// file `ACME Corp` as an attendee), and that tags/action items/duration come from the note.
+    #[test]
+    fn template_vars_resolve_on_a_first_summarize_with_no_graph_rows() {
+        let model = "---\n\
+                     title: model guess\n\
+                     participants: [Anna, \"Bob C\"]\n\
+                     tags: [q3]\n\
+                     ---\n\n\
+                     # Q3 planning\n\n\
+                     Discussed [[Roadmap]] and [[Pricing|the pricing note]] again, plus [[Roadmap]].\n\n\
+                     ## Action items\n- [ ] Anna — ship it\n";
+
+        // FIRST summarize: the gated graph read is empty.
+        let first = resolve_vars_from_note(
+            Vec::new(),
+            "Q3 planning",
+            "2026-07-26",
+            1800,
+            Some("en"),
+            model,
+        );
+        assert_eq!(
+            first.entities,
+            vec!["Roadmap".to_string(), "Pricing".to_string()],
+            "with no graph rows yet, `{{{{entities}}}}` must resolve from the note's own wikilinks \
+             (de-duplicated, alias stripped, first-appearance order)"
+        );
+        assert_eq!(
+            first.participants,
+            vec!["Anna".to_string(), "Bob C".to_string()],
+            "participants come from the model's own front-matter, nothing else"
+        );
+        assert_eq!(first.tags, vec!["meeting".to_string(), "q3".to_string()]);
+        assert_eq!(first.action_items, vec!["Anna — ship it".to_string()]);
+        assert_eq!(first.duration_minutes, 30);
+        assert_eq!(first.title, "Q3 planning");
+        assert_eq!(first.language.as_deref(), Some("en"));
+
+        // RE-summarize: the gated rows exist now — they lead, wikilinks fill in the rest, and they
+        // still do NOT contaminate `participants` (the list is mixed-kind: people AND orgs).
+        let again = resolve_vars_from_note(
+            vec!["ACME Corp".to_string(), "Roadmap".to_string()],
+            "Q3 planning",
+            "2026-07-26",
+            1800,
+            Some("en"),
+            model,
+        );
+        assert_eq!(
+            again.entities,
+            vec![
+                "ACME Corp".to_string(),
+                "Roadmap".to_string(),
+                "Pricing".to_string()
+            ],
+            "gated names lead; a wikilink already present is not duplicated"
+        );
+        assert_eq!(
+            again.participants, first.participants,
+            "the mixed-kind entity list must never be folded into participants"
+        );
+
+        // A note with no links and no model front-matter degrades to empty lists, never a panic.
+        let bare = resolve_vars_from_note(Vec::new(), "T", "2026-07-26", 0, None, "# Body\n");
+        assert!(bare.entities.is_empty() && bare.participants.is_empty());
+        assert_eq!(bare.tags, vec!["meeting".to_string()]);
+        assert_eq!(bare.duration_minutes, 0);
+    }
+
+    /// `wikilink_targets` handles the shapes Obsidian actually emits and refuses the malformed ones.
+    #[test]
+    fn wikilink_targets_parses_aliases_headings_and_refuses_junk() {
+        assert_eq!(
+            wikilink_targets("see [[A]], [[B|alias]], [[C#Section]], [[  D  ]]"),
+            vec![
+                "A".to_string(),
+                "B".to_string(),
+                "C".to_string(),
+                "D".to_string()
+            ]
+        );
+        // Case-insensitive de-dup, first spelling wins.
+        assert_eq!(
+            wikilink_targets("[[Roadmap]] then [[roadmap]]"),
+            vec!["Roadmap".to_string()]
+        );
+        // Unterminated / empty / line-spanning are not links.
+        assert!(wikilink_targets("[[unterminated").is_empty());
+        assert!(wikilink_targets("[[]] [[   ]]").is_empty());
+        assert!(wikilink_targets("[[spans\nlines]]").is_empty());
+        assert!(wikilink_targets("no links here").is_empty());
     }
 
     #[test]
