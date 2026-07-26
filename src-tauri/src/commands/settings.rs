@@ -1,6 +1,6 @@
 //! Egress-consent commands — extracted verbatim from `commands` (God-file split, a PURE MOVE — no
-//! behavior change). These five commands are each the SINGLE, dedicated writer that flips one
-//! one-time egress-consent flag (cloud egress, web search, Jira, Slack) ON or OFF — persisting the
+//! behavior change). These commands are each the SINGLE, dedicated writer that flips one
+//! one-time egress-consent flag (cloud egress, web search, Jira, Slack, Notion, ClickUp) ON or OFF — persisting the
 //! flag AND refreshing the in-memory config cache, so the next provider/connector build re-reads the
 //! live value fail-closed. They are NON-content-gated: they read/write only a consent boolean via
 //! `AppConfig`'s dedicated `grant_*`/`revoke_*` methods — NO meeting content, no seal/unlock surface,
@@ -97,6 +97,32 @@ pub fn consent_to_slack(state: State<'_, AppState>) -> Result<(), AppError> {
         .lock()
         .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
     cache.grant_slack_consent(&state.db)?;
+    Ok(())
+}
+
+/// One-time Notion egress consent — the ONLY way `notion_consented` flips true. Persists the flag
+/// AND updates the in-memory config cache, so the next `ConnectorRegistry::build` exposes the notion
+/// tool (provided Notion is also enabled + a token is stored). Idempotent.
+#[tauri::command]
+pub fn consent_to_notion(state: State<'_, AppState>) -> Result<(), AppError> {
+    let mut cache = state
+        .config
+        .lock()
+        .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
+    cache.grant_notion_consent(&state.db)?;
+    Ok(())
+}
+
+/// One-time ClickUp egress consent — the ONLY way `clickup_consented` flips true. Persists the flag
+/// AND updates the in-memory config cache, so the next `ConnectorRegistry::build` exposes the clickup
+/// tool (provided ClickUp is also enabled + a workspace id and token are configured). Idempotent.
+#[tauri::command]
+pub fn consent_to_clickup(state: State<'_, AppState>) -> Result<(), AppError> {
+    let mut cache = state
+        .config
+        .lock()
+        .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
+    cache.grant_clickup_consent(&state.db)?;
     Ok(())
 }
 

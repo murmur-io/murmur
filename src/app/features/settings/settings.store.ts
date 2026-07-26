@@ -197,6 +197,11 @@ export class SettingsStore {
     jiraEmail: "",
     // brain2 connectors (Phase 3) — Slack master toggle (NEW EGRESS; round-tripped).
     slackEnabled: false,
+    // brain2 connectors — Notion + ClickUp READ connectors (NEW EGRESS; round-tripped)
+    // plus ClickUp's non-secret workspace ("team") id.
+    notionEnabled: false,
+    clickupEnabled: false,
+    clickupTeamId: "",
     // AI Gateway (Phase 1) — base URL and model, round-tripped on save.
     gatewayBaseUrl: "",
     gatewayModel: "",
@@ -252,6 +257,10 @@ export class SettingsStore {
   readonly jiraTokenControl = new FormControl("", { nonNullable: true });
   /** BYO Slack user token input (Slack connector). Cleared after save. */
   readonly slackTokenControl = new FormControl("", { nonNullable: true });
+  /** BYO Notion integration token input (Notion connector). Cleared after save. */
+  readonly notionTokenControl = new FormControl("", { nonNullable: true });
+  /** BYO ClickUp personal API token input (ClickUp connector). Cleared after save. */
+  readonly clickupTokenControl = new FormControl("", { nonNullable: true });
 
   /**
    * PROTOTYPE auto-save (no Save button): every committed form change persists
@@ -607,6 +616,48 @@ export class SettingsStore {
   /** Surfaced if storing the Slack token rejects. */
   private readonly _slackTokenError = signal<string | null>(null);
   readonly slackTokenError = this._slackTokenError.asReadonly();
+
+  // ── brain2 connectors — Notion (READ connector, NEW EGRESS) ────────────
+
+  /** Notion egress consent state — drives the "Allow Notion access" row; round-tripped on save. */
+  private readonly _notionConsented = signal(false);
+  readonly notionConsented = this._notionConsented.asReadonly();
+  /** True while the one-time Notion consent command is in flight. */
+  private readonly _notionConsenting = signal(false);
+  readonly notionConsenting = this._notionConsenting.asReadonly();
+  /** Surfaced if granting Notion consent rejects. */
+  private readonly _notionConsentError = signal<string | null>(null);
+  readonly notionConsentError = this._notionConsentError.asReadonly();
+  /** Whether a Notion integration token is stored (has-token check; never the value). */
+  private readonly _hasNotionToken = signal(false);
+  readonly hasNotionToken = this._hasNotionToken.asReadonly();
+  /** True while the BYO token is being saved. */
+  private readonly _savingNotionToken = signal(false);
+  readonly savingNotionToken = this._savingNotionToken.asReadonly();
+  /** Surfaced if storing the Notion token rejects. */
+  private readonly _notionTokenError = signal<string | null>(null);
+  readonly notionTokenError = this._notionTokenError.asReadonly();
+
+  // ── brain2 connectors — ClickUp (READ connector, NEW EGRESS) ───────────
+
+  /** ClickUp egress consent state — drives the "Allow ClickUp access" row; round-tripped on save. */
+  private readonly _clickupConsented = signal(false);
+  readonly clickupConsented = this._clickupConsented.asReadonly();
+  /** True while the one-time ClickUp consent command is in flight. */
+  private readonly _clickupConsenting = signal(false);
+  readonly clickupConsenting = this._clickupConsenting.asReadonly();
+  /** Surfaced if granting ClickUp consent rejects. */
+  private readonly _clickupConsentError = signal<string | null>(null);
+  readonly clickupConsentError = this._clickupConsentError.asReadonly();
+  /** Whether a ClickUp API token is stored (has-token check; never the value). */
+  private readonly _hasClickupToken = signal(false);
+  readonly hasClickupToken = this._hasClickupToken.asReadonly();
+  /** True while the BYO token is being saved. */
+  private readonly _savingClickupToken = signal(false);
+  readonly savingClickupToken = this._savingClickupToken.asReadonly();
+  /** Surfaced if storing the ClickUp token rejects. */
+  private readonly _clickupTokenError = signal<string | null>(null);
+  readonly clickupTokenError = this._clickupTokenError.asReadonly();
 
   // ── AI Gateway (Phase 1) — key management + destination computed signals ──
 
@@ -1367,6 +1418,10 @@ export class SettingsStore {
       // brain2 connectors (Phase 3) — Slack consent is preserve-only (granted only via
       // consent_to_slack); snapshot it so save() round-trips it unchanged.
       this._slackConsented.set(cfg.slackConsented ?? false);
+      // brain2 connectors — Notion / ClickUp consent is preserve-only (granted only via
+      // consent_to_notion / consent_to_clickup); snapshot so save() round-trips it unchanged.
+      this._notionConsented.set(cfg.notionConsented ?? false);
+      this._clickupConsented.set(cfg.clickupConsented ?? false);
       this.form.patchValue({
         providerId: cfg.providerId,
         vaultPath: cfg.vaultPath ?? "",
@@ -1421,6 +1476,10 @@ export class SettingsStore {
         jiraEmail: cfg.jiraEmail ?? "",
         // brain2 connectors (Phase 3) — Slack toggle.
         slackEnabled: cfg.slackEnabled ?? false,
+        // brain2 connectors — Notion / ClickUp toggles + ClickUp's non-secret workspace id.
+        notionEnabled: cfg.notionEnabled ?? false,
+        clickupEnabled: cfg.clickupEnabled ?? false,
+        clickupTeamId: cfg.clickupTeamId ?? "",
         // AI Gateway (Phase 1) — base URL + model, default "" for pre-existing configs.
         gatewayBaseUrl: cfg.gatewayBaseUrl ?? "",
         gatewayModel: cfg.gatewayModel ?? "",
@@ -1475,6 +1534,10 @@ export class SettingsStore {
       this._hasWebKey.set(await this.ipc.hasWebSearchKey().catch(() => false));
       this._hasJiraToken.set(await this.ipc.hasJiraToken().catch(() => false));
       this._hasSlackToken.set(await this.ipc.hasSlackToken().catch(() => false));
+      this._hasNotionToken.set(await this.ipc.hasNotionToken().catch(() => false));
+      this._hasClickupToken.set(
+        await this.ipc.hasClickupToken().catch(() => false),
+      );
       this._hasGatewayKey.set(await this.ipc.hasGatewayKey().catch(() => false));
       this._modelPresent.set(await this.ipc.modelPresent());
       // OPTIONAL parakeet live-ASR engine presence (best-effort — absent is the common case).
@@ -2166,6 +2229,14 @@ export class SettingsStore {
       // save just carries the current value back.
       slackEnabled: v.slackEnabled,
       slackConsented: this.slackConsented(),
+      // brain2 connectors — Notion / ClickUp toggles (+ ClickUp's non-secret workspace id) are
+      // settable from the form; their consent is PRESERVE-ONLY (granted via allowNotion /
+      // allowClickup's dedicated commands), so a save just carries the current value back.
+      notionEnabled: v.notionEnabled,
+      notionConsented: this.notionConsented(),
+      clickupEnabled: v.clickupEnabled,
+      clickupConsented: this.clickupConsented(),
+      clickupTeamId: v.clickupTeamId,
       // Round-trip the Stage E security flags so a settings save never silently
       // resets them. Cloud-egress consent is GRANTED only via the dedicated
       // command (allowCloudProcessing) — here we just carry the current value back.
@@ -2471,6 +2542,86 @@ export class SettingsStore {
       this._slackConsentError.set(String(e));
     } finally {
       this._slackConsenting.set(false);
+    }
+  }
+
+  /**
+   * brain2 connectors — store/replace the BYO Notion integration token in the
+   * Keychain, then re-probe presence so the "Token set ✓" pill flips. The value is
+   * cleared from the input after saving (it's never shown back). Mirrors saveSlackToken().
+   */
+  async saveNotionToken(): Promise<void> {
+    const key = this.notionTokenControl.value;
+    if (!key.trim()) return;
+    this._notionTokenError.set(null);
+    this._savingNotionToken.set(true);
+    try {
+      await this.ipc.setNotionToken(key);
+      this.notionTokenControl.setValue("");
+      this._hasNotionToken.set(await this.ipc.hasNotionToken());
+    } catch (e) {
+      this._notionTokenError.set(String(e));
+    } finally {
+      this._savingNotionToken.set(false);
+    }
+  }
+
+  /**
+   * brain2 connectors — grant the one-time Notion egress consent via the dedicated
+   * command (an explicit, auditable user act — NOT a side effect of a normal settings
+   * save). After it resolves the brain may expose the Notion connector (when Notion is
+   * enabled AND a token is stored). Mirrors allowSlack().
+   */
+  async allowNotion(): Promise<void> {
+    this._notionConsentError.set(null);
+    this._notionConsenting.set(true);
+    try {
+      await this.ipc.consentToNotion();
+      this._notionConsented.set(true);
+    } catch (e) {
+      this._notionConsentError.set(String(e));
+    } finally {
+      this._notionConsenting.set(false);
+    }
+  }
+
+  /**
+   * brain2 connectors — store/replace the BYO ClickUp personal API token in the
+   * Keychain, then re-probe presence so the "Token set ✓" pill flips. The value is
+   * cleared from the input after saving (it's never shown back). Mirrors saveNotionToken().
+   */
+  async saveClickupToken(): Promise<void> {
+    const key = this.clickupTokenControl.value;
+    if (!key.trim()) return;
+    this._clickupTokenError.set(null);
+    this._savingClickupToken.set(true);
+    try {
+      await this.ipc.setClickupToken(key);
+      this.clickupTokenControl.setValue("");
+      this._hasClickupToken.set(await this.ipc.hasClickupToken());
+    } catch (e) {
+      this._clickupTokenError.set(String(e));
+    } finally {
+      this._savingClickupToken.set(false);
+    }
+  }
+
+  /**
+   * brain2 connectors — grant the one-time ClickUp egress consent via the dedicated
+   * command (an explicit, auditable user act — NOT a side effect of a normal settings
+   * save). After it resolves the brain may expose the ClickUp connector (when ClickUp is
+   * enabled AND a workspace id + token are configured). Mirrors allowNotion().
+   */
+  async allowClickup(): Promise<void> {
+    this._clickupConsentError.set(null);
+    this._clickupConsenting.set(true);
+    try {
+      await this.ipc.consentToClickup();
+      this._clickupConsented.set(true);
+    } catch (e) {
+      this._clickupConsentError.set(String(e));
+    } finally {
+      this._clickupConsenting.set(false);
     }
   }
 
