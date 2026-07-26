@@ -1311,6 +1311,27 @@ export interface SavedRecipe {
   createdAt: string;
 }
 
+/** One ordered `## {heading}` block of a user-authored note template (declarative data). */
+export interface NoteTemplateSection {
+  heading: string;
+  instruction: string;
+}
+
+/**
+ * A user-authored NOTE TEMPLATE (Granola-style named sections). Selected by `id` via the note-style
+ * selector and rendered into the summarizer system prompt. Mirrors the Rust `storage::models::
+ * NoteTemplate`. Declarative data only — the backend rejects scripting tokens (`<%`, `tp.`,
+ * `require(`, `process.`) at save.
+ */
+export interface NoteTemplate {
+  id: string;
+  name: string;
+  tone: string;
+  sections: NoteTemplateSection[];
+  extraFrontmatterKeys: string[];
+  createdAt: string;
+}
+
 export interface ActionItem {
   idx: number;
   done: boolean;
