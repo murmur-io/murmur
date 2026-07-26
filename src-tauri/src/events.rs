@@ -447,6 +447,38 @@ pub fn emit_org_feed_updated(app: &AppHandle, orgs_changed: u32) {
     }
 }
 
+/// The [`EVENT_ORG_FEED_UPDATED`] emit seen as a capability rather than as a concrete `AppHandle`.
+///
+/// Exists so the "did this command actually tell the FE to re-fetch?" half of an org-item mutation is
+/// UNIT-TESTABLE. An org-item-mutating command that stays silent leaves `OrgBrainService.loadOrgs()`,
+/// the Settings organization section and the org-item viewer showing a row that no longer exists
+/// until an unrelated background tick happens to be productive (up to
+/// [`crate::commands::ORG_SYNC_TICK_SECS`] later, or never on a quiet feed). That omission shipped
+/// once already (`revoke_org_share`), so THAT command's emit is expressed as a seam a test can
+/// observe rather than a bare line that is easy to forget and impossible to assert on. The other
+/// org-item-mutating commands still call [`emit_org_feed_updated`] directly — this trait is the
+/// testing seam for the path that regressed, not (yet) a repo-wide convention.
+///
+/// The production implementation is the `AppHandle` one below; the crate's tests substitute a
+/// recording double. Content-free by construction — the only argument is a count.
+///
+/// `Send + Sync` is REQUIRED, not decorative: the notifier is held across the `await` of the revoke
+/// inside an `async` `#[tauri::command]`, and Tauri's `generate_handler!` demands a `Send` future.
+/// Without the supertraits `&dyn OrgFeedNotifier` is neither, and the command fails to compile with
+/// "future returned by `revoke_org_share` is not `Send`". Both implementations (`AppHandle` and the
+/// tests' `Mutex`-backed recorder) already satisfy them.
+pub trait OrgFeedNotifier: Send + Sync {
+    /// Tell the FE that `orgs_changed` orgs' local replicas changed and every org view should
+    /// re-fetch. Best-effort: an implementation must never fail the caller's operation.
+    fn org_feed_updated(&self, orgs_changed: u32);
+}
+
+impl OrgFeedNotifier for AppHandle {
+    fn org_feed_updated(&self, orgs_changed: u32) {
+        emit_org_feed_updated(self, orgs_changed);
+    }
+}
+
 /// DELETE FAN-OUT FIX (2026-07-15): emitted once a note/meeting delete has FULLY succeeded — local
 /// rows gone AND (per the org-share revoke-cascade fix) any live org shares of it already revoked.
 /// Root cause this closes: no delete flow ever told OTHER open consumers (most visibly the tab-strip,
