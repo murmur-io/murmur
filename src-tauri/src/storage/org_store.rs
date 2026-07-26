@@ -37,20 +37,27 @@ pub(crate) struct PreparedOrgItemIndex {
     vector_blobs: Option<Vec<Vec<u8>>>,
 }
 
+/// What this device currently holds for ONE org item id — the minimum the anti-entropy reconcile
+/// sweep needs to decide "already converged, skip" vs "fetch + ingest" WITHOUT downloading a blob,
+/// and the same read [`crate::commands::org_sweep_pending`] uses to spot an orphaned replica of an
+/// already-revoked share. Content-free: a tombstone flag plus the opaque plaintext hash the publisher
+/// sealed under — never the markdown, the title, or any key material.
+#[derive(Clone, Debug)]
+pub(crate) struct OrgReplicaState {
+    /// `true` once the item has been evicted here. Append-only and permanent: a later live feed
+    /// record must never resurrect withdrawn plaintext.
+    pub(crate) tombstoned: bool,
+    /// The publisher's plaintext hash for the version stored locally, or `None` for a row written
+    /// before the feed carried one. Equality with the feed's hash is what lets the sweep skip an
+    /// already-converged item with no blob fetch.
+    pub(crate) content_sha256: Option<Vec<u8>>,
+}
+
 /// One live org item's existing chunk rows, loaded for a model-switch reindex. The keyset iterator
 /// returns exactly one item at a time so a large local replica never becomes one plaintext RAM
 /// buffer. Ordered chunk ids plus the canonical item version/hash form the optimistic concurrency
 /// token for the vector-only commit (SQLite rowids may be reused after a clean replace, so ids alone
 /// are insufficient).
-/// What this device currently holds for ONE org item id — the minimum the anti-entropy reconcile
-/// sweep needs to decide "already converged, skip" vs "fetch + ingest" WITHOUT downloading a blob.
-/// Content-free: a tombstone flag plus the opaque plaintext hash the publisher sealed under.
-#[derive(Clone, Debug)]
-pub(crate) struct OrgReplicaState {
-    pub(crate) tombstoned: bool,
-    pub(crate) content_sha256: Option<Vec<u8>>,
-}
-
 pub(crate) struct OrgItemVectorBatch {
     pub(crate) item_id: String,
     pub(crate) chunk_ids: Vec<i64>,
