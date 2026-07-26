@@ -64,6 +64,13 @@ export class SettingsTranscriptionSectionComponent {
     // — the counterpart to the onboarding wizard's `"auto"` preselect.
     this.store.markModelSizeUserPick();
     this.form.controls.modelSize.setValue(size);
+    // MANDATORY, and the reason the pick was SILENTLY DISCARDED before: `setValue` is a
+    // PROGRAMMATIC write, which does not mark the form dirty, and the store's debounced
+    // auto-save is gated on `form.dirty` (settings.store.ts). Without this the rung visibly
+    // moves and NOTHING is persisted — the picker looks like it worked. Every sibling that
+    // patches the form on the user's behalf does the same (role/posture picks, vault pickers);
+    // see the convention note in settings.store.ts.
+    this.form.markAsDirty();
   }
 
   downloadModel(): void {

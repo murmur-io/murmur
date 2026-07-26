@@ -119,12 +119,19 @@ export class ModelPowerComponent {
     this.ladder().map((m) => ({ id: m.id, name: m.tier ?? m.id })),
   );
 
-  /** Every catalog row that is NOT a rung — the honest long tail. */
+  /**
+   * EVERY catalog row, rungs included — this list is also the only place a downloaded
+   * model can be DELETED.
+   *
+   * It deliberately no longer filters to `tier === null`. Doing so made the two
+   * biggest downloads the ladder actively invites — Sharp (~875 MB) and Maximum
+   * (~3 GB) — impossible to remove from any surface, so "reclaim disk" was
+   * unreachable for exactly the sizes that cost disk. The backend's four refusals
+   * (effective model, live-caption pin, non-registry id, never VAD/Parakeet) already
+   * make surfacing it safe.
+   */
   readonly longTail = computed<WhisperModelDto[]>(() =>
-    this.machine
-      .models()
-      .filter((m) => m.tier === null)
-      .sort((a, b) => a.power - b.power),
+    [...this.machine.models()].sort((a, b) => a.power - b.power),
   );
 
   /** The catalog row for the current selection, or `null` for an unknown/custom id. */
