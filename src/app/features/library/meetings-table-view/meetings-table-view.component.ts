@@ -9,8 +9,18 @@ import { MurTableComponent } from "../../../design-system/table/table.component"
 import { MurTableColumnComponent } from "../../../design-system/table/table-column.component";
 import { LockBadgeComponent } from "../../folders/lock-badge/lock-badge.component";
 import type { FolderExposure } from "../../../services/folders.service";
-import type { Meeting, MeetingStatus } from "../../../core/models";
+import {
+  meetingStatusLabel,
+  meetingStatusPillClass,
+} from "../../../design-system/meeting-status";
+import type { Meeting } from "../../../core/models";
 import type { ViewRow } from "../../../services/view-engine";
+
+/** A {@link ViewRow} plus its pre-derived status-pill presentation. */
+export interface DecoratedViewRow extends ViewRow {
+  readonly statusPillClass: string;
+  readonly statusLabel: string;
+}
 
 /** One resolved column: its field id + header label. */
 interface TableColumn {
@@ -84,6 +94,20 @@ export class MeetingsTableViewComponent {
     }),
   );
 
+  /**
+   * The rows fed to `<mur-table>`, each carrying its status-pill presentation
+   * already derived — the cell template must not call a helper per row (a
+   * method binding re-runs on every change-detection pass; a `computed` is
+   * cached and dependency-tracked).
+   */
+  readonly decoratedRows = computed<DecoratedViewRow[]>(() =>
+    this.rows().map((row) => ({
+      ...row,
+      statusPillClass: meetingStatusPillClass(row.meeting.status),
+      statusLabel: meetingStatusLabel(row.meeting.status),
+    })),
+  );
+
   /** `@for` / `mur-table` track key — stable per meeting. */
   readonly trackByRow = (row: ViewRow): string => row.meeting.id;
 
@@ -94,26 +118,6 @@ export class MeetingsTableViewComponent {
 
   onOpen(event: Event, meeting: Meeting): void {
     this.openMeeting.emit({ event, meeting });
-  }
-
-  statusLabel(s: string): string {
-    return s.charAt(0) + s.slice(1).toLowerCase();
-  }
-
-  /** Maps a meeting status to a status-pill state modifier (matches the list). */
-  statusPillClass(s: MeetingStatus): string {
-    switch (s) {
-      case "RECORDING":
-      case "ERROR":
-        return "is-danger";
-      case "TRANSCRIBED":
-      case "SUMMARIZED":
-        return "is-accent";
-      case "EXPORTED":
-        return "is-success";
-      default:
-        return "";
-    }
   }
 
   formatDate(startedAt: string): string {

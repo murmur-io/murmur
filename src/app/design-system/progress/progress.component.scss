@@ -1,0 +1,54 @@
+/* The HOST is the track: one element, no wrapper. `--radius-pill` renders the
+   same 3px/4px corner the seven hand-rolled bars used (a radius is clamped to
+   half the box height), so migrating them is visually neutral. */
+:host {
+  display: block;
+  position: relative;
+  width: 100%;
+  height: 6px;
+  border-radius: var(--radius-pill);
+  background: var(--surface-input);
+  overflow: hidden;
+}
+
+/* The wizard bars (onboarding + privacy) run one step heavier. */
+:host(.is-md) {
+  height: 8px;
+}
+
+.fill {
+  height: 100%;
+  border-radius: var(--radius-pill);
+  background: var(--accent);
+  transition: width var(--transition);
+}
+
+/* Indeterminate: a sliver sweeping the track — no width binding, so it reads as
+   "busy, amount unknown" (the host also omits aria-valuenow). */
+.fill--indeterminate {
+  position: absolute;
+  inset-block: 0;
+  width: 35%;
+  animation: mur-progress-sweep 1.4s ease-in-out infinite;
+}
+
+@keyframes mur-progress-sweep {
+  from {
+    inset-inline-start: -35%;
+  }
+  to {
+    inset-inline-start: 100%;
+  }
+}
+
+/* Belt-and-braces over the global reduced-motion rule in styles.css: that rule
+   only crushes the DURATION, which would leave this sweep strobing. Pin the
+   sliver to a full, still bar instead. */
+@media (prefers-reduced-motion: reduce) {
+  .fill--indeterminate {
+    animation: none;
+    inset-inline-start: 0;
+    width: 100%;
+    opacity: 0.5;
+  }
+}

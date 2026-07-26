@@ -21,6 +21,7 @@ import { save } from "@tauri-apps/plugin-dialog";
 import { IpcService } from "../../../core/ipc.service";
 import { tabKeyFor } from "../../../core/tab-keys";
 import { TabsService } from "../../../core/tabs.service";
+import { meetingStatusPillClass } from "../../../design-system/meeting-status";
 import type {
   AppConfigDto,
   AssistantInteraction,
@@ -93,6 +94,16 @@ export class DetailComponent implements OnInit {
   private readonly tabsService = inject(TabsService);
 
   readonly detail = signal<MeetingDetail | null>(null);
+
+  /**
+   * The header status pill's state modifier — DERIVED, not a template method
+   * call (a method binding re-runs on every change-detection pass; a computed
+   * is cached + dependency-tracked). Empty while nothing is loaded, which
+   * renders the neutral pill.
+   */
+  readonly statusPillClass = computed(() =>
+    meetingStatusPillClass(this.detail()?.meeting.status ?? ""),
+  );
   readonly loading = signal(true);
   readonly busy = signal(false);
   readonly msg = signal("");
@@ -2173,22 +2184,6 @@ export class DetailComponent implements OnInit {
   /** Strip surrounding quotes/whitespace from a YAML scalar. */
   private cleanScalar(s: string): string {
     return s.trim().replace(/^["']/, "").replace(/["']$/, "").trim();
-  }
-
-  /** Maps a meeting status to a status-pill state modifier (presentation only). */
-  statusPillClass(status: string): string {
-    switch (status) {
-      case "RECORDING":
-      case "ERROR":
-        return "is-danger";
-      case "TRANSCRIBED":
-      case "SUMMARIZED":
-        return "is-accent";
-      case "EXPORTED":
-        return "is-success";
-      default:
-        return "";
-    }
   }
 
   /** Presentational: stored timestamp → friendly local date. */
