@@ -12,20 +12,40 @@ use crate::summarize::provider::SummarizeRequest;
 /// text can ever be persisted, let alone egressed as the system prompt.
 pub const FORBIDDEN_TEMPLATE_TOKENS: [&str; 4] = ["<%", "tp.", "require(", "process."];
 
-/// Reject a note template whose ANY text field contains a scripting token. Called by the
-/// `save_note_template` command BEFORE persisting. Declarative data only, ever — this is the
-/// security boundary for the template layer (the rendered prompt still passes the
+/// Reject a note template whose ANY text field contains a scripting token, OR misuses the `{{}}`
+/// DSL. Called by the `save_note_template` command BEFORE persisting. Declarative data only, ever —
+/// this is the security boundary for the template layer (the rendered prompt still passes the
 /// `RedactingProvider` firewall on egress, unchanged).
+///
+/// WHICH FIELDS SUPPORT THE `{{}}` DSL (T4b) — the split is deliberate and enforced HERE:
+///   * `sections[].heading` / `sections[].instruction` — YES. They are rendered into the body: the
+///     `body_scaffold` substitutes them ([`render_body_scaffold`]) and any placeholder the model
+///     echoes back from the instruction is resolved in the finished note
+///     ([`assemble_note_with_template`]), so a placeholder in a section can never reach the user
+///     unresolved.
+///   * `extra_frontmatter_keys` — YES (`client: {{entities}}`). This is the deterministic
+///     front-matter binding: Murmur resolves + YAML-escapes it itself.
+///   * `name` / `tone` — NO. Neither is ever rendered into a note: `name` is a picker label and
+///     `tone` is a directive sent verbatim to the model. A `{{}}` there would silently be literal
+///     text forever, so it is REFUSED outright rather than accepted-and-ignored.
+///
+/// FAIL-CLOSED at SAVE: an unknown / malformed `{{ … }}` is REFUSED here rather than silently
+/// dropped at render time, so a typo'd variable can never quietly vanish from a user's notes and an
+/// ident outside the closed `match` can never reach the renderer at all.
 pub fn validate_note_template(name: &str, tone: &str, t: &NoteTemplate) -> Result<()> {
-    let mut fields: Vec<&str> = vec![name, tone];
+    // Fields that DO render `{{}}` (validated against the allowlist) …
+    let mut dsl_fields: Vec<&str> = Vec::new();
     for s in &t.sections {
-        fields.push(&s.heading);
-        fields.push(&s.instruction);
+        dsl_fields.push(&s.heading);
+        dsl_fields.push(&s.instruction);
     }
     for k in &t.extra_frontmatter_keys {
-        fields.push(k);
+        dsl_fields.push(k);
     }
-    for f in fields {
+    // … and fields that never do (any `{{` is refused).
+    let plain_fields: [&str; 2] = [name, tone];
+
+    for f in plain_fields.iter().copied().chain(dsl_fields.iter().copied()) {
         for tok in FORBIDDEN_TEMPLATE_TOKENS {
             if f.contains(tok) {
                 return Err(AppError::InvalidArg(format!(
@@ -34,6 +54,19 @@ pub fn validate_note_template(name: &str, tone: &str, t: &NoteTemplate) -> Resul
                 )));
             }
         }
+    }
+    for f in plain_fields {
+        if f.contains("{{") {
+            return Err(AppError::InvalidArg(
+                "`{{ … }}` variables are only supported in a template's SECTIONS and its \
+                 front-matter keys — the template name and tone are never rendered into a note, \
+                 so a variable there would stay literal text"
+                    .to_string(),
+            ));
+        }
+    }
+    for f in dsl_fields {
+        validate_template_vars(f)?;
     }
     Ok(())
 }
@@ -61,6 +94,14 @@ pub fn set_saved_templates(templates: Vec<NoteTemplate>) {
     for t in templates {
         map.insert(t.id.clone(), t);
     }
+}
+
+/// Resolve a saved template by id from the registry (a cheap read-lock clone), or `None` for a
+/// built-in / unknown id. THE registry seam callers outside this module use, so a consumer (the
+/// pipeline) resolves the row ONCE and then passes it EXPLICITLY to the pure renderers — which is
+/// what keeps the renderers unit-testable without mutating process-global state.
+pub fn saved_template(id: &str) -> Option<NoteTemplate> {
+    lookup_saved_template(id)
 }
 
 /// Resolve a saved template by id from the registry (a cheap read-lock clone), or `None`.
@@ -207,8 +248,13 @@ fn style_variant_with_keys(tone: &str, body_sections: &str, extra_keys: &[String
     } else {
         format!(" {tone}")
     };
+    // T4b: a key whose entry carries a `{{}}` value is filled DETERMINISTICALLY by Murmur after the
+    // provider call — asking the model for it would be wasted prompt AND a second, guessed source of
+    // truth, so it is omitted here. A plain key (no `{{}}`) renders the legacy request line
+    // byte-identically.
     let extra = extra_keys
         .iter()
+        .filter(|k| !k.contains("{{"))
         .map(|k| format!("- {}: (fill in from the meeting, or omit if unknown)\n", k.trim()))
         .collect::<String>();
     format!(
@@ -488,6 +534,636 @@ recipe: {recipe}\n\
         source = yaml_quote(source_name),
         recipe = recipe,
     )
+}
+
+// ── T4b — the LOGIC-LESS `{{}}` variable DSL + MURMUR-ASSEMBLED front-matter ─────────────────────
+//
+// WHY. Until now the note's YAML front-matter was GUESSED BY THE MODEL from the transcript and only
+// validated to start with `---` (`claude_code.rs`'s output check). That is both a correctness
+// problem (a hallucinated `date:`, a dropped `participants:`) and an INJECTION surface: whatever the
+// model echoes lands verbatim in a file Obsidian parses — a transcript-derived participant literally
+// named `---\nadmin: true` closes the fence and opens a second document, and `<% tp.system %>` is a
+// Templater payload the vault would EXECUTE.
+//
+// So Murmur assembles the front-matter itself: the LLM produces the BODY, Murmur resolves a small
+// FIXED set of deterministic variables, strips the fence/scripting tokens out of every resolved
+// value, YAML-escapes it, builds the `---` block and PREPENDS it.
+//
+// GRAMMAR (deliberately not a language): `{{ident}}` or `{{ident:format}}`, `ident` ∈ a closed Rust
+// `match` ([`is_known_template_var`]). No expressions, no conditionals, no loops, no nesting, no
+// recursion — [`substitute_vars`] is a SINGLE pass whose replacement text is never re-scanned, and
+// every resolved value has `{{` stripped so a value can never become a placeholder.
+//
+// EGRESS — SCOPE, precisely. Resolved values are computed AFTER the provider call, so they cannot
+// ride the generation prompt. On top of that, `pipeline::note_split::assemble_and_split` types
+// the pre-assembly output as a `ClassificationInput`, and the two CLASSIFICATION-only consumers
+// (`resolve_subfolder` → the thematic folder classifier, and the graph-extraction step) take that
+// TYPE — so they structurally cannot be handed the assembled note. That is the enforced guarantee
+// and it is exactly two call paths wide; it is NOT a claim that the resolved values never leave the
+// device by any route. The assembled note is what gets persisted, sealed and exported, so anything
+// that later reads the STORED note (Ask grounding, a re-summarize, a share/publish) sees them —
+// which is why every value must come from this meeting's own note plus its own
+// `visibility_clause`-gated reads, and nothing wider. `meeting_id` is deliberately NOT a variable —
+// no user-facing note value, highest linkability cost.
+
+/// The FIXED allowlist of `{{}}` identifiers, in the order the error message lists them. Kept in
+/// lockstep with the closed `match` in [`is_known_template_var`] (pinned by a test).
+///
+/// `title` / `date` reuse the Obsidian/Templater spellings so a template pasted from a vault keeps
+/// working for the shared keys.
+///
+/// What each resolves FROM is the pipeline's job — see `pipeline::resolve_vars_from_note`. Two are
+/// worth knowing here: `participants` is the model's own front-matter list (the only source that
+/// heard the room), and `entities` is the `visibility_clause`-gated graph list UNION the note's own
+/// `[[wikilink]]` targets, because the graph rows for a meeting are written AFTER its note is
+/// assembled and so are empty on a first summarize.
+pub const TEMPLATE_VARS: [&str; 8] = [
+    "title",
+    "date",
+    "duration_minutes",
+    "participants",
+    "action_items",
+    "entities",
+    "tags",
+    "language",
+];
+
+/// Is `ident` a known template variable? THE allowlist — a closed `match`, no dynamic namespace.
+///
+/// NOT included, on purpose: `meeting_id` (a UUID with no user-facing note value and the highest
+/// linkability cost of anything we hold — dropped by the 2026-07-26 egress review).
+pub fn is_known_template_var(ident: &str) -> bool {
+    matches!(
+        ident,
+        "title"
+            | "date"
+            | "duration_minutes"
+            | "participants"
+            | "action_items"
+            | "entities"
+            | "tags"
+            | "language"
+    )
+}
+
+/// The front-matter keys Murmur OWNS: it renders each one deterministically, so a model-emitted line
+/// for the same key is dropped during the merge rather than duplicated.
+const OWNED_FRONT_MATTER_KEYS: [&str; 5] = [
+    "title",
+    "date",
+    "duration_minutes",
+    "tags",
+    "participants",
+];
+
+/// Bound on how many items a list variable renders (a runaway entity list must not turn the
+/// front-matter block into the note) and on how many model-emitted lines survive the merge.
+const MAX_LIST_ITEMS: usize = 24;
+const MAX_PRESERVED_FRONT_MATTER_LINES: usize = 32;
+
+/// The DETERMINISTIC values behind the `{{}}` variables for ONE meeting. Resolved by the pipeline
+/// from the meeting's own row plus the GATED store (`Db::list_entities_for_meeting_visible`, i.e.
+/// the same `visibility_clause` predicate as every other graph read), never by the model.
+///
+/// Plain data + pure rendering, so the whole escaping/stripping contract is unit-testable without a
+/// DB or an `AppState`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResolvedVars {
+    pub title: String,
+    pub date_iso: String,
+    pub duration_minutes: i64,
+    pub participants: Vec<String>,
+    pub action_items: Vec<String>,
+    pub entities: Vec<String>,
+    pub tags: Vec<String>,
+    pub language: Option<String>,
+}
+
+/// Tokens a RESOLVED value may never carry into the note: the front-matter fence (`---`), the
+/// Templater opening/closing pair, and `{{`/`}}` (so a value can never be re-read as a placeholder).
+/// Stripped ANYWHERE in the value, not just leading — `<% tp.system %>` is a live payload wherever
+/// it sits in a line Obsidian renders.
+const VALUE_STRIP_TOKENS: [&str; 5] = ["<%", "%>", "{{", "}}", "---"];
+
+/// Make an arbitrary resolved value safe to place in a note:
+///   1. strip every fence/scripting token, repeating until STABLE so a removal can never SPLICE a
+///      new token into existence (`<<%%>>` → `<%>` → …) — bounded, never recursive;
+///   2. collapse ALL whitespace to single spaces (a front-matter scalar is single-line by
+///      construction — this is what defuses `---\nadmin: true`, and it tidies the gaps step 1 left);
+///   3. strip once more, because collapsing whitespace is the only way step 1's output could change.
+fn sanitize_value(raw: &str) -> String {
+    fn strip_tokens(mut s: String) -> String {
+        for _ in 0..4 {
+            let before = s.clone();
+            for tok in VALUE_STRIP_TOKENS {
+                if s.contains(tok) {
+                    s = s.replace(tok, "");
+                }
+            }
+            if s == before {
+                break;
+            }
+        }
+        s
+    }
+    let stripped = strip_tokens(raw.to_string());
+    let flat = stripped.split_whitespace().collect::<Vec<_>>().join(" ");
+    strip_tokens(flat).trim().to_string()
+}
+
+/// Would YAML re-TYPE this plain scalar as something other than a string? A reserved boolean/null
+/// word (YAML 1.1 accepts `y`/`yes`/`on`/`off` too, and Obsidian's parser follows suit) or anything
+/// that parses as a number — a participant literally named `No`, or a purely numeric title like
+/// `2026`, must come out of the block as a STRING, not `false` / `2026`.
+///
+/// `f64::from_str` also accepts `inf` / `infinity` / `nan` (case-insensitively), so the numeric test
+/// covers those spellings on its own.
+fn is_yaml_typed_plain(v: &str) -> bool {
+    let lower = v.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "y" | "n"
+            | "yes"
+            | "no"
+            | "true"
+            | "false"
+            | "on"
+            | "off"
+            | "null"
+            | "~"
+            | ".nan"
+            | ".inf"
+            | "+.inf"
+            | "-.inf"
+    ) || v.parse::<f64>().is_ok()
+}
+
+/// Render one sanitized value as a YAML scalar: bare when it is unambiguously a plain STRING token
+/// (`2026-07-26`, `Q3_planning`), double-quoted+escaped otherwise — so a raw `:` / `"` / `#` in a
+/// participant name can never break the block, and a reserved word / number
+/// ([`is_yaml_typed_plain`]) can never be re-typed away from the string the user meant.
+fn yaml_scalar(raw: &str) -> String {
+    let v = sanitize_value(raw);
+    let bare = !v.is_empty()
+        && !v.starts_with('-')
+        && v.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '-'))
+        && !is_yaml_typed_plain(&v);
+    if bare {
+        v
+    } else {
+        yaml_quote(&v)
+    }
+}
+
+/// Render a list variable as a YAML flow list of scalars (`[]` when empty), capped at
+/// [`MAX_LIST_ITEMS`]. Every item goes through [`yaml_scalar`], so an injected item is quoted, not
+/// executed.
+fn yaml_flow_list(items: &[String]) -> String {
+    let rendered = items
+        .iter()
+        .map(|s| sanitize_value(s.as_str()))
+        .filter(|s| !s.is_empty())
+        .take(MAX_LIST_ITEMS)
+        .map(|s| yaml_scalar(&s))
+        .collect::<Vec<_>>();
+    format!("[{}]", rendered.join(", "))
+}
+
+/// Format an ISO date with an Obsidian/moment-style pattern (`YYYY-MM-DD`, `DD.MM.YYYY`, `MMMM D`).
+/// Unparseable date or empty format ⇒ the sanitized ISO string, unchanged. Single left-to-right
+/// pass, longest token first — emitted text is never re-scanned, so a month NAME containing `M`
+/// cannot re-expand.
+fn format_date(date_iso: &str, format: Option<&str>) -> String {
+    let iso = sanitize_value(date_iso);
+    let Some(fmt) = format.map(str::trim).filter(|f| !f.is_empty()) else {
+        return iso;
+    };
+    let Some(date) = iso
+        .get(..10)
+        .and_then(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
+    else {
+        return iso;
+    };
+    let tokens: [(&str, String); 9] = [
+        ("YYYY", date.format("%Y").to_string()),
+        ("YY", date.format("%y").to_string()),
+        ("MMMM", date.format("%B").to_string()),
+        ("MMM", date.format("%b").to_string()),
+        ("MM", date.format("%m").to_string()),
+        ("dddd", date.format("%A").to_string()),
+        ("ddd", date.format("%a").to_string()),
+        ("DD", date.format("%d").to_string()),
+        ("D", date.format("%e").to_string().trim().to_string()),
+    ];
+    let mut out = String::new();
+    let mut at = 0usize;
+    while at < fmt.len() {
+        let rest = &fmt[at..];
+        match tokens.iter().find(|(tok, _)| rest.starts_with(tok)) {
+            Some((tok, value)) => {
+                out.push_str(value);
+                at += tok.len();
+            }
+            None => {
+                let ch = rest.chars().next().unwrap_or('\u{0}');
+                out.push(ch);
+                at += ch.len_utf8();
+            }
+        }
+    }
+    sanitize_value(&out)
+}
+
+/// The compiled `{{ident}}` / `{{ident:format}}` grammar, shared by the renderer and the save-time
+/// validator so the two can never drift. `None` only if the (constant, test-pinned) pattern failed
+/// to compile — callers then fail CLOSED rather than `expect()`-ing.
+fn var_regex() -> Option<&'static regex::Regex> {
+    static RE: OnceLock<Option<regex::Regex>> = OnceLock::new();
+    RE.get_or_init(|| {
+        regex::Regex::new(r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*(?::([^{}\r\n]*))?\}\}").ok()
+    })
+    .as_ref()
+}
+
+/// Resolve one variable to its INLINE (body) text form. Lists comma-join; `date` honors the
+/// optional format. Returns `None` for an ident outside the allowlist.
+fn resolve_var_inline(vars: &ResolvedVars, ident: &str, format: Option<&str>) -> Option<String> {
+    let join = |items: &[String]| {
+        items
+            .iter()
+            .map(|s| sanitize_value(s.as_str()))
+            .filter(|s| !s.is_empty())
+            .take(MAX_LIST_ITEMS)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let value = match ident {
+        "title" => sanitize_value(&vars.title),
+        "date" => format_date(&vars.date_iso, format),
+        "duration_minutes" => vars.duration_minutes.to_string(),
+        "participants" => join(&vars.participants),
+        "action_items" => join(&vars.action_items),
+        "entities" => join(&vars.entities),
+        "tags" => join(&vars.tags),
+        "language" => sanitize_value(vars.language.as_deref().unwrap_or("")),
+        _ => return None,
+    };
+    Some(value)
+}
+
+/// Resolve one variable to its YAML (front-matter) value form: a flow list for the list vars, a
+/// bare/quoted scalar otherwise.
+fn resolve_var_yaml(vars: &ResolvedVars, ident: &str, format: Option<&str>) -> Option<String> {
+    match ident {
+        "participants" => Some(yaml_flow_list(&vars.participants)),
+        "action_items" => Some(yaml_flow_list(&vars.action_items)),
+        "entities" => Some(yaml_flow_list(&vars.entities)),
+        "tags" => Some(yaml_flow_list(&vars.tags)),
+        "duration_minutes" => Some(vars.duration_minutes.to_string()),
+        _ => resolve_var_inline(vars, ident, format).map(|v| yaml_scalar(&v)),
+    }
+}
+
+/// SINGLE-PASS `{{}}` substitution over arbitrary text. `replace_all` writes each replacement
+/// straight to the output (it is never re-scanned) and every resolved value has `{{`/`<%` stripped,
+/// so expansion is non-recursive BY CONSTRUCTION. An ident outside the allowlist is left VERBATIM —
+/// visible in the note, never silently dropped (and it cannot get this far: `validate_note_template`
+/// refuses it at save).
+pub fn substitute_vars(input: &str, vars: &ResolvedVars) -> String {
+    let Some(re) = var_regex() else {
+        return input.to_string();
+    };
+    re.replace_all(input, |caps: &regex::Captures<'_>| {
+        let whole = caps.get(0).map(|m| m.as_str()).unwrap_or_default();
+        let ident = caps.get(1).map(|m| m.as_str()).unwrap_or_default();
+        let format = caps.get(2).map(|m| m.as_str());
+        resolve_var_inline(vars, ident, format).unwrap_or_else(|| whole.to_string())
+    })
+    .into_owned()
+}
+
+/// Fail-closed save-time check: EVERY `{{` in `field` must open a well-formed placeholder whose
+/// ident is in the allowlist. Anything else — a typo, a `{{meeting_id}}`, an unterminated `{{` — is
+/// `AppError::InvalidArg`. Uses the SAME regex the renderer substitutes with, anchored at each `{{`,
+/// so validation and rendering cannot disagree.
+fn validate_template_vars(field: &str) -> Result<()> {
+    if !field.contains("{{") {
+        return Ok(());
+    }
+    let Some(re) = var_regex() else {
+        // The grammar is unavailable ⇒ nothing can be rendered safely ⇒ refuse the `{{` outright.
+        return Err(AppError::InvalidArg(
+            "note template variables are unavailable — remove the `{{ … }}` placeholders".into(),
+        ));
+    };
+    let mut from = 0usize;
+    while let Some(rel) = field[from..].find("{{") {
+        let at = from + rel;
+        let caps = re
+            .captures_at(field, at)
+            .filter(|c| c.get(0).map(|m| m.start()) == Some(at));
+        let Some(caps) = caps else {
+            return Err(AppError::InvalidArg(format!(
+                "malformed template variable in `{field}` — the only supported forms are \
+                 `{{{{name}}}}` and `{{{{name:format}}}}`, with name one of: {}",
+                TEMPLATE_VARS.join(", ")
+            )));
+        };
+        let ident = caps.get(1).map(|m| m.as_str()).unwrap_or_default();
+        if !is_known_template_var(ident) {
+            return Err(AppError::InvalidArg(format!(
+                "unknown template variable `{{{{{ident}}}}}` — allowed: {}",
+                TEMPLATE_VARS.join(", ")
+            )));
+        }
+        from = caps.get(0).map(|m| m.end()).unwrap_or(at + 2);
+    }
+    Ok(())
+}
+
+/// Read one LIST-valued key out of a raw YAML front-matter block: flow (`participants: [A, B]`) or
+/// block (`participants:` + `- A` lines) or a single scalar. Hand-rolled, dep-free, best-effort —
+/// it parses the MODEL's guess so [`ResolvedVars`] can re-render it safely; it is never trusted to
+/// be well-formed.
+pub(crate) fn front_matter_list(yaml: &str, key: &str) -> Vec<String> {
+    fn push(out: &mut Vec<String>, raw: &str) {
+        let s = raw
+            .trim()
+            .trim_matches('"')
+            .trim_matches('\'')
+            .trim()
+            .to_string();
+        if !s.is_empty() {
+            out.push(s);
+        }
+    }
+    let mut out = Vec::new();
+    let mut lines = yaml.lines().peekable();
+    while let Some(line) = lines.next() {
+        let Some((k, v)) = line.split_once(':') else {
+            continue;
+        };
+        if !k.trim().eq_ignore_ascii_case(key) {
+            continue;
+        }
+        let v = v.trim();
+        if let Some(inner) = v.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+            for item in inner.split(',') {
+                push(&mut out, item);
+            }
+        } else if !v.is_empty() {
+            push(&mut out, v);
+        } else {
+            while let Some(next) = lines.peek() {
+                let t = next.trim();
+                match t.strip_prefix('-') {
+                    Some(item) => {
+                        push(&mut out, item);
+                        lines.next();
+                    }
+                    None => break,
+                }
+            }
+        }
+        break;
+    }
+    out
+}
+
+/// The deterministic front-matter LINES (no fences) Murmur owns, in a stable order: the fixed five,
+/// then each of the template's `extra_frontmatter_keys` that carries a `{{}}` value.
+fn deterministic_front_matter_lines(t: Option<&NoteTemplate>, vars: &ResolvedVars) -> Vec<String> {
+    let mut lines = vec![
+        format!("title: {}", yaml_scalar(&vars.title)),
+        format!("date: {}", yaml_scalar(&vars.date_iso)),
+        format!("duration_minutes: {}", vars.duration_minutes),
+        format!("tags: {}", yaml_flow_list(&vars.tags)),
+        format!("participants: {}", yaml_flow_list(&vars.participants)),
+    ];
+    if let Some(t) = t {
+        for entry in &t.extra_frontmatter_keys {
+            if let Some(line) = render_extra_key_line(entry, vars) {
+                lines.push(line);
+            }
+        }
+    }
+    lines
+}
+
+/// Render ONE `extra_frontmatter_keys` entry into a deterministic front-matter line — but only when
+/// it actually carries a `{{}}` value. Supported shapes:
+///   * `client: {{participants}}` → the variable's YAML form (flow list / scalar), Murmur-quoted.
+///   * `slug: {{date:YYYY}}-review` → substituted, then emitted as ONE opaque scalar (quoted unless
+///     the result is already a plain token).
+///   * `project` (no `{{}}`) → `None`: no deterministic value exists, so the key stays a REQUEST to
+///     the model (the prompt still lists it) and the model's own line survives the merge.
+/// An unsafe/absent key name, or a key Murmur already owns, yields `None`.
+fn render_extra_key_line(entry: &str, vars: &ResolvedVars) -> Option<String> {
+    let (key, value_tpl) = entry.split_once(':')?;
+    let key = key.trim();
+    let lower = key.to_ascii_lowercase();
+    if !is_safe_yaml_key(key) || OWNED_FRONT_MATTER_KEYS.contains(&lower.as_str()) {
+        return None;
+    }
+    let value_tpl = value_tpl.trim();
+    if !value_tpl.contains("{{") {
+        return None;
+    }
+    // The whole value is exactly one placeholder ⇒ render its native YAML form (a list stays a list).
+    if let Some(re) = var_regex() {
+        if let Some(caps) = re.captures(value_tpl) {
+            let whole = caps.get(0).map(|m| m.as_str()).unwrap_or_default();
+            if whole == value_tpl {
+                let ident = caps.get(1).map(|m| m.as_str()).unwrap_or_default();
+                let format = caps.get(2).map(|m| m.as_str());
+                if let Some(v) = resolve_var_yaml(vars, ident, format) {
+                    return Some(format!("{key}: {v}"));
+                }
+                return None;
+            }
+        }
+    }
+    // Mixed literal + placeholder(s) ⇒ substitute, then quote the result as ONE opaque scalar.
+    let rendered = substitute_vars(value_tpl, vars);
+    Some(format!("{key}: {}", yaml_scalar(&rendered)))
+}
+
+/// A YAML key we are willing to emit: a conservative identifier, so a model-echoed "key" can never
+/// smuggle punctuation (or a fence) into the block.
+fn is_safe_yaml_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= 64
+        && key
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
+}
+
+/// RENDER a note template against the resolved variables.
+///
+/// Returns `(frontmatter_yaml, body_scaffold)`:
+///   * `frontmatter_yaml` — the COMPLETE `---`-fenced block Murmur prepends. First line is exactly
+///     `---`, last is exactly `---`; every value is sanitized + YAML-escaped, so it is always ONE
+///     well-formed single-document block.
+///   * `body_scaffold` — the template's section skeleton with `{{}}` resolved. The model normally
+///     supplies the body; the scaffold is what a body-less generation degrades to, so a note is
+///     never just front-matter.
+///
+/// `template = None` (a built-in style / unknown id) renders the fixed five keys and a bare title
+/// scaffold. Pure: no clock, no DB, no I/O.
+pub fn render_template(template: Option<&NoteTemplate>, vars: &ResolvedVars) -> (String, String) {
+    let lines = deterministic_front_matter_lines(template, vars);
+    let front = format!("---\n{}\n---\n", lines.join("\n"));
+    (front, render_body_scaffold(template, vars))
+}
+
+fn render_body_scaffold(t: Option<&NoteTemplate>, vars: &ResolvedVars) -> String {
+    let sections = match t {
+        Some(t) if !t.sections.is_empty() => render_sections(&t.sections),
+        _ => "# <title>\n".to_string(),
+    };
+    let title = sanitize_value(&vars.title);
+    let sections = sections.replacen("# <title>", &format!("# {title}"), 1);
+    substitute_vars(&sections, vars)
+}
+
+/// ASSEMBLE the final note: Murmur's deterministic front-matter block PREPENDED to the model's body.
+///
+/// * The model's own front-matter is NOT trusted — it is split off and re-merged key-by-key: a key
+///   Murmur owns is dropped (Murmur's deterministic value wins), a surviving key keeps its line only
+///   if it is a safe `key: scalar` (else the value is re-quoted), and list continuations / bare
+///   fences are discarded. This is what preserves stamps like `murmur_enhanced: true` and a
+///   template's model-filled extra keys while making a fence-injection structurally impossible.
+/// * A body-empty generation degrades to the template's `body_scaffold`.
+/// * The BODY is `{{}}`-substituted too. A section instruction may legitimately carry a
+///   placeholder (`Attendees: {{participants}}`), and that instruction reaches the model VERBATIM
+///   in the prompt — so the model can echo the raw `{{participants}}` into its note. Resolving the
+///   body here is what guarantees a placeholder never reaches the user unresolved, on the
+///   model-body path as well as on the scaffold path. Substitution is the SAME single pass with the
+///   SAME sanitized values (`{{`/`<%`/`---` stripped), so it cannot recurse and cannot inject.
+///
+/// Pure + idempotent-shaped: re-assembling an already-assembled note re-derives the same block.
+pub fn assemble_note_with_template(
+    template: Option<&NoteTemplate>,
+    vars: &ResolvedVars,
+    model_markdown: &str,
+) -> String {
+    let (model_yaml, model_body) = crate::storage::db::split_front_matter(model_markdown);
+    let mut lines = deterministic_front_matter_lines(template, vars);
+    let owned: std::collections::HashSet<String> = lines
+        .iter()
+        .filter_map(|l| l.split_once(':').map(|(k, _)| k.trim().to_ascii_lowercase()))
+        .collect();
+    lines.extend(preserved_front_matter_lines(&model_yaml, &owned));
+
+    let body = if model_body.trim().is_empty() {
+        render_body_scaffold(template, vars)
+    } else {
+        substitute_vars(&model_body, vars)
+    };
+    format!(
+        "---\n{}\n---\n\n{}",
+        lines.join("\n"),
+        body.trim_start_matches('\n')
+    )
+}
+
+/// The model-emitted front-matter lines that SURVIVE the merge, re-quoted where needed. Everything
+/// structural (blank lines, comments, a bare `---`) and every key Murmur already rendered is
+/// dropped.
+///
+/// A key with NO inline value is a YAML BLOCK list: its `- item` continuation lines are CONSUMED
+/// with it, and — when the key is one Murmur does not own — re-emitted as a sanitized flow list
+/// (`project: ["Atlas", "Beta"]`) so a model that answers a template's plain
+/// `extra_frontmatter_keys` entry in block style keeps its value instead of losing it silently.
+/// A block under a key Murmur DOES own (or an unsafe key) is dropped WITH its items, so the block
+/// can never end on a dangling key or an orphaned `- item`.
+fn preserved_front_matter_lines(
+    yaml: &str,
+    owned: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    let lines: Vec<&str> = yaml.lines().collect();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < lines.len() {
+        if out.len() >= MAX_PRESERVED_FRONT_MATTER_LINES {
+            break;
+        }
+        let t = lines[i].trim();
+        i += 1;
+        // A bare fence / a list item with no owning key / a comment is structural noise.
+        if t.is_empty() || t.starts_with('-') || t.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = t.split_once(':') else {
+            continue;
+        };
+        let key = key.trim();
+        let value = value.trim();
+        let keep = is_safe_yaml_key(key) && !owned.contains(&key.to_ascii_lowercase());
+
+        if value.is_empty() {
+            // BLOCK form — consume this key's `- item` continuation lines either way.
+            let mut items = Vec::new();
+            while i < lines.len() {
+                let c = lines[i].trim();
+                // A bare fence terminates the block; it is not an item.
+                if c == "---" {
+                    break;
+                }
+                let Some(item) = c.strip_prefix('-') else { break };
+                // Unwrap the model's own quoting so the re-emitted flow list quotes ONCE.
+                items.push(
+                    item.trim()
+                        .trim_matches('"')
+                        .trim_matches('\'')
+                        .trim()
+                        .to_string(),
+                );
+                i += 1;
+            }
+            if keep && !items.is_empty() {
+                let flow = yaml_flow_list(&items);
+                if flow != "[]" {
+                    out.push(format!("{key}: {flow}"));
+                }
+            }
+            continue;
+        }
+        if !keep {
+            continue;
+        }
+        if is_simple_yaml_value(value) {
+            out.push(format!("{key}: {value}"));
+        } else {
+            let unquoted = value
+                .strip_prefix('"')
+                .and_then(|v| v.strip_suffix('"'))
+                .unwrap_or(value);
+            out.push(format!("{key}: {}", yaml_quote(&sanitize_value(unquoted))));
+        }
+    }
+    out
+}
+
+/// Is this model-emitted YAML value safe to keep VERBATIM? A bare scalar or a flow list built from
+/// plain tokens — anything with a fence, a scripting opening, a quote, or `{{` gets re-quoted.
+fn is_simple_yaml_value(value: &str) -> bool {
+    if VALUE_STRIP_TOKENS.iter().any(|tok| value.contains(tok)) {
+        return false;
+    }
+    let inner = value
+        .strip_prefix('[')
+        .and_then(|v| v.strip_suffix(']'))
+        .unwrap_or(value);
+    !inner.is_empty()
+        && inner
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '-' | ',' | ' '))
 }
 
 #[cfg(test)]
@@ -902,6 +1578,423 @@ Formatting rules:
                 "scripting token must be rejected as InvalidArg; got {err:?}"
             );
         }
+    }
+
+    // ── T4b — the `{{}}` DSL + Murmur-assembled front-matter ─────────────────────────────────────
+
+    /// A `ResolvedVars` carrying the three HOSTILE transcript-derived values the whole feature
+    /// exists for, plus a benign one.
+    fn hostile_vars() -> ResolvedVars {
+        ResolvedVars {
+            title: "Q3 planning".to_string(),
+            date_iso: "2026-07-26".to_string(),
+            duration_minutes: 42,
+            participants: vec![
+                // (a) closes the fence and opens a SECOND YAML document.
+                "---\nadmin: true".to_string(),
+                // (b) an Obsidian Templater payload the vault would EXECUTE on open.
+                "<% tp.system.prompt() %>".to_string(),
+                // (c) a raw `:` — breaks an unquoted YAML scalar.
+                "Ann: the CFO".to_string(),
+                "Bob".to_string(),
+            ],
+            action_items: vec!["Bob — ship it".to_string()],
+            entities: vec!["ACME Corp".to_string()],
+            tags: vec!["meeting".to_string()],
+            language: Some("en".to_string()),
+        }
+    }
+
+    /// Count the `---` FENCE lines in a note (a well-formed single-document front-matter block has
+    /// exactly two, and they are the first line and the block terminator).
+    fn fence_lines(s: &str) -> usize {
+        s.lines().filter(|l| l.trim() == "---").count()
+    }
+
+    /// RED-before-GREEN (the escaping/stripping core). A transcript-derived participant named
+    /// `---\nadmin: true`, one containing `<% tp.system %>`, and one with a raw `:` must ALL come out
+    /// of the assembler as inert, quoted, single-line YAML scalars:
+    ///   * the assembled note starts with `---` and contains EXACTLY ONE front-matter block,
+    ///   * no injected fence, no `<%`/`%>`, no `{{`,
+    ///   * `admin: true` never becomes a front-matter KEY of its own.
+    /// Without the sanitize+quote step every one of these assertions fails (the fence closes early,
+    /// the Templater token survives, and the bare `:` splits the scalar).
+    #[test]
+    fn resolved_values_cannot_inject_a_fence_or_a_scripting_token() {
+        let vars = hostile_vars();
+        let (front, _scaffold) = render_template(None, &vars);
+
+        assert!(front.starts_with("---\n"), "front-matter must open with ---: {front}");
+        assert!(front.trim_end().ends_with("---"), "…and close with ---: {front}");
+        assert_eq!(fence_lines(&front), 2, "exactly ONE yaml document: {front}");
+        assert!(!front.contains("<%") && !front.contains("%>"), "{front}");
+        assert!(!front.contains("{{"), "{front}");
+        // The fence text is gone from the VALUE, and `admin: true` never becomes its own line.
+        assert!(
+            !front.lines().any(|l| l.trim_start().starts_with("admin:")),
+            "an injected key must never reach the block: {front}"
+        );
+        // Every hostile participant survives as CONTENT — quoted, escaped, single-line.
+        let participants = front
+            .lines()
+            .find(|l| l.starts_with("participants:"))
+            .expect("participants line");
+        assert!(participants.contains("\"admin: true\""), "{participants}");
+        assert!(participants.contains("\"tp.system.prompt()\""), "{participants}");
+        assert!(participants.contains("\"Ann: the CFO\""), "{participants}");
+        assert!(participants.contains("Bob"), "{participants}");
+        assert!(!participants.contains('\n'), "single-line: {participants}");
+
+        // The same holds for the FULL assembled note (front-matter + the model's body).
+        let note = assemble_note_with_template(None, &vars, "---\ntitle: guessed\n---\n\n# Body\n");
+        assert!(note.starts_with("---\n"), "{note}");
+        assert_eq!(fence_lines(&note), 2, "assembled note is one yaml doc: {note}");
+        assert!(!note.contains("<%") && !note.contains("%>"), "{note}");
+        assert!(note.contains("# Body"), "the model body survives: {note}");
+        // Murmur's deterministic title WINS over the model's guess.
+        assert!(note.contains("title: \"Q3 planning\""), "{note}");
+        assert!(!note.contains("title: guessed"), "{note}");
+    }
+
+    /// RED-before-GREEN (`{{date}}`). Bare `{{date}}` renders the ISO date; `{{date:FORMAT}}` honors
+    /// the Obsidian/moment tokens; an unparseable date degrades to the raw ISO string instead of
+    /// erroring; and the emitted month NAME is never re-scanned (no token re-expansion).
+    #[test]
+    fn date_variable_renders_iso_and_obsidian_formats() {
+        let vars = hostile_vars();
+        assert_eq!(substitute_vars("{{date}}", &vars), "2026-07-26");
+        assert_eq!(substitute_vars("{{date:YYYY}}", &vars), "2026");
+        assert_eq!(substitute_vars("{{date:YYYY-MM-DD}}", &vars), "2026-07-26");
+        assert_eq!(substitute_vars("{{date:DD.MM.YYYY}}", &vars), "26.07.2026");
+        assert_eq!(substitute_vars("{{date:YY}}", &vars), "26");
+        // A month NAME contains `M`/`D` letters — they must NOT re-expand.
+        assert_eq!(substitute_vars("{{date:MMMM D}}", &vars), "July 26");
+        // Whitespace inside the braces is tolerated (Obsidian-style).
+        assert_eq!(substitute_vars("{{ date : YYYY }}", &vars), "2026");
+        // A non-ISO date passes through sanitized rather than failing.
+        let mut odd = hostile_vars();
+        odd.date_iso = "not-a-date".to_string();
+        assert_eq!(substitute_vars("{{date:YYYY}}", &odd), "not-a-date");
+    }
+
+    /// The DSL is LOGIC-LESS and NON-RECURSIVE: a resolved value that itself looks like a
+    /// placeholder is never expanded (the `{{` is stripped from every value AND `replace_all` never
+    /// re-scans its own output), and an ident outside the allowlist is left VERBATIM — visible, not
+    /// silently dropped.
+    #[test]
+    fn substitution_is_single_pass_and_never_recurses() {
+        let vars = ResolvedVars {
+            title: "{{participants}} <% tp.file %>".to_string(),
+            participants: vec!["Anna".to_string()],
+            ..Default::default()
+        };
+        let out = substitute_vars("T: {{title}}", &vars);
+        assert!(!out.contains("Anna"), "a value must not re-expand: {out}");
+        assert!(!out.contains("{{") && !out.contains("<%"), "{out}");
+        assert_eq!(out, "T: participants tp.file");
+        // Unknown ident ⇒ untouched text (save-time validation is what refuses it).
+        assert_eq!(
+            substitute_vars("{{meeting_id}} {{nope}}", &vars),
+            "{{meeting_id}} {{nope}}"
+        );
+    }
+
+    /// The allowlist is a CLOSED `match`, `TEMPLATE_VARS` mirrors it exactly, and `meeting_id` is
+    /// deliberately absent (2026-07-26 egress review: no note value, highest linkability cost).
+    #[test]
+    fn allowlist_is_closed_and_excludes_meeting_id() {
+        for v in TEMPLATE_VARS {
+            assert!(is_known_template_var(v), "{v} must be known");
+        }
+        for v in ["meeting_id", "transcript", "note", "audio_path", "folder", ""] {
+            assert!(!is_known_template_var(v), "{v} must NOT be a template var");
+        }
+        assert!(!TEMPLATE_VARS.contains(&"meeting_id"));
+        // Every allowlisted ident actually resolves (no half-wired var).
+        let vars = hostile_vars();
+        for v in TEMPLATE_VARS {
+            assert!(resolve_var_inline(&vars, v, None).is_some(), "{v} unresolved");
+            assert!(resolve_var_yaml(&vars, v, None).is_some(), "{v} unresolved");
+        }
+        // The grammar itself compiles (the renderer/validator share it).
+        assert!(var_regex().is_some(), "the `{{{{}}}}` grammar must compile");
+    }
+
+    /// RED-before-GREEN (fail-closed at SAVE). An unknown `{{var}}` — including the deliberately
+    /// dropped `{{meeting_id}}` — and a malformed/unterminated `{{` are REFUSED with
+    /// `AppError::InvalidArg`, in every field that RENDERS the DSL. Known vars save fine.
+    #[test]
+    fn unknown_template_var_is_rejected_at_save() {
+        // Known vars, in each RENDERING field shape, validate.
+        let ok = tpl(
+            "t-ok",
+            "Warm and outcome-first.",
+            &[("Summary {{date:YYYY}}", "Attendees: {{participants}}")],
+            &["client: {{entities}}", "plainkey"],
+        );
+        assert!(validate_note_template(&ok.name, &ok.tone, &ok).is_ok());
+
+        // meeting_id was REMOVED from the allowlist — it must be refused like any other unknown.
+        let mid = tpl("t1", "warm", &[("S", "id {{meeting_id}}")], &[]);
+        // A typo'd var must never silently vanish from the user's notes.
+        let typo = tpl("t2", "warm", &[("S", "{{participant}}")], &[]);
+        // …in an extra front-matter key.
+        let key = tpl("t4", "warm", &[("S", "ok")], &["client: {{secrets}}"]);
+        // …and a malformed / unterminated placeholder is refused too (fail-closed).
+        let open = tpl("t5", "warm", &[("S", "{{title")], &[]);
+        let junk = tpl("t6", "warm", &[("S", "{{ 1title }}")], &[]);
+        for t in [&mid, &typo, &key, &open, &junk] {
+            let err = validate_note_template(&t.name, &t.tone, t);
+            assert!(
+                matches!(err, Err(AppError::InvalidArg(_))),
+                "{} must be rejected as InvalidArg; got {err:?}",
+                t.id
+            );
+        }
+        // The refusal NAMES the allowlist so the user can fix it.
+        let msg = format!("{:?}", validate_note_template(&mid.name, &mid.tone, &mid));
+        assert!(msg.contains("participants"), "error must list the allowlist: {msg}");
+    }
+
+    /// The DSL's FIELD SCOPE is enforced, not merely documented: `name` and `tone` are never
+    /// rendered into a note (the name is a picker label; the tone is a directive sent verbatim to
+    /// the model), so ANY `{{ … }}` there is refused at save — even a perfectly valid one. Accepting
+    /// it would leave the user with literal `{{date}}` text in their prompt forever.
+    #[test]
+    fn dsl_is_rejected_in_the_fields_that_never_render_it() {
+        // A VALID variable is still refused in tone…
+        let tone_known = tpl("t-tone", "It is {{date:YYYY}}.", &[("S", "ok")], &[]);
+        // …and in an unknown spelling…
+        let tone_unknown = tpl("t-tone2", "{{everything}}", &[("S", "ok")], &[]);
+        for t in [&tone_known, &tone_unknown] {
+            let err = validate_note_template(&t.name, &t.tone, t);
+            assert!(
+                matches!(err, Err(AppError::InvalidArg(_))),
+                "{} — `{{{{}}}}` in tone must be refused; got {err:?}",
+                t.id
+            );
+        }
+        // …and in the template NAME.
+        let named = tpl("t-name", "warm", &[("S", "ok")], &[]);
+        let err = validate_note_template("Weekly {{title}}", &named.tone, &named);
+        assert!(
+            matches!(err, Err(AppError::InvalidArg(_))),
+            "`{{{{}}}}` in the name must be refused; got {err:?}"
+        );
+        // The refusal explains WHERE variables are supported.
+        let msg = format!("{:?}", validate_note_template("Weekly {{title}}", &named.tone, &named));
+        assert!(msg.contains("SECTIONS"), "error must name the supported fields: {msg}");
+    }
+
+    /// A section instruction reaches the model VERBATIM in the prompt, so the model can echo the raw
+    /// `{{participants}}` back into its note. The assembler resolves the MODEL BODY too, so a
+    /// placeholder can never survive into the user's note. RED without the body substitution: the
+    /// literal `{{participants}}` stays in the assembled note.
+    #[test]
+    fn placeholders_echoed_by_the_model_are_resolved_in_the_body() {
+        let vars = hostile_vars();
+        let model = "---\ntitle: guess\n---\n\n# Q3\n\nAttendees: {{participants}}\nOn {{date:YYYY}}.\n";
+        let note = assemble_note_with_template(None, &vars, model);
+
+        assert!(
+            !note.contains("{{"),
+            "no placeholder may survive into the user's note: {note}"
+        );
+        assert!(note.contains("Attendees: admin: true, tp.system.prompt()"), "{note}");
+        assert!(note.contains("On 2026."), "{note}");
+        // Resolution in the body is still sanitized — the fence/Templater tokens stay stripped.
+        assert!(!note.contains("<%") && !note.contains("%>"), "{note}");
+        assert_eq!(fence_lines(&note), 2, "one yaml doc: {note}");
+        // An ident outside the allowlist stays VERBATIM (visible, never silently dropped).
+        let unknown = assemble_note_with_template(None, &vars, "# B\n\nid {{meeting_id}}\n");
+        assert!(unknown.contains("{{meeting_id}}"), "{unknown}");
+    }
+
+    /// YAML would RE-TYPE a bare reserved word or a number: a participant literally named `No`, or a
+    /// purely numeric title, must round-trip as the STRING the user meant. RED without the
+    /// [`is_yaml_typed_plain`] guard (they render bare and parse as `false` / `2026`).
+    #[test]
+    fn yaml_reserved_words_and_numbers_are_quoted() {
+        let vars = ResolvedVars {
+            title: "2026".to_string(),
+            date_iso: "2026-07-26".to_string(),
+            duration_minutes: 30,
+            participants: vec![
+                "No".to_string(),
+                "yes".to_string(),
+                "Off".to_string(),
+                "null".to_string(),
+                "~".to_string(),
+                "3.14".to_string(),
+                "Anna".to_string(),
+            ],
+            tags: vec!["meeting".to_string()],
+            ..Default::default()
+        };
+        let (front, _) = render_template(None, &vars);
+
+        // A numeric title is a STRING, not the number 2026.
+        assert!(front.contains("title: \"2026\""), "{front}");
+        let participants = front
+            .lines()
+            .find(|l| l.starts_with("participants:"))
+            .expect("participants line");
+        for quoted in ["\"No\"", "\"yes\"", "\"Off\"", "\"null\"", "\"~\"", "\"3.14\""] {
+            assert!(
+                participants.contains(quoted),
+                "{quoted} must be quoted, not re-typed by YAML: {participants}"
+            );
+        }
+        // A plain name still renders BARE — the guard must not over-quote everything.
+        assert!(participants.contains("Anna,") || participants.contains("Anna]"), "{participants}");
+        // The ISO date is not a number, so it stays bare (Obsidian parses it as a date).
+        assert!(front.contains("date: 2026-07-26"), "{front}");
+        // duration_minutes is a REAL number and must stay unquoted.
+        assert!(front.contains("duration_minutes: 30"), "{front}");
+    }
+
+    /// A model that answers a template's PLAIN `extra_frontmatter_keys` entry in YAML BLOCK-list
+    /// style must keep its value. RED before the block-list re-read: the `project:` key and every
+    /// `- item` under it were dropped silently. A block under a key MURMUR owns is still discarded
+    /// (Murmur's own deterministic value wins).
+    #[test]
+    fn model_block_lists_survive_for_keys_murmur_does_not_own() {
+        let vars = hostile_vars();
+        let model = "---\n\
+                     project:\n\
+                     - Atlas\n\
+                     - \"Beta Phase\"\n\
+                     tags:\n\
+                     - dropped-because-owned\n\
+                     empty_block:\n\
+                     decisions: [a, b]\n\
+                     ---\n\n\
+                     # Body\n";
+        let note = assemble_note_with_template(None, &vars, model);
+
+        assert!(
+            note.contains("project: [Atlas, \"Beta Phase\"]"),
+            "a non-owned block list must be re-emitted as a sanitized flow list: {note}"
+        );
+        // Murmur owns `tags` — its deterministic value wins and the model's block is dropped whole.
+        assert!(!note.contains("dropped-because-owned"), "{note}");
+        assert_eq!(
+            note.lines().filter(|l| l.starts_with("tags:")).count(),
+            1,
+            "no duplicate owned key: {note}"
+        );
+        // A key with an empty block and no items is dropped (never a dangling key).
+        assert!(!note.contains("empty_block"), "{note}");
+        // An inline flow list is untouched.
+        assert!(note.contains("decisions: [a, b]"), "{note}");
+        assert_eq!(fence_lines(&note), 2, "one yaml doc: {note}");
+    }
+
+    /// A template's `extra_frontmatter_keys` carry the DSL: `key: {{var}}` renders the variable's
+    /// native YAML form (a list stays a list), a mixed literal+placeholder value is quoted as one
+    /// opaque scalar, and a PLAIN key stays a request to the model (byte-identical prompt line).
+    #[test]
+    fn extra_frontmatter_keys_render_deterministic_values() {
+        let t = tpl(
+            "tpl-vars",
+            "",
+            &[("Outcome", "Attendees: {{participants}}")],
+            &["client: {{entities}}", "slug: {{date:YYYY}}-q3", "project"],
+        );
+        let vars = hostile_vars();
+        let (front, scaffold) = render_template(Some(&t), &vars);
+
+        // A whole-placeholder value keeps its NATIVE yaml form (a list stays a list)…
+        assert!(front.contains("client: [\"ACME Corp\"]"), "{front}");
+        // …a mixed literal+placeholder value becomes one scalar (bare here — it is a plain token).
+        assert!(front.contains("slug: 2026-q3"), "{front}");
+        // A plain key has no deterministic value ⇒ Murmur emits nothing for it.
+        assert!(!front.contains("project:"), "{front}");
+        assert_eq!(fence_lines(&front), 2, "{front}");
+
+        // The prompt still ASKS for the plain key, and no longer asks for the ones Murmur fills.
+        let prompt = render_saved_template(&t);
+        assert!(prompt.contains("- project: (fill in from the meeting"), "{prompt}");
+        assert!(!prompt.contains("- client:"), "{prompt}");
+        assert!(!prompt.contains("- slug:"), "{prompt}");
+
+        // The body scaffold resolves its vars and heads with the real title.
+        assert!(scaffold.starts_with("# Q3 planning\n"), "{scaffold}");
+        assert!(scaffold.contains("Attendees: admin: true, tp.system.prompt()"), "{scaffold}");
+        assert!(!scaffold.contains("{{"), "{scaffold}");
+    }
+
+    /// The MERGE with the model's own front-matter: keys Murmur owns are replaced (never
+    /// duplicated), a foreign stamp like `murmur_enhanced: true` is PRESERVED verbatim, a hostile
+    /// model key is re-quoted, and structural junk (a bare `---`, list continuations, an empty key)
+    /// is dropped — the result is always one well-formed block.
+    #[test]
+    fn model_front_matter_is_merged_not_trusted() {
+        let vars = hostile_vars();
+        let model = "---\n\
+                     murmur_enhanced: true\n\
+                     title: model guess\n\
+                     participants:\n\
+                     - someone\n\
+                     project: <% tp.system %>\n\
+                     empty:\n\
+                     bad key!: x\n\
+                     ---\n\n\
+                     # Real body\n\nText.\n";
+        let note = assemble_note_with_template(None, &vars, model);
+
+        assert_eq!(fence_lines(&note), 2, "one yaml doc: {note}");
+        assert!(note.contains("murmur_enhanced: true"), "stamp preserved: {note}");
+        assert_eq!(
+            note.lines().filter(|l| l.starts_with("title:")).count(),
+            1,
+            "no duplicate owned key: {note}"
+        );
+        assert!(note.contains("title: \"Q3 planning\""), "{note}");
+        assert!(!note.contains("model guess"), "{note}");
+        assert!(!note.contains("<%"), "hostile value re-quoted: {note}");
+        assert!(note.contains("project: \"tp.system\""), "{note}");
+        assert!(!note.contains("empty:"), "dangling key dropped: {note}");
+        assert!(!note.contains("bad key!"), "unsafe key dropped: {note}");
+        assert!(!note.contains("- someone"), "orphan list item dropped: {note}");
+        assert!(note.contains("# Real body"), "{note}");
+    }
+
+    /// A generation with NO front-matter, and one with an EMPTY body, both still produce a valid
+    /// `---`-first note (the scaffold fills a body-less generation).
+    #[test]
+    fn assembly_handles_missing_front_matter_and_empty_body() {
+        let vars = hostile_vars();
+        let bare = assemble_note_with_template(None, &vars, "# Just a body\n\nText.\n");
+        assert!(bare.starts_with("---\n"), "{bare}");
+        assert_eq!(fence_lines(&bare), 2, "{bare}");
+        assert!(bare.contains("# Just a body"), "{bare}");
+
+        let t = tpl("t-scaffold", "", &[("Outcome", "One line.")], &[]);
+        let empty = assemble_note_with_template(Some(&t), &vars, "---\ntitle: x\n---\n");
+        assert!(empty.starts_with("---\n"), "{empty}");
+        assert_eq!(fence_lines(&empty), 2, "{empty}");
+        assert!(empty.contains("# Q3 planning"), "scaffold body: {empty}");
+        assert!(empty.contains("## Outcome"), "scaffold sections: {empty}");
+    }
+
+    /// The model's guessed lists are RE-READ (so nothing the user expects is lost) but never
+    /// trusted: `front_matter_list` handles the flow, block and scalar shapes.
+    #[test]
+    fn front_matter_list_reads_flow_block_and_scalar() {
+        assert_eq!(
+            front_matter_list("participants: [Anna, \"Bob C\"]", "participants"),
+            vec!["Anna".to_string(), "Bob C".to_string()]
+        );
+        assert_eq!(
+            front_matter_list("tags:\n  - meeting\n  - q3\ntitle: x", "tags"),
+            vec!["meeting".to_string(), "q3".to_string()]
+        );
+        assert_eq!(
+            front_matter_list("participants: Anna", "participants"),
+            vec!["Anna".to_string()]
+        );
+        assert!(front_matter_list("title: x", "participants").is_empty());
     }
 
     /// A saved template with empty tone and no sections still renders a valid front-matter-first
