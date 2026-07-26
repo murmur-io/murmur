@@ -41,6 +41,10 @@
 //! crypto LOGIC changed — only relocation.
 
 use super::*;
+// Brought into scope (rather than spelled out at the call site) so the `org-feed-updated` notice is
+// callable on a `&dyn` notifier — the seam that makes "did this command tell the FE to re-fetch?"
+// unit-testable without a Tauri runtime.
+use crate::events::OrgFeedNotifier;
 
 /// Resolve only exact-owner images referenced by outgoing Markdown. Missing/foreign markers are
 /// flattened to inert alt text; arbitrary URLs are never fetched.
@@ -3940,12 +3944,39 @@ pub fn org_live_shares_for_source(
         .collect())
 }
 
-/// `revoke_org_share(item_id)` — tombstone a published org item (destroys its server ciphertext) and
-/// mark the local row revoked. Marks `revoke_pending` first (crash-safe: the launch sweep completes a
-/// `revoke_pending` if the tombstone call didn't land).
+/// `revoke_org_share(item_id)` — tombstone a published org item (destroys its server ciphertext), evict
+/// this device's own decrypted replica of it, and mark the local row revoked.
+///
+/// CRASH-SAFE ORDER, each step idempotent so an interruption is always re-drivable:
+/// `revoke_pending` → server DELETE → local eviction → `revoked`. Marking `revoke_pending` FIRST means
+/// the launch sweep completes a tombstone that didn't land; evicting BEFORE the `revoked` flip means an
+/// interruption can never leave withdrawn content live locally under a row no queue re-drives (see the
+/// ordering note inside `revoke_org_share_inner_with_policy`).
+///
+/// Emits [`crate::events::EVENT_ORG_FEED_UPDATED`] on success — like every other org-item-mutating
+/// command here — so the org roster, the Settings organization section and an open org-item viewer
+/// re-fetch immediately instead of showing the withdrawn row until some later productive sync tick.
 #[tauri::command]
-pub async fn revoke_org_share(state: State<'_, AppState>, item_id: String) -> Result<(), AppError> {
-    revoke_org_share_inner(state.inner(), item_id).await
+pub async fn revoke_org_share(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    item_id: String,
+) -> Result<(), AppError> {
+    revoke_org_share_notifying(state.inner(), item_id, &app).await
+}
+
+/// Inner of [`revoke_org_share`] with the FE notice expressed as the testable
+/// [`crate::events::OrgFeedNotifier`] seam instead of a concrete `AppHandle`. The notice fires ONLY
+/// after the revoke fully succeeded — a failed revoke changed nothing worth re-fetching, and the row
+/// the FE already shows is still the truth.
+pub(crate) async fn revoke_org_share_notifying(
+    state: &AppState,
+    item_id: String,
+    notifier: &dyn OrgFeedNotifier,
+) -> Result<(), AppError> {
+    revoke_org_share_inner(state, item_id).await?;
+    notifier.org_feed_updated(1);
+    Ok(())
 }
 
 pub(crate) async fn revoke_org_share_inner(
@@ -4001,23 +4032,34 @@ async fn revoke_org_share_inner_with_policy(
             "background org revoke deferred for recording".into(),
         ));
     }
+    // EVICT THE LOCAL REPLICA ON THE PUBLISHING DEVICE — *BEFORE* the `revoked` state flip. Withdrawing
+    // a share used to mutate ONLY the `org_shares` state machine, so the device that revoked kept its
+    // own `org_items` row — markdown, chunks, FTS tokens, int8 vectors and the image BLOBs — live and
+    // searchable through org search / Ask / MCP `org_search` forever. Routed through the ONE eviction
+    // primitive so this path gets exactly the same cleanup as a feed tombstone or the reconcile sweep.
+    // AFTER the server DELETE succeeded (an eviction before a failed tombstone would blind this device
+    // to still-shared content), and idempotent — a device with no local replica row is simply a no-op.
+    //
+    // ORDER IS LOAD-BEARING (eviction THEN state, never state THEN eviction). These are two separate
+    // commits, so a crash / quit / background-epoch flip lands between them:
+    //   - state-then-eviction (the pre-2026-07-26 order) leaves a row marked `revoked` whose decrypted
+    //     replica is still live and searchable. `org_sweep_pending` only re-drives `revoke_pending`, so
+    //     that row NEVER re-enters the crash-safe recovery path and the leak persists until the slow
+    //     anti-entropy sweep happens to walk that seq.
+    //   - eviction-then-state (this order) leaves a `revoke_pending` row whose replica is ALREADY gone.
+    //     The server tombstone and the eviction are both idempotent, so the launch sweep re-drives the
+    //     row harmlessly and completes the flip. Strictly safer: the interrupted state is a stale
+    //     bookkeeping row, never live withdrawn content.
     if policy
-        .commit(|| state.db.set_org_share_state(&row.id, "revoked", &now))?
+        .commit(|| state.db.evict_org_item(&item_id).map(|_| ()))?
         .is_none()
     {
         return Err(AppError::Unavailable(
             "background org revoke deferred for recording".into(),
         ));
     }
-    // EVICT THE LOCAL REPLICA ON THE PUBLISHING DEVICE. Withdrawing a share used to mutate ONLY the
-    // `org_shares` state machine, so the device that revoked kept its own `org_items` row — markdown,
-    // chunks, FTS tokens, int8 vectors and the image BLOBs — live and searchable through org search /
-    // Ask / MCP `org_search` forever. Routed through the ONE eviction primitive so this path gets
-    // exactly the same cleanup as a feed tombstone or the reconcile sweep. AFTER the server DELETE
-    // succeeded (an eviction before a failed tombstone would blind this device to still-shared
-    // content), and idempotent — a device with no local replica row is simply a no-op.
     if policy
-        .commit(|| state.db.evict_org_item(&item_id).map(|_| ()))?
+        .commit(|| state.db.set_org_share_state(&row.id, "revoked", &now))?
         .is_none()
     {
         return Err(AppError::Unavailable(
@@ -4329,7 +4371,11 @@ pub(crate) async fn org_background_sync_tick(state: &AppState) -> bool {
 
 /// `org_sweep_pending()` — the on-launch org queue sweep (extends the mode-B `share_rewrap_pending`
 /// launch pattern). Idempotent + OFFLINE-TOLERANT: logged out / no server / a per-row failure leaves
-/// the row where it is for the next pass (never an error). Three queues:
+/// the row where it is for the next pass (never an error). One local repair pass plus three queues:
+///   - `revoked` rows whose LOCAL replica is somehow still live → evicted through the ONE eviction
+///     primitive, NO network (the server tombstone already landed for a `revoked` row). Defence in
+///     depth behind `revoke_org_share_inner_with_policy`'s evict-before-flip ordering, and the one
+///     step that runs even while logged out, since it needs neither a server nor a session;
 ///   - `queued`, or a `failed` row that NEVER published (`item_id` still `NULL`) → fresh publish via
 ///     `share_to_org_inner` (re-seal under the current OCK + upload + publish → `uploaded`);
 ///   - a `failed` row that WAS live before (`item_id` set — the row's LAST republish attempt failed,
@@ -4357,20 +4403,62 @@ async fn org_sweep_pending_with_policy(
     if !policy.is_current() {
         return Ok(0);
     }
-    let base = share_base_url(state)?;
-    if base.trim().is_empty() {
-        return Ok(0);
-    }
-    // Logged out ⇒ nothing to do (best-effort launch sweep, not an error).
-    if valid_access_token(state).await.is_err() {
-        return Ok(0);
-    }
-    if !policy.is_current() {
-        return Ok(0);
-    }
     let mut advanced = 0u32;
     let mut attempted = 0usize;
     let background_limit = policy.background_epoch.map(|_| 1usize);
+
+    // 0a) LOCAL-ONLY ORPHAN REPAIR (defence in depth behind the eviction-before-`revoked` ordering in
+    //     `revoke_org_share_inner_with_policy`). A device interrupted in the OLD order — or by any
+    //     future bug that flips a row to `revoked` without evicting — keeps a fully decrypted, fully
+    //     searchable replica of content it already withdrew from the server, and no queue re-drives a
+    //     `revoked` row. This pass converges exactly those: for each `revoked` row that still names a
+    //     server item, ask the (indexed, content-free) replica state whether a LIVE local row remains
+    //     and, if so, run the ONE eviction primitive. NO NETWORK — the server tombstone already
+    //     happened for a `revoked` row, so re-issuing it would only re-DELETE an already-gone item on
+    //     every launch. Runs BEFORE the logged-out / no-server early returns because it needs neither,
+    //     and is a pure read (zero write transactions) once every replica has converged. It does NOT
+    //     spend the per-tick `attempted` budget — that budget bounds NETWORK/model work, and starving
+    //     an outbound publish for a minute behind a purely local tombstone would be the wrong trade —
+    //     but it IS bounded by `ORG_REVOKED_ORPHAN_REPAIR_PER_SWEEP` and by the background epoch.
+    let mut repaired = 0usize;
+    for row in state.db.list_org_shares_in_state("revoked")? {
+        if repaired >= ORG_REVOKED_ORPHAN_REPAIR_PER_SWEEP || !policy.is_current() {
+            break;
+        }
+        let Some(item_id) = row.item_id.as_deref() else {
+            continue;
+        };
+        if !state
+            .db
+            .org_replica_state(item_id)?
+            .is_some_and(|held| !held.tombstoned)
+        {
+            continue;
+        }
+        if policy
+            .commit(|| state.db.evict_org_item(item_id))?
+            .unwrap_or(false)
+        {
+            repaired += 1;
+            advanced += 1;
+            tracing::info!(
+                target: "org",
+                "evicted an orphaned local replica of an already-revoked org share"
+            );
+        }
+    }
+
+    let base = share_base_url(state)?;
+    if base.trim().is_empty() {
+        return Ok(advanced);
+    }
+    // Logged out ⇒ nothing more to do (best-effort launch sweep, not an error).
+    if valid_access_token(state).await.is_err() {
+        return Ok(advanced);
+    }
+    if !policy.is_current() {
+        return Ok(advanced);
+    }
 
     // 0) DEDUP (auto-clean, user-opted-in): collapse accidental DUPLICATE live items — same org + same
     //    source — down to the earliest, tombstoning the extras. Fixes duplicates created BEFORE the
@@ -4527,6 +4615,13 @@ pub async fn org_sync_now(
 /// One deliberately small feed page per org-sync invocation. A protocol-valid org blob may be up to
 /// 16 MiB; keeping this at four bounds the decrypted/prepared page far below the old 200-item shape.
 const ORG_FEED_PAGE: u32 = 4;
+
+/// How many orphaned local replicas of ALREADY-`revoked` shares one `org_sweep_pending` pass may
+/// evict (step 0a). Bounded for the same reason every other sweep step is: a launch/background pass
+/// must stay a short, predictable amount of local work. The steady state is zero — the scan itself is
+/// one indexed read per revoked row and writes nothing once every replica has converged — so this cap
+/// only ever bites on a device with a genuine backlog, which the next pass continues.
+const ORG_REVOKED_ORPHAN_REPAIR_PER_SWEEP: usize = 8;
 
 /// One deliberately small ANTI-ENTROPY page per reconcile tick — same order of magnitude as
 /// [`ORG_FEED_PAGE`], so the slow sweep can never starve the live pull nor hammer the server. The
@@ -5149,13 +5244,6 @@ async fn org_sync_one(
 // sweep is what repairs replicas ALREADY orphaned on real machines, and remains a correct backstop
 // afterwards.
 
-/// One anti-entropy reconcile tick: pick one joined org (round-robin) and walk one bounded
-/// [`ORG_RECONCILE_PAGE`] of its feed from the SLOW cursor. Returns how many local replica rows this
-/// tick actually changed (evicted + re-ingested), so the caller can fire `org-feed-updated`.
-///
-/// Best-effort and offline-tolerant in exactly the same shape as the live pull: logged out / no org /
-/// no server ⇒ `Ok(0)`, never an error. Honors the background epoch through `policy` at every await
-/// boundary and every DB commit.
 /// Run ONE anti-entropy reconcile step immediately (manual policy — never epoch-deferred). Returns
 /// the number of local replica rows this step changed. The scheduled path is
 /// `org_background_sync_tick`; this is the direct entry point for internal callers and for the
@@ -5164,6 +5252,22 @@ pub async fn org_reconcile_now_inner(state: &AppState) -> Result<u32, AppError> 
     org_reconcile_tick_with_policy(state, OrgWorkPolicy::manual()).await
 }
 
+/// One anti-entropy reconcile tick: pick one joined org (round-robin) and walk one bounded
+/// [`ORG_RECONCILE_PAGE`] of its feed from the SLOW cursor. Returns how many local replica rows this
+/// tick actually changed (evicted + re-ingested), so the caller can fire `org-feed-updated`.
+///
+/// CONFIGURATION-tolerant, NOT network-tolerant — the distinction matters, so state it exactly. No
+/// joined org, no configured server, or no valid session ⇒ `Ok(0)`: nothing to reconcile is not a
+/// failure. But once a request is actually made, a failing `client.org_feed(..)` PROPAGATES as `Err`
+/// from here (unlike the per-record failures inside `org_reconcile_one`, which are deliberately
+/// swallowed so the slow cursor can never stall short of a tombstone). The scheduled caller
+/// `org_background_sync_tick` is what makes an offline tick harmless: it logs a non-PII warning and
+/// returns `false`. Kept as an `Err` rather than folded into `Ok(0)` because the manual entry point
+/// (`org_reconcile_now_inner`, used by internal callers and the regression tests) needs to be able to
+/// tell "the feed is genuinely converged" from "the server could not be reached" — collapsing them
+/// would make an unreachable server indistinguishable from a healthy no-op.
+///
+/// Honors the background epoch through `policy` at every await boundary and every DB commit.
 async fn org_reconcile_tick_with_policy(
     state: &AppState,
     policy: OrgWorkPolicy,
