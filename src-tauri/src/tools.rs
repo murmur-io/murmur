@@ -565,7 +565,12 @@ pub fn execute_tool(
             // against `unlocked`, so a locked-and-not-unlocked folder's documents are invisible here
             // exactly like a sealed meeting. Appended as a `DOCUMENTS:` section.
             let knn_docs = db
-                .search_doc_chunks_visible(&query_vec, 20, unlocked)
+                .search_doc_chunks_visible(
+                    &query_vec,
+                    20,
+                    crate::embed::KNN_SEARCH_COSINE_FLOOR,
+                    unlocked,
+                )
                 .unwrap_or_default();
             let fts_docs = db
                 .search_doc_chunks_fts_visible(q, 20, unlocked)
@@ -589,7 +594,14 @@ pub fn execute_tool(
                     }
                 }
             }
-            match db.search_hybrid_visible(q, &query_vec, 20, unlocked, date_filter) {
+            match db.search_hybrid_visible(
+                q,
+                &query_vec,
+                20,
+                crate::embed::KNN_SEARCH_COSINE_FLOOR,
+                unlocked,
+                date_filter,
+            ) {
                 Ok(hits) if hits.is_empty() && docs.is_empty() => {
                     Ok(format!("No meetings or documents match \"{q}\"."))
                 }
@@ -1290,7 +1302,8 @@ pub(crate) fn search_org_brain_hits(
         match embedder.embed_query(std::slice::from_ref(&q.to_string())) {
             Ok(v) => {
                 let qv = v.into_iter().next().unwrap_or_default();
-                db.search_org_chunks_knn(&qv, 20).unwrap_or_default()
+                db.search_org_chunks_knn(&qv, 20, crate::embed::ORG_KNN_SEARCH_COSINE_FLOOR)
+                    .unwrap_or_default()
             }
             Err(_) => Vec::new(),
         }
