@@ -1,6 +1,6 @@
 <select
   [value]="value()"
-  [disabled]="disabled()"
+  [disabled]="isDisabled()"
   [attr.aria-label]="ariaLabel()"
   (change)="onChangeEvent($event)"
 >

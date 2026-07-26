@@ -8,6 +8,7 @@ import {
 } from "@angular/core";
 import type { BrainModelDto } from "../../../../../core/models";
 import { SettingsStore } from "../../../settings.store";
+import { MurProgressComponent } from "../../../../../design-system/progress/progress.component";
 
 /** The two on-device model FAMILIES, split by model name (Bielik = Polish-native). */
 type Family = "multi" | "pl";
@@ -45,7 +46,7 @@ type Family = "multi" | "pl";
 @Component({
   selector: "app-model-effort-picker",
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [],
+  imports: [MurProgressComponent],
   templateUrl: "./model-effort-picker.component.html",
   styleUrl: "./model-effort-picker.component.scss",
 })
@@ -217,9 +218,34 @@ export class ModelEffortPickerComponent {
       : Math.round(bytes / (1024 * 1024)) + " MB";
   }
 
-  /** Family split by NAME (Bielik = Polish-native), no hardcoded ids. */
+  /**
+   * Family split by the model's DECLARED languages: a model that does not claim
+   * `"multi"` is the Polish-native lane.
+   *
+   * This replaces the former `name.toLowerCase().includes("bielik")` sniff,
+   * which coupled the UI to one vendor's product name — a new Polish-native
+   * model (or a renamed Bielik) would silently land in the multilingual lane.
+   * `languages` is registry DATA (`reason::BrainModel::languages`), so the
+   * classification now travels with the model.
+   *
+   * EQUIVALENCE, verified row-by-row against `src-tauri/src/reason.rs`
+   * `BRAIN_MODELS` (all six):
+   *
+   *   id                       | name has "bielik" | languages            | !has "multi"
+   *   -------------------------|-------------------|----------------------|-------------
+   *   qwen3-1.7b               | no                | ["en","multi","pl"]  | false
+   *   bielik-1.5b-v3           | YES               | ["pl","en"]          | TRUE
+   *   qwen3-4b-instruct-2507   | no                | ["en","multi","pl"]  | false
+   *   bielik-4.5b-v3           | YES               | ["pl","en"]          | TRUE
+   *   bielik-11b-v3            | YES               | ["pl","en"]          | TRUE
+   *   qwen3-14b                | no                | ["en","multi"]       | false
+   *
+   * Identical on every row. (`RETIRED_BRAIN_MODELS` carries no `languages` and
+   * is hidden from the picker, so it cannot reach this predicate.)
+   * Pinned by `e2e/settings-ai/model-family-split.spec.ts`.
+   */
   private isPolish(m: BrainModelDto): boolean {
-    return m.name.toLowerCase().includes("bielik");
+    return !(m.languages ?? []).includes("multi");
   }
 
   /** A family's HEAVY models, smallest → largest. */

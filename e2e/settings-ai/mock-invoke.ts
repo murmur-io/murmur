@@ -16,17 +16,32 @@ const BASE_MOCK = path.resolve(
  * self-contained: no closures over test-scope variables). Unknown commands fall
  * through to the demo mock's benign defaults, so the app always boots.
  *
+ * `constants` is the escape hatch for that closure rule: each value is
+ * JSON-serialized and replayed page-side as a constant-returning handler, so a
+ * large fixture can live as a normal test-scope `const` instead of being
+ * duplicated inline inside every override arrow.
+ *
  * @example
  *   await mockTauri(page, { brain_posture: () => "hybrid" });
+ *   await mockTauri(page, {}, { list_brain_models: REGISTRY });
  */
 export async function mockTauri(
   page: Page,
   overrides: Record<string, (args: any) => unknown> = {},
+  constants: Record<string, unknown> = {},
 ): Promise<void> {
   await page.addInitScript({ path: BASE_MOCK });
-  const serialized = Object.fromEntries(
-    Object.entries(overrides).map(([k, v]) => [k, v.toString()]),
-  );
+  const serialized = {
+    ...Object.fromEntries(
+      Object.entries(constants).map(([k, v]) => [
+        k,
+        `() => (${JSON.stringify(v)})`,
+      ]),
+    ),
+    ...Object.fromEntries(
+      Object.entries(overrides).map(([k, v]) => [k, v.toString()]),
+    ),
+  };
   await page.addInitScript((ov: Record<string, string>) => {
     const internals = (window as unknown as { __TAURI_INTERNALS__: { invoke: (c: string, a: unknown) => Promise<unknown> } }).__TAURI_INTERNALS__;
     const orig = internals.invoke.bind(internals);

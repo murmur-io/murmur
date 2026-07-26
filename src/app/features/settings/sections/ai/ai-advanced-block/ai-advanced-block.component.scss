@@ -1,64 +1,9 @@
+/* Layout-transparent, like every other settings-section child: the disclosure's
+   own `.disc-wrap` must be the direct flex item of `.section-body`. `mur-disclosure`
+   carries `display: contents` for exactly the same reason — see its class doc.
+
+   The whole toggle/body treatment that used to live here moved INTO
+   `<mur-disclosure>` verbatim (tokens unchanged); nothing else was section-specific. */
 :host {
   display: contents;
 }
-
-/* ── Disclosure container — in-flow, not an overlay (T3) ── */
-.adv-wrap {
-  display: flex;
-  flex-direction: column;
-}
-
-/* ── Toggle button ── */
-.adv-toggle {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
-  width: 100%;
-  text-align: left;
-  padding: var(--space-3) var(--space-4);
-  background: var(--surface-input);
-  border: 1px solid var(--border-subtle);
-  border-radius: var(--radius-md);
-  color: var(--text-secondary);
-  font-size: 0.875rem;
-  font-weight: 550;
-  cursor: pointer;
-  transition:
-    border-color var(--transition),
-    background var(--transition);
-}
-.adv-toggle:hover {
-  border-color: var(--border-strong);
-  color: var(--text-primary);
-}
-.adv-toggle:focus-visible {
-  outline: none;
-  box-shadow: 0 0 0 3px var(--accent-ring);
-}
-.adv-toggle[aria-expanded="true"] {
-  border-bottom-left-radius: 0;
-  border-bottom-right-radius: 0;
-  border-bottom-color: transparent;
-}
-
-.adv-chevron {
-  flex: none;
-  transition: transform var(--transition);
-}
-.adv-chevron.is-open {
-  transform: rotate(90deg);
-}
-
-/* ── Expanded body — stacks sub-sections vertically ── */
-.adv-body {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-4);
-  padding: var(--space-4);
-  border: 1px solid var(--border-subtle);
-  border-top: none;
-  border-bottom-left-radius: var(--radius-md);
-  border-bottom-right-radius: var(--radius-md);
-  background: var(--surface-input);
-}
-    

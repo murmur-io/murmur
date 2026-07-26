@@ -193,18 +193,6 @@
   gap: var(--space-1);
   max-width: 320px;
 }
-.dl-progress-track {
-  height: 8px;
-  border-radius: var(--radius-sm);
-  background: var(--surface-input);
-  overflow: hidden;
-}
-.dl-progress-fill {
-  height: 100%;
-  background: var(--accent);
-  border-radius: var(--radius-sm);
-  transition: width var(--transition);
-}
 .dl-progress-label {
   display: inline-flex;
   align-items: center;

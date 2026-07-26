@@ -1,0 +1,5 @@
+@if (indeterminate()) {
+  <div class="fill fill--indeterminate"></div>
+} @else {
+  <div class="fill" [style.width.%]="fillPct()"></div>
+}

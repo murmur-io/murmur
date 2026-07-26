@@ -29,12 +29,10 @@
         } @else if (embedModelPresent() === false) {
           @if (downloadingEmbedModel()) {
             <div class="semantic-progress" role="status">
-              <div class="semantic-progress-track" aria-hidden="true">
-                <div
-                  class="semantic-progress-fill"
-                  [style.width.%]="embedDownloadFrac() * 100"
-                ></div>
-              </div>
+              <mur-progress
+                ariaLabel="Embedding model download"
+                [value]="embedDownloadFrac() * 100"
+              />
               <span class="semantic-progress-label text-muted">
                 Downloading embedding model… {{ embedPct() }}
               </span>
@@ -85,12 +83,10 @@
       </div>
       @if (reindexing()) {
         <div class="semantic-progress" role="status">
-          <div class="semantic-progress-track" aria-hidden="true">
-            <div
-              class="semantic-progress-fill"
-              [style.width.%]="reindexFrac() * 100"
-            ></div>
-          </div>
+          <mur-progress
+            ariaLabel="Note re-indexing"
+            [value]="reindexFrac() * 100"
+          />
           <span class="semantic-progress-label text-muted">
             Indexing notes… {{ reindexPct() }}
           </span>
