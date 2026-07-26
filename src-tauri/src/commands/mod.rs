@@ -42,6 +42,12 @@ pub use reminders::*;
 mod model_perf;
 pub use model_perf::*;
 
+// LIVE-CAPTION model readiness: the ONE resolution shared by `start_recording` (which needs the
+// model PATH) and `get_config` (which needs the STATE the recorder renders), plus the live-safe
+// companion-download decision `download_model` consults. Holds no `#[tauri::command]`, so it is NOT
+// glob-re-exported — callers reach it as `live_captions::…` / `super::live_captions::…`.
+mod live_captions;
+
 // Keychain secret setters/probes. Bound as `secrets_commands` to avoid colliding with the
 // crate-level `secrets` module (`use crate::{pipeline, secrets};` above).
 #[path = "secrets.rs"]
@@ -771,6 +777,26 @@ pub struct AppConfigDto {
     /// Model-role override — the effort for the Live role.
     #[serde(default)]
     pub role_live_effort: String,
+    /// DISPLAY-ONLY out — LIVE-CAPTION readiness for THIS machine, so the recorder can tell the user
+    /// whether live captions are on instead of the truth living in a backend `warn!`:
+    /// `"ready"` | `"modelMissing"` (nothing live-safe downloaded — the live-safe companion fetch
+    /// never landed; re-running the model download fixes it) | `"pinnedHeavy"` (the live pin names a
+    /// medium/large-class size that isn't downloaded — a configuration choice, since a heavy model is
+    /// never run on the 3 s tick) | `"noModel"` (no whisper model at all — the model-download banner
+    /// owns that state). It is a DEVICE/DISK fact, not a persisted setting, so it is computed in
+    /// `get_config` (NOT in the pure `config_to_dto`, which leaves it `""` = not probed) and
+    /// `dto_to_config` ignores it entirely — a settings save can neither set nor clear it.
+    /// `#[serde(default)]` keeps an older FE payload that omits the key deserializing cleanly.
+    #[serde(default)]
+    pub live_captions: String,
+    /// DISPLAY-ONLY out — would a `download_model` run right now ALSO fetch the live-safe caption
+    /// companion (`live_captions::companion_size_for`)? The onboarding wizard discloses the extra
+    /// transfer from THIS flag rather than re-deriving the rule in TypeScript, so the wizard's
+    /// promise and the download's behavior cannot drift. Same DISPLAY-ONLY discipline as
+    /// [`Self::live_captions`]: filled in by `get_config`, `false` in the pure `config_to_dto`, and
+    /// ignored by `dto_to_config`.
+    #[serde(default)]
+    pub live_companion_pending: bool,
 }
 
 /// serde default for the Stage E security flags (which default ON in `AppConfig`).
@@ -1277,16 +1303,6 @@ pub async fn start_recording(
     // Best-effort LIVE captions: a read-only background loop emitting partial transcripts
     // during recording (see transcribe::live). Never affects the recording or final note.
     if let Some(cfg) = state.config.lock().ok().map(|c| c.clone()) {
-        let lang = cfg.language.as_deref().unwrap_or("");
-        let configured = || {
-            crate::transcribe::model::resolve_model_path(
-                cfg.whisper_model_path.as_deref().map(std::path::Path::new),
-                &cfg.model_size,
-                lang,
-            )
-            .ok()
-            .flatten()
-        };
         // T1.3 — the UNCONDITIONAL live-model pin (`live_model_pin`, default "small"): the LIVE
         // caption tick decodes with the pinned SIZE whenever its file is downloaded, regardless
         // of `model_size` — a `large-v3` live tick saturates the shared Metal GPU for the whole
@@ -1301,50 +1317,47 @@ pub async fn start_recording(
         // target machines): prefer the largest downloaded live-SAFE model (small → base →
         // tiny); a live-safe CONFIGURED model still works as before; but a medium/large-class
         // configured model is NEVER handed to the live tick — captions are skipped for THIS
-        // recording. Missing live models are downloaded explicitly from Settings while idle;
-        // recording lifecycle code never launches a ~487 MB background transfer beside capture.
-        let live_model = match crate::transcribe::model::live_pin_size(
-            &cfg.live_model_pin,
-            cfg.brain_live,
-        ) {
-            Some(size) => match crate::transcribe::model::resolve_model_path(None, &size, lang) {
-                Ok(Some(p)) => Some(p),
-                _ => match crate::transcribe::model::live_fallback_model(lang) {
-                    Some(p) => {
-                        tracing::warn!(
-                            target: "live",
-                            pin = %size,
-                            "pinned live model absent; live tick uses the largest downloaded live-safe whisper model"
-                        );
-                        Some(p)
-                    }
-                    None => match configured() {
-                        Some(p) if !crate::transcribe::model::is_live_heavy_model_file(&p) => {
-                            tracing::warn!(
-                                target: "live",
-                                pin = %size,
-                                "pinned live model absent; live tick uses the configured whisper model (may contend with the light reasoner)"
-                            );
-                            Some(p)
-                        }
-                        Some(_) => {
-                            // Only medium/large-class models downloaded (e.g. the fresh
-                            // turbo-default install): NEVER run a large encoder on the 3 s
-                            // live tick (T1.3 heat).
-                            tracing::warn!(
-                                target: "live",
-                                pin = %size,
-                                "pinned live model absent and only medium/large models downloaded; live captions off for this recording; download a live-safe model from Settings while idle"
-                            );
-                            None
-                        }
-                        None => None,
-                    },
-                },
-            },
-            None => configured(),
-        };
-        if let Some(model_path) = live_model {
+        // recording. The live-safe companion model is fetched by `download_model` (see
+        // `commands/live_captions.rs`) so the DEFAULT install has one; recording lifecycle code
+        // never launches a ~487 MB background transfer beside capture.
+        //
+        // The whole chain lives in `live_captions::resolve` — ONE decision, also read by
+        // `get_config` so the recorder UI can render the "live captions are off" state instead of
+        // this log line being the only trace of it.
+        let resolved = live_captions::resolve(&cfg);
+        // The pin the resolution actually used (an empty config pin still pins `small` under the
+        // legacy `brain_live` guarantee), so the log field never reads as an empty pin.
+        let pin = crate::transcribe::model::live_pin_size(&cfg.live_model_pin, cfg.brain_live)
+            .unwrap_or_default();
+        match &resolved {
+            live_captions::LiveCaptions::Fallback(_) => tracing::warn!(
+                target: "live",
+                pin = %pin,
+                "pinned live model absent; live tick uses the largest downloaded live-safe whisper model"
+            ),
+            live_captions::LiveCaptions::Configured(_) => tracing::warn!(
+                target: "live",
+                pin = %pin,
+                "pinned live model absent; live tick uses the configured whisper model (may contend with the light reasoner)"
+            ),
+            // Only medium/large-class models downloaded (e.g. a fresh turbo-default install whose
+            // live-safe companion download never landed): NEVER run a large encoder on the 3 s live
+            // tick (T1.3 heat). The FE surfaces this state from `get_config`.
+            live_captions::LiveCaptions::ModelMissing => tracing::warn!(
+                target: "live",
+                pin = %pin,
+                "pinned live model absent and only medium/large models downloaded; live captions off for this recording; download a live-safe model from Settings while idle"
+            ),
+            live_captions::LiveCaptions::PinnedHeavy => tracing::warn!(
+                target: "live",
+                pin = %pin,
+                "the pinned live model is a medium/large-class size that is not downloaded; live captions off for this recording (a heavy model is never run on the live tick)"
+            ),
+            live_captions::LiveCaptions::Pinned(_)
+            | live_captions::LiveCaptions::Unpinned(_)
+            | live_captions::LiveCaptions::NoModel => {}
+        }
+        if let Some(model_path) = resolved.model_path() {
             crate::transcribe::live::spawn(
                 app.clone(),
                 meeting_id.clone(),
@@ -4654,13 +4667,29 @@ pub fn topic_threads(state: State<'_, AppState>) -> Result<Vec<TopicThread>, App
 }
 
 /// Read current config (settings table), without secrets.
+///
+/// Also carries the two DISPLAY-ONLY live-caption facts (`live_captions::dto_probe`, ONE
+/// models-dir lookup): the `live_captions` readiness state — the same resolution `start_recording`
+/// runs, so the recorder can render a calm "live captions are off" notice instead of that fact only
+/// existing in a backend `warn!` — and `live_companion_pending`, the same decision `download_model`
+/// makes, so the onboarding wizard discloses the extra transfer without duplicating the rule. Both
+/// are device/disk probes (a few `is_file` checks), deliberately NOT part of the pure
+/// `config_to_dto`.
 #[tauri::command]
 pub fn get_config(state: State<'_, AppState>) -> Result<AppConfigDto, AppError> {
-    let config = state
-        .config
-        .lock()
-        .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
-    Ok(config_to_dto(&config))
+    // Snapshot the config, then probe — the disk checks below must not hold the config mutex.
+    let config: AppConfig = {
+        let guard = state
+            .config
+            .lock()
+            .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
+        guard.clone()
+    };
+    let mut dto = config_to_dto(&config);
+    let (live_state, companion_pending) = live_captions::dto_probe(&config);
+    dto.live_captions = live_state;
+    dto.live_companion_pending = companion_pending;
+    Ok(dto)
 }
 
 /// Build the ready-to-paste Claude Code MCP config block for the localhost MCP server, WITH the
@@ -4871,6 +4900,11 @@ fn config_to_dto(c: &AppConfig) -> AppConfigDto {
         role_live_connection: c.role_live_connection.clone(),
         role_live_model: c.role_live_model.clone(),
         role_live_effort: c.role_live_effort.clone(),
+        // NOT settings: live-caption readiness + the pending-companion disclosure are disk probes,
+        // filled in by `get_config` (the ONE FE-facing read) so this stays pure and every config
+        // round-trip test is unaffected.
+        live_captions: String::new(),
+        live_companion_pending: false,
     }
 }
 
