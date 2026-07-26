@@ -1,0 +1,123 @@
+{
+  "_comment": [
+    "THE `whisper_recommendation` WIRE FORMAT — one fixture, two consumers.",
+    "",
+    "Rust asserts this file's KEY SHAPE and its enum vocabulary against the real serialized",
+    "`WhisperRecommendationDto` (src-tauri/src/commands/model_perf.rs, test",
+    "`whisper_recommendation_wire_format_matches_the_e2e_fixture`), and the Playwright specs feed",
+    "THIS file to the mocked `whisper_recommendation` command. So a renamed / added / dropped field",
+    "on the Rust DTO fails the Rust test, and the UI is only ever driven by a payload the backend",
+    "could really have produced. Before this existed, the camelCase wire format had never been",
+    "exercised end to end at all.",
+    "",
+    "The scenario: a 64 GiB Apple-Silicon Mac that already has Sharp + Balanced on disk.",
+    "Keys starting with `_` are documentation and are ignored by both consumers."
+  ],
+  "machine": {
+    "totalRamBytes": 68719476736,
+    "appleSilicon": true,
+    "chipName": "Apple M4 Max",
+    "freeDiskBytes": 214748364800
+  },
+  "models": [
+    {
+      "id": "tiny",
+      "tier": null,
+      "headline": "Smallest and fastest; makes frequent mistakes.",
+      "approxDownloadBytes": 78643200,
+      "approxRamBytes": null,
+      "liveSafe": true,
+      "power": 1,
+      "downloaded": false
+    },
+    {
+      "id": "base",
+      "tier": "Light",
+      "headline": "Gets the gist.",
+      "approxDownloadBytes": 157286400,
+      "approxRamBytes": null,
+      "liveSafe": true,
+      "power": 2,
+      "downloaded": false
+    },
+    {
+      "id": "small-q8_0",
+      "tier": null,
+      "headline": "Balanced accuracy at a smaller download.",
+      "approxDownloadBytes": 283115520,
+      "approxRamBytes": null,
+      "liveSafe": true,
+      "power": 3,
+      "downloaded": false
+    },
+    {
+      "id": "small",
+      "tier": "Balanced",
+      "headline": "Readable transcripts, small footprint. Also powers live captions.",
+      "approxDownloadBytes": 492830720,
+      "approxRamBytes": 966367641,
+      "liveSafe": true,
+      "power": 4,
+      "downloaded": true
+    },
+    {
+      "id": "medium-q8_0",
+      "tier": null,
+      "headline": "Medium accuracy at a smaller download.",
+      "approxDownloadBytes": 891289600,
+      "approxRamBytes": null,
+      "liveSafe": false,
+      "power": 5,
+      "downloaded": false
+    },
+    {
+      "id": "large-v3-turbo-q8_0",
+      "tier": "Sharp",
+      "headline": "Near-best accuracy, no speed penalty.",
+      "approxDownloadBytes": 917504000,
+      "approxRamBytes": 1610612736,
+      "liveSafe": false,
+      "power": 6,
+      "downloaded": true
+    },
+    {
+      "id": "medium",
+      "tier": null,
+      "headline": "The older mid-size model; superseded by Sharp.",
+      "approxDownloadBytes": 1610612736,
+      "approxRamBytes": null,
+      "liveSafe": false,
+      "power": 7,
+      "downloaded": false
+    },
+    {
+      "id": "large-v3-turbo",
+      "tier": null,
+      "headline": "Sharp without the quantisation; a bigger download for the same speed.",
+      "approxDownloadBytes": 1717567488,
+      "approxRamBytes": null,
+      "liveSafe": false,
+      "power": 8,
+      "downloaded": false
+    },
+    {
+      "id": "large-v3",
+      "tier": "Maximum",
+      "headline": "The heaviest model, for hard audio.",
+      "approxDownloadBytes": 3221225472,
+      "approxRamBytes": 4187593113,
+      "liveSafe": false,
+      "power": 9,
+      "downloaded": false
+    }
+  ],
+  "selectedId": "large-v3-turbo-q8_0",
+  "recommendedId": "large-v3-turbo-q8_0",
+  "autoDefaultId": "large-v3-turbo-q8_0",
+  "reason": "alreadyDownloaded",
+  "modelSizeSource": "auto",
+  "customPathOverride": false,
+  "pendingDownloadBytes": 0,
+  "liveCaptions": "ready",
+  "brainAdvice": "full"
+}

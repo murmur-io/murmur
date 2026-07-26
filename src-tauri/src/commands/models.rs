@@ -251,11 +251,42 @@ pub async fn provider_statuses(
 /// tick, so the default install had NO live captions). BEST-EFFORT: a companion failure never fails
 /// this command — the batch model is what gates recording, and the recorder surfaces the
 /// "live captions off" state from `get_config`.
+/// What a `download_model` call ended up doing.
+///
+/// A user-initiated CANCEL is `Ok(status: "cancelled")`, never an `Err`: cancelling is not a
+/// failure, and returning an error would force the FE to string-match a message to tell a cancel
+/// apart from a dead link — exactly the fragility a typed outcome removes. `path` is the batch
+/// model that IS on disk when the call returns, so a cancel that arrived after the batch model
+/// landed (i.e. during the live-caption companion) still reports the file the user now has.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelDownloadOutcomeDto {
+    /// `"ready"` or `"cancelled"`.
+    pub status: String,
+    /// The batch model's path when one is on disk, else `null`.
+    pub path: Option<String>,
+}
+
+impl ModelDownloadOutcomeDto {
+    fn ready(path: String) -> Self {
+        Self {
+            status: "ready".into(),
+            path: Some(path),
+        }
+    }
+    fn cancelled(path: Option<String>) -> Self {
+        Self {
+            status: "cancelled".into(),
+            path,
+        }
+    }
+}
+
 #[tauri::command]
 pub async fn download_model(
     app: AppHandle,
     state: State<'_, AppState>,
-) -> Result<String, AppError> {
+) -> Result<ModelDownloadOutcomeDto, AppError> {
     let (configured, size, language, live_model_pin, brain_live) = {
         let c = state
             .config
@@ -274,32 +305,13 @@ pub async fn download_model(
     // Throttle progress events to roughly every 8 MB so a multi-GB download doesn't flood the FE.
     const EMIT_EVERY: u64 = 8 * 1024 * 1024;
     let mut last_emit: u64 = 0;
-    let path = crate::transcribe::ensure_model(p, &size, &language, |downloaded, total| {
-        if downloaded - last_emit >= EMIT_EVERY {
-            last_emit = downloaded;
-            let _ = app.emit(
-                crate::events::EVENT_MODEL_DOWNLOAD,
-                crate::events::ModelDownloadPayload {
-                    downloaded,
-                    total,
-                    done: false,
-                },
-            );
-        }
-    })
-    .await?;
-
-    // The LIVE-caption companion, decided against the model that actually landed above (so a custom
-    // `whisper_model_path` is covered without re-deriving it). Progress rides the SAME throttled
-    // event stream — the FE bar restarts for the (much smaller) second file, which is honest: it is a
-    // second download. Nothing is fetched when the live tick already has something to run.
-    if let Some(live_size) =
-        super::live_captions::companion_size(&path, &language, &live_model_pin, brain_live)
-    {
-        let mut companion_emit: u64 = 0;
-        match crate::transcribe::ensure_model(None, &live_size, &language, |downloaded, total| {
-            if downloaded - companion_emit >= EMIT_EVERY {
-                companion_emit = downloaded;
+    let outcome = crate::transcribe::model::ensure_model_cancellable(
+        p,
+        &size,
+        &language,
+        |downloaded, total| {
+            if downloaded - last_emit >= EMIT_EVERY {
+                last_emit = downloaded;
                 let _ = app.emit(
                     crate::events::EVENT_MODEL_DOWNLOAD,
                     crate::events::ModelDownloadPayload {
@@ -309,14 +321,76 @@ pub async fn download_model(
                     },
                 );
             }
-        })
+        },
+    )
+    .await?;
+    let path = match outcome {
+        crate::transcribe::model::DownloadOutcome::Ready(p) => p,
+        crate::transcribe::model::DownloadOutcome::Cancelled => {
+            // Tell the FE the bar is over, then report the cancel as a normal outcome. Nothing was
+            // left on disk (`ensure_model_cancellable` removes its own `.part`), so there is no
+            // path to report and no companion to consider.
+            let _ = app.emit(
+                crate::events::EVENT_MODEL_DOWNLOAD,
+                crate::events::ModelDownloadPayload {
+                    downloaded: 0,
+                    total: None,
+                    done: true,
+                },
+            );
+            return Ok(ModelDownloadOutcomeDto::cancelled(None));
+        }
+    };
+
+    // The LIVE-caption companion, decided against the model that actually landed above (so a custom
+    // `whisper_model_path` is covered without re-deriving it). Progress rides the SAME throttled
+    // event stream — the FE bar restarts for the (much smaller) second file, which is honest: it is a
+    // second download. Nothing is fetched when the live tick already has something to run.
+    if let Some(live_size) =
+        super::live_captions::companion_size(&path, &language, &live_model_pin, brain_live)
+    {
+        let mut companion_emit: u64 = 0;
+        match crate::transcribe::model::ensure_model_cancellable(
+            None,
+            &live_size,
+            &language,
+            |downloaded, total| {
+                if downloaded - companion_emit >= EMIT_EVERY {
+                    companion_emit = downloaded;
+                    let _ = app.emit(
+                        crate::events::EVENT_MODEL_DOWNLOAD,
+                        crate::events::ModelDownloadPayload {
+                            downloaded,
+                            total,
+                            done: false,
+                        },
+                    );
+                }
+            },
+        )
         .await
         {
-            Ok(_) => tracing::info!(
+            Ok(crate::transcribe::model::DownloadOutcome::Ready(_)) => tracing::info!(
                 target: "transcribe",
                 size = %live_size,
                 "live-caption companion model ready beside the batch model"
             ),
+            Ok(crate::transcribe::model::DownloadOutcome::Cancelled) => {
+                // The batch model DID land before the cancel arrived, so report the file the user
+                // now has alongside the cancel — the recommendation refresh the FE runs next will
+                // show it as downloaded, and a `path: null` here would contradict that.
+                let _ = app.emit(
+                    crate::events::EVENT_MODEL_DOWNLOAD,
+                    crate::events::ModelDownloadPayload {
+                        downloaded: 0,
+                        total: None,
+                        done: true,
+                    },
+                );
+                return Ok(ModelDownloadOutcomeDto::cancelled(Some(
+                    path.to_string_lossy().to_string(),
+                )));
+            }
             Err(e) => tracing::warn!(
                 target: "transcribe",
                 size = %live_size,
@@ -334,7 +408,82 @@ pub async fn download_model(
             done: true,
         },
     );
-    Ok(path.to_string_lossy().to_string())
+    Ok(ModelDownloadOutcomeDto::ready(
+        path.to_string_lossy().to_string(),
+    ))
+}
+
+/// Cancel the whisper model download that is in flight RIGHT NOW.
+///
+/// Infallible and idempotent: with nothing running it simply moves the generation counter forward,
+/// which affects no future download (see `transcribe::model::cancel_model_downloads`). The
+/// in-flight `download_model` resolves with `status: "cancelled"` shortly after — a cancel is a
+/// normal outcome there, never an `Err`.
+#[tauri::command]
+pub fn cancel_model_download() -> Result<(), AppError> {
+    crate::transcribe::model::cancel_model_downloads();
+    Ok(())
+}
+
+/// Delete ONE downloaded whisper model file to reclaim disk.
+///
+/// Every refusal lives in `transcribe::model::deletable_model_file` (pure + unit-tested): a
+/// non-registry id, the EFFECTIVE model, and the LIVE-caption pin are all refused, and the one file
+/// this can ever remove is `model_filename`'s `ggml-<id>[.en].bin` inside the models dir — the VAD,
+/// diarization and parakeet files are unreachable by construction.
+///
+/// LIFECYCLE: gated by the SAME sequence `retry_transcription_prep` uses — the recording-priority
+/// flag, the recorder slot, AND the lifecycle mutex. `recording_has_priority()` alone is not enough:
+/// during a retry that flag is false, so a delete would sail straight through and could pull the
+/// model file out from under an ASR pass that is about to load it.
+///
+/// NOT a content path: model files carry no meeting content, so there is nothing here for the lock
+/// model to gate. Logs the model id only (no PII).
+#[tauri::command]
+pub fn delete_whisper_model(state: State<'_, AppState>, size: String) -> Result<(), AppError> {
+    if crate::perf::recording_has_priority() {
+        return Err(AppError::Audio(
+            "a recording is in progress — stop it before deleting a model".into(),
+        ));
+    }
+    {
+        let recorder = state
+            .recorder
+            .lock()
+            .map_err(|_| AppError::Audio("recorder mutex poisoned".into()))?;
+        if recorder.is_some() {
+            return Err(AppError::Audio(
+                "a recording is in progress — stop it before deleting a model".into(),
+            ));
+        }
+    }
+    // Serialize with Stop / retry / lock so a transcription cannot claim the file mid-delete. Taken
+    // only after the recorder mutex is dropped (same ordering as `retry_transcription_prep`).
+    let _lifecycle = super::lifecycle_guard(&state);
+
+    let (configured_size, language, live_pin, brain_live) = {
+        let c = state
+            .config
+            .lock()
+            .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
+        (
+            c.model_size.clone(),
+            c.language.clone().unwrap_or_default(),
+            c.live_model_pin.clone(),
+            c.brain_live,
+        )
+    };
+    let effective = crate::transcribe::effective_model_size(&configured_size);
+    let pin = crate::transcribe::model::live_pin_size(&live_pin, brain_live);
+    let file = crate::transcribe::model::deletable_model_file(
+        &size,
+        &effective,
+        pin.as_deref(),
+        &language,
+    )?;
+    let dir = crate::transcribe::models_dir()?;
+    crate::transcribe::model::delete_model_file_in(&dir, &file)?;
+    Ok(())
 }
 
 /// Download the OPTIONAL parakeet live-ASR engine's four int8 models (~600 MB) from the csukuangfj

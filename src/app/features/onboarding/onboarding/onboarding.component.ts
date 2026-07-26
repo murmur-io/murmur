@@ -12,9 +12,13 @@ import { open } from "@tauri-apps/plugin-dialog";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { IpcService } from "../../../core/ipc.service";
 import { hostIsLoopback } from "../../../core/loopback";
+import { modelSizeLabel } from "../../../core/model-bytes";
 import type { AppConfigDto, ProviderStatus } from "../../../core/models";
+import { MachineService } from "../../../services/machine.service";
 import { BrainEnableCardComponent } from "../../brain/brain-enable-card/brain-enable-card.component";
 import { MurProgressComponent } from "../../../design-system/progress/progress.component";
+import { MurSelectComponent } from "../../../design-system/select/select.component";
+import { ModelPowerComponent } from "../../settings/sections/settings-transcription-section/model-power/model-power.component";
 
 /** The wizard steps, in order. Drives the dot indicator + progress copy. */
 type Step = "welcome" | "model" | "provider" | "brain" | "vault" | "done";
@@ -70,16 +74,6 @@ function liveCompanionPendingOf(cfg: AppConfigDto): boolean {
     .liveCompanionPending === true;
 }
 
-/** Approx download size per Whisper quality (mirrors Settings). */
-const SIZE_HINTS: Record<string, string> = {
-  tiny: "~75 MB",
-  base: "~150 MB",
-  small: "~470 MB",
-  "large-v3-turbo-q8_0": "~875 MB",
-  medium: "~1.5 GB",
-  "large-v3": "~3 GB",
-};
-
 /**
  * First-run wizard — a full-bleed, focused glassmorphism flow that gets a fresh
  * macOS user from launch to a working recorder in five calm steps:
@@ -93,7 +87,12 @@ const SIZE_HINTS: Record<string, string> = {
 @Component({
   selector: "app-onboarding",
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [BrainEnableCardComponent, MurProgressComponent],
+  imports: [
+    BrainEnableCardComponent,
+    MurProgressComponent,
+    MurSelectComponent,
+    ModelPowerComponent,
+  ],
   templateUrl: "./onboarding.component.html",
   styleUrl: "./onboarding.component.scss",
 })
@@ -101,6 +100,8 @@ export class OnboardingComponent implements OnInit {
   private readonly ipc = inject(IpcService);
   private readonly router = inject(Router);
   private readonly destroyRef = inject(DestroyRef);
+  /** The root-held catalog + machine answer (P1). Shared with Settings, never re-fetched per host. */
+  readonly machine = inject(MachineService);
 
   readonly steps = STEPS;
   readonly currentStep = signal<Step>("welcome");
@@ -115,7 +116,42 @@ export class OnboardingComponent implements OnInit {
   readonly modelPresent = signal<boolean | null>(null);
   readonly downloading = signal(false);
   readonly downloadError = signal<string | null>(null);
-  readonly sizeHint = computed(() => SIZE_HINTS[this.modelSize()] ?? "");
+  /**
+   * The chosen size's download figure, from the RUST CATALOG (the FE's own six-entry
+   * `SIZE_HINTS` table is gone — it had already drifted from Settings' nine-entry
+   * copy and from the backend). `""` when the catalog has not arrived, which is the
+   * NORMAL first-launch state: the button then says "Download model" with no figure
+   * rather than a made-up one.
+   */
+  readonly sizeHint = computed(() => {
+    const row = this.machine.models().find((m) => m.id === this.modelSize());
+    return row ? modelSizeLabel(row.approxDownloadBytes) : "";
+  });
+
+  /**
+   * COLD CACHE. This is first launch: nothing is cached, and `whisper_recommendation`
+   * is as fallible as any other IPC call. `loading()` keeps this false while the
+   * first probe is still in flight, so the escape hatch below cannot flash during a
+   * perfectly normal startup.
+   */
+  readonly catalogUnavailable = computed(
+    () => !this.machine.loading() && this.machine.models().length === 0,
+  );
+
+  /**
+   * The model step is the wizard's ONLY unskippable step (`canAdvance` demands a
+   * downloaded model), which is fine right up until the catalog never loads or the
+   * download keeps failing — at which point a first-run user is stranded on it with
+   * no way forward and no way out. This is the way out. It is deliberately NOT always
+   * visible: skipping leaves the app unable to transcribe, so it appears only once
+   * something has actually gone wrong.
+   */
+  readonly canSkipModel = computed(
+    () =>
+      this.modelPresent() !== true &&
+      !this.downloading() &&
+      (this.catalogUnavailable() || this.downloadError() !== null),
+  );
   /**
    * Will `download_model` ALSO fetch a small live-caption model beside the chosen one? Read
    * STRAIGHT FROM THE BACKEND (`AppConfigDto.liveCompanionPending`, filled in by `get_config` from
@@ -315,7 +351,12 @@ export class OnboardingComponent implements OnInit {
   /** Side-effects run when a step becomes visible (probe model / providers). */
   private async onEnterStep(step: Step): Promise<void> {
     if (step === "model") {
-      await this.persistConfig();
+      // Cold cache by definition — this is the first time anything asks the backend
+      // what this Mac is. `refresh()` swallows its own failures, so a dead probe
+      // leaves the catalog empty rather than throwing the wizard off the step.
+      await this.machine.refresh();
+      const source = this.preselectRecommended();
+      await this.persistConfig(false, source);
       this.modelPresent.set(await this.ipc.modelPresent());
       await this.refreshLiveCompanionPending();
     } else if (step === "provider") {
@@ -325,14 +366,49 @@ export class OnboardingComponent implements OnInit {
 
   // ── Model step ────────────────────────────────────────────────────────────
 
-  async onLanguage(event: Event): Promise<void> {
-    this.language.set((event.target as HTMLSelectElement).value);
+  /** Runs at most once per wizard: the preselect is an opening offer, not a policy. */
+  private preselectApplied = false;
+
+  /**
+   * Put Murmur's recommendation in front of the user instead of whatever the config
+   * happened to default to — and record that it got there AUTOMATICALLY.
+   *
+   * Returns `"auto"` when it applied, so the very write that persists the preselected
+   * size carries `modelSizeSource: "auto"`. Without that, a fresh install which simply
+   * accepted the recommendation would be stored as a DELIBERATE user choice, and
+   * nothing downstream could ever tell "they chose this" from "we chose this for them".
+   *
+   * It refuses to run when `modelSizeSource` is already recorded: that means an
+   * install with a history (including one the backfill marked `"user"`), and
+   * re-running setup must never relabel a real choice as an automatic one.
+   */
+  private preselectRecommended(): "auto" | undefined {
+    if (this.preselectApplied) return undefined;
+    const data = this.machine.data();
+    // No catalog yet (cold / failed probe) — stay unapplied so a later entry retries.
+    if (!data?.recommendedId) return undefined;
+    this.preselectApplied = true;
+    if (data.modelSizeSource) return undefined;
+    this.modelSize.set(data.recommendedId);
+    return "auto";
+  }
+
+  async onLanguage(language: string): Promise<void> {
+    this.language.set(language);
     await this.refreshModelPresence();
   }
 
-  async onModelSize(event: Event): Promise<void> {
-    this.modelSize.set((event.target as HTMLSelectElement).value);
-    await this.refreshModelPresence();
+  /** An explicit pick from the power slider / "show every size" list. */
+  async onModelSize(size: string): Promise<void> {
+    if (size === this.modelSize()) return;
+    this.modelSize.set(size);
+    // A DELIBERATE choice — the opposite of the preselect above.
+    await this.refreshModelPresence("user");
+  }
+
+  /** Move past the model step without one. See {@link canSkipModel}. */
+  async skipModel(): Promise<void> {
+    await this.next();
   }
 
   /**
@@ -347,10 +423,12 @@ export class OnboardingComponent implements OnInit {
   private modelPresenceRequestId = 0;
 
   /** Persist the chosen language + size, then re-check what's on disk. */
-  private async refreshModelPresence(): Promise<void> {
+  private async refreshModelPresence(
+    modelSizeSource?: "auto" | "user",
+  ): Promise<void> {
     const requestId = ++this.modelPresenceRequestId;
     this.modelPresent.set(null);
-    await this.persistConfig();
+    await this.persistConfig(false, modelSizeSource);
     if (requestId !== this.modelPresenceRequestId) return; // superseded mid-flight
     const present = await this.ipc.modelPresent();
     if (requestId !== this.modelPresenceRequestId) return; // superseded mid-flight
@@ -360,6 +438,10 @@ export class OnboardingComponent implements OnInit {
     const pending = await this.readLiveCompanionPending();
     if (requestId !== this.modelPresenceRequestId) return; // superseded mid-flight
     this.liveCompanionPending.set(pending);
+    // The picker's own facts (pendingDownloadBytes, per-row `downloaded`, the
+    // live-caption state) describe the SAVED selection too. Inside the same guard, so
+    // an abandoned selection's catalog never lands over the current one.
+    await this.machine.refresh();
   }
 
   /** Re-read the backend's companion decision for the currently SAVED language + size. */
@@ -383,14 +465,27 @@ export class OnboardingComponent implements OnInit {
     try {
       // The model is fetched for the SAVED language + size — persist first.
       await this.persistConfig();
+      // A CANCEL resolves normally (`status: "cancelled"`) and must not paint an
+      // error: the user asked for it. Presence is re-read either way.
       await this.ipc.downloadModel();
       this.modelPresent.set(await this.ipc.modelPresent());
       // The companion has landed (or was never needed) — stop promising a second transfer.
       await this.refreshLiveCompanionPending();
+      await this.machine.refresh();
     } catch (e) {
       this.downloadError.set(String(e));
     } finally {
       this.downloading.set(false);
+    }
+  }
+
+  /** Stop an in-flight download. Best-effort; the download reports its own outcome. */
+  async cancelDownload(): Promise<void> {
+    try {
+      await this.ipc.cancelModelDownload();
+    } catch {
+      // Nothing to cancel, or the command is unavailable — the download still
+      // resolves (or fails) on its own, and there is nothing useful to say here.
     }
   }
 
@@ -547,8 +642,17 @@ export class OnboardingComponent implements OnInit {
    * Save the current wizard choices, preserving every other config field from
    * the loaded snapshot. `markOnboarded` flips the first-run gate on the final
    * step. A tracked timeout is NOT needed here — these are awaited one-shots.
+   *
+   * `modelSizeSource` is OMITTED by default, and omitting it means PRESERVE (the
+   * backend leaves the stored row untouched). That default is what lets every other
+   * write here — provider, vault, finish — go through without opinions about a field
+   * they know nothing about. Only the two writes that genuinely decide the question
+   * pass it: the PRESELECT (`"auto"`) and an explicit pick (`"user"`).
    */
-  private async persistConfig(markOnboarded = false): Promise<void> {
+  private async persistConfig(
+    markOnboarded = false,
+    modelSizeSource?: "auto" | "user",
+  ): Promise<void> {
     const base = this.loadedConfig;
     const cfg: AppConfigDto = {
       providerId: this.provider(),
@@ -578,6 +682,9 @@ export class OnboardingComponent implements OnInit {
       audioStorageLimitGb: base?.audioStorageLimitGb ?? null,
       audioAutoPrune: base?.audioAutoPrune ?? false,
       modelSize: this.modelSize(),
+      // `null` is the WIRE spelling of "absent" for this field (Rust `Option<String>`
+      // with `#[serde(default)]`), i.e. preserve whatever is stored.
+      modelSizeSource: modelSizeSource ?? null,
       // Live-caption engine — preserve-only here (the Settings Transcription section owns the
       // toggle + the parakeet download); round-trip the snapshot, default "whisper".
       liveAsrEngine: base?.liveAsrEngine ?? "whisper",
@@ -661,7 +768,9 @@ export class OnboardingComponent implements OnInit {
       shareEgressConsented: base?.shareEgressConsented ?? false,
     };
     await this.ipc.saveConfig(cfg);
-    // Keep the snapshot current so successive saves don't clobber fresh choices.
-    this.loadedConfig = cfg;
+    // Keep the snapshot current so successive saves don't clobber fresh choices —
+    // but WITHOUT the one-shot `modelSizeSource`, so a later preserve-write cannot
+    // accidentally re-assert a decision this call already made.
+    this.loadedConfig = { ...cfg, modelSizeSource: null };
   }
 }

@@ -27,6 +27,7 @@ import type {
   Posture,
   RetiredModelNudge,
   WhisperRecommendationDto,
+  ModelDownloadOutcome,
   WhisperCard,
   EmbedDownloadProgress,
   EgressLedger,
@@ -1951,9 +1952,37 @@ export class IpcService {
     return invoke<boolean>("model_present");
   }
 
-  /** Download the default Whisper model (~150 MB) if missing; resolves with its path. */
-  downloadModel(): Promise<string> {
-    return invoke<string>("download_model");
+  /**
+   * Download the Whisper model for the SAVED language + size (plus the live-caption
+   * companion when one is planned). Progress streams over {@link onModelDownload}.
+   *
+   * Resolves with a typed OUTCOME: `status: "cancelled"` when
+   * {@link cancelModelDownload} interrupted it. A cancel is NOT a rejection —
+   * the FE must never string-match an error message to tell a user-initiated
+   * cancel apart from a dead link.
+   */
+  downloadModel(): Promise<ModelDownloadOutcome> {
+    return invoke<ModelDownloadOutcome>("download_model");
+  }
+
+  /**
+   * Cancel the Whisper model download that is in flight right now. Idempotent
+   * and infallible — with nothing running it is a no-op, and it can never reach
+   * forward into a download that has not started yet (the backend watches a
+   * generation counter, not a global flag).
+   */
+  cancelModelDownload(): Promise<void> {
+    return invoke<void>("cancel_model_download");
+  }
+
+  /**
+   * Delete ONE downloaded Whisper model to reclaim disk. Rejects (with the
+   * backend's reason) when the size is the effective model, the live-caption
+   * pin, or not a catalog id — the backend owns every refusal, so the FE never
+   * re-implements them.
+   */
+  deleteWhisperModel(size: string): Promise<void> {
+    return invoke<void>("delete_whisper_model", { size });
   }
 
   /** Whether the OPTIONAL parakeet live-ASR engine's models are all present on disk. */

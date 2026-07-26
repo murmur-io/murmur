@@ -1,0 +1,40 @@
+<div class="ps-wrap">
+  <!-- The painted track sits BEHIND the native input (which is transparent apart
+       from its thumb) so the fill can animate; the input stays the one real
+       control, so focus, keyboard and assistive tech are all native. -->
+  <div class="ps-track" aria-hidden="true">
+    <span class="ps-fill" [style.width.%]="fillPct()"></span>
+    @for (r of rungs(); track r.id; let i = $index) {
+      <span
+        class="ps-notch"
+        [class.is-reached]="i <= activeIndex() && !isOffLadder()"
+        [style.left.%]="maxIndex() > 0 ? (i / maxIndex()) * 100 : 0"
+      ></span>
+    }
+  </div>
+
+  <input
+    #rangeInput
+    class="mur-range ps-input"
+    type="range"
+    min="0"
+    step="1"
+    [max]="maxIndex()"
+    [value]="activeIndex()"
+    [disabled]="isDisabled()"
+    [attr.aria-label]="ariaLabel()"
+    [attr.aria-valuetext]="valueText()"
+    (input)="onInput($event)"
+    (change)="onChangeEvent($event)"
+    (keydown)="onKeydown($event)"
+  />
+
+  <!-- Decoration: the input above already announces the active rung by NAME. -->
+  <div class="ps-labels" aria-hidden="true">
+    @for (r of rungs(); track r.id; let i = $index) {
+      <span class="ps-label" [class.is-active]="i === activeIndex() && !isOffLadder()">
+        {{ r.name }}
+      </span>
+    }
+  </div>
+</div>
