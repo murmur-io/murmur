@@ -1,6 +1,7 @@
 //! Keychain secret (BYO API token/key) setters + presence probes — extracted verbatim from
 //! `commands` (God-file split, a PURE MOVE — no behavior change). These commands store/replace/clear
-//! BYO credentials in the macOS Keychain (Jira token, Slack token, Anthropic key, AI-Gateway key,
+//! BYO credentials in the macOS Keychain (Jira token, Slack token, Notion token, ClickUp token,
+//! Anthropic key, AI-Gateway key,
 //! web-search key) and report ONLY presence (`has_*`). NON-content-gated: they read/write NO meeting
 //! content and touch no seal/unlock surface — the keys are never logged, never returned to the FE.
 //! Every symbol keeps its EXACT prior body/signature and is re-exported at `crate::commands` via
@@ -58,6 +59,49 @@ pub fn set_slack_token(key: String) -> Result<(), AppError> {
 pub fn has_slack_token() -> Result<bool, AppError> {
     Ok(
         secrets::get_secret(crate::connectors::slack::SLACK_TOKEN_ACCOUNT)?
+            .filter(|k| !k.trim().is_empty())
+            .is_some(),
+    )
+}
+
+/// Store/replace the BYO Notion integration token in the Keychain (account "notion_api_token"). An
+/// empty input clears it. NEVER logged, NEVER returned to the FE — only `has_*` reports presence.
+#[tauri::command]
+pub fn set_notion_token(key: String) -> Result<(), AppError> {
+    if key.trim().is_empty() {
+        return secrets::delete_secret(crate::connectors::notion::NOTION_TOKEN_ACCOUNT);
+    }
+    secrets::set_secret(crate::connectors::notion::NOTION_TOKEN_ACCOUNT, key.trim())
+}
+
+/// Whether a Notion token is currently stored (UI shows "set"/"not set"; never the value).
+#[tauri::command]
+pub fn has_notion_token() -> Result<bool, AppError> {
+    Ok(
+        secrets::get_secret(crate::connectors::notion::NOTION_TOKEN_ACCOUNT)?
+            .filter(|k| !k.trim().is_empty())
+            .is_some(),
+    )
+}
+
+/// Store/replace the BYO ClickUp personal API token in the Keychain (account "clickup_api_token").
+/// An empty input clears it. NEVER logged, NEVER returned to the FE — only `has_*` reports presence.
+#[tauri::command]
+pub fn set_clickup_token(key: String) -> Result<(), AppError> {
+    if key.trim().is_empty() {
+        return secrets::delete_secret(crate::connectors::clickup::CLICKUP_TOKEN_ACCOUNT);
+    }
+    secrets::set_secret(
+        crate::connectors::clickup::CLICKUP_TOKEN_ACCOUNT,
+        key.trim(),
+    )
+}
+
+/// Whether a ClickUp token is currently stored (UI shows "set"/"not set"; never the value).
+#[tauri::command]
+pub fn has_clickup_token() -> Result<bool, AppError> {
+    Ok(
+        secrets::get_secret(crate::connectors::clickup::CLICKUP_TOKEN_ACCOUNT)?
             .filter(|k| !k.trim().is_empty())
             .is_some(),
     )

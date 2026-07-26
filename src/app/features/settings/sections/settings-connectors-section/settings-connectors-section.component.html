@@ -356,6 +356,238 @@
                 }
               </div>
             }
+
+            <!-- Notion connector (READ-ONLY) -->
+            <label class="toggle-row">
+              <span class="toggle-copy">
+                <span class="toggle-title">Notion</span>
+                <span class="text-secondary toggle-sub">
+                  When enabled (and allowed below, with an integration token), the
+                  assistant can search your Notion pages and databases and cite
+                  them. Read-only — Murmur never creates or edits anything in
+                  Notion. Notion results are added as “via notion” sources.
+                </span>
+              </span>
+              <mur-toggle formControlName="notionEnabled" />
+            </label>
+
+            @if (form.controls.notionEnabled.value) {
+              <!-- Egress banner — make the new off-device path impossible to miss. -->
+              <p class="banner is-warning connector-egress" role="note">
+                <strong>This sends data off your Mac.</strong> When the brain runs a
+                Notion search, your (redacted) query leaves the device for your
+                Notion workspace. Only the query is sent — never your notes or
+                transcript. Disable this, or skip the consent below, to keep
+                everything local.
+              </p>
+
+              <!-- BYO integration token -->
+              <fieldset class="connector-fieldset">
+                <legend>Notion integration token</legend>
+                <div class="key-status">
+                  <span class="text-secondary">Status</span>
+                  @if (hasNotionToken()) {
+                    <span class="pill is-success">
+                      <span class="pill-dot"></span>
+                      Token set ✓
+                    </span>
+                  } @else {
+                    <span class="pill">
+                      <span class="pill-dot"></span>
+                      Not set
+                    </span>
+                  }
+                </div>
+                <span class="row">
+                  <input
+                    type="password"
+                    [formControl]="notionTokenControl"
+                    placeholder="Notion integration token (ntn_… / secret_…)"
+                    autocomplete="off"
+                  />
+                  <button
+                    type="button"
+                    class="btn"
+                    (click)="saveNotionToken()"
+                    [disabled]="savingNotionToken()"
+                  >
+                    {{ savingNotionToken() ? "Saving…" : "Save token" }}
+                  </button>
+                </span>
+                <span class="field-help text-muted">
+                  Create an internal integration in Notion, share the pages you want
+                  searchable with it, and paste its token here. It's stored in your
+                  macOS Keychain, never logged, and never leaves with your notes.
+                </span>
+                @if (notionTokenError(); as nkerr) {
+                  <p class="text-danger brain-error">{{ nkerr }}</p>
+                }
+              </fieldset>
+
+              <!-- One-time egress consent (mirrors the Slack UX) -->
+              <div class="privacy-section connector-consent">
+                <span class="privacy-section-label text-muted"
+                  >Allow Notion access</span
+                >
+                <p class="text-secondary privacy-note">
+                  Your search query leaves this device for your Notion workspace
+                  (redacted first). Until you allow this once, Notion search stays
+                  off and no query is ever sent.
+                </p>
+                @if (notionConsented()) {
+                  <span class="pill is-success cloud-consent-pill">
+                    <span class="pill-dot"></span>
+                    Notion access allowed
+                  </span>
+                } @else {
+                  <div class="cloud-consent-row">
+                    <button
+                      type="button"
+                      class="btn btn-primary"
+                      (click)="allowNotion()"
+                      [disabled]="notionConsenting()"
+                    >
+                      @if (notionConsenting()) {
+                        <span class="spin-ring" aria-hidden="true"></span>
+                        Enabling…
+                      } @else {
+                        Allow Notion access (one-time consent)
+                      }
+                    </button>
+                    <span class="text-muted cloud-consent-hint">
+                      One-time. The brain works fully offline on your notes without
+                      it.
+                    </span>
+                  </div>
+                }
+                @if (notionConsentError(); as ncerr) {
+                  <p class="text-danger privacy-note">{{ ncerr }}</p>
+                }
+              </div>
+            }
+
+            <!-- ClickUp connector (READ-ONLY) -->
+            <label class="toggle-row">
+              <span class="toggle-copy">
+                <span class="toggle-title">ClickUp</span>
+                <span class="text-secondary toggle-sub">
+                  When enabled (and allowed below, with a workspace id and API
+                  token), the assistant can search your recently-updated ClickUp
+                  tasks and cite them. Read-only — Murmur never creates or edits
+                  tasks. ClickUp results are added as “via clickup” sources.
+                </span>
+              </span>
+              <mur-toggle formControlName="clickupEnabled" />
+            </label>
+
+            @if (form.controls.clickupEnabled.value) {
+              <!-- Egress banner — make the new off-device path impossible to miss. -->
+              <p class="banner is-warning connector-egress" role="note">
+                <strong>This sends data off your Mac.</strong> When the brain runs a
+                ClickUp search, Murmur reads your recently-updated tasks from your
+                ClickUp workspace. Your notes and transcript are never sent. Disable
+                this, or skip the consent below, to keep everything local.
+              </p>
+
+              <!-- Workspace (non-secret) -->
+              <fieldset class="connector-fieldset">
+                <legend>ClickUp workspace</legend>
+                <span class="row">
+                  <input
+                    type="text"
+                    formControlName="clickupTeamId"
+                    placeholder="Workspace (team) id, e.g. 9001"
+                    autocomplete="off"
+                  />
+                </span>
+                <span class="field-help text-muted">
+                  The numeric id in your ClickUp URL
+                  (app.clickup.com/&lt;workspace-id&gt;/…).
+                </span>
+              </fieldset>
+
+              <!-- BYO API token -->
+              <fieldset class="connector-fieldset">
+                <legend>ClickUp API token</legend>
+                <div class="key-status">
+                  <span class="text-secondary">Status</span>
+                  @if (hasClickupToken()) {
+                    <span class="pill is-success">
+                      <span class="pill-dot"></span>
+                      Token set ✓
+                    </span>
+                  } @else {
+                    <span class="pill">
+                      <span class="pill-dot"></span>
+                      Not set
+                    </span>
+                  }
+                </div>
+                <span class="row">
+                  <input
+                    type="password"
+                    [formControl]="clickupTokenControl"
+                    placeholder="ClickUp personal API token (pk_…)"
+                    autocomplete="off"
+                  />
+                  <button
+                    type="button"
+                    class="btn"
+                    (click)="saveClickupToken()"
+                    [disabled]="savingClickupToken()"
+                  >
+                    {{ savingClickupToken() ? "Saving…" : "Save token" }}
+                  </button>
+                </span>
+                <span class="field-help text-muted">
+                  Bring your own token — it's stored in your macOS Keychain, never
+                  logged, and never leaves with your notes.
+                </span>
+                @if (clickupTokenError(); as ckerr) {
+                  <p class="text-danger brain-error">{{ ckerr }}</p>
+                }
+              </fieldset>
+
+              <!-- One-time egress consent (mirrors the Notion UX) -->
+              <div class="privacy-section connector-consent">
+                <span class="privacy-section-label text-muted"
+                  >Allow ClickUp access</span
+                >
+                <p class="text-secondary privacy-note">
+                  Murmur reaches your ClickUp workspace to read your tasks. Until you
+                  allow this once, ClickUp search stays off and nothing is ever sent.
+                </p>
+                @if (clickupConsented()) {
+                  <span class="pill is-success cloud-consent-pill">
+                    <span class="pill-dot"></span>
+                    ClickUp access allowed
+                  </span>
+                } @else {
+                  <div class="cloud-consent-row">
+                    <button
+                      type="button"
+                      class="btn btn-primary"
+                      (click)="allowClickup()"
+                      [disabled]="clickupConsenting()"
+                    >
+                      @if (clickupConsenting()) {
+                        <span class="spin-ring" aria-hidden="true"></span>
+                        Enabling…
+                      } @else {
+                        Allow ClickUp access (one-time consent)
+                      }
+                    </button>
+                    <span class="text-muted cloud-consent-hint">
+                      One-time. The brain works fully offline on your notes without
+                      it.
+                    </span>
+                  </div>
+                }
+                @if (clickupConsentError(); as ccerr) {
+                  <p class="text-danger privacy-note">{{ ccerr }}</p>
+                }
+              </div>
+            }
           </div>
 </div>
   

@@ -47,7 +47,7 @@ const SETTINGS_SECTIONS: readonly SettingsSection[] = [
   { id: "notes", label: "Notes", keywords: "summary style brief detailed action language auto organize subfolders thematic enhance skeleton typed notes append" },
   // Stage-2 hub: Brain & AI + Providers collapsed into ONE section (keywords merged).
   { id: "ai", label: "AI & Models", keywords: "provider assistant backend cloud local gguf model reasoning effort semantic search embedding reindex in-meeting voice assistant wake anthropic ollama claude code gateway openai api key availability binary default consent revoke privacy egress" },
-  { id: "connectors", label: "Connectors", keywords: "web search brave egress api key internet" },
+  { id: "connectors", label: "Connectors", keywords: "web search brave egress api key internet jira slack notion clickup token tasks pages" },
   { id: "account", label: "Account", keywords: "sign in login sign up account sharing share link server e2ee zero knowledge recovery" },
   { id: "organization", label: "Organization", keywords: "org team shared brain company workspace members invite colleague owner consent sync org brain shared knowledge base leave" },
   { id: "privacy", label: "Privacy & Integrations", keywords: "redaction firewall cloud processing consent locked folders mcp server claude desktop memory remember facts user memory cross-meeting forget" },
