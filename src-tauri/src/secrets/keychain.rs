@@ -40,6 +40,16 @@ pub const ACCOUNT_JIRA_TOKEN: &str = "jira_api_token";
 /// recognizes it as a known fixed account (no per-call string leak in [`leak_account`]).
 pub const ACCOUNT_SLACK_TOKEN: &str = "slack_user_token";
 
+/// Keychain account holding the BYO Notion connector integration token. Mirrors
+/// [`crate::connectors::notion::NOTION_TOKEN_ACCOUNT`]. Named here so the data-protection routing
+/// recognizes it as a known fixed account (no per-call string leak in [`leak_account`]).
+pub const ACCOUNT_NOTION_TOKEN: &str = "notion_api_token";
+
+/// Keychain account holding the BYO ClickUp connector personal API token (`pk_…`). Mirrors
+/// [`crate::connectors::clickup::CLICKUP_TOKEN_ACCOUNT`]. Named here so the data-protection routing
+/// recognizes it as a known fixed account (no per-call string leak in [`leak_account`]).
+pub const ACCOUNT_CLICKUP_TOKEN: &str = "clickup_api_token";
+
 /// Keychain account holding the AI Gateway API key. Mirrors `summarize::GATEWAY_KEY_ACCOUNT` and
 /// `commands::GATEWAY_KEY_ACCOUNT`. Strictly separate from [`ACCOUNT_ANTHROPIC_KEY`] — never a
 /// fallback (R3). Named here so the data-protection routing recognizes it as a known fixed account
@@ -1611,6 +1621,8 @@ fn leak_account(account: &str) -> &'static str {
         ACCOUNT_WEB_SEARCH_KEY => ACCOUNT_WEB_SEARCH_KEY,
         ACCOUNT_JIRA_TOKEN => ACCOUNT_JIRA_TOKEN,
         ACCOUNT_SLACK_TOKEN => ACCOUNT_SLACK_TOKEN,
+        ACCOUNT_NOTION_TOKEN => ACCOUNT_NOTION_TOKEN,
+        ACCOUNT_CLICKUP_TOKEN => ACCOUNT_CLICKUP_TOKEN,
         ACCOUNT_GATEWAY_KEY => ACCOUNT_GATEWAY_KEY,
         // The 7 sharing-session accounts (share::mod KC_* constants). Matched by literal so the
         // hot set/get/delete paths (account_status → load_tokens is FE-polled) return a &'static str
@@ -1766,6 +1778,45 @@ mod tests {
         assert_eq!(hex_to_key32(&hex), Some(bytes));
         // Trims surrounding whitespace (env-var convenience).
         assert_eq!(hex_to_key32(&format!("  {hex}\n")), Some(bytes));
+    }
+
+    /// DRIFT GUARD: the connector token accounts named here MUST equal the constants the connectors
+    /// actually read/write, or the data-protection routing (`leak_account`) silently falls through to
+    /// the unknown-account arm and the secret lands under a different item than it is read from.
+    #[test]
+    fn connector_token_accounts_mirror_the_connector_constants() {
+        assert_eq!(
+            ACCOUNT_JIRA_TOKEN,
+            crate::connectors::jira::JIRA_TOKEN_ACCOUNT
+        );
+        assert_eq!(
+            ACCOUNT_SLACK_TOKEN,
+            crate::connectors::slack::SLACK_TOKEN_ACCOUNT
+        );
+        assert_eq!(
+            ACCOUNT_NOTION_TOKEN,
+            crate::connectors::notion::NOTION_TOKEN_ACCOUNT
+        );
+        assert_eq!(
+            ACCOUNT_CLICKUP_TOKEN,
+            crate::connectors::clickup::CLICKUP_TOKEN_ACCOUNT
+        );
+        assert_eq!(
+            ACCOUNT_WEB_SEARCH_KEY,
+            crate::connectors::web::WEB_SEARCH_KEY_ACCOUNT
+        );
+        // Every connector account is DISTINCT — no two BYO credentials may share a Keychain item.
+        let accounts = [
+            ACCOUNT_JIRA_TOKEN,
+            ACCOUNT_SLACK_TOKEN,
+            ACCOUNT_NOTION_TOKEN,
+            ACCOUNT_CLICKUP_TOKEN,
+            ACCOUNT_WEB_SEARCH_KEY,
+            ACCOUNT_ANTHROPIC_KEY,
+            ACCOUNT_GATEWAY_KEY,
+        ];
+        let unique: std::collections::BTreeSet<&str> = accounts.iter().copied().collect();
+        assert_eq!(unique.len(), accounts.len(), "keychain accounts must be distinct");
     }
 
     #[test]

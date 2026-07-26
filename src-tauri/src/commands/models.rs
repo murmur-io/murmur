@@ -244,12 +244,19 @@ pub async fn provider_statuses(
 /// English is selected) from the whisper.cpp HuggingFace mirror into the app models dir if
 /// missing; returns its path. No-op (returns the existing path) when already present. Emits
 /// [`crate::events::EVENT_MODEL_DOWNLOAD`] progress (throttled) so the FE can show a progress bar.
+///
+/// ALSO fetches the live-safe COMPANION model when the batch model can't serve live captions — see
+/// `commands/live_captions.rs::companion_size_for` for the full decision (and the defect it closes:
+/// a fresh ≥ 12 GB Mac downloads only the heavy turbo default, which is never run on the 3 s live
+/// tick, so the default install had NO live captions). BEST-EFFORT: a companion failure never fails
+/// this command — the batch model is what gates recording, and the recorder surfaces the
+/// "live captions off" state from `get_config`.
 #[tauri::command]
 pub async fn download_model(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<String, AppError> {
-    let (configured, size, language) = {
+    let (configured, size, language, live_model_pin, brain_live) = {
         let c = state
             .config
             .lock()
@@ -258,6 +265,8 @@ pub async fn download_model(
             c.whisper_model_path.clone(),
             c.model_size.clone(),
             c.language.clone().unwrap_or_default(),
+            c.live_model_pin.clone(),
+            c.brain_live,
         )
     };
     let p = configured.as_deref().map(std::path::Path::new);
@@ -279,6 +288,43 @@ pub async fn download_model(
         }
     })
     .await?;
+
+    // The LIVE-caption companion, decided against the model that actually landed above (so a custom
+    // `whisper_model_path` is covered without re-deriving it). Progress rides the SAME throttled
+    // event stream — the FE bar restarts for the (much smaller) second file, which is honest: it is a
+    // second download. Nothing is fetched when the live tick already has something to run.
+    if let Some(live_size) =
+        super::live_captions::companion_size(&path, &language, &live_model_pin, brain_live)
+    {
+        let mut companion_emit: u64 = 0;
+        match crate::transcribe::ensure_model(None, &live_size, &language, |downloaded, total| {
+            if downloaded - companion_emit >= EMIT_EVERY {
+                companion_emit = downloaded;
+                let _ = app.emit(
+                    crate::events::EVENT_MODEL_DOWNLOAD,
+                    crate::events::ModelDownloadPayload {
+                        downloaded,
+                        total,
+                        done: false,
+                    },
+                );
+            }
+        })
+        .await
+        {
+            Ok(_) => tracing::info!(
+                target: "transcribe",
+                size = %live_size,
+                "live-caption companion model ready beside the batch model"
+            ),
+            Err(e) => tracing::warn!(
+                target: "transcribe",
+                size = %live_size,
+                error = %e,
+                "live-caption companion model download failed; live captions stay off until it is retried"
+            ),
+        }
+    }
 
     let _ = app.emit(
         crate::events::EVENT_MODEL_DOWNLOAD,

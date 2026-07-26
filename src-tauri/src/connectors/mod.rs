@@ -27,9 +27,11 @@
 //! result snippets, or the API key.
 
 pub mod calendar;
+pub mod clickup;
 pub mod jira;
 pub mod mcp;
 pub mod mcp_client;
+pub mod notion;
 pub mod slack;
 pub mod web;
 
@@ -211,6 +213,12 @@ impl ConnectorRegistry {
             connectors.push(Box::new(c));
         }
         if let Some(c) = slack::SlackConnector::from_config_if_available(config) {
+            connectors.push(Box::new(c));
+        }
+        if let Some(c) = notion::NotionConnector::from_config_if_available(config) {
+            connectors.push(Box::new(c));
+        }
+        if let Some(c) = clickup::ClickUpConnector::from_config_if_available(config) {
             connectors.push(Box::new(c));
         }
         Self {
@@ -819,6 +827,138 @@ mod tests {
             !ConnectorRegistry::build(&consented_disabled).has("web"),
             "consented-but-disabled web search must be excluded (fail-closed on enable)"
         );
+    }
+
+    /// NOTION + CLICKUP fail-closed at the REGISTRY boundary (the new External connectors).
+    /// RED-before-GREEN: drop either `from_config_if_available` gate and the connector becomes
+    /// present here and would attempt a network call. Every combination short of
+    /// `enabled && consented && configured` must leave it ABSENT.
+    #[test]
+    fn registry_excludes_notion_and_clickup_when_disabled_or_unconsented_failclosed() {
+        use crate::settings::AppConfig;
+        // Default config: both OFF + unconsented → both connectors are absent.
+        let registry = ConnectorRegistry::build(&AppConfig::default());
+        assert!(!registry.has("notion"), "notion absent by default");
+        assert!(!registry.has("clickup"), "clickup absent by default");
+
+        // Enabled but STILL unconsented → excluded (consent is the second required gate).
+        let enabled_unconsented = AppConfig {
+            notion_enabled: true,
+            clickup_enabled: true,
+            clickup_team_id: "9001".into(),
+            ..AppConfig::default()
+        };
+        let registry = ConnectorRegistry::build(&enabled_unconsented);
+        assert!(!registry.has("notion"), "enabled-but-unconsented notion");
+        assert!(!registry.has("clickup"), "enabled-but-unconsented clickup");
+
+        // Consented but DISABLED → excluded (enable is the first required gate).
+        let consented_disabled = AppConfig {
+            notion_consented: true,
+            clickup_consented: true,
+            clickup_team_id: "9001".into(),
+            ..AppConfig::default()
+        };
+        let registry = ConnectorRegistry::build(&consented_disabled);
+        assert!(!registry.has("notion"), "consented-but-disabled notion");
+        assert!(!registry.has("clickup"), "consented-but-disabled clickup");
+
+        // ClickUp: enabled + consented but NO team id → still excluded (unconfigured).
+        let unconfigured = AppConfig {
+            clickup_enabled: true,
+            clickup_consented: true,
+            clickup_team_id: "   ".into(),
+            ..AppConfig::default()
+        };
+        assert!(
+            !ConnectorRegistry::build(&unconfigured).has("clickup"),
+            "clickup with no team id must stay excluded"
+        );
+    }
+
+    /// An UNCONSENTED notion/clickup search fails closed AND writes NO ledger row — nothing left the
+    /// device, so nothing is recorded (mirrors `unexposed_connector_id_fails_closed_without_egress`).
+    #[test]
+    fn unconsented_notion_and_clickup_search_egresses_nothing_and_records_nothing() {
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let registry = ConnectorRegistry::with_parts(
+            vec![],
+            std::sync::Arc::new(NoopNameRedactor),
+            std::sync::Arc::new(CaptureEgressSink(captured.clone())),
+        );
+        for id in ["notion", "clickup"] {
+            let res = block_on(registry.search(id, "what did we decide about launch"));
+            assert!(
+                matches!(res, Err(ConnectorError::NeedsConsent)),
+                "{id} must fail closed (needs_consent), egressing nothing: {res:?}"
+            );
+        }
+        assert!(
+            captured.lock().unwrap().is_empty(),
+            "a fail-closed (not-exposed) search must egress nothing AND record no ledger row"
+        );
+    }
+
+    /// PER-CONNECTOR ATTRIBUTION for the two new connectors: each records its OWN truthful ledger
+    /// attribution, never the web-search label. Mirrors the jira/slack attribution tests.
+    #[test]
+    fn notion_and_clickup_searches_are_attributed_to_themselves_not_web() {
+        struct LabeledConnector {
+            id: &'static str,
+            kind: &'static str,
+            destination: &'static str,
+        }
+        #[async_trait::async_trait]
+        impl Connector for LabeledConnector {
+            fn id(&self) -> &str {
+                self.id
+            }
+            fn egress_class(&self) -> EgressClass {
+                EgressClass::External
+            }
+            fn egress_attribution(&self) -> (&'static str, &'static str) {
+                (self.kind, self.destination)
+            }
+            async fn search(&self, _redacted_query: &str) -> ConnectorResult {
+                Ok(Vec::new())
+            }
+        }
+        for (id, kind, destination) in [
+            ("notion", "notion_search", "Notion (connector)"),
+            ("clickup", "clickup_search", "ClickUp (connector)"),
+        ] {
+            let recorded = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let registry = ConnectorRegistry::with_parts(
+                vec![Box::new(LabeledConnector {
+                    id,
+                    kind,
+                    destination,
+                })],
+                std::sync::Arc::new(NoopNameRedactor),
+                std::sync::Arc::new(CaptureEgressSink(recorded.clone())),
+            );
+            block_on(registry.search(id, "roadmap status")).unwrap();
+            let rows = recorded.lock().unwrap();
+            assert_eq!(rows.len(), 1, "exactly one ledger row for the {id} search");
+            assert_eq!(rows[0].provider_id, id);
+            assert_eq!(rows[0].call_kind, kind);
+            assert_eq!(rows[0].destination, destination);
+            assert_ne!(
+                rows[0].call_kind, "web_search",
+                "a {id} egress must NOT be mislabeled as a web search"
+            );
+            assert!(
+                !rows[0].destination.to_lowercase().contains("web search"),
+                "a {id} destination must not read as a web search: {}",
+                rows[0].destination
+            );
+            // CONTENT-FREE: the query text never reaches the ledger row.
+            let debug = format!("{:?}", rows[0]);
+            assert!(
+                !debug.contains("roadmap"),
+                "query terms must NOT appear in the ledger row: {debug}"
+            );
+        }
     }
 
     #[test]

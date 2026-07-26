@@ -442,6 +442,36 @@ pub struct AppConfig {
     /// dedicated `consent_to_slack` command. `#[serde(default)]` ⇒ pre-existing configs load as `false`.
     #[serde(default)]
     pub slack_consented: bool,
+    /// brain2 connector framework — master toggle for the NOTION connector (Settings ▸ Connectors).
+    /// Default OFF (`#[serde(default)]` ⇒ a config persisted before this field existed loads as
+    /// `false`). Even when ON, the connector is exposed only once `notion_consented` is granted AND
+    /// an integration token is in the Keychain — see
+    /// `connectors::notion::NotionConnector::from_config_if_available`.
+    #[serde(default)]
+    pub notion_enabled: bool,
+    /// brain2 connector framework — one-time NOTION egress consent. The Notion connector reaches an
+    /// EXTERNAL service (a NEW EGRESS CLASS): the outgoing (redacted) query leaves the device.
+    /// PRESERVE-ONLY: `dto_to_config` ignores the incoming DTO value and a plain `save` never writes
+    /// it, so a normal settings save can neither grant nor clear it. Flipped true SOLELY by the
+    /// dedicated `consent_to_notion` command. `#[serde(default)]` ⇒ pre-existing configs load as `false`.
+    #[serde(default)]
+    pub notion_consented: bool,
+    /// brain2 connector framework — master toggle for the CLICKUP connector (Settings ▸ Connectors).
+    /// Default OFF (`#[serde(default)]` ⇒ a config persisted before this field existed loads as
+    /// `false`). Even when ON, the connector is exposed only once `clickup_consented` is granted AND
+    /// a workspace (team) id + API token are configured — see
+    /// `connectors::clickup::ClickUpConnector::from_config_if_available`.
+    #[serde(default)]
+    pub clickup_enabled: bool,
+    /// brain2 connector framework — one-time CLICKUP egress consent. Same PRESERVE-ONLY discipline
+    /// as `notion_consented`; flipped true SOLELY by the dedicated `consent_to_clickup` command.
+    /// `#[serde(default)]` ⇒ pre-existing configs load as `false`.
+    #[serde(default)]
+    pub clickup_consented: bool,
+    /// The ClickUp workspace ("team") id the task search reads, e.g. `9001` (non-secret). Default
+    /// `""` (unset). `#[serde(default)]` ⇒ pre-existing configs load as `""`.
+    #[serde(default)]
+    pub clickup_team_id: String,
     /// Opt-in: restore the OLDER-VERSION behavior of INHERITING the shell environment into the
     /// `claude` CLI subprocess, so env vars set in the user's shell — `ANTHROPIC_API_KEY`,
     /// `ANTHROPIC_BASE_URL`, proxy vars (`HTTPS_PROXY`) — reach the CLI again. The F2 audit hardening
@@ -685,6 +715,11 @@ impl Default for AppConfig {
             jira_email: String::new(),
             slack_enabled: false,
             slack_consented: false,
+            notion_enabled: false,
+            notion_consented: false,
+            clickup_enabled: false,
+            clickup_consented: false,
+            clickup_team_id: String::new(),
             claude_code_inherit_env: false,
             gateway_base_url: String::new(),
             gateway_model: String::new(),
@@ -778,6 +813,11 @@ const K_JIRA_BASE_URL: &str = "jira_base_url";
 const K_JIRA_EMAIL: &str = "jira_email";
 const K_SLACK_ENABLED: &str = "slack_enabled";
 const K_SLACK_CONSENTED: &str = "slack_consented";
+const K_NOTION_ENABLED: &str = "notion_enabled";
+const K_NOTION_CONSENTED: &str = "notion_consented";
+const K_CLICKUP_ENABLED: &str = "clickup_enabled";
+const K_CLICKUP_CONSENTED: &str = "clickup_consented";
+const K_CLICKUP_TEAM_ID: &str = "clickup_team_id";
 const K_CLAUDE_CODE_INHERIT_ENV: &str = "claude_code_inherit_env";
 const K_GATEWAY_BASE_URL: &str = "gateway_base_url";
 const K_GATEWAY_MODEL: &str = "gateway_model";
@@ -1018,6 +1058,23 @@ impl AppConfig {
         }
         if let Some(v) = db.get_setting(K_SLACK_CONSENTED)? {
             cfg.slack_consented = v == "true";
+        }
+        if let Some(v) = db.get_setting(K_NOTION_ENABLED)? {
+            cfg.notion_enabled = v == "true";
+        }
+        if let Some(v) = db.get_setting(K_NOTION_CONSENTED)? {
+            cfg.notion_consented = v == "true";
+        }
+        if let Some(v) = db.get_setting(K_CLICKUP_ENABLED)? {
+            cfg.clickup_enabled = v == "true";
+        }
+        if let Some(v) = db.get_setting(K_CLICKUP_CONSENTED)? {
+            cfg.clickup_consented = v == "true";
+        }
+        // `""` is valid (= unset) for the ClickUp team id, so take the stored value verbatim
+        // (mirrors the jira string fields).
+        if let Some(v) = db.get_setting(K_CLICKUP_TEAM_ID)? {
+            cfg.clickup_team_id = v;
         }
         if let Some(v) = db.get_setting(K_CLAUDE_CODE_INHERIT_ENV)? {
             cfg.claude_code_inherit_env = v == "true";
@@ -1361,6 +1418,24 @@ impl AppConfig {
         // by `grant_slack_consent`, so a settings save can neither grant nor clear the egress consent
         // (stronger than the DTO-layer preserve; a save carrying `false` can never clobber the grant).
         db.set_setting(
+            K_NOTION_ENABLED,
+            if self.notion_enabled { "true" } else { "false" },
+        )?;
+        // PRESERVE-ONLY: `notion_consented` is NEVER written by a plain save — only
+        // `grant_notion_consent` persists it (same discipline as jira/slack).
+        db.set_setting(
+            K_CLICKUP_ENABLED,
+            if self.clickup_enabled {
+                "true"
+            } else {
+                "false"
+            },
+        )?;
+        // PRESERVE-ONLY: `clickup_consented` is NEVER written by a plain save — only
+        // `grant_clickup_consent` persists it. The non-secret workspace id IS saved verbatim
+        // (like the jira base URL/email); `""` = unset.
+        db.set_setting(K_CLICKUP_TEAM_ID, &self.clickup_team_id)?;
+        db.set_setting(
             K_CLAUDE_CODE_INHERIT_ENV,
             if self.claude_code_inherit_env {
                 "true"
@@ -1594,6 +1669,29 @@ impl AppConfig {
     pub fn grant_slack_consent(&mut self, db: &Db) -> Result<()> {
         db.set_setting(K_SLACK_CONSENTED, "true")?;
         self.slack_consented = true;
+        Ok(())
+    }
+
+    /// brain2 connectors — record the user's one-time consent to send the (redacted) Notion search
+    /// query to an EXTERNAL service. Mirrors [`grant_slack_consent`]: the ONLY supported mutator of
+    /// `notion_consented`, so Notion egress consent can never be granted as an incidental side
+    /// effect of a settings write. Until granted, the Notion connector is absent from the brain's
+    /// tool registry.
+    ///
+    /// FAIL-CLOSED ORDERING — persist FIRST, flip the in-memory flag ONLY on a durable success.
+    pub fn grant_notion_consent(&mut self, db: &Db) -> Result<()> {
+        db.set_setting(K_NOTION_CONSENTED, "true")?;
+        self.notion_consented = true;
+        Ok(())
+    }
+
+    /// brain2 connectors — record the user's one-time consent to reach ClickUp. Mirrors
+    /// [`grant_notion_consent`]: the ONLY supported mutator of `clickup_consented`.
+    ///
+    /// FAIL-CLOSED ORDERING — persist FIRST, flip the in-memory flag ONLY on a durable success.
+    pub fn grant_clickup_consent(&mut self, db: &Db) -> Result<()> {
+        db.set_setting(K_CLICKUP_CONSENTED, "true")?;
+        self.clickup_consented = true;
         Ok(())
     }
 }
@@ -2383,6 +2481,96 @@ mod tests {
         assert!(
             AppConfig::load(&db).unwrap().slack_consented,
             "grant_slack_consent's durable record survives; consent flips true only via the grant path"
+        );
+    }
+
+    #[test]
+    fn notion_flags_default_off_and_round_trip() {
+        let db = temp_db();
+        // Fail-closed defaults: both flags OFF until explicitly set/granted.
+        let cfg = AppConfig::load(&db).unwrap();
+        assert!(!cfg.notion_enabled, "notion must default OFF");
+        assert!(!cfg.notion_consented, "notion consent must default ungranted");
+
+        let cfg = AppConfig {
+            notion_enabled: true,
+            ..cfg
+        };
+        cfg.save(&db).unwrap();
+        let loaded = AppConfig::load(&db).unwrap();
+        assert!(loaded.notion_enabled);
+        // PRESERVE-ONLY: a save can never grant consent.
+        assert!(!loaded.notion_consented);
+    }
+
+    #[test]
+    fn notion_consent_grant_persists_and_save_cannot_clobber() {
+        let db = temp_db();
+        let mut cfg = AppConfig::load(&db).unwrap();
+        cfg.grant_notion_consent(&db).unwrap();
+        assert!(cfg.notion_consented);
+        assert!(AppConfig::load(&db).unwrap().notion_consented);
+        assert_eq!(
+            db.get_setting(K_NOTION_CONSENTED).unwrap().as_deref(),
+            Some("true"),
+            "durable notion consent record persisted (persist-first)"
+        );
+        // A later plain save must PRESERVE the granted consent — a plain `save` never writes the flag.
+        let cfg2 = AppConfig {
+            notion_consented: false,
+            ..AppConfig::load(&db).unwrap()
+        };
+        cfg2.save(&db).unwrap();
+        assert!(
+            AppConfig::load(&db).unwrap().notion_consented,
+            "grant_notion_consent's durable record survives; consent flips true only via the grant path"
+        );
+    }
+
+    #[test]
+    fn clickup_flags_default_off_and_round_trip() {
+        let db = temp_db();
+        let cfg = AppConfig::load(&db).unwrap();
+        assert!(!cfg.clickup_enabled, "clickup must default OFF");
+        assert!(
+            !cfg.clickup_consented,
+            "clickup consent must default ungranted"
+        );
+        assert!(cfg.clickup_team_id.is_empty());
+
+        let cfg = AppConfig {
+            clickup_enabled: true,
+            clickup_team_id: "9001".into(),
+            ..cfg
+        };
+        cfg.save(&db).unwrap();
+        let loaded = AppConfig::load(&db).unwrap();
+        assert!(loaded.clickup_enabled);
+        assert_eq!(loaded.clickup_team_id, "9001");
+        // PRESERVE-ONLY: a save can never grant consent.
+        assert!(!loaded.clickup_consented);
+    }
+
+    #[test]
+    fn clickup_consent_grant_persists_and_save_cannot_clobber() {
+        let db = temp_db();
+        let mut cfg = AppConfig::load(&db).unwrap();
+        cfg.grant_clickup_consent(&db).unwrap();
+        assert!(cfg.clickup_consented);
+        assert!(AppConfig::load(&db).unwrap().clickup_consented);
+        assert_eq!(
+            db.get_setting(K_CLICKUP_CONSENTED).unwrap().as_deref(),
+            Some("true"),
+            "durable clickup consent record persisted (persist-first)"
+        );
+        let cfg2 = AppConfig {
+            clickup_consented: false,
+            ..AppConfig::load(&db).unwrap()
+        };
+        cfg2.save(&db).unwrap();
+        assert!(
+            AppConfig::load(&db).unwrap().clickup_consented,
+            "grant_clickup_consent's durable record survives; consent flips true only via the grant path"
         );
     }
 

@@ -150,6 +150,14 @@
               </span>
             }
           </div>
+          @if (liveCompanionPending()) {
+            <!-- Honesty: a big model is never run on the live-caption tick (it would heat the
+                 Mac all meeting), so the download also brings a small live-caption model. -->
+            <p class="text-muted model-note live-companion-note">
+              Live captions also need a small model — we fetch it alongside this one, so
+              captions work while you record.
+            </p>
+          }
           @if (downloadError(); as derr) {
             <p class="ob-error text-danger">{{ derr }}</p>
           }
