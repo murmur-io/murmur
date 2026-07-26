@@ -28,6 +28,10 @@ pub mod ner_deberta;
 pub mod ollama;
 pub mod organize;
 pub mod provider;
+/// The RECALL half of the note's trust net — a deterministic, ZERO-EGRESS cue scan of THIS meeting's
+/// own transcript that surfaces commitments no `- [ ]` action item captured, under an opt-in,
+/// clearly-marked "## Possible missed items" section. Non-destructive, like `grounding`.
+pub mod recall_net;
 pub mod recipes;
 pub mod redact;
 pub mod related_context;
