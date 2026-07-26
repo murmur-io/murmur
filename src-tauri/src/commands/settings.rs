@@ -23,6 +23,7 @@ use tauri::State;
 
 use crate::error::AppError;
 use crate::state::AppState;
+use crate::storage::models::{NoteTemplate, NoteTemplateSection};
 
 /// E10 — grant the one-time cloud-egress consent. This is the ONLY supported way to flip
 /// `cloud_egress_consented` true: it persists the flag AND updates the in-memory config cache, so
@@ -96,5 +97,117 @@ pub fn consent_to_slack(state: State<'_, AppState>) -> Result<(), AppError> {
         .lock()
         .map_err(|_| AppError::Config("config mutex poisoned".into()))?;
     cache.grant_slack_consent(&state.db)?;
+    Ok(())
+}
+
+// ── Note templates (user-authored named sections) ────────────────────────────────────────────────
+//
+// CONTENT-FREE, single-user metadata — exactly like `save_recipe` / `upsert_saved_view`: these
+// persist only a note SHAPE (a name, a tone line, ordered `{heading, instruction}` sections, and
+// extra front-matter keys), NEVER meeting content, so they are NOT visibility-gated (there is
+// nothing sealed to leak). A saved template is rendered into the summarizer SYSTEM PROMPT by
+// `summarize::template::build_template` (the same `SummarizeRequest.template` seam the built-in
+// styles use) and still passes the `RedactingProvider` firewall on egress, unchanged.
+//
+// SECURITY: `save_note_template` REJECTS any template whose text carries a scripting token
+// (`<%` / `tp.` / `require(` / `process.`) with `AppError::InvalidArg` — a template is DECLARATIVE
+// data, never code. After every mutation we refresh the process-global saved-template registry
+// (`template::set_saved_templates`) so the next note generation resolves the live data (the pipeline
+// renders through `build_template` with only the style string, so the registry — not `AppState` —
+// is how a saved-template id reaches the renderer).
+
+/// List the user's saved note templates (newest first). CONTENT-FREE; not gated.
+#[tauri::command]
+pub fn list_note_templates(state: State<'_, AppState>) -> Result<Vec<NoteTemplate>, AppError> {
+    state.db.list_note_templates()
+}
+
+/// Save (create or replace) a note template. Validates the name + at least one section, REJECTS any
+/// scripting token, persists, refreshes the registry, and returns the stored row. An empty `id`
+/// mints a new uuid; a non-empty existing id replaces in place.
+#[tauri::command]
+pub fn save_note_template(
+    state: State<'_, AppState>,
+    id: Option<String>,
+    name: String,
+    tone: String,
+    sections: Vec<NoteTemplateSection>,
+    extra_frontmatter_keys: Vec<String>,
+) -> Result<NoteTemplate, AppError> {
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err(AppError::InvalidArg("template name is required".into()));
+    }
+    // SECURITY GATE — no scripting, ever. Validate the RAW inputs (before any normalization drops
+    // blank-heading rows) so a forbidden token can never slip through in a discarded field. A note
+    // template is DECLARATIVE data rendered into the system prompt, never code.
+    {
+        let raw = NoteTemplate {
+            id: String::new(),
+            name: name.clone(),
+            tone: tone.clone(),
+            sections: sections.clone(),
+            extra_frontmatter_keys: extra_frontmatter_keys.clone(),
+            created_at: String::new(),
+        };
+        crate::summarize::template::validate_note_template(&raw.name, &raw.tone, &raw)?;
+    }
+    // Normalize: drop wholly-blank sections/keys so a stray empty row can't produce a bare `## `.
+    let sections: Vec<NoteTemplateSection> = sections
+        .into_iter()
+        .filter(|s| !s.heading.trim().is_empty())
+        .map(|s| NoteTemplateSection {
+            heading: s.heading.trim().to_string(),
+            instruction: s.instruction.trim().to_string(),
+        })
+        .collect();
+    if sections.is_empty() {
+        return Err(AppError::InvalidArg(
+            "a note template needs at least one section".into(),
+        ));
+    }
+    let extra_frontmatter_keys: Vec<String> = extra_frontmatter_keys
+        .into_iter()
+        .map(|k| k.trim().to_string())
+        .filter(|k| !k.is_empty())
+        .collect();
+
+    let id = id
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    // Preserve the original created_at when replacing an existing template.
+    let created_at = state
+        .db
+        .list_note_templates()?
+        .into_iter()
+        .find(|t| t.id == id)
+        .map(|t| t.created_at)
+        .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+
+    let rec = NoteTemplate {
+        id,
+        name: name.clone(),
+        tone: tone.trim().to_string(),
+        sections,
+        extra_frontmatter_keys,
+        created_at,
+    };
+    // SECURITY GATE (belt-and-suspenders) — re-validate the exact normalized row that will be
+    // persisted + egressed. Normalization only trims, so this can't newly pass what the raw check
+    // above rejected; it guarantees the STORED bytes carry no scripting token.
+    crate::summarize::template::validate_note_template(&rec.name, &rec.tone, &rec)?;
+
+    state.db.insert_note_template(&rec)?;
+    // Refresh the renderer's registry so the next note generation sees the live template.
+    crate::summarize::template::set_saved_templates(state.db.list_note_templates()?);
+    Ok(rec)
+}
+
+/// Delete a saved note template by id, then refresh the renderer's registry.
+#[tauri::command]
+pub fn delete_note_template(state: State<'_, AppState>, id: String) -> Result<(), AppError> {
+    state.db.delete_note_template(&id)?;
+    crate::summarize::template::set_saved_templates(state.db.list_note_templates()?);
     Ok(())
 }

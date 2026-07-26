@@ -91,6 +91,8 @@ import type {
   VerifyFindingDto,
   ProviderStatus,
   SavedRecipe,
+  NoteTemplate,
+  NoteTemplateSection,
   SavedView,
   MeetingActionSummary,
   SearchHit,
@@ -1092,6 +1094,36 @@ export class IpcService {
   /** Delete a saved recipe. */
   deleteRecipe(id: string): Promise<void> {
     return invoke<void>("delete_recipe", { id });
+  }
+
+  /** User-authored note templates (Granola-style named sections). */
+  listNoteTemplates(): Promise<NoteTemplate[]> {
+    return invoke<NoteTemplate[]>("list_note_templates");
+  }
+
+  /**
+   * Save (create or replace) a note template. Pass `id: null` to create; the backend rejects
+   * scripting tokens (`<%`, `tp.`, `require(`, `process.`) and returns the stored row.
+   */
+  saveNoteTemplate(
+    id: string | null,
+    name: string,
+    tone: string,
+    sections: NoteTemplateSection[],
+    extraFrontmatterKeys: string[],
+  ): Promise<NoteTemplate> {
+    return invoke<NoteTemplate>("save_note_template", {
+      id,
+      name,
+      tone,
+      sections,
+      extraFrontmatterKeys,
+    });
+  }
+
+  /** Delete a saved note template by id. */
+  deleteNoteTemplate(id: string): Promise<void> {
+    return invoke<void>("delete_note_template", { id });
   }
 
   /** Run a recipe prompt over a meeting's transcript (grounded). */
