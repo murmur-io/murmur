@@ -1073,6 +1073,36 @@ pub struct RecipeRecord {
     pub created_at: String,
 }
 
+/// One ordered `## {heading}` block of a user-authored note template. `instruction` is the plain,
+/// DECLARATIVE guidance the model gets for that section — it is DATA, never code (see
+/// `summarize::template::validate_note_template`, which rejects scripting tokens at save).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NoteTemplateSection {
+    pub heading: String,
+    pub instruction: String,
+}
+
+/// A user-authored NOTE TEMPLATE (Granola-style named sections). CONTENT-FREE, single-user metadata
+/// (exactly like `saved_recipes` / `saved_views`): it stores only a note SHAPE — a tone line, an
+/// ordered list of `{heading, instruction}` sections, and any extra front-matter keys — never meeting
+/// content, so its read/write path is NOT visibility-gated. Selected by id via the note-style
+/// selector; rendered into the summarizer system prompt by `summarize::template::build_template`
+/// (the same `SummarizeRequest.template` seam the built-in styles use). `sections` and
+/// `extra_frontmatter_keys` persist as JSON TEXT columns.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NoteTemplate {
+    pub id: String,
+    pub name: String,
+    /// A short style/tone directive appended to the prompt preamble (may be empty).
+    pub tone: String,
+    pub sections: Vec<NoteTemplateSection>,
+    /// Additional YAML front-matter keys to request beyond the fixed 5 (may be empty).
+    pub extra_frontmatter_keys: Vec<String>,
+    pub created_at: String,
+}
+
 /// A user-saved VIEW over a list surface (Feature B — "Saved views over the meetings list").
 ///
 /// LOCK MODEL: this is CONTENT-FREE user metadata (like `saved_recipes`) — a single-user,
