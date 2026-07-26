@@ -133,6 +133,25 @@ export interface AppConfigDto {
   audioAutoPrune: boolean;
   modelSize: string;
   /**
+   * WHO put {@link modelSize} there — `"auto"` (Murmur's recommendation was
+   * accepted as-is) or `"user"` (a deliberate pick). Mirrors Rust
+   * `AppConfigDto::model_size_source`, and it is deliberately OPTIONAL in both
+   * directions: OMITTING it means PRESERVE, so every existing save path (the
+   * whole Settings form, every onboarding write that is not about the model
+   * choice) leaves the stored value exactly as it is instead of clobbering it.
+   *
+   * It matters because the onboarding wizard PRESELECTS the recommendation and
+   * then persists it like any other field: without sending `"auto"` there, a
+   * fresh install that simply accepted the default would be recorded as a
+   * deliberate user choice, and the backfill/nudge logic that keys off "did
+   * they actually choose this?" would never be able to tell them apart.
+   *
+   * Read it back through `whisperRecommendation().modelSizeSource`, never from
+   * a config round-trip (`config_to_dto` leaves it null so a read-modify-write
+   * is a preserve).
+   */
+  modelSizeSource?: string | null;
+  /**
    * OPTIONAL live-caption ASR engine (mirrors Rust `live_asr_engine`): `"whisper"` (default) or
    * `"parakeet"`. When `"parakeet"` AND its models are downloaded, live captions decode on the
    * CPU-only NVIDIA parakeet engine (off the Metal GPU); whisper stays the batch authority and the
@@ -605,7 +624,37 @@ export interface WhisperRecommendationDto {
    * apart so an unmeasured id cannot promise a free multi-GB transfer.
    */
   pendingDownloadBytes: number | null;
+  /**
+   * LIVE-caption readiness, from the SAME classification `get_config` ships as
+   * `liveCaptions` — resolved over the one models-dir listing this DTO already
+   * took. `"noModel"` / `"modelMissing"` are what the picker's repair
+   * affordance keys off; `"pinnedHeavy"` is a deliberate configuration, not a
+   * failure, so it is NOT offered a repair.
+   */
+  liveCaptions: LiveCaptionsState;
   brainAdvice: BrainAdvice;
+}
+
+/**
+ * How the live-caption tick's model resolved. `""` = not probed yet.
+ * Mirrors the Rust `LiveCaptions::dto_state`.
+ */
+export type LiveCaptionsState =
+  | ""
+  | "ready"
+  | "noModel"
+  | "modelMissing"
+  | "pinnedHeavy";
+
+/**
+ * What a `download_model` call ended up doing. A user-initiated CANCEL is a
+ * NORMAL outcome (`status: "cancelled"`), never a rejected promise — the FE
+ * must never have to string-match an error message to tell a cancel apart from
+ * a dead link.
+ */
+export interface ModelDownloadOutcome {
+  status: "ready" | "cancelled";
+  path: string | null;
 }
 
 /**

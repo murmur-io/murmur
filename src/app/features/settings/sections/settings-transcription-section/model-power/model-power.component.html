@@ -1,0 +1,149 @@
+<div class="mp">
+  @if (catalogLoaded()) {
+    <div class="mp-slider">
+      <mur-power-slider
+        ariaLabel="Transcription model power"
+        [rungs]="rungs()"
+        [value]="size()"
+        [disabled]="disabled()"
+        (valueChange)="pick($event)"
+      />
+    </div>
+
+    <!-- The HEADLINE says what the rung DOES. The download size is secondary detail
+         below it, never the thing the user reads first. -->
+    <div class="mp-active">
+      <div class="mp-active-head">
+        <h4 class="mp-active-name">
+          {{ selected()?.tier ?? selected()?.id ?? size() }}
+        </h4>
+        @if (isRecommended()) {
+          <mur-pill kind="accent">Recommended for this Mac</mur-pill>
+        }
+      </div>
+
+      @if (selected(); as m) {
+        <p class="mp-headline">{{ m.headline }}</p>
+      } @else {
+        <p class="mp-headline text-muted">
+          This size isn’t one Murmur knows about — it stays selected until you pick
+          another.
+        </p>
+      }
+
+      @if (rating(); as r) {
+        <div class="mp-meters">
+          <mur-meter
+            label="Accuracy"
+            [value]="r.accuracy"
+            [max]="4"
+            [detail]="accuracyDetail()"
+          />
+          <mur-meter label="Speed" [value]="r.speed" [max]="4" />
+        </div>
+      }
+
+      <p class="field-help text-muted mp-download">{{ downloadCopy() }}</p>
+
+      @if (reasonCopy(); as why) {
+        <p class="field-help text-muted mp-reason">{{ why }}</p>
+      }
+
+      @if (!isRecommended() && recommendedTier(); as recTier) {
+        <button
+          type="button"
+          class="btn btn-ghost mp-use-rec"
+          [disabled]="disabled()"
+          (click)="useRecommended()"
+        >
+          Use {{ recTier }}, the recommendation for this Mac
+        </button>
+      }
+    </div>
+
+    @if (needsLiveRepair()) {
+      <div class="banner mp-repair" role="status">
+        <span>
+          Live captions have no model to run. Fetching the transcription model
+          brings the small live-caption model with it.
+        </span>
+        <button
+          type="button"
+          class="btn btn-primary"
+          [disabled]="disabled()"
+          (click)="repair.emit()"
+        >
+          Fix live captions
+        </button>
+      </div>
+    }
+  }
+
+  <!-- ALWAYS openable, even with no catalog: on a cold first launch the list is the
+       only place a user can see that Murmur simply hasn't heard back yet. -->
+  <mur-disclosure panelLabel="Every transcription model size">
+    <span murDisclosureSummary>Show every size</span>
+
+    @if (longTail().length) {
+      <ul class="mp-tail">
+        @for (m of longTail(); track m.id) {
+          <li class="mp-tail-row" [class.is-selected]="m.id === size()">
+            <button
+              type="button"
+              class="mp-tail-pick"
+              [disabled]="disabled()"
+              [attr.aria-pressed]="m.id === size()"
+              (click)="pick(m.id)"
+            >
+              <span class="mp-tail-headline">{{ m.headline }}</span>
+              <span class="mp-tail-meta">
+                <!-- The honest raw id, in muted mono — this is the string the model
+                     file is actually named after. -->
+                <code class="mp-tail-id">{{ m.id }}</code>
+                <span class="mp-tail-size">{{ sizeLabel(m) }}</span>
+                @if (m.downloaded) {
+                  <span class="mp-tail-on-disk">on this Mac</span>
+                }
+              </span>
+            </button>
+
+            @if (m.downloaded) {
+              @if (confirmDelete() === m.id) {
+                <span class="mp-tail-confirm">
+                  <button
+                    type="button"
+                    class="btn btn-ghost mp-danger"
+                    [disabled]="deleting()"
+                    (click)="remove(m.id)"
+                  >
+                    Delete for good
+                  </button>
+                  <button type="button" class="btn btn-ghost" (click)="cancelDelete()">
+                    Keep
+                  </button>
+                </span>
+              } @else {
+                <button
+                  type="button"
+                  class="btn btn-ghost mp-tail-delete"
+                  [disabled]="disabled() || deleting()"
+                  (click)="askDelete(m.id)"
+                >
+                  Delete
+                </button>
+              }
+            }
+          </li>
+        }
+      </ul>
+    } @else {
+      <p class="field-help text-muted">
+        Murmur hasn’t read this Mac’s model list yet.
+      </p>
+    }
+
+    @if (deleteError(); as err) {
+      <p class="field-help text-danger mp-delete-error" role="alert">{{ err }}</p>
+    }
+  </mur-disclosure>
+</div>
