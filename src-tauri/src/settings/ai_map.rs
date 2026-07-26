@@ -93,6 +93,39 @@ fn role_row(job: &str, title: &str, role: Role, cfg: &AppConfig) -> AiMapRow {
     }
 }
 
+/// What the Transcription row shows in its `model` cell.
+///
+/// P1: the raw checkpoint id (`large-v3-turbo-q8_0`) is not a thing a person can reason about, so a
+/// size that IS a ladder rung renders its human tier label instead ("Sharp"). The fallbacks matter
+/// as much as the happy path — the cell must NEVER be empty:
+///
+/// 1. an explicit custom `whisper_model_path` that exists overrides every size, so the FILE NAME is
+///    the honest answer (a tier word there would be a lie about which weights actually load);
+/// 2. a size that matches no registry row (a long-tail size, or an id we do not know) renders the
+///    RAW id;
+/// 3. a BLANK `model_size` resolves the machine-conditional default first (the same ONE decision
+///    `effective_model_size` takes everywhere else), then falls through the rules above.
+fn transcription_model_display(cfg: &AppConfig) -> String {
+    if let Some(path) = cfg
+        .whisper_model_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let p = std::path::Path::new(path);
+        if p.is_file() {
+            return p
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| path.to_string());
+        }
+    }
+    let size = crate::transcribe::effective_model_size(&cfg.model_size);
+    crate::transcribe::catalog::tier_label(&size)
+        .map(str::to_string)
+        .unwrap_or(size)
+}
+
 /// The full resolved map in display order. Pure (config in, rows out).
 pub fn ai_map_rows(cfg: &AppConfig) -> Vec<AiMapRow> {
     let light_id = class_model_id(cfg, ModelClass::Light).unwrap_or_default();
@@ -119,7 +152,7 @@ pub fn ai_map_rows(cfg: &AppConfig) -> Vec<AiMapRow> {
             job: "transcription".to_string(),
             title: "Transcription".to_string(),
             engine: "Whisper".to_string(),
-            model: cfg.model_size.clone(),
+            model: transcription_model_display(cfg),
             on_device: true,
             redacted: false,
             active: true,
@@ -175,11 +208,87 @@ mod tests {
         assert!(!reactions.routable);
         let tr = row(&rows, "transcription");
         assert_eq!(tr.engine, "Whisper");
-        // The default whisper size is machine-conditional (downloaded models + RAM decide, see
-        // transcribe::model::default_model_size_now) — assert the row mirrors that ONE decision
-        // instead of hardcoding "small", which only holds on a model-less machine.
-        assert_eq!(tr.model, crate::transcribe::model::default_model_size_now());
+        // P1: the cell shows the HUMAN TIER LABEL, not the raw checkpoint id. The default whisper
+        // size is still machine-conditional (downloaded models + RAM decide, see
+        // transcribe::model::default_model_size_now), so assert the row mirrors that ONE decision
+        // THROUGH the label mapping rather than hardcoding a word that only holds on some machines.
+        let resolved = crate::transcribe::model::default_model_size_now();
+        assert_eq!(
+            tr.model,
+            crate::transcribe::catalog::tier_label(resolved).unwrap(),
+            "both backend defaults are ladder rungs, so a label always exists"
+        );
+        assert!(
+            tr.model == "Balanced" || tr.model == "Sharp",
+            "the only two sizes default_model_size_now can return, got {}",
+            tr.model
+        );
         assert!(tr.on_device);
+    }
+
+    /// P1 fallbacks — the Transcription cell is NEVER empty and never claims a tier it cannot back.
+    #[test]
+    fn transcription_cell_falls_back_to_the_raw_id_and_never_blanks() {
+        // A ladder rung renders its label.
+        let sharp = AppConfig {
+            model_size: "large-v3-turbo-q8_0".to_string(),
+            ..AppConfig::default()
+        };
+        assert_eq!(row(&ai_map_rows(&sharp), "transcription").model, "Sharp");
+        let maximum = AppConfig {
+            model_size: "large-v3".to_string(),
+            ..AppConfig::default()
+        };
+        assert_eq!(row(&ai_map_rows(&maximum), "transcription").model, "Maximum");
+
+        // A LONG-TAIL size is not a rung → the raw id, never an empty cell.
+        let long_tail = AppConfig {
+            model_size: "medium".to_string(),
+            ..AppConfig::default()
+        };
+        assert_eq!(row(&ai_map_rows(&long_tail), "transcription").model, "medium");
+
+        // An UNKNOWN id → the raw id verbatim.
+        let unknown = AppConfig {
+            model_size: "some-fork-of-whisper".to_string(),
+            ..AppConfig::default()
+        };
+        assert_eq!(
+            row(&ai_map_rows(&unknown), "transcription").model,
+            "some-fork-of-whisper"
+        );
+
+        // A configured-but-MISSING custom path does not override anything (it never loads).
+        let ghost_path = AppConfig {
+            whisper_model_path: Some("/definitely/not/here/ggml-x.bin".to_string()),
+            model_size: "large-v3".to_string(),
+            ..AppConfig::default()
+        };
+        assert_eq!(
+            row(&ai_map_rows(&ghost_path), "transcription").model,
+            "Maximum"
+        );
+
+        // An EXISTING custom path overrides the ladder → its file name, never a tier word.
+        let dir = std::env::temp_dir().join(format!("murmur-aimap-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let custom = dir.join("my-own-whisper.bin");
+        std::fs::write(&custom, b"x").unwrap();
+        let custom_cfg = AppConfig {
+            whisper_model_path: Some(custom.to_string_lossy().to_string()),
+            model_size: "large-v3".to_string(),
+            ..AppConfig::default()
+        };
+        assert_eq!(
+            row(&ai_map_rows(&custom_cfg), "transcription").model,
+            "my-own-whisper.bin"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Every shape above produced a non-empty cell.
+        for cfg in [&sharp, &long_tail, &unknown, &ghost_path, &custom_cfg] {
+            assert!(!row(&ai_map_rows(cfg), "transcription").model.is_empty());
+        }
     }
 
     #[test]
