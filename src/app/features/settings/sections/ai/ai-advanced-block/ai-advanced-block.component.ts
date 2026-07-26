@@ -7,6 +7,7 @@ import {
 import { SettingsStore } from "../../../settings.store";
 import { AiConnectionCardsComponent } from "../ai-connection-cards/ai-connection-cards.component";
 import { AiRoleRowsComponent } from "../ai-role-rows/ai-role-rows.component";
+import { MurDisclosureComponent } from "../../../../../design-system/disclosure/disclosure.component";
 
 /**
  * AI & Models → Collapsed "Advanced" disclosure block (Task 4, posture redesign).
@@ -23,11 +24,22 @@ import { AiRoleRowsComponent } from "../ai-role-rows/ai-role-rows.component";
  *
  * NOT an overlay — the expanded content is IN-FLOW (no `--surface-overlay`, no
  * `backdrop-filter`). See angular-zoneless.md T3.
+ *
+ * The trigger/panel chrome now comes from the shared `<mur-disclosure>` (the
+ * markup + CSS moved there unchanged). One behavioural consequence: projected
+ * content is created with THIS view, so the two sub-blocks are instantiated
+ * even while collapsed. Both are pure store-derived signal components with no
+ * IPC or timers on construction, so this costs DOM only — and it is what makes
+ * the trigger's `aria-controls` resolve to a real panel in both states.
  */
 @Component({
   selector: "app-ai-advanced-block",
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [AiConnectionCardsComponent, AiRoleRowsComponent],
+  imports: [
+    AiConnectionCardsComponent,
+    AiRoleRowsComponent,
+    MurDisclosureComponent,
+  ],
   templateUrl: "./ai-advanced-block.component.html",
   styleUrl: "./ai-advanced-block.component.scss",
 })
@@ -55,8 +67,4 @@ export class AiAdvancedBlockComponent {
       }
     },
   );
-
-  toggle(): void {
-    this.store.advancedExpanded.update((v) => !v);
-  }
 }

@@ -11,6 +11,7 @@ import { AuditStore } from "../../../../audit/audit.store";
 import { ToastService } from "../../../../../services/toast.service";
 import { SettingsStore } from "../../../settings.store";
 import { MurToggleComponent } from "../../../../../design-system/toggle/toggle.component";
+import { MurProgressComponent } from "../../../../../design-system/progress/progress.component";
 
 /**
  * AI & Models → "Search index" block.
@@ -32,8 +33,7 @@ import { MurToggleComponent } from "../../../../../design-system/toggle/toggle.c
 @Component({
   selector: "app-on-device-intelligence-block",
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [
-    MurToggleComponent,ReactiveFormsModule],
+  imports: [MurToggleComponent, MurProgressComponent, ReactiveFormsModule],
   templateUrl: "./on-device-intelligence-block.component.html",
   styleUrl: "./on-device-intelligence-block.component.scss",
 })

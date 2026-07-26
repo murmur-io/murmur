@@ -41,7 +41,9 @@ test("picking Fully local asks first, then on confirm downloads + selects all ne
         filename: "qwen3-4b.gguf",
         url: "https://example.com/qwen3-4b.gguf",
         minRamGb: 8,
-        languages: ["en", "pl"],
+        // Registry-faithful: every Qwen row in `reason::BRAIN_MODELS` declares
+        // "multi" — that tag is what puts a model in the Multilingual family.
+        languages: ["en", "multi", "pl"],
         arch: "qwen3",
       },
     ],
@@ -141,7 +143,9 @@ test("picking Fully local with all models already downloaded selects all needed 
         filename: "qwen3-4b.gguf",
         url: "https://example.com/qwen3-4b.gguf",
         minRamGb: 8,
-        languages: ["en", "pl"],
+        // Registry-faithful: every Qwen row in `reason::BRAIN_MODELS` declares
+        // "multi" — that tag is what puts a model in the Multilingual family.
+        languages: ["en", "multi", "pl"],
         arch: "qwen3",
       },
     ],
