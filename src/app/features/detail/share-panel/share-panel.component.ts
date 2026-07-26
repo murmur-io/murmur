@@ -423,11 +423,16 @@ export class SharePanelComponent {
       }
       this._orgs.set(orgs);
       if (orgs.length > 0) {
-        const shares = await this.ipc.listOrgShares();
+        // `listOrgShares` is now org-SCOPED (it used to silently answer for the first joined org
+        // only). This panel's count spans every org the user belongs to, so ask each one and merge —
+        // a per-org failure must not blank the others, hence the per-call catch.
+        const perOrg = await Promise.all(
+          orgs.map((o) => this.ipc.listOrgShares(o.orgId).catch(() => [])),
+        );
         if (this.meetingId() !== id) {
           return;
         }
-        this.orgShares.set(shares);
+        this.orgShares.set(perOrg.flat());
         // Per-source live shares → the CTA "In Org Brain ✓" state + re-share block.
         const live = await this.ipc.orgLiveSharesForSource({ meetingId: id });
         if (this.meetingId() !== id) {

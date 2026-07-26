@@ -1550,7 +1550,22 @@ impl Db {
             "org_state",
             "context_enabled",
             "INTEGER NOT NULL DEFAULT 1",
-        )
+        )?;
+        // ANTI-ENTROPY RECONCILE CURSOR (2026-07-26). A SECOND, deliberately slow cursor that is
+        // INDEPENDENT of the live `last_seq` pull cursor: it restarts from 0 and walks the whole feed
+        // in small bounded steps so a record whose `seq` sits BELOW `last_seq` (e.g. a server-side
+        // tombstone that never got a fresh seq) is still observed and applied. Additive + guarded, so
+        // an already-migrated DB just gains the columns; existing rows start a fresh pass at 0.
+        //   - `reconcile_seq`     — how far the slow walk has got in the CURRENT pass (0 = at the start).
+        //   - `reconcile_pass_at` — RFC3339 stamp of the last COMPLETED full pass (NULL = never).
+        // Neither column is ever read by the live pull; nothing here can rewind `last_seq`.
+        Self::add_column_if_missing(
+            conn,
+            "org_state",
+            "reconcile_seq",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        Self::add_column_if_missing(conn, "org_state", "reconcile_pass_at", "TEXT")
     }
 
     /// M6 Shared Brain (sync/ingest slice) — the local DECRYPTED REPLICA of the org feed + its
