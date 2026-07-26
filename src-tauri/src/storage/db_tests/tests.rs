@@ -932,6 +932,223 @@ fn org_tombstone_evicts_from_retrieval_and_viewer() {
     db.tombstone_org_item("it-t").unwrap();
 }
 
+/// ITEM 3 (RED-before-GREEN, leak): an org eviction MUST take the item's `note_attachments` image
+/// BLOBs with it, on EVERY path — including the feed tombstone.
+///
+/// Pre-fix these survived forever: `note_attachments.org_item_id` carries
+/// `REFERENCES org_items(item_id) ON DELETE CASCADE`, but an eviction is an UPDATE
+/// (`tombstoned = 1`) — the header row deliberately survives as a tombstone so an append-only
+/// re-pull stays idempotent — so the CASCADE never fired and a withdrawn colleague's pictures stayed
+/// as plaintext BLOBs in SQLite. Also asserts the primitive's return value: `true` only when a LIVE
+/// row was actually evicted, so callers can count real convergence work.
+#[test]
+fn evicting_an_org_item_purges_its_attachment_blobs_on_every_path() {
+    let attachment_count = |db: &Db, item_id: &str| -> i64 {
+        db.lock()
+            .query_row(
+                "SELECT COUNT(*) FROM note_attachments WHERE org_item_id = ?1",
+                rusqlite::params![item_id],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    let seed_item_with_image = |db: &Db, item_id: &str, seq: u64| {
+        db.upsert_org_item(
+            item_id,
+            "org-1",
+            seq,
+            "carol",
+            "Illustrated plan",
+            "the classified atlas acquisition timeline",
+            "2026-07-10T09:00:00Z",
+            1,
+            1,
+            &sha32(4),
+            None,
+            None,
+            Some(&crate::embed::StubEmbedder),
+        )
+        .unwrap();
+        db.replace_org_item_attachment_bundle(
+            item_id,
+            &[crate::storage::IncomingAttachment {
+                id: uuid::Uuid::new_v4().to_string(),
+                mime_type: "image/png".into(),
+                extension: "png".into(),
+                width: 4,
+                height: 4,
+                sha256: [5u8; 32],
+                data: vec![9u8; 16],
+            }],
+        )
+        .unwrap();
+        assert_eq!(attachment_count(db, item_id), 1);
+    };
+
+    // Path A — the direct eviction primitive.
+    let db = mem_db();
+    seed_org_state(&db, "org-1");
+    seed_item_with_image(&db, "it-img", 1);
+    assert!(
+        db.evict_org_item("it-img").unwrap(),
+        "evicting a LIVE item reports that it did real work"
+    );
+    assert_eq!(
+        attachment_count(&db, "it-img"),
+        0,
+        "withdrawn colleague images must not survive the eviction"
+    );
+    assert!(
+        !db.evict_org_item("it-img").unwrap(),
+        "a second eviction is an idempotent no-op and reports no work"
+    );
+    assert!(
+        !db.evict_org_item("it-never-existed").unwrap(),
+        "evicting an unknown id is a no-op, not an error"
+    );
+
+    // Path B — the FEED tombstone (the arm a member's background sync actually applies).
+    let db = mem_db();
+    seed_org_state(&db, "org-1");
+    seed_item_with_image(&db, "it-feed", 1);
+    assert!(db.commit_org_feed_tombstone("org-1", "it-feed", 2).unwrap());
+    assert_eq!(
+        attachment_count(&db, "it-feed"),
+        0,
+        "the feed tombstone path routes through the SAME eviction primitive"
+    );
+}
+
+/// The anti-entropy reconcile cursor is a SECOND, wholly independent cursor: advancing/completing it
+/// must never touch the live `last_seq` pull cursor (rewinding that would silently re-ingest, or —
+/// worse — skip, live feed records). A completed pass rewinds only the SLOW cursor.
+#[test]
+fn reconcile_cursor_is_independent_of_the_live_feed_cursor() {
+    let db = mem_db();
+    seed_org_state(&db, "org-1");
+    db.set_org_last_seq("org-1", 42).unwrap();
+
+    assert_eq!(db.org_reconcile_seq_for("org-1").unwrap(), 0);
+    assert!(db.org_reconcile_pass_at("org-1").unwrap().is_none());
+
+    db.set_org_reconcile_seq("org-1", 7).unwrap();
+    assert_eq!(db.org_reconcile_seq_for("org-1").unwrap(), 7);
+    assert_eq!(
+        db.org_last_seq_for("org-1").unwrap(),
+        42,
+        "advancing the slow cursor never writes last_seq"
+    );
+
+    db.complete_org_reconcile_pass("org-1", "2026-07-26T00:00:00Z")
+        .unwrap();
+    assert_eq!(
+        db.org_reconcile_seq_for("org-1").unwrap(),
+        0,
+        "a completed pass rewinds the SLOW cursor to re-observe the whole feed"
+    );
+    assert_eq!(
+        db.org_reconcile_pass_at("org-1").unwrap().as_deref(),
+        Some("2026-07-26T00:00:00Z")
+    );
+    assert_eq!(
+        db.org_last_seq_for("org-1").unwrap(),
+        42,
+        "completing a pass never rewinds the LIVE cursor"
+    );
+
+    // An unknown org is a no-op on both writers, and reads as a fresh pass.
+    db.set_org_reconcile_seq("org-none", 9).unwrap();
+    db.complete_org_reconcile_pass("org-none", "2026-07-26T00:00:00Z")
+        .unwrap();
+    assert_eq!(db.org_reconcile_seq_for("org-none").unwrap(), 0);
+    assert!(db.org_reconcile_pass_at("org-none").unwrap().is_none());
+}
+
+/// A reconcile-found live record is committed WITHOUT claiming a feed sequence — the sweep walks
+/// seqs that are usually already behind the live cursor, so `commit_org_feed_item`'s
+/// `seq > last_seq` claim would silently drop the write. The reconcile commit keeps the two
+/// invariants that matter: live membership is still required, and a tombstone is still permanent.
+#[test]
+fn reconcile_commit_writes_below_the_live_cursor_but_never_resurrects_a_tombstone() {
+    let db = mem_db();
+    seed_org_state(&db, "org-1");
+    db.set_org_last_seq("org-1", 42).unwrap();
+    let prepared = Db::prepare_org_item_index("Recovered", "t", "recovered body", None).unwrap();
+
+    // Below the live cursor: the feed-commit path refuses (its cursor claim fails), the reconcile
+    // commit succeeds — and leaves the live cursor exactly where it was.
+    assert!(!db
+        .commit_org_feed_item(
+            "it-below", "org-1", 5, "anna", "Recovered", "recovered body", "t", 1, 1, &sha32(6),
+            None, None, &prepared,
+        )
+        .unwrap());
+    assert!(db
+        .commit_org_reconcile_item(
+            "it-below", "org-1", 5, "anna", "Recovered", "recovered body", "t", 1, 1, &sha32(6),
+            None, None, &prepared,
+        )
+        .unwrap());
+    assert!(db.get_org_item("it-below").unwrap().is_some());
+    assert_eq!(db.org_last_seq_for("org-1").unwrap(), 42);
+
+    // A tombstone is permanent: the sweep must never resurrect withdrawn plaintext.
+    assert!(db.evict_org_item("it-below").unwrap());
+    assert!(!db
+        .commit_org_reconcile_item(
+            "it-below", "org-1", 5, "anna", "Recovered", "recovered body", "t", 2, 1, &sha32(6),
+            None, None, &prepared,
+        )
+        .unwrap());
+    assert!(db.get_org_item("it-below").unwrap().is_none());
+
+    // Withdrawn membership can never be followed by a plaintext replica resurrection.
+    assert!(!db
+        .commit_org_reconcile_item(
+            "it-gone-org", "org-left", 5, "anna", "Recovered", "recovered body", "t", 1, 1,
+            &sha32(6), None, None, &prepared,
+        )
+        .unwrap());
+    assert!(db.get_org_item("it-gone-org").unwrap().is_none());
+}
+
+/// The reconcile sweep decides "already converged" from the feed's `content_sha256` alone — no blob
+/// fetch. This is the read that backs it: what the device currently holds for one item id.
+#[test]
+fn org_replica_state_reports_what_this_device_holds() {
+    let db = mem_db();
+    seed_org_state(&db, "org-1");
+    assert!(db.org_replica_state("it-unknown").unwrap().is_none());
+
+    let sha = sha32(8);
+    db.upsert_org_item(
+        "it-held",
+        "org-1",
+        3,
+        "carol",
+        "Held",
+        "held body",
+        "2026-07-10T09:00:00Z",
+        1,
+        1,
+        &sha,
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+    let held = db.org_replica_state("it-held").unwrap().unwrap();
+    assert!(!held.tombstoned);
+    assert_eq!(held.content_sha256.as_deref(), Some(sha.as_slice()));
+
+    db.evict_org_item("it-held").unwrap();
+    let gone = db.org_replica_state("it-held").unwrap().unwrap();
+    assert!(
+        gone.tombstoned,
+        "an evicted item is still reported — as a permanent tombstone"
+    );
+}
+
 /// LEAVE PURGE (RED-before-GREEN, leak/consent): `purge_org_replica` drops the WHOLE decrypted
 /// replica of an org — every `org_items` header, its `org_chunks`/`org_vec_chunks`, and the
 /// `fts_org_chunks` tokens — so `org_leave` leaves NO searchable copy of colleagues' content.
