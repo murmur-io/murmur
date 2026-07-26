@@ -67,6 +67,29 @@
   margin-left: auto;
 }
 
+/* --- "Live captions are off" notice (same calm, dismissible shape as the vault one) --- */
+.cc-notice {
+  align-items: center;
+  flex-wrap: wrap;
+}
+.cc-notice-body {
+  flex: 1 1 16rem;
+  min-width: 0;
+}
+.cc-notice-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex: none;
+  margin-left: auto;
+}
+/* A retry that didn't land — said out loud, never a click that silently did nothing. */
+.cc-notice-error {
+  display: block;
+  margin-top: var(--space-1);
+  color: var(--danger);
+}
+
 /* --- Cloud-egress consent prompt (shown instead of a silent failure) --- */
 .cloud-consent {
   align-items: center;
@@ -572,6 +595,18 @@
 }
 .cc-idle {
   color: var(--text-muted);
+  font-style: italic;
+}
+/* No live-safe model on this Mac ⇒ the ticker never fills. Say so plainly instead of
+   showing "Listening…" for the whole meeting (the recording itself is unaffected). */
+.cc-off {
+  color: var(--text-muted);
+  cursor: default;
+}
+.cc-off-text {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
   font-style: italic;
 }
 /* Live-captions honesty hint — muted, non-shrinking (flex:none) so the

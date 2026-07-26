@@ -10,6 +10,7 @@ import {
   viewChild,
 } from "@angular/core";
 import { RouterLink } from "@angular/router";
+import type { UnlistenFn } from "@tauri-apps/api/event";
 import { RecorderStore } from "../../../core/recorder.store";
 import { IpcService } from "../../../core/ipc.service";
 import type { Analytics, AppConfigDto } from "../../../core/models";
@@ -21,6 +22,28 @@ import { MeetingConversationStore } from "../../../core/meeting-conversation.sto
 
 /** localStorage key for the permanent "no vault set" notice dismissal. */
 const VAULT_NOTICE_DISMISSED_KEY = "murmur-vault-notice-dismissed";
+
+/**
+ * LIVE-CAPTION readiness, as reported by the backend in `get_config`
+ * (Rust `AppConfigDto::live_captions` — a device/disk probe, NOT a persisted setting):
+ *
+ *  - `"ready"`        — the live tick has a live-safe whisper model to run.
+ *  - `"modelMissing"` — nothing live-safe is downloaded. The heavy batch model (e.g. the turbo
+ *                       default a fresh 12 GB+ Mac gets) is deliberately never run on the 3 s live
+ *                       tick, so the small live-caption companion download simply never landed —
+ *                       re-running the model download fixes it.
+ *  - `"pinnedHeavy"`  — the configured live-model pin is itself a medium/large-class size that isn't
+ *                       downloaded. A configuration outcome, not a failed download: Murmur never
+ *                       fetches or runs a heavy model for live captions.
+ *  - `"noModel"`      — no whisper model at all; the "Transcription model needed" banner owns it.
+ *  - `""` / absent    — not probed (an older backend, or a mocked config): render nothing.
+ */
+type LiveCaptionsState =
+  | "ready"
+  | "modelMissing"
+  | "pinnedHeavy"
+  | "noModel"
+  | "";
 
 @Component({
   selector: "app-record",
@@ -68,6 +91,9 @@ export class RecordComponent implements OnInit {
 
   /** Handle for the meeting-app poll — cleared on destroy (no leaked interval). */
   private meetingAppPoll: ReturnType<typeof setInterval> | null = null;
+
+  /** Release handle for the model-download stream — dropped on destroy. */
+  private unlistenModelDownload: UnlistenFn | null = null;
 
   /** The in-pill mic-mute toggle — its `muted()` signal drives the stage hint. */
   private readonly micToggle = viewChild(MicMuteToggleComponent);
@@ -150,6 +176,70 @@ export class RecordComponent implements OnInit {
       this.enhanceSettled()
     );
   });
+
+  /**
+   * The backend's live-caption readiness for THIS machine. Read through a narrow structural cast:
+   * the key is DISPLAY-ONLY (`get_config` fills it; a settings save can neither set nor clear it),
+   * so it is not part of the settings-shaped `AppConfigDto` the FE round-trips — and a backend or
+   * mock that doesn't send it must read as "not probed" (`""`) and render nothing.
+   */
+  readonly liveCaptions = computed<LiveCaptionsState>(
+    () =>
+      ((this.config() as (AppConfigDto & { liveCaptions?: string }) | null)
+        ?.liveCaptions as LiveCaptionsState) || "",
+  );
+
+  /**
+   * No live captions this recording — the live tick has no live-safe model. The heat policy is
+   * deliberate (a medium/large encoder every 3 s saturates the shared Metal GPU for the whole
+   * meeting), so the honest thing is to SAY captions are off rather than show "Listening…" forever.
+   * `"noModel"` is excluded: the transcription-model download banner already owns that state.
+   */
+  readonly liveCaptionsOff = computed(
+    () =>
+      this.liveCaptions() === "modelMissing" ||
+      this.liveCaptions() === "pinnedHeavy",
+  );
+
+  /**
+   * Which cause — a HEAVY live-model pin (a configuration choice: nothing to download on the user's
+   * behalf) vs a missing/failed live-safe companion download (retryable right here). Drives the
+   * notice copy + whether a Download action is offered at all.
+   */
+  readonly liveCaptionsHeavyPin = computed(
+    () => this.liveCaptions() === "pinnedHeavy",
+  );
+
+  /** Dismissed for this session only (like the meeting-app nudge). */
+  private readonly liveCaptionsNoticeDismissed = signal(false);
+
+  /**
+   * The live-caption COMPANION fetch behind the notice's "Download it" — deliberately a SEPARATE
+   * busy flag from {@link downloadingModel}. That one means "the model recording needs isn't here
+   * yet", which is why {@link canRecord} gates on it; this one runs with the batch model already
+   * present, so it must never disable Start — the notice's own copy promises recording is
+   * unaffected, and it is.
+   */
+  readonly downloadingLiveCompanion = signal(false);
+  /**
+   * Why the companion retry didn't help — either the command rejected, or it returned but the
+   * refreshed state still says no live captions (the backend swallows a companion failure so the
+   * batch model still counts as downloaded). Never let a click look like it worked when it didn't.
+   */
+  readonly liveCompanionError = signal<string | null>(null);
+
+  /**
+   * Show the calm, non-blocking "live captions are off" notice: only when a transcription model IS
+   * present (otherwise the download banner is the right thing to show), while NOT recording (the
+   * footer's "Captions off" indicator carries it then), and not dismissed this session.
+   */
+  readonly showLiveCaptionsNotice = computed(
+    () =>
+      this.liveCaptionsOff() &&
+      this.modelPresent() === true &&
+      !this.store.isRecording() &&
+      !this.liveCaptionsNoticeDismissed(),
+  );
 
   /**
    * True when no Obsidian vault folder is configured. The vault is EXPORT-ONLY — every note
@@ -395,13 +485,32 @@ export class RecordComponent implements OnInit {
         clearInterval(this.meetingAppPoll);
         this.meetingAppPoll = null;
       }
+      this.unlistenModelDownload?.();
+      this.unlistenModelDownload = null;
     });
+    // Live-caption readiness is a DEVICE/DISK fact, not a setting, so it can change while this
+    // screen is open — a model download finishing anywhere (Settings, the onboarding wizard, the
+    // notice below) can flip "Live captions are off" to on. Follow the download stream so the
+    // notice + the footer's "Captions off" indicator clear on their own instead of contradicting
+    // what `start_recording` would actually do until a remount.
+    try {
+      const unlisten = await this.ipc.onModelDownload((p) => {
+        if (p.done) void this.onModelDownloadDone();
+      });
+      // Destroyed while the subscription was in flight — release it immediately; the onDestroy
+      // above has already run and would never see this handle.
+      if (destroyed) unlisten();
+      else this.unlistenModelDownload = unlisten;
+    } catch {
+      // No download stream (older backend / a mock without event plumbing) — the state still
+      // refreshes on the next mount and after this screen's own download action.
+    }
     await this.store.init();
     // Subscribe the notes/threads store to the wake/result + BOTH tool-trace
     // streams now, regardless of whether the surface is visible yet — otherwise
     // events fired before it renders (or while the config snapshot is stale) drop.
     void this.assistant.init();
-    this.config.set(await this.ipc.getConfig());
+    await this.refreshConfig();
     void this.ipc.outputIsBuiltinSpeakers().then((v) => this.onSpeakers.set(v ?? true));
     this.modelPresent.set(await this.ipc.modelPresent());
     // Stats are secondary — never let a failure here block the record screen.
@@ -425,6 +534,36 @@ export class RecordComponent implements OnInit {
     );
   }
 
+  /**
+   * Monotonic guard for {@link refreshConfig}: the snapshot is re-read from several places (mount,
+   * the download stream, this screen's own actions), so a slow earlier read must never overwrite a
+   * newer one — same shape as `entity-detail.component.ts`'s `_load`.
+   */
+  private configRequestId = 0;
+
+  /** Re-read the settings/readiness snapshot into {@link config}, dropping superseded responses. */
+  private async refreshConfig(): Promise<void> {
+    const requestId = ++this.configRequestId;
+    const cfg = await this.ipc.getConfig();
+    if (requestId !== this.configRequestId) return;
+    this.config.set(cfg);
+  }
+
+  /**
+   * A model download finished SOMEWHERE (this screen, Settings, the wizard) — re-probe the two
+   * facts it can change: whether a transcription model exists at all, and whether the live tick now
+   * has a live-safe model. Best-effort: a failed probe leaves the last-known state rather than
+   * claiming a state we didn't read.
+   */
+  private async onModelDownloadDone(): Promise<void> {
+    try {
+      this.modelPresent.set(await this.ipc.modelPresent());
+      await this.refreshConfig();
+    } catch {
+      /* keep the last-known state */
+    }
+  }
+
   /** Best-effort poll for a running meeting app; failures leave the nudge hidden. */
   private async checkMeetingApp(): Promise<void> {
     try {
@@ -442,6 +581,11 @@ export class RecordComponent implements OnInit {
   /** Nudge ghost action — hide it for the rest of this session. */
   dismissNudge(): void {
     this.nudgeDismissed.set(true);
+  }
+
+  /** Live-captions notice dismiss — this session only (the state itself is unchanged). */
+  dismissLiveCaptionsNotice(): void {
+    this.liveCaptionsNoticeDismissed.set(true);
   }
 
   /** No-vault info-notice dismiss — permanent (localStorage), not just this session. */
@@ -500,7 +644,7 @@ export class RecordComponent implements OnInit {
     this.consenting.set(true);
     try {
       await this.ipc.consentToCloudEgress();
-      this.config.set(await this.ipc.getConfig());
+      await this.refreshConfig();
       const id = this.store.meetingId();
       if (id) {
         await this.store.resummarize(id);
@@ -512,17 +656,51 @@ export class RecordComponent implements OnInit {
     }
   }
 
-  /** Download the Whisper model, then re-check presence. */
+  /**
+   * Download the Whisper model, then re-check presence. This is the BLOCKING download (the model
+   * recording itself needs) — hence `downloadingModel`, which `canRecord` gates on. The backend
+   * fetches the live-safe caption companion in the same command when the batch model can't serve
+   * live captions, so the readiness snapshot is refreshed too.
+   */
   async downloadModel(): Promise<void> {
     this.modelDownloadError.set(null);
     this.downloadingModel.set(true);
     try {
       await this.ipc.downloadModel();
       this.modelPresent.set(await this.ipc.modelPresent());
+      await this.refreshConfig();
     } catch (e) {
       this.modelDownloadError.set(String(e));
     } finally {
       this.downloadingModel.set(false);
+    }
+  }
+
+  /**
+   * Retry the live-caption COMPANION fetch from the "live captions are off" notice. Same backend
+   * command (`download_model` re-runs the companion decision against the model already on disk and
+   * fetches only what's missing), but tracked in {@link downloadingLiveCompanion} so it does NOT
+   * disable Start: the batch model is already present, recording is genuinely unaffected, and the
+   * notice says so.
+   *
+   * The backend swallows a companion failure by design (the batch model is what gates recording),
+   * so success is judged by the REFRESHED readiness state, not by the command resolving.
+   */
+  async downloadLiveCompanion(): Promise<void> {
+    this.liveCompanionError.set(null);
+    this.downloadingLiveCompanion.set(true);
+    try {
+      await this.ipc.downloadModel();
+      await this.refreshConfig();
+      if (this.liveCaptionsOff()) {
+        this.liveCompanionError.set(
+          "The live-caption model still isn't on this Mac — check your connection and try again.",
+        );
+      }
+    } catch (e) {
+      this.liveCompanionError.set(String(e));
+    } finally {
+      this.downloadingLiveCompanion.set(false);
     }
   }
 
