@@ -43,6 +43,55 @@
     </div>
   }
 
+  <!-- ── LIVE-CAPTION readiness — a calm, dismissible notice. Murmur deliberately never runs a
+       medium/large model on the 3 s live tick (it would heat the Mac for the whole meeting), so
+       when no small live-caption model is on this Mac there are simply no live captions. That used
+       to live ONLY in a backend log line; recording + the full post-Stop transcript are
+       unaffected either way. Independent of the banners above (it never stacks with the
+       model-download one — it requires a present transcription model). ─────────────────────── -->
+  @if (showLiveCaptionsNotice()) {
+    <div class="banner is-accent cc-notice" role="note">
+      <span class="banner-icon" aria-hidden="true">◌</span>
+      <span class="cc-notice-body">
+        <strong>Live captions are off.</strong>
+        @if (liveCaptionsHeavyPin()) {
+          Your live-caption model is a large one and isn't downloaded — Murmur never runs a
+          large model live, to keep your Mac cool. Choose a small live-caption model in
+          Settings.
+        } @else {
+          The small live-caption model isn't on this Mac — its download may have failed.
+        }
+        Recording is unaffected: the full <strong>Me / Others</strong> transcript still runs
+        after you stop.
+        @if (liveCompanionError(); as cerr) {
+          <span class="cc-notice-error">{{ cerr }}</span>
+        }
+      </span>
+      <span class="cc-notice-actions">
+        @if (!liveCaptionsHeavyPin()) {
+          <!-- Tracked by `downloadingLiveCompanion`, NOT `downloadingModel`: the transcription
+               model is already present, so this fetch must never disable Start (see canRecord). -->
+          <button
+            type="button"
+            class="btn btn-ghost btn-sm"
+            (click)="downloadLiveCompanion()"
+            [disabled]="downloadingLiveCompanion()"
+          >
+            {{ downloadingLiveCompanion() ? "Downloading…" : "Download it" }}
+          </button>
+        }
+        <a class="btn btn-ghost btn-sm" routerLink="/settings">Settings</a>
+        <button
+          type="button"
+          class="btn btn-ghost btn-sm"
+          (click)="dismissLiveCaptionsNotice()"
+        >
+          Dismiss
+        </button>
+      </span>
+    </div>
+  }
+
   <!-- Headphones hint — a separate banner only when NOT recording; while recording it
        folds into the single coherent top bar below (no stacked bands). -->
   @if (headphonesHint() && !store.isRecording()) {
@@ -177,50 +226,68 @@
       <!-- Mic-mute: silences only the local mic; system audio keeps recording. -->
       <app-mic-mute-toggle [compact]="true" #micToggle />
 
-      <!-- Live caption ticker — the mic-only partial. -->
-      <p class="cc-line" aria-live="polite">
-        @if (liveCaption(); as cc) {
-          @for (rev of [cc]; track rev) {
-            <span class="cc-text">{{ cc }}</span>
+      <!-- Live caption ticker — the mic-only partial. When no live-safe model is on this Mac the
+           tick never runs, so an eternal "Listening…" would be a lie: say captions are off. -->
+      @if (liveCaptionsOff()) {
+        <p
+          class="cc-line cc-off"
+          role="note"
+          title="No small live-caption model is available on this Mac, and Murmur never runs a large model on the live tick (it would heat your Mac for the whole meeting). Everything is still being recorded — the full Me / Others transcript runs after you stop."
+        >
+          <span class="cc-off-text">
+            Captions off — full transcript after Stop
+          </span>
+        </p>
+      } @else {
+        <p class="cc-line" aria-live="polite">
+          @if (liveCaption(); as cc) {
+            @for (rev of [cc]; track rev) {
+              <span class="cc-text">{{ cc }}</span>
+            }
+          } @else {
+            <span class="cc-idle">Listening…</span>
           }
-        } @else {
-          <span class="cc-idle">Listening…</span>
-        }
-      </p>
+        </p>
+      }
 
       <!-- Honesty hint: live captions are your side (your mic) only; the other
            participants are captured now and folded into the full Me / Others
-           transcript after you Stop. -->
-      <span
-        class="cc-scope"
-        role="note"
-        title="Live captions show your side (your microphone) during the meeting. The other participants are captured now and added to the full Me / Others transcript after you stop."
-      >
-        <svg
-          class="cc-scope-ico"
-          viewBox="0 0 16 16"
-          width="12"
-          height="12"
-          aria-hidden="true"
+           transcript after you Stop. Hidden when captions are off — the indicator
+           above already tells the whole truth. -->
+      @if (!liveCaptionsOff()) {
+        <span
+          class="cc-scope"
+          role="note"
+          title="Live captions show your side (your microphone) during the meeting. The other participants are captured now and added to the full Me / Others transcript after you stop."
         >
-          <circle
-            cx="8"
-            cy="8"
-            r="6.5"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="1.3"
-          />
-          <path
-            d="M8 7.2v4"
-            stroke="currentColor"
-            stroke-width="1.3"
-            stroke-linecap="round"
-          />
-          <circle cx="8" cy="4.6" r="0.9" fill="currentColor" />
-        </svg>
-        <span class="cc-scope-text">Your side · full transcript after Stop</span>
-      </span>
+          <svg
+            class="cc-scope-ico"
+            viewBox="0 0 16 16"
+            width="12"
+            height="12"
+            aria-hidden="true"
+          >
+            <circle
+              cx="8"
+              cy="8"
+              r="6.5"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.3"
+            />
+            <path
+              d="M8 7.2v4"
+              stroke="currentColor"
+              stroke-width="1.3"
+              stroke-linecap="round"
+            />
+            <circle cx="8" cy="4.6" r="0.9" fill="currentColor" />
+          </svg>
+          <span class="cc-scope-text">
+            Your side · full transcript after Stop
+          </span>
+        </span>
+      }
 
       <!-- Ask — SUMMONS the Brain panel over the notepad (voice + text + presets live
            in the panel). A quiet dot marks an ongoing thread while the panel is closed. -->
