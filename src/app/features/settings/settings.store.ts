@@ -16,6 +16,8 @@ import type {
   GatewayModel,
   InputDeviceInfo,
   ModelClass,
+  NoteTemplate,
+  NoteTemplateSection,
   Posture,
   ProviderStatus,
   ReindexResult,
@@ -352,6 +354,75 @@ export class SettingsStore {
   /** Reveal the recordings folder in Finder (best-effort; fire-and-forget). */
   revealAudioDir(): void {
     void this.ipc.revealAudioDir();
+  }
+
+  // ── Note templates (user-authored named sections) ───────────────────────
+
+  /** The user's saved note templates (newest first). Loaded in load(); refreshed on save/delete. */
+  private readonly _noteTemplates = signal<NoteTemplate[]>([]);
+  readonly noteTemplates = this._noteTemplates.asReadonly();
+  /** True while a note-template save/delete IPC call is in flight (debounces the buttons). */
+  private readonly _noteTemplateBusy = signal(false);
+  readonly noteTemplateBusy = this._noteTemplateBusy.asReadonly();
+  /** Surfaced if a save/delete rejects — notably the backend's scripting-token rejection. */
+  private readonly _noteTemplateError = signal<string | null>(null);
+  readonly noteTemplateError = this._noteTemplateError.asReadonly();
+
+  /** Refresh the saved note-template list (best-effort; a failure or non-array leaves it empty). */
+  async loadNoteTemplates(): Promise<void> {
+    const list = await this.ipc.listNoteTemplates().catch(() => []);
+    this._noteTemplates.set(Array.isArray(list) ? list : []);
+  }
+
+  /**
+   * Create or replace a note template, then refresh the list. Returns the stored row, or null on
+   * rejection (the error — e.g. a forbidden scripting token — is surfaced in `noteTemplateError`).
+   * Deliberately NOT tied to the settings auto-save: templates are their own persisted rows, not a
+   * field of AppConfig.
+   */
+  async saveNoteTemplate(draft: {
+    id: string | null;
+    name: string;
+    tone: string;
+    sections: NoteTemplateSection[];
+    extraFrontmatterKeys: string[];
+  }): Promise<NoteTemplate | null> {
+    this._noteTemplateBusy.set(true);
+    this._noteTemplateError.set(null);
+    try {
+      const saved = await this.ipc.saveNoteTemplate(
+        draft.id,
+        draft.name,
+        draft.tone,
+        draft.sections,
+        draft.extraFrontmatterKeys,
+      );
+      await this.loadNoteTemplates();
+      return saved;
+    } catch (e) {
+      this._noteTemplateError.set(String(e));
+      return null;
+    } finally {
+      this._noteTemplateBusy.set(false);
+    }
+  }
+
+  /** Delete a saved note template; if it was the selected note-style, fall back to "standard". */
+  async deleteNoteTemplate(id: string): Promise<void> {
+    this._noteTemplateBusy.set(true);
+    this._noteTemplateError.set(null);
+    try {
+      await this.ipc.deleteNoteTemplate(id);
+      if (this.form.controls.noteStyle.value === id) {
+        this.form.patchValue({ noteStyle: "standard" });
+        this.form.markAsDirty(); // user-driven reset → auto-save persists it
+      }
+      await this.loadNoteTemplates();
+    } catch (e) {
+      this._noteTemplateError.set(String(e));
+    } finally {
+      this._noteTemplateBusy.set(false);
+    }
   }
 
   private readonly _hasKey = signal(false);
@@ -1438,6 +1509,8 @@ export class SettingsStore {
       this._appInfo.set(await this.ipc.appInfo().catch(() => null));
       // Recording-storage usage report (best-effort; drives the Storage section + Library bar).
       await this.loadStorageReport();
+      // User-authored note templates (best-effort; feeds the note-style selector + editor).
+      await this.loadNoteTemplates();
       // MCP config block for Claude Code — carries the private bearer token so the copied
       // snippet authenticates (fixes the `-32001 unauthorized` handshake). Best-effort: on a
       // keychain read failure it stays empty and the copy button no-ops rather than pasting a
