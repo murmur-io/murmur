@@ -15,19 +15,21 @@
                 <option value="brief">Brief (TL;DR + actions)</option>
                 <option value="detailed">Detailed (full depth)</option>
                 <option value="action">Action-focused</option>
-                @if (
-                  form.controls.noteStyle.value !== "standard" &&
-                  form.controls.noteStyle.value !== "brief" &&
-                  form.controls.noteStyle.value !== "detailed" &&
-                  form.controls.noteStyle.value !== "action"
-                ) {
+                @if (noteTemplates().length > 0) {
+                  <optgroup label="Your templates">
+                    @for (t of noteTemplates(); track t.id) {
+                      <option [value]="t.id">{{ t.name }}</option>
+                    }
+                  </optgroup>
+                }
+                @if (showCustomOption()) {
                   <!--
                     note_style is a free-form String on the Rust side (commands.rs
                     `AppConfigDto.note_style`) with no enum validation — a hand-edited
                     config.json, legacy/removed style, or seed data can carry a value
-                    outside the four options above. Without this, the native <select>
-                    shows no visible selection at all. Surface the raw stored value as
-                    its own option instead of rendering blank.
+                    outside the four built-ins AND the saved templates above. Without
+                    this, the native <select> shows no visible selection at all. Surface
+                    the raw stored value as its own option instead of rendering blank.
                   -->
                   <option [value]="form.controls.noteStyle.value">
                     {{ form.controls.noteStyle.value }} (custom)
@@ -51,12 +53,23 @@
                     meetings.
                   }
                   @default {
-                    An unrecognized saved style — pick one of the options above to
-                    reset it to a supported style.
+                    @if (selectedTemplate(); as t) {
+                      Your template “{{ t.name }}” — {{ t.sections.length }} custom
+                      section{{ t.sections.length === 1 ? "" : "s" }}, written to
+                      your instructions.
+                    } @else {
+                      An unrecognized saved style — pick one of the options above to
+                      reset it to a supported style.
+                    }
                   }
                 }
               </span>
             </label>
+
+            <div class="field">
+              <span class="field-label">Custom templates</span>
+              <app-note-templates-editor />
+            </div>
 
             <label class="field">
               <span class="field-label">Your typed notes</span>
