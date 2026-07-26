@@ -10,6 +10,7 @@
 //! then hand it to `Transcriber::load`.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::{AppError, Result};
 
@@ -328,6 +329,71 @@ pub fn is_live_heavy_model_file(path: &Path) -> bool {
     })
 }
 
+/// The FOUR refusals a "delete this downloaded model" request must survive, PURE over the facts
+/// that decide them, returning the one file it is then allowed to remove.
+///
+/// 1. **A non-registry id is refused.** This is also the refusal that keeps the VAD
+///    (`ggml-silero-*.bin`), diarization (`*.onnx`) and parakeet bundles out of reach — none of
+///    them is a whisper catalog id, so no request can name one — and it is why the returned name is
+///    always [`model_filename`]'s `ggml-<id>[.en].bin` rather than caller-supplied text.
+/// 2. **The EFFECTIVE model is refused** — it is what a recording would load right now, so deleting
+///    it strands transcription with nothing to run.
+/// 3. **The LIVE-caption pin is refused.** `live_model_pin` defaults to `small` while the batch
+///    default on a 12 GB+ Mac is the turbo quant, so the two DIFFER on the shipped default: without
+///    this refusal, deleting `small` (which is neither selected nor recommended, and looks like
+///    obvious junk in the "show every size" list) silently kills live captions, and the UI offers no
+///    way back because nothing re-fetches a companion for an already-downloaded batch model.
+/// 4. **Nothing outside the models dir, ever** — the returned value is a bare filename with no path
+///    separator, asserted here rather than trusted.
+///
+/// `effective_size` is `effective_model_size(cfg.model_size)` and `live_pin` is
+/// `live_pin_size(cfg.live_model_pin, cfg.brain_live)`, both resolved by the caller so this stays
+/// pure and headless-testable.
+pub fn deletable_model_file(
+    size: &str,
+    effective_size: &str,
+    live_pin: Option<&str>,
+    language: &str,
+) -> Result<String> {
+    let size = size.trim();
+    let Some(model) = crate::transcribe::catalog::model_by_id(size) else {
+        return Err(AppError::InvalidArg(format!(
+            "not a transcription model Murmur manages: {size}"
+        )));
+    };
+    if model.id == effective_size.trim() {
+        return Err(AppError::InvalidArg(
+            "this is the model your recordings use — switch to another size first".into(),
+        ));
+    }
+    if live_pin.map(str::trim) == Some(model.id) {
+        return Err(AppError::InvalidArg(
+            "this model powers live captions — change the live-caption model first".into(),
+        ));
+    }
+    let file = model_filename(model.id, language);
+    if file.contains('/') || file.contains('\\') {
+        return Err(AppError::InvalidArg(
+            "refusing a model filename that escapes the models directory".into(),
+        ));
+    }
+    Ok(file)
+}
+
+/// Remove exactly ONE file from `dir`. `Ok(false)` = it was already gone (delete is idempotent —
+/// a second click must not raise an error). Touches nothing else in the directory, which is what
+/// keeps the VAD / diarization / parakeet files intact.
+pub fn delete_model_file_in(dir: &Path, file: &str) -> Result<bool> {
+    let path = dir.join(file);
+    if !path.is_file() {
+        return Ok(false);
+    }
+    std::fs::remove_file(&path)
+        .map_err(|e| AppError::Transcribe(format!("delete model file: {e}")))?;
+    tracing::info!(target: "transcribe", file = %file, "deleted a downloaded whisper model");
+    Ok(true)
+}
+
 /// Hugging Face mirror of the official whisper.cpp GGML models (ggerganov/whisper.cpp).
 /// `resolve/main` serves the raw file; whisper-rs loads the GGML/GGUF binary directly.
 pub fn model_url(filename: &str) -> String {
@@ -459,12 +525,22 @@ where
             base = base.saturating_add(std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0));
             continue;
         }
-        download_model_streaming(&client, &parakeet_model_url(file), &dest, |d, _t| {
-            // The aggregate total is unknown across four files (mixed Content-Length availability),
-            // so report the running byte sum with `None` total — the FE shows an indeterminate/byte
-            // progress, consistent with the whisper multi-GB bar.
-            on_progress(base.saturating_add(d), None);
-        })
+        download_model_streaming(
+            &client,
+            &parakeet_model_url(file),
+            &dest,
+            |d, _t| {
+                // The aggregate total is unknown across four files (mixed Content-Length
+                // availability), so report the running byte sum with `None` total — the FE shows an
+                // indeterminate/byte progress, consistent with the whisper multi-GB bar.
+                on_progress(base.saturating_add(d), None);
+            },
+            // Parakeet is a SEPARATE command from the whisper download, so it deliberately does not
+            // observe the whisper cancellation generation: a cancelled whisper fetch must not abort
+            // a live Parakeet fetch. That cross-download bleed is exactly why the generation is a
+            // counter rather than a global bool.
+            None,
+        )
         .await?;
         base = base.saturating_add(std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0));
     }
@@ -498,6 +574,89 @@ pub fn resolve_model_path(
         return Ok(Some(derived));
     }
     Ok(None)
+}
+
+/// Monotonic GENERATION counter for user-cancellable whisper model downloads.
+///
+/// MODULE-PRIVATE and a COUNTER, deliberately not a global `AtomicBool`. A bool leaks across
+/// downloads: cancel a 3 GB fetch, immediately start a different one, and the still-set flag
+/// cancels the NEW download the instant it reads it (and whoever clears the flag races whoever
+/// sets it). A generation has no such window — an in-flight download captures the value it started
+/// under and aborts only while the CURRENT value differs from ITS OWN, so a cancel can never reach
+/// forward into a download that had not begun when the user pressed the button.
+static DOWNLOAD_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// The generation a cancellable download must capture at its start and carry for its lifetime.
+pub fn current_download_generation() -> u64 {
+    DOWNLOAD_GENERATION.load(Ordering::SeqCst)
+}
+
+/// Cancel every whisper model download that is in flight RIGHT NOW. Downloads started after this
+/// returns are unaffected (that is the whole point of the counter). Idempotent and infallible: a
+/// cancel with nothing running simply moves the counter forward.
+pub fn cancel_model_downloads() {
+    DOWNLOAD_GENERATION.fetch_add(1, Ordering::SeqCst);
+}
+
+/// Has the download watching `watch` been superseded? `None` = a non-cancellable fetch (the VAD /
+/// diarization first-use downloads on the pipeline path), which is never interrupted.
+fn download_superseded(watch: Option<u64>) -> bool {
+    matches!(watch, Some(generation) if DOWNLOAD_GENERATION.load(Ordering::SeqCst) != generation)
+}
+
+/// What a cancellable model download ended up doing. `Cancelled` is a NORMAL outcome, not an
+/// error: a user-initiated cancel is not a failure, and modelling it as `Err` would force every
+/// caller (and eventually the FE) to string-match an error message to tell the two apart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DownloadOutcome {
+    /// The model is on disk at this path (it was downloaded, or already there).
+    Ready(PathBuf),
+    /// The user cancelled; nothing was left behind (the `.part` is removed by [`PartFileGuard`]).
+    Cancelled,
+}
+
+/// Outcome of ONE streamed body write. Mirrors [`DownloadOutcome`] minus the path, which the
+/// caller already knows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamOutcome {
+    Complete,
+    Cancelled,
+}
+
+/// [`ensure_model`], but INTERRUPTIBLE by [`cancel_model_downloads`]. Used only by the
+/// user-facing `download_model` command — the pipeline's first-use fetches stay uncancellable so a
+/// stray cancel can never wedge a transcription that is already running.
+pub async fn ensure_model_cancellable<F>(
+    configured: Option<&Path>,
+    size: &str,
+    language: &str,
+    on_progress: F,
+) -> Result<DownloadOutcome>
+where
+    F: FnMut(u64, Option<u64>),
+{
+    let size = effective_model_size(size);
+    if let Some(found) = resolve_model_path(configured, &size, language)? {
+        return Ok(DownloadOutcome::Ready(found));
+    }
+    let dir = models_dir()?;
+    let file = model_filename(&size, language);
+    let dest = dir.join(&file);
+    // Captured BEFORE the first byte: this download aborts only while the counter differs from the
+    // value it started under.
+    let watch = Some(current_download_generation());
+    match download_model_streaming(
+        &download_client(None),
+        &model_url(&file),
+        &dest,
+        on_progress,
+        watch,
+    )
+    .await?
+    {
+        StreamOutcome::Complete => Ok(DownloadOutcome::Ready(dest)),
+        StreamOutcome::Cancelled => Ok(DownloadOutcome::Cancelled),
+    }
 }
 
 /// Ensure a usable GGUF model exists on disk and return its path.
@@ -535,6 +694,9 @@ where
         &model_url(&file),
         &dest,
         on_progress,
+        // Uncancellable: this is the pipeline's first-use path, where an abort would wedge a
+        // transcription that is already running.
+        None,
     )
     .await?;
     Ok(dest)
@@ -609,20 +771,22 @@ fn download_client(total_timeout: Option<std::time::Duration>) -> reqwest::Clien
 /// progress instead of buffering the whole body in memory. Overwrites any stale partial. Verifies a
 /// non-empty body before the rename. NO PII is logged (model id / byte counts only). The `client`
 /// carries the caller's timeout posture (see [`download_client`]).
+///
+/// `watch` carries the caller's cancellation generation (see [`current_download_generation`]);
+/// `None` means "cannot be cancelled".
 async fn download_model_streaming<F>(
     client: &reqwest::Client,
     url: &str,
     dest: &Path,
-    mut on_progress: F,
-) -> Result<()>
+    on_progress: F,
+    watch: Option<u64>,
+) -> Result<StreamOutcome>
 where
     F: FnMut(u64, Option<u64>),
 {
-    use tokio::io::AsyncWriteExt;
-
     tracing::info!(target: "transcribe", file = %dest.display(), "downloading whisper model");
 
-    let mut resp = client
+    let resp = client
         .get(url)
         .send()
         .await
@@ -634,6 +798,54 @@ where
         )));
     }
     let total = resp.content_length();
+    write_body_to_dest(ResponseChunks(resp), dest, total, on_progress, watch).await
+}
+
+/// A source of response-body bytes for [`write_body_to_dest`].
+///
+/// This tiny seam is what makes the CANCEL + `.part`-cleanup path testable headless: the real
+/// implementation pulls from a `reqwest::Response`, and the unit tests drive the identical loop
+/// from an in-memory fake, so no test needs a network (or a loopback listener the sandbox may
+/// refuse). PRIVATE, so `async fn` in it is not publicly-reachable API.
+trait BodyChunks {
+    /// The next body chunk, or `None` at end of body.
+    async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>>;
+}
+
+/// [`BodyChunks`] over a live HTTP response. The `to_vec` copies one ~16 kB chunk at a time —
+/// immaterial next to the network + disk write it sits between.
+struct ResponseChunks(reqwest::Response);
+
+impl BodyChunks for ResponseChunks {
+    async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .0
+            .chunk()
+            .await
+            .map_err(|e| AppError::Transcribe(format!("model download body failed: {e}")))?
+            .map(|b| b.to_vec()))
+    }
+}
+
+/// Stream `source` into `<dest>.part` and atomically rename it onto `dest`.
+///
+/// Between chunks it asks [`download_superseded`] whether the user cancelled; on a cancel it
+/// returns EARLY, which unwinds through the armed [`PartFileGuard`] and removes the partial file —
+/// so a cancelled multi-GB download leaves nothing behind. Cancellation is checked between chunks
+/// rather than by dropping the future so the `.part` removal is guaranteed to have run before the
+/// caller observes the outcome.
+async fn write_body_to_dest<S, F>(
+    mut source: S,
+    dest: &Path,
+    total: Option<u64>,
+    mut on_progress: F,
+    watch: Option<u64>,
+) -> Result<StreamOutcome>
+where
+    S: BodyChunks,
+    F: FnMut(u64, Option<u64>),
+{
+    use tokio::io::AsyncWriteExt;
 
     let part = dest.with_extension("part");
     // R1: guard the `.part` so ANY early return below — a mid-stream body/write/flush error, a
@@ -647,11 +859,18 @@ where
         .await
         .map_err(|e| AppError::Transcribe(format!("create model temp file: {e}")))?;
     let mut downloaded: u64 = 0;
-    while let Some(chunk) = resp
-        .chunk()
-        .await
-        .map_err(|e| AppError::Transcribe(format!("model download body failed: {e}")))?
-    {
+    while let Some(chunk) = source.next_chunk().await? {
+        // Checked BEFORE the write so a cancel never grows the partial file it is about to remove.
+        if download_superseded(watch) {
+            tracing::info!(
+                target: "transcribe",
+                file = %dest.display(),
+                bytes = downloaded,
+                "whisper model download cancelled by the user"
+            );
+            // Early return ⇒ the armed guard removes the `.part`.
+            return Ok(StreamOutcome::Cancelled);
+        }
         file.write_all(&chunk)
             .await
             .map_err(|e| AppError::Transcribe(format!("write model chunk: {e}")))?;
@@ -681,7 +900,7 @@ where
         bytes = downloaded,
         "whisper model ready"
     );
-    Ok(())
+    Ok(StreamOutcome::Complete)
 }
 
 /// RAII guard that removes a partial `<model>.part` download file on drop unless [`disarm`]ed after
@@ -759,7 +978,9 @@ pub fn sweep_stale_model_parts(models_dir: &Path) {
 /// "others" label).
 async fn download_model(url: &str, dest: &Path) -> Result<()> {
     let client = download_client(Some(SMALL_MODEL_DOWNLOAD_TIMEOUT));
-    download_model_streaming(&client, url, dest, |_, _| {}).await
+    // `None` = uncancellable, so the returned outcome can only ever be `Complete`.
+    download_model_streaming(&client, url, dest, |_, _| {}, None).await?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -811,7 +1032,10 @@ mod tests {
         let dest = dir.join("ggml-tiny.bin");
         let url = format!("http://{addr}/model.bin");
 
-        let res = download_model_streaming(&download_client(None), &url, &dest, |_, _| {}).await;
+        // `None` watch: this regression is about a TRUNCATED BODY, not cancellation, so the
+        // download must fail on its own merits with no generation observed.
+        let res =
+            download_model_streaming(&download_client(None), &url, &dest, |_, _| {}, None).await;
         assert!(res.is_err(), "a truncated body must surface an error");
 
         // `with_extension("part")` maps `ggml-tiny.bin` → `ggml-tiny.part`.
@@ -869,7 +1093,9 @@ mod tests {
         let client = download_client(Some(std::time::Duration::from_millis(400)));
         let res = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            download_model_streaming(&client, &url, &dest, |_, _| {}),
+            // `None` watch: this regression pins the CLIENT TIMEOUT, so no cancellation generation
+            // is observed — the download must resolve on the timeout alone.
+            download_model_streaming(&client, &url, &dest, |_, _| {}, None),
         )
         .await
         .expect("a stalled download must RESOLVE (as Err) within the client timeout — not hang");
@@ -1436,5 +1662,233 @@ mod tests {
         assert_eq!(paths.decoder, dir.join(PARAKEET_DECODER));
         assert_eq!(paths.joiner, dir.join(PARAKEET_JOINER));
         assert_eq!(paths.tokens, dir.join(PARAKEET_TOKENS));
+    }
+
+    // ── P2 (W2): delete refusals + download cancellation ────────────────────────────────────────
+
+    use crate::transcribe::catalog::{BALANCED_ID, LIGHT_ID, MAXIMUM_ID, SHARP_ID};
+
+    /// REFUSAL 2 — the model a recording would load RIGHT NOW is never deletable, and this leg is
+    /// pinned ON ITS OWN: the live pin is a size that is not under test, so only the effective-model
+    /// term can be what refuses.
+    #[test]
+    fn delete_refuses_the_effective_model() {
+        let err = deletable_model_file(SHARP_ID, SHARP_ID, Some(LIGHT_ID), "")
+            .expect_err("the effective model must be refused");
+        assert!(matches!(err, AppError::InvalidArg(_)), "got {err:?}");
+        // …and the SAME id with a different effective model is allowed, so the assertion above
+        // pins the effective-model term rather than "delete refuses everything".
+        assert_eq!(
+            deletable_model_file(SHARP_ID, BALANCED_ID, Some(LIGHT_ID), "").unwrap(),
+            "ggml-large-v3-turbo-q8_0.bin"
+        );
+        // A blank configured size resolves to a real default upstream; the refusal compares the
+        // ALREADY-resolved effective size, so an empty one must not accidentally match anything.
+        assert!(deletable_model_file(SHARP_ID, "", Some(LIGHT_ID), "").is_ok());
+    }
+
+    /// REFUSAL 3 — the live-caption pin, on its own leg. This is the one that actually bites on the
+    /// shipped default: the batch default is the turbo quant while `live_model_pin` is `small`, so
+    /// `small` is neither selected nor recommended and looks like junk in the long-tail list.
+    #[test]
+    fn delete_refuses_the_live_caption_pin() {
+        let err = deletable_model_file(BALANCED_ID, SHARP_ID, Some(BALANCED_ID), "")
+            .expect_err("the live-caption pin must be refused");
+        assert!(matches!(err, AppError::InvalidArg(_)), "got {err:?}");
+        // Same size, same effective model, pin moved elsewhere ⇒ allowed. Only the pin term moved.
+        assert_eq!(
+            deletable_model_file(BALANCED_ID, SHARP_ID, Some(LIGHT_ID), "").unwrap(),
+            "ggml-small.bin"
+        );
+        // A DISABLED pin (`live_pin_size` → None) must not refuse anything either.
+        assert!(deletable_model_file(BALANCED_ID, SHARP_ID, None, "").is_ok());
+        // The pin the shipped config actually carries resolves to `small` — so the refusal above is
+        // about the real default, not a hypothetical.
+        assert_eq!(live_pin_size("small", false).as_deref(), Some(BALANCED_ID));
+    }
+
+    /// REFUSAL 1 — anything that is not a whisper CATALOG id is rejected outright, including ids
+    /// that would otherwise resolve a filename through `model_filename`'s permissive passthrough.
+    #[test]
+    fn delete_rejects_a_non_registry_id() {
+        for bogus in [
+            "",
+            "   ",
+            "not-a-model",
+            "ggml-small.bin",
+            "../../etc/passwd",
+            "silero-v5.1.2",
+        ] {
+            let err = deletable_model_file(bogus, SHARP_ID, Some(BALANCED_ID), "")
+                .expect_err("a non-registry id must be refused");
+            assert!(matches!(err, AppError::InvalidArg(_)), "{bogus:?} → {err:?}");
+        }
+        // A REAL registry id still passes, so the loop above is not just "everything is refused".
+        assert!(deletable_model_file(MAXIMUM_ID, SHARP_ID, Some(BALANCED_ID), "").is_ok());
+    }
+
+    /// REFUSAL 4 — a delete removes exactly the one whisper file it named and NOTHING else: the
+    /// VAD model, the diarization models and the whole parakeet bundle survive untouched. Driven
+    /// over a real temp dir, because "we only ever join a `ggml-*.bin`" is the kind of claim that
+    /// deserves a filesystem, not a comment.
+    #[test]
+    fn delete_never_touches_vad_or_parakeet() {
+        let dir = parts_tmp_dir("delete-scope");
+        let bystanders = [
+            VAD_MODEL_FILE,
+            DIARIZE_SEG_MODEL_FILE,
+            DIARIZE_EMB_MODEL_FILE,
+            "ggml-large-v3-turbo-q8_0.bin",
+        ];
+        for f in bystanders {
+            std::fs::write(dir.join(f), b"KEEP").unwrap();
+        }
+        let parakeet = dir.join(PARAKEET_SUBDIR);
+        std::fs::create_dir_all(&parakeet).unwrap();
+        for f in PARAKEET_FILES {
+            std::fs::write(parakeet.join(f), b"KEEP").unwrap();
+        }
+        std::fs::write(dir.join("ggml-large-v3.bin"), b"DELETE-ME").unwrap();
+
+        let file = deletable_model_file(MAXIMUM_ID, SHARP_ID, Some(BALANCED_ID), "").unwrap();
+        assert!(delete_model_file_in(&dir, &file).unwrap());
+
+        assert!(!dir.join("ggml-large-v3.bin").is_file(), "the named model goes");
+        for f in bystanders {
+            assert!(dir.join(f).is_file(), "{f} must survive a model delete");
+        }
+        for f in PARAKEET_FILES {
+            assert!(parakeet.join(f).is_file(), "parakeet {f} must survive");
+        }
+        // Idempotent: deleting again is a no-op success, never an error the UI has to explain.
+        assert!(!delete_model_file_in(&dir, &file).unwrap());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `DOWNLOAD_GENERATION` is process-global, so the three cancellation tests below MUST NOT
+    /// interleave: one test's `cancel_model_downloads()` would land inside another's write loop and
+    /// cancel it. `cargo test` runs them on parallel threads, so they serialize on this lock rather
+    /// than on luck. Poison-tolerant (a panicking test must not cascade into a spurious failure).
+    static CANCEL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn cancel_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        CANCEL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// A canned [`BodyChunks`] that runs `on_chunk` after handing out each chunk — the hook the
+    /// cancellation test uses to press Cancel mid-stream.
+    struct FakeChunks<F: FnMut(usize)> {
+        chunks: Vec<Vec<u8>>,
+        next: usize,
+        on_chunk: F,
+    }
+
+    impl<F: FnMut(usize)> BodyChunks for FakeChunks<F> {
+        async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>> {
+            if self.next >= self.chunks.len() {
+                return Ok(None);
+            }
+            let chunk = self.chunks[self.next].clone();
+            self.next += 1;
+            (self.on_chunk)(self.next);
+            Ok(Some(chunk))
+        }
+    }
+
+    /// Cancelling mid-download leaves NOTHING behind: no `.part`, no half-written model, and the
+    /// outcome is `Cancelled` rather than an `Err` the FE would have to string-match.
+    ///
+    /// RED before GREEN: without the `download_superseded` check in the write loop this test fails
+    /// on its FIRST assertion (the outcome would be `Complete` and the finished file would exist).
+    #[tokio::test]
+    async fn download_cancel_removes_the_part_file() {
+        let _serial = cancel_test_guard();
+        let dir = parts_tmp_dir("cancel");
+        let dest = dir.join("ggml-tiny.bin");
+        let watch = Some(current_download_generation());
+        let out = write_body_to_dest(
+            FakeChunks {
+                chunks: vec![vec![1u8; 32], vec![2u8; 32], vec![3u8; 32]],
+                next: 0,
+                // The user presses Cancel while the body is still arriving.
+                on_chunk: |n| {
+                    if n == 1 {
+                        cancel_model_downloads();
+                    }
+                },
+            },
+            &dest,
+            Some(96),
+            |_, _| {},
+            watch,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out, StreamOutcome::Cancelled);
+        assert!(!dest.is_file(), "a cancelled download leaves no model file");
+        assert!(
+            !dest.with_extension("part").is_file(),
+            "a cancelled download leaves no .part residue"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The control for the test above: the SAME fake body, without a cancel, completes and lands
+    /// the file. Without this, "no file on disk" could equally mean the write loop is simply broken.
+    #[tokio::test]
+    async fn download_without_cancel_lands_the_file() {
+        let _serial = cancel_test_guard();
+        let dir = parts_tmp_dir("no-cancel");
+        let dest = dir.join("ggml-tiny.bin");
+        let watch = Some(current_download_generation());
+        let out = write_body_to_dest(
+            FakeChunks {
+                chunks: vec![vec![1u8; 32], vec![2u8; 32]],
+                next: 0,
+                on_chunk: |_| {},
+            },
+            &dest,
+            Some(64),
+            |_, _| {},
+            watch,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out, StreamOutcome::Complete);
+        assert_eq!(std::fs::metadata(&dest).unwrap().len(), 64);
+        assert!(!dest.with_extension("part").is_file());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The counter's whole reason for existing: a cancel must NOT leak into the next download. A
+    /// global `AtomicBool` would still be set when the second fetch starts and would kill it.
+    #[tokio::test]
+    async fn a_cancel_does_not_leak_into_the_next_download() {
+        let _serial = cancel_test_guard();
+        cancel_model_downloads();
+        // A download that starts AFTER the cancel captures the new generation and is unaffected.
+        let dir = parts_tmp_dir("no-leak");
+        let dest = dir.join("ggml-base.bin");
+        let out = write_body_to_dest(
+            FakeChunks {
+                chunks: vec![vec![7u8; 16]],
+                next: 0,
+                on_chunk: |_| {},
+            },
+            &dest,
+            Some(16),
+            |_, _| {},
+            Some(current_download_generation()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out, StreamOutcome::Complete);
+        assert!(dest.is_file());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

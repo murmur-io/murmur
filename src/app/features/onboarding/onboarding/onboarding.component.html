@@ -63,9 +63,14 @@
           <div class="field-grid">
             <label class="field">
               <span class="field-label">Language</span>
-              <select
+              <!-- The SIGNAL path of <mur-select>: no reactive form here, so
+                   `[value]`/`(valueChange)` + `[disabled]` drive it directly. The CVA's
+                   writeValue/setDisabledState are never invoked on this instance, which
+                   is exactly why the two ways of driving it must not fight. -->
+              <mur-select
+                ariaLabel="Transcription language"
                 [value]="language()"
-                (change)="onLanguage($event)"
+                (valueChange)="onLanguage($event)"
                 [disabled]="downloading()"
               >
                 <option value="">Auto-detect</option>
@@ -78,27 +83,18 @@
                 <option value="pt">Português</option>
                 <option value="uk">Українська</option>
                 <option value="nl">Nederlands</option>
-              </select>
-            </label>
-
-            <label class="field">
-              <span class="field-label">Quality</span>
-              <select
-                [value]="modelSize()"
-                (change)="onModelSize($event)"
-                [disabled]="downloading()"
-              >
-                <option value="tiny">Tiny — fastest (~75 MB)</option>
-                <option value="base">Base (~150 MB)</option>
-                <option value="small">Small — light (~470 MB)</option>
-                <option value="large-v3-turbo-q8_0">
-                  Large v3 Turbo (q8) — recommended on 12+ GB Macs (~875 MB)
-                </option>
-                <option value="medium">Medium — accurate (~1.5 GB)</option>
-                <option value="large-v3">Large — best (~3 GB)</option>
-              </select>
+              </mur-select>
             </label>
           </div>
+
+          <!-- The SAME picker Settings hosts. Fully controlled: the wizard owns the
+               size signal, the card only reports picks. -->
+          <app-model-power
+            [size]="modelSize()"
+            [disabled]="downloading()"
+            (sizeChange)="onModelSize($event)"
+            (repair)="downloadModel()"
+          />
 
           <div class="model-state">
             @if (modelPresent() === true) {
@@ -126,6 +122,15 @@
                     }
                   </span>
                 </div>
+                <!-- Cancelling is a NORMAL outcome, not a failure — the command
+                     resolves with status "cancelled" and leaves no partial file. -->
+                <button
+                  type="button"
+                  class="btn btn-ghost"
+                  (click)="cancelDownload()"
+                >
+                  Cancel download
+                </button>
                 <span class="text-muted model-note">
                   Fetching the model — large models can take a few minutes.
                 </span>
@@ -136,10 +141,21 @@
                   (click)="downloadModel()"
                 >
                   <span class="dl-arrow" aria-hidden="true">↓</span>
-                  Download model ({{ sizeHint() }})
+                  <!-- COLD CACHE: on a first launch the catalog may not have arrived
+                       (or the probe may have failed), and the size figure comes only
+                       from it. No figure ⇒ no figure — never a made-up one. -->
+                  @if (sizeHint()) {
+                    Download model ({{ sizeHint() }})
+                  } @else {
+                    Download model
+                  }
                 </button>
                 <span class="text-muted model-note">
-                  {{ sizeHint() }}, one time, on-device.
+                  @if (sizeHint()) {
+                    {{ sizeHint() }}, one time, on-device.
+                  } @else {
+                    One time, on-device.
+                  }
                 </span>
               }
             } @else {
@@ -159,6 +175,19 @@
           }
           @if (downloadError(); as derr) {
             <p class="ob-error text-danger">{{ derr }}</p>
+          }
+          <!-- The wizard's only unskippable step needs a way out when the thing it
+               demands cannot be obtained (no catalog, or a download that keeps
+               failing). Skipping leaves Murmur unable to transcribe, so this appears
+               only once something has actually gone wrong. -->
+          @if (canSkipModel()) {
+            <button type="button" class="btn btn-ghost ob-skip" (click)="skipModel()">
+              I’ll set this up later
+            </button>
+            <p class="text-muted model-note">
+              Murmur can’t transcribe until a model is downloaded — you can finish this
+              in Settings → Transcription.
+            </p>
           }
         }
 
