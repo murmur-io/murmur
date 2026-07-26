@@ -46,6 +46,24 @@ export class SettingsConnectorsSectionComponent {
   readonly slackConsenting = this.store.slackConsenting;
   readonly slackConsentError = this.store.slackConsentError;
 
+  // brain2 connectors — Notion (BYO-token READ connector).
+  readonly notionTokenControl = this.store.notionTokenControl;
+  readonly hasNotionToken = this.store.hasNotionToken;
+  readonly savingNotionToken = this.store.savingNotionToken;
+  readonly notionTokenError = this.store.notionTokenError;
+  readonly notionConsented = this.store.notionConsented;
+  readonly notionConsenting = this.store.notionConsenting;
+  readonly notionConsentError = this.store.notionConsentError;
+
+  // brain2 connectors — ClickUp (BYO-token READ connector).
+  readonly clickupTokenControl = this.store.clickupTokenControl;
+  readonly hasClickupToken = this.store.hasClickupToken;
+  readonly savingClickupToken = this.store.savingClickupToken;
+  readonly clickupTokenError = this.store.clickupTokenError;
+  readonly clickupConsented = this.store.clickupConsented;
+  readonly clickupConsenting = this.store.clickupConsenting;
+  readonly clickupConsentError = this.store.clickupConsentError;
+
   saveWebKey(): void {
     void this.store.saveWebKey();
   }
@@ -68,5 +86,21 @@ export class SettingsConnectorsSectionComponent {
 
   allowSlack(): void {
     void this.store.allowSlack();
+  }
+
+  saveNotionToken(): void {
+    void this.store.saveNotionToken();
+  }
+
+  allowNotion(): void {
+    void this.store.allowNotion();
+  }
+
+  saveClickupToken(): void {
+    void this.store.saveClickupToken();
+  }
+
+  allowClickup(): void {
+    void this.store.allowClickup();
   }
 }

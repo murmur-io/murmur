@@ -716,6 +716,40 @@ pub struct AppConfigDto {
     /// mutator is the dedicated `consent_to_slack` command. `#[serde(default)]` = false (fail-closed).
     #[serde(default)]
     pub slack_consented: bool,
+    /// brain2 connectors — the NOTION master toggle. Settable from the DTO (the Settings UI owns the
+    /// toggle). Even ON, the connector is exposed only once `notion_consented` is granted AND an
+    /// integration token is configured.
+    ///
+    /// OMISSION-SAFE (`Option`, unlike the older `jira_enabled`/`slack_enabled` plain bools): an
+    /// ABSENT key means "don't touch" and `dto_to_config` PRESERVES the stored value, while an
+    /// explicit `false` still disables. Needed because a caller that predates this field (the
+    /// onboarding wizard round-trips the whole DTO) would otherwise silently CLEAR a toggle the user
+    /// had enabled. This is strictly at least as fail-closed as the plain-bool shape: preserving can
+    /// never ENABLE a connector the user did not enable.
+    #[serde(default)]
+    pub notion_enabled: Option<bool>,
+    /// brain2 connectors — one-time NOTION egress consent. PRESERVE-ONLY on this DTO, exactly like
+    /// `slack_consented`: `get_config` carries the current value OUT (so the FE can show consent
+    /// status), but `dto_to_config` IGNORES the incoming value and PRESERVES the stored one. The ONLY
+    /// mutator is the dedicated `consent_to_notion` command. `#[serde(default)]` = false (fail-closed).
+    #[serde(default)]
+    pub notion_consented: bool,
+    /// brain2 connectors — the CLICKUP master toggle. Settable from the DTO, OMISSION-SAFE exactly
+    /// like [`AppConfigDto::notion_enabled`] (absent ⇒ preserve; explicit `false` ⇒ disable). Even
+    /// ON, the connector is exposed only once `clickup_consented` is granted AND a workspace (team)
+    /// id + API token are configured.
+    #[serde(default)]
+    pub clickup_enabled: Option<bool>,
+    /// brain2 connectors — one-time CLICKUP egress consent. PRESERVE-ONLY on this DTO, exactly like
+    /// `notion_consented`; the ONLY mutator is the dedicated `consent_to_clickup` command.
+    /// `#[serde(default)]` = false (fail-closed).
+    #[serde(default)]
+    pub clickup_consented: bool,
+    /// The ClickUp workspace ("team") id the task search reads (non-secret). Settable from the DTO,
+    /// OMISSION-SAFE (absent ⇒ preserve the stored id; an explicit `""` ⇒ clear it), so a caller that
+    /// predates this field cannot wipe a configured workspace.
+    #[serde(default)]
+    pub clickup_team_id: Option<String>,
     /// Opt-in: inherit the shell environment into the `claude` CLI subprocess (restores the older
     /// behavior where an env `ANTHROPIC_API_KEY` reached the CLI). Settable from the DTO (the Settings
     /// UI owns the toggle). An omitted value deserializes to `false` (`#[serde(default)]`) = the
@@ -4885,6 +4919,17 @@ fn config_to_dto(c: &AppConfig) -> AppConfigDto {
         // DISPLAY-ONLY out: lets the FE show "consented" status; the FE cannot set it back (preserved
         // in `dto_to_config`).
         slack_consented: c.slack_consented,
+        // Always carried OUT as an explicit value, so the FE round-trips a real boolean (only a
+        // caller that predates the field ever omits it — see the `Option` rationale on the field).
+        notion_enabled: Some(c.notion_enabled),
+        // DISPLAY-ONLY out: lets the FE show "consented" status; the FE cannot set it back (preserved
+        // in `dto_to_config`).
+        notion_consented: c.notion_consented,
+        clickup_enabled: Some(c.clickup_enabled),
+        // DISPLAY-ONLY out: lets the FE show "consented" status; the FE cannot set it back (preserved
+        // in `dto_to_config`).
+        clickup_consented: c.clickup_consented,
+        clickup_team_id: Some(c.clickup_team_id.clone()),
         claude_code_inherit_env: c.claude_code_inherit_env,
         gateway_base_url: c.gateway_base_url.clone(),
         gateway_model: c.gateway_model.clone(),
@@ -5097,6 +5142,24 @@ fn dto_to_config(d: AppConfigDto, current: &AppConfig) -> AppConfig {
         // live value (BLK-4 mirror). Only `consent_to_slack` may flip it, so a settings save can
         // neither grant nor clear Slack egress consent.
         slack_consented: current.slack_consented,
+        // brain2 connectors: the Notion master toggle IS settable from the DTO (Settings owns it).
+        // OMISSION-SAFE: an ABSENT key preserves the stored toggle (a caller that predates the field
+        // cannot clear it); an explicit `false` still disables. Preserving can never ENABLE a
+        // connector the user did not enable, so this stays fail-closed.
+        notion_enabled: d.notion_enabled.unwrap_or(current.notion_enabled),
+        // brain2 connectors (NEW EGRESS CLASS): consent is NEVER set from the DTO — preserved from the
+        // live value (BLK-4 mirror). Only `consent_to_notion` may flip it, so a settings save can
+        // neither grant nor clear Notion egress consent.
+        notion_consented: current.notion_consented,
+        // brain2 connectors: the ClickUp master toggle + non-secret workspace id ARE settable from
+        // the DTO (Settings owns them), with the same omission-safe preserve as Notion.
+        clickup_enabled: d.clickup_enabled.unwrap_or(current.clickup_enabled),
+        // brain2 connectors (NEW EGRESS CLASS): consent is NEVER set from the DTO — preserved from the
+        // live value. Only `consent_to_clickup` may flip it.
+        clickup_consented: current.clickup_consented,
+        clickup_team_id: d
+            .clickup_team_id
+            .unwrap_or_else(|| current.clickup_team_id.clone()),
         // Opt-in env inheritance for the `claude` CLI IS settable from the DTO (the Settings UI owns
         // the toggle). Default OFF on the DTO (`#[serde(default)]`), so a partial/older save can never
         // silently enable it. Even ON, the DB keys are never inherited (claude_code.rs `harden_env`).
@@ -9401,3 +9464,104 @@ mod storage_cmd_tests;
 #[cfg(test)]
 #[path = "tests/pipeline_task_tests.rs"]
 mod pipeline_task_tests;
+
+// ─── brain2 connectors — the Notion/ClickUp settings-DTO contract ───────────────────────────────
+//
+// Guards the two egress-adjacent invariants of the two new BYO-token READ connectors at the
+// `AppConfigDto` boundary: (1) an OMITTED enable/workspace key PRESERVES the stored value (a caller
+// that predates the field cannot silently clear a connector the user configured) while an explicit
+// value still applies, and (2) the one-time egress CONSENT is preserve-only — a settings save can
+// neither grant it nor clear it; only the dedicated `consent_to_*` command can.
+#[cfg(test)]
+mod connector_dto_tests {
+    use super::*;
+
+    /// A config with both new connectors fully switched on.
+    fn configured() -> AppConfig {
+        AppConfig {
+            notion_enabled: true,
+            notion_consented: true,
+            clickup_enabled: true,
+            clickup_consented: true,
+            clickup_team_id: "9001".to_string(),
+            ..AppConfig::default()
+        }
+    }
+
+    /// RED-before-GREEN for the omission-safe shape: with plain `bool`/`String` DTO fields, an
+    /// older caller that round-trips the whole DTO (the onboarding wizard) omits these keys, serde
+    /// defaults them to `false`/`""`, and the user's enabled connector is silently CLEARED.
+    #[test]
+    fn omitted_connector_keys_preserve_the_stored_values() {
+        let current = configured();
+        let mut dto = config_to_dto(&current);
+        dto.notion_enabled = None;
+        dto.clickup_enabled = None;
+        dto.clickup_team_id = None;
+        let out = dto_to_config(dto, &current);
+        assert!(
+            out.notion_enabled,
+            "an ABSENT notion_enabled must PRESERVE, never clear"
+        );
+        assert!(out.clickup_enabled, "an ABSENT clickup_enabled preserves");
+        assert_eq!(
+            out.clickup_team_id, "9001",
+            "an ABSENT workspace id preserves"
+        );
+    }
+
+    /// An OMITTED key can never ENABLE a connector either — preserve means preserve, in both
+    /// directions (fail-closed: a partial save cannot turn on external egress).
+    #[test]
+    fn omitted_connector_keys_cannot_enable_a_disabled_connector() {
+        let current = AppConfig::default(); // everything OFF
+        let mut dto = config_to_dto(&current);
+        dto.notion_enabled = None;
+        dto.clickup_enabled = None;
+        let out = dto_to_config(dto, &current);
+        assert!(!out.notion_enabled);
+        assert!(!out.clickup_enabled);
+    }
+
+    /// An EXPLICIT value still applies (the Settings UI always sends one), and the granted consent
+    /// survives a save that carries `false`.
+    #[test]
+    fn explicit_values_apply_while_consent_stays_preserve_only() {
+        let current = configured();
+        let mut dto = config_to_dto(&current);
+        dto.notion_enabled = Some(false);
+        dto.clickup_enabled = Some(false);
+        dto.clickup_team_id = Some(String::new());
+        // A save that carries consent=false must NOT revoke the grant.
+        dto.notion_consented = false;
+        dto.clickup_consented = false;
+        let out = dto_to_config(dto, &current);
+        assert!(!out.notion_enabled, "an explicit false still disables");
+        assert!(!out.clickup_enabled);
+        assert_eq!(out.clickup_team_id, "", "an explicit empty id still clears");
+        assert!(
+            out.notion_consented,
+            "notion consent is preserve-only from the DTO"
+        );
+        assert!(out.clickup_consented);
+    }
+
+    /// A settings save can NEVER GRANT external-egress consent — only `consent_to_notion` /
+    /// `consent_to_clickup` may. RED if `dto_to_config` ever read `d.*_consented`.
+    #[test]
+    fn a_settings_save_can_never_grant_connector_consent() {
+        let current = AppConfig::default(); // unconsented
+        let mut dto = config_to_dto(&current);
+        dto.notion_consented = true;
+        dto.clickup_consented = true;
+        let out = dto_to_config(dto, &current);
+        assert!(
+            !out.notion_consented,
+            "a settings save must NEVER grant Notion egress consent"
+        );
+        assert!(
+            !out.clickup_consented,
+            "a settings save must NEVER grant ClickUp egress consent"
+        );
+    }
+}
