@@ -255,6 +255,18 @@ legend { padding: 0 var(--space-2); color: var(--text-secondary); font-size: 0.8
 .banner.is-accent { background: var(--accent-soft); border-color: rgba(110, 118, 255, 0.3); color: var(--text-primary); }
 
 /* --- Helper text ----------------------------------------------------------- */
+/* The explanatory line under a form control. Promoted here from ELEVEN
+   identical per-section copies (settings notes/audio/transcription/connectors/
+   storage + the five AI blocks). Colour is NOT baked in — callers pair it with
+   `.text-muted` (the norm) or `.text-danger`. `margin: 0` because every host is
+   a flex column with its own `gap`; a `<p class="field-help">` would otherwise
+   add the global `p` bottom margin on top of it. */
+.field-help {
+  margin: 0;
+  font-size: 0.8125rem;
+  line-height: 1.5;
+}
+
 .text-secondary { color: var(--text-secondary); }
 .text-muted { color: var(--text-muted); }
 .text-success { color: var(--success); }

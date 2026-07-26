@@ -6,8 +6,9 @@ import { mockTauri } from "./mock-invoke";
  * BrainEngineCardComponent (Advanced → Engines → "On this Mac — built-in
  * models") hosting ModelEffortPickerComponent behind its Configure disclosure.
  *
- * Supersedes local-models-list.spec.ts — LocalModelsListComponent is no longer
- * mounted anywhere (the models moved into the engine card + effort picker).
+ * Superseded local-models-list.spec.ts — LocalModelsListComponent had no mount
+ * site left once the models moved into the engine card + effort picker, and the
+ * component was DELETED in the P0 foundations PR.
  */
 test.describe("brain-engine-card (on-device models)", () => {
   test.beforeEach(async ({ page }) => {
@@ -40,7 +41,9 @@ test.describe("brain-engine-card (on-device models)", () => {
           filename: "qwen3-4b.gguf",
           url: "https://example.com/qwen3-4b.gguf",
           minRamGb: 8,
-          languages: ["en", "pl"],
+          // Registry-faithful: every Qwen row in `reason::BRAIN_MODELS` declares
+          // "multi" — that tag is what puts a model in the Multilingual family.
+          languages: ["en", "multi", "pl"],
           arch: "qwen3",
         },
       ],

@@ -60,18 +60,6 @@
   min-width: 180px;
   flex: 1 1 auto;
 }
-.semantic-progress-track {
-  height: 6px;
-  border-radius: 3px;
-  background: var(--surface-raised);
-  overflow: hidden;
-}
-.semantic-progress-fill {
-  height: 100%;
-  background: var(--accent);
-  border-radius: 3px;
-  transition: width var(--transition);
-}
 .semantic-progress-label {
   font-size: 0.75rem;
 }

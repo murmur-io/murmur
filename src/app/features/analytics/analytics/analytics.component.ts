@@ -7,6 +7,10 @@ import {
 } from "@angular/core";
 import { IpcService } from "../../../core/ipc.service";
 import { AnalyticsStore } from "../../../services/analytics-store.service";
+import {
+  meetingStatusLabel,
+  meetingStatusPillClass,
+} from "../../../design-system/meeting-status";
 import { EgressLedgerComponent } from "../egress-ledger/egress-ledger.component";
 import { TopicThreadsComponent } from "../topic-threads/topic-threads.component";
 import { WeeklyDigestComponent } from "../weekly-digest/weekly-digest.component";
@@ -170,9 +174,9 @@ export class AnalyticsComponent implements OnInit {
       const count = counts.get(status) ?? 0;
       return {
         status,
-        label: this.statusLabel(status),
+        label: meetingStatusLabel(status),
         count,
-        pillClass: this.statusPillClass(status),
+        pillClass: meetingStatusPillClass(status),
         pct: Math.round((count / max) * 100),
       };
     });
@@ -217,26 +221,6 @@ export class AnalyticsComponent implements OnInit {
     const label = b.count === 1 ? "1 meeting" : `${b.count} meetings`;
     const when = this.tickLabel(b.date);
     return `${when} · ${label}`;
-  }
-
-  statusLabel(s: string): string {
-    return s.charAt(0) + s.slice(1).toLowerCase();
-  }
-
-  /** Maps a status to a pill state modifier (matches Library exactly). */
-  statusPillClass(s: string): string {
-    switch (s) {
-      case "RECORDING":
-      case "ERROR":
-        return "is-danger";
-      case "TRANSCRIBED":
-      case "SUMMARIZED":
-        return "is-accent";
-      case "EXPORTED":
-        return "is-success";
-      default:
-        return "";
-    }
   }
 
   /** seconds → compact "1h 5m" / "12m" / "45s". Treats empty/zero gracefully. */
