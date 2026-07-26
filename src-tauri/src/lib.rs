@@ -18,6 +18,7 @@ pub mod extract;
 pub mod facts;
 mod instance_lock;
 pub mod links;
+pub mod machine;
 pub mod mcp;
 pub mod memory;
 pub mod orchestrate;
@@ -394,6 +395,9 @@ pub fn run() {
             commands::brain_model_present,
             commands::list_brain_models,
             commands::brain_model_retirement_nudge,
+            commands::whisper_recommendation,
+            commands::machine_change_nudge,
+            commands::dismiss_machine_change_nudge,
             commands::brain_posture,
             commands::resolved_ai_map,
             commands::set_brain_posture,
@@ -677,6 +681,34 @@ pub fn run() {
             // so a live in-progress download is never raced. Best-effort; never fatal to launch.
             if let Ok(models_dir) = crate::transcribe::model::models_dir() {
                 crate::transcribe::model::sweep_stale_model_parts(&models_dir);
+            }
+            // P1: notice a MACHINE CHANGE (restore-from-backup / Migration Assistant onto a
+            // different Mac) and record the model-size provenance for existing installs.
+            //
+            // Both are settings-row writes, deliberately NOT an event: Tauri does not buffer
+            // events and the webview has not called `listen()` yet during `setup`, so an event
+            // emitted here would simply be lost. The FE PULLS via `machine_change_nudge()`.
+            // `note_machine_fingerprint` writes the pending row BEFORE moving the fingerprint, so
+            // a crash in between leaves the nudge recoverable rather than silently consumed.
+            // Best-effort throughout: a settings write failure must never be fatal to launch, and
+            // nothing here logs any user content.
+            {
+                let state = app.state::<AppState>();
+                let fingerprint = crate::machine::current_fingerprint();
+                if let Err(e) =
+                    crate::settings::note_machine_fingerprint(&state.db, fingerprint.as_deref())
+                {
+                    tracing::warn!(target: "startup", error = %e, "machine fingerprint compare failed");
+                }
+                let (onboarded, model_size) = match state.config.lock() {
+                    Ok(c) => (c.onboarded, c.model_size.clone()),
+                    Err(_) => (false, String::new()),
+                };
+                if let Err(e) =
+                    crate::settings::backfill_model_size_source(&state.db, onboarded, &model_size)
+                {
+                    tracing::warn!(target: "startup", error = %e, "model_size_source backfill failed");
+                }
             }
             // R2: reclaim any orphaned export temp DOTFILE (`.<stem>.<pid>.tmp` / `.edit.<pid>.tmp`)
             // a SIGKILL between fsync + rename left in the user's Obsidian vault. Only removes a temp

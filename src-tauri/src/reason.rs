@@ -371,6 +371,40 @@ pub fn residency_fits(
     }
 }
 
+/// RAM floor for ADVISING the full on-device brain (heavy reasoner resident alongside a recording).
+///
+/// 24 GiB, and deliberately CONSERVATIVE. The earlier design offered "Full" to a 16 GB Mac on a
+/// 12.2 GB paper ESTIMATE while, in the same breath, citing the MEASURED 14 GB main-process
+/// recording peak (2026-07-21 recording-RAM RCA) to justify whisper conservatism — the same
+/// evidence held to two different standards. Until somebody takes an RSS-over-time measurement of
+/// the heavy reasoner co-resident with a real recording on a signed build, this floor stays above
+/// the measured peak plus a heavy model. Lowering it is a behaviour change gated on that
+/// measurement, not on a design document.
+pub const BRAIN_FULL_MIN_RAM_BYTES: u64 = 24 * 1024 * 1024 * 1024;
+
+/// What on-device brain posture should we ADVISE on this machine? Advice only — nothing here gates
+/// or changes what the user already chose; `brain_live_ram_ok` remains the actual residency guard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BrainAdvice {
+    /// Enough measured headroom for the full on-device stack (heavy reasoner + recording).
+    Full,
+    /// Realtime Reactions (the light engine) only — the safe advice everywhere else, including on
+    /// a machine whose RAM we could not read.
+    Reactions,
+}
+
+/// [`BrainAdvice`] for a machine. PURE over total RAM so both branches are headless-testable.
+/// UNKNOWN RAM advises [`BrainAdvice::Reactions`] — the same fail-conservative direction the whisper
+/// recommendation takes, for the same reason: never talk a user into a heavy on-device load on the
+/// strength of a measurement we could not take.
+pub fn brain_advice_for(total_ram_bytes: Option<u64>) -> BrainAdvice {
+    match total_ram_bytes {
+        Some(b) if b >= BRAIN_FULL_MIN_RAM_BYTES => BrainAdvice::Full,
+        _ => BrainAdvice::Reactions,
+    }
+}
+
 /// Resolve a user-supplied CUSTOM brain GGUF path override, or `Ok(None)`.
 ///
 /// `configured` is the explicit path from settings (`brain_model_path`), used verbatim if it points
@@ -1856,6 +1890,34 @@ mod tests {
         assert!(residency_fits(&[light, heavy], None, CALL_OVERHEAD_GB));
         // Light alone (the Brain-Live-during-recording set) fits 8 GB.
         assert!(residency_fits(&[light], Some(8), CALL_OVERHEAD_GB));
+    }
+
+    /// C4 — the brain advice floor is MEASURED-conservative, not estimate-optimistic. A 16 GB Mac
+    /// is advised Reactions, not Full: the earlier 12.2 GB estimate contradicted the 14 GB measured
+    /// recording peak that the whisper conservatism cites.
+    #[test]
+    fn brain_advice_needs_24_gb_for_full() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        assert_eq!(brain_advice_for(Some(64 * GIB)), BrainAdvice::Full);
+        // The floor is inclusive.
+        assert_eq!(
+            brain_advice_for(Some(BRAIN_FULL_MIN_RAM_BYTES)),
+            BrainAdvice::Full
+        );
+        assert_eq!(
+            brain_advice_for(Some(BRAIN_FULL_MIN_RAM_BYTES - 1)),
+            BrainAdvice::Reactions
+        );
+        // The machines the old 12.2 GB estimate would have mis-advised.
+        assert_eq!(brain_advice_for(Some(16 * GIB)), BrainAdvice::Reactions);
+        assert_eq!(brain_advice_for(Some(8 * GIB)), BrainAdvice::Reactions);
+    }
+
+    /// An unreadable RAM probe advises Reactions — never talk a user into the heavy on-device
+    /// stack on a measurement we could not take (same fail direction as the whisper default).
+    #[test]
+    fn brain_advice_unknown_ram_fails_conservative() {
+        assert_eq!(brain_advice_for(None), BrainAdvice::Reactions);
     }
 
     #[test]
