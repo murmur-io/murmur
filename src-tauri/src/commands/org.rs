@@ -3757,17 +3757,29 @@ async fn republish_org_shares_for_source_with_policy(
     Ok(republished)
 }
 
-/// `list_org_shares()` — the caller's outbound org shares (local rows; titles render only to the
-/// local owner). Content-free enough for the FE list.
+/// `list_org_shares(org_id)` — the caller's outbound shares INTO ONE org (local rows; titles render
+/// only to the local owner). Content-free enough for the FE list.
 #[tauri::command]
-pub fn list_org_shares(state: State<'_, AppState>) -> Result<Vec<OrgShareEntry>, AppError> {
-    // TODO(multi-org): let the user pick the target org — the FE does NOT yet pass an org_id here, so
-    // this read still lists the FIRST local org's shares. A READ (not destructive/egress), so a
-    // first-org default is acceptable until the FE gains an org picker; thread `org_id` through then.
-    let Some(org) = state.inner().db.list_org_states()?.into_iter().next() else {
+pub fn list_org_shares(
+    state: State<'_, AppState>,
+    org_id: String,
+) -> Result<Vec<OrgShareEntry>, AppError> {
+    list_org_shares_inner(state.inner(), &org_id)
+}
+
+/// The multi-org fix (2026-07-26): this read used to ignore its caller entirely and return the FIRST
+/// locally-joined org's shares (`list_org_states().next()`) in a shipped MULTI-org app — so a member
+/// of two orgs saw the wrong org's share list. The org id is now the caller's explicit choice.
+/// An unknown/unjoined id returns an EMPTY list rather than silently falling back to another org.
+pub(crate) fn list_org_shares_inner(
+    state: &AppState,
+    org_id: &str,
+) -> Result<Vec<OrgShareEntry>, AppError> {
+    let org_id = org_id.trim();
+    if org_id.is_empty() || state.db.get_org_state(org_id)?.is_none() {
         return Ok(Vec::new());
-    };
-    let rows = state.inner().db.list_org_shares_for_org(&org.org_id)?;
+    }
+    let rows = state.db.list_org_shares_for_org(org_id)?;
     Ok(rows
         .into_iter()
         .map(|r| OrgShareEntry {
@@ -3991,6 +4003,21 @@ async fn revoke_org_share_inner_with_policy(
     }
     if policy
         .commit(|| state.db.set_org_share_state(&row.id, "revoked", &now))?
+        .is_none()
+    {
+        return Err(AppError::Unavailable(
+            "background org revoke deferred for recording".into(),
+        ));
+    }
+    // EVICT THE LOCAL REPLICA ON THE PUBLISHING DEVICE. Withdrawing a share used to mutate ONLY the
+    // `org_shares` state machine, so the device that revoked kept its own `org_items` row — markdown,
+    // chunks, FTS tokens, int8 vectors and the image BLOBs — live and searchable through org search /
+    // Ask / MCP `org_search` forever. Routed through the ONE eviction primitive so this path gets
+    // exactly the same cleanup as a feed tombstone or the reconcile sweep. AFTER the server DELETE
+    // succeeded (an eviction before a failed tombstone would blind this device to still-shared
+    // content), and idempotent — a device with no local replica row is simply a no-op.
+    if policy
+        .commit(|| state.db.evict_org_item(&item_id).map(|_| ()))?
         .is_none()
     {
         return Err(AppError::Unavailable(
@@ -4238,11 +4265,17 @@ pub const ORG_SYNC_TICK_SECS: u64 = 60;
 /// `Ok` when logged out / no org joined, so this is a no-op until a session is live. Logs only
 /// non-PII counts on a productive tick.
 ///
-/// Returns `true` when the inbound sync actually CHANGED the local replica this tick (≥1 ingest or
-/// tombstone) — the caller (`lib.rs` loop) uses this to fire a content-free
-/// [`crate::events::EVENT_ORG_FEED_UPDATED`] so an open FE view re-fetches WITHOUT polling. Returns
-/// `false` on a no-op / error tick. Emitting is done by the loop (which holds the `AppHandle`); the
-/// tick signature stays `&AppState`, unchanged for the other internal callers.
+/// When the live pull finds NOTHING to pull, the tick spends its budget on ONE bounded step of the
+/// ANTI-ENTROPY RECONCILE SWEEP instead (`org_reconcile_tick_with_policy`) — the slow second cursor
+/// that re-walks the whole feed from 0 so a tombstone sitting BELOW the live cursor (the server never
+/// re-seqs a withdrawal) is still eventually applied. The live pull always wins the budget while it
+/// has work, so the sweep can never starve it.
+///
+/// Returns `true` when the local replica actually CHANGED this tick (≥1 ingest or tombstone from the
+/// live pull, or ≥1 row converged by the sweep) — the caller (`lib.rs` loop) uses this to fire a
+/// content-free [`crate::events::EVENT_ORG_FEED_UPDATED`] so an open FE view re-fetches WITHOUT
+/// polling. Returns `false` on a no-op / error tick. Emitting is done by the loop (which holds the
+/// `AppHandle`); the tick signature stays `&AppState`, unchanged for the other internal callers.
 pub(crate) async fn org_background_sync_tick(state: &AppState) -> bool {
     let policy = OrgWorkPolicy::background(crate::perf::background_epoch());
     if !policy.is_current() {
@@ -4262,22 +4295,36 @@ pub(crate) async fn org_background_sync_tick(state: &AppState) -> bool {
     if !policy.is_current() {
         return false;
     }
-    match org_sync_now_inner_with_policy(state, policy).await {
-        Ok(r) if r.ingested > 0 || r.tombstoned > 0 => {
-            tracing::info!(
-                target: "org",
-                ingested = r.ingested,
-                tombstoned = r.tombstoned,
-                "org feed synced"
-            );
-            true
-        }
-        Ok(_) => false,
+    let report = match org_sync_now_inner_with_policy(state, policy).await {
+        Ok(r) => r,
         Err(e) => {
             tracing::warn!(target: "org", error = %e, "org feed sync tick failed");
-            false
+            return false;
+        }
+    };
+    let live_changed = report.ingested > 0 || report.tombstoned > 0;
+    if live_changed {
+        tracing::info!(
+            target: "org",
+            ingested = report.ingested,
+            tombstoned = report.tombstoned,
+            "org feed synced"
+        );
+    }
+    // ANTI-ENTROPY: the slow reconcile sweep runs ONLY on a tick where the live pull found nothing to
+    // pull. That is what makes "the live pull keeps priority" structural rather than a hope — while
+    // any org is genuinely behind, every page budget goes to catching it up; the sweep only spends a
+    // budget once the live cursor is idle. Best-effort: a failure never kills the loop.
+    if !live_changed && report.pulled == 0 && policy.is_current() {
+        match org_reconcile_tick_with_policy(state, policy).await {
+            Ok(changed) => return changed > 0,
+            Err(e) => {
+                tracing::warn!(target: "org", error = %brief_err(&e), "org reconcile tick failed");
+                return false;
+            }
         }
     }
+    live_changed
 }
 
 /// `org_sweep_pending()` — the on-launch org queue sweep (extends the mode-B `share_rewrap_pending`
@@ -4480,6 +4527,25 @@ pub async fn org_sync_now(
 /// One deliberately small feed page per org-sync invocation. A protocol-valid org blob may be up to
 /// 16 MiB; keeping this at four bounds the decrypted/prepared page far below the old 200-item shape.
 const ORG_FEED_PAGE: u32 = 4;
+
+/// One deliberately small ANTI-ENTROPY page per reconcile tick — same order of magnitude as
+/// [`ORG_FEED_PAGE`], so the slow sweep can never starve the live pull nor hammer the server. The
+/// sweep only runs on a tick where the live pull found NOTHING (see `org_background_sync_tick`), so
+/// the live cursor always keeps priority.
+const ORG_RECONCILE_PAGE: u32 = 4;
+
+/// Multi-org fairness for the reconcile sweep, mirroring [`ORG_SYNC_ROUND_ROBIN`]. Process-local
+/// scheduling only — the durable per-org `reconcile_seq` cursor is the authoritative position, so a
+/// restart can repeat work but never skip a record.
+static ORG_RECONCILE_ROUND_ROBIN: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// How long to wait after a COMPLETED full pass before starting the next one. Anti-entropy is a
+/// safety net, not a poll: without this a member of a small org would re-walk its whole feed every
+/// few idle minutes forever. Six hours keeps the repair well inside "the same day" while making the
+/// steady-state cost of the sweep negligible. Only gates the START of a pass — a pass already in
+/// flight always runs to completion.
+const ORG_RECONCILE_PASS_COOLDOWN_SECS: i64 = 6 * 3600;
 
 /// The un-targeted/background command consumes ONE global page budget, not one page per joined org.
 /// This process-local cursor is sufficient because cursors themselves remain durable per org; after
@@ -5065,6 +5131,388 @@ async fn org_sync_one(
     // `report.last_seq` reflects the LAST org synced (per-org field on an aggregate report).
     report.last_seq = state.db.org_last_seq_for(&org.org_id)?;
     Ok(())
+}
+
+// ── ANTI-ENTROPY RECONCILE SWEEP (2026-07-26) ─────────────────────────────────────────────────────
+//
+// THE BUG THIS EXISTS FOR. The server withdraws an org item with
+// `UPDATE org_items SET tombstoned_at = now()` and NEVER changes that item's `seq`; the feed is
+// `WHERE org_id = ? AND seq > ?`. So a member whose live cursor (`org_state.last_seq`) is ALREADY
+// past that seq can never be told the item is gone: the decrypted local replica (`org_items.markdown`
+// + `org_chunks` + `fts_org_chunks` + `org_vec_chunks` + `note_attachments`) survives forever and
+// stays searchable through org search, Ask and MCP `org_search`. Because every edit publishes rev+1
+// as a NEW item and tombstones the old one, recipients also accumulate every superseded revision.
+//
+// THE FIX. A SECOND, deliberately slow cursor (`org_state.reconcile_seq`) that restarts at 0 and
+// walks the entire feed in small bounded steps, applying whatever the feed currently says. It NEVER
+// writes `last_seq`. A server-side fix (assigning a fresh `seq` on tombstone) lands separately; this
+// sweep is what repairs replicas ALREADY orphaned on real machines, and remains a correct backstop
+// afterwards.
+
+/// One anti-entropy reconcile tick: pick one joined org (round-robin) and walk one bounded
+/// [`ORG_RECONCILE_PAGE`] of its feed from the SLOW cursor. Returns how many local replica rows this
+/// tick actually changed (evicted + re-ingested), so the caller can fire `org-feed-updated`.
+///
+/// Best-effort and offline-tolerant in exactly the same shape as the live pull: logged out / no org /
+/// no server ⇒ `Ok(0)`, never an error. Honors the background epoch through `policy` at every await
+/// boundary and every DB commit.
+/// Run ONE anti-entropy reconcile step immediately (manual policy — never epoch-deferred). Returns
+/// the number of local replica rows this step changed. The scheduled path is
+/// `org_background_sync_tick`; this is the direct entry point for internal callers and for the
+/// regression tests that drive the sweep against a mock feed.
+pub async fn org_reconcile_now_inner(state: &AppState) -> Result<u32, AppError> {
+    org_reconcile_tick_with_policy(state, OrgWorkPolicy::manual()).await
+}
+
+async fn org_reconcile_tick_with_policy(
+    state: &AppState,
+    policy: OrgWorkPolicy,
+) -> Result<u32, AppError> {
+    if !policy.is_current() {
+        return Ok(0);
+    }
+    let orgs = state.db.list_org_states()?;
+    if orgs.is_empty() {
+        return Ok(0);
+    }
+    let base = share_base_url(state)?;
+    if base.trim().is_empty() {
+        return Ok(0);
+    }
+    let access = match valid_access_token(state).await {
+        Ok(a) => a,
+        Err(_) => return Ok(0),
+    };
+    if !policy.is_current() {
+        return Ok(0);
+    }
+    let client = crate::share::client::ShareClient::new(&base)?;
+    let index =
+        ORG_RECONCILE_ROUND_ROBIN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % orgs.len();
+    let org = &orgs[index];
+    org_reconcile_one(state, &client, &access, org, policy).await
+}
+
+/// Is the last COMPLETED reconcile pass still inside [`ORG_RECONCILE_PASS_COOLDOWN_SECS`]?
+/// `None`/unparseable ⇒ `false` (never joined, never completed, or a corrupt stamp ⇒ sweep now:
+/// failing OPEN here just costs one bounded page, while failing closed would silently disable the
+/// whole repair). A stamp in the future (a clock that jumped backwards) also reads as "recent",
+/// which self-corrects the moment the clock does.
+fn recently_reconciled(pass_at: Option<&str>) -> bool {
+    let Some(at) = pass_at else {
+        return false;
+    };
+    let Ok(at) = chrono::DateTime::parse_from_rfc3339(at) else {
+        return false;
+    };
+    let age = chrono::Utc::now()
+        .signed_duration_since(at.with_timezone(&chrono::Utc))
+        .num_seconds();
+    age < ORG_RECONCILE_PASS_COOLDOWN_SECS
+}
+
+/// Reconcile ONE bounded page of one org's feed against the local replica, from the slow cursor.
+///
+/// Per record, in feed order:
+///   - a TOMBSTONE record → evict the local replica through the ONE eviction primitive
+///     (`Db::evict_org_item`), idempotently;
+///   - a LIVE record whose `content_sha256` already matches what is stored → SKIP with NO blob fetch
+///     (the whole point of carrying the hash on the feed entry);
+///   - a LIVE record already tombstoned locally → SKIP (an append-only tombstone is permanent; the
+///     sweep must never resurrect withdrawn plaintext);
+///   - a LIVE record that is missing locally or diverged → open + ingest it.
+///
+/// UNLIKE the live pull, the sweep NEVER stalls: any per-record failure (key gap, blob fetch error,
+/// broken cell) just advances the slow cursor past it, because stalling is precisely the failure mode
+/// that would stop the sweep from ever reaching the tombstones behind it. The record comes around
+/// again on the next pass.
+///
+/// Walking off the end of the feed COMPLETES the pass: stamp `reconcile_pass_at` and rewind
+/// `reconcile_seq` to 0 so the next pass re-observes every record. `last_seq` is never written here.
+async fn org_reconcile_one(
+    state: &AppState,
+    client: &crate::share::client::ShareClient,
+    access: &str,
+    org: &crate::storage::OrgState,
+    policy: OrgWorkPolicy,
+) -> Result<u32, AppError> {
+    if !policy.is_current() {
+        return Ok(0);
+    }
+    /// One decided reconcile action. Every feed record in the page gets exactly one, so the slow
+    /// cursor can advance strictly through what has actually been handled.
+    enum ReconcileAction {
+        /// Already converged (or deliberately left alone) — nothing to write.
+        Skip { seq: u64 },
+        /// The feed says this item is withdrawn → evict the local replica.
+        Evict { item_id: String, seq: u64 },
+        /// Divergent live record → (re)write the opened envelope into the replica.
+        Ingest {
+            item_id: String,
+            seq: u64,
+            rev: u32,
+            generation: u32,
+            env: Box<crate::share::org_envelope::OrgEnvelope>,
+            attachments: Vec<crate::storage::IncomingAttachment>,
+            sha: Vec<u8>,
+            author_user_id: String,
+        },
+    }
+
+    let cursor = state.db.org_reconcile_seq_for(&org.org_id)?;
+    // At the START of a pass only: hold off if the previous full pass finished recently. A pass
+    // already under way (cursor > 0) always runs to completion, so a repair in flight is never
+    // abandoned half-done.
+    if cursor == 0 && recently_reconciled(state.db.org_reconcile_pass_at(&org.org_id)?.as_deref()) {
+        return Ok(0);
+    }
+    let feed = client
+        .org_feed(access, &org.org_id, cursor, ORG_RECONCILE_PAGE)
+        .await?;
+    if !policy.is_current() {
+        return Ok(0);
+    }
+    if feed.items.len() > ORG_RECONCILE_PAGE as usize {
+        return Err(AppError::Unavailable(
+            "org server exceeded the requested bounded reconcile page".into(),
+        ));
+    }
+    if feed.items.is_empty() {
+        let now = chrono::Utc::now().to_rfc3339();
+        if policy
+            .commit(|| state.db.complete_org_reconcile_pass(&org.org_id, &now))?
+            .is_some()
+        {
+            tracing::debug!(target: "org", "org reconcile pass complete");
+        }
+        return Ok(0);
+    }
+
+    let mut actions: Vec<ReconcileAction> = Vec::new();
+    let mut walked = cursor;
+    for item in &feed.items {
+        if !policy.is_current() {
+            return Ok(0);
+        }
+        if item.seq <= walked {
+            return Err(AppError::Unavailable(
+                "org server returned a non-increasing feed sequence".into(),
+            ));
+        }
+        walked = item.seq;
+
+        if item.tombstoned {
+            actions.push(ReconcileAction::Evict {
+                item_id: item.item_id.clone(),
+                seq: item.seq,
+            });
+            continue;
+        }
+
+        let held = state.db.org_replica_state(&item.item_id)?;
+        if held.as_ref().is_some_and(|h| h.tombstoned) {
+            // Permanent: an append-only tombstone is never undone by a later live record.
+            actions.push(ReconcileAction::Skip { seq: item.seq });
+            continue;
+        }
+        // CONVERGED: the stored plaintext hash equals the feed's ⇒ nothing to do, and — critically —
+        // no blob is fetched. This is what keeps a full pass cheap on a large, healthy replica.
+        if let (Some(held), Some(sha)) = (held.as_ref(), item.content_sha256.as_ref()) {
+            if held.content_sha256.as_deref() == Some(sha.as_slice()) {
+                actions.push(ReconcileAction::Skip { seq: item.seq });
+                continue;
+            }
+        }
+
+        let (Some(blob_id), Some(sha)) = (item.blob_id.clone(), item.content_sha256.clone()) else {
+            // Structurally unopenable (no blob / no hash ⇒ no AAD nonce). Advance; never stall.
+            actions.push(ReconcileAction::Skip { seq: item.seq });
+            continue;
+        };
+        let item_nonce = org_item_nonce(&sha);
+        let ock =
+            match acquire_org_ock_with_policy(state, &org.org_id, item.generation, policy).await {
+                Ok(k) => k,
+                Err(_) => {
+                    if !policy.is_current() {
+                        return Ok(0);
+                    }
+                    actions.push(ReconcileAction::Skip { seq: item.seq });
+                    continue;
+                }
+            };
+        if !policy.is_current() {
+            return Ok(0);
+        }
+        let ciphertext = match client.get_blob(access, &blob_id).await {
+            Ok(c) => c,
+            Err(_) => {
+                if !policy.is_current() {
+                    return Ok(0);
+                }
+                actions.push(ReconcileAction::Skip { seq: item.seq });
+                continue;
+            }
+        };
+        if !policy.is_current() {
+            return Ok(0);
+        }
+        if ciphertext.len() > murmur_protocol::caps::MAX_ORG_ITEM_BLOB_BYTES {
+            actions.push(ReconcileAction::Skip { seq: item.seq });
+            continue;
+        }
+        let env = match crate::share::org_envelope::open_org_envelope(
+            &ock,
+            &ciphertext,
+            &org.org_id,
+            &item_nonce,
+        ) {
+            Ok(e) => e,
+            Err(_) => {
+                actions.push(ReconcileAction::Skip { seq: item.seq });
+                continue;
+            }
+        };
+        if env.content_sha256() != sha {
+            actions.push(ReconcileAction::Skip { seq: item.seq });
+            continue;
+        }
+        let (local_markdown, incoming_attachments) =
+            match prepare_incoming_attachment_bundle(&env.markdown, &env.attachments) {
+                Ok(bundle) => bundle,
+                Err(_) => {
+                    actions.push(ReconcileAction::Skip { seq: item.seq });
+                    continue;
+                }
+            };
+        let mut env = env;
+        env.markdown = local_markdown;
+        env.attachments.clear();
+        actions.push(ReconcileAction::Ingest {
+            item_id: item.item_id.clone(),
+            seq: item.seq,
+            rev: item.rev,
+            generation: item.generation,
+            env: Box::new(env),
+            attachments: incoming_attachments,
+            sha,
+            author_user_id: item.author_user_id.clone(),
+        });
+    }
+
+    // ── APPLY — on the blocking pool, through the ONE global heavy-inference gate (same discipline
+    // as the live ingest: an embed is a Metal forward pass and must never run ungated inline).
+    let db = state.db.clone();
+    let org_id = org.org_id.clone();
+    let background_epoch = policy.background_epoch;
+    let (changed, progress) = crate::perf::run_heavy(
+        &state.heavy_inference,
+        move || -> Result<(u32, u64), AppError> {
+            let embedder: Option<Box<dyn crate::embed::Embedder>> = match background_epoch {
+                Some(epoch) => crate::embed::background_persistence_embedder(epoch).ok(),
+                None => crate::embed::active_persistence_embedder_if_available(),
+            };
+            let embedder_ref: Option<&dyn crate::embed::Embedder> = embedder.as_deref();
+            let mut changed = 0u32;
+            let mut progress = cursor;
+            for action in actions {
+                if !policy.is_current() {
+                    break;
+                }
+                match action {
+                    ReconcileAction::Skip { seq } => progress = seq,
+                    ReconcileAction::Evict { item_id, seq } => {
+                        let Some(evicted) = policy.commit(|| db.evict_org_item(&item_id))? else {
+                            break;
+                        };
+                        if evicted {
+                            changed += 1;
+                        }
+                        progress = seq;
+                    }
+                    ReconcileAction::Ingest {
+                        item_id,
+                        seq,
+                        rev,
+                        generation,
+                        env,
+                        attachments,
+                        sha,
+                        author_user_id,
+                    } => {
+                        let env = *env;
+                        let prepared = match crate::storage::Db::prepare_org_item_index(
+                            &env.title,
+                            &env.created_at,
+                            &env.markdown,
+                            embedder_ref,
+                        ) {
+                            Ok(prepared) => prepared,
+                            // The sweep is a background repair, never the user's critical path: a
+                            // model that refuses right now degrades to an honest FTS-only write
+                            // rather than stalling the walk. The normal embed backlog repair in the
+                            // live pull fills the vectors in later.
+                            Err(AppError::Unavailable(_)) => crate::storage::Db::prepare_org_item_index(
+                                &env.title,
+                                &env.created_at,
+                                &env.markdown,
+                                None,
+                            )?,
+                            Err(e) => return Err(e),
+                        };
+                        let author_ref = if author_user_id.is_empty() {
+                            None
+                        } else {
+                            Some(author_user_id.as_str())
+                        };
+                        let Some(applied) = policy.commit(|| {
+                            let applied = db.commit_org_reconcile_item(
+                                &item_id,
+                                &org_id,
+                                seq,
+                                &env.author_hint,
+                                &env.title,
+                                &env.markdown,
+                                &env.created_at,
+                                rev,
+                                generation,
+                                &sha,
+                                env.source_kind
+                                    .map(crate::share::org_envelope::OrgSourceKind::as_str),
+                                author_ref,
+                                &prepared,
+                            )?;
+                            if applied {
+                                db.replace_org_item_attachment_bundle(&item_id, &attachments)?;
+                            }
+                            Ok(applied)
+                        })?
+                        else {
+                            break;
+                        };
+                        if applied {
+                            changed += 1;
+                        }
+                        progress = seq;
+                    }
+                }
+            }
+            Ok((changed, progress))
+        },
+    )
+    .await?;
+
+    if progress > cursor
+        && policy
+            .commit(|| state.db.set_org_reconcile_seq(&org.org_id, progress))?
+            .is_none()
+    {
+        return Ok(changed);
+    }
+    if changed > 0 {
+        tracing::info!(target: "org", changed, "org reconcile sweep converged local replica");
+    }
+    Ok(changed)
 }
 
 /// Re-derive `author_user_id` for the oldest bounded batch of locally-held LIVE items still missing
