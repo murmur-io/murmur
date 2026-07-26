@@ -712,9 +712,15 @@ export class IpcService {
     return invoke<void>("share_document_to_org", { documentId, orgId, scrub });
   }
 
-  /** This user's outgoing org shares (drives the "In Org Brain" state + per-item revoke). */
-  listOrgShares(): Promise<OrgShareEntry[]> {
-    return invoke<OrgShareEntry[]>("list_org_shares");
+  /**
+   * This user's outgoing shares INTO ONE org (drives the "In Org Brain" state + per-item revoke).
+   *
+   * `orgId` is REQUIRED (2026-07-26): the backend used to ignore the caller entirely and answer with
+   * the FIRST locally-joined org's shares, so in a multi-org account this read silently described the
+   * wrong org. An unjoined/unknown id resolves to `[]`, never another org's rows.
+   */
+  listOrgShares(orgId: string): Promise<OrgShareEntry[]> {
+    return invoke<OrgShareEntry[]>("list_org_shares", { orgId });
   }
 
   /**
@@ -762,9 +768,16 @@ export class IpcService {
     return invoke<OrgSyncReport>("org_sync_now", { orgId });
   }
 
-  /** The full decrypted org item for the read-only viewer route. */
-  orgGetItem(itemId: string): Promise<OrgItemDetail> {
-    return invoke<OrgItemDetail>("org_get_item", { itemId });
+  /**
+   * The full decrypted org item for the read-only viewer route.
+   *
+   * `null` when the item is unknown, TOMBSTONED (withdrawn from the org), or its org is disabled on
+   * this instance — the backend has always returned `Option<OrgItemDetail>`; the signature used to
+   * claim otherwise, which is how a withdrawn item could go on being rendered. Callers MUST treat
+   * `null` as "no longer available", not as an error.
+   */
+  orgGetItem(itemId: string): Promise<OrgItemDetail | null> {
+    return invoke<OrgItemDetail | null>("org_get_item", { itemId });
   }
 
   /**

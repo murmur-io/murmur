@@ -52,6 +52,19 @@
       <p class="empty-title">Couldn't load this item</p>
       <p class="empty">{{ err }}</p>
     </div>
+  } @else if (removed()) {
+    <!-- Withdrawn from the org while this tab was open (or a stale link to an
+         already-withdrawn item). The content is dropped, not merely hidden. -->
+    <div class="oi-state card" data-testid="org-item-removed">
+      <p class="empty-title">This shared note is no longer available</p>
+      <p class="empty">
+        It was removed from the Org Brain, so its content is no longer on this
+        device.
+      </p>
+      <button type="button" class="btn btn-ghost" (click)="back()">
+        Back to Notes
+      </button>
+    </div>
   } @else if (item(); as it) {
     <article class="card oi-card">
       <header class="oi-head">

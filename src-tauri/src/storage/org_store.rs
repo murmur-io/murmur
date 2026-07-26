@@ -42,6 +42,15 @@ pub(crate) struct PreparedOrgItemIndex {
 /// buffer. Ordered chunk ids plus the canonical item version/hash form the optimistic concurrency
 /// token for the vector-only commit (SQLite rowids may be reused after a clean replace, so ids alone
 /// are insufficient).
+/// What this device currently holds for ONE org item id — the minimum the anti-entropy reconcile
+/// sweep needs to decide "already converged, skip" vs "fetch + ingest" WITHOUT downloading a blob.
+/// Content-free: a tombstone flag plus the opaque plaintext hash the publisher sealed under.
+#[derive(Clone, Debug)]
+pub(crate) struct OrgReplicaState {
+    pub(crate) tombstoned: bool,
+    pub(crate) content_sha256: Option<Vec<u8>>,
+}
+
 pub(crate) struct OrgItemVectorBatch {
     pub(crate) item_id: String,
     pub(crate) chunk_ids: Vec<i64>,
@@ -884,7 +893,7 @@ impl Db {
         }
 
         if let Some(old_item_id) = superseded_item_id.filter(|old| *old != item_id) {
-            Self::tombstone_org_item_tx(&tx, old_item_id)?;
+            let _evicted = Self::tombstone_org_item_tx(&tx, old_item_id)?;
         }
         tx.commit().map_err(map_err)?;
         Ok(())
@@ -1025,15 +1034,11 @@ impl Db {
         Ok(())
     }
 
-    /// TOMBSTONE an org item: mark the row `tombstoned=1` and DROP its chunks/vectors/FTS so the item
-    /// vanishes from retrieval, while the tombstone row keeps a re-pull idempotent (a later feed entry
-    /// for the same id is a no-op). Idempotent — tombstoning an unknown/already-tombstoned id is fine.
+    /// TOMBSTONE an org item — the discard-the-result alias of the ONE eviction primitive
+    /// [`Db::evict_org_item`]. Kept as the historical name used by `delete_org_item_as_author`.
+    /// Idempotent — tombstoning an unknown/already-tombstoned id is fine.
     pub fn tombstone_org_item(&self, item_id: &str) -> Result<()> {
-        let mut conn = self.lock();
-        let tx = conn.transaction().map_err(map_err)?;
-        Self::tombstone_org_item_tx(&tx, item_id)?;
-        tx.commit().map_err(map_err)?;
-        Ok(())
+        self.evict_org_item(item_id).map(|_| ())
     }
 
     /// Commit one tombstone and its exact feed sequence atomically. Later page entries remain
@@ -1049,7 +1054,7 @@ impl Db {
         if !Self::claim_org_feed_seq_tx(&tx, org_id, seq)? {
             return Ok(false);
         }
-        Self::tombstone_org_item_tx(&tx, item_id)?;
+        let _evicted = Self::tombstone_org_item_tx(&tx, item_id)?;
         tx.commit().map_err(map_err)?;
         Ok(true)
     }
@@ -1066,14 +1071,48 @@ impl Db {
         Ok(true)
     }
 
-    fn tombstone_org_item_tx(tx: &rusqlite::Transaction<'_>, item_id: &str) -> Result<()> {
+    /// EVICT one org item from this device's decrypted replica — the SINGLE eviction primitive every
+    /// withdrawal path goes through (feed tombstone, the anti-entropy reconcile sweep, a local
+    /// `revoke_org_share`, and a republish superseding its predecessor). Returns `true` when a LIVE
+    /// local row was actually evicted by THIS call (so a caller can count real convergence work);
+    /// `false` for an unknown or already-tombstoned id. Idempotent.
+    ///
+    /// "Evicted" means everything derived from the withdrawn content is gone: chunks + int8 vectors +
+    /// the FTS tokens (via [`Self::purge_org_item_chunks_tx`]'s `_ad` trigger), the plaintext
+    /// `markdown`/`title` columns, AND the item's `note_attachments` image BLOBs. Only the
+    /// `tombstoned = 1` header row survives, so a later re-pull of the same append-only id stays a
+    /// no-op instead of resurrecting the content.
+    pub fn evict_org_item(&self, item_id: &str) -> Result<bool> {
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        let evicted = Self::tombstone_org_item_tx(&tx, item_id)?;
+        tx.commit().map_err(map_err)?;
+        Ok(evicted)
+    }
+
+    /// The in-transaction body of [`Db::evict_org_item`]. Returns whether a LIVE row was evicted.
+    fn tombstone_org_item_tx(tx: &rusqlite::Transaction<'_>, item_id: &str) -> Result<bool> {
+        let was_live: bool = tx
+            .query_row(
+                "SELECT tombstoned FROM org_items WHERE item_id = ?1",
+                rusqlite::params![item_id],
+                |r| Ok(r.get::<_, i64>(0)? == 0),
+            )
+            .optional()
+            .map_err(map_err)?
+            .unwrap_or(false);
         Self::purge_org_item_chunks_tx(tx, item_id)?;
+        // Withdrawn colleague IMAGES must go with the text. `note_attachments.org_item_id` only
+        // CASCADEs on a row DELETE, and a tombstone is an UPDATE — so without this the plaintext
+        // image BLOBs of a revoked item survived forever. Purged inside the same transaction as the
+        // text so no reader can ever observe one half of the eviction.
+        Self::purge_org_item_attachments_tx(tx, item_id)?;
         tx.execute(
             "UPDATE org_items SET tombstoned = 1, markdown = '', title = '' WHERE item_id = ?1",
             rusqlite::params![item_id],
         )
         .map_err(map_err)?;
-        Ok(())
+        Ok(was_live)
     }
 
     /// Atomically require live membership and claim a strictly newer action sequence. A zero-row
@@ -1504,6 +1543,147 @@ impl Db {
             .get_org_state(org_id)?
             .map(|s| s.last_seq.max(0) as u64)
             .unwrap_or(0))
+    }
+
+    // ── ANTI-ENTROPY RECONCILE (2026-07-26) ───────────────────────────────────────────────────────
+    // A SECOND, slow cursor per org, wholly independent of the live `last_seq` pull cursor. The
+    // server tombstones an item WITHOUT minting a fresh `seq`, and the feed is `seq > cursor` — so a
+    // member already past that seq NEVER sees the tombstone on the live cursor and keeps a searchable
+    // decrypted replica of withdrawn content forever. This cursor restarts at 0 and walks the whole
+    // feed in small bounded steps so every record is eventually re-observed. NOTHING here writes
+    // `last_seq`: the live pull's position is never rewound or clobbered.
+
+    /// How far the slow reconcile walk has got in the CURRENT pass (0 = at the start of a pass).
+    /// Returns 0 for an unknown org.
+    pub fn org_reconcile_seq_for(&self, org_id: &str) -> Result<u64> {
+        let conn = self.lock();
+        Ok(conn
+            .query_row(
+                "SELECT reconcile_seq FROM org_state WHERE org_id = ?1",
+                rusqlite::params![org_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(map_err)?
+            .map(|s| s.max(0) as u64)
+            .unwrap_or(0))
+    }
+
+    /// Advance the reconcile cursor. A no-op for an unknown org (a leave mid-sweep must not
+    /// resurrect state). Deliberately NOT monotonic-guarded: a pass legitimately restarts at 0.
+    pub fn set_org_reconcile_seq(&self, org_id: &str, seq: u64) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE org_state SET reconcile_seq = ?2 WHERE org_id = ?1",
+            rusqlite::params![org_id, seq as i64],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Mark a FULL pass complete: stamp `reconcile_pass_at` and rewind the reconcile cursor to 0 so
+    /// the next pass starts again from the head of the feed. `last_seq` is untouched.
+    pub fn complete_org_reconcile_pass(&self, org_id: &str, at: &str) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE org_state SET reconcile_seq = 0, reconcile_pass_at = ?2 WHERE org_id = ?1",
+            rusqlite::params![org_id, at],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// RFC3339 stamp of the last COMPLETED reconcile pass, or `None` when none has finished yet.
+    pub fn org_reconcile_pass_at(&self, org_id: &str) -> Result<Option<String>> {
+        let conn = self.lock();
+        Ok(conn
+            .query_row(
+                "SELECT reconcile_pass_at FROM org_state WHERE org_id = ?1",
+                rusqlite::params![org_id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(map_err)?
+            .flatten())
+    }
+
+    /// What this device currently holds for one org item, so the reconcile sweep can decide whether a
+    /// live feed record needs a blob fetch at all. `None` ⇒ the item is not held locally.
+    pub(crate) fn org_replica_state(&self, item_id: &str) -> Result<Option<OrgReplicaState>> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT tombstoned, content_sha256 FROM org_items WHERE item_id = ?1",
+            rusqlite::params![item_id],
+            |r| {
+                Ok(OrgReplicaState {
+                    tombstoned: r.get::<_, i64>(0)? != 0,
+                    content_sha256: r.get::<_, Option<Vec<u8>>>(1)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(map_err)
+    }
+
+    /// Commit one already-prepared live item found by the RECONCILE sweep. Identical to
+    /// [`Db::commit_org_feed_item`] except it NEVER touches `org_state.last_seq` — the sweep walks
+    /// sequences that are (usually) already behind the live cursor, so claiming them would rewind or
+    /// no-op the live pull. Membership is still required in the SAME transaction (a leave mid-sweep
+    /// must not resurrect plaintext), and an existing tombstone is still permanent.
+    ///
+    /// Returns `true` when the row was actually (re)written.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn commit_org_reconcile_item(
+        &self,
+        item_id: &str,
+        org_id: &str,
+        seq: u64,
+        author_hint: &str,
+        title: &str,
+        markdown: &str,
+        created_at: &str,
+        rev: u32,
+        generation: u32,
+        content_sha256: &[u8],
+        source_kind: Option<&str>,
+        author_user_id: Option<&str>,
+        prepared: &PreparedOrgItemIndex,
+    ) -> Result<bool> {
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_err)?;
+        if !Self::org_membership_exists_tx(&tx, org_id)? {
+            return Ok(false);
+        }
+        let already_tombstoned = tx
+            .query_row(
+                "SELECT tombstoned FROM org_items WHERE item_id = ?1",
+                rusqlite::params![item_id],
+                |r| Ok(r.get::<_, i64>(0)? != 0),
+            )
+            .optional()
+            .map_err(map_err)?
+            .unwrap_or(false);
+        if already_tombstoned {
+            return Ok(false);
+        }
+        Self::upsert_org_item_prepared_tx(
+            &tx,
+            item_id,
+            org_id,
+            seq,
+            author_hint,
+            title,
+            markdown,
+            created_at,
+            rev,
+            generation,
+            content_sha256,
+            source_kind,
+            author_user_id,
+            prepared,
+        )?;
+        tx.commit().map_err(map_err)?;
+        Ok(true)
     }
 
     /// GATED-FREE (no folder lock applies to org items) semantic KNN over the int8 org partition:
