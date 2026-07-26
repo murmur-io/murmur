@@ -973,6 +973,54 @@ export class IpcService {
     return invoke<boolean>("has_slack_token");
   }
 
+  /**
+   * brain2 connectors — grant the one-time consent for NOTION egress. The ONLY supported way to
+   * flip `notionConsented` true: the backend persists the flag AND updates its in-memory config
+   * cache, so the next brain/Ask answer may expose the Notion connector (provided Notion is enabled
+   * AND an integration token is stored). Idempotent. Mirrors {@link consentToSlack}.
+   */
+  consentToNotion(): Promise<void> {
+    return invoke<void>("consent_to_notion");
+  }
+
+  /**
+   * brain2 connectors — store/replace the BYO Notion integration token in the Keychain. An empty
+   * string clears it. NEVER logged / NEVER returned to the FE — only {@link hasNotionToken} reports
+   * presence. Mirrors {@link setSlackToken}.
+   */
+  setNotionToken(key: string): Promise<void> {
+    return invoke<void>("set_notion_token", { key });
+  }
+
+  /** Whether a Notion integration token is currently stored. Never the value. */
+  hasNotionToken(): Promise<boolean> {
+    return invoke<boolean>("has_notion_token");
+  }
+
+  /**
+   * brain2 connectors — grant the one-time consent for CLICKUP egress. The ONLY supported way to
+   * flip `clickupConsented` true: the backend persists the flag AND updates its in-memory config
+   * cache, so the next brain/Ask answer may expose the ClickUp connector (provided ClickUp is
+   * enabled AND a workspace id + token are configured). Idempotent. Mirrors {@link consentToNotion}.
+   */
+  consentToClickup(): Promise<void> {
+    return invoke<void>("consent_to_clickup");
+  }
+
+  /**
+   * brain2 connectors — store/replace the BYO ClickUp personal API token in the Keychain. An empty
+   * string clears it. NEVER logged / NEVER returned to the FE — only {@link hasClickupToken}
+   * reports presence. Mirrors {@link setNotionToken}.
+   */
+  setClickupToken(key: string): Promise<void> {
+    return invoke<void>("set_clickup_token", { key });
+  }
+
+  /** Whether a ClickUp API token is currently stored. Never the value. */
+  hasClickupToken(): Promise<boolean> {
+    return invoke<boolean>("has_clickup_token");
+  }
+
   providerStatuses(): Promise<ProviderStatus[]> {
     return invoke<ProviderStatus[]>("provider_statuses");
   }
