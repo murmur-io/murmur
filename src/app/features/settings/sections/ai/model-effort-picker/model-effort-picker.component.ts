@@ -10,7 +10,12 @@ import type { BrainModelDto } from "../../../../../core/models";
 import { SettingsStore } from "../../../settings.store";
 import { MurProgressComponent } from "../../../../../design-system/progress/progress.component";
 
-/** The two on-device model FAMILIES, split by model name (Bielik = Polish-native). */
+/**
+ * The two on-device model FAMILIES, split by the model's own LANGUAGE TAGS:
+ * a row that does not advertise `"multi"` is Polish-native. Do NOT reintroduce
+ * the retired name sniff (`name.includes("bielik")`) — the tags are the
+ * catalog's own declaration, so a new Polish model needs no code change here.
+ */
 type Family = "multi" | "pl";
 
 /**
