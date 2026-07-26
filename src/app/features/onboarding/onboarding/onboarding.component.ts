@@ -58,6 +58,17 @@ const CLOUD_PROVIDER_IDS: readonly string[] = [
 /** The local-posture provider — Ollama running on THIS Mac (loopback). */
 const LOCAL_PROVIDER_ID = "ollama";
 
+/**
+ * Read the DISPLAY-ONLY `liveCompanionPending` probe off a config snapshot through a narrow
+ * structural cast: `get_config` fills it, but a settings SAVE can neither set nor clear it, so it is
+ * not part of the settings-shaped `AppConfigDto` the wizard round-trips. A backend (or a mock) that
+ * doesn't send it reads as `false` — disclose nothing rather than promise a transfer.
+ */
+function liveCompanionPendingOf(cfg: AppConfigDto): boolean {
+  return (cfg as AppConfigDto & { liveCompanionPending?: boolean })
+    .liveCompanionPending === true;
+}
+
 /** Approx download size per Whisper quality (mirrors Settings). */
 const SIZE_HINTS: Record<string, string> = {
   tiny: "~75 MB",
@@ -104,6 +115,18 @@ export class OnboardingComponent implements OnInit {
   readonly downloading = signal(false);
   readonly downloadError = signal<string | null>(null);
   readonly sizeHint = computed(() => SIZE_HINTS[this.modelSize()] ?? "");
+  /**
+   * Will `download_model` ALSO fetch a small live-caption model beside the chosen one? Read
+   * STRAIGHT FROM THE BACKEND (`AppConfigDto.liveCompanionPending`, filled in by `get_config` from
+   * the very decision the download makes) rather than re-derived here: the rule is not just "is the
+   * chosen quality heavy" — it also depends on the live-model pin being enabled and light, and on
+   * nothing live-safe already being on disk. An FE copy of half of it promised transfers the
+   * backend would skip. Refreshed after every persist, so it always describes the SAVED selection
+   * this download will actually use.
+   *
+   * Say it out loud so the download is never bigger than the wizard admitted.
+   */
+  readonly liveCompanionPending = signal(false);
   /** 0..1 download progress for the in-flight model (best-effort from events). */
   readonly downloadFrac = signal(0);
   /** Whole-percent label for the in-flight model download. */
@@ -241,6 +264,7 @@ export class OnboardingComponent implements OnInit {
     try {
       const cfg = await this.ipc.getConfig();
       this.loadedConfig = cfg;
+      this.liveCompanionPending.set(liveCompanionPendingOf(cfg));
       this.language.set(cfg.language ?? "");
       this.modelSize.set(cfg.modelSize ?? "small");
       this.provider.set(cfg.providerId ?? "claude_code");
@@ -292,6 +316,7 @@ export class OnboardingComponent implements OnInit {
     if (step === "model") {
       await this.persistConfig();
       this.modelPresent.set(await this.ipc.modelPresent());
+      await this.refreshLiveCompanionPending();
     } else if (step === "provider") {
       await this.recheckProviders();
     }
@@ -329,6 +354,25 @@ export class OnboardingComponent implements OnInit {
     const present = await this.ipc.modelPresent();
     if (requestId !== this.modelPresenceRequestId) return; // superseded mid-flight
     this.modelPresent.set(present);
+    // The companion disclosure describes the SAVED selection, so it is refreshed inside the same
+    // guarded sequence — a late answer for an abandoned selection must not land either.
+    const pending = await this.readLiveCompanionPending();
+    if (requestId !== this.modelPresenceRequestId) return; // superseded mid-flight
+    this.liveCompanionPending.set(pending);
+  }
+
+  /** Re-read the backend's companion decision for the currently SAVED language + size. */
+  private async refreshLiveCompanionPending(): Promise<void> {
+    this.liveCompanionPending.set(await this.readLiveCompanionPending());
+  }
+
+  /** `liveCompanionPending` from a fresh `get_config`; any failure discloses nothing. */
+  private async readLiveCompanionPending(): Promise<boolean> {
+    try {
+      return liveCompanionPendingOf(await this.ipc.getConfig());
+    } catch {
+      return false;
+    }
   }
 
   async downloadModel(): Promise<void> {
@@ -340,6 +384,8 @@ export class OnboardingComponent implements OnInit {
       await this.persistConfig();
       await this.ipc.downloadModel();
       this.modelPresent.set(await this.ipc.modelPresent());
+      // The companion has landed (or was never needed) — stop promising a second transfer.
+      await this.refreshLiveCompanionPending();
     } catch (e) {
       this.downloadError.set(String(e));
     } finally {
