@@ -25,7 +25,7 @@ use rusqlite::OptionalExtension;
 
 use crate::embed::Embedder;
 use crate::error::Result;
-use crate::storage::db::{fts_match_query, map_err, Db};
+use crate::storage::db::{fts_match_query, fts_match_query_any, map_err, Db};
 use crate::storage::models::OrgChunkHit;
 
 /// Chunk/vector material for one org item, prepared before entering the short feed-commit
@@ -1515,7 +1515,18 @@ impl Db {
     /// disabled org's chunks are EXCLUDED at the SQL level, never read into Rust at all. This is the
     /// hard data-level gate (not a UI hide): a caller cannot accidentally surface a disabled org's
     /// content by forgetting to filter it downstream.
-    pub fn search_org_chunks_knn(&self, query_vec: &[f32], k: i64) -> Result<Vec<OrgChunkHit>> {
+    ///
+    /// `min_cosine` (S1) is the OPT-IN relevance floor for the int8 leg. The stored vectors are
+    /// `round(unit·127)`, so the vec0 L2 distance is over 127-scaled vectors — divide by `127.0`
+    /// BEFORE the cosine map (`cos ≈ cosine_from_l2_distance(d/127)`; a DIFFERENT distribution from
+    /// the f32 legs, hence its own const). Sentinel `0.0` = NO floor. Applied AFTER the
+    /// tombstone/context-enabled SQL gate — it can only ever REMOVE below-floor rows.
+    pub fn search_org_chunks_knn(
+        &self,
+        query_vec: &[f32],
+        k: i64,
+        min_cosine: f32,
+    ) -> Result<Vec<OrgChunkHit>> {
         if query_vec.is_empty() || k <= 0 {
             return Ok(Vec::new());
         }
@@ -1538,16 +1549,32 @@ impl Db {
         let mut stmt = conn.prepare(sql).map_err(map_err)?;
         let rows = stmt
             .query_map(rusqlite::params![blob, k], |row| {
-                Ok(OrgChunkHit {
+                let hit = OrgChunkHit {
                     item_id: row.get(0)?,
                     author_hint: row.get(1)?,
                     title: row.get(2)?,
                     snippet: row.get(3)?,
                     content_sha256: row.get::<_, Option<Vec<u8>>>(4)?.unwrap_or_default(),
-                })
+                };
+                let distance: f64 = row.get(5)?;
+                Ok((hit, distance))
             })
             .map_err(map_err)?;
-        Self::dedup_org_hits_by_item(rows)
+        // Drop below-floor candidates BEFORE the per-item dedup so the winner is the nearest survivor.
+        // int8 rescale: the distance is over 127-scaled vectors ⇒ divide by 127 before the cosine map.
+        let filtered = rows.filter_map(|r| match r {
+            Ok((hit, distance)) => {
+                if min_cosine > 0.0
+                    && crate::links::cosine_from_l2_distance((distance as f32) / 127.0) < min_cosine
+                {
+                    None
+                } else {
+                    Some(Ok(hit))
+                }
+            }
+            Err(e) => Some(Err(e)),
+        });
+        Self::dedup_org_hits_by_item(filtered)
     }
 
     /// KEYWORD (FTS5/BM25) leg over the org partition — the model-free twin of
@@ -1562,7 +1589,8 @@ impl Db {
         if limit <= 0 {
             return Ok(Vec::new());
         }
-        let Some(match_expr) = fts_match_query(query.trim()) else {
+        let q = query.trim();
+        let Some(and_expr) = fts_match_query(q) else {
             return Ok(Vec::new()); // punctuation-only / empty query → no hits, never an FTS error.
         };
         let conn = self.lock();
@@ -1579,18 +1607,36 @@ impl Db {
               ORDER BY rank ASC, oi.item_id ASC
               LIMIT ?2";
         let mut stmt = conn.prepare(sql).map_err(map_err)?;
-        let rows = stmt
-            .query_map(rusqlite::params![match_expr, sql_cap], |row| {
-                Ok(OrgChunkHit {
-                    item_id: row.get(0)?,
-                    author_hint: row.get(1)?,
-                    title: row.get(2)?,
-                    snippet: row.get(3)?,
-                    content_sha256: row.get::<_, Option<Vec<u8>>>(4)?.unwrap_or_default(),
+        // Collect the (already-gated) candidate rows for a given match expression.
+        let run = |stmt: &mut rusqlite::Statement, expr: &str| -> Result<Vec<OrgChunkHit>> {
+            let rows = stmt
+                .query_map(rusqlite::params![expr, sql_cap], |row| {
+                    Ok(OrgChunkHit {
+                        item_id: row.get(0)?,
+                        author_hint: row.get(1)?,
+                        title: row.get(2)?,
+                        snippet: row.get(3)?,
+                        content_sha256: row.get::<_, Option<Vec<u8>>>(4)?.unwrap_or_default(),
+                    })
                 })
-            })
-            .map_err(map_err)?;
-        let mut hits = Self::dedup_org_hits_by_item(rows)?;
+                .map_err(map_err)?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r.map_err(map_err)?);
+            }
+            Ok(out)
+        };
+        // S2 AND→OR fallback: implicit-AND matched nothing ⇒ retry with the content-word OR twin.
+        // Fires only on an empty AND result — never widens a successful query.
+        let mut rows_vec = run(&mut stmt, &and_expr)?;
+        if rows_vec.is_empty() {
+            if let Some(any_expr) = fts_match_query_any(q) {
+                if any_expr != and_expr {
+                    rows_vec = run(&mut stmt, &any_expr)?;
+                }
+            }
+        }
+        let mut hits = Self::dedup_org_hits_by_item(rows_vec.into_iter().map(Ok))?;
         hits.truncate(limit as usize);
         Ok(hits)
     }

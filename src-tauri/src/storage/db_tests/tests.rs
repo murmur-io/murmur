@@ -307,7 +307,7 @@ fn org_ingest_round_trips_through_int8_knn_and_fts() {
         .embed_query(&["apollo budget".to_string()])
         .unwrap()
         .remove(0);
-    let knn = db.search_org_chunks_knn(&qv, 10).unwrap();
+    let knn = db.search_org_chunks_knn(&qv, 10, 0.0).unwrap();
     assert!(
         knn.iter().any(|h| h.item_id == "it-1"),
         "int8 KNN must retrieve the ingested item"
@@ -352,7 +352,7 @@ fn org_ingest_fts_only_when_no_embedder() {
         .embed_query(&["hiring platform".to_string()])
         .unwrap()
         .remove(0);
-    let knn = db.search_org_chunks_knn(&qv, 10).unwrap();
+    let knn = db.search_org_chunks_knn(&qv, 10, 0.0).unwrap();
     assert!(knn.is_empty(), "no int8 vectors when ingested FTS-only");
 
     // The re-embed backlog lists exactly this item.
@@ -911,7 +911,7 @@ fn org_tombstone_evicts_from_retrieval_and_viewer() {
         .unwrap()
         .remove(0);
     assert!(
-        db.search_org_chunks_knn(&qv, 10).unwrap().is_empty(),
+        db.search_org_chunks_knn(&qv, 10, 0.0).unwrap().is_empty(),
         "tombstoned item must vanish from KNN"
     );
     assert!(
@@ -1016,7 +1016,7 @@ fn purge_org_replica_drops_the_whole_decrypted_replica() {
         .embed_query(&["falcon rollout".to_string()])
         .unwrap()
         .remove(0);
-    let knn = db.search_org_chunks_knn(&qv, 10).unwrap();
+    let knn = db.search_org_chunks_knn(&qv, 10, 0.0).unwrap();
     assert!(
         knn.iter()
             .all(|h| h.item_id != "it-a" && h.item_id != "it-b"),
@@ -1269,7 +1269,7 @@ fn disabled_org_is_excluded_from_both_retrieval_legs_while_enabled_org_still_sur
         .embed_query(&["quantum ledger migration".to_string()])
         .unwrap()
         .remove(0);
-    let knn_after = db.search_org_chunks_knn(&qv, 10).unwrap();
+    let knn_after = db.search_org_chunks_knn(&qv, 10, 0.0).unwrap();
     assert!(
         knn_after.iter().all(|h| h.item_id != "it-disabled"),
         "the disabled org's item must be ABSENT from KNN too: {:?}",
@@ -5847,7 +5847,7 @@ fn vec_knn_orders_nearest_first() {
     insert_known_chunk(&db, "m-far", "far", &one_hot(2));
 
     let nothing = std::collections::HashSet::new();
-    let hits = db.search_semantic_visible(&query, 3, &nothing).unwrap();
+    let hits = db.search_semantic_visible(&query, 3, 0.0, &nothing).unwrap();
     let order: Vec<&str> = hits.iter().map(|h| h.meeting.id.as_str()).collect();
     assert_eq!(
         order,
@@ -5876,7 +5876,7 @@ fn vec_semantic_search_is_gated_by_visibility() {
     let query = one_hot(0);
     // Empty unlock set → excluded.
     let nothing = std::collections::HashSet::new();
-    let hidden = db.search_semantic_visible(&query, 10, &nothing).unwrap();
+    let hidden = db.search_semantic_visible(&query, 10, 0.0, &nothing).unwrap();
     assert!(
         !hidden.iter().any(|h| h.meeting.id == "sealed"),
         "sealed-not-unlocked meeting leaked through the semantic gate"
@@ -5884,7 +5884,7 @@ fn vec_semantic_search_is_gated_by_visibility() {
     // Folder session-unlocked → present.
     let mut unlocked = std::collections::HashSet::new();
     unlocked.insert("f-locked".to_string());
-    let shown = db.search_semantic_visible(&query, 10, &unlocked).unwrap();
+    let shown = db.search_semantic_visible(&query, 10, 0.0, &unlocked).unwrap();
     assert!(
         shown.iter().any(|h| h.meeting.id == "sealed"),
         "session-unlocked meeting must reappear in semantic results"
@@ -5911,7 +5911,7 @@ fn vec_hybrid_search_is_gated_by_visibility() {
     // Empty unlock set → the sealed meeting is absent through the whole fused reader.
     let nothing = std::collections::HashSet::new();
     let hidden = db
-        .search_hybrid_visible("budget", &query_vec, 10, &nothing, None)
+        .search_hybrid_visible("budget", &query_vec, 10, 0.0, &nothing, None)
         .unwrap();
     assert!(
         !hidden.iter().any(|h| h.meeting.id == "sealed"),
@@ -5922,7 +5922,7 @@ fn vec_hybrid_search_is_gated_by_visibility() {
     let mut unlocked = std::collections::HashSet::new();
     unlocked.insert("f-locked".to_string());
     let shown = db
-        .search_hybrid_visible("budget", &query_vec, 10, &unlocked, None)
+        .search_hybrid_visible("budget", &query_vec, 10, 0.0, &unlocked, None)
         .unwrap();
     assert!(
         shown.iter().any(|h| h.meeting.id == "sealed"),
@@ -6322,7 +6322,7 @@ fn doc_chunk_search_is_gated_by_visibility() {
     // Open folder → visible.
     let nothing = std::collections::HashSet::new();
     assert!(
-        db.search_doc_chunks_visible(&query, 10, &nothing)
+        db.search_doc_chunks_visible(&query, 10, 0.0, &nothing)
             .unwrap()
             .iter()
             .any(|h| h.document_id == "d1"),
@@ -6331,7 +6331,7 @@ fn doc_chunk_search_is_gated_by_visibility() {
 
     // Seal the folder (chunk row deliberately survives) → INVISIBLE with empty unlock set.
     db.set_folder_locked("f-locked", true, None).unwrap();
-    let hidden = db.search_doc_chunks_visible(&query, 10, &nothing).unwrap();
+    let hidden = db.search_doc_chunks_visible(&query, 10, 0.0, &nothing).unwrap();
     assert!(
         !hidden.iter().any(|h| h.document_id == "d1"),
         "sealed-not-unlocked document chunk leaked through the gate"
@@ -6340,7 +6340,7 @@ fn doc_chunk_search_is_gated_by_visibility() {
     // Session-unlock → present again.
     let mut unlocked = std::collections::HashSet::new();
     unlocked.insert("f-locked".to_string());
-    let shown = db.search_doc_chunks_visible(&query, 10, &unlocked).unwrap();
+    let shown = db.search_doc_chunks_visible(&query, 10, 0.0, &unlocked).unwrap();
     assert!(
         shown.iter().any(|h| h.document_id == "d1"),
         "session-unlocked document chunk must reappear in search"
@@ -9532,7 +9532,7 @@ fn transcript_chunks_are_gated_by_visibility_semantic() {
 
     let query = one_hot(0);
     let nothing = std::collections::HashSet::new();
-    let hidden = db.search_semantic_visible(&query, 10, &nothing).unwrap();
+    let hidden = db.search_semantic_visible(&query, 10, 0.0, &nothing).unwrap();
     assert!(
         !hidden.iter().any(|h| h.meeting.id == "sealed"),
         "sealed meeting's TRANSCRIPT chunk leaked through the semantic gate"
@@ -9540,7 +9540,7 @@ fn transcript_chunks_are_gated_by_visibility_semantic() {
     // Session-unlock → it reappears (proves the row + gate, not purge).
     let mut unlocked = std::collections::HashSet::new();
     unlocked.insert("f-locked".to_string());
-    let shown = db.search_semantic_visible(&query, 10, &unlocked).unwrap();
+    let shown = db.search_semantic_visible(&query, 10, 0.0, &unlocked).unwrap();
     assert!(
         shown.iter().any(|h| h.meeting.id == "sealed"),
         "session-unlocked meeting's transcript chunk must reappear in semantic results"
@@ -9581,7 +9581,7 @@ fn transcript_chunks_are_gated_by_visibility_hybrid() {
     let query_vec = one_hot(0);
     let nothing = std::collections::HashSet::new();
     let hidden = db
-        .search_hybrid_visible("merger", &query_vec, 10, &nothing, None)
+        .search_hybrid_visible("merger", &query_vec, 10, 0.0, &nothing, None)
         .unwrap();
     assert!(
         !hidden.iter().any(|h| h.meeting.id == "sealed"),
@@ -9590,7 +9590,7 @@ fn transcript_chunks_are_gated_by_visibility_hybrid() {
     let mut unlocked = std::collections::HashSet::new();
     unlocked.insert("f-locked".to_string());
     let shown = db
-        .search_hybrid_visible("merger", &query_vec, 10, &unlocked, None)
+        .search_hybrid_visible("merger", &query_vec, 10, 0.0, &unlocked, None)
         .unwrap();
     assert!(
         shown.iter().any(|h| h.meeting.id == "sealed"),
@@ -9655,14 +9655,14 @@ fn transcript_chunks_purged_on_seal() {
     let query = one_hot(0);
     let nothing = std::collections::HashSet::new();
     assert!(
-        !db.search_semantic_visible(&query, 10, &nothing)
+        !db.search_semantic_visible(&query, 10, 0.0, &nothing)
             .unwrap()
             .iter()
             .any(|h| h.meeting.id == "m1"),
         "sealed meeting must not surface via semantic search after purge"
     );
     assert!(
-        !db.search_hybrid_visible("marketing", &query, 10, &nothing, None)
+        !db.search_hybrid_visible("marketing", &query, 10, 0.0, &nothing, None)
             .unwrap()
             .iter()
             .any(|h| h.meeting.id == "m1"),
@@ -9735,7 +9735,7 @@ fn vec_hybrid_fuses_fts_and_vector() {
 
     let nothing = std::collections::HashSet::new();
     let hits = db
-        .search_hybrid_visible("alpha", &query, 10, &nothing, None)
+        .search_hybrid_visible("alpha", &query, 10, 0.0, &nothing, None)
         .unwrap();
     let ids: Vec<&str> = hits.iter().map(|h| h.meeting.id.as_str()).collect();
     // One hit per meeting (dedup).
@@ -9794,14 +9794,14 @@ fn graph_leg_surfaces_co_mentioned_meeting_fts_and_vector_miss() {
     );
     // ... and absent from vector (no chunk at all → empty KNN).
     assert!(
-        db.search_semantic_visible(&empty_vec, 10, &nothing)
+        db.search_semantic_visible(&empty_vec, 10, 0.0, &nothing)
             .unwrap()
             .is_empty(),
         "vector must miss B"
     );
     // The query names entity Atlas → graph leg pulls in its neighbour B.
     let hits = db
-        .search_hybrid_visible("atlas status", &empty_vec, 10, &nothing, None)
+        .search_hybrid_visible("atlas status", &empty_vec, 10, 0.0, &nothing, None)
         .unwrap();
     assert!(
         hits.iter().any(|h| h.meeting.id == "B"),
@@ -9900,7 +9900,7 @@ fn no_entity_match_leaves_hybrid_identical_to_two_leg_fusion() {
 
     // Expected = RRF over EXACTLY the two legs.
     let fts = db.search_visible("budget planning", 10, &nothing).unwrap();
-    let sem = db.search_semantic_visible(&query, 10, &nothing).unwrap();
+    let sem = db.search_semantic_visible(&query, 10, 0.0, &nothing).unwrap();
     let fts_ids: Vec<String> = fts.iter().map(|h| h.meeting.id.clone()).collect();
     let sem_ids: Vec<String> = sem.iter().map(|h| h.meeting.id.clone()).collect();
     let expected: Vec<String> = crate::embed::rrf_fuse(&[fts_ids, sem_ids], crate::embed::RRF_K)
@@ -9909,7 +9909,7 @@ fn no_entity_match_leaves_hybrid_identical_to_two_leg_fusion() {
         .collect();
 
     let got: Vec<String> = db
-        .search_hybrid_visible("budget planning", &query, 10, &nothing, None)
+        .search_hybrid_visible("budget planning", &query, 10, 0.0, &nothing, None)
         .unwrap()
         .into_iter()
         .map(|h| h.meeting.id)
@@ -9946,7 +9946,7 @@ fn three_leg_rrf_ranks_multi_leg_first_and_dedups() {
 
     let nothing = std::collections::HashSet::new();
     let hits = db
-        .search_hybrid_visible("atlas budget", &query, 10, &nothing, None)
+        .search_hybrid_visible("atlas budget", &query, 10, 0.0, &nothing, None)
         .unwrap();
     let ids: Vec<&str> = hits.iter().map(|h| h.meeting.id.as_str()).collect();
     // Dedup: each meeting once.
@@ -10362,7 +10362,7 @@ fn hybrid_date_filter_excludes_out_of_window_lexical_match() {
 
     // RED baseline (no filter): BOTH lexical matches surface.
     let unfiltered = db
-        .search_hybrid_visible("budżet", &[], 10, &nothing, None)
+        .search_hybrid_visible("budżet", &[], 10, 0.0, &nothing, None)
         .unwrap();
     assert!(unfiltered.iter().any(|h| h.meeting.id == "m-in"));
     assert!(
@@ -10373,7 +10373,7 @@ fn hybrid_date_filter_excludes_out_of_window_lexical_match() {
     // GREEN: the "last week of the 2026-06-29 anchor" window excludes m-out on EVERY leg.
     let window = Some(("2026-06-22".to_string(), "2026-06-29".to_string()));
     let filtered = db
-        .search_hybrid_visible("budżet", &[], 10, &nothing, window)
+        .search_hybrid_visible("budżet", &[], 10, 0.0, &nothing, window)
         .unwrap();
     assert!(
         filtered.iter().any(|h| h.meeting.id == "m-in"),
@@ -10834,4 +10834,287 @@ fn note_templates_round_trip() {
 
     db.delete_note_template("tpl-1").unwrap();
     assert!(db.list_note_templates().unwrap().is_empty());
+}
+
+// ── S1 cosine-similarity floor + S2 AND→OR FTS fallback (retrieval-floor-fts-fallback) ──────────
+
+/// Insert a doc-chunk row + its `doc_vec_chunks` embedding under a MEANING-controlled vector (the
+/// document twin of [`insert_known_chunk`]). Used by the S1 floor tests.
+fn insert_known_doc_chunk(db: &Db, document_id: &str, text: &str, vector: &[f32]) -> i64 {
+    let conn = db.lock();
+    conn.execute(
+        "INSERT INTO doc_chunks (document_id, chunk_index, text) VALUES (?1, 0, ?2)",
+        rusqlite::params![document_id, text],
+    )
+    .unwrap();
+    let chunk_id = conn.last_insert_rowid();
+    let blob = crate::embed::vec_to_blob(vector);
+    conn.execute(
+        "INSERT INTO doc_vec_chunks(chunk_id, embedding) VALUES (?1, ?2)",
+        rusqlite::params![chunk_id, blob],
+    )
+    .unwrap();
+    chunk_id
+}
+
+/// Insert an org item + one chunk + its int8 `org_vec_chunks` embedding under a controlled vector
+/// (the KNN leg quantizes to int8, so the stored vector is `round(unit·127)`). `seed_org_state`
+/// must have run first (the reader INNER JOINs `org_state` on `context_enabled = 1`).
+fn insert_known_org_chunk(
+    db: &Db,
+    org_id: &str,
+    item_id: &str,
+    title: &str,
+    text: &str,
+    vector: &[f32],
+) {
+    let conn = db.lock();
+    conn.execute(
+        "INSERT INTO org_items (item_id, org_id, seq, author_hint, title, markdown, created_at, rev, generation, content_sha256, tombstoned)
+             VALUES (?1, ?2, 1, 'anna', ?3, ?4, '2026-07-10T09:00:00Z', 1, 1, NULL, 0)",
+        rusqlite::params![item_id, org_id, title, text],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO org_chunks (item_id, chunk_idx, text) VALUES (?1, 0, ?2)",
+        rusqlite::params![item_id, text],
+    )
+    .unwrap();
+    let chunk_id = conn.last_insert_rowid();
+    let blob = crate::embed::vec_to_int8_blob(vector);
+    conn.execute(
+        "INSERT INTO org_vec_chunks(chunk_id, embedding) VALUES (?1, vec_int8(?2))",
+        rusqlite::params![chunk_id, blob],
+    )
+    .unwrap();
+}
+
+/// S1 Test A (meetings): the cosine floor drops an ORTHOGONAL (cos 0.0) k-nearest neighbour while
+/// keeping the near (cos 1.0) one. Proving BOTH survive with `min_cosine = 0.0` shows the exclusion
+/// is the FLOOR, not the visibility gate.
+#[test]
+fn s1_floor_drops_orthogonal_semantic_neighbour() {
+    let db = mem_db();
+    db.insert_meeting(&sample_meeting("m-near", "2026-06-24T10:00:00Z"))
+        .unwrap();
+    db.insert_meeting(&sample_meeting("m-far", "2026-06-24T11:00:00Z"))
+        .unwrap();
+    note_for(&db, "m-near", "claude_code", "near");
+    note_for(&db, "m-far", "claude_code", "far");
+    insert_known_chunk(&db, "m-near", "near", &one_hot(0)); // cos 1.0 vs query
+    insert_known_chunk(&db, "m-far", "far", &one_hot(2)); // cos 0.0 vs query
+
+    let nothing = std::collections::HashSet::new();
+    let query = one_hot(0);
+
+    // No floor (0.0) → BOTH returned.
+    let all = db.search_semantic_visible(&query, 10, 0.0, &nothing).unwrap();
+    let ids: Vec<&str> = all.iter().map(|h| h.meeting.id.as_str()).collect();
+    assert!(
+        ids.contains(&"m-near") && ids.contains(&"m-far"),
+        "no-floor must return both, got {ids:?}"
+    );
+
+    // Floor 0.75 → only the near (cos 1.0) survives.
+    let floored = db.search_semantic_visible(&query, 10, 0.75, &nothing).unwrap();
+    let fids: Vec<&str> = floored.iter().map(|h| h.meeting.id.as_str()).collect();
+    assert_eq!(
+        fids,
+        vec!["m-near"],
+        "floor must drop the orthogonal filler, got {fids:?}"
+    );
+}
+
+/// S1 Test A (documents): same floor behaviour for the doc-chunk vector leg.
+#[test]
+fn s1_floor_drops_orthogonal_doc_chunk() {
+    let db = mem_db();
+    seed_folder(&db, "f-open", "Project");
+    db.insert_document("d-near", "f-open", "near.md", "near body", "document", 100)
+        .unwrap();
+    db.insert_document("d-far", "f-open", "far.md", "far body", "document", 100)
+        .unwrap();
+    insert_known_doc_chunk(&db, "d-near", "near body", &one_hot(0));
+    insert_known_doc_chunk(&db, "d-far", "far body", &one_hot(2));
+
+    let nothing = std::collections::HashSet::new();
+    let query = one_hot(0);
+
+    let all = db
+        .search_doc_chunks_visible(&query, 10, 0.0, &nothing)
+        .unwrap();
+    let ids: Vec<&str> = all.iter().map(|h| h.document_id.as_str()).collect();
+    assert!(
+        ids.contains(&"d-near") && ids.contains(&"d-far"),
+        "no-floor must return both docs, got {ids:?}"
+    );
+
+    let floored = db
+        .search_doc_chunks_visible(&query, 10, 0.75, &nothing)
+        .unwrap();
+    let fids: Vec<&str> = floored.iter().map(|h| h.document_id.as_str()).collect();
+    assert_eq!(
+        fids,
+        vec!["d-near"],
+        "floor must drop the orthogonal doc, got {fids:?}"
+    );
+}
+
+/// S1 Test A (org int8): the floor drops an orthogonal item on the int8 leg — proving the `/127`
+/// rescale (the int8 vectors are `round(unit·127)`, a different distance distribution).
+#[test]
+fn s1_floor_drops_orthogonal_org_chunk_int8() {
+    let db = mem_db();
+    seed_org_state(&db, "org-1");
+    insert_known_org_chunk(&db, "org-1", "it-near", "Near", "near body", &one_hot(0));
+    insert_known_org_chunk(&db, "org-1", "it-far", "Far", "far body", &one_hot(2));
+
+    let query = one_hot(0);
+
+    let all = db.search_org_chunks_knn(&query, 10, 0.0).unwrap();
+    let ids: Vec<&str> = all.iter().map(|h| h.item_id.as_str()).collect();
+    assert!(
+        ids.contains(&"it-near") && ids.contains(&"it-far"),
+        "no-floor must return both items, got {ids:?}"
+    );
+
+    let floored = db.search_org_chunks_knn(&query, 10, 0.75).unwrap();
+    let fids: Vec<&str> = floored.iter().map(|h| h.item_id.as_str()).collect();
+    assert_eq!(
+        fids,
+        vec!["it-near"],
+        "int8 /127-rescaled floor must drop the orthogonal item, got {fids:?}"
+    );
+}
+
+/// S1 Test B (recall safety): with the vector leg FLOORED to empty on an irrelevant corpus, an
+/// EXACT-WORD FTS hit still surfaces through `search_hybrid_visible` — the floor never touches the
+/// FTS/graph legs, and `score_fuse`'s empty-leg redistribution rescales the survivors.
+#[test]
+fn s1_floor_keeps_fts_hit_when_vector_leg_floored_empty() {
+    let db = mem_db();
+    db.insert_meeting(&sample_meeting("m-budget", "2026-06-24T10:00:00Z"))
+        .unwrap();
+    // FTS text carries "budget"; the ONLY chunk is orthogonal (one_hot(2)) to the query one_hot(0).
+    note_for(&db, "m-budget", "claude_code", "the quarterly budget review");
+    insert_known_chunk(&db, "m-budget", "the quarterly budget review", &one_hot(2));
+
+    let nothing = std::collections::HashSet::new();
+    let hits = db
+        .search_hybrid_visible("budget", &one_hot(0), 10, 0.75, &nothing, None)
+        .unwrap();
+    assert!(
+        hits.iter().any(|h| h.meeting.id == "m-budget"),
+        "an exact-word FTS hit must survive even when the vector leg is floored to empty"
+    );
+}
+
+/// S2 Test C (meetings): the AND→OR fallback recovers a multi-word miss — "etykieta parcel" (AND
+/// misses, no "etykieta") matches a note containing only "parcel" via the OR twin.
+#[test]
+fn s2_and_to_or_fallback_recovers_multiword_miss_meetings() {
+    let db = mem_db();
+    db.insert_meeting(&sample_meeting("m1", "2026-06-24T10:00:00Z"))
+        .unwrap();
+    note_for(&db, "m1", "claude_code", "parcel size delivery schedule");
+    let nothing = std::collections::HashSet::new();
+    let hits = db.search_visible("etykieta parcel", 10, &nothing).unwrap();
+    assert!(
+        hits.iter().any(|h| h.meeting.id == "m1"),
+        "AND→OR fallback must recover a note sharing only 'parcel'"
+    );
+}
+
+/// S2 Test C (documents): the same AND→OR fallback in the doc-chunk FTS reader.
+#[test]
+fn s2_and_to_or_fallback_recovers_multiword_miss_docs() {
+    let db = mem_db();
+    seed_folder(&db, "f-open", "Project");
+    db.insert_document(
+        "d1",
+        "f-open",
+        "spec.md",
+        "parcel size delivery schedule",
+        "document",
+        100,
+    )
+    .unwrap();
+    db.index_document_chunks("d1", None).unwrap();
+    let nothing = std::collections::HashSet::new();
+    let hits = db
+        .search_doc_chunks_fts_visible("etykieta parcel", 10, &nothing)
+        .unwrap();
+    assert!(
+        hits.iter().any(|h| h.document_id == "d1"),
+        "AND→OR fallback must recover a document sharing only 'parcel'"
+    );
+}
+
+/// S2 Test C (org): the same AND→OR fallback in the org-chunk FTS reader.
+#[test]
+fn s2_and_to_or_fallback_recovers_multiword_miss_org() {
+    let db = mem_db();
+    seed_org_state(&db, "org-1");
+    db.upsert_org_item(
+        "it-1",
+        "org-1",
+        1,
+        "anna",
+        "Parcels",
+        "parcel size delivery schedule",
+        "2026-07-10T09:00:00Z",
+        1,
+        1,
+        &sha32(1),
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+    let hits = db.search_org_chunks_fts("etykieta parcel", 10).unwrap();
+    assert!(
+        hits.iter().any(|h| h.item_id == "it-1"),
+        "AND→OR fallback must recover an org item sharing only 'parcel'"
+    );
+}
+
+/// S2 Test D (precision preserved — the QA "No meetings match" guard): a query whose content words
+/// appear in NONE of the corpus notes stays EMPTY even after the OR fallback (no shared content
+/// word ⇒ the OR built from the query's own content words matches nothing).
+#[test]
+fn s2_precision_preserved_no_shared_content_word() {
+    let db = mem_db();
+    db.insert_meeting(&sample_meeting("m1", "2026-06-24T10:00:00Z"))
+        .unwrap();
+    db.insert_meeting(&sample_meeting("m2", "2026-06-24T11:00:00Z"))
+        .unwrap();
+    note_for(&db, "m1", "claude_code", "parcel size delivery schedule");
+    note_for(&db, "m2", "claude_code", "roadmap planning session notes");
+    let nothing = std::collections::HashSet::new();
+    let hits = db
+        .search_visible("shipment label generation", 10, &nothing)
+        .unwrap();
+    assert!(
+        hits.is_empty(),
+        "OR fallback must NOT match when no content word is shared, got {:?}",
+        hits.iter().map(|h| h.meeting.id.clone()).collect::<Vec<_>>()
+    );
+}
+
+/// S2 Test E (stopword-only overlap must NOT hit): a query sharing ONLY stopwords ("the", "is")
+/// with a note stays empty — `fts_match_query_any` drops stopwords/<3-char before building the OR,
+/// so the shared function words can never produce a hit through the fallback.
+#[test]
+fn s2_stopword_only_overlap_does_not_hit() {
+    let db = mem_db();
+    db.insert_meeting(&sample_meeting("m1", "2026-06-24T10:00:00Z"))
+        .unwrap();
+    note_for(&db, "m1", "claude_code", "the plan is done");
+    let nothing = std::collections::HashSet::new();
+    let hits = db.search_visible("what is the status", 10, &nothing).unwrap();
+    assert!(
+        hits.is_empty(),
+        "stopword-only overlap must not produce a hit through the OR fallback, got {:?}",
+        hits.iter().map(|h| h.meeting.id.clone()).collect::<Vec<_>>()
+    );
 }
