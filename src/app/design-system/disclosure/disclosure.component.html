@@ -1,0 +1,42 @@
+<div class="disc-wrap">
+  <button
+    type="button"
+    class="disc-trigger"
+    [id]="triggerId"
+    [attr.aria-expanded]="open()"
+    [attr.aria-controls]="panelId"
+    (click)="toggle()"
+  >
+    <svg
+      class="disc-chevron"
+      [class.is-open]="open()"
+      width="12"
+      height="12"
+      viewBox="0 0 12 12"
+      fill="none"
+      aria-hidden="true"
+    >
+      <path
+        d="M4 2l4 4-4 4"
+        stroke="currentColor"
+        stroke-width="1.5"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+      />
+    </svg>
+    <span class="disc-summary"><ng-content select="[murDisclosureSummary]" /></span>
+  </button>
+
+  <!-- Always in the DOM so `aria-controls` above never dangles; `hidden` (and the
+       matching display:none in the SCSS) is what collapses it. -->
+  <div
+    class="disc-panel"
+    role="group"
+    [id]="panelId"
+    [hidden]="!open()"
+    [attr.aria-labelledby]="panelLabel() ? null : triggerId"
+    [attr.aria-label]="panelLabel()"
+  >
+    <ng-content />
+  </div>
+</div>

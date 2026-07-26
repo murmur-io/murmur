@@ -1,0 +1,72 @@
+/* LOAD-BEARING: the consuming sections (settings-ai-section and friends)
+   flex-stack their children, so this component element must NOT introduce an
+   extra box — `.disc-wrap` is the flex item. See the class doc. */
+:host {
+  display: contents;
+}
+
+.disc-wrap {
+  display: flex;
+  flex-direction: column;
+}
+
+/* ── Trigger ── */
+.disc-trigger {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  width: 100%;
+  text-align: left;
+  padding: var(--space-3) var(--space-4);
+  background: var(--surface-input);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  color: var(--text-secondary);
+  font-family: inherit;
+  font-size: 0.875rem;
+  font-weight: 550;
+  cursor: pointer;
+  transition:
+    border-color var(--transition),
+    background var(--transition);
+}
+.disc-trigger:hover {
+  border-color: var(--border-strong);
+  color: var(--text-primary);
+}
+.disc-trigger:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+/* Open: the trigger and the panel read as ONE joined surface. */
+.disc-trigger[aria-expanded="true"] {
+  border-bottom-left-radius: 0;
+  border-bottom-right-radius: 0;
+  border-bottom-color: transparent;
+}
+
+.disc-chevron {
+  flex: none;
+  transition: transform var(--transition);
+}
+.disc-chevron.is-open {
+  transform: rotate(90deg);
+}
+
+/* ── Panel — in-flow (never an overlay), stacks its projected children ── */
+.disc-panel {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  padding: var(--space-4);
+  border: 1px solid var(--border-subtle);
+  border-top: none;
+  border-bottom-left-radius: var(--radius-md);
+  border-bottom-right-radius: var(--radius-md);
+  background: var(--surface-input);
+}
+/* REQUIRED: the `display: flex` above outranks the UA's `[hidden] { display: none }`
+   (author beats user-agent), so the collapsed panel would stay visible without this. */
+.disc-panel[hidden] {
+  display: none;
+}

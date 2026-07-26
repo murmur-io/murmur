@@ -112,12 +112,11 @@
             } @else if (modelPresent() === false) {
               @if (downloading()) {
                 <div class="dl-progress" role="status">
-                  <div class="dl-progress-track" aria-hidden="true">
-                    <div
-                      class="dl-progress-fill"
-                      [style.width.%]="downloadFrac() * 100"
-                    ></div>
-                  </div>
+                  <mur-progress
+                    size="md"
+                    ariaLabel="Transcription model download"
+                    [value]="downloadFrac() * 100"
+                  />
                   <span class="dl-progress-label text-muted">
                     @if (downloadFrac() > 0) {
                       Downloading… {{ downloadPct() }}
