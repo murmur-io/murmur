@@ -82,7 +82,9 @@ const TURBO_DEFAULT_FILE: &str = "ggml-large-v3-turbo-q8_0.bin";
 
 /// RAM floor for defaulting a FRESH install to the turbo quant: the ~1 GB-resident turbo is a
 /// safe default on ≥ 12 GB machines; 8 GB Macs stay on `small` (the A2 RAM-safety rationale).
-const TURBO_DEFAULT_MIN_RAM_BYTES: u64 = 12 * 1024 * 1024 * 1024;
+/// `pub(crate)` so [`crate::transcribe::catalog::recommend`] branches on the SAME constant — one
+/// floor, two consumers, no drift.
+pub(crate) const TURBO_DEFAULT_MIN_RAM_BYTES: u64 = 12 * 1024 * 1024 * 1024;
 
 /// T2 DEFAULT FLIP — the ONE place that decides what an EMPTY `model_size` means. PURE over the
 /// models-dir file names + total RAM so every branch is headless-testable:
@@ -106,20 +108,58 @@ pub fn default_model_size<S: AsRef<str>>(
     models_dir_files: &[S],
     total_ram_bytes: Option<u64>,
 ) -> &'static str {
-    if models_dir_files
-        .iter()
-        .any(|f| f.as_ref() == TURBO_DEFAULT_FILE)
+    // The ARCH term is not an input of this two-argument contract (its tests are the proof of
+    // zero behavior change, and they pass only RAM), so the arch is treated as Apple Silicon here
+    // and the REAL arch cap is applied by [`default_model_size_now`], which knows the machine.
+    default_model_size_for(models_dir_files, total_ram_bytes, Some(true))
+}
+
+/// Arch-aware core of [`default_model_size`] — PURE over
+/// `(models_dir_files, total_ram_bytes, apple_silicon)`, so every branch stays headless-testable.
+/// Branch 2 (and ONLY branch 2) consults [`crate::transcribe::catalog::recommend`], which is where
+/// the Apple-Silicon-vs-Intel cap and the RAM floor live; branches 1 and 3 are unchanged and remain
+/// presence-first, so an existing install is never surprised by an unrequested download whatever
+/// the hardware says.
+pub fn default_model_size_for<S: AsRef<str>>(
+    models_dir_files: &[S],
+    total_ram_bytes: Option<u64>,
+    apple_silicon: Option<bool>,
+) -> &'static str {
+    if turbo_present_in(models_dir_files) {
+        return TURBO_DEFAULT_SIZE;
+    }
+    if !any_whisper_model_in(models_dir_files)
+        && crate::transcribe::catalog::recommend(total_ram_bytes, apple_silicon).id
+            == TURBO_DEFAULT_SIZE
     {
         return TURBO_DEFAULT_SIZE;
     }
-    let any_whisper_model = models_dir_files.iter().any(|f| {
+    "small"
+}
+
+/// Is the turbo default's file among these models-dir file names? Branch 1 of
+/// [`default_model_size_for`], factored out because the recommendation DTO needs the same fact to
+/// tell `AlreadyDownloaded` apart from `FreshInstallAmpleRam` (a presence-first decision must never
+/// be reported as a RAM-causal one).
+pub fn turbo_present_in<S: AsRef<str>>(models_dir_files: &[S]) -> bool {
+    models_dir_files
+        .iter()
+        .any(|f| f.as_ref() == TURBO_DEFAULT_FILE)
+}
+
+/// Is ANY whisper model already on disk? Branch 2's guard of [`default_model_size_for`], factored
+/// out for the same reason [`turbo_present_in`] was: the recommendation DTO needs the identical fact
+/// to tell "install history kept the default conservative" (`ExistingInstall`) apart from "this
+/// machine's hardware did" (`ModestRam` / `ArchUnknown` / …). Re-deriving it at the call site is how
+/// a fresh install on a modest Mac ended up wearing an install-history label.
+///
+/// The VAD model is excluded deliberately — it ships alongside every install and is not a
+/// transcription model, so counting it would make every machine look like an existing install.
+pub fn any_whisper_model_in<S: AsRef<str>>(models_dir_files: &[S]) -> bool {
+    models_dir_files.iter().any(|f| {
         let name = f.as_ref();
         name.starts_with("ggml-") && name.ends_with(".bin") && name != VAD_MODEL_FILE
-    });
-    if !any_whisper_model && total_ram_bytes.is_some_and(|b| b >= TURBO_DEFAULT_MIN_RAM_BYTES) {
-        return TURBO_DEFAULT_SIZE;
-    }
-    "small"
+    })
 }
 
 /// [`default_model_size`] over the REAL machine: lists [`models_dir`] + reads total RAM via
@@ -130,13 +170,20 @@ pub fn default_model_size_now() -> &'static str {
     let Ok(dir) = models_dir() else {
         return "small";
     };
-    let Ok(read) = std::fs::read_dir(&dir) else {
+    let Ok(files) = models_dir_file_names(&dir) else {
         return "small";
     };
-    let files: Vec<String> = read
+    let profile = crate::machine::profile();
+    default_model_size_for(&files, profile.total_ram_bytes, profile.apple_silicon)
+}
+
+/// The file NAMES directly inside `dir` — the exact shape [`default_model_size_for`] consumes. Also
+/// used by the recommendation command so the DTO's presence facts and the auto default are read
+/// from ONE listing rather than two (which could disagree mid-download).
+pub fn models_dir_file_names(dir: &Path) -> std::io::Result<Vec<String>> {
+    Ok(std::fs::read_dir(dir)?
         .filter_map(|e| e.ok().and_then(|e| e.file_name().into_string().ok()))
-        .collect();
-    default_model_size(&files, total_ram_bytes())
+        .collect())
 }
 
 /// Resolve a possibly-empty configured `model_size` to the size that should actually load:
@@ -152,18 +199,12 @@ pub fn effective_model_size(size: &str) -> String {
     }
 }
 
-/// macOS total physical RAM in bytes via `sysctl -n hw.memsize` — mirrors
-/// `commands.rs::total_ram_gb` (no new FFI/crate). `None` on any failure.
-fn total_ram_bytes() -> Option<u64> {
-    let out = std::process::Command::new("sysctl")
-        .arg("-n")
-        .arg("hw.memsize")
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    String::from_utf8(out.stdout).ok()?.trim().parse().ok()
+/// macOS total physical RAM in bytes. Since P1 this reads the CACHED
+/// [`crate::machine::MachineProfile`] instead of re-spawning `sysctl -n hw.memsize` per call, so
+/// the whole app pays ONE probe for the process (`commands::model_perf::total_ram_gb` routes here
+/// too). `None` on any failure, exactly as before.
+pub(crate) fn total_ram_bytes() -> Option<u64> {
+    crate::machine::total_ram_bytes()
 }
 
 /// Map a chosen size + language to a whisper.cpp GGML model filename.
@@ -1082,6 +1123,65 @@ mod tests {
                 "existing install with {present} must stay on small"
             );
         }
+    }
+
+    /// P1 arch cap, INTEL leg on its own: a fresh install with ample RAM on an Intel Mac stays on
+    /// `small`. Deliberately a separate test from the Apple-Silicon leg below — a conjunction would
+    /// pin neither leg.
+    #[test]
+    fn default_model_size_for_intel_fresh_install_stays_small() {
+        let none: [&str; 0] = [];
+        assert_eq!(
+            default_model_size_for(&none, Some(32 * GIB), Some(false)),
+            "small"
+        );
+        // An UNREADABLE arch probe fails SMALL too — never a large download on a missing measurement.
+        assert_eq!(
+            default_model_size_for(&none, Some(32 * GIB), None),
+            "small"
+        );
+    }
+
+    /// P1 arch cap, APPLE-SILICON leg on its own, at the SAME RAM figure as the Intel test above —
+    /// so the pair proves the arch term is what moved the answer.
+    #[test]
+    fn default_model_size_for_apple_silicon_fresh_install_gets_turbo() {
+        let none: [&str; 0] = [];
+        assert_eq!(
+            default_model_size_for(&none, Some(32 * GIB), Some(true)),
+            TURBO_DEFAULT_SIZE
+        );
+    }
+
+    /// P1 — the arch cap NEVER overrides branch 1 or branch 3: a turbo file already on disk wins on
+    /// Intel too (the user already paid for it), and an existing install stays on `small` on Apple
+    /// Silicon. Only branch 2 consults the recommendation.
+    #[test]
+    fn default_model_size_for_arch_only_affects_branch_two() {
+        for arch in [Some(true), Some(false), None] {
+            assert_eq!(
+                default_model_size_for(&[TURBO_DEFAULT_FILE], Some(8 * GIB), arch),
+                TURBO_DEFAULT_SIZE,
+                "branch 1 (already downloaded) is presence-first for arch={arch:?}"
+            );
+            assert_eq!(
+                default_model_size_for(&["ggml-small.bin"], Some(64 * GIB), arch),
+                "small",
+                "branch 3 (existing install) is unchanged for arch={arch:?}"
+            );
+        }
+    }
+
+    /// P1 — `turbo_present_in` is exactly branch 1's predicate (the DTO uses it to tell
+    /// `AlreadyDownloaded` apart from `FreshInstallAmpleRam`).
+    #[test]
+    fn turbo_present_in_matches_branch_one() {
+        assert!(turbo_present_in(&[TURBO_DEFAULT_FILE, "ggml-small.bin"]));
+        assert!(!turbo_present_in(&["ggml-small.bin", "ggml-large-v3.bin"]));
+        let none: [&str; 0] = [];
+        assert!(!turbo_present_in(&none));
+        // A `.part` partial is NOT the model.
+        assert!(!turbo_present_in(&["ggml-large-v3-turbo-q8_0.bin.part"]));
     }
 
     /// T2 DEFAULT FLIP — the constant pair stays coherent with `model_filename` for every

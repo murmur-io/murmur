@@ -23,8 +23,10 @@ import type {
   AcceptedShare,
   BrainDownloadProgress,
   BrainModelDto,
+  MachineChangeNudge,
   Posture,
   RetiredModelNudge,
+  WhisperRecommendationDto,
   WhisperCard,
   EmbedDownloadProgress,
   EgressLedger,
@@ -2030,6 +2032,34 @@ export class IpcService {
    */
   brainModelRetirementNudge(): Promise<RetiredModelNudge | null> {
     return invoke<RetiredModelNudge | null>("brain_model_retirement_nudge");
+  }
+
+  // ── P1 — this Mac, the whisper catalog, and the recommendation ──────────
+
+  /**
+   * ONE command answering the machine profile, the whisper catalog and BOTH
+   * "which model?" answers (`recommendedId` = the honest hardware answer,
+   * `autoDefaultId` = what a blank config resolves to today). It is deliberately
+   * one call rather than two: free disk is volatile, so two commands reading it
+   * at different instants could disagree.
+   */
+  whisperRecommendation(): Promise<WhisperRecommendationDto> {
+    return invoke<WhisperRecommendationDto>("whisper_recommendation");
+  }
+
+  /**
+   * The one-shot notice that this install last ran on a DIFFERENT Mac. `null`
+   * when there is nothing to say. PULLED rather than pushed — an event emitted
+   * during backend `setup` would be lost, because the webview has not called
+   * `listen()` yet at that point.
+   */
+  machineChangeNudge(): Promise<MachineChangeNudge | null> {
+    return invoke<MachineChangeNudge | null>("machine_change_nudge");
+  }
+
+  /** Clear the machine-change notice so it never shows again for this move. */
+  dismissMachineChangeNudge(): Promise<void> {
+    return invoke<void>("dismiss_machine_change_nudge");
   }
 
   /**
