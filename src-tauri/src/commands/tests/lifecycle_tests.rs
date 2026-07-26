@@ -18921,35 +18921,10 @@
     fn revoke_org_share_evicts_the_local_replica_on_the_publishing_device() {
         let mock = MockOrgServer::start();
         let state = build_state("org-revoke-evicts");
-        seed_org(&state.db, "org-1", "Acme", "member", 1);
-        state.config.lock().unwrap().share_base_url = mock.base.clone();
-        seed_live_session(&state);
-        seed_ock(&state, "org-1", 1);
-
-        // A published share, with the publishing device's own local replica of it.
-        state
-            .db
-            .insert_org_share(
-                "os-rv",
-                "org-1",
-                None,
-                Some("n-rv"),
-                "note",
-                Some("Quarterly acquisition plan"),
-                1,
-                1,
-                &[7u8; 32],
-                "2026-07-11T00:00:00Z",
-            )
-            .unwrap();
-        state
-            .db
-            .set_org_share_uploaded("os-rv", "it-rv", "2026-07-11T00:00:00Z")
-            .unwrap();
-        seed_replica_item(&state, "it-rv", "org-1", 5);
+        // A published share, with the publishing device's own local replica of it (the helper also
+        // asserts the pre-state: the replica really is present, indexed and attached).
+        seed_published_share_with_replica(&state, &mock.base);
         assert!(state.db.get_org_item("it-rv").unwrap().is_some());
-        let (chunks, vectors, fts, attachments) = replica_counts(&state, "it-rv");
-        assert!(chunks > 0 && vectors > 0 && fts > 0 && attachments == 1);
 
         block_on(revoke_org_share_inner(&state, "it-rv".to_string())).unwrap();
 
@@ -18971,6 +18946,262 @@
             state.db.get_org_share("os-rv").unwrap().unwrap().state,
             "revoked"
         );
+    }
+
+    /// Seed the exact shape every revoke-window test needs: one joined org with a live session + OCK,
+    /// one PUBLISHED share (`os-rv` → `it-rv`) and the publishing device's own fully-indexed,
+    /// fully-attached local replica of it.
+    fn seed_published_share_with_replica(state: &AppState, base: &str) {
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        state.config.lock().unwrap().share_base_url = base.to_string();
+        seed_live_session(state);
+        seed_ock(state, "org-1", 1);
+        state
+            .db
+            .insert_org_share(
+                "os-rv",
+                "org-1",
+                None,
+                Some("n-rv"),
+                "note",
+                Some("Quarterly acquisition plan"),
+                1,
+                1,
+                &[7u8; 32],
+                "2026-07-11T00:00:00Z",
+            )
+            .unwrap();
+        state
+            .db
+            .set_org_share_uploaded("os-rv", "it-rv", "2026-07-11T00:00:00Z")
+            .unwrap();
+        seed_replica_item(state, "it-rv", "org-1", 5);
+        let (chunks, vectors, fts, attachments) = replica_counts(state, "it-rv");
+        assert!(chunks > 0 && vectors > 0 && fts > 0 && attachments == 1);
+    }
+
+    /// Install a raw SQLite guard/fault trigger on the test DB (dropped again by `drop_test_trigger`).
+    /// This is the only seam that can interrupt a revoke BETWEEN its two local commits without adding
+    /// a production-code test hook: SQLite enforces it inside the very transaction being committed.
+    fn install_test_trigger(state: &AppState, sql: &str) {
+        state.db.lock().execute_batch(sql).unwrap();
+    }
+
+    fn drop_test_trigger(state: &AppState, name: &str) {
+        state
+            .db
+            .lock()
+            .execute_batch(&format!("DROP TRIGGER {name};"))
+            .unwrap();
+    }
+
+    /// THE REVOKE CRASH WINDOW, part 1 — the ORDERING itself.
+    ///
+    /// A revoke makes two SEPARATE local commits after the server DELETE lands: the `org_shares` state
+    /// flip and the local replica eviction. Whichever runs second defines what a crash / quit /
+    /// background-epoch flip between them leaves behind. Pre-fix the order was state-THEN-eviction, so
+    /// the interrupted state was a row marked `revoked` whose decrypted replica — markdown, chunks,
+    /// int8 vectors, FTS tokens, image BLOBs — was still live and searchable through org search / Ask /
+    /// MCP `org_search`, and `org_sweep_pending` (which only re-drives `revoke_pending`) could never
+    /// reach it again.
+    ///
+    /// The invariant is asserted where it actually lives — in the DB, not in the call sequence: a
+    /// BEFORE-UPDATE trigger ABORTS any transition of a share row to `revoked` while that item's
+    /// replica row is still live. On the pre-fix order that abort fires and the revoke returns `Err`
+    /// (RED); on the fixed order the eviction has already happened, the guard is satisfied, and the
+    /// revoke completes.
+    #[test]
+    fn revoke_evicts_the_local_replica_before_it_flips_the_share_to_revoked() {
+        let mock = MockOrgServer::start();
+        let state = build_state("org-revoke-order");
+        seed_published_share_with_replica(&state, &mock.base);
+
+        install_test_trigger(
+            &state,
+            "CREATE TRIGGER guard_revoke_order BEFORE UPDATE ON org_shares
+               WHEN NEW.state = 'revoked'
+                AND EXISTS (SELECT 1 FROM org_items
+                             WHERE item_id = NEW.item_id AND tombstoned = 0)
+             BEGIN
+               SELECT RAISE(ABORT, 'share flipped to revoked while its replica was still live');
+             END;",
+        );
+
+        block_on(revoke_org_share_inner(&state, "it-rv".to_string()))
+            .expect("the eviction must be committed BEFORE the revoked state flip");
+
+        assert_eq!(
+            mock.log.lock().unwrap().tombstoned,
+            vec!["it-rv".to_string()],
+            "the server is still told FIRST — an eviction before a failed tombstone would blind us"
+        );
+        assert!(state.db.get_org_item("it-rv").unwrap().is_none());
+        assert_eq!(replica_counts(&state, "it-rv"), (0, 0, 0, 0));
+        assert_eq!(
+            state.db.get_org_share("os-rv").unwrap().unwrap().state,
+            "revoked"
+        );
+    }
+
+    /// THE REVOKE CRASH WINDOW, part 2 — what an INTERRUPTION in the window actually leaves, and that
+    /// the launch sweep still repairs it.
+    ///
+    /// The interruption is injected as a fault trigger that ABORTS the eviction's `org_items` write —
+    /// the observable equivalent of the process dying at that instant: the server tombstone has landed,
+    /// the eviction has not. What matters is the state the share row is left in.
+    ///   - Pre-fix (state THEN eviction) it is `revoked`: `org_sweep_pending` only re-drives
+    ///     `revoke_pending`, so the still-live replica is unreachable by the crash-safe recovery path.
+    ///   - Post-fix (eviction THEN state) it is `revoke_pending`: both the server tombstone and the
+    ///     eviction are idempotent, so the very next sweep re-drives the row and converges it.
+    #[test]
+    fn an_interrupted_revoke_leaves_a_re_drivable_row_not_a_live_orphaned_replica() {
+        let mock = MockOrgServer::start();
+        let state = build_state("org-revoke-interrupted");
+        seed_published_share_with_replica(&state, &mock.base);
+
+        // Fault injection: the eviction's tombstone write fails (≙ the process stopping right there).
+        install_test_trigger(
+            &state,
+            "CREATE TRIGGER fault_on_evict BEFORE UPDATE ON org_items
+               WHEN NEW.tombstoned = 1
+             BEGIN SELECT RAISE(ABORT, 'simulated interruption during the local eviction'); END;",
+        );
+
+        block_on(revoke_org_share_inner(&state, "it-rv".to_string()))
+            .expect_err("the interrupted eviction must surface, not be silently swallowed");
+
+        assert_eq!(
+            mock.log.lock().unwrap().tombstoned,
+            vec!["it-rv".to_string()],
+            "the server withdrawal already happened — this is exactly the dangerous window"
+        );
+        assert!(
+            state.db.get_org_item("it-rv").unwrap().is_some(),
+            "the eviction really did not happen (its transaction rolled back)"
+        );
+        assert_eq!(
+            state.db.get_org_share("os-rv").unwrap().unwrap().state,
+            "revoke_pending",
+            "an interruption must NEVER leave a `revoked` row whose replica is still live — that row \
+             re-enters no queue"
+        );
+
+        // The interruption is over (the app relaunches): the sweep re-drives the `revoke_pending` row.
+        drop_test_trigger(&state, "fault_on_evict");
+        assert!(block_on(org_sweep_pending_inner(&state)).unwrap() >= 1);
+
+        assert!(
+            state.db.get_org_item("it-rv").unwrap().is_none(),
+            "the launch sweep converged the replica the interrupted revoke left behind"
+        );
+        assert_eq!(replica_counts(&state, "it-rv"), (0, 0, 0, 0));
+        assert_eq!(
+            state.db.get_org_share("os-rv").unwrap().unwrap().state,
+            "revoked"
+        );
+    }
+
+    /// DEFENCE IN DEPTH behind the ordering fix: `org_sweep_pending` now also converges a `revoked`
+    /// row that still has a LIVE local replica — the shape a device interrupted under the OLD order is
+    /// stuck in, and the one shape no queue used to re-drive. Local-only: no server, no session, no
+    /// network call (the server tombstone already landed for a `revoked` row, so re-issuing it every
+    /// launch would be pure waste).
+    #[test]
+    fn the_launch_sweep_evicts_an_orphaned_replica_of_an_already_revoked_share() {
+        let state = build_state("org-revoked-orphan-repair");
+        // No `share_base_url`, no session — deliberately: the repair must not depend on either (and
+        // this test must never reach out to the default production host).
+        state.config.lock().unwrap().share_base_url = String::new();
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        state
+            .db
+            .insert_org_share(
+                "os-orphan",
+                "org-1",
+                None,
+                Some("n-orphan"),
+                "note",
+                Some("Quarterly acquisition plan"),
+                1,
+                1,
+                &[7u8; 32],
+                "2026-07-11T00:00:00Z",
+            )
+            .unwrap();
+        state
+            .db
+            .set_org_share_uploaded("os-orphan", "it-orphan", "2026-07-11T00:00:00Z")
+            .unwrap();
+        state
+            .db
+            .set_org_share_state("os-orphan", "revoked", "2026-07-11T00:05:00Z")
+            .unwrap();
+        seed_replica_item(&state, "it-orphan", "org-1", 5);
+
+        assert_eq!(block_on(org_sweep_pending_inner(&state)).unwrap(), 1);
+        assert!(state.db.get_org_item("it-orphan").unwrap().is_none());
+        assert_eq!(replica_counts(&state, "it-orphan"), (0, 0, 0, 0));
+
+        // Converged ⇒ the next pass is a pure no-op (it must not keep counting the same row forever).
+        assert_eq!(block_on(org_sweep_pending_inner(&state)).unwrap(), 0);
+    }
+
+    /// Records every [`crate::events::EVENT_ORG_FEED_UPDATED`] notice a command fires, so the "does the
+    /// FE actually get told to re-fetch?" half of an org mutation is assertable without a Tauri runtime.
+    #[derive(Default)]
+    struct RecordingOrgFeedNotifier {
+        calls: Mutex<Vec<u32>>,
+    }
+
+    impl crate::events::OrgFeedNotifier for RecordingOrgFeedNotifier {
+        fn org_feed_updated(&self, orgs_changed: u32) {
+            self.calls.lock().unwrap().push(orgs_changed);
+        }
+    }
+
+    /// `revoke_org_share` was the ONLY org-item-mutating command that never emitted `org-feed-updated`
+    /// — every sibling (`delete_org_item_as_author`, the share/publish paths) does. Now that a revoke
+    /// mutates the LOCAL replica too, the omission left `OrgBrainService.loadOrgs()`, the Settings
+    /// organization section and an open org-item viewer showing the withdrawn row until some unrelated
+    /// productive sync tick (up to `ORG_SYNC_TICK_SECS` later, or never on a quiet feed) — and the
+    /// reconcile sweep cannot cover the gap, since it emits only when it changed something and the item
+    /// is already locally tombstoned by then.
+    #[test]
+    fn a_successful_revoke_tells_the_frontend_to_refresh() {
+        let mock = MockOrgServer::start();
+        let state = build_state("org-revoke-emits");
+        seed_published_share_with_replica(&state, &mock.base);
+
+        let notifier = RecordingOrgFeedNotifier::default();
+        block_on(revoke_org_share_notifying(
+            &state,
+            "it-rv".to_string(),
+            &notifier,
+        ))
+        .unwrap();
+
+        assert_eq!(
+            *notifier.calls.lock().unwrap(),
+            vec![1],
+            "a successful revoke must fire exactly one org-feed-updated notice"
+        );
+    }
+
+    /// The flip side: a revoke that FAILED changed nothing the FE needs to re-fetch, so it must stay
+    /// silent (a notice there would make every open view re-fetch identical state on every error).
+    #[test]
+    fn a_failed_revoke_does_not_tell_the_frontend_to_refresh() {
+        let state = build_state("org-revoke-no-emit-on-failure");
+        let notifier = RecordingOrgFeedNotifier::default();
+
+        block_on(revoke_org_share_notifying(
+            &state,
+            "it-does-not-exist".to_string(),
+            &notifier,
+        ))
+        .expect_err("no local org share for that item");
+
+        assert!(notifier.calls.lock().unwrap().is_empty());
     }
 
     /// ITEM 4 — `list_org_shares` takes the caller's chosen org. Pre-fix it ignored the caller and
