@@ -295,6 +295,46 @@ export interface AppConfigDto {
    */
   slackConsented: boolean;
   /**
+   * OPTIONAL by design (unlike the older `jiraEnabled`/`slackEnabled`): the five Notion/ClickUp
+   * keys below are OMISSION-SAFE on the Rust side — an ABSENT key means "don't touch" and the
+   * backend PRESERVES the stored value, while an explicit `false`/`""` still clears it. That lets a
+   * caller which round-trips the whole DTO but predates these fields (the onboarding wizard) save
+   * without silently disabling a connector the user enabled. Settings ALWAYS sends them explicitly.
+   */
+  /**
+   * brain2 connectors — the NOTION connector MASTER toggle. NEW CLOUD EGRESS: when on (AND
+   * `notionConsented` AND an integration token is configured), the brain/Ask answer may send a
+   * REDACTED query off-device to the user's Notion workspace (a READ-ONLY page/database search).
+   * A settable flag, round-tripped on every `save_config`. Default false. Mirrors Rust
+   * `AppConfigDto.notion_enabled`.
+   */
+  notionEnabled?: boolean;
+  /**
+   * brain2 connectors — one-time consent for the Notion egress. Like `slackConsented`,
+   * PRESERVE-ONLY on `save_config` (a normal save carries the current value back, never flips it)
+   * and granted SOLELY by the dedicated `consent_to_notion` command. Default false (fail-closed).
+   * Mirrors Rust `AppConfigDto.notion_consented`.
+   */
+  notionConsented?: boolean;
+  /**
+   * brain2 connectors — the CLICKUP connector MASTER toggle. NEW CLOUD EGRESS: when on (AND
+   * `clickupConsented` AND a workspace id + API token are configured), the brain/Ask answer may
+   * reach the user's ClickUp workspace for a READ-ONLY task search. Settable, round-tripped on
+   * every `save_config`. Default false. Mirrors Rust `AppConfigDto.clickup_enabled`.
+   */
+  clickupEnabled?: boolean;
+  /**
+   * brain2 connectors — one-time consent for the ClickUp egress. PRESERVE-ONLY on `save_config`,
+   * granted SOLELY by the dedicated `consent_to_clickup` command. Default false (fail-closed).
+   * Mirrors Rust `AppConfigDto.clickup_consented`.
+   */
+  clickupConsented?: boolean;
+  /**
+   * The ClickUp workspace ("team") id the task search reads (non-secret). Settable, round-tripped
+   * on `save_config`. Default "". Mirrors Rust `AppConfigDto.clickup_team_id`.
+   */
+  clickupTeamId?: string;
+  /**
    * Opt-in: pass the shell environment through to the `claude` CLI subprocess, so an env
    * `ANTHROPIC_API_KEY` (and proxy / base-url vars) reach it again — restores how older versions
    * authenticated the CLI before the env-hardening. Settable flag, round-tripped on `save_config`.
