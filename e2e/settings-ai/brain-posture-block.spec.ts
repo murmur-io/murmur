@@ -37,7 +37,9 @@ test.describe("brain-posture-block", () => {
           filename: "qwen3-4b.gguf",
           url: "https://example.com/qwen3-4b.gguf",
           minRamGb: 8,
-          languages: ["en", "pl"],
+          // Registry-faithful: every Qwen row in `reason::BRAIN_MODELS` declares
+          // "multi" — that tag is what puts a model in the Multilingual family.
+          languages: ["en", "multi", "pl"],
           arch: "qwen3",
         },
       ],

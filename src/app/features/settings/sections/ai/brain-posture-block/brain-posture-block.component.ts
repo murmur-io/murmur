@@ -6,6 +6,7 @@ import {
 } from "@angular/core";
 import type { Posture } from "../../../../../core/models";
 import { SettingsStore } from "../../../settings.store";
+import { MurProgressComponent } from "../../../../../design-system/progress/progress.component";
 
 /**
  * AI & Models → Brain Posture block: the 3-way preset selector (Cloud /
@@ -21,7 +22,7 @@ import { SettingsStore } from "../../../settings.store";
 @Component({
   selector: "app-brain-posture-block",
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [],
+  imports: [MurProgressComponent],
   templateUrl: "./brain-posture-block.component.html",
   styleUrl: "./brain-posture-block.component.scss",
 })

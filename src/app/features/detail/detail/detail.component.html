@@ -45,7 +45,7 @@
           <h2>{{ d.meeting.title || "(untitled)" }}</h2>
         }
         <div class="meta">
-          <span class="pill" [class]="statusPillClass(d.meeting.status)">
+          <span class="pill" [class]="statusPillClass()">
             <span class="pill-dot"></span>
             {{ d.meeting.status }}
           </span>

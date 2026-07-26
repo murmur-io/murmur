@@ -78,12 +78,11 @@
                 </p>
                 @if (downloadingNerModel()) {
                   <div class="dl-progress" role="status">
-                    <div class="dl-progress-track" aria-hidden="true">
-                      <div
-                        class="dl-progress-fill"
-                        [style.width.%]="nerDownloadFrac() * 100"
-                      ></div>
-                    </div>
+                    <mur-progress
+                      size="md"
+                      ariaLabel="Name-detector model download"
+                      [value]="nerDownloadFrac() * 100"
+                    />
                     <span class="dl-progress-label text-muted">
                       @if (nerDownloadFrac() > 0) {
                         Downloading… {{ nerPct() }}
