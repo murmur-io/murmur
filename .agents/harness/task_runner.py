@@ -711,6 +711,42 @@ def dependency_revisions(repo_root: Path) -> Dict[str, str]:
     return {"murmur-server.expected": expected, "murmur-server.head": head, "murmur-server.dirty": dirty}
 
 
+def warn_if_protocol_pin_is_stale(repo_root: Path) -> None:
+    """Warn (never fail) when `.murmur-server-revision` lags the sibling's `origin/main`.
+
+    The pin decides which `murmur-protocol` tree a task compiles against, and `init` materialises the
+    sibling worktree at exactly that SHA. A stale pin is therefore SILENT: every check passes, against
+    a server that is not the deployed one. On 2026-07-26 a task compiled against a tree three merged
+    server PRs behind and only a protocol reviewer noticed, after two wasted rounds.
+
+    Advisory on purpose. Pinning deliberately BEHIND `origin/main` is legitimate -- a client change
+    that must not assume an unreleased server surface -- so this only makes the choice visible rather
+    than accidental. Any git failure (no sibling, no remote, offline) is swallowed: a warning must
+    never be able to block `init`.
+    """
+    sibling = (repo_root / ".." / "murmur-server").resolve()
+    revision_path = repo_root / ".murmur-server-revision"
+    if not sibling.is_dir() or not revision_path.is_file():
+        return
+    try:
+        pinned = revision_path.read_text(encoding="utf-8").strip()
+        upstream = git(sibling, "rev-parse", "--verify", "origin/main^{commit}", check=False)
+    except Exception:  # noqa: BLE001 - advisory only; never let this break init
+        return
+    if not SHA1_RE.fullmatch(pinned) or not SHA1_RE.fullmatch(upstream or ""):
+        return
+    if pinned == upstream:
+        return
+    behind = git(sibling, "rev-list", "--count", f"{pinned}..{upstream}", check=False)
+    detail = f" ({behind} commit(s) behind)" if (behind or "").isdigit() and behind != "0" else ""
+    print(
+        f"[harness] WARNING: .murmur-server-revision pins {pinned[:12]} but the sibling "
+        f"origin/main is {upstream[:12]}{detail}; this task compiles against the PINNED tree. "
+        "Bump the pin first if it needs the newer protocol surface.",
+        file=sys.stderr,
+    )
+
+
 def validate_protocol_dependency(revisions: Mapping[str, str]) -> None:
     expected = revisions.get("murmur-server.expected", "")
     head = revisions.get("murmur-server.head", "")
@@ -3899,6 +3935,7 @@ def cmd_init(args: argparse.Namespace) -> int:
         contract["dependency_revisions"] = dependency_revisions(worktree)
         if contract["dependency_revisions"]:
             validate_protocol_dependency(contract["dependency_revisions"])
+            warn_if_protocol_pin_is_stale(primary)
         contract["contract_sha256"] = contract_hash(contract)
         validate_schema(contract, load_schema("task"), label="task contract")
         atomic_write_json(task_dir / "task.json", contract)
@@ -4430,6 +4467,27 @@ def _remove_task_worktrees(
     return archive_ref, snapshot_sha
 
 
+def task_worktree_is_untouched(contract: Mapping[str, Any]) -> bool:
+    """True when a task's worktree still holds exactly its base commit and no edits.
+
+    Lets `reap` discard a freshly mis-parameterised INITIALIZED task. Fails CLOSED: a missing
+    worktree, a moved HEAD, an unreadable status, or any git error all return False, so the only path
+    to an immediate reap is a worktree provably identical to its base. A VANISHED worktree is not
+    treated as untouched -- the work may have been moved elsewhere, and the age-based gc sweep is the
+    right tool for that case.
+    """
+    worktree = Path(str(contract.get("worktree_path", "")))
+    base_sha = str(contract.get("base_sha", ""))
+    if not worktree.is_dir() or not SHA1_RE.fullmatch(base_sha):
+        return False
+    try:
+        if git(worktree, "rev-parse", "HEAD", check=False) != base_sha:
+            return False
+        return not git_bytes(worktree, "status", "--porcelain", check=False).strip()
+    except Exception:  # noqa: BLE001 - any git failure means "not provably clean"
+        return False
+
+
 def cmd_reap(args: argparse.Namespace) -> int:
     contract, task_dir, _ = load_task_from_current_repo(args.task_id, Path.cwd())
     lock = acquire_run_lock(
@@ -4448,10 +4506,18 @@ def cmd_reap(args: argparse.Namespace) -> int:
                 )
                 <= stale_before
             )
+            # An INITIALIZED task whose worktree is still untouched holds no work to lose, so it can
+            # be discarded now rather than waiting for the age-based gc sweep. Without this a
+            # mis-parameterised init (wrong --base, stale dependency pin) leaves a task that can be
+            # neither closed (needs COMMITTED) nor reaped (needs a terminal state) -- dead task dirs
+            # accumulate, and reusing the id later trips "task already exists". Deliberately narrow:
+            # only INITIALIZED, and only with a verifiably empty worktree.
+            if not stale_abandoned and prior_status == "INITIALIZED":
+                stale_abandoned = task_worktree_is_untouched(contract)
             if not stale_abandoned:
                 raise HarnessError(
-                    "reap accepts only FAILED/BLOCKED/CLOSED tasks, or an abandoned "
-                    f"stale task selected by gc; found {prior_status!r}"
+                    "reap accepts only FAILED/BLOCKED/CLOSED tasks, an untouched INITIALIZED "
+                    f"task, or an abandoned stale task selected by gc; found {prior_status!r}"
                 )
             set_state(
                 task_dir,
