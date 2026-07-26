@@ -958,6 +958,7 @@ fn deterministic_front_matter_lines(t: Option<&NoteTemplate>, vars: &ResolvedVar
 ///     the result is already a plain token).
 ///   * `project` (no `{{}}`) → `None`: no deterministic value exists, so the key stays a REQUEST to
 ///     the model (the prompt still lists it) and the model's own line survives the merge.
+///
 /// An unsafe/absent key name, or a key Murmur already owns, yields `None`.
 fn render_extra_key_line(entry: &str, vars: &ResolvedVars) -> Option<String> {
     let (key, value_tpl) = entry.split_once(':')?;
@@ -1617,6 +1618,7 @@ Formatting rules:
     ///   * the assembled note starts with `---` and contains EXACTLY ONE front-matter block,
     ///   * no injected fence, no `<%`/`%>`, no `{{`,
     ///   * `admin: true` never becomes a front-matter KEY of its own.
+    ///
     /// Without the sanitize+quote step every one of these assertions fails (the fence closes early,
     /// the Templater token survives, and the bare `:` splits the scalar).
     #[test]

@@ -3211,7 +3211,7 @@ fn wikilink_targets(body: &str) -> Vec<String> {
         // `[[Target|alias]]` / `[[Target#heading]]` — everything after the first `|` or `#` is
         // presentation, not the target.
         let target = raw
-            .split(|c| c == '|' || c == '#')
+            .split(['|', '#'])
             .next()
             .unwrap_or_default()
             .trim()
