@@ -515,6 +515,113 @@ export interface RetiredModelNudge {
   fileOnDisk: boolean;
 }
 
+// ── P1 — this Mac, the whisper catalog, and the recommendation ────────────
+
+/**
+ * The hardware facts a consumer actually READS. Deliberately narrow: core
+ * counts, OS version and thermal state are cheap to probe but do not cross IPC
+ * until something branches on them. Every field is nullable because every probe
+ * fails SOFT — an unreadable probe is `null`, never a guess.
+ */
+export interface MachineProfileDto {
+  totalRamBytes: number | null;
+  appleSilicon: boolean | null;
+  /** Normalised to `Apple …`; Intel's long brand string is rejected outright. */
+  chipName: string | null;
+  /** Free space on the volume holding the models dir. Read once, backend-side. */
+  freeDiskBytes: number | null;
+}
+
+/** One whisper catalog row, plus whether its file is on disk right now. */
+export interface WhisperModelDto {
+  id: string;
+  /** Ladder rung (`Light` / `Balanced` / `Sharp` / `Maximum`), or null for a long-tail size. */
+  tier: string | null;
+  headline: string;
+  approxDownloadBytes: number | null;
+  approxRamBytes: number | null;
+  liveSafe: boolean;
+  power: number;
+  downloaded: boolean;
+}
+
+/**
+ * Why {@link WhisperRecommendationDto.autoDefaultId} is what it is. Authored in
+ * Rust next to the branch that produced it so it cannot drift. The FE maps a
+ * variant to a sentence and never assembles the reasoning itself — in
+ * particular the RAM-causal sentence belongs to `freshInstallAmpleRam` and to
+ * nothing else, because every other branch is presence-first.
+ */
+export type RecommendReason =
+  /** Presence, not RAM, decided this — never render a RAM-causal sentence. */
+  | "alreadyDownloaded"
+  /** The ONE branch where "your Mac has N GB, so Murmur picked Sharp" is true. */
+  | "freshInstallAmpleRam"
+  /** Proven not Apple Silicon. The ONLY variant whose copy may name a chip family. */
+  | "notAppleSilicon"
+  /** The chip probe failed. Copy must NOT name a chip — on a real Intel Mac the
+   * `hw.optional.arm64` key is absent rather than false, so this state is reached
+   * by both a genuine Intel Mac and an Apple-Silicon Mac that could not answer. */
+  | "archUnknown"
+  /** Apple Silicon with MEASURED RAM below the floor — causal, but the "not enough" one. */
+  | "modestRam"
+  /** Apple Silicon whose RAM could not be measured. Makes no claim. */
+  | "ramUnknown"
+  /** A non-turbo model is already on disk: history, not hardware, kept it conservative. */
+  | "existingInstall";
+
+/** The on-device brain posture we ADVISE here. Advice only — it gates nothing. */
+export type BrainAdvice = "full" | "reactions";
+
+/**
+ * What one command answers: the machine, the catalog, and the TWO different
+ * answers to "which model?".
+ *
+ * {@link recommendedId} is the honest hardware answer, blind to what is on
+ * disk. {@link autoDefaultId} is what a blank config resolves to today, which
+ * is presence-first and therefore differs on most existing installs. Shipping
+ * only one of the two would make the badge contradict the selected size.
+ */
+export interface WhisperRecommendationDto {
+  machine: MachineProfileDto;
+  /** The visible catalog (provisional rows excluded), ascending by cost. */
+  models: WhisperModelDto[];
+  /** The size that will actually load right now (a blank `modelSize` resolved). */
+  selectedId: string;
+  recommendedId: string;
+  autoDefaultId: string;
+  reason: RecommendReason;
+  /** `"auto"` / `"user"` / null — who put `selectedId` there. */
+  modelSizeSource: string | null;
+  /** A custom model file is configured AND exists, so it overrides the ladder. */
+  customPathOverride: boolean;
+  /**
+   * Bytes a download would transfer right now for the selected size, INCLUDING
+   * the live-caption companion when one is planned. Computed in Rust so the FE
+   * never sums model sizes itself.
+   *
+   * `0` = nothing to fetch. `null` = a download IS pending but its size is not
+   * known — render "size unknown", NEVER "free". The two are deliberately kept
+   * apart so an unmeasured id cannot promise a free multi-GB transfer.
+   */
+  pendingDownloadBytes: number | null;
+  brainAdvice: BrainAdvice;
+}
+
+/**
+ * The one-shot machine-change notice — this install last ran on a DIFFERENT Mac
+ * (restore-from-backup / Migration Assistant) and has not dismissed the notice.
+ * Deliberately PULLED, never pushed: an event emitted during backend `setup`
+ * would be lost, because the webview has not called `listen()` yet.
+ */
+export interface MachineChangeNudge {
+  recommendedId: string;
+  recommendedTier: string | null;
+  selectedId: string;
+  chipName: string | null;
+  totalRamBytes: number | null;
+}
+
 /**
  * Realtime Reactions — one "whisper" contradiction card (`EVENT_WHISPER_CARD`).
  * Mirrors the Rust `WhisperCard` (camelCase). EPHEMERAL (emitted as an event,

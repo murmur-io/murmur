@@ -1,4 +1,5 @@
 pub mod bullets;
+pub mod catalog;
 pub mod diarize;
 pub mod live;
 pub mod live_asr;
