@@ -3245,10 +3245,17 @@ impl Db {
     /// applies EXACTLY the `search_visible` visibility predicate (a meeting is kept iff it has a
     /// VISIBLE note row — open/NULL folder OR session-unlocked) so a sealed-and-not-unlocked meeting
     /// is excluded even if a stray chunk survived. Dedups to one hit per meeting (best/nearest).
+    ///
+    /// `min_cosine` (S1) is an OPT-IN relevance FLOOR over the vector leg: a candidate whose cosine
+    /// (mapped from the vec0 L2 distance over UNIT vectors via [`crate::links::cosine_from_l2_distance`],
+    /// since `|a-b|² = 2 − 2·cos`) is BELOW it is dropped as noise. Sentinel `0.0` = NO floor
+    /// (behaviour-identical to before S1). Applied strictly AFTER the visibility gate, so it can only
+    /// ever REMOVE rows — never widen or reorder a leg around its gate.
     pub fn search_semantic_visible(
         &self,
         query_vec: &[f32],
         k: i64,
+        min_cosine: f32,
         unlocked: &HashSet<String>,
     ) -> Result<Vec<SearchHit>> {
         if query_vec.is_empty() || k <= 0 {
@@ -3284,14 +3291,22 @@ impl Db {
             .query_map(rusqlite::params![blob, k], |row| {
                 let meeting = row_to_meeting(row)?;
                 let snippet: String = row.get(8)?;
-                Ok((meeting, snippet))
+                let distance: f64 = row.get(9)?;
+                Ok((meeting, snippet, distance))
             })
             .map_err(map_err)?;
 
         let mut seen: HashSet<String> = HashSet::new();
         let mut hits = Vec::new();
         for r in rows {
-            let (meeting, snippet) = r.map_err(map_err)?;
+            let (meeting, snippet, distance) = r.map_err(map_err)?;
+            // S1 relevance floor: drop a below-floor neighbour (noise on a tiny/irrelevant corpus).
+            // Applied AFTER the SQL visibility gate — it can only REMOVE rows.
+            if min_cosine > 0.0
+                && crate::links::cosine_from_l2_distance(distance as f32) < min_cosine
+            {
+                continue;
+            }
             let meeting = meeting?;
             if !seen.insert(meeting.id.clone()) {
                 continue; // already have a nearer chunk for this meeting.
@@ -3378,7 +3393,8 @@ impl Db {
         }
 
         // GATED KNN. Ask for k+1 because self is always the nearest hit; then drop self + truncate.
-        let mut hits = self.search_semantic_visible(&centroid, k + 1, unlocked)?;
+        // No S1 floor here (0.0) — related-meetings is behaviour-preserving; only the MCP search arms floor.
+        let mut hits = self.search_semantic_visible(&centroid, k + 1, 0.0, unlocked)?;
         hits.retain(|h| h.meeting.id != meeting_id);
         hits.truncate(k as usize);
         tracing::debug!(
@@ -3402,7 +3418,7 @@ impl Db {
         date_filter: Option<&(String, String)>,
     ) -> Result<Vec<(String, f64)>> {
         let q = query.trim();
-        let Some(match_expr) = fts_match_query(q) else {
+        let Some(and_expr) = fts_match_query(q) else {
             return Ok(Vec::new());
         };
         let conn = self.lock();
@@ -3446,16 +3462,32 @@ impl Db {
               LIMIT ?2"
         );
         let mut stmt = conn.prepare(&sql).map_err(map_err)?;
-        let rows = stmt
-            .query_map(rusqlite::params![match_expr, limit], |r| {
-                let id: String = r.get(0)?;
-                let rank: f64 = r.get(1)?;
-                Ok((id, -rank)) // FTS5 bm25() is lower/more-negative = better ⇒ negate to higher-better.
-            })
-            .map_err(map_err)?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r.map_err(map_err)?);
+        // Run the (already-gated) FTS body with a given match expression. The visibility predicate is
+        // baked into the SQL, so swapping AND→OR only ever changes WHICH visible rows match.
+        let run = |stmt: &mut rusqlite::Statement, expr: &str| -> Result<Vec<(String, f64)>> {
+            let rows = stmt
+                .query_map(rusqlite::params![expr, limit], |r| {
+                    let id: String = r.get(0)?;
+                    let rank: f64 = r.get(1)?;
+                    Ok((id, -rank)) // FTS5 bm25() is lower/more-negative = better ⇒ negate to higher-better.
+                })
+                .map_err(map_err)?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r.map_err(map_err)?);
+            }
+            Ok(out)
+        };
+        // S2 AND→OR fallback: implicit-AND matched nothing ⇒ retry with the content-word OR twin
+        // (stopwords/<3-char dropped). Only fires on an EMPTY AND result, so it never widens a
+        // successful query; stays exact-word lexical.
+        let mut out = run(&mut stmt, &and_expr)?;
+        if out.is_empty() {
+            if let Some(any_expr) = fts_match_query_any(q) {
+                if any_expr != and_expr {
+                    out = run(&mut stmt, &any_expr)?;
+                }
+            }
         }
         Ok(out)
     }
@@ -3468,6 +3500,7 @@ impl Db {
         &self,
         query_vec: &[f32],
         k: i64,
+        min_cosine: f32,
         unlocked: &HashSet<String>,
         date_filter: Option<&(String, String)>,
     ) -> Result<Vec<(String, f64)>> {
@@ -3519,7 +3552,13 @@ impl Db {
             .map_err(map_err)?;
         let mut out = Vec::new();
         for r in rows {
-            out.push(r.map_err(map_err)?);
+            let (id, d) = r.map_err(map_err)?;
+            // S1 relevance floor over the vector leg (opt-in; 0.0 = none). Applied AFTER the SQL
+            // visibility gate, so it can only REMOVE below-floor rows — never widen or reorder.
+            if min_cosine > 0.0 && crate::links::cosine_from_l2_distance(d as f32) < min_cosine {
+                continue;
+            }
+            out.push((id, d));
         }
         Ok(out)
     }
@@ -3538,11 +3577,18 @@ impl Db {
     /// the window itself becomes the FTS leg (visible meetings in range, newest-first) — the
     /// "what did we discuss last week" shape. All legs route through the SAME
     /// `visibility_clause`, so the fused output stays gated.
+    ///
+    /// `min_cosine` (S1) is the vector-leg relevance FLOOR, threaded to BOTH vector legs
+    /// (`search_semantic_visible` for the snippet leg, `knn_meeting_distances` for the score leg);
+    /// the FTS and graph legs are NEVER floored. Sentinel `0.0` = no floor. When the floor empties
+    /// the KNN leg on an irrelevant corpus, `score_fuse`'s empty-leg redistribution rescales the
+    /// surviving FTS + graph legs, so an exact-word FTS hit still surfaces (recall safety).
     pub fn search_hybrid_visible(
         &self,
         query: &str,
         query_vec: &[f32],
         limit: i64,
+        min_cosine: f32,
         unlocked: &HashSet<String>,
         date_filter: Option<(String, String)>,
     ) -> Result<Vec<SearchHit>> {
@@ -3558,7 +3604,7 @@ impl Db {
 
         // Snippet-bearing hit lists (each already gated); ordering comes from the scored legs.
         let fts = self.search_visible_impl(query, limit, unlocked, range)?;
-        let semantic = self.search_semantic_visible(query_vec, limit, unlocked)?;
+        let semantic = self.search_semantic_visible(query_vec, limit, min_cosine, unlocked)?;
 
         // GraphRAG-lite leg: resolve the query to known VISIBLE entities (deterministic, no LLM),
         // then gather their co-mention neighbourhood. Both the resolver and the neighbour reader
@@ -3580,7 +3626,7 @@ impl Db {
                 .map(|(i, m)| (m.id.clone(), 1.0 / (i as f64 + 1.0)))
                 .collect();
         }
-        let knn_scored = self.knn_meeting_distances(query_vec, limit, unlocked, range)?;
+        let knn_scored = self.knn_meeting_distances(query_vec, limit, min_cosine, unlocked, range)?;
         let graph_scored: Vec<(String, f64)> = graph
             .iter()
             .enumerate()
@@ -4431,10 +4477,16 @@ impl Db {
     /// winner's `sibling_hits` across the pre-dedup KNN candidates ([`Db::fold_doc_candidates`]).
     /// Returns the chunk snippet + the document name + its folder id + the winning chunk's
     /// hierarchy metadata (NO meeting — documents are not meetings).
+    ///
+    /// `min_cosine` (S1) is the OPT-IN vector-leg relevance floor (cosine mapped from the vec0 L2
+    /// distance via [`crate::links::cosine_from_l2_distance`]); a below-floor candidate is dropped
+    /// as noise. Sentinel `0.0` = NO floor. Applied AFTER the SQL visibility gate, so it can only
+    /// ever REMOVE rows.
     pub fn search_doc_chunks_visible(
         &self,
         query_vec: &[f32],
         k: i64,
+        min_cosine: f32,
         unlocked: &HashSet<String>,
     ) -> Result<Vec<DocChunkHit>> {
         if query_vec.is_empty() || k <= 0 {
@@ -4443,6 +4495,7 @@ impl Db {
         let conn = self.lock();
         let visible = visibility_clause("f", unlocked);
         // KNN isolated to the vec0 table in a CTE; visibility + document columns joined OUTSIDE it.
+        // The trailing `knn.distance` column feeds the S1 relevance floor (dropped below-floor).
         let sql = format!(
             "WITH knn(chunk_id, distance) AS (
                  SELECT chunk_id, distance FROM doc_vec_chunks
@@ -4450,7 +4503,7 @@ impl Db {
                   ORDER BY distance
              )
              SELECT d.id, d.name, d.folder_id, dc.text, d.kind,
-                    dc.id, dc.parent_id, dc.section_path, dc.page_no, dc.level
+                    dc.id, dc.parent_id, dc.section_path, dc.page_no, dc.level, knn.distance
                FROM knn
                JOIN doc_chunks dc ON dc.id = knn.chunk_id
                JOIN documents d ON d.id = dc.document_id
@@ -4461,10 +4514,27 @@ impl Db {
         let blob = crate::embed::vec_to_blob(query_vec);
         let mut stmt = conn.prepare(&sql).map_err(map_err)?;
         let rows = stmt
-            .query_map(rusqlite::params![blob, k], Self::doc_candidate_from_row)
+            .query_map(rusqlite::params![blob, k], |row| {
+                let hit = Self::doc_candidate_from_row(row)?;
+                let distance: f64 = row.get(10)?;
+                Ok((hit, distance))
+            })
             .map_err(map_err)?;
-        // The k-row KNN CTE already bounds the candidate set; every deduped hit is kept (as before).
-        Self::fold_doc_candidates(rows, None)
+        // Drop below-floor candidates (0.0 = no floor) BEFORE the per-document dedup/fold, so the
+        // fold's winner is the nearest SURVIVING chunk. The k-row KNN CTE bounds the candidate set.
+        let filtered = rows.filter_map(|r| match r {
+            Ok((hit, distance)) => {
+                if min_cosine > 0.0
+                    && crate::links::cosine_from_l2_distance(distance as f32) < min_cosine
+                {
+                    None
+                } else {
+                    Some(Ok(hit))
+                }
+            }
+            Err(e) => Some(Err(e)),
+        });
+        Self::fold_doc_candidates(filtered, None)
     }
 
     /// GATED keyword (FTS5/BM25) search over DOCUMENT chunks — the model-free twin of
@@ -4484,7 +4554,8 @@ impl Db {
         if limit <= 0 {
             return Ok(Vec::new());
         }
-        let Some(match_expr) = fts_match_query(query.trim()) else {
+        let q = query.trim();
+        let Some(and_expr) = fts_match_query(q) else {
             return Ok(Vec::new()); // punctuation-only / empty query → no hits, never an FTS error.
         };
         let conn = self.lock();
@@ -4500,13 +4571,31 @@ impl Db {
               ORDER BY bm25(fts_doc_chunks) ASC, d.id ASC"
         );
         let mut stmt = conn.prepare(&sql).map_err(map_err)?;
-        let rows = stmt
-            .query_map(rusqlite::params![match_expr], Self::doc_candidate_from_row)
-            .map_err(map_err)?;
         // Bound the sibling-count scan so a stop-word-ish query over a large corpus stays cheap;
         // sibling counts are then a LOWER bound, which can only under-trigger expansion (safe).
         let scan_cap = (limit as usize).saturating_mul(10).max(64);
-        Self::fold_doc_candidates(rows.take(scan_cap), Some(limit as usize))
+        // Collect the (already-gated) candidate rows for a given match expression, bounded by scan_cap.
+        let run = |stmt: &mut rusqlite::Statement, expr: &str| -> Result<Vec<DocChunkHit>> {
+            let rows = stmt
+                .query_map(rusqlite::params![expr], Self::doc_candidate_from_row)
+                .map_err(map_err)?;
+            let mut cands = Vec::new();
+            for r in rows.take(scan_cap) {
+                cands.push(r.map_err(map_err)?);
+            }
+            Ok(cands)
+        };
+        // S2 AND→OR fallback: implicit-AND matched nothing ⇒ retry with the content-word OR twin.
+        // Fires only on an empty AND result — never widens a successful query.
+        let mut cands = run(&mut stmt, &and_expr)?;
+        if cands.is_empty() {
+            if let Some(any_expr) = fts_match_query_any(q) {
+                if any_expr != and_expr {
+                    cands = run(&mut stmt, &any_expr)?;
+                }
+            }
+        }
+        Self::fold_doc_candidates(cands.into_iter().map(Ok), Some(limit as usize))
     }
 
     /// Brain v3 audit Fix 1 — HIT-ALIGNED, SIBLING-GATED parent expansion (LlamaIndex auto-merging
@@ -5626,7 +5715,7 @@ impl Db {
         date_filter: Option<&(String, String)>,
     ) -> Result<Vec<SearchHit>> {
         let q = query.trim();
-        let Some(match_expr) = fts_match_query(q) else {
+        let Some(and_expr) = fts_match_query(q) else {
             return Ok(Vec::new());
         };
         let conn = self.lock();
@@ -5677,12 +5766,28 @@ impl Db {
               LIMIT ?2"
         );
         let mut stmt = conn.prepare(&sql).map_err(map_err)?;
-        let rows = stmt
-            .query_map(rusqlite::params![match_expr, limit], row_to_meeting)
-            .map_err(map_err)?;
-        let mut meetings = Vec::new();
-        for r in rows {
-            meetings.push(r.map_err(map_err)??);
+        // Run the (already-gated) FTS body with a given match expression; only WHICH visible rows
+        // match changes when we swap AND→OR.
+        let run = |stmt: &mut rusqlite::Statement, expr: &str| -> Result<Vec<Meeting>> {
+            let rows = stmt
+                .query_map(rusqlite::params![expr, limit], row_to_meeting)
+                .map_err(map_err)?;
+            let mut meetings = Vec::new();
+            for r in rows {
+                meetings.push(r.map_err(map_err)??);
+            }
+            Ok(meetings)
+        };
+        // S2 AND→OR fallback: implicit-AND matched nothing ⇒ retry with the content-word OR twin
+        // (stopwords/<3-char dropped). Fires ONLY on an empty AND result, so it never widens a
+        // successful query and stays exact-word lexical (the crisp "no match" is preserved).
+        let mut meetings = run(&mut stmt, &and_expr)?;
+        if meetings.is_empty() {
+            if let Some(any_expr) = fts_match_query_any(q) {
+                if any_expr != and_expr {
+                    meetings = run(&mut stmt, &any_expr)?;
+                }
+            }
         }
         let like = format!("%{}%", escape_like(q));
         let mut hits = Vec::with_capacity(meetings.len());
