@@ -2302,9 +2302,31 @@ async fn summarize_and_export(
     // would `> unverified` a legitimately-abstractive sentence in the note 100% of users read).
     // The markers become part of the note markdown and are sealed WITH it. The meeting's own
     // segments are fetched ONLY on this opt-in path (the default OFF path does no wasted DB read).
-    let markdown = if config.ground_summary {
+    //
+    // The RECALL half of the same net (opt-in, its own flag): `recall_net::append_possible_missed_items`
+    // scans the SAME segments for commitment cues the note's `- [ ]` items do not cover and APPENDS a
+    // clearly-marked "## Possible missed items" section. Grounding catches what the model made UP;
+    // this catches what it left OUT. Same posture: deterministic, zero-egress, non-destructive
+    // (append-only — the body above it stays byte-identical, so action-item parsing is unaffected),
+    // idempotent, and default OFF. The flag is a standalone settings row (see
+    // `settings::action_item_recall_net_enabled`), not an `AppConfig` field.
+    //
+    // Both flags OFF ⇒ this whole block is byte-identical to the pre-existing pipeline AND does no
+    // segment read at all; the (single) read is shared when both are on, and grounding runs FIRST so
+    // it never sees — or flags — the appended transcript quotes.
+    let recall_net = crate::settings::action_item_recall_net_enabled(&state.db);
+    let markdown = if config.ground_summary || recall_net {
         let segments = state.db.get_segments(meeting_id).unwrap_or_default();
-        crate::summarize::grounding::annotate_unverified(&markdown, &segments)
+        let grounded = if config.ground_summary {
+            crate::summarize::grounding::annotate_unverified(&markdown, &segments)
+        } else {
+            markdown
+        };
+        if recall_net {
+            crate::summarize::recall_net::append_possible_missed_items(&grounded, &segments)
+        } else {
+            grounded
+        }
     } else {
         markdown
     };
