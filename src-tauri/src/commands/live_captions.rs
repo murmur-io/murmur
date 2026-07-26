@@ -243,6 +243,29 @@ fn companion_pending_in(
     live_model_pin: &str,
     brain_live: bool,
 ) -> bool {
+    companion_pending_size_in(
+        dir,
+        configured,
+        model_size,
+        language,
+        live_model_pin,
+        brain_live,
+    )
+    .is_some()
+}
+
+/// [`companion_pending_in`] but returning WHICH size would be fetched, so the recommendation DTO can
+/// price the companion download in Rust (the FE must never sum model sizes itself). Same ONE
+/// decision — `companion_pending_in` is now literally `.is_some()` over this — so the disclosure and
+/// the byte total can never disagree.
+pub(crate) fn companion_pending_size_in(
+    dir: &Path,
+    configured: Option<&Path>,
+    model_size: &str,
+    language: &str,
+    live_model_pin: &str,
+    brain_live: bool,
+) -> Option<String> {
     companion_size_lazy(
         dir,
         // Mirrors `ensure_model`'s own resolution: an existing explicit path is used verbatim,
@@ -255,7 +278,6 @@ fn companion_pending_in(
         live_model_pin,
         brain_live,
     )
-    .is_some()
 }
 
 /// The two DISPLAY-ONLY facts `get_config` ships to the FE, resolved over ONE models-dir lookup:

@@ -844,6 +844,19 @@ const K_ROLE_ASK_EFFORT: &str = "role_ask_effort";
 /// (`AppConfig::save` never writes this key), and it round-trips durably. Promoting it to a real
 /// `AppConfig` field + a Settings toggle is the follow-up, alongside `ground_summary`'s.
 const K_ACTION_ITEM_RECALL_NET: &str = "action_item_recall_net";
+/// P1 — WHO chose the current `model_size`: `"auto"` (Murmur's recommendation) or `"user"` (a
+/// deliberate pick). STANDALONE rows for the same reason as [`K_ACTION_ITEM_RECALL_NET`]: an
+/// `AppConfig` field would have to be threaded through `commands::dto_to_config`'s exhaustive
+/// struct literal. See [`model_size_source`].
+const K_MODEL_SIZE_SOURCE: &str = "model_size_source";
+/// P1 — the last-seen [`crate::machine::fingerprint`]. Compared once at startup so a
+/// restore-from-backup / Migration Assistant move to a different Mac can re-offer the
+/// recommendation.
+const K_MACHINE_FINGERPRINT: &str = "machine_fingerprint";
+/// P1 — set when the startup compare saw a DIFFERENT machine, cleared when the user dismisses the
+/// nudge. A settings ROW, not an event: Tauri does not buffer events and the webview has not called
+/// `listen()` during `setup`, so an event emitted there is simply lost. The nudge is a PULL.
+const K_MACHINE_CHANGE_PENDING: &str = "machine_change_pending";
 const K_ROLE_LIVE_CONNECTION: &str = "role_live_connection";
 const K_ROLE_LIVE_MODEL: &str = "role_live_model";
 const K_ROLE_LIVE_EFFORT: &str = "role_live_effort";
@@ -1737,6 +1750,125 @@ pub fn set_action_item_recall_net(db: &Db, enabled: bool) -> Result<()> {
         K_ACTION_ITEM_RECALL_NET,
         if enabled { "true" } else { "false" },
     )
+}
+
+/// `model_size_source` = `"auto"` (Murmur's recommendation put it there) or `"user"` (a deliberate
+/// pick). Any other stored value — including a blank one — reads as ABSENT, so an unknown token can
+/// never masquerade as a deliberate choice.
+pub const MODEL_SIZE_SOURCE_AUTO: &str = "auto";
+pub const MODEL_SIZE_SOURCE_USER: &str = "user";
+
+/// Read the recorded source of the current `model_size`, or `None` when it was never recorded.
+pub fn model_size_source(db: &Db) -> Option<String> {
+    db.get_setting(K_MODEL_SIZE_SOURCE)
+        .ok()
+        .flatten()
+        .filter(|v| v == MODEL_SIZE_SOURCE_AUTO || v == MODEL_SIZE_SOURCE_USER)
+}
+
+/// Record who chose the current `model_size`. REVERSIBLE, not write-once: "Switch to Sharp" records
+/// `"auto"`, the Quality control records `"user"`, and either may overwrite the other. An
+/// unrecognised token is rejected (`InvalidArg`) rather than stored, so the row can only ever hold
+/// a value [`model_size_source`] will read back.
+/// Validation ONLY — split out from [`set_model_size_source`] so a caller can refuse a bad token
+/// BEFORE it persists anything else, while deferring the write itself until the `model_size` this
+/// row describes is durable. Returns the trimmed, accepted token.
+pub fn validate_model_size_source(source: &str) -> Result<&str> {
+    let s = source.trim();
+    if s != MODEL_SIZE_SOURCE_AUTO && s != MODEL_SIZE_SOURCE_USER {
+        return Err(crate::error::AppError::InvalidArg(format!(
+            "model_size_source must be \"auto\" or \"user\", got: {s}"
+        )));
+    }
+    Ok(s)
+}
+
+pub fn set_model_size_source(db: &Db, source: &str) -> Result<()> {
+    let s = validate_model_size_source(source)?;
+    db.set_setting(K_MODEL_SIZE_SOURCE, s)
+}
+
+/// C9 BACKFILL — stamp an onboarded install's `model_size` as `"user"`, once.
+///
+/// EXACT REACH, stated plainly because an earlier version of this doc got it wrong: there is NO
+/// "predates the row" marker anywhere. This runs from `lib.rs` setup on EVERY launch, so it stamps
+/// ANY onboarded install whose row is still absent — a years-old install on its next launch, and
+/// equally a brand-new install on the first launch after onboarding completes. Do not describe it
+/// as an existing-install-only migration.
+///
+/// BE HONEST ABOUT WHAT IT CAN KNOW. Provenance was never recorded, so it is **unrecoverable**: a
+/// user who deliberately picked `small` and a user who merely accepted what onboarding preselected
+/// are byte-identical on disk. Both are marked `"user"`. That is a deliberate choice of failure
+/// direction — `"user"` means "never move this selection on the user's behalf", the never-surprise
+/// direction — and it must NOT be read as evidence the user actively chose the size.
+///
+/// The `model_size.trim().is_empty()` guard below is DEFENSIVE ONLY and discriminates nothing in
+/// practice: `AppConfig::default()` always seeds `model_size` from `default_model_size_now()`, and
+/// `AppConfig::load` only overwrites it when the stored value is non-empty, so the value reaching
+/// this function is never blank outside a hand-edited config. Do not build behaviour on it.
+///
+/// Consequently `"auto"` is written by NOTHING in this tree today — the only non-backfill writer is
+/// `save_config_inner`, and no caller sends the token yet.
+///
+/// FOLLOW-UP OWNED BY THE UI PR: the onboarding write that persists the PRESELECTED recommendation
+/// should send `"auto"` explicitly, so a fresh install is not mislabelled as a deliberate choice.
+/// Until it does, a fresh install is treated as `"user"`, which is inert but conservative.
+///
+/// Idempotent: it never overwrites an existing row, so a later `"auto"` cannot be clobbered back to
+/// `"user"` on the next launch. Returns `true` when it actually wrote.
+pub fn backfill_model_size_source(db: &Db, onboarded: bool, model_size: &str) -> Result<bool> {
+    if model_size_source(db).is_some() || !onboarded || model_size.trim().is_empty() {
+        return Ok(false);
+    }
+    set_model_size_source(db, MODEL_SIZE_SOURCE_USER)?;
+    Ok(true)
+}
+
+/// Whether a machine-change nudge is waiting to be shown.
+pub fn machine_change_pending(db: &Db) -> bool {
+    matches!(
+        db.get_setting(K_MACHINE_CHANGE_PENDING)
+            .ok()
+            .flatten()
+            .as_deref(),
+        Some("true")
+    )
+}
+
+/// Clear the pending machine-change nudge (the user dismissed it).
+pub fn clear_machine_change_pending(db: &Db) -> Result<()> {
+    db.set_setting(K_MACHINE_CHANGE_PENDING, "false")
+}
+
+/// Startup machine-change compare. Returns `true` when this launch newly RAISED the nudge.
+///
+/// ORDER IS LOAD-BEARING: on a mismatch the pending row is written FIRST and the new fingerprint
+/// only afterwards. Writing the fingerprint first (as an earlier design did, at "emit" time) makes
+/// the nudge unrecoverable — a crash, or simply a webview that had not yet subscribed, loses the
+/// signal forever because the machine now looks unchanged.
+///
+/// A FIRST-EVER launch (no stored fingerprint) records the fingerprint and raises NOTHING — there
+/// is no "change" to report on a machine we have never seen. An unreadable fingerprint (`None`,
+/// i.e. RAM could not be probed) is a complete no-op: it must never clear or overwrite a good
+/// stored value, and it must never fire a nudge off a missing measurement.
+pub fn note_machine_fingerprint(db: &Db, current: Option<&str>) -> Result<bool> {
+    let Some(current) = current else {
+        return Ok(false);
+    };
+    let stored = db.get_setting(K_MACHINE_FINGERPRINT)?;
+    match stored.as_deref().filter(|s| !s.is_empty()) {
+        Some(prev) if prev == current => Ok(false),
+        Some(_) => {
+            // Raise the nudge BEFORE moving the fingerprint (see the doc comment).
+            db.set_setting(K_MACHINE_CHANGE_PENDING, "true")?;
+            db.set_setting(K_MACHINE_FINGERPRINT, current)?;
+            Ok(true)
+        }
+        None => {
+            db.set_setting(K_MACHINE_FINGERPRINT, current)?;
+            Ok(false)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2996,5 +3128,122 @@ mod tests {
         assert_eq!(loaded.audio_storage_limit_gb, Some(2));
         assert!(loaded.audio_auto_prune);
         let _ = std::fs::remove_file(&p);
+    }
+
+    /// C9 — `model_size_source` round-trips, rejects an unrecognised token, and is REVERSIBLE
+    /// (auto → user → auto), never write-once.
+    #[test]
+    fn model_size_source_round_trips_and_is_reversible() {
+        let db = temp_db();
+        assert_eq!(model_size_source(&db), None, "absent until recorded");
+
+        set_model_size_source(&db, MODEL_SIZE_SOURCE_AUTO).unwrap();
+        assert_eq!(model_size_source(&db).as_deref(), Some("auto"));
+        set_model_size_source(&db, MODEL_SIZE_SOURCE_USER).unwrap();
+        assert_eq!(model_size_source(&db).as_deref(), Some("user"));
+        // …and back again — the field is not write-once.
+        set_model_size_source(&db, MODEL_SIZE_SOURCE_AUTO).unwrap();
+        assert_eq!(model_size_source(&db).as_deref(), Some("auto"));
+
+        // An unrecognised token is REFUSED, and the stored value survives untouched.
+        assert!(set_model_size_source(&db, "whatever").is_err());
+        assert!(set_model_size_source(&db, "").is_err());
+        assert_eq!(model_size_source(&db).as_deref(), Some("auto"));
+    }
+
+    /// C9 BACKFILL — an existing (onboarded, non-blank size) install is recorded as a deliberate
+    /// `"user"` choice exactly once; every other shape is left alone, and the backfill never
+    /// overwrites a value already there.
+    #[test]
+    fn model_size_source_backfill_only_marks_existing_installs() {
+        // Onboarded + a real size ⇒ backfilled once, then idempotent.
+        let db = temp_db();
+        assert!(backfill_model_size_source(&db, true, "small").unwrap());
+        assert_eq!(model_size_source(&db).as_deref(), Some("user"));
+        assert!(
+            !backfill_model_size_source(&db, true, "small").unwrap(),
+            "a second run must not rewrite the row"
+        );
+
+        // A later `"auto"` (the user took the recommendation) must NOT be clobbered back to
+        // `"user"` on the next launch.
+        set_model_size_source(&db, MODEL_SIZE_SOURCE_AUTO).unwrap();
+        assert!(!backfill_model_size_source(&db, true, "small").unwrap());
+        assert_eq!(model_size_source(&db).as_deref(), Some("auto"));
+
+        // NOT onboarded ⇒ nothing recorded (a fresh install's size comes from the recommendation).
+        let fresh = temp_db();
+        assert!(!backfill_model_size_source(&fresh, false, "small").unwrap());
+        assert_eq!(model_size_source(&fresh), None);
+
+        // A BLANK size is refused — but ONLY as a defensive guard for a hand-edited config. It is
+        // NOT a discriminator between "chose deliberately" and "accepted the preselection":
+        // `AppConfig::default()` seeds `model_size` from `default_model_size_now()` and
+        // `AppConfig::load` only overwrites a non-empty stored value, so the real call site at
+        // launch never passes a blank. The next assertion states what actually happens to the
+        // existing user base.
+        let blank = temp_db();
+        assert!(!backfill_model_size_source(&blank, true, "").unwrap());
+        assert!(!backfill_model_size_source(&blank, true, "   ").unwrap());
+        assert_eq!(model_size_source(&blank), None);
+
+        // THE HONEST STATEMENT OF THIS FUNCTION'S REACH: an onboarded install is marked "user"
+        // regardless of whether the size was actively chosen or merely accepted from onboarding's
+        // preselection, because provenance was never recorded and is unrecoverable. "user" is the
+        // never-surprise direction (do not move the selection on their behalf) — it must not be
+        // read as evidence the user made a deliberate choice.
+        let preselected = temp_db();
+        let untouched_default = AppConfig::default().model_size;
+        assert!(
+            backfill_model_size_source(&preselected, true, &untouched_default).unwrap(),
+            "an untouched onboarding preselection is still stamped, because it is indistinguishable from a real choice"
+        );
+        assert_eq!(model_size_source(&preselected).as_deref(), Some("user"));
+    }
+
+    /// C3 — the machine-change nudge is a durable PULL. First launch records silently; an identical
+    /// launch is a no-op; a DIFFERENT machine raises the pending row AND moves the fingerprint (in
+    /// that order), and the nudge survives until dismissed.
+    #[test]
+    fn machine_fingerprint_raises_a_durable_nudge_only_on_a_real_change() {
+        let db = temp_db();
+        assert!(!machine_change_pending(&db));
+
+        // First ever launch: record, do not nudge.
+        assert!(!note_machine_fingerprint(&db, Some("ram=1;arch=arm64;chip=Apple M1")).unwrap());
+        assert!(!machine_change_pending(&db));
+
+        // Same machine again: no-op.
+        assert!(!note_machine_fingerprint(&db, Some("ram=1;arch=arm64;chip=Apple M1")).unwrap());
+        assert!(!machine_change_pending(&db));
+
+        // A different Mac: nudge raised.
+        assert!(note_machine_fingerprint(&db, Some("ram=2;arch=arm64;chip=Apple M4 Max")).unwrap());
+        assert!(machine_change_pending(&db));
+
+        // The nudge SURVIVES a relaunch on the (now current) machine — it is a pull, not an event
+        // that evaporates because nobody was listening.
+        assert!(
+            !note_machine_fingerprint(&db, Some("ram=2;arch=arm64;chip=Apple M4 Max")).unwrap()
+        );
+        assert!(machine_change_pending(&db));
+
+        clear_machine_change_pending(&db).unwrap();
+        assert!(!machine_change_pending(&db));
+    }
+
+    /// An UNREADABLE fingerprint (RAM probe failed) is a complete no-op: it must not fire a nudge
+    /// off a missing measurement, and it must not clobber the good stored value.
+    #[test]
+    fn machine_fingerprint_unreadable_probe_is_a_no_op() {
+        let db = temp_db();
+        note_machine_fingerprint(&db, Some("ram=1;arch=arm64;chip=Apple M1")).unwrap();
+
+        assert!(!note_machine_fingerprint(&db, None).unwrap());
+        assert!(!machine_change_pending(&db));
+
+        // The stored value survived, so the NEXT good read still compares as unchanged.
+        assert!(!note_machine_fingerprint(&db, Some("ram=1;arch=arm64;chip=Apple M1")).unwrap());
+        assert!(!machine_change_pending(&db));
     }
 }
