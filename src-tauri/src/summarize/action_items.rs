@@ -82,8 +82,10 @@ fn extract_owner(text: &str) -> Option<String> {
     None
 }
 
-/// First `YYYY-MM-DD` substring in `s`, char-boundary safe.
-fn find_date(s: &str) -> Option<String> {
+/// First `YYYY-MM-DD` substring in `s`, char-boundary safe. `pub(crate)` so the action-item RECALL
+/// NET (`summarize::recall_net`) treats a spoken ISO date as a deadline cue using the SAME date
+/// notion the checklist due-date patcher uses — one date scanner, not two.
+pub(crate) fn find_date(s: &str) -> Option<String> {
     let len = s.len();
     if len < 10 {
         return None;

@@ -836,6 +836,14 @@ const K_ROLE_NOTES_EFFORT: &str = "role_notes_effort";
 const K_ROLE_ASK_CONNECTION: &str = "role_ask_connection";
 const K_ROLE_ASK_MODEL: &str = "role_ask_model";
 const K_ROLE_ASK_EFFORT: &str = "role_ask_effort";
+/// ACTION-ITEM RECALL NET (opt-in) — see [`action_item_recall_net_enabled`]. Deliberately a
+/// STANDALONE settings row rather than an `AppConfig` field: `commands::dto_to_config` builds
+/// `AppConfig` as an EXHAUSTIVE struct literal, so a new field would have to be threaded through
+/// that file too. Keeping the flag as its own key gives the SAME semantics as the preserve-only
+/// `ground_summary` discipline for free — a normal settings save neither grants nor clears it
+/// (`AppConfig::save` never writes this key), and it round-trips durably. Promoting it to a real
+/// `AppConfig` field + a Settings toggle is the follow-up, alongside `ground_summary`'s.
+const K_ACTION_ITEM_RECALL_NET: &str = "action_item_recall_net";
 const K_ROLE_LIVE_CONNECTION: &str = "role_live_connection";
 const K_ROLE_LIVE_MODEL: &str = "role_live_model";
 const K_ROLE_LIVE_EFFORT: &str = "role_live_effort";
@@ -1701,6 +1709,36 @@ fn opt(value: Option<String>) -> Option<String> {
     value.filter(|v| !v.is_empty())
 }
 
+/// ACTION-ITEM RECALL NET — is the opt-in transcript cue scan
+/// ([`crate::summarize::recall_net::append_possible_missed_items`]) enabled?
+///
+/// Default OFF / OPT-IN, mirroring `ground_summary`: a lexical cue scan is deliberately
+/// LOW-PRECISION, so an always-on version would append noisy "Possible missed items" quotes to the
+/// note 100% of users read. It must stay opt-in until the cue list + overlap thresholds are
+/// calibrated against real meetings. OFF is BYTE-IDENTICAL to the previous pipeline (the scan never
+/// runs and the meeting's segments are not even fetched).
+///
+/// FAIL-CLOSED: an absent key, any value other than `"true"`, or a DB read error all read as OFF —
+/// a storage hiccup can never silently switch a note-content feature on.
+pub fn action_item_recall_net_enabled(db: &Db) -> bool {
+    matches!(
+        db.get_setting(K_ACTION_ITEM_RECALL_NET)
+            .ok()
+            .flatten()
+            .as_deref(),
+        Some("true")
+    )
+}
+
+/// Persist the opt-in above. The ONLY mutator (the flag is not on the settings DTO), so it can never
+/// be flipped as a side effect of a generic settings save. Idempotent.
+pub fn set_action_item_recall_net(db: &Db, enabled: bool) -> Result<()> {
+    db.set_setting(
+        K_ACTION_ITEM_RECALL_NET,
+        if enabled { "true" } else { "false" },
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2265,6 +2303,42 @@ mod tests {
         .save(&db)
         .unwrap();
         assert!(!AppConfig::load(&db).unwrap().ground_summary);
+    }
+
+    /// ACTION-ITEM RECALL NET: defaults OFF / opt-in on a fresh DB (the cue scan is low-precision
+    /// until calibrated), both states round-trip, and — the preserve-only half — a normal
+    /// `AppConfig::save` can neither grant nor clear it.
+    #[test]
+    fn recall_net_defaults_off_round_trips_and_survives_a_settings_save() {
+        let db = temp_db();
+        assert!(
+            !action_item_recall_net_enabled(&db),
+            "the recall net must default OFF on a fresh DB (opt-in until calibrated)"
+        );
+
+        set_action_item_recall_net(&db, true).unwrap();
+        assert!(
+            action_item_recall_net_enabled(&db),
+            "an explicit opt-in must persist"
+        );
+
+        // A generic settings save writes every KNOWN key; this one is not among them, so the user's
+        // opt-in survives (and, symmetrically, a save can never turn it ON).
+        AppConfig::default().save(&db).unwrap();
+        assert!(
+            action_item_recall_net_enabled(&db),
+            "a settings save must not clear the opt-in"
+        );
+
+        set_action_item_recall_net(&db, false).unwrap();
+        assert!(!action_item_recall_net_enabled(&db), "an opt-out persists");
+
+        // FAIL-CLOSED on a junk value (only the exact "true" enables it).
+        db.set_setting(K_ACTION_ITEM_RECALL_NET, "yes").unwrap();
+        assert!(
+            !action_item_recall_net_enabled(&db),
+            "any value other than \"true\" reads as OFF"
+        );
     }
 
     /// A config payload that OMITS `ground_summary` (persisted before the field existed) deserializes
