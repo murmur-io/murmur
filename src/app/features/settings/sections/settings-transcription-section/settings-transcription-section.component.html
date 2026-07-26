@@ -78,12 +78,10 @@
               } @else if (modelPresent() === false) {
                 @if (downloadingModel()) {
                   <div class="brain-progress" role="status">
-                    <div class="brain-progress-track" aria-hidden="true">
-                      <div
-                        class="brain-progress-fill"
-                        [style.width.%]="modelDownloadFrac() * 100"
-                      ></div>
-                    </div>
+                    <mur-progress
+                      ariaLabel="Transcription model download"
+                      [value]="modelDownloadFrac() * 100"
+                    />
                     <span class="brain-progress-label text-muted">
                       @if (modelDownloadFrac() > 0) {
                         Downloading… {{ modelPct() }}
@@ -160,12 +158,10 @@
               } @else if (parakeetPresent() === false) {
                 @if (downloadingParakeet()) {
                   <div class="brain-progress" role="status">
-                    <div class="brain-progress-track" aria-hidden="true">
-                      <div
-                        class="brain-progress-fill"
-                        [style.width.%]="parakeetDownloadFrac() * 100"
-                      ></div>
-                    </div>
+                    <mur-progress
+                      ariaLabel="Live-captions model download"
+                      [value]="parakeetDownloadFrac() * 100"
+                    />
                     <span class="brain-progress-label text-muted">
                       @if (parakeetDownloadFrac() > 0) {
                         Downloading… {{ parakeetPct() }}

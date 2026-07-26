@@ -221,10 +221,6 @@ input[type="range"]:focus-visible {
   font-size: 0.9rem;
   font-weight: 550;
 }
-.field-help {
-  font-size: 0.8125rem;
-  line-height: 1.5;
-}
 .gguf-field {
   margin-top: var(--space-1);
 }
@@ -241,18 +237,6 @@ input[type="range"]:focus-visible {
   min-width: 120px;
   flex: none;
 }
-.brain-progress-track {
-  height: 6px;
-  border-radius: 3px;
-  background: var(--surface-raised);
-  overflow: hidden;
-}
-.brain-progress-fill {
-  height: 100%;
-  background: var(--accent);
-  border-radius: 3px;
-  transition: width var(--transition);
-}
 .brain-progress-label {
   font-size: 0.75rem;
 }
@@ -264,9 +248,9 @@ input[type="range"]:focus-visible {
 }
 
 @media (prefers-reduced-motion: reduce) {
+  /* The progress fill moved into <mur-progress>, which honours reduced motion itself. */
   .seg button,
   input[type="range"]::-webkit-slider-thumb,
-  .brain-progress-fill,
   .adv-link {
     transition: none;
   }

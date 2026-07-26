@@ -247,18 +247,6 @@
   min-width: 220px;
   flex: 1;
 }
-.dl-progress-track {
-  height: 8px;
-  border-radius: var(--radius-sm);
-  background: var(--surface-input);
-  overflow: hidden;
-}
-.dl-progress-fill {
-  height: 100%;
-  background: var(--accent);
-  border-radius: var(--radius-sm);
-  transition: width var(--transition);
-}
 .dl-progress-label {
   display: inline-flex;
   align-items: center;

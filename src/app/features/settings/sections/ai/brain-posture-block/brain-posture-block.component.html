@@ -165,12 +165,10 @@
         </p>
         @if (brainDownloadingId()) {
           <div class="semantic-progress" role="status">
-            <div class="semantic-progress-track" aria-hidden="true">
-              <div
-                class="semantic-progress-fill"
-                [style.width.%]="brainDownloadFrac() * 100"
-              ></div>
-            </div>
+            <mur-progress
+              ariaLabel="On-device model download"
+              [value]="brainDownloadFrac() * 100"
+            />
             <span class="semantic-progress-label text-muted">
               {{ downloadingModelName() }} · {{ brainPct() }}
             </span>

@@ -14,6 +14,7 @@ import { IpcService } from "../../../core/ipc.service";
 import { hostIsLoopback } from "../../../core/loopback";
 import type { AppConfigDto, ProviderStatus } from "../../../core/models";
 import { BrainEnableCardComponent } from "../../brain/brain-enable-card/brain-enable-card.component";
+import { MurProgressComponent } from "../../../design-system/progress/progress.component";
 
 /** The wizard steps, in order. Drives the dot indicator + progress copy. */
 type Step = "welcome" | "model" | "provider" | "brain" | "vault" | "done";
@@ -92,7 +93,7 @@ const SIZE_HINTS: Record<string, string> = {
 @Component({
   selector: "app-onboarding",
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [BrainEnableCardComponent],
+  imports: [BrainEnableCardComponent, MurProgressComponent],
   templateUrl: "./onboarding.component.html",
   styleUrl: "./onboarding.component.scss",
 })

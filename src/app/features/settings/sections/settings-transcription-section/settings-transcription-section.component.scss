@@ -60,18 +60,6 @@
   gap: 3px;
   min-width: 120px;
 }
-.brain-progress-track {
-  height: 6px;
-  border-radius: 3px;
-  background: var(--surface-input);
-  overflow: hidden;
-}
-.brain-progress-fill {
-  height: 100%;
-  background: var(--accent);
-  border-radius: 3px;
-  transition: width var(--transition);
-}
 .brain-progress-label {
   font-size: 0.75rem;
 }
@@ -89,8 +77,4 @@
 }
 
 /* One-line helper that tracks the selected summary style. */
-.field-help {
-  font-size: 0.8125rem;
-  line-height: 1.5;
-}
     
