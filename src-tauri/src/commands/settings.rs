@@ -141,6 +141,24 @@ pub fn consent_to_clickup(state: State<'_, AppState>) -> Result<(), AppError> {
 // (`template::set_saved_templates`) so the next note generation resolves the live data (the pipeline
 // renders through `build_template` with only the style string, so the registry — not `AppState` —
 // is how a saved-template id reaches the renderer).
+//
+// T4b — the `{{}}` VARIABLE DSL. A template may reference a small FIXED set of variables
+// (`summarize::template::TEMPLATE_VARS`) as `{{name}}` / `{{name:format}}`, Obsidian-compatible for
+// the shared keys (`{{title}}`, `{{date:YYYY-MM-DD}}`). It is deliberately LOGIC-LESS: no
+// expressions, no conditionals, no nesting, no recursion — just a closed `match` resolved by Murmur
+// AFTER the provider call, so a variable can never widen egress. The same
+// `validate_note_template` gate is therefore also the DSL gate: an ident outside the allowlist (or
+// a malformed `{{ … }}`) is refused HERE, FAIL-CLOSED, rather than silently disappearing from the
+// user's notes at render time. `{{meeting_id}}` is intentionally NOT a variable.
+//
+// WHICH FIELDS TAKE VARIABLES (enforced by `validate_note_template`, not just documented):
+//   * `sections[].heading` / `sections[].instruction` — YES. They render into the note body, and any
+//     placeholder the model echoes back from an instruction is resolved when Murmur assembles the
+//     finished note, so it can never reach the user unresolved.
+//   * `extra_frontmatter_keys` — YES; this is the deterministic front-matter binding.
+//   * `name` / `tone` — NO. Neither is ever rendered into a note (the name is a picker label, the
+//     tone is a directive sent verbatim to the model), so a `{{}}` there is REFUSED rather than
+//     accepted-and-silently-ignored.
 
 /// List the user's saved note templates (newest first). CONTENT-FREE; not gated.
 #[tauri::command]
@@ -149,8 +167,13 @@ pub fn list_note_templates(state: State<'_, AppState>) -> Result<Vec<NoteTemplat
 }
 
 /// Save (create or replace) a note template. Validates the name + at least one section, REJECTS any
-/// scripting token, persists, refreshes the registry, and returns the stored row. An empty `id`
+/// scripting token AND any unknown/malformed `{{var}}` (T4b — fail-closed at SAVE, never a silent
+/// drop at render), persists, refreshes the registry, and returns the stored row. An empty `id`
 /// mints a new uuid; a non-empty existing id replaces in place.
+///
+/// An `extra_frontmatter_keys` entry may be a plain key (`project` — still just a REQUEST to the
+/// model) or a DSL binding (`client: {{entities}}`, `slug: {{date:YYYY}}-review`), which Murmur
+/// resolves and YAML-escapes itself when it assembles the note's front-matter.
 #[tauri::command]
 pub fn save_note_template(
     state: State<'_, AppState>,

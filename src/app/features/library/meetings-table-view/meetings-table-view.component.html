@@ -1,4 +1,8 @@
-<mur-table [rows]="rows()" [trackBy]="trackByRow" [rowClass]="rowClassFor">
+<mur-table
+  [rows]="decoratedRows()"
+  [trackBy]="trackByRow"
+  [rowClass]="rowClassFor"
+>
   @for (col of resolvedColumns(); track col.key) {
     <mur-table-column
       [key]="col.key"
@@ -41,9 +45,9 @@
             }
           }
           @case ("status") {
-            <span class="pill" [class]="statusPillClass(m.status)">
+            <span class="pill" [class]="row.statusPillClass">
               <span class="pill-dot"></span>
-              {{ statusLabel(m.status) }}
+              {{ row.statusLabel }}
             </span>
           }
           @case ("duration") {

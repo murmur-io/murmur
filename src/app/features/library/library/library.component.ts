@@ -15,11 +15,14 @@ import { RouterLink } from "@angular/router";
 import { IpcService } from "../../../core/ipc.service";
 import { TabsService } from "../../../core/tabs.service";
 import { MurSpinnerComponent } from "../../../design-system/spinner/spinner.component";
+import {
+  meetingStatusLabel,
+  meetingStatusPillClass,
+} from "../../../design-system/meeting-status";
 import type {
   FolderNode,
   Meeting,
   MeetingOrgShareRow,
-  MeetingStatus,
   OrgItemHeader,
   OrgStatus,
   SearchHit,
@@ -60,6 +63,9 @@ export interface MeetingsListItem {
   id: string;
   sortAt: number;
   meeting: Meeting;
+  /** Pre-derived pill presentation — the template must not call helpers per row. */
+  statusPillClass: string;
+  statusLabel: string;
 }
 
 /**
@@ -457,6 +463,8 @@ export class LibraryComponent implements OnInit {
         id: `meeting:${meeting.id}`,
         sortAt: this.meetingSortAt(meeting),
         meeting,
+        statusPillClass: meetingStatusPillClass(meeting.status),
+        statusLabel: meetingStatusLabel(meeting.status),
       }))
       .sort((a, b) => b.sortAt - a.sortAt),
   );
@@ -1032,26 +1040,6 @@ export class LibraryComponent implements OnInit {
       case "transcript":
         return "is-accent";
       case "note":
-        return "is-success";
-      default:
-        return "";
-    }
-  }
-
-  statusLabel(s: string): string {
-    return s.charAt(0) + s.slice(1).toLowerCase();
-  }
-
-  /** Maps a meeting status to a status-pill state modifier (matches Record). */
-  statusPillClass(s: MeetingStatus): string {
-    switch (s) {
-      case "RECORDING":
-      case "ERROR":
-        return "is-danger";
-      case "TRANSCRIBED":
-      case "SUMMARIZED":
-        return "is-accent";
-      case "EXPORTED":
         return "is-success";
       default:
         return "";

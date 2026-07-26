@@ -1,6 +1,7 @@
 import { ChangeDetectionStrategy, Component, inject } from "@angular/core";
 import { ReactiveFormsModule } from "@angular/forms";
 import { MurToggleComponent } from "../../../../design-system/toggle/toggle.component";
+import { MurProgressComponent } from "../../../../design-system/progress/progress.component";
 import { RouterLink } from "@angular/router";
 import { SettingsStore } from "../../settings.store";
 
@@ -13,7 +14,11 @@ import { SettingsStore } from "../../settings.store";
   selector: "app-settings-privacy-section",
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [
-    MurToggleComponent,ReactiveFormsModule, RouterLink],
+    MurToggleComponent,
+    MurProgressComponent,
+    ReactiveFormsModule,
+    RouterLink,
+  ],
   templateUrl: "./settings-privacy-section.component.html",
   styleUrl: "./settings-privacy-section.component.scss",
 })
