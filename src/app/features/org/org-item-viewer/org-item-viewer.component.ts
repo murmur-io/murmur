@@ -1,6 +1,7 @@
 import {
   ChangeDetectionStrategy,
   Component,
+  DestroyRef,
   Injector,
   computed,
   effect,
@@ -38,6 +39,16 @@ import { ToastService } from "../../../services/toast.service";
  * The route param drives the load via an IPC-on-signal-change effect (T1) with a
  * stale-result guard, so navigating between org items in place re-fetches
  * correctly. Back returns to the Notes home (mirrors the note-editor `back()`).
+ *
+ * WITHDRAWN CONTENT (2026-07-26). This view is kept ALIVE while backgrounded by
+ * `TabRouteReuseStrategy` and previously fetched exactly once, on route entry —
+ * so an item the org withdrew stayed fully readable here indefinitely, long
+ * after the backend evicted it from every other surface. It now subscribes to
+ * `org-feed-updated` (fired by the background sync AND by the anti-entropy
+ * reconcile sweep whenever the local replica changes) and re-fetches; a
+ * `null` detail means the item is gone, so the content is dropped immediately,
+ * the view says so plainly, and the tab is closed. Mirrors `TabsService`'s
+ * `onContentDeleted` fan-out for notes/meetings.
  */
 @Component({
   selector: "app-org-item-viewer",
@@ -53,6 +64,7 @@ export class OrgItemViewerComponent {
   private readonly injector = inject(Injector);
   private readonly tabsService = inject(TabsService);
   private readonly toast = inject(ToastService);
+  private readonly destroyRef = inject(DestroyRef);
 
   /** The `:id` route param as a signal (re-fetches when it changes in place). */
   private readonly itemId = toSignal(
@@ -71,6 +83,14 @@ export class OrgItemViewerComponent {
   readonly orgName = this._orgName.asReadonly();
   readonly loading = signal(true);
   readonly error = signal<string | null>(null);
+  /**
+   * True once this item has been WITHDRAWN from the org (the re-fetch came back
+   * empty). Renders the "no longer shared" state instead of the — now stale —
+   * content, which is the whole point: a revoked note must stop being readable
+   * here the moment the local replica is evicted, not on the next app launch.
+   */
+  private readonly _removed = signal(false);
+  readonly removed = this._removed.asReadonly();
   /** Decrypted attachment DTOs for this received org item; view-only. */
   readonly attachments = signal<NoteAttachmentDto[]>([]);
 
@@ -121,6 +141,10 @@ export class OrgItemViewerComponent {
     this.orgChatOpen.update((v) => !v);
   }
 
+  /** Released on destroy so the org-feed listener never outlives this view. */
+  private feedUnlisten: (() => void) | null = null;
+  private feedDestroyed = false;
+
   constructor() {
     // Resolve + fetch the org item whenever the route id changes. Async IPC
     // effect (T1) — first resolves the local editable source and (for the author)
@@ -133,6 +157,97 @@ export class OrgItemViewerComponent {
       },
       { injector: this.injector },
     );
+
+    // Live convergence: the backend fires this content-free event whenever the
+    // local org replica actually changed (a feed tombstone, the anti-entropy
+    // reconcile sweep, or a revoke). A backgrounded tab gets no lifecycle hook,
+    // so this subscription is the ONLY thing that can tell an already-rendered
+    // viewer its item is gone.
+    this.destroyRef.onDestroy(() => {
+      this.feedDestroyed = true;
+      this.feedUnlisten?.();
+    });
+    void this.ipc
+      .onOrgFeedUpdated(() => {
+        void this.revalidate();
+      })
+      .then((un) => {
+        if (this.feedDestroyed) {
+          un();
+        } else {
+          this.feedUnlisten = un;
+        }
+      })
+      .catch(() => {
+        /* best-effort: no Tauri host (plain browser) → no live convergence */
+      });
+  }
+
+  /**
+   * Re-fetch the currently displayed item after the org replica changed.
+   *
+   * `null` ⇒ the item was withdrawn (or its org was disabled/left): drop the
+   * content NOW, say so, and close the tab. Otherwise refresh in place —
+   * skipping the content swap while the author is editing, so a background sync
+   * can never silently overwrite an in-progress draft. Any IPC failure is
+   * ignored: a transient error must never be mistaken for "withdrawn".
+   */
+  private async revalidate(): Promise<void> {
+    const id = this.itemId();
+    if (!id || this._removed() || this.loading()) {
+      return;
+    }
+    let detail: OrgItemDetail | null;
+    try {
+      detail = await this.ipc.orgGetItem(id);
+    } catch {
+      return;
+    }
+    if (this.itemId() !== id || this._removed()) {
+      return;
+    }
+    if (!detail) {
+      this.markRemoved(id);
+      return;
+    }
+    if (this.editing() || this.saving()) {
+      return;
+    }
+    this._item.set(detail);
+    this.tabsService.setTitle(
+      tabKeyFor("org-item", id),
+      detail.title || "Shared note",
+    );
+    void this.reloadAttachments(id);
+  }
+
+  /**
+   * The item is gone from the org: evict everything this view is holding, tell
+   * the user plainly, and close the tab (which, per `TabsService.closeTab`,
+   * also destroys the cached detached instance and navigates to a neighbor).
+   * A deep-linked view with no tab simply stays on the "no longer shared" state.
+   */
+  private markRemoved(id: string): void {
+    this._removed.set(true);
+    this._item.set(null);
+    this.attachments.set([]);
+    this.editing.set(false);
+    this.confirmingRemove.set(false);
+    this.orgChatOpen.set(false);
+    this.toast.info("This shared note is no longer available in the org.");
+    void this.tabsService.closeTab(tabKeyFor("org-item", id));
+  }
+
+  /** Refresh the decrypted attachment DTOs for `id`. Stale-guarded, never throws. */
+  private async reloadAttachments(id: string): Promise<void> {
+    try {
+      const rows = await this.ipc.listNoteAttachments("org", id);
+      if (this.itemId() === id && !this._removed()) {
+        this.attachments.set(Array.isArray(rows) ? rows : []);
+      }
+    } catch {
+      /* best-effort: keep whatever is already rendered */
+    }
   }
 
   /**
@@ -152,6 +267,7 @@ export class OrgItemViewerComponent {
     this.loading.set(true);
     this.error.set(null);
     this._item.set(null);
+    this._removed.set(false);
     this.attachments.set([]);
     this._orgName.set("");
     // A route change (incl. the post-save redirect to the superseded item) always exits edit mode.
@@ -185,6 +301,15 @@ export class OrgItemViewerComponent {
       const item = await this.ipc.orgGetItem(id);
       if (this.itemId() !== id) {
         return; // stale — the route moved on under us
+      }
+      if (!item) {
+        // A stale link/citation to an item the org already withdrew. Say so
+        // plainly rather than rendering an empty shell. (No tab-close here —
+        // the user just opened this; closing out from under them would be
+        // disorienting. `revalidate()` owns the disappeared-while-open case.)
+        this._removed.set(true);
+        this.attachments.set([]);
+        return;
       }
       this._item.set(item);
       try {
