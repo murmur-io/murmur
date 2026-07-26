@@ -831,6 +831,17 @@ pub struct AppConfigDto {
     /// ignored by `dto_to_config`.
     #[serde(default)]
     pub live_companion_pending: bool,
+    /// P1 (C9) — WHO chose `model_size`: `Some("auto")` (the user took Murmur's recommendation) or
+    /// `Some("user")` (a deliberate pick). ABSENT (`None`) means PRESERVE — the stored value is left
+    /// exactly as it is, which is why a plain settings save that knows nothing about this field can
+    /// never clobber it. Deliberately an `Option`, NOT a plain string: the field must be REVERSIBLE
+    /// (auto → user → auto), not write-once. It lives in its own settings row rather than on
+    /// `AppConfig` (see `settings::config::model_size_source`), so `dto_to_config`'s exhaustive
+    /// struct literal is untouched; `save_config_inner` applies it. `config_to_dto` leaves it `None`
+    /// so a read-modify-write round-trip is a preserve, and the READ surface is
+    /// `whisper_recommendation().modelSizeSource`.
+    #[serde(default)]
+    pub model_size_source: Option<String>,
 }
 
 /// serde default for the Stage E security flags (which default ON in `AppConfig`).
@@ -4837,6 +4848,20 @@ pub(crate) fn save_config_inner(state: &AppState, config: AppConfigDto) -> Resul
         crate::summarize::gateway::validate_gateway_url(&config.share_base_url)?;
     }
 
+    // P1 (C9): the model-size provenance lives in its own settings row, so it is applied HERE
+    // rather than through `dto_to_config`'s exhaustive `AppConfig` literal. `None` = PRESERVE (the
+    // overwhelmingly common case — an ordinary settings save says nothing about provenance);
+    // `Some(token)` sets it, and an unrecognised token is REFUSED before anything is persisted.
+    //
+    // VALIDATION happens here (before any write); the WRITE itself is deferred until after the
+    // config it describes has been persisted. Writing it first meant a later failure — a poisoned
+    // mutex, or `AppConfig::save` erroring — left the provenance row describing a `model_size` that
+    // was never stored, i.e. Murmur claiming it picked a size the user had picked.
+    let model_size_source = config.model_size_source.clone();
+    if let Some(source) = model_size_source.as_deref() {
+        crate::settings::validate_model_size_source(source)?;
+    }
+
     // Generic Settings cannot change `embed_model_id`: `dto_to_config` preserves it from this
     // mutex-protected cache, while the dedicated selector takes the model-selection write barrier
     // before taking the same mutex. Do not make an unrelated Settings save wait behind a minutes-
@@ -4848,6 +4873,18 @@ pub(crate) fn save_config_inner(state: &AppState, config: AppConfigDto) -> Resul
     let new_config = dto_to_config(config, &cache);
     new_config.save(&state.db)?;
     *cache = new_config;
+
+    // Only now that the config it describes is durable — and NON-FATALLY, matching the startup
+    // backfill. The token was already validated above, so the only failures left are DB-level. If
+    // one happens, the `model_size` the user asked for IS saved and the cache already reflects it;
+    // returning `Err` here would report "save failed" for a save that succeeded, which is worse than
+    // a provenance row that is one launch stale (the backfill re-runs at every launch and the row is
+    // advisory — nothing branches on it today).
+    if let Some(source) = model_size_source.as_deref() {
+        if let Err(e) = crate::settings::set_model_size_source(&state.db, source) {
+            tracing::warn!(target: "settings", error = %e, "model_size_source write failed after a successful config save");
+        }
+    }
     Ok(())
 }
 
@@ -4950,6 +4987,9 @@ fn config_to_dto(c: &AppConfig) -> AppConfigDto {
         // round-trip test is unaffected.
         live_captions: String::new(),
         live_companion_pending: false,
+        // P1: `None` = PRESERVE. A read-modify-write round-trip through the settings screen must
+        // never rewrite (or clear) the model-size provenance as a side effect.
+        model_size_source: None,
     }
 }
 
