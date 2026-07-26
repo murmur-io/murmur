@@ -59,15 +59,83 @@ Order PRs by dependency (shared-file PRs serialize; disjoint ones can overlap bu
 on the LATEST trunk; if two touch the same file, the second rebases + resolves (usually a clean
 union — e.g. two additive blocks in `detail.component.ts`).
 
+## ALWAYS `--base origin/murmur` (2026-07-26 — the single biggest time sink found so far)
+
+`scripts/agent-harness init` defaults `--base` to **HEAD, i.e. your LOCAL `murmur`** — which goes
+stale the moment any PR merges (yours or someone else's). Two failures, both observed in one program:
+
+1. **Every PR's CI ran TWICE.** A branch cut from stale trunk is refused at merge
+   ("Required status check … is expected" = *branch not up to date*), so you merge `origin/murmur` in,
+   push, and pay a second full CI cycle. ~26 min per PR, and it looked like "CI is slow".
+2. **A PR was created WITHOUT its dependency's work in it.** P2's worktree came up with no
+   `machine.service.ts` and no `catalog.rs` because local trunk predated P1's merge — the writer would
+   have spent a full round building on a foundation that was not there.
+
+**The rule:** `git fetch origin murmur -q` then `init … --base origin/murmur`. Verify before running:
+`ls <worktree>/<a file the previous PR added>`. And `git merge --ff-only origin/murmur` on the local
+trunk periodically so the working checkout doesn't drift either.
+
+## CLEANING UP A FAILED `init` TOUCHES **TWO** REPOS
+
+The harness pairs a `meetnotes` worktree with a `../murmur-server` worktree. `rm -rf` on the task dir
+leaves BOTH registrations dangling, and the next `init` dies with *"missing but already registered
+worktree"* — pointing at `murmur-server`, which is the confusing part. Full cleanup:
+
+```bash
+rm -rf ../.murmur-agent-tasks/<task-id> .git/agent-harness/tasks/<task-id>
+git worktree prune && git -C ../murmur-server worktree prune
+git branch -D agent/<task-id>
+```
+
+## THE INSTRUCTIONS HASH COVERS `.agents/harness/*`, NOT JUST `CLAUDE.md`
+
+`run` refuses with *"active agent instructions changed after init"* if anything in the hashed
+instruction set moves between `init` and `run` — and that set includes `.agents/harness/config.json`
+and `task_runner.py`. Uncommitted local edits there (a teammate's in-progress harness improvement) are
+enough to trip it. Init and run back-to-back, and if it fires, re-init rather than hunting for the diff.
+
 ## THE PRE-PUSH CHECKLIST (each catches a real CI-cycle-waster)
 
-- `cargo test --lib <targeted>` green (NOT the full suite).
+- `cargo test --lib <targeted>` green (NOT the full suite). **This is not advice, it is arithmetic:**
+  the full suite is ~170 s, and running it 5× "to be sure" burned ~14 min of a program's wall clock
+  while CI was going to run it anyway. Filter locally; the full gate is CI's job.
 - **`cargo clippy --lib -- -D warnings` clean** — link-free, ~15s. Catches the `dead_code` class that
   `cargo test` AND `clippy --lib --tests` MASK (a const/fn used only in `#[cfg(test)]` is "unused" in
   CI's lib-only build; often the feature is inert too). Ate a CI cycle when skipped.
 - **MSRV grep**: `git diff origin/murmur -- src-tauri | grep '^+' | grep -oE 'is_none_or|LazyLock|split_at_checked|take_if'`
   → empty. `-D warnings` implies `-D clippy::incompatible_msrv` (MSRV 1.77); `is_none_or`(1.82) → `map_or(true, …)`.
 - FE PRs: `npx ng lint && npx ng build` (never `ng test`).
+
+## WHEN THE HARNESS WRITER DIES MID-ROUND (it is usually NOT the code)
+
+A writer session can be killed by a **tool-permission rejection**, not a build failure. Observed:
+4 of 68 shell calls refused (two heredocs, a `grep` with an odd pattern, a warnings sweep) — the
+`cargo test` runs in the same session had all SUCCEEDED, and ~1000 lines of good work were already on
+disk. The task lands in `BLOCKED`, which `reap` accepts but `close` does not.
+
+**Do not restart from zero.** Salvage:
+1. Inspect the log to find the ACTUAL cause — `logs/round-01-writer-<vendor>.jsonl`, look for the
+   `tool_result` with `is_error` and match its `tool_use_id` back to the `tool_use` block. If it says
+   *"The user doesn't want to proceed with this tool use"*, it was a permission denial, not a defect.
+2. Verify the worktree YOURSELF: targeted `cargo test`, `clippy --lib -D warnings`, `ng lint`,
+   `ng build`. Check the contract's load-bearing invariants by hand (e.g. "the pre-existing tests must
+   be byte-identical" → extract them from base and HEAD and diff).
+3. Finish whatever the writer never reached.
+4. **Then get an INDEPENDENT review anyway** — you are now an author. The harness is blocked, so run
+   the reviewers as a Workflow instead; the principle (the implementer never owns the verdict) is what
+   matters, not the runner.
+
+## TELL REVIEWERS THE PROVENANCE — IT CHANGES WHAT THEY FIND
+
+When part of a diff was written by the orchestrator, or salvaged, or hand-patched, **say so in the
+review prompt and tell them to treat those parts with MORE suspicion, not less.** This is not
+politeness; it is targeting. Doing it produced a same-round catch of a missing stale-result guard in
+orchestrator-written Angular — the exact class the repo's own rules call out, in the exact file the
+reviewer had been told to distrust. A reviewer given a diff with no provenance spreads attention
+evenly over code that does not deserve it evenly.
+
+Corollary: **fold fixes into ONE round.** Review → fix → re-review ran ~21 min sequentially; asking
+reviewers for exact patches alongside findings collapses that to one pass.
 
 ## VERIFIER DISCIPLINE (this is where the real bugs hide)
 
