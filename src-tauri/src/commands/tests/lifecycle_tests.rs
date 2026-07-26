@@ -17029,6 +17029,67 @@
     struct MockOrgLog {
         published: Vec<String>,
         tombstoned: Vec<String>,
+        /// The feed the mock serves from `GET /v1/orgs/{id}/items?sinceSeq=&limit=`, ascending by
+        /// `seq`. Seeded by a test (see `MockOrgServer::seed_feed`) so the anti-entropy reconcile
+        /// sweep can be driven headless. METADATA ONLY — a record that is tombstoned, or whose
+        /// `content_sha256` already matches the local replica, is decided without any blob, which is
+        /// exactly the sweep's cheap path.
+        feed: Vec<MockFeedEntry>,
+        /// Every `sinceSeq` the client asked the feed for, in order — lets a test prove the SLOW
+        /// reconcile cursor really restarts at 0 while the LIVE cursor stays where it was.
+        feed_since: Vec<u64>,
+    }
+
+    /// One row of `MockOrgLog::feed` — the fields `share::org_dto::OrgItemEntry` deserializes.
+    #[derive(Clone)]
+    struct MockFeedEntry {
+        item_id: String,
+        seq: u64,
+        tombstoned: bool,
+        content_sha256: Option<Vec<u8>>,
+    }
+
+    impl MockFeedEntry {
+        /// A withdrawn record. The real server writes `tombstoned_at` WITHOUT minting a fresh `seq`,
+        /// so the seq stays the item's ORIGINAL one — which is the entire reason a member already
+        /// past it never learns the item is gone.
+        fn tombstoned(item_id: &str, seq: u64) -> Self {
+            Self {
+                item_id: item_id.into(),
+                seq,
+                tombstoned: true,
+                content_sha256: None,
+            }
+        }
+
+        /// A live record carrying its plaintext hash (no blob id ⇒ the sweep must decide it from the
+        /// hash alone, never by fetching).
+        fn live(item_id: &str, seq: u64, content_sha256: &[u8]) -> Self {
+            Self {
+                item_id: item_id.into(),
+                seq,
+                tombstoned: false,
+                content_sha256: Some(content_sha256.to_vec()),
+            }
+        }
+
+        /// Serialize exactly like the server's `OrgItemEntry` — camelCase, `murmur_protocol::b64`
+        /// (base64url-unpadded) bytes, and the SAME optionality the real server emits: a tombstone
+        /// OMITS `blobId`/`contentSha256` entirely rather than sending nulls (mirrors the fixture in
+        /// `share::org_dto`'s own wire test).
+        fn to_json(&self) -> String {
+            let sha = match &self.content_sha256 {
+                Some(bytes) => {
+                    format!(",\"contentSha256\":\"{}\"", murmur_protocol::b64::encode(bytes))
+                }
+                None => String::new(),
+            };
+            format!(
+                "{{\"itemId\":\"{}\",\"seq\":{},\"authorUserId\":\"author-1\",\"rev\":1,\
+                  \"generation\":1,\"createdAt\":\"2026-07-01T00:00:00Z\",\"tombstoned\":{}{}}}",
+                self.item_id, self.seq, self.tombstoned, sha
+            )
+        }
     }
 
     /// A minimal in-process org server (tiny_http) that answers the TWO routes the atomic-inline org
@@ -17080,6 +17141,50 @@
                                 let _ = req.respond(resp);
                                 continue;
                             }
+                            // GET /v1/orgs/{id}/items?sinceSeq=&limit= → the bounded append-only feed.
+                            // Mirrors the real server EXACTLY on the property this whole fix is about:
+                            // the window is `seq > sinceSeq`, and a tombstoned record keeps its
+                            // ORIGINAL seq — so a caller whose cursor is already past it never sees it.
+                            if method == tiny_http::Method::Get
+                                && path.starts_with("/v1/orgs/")
+                                && path.ends_with("/items")
+                            {
+                                let query = url.split_once('?').map(|(_, q)| q).unwrap_or("");
+                                let param = |key: &str| -> Option<u64> {
+                                    query.split('&').find_map(|kv| {
+                                        kv.split_once('=').and_then(|(k, v)| {
+                                            (k == key).then(|| v.parse::<u64>().ok()).flatten()
+                                        })
+                                    })
+                                };
+                                let since = param("sinceSeq").unwrap_or(0);
+                                let limit = param("limit").unwrap_or(50) as usize;
+                                let mut guard = log_t.lock().unwrap();
+                                guard.feed_since.push(since);
+                                let page: Vec<MockFeedEntry> = guard
+                                    .feed
+                                    .iter()
+                                    .filter(|e| e.seq > since)
+                                    .take(limit)
+                                    .cloned()
+                                    .collect();
+                                drop(guard);
+                                let next_seq = page.last().map(|e| e.seq).unwrap_or(since);
+                                let items = page
+                                    .iter()
+                                    .map(MockFeedEntry::to_json)
+                                    .collect::<Vec<_>>()
+                                    .join(",");
+                                let body =
+                                    format!("{{\"items\":[{items}],\"nextSeq\":{next_seq}}}");
+                                let resp = tiny_http::Response::from_string(body).with_header(
+                                    "Content-Type: application/json"
+                                        .parse::<tiny_http::Header>()
+                                        .unwrap(),
+                                );
+                                let _ = req.respond(resp);
+                                continue;
+                            }
                             // DELETE /v1/orgs/{id}/items/{itemId} → 200 (tombstone)
                             if method == tiny_http::Method::Delete
                                 && path.contains("/items/")
@@ -17104,6 +17209,16 @@
                 shutdown,
                 handle: Some(handle),
             }
+        }
+
+        /// Install the records `GET …/items` will serve (ascending `seq`).
+        fn seed_feed(&self, entries: Vec<MockFeedEntry>) {
+            self.log.lock().unwrap().feed = entries;
+        }
+
+        /// Every `sinceSeq` the client has asked for so far, in order.
+        fn feed_since(&self) -> Vec<u64> {
+            self.log.lock().unwrap().feed_since.clone()
         }
     }
 
@@ -18533,5 +18648,384 @@
             masked.org.is_empty(),
             "a sealed-not-unlocked folder leaks NO org share titles: {:?}",
             masked.org
+        );
+    }
+
+    // ── ORG REPLICA CONVERGENCE (2026-07-26) — the anti-entropy reconcile sweep ────────────────────
+
+    /// Seed one fully-indexed, fully-attached org item straight into the local replica, exactly as a
+    /// feed ingest would leave it: `org_items` row + `org_chunks` + `fts_org_chunks` tokens +
+    /// `org_vec_chunks` int8 vectors + a `note_attachments` image BLOB. Returns the plaintext hash the
+    /// feed entry would carry. `StubEmbedder` is used ONLY to materialise vector rows so the test can
+    /// prove they are evicted — no production path writes stub output.
+    fn seed_replica_item(state: &AppState, item_id: &str, org_id: &str, seq: u64) -> [u8; 32] {
+        let sha = [7u8; 32];
+        state
+            .db
+            .upsert_org_item(
+                item_id,
+                org_id,
+                seq,
+                "anna",
+                "Quarterly acquisition plan",
+                "# Quarterly acquisition plan\n\nzephyrine budget approved",
+                "2026-07-01T00:00:00Z",
+                1,
+                1,
+                &sha,
+                None,
+                Some("author-1"),
+                Some(&crate::embed::StubEmbedder),
+            )
+            .unwrap();
+        state
+            .db
+            .replace_org_item_attachment_bundle(
+                item_id,
+                &[crate::storage::IncomingAttachment {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    mime_type: "image/png".into(),
+                    extension: "png".into(),
+                    width: 4,
+                    height: 4,
+                    sha256: [9u8; 32],
+                    data: vec![1u8, 2, 3, 4],
+                }],
+            )
+            .unwrap();
+        sha
+    }
+
+    /// Counts of everything derived from ONE org item that a withdrawal must take with it:
+    /// (chunks, int8 vectors, FTS token hits, image BLOBs).
+    fn replica_counts(state: &AppState, item_id: &str) -> (i64, i64, i64, i64) {
+        let conn = state.db.lock();
+        let chunks: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM org_chunks WHERE item_id = ?1",
+                rusqlite::params![item_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let vectors: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM org_vec_chunks WHERE chunk_id IN
+                   (SELECT id FROM org_chunks WHERE item_id = ?1)",
+                rusqlite::params![item_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let fts: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM fts_org_chunks WHERE fts_org_chunks MATCH 'zephyrine'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let attachments: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM note_attachments WHERE org_item_id = ?1",
+                rusqlite::params![item_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        (chunks, vectors, fts, attachments)
+    }
+
+    /// ITEM 1 — THE CORE REGRESSION, RED BEFORE GREEN IN ONE TEST.
+    ///
+    /// The server tombstones an org item with `UPDATE … SET tombstoned_at = now()` and NEVER mints a
+    /// fresh `seq`; the feed window is `seq > cursor`. So a member whose live cursor
+    /// (`org_state.last_seq`) has already moved past that item can NEVER be told it was withdrawn.
+    ///
+    /// RED LEG (asserted here, not merely described): with the tombstone sitting at its ORIGINAL seq
+    /// BELOW the live cursor, a full live `org_sync_now` leaves the ENTIRE decrypted replica — row,
+    /// chunks, FTS tokens, int8 vectors AND the image BLOBs — intact and searchable. That leg fails
+    /// against any "fix" that just moves the live cursor, and it is exactly what the pre-fix build
+    /// does on every sync.
+    ///
+    /// GREEN LEG: the anti-entropy sweep restarts from seq 0, observes the tombstone, and evicts all
+    /// five — WITHOUT rewinding or clobbering the live cursor.
+    #[test]
+    fn reconcile_sweep_evicts_a_tombstone_the_live_cursor_can_never_see() {
+        let mock = MockOrgServer::start();
+        let state = build_state("org-reconcile-orphan");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        state.config.lock().unwrap().share_base_url = mock.base.clone();
+        seed_live_session(&state);
+        seed_ock(&state, "org-1", 1);
+
+        seed_replica_item(&state, "it-orphan", "org-1", 5);
+        // The live cursor has long since moved past seq 5 (later items were ingested since).
+        state.db.set_org_last_seq("org-1", 42).unwrap();
+
+        // Pre-state: the replica is fully present and fully searchable.
+        assert!(state.db.get_org_item("it-orphan").unwrap().is_some());
+        let (chunks, vectors, fts, attachments) = replica_counts(&state, "it-orphan");
+        assert!(chunks > 0, "seeded item has chunks");
+        assert!(vectors > 0, "seeded item has int8 vectors");
+        assert!(fts > 0, "seeded item is keyword-searchable");
+        assert_eq!(attachments, 1, "seeded item has an image BLOB");
+
+        // The server withdrew it — at its ORIGINAL seq, below the live cursor.
+        mock.seed_feed(vec![MockFeedEntry::tombstoned("it-orphan", 5)]);
+
+        // ── RED: the live pull structurally cannot see it. Nothing is evicted. ────────────────────
+        block_on(org_sync_now_inner(&state)).unwrap();
+        assert!(
+            state.db.get_org_item("it-orphan").unwrap().is_some(),
+            "RED leg: the live cursor is past seq 5, so the live pull can never evict this item"
+        );
+        assert_eq!(
+            replica_counts(&state, "it-orphan"),
+            (chunks, vectors, fts, attachments),
+            "RED leg: the live pull leaves the whole derived replica intact"
+        );
+        assert_eq!(state.db.org_last_seq_for("org-1").unwrap(), 42);
+
+        // ── GREEN: the anti-entropy sweep restarts at 0 and applies the tombstone. ────────────────
+        let changed = block_on(org_reconcile_now_inner(&state)).unwrap();
+        assert_eq!(changed, 1, "the sweep evicted exactly one stale replica row");
+        assert!(
+            state.db.get_org_item("it-orphan").unwrap().is_none(),
+            "the withdrawn item is gone from the read path"
+        );
+        assert_eq!(
+            replica_counts(&state, "it-orphan"),
+            (0, 0, 0, 0),
+            "chunks, int8 vectors, FTS tokens AND image BLOBs are all evicted together"
+        );
+        let (markdown, title): (String, String) = {
+            let conn = state.db.lock();
+            conn.query_row(
+                "SELECT markdown, title FROM org_items WHERE item_id = 'it-orphan'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            (markdown.as_str(), title.as_str()),
+            ("", ""),
+            "the plaintext columns are blanked (only the tombstone header survives)"
+        );
+
+        // The LIVE cursor is untouched — the sweep must never rewind or clobber it.
+        assert_eq!(
+            state.db.org_last_seq_for("org-1").unwrap(),
+            42,
+            "the slow sweep NEVER writes org_state.last_seq"
+        );
+        // The slow cursor really did start at 0 (the live pull asked from 42).
+        assert_eq!(
+            mock.feed_since(),
+            vec![42, 0],
+            "live pull asks from last_seq; the reconcile sweep asks from the slow cursor (0)"
+        );
+    }
+
+    /// The sweep must CONVERGE, not thrash: a live record whose `content_sha256` already matches the
+    /// local replica is skipped WITHOUT a blob fetch (the mock serves no blob at all, so any fetch
+    /// attempt would have to fail), the slow cursor advances past it, and once the walk runs off the
+    /// end of the feed the pass is stamped complete and the cursor rewinds to 0 for the next pass.
+    #[test]
+    fn reconcile_sweep_skips_converged_items_and_wraps_the_pass() {
+        let mock = MockOrgServer::start();
+        let state = build_state("org-reconcile-converged");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        state.config.lock().unwrap().share_base_url = mock.base.clone();
+        seed_live_session(&state);
+        seed_ock(&state, "org-1", 1);
+
+        let sha = seed_replica_item(&state, "it-live", "org-1", 3);
+        state.db.set_org_last_seq("org-1", 42).unwrap();
+        mock.seed_feed(vec![MockFeedEntry::live("it-live", 3, &sha)]);
+
+        // Pass 1: the record is already converged → skipped, cursor advances to its seq.
+        assert_eq!(block_on(org_reconcile_now_inner(&state)).unwrap(), 0);
+        assert!(
+            state.db.get_org_item("it-live").unwrap().is_some(),
+            "a converged live record is left completely alone"
+        );
+        assert_eq!(state.db.org_reconcile_seq_for("org-1").unwrap(), 3);
+        assert!(
+            state.db.org_reconcile_pass_at("org-1").unwrap().is_none(),
+            "the pass is not complete until the walk runs off the end of the feed"
+        );
+
+        // Pass 2: nothing left beyond seq 3 → the pass completes and rewinds to 0.
+        assert_eq!(block_on(org_reconcile_now_inner(&state)).unwrap(), 0);
+        assert_eq!(
+            state.db.org_reconcile_seq_for("org-1").unwrap(),
+            0,
+            "a completed pass rewinds the SLOW cursor so the next pass re-observes everything"
+        );
+        assert!(state.db.org_reconcile_pass_at("org-1").unwrap().is_some());
+        assert_eq!(
+            state.db.org_last_seq_for("org-1").unwrap(),
+            42,
+            "the live cursor is still untouched"
+        );
+
+        // A third tick right after a COMPLETED pass holds off — anti-entropy is a safety net, not a
+        // poll, so a small org is not re-walked every idle minute. No further feed request is made.
+        assert_eq!(block_on(org_reconcile_now_inner(&state)).unwrap(), 0);
+        assert_eq!(
+            mock.feed_since(),
+            vec![0, 3],
+            "a just-completed pass is not immediately re-walked"
+        );
+    }
+
+    /// The sweep is BOUNDED per tick: it never drains the whole feed in one go (that would starve the
+    /// live pull and hammer the server). With more records than one page, one tick advances the slow
+    /// cursor by at most a page and leaves the rest for later ticks.
+    #[test]
+    fn reconcile_sweep_is_bounded_to_one_small_page_per_tick() {
+        let mock = MockOrgServer::start();
+        let state = build_state("org-reconcile-bounded");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        state.config.lock().unwrap().share_base_url = mock.base.clone();
+        seed_live_session(&state);
+        seed_ock(&state, "org-1", 1);
+        state.db.set_org_last_seq("org-1", 99).unwrap();
+
+        // Twelve withdrawn records, all at seqs below the live cursor.
+        let feed: Vec<MockFeedEntry> = (1..=12)
+            .map(|seq| MockFeedEntry::tombstoned(&format!("it-{seq}"), seq))
+            .collect();
+        mock.seed_feed(feed);
+
+        block_on(org_reconcile_now_inner(&state)).unwrap();
+        let after_one_tick = state.db.org_reconcile_seq_for("org-1").unwrap();
+        assert!(
+            after_one_tick > 0 && after_one_tick <= 4,
+            "one tick walks at most ORG_RECONCILE_PAGE records, got {after_one_tick}"
+        );
+        block_on(org_reconcile_now_inner(&state)).unwrap();
+        assert!(
+            state.db.org_reconcile_seq_for("org-1").unwrap() > after_one_tick,
+            "the next tick resumes where the previous one stopped"
+        );
+        assert_eq!(state.db.org_last_seq_for("org-1").unwrap(), 99);
+    }
+
+    /// ITEM 2 — a revoke MUST evict the local replica on the PUBLISHING device.
+    ///
+    /// RED before this fix: `revoke_org_share_inner_with_policy` only moved the `org_shares` state
+    /// machine to `revoked`; it performed NO `org_items` mutation, so the device that withdrew the
+    /// note kept its own decrypted copy — markdown, chunks, FTS tokens, vectors and image BLOBs —
+    /// live and searchable through org search / Ask / MCP `org_search` forever. Every assertion below
+    /// the revoke call fails on that code.
+    #[test]
+    fn revoke_org_share_evicts_the_local_replica_on_the_publishing_device() {
+        let mock = MockOrgServer::start();
+        let state = build_state("org-revoke-evicts");
+        seed_org(&state.db, "org-1", "Acme", "member", 1);
+        state.config.lock().unwrap().share_base_url = mock.base.clone();
+        seed_live_session(&state);
+        seed_ock(&state, "org-1", 1);
+
+        // A published share, with the publishing device's own local replica of it.
+        state
+            .db
+            .insert_org_share(
+                "os-rv",
+                "org-1",
+                None,
+                Some("n-rv"),
+                "note",
+                Some("Quarterly acquisition plan"),
+                1,
+                1,
+                &[7u8; 32],
+                "2026-07-11T00:00:00Z",
+            )
+            .unwrap();
+        state
+            .db
+            .set_org_share_uploaded("os-rv", "it-rv", "2026-07-11T00:00:00Z")
+            .unwrap();
+        seed_replica_item(&state, "it-rv", "org-1", 5);
+        assert!(state.db.get_org_item("it-rv").unwrap().is_some());
+        let (chunks, vectors, fts, attachments) = replica_counts(&state, "it-rv");
+        assert!(chunks > 0 && vectors > 0 && fts > 0 && attachments == 1);
+
+        block_on(revoke_org_share_inner(&state, "it-rv".to_string())).unwrap();
+
+        assert_eq!(
+            mock.log.lock().unwrap().tombstoned,
+            vec!["it-rv".to_string()],
+            "the server was told first (an eviction before a failed tombstone would blind us)"
+        );
+        assert!(
+            state.db.get_org_item("it-rv").unwrap().is_none(),
+            "the withdrawn item is gone from this device's read path"
+        );
+        assert_eq!(
+            replica_counts(&state, "it-rv"),
+            (0, 0, 0, 0),
+            "chunks, int8 vectors, FTS tokens AND the withdrawn image BLOBs all go with it"
+        );
+        assert_eq!(
+            state.db.get_org_share("os-rv").unwrap().unwrap().state,
+            "revoked"
+        );
+    }
+
+    /// ITEM 4 — `list_org_shares` takes the caller's chosen org. Pre-fix it ignored the caller and
+    /// returned `list_org_states().next()` — the FIRST local org — so in a shipped MULTI-org app a
+    /// member of two orgs saw the wrong org's share list. An unknown org id returns EMPTY rather than
+    /// silently falling back.
+    #[test]
+    fn list_org_shares_is_scoped_to_the_requested_org() {
+        let state = build_state("org-shares-scoped");
+        seed_org_at(&state.db, "org-a", "Alpha", "member", "2026-07-01T00:00:00Z");
+        seed_org_at(&state.db, "org-b", "Beta", "member", "2026-07-02T00:00:00Z");
+        state
+            .db
+            .insert_org_share(
+                "os-a",
+                "org-a",
+                None,
+                Some("n-a"),
+                "note",
+                Some("Alpha note"),
+                1,
+                1,
+                &[1u8; 32],
+                "2026-07-11T00:00:00Z",
+            )
+            .unwrap();
+        state
+            .db
+            .insert_org_share(
+                "os-b",
+                "org-b",
+                None,
+                Some("n-b"),
+                "note",
+                Some("Beta note"),
+                1,
+                1,
+                &[2u8; 32],
+                "2026-07-11T00:00:00Z",
+            )
+            .unwrap();
+
+        let alpha = list_org_shares_inner(&state, "org-a").unwrap();
+        assert_eq!(alpha.len(), 1);
+        assert_eq!(alpha[0].title.as_deref(), Some("Alpha note"));
+
+        // The SECOND org — the one the pre-fix `.next()` could never reach.
+        let beta = list_org_shares_inner(&state, "org-b").unwrap();
+        assert_eq!(beta.len(), 1);
+        assert_eq!(beta[0].title.as_deref(), Some("Beta note"));
+
+        assert!(
+            list_org_shares_inner(&state, "org-unknown")
+                .unwrap()
+                .is_empty(),
+            "an unjoined org id returns EMPTY, never another org's shares"
         );
     }
