@@ -1,0 +1,104 @@
+.note-templates {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+}
+
+.nt-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+
+/* Local size modifier — the shared primitives only ship the base .btn sizes. */
+.btn-sm {
+  padding: var(--space-1) var(--space-2);
+  font-size: 0.85em;
+}
+
+.nt-error {
+  color: var(--danger);
+  background: var(--danger-soft);
+  border-radius: var(--radius-md);
+  padding: var(--space-2);
+  margin: 0;
+}
+
+.nt-empty {
+  margin: 0;
+}
+
+.nt-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.nt-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  padding: var(--space-2);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+}
+
+.nt-row-main {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.nt-name {
+  font-weight: 600;
+}
+
+.nt-meta {
+  font-size: 0.85em;
+}
+
+.nt-row-actions {
+  display: flex;
+  gap: var(--space-1);
+  flex-shrink: 0;
+}
+
+.nt-form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-3);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+}
+
+.nt-section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  padding: var(--space-2);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  margin-bottom: var(--space-2);
+}
+
+.nt-section-instruction {
+  resize: vertical;
+  font: inherit;
+}
+
+.nt-section-remove {
+  align-self: flex-end;
+}
+
+.nt-actions {
+  display: flex;
+  gap: var(--space-2);
+}

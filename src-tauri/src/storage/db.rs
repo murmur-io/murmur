@@ -12,8 +12,9 @@ use crate::embed::Embedder;
 use crate::storage::models::{
     Analytics, BacklinkSource, Commitment, CorrectionRecord, DayCount, DocChunkHit,
     DocOutlineEntry, DocumentInfo, DocumentSummary, EntityKind, GraphNode, Meeting,
-    MeetingActionSummary, MeetingStatus, NoteCitation, PendingShareAccept, PeopleList, PersonCard,
-    PropertyKind, PropertyValue, RecipeRecord, SavedView, SearchHit, StatusCount,
+    MeetingActionSummary, MeetingStatus, NoteCitation, NoteTemplate, NoteTemplateSection,
+    PendingShareAccept, PeopleList, PersonCard, PropertyKind, PropertyValue, RecipeRecord, SavedView,
+    SearchHit, StatusCount,
 };
 use crate::transcribe::types::Segment;
 
@@ -406,6 +407,19 @@ impl Db {
                id TEXT PRIMARY KEY,
                title TEXT NOT NULL,
                prompt TEXT NOT NULL,
+               created_at TEXT NOT NULL
+             );
+             -- User-authored NOTE TEMPLATES (Granola-style named sections). CONTENT-FREE,
+             -- single-user metadata (mirrors `saved_recipes`): a note SHAPE only — tone +
+             -- ordered sections (JSON) + extra front-matter keys (JSON) — never meeting content,
+             -- so it is not visibility-gated. Selected by id via the note-style selector and
+             -- rendered into the summarizer system prompt by `summarize::template::build_template`.
+             CREATE TABLE IF NOT EXISTS note_templates (
+               id TEXT PRIMARY KEY,
+               name TEXT NOT NULL,
+               tone TEXT NOT NULL DEFAULT '',
+               sections TEXT NOT NULL DEFAULT '[]',
+               extra_frontmatter_keys TEXT NOT NULL DEFAULT '[]',
                created_at TEXT NOT NULL
              );
              CREATE TABLE IF NOT EXISTS saved_views (
@@ -5057,6 +5071,77 @@ impl Db {
         let conn = self.lock();
         conn.execute(
             "DELETE FROM saved_recipes WHERE id = ?1",
+            rusqlite::params![id],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    // ── note templates (user-authored named sections) ────────────────────────
+    //
+    // CONTENT-FREE, single-user metadata (mirrors `saved_recipes`): a note SHAPE only, never
+    // meeting content, so these paths are NOT visibility-gated. `sections` and
+    // `extra_frontmatter_keys` are stored as JSON TEXT and parsed here; a corrupt/legacy row
+    // falls back to an empty list rather than failing the whole read.
+
+    pub fn list_note_templates(&self) -> Result<Vec<NoteTemplate>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, name, tone, sections, extra_frontmatter_keys, created_at \
+                 FROM note_templates ORDER BY created_at DESC",
+            )
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map([], |r| {
+                let sections_json: String = r.get(3)?;
+                let extra_json: String = r.get(4)?;
+                Ok(NoteTemplate {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    tone: r.get(2)?,
+                    sections: serde_json::from_str::<Vec<NoteTemplateSection>>(&sections_json)
+                        .unwrap_or_default(),
+                    extra_frontmatter_keys: serde_json::from_str::<Vec<String>>(&extra_json)
+                        .unwrap_or_default(),
+                    created_at: r.get(5)?,
+                })
+            })
+            .map_err(map_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(map_err)?);
+        }
+        Ok(out)
+    }
+
+    pub fn insert_note_template(&self, t: &NoteTemplate) -> Result<()> {
+        let sections_json = serde_json::to_string(&t.sections)
+            .map_err(|e| AppError::Storage(format!("serialize note-template sections: {e}")))?;
+        let extra_json = serde_json::to_string(&t.extra_frontmatter_keys)
+            .map_err(|e| AppError::Storage(format!("serialize note-template keys: {e}")))?;
+        let conn = self.lock();
+        conn.execute(
+            "INSERT OR REPLACE INTO note_templates \
+             (id, name, tone, sections, extra_frontmatter_keys, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                t.id,
+                t.name,
+                t.tone,
+                sections_json,
+                extra_json,
+                t.created_at
+            ],
+        )
+        .map_err(map_err)?;
+        Ok(())
+    }
+
+    pub fn delete_note_template(&self, id: &str) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "DELETE FROM note_templates WHERE id = ?1",
             rusqlite::params![id],
         )
         .map_err(map_err)?;

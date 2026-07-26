@@ -1,4 +1,76 @@
+use std::collections::HashMap;
+use std::sync::{OnceLock, RwLock};
+
+use crate::error::{AppError, Result};
+use crate::storage::models::{NoteTemplate, NoteTemplateSection};
 use crate::summarize::provider::SummarizeRequest;
+
+/// Scripting tokens that are FORBIDDEN in a user-authored note template. A note template is
+/// DECLARATIVE DATA rendered into the summarizer system prompt — never code. These are the
+/// hallmark openings of the templating/scripting engines an Obsidian user might paste from
+/// (Templater `<%`/`tp.`, Node `require(`/`process.`). We refuse them at SAVE (below), so no such
+/// text can ever be persisted, let alone egressed as the system prompt.
+pub const FORBIDDEN_TEMPLATE_TOKENS: [&str; 4] = ["<%", "tp.", "require(", "process."];
+
+/// Reject a note template whose ANY text field contains a scripting token. Called by the
+/// `save_note_template` command BEFORE persisting. Declarative data only, ever — this is the
+/// security boundary for the template layer (the rendered prompt still passes the
+/// `RedactingProvider` firewall on egress, unchanged).
+pub fn validate_note_template(name: &str, tone: &str, t: &NoteTemplate) -> Result<()> {
+    let mut fields: Vec<&str> = vec![name, tone];
+    for s in &t.sections {
+        fields.push(&s.heading);
+        fields.push(&s.instruction);
+    }
+    for k in &t.extra_frontmatter_keys {
+        fields.push(k);
+    }
+    for f in fields {
+        for tok in FORBIDDEN_TEMPLATE_TOKENS {
+            if f.contains(tok) {
+                return Err(AppError::InvalidArg(format!(
+                    "note template may not contain the scripting token `{tok}` — templates are \
+                     declarative data, not code"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Process-global registry of saved note templates, keyed by id. Populated at boot from the DB
+/// (`lib.rs` setup → `Db::list_note_templates`) and refreshed on every save/delete
+/// (`commands::settings`). It exists because `build_template` is a PURE renderer called from the
+/// pipeline with only the style STRING (`pipeline.rs:2266`) — it has no `AppState`/DB handle — so
+/// resolving a saved-template id to its data goes through this cache. Same `OnceLock<RwLock<…>>`
+/// shape already used elsewhere in `summarize/` (e.g. `claude_code.rs`, `ner_deberta.rs`). Holds
+/// CONTENT-FREE metadata only (a note shape), never meeting content.
+fn saved_template_registry() -> &'static RwLock<HashMap<String, NoteTemplate>> {
+    static REG: OnceLock<RwLock<HashMap<String, NoteTemplate>>> = OnceLock::new();
+    REG.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// Replace the saved-template registry with `templates` (id → template). Idempotent; called at boot
+/// and after each save/delete so `build_template(<saved id>, …)` renders the live data.
+pub fn set_saved_templates(templates: Vec<NoteTemplate>) {
+    let mut map = match saved_template_registry().write() {
+        Ok(m) => m,
+        Err(poison) => poison.into_inner(),
+    };
+    map.clear();
+    for t in templates {
+        map.insert(t.id.clone(), t);
+    }
+}
+
+/// Resolve a saved template by id from the registry (a cheap read-lock clone), or `None`.
+fn lookup_saved_template(id: &str) -> Option<NoteTemplate> {
+    let map = match saved_template_registry().read() {
+        Ok(m) => m,
+        Err(poison) => poison.into_inner(),
+    };
+    map.get(id).cloned()
+}
 
 /// The canonical Obsidian note-format prompt (front-matter + sections), shared by all providers.
 ///
@@ -74,19 +146,77 @@ pub fn template_for_style(style: &str) -> String {
             "Be ACTION-FOCUSED — the reader cares most about what happens next and who owns it.",
             "# <title>\n\n## Summary\n1–2 sentences of context.\n\n## Action items\n- [ ] Owner — action (due date if mentioned)\n\n## Decisions\n- Decisions made (or \"None recorded\").\n\n## Follow-ups\n- Open questions / things to revisit.\n",
         ),
-        _ => default_template(),
+        // "standard" and "" render the canonical default template, byte-identical to the legacy
+        // `_ => default_template()` arm. Any OTHER id is a saved user template: resolve it from the
+        // registry and render it from its data (same `style_variant` shape). An id that is NOT a
+        // known saved template falls back to `default_template()` — byte-identical to the legacy
+        // behavior for an unknown/hand-edited style value.
+        "standard" | "" => default_template(),
+        other => lookup_saved_template(other)
+            .map(|t| render_saved_template(&t))
+            .unwrap_or_else(default_template),
     }
+}
+
+/// Render a saved user template into the style-prompt portion (the `style_variant` shape) from its
+/// DATA: `tone` becomes the preamble directive, `sections` become the ordered `## heading` body,
+/// and `extra_frontmatter_keys` are appended to the fixed front-matter key list. A template with
+/// empty tone / no extra keys renders the same shape a built-in style does.
+pub fn render_saved_template(t: &NoteTemplate) -> String {
+    style_variant_with_keys(
+        t.tone.trim(),
+        &render_sections(&t.sections),
+        &t.extra_frontmatter_keys,
+    )
+}
+
+/// Build the `# <title>` + ordered `## {heading}\n{instruction}` body from a template's sections,
+/// matching the exact spacing the built-in `body_sections` string literals use: a leading
+/// `# <title>\n\n`, sections joined by a blank line, and a single trailing newline. An empty
+/// section list degrades to just the title line (a template with no sections is still a valid,
+/// front-matter-first note).
+fn render_sections(sections: &[NoteTemplateSection]) -> String {
+    if sections.is_empty() {
+        return "# <title>\n".to_string();
+    }
+    let joined = sections
+        .iter()
+        .map(|s| format!("## {}\n{}", s.heading.trim(), s.instruction.trim()))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    format!("# <title>\n\n{joined}\n")
 }
 
 /// Build a style variant: the shared front-matter contract + a style-specific tone line and
 /// body section layout. Mirrors `default_template`'s invariants (first line `---`, no fences).
+/// Thin wrapper over [`style_variant_with_keys`] with no extra front-matter keys — the built-in
+/// styles call this, so their output stays byte-identical.
 fn style_variant(tone: &str, body_sections: &str) -> String {
+    style_variant_with_keys(tone, body_sections, &[])
+}
+
+/// The general form of [`style_variant`], adding `extra_keys` to the front-matter key list. When
+/// `tone` is empty the tone clause is omitted (the preamble ends at the period); a non-empty tone
+/// renders as `… whole note. {tone}` exactly as the built-in styles do. When `extra_keys` is empty
+/// the front-matter block is byte-identical to the legacy `style_variant` output (the built-in
+/// styles rely on this for the byte-identity regression). Each extra key is requested as an
+/// optional line so a template can add e.g. `project` / `client` front-matter.
+fn style_variant_with_keys(tone: &str, body_sections: &str, extra_keys: &[String]) -> String {
+    let tone_clause = if tone.is_empty() {
+        String::new()
+    } else {
+        format!(" {tone}")
+    };
+    let extra = extra_keys
+        .iter()
+        .map(|k| format!("- {}: (fill in from the meeting, or omit if unknown)\n", k.trim()))
+        .collect::<String>();
     format!(
         r#"You are a meticulous meeting-notes writer for an Obsidian vault.
 
 Produce a SINGLE, complete Markdown note summarizing the meeting transcript that
 follows. Output ONLY the note — no preamble, no explanation, no code fences around
-the whole note. {tone}
+the whole note.{tone_clause}
 
 The note MUST begin, on the very first line, with a YAML front-matter block delimited
 by a line containing exactly three dashes (`---`), then the front-matter keys, then a
@@ -98,7 +228,7 @@ Front-matter (YAML) keys to include:
 - duration_minutes: integer minutes (rounded)
 - tags: a YAML list including at least [meeting]
 - participants: a YAML list (may be empty if unknown)
-
+{extra}
 After the closing `---`, write the note body using these sections (omit a section only
 if there is genuinely nothing to say):
 
@@ -604,5 +734,184 @@ mod tests {
             "instructs action-item OWNER attribution"
         );
         assert!(labeled.contains("(speaker)") && labeled.contains("others"));
+    }
+
+    fn tpl(id: &str, tone: &str, sections: &[(&str, &str)], extra: &[&str]) -> NoteTemplate {
+        NoteTemplate {
+            id: id.to_string(),
+            name: format!("{id}-name"),
+            tone: tone.to_string(),
+            sections: sections
+                .iter()
+                .map(|(h, i)| NoteTemplateSection {
+                    heading: h.to_string(),
+                    instruction: i.to_string(),
+                })
+                .collect(),
+            extra_frontmatter_keys: extra.iter().map(|k| k.to_string()).collect(),
+            created_at: "2026-07-25T00:00:00Z".to_string(),
+        }
+    }
+
+    /// (i) BYTE-IDENTITY REGRESSION: after the data-driven refactor, the built-in `brief` style must
+    /// render EXACTLY the same prompt as before (the full literal is pinned so any spacing/keyword
+    /// drift from the `style_variant` → `style_variant_with_keys` change fails here). RED if the
+    /// refactor leaks an extra-key line, drops the tone clause, or shifts the front-matter spacing.
+    #[test]
+    fn builtin_brief_style_is_byte_identical() {
+        let expected = r#"You are a meticulous meeting-notes writer for an Obsidian vault.
+
+Produce a SINGLE, complete Markdown note summarizing the meeting transcript that
+follows. Output ONLY the note — no preamble, no explanation, no code fences around
+the whole note. Keep it SHORT — a busy reader skims this in 15 seconds.
+
+The note MUST begin, on the very first line, with a YAML front-matter block delimited
+by a line containing exactly three dashes (`---`), then the front-matter keys, then a
+closing `---` line. Do not emit anything before the opening `---`.
+
+Front-matter (YAML) keys to include:
+- title: a concise human-readable meeting title (string)
+- date: the meeting date in ISO format (YYYY-MM-DD)
+- duration_minutes: integer minutes (rounded)
+- tags: a YAML list including at least [meeting]
+- participants: a YAML list (may be empty if unknown)
+
+After the closing `---`, write the note body using these sections (omit a section only
+if there is genuinely nothing to say):
+
+# <title>
+
+## TL;DR
+Max 2 sentences capturing the outcome.
+
+## Decisions
+- Only the decisions actually made (or omit).
+
+## Action items
+- [ ] Owner — action (due date if mentioned)
+
+Linking rules:
+- When the meeting clearly references one of the EXISTING NOTE TITLES provided below,
+  link to it using Obsidian wikilink syntax: [[Exact Title]]. Only link titles that
+  appear in that list; never invent links.
+
+Formatting rules:
+- Use plain Markdown. Use real newlines.
+- Be faithful to the transcript; do not fabricate participants, decisions, or action
+  items that are not supported by the transcript.
+"#;
+        assert_eq!(template_for_style("brief"), expected);
+    }
+
+    /// (i, continued) The other three built-in ids preserve their exact touched-seam bytes: no
+    /// leaked extra-key line, the front-matter/`After the closing` spacing unchanged, and the tone
+    /// clause intact. `standard`/`""`/unknown all render the canonical default template unchanged.
+    #[test]
+    fn builtin_styles_have_no_extra_key_leak_and_default_fallback() {
+        for style in ["brief", "detailed", "action"] {
+            let out = template_for_style(style);
+            assert!(
+                !out.contains("(fill in from the meeting"),
+                "{style}: a built-in style must not render an extra-key line"
+            );
+            assert!(
+                out.contains("may be empty if unknown)\n\nAfter the closing"),
+                "{style}: front-matter → body spacing must be byte-identical"
+            );
+            assert!(
+                out.contains("the whole note. "),
+                "{style}: the tone clause must render as `whole note. <tone>`"
+            );
+        }
+        // standard, "" and any unknown/unregistered id all resolve to the canonical default.
+        assert_eq!(template_for_style("standard"), default_template());
+        assert_eq!(template_for_style(""), default_template());
+        assert_eq!(
+            template_for_style("no-such-template-id-xyz"),
+            default_template()
+        );
+    }
+
+    /// (ii) A saved template renders the expected prompt SHAPE from its DATA: the tone clause, its
+    /// ordered `## heading` sections (in order, with their instructions), and each extra
+    /// front-matter key as an optional line — all inside the same front-matter-first contract. And
+    /// once registered, `build_template(<saved id>, …)` resolves it through the registry (the exact
+    /// path the pipeline uses) and wraps it with the language directive.
+    #[test]
+    fn saved_template_renders_expected_prompt_from_data() {
+        let t = tpl(
+            "tpl-client-call",
+            "Write it for the CLIENT — warm, outcome-first.",
+            &[
+                ("Outcome", "One line: what we agreed."),
+                ("Next steps", "- [ ] Owner — action"),
+            ],
+            &["client", "project"],
+        );
+
+        let body = render_saved_template(&t);
+        // Front-matter-first invariant is unchanged (the style portion starts with the shared
+        // preamble; the whole rendered prompt still instructs a `---`-first note).
+        assert!(body.contains("no code fences around\nthe whole note. Write it for the CLIENT"));
+        assert!(body.contains("Do not emit anything before the opening `---`."));
+        // Extra front-matter keys are requested, after the fixed 5, before the blank line + body.
+        assert!(body.contains(
+            "- participants: a YAML list (may be empty if unknown)\n\
+             - client: (fill in from the meeting, or omit if unknown)\n\
+             - project: (fill in from the meeting, or omit if unknown)\n\n\
+             After the closing"
+        ));
+        // Ordered sections, in order, with instructions.
+        let out_at = body.find("## Outcome\nOne line: what we agreed.").expect("s1");
+        let next_at = body
+            .find("## Next steps\n- [ ] Owner — action")
+            .expect("s2");
+        assert!(out_at < next_at, "sections render in author order");
+        assert!(body.contains("# <title>\n\n## Outcome"), "title heads the body");
+
+        // Registered → build_template resolves it (pipeline's exact call) + appends the language
+        // directive; unlabeled adds no speaker directive.
+        set_saved_templates(vec![t.clone()]);
+        let built = build_template("tpl-client-call", "auto", false);
+        assert!(built.starts_with(&body), "build_template renders the saved body");
+        assert!(built.contains("OUTPUT LANGUAGE:"), "language directive appended");
+        assert!(!built.contains("SPEAKER ATTRIBUTION"), "no attribution when unlabeled");
+        // Cleanup so the process-global registry doesn't leak into other tests.
+        set_saved_templates(vec![]);
+    }
+
+    /// (iii) SECURITY: a template whose ANY field carries a scripting token (`<%`, `tp.`,
+    /// `require(`, `process.`) is REJECTED with `AppError::InvalidArg` at save — declarative data
+    /// only, never code. RED if a token slips through into a persisted (and thus egress-able)
+    /// template.
+    #[test]
+    fn scripting_tokens_are_rejected() {
+        // A clean template validates.
+        let ok = tpl("t1", "warm", &[("Summary", "One line.")], &["client"]);
+        assert!(validate_note_template(&ok.name, &ok.tone, &ok).is_ok());
+
+        // Each forbidden token, in a DIFFERENT field, must be refused.
+        let name_bad = tpl("t2", "warm", &[("Summary", "<% tp.file.title %>")], &[]);
+        let tone_bad = tpl("t3", "process.env.SECRET", &[("S", "ok")], &[]);
+        let heading_bad = tpl("t4", "warm", &[("require(fs)", "ok")], &[]);
+        let key_bad = tpl("t5", "warm", &[("S", "ok")], &["tp.frontmatter"]);
+        for t in [&name_bad, &tone_bad, &heading_bad, &key_bad] {
+            let err = validate_note_template(&t.name, &t.tone, t);
+            assert!(
+                matches!(err, Err(AppError::InvalidArg(_))),
+                "scripting token must be rejected as InvalidArg; got {err:?}"
+            );
+        }
+    }
+
+    /// A saved template with empty tone and no sections still renders a valid front-matter-first
+    /// prompt (no trailing-space tone artifact, just `## <title>`).
+    #[test]
+    fn saved_template_empty_tone_and_sections_is_valid() {
+        let t = tpl("bare", "", &[], &[]);
+        let body = render_saved_template(&t);
+        assert!(body.contains("no code fences around\nthe whole note.\n\nThe note MUST begin"));
+        assert!(body.contains("# <title>\n\nLinking rules:"));
+        assert!(!body.contains("(fill in from the meeting"));
     }
 }
