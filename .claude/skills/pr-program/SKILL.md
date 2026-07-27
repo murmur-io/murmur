@@ -59,15 +59,113 @@ Order PRs by dependency (shared-file PRs serialize; disjoint ones can overlap bu
 on the LATEST trunk; if two touch the same file, the second rebases + resolves (usually a clean
 union — e.g. two additive blocks in `detail.component.ts`).
 
+## ALWAYS `--base origin/murmur` (2026-07-26 — the single biggest time sink found so far)
+
+`scripts/agent-harness init` defaults `--base` to **HEAD, i.e. your LOCAL `murmur`** — which goes
+stale the moment any PR merges (yours or someone else's). Two failures, both observed in one program:
+
+1. **Every PR's CI ran TWICE.** A branch cut from stale trunk is refused at merge
+   ("Required status check … is expected" = *branch not up to date*), so you merge `origin/murmur` in,
+   push, and pay a second full CI cycle. ~26 min per PR, and it looked like "CI is slow".
+2. **A PR was created WITHOUT its dependency's work in it.** P2's worktree came up with no
+   `machine.service.ts` and no `catalog.rs` because local trunk predated P1's merge — the writer would
+   have spent a full round building on a foundation that was not there.
+
+**The rule:** `git fetch origin murmur -q` then `init … --base origin/murmur`. Verify before running:
+`ls <worktree>/<a file the previous PR added>`. And `git merge --ff-only origin/murmur` on the local
+trunk periodically so the working checkout doesn't drift either.
+
+## CLEANING UP A FAILED `init` TOUCHES **TWO** REPOS
+
+The harness pairs a `meetnotes` worktree with a `../murmur-server` worktree. `rm -rf` on the task dir
+leaves BOTH registrations dangling, and the next `init` dies with *"missing but already registered
+worktree"* — pointing at `murmur-server`, which is the confusing part. Full cleanup:
+
+```bash
+rm -rf ../.murmur-agent-tasks/<task-id> .git/agent-harness/tasks/<task-id>
+git worktree prune && git -C ../murmur-server worktree prune
+git branch -D agent/<task-id>
+```
+
+## THE INSTRUCTIONS HASH COVERS `.agents/harness/*`, NOT JUST `CLAUDE.md`
+
+`run` refuses with *"active agent instructions changed after init"* if anything in the hashed
+instruction set moves between `init` and `run` — and that set includes `.agents/harness/config.json`
+and `task_runner.py`. Uncommitted local edits there (a teammate's in-progress harness improvement) are
+enough to trip it. Init and run back-to-back, and if it fires, re-init rather than hunting for the diff.
+
 ## THE PRE-PUSH CHECKLIST (each catches a real CI-cycle-waster)
 
-- `cargo test --lib <targeted>` green (NOT the full suite).
+- `cargo test --lib <targeted>` green (NOT the full suite). **This is not advice, it is arithmetic:**
+  the full suite is ~170 s, and running it 5× "to be sure" burned ~14 min of a program's wall clock
+  while CI was going to run it anyway. Filter locally; the full gate is CI's job.
 - **`cargo clippy --lib -- -D warnings` clean** — link-free, ~15s. Catches the `dead_code` class that
   `cargo test` AND `clippy --lib --tests` MASK (a const/fn used only in `#[cfg(test)]` is "unused" in
   CI's lib-only build; often the feature is inert too). Ate a CI cycle when skipped.
 - **MSRV grep**: `git diff origin/murmur -- src-tauri | grep '^+' | grep -oE 'is_none_or|LazyLock|split_at_checked|take_if'`
   → empty. `-D warnings` implies `-D clippy::incompatible_msrv` (MSRV 1.77); `is_none_or`(1.82) → `map_or(true, …)`.
 - FE PRs: `npx ng lint && npx ng build` (never `ng test`).
+
+## WHEN THE HARNESS WRITER DIES MID-ROUND — READ THE DURATION FIRST
+
+**The usual cause is the WALL-CLOCK TIMEOUT.** On 2026-07-26 two writers died at
+`duration_ms` 1799668 and 1799683 — the 1800 s budget, to the millisecond, 108 and 181 turns,
+$14.99 and $26.33 forfeited.
+
+**Do not repeat the misdiagnosis this section used to carry.** It previously claimed a
+*tool-permission rejection* killed the writer, because the last tool calls before the wall happened
+to be refusals (heredocs blocked by this repo's own hooks). That is inferring cause from POSITION in
+the log. Permission denials do not end a session — Claude Code feeds the refusal back as stderr and
+the writer continues. Both deaths were the clock.
+
+**Diagnose in this order:**
+1. **`duration_ms` from the last `{"type":"result"}` line** of `logs/round-01-writer-<vendor>.jsonl`.
+   Within a second of the configured budget ⇒ timeout. Nothing else to look for.
+2. `events.jsonl` → the `model-process-exit` event carries `timed_out`, `exit_code` and
+   `terminal_subtype`. (Added 2026-07-27; older tasks predate it and only have the raw log.)
+3. Only then look at tool errors — and remember refusals are a turn TAX, not a cause of death.
+
+**Since 2026-07-27 a timed-out writer no longer forfeits the round:** it yields a
+`<TIMED OUT>` stub, the tree stays staged, and the checks and independent reviews still run. The
+reviewers receive a runner-derived `## Round provenance` warning instructing them to enumerate every
+contract deliverable as delivered/partial/missing, and the attestation plus the commit trailer record
+`Harness-Writer-Degraded: timeout`. **The most likely defect in such a round is OMISSION, which does
+not show up as a fault in the code that IS present** — both salvaged tasks that day were missing
+deliverables, not wrong.
+
+**If a round still lands in a terminal state, salvage rather than restart:**
+1. Verify the worktree YOURSELF: targeted `cargo test`, **`clippy --lib --tests -- -D warnings`**
+   (`--lib` alone misses lints in `#[cfg(test)]` code — that cost a CI cycle on 2026-07-26), `ng lint`,
+   `ng build`. Check the contract's load-bearing invariants by hand.
+2. Finish whatever the writer never reached — check the CONTRACT item by item, not the diff.
+3. **Then get an INDEPENDENT review anyway** — you are now an author. Run the reviewers as a Workflow;
+   the principle (the implementer never owns the verdict) is what matters, not the runner.
+4. Expect the CI attestation gate to REFUSE a hand-committed `agent/*` branch. That is the gate
+   working. Either re-run the task properly or declare `Harness-Lane: B` in the PR description so the
+   choice is recorded.
+
+## NEVER WRITE A THROWAWAY SCRIPT THAT `cd`s AND THEN RUNS `git`
+
+A verification script written during this program **destroyed the operator's primary checkout twice**:
+`mktemp -d` fails under the agent sandbox, `set -u` does NOT catch it (the assignment succeeds with an
+empty value), and **`cd "" || exit 1` SUCCEEDS in bash** — an empty operand is a no-op. Every `git`
+command then ran in the real repo, committing the entire uncommitted WIP onto local `murmur`.
+
+If a script must create a scratch repo: create the directory explicitly under the script's own
+directory, `exit` non-zero if `mkdir`/`cd` fail, and **assert `pwd -P` is not inside a real checkout
+before the first git command**.
+
+## TELL REVIEWERS THE PROVENANCE — IT CHANGES WHAT THEY FIND
+
+When part of a diff was written by the orchestrator, or salvaged, or hand-patched, **say so in the
+review prompt and tell them to treat those parts with MORE suspicion, not less.** This is not
+politeness; it is targeting. Doing it produced a same-round catch of a missing stale-result guard in
+orchestrator-written Angular — the exact class the repo's own rules call out, in the exact file the
+reviewer had been told to distrust. A reviewer given a diff with no provenance spreads attention
+evenly over code that does not deserve it evenly.
+
+Corollary: **fold fixes into ONE round.** Review → fix → re-review ran ~21 min sequentially; asking
+reviewers for exact patches alongside findings collapses that to one pass.
 
 ## VERIFIER DISCIPLINE (this is where the real bugs hide)
 

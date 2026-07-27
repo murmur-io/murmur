@@ -679,6 +679,22 @@ def instructions_hash(repo_root: Path) -> str:
     return digest.hexdigest()
 
 
+def _prune_worktree_registrations(primary: Path) -> None:
+    """Drop dangling worktree registrations in the primary repo AND its sibling.
+
+    The harness pairs a `meetnotes` worktree with a `../murmur-server` one, so a task dir
+    deleted outside the runner orphans TWO registrations. Best-effort by design: a repo that
+    is absent, or a git that refuses, must never block `init`.
+    """
+    for repo in (primary, primary.parent / "murmur-server"):
+        if not (repo / ".git").exists():
+            continue
+        try:
+            run_capture(["git", "worktree", "prune"], repo)
+        except Exception:
+            continue
+
+
 def has_murmur_server_path_dependency(repo_root: Path) -> bool:
     cargo_files = [repo_root / "Cargo.toml", repo_root / "src-tauri" / "Cargo.toml"]
     crates = repo_root / "crates"
@@ -2063,6 +2079,41 @@ def _claude_terminal_subtype(log_path: Path) -> Optional[str]:
     return subtype
 
 
+def _timed_out_writer_document(vendor: str, duration_ms: int, timeout_seconds: int) -> Dict[str, Any]:
+    """A schema-valid writer stub for a writer that hit its wall-clock budget.
+
+    A timeout used to RAISE, forfeiting the whole round — every edit already on disk,
+    plus the checks and independent reviews that had not run yet. Measured cost of that
+    choice on 2026-07-26: two writers killed at exactly 1799.7 s (108 and 181 turns,
+    $14.99 and $26.33), both leaving complete, compiling work that had to be recovered by
+    hand. The tree is already staged at this point, so the honest move is to proceed and
+    let the deterministic checks and the independent reviewers say what is missing — a
+    round that ends in "incomplete, X and Y are absent" beats one that ends in silence.
+
+    The summary states the truth loudly so no reviewer mistakes a partial deliverable for
+    a finished one.
+    """
+
+    return {
+        "status": "completed",
+        "summary": (
+            f"<TIMED OUT> the {vendor} writer hit its {timeout_seconds}s wall-clock budget "
+            f"after {round(duration_ms / 1000)}s and was stopped mid-round. The staged diff "
+            "is whatever it had completed by then and is very likely INCOMPLETE — expect "
+            "unfinished call sites, missing tests and half-applied refactors. This is not a "
+            "self-report of a finished change: the verdict rests entirely on the harness's "
+            "deterministic checks and the independent reviews."
+        ),
+        "tests_run": [],
+        "remaining_risks": [
+            "the writer was stopped by a timeout, so the deliverable may be PARTIAL; "
+            "reviewers must hunt OMISSIONS as well as defects",
+            "a timed-out writer's most likely failure is missing work, which does not "
+            "show up as a defect in the code that IS present — check every contract item",
+        ],
+    }
+
+
 def _degraded_writer_document(vendor: str, subtype: str) -> Dict[str, Any]:
     """A schema-valid writer stub used when the writer's self-report was unparseable."""
 
@@ -2138,6 +2189,10 @@ def invoke_model(
     recorded_argv: List[str] = [vendor, "fake"]
     budget: Optional[str] = None
     removed_env_names: List[str] = []
+    # RUNNER-OWNED record of an abnormal round. It must not come from the model's own
+    # self-report: a killed writer cannot be trusted to describe its own death, and a
+    # self-report is not delivered to reviewers anyway. `None` = a clean round.
+    degraded: Optional[str] = None
 
     if vendor == "fake":
         verdict_override = os.environ.get(f"MURMUR_HARNESS_FAKE_{label.upper().replace('-', '_')}_VERDICT")
@@ -2330,12 +2385,62 @@ def invoke_model(
             stdin_bytes=prompt.encode("utf-8"),
             env=environment,
         )
+        # RECORD THE PROCESS OUTCOME BEFORE ANY BRANCH CAN RAISE.
+        #
+        # The `model-invocation` event below is appended only on the SUCCESS path, so every
+        # failure was invisible in the event stream — 271 raw logs against 257 events, i.e.
+        # 5.2% of invocations unaccounted for. That blind spot is why a timeout was
+        # misdiagnosed as a permission rejection: with no recorded exit reason, the only
+        # evidence left was the position of the last tool call in the log. Emitting here
+        # makes every future failure self-diagnosing.
+        append_jsonl(
+            task_dir / "events.jsonl",
+            {
+                "at": utc_now(),
+                "event": "model-process-exit",
+                "label": label,
+                "role": role,
+                "vendor": vendor,
+                "exit_code": process_result["exit_code"],
+                "timed_out": process_result["timed_out"],
+                "duration_ms": process_result["duration_ms"],
+                "wall_timeout_seconds": timeout_seconds,
+                "terminal_subtype": _claude_terminal_subtype(log_path),
+                "log_path": str(log_path),
+            },
+        )
         if process_result["exit_code"] != 0 or process_result["timed_out"]:
             subtype = None if process_result["timed_out"] else _claude_terminal_subtype(log_path)
-            if role == "writer" and subtype in _RECOVERABLE_WRITER_REPORT_SUBTYPES:
+            if role == "writer" and process_result["timed_out"]:
+                # A TIMED-OUT WRITER IS RECOVERED, NOT DISCARDED.
+                #
+                # Raising here forfeited the entire round: every edit already on disk, plus
+                # the deterministic checks and the independent reviews that had not run yet.
+                # The tree is staged at this point, so proceeding costs nothing and buys a
+                # real verdict. The stub summary states loudly that the work is likely
+                # partial, and `stage_owned_paths` + the reviewers remain the authority —
+                # this is not the writer certifying itself.
+                degraded = "timeout"
+                document = _timed_out_writer_document(
+                    vendor, int(process_result["duration_ms"]), int(timeout_seconds)
+                )
+                append_jsonl(
+                    task_dir / "events.jsonl",
+                    {
+                        "at": utc_now(),
+                        "event": "writer-timed-out-recovered",
+                        "label": label,
+                        "vendor": vendor,
+                        "duration_ms": process_result["duration_ms"],
+                        "wall_timeout_seconds": timeout_seconds,
+                        "reason": "writer hit its wall-clock budget; proceeding on the staged tree so checks and reviews still run",
+                    },
+                )
+            elif role == "writer" and subtype in _RECOVERABLE_WRITER_REPORT_SUBTYPES:
                 # The writer produced its edits but could not emit a well-formed final
                 # report. Proceed on the STAGED tree — checks + independent reviews own
                 # the verdict — instead of forfeiting a complete, compiling deliverable.
+                degraded = "unparseable-report"
                 document = _degraded_writer_document(vendor, subtype)
                 append_jsonl(
                     task_dir / "events.jsonl",
@@ -2403,6 +2508,7 @@ def invoke_model(
         "role": role,
         "label": label,
         "result": document,
+        "degraded": degraded,
         "result_path": str(result_path),
         "artifact_sha256": sha256_file(result_path),
         "invocation_path": str(invocation_path),
@@ -2423,11 +2529,45 @@ def writer_prompt(contract: Mapping[str, Any], feedback: Sequence[Mapping[str, A
     return "\n".join(sections)
 
 
+def _round_provenance_section(writer_degraded: Optional[str]) -> str:
+    """RUNNER-DERIVED warning that the deliverable may be truncated.
+
+    Deliberately NOT sourced from the writer's own self-report: reviewers never receive
+    that document (this function's caller assembles the prompt from the reviewer prompt,
+    the contract, the diff and the check evidence — and nothing else), so any warning
+    written into a writer stub reaches nobody. The runner knows the process was killed;
+    only the runner can tell the reviewer.
+    """
+
+    if not writer_degraded:
+        return ""
+    if writer_degraded == "timeout":
+        cause = (
+            "the writer process was KILLED at its wall-clock budget, mid-round. The diff "
+            "below is whatever it had finished by then."
+        )
+    else:
+        cause = (
+            f"the writer terminated abnormally ({writer_degraded}) and its self-report was "
+            "recovered rather than authored."
+        )
+    return (
+        "\n## Round provenance — READ THIS FIRST\n"
+        f"This round is DEGRADED: {cause}\n\n"
+        "Consequence for your review: the most likely defect is OMISSION, which does not "
+        "appear as a fault in the code that IS present. Do not review only what is in the "
+        "diff. Enumerate EVERY deliverable named in the contract above and report each one "
+        "as delivered / partial / missing. A contract item you cannot find is a finding, "
+        "not an absence of evidence."
+    )
+
+
 def review_prompt(
     review_name: str,
     contract: Mapping[str, Any],
     diff: bytes,
     checks: Sequence[Mapping[str, Any]],
+    writer_degraded: Optional[str] = None,
 ) -> str:
     declared_check_ids = [
         check["id"]
@@ -2446,6 +2586,7 @@ def review_prompt(
         [
             read_prompt(f"{review_name}-reviewer"),
             learning_prompt(contract, role="reviewer", review_name=review_name),
+            _round_provenance_section(writer_degraded),
             "\n## Immutable task contract\n```json\n" + json.dumps(contract, indent=2, sort_keys=True) + "\n```",
             "\n## Exact staged binary diff\n```diff\n" + diff.decode("utf-8", "replace") + "\n```",
             "\n## Evidence scheduling\nAll contract `checks` and `final_checks` have "
@@ -2805,6 +2946,13 @@ def create_attestation(
             "log_path": latest_writer["log"],
             "log_sha256": latest_writer["log_sha256"],
             "created_at": latest_writer["created_at"],
+            # `null` on a clean round; "timeout" / "unparseable-report" when the writer
+            # process ended abnormally and its tree was recovered rather than reported.
+            # Without this the receipt for a SIGKILLed writer is byte-shape-identical to a
+            # clean one — false confidence in the exact artifact the CI gate publishes.
+            "degraded": latest_writer.get("degraded"),
+            "timed_out": bool(latest_writer.get("timed_out")),
+            "duration_ms": latest_writer.get("duration_ms"),
         },
         "reviewer": {
             "vendor": contract["reviewer"],
@@ -3000,7 +3148,16 @@ def run_task(
                 worktree=worktree,
                 task_dir=task_dir,
                 label=f"round-{round_number:02d}-writer",
-                timeout_seconds=bounded_timeout(task_deadline, int(config["agent_timeout_seconds"])),
+                # Writers get their OWN budget. Sharing one `agent_timeout_seconds` with
+                # reviewers killed three writers at EXACTLY 1799.7 s while no reviewer ever
+                # came close: measured writer median 514 s / p90 1539 s / max 1800 s, against
+                # reviewer median 260 s / max 611 s. A writer does strictly more work than a
+                # reviewer, so one shared ceiling sizes the budget to the wrong role and the
+                # whole round — checks and reviews included — is forfeited at the wall.
+                timeout_seconds=bounded_timeout(
+                    task_deadline,
+                    int(config.get("writer_timeout_seconds", config["agent_timeout_seconds"])),
+                ),
                 instructions_sha256=contract["instructions_sha256"],
             )
             writer_runs.append(writer)
@@ -3181,12 +3338,26 @@ def run_task(
                         contract,
                         reviewed_diff,
                         review_checks,
+                        # The runner tells the reviewer the round was degraded. Relying on
+                        # the writer's own stub to carry that warning was a fiction: the
+                        # writer result is never part of the reviewer prompt.
+                        writer_degraded=writer.get("degraded"),
                     ),
                     schema_name="review",
                     worktree=worktree,
                     task_dir=task_dir,
                     label=f"round-{round_number:02d}-{review_name}",
-                    timeout_seconds=bounded_timeout(task_deadline, int(config["agent_timeout_seconds"])),
+                    # Reviewers are measured far faster than writers (median 260 s, max 611 s),
+                    # so they get a tighter budget — a reviewer that runs an hour is stuck, not
+                    # thorough, and it should surface as a failure rather than eat the task clock.
+                    timeout_seconds=bounded_timeout(
+                        task_deadline,
+                        int(
+                            config.get(
+                                "reviewer_timeout_seconds", config["agent_timeout_seconds"]
+                            )
+                        ),
+                    ),
                     instructions_sha256=contract["instructions_sha256"],
                 )
                 evidence = _review_evidence(model_review)
@@ -3759,7 +3930,57 @@ def cmd_init(args: argparse.Namespace) -> int:
     if overlaps and args.kind != "harness":
         raise HarnessError(f"owned paths overlap protected harness/guardrail paths: {', '.join(overlaps)}")
 
-    base_sha = git(cwd, "rev-parse", "--verify", "--end-of-options", f"{args.base or 'HEAD'}^{{commit}}")
+    # DEFAULT TO THE REMOTE TRUNK, NOT LOCAL HEAD.
+    #
+    # Defaulting to HEAD silently cut every task from whatever the operator's checkout
+    # happened to be on, which goes stale the instant any PR merges. Two measured
+    # consequences on 2026-07-26: every PR's CI ran TWICE (the merge is refused as
+    # "branch not up to date", so the branch is caught up and the ~17 min gate re-runs),
+    # and one task's worktree came up WITHOUT its dependency PR's files — the writer
+    # would have spent a whole round building on a foundation that did not exist.
+    #
+    # An explicit --base is still honoured verbatim; only the DEFAULT changes, and a
+    # default that cannot be fetched falls back to HEAD rather than blocking offline work.
+    requested_base = args.base
+    if not requested_base:
+        default_remote_base = str(config.get("default_base", "origin/murmur"))
+        try:
+            remote, _, remote_branch = default_remote_base.partition("/")
+            if remote and remote_branch:
+                # NEVER let this hang. A credential prompt on stdin has no terminal here,
+                # and a hang is not an exception — the fallback below would never fire and
+                # `init` would sit forever. This repo has paid for that exact shape before
+                # (a locked keychain wedged eleven `security` processes on 2026-06-27), so
+                # the fetch is both non-interactive AND wall-clocked.
+                subprocess.run(
+                    ["git", "fetch", "--quiet", remote, remote_branch],
+                    cwd=cwd,
+                    check=True,
+                    capture_output=True,
+                    timeout=int(config.get("base_fetch_timeout_seconds", 30)),
+                    env={
+                        **os.environ,
+                        "GIT_TERMINAL_PROMPT": "0",
+                        "GIT_ASKPASS": "",
+                        "SSH_ASKPASS": "",
+                    },
+                )
+            git(cwd, "rev-parse", "--verify", "--end-of-options", f"{default_remote_base}^{{commit}}")
+            requested_base = default_remote_base
+        except Exception as exc:
+            # No network, no remote, a differently-named trunk, or a fetch that timed out.
+            # LOUDLY: falling back to local HEAD silently is how a task gets cut from a
+            # stale trunk, which is the bug this default exists to prevent. The operator
+            # must be able to see that it happened.
+            print(
+                f"agent-harness: WARNING — could not resolve {default_remote_base} "
+                f"({type(exc).__name__}); falling back to local HEAD. The task base may be "
+                "STALE: its CI can fail as out-of-date, and it may miss a dependency PR's "
+                f"work. Pass --base explicitly to be sure.",
+                file=sys.stderr,
+            )
+            requested_base = "HEAD"
+    base_sha = git(cwd, "rev-parse", "--verify", "--end-of-options", f"{requested_base}^{{commit}}")
     if not SHA1_RE.fullmatch(base_sha):
         raise HarnessError(f"invalid base commit: {base_sha}")
     branch = args.branch or f"agent/{args.task_id}"
@@ -3849,6 +4070,11 @@ def cmd_init(args: argparse.Namespace) -> int:
     task_dir.mkdir(parents=True)
     task_root.mkdir(parents=True)
     server_source: Optional[Path] = None
+    # PRUNE BOTH REPOS FIRST. A task dir removed by hand (or a rollback that lost a race)
+    # leaves the worktree REGISTRATION behind in .git/worktrees, and the next `init` then
+    # dies with "missing but already registered worktree" — pointing at the SIBLING repo,
+    # far from the cause and thoroughly confusing. `prune` is a no-op when nothing dangles.
+    _prune_worktree_registrations(primary)
     try:
         run_capture(["git", "worktree", "add", "-b", branch, str(worktree), base_sha], primary)
         if has_murmur_server_path_dependency(worktree):
@@ -4225,6 +4451,36 @@ def cmd_commit(args: argparse.Namespace) -> int:
             f"found {actual_name or 'unset'} <{actual_email or 'unset'}>"
         )
 
+    # PUBLISH THE RECEIPT INTO THE COMMIT MESSAGE.
+    #
+    # The attestation lives in `.git/agent-harness/`, which is LOCAL — so nothing outside
+    # this machine could tell an attested commit from an unattested one. That is how a
+    # BLOCKED task's branch (2,566 lines) reached trunk on 2026-07-26 with an empty
+    # `results/` and no attestation, and nothing noticed.
+    #
+    # Trailers, not a second commit or a tracked file: both of those would change the tree
+    # the attestation binds, and a second commit would also break `close`'s "exactly one
+    # task commit" invariant. A message carries the receipt at zero cost to integrity.
+    #
+    # HONEST LIMIT: this is a PRESENCE-and-CONSISTENCY signal for CI, not a cryptographic
+    # proof. It defends against forgetting, which is the failure that actually happened —
+    # it does not defend against someone deliberately forging a trailer.
+    trailer_lines = [
+        f"Harness-Task: {contract['task_id']}",
+        "Harness-Verdict: PASS",
+        f"Harness-Base: {contract['base_sha']}",
+        f"Harness-Diff-Sha256: {attestation['staged_diff_sha256']}",
+        f"Harness-Attestation-Sha256: {sha256_file(task_dir / 'attestation.json')}",
+    ]
+    # A round whose writer was killed still reaches PASS on the strength of the checks and
+    # the independent reviews — but the receipt must SAY SO. Publishing a degraded round
+    # under a trailer identical to a clean one is exactly the false confidence this receipt
+    # exists to prevent.
+    writer_degraded = (attestation.get("writer") or {}).get("degraded")
+    if writer_degraded:
+        trailer_lines.insert(2, f"Harness-Writer-Degraded: {writer_degraded}")
+    trailers = "\n".join(trailer_lines)
+    message = f"{message}\n\n{trailers}"
     commit_argv = ["git", "commit"]
     if not contract["expected_change"]:
         commit_argv.append("--allow-empty")

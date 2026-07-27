@@ -78,7 +78,13 @@
         "invocation_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
         "log_path": { "type": "string", "minLength": 1 },
         "log_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
-        "created_at": { "type": "string", "format": "date-time" }
+        "created_at": { "type": "string", "format": "date-time" },
+        "degraded": {
+          "description": "How the writer round ended abnormally, or null on a clean round. RUNNER-derived, never taken from the model's self-report — a receipt for a killed writer must not be byte-shape-identical to a clean one.",
+          "enum": ["timeout", "unparseable-report", null]
+        },
+        "timed_out": { "type": "boolean" },
+        "duration_ms": { "type": ["integer", "null"], "minimum": 0 }
       }
     },
     "reviewerRun": {
