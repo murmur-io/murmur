@@ -76,6 +76,24 @@ pub(crate) fn forget_user_fact_inner(state: &AppState, id: &str) -> Result<(), A
     Ok(())
 }
 
+/// Forget ONE ENTITY fact (bitemporal invalidate — the row is CLOSED, never silently deleted, so
+/// history is preserved). The entity twin of [`forget_user_fact`]: until this existed an entity fact
+/// could only be superseded by a later meeting asserting a different object for the same key, so a
+/// junk row nobody would ever restate stayed CURRENT forever and kept surfacing through
+/// `get_entity_dossier` as truth. Idempotent. Content-free logging (the fact id only).
+#[tauri::command]
+pub fn forget_entity_fact(state: State<'_, AppState>, id: String) -> Result<(), AppError> {
+    forget_entity_fact_inner(state.inner(), &id)
+}
+
+/// Inner of [`forget_entity_fact`] taking `&AppState` (unit-testable).
+pub(crate) fn forget_entity_fact_inner(state: &AppState, id: &str) -> Result<(), AppError> {
+    let at = chrono::Utc::now().to_rfc3339();
+    let closed = state.db.forget_entity_fact(id, &at)?;
+    tracing::info!(target: "facts", fact_id = %id, closed, "entity fact forgotten (invalidated)");
+    Ok(())
+}
+
 /// Clear ALL user memory: bitemporal-close every currently-open user fact (invalidate, never delete —
 /// closed history stays). After this `get_user_memory` and the brief are empty. Content-free logging
 /// (a count only).
