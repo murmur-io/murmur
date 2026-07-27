@@ -1,0 +1,9 @@
+<span class="meter-label">{{ label() }}</span>
+<span class="meter-pips" aria-hidden="true">
+  @for (i of pips(); track i) {
+    <span class="meter-pip" [class.is-on]="i < filled()"></span>
+  }
+</span>
+@if (detail(); as d) {
+  <span class="meter-detail">{{ d }}</span>
+}
