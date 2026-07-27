@@ -562,14 +562,23 @@ fn dp_biometric_read(account: &str, reason: &str) -> Result<[u8; 32]> {
         }
         return match status {
             s if s == ERR_SEC_USER_CANCELED => {
-                Err(AppError::BiometricFailed("Touch ID was cancelled".into()))
+                Err(AppError::BiometricFailed(crate::errcode::tag(
+                    crate::errcode::TOUCH_ID_CANCELLED,
+                    "Touch ID was cancelled",
+                )))
             }
             s if s == errSecAuthFailed => {
-                Err(AppError::BiometricFailed("authentication failed".into()))
+                Err(AppError::BiometricFailed(crate::errcode::tag(
+                    crate::errcode::TOUCH_ID_FAILED,
+                    "authentication failed",
+                )))
             }
-            s if s == ERR_SEC_INTERACTION_NOT_ALLOWED => Err(AppError::BiometricFailed(
-                "interaction not allowed (no UI context to present Touch ID)".into(),
-            )),
+            s if s == ERR_SEC_INTERACTION_NOT_ALLOWED => {
+                Err(AppError::BiometricFailed(crate::errcode::tag(
+                    crate::errcode::TOUCH_ID_FAILED,
+                    "interaction not allowed (no UI context to present Touch ID)",
+                )))
+            }
             other => Err(map_osstatus("read account-MK item", other)),
         };
     }
@@ -981,14 +990,23 @@ impl KekStore for MacKekStore {
             return match status {
                 s if s == errSecItemNotFound => Ok(None),
                 s if s == ERR_SEC_USER_CANCELED => {
-                    Err(AppError::BiometricFailed("Touch ID was cancelled".into()))
+                    Err(AppError::BiometricFailed(crate::errcode::tag(
+                        crate::errcode::TOUCH_ID_CANCELLED,
+                        "Touch ID was cancelled",
+                    )))
                 }
                 s if s == errSecAuthFailed => {
-                    Err(AppError::BiometricFailed("authentication failed".into()))
+                    Err(AppError::BiometricFailed(crate::errcode::tag(
+                        crate::errcode::TOUCH_ID_FAILED,
+                        "authentication failed",
+                    )))
                 }
-                s if s == ERR_SEC_INTERACTION_NOT_ALLOWED => Err(AppError::BiometricFailed(
-                    "interaction not allowed (no UI context to present Touch ID)".into(),
-                )),
+                s if s == ERR_SEC_INTERACTION_NOT_ALLOWED => {
+                    Err(AppError::BiometricFailed(crate::errcode::tag(
+                        crate::errcode::TOUCH_ID_FAILED,
+                        "interaction not allowed (no UI context to present Touch ID)",
+                    )))
+                }
                 other => Err(map_osstatus("read biometric KEK item", other)),
             };
         }
@@ -1061,14 +1079,23 @@ impl MacKekStore {
             return match status {
                 s if s == errSecItemNotFound => Ok(Vec::new()),
                 s if s == ERR_SEC_USER_CANCELED => {
-                    Err(AppError::BiometricFailed("Touch ID was cancelled".into()))
+                    Err(AppError::BiometricFailed(crate::errcode::tag(
+                        crate::errcode::TOUCH_ID_CANCELLED,
+                        "Touch ID was cancelled",
+                    )))
                 }
                 s if s == errSecAuthFailed => {
-                    Err(AppError::BiometricFailed("authentication failed".into()))
+                    Err(AppError::BiometricFailed(crate::errcode::tag(
+                        crate::errcode::TOUCH_ID_FAILED,
+                        "authentication failed",
+                    )))
                 }
-                s if s == ERR_SEC_INTERACTION_NOT_ALLOWED => Err(AppError::BiometricFailed(
-                    "interaction not allowed (no UI context to present Touch ID)".into(),
-                )),
+                s if s == ERR_SEC_INTERACTION_NOT_ALLOWED => {
+                    Err(AppError::BiometricFailed(crate::errcode::tag(
+                        crate::errcode::TOUCH_ID_FAILED,
+                        "interaction not allowed (no UI context to present Touch ID)",
+                    )))
+                }
                 other => Err(map_osstatus("enumerate biometric KEK items", other)),
             };
         }
@@ -1129,7 +1156,10 @@ fn map_osstatus(ctx: &str, status: core_foundation::base::OSStatus) -> AppError 
     );
     if status == sec_consts::ERR_SEC_INTERACTION_NOT_ALLOWED {
         // The keychain is locked / no UI context — treat as a denied access, recoverable.
-        return AppError::KeychainDenied(format!("{ctx}: OSStatus {status}"));
+        return AppError::KeychainDenied(crate::errcode::tag(
+            crate::errcode::KEYCHAIN_DENIED,
+            format!("{ctx}: OSStatus {status}"),
+        ));
     }
     if status == MISSING_ENTITLEMENT_STATUS {
         // Unsigned/ad-hoc dev build: the data-protection keychain entitlement is absent. Build the

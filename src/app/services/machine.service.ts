@@ -5,6 +5,7 @@ import type {
   WhisperModelDto,
   WhisperRecommendationDto,
 } from "../core/models";
+import { ErrorCopyService } from "../core/copy/error-copy.service";
 
 /**
  * Root-held answer to "what does THIS Mac deserve?" — the machine profile, the
@@ -27,6 +28,7 @@ import type {
 @Injectable({ providedIn: "root" })
 export class MachineService {
   private readonly ipc = inject(IpcService);
+  private readonly errorCopy = inject(ErrorCopyService);
 
   private readonly _data = signal<WhisperRecommendationDto | null>(null);
   private readonly _loading = signal(false);
@@ -101,7 +103,7 @@ export class MachineService {
       if (seq !== this.loadSeq) return;
       // Keep the last-known catalog on screen rather than blanking it: a failed
       // refresh should degrade to stale-but-useful, never to empty.
-      this._error.set(String(e));
+      this._error.set(this.errorCopy.humanize(e));
     } finally {
       // `_loading` is gated too: a superseded call clearing it would report
       // "settled" while the newest request is still in flight.

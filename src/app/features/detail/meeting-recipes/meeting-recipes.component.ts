@@ -15,6 +15,7 @@ import {
 import { IpcService } from "../../../core/ipc.service";
 import type { BuiltinRecipe, SavedRecipe } from "../../../core/models";
 import { MarkdownComponent } from "../../../shared/markdown/markdown.component";
+import { ErrorCopyService } from "../../../core/copy/error-copy.service";
 
 /**
  * "Recipes / Generate" — one-tap grounded generations over a single meeting's
@@ -42,6 +43,7 @@ export class MeetingRecipesComponent implements OnInit {
   private readonly ipc = inject(IpcService);
   private readonly injector = inject(Injector);
   private readonly destroyRef = inject(DestroyRef);
+  private readonly errorCopy = inject(ErrorCopyService);
 
   /** The meeting whose transcript grounds every generation. */
   readonly meetingId = input.required<string>();
@@ -161,7 +163,7 @@ export class MeetingRecipesComponent implements OnInit {
       this.scrollToOutput();
     } catch (e) {
       // Keep lastPrompt so Retry can re-run the same recipe.
-      this.error.set("Couldn’t generate: " + String(e));
+      this.error.set(this.errorCopy.because("Couldn’t generate", e));
     } finally {
       this.pending.set(false);
     }
@@ -188,7 +190,7 @@ export class MeetingRecipesComponent implements OnInit {
       await this.ipc.deleteRecipe(id);
       await this.refreshRecipes();
     } catch (e) {
-      this.error.set("Couldn’t delete recipe: " + String(e));
+      this.error.set(this.errorCopy.because("Couldn’t delete recipe", e));
     } finally {
       this.deletingId.set(null);
     }
@@ -212,7 +214,7 @@ export class MeetingRecipesComponent implements OnInit {
       await this.ipc.saveRecipe(title, prompt);
       await this.refreshRecipes();
     } catch (e) {
-      this.error.set("Couldn’t save recipe: " + String(e));
+      this.error.set(this.errorCopy.because("Couldn’t save recipe", e));
     }
   }
 

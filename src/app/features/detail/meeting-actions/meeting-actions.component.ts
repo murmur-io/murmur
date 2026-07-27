@@ -10,6 +10,7 @@ import {
 } from "@angular/core";
 import { IpcService } from "../../../core/ipc.service";
 import type { ActionItem } from "../../../core/models";
+import { ErrorCopyService } from "../../../core/copy/error-copy.service";
 
 /**
  * "Action items" — a glass panel listing the action-item checklist parsed from a
@@ -38,6 +39,7 @@ import type { ActionItem } from "../../../core/models";
 export class MeetingActionsComponent implements OnInit {
   private readonly ipc = inject(IpcService);
   private readonly destroyRef = inject(DestroyRef);
+  private readonly errorCopy = inject(ErrorCopyService);
 
   /** The meeting whose note's action items are listed + patched. */
   readonly meetingId = input.required<string>();
@@ -104,13 +106,18 @@ export class MeetingActionsComponent implements OnInit {
     }
   }
 
-  /** Map a Reminders failure to a clear message (permission denial → settings). */
+  /**
+   * Map a Reminders failure to a clear message (permission denial → settings).
+   *
+   * Keyed on the `[reminders-denied]` code (`errcode::REMINDERS_DENIED`) rather than on a
+   * `/permission|denied|access|authoriz|not allowed/` sweep over the raw string — that sweep also
+   * matched unrelated failures, and it rendered the osascript stderr verbatim on the miss.
+   */
   private reminderErrorMessage(error: unknown): string {
-    const raw = String(error);
-    if (/permission|denied|access|authoriz|not allowed/i.test(raw)) {
+    if (this.errorCopy.is(error, "reminders-denied")) {
       return "Grant Reminders access in System Settings.";
     }
-    return "Couldn’t add to Reminders: " + raw;
+    return this.errorCopy.because("Couldn’t add to Reminders", error);
   }
 
   // --- Save to Obsidian Tasks ---------------------------------------------
@@ -132,7 +139,7 @@ export class MeetingActionsComponent implements OnInit {
       await this.loadItems();
       this.flashPatchSaved();
     } catch (e) {
-      this.patchError.set("Couldn’t save to your note: " + String(e));
+      this.patchError.set(this.errorCopy.because("Couldn’t save to your note", e));
     } finally {
       this.patching.set(false);
     }

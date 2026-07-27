@@ -16,6 +16,7 @@ import type {
   ShareInboxItem,
 } from "../../../../core/models";
 import { SharingAuthFlowComponent } from "../../../sharing/sharing-auth-flow/sharing-auth-flow.component";
+import { ErrorCopyService } from "../../../../core/copy/error-copy.service";
 
 /** A flattened, depth-indented folder option for the accept-into picker. */
 interface FolderOption {
@@ -51,6 +52,7 @@ interface FolderOption {
 export class SettingsAccountSectionComponent {
   private readonly ipc = inject(IpcService);
   private readonly injector = inject(Injector);
+  private readonly errorCopy = inject(ErrorCopyService);
 
   /** The current sharing-account session; `null` until the first load resolves. */
   private readonly _status = signal<AccountStatus | null>(null);
@@ -176,7 +178,7 @@ export class SettingsAccountSectionComponent {
       st = await this.ipc.accountStatus();
       this._status.set(st);
     } catch (e) {
-      this._accountError.set(String(e));
+      this._accountError.set(this.errorCopy.humanize(e));
     } finally {
       this._loaded.set(true);
     }
@@ -201,7 +203,7 @@ export class SettingsAccountSectionComponent {
     try {
       this._inbox.set(await this.ipc.listShareInbox());
     } catch (e) {
-      this._inboxError.set(String(e));
+      this._inboxError.set(this.errorCopy.humanize(e));
     } finally {
       this._inboxLoading.set(false);
     }
@@ -257,18 +259,12 @@ export class SettingsAccountSectionComponent {
       }
     } catch (e) {
       this._biometricFailed.set(true);
-      this._unlockError.set(this.friendlyUnlockError(String(e)));
+      // Cancel-vs-failure now comes from the `[touch-id-*]` code, not from the word "cancel"
+      // appearing in the keychain's own sentence. The password fall-back is unchanged.
+      this._unlockError.set(this.errorCopy.humanize(e, "account"));
     } finally {
       this._unlocking.set(false);
     }
-  }
-
-  /** Turn a raw biometric-unlock error into a friendly fall-back message. */
-  private friendlyUnlockError(raw: string): string {
-    if (/cancel/i.test(raw)) {
-      return "Touch ID was cancelled. Sign in with your password to share instead.";
-    }
-    return "Couldn't unlock with Touch ID. Sign in with your password to share instead.";
   }
 
   /** Sign out (server family-revoke + clear tokens + drop session MK), then reload. */
@@ -279,7 +275,7 @@ export class SettingsAccountSectionComponent {
       await this.ipc.accountLogout();
       await this.reload();
     } catch (e) {
-      this._accountError.set(String(e));
+      this._accountError.set(this.errorCopy.humanize(e));
     } finally {
       this._busy.set(false);
     }
@@ -312,7 +308,7 @@ export class SettingsAccountSectionComponent {
     } catch (e) {
       this._rowError.set({
         id: item.shareId,
-        msg: this.friendlyShareError(String(e)),
+        msg: this.errorCopy.humanize(e, "account"),
       });
     } finally {
       this._busyShare.set(null);
@@ -331,18 +327,13 @@ export class SettingsAccountSectionComponent {
       await this.ipc.declineShare(item.shareId);
       await this.loadInbox();
     } catch (e) {
-      this._rowError.set({ id: item.shareId, msg: String(e) });
+      this._rowError.set({
+        id: item.shareId,
+        msg: this.errorCopy.humanize(e, "account"),
+      });
     } finally {
       this._busyShare.set(null);
     }
-  }
-
-  /** Turn a raw backend error into a friendly, non-crashy inline message. */
-  private friendlyShareError(raw: string): string {
-    if (/lock/i.test(raw)) {
-      return "That folder is locked. Unlock it (or pick an open folder / the default) to accept.";
-    }
-    return raw;
   }
 
   /** Presentational: render an ISO timestamp as a friendly local date. */

@@ -12,6 +12,7 @@ import { ToastService } from "../../../../../services/toast.service";
 import { SettingsStore } from "../../../settings.store";
 import { MurToggleComponent } from "../../../../../design-system/toggle/toggle.component";
 import { MurProgressComponent } from "../../../../../design-system/progress/progress.component";
+import { ErrorCopyService } from "../../../../../core/copy/error-copy.service";
 
 /**
  * AI & Models → "Search index" block.
@@ -41,6 +42,7 @@ export class OnDeviceIntelligenceBlockComponent {
   private readonly store = inject(SettingsStore);
   private readonly audit = inject(AuditStore);
   private readonly toast = inject(ToastService);
+  private readonly errorCopy = inject(ErrorCopyService);
 
   readonly form = this.store.form;
   readonly embedModelPresent = this.store.embedModelPresent;
@@ -115,7 +117,7 @@ export class OnDeviceIntelligenceBlockComponent {
     try {
       await this.audit.setSchedule(enabled);
     } catch (e) {
-      this.toast.danger(String(e));
+      this.toast.danger(this.errorCopy.humanize(e));
     } finally {
       this.auditControl.enable({ emitEvent: false });
       this.auditBusy.set(false);

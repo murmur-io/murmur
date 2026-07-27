@@ -14,6 +14,7 @@ import {
 import { EgressLedgerComponent } from "../egress-ledger/egress-ledger.component";
 import { TopicThreadsComponent } from "../topic-threads/topic-threads.component";
 import { WeeklyDigestComponent } from "../weekly-digest/weekly-digest.component";
+import { ErrorCopyService } from "../../../core/copy/error-copy.service";
 
 /** One rendered column of the 30-day activity chart (zero-filled for gaps). */
 interface ChartBar {
@@ -57,6 +58,7 @@ const STATUS_ORDER = [
 export class AnalyticsComponent implements OnInit {
   private readonly ipc = inject(IpcService);
   private readonly store = inject(AnalyticsStore);
+  private readonly errorCopy = inject(ErrorCopyService);
 
   /**
    * Root-persisted so a navigate-away-and-back shows the LAST-KNOWN numbers
@@ -210,7 +212,7 @@ export class AnalyticsComponent implements OnInit {
       this.data.set(await this.ipc.getAnalytics());
     } catch (e) {
       this.data.set(null);
-      this.error.set(String(e));
+      this.error.set(this.errorCopy.humanize(e));
     } finally {
       this.loading.set(false);
     }

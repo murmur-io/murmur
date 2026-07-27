@@ -15,6 +15,7 @@ import { MurSpinnerComponent } from "../../../design-system/spinner/spinner.comp
 import { ToastService } from "../../../services/toast.service";
 import { MarkdownComponent } from "../../../shared/markdown/markdown.component";
 import { AuditStore } from "../audit.store";
+import { ErrorCopyService } from "../../../core/copy/error-copy.service";
 
 /** Per-kind copy: the section heading, its one-line explanation, and the row chip. */
 const KIND_META: Record<
@@ -104,6 +105,7 @@ export class AuditComponent {
   protected readonly store = inject(AuditStore);
   private readonly ipc = inject(IpcService);
   private readonly toast = inject(ToastService);
+  private readonly errorCopy = inject(ErrorCopyService);
 
   /** The user's manual collapse/expand toggle (auto-opens on "Audit now"). */
   readonly open = signal(false);
@@ -163,7 +165,7 @@ export class AuditComponent {
     try {
       await this.store.runNow();
     } catch (e) {
-      this.toast.danger(String(e));
+      this.toast.danger(this.errorCopy.humanize(e));
     }
   }
 
@@ -175,7 +177,7 @@ export class AuditComponent {
     try {
       await this.store.resolve(f.id, "accept");
     } catch (e) {
-      this.toast.danger(String(e));
+      this.toast.danger(this.errorCopy.humanize(e));
     } finally {
       this.busyId.set(null);
     }
@@ -186,7 +188,7 @@ export class AuditComponent {
     try {
       await this.store.resolve(f.id, "dismiss");
     } catch (e) {
-      this.toast.danger(String(e));
+      this.toast.danger(this.errorCopy.humanize(e));
     } finally {
       this.busyId.set(null);
     }
@@ -225,7 +227,7 @@ export class AuditComponent {
         this.explanations.update((m) => new Map(m).set(id, ex));
       }
     } catch (e) {
-      this.toast.danger(String(e));
+      this.toast.danger(this.errorCopy.humanize(e));
     } finally {
       this.explaining.update((s) => {
         const next = new Set(s);

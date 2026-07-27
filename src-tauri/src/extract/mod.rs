@@ -107,10 +107,48 @@ fn guard_extracted_text_size_with_ceiling(blocks: &[ExtractedBlock], ceiling: u6
         .iter()
         .fold(0u64, |acc, b| acc.saturating_add(b.text.len() as u64));
     if total > ceiling {
-        return Err(AppError::InvalidArg(
-            "this document is too large to import — its extracted text exceeds the size limit"
-                .into(),
-        ));
+        // CODED: this is one of the three size rejections a real import can hit (the other two are
+        // the zip-bomb ceiling in `ooxml`/`xlsx` and the flow-file cap below). All three carry
+        // `DOC_TOO_LARGE` so the import surface renders the size sentence rather than the generic
+        // one — see `errcode::DOC_TOO_LARGE`.
+        return Err(AppError::InvalidArg(crate::errcode::tag(
+            crate::errcode::DOC_TOO_LARGE,
+            "this document is too large to import — its extracted text exceeds the size limit",
+        )));
+    }
+    Ok(())
+}
+
+/// The "this file could not be parsed" failure, carrying [`crate::errcode::DOC_UNREADABLE`].
+///
+/// Every extractor reaches this same conclusion from a dozen places (a zip entry that will not
+/// inflate, malformed DOCX/PPTX XML, a non-UTF-8 flow file, a PDF PDFKit refuses). Spelling the
+/// `AppError::InvalidArg(errcode::tag(errcode::DOC_UNREADABLE, …))` sandwich out at each one is how
+/// a site quietly ends up UN-coded and degrades to the generic sentence in the import surface.
+/// `msg` stays developer prose — it is logged, never rendered.
+pub(crate) fn unreadable(msg: impl AsRef<str>) -> AppError {
+    AppError::InvalidArg(crate::errcode::tag(crate::errcode::DOC_UNREADABLE, msg))
+}
+
+/// The ON-DISK file-size cap for the FLOW formats, applied BEFORE the read. Shared by
+/// [`read_flow_file_to_string`] (md/txt) and [`html::extract_html`] so BOTH rejections carry the
+/// same [`crate::errcode::DOC_TOO_LARGE`] code and the same wording — two hand-written copies is
+/// how one of them ended up un-coded. The `label` is a non-PII format name ("document" / "HTML").
+pub(crate) fn guard_flow_file_size(path: &Path, label: &str) -> Result<()> {
+    guard_flow_file_size_with_ceiling(path, label, MAX_FLOW_FILE_BYTES)
+}
+
+/// [`guard_flow_file_size`] with an explicit ceiling — production passes the shared const; a test
+/// injects a tiny ceiling so a small real file trips the REAL rejection (and its code) without
+/// materializing 256 MiB.
+fn guard_flow_file_size_with_ceiling(path: &Path, label: &str, ceiling: u64) -> Result<()> {
+    let meta =
+        std::fs::metadata(path).map_err(|e| unreadable(format!("could not read {label}: {e}")))?;
+    if meta.len() > ceiling {
+        return Err(AppError::InvalidArg(crate::errcode::tag(
+            crate::errcode::DOC_TOO_LARGE,
+            format!("this {label} is too large to import — it exceeds the size limit"),
+        )));
     }
     Ok(())
 }
@@ -120,15 +158,8 @@ fn guard_extracted_text_size_with_ceiling(blocks: &[ExtractedBlock], ceiling: u6
 /// on a missing/unreadable/non-UTF-8 file OR one whose on-disk size exceeds [`MAX_FLOW_FILE_BYTES`].
 /// The `label` is a non-PII format name ("document" / "HTML") for the error text.
 pub(crate) fn read_flow_file_to_string(path: &Path, label: &str) -> Result<String> {
-    let meta = std::fs::metadata(path)
-        .map_err(|e| AppError::InvalidArg(format!("could not read {label}: {e}")))?;
-    if meta.len() > MAX_FLOW_FILE_BYTES {
-        return Err(AppError::InvalidArg(format!(
-            "this {label} is too large to import — it exceeds the size limit"
-        )));
-    }
-    std::fs::read_to_string(path)
-        .map_err(|e| AppError::InvalidArg(format!("could not read {label}: {e}")))
+    guard_flow_file_size(path, label)?;
+    std::fs::read_to_string(path).map_err(|e| unreadable(format!("could not read {label}: {e}")))
 }
 
 /// An extraction-progress signal emitted by the paged formats (PDF) as they process. Threaded from
@@ -189,10 +220,14 @@ pub fn extract_blocks(
         }
         #[cfg(not(target_os = "macos"))]
         "png" | "jpg" | "jpeg" | "heic" | "tiff" | "tif" | "bmp" | "gif" => Err(
-            AppError::InvalidArg("image OCR is only available on macOS".into()),
+            AppError::InvalidArg(crate::errcode::tag(
+                crate::errcode::DOC_UNSUPPORTED,
+                "image OCR is only available on macOS",
+            )),
         ),
-        other => Err(AppError::InvalidArg(format!(
-            "unsupported document type: .{other}"
+        other => Err(AppError::InvalidArg(crate::errcode::tag(
+            crate::errcode::DOC_UNSUPPORTED,
+            format!("unsupported document type: .{other}"),
         ))),
     }?;
     // UNIVERSAL memory guard: cap the accumulated extracted text for ALL formats (finding: the
@@ -404,6 +439,13 @@ mod tests {
             matches!(err, AppError::InvalidArg(_)),
             "over-ceiling fails closed: {err:?}"
         );
+        // …and it carries the code, or the import surface renders the GENERIC sentence instead of
+        // the size one (the round-01 finding: this rejection was un-coded).
+        assert!(
+            matches!(&err, AppError::InvalidArg(m)
+                if m.starts_with(&format!("[{}] ", crate::errcode::DOC_TOO_LARGE))),
+            "the universal extracted-text ceiling must carry DOC_TOO_LARGE: {err:?}"
+        );
         // Production const is generously large — normal blocks never trip it.
         assert!(
             guard_extracted_text_size(&blocks).is_ok(),
@@ -422,6 +464,40 @@ mod tests {
         // A missing file fails closed (no panic).
         let missing = std::path::Path::new("/nonexistent/murmur/flow-missing.txt");
         assert!(read_flow_file_to_string(missing, "document").is_err());
+    }
+
+    /// RED→GREEN for the round-01 finding: the flow-format ON-DISK size rejection — shared by the
+    /// md/txt read and by `html::extract_html` — must carry [`crate::errcode::DOC_TOO_LARGE`], or
+    /// the import surface degrades it to the generic "please try again" sentence. Uses a TINY
+    /// injected ceiling so a 13-byte file trips the REAL rejection.
+    #[test]
+    fn flow_file_size_rejection_carries_the_too_large_code() {
+        let p = write_tmp("txt", b"over the cap");
+        // Under the injected ceiling → allowed (the guard fails only when EXCEEDED).
+        assert!(guard_flow_file_size_with_ceiling(&p, "document", 12).is_ok());
+        let err = guard_flow_file_size_with_ceiling(&p, "document", 11).unwrap_err();
+        assert!(
+            matches!(&err, AppError::InvalidArg(m)
+                if m.starts_with(&format!("[{}] ", crate::errcode::DOC_TOO_LARGE))),
+            "flow-file size cap must carry DOC_TOO_LARGE: {err:?}"
+        );
+        // The HTML label flows through the SAME helper, so `.html` gets the same code.
+        let h = write_tmp("html", b"<p>over the cap</p>");
+        let err = guard_flow_file_size_with_ceiling(&h, "HTML", 1).unwrap_err();
+        assert!(
+            matches!(&err, AppError::InvalidArg(m)
+                if m.starts_with(&format!("[{}] ", crate::errcode::DOC_TOO_LARGE))
+                    && m.contains("HTML")),
+            "the HTML file cap must carry DOC_TOO_LARGE: {err:?}"
+        );
+        // An unreadable file stays a DIFFERENT code — the size code must not swallow it.
+        let missing = std::path::Path::new("/nonexistent/murmur/flow-missing.txt");
+        let err = guard_flow_file_size_with_ceiling(missing, "document", 1).unwrap_err();
+        assert!(
+            matches!(&err, AppError::InvalidArg(m)
+                if m.starts_with(&format!("[{}] ", crate::errcode::DOC_UNREADABLE))),
+            "a missing file is unreadable, not oversize: {err:?}"
+        );
     }
 
     /// A single flow block is stored VERBATIM (no sentinel) so a `.md` upload's plaintext is

@@ -42,9 +42,9 @@ const XML_1_0: XmlVersion = XmlVersion::Implicit1_0;
 /// the ingest caller sizes them). Fail-closed to `InvalidArg`.
 fn open_zip(path: &Path) -> Result<zip::ZipArchive<std::io::Cursor<Vec<u8>>>> {
     let bytes = std::fs::read(path)
-        .map_err(|e| AppError::InvalidArg(format!("could not read document: {e}")))?;
+        .map_err(|e| super::unreadable(format!("could not read document: {e}")))?;
     zip::ZipArchive::new(std::io::Cursor::new(bytes))
-        .map_err(|e| AppError::InvalidArg(format!("not a valid OOXML (zip) document: {e}")))
+        .map_err(|e| super::unreadable(format!("not a valid OOXML (zip) document: {e}")))
 }
 
 /// A running DECOMPRESSED-bytes budget for ONE document's extraction — the decompression-bomb guard
@@ -91,16 +91,17 @@ fn guard_zip_with_ceiling(path: &Path, ceiling: u64) -> Result<()> {
     for i in 0..zip.len() {
         let file = zip
             .by_index(i)
-            .map_err(|e| AppError::InvalidArg(format!("corrupt zip entry: {e}")))?;
+            .map_err(|e| super::unreadable(format!("corrupt zip entry: {e}")))?;
         // Discard the inflated bytes — we only need to prove the TOTAL stays under the ceiling.
         let mut sink = SinkCounter::default();
         let limit = budget.remaining.saturating_add(1);
         let read = std::io::copy(&mut file.take(limit), &mut sink)
-            .map_err(|e| AppError::InvalidArg(format!("could not decode zip entry: {e}")))?;
+            .map_err(|e| super::unreadable(format!("could not decode zip entry: {e}")))?;
         if read > budget.remaining {
-            return Err(AppError::InvalidArg(
-                "document too large / possible zip bomb".into(),
-            ));
+            return Err(AppError::InvalidArg(crate::errcode::tag(
+                crate::errcode::DOC_TOO_LARGE,
+                "document too large / possible zip bomb",
+            )));
         }
         budget.remaining -= read;
     }
@@ -137,7 +138,7 @@ fn read_entry(
     let file = match zip.by_name(name) {
         Ok(f) => f,
         Err(zip::result::ZipError::FileNotFound) => return Ok(None),
-        Err(e) => return Err(AppError::InvalidArg(format!("corrupt OOXML entry: {e}"))),
+        Err(e) => return Err(super::unreadable(format!("corrupt OOXML entry: {e}"))),
     };
     read_capped(file, budget).map(Some)
 }
@@ -155,16 +156,17 @@ fn read_capped<R: Read>(reader: R, budget: &mut DecompressBudget) -> Result<Stri
     let read = reader
         .take(limit)
         .read_to_end(&mut buf)
-        .map_err(|e| AppError::InvalidArg(format!("could not decode OOXML entry: {e}")))?
+        .map_err(|e| super::unreadable(format!("could not decode OOXML entry: {e}")))?
         as u64;
     if read > budget.remaining {
-        return Err(AppError::InvalidArg(
-            "document too large / possible zip bomb".into(),
-        ));
+        return Err(AppError::InvalidArg(crate::errcode::tag(
+            crate::errcode::DOC_TOO_LARGE,
+            "document too large / possible zip bomb",
+        )));
     }
     budget.remaining -= read;
     String::from_utf8(buf)
-        .map_err(|e| AppError::InvalidArg(format!("could not decode OOXML entry: {e}")))
+        .map_err(|e| super::unreadable(format!("could not decode OOXML entry: {e}")))
 }
 
 /// The local name of an element (strip the `w:` / `a:` / `p:` namespace prefix).
@@ -294,9 +296,7 @@ pub fn extract_docx(path: &Path) -> Result<Vec<ExtractedBlock>> {
         .map(|xml| parse_styles_heading_levels(&xml))
         .unwrap_or_default();
     let Some(xml) = read_entry(&mut zip, "word/document.xml", &mut budget)? else {
-        return Err(AppError::InvalidArg(
-            "DOCX is missing word/document.xml".into(),
-        ));
+        return Err(super::unreadable("DOCX is missing word/document.xml"));
     };
     parse_docx_xml(&xml, &style_headings)
 }
@@ -450,7 +450,7 @@ fn parse_docx_xml(xml: &str, style_headings: &StyleHeadings) -> Result<Vec<Extra
                 if capture_text && suppress_depth == 0 {
                     let txt = t
                         .xml_content(XML_1_0)
-                        .map_err(|e| AppError::InvalidArg(format!("bad DOCX text: {e}")))?;
+                        .map_err(|e| super::unreadable(format!("bad DOCX text: {e}")))?;
                     match tables.last_mut() {
                         Some(f) if f.in_cell => f.cell_text.push_str(&txt),
                         _ => para_text.push_str(&txt),
@@ -520,7 +520,7 @@ fn parse_docx_xml(xml: &str, style_headings: &StyleHeadings) -> Result<Vec<Extra
             },
             Ok(Event::Eof) => break,
             Err(e) => {
-                return Err(AppError::InvalidArg(format!("malformed DOCX XML: {e}")));
+                return Err(super::unreadable(format!("malformed DOCX XML: {e}")));
             }
             _ => {}
         }
@@ -648,7 +648,7 @@ fn parse_pptx_slide(xml: &str, slide_num: u32) -> Result<Option<ExtractedBlock>>
                 if capture_text && (in_shape || in_table_cell) {
                     let txt = t
                         .xml_content(XML_1_0)
-                        .map_err(|e| AppError::InvalidArg(format!("bad PPTX text: {e}")))?;
+                        .map_err(|e| super::unreadable(format!("bad PPTX text: {e}")))?;
                     if in_table_cell {
                         table_cell_text.push_str(&txt);
                     } else {
@@ -684,7 +684,7 @@ fn parse_pptx_slide(xml: &str, slide_num: u32) -> Result<Option<ExtractedBlock>>
                 _ => {}
             },
             Ok(Event::Eof) => break,
-            Err(e) => return Err(AppError::InvalidArg(format!("malformed PPTX XML: {e}"))),
+            Err(e) => return Err(super::unreadable(format!("malformed PPTX XML: {e}"))),
             _ => {}
         }
         buf.clear();

@@ -9,7 +9,7 @@ use std::path::Path;
 use calamine::{open_workbook, Data, Reader, Xlsx};
 
 use super::ExtractedBlock;
-use crate::error::{AppError, Result};
+use crate::error::Result;
 
 /// Extract every sheet of an XLSX into blocks (one per non-empty row, heading = sheet name).
 pub fn extract_xlsx(path: &Path) -> Result<Vec<ExtractedBlock>> {
@@ -19,8 +19,8 @@ pub fn extract_xlsx(path: &Path) -> Result<Vec<ExtractedBlock>> {
     // spreadsheet passes; only a tiny archive that inflates to gigabytes is stopped.
     super::ooxml::guard_zip_not_a_bomb(path)?;
 
-    let mut workbook: Xlsx<_> = open_workbook(path)
-        .map_err(|e| AppError::InvalidArg(format!("could not open XLSX: {e}")))?;
+    let mut workbook: Xlsx<_> =
+        open_workbook(path).map_err(|e| super::unreadable(format!("could not open XLSX: {e}")))?;
 
     let mut blocks: Vec<ExtractedBlock> = Vec::new();
     for sheet in workbook.sheet_names() {
@@ -78,6 +78,9 @@ fn cell_text(cell: &Data) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The extractor itself no longer names `AppError` (failures go through `super::unreadable`),
+    // but the tests still assert on the VARIANT.
+    use crate::error::AppError;
     use std::io::Write;
 
     /// Build a minimal valid XLSX (one sheet, inline strings) in memory and write it to a temp file.

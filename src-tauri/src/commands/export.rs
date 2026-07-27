@@ -42,9 +42,10 @@ pub(crate) fn export_audio_inner(
     // WAV is AES-GCM-encrypted at rest (audio_path → <file>.enc) and there is no plaintext on disk
     // to copy until the folder is session-unlocked; fail closed with a Locked error.
     if !meeting_is_unlocked(state, meeting_id)? {
-        return Err(AppError::Locked(
-            "this meeting's folder is locked — unlock it to export the audio".into(),
-        ));
+        return Err(AppError::Locked(crate::errcode::tag(
+            crate::errcode::MEETING_LOCKED,
+            "unlock this meeting's folder to export the audio",
+        )));
     }
     let meeting = state
         .db
@@ -75,9 +76,10 @@ fn export_master(
 ) -> Result<(), AppError> {
     let _lifecycle = lifecycle_guard(state);
     if !meeting_is_unlocked(state, meeting_id)? {
-        return Err(AppError::Locked(
-            "this meeting's folder is locked — unlock it to export the master".into(),
-        ));
+        return Err(AppError::Locked(crate::errcode::tag(
+            crate::errcode::MEETING_LOCKED,
+            "unlock this meeting's folder to export the master",
+        )));
     }
     let (mic, sys) = state.db.get_meeting_master_paths(meeting_id)?;
     let src = match which {
@@ -125,9 +127,10 @@ pub fn export_note(
     // D4 READ-GATE: refuse to export a sealed-and-not-unlocked meeting's note (its plaintext
     // markdown is blanked while sealed — exporting would write an empty/garbage file). Fail closed.
     if !meeting_is_unlocked(state.inner(), &meeting_id)? {
-        return Err(AppError::Locked(
-            "this meeting's folder is locked — unlock it to export the note".into(),
-        ));
+        return Err(AppError::Locked(crate::errcode::tag(
+            crate::errcode::MEETING_LOCKED,
+            "unlock this meeting's folder to export the note",
+        )));
     }
     let note = state
         .db
@@ -167,9 +170,10 @@ pub(crate) fn export_canvas_inner(
     // D4 READ-GATE: a sealed-and-not-unlocked meeting's timeline is blanked; refuse to build a
     // canvas from it. Fail closed.
     if !meeting_is_unlocked(state, meeting_id)? {
-        return Err(AppError::Locked(
-            "this meeting's folder is locked — unlock it to export the canvas".into(),
-        ));
+        return Err(AppError::Locked(crate::errcode::tag(
+            crate::errcode::MEETING_LOCKED,
+            "unlock this meeting's folder to export the canvas",
+        )));
     }
     let meeting = state
         .db

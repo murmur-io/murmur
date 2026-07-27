@@ -21,6 +21,7 @@ import type {
 import { MarkdownComponent } from "../../../shared/markdown/markdown.component";
 import { NoteChatComponent } from "../../notes/note-chat/note-chat.component";
 import { ToastService } from "../../../services/toast.service";
+import { ErrorCopyService } from "../../../core/copy/error-copy.service";
 
 /**
  * Viewer for ONE org-brain item (`/org-item/:id`). Reached from an org-origin
@@ -65,6 +66,7 @@ export class OrgItemViewerComponent {
   private readonly tabsService = inject(TabsService);
   private readonly toast = inject(ToastService);
   private readonly destroyRef = inject(DestroyRef);
+  private readonly errorCopy = inject(ErrorCopyService);
 
   /** The `:id` route param as a signal (re-fetches when it changes in place). */
   private readonly itemId = toSignal(
@@ -334,7 +336,7 @@ export class OrgItemViewerComponent {
       if (this.itemId() !== id) {
         return;
       }
-      this.error.set(String(e));
+      this.error.set(this.errorCopy.humanize(e));
       this._item.set(null);
       this.attachments.set([]);
     } finally {
@@ -463,7 +465,7 @@ export class OrgItemViewerComponent {
       this.toast.success("Removed from the org");
       void this.router.navigate(["/notes"]);
     } catch (e) {
-      this.toast.danger(`Couldn’t remove — ${String(e)}`);
+      this.toast.danger(this.errorCopy.because("Couldn’t remove", e));
       this.confirmingRemove.set(false);
     } finally {
       this.saving.set(false);

@@ -12,6 +12,7 @@ import type { UserMemory, UserMemoryFact } from "../../../core/models";
 import { FoldersService } from "../../../services/folders.service";
 import { ToastService } from "../../../services/toast.service";
 import { MemoryImportComponent } from "../memory-import/memory-import.component";
+import { ErrorCopyService } from "../../../core/copy/error-copy.service";
 
 /**
  * "What the brain knows about you" — the user-memory audit section on the Brain
@@ -38,6 +39,7 @@ export class BrainMemoryComponent {
   private readonly ipc = inject(IpcService);
   private readonly folders = inject(FoldersService);
   private readonly toast = inject(ToastService);
+  private readonly errorCopy = inject(ErrorCopyService);
 
   /** Collapsed by default — the Brain page leads with sources, not memory. */
   readonly open = signal(false);
@@ -98,7 +100,7 @@ export class BrainMemoryComponent {
       this.memory.set(await this.ipc.getUserMemory());
     } catch (e) {
       this.memory.set(null);
-      this.error.set(String(e));
+      this.error.set(this.errorCopy.humanize(e));
     } finally {
       this.loading.set(false);
     }
@@ -112,7 +114,7 @@ export class BrainMemoryComponent {
       await this.fetch();
       this.toast.info("Forgotten.");
     } catch (e) {
-      this.toast.danger(String(e));
+      this.toast.danger(this.errorCopy.humanize(e));
     } finally {
       this.forgettingId.set(null);
     }
@@ -127,7 +129,7 @@ export class BrainMemoryComponent {
       this.confirmingClear.set(false);
       this.toast.info("Memory cleared.");
     } catch (e) {
-      this.toast.danger(String(e));
+      this.toast.danger(this.errorCopy.humanize(e));
     } finally {
       this.clearing.set(false);
     }

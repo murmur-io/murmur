@@ -20,6 +20,7 @@ import type {
   OrgStatus,
 } from "../../../core/models";
 import { MurSelectComponent } from "../../../design-system/select/select.component";
+import { ErrorCopyService } from "../../../core/copy/error-copy.service";
 
 /**
  * Which local source this sheet is publishing to the org brain — a recorded
@@ -67,6 +68,7 @@ export interface OrgShareTarget {
 export class OrgShareSheetComponent {
   private readonly ipc = inject(IpcService);
   private readonly injector = inject(Injector);
+  private readonly errorCopy = inject(ErrorCopyService);
 
   /** The local source (meeting / note) being published. */
   readonly target = input.required<OrgShareTarget>();
@@ -190,7 +192,7 @@ export class OrgShareSheetComponent {
         this.selectedOrgId.set(list[0].orgId);
       }
     } catch (e) {
-      this.orgsError.set(String(e));
+      this.orgsError.set(this.errorCopy.humanize(e));
     } finally {
       this.orgsLoading.set(false);
     }
@@ -239,7 +241,7 @@ export class OrgShareSheetComponent {
       if (this.target().id !== t.id || this.scrub() !== scrub) {
         return;
       }
-      this.previewError.set(this.friendlyError(String(e)));
+      this.previewError.set(this.errorCopy.humanize(e, "org-share"));
       this._preview.set(null);
     } finally {
       if (this.target().id === t.id && this.scrub() === scrub) {
@@ -283,7 +285,7 @@ export class OrgShareSheetComponent {
       }
       this.shared.emit();
     } catch (e) {
-      this.shareError.set(this.friendlyError(String(e)));
+      this.shareError.set(this.errorCopy.humanize(e, "org-share"));
     } finally {
       this.sharing.set(false);
     }
@@ -292,17 +294,6 @@ export class OrgShareSheetComponent {
   /** Cancel — nothing left the device. */
   cancel(): void {
     this.cancelled.emit();
-  }
-
-  /** A `Locked`/consent error → a plain message; else the raw backend error. */
-  private friendlyError(raw: string): string {
-    if (/Locked/i.test(raw)) {
-      return "This item is locked — unlock its folder before adding it to the org brain.";
-    }
-    if (/consent/i.test(raw)) {
-      return "You haven't allowed org sharing yet. Grant org-sharing consent in Settings → Organization.";
-    }
-    return raw;
   }
 
   /** Presentational: a byte count → a compact size label. */
