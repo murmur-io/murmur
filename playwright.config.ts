@@ -21,7 +21,21 @@ export default defineConfig({
   timeout: 30_000,
   fullyParallel: false,
   forbidOnly: !!process.env.CI,
-  retries: 0,
+  // CI retries flaky tests; LOCAL stays 0 so a flake you just wrote fails loudly.
+  //
+  // This does NOT hide failures: a test that only passes on a retry is reported as
+  // `flaky`, not `passed`, so the signal is preserved and quantified rather than
+  // swallowed. What it removes is the all-or-nothing coupling — with `retries: 0`
+  // a single timing-sensitive assertion anywhere in the ~330-test webkit project
+  // fails the whole lane, and the shared macOS runner produces exactly that: three
+  // consecutive runs of unrelated diffs (one Rust-only, one Python-only) each failed
+  // a DIFFERENT webkit test, every one dying on an assertion timeout around 12-13s
+  // rather than the 30s test timeout. That is runner timing noise, not a defect the
+  // gate should be attributing to whichever PR happens to be passing through.
+  //
+  // A test that goes flaky PERSISTENTLY is still a bug to fix at the source — the
+  // flaky count in the report is where to look for it.
+  retries: process.env.CI ? 2 : 0,
   reporter: [["list"]],
   use: {
     baseURL: `http://127.0.0.1:${PORT}`,
