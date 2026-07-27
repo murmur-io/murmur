@@ -1772,6 +1772,22 @@ mod tests {
     /// than on luck. Poison-tolerant (a panicking test must not cascade into a spurious failure).
     static CANCEL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// Each holder keeps this guard across `.await`, which normally earns
+    /// `clippy::await_holding_lock` — and normally deserves it, because a std guard held across a
+    /// yield can deadlock an executor. It is sound HERE, and only here:
+    ///
+    ///  * every `#[tokio::test]` builds its OWN current-thread runtime, so no two holders ever
+    ///    share an executor and a blocked thread cannot starve another task that wants the lock;
+    ///  * the only lockers are the three cancellation tests in this module — nothing in production
+    ///    touches `CANCEL_TEST_LOCK`, so there is no lock-order cycle to construct;
+    ///  * BLOCKING the thread is precisely the intent. `DOWNLOAD_GENERATION` is process-global, so
+    ///    a second test entering while the first is mid-write-loop would cancel it; serialising on
+    ///    a std mutex is what makes that impossible.
+    ///
+    /// A `tokio::sync::Mutex` would silence the lint but NOT serialise `cargo test`'s parallel
+    /// threads, since each runs its own runtime — it would be a worse fix that merely reads better.
+    ///
+    /// The `#[allow]` therefore sits on each of the three holders, where the lint actually fires.
     fn cancel_test_guard() -> std::sync::MutexGuard<'static, ()> {
         CANCEL_TEST_LOCK
             .lock()
@@ -1803,6 +1819,8 @@ mod tests {
     ///
     /// RED before GREEN: without the `download_superseded` check in the write loop this test fails
     /// on its FIRST assertion (the outcome would be `Complete` and the finished file would exist).
+    // Holds CANCEL_TEST_LOCK across .await on purpose — see cancel_test_guard's doc.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn download_cancel_removes_the_part_file() {
         let _serial = cancel_test_guard();
@@ -1839,6 +1857,8 @@ mod tests {
 
     /// The control for the test above: the SAME fake body, without a cancel, completes and lands
     /// the file. Without this, "no file on disk" could equally mean the write loop is simply broken.
+    // Holds CANCEL_TEST_LOCK across .await on purpose — see cancel_test_guard's doc.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn download_without_cancel_lands_the_file() {
         let _serial = cancel_test_guard();
@@ -1867,6 +1887,8 @@ mod tests {
 
     /// The counter's whole reason for existing: a cancel must NOT leak into the next download. A
     /// global `AtomicBool` would still be set when the second fetch starts and would kill it.
+    // Holds CANCEL_TEST_LOCK across .await on purpose — see cancel_test_guard's doc.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn a_cancel_does_not_leak_into_the_next_download() {
         let _serial = cancel_test_guard();
