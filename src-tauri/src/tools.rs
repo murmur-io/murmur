@@ -147,6 +147,8 @@ pub enum ToolCall {
         offset: usize,
         /// Max chars of transcript to return from `offset` (0 = unlimited = today's behavior).
         max_chars: usize,
+        /// Which capture lane(s) to render: `merged` (default) | `mic` | `system`.
+        channel: String,
     },
     /// The full body of one standalone note OR imported/uploaded document by id (Feature D). Gated
     /// by [`Db::get_document_if_visible`] — a sealed-and-not-session-unlocked document is invisible
@@ -645,6 +647,7 @@ pub fn execute_tool(
             transcript_format,
             offset,
             max_chars,
+            channel,
         } => {
             let mid = meeting_id.as_str();
             // A sealed-and-not-unlocked meeting is invisible — including its transcript AND its
@@ -667,7 +670,7 @@ pub fn execute_tool(
                         .map(|t| format!("TITLE: [[{t}]]\n\n"))
                         .unwrap_or_default();
                     let note = db.get_note_if_visible(mid, unlocked).ok().flatten();
-                    let segs = db.get_segments(mid).unwrap_or_default();
+                    let segs = select_channel(db.get_segments(mid).unwrap_or_default(), channel);
                     // Feature D: DEFAULT to the STRUCTURED per-segment transcript (speaker + raw-second
                     // timestamps). `transcript_format == "plain"` keeps the LEGACY byte-identical flat
                     // space-join for backward compatibility; every other value (incl. absent/default,
@@ -1933,6 +1936,68 @@ fn format_structured_transcript(segs: &[crate::transcribe::types::Segment]) -> S
         .join("\n")
 }
 
+/// How far apart two segments may start and still be considered the same utterance echoed across
+/// the two capture lanes. The mic and system clocks drift relative to each other, so this is
+/// deliberately looser than an exact-timestamp match.
+const RENDER_DEDUP_WINDOW_S: f64 = 4.0;
+
+/// Token-overlap above which a `me` segment is treated as an ECHO of a nearby `others` segment.
+/// High on purpose: dropping real speech is far worse than leaving a duplicate in.
+const RENDER_DEDUP_JACCARD: f32 = 0.85;
+
+/// Select which capture lane(s) to render, de-duplicating the merged view (#14).
+///
+/// Murmur records two independent streams — mic and system audio — transcribed separately and
+/// merged by wall-clock. `audio/merge.rs::suppress_cross_stream_echo` exists to remove the
+/// resulting cross-talk, but it is armed by a SINGLE whole-recording boolean derived from
+/// `align.rs::estimate_stream_offset`, which requires the lag spread across three 30s windows to
+/// stay within 0.2s. `merge.rs`'s own header notes the two clocks drift "seconds per hour", so on a
+/// long recording the estimator rejects its own measurement and the deduper is off for the ENTIRE
+/// meeting — the recordings with the most bleed are exactly the ones it never runs on.
+///
+/// Measured consequence: an effective 1.6–1.8× multiplier, so only ~65–72k of a 116.5k-char
+/// transcript is unique. And it is NON-uniform (near-identical Me/Others pairs early, Others-only
+/// late), so no single rule applied to the stored data would be right either.
+///
+/// This is the SAFE half of the fix: it is a RENDER-time filter. Stored segments are never touched,
+/// so the content-loss doctrine is not re-litigated, and `mic`/`system` remain available to inspect
+/// the raw lanes. Fixing the arming itself is the upstream half and needs real recordings to prove.
+fn select_channel(
+    segs: Vec<crate::transcribe::types::Segment>,
+    channel: &str,
+) -> Vec<crate::transcribe::types::Segment> {
+    use crate::audio::merge::{is_others, jaccard, norm_tokens};
+    match channel {
+        "mic" => segs.into_iter().filter(|s| !is_others(s)).collect(),
+        "system" => segs.into_iter().filter(is_others).collect(),
+        _ => {
+            // Drop a `me` segment that merely echoes a nearby `others` segment. The mic picks up
+            // the far side through the speakers; the system lane is the clean copy, so the ECHO is
+            // the one to discard.
+            let others: Vec<(f64, Vec<String>)> = segs
+                .iter()
+                .filter(|s| is_others(s))
+                .map(|s| (s.start_s, norm_tokens(&s.text)))
+                .collect();
+            segs.into_iter()
+                .filter(|s| {
+                    if is_others(s) {
+                        return true;
+                    }
+                    let mine = norm_tokens(&s.text);
+                    if mine.is_empty() {
+                        return true;
+                    }
+                    !others.iter().any(|(start, toks)| {
+                        (s.start_s - start).abs() <= RENDER_DEDUP_WINDOW_S
+                            && jaccard(&mine, toks) >= RENDER_DEDUP_JACCARD
+                    })
+                })
+                .collect()
+        }
+    }
+}
+
 /// Render a list of search hits (FTS or hybrid) into the tool text payload — one line per meeting.
 /// Feature D: each line carries a `[meeting:{id}]` id-type tag so a model reading a mixed
 /// meeting+document result knows to call `get_meeting` (not `get_document`) for these ids.
@@ -2220,6 +2285,12 @@ impl crate::agent::ToolExecutor for GatedToolExecutor<'_> {
                         transcript_format: fmt,
                         offset: u("offset"),
                         max_chars: u("maxChars"),
+                        channel: args
+                            .get("channel")
+                            .and_then(|v| v.as_str())
+                            .filter(|c| matches!(*c, "mic" | "system"))
+                            .unwrap_or("merged")
+                            .to_string(),
                     },
                     self.db,
                     &unlocked,
@@ -4529,6 +4600,7 @@ mod tests {
                 transcript_format: "structured".into(),
                 offset: 0,
                 max_chars: 0,
+                            channel: "merged".into(),
             },
             &db,
             &HashSet::new(),
@@ -4618,6 +4690,7 @@ mod tests {
                 transcript_format: "plain".into(),
                 offset: 0,
                 max_chars: 0,
+                            channel: "merged".into(),
             },
             &db,
             &HashSet::new(),
@@ -4701,6 +4774,7 @@ mod tests {
                 transcript_format: "structured".into(),
                 offset: 0,
                 max_chars: 0,
+                            channel: "merged".into(),
             },
             &db,
             &HashSet::new(),
@@ -4757,6 +4831,7 @@ mod tests {
                 transcript_format: "structured".into(),
                 offset: 0,
                 max_chars: 0,
+                            channel: "merged".into(),
             },
             &db,
             &HashSet::new(),
@@ -5207,6 +5282,7 @@ mod tests {
                 transcript_format: "structured".into(),
                 offset: 0,
                 max_chars: 6000,
+                            channel: "merged".into(),
             },
             &db,
             &HashSet::new(),
@@ -5223,9 +5299,52 @@ mod tests {
         );
     }
 
+    /// R15/#14 (regression). The merged view drops a `me` segment that merely ECHOES a nearby
+    /// `others` segment, while `mic`/`system` still expose the raw lanes.
+    ///
+    /// RED against the previous behavior: every segment was rendered, so a near-identical pair
+    /// appeared twice — the measured 1.6–1.8× multiplier that left only ~65–72k of a 116.5k-char
+    /// transcript unique.
+    #[test]
+    fn merged_channel_drops_the_echo_and_keeps_divergent_speech() {
+        let seg = |idx: i64, start: f64, text: &str, spk: &str| Segment {
+            idx,
+            start_s: start,
+            end_s: start + 1.0,
+            text: text.into(),
+            speaker: Some(spk.into()),
+            confidence: None,
+        };
+        let segs = vec![
+            // A true cross-lane echo: the mic heard the far side through the speakers.
+            seg(0, 10.0, "the contract is now signed by both parties", "others"),
+            seg(1, 10.4, "the contract is now signed by both parties", "me"),
+            // DIVERGENT content at the same instant — two different sentences, NOT an echo. The
+            // real transcript had exactly this ("I built them." vs "I don't know." at 271.8s), and
+            // dropping either would be content loss.
+            seg(2, 30.0, "I built them", "others"),
+            seg(3, 30.1, "I do not know", "me"),
+        ];
+
+        let merged = select_channel(segs.clone(), "merged");
+        assert_eq!(merged.len(), 3, "only the echo is dropped: {merged:?}");
+        assert!(
+            merged.iter().any(|s| s.text == "I do not know"),
+            "divergent speech at the same second must SURVIVE — it is not an echo"
+        );
+        assert_eq!(
+            merged.iter().filter(|s| s.text.contains("contract")).count(),
+            1,
+            "the echoed sentence appears once, from the clean system lane"
+        );
+
+        // The raw lanes stay inspectable.
+        assert_eq!(select_channel(segs.clone(), "mic").len(), 2);
+        assert_eq!(select_channel(segs, "system").len(), 2);
+    }
+
     /// E1 (RED-before-GREEN) — `get_meeting` emits the NOTE section only on the FIRST window
-    /// (`offset == 0`); paging a long transcript (`offset > 0`) must NOT re-ship the whole note on
-    /// every page. Pre-fix the NOTE was prepended UNCONDITIONALLY at every offset. RED on the old code.
+    /// (`offset == 0`); paging a long transcript must NOT re-ship the whole note on every page.
     #[test]
     fn get_meeting_note_only_on_first_window() {
         let db = tmp_db();
@@ -5263,6 +5382,7 @@ mod tests {
                 transcript_format: "structured".into(),
                 offset: 0,
                 max_chars: 20,
+                            channel: "merged".into(),
             },
             &db,
             &HashSet::new(),
@@ -5282,6 +5402,7 @@ mod tests {
                 transcript_format: "structured".into(),
                 offset: 10,
                 max_chars: 20,
+                            channel: "merged".into(),
             },
             &db,
             &HashSet::new(),

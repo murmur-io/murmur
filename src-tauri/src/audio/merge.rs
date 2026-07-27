@@ -142,7 +142,7 @@ const ECHO_CONCAT_MAX: usize = 3;
 const ECHO_CONCAT_MAX_GAP_S: f64 = 1.0;
 
 /// Lowercased Unicode-alphanumeric tokens ("Zamknijmy budżet!" → ["zamknijmy","budżet"]).
-fn norm_tokens(text: &str) -> Vec<String> {
+pub(crate) fn norm_tokens(text: &str) -> Vec<String> {
     text.to_lowercase()
         .split(|c: char| !c.is_alphanumeric())
         .filter(|t| !t.is_empty())
@@ -151,7 +151,7 @@ fn norm_tokens(text: &str) -> Vec<String> {
 }
 
 /// Word-set Jaccard: |A∩B| / |A∪B| over unique tokens.
-fn jaccard(a: &[String], b: &[String]) -> f32 {
+pub(crate) fn jaccard(a: &[String], b: &[String]) -> f32 {
     use std::collections::HashSet;
     let sa: HashSet<&String> = a.iter().collect();
     let sb: HashSet<&String> = b.iter().collect();
@@ -166,7 +166,7 @@ fn jaccard(a: &[String], b: &[String]) -> f32 {
 
 /// Token-level longest-common-subsequence ratio normalized by the shorter side (word-order
 /// sensitive — protects against shared-vocabulary false positives).
-fn token_lcs(a: &[String], b: &[String]) -> f32 {
+pub(crate) fn token_lcs(a: &[String], b: &[String]) -> f32 {
     let shorter = a.len().min(b.len());
     if shorter == 0 {
         return 0.0;
@@ -185,7 +185,7 @@ fn token_lcs(a: &[String], b: &[String]) -> f32 {
 }
 
 /// Is this segment on the clean (system) side? Diarization may have relabelled to others-N.
-fn is_others(seg: &Segment) -> bool {
+pub(crate) fn is_others(seg: &Segment) -> bool {
     seg.speaker
         .as_deref()
         .map(|s| s != SPEAKER_ME)

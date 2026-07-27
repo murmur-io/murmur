@@ -242,7 +242,7 @@ fn tools_spec() -> Value {
         {
             "name": "get_meeting",
             "description": "Get a meeting's AI note (summary) and transcript by id (from a search hit labelled 'meeting:...'). The transcript is STRUCTURED by default — one line per segment, '[<start_s>–<end_s>] <Speaker>: <text>' with Me/Others/Unknown speakers and raw-second timestamps; pass transcriptFormat 'plain' for the old flat text. The transcript is returned as a WINDOW (default first 6000 chars) prefixed with 'TOTAL_CHARS: <N> (showing <start>..<end>)'; page a long transcript by passing offset + maxChars.",
-            "inputSchema": { "type": "object", "properties": { "meetingId": { "type": "string" }, "transcriptFormat": { "type": "string", "enum": ["structured", "plain"], "description": "Transcript rendering (default 'structured')." }, "offset": { "type": "number", "description": "Chars to skip into the transcript (default 0)." }, "maxChars": { "type": "number", "description": "Max transcript chars to return from offset (default: a bounded 6000-char window with the total disclosed)." } }, "required": ["meetingId"] }
+            "inputSchema": { "type": "object", "properties": { "meetingId": { "type": "string" }, "transcriptFormat": { "type": "string", "enum": ["structured", "plain"], "description": "Transcript rendering (default 'structured')." }, "offset": { "type": "number", "description": "Chars to skip into the transcript (default 0)." }, "maxChars": { "type": "number", "description": "Max transcript chars to return from offset (default: a bounded 6000-char window with the total disclosed)." }, "channel": { "type": "string", "enum": ["merged", "mic", "system"], "description": "Which capture lane to render. Default 'merged' de-duplicates cross-talk between the microphone and system-audio streams — the mic hears the far side through the speakers, so the same sentence can otherwise appear twice. Use 'mic' or 'system' to inspect a raw lane." } }, "required": ["meetingId"] }
         },
         {
             "name": "get_document",
@@ -409,6 +409,14 @@ fn dispatch_tool(
             // the client; explicit offset/maxChars are honored verbatim.
             offset: mcp_body_window(args).0,
             max_chars: mcp_body_window(args).1,
+            // #14 — `merged` is the DEFAULT and de-duplicates the two capture lanes at render
+            // time; `mic`/`system` expose the raw lanes for inspection.
+            channel: args
+                .get("channel")
+                .and_then(Value::as_str)
+                .filter(|c| matches!(*c, "mic" | "system"))
+                .unwrap_or("merged")
+                .to_string(),
         },
         "get_document" => ToolCall::GetDocument {
             document_id: args
