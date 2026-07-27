@@ -209,7 +209,14 @@ fn map_to_tool_call(q: &RetrievalQuery) -> Option<ToolCall> {
     match q.tool.trim() {
         "search_meetings" if !query.is_empty() => Some(ToolCall::SearchMeetings { query }),
         "semantic_search" if !query.is_empty() => Some(ToolCall::SearchSemantic { query }),
-        "get_dossier" if !query.is_empty() => Some(ToolCall::GetEntityDossier { entity: query }),
+        // An INTERNAL caller, not the flooding surface — the raw MCP tools/call is. Keep the
+        // pre-existing full-corpus behavior explicitly rather than inheriting a new default.
+        "get_dossier" if !query.is_empty() => Some(ToolCall::GetEntityDossier {
+            entity: query,
+            note_detail: "full".to_string(),
+            offset: 0,
+            max_chars: 0,
+        }),
         "list_commitments" => Some(ToolCall::GetOpenCommitments { owner: None }),
         _ => None,
     }
