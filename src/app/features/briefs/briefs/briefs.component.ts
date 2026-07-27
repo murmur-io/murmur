@@ -8,6 +8,7 @@ import {
 import type { BriefRun, BriefSchedule } from "../../../core/models";
 import { ToastService } from "../../../services/toast.service";
 import { BriefsStore } from "../briefs.store";
+import { ErrorCopyService } from "../../../core/copy/error-copy.service";
 
 /** Weekday labels indexed by the backend convention: 0 = Monday … 6 = Sunday. */
 const WEEKDAYS = [
@@ -44,6 +45,7 @@ const WEEKDAYS = [
 export class BriefsComponent {
   protected readonly store = inject(BriefsStore);
   private readonly toast = inject(ToastService);
+  private readonly errorCopy = inject(ErrorCopyService);
 
   /** The user's manual collapse/expand toggle (click on `.br-toggle`). */
   readonly open = signal(false);
@@ -155,7 +157,7 @@ export class BriefsComponent {
       this.formHint.set("");
       this.toast.info("Brief scheduled.");
     } catch (e) {
-      this.toast.danger(String(e));
+      this.toast.danger(this.errorCopy.humanize(e));
     } finally {
       this.creating.set(false);
     }
@@ -166,7 +168,7 @@ export class BriefsComponent {
     try {
       await this.store.update({ ...s, enabled: !s.enabled });
     } catch (e) {
-      this.toast.danger(String(e));
+      this.toast.danger(this.errorCopy.humanize(e));
     } finally {
       this.busyId.set(null);
     }
@@ -177,7 +179,7 @@ export class BriefsComponent {
     try {
       await this.store.remove(s.id);
     } catch (e) {
-      this.toast.danger(String(e));
+      this.toast.danger(this.errorCopy.humanize(e));
     } finally {
       this.busyId.set(null);
     }
@@ -189,7 +191,7 @@ export class BriefsComponent {
       await this.store.accept(run.id);
       this.toast.info("Brief saved to your vault (Briefs/).");
     } catch (e) {
-      this.toast.danger(String(e));
+      this.toast.danger(this.errorCopy.humanize(e));
     } finally {
       this.busyId.set(null);
     }
@@ -200,7 +202,7 @@ export class BriefsComponent {
     try {
       await this.store.dismiss(run.id);
     } catch (e) {
-      this.toast.danger(String(e));
+      this.toast.danger(this.errorCopy.humanize(e));
     } finally {
       this.busyId.set(null);
     }

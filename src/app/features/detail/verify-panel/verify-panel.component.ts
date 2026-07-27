@@ -8,6 +8,7 @@ import {
 } from "@angular/core";
 import { IpcService } from "../../../core/ipc.service";
 import type { VerifyFindingDto } from "../../../core/models";
+import { ErrorCopyService } from "../../../core/copy/error-copy.service";
 
 /**
  * VERIFY WITH JIRA — on-demand deterministic check of the note's ticket claims against LIVE Jira
@@ -23,6 +24,7 @@ import type { VerifyFindingDto } from "../../../core/models";
 })
 export class VerifyPanelComponent {
   private readonly ipc = inject(IpcService);
+  private readonly errorCopy = inject(ErrorCopyService);
 
   readonly meetingId = input.required<string>();
   /** Fires after markers are applied so the parent reloads the note. */
@@ -47,7 +49,7 @@ export class VerifyPanelComponent {
     try {
       this.findings.set(await this.ipc.verifyNoteSources(this.meetingId()));
     } catch (e) {
-      this.error.set(e instanceof Error ? e.message : String(e));
+      this.error.set(this.errorCopy.humanize(e));
     } finally {
       this.running.set(false);
     }
@@ -64,7 +66,7 @@ export class VerifyPanelComponent {
       this.applied.set(true);
       this.noteChanged.emit();
     } catch (e) {
-      this.error.set(e instanceof Error ? e.message : String(e));
+      this.error.set(this.errorCopy.humanize(e));
     } finally {
       this.running.set(false);
     }

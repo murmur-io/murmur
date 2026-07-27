@@ -2109,7 +2109,7 @@ mod tests {
     //
     // These tests discriminate "refused by the consent gate" from "got PAST the gate" by the error
     // VARIANT `make_provider` returns for a deliberately-unknown provider id: the fail-closed gate
-    // fires FIRST (`Unavailable("cloud egress not consented …")`); past it, the unknown id yields
+    // fires FIRST (`Unavailable("[cloud-consent] …")`); past it, the unknown id yields
     // `InvalidArg("unknown provider id: …")`. No network, no keychain, no CLI is ever touched.
 
     /// An unknown provider id: classified as CLOUD by `egress_is_cloud` (fail-safe default), so it

@@ -68,14 +68,22 @@ impl ShareClient {
     /// map_err → `Unavailable`) or a 5xx is unavailability. 401 → Auth (re-login).
     fn status_err(ctx: &str, status: StatusCode) -> AppError {
         match status {
-            StatusCode::UNAUTHORIZED => AppError::Auth(format!("{ctx}: not authenticated")),
-            StatusCode::TOO_MANY_REQUESTS => AppError::InvalidArg(format!(
-                "{ctx}: too many attempts — wait a bit and try again"
+            StatusCode::UNAUTHORIZED => AppError::Auth(crate::errcode::tag(
+                crate::errcode::SHARING_SIGNIN_REQUIRED,
+                format!("{ctx}: not authenticated"),
             )),
-            s if s.is_client_error() => {
-                AppError::InvalidArg(format!("{ctx}: rejected ({})", s.as_u16()))
-            }
-            s => AppError::Unavailable(format!("{ctx}: server returned {}", s.as_u16())),
+            StatusCode::TOO_MANY_REQUESTS => AppError::InvalidArg(crate::errcode::tag(
+                crate::errcode::SHARING_RATE_LIMITED,
+                format!("{ctx}: too many attempts"),
+            )),
+            s if s.is_client_error() => AppError::InvalidArg(crate::errcode::tag(
+                crate::errcode::SHARING_REJECTED,
+                format!("{ctx}: rejected ({})", s.as_u16()),
+            )),
+            s => AppError::Unavailable(crate::errcode::tag(
+                crate::errcode::SHARING_UNREACHABLE,
+                format!("{ctx}: server returned {}", s.as_u16()),
+            )),
         }
     }
 
@@ -91,10 +99,12 @@ impl ShareClient {
         if let Some(tok) = bearer {
             req = req.bearer_auth(tok);
         }
-        let resp = req
-            .send()
-            .await
-            .map_err(|_| AppError::Unavailable(format!("{ctx}: could not reach the server")))?;
+        let resp = req.send().await.map_err(|_| {
+            AppError::Unavailable(crate::errcode::tag(
+                crate::errcode::SHARING_UNREACHABLE,
+                format!("{ctx}: could not reach the server"),
+            ))
+        })?;
         let status = resp.status();
         if !status.is_success() {
             return Err(Self::status_err(ctx, status));
@@ -117,7 +127,12 @@ impl ShareClient {
             .bearer_auth(bearer)
             .send()
             .await
-            .map_err(|_| AppError::Unavailable(format!("{ctx}: could not reach the server")))?;
+            .map_err(|_| {
+                AppError::Unavailable(crate::errcode::tag(
+                    crate::errcode::SHARING_UNREACHABLE,
+                    format!("{ctx}: could not reach the server"),
+                ))
+            })?;
         let status = resp.status();
         if !status.is_success() {
             return Err(Self::status_err(ctx, status));

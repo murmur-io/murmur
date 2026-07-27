@@ -247,10 +247,15 @@ test("Vault audit: schedule chip renders and Explain (AI) loads inline or toasts
   await okRow.getByRole("button", { name: "Show explanation" }).click();
   await expect(okRow.locator(".au-explain")).toBeVisible();
 
-  // Explain rejection: danger toast with the backend message, row unchanged.
+  // Explain rejection: danger toast, row unchanged.
+  //
+  // P3: the toast no longer echoes the backend's own sentence. `explain_audit_finding` rejects
+  // with an UN-CODED failure here, so `ErrorCopyService.humanize` renders the generic sentence
+  // (deny-by-default) rather than a Rust string. What this spec protects is unchanged — that a
+  // rejection is SURFACED and leaves the row untouched — not which words appear.
   await errRow.getByRole("button", { name: "Explain (AI)" }).click();
   await expect(page.locator(".toast.is-danger .toast-msg")).toHaveText(
-    /AI consent required — enable cloud assistance in Settings/,
+    /Something went wrong\. Please try again\./,
   );
   await expect(errRow.locator(".au-explain")).toHaveCount(0);
   await expect(
@@ -309,9 +314,13 @@ test("Settings: weekly-audit toggle commits via set_audit_schedule and reverts o
   await expect(input).toBeEnabled();
 
   // Flip OFF → the backend rejects → toast + revert to the confirmed ON.
+  //
+  // P3: the rejection here is un-coded, so the toast is the generic sentence rather than the raw
+  // backend string. The behaviour under test — a rejected commit raises a danger toast and the
+  // switch reverts to the last CONFIRMED state — is untouched.
   await input.click();
   await expect(page.locator(".toast.is-danger .toast-msg")).toHaveText(
-    /Locked: unlock the vault to change the schedule/,
+    /Something went wrong\. Please try again\./,
   );
   await expect(input).toBeChecked();
   await expect(input).toBeEnabled();

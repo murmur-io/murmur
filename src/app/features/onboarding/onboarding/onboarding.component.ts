@@ -19,6 +19,7 @@ import { BrainEnableCardComponent } from "../../brain/brain-enable-card/brain-en
 import { MurProgressComponent } from "../../../design-system/progress/progress.component";
 import { MurSelectComponent } from "../../../design-system/select/select.component";
 import { ModelPowerComponent } from "../../settings/sections/settings-transcription-section/model-power/model-power.component";
+import { ErrorCopyService } from "../../../core/copy/error-copy.service";
 
 /** The wizard steps, in order. Drives the dot indicator + progress copy. */
 type Step = "welcome" | "model" | "provider" | "brain" | "vault" | "done";
@@ -100,6 +101,7 @@ export class OnboardingComponent implements OnInit {
   private readonly ipc = inject(IpcService);
   private readonly router = inject(Router);
   private readonly destroyRef = inject(DestroyRef);
+  private readonly errorCopy = inject(ErrorCopyService);
   /** The root-held catalog + machine answer (P1). Shared with Settings, never re-fetched per host. */
   readonly machine = inject(MachineService);
 
@@ -218,7 +220,9 @@ export class OnboardingComponent implements OnInit {
           id,
           available: false,
           reason:
-            id === "gateway" ? "Add your gateway's base URL below" : undefined,
+            id === "gateway"
+              ? "Add your gateway's server address below"
+              : undefined,
         },
     );
   });
@@ -473,7 +477,7 @@ export class OnboardingComponent implements OnInit {
       await this.refreshLiveCompanionPending();
       await this.machine.refresh();
     } catch (e) {
-      this.downloadError.set(String(e));
+      this.downloadError.set(this.errorCopy.humanize(e));
     } finally {
       this.downloading.set(false);
     }
@@ -574,7 +578,7 @@ export class OnboardingComponent implements OnInit {
       // Re-probe so the "Available" pill updates once the key takes effect.
       await this.recheckProviders();
     } catch (e) {
-      this.keyError.set(String(e));
+      this.keyError.set(this.errorCopy.humanize(e));
     } finally {
       this.savingKey.set(false);
     }

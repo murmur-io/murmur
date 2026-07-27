@@ -11,6 +11,10 @@ import {
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { IpcService } from "../../../core/ipc.service";
 import { SettingsStore } from "../../settings/settings.store";
+import {
+  ErrorCopyService,
+  UserFacingError,
+} from "../../../core/copy/error-copy.service";
 
 /**
  * "Enable the brain" — the one-click activation card for the two on-device
@@ -43,6 +47,7 @@ export class BrainEnableCardComponent {
   private readonly ipc = inject(IpcService);
   private readonly store = inject(SettingsStore);
   private readonly destroyRef = inject(DestroyRef);
+  private readonly errorCopy = inject(ErrorCopyService);
 
   /** Fires once when both models land (parent may advance the wizard). */
   readonly enabled = output<void>();
@@ -130,7 +135,16 @@ export class BrainEnableCardComponent {
         this.stage.set("brain");
         this._brainFrac.set(0);
         const heavy = this.store.brainModels().find((m) => m.selectedHeavy);
-        if (!heavy) throw new Error("no on-device model available");
+        // Frontend-authored refusal, so it carries its own finished sentence (see
+        // `UserFacingError`): the catalog has no model marked as the on-device choice, which is a
+        // state the user can act on. A bare `Error` here would be denied to the generic sentence
+        // and tell them nothing — and the old raw `e.message` ("no on-device model available") was
+        // developer shorthand, not copy.
+        if (!heavy) {
+          throw new UserFacingError(
+            "No on-device model is selected yet — choose one under AI & Models, then try again.",
+          );
+        }
         await this.store.downloadBrainModel(heavy.id);
         // Downloading the GGUF is not the same as SELECTING it: `brain_model_present`
         // resolves via the persisted `brain_model_id`, which download alone never
@@ -162,12 +176,12 @@ export class BrainEnableCardComponent {
           specific ??
             (!this.brainPresent()
               ? "The brain model downloaded, but Murmur can't find it afterward. Check available disk space, then try again."
-              : "The embedding model downloaded, but Murmur can't find it afterward. Check available disk space, then try again."),
+              : "The search-index model downloaded, but Murmur can't find it afterward. Check available disk space, then try again."),
         );
         this.stage.set("idle");
       }
     } catch (e) {
-      this.error.set(e instanceof Error ? e.message : String(e));
+      this.error.set(this.errorCopy.humanize(e));
       this.stage.set("idle");
     } finally {
       this.running.set(false);

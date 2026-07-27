@@ -5,6 +5,7 @@ import {
   type SavedView,
   type ViewConfig,
 } from "../core/models";
+import { ErrorCopyService } from "../core/copy/error-copy.service";
 
 /** localStorage key holding the last active NOTES saved-view id (null = List default). */
 const ACTIVE_VIEW_KEY = "murmur.savedViews.notes.activeId";
@@ -33,6 +34,7 @@ const ACTIVE_VIEW_KEY = "murmur.savedViews.notes.activeId";
 @Injectable({ providedIn: "root" })
 export class NotesSavedViewsService {
   private readonly ipc = inject(IpcService);
+  private readonly errorCopy = inject(ErrorCopyService);
 
   private readonly _views = signal<SavedView[]>([]);
   private readonly _loading = signal(false);
@@ -78,7 +80,7 @@ export class NotesSavedViewsService {
         this.setActiveView(null);
       }
     } catch (e) {
-      this._error.set(String(e));
+      this._error.set(this.errorCopy.humanize(e));
     } finally {
       this._loading.set(false);
     }
@@ -110,7 +112,7 @@ export class NotesSavedViewsService {
     try {
       saved = await this.ipc.upsertSavedView(draft);
     } catch (e) {
-      this._error.set(String(e));
+      this._error.set(this.errorCopy.humanize(e));
       throw e;
     }
     await this.load();
@@ -128,7 +130,7 @@ export class NotesSavedViewsService {
     try {
       saved = await this.ipc.upsertSavedView(view);
     } catch (e) {
-      this._error.set(String(e));
+      this._error.set(this.errorCopy.humanize(e));
       throw e;
     }
     await this.load();
@@ -144,7 +146,7 @@ export class NotesSavedViewsService {
     try {
       await this.ipc.deleteSavedView(id);
     } catch (e) {
-      this._error.set(String(e));
+      this._error.set(this.errorCopy.humanize(e));
       throw e;
     }
     if (this._activeViewId() === id) {

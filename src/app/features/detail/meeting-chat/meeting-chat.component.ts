@@ -17,6 +17,7 @@ import type { ChatTurn, SourceRef } from "../../../core/models";
 import { SourceScopeService } from "../../../services/source-scope.service";
 import { SourcePickerComponent } from "../../../design-system/source-picker/source-picker.component";
 import { MarkdownComponent } from "../../../shared/markdown/markdown.component";
+import { ErrorCopyService } from "../../../core/copy/error-copy.service";
 
 /** The starter prompts shown in the empty state — tap to ask immediately. */
 const STARTERS: readonly string[] = [
@@ -50,6 +51,7 @@ export class MeetingChatComponent {
   private readonly ipc = inject(IpcService);
   private readonly injector = inject(Injector);
   private readonly sourceScope = inject(SourceScopeService);
+  private readonly errorCopy = inject(ErrorCopyService);
 
   /** The anchor meeting whose transcript supplies the primary grounding. */
   readonly meetingId = input.required<string>();
@@ -221,7 +223,7 @@ export class MeetingChatComponent {
       ]);
     } catch (e) {
       // Keep the user's question in the log so Retry can re-send it.
-      this.error.set("Couldn’t get an answer: " + String(e));
+      this.error.set(this.errorCopy.because("Couldn’t get an answer", e));
     } finally {
       this.pending.set(false);
       this.scrollToLatest();

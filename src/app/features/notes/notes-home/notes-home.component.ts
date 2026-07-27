@@ -29,6 +29,7 @@ import { OrgBrainService } from "../../../services/org-brain.service";
 import { ToastService } from "../../../services/toast.service";
 import { OrganizeSheetComponent } from "../organize-sheet/organize-sheet.component";
 import { NotesViewSwitcherComponent } from "../notes-view-switcher/notes-view-switcher.component";
+import { ErrorCopyService } from "../../../core/copy/error-copy.service";
 
 /**
  * The Notes landing view — NOW a normal in-flow route beside the ALWAYS-VISIBLE
@@ -71,6 +72,7 @@ export class NotesHomeComponent implements OnInit {
   private readonly router = inject(Router);
   private readonly toast = inject(ToastService);
   private readonly tabsService = inject(TabsService);
+  private readonly errorCopy = inject(ErrorCopyService);
 
   /** The note list from the store (gated — masked rows carry no snippet/tags). */
   readonly noteList = this.notes.notes;
@@ -430,12 +432,13 @@ export class NotesHomeComponent implements OnInit {
       const id = await this.notes.create(this.activeFolderId(), "Untitled");
       await this.router.navigate(["/notes", id]);
     } catch (e) {
-      // A sealed target folder (the selected one, or the default "Notes" folder
-      // if it's locked) refuses the write with a `Locked` AppError. Say WHY —
-      // the old generic "couldn't create" hid the real cause, so a user whose
-      // default folder was locked just saw an unexplained failure (2026-07-14).
+      // A sealed target folder (the selected one, or the default "Notes" folder if it's locked)
+      // refuses the write with `[folder-locked]`. Say WHY — the old generic "couldn't create" hid
+      // the real cause, so a user whose default folder was locked just saw an unexplained failure
+      // (2026-07-14). P3 keeps that behaviour but keys it on the CODE rather than on `/locked/i`
+      // over the raw string, which also matched unrelated messages containing the word.
       this.toast.danger(
-        /locked/i.test(String(e))
+        this.errorCopy.is(e, "folder-locked")
           ? "This folder is locked — unlock it first to add a note."
           : "Couldn’t create the note. Please try again.",
       );

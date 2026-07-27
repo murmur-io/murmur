@@ -8,6 +8,7 @@ import {
 import { RouterLink } from "@angular/router";
 import { IpcService } from "../../../core/ipc.service";
 import { TopicThreadsStore } from "../../../services/topic-threads-store.service";
+import { ErrorCopyService } from "../../../core/copy/error-copy.service";
 
 /**
  * "Topic threads" — cross-meeting topic clusters surfaced on the Analytics
@@ -35,6 +36,7 @@ import { TopicThreadsStore } from "../../../services/topic-threads-store.service
 export class TopicThreadsComponent implements OnInit {
   private readonly ipc = inject(IpcService);
   private readonly store = inject(TopicThreadsStore);
+  private readonly errorCopy = inject(ErrorCopyService);
 
   /**
    * All loaded threads, sorted multi-mention first (most-discussed topics up
@@ -60,7 +62,7 @@ export class TopicThreadsComponent implements OnInit {
       );
       this.threads.set(sorted);
     } catch (e) {
-      this.error.set("Couldn’t load topic threads: " + String(e));
+      this.error.set(this.errorCopy.because("Couldn’t load topic threads", e));
     } finally {
       this.loading.set(false);
     }

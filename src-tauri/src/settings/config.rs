@@ -1561,8 +1561,8 @@ impl AppConfig {
     ///
     /// The FE wires a first-cloud-send confirmation prompt that calls the `consent_to_cloud_egress`
     /// Tauri command before the first claude_code/anthropic run. Until the user confirms, the egress
-    /// path returns `AppError::Unavailable("cloud egress not consented …")`, which the FE detects to
-    /// surface the consent dialog.
+    /// path returns `AppError::Unavailable(errcode::tag(errcode::CLOUD_CONSENT, …))`, and the FE
+    /// matches the `[cloud-consent]` CODE (never the prose) to surface the consent dialog.
     ///
     /// FAIL-CLOSED ORDERING — persist FIRST, flip the in-memory flag ONLY on a durable success. If
     /// the write fails we return the error with the session still UNCONSENTED, so we never egress on
