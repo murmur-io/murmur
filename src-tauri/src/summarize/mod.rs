@@ -194,12 +194,15 @@ fn make_provider_resolved(
     // content can be sent) until the user has explicitly consented once. ollama is gated ONLY when
     // its base URL is non-loopback (remote) — closing the gap where a remote ollama_base_url would
     // bypass the redaction firewall and consent check.
+    // The refusal carries the `[cloud-consent]` code (see `crate::errcode`) because the Record
+    // screen turns THIS specific failure into an "Allow" banner rather than an error. Before the
+    // code existed the frontend regex-matched this sentence, so rewording it silently broke the
+    // consent flow for every cloud user; the code is now the contract and the prose is free.
     if egress_is_cloud(id, config) && !config.cloud_egress_consented {
-        return Err(crate::error::AppError::Unavailable(
-            "cloud egress not consented: this provider sends meeting content off-device; \
-             grant one-time consent before using it"
-                .to_string(),
-        ));
+        return Err(crate::error::AppError::Unavailable(crate::errcode::tag(
+            crate::errcode::CLOUD_CONSENT,
+            "this provider sends meeting content off-device; grant one-time consent before using it",
+        )));
     }
 
     let inner: Arc<dyn SummarizerProvider> = match id {

@@ -19,6 +19,11 @@ import { MeetingConversationComponent } from "../meeting-conversation/meeting-co
 import { BrainRevealCardComponent } from "../brain-reveal-card/brain-reveal-card.component";
 import { ReTruthCardComponent } from "../re-truth-card/re-truth-card.component";
 import { MeetingConversationStore } from "../../../core/meeting-conversation.store";
+import { ErrorCopyService } from "../../../core/copy/error-copy.service";
+import {
+  cloudDestinationLabel,
+  connectionLabel,
+} from "../../../core/copy/labels";
 
 /** localStorage key for the permanent "no vault set" notice dismissal. */
 const VAULT_NOTICE_DISMISSED_KEY = "murmur-vault-notice-dismissed";
@@ -61,6 +66,7 @@ type LiveCaptionsState =
 })
 export class RecordComponent implements OnInit {
   readonly store = inject(RecorderStore);
+  private readonly errorCopy = inject(ErrorCopyService);
   /** The in-meeting NOTES + @brain THREADS store. Injected + init()'d here (not only from
    * the surface) so it subscribes to the wake/result streams even before the surface shows. */
   readonly assistant = inject(MeetingConversationStore);
@@ -277,52 +283,39 @@ export class RecordComponent implements OnInit {
   }
 
   /**
-   * True when the last failure was the backend's cloud-egress consent gate. We
-   * detect the stable "cloud egress not consented" marker from `make_provider`
-   * and surface a friendly consent prompt instead of the raw error banner —
-   * never a silent failure.
+   * True when the last failure was the backend's cloud-egress consent gate, so the surface can
+   * offer "Allow" instead of an error banner — never a silent failure.
+   *
+   * This matches the STABLE `[cloud-consent]` CODE
+   * (`src-tauri/src/errcode.rs::CLOUD_CONSENT`, emitted by
+   * `summarize::make_provider_resolved`), never the prose. It used to regex-match the Rust
+   * sentence "cloud egress not consented", which meant rewording that sentence — an ordinary
+   * de-jargoning edit — silently broke the consent flow for every cloud user: the Allow banner
+   * would stop rendering and the raw backend string would surface instead.
+   *
+   * `RecorderStore.errorCode` carries the code off the RAW wire string; `store.error()` is already
+   * humanized and no longer contains it.
    */
-  readonly needsCloudConsent = computed(() => {
-    const e = this.store.error();
-    return !!e && /cloud egress not consented/i.test(e);
-  });
+  readonly needsCloudConsent = computed(
+    () => this.store.errorCode() === "cloud-consent",
+  );
 
   /** Human label for the configured provider (for the consent copy). */
   readonly providerLabel = computed(() => {
-    switch (this.config()?.providerId) {
-      case "anthropic":
-        return "The Anthropic API";
-      case "claude_code":
-        return "Claude Code";
-      case "gateway":
-        return "Kong AI Gateway";
-      case "ollama":
-        return "Ollama";
-      default:
-        return "This provider";
-    }
+    const id = this.config()?.providerId;
+    // "The Anthropic API" reads better than the bare label in this sentence position.
+    return id === "anthropic" ? "The Anthropic API" : connectionLabel(id);
   });
 
   /**
    * Human name of the destination the redacted transcript goes to (for the
    * consent copy). This banner only shows after the backend's fail-closed
    * `egress_is_cloud` gate refused (`needsCloudConsent`), so the provider is
-   * cloud-classified by definition — for ollama that means the base URL is
-   * non-loopback, hence "your remote Ollama server" without re-parsing it here.
+   * cloud-classified by definition — see `cloudDestinationLabel`.
    */
-  readonly cloudDestination = computed(() => {
-    switch (this.config()?.providerId) {
-      case "anthropic":
-      case "claude_code":
-        return "Anthropic's cloud";
-      case "gateway":
-        return "your Kong AI Gateway";
-      case "ollama":
-        return "your remote Ollama server";
-      default:
-        return "your provider's cloud";
-    }
-  });
+  readonly cloudDestination = computed(() =>
+    cloudDestinationLabel(this.config()?.providerId),
+  );
 
   /** True while the one-time consent command + retry are in flight. */
   readonly consenting = signal(false);
@@ -670,7 +663,7 @@ export class RecordComponent implements OnInit {
       this.modelPresent.set(await this.ipc.modelPresent());
       await this.refreshConfig();
     } catch (e) {
-      this.modelDownloadError.set(String(e));
+      this.modelDownloadError.set(this.errorCopy.humanize(e));
     } finally {
       this.downloadingModel.set(false);
     }
@@ -698,7 +691,7 @@ export class RecordComponent implements OnInit {
         );
       }
     } catch (e) {
-      this.liveCompanionError.set(String(e));
+      this.liveCompanionError.set(this.errorCopy.humanize(e));
     } finally {
       this.downloadingLiveCompanion.set(false);
     }

@@ -31,6 +31,7 @@ import {
 } from "./note-assist-catalog";
 import { RepositionOnScrollDirective } from "./reposition-on-scroll.directive";
 import { TeleportToBodyDirective } from "../../../design-system/teleport-to-body.directive";
+import { ErrorCopyService } from "../../../core/copy/error-copy.service";
 
 /** The live text selection the popover acts on, plus its viewport anchor rect. */
 export interface PopoverSelection {
@@ -123,6 +124,7 @@ export class NoteBrainPopoverComponent {
   private readonly destroyRef = inject(DestroyRef);
   private readonly router = inject(Router);
   private readonly tabsService = inject(TabsService);
+  private readonly errorCopy = inject(ErrorCopyService);
   /** Root-owned timer service — the sanctioned home for the step-animation tick (rule §5). */
   private readonly timers = inject(TimerService);
 
@@ -395,7 +397,7 @@ export class NoteBrainPopoverComponent {
         return;
       }
       this.clearStepTimers();
-      this.errorMsg.set(String(e));
+      this.errorMsg.set(this.errorCopy.humanize(e));
       this.phase.set("error");
     }
   }

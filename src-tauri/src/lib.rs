@@ -10,6 +10,7 @@ pub mod crypto;
 pub mod e2ee;
 pub mod embed;
 pub mod enrich;
+pub mod errcode;
 pub mod error;
 pub mod eval;
 pub mod events;

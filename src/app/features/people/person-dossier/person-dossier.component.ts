@@ -16,6 +16,7 @@ import type {
   DossierData,
   EntityNeighbor,
 } from "../../../core/models";
+import { ErrorCopyService } from "../../../core/copy/error-copy.service";
 
 /**
  * The `/people` detail pane — a STRUCTURED, glanceable dossier for one person
@@ -47,6 +48,7 @@ import type {
 })
 export class PersonDossierComponent {
   private readonly ipc = inject(IpcService);
+  private readonly errorCopy = inject(ErrorCopyService);
 
   /** The person/entity to build the dossier for; changing it re-loads the pane. */
   readonly entityId = input.required<string>();
@@ -116,7 +118,7 @@ export class PersonDossierComponent {
         return;
       }
       this.dossier.set(null);
-      this.error.set(String(e));
+      this.error.set(this.errorCopy.humanize(e));
     } finally {
       if (this.entityId() === id) {
         this.loading.set(false);

@@ -41,6 +41,7 @@ import { NoteDragService } from "../../folders/note-drag.service";
 import { ToastService } from "../../../services/toast.service";
 import { MeetingsViewSwitcherComponent } from "../meetings-view-switcher/meetings-view-switcher.component";
 import { MeetingsTableViewComponent } from "../meetings-table-view/meetings-table-view.component";
+import { matchedInLabel } from "../../../core/copy/labels";
 
 /** Debounce window for search-as-you-type — quick enough to feel instant. */
 const SEARCH_DEBOUNCE_MS = 180;
@@ -49,6 +50,36 @@ const SEARCH_DEBOUNCE_MS = 180;
 interface SnippetPart {
   text: string;
   hit: boolean;
+}
+
+/**
+ * A search hit with its presentation already resolved.
+ *
+ * The template renders these fields directly instead of calling a helper per row: a method
+ * binding inside a `@for` re-runs on every change-detection pass for every visible row, which
+ * the zoneless rules table bans in favour of a `computed()` view model.
+ */
+interface SearchRow extends SearchHit {
+  /** Human label for the field the hit matched in — `""` when it cannot be named. */
+  readonly whereMatched: string;
+  /** Tint class for the matched-in badge. */
+  readonly badgeClass: string;
+}
+
+/**
+ * Tint the matched-in badge: transcript/note = accent, title = neutral.
+ *
+ * A pure module function, not a component method, so it cannot be reached from a template.
+ */
+function matchBadgeClass(matchedIn: string): string {
+  switch (matchedIn) {
+    case "transcript":
+      return "is-accent";
+    case "note":
+      return "is-success";
+    default:
+      return "";
+  }
 }
 
 /**
@@ -617,13 +648,25 @@ export class LibraryComponent implements OnInit {
    * meetings carrying the tag, and hits outside it are dropped. "All" (null tag)
    * passes every hit through untouched.
    */
-  readonly displayedResults = computed(() => {
+  readonly displayedResults = computed<SearchRow[]>(() => {
     const hits = this.results();
-    if (this.activeTag() === null) {
-      return hits;
+    let narrowed = hits;
+    if (this.activeTag() !== null) {
+      const ids = this.tagMeetingIds();
+      narrowed = hits.filter((h) => ids.has(h.meeting.id));
     }
-    const ids = this.tagMeetingIds();
-    return hits.filter((h) => ids.has(h.meeting.id));
+    // The matched-in label and its tint are resolved HERE, once per hit, rather than by
+    // template method calls inside the `@for` — a method binding re-runs on every change
+    // detection pass for every visible row, and the rules table bans it outright.
+    //
+    // `matchedInLabel` returns "" for a value it cannot name, and the template renders NO
+    // badge for "". The old `default: "title"` arm asserted the hit was in the TITLE for any
+    // unrecognised value — a confident lie rather than an absent answer.
+    return narrowed.map((hit) => ({
+      ...hit,
+      whereMatched: matchedInLabel(hit.matchedIn),
+      badgeClass: matchBadgeClass(hit.matchedIn),
+    }));
   });
 
   /**
@@ -1020,30 +1063,6 @@ export class LibraryComponent implements OnInit {
       parts.push({ text: snippet.slice(from), hit: false });
     }
     return parts;
-  }
-
-  /** Human label for the field a hit matched in. */
-  matchLabel(matchedIn: string): string {
-    switch (matchedIn) {
-      case "transcript":
-        return "in transcript";
-      case "note":
-        return "in note";
-      default:
-        return "title";
-    }
-  }
-
-  /** Tint the matched-in badge: transcript/note = accent, title = neutral. */
-  matchBadgeClass(matchedIn: string): string {
-    switch (matchedIn) {
-      case "transcript":
-        return "is-accent";
-      case "note":
-        return "is-success";
-      default:
-        return "";
-    }
   }
 
   /** Presentational only: render the stored timestamp as a friendly local date. */

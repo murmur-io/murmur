@@ -10,6 +10,7 @@ import {
 import { IpcService } from "../../../core/ipc.service";
 import { FoldersService } from "../../../services/folders.service";
 import type { ApplyResult, SupersessionDto } from "../../../core/models";
+import { ErrorCopyService } from "../../../core/copy/error-copy.service";
 
 /**
  * Re-Truth — "the vault heals itself" (post-note surface, Tier-4-style reveal).
@@ -44,6 +45,7 @@ import type { ApplyResult, SupersessionDto } from "../../../core/models";
 export class ReTruthCardComponent {
   private readonly ipc = inject(IpcService);
   private readonly folders = inject(FoldersService);
+  private readonly errorCopy = inject(ErrorCopyService);
 
   /**
    * Fires the preview only when the post-note surface is live — the record
@@ -189,7 +191,7 @@ export class ReTruthCardComponent {
       this._appliedIds.set(ids);
       this._healed.set(res);
     } catch (e) {
-      this._error.set(String(e));
+      this._error.set(this.errorCopy.humanize(e));
     } finally {
       this._busy.set(false);
     }
@@ -208,7 +210,7 @@ export class ReTruthCardComponent {
       this._healed.set(null);
       this._appliedIds.set([]);
     } catch (e) {
-      this._error.set(String(e));
+      this._error.set(this.errorCopy.humanize(e));
     } finally {
       this._busy.set(false);
     }

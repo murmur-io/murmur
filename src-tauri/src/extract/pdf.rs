@@ -82,7 +82,10 @@ fn page_needs_ocr(text_layer: &str) -> bool {
 
 /// Map a caught-exception / nil / empty result into a single fail-closed error.
 fn read_failed() -> AppError {
-    AppError::InvalidArg("could not read PDF".into())
+    AppError::InvalidArg(crate::errcode::tag(
+        crate::errcode::DOC_UNREADABLE,
+        "could not read PDF",
+    ))
 }
 
 /// Run an ObjC closure that borrows non-`UnwindSafe` PDFKit handles inside `objc2::exception::catch`.
@@ -120,9 +123,10 @@ pub fn extract_pdf(path: &Path, progress: &ProgressFn<'_>) -> Result<Vec<Extract
     // the content is password-protected and unreadable without the password.
     let locked = catch_objc(|| unsafe { doc.isLocked() }).unwrap_or(false);
     if locked {
-        return Err(AppError::InvalidArg(
-            "this PDF is password-protected — unlock it and re-import".into(),
-        ));
+        return Err(AppError::InvalidArg(crate::errcode::tag(
+            crate::errcode::DOC_PASSWORD,
+            "this PDF is password-protected",
+        )));
     }
 
     let page_count: usize = catch_objc(|| unsafe { doc.pageCount() }).ok_or_else(read_failed)?;
@@ -198,9 +202,10 @@ pub fn extract_pdf(path: &Path, progress: &ProgressFn<'_>) -> Result<Vec<Extract
 
     if !any_text {
         // Every page yielded nothing — no text layer anywhere AND OCR (where attempted) found nothing.
-        return Err(AppError::InvalidArg(
-            "no text found in this document, even with OCR".into(),
-        ));
+        return Err(AppError::InvalidArg(crate::errcode::tag(
+            crate::errcode::DOC_NO_TEXT,
+            "no text found in this document, even with OCR",
+        )));
     }
 
     // Surface OCR-cap truncation to the caller (the FE shows a partial-import notice). Counts only.

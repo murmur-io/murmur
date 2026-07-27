@@ -15,6 +15,7 @@ import type {
   OrgMember,
   OrgStatus,
 } from "../../../../core/models";
+import { ErrorCopyService } from "../../../../core/copy/error-copy.service";
 
 /**
  * Settings → Organization section (Shared Brain v1, MULTI-ORG).
@@ -52,6 +53,7 @@ import type {
 export class SettingsOrganizationSectionComponent {
   private readonly ipc = inject(IpcService);
   private readonly toast = inject(ToastService);
+  private readonly errorCopy = inject(ErrorCopyService);
 
   /** Every org the user belongs to (created OR invited-into). Empty ⇒ empty state. */
   private readonly _orgs = signal<OrgStatus[]>([]);
@@ -180,7 +182,7 @@ export class SettingsOrganizationSectionComponent {
           this.reconcileExpanded(list);
         } catch (e) {
           if (seq === this._loadSeq) {
-            this._error.set(String(e));
+            this._error.set(this.errorCopy.humanize(e));
           }
         } finally {
           if (seq === this._loadSeq) {
@@ -260,7 +262,7 @@ export class SettingsOrganizationSectionComponent {
       this.createName.set("");
       this.reload();
     } catch (e) {
-      this._error.set(String(e));
+      this._error.set(this.errorCopy.humanize(e));
     } finally {
       this.creating.set(false);
     }
@@ -288,7 +290,7 @@ export class SettingsOrganizationSectionComponent {
         list.map((o) => ({ ...o, consented: grant })),
       );
     } catch (e) {
-      this._error.set(String(e));
+      this._error.set(this.errorCopy.humanize(e));
     } finally {
       this.consentBusy.set(false);
     }
@@ -323,7 +325,7 @@ export class SettingsOrganizationSectionComponent {
       }
     } catch (e) {
       if (this._expandedOrgId() === orgId) {
-        this._membersError.set(String(e));
+        this._membersError.set(this.errorCopy.humanize(e));
       }
     } finally {
       if (this._expandedOrgId() === orgId) {
@@ -350,7 +352,7 @@ export class SettingsOrganizationSectionComponent {
       await this.loadMembers(orgId);
       this.reload();
     } catch (e) {
-      this._membersError.set(String(e));
+      this._membersError.set(this.errorCopy.humanize(e));
     } finally {
       this.inviting.set(false);
     }
@@ -368,7 +370,7 @@ export class SettingsOrganizationSectionComponent {
       await this.loadMembers(orgId);
       this.reload();
     } catch (e) {
-      this._membersError.set(String(e));
+      this._membersError.set(this.errorCopy.humanize(e));
     } finally {
       this._removingId.set(null);
     }
@@ -391,7 +393,7 @@ export class SettingsOrganizationSectionComponent {
       }
       this.reload();
     } catch (e) {
-      this._error.set(String(e));
+      this._error.set(this.errorCopy.humanize(e));
     } finally {
       this._busyOrgId.set(null);
     }
@@ -422,7 +424,7 @@ export class SettingsOrganizationSectionComponent {
       this._orgs.update((list) =>
         list.map((o) => (o.orgId === org.orgId ? { ...o, contextEnabled: !next } : o)),
       );
-      this._error.set(String(e));
+      this._error.set(this.errorCopy.humanize(e));
     } finally {
       this._contextTogglingOrgId.set(null);
     }
@@ -465,8 +467,8 @@ export class SettingsOrganizationSectionComponent {
         void this.loadOrgItems(org.orgId);
       }
     } catch (e) {
-      this._error.set(String(e));
-      this.toast.danger(`Sync failed — ${String(e)}`);
+      this._error.set(this.errorCopy.humanize(e));
+      this.toast.danger(this.errorCopy.because("Sync failed", e));
     } finally {
       this._syncingOrgId.set(null);
     }
@@ -500,7 +502,7 @@ export class SettingsOrganizationSectionComponent {
       this._orgItems.set(items);
     } catch (e) {
       if (seq === this._browseSeq) {
-        this._itemsError.set(String(e));
+        this._itemsError.set(this.errorCopy.humanize(e));
       }
     } finally {
       if (seq === this._browseSeq) {

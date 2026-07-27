@@ -1,5 +1,29 @@
 use serde::Serialize;
 
+/// The ONE error type. Every fallible fn in this crate returns [`Result<T>`].
+///
+/// # The `[code]` convention (read before adding a user-facing failure)
+///
+/// `AppError` serializes across IPC as its bare `Display` string, which means the message body is
+/// **developer prose** — it is not, and must never be, what the user reads. The frontend renders a
+/// generic sentence for any error it does not recognise.
+///
+/// A failure that IS meant to reach a banner or a toast opts in by carrying a stable machine code
+/// at the front of its body, via [`crate::errcode::tag`]:
+///
+/// ```ignore
+/// return Err(AppError::Locked(errcode::tag(
+///     errcode::NOTE_LOCKED,
+///     format!("note {id} is in a locked folder"),
+/// )));
+/// // → "locked: [note-locked] note n1 is in a locked folder"
+/// ```
+///
+/// `src/app/core/copy/error-copy.service.ts` strips the variant tag, reads the `[code]`, and owns
+/// the sentence. See [`crate::errcode`] for the full allowlist and the rules.
+///
+/// **Do not hand-build error strings the FE has to parse.** The code is the contract; the prose
+/// after it is free to change.
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
     #[error("audio capture error: {0}")]

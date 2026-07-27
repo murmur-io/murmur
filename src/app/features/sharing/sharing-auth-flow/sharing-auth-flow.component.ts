@@ -13,6 +13,7 @@ import {
 import { FormControl, ReactiveFormsModule } from "@angular/forms";
 import { IpcService } from "../../../core/ipc.service";
 import type { AccountStatus } from "../../../core/models";
+import { ErrorCopyService } from "../../../core/copy/error-copy.service";
 
 /**
  * The reusable multi-step sharing-account flow. One state machine, two entry
@@ -60,6 +61,7 @@ type Step =
 export class SharingAuthFlowComponent {
   private readonly ipc = inject(IpcService);
   private readonly injector = inject(Injector);
+  private readonly errorCopy = inject(ErrorCopyService);
 
   /** Fired once the session is logged in (after sign-in, or signup → auto-login). */
   readonly completed = output<AccountStatus>();
@@ -350,20 +352,17 @@ export class SharingAuthFlowComponent {
     }
   }
 
-  /** Map a raw backend error to a friendly, non-crashy inline message. */
+  /**
+   * Map a backend failure to the sentence for this form.
+   *
+   * This used to sniff the raw string for connectivity words and, on a miss, strip the `AppError`
+   * variant prefix and render whatever was left. On a rejected sign-in code that meant the user
+   * read `verify_code: rejected (400)` — the shape of failure P3 exists to delete. The four
+   * `sharing-*` codes (`share/client.rs::status_err`) now carry the distinction that mattered:
+   * unreachable is connectivity, 429 is rate-limiting, 4xx is a bad or expired code, 401 is a
+   * signed-out session.
+   */
   private friendly(e: unknown): string {
-    const raw = String(e);
-    // Only a genuine connectivity problem gets the "can't reach" guidance. A 4xx
-    // (wrong or expired code, too many tries, bad password) is NOT unreachability — it arrives as a
-    // clear sentence we surface as-is (below).
-    if (/could not reach|unreachable|no sharing server|failed to build|network|timed? ?out/i.test(raw)) {
-      return "Can't reach the sharing server. Check your connection, then try again.";
-    }
-    // AppError serializes as "invalid argument: <msg>" / "authentication error: <msg>" etc. — strip
-    // the variant prefix so the user reads the clean message.
-    return raw.replace(
-      /^(invalid argument|authentication error|provider unavailable|config error|storage error|secrets error|locked): /i,
-      "",
-    );
+    return this.errorCopy.humanize(e);
   }
 }

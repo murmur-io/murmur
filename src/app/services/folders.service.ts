@@ -1,6 +1,7 @@
 import { Injectable, computed, inject, signal } from "@angular/core";
 import { IpcService } from "../core/ipc.service";
 import type { Folder, FolderNode } from "../core/models";
+import { ErrorCopyService } from "../core/copy/error-copy.service";
 
 /**
  * A folder's privacy exposure, derived from its lock flags:
@@ -22,6 +23,7 @@ export type FolderExposure = "open" | "locked" | "session";
 @Injectable({ providedIn: "root" })
 export class FoldersService {
   private readonly ipc = inject(IpcService);
+  private readonly errorCopy = inject(ErrorCopyService);
 
   private readonly _tree = signal<FolderNode[]>([]);
   private readonly _loading = signal(false);
@@ -91,7 +93,7 @@ export class FoldersService {
       this._tree.set(await this.ipc.listFolders());
       this.loadedOnce = true;
     } catch (e) {
-      this._error.set(String(e));
+      this._error.set(this.errorCopy.humanize(e));
     } finally {
       this._loading.set(false);
     }
@@ -138,7 +140,7 @@ export class FoldersService {
     try {
       folder = await this.ipc.createFolder(name, parentId);
     } catch (e) {
-      this._error.set(String(e));
+      this._error.set(this.errorCopy.humanize(e));
       throw e;
     }
     // The folder now exists. The refresh is best-effort: a refresh error is logged into `error`
@@ -159,7 +161,7 @@ export class FoldersService {
     try {
       folder = await this.ipc.renameFolder(folderId, newName);
     } catch (e) {
-      this._error.set(String(e));
+      this._error.set(this.errorCopy.humanize(e));
       throw e;
     }
     await this.load();
@@ -177,7 +179,7 @@ export class FoldersService {
     try {
       await this.ipc.deleteFolder(folderId);
     } catch (e) {
-      this._error.set(String(e));
+      this._error.set(this.errorCopy.humanize(e));
       throw e;
     }
     await this.load();
@@ -190,7 +192,7 @@ export class FoldersService {
       await this.ipc.moveNote(meetingId, folderId);
       await this.load();
     } catch (e) {
-      this._error.set(String(e));
+      this._error.set(this.errorCopy.humanize(e));
       throw e;
     }
   }
@@ -202,7 +204,7 @@ export class FoldersService {
       await this.ipc.lockFolder(folderId);
       await this.load();
     } catch (e) {
-      this._error.set(String(e));
+      this._error.set(this.errorCopy.humanize(e));
       throw e;
     }
   }
@@ -214,7 +216,7 @@ export class FoldersService {
       await this.ipc.unlockFolder(folderId);
       await this.load();
     } catch (e) {
-      this._error.set(String(e));
+      this._error.set(this.errorCopy.humanize(e));
       throw e;
     }
   }
@@ -226,7 +228,7 @@ export class FoldersService {
       await this.ipc.relockFolder(folderId);
       await this.load();
     } catch (e) {
-      this._error.set(String(e));
+      this._error.set(this.errorCopy.humanize(e));
       throw e;
     }
   }
@@ -238,7 +240,7 @@ export class FoldersService {
       await this.ipc.relockAll();
       await this.load();
     } catch (e) {
-      this._error.set(String(e));
+      this._error.set(this.errorCopy.humanize(e));
       throw e;
     }
   }
@@ -250,7 +252,7 @@ export class FoldersService {
       await this.ipc.removeLock(folderId);
       await this.load();
     } catch (e) {
-      this._error.set(String(e));
+      this._error.set(this.errorCopy.humanize(e));
       throw e;
     }
   }
